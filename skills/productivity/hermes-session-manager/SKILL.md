@@ -37,9 +37,10 @@ Never wait on a worker inside a turn and never predict its result.
 **Outcome first.** Read each chat's stored outcome before anything else:
 `hermes sessions outcome-audit --json` (every sidebar row as `{id, title, kind, reason, age_h, on, items}`), or
 `hermes sessions outcome <id> --json` for one. Map it directly: `decision` → blocked on the user (its `items`
-are the asks), `waiting`/`running` → moving (its `on` names what), `done` → done (`summary`), `muted` → leave
-alone, `unresolved` → stalled, with `reason`. Don't re-derive a chat that has an outcome. The rules below are the
-fallback for cores without these commands, rows with no outcome, and cards and Inbox items.
+are the asks), `waiting`/`running` → inspect the named work, `done` → done (`summary`), `muted` → leave
+alone, `unresolved` → stalled, with `reason`. Stored waiting/running is not execution evidence. After recovery
+or ownership changes, refresh this authoritative outcome; an immediate declared-done readback can precede
+link derivation and revert to waiting. Use the fallback rules below only where no authoritative outcome exists.
 
 - **Blocked on the user:** a blocked card whose blocker is the user, an open Inbox item, or a
   session whose last assistant message asks the user something (a question, an approval, a click,
@@ -60,9 +61,10 @@ say what's running, never what needs the user.
 
 - Stalled card: read its log (`hermes kanban log <id>`), then `kanban_comment` with the next step,
   `reclaim` a dead claim, or unblock it if the blocker is gone. Fix it yourself when it is small.
-- For a completion sweep ("get all sessions green"), treat dispatch as intermediate, not completion.
-  For each non-green session, inspect the remaining deliverable and why it stopped; resolve asks
-  within existing authority, then resume concrete work or take it over rather than only nudging.
+- For a completion sweep ("get all sessions green"), inspect each remaining deliverable and why it stopped,
+  then resolve authorized asks and resume concrete work. If a recipient only relays the instruction back,
+  direct it to produce the missing artifact in its own session; a coordination reply is not execution.
+  Reuse existing cards and keep real observation, physical, privacy and spend gates intact.
 - Verify execution after dispatch: `cross_session.send` can return `delivered=true, status=streaming`
   while agent initialization subsequently fails. Read back the exact message, then require a new tool
   operation or substantive conclusion; correlate a silent chat's runtime ID with `logs/errors.log`.
