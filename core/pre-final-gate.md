@@ -16,6 +16,13 @@ What you see: a plugin can stop a final answer before it reaches the screen and 
 - A callback that raises, or runs longer than `agent.pre_final_gate_timeout` (default 30 s), is logged at WARNING and the answer is delivered unchanged.
 - Callback attribute `needs_buffer = True`: assistant text deltas are buffered for the turn. They are released when a response turns out to carry tool calls, when the gate delivers, or at turn end. On a hold they are dropped. This is needed because no surface can retract streamed text: Desktop keeps any text that comes before a later tool call, and CLI and messaging streams cannot unprint. The cost is that answers appear in one chunk instead of streaming.
 - Callback attribute `include_background = True`: the hook also runs in kanban workers, `delegate_task` subagents and cron. It is skipped there by default.
+- Callback attribute `include_forks = True`: the hook also runs on detached fork turns (background review, `/btw` side questions: `_turn_origin` or `_persist_disabled` set). It is skipped there by default. `include_background` does not imply it; a fork that is also a background agent needs both. See "Fork turns" below.
+
+## Fork turns
+
+A fork (`build_cache_parity_fork`: background review, `/btw`) shares the parent's `session_id` and `platform`, but it is not a reply in the conversation. A review fork's text is never shown. A `/btw` answer is shown, but as a tool-less side note outside the transcript (tools denied at dispatch, 3 iterations max), so a hold's nudge ("file a card", "publish the ask") cannot be acted on and only burns those iterations, and gates that key state by `session_id` (ask-gate, user-steps, session-outcome, chat-closeout) would mix fork text into the parent's state. `eligible_callbacks` therefore drops every callback without `include_forks` when `is_fork_turn(agent)` is true. The parent's own final answers stay gated. This matches `pre_verify` (skipped for forks since `966154e8d35`) and `post_llm_call`.
+
+Why a core filter and not a `turn_origin` kwarg: `_call` passes kwargs through unfiltered, so a new kwarg breaks every callback without `**kwargs`. Coach's `envelope_gate` accepts `turn_origin` (hermes-mods a91fbc66), but core never passed it; the filter makes that check redundant but harmless. Excluding forks also stops a fork's stream from being buffered for a gate that won't run.
 
 ## How it works
 
@@ -37,6 +44,7 @@ What you see: a plugin can stop a final answer before it reaches the screen and 
 - `test_hold_once_never_shows_or_persists_first_answer`: the held text never reaches the stream or interim callbacks. The second request carries the held answer and the nudge. Both hold rows are ephemeral, and the returned history is `[user, assistant(final)]`.
 - `test_append_delivers_with_note`, `test_hold_limit_then_delivers_with_append` (attempts 0, 1, 2, then deliver with the note), `test_hook_exception_delivers_unchanged_and_logs`, `test_skipped_for_subagents_unless_opted_in`, `test_no_hook_streams_live`, `test_buffer_released_by_interim_and_discarded_on_hold`.
 - Live: a throwaway plugin that holds once on a marker prompt, run against the Desktop backend over `/api/ws`. The first answer appeared in no `message.delta`/`message.interim`/`message.complete` event and not in the stored transcript, and the second answer did (task t_45d5a361).
+- `test_skipped_for_fork_turns_unless_opted_in` (parametrized: `_turn_origin` background_review / side_question, `_persist_disabled`): a control user turn is held, then gated; the same hook with only `include_background` is not called on the fork, which delivers its first answer unbuffered; with `include_forks` it runs again. RED before the filter (3 failed: the hook held the fork), GREEN after.
 - `test_slow_hook_times_out_and_delivers`: a callback past `agent.pre_final_gate_timeout` is skipped and the answer is delivered.
 
 ## Applying
