@@ -196,6 +196,9 @@ def test_complete_via_terminal_cli(board):
     f'hermes kanban edit {OWN} --title "X (shipped; iMac run split to follow-up)" --body "narrowed"',
     f"hermes kanban edit {OWN} --body 'no iMac run'",
     'hermes kanban edit "$HERMES_KANBAN_TASK" --body narrowed',
+    # a worker's terminal has the card id as HERMES_KANBAN_WORKER_TASK (HERMES_KANBAN_TASK is scrubbed there)
+    'hermes kanban edit "$HERMES_KANBAN_WORKER_TASK" --body narrowed',
+    'hermes kanban edit ${HERMES_KANBAN_WORKER_TASK} --title narrowed',
     f"env -u HERMES_DELEGATED_CHILD_CONTEXT hermes kanban --board hermes edit {OWN} --title=new",
     f"cd /tmp && hermes kanban edit {OWN} --body x && hermes kanban complete {OWN} --summary ok",
 ])

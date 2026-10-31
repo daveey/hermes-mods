@@ -433,7 +433,8 @@ def check_create(args: dict, env=None, names_fn=None) -> Optional[str]:
             "what the card is for, reword the body so it doesn't call it the origin.")
 
 
-_OWN_REFS = ("$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}")
+# HERMES_KANBAN_TASK is scrubbed from a worker's tool children; they carry the card id as HERMES_KANBAN_WORKER_TASK.
+_OWN_REFS = ("$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}", "$HERMES_KANBAN_WORKER_TASK", "${HERMES_KANBAN_WORKER_TASK}")
 _SEPARATORS = {";", "&&", "||", "|", "&", "\n", "(", ")"}
 
 
