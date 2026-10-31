@@ -1,0 +1,166 @@
+From 632eb9c39d518188e71d3404c5f012d4e4e6a113 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 01:02:06 +0000
+Subject: [PATCH] fix(cli): classic-CLI quit no longer runs the prompt restore
+ on the gateway proxy; store reads parity [daveey]
+
+Quitting a classic-CLI chat ran main's close-time flush, which builds the agent's system prompt
+when none is cached. A GatewayAgent never caches one (the gateway builds, persists and refreshes
+it), so the build ran conversation_loop's restore on the proxy, whose GatewaySessionStore refused
+prompt_refresh_epoch and logged a GatewayClientError traceback (self-heal agent-928bcf8050).
+
+- cli_session_mixin: _persist_active_session_before_close returns for a GatewayAgent.
+- gateway_session_store: _READS += prompt_refresh_epoch, latest_conversation_role,
+  get_conversation_root; _GATEWAY_OWNED += update_system_prompt; _REFUSED_BY_DESIGN map.
+- Parity test: every _session_db call in conversation_loop/prompt_refresh/run_agent must be
+  classified by the store, so a new SessionDB call fails CI instead of refusing at runtime.
+---
+ hermes_cli/cli_session_mixin.py               |  6 ++
+ hermes_cli/gateway_session_store.py           |  8 ++
+ .../hermes_cli/test_gateway_session_store.py  | 90 +++++++++++++++++++
+ 3 files changed, 104 insertions(+)
+
+diff --git a/hermes_cli/cli_session_mixin.py b/hermes_cli/cli_session_mixin.py
+index 688c954445f..a69effc3fdb 100644
+--- a/hermes_cli/cli_session_mixin.py
++++ b/hermes_cli/cli_session_mixin.py
+@@ -1078,6 +1078,12 @@ class CLISessionMixin:
+         agent = getattr(self, "agent", None)
+         if not agent or not hasattr(agent, "_persist_session"):
+             return
++        from hermes_cli.gateway_agent import GatewayAgent
++        if isinstance(agent, GatewayAgent):
++            # [daveey] The gateway ran the turn and owns its transcript and system prompt; the proxy's
++            # persistence is a no-op, so building a prompt here only ran the agent loop's restore on
++            # the proxy (agent-928bcf8050: a refused store read logged a traceback on every quit).
++            return
+ 
+         persist_lock = getattr(agent, "_session_persist_lock", None)
+ 
+diff --git a/hermes_cli/gateway_session_store.py b/hermes_cli/gateway_session_store.py
+index ae5e82d172e..a783abd3e91 100644
+--- a/hermes_cli/gateway_session_store.py
++++ b/hermes_cli/gateway_session_store.py
+@@ -35,13 +35,21 @@ _READS = frozenset({
+     "get_handoff_state", "get_meta", "get_compression_tip", "resolve_session_by_title", "get_messages",
+     "session_count", "sanitize_title", "session_yolo_enabled",
+     "get_session_model_config_value",
++    # [daveey] Reads the agent loop makes on whatever ``_session_db`` it holds (conversation_loop,
++    # prompt_refresh, run_agent); tests/hermes_cli/test_gateway_session_store.py pins the parity.
++    "prompt_refresh_epoch", "latest_conversation_role", "get_conversation_root",
+ })
+ # Writes the gateway already performs itself (persistence, accounting, maintenance).
+ _GATEWAY_OWNED = frozenset({
+     "create_session", "reopen_session", "append_messages_batch", "flush_token_counts",
+     "update_session_model", "patch_session_model_config", "maybe_auto_archive",
+     "maybe_auto_prune_and_vacuum", "set_meta", "update_token_counts", "close",
++    "update_system_prompt",  # [daveey] the gateway builds, persists and refreshes the prompt
+ })
++# [daveey] Agent-loop SessionDB methods this store refuses on purpose: name -> why. The parity test
++# requires every ``_session_db`` call in the agent loop to be in one of these sets, so a new call
++# fails CI until it is classified instead of becoming a runtime refusal traceback.
++_REFUSED_BY_DESIGN: dict[str, str] = {}
+ # Mutations the owner refuses without the execution generation they were read at (hermes_state_runtime).
+ _GENERATION_FENCED = frozenset({"delete", "rewind", "reset", "branch", "model", "compress", "workspace"})
+ _COUNTED_REPAIRS = frozenset({"prune_empty_ghost_sessions", "finalize_orphaned_compression_sessions"})
+diff --git a/tests/hermes_cli/test_gateway_session_store.py b/tests/hermes_cli/test_gateway_session_store.py
+index 334e7772975..4fbe5182d80 100644
+--- a/tests/hermes_cli/test_gateway_session_store.py
++++ b/tests/hermes_cli/test_gateway_session_store.py
+@@ -916,3 +916,93 @@ def test_an_explicit_kanban_source_is_still_sent_for_the_gateway_to_refuse(store
+     db, client = store
+     db.open_session(cli(), {})
+     assert client.calls[-1][1]["source"] == "kanban"
++
++
++# -- the agent loop's SessionDB calls vs this store (agent-928bcf8050) ------------------------------
++def test_prompt_refresh_epoch_is_a_read_the_store_answers(store, tmp_path, monkeypatch, caplog):
++    """``hermes sessions refresh-prompts`` records an epoch in state.db; the store reads it back
++    instead of refusing (which logged a GatewayClientError traceback on every CLI close)."""
++    import logging
++    from types import SimpleNamespace
++
++    from agent.prompt_refresh import requested_epoch
++    from hermes_state import SessionDB
++    db, client = store
++    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
++    writer = SessionDB(db_path=tmp_path / "state.db")
++    writer.create_session(session_id="local-old", source="cli")
++    epoch = writer.request_prompt_refresh("local-old")
++    writer.close()
++    before = len(client.calls)
++    with caplog.at_level(logging.WARNING, logger="agent.prompt_refresh"):
++        assert requested_epoch(SimpleNamespace(_session_db=db, session_id="local-old")) == epoch > 0
++    assert not [r for r in caplog.records if "Prompt refresh epoch read failed" in r.getMessage()]
++    assert len(client.calls) == before  # a local WAL read, no RPC
++
++
++def test_cli_close_does_not_build_a_system_prompt_for_a_gateway_agent(store, monkeypatch, caplog):
++    """The real path of agent-928bcf8050: quitting a classic-CLI chat ran main's close-time flush,
++    which builds the agent's system prompt when none is cached. A GatewayAgent never caches one (the
++    gateway builds, persists and refreshes it), so the build ran the agent loop's prompt restore on the
++    proxy: it read the store and logged a traceback, and its result was thrown away by the no-op
++    ``_persist_session``. The gateway owns that work; close does nothing here."""
++    import logging
++
++    import cli as cli_mod
++    import agent.conversation_loop as loop
++    from hermes_cli.gateway_agent import GatewayAgent
++    db, _ = store
++    agent = GatewayAgent(session_db=db, session_id="local-old")
++    calls = []
++    monkeypatch.setattr(loop, "_restore_or_build_system_prompt", lambda *a, **k: calls.append(a))
++    cli = object.__new__(cli_mod.HermesCLI)
++    history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
++    agent._session_messages = list(history)  # what a finished turn leaves (``out["messages"]``)
++    cli.conversation_history = list(history)
++    cli.session_id = "local-old"
++    cli.agent = agent
++    with caplog.at_level(logging.DEBUG):
++        cli._persist_active_session_before_close()
++    assert calls == []
++    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
++
++
++# Agent-loop modules whose ``_session_db`` calls run against this store when an agent is handed it.
++_AGENT_LOOP_FILES = ("agent/conversation_loop.py", "agent/prompt_refresh.py", "run_agent.py")
++
++
++def _agent_loop_session_db_methods():
++    import re
++    from pathlib import Path
++    root = Path(__file__).resolve().parents[2]
++    found = {}
++    for rel in _AGENT_LOOP_FILES:
++        text = (root / rel).read_text(encoding="utf-8")
++        for pattern in (r"_session_db\.([A-Za-z_]\w*)\s*\(",
++                        # getattr(agent._session_db, "X"...) / getattr(getattr(agent, "_session_db", None), "X"...)
++                        r"getattr\(\s*[\w.]*_session_db\s*,\s*[\"']([A-Za-z_]\w*)[\"']",
++                        r"getattr\(\s*getattr\([^()]*[\"']_session_db[\"'][^()]*\)\s*,\s*[\"']([A-Za-z_]\w*)[\"']"):
++            for name in re.findall(pattern, text):
++                found.setdefault(name, rel)
++        # ``db = getattr(agent, "_session_db", None)`` then ``db.X(``
++        if re.search(r"\bdb\b[^=\n]*=\s*getattr\([^)]*[\"']_session_db[\"']", text):
++            for name in re.findall(r"\bdb\.([A-Za-z_]\w*)\s*\(", text):
++                found.setdefault(name, rel)
++    return found
++
++
++def test_every_session_db_call_in_the_agent_loop_is_classified_by_the_store():
++    """Parity guard: a SessionDB method the agent loop calls (or probes with ``getattr``) is a read the
++    store serves, a write the gateway owns, a counted repair, a real store attribute, or explicitly
++    refused by design with a reason. An unclassified name would fall to ``__getattr__``'s refusal and
++    surface as a traceback at runtime, as ``prompt_refresh_epoch`` did."""
++    from hermes_cli import gateway_session_store as gss
++    found = _agent_loop_session_db_methods()
++    assert "prompt_refresh_epoch" in found and "update_system_prompt" in found  # the scan sees them
++    classified = gss._READS | gss._GATEWAY_OWNED | gss._COUNTED_REPAIRS | set(gss._REFUSED_BY_DESIGN)
++    unclassified = {name: rel for name, rel in found.items()
++                    if name not in classified and not hasattr(GatewaySessionStore, name)}
++    assert unclassified == {}, (
++        "Classify these SessionDB calls in hermes_cli/gateway_session_store.py "
++        f"(_READS / _GATEWAY_OWNED / _COUNTED_REPAIRS / _REFUSED_BY_DESIGN): {unclassified}")
++    assert all(isinstance(why, str) and why for why in gss._REFUSED_BY_DESIGN.values())
+-- 
+2.55.0
+

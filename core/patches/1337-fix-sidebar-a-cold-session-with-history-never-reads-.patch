@@ -1,0 +1,188 @@
+From 1f8a5020afc8913384151f4a32f06edc91c2e6c7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:00:12 -0700
+Subject: [PATCH] fix(sidebar): a cold session with history never reads as a
+ draft [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A settled session nothing shows has its transcript released (messages: []).
+$draftSessionIds called any empty client state a draft unless its row was in
+$sessions with message_count > 0, but project-tree rows older than the recents
+page are not in $sessions. Such a chat (207 messages) painted the "Draft —
+nothing sent yet" dot and no stripe, instead of green done, until a reload
+dropped the client state.
+
+- releaseSessionTranscript marks the state transcriptReleased; $draftSessionIds
+  never counts a released state as unsent.
+- withRowActivity: the row's own message_count > 0 beats a store draft claim.
+
+Tests: session-dot-state.test.ts (released state with no listed row, row with
+messages vs a draft claim, controls for a real unsent tab / message_count 0).
+---
+ .../src/app/chat/session-tab-accent.test.tsx  |  3 +-
+ apps/desktop/src/app/types.ts                 |  3 ++
+ .../src/store/session-dot-state.test.ts       | 33 ++++++++++++++++++-
+ apps/desktop/src/store/session-dot-state.ts   | 11 +++++--
+ apps/desktop/src/store/session-states.test.ts |  2 +-
+ apps/desktop/src/store/session-states.ts      |  5 ++-
+ 6 files changed, 48 insertions(+), 9 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/session-tab-accent.test.tsx b/apps/desktop/src/app/chat/session-tab-accent.test.tsx
+index 23c3cc32bf8..dd2c8e20c85 100644
+--- a/apps/desktop/src/app/chat/session-tab-accent.test.tsx
++++ b/apps/desktop/src/app/chat/session-tab-accent.test.tsx
+@@ -71,7 +71,8 @@ describe('session tab underline', () => {
+     ['draft', 'neutral', 'zinc-400']
+   ] as const)('uses the sidebar palette for %s', (state, stripe, color) => {
+     states.set({ session: state })
+-    const { container } = render(tab())
++    // [daveey] A draft has sent nothing: a row with messages overrides a stale `draft` claim (withRowActivity).
++    const { container } = render(tab(state === 'draft' ? { ...row, message_count: 0 } : row))
+     const accent = container.querySelector('[data-session-tab-accent]')!
+ 
+     expect(accent.getAttribute('data-session-tab-accent')).toBe(stripe)
+diff --git a/apps/desktop/src/app/types.ts b/apps/desktop/src/app/types.ts
+index fa6a937c579..0d0666906e3 100644
+--- a/apps/desktop/src/app/types.ts
++++ b/apps/desktop/src/app/types.ts
+@@ -153,6 +153,9 @@ export interface ClientSessionState {
+   transcriptAuthorityEpoch?: number
+   transcriptProvenance?: PersistedDisplayTranscriptProvenance
+   messages: ChatMessage[]
++  /** [daveey] `messages` was emptied by `releaseSessionTranscript` (a settled session nothing shows), so the empty
++   *  list means "not loaded", never "nothing sent yet". */
++  transcriptReleased?: boolean
+   branch: string
+   cwd: string
+   model: string
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index fbb3c317f65..37944633f27 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -38,7 +38,7 @@ import {
+   withoutBackgroundProcess,
+   withRowActivity
+ } from './session-dot-state'
+-import { clearAllSessionStates, publishSessionState } from './session-states'
++import { $sessionStates, clearAllSessionStates, publishSessionState } from './session-states'
+ import { $unreadWriteGuard } from './session-unread-remote'
+ import { $subagentsBySession, type SubagentProgress } from './subagents'
+ 
+@@ -249,6 +249,22 @@ describe('persisted unread (backend watermark)', () => {
+     expect($sessionDotStateById.get()['s1']).toBe('unread')
+   })
+ 
++  // [daveey] A settled session nothing references releases its transcript (messages: []). When its row is not in
++  // `$sessions` (a project-tree row past the recents page) that cold state must not read as "nothing sent yet".
++  it('a released transcript is not a draft, even with no listed row', () => {
++    // No busy→idle transition here: that would claim `unread` and mask the draft question.
++    const loaded = { ...createClientSessionState('s1'), messages: [{ id: 'm1', parts: [], role: 'user' }] as never }
++    publishSessionState('rt1', loaded)
++    expect($sessionDotStateById.get()['s1']).not.toBe('draft')
++    publishSessionState('rt1', { ...loaded })
++    expect($sessionStates.get().rt1?.messages).toEqual([])
++    expect($sessionDotStateById.get()['s1']).not.toBe('draft')
++
++    // Control: an open tab nothing was ever sent to, with no listed row, is still a draft.
++    publishSessionState('rt2', createClientSessionState('s2'))
++    expect($sessionDotStateById.get()['s2']).toBe('draft')
++  })
++
+   it('lets working outrank persisted unread', () => {
+     setSessions([storedRow('s1', { unread: true })])
+     publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+@@ -632,6 +648,21 @@ describe('withRowActivity', () => {
+     expect(withRowActivity('idle', { offline_cached: true, turn_live: true })).toBe('idle')
+   })
+ 
++  // [daveey] The row is authoritative about its own history: a project-tree row older than the recents page is not in
++  // `$sessions`, so a cold (transcript-released) client state for it read as a draft and the row lost its green.
++  it('a draft claim yields to a row that has messages', () => {
++    const fresh = { kanban_observed_at: Date.now() / 1000 }
++
++    expect(withRowActivity('draft', { ...fresh, message_count: 207 })).toBe('idle')
++    expect(sessionStatusStripe(withRowActivity('draft', { ...fresh, message_count: 207 }), true)).toBe('done')
++    // Still background when the row carries work.
++    expect(withRowActivity('draft', { ...fresh, goal_active: true, message_count: 3 })).toBe('background')
++
++    // Controls: a genuinely unsent row (or one whose count is unknown) stays a draft.
++    expect(withRowActivity('draft', { ...fresh, message_count: 0 })).toBe('draft')
++    expect(withRowActivity('draft', fresh)).toBe('draft')
++  })
++
+   it('a decision outcome yields to a running close-out turn and paints red again once it ends', () => {
+     const decision = { kind: 'decision', summary: 'Pick A or B' } as const
+     const row = { kanban_active: 0, kanban_observed_at: Date.now() / 1000 }
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index b207579fdb4..22183518875 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -390,7 +390,7 @@ export const kanbanStripeCounts = (row: KanbanCounts): { blocked: number; stalle
+ type RowActivity = Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active' | 'kanban_blocked'> &
+   Partial<Pick<SessionInfo, 'kanban_held' | 'kanban_parked'>> &
+   Partial<Pick<SessionInfo, 'kanban_observed_at' | 'kanban_remote_stale' | 'kanban_unknown' | 'kanban_unseen' | 'offline_cached'>> &
+-  Partial<Pick<SessionInfo, 'turn_live'>>
++  Partial<Pick<SessionInfo, 'message_count' | 'turn_live'>>
+ 
+ /** [daveey] Work the row's own stamps say is still in flight outside a turn: a goal, cards, a background job. */
+ const rowHasBackgroundWork = (row: RowActivity): boolean =>
+@@ -415,11 +415,16 @@ export const withRowActivity = (state: SessionDotState, row: RowActivity): Sessi
+     return 'working'
+   }
+ 
+-  if ((state === 'idle' || state === 'unread' || state === 'draft') && rowHasBackgroundWork(row)) {
++  // [daveey] The row knows its own history: a store-side `draft` claim (a client state with no messages, matched
++  // against `$sessions` only) is wrong for a row that has messages. A project-tree row older than the recents page is
++  // not in `$sessions`, so a cold state for it (transcript released) painted "nothing sent yet" and no stripe.
++  const settled = state === 'draft' && (row.message_count ?? 0) > 0 ? 'idle' : state
++
++  if ((settled === 'idle' || settled === 'unread' || settled === 'draft') && rowHasBackgroundWork(row)) {
+     return 'background'
+   }
+ 
+-  return (state === 'idle' || state === 'draft') && (row.kanban_unseen ?? 0) > 0 ? 'unread' : state
++  return (settled === 'idle' || settled === 'draft') && (row.kanban_unseen ?? 0) > 0 ? 'unread' : settled
+ }
+ 
+ /** Whether this turn is the session's own, live: brighter title, and the row's
+diff --git a/apps/desktop/src/store/session-states.test.ts b/apps/desktop/src/store/session-states.test.ts
+index f8015d7e10b..c1eab62ed2d 100644
+--- a/apps/desktop/src/store/session-states.test.ts
++++ b/apps/desktop/src/store/session-states.test.ts
+@@ -1064,7 +1064,7 @@ describe('releaseSessionTranscript', () => {
+     $sessionStates.set({ runtime: legacy })
+ 
+     expect(() => releaseSessionTranscript('runtime')).not.toThrow()
+-    expect($sessionStates.get().runtime).toEqual({ ...legacy, messages: [] })
++    expect($sessionStates.get().runtime).toEqual({ ...legacy, messages: [], transcriptReleased: true })
+   })
+ })
+ 
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index 325bfd7df8f..751e213315d 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -952,8 +952,7 @@ export function releaseSessionTranscript(runtimeId: string, state?: ClientSessio
+     return
+   }
+ 
+-  const lightweight =
+-    Array.isArray(retained.messages) && retained.messages.length === 0 ? retained : { ...retained, messages: [] }
++  const lightweight = retained.messages?.length === 0 ? retained : { ...retained, messages: [], transcriptReleased: true }
+ 
+   $sessionStates.set({ ...current, [runtimeId]: lightweight })
+ }
+@@ -1175,7 +1174,7 @@ export const $attentionSessionIds = computed(
+ let draftIds: readonly string[] = []
+ export const $draftSessionIds = computed([$sessionStates, $sessions], (states, sessions) => {
+   const unsent = (state: ClientSessionState) => {
+-    if (state.busy || state.messages.length > 0) {
++    if (state.busy || state.messages.length > 0 || state.transcriptReleased) {
+       return false
+     }
+ 
+-- 
+2.55.0
+

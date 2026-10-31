@@ -1,0 +1,131 @@
+From 7b749582f004d053d29c32552dbb81b3592eea55 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 14:19:11 -0700
+Subject: [PATCH] fix(mem_trim): no full gc.collect() where no page release
+ follows, so trims stop freezing the gateway loop [daveey]
+
+2026-10-30 13:52 PDT (load ~80): py-spy --gil on the MacBook gateway showed trim_memory's gc.collect() holding the
+GIL in one thread for 6.8% of all GIL-held samples (~2.7 s of 40 s), while Desktop reads on conn=local kept missing
+their 4 s timeout. A full collection is one C-level heap walk that the switch interval cannot preempt: 2.2-3.2 s for
+~6M objects on the same loaded Mac (python 3.14.9). Agent closes force a trim every 5 s, so the API loop stalled
+again and again. On macOS/musl no malloc_trim follows, so the walk bought only ~3% footprint (b7e987909a).
+
+Now: full collection only when glibc's page release follows; otherwise gc.collect(1) (young generations, sub-ms).
+Tests: tests/hermes_cli/test_mem_trim.py (real-gc callback checks for both paths). t_01a18e1adb124d2e
+---
+ hermes_cli/mem_trim.py            | 18 +++++++++++----
+ tests/hermes_cli/test_mem_trim.py | 38 +++++++++++++++++++++++++++----
+ 2 files changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/mem_trim.py b/hermes_cli/mem_trim.py
+index 8c0c9a86d2c..ca1f5b4b39f 100644
+--- a/hermes_cli/mem_trim.py
++++ b/hermes_cli/mem_trim.py
+@@ -1,8 +1,10 @@
+ """Rate-limited heap release for long-lived Hermes gateway processes.
+ 
+-On Linux/glibc, ``malloc_trim(0)`` can return pages from freed Python/C allocations to the OS. Every
+-platform runs the rate-limited ``gc.collect()``; only the page release is glibc-only. Behavior is configured
+-under ``context.memory_trim`` in ``config.yaml``.
++On Linux/glibc, ``malloc_trim(0)`` can return pages from freed Python/C allocations to the OS, so a full
++``gc.collect()`` runs first to free as much as possible. Without that page release (macOS, musl) only the young
++generations are collected (``gc.collect(1)``, well under a millisecond): a full collection holds the GIL for the
++whole heap walk (2-3 s for ~6M objects on a loaded Mac) and starves the gateway's API loop, for a ~3% footprint
++gain. Behavior is configured under ``context.memory_trim`` in ``config.yaml``.
+ """
+ 
+ from __future__ import annotations
+@@ -33,6 +35,8 @@ _last_trim_monotonic = 0.0
+ _probe_done = False
+ _malloc_trim: Callable[[int], int] | None = None
+ _trim_call_count = 0
++# Collected generation when no page-release primitive follows: young generations only (see module docstring).
++_NO_RELEASE_GC_GENERATION = 1
+ 
+ 
+ def _config_settings() -> tuple[bool, float, int, float]:
+@@ -165,8 +169,12 @@ def trim_memory(
+         try:
+             before = collect_memory_snapshot()
+             started = time.perf_counter()
+-            gc.collect()
+-            # Cycle collection is allocator-independent; only the page release needs glibc.
++            if trim is not None:
++                gc.collect()
++            else:
++                # No page release follows, so a full GIL-holding heap walk would buy little and stall every other
++                # thread (the gateway API loop missed Desktop's 4 s timeouts on 2026-10-30, t_01a18e1adb124d2e).
++                gc.collect(_NO_RELEASE_GC_GENERATION)
+             trim_result = trim(0) if trim is not None else 0
+             released = bool(trim_result)
+             after = collect_memory_snapshot()
+diff --git a/tests/hermes_cli/test_mem_trim.py b/tests/hermes_cli/test_mem_trim.py
+index 086c3c146db..4ebae9280cd 100644
+--- a/tests/hermes_cli/test_mem_trim.py
++++ b/tests/hermes_cli/test_mem_trim.py
+@@ -38,13 +38,43 @@ def test_config_kill_switch_overrides_force_from_config_file(monkeypatch, tmp_pa
+ 
+ 
+ def test_gc_collect_runs_even_without_platform_primitive(monkeypatch):
+-    # No page-release primitive (macOS, musl): the rate-limited gc.collect() still runs;
++    # No page-release primitive (macOS, musl): the rate-limited collection still runs, young generations only;
+     # only the success flag stays False.
+     collect = Mock()
+     monkeypatch.setattr(mem_trim.gc, "collect", collect)
+ 
+     assert mem_trim.trim_memory(force=True, reason="test") is False
+-    collect.assert_called_once()
++    collect.assert_called_once_with(1)
++
++
++def _collected_generations(monkeypatch, primitive):
++    """Run one real trim (real gc, no mock) and return the generations the collector actually walked."""
++    import gc
++    monkeypatch.setattr(mem_trim, "_malloc_trim", primitive)
++    seen = []
++
++    def _cb(phase, info):
++        if phase == "start":
++            seen.append(info["generation"])
++
++    gc.callbacks.append(_cb)
++    try:
++        mem_trim.trim_memory(force=True, reason="test")
++    finally:
++        gc.callbacks.remove(_cb)
++    return seen
++
++
++def test_no_page_release_never_walks_the_old_generation(monkeypatch):
++    # A full (generation 2) collection holds the GIL for the whole heap walk: 2-3 s for ~6M objects on a loaded
++    # Mac, which starved the gateway API loop past Desktop's 4 s timeout (t_01a18e1adb124d2e).
++    # (Automatic generation-0 passes from the test's own allocations may interleave.)
++    seen = _collected_generations(monkeypatch, None)
++    assert 1 in seen and max(seen) == 1
++
++
++def test_page_release_platform_still_runs_full_collection(monkeypatch):
++    assert 2 in _collected_generations(monkeypatch, lambda pad: 1)
+ 
+ 
+ def test_collect_memory_snapshot_parses_linux_proc_status(monkeypatch):
+@@ -68,14 +98,14 @@ def test_collect_memory_snapshot_parses_linux_proc_status(monkeypatch):
+ 
+ def test_success_collects_then_trims(monkeypatch):
+     calls = []
+-    monkeypatch.setattr(mem_trim.gc, "collect", lambda: calls.append("gc"))
++    monkeypatch.setattr(mem_trim.gc, "collect", lambda *gen: calls.append(("gc", *gen)))
+     monkeypatch.setattr(
+         mem_trim, "_malloc_trim", lambda pad: calls.append(("trim", pad)) or 1
+     )
+     monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+ 
+     assert mem_trim.trim_memory(reason="turn", cooldown_seconds=60) is True
+-    assert calls == ["gc", ("trim", 0)]
++    assert calls == [("gc",), ("trim", 0)]
+     assert mem_trim._last_trim_monotonic == 100.0
+ 
+ 
+-- 
+2.55.0
+

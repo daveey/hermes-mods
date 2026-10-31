@@ -1,0 +1,370 @@
+From 9bd943bec32a0e9906cd275e8bc1fc30f916d3c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 21:02:28 +0000
+Subject: [PATCH] ci(js-tests): check E2E drivers under the runtime-only
+ tests-js install; run tests-js on tests/install and scripts/sandbox changes
+ [daveey]
+
+---
+ .../scripts/check-runtime-driver-imports.mjs  | 161 ++++++++++++++++++
+ .github/workflows/js-tests.yml                |  31 ++++
+ scripts/ci/classify_changes.py                |   7 +-
+ tests/ci/test_runtime_install_shape.py        | 114 +++++++++++++
+ 4 files changed, 312 insertions(+), 1 deletion(-)
+ create mode 100644 .github/scripts/check-runtime-driver-imports.mjs
+ create mode 100644 tests/ci/test_runtime_install_shape.py
+
+diff --git a/.github/scripts/check-runtime-driver-imports.mjs b/.github/scripts/check-runtime-driver-imports.mjs
+new file mode 100644
+index 00000000000..0a6a067e729
+--- /dev/null
++++ b/.github/scripts/check-runtime-driver-imports.mjs
+@@ -0,0 +1,161 @@
++// Proves the E2E driver entry points resolve every import under the
++// runtime-only tests-js install the release workflows use:
++//   npm ci --workspace tests-js --include-workspace-root --omit=dev --ignore-scripts
++// That install has no devDependencies (vitest, jsdom, node-pty, ...), so a
++// driver that imports one only fails on a hosted macOS/Windows release runner.
++// This walks each entry point's static import graph (import/export-from,
++// import(), require() with a string literal) and resolves every specifier the
++// way node would from that file, against the installed tree.
++//
++// Usage: node .github/scripts/check-runtime-driver-imports.mjs [--list]
++// Entry points are tests/install/e2e-assets/*.{mjs,cjs,ts} (minus .d.mts) and
++// EXTRA_ENTRIES; tests/ci/test_runtime_install_shape.py keeps them in sync with
++// what the workflows launch.
++import fs from 'node:fs'
++import { builtinModules, createRequire } from 'node:module'
++import path from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
++const ASSETS = 'tests/install/e2e-assets'
++// Launched outside e2e-assets: desktop-smoke-windows.ps1 and mock-provider.sh run it.
++export const EXTRA_ENTRIES = ['tests-js/scripts/mock-provider-config.ts']
++const CODE = /\.(mjs|cjs|js|ts|mts|cts)$/
++const builtins = new Set(builtinModules)
++
++export function entryPoints() {
++  const dir = path.join(root, ASSETS)
++  const found = fs
++    .readdirSync(dir)
++    .filter(n => CODE.test(n) && !n.endsWith('.d.mts'))
++    .map(n => `${ASSETS}/${n}`)
++
++  return [...found, ...EXTRA_ENTRIES].sort()
++}
++
++const SPEC = [
++  /\b(?:import|export)\s+(?!type\b)[^'"`;]*?\bfrom\s*['"]([^'"]+)['"]/g,
++  /\bimport\s*['"]([^'"]+)['"]/g,
++  /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
++  /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g
++]
++
++function specifiers(source) {
++  const text = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
++  const out = new Set()
++
++  for (const re of SPEC) {
++    for (const m of text.matchAll(re)) {
++      out.add(m[1])
++    }
++  }
++
++  return out
++}
++
++function bareName(spec) {
++  const parts = spec.split('/')
++
++  return spec.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]
++}
++
++function resolveBare(spec, fromFile) {
++  try {
++    return createRequire(fromFile).resolve(spec)
++  } catch (e) {
++    if (e.code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED' && e.code !== 'ERR_REQUIRE_ESM') {
++      throw e
++    }
++  }
++
++  // ESM-only package: require() cannot load it, but it is installed.
++  for (let dir = path.dirname(fromFile); ; dir = path.dirname(dir)) {
++    if (fs.existsSync(path.join(dir, 'node_modules', bareName(spec), 'package.json'))) {
++      return dir
++    }
++
++    if (dir === path.dirname(dir)) {
++      throw new Error(`Cannot find package '${bareName(spec)}'`)
++    }
++  }
++}
++
++function resolveRelative(spec, fromFile) {
++  const base = path.resolve(path.dirname(fromFile), spec)
++  const exts = ['.mjs', '.cjs', '.js', '.ts', '.mts', '.cts', '.json']
++
++  for (const cand of [base, ...exts.map(e => base + e)]) {
++    if (fs.existsSync(cand) && fs.statSync(cand).isFile()) {
++      return cand
++    }
++  }
++
++  throw new Error(`Cannot find file '${spec}'`)
++}
++
++export function check(entries) {
++  const failures = []
++  const seen = new Set()
++
++  const visit = (file, via) => {
++    if (seen.has(file)) {
++      return
++    }
++
++    seen.add(file)
++
++    if (!CODE.test(file)) {
++      return
++    }
++
++    for (const spec of specifiers(fs.readFileSync(file, 'utf8'))) {
++      try {
++        if (spec.startsWith('node:') || builtins.has(spec)) {
++          continue
++        }
++
++        if (spec.startsWith('.')) {
++          visit(resolveRelative(spec, file), via)
++        } else {
++          resolveBare(spec, file)
++        }
++      } catch (e) {
++        failures.push(`${path.relative(root, file)} (from ${via}): '${spec}': ${e.message.split('\n')[0]}`)
++      }
++    }
++  }
++
++  for (const rel of entries) {
++    const file = path.join(root, rel)
++
++    if (fs.existsSync(file)) {
++      visit(file, rel)
++    } else {
++      failures.push(`${rel}: entry point missing`)
++    }
++  }
++
++  return { failures, files: seen.size }
++}
++
++if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
++  const entries = entryPoints()
++
++  if (process.argv.includes('--list')) {
++    console.log(entries.join('\n'))
++  } else {
++    const { failures, files } = check(entries)
++
++    if (failures.length) {
++      console.error(`${failures.length} unresolved import(s) under the runtime-only install:`)
++
++      for (const f of failures) {
++        console.error(`  ${f}`)
++      }
++
++      process.exit(1)
++    }
++
++    console.log(`${entries.length} driver entry points, ${files} files: every import resolves`)
++  }
++}
+diff --git a/.github/workflows/js-tests.yml b/.github/workflows/js-tests.yml
+index 1f0140597e5..5674babc67c 100644
+--- a/.github/workflows/js-tests.yml
++++ b/.github/workflows/js-tests.yml
+@@ -192,3 +192,34 @@ jobs:
+           npm run build --workspace ui-tui
+       - name: Check the checkout is clean
+         uses: ./.github/actions/check-clean-worktree
++
++  # The E2E drivers (desktop-bundle-smoke, install-e2e-run/-macos-run/
++  # -windows-run) install ONLY the runtime deps of tests-js and run
++  # tests/install/e2e-assets drivers. They run on release or dispatch on hosted
++  # macOS/Windows runners, so a driver that imports a devDependency (vitest,
++  # jsdom, node-pty, ...) first fails at release time. This job installs that
++  # exact shape and resolves every import of every driver entry point. Its
++  # install command must stay identical to theirs
++  # (tests/ci/test_runtime_install_shape.py). [daveey]
++  runtime-install-shape:
++    name: E2E driver runtime-install checks
++    runs-on: [self-hosted, hermes-hub]
++    timeout-minutes: 10
++    steps:
++      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
++        with:
++          ref: ${{ inputs.commit }}
++          persist-credentials: false
++      - uses: ./.github/actions/setup-pm
++        with:
++          toolchain: all
++          extras: '[]'
++          cache-node: false
++      - name: Install locked chat driver dependencies
++        run: npm ci --workspace tests-js --include-workspace-root --omit=dev --ignore-scripts --no-audit --no-fund
++      - name: Resolve every driver import
++        run: |
++          node .github/scripts/check-runtime-driver-imports.mjs
++          node --test tests/install/e2e-assets/windows-bundled-helpers.test.mjs
++      - name: Check the checkout is clean
++        uses: ./.github/actions/check-clean-worktree
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index f9e139d592b..b4ba7a556ec 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -107,6 +107,10 @@ _FRONTEND_FILES = {
+ # change to the bridge or to the Python adapter that speaks its protocol
+ # selects ``frontend``.
+ _WHATSAPP_BRIDGE = ("scripts/whatsapp-bridge/", "plugins/platforms/whatsapp/")
++# Code that tests-js imports or spawns (install drivers, the e2e matrix
++# generator, scripts/generate-icons.mjs): a change there must run the tests that
++# exercise it and the runtime-only install-shape job. [daveey]
++_TESTS_JS_INPUTS = ("tests/install/", "scripts/sandbox/")
+ _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
+ _DOCKER_META = ("docker/", ".hadolint.yaml", "Dockerfile", ".dockerignore") # docker setup
+ _NIX_PATHS = ("nix/",) # nix files
+@@ -644,7 +648,8 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
+     python_prod = any(not _py_irrelevant(f) and not _py_test_only(f) for f in code)
+     frontend = any(
+         f.startswith(_FRONTEND) or f in _ROOT_NPM or f in _FRONTEND_FILES
+-        or f.startswith(("tests-js/",) + _WHATSAPP_BRIDGE)
++        or f.startswith(("tests-js/",) + _WHATSAPP_BRIDGE + _TESTS_JS_INPUTS)
++        or f == "scripts/generate-icons.mjs"
+         or (f.startswith("scripts/build/") and f.endswith((".mjs", ".js", ".ts")))
+         for f in files
+     )
+diff --git a/tests/ci/test_runtime_install_shape.py b/tests/ci/test_runtime_install_shape.py
+new file mode 100644
+index 00000000000..9ef4cce1630
+--- /dev/null
++++ b/tests/ci/test_runtime_install_shape.py
+@@ -0,0 +1,114 @@
++"""The runtime-only tests-js install shape is checked on the PRs that can break it.
++
++desktop-bundle-smoke.yml and the install-e2e-*-run.yml workflows install
++``npm ci --workspace tests-js --include-workspace-root --omit=dev`` and launch
++tests/install/e2e-assets drivers. They run on release/dispatch only, so a driver
++importing a devDependency first failed at release time. js-tests.yml's
++``runtime-install-shape`` job installs the same shape on every frontend-lane PR
++and resolves every driver import. These tests keep the two in sync.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import re
++from pathlib import Path
++
++import pytest
++
++_REPO = Path(__file__).resolve().parents[2]
++_spec = importlib.util.spec_from_file_location(
++    "classify_changes", _REPO / "scripts/ci/classify_changes.py"
++)
++assert _spec and _spec.loader
++_classify = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(_classify)
++
++_WORKFLOWS = [
++    "desktop-bundle-smoke.yml",
++    "install-e2e-run.yml",
++    "install-e2e-macos-run.yml",
++    "install-e2e-windows-run.yml",
++]
++_INSTALL = re.compile(r"^\s*run:\s*(npm ci --workspace tests-js .*)$", re.MULTILINE)
++_ASSETS = _REPO / "tests/install/e2e-assets"
++_CHECKER = (_REPO / ".github/scripts/check-runtime-driver-imports.mjs").read_text(
++    encoding="utf-8"
++)
++
++
++def _yaml(rel: str):
++    yaml = pytest.importorskip("hermes_yaml")
++    return yaml.safe_load((_REPO / rel).read_text(encoding="utf-8-sig"))
++
++
++def _install_commands(workflow: str) -> list[str]:
++    text = (_REPO / ".github/workflows" / workflow).read_text(encoding="utf-8")
++    return [m.strip() for m in _INSTALL.findall(text)]
++
++
++def test_every_runtime_install_in_the_workflows_is_one_shape():
++    shapes = {c for w in _WORKFLOWS for c in _install_commands(w)}
++    assert len(shapes) == 1, shapes
++    assert "--omit=dev" in next(iter(shapes))
++    # desktop-bundle-smoke 1, install-e2e-run 1, macos 2, windows 2: a new
++    # install step must be added to this count on purpose.
++    assert sum(len(_install_commands(w)) for w in _WORKFLOWS) == 6
++
++
++def test_job_installs_exactly_that_shape_and_gates_the_merge():
++    job = _yaml(".github/workflows/js-tests.yml")["jobs"]["runtime-install-shape"]
++    runs = [s["run"].strip() for s in job["steps"] if "run" in s]
++    assert runs[0] == _install_commands(_WORKFLOWS[0])[0]
++    assert "check-runtime-driver-imports.mjs" in runs[1]
++    assert "windows-bundled-helpers.test.mjs" in runs[1]
++    assert not job.get("continue-on-error")
++    assert "if" not in job
++    ci = _yaml(".github/workflows/ci.yaml")
++    assert "frontend" in ci["jobs"]["js-tests"]["if"]
++    assert "js-tests" in ci["jobs"]["all-checks-pass"]["needs"]
++
++
++def test_checker_covers_every_node_script_the_launchers_run():
++    """Each e2e-assets .mjs/.cjs/.ts a launcher or workflow names is a checked entry point."""
++    launchers = list((_REPO / "tests/install").glob("*.sh")) + list(
++        (_REPO / "tests/install").glob("*.ps1")
++    )
++    launchers += [_REPO / ".github/workflows" / w for w in _WORKFLOWS]
++    named: set[str] = set()
++    for path in launchers:
++        text = path.read_text(encoding="utf-8", errors="replace")
++        named |= set(
++            re.findall(r"([A-Za-z0-9_-]+(?:\.[a-z]+)*\.(?:mjs|cjs|ts))\b", text)
++        )
++    on_disk = {p.name for p in _ASSETS.iterdir() if p.suffix in {".mjs", ".cjs", ".ts"}}
++    launched = named & on_disk
++    # Guards the pattern itself: these are launched by the scripts today.
++    assert {
++        "desktop-smoke.ts",
++        "bundle-inputs.mjs",
++        "launch-from-spec.mjs",
++        "windows-bundled-helpers.test.mjs",
++    } <= launched
++    # The checker globs the whole assets dir, so every launched file is covered.
++    assert "readdirSync(dir)" in _CHECKER
++    assert "const ASSETS = 'tests/install/e2e-assets'" in _CHECKER
++    # Launched from outside the assets dir.
++    assert "tests-js/scripts/mock-provider-config.ts" in _CHECKER
++    for ps1 in ("desktop-smoke-windows.ps1",):
++        assert "mock-provider-config.ts" in (_ASSETS / ps1).read_text(encoding="utf-8")
++
++
++@pytest.mark.parametrize(
++    "path",
++    [
++        "tests/install/e2e-assets/desktop-smoke.ts",
++        "tests/install/windows-e2e.ps1",
++        "scripts/sandbox/generate-e2e-matrix.mjs",
++        "scripts/generate-icons.mjs",
++        ".github/scripts/check-runtime-driver-imports.mjs",
++        "tests-js/scripts/mock-provider-config.ts",
++    ],
++)
++def test_every_input_of_the_shape_selects_the_frontend_lane(path):
++    assert _classify.classify([path])["frontend"] is True
+-- 
+2.55.0
+

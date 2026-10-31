@@ -1,0 +1,188 @@
+From 0a15725438e1dec9043d9648edacfb3f09e2b7ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 21:21:23 +0000
+Subject: [PATCH] fix(kanban): cancel placed copy on manual completion [daveey]
+
+---
+ hermes_cli/kanban_db.py                   |  9 ++-
+ hermes_cli/kanban_placement_forward.py    | 30 +++++++-
+ tests/hermes_cli/test_kanban_placement.py | 84 +++++++++++++++++++++++
+ 3 files changed, 121 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 48738c91011..f1b4334b3ae 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2735,11 +2735,15 @@ def complete_task(
+     summary: Optional[str] = None, metadata: Optional[dict] = None,
+     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
+     fire_lifecycle_hook: bool = True, force: bool = False, goal_verification=None,
++    placement_settled: bool = False,
+ ) -> bool:
+     """``running|ready|blocked|review -> done``; records ``result``.
+ 
+     ``ready`` is accepted for manual CLI completion, ``review`` for human
+-    approval. A ``running`` task under a live claim is only completed with
++    approval. ``placement_settled`` is internal to the placement forwarder: it
++    suppresses remote cancellation when mirroring a successful remote result.
++    Other successful completions archive outstanding placed work.
++    A ``running`` task under a live claim is only completed with
+     proof of ownership (``expected_run_id``) or ``force=True`` (explicit
+     operator override) — otherwise :class:`LiveClaimError`, the same fence
+     :func:`request_review` applies. With no active run the handoff fields survive via
+@@ -2845,6 +2849,9 @@ def complete_task(
+             run_id=run_id,
+         )
+     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
++    if not placement_settled:
++        from hermes_cli.kanban_placement_forward import forward_completion
++        forward_completion(conn, task_id)
+     # Success wipes the breaker counter (history stays on the event log).
+     _clear_failure_counter(conn, task_id)
+     recompute_ready(conn)  # separate txn so children see ``done``
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index afc508bae90..f0fdb01c918 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -248,6 +248,34 @@ def sweep_unresolved_archives(conn: sqlite3.Connection, *, now: Optional[float]
+     return sent
+ 
+ 
++def forward_completion(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """Manual origin completion cancels outstanding placed work, never completes it as successful.
++
++    Reuse archive's durable queue and audit event. Unknown/offline observations still send;
++    only a confirmed terminal copy is left untouched. Called after local completion commits.
++    """
++    try:
++        st = state(conn, task_id)
++        if not st or not (st.get("request_id") or st.get("remote_task_id")):
++            return None
++        from hermes_cli import kanban_placement as kp
++        from hermes_cli import kanban_wait_replica as replica
++        rtid = st.get("remote_task_id") or kp.remote_task_id(st["request_id"])
++        if rtid:
++            try:
++                # Local fresh snapshot only: do not hold completion/child release on sleeping-host SSH.
++                rc, out = replica.check(st["target"], rtid, until=UNTIL)
++                words = (out or "").split()
++                if rc == 0 and len(words) >= 2 and words[0] == rtid and words[1] in UNTIL:
++                    return None
++            except Exception:  # health: allow BLE001 -- unavailable observation must not prevent durable cancellation
++                pass
++        return forward_archive(conn, task_id)
++    except Exception as exc:  # health: allow BLE001 -- courtesy forwarding must not undo a committed completion
++        print(f"placement completion forward failed: {exc!r}", file=sys.stderr)
++        return None
++
++
+ # --- the forwarder -----------------------------------------------------------------------------
+ 
+ def _iso(ts: float) -> str:
+@@ -361,7 +389,7 @@ class Forwarder:
+         status = words[1] if rc == 0 and len(words) >= 2 and words[0] == rtid else ""
+         if status == "done":
+             ok = kb.complete_task(
+-                self.conn, self.task_id, expected_run_id=self.run_id,
++                self.conn, self.task_id, expected_run_id=self.run_id, placement_settled=True,
+                 summary=(f"Ran on {target} as {rtid} (deferred placement), which is done. Its handoff is on "
+                          f"that card: cross_task @task:default@{target}/{rtid}."),
+                 metadata={"placement": {"gateway": target, "remote_task_id": rtid}})
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 97226e23c3f..4a4a97ac261 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1420,6 +1420,90 @@ def _forwarded_card(mac, monkeypatch, conn):
+     return child
+ 
+ 
++@pytest.mark.parametrize("rc", [0, 3])
++def test_manual_completion_archives_forwarded_copy_online_or_queued(mac, monkeypatch, rc):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        mac["result"]["rc"] = rc
++        assert kb.complete_task(conn, child, summary="Finished manually", force=True)
++        assert kb.get_task(conn, child).status == "done"
++        assert len(mac["calls"]) == 1
++        argv = mac["calls"][0]
++        assert argv[1:6] == ["request", "hub", "tasks", f"default/default/{HUB_TID}", "archive"]
++        assert kpf.archive_forward_view(conn, child)["status"] == "pending"
++        rid = argv[argv.index("--id") + 1]
++        assert mac["hub"].execute("SELECT state FROM sent WHERE id=?", (rid,)).fetchone()[0] == "sent"
++        mac["hub"].execute("UPDATE sent SET state='done' WHERE id=?", (rid,))
++        mac["hub"].commit()
++        assert kpf.archive_forward_view(conn, child)["status"] == "archived"
++        assert not kb.complete_task(conn, child, summary="Again", force=True)
++        assert len(mac["calls"]) == 1
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_manual_completion_preserves_terminal_remote_copy(mac, monkeypatch, status):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_wait_replica as replica
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        monkeypatch.setattr(replica, "check", lambda *a, **kw: (0, f"{HUB_TID} {status}"))
++        assert kb.complete_task(conn, child, summary="Finished manually", force=True)
++        assert mac["calls"] == []
++
++
++@pytest.mark.parametrize("observation", ["offline", "stale", "exception", "wrong-id"])
++def test_completion_queues_archive_when_observation_is_unknown(mac, monkeypatch, observation):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_wait_replica as replica
++    from hermes_cli import kanban_wait_check as kwait
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        def observe(*a, **kw):
++            if observation == "exception":
++                raise OSError("unavailable")
++            return {"offline": (2, "unavailable"), "stale": (3, f"{HUB_TID} done (stale)"),
++                    "wrong-id": (0, "t_other done")}[observation]
++        monkeypatch.setattr(replica, "check", observe)
++        monkeypatch.setattr(kwait, "check_remote", lambda *a, **kw: pytest.fail("must not SSH on completion"))
++        mac["result"]["rc"] = 3
++        assert kb.complete_task(conn, child, summary="Manual override", force=True)
++        assert len(mac["calls"]) == 1
++
++
++def test_settle_completion_never_forwards_archive(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        f = _forwarder(conn, child, mac, monkeypatch, check=(0, f"{HUB_TID} done"))
++        assert f.run() == "completed"
++        assert kb.get_task(conn, child).status == "done"
++        assert mac["calls"] == []
++        assert kpf.archive_forward_view(conn, child) is None
++
++
++def test_refused_and_plain_completion_do_not_forward(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        assert not kb.complete_task(conn, child, summary="Still scheduled", force=True)
++        plain = kb.create_task(conn, title="plain", assignee="default")
++        kb.recompute_ready(conn)
++        assert kb.complete_task(conn, plain, summary="Local only", force=True)
++        assert mac["calls"] == []
++
++
+ def test_archiving_a_forwarded_card_archives_the_remote_copy(mac, monkeypatch):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+-- 
+2.55.0
+
