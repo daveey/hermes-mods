@@ -43,6 +43,10 @@ _TURN_PUBLISHED: dict[str, set] = {}
 def _published(owner: dict, request: dict) -> dict:
     sid = (owner or {}).get('storedSessionId')
     if sid and isinstance(request, dict) and request.get('requestId'):
+        # Bounded: sessions whose turn never reaches the reply transform (ineligible/background) are evicted
+        # oldest-first instead of accumulating for the life of the process.
+        while len(_TURN_PUBLISHED) >= 256 and sid not in _TURN_PUBLISHED:
+            _TURN_PUBLISHED.pop(next(iter(_TURN_PUBLISHED)))
         _TURN_PUBLISHED.setdefault(sid, set()).add(request['requestId'])
     return request
 _BACKFILLED = False
