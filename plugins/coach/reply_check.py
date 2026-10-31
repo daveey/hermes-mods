@@ -93,7 +93,19 @@ REPORT_RE = re.compile(
     r"|\bsame (?:[\w-]+ )?(?:problem|issue|bug) (?:applies|exists|affects)\b|\b(?:are|is) also (?:affected|broken)\b"
     # A workaround handed to the user instead of a fix ("if the job holds one, pressing 'Post now' ... will work").
     r"|\bif\b[^.\n]{0,120}?,\s*(?:pressing|clicking|running|re-?running|tapping)\b[^.\n]{0,120}?\bwill (?:work|fix|clear)"
-    r"|\byou can (?:press|click|tap|run|re-?run|hit)\b[^.\n]{0,80}?\bto\b",
+    r"|\byou can (?:press|click|tap|run|re-?run|hit)\b[^.\n]{0,80}?\bto\b"
+    # Owner named as working on it, with no word of a check (Oct 30 human-turn misses: "Card X is working on that now",
+    # "the card is doing these now", "the Steward is handling it", "the other session owns remediation", "fix work will
+    # start once that hold is lifted", "it's waiting until your MacBook is less busy").
+    r"|\b(?:is|are) (?:now |still )?(?:working on|handling|doing|seeing) (?:that|this|it|these|those|them)\b"
+    r"|\bowns? (?:the )?(?:remediation|fix|rest|follow-?ups?|retest\w*|verification)\b"
+    r"|\bwill (?:start|begin|resume) once\b|\bno (?:fix|work) has (?:started|begun)\b"
+    r"|\b(?:is|are|it'?s|still) waiting (?:until|for (?:hermes-sync|the next|your|a restart|it to))\b"
+    # Leftovers waved off as small or optional ("moving it over is optional tidy-up", "I left that alone", "a leftover
+    # test screenshot", "fixing it means making sure ...", "the changes require a gateway restart", "not posted").
+    r"|\boptional (?:tidy-?up|clean-?up|follow-?up)\b|\bleft (?:that|it|this|them) (?:alone|as (?:is|it is))\b"
+    r"|\bleftovers?\b|\b(?:fixing|solving) (?:it|this|that) (?:means|would mean|requires|needs)\b"
+    r"|\b(?:requires?|needs?) an? (?:\w+ )?restart\b|\bnot posted\b|\bthe blocker is\b|\bnext question is\b",
     re.I)
 # An explicit scope limit in the user's ask: a diagnosis is what they asked for, so report_only never applies.
 SCOPE_LIMIT_RE = re.compile(
@@ -992,6 +1004,16 @@ probabilities (0-1):
     tool log closes or hands it off, score it high (0.7+), the same as a pure diagnosis.
   * Passing a leftover to a card, session or owner counts as starting it only when the message says what was sent
     AND the tool log shows the send. A bare "the owner/card has it" does not.
+  * Owner claims need a check. "Card X is working on that now", "the card is doing these now", "X is handling it",
+    "the other session owns remediation", "fix work will start once the hold is lifted", "it's waiting until ..." score
+    HIGH (0.7+) unless the tool log shows this turn's check of that owner (kanban_show, process poll, reading its
+    session) and the message reports what the check found. A message SENT to an owner is not a check that it moves.
+  * Small or optional leftovers still count. A closing "one limit / one gap / one small thing", "I left that alone",
+    "optional tidy-up", "I didn't touch it", "haven't checked X", "needs a restart / the next sync to take effect", "not
+    posted" about something the agent could do or check with its access scores 0.7+, even when the main work is done
+    and verified. Calling a leftover minor, harmless or someone else's does not excuse it.
+  * Be consistent: if your evidence names an open, agent-fixable leftover that nothing in the tool log closes or hands
+    off, report_only must be at least 0.7.
   Score it LOW when: the user explicitly limited scope ("analysis only", "just tell me", "plan first", "don't change
   anything"); the problem genuinely needs the user's hands, password, money, a physical device or a decision only
   they can make, and the message says so; the message is a plan the user asked for; no unresolved problem is left;
