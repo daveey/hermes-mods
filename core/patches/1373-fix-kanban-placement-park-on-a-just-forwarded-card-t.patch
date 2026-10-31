@@ -1,0 +1,139 @@
+From 5dc666b7b97cae2715237edffef3f13a3e0fdfbf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 01:45:49 +0000
+Subject: [PATCH] fix(kanban-placement): park on a just-forwarded card the
+ replica hasn't synced instead of the clock
+
+confirm_remote raised INVALID_AWAITING (not found in <gw> replica) right after a successful forward; main() then parked on the clock for 10 min with a misleading 'forward step failed'. Retry briefly, then park on the card unconfirmed; failure reasons now carry the exception text.
+---
+ hermes_cli/kanban_placement_forward.py    | 33 +++++++++++----
+ tests/hermes_cli/test_kanban_placement.py | 51 +++++++++++++++++++++++
+ 2 files changed, 75 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 8dd69b940bb..9fae8121cab 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -40,6 +40,8 @@ REQUEUE_SECONDS = 600          # retry a not-live target / a still-queued reques
+ SETTLE_PARK_SECONDS = 14 * 86400  # timer backstop of the settle park; the wake probe ends it first
+ CHECK_EVERY = 300
+ AWAIT_BUDGET = 45.0
++CONFIRM_RETRIES = 2            # confirm a just-forwarded card this many extra times before parking unconfirmed
++CONFIRM_RETRY_DELAY = 3.0
+ ARCHIVE_AWAIT_BUDGET = 5.0     # archive: wait this long for the target's card id before recording ``unresolved``
+ ARCHIVE_SWEEP_GIVE_UP = 7 * 86400  # the dispatcher sweep stops retrying an ``unresolved`` archive after this
+ CANCEL_INTENT = "placement_cancel_intent"  # written in the terminal txn: the placed copy must be cancelled
+@@ -456,6 +458,7 @@ class Forwarder:
+         from hermes_cli import kanban_wait_check as kwait
+         self.conn, self.task_id, self.run_id = conn, task_id, run_id
+         self.now = now or time.time
++        self.sleep = time.sleep
+         self.cfg = kp.config()
+         self.self_gw = reg.self_gateway() or "local"
+         self.hub_cli = reg.hub_cli_path(self.cfg.get("hub_cli"))
+@@ -551,14 +554,26 @@ class Forwarder:
+         from hermes_cli import kanban_awaiting as kaw
+         from hermes_cli import kanban_db as kb
+         awaiting = {"kind": "card", "ref": rtid, "gateway": target}
+-        try:
+-            kaw.confirm_remote(awaiting)  # ssh, before the write txn
+-        except kaw.AwaitingError as exc:
+-            # It finished between the settle read and this confirm: settle it (completes this card), once.
+-            if exc.code != kaw.PRODUCER_DONE or getattr(self, "_resettled", False):
+-                raise
+-            self._resettled = True
+-            return self._settle(kb.get_task(self.conn, self.task_id), target, rtid)
++        for attempt in range(CONFIRM_RETRIES + 1):
++            try:
++                kaw.confirm_remote(awaiting)  # ssh, before the write txn
++                break
++            except kaw.AwaitingError as exc:
++                # It finished between the settle read and this confirm: settle it (completes this card), once.
++                if exc.code == kaw.PRODUCER_DONE and not getattr(self, "_resettled", False):
++                    self._resettled = True
++                    return self._settle(kb.get_task(self.conn, self.task_id), target, rtid)
++                if exc.code != kaw.INVALID_AWAITING:
++                    raise  # archived/triage producer: genuinely not live
++                # The target just made this card and its replica has not synced it yet (``not found in <gw>
++                # replica``), or ssh is down. The id came from the target's own create outcome, so it exists:
++                # retry briefly, then park on it anyway; the wake probe re-reads it every CHECK_EVERY.
++                if attempt < CONFIRM_RETRIES:
++                    self.sleep(CONFIRM_RETRY_DELAY)
++                    continue
++                print(f"placement forward: {rtid} on {target} not confirmable yet ({exc.code}: {str(exc)[:160]}); "
++                      "parking on it unconfirmed", flush=True)
++                kaw._REMOTE_CONFIRMED[(target, rtid)] = (time.monotonic(), "just forwarded; not in replica yet")
+         ok = kb.schedule_task(
+             self.conn, self.task_id, expected_run_id=self.run_id, awaiting=awaiting,
+             wake_check=wake_probe(target, rtid), check_every=CHECK_EVERY,
+@@ -592,7 +607,7 @@ def main(argv: Optional[list] = None) -> int:
+                 st = state(conn, task_id)
+                 if st and (st.get("request_id") or st.get("remote_task_id")):
+                     # Already sent: a local run would duplicate it. Retry the forward later.
+-                    action = fwd._park_clock(f"forward step failed ({type(exc).__name__}); retrying")
++                    action = fwd._park_clock(f"forward step failed ({type(exc).__name__}: {str(exc)[:160]}); retrying")
+                 else:
+                     action = fwd._cancel(f"forward failed: {exc!r}"[:400])
+     except Exception as exc:
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 942b745862d..062efee7c8c 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1675,3 +1675,54 @@ def test_unresolved_archive_sweep_gives_up_after_seven_days_with_a_comment(mac,
+         kpf.sweep_unresolved_archives(conn, now=time.time() + 30 * 86400)  # not swept again
+         assert len(kpf._archive_events(conn, child)) == 2
+     assert _archive_requests(mac) == []
++
++
++def test_just_forwarded_card_the_replica_has_not_synced_parks_on_the_card_not_the_clock(mac, monkeypatch):
++    """confirm_remote says ``not found in <gw> replica`` right after a forward: retry, then a card-wait park."""
++    from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    calls = []
++
++    def unsynced(awaiting):
++        calls.append(awaiting["ref"])
++        raise kaw.AwaitingError(kaw.INVALID_AWAITING, f"cannot confirm producer card {awaiting['ref']}: not found")
++
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="Orchestrate", assignee="default")
++        created = json.loads(kt._handle_create({"title": "Fix the flaky lint", "body": "Push it.", "parents": [parent],
++                                                "session_id": "20261027_183000_abc123"}))
++        kb.complete_task(conn, parent, summary="fanned out", force=True)
++        kb.recompute_ready(conn)
++        child = created["task_id"]
++        f = _forwarder(conn, child, mac, monkeypatch)
++        monkeypatch.setattr(kaw, "confirm_remote", unsynced)
++        f.sleep = lambda s: None
++        assert f.run() == "parked"
++        assert len(calls) == 3  # first try + 2 retries
++        task = kb.get_task(conn, child)
++        assert task.status == "scheduled"
++        aw, _ = kaw._latest_park(conn, child)
++        assert aw["kind"] == "card" and aw["ref"] == HUB_TID and aw["gateway"] == "hub", aw
++
++
++def test_archived_producer_is_not_parked_on(mac, monkeypatch):
++    from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    def archived(awaiting):
++        raise kaw.AwaitingError(kaw.AGENT_ACTION_WAIT, "the producer card is not live")
++
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="Orchestrate", assignee="default")
++        created = json.loads(kt._handle_create({"title": "Fix the flaky lint", "body": "Push it.", "parents": [parent],
++                                                "session_id": "20261027_183000_abc123"}))
++        kb.complete_task(conn, parent, summary="fanned out", force=True)
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, created["task_id"], mac, monkeypatch)
++        monkeypatch.setattr(kaw, "confirm_remote", archived)
++        with pytest.raises(kaw.AwaitingError):
++            f.run()
+-- 
+2.55.0
+

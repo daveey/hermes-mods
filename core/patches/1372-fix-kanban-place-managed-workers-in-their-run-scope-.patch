@@ -1,0 +1,648 @@
+From cb4ac494b00a2dbcdfe0c7cf508e908db88d0663 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 01:57:03 +0000
+Subject: [PATCH] fix(kanban): place managed workers in their run scope and
+ bound the aggregate pool (#396)
+
+* fix(kanban): place managed workers in their run scope and bound the aggregate pool
+
+The real worker is a gateway Popen child, so it ran in the uncapped hermes-gateway.service
+while only the ~50MB submitter sat in the per-run 8GiB scope. Several runs thrashed host
+memory/IO (PSI full 40%, load 222) until worker_receipt_timeout tripped 12 cards.
+Move the spawned child into the verified claim's scope (fail closed, kill+reap) and put all
+run scopes in hermes-kanban.slice (MemoryHigh=70%, MemoryMax=80%). [daveey]
+
+* fix(kanban): wait for submitter PID publication before verifying run scope
+---
+ gateway/session_kanban_scope.py               | 130 +++++++++
+ gateway/session_managed_worker.py             |   8 +-
+ hermes_cli/kanban_aggregate_scope.py          |  30 +++
+ hermes_cli/kanban_db_dispatch.py              |   6 +-
+ tests/gateway/fixtures/kanban_owner_probe.py  |  19 +-
+ .../test_managed_kanban_scope_placement.py    | 252 ++++++++++++++++++
+ .../hermes_cli/test_kanban_aggregate_scope.py |  42 +++
+ .../test_kanban_gateway_restart_handoff.py    |   7 +
+ .../test_kanban_worker_scope_failure.py       |   2 +
+ 9 files changed, 484 insertions(+), 12 deletions(-)
+ create mode 100644 gateway/session_kanban_scope.py
+ create mode 100644 hermes_cli/kanban_aggregate_scope.py
+ create mode 100644 tests/gateway/test_managed_kanban_scope_placement.py
+ create mode 100644 tests/hermes_cli/test_kanban_aggregate_scope.py
+
+diff --git a/gateway/session_kanban_scope.py b/gateway/session_kanban_scope.py
+new file mode 100644
+index 00000000000..a3f6fba7963
+--- /dev/null
++++ b/gateway/session_kanban_scope.py
+@@ -0,0 +1,130 @@
++"""Place a managed Kanban worker in its run's per-run systemd scope (Linux cgroup v2).
++
++The dispatcher's submitter runs inside ``hermes-worker-kanban-<task>-run-<n>.scope`` (memory-capped),
++but the real worker is a Popen child of the gateway and would stay in the uncapped gateway unit.
++Right after the spawn, while the child still waits for its bootstrap and the Popen is unreaped (so
++the PID cannot be reused), the child's PID is written to the scope's ``cgroup.procs``. Descendants
++inherit the cgroup. No scope claimed (non-Linux, no systemd, submitter not in a run scope): unchanged.
++A claimed scope that cannot be joined fails closed: the new child is killed and reaped.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import sqlite3
++import sys
++import threading
++import time
++from pathlib import Path
++
++CGROUP_ROOT = Path('/sys/fs/cgroup')
++_UNIT = re.compile(r'hermes-worker-kanban-(?P<task>.+)-run-(?P<run>\d+)\.scope')
++
++
++class ScopePlacementError(RuntimeError):
++    pass
++
++
++def _cgroup_path(pid):
++    """The unified-hierarchy cgroup of ``pid`` ('/a/b'), or None if unreadable/not v2."""
++    try:
++        text = Path(f'/proc/{int(pid)}/cgroup').read_text(encoding='utf-8')
++    except (OSError, ValueError):
++        return None
++    for line in text.splitlines():
++        if line.startswith('0::'):
++            return line[3:]
++    return None
++
++
++def resolve_run_scope(policy):
++    """The existing cgroup directory of this attempt's run scope, or None when none is claimed.
++
++    Raises ScopePlacementError when a run scope is claimed but inconsistent (stale claim, wrong scope).
++    """
++    if not sys.platform.startswith('linux') or not policy or not getattr(policy, 'kanban_json', None):
++        return None
++    if not (CGROUP_ROOT / 'cgroup.controllers').exists():
++        return None
++    context = json.loads(policy.kanban_json)
++    task_id, run_id, claim, db = (context.get(k) for k in ('task_id', 'run_id', 'claim_lock', 'db'))
++    if not (task_id and isinstance(run_id, int) and claim and db):
++        return None
++    try:
++        conn = sqlite3.connect(Path(db).resolve().as_uri() + '?mode=ro', uri=True, timeout=5)
++    except sqlite3.Error as exc:
++        raise ScopePlacementError(f'kanban_scope_db_unreadable: {exc}') from exc
++    try:
++        # Popen can exec the submitter before the dispatcher publishes its PID. This
++        # runs off-loop before spawn: wait boundedly, revalidating the claim each time.
++        deadline = time.monotonic() + 10
++        while True:
++            task = conn.execute('SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?', (task_id,)).fetchone()
++            run = conn.execute('SELECT worker_pid FROM task_runs WHERE id=? AND task_id=? AND status=? AND claim_lock=?',
++                               (run_id, task_id, 'running', claim)).fetchone()
++            if not task or tuple(task) != ('running', run_id, claim) or not run:
++                raise ScopePlacementError('kanban_scope_stale_claim')
++            if run[0] or time.monotonic() >= deadline:
++                break
++            threading.Event().wait(.05)
++    except sqlite3.Error as exc:
++        raise ScopePlacementError(f'kanban_scope_db_unreadable: {exc}') from exc
++    finally:
++        conn.close()
++    submitter = run[0]
++    path = _cgroup_path(submitter) if submitter else None
++    if not path:
++        raise ScopePlacementError('kanban_scope_submitter_missing')
++    match = _UNIT.fullmatch(path.rsplit('/', 1)[-1])
++    if match is None:
++        return None  # submitter not in a per-run scope (no systemd-run): unchanged
++    if (match['task'], int(match['run'])) != (task_id, run_id):
++        raise ScopePlacementError('kanban_scope_mismatch')
++    target = CGROUP_ROOT / path.lstrip('/')
++    if not (target / 'cgroup.procs').is_file():
++        raise ScopePlacementError('kanban_scope_missing')
++    return target
++
++
++def migrate(pid, target):
++    """Write ``pid`` into ``target``'s cgroup.procs and confirm via /proc; no shell."""
++    expected = '/' + str(target.relative_to(CGROUP_ROOT)).strip('/')
++    try:
++        fd = os.open(target / 'cgroup.procs', os.O_WRONLY)
++        try:
++            os.write(fd, f'{pid}\n'.encode())
++        finally:
++            os.close(fd)
++    except OSError as exc:
++        raise ScopePlacementError(f'kanban_scope_migrate_failed: {exc}') from exc
++    if _cgroup_path(pid) != expected:
++        raise ScopePlacementError('kanban_scope_unconfirmed')
++
++
++def placing_spawn(spawn, policy):
++    """``spawn`` wrapped to run synchronously: resolve scope, spawn, migrate, or kill+reap and raise.
++
++    Meant for ``acquire_process``'s worker thread, which owns the returned handle afterwards.
++    """
++    def run(*args, **kwargs):
++        target = resolve_run_scope(policy)  # validated before anything is spawned
++        process = spawn(*args, **kwargs)
++        if target is None:
++            return process
++        try:
++            migrate(process.pid, target)
++        except BaseException:
++            from gateway.session_managed_worker import ManagedWorker
++            try:
++                ManagedWorker(process).close()
++            finally:
++                for stream in (process.stdin, process.stdout, process.stderr):
++                    if stream is not None:
++                        try:
++                            stream.close()
++                        except OSError:
++                            pass
++            raise
++        return process
++    return run
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index afd5117c089..57297743d2b 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -583,7 +583,7 @@ async def _settle_lost(authority, row, scope, recording):
+         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
+ 
+ 
+-async def _spawn_registered_worker(authority, ref, row):
++async def _spawn_registered_worker(authority, ref, row, policy=None):
+     """Spawn the turn's child and register it for Stops: ``(worker, process)``, or None when the spawn was cancelled (the
+     interrupted result is already recorded). The generation stays marked spawning until registration."""
+     spawning = _mark_spawning(authority, ref, row)
+@@ -594,7 +594,9 @@ async def _spawn_registered_worker(authority, ref, row):
+         from gateway.session_worker_spawn import acquire_process
+         from gateway.session_managed_worker_log import worker_log_path
+         log_path = worker_log_path(authority.profile_id)
+-        process = await acquire_process(subprocess.Popen, [sys.executable, '-m', 'agent.managed_worker'],
++        from gateway.session_kanban_scope import placing_spawn
++        process = await acquire_process(placing_spawn(lambda *a, **kw: subprocess.Popen(*a, **kw), policy),
++            [sys.executable, '-m', 'agent.managed_worker'],
+             cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
+             stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
+     except asyncio.CancelledError:
+@@ -655,7 +657,7 @@ async def execute_managed(authority, ref, row, policy):
+         return refusal
+     if _stopped_before_spawn(authority, ref, row):
+         return ''
+-    spawned = await _spawn_registered_worker(authority, ref, row)
++    spawned = await _spawn_registered_worker(authority, ref, row, policy)
+     if spawned is None:
+         return ''
+     worker, process = spawned
+diff --git a/hermes_cli/kanban_aggregate_scope.py b/hermes_cli/kanban_aggregate_scope.py
+new file mode 100644
+index 00000000000..d0d09d0933d
+--- /dev/null
++++ b/hermes_cli/kanban_aggregate_scope.py
+@@ -0,0 +1,30 @@
++"""Bound the sum of Kanban run scopes, not just each individual run.
++
++MemoryHigh starts reclaim at 70% of RAM; MemoryMax reserves at least 20%
++for the gateway/control plane. All boards/profiles in this user manager share
++one pool. The gateway itself is deliberately not moved into the pool.
++"""
++from functools import lru_cache
++import subprocess
++
++
++@lru_cache(maxsize=1)
++def configure_pool():
++    """Set runtime properties; only cache success, never launch unbounded on failure."""
++    try:
++        subprocess.run(
++            ['systemctl', '--user', 'set-property', '--runtime', 'hermes-kanban.slice',
++             'MemoryHigh=70%', 'MemoryMax=80%'], check=True,
++            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
++    except (OSError, subprocess.SubprocessError) as exc:
++        from tools.process_registry import RestartSafeScopeUnavailable
++        raise RestartSafeScopeUnavailable(f'Kanban aggregate memory budget unavailable: {exc}') from exc
++
++
++def bounded_scope(argv):
++    """Add the shared bounded slice only to the systemd scope wrapper, never worker args."""
++    if not argv or argv[0].rsplit('/', 1)[-1] != 'systemd-run' or '--scope' not in argv:
++        return argv
++    configure_pool()
++    at = argv.index('--') if '--' in argv else argv.index('--scope') + 1  # systemd-run option space only
++    return [*argv[:at], '--slice=hermes-kanban.slice', *argv[at:]]
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 9cc990b1149..fa9953e90e6 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -35,7 +35,7 @@ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as
+ from hermes_cli import kanban_db_dispatch_quota as _kbq
+ from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code_kind
+ from hermes_cli.kanban_db_dispatch_allowlist import _dispatch_profile_allowlist, dispatch_profile_allowlist_summary
+-from hermes_cli import kanban_worker_scope as _worker_scope
++from hermes_cli import kanban_worker_scope as _worker_scope, kanban_aggregate_scope as _aggregate_scope
+ from hermes_cli import kanban_host_reboot as _host_reboot, kanban_owner_unavailable as _ou  # [daveey]
+ from hermes_cli import kanban_owner_death as _owner_death  # [daveey]
+ from hermes_cli.kanban_db_dispatch_crash_accounting import _account_crashes  # [daveey]
+@@ -2974,8 +2974,8 @@ def _restart_safe_worker_argv(task: Task, command: list[str], board: Optional[st
+         require_restart_safe_scope=True,
+         outlives_parent=True,
+     ).argv)
+-    # Typed OOM recovery: a task whose last run(s) were OOM-killed gets a raised cap.
+-    return _worker_scope.apply_oom_recovery(argv, task.id, board)
++    # OOM recovery raises the cap; bounded_scope adds the shared pool (kanban_aggregate_scope)
++    return _aggregate_scope.bounded_scope(_worker_scope.apply_oom_recovery(argv, task.id, board))
+ 
+ 
+ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+diff --git a/tests/gateway/fixtures/kanban_owner_probe.py b/tests/gateway/fixtures/kanban_owner_probe.py
+index 281cd8e810c..6daa513b02b 100644
+--- a/tests/gateway/fixtures/kanban_owner_probe.py
++++ b/tests/gateway/fixtures/kanban_owner_probe.py
+@@ -99,16 +99,21 @@ def main():
+     env = dict(os.environ)
+     receipt, clients = {}, []
+     original_popen = subprocess.Popen
++    original_set_pid = dispatch._set_worker_pid
++    def set_pid(*args, **kwargs):
++        original_set_pid(*args, **kwargs)
++        if peer.mode == 'timeout':
++            # Model work now requires the published submitter PID to verify its
++            # cgroup. Gate after publication, never inside Popen before it returns.
++            assert peer.blocked.wait(55), 'managed worker did not reach loopback'
++            with closing(connect(board='owned')) as snapshot:
++                bound = snapshot.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_bound' "
++                                         "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++                receipt['managed_pid'] = json.loads(bound[0])['pid'] if bound else None
+     def spawn(*args, **kwargs):
+         child = original_popen(*args, **kwargs)
+         if 'hermes_cli.kanban_worker_client' in args[0]:
+             clients.append(child)
+-            if peer.mode == 'timeout':
+-                assert peer.blocked.wait(55), 'managed worker did not reach loopback'
+-                with closing(connect(board='owned')) as snapshot:
+-                    bound = snapshot.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_bound' "
+-                                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+-                    receipt['managed_pid'] = json.loads(bound[0])['pid'] if bound else None
+         return child
+     def wait_for(predicate):
+         deadline = time.monotonic() + 60
+@@ -120,6 +125,7 @@ def main():
+     try:
+         with daemon(root, home, env, barrier=False) as (_proc, desc):
+             subprocess.Popen = spawn
++            dispatch._set_worker_pid = set_pid
+             try:
+                 with closing(connect(board='owned')) as conn:
+                     from contextlib import nullcontext
+@@ -191,6 +197,7 @@ def main():
+                         assert task.status == 'ready' and task.consecutive_failures == 1 and run['outcome'] == 'timed_out', receipt
+             finally:
+                 subprocess.Popen = original_popen
++                dispatch._set_worker_pid = original_set_pid
+             if peer.mode != 'complete':
+                 return
+             assert receipt['client_exit'] == ('clean_exit', 0), receipt
+diff --git a/tests/gateway/test_managed_kanban_scope_placement.py b/tests/gateway/test_managed_kanban_scope_placement.py
+new file mode 100644
+index 00000000000..8893bb92364
+--- /dev/null
++++ b/tests/gateway/test_managed_kanban_scope_placement.py
+@@ -0,0 +1,252 @@
++"""A managed Kanban worker and its descendants land in the run's real, finite systemd scope."""
++import asyncio
++import json
++import os
++import shutil
++import subprocess
++import sys
++import threading
++import time
++import uuid
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import session_kanban_scope as scope_mod
++from tests.waiting import async_wait_until
++
++CHILD = ("import subprocess,sys;sys.stdin.readline();"
++         "d=subprocess.Popen([sys.executable,'-c','import sys;sys.stdin.read()']);"
++         "print(d.pid,flush=True);sys.stdin.read();d.wait()")
++
++
++def _cgroup(pid):
++    return scope_mod._cgroup_path(pid)
++
++
++@pytest.fixture
++def run_scope(tmp_path):
++    """A disposable, memory-capped per-run scope holding a sleeping 'submitter', plus a tiny board."""
++    if not (sys.platform.startswith('linux') and shutil.which('systemd-run')
++            and scope_mod.CGROUP_ROOT.joinpath('cgroup.controllers').exists()):
++        pytest.skip('needs Linux cgroup v2 + systemd-run')
++    task_id, run_id, claim = f't_scopetest{uuid.uuid4().hex[:8]}', 7, 'host:1'
++    unit = f'hermes-worker-kanban-{task_id}-run-{run_id}.scope'
++    runtime = f'/run/user/{os.getuid()}'
++    env = dict(os.environ, XDG_RUNTIME_DIR=runtime, DBUS_SESSION_BUS_ADDRESS=f'unix:path={runtime}/bus')
++    submitter = subprocess.Popen(['systemd-run', '--user', '--scope', '--quiet', '--collect', '-p', 'MemoryMax=64M',
++                                  '-u', unit, 'sleep', '120'], stderr=subprocess.PIPE, env=env,
++                                 text=True)
++    deadline = time.time() + 10
++    while time.time() < deadline and not (_cgroup(submitter.pid) or '').endswith(unit):
++        time.sleep(0.05)
++    if not (_cgroup(submitter.pid) or '').endswith(unit):
++        submitter.kill()
++        submitter.wait()
++        pytest.skip(f'cannot create a user scope here: {submitter.stderr.read()[:200]!r}')
++    from hermes_cli.kanban_db_connect import connect_closing
++    db = tmp_path / 'board.db'
++    with connect_closing(db) as conn:
++        conn.execute("INSERT INTO tasks (id,title,status,created_at,current_run_id,claim_lock) VALUES (?,?,?,?,?,?)",
++                     (task_id, 't', 'running', 1, run_id, claim))
++        conn.execute("INSERT INTO task_runs (id,task_id,status,claim_lock,worker_pid,started_at) VALUES (?,?,?,?,?,?)",
++                     (run_id, task_id, 'running', claim, submitter.pid, 1))
++        conn.commit()
++    ctx = dict(task_id=task_id, run_id=run_id, claim_lock=claim, db=str(db))
++    policy = SimpleNamespace(kanban_json=json.dumps(ctx))
++    yield SimpleNamespace(policy=policy, unit=unit, db=db, ctx=ctx, submitter=submitter, tmp=tmp_path)
++    submitter.kill()
++    submitter.wait()
++
++
++def _spawn(*args, **kwargs):
++    return subprocess.Popen([sys.executable, '-c', CHILD], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                            start_new_session=True, close_fds=True)
++
++
++def _reap(process):
++    if process.stdin and not process.stdin.closed:
++        process.stdin.close()
++    try:
++        process.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        import signal
++        os.killpg(process.pid, signal.SIGKILL)
++        process.wait(timeout=5)
++    if process.stdout:
++        process.stdout.close()
++
++
++def test_child_and_descendant_inherit_run_scope_and_limit(run_scope):
++    process = scope_mod.placing_spawn(_spawn, run_scope.policy)()
++    try:
++        process.stdin.write(b'go\n')
++        process.stdin.flush()
++        descendant = int(process.stdout.readline())
++        want = _cgroup(run_scope.submitter.pid)
++        assert want.endswith(run_scope.unit)
++        assert _cgroup(process.pid) == want and _cgroup(descendant) == want
++        assert (scope_mod.CGROUP_ROOT / want.lstrip('/') / 'memory.max').read_text().strip() == str(64 * 1024 * 1024)
++    finally:
++        _reap(process)
++
++
++def test_unplaced_spawn_stays_in_gateway_cgroup(run_scope):
++    """Control (the pre-fix behaviour): the bare spawn is not in the run scope."""
++    process = _spawn()
++    try:
++        assert _cgroup(process.pid) != _cgroup(run_scope.submitter.pid)
++    finally:
++        _reap(process)
++
++
++def test_non_kanban_policy_unchanged(run_scope):
++    for policy in (None, SimpleNamespace(kanban_json=None)):
++        process = scope_mod.placing_spawn(_spawn, policy)()
++        try:
++            assert _cgroup(process.pid) == _cgroup(os.getpid())
++        finally:
++            _reap(process)
++
++
++@pytest.mark.parametrize('mutate', ['claim', 'run', 'status'])
++def test_stale_claim_fails_closed_before_spawn(run_scope, mutate):
++    ctx = dict(run_scope.ctx)
++    if mutate == 'claim':
++        ctx['claim_lock'] = 'other:2'
++    elif mutate == 'run':
++        ctx['run_id'] = 8
++    else:
++        import sqlite3
++        with sqlite3.connect(run_scope.db) as conn:
++            conn.execute("UPDATE tasks SET status='ready'")
++    spawned = []
++    with pytest.raises(scope_mod.ScopePlacementError):
++        scope_mod.placing_spawn(lambda: spawned.append(1), SimpleNamespace(kanban_json=json.dumps(ctx)))()
++    assert spawned == []
++
++
++def test_submitter_in_other_runs_scope_fails_closed(run_scope):
++    import sqlite3
++    with sqlite3.connect(run_scope.db) as conn:
++        conn.execute("UPDATE task_runs SET worker_pid=?", (os.getpid(),))
++    # our own cgroup is not a run scope: unchanged, not a failure
++    assert scope_mod.resolve_run_scope(run_scope.policy) is None
++    ctx = dict(run_scope.ctx, run_id=7)
++    other = Path(run_scope.unit.replace('-run-7', '-run-9'))
++    real = scope_mod._cgroup_path
++    scope_mod._cgroup_path = lambda pid: '/x/' + other.name
++    try:
++        with pytest.raises(scope_mod.ScopePlacementError, match='mismatch'):
++            scope_mod.resolve_run_scope(SimpleNamespace(kanban_json=json.dumps(ctx)))
++    finally:
++        scope_mod._cgroup_path = real
++
++
++def test_migration_failure_kills_and_reaps_child(run_scope, monkeypatch):
++    made = []
++
++    def spawn(*a, **k):
++        made.append(_spawn())
++        return made[-1]
++    monkeypatch.setattr(scope_mod, 'migrate', lambda pid, target: (_ for _ in ()).throw(
++        scope_mod.ScopePlacementError('kanban_scope_migrate_failed')))
++    with pytest.raises(scope_mod.ScopePlacementError):
++        scope_mod.placing_spawn(spawn, run_scope.policy)()
++    assert made and made[0].poll() is not None  # reaped, not leaked
++    assert made[0].stdin.closed
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('cancel_early', [True, False])
++async def test_cancel_interleaving_leaves_no_child(run_scope, monkeypatch, cancel_early):
++    from gateway.session_worker_spawn import acquire_process
++    made = []
++
++    def spawn(*a, **k):
++        made.append(_spawn())
++        return made[-1]
++    real_migrate = scope_mod.migrate
++
++    entered, release = threading.Event(), threading.Event()
++
++    def slow_migrate(pid, target):
++        entered.set()
++        release.wait(timeout=10)
++        real_migrate(pid, target)
++    monkeypatch.setattr(scope_mod, 'migrate', slow_migrate)
++    task = asyncio.create_task(acquire_process(scope_mod.placing_spawn(spawn, run_scope.policy)))
++    await async_wait_until(entered.is_set, what='migration started')
++    if cancel_early:
++        task.cancel()
++        release.set()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        await async_wait_until(lambda: made and made[0].poll() is not None, what='orphan reaped')
++    else:
++        release.set()
++        process = await task
++        try:
++            assert _cgroup(process.pid) == _cgroup(run_scope.submitter.pid)
++        finally:
++            _reap(process)
++    for child in made:
++        _reap(child)
++
++
++@pytest.mark.asyncio
++async def test_spawn_registered_worker_places_real_child(run_scope, monkeypatch):
++    """The production spawn path (not just the helper) lands the Popen child in the run scope."""
++    from gateway import session_managed_worker as managed
++    authority = SimpleNamespace(profile_id='p', pending_results={}, _managed_spawning={})
++    monkeypatch.setattr(managed, '_mark_spawning', lambda *a: authority._managed_spawning)
++    monkeypatch.setattr(managed, '_worker_env', lambda a: dict(os.environ))
++    monkeypatch.setattr(managed, 'WORKER_POPEN', {'start_new_session': True, 'close_fds': True})
++    monkeypatch.setattr(managed, 'worker_log_path', lambda p: None, raising=False)
++    spawned = await managed._spawn_registered_worker(
++        authority, SimpleNamespace(session_id='s'), {'generation': 1}, run_scope.policy)
++    worker, process = spawned
++    try:
++        assert _cgroup(process.pid) == _cgroup(run_scope.submitter.pid)
++    finally:
++        worker.close()
++
++
++def test_unreadable_board_does_not_bypass_budget(run_scope):
++    ctx = dict(run_scope.ctx, db=str(run_scope.tmp / 'missing.db'))
++    with pytest.raises(scope_mod.ScopePlacementError, match='db_unreadable'):
++        scope_mod.resolve_run_scope(SimpleNamespace(kanban_json=json.dumps(ctx)))
++
++
++
++def test_pid_publication_after_scope_resolution_started(run_scope, monkeypatch):
++    """A fast submitter can reach the owner before Popen returns/publishes its PID."""
++    import sqlite3
++    from concurrent.futures import ThreadPoolExecutor
++    real_connect = sqlite3.connect
++    observed = threading.Event()
++    with real_connect(run_scope.db) as conn:
++        conn.execute('UPDATE task_runs SET worker_pid=NULL')
++
++    def connect(*args, **kwargs):
++        conn = real_connect(*args, **kwargs)
++        conn.set_trace_callback(lambda sql: observed.set() if 'SELECT worker_pid' in sql else None)
++        return conn
++
++    monkeypatch.setattr(scope_mod.sqlite3, 'connect', connect)
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        pending = executor.submit(scope_mod.resolve_run_scope, run_scope.policy)
++        assert observed.wait(5)
++        assert not pending.done()
++        with real_connect(run_scope.db) as conn:
++            conn.execute('UPDATE task_runs SET worker_pid=?', (run_scope.submitter.pid,))
++        assert pending.result(timeout=5).name == run_scope.unit
++
++
++def test_dead_submitter_does_not_bypass_budget(run_scope):
++    run_scope.submitter.kill()
++    run_scope.submitter.wait()
++    with pytest.raises(scope_mod.ScopePlacementError, match='submitter_missing'):
++        scope_mod.resolve_run_scope(run_scope.policy)
++
+diff --git a/tests/hermes_cli/test_kanban_aggregate_scope.py b/tests/hermes_cli/test_kanban_aggregate_scope.py
+new file mode 100644
+index 00000000000..67273c92935
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_aggregate_scope.py
+@@ -0,0 +1,42 @@
++"""All per-run budgets share a finite pool, leaving the owner outside it."""
++import subprocess
++from unittest.mock import patch
++
++import pytest
++
++
++def test_non_systemd_command_is_unchanged():
++    from hermes_cli.kanban_aggregate_scope import bounded_scope
++    command = ['python', '-m', 'worker']
++    with patch('subprocess.run') as run:
++        assert bounded_scope(command) == command
++        run.assert_not_called()
++
++
++def test_pool_budget_is_configured_before_returning_scoped_command():
++    from hermes_cli.kanban_aggregate_scope import bounded_scope, configure_pool
++    configure_pool.cache_clear()
++    command = ['systemd-run', '--user', '--scope', '--unit=x.scope', '--', 'worker']
++    with patch('subprocess.run') as run:
++        got = bounded_scope(command)
++        run.assert_called_once_with(
++            ['systemctl', '--user', 'set-property', '--runtime', 'hermes-kanban.slice',
++             'MemoryHigh=70%', 'MemoryMax=80%'], check=True,
++            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
++        assert '--slice=hermes-kanban.slice' in got[:got.index('--')]
++        assert got[got.index('--') + 1:] == ['worker']
++        bounded_scope(command)
++        assert run.call_count == 1
++    configure_pool.cache_clear()
++
++
++def test_unavailable_budget_fails_closed_and_retries_later():
++    from hermes_cli.kanban_aggregate_scope import bounded_scope, configure_pool
++    configure_pool.cache_clear()
++    command = ['systemd-run', '--user', '--scope', '--', 'worker']
++    with patch('subprocess.run', side_effect=subprocess.CalledProcessError(1, 'systemctl')) as run:
++        for _ in range(2):
++            with pytest.raises(RuntimeError, match='aggregate'):
++                bounded_scope(command)
++        assert run.call_count == 2
++    configure_pool.cache_clear()
+diff --git a/tests/hermes_cli/test_kanban_gateway_restart_handoff.py b/tests/hermes_cli/test_kanban_gateway_restart_handoff.py
+index dd4ee7683a2..0ba344e09d1 100644
+--- a/tests/hermes_cli/test_kanban_gateway_restart_handoff.py
++++ b/tests/hermes_cli/test_kanban_gateway_restart_handoff.py
+@@ -14,6 +14,13 @@ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_dispatch as kbd
+ 
+ 
++@pytest.fixture(autouse=True)
++def _no_live_pool_budget(monkeypatch):
++    """The shared-slice budget mutates the live user manager; test_kanban_aggregate_scope covers it."""
++    from hermes_cli import kanban_aggregate_scope
++    monkeypatch.setattr(kanban_aggregate_scope, "configure_pool", lambda: None)
++
++
+ @pytest.fixture
+ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, kb.Task]:
+     root = tmp_path / ".hermes"
+diff --git a/tests/hermes_cli/test_kanban_worker_scope_failure.py b/tests/hermes_cli/test_kanban_worker_scope_failure.py
+index 0ddbb92b0a5..70e3c6c19d4 100644
+--- a/tests/hermes_cli/test_kanban_worker_scope_failure.py
++++ b/tests/hermes_cli/test_kanban_worker_scope_failure.py
+@@ -64,6 +64,8 @@ def test_scope_failure_overrides_clean_exit_and_reaches_retry_context(kanban_hom
+ 
+ def test_scope_retention_preserves_worker_arguments(monkeypatch):
+     from types import SimpleNamespace
++    from hermes_cli import kanban_aggregate_scope
++    monkeypatch.setattr(kanban_aggregate_scope, "configure_pool", lambda: None)
+     from tools import process_registry as pr
+     command = ["python", "worker.py", "--collect"]
+     monkeypatch.setattr(pr, "restart_safe_gateway_child_argv", lambda *a, **kw: SimpleNamespace(
+-- 
+2.55.0
+

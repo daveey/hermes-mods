@@ -1,0 +1,125 @@
+From 57b10c9efd73edb36e88a735d5ded2945ef474ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 01:29:13 +0000
+Subject: [PATCH] fix(agent): skip pre_final_gate callbacks on detached fork
+ turns [daveey]
+
+Decision: exclude fork turns (background review, /btw side questions:
+_turn_origin or _persist_disabled) from pre_final_gate in eligible_callbacks,
+with an opt-in include_forks callback attribute.
+
+Rationale: a fork shares the parent's session_id and platform but is not a
+reply in the conversation. A background-review fork's text is never shown. A
+/btw answer is shown, but as a tool-less side note outside the transcript
+(tools denied at dispatch, 3 iterations max): a gate's hold nudge ("file a
+card", "publish the ask") cannot be acted on there and only burns those
+iterations, and gates that key state by session_id (ask-gate, user-steps,
+session-outcome, chat-closeout) would mix fork text into the parent's state.
+The parent's real final answers stay gated on its own turns. pre_verify
+(966154e8d35) and post_llm_call already skip forks, and coach's envelope_gate
+already opts out via a turn_origin kwarg that core never passed; no
+registered gate wants fork text. Filtering in core is safer than passing a
+turn_origin kwarg: _call passes kwargs through unfiltered, so a new kwarg
+breaks every callback without **kwargs. Excluding forks also stops a fork's
+stream being buffered for a gate that won't run.
+
+include_background does not imply include_forks: ask-gate opts into
+background runs, which must not pull fork text in. A fork that is also a
+background agent needs both opt-ins.
+
+Test: tests/agent/test_pre_final_gate.py::test_skipped_for_fork_turns_unless_opted_in
+(background_review, side_question, persist_disabled; control user turn still
+gated; include_forks callback still runs). RED before (3 failed: the hook held
+the fork), GREEN after (gate suites: 89 passed).
+---
+ agent/pre_final_gate.py            | 14 ++++++++++++
+ tests/agent/test_pre_final_gate.py | 34 ++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/agent/pre_final_gate.py b/agent/pre_final_gate.py
+index f8f76abcf6c..a52ef235bec 100644
+--- a/agent/pre_final_gate.py
++++ b/agent/pre_final_gate.py
+@@ -48,6 +48,13 @@ Callback attributes (set on the function before ``ctx.register_hook``):
+   ownership still takes precedence; registration order is unchanged when no callback opts in.
+ - ``include_background = True``: also run in kanban workers, delegate_task subagents and cron jobs
+   (skipped there by default).
++- ``include_forks = True``: also run on detached fork turns (background review, side questions:
++  ``_turn_origin`` / ``_persist_disabled``), skipped there by default. A fork shares the parent's
++  session_id and platform, but it is not a reply in the conversation: a review fork's text is never
++  shown, and a ``/btw`` answer is a tool-less side note outside the transcript, so a hold's nudge
++  (file a card, publish an ask) cannot be acted on and only burns the fork's few iterations, while
++  per-session gate state would mix with the parent's. Same rule as ``pre_verify`` and
++  ``post_llm_call``. A fork that is also a background agent needs both opt-ins.
+ """
+ 
+ from __future__ import annotations
+@@ -119,6 +126,11 @@ def is_background_agent(agent: Any) -> bool:
+     return False
+ 
+ 
++def is_fork_turn(agent: Any) -> bool:
++    """Detached fork (background review, ``/btw`` side question): not a reply in the conversation."""
++    return bool(getattr(agent, "_turn_origin", None) or getattr(agent, "_persist_disabled", False))
++
++
+ def eligible_callbacks(agent: Any) -> list[Callable]:
+     """Registered ``pre_final_gate`` callbacks that apply to this agent's context."""
+     try:
+@@ -134,6 +146,8 @@ def eligible_callbacks(agent: Any) -> list[Callable]:
+         return []
+     if callbacks and is_background_agent(agent):
+         callbacks = [cb for cb in callbacks if getattr(cb, "include_background", False)]
++    if callbacks and is_fork_turn(agent):
++        callbacks = [cb for cb in callbacks if getattr(cb, "include_forks", False)]
+     return callbacks
+ 
+ 
+diff --git a/tests/agent/test_pre_final_gate.py b/tests/agent/test_pre_final_gate.py
+index 4ed634e3ced..efb70e05c1f 100644
+--- a/tests/agent/test_pre_final_gate.py
++++ b/tests/agent/test_pre_final_gate.py
+@@ -515,6 +515,40 @@ def test_skipped_for_subagents_unless_opted_in(agent):
+     assert _run(agent, hook)["final_response"] == "sub answer\n\nx" and calls
+ 
+ 
++@pytest.mark.parametrize("fork_attrs", [
++    {"_turn_origin": "background_review"},
++    {"_turn_origin": "side_question"},
++    {"_persist_disabled": True},
++])
++def test_skipped_for_fork_turns_unless_opted_in(agent, fork_attrs):
++    """Fork output never reaches the user: no gate judges, holds or buffers it by default."""
++    calls = []
++
++    @_buffered
++    def hook(**kw):
++        calls.append(kw["final_response"])
++        return {"hold": True, "nudge": "should not reach a fork"} if len(calls) == 1 else {"append": "x"}
++
++    hook.include_background = True  # the background opt-in alone does not cover forks
++
++    run = Run(agent, ["user answer", "user answer 2"])  # control: an ordinary user turn is gated
++    assert _run(agent, hook)["final_response"] == "user answer 2\n\nx"
++    assert calls == ["user answer", "user answer 2"] and len(run.requests) == 2
++
++    calls.clear()
++    for name, value in fork_attrs.items():
++        setattr(agent, name, value)
++    run = Run(agent, ["fork answer"])
++    assert _run(agent, hook)["final_response"] == "fork answer"
++    assert not calls and len(run.requests) == 1 and run.shown == "fork answer"
++    assert agent._final_gate_buffer is None
++
++    hook.include_forks = True
++    run = Run(agent, ["fork answer", "fork answer 2"])
++    assert _run(agent, hook)["final_response"] == "fork answer 2\n\nx"
++    assert calls == ["fork answer", "fork answer 2"] and len(run.requests) == 2
++
++
+ def test_no_hook_streams_live(agent):
+     run = Run(agent, ["streamed"])
+     with patch("hermes_cli.lifecycle.has_hook", return_value=False), \
+-- 
+2.55.0
+

@@ -1,0 +1,332 @@
+From 12d643cf97a685750a366c4a3e5c9319a39c6c7b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 01:26:13 +0000
+Subject: [PATCH] fix(disk-cleanup): serialize tracked.json writers; unique
+ temp file [daveey]
+
+Parallel tool calls and every Hermes process on a host share
+disk-cleanup/tracked.json. save_tracked always wrote the fixed name
+tracked.json.tmp then replace()d it, and track()/forget()/quick() did
+read-change-write with no lock, so concurrent writers renamed each
+other's temp away (FileNotFoundError out of post_tool_call) and dropped
+entries (4 procs x 150 track(): 403 errors, 19/600 kept).
+
+- _tracked_lock(): process RLock + flock on disk-cleanup/tracked.lock,
+  re-entrant per thread, around every read-change-write.
+- save_tracked writes via utils.atomic_json_write (unique temp + fsync),
+  still keeps .bak.
+- quick() holds the lock for its tracked-state pass only; the empty-dir
+  sweep runs outside it.
+- post_tool_call catches track failures and writes 'ERROR: track failed'
+  to cleanup.log instead of raising.
+
+Self-heal plugin-129c2f2518.
+---
+ plugins/disk-cleanup/__init__.py          |  10 +-
+ plugins/disk-cleanup/disk_cleanup.py      | 126 ++++++++++++++--------
+ tests/plugins/test_disk_cleanup_plugin.py |  97 +++++++++++++++++
+ 3 files changed, 190 insertions(+), 43 deletions(-)
+
+diff --git a/plugins/disk-cleanup/__init__.py b/plugins/disk-cleanup/__init__.py
+index c8dc4b734ff..b4db63135bb 100644
+--- a/plugins/disk-cleanup/__init__.py
++++ b/plugins/disk-cleanup/__init__.py
+@@ -114,7 +114,15 @@ def _on_post_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = Non
+         except Exception:
+             continue
+         category = dg.guess_category(p) if created else None
+-        if category is not None and dg.track(str(p), category, silent=True) and category == "test":
++        if category is None:
++            continue
++        try:
++            newly = dg.track(str(p), category, silent=True)
++        except Exception as exc:  # best-effort hook: never raise into the tool loop, but leave a trace
++            dg._log(f"ERROR: track failed for {p}: {type(exc).__name__}: {exc}")
++            logger.warning("disk-cleanup: track failed for %s: %s", p, exc, exc_info=True)
++            continue
++        if newly and category == "test":
+             with _lock:
+                 _recent_test_tracks.setdefault(_owner(task_id, session_id), set()).add(str(p))
+ 
+diff --git a/plugins/disk-cleanup/disk_cleanup.py b/plugins/disk-cleanup/disk_cleanup.py
+index f911197ae3e..d966ce9fccc 100755
+--- a/plugins/disk-cleanup/disk_cleanup.py
++++ b/plugins/disk-cleanup/disk_cleanup.py
+@@ -13,11 +13,18 @@ import functools
+ import json
+ import logging
+ import shutil
++import threading
+ from datetime import datetime, timezone, UTC
+ from pathlib import Path
+ from typing import Any, Dict, Iterator, List, Optional, Tuple
+ 
+ from hermes_constants import get_hermes_home
++from utils import atomic_json_write
++
++try:
++    import fcntl
++except ImportError:  # pragma: no cover — non-POSIX: the in-process lock still serialises threads
++    fcntl = None
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -88,15 +95,46 @@ def load_tracked() -> list[dict[str, Any]]:
+         return []
+ 
+ 
++# tracked.json is shared by parallel tool calls in one process and by every Hermes process on the
++# host. Every read-change-write runs under _tracked_lock(): a process-wide RLock for threads plus an
++# flock on ``disk-cleanup/tracked.lock`` for other processes (the kernel frees it if a holder dies).
++_tracked_rlock = threading.RLock()
++_tracked_depth = threading.local()
++
++
++@contextlib.contextmanager
++def _tracked_lock() -> Iterator[None]:
++    """Serialise tracked.json read-change-write across threads and processes. Re-entrant per thread:
++    only the outermost holder takes the flock (a second flock on a new fd would self-deadlock)."""
++    with _tracked_rlock:
++        depth = getattr(_tracked_depth, "n", 0)
++        _tracked_depth.n = depth + 1
++        try:
++            if depth or fcntl is None:
++                yield
++                return
++            lock_path = _state_file("tracked.lock")
++            lock_path.parent.mkdir(parents=True, exist_ok=True)
++            with open(lock_path, "a+", encoding="utf-8") as fh:  # windows-footgun: ok (append mode, lock file only)
++                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
++                try:
++                    yield
++                finally:
++                    with contextlib.suppress(OSError):
++                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
++        finally:
++            _tracked_depth.n = depth
++
++
+ def save_tracked(tracked: list[dict[str, Any]]) -> None:
+-    """Atomic write: ``.tmp`` → backup old → rename."""
++    """Back up the old file to ``.bak``, then write atomically through a unique temp file: two
++    writers never share a temp name, so neither can rename the other's away."""
+     tf = _state_file("tracked.json")
+     tf.parent.mkdir(parents=True, exist_ok=True)
+-    tmp = tf.with_suffix(".json.tmp")
+-    tmp.write_text(json.dumps(tracked, indent=2), encoding="utf-8")
+-    if tf.exists():
+-        shutil.copy2(tf, tf.with_suffix(".json.bak"))
+-    tmp.replace(tf)
++    with _tracked_lock():
++        if tf.exists():
++            shutil.copy2(tf, tf.with_suffix(".json.bak"))
++        atomic_json_write(tf, tracked, indent=2)
+ 
+ 
+ ALLOWED_CATEGORIES = {
+@@ -186,12 +224,13 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
+         _log(f"REJECT: {path} (outside HERMES_HOME)")
+         return False
+     size = path.stat().st_size if path.is_file() else 0
+-    tracked = load_tracked()
+-    if any(item["path"] == str(path) for item in tracked):
+-        return False
+-    tracked.append({"path": str(path), "timestamp": datetime.now(UTC).isoformat(),
+-                    "category": category, "size": size})
+-    save_tracked(tracked)
++    with _tracked_lock():
++        tracked = load_tracked()
++        if any(item["path"] == str(path) for item in tracked):
++            return False
++        tracked.append({"path": str(path), "timestamp": datetime.now(UTC).isoformat(),
++                        "category": category, "size": size})
++        save_tracked(tracked)
+     _log(f"TRACKED: {path} ({category}, {fmt_size(size)})")
+     if not silent:
+         print(f"Tracked: {path} ({category}, {fmt_size(size)})")
+@@ -201,12 +240,13 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
+ def forget(path_str: str) -> int:
+     """Remove a path from tracking without deleting the file."""
+     p = Path(path_str).resolve()
+-    tracked = load_tracked()
+-    kept = [i for i in tracked if Path(i["path"]).resolve() != p]
+-    removed = len(tracked) - len(kept)
+-    if removed:
+-        save_tracked(kept)
+-        _log(f"FORGOT: {p} ({removed} entries)")
++    with _tracked_lock():
++        tracked = load_tracked()
++        kept = [i for i in tracked if Path(i["path"]).resolve() != p]
++        removed = len(tracked) - len(kept)
++        if removed:
++            save_tracked(kept)
++            _log(f"FORGOT: {p} ({removed} entries)")
+     return removed
+ 
+ 
+@@ -274,31 +314,33 @@ def quick() -> dict[str, Any]:
+     deleted = freed = 0
+     new_tracked: list[dict] = []
+     errors: list[str] = []
+-    for item, p, age in _live_items(load_tracked(), datetime.now(UTC), log_stale=True):
+-        cat = item["category"]
+-        if cat in _STALE_SKIP_NOTE and (re_cat := guess_category(p)) != cat:
+-            # Misclassified stale entry — drop it rather than delete the file.
+-            _log(f"SKIP stale {cat} entry: {p} (re-classified as {re_cat!r}{_STALE_SKIP_NOTE[cat]})")
+-            continue
+-        # Hard safety net even if re-validation above somehow let it through.
+-        if _is_protected_cron_path(p):
+-            _log(f"SKIP protected cron path: {p}")
+-            continue
+-        if _is_protected_dir(p):
+-            _log(f"SKIPPED: {p} (protected top-level dir)")
+-            continue
+-        if not _is_auto_delete(cat, age):
+-            new_tracked.append(item)
+-            continue
+-        err = _delete_item(item)
+-        if err is None:
+-            freed += item["size"]
+-            deleted += 1
+-        else:
+-            errors.append(err)
+-            new_tracked.append(item)
++    with _tracked_lock():  # a track() racing this read-change-write would otherwise be dropped
++        for item, p, age in _live_items(load_tracked(), datetime.now(UTC), log_stale=True):
++            cat = item["category"]
++            if cat in _STALE_SKIP_NOTE and (re_cat := guess_category(p)) != cat:
++                # Misclassified stale entry — drop it rather than delete the file.
++                _log(f"SKIP stale {cat} entry: {p} (re-classified as {re_cat!r}{_STALE_SKIP_NOTE[cat]})")
++                continue
++            # Hard safety net even if re-validation above somehow let it through.
++            if _is_protected_cron_path(p):
++                _log(f"SKIP protected cron path: {p}")
++                continue
++            if _is_protected_dir(p):
++                _log(f"SKIPPED: {p} (protected top-level dir)")
++                continue
++            if not _is_auto_delete(cat, age):
++                new_tracked.append(item)
++                continue
++            err = _delete_item(item)
++            if err is None:
++                freed += item["size"]
++                deleted += 1
++            else:
++                errors.append(err)
++                new_tracked.append(item)
++        save_tracked(new_tracked)
++    # The empty-dir sweep touches no tracked state; run it outside the lock (it can be slow).
+     empty_removed = _sweep_empty_dirs(get_hermes_home())
+-    save_tracked(new_tracked)
+     _log(f"QUICK_SUMMARY: {deleted} files, {empty_removed} dirs, {fmt_size(freed)}")
+     return {"deleted": deleted, "empty_dirs": empty_removed, "freed": freed, "errors": errors}
+ 
+diff --git a/tests/plugins/test_disk_cleanup_plugin.py b/tests/plugins/test_disk_cleanup_plugin.py
+index 951e876115d..1456d899f0b 100644
+--- a/tests/plugins/test_disk_cleanup_plugin.py
++++ b/tests/plugins/test_disk_cleanup_plugin.py
+@@ -710,3 +710,100 @@ class TestBundledDiscovery:
+         mgr.discover_and_load()
+         assert "memory" not in mgr._plugins
+         assert "context_engine" not in mgr._plugins
++
++
++# ---------------------------------------------------------------------------
++# Concurrent writers (self-heal plugin-129c2f2518)
++# ---------------------------------------------------------------------------
++
++_WRITER_SCRIPT = """
++import importlib.util, sys
++spec = importlib.util.spec_from_file_location("dc_writer", sys.argv[1])
++dg = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(dg)
++errors = 0
++for path in sys.argv[2:]:
++    try:
++        dg.track(path, "temp", silent=True)
++    except Exception as exc:
++        errors += 1
++        print(f"ERR {type(exc).__name__}: {exc}", file=sys.stderr)
++sys.exit(1 if errors else 0)
++"""
++
++
++class TestConcurrentTrackedWriters:
++    """tracked.json is shared by parallel tool calls in one process and by every Hermes process
++    on the host. Each read-change-write must be serialized, and the temp file must be unique, or
++    writers rename each other's temp file away (FileNotFoundError) and drop entries."""
++
++    @staticmethod
++    def _files(home, prefix, n):
++        out = []
++        for i in range(n):
++            p = home / "scratch" / f"{prefix}_{i}.txt"
++            p.parent.mkdir(exist_ok=True)
++            p.write_text("x")
++            out.append(str(p.resolve()))
++        return out
++
++    def test_threads_keep_every_entry_without_error(self, _isolate_env):
++        import threading
++        dg = _load_lib()
++        batches = [self._files(_isolate_env, f"t{t}", 25) for t in range(8)]
++        barrier = threading.Barrier(len(batches))
++        errors = []
++
++        def worker(paths):
++            barrier.wait()
++            for p in paths:
++                try:
++                    dg.track(p, "temp", silent=True)
++                except Exception as exc:
++                    errors.append(repr(exc))
++
++        threads = [threading.Thread(target=worker, args=(b,)) for b in batches]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join(60)
++        assert errors == []
++        tracked = {i["path"] for i in dg.load_tracked()}
++        assert tracked == {p for b in batches for p in b}
++
++    def test_processes_keep_every_entry_without_error(self, _isolate_env):
++        import subprocess
++        repo_root = Path(__file__).resolve().parents[2]
++        lib = repo_root / "plugins" / "disk-cleanup" / "disk_cleanup.py"
++        batches = [self._files(_isolate_env, f"p{n}", 25) for n in range(4)]
++        env = {**os.environ, "HERMES_HOME": str(_isolate_env),
++               "PYTHONPATH": os.pathsep.join(filter(None, [str(repo_root), os.environ.get("PYTHONPATH")]))}
++        procs = [subprocess.Popen([sys.executable, "-c", _WRITER_SCRIPT, str(lib), *b], env=env,
++                                  stderr=subprocess.PIPE, text=True) for b in batches]
++        results = [(p.wait(120), p.stderr.read()) for p in procs]
++        assert [r for r in results if r[0] != 0] == []
++        dg = _load_lib()
++        tracked = {i["path"] for i in dg.load_tracked()}
++        assert tracked == {p for b in batches for p in b}
++
++    def test_save_tracked_leaves_no_shared_tmp_file(self, _isolate_env):
++        dg = _load_lib()
++        dg.save_tracked([{"path": "a", "timestamp": "2026-01-01T00:00:00+00:00", "category": "temp", "size": 0}])
++        dg.save_tracked([])
++        state = _isolate_env / "disk-cleanup"
++        assert not (state / "tracked.json.tmp").exists()
++        assert json.loads((state / "tracked.json").read_text()) == []
++        assert (state / "tracked.json.bak").exists()
++
++    def test_post_tool_call_logs_track_failure_instead_of_raising(self, _isolate_env, monkeypatch):
++        pi = _load_plugin_init()
++
++        def boom(*_a, **_k):
++            raise FileNotFoundError("tracked.json.tmp -> tracked.json")
++
++        monkeypatch.setattr(pi.dg, "track", boom)
++        target = _isolate_env / "test_created.py"
++        _run_tool(pi, "write_file", {"path": str(target)}, create=lambda: target.write_text("x"),
++                  task_id="t1")
++        log = (_isolate_env / "disk-cleanup" / "cleanup.log").read_text()
++        assert "ERROR: track failed" in log and "tracked.json.tmp" in log
+-- 
+2.55.0
+

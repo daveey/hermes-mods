@@ -1,0 +1,204 @@
+From 551588c6f57659c0781dbc054a44b7e7325dda33 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 01:24:15 +0000
+Subject: [PATCH] fix(kanban): record create_overlap why in the event and log
+ all-remote refusals durably
+
+---
+ hermes_cli/kanban_overlap.py               |  28 +++++-
+ tests/tools/test_kanban_create_overlap.py  | 106 +++++++++++++++++++++
+ website/docs/user-guide/features/kanban.md |   4 +
+ 3 files changed, 134 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index 1c231c8e598..16c90ea129f 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -39,6 +39,9 @@ _log = logging.getLogger(__name__)
+ EVENT = "create_overlap"
+ OPEN = ("todo", "ready", "running", "scheduled", "blocked", "review", "triage")
+ MAX_SHOWN = 8
++MAX_WHY = 300
++LOG_NAME = "create_overlap.jsonl"
++LOG_MAX_BYTES = 1024 * 1024
+ MIN_SHARED = 3
+ PLAIN_BOARD_SCORE = 0.25
+ _STOP = frozenset("""
+@@ -295,6 +298,24 @@ def covered(matches: list[dict], distinct_from: list[str], reason: str) -> bool:
+     return bool(reason.strip()) and all(m["id"] in distinct_from for m in matches[:MAX_SHOWN])
+ 
+ 
++def log_path():
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "logs" / LOG_NAME
++
++
++def _append_log(payload: dict) -> None:
++    """One JSON line for a refusal that has no board to hold an event (every match is on another gateway).
++    Past ``LOG_MAX_BYTES`` the file is renamed to ``.1`` (one generation kept), so the record is bounded."""
++    import time
++    path = log_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if path.exists() and path.stat().st_size >= LOG_MAX_BYTES:
++        path.replace(path.with_name(path.name + ".1"))
++    line = json.dumps({"ts": time.time(), **payload}, ensure_ascii=False)
++    with path.open("a", encoding="utf-8") as fh:
++        fh.write(line + "\n")
++
++
+ def record(conn: Optional[sqlite3.Connection], task_id: Optional[str], *, outcome: str, title: str,
+            matches: list[dict], reason: str = "", session_id: Optional[str] = None) -> None:
+     """``create_overlap`` event (the detection signal): on the new card for an override; for a refusal on the
+@@ -302,10 +323,8 @@ def record(conn: Optional[sqlite3.Connection], task_id: Optional[str], *, outcom
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+     payload = {"outcome": outcome, "title": title, "reason": reason or None, "session_id": session_id,
+-               "matches": [{"id": m["id"], "board": m["board"], "gateway": m["gateway"], "status": m["status"]}
+-                           for m in public(matches)]}
+-    # The matched cards ride in the log line: a refusal whose matches are all on other gateways records no
+-    # event anywhere, so this line is the only trace an audit can read (hub t_01a189b2d186a986).
++               "matches": [{"id": m["id"], "board": m["board"], "gateway": m["gateway"], "status": m["status"],
++                            "why": (m.get("why") or "")[:MAX_WHY]} for m in public(matches)]}
+     _log.info("kanban create overlap: %s %r (%d matches: %s)", outcome, title, len(matches),
+               ", ".join(f"{m['gateway']}/{m['board']}/{m['id']} ({m['why']})" for m in matches[:MAX_SHOWN]))
+     try:
+@@ -315,6 +334,7 @@ def record(conn: Optional[sqlite3.Connection], task_id: Optional[str], *, outcom
+             return
+         local = next((m for m in matches if m["_local"]), None)
+         if local is None:
++            _append_log(payload)
+             return
+         with kbc.connect_closing(board=local["board"]) as other, kb.write_txn(other):
+             kb._append_event(other, local["id"], EVENT, payload)
+diff --git a/tests/tools/test_kanban_create_overlap.py b/tests/tools/test_kanban_create_overlap.py
+index bb92ccefc34..44c584d8873 100644
+--- a/tests/tools/test_kanban_create_overlap.py
++++ b/tests/tools/test_kanban_create_overlap.py
+@@ -286,3 +286,109 @@ def test_rest_alarm_create_is_not_refused_for_a_plain_word_board_slug(home):
+     assert r.status_code != 409, r.text
+     assert r.status_code == 200, r.text
+     assert "create_overlap" not in r.text
++
++
++# --- durable refusal record: `why` in the event payload, a JSONL line when no board can hold the event ---
++
++def _overlap_events(board, task_id):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing(board=board) as conn:
++        return [e.payload for e in kb.list_events(conn, task_id) if e.kind == "create_overlap"]
++
++
++def _log_lines():
++    from hermes_cli import kanban_overlap
++    path = kanban_overlap.log_path()
++    return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
++
++
++def _remote_only(home, tmp_path, monkeypatch):
++    """Self is the macbook; the only matching card lives on the hub replica."""
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: "macbook")
++    _fake_replica(tmp_path / "hub-state" / "hub.db", [
++        ("hub", {"id": "t_b1", "board": "unconventional-collab", "title": B1_TITLE, "status": "scheduled",
++                 "gateway": "hub", "sessions": [{"session": "20261026_154948_ea6cfd"}]})])
++
++
++def _cli_create(monkeypatch):
++    import argparse
++    from hermes_cli import kanban as kc
++    monkeypatch.setattr(kc, "_check_dispatcher_presence", lambda **kw: (True, ""))
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    return kc._cmd_create(root.parse_args(["kanban", "create", DUP_TITLE, "--body", DUP_BODY,
++                                           "--assignee", "default", "--json"]))
++
++
++def _rest_create():
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from plugins.kanban.dashboard.plugin_api import router
++    app = FastAPI()
++    app.include_router(router)
++    with TestClient(app) as client:
++        return client.post("/tasks", json={"title": DUP_TITLE, "body": DUP_BODY, "assignee": "default"})
++
++
++def _assert_local_event_has_why(b1):
++    [payload] = _overlap_events("unconventional-collab", b1)
++    assert payload["outcome"] == "refused"
++    [m] = payload["matches"]
++    assert m["id"] == b1 and "the new card names board 'unconventional-collab'" in m["why"], m
++    assert _log_lines() == []  # a DB event exists, so no second record
++
++
++def _assert_remote_line_has_why():
++    [line] = _log_lines()
++    assert line["outcome"] == "refused" and line["title"] == DUP_TITLE and line["ts"] > 0
++    [m] = line["matches"]
++    assert (m["gateway"], m["id"]) == ("hub", "t_b1") and "unconventional-collab" in m["why"], m
++
++
++def test_tool_local_refusal_event_carries_why(home):
++    b1 = _board_with_b1()
++    assert _create().get("code") == "create_overlap"
++    _assert_local_event_has_why(b1)
++
++
++def test_tool_all_remote_refusal_is_recorded_durably(home, tmp_path, monkeypatch):
++    _remote_only(home, tmp_path, monkeypatch)
++    assert _create().get("code") == "create_overlap"
++    _assert_remote_line_has_why()
++
++
++def test_cli_local_refusal_event_carries_why(home, monkeypatch, capsys):
++    b1 = _board_with_b1()
++    assert _cli_create(monkeypatch) == 2
++    _assert_local_event_has_why(b1)
++
++
++def test_cli_all_remote_refusal_is_recorded_durably(home, tmp_path, monkeypatch, capsys):
++    _remote_only(home, tmp_path, monkeypatch)
++    assert _cli_create(monkeypatch) == 2
++    _assert_remote_line_has_why()
++
++
++def test_rest_local_refusal_event_carries_why(home):
++    b1 = _board_with_b1()
++    assert _rest_create().status_code == 409
++    _assert_local_event_has_why(b1)
++
++
++def test_rest_all_remote_refusal_is_recorded_durably(home, tmp_path, monkeypatch):
++    _remote_only(home, tmp_path, monkeypatch)
++    assert _rest_create().status_code == 409
++    _assert_remote_line_has_why()
++
++
++def test_why_is_bounded_and_the_log_rotates(home, monkeypatch):
++    from hermes_cli import kanban_overlap as ko
++    monkeypatch.setattr(ko, "LOG_MAX_BYTES", 400)
++    match = {"id": "t_x", "board": "b", "gateway": "hub", "status": "ready", "why": "w" * 5000, "_local": False}
++    for _ in range(4):
++        ko.record(None, None, outcome="refused", title="t", matches=[match])
++    assert all(len(m["why"]) == ko.MAX_WHY for line in _log_lines() for m in line["matches"])
++    rotated = ko.log_path().with_name(ko.LOG_NAME + ".1")
++    assert rotated.exists() and ko.log_path().stat().st_size < 2000
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 5fe7212f94c..afe4082fbb2 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -55,6 +55,10 @@ when the proposed work is genuinely separate. Set `kanban.create_overlap_check`
+ `false` to disable this check. Missing or unreadable replicas are skipped and logged;
+ the check cannot guarantee uniqueness against unavailable boards.
+ 
++Every refusal is recorded with each match's `why`: as a `create_overlap` event on the
++creator's card or the best local match, or, when every match is on another gateway, as a
++line in `<kanban home>/logs/create_overlap.jsonl` (rotated to `.1` at 1 MiB).
++
+ ## PR completion contracts
+ 
+ Declare PR work at creation with `--completion-contract OWNER/REPO` (or an exact
+-- 
+2.55.0
+

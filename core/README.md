@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1368 patches, one entry per non-merge source commit through `632eb9c39d518188e71d3404c5f012d4e4e6a113`.
+1375 patches, one entry per non-merge source commit through `93843e3a493cdd647b59f65d6a29967801feb621`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -24,10 +24,22 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `6bb377a51d5c8e279a7a5e34d717d653d421d064`; current merge-base: `ef35e8b9e1a8bc7f0efb50e4f2d68f1ec052f6a8`.
 Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with an explicit upstream-merge bridge immediately before patch 1328. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-The snapshot's full verifier exits 0 with [mirror-replay-1368.json](mirror-replay-1368.json) (one hash-pinned bridge) and [mirror-policy-1368.json](mirror-policy-1368.json).
-The current snapshot's executed checks are in [mirror-1368-verification.md](mirror-1368-verification.md), with its policy [mirror-policy-1368.json](mirror-policy-1368.json) (previous snapshots: [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+The snapshot's full verifier exits 0 with [mirror-replay-1375.json](mirror-replay-1375.json) (one hash-pinned bridge) and [mirror-policy-1375.json](mirror-policy-1375.json).
+The current snapshot's executed checks are in [mirror-1375-verification.md](mirror-1375-verification.md), with its policy [mirror-policy-1375.json](mirror-policy-1375.json) (previous snapshots: [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1369–1375
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Canonical served identity in chat replies](canonical-served-identity.md) | 1369 | Source `970d5e40c12`; implementation and source test inventory in the feature doc. |
+| [Serialized disk-cleanup tracked writers](disk-cleanup-tracked-writers.md) | 1370 | Source `12d643cf97a`; implementation and source test inventory in the feature doc. |
+| [Durable overlap refusal explanations](overlap-durable-refusal.md) | 1371 | Source `551588c6f57`; implementation and source test inventory in the feature doc. |
+| [Managed worker run scope and aggregate memory bound](managed-worker-run-scope.md) | 1372 | Source `cb4ac494b00`; implementation and source test inventory in the feature doc. |
+| [Forwarded-card wait survives replica lag](forwarded-card-replica-lag.md) | 1373 | Source `5dc666b7b97`; implementation and source test inventory in the feature doc. |
+| [Detached forks skip pre-final gates](fork-pre-final-gates.md) | 1374 | Source `57b10c9efd7`; implementation and source test inventory in the feature doc. |
+| [Recovery probe waits for dispatcher admission](recovery-admission-test.md) | 1375 | Source `93843e3a493`; implementation and source test inventory in the feature doc. |
 
 ## Mirror follow-ups 1302–1326
 
@@ -121,7 +133,7 @@ python3 -B core/verify_mirror.py \
   --policy core/mirror-policy-NNNN.json
 ```
 
-For the 1368 snapshot, also pass `--replay-plan core/mirror-replay-1368.json`.
+For the 1375 snapshot, also pass `--replay-plan core/mirror-replay-1375.json` and use `--policy core/mirror-policy-1375.json`.
 This explicit opt-in pins the historical replay start and a bridge's boundary by source SHA, its source merge and its diff by SHA-256. Starts and merge IDs must be full commit IDs; merge ancestry, boundary membership and unique boundaries are validated. Bridge paths are relative to the plan, without parent traversal. Each uninterrupted patch segment is replayed in published order, then the bridge is applied with `git apply --index --3way` and committed. No source patch is skipped; final tree comparison is unchanged. The merge label documents provenance; the diff hash binds the reviewed public bridge (which may contain normalization), not an automatically regenerated source diff.
 
 Exit 0 is the acceptance step for every mirror pass; record its JSON line in the snapshot's
@@ -915,3 +927,4 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [managed-worker.log block header](managed-worker-log-header.md) | 1366 | Each worker block starts with `[pid N] @ <UTC> core=<sha>` so crash storms date against deploys. |
 | [Classic CLI quit on gateway proxy](cli-quit-gateway-proxy-restore.md) | 1368 | Quit no longer runs the prompt restore on the gateway proxy; store reads keep parity. |
 | [1368-entry mirror snapshot](mirror-1368-verification.md) | verification report | Appends 1327–1368; `verify_mirror.py` exits 0 with policy [mirror-policy-1368.json](mirror-policy-1368.json). |
+| [1375-entry mirror snapshot](mirror-1375-verification.md) | verification report | Appends 1369–1375; full inventory, replay and tree acceptance with the snapshot-bound policy and replay plan. |

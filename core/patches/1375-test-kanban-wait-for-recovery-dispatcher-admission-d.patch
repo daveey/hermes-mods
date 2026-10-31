@@ -1,0 +1,103 @@
+From 93843e3a493cdd647b59f65d6a29967801feb621 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 01:51:34 +0000
+Subject: [PATCH] test(kanban): wait for recovery dispatcher admission [daveey]
+
+---
+ .../gateway/fixtures/kanban_recovery_probe.py | 33 +++++++++++++++++--
+ tests/gateway/test_kanban_recovery.py         | 11 +++++--
+ 2 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/tests/gateway/fixtures/kanban_recovery_probe.py b/tests/gateway/fixtures/kanban_recovery_probe.py
+index a287e5fc119..9165abac15e 100644
+--- a/tests/gateway/fixtures/kanban_recovery_probe.py
++++ b/tests/gateway/fixtures/kanban_recovery_probe.py
+@@ -1,6 +1,6 @@
+ """Disposable ordinary owner, actual dispatcher, custom paths and process death."""
+ import asyncio
+-from contextlib import closing
++from contextlib import closing, nullcontext
+ from http.server import ThreadingHTTPServer
+ import json
+ import os
+@@ -14,6 +14,23 @@ import time
+ 
+ from kanban_owner_probe import Model as BaseModel
+ from local_recovery_probe import daemon, websocket, rpc
++from tests.waiting import wait_until
++
++
++def dispatch_started(conn, tid):
++    """A busy admission lock defers a tick without opening an attempt."""
++    from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
++
++    result = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
++    if result.spawned:
++        assert [s[0] for s in result.spawned] == [tid], result
++        return result
++    # Only an uneventful deferral is repeatable, never a failed/guarded spawn or
++    # a lost attempt. A descheduled reservation publisher can still own the flock.
++    assert result == dispatch.DispatchResult(scheduling_admitted=True), result
++    task = kb.get_task(conn, tid)
++    assert task is not None and task.status == 'ready' and task.current_run_id is None, task
++    return None
+ 
+ 
+ class Model(BaseModel):
+@@ -84,7 +101,7 @@ def main():
+             row = db.execute('SELECT * FROM session_admissions').fetchone()
+             return dict(row) if row else None
+     async def retry(desc, params, *, resolve=False):
+-        async with websocket(owner, desc) as ws:
++        async with websocket(owner, desc, open_timeout=120) as ws:
+             answer = await rpc(ws, 'kanban.run', **params)
+             assert 'result' in answer, answer
+             for changed in ({'board': 'foreign'}, {'claim_lock': 'forged'}, {'db': str(home / 'other.sqlite')}, {'run_id': params['run_id'] + 1}):
+@@ -112,7 +129,17 @@ def main():
+             with daemon(root, owner, env, barrier=False) as (proc, desc):
+                 subprocess.Popen = spawn
+                 try:
+-                    launched = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
++                    from hermes_cli.admission_fence import admission_lock
++                    from hermes_constants import get_default_hermes_root
++                    contend = '--admission-contention' in sys.argv
++                    with admission_lock(get_default_hermes_root()) if contend else nullcontext():
++                        launched = dispatch_started(conn, tid)
++                    if contend:
++                        assert launched is None, launched
++                        receipt['admission_deferred_without_run'] = True
++                    if launched is None:
++                        launched = wait_until(lambda: dispatch_started(conn, tid), timeout=50,
++                                              what='recovery dispatcher claim and spawn')
+                 finally:
+                     subprocess.Popen = original_popen
+                 assert [s[0] for s in launched.spawned] == [tid], launched
+diff --git a/tests/gateway/test_kanban_recovery.py b/tests/gateway/test_kanban_recovery.py
+index 53b71141bdc..f37d5372cbc 100644
+--- a/tests/gateway/test_kanban_recovery.py
++++ b/tests/gateway/test_kanban_recovery.py
+@@ -13,13 +13,18 @@ import pytest
+ # flags); without it the probe cannot prove the client never opens state.db writable.
+ @pytest.mark.platforms('linux')
+ @pytest.mark.skipif(shutil.which('strace') is None, reason='requires strace on PATH')
+-@pytest.mark.parametrize('mode', ['custom', 'cross_profile', 'restart'])
+-def test_owner_board_recovery(tmp_path, mode):
++@pytest.mark.parametrize('mode,contention', [('custom', False), ('cross_profile', False),
++                                           ('restart', False), ('restart', True)],
++                         ids=['custom', 'cross_profile', 'restart', 'restart-contention'])
++def test_owner_board_recovery(tmp_path, mode, contention):
+     repo = Path(__file__).resolve().parents[2]
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(tmp_path / 'user'), HERMES_HOME=str(tmp_path / 'state'),
+                PYTHONPATH=str(repo), KANBAN_RECOVERY_MODE=mode)
+-    result = subprocess.run([sys.executable, str(repo / 'tests/gateway/fixtures/kanban_recovery_probe.py')],
++    command = [sys.executable, str(repo / 'tests/gateway/fixtures/kanban_recovery_probe.py')]
++    if contention:
++        command.append('--admission-contention')
++    result = subprocess.run(command,
+                             cwd=repo, env=env, stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=180, check=False)
+     assert result.returncode == 0, result.stdout + result.stderr
+-- 
+2.55.0
+
