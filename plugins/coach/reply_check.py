@@ -762,12 +762,36 @@ def scheduled_wait_status(user_ask: str, reply: str) -> Optional[str]:
     return f"status question; only open item is a scheduled wait (\"{m.group(0)}\")"
 
 
-def report_only_guard(user_ask: str, reply: str) -> Optional[str]:
-    """Why report_only can't apply to this turn ("scope_limited" / "scheduled_wait"), else None."""
+# report_only vs kanban_continue (self-heal agent-2d5f5e554b): a Kanban worker out of runtime checkpointed its own card
+# with kanban_continue ("a fresh run will resume this card now ... do not call more tools") and listed what the next
+# run will do. The judge read that list as unfinished work left unowned and nudged; the nudge pushed the worker into
+# more tool calls and a rewrite with a wrong fact. kanban_continue is the protocol's hand-off of unfinished work to the
+# next run of the same card, so a successful one this turn is a started fix. Matches the tool call itself (direct or
+# through the deferred tool_call), not a line that merely mentions it (tool_describe, grep); a call followed by the
+# turn log's `<- ERROR` line (agent_rules.observe) did not continue anything.
+_CONTINUE_RE = re.compile(r"^\s*->\s*kanban_continue\(|^\s*->\s*tool_call\(.*[\"']name[\"']\s*:\s*[\"']kanban_continue[\"']",
+                          re.I)
+
+
+def continued_run(tool_log: Optional[list] = None) -> bool:
+    """True when this turn's tool log shows a kanban_continue (direct or via tool_call) that did not error."""
+    lines = list(tool_log or [])
+    for i, line in enumerate(lines):
+        if _CONTINUE_RE.search(line or ""):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not (nxt or "").lstrip().startswith("<- ERROR"):
+                return True
+    return False
+
+
+def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """Why report_only can't apply to this turn ("scope_limited" / "scheduled_wait" / "continued_run"), else None."""
     if scope_limited(user_ask):
         return "scope_limited"
     if scheduled_wait_status(user_ask, reply):
         return "scheduled_wait"
+    if continued_run(tool_log):
+        return "continued_run"
     return None
 
 
@@ -790,7 +814,7 @@ def prefilter(reply: str) -> list[str]:
 
 
 # Tools that, called this turn, leave something that will wake the session later.
-WAKE_TOOLS = ("delegate_task", "kanban_create", "kanban_schedule", "cronjob")
+WAKE_TOOLS = ("delegate_task", "kanban_create", "kanban_schedule", "kanban_continue", "cronjob")
 
 
 def _ro_connect(path, timeout=10):
@@ -928,6 +952,8 @@ probabilities (0-1):
     scores high. "No action needed from you" / "nothing needs you" does not excuse it.
   * Pointing at an existing owner (card, worker, other session) that "has it" scores high UNLESS the tool log shows
     the agent checked that owner this turn (e.g. kanban_show / process poll) and it is actually running.
+  * A Kanban worker that checkpointed its own card with kanban_continue this turn has started the remaining work
+    (score low) when the leftovers it lists are what the checkpoint carries to the next run of that card.
   * Handing THIS problem's fix to another agent this turn counts as starting it (score low): the tool log has a
     send to it (cross_session / kanban_comment / kanban_create / delegate_task) and the message says what fix or
     reproduction it sent.
@@ -969,14 +995,14 @@ Return ONLY one JSON object:
 - agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
-  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR).
+  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run.
   "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how), possibly asking for a go-ahead.
   "offered": only a vague offer ("want me to fix it?", "I can look into it") with no concrete solution.
   "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.
   "na": no unresolved problem in the reply (a pure answer, finished work, chit-chat).
 - user_wanted_action: true if the message asked the agent to do, fix, build or change something (not just a question, status check or FYI)."""
 CONFIRM_FLOOR = 0.75  # screen report_only p at or above this gets the second opinion (tuned on train)
-CONFIRM_DAILY_CAP = 100
+CONFIRM_DAILY_CAP = 200  # 2026-10-30 needed ~190 (88 capped turns left the screen to decide alone)
 
 
 def confirm_system() -> str:
@@ -1395,8 +1421,11 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           kanban_down: Optional[bool] = None,
           human_asks: Optional[Callable[[], list]] = None,
           audit: Optional[Callable[[dict], None]] = None,
-          card_status: Optional[Callable[[str], Optional[str]]] = None) -> Optional[dict]:
+          card_status: Optional[Callable[[str], Optional[str]]] = None,
+          capped_nudge: bool = True) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `capped_nudge=False` (Kanban worker turns): when the report_only second opinion was due but unavailable (daily
+    cap, error), the screen alone never nudges (audit source "screen_capped_skip").
     `card_status(card_id) -> status | None` looks up cards the reply names as owner (default: this host's boards,
     read-only); a done/archived one is the deterministic `closed_owner` report_only hit.
     `human_asks()` lists asks waiting on the user from cards linked to the chat ([{id, title, action}]); it is called
@@ -1414,7 +1443,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     before the LLM judge; when no candidate survives, the LLM is skipped. `shadow` = log only, drop nothing."""
     # scope limit or a status question answered with a legitimately scheduled wait: report_only (and status_only, whose
     # walls the scheduled wait is one of) can't apply, so neither the deterministic checks nor the judge see it.
-    scoped = bool(report_only_guard(user_ask, reply))
+    scoped = bool(report_only_guard(user_ask, reply, tool_log))
     if human_asks is not None and (not only or "denied_ask" in only):
         phrase = denies_ask(reply)
         asks = []
@@ -1514,6 +1543,9 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             v["report_only"], v["evidence"] = float(c2[0]), (c2[1] or v["evidence"])
             v["report_only_src"] = "confirm"
             th_ro = ths.get("report_only", th_scr)
+        elif not capped_nudge:
+            v["report_only_src"] = "screen_capped_skip"
+            th_ro = 2.0  # unreachable (p <= 1); a finite number keeps log.jsonl valid JSON
         else:
             v["report_only_src"] = "screen_fallback"
             th_ro = max(th_scr, ths.get("report_only_capped", th_scr))
@@ -1525,6 +1557,10 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "threshold": th_ro, "passing": v["report_only"] >= th_ro})
         except Exception:
             pass  # telemetry never changes a verdict
+    if v.get("report_only_src") == "screen_capped_skip":
+        cands = [r for r in cands if r != "report_only"]
+        if not cands:
+            return None
     if thresholds:
         thresholds = {**thresholds, "report_only": th_ro}
         passing = [r for r in cands if v[r] >= thresholds.get(r, threshold)]

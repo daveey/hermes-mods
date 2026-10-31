@@ -540,6 +540,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            screen=screen, screen_below=s1.below(), shadow=m == "shadow", log=s1.log,
                            confirm=confirm, confirm_floor=rc.CONFIRM_FLOOR,
                            kanban_down=kanban_down,
+                           # a Kanban worker turn has no user to push back: a capped second opinion skips the nudge
+                           capped_nudge=platform != "kanban",
                            human_asks=lambda: rc.session_human_asks(session_id),
                            audit=lambda event: store.log({**event, "session_id": session_id,
                                                           "turn": coach.turn_number(session_id),
@@ -554,7 +556,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     v = hit["verdict"]
                     rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response)
                             and v.get(r, 0) >= rc.rule_threshold(r, v, cfg.get("thresholds") or {}, cfg["threshold"])
-                            and r != "unwatched" and not (r == "report_only" and rc.report_only_guard(ask, final_response))]
+                            and r != "unwatched" and not (r == "report_only" and rc.report_only_guard(ask, final_response, log_lines))]
                     hit = None
                     if rest:
                         r = max(rest, key=lambda x: v[x])
@@ -562,7 +564,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                "nudge": rc.nudge_for(r, v["evidence"], kanban_down=kanban_down,
                                                      card_closed=rc.card_closed(log_lines))}
             if not hit:
-                guard = rc.report_only_guard(ask, final_response)
+                guard = rc.report_only_guard(ask, final_response, log_lines)
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response), "ask_len": len(ask or ""),
                            **({"guard": guard} if guard else {})})
