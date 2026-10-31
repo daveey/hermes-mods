@@ -1008,11 +1008,11 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
    with a file:line, log line, db row or quote; label guesses `(hypothesis)`; branch "why it happened" and "why
    nothing caught it"; stop at a process/guard/design gap Hermes controls. Post the chain as a comment on this card.
 3. A real defect already owned by another card is a duplicate, NOT not_defect. Record
-   `python3 {SELF} event duplicate {fp} --card $HERMES_KANBAN_TASK --owner <owner-card> --note "<evidence>"`,
+   `python3 {SELF} event duplicate {fp} --owner <owner-card> --note "<evidence>"`,
    then complete this card as a duplicate. Post nothing to the Inbox; the owner retains the real defect.
    Not a real defect (expected behaviour, user's own setting, outside world with nothing to guard)? Only after you
    checked the user's complaint itself, not just the detector's trigger. Run
-   `python3 {SELF} event not_defect {fp} --card $HERMES_KANBAN_TASK --note "<why>"` and complete this card with a
+   `python3 {SELF} event not_defect {fp} --note "<why>"` and complete this card with a
    result that starts with "not a defect:". Post nothing to the Inbox.
 4. Otherwise write the proposal to {proposal} (markdown, <= 3500 chars, plain words, no jargon) with exactly these
    sections:
@@ -1021,7 +1021,7 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
    **Plan**: the exact changes (files/skills/config), the regression test (fails before, passes after), the
    detection guard, and what gets verified live after shipping.
    **Cost / risk**, then **Undo**: how to revert. The first line is a one-line title: what is broken.
-   Do NOT post it to the Inbox. Record it: `python3 {SELF} event proposed {fp} --card $HERMES_KANBAN_TASK`
+   Do NOT post it to the Inbox. Record it: `python3 {SELF} event proposed {fp}`
    (the lane auto-approves it within 5 minutes and files the fix card from this proposal).
 5. Complete this card with the proposal's first line as the summary. Do not start the fix.
 """
@@ -1048,7 +1048,7 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
 
 ## Acceptance (all of it, in order)
 1. Re-check the defect still reproduces on the current code (it may have been fixed meanwhile: then say so, run
-   `python3 {SELF} event not_defect {fp} --card $HERMES_KANBAN_TASK --note "already fixed by <sha>"` and stop).
+   `python3 {SELF} event not_defect {fp} --note "already fixed by <sha>"` and stop).
 2. Write the regression test FIRST and show it FAILING on the current code (paste the failing output in a card
    comment).
 3. Make the fix from the plan (root level, not just the symptom) and the detection guard. Show the same test
@@ -1058,7 +1058,7 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
 6. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post` for a finished fix
    (David archived those unread and the inbox muted the poster). Write `result.md` (what changed with commits,
    the red/green test output, the live proof, and the undo command) and run
-   `python3 {SELF} event fixed {fp} --card $HERMES_KANBAN_TASK --note "<commit sha>" --result result.md`.
+   `python3 {SELF} event fixed {fp} --note "<commit sha>" --result result.md`.
    That stores the result under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed; the card's
    kanban_complete summary carries it too. Nothing reaches the Inbox.
 7. Complete the card. If something irreversible or external blocks the fix, kanban_block with the exact ask instead.
@@ -2366,6 +2366,23 @@ EVENT_STATUS = {"proposed": "proposed", "fixed": "fixed", "not_defect": "not_def
                 "declined": "declined", "duplicate": "approved"}
 
 
+def resolve_event_card(card: str, st: dict) -> str:
+    """The card an `event` reports for, when `--card` is omitted.
+
+    Briefs print the command without `--card`: Hermes scrubs ``HERMES_KANBAN_TASK`` from a worker's tool children
+    (terminal, execute_code: ``scrub_kanban_env``) and exports ``HERMES_KANBAN_WORKER_TASK`` there instead, so a
+    `--card $HERMES_KANBAN_TASK` line expanded to a bare `--card` and argparse exited 2. Order: explicit `--card`,
+    the worker process's own id, the tool-child marker, then the fingerprint's recorded card (the fix card once
+    approved, else the investigation card)."""
+    for c in (card, os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_WORKER_TASK")):
+        c = (c or "").strip()
+        if c:
+            return c
+    if st.get("status") == "approved" and st.get("fix_card"):
+        return st["fix_card"]
+    return st.get("card") or st.get("fix_card") or ""
+
+
 def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None, now: Optional[float] = None,
                  owner: str = "", result: str = "") -> dict:
     """`self_heal.py event <kind> <fp>`: cards report their lifecycle; logged as selfheal_<kind>.
@@ -2375,10 +2392,11 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     now = now or time.time()
     if kind not in EVENT_STATUS:
         raise ValueError(f"unknown event {kind}; one of {sorted(EVENT_STATUS)}")
-    if kind == "duplicate" and (not _CARD_ID.fullmatch(owner) or owner == card):
-        raise ValueError("duplicate requires a distinct --owner t_<hex> card")
     lane = LaneState(store.root)
     st = lane.get(fp)
+    card = resolve_event_card(card, st)
+    if kind == "duplicate" and (not _CARD_ID.fullmatch(owner) or owner == card):
+        raise ValueError("duplicate requires a distinct --owner t_<hex> card")
     kw: dict = {"status": EVENT_STATUS[kind]}
     cron_check = None
     if result and kind != "fixed":
