@@ -303,8 +303,9 @@ async def _run_timed(key, fn):
                         done - entered, _default_backlog(loop))
         if done - entered >= _SLOW_LOG_S:
             t0 = started.get("t", done)
-            log.warning("hub-sync slow poll key=%r total=%.2fs queue=%.2fs run=%.2fs default_backlog=%s",
-                        key, done - entered, t0 - entered, done - t0, _default_backlog(loop))
+            # pid: the gateway, the dashboard and each Desktop serve log to the same agent.log
+            log.warning("hub-sync slow poll key=%r total=%.2fs queue=%.2fs run=%.2fs default_backlog=%s pid=%d",
+                        key, done - entered, t0 - entered, done - t0, _default_backlog(loop), os.getpid())
 
 
 async def _cold_answer(flight: asyncio.Task):
