@@ -711,3 +711,35 @@ def test_incident_replay_keeps_update_pause_note_quiet(tmp_path):
     fired = {(f["sid"], f["idx"]): f for f in res["fps"]}
     assert ("p", 0) not in fired
     assert fired[("k", 0)]["sym"] == "turn interrupted (backend stopped)"
+
+
+# Live check of agent-6eb3a51e94: the terminal tool's error line is its JSON result (truncated to 120 chars by the turn
+# log), so the symptom read `repeated terminal error: {"output": "Error: unable to open database \" \": unabl`.
+def test_repeat_failure_unwraps_a_json_tool_result():
+    res = ('{"output": "Error: unable to open database \\"/home/u/.hermes/cache/scratch/probe/x.db\\": unable to open '
+           'database file", "exit_code": 1, "error": null}')[:120]
+    log = ["-> terminal(sqlite3 /home/u/.hermes/cache/scratch/probe/x.db 'select 1')", f"   <- ERROR {res}"] * 3
+    hit = sh.machine_signal("done", log)
+    assert hit["symptom"].startswith("repeated terminal error: Error: unable to open database"), hit["symptom"]
+    assert "{" not in hit["symptom"] and '\\"' not in hit["symptom"] and '"' not in hit["symptom"]
+    err = '{"error": "kanban.db: database is locked (5)", "success": false}'
+    lk = sh.machine_signal("done", ["-> kanban_show(task_id='t_01a18f450bc2683c')", f"   <- ERROR {err}"] * 3)
+    assert lk["symptom"] == "repeated kanban_show error: kanban.db: database is locked", lk["symptom"]
+
+
+# Live check of agent-6eb3a51e94: a long-running gateway hot-reloads self_heal.py but keeps the coach __init__ it
+# booted with, which passed only the reply tail as evidence. handle() itself must lead with the hit's evidence.
+def test_handle_leads_with_the_hit_evidence_whatever_the_caller_passes(tmp_path):
+    store = core.Store(tmp_path / "coach")
+    hit = sh.machine_signal("done", OVERLAP)
+    got = []
+    sh.handle(hit, "s1", store, evidence="Done; the fleet shows a clean trend.", m="shadow",
+              filer=lambda d, store=None, m=None: got.append(d))
+    (det,) = events(tmp_path)
+    assert det["evidence"].startswith("kanban_create failed 3x") and "clean trend" in det["evidence"]
+    assert "create_overlap: refused" in got[0]["quote"] and "clean trend" in got[0]["quote"]
+    # a caller that already leads with it is not doubled
+    sh.handle({**hit, "fingerprint": "agent-other"}, "s2", store,
+              evidence=f"{hit['evidence']} | reply: Done.", m="shadow", filer=lambda d, store=None, m=None: None)
+    det2 = events(tmp_path)[-1]
+    assert det2["evidence"].count("kanban_create failed 3x") == 1

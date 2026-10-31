@@ -518,8 +518,9 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   `turn lease lost`, `Turn stopped by`, `the turn stopped while a tool result was still pending`); the tool log counts
   only for an empty reply whose last line is a cancelled tool, since its `-> tool(args)` lines carry command text.
   A repeated tool error files as `repeated <tool> error: <normalized error>` (card/session ids, paths, hex and numbers
-  stripped), so each distinct failure is its own fingerprint, and its evidence (the tool, error line, count and last
-  call) leads the defect quote. Owner adoption for any machine signal takes a session card only when its title or
+  stripped; a JSON tool result is unwrapped to its error/output string), so each distinct failure is its own
+  fingerprint, and its evidence (the tool, error line, count and last call) leads the defect quote. `handle()` adds it
+  itself, so a gateway that hot-reloaded `self_heal.py` under an older `__init__.py` still records it. Owner adoption for any machine signal takes a session card only when its title or
   body names the tool (unless generic, like `terminal`) or the error's words; otherwise it files
   (`selfheal_adopt_skipped`). Origin: agent-6eb3a51e94, one fixed label lumped every repeated error together.
   A backend that stops mid-turn never reaches this hook: the next user turn, core's `[System note: Your previous turn

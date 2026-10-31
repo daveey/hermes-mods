@@ -269,13 +269,38 @@ _ERR_NORM = [
     (re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,}\b", re.I), " "),  # hex shas/ids
     (re.compile(r"\d+"), " "),
     (re.compile(r"\(\s*\)|\[\s*\]"), " "),
+    (re.compile(r"[\\\"'`]+\s*[\\\"'`]*"), " "),  # quotes left around a stripped path
     (re.compile(r"\s+"), " "),
 ]
 
 
+_JSON_FIELD_RE = re.compile(r'"(error|message|stderr|output)"\s*:\s*"((?:[^"\\]|\\.)*)')
+
+
+def unwrap_tool_error(err: str) -> str:
+    """The error text inside a tool's JSON result (`{"output": "Error: ...", "exit_code": 1}`, often truncated by the
+    turn log so json.loads fails): the first non-empty error/message/stderr/output string, else the text itself."""
+    t = str(err or "").strip()
+    if not t.startswith("{"):
+        return t
+    try:
+        obj = json.loads(t)
+        if isinstance(obj, dict):
+            for k in ("error", "message", "stderr", "output"):
+                if isinstance(obj.get(k), str) and obj[k].strip():
+                    return obj[k].strip()
+    except ValueError:
+        pass
+    found = {k: v for k, v in reversed(_JSON_FIELD_RE.findall(t)) if v.strip()}
+    for k in ("error", "message", "stderr", "output"):
+        if k in found:
+            return found[k].replace('\\"', '"').replace("\\n", " ").strip()
+    return t
+
+
 def normalize_error(err: str) -> str:
     """Error text with the parts that vary between occurrences of one error (ids, paths, hex, numbers) removed."""
-    t = str(err or "")
+    t = unwrap_tool_error(err)
     for rx, sub in _ERR_NORM:
         t = rx.sub(sub, t)
     return t.strip(" :,;.-")
@@ -704,6 +729,11 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     if not hit:
         return None
     m = m or mode()
+    # A machine signal carries what failed; lead with it here, not only in the caller, because a long-running gateway
+    # re-execs this module on change but keeps the coach __init__ it booted with (agent-6eb3a51e94 live check).
+    hit_ev = str(hit.get("evidence") or "")
+    if hit_ev and not str(evidence or "").startswith(hit_ev[:60]):
+        evidence = f"{hit_ev[:300]} | reply: {str(evidence or '')[-180:]}"
     new = Fingerprints(store.root).record(hit, session_id)
     rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
            "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
