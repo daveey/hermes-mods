@@ -63,6 +63,14 @@ say what's running, never what needs the user.
 - For a completion sweep ("get all sessions green"), treat dispatch as intermediate, not completion.
   For each non-green session, inspect the remaining deliverable and why it stopped; resolve asks
   within existing authority, then resume concrete work or take it over rather than only nudging.
+- Verify execution after dispatch: `cross_session.send` can return `delivered=true, status=streaming`
+  while agent initialization subsequently fails. Read back the exact message, then require a new tool
+  operation or substantive conclusion; correlate a silent chat's runtime ID with `logs/errors.log`.
+  For authorized session-only model recovery, use the owning Desktop route's `config.set` RPC
+  (`key=model`, concrete model plus `--provider`), never global/profile edits. If it reports
+  `Exact pinned route cannot fail over`, inspect durable routing provenance: a failed pre-build
+  switch may retain the old allocation. Preserve independent-review identity gates; do not edit
+  SQLite or claim the switch worked without a successful RPC readback and actual execution.
 - Finish in the originating session: a conclusion stating what was done, what was verified and
   why the work is finished, plus its done outcome. For obsolete work, state why it is no longer
   relevant instead of claiming implementation success. Archiving is not a substitute for this conclusion.
