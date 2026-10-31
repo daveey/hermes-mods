@@ -556,6 +556,20 @@ def test_non_interactive_source_gets_no_tool(plugin, monkeypatch):
         assert plugin.check_fn() is True
 
 
+def test_gateway_local_turn_of_a_desktop_chat_gets_the_tool(plugin, monkeypatch):
+    """A Desktop chat's turn admitted through the gateway's ``local`` platform (a cross-session send, a
+    notice) binds HERMES_SESSION_PLATFORM=local and no HERMES_SESSION_SOURCE. The tool must follow the
+    chat's stored source, like the gate does, or the gate asks for a call the chat cannot make."""
+    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "local")
+    for sid, offered in (("S1", True), ("T1", True), ("C1", True), ("K1", False), ("R1", False)):
+        monkeypatch.setenv("HERMES_SESSION_ID", sid)
+        assert plugin.check_fn() is offered, sid
+        assert plugin._interactive("local", sid) is offered, sid  # gate and tool agree
+    monkeypatch.delenv("HERMES_SESSION_ID")
+    assert plugin.check_fn() is False  # no session row: the bare surface still decides
+
+
 def test_non_interactive_session_refused_and_not_gated(plugin, fake):
     for sid in ("K1", "R1"):
         out = call(plugin, {"kind": "done", "summary": "x"}, sid=sid)

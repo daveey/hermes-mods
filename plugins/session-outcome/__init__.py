@@ -138,8 +138,11 @@ def _interactive(platform: str = "", session_id: str = "") -> bool:
 
 
 def check_fn() -> bool:
-    """Offer the tool only to desktop/tui/cli chats, and only when core can store the outcome."""
-    return _outcome_api() is not None and _interactive()
+    """Offer the tool only to desktop/tui/cli chats, and only when core can store the outcome. The bound
+    session's stored source decides first, exactly as in the gate: a Desktop chat's turn admitted through
+    the gateway's ``local`` platform (cross-session send, notice) binds no HERMES_SESSION_SOURCE, so the
+    bare surface reads ``local`` and would hide the tool the gate then asks the chat to call."""
+    return _outcome_api() is not None and _interactive("", _session_env("HERMES_SESSION_ID"))
 
 
 try:  # evaluated per tool-list build, never cached across sessions
