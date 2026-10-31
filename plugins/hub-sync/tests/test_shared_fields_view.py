@@ -141,3 +141,32 @@ def test_an_inbox_act_stays_a_request_in_primary(env):
         assert c.execute("SELECT COUNT(*) FROM shared_out").fetchone()[0] == 0
     finally:
         c.close()
+
+
+def _full_sessions(hv, gateway=None, exclude=(), include_archived=False, limit=500):
+    """The pre-pagination read: decorate every row, then filter, sort and cut."""
+    def fn(v):
+        rows = [r for r in v.rows("sessions") if (not gateway or r["gateway"] == gateway)
+                and r["gateway"] not in set(exclude) and (include_archived or not r.get("archived"))]
+        rows.sort(key=lambda r: -(r.get("activity") or r.get("started_at") or 0))
+        return {"sessions": rows[:limit]}
+    return hv._with_view(fn, sessions=[])["sessions"]
+
+
+def test_sessions_page_matches_a_full_decorated_read_with_overrides(env):
+    hv, client, db = env
+    _mode(db, "primary")
+    all_rows = hv.sessions(include_archived=True)["sessions"]
+    mini = next(s for s in all_rows if s["gateway"] == "mini" and not s.get("archived"))
+    old = next(s for s in all_rows if s.get("archived"))
+    _override(db, mini["gateway"], "sessions", mini["key"], "archived", True)    # hidden by an override
+    _override(db, old["gateway"], "sessions", old["key"], "archived", False)     # un-archived by an override
+    _override(db, mini["gateway"], "sessions", mini["key"], "title", "Renamed")
+    for kw in ({}, {"include_archived": True}, {"gateway": "mini"}, {"exclude": ["mini"]}, {"limit": 1}, {"limit": 2}):
+        got = hv.sessions(**kw)["sessions"]
+        assert got == _full_sessions(hv, **kw), kw
+    keys = {(s["gateway"], s["key"]) for s in hv.sessions()["sessions"]}
+    assert (mini["gateway"], mini["key"]) not in keys and (old["gateway"], old["key"]) in keys
+    before = hv.sessions(include_archived=True)["sessions"]
+    hv.sessions(limit=1)
+    assert hv.sessions(include_archived=True)["sessions"] == before  # cache rows are not mutated

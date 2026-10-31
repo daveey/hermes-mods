@@ -329,30 +329,45 @@ class View:
             _DECODED[key] = (sig, out, (by_key, high, seqs))
         return out
 
-    def rows(self, coll: str) -> List[dict]:
+    def rows(self, coll: str, pick=None) -> List[dict]:
         """Own records from `published`, other gateways' from `replica` (never own rows twice), with shared-field
-        overrides on top when the collection is in primary mode."""
-        out = []
-        pend = self.pending()
+        overrides on top when the collection is in primary mode.
+
+        ``pick`` takes the undecorated candidates ``[(gateway, key, data, row, local)]`` (``data`` is shared with the decode
+        cache: read only) and returns the subset to decorate, in order. Decorating copies a dict, attaches pending
+        actions and applies overrides per row, which is the bulk of a ``sessions`` read over ~11k rows when only a
+        few hundred are served."""
+        cands = []  # (gateway, key, data, row, local)
         if _has(self.conn, "published"):
             for r, data in self._decoded("published", coll):
-                d = dict(data)
-                d.update(gateway=self.gateway, key=r["key"], version=r["version"], local=True, stale=False,
-                         synced_at=self.now, pending=pend.get((self.gateway, coll, r["key"]), []))
-                out.append(d)
+                cands.append((self.gateway, r["key"], data, r, True))
         if _has(self.conn, "replica"):
-            stale = self.hub_stale()
-            synced = {}  # per gateway, not per row (~16k rows, a handful of gateways)
             for r, data in self._decoded("replica", coll):
-                d = dict(data)
-                gw = r["gw"]
+                cands.append((r["gw"], r["key"], data, r, False))
+        if pick is not None:
+            cands = pick(cands)
+        pend = self.pending()
+        out = []
+        stale = self.hub_stale() if any(not c[4] for c in cands) else False
+        synced = {}  # per gateway, not per row (~16k rows, a handful of gateways)
+        for gw, _key, data, r, local in cands:
+            d = dict(data)
+            if local:
+                d.update(gateway=gw, key=r["key"], version=r["version"], local=True, stale=False,
+                         synced_at=self.now, pending=pend.get((gw, coll, r["key"]), []))
+            else:
                 if gw not in synced:
                     synced[gw] = self.synced_at(gw)
                 d.update(gateway=gw, key=r["key"], version=r["version"], local=False, stale=stale,
                          synced_at=synced[gw], updated_at_hub=(r["updated_at"] or 0) / 1000.0,
-                         pending=pend.get((r["gw"], coll, r["key"]), []))
-                out.append(d)
+                         pending=pend.get((gw, coll, r["key"]), []))
+            out.append(d)
         return [self._overlay(coll, d) for d in out]
+
+    def effective(self, coll: str, gw: str, key: str, data: dict, field: str):
+        """``data[field]`` as ``rows`` would serve it after the shared-field overlay, without building the row."""
+        o = self.overrides(coll).get((gw, key), {}).get(field)
+        return o["value"] if o is not None and field != "pending_action" else data.get(field)
 
     def gateways(self) -> List[dict]:
         names = set(self.owner_seen())
@@ -445,9 +460,17 @@ def _gw_filter(rows, gateway: Optional[str], exclude: Iterable[str]):
 def sessions(gateway: Optional[str] = None, exclude: Iterable[str] = (), include_archived: bool = False,
              limit: int = 500) -> dict:
     def fn(v: View):
-        rows = [r for r in _gw_filter(v.rows("sessions"), gateway, exclude)
-                if include_archived or not r.get("archived")]
-        return {"sessions": _sort_activity(rows)[:max(1, min(limit, 5000))]}
+        def pick(cands):
+            ex = {g for g in exclude if g}
+            rows = [c for c in cands if (not gateway or c[0] == gateway) and c[0] not in ex
+                    and (include_archived or not v.effective("sessions", c[0], c[1], c[2], "archived"))]
+            def act(c):
+                g, k, d = c[:3]
+                return -(v.effective("sessions", g, k, d, "activity") or v.effective("sessions", g, k, d, "started_at") or 0)
+            rows.sort(key=act)
+            return rows[:max(1, min(limit, 5000))]
+        rows = _sort_activity(v.rows("sessions", pick))  # same stable order the full read gave
+        return {"sessions": rows[:max(1, min(limit, 5000))]}
     return _with_view(fn, sessions=[])
 
 
