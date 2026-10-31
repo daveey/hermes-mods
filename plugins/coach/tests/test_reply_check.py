@@ -845,6 +845,53 @@ def test_status_only_still_fires_on_the_human_ask_about_a_card():
     assert rc.status_only("so why is the [Kanban close-out] still waiting?", reply, ["-> kanban_show(t_x)"])
 
 
+# --- agent-e80aa5e107: the Kanban worker prompt is dispatcher-written and re-sent unchanged on every wake. status_only
+# read "finish it" in a card body's quote of David's standing mandate as a progress ask and held a shepherd that had
+# linked a follow-up and parked on it (@session:default/local-465bb476…, state.db 486189/486207).
+KANBAN_WAKE_ASK = (
+    "# Kanban task t_7d17e13d: Upkeep system shepherd · drive graph to completion and ship\n\nAssignee: default\n"
+    "Status:   running\nWorkspace: scratch @ /tmp/w\n\n## Body\nORCHESTRATOR card: do not implement phase work. Drive "
+    "the graph; fix resolvable stalls yourself within the approved mandate (David: \"unblock the task and finish it\"; "
+    "standing merge/ship approval).\n\n## Recent work by @default\n- t_x — something (just now)\n")
+KANBAN_WAKE_REPLY = (
+    "Nothing here is left for me to do. The shepherd card is an orchestrator card, and it can't implement the phase "
+    "work. P4a (t_ed0dc8ac) is running; t_01a19026c03f0589 is probing the phone. I linked it into SHIP and parked "
+    "on it.")
+KANBAN_WAKE_LOG = ['-> kanban_show({"task_id": "t_01a19026c03f0589"})', '-> kanban_link({"parent_id": "t_01a19026"})',
+                   '-> kanban_comment({"task_id": "t_7d17e13d"})', '-> kanban_block({"kind": "time"})']
+
+
+def test_status_only_skips_the_kanban_worker_prompt():
+    assert rc.PROGRESS_ASK_RE.search(KANBAN_WAKE_ASK)  # the body's quoted mandate says "finish it"
+    assert rc.status_only(KANBAN_WAKE_ASK, KANBAN_WAKE_REPLY, KANBAN_WAKE_LOG) is None
+
+
+def test_status_only_still_fires_on_a_human_finish_ask_with_the_same_turn():
+    hit = rc.status_only("why is this still not finished?", KANBAN_WAKE_REPLY, KANBAN_WAKE_LOG)
+    assert hit and "kanban_link" in hit
+    # a human quoting the header mid-message is not the dispatcher prompt (only the anchored header counts)
+    assert rc.status_only("so finish it: # Kanban task t_x: y", KANBAN_WAKE_REPLY, KANBAN_WAKE_LOG)
+
+
+def test_check_returns_no_status_only_hold_on_the_kanban_worker_prompt():
+    llm = lambda s, p: json.dumps({k: 0 for k in rc.RULES})
+    hit = rc.check(KANBAN_WAKE_REPLY, KANBAN_WAKE_ASK, KANBAN_WAKE_LOG, llm, only=["status_only"])
+    assert not hit or hit["rule"] != "status_only"
+
+
+def _kanban_worker_prompt_from_core() -> str:
+    """The real core producer's header (kanban_db_context._ctx_header), rendered, plus a body quoting a mandate."""
+    import ast
+    path = CORE / "hermes_cli" / "kanban_db_context.py"
+    assert path.is_file(), f"core checkout missing: set HERMES_AGENT_DIR (looked at {path})"
+    fn = next(n for n in ast.walk(ast.parse(path.read_text()))
+              if isinstance(n, ast.FunctionDef) and n.name == "_ctx_header")
+    first = next(n for n in ast.walk(fn) if isinstance(n, ast.JoinedStr))
+    header = "".join(v.value if isinstance(v, ast.Constant) else {"task.id": "t_x", "task.title": "T"}[
+        ast.unparse(v.value)] for v in first.values)
+    return header + "\n\nAssignee: default\n\n## Body\nunblock the task and finish it\n"
+
+
 def test_notice_turn_recognizes_every_prompt_producer_text():
     """Drift guard: the producers' real text, not a copy. A new prompt envelope must be added to NOTICE_RE."""
     path = CORE / "tui_gateway" / "notice_guarantee.py"
@@ -861,6 +908,10 @@ def test_notice_turn_recognizes_every_prompt_producer_text():
     sh = _mod("self_heal")  # the complaint lane must not read them as user complaints either
     for text in texts + [_ask_relay_prompt()]:
         assert sh.SYNTHETIC_RE.match(text), text[:60]
+    # every automation prompt, the Kanban worker prompt included (agent-e80aa5e107), is exempt from status_only
+    for text in texts + [_ask_relay_prompt(), _kanban_worker_prompt_from_core()]:
+        assert rc.automation_prompt(text), text[:60]
+        assert rc.status_only(text + "\nfinish it", "Parked on t_y.", ["-> kanban_show(t_x)"]) is None, text[:60]
 
 
 # --- agent-f668487724: past the confirm cap the screen alone (57% agreement with the second opinion) nudged a worker

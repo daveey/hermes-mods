@@ -303,10 +303,12 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
 
     A Hermes-written prompt (notice_turn: [Kanban close-out], [chat-closeout], owner-wake ...) is never the user asking
     about progress: its fixed wording ("what you are still waiting on") and the card asks it quotes ("unblock =
-    complete it") matched the progress pattern on every close-out (agent-21185525f4). report_only and the judge
-    still review those turns."""
+    complete it") matched the progress pattern on every close-out (agent-21185525f4). The Kanban worker prompt
+    ("# Kanban task <id>: ...") is automation too: the dispatcher re-sends the card body unchanged on every wake, and
+    a body quoting a standing mandate ("unblock the task and finish it") held a shepherd that had parked correctly
+    (agent-e80aa5e107). report_only and the judge still review those turns."""
     user_ask = (user_ask or "")[:ASK_HEAD]
-    if notice_turn(user_ask) or not PROGRESS_ASK_RE.search(user_ask) or not (reply or "").strip():
+    if automation_prompt(user_ask) or not PROGRESS_ASK_RE.search(user_ask) or not (reply or "").strip():
         return None
     kinds = [k for k in (_tool_kind(l) for l in tool_log or []) if k]
     if "work" in kinds or "card" not in kinds:
@@ -1025,6 +1027,12 @@ NOTICE_RE = re.compile(
 def notice_turn(user_ask: str) -> bool:
     """Only anchored automation envelopes, never a human question mentioning a notice."""
     return bool(NOTICE_RE.search(user_ask or ""))
+
+
+def automation_prompt(user_ask: str) -> bool:
+    """A Hermes-written prompt, not a human asking now: a notice envelope or the dispatcher's Kanban worker prompt
+    (anchored header only; agent-e80aa5e107). Rules that read the ask as the user's live question skip these."""
+    return notice_turn(user_ask) or bool(KANBAN_PROMPT_RE.match(user_ask or ""))
 
 
 NOTICE_CONTEXT = """AUTOMATED NOTICE, not a human request for a read-only status update. The notice supplies a worker's

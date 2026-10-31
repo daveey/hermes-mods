@@ -105,7 +105,11 @@ the user wrote "can you just finish it please?". The report_only owner check cou
 a git commit, a test run, `kanban_create`, `delegate_task`) counts as work and keeps it quiet, as does an explicit scope
 limit. It runs before the judge, logs `reply_nudge` with `rule=status_only`, and `COACH_REPLY_RULES` without it turns
 it off. Tests: `tests/test_status_only.py` (the four real asks and replies; their tool logs are rebuilt from what each
-reply says it did, because the coach digest keeps replies but not tool logs).
+reply says it did, because the coach digest keeps replies but not tool logs). Hermes-written prompts are never the
+user asking now (`automation_prompt`): notice envelopes ([Kanban close-out], [chat-closeout], owner-wake ...) and the
+dispatcher's Kanban worker prompt (`# Kanban task <id>: ...`, re-sent unchanged on every wake), whose card body quoting
+"unblock the task and finish it" held a shepherd that had parked correctly (agent-e80aa5e107). report_only and the
+judge still review those turns; `test_notice_turn_recognizes_every_prompt_producer_text` renders core's real header.
 
 Measured on 360 real replies against hindsight labels (the labeler also saw the user's next message). At
 threshold 0.7: `handoff` precision 0.91, recall 0.33; `confirm` precision 1.0 on 4 fires, recall 0.11. Held-out
