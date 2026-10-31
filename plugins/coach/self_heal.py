@@ -44,6 +44,60 @@ SYNTHETIC_RE = re.compile(
 # fixed the reply is judged by its reply_nudge_outcome (signals.collect_coach), never by the complaint backstop.
 # Plugin-appended blocks that are not the user's words.
 TRAILER_RE = re.compile(r"\n?\s*(?:\[user-steps\]|--- Attached Context ---|Session link\(s\) @session).*", re.S)
+# A deliberate live probe of a detector (agent-771fbd2b85): a session whose FIRST user message starts with
+# `[selfheal-probe]` (or the older "Live test of a detector" wording) fails on purpose. Every entry path (handle,
+# file_defect, retry_deferred) logs `selfheal_skip why=probe` for it and files nothing; deleting pending rows by hand
+# did not hold, because a deferred retry refiled the probe later.
+PROBE_RE = re.compile(r"^\s*(?:\[selfheal-probe\]|Live test of a detector\b)", re.I)
+
+
+def first_user_message(session_id: str, home: Optional[Path] = None) -> Optional[str]:
+    """The session's first stored user message (cleaned) from <HERMES_HOME>/state.db; None when the session has no
+    user row on this host or the db cannot be read (fail-open: the caller treats that as not a probe)."""
+    if not session_id:
+        return None
+    import sqlite3
+    path = Path(home or os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "state.db"
+    if not path.is_file():
+        return None
+    try:
+        try:
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            db.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        except sqlite3.Error:
+            db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5)
+            db.execute("PRAGMA query_only=ON")
+        try:
+            row = db.execute("SELECT content FROM messages WHERE session_id=? AND role='user' "
+                             "ORDER BY timestamp, id LIMIT 1", (session_id,)).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    content = row[0]
+    try:
+        parsed = json.loads(content) if isinstance(content, str) and content[:1] == "[" else None
+        if isinstance(parsed, list):
+            content = parsed
+    except ValueError:
+        pass
+    return clean_user(content)
+
+
+def probe_session(session_id: str, ask: str = "", home: Optional[Path] = None) -> bool:
+    """True when the session is a deliberate detector probe: its first stored user message starts with the marker,
+    or (no user row stored yet, e.g. the first turn's hook runs before the write) the turn's own ask does."""
+    first = first_user_message(session_id, home)
+    if first is None:
+        first = clean_user(ask) if ask else ""
+    return bool(PROBE_RE.match(first or ""))
+
+
+def probe_defect(d: dict) -> bool:
+    """A defect payload from a probe: an explicit `probe` flag (set by another host), else the session lookup."""
+    return bool(d.get("probe")) or probe_session(str(d.get("session_id") or ""))
 
 ADMIT_RE = re.compile(
     r"\b(my mistake|my (?:bad|fault|error)|that was (?:my|a) mistake|i (?:was wrong|missed|forgot|skipped|"
@@ -723,9 +777,10 @@ class Fingerprints:
 
 
 def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: Optional[str] = None,
-           filer: Optional[Callable] = None, platform: str = "") -> Optional[dict]:
+           filer: Optional[Callable] = None, platform: str = "", ask: str = "") -> Optional[dict]:
     """Log a detection and hand a new fingerprint (first time today) to the lane: `file_defect` logs
-    `selfheal_would_file` in shadow mode and files the investigation card on the hub in live mode."""
+    `selfheal_would_file` in shadow mode and files the investigation card on the hub in live mode. A deliberate
+    detector probe (`probe_session`) is logged and skipped: no fingerprint record, no queue row, no filing."""
     if not hit:
         return None
     m = m or mode()
@@ -734,6 +789,14 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     hit_ev = str(hit.get("evidence") or "")
     if hit_ev and not str(evidence or "").startswith(hit_ev[:60]):
         evidence = f"{hit_ev[:300]} | reply: {str(evidence or '')[-180:]}"
+    if probe_session(session_id, ask):
+        rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
+               "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
+               "fingerprint": hit["fingerprint"], "new": False, "probe": True, "evidence": (evidence or "")[:300]}
+        store.log(rec)
+        store.log({"event": "selfheal_skip", "mode": m, "fingerprint": hit["fingerprint"], "why": "probe",
+                   "session_id": session_id})
+        return rec
     new = Fingerprints(store.root).record(hit, session_id)
     rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
            "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
@@ -1165,6 +1228,9 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
    PASSING, plus the module's existing tests.
 4. {ship}
 5. Verify live on the real path (the surface/command/session type where it happened), and capture the proof.
+   A live probe that makes a detector fire on purpose starts its first prompt with `[selfheal-probe]` (e.g.
+   `hermes chat -q '[selfheal-probe] ...'`): the lane then logs `selfheal_skip why=probe` and files nothing.
+   Check that log line; never delete selfheal_pending rows by hand (a deferred retry refiles them).
 6. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post` for a finished fix
    (David archived those unread and the inbox muted the poster). Write `result.md` (what changed with commits,
    the red/green test output, the live proof, and the undo command) and run
@@ -2326,6 +2392,10 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     fp = d["fingerprint"]
     if m == "off":
         return {"action": "skip", "why": "COACH_SELFHEAL=off"}
+    if probe_defect(d):  # every path lands here, incl. retry_deferred and payloads forwarded from other hosts
+        store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": "probe",
+                   "session_id": d.get("session_id")})
+        return {"action": "skip", "why": "probe"}
     hub = is_hub(cfg)
     if m == "live" and not hub:
         rc, out, err = _run(hub_ssh_argv(cfg) + [cfg["hub_ssh"],

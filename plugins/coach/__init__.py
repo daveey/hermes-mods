@@ -357,7 +357,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 lead = ("update pause continued" if hit.get("symptom", "").startswith("update pause")
                         else "backend stopped mid-turn; chat resumed")
                 evidence = f"{lead} {hit['gap_s'] // 60} min later. {evidence}"
-            sh.handle(hit, session_id, store, evidence=evidence, platform=platform)
+            sh.handle(hit, session_id, store, evidence=evidence, platform=platform, ask=user_message)
         except Exception as exc:
             log.debug("coach self_heal complaint: %s", exc)
 
@@ -372,7 +372,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             # A machine signal carries what failed (tool, error line, count): lead with it, then the reply tail.
             evidence = (f"{hit['evidence'][:300]} | reply: {reply[-180:]}" if hit and hit.get("evidence")
                         else reply[-300:])
-            sh.handle(hit, session_id, store, evidence=evidence, platform=platform)
+            sh.handle(hit, session_id, store, evidence=evidence, platform=platform, ask=ask)
         except Exception as exc:
             log.debug("coach self_heal admission: %s", exc)
 

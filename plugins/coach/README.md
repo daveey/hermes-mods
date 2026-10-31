@@ -556,7 +556,11 @@ after a Stop, and rows from older cores (no reason) are judged as before. Count 
 Both run in a background thread (the turn never waits) and are fail-open. They skip cron, subagents and Kanban
 workers. The complaint prefilter also rejects cross-session courier messages, generated blocked-card notices and
 standalone chat-closeout messages before any judge call. Those are coordination, not fresh user complaints;
-underlying failures remain eligible through machine signals. Real user text before an appended notice is retained. `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to
+underlying failures remain eligible through machine signals. Real user text before an appended notice is retained.
+A deliberate detector probe, a session whose first user message (`state.db`, else the turn's own ask) starts with
+`[selfheal-probe]` or "Live test of a detector", is logged (`selfheal_detect` with `probe: true`, then
+`selfheal_skip why=probe`) and never filed: `handle`, `file_defect` and the deferred retry all check it, and a payload
+from another host can carry `"probe": true` (agent-771fbd2b85; tests `tests/test_self_heal_probe.py`). `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to
 `coach/log.jsonl`; live also appends the defect to `coach/selfheal_queue.jsonl` for the self-heal lane, once per
 fingerprint per UTC day (`coach/selfheal.json` holds the fingerprints). The fingerprint is a hash of the component
 and the symptom's stemmed content words, so "sidebar sessions reshuffle" and "session sidebar reshuffles" match.
