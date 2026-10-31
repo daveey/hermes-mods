@@ -1259,3 +1259,48 @@ def test_free_text_message_keeps_the_fingerprint_it_had_before():
     old = sg.fp(row["component"], "tb", "ValueError", "session_store.py:release_turn")
     assert row["fp"] == old
     assert _fp_of("ValueError: bad value 123 for x") == _fp_of("ValueError: bad value 456 for x")
+
+
+# ── a nudge whose revision never reached the user (self-heal agent-77325213e1: a background-review fork) ─────
+
+def _fork_home(tmp_path, revised, rows):
+    """A coach home with one report_only nudge whose failed revision is `revised`, and a state.db holding `rows`
+    (role, content) for that session."""
+    import sqlite3
+    nudge = {**NUDGE, "rule": "report_only", "outcome": True, "evidence": "Final reports documenting limits"}
+    h = _coach_home(tmp_path, [nudge, {**_outcome(False), "rule": "report_only", "reply": revised}])
+    db = sqlite3.connect(h / "state.db")
+    db.execute("create table messages (id integer primary key, session_id text, role text, content text,"
+               " timestamp real, active integer default 1)")
+    db.executemany("insert into messages (session_id, role, content, timestamp) values (?, ?, ?, ?)",
+                   [(NUDGE["session_id"], r, c, NOW - 200) for r, c in rows])
+    db.commit()
+    db.close()
+    return h
+
+
+def test_revision_missing_from_the_session_routes_as_coach_fork_bug(tmp_path):
+    h = _fork_home(tmp_path, "The rating page is already fixed and live in the chat, two messages up.",
+                   [("user", "submit isnt working"), ("assistant", "Fixed the rating page; Submit now saves.")])
+    got = sg.collect_coach(h, {}, NOW)
+    assert len(got) == 1
+    s = got[0]
+    assert s["component"] == "coach" and "never reached the user" in s["symptom"]
+    assert "agent's revised reply" not in s["symptom"]
+    assert s["fp"] == sg.fp("coach", "judged_unsent_draft", "report_only")
+
+
+def test_revision_present_in_the_session_still_files_as_agent_defect(tmp_path):
+    text = "Here is what I documented about the Submit limits; the save path is untested."
+    h = _fork_home(tmp_path, text, [("user", "submit isnt working"), ("assistant", text + "\n\nMore detail.")])
+    got = sg.collect_coach(h, {}, NOW)
+    assert len(got) == 1 and got[0]["component"] == "agent"
+    assert "agent's revised reply still failed the coach report_only check" in got[0]["symptom"]
+
+
+def test_revision_check_without_state_db_files_as_agent_defect(tmp_path):
+    nudge = {**NUDGE, "rule": "report_only", "outcome": True}
+    h = _coach_home(tmp_path, [nudge, {**_outcome(False), "rule": "report_only",
+                                       "reply": "A revision long enough to compare with stored rows."}])
+    got = sg.collect_coach(h, {}, NOW)
+    assert len(got) == 1 and got[0]["component"] == "agent"

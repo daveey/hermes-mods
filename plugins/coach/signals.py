@@ -24,7 +24,9 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               (unplanned SIGTERM bounce) or `gateway.start_refused` (second start refused next to a live
               gateway) only as a storm: 3+ in 10 min per profile; a refusal by a dead owner pid always;
 - coach       coach `fixloop_card` (2nd confirmed failure of a fix) and reply_check `reply_nudge` events (any
-              rule) whose `reply_nudge_outcome` says the revised reply still fails (or none came within 15 min).
+              rule) whose `reply_nudge_outcome` says the revised reply still fails (or none came within 15 min);
+              a failed revision that is in no assistant row of its session (a detached fork's text the user never
+              saw) files as a coach bug (`judged_unsent_draft`), not an agent defect.
 Profiles (<home>/profiles/*) are swept too, except the coach log, which lives in <home>/coach only.
 
 Every collector reads from a cursor (<home>/coach/signals-cursor.json: byte offsets + inode per log, last seen
@@ -984,6 +986,53 @@ def _outcome_matches(n: dict, o: dict) -> bool:
     return -5 <= dt <= HANDOFF_GRACE_S
 
 
+def _squash(s: str) -> str:
+    return " ".join(str(s or "").split())
+
+
+def unsent_reply(home: Path, session_id: str, reply: str) -> bool:
+    """True when a nudge's revised reply provably never became an assistant row of its session: the session has
+    rows in some state.db and none of its assistant rows starts with the reply. A live turn's revision is always
+    persisted (78 of 78 judged outcomes on the hub, 2026-10-31); a detached fork's (background review, side question
+    sharing the parent's session_id, self-heal agent-77325213e1) never is, so its "failed revision" is a coach bug,
+    not an agent defect. Short or redacted reply, no state.db or no rows for the session = False (file as before)."""
+    head = _squash(reply)[:80]
+    if len(head) < 20 or not session_id or any(m in head.lower() for m in ("[redacted", "***", "«redacted")):
+        return False  # too little or redacted text can't be compared with the stored row
+    seen_session = False
+    for _prof, h in homes(home):
+        db = h / "state.db"
+        if not db.is_file():
+            continue
+        try:
+            c = _ro(db)
+            try:
+                rows = c.execute("select role, content from messages where session_id = ?",
+                                 (session_id,)).fetchall()
+            finally:
+                c.close()
+        except sqlite3.Error:
+            return False  # unreadable: can't prove it was unsent
+        if rows:
+            seen_session = True
+        if any(role == "assistant" and _squash(content).startswith(head) for role, content in rows):
+            return False
+    return seen_session
+
+
+def _unsent_draft_signal(r: dict, why: str) -> dict:
+    rule = r.get("rule") or "handoff"
+    ev = str(r.get("evidence") or "")
+    return {"kind": "coach", "component": "coach", "at": float(r.get("ts") or 0),
+            "session_id": r.get("session_id") or "",
+            "symptom": f"coach {rule} check judged a text that never reached the user (fork turn?): {ev[:100]}",
+            "details": (f"coach reply_check {rule} nudge (p={r.get('p')}) on draft {r.get('draft_id')}: its revised "
+                        f"reply is in no assistant row of session {r.get('session_id')}, so a detached fork "
+                        f"(background review, side question) sharing the session_id reached pre_verify. {why}"
+                        + (f"; revised reply: {r.get('reply')}" if r.get("reply") else ""))[:1500],
+            "fp": fp("coach", "judged_unsent_draft", rule)}
+
+
 def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
     """fixloop_card events file at once. A reply_check nudge (any rule in OUTCOME_RULES) is the guard WORKING (the
     agent was sent back to fix its reply), so it files only when its reply_nudge_outcome says the revised reply still
@@ -1020,8 +1069,12 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
             pending.remove(n)
             if r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"
-                out.append(_handoff_signal({**n, "reply": r.get("reply") or ""},
-                                           f"the revised reply {still} (outcome p={r.get('p')})"))
+                why = f"the revised reply {still} (outcome p={r.get('p')})"
+                rec = {**n, "reply": r.get("reply") or ""}
+                if unsent_reply(home, str(n.get("session_id") or ""), rec["reply"]):
+                    out.append(_unsent_draft_signal(rec, why))  # a fork's text: route to the coach, not the agent
+                else:
+                    out.append(_handoff_signal(rec, why))
     keep = []
     for n in pending:
         if now - float(n.get("ts") or 0) > HANDOFF_GRACE_S:
