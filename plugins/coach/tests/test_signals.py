@@ -90,6 +90,48 @@ def test_errors_log_tracebacks(home):
     assert "/home/you" not in db[0]["details"] and "~/.hermes/hermes-agent" in db[0]["details"]
 
 
+@pytest.mark.parametrize("traceback", [False, True])
+def test_offline_cron_summary_is_not_a_defect(traceback):
+    message = "RuntimeError: Hermes can't reach the model provider. You may be offline."
+    lines = ["2026-10-22 08:00:00,000 ERROR cron.scheduler: "
+             f"Job 'example-monitor' failed: {message}"]
+    if traceback:
+        lines += ["Traceback (most recent call last):",
+                  '  File "/home/you/.hermes/hermes-agent/cron/scheduler.py", line 10, in run_job',
+                  message]
+    assert sg.parse_errors(lines) == []
+
+
+@pytest.mark.parametrize("traceback", [False, True])
+def test_provider_dns_misconfiguration_is_a_defect(traceback):
+    message = ("provider host does not resolve while network is up: api.example.com "
+               "(control host github.com resolves) — check the provider base_url")
+    lines = [f"2026-10-22 08:00:00,000 ERROR run_agent: {message}"]
+    if traceback:
+        lines += ["Traceback (most recent call last):",
+                  '  File "/home/you/.hermes/hermes-agent/run_agent.py", line 10, in run',
+                  f"RuntimeError: {message}"]
+    signals = sg.parse_errors(lines)
+    assert len(signals) == 1
+    assert signals[0]["component"] == "agent"
+    assert message in signals[0]["details"]
+
+
+@pytest.mark.parametrize("message", [
+    "RuntimeError: Hermes can't reach the model provider.",
+    "RuntimeError: provider host does not resolve while network is up: api.example.com "
+    "(control host github.com resolves) — check the provider base_url",
+    "RuntimeError: unexpected failure; Hermes can't reach the model provider. You may be offline.",
+    "ValueError: Hermes can't reach the model provider. You may be offline.",
+])
+def test_offline_suppression_does_not_hide_other_errors(message):
+    lines = ["2026-10-22 08:00:00,000 ERROR cron.scheduler: Job 'example-monitor' failed",
+             "Traceback (most recent call last):",
+             '  File "/home/you/.hermes/hermes-agent/cron/scheduler.py", line 10, in run_job',
+             message]
+    assert len(sg.parse_errors(lines)) == 1
+
+
 def test_library_warning_traceback_is_not_a_defect_but_ours_is():
     def rec(level, logger, path):
         return [f"2026-10-22 08:00:00,000 {level} {logger}: Failed to clean up child process",

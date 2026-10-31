@@ -694,6 +694,16 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
 
 Raw machine signals become `file_defect` calls with `source: signal` and stable fingerprints:
 
+The errors-log detector suppresses only the exact final exception
+`RuntimeError: Hermes can't reach the model provider. You may be offline.`
+The cron job summary remains quiet with or without that traceback; other exception types,
+partial messages and quoted offline text in unrelated exceptions still file normally.
+An ERROR from a Hermes logger saying `provider host does not resolve while network is up: …
+(control host … resolves) — check the provider base_url` produces one agent signal, even
+without a traceback, fingerprinted by provider host. Misconfigured provider diagnostics are
+not treated as offline noise. `tests/test_signals.py` replays both records, with and without
+tracebacks, and checks the suppression boundaries using in-memory logs (no live stores).
+
 | kind | source | fingerprint (host in it?) |
 |---|---|---|
 | `errors` | new tracebacks in `<home>/logs/errors.log` (any level), minus tool output (`agent.tool_executor`) and provider transients (429/529/overloaded/timeouts) | exception type + innermost 4 frames as `file:function`, no line numbers (no) |

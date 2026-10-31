@@ -95,6 +95,12 @@ PROXY_5XX_RE = re.compile(r"<title>\s*5\d\d\b|\b5\d\d\s+(?:Bad Gateway|Service|G
                           r"Bad Gateway|Service (?:Temporarily )?Unavailable|Gateway Time-?out|"
                           r"Error code: 5\d\d\b|\bstatus(?:_code)?[\s:=]+5\d\d\b", re.I)
 EXC_BODY_LINES, EXC_BODY_CHARS = 20, 2000
+# Match only core's final offline exception, never generic DNS failures or a message quoting it.
+OFFLINE_EXC = "RuntimeError: Hermes can't reach the model provider. You may be offline."
+PROVIDER_DNS_RE = re.compile(
+    r"^provider host does not resolve while network is up: (\S+) "
+    r"\(control host (\S+) resolves\) — check the provider base_url$"
+)
 
 
 def _exc_body(block: List[str], exc_line: str) -> str:
@@ -374,6 +380,13 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
                         "fp": fp("agent", "admission-busy", host, prof, what)})
             continue
+        dns = PROVIDER_DNS_RE.fullmatch(r["msg"])
+        if dns and r["level"] == "ERROR" and OWN_LOGGER_RE.match(r["logger"]):
+            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+                        "symptom": f"provider host does not resolve while network is up: {dns.group(1)}",
+                        "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
+                        "fp": fp("agent", "provider-dns", dns.group(1))})
+            continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
             continue
         # the last chained exception block
@@ -390,7 +403,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                                    "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
                                                                    + block))[-1500:]})
             continue
-        if (TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line)
+        if (TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line) or exc_line == OFFLINE_EXC
                 or provider_5xx(exc_type, exc_line, _exc_body(block, exc_line))):
             continue
         last = exc_line or next((l for l in reversed(block) if l and not l[0].isspace()), "")  # socket.gaierror
