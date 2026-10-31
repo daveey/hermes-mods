@@ -85,6 +85,71 @@ class MirrorTests(unittest.TestCase):
             self.assertFalse(worktree.exists())
             self.assertFalse(worktree.parent.exists())
 
+    def bridge_fixture(self):
+        import hashlib
+        original_base = self.base
+        self.git('checkout', '-qb', 'upstream', original_base)
+        self.write('upstream.py', 'upstream = True\n')
+        upstream = self.commit('upstream update')
+        self.git('checkout', '-q', 'main')
+        parent = self.tip
+        self.git('merge', '--no-ff', '-qm', 'upstream merge', upstream)
+        merge = self.git('rev-parse', 'HEAD')
+        data = mirror.git(self.repo, 'diff', '--binary', parent, merge)
+        self.write('post.py', 'post = True\n')
+        self.tip = self.commit('after merge')
+        self.base = upstream
+        self.export()
+        diff = self.root / 'bridge.diff'
+        diff.write_bytes(data)
+        plan = dict(source_tip=self.tip, base=self.base, start=original_base,
+                    bridges=[dict(before=self.tip, diff=diff.name,
+                                  sha256=hashlib.sha256(data).hexdigest(), source_merge=merge)])
+        path = self.root / 'replay.json'
+        path.write_text(json.dumps(plan))
+        return path, plan
+
+    def test_bridge_replay_and_cli(self):
+        path, _ = self.bridge_fixture()
+        result = mirror.verify(self.repo, self.tip, self.base, self.patches, replay_plan=path)
+        self.assertEqual(result['bridges'], 1)
+        self.assertEqual(result['patches'], 3)
+        cli = subprocess.run([sys.executable, str(SCRIPT), '--source-repo', str(self.repo),
+                              '--source-tip', self.tip, '--base', self.base,
+                              '--patch-dir', str(self.patches), '--replay-plan', str(path)],
+                             capture_output=True, text=True)
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        self.assertEqual(json.loads(cli.stdout), result)
+
+    def test_bridge_rejects_snapshot_boundary_hash_and_nonmerge(self):
+        path, plan = self.bridge_fixture()
+        import copy
+        for field, value in [('source_tip', self.one), ('before', self.base),
+                             ('sha256', '0' * 64), ('source_merge', self.tip),
+                             ('source_merge', 'main'), ('diff', '../bridge.diff'),
+                             ('diff', '/bridge.diff'), ('start', 'main'),
+                             ('start', self.tip), ('before', self.one)]:
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(plan)
+                if field in {'source_tip', 'start'}:
+                    invalid[field] = value
+                else:
+                    invalid['bridges'][0][field] = value
+                path.write_text(json.dumps(invalid))
+                with self.assertRaises(mirror.VerificationError):
+                    mirror.verify(self.repo, self.tip, self.base, self.patches, replay_plan=path)
+
+    def test_bridge_does_not_bypass_final_tree_comparison(self):
+        import hashlib
+        path, plan = self.bridge_fixture()
+        diff = self.root / 'bridge.diff'
+        data = diff.read_bytes().replace(b'upstream = True', b'upstream = None')
+        diff.write_bytes(data)
+        plan['bridges'][0]['sha256'] = hashlib.sha256(data).hexdigest()
+        path.write_text(json.dumps(plan))
+        with self.assertRaisesRegex(mirror.VerificationError, 'Unexplained blob divergence'):
+            mirror.verify(self.repo, self.tip, self.base, self.patches, replay_plan=path)
+
     def test_faithful_replay_and_cleanup(self):
         self.verify()
 

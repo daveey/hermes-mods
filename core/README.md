@@ -22,7 +22,9 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `6bb377a51d5c8e279a7a5e34d717d653d421d064`; merge-base: `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
+Upstream exclusion tip: `6bb377a51d5c8e279a7a5e34d717d653d421d064`; current merge-base: `ef35e8b9e1a8bc7f0efb50e4f2d68f1ec052f6a8`.
+Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with an explicit upstream-merge bridge immediately before patch 1328. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
+The snapshot's full verifier exits 0 with [mirror-replay-1368.json](mirror-replay-1368.json) (one hash-pinned bridge) and [mirror-policy-1368.json](mirror-policy-1368.json).
 The current snapshot's executed checks are in [mirror-1368-verification.md](mirror-1368-verification.md), with its policy [mirror-policy-1368.json](mirror-policy-1368.json) (previous snapshots: [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
@@ -119,10 +121,13 @@ python3 -B core/verify_mirror.py \
   --policy core/mirror-policy-NNNN.json
 ```
 
+For the 1368 snapshot, also pass `--replay-plan core/mirror-replay-1368.json`.
+This explicit opt-in pins the historical replay start and a bridge's boundary by source SHA, its source merge and its diff by SHA-256. Starts and merge IDs must be full commit IDs; merge ancestry, boundary membership and unique boundaries are validated. Bridge paths are relative to the plan, without parent traversal. Each uninterrupted patch segment is replayed in published order, then the bridge is applied with `git apply --index --3way` and committed. No source patch is skipped; final tree comparison is unchanged. The merge label documents provenance; the diff hash binds the reviewed public bridge (which may contain normalization), not an automatically regenerated source diff.
+
 Exit 0 is the acceptance step for every mirror pass; record its JSON line in the snapshot's
 `mirror-NNNN-verification.md`. Use frozen commit IDs, not moving refs, in publication evidence. `--base` is the
-upstream exclusion tip for `base..source-tip`; the replay starts at its merge-base
-with the source tip, not at an upstream tip that may have advanced. The verifier
+upstream exclusion tip for `base..source-tip`; by default replay starts at its merge-base
+with the source tip, unless an explicit snapshot-bound replay plan supplies a historical start. The verifier
 resolves inputs once and checks the inventory: patch ordinals contiguous from
 0001, every patch's first line a `From <sha>` header, no header repeated, and the
 header set equal to the set of `git rev-list --no-merges base..source-tip`. A
@@ -680,7 +685,23 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-The current local candidate contains **400 patches**, pinned to source
+For the current **1368-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, apply patches 0001–1327, apply and commit `core/bridges/error-card-v2.diff`, then apply patches 1328–1368. Do not start at the new merge-base or apply the entire glob without the bridge. Example (Bash, with this repository's absolute path in `MODS`):
+
+```bash
+git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
+cd ../hermes-mods-test
+patches=("$MODS"/core/patches/*.patch)
+git am -3 --empty=keep "${patches[@]:0:1327}"
+git apply --index --3way "$MODS/core/bridges/error-card-v2.diff"
+git commit -m 'Explicit upstream error-card-v2 merge bridge'
+git am -3 --empty=keep "${patches[@]:1327:41}"
+```
+
+The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.
+
+### Historical apply reports (not instructions for the current series)
+
+The historical 400-patch candidate was pinned to source
 `0146a882edf55e22fc9197e2a2e190a0fbacf068` (source independently reviewed and published).
 All 400 apply in order with `git am -3 --empty=keep`; 290 selected Python tests across
 15 files pass on the applied public series, with no failures or skips.

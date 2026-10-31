@@ -5,6 +5,7 @@ Only object IDs, counts and patch ordinals are reported, never source contents o
 Git diagnostics (which may contain private patch context). No denylist is read.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -185,22 +186,78 @@ def compare(repo, tip, applied, substitutions, fingerprints, renames=()):
         raise VerificationError('Unused historical fingerprints; policy must match exactly')
 
 
-def verify(source_repo, source_tip, base, patch_dir, policy=None):
+def load_replay_plan(path, repo, tip, base, patches):
+    """Explicit opt-in only: pinned start and hash-bound merge diffs, never skips."""
+    if path is None:
+        return None, {}
+    try:
+        plan = json.loads(Path(path).read_text())
+        if set(plan) != {'source_tip', 'base', 'start', 'bridges'}:
+            raise ValueError()
+        if plan['source_tip'] != tip or plan['base'] != base:
+            raise ValueError()
+        if not re.fullmatch(r'[0-9a-f]{40}', plan['start']):
+            raise ValueError()
+        start = resolve(repo, plan['start'])
+        git(repo, 'merge-base', '--is-ancestor', start, tip)
+        git(repo, 'merge-base', '--is-ancestor', start, base)
+        headers = {HEADER.fullmatch(p.read_bytes().split(b'\n', 1)[0])[1].decode()
+                   for p in patches}
+        bridges = {}
+        if not isinstance(plan['bridges'], list) or not plan['bridges']:
+            raise ValueError()
+        for bridge in plan['bridges']:
+            if set(bridge) != {'before', 'diff', 'sha256', 'source_merge'}:
+                raise ValueError()
+            before = bridge['before']
+            if before not in headers or before in bridges:
+                raise ValueError()
+            if not re.fullmatch(r'[0-9a-f]{40}', bridge['source_merge']):
+                raise ValueError()
+            merge = resolve(repo, bridge['source_merge'])
+            if len(git(repo, 'rev-list', '--parents', '-1', merge).split()) < 3:
+                raise ValueError()
+            git(repo, 'merge-base', '--is-ancestor', merge, before)
+            relative = Path(bridge['diff'])
+            if relative.is_absolute() or '..' in relative.parts:
+                raise ValueError()
+            data = (Path(path).resolve().parent / relative).read_bytes()
+            if hashlib.sha256(data).hexdigest() != bridge['sha256']:
+                raise ValueError()
+            bridges[before] = data
+        return start, bridges
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise VerificationError('Invalid replay plan or snapshot mismatch') from None
+
+
+def verify(source_repo, source_tip, base, patch_dir, policy=None, replay_plan=None):
     repo = Path(source_repo).resolve()
     tip, base = resolve(repo, source_tip), resolve(repo, base)
     patches = inventory(repo, base, tip, patch_dir)
     substitutions, fingerprints, renames = load_policy(policy, tip, base)
     merge_base = git(repo, 'merge-base', base, tip).decode().strip()
+    start, bridges = load_replay_plan(replay_plan, repo, tip, base, patches)
+    replay_start = start or merge_base
     # Only remove the uniquely allocated worktree; never prune anyone else's.
     directory = Path(tempfile.mkdtemp(prefix='mirror-verify-'))
     worktree = directory / 'replay'
     added = False
     try:
-        git(repo, 'worktree', 'add', '--detach', str(worktree), merge_base)
+        git(repo, 'worktree', 'add', '--detach', str(worktree), replay_start)
         added = True
-        # Stream mboxes via stdin to avoid command-line limits for long series.
-        if patches:
-            git(worktree, 'am', '-3', '--empty=keep', data=b''.join(p.read_bytes() for p in patches))
+        # Batch each uninterrupted segment; all source patches still replay once.
+        pending = []
+        for patch in patches:
+            sha = HEADER.fullmatch(patch.read_bytes().split(b'\n', 1)[0])[1].decode()
+            if sha in bridges:
+                if pending:
+                    git(worktree, 'am', '-3', '--empty=keep', data=b''.join(pending))
+                    pending = []
+                git(worktree, 'apply', '--index', '--3way', data=bridges[sha])
+                git(worktree, 'commit', '--allow-empty', '-qm', 'Explicit upstream merge bridge')
+            pending.append(patch.read_bytes())
+        if pending:
+            git(worktree, 'am', '-3', '--empty=keep', data=b''.join(pending))
         applied = resolve(worktree, 'HEAD')
         compare(repo, tip, applied, substitutions, fingerprints, renames)
     finally:
@@ -213,7 +270,10 @@ def verify(source_repo, source_tip, base, patch_dir, policy=None):
             except VerificationError:
                 git(repo, 'worktree', 'remove', '--force', str(worktree))
         shutil.rmtree(directory)
-    return {'patches': len(patches), 'source_tip': tip, 'base': base, 'merge_base': merge_base}
+    result = {'patches': len(patches), 'source_tip': tip, 'base': base, 'merge_base': merge_base}
+    if replay_plan is not None:
+        result.update(replay_start=replay_start, bridges=len(bridges))
+    return result
 
 
 def main():
@@ -223,6 +283,7 @@ def main():
     parser.add_argument('--base', required=True, help='Upstream/exclusion commit, not necessarily merge-base')
     parser.add_argument('--patch-dir', required=True)
     parser.add_argument('--policy', help='Explicit public substitutions and snapshot-bound blob pairs (JSON)')
+    parser.add_argument('--replay-plan', help='Snapshot-bound historical start and hash-pinned merge bridges (JSON)')
     args = parser.parse_args()
     try:
         result = verify(**vars(args))
