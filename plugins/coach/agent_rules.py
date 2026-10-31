@@ -26,6 +26,28 @@ POLL_WINDOW = 10          # last N tool calls ...
 POLL_HITS = 3             # ... with this many sleep/poll calls -> background + notify
 CHECKPOINT_TOOLS = 40     # tool calls in one turn without a reply -> summarize
 LONG_JOB_S = 600          # a job this long belongs on the board
+ASK_CAP = 20000           # chars of the user's request kept for the reply check (a limit can end a long Kanban body)
+
+# Preloaded-skill blocks core puts before the user's own request (agent/skill_commands.py: `hermes -s`, Kanban card
+# skills, skills.auto_load, bundles). A Kanban worker with skills gets 20-220 KB of skill text before "# Kanban task",
+# so a cap on the raw message keeps only skill text, and skill prose ("read-only probe", "**Plan first**") reads as the
+# user's scope limit. Each block ends with its "Load any of these with skill_view(...)" line, or its
+# "[Skill directory: ...]" line plus one note line.
+_SKILL_PREAMBLE_RE = re.compile(
+    r'\A\s*\[IMPORTANT: The (?:user launched this CLI session with the "|"[^"\n]+" skill is auto-loaded)')
+_SKILL_BLOCK_END_RE = re.compile(
+    r'^(?:Load any of these with skill_view\(name="[^"\n]*"[^\n]*|\[Skill directory: [^\n]*\]\n[^\n]*)$', re.M)
+
+
+def request_text(message: Any) -> str:
+    """The user's own request: `message` minus any preloaded-skill blocks in front of it (unchanged when there are
+    none, or when their end can't be found)."""
+    msg = message if isinstance(message, str) else ""
+    if not _SKILL_PREAMBLE_RE.match(msg):
+        return msg
+    ends = list(_SKILL_BLOCK_END_RE.finditer(msg))
+    rest = msg[ends[-1].end():].strip() if ends else ""
+    return rest or msg
 
 HINTS = {
     "repeat_failure": ("The same command has now failed {n} times: `{cmd}`. Stop retrying variations. Reproduce it "
@@ -1195,7 +1217,9 @@ class AgentCoach:
         s.pop("turn_commits", None)
         s["turn_t0"] = time.time()  # wall clock: the diff review asks git for commits made since the turn began
         if isinstance(user_message, str) and user_message.strip():
-            s["ask"] = user_message[:2000]
+            # the user's own request (preloaded-skill blocks dropped), capped: "Diagnosis only." can end a Kanban body
+            # past char 2000 (self-heal agent-668442d68f). Prompt builders clip it (reply_check.request_excerpt).
+            s["ask"] = request_text(user_message)[:ASK_CAP]
         return self.take(sid)
 
     def queue_hint(self, sid: str, text: str) -> None:

@@ -561,11 +561,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             if not hit:
                 guard = rc.report_only_guard(ask, final_response)
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
-                           "candidates": rc.prefilter(final_response), **({"guard": guard} if guard else {})})
+                           "candidates": rc.prefilter(final_response), "ask_len": len(ask or ""),
+                           **({"guard": guard} if guard else {})})
                 return None
             tracked = hit["rule"] in rc.RULES
             out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
-                          "p": hit["p"], "evidence": hit["evidence"],
+                          "p": hit["p"], "evidence": hit["evidence"], "ask_len": len(ask or ""),
                           # signals.template_holds groups on it: one rule holding the same fixed text in many chats
                           "ask_head": " ".join((ask or "").split())[:40],
                           **({"reason": hit["reason"]} if hit.get("reason") else {}),

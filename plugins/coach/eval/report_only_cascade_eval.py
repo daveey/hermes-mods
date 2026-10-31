@@ -42,14 +42,20 @@ def main():
     if a.profile: os.environ["COACH_REPLY_PROFILE"] = a.profile
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     rows = [json.loads(l) for l in open(a.data) if l.strip()]
+    # production gating reads the user's own request untruncated (agent_rules.request_text: preloaded-skill blocks
+    # dropped, ASK_CAP): a scope limit past char 2000 (the end of a Kanban body) counts (self-heal agent-668442d68f).
+    assert rc.scope_limited("x" * 2100 + "\nDiagnosis only."), "scope check must read the whole request"
+    ar_spec = importlib.util.spec_from_file_location("ar_eval", COACH / "agent_rules.py")
+    ar = importlib.util.module_from_spec(ar_spec); ar_spec.loader.exec_module(ar)
+    ask_of = lambda u: ar.request_text(u)[:ar.ASK_CAP]  # what turn_start stores as the ask
     for r in rows:
         r["tool_log"] = r.get("tool_log") or [f"-> {k}(...)" for k, n in (r.get("tools") or {}).items() for _ in range(min(int(n), 5))]
         r["tool_rich"] = r.get("tool_rich") or r["tool_log"]
-        r["split"] = split(r["session"]); r["scoped"] = rc.scope_limited(r["user"]); r["cand"] = "report_only" in rc.prefilter(r["reply"])
+        r["split"] = split(r["session"]); r["scoped"] = rc.scope_limited(ask_of(r["user"])); r["cand"] = "report_only" in rc.prefilter(r["reply"])
     fixtures = json.loads((COACH / "tests/fixtures/report_only_scope_limits.json").read_text())
     for i, f in enumerate(fixtures):
         rows.append({"id": f"scope{i}", "session": f"fx{i}", "split": "fixture", "trigger": "fixture", "user": f["user"], "reply": f["reply"],
-                     "tool_log": f.get("log", []), "tool_rich": f.get("log", []), "pos": False, "scoped": rc.scope_limited(f["user"]),
+                     "tool_log": f.get("log", []), "tool_rich": f.get("log", []), "pos": False, "scoped": rc.scope_limited(ask_of(f["user"])),
                      "cand": "report_only" in rc.prefilter(f["reply"])})
     cache_p = out / "cache.jsonl"; cache = {}
     if cache_p.exists():

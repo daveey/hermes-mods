@@ -93,10 +93,18 @@ REPORT_RE = re.compile(
     re.I)
 # An explicit scope limit in the user's ask: a diagnosis is what they asked for, so report_only never applies.
 SCOPE_LIMIT_RE = re.compile(
+    # "X-only" as a limit ("Diagnosis only.", "Read-only: ...", "an analysis-only task"), not as an adjective in a long
+    # request ("Read-only checks before...", "run it read-only on the hub", "the report-only chain").
     r"\b(?:analysis|analy[sz]e|diagnos(?:is|e)|research|investigat(?:e|ion)|report|read)[- ]only\b"
+    r"(?=\s*(?:[.,:;!?)\n—–-]|$|please\b|for now\b)|\s+(?:task|card|investigation|analysis|pass|review|audit|mode|"
+    r"work|run|session|request|turn)s?\b)"
     r"|\bjust (?:tell me (?:why|what|how|if|whether)|explain|answer)\b|\bonly (?:tell|explain|want to know|report)\b"
     r"|\bplan (?:it )?first\b|\bdon'?t (?:change|touch|fix|edit|modify|mutate|ship|deploy) (?:anything|it|this|that|a thing)\b"
     r"|\bdo not (?:change|touch|fix|edit|modify|mutate) (?:anything|it|this|that)\b"
+    # "Do not change any cards in this task." (self-heal agent-668442d68f). Only state/artifact nouns: "fix X but
+    # don't change any tests" is a constraint on a fix, not a diagnosis-only limit.
+    r"|\b(?:do not|don'?t) (?:change|touch|edit|modify|mutate) any (?:of the )?(?:cards?|tasks?|tickets?|issues?|"
+    r"files?|code|config(?:s|uration)?|settings?|state|services?|jobs?|data)\b"
     r"|\b(?:make |with )?no (?:edits|changes|fixes|code changes|mutations)\b|\bwithout (?:changing|fixing|editing) (?:anything|it)\b"
     r"|\bdon'?t fix\b|\bnot (?:to )?fix (?:it|anything)\b",
     re.I)
@@ -297,7 +305,8 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
     about progress: its fixed wording ("what you are still waiting on") and the card asks it quotes ("unblock =
     complete it") matched the progress pattern on every close-out (agent-21185525f4). report_only and the judge
     still review those turns."""
-    if notice_turn(user_ask) or not PROGRESS_ASK_RE.search(user_ask or "") or not (reply or "").strip():
+    user_ask = (user_ask or "")[:ASK_HEAD]
+    if notice_turn(user_ask) or not PROGRESS_ASK_RE.search(user_ask) or not (reply or "").strip():
         return None
     kinds = [k for k in (_tool_kind(l) for l in tool_log or []) if k]
     if "work" in kinds or "card" not in kinds:
@@ -650,9 +659,50 @@ DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only"
 DEFAULT_THRESHOLDS = {"report_only": 0.5, "report_only_screen": 0.85, "report_only_capped": 0.92}
 
 
+# The ask can be long (agent_rules keeps up to 20000 chars). Checks other than the scope limit read only its head, as
+# they always have; prompts clip it themselves (request_excerpt).
+ASK_HEAD = 2000
+# A Kanban worker's request (core kanban_db_context): "# Kanban task <id>: <title>", header lines, "## Body", then board
+# sections the card's author didn't write (other cards' summaries, shared blockers, comments). A limit such as
+# "Diagnosis only." usually ends the body, past ~2 KB of header (self-heal agent-668442d68f).
+KANBAN_PROMPT_RE = re.compile(r"\A\s*# Kanban task \S+:")
+_CARD_SECTION_RE = re.compile(
+    r"^## (Body|Standing instructions\b[^\n]*|Attachments|Prior attempts on this task|Parent task results|"
+    r"Recent work by @[^\n]*|Comment thread|Open shared blockers on this board|Continuation checkpoint\b[^\n]*|"
+    r"Woken [^\n]*|Wake check|Interrupted worker continuation)[ \t]*$", re.M)
+_USER_SECTIONS = ("Body", "Standing instructions")
+
+
+def scope_text(user_ask: str) -> str:
+    """The part of the ask its author wrote: the whole ask, or for a Kanban worker request the card's header/title,
+    `## Body` and the user's standing instructions (not other cards' summaries or shared blockers)."""
+    ask = user_ask or ""
+    if not KANBAN_PROMPT_RE.match(ask):
+        return ask
+    marks = list(_CARD_SECTION_RE.finditer(ask))
+    parts = [ask[:marks[0].start()] if marks else ask]
+    for i, m in enumerate(marks):
+        if m.group(1).startswith(_USER_SECTIONS):
+            parts.append(ask[m.start():marks[i + 1].start() if i + 1 < len(marks) else len(ask)])
+    return "\n".join(parts)
+
+
+def request_excerpt(user_ask: str, head: int = 1500, tail: int = 500) -> str:
+    """The ask for a judge prompt: its first `head` chars plus the last `tail` chars of the author's text (the card
+    body for a Kanban request), where a closing limit like "Diagnosis only." sits."""
+    ask = user_ask or ""
+    if len(ask) <= head:
+        return ask
+    end = scope_text(ask).rstrip()[-tail:]
+    if not end or end in ask[:head]:
+        return ask[:head]
+    return f"{ask[:head]}\n[... request continues; it ends:]\n{end}"
+
+
 def scope_limited(user_ask: str) -> bool:
-    """The user explicitly limited the turn to analysis ("analysis only", "just tell me", "don't change anything")."""
-    return bool(SCOPE_LIMIT_RE.search(user_ask or ""))
+    """The user explicitly limited the turn to analysis ("analysis only", "just tell me", "don't change anything").
+    Reads the whole author-written text (scope_text), not a head: Kanban limits sit at the end of the body."""
+    return bool(SCOPE_LIMIT_RE.search(scope_text(user_ask)))
 
 
 # report_only, legitimate scheduled wait (audit t_01a17f79ade9cbdd, session 20261025_182511_c46056): the user asked a
@@ -702,7 +752,7 @@ UNFINISHED_WORK_RE = re.compile(
 
 def scheduled_wait_status(user_ask: str, reply: str) -> Optional[str]:
     """Evidence when a pure status question got a reply whose only open item is a legitimately scheduled wait."""
-    ask = user_ask or ""
+    ask = (user_ask or "")[:ASK_HEAD]
     if not STATUS_QUESTION_RE.search(ask) or ACTION_ASK_RE.search(ask):
         return None
     tail = (reply or "")[-1500:]
@@ -963,7 +1013,7 @@ def confirm_prompt(user_ask: str, rich_log: list[str], reply: str) -> str:
     ask = user_ask or ""
     notice = notice_turn(ask)
     # Notices put the closeout/action instruction after long handoffs. Keep both ends within the same budget.
-    request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else ask[:1500]
+    request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else request_excerpt(ask)
     context = f"{NOTICE_CONTEXT}\n\n" if notice else ""
     return (f"{context}USER'S REQUEST (latest):\n{request}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
             f"truncated):\n{log[:7000]}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
@@ -1139,7 +1189,7 @@ def judge_system() -> str:
 
 def judge_prompt(user_ask: str, tool_log: list[str], reply: str) -> str:
     log = "\n".join(tool_log[-40:]) or "(no tool calls this turn)"
-    return (f"USER'S REQUEST (latest):\n{(user_ask or '')[:1500]}\n\nTOOL LOG THIS TURN (oldest first, truncated):\n"
+    return (f"USER'S REQUEST (latest):\n{request_excerpt(user_ask)}\n\nTOOL LOG THIS TURN (oldest first, truncated):\n"
             f"{log[:5000]}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
