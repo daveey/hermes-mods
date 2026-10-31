@@ -160,6 +160,10 @@ NETWORK_RE = re.compile(r"^(?:[\w.]*\.)?(?:ClientConnectorError|OSError|Connecti
                         r"Connection refused|Connection reset by peer)", re.I)
 ATTENTION_RE = re.compile(r"^(\S+) has been failing/reconnecting continuously for ([\d.]+) hours \((\d+) attempts\)"
                           r".*NEEDS_ATTENTION")
+# Core's final busy-lock refusal (backend_retirement._reserve, agent-6f2f71c662): admission.lock stayed busy past the
+# turn-side retry with no update hold, so one turn/notification/review was refused. One WARNING, no traceback.
+ADMISSION_BUSY_RE = re.compile(r"^((?:Review u|U)pdate admission) unavailable: update admission lock busy for "
+                               r"([\d.]+)s \(no update hold\)")
 RECONNECT_STORM = 20               # more than this many library reconnects in RECONNECT_WINDOW_S files one defect
 RECONNECT_WINDOW_S = 3600
 
@@ -349,6 +353,15 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                                    f"continuously for {hours} hours ({attempts} attempts)",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
                         "fp": fp("gateway", "needs-attention", host, prof, key)})
+            continue
+        bm = ADMISSION_BUSY_RE.match(r["msg"])
+        if bm:
+            what, secs = bm.groups()
+            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+                        "symptom": f"{what} refused: update admission lock busy for {secs}s with no update hold "
+                                   f"on {host or 'this host'} ({prof})",
+                        "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
+                        "fp": fp("agent", "admission-busy", host, prof, what)})
             continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
             continue

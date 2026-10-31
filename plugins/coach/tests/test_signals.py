@@ -263,6 +263,42 @@ def test_needs_attention_warning_files_one_defect_per_host_profile_platform(tmp_
     assert kinds(sg.collect(other, {}, "mini", NOW), "errors")[0]["fp"] != disc[0]["fp"]  # per host
 
 
+ADMISSION_BUSY = ("{at},000 WARNING hermes_cli.backend_retirement: {what} unavailable: update admission lock busy "
+                  "for 0.5s (no update hold)")
+ADMISSION_BUSY_OLD = ["{at},000 WARNING hermes_cli.backend_retirement: Update admission unavailable",
+                      "Traceback (most recent call last):",
+                      '  File "/x/hermes_cli/backend_retirement.py", line 153, in reservation',
+                      "    pending = reserve(root)",
+                      '  File "/x/hermes_cli/admission_fence.py", line 37, in admission_lock',
+                      '    raise TimeoutError("Hermes update admission lock is busy") from None',
+                      "TimeoutError: Hermes update admission lock is busy"]
+
+
+def test_admission_busy_final_refusal_files_one_defect_without_traceback(tmp_path):
+    """agent-6f2f71c662: core now rides out a briefly busy update lock and logs one traceback-less WARNING only when
+    the lock stayed busy past its retry. That line is the detector: one defect per host/profile/source."""
+    h = tmp_path / "home"
+    (h / "logs").mkdir(parents=True)
+    at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NOW - 300))
+    (h / "logs" / "errors.log").write_text("\n".join(
+        [ADMISSION_BUSY.format(at=at, what="Update admission")] * 2
+        + [ADMISSION_BUSY.format(at=at, what="Review update admission")]) + "\n")
+    sigs = kinds(sg.collect(h, {}, "macbook", NOW), "errors")
+    turn = [s for s in sigs if s["symptom"].startswith("Update admission refused")]
+    assert len(turn) == 1 and turn[0]["count"] == 2
+    assert turn[0]["component"] == "agent" and "busy for 0.5s" in turn[0]["symptom"]
+    assert "macbook" in turn[0]["symptom"] and "(default)" in turn[0]["symptom"]
+    review = [s for s in sigs if s["symptom"].startswith("Review update admission refused")]
+    assert len(review) == 1 and review[0]["fp"] != turn[0]["fp"]
+    # a line that merely quotes the phrase (not at message start) is not a refusal
+    quoted = f"{at},000 WARNING tools.terminal: output: Update admission unavailable: update admission lock busy " \
+             "for 0.5s (no update hold)"
+    assert sg.parse_errors([quoted]) == []
+    # an older core's traceback form still files through the generic traceback path
+    old = sg.parse_errors([l.format(at=at) for l in ADMISSION_BUSY_OLD])
+    assert len(old) == 1 and old[0]["symptom"].startswith("TimeoutError in admission_lock")
+
+
 def _reconnect_log(home, n, start):
     lines = []
     for i in range(n):
