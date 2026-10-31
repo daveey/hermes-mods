@@ -113,7 +113,7 @@ def test_settings_defaults(monkeypatch):
     cfg = rc.settings()
     assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask",
                             "credit_ask", "laptop_job"] and cfg["threshold"] == 0.7
-    assert cfg["thresholds"] == {"report_only": 0.5, "report_only_screen": 0.85}
+    assert cfg["thresholds"] == {"report_only": 0.5, "report_only_screen": 0.85, "report_only_capped": 0.92}
 
 
 ORPHAN = ("Everything is running.\n\nOnce the last runs finish, around 03:30 UTC, I'll build the tables from the "
@@ -288,8 +288,8 @@ def test_check_report_only_respects_its_own_threshold():
 
 
 def test_thresholds_env_override(monkeypatch):
-    monkeypatch.setenv("COACH_REPLY_THRESHOLDS", "report_only=0.95,bogus=0.1,handoff=x")
-    assert rc.settings()["thresholds"] == {"report_only": 0.95, "report_only_screen": 0.85}
+    monkeypatch.setenv("COACH_REPLY_THRESHOLDS", "report_only=0.95,bogus=0.1,handoff=x,report_only_capped=0.97")
+    assert rc.settings()["thresholds"] == {"report_only": 0.95, "report_only_screen": 0.85, "report_only_capped": 0.97}
 
 
 SCOPE_LIMITED_ASKS = [  # explicit limits: a diagnosis is exactly what was asked for
@@ -362,13 +362,19 @@ def test_confirm_replaces_the_screen_p_and_can_veto_it():
 
 def test_confirm_unavailable_falls_back_to_the_stricter_screen_threshold():
     ths = rc.settings()["thresholds"]
-    for p, fires in ((0.80, False), (0.90, True)):  # 0.80 clears the floor but not report_only_screen (0.85)
+    # without a confirm callable at all the screen is held to report_only_screen (0.85)
+    for p, fires in ((0.80, False), (0.88, True)):
         llm, _ = _judge(_ro_verdict(p))
-        hit = rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths,
-                       confirm=lambda: None, confirm_floor=rc.CONFIRM_FLOOR)
-        assert bool(hit) is fires
-        # without a confirm callable at all the screen is held to the same screen threshold
         assert bool(rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths)) is fires
+    # a second opinion was due but unavailable (daily cap hit, error): the screen alone needs report_only_capped
+    # (0.92). agent-fb58ec3a8f: a capped confirm let a 0.88 screen nudge, where confirms clear 43% at >= 0.85.
+    for p, fires in ((0.80, False), (0.88, False), (0.93, True)):
+        llm, _ = _judge(_ro_verdict(p))
+        audit = []
+        hit = rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths,
+                       confirm=lambda: None, confirm_floor=rc.CONFIRM_FLOOR, audit=audit.append)
+        assert bool(hit) is fires
+        assert audit and audit[0]["source"] == "screen_fallback" and audit[0]["threshold"] == 0.92
 
 
 def test_parse_confirm_reads_the_strong_models_label():

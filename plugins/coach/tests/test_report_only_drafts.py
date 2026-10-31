@@ -106,7 +106,7 @@ def test_judge_and_second_opinion_prompts_carry_the_exemption():
     assert "scheduled or parked on purpose" in rc.JUDGE_SYS
     assert "scheduled or parked on purpose" in rc.REPORT_ONLY_RULE  # the slice the second opinion reuses
     assert "scheduled or parked on purpose" in rc.CONFIRM_SYS
-    assert rc.DEFAULT_THRESHOLDS == {"report_only": 0.5, "report_only_screen": 0.85}  # no retune from 5 samples
+    assert rc.DEFAULT_THRESHOLDS == {"report_only": 0.5, "report_only_screen": 0.85, "report_only_capped": 0.92}  # no retune from 5 samples
 
 
 # ── 1. judged-draft retention ────────────────────────────────────────────────────────────────────────────────────────

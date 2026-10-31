@@ -125,8 +125,9 @@ the screen's report_only p >= 0.75 (`CONFIRM_FLOOR`) one call to `coach_report_o
 plus the real args of kanban_create, delegate_task, patch and terminal calls) labels the outcome; a report_only +
 agent_fixable label is p 0.9 and nudges (`report_only=0.5`). Capped at 100 confirm calls per host per day (events
 `report_only_confirm` and `report_only_confirm_capped` in `log.jsonl`; `COACH_REPORT_ONLY_CONFIRM_CAP`, set
-`COACH_REPORT_ONLY_CONFIRM=0` to turn it off); at the cap, on error, or with no confirm wired, the screen alone must
-reach `report_only_screen=0.85`.
+`COACH_REPORT_ONLY_CONFIRM=0` to turn it off); with no confirm wired the screen alone must reach
+`report_only_screen=0.85`, and when a confirm was due but unavailable (cap hit, error) it must reach
+`report_only_capped=0.92` (confirms clear 43% of screen hits at >= 0.85; agent-fb58ec3a8f).
 Held-out human turns (59 positives; precision / recall, 95% Wilson CI): cascade at screen floor 0.75: 0.957 (0.79-0.99) /
 0.373 (0.26-0.50); Sonnet screen alone at 0.75: 0.647 / 0.373, at 0.85: 0.562 / 0.153. Train (116 positives), cascade at
 0.75: 0.811 (0.66-0.91) / 0.259 (0.19-0.35); floor 0.5: 0.679 / 0.474. Pooled train + held-out (175 positives): floor 0.75
@@ -217,7 +218,7 @@ chars) and the reply (6,000 chars) are kept, never tool calls or outputs, both t
 (`COACH_DRAFTS_MAX_BYTES`, `COACH_DRAFTS_MAX_AGE_DAYS`; oldest dropped first); `COACH_DRAFTS=off` disables it. Read
 one back: `drafts.Drafts(<coach dir>).for_event(<log record>)`, or `grep <draft_id> ~/.hermes/coach/drafts.jsonl`.
 Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` and `COACH_REPLY_THRESHOLDS`
-(`rule=th,...` per-rule overrides; defaults `report_only=0.5` for the second opinion, `report_only_screen=0.85`). Needs core
+(`rule=th,...` per-rule overrides; defaults `report_only=0.5` for the second opinion, `report_only_screen=0.85`, `report_only_capped=0.92`). Needs core
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
 Fork turns (background review, side questions) are never judged: core skips `pre_verify` when the agent has
@@ -661,7 +662,7 @@ Raw machine signals become `file_defect` calls with `source: signal` and stable 
 | `cron` | a job whose sticky `last_failure.at` is new (`cron/jobs.json`), even if it has recovered since | job name (yes) |
 | `kanban` | a card with ≥ 2 runs `crashed` / `timed_out` / `spawn_failed`, every board db; self-heal's own `selfheal:` cards are skipped. Also the dispatcher's systemic breaker (3+ same-fingerprint crashes in one tick, each card crashed once): a `gave_up` event with `sticky: true` (event-id cursor per board) files one `systemic kanban crash … held N card(s) in triage` per board + normalized error head per 30 min; it names no card trigger, so the held cards finishing later doesn't drop it | board + card id (yes); systemic hold: error head (no) |
 | `gateway` | `gateway.previous_unclean_exit`, `asyncio.run.exception`, `gateway.exit_nonzero` in `logs/gateway-exit-diag.log` (a clean exit or a code-75 restart is not a crash); `gateway.exit_signal` (an unplanned SIGTERM bounce: bootout, `kickstart -k`) only as a restart storm, 3+ in 10 min per profile | tag + exception type; for `exit_nonzero`, its `cause` + reason class (a new cause is a new defect; `cause: unrecorded` = exit path missing a cause note) (yes) |
-| `coach` | coach `fixloop_card` (2nd confirmed failure of a fix), and a `reply_nudge` of any reply_check rule (handoff, status_only, report_only, denied_ask, ...) only when its `reply_nudge_outcome` (pre_verify re-runs that rule once on the revised reply and the turn's tool log, attempt 1, same judge and threshold, never nudges again) says it still fails, or no outcome came within 15 min. Non-handoff nudges without the `outcome` marker (a backend still on the old plugin) are not filed. The complaint backstop never judges `[coach]` turns (they are stored as user-role messages but are the coach's own text). `self_heal.py status` → `nudges` counts per rule (resolved / still_failing / no_outcome / waiting / untracked / filed); `handoff_nudges` is kept | session (+ issue) (no) |
+| `coach` | coach `fixloop_card` (2nd confirmed failure of a fix), and a `reply_nudge` of any reply_check rule (handoff, status_only, report_only, denied_ask, ...) only when its `reply_nudge_outcome` (pre_verify re-runs that rule once on the revised reply and the turn's tool log, attempt 1, same judge and threshold, never nudges again) says it still fails, or no outcome came within 15 min (symptom "coach <rule> nudge got no outcome (no revised reply)"). A no-outcome nudge whose session transcript (`state.db`, default home and profiles) shows an interruption marker ("Operation interrupted" / "An automated delivery was interrupted") after the nudge with no later final reply is not filed: the turn died (gateway restart), and `nudge_outcome_lost` (reason=interrupted) is logged instead; an unreadable db or a session not found files as before. Non-handoff nudges without the `outcome` marker (a backend still on the old plugin) are not filed. The complaint backstop never judges `[coach]` turns (they are stored as user-role messages but are the coach's own text). `self_heal.py status` → `nudges` counts per rule (resolved / still_failing / no_outcome / waiting / untracked / filed); `handoff_nudges` is kept | session (+ issue) (no) |
 | `monitor` | a propose-only monitor's finding (`route-monitor`, below) | the monitor's own dedupe key |
 
 Profiles (`<home>/profiles/*`) are swept too. Cursor `<home>/coach/signals-cursor.json` (offset + inode per log, last

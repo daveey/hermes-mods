@@ -963,7 +963,8 @@ NUDGE_WHAT = {"handoff": "agent handed the user a step it could do itself"}
 def _handoff_signal(r: dict, why: str) -> dict:
     ev = str(r.get("evidence") or "")
     rule = r.get("rule") or "handoff"
-    what = NUDGE_WHAT.get(rule) or f"agent's revised reply still failed the coach {rule} check"
+    what = NUDGE_WHAT.get(rule) or (f"coach {rule} nudge got no outcome (no revised reply)" if r.get("no_outcome")
+                                    else f"agent's revised reply still failed the coach {rule} check")
     reply = str(r.get("reply") or "")
     return {"kind": "coach", "component": "agent", "at": float(r.get("ts") or 0),
             "session_id": r.get("session_id") or "",
@@ -1033,6 +1034,50 @@ def _unsent_draft_signal(r: dict, why: str) -> dict:
             "fp": fp("coach", "judged_unsent_draft", rule)}
 
 
+INTERRUPT_RE = re.compile(r"^\s*(?:Operation interrupted\b|An automated delivery was interrupted\b)")
+
+
+def _turn_lost(home: Path, n: dict) -> bool:
+    """True when the nudged session's visible transcript after the nudge ends in an interruption marker with no later
+    final assistant reply (the turn was killed, so no reply_nudge_outcome can be logged). Any doubt (session not
+    found, unreadable db) is False: the nudge files as before (fail-open)."""
+    sid, ts = n.get("session_id") or "", float(n.get("ts") or 0)
+    if not sid:
+        return False
+    for _prof, h in homes(home):
+        db = h / "state.db"
+        if not db.is_file():
+            continue
+        try:
+            c = _ro(db)
+            try:
+                rows = c.execute("select content, tool_calls from messages where session_id=? and role='assistant' "
+                                 "and timestamp>=? and (active=1 or compacted=1) order by timestamp, id",
+                                 (sid, ts)).fetchall()
+            finally:
+                c.close()
+        except sqlite3.Error:
+            continue
+        lost = None
+        for content, tool_calls in rows:
+            text = str(content or "")
+            if INTERRUPT_RE.search(text):
+                lost = True
+            elif text.strip() and not (tool_calls or "").strip("[] "):
+                lost = False  # a final reply after the interrupt: the turn went on (or a new one ran)
+        if lost is not None:
+            return lost
+    return False
+
+
+def _coach_log(home: Path, rec: dict) -> None:
+    try:
+        with (home / "coach" / "log.jsonl").open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
 def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
     """fixloop_card events file at once. A reply_check nudge (any rule in OUTCOME_RULES) is the guard WORKING (the
     agent was sent back to fix its reply), so it files only when its reply_nudge_outcome says the revised reply still
@@ -1078,7 +1123,15 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
     keep = []
     for n in pending:
         if now - float(n.get("ts") or 0) > HANDOFF_GRACE_S:
-            out.append(_handoff_signal(n, f"no outcome logged within {HANDOFF_GRACE_S // 60} min of the nudge"))
+            if _turn_lost(home, n):
+                # agent-fb58ec3a8f: the turn died after the nudge (gateway restart), so no final reply ran and no
+                # outcome can come. Gateway/drain signals own that restart; it is not an agent that ignored a nudge.
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_lost", "reason": "interrupted",
+                                  "session_id": n.get("session_id") or "", "rule": n.get("rule") or "handoff",
+                                  "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id")})
+                continue
+            out.append(_handoff_signal({**n, "no_outcome": True},
+                                       f"no outcome logged within {HANDOFF_GRACE_S // 60} min of the nudge"))
         else:
             keep.append(n)
     if keep:

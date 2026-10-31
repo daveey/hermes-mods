@@ -611,7 +611,9 @@ DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only"
                  "laptop_job")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
-DEFAULT_THRESHOLDS = {"report_only": 0.5, "report_only_screen": 0.85}
+# report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
+# clear 43% of screen >= 0.85 hits, so the screen alone must be surer (agent-fb58ec3a8f).
+DEFAULT_THRESHOLDS = {"report_only": 0.5, "report_only_screen": 0.85, "report_only_capped": 0.92}
 
 
 def scope_limited(user_ask: str) -> bool:
@@ -1217,7 +1219,7 @@ def settings() -> dict:
     ths = dict(DEFAULT_THRESHOLDS)
     for part in os.environ.get("COACH_REPLY_THRESHOLDS", "").split(","):
         k, _, v = part.partition("=")
-        if k.strip() in RULES or k.strip() == "report_only_screen":
+        if k.strip() in RULES or k.strip() in ("report_only_screen", "report_only_capped"):
             try:
                 ths[k.strip()] = float(v)
             except ValueError:
@@ -1286,11 +1288,15 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
 
 def rule_threshold(rule: str, verdict: dict, thresholds: dict, default: float) -> float:
     """The threshold a verdict is held to: report_only uses its second-opinion threshold only when the strong model
-    scored it, otherwise report_only_screen."""
+    scored it, report_only_capped (if stricter) when the second opinion was due but unavailable, else
+    report_only_screen."""
     if rule == "report_only":
         if verdict.get("report_only_src") == "confirm":
             return thresholds.get("report_only", default)
-        return thresholds.get("report_only_screen", thresholds.get("report_only", default))
+        scr = thresholds.get("report_only_screen", thresholds.get("report_only", default))
+        if verdict.get("report_only_src") == "screen_fallback":
+            return max(scr, thresholds.get("report_only_capped", scr))
+        return scr
     return thresholds.get(rule, default)
 
 
@@ -1316,7 +1322,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     `confirm() -> (p, evidence) | None` is the report_only second opinion (aux task `coach_report_only`, real tool
     arguments): when the screen's report_only p is >= `confirm_floor`, its p replaces the screen's and is compared with
     thresholds["report_only"]; None (daily cap hit, error) falls back to the screen's p against
-    thresholds["report_only_screen"] (default: the report_only threshold). Without `confirm` nothing changes.
+    thresholds["report_only_screen"] (default: the report_only threshold), raised to thresholds["report_only_capped"]
+    when a second opinion was due but unavailable. Without `confirm` nothing changes.
     `wake()` lists the session's wake sources; any source drops the `unwatched` candidate before the judge runs
     (no wake callable = can't tell, so `unwatched` is skipped).
     `screen(candidates) -> {rule: p} | None` (a System One model) drops screened candidates below `screen_below`
@@ -1425,6 +1432,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             th_ro = ths.get("report_only", th_scr)
         else:
             v["report_only_src"] = "screen_fallback"
+            th_ro = max(th_scr, ths.get("report_only_capped", th_scr))
     if audit is not None and "report_only" in cands:
         try:
             audit({"event": "report_only_scored", "screen_p": screen_p,
