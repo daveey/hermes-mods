@@ -123,11 +123,16 @@ will work", "you can click Retry to ..."); added for bot-dc58243931, they change
 (identical candidates, so identical judge precision) and replays of that turn through `pre_verify` nudged 4 of 5. Production path: prefilter, scope-limit guard, Sonnet `coach_reply` screen; when
 the screen's report_only p >= 0.75 (`CONFIRM_FLOOR`) one call to `coach_report_only` (claude-opus-5-5, labeling rubric
 plus the real args of kanban_create, delegate_task, patch and terminal calls) labels the outcome; a report_only +
-agent_fixable label is p 0.9 and nudges (`report_only=0.5`). Capped at 100 confirm calls per host per day (events
+agent_fixable label is p 0.9 and nudges (`report_only=0.5`). Capped at 250 confirm calls per host per day (events
 `report_only_confirm` and `report_only_confirm_capped` in `log.jsonl`; `COACH_REPORT_ONLY_CONFIRM_CAP`, set
 `COACH_REPORT_ONLY_CONFIRM=0` to turn it off); with no confirm wired the screen alone must reach
-`report_only_screen=0.85`, and when a confirm was due but unavailable (cap hit, error) it must reach
-`report_only_capped=0.92` (confirms clear 43% of screen hits at >= 0.85; agent-fb58ec3a8f).
+`report_only_screen=0.85`. When a confirm was due but unavailable (cap hit, error) the reply is NOT nudged: the
+audit row says `passing: false, suppressed: "unconfirmed"` (agent-f668487724: past the cap the screen agreed with the
+second opinion on only 39 of 68 hits, and each false nudge became a self-heal card). `COACH_REPORT_ONLY_FALLBACK=nudge`
+restores the old screen fallback, held to `report_only_capped=0.92`. Since that leaves a capped day unchecked, any
+`report_only_confirm_capped` row makes `signals.confirm_cap_check` file one self-heal card per day (later days comment
+on it). A `kanban_block(kind=capability, needs=[...])` with no `human_request` opens an agent owner card and is not
+counted as a human ask (`human_block`).
 Held-out human turns (59 positives; precision / recall, 95% Wilson CI): cascade at screen floor 0.75: 0.957 (0.79-0.99) /
 0.373 (0.26-0.50); Sonnet screen alone at 0.75: 0.647 / 0.373, at 0.85: 0.562 / 0.153. Train (116 positives), cascade at
 0.75: 0.811 (0.66-0.91) / 0.259 (0.19-0.35); floor 0.5: 0.679 / 0.474. Pooled train + held-out (175 positives): floor 0.75

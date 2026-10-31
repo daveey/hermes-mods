@@ -69,8 +69,11 @@ def test_reply_after_a_successful_kanban_continue_is_not_report_only():
     assert rc.report_only_guard(ASK, DRAFT, OK_LOG) == "continued_run"
 
 
+CONFIRMED = lambda: (0.9, "stops at the diagnosis")  # noqa: E731  (an unconfirmed screen never nudges: agent-f668487724)
+
+
 def test_same_reply_without_kanban_continue_still_nudges():
-    hit, _ = _check(BEFORE, p=0.95)
+    hit, _ = _check(BEFORE, p=0.95, confirm=CONFIRMED)
     assert hit and hit["rule"] == "report_only"
     assert not rc.continued_run(BEFORE)
     assert rc.report_only_guard(ASK, DRAFT, BEFORE) is None
@@ -80,7 +83,7 @@ def test_same_reply_without_kanban_continue_still_nudges():
 
 def test_kanban_continue_that_errored_still_nudges():
     assert not rc.continued_run(ERR_LOG)
-    hit, _ = _check(ERR_LOG, p=0.95)
+    hit, _ = _check(ERR_LOG, p=0.95, confirm=CONFIRMED)
     assert hit and hit["rule"] == "report_only"
 
 
@@ -102,9 +105,15 @@ def test_capped_confirm_does_not_let_the_screen_nudge_alone_when_told_not_to():
     # the confirm, when it runs, still decides
     hit, _ = _check(BEFORE, p=0.97, confirm=lambda: (0.9, "stops at the diagnosis"), capped_nudge=False)
     assert hit and hit["rule"] == "report_only"
-    # default (interactive chats) keeps the stricter capped bar
-    hit, _ = _check(BEFORE, p=0.97, confirm=lambda: None)
+    # interactive chats: by default the unconfirmed screen is suppressed too (agent-f668487724) ...
+    audit = []
+    hit, _ = _check(BEFORE, p=0.97, confirm=lambda: None, audit=audit.append)
+    assert hit is None and audit[0]["source"] == "screen_fallback" and audit[0]["suppressed"] == "unconfirmed"
+    # ... and report_only_fallback="nudge" restores the stricter capped bar for them only
+    hit, _ = _check(BEFORE, p=0.97, confirm=lambda: None, report_only_fallback="nudge")
     assert hit and hit["verdict"]["report_only_src"] == "screen_fallback"
+    hit, _ = _check(BEFORE, p=0.97, confirm=lambda: None, capped_nudge=False, report_only_fallback="nudge")
+    assert hit is None  # a Kanban worker turn never nudges on the screen alone
 
 
 def test_confirm_daily_cap_raised():
@@ -146,7 +155,14 @@ def test_pre_verify_kanban_platform_capped_confirm_skips_the_screen_nudge(tmp_pa
     assert hooks["pre_verify"](session_id=sid, platform="kanban", attempt=0, final_response=DRAFT) is None
     logged = [json.loads(l) for l in logf.read_text().splitlines()]
     assert any(r["event"] == "report_only_scored" and r["source"] == "screen_capped_skip" for r in logged)
-    # an interactive chat with the same capped confirm still nudges on a 0.97 screen
+    # an interactive chat with the same capped confirm: suppressed by default (agent-f668487724) ...
+    hooks3, logf3 = _hooks(tmp_path / "c", monkeypatch)
+    hooks3["pre_llm_call"](session_id="c0", user_message=ASK, platform="cli")
+    assert hooks3["pre_verify"](session_id="c0", platform="cli", attempt=0, final_response=DRAFT) is None
+    assert any(r["event"] == "report_only_scored" and r.get("suppressed") == "unconfirmed"
+               for r in map(json.loads, logf3.read_text().splitlines()))
+    # ... and with COACH_REPORT_ONLY_FALLBACK=nudge it still nudges on a 0.97 screen
+    monkeypatch.setenv("COACH_REPORT_ONLY_FALLBACK", "nudge")
     hooks2, logf2 = _hooks(tmp_path / "b", monkeypatch)
     hooks2["pre_llm_call"](session_id="c1", user_message=ASK, platform="cli")
     out = hooks2["pre_verify"](session_id="c1", platform="cli", attempt=0, final_response=DRAFT)

@@ -546,6 +546,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            audit=lambda event: store.log({**event, "session_id": session_id,
                                                           "turn": coach.turn_number(session_id),
                                                           "notice": rc.notice_turn(ask)}),
+                           report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK),
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)

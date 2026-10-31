@@ -120,3 +120,35 @@ def test_session_in_a_profile_state_db_is_found(tmp_path):
     c.close()
     src.close()
     assert _coach(sg.collect_coach(h, {}, LATE)) == []
+
+
+# agent-f668487724: past the report_only confirm cap an unconfirmed report_only no longer nudges, so a capped day is a
+# blind spot. Any report_only_confirm_capped row files one signal per day (later days comment on the same card).
+def test_confirm_cap_reached_files_one_signal_per_day(tmp_path):
+    h = tmp_path / "home"
+    (h / "coach").mkdir(parents=True)
+    rows = [{"ts": NOW + i, "event": "report_only_confirm_capped", "session_id": f"s{i}", "used": 250 + i, "cap": 250}
+            for i in range(3)]
+    (h / "coach" / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    cur = {}
+    got = [s for s in sg.collect_coach(h, cur, NOW + 60) if "confirm" in s["fp"] or "cap" in s["symptom"]]
+    assert len(got) == 1 and got[0]["component"] == "plugin" and got[0]["comment_open_card"] is True
+    assert "used=250 cap=250" in got[0]["details"]
+    # same day again: nothing new
+    with open(h / "coach" / "log.jsonl", "a") as f:
+        f.write(json.dumps({**rows[0], "ts": NOW + 120}) + "\n")
+    assert [s for s in sg.collect_coach(h, cur, NOW + 180) if "cap reached" in s["symptom"]] == []
+    # a later day: one more signal with the same fingerprint (comments on the open card)
+    with open(h / "coach" / "log.jsonl", "a") as f:
+        f.write(json.dumps({**rows[0], "ts": NOW + 86400 * 2}) + "\n")
+    again = [s for s in sg.collect_coach(h, cur, NOW + 86400 * 2 + 60) if "cap reached" in s["symptom"]]
+    assert len(again) == 1 and again[0]["fp"] == got[0]["fp"]
+    d = sg.to_defect(again[0])
+    assert d["component"] == "plugin" and d.get("comment_open_card") is True
+
+
+def test_no_capped_rows_files_nothing(tmp_path):
+    h = tmp_path / "home"
+    (h / "coach").mkdir(parents=True)
+    (h / "coach" / "log.jsonl").write_text(json.dumps({"ts": NOW, "event": "report_only_confirm", "ok": True}) + "\n")
+    assert [s for s in sg.collect_coach(h, {}, NOW + 60) if "cap reached" in s["symptom"]] == []

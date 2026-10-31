@@ -1002,7 +1002,14 @@ Return ONLY one JSON object:
   "na": no unresolved problem in the reply (a pure answer, finished work, chit-chat).
 - user_wanted_action: true if the message asked the agent to do, fix, build or change something (not just a question, status check or FYI)."""
 CONFIRM_FLOOR = 0.75  # screen report_only p at or above this gets the second opinion (tuned on train)
-CONFIRM_DAILY_CAP = 200  # 2026-10-30 needed ~190 (88 capped turns left the screen to decide alone)
+# 250 covers the busiest day seen (2026-10-30: 189 screen scores at or above the floor, 88 capped turns;
+# agent-f668487724, agent-2d5f5e554b). The coach's daily check opens a Kanban card when report_only_confirm_capped
+# fires anyway (signals.confirm_cap_check).
+CONFIRM_DAILY_CAP = 250
+# What an unconfirmed report_only does when the second opinion was due but unavailable (cap hit, error): "skip" (no
+# nudge; the screen alone agreed with the second opinion on only 57% of its hits) or "nudge" (the old screen fallback,
+# held to report_only_capped). COACH_REPORT_ONLY_FALLBACK overrides. Kanban worker turns always skip (capped_nudge).
+REPORT_ONLY_FALLBACK = "skip"
 
 
 def confirm_system() -> str:
@@ -1334,7 +1341,9 @@ def settings() -> dict:
                 ths[k.strip()] = float(v)
             except ValueError:
                 pass
-    return {"rules": rules, "threshold": th, "thresholds": ths}
+    fb = os.environ.get("COACH_REPORT_ONLY_FALLBACK", REPORT_ONLY_FALLBACK).strip().lower()
+    return {"rules": rules, "threshold": th, "thresholds": ths,
+            "report_only_fallback": fb if fb in ("skip", "nudge") else REPORT_ONLY_FALLBACK}
 
 
 def aux_judge(system: str, prompt: str) -> str:
@@ -1422,10 +1431,14 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           human_asks: Optional[Callable[[], list]] = None,
           audit: Optional[Callable[[dict], None]] = None,
           card_status: Optional[Callable[[str], Optional[str]]] = None,
-          capped_nudge: bool = True) -> Optional[dict]:
+          capped_nudge: bool = True,
+          report_only_fallback: str = REPORT_ONLY_FALLBACK) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
     `capped_nudge=False` (Kanban worker turns): when the report_only second opinion was due but unavailable (daily
     cap, error), the screen alone never nudges (audit source "screen_capped_skip").
+    `report_only_fallback` ("skip", the default, or "nudge") does the same for every other turn: "skip" audits the
+    screen_fallback row as passing=false, suppressed="unconfirmed" (agent-f668487724); "nudge" restores the old
+    fallback, held to thresholds["report_only_capped"].
     `card_status(card_id) -> status | None` looks up cards the reply names as owner (default: this host's boards,
     read-only); a done/archived one is the deterministic `closed_owner` report_only hit.
     `human_asks()` lists asks waiting on the user from cards linked to the chat ([{id, title, action}]); it is called
@@ -1549,15 +1562,19 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         else:
             v["report_only_src"] = "screen_fallback"
             th_ro = max(th_scr, ths.get("report_only_capped", th_scr))
+    # agent-f668487724: an unconfirmed report_only (second opinion due but capped or failed) never nudges by default.
+    suppressed = (v.get("report_only_src") == "screen_fallback" and report_only_fallback != "nudge"
+                  and v["report_only"] >= th_ro)
     if audit is not None and "report_only" in cands:
         try:
             audit({"event": "report_only_scored", "screen_p": screen_p,
                    "confirm_attempted": confirm_attempted, "floor": confirm_floor,
                    "source": v.get("report_only_src", "screen"), "final_p": v["report_only"],
-                   "threshold": th_ro, "passing": v["report_only"] >= th_ro})
+                   "threshold": th_ro, "passing": v["report_only"] >= th_ro and not suppressed,
+                   **({"suppressed": "unconfirmed"} if suppressed else {})})
         except Exception:
             pass  # telemetry never changes a verdict
-    if v.get("report_only_src") == "screen_capped_skip":
+    if suppressed or v.get("report_only_src") == "screen_capped_skip":
         cands = [r for r in cands if r != "report_only"]
         if not cands:
             return None
@@ -1630,6 +1647,10 @@ def human_block(tool_name: str, args: Any, default_card: str = "") -> Optional[t
     hr_text = json.dumps(hr, ensure_ascii=False) if isinstance(hr, dict) and hr else ""
     if tool_name == "kanban_block":
         if not hr_text and str(a.get("kind") or "") not in ("needs_input", "capability"):
+            return None
+        # capability + needs=[...] and no human_request opens an agent owner card on the gateway holding the access;
+        # it asks nobody (agent-f668487724). A capability block without needs still asks a human.
+        if not hr_text and str(a.get("kind") or "") == "capability" and a.get("needs"):
             return None
         text = "\n".join(s for s in (str(a.get("reason") or ""), hr_text) if s)
         return (text, str(a.get("task_id") or default_card or "")) if text.strip() else None

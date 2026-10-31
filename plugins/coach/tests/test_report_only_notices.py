@@ -51,7 +51,8 @@ def test_confirm_and_fallback_scores_are_auditable():
         v.update(report_only=0.8)
         rc.check('The cache is still broken.', 'Fix it.', [], lambda *a: json.dumps(v),
                  only=['report_only'], audit=events.append, confirm=lambda: result,
-                 thresholds={'report_only': 0.75, 'report_only_screen': 0.85}, confirm_floor=0.5)
+                 thresholds={'report_only': 0.75, 'report_only_screen': 0.85}, confirm_floor=0.5,
+                 report_only_fallback='nudge')
         e = next(e for e in events if e['event'] == 'report_only_scored')
         assert e['confirm_attempted'] is True and e['source'] == source
         assert e['final_p'] == final_p and not e['passing']

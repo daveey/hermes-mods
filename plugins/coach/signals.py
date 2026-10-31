@@ -1174,6 +1174,37 @@ def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") ->
     return out
 
 
+def confirm_cap_check(cur: dict, capped: List[dict], now: float, host: str = "") -> List[dict]:
+    """agent-f668487724: report_only's second opinion has a daily cap (reply_check.CONFIRM_DAILY_CAP, sized to the
+    busiest day seen). Past it, an unconfirmed report_only no longer nudges, so the check silently goes quiet. Any
+    report_only_confirm_capped row means the cap is too small again: one signal per day it happens (the same card gets
+    a comment on later days). capped: this pass's report_only_confirm_capped rows."""
+    filed = [d for d in cur.get("coach_confirm_cap") or [] if isinstance(d, str)][-14:]
+    by_day: Dict[str, List[dict]] = {}
+    for r in capped:
+        at = float(r.get("ts") or now)
+        by_day.setdefault(time.strftime("%Y-%m-%d", time.localtime(at)), []).append(r)
+    out = []
+    for day, rows in sorted(by_day.items()):
+        if day in filed:
+            continue
+        filed.append(day)
+        r = rows[0]
+        out.append({"kind": "coach", "component": "plugin", "at": float(r.get("ts") or now), "session_id": "",
+                    "symptom": "coach report_only second-opinion daily cap reached: unconfirmed report_only replies "
+                               "go unchecked",
+                    "details": (f"coach/log.jsonl on {host or 'this host'} has report_only_confirm_capped on {day} "
+                                f"(used={r.get('used')} cap={r.get('cap')}). Past the cap the screen-only score no "
+                                f"longer nudges (report_only_fallback=skip), so report_only misses replies for the "
+                                f"rest of the day. Raise reply_check.CONFIRM_DAILY_CAP (or COACH_REPORT_ONLY_CONFIRM_CAP)"
+                                f" to cover the day's report_only_confirm count, or lower the confirm volume.")[:1500],
+                    "fp": fp("plugin", "report-only-confirm-cap"),
+                    "comment_open_card": True})
+    if filed:
+        cur["coach_confirm_cap"] = filed[-14:]
+    return out
+
+
 def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     """fixloop_card events file at once. A reply_check nudge (any rule in OUTCOME_RULES) is the guard WORKING (the
     agent was sent back to fix its reply), so it files only when its reply_nudge_outcome says the revised reply still
@@ -1184,8 +1215,9 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
     out = []
     pending: List[dict] = list(cur.get("coach_handoff_pending") or [])
     nudges: List[dict] = []
+    capped: List[dict] = []
     for ln in read_new(home / "coach" / "log.jsonl", cur, "coach", now):
-        if '"fixloop_card"' not in ln and '"reply_nudge' not in ln:
+        if '"fixloop_card"' not in ln and '"reply_nudge' not in ln and '"report_only_confirm_capped"' not in ln:
             continue
         try:
             r = json.loads(ln)
@@ -1193,6 +1225,9 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
             continue
         at = float(r.get("ts") or now)
         if at < now - BACKFILL_S:
+            continue
+        if r.get("event") == "report_only_confirm_capped":
+            capped.append(r)
             continue
         rule = r.get("rule")
         if r.get("event") == "reply_nudge" and rule:
@@ -1238,6 +1273,7 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
     else:
         cur.pop("coach_handoff_pending", None)
     out += template_holds(cur, nudges, now, host)
+    out += confirm_cap_check(cur, capped, now, host)
     return out
 
 

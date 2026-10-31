@@ -330,6 +330,9 @@ def test_pre_verify_hook_holds_a_report_only_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(rcl, "aux_judge", lambda s, p: json.dumps(
         {"handoff": 0.0, "confirm": 0.0, "unverified": 0.0, "unwatched": 0.0, "report_only": 0.93,
          "evidence": "stops at 'haven't fixed the panel'"}))
+    # the second opinion confirms (an unconfirmed screen score no longer nudges: agent-f668487724)
+    monkeypatch.setattr(rcl, "aux_confirm", lambda s, p: json.dumps(
+        {"outcome": "report_only", "agent_fixable": True, "quote": "haven't fixed the panel"}))
     store = core.Store(root=tmp_path / "coach")
     coach, hooks = mod.build(store=store, checkout=None)
     hooks["pre_llm_call"](session_id="s9", user_message=REPORT_ASK)
@@ -372,7 +375,8 @@ def test_confirm_unavailable_falls_back_to_the_stricter_screen_threshold():
         llm, _ = _judge(_ro_verdict(p))
         audit = []
         hit = rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths,
-                       confirm=lambda: None, confirm_floor=rc.CONFIRM_FLOOR, audit=audit.append)
+                       confirm=lambda: None, confirm_floor=rc.CONFIRM_FLOOR, audit=audit.append,
+                       report_only_fallback="nudge")  # the opt-in old behaviour (default skip: agent-f668487724)
         assert bool(hit) is fires
         assert audit and audit[0]["source"] == "screen_fallback" and audit[0]["threshold"] == 0.92
 
@@ -405,11 +409,23 @@ def test_pre_verify_hook_runs_the_confirm_with_real_args_and_honours_the_daily_c
         hooks["post_tool_call"](tool_name="kanban_create", args={"title": "Fix stale panel", "body": "cache never refreshes"},
                                 result="ok", session_id=sid)
         out = hooks["pre_verify"](session_id=sid, attempt=0, final_response=REPORT_REPLY)
-        assert out and out["action"] == "continue"  # the third falls back to the screen (0.93 >= 0.85)
+        if i < 2:
+            assert out and out["action"] == "continue"  # confirmed by the second opinion
+        else:
+            # agent-f668487724: past the cap the screen alone (0.93) no longer nudges by default
+            assert out is None
     assert len(prompts) == 2 and "Fix stale panel" in prompts[0] and "cache never refreshes" in prompts[0]
     logged = [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
     assert sum(r["event"] == "report_only_confirm" for r in logged) == 2
     assert sum(r["event"] == "report_only_confirm_capped" for r in logged) == 1
+    scored = [r for r in logged if r["event"] == "report_only_scored"]
+    assert scored[-1]["source"] == "screen_fallback" and scored[-1]["suppressed"] == "unconfirmed"
+    assert scored[-1]["passing"] is False
+    # COACH_REPORT_ONLY_FALLBACK=nudge restores the old screen fallback (held to report_only_capped 0.92)
+    monkeypatch.setenv("COACH_REPORT_ONLY_FALLBACK", "nudge")
+    hooks["pre_llm_call"](session_id="s9", user_message=REPORT_ASK)
+    out = hooks["pre_verify"](session_id="s9", attempt=0, final_response=REPORT_REPLY)
+    assert out and out["action"] == "continue"
 
 
 # --- report_only, unverified owner: the reply hands a problem to another session/card/worker that this turn never
@@ -845,3 +861,44 @@ def test_notice_turn_recognizes_every_prompt_producer_text():
     sh = _mod("self_heal")  # the complaint lane must not read them as user complaints either
     for text in texts + [_ask_relay_prompt()]:
         assert sh.SYNTHETIC_RE.match(text), text[:60]
+
+
+# --- agent-f668487724: past the confirm cap the screen alone (57% agreement with the second opinion) nudged a worker
+# that had already routed the MacBook step to a capability owner. An unconfirmed report_only never nudges by default.
+def test_capped_confirm_does_not_nudge_on_the_screen_alone(monkeypatch):
+    monkeypatch.delenv("COACH_REPORT_ONLY_FALLBACK", raising=False)
+    llm, _ = _judge(_ro_verdict(0.94))
+    audit = []
+    hit = rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=rc.settings()["thresholds"],
+                   confirm=lambda: None, confirm_floor=rc.CONFIRM_FLOOR, audit=audit.append)
+    assert hit is None
+    e = next(e for e in audit if e["event"] == "report_only_scored")
+    assert e["source"] == "screen_fallback" and e["passing"] is False and e.get("suppressed") == "unconfirmed"
+
+
+def test_report_only_fallback_nudge_restores_the_screen_fallback(monkeypatch):
+    monkeypatch.setenv("COACH_REPORT_ONLY_FALLBACK", "nudge")
+    assert rc.settings()["report_only_fallback"] == "nudge"
+    llm, _ = _judge(_ro_verdict(0.94))
+    audit = []
+    hit = rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=rc.settings()["thresholds"],
+                   confirm=lambda: None, confirm_floor=rc.CONFIRM_FLOOR, audit=audit.append,
+                   report_only_fallback=rc.settings()["report_only_fallback"])
+    assert hit and hit["rule"] == "report_only"
+    assert audit[0]["passing"] is True and "suppressed" not in audit[0]
+
+
+def test_confirm_daily_cap_covers_the_busiest_day():
+    assert rc.CONFIRM_DAILY_CAP >= 250  # 10-30 had 189 screen scores at or above the 0.75 confirm floor
+
+
+def test_capability_block_with_needs_is_not_a_human_ask():
+    # kanban_block(kind=capability, needs=[...]) with no human_request opens an agent owner card; it asks David nothing
+    args = {"kind": "capability", "reason": "MacBook rollout needs the MacBook gateway", "needs": ["host:macbook"]}
+    assert rc.human_block("kanban_block", args, "t_x") is None
+    assert rc.human_block("tool_call", {"calls": [{"name": "kanban_block", "arguments": args}]}, "t_x") is None
+    # a capability block with no needs, or one that also carries a human_request, still asks a human
+    assert rc.human_block("kanban_block", {"kind": "capability", "reason": "needs the YubiKey"}, "t_x")
+    hr = {"action": "Tap the key. Unblock = go; archive = drop.", "why_human": "physical", "interaction": "physical",
+          "scope": "x", "evidence": "y"}
+    assert rc.human_block("kanban_block", {**args, "human_request": hr}, "t_x")
