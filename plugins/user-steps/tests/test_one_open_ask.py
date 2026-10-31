@@ -356,6 +356,50 @@ def test_tool_a_ref_from_another_gateway_profile_or_step_folds_nothing(plugin, f
     assert store.get(OWNER, target['requestId']) == target
 
 
+def _cited_body(target, title='Approve the notify fix?'):
+    ref = next(a for a in target['aliases'] if a['type'] == 'user_step')
+    body = payload_of(approval(title, markdown='The full exact plan.'))
+    body['scope'] = dict(body['scope'], sourceRefs=[ref])
+    return body, ref
+
+
+def test_tool_citing_a_target_revised_meanwhile_is_an_error_not_a_second_tile(plugin, monkeypatch):
+    store = plugin.core.ActionStore()
+    target = extracted(plugin, store, 'Approve the notify fix?')
+    body, _ = _cited_body(target)
+
+    def stale(*a, **k):
+        raise plugin.core.ActionError('Stale revision', 409)
+    monkeypatch.setattr(plugin.core.ActionStore, 'revise', stale)
+    out = publish(plugin, {'request': body})
+    assert out.get('status') == 409 and target['requestId'] in out['error'] and 'expectedRevision' in out['error']
+    assert [r['requestId'] for r in live(store)] == [target['requestId']]
+
+
+def test_tool_citing_a_target_decided_meanwhile_publishes_separately_without_its_refs(plugin, monkeypatch):
+    store = plugin.core.ActionStore()
+    target = extracted(plugin, store, 'Approve the notify fix?')
+    body, ref = _cited_body(target)
+
+    def decided(*a, **k):
+        raise plugin.core.ActionError('A decision is already recorded for this revision', 409)
+    monkeypatch.setattr(plugin.core.ActionStore, 'revise', decided)
+    out = publish(plugin, {'request': body})['request']
+    assert out['requestId'] != target['requestId']
+    assert ref not in out['aliases'] and ref not in out['scope']['sourceRefs']
+    assert not out.get('resolution')
+
+
+def test_tool_citing_steps_of_two_open_requests_is_refused(plugin):
+    store = plugin.core.ActionStore()
+    a, b = extracted(plugin, store, 'Approve the notify fix?'), extracted(plugin, store, 'Approve the notify fix?')
+    body, ref_a = _cited_body(a)
+    body['scope']['sourceRefs'].append(next(x for x in b['aliases'] if x['type'] == 'user_step'))
+    out = publish(plugin, {'request': body})
+    assert 'more than one open request' in out['error']
+    assert store.get(OWNER, a['requestId']) == a and store.get(OWNER, b['requestId']) == b
+
+
 def test_tool_extracted_tile_in_another_session_is_never_a_fold_target(plugin):
     store = plugin.core.ActionStore()
     title = 'Approve the notify fix?'

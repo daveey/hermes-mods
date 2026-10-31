@@ -1270,7 +1270,10 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         mirrored = {s.get('requestId') for s in opened}
         listed += [{'id': a['id'], 'kind': a['kind'], 'text': a['title']}
                    for a in open_asks(action_store, action_owner) if a['id'] not in mirrored]
-    elsewhere = elsewhere_titles(action_store, action_owner) if action_store is not None else []
+    # Other chats' open asks are only a relay source in a turn a runtime notice started (relay provenance). In a
+    # turn the user started, an equal or similar title elsewhere is no source association: never suppress by it.
+    relay = _runtime_message(user_msg)
+    elsewhere = elsewhere_titles(action_store, action_owner) if action_store is not None and relay else []
     res = extract(reply, listed, user_msg, llm, continuity=True, elsewhere=elsewhere)
     published, resolved = [], []
     text = reply
@@ -1315,7 +1318,7 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             # borrow their ownership, frame their ids, or decide/revise their requests.
             # Relay provenance required: only a turn a runtime notice started relays another chat's ask. In a
             # turn the user started, an equal title is no source association: that ask stays its own request.
-            other_keys = elsewhere_open_keys(action_store, action_owner) if _runtime_message(user_msg) else set()
+            other_keys = elsewhere_open_keys(action_store, action_owner) if relay else set()
             mapped: dict[str, dict] = {}
             # Retain old label dedup only for genuinely new actions, never use it
             # as an authority binding or to bypass exact retirement/reuse.

@@ -320,7 +320,10 @@ a note. A same-title request is published separately and the `note` names the op
 same-title requests so the agent can withdraw one it replaces; nothing is withdrawn
 automatically. The in-place revision is refused if a decision was recorded meanwhile
 (`revise(..., undecided=True)`), and the request is then published as new without the
-decided request's refs: the decision wins. A request that says, unscoped, that it asks nothing (title "No
+decided request's refs: the decision wins. If the cited request was only revised
+meanwhile (stale revision, still undecided), the call fails with 409 naming that
+request, so one source step never gets a second tile. Citing steps of two open
+requests at once is refused. A request that says, unscoped, that it asks nothing (title "No
 decision needed: ...", scope "Settled, nothing to decide.") is never published: a
 revision (with `expectedRevision`) withdraws the request, a new one is refused with
 the withdraw instruction. None of this records a decision or grants anything.
@@ -512,15 +515,16 @@ first tool starts); this card is the net for when that recovery misses. Tests: `
 
 A reply that only lists decisions waiting in other chats, queues or cards is a status report. A step whose
 evidence sits in that paragraph is not minted, unless the span itself is a direct request and does not contain
-the digest marker. The extractor receives up to 30 titles of open asks in other sessions
-(`ELSEWHERE`); a sentence mapped to one of those titles is neither minted nor framed.
-Before publishing extracted steps in a turn a runtime notice started (a Kanban
-notice, owner wake or chat-closeout row: relay provenance), a deterministic read
+the digest marker. In a turn a runtime notice started (a Kanban notice, owner wake or
+chat-closeout row: relay provenance) the extractor receives up to 30 titles of open asks
+in other sessions (`ELSEWHERE`); a sentence mapped to one of those titles is neither
+minted nor framed. Before publishing extracted steps in such a turn, a deterministic read
 rechecks **all** undecided other-session titles in the same gateway/profile
 namespace, without the prompt's recency cap. Exact normalized candidate-title or
 specific evidence-sentence equality suppresses that relay even when the extractor
-omits its `elsewhere` mapping. In a turn the user started, an equal title in another
-chat is no source association: the ask is published as this chat's own request. This
+omits its `elsewhere` mapping. In a turn the user started, the prompt lists no other
+chats and an equal title in another chat is no source association: the ask is
+published as this chat's own request. This
 never adopts or frames another session's request or changes its state, revision or decisions.
 Unrelated asks, other namespaces and retired requests remain independent. This is a
 publication-time snapshot, not atomic concurrent-session admission or fuzzy matching.

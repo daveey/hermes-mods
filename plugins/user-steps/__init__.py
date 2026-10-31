@@ -186,8 +186,8 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
             note += ('\n[Agent work: these approvals lack a complete plan, so the user cannot decide them. '
                      'If still needed, publish action_request with the same requestId and expectedRevision, '
                      'the FULL exact plan, scope, consequences and approve/change/decline choices. Do not ask '
-                     'the user to request a plan. If it is no longer needed, withdraw it instead. If several ask '
-                     'the same decision, complete ONE and withdraw the others as duplicates.] ' + json.dumps([{'requestId': r['requestId'],
+                     'the user to request a plan. If it is no longer needed, withdraw it instead. Similar titles are not '
+                     'duplicates: withdraw one only when you know it asks the same decision.] ' + json.dumps([{'requestId': r['requestId'],
                                                                      'expectedRevision': r['revision'],
                                                                      'title': r['title']} for r in incomplete]))
         gone = st.unnotified_withdrawals(own)
@@ -276,7 +276,7 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
         return None
     if attempt >= hold_budget:
         return {'replace': 'The approval request is not ready: the agent has not provided a complete exact plan. No approval is requested and no permission has been granted.'}
-    return {'hold': True, 'nudge': 'Complete the missing agent work now: publish action_request with the FULL EXACT inline plan, scope, consequences, limits, exclusions and approve/change/decline choices. Use the same question as its title. If an open request already asks this, revise THAT one (its requestId and expectedRevision) instead of creating another, and withdraw any duplicates. Do not ask the user to request a plan, and do not invent approval. If this is only a clarification, publish kind choice/input with concrete answer labels instead. Then present the decision.'}
+    return {'hold': True, 'nudge': 'Complete the missing agent work now: publish action_request with the FULL EXACT inline plan, scope, consequences, limits, exclusions and approve/change/decline choices. If an open request already asks this, revise THAT one (its requestId and expectedRevision) instead of creating another; a matching title alone does not make it the same request. Do not ask the user to request a plan, and do not invent approval. If this is only a clarification, publish kind choice/input with concrete answer labels instead. Then present the decision.'}
 
 
 publication_buffer.needs_buffer = True
@@ -433,8 +433,14 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
                                     bind=adapter.bind_request, undecided=True)
                 except core.ActionError as exc:
                     if exc.status != 409: raise
-                    # Decided or moved on meanwhile: the decision wins. Publish a separate request that does not
-                    # reuse the decided request's refs.
+                    if 'decision' not in str(exc).lower():
+                        # Revised concurrently, still undecided: never publish a second tile for the same source
+                        # step. Hand the agent the request to revise by its id.
+                        raise core.ActionError(f"The open request this cites ({target['requestId']}) changed "
+                                               f"meanwhile ({exc}); revise it by requestId with its current "
+                                               "expectedRevision.", 409) from exc
+                    # A decision was recorded or is being delivered: the decision wins. Publish a separate
+                    # request that does not reuse the decided request's refs.
                     payload.update(requestId=rid, aliases=[a for a in payload['aliases'] if a not in target['aliases']])
                     if isinstance(payload.get('scope'), dict):
                         payload['scope'] = {**payload['scope'], 'sourceRefs': [

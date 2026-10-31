@@ -125,7 +125,7 @@ def test_elsewhere_titles_reach_the_prompt_and_a_mapped_repeat_is_not_minted(tmp
     step = {'text': repeated, 'kind': 'input', 'verbatim_span': sentence, 'options': []}
     seen = []
     out = run(store, ledger, reply, [step],
-              elsewhere=[{'title': repeated, 'verbatim_span': sentence}], seen=seen)
+              elsewhere=[{'title': repeated, 'verbatim_span': sentence}], seen=seen, user_msg=NOTICE)
     assert seen, 'the extractor was not called'
     prompt = seen[0]
     assert 'ELSEWHERE' in prompt
@@ -148,7 +148,7 @@ def test_elsewhere_mapping_is_not_framed_onto_a_local_tile(tmp_path):
     out = run(store, ledger, reply,
               [{'text': title, 'kind': 'input', 'verbatim_span': sentence, 'options': []}],
               elsewhere=[{'title': title, 'verbatim_span': sentence}],
-              repeats=[{'id': local['steps'][0]['id'], 'verbatim_span': sentence}])
+              repeats=[{'id': local['steps'][0]['id'], 'verbatim_span': sentence}], user_msg=NOTICE)
     assert out['steps'] == []
     assert '::user-step' not in (out['text'] or '')
 
@@ -247,8 +247,14 @@ def test_equal_elsewhere_title_in_a_user_turn_is_its_own_request(tmp_path, typed
     original = store.create(OTHER, _approval(OTHER, title))
     before = store.get(OTHER, original['requestId'])
     sentence = title + '?'
+    seen = []
+    # Even when the model pairs the sentence with the other chat's title (ELSEWHERE mapping), that pairing is
+    # title overlap, not provenance: in a user-started turn it suppresses nothing, and the prompt lists no
+    # other chats' asks at all.
     out = run(store, ledger, sentence,
-              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}], user_msg=typed)
+              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}], user_msg=typed,
+              elsewhere=[{'title': title, 'verbatim_span': sentence}], seen=seen)
+    assert seen and 'other chats; a sentence restating one is never a new step):\n(none)' in seen[0]
     assert len(out['steps']) == 1 and out['steps'][0]['requestId'] != original['requestId']
     assert titles(store, OWNER) == [title]
     assert store.get(OTHER, original['requestId']) == before
