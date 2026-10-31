@@ -48,6 +48,8 @@ def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
 @pytest.fixture(autouse=True)
 def _confirm_env(monkeypatch):
     monkeypatch.delenv("HERMES_USER_TERMINAL_CONFIRM", raising=False)
+    # No detached watchdogs from unit tests (they would judge fake runner pids); _watch() runs the real one.
+    monkeypatch.setattr(ut, "spawn_watchdog", lambda job: None, raising=False)
 
 
 # The job runner wraps the command in BSD/macOS `script -q FILE cmd...`; util-linux `script` takes
@@ -926,3 +928,188 @@ def test_duplicate_runners_run_the_command_once(tmp_path, monkeypatch):
 def test_center_is_best_effort_inside_the_open_script():
     for script in (ut._center("Terminal"), ut._center("iTerm")):
         assert script.strip().startswith("try") and "with timeout of" in script and script.strip().endswith("end try")
+
+
+
+# ---------------------------------------------------------------- owned prompts: withdrawal, max age, dead runner
+
+def _watch(job: Path, secs: float = 3.0, env: dict | None = None) -> None:
+    """The job-local watchdog as it really runs: this plugin file executed with --watchdog (bounded)."""
+    e = {**os.environ, **(env or {})}
+    subprocess.run([sys.executable, str(Path(ut.__file__)), "--watchdog", str(job), str(secs), "0.2"], env=e,
+                   timeout=secs + 20, capture_output=True)
+
+
+def _board(tmp_path: Path, status="blocked", run=None) -> Path:
+    import sqlite3
+    db = tmp_path / "kanban.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, current_run_id INTEGER)")
+    con.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
+                "payload TEXT, created_at INTEGER)")
+    con.execute("INSERT INTO tasks VALUES ('t_card', ?, ?)", (status, run))
+    con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'blocked', ?)",
+                (int(time.time()) - 600,))
+    con.commit()
+    con.close()
+    return db
+
+
+def _owned_job(tmp_path, monkeypatch, db: Path, run_id="7") -> Path:
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_card")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    monkeypatch.setattr(ut, "open_window", lambda job: "Terminal")
+    monkeypatch.setattr(ut, "spawn_watchdog", lambda job: None, raising=False)
+    res = json.loads(ut.handle({"command": "echo hi", "reason": "r", "cwd": str(tmp_path), "wait_s": 1}))
+    return Path(tmp_path / "jobs" / res["job_id"])
+
+
+@pytest.mark.parametrize("key", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"])
+def test_owner_is_the_worker_card_and_run(tmp_path, monkeypatch, key):
+    for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setenv(key, "t_card")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    seen = {}
+    monkeypatch.setattr(ut, "open_window", lambda job: seen.setdefault("env", ut.launch_env()) and "Terminal")
+    monkeypatch.setattr(ut, "spawn_watchdog", lambda job: None, raising=False)
+    res = json.loads(ut.handle({"command": "echo hi", "cwd": str(tmp_path), "wait_s": 1}, session_id="s1"))
+    owner_file = tmp_path / res["job_id"] / "owner.json"
+    assert owner_file.exists(), "job records no owner"
+    owner = json.loads(owner_file.read_text())
+    assert owner == {"kind": "kanban", "task": "t_card", "run_id": 42, "board": "default",
+                     "db": str(tmp_path / "kanban.db")}
+    assert key not in seen["env"]  # the launched window still gets the scrubbed env
+
+
+def test_owner_is_the_chat_session_without_a_card(tmp_path, monkeypatch):
+    for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setattr(ut, "open_window", lambda job: "Terminal")
+    spawned = []
+    monkeypatch.setattr(ut, "spawn_watchdog", spawned.append, raising=False)
+    res = json.loads(ut.handle({"command": "echo hi", "cwd": str(tmp_path), "wait_s": 1}, session_id="chat-123"))
+    assert [p.name for p in spawned] == [res["job_id"]]  # every local job gets its own watchdog
+    owner_file = tmp_path / res["job_id"] / "owner.json"
+    assert owner_file.exists(), "job records no owner"
+    assert json.loads(owner_file.read_text()) == {"kind": "session", "session_id": "chat-123"}
+
+
+def _gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+@needs_bsd_script
+def test_withdraw_kills_running_command_group_and_window_says_so(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    marker = tmp_path / "after"
+    job = ut.create_job(f"echo $$ > {tmp_path}/shell; sleep 300 & echo $! > {tmp_path}/child; sleep 300; touch {marker}",
+                        "r", str(tmp_path))
+    out = {}
+    th = threading.Thread(target=lambda: out.setdefault("screen", _drive(job, ["\n"], timeout=30)))
+    th.start()
+    deadline = time.time() + 15
+    while time.time() < deadline and not (tmp_path / "child").exists():
+        time.sleep(0.1)
+    child = int((tmp_path / "child").read_text())
+    assert not _gone(child)
+    try:
+        res = json.loads(ut.handle({"action": "withdraw", "job_id": job.name, "reason": "card finished", "wait_s": 1}))
+        th.join(10)
+        alive_after = not _gone(child)
+    finally:  # never leave a sleep 300 (or a hung pty driver) behind when this fails
+        for pid in (child,):
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+        subprocess.run(["pkill", "-9", "-P", (tmp_path / "shell").read_text().strip()], check=False)
+        th.join(35)
+    assert not alive_after, "background sleep 300 survived the withdrawal"
+    assert res.get("status") == "withdrawn"
+    assert not marker.exists()
+    assert b"Hermes withdrew this request: card finished. Nothing else to do here." in out["screen"]
+    st = ut.wait_for(job, 0)
+    assert st["status"] == "withdrawn" and st["reason"] == "card finished"  # never overwritten by "ran"
+    assert (job / "withdraw").read_text().strip() == "card finished"
+
+
+@needs_bsd_script
+def test_runner_refuses_when_withdraw_marker_preexists(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    ran = tmp_path / "ran"
+    job = ut.create_job(f"touch {ran}", "r", str(tmp_path))
+    (job / "withdraw").write_text("no longer needed")
+    screen = _drive(job, ["\n"])
+    assert not ran.exists()
+    assert b"Hermes withdrew this request: no longer needed. Nothing else to do here." in screen
+    assert ut.read_status(job).get("status") != "ran"
+
+
+def test_watchdog_keeps_same_blocked_run_then_withdraws_on_unblock(tmp_path, monkeypatch):
+    import sqlite3
+    db = _board(tmp_path, "blocked", None)
+    job = _owned_job(tmp_path, monkeypatch, db)
+    _watch(job, 1.5)
+    assert ut.read_status(job)["status"] == "waiting_for_user"  # still blocked, same run: kept
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'unblocked', ?)",
+                (int(time.time()),))
+    con.execute("UPDATE tasks SET status='ready'")
+    con.commit()
+    con.close()
+    _watch(job, 3)
+    st = ut.wait_for(job, 0)
+    assert st["status"] == "withdrawn" and "unblocked" in st["reason"]
+
+
+@pytest.mark.parametrize("status,run", [("done", None), ("archived", None), ("running", 9)])
+def test_watchdog_withdraws_when_card_finished_or_newer_run(tmp_path, monkeypatch, status, run):
+    db = _board(tmp_path, status, run)
+    job = _owned_job(tmp_path, monkeypatch, db)
+    _watch(job, 3)
+    assert ut.wait_for(job, 0)["status"] == "withdrawn"
+
+
+def test_watchdog_max_age(tmp_path, monkeypatch):
+    db = _board(tmp_path, "blocked", None)
+    job = _owned_job(tmp_path, monkeypatch, db)
+    meta = json.loads((job / "meta.json").read_text())
+    meta["created"] = time.time() - 3 * 60
+    (job / "meta.json").write_text(json.dumps(meta))
+    _watch(job, 3, {"HERMES_USER_TERMINAL_MAX_WAIT_MINUTES": "2"})
+    st = ut.wait_for(job, 0)
+    assert st["status"] == "withdrawn" and "2 minutes" in st["reason"]
+
+
+def test_watchdog_dead_runner_becomes_abandoned_but_not_before_launch(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    _watch(job, 1)
+    assert ut.read_status(job)["status"] == "waiting_for_user"  # no runner yet (launch race): kept
+    p = subprocess.Popen(["true"])
+    p.wait()
+    (job / "opened").write_text(f"{p.pid}\n")
+    ut.wait_for  # noqa: B018
+    (job / "status.json").write_text(json.dumps({"status": "running"}))
+    (job / "start.lock").mkdir()
+    (job / "start.lock" / "owner").write_text(f"runner {p.pid}\n")
+    _watch(job, 3)
+    st = ut.wait_for(job, 0)
+    assert st["status"] == "abandoned" and st["ok"] is False
+
+
+def test_remote_withdraw_is_refused_not_resumed(remote, monkeypatch):
+    monkeypatch.setattr(ut, "owner_refusal", lambda sid: None)
+    res = json.loads(ut.handle_remote({"action": "withdraw", "job_id": "x", "reason": "r", "wait_s": 1}))
+    assert res["ok"] is False and "withdraw is not available" in res["error"]

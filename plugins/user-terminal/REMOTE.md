@@ -36,6 +36,10 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
    so it is retried for up to 25 s. A failure after sending (`Timed out connecting…` on `start`) is never retried,
    so nothing can run twice. The result POST back to the gateway is retried, because it is keyed by request id.
 
+- Owned-prompt withdrawal is not relayed: `action: withdraw` on a screenless gateway returns an error (never a
+  silent resume). The Mac's job-local watchdog still withdraws a relayed job after `user_terminal.max_wait_minutes`
+  and marks it `abandoned` when its window dies; the remote card's board is not read from the Mac.
+
 ## How it works
 
 ```

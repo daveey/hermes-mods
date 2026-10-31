@@ -26,6 +26,22 @@ Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
               runs nothing, and fail_job() never overwrites a running/ran/declined job.
   open_warning.txt  the opener's error when its window started anyway (returned as opener_warning)
   origin.txt  who asked, for a request relayed from another gateway (shown by the runner)
+  owner.json  who owns the prompt: {kind: kanban, task, run_id, board, db} (HERMES_KANBAN_TASK, else
+              HERMES_KANBAN_WORKER_TASK; read before launch_env() strips them), {kind: session}, or {kind: relayed}
+  withdraw    the withdrawal marker; holds the reason. A runner that starts while it exists refuses.
+  final.lock  the final-outcome gate (atomic mkdir; result.json inside). ran/declined (runner), failed,
+              withdrawn and abandoned (Python) are written only by its winner, so a withdrawal is never
+              overwritten by "ran".
+  cmd.pgid    the command's process group (script(1)'s session leader) so a withdrawal kills it, children included
+
+Owned prompts: each job gets a detached job-local watchdog (this file run with --watchdog, polling every 2 s,
+bounded to max age + 2 min). It withdraws the job when the owning card is done/archived, got an ``unblocked``
+event after the job was created, or has a newer current_run_id (board sqlite opened mode=ro + query_only; a
+card still blocked on the same run keeps its prompt); when it is older than ``user_terminal.max_wait_minutes``
+(default 120, env HERMES_USER_TERMINAL_MAX_WAIT_MINUTES); or on ``action: withdraw`` (job_id, reason). Withdrawal
+kills the command's process group (e.g. a sudo waiting for its password), keeps the window's TTY, records
+status ``withdrawn`` with the reason and prints "Hermes withdrew this request: <reason>. Nothing else to do here."
+A runner that died while waiting/running (pid + start time, only once a runner announced itself) -> ``abandoned``.
 
 Terminal choice: iTerm > Terminal.app > cmux; env HERMES_USER_TERMINAL = iterm | terminal | cmux tries that one first.
 (cmux is last: its control socket only accepts processes started inside cmux by default.)
@@ -49,6 +65,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -99,6 +116,7 @@ SCHEMA = {
             "cwd": {"type": "string", "description": "Working directory (default: user's home)."},
             "wait_s": {"type": "integer", "description": f"Seconds to wait for the user + command (default {DEFAULT_WAIT}, max {MAX_WAIT})."},
             "job_id": {"type": "string", "description": "Resume waiting on an earlier pending job instead of starting a new one."},
+            "action": {"type": "string", "enum": ["run", "withdraw"], "description": "withdraw (with job_id and reason): take back a request that is no longer needed; the window says so and any running command is stopped."},
         },
     },
 }
@@ -109,7 +127,17 @@ JOB="$1"
 printf '%s\n' "$$" >> "$JOB/opened"   # evidence for the opener: a window exists (stops its fallback)
 B=$'\e[1m'; D=$'\e[2m'; Y=$'\e[33m'; G=$'\e[32m'; R=$'\e[31m'; C=$'\e[36m'; N=$'\e[0m'
 status() { printf '%s' "$1" > "$JOB/.status.$$.tmp" && mv "$JOB/.status.$$.tmp" "$JOB/status.json"; }
+# Final outcome gate shared with withdraw_job()/mark_abandoned() in Python: whoever creates final.lock owns the
+# job's final status, so a withdrawal is never overwritten by "ran" (and vice versa).
+final() { mkdir "$JOB/final.lock" 2>/dev/null || return 1; printf '%s' "$1" > "$JOB/final.lock/result.json"; status "$1"; }
+withdrawn_msg() {
+  echo; echo "${B}${Y}Hermes withdrew this request: $(head -c 2000 "$JOB/withdraw" 2>/dev/null | tr -s '\n' ' ' | sed 's/ *$//'). Nothing else to do here.${N}"
+  read -r -t 600 -p "Press Enter to close. " </dev/tty; exit 0
+}
+trap 'withdrawn_msg' USR1
+if [ -e "$JOB/withdraw" ]; then withdrawn_msg; fi   # withdrawn before this window started: never run
 refuse() {
+  if [ -e "$JOB/withdraw" ]; then withdrawn_msg; fi
   if grep -q '"status": *"failed"' "$JOB/status.json" 2>/dev/null; then
     echo "Hermes already gave up on this window (it did not open in time) and told the agent; not running it."
   else
@@ -119,7 +147,7 @@ refuse() {
 }
 # The single-start gate, shared with fail_job() in Python: whoever creates start.lock decides (run, decline or
 # failed). mkdir is atomic, so two windows, or a window and Hermes giving up, can never both win.
-gate() { mkdir "$JOB/start.lock" 2>/dev/null || refuse; echo "runner $$" > "$JOB/start.lock/owner"; }
+gate() { mkdir "$JOB/start.lock" 2>/dev/null || refuse; echo "runner $$" > "$JOB/start.lock/owner"; [ -e "$JOB/withdraw" ] && withdrawn_msg; }
 if grep -q '"status": *"failed"' "$JOB/status.json" 2>/dev/null; then refuse; fi
 if [ -s "$JOB/origin.txt" ]; then printf '\e]0;Hermes (%s) wants to run a command\a' "$(head -n1 "$JOB/origin_short.txt" 2>/dev/null)"; else printf '\e]0;Hermes wants to run a command\a'; fi
 clear
@@ -139,7 +167,7 @@ if [ -f "$JOB/confirm" ]; then
     read -r -p "${B}Run it? [y/N]${N} " ans
     case "$ans" in
       y|Y|yes|YES) break ;;
-      ""|n|N|no|NO) gate; status '{"status":"declined"}'; echo "${R}Declined — told Hermes.${N}"; sleep 2; exit 0 ;;
+      ""|n|N|no|NO) gate; final '{"status":"declined"}'; echo "${R}Declined — told Hermes.${N}"; sleep 2; exit 0 ;;
     esac
   done
 fi
@@ -149,9 +177,12 @@ status '{"status":"running"}'
 echo "${D}──────────────────────────────────────────${N}"
 cd "$(cat "$JOB/cwd.txt")" || { status '{"status":"ran","exit_code":1,"error":"cwd not found"}'; read -r -p "cwd not found. Enter to close. "; exit 1; }
 SH="${SHELL:-/bin/zsh}"
-/usr/bin/script -q "$JOB/output.log" /bin/bash -c "\"$SH\" -l \"$JOB/cmd.sh\"; echo \$? > \"$JOB/rc\""
+# Inside script(1) the bash is a session + process-group leader on the pty: cmd.pgid lets withdraw_job() kill
+# the whole command (sleep children, a sudo waiting for its password) while this runner keeps the window's TTY.
+# It records its pgid before checking final.lock, so a withdrawal either sees the pgid or this check sees it.
+/usr/bin/script -q "$JOB/output.log" /bin/bash -c "echo \$\$ > \"$JOB/cmd.pgid\"; [ -d \"$JOB/final.lock\" ] && exit 143; \"$SH\" -l \"$JOB/cmd.sh\"; echo \$? > \"$JOB/rc\""
 rc=$(cat "$JOB/rc" 2>/dev/null || echo 1)
-status "{\"status\":\"ran\",\"exit_code\":$rc}"
+final "{\"status\":\"ran\",\"exit_code\":$rc}" || withdrawn_msg
 echo "${D}──────────────────────────────────────────${N}"
 if [ "$rc" = 0 ]; then echo "${G}✓ Done (exit 0). Output sent to Hermes.${N}"; else echo "${R}✗ Exit $rc. Output sent to Hermes.${N}"; fi
 read -r -t 600 -p "Press Enter to close. "
@@ -469,8 +500,24 @@ def confirm_mode() -> str:
         mode, mode if mode in ("off", "remote", "all") else "off")
 
 
+def job_owner(session_id: str | None = None) -> dict:
+    """Who asked: the Kanban card + run (HERMES_KANBAN_TASK, else HERMES_KANBAN_WORKER_TASK; RUN_ID; board db),
+    else the chat session. Read from os.environ before launch_env() strips the worker identity."""
+    task = (os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK") or "").strip()
+    if task:
+        board = (os.environ.get("HERMES_KANBAN_BOARD") or "default").strip() or "default"
+        db = os.environ.get("HERMES_KANBAN_DB") or ""
+        if not db:
+            root = _home().parent.parent if _home().parent.name == "profiles" else _home()
+            db = str(root / "kanban.db") if board == "default" else str(root / "kanban" / "boards" / board / "kanban.db")
+        run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        return {"kind": "kanban", "task": task, "run_id": int(run) if run.isdigit() else None, "board": board,
+                "db": db}
+    return {"kind": "session", "session_id": str(session_id or _session_env("HERMES_SESSION_ID") or "")}
+
+
 def create_job(command: str, reason: str, cwd: str, origin: dict | None = None,
-               confirm: bool | None = None) -> Path:
+               confirm: bool | None = None, owner: dict | None = None) -> Path:
     job = jobs_dir() / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
     job.mkdir(parents=True)
     (job / "cmd.sh").write_text(command.rstrip("\n") + "\n")
@@ -492,6 +539,7 @@ def create_job(command: str, reason: str, cwd: str, origin: dict | None = None,
     (job / "status.json").write_text(json.dumps({"status": "waiting_for_user"}))
     (job / "meta.json").write_text(json.dumps({"command": command, "reason": reason, "cwd": cwd,
                                                 "origin": origin if full else None, "created": time.time()}))
+    (job / "owner.json").write_text(json.dumps(owner or {"kind": "none"}))
     return job
 
 
@@ -503,6 +551,10 @@ def job_origin_gateway(job: Path) -> str:
 
 
 def read_status(job: Path) -> dict:
+    try:  # the final.lock winner's result beats any later status.json write
+        return json.loads((job / "final.lock" / "result.json").read_text())
+    except (OSError, ValueError):
+        pass
     try:
         return json.loads((job / "status.json").read_text())
     except (OSError, ValueError):
@@ -518,7 +570,227 @@ def _interrupted() -> bool:
         return False
 
 
-FINAL = ("ran", "declined", "failed")
+FINAL = ("ran", "declined", "failed", "withdrawn", "abandoned")
+
+
+def _write_status(job: Path, st: dict) -> None:
+    tmp = job / f".status.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(json.dumps(st))
+    os.replace(tmp, job / "status.json")
+
+
+def _take_final(job: Path, st: dict) -> bool:
+    """The final-outcome gate shared with runner.sh's final(): only the mkdir winner records a final status."""
+    try:
+        (job / "final.lock").mkdir()
+    except FileExistsError:
+        return False
+    (job / "final.lock" / "result.json").write_text(json.dumps(st))
+    _write_status(job, st)
+    return True
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _read_pid(path: Path) -> int | None:
+    try:
+        lines = [x for x in path.read_text().split() if x.strip().isdigit()]
+        return int(lines[-1]) if lines else None
+    except OSError:
+        return None
+
+
+def _kill_command(job: Path, secs: float = 3.0) -> None:
+    """Kill the command's process group (script(1)'s session leader and every child, e.g. sleep or a waiting
+    sudo), then tell the runner (SIGUSR1) to show the withdrawal; the runner and its window stay open."""
+    deadline = time.time() + secs
+    killed = False
+    while time.time() < deadline:
+        pg = _read_pid(job / "cmd.pgid")
+        if pg and pg > 1:
+            for sig in (15, 9) if killed else (15,):
+                try:
+                    os.killpg(pg, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            killed = True
+        time.sleep(0.2)
+    for rp in runner_pids(job):
+        try:
+            os.kill(rp, signal.SIGUSR1)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def runner_pids(job: Path) -> list[int]:
+    try:
+        return [int(x) for x in (job / "opened").read_text().split() if x.strip().isdigit()]
+    except OSError:
+        return []
+
+
+WITHDRAW_MSG = "Hermes withdrew this request: {reason}. Nothing else to do here."
+
+
+def withdraw_job(job: Path, reason: str) -> dict:
+    """Withdraw a job that is still waiting or running: marker JOB/withdraw (holds the reason; a runner that
+    starts later refuses), then the final gate, then kill the command group and tell the runner. A job that
+    already ended (ran/declined/failed/abandoned) keeps its outcome."""
+    reason = " ".join(str(reason or "withdrawn by Hermes").split())[:500] or "withdrawn by Hermes"
+    st = read_status(job)
+    if st.get("status") in FINAL:
+        return st
+    if not (job / "withdraw").exists():
+        tmp = job / f".withdraw.{uuid.uuid4().hex[:8]}.tmp"
+        tmp.write_text(reason)
+        os.replace(tmp, job / "withdraw")
+    else:
+        reason = (job / "withdraw").read_text().strip() or reason
+    new = {"status": "withdrawn", "reason": reason, "job_id": job.name}
+    if not _take_final(job, new):
+        return read_status(job)
+    try:  # take the start gate too, so a window that has not started yet refuses
+        (job / "start.lock").mkdir()
+        (job / "start.lock" / "owner").write_text(f"withdraw_job {os.getpid()}\n")
+    except FileExistsError:
+        pass
+    _kill_command(job)
+    return new
+
+
+def _proc_start(pid: int) -> str:
+    try:
+        return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                              timeout=2).stdout.strip()
+    except Exception:
+        return ""
+
+
+def mark_abandoned(job: Path, why: str) -> dict:
+    st = {"status": "abandoned", "reason": why, "job_id": job.name}
+    if _take_final(job, st):
+        _kill_command(job, 1.0)
+        return st
+    return read_status(job)
+
+
+def max_wait_minutes() -> float:
+    v: Any = os.environ.get("HERMES_USER_TERMINAL_MAX_WAIT_MINUTES", "")
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+
+        c = ((load_config() or {}).get("user_terminal") or {}).get("max_wait_minutes")
+        if c is not None and str(c).strip():
+            v = c
+    except Exception:
+        pass
+    try:
+        f = float(v)
+        return f if f > 0 else 120.0
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _board_check(owner: dict, created: float) -> str | None:
+    """Reason the owning card no longer wants this prompt, or None. Read-only (mode=ro, query_only)."""
+    import sqlite3
+
+    task, db = owner.get("task"), owner.get("db")
+    if not task or not db or not Path(db).exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        con.execute("PRAGMA query_only=1")
+        row = con.execute("SELECT status, current_run_id FROM tasks WHERE id=?", (task,)).fetchone()
+        if not row:
+            return None
+        status, cur = row
+        if status in ("done", "completed", "archived"):
+            return f"card {task} is {status}"
+        ev = con.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='unblocked' AND created_at>=? LIMIT 1",
+                         (task, int(created))).fetchone()
+        if ev:
+            return f"card {task} was unblocked after this request"
+        mine = owner.get("run_id")
+        if mine is not None and cur is not None and int(cur) > int(mine):
+            return f"card {task} moved on to a newer run ({cur})"
+        return None
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+def watch_once(job: Path, seen: dict) -> dict | None:
+    """One watchdog pass. Returns the new final status if this pass ended the job."""
+    st = read_status(job)
+    if st.get("status") in FINAL:
+        return st
+    if (job / "withdraw").exists():
+        return withdraw_job(job, (job / "withdraw").read_text())
+    try:
+        meta = json.loads((job / "meta.json").read_text())
+        owner = json.loads((job / "owner.json").read_text())
+    except (OSError, ValueError):
+        meta, owner = {}, {}
+    created = float(meta.get("created") or time.time())
+    if owner.get("kind") == "kanban":
+        why = _board_check(owner, created)
+        if why:
+            return withdraw_job(job, why)
+    limit = max_wait_minutes()
+    if time.time() - created > limit * 60:
+        return withdraw_job(job, f"it waited longer than {limit:g} minutes")
+    # Dead runner: only once a runner announced itself (no launch race); pid identity = pid + start time.
+    # A duplicate window that refused exits normally, so once a runner holds start.lock only that one counts.
+    try:
+        own = (job / "start.lock" / "owner").read_text().split()
+    except OSError:
+        own = []
+    pids = [int(own[1])] if len(own) == 2 and own[0] == "runner" and own[1].isdigit() else (
+        [] if (job / "start.lock").exists() else runner_pids(job))
+    alive_any = False
+    for pid in pids:
+        start = seen.setdefault(pid, _proc_start(pid))
+        if _pid_alive(pid) and (not start or _proc_start(pid) == start):
+            alive_any = True
+    if pids and not alive_any and read_status(job).get("status") in ("waiting_for_user", "running"):
+        return mark_abandoned(job, "the terminal window closed before the command finished")
+    return None
+
+
+def watchdog(job: Path, interval: float = 2.0, max_s: float | None = None) -> dict:
+    seen: dict = {}
+    end = time.time() + (max_s if max_s is not None else max_wait_minutes() * 60 + 120)
+    while time.time() < end:
+        r = watch_once(job, seen)
+        if r and r.get("status") in FINAL:
+            return r
+        time.sleep(min(interval, 15.0))
+    return watch_once(job, seen) or read_status(job)
+
+
+def spawn_watchdog(job: Path) -> None:
+    """Job-local detached watchdog (this file run as a script), polling every 2 s (bounded 15 s)."""
+    import sys
+
+    try:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--watchdog", str(job)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, env=launch_env())
+    except Exception:
+        pass
 
 
 def fail_job(job: Path, error: str, diagnosis: dict | None = None) -> dict:
@@ -535,9 +807,8 @@ def fail_job(job: Path, error: str, diagnosis: dict | None = None) -> dict:
     st: dict[str, Any] = {"status": "failed", "error": error, "job_id": job.name}
     if diagnosis:
         st["diagnosis"] = diagnosis
-    tmp = job / f".status.{uuid.uuid4().hex[:8]}.tmp"
-    tmp.write_text(json.dumps(st))
-    os.replace(tmp, job / "status.json")
+    if not _take_final(job, st):
+        return read_status(job)
     return st
 
 
@@ -575,6 +846,14 @@ def wait_for(job: Path, wait_s: float) -> dict:
         result["note"] = ("No terminal window started this command, so nothing ran (Hermes holds the job's start "
                           "gate; a window that opens late refuses it). Report the error; do not hand the command "
                           "to the user to paste.")
+    elif st.get("status") == "withdrawn":
+        result["ok"] = True
+        result["note"] = WITHDRAW_MSG.format(reason=st.get("reason") or "withdrawn") + (
+            " The window was told; do not re-ask unless the work still needs it.")
+    elif st.get("status") == "abandoned":
+        result["ok"] = False
+        result["note"] = ("The terminal window went away before the command finished (abandoned). Nothing more "
+                          "will happen for this job_id; start a new request if it is still needed.")
     elif st.get("status") not in ("ran", "declined"):
         result["status"] = "pending" if st.get("status") != "running" else "running"
         result["note"] = ("Still waiting (user hasn't answered, or the command is still running). Call "
@@ -590,8 +869,15 @@ def wait_for(job: Path, wait_s: float) -> dict:
     return result
 
 
-def handle(args: dict, **_kw: Any) -> str:
+def handle(args: dict, session_id: str | None = None, **_kw: Any) -> str:
     try:
+        if str(args.get("action") or "").strip().lower() == "withdraw":
+            job_id = str(args.get("job_id") or "").strip()
+            job = jobs_dir() / Path(job_id).name
+            if not job_id or not job.is_dir():
+                return _err(f"unknown job_id {job_id}")
+            st = withdraw_job(job, str(args.get("reason") or "withdrawn by Hermes"))
+            return json.dumps({"ok": True, "job_id": job.name, **st})
         wait_s = float(args.get("wait_s") or DEFAULT_WAIT)
         wait_s = max(1.0, min(wait_s, MAX_WAIT))
         job_id = str(args.get("job_id") or "").strip()
@@ -606,7 +892,8 @@ def handle(args: dict, **_kw: Any) -> str:
         cwd = os.path.expanduser(str(args.get("cwd") or "").strip() or "~")
         if not os.path.isdir(cwd):
             return _err(f"cwd does not exist: {cwd}")
-        job = create_job(command, str(args.get("reason") or ""), cwd)
+        job = create_job(command, str(args.get("reason") or ""), cwd, owner=job_owner(session_id))
+        spawn_watchdog(job)
         where, failed = _open_or_fail(job, "could not open a terminal window")
         if failed:
             return json.dumps(failed)
@@ -677,7 +964,8 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
     cwd = os.path.expanduser(str(cwd or "").strip() or "~")
     if not os.path.isdir(cwd):
         return {"ok": False, "error": f"cwd does not exist on the Mac: {cwd}"}
-    job = create_job(command, str(reason or ""), cwd, origin)
+    job = create_job(command, str(reason or ""), cwd, origin, owner={"kind": "relayed"})
+    spawn_watchdog(job)  # max age + dead runner; the remote card's board is not readable here
     where, failed = _open_or_fail(job, "could not open a terminal window on the Mac")
     if failed:
         return failed
@@ -890,6 +1178,9 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
         refusal = owner_refusal(session_id)
         if refusal:
             return _err(refusal)
+        if str(args.get("action") or "").strip().lower() == "withdraw":  # not relayed (yet): never a silent resume
+            return _err("withdraw is not available for a job relayed to the owner's Mac; the Mac's watchdog "
+                        "withdraws it after user_terminal.max_wait_minutes or when its window closes")
         wait_s = max(1.0, min(float(args.get("wait_s") or DEFAULT_WAIT), MAX_WAIT))
         job_id = str(args.get("job_id") or "").strip()
         command = str(args.get("command") or "").strip()
@@ -948,3 +1239,12 @@ def register(ctx) -> None:
     ctx.register_tool(name="run_in_user_terminal", toolset=TOOLSET, schema=SCHEMA, handler=handle, emoji="🖥️",
                       description="Open a terminal on the user's screen, confirm there, run, return output")
     ctx.register_hook("transform_terminal_output", transform_terminal_output)
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    if len(_sys.argv) >= 3 and _sys.argv[1] == "--watchdog":  # --watchdog JOB [max_s] [interval]
+        _a = _sys.argv[2:]
+        watchdog(Path(_a[0]), interval=float(_a[2]) if len(_a) > 2 else 2.0,
+                 max_s=float(_a[1]) if len(_a) > 1 else None)
