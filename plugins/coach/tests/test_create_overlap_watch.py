@@ -64,3 +64,17 @@ def test_week_key_is_stable_within_an_iso_week():
     monday = time.mktime((2026, 10, 26, 12, 0, 0, 0, 0, 0))
     assert cw.card_key("h", monday) == cw.card_key("h", monday + 5 * 86400)
     assert cw.card_key("h", monday) != cw.card_key("h", monday + 7 * 86400)
+
+
+def test_cleanup_archives_are_not_duplicates(tmp_path):
+    _board(tmp_path / "kanban.db", [("d1", "archived", "override", 1), ("s1", "archived", "override", 1),
+                                    ("p1", "archived", "override", 1), ("w1", "archived", "override", 1)])
+    db = sqlite3.connect(tmp_path / "kanban.db")
+    db.execute("UPDATE tasks SET title='Scratch: placement live proof (park only)' WHERE id='s1'")
+    db.execute("UPDATE tasks SET title='[askrelay-live] Wire scratch integration' WHERE id='p1'")
+    for tid, src in (("d1", "ready"), ("s1", "ready"), ("p1", "blocked"), ("w1", "done")):
+        db.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                   (tid, "archived", json.dumps({"source_status": src}), int(NOW)))
+    db.commit()
+    db.close()
+    assert [f["id"] for f in cw.scan(str(tmp_path), now=NOW)] == ["d1"]  # only the ready-card archive is a duplicate

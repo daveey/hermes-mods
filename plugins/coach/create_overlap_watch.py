@@ -17,6 +17,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -27,6 +28,15 @@ from typing import Callable, Optional
 
 THRESHOLD = 2
 EVENT = "create_overlap"
+
+
+# Cards made to be thrown away: live-proof / scratch / synthetic probes archive themselves as cleanup, not as duplicates.
+SCRATCH_TITLE = re.compile(r"\bscratch\b|\blive[- ](?:proof|check)\b|\bsynthetic\b|\bwaiter\b|^\[[\w-]*-live\]", re.I)
+
+
+def is_cleanup_archive(title: str, source_status: Optional[str]) -> bool:
+    """True when the archive is routine cleanup rather than a coordinator closing a duplicate."""
+    return source_status == "done" or bool(SCRATCH_TITLE.search(title or ""))
 
 
 def hermes_home(home: Optional[str] = None) -> Path:
@@ -70,16 +80,24 @@ def scan(home: Optional[str] = None, days: float = 7, now: Optional[float] = Non
                 "JOIN tasks t ON t.id = e.task_id WHERE e.kind = ? AND e.created_at >= ?", (EVENT, since)).fetchall()
         except sqlite3.Error:
             rows = []
-        finally:
-            con.close()
+        con2 = con
         for tid, raw, at, title, status in rows:
             try:
                 p = json.loads(raw or "{}")
             except ValueError:
                 continue
             if p.get("outcome") == "override" and status == "archived":
+                try:
+                    arch = con2.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='archived' "
+                                        "ORDER BY created_at DESC LIMIT 1", (tid,)).fetchone()
+                    src = json.loads(arch[0] or "{}").get("source_status") if arch else None
+                except (sqlite3.Error, ValueError):
+                    src = None
+                if is_cleanup_archive(title, src):
+                    continue
                 found.append({"board": board, "id": tid, "title": title, "at": at, "reason": p.get("reason"),
                               "overrode": [m.get("id") for m in p.get("matches") or []]})
+        con.close()
     return sorted(found, key=lambda f: f["at"])
 
 
