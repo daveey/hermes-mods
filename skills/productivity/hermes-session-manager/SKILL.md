@@ -60,12 +60,14 @@ say what's running, never what needs the user.
 
 - Stalled card: read its log (`hermes kanban log <id>`), then `kanban_comment` with the next step,
   `reclaim` a dead claim, or unblock it if the blocker is gone. Fix it yourself when it is small.
-- Stalled session: resume it with a short nudge naming the next step, or file a card for the fix.
-- Problems you find get fixed, a card, or a blocked card with the exact ask. Never end a sweep on a
-  diagnosis alone.
-- Any decision only the user can make becomes a **blocked card** (`kanban_create`,
-  `initial_status="blocked"`) with the evidence, the exact ask, and what yes/no mean. A question
-  that only lives in chat text does not show as waiting.
+- For a completion sweep ("get all sessions green"), treat dispatch as intermediate, not completion.
+  For each non-green session, inspect the remaining deliverable and why it stopped; resolve asks
+  within existing authority, then resume concrete work or take it over rather than only nudging.
+- Finish in the originating session: a conclusion stating what was done, what was verified and
+  why the work is finished, plus its done outcome. For obsolete work, state why it is no longer
+  relevant instead of claiming implementation success. Archiving is not a substitute for this conclusion.
+- Keep genuine unfinished work open. Only irreducible human actions become blocked cards with
+  `human_request`; delegated judgment does not supply credentials, physical evidence or extra spend.
 
 ## Archive rule (needs the user's standing approval; record it in memory)
 
