@@ -187,6 +187,17 @@ session" without checking it; the judge scored that reply 0.60 and 0.75 against 
 `tests/fixtures/report_only_unverified_owner.json`; `eval/report_only_eval.py --no-judge` scores the check alone
 (762-row labeled set: 1 fire, a gold positive, 0 held-out fires; 30 days of hub replies: 1 fire, the incident). The
 explicit scope-limit guard and `COACH_REPLY_RULES` without `report_only` turn it off.
+
+**Closed cards (agent-a806f203ab).** A Kanban worker called `kanban_complete`, then an operator note reopened the work
+in the same turn; it pushed a fix and ended with CI unwatched, a proof never run and a done card named as "owner".
+Three changes: (1) when this turn's tool log shows a `kanban_complete` that did not error (tool, deferred `tool_call`
+or `hermes kanban complete`), report_only nudges carry the closed-card text (`REPORT_ONLY_CARD_CLOSED`: nothing wakes a
+closed card, finish now with a foreground `wait_for_ci.py --timeout` and the proof, or `kanban_create` a follow-up and
+name it); the `reply_nudge` event logs `variant=card_closed`. (2) "owned by / belongs to / lives on card t_…" and
+"owned by card/task/session" count as owner handoffs for `unverified_owner`. (3) `closed_owner`: a card named as
+owner ("owned by card t_…", "card t_… owns it", "tracked on card t_…") that is `done`/`archived` on this host's boards
+(read-only lookup) fires report_only with `reason=closed_owner`, even after a `kanban_show`. Cards on another
+gateway's board are unknown and never fire.
 Six explicit scope-limit fixtures (`tests/fixtures/report_only_scope_limits.json`) never fire; the deterministic
 `scope_limited()` guard drops them and the judge alone scores them <= 0.1.
 Scheduled-wait exemption (deterministic, no AI call): a pure status question ("is this session done? it was green but

@@ -556,7 +556,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     if rest:
                         r = max(rest, key=lambda x: v[x])
                         hit = {"rule": r, "p": v[r], "evidence": v["evidence"],
-                               "nudge": rc.nudge_for(r, v["evidence"], kanban_down=kanban_down)}
+                               "nudge": rc.nudge_for(r, v["evidence"], kanban_down=kanban_down,
+                                                     card_closed=rc.card_closed(log_lines))}
             if not hit:
                 guard = rc.report_only_guard(ask, final_response)
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
@@ -565,7 +566,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             tracked = hit["rule"] in rc.RULES
             out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
                           "p": hit["p"], "evidence": hit["evidence"],
-                          **({"reason": hit["reason"]} if hit.get("reason") else {}), **draft_ref(),
+                          **({"reason": hit["reason"]} if hit.get("reason") else {}),
+                          **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref(),
                           **({"outcome": True} if tracked else {})}
             if tracked:  # judged again on attempt 1 (any rule): self-heal files the outcome, not the nudge
                 coach.loop_state(session_id)["outcome_nudge"] = {

@@ -655,3 +655,91 @@ def test_denied_ask_skips_a_reply_that_already_tells_the_ask():
         assert rc.check(reply, "status?", [], _zero_judge, human_asks=asks) is None, reply
     hit = rc.check("The PR merges on its own; nothing needs you.", "status?", [], _zero_judge, human_asks=asks)
     assert hit and hit["rule"] == "denied_ask"
+
+
+# ---- agent-a806f203ab: a worker that closed its own card earlier in the turn, then named a done card as owner ----
+CLOSED_REPLY = (  # shape of the 2026-10-30 revised reply (msg 444875), product details removed
+    "I fixed both gaps by pushing commit 849d3ff2 to PR #248. Exact-head CI on 849d3ff2 hasn't finished. The earlier "
+    "green run was on a715eac4, and I'm not watching the new run.\n\nI did not run the deletion check for the new "
+    "assertion, so I haven't shown it fails when a label loses its timestamp.\n\nI left a comment on #248 with the "
+    "commit and the CI state. My original card is already completed. The follow-up lives on PR #248, owned by card "
+    "t_01a18de0c2168ff2.")
+CLOSED_LOG = ['-> kanban_complete({"task_id": "t_01a18e0f85fa5317", "summary": "duplicate of #248"})',
+              "-> terminal(git push origin HEAD:fix)", "-> terminal(gh pr comment 248 --body ...)"]
+
+
+def test_card_closed_reads_a_successful_kanban_complete_only():
+    assert rc.card_closed(CLOSED_LOG)
+    assert rc.card_closed(['-> tool_call({"calls": [{"name": "kanban_complete", "arguments": {}}]})'])
+    assert rc.card_closed(["-> terminal(hermes kanban complete t_1 --summary done)"])
+    assert not rc.card_closed(['-> kanban_complete({"task_id": "t_1"})', '   <- ERROR {"error": "refused"}'])
+    assert not rc.card_closed(["-> kanban_show(t_1)", "-> terminal(grep -n kanban_complete x.py)"])
+
+
+def test_report_only_after_own_card_closed_gets_card_closed_nudge():
+    llm, _ = _judge({"report_only": 0.95, "evidence": "not watching the new run; deletion check not run"})
+    hit = rc.check(CLOSED_REPLY, "work kanban task", CLOSED_LOG, llm, threshold=0.7,
+                   thresholds=rc.settings()["thresholds"], card_status=lambda cid: None)
+    assert hit and hit["rule"] == "report_only"
+    assert "Your card is closed" in hit["nudge"] and "nothing wakes you" in hit["nudge"]
+    assert "wait_for_ci.py" in hit["nudge"] and "A done card owns nothing" in hit["nudge"]
+    open_card = rc.check(CLOSED_REPLY, "work kanban task", CLOSED_LOG[1:], llm, threshold=0.7,
+                         thresholds=rc.settings()["thresholds"], card_status=lambda cid: None)
+    assert open_card and "Your card is closed" not in open_card["nudge"]
+
+
+def test_owner_phrase_owned_by_card_is_a_handoff():
+    assert rc.unverified_owner(CLOSED_REPLY, CLOSED_LOG) == "owned by card t_01a18de0c2168ff2"
+    assert rc.unverified_owner("That follow-up belongs to task t_abc123 now.", []) is not None
+    assert rc.unverified_owner("The fix lives with card t_abc123.", []) is not None
+    assert rc.unverified_owner("The fix lives on main; card t_abc123 shipped it.", []) is None
+
+
+def test_closed_owner_fires_on_a_done_owner_even_after_kanban_show():
+    log = CLOSED_LOG + ["-> kanban_show(t_01a18de0c2168ff2)"]
+    status = {"t_01a18de0c2168ff2": "done"}.get
+    assert rc.closed_owner(CLOSED_REPLY, card_status=status) == ("t_01a18de0c2168ff2", "done")
+    llm, calls = _judge({"report_only": 0.0, "evidence": ""})
+    hit = rc.check(CLOSED_REPLY, "work kanban task", log, llm, threshold=0.7, card_status=status)
+    assert hit and hit["rule"] == "report_only" and hit.get("reason") == "closed_owner"
+    assert "t_01a18de0c2168ff2" in hit["nudge"] and "done" in hit["nudge"]
+    assert "Your card is closed" in hit["nudge"] and not calls  # deterministic: no judge call
+
+
+def test_closed_owner_quiet_for_a_running_owner_that_was_checked():
+    log = CLOSED_LOG[1:] + ["-> kanban_show(t_01a18de0c2168ff2)"]
+    status = {"t_01a18de0c2168ff2": "running"}.get
+    assert rc.closed_owner(CLOSED_REPLY, card_status=status) is None
+    llm, _ = _judge({"report_only": 0.0, "evidence": ""})
+    assert rc.check(CLOSED_REPLY, "work kanban task", log, llm, threshold=0.7, card_status=status) is None
+    assert rc.closed_owner(CLOSED_REPLY, card_status=lambda cid: None) is None  # unknown card: fail-open
+
+
+def test_closed_owner_reads_the_board_read_only(tmp_path, monkeypatch):
+    import sqlite3
+    db = tmp_path / "kanban.db"
+    c = sqlite3.connect(db)
+    c.execute("create table tasks (id text primary key, status text)")
+    c.executemany("insert into tasks values (?, ?)", [("t_aa11", "done"), ("t_bb22", "running")])
+    c.commit()
+    c.close()
+    monkeypatch.setattr(rc, "_board_dbs", lambda: [db])
+    assert rc.board_card_status("t_aa11") == "done"
+    assert rc.board_card_status("t_bb22") == "running"
+    assert rc.board_card_status("t_cc33") is None
+    assert rc.closed_owner("The rest is owned by card t_aa11.") == ("t_aa11", "done")
+    assert rc.closed_owner("CI is owned by card `t_aa11` / PR 172.") == ("t_aa11", "done")
+    assert rc.closed_owner("Fix card `t_aa11` owns it.") == ("t_aa11", "done")
+    assert rc.closed_owner("Fix card `t_bb22` owns it.") is None
+    assert rc.closed_owner('He wrote "owned by card t_aa11" in the log.') is None  # quoted, not a claim
+
+
+def test_judged_report_only_after_own_card_closed_uses_the_closed_card_template():
+    reply = CLOSED_REPLY.split("\n\nI left")[0]  # no owner phrase: the judge path picks the nudge
+    llm, _ = _judge({"report_only": 0.95, "evidence": "not watching the new run"})
+    hit = rc.check(reply, "work kanban task", CLOSED_LOG, llm, threshold=0.7, card_status=lambda cid: None)
+    assert hit["rule"] == "report_only" and hit.get("variant") == "card_closed"
+    assert hit["nudge"] == rc.REPORT_ONLY_CARD_CLOSED.format(evidence="not watching the new run")
+    plain = rc.check(reply, "work kanban task", CLOSED_LOG[1:], llm, threshold=0.7, card_status=lambda cid: None)
+    assert "variant" not in plain and plain["nudge"] == rc.NUDGES["report_only"].format(evidence="not watching the new run")
+    assert rc.nudge_for("report_only", "e", kanban_down=True, card_closed=True) == rc.REPORT_ONLY_KANBAN_DOWN.format(evidence="e")

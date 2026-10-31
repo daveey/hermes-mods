@@ -114,8 +114,18 @@ OWNER_HANDOFF_RE = re.compile(
     r"|\b(?:another|the other|a different) (?:session|agent|worker) (?:is|are) (?:still )?"
     r"(?:landing|handling|fixing|working on|changing|editing)\b"
     r"|\bthe (?:existing )?owner (?:has|owns|is (?:on|handling)) (?:it|this|that|them)\b"
-    r"|\b(?:that'?s|it'?s|this is) (?:for )?" + _WHO + r"(?:'s)? (?:to fix|problem|job|change)\b",
+    r"|\b(?:that'?s|it'?s|this is) (?:for )?" + _WHO + r"(?:'s)? (?:to fix|problem|job|change)\b"
+    # agent-a806f203ab: "the follow-up lives on PR #248, owned by card t_…" named a card as owner without a check.
+    r"|\b(?:owned by|lives (?:on|with)|belongs to) (?:the )?(?:card|task) t_[0-9a-f]+\b"
+    r"|\bowned by (?:that |another |the other |its )?(?:card|task|session)\b",
     re.I)
+# The card ids a reply names as the owner of the remaining work ("owned by card t_…", "belongs to task t_…").
+OWNER_CARD_RE = re.compile(
+    r"\b(?:owned by|lives (?:on|with)|belongs to|handled by|tracked (?:by|on|in)|owner is|owner:)\s+(?:the\s+)?"
+    r"(?:card|task)\s+`?(t_[0-9a-f]+)\b`?"
+    r"|\b(?:card|task)\s+`?(t_[0-9a-f]+)`?\s+(?:owns|is handling|is landing|will (?:land|handle|fix))\b",
+    re.I)
+CLOSED_CARD_STATUSES = ("done", "archived")
 # Tool-log evidence that the agent checked or messaged an owner this turn: the tool itself (`-> kanban_show(`), the
 # deferred `tool_call` wrapper (`"name": "cross_task"`), or the CLI form in a terminal call (`hermes kanban show`).
 _OWNER_TOOLS = (r"(?:cross_session|cross_task|session_mentions|kanban_(?:show|comment|create|list|link|block|unblock)|"
@@ -146,6 +156,77 @@ def unverified_owner(reply: str, tool_log: Optional[list] = None) -> Optional[st
     if any(OWNER_CHECK_RE.search(l or "") for l in (tool_log or [])):
         return None
     return m.group(0).strip()
+
+
+# agent-a806f203ab: a Kanban worker called kanban_complete, then an operator note reopened the work in the same turn.
+# It pushed a fix and ended with CI unwatched and a proof never run, because nothing wakes a closed card and the
+# report_only nudge only offered "fix it now or kanban_create". card_closed() picks the closed-card nudge.
+_COMPLETE_RE = re.compile(r"^\s*->\s*kanban_complete\(|[\"']name[\"']\s*:\s*[\"']kanban_complete[\"']"
+                          r"|^\s*->\s*terminal\(.*\bhermes kanban\b.*\bcomplete\b", re.I)
+
+
+def card_closed(tool_log: Optional[list] = None) -> bool:
+    """True when this turn's tool log shows a kanban_complete (tool, deferred tool_call or CLI) that did not error."""
+    lines = list(tool_log or [])
+    for i, line in enumerate(lines):
+        if _COMPLETE_RE.search(line or ""):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not (nxt or "").lstrip().startswith("<- ERROR"):
+                return True
+    return False
+
+
+def _board_dbs() -> list:
+    """Every Kanban board db on this host (default + kanban/boards/*), via core when importable."""
+    from pathlib import Path
+    try:
+        from hermes_cli import kanban_session_activity as ksa  # type: ignore
+        return list(ksa._board_db_paths())
+    except Exception:
+        pass
+    env = os.environ.get("HERMES_KANBAN_DB")
+    root = Path(os.environ.get("HERMES_KANBAN_HOME") or _hermes_home())
+    paths = [Path(env)] if env else [root / "kanban.db"]
+    paths += sorted((root / "kanban" / "boards").glob("*/kanban.db"))
+    return [p for p in paths if p.is_file()]
+
+
+def board_card_status(card_id: str) -> Optional[str]:
+    """The card's status on any board on this host, read-only; None when no board has it or a read fails."""
+    for path in _board_dbs():
+        try:
+            conn = _ro_connect(path, timeout=2)
+            try:
+                row = conn.execute("select status from tasks where id=?", (card_id,)).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        if row:
+            return str(row[0])
+    return None
+
+
+def closed_owner(reply: str, card_status: Optional[Callable[[str], Optional[str]]] = None
+                 ) -> Optional[tuple[str, str]]:
+    """(card id, status) when the reply's ending names a card as owner of the remaining work and that card is done or
+    archived (a closed card owns nothing). Fires even when the turn looked the card up. Unknown cards (another
+    gateway's board, a typo) and read errors are fail-open: None."""
+    tail = (reply or "")[-1500:]
+    lookup = card_status or board_card_status
+    seen: set = set()
+    for m in OWNER_CARD_RE.finditer(tail):
+        cid = m.group(1) or m.group(2)
+        if not cid or cid in seen or _quoted(tail, m.start(), m.end()):
+            continue
+        seen.add(cid)
+        try:
+            st = lookup(cid)
+        except Exception:
+            st = None
+        if st and st.lower() in CLOSED_CARD_STATUSES:
+            return cid, st.lower()
+    return None
 
 
 # status_only: the user asks why it's waiting / what's going on / to finish it, and the turn only reopened, unblocked,
@@ -1082,9 +1163,31 @@ def kanban_db_down(tool_log: list[str]) -> bool:
     return any(KANBAN_DB_DOWN.search(line or "") for line in tool_log or [])
 
 
-def nudge_for(rule: str, evidence: str, kanban_down: bool = False) -> str:
-    tmpl = REPORT_ONLY_KANBAN_DOWN if rule == "report_only" and kanban_down else NUDGES[rule]
+def nudge_for(rule: str, evidence: str, kanban_down: bool = False, card_closed: bool = False) -> str:
+    if rule == "report_only" and kanban_down:
+        tmpl = REPORT_ONLY_KANBAN_DOWN
+    elif rule == "report_only" and card_closed:
+        tmpl = REPORT_ONLY_CARD_CLOSED
+    else:
+        tmpl = NUDGES[rule]
     return tmpl.format(evidence=evidence or "see your last message")
+
+
+# agent-a806f203ab: the worker's own card was already closed when the work reopened in the same turn.
+REPORT_ONLY_CARD_CLOSED = (
+    "[coach] Your message ends on a problem you could fix ({evidence}) without fixing it, starting a fix or proposing "
+    "one. Your card is closed (kanban_complete ran this turn), so nothing wakes you: kanban_continue, kanban_schedule "
+    "and a re-run don't apply to a closed card. Finish now, in this turn: wait on CI in the foreground "
+    "(`wait_for_ci.py --timeout`), run the proof you skipped, then report the result. Or kanban_create a follow-up "
+    "card with acceptance criteria and name it. A done card owns nothing: don't name one as the owner.")
+CARD_CLOSED_TAIL = (" Your card is closed (kanban_complete ran this turn), so nothing wakes you. Finish now, in this turn "
+                    "(wait on CI in the foreground with `wait_for_ci.py --timeout`, run the proof), or kanban_create "
+                    "a follow-up card and name it. A done card owns nothing.")
+CLOSED_OWNER_NUDGE = (
+    "[coach] Your message names card {card} as the owner of the remaining work (\"{evidence}\"), but that card is "
+    "{status}: a {status} card owns nothing and no worker will pick this up. Finish the work yourself now (wait on CI "
+    "in the foreground, run the proof), or kanban_create a follow-up card with acceptance criteria, linked to this "
+    "chat, and name that card instead.")
 
 
 OWNER_KANBAN_DOWN = (" This session's Kanban tools can't read the board, so look cards up with `hermes kanban show "
@@ -1201,8 +1304,11 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = 0.5,
           kanban_down: Optional[bool] = None,
           human_asks: Optional[Callable[[], list]] = None,
-          audit: Optional[Callable[[dict], None]] = None) -> Optional[dict]:
+          audit: Optional[Callable[[dict], None]] = None,
+          card_status: Optional[Callable[[str], Optional[str]]] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `card_status(card_id) -> status | None` looks up cards the reply names as owner (default: this host's boards,
+    read-only); a done/archived one is the deterministic `closed_owner` report_only hit.
     `human_asks()` lists asks waiting on the user from cards linked to the chat ([{id, title, action}]); it is called
     only when the reply says nothing needs the user, and a hit is the deterministic `denied_ask` rule.
     `thresholds` ({rule: th}) overrides `threshold` per rule; with it, the top rule among those over their own
@@ -1245,12 +1351,23 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                     "verdict": {"laptop_job": 1.0, "evidence": phrase},
                     "nudge": LAPTOP_JOB_NUDGE.format(evidence=phrase[:160])}
     if (not only or "report_only" in only) and not scoped:
+        closed = card_closed(tool_log)
+        tail = CARD_CLOSED_TAIL if closed else ""
+        owner = closed_owner(reply, card_status)
+        if owner:  # deterministic: a done/archived card named as owner, checked or not (agent-a806f203ab)
+            cid, st = owner
+            ev = f"owned by card {cid} ({st})"
+            return {"rule": "report_only", "p": 1.0, "evidence": ev, "reason": "closed_owner",
+                    **({"variant": "card_closed"} if closed else {}),
+                    "verdict": {"report_only": 1.0, "report_only_src": "closed_owner", "evidence": ev},
+                    "nudge": CLOSED_OWNER_NUDGE.format(card=cid, status=st, evidence=ev) + tail}
         phrase = unverified_owner(reply, tool_log)
         if phrase:  # deterministic: no judge call, no AI score at the edge of its bar
             down = kanban_db_down(tool_log) if kanban_down is None else kanban_down
             return {"rule": "report_only", "p": 1.0, "evidence": phrase, "reason": "unverified_owner",
+                    **({"variant": "card_closed"} if closed else {}),
                     "verdict": {"report_only": 1.0, "report_only_src": "unverified_owner", "evidence": phrase},
-                    "nudge": OWNER_NUDGE.format(evidence=phrase[:200]) + (OWNER_KANBAN_DOWN if down else "")}
+                    "nudge": OWNER_NUDGE.format(evidence=phrase[:200]) + (OWNER_KANBAN_DOWN if down else "") + tail}
     if (not only or "status_only" in only) and not scoped:
         ev = status_only(user_ask, reply, tool_log)
         if ev:  # deterministic: the judge path's owner-check exemption counts card bookkeeping as acting
@@ -1327,8 +1444,10 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         if v[best] < threshold:
             return None
     down = kanban_db_down(tool_log) if kanban_down is None else kanban_down
+    closed = best == "report_only" and card_closed(tool_log)
     return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v,
-            "nudge": nudge_for(best, v["evidence"], kanban_down=down)}
+            **({"variant": "card_closed"} if closed and not down else {}),
+            "nudge": nudge_for(best, v["evidence"], kanban_down=down, card_closed=closed)}
 
 
 # ───────────────────────────── block-time handoff check (agent-19492bff76) ─────────────────────────────
