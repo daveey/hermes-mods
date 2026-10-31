@@ -908,14 +908,15 @@ def test_handoff_outcome_of_another_session_does_not_resolve_it(tmp_path):
 MR_MSG = "Class selectors require provider auto; use a concrete model to pin a provider"
 
 
-def _worker_block(pid, exc="agent.model_routing.ModelRoutingError", msg=MR_MSG):
+def _worker_block(pid, exc="agent.model_routing.ModelRoutingError", msg=MR_MSG, stamp=None, core="8ccfb38284"):
     lines = ["managed worker failed", "Traceback (most recent call last):",
              '  File "/home/you/.hermes/hermes-agent/agent/managed_worker.py", line 464, in main',
              "    execute(frame, channel)",
              '  File "/home/you/.hermes/hermes-agent/agent/model_routing.py", line 125, in resolve_model_route',
              f'    raise {exc.split(".")[-1]}("{msg}")',
              f"{exc}: {msg}"]
-    return "".join(f"[pid {pid}] {l}\n" for l in lines)
+    head = f"[pid {pid}] @ {stamp} core={core}\n" if stamp else ""
+    return head + "".join(f"[pid {pid}] {l}\n" for l in lines)
 
 
 def _worker_home(tmp_path):
@@ -1058,6 +1059,59 @@ def test_worker_storm_scrubs_secrets_from_details(tmp_path):
     _append_worker(h, *[_worker_block(p, "RuntimeError", "bad key sk-ant-abc123DEF456ghi789") for p in (1, 2, 3)])
     st = _storms(sg.collect(h, cur, "hubhost", NOW))
     assert len(st) == 1 and "sk-ant-abc123" not in st[0]["details"] + st[0]["symptom"]
+
+
+def _iso_epoch(stamp):
+    from datetime import datetime
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+
+def test_worker_storm_from_headered_blocks_reports_crash_times_and_core_sha(tmp_path):
+    """core's `[pid N] @ <UTC> core=<sha>` header dates each crash: the storm names the earliest/latest crash and
+    the sha(s), `at` is the latest crash (not the pass time), and the header is not part of the traceback."""
+    h, cur = _primed_worker_home(tmp_path)
+    stamps = ("2026-10-30T07:39:02Z", "2026-10-30T07:41:30Z", "2026-10-30T08:01:15Z")
+    _append_worker(h, _worker_block(101, stamp=stamps[0], core="76dedd30c8"),
+                   _worker_block(102, stamp=stamps[1], core="7c00ede0c4"),
+                   _worker_block(103, stamp=stamps[2], core="7c00ede0c4"))
+    st = _storms(sg.collect(h, cur, "hubhost", NOW))
+    assert len(st) == 1, st
+    s = st[0]
+    assert ("Crash times (UTC, log headers): earliest 2026-10-30T07:39:02Z, latest 2026-10-30T08:01:15Z; "
+            "core: 76dedd30c8, 7c00ede0c4") in s["details"]
+    assert s["at"] == _iso_epoch(stamps[2]) != NOW
+    assert "@ 2026" not in s["details"].split("Latest (pid")[1]
+    assert "log lines carry no timestamps" not in s["details"]
+    # same fingerprint as a headerless storm of the same crash
+    assert s["fp"] == sg.fp("kanban", "worker-storm", "agent.model_routing.ModelRoutingError", sg._norm_msg(MR_MSG))
+
+
+def test_worker_storm_with_some_headerless_pids_keeps_the_pass_time(tmp_path):
+    """a storm mixing old-core (no header) and new-core blocks reports the stamped times but keeps `at` = pass."""
+    h, cur = _primed_worker_home(tmp_path)
+    _append_worker(h, _worker_block(101), _worker_block(102, stamp="2026-10-30T07:41:30Z"), _worker_block(103))
+    s = _storms(sg.collect(h, cur, "hubhost", NOW))[0]
+    assert s["at"] == NOW
+    assert "(1 of 3 pids stamped): earliest 2026-10-30T07:41:30Z" in s["details"]
+
+
+def test_worker_storm_header_times_span_passes(tmp_path):
+    """crash times survive in the cursor between passes, so a storm completed in a later pass still dates all 3."""
+    h, cur = _primed_worker_home(tmp_path)
+    _append_worker(h, _worker_block(101, stamp="2026-10-30T07:00:00Z"), _worker_block(102, stamp="2026-10-30T07:05:00Z"))
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
+    _append_worker(h, _worker_block(103, stamp="2026-10-30T07:09:00Z"))
+    s = _storms(sg.collect(h, cur, "hubhost", NOW + 60))[0]
+    assert "earliest 2026-10-30T07:00:00Z, latest 2026-10-30T07:09:00Z; core: 8ccfb38284" in s["details"]
+    assert s["at"] == _iso_epoch("2026-10-30T07:09:00Z")
+
+
+def test_headerless_worker_storm_has_no_crash_time_line(tmp_path):
+    h, cur = _primed_worker_home(tmp_path)
+    _append_worker(h, *[_worker_block(p) for p in (101, 102, 103)])
+    s = _storms(sg.collect(h, cur, "hubhost", NOW))[0]
+    assert s["at"] == NOW and "Crash times" not in s["details"]
+    assert "log lines carry no timestamps" in s["details"]
 
 
 def _hold_board(db, events):

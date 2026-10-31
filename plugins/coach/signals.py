@@ -7,9 +7,11 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               rotates) only as a storm: 3+ in 10 min per host, fingerprinted by status + reason class
               (revoked/expired/invalid/other); the e0a5909348 credential-guard warnings (no traceback) always;
 - hook        plugin hook exceptions (`Hook '<name>' callback <cb> raised: ...` from hermes_cli/plugins_dispatch);
-- worker      managed kanban worker crashes in <home>/logs/managed-worker.log (`[pid N] ` lines, no timestamps) only
+- worker      managed kanban worker crashes in <home>/logs/managed-worker.log (`[pid N] ` lines; newer core also
+              writes one `[pid N] @ <UTC> core=<sha>` header per worker) only
               as a storm: 3+ distinct pids dying with the same exception + normalized message within 30 min per
-              host (state in the cursor, `at` = pass time), filed once per fingerprint per 30 min;
+              host (state in the cursor; `at` = latest logged crash time when every pid has a header, else the
+              pass time), filed once per fingerprint per 30 min;
 - cron        a cron job whose sticky `last_failure.at` is newer than the cursor (cron/jobs.json), filed only while
               failure_streak >= cron.failure_nudge_threshold (default 3) or after that many recovered failures in
               24 h (cursor `cron_fails`); a one-off failure the next run recovered from is only counted;
@@ -51,6 +53,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -456,6 +459,9 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
 # nothing was filed), so that files one signal per (exception, normalized message) per window.
 WORKER_STORM_N, WORKER_STORM_S = 3, 1800
 PID_LINE_RE = re.compile(r"^\[pid (\d+)\] ?(.*)$")
+# Core since the managed-worker.log header commit writes, before a worker's first line, one
+# "[pid N] @ <ISO8601 UTC> core=<short sha>" header. Older logs have none; their crashes keep the pass time.
+PID_HEADER_RE = re.compile(r"^\[pid (\d+)\] @ (\d{4}-\d\d-\d\dT[\d:.]+(?:Z|[+-]\d\d:?\d\d)) core=(\S+)$")
 WORKER_EXC_RE = re.compile(r"^([A-Za-z_][\w.]*): (.*)$")
 SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}")
 
@@ -473,11 +479,30 @@ def _norm_msg(msg: str) -> str:
     return re.sub(r"\d+", "N", s).strip()
 
 
+def _header_time(stamp: str) -> Optional[float]:
+    try:
+        t = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t.timestamp() if t.tzinfo is not None else None
+
+
+def _utc(t: float) -> str:
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def parse_worker_crashes(lines: List[str]) -> List[dict]:
     """managed-worker.log lines -> one {pid, exc, msg, block} per pid block that holds a traceback, from its last
-    `Type: msg` line after the last `Traceback` line. Provider transients and exit noise are not crashes."""
+    `Type: msg` line after the last `Traceback` line. Provider transients and exit noise are not crashes. A block
+    under a `[pid N] @ <UTC> core=<sha>` header also carries `t` (epoch of that header) and `core`."""
     by_pid: Dict[str, List[str]] = {}
+    stamps: Dict[str, tuple] = {}
     for ln in lines:
+        h = PID_HEADER_RE.match(ln)
+        if h and (t := _header_time(h.group(2))) is not None:
+            stamps[h.group(1)] = (t, h.group(3))
+            by_pid.setdefault(h.group(1), [])
+            continue
         m = PID_LINE_RE.match(ln)
         if m:
             by_pid.setdefault(m.group(1), []).append(m.group(2))
@@ -493,14 +518,19 @@ def parse_worker_crashes(lines: List[str]) -> List[dict]:
         exc, msg = em.group(1), em.group(2)
         if TRANSIENT_RE.search(f"{exc}: {msg}") or EXIT_NOISE_RE.search(msg):
             continue
-        out.append({"pid": pid, "exc": exc, "msg": msg, "block": tail})
+        crash = {"pid": pid, "exc": exc, "msg": msg, "block": tail}
+        if pid in stamps:
+            crash["t"], crash["core"] = stamps[pid]
+        out.append(crash)
     return out
 
 
 def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List[dict]:
-    """Keep this host's recent worker crashes in the cursor (a storm spans passes; `at` is the pass time, the log
-    has none); WORKER_STORM_N distinct pids with the same (exception, normalized message) within WORKER_STORM_S
-    file one signal, and the same fingerprint is not filed again within WORKER_STORM_S."""
+    """Keep this host's recent worker crashes in the cursor (a storm spans passes, and the window runs on pass
+    times); WORKER_STORM_N distinct pids with the same (exception, normalized message) within WORKER_STORM_S
+    file one signal, and the same fingerprint is not filed again within WORKER_STORM_S. Crashes from headered
+    blocks also carry their logged UTC time and core sha: the details name the earliest/latest crash and the
+    sha(s), and when every pid in the storm has a time the signal's `at` is the latest crash, not the pass."""
     st = cur.get("worker_storm") or {}
     evs = [e for e in st.get("ev") or [] if e.get("at", 0) > now - WORKER_STORM_S]
     filed = {k: v for k, v in (st.get("filed") or {}).items() if v > now - WORKER_STORM_S}
@@ -508,22 +538,27 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
     latest: Dict[str, dict] = {}
     for c in crashes:
         k = h10(c["exc"], _norm_msg(c["msg"]))
-        evs.append({"at": now, "pid": c["pid"], "k": k})
+        ev = {"at": now, "pid": c["pid"], "k": k}
+        if c.get("t") is not None:
+            ev["t"], ev["core"] = c["t"], c.get("core") or "unknown"
+        evs.append(ev)
         latest[k] = c
     for k, c in latest.items():
-        pids = sorted({e["pid"] for e in evs if e["k"] == k}, key=lambda p: (len(p), p))
+        mine = [e for e in evs if e["k"] == k]
+        pids = sorted({e["pid"] for e in mine}, key=lambda p: (len(p), p))
         if len(pids) < WORKER_STORM_N or k in filed:
             continue
         filed[k] = now
         evs = [e for e in evs if e["k"] != k]
         norm = _norm_msg(c["msg"])
         tb = "\n".join(c["block"][-15:])
-        out.append({"kind": "worker", "component": "kanban", "at": now, "session_id": "",
+        when, at = _crash_times(mine, pids, now)
+        out.append({"kind": "worker", "component": "kanban", "at": at, "session_id": "",
                     "symptom": f"managed-worker crash storm on {host or 'this host'}: {len(pids)} workers died "
                                f"with {c['exc'].split('.')[-1]}: {_scrub(c['msg'])[:120]}",
                     "details": _scrub(f"{len(pids)} managed kanban workers died with {c['exc']} within "
                                       f"{WORKER_STORM_S // 60} min (logs/managed-worker.log). pids: "
-                                      f"{', '.join(pids)}\n{_span_note(c)}"
+                                      f"{', '.join(pids)}\n{when}{_span_note(c)}"
                                       f"Latest (pid {c['pid']}):\n{tb}")[:1500],
                     "fp": fp("kanban", "worker-storm", c["exc"], norm)})
     if evs or filed:
@@ -533,14 +568,29 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
     return out
 
 
+def _crash_times(evs: List[dict], pids: List[str], now: float) -> Tuple[str, float]:
+    """(details line, signal time) from the storm's headered crashes; ("", now) when none carries a time."""
+    stamped = {e["pid"]: e for e in evs if e.get("t") is not None}
+    if not stamped:
+        return "", now
+    ts = sorted(e["t"] for e in stamped.values())
+    cores = sorted({e.get("core") or "unknown" for e in stamped.values()})
+    every = all(p in stamped for p in pids)
+    part = "" if every else f" ({len(stamped)} of {len(pids)} pids stamped)"
+    line = (f"Crash times (UTC, log headers){part}: earliest {_utc(ts[0])}, latest {_utc(ts[-1])}; "
+            f"core: {', '.join(cores)}\n")
+    return line, (ts[-1] if every else now)
+
+
 def _span_note(c: dict) -> str:
-    """Where the latest crash came from: the log has no timestamps, so the byte range read this pass is what
-    shows a late or replayed signal in the card evidence (kanban-e001f2d4a0)."""
+    """Where the latest crash came from: the byte range read this pass, which shows a late or replayed signal in
+    the card evidence (kanban-e001f2d4a0) whether or not the block carried a header."""
     if not c.get("span"):
         return ""
     prof = c.get("profile") or "default"
+    plain = " (log lines carry no timestamps)" if c.get("t") is None else ""
     return (f"Latest crash first seen this pass in {prof} logs/managed-worker.log bytes "
-            f"{c['span'][0]}-{c['span'][1]} (log lines carry no timestamps).\n")
+            f"{c['span'][0]}-{c['span'][1]}{plain}.\n")
 
 
 def collect_worker(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
