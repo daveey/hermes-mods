@@ -413,10 +413,36 @@ function api(path, opts = {}) {
 const boardQs = board => (board && board !== 'default' ? `?board=${encodeURIComponent(board)}` : '')
 const taskPath = (id, board, sub = '') => `/api/plugins/kanban/tasks/${encodeURIComponent(id)}${sub}${boardQs(board)}`
 
+/** The focused chat's owner read route: the same rule as session-tasks' focusedRoute, whose chips this panel's
+ *  items are compared with (exact identity). An owner with no connection is unresolved, never the active one. */
+export function ownerRoute() {
+  try {
+    const owner = host.state?.focusedSessionOwner?.get?.()
+    return {
+      connectionId: owner ? owner.connectionId || null : activeConnection() || null,
+      profile: owner ? (owner.targetProfile || owner.profile || 'default') : (host.state?.profile?.get?.() || 'default')
+    }
+  } catch {
+    return { connectionId: null, profile: null }
+  }
+}
+
+/** Qualify one `/api/session-kanban-tasks` row read on `connectionId`. Core's local rows carry no profile, gateway
+ *  or connection; only a row read through the owner route (that connection, scoped to that profile) inherits the
+ *  route's profile, exactly like session-tasks' withLocalRoute. Rows that name their own owner (gateway replicas,
+ *  an explicit profile, explicitly unknown ownership) and rows read on any other connection keep what they have:
+ *  missing identity stays missing, so exact matching fails open instead of merging. */
+export function withOwnerRoute(t, route, connectionId) {
+  const row = { ...t, connectionId }
+  if (!route?.connectionId || !str(route.profile) || connectionId !== route.connectionId) return row
+  if (t.gateway || t.connectionId || t.profile === null || t.ownership_state === 'unknown') return row
+  return { ...row, profile: t.profile || route.profile }
+}
+
 /** Live lists on every registered gateway, plus hub session links for cross-host
  * subscriptions and offline owners. Replica rows discover cards; only the owner
  * detail response makes them actionable. Never guess a connection from a name. */
-export async function sessionTasks(ids, call = api, registry = () => host.connections?.(), resolve = name => sdk.connectionForHubGateway?.(name)) {
+export async function sessionTasks(ids, call = api, registry = () => host.connections?.(), resolve = name => sdk.connectionForHubGateway?.(name), route = ownerRoute()) {
   const active = activeConnection() || 'local'
   let connections = []
   try { connections = await registry() || [] } catch { /* active still works */ }
@@ -427,10 +453,12 @@ export async function sessionTasks(ids, call = api, registry = () => host.connec
   const live = await Promise.all(owners.map(async connectionId => {
     try {
       await sdk.learnHubGatewayName?.(connectionId)
-      const r = await call(`/api/session-kanban-tasks?ids=${query}`, { connectionId })
+      // The owner's own gateway is read through the owner profile, so its rows' identity is that route's.
+      const owned = route?.connectionId === connectionId && str(route.profile)
+      const r = await call(`/api/session-kanban-tasks?ids=${query}`, owned ? { connectionId, profile: route.profile } : { connectionId })
       if (!Array.isArray(r?.tasks)) return []
       answered = true
-      return r.tasks.map(t => ({ ...t, connectionId }))
+      return r.tasks.map(t => withOwnerRoute(t, owned ? route : null, connectionId))
     } catch { return [] }
   }))
   try {
