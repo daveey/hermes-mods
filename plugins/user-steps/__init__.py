@@ -255,8 +255,11 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     # the same approval again (hub chat 67cb2d).
     open_asks = core.open_asks(store, owner, _ledger().read(session_id).get('steps', []))
     # continuity=True: the listed titles must not silently drop a re-ask before covered() judges it.
+    # Other chats' titles are relay context only in a turn a runtime notice started (relay provenance); in a
+    # turn the user started an overlapping title elsewhere must not drop this reply's approval from the gate.
+    relay = core._runtime_message(_USER_MSG.get(session_id, ''))
     res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks],
-                       '', aux_llm, continuity=True, elsewhere=core.elsewhere_titles(store, owner))
+                       '', aux_llm, continuity=True, elsewhere=core.elsewhere_titles(store, owner) if relay else [])
     approvals = [s for s in res.get('steps', []) if s['kind'] == 'approve']
     if not approvals:
         return None
@@ -434,12 +437,15 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
                                     bind=adapter.bind_request, undecided=True)
                 except core.ActionError as exc:
                     if exc.status != 409: raise
-                    if 'decision' not in str(exc).lower():
+                    if str(exc) == 'Stale revision':
                         # Revised concurrently, still undecided: never publish a second tile for the same source
                         # step. Hand the agent the request to revise by its id.
                         raise core.ActionError(f"The open request this cites ({target['requestId']}) changed "
-                                               f"meanwhile ({exc}); revise it by requestId with its current "
-                                               "expectedRevision.", 409) from exc
+                                               "meanwhile (stale revision); revise it by requestId with its "
+                                               "current expectedRevision.", 409) from exc
+                    if str(exc) not in ('A decision is already recorded for this revision',
+                                        'Decision delivery is pending'):
+                        raise  # e.g. an alias that belongs to another request: report it as is
                     # A decision was recorded or is being delivered: the decision wins. Publish a separate
                     # request that does not reuse the decided request's refs.
                     payload.update(requestId=rid, aliases=[a for a in payload['aliases'] if a not in target['aliases']])

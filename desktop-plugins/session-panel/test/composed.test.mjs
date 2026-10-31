@@ -111,8 +111,9 @@ test('sameCard: exact qualified identity only', () => {
   assert.equal(steps.sameCard(a, { ...a, profile: 'other' }), false)
   assert.equal(steps.sameCard(a, { ...a, id: 't_y' }), false)
   assert.equal(steps.sameCard({ id: 't_x' }, { id: 't_x' }), false, 'no owner on either side never matches')
-  assert.equal(steps.sameCard({ id: 't_x', gateway: 'G1' }, { id: 't_x', gatewayId: 'G1' }), true)
-  assert.equal(steps.sameCard({ id: 't_x', gateway: 'G1', title: 'A' }, { id: 't_y', gateway: 'G1', title: 'A' }), false, 'title is not identity')
+  assert.equal(steps.sameCard({ ...a, profile: undefined }, a), false, 'unknown profile never matches')
+  assert.equal(steps.sameCard({ id: 't_x', gateway: 'G1', profile: 'p' }, { id: 't_x', gatewayId: 'G1', profile: 'p' }), true)
+  assert.equal(steps.sameCard({ id: 't_x', gateway: 'G1', profile: 'p', title: 'A' }, { id: 't_y', gateway: 'G1', profile: 'p', title: 'A' }), false, 'title is not identity')
 })
 
 test('done', () => { root.unmount() })

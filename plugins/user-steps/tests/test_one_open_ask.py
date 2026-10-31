@@ -401,6 +401,19 @@ def test_tool_citing_a_target_decided_meanwhile_publishes_separately_without_its
     assert not out.get('resolution')
 
 
+def test_tool_fold_conflict_on_another_requests_alias_is_reported_as_is(plugin, monkeypatch):
+    store = plugin.core.ActionStore()
+    target = extracted(plugin, store, 'Approve the notify fix?')
+    body, _ = _cited_body(target)
+
+    def taken(*a, **k):
+        raise plugin.core.ActionError('Alias already belongs to another request', 409)
+    monkeypatch.setattr(plugin.core.ActionStore, 'revise', taken)
+    out = publish(plugin, {'request': body})
+    assert out == {'error': 'Alias already belongs to another request', 'status': 409}
+    assert [r['requestId'] for r in live(store)] == [target['requestId']]
+
+
 def test_tool_citing_steps_of_two_open_requests_is_refused(plugin):
     store = plugin.core.ActionStore()
     a, b = extracted(plugin, store, 'Approve the notify fix?'), extracted(plugin, store, 'Approve the notify fix?')

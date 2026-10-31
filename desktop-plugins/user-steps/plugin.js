@@ -586,8 +586,8 @@ function StepRow({ step, sessionId }) {
   })
 }
 
-/** Same Kanban card by exact qualified identity: id + board + owner (connection, else gateway) and, when both
- *  say, profile. Missing owner on either side is not a match (fail open to showing both, never to merging). */
+/** Same Kanban card by exact qualified identity: id + board + owner (connection, else gateway) + profile. A
+ *  missing owner or profile on either side is not a match (fail open to showing both, never to merging). */
 export function sameCard(a, b) {
   if (!a || !b || !str(a.id) || str(a.id) !== str(b.id)) return false
   if ((str(a.board) || 'default') !== (str(b.board) || 'default')) return false
@@ -596,7 +596,7 @@ export function sameCard(a, b) {
     const ga = str(a.gatewayId || a.gateway), gb = str(b.gatewayId || b.gateway)
     if (!ga || !gb || ga !== gb) return false
   }
-  return !(a.profile && b.profile && str(a.profile) !== str(b.profile))
+  return !!str(a.profile) && str(a.profile) === str(b.profile)
 }
 
 export function Strip({ hideCards = [] } = {}) {

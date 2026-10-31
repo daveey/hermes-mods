@@ -182,7 +182,14 @@ def test_publication_buffer_receives_elsewhere_titles_and_does_not_hold_a_restat
                            'elsewhere': [{'title': title, 'verbatim_span': sentence}], 'resolved': []})
 
     monkeypatch.setattr(plugin, 'aux_llm', llm)
+    plugin._USER_MSG['session-a'] = NOTICE  # relay provenance: a runtime notice started this turn
     assert plugin.publication_buffer(session_id='session-a', platform='desktop', final_response=reply) is None
+    # The same reply in a turn the user started: the other chat's title is no source association, so this
+    # chat's approval sentence reaches the plan gate and the reply is held for a complete plan.
+    plugin._USER_MSG['session-a'] = 'Should we register a spare runner?'
+    held = plugin.publication_buffer(session_id='session-a', platform='desktop', final_response=reply)
+    assert held and held.get('hold'), held
+    plugin._USER_MSG.pop('session-a', None)
     assert seen and 'ELSEWHERE' in seen[0] and title in seen[0]
 
 
