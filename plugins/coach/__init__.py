@@ -140,10 +140,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             log.debug("coach compute_envelope: %s", exc)
             return None
 
-    def envelope_gate(session_id="", platform="", final_response="", attempt=0, **_):
+    def envelope_gate(session_id="", platform="", final_response="", attempt=0, turn_origin=None, **_):
         """pre_final_gate: hold an in-envelope compute/spend ask once, ahead of ordinary gates (user-steps would
-        otherwise push it into a formal approval request and replace it before pre_verify sees it)."""
-        if attempt or not session_id or platform in ("cron",) or not isinstance(final_response, str):
+        otherwise push it into a formal approval request and replace it before pre_verify sees it). A fork turn
+        (`turn_origin` set: background review, side question) is not a reply to the user: never judged."""
+        if turn_origin or attempt or not session_id or platform in ("cron",) or not isinstance(final_response, str):
             return None
         msg = _envelope(session_id, "reply", final_response)
         return {"hold": True, "nudge": msg} if msg else None
@@ -386,7 +387,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             log.debug("coach post_llm_call: %s", exc)
 
-    def pre_verify(session_id="", platform="", attempt=0, final_response="", changed_paths=None, **_):
+    def pre_verify(session_id="", platform="", attempt=0, final_response="", changed_paths=None, turn_origin=None,
+                   **_):
         """Check the agent's final answer before the turn ends; a hit keeps the turn going with a nudge.
         At most one nudge per turn (attempt 0 only); fail-open on every error.
 
@@ -394,7 +396,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         counts only when it is returned before that deadline: `reply_nudge` is logged then, `reply_nudge_abandoned`
         when the host already gave up (its result is discarded). The nudge is `reply_nudge_delivered` once the
         continuation it asked for reaches pre_verify again in the same turn (attempt >= 1), and
-        `reply_nudge_undelivered` when the next check comes from a later turn instead."""
+        `reply_nudge_undelivered` when the next check comes from a later turn instead.
+
+        A fork turn (`turn_origin` set: background review, side question) shares the parent's session_id but its
+        output never reaches the user: it is not judged and leaves the session's pending nudge alone
+        (agent-0fe2ee028b). Core itself skips pre_verify for fork turns (fork commit "skip the pre_verify
+        user-reply gate for fork turns"); this is the plugin-side guard for any host that passes the marker."""
+        if turn_origin:
+            return None
         try:
             rc = _load("reply_check")
             budget = rc.start_budget()

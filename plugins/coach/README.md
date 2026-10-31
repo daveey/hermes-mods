@@ -209,6 +209,10 @@ Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` an
 (`rule=th,...` per-rule overrides; defaults `report_only=0.5` for the second opinion, `report_only_screen=0.85`). Needs core
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
+Fork turns (background review, side questions) are never judged: core skips `pre_verify` when the agent has
+`_turn_origin` set (fork commit "skip the pre_verify user-reply gate for fork turns"), and `pre_verify` /
+`envelope_gate` return early on a `turn_origin` kwarg without touching the session's pending nudge
+(`tests/test_fork_turns.py`, agent-0fe2ee028b).
 
 Latency budget (`reply_check.Budget`). The host runs `pre_verify` on a worker it abandons at a deadline, so the whole
 check runs inside one explicit budget: `COACH_PRE_VERIFY_BUDGET_S` (default 75s) and the coach declares host timeout
