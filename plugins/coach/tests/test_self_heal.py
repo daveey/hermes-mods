@@ -120,6 +120,19 @@ def test_machine_signals_need_no_judge():
     assert sh.detect_admission("Sorry, not processed.", llm)["source"] == "signal" and not calls
 
 
+def test_machine_signal_flags_core_failed_turn_notices():
+    """agent-c46bf512ae: 15 turns ended on core's failed-turn boundary and no turn-end signal fired."""
+    partial = ("This turn did not complete. Some actions may already have run; verify their effects "
+               "before resending.")
+    restart = ("Hermes restarted before this turn finished. It continues automatically once the backend is back; "
+               "send it again only if nothing happens within a few minutes.")
+    for notice in (partial, restart,
+                   "Your request was not processed. Send it again if you still want me to carry it out."):
+        assert sh.machine_signal(notice)["kind"] == "failed_turn"
+        assert sh.machine_signal(notice)["source"] == "signal"
+    assert sh.machine_signal("Done. I noted that 'This turn did not complete' is core's notice text.") is None
+
+
 # gateway-a8b8d01aa4: finished turns were filed as "turn interrupted" because the tool log merely mentioned it.
 FINISHED = "Done. The hub's own background retry switches on once the hub Desktop backend restarts."
 

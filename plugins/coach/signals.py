@@ -97,6 +97,11 @@ PROXY_5XX_RE = re.compile(r"<title>\s*5\d\d\b|\b5\d\d\s+(?:Bad Gateway|Service|G
 EXC_BODY_LINES, EXC_BODY_CHARS = 20, 2000
 # Match only core's final offline exception, never generic DNS failures or a message quoting it.
 OFFLINE_EXC = "RuntimeError: Hermes can't reach the model provider. You may be offline."
+# The turn loop's terminal refusal (agent/conversation_loop.py): the turn dies on it with no traceback, so nothing else
+# files it (agent-c46bf512ae: 15 turns died on "Chat ownership lease is unavailable" and raised nothing). Provider
+# HTTP errors and provider stalls ride the same line; the provider/credit lanes own those.
+NONRETRYABLE_RE = re.compile(r"Non-retryable client error: (.+)")
+NONRETRYABLE_PROVIDER_RE = re.compile(r"^(?:Error code: \d{3}\b|Provider has been unresponsive\b)")
 PROVIDER_DNS_RE = re.compile(
     r"^provider host does not resolve while network is up: (\S+) "
     r"\(control host (\S+) resolves\) — check the provider base_url$"
@@ -386,6 +391,15 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                         "symptom": f"provider host does not resolve while network is up: {dns.group(1)}",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
                         "fp": fp("agent", "provider-dns", dns.group(1))})
+            continue
+        nr = NONRETRYABLE_RE.fullmatch(r["msg"])
+        if (nr and r["level"] == "ERROR" and OWN_LOGGER_RE.match(r["logger"])
+                and not NONRETRYABLE_PROVIDER_RE.match(nr.group(1))):
+            why = nr.group(1).strip()
+            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+                        "symptom": f"turn failed on a Hermes refusal: {why[:160]}",
+                        "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"] + r["cont"]))[:1500],
+                        "fp": fp("agent", "non-retryable", re.sub(r"\d+", "N", why[:120]))})
             continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
             continue
@@ -1135,13 +1149,29 @@ def subagent_session(home: Path, n: dict) -> bool:
     return False
 
 
-def _turn_lost(home: Path, n: dict) -> bool:
-    """True when the nudged session's visible transcript after the nudge ends in an interruption marker with no later
-    final assistant reply (the turn was killed, so no reply_nudge_outcome can be logged). Any doubt (session not
-    found, unreadable db) is False: the nudge files as before (fail-open)."""
+# Core's failed-turn boundary rows (agent/turn_failure_copy.py): the Hermes-authored assistant row closing a turn that
+# died with no reply, typed messages.display_kind='failed_turn' (older rows untyped: exact text, as core's own
+# untyped_failed_turn_display_kind reads them). agent-c46bf512ae: a nudged turn died on one and filed as ignored.
+FAILED_TURN_KIND = "failed_turn"
+FAILED_TURN_NOTICES = frozenset({
+    "Your request was not processed. Send it again if you still want me to carry it out.",
+    "This turn did not complete. Some actions may already have run; verify their effects before resending.",
+    "Hermes restarted before this turn finished. It continues automatically once the backend is back; "
+    "send it again only if nothing happens within a few minutes.",
+    "An automated delivery was interrupted and was not run again. Some actions may already have run; "
+    "verify their effects.",
+})
+
+
+def _turn_lost(home: Path, n: dict) -> Optional[str]:
+    """Why the nudged turn died, or None. The nudged turn is the transcript after the nudge up to the next user row (a
+    later turn's reply is not the nudged turn's outcome). It is lost when it ends on an interruption marker
+    ("interrupted") or on core's failed-turn boundary row ("failed_turn") with no final assistant reply after it (the
+    turn was killed, so no reply_nudge_outcome can be logged). Any doubt (session not found, unreadable db) is None:
+    the nudge files as before (fail-open)."""
     sid, ts = n.get("session_id") or "", float(n.get("ts") or 0)
     if not sid:
-        return False
+        return None
     for _prof, h in homes(home):
         db = h / "state.db"
         if not db.is_file():
@@ -1149,23 +1179,32 @@ def _turn_lost(home: Path, n: dict) -> bool:
         try:
             c = _ro(db)
             try:
-                rows = c.execute("select content, tool_calls from messages where session_id=? and role='assistant' "
-                                 "and timestamp>=? and (active=1 or compacted=1) order by timestamp, id",
-                                 (sid, ts)).fetchall()
+                cols = {r[1] for r in c.execute("pragma table_info(messages)")}
+                kind = "display_kind" if "display_kind" in cols else "null"
+                rows = c.execute(f"select role, content, tool_calls, {kind} from messages where session_id=? "
+                                 "and role in ('user','assistant') and timestamp>=? and (active=1 or compacted=1) "
+                                 "order by timestamp, id", (sid, ts)).fetchall()
             finally:
                 c.close()
         except sqlite3.Error:
             continue
-        lost = None
-        for content, tool_calls in rows:
+        lost = seen = None
+        for role, content, tool_calls, display_kind in rows:
+            if role == "user":
+                if seen:
+                    break  # the next turn began: only the nudged turn decides
+                continue
+            seen = True
             text = str(content or "")
             if INTERRUPT_RE.search(text):
-                lost = True
+                lost = "interrupted"
+            elif display_kind == FAILED_TURN_KIND or text.strip() in FAILED_TURN_NOTICES:
+                lost = "failed_turn"
             elif text.strip() and not (tool_calls or "").strip("[] "):
-                lost = False  # a final reply after the interrupt: the turn went on (or a new one ran)
+                lost = False  # a final reply after the interrupt: the turn went on
         if lost is not None:
-            return lost
-    return False
+            return lost or None
+    return None
 
 
 def _coach_log(home: Path, rec: dict) -> None:
@@ -1332,10 +1371,12 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                                   "session_id": n.get("session_id") or "", "rule": n.get("rule"),
                                   "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id")})
                 continue
-            if _turn_lost(home, n):
-                # agent-fb58ec3a8f: the turn died after the nudge (gateway restart), so no final reply ran and no
-                # outcome can come. Gateway/drain signals own that restart; it is not an agent that ignored a nudge.
-                _coach_log(home, {"ts": now, "event": "nudge_outcome_lost", "reason": "interrupted",
+            lost = _turn_lost(home, n)
+            if lost:
+                # agent-fb58ec3a8f / agent-c46bf512ae: the turn died after the nudge (gateway restart, a failed-turn
+                # boundary), so no final reply ran and no outcome can come. The restart/error signals own that
+                # death; it is not an agent that ignored a nudge.
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_lost", "reason": lost,
                                   "session_id": n.get("session_id") or "", "rule": n.get("rule") or "handoff",
                                   "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id")})
                 continue

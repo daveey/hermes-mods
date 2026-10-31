@@ -127,6 +127,14 @@ CANCEL_LINE_RE = re.compile(r"^\s*<-\s*ERROR\b.*(?:Tool execution cancelled|Oper
                             re.I)
 # Core's crash-recovery note (tui_gateway/session_history.py _AUTO_CONTINUE_NOTE_PREFIX): the next user turn after a
 # backend stopped mid-turn. The only trace such a stop leaves, since the cut turn never reaches post_llm_call.
+# Core's failed-turn boundary notices (agent/turn_failure_copy.py), matched exactly so a reply quoting one stays a
+# reply. agent-c46bf512ae: 15 turns ended on one ("This turn did not complete...") and no turn-end signal fired.
+FAILED_TURN_NOTICES = frozenset({
+    "Your request was not processed. Send it again if you still want me to carry it out.",
+    "This turn did not complete. Some actions may already have run; verify their effects before resending.",
+    "Hermes restarted before this turn finished. It continues automatically once the backend is back; "
+    "send it again only if nothing happens within a few minutes.",
+})
 RESUME_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
 # Core's update-pause note (tui_gateway/update_pause.py pause_note) shares that prefix but marks a PLANNED pause: the
 # turn stopped at a step boundary so a Hermes update could land, then continued by itself (gateway-9aaf151a15).
@@ -298,7 +306,10 @@ def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
     """Turn-end telemetry, no judge: a provider-error reply, an interrupted turn, or one tool error repeated 3x."""
     r = (final_reply or "")[:400]
     log = [str(x) for x in (tool_log or [])]
-    if API_ERR_RE.search(r):
+    if (final_reply or "").strip() in FAILED_TURN_NOTICES:
+        v = {"p_defect": 0.9, "kind": "failed_turn", "component": "gateway",
+             "symptom": "turn ended on a failed-turn notice (no reply)"}
+    elif API_ERR_RE.search(r):
         v = {"p_defect": 0.9, "kind": "api_error", "component": "provider", "symptom": "turn failed with provider error"}
     elif INTERRUPT_RE.search(r) or (not r.strip() and log and CANCEL_LINE_RE.search(log[-1])):
         v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",

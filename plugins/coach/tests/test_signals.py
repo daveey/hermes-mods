@@ -1531,3 +1531,29 @@ def test_worker_crash_with_html_5xx_body_is_transient():
     assert sg.parse_worker_crashes(log) == []
     ctl = [f"[pid 42] {l}" for l in lines[:4] + ["KeyError: 'route'", "<title>502 Bad Gateway</title>"]]
     assert len(sg.parse_worker_crashes(ctl)) == 1
+
+
+# agent-c46bf512ae: 15 turns died on "Non-retryable client error: Chat ownership lease is unavailable" (a Hermes-side
+# refusal, no traceback) and errors.log raised nothing. Each distinct Hermes refusal files one signal; provider HTTP
+# errors (already owned by the provider/credit lanes) do not.
+def test_non_retryable_hermes_refusal_files_one_signal_per_message():
+    lines = ["2026-10-30 21:27:08,405 ERROR [20261022_204322_4d8ce1] agent.conversation_loop: "
+             "Non-retryable client error: Chat ownership lease is unavailable",
+             "2026-10-30 23:45:50,100 ERROR [20261022_221516_1b9736] agent.conversation_loop: "
+             "Non-retryable client error: Chat ownership lease is unavailable"]
+    got = sg.parse_errors(lines)
+    assert len(got) == 2 and got[0]["fp"] == got[1]["fp"]
+    assert got[0]["component"] == "agent" and got[0]["session_id"] == "20261022_204322_4d8ce1"
+    assert "Chat ownership lease is unavailable" in got[0]["symptom"]
+    other = sg.parse_errors(["2026-10-30 21:27:08,405 ERROR agent.conversation_loop: "
+                             "Non-retryable client error: Selected class route is ineligible for this request"])
+    assert len(other) == 1 and other[0]["fp"] != got[0]["fp"]
+
+
+def test_non_retryable_provider_http_error_is_not_a_hermes_defect():
+    lines = ["2026-10-30 21:27:08,405 ERROR agent.conversation_loop: Non-retryable client error: Error code: 403 - "
+             "{'error': {'message': 'Key limit exceeded (total limit).'}}",
+             "2026-10-30 21:27:09,405 ERROR agent.conversation_loop: Non-retryable client error: Provider has been "
+             "unresponsive (no response received) for 5 consecutive stale attempts",
+             "2026-10-30 21:27:10,405 WARNING agent.conversation_loop: Non-retryable client error: whatever"]
+    assert sg.parse_errors(lines) == []

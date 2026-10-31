@@ -152,3 +152,54 @@ def test_no_capped_rows_files_nothing(tmp_path):
     (h / "coach").mkdir(parents=True)
     (h / "coach" / "log.jsonl").write_text(json.dumps({"ts": NOW, "event": "report_only_confirm", "ok": True}) + "\n")
     assert [s for s in sg.collect_coach(h, {}, NOW + 60) if "cap reached" in s["symptom"]] == []
+
+
+# agent-c46bf512ae: the nudged turn died on a core failed-turn boundary ("This turn did not complete..."), which
+# _turn_lost did not know, and a LATER notice turn's final reply reset the verdict, so it filed as an agent ignoring
+# the nudge. Replays the incident's shape: tool rows, the failed_turn row, then a different (user-started) turn.
+PARTIAL = "This turn did not complete. Some actions may already have run; verify their effects before resending."
+
+
+def _home_typed(tmp_path, messages):
+    h = tmp_path / "home"
+    (h / "coach").mkdir(parents=True)
+    (h / "coach" / "log.jsonl").write_text(json.dumps(NUDGE) + "\n")
+    c = sqlite3.connect(h / "state.db")
+    c.execute("create table messages (id integer primary key, session_id text, role text, content text, "
+              "tool_calls text, timestamp real, active integer default 1, compacted integer default 0, "
+              "display_kind text)")
+    for role, content, tool_calls, dt, kind in messages:
+        c.execute("insert into messages (session_id, role, content, tool_calls, timestamp, display_kind) "
+                  "values (?,?,?,?,?,?)", (SID, role, content, tool_calls, NOW + dt, kind))
+    c.commit()
+    c.close()
+    return h
+
+
+FAILED_TURN_INCIDENT = [("assistant", "", '[{"name": "kanban_show"}]', 5, None),
+                        ("tool", "{...}", None, 6, None),
+                        ("assistant", PARTIAL, None, 20, "failed_turn"),
+                        # 23:49: a different turn (a Kanban notice) ran and answered
+                        ("user", "[Kanban notice] t_123 completed", None, 200, None),
+                        ("assistant", "Noted: t_123 is done.", None, 230, None)]
+
+
+def test_incident_failed_turn_row_is_lost_not_an_ignored_nudge(tmp_path):
+    h = _home_typed(tmp_path, FAILED_TURN_INCIDENT)
+    assert _coach(sg.collect_coach(h, {}, LATE)) == []
+    lost = [r for r in _log(h) if r.get("event") == "nudge_outcome_lost"]
+    assert len(lost) == 1 and lost[0]["reason"] == "failed_turn" and lost[0]["session_id"] == SID
+
+
+def test_untyped_failed_turn_notice_text_is_lost_too(tmp_path):
+    rows = [(r, (c if k != "failed_turn" else c), t, dt, None) for r, c, t, dt, k in FAILED_TURN_INCIDENT]
+    h = _home_typed(tmp_path, rows)
+    assert _coach(sg.collect_coach(h, {}, LATE)) == []
+
+
+def test_reply_in_the_nudged_turn_after_a_tool_still_files(tmp_path):
+    """No failed boundary: the nudged turn answered (without an outcome line) -> files as before."""
+    h = _home_typed(tmp_path, [("assistant", "", '[{"name": "terminal"}]', 5, None),
+                               ("assistant", "Here is the revised summary.", None, 60, None)])
+    got = _coach(sg.collect_coach(h, {}, LATE))
+    assert len(got) == 1 and "no outcome" in got[0]["symptom"]
