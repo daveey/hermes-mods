@@ -30,7 +30,9 @@ The other task actions take the key `<profile>/<board>/<id>`, as the replica pub
 `invalid_task_route` after the request was sent.
 
 Reads run out of the gateway process. Each GET is answered by one of two `hubview_worker.py` children (niced +5)
-over a pipe, and the gateway relays the child's JSON bytes unchanged. Inside the gateway, hubview's pure-Python
+over a socketpair with 8 MB buffers (not a 64 KB pipe: a 1.35 MB sessions answer then crossed in ~21 reads, each
+winning the gateway's GIL back from its busy loop, 0.8-1.7 s under load), and the gateway relays the child's JSON
+bytes unchanged. Inside the gateway, hubview's pure-Python
 decode held the GIL against the asyncio loop that serves the whole API. At load ~100 on 2026-10-30 that made
 `/status` (2 ms of CPU) miss the Desktop's 4 s timeout 338 times in 20 min. If a child dies, hangs (60 s) or fails
 to spawn, that read is answered in-process and the children stay off for 30 s. A change to `hubview.py` or the

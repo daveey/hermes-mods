@@ -47,8 +47,9 @@ def serve(view, stdin, stdout) -> None:
             head = {"ok": True, "len": len(body)}
         except Exception as e:  # noqa: BLE001 - report it; the gateway falls back to an in-process read
             body, head = b"", {"ok": False, "error": repr(e)[:500], "len": 0}
-        stdout.write(json.dumps(head).encode() + b"\n")
-        stdout.write(body)
+        # One write: the gateway's socket buffer holds the whole answer, so it can be taken in one read (see
+        # plugin_api._answer_channel); two writes could wake the relay thread twice.
+        stdout.write(json.dumps(head).encode() + b"\n" + body)
         stdout.flush()
 
 

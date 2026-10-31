@@ -150,6 +150,7 @@ def _float(v):
 _DECODED: Dict[tuple, tuple] = {}
 _DECODED_LOCK = threading.Lock()
 _SEEN: Dict[str, tuple] = {}  # hub.db path -> (file signature, owner_seen map); see View.owner_seen
+_OVERRIDES: Dict[tuple, tuple] = {}  # (hub.db path, coll) -> (file signature, overrides map, raw-text memo)
 
 
 def _file_sig(path: Path) -> tuple:
@@ -231,16 +232,43 @@ class View:
         return self._pending
 
     def overrides(self, coll: str) -> Dict[tuple, Dict[str, dict]]:
-        """(gw, key) -> field -> {value, by, hlc} for this collection, when its shared fields are in primary mode."""
-        if coll not in self._overrides:
-            out: Dict[tuple, Dict[str, dict]] = {}
-            if coll in SHARED and shared_mode(self.conn, coll) == "primary" and _has(self.conn, "overrides"):
-                for r in self.conn.execute("SELECT gw, key, field, value, hlc, by_gw FROM overrides WHERE coll = ? AND value IS NOT NULL",
-                                           (coll,)):
-                    if r["field"] in SHARED[coll] or r["field"] == "pending_action":
-                        out.setdefault((r["gw"], r["key"]), {})[r["field"]] = {"value": _json(r["value"]), "by": r["by_gw"], "hlc": r["hlc"]}
-            self._overrides[coll] = out
-        return self._overrides[coll]
+        """(gw, key) -> field -> {value, by, hlc} for this collection, when its shared fields are in primary mode.
+
+        Memoized per hub.db file signature like ``owner_seen``, and on a signature change a value whose raw JSON text
+        is unchanged reuses its decoded copy: sessions has ~6.6k override rows and every poll opened a new View that
+        re-ran the query and ``json.loads`` on all of them (half a sessions read's CPU). Maps handed out are shared
+        with the cache: read only. [daveey]"""
+        if coll in self._overrides:
+            return self._overrides[coll]
+        sig = _file_sig(self.path) if self.path is not None else None
+        ck = (str(self.path), coll)
+        hit = None
+        if sig is not None:
+            with _DECODED_LOCK:
+                hit = _OVERRIDES.get(ck)
+            if hit is not None and hit[0] == sig:
+                self._overrides[coll] = hit[1]
+                return hit[1]
+        memo = hit[2] if hit is not None else {}
+        out: Dict[tuple, Dict[str, dict]] = {}
+        raw: Dict[tuple, tuple] = {}
+        if coll in SHARED and shared_mode(self.conn, coll) == "primary" and _has(self.conn, "overrides"):
+            for r in self.conn.execute("SELECT gw, key, field, value, hlc, by_gw FROM overrides WHERE coll = ? AND value IS NOT NULL",
+                                       (coll,)):
+                if r["field"] in SHARED[coll] or r["field"] == "pending_action":
+                    ident = (r["gw"], r["key"], r["field"])
+                    old = memo.get(ident)
+                    if old is not None and old[0] == r["value"] and old[1]["hlc"] == r["hlc"] and old[1]["by"] == r["by_gw"]:
+                        o = old[1]
+                    else:
+                        o = {"value": _json(r["value"]), "by": r["by_gw"], "hlc": r["hlc"]}
+                    raw[ident] = (r["value"], o)
+                    out.setdefault((r["gw"], r["key"]), {})[r["field"]] = o
+        if sig is not None:
+            with _DECODED_LOCK:
+                _OVERRIDES[ck] = (sig, out, raw)
+        self._overrides[coll] = out
+        return out
 
     def _overlay(self, coll: str, d: dict) -> dict:
         ovr = self.overrides(coll).get((d["gateway"], d["key"]))

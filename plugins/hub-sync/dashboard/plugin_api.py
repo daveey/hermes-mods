@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import select
+import socket
 import subprocess
 import sys
 import threading
@@ -87,6 +88,26 @@ class ChildReadError(ChildUnavailable):
     """The child is healthy but hubview raised; the in-process retry raises the same error as before."""
 
 
+# The child answers over a socketpair whose buffers hold a whole answer, not a pipe. A macOS pipe holds 64 KB, so a
+# 1.35 MB sessions(limit=2000) answer (3.2 MB for tasks) crossed in 21-50 reads, and each read had to win the
+# gateway's GIL back from its busy loop thread: with two spinning threads in the parent, sessions-2000 took 0.8-1.7 s
+# and tasks 1.8-2.6 s for ~0.06 s of child CPU, while status (one read) stayed at 0.2 s. That is why only the large
+# keys logged "slow poll" on 2026-10-30. With an 8 MB buffer the child writes its answer in one go and the relay
+# thread takes it in one or two reads. [daveey]
+_SOCK_BUF = 8 << 20
+
+
+def _answer_channel():
+    """(parent end, child end) of a stream socketpair with large buffers; buffer sizes are best effort."""
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    for s, opt in ((child, socket.SO_SNDBUF), (parent, socket.SO_RCVBUF)):
+        try:
+            s.setsockopt(socket.SOL_SOCKET, opt, _SOCK_BUF)
+        except OSError:
+            pass  # capped by kern.ipc.maxsockbuf / net.core.*mem_max: smaller buffer, more reads, same answer
+    return parent, child
+
+
 class _Child:
     """One hubview_worker.py process, used by one thread at a time (``lock``)."""
 
@@ -94,11 +115,19 @@ class _Child:
         self.lock = threading.Lock()
         self.argv = argv
         self.proc: Optional[subprocess.Popen] = None
+        self.sock: Optional[socket.socket] = None
         self.sig: Any = None
         self.buf = b""
+        self.reads = 0  # os.read calls of the last answer (tests; diagnostics)
 
     def close(self) -> None:
         p, self.proc, self.buf = self.proc, None, b""
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
         if p is None:
             return
         try:
@@ -106,6 +135,8 @@ class _Child:
         except OSError:
             pass
         for f in (p.stdin, p.stdout):
+            if f is None:
+                continue
             try:
                 f.close()
             except Exception:  # noqa: BLE001
@@ -116,7 +147,7 @@ class _Child:
             pass
 
     def _read_exact(self, n: int, deadline: float, until_newline: bool = False) -> bytes:
-        fd = self.proc.stdout.fileno()
+        fd = self.sock.fileno()
         while True:
             if until_newline:
                 i = self.buf.find(b"\n")
@@ -132,7 +163,8 @@ class _Child:
             ready, _, _ = select.select([fd], [], [], left)
             if not ready:
                 continue
-            chunk = os.read(fd, 1 << 20)
+            chunk = os.read(fd, max(1 << 20, min(n - len(self.buf), 1 << 26)))
+            self.reads += 1
             if not chunk:
                 raise ChildUnavailable("exited (rc=%s)" % self.proc.poll())
             self.buf += chunk
@@ -142,13 +174,22 @@ class _Child:
             self.close()  # hubview.py or the worker changed on disk, or the child died: start a fresh one
         if self.proc is None:
             try:
-                self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                parent, child = _answer_channel()
+            except OSError as e:
+                raise ChildUnavailable("socketpair failed: %s" % e) from e
+            try:
+                self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=child.fileno(),
                                              stderr=subprocess.DEVNULL, close_fds=True, bufsize=0)
             except OSError as e:
+                parent.close()
                 raise ChildUnavailable("spawn failed: %s" % e) from e
+            finally:
+                child.close()  # the child holds its own copy; EOF on ours then means it exited
+            self.sock = parent
             self.sig = sig
         try:
             self.proc.stdin.write(json.dumps({"fn": fn, "args": args}).encode() + b"\n")
+            self.reads = 0
             deadline = time.monotonic() + timeout
             head = json.loads(self._read_exact(0, deadline, until_newline=True))
             body = self._read_exact(int(head.get("len") or 0), deadline)

@@ -170,3 +170,23 @@ def test_sessions_page_matches_a_full_decorated_read_with_overrides(env):
     before = hv.sessions(include_archived=True)["sessions"]
     hv.sessions(limit=1)
     assert hv.sessions(include_archived=True)["sessions"] == before  # cache rows are not mutated
+
+
+def test_overrides_are_decoded_once_per_hub_db_and_unchanged_values_are_reused(env, monkeypatch):
+    """Every poll opens a new View; ~6.6k sessions overrides used to be re-queried and re-decoded each time."""
+    hv, client, db = env
+    _mode(db, "primary")
+    _override(db, "mini", "sessions", "default/s_mini", "title", "Renamed on cloud")
+    _override(db, "mini", "sessions", "default/s_mini", "pinned", True)
+    calls = []
+    real = hv._json
+    monkeypatch.setattr(hv, "_json", lambda text: calls.append(text) or real(text))
+    first = _session(hv, "mini", "default/s_mini")
+    assert first["title"] == "Renamed on cloud" and len(calls) == 2
+    assert _session(hv, "mini", "default/s_mini") == first and len(calls) == 2  # same hub.db: no decode
+    _override(db, "mini", "sessions", "default/s_mini", "title", "Renamed again")  # a commit moves the signature
+    s = _session(hv, "mini", "default/s_mini")
+    assert s["title"] == "Renamed again" and s["pinned"] is True
+    assert calls[2:] == [json.dumps("Renamed again")]  # only the changed value decoded again
+    _override(db, "mini", "sessions", "default/s_mini", "pinned", None)  # cleared: no longer applied
+    assert _session(hv, "mini", "default/s_mini").get("pinned") is not True

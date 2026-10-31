@@ -177,3 +177,25 @@ def test_worker_refuses_anything_but_reads(tmp_path):
 def test_inproc_env_disables_the_child(monkeypatch, env):
     monkeypatch.setenv("HUB_SYNC_INPROC", "1")
     assert _api("hub_sync_api_inproc")._READER is None
+
+
+def test_a_large_answer_crosses_in_a_few_reads_not_one_per_64k(tmp_path, env, monkeypatch):
+    """A pipe (64 KB on macOS) made a 1.35 MB sessions answer cross in ~21 reads, each needing the gateway's GIL
+    back from its loop: 0.8-1.7 s per poll under load for 0.06 s of child CPU. The socketpair holds the whole answer."""
+    api = _api("hub_sync_api_child_big")
+    api._READER.close()
+    view = tmp_path / "bigview.py"
+    view.write_text("def status():\n    return {'rows': ['x' * 1000] * 2000}\n")
+    r = api._Reader(view, WORKER, children=1, timeout_s=10)
+    reads = []
+    real = os.read
+    monkeypatch.setattr(os, "read", lambda fd, n: reads.append(n) or real(fd, n))
+    try:
+        assert json.loads(r.call("status", [])) == {"rows": ["x" * 1000] * 2000}
+        if sys.platform == "darwin":  # Linux caps socket buffers (net.core.rmem_max) lower: more reads, same answer
+            for _ in range(3):
+                reads.clear()
+                r.call("status", [])
+                assert len(reads) <= 4, len(reads)
+    finally:
+        r.close()
