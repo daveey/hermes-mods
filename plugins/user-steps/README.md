@@ -512,6 +512,15 @@ first tool starts); this card is the net for when that recovery misses. Tests: `
 
 A reply that only lists decisions waiting in other chats, queues or cards is a status report. A step whose
 evidence sits in that paragraph is not minted, unless the span itself is a direct request and does not contain
-the digest marker. The extractor prompt also receives up to 30 titles of open asks in other sessions
-(`ELSEWHERE`); a sentence that restates one of those titles is neither minted nor framed. A listed title
-cannot suppress an unrelated ask. Tests: `tests/test_elsewhere_digest.py`.
+the digest marker. The extractor receives up to 30 titles of open asks in other sessions
+(`ELSEWHERE`); a sentence mapped to one of those titles is neither minted nor framed.
+Before publishing extracted steps, a deterministic read rechecks **all** undecided
+other-session titles in the same gateway/profile namespace, without the prompt's
+recency cap. Exact normalized candidate-title or specific evidence-sentence equality
+suppresses publication even when the extractor omits its `elsewhere` mapping. This
+never adopts or frames another session's request or changes its state, revision or decisions.
+Unrelated asks, other namespaces and retired requests remain independent. This is a
+publication-time snapshot, not atomic concurrent-session admission or fuzzy matching.
+Tests: `tests/test_elsewhere_digest.py` (missing mapping beyond 30 titles; a title
+created during extraction; evidence equality; owner immutability/no operation;
+namespace and retired-request isolation; unrelated asks).

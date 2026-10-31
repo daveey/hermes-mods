@@ -1306,12 +1306,20 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             recent = sum(1 for s in d["steps"] if now - s.get("created", 0) < 3600)
             budget = min(MAX_NEW_PER_REPLY, max(0, MAX_NEW_PER_HOUR - recent))
             asks = open_asks(action_store, action_owner, d["steps"]) if action_store is not None else []
+            # The prompt's bounded ELSEWHERE list is advisory, not a publication guard.
+            # Recheck all other-session titles after extraction; suppression only, never
+            # borrow their ownership, frame their ids, or decide/revise their requests.
+            other_keys = elsewhere_open_keys(action_store, action_owner)
             mapped: dict[str, dict] = {}
             # Retain old label dedup only for genuinely new actions, never use it
             # as an authority binding or to bypass exact retirement/reuse.
             for candidate, prior in matches:
                 block = locate(text, candidate["verbatim_span"])
                 if held or candidate in suppressed or block is None:
+                    continue
+                key, span = ask_key(candidate.get('text')), ask_key(candidate.get('verbatim_span'))
+                if ((len(key) >= _ASK_KEY_MIN and key in other_keys)
+                        or (len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5 and span in other_keys)):
                     continue
                 if action_store is not None:
                     same = same_open_ask(candidate, asks, res.get("repeats") or (), mapped)
@@ -1441,6 +1449,25 @@ def elsewhere_titles(store, owner, limit=30) -> list[str]:
         if title and title not in out:
             out.append(title)
     return out
+
+
+def elsewhere_open_keys(store, owner) -> set[str]:
+    """All undecided other-session title keys in this namespace, for suppression only.
+
+    Unlike the model's bounded title context this read has no recency cap. Exact
+    normalized equality only: no fuzzy topic/menu matching across owner boundaries.
+    This is a publication-time snapshot, not atomic cross-session admission.
+    """
+    if store is None or not owner or not owner.get('storedSessionId'):
+        return set()
+    with store._read() as c:
+        rows = c.execute(
+            'SELECT v.body FROM requests r JOIN revisions v '
+            'ON v.namespace=r.namespace AND v.id=r.id AND v.revision=r.revision '
+            "WHERE r.namespace=? AND r.session!=? AND r.state IN ('open','needs_context') "
+            'AND r.resolution IS NULL',
+            (store._ns(owner), owner['storedSessionId'])).fetchall()
+    return {ask_key(json.loads(row[0]).get('title')) for row in rows}
 
 
 def open_asks(store, owner, steps=()) -> list[dict]:

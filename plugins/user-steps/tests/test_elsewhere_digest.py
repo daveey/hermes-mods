@@ -179,3 +179,77 @@ def test_publication_buffer_receives_elsewhere_titles_and_does_not_hold_a_restat
     monkeypatch.setattr(plugin, 'aux_llm', llm)
     assert plugin.publication_buffer(session_id='session-a', platform='desktop', final_response=reply) is None
     assert seen and 'ELSEWHERE' in seen[0] and title in seen[0]
+
+
+def test_exact_elsewhere_title_suppressed_without_model_mapping_beyond_prompt_cap(tmp_path):
+    store, ledger = env(tmp_path)
+    title = 'Approve deploying build 412 to the test environment'
+    original = store.create(OTHER, _approval(OTHER, title))
+    for i in range(35):
+        store.create(OTHER, _approval(OTHER, f'Approve unrelated operation number {i}'))
+    assert title not in core.elsewhere_titles(store, OWNER)
+    before = store.get(OTHER, original['requestId'])
+    sentence = 'Can you approve the deployment described in the other chat?'
+    seen = []
+    out = run(store, ledger, sentence,
+              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}], seen=seen)
+    assert seen and title not in seen[0]
+    assert out['steps'] == []
+    assert titles(store, OWNER) == []
+    assert ledger.read('session-a')['steps'] == []
+    assert '::user-step' not in (out['text'] or '')
+    assert store.get(OTHER, original['requestId']) == before
+    with store._read() as c:
+        assert c.execute('SELECT COUNT(*) FROM operations').fetchone()[0] == 0
+
+
+def test_elsewhere_title_created_during_extraction_is_rechecked(tmp_path):
+    store, ledger = env(tmp_path)
+    title = 'Approve deploying build 412 to the test environment'
+    sentence = title + '?'
+    def llm(system, user):
+        store.create(OTHER, _approval(OTHER, title))
+        return json.dumps({'steps': [{'text': title, 'kind': 'approve',
+                                     'verbatim_span': sentence, 'options': []}], 'resolved': []})
+    out = core.process_reply(sentence, 'session-a', ledger=ledger, action_store=store,
+                             action_owner=OWNER, llm=llm)
+    assert out['steps'] == []
+    assert titles(store, OWNER) == []
+    assert ledger.read('session-a')['steps'] == []
+
+
+def test_exact_elsewhere_evidence_suppressed_without_adopting_owner(tmp_path):
+    store, ledger = env(tmp_path)
+    title = 'Can you approve deploying build 412 to the test environment?'
+    original = store.create(OTHER, _approval(OTHER, title))
+    before = store.get(OTHER, original['requestId'])
+    out = run(store, ledger, title, [{'text': 'Deployment permission for the test environment',
+                                     'kind': 'approve', 'verbatim_span': title, 'options': []}])
+    assert out['steps'] == []
+    assert ledger.read('session-a')['steps'] == []
+    assert titles(store, OWNER) == []
+    assert store.get(OTHER, original['requestId']) == before
+
+
+def test_identical_title_in_other_namespace_does_not_suppress(tmp_path):
+    store, ledger = env(tmp_path)
+    title = 'Approve deploying build 412 to the test environment'
+    for owner in (dict(OTHER, gatewayId='different-gateway'), dict(OTHER, profile='different-profile')):
+        store.create(owner, _approval(owner, title))
+    sentence = title + '?'
+    out = run(store, ledger, sentence,
+              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}])
+    assert len(out['steps']) == 1
+    assert titles(store, OWNER) == [title]
+
+
+def test_retired_elsewhere_title_does_not_suppress(tmp_path):
+    store, ledger = env(tmp_path)
+    title = 'Approve deploying build 412 to the test environment'
+    original = store.create(OTHER, _approval(OTHER, title))
+    store.withdraw(OTHER, original['requestId'], by='agent', reason='No longer needed')
+    sentence = title + '?'
+    out = run(store, ledger, sentence,
+              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}])
+    assert len(out['steps']) == 1
+    assert titles(store, OWNER) == [title]
