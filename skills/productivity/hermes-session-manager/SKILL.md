@@ -76,6 +76,13 @@ say what's running, never what needs the user.
   relevant instead of claiming implementation success. Archiving is not a substitute for this conclusion.
 - Keep genuine unfinished work open. Only irreducible human actions become blocked cards with
   `human_request`; delegated judgment does not supply credentials, physical evidence or extra spend.
+- Verify completion with a fresh `sessions outcome <id> --json` after derivation, not only an immediate
+  `session_outcome` declaration/readback: live card links can restore `waiting`. Trace remote links to the
+  owner's `kanban notify-list <task> --json` and the card's named canonical origin. Remove only a demonstrably
+  obsolete observer via supported `notify-unsubscribe`, sync owner and consumer, then re-read the derived
+  outcome; preserve canonical ownership and unmet acceptance. If a child-context mutation fence refuses the
+  cleanup and no corresponding tool exists, hand the exact operation and evidence to the parent; never route
+  around the fence or edit the subscription database.
 
 ## Archive rule (needs the user's standing approval; record it in memory)
 
