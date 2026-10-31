@@ -33,6 +33,17 @@ resume month monthly /month cost costs spend spending budget dollar dollars per 
 year years two three four five six yes current currently still new old only both each via using use used
 """.split())
 
+# Workflow vocabulary and hardware do not identify a project/subject, even when rare on a board.
+# Apply to subject anchors only: these words may still contribute to coverage after subject relevance.
+_ANCHOR_STOP = set("""
+acceptance action agent amendment approve ask aware baseline block board build budget cap change check code
+cohort condition control cpu current decision deploy diagnostic envelope evidence execution experiment
+fix gate gated gpu headroom implementation independent launch l40s ledger may model new one original parent
+plan proposal readin readiness readines reconciliation repair report request rerun reserv retain review run
+scientific scope selection single stage step subject synthetic task test total train trial
+tune update validation verification verify width work workflow
+""".split())
+
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{8,}\b")
 _DENIAL = re.compile(
     r"\bno\s+(?:sign|evidence|record|trace|indication|mention)s?\b"
@@ -86,11 +97,15 @@ def _rows(db_paths: list[Path], connect: Callable, now: float) -> list[tuple]:
 
 
 def matches(core: Any, query: str, named_text: str = "", exclude: set[str] | None = None,
-            db_paths: list[Path] | None = None, now: float | None = None) -> list[dict]:
+            db_paths: list[Path] | None = None, now: float | None = None,
+            subject: str | None = None) -> list[dict]:
     """Open / recently-done cards on the ask's subject that the ask does not already name, best first."""
     now = time.time() if now is None else now
     q = tokens(core, query)
-    if len(q) < MIN_SHARED:
+    anchors = tokens(core, subject or query) - {core._stem(t) for t in _ANCHOR_STOP}
+    if not anchors:
+        anchors = q - {core._stem(t) for t in _ANCHOR_STOP}
+    if len(q) < MIN_SHARED or not anchors:
         return []
     named = set(_CARD_ID.findall(named_text or "")) | set(_CARD_ID.findall(query or "")) | (exclude or set())
     rows = _rows(db_paths if db_paths is not None else core.boards(), core._ro_connect, now)
@@ -115,6 +130,11 @@ def matches(core: Any, query: str, named_text: str = "", exclude: set[str] | Non
     for r, toks in docs:
         if r[0] in named:
             continue
+        # A long execution brief can share many workflow words with an unrelated ask.
+        # Require a non-workflow subject anchor before scoring; bodies may identify the subject
+        # of a migration whose title uses a different subsystem name.
+        if not anchors & toks:
+            continue
         shared = toks & q
         if len(shared) < MIN_SHARED:
             continue
@@ -136,10 +156,12 @@ def render(core: Any, hits: list[dict]) -> str:
 
 
 def ask_message(core: Any, hits: list[dict]) -> str:
-    return ("ask-gate: superseding_work — this approval ask names none of the open or recently decided cards on "
-            "the same subject:\n" + render(core, hits) + "\nRead each one. If one replaces, changes or makes this "
+    return ("ask-gate: superseding_work — this approval ask leaves these open or recently decided candidates unnamed "
+            "on the same subject:\n" + render(core, hits) + "\nRead each one. If one replaces, changes or makes this "
             "ask moot, say so and ask about that instead (or drop the ask). Otherwise add a line naming each card id "
-            "and why it does not replace this ask, then file it again. This check holds an ask once; it grants no "
+            "and why it does not replace this ask, then file it again. Keep the filing's idempotency key (or title; "
+            "task_id for a block). Reconciliation of this displayed list releases this check even if action/scope "
+            "wording changes; it does not page through more cards. An identical retry also passes. This grants no "
             "approval and changes no task state.")
 
 

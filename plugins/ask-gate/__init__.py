@@ -687,6 +687,8 @@ def _pr_filing_hold(session_id: str, tool_name: str, args: dict, request: dict) 
 
 # Process-local one-shot holds, like _PR_FILING_HELD: a retry of the same ask (or reply) passes this check.
 _SUPERSEDING_HELD: set[tuple[str, str, str]] = set()
+# One bounded candidate snapshot per held draft. Reconciliation names that snapshot, not the next page.
+_SUPERSEDING_ASK_SNAPSHOTS: dict[tuple[str, str, str], list[set[str]]] = {}
 
 
 def _superseding_ask_hold(session_id: str, tool_name: str, args: dict, request: dict) -> dict | None:
@@ -699,17 +701,26 @@ def _superseding_ask_hold(session_id: str, tool_name: str, args: dict, request: 
         named = "\n".join([query, str(args.get("body") or ""), str(args.get("reason") or ""),
                            request["evidence"], request["why_human"]])
         own = {str(x) for x in (args.get("task_id"), os.environ.get("HERMES_KANBAN_TASK")) if x}
-        key = (session_id, tool_name, core.text_hash(query))
-        if key in _SUPERSEDING_HELD:
+        # Reconciliation edits action/scope by design. Keep the presented snapshot at the filing
+        # identity, but do not exempt every future approval on that card/title.
+        filing = (str(args.get("idempotency_key") or args.get("title") or "")
+                  if tool_name == "kanban_create" else str(args.get("task_id") or ""))
+        filing_key = (session_id, tool_name, core.text_hash(filing or query))
+        key = (session_id, tool_name, core.text_hash((filing or "") + "\n" + query))
+        named_ids = set(superseding._CARD_ID.findall(named))
+        reconciled = any(shown <= named_ids for shown in _SUPERSEDING_ASK_SNAPSHOTS.get(filing_key, []))
+        if key in _SUPERSEDING_HELD or reconciled:
             core.log_event("superseding_released", tool=tool_name, session=session_id)
             return None
-        hits = superseding.matches(core, query, named, exclude=own)
+        hits = superseding.matches(core, query, named, exclude=own,
+                                   subject=str(args.get("title") or request["scope"]))
     except Exception as e:
         core.log_event("superseding_error", tool=tool_name, session=session_id, error=repr(e)[:300])
         return None
     if not hits:
         return None
     _SUPERSEDING_HELD.add(key)
+    _SUPERSEDING_ASK_SNAPSHOTS.setdefault(filing_key, []).append({h["id"] for h in hits})
     core.log_event("superseding_held", tool=tool_name, session=session_id,
                    cards=[(h["id"], h["score"]) for h in hits])
     return {"action": "block", "message": superseding.ask_message(core, hits)}

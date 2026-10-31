@@ -309,20 +309,38 @@ Fix (`superseding.py`, deterministic, read-only, fails open):
 - An explicit `human_request` with `interaction: approval` on `kanban_create`/`kanban_block`: topic tokens of title +
   action + scope (hyphen compounds split, ask boilerplate dropped) are scored against every board's open cards and
   cards done in the last 7 days (IDF over that set; >= 3 shared tokens and >= 18% weighted coverage; open cards
-  first, at most 6). Cards the ask already names by id (title, body, reason, evidence, why_human), the card being
-  blocked, and the worker's own card are dropped. Anything left holds the call once with the list ("name each and
-  say why it does not replace this ask"), logged `superseding_held`; a retry of the same ask passes
-  (`superseding_released`).
+  first, at most 6). Before scoring, a candidate must share a non-workflow subject anchor from the ask title
+  (scope when no title; full query when that supplies no informative anchors). CPU/GPU, parent, acceptance,
+  execution, rerun and similar workflow words alone cannot establish relevance. Candidate bodies remain eligible:
+  a migration need not use the same subsystem name in its title.
+- Cards the ask already names by id (title, body, reason, evidence, why_human), the card being blocked, and the
+  worker's own card are dropped. An unnamed list holds once, logged `superseding_held`. The displayed candidate
+  snapshot is retained process-locally by session/tool/filing: create's idempotency key (title fallback), or block's
+  task_id. Naming **all displayed IDs** on that filing releases this lint even after action/scope rewrites; it
+  does not request the next six. An identical draft retry also passes. Independent filings and changed approvals
+  without that reconciliation are still checked. The release (`superseding_released`) does not skip evidence,
+  approval-store, retirement, judge, or core authorization/scientific gates.
 - A final reply or `clarify` question that says "no sign / no evidence / found nothing / hasn't moved" is matched
   (with the user's last message) the same way and held once with the in-flight cards unless it names them.
-- Known cost: on a busy board most approval asks share a subject with something, so expect one hold per approval
-  ask; in a replay of the hub's last approval cards most hits were genuinely related (sibling asks, the migration).
+- Limits: this remains a lexical advisory, not proof of supersession or approval. It can miss work using unrelated
+  terminology. One-shot/snapshot state is process-local; preserve a stable filing identity across rewrites. A
+  restarted process has no prior hold snapshot. Already-imported agent hooks do not hot-reload from a source pull.
 - Kill switch: `ask_gate.superseding_work: false` in config, or env `ASK_GATE_SUPERSEDING_OFF=1`.
 
-Tests: `tests/test_superseding_work.py` (the incident's real create args against a fixture board holding the
-runner-migration card: held on both tools, found on another board, passes once named, passes on retry; an unrelated
-ask, a non-approval interaction, a done card older than 7 days and both kill switches (env, config) are not held; a recent done card
-is; the incident reply, a reply naming the card, a reply without a denial, and a clarify denial).
+Regression root cause: workflow vocabulary could satisfy IDF coverage on busy boards. Following the notice while
+rewriting action/scope changed the exact query hash, and excluding already-named cards revealed the next six.
+The original retry test resubmitted identical arguments with only one relevant candidate, so neither the rewrite
+nor pagination failure was exercised. Fix: distinct subject anchors plus bounded displayed-list reconciliation,
+not a session-wide or task-wide exemption.
+
+Tests: `tests/test_superseding_work.py` retains the original runner-migration create/block, cross-board,
+named-card, retry, recent/old-done, denial/reply/clarify and kill-switch tests.
+`tests/test_superseding_reconciliation.py` adds busy-board generic-overlap negatives, positive contract/body subject
+matches, 14-candidate rewritten reconciliation, and independent new asks (including the same task). It also runs
+real `model_tools.handle_function_call` direct and deferred `tool_call` dispatch through the registered gate hook,
+with unrelated gate dependencies isolated and the execution sink/post-result hooks replaced so no synthetic
+asks reach a live board.
+Run `scripts/test-all -k ask-gate` from the repository root.
 
 ## Approval-store reconciliation adapters
 
