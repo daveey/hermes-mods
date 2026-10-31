@@ -67,6 +67,8 @@ def test_duplicate_event_adopts_owner_and_cli(store, monkeypatch, capsys):
     monkeypatch.setattr(sh, "_store", lambda s=None: store)
     with pytest.raises(ValueError, match="owner"):
         sh.record_event("duplicate", "kanban-test", store=store)
+    # the CLI refuses a fingerprint the lane never filed (f611a578); a real duplicate event follows a filed entry
+    sh.LaneState(store.root).update("kanban-test", status="filed", card="t_12345678")
     assert sh.main(["event", "duplicate", "kanban-test", "--card", "t_12345678", "--owner", "t_abcdef01"]) == 0
     st = sh.LaneState(store.root).get("kanban-test")
     assert st["status"] == "approved" and st["fix_card"] == "t_abcdef01"
