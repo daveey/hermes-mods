@@ -369,7 +369,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             hit = sh.detect_admission(reply, llm=selfheal_llm, threshold=sh.audit_threshold(), tool_log=tool_log,
                                       ask=ask,
                                       confirm=_confirm(sh))
-            sh.handle(hit, session_id, store, evidence=reply[-300:], platform=platform)
+            # A machine signal carries what failed (tool, error line, count): lead with it, then the reply tail.
+            evidence = (f"{hit['evidence'][:300]} | reply: {reply[-180:]}" if hit and hit.get("evidence")
+                        else reply[-300:])
+            sh.handle(hit, session_id, store, evidence=evidence, platform=platform)
         except Exception as exc:
             log.debug("coach self_heal admission: %s", exc)
 

@@ -1723,3 +1723,52 @@ def test_fork_history_is_isolated_from_the_real_fork(tmp_path):
     (736354aa74fa, 2026-10-22 09:16Z) sits inside the NOW window and made the not-adopted digest test skip."""
     assert sh._fork_repo() == tmp_path / "no-fork-repo"
     assert sh.session_commit_fix(defect(at=NOW - 60, host="macbook"), NOW - 60, data=tmp_path) is None
+
+
+# agent-6eb3a51e94: a repeated-tool-error signal adopted an unrelated card the session made next ("Ask Eve: screen-reader
+# label test") as its owner. A signal hit adopts only a card that names its tool or error.
+def _repeat_signal_defect(**kw):
+    log = ["-> kanban_create(title='x', assignee=default)",
+           "   <- ERROR create_overlap: refused, open card t_01a18f450bc2683c covers it"] * 3
+    hit = sh.machine_signal("done", log)
+    d = {**hit, "session_id": "20261022_090000_abcdef", "quote": hit.get("evidence") or "done", "host": "macbook",
+         "at": NOW - 60}
+    d.update(kw)
+    return d
+
+
+def test_signal_hit_does_not_adopt_an_unrelated_session_card(store):
+    r = Runner()
+    cards = [{"id": "t_eve00000", "status": "running", "created_at": NOW - 30, "board": None,
+              "title": "Ask Eve: screen-reader label test"}]
+    out = sh.file_defect(_repeat_signal_defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN,
+                         owner_fn=_owner(cards))
+    assert out["action"] == "filed" and len(r.creates()) == 1
+    assert not ev(store, "selfheal_adopted_owner")
+
+
+def test_signal_hit_adopts_a_session_card_that_names_its_error(store):
+    r = Runner()
+    cards = [{"id": "t_ovl00000", "status": "running", "created_at": NOW - 30, "board": None,
+              "title": "kanban_create keeps refusing with create_overlap"}]
+    out = sh.file_defect(_repeat_signal_defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN,
+                         owner_fn=_owner(cards))
+    assert out["action"] == "skip" and out["card"] == "t_ovl00000" and not r.creates()
+
+
+def test_admission_hook_passes_the_repeated_error_as_evidence(store, monkeypatch):
+    monkeypatch.setenv("COACH_SELFHEAL", "shadow")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    got = []
+    _, hooks = plugin.build(store=store, checkout=None, selfheal_sync=True, selfheal_llm=judge(0.0))
+    monkeypatch.setattr(_hooked_self_heal(plugin), "file_defect", lambda d, store=None, m=None: got.append(d))
+    for _ in range(3):
+        hooks["post_tool_call"](tool_name="terminal", args={"command": "sqlite3 kanban.db 'select 1'"},
+                                result='{"exit_code": 1, "error": "Error: disk I/O error"}', session_id="s1",
+                                status="error", error_message="Error: disk I/O error")
+    hooks["post_llm_call"](session_id="s1", assistant_response="Done; I'll call the job done only when the fleet "
+                                                               "shows a clean trend.")
+    assert len(got) == 1 and got[0]["kind"] == "repeat_failure"
+    assert "disk I/O error" in got[0]["quote"] and "terminal(" in got[0]["quote"]
+    (det,) = ev(store, "selfheal_detect")
+    assert "disk I/O error" in det["evidence"]

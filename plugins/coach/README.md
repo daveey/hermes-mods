@@ -517,6 +517,11 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   tool error repeated 3×). "Interrupted" is read from the start of the reply only (core's placeholders: `Operation interrupted`,
   `turn lease lost`, `Turn stopped by`, `the turn stopped while a tool result was still pending`); the tool log counts
   only for an empty reply whose last line is a cancelled tool, since its `-> tool(args)` lines carry command text.
+  A repeated tool error files as `repeated <tool> error: <normalized error>` (card/session ids, paths, hex and numbers
+  stripped), so each distinct failure is its own fingerprint, and its evidence (the tool, error line, count and last
+  call) leads the defect quote. Owner adoption for any machine signal takes a session card only when its title or
+  body names the tool (unless generic, like `terminal`) or the error's words; otherwise it files
+  (`selfheal_adopt_skipped`). Origin: agent-6eb3a51e94, one fixed label lumped every repeated error together.
   A backend that stops mid-turn never reaches this hook: the next user turn, core's `[System note: Your previous turn
   was interrupted mid-run` resume note, files `turn interrupted (backend stopped)` with the gap since the last activity.
   Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
