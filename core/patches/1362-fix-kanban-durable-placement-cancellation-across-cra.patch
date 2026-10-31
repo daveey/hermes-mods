@@ -1,0 +1,651 @@
+From bd69a5105566c128412c3f37f9a9a1b1dfe609ef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 00:23:07 +0000
+Subject: [PATCH] fix(kanban): durable placement cancellation across crash gap
+ and send failures [daveey]
+
+Archive and manual completion of a placed card now append placement_cancel_intent
+in the same txn as the terminal flip. The dispatcher sweep replays an intent with
+no forward event after it (crash between commit and forward), resends a failed
+archive with capped exponential backoff, and gives up after 7 days with a comment.
+A send that raised is recorded failed instead of lost; a completion whose remote
+copy is already terminal records skipped. Settle completions record no intent and
+are never cancelled. Resends reuse the deterministic hub request id.
+---
+ hermes_cli/kanban_db.py                       |   6 +-
+ hermes_cli/kanban_db_archive.py               |   4 +
+ hermes_cli/kanban_placement_forward.py        | 182 ++++++++--
+ .../test_kanban_placement_cancel.py           | 340 ++++++++++++++++++
+ 4 files changed, 502 insertions(+), 30 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_cancel.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e54d53726ce..0f9fc48ce5f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -30,6 +30,7 @@ from pathlib import Path
+ from typing import Any, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync
++from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_admission import admission_hold_set, claim_transaction, claim_and_open_run
+ from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+@@ -2845,10 +2846,9 @@ def complete_task(
+             conn, task_id, "completed", completion_payload,
+             run_id=run_id,
+         )
++        _placement_fwd.record_cancel_intent(conn, task_id, "completed", settled=placement_settled)  # [daveey]
+     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
+-    if not placement_settled:
+-        from hermes_cli.kanban_placement_forward import forward_completion
+-        forward_completion(conn, task_id)
++    _placement_fwd.forward_completion(conn, task_id, settled=placement_settled)
+     # Success wipes the breaker counter (history stays on the event log).
+     _clear_failure_counter(conn, task_id)
+     recompute_ready(conn)  # separate txn so children see ``done``
+diff --git a/hermes_cli/kanban_db_archive.py b/hermes_cli/kanban_db_archive.py
+index e1a90225d17..88c3cb42e69 100644
+--- a/hermes_cli/kanban_db_archive.py
++++ b/hermes_cli/kanban_db_archive.py
+@@ -45,6 +45,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via:
+         # [daveey] via: archived outside the creator scope; event_extra: e.g. a forwarded run (kanban_owner_archive_relay)
+         payload = {"source_status": row["status"], **({"via": via} if via else {}), **(event_extra or {})}
+         kb._append_event(conn, task_id, "archived", payload, run_id=run_id)
++        # [daveey] Same txn as the flip: a crash before forward_archive below still leaves the cancellation
++        # for the dispatcher sweep (kanban_placement_forward.sweep_unresolved_archives).
++        from hermes_cli.kanban_placement_forward import record_cancel_intent
++        record_cancel_intent(conn, task_id, "archived")
+     if was_running:
+         termination = kb._terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+         with kb.write_txn(conn):
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 0dd5b013501..ba05fe5d6f4 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -42,6 +42,10 @@ CHECK_EVERY = 300
+ AWAIT_BUDGET = 45.0
+ ARCHIVE_AWAIT_BUDGET = 5.0     # archive: wait this long for the target's card id before recording ``unresolved``
+ ARCHIVE_SWEEP_GIVE_UP = 7 * 86400  # the dispatcher sweep stops retrying an ``unresolved`` archive after this
++CANCEL_INTENT = "placement_cancel_intent"  # written in the terminal txn: the placed copy must be cancelled
++INTENT_GRACE = 60.0            # an intent with no forward event this long after it = the forward never ran (crash)
++FAILED_RETRY_BASE = 300.0      # a ``failed`` archive send is retried after 300 s, 600 s, ... capped at FAILED_RETRY_MAX
++FAILED_RETRY_MAX = 6 * 3600.0
+ UNTIL = ("done", "archived")
+ MODULE = "hermes_cli.kanban_placement_forward"
+ 
+@@ -121,6 +125,26 @@ def _archive_events(conn: sqlite3.Connection, task_id: str) -> list:
+     return out
+ 
+ 
++def record_cancel_intent(conn: sqlite3.Connection, task_id: str, reason: str, *, settled: bool = False) -> None:
++    """Inside the caller's terminal write txn (archive / manual completion): record that the placed copy of
++    ``task_id`` must be cancelled. Committed atomically with the status flip, so a crash before the forward runs
++    leaves the intent for :func:`sweep_unresolved_archives` to replay. No-op for a card never forwarded, and for
++    ``settled`` (the forwarder completed it because the copy there is done: nothing to cancel). Never
++    raises: a broken placement record must not roll back the archive/completion it rides on."""
++    if settled:
++        return
++    try:
++        st = state(conn, task_id)
++        if not st or not (st.get("request_id") or st.get("remote_task_id")):
++            return
++        from hermes_cli import kanban_db as kb
++        kb._append_event(conn, task_id, CANCEL_INTENT, {
++            "reason": reason, "gateway": st.get("target"), "request_id": st.get("request_id"),
++            "remote_task_id": st.get("remote_task_id")})
++    except Exception as exc:  # health: allow BLE001 -- the post-commit forward still runs
++        print(f"placement cancel intent for {task_id} not recorded: {exc!r}", file=sys.stderr)
++
++
+ def archive_forward_view(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+     """What ``kanban_archive`` reports about the placed copy of ``task_id``: ``{gateway, task_id, status}`` with
+     status ``archived`` (the target applied the request), ``pending`` (queued or sent, not applied yet) or
+@@ -206,54 +230,152 @@ def forward_archive(conn: sqlite3.Connection, task_id: str, *, runner: Optional[
+         return archive_forward_view(conn, task_id)
+     except Exception as exc:  # health: allow BLE001 -- an archive must never fail on the courtesy forward
+         print(f"placement archive forward failed: {exc!r}", file=sys.stderr)
++        _record_failure(conn, task_id, exc)
++        return None
++
++
++def _record_failure(conn: sqlite3.Connection, task_id: str, exc: BaseException) -> None:
++    """Best effort: a send that raised is ``failed`` (retried by the sweep with backoff), not silently lost."""
++    try:
++        st = state(conn, task_id)
++        if not st:
++            return
++        from hermes_cli import kanban_db as kb
++        with kb.write_txn(conn):
++            kb._append_event(conn, task_id, ARCHIVE_FORWARDED, {
++                "gateway": st.get("target"), "request_id": None, "remote_task_id": st.get("remote_task_id"),
++                "status": "failed", "error": repr(exc)[-300:]})
++    except Exception as exc2:  # health: allow BLE001 -- the cancel intent still drives the sweep's replay
++        print(f"placement archive forward: recording the failure failed: {exc2!r}", file=sys.stderr)
++
++
++def _last_event(conn: sqlite3.Connection, task_id: str, kind: str) -> Optional[tuple]:
++    """``(event id, payload, created_at)`` of the newest ``kind`` event of ``task_id``, else None."""
++    row = conn.execute("SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
++                       "ORDER BY id DESC LIMIT 1", (task_id, kind)).fetchone()
++    if not row:
+         return None
++    try:
++        payload = json.loads(row[1] or "{}")
++    except ValueError:
++        payload = {}
++    return int(row[0]), payload if isinstance(payload, dict) else {}, float(row[2] or 0)
++
++
++def _first_event_ts(conn: sqlite3.Connection, task_id: str, kind: str) -> float:
++    row = conn.execute("SELECT MIN(created_at) FROM task_events WHERE task_id = ? AND kind = ?",
++                       (task_id, kind)).fetchone()
++    return float(row[0] or 0) if row else 0.0
++
++
++def _failures_since(conn: sqlite3.Connection, task_id: str, after_id: int) -> int:
++    n = 0
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND id > ?",
++                               (task_id, ARCHIVE_FORWARDED, after_id)).fetchall():
++        try:
++            n += json.loads(raw or "{}").get("status") == "failed"
++        except (ValueError, AttributeError):
++            continue
++    return n
++
++
++def _give_up(conn: sqlite3.Connection, task_id: str, payload: dict, gw: str, why: str) -> None:
++    from hermes_cli import kanban_db as kb
++    days = ARCHIVE_SWEEP_GIVE_UP // 86400
++    with kb.write_txn(conn):
++        kb._append_event(conn, task_id, ARCHIVE_FORWARDED, {
++            **payload, "gateway": gw, "status": "expired",
++            "note": f"{why} for {days} days; stopped retrying the archive."})
++    kb.add_comment(conn, task_id, "placement",
++                   f"Placement archive forward gave up: {why} for {days} days after this card was closed, so no "
++                   f"copy was archived there. If one appears later, archive it with `hermes-hub tasks --gw {gw}`.")
++
++
++def _sent(view: Optional[dict]) -> bool:
++    return bool(view) and view.get("status") in ("pending", "archived")
+ 
+ 
+ def sweep_unresolved_archives(conn: sqlite3.Connection, *, now: Optional[float] = None,
+                               runner: Optional[Callable] = None) -> list[str]:
+-    """Dispatcher tick: send the archive for each archived/done card whose last ``placement_archive_forwarded`` is
+-    ``unresolved`` once the target's card id reached this gateway's hub replica (no waiting here: the tick reads
+-    the replica only). A card still unresolved after :data:`ARCHIVE_SWEEP_GIVE_UP` gets an ``expired`` event and
+-    a comment, and is not swept again. Returns the ids whose archive request was sent."""
++    """Dispatcher tick: drive the cancellation of every archived/done card's placed copy to a closed state.
++
++    * ``unresolved`` (the target had not made the card): send the archive once the target's card id reached this
++      gateway's hub replica (no waiting here: the tick reads the replica only).
++    * ``failed`` (the send was refused or raised): resend after :data:`FAILED_RETRY_BASE` seconds, doubling per
++      failure up to :data:`FAILED_RETRY_MAX`.
++    * a :data:`CANCEL_INTENT` with no forward event after it, older than :data:`INTENT_GRACE`: the process died
++      between the terminal commit and the forward. Replay it: an archive forwards the archive, a manual completion
++      reruns :func:`forward_completion` (a copy already done/archived there is left alone).
++
++    ``pending``/``archived``/``expired``/``skipped`` are closed. An open cancellation that still fails one more
++    try :data:`ARCHIVE_SWEEP_GIVE_UP` after its intent (legacy cards without one: after their first forward event)
++    gets an ``expired`` event and a comment, and is not swept again. Resends reuse the card's hub request id
++    (:func:`_archive_request_id`), so a replay racing the original forward is applied once. Returns the ids whose
++    archive request was sent."""
+     now = time.time() if now is None else now
+     rows = conn.execute(
+         "SELECT t.id FROM tasks t WHERE t.status IN ('archived', 'done') AND EXISTS "
+-        "(SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = ?)", (ARCHIVE_FORWARDED,)).fetchall()
++        "(SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind IN (?, ?))",
++        (ARCHIVE_FORWARDED, CANCEL_INTENT)).fetchall()
+     sent: list[str] = []
+     for (task_id,) in rows:
+-        last = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+-                            "ORDER BY id DESC LIMIT 1", (task_id, ARCHIVE_FORWARDED)).fetchone()
+-        try:
+-            payload = json.loads(last[0] or "{}")
+-        except ValueError:
++        intent = _last_event(conn, task_id, CANCEL_INTENT)
++        last = _last_event(conn, task_id, ARCHIVE_FORWARDED)
++        status = last[1].get("status") if last else None
++        if status in ("pending", "archived", "expired"):
++            continue  # closed; one archive request per card covers a later intent too
++        if intent and (last is None or last[0] < intent[0]):
++            # Crash gap: the terminal txn committed, the forward recorded nothing after it. Always try first: a
++            # dispatcher that was down past the give-up still sends once it is back.
++            age = now - intent[2]
++            if age < INTENT_GRACE:
++                continue  # the closing process may still be forwarding
++            if intent[1].get("reason") == "completed":
++                view = forward_completion(conn, task_id, runner=runner)
++            else:
++                view = forward_archive(conn, task_id, runner=runner, await_budget=0)
++            if _sent(view):
++                sent.append(task_id)
++            elif age >= ARCHIVE_SWEEP_GIVE_UP and _last_event(conn, task_id, ARCHIVE_FORWARDED) == last:
++                gw = intent[1].get("gateway") or "the target"
++                _give_up(conn, task_id, {}, gw, f"the cancellation of the copy on {gw} never ran")
+             continue
+-        if payload.get("status") != "unresolved":
++        if last is None or status not in ("unresolved", "failed"):
++            continue  # ``skipped``: the copy there was already terminal
++        payload = last[1]
++        gw = payload.get("gateway") or "the target"
++        # The clock never moves with retries: the intent, else (legacy) the first forward event.
++        clock = intent[2] if intent else _first_event_ts(conn, task_id, ARCHIVE_FORWARDED)
++        expired = now - clock >= ARCHIVE_SWEEP_GIVE_UP
++        if status == "failed":
++            n = _failures_since(conn, task_id, intent[0] if intent else 0)
++            if not expired and now - last[2] < min(FAILED_RETRY_BASE * 2 ** max(n - 1, 0), FAILED_RETRY_MAX):
++                continue
++            if _sent(forward_archive(conn, task_id, runner=runner, await_budget=0)):
++                sent.append(task_id)
++            elif expired:  # one last try failed too
++                _give_up(conn, task_id, payload, gw, f"sending the archive to {gw} kept failing ({n + 1} times)")
+             continue
+         if forward_archive(conn, task_id, runner=runner, await_budget=0, record_unresolved=False) is not None:
+             sent.append(task_id)
+             continue
+-        if now - float(last[1] or 0) < ARCHIVE_SWEEP_GIVE_UP:
+-            continue
+-        from hermes_cli import kanban_db as kb
+-        gw = payload.get("gateway") or "the target"
+-        days = ARCHIVE_SWEEP_GIVE_UP // 86400
+-        with kb.write_txn(conn):
+-            kb._append_event(conn, task_id, ARCHIVE_FORWARDED, {
+-                **payload, "status": "expired",
+-                "note": f"{gw} never made the card for this request in {days} days; stopped retrying the archive."})
+-        kb.add_comment(conn, task_id, "placement",
+-                       f"Placement archive forward gave up: {gw} still had no card for request "
+-                       f"{payload.get('request_id') or '?'} {days} days after this card was archived, so no copy "
+-                       f"was archived there. If one appears later, archive it with `hermes-hub tasks --gw {gw}`.")
++        if expired:
++            _give_up(conn, task_id, payload, gw,
++                     f"{gw} never made the card for request {payload.get('request_id') or '?'}")
+     return sent
+ 
+ 
+-def forward_completion(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++def forward_completion(conn: sqlite3.Connection, task_id: str, *, runner: Optional[Callable] = None,
++                       settled: bool = False) -> Optional[dict]:
+     """Manual origin completion cancels outstanding placed work, never completes it as successful.
+ 
+     Reuse archive's durable queue and audit event. Unknown/offline observations still send;
+-    only a confirmed terminal copy is left untouched. Called after local completion commits.
++    only a confirmed terminal copy is left untouched (recorded ``skipped``, which closes the
++    completion's cancel intent). Called after local completion commits, and by the sweep's replay.
++    ``settled`` (the forwarder's own completion: the copy there is done) forwards nothing.
+     """
++    if settled:
++        return None
+     try:
+         st = state(conn, task_id)
+         if not st or not (st.get("request_id") or st.get("remote_task_id")):
+@@ -267,12 +389,18 @@ def forward_completion(conn: sqlite3.Connection, task_id: str) -> Optional[dict]
+                 rc, out = replica.check(st["target"], rtid, until=UNTIL)
+                 words = (out or "").split()
+                 if rc == 0 and len(words) >= 2 and words[0] == rtid and words[1] in UNTIL:
++                    from hermes_cli import kanban_db as kb
++                    with kb.write_txn(conn):  # closes the cancel intent: nothing to cancel there
++                        kb._append_event(conn, task_id, ARCHIVE_FORWARDED, {
++                            "gateway": st["target"], "request_id": None, "remote_task_id": rtid,
++                            "status": "skipped", "note": f"{rtid} was already {words[1]} on {st['target']}"})
+                     return None
+             except Exception as exc:  # health: allow BLE001 -- unavailable observation must not prevent durable cancellation
+                 print(f"placement completion observation failed; forwarding archive: {exc!r}", file=sys.stderr)
+-        return forward_archive(conn, task_id, await_budget=0)
++        return forward_archive(conn, task_id, runner=runner, await_budget=0)
+     except Exception as exc:  # health: allow BLE001 -- courtesy forwarding must not undo a committed completion
+         print(f"placement completion forward failed: {exc!r}", file=sys.stderr)
++        _record_failure(conn, task_id, exc)
+         return None
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_placement_cancel.py b/tests/hermes_cli/test_kanban_placement_cancel.py
+new file mode 100644
+index 00000000000..b236a3724ae
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_cancel.py
+@@ -0,0 +1,340 @@
++"""Durable cancellation of a placed copy: crash gap, send failures, settle. [daveey]
++
++Archiving or manually completing a card that placement forwarded to another gateway must cancel (archive)
++the copy there. ``placement_cancel_intent`` is written in the same txn as the terminal flip, and the
++dispatcher sweep (:func:`kanban_placement_forward.sweep_unresolved_archives`) replays a forward that never
++ran, resends a failed one with backoff, and gives up after a bounded time. A successful settle never cancels.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from tests.hermes_cli.test_kanban_placement import (
++    HUB_TID, _archive_requests, _forwarded_card, _forwarder, _unresolved_forwarded_card,
++)
++
++pytest_plugins = ["tests.hermes_cli.test_kanban_placement"]  # its ``mac`` fixture (fake hub + board)
++
++
++class _Crash(BaseException):
++    """The process dies right after the terminal txn committed (before the forward recorded anything)."""
++
++
++def _crash_in(monkeypatch, name):
++    from hermes_cli import kanban_placement_forward as kpf
++    real = getattr(kpf, name)
++    armed = {"on": True}
++
++    def crashing(*a, **kw):
++        if armed["on"]:
++            armed["on"] = False
++            raise _Crash(name)
++        return real(*a, **kw)
++
++    monkeypatch.setattr(kpf, name, crashing)
++
++
++def _kinds(conn, tid):
++    return [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
++
++
++def _statuses(conn, tid):
++    from hermes_cli import kanban_placement_forward as kpf
++    return [e["status"] for e in kpf._archive_events(conn, tid)]
++
++
++@pytest.mark.parametrize("rc", [0, 3])
++def test_crash_after_archive_commit_is_replayed_by_the_sweep_once(mac, monkeypatch, rc):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        _crash_in(monkeypatch, "forward_archive")
++        with pytest.raises(_Crash):
++            kb.archive_task(conn, child)
++    # Restart: a fresh connection sees the committed archive + intent, and no forward.
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, child).status == "archived"
++        assert kpf.CANCEL_INTENT in _kinds(conn, child) and _statuses(conn, child) == []
++        assert kpf.sweep_unresolved_archives(conn) == []  # inside the grace: the closer may still be forwarding
++        assert _archive_requests(mac) == []
++        mac["result"]["rc"] = rc
++        later = time.time() + kpf.INTENT_GRACE + 1
++        assert kpf.sweep_unresolved_archives(conn, now=later) == [child]
++        assert kpf.archive_forward_view(conn, child)["status"] == "pending"
++        assert kpf.sweep_unresolved_archives(conn, now=later + 3600) == []  # idempotent
++    sent = _archive_requests(mac)
++    assert len(sent) == 1 and sent[0][1:6] == ["request", "hub", "tasks", f"default/default/{HUB_TID}", "archive"]
++    rid = sent[0][sent[0].index("--id") + 1]
++    assert mac["hub"].execute("SELECT state FROM sent WHERE id=?", (rid,)).fetchone()[0] == "sent"
++
++
++def test_archive_without_crash_is_not_resent_by_the_sweep(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        assert kb.archive_task(conn, child)
++        assert kpf.sweep_unresolved_archives(conn, now=time.time() + 86400) == []
++    assert len(_archive_requests(mac)) == 1
++
++
++def test_completion_then_archive_sends_one_request(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        assert kb.complete_task(conn, child, summary="Manual", force=True)
++        assert kb.archive_task(conn, child)
++        assert _kinds(conn, child).count(kpf.CANCEL_INTENT) == 2
++        for dt in (kpf.INTENT_GRACE + 1, 86400, 8 * 86400):
++            assert kpf.sweep_unresolved_archives(conn, now=time.time() + dt) == []
++        assert _statuses(conn, child) == ["pending"]
++    assert len(_archive_requests(mac)) == 1
++
++
++@pytest.mark.parametrize("rc", [0, 3])
++def test_crash_after_manual_completion_with_delayed_create_cancels_the_late_copy(mac, monkeypatch, rc):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child, rid = _unresolved_forwarded_card(mac, monkeypatch, conn)
++        assert kb.unblock_task(conn, child)
++        _crash_in(monkeypatch, "forward_completion")
++        with pytest.raises(_Crash):
++            kb.complete_task(conn, child, summary="Manual override", force=True)
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, child).status == "done"
++        later = time.time() + kpf.INTENT_GRACE + 1
++        # Replay: the target still has no card, so the cancellation is recorded unresolved, not dropped.
++        assert kpf.sweep_unresolved_archives(conn, now=later) == []
++        assert _statuses(conn, child) == ["unresolved"]
++        assert kpf.sweep_unresolved_archives(conn, now=later + 60) == []
++        assert _archive_requests(mac) == []
++        # The queued create executes late on the target; the next tick cancels that copy.
++        mac["hub"].execute("UPDATE sent SET state='done', result=? WHERE id=?",
++                           (json.dumps({"ok": True, "task_id": "t_hub0001", "status": "ready"}), rid))
++        mac["hub"].commit()
++        mac["result"]["rc"] = rc
++        assert kpf.sweep_unresolved_archives(conn, now=later + 120) == [child]
++        assert kpf.sweep_unresolved_archives(conn, now=later + 180) == []
++    sent = _archive_requests(mac)
++    assert len(sent) == 1 and sent[0][1:6] == ["request", "hub", "tasks", "default/default/t_hub0001", "archive"]
++
++
++def test_crash_after_manual_completion_of_a_running_copy_cancels_it(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from hermes_cli import kanban_wait_replica as replica
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        _crash_in(monkeypatch, "forward_completion")
++        with pytest.raises(_Crash):
++            kb.complete_task(conn, child, summary="Manual", force=True)
++        monkeypatch.setattr(replica, "check", lambda *a, **kw: (1, f"{HUB_TID} running"))
++        assert kpf.sweep_unresolved_archives(conn, now=time.time() + kpf.INTENT_GRACE + 1) == [child]
++        assert _statuses(conn, child) == ["pending"]
++    assert len(_archive_requests(mac)) == 1
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_completion_replay_leaves_a_terminal_remote_copy_alone(mac, monkeypatch, status):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from hermes_cli import kanban_wait_replica as replica
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        _crash_in(monkeypatch, "forward_completion")
++        with pytest.raises(_Crash):
++            kb.complete_task(conn, child, summary="Manual", force=True)
++        monkeypatch.setattr(replica, "check", lambda *a, **kw: (0, f"{HUB_TID} {status}"))
++        later = time.time() + kpf.INTENT_GRACE + 1
++        assert kpf.sweep_unresolved_archives(conn, now=later) == []
++        assert _statuses(conn, child) == ["skipped"]
++        assert kpf.sweep_unresolved_archives(conn, now=later + 86400) == []
++        assert _statuses(conn, child) == ["skipped"]
++    assert mac["calls"] == []
++
++
++def test_settle_completion_records_no_cancel_intent_and_sweep_never_cancels(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        assert _forwarder(conn, child, mac, monkeypatch, check=(0, f"{HUB_TID} done")).run() == "completed"
++        assert kpf.CANCEL_INTENT not in _kinds(conn, child)
++        for dt in (kpf.INTENT_GRACE + 1, 86400, 8 * 86400):
++            assert kpf.sweep_unresolved_archives(conn, now=time.time() + dt) == []
++        assert _statuses(conn, child) == []
++    assert mac["calls"] == []
++
++
++def test_a_broken_placement_record_never_blocks_the_archive(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        real_state = kpf.state
++        calls = {"n": 0}
++
++        def flaky_state(c, tid):
++            calls["n"] += 1
++            if calls["n"] == 1:  # the in-txn intent read
++                raise RuntimeError("corrupt placement record")
++            return real_state(c, tid)
++
++        monkeypatch.setattr(kpf, "state", flaky_state)
++        assert kb.archive_task(conn, child)
++        assert kb.get_task(conn, child).status == "archived"
++        assert kpf.CANCEL_INTENT not in _kinds(conn, child)
++        assert _statuses(conn, child) == ["pending"]  # the post-commit forward still ran
++
++
++def test_failed_archive_send_is_retried_with_backoff_until_it_is_queued(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        mac["result"]["rc"] = 1
++        assert kb.archive_task(conn, child)
++        t0 = time.time()
++        assert _statuses(conn, child) == ["failed"]
++        assert kpf.sweep_unresolved_archives(conn, now=t0 + 10) == []  # backoff
++        assert len(_archive_requests(mac)) == 1
++        # Second attempt: the hub client itself raises (e.g. missing binary): recorded failed, not lost.
++        real = kp.hub_runner
++        monkeypatch.setattr(kp, "hub_runner", lambda argv: (_ for _ in ()).throw(OSError("no hermes-hub")))
++        assert kpf.sweep_unresolved_archives(conn, now=t0 + kpf.FAILED_RETRY_BASE + 1) == []
++        events = kpf._archive_events(conn, child)
++        assert [e["status"] for e in events] == ["failed", "failed"] and "no hermes-hub" in events[-1]["error"]
++        monkeypatch.setattr(kp, "hub_runner", real)
++        mac["result"]["rc"] = 0
++        # Two failures: the next retry waits 2x the base.
++        assert kpf.sweep_unresolved_archives(conn, now=t0 + kpf.FAILED_RETRY_BASE * 2 - 30) == []
++        assert kpf.sweep_unresolved_archives(conn, now=t0 + kpf.FAILED_RETRY_BASE * 2 + 30) == [child]
++        assert kpf.archive_forward_view(conn, child)["status"] == "pending"
++        assert kpf.sweep_unresolved_archives(conn, now=t0 + 86400) == []
++    assert len(_archive_requests(mac)) == 2
++
++
++def test_failed_retry_backoff_is_capped(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        mac["result"]["rc"] = 1
++        assert kb.archive_task(conn, child)
++        for _ in range(9):  # 10 failures: uncapped backoff would be 300 * 2**9 s (~43 h)
++            kpf.sweep_unresolved_archives(conn, now=time.time() + kpf.FAILED_RETRY_MAX + 1)
++        assert _statuses(conn, child).count("failed") == 10
++        mac["result"]["rc"] = 0
++        assert kpf.sweep_unresolved_archives(conn, now=time.time() + kpf.FAILED_RETRY_MAX - 60) == []
++        assert kpf.sweep_unresolved_archives(conn, now=time.time() + kpf.FAILED_RETRY_MAX + 1) == [child]
++
++
++def test_completion_send_exception_is_recorded_failed_and_retried(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child, rid = _unresolved_forwarded_card(mac, monkeypatch, conn)
++        kb.unblock_task(conn, child)
++        real = kp.remote_task_id
++        monkeypatch.setattr(kp, "remote_task_id", lambda r: (_ for _ in ()).throw(OSError("replica unreadable")))
++        assert kb.complete_task(conn, child, summary="Manual", force=True)
++        assert kb.get_task(conn, child).status == "done"
++        events = kpf._archive_events(conn, child)
++        assert [e["status"] for e in events] == ["failed"] and "replica unreadable" in events[0]["error"]
++        monkeypatch.setattr(kp, "remote_task_id", real)
++        mac["hub"].execute("UPDATE sent SET state='done', result=? WHERE id=?",
++                           (json.dumps({"ok": True, "task_id": "t_hub0001", "status": "ready"}), rid))
++        mac["hub"].commit()
++        assert kpf.sweep_unresolved_archives(conn, now=time.time() + kpf.FAILED_RETRY_BASE + 1) == [child]
++    assert len(_archive_requests(mac)) == 1
++
++
++def test_failed_archive_send_tries_once_more_then_gives_up_after_seven_days(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        mac["result"]["rc"] = 1
++        assert kb.archive_task(conn, child)
++        assert kpf.sweep_unresolved_archives(conn, now=time.time() + kpf.ARCHIVE_SWEEP_GIVE_UP + 60) == []
++        assert _statuses(conn, child) == ["failed", "failed", "expired"]
++        assert any("kept failing" in c.body for c in kb.list_comments(conn, child))
++        kpf.sweep_unresolved_archives(conn, now=time.time() + 30 * 86400)
++        assert len(_statuses(conn, child)) == 3
++    assert len(_archive_requests(mac)) == 2
++
++
++def test_legacy_failed_without_intent_gives_up_on_its_first_event_clock(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        mac["result"]["rc"] = 1
++        assert kb.archive_task(conn, child)
++        conn.execute("DELETE FROM task_events WHERE task_id=? AND kind=?", (child, kpf.CANCEL_INTENT))
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind=?",
++                     (int(time.time() - 8 * 86400), child, kpf.ARCHIVE_FORWARDED))
++        conn.commit()
++        kpf._record_failure(conn, child, OSError("still down"))  # a retry that failed just now
++        # A last-event clock would never expire while retries keep failing; the first event's does.
++        assert kpf.sweep_unresolved_archives(conn) == []
++        assert _statuses(conn, child) == ["failed", "failed", "failed", "expired"]
++
++
++def test_crash_gap_after_a_long_outage_still_sends_before_giving_up(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        _crash_in(monkeypatch, "forward_archive")
++        with pytest.raises(_Crash):
++            kb.archive_task(conn, child)
++        far = time.time() + kpf.ARCHIVE_SWEEP_GIVE_UP + 60
++        assert kpf.sweep_unresolved_archives(conn, now=far) == [child]
++        assert _statuses(conn, child) == ["pending"]
++    assert len(_archive_requests(mac)) == 1
++
++
++def test_crash_gap_gives_up_after_seven_days_when_every_try_fails(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        _crash_in(monkeypatch, "forward_archive")
++        with pytest.raises(_Crash):
++            kb.archive_task(conn, child)
++        mac["result"]["rc"] = 1
++        far = time.time() + kpf.ARCHIVE_SWEEP_GIVE_UP + 60
++        assert kpf.sweep_unresolved_archives(conn, now=far) == []
++        assert _statuses(conn, child) == ["failed"]
++        assert kpf.sweep_unresolved_archives(conn, now=far + 1) == []
++        assert _statuses(conn, child) == ["failed", "failed", "expired"]
++        assert kpf.sweep_unresolved_archives(conn, now=far + 30 * 86400) == []
++        assert len(_statuses(conn, child)) == 3
+-- 
+2.55.0
+

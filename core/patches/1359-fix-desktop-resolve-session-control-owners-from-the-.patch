@@ -1,0 +1,442 @@
+From 6c2d635aaa1f56403d22dc19529911a1d0948104 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 16:26:51 -0700
+Subject: [PATCH] fix(desktop): resolve session-control owners from the project
+ tree; re-read after an owner miss [daveey]
+
+"Session controls unavailable: Session owner could not be resolved (session.control.read)"
+stayed on a resumed day-old local chat (20261029_140918_f8947c, 10-30 15:57 PT). After the
+restart its only loaded row was the sidebar project tree: the resume found the owner there
+(cachedSessionRow reads the tree), but the sync owner ladder (ownerLookupSessionRows) never
+looked at the tree, a local-primary bare-profile owner is not hinted, and primary events are
+untagged, so the composer's read failed closed and was never retried.
+
+- ownerLookupSessionRows includes project-tree rows (same owner stamps), memoized by input
+  identity.
+- An owner-resolution miss in refreshSessionControl arms a local re-check (owner-bearing
+  atoms + 2 s poll, 15 min cap) that re-reads once the owner ladder resolves. Nothing is
+  sent while unresolved: still fail-closed, no ambient fallback.
+- Owner misses (read and action) and the later recovery log to desktop.log.
+---
+ .../src/store/session-control-owner.test.ts   | 121 +++++++++++++++
+ apps/desktop/src/store/session-control.ts     | 144 +++++++++++++++++-
+ apps/desktop/src/store/session.ts             |  55 ++++++-
+ 3 files changed, 313 insertions(+), 7 deletions(-)
+ create mode 100644 apps/desktop/src/store/session-control-owner.test.ts
+
+diff --git a/apps/desktop/src/store/session-control-owner.test.ts b/apps/desktop/src/store/session-control-owner.test.ts
+new file mode 100644
+index 00000000000..75cfa67a241
+--- /dev/null
++++ b/apps/desktop/src/store/session-control-owner.test.ts
+@@ -0,0 +1,121 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { $gateway, setPrimaryGateway, setPrimaryGatewayConnection } from '@/store/gateway'
++import { $profiles } from '@/store/profile'
++import { $projectTree } from '@/store/project-tree'
++import { _resetSessionOwnerHintsForTests, setSessions } from '@/store/session'
++import { $sessionControlBySession, clearAllSessionControl, refreshSessionControl } from '@/store/session-control'
++import { $sessionTiles, clearAllSessionStates, publishSessionState } from '@/store/session-states'
++import { makeSessionInfo } from '@/test/session-info'
++
++// 2026-10-30 15:57 PT, chat 20261029_140918_f8947c: after a Desktop restart a
++// day-old LOCAL chat was resumed into main. Its only loaded row was the
++// sidebar project tree (the capped recents page no longer held it), the resume
++// cached that row (open-timing owner stage 22 ms) but persisted no hint (a
++// local-primary untagged row resolves to a bare profile, which is not
++// hinted), and primary events are untagged, so no runtime owner either. The
++// composer's session.control.read then failed closed with
++// "Session owner could not be resolved" and the banner stayed for the chat's
++// life, although the owner was sitting in the tree row.
++
++const CONTROL = { goal: null, heartbeat: null, loop: null, revision: 'r1', updated_at: 1 }
++
++function treeWith(rows: ReturnType<typeof makeSessionInfo>[]) {
++  return [{ id: 'home', isNoProject: true, label: 'Home', path: null, previewSessions: rows, repos: [], sessionCount: 1 }]
++}
++
++describe('session.control.read owner resolution for a resumed chat (t_01a18f128c7f815c)', () => {
++  const primaryRequest = vi.fn(async (method: string) =>
++    method === 'session.control.read' ? { control: CONTROL } : { ok: true }
++  )
++
++  const ambientRequest = vi.fn(async () => ({ control: CONTROL }))
++  const logLine = vi.fn()
++
++  beforeEach(() => {
++    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
++      connections: { list: async () => null },
++      logLine
++    }
++    $connectionsRegistry.set({
++      activeConnectionId: 'local',
++      connections: [
++        { id: 'local', kind: 'local', label: 'Local' },
++        { id: 'mac-mini', kind: 'remote', label: 'mini' }
++      ],
++      primary: 'local'
++    } as never)
++    $profiles.set([{ name: 'default' }, { name: 'omar' }] as never)
++    setPrimaryGateway({ onEvent: () => () => undefined, request: primaryRequest, state: 'open' } as never, 'default')
++    setPrimaryGatewayConnection({ connectionId: 'local' })
++    $gateway.set({ request: ambientRequest } as never)
++    // The resume binds the main-pane runtime to its stored id (state mirror).
++    publishSessionState('rt-main', createClientSessionState('stored-old'))
++  })
++
++  afterEach(() => {
++    vi.useRealTimers()
++    primaryRequest.mockClear()
++    ambientRequest.mockClear()
++    logLine.mockClear()
++    clearAllSessionControl()
++    clearAllSessionStates()
++    $sessionTiles.set([])
++    $projectTree.set([])
++    setSessions([])
++    $profiles.set([])
++    $gateway.set(null as never)
++    setPrimaryGateway(null)
++    $connectionsRegistry.set(null)
++    _resetSessionOwnerHintsForTests({ storage: true })
++    delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
++  })
++
++  it('routes the read by the project-tree row when the chat is outside the loaded recents page', async () => {
++    $projectTree.set(treeWith([makeSessionInfo({ id: 'stored-old', profile: 'default' })]) as never)
++
++    await refreshSessionControl('rt-main')
++
++    expect($sessionControlBySession.get()['rt-main']).toMatchObject({ capability: 'supported', error: null })
++    expect(primaryRequest).toHaveBeenCalledWith('session.control.read', { session_id: 'rt-main' })
++    expect(ambientRequest).not.toHaveBeenCalled()
++  })
++
++  it('fails closed and logs while the owner is unknown, then re-reads once the owner row lands', async () => {
++    // Read before the sidebar has loaded any row for the chat (boot race).
++    await refreshSessionControl('rt-main')
++
++    const failed = $sessionControlBySession.get()['rt-main']
++    expect(failed?.error).toMatch(/Session owner could not be resolved/)
++    // Fail closed: nothing was sent on any socket, least of all the ambient one.
++    expect(primaryRequest).not.toHaveBeenCalled()
++    expect(ambientRequest).not.toHaveBeenCalled()
++    // The miss leaves a trace in desktop.log.
++    expect(logLine).toHaveBeenCalledWith(expect.stringMatching(/\[session-control\].*owner unresolved.*rt-main/))
++
++    // The owner row arrives (sidebar list / project tree refresh).
++    setSessions([makeSessionInfo({ id: 'stored-old', profile: 'default' })])
++
++    await vi.waitFor(() => {
++      expect($sessionControlBySession.get()['rt-main']).toMatchObject({ capability: 'supported', error: null })
++    })
++    expect(primaryRequest).toHaveBeenCalledWith('session.control.read', { session_id: 'rt-main' })
++    expect(ambientRequest).not.toHaveBeenCalled()
++  })
++
++  it('keeps failing closed while the owner stays unresolvable', async () => {
++    vi.useFakeTimers()
++    await refreshSessionControl('rt-main')
++    // Unrelated sidebar churn that names no owner for this chat.
++    setSessions([makeSessionInfo({ id: 'someone-else', profile: 'omar' })])
++    await vi.advanceTimersByTimeAsync(30_000)
++
++    expect($sessionControlBySession.get()['rt-main']?.error).toMatch(/Session owner could not be resolved/)
++    expect(primaryRequest).not.toHaveBeenCalled()
++    expect(ambientRequest).not.toHaveBeenCalled()
++    // One log line per miss, not one per retry check.
++    expect(logLine).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/apps/desktop/src/store/session-control.ts b/apps/desktop/src/store/session-control.ts
+index 0046d47826f..d95bb7db439 100644
+--- a/apps/desktop/src/store/session-control.ts
++++ b/apps/desktop/src/store/session-control.ts
+@@ -1,11 +1,33 @@
+ import { JsonRpcGatewayError } from '@hermes/shared'
+ import { atom } from 'nanostores'
+ 
++import { $connectionsRegistry } from './connection-registry-state'
+ import { $gateway } from './gateway'
+ import { refreshSessionGoal } from './goals'
++import { $profiles } from './profile'
++import { $projectTree } from './project-tree'
+ import { isSessionGone, isSessionGoneForBackgroundPolling, markSessionGone } from './runtime-gone'
++import {
++  $activeSessionId,
++  $cronSessions,
++  $messagingSessions,
++  $selectedStoredSessionId,
++  $sessions,
++  $unlistedSessionOwnerRows
++} from './session'
+ import { ambientRequestFor } from './session-gone-latch'
+-import { requestForOwnedSession } from './session-states'
++import {
++  ambientGatewayOwnsEverySession,
++  isSessionOwnerResolutionError,
++  sessionOwnerIsKnown
++} from './session-owner-resolution'
++import {
++  $sessionStates,
++  $sessionTiles,
++  knownOwnerForSession,
++  requestForOwnedSession,
++  storedSessionIdForRuntimeId
++} from './session-states'
+ 
+ export type SessionControlGoalStatus = 'active' | 'done' | 'paused'
+ export type SessionControlLoopMode = 'interval' | 'self_paced'
+@@ -143,6 +165,13 @@ const ERROR_LIMIT = 240
+ const versions = new Map<string, number>()
+ const eventVersions = new Map<string, number>()
+ 
++// An owner miss re-reads once the owner becomes resolvable (t_01a18f128c7f815c).
++// Owner-bearing atoms give the immediate signal; the poll is a local-only
++// backstop for rungs with no atom (owner hints, event-proven runtime owners).
++const OWNER_RETRY_POLL_MS = 2_000
++const OWNER_RETRY_MAX_MS = 15 * 60_000
++const ownerRetries = new Map<string, () => void>()
++
+ export const $sessionControlBySession = atom<Record<string, SessionControlEntry>>({})
+ 
+ function isRecord(value: unknown): value is UnknownRecord {
+@@ -607,6 +636,7 @@ export function clearSessionControl(sessionId: string): void {
+   }
+ 
+   advanceVersion(sessionId)
++  disarmOwnerRetry(sessionId)
+   const entries = $sessionControlBySession.get()
+ 
+   if (!(sessionId in entries)) {
+@@ -628,6 +658,10 @@ export function clearAllSessionControl(): void {
+     advanceVersion(sessionId)
+   }
+ 
++  for (const sessionId of [...ownerRetries.keys()]) {
++    disarmOwnerRetry(sessionId)
++  }
++
+   $sessionControlBySession.set({})
+   versions.clear()
+   eventVersions.clear()
+@@ -702,6 +736,105 @@ function publishFailure(sessionId: string, token: number, error: unknown, clearP
+   })
+ }
+ 
++function logLine(line: string): void {
++  try {
++    console.warn(line)
++    window.hermesDesktop?.logLine?.(line)
++  } catch {
++    // logging must never break a control read
++  }
++}
++
++/** desktop.log trace for an owner miss: the screenshot-only banner of
++ *  t_01a18f128c7f815c left nothing to diagnose from. */
++function logOwnerMiss(sessionId: string, method: string): void {
++  const stored = storedSessionIdForRuntimeId(sessionId)
++
++  logLine(
++    `[session-control] owner unresolved session=${sessionId} stored=${stored ?? '-'} method=${method} ` +
++      `registry=${$connectionsRegistry.get() ? 'yes' : 'pending'} profiles=${$profiles.get().length} ` +
++      `rows=${$sessions.get().length} tree=${$projectTree.get().length}`
++  )
++}
++
++/** Same gate as assertSessionOwnerResolved, without throwing. */
++function ownerResolvable(sessionId: string): boolean {
++  return sessionOwnerIsKnown(knownOwnerForSession(sessionId)) || ambientGatewayOwnsEverySession()
++}
++
++function disarmOwnerRetry(sessionId: string): void {
++  const disarm = ownerRetries.get(sessionId)
++
++  if (disarm) {
++    ownerRetries.delete(sessionId)
++    disarm()
++  }
++}
++
++/**
++ * After a read failed closed on an unresolved owner, re-read as soon as the
++ * owner becomes resolvable, so the banner cannot outlive the miss. Nothing is
++ * sent until then — the gate stays fail-closed; this only re-runs the same
++ * owner ladder. Any newer read/action/event (version bump) or a clear
++ * supersedes the retry.
++ */
++function armOwnerRetry(sessionId: string, token: number): void {
++  disarmOwnerRetry(sessionId)
++
++  const atoms = [
++    $sessions,
++    $cronSessions,
++    $messagingSessions,
++    $unlistedSessionOwnerRows,
++    $projectTree,
++    $sessionTiles,
++    $sessionStates,
++    $selectedStoredSessionId,
++    $activeSessionId,
++    $connectionsRegistry,
++    $profiles
++  ] as const
++
++  const unsubscribers: Array<() => void> = []
++  let timer: ReturnType<typeof setInterval> | undefined
++  let deadline: ReturnType<typeof setTimeout> | undefined
++
++  const stop = () => {
++    unsubscribers.splice(0).forEach(unsubscribe => unsubscribe())
++    clearInterval(timer)
++    clearTimeout(deadline)
++  }
++
++  const check = () => {
++    if (ownerRetries.get(sessionId) !== stop) {
++      return
++    }
++
++    if (!isCurrent(sessionId, token) || isSessionGone(sessionId)) {
++      disarmOwnerRetry(sessionId)
++
++      return
++    }
++
++    if (!ownerResolvable(sessionId)) {
++      return
++    }
++
++    disarmOwnerRetry(sessionId)
++    logLine(`[session-control] owner resolved after miss session=${sessionId}; re-reading`)
++    void refreshSessionControl(sessionId, { background: true })
++  }
++
++  ownerRetries.set(sessionId, stop)
++
++  for (const store of atoms) {
++    unsubscribers.push((store as { listen: (cb: () => void) => () => void }).listen(check))
++  }
++
++  timer = setInterval(check, OWNER_RETRY_POLL_MS)
++  deadline = setTimeout(() => disarmOwnerRetry(sessionId), OWNER_RETRY_MAX_MS)
++}
++
+ function finishGoneRequest(sessionId: string, token: number, clearPendingAction: boolean): void {
+   if (!isCurrent(sessionId, token)) {
+     return
+@@ -813,6 +946,11 @@ export async function refreshSessionControl(
+ 
+     publishFailure(sessionId, token, error, false)
+ 
++    if (isSessionOwnerResolutionError(error)) {
++      logOwnerMiss(sessionId, 'session.control.read')
++      armOwnerRetry(sessionId, token)
++    }
++
+     return $sessionControlBySession.get()[sessionId]
+   }
+ }
+@@ -874,6 +1012,10 @@ export async function runSessionControlAction(
+       finishGoneRequest(sessionId, token, true)
+     } else {
+       publishFailure(sessionId, token, error, true)
++
++      if (isSessionOwnerResolutionError(error)) {
++        logOwnerMiss(sessionId, 'session.control')
++      }
+     }
+ 
+     const detail = error instanceof Error ? refusalDetail(error) : ''
+diff --git a/apps/desktop/src/store/session.ts b/apps/desktop/src/store/session.ts
+index f9316ac3601..954e6bf7595 100644
+--- a/apps/desktop/src/store/session.ts
++++ b/apps/desktop/src/store/session.ts
+@@ -18,6 +18,7 @@ import type { TileSessionFocusStamp } from '@/lib/session-timer-since'
+ import { persistBoolean, persistString, readJson, storedBoolean, storedString, writeJson } from '@/lib/storage'
+ import type { SessionInfo, UsageStats } from '@/types/hermes'
+ 
++import { $projectTree } from './project-tree'
+ import { $removedSessionIds, isSessionRemovalPending, tombstoneRowIds } from './session-removal'
+ import type { SessionOwnerRoute, SessionOwnerScope } from './session-request-router'
+ import { clearUnreadOnOpen } from './session-unread-remote'
+@@ -1089,24 +1090,66 @@ function withUnlistedOwnerStubs(rows: SessionInfo[], stubs: readonly SessionInfo
+  * install failed closed with SessionOwnerResolutionError even though the row
+  * naming its owner was already in memory, one atom over. Concatenation order
+  * mirrors lookup priority: recents first (they can carry fresher optimistic
+- * connection tags), then the cron and messaging slices. Unlisted-draft stubs
+- * ($unlistedSessionOwnerRows) ride last: a real row for the same id always
+- * shadows its stub, so a listed session never resolves off a stale stamp.
++ * connection tags), then the cron and messaging slices, then the sidebar
++ * project tree. Unlisted-draft stubs ($unlistedSessionOwnerRows) ride last: a
++ * real row for the same id always shadows its stub, so a listed session never
++ * resolves off a stale stamp.
++ *
++ * The project tree is the only loaded copy of a chat older than the capped
++ * recents page (#76535), and its rows carry the same owner stamps (bare for
++ * the local primary, connection-tagged otherwise; store/projects.ts). Without
++ * it, a resumed day-old chat whose resume found its owner in the tree still
++ * failed every session-scoped RPC closed ("Session controls unavailable",
++ * t_01a18f128c7f815c).
+  */
+ export function ownerLookupSessionRows(): SessionInfo[] {
++  const sessions = $sessions.get()
+   const cron = $cronSessions.get()
+   const messaging = $messagingSessions.get()
++  const tree = $projectTree.get()
+   const stubs = $unlistedSessionOwnerRows.get()
+ 
+   // Recents-only stays the common case; keep its array identity (no copy) so
+   // per-list memo caches (lineageAliases) keyed on the reference still hit.
+-  if (!cron.length && !messaging.length) {
+-    return withUnlistedOwnerStubs($sessions.get(), stubs)
++  if (!cron.length && !messaging.length && !tree.length) {
++    return withUnlistedOwnerStubs(sessions, stubs)
++  }
++
++  const last = ownerLookupMemo
++
++  if (
++    last &&
++    last.sessions === sessions &&
++    last.cron === cron &&
++    last.messaging === messaging &&
++    last.tree === tree &&
++    last.stubs === stubs
++  ) {
++    return last.rows
+   }
+ 
+-  return withUnlistedOwnerStubs([...$sessions.get(), ...cron, ...messaging], stubs)
++  const treeRows = tree.flatMap(project => [
++    ...(project.previewSessions ?? []),
++    ...project.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions))
++  ])
++
++  const rows = withUnlistedOwnerStubs([...sessions, ...cron, ...messaging, ...treeRows], stubs)
++  ownerLookupMemo = { cron, messaging, rows, sessions, stubs, tree }
++
++  return rows
+ }
+ 
++// Same inputs → same array, so identity-keyed memo caches keep hitting when
++// the merged (non-recents-only) path is taken.
++let ownerLookupMemo: {
++  cron: ReturnType<typeof $cronSessions.get>
++  messaging: ReturnType<typeof $messagingSessions.get>
++  rows: SessionInfo[]
++  sessions: ReturnType<typeof $sessions.get>
++  stubs: ReturnType<typeof $unlistedSessionOwnerRows.get>
++  tree: ReturnType<typeof $projectTree.get>
++} | null = null
++
+ // Whether a profile's last session page was CAPPED by the request limit, keyed
+ // by profile name — i.e. more rows exist on disk than were loaded. Replaces the
+ // old exact per-profile totals: rendering `loaded/total` in the sidebar cost a
+-- 
+2.55.0
+

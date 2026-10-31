@@ -1,0 +1,442 @@
+From efcb1f525525d9c4ce947266c577bac35fafd837 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 20:45:01 +0000
+Subject: [PATCH] fix(gateway): GIL-safe SIGUSR2 stack dump instead of
+ faulthandler.register [daveey]
+
+faulthandler.register(SIGUSR2, all_threads=True) dumps from C signal context on
+whichever thread caught the signal and walks every other thread's frame chain
+while those threads run, without the GIL. A thread popping a frame mid-walk
+makes dump_frame read freed memory: David-MBP gateway 43117 segfaulted in
+faulthandler_user -> _Py_DumpTracebackThreads -> dump_frame ->
+_PyFrame_SafeGetCode on 10-30, losing 4 in-flight Kanban runs.
+
+SIGUSR2 now installs a Python-level signal.signal handler (ThreadStackDumper,
+gateway/sigusr2_stack_dump.py) that runs on the main thread with the GIL held,
+snapshots sys._current_frames(), names threads from threading.enumerate(), and
+appends a timestamped dump to the same gateway_faulthandler.log via a raw fd
+write. A second SIGUSR2 within 1 s of the last dump is ignored; a write error
+is swallowed so SIGUSR2 never terminates the gateway. faulthandler.enable() for
+fatal errors is unchanged; Windows (no SIGUSR2) is unchanged.
+---
+ gateway/run_startup.py                     |  22 ++-
+ gateway/sigusr2_stack_dump.py              | 116 ++++++++++++
+ hermes_cli/stderr_timestamp.py             |   7 +-
+ tests/gateway/test_sigusr2_stack_dump.py   | 194 +++++++++++++++++++++
+ website/docs/user-guide/messaging/index.md |  10 ++
+ 5 files changed, 337 insertions(+), 12 deletions(-)
+ create mode 100644 gateway/sigusr2_stack_dump.py
+ create mode 100644 tests/gateway/test_sigusr2_stack_dump.py
+
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index f4bac7fd9d3..5a5e04bf6c7 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -27,6 +27,7 @@ from gateway.restart import (
+     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
+ )
+ from gateway.run_shutdown import _log_suppressed, _send_error
++from gateway.sigusr2_stack_dump import ThreadStackDumper
+ from gateway.shutdown_watchdog import (
+     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
+     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
+@@ -912,7 +913,7 @@ class GatewayStartupMixin:
+         return open(os.path.join(log_dir, "gateway_faulthandler.log"), "a", encoding="utf-8")  # windows-footgun: ok (append log writer, not a read)
+ 
+     def _start_install_faulthandler(self) -> None:
+-        """Enable faulthandler (stderr or a log file) plus the SIGUSR2 stack-dump hook."""
++        """Enable faulthandler for fatal errors (stderr or a log file) plus the GIL-safe SIGUSR2 stack dump."""
+         # sys.stderr may be None (Windows VBS / pythonw / detached service): fall back to a log file.
+         try:
+             # Enable faulthandler for stack dumps on freezes/crashes (#70344). Falls back to a log file when
+@@ -922,15 +923,18 @@ class GatewayStartupMixin:
+         except (RuntimeError, ValueError, OSError):
+             with _log_suppressed(logging.DEBUG, "faulthandler.enable() unavailable", exc_info=True):
+                 faulthandler.enable(file=self._open_faulthandler_log(), all_threads=True)
+-        # SIGUSR2 stack dump to file for service managers that drop stderr; POSIX-only.
+-        # chain=False: SIGUSR2's default disposition is "terminate", so chaining to it
+-        # dumps the stacks and then kills the gateway the operator was trying to inspect.
++        # SIGUSR2 = operator stack-dump request (POSIX-only), appended to gateway_faulthandler.log.
++        # A Python-level handler, NOT faulthandler.register(all_threads=True): that one walks other
++        # threads' frames from C signal context while they run and segfaulted the gateway it was
++        # inspecting. This one runs on the main thread with the GIL held (gateway/sigusr2_stack_dump.py),
++        # is rate-limited to one dump per second, and never terminates the process.
+         _sigusr2 = getattr(signal, "SIGUSR2", None)
+-        if _sigusr2 is not None and hasattr(faulthandler, "register"):
+-            with _log_suppressed(logging.DEBUG, "Could not set up faulthandler file logging", exc_info=True):
+-                faulthandler.register(
+-                    _sigusr2, file=self._open_faulthandler_log(), all_threads=True, chain=False,
+-                )
++        if _sigusr2 is not None:
++            with _log_suppressed(logging.DEBUG, "Could not install the SIGUSR2 stack-dump handler", exc_info=True):
++                if hasattr(faulthandler, "unregister"):
++                    faulthandler.unregister(_sigusr2)  # drop a registration an older in-process setup left
++                # signal.signal only works on the main thread; elsewhere this raises ValueError (logged).
++                signal.signal(_sigusr2, ThreadStackDumper(self._open_faulthandler_log()))
+ 
+     async def _start_log_startup_environment(self) -> None:
+         """Bind the gateway loop, disarm the startup watchdog, and log the startup environment."""
+diff --git a/gateway/sigusr2_stack_dump.py b/gateway/sigusr2_stack_dump.py
+new file mode 100644
+index 00000000000..83f96e7959d
+--- /dev/null
++++ b/gateway/sigusr2_stack_dump.py
+@@ -0,0 +1,116 @@
++"""SIGUSR2 on-demand stack dump for the gateway: a Python-level signal handler, GIL-safe.
++
++``kill -USR2 <gateway pid>`` appends every thread's Python stack to ``<log_dir>/gateway_faulthandler.log``
++and the gateway keeps running.
++
++Why not ``faulthandler.register(SIGUSR2, all_threads=True)``: faulthandler dumps from C signal context on
++whichever thread caught the signal and walks every OTHER thread's frame chain while those threads keep
++running, without the GIL. A thread that pops a frame mid-walk makes ``dump_frame`` read freed memory, so the
++dump itself segfaults the gateway (David-MBP gateway 43117, 10-30: ``faulthandler_user ->
++_Py_DumpTracebackThreads -> dump_frame -> _PyFrame_SafeGetCode -> SIGSEGV``).
++
++This handler is installed with ``signal.signal``, so CPython runs it on the main thread between bytecodes,
++holding the GIL. ``sys._current_frames()`` snapshots every thread's top frame atomically under the GIL and
++returns refcounted frame objects; walking ``f_back`` from them reads Python objects, never raw interpreter
++frames another thread can free. A frame that returns mid-dump keeps its frame object alive, so the worst
++case is a slightly stale line, never a crash.
++
++Trade-off: the dump runs when the main thread next executes bytecode. A main thread blocked in a syscall
++is interrupted (EINTR) and runs it at once; one stuck inside a long C call that holds the GIL runs it only
++after that call returns. Fatal-error dumps (``faulthandler.enable()``) and the shutdown/exit watchdog
++dumps are unchanged.
++
++Rate limit: a SIGUSR2 within ``SIGUSR2_DUMP_MIN_INTERVAL_S`` of the last dump is ignored, so a collector
++that signals on every loop lag can't turn dumps into a CPU sink for a 150-thread gateway.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import threading
++import time
++import traceback
++from datetime import UTC, datetime
++from typing import Callable, IO, Optional
++
++SIGUSR2_DUMP_MIN_INTERVAL_S = 1.0
++DUMP_HEADER = "--- SIGUSR2 stack dump "
++DUMP_FOOTER = "--- end SIGUSR2 stack dump ---"
++
++
++class ThreadStackDumper:
++    """``signal.signal`` handler that appends all threads' Python stacks to ``fh``; never raises."""
++
++    def __init__(
++        self,
++        fh: IO[str],
++        *,
++        min_interval_s: float = SIGUSR2_DUMP_MIN_INTERVAL_S,
++        clock: Callable[[], float] = time.monotonic,
++    ) -> None:
++        self._fh = fh  # keep the file object referenced so its fd stays open for the process lifetime
++        self._min_interval_s = min_interval_s
++        self._clock = clock
++        self._last_dump: Optional[float] = None
++        self.dumps = 0
++        self.ignored = 0
++
++    def __call__(self, signum, frame) -> None:
++        now = self._clock()
++        if self._last_dump is not None and now - self._last_dump < self._min_interval_s:
++            self.ignored += 1
++            return
++        # Stamp before dumping: a second SIGUSR2 delivered while this handler runs re-enters it
++        # between bytecodes and must hit the rate limit, not start a nested dump.
++        self._last_dump = now
++        try:
++            text = self.render(signum, frame)
++            data = text.encode("utf-8", "replace")
++            fd = self._fh.fileno()
++            # os.write, not fh.write: a buffered writer re-entered from a signal handler raises
++            # "reentrant call"; a raw fd write is unbuffered, so the dump is on disk when we return.
++            while data:
++                written = os.write(fd, data)
++                data = data[written:]
++            self.dumps += 1
++        except Exception:  # health: allow BLE001 S110 -- signal-handler boundary: SIGUSR2 must never kill the gateway, and logging here can deadlock on a lock the interrupted code holds
++            # A closed fd or full disk loses this dump only; ``ignored``/``dumps`` stay readable for tests.
++            pass
++
++    @staticmethod
++    def render(signum, frame) -> str:
++        """Format every thread's stack. Snapshot first (no I/O), then look up source lines."""
++        frames = sys._current_frames()
++        by_ident = {t.ident: t for t in threading.enumerate()}
++        current = threading.get_ident()
++        snapshots = []
++        for ident, top in frames.items():
++            if ident == current and frame is not None:
++                top = frame  # the interrupted frame, not this handler's own
++            stack = traceback.StackSummary.extract(traceback.walk_stack(top), lookup_lines=False)
++            stack.reverse()
++            snapshots.append((ident, stack))
++        stamp = datetime.now(UTC).isoformat(timespec="milliseconds")
++        lines = [
++            f"{DUMP_HEADER}{stamp} pid={os.getpid()} signal={int(signum)} threads={len(snapshots)}"
++            " (Python-level handler on the main thread, GIL held) ---\n"
++        ]
++        # Main thread first, then by thread name, so dumps diff cleanly.
++        def order(item):
++            thread = by_ident.get(item[0])
++            return (item[0] != threading.main_thread().ident, thread.name if thread else "", item[0])
++
++        for ident, stack in sorted(snapshots, key=order):
++            thread = by_ident.get(ident)
++            name = thread.name if thread is not None else "<unknown>"
++            flags = []
++            if thread is not None and thread.daemon:
++                flags.append("daemon")
++            if ident == current:
++                flags.append("current")
++            suffix = f" ({', '.join(flags)})" if flags else ""
++            lines.append(f'\nThread 0x{ident:x} "{name}"{suffix}, most recent call last:\n')
++            lines.extend(stack.format())
++        lines.append(f"{DUMP_FOOTER}\n\n")
++        return "".join(lines)
+diff --git a/hermes_cli/stderr_timestamp.py b/hermes_cli/stderr_timestamp.py
+index 47dc44c0855..d47b56c1622 100644
+--- a/hermes_cli/stderr_timestamp.py
++++ b/hermes_cli/stderr_timestamp.py
+@@ -73,9 +73,10 @@ def _install_signal_forwarders(proc: subprocess.Popen[bytes]) -> dict[int, objec
+     # SIGUSR1 is the gateway's drain-aware restart request. launchd owns THIS wrapper's PID,
+     # so `hermes update` signals us, not the gateway; an unforwarded SIGUSR1 kills the wrapper
+     # (Python's default action), launchd tears the group down with SIGTERM and applies its
+-    # ~60 s crash back-off per sibling profile (#101426). SIGUSR2 is the gateway's
+-    # faulthandler stack-dump request (gateway/run_startup.py); unforwarded it terminates
+-    # the wrapper the same way instead of dumping stacks.
++    # ~60 s crash back-off per sibling profile (#101426). SIGUSR2 is the gateway's stack-dump
++    # request: a GIL-safe Python handler (gateway/sigusr2_stack_dump.py) appends every thread's
++    # stack to <log_dir>/gateway_faulthandler.log, at most once a second. Unforwarded it
++    # terminates the wrapper the same way instead of dumping stacks.
+     forwarded = (
+         signal.SIGTERM,
+         signal.SIGINT,
+diff --git a/tests/gateway/test_sigusr2_stack_dump.py b/tests/gateway/test_sigusr2_stack_dump.py
+new file mode 100644
+index 00000000000..86a94914c3f
+--- /dev/null
++++ b/tests/gateway/test_sigusr2_stack_dump.py
+@@ -0,0 +1,194 @@
++"""SIGUSR2 stack dump is a Python-level handler, never faulthandler's C signal-context walk.
++
++faulthandler.register(SIGUSR2, all_threads=True) dumps from the signal handler on whichever thread
++caught the signal, walking every other thread's frame chain while those threads keep running. A thread
++that pops a frame mid-walk makes dump_frame read freed memory: David-MBP's gateway 43117 segfaulted
++that way (faulthandler_user -> _Py_DumpTracebackThreads -> dump_frame -> _PyFrame_SafeGetCode) on
++10-30 and took 4 Kanban runs with it.
++"""
++
++from __future__ import annotations
++
++import os
++import signal
++import subprocess
++import sys
++import time
++
++import pytest
++
++pytestmark = pytest.mark.skipif(not hasattr(signal, "SIGUSR2"), reason="POSIX-only signal")
++
++_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++_SETUP = """
++import faulthandler, os, signal, sys, threading, time
++from types import SimpleNamespace
++sys.path.insert(0, sys.argv[2])
++from gateway.run_startup import GatewayStartupMixin
++runner = object.__new__(GatewayStartupMixin)
++runner.config = SimpleNamespace(log_dir=sys.argv[1])
++runner._start_install_faulthandler()
++"""
++
++_STRUCTURAL_CHILD = _SETUP + """
++from gateway import run_startup
++handler = signal.getsignal(signal.SIGUSR2)
++print("unregister", faulthandler.unregister(signal.SIGUSR2))
++print("python_handler", isinstance(handler, getattr(run_startup, "ThreadStackDumper", ())))
++"""
++
++# 150 threads churning frames (deep recursion + generators) while the parent fires SIGUSR2.
++_CHURN_CHILD = _SETUP + """
++stop = threading.Event()
++go = threading.Event()  # start all threads idle, then release them: starting 150 already-churning
++                        # threads one by one is a GIL convoy that takes minutes under load
++
++def gen(n):
++    for i in range(n):
++        yield i
++
++def recurse(n):
++    if n == 0:
++        return sum(gen(8))
++    return recurse(n - 1) + 1
++
++def churn():
++    go.wait()
++    while not stop.is_set():
++        recurse(40)
++
++threads = [threading.Thread(target=churn, name=f"churn-{i}", daemon=True) for i in range(150)]
++for t in threads:
++    t.start()
++go.set()
++print("ready", " ".join(t.name for t in threading.enumerate()), flush=True)
++sys.stdin.readline()
++stop.set()
++# No join: joining 150 GIL-contending threads one by one takes ~30 s under load; they are daemon
++# threads, so a normal interpreter exit (rc 0) is the clean-exit proof.
++print("clean-exit", flush=True)
++"""
++
++_IDLE_CHILD = _SETUP + """
++print("ready", flush=True)
++sys.stdin.readline()
++
++def run_pending_signal_handlers():
++    pass  # entering a Python function checks the eval breaker, so a still-pending SIGUSR2 handler runs here
++
++run_pending_signal_handlers()
++"""
++
++
++def _spawn(code: str, log_dir):
++    child = subprocess.Popen(
++        [sys.executable, "-c", code, str(log_dir), _REPO_ROOT],
++        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
++    )
++    assert child.stdin and child.stdout and child.stderr
++    return child, child.stdin, child.stdout, child.stderr
++
++
++def _dumps(log_dir) -> list[str]:
++    path = os.path.join(str(log_dir), "gateway_faulthandler.log")
++    if not os.path.exists(path):
++        return []
++    text = open(path, encoding="utf-8").read()
++    return [b for b in text.split("--- SIGUSR2 stack dump ")[1:]]
++
++
++def test_setup_installs_python_handler_not_faulthandler_register(tmp_path):
++    """Structural: after setup, faulthandler has no SIGUSR2 registration and the signal's
++    disposition is the gateway's Python-level ThreadStackDumper."""
++    out = subprocess.run(
++        [sys.executable, "-c", _STRUCTURAL_CHILD, str(tmp_path), _REPO_ROOT],
++        capture_output=True, text=True, timeout=60, check=False,
++    )
++    assert out.returncode == 0, out.stderr
++    assert "unregister False" in out.stdout, out.stdout
++    assert "python_handler True" in out.stdout, out.stdout
++
++
++def test_sigusr2_storm_against_frame_churning_threads_never_crashes(tmp_path):
++    """Behavioral: 300 SIGUSR2 ~5 ms apart against 150 frame-churning threads; the child exits 0
++    and the log's last dump names every live thread."""
++    child, stdin, stdout, stderr = _spawn(_CHURN_CHILD, tmp_path)
++    try:
++        line = stdout.readline().split()
++        assert line and line[0] == "ready", stderr.read()
++        live = line[1:]
++        assert len(live) >= 151
++        for _ in range(300):
++            child.send_signal(signal.SIGUSR2)
++            time.sleep(0.005)  # health: allow HX013 -- the ~5 ms signal spacing is the storm under test
++        assert child.poll() is None, f"died under SIGUSR2 (rc={child.returncode}): {stderr.read()[-2000:]}"
++        stdin.write("stop\n")
++        stdin.flush()
++        rc = child.wait(timeout=60)
++        rest = stdout.read()
++    finally:
++        if child.poll() is None:
++            child.kill()
++            child.wait()
++    assert rc == 0, f"rc={rc}"
++    assert "clean-exit" in rest
++    dumps = _dumps(tmp_path)
++    assert dumps, "no SIGUSR2 dump written"
++    # The rate limit caps 300 signals over ~1.5 s+ to a handful of dumps, not 300.
++    assert len(dumps) <= 10, len(dumps)
++    last = dumps[-1]
++    missing = [name for name in live if f'"{name}"' not in last]
++    assert not missing, f"dump lacks threads: {missing[:10]}"
++    assert "--- end SIGUSR2 stack dump ---" in last
++
++
++def test_two_sigusr2_one_ms_apart_produce_one_dump(tmp_path):
++    child, stdin, stdout, stderr = _spawn(_IDLE_CHILD, tmp_path)
++    try:
++        assert stdout.readline().strip() == "ready", stderr.read()
++        child.send_signal(signal.SIGUSR2)
++        time.sleep(0.001)  # health: allow HX013 -- the 1 ms gap between the two signals is the behaviour under test
++        child.send_signal(signal.SIGUSR2)
++        # Both signals are pending before kill() returns; the child runs their handlers before it
++        # exits (on readline's EINTR, or at its explicit Python call after it), so rc 0 settles the count.
++        stdin.write("\n")
++        stdin.flush()
++        assert child.wait(timeout=30) == 0
++    finally:
++        if child.poll() is None:
++            child.kill()
++            child.wait()
++    assert len(_dumps(tmp_path)) == 1
++
++
++def test_rate_limit_ignores_second_dump_within_interval_and_allows_after(tmp_path):
++    """Direct handler calls: the 1 ms test above could pass on the kernel coalescing the two
++    pending signals alone, so drive the rate limit with a fake clock."""
++    from gateway.run_startup import ThreadStackDumper
++
++    now = [100.0]
++    with open(tmp_path / "log", "a", encoding="utf-8") as fh:
++        dumper = ThreadStackDumper(fh, clock=lambda: now[0])
++        dumper(signal.SIGUSR2, sys._getframe())
++        now[0] += 0.001
++        dumper(signal.SIGUSR2, sys._getframe())
++        now[0] += 0.5
++        dumper(signal.SIGUSR2, sys._getframe())
++        assert dumper.dumps == 1
++        now[0] += 0.6  # 1.101 s after the first dump
++        dumper(signal.SIGUSR2, sys._getframe())
++        assert dumper.dumps == 2
++    text = (tmp_path / "log").read_text(encoding="utf-8")
++    assert text.count("--- SIGUSR2 stack dump ") == 2
++    assert "MainThread" in text and "test_rate_limit_ignores_second_dump" in text
++
++
++def test_dump_failure_never_raises(tmp_path):
++    """SIGUSR2 must never terminate the gateway: a write failure (closed fd) is swallowed."""
++    from gateway.run_startup import ThreadStackDumper
++
++    fh = open(tmp_path / "log", "a", encoding="utf-8")
++    dumper = ThreadStackDumper(fh)
++    fh.close()
++    dumper(signal.SIGUSR2, None)  # must not raise
+diff --git a/website/docs/user-guide/messaging/index.md b/website/docs/user-guide/messaging/index.md
+index 3bef1150036..2ba3ed8e74a 100644
+--- a/website/docs/user-guide/messaging/index.md
++++ b/website/docs/user-guide/messaging/index.md
+@@ -186,6 +186,16 @@ stack to `~/.hermes/logs/gateway_faulthandler.log` and the gateway keeps
+ running — use it to see what a stalled or misbehaving gateway is doing without
+ restarting it.
+ 
++The dump is GIL-safe: a Python-level handler runs on the main thread with the
++GIL held and walks the threads through `sys._current_frames()`, so a thread
++that returns mid-dump cannot crash the gateway (the earlier
++`faulthandler.register` hook walked frames from C signal context and could
++segfault). Each dump starts with `--- SIGUSR2 stack dump <UTC time> pid=…` and
++names every thread. A second `SIGUSR2` within 1 s of the last dump is ignored.
++The dump runs when the main thread next executes Python code, so a main thread
++wedged inside a long C call dumps only after that call returns; the event-loop
++watchdog below covers that case.
++
+ ### Built-in event-loop liveness watchdog
+ 
+ On every platform the gateway runs an out-of-loop watchdog thread that probes
+-- 
+2.55.0
+

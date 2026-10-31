@@ -1,0 +1,143 @@
+From e9c7d449caca54d9cdaa6357d4f885748a59ba6b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:00:50 -0700
+Subject: [PATCH] fix(desktop): swallow unhandled PowerSettlingError rejections
+ in the renderer [daveey]
+
+Background reads skipped around sleep/wake are expected and retried, but an uncaught fire-and-forget caller
+logged 'Uncaught (in promise) ... PowerSettlingError' (4x on 10-30). Electron strips the code across IPC, so
+the guard matches the error name in the message; other rejections still reach the console.
+---
+ .../src/lib/power-settling-rejections.test.ts | 53 +++++++++++++++++++
+ .../src/lib/power-settling-rejections.ts      | 37 +++++++++++++
+ apps/desktop/src/main.tsx                     |  3 ++
+ 3 files changed, 93 insertions(+)
+ create mode 100644 apps/desktop/src/lib/power-settling-rejections.test.ts
+ create mode 100644 apps/desktop/src/lib/power-settling-rejections.ts
+
+diff --git a/apps/desktop/src/lib/power-settling-rejections.test.ts b/apps/desktop/src/lib/power-settling-rejections.test.ts
+new file mode 100644
+index 00000000000..e288af8293b
+--- /dev/null
++++ b/apps/desktop/src/lib/power-settling-rejections.test.ts
+@@ -0,0 +1,53 @@
++import { afterEach, describe, expect, it } from 'vitest'
++
++import { installPowerSettlingRejectionGuard, isPowerSettlingRejection } from './power-settling-rejections'
++
++// The exact message desktop.log recorded for an uncaught skipped read (10-30 10:44 PDT).
++const IPC_MESSAGE =
++  "Error invoking remote method 'hermes:api': PowerSettlingError: Background read skipped: the machine is asleep or settling after a wake; the next poll retries."
++
++function rejectionEvent(reason: unknown): PromiseRejectionEvent {
++  const event = new Event('unhandledrejection', { cancelable: true }) as PromiseRejectionEvent
++  Object.defineProperty(event, 'reason', { value: reason })
++
++  return event
++}
++
++describe('power-settling rejection guard', () => {
++  let uninstall: (() => void) | undefined
++
++  afterEach(() => {
++    uninstall?.()
++    uninstall = undefined
++  })
++
++  it('recognizes the IPC-stripped error by its name in the message, and the main-process code', () => {
++    expect(isPowerSettlingRejection(new Error(IPC_MESSAGE))).toBe(true)
++    expect(isPowerSettlingRejection({ code: 'POWER_SETTLING' })).toBe(true)
++    expect(isPowerSettlingRejection(IPC_MESSAGE)).toBe(true)
++    expect(isPowerSettlingRejection(new Error("Error invoking remote method 'hermes:api': 500: boom"))).toBe(false)
++    expect(isPowerSettlingRejection(null)).toBe(false)
++    expect(isPowerSettlingRejection(undefined)).toBe(false)
++  })
++
++  it('swallows an unhandled PowerSettlingError rejection', () => {
++    const target = new EventTarget()
++    uninstall = installPowerSettlingRejectionGuard(target as unknown as Window)
++    const event = rejectionEvent(new Error(IPC_MESSAGE))
++    target.dispatchEvent(event)
++    expect(event.defaultPrevented).toBe(true)
++  })
++
++  it('leaves every other unhandled rejection to the console', () => {
++    const target = new EventTarget()
++    uninstall = installPowerSettlingRejectionGuard(target as unknown as Window)
++    const event = rejectionEvent(new Error('Timed out connecting to Hermes backend'))
++    target.dispatchEvent(event)
++    expect(event.defaultPrevented).toBe(false)
++  })
++
++  it('is installed by the renderer entry', async () => {
++    const { default: main } = (await import('../main.tsx?raw')) as { default: string }
++    expect(main).toMatch(/^installPowerSettlingRejectionGuard\(\)$/m)
++  })
++})
+diff --git a/apps/desktop/src/lib/power-settling-rejections.ts b/apps/desktop/src/lib/power-settling-rejections.ts
+new file mode 100644
+index 00000000000..a540f1baead
+--- /dev/null
++++ b/apps/desktop/src/lib/power-settling-rejections.ts
+@@ -0,0 +1,37 @@
++// [daveey] Background reads the main process skips while the Mac sleeps or settles after a wake reject with
++// PowerSettlingError (electron/power-settle.ts). That is expected: the next poll retries. A renderer caller
++// that fire-and-forgets such a read without a .catch left one "Uncaught (in promise) ... PowerSettlingError"
++// console error per skipped read in desktop.log (4x around the 10-30 10:00 and 10:44 PDT wakes). Electron
++// strips the error's `code` across IPC, so the only marker the renderer gets is the error name in the message.
++// This guard swallows exactly those rejections. Any other unhandled rejection still reaches the console.
++
++const POWER_SETTLING_MARKER = 'PowerSettlingError:'
++
++export function isPowerSettlingRejection(reason: unknown): boolean {
++  if (reason && typeof reason === 'object' && (reason as { code?: unknown }).code === 'POWER_SETTLING') {
++    return true
++  }
++
++  const message =
++    typeof reason === 'string' ? reason : String((reason as { message?: unknown } | null)?.message ?? '')
++
++  return message.includes(POWER_SETTLING_MARKER)
++}
++
++interface RejectionTarget {
++  addEventListener(type: 'unhandledrejection', listener: (event: PromiseRejectionEvent) => void): void
++  removeEventListener(type: 'unhandledrejection', listener: (event: PromiseRejectionEvent) => void): void
++}
++
++/** Install once on window; returns an uninstaller (tests). */
++export function installPowerSettlingRejectionGuard(target: RejectionTarget = window): () => void {
++  const onRejection = (event: PromiseRejectionEvent) => {
++    if (isPowerSettlingRejection(event.reason)) {
++      event.preventDefault()
++    }
++  }
++
++  target.addEventListener('unhandledrejection', onRejection)
++
++  return () => target.removeEventListener('unhandledrejection', onRejection)
++}
+diff --git a/apps/desktop/src/main.tsx b/apps/desktop/src/main.tsx
+index 7c3f42a78b2..4af66b95878 100644
+--- a/apps/desktop/src/main.tsx
++++ b/apps/desktop/src/main.tsx
+@@ -35,6 +35,7 @@ import { HapticsProvider } from './components/haptics-provider'
+ import { RootTooltipProvider } from './components/ui/tooltip'
+ import { ProfileI18nProvider as I18nProvider } from './i18n/profile-provider'
+ import { installClipboardShim } from './lib/clipboard'
++import { installPowerSettlingRejectionGuard } from './lib/power-settling-rejections'
+ import { queryClient } from './lib/query-client'
+ import { installRendererAnimationPauseState } from './lib/renderer-loop-pause'
+ import { installSelectionCopyColorGuard } from './lib/selection-copy-colors'
+@@ -46,6 +47,8 @@ import { isMainWindow } from './store/windows'
+ import { ThemeProvider } from './themes/context'
+ 
+ installClipboardShim()
++// Skipped background reads around sleep/wake are expected; keep them out of the console (power-settling-rejections.ts).
++installPowerSettlingRejectionGuard()
+ // Chromium serializes selection copies (Cmd+C, right-click Copy) with the
+ // theme's computed colors inlined; without this guard a dark-theme selection
+ // pastes as near-white text into light-background targets.
+-- 
+2.55.0
+

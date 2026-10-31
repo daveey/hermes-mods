@@ -1,6 +1,8 @@
 # Kanban worker tool children carry `HERMES_KANBAN_WORKER_TASK`
 
-Patches:
+Patches: 0775 1365
+
+- `patches/1365-fix-kanban-worker-protocol-prompt-names-HERMES_KANBA.patch`: the worker protocol prompt names the marker for shell use.
 
 - `patches/0775-fix-kanban-worker-tool-children-carry-HERMES_KANBAN_.patch`: informational card marker exported
   to every tool child of a Kanban worker; docs row in `environment-variables.md`.
@@ -23,6 +25,8 @@ Patches:
 - **Agent-scope launches strip it.** It shares the `HERMES_KANBAN_` prefix, so a Desktop, `serve` or gateway
   launched from a worker shell drops it with the rest of the agent-scope family (`strip_agent_scope_env`).
 
+- **The protocol prompt names it (1365).** `KANBAN_GUIDANCE` said the task id is in `$HERMES_KANBAN_TASK`, but terminal and execute_code shells never have it, so `--card $HERMES_KANBAN_TASK` expanded to a bare `--card` and the worktree fallback branch became `wt/`. The prompt now says shells use `$HERMES_KANBAN_WORKER_TASK`, and the fallback is `wt/$HERMES_KANBAN_WORKER_TASK`.
+
 ## How it works
 
 - `agent/delegation_context.py`: `KANBAN_WORKER_TASK_ENV`; `scrub_kanban_env` sets it from
@@ -44,6 +48,8 @@ Patches:
     board-pinned, `kanban_complete/block/heartbeat/request_review` check_fns false (control: the same probe with
     `HERMES_KANBAN_TASK` sees all four).
   - RED: with the marker assignment disabled, the 3 worker entry-path tests and the grandchild test fail.
+
+- 1365: `test_worker_protocol_prompt_names_the_variable_its_shells_have` asserts `KANBAN_GUIDANCE` contains `$HERMES_KANBAN_WORKER_TASK` and neither `wt/$HERMES_KANBAN_TASK` nor ``$HERMES_KANBAN_TASK`;``. Not run for this mirror. Code: `agent/prompt_builder.py`.
 
 ## Apply
 

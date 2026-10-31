@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1326 patches, one entry per non-merge source commit through `ff727b789d071d615d9225ba3c80c460580422af`.
+1368 patches, one entry per non-merge source commit through `632eb9c39d518188e71d3404c5f012d4e4e6a113`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -23,7 +23,7 @@ follows 1281 although it sorts at position 1259 by date. Each patch is identifie
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `6bb377a51d5c8e279a7a5e34d717d653d421d064`; merge-base: `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
-The current snapshot's executed checks are in [mirror-1326-verification.md](mirror-1326-verification.md), with its policy [mirror-policy-1326.json](mirror-policy-1326.json) (previous snapshots: [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+The current snapshot's executed checks are in [mirror-1368-verification.md](mirror-1368-verification.md), with its policy [mirror-policy-1368.json](mirror-policy-1368.json) (previous snapshots: [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
 
@@ -870,3 +870,27 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Serve update-gate log](serve-update-gate-log.md) | 1292 | Gate waits and re-execs are appended to `logs/serve-update-gate.log`. |
 | [Upstream sync lands via PR](upstream-sync-land-via-pr.md) | 1293 1295 1296 | `land()` merges a PR pinned to the head once the required check is green; GitHub refusals are reported verbatim. |
 | [Kubernetes terminal backend: one pod per session](kubernetes-terminal-backend.md) | pending (fork PR #242) | `terminal.backend: kubernetes`: a hardened pod per session in a profile-configured namespace, exec over the pod API, existing-claim or emptyDir workspace, no PVC rights needed. |
+
+## Mirror follow-ups 1327–1368
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Per-profile background-job recovery](process-profile-recovery.md) | 1327 | Each profile recovers only its own background jobs; finished jobs leave every checkpoint. Source `b57f02fcdf8`. |
+| [Desktop renderer resilience](desktop-renderer-resilience.md) | 1328 1336 1338 1345 1346 1361 | Recovery action label kept across the error-card merge, PowerSettlingError rejections swallowed, ticket bootstrap cause named with one retry, storage-spy test seams, teardown-safe notification timers. |
+| [SIGUSR2 stack dump](gateway-sigusr2-stack-dump.md) | 1329 1367 | GIL-safe Python SIGUSR2 handler replaces `faulthandler.register`; 1367 hardens the stress test. |
+| [Managed-worker launch terminal policy](managed-worker-launch-terminal-policy.md) | 1330 1331 1332 | Secondary-profile workers no longer inherit the launch profile's derived terminal settings; `home_mode` rebuilt from the target profile. |
+| [Desktop reload resume snapshot](desktop-reload-resume-snapshot.md) | 1333 | A reloaded window resumes a streaming segment from a snapshot instead of a replay it may miss. |
+| [Gateway GIL interval and trim](gateway-gil-and-trim.md) | 1334 1335 | 1 ms GIL switch interval for the API loop; mem trim skips full `gc.collect()` where no page release follows. |
+| [Sidebar session-state fixes](sidebar-session-state-fixes.md) | 1337 1347 1359 | Cold sessions with history never read as drafts, project-tree rows carry stored outcome and mute, session-control owners resolve from the project tree. |
+| [Webapp SSH-served Desktop owner](webapp-ssh-desktop-owner-identity.md) | 1339 | Another Mac's SSH-served Desktop maps to the host owner so its archive of a hub chat stops 403ing. |
+| [Kanban owner_restart_lost](kanban-owner-restart-lost.md) | 1340 1341 1342 | A run lost to its owner's unclean death is booked uncharged; systemic crash fingerprints open one fix card. |
+| [Kanban placement cancellation](kanban-placement-cancellation.md) | 1348 1349 1350 1362 1363 | Completion or archive durably cancels the placed copy across crash gaps and failed sends. |
+| [API chat completions served model](api-chat-served-model.md) | 1351 1352 | Non-streaming replies name the served provider and model. |
+| [Routing: managed pin and refused route](routing-managed-pin-and-refused-route.md) | 1353 1360 | A managed pin on its own endpoint is not an override; a policy-refused route cannot block switching away. |
+| [Nightly e2e](nightly-e2e.md) | 1354 1355 1356 1357 | Dispatch-only nightly e2e plus hub report script that files a Kanban card on red or on persistent did-not-run. |
+| [CI/test stability](ci-test-stability-1343.md) | 1343 1344 1358 | PTY frame consumption, runtime-only driver import check, awaited authorization dispatch. |
+| [pre_verify skips fork turns](pre-verify-every-turn.md) | 1364 | `pre_verify` hooks are not called for detached fork turns (extends the live-turn verification doc). |
+| [Kanban worker task marker in prompt](kanban-worker-task-marker.md) | 1365 | Worker protocol prompt names `$HERMES_KANBAN_WORKER_TASK` for shell use. |
+| [managed-worker.log block header](managed-worker-log-header.md) | 1366 | Each worker block starts with `[pid N] @ <UTC> core=<sha>` so crash storms date against deploys. |
+| [Classic CLI quit on gateway proxy](cli-quit-gateway-proxy-restore.md) | 1368 | Quit no longer runs the prompt restore on the gateway proxy; store reads keep parity. |
+| [1368-entry mirror snapshot](mirror-1368-verification.md) | verification report | Appends 1327–1368; `verify_mirror.py` exits 0 with policy [mirror-policy-1368.json](mirror-policy-1368.json). |

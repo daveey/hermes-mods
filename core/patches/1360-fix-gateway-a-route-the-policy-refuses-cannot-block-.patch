@@ -1,0 +1,99 @@
+From a85307bb6ed603ab0ead82f01de156e849a7dfea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 16:36:49 -0700
+Subject: [PATCH] fix(gateway): a route the policy refuses cannot block
+ switching away from it [daveey]
+
+_current_route already lets a pick leave a route that cannot authenticate, but a ModelRoutingError
+from the same resolution escaped and crashed session.mutate, so Desktop showed "Model switch failed:
+internal error" on the one action that recovers the chat. d464e6a60e cleared the adopted-chat cause;
+any other refusal (a pin the registry rejects, a real endpoint override) still hit this crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gateway/session_mutation_model.py             |  8 ++--
+ .../gateway/test_model_pick_refused_route.py  | 45 +++++++++++++++++++
+ 2 files changed, 50 insertions(+), 3 deletions(-)
+ create mode 100644 tests/gateway/test_model_pick_refused_route.py
+
+diff --git a/gateway/session_mutation_model.py b/gateway/session_mutation_model.py
+index a1c8128acdc..e8826772fd0 100644
+--- a/gateway/session_mutation_model.py
++++ b/gateway/session_mutation_model.py
+@@ -24,9 +24,11 @@ def _current_route(authority, live, old):
+     the configured name: a named ``providers:`` entry resolves to the bare ``custom`` class, and a
+     pick on the same entry must not read as a route change. Only the session's own route counts:
+     a fallback is where a turn lands, not what the user switches from. A route that cannot
+-    authenticate here must not block leaving it: like main's agent-less ``--provider`` path, the
+-    pick then switches from the configured provider alone and resolves its own target.
++    authenticate here, or that the routing policy refuses, must not block leaving it: like main's
++    agent-less ``--provider`` path, the pick then switches from the configured provider alone and
++    resolves its own target.
+     """
++    from agent.model_routing import ModelRoutingError
+     from gateway.session_policy import profile_read_scope
+     from hermes_cli.auth import AuthError
+     with profile_read_scope(old, authority):
+@@ -35,7 +37,7 @@ def _current_route(authority, live, old):
+         try:
+             model, runtime = authority.runner._resolve_session_agent_runtime(
+                 source=live.source, session_key=live.route, fallback=False)
+-        except AuthError:
++        except (AuthError, ModelRoutingError):
+             return config, _Route(block.get('provider') or '', old.current_model(authority) or '',
+                                   block.get('base_url') or '', '')
+     return config, _Route(block.get('provider') or runtime.get('provider') or '', model or '',
+diff --git a/tests/gateway/test_model_pick_refused_route.py b/tests/gateway/test_model_pick_refused_route.py
+new file mode 100644
+index 00000000000..4e42526c569
+--- /dev/null
++++ b/tests/gateway/test_model_pick_refused_route.py
+@@ -0,0 +1,45 @@
++"""A route the managed subscription policy refuses must not block switching away from it."""
++from dataclasses import asdict
++from types import SimpleNamespace
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from gateway.session_mutation_model import prepare_model
++from gateway.session_policy import build_policy, restore_policy
++from hermes_cli import model_switch
++from hermes_state import SessionDB
++from tests.agent import test_managed_subscription as fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.mark.asyncio
++async def test_pick_leaves_a_route_the_managed_policy_refuses(managed, tmp_path, monkeypatch):
++    def refuse(**kwargs):
++        raise ModelRoutingError('Managed subscription policy rejects unregistered or ambiguous concrete pin')
++
++    seen = {}
++
++    def switch(**kwargs):
++        seen.update(kwargs)
++        return model_switch.ModelSwitchResult(success=True, new_model='anthropic-deep', target_provider='anthropic',
++                                              base_url='https://api.anthropic.com', api_mode='anthropic_messages')
++
++    monkeypatch.setattr(model_switch, 'switch_model', switch)
++    url = 'https://openrouter.ai/api/v1'
++    config = {**managed, 'model': {'default': 'paid', 'provider': 'openrouter', 'base_url': url}}
++    policy = build_policy({'cwd': str(tmp_path), 'model': 'paid', 'provider': 'openrouter', 'base_url': url},
++                          config, private_secrets={})
++    with SessionDB(tmp_path / 'state.db') as db:
++        authority = SimpleNamespace(instance_id='i', epoch=1, profile_id='p', db=db)
++        authority.runner = SimpleNamespace(session_authority=authority, _resolve_session_agent_runtime=refuse)
++        result = await prepare_model(authority, SimpleNamespace(source=None, route='r'),
++                                     {'model': 'anthropic-deep', 'provider': 'anthropic'},
++                                     {'snapshot': {'receipt': {'session_id': 'sid', 'policy': asdict(policy)}}})
++    moved = restore_policy(result['policy'])
++    assert moved.model == 'anthropic-deep'
++    assert moved.config()['model']['provider'] == 'anthropic'
++    assert seen['current_model'] == 'paid' and seen['current_api_key'] == ''
+-- 
+2.55.0
+

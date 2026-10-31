@@ -1,0 +1,339 @@
+From 9722d7272fa5b8fede349ccde4387578082f4a99 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 23:10:52 +0000
+Subject: [PATCH] ci: nightly e2e state lock, did-not-run card on persistent
+ errors, ERROR ids [daveey]
+
+---
+ scripts/ci/nightly_e2e.py    |  96 +++++++++++++++++++-------
+ tests/ci/test_nightly_e2e.py | 130 +++++++++++++++++++++++++++++++++--
+ 2 files changed, 196 insertions(+), 30 deletions(-)
+
+diff --git a/scripts/ci/nightly_e2e.py b/scripts/ci/nightly_e2e.py
+index 60a0b90ee49..a741a6d75c6 100644
+--- a/scripts/ci/nightly_e2e.py
++++ b/scripts/ci/nightly_e2e.py
+@@ -14,25 +14,35 @@ Reporting (``report``), always within ``DEADLINE_HOURS`` of the dispatch:
+                  with the same ids comments on that open card instead of filing another. Body: run link + tests.
+ * not finished in time / cancelled / never started -> ONE "did not run" card, later occurrences comment on it.
+ * green while a card of ours is open -> comment the green run on every open one.
++* GitHub (or the board) keeps erroring -> retried every tick; past the deadline the run gets the "did not run" card
++                 with the error. If the board itself fails, the run stays pending and ``report`` exits 1, so the cron
++                 run shows the error; a run is never dropped without a card.
++
++Both commands hold an exclusive flock on ``<state>.lock`` from loading the state to saving it, so the 02:00 dispatch
++and a report tick that overlap cannot overwrite each other's ``pending`` (hub-only, so fcntl is enough).
+ 
+ Never the Inbox: an agent can fix a red suite, so it is a card (AGENTS.md "Proposing Work").
+ Cards go through ``hermes kanban`` of the host it runs on (flaky_kanban.CliBoard); GitHub through the REST API
+-with ``GH_TOKEN`` (the hub wrapper scripts/nightly_e2e.py mints it the same way ci_flaky_cards.py does).
++with ``GH_TOKEN``. The hub cron wrappers (~/.hermes/scripts/nightly_e2e_dispatch.py and nightly_e2e_report.py) run
++this under ``token-broker exec --scope user/github``, which injects it: dispatching needs actions:write, which the
++read-only GitHub App token ci_flaky_cards.py uses does not have.
+ """
+ 
+ from __future__ import annotations
+ 
+ import argparse
++import contextlib
+ import hashlib
+ import json
+ import os
+ import re
++import subprocess
+ import sys
+ import time
+ import urllib.error
+ import urllib.request
+ from pathlib import Path
+-from typing import Any, Protocol
++from typing import Any, Iterator, Protocol
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+ from flaky_kanban import OPEN, CliBoard, CreateRefused
+@@ -43,11 +53,15 @@ E2E_JOB = "e2e"  # the called tests.yml job: reported by GitHub as "e2e / e2e"
+ DEADLINE_HOURS = 4.0
+ RUN_LOOKUP_MINUTES = 30.0  # a dispatch with no run after this long never started
+ DEFAULT_STATE = Path(os.path.expanduser("~/.hermes/state/nightly-e2e.json"))
+-FAILED_LINE = re.compile(
+-    r"Z FAILED (tests/\S+::\S+)"
+-)  # the summary line; the live "║ FAILED" copies are excluded
++# pytest's short-summary lines: FAILED, and ERROR for setup/teardown/collection errors ("ERROR tests/x.py" has no
++# "::"). The live "║ FAILED" copies are excluded.
++FAILED_LINE = re.compile(r"Z (?:FAILED|ERROR) (tests/\S+)")
+ SUMMARY_LINE = re.compile(r"=== Summary: .*? ===")
+ MAX_LISTED = 150
++# GitHub (urllib: OSError, bad JSON: ValueError, missing field: KeyError) and board (CliBoard: RuntimeError, a hung
++# `hermes kanban`: subprocess.TimeoutExpired) failures; anything else is a bug and crashes.
++SETTLE_ERRORS = (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError)
++BOARD_FAILED = "BOARD FAILED"
+ 
+ 
+ class GitHub(Protocol):
+@@ -195,8 +209,23 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
+     os.replace(tmp, path)
+ 
+ 
++@contextlib.contextmanager
++def locked_state(path: Path) -> Iterator[dict[str, Any]]:
++    """The state, loaded and saved under an exclusive flock on ``<path>.lock`` held for the whole block."""
++    import fcntl  # hub-only; imported here so the module (and its tests) still import on Windows
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with open(path.with_suffix(".lock"), "ab") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes, after save_state
++        state = load_state(path)
++        try:
++            yield state
++        finally:
++            save_state(path, state)
++
++
+ def failing_tests(log: str) -> list[str]:
+-    """Sorted, de-duplicated test ids from a job log's pytest summary lines (not the live ║ copies)."""
++    """Sorted, de-duplicated test ids from a job log's pytest FAILED/ERROR summary lines (not the live ║ copies)."""
+     return sorted(set(FAILED_LINE.findall(log)))
+ 
+ 
+@@ -392,21 +421,41 @@ def _settle(
+     )
+ 
+ 
++def _settle_error(
++    board: Any, state: dict[str, Any], entry: dict[str, Any], err: Exception, *, now: float
++) -> tuple[bool, str]:
++    """Within the deadline: stay pending, the next tick retries. Past it: the "did not run" card carries the error;
++    if the board fails too, stay pending and say so (``BOARD_FAILED``): a run is never dropped without a card."""
++    age = now - entry["dispatched_at"]
++    if age <= DEADLINE_HOURS * 3600:
++        return False, f"error (retrying): {err!r}"
++    try:
++        return True, "did-not-run after errors: " + _file_or_update(
++            board,
++            state,
++            "did-not-run",
++            "Nightly e2e result unknown (settling the run kept failing)",
++            _card_body(
++                "did-not-run",
++                entry,
++                [],
++                f"Settling the run still failed {age / 3600:.1f} h after dispatch: {err!r}",
++            ),
++            f"Nightly e2e result unknown again: settling {entry.get('url') or entry['sha']} still failed after "
++            f"{DEADLINE_HOURS:g} h: {err!r}",
++        )
++    except SETTLE_ERRORS as board_err:
++        return False, f"{BOARD_FAILED}, kept pending: settle error {err!r}; filing the card: {board_err!r}"
++
++
+ def report(gh: GitHub, board: Any, state: dict[str, Any], *, now: float) -> list[str]:
+     out: list[str] = []
+     still: list[dict[str, Any]] = []
+     for entry in list(state["pending"]):
+         try:
+             done, msg = _settle(gh, board, state, entry, now=now)
+-        except (
+-            OSError,
+-            ValueError,
+-            KeyError,
+-            RuntimeError,
+-        ) as err:  # keep the run pending; the next tick retries. A permanent error ends at the deadline.
+-            done, msg = False, f"error: {err!r}"
+-            if now - entry["dispatched_at"] > (DEADLINE_HOURS + 2) * 3600:
+-                done, msg = True, f"abandoned after errors: {err!r}"
++        except SETTLE_ERRORS as err:
++            done, msg = _settle_error(board, state, entry, err, now=now)
+         out.append(f"{entry.get('url') or entry['sha']}: {msg}")
+         if not done:
+             still.append(entry)
+@@ -439,21 +488,18 @@ def main(argv: list[str] | None = None) -> int:
+     ap.add_argument("--hermes", default="hermes")
+     args = ap.parse_args(argv)
+     gh = RestGitHub(_token(), args.repo, args.workflow_ref)
+-    state = load_state(args.state)
+-    now = time.time()
+-    try:
++    with locked_state(args.state) as state:
++        now = time.time()  # after the lock: a dispatch that waited on a report tick records when it really ran
+         if args.command == "dispatch":
+             entry = dispatch(gh, state, args.ref, now=now)
+             print(
+                 f"nightly-e2e: dispatched {entry['ref']} = {entry['sha']}: {entry['url'] or 'run not visible yet'}"
+             )
+-        else:
+-            lines = report(gh, NightlyBoard(args.hermes), state, now=now)
+-            if lines:  # silent when nothing is pending: a no-agent cron job with empty stdout stays quiet
+-                print("nightly-e2e:\n" + "\n".join(lines))
+-    finally:
+-        save_state(args.state, state)
+-    return 0
++            return 0
++        lines = report(gh, NightlyBoard(args.hermes), state, now=now)
++    if lines:  # silent when nothing is pending: a no-agent cron job with empty stdout stays quiet
++        print("nightly-e2e:\n" + "\n".join(lines))
++    return 1 if any(BOARD_FAILED in line for line in lines) else 0
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/ci/test_nightly_e2e.py b/tests/ci/test_nightly_e2e.py
+index 3a273b523f9..e7f279f2460 100644
+--- a/tests/ci/test_nightly_e2e.py
++++ b/tests/ci/test_nightly_e2e.py
+@@ -2,7 +2,10 @@
+ 
+ from __future__ import annotations
+ 
++import os
++import subprocess
+ import sys
++import time
+ from pathlib import Path
+ 
+ import pytest
+@@ -118,6 +121,22 @@ def test_failing_tests_are_sorted_unique_and_skip_live_copies():
+     assert ne.failing_tests(log) == ["tests/e2e/a.py::t", "tests/e2e/b.py::t[2]"]
+ 
+ 
++def test_failing_tests_include_pytest_error_summary_ids():
++    log = "\n".join(
++        [
++            _log("tests/e2e/a.py::t"),
++            "2026-10-30T10:09:00.1Z   ║ ERROR tests/e2e/live.py::t - live copy",
++            "2026-10-30T10:20:07.7Z ERROR tests/e2e/c.py::t - fixture 'tmux' not found",
++            "2026-10-30T10:20:07.8Z ERROR tests/e2e/broken.py - ImportError: x",
++        ]
++    )
++    assert ne.failing_tests(log) == [
++        "tests/e2e/a.py::t",
++        "tests/e2e/broken.py",
++        "tests/e2e/c.py::t",
++    ]
++
++
+ def test_failure_key_depends_only_on_the_set():
+     assert (
+         ne.failure_key(["b", "a"])
+@@ -271,14 +290,115 @@ def test_failure_outside_pytest_still_files_a_card(env):
+     assert "outside pytest" in board.cards["t_1"]["body"]
+ 
+ 
+-def test_api_error_keeps_run_pending_then_gives_up(env):
++def _raise(err):
++    def fn(*_a, **_k):
++        raise err
++
++    return fn
++
++
++@pytest.mark.parametrize("failing", ["run", "job_log"])
++def test_persistent_github_error_files_did_not_run_card_past_deadline(env, failing):
+     gh, board, state = env
+     _dispatch(gh, state)
+-    gh.run = lambda rid: (_ for _ in ()).throw(RuntimeError("503"))
+-    ne.report(gh, board, state, now=T0 + 600)
++    gh.finish(100, "failure", _log("tests/e2e/a.py::t"))
++    setattr(gh, failing, _raise(OSError("HTTP 503")))
++    lines = ne.report(gh, board, state, now=T0 + 3.9 * 3600)
++    assert len(state["pending"]) == 1 and board.cards == {} and "retrying" in lines[0]
++    lines = ne.report(gh, board, state, now=T0 + 4.1 * 3600)
++    assert state["pending"] == [] and len(board.cards) == 1
++    card = board.cards["t_1"]
++    assert "did NOT run" in card["body"] and "HTTP 503" in card["body"]
++    assert "https://gh/run/100" in card["body"] and "did-not-run after errors" in lines[0]
++    # the next night's persistent error comments on the same open card
++    _dispatch(gh, state, now=T0 + 86400)
++    gh.finish(101, "failure", _log("tests/e2e/a.py::t"))
++    ne.report(gh, board, state, now=T0 + 86400 + 4.1 * 3600)
++    assert len(board.cards) == 1 and "HTTP 503" in card["comments"][0]
++
++
++class BrokenBoard(FakeBoard):
++    create = status = comment = _raise(RuntimeError("hermes kanban create failed (1): db locked"))
++
++
++def test_board_failure_past_deadline_keeps_run_pending_and_says_so(env):
++    gh, _board, state = env
++    _dispatch(gh, state)
++    gh.run = _raise(OSError("HTTP 503"))
++    lines = ne.report(gh, BrokenBoard(), state, now=T0 + 5 * 3600)
+     assert len(state["pending"]) == 1
+-    ne.report(gh, board, state, now=T0 + 7 * 3600)
+-    assert state["pending"] == []
++    assert ne.BOARD_FAILED in lines[0] and "HTTP 503" in lines[0] and "db locked" in lines[0]
++    board = FakeBoard()  # the board recovers: the next tick files the card
++    ne.report(gh, board, state, now=T0 + 5 * 3600 + 600)
++    assert state["pending"] == [] and len(board.cards) == 1
++
++
++def _seed(path, gh, dispatched_at):
++    with ne.locked_state(path) as state:
++        _dispatch(gh, state, now=dispatched_at)
++
++
++@pytest.mark.platforms("posix")
++def test_main_report_exits_1_and_keeps_pending_when_board_fails(tmp_path, monkeypatch, capsys):
++    gh, path = FakeGitHub(), tmp_path / "state.json"
++    _seed(path, gh, time.time() - 5 * 3600)
++    gh.run = _raise(OSError("HTTP 503"))
++    monkeypatch.setenv("GH_TOKEN", "x")
++    monkeypatch.setattr(ne, "RestGitHub", lambda *a: gh)
++    monkeypatch.setattr(ne, "NightlyBoard", lambda *a: BrokenBoard())
++    assert ne.main(["report", "--state", str(path)]) == 1
++    assert ne.BOARD_FAILED in capsys.readouterr().out
++    assert [e["run_id"] for e in ne.load_state(path)["pending"]] == [100]
++
++
++# A real process per command: report loads pending, then (inside GitHub calls) a dispatch runs and saves.
++_CHILD = r"""
++import sys, time
++from pathlib import Path
++sys.path.insert(0, sys.argv[1])
++import nightly_e2e as ne
++mode, state, signal = sys.argv[2], sys.argv[3], Path(sys.argv[4])
++
++class GH:
++    def __init__(self, *a): pass
++    def resolve(self, ref): return "b" * 40
++    def dispatch(self, ref, sha): pass
++    def runs_since(self, since): return [{"id": 5000, "html_url": "https://gh/run/5000"}]
++    def run(self, run_id):
++        signal.touch()  # report holds the pending list it loaded; the racing dispatch starts now
++        time.sleep(1.5)
++        return {"status": "completed", "conclusion": "success"}
++    def jobs(self, run_id): return [{"id": 1, "name": "e2e / e2e", "conclusion": "success"}]
++
++ne.RestGitHub, ne.NightlyBoard = GH, lambda *a: None
++sys.exit(ne.main([mode, "--state", state]))
++"""
++
++
++@pytest.mark.platforms("posix")
++def test_concurrent_report_and_dispatch_processes_do_not_lose_the_dispatch(tmp_path):
++    path, signal = tmp_path / "state.json", tmp_path / "report-inside-github"
++    _seed(path, FakeGitHub(), time.time() - 600)  # run 100, pending; the report settles it green
++    child = tmp_path / "child.py"
++    child.write_text(_CHILD, encoding="utf-8")
++    env = {**os.environ, "GH_TOKEN": "x"}
++
++    def start(mode):
++        argv = [sys.executable, str(child), str(ROOT / "scripts" / "ci"), mode, str(path), str(signal)]
++        return subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++
++    report = start("report")
++    deadline = time.monotonic() + 30
++    while not signal.exists():
++        assert report.poll() is None and time.monotonic() < deadline, report.communicate()[0]
++        time.sleep(0.02)
++    dispatch = start("dispatch")
++    outs = [p.communicate(timeout=60)[0] for p in (report, dispatch)]
++    assert [report.returncode, dispatch.returncode] == [0, 0], outs
++    state = ne.load_state(path)
++    # unserialized, the report saves the pending list it loaded before the dispatch: run 5000 is wiped
++    assert [e["run_id"] for e in state["pending"]] == [5000], outs
++    assert set(state["seen"]) == {100, 5000}
+ 
+ 
+ def test_state_round_trip(tmp_path):
+-- 
+2.55.0
+

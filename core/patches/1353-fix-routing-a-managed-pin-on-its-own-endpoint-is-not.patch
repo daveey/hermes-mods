@@ -1,0 +1,250 @@
+From d464e6a60e15212742665a2edbc4027fdcc3fd85 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 16:08:07 -0700
+Subject: [PATCH] fix(routing): a managed pin on its own endpoint is not an
+ override, and a refusal is not a bad sign-in [daveey]
+
+Every turn of an adopted Desktop chat failed before reaching a provider:
+"Managed subscription pins cannot override credentials or endpoint", shown as
+"The AI service rejected your sign-in", with no Retry.
+
+Why it happened:
+- adopt_legacy_session froze the saved endpoint into the launch request, because
+  same_route compares the profile's implicit native URL ('') with the saved
+  https://api.anthropic.com and calls them different.
+- route_runtime passes that launch URL to the resolver as explicit_base_url.
+- The managed guard (40f638ec5b) refused any explicit URL, even the pin's own.
+- Why it wasn't caught: guard tests used only foreign URLs, and no test ran an
+  adopted receipt through a managed route.
+- Why it looked like auth: _resolution_failure_reply stamps every resolver failure
+  on a local chat auth_permanent, so the card hid the real sentence.
+
+14 of 14 stored receipts carrying a base_url failed before this and resolve after
+it. Routing never used that URL, so the guard now refuses only a real override;
+auto, custom, other vendors, unknown hosts and any explicit key stay refused.
+ModelRoutingError on a local chat reports route_refused on the gateway layer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/error_surface.py                        |   4 +-
+ agent/model_routing_managed.py                |  16 +++
+ gateway/run_turn_runner.py                    |   4 +-
+ hermes_cli/runtime_provider.py                |   4 +-
+ .../test_managed_pin_native_endpoint.py       | 112 ++++++++++++++++++
+ 5 files changed, 135 insertions(+), 5 deletions(-)
+ create mode 100644 tests/gateway/test_managed_pin_native_endpoint.py
+
+diff --git a/agent/error_surface.py b/agent/error_surface.py
+index 9e86841dc81..b12ec18142d 100644
+--- a/agent/error_surface.py
++++ b/agent/error_surface.py
+@@ -40,7 +40,7 @@ _REASON_TO_LAYER = {
+     "pre_final_gate_unresolved": LAYER_GATEWAY,
+     "session_turn_lease_lost": LAYER_GATEWAY,  # [daveey] tui_gateway/prompt_turn._surface_system_interrupt
+     "gateway_connection": LAYER_GATEWAY, "host_error": LAYER_GATEWAY, "workspace_unavailable": LAYER_GATEWAY,
+-    "launch_credentials_unavailable": LAYER_GATEWAY,
++    "launch_credentials_unavailable": LAYER_GATEWAY, "route_refused": LAYER_GATEWAY,
+     "truncated": LAYER_PROVIDER, "empty_response": LAYER_PROVIDER, "invalid_response": LAYER_PROVIDER,
+     "context_overflow": LAYER_PROVIDER,  # a bigger-window model IS the fix, so Switch provider applies
+ }
+@@ -58,7 +58,7 @@ _FREE_TIER_RETRYABLE_KINDS = {"rate_limited", "at_capacity", "outage"}
+ _NON_RETRYABLE_REASONS = {
+     "auth", "auth_permanent", "billing", "billing_unverified", "content_policy_blocked",
+     "provider_policy_blocked", "data_policy_denied", "model_not_found", "format_error", "ssl_cert_verification",
+-    "context_overflow", "interpreter_shutdown", "upstream_blocked", "pre_final_gate_unresolved",
++    "context_overflow", "interpreter_shutdown", "upstream_blocked", "pre_final_gate_unresolved", "route_refused",
+ }
+ 
+ # Providers whose base_url is user-supplied rather than a known vendor.
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+index 5d73947fd23..187a6017803 100644
+--- a/agent/model_routing_managed.py
++++ b/agent/model_routing_managed.py
+@@ -19,6 +19,22 @@ def managed_config(config=None):
+     return config
+ 
+ 
++def overrides_endpoint(provider, base_url, config):
++    """True when *base_url* asks for anything but *provider*'s own endpoint. [daveey]
++
++    Adoption freezes a Desktop chat's saved endpoint into its launch request, so a native URL reaches
++    the resolver as "explicit" while overriding nothing. ``auto`` and bare ``custom`` have no endpoint
++    of their own, and an unknown host proves nothing, so those stay overrides.
++    """
++    if not base_url:
++        return False
++    from hermes_cli.providers import normalize_provider
++    from hermes_cli.route_identity import provider_owns_route
++    canonical = normalize_provider(str(provider or "").strip().lower())
++    return (canonical in ("", "auto", "custom", "local")
++            or provider_owns_route(canonical, base_url, config) is not True)
++
++
+ class ManagedPinRejectedError(ModelRoutingError):
+     """A concrete pin the registry cannot serve. Config, not a transient: a retry never heals it. [daveey]"""
+ 
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index dae4c3e9020..08371989f1d 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -139,6 +139,7 @@ def _settle_api_runtime_lock(agent, result, captured):
+ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, str, bool]:
+     """``(chat text, failure_reason, retryable)`` for a model/credential resolution failure before the turn."""
+     from agent.error_classifier import FailoverReason
++    from agent.model_routing import ModelRoutingError
+     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+     from hermes_state_runtime import RuntimeStoreError
+     auth_permanent = FailoverReason.auth_permanent.value
+@@ -169,7 +170,8 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str,
+     if platform == Platform.LOCAL:
+         # The local operator reads the terminal: the resolver's own sentence ("provider 'custom'
+         # resolved without credentials ...") is the diagnosis; /login is not.
+-        return f"⚠️ {exc}", auth_permanent, False
++        # [daveey] A routing refusal is a policy verdict, not a credential one: no provider saw this turn.
++        return f"⚠️ {exc}", "route_refused" if isinstance(exc, ModelRoutingError) else auth_permanent, False
+     seen: set[int] = set()
+     host = auth = False
+     link: BaseException | None = exc
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 04a759500b4..e7b20f38eea 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -1061,7 +1061,7 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
+     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
+     OpenCode Zen/Go where different models route through different API surfaces)."""
+     from agent.model_routing import ModelRoutingError, is_class_selector
+-    from agent.model_routing_managed import managed_config, resolve_managed_runtime
++    from agent.model_routing_managed import managed_config, overrides_endpoint, resolve_managed_runtime
+     managed = managed_config(routing_config)
+     if managed is not None and not target_model:
+         model_config = managed.get("model", {})
+@@ -1069,7 +1069,7 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
+         if not requested and isinstance(model_config, dict):
+             requested = model_config.get("provider")
+     if managed is not None and not is_class_selector(target_model):
+-        if explicit_api_key or explicit_base_url:
++        if explicit_api_key or overrides_endpoint(requested, explicit_base_url, managed):
+             raise ModelRoutingError("Managed subscription pins cannot override credentials or endpoint")
+         return resolve_managed_runtime(target_model, requested, config=managed,
+                                        session_id=routing_session_id, requirements=routing_requirements)
+diff --git a/tests/gateway/test_managed_pin_native_endpoint.py b/tests/gateway/test_managed_pin_native_endpoint.py
+new file mode 100644
+index 00000000000..9d5fde88c33
+--- /dev/null
++++ b/tests/gateway/test_managed_pin_native_endpoint.py
+@@ -0,0 +1,112 @@
++"""[daveey] A managed pin frozen with its provider's own endpoint still runs.
++
++``adopt_legacy_session`` freezes a Desktop chat's saved endpoint into the launch request, and
++``route_runtime`` hands that URL to the resolver as ``explicit_base_url``. The managed guard refused
++every explicit URL, so all 14 adopted chats failed each turn with "Managed subscription pins cannot
++override credentials or endpoint", and the Desktop card called it a rejected sign-in.
++"""
++import pytest
++
++ANTHROPIC = ('anthropic', 'claude-opus-5-5', 'https://api.anthropic.com')
++CODEX = ('openai-codex', 'gpt-6-astra', 'https://chatgpt.com/backend-api/codex')
++
++
++def _route(provider, model):
++    return {'provider': provider, 'model': model, 'billing': 'subscription', 'weight': 1,
++            'capabilities': {}}
++
++
++CONFIG = {'model': {'default': ANTHROPIC[1], 'provider': ANTHROPIC[0]},
++          'model_routing': {'enabled': True, 'policy_version': 1, 'allow_metered': False,
++                            'enforce_subscription_only': True,
++                            'routes': {'deep': [_route(*ANTHROPIC[:2]), _route(*CODEX[:2])]}}}
++
++
++@pytest.fixture
++def managed(tmp_path, monkeypatch):
++    """The real guard over a stubbed allocation: every call that passes it lands in ``calls``."""
++    from hermes_cli.config import atomic_config_write
++    home = tmp_path / 'home'
++    home.mkdir()
++    atomic_config_write(home / 'config.yaml', CONFIG)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    calls = []
++
++    def allocate(model, provider, **kwargs):
++        calls.append((model, provider))
++        return {'provider': provider, 'requested_provider': provider, 'api_key': 'pool', 'base_url': 'native',
++                'api_mode': None}
++
++    monkeypatch.setattr('agent.model_routing_managed.resolve_managed_runtime', allocate)
++    return calls
++
++
++def _adopted_policy(tmp_path, provider, model, base_url):
++    from gateway.session_policy import build_policy
++    config = {**CONFIG, 'model': {'default': model, 'provider': provider, 'base_url': base_url}}
++    return build_policy({'source': 'gui', 'cwd': str(tmp_path), 'toolsets': [], 'model': model,
++                         'provider': provider, 'base_url': base_url}, config, profile_terminal=False)
++
++
++@pytest.mark.parametrize('route', [ANTHROPIC, CODEX], ids=['anthropic', 'codex'])
++def test_resolver_serves_a_pin_on_its_own_endpoint(managed, route):
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    provider, model, base_url = route
++    runtime = resolve_runtime_provider(requested=provider, target_model=model, explicit_base_url=base_url)
++    assert managed == [(model, provider)]
++    assert runtime['api_key'] == 'pool'
++
++
++@pytest.mark.parametrize('route', [ANTHROPIC, CODEX], ids=['anthropic', 'codex'])
++@pytest.mark.parametrize('fallback', [True, False])
++def test_an_adopted_chat_route_runs_on_its_frozen_native_endpoint(managed, tmp_path, route, fallback):
++    from gateway.session_worker_construct import route_runtime
++    provider, model, base_url = route
++    policy = _adopted_policy(tmp_path, provider, model, base_url)
++    frozen, effective = policy.effective()
++    runtime, fallback_entry = route_runtime(policy, frozen, effective, None, fallback=fallback)
++    assert fallback_entry is None
++    assert managed == [(model, provider)] and runtime['provider'] == provider
++
++
++@pytest.mark.parametrize('provider,base_url', [
++    ('anthropic', 'https://proxy.example.com/v1'),
++    ('anthropic', 'https://openrouter.ai/api/v1'),
++    ('openai-codex', 'https://api.anthropic.com'),
++    ('auto', 'https://api.anthropic.com'),
++    (None, 'https://api.anthropic.com'),
++    ('custom', 'https://api.anthropic.com'),
++], ids=['unknown-host', 'other-vendor', 'crossed-native', 'auto', 'no-provider', 'custom'])
++def test_a_real_endpoint_override_is_still_refused(managed, provider, base_url):
++    from agent.model_routing import ModelRoutingError
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    with pytest.raises(ModelRoutingError, match='cannot override'):
++        resolve_runtime_provider(requested=provider, target_model=ANTHROPIC[1], explicit_base_url=base_url)
++    assert managed == []
++
++
++@pytest.mark.parametrize('base_url', [None, ANTHROPIC[2]], ids=['key-alone', 'key-with-native-url'])
++def test_an_explicit_key_is_still_refused(managed, base_url):
++    from agent.model_routing import ModelRoutingError
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    with pytest.raises(ModelRoutingError, match='cannot override'):
++        resolve_runtime_provider(requested=ANTHROPIC[0], target_model=ANTHROPIC[1], explicit_api_key='sk-explicit',
++                                 explicit_base_url=base_url)
++    assert managed == []
++
++
++def test_a_routing_refusal_on_a_local_chat_is_not_a_rejected_sign_in():
++    from agent.error_surface import _REASON_TO_LAYER, LAYER_AUTH
++    from agent.model_routing import ModelRoutingError
++    from gateway.config import Platform
++    from gateway.run_turn_runner import _resolution_failure_reply
++    text, reason, retryable = _resolution_failure_reply(ModelRoutingError('no route'), Platform.LOCAL)
++    assert 'no route' in text and retryable is False
++    assert reason != 'auth_permanent' and _REASON_TO_LAYER.get(reason) not in (None, LAYER_AUTH)
++
++
++def test_a_plain_credential_failure_on_a_local_chat_stays_a_sign_in_failure():
++    from gateway.config import Platform
++    from gateway.run_turn_runner import _resolution_failure_reply
++    from hermes_cli.auth import AuthError
++    assert _resolution_failure_reply(AuthError('no creds'), Platform.LOCAL)[1] == 'auth_permanent'
+-- 
+2.55.0
+

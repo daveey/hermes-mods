@@ -1,55 +1,72 @@
-# pre_verify can check every final answer, not only ones after edits
+# pre_verify checks live final answers, never detached fork summaries
 
-Patches:
-
-- `patches/0052-feat-agent-agent.pre_verify_every_turn-fires-pre_ver.patch`: agent. New config key
-  `agent.pre_verify_every_turn` fires the `pre_verify` plugin hook on text stops with no file edits.
-
-What you see: nothing, unless a plugin registers `pre_verify` and you set `agent.pre_verify_every_turn: true`. Then
-that plugin gets a say on every final answer, for example to catch a hand-off or an unchecked "done", and can keep
-the agent going with a message. Stock Hermes only asked the hook after a turn that edited files.
+Patches: 0052 and 1364 (`966154e8d35`).
 
 ## Behavior
 
-- **Default off** (`pre_verify_every_turn: False` in `DEFAULT_CONFIG["agent"]`). Behavior is then upstream: the hook
-  runs only when the turn changed files.
-- **On:** when the agent stops with a text answer, a registered `pre_verify` hook is called even with no edits. It
-  gets `changed_paths=[]`, plus the usual `final_response`, `attempt`, `coding`, `session_id`, `platform`, `model`.
-- The hook keeps the turn going the same way as before: return `{"action": "continue", "message": ...}` (or
-  `{"decision": "block", "reason": ...}`).
-- The existing cap still applies: at most `agent.max_verify_nudges` (default 3) continue nudges per turn, so a hook
-  can't trap the loop.
-- The value is parsed with `is_truthy_value`, so `"yes"` counts as true.
+- **Default off** (`pre_verify_every_turn: False` in `DEFAULT_CONFIG["agent"]`):
+  live turns consult the hook only after file edits.
+- **On:** live text stops consult a registered `pre_verify` hook even without
+  edits, supplying `changed_paths=[]` and the usual final response, attempt,
+  coding flag, session ID, platform, and model.
+- Hooks may return `{"action": "continue", "message": ...}` or
+  `{"decision": "block", "reason": ...}` to request another turn.
+- The existing `agent.max_verify_nudges` cap (default 3) still applies.
+- Detached forks skip every `pre_verify` hook when `_turn_origin` is truthy or
+  `_persist_disabled` is true, even with edits and every-turn checking enabled.
+  This covers background skill/memory review and side-question summaries that
+  share a parent session ID but are not the user's reply.
+- Live turns still call the hook with their parent session identity.
 
 ## How it works
 
-- `agent/verify_hooks.py`: new `pre_verify_every_turn(config=None)` reads `agent.pre_verify_every_turn`, exported in
-  `__all__`.
-- `agent/turn_stop_gates.py`, `_pre_verify_nudge`: the condition changed from
-  `_edited and has_hook("pre_verify") and attempt < max_verify_nudges()` to
-  `has_hook("pre_verify") and attempt < max_verify_nudges() and (_edited or pre_verify_every_turn())`.
-  `get_pre_verify_continue_message` is called unchanged.
-- `hermes_cli/config_defaults.py`: adds the default with a comment.
+`pre_verify_every_turn(config=None)` reads the opt-in using `is_truthy_value`;
+truthy strings such as `"yes"` are accepted (that spelling is untested here).
+`_pre_verify_nudge` first checks the fork markers and returns `None` immediately.
+It emits one INFO line per skipped invocation:
+`pre_verify skipped for fork turn origin=<origin> session=<sid>`.
+An absent origin is logged as `persist_disabled`; logging is untested by the new cases.
+This aligns with `post_llm_call`, which the finalizer already skips for
+`_persist_disabled`. No finalizer change is included in 1364.
+For a live turn, the remaining condition is a registered hook, attempts below
+the cap, and either edits or the every-turn opt-in.
+
+## Code
+
+- `agent/verify_hooks.py`: option reader and export.
+- `agent/turn_stop_gates.py`: `_pre_verify_nudge` and detached-fork guard.
+- `hermes_cli/config_defaults.py`: default off.
 
 ## Tests
 
-`tests/agent/test_verify_hooks.py`:
-
+In `tests/agent/test_verify_hooks.py`:
 - `TestPreVerifyEveryTurn`: `test_off_by_default`, `test_opt_in`.
 - `TestPreVerifyGateWithoutEdits`: `test_no_edits_default_skips_hook`,
   `test_no_edits_opted_in_calls_hook_with_empty_paths`, `test_edits_still_call_hook_when_off`.
+- `TestPreVerifySkipsForkTurns`:
+  `test_background_review_fork_never_calls_hook` (both marks),
+  `test_turn_origin_alone_skips_hook`, `test_persist_disabled_alone_skips_hook`,
+  `test_live_turn_still_calls_hook` (control).
+
+Tests were inspected, not executed for this documentation task. The new tests
+invoke the stop gate directly, not the full background-review/side-question launchers.
 
 ## Applying
 
-Standalone. It builds on the upstream `pre_verify` hook and `max_verify_nudges` in `agent/verify_hooks.py`.
+0052 builds on upstream's `pre_verify` hook and `max_verify_nudges` support.
+Apply 1364 later in mirror series order. No new option is needed for fork exclusion.
 
 ## Gotchas
 
-- With this on, every hooked text stop pays for the hook call, and a hook that says "continue" costs a model turn.
-  Hooks should scope themselves (check `changed_paths`, `coding`, `attempt`, `final_response`).
-- Hooks written for the old contract may assume `changed_paths` is non-empty. Check yours before turning this on.
+Every eligible live text stop pays for its hook call, and a continue result
+costs another model turn. Hooks should scope themselves by paths/coding/attempt
+and tolerate empty `changed_paths`. The cap and return-shape contracts are
+existing behavior, not separately exercised by the four fork regressions.
 
-## Plugin?
+## Plugin side
 
-No. The plugin can supply the `pre_verify` hook, but whether the hook is called at all is decided in core
-(`_pre_verify_nudge`), so the gate needs this patch.
+Core must decide whether hooks are called; a plugin alone cannot make this guard.
+The companion coach hook also returns `None` for a `turn_origin` kwarg, and its
+`signals.py` routes a failed revision absent from `state.db` as
+`coach/judged_unsent_draft`. Those plugin changes are supplied context, untested
+by this core patch's tests.

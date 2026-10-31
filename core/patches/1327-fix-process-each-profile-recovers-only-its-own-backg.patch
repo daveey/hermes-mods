@@ -1,0 +1,755 @@
+From b57f02fcdf8258a72964a43be0ed3ca645e59ec4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 20:30:13 +0000
+Subject: [PATCH] fix(process): each profile recovers only its own background
+ jobs; finished jobs leave every checkpoint [daveey]
+
+The multiplexed gateway's one ProcessRegistry wrote every live job into every profile's
+processes.json, and a finished job left only the file of the profile that saw its exit. Each later
+restart re-attached the finished job from another profile's stale copy (proc_05186a9e0419: alpha-follow
+18:12Z, bb-tuner 19:11Z, ci-sweeper 20:12Z on 10-30) and wrote another result there.
+
+- a job keyed agent:<profile>:... is written to and recovered from only that profile's checkpoint
+  (agent:main = default only in a multiplexed registry); a non-owner hands its copy to the owner
+- a job whose result receipt exists in any profile is never re-attached, and is dropped from every
+  profile's processes.json when it finishes (one file lock at a time)
+- multiplexed startup first settles finished copies and re-homes the rest (the one-time cleanup)
+
+Tests: stale copy + foreign job (RED on main), startup cleanup, single-profile agent:main keys, and
+a re-attached sandbox completion starting a turn in a live Slack session through the real
+completion path (RED with the injection disabled).
+---
+ gateway/run_startup.py                        |   6 +
+ tests/gateway/test_completion_delivery.py     |   2 +-
+ tests/tools/test_kill_verify_tree_death.py    |   4 +-
+ ...st_process_checkpoint_profile_ownership.py | 192 +++++++++++++++
+ .../test_process_recovery_sandbox_reattach.py |  52 ++++
+ tools/process_registry.py                     |   2 +-
+ tools/process_registry_checkpoint.py          |  70 +++++-
+ tools/process_registry_profiles.py            | 230 ++++++++++++++++++
+ 8 files changed, 545 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tools/test_process_checkpoint_profile_ownership.py
+ create mode 100644 tools/process_registry_profiles.py
+
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index 04e33862fca..f4bac7fd9d3 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -1200,6 +1200,12 @@ class GatewayStartupMixin:
+         # served profile's file under its scope or those processes are never re-adopted.
+         with _log_suppressed(logging.WARNING, "Process checkpoint recovery: %s"):
+             from tools.process_registry import process_registry
++            if getattr(self.config, "multiplex_profiles", False):
++                # One registry serves every profile: each job lives in (and is recovered from) its own
++                # profile's checkpoint only. Settle finished copies and re-home the rest first. [daveey]
++                from tools.process_registry_profiles import consolidate_checkpoints
++                process_registry.profile_scoped_checkpoints = True
++                consolidate_checkpoints(multiplexed=True)
+             # owner="gateway": leave Desktop/TUI chats' orphans to the Desktop backend, so this gateway's
+             # shutdown kill_all can never kill a job it does not own. [daveey]
+             recovered = process_registry.recover_from_checkpoint(owner="gateway")
+diff --git a/tests/gateway/test_completion_delivery.py b/tests/gateway/test_completion_delivery.py
+index bcdfd22a32d..e3539b632ac 100644
+--- a/tests/gateway/test_completion_delivery.py
++++ b/tests/gateway/test_completion_delivery.py
+@@ -233,7 +233,7 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
+     session.process.pid = 4242
+     registry._running[session.id] = session
+     monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_a, **_kw: None)
+-    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
++    monkeypatch.setattr(registry, "_write_checkpoint", lambda *_a, **_k: None)
+     monkeypatch.setattr(pr_module, "process_registry", registry)
+ 
+     result = registry.kill_process(session.id)
+diff --git a/tests/tools/test_kill_verify_tree_death.py b/tests/tools/test_kill_verify_tree_death.py
+index b455a843c0b..6a6baa4423a 100644
+--- a/tests/tools/test_kill_verify_tree_death.py
++++ b/tests/tools/test_kill_verify_tree_death.py
+@@ -112,7 +112,7 @@ def test_escalated_kill_of_sigterm_ignoring_child_reports_killed(tmp_path, monke
+     after kill() still says alive, which turned every escalated kill into 'Kill incomplete'."""
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 0.2))
+-    monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self: None)
++    monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self, *_a, **_k: None)
+     reg = ProcessRegistry()
+     s = reg.spawn_local("trap '' TERM; sleep 30", cwd=str(tmp_path))
+     try:
+@@ -143,7 +143,7 @@ def test_kill_reaps_children_spawned_during_the_grace_window(tmp_path, monkeypat
+ 
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 1.5))
+-    monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self: None)
++    monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self, *_a, **_k: None)
+     started, pid_file = tmp_path / "started", tmp_path / "late_pids"
+     reg = ProcessRegistry()
+     s = reg.spawn_local(
+diff --git a/tests/tools/test_process_checkpoint_profile_ownership.py b/tests/tools/test_process_checkpoint_profile_ownership.py
+new file mode 100644
+index 00000000000..3093fcc6f29
+--- /dev/null
++++ b/tests/tools/test_process_checkpoint_profile_ownership.py
+@@ -0,0 +1,192 @@
++"""A multiplexed gateway's profiles each recover only their own background jobs. [daveey]
++
++One ``ProcessRegistry`` serves every profile of a multiplexed gateway, and each profile has its own
++``processes.json``. Every profile's checkpoint used to receive every live job; when the job finished
++only the file of the profile that saw the exit lost it, so each later restart re-attached the finished
++job from another profile's stale copy and wrote another result there (proc_05186a9e0419, owned by
++alpha-askeve, re-attached by alpha-follow 18:12Z, bb-tuner 19:11Z and ci-sweeper 20:12Z on 2026-10-30).
++"""
++
++import contextlib
++import json
++import shlex
++import subprocess
++import sys
++import time
++
++import pytest
++
++from tools.process_registry import ProcessRegistry
++
++OWNER = "alpha-askeve"
++OTHER = "coach"
++KEY = f"agent:{OWNER}:slack:dm:C123:1761813563.000100"
++
++
++class LocalShellSandbox:
++    """Stands in for a re-attached sandbox: runs the poller's commands in a local bash."""
++
++    def execute(self, command: str, cwd: str = "", timeout: int = 10, **_kw) -> dict:
++        res = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=timeout, check=False)
++        return {"output": res.stdout + res.stderr, "returncode": res.returncode}
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _start_wrapped(temp_dir, sid: str, script: str) -> int:
++    """Start *script* exactly as ``spawn_via_env`` wraps it inside a sandbox; return its PID."""
++    q = shlex.quote
++    log, pid, ext = (f"{temp_dir}/hermes_bg_{sid}.{e}" for e in ("log", "pid", "exit"))
++    wrapper = (f"( nohup bash -c {q(script)} > {q(log)} 2>&1; rc=$?; printf '%s\\n' \"$rc\" > {q(ext)} ) "
++               f"> /dev/null 2>&1 & echo $! > {q(pid)} && cat {q(pid)}")
++    out = subprocess.run(["bash", "-c", wrapper], capture_output=True, text=True, timeout=10, check=False).stdout
++    return int(out.strip().splitlines()[-1])
++
++
++def _entry(sid: str, pid: int, temp_dir, key: str = KEY) -> dict:
++    return {
++        "session_id": sid, "command": "~/work/qa.sh", "pid": pid, "pid_scope": "sandbox",
++        "started_at": time.time(), "task_id": f"profile_{OWNER}", "owner_task_id": key, "session_key": key,
++        "notify_on_complete": True, "watcher_platform": "local", "watcher_chat_id": "C123", "watcher_interval": 1,
++        "sandbox_handle": {"backend": "docker", "container_id": "214b16909172", "docker_exe": "docker"},
++        "sandbox_temp_dir": str(temp_dir), "writer_pid": _dead_pid(), "writer_start_time": None,
++    }
++
++
++@pytest.fixture()
++def homes(tmp_path, monkeypatch):
++    """A Hermes root with two named profiles, as the hub's multiplexed gateway serves them."""
++    root = tmp_path / ".hermes"
++    root.mkdir()
++    (root / "config.yaml").write_text("")
++    out = {"default": root}
++    for name in (OWNER, OTHER):
++        home = root / "profiles" / name
++        home.mkdir(parents=True)
++        (home / "config.yaml").write_text("")
++        out[name] = home
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    sandbox = LocalShellSandbox()
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment", lambda handle: sandbox)
++    return out
++
++
++@contextlib.contextmanager
++def scope(home):
++    """The profile scope the multiplexed gateway runs each profile's recovery and turns under."""
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    token = set_hermes_home_override(str(home))
++    try:
++        yield
++    finally:
++        reset_hermes_home_override(token)
++
++
++def _gateway_registry() -> ProcessRegistry:
++    reg = ProcessRegistry()
++    reg.profile_scoped_checkpoints = True  # what multiplexed gateway startup sets
++    return reg
++
++
++def _ids(home) -> list:
++    path = home / "processes.json"
++    return [e["session_id"] for e in json.loads(path.read_text())] if path.exists() else []
++
++
++def _result(home, sid):
++    return home / "logs" / "process-results" / f"{sid}.json"
++
++
++def _wait_exit(reg, sid, timeout=20.0):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        session = reg.get(sid)
++        if session is not None and session.exited:
++            return session
++        time.sleep(0.1)
++    raise AssertionError(f"{sid} never exited")
++
++
++def test_stale_copy_in_another_profile_is_not_reattached_after_the_owner_saw_the_exit(homes, tmp_path, caplog):
++    sid = "proc_05186a9e0419"
++    pid = _start_wrapped(tmp_path, sid, "sleep 1; echo DONE; exit 3")
++    entry = _entry(sid, pid, tmp_path)
++    # The state the hub was in: both profiles' checkpoints carry the job.
++    for name in (OWNER, OTHER):
++        (homes[name] / "processes.json").write_text(json.dumps([entry]))
++
++    owner_gw = _gateway_registry()
++    with scope(homes[OWNER]):
++        assert owner_gw.recover_from_checkpoint(owner="gateway") == 1
++        assert _wait_exit(owner_gw, sid).exit_code == 3
++    assert _result(homes[OWNER], sid).exists()
++    owner_gw.pending_watchers.clear()
++
++    # The next gateway restart recovers the other profile.
++    caplog.set_level("INFO", logger="tools.process_registry")
++    restarted = _gateway_registry()
++    with scope(homes[OTHER]):
++        assert restarted.recover_from_checkpoint(owner="gateway") == 0
++    assert sid not in restarted._running and not restarted.pending_watchers
++    assert not any("Re-attached sandbox process" in r.getMessage() for r in caplog.records)
++    assert not _result(homes[OTHER], sid).exists()
++    assert sid not in _ids(homes[OTHER]) and sid not in _ids(homes[OWNER])
++
++
++def test_finished_job_left_in_another_profile_is_dropped_at_startup(homes, tmp_path):
++    """The one-time cleanup: the hub's ci-sweeper/coach copies of a job whose result is recorded."""
++    from tools.process_registry_profiles import consolidate_checkpoints
++
++    sid = "proc_05186a9e0419"
++    (homes[OTHER] / "processes.json").write_text(json.dumps([_entry(sid, 51438, tmp_path)]))
++    _result(homes[OWNER], sid).parent.mkdir(parents=True)
++    _result(homes[OWNER], sid).write_text("{}")
++
++    assert consolidate_checkpoints(multiplexed=True) == 1
++    assert _ids(homes[OTHER]) == [] and _ids(homes[OWNER]) == []
++
++
++def test_non_owner_profile_never_reattaches_another_profiles_job(homes, tmp_path, caplog):
++    sid = "proc_foreign"
++    pid = _start_wrapped(tmp_path, sid, "sleep 30")
++    try:
++        (homes[OTHER] / "processes.json").write_text(json.dumps([_entry(sid, pid, tmp_path)]))
++        caplog.set_level("INFO", logger="tools.process_registry")
++
++        other_gw = _gateway_registry()
++        with scope(homes[OTHER]):
++            assert other_gw.recover_from_checkpoint(owner="gateway") == 0
++        assert sid not in other_gw._running and not other_gw.pending_watchers
++        assert not any("Re-attached sandbox process" in r.getMessage() for r in caplog.records)
++        # The copy moved to its owner's checkpoint, which re-attaches it exactly once.
++        assert _ids(homes[OTHER]) == [] and _ids(homes[OWNER]) == [sid]
++        with scope(homes[OWNER]):
++            assert other_gw.recover_from_checkpoint(owner="gateway") == 1
++        assert sid in other_gw._running
++
++        # While it runs, the other profile's checkpoint writes never persist it.
++        with scope(homes[OTHER]):
++            other_gw._write_checkpoint()
++        with scope(homes[OWNER]):
++            other_gw._write_checkpoint()
++        assert _ids(homes[OTHER]) == [] and _ids(homes[OWNER]) == [sid]
++    finally:
++        subprocess.run(["bash", "-c", f"kill {pid} 2>/dev/null; pkill -P {pid} 2>/dev/null"], check=False)
++
++
++def test_single_profile_gateway_keeps_recovering_its_own_main_keyed_jobs(homes, tmp_path):
++    """A non-multiplexed gateway of a named profile builds ``agent:main:`` keys for its own sessions."""
++    sid = "proc_main_key"
++    pid = _start_wrapped(tmp_path, sid, "sleep 30")
++    try:
++        (homes[OTHER] / "processes.json").write_text(
++            json.dumps([_entry(sid, pid, tmp_path, key="agent:main:slack:dm:C123")]))
++        reg = ProcessRegistry()  # not multiplexed
++        with scope(homes[OTHER]):
++            assert reg.recover_from_checkpoint(owner="gateway") == 1
++    finally:
++        subprocess.run(["bash", "-c", f"kill {pid} 2>/dev/null; pkill -P {pid} 2>/dev/null"], check=False)
+diff --git a/tests/tools/test_process_recovery_sandbox_reattach.py b/tests/tools/test_process_recovery_sandbox_reattach.py
+index 59d97694598..8659149787d 100644
+--- a/tests/tools/test_process_recovery_sandbox_reattach.py
++++ b/tests/tools/test_process_recovery_sandbox_reattach.py
+@@ -137,6 +137,58 @@ def test_a_alive_sandbox_process_is_reattached_and_its_completion_delivered(
+     assert registry.get("proc_qa").exit_code == 3
+ 
+ 
++def test_a_reattached_sandbox_completion_starts_a_turn_in_the_live_gateway_session(
++        checkpoint, registry, tmp_path, monkeypatch):
++    """The path the 10-30 live proof (a one-shot ``chat -q``) never ran: the re-attached job's exit goes
++    through the gateway's normal completion path (batch -> admission -> wake injection) into the live
++    Slack session's adapter as an internal message, which is what starts the agent's turn there."""
++    from gateway.config import Platform
++    from gateway.session import SessionSource
++
++    class AdmittingHandler(AsyncMock):
++        """Fake transport whose insertion issues the production acceptance receipt."""
++
++        async def _execute_mock_call(self, event, *args, **kwargs):
++            result = await super()._execute_mock_call(event, *args, **kwargs)
++            event._gateway_accepted = True
++            return result
++
++    sandbox = LocalShellSandbox()
++    pid = _start_wrapped(tmp_path, "proc_live", "sleep 1; echo 'pytest rc=1'; exit 3")
++    checkpoint.write_text(json.dumps([_sandbox_entry("proc_live", pid, tmp_path)]))
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment", lambda handle: sandbox)
++    assert registry.recover_from_checkpoint(owner="gateway") == 1
++
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++    import gateway.run as gateway_run
++    (tmp_path / "config.yaml").write_text("display:\n  background_process_notifications: concise\n")
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    runner = GatewayRunner(GatewayConfig())
++    adapter = SimpleNamespace(send=AsyncMock(), handle_message=AdmittingHandler(), _active_sessions={})
++    runner.adapters[Platform.SLACK] = adapter
++    # The live (not one-shot) session: the gateway's session store knows where the chat lives.
++    runner.session_store._entries[GW_KEY] = SimpleNamespace(origin=SessionSource(
++        platform=Platform.SLACK, chat_id="C123", chat_type="dm", thread_id="1761813563.000100",
++        user_id="U1", user_name="David"))
++
++    watchers, registry.pending_watchers = registry.pending_watchers, []
++
++    async def _go():
++        await asyncio.wait_for(asyncio.gather(*(runner._watch_process(w) for w in watchers)), 20)
++        for _ in range(100):  # the completion batch flushes on its own task
++            if adapter.handle_message.await_count:
++                break
++            await asyncio.sleep(0.1)
++
++    asyncio.run(_go())
++    adapter.handle_message.assert_awaited_once()
++    event = adapter.handle_message.await_args.args[0]
++    assert event.internal is True
++    assert event.source.platform == Platform.SLACK and event.source.chat_id == "C123"
++    assert "proc_live" in event.text and "exit code 3" in event.text
++
++
+ def test_a_tui_owned_sandbox_completion_goes_through_the_readopt_sink(checkpoint, registry, tmp_path, monkeypatch):
+     sandbox = LocalShellSandbox()
+     pid = _start_wrapped(tmp_path, "proc_tui", "echo hi; exit 0")
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 10eaccd2bf4..c2425b6aea8 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -1542,7 +1542,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+ 
+     def _publish_finished(self, session: ProcessSession, was_running: bool) -> None:
+         self._release_finished_handles(session)
+-        self._write_checkpoint()
++        self._write_checkpoint(settled_id=session.id if was_running else None)
+         if was_running and session.notify_on_complete:
+             notification = {
+                 "type": "completion",
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index 1e9a38735e8..9a6fa66d8bc 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -18,19 +18,36 @@ _SANDBOX_ORPHAN_KEEP_SECONDS = 7 * 24 * 3600
+ 
+ 
+ class ProcessCheckpointMixin:
++    # Set by the multiplexed gateway: one registry serves every profile, so an ``agent:main:`` key names
++    # the default profile rather than "whoever wrote it" (see tools.process_registry_profiles). [daveey]
++    profile_scoped_checkpoints: bool = False
++
++    def _owned_here(self, session_key, scope=None) -> bool:
++        from tools.process_registry_profiles import owned_here
++        return owned_here(session_key, multiplexed=self.profile_scoped_checkpoints, scope=scope)
++
+     def _detached_host_fate(self, pid: Optional[int], expected_start: Optional[int]) -> str:
+         """Subclass supplies the live PID decision. See ProcessRegistry."""
+         raise NotImplementedError
+ 
+     # ----- Checkpoint (crash recovery) -----
+ 
+-    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
+-        """Write running process metadata to the checkpoint file atomically."""
++    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None, *,
++                          settled_id: Optional[str] = None):
++        """Write running process metadata to the checkpoint file atomically. ``settled_id``: a job whose
++        result was just recorded, dropped from every other profile's checkpoint too (after this one's
++        lock is released), so no profile re-attaches it at a restart. [daveey]"""
+         try:
+             with self._checkpoint_file_lock():
+                 self._write_checkpoint_locked(extra_entries)
+         except Exception as e:
+             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
++        if settled_id:
++            from tools.process_registry_profiles import drop_from_every_checkpoint
++            try:
++                drop_from_every_checkpoint([settled_id])
++            except Exception:
++                logger.debug("Dropping %s from other checkpoints failed", settled_id, exc_info=True)
+ 
+     @staticmethod
+     def _checkpoint_file_lock():
+@@ -132,13 +149,20 @@ class ProcessCheckpointMixin:
+         that must leave the file even though no table of ours tracks them."""
+         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
+ 
++        from tools.process_registry_profiles import scope_profile
++
+         writer = self._writer_identity()
++        scope = scope_profile()
+         with self._lock:
+             own_ids = set(self._running) | set(self._finished) | set(drop_ids)
+             entries = []
+             for s in self._running.values():
+                 if s.exited:
+                     continue
++                # One registry serves every profile of a multiplexed gateway: a job goes only in its own
++                # profile's checkpoint, or every other profile re-attaches it after it finished. [daveey]
++                if not self._owned_here(s.session_key, scope):
++                    continue
+                 # Backfill the start time so recovery can detect PID recycling
+                 # even for sessions spawned before this field existed.
+                 if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+@@ -196,8 +220,11 @@ class ProcessCheckpointMixin:
+         both lose them, so the chat paints green and never wakes. [daveey]"""
+         from tools.process_registry import _checkpoint_path
+ 
++        from tools.process_registry_profiles import scope_profile
++
++        scope = scope_profile()
+         with self._lock:
+-            own = {s.id for s in self._running.values() if not s.exited}
++            own = {s.id for s in self._running.values() if not s.exited and self._owned_here(s.session_key, scope)}
+         if not own:
+             return False
+         try:
+@@ -229,32 +256,44 @@ class ProcessCheckpointMixin:
+         so two backends starting together adopt an orphan once. [daveey]"""
+         try:
+             with self._checkpoint_file_lock():
+-                return self._recover_from_checkpoint_locked(owner)
++                recovered, foreign, settled, source = self._recover_from_checkpoint_locked(owner)
+         except Exception as e:
+             logger.warning("Process checkpoint recovery failed: %s", e, exc_info=True)
+             return 0
++        # Outside the lock: these take other profiles' checkpoint locks, one at a time. [daveey]
++        from tools.process_registry_profiles import drop_from_every_checkpoint, hand_to_owners
++        try:
++            hand_to_owners(foreign, source, multiplexed=self.profile_scoped_checkpoints)
++            drop_from_every_checkpoint(settled)
++        except Exception:
++            logger.warning("Settling other profiles' process checkpoints failed", exc_info=True)
++        return recovered
+ 
+-    def _recover_from_checkpoint_locked(self, owner: Optional[str]) -> int:
++    def _recover_from_checkpoint_locked(self, owner: Optional[str]):
++        """Returns (recovered count, entries another profile owns, settled ids, this checkpoint's path)."""
+         from tools.process_registry import (
+             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
+             _CHECKPOINT_DEFAULTS, _stop_systemd_unit,
+         )
+         from tools.process_registry_readopt import OWNER_TUI, UNKNOWN_EXIT_REASON, owner_accepts
+         from tools.process_registry_output_log import adoptable_log
++        from tools.process_registry_profiles import result_recorded, scope_profile
+ 
+         # This host adopts what a crashed predecessor left running, so the jobs it starts must
+         # survive its own crash for the next one: they stay out of the owner-death supervisor.
+         self._jobs_outlive_host = True
+         checkpoint_path = _checkpoint_path()
+         if not checkpoint_path.exists():
+-            return 0
++            return 0, [], set(), checkpoint_path
+         try:
+             entries = json.loads(checkpoint_path.read_text(encoding="utf-8-sig"))
+         except Exception:
+-            return 0
++            return 0, [], set(), checkpoint_path
+         recovered = 0
+         unresolved_scope_entries: list[dict[str, Any]] = []
+         settled_ids: set = set()  # sandbox entries answered with a lost-watcher notice: leave the file
++        foreign: list[dict[str, Any]] = []  # another profile's jobs: handed to its checkpoint after the lock
++        scope = scope_profile()
+         for entry in entries:
+             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
+             if not pid:
+@@ -265,6 +304,17 @@ class ProcessCheckpointMixin:
+                 already_tracked = entry.get("session_id") in self._running
+             if already_tracked:
+                 continue
++            # Its exit was already observed and delivered (a result receipt exists in some profile):
++            # re-attaching would start a watcher on a finished job's (maybe reused) PID. [daveey]
++            if result_recorded(entry.get("session_id")):
++                logger.info("Not re-attaching finished process %s of session %s: its exit is already recorded",
++                            entry.get("session_id"), entry.get("session_key") or "-")
++                settled_ids.add(entry.get("session_id"))
++                continue
++            # Only the profile that owns the job recovers it; this copy goes to the owner's file. [daveey]
++            if not self._owned_here(entry.get("session_key"), scope):
++                foreign.append(entry)
++                continue
+             # Another live Hermes process (Desktop backend, kanban worker, CLI) still
+             # supervises it: adopting would double-own the child and let OUR shutdown
+             # kill it. Only orphans (writer gone) are recovered. [daveey]
+@@ -334,8 +384,10 @@ class ProcessCheckpointMixin:
+             # Re-enqueue watcher so gateway can resume notifications
+             if session.watcher_interval > 0:
+                 self.pending_watchers.append(self._recovered_watcher(session))
+-        self._write_checkpoint_locked(extra_entries=unresolved_scope_entries, drop_ids=frozenset(settled_ids))
+-        return recovered
++        # Another profile's jobs stay in this file until hand_to_owners has put them in the owner's. [daveey]
++        self._write_checkpoint_locked(extra_entries=unresolved_scope_entries + foreign,
++                                      drop_ids=frozenset(settled_ids))
++        return recovered, foreign, settled_ids, checkpoint_path
+ 
+     def _recover_sandbox_entry(self, entry: dict[str, Any], owner: Optional[str]) -> bool:
+         """Re-attach a sandbox job's watcher (True), or deliver a "watcher lost" notice to its owning
+diff --git a/tools/process_registry_profiles.py b/tools/process_registry_profiles.py
+new file mode 100644
+index 00000000000..18ca789359d
+--- /dev/null
++++ b/tools/process_registry_profiles.py
+@@ -0,0 +1,230 @@
++"""Which profile's ``processes.json`` owns a background job, and settling finished jobs everywhere. [daveey]
++
++The multiplexed gateway serves every profile from one process and one ``ProcessRegistry``, but
++``_checkpoint_path`` is profile-scoped, so each profile's checkpoint used to receive EVERY live job.
++A finished job then left only the file of the profile that saw its exit; every other profile kept its
++copy and re-attached that finished job at the next restart, one profile per restart (proc_05186a9e0419,
++owned by alpha-askeve, re-attached by alpha-follow, bb-tuner and ci-sweeper on 2026-10-30).
++
++Rules:
++  * a job whose session key names a profile (``agent:<profile>:...``) belongs to that profile's file;
++    ``agent:main:...`` names the default profile only in a multiplexed registry (a single-profile
++    gateway builds ``agent:main`` keys for its own profile). Keys that name no profile (Desktop/TUI
++    session ids, keyless CLI and worker jobs) belong wherever they are written, as before.
++  * a job whose exit is recorded (a result receipt in any profile) is settled: it leaves every
++    profile's checkpoint and is never re-attached.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++from pathlib import Path
++from typing import Any, Iterable, Optional
++
++logger = logging.getLogger("tools.process_registry")
++
++
++def entry_profile(session_key: Any) -> Optional[str]:
++    """Profile a job's session key names, or None when it names none."""
++    from hermes_state_keys import profile_from_session_key
++    return profile_from_session_key(session_key)
++
++
++def scope_profile() -> Optional[str]:
++    """Profile of the home this thread's checkpoint writes go to (None = not a recognisable profile home)."""
++    from hermes_constants import get_hermes_home, profile_name_for_home
++    return profile_name_for_home(get_hermes_home())
++
++
++def owner_of(session_key: Any, *, multiplexed: bool) -> Optional[str]:
++    """Profile that owns a job with *session_key*, or None when any profile's file may carry it."""
++    profile = entry_profile(session_key)
++    if profile == "default" and not multiplexed:
++        return None
++    return profile
++
++
++def owned_here(session_key: Any, *, multiplexed: bool, scope: Optional[str] = None) -> bool:
++    """True when this thread's profile checkpoint may carry (and recover) the job."""
++    owner = owner_of(session_key, multiplexed=multiplexed)
++    if owner is None:
++        return True
++    here = scope if scope is not None else scope_profile()
++    return here is None or owner == here
++
++
++def profile_homes() -> list[Path]:
++    """The default home and every named profile home under it."""
++    from hermes_constants import get_default_hermes_root
++    root = get_default_hermes_root()
++    homes = [root]
++    with contextlib.suppress(OSError):
++        homes += sorted(p for p in (root / "profiles").iterdir() if p.is_dir() and not p.name.startswith("."))
++    return homes
++
++
++def home_of_profile(profile: str) -> Optional[Path]:
++    from hermes_constants import profile_name_for_home
++    for home in profile_homes():
++        if profile_name_for_home(home) == profile:
++            return home
++    return None
++
++
++def result_recorded(session_id: Any) -> bool:
++    """True when any profile holds the job's completion receipt: its exit was observed and delivered."""
++    if not isinstance(session_id, str) or not session_id.startswith("proc_") or "/" in session_id:
++        return False
++    return any((home / "logs" / "process-results" / f"{session_id}.json").exists() for home in profile_homes())
++
++
++def checkpoint_paths() -> list[Path]:
++    from tools.process_registry import _checkpoint_path
++    paths = [home / "processes.json" for home in profile_homes()]
++    current = _checkpoint_path()
++    if current not in paths:
++        paths.append(current)
++    return paths
++
++
++@contextlib.contextmanager
++def _file_lock(path: Path):
++    """The same ``processes.json.lock`` flock every writer takes. Callers never hold another one."""
++    try:
++        import fcntl
++    except ImportError:  # Windows
++        yield
++        return
++    with open(str(path) + ".lock", "ab") as fh:
++        try:
++            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
++        except OSError:
++            pass
++        try:
++            yield
++        finally:
++            with contextlib.suppress(OSError):
++                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
++
++
++def _holding_a_checkpoint_lock() -> bool:
++    from tools.process_registry_checkpoint import _CHECKPOINT_LOCK_HELD
++    return bool(getattr(_CHECKPOINT_LOCK_HELD, "depth", 0))
++
++
++def _rewrite(path: Path, edit) -> bool:
++    """Read-edit-write one checkpoint under its lock; True when it changed."""
++    from utils import atomic_json_write
++    if not path.exists():
++        return False
++    with _file_lock(path):
++        try:
++            entries = json.loads(path.read_text(encoding="utf-8-sig"))
++        except (OSError, ValueError):
++            return False
++        if not isinstance(entries, list):
++            return False
++        updated = edit(entries)
++        if updated is None or updated == entries:
++            return False
++        atomic_json_write(path, updated)
++        return True
++
++
++def drop_from_every_checkpoint(session_ids: Iterable[Any]) -> list[Path]:
++    """Remove settled jobs from every profile's ``processes.json``; returns the files changed.
++
++    Takes one file lock at a time, and never while this thread holds a checkpoint lock (a second
++    flock on the same file from this process would wait on itself): then it does nothing, and the
++    next recovery's recorded-result check settles the copies instead."""
++    ids = {sid for sid in session_ids if sid}
++    if not ids or _holding_a_checkpoint_lock():
++        return []
++    changed = []
++    for path in checkpoint_paths():
++        try:
++            if _rewrite(path, lambda entries: [e for e in entries
++                                               if not (isinstance(e, dict) and e.get("session_id") in ids)]):
++                changed.append(path)
++        except Exception:
++            logger.debug("Could not drop %s from %s", sorted(ids), path, exc_info=True)
++    if changed:
++        logger.info("Dropped finished process(es) %s from %d other profile checkpoint(s)",
++                    ", ".join(sorted(ids)), len(changed))
++    return changed
++
++
++def hand_to_owners(entries: list[dict[str, Any]], source: Path, *, multiplexed: bool) -> int:
++    """Move jobs another profile owns out of *source*: add each to its owner's checkpoint when that file
++    lacks it, then drop it from *source* (in that order, so a crash in between leaves a copy, never none).
++    Returns how many left *source*. Never called while holding a checkpoint lock."""
++    if not entries or _holding_a_checkpoint_lock():
++        return 0
++    moved: set = set()
++    for entry in entries:
++        owner = owner_of(entry.get("session_key"), multiplexed=multiplexed)
++        home = home_of_profile(owner) if owner else None
++        if home is None:
++            continue  # owner not on this host: leave it where it is
++        target = home / "processes.json"
++        sid = entry.get("session_id")
++
++        held = []
++
++        def _add(existing, entry=entry, sid=sid, held=held):
++            held.append(True)  # the owner's file was read: it now carries the job either way
++            if any(isinstance(e, dict) and e.get("session_id") == sid for e in existing):
++                return None
++            return [*existing, entry]
++
++        try:
++            if not target.exists():
++                from utils import atomic_json_write
++                with _file_lock(target):
++                    if not target.exists():
++                        atomic_json_write(target, [])
++            _rewrite(target, _add)
++            if held:
++                moved.add(sid)
++        except Exception:
++            logger.debug("Could not hand %s to %s", sid, target, exc_info=True)
++    if moved:
++        _rewrite(source, lambda existing: [e for e in existing
++                                           if not (isinstance(e, dict) and e.get("session_id") in moved)])
++        logger.info("Handed %d process(es) owned by another profile out of %s: %s",
++                    len(moved), source, ", ".join(sorted(moved)))
++    return len(moved)
++
++
++def consolidate_checkpoints(*, multiplexed: bool) -> int:
++    """Startup pass of a multiplexed gateway, before any profile recovers: drop finished jobs from every
++    profile's checkpoint and move each other job into its owner's, so each profile's recovery sees exactly
++    its own jobs whatever order the profiles recover in. Returns how many entries left a file."""
++    from hermes_constants import profile_name_for_home
++    if _holding_a_checkpoint_lock():
++        return 0
++    changed = 0
++    for home in profile_homes():
++        path = home / "processes.json"
++        try:
++            entries = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else []
++        except (OSError, ValueError):
++            continue
++        if not isinstance(entries, list):
++            continue
++        here = profile_name_for_home(home)
++        finished = {e.get("session_id") for e in entries
++                    if isinstance(e, dict) and result_recorded(e.get("session_id"))}
++        if finished:
++            changed += len(finished)
++            _rewrite(path, lambda existing, finished=finished: [
++                e for e in existing if not (isinstance(e, dict) and e.get("session_id") in finished)])
++        foreign = [e for e in entries if isinstance(e, dict) and e.get("session_id") not in finished
++                   and not owned_here(e.get("session_key"), multiplexed=multiplexed, scope=here)]
++        changed += hand_to_owners(foreign, path, multiplexed=multiplexed)
++    if changed:
++        logger.info("Process checkpoints: settled or re-homed %d entr%s across profiles",
++                    changed, "y" if changed == 1 else "ies")
++    return changed
+-- 
+2.55.0
+

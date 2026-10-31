@@ -1,0 +1,150 @@
+From e3fd0a038e223301746c556442fc5eae6b6a4d31 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:00:49 -0700
+Subject: [PATCH] fix(gateway): 1 ms GIL switch interval so the API loop isn't
+ starved by CPU-bound threads [daveey]
+
+2026-10-30 11:08-11:27 PDT (load 66-96): the gateway loop thread spent 64% of samples in take_gil and 666
+Desktop reads on conn=local missed their 4 s timeout (hub-sync/status, 2 ms CPU, ran up to 5.45 s). A loop
+beside K CPU threads measured p50 222->36 ms (K=1) and 750->148 ms (K=4) going from 5 ms to 1 ms.
+HERMES_GATEWAY_SWITCH_INTERVAL_MS overrides. Tests: tests/gateway/test_gil_budget.py.
+---
+ gateway/gil_budget.py            | 55 ++++++++++++++++++++++++++++++++
+ gateway/run_bootstrap.py         |  4 +++
+ tests/gateway/test_gil_budget.py | 47 +++++++++++++++++++++++++++
+ 3 files changed, 106 insertions(+)
+ create mode 100644 gateway/gil_budget.py
+ create mode 100644 tests/gateway/test_gil_budget.py
+
+diff --git a/gateway/gil_budget.py b/gateway/gil_budget.py
+new file mode 100644
+index 00000000000..8240b59fa73
+--- /dev/null
++++ b/gateway/gil_budget.py
+@@ -0,0 +1,55 @@
++"""[daveey] Interpreter switch interval for the gateway process.
++
++The gateway is one Python process. Its asyncio loop serves the whole local API (Desktop conn=local, gateway
++tickets), and the same process runs every agent conversation loop, AnyIO worker threads for sync routes, and
++plugin thread pools. Each await the loop resumes needs the GIL back. When CPU-bound threads are runnable, a waiter
++gets it only after the holder's switch interval expires, which is 5 ms by default, and often only after other
++runnable threads have each taken a turn (the convoy effect). One API request crosses many such handoffs.
++
++Measured on David-MBP on 2026-10-30, under load avg 38: an asyncio echo server answering beside K pure-Python
++burner threads.
++
++    K=1  5 ms: p50  222 ms     1 ms: p50  36 ms
++    K=4  5 ms: p50  750 ms     1 ms: p50 148 ms (p95 1.6 s -> 0.24 s)
++
++During 11:08-11:27 PDT that day (load 66-96), the gateway loop thread spent 64% of its samples in take_gil, and
++666 Desktop reads on conn=local missed their 4 s timeout. hub-sync/status, which costs 2 ms of CPU, ran up to
++5.45 s. A 1 ms interval slices the CPU-bound threads finely enough that the loop thread stays responsive. The cost
++is a few more GIL handoffs per second for those threads. mcp_startup's discovery window already drops to 0.5 ms
++for the same reason; it restores whatever is set here.
++
++``HERMES_GATEWAY_SWITCH_INTERVAL_MS`` overrides the interval (0 or unparsable keeps the interpreter default).
++"""
++from __future__ import annotations
++
++import logging
++import os
++import sys
++
++GATEWAY_SWITCH_INTERVAL_S = 0.001
++ENV = "HERMES_GATEWAY_SWITCH_INTERVAL_MS"
++
++log = logging.getLogger(__name__)
++
++
++def gateway_switch_interval(environ=None) -> float | None:
++    """Seconds to set, or None to keep the interpreter default."""
++    raw = (environ if environ is not None else os.environ).get(ENV)
++    if raw is None or not str(raw).strip():
++        return GATEWAY_SWITCH_INTERVAL_S
++    try:
++        ms = float(raw)
++    except ValueError:
++        return None
++    return ms / 1000.0 if ms > 0 else None
++
++
++def apply_gateway_switch_interval(environ=None) -> float:
++    """Set the process switch interval for a gateway; returns the interval now in effect."""
++    target = gateway_switch_interval(environ)
++    if target is not None:
++        try:
++            sys.setswitchinterval(target)
++        except (ValueError, OverflowError) as exc:  # pragma: no cover - defensive
++            log.warning("gateway switch interval %r refused: %s", target, exc)
++    return sys.getswitchinterval()
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 6f8c5ba66f4..aa0aa36a755 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -795,6 +795,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
+     from hermes_cli.resource_limits import apply_nofile_soft_limit
+     apply_nofile_soft_limit()
+ 
++    # GIL handoffs to the API loop wait out the switch interval behind CPU-bound threads (gil_budget.py).
++    from gateway.gil_budget import apply_gateway_switch_interval
++    apply_gateway_switch_interval()
++
+     # Snapshot the revision while sys.modules matches disk so a later `git pull` is detected safely.
+     from gateway.code_skew import install_boot_pinned_imports, record_boot_fingerprint
+     record_boot_fingerprint()
+diff --git a/tests/gateway/test_gil_budget.py b/tests/gateway/test_gil_budget.py
+new file mode 100644
+index 00000000000..1d5f4fb725c
+--- /dev/null
++++ b/tests/gateway/test_gil_budget.py
+@@ -0,0 +1,47 @@
++"""gateway/gil_budget.py: the gateway runs with a 1 ms interpreter switch interval (API loop vs CPU threads)."""
++import ast
++import inspect
++import sys
++
++import pytest
++
++from gateway import gil_budget
++
++
++@pytest.fixture
++def restore_interval():
++    prev = sys.getswitchinterval()
++    yield
++    sys.setswitchinterval(prev)
++
++
++def test_default_is_one_millisecond():
++    assert gil_budget.gateway_switch_interval({}) == pytest.approx(0.001)
++
++
++@pytest.mark.parametrize("raw,expected", [("2.5", 0.0025), ("0.5", 0.0005), ("0", None), ("-1", None),
++                                          ("fast", None), ("  ", 0.001)])
++def test_env_override(raw, expected):
++    got = gil_budget.gateway_switch_interval({gil_budget.ENV: raw})
++    assert got == (pytest.approx(expected) if expected is not None else None)
++
++
++def test_apply_sets_the_process_interval(restore_interval):
++    sys.setswitchinterval(0.005)
++    assert gil_budget.apply_gateway_switch_interval({}) == pytest.approx(0.001)
++    assert sys.getswitchinterval() == pytest.approx(0.001)
++
++
++def test_disabled_override_keeps_the_current_interval(restore_interval):
++    sys.setswitchinterval(0.005)
++    assert gil_budget.apply_gateway_switch_interval({gil_budget.ENV: "0"}) == pytest.approx(0.005)
++
++
++def test_start_gateway_applies_it_before_serving():
++    """The bootstrap calls apply_gateway_switch_interval() before it builds the runner."""
++    from gateway import run_bootstrap
++    src = inspect.getsource(run_bootstrap.start_gateway)
++    calls = [n.func.id for n in ast.walk(ast.parse(src))
++             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
++    assert "apply_gateway_switch_interval" in calls
++    assert src.index("apply_gateway_switch_interval()") < src.index("GatewayRunner(")
+-- 
+2.55.0
+

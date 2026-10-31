@@ -1,0 +1,571 @@
+From 997c5cf2476bea6422e4cb79653b7cf2e23c57e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 20:23:57 +0000
+Subject: [PATCH] fix(kanban): book a run lost to its owner's unclean death as
+ owner_restart_lost; systemic trips get a fix card [daveey]
+
+One gateway segfault (David-MBP 10-30 12:26, pid 43117) made its in-flight managed runs exit 1 with
+'service_identity_unverified'; three shared the fingerprint and the systemic rule parked them in sticky
+triage with no owner.
+
+- kanban_owner_death: owner-unavailable words + (unclean ledger record for the receipt's owner pid, or that
+  pid gone) => owner_restart_lost, infrastructure, uncounted, respawn spaced by check_respawn_guard; the
+  event names owner_death_pid. Crash-loop guard: a card also in flight at the owner's previous unclean
+  death is charged normally (and never counted systemic).
+- kanban_systemic_crash: a non-owner fingerprint seen >=3 times opens one fix card per fingerprint
+  (idempotency key systemic-crash:<hash>, reused across ticks); tripped cards are linked as its children,
+  carry fix_card in gave_up, and resume when it is done instead of a silent sticky hold.
+---
+ hermes_cli/kanban_db_dispatch.py            |  33 ++-
+ hermes_cli/kanban_owner_death.py            | 142 +++++++++++++
+ hermes_cli/kanban_systemic_crash.py         |  87 ++++++++
+ tests/hermes_cli/test_kanban_owner_death.py | 219 ++++++++++++++++++++
+ 4 files changed, 477 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_owner_death.py
+ create mode 100644 hermes_cli/kanban_systemic_crash.py
+ create mode 100644 tests/hermes_cli/test_kanban_owner_death.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 85a64785b0b..6fe8c11ea8e 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -37,6 +37,7 @@ from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code
+ from hermes_cli.kanban_db_dispatch_allowlist import _dispatch_profile_allowlist, dispatch_profile_allowlist_summary
+ from hermes_cli import kanban_worker_scope as _worker_scope
+ from hermes_cli import kanban_host_reboot as _host_reboot, kanban_owner_unavailable as _ou  # [daveey]
++from hermes_cli import kanban_owner_death as _owner_death, kanban_systemic_crash as _systemic  # [daveey]
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+ from hermes_cli.kanban_db_dispatch_queries import lane_rows, skip_reap
+ 
+@@ -1398,6 +1399,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+                                          run_id=row["current_run_id"], conn=conn)
+             _host_reboot.note(dead, row, now_boot, reboot_victims)  # [daveey]
+             apply_attempt_note(conn, row["id"], pid, dead)
++            _owner_death.note(dead, conn, row["id"], row["current_run_id"])  # owner died under it [daveey]
+             retry_status = _kb._retry_status_for_run(conn, row["id"])
+             dead.event_payload["retry_status"] = retry_status
+             cur = conn.execute(
+@@ -1469,9 +1471,22 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+     """
+     auto_blocked: list[str] = []
+     fp_counts: dict[str, int] = {}
+-    for _, _, _, dead in crash_details:
++    fp_tasks: dict[str, list[str]] = {}
++    for tid, _, _, dead in crash_details:
++        if dead.event_payload.get("owner_death_pid") is not None:
++            continue  # an owner-death repeat (crash-loop guard) is charged normally, never systemic [daveey]
+         fp = _error_fingerprint(dead.error_text)
+         fp_counts[fp] = fp_counts.get(fp, 0) + 1
++        if not (dead.protocol_violation or dead.terminal_provider or dead.unknown_skill or dead.stdlib_shadow
++                or dead.reboot_culprit):
++            fp_tasks.setdefault(fp, []).append(tid)
++    # One visible owner per systemic fingerprint: a fix card the tripped cards wait on. [daveey]
++    fix_cards: dict[str, Optional[str]] = {}
++    for fp, tids in fp_tasks.items():
++        if fp_counts.get(fp, 0) >= 3:
++            sample = next(d.error_text for t, _, _, d in crash_details if t == tids[0])
++            arow = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (tids[0],)).fetchone()
++            fix_cards[fp] = _systemic.ensure_fix_card(conn, fp, tids, sample, arow["assignee"] if arow else None)
+     for tid, pid, claimer, dead in crash_details:
+         error_text = dead.error_text
+         if dead.protocol_violation:
+@@ -1522,10 +1537,17 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+             if dead.reboot_culprit:
+                 _host_reboot.comment_culprit(conn, tid, dead.reboot_culprit)
+         else:
+-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
++            fp = _error_fingerprint(error_text)
++            is_systemic = dead.event_payload.get("owner_death_pid") is None and fp_counts.get(fp, 0) >= 3
++            fix_id = fix_cards.get(fp) if is_systemic else None
++            if fix_id == tid:
++                fix_id = None  # the fix card itself died of it: hold it for an operator
+             extra = {"pid": pid, "claimer": claimer}
+-            if is_systemic:
+-                # Trips at 1, below any ``failure_limit``: hold it for an operator.
++            if fix_id:
++                # Trips at 1 and waits on the fingerprint's fix card (linked below), not a silent hold.
++                extra["fix_card"] = fix_id
++            elif is_systemic:
++                # No fix card could be opened: trips at 1, held for an operator.
+                 extra["sticky"] = True
+             tripped = _record_task_failure(
+                 conn, tid,
+@@ -1536,6 +1558,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                 end_run=False,
+                 event_payload_extra=extra,
+             )
++            if tripped and fix_id and not _systemic.attach(conn, fix_id, tid):
++                with _kb.write_txn(conn):  # unlinked: never let recompute_ready respawn it into the same wall
++                    _kb._append_event(conn, tid, "gave_up", {**extra, "sticky": True, "fix_card_link_failed": True})
+         if tripped:
+             auto_blocked.append(tid)
+     return auto_blocked
+diff --git a/hermes_cli/kanban_owner_death.py b/hermes_cli/kanban_owner_death.py
+new file mode 100644
+index 00000000000..15b0c8e3ccd
+--- /dev/null
++++ b/hermes_cli/kanban_owner_death.py
+@@ -0,0 +1,142 @@
++"""Book a worker lost to its profile owner's DEATH like one lost to a restart. [daveey]
++
++2026-10-30 12:26 PDT, David-MBP: gateway 43117 segfaulted. Its 4 in-flight managed runs exited 1 a few
++seconds later ("[owner admission settled interrupted] Kanban owner refused: Gateway inaccessible:
++service_identity_unverified"); three shared that fingerprint, so the sweep's systemic rule tripped them
++straight into sticky triage on their first failure. A clean restart of the same gateway books the same runs
++``owner_restart_lost`` and charges nothing; an unclean death is no more the cards' fault.
++
++A crashed run is rebooked as ``owner_restart_lost`` (``infrastructure: true``, no failure counted, respawn
++spaced by ``check_respawn_guard``) when BOTH hold:
++
++- the worker reports its owner unavailable (``OWNER_GONE_MARKERS`` in the run error or worker output), and
++- the owner named by the run's ``owner_admitted`` receipt is gone: the owner's lifecycle ledger
++  (``logs/gateway-exit-diag.log``) records that pid's life as UNCLEAN, or the pid is dead/recycled.
++
++Crash-loop guard: a card that was also in flight at the owner's PREVIOUS unclean death is charged normally
++(``owner_death_repeat``), because a card whose own work kills the gateway has to stop.
++"""
++from __future__ import annotations
++
++import json
++import re
++from pathlib import Path
++from typing import Optional
++
++# Lower-case substrings of what a worker says when its owner went away under it.
++OWNER_GONE_MARKERS = (
++    "service_identity_unverified",
++    "owner admission settled interrupted",
++)
++# A ``worker_lost`` note counts only when its reason names the owner going away: the live owner records
++# ``managed_worker_failed`` & co. for a worker that died on its own, which stays the card's crash.
++_OWNER_GONE_LOSS = re.compile(r"managed worker lost: [^\]]*(owner|gateway|shutdown|restart)")
++_EXIT_DIAG_TAIL_BYTES = 256 * 1024
++_RUN_SCAN_LIMIT = 20
++
++
++def unclean_owner_deaths(owner_home: Path) -> list[int]:
++    """Prior pids the owner's ledger recorded as UNCLEAN exits, oldest first. ``[]`` when unreadable."""
++    path = owner_home / "logs" / "gateway-exit-diag.log"
++    try:
++        with path.open("rb") as fh:
++            fh.seek(0, 2)
++            size = fh.tell()
++            fh.seek(max(0, size - _EXIT_DIAG_TAIL_BYTES))
++            data = fh.read().decode("utf-8", "replace")
++    except OSError:
++        return []
++    deaths: list[int] = []
++    for line in data.splitlines():
++        try:
++            record = json.loads(line)
++        except ValueError:
++            continue
++        if not isinstance(record, dict) or record.get("tag") != "gateway.previous_unclean_exit":
++            continue
++        try:
++            pid = int(record["prior_pid"])
++        except (KeyError, TypeError, ValueError):
++            continue
++        if not deaths or deaths[-1] != pid:
++            deaths.append(pid)
++    return deaths
++
++
++def _reports_owner_gone(dead) -> bool:
++    text = f"{dead.error_text}\n{dead.event_payload.get('worker_output') or ''}".lower()
++    return any(marker in text for marker in OWNER_GONE_MARKERS) or bool(_OWNER_GONE_LOSS.search(text))
++
++
++def _earlier_owner_death_pids(conn, task_id: str) -> list[int]:
++    """``owner_death_pid`` of the card's closed runs, newest first (``None`` for a run without one)."""
++    out = []
++    for row in conn.execute(
++        "SELECT metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT ?",
++        (task_id, _RUN_SCAN_LIMIT),
++    ):
++        try:
++            meta = json.loads(row[0]) if row[0] else {}
++        except (TypeError, ValueError):
++            meta = {}
++        pid = meta.get("owner_death_pid") if isinstance(meta, dict) else None
++        out.append(int(pid) if isinstance(pid, int) else None)
++    return out
++
++
++def _previous_death_seen(conn, task_id: str, owner_pid: int, deaths: list[int]) -> Optional[int]:
++    """The owner's previous unclean death this card was ALSO in flight at, or None."""
++    earlier = _earlier_owner_death_pids(conn, task_id)
++    if owner_pid in deaths:
++        idx = deaths.index(owner_pid)
++        previous = deaths[idx - 1] if idx > 0 else None
++    else:
++        previous = deaths[-1] if deaths else None
++    if previous is not None:
++        return previous if previous in earlier else None
++    # No ledger to order the deaths: the card's last closed run was lost to another owner death.
++    if earlier and earlier[0] is not None and earlier[0] != owner_pid:
++        return earlier[0]
++    return None
++
++
++def note(dead, conn, task_id: Optional[str], run_id) -> None:
++    """Rebook ``dead`` (``_DeadWorker``) lost to its owner's death as ``owner_restart_lost``. No-op for
++    any other death; a crash-loop repeat stays a crash and is tagged so the systemic rule skips it."""
++    if conn is None or not task_id or dead.kind in ("clean_exit", "rate_limited", "owner_restart", "oom_killed"):
++        return
++    if (dead.protocol_violation or dead.rate_limited or dead.terminal_provider or dead.host_reboot
++            or dead.owner_unavailable or dead.owner_restart or dead.reboot_culprit):
++        return
++    if not _reports_owner_gone(dead):
++        return
++    from hermes_cli.kanban_owner_recovery import _owner_process_gone, _owner_receipt
++    receipt = _owner_receipt(conn, task_id)
++    if not receipt:
++        return
++    try:
++        owner_pid = int(receipt["pid"])
++        owner_home = Path(receipt["db"]).parent
++    except (KeyError, TypeError, ValueError):
++        return
++    deaths = unclean_owner_deaths(owner_home)
++    unclean = owner_pid in deaths
++    if not unclean and not _owner_process_gone(receipt):
++        return  # the owner that admitted this run is still alive: not an owner death
++    payload = dead.event_payload
++    payload["owner_death_pid"] = owner_pid
++    payload["owner_exit"] = "unclean" if unclean else "pid_changed"
++    repeat = _previous_death_seen(conn, task_id, owner_pid, deaths)
++    if repeat is not None:
++        payload["owner_death_repeat"] = repeat
++        dead.error_text = (
++            f"{dead.error_text} (owner pid {owner_pid} died with this card in flight, as pid {repeat} did "
++            "before it: counted as a failure)")
++        return
++    original = dead.error_text
++    dead.kind, dead.owner_restart, dead.event_kind = "owner_restart", True, "owner_restart_lost"
++    payload.update(exit_kind="owner_restart", owner_restart=True, infrastructure=True)
++    how = "an unclean exit" if unclean else "its pid changed since the claim"
++    dead.error_text = (
++        f"pid {payload.get('pid')} lost its turn to the death of its profile owner (pid {owner_pid}, {how}) — "
++        f"requeued without counting a failure; worker said: {original}")
+diff --git a/hermes_cli/kanban_systemic_crash.py b/hermes_cli/kanban_systemic_crash.py
+new file mode 100644
+index 00000000000..c32ee0f2ef9
+--- /dev/null
++++ b/hermes_cli/kanban_systemic_crash.py
+@@ -0,0 +1,87 @@
++"""Give a systemic crash trip a visible owner: one fix card per fingerprint. [daveey]
++
++The dead-worker sweep trips cards whose crash fingerprint repeats >= 3 times in one tick at once (a retry
++would hit the same wall). It used to park them in sticky triage "for an operator" with no card, ask or
++owner, so nothing ever looked at them (2026-10-30 12:26 PDT, David-MBP, 3 cards for 35 min).
++
++Now the sweep opens ONE fix card per fingerprint (idempotency key ``systemic-crash:<hash>``, reused across
++ticks while it is open), and each tripped card is linked as its child: it waits on the fix card instead of a
++sticky hold, and ``recompute_ready`` resumes it when the fix card is done (within the failure budget).
++"""
++from __future__ import annotations
++
++import hashlib
++import logging
++import sqlite3
++from typing import Optional
++
++_log = logging.getLogger(__name__)
++AUTHOR = "kanban-dispatcher"
++_MAX_ROUNDS = 20
++
++
++def fix_key(fingerprint: str) -> str:
++    return "systemic-crash:" + hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:16]
++
++
++def _open_card(conn: sqlite3.Connection, key: str) -> tuple[Optional[str], bool]:
++    """``(id, reusable)`` of the newest non-archived card with ``key``; ``(None, True)`` when none."""
++    row = conn.execute(
++        "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
++        "ORDER BY created_at DESC LIMIT 1", (key,)).fetchone()
++    if row is None:
++        return None, True
++    return row["id"], row["status"] != "done"
++
++
++def ensure_fix_card(conn: sqlite3.Connection, fingerprint: str, task_ids: list[str], sample_error: str,
++                    assignee: Optional[str]) -> Optional[str]:
++    """The open fix card for ``fingerprint`` (created on first sight), or None when it cannot be made.
++
++    A done fix card did not fix it (the same crash is back): the next round's key (``:r2``...) opens a
++    fresh card. Each call names its tripped cards in a comment on the fix card.
++    """
++    from hermes_cli import kanban_db as kb
++    base = fix_key(fingerprint)
++    try:
++        for n in range(1, _MAX_ROUNDS + 1):
++            key = base if n == 1 else f"{base}:r{n}"
++            existing, reusable = _open_card(conn, key)
++            if existing and not reusable:
++                continue
++            listed = ", ".join(task_ids)
++            if existing:
++                kb.add_comment(conn, existing, AUTHOR,
++                               f"The same crash tripped {len(task_ids)} more card(s): {listed}. "
++                               "They wait on this card as children.")
++                return existing
++            body = (
++                f"{len(task_ids)} Kanban workers crashed with the same error in one dispatcher tick, so the "
++                "sweep tripped their cards instead of retrying into the same wall.\n\n"
++                f"Fingerprint: `{fingerprint}`\n\nSample error:\n```\n{sample_error[:500]}\n```\n\n"
++                f"Tripped cards (children of this card): {listed}\n\n"
++                "Find and fix the root cause of this crash. When this card is done, the tripped cards resume "
++                "on their own (they are linked as its children). Do not re-queue them by hand.")
++            return kb.create_task(
++                conn, title=f"Systemic Kanban crash: {len(task_ids)} cards died with `{fingerprint[:60]}`",
++                body=body, assignee=assignee, created_by=AUTHOR, idempotency_key=key)
++    except Exception:
++        _log.warning("kanban: opening the systemic-crash fix card failed", exc_info=True)
++    return None
++
++
++def attach(conn: sqlite3.Connection, fix_id: str, task_id: str) -> bool:
++    """Link a tripped card under its fix card and say so on the card. False when the link failed."""
++    from hermes_cli import kanban_db as kb
++    try:
++        kb.link_tasks(conn, fix_id, task_id)
++    except Exception:
++        _log.warning("kanban: linking %s under systemic fix card %s failed", task_id, fix_id, exc_info=True)
++        return False
++    try:
++        kb.add_comment(conn, task_id, AUTHOR,
++                       f"Tripped by a systemic crash shared with other cards. Fix card {fix_id} owns it; this "
++                       "card resumes when that card is done.")
++    except Exception:
++        _log.debug("kanban: systemic-trip comment failed", exc_info=True)
++    return True
+diff --git a/tests/hermes_cli/test_kanban_owner_death.py b/tests/hermes_cli/test_kanban_owner_death.py
+new file mode 100644
+index 00000000000..2fb143eecf2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_death.py
+@@ -0,0 +1,219 @@
++"""One unclean owner death must not park every in-flight Kanban card in sticky triage. [daveey]
++
++2026-10-30 12:26 PDT, David-MBP: gateway 43117 segfaulted; its in-flight managed runs exited 1 with
++"[owner admission settled interrupted] Kanban owner refused: Gateway inaccessible:
++service_identity_unverified", three shared that fingerprint, and the systemic rule tripped them into
++sticky triage with no owner (t_01a18db7ce134b33, t_01a18e08b1e764a1, t_01a18e122934644d).
++
++* A run lost to its owner's death (owner-unavailable words + an unclean ledger record or a gone owner
++  pid) is booked ``owner_restart_lost``, uncounted, however many die together.
++* A card in flight at two consecutive unclean owner deaths is charged.
++* A real systemic trip opens ONE fix card per fingerprint and the tripped cards wait on it.
++"""
++
++import json
++import os
++import time
++
++import psutil
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_block_routing import has_sticky_block
++from hermes_cli.kanban_systemic_crash import fix_key
++
++DEAD_OWNER = 43117
++REFUSAL = "Kanban owner refused: Gateway inaccessible: service_identity_unverified"
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    me = os.getpid()
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == me)  # every worker and the old owner are dead
++    output = {"text": REFUSAL}
++    monkeypatch.setattr(kbd, "_worker_final_output", lambda *a, **kw: output["text"])
++    owner_home = tmp_path / "owner"
++    (owner_home / "logs").mkdir(parents=True)
++    return {"home": tmp_path, "owner_home": owner_home, "output": output}
++
++
++def _ledger(board, *dead_pids):
++    with (board["owner_home"] / "logs" / "gateway-exit-diag.log").open("a") as fh:
++        for pid in dead_pids:
++            fh.write(json.dumps({"ts": "2026-10-30T19:26:23Z", "tag": "gateway.previous_unclean_exit",
++                                 "pid": pid + 1, "prior_pid": pid}) + "\n")
++
++
++def _claim(conn, tid, pid, board, owner_pid=DEAD_OWNER, birth=1.0):
++    host = kb._claimer_id().split(":", 1)[0]
++    kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
++    run_id = _task(conn, tid).current_run_id
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?", (pid, int(time.time()) - 600, tid))
++        kb._append_event(conn, tid, "owner_admitted",
++                         {"db": str(board["owner_home"] / "state.db"), "session_id": "s", "request_id": f"r{pid}",
++                          "pid": owner_pid, "birth": birth}, run_id=run_id)
++        kb._append_event(conn, tid, "worker_bound", {"pid": pid + 500000, "started_at": "x"}, run_id=run_id)
++    return tid
++
++
++def _reaped(monkeypatch, pids, code=1):
++    monkeypatch.setattr(kbd, "_recent_worker_exits", {pid: ((code & 0xFF) << 8, time.time()) for pid in pids})
++
++
++def _kinds(conn, tid):
++    return [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
++
++
++def _last_payload(conn, tid, kind):
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
++                       (tid, kind)).fetchone()
++    return json.loads(row[0]) if row and row[0] else {}
++
++
++def test_runs_lost_to_an_unclean_owner_death_requeue_uncounted(board, monkeypatch):
++    _ledger(board, DEAD_OWNER)
++    with kbc.connect() as conn:
++        pids = [81001, 81002, 81003, 81004]
++        tids = [_claim(conn, kb.create_task(conn, title=f"card {p}", assignee="default"), p, board) for p in pids]
++        _reaped(monkeypatch, pids)
++        assert kbd.detect_crashed_workers(conn) == []
++        assert kbd.detect_crashed_workers._last_auto_blocked == []  # type: ignore[attr-defined]
++        for tid in tids:
++            task = _task(conn, tid)
++            assert (task.status, task.consecutive_failures) == ("ready", 0)
++            kinds = _kinds(conn, tid)
++            assert "gave_up" not in kinds and "crashed" not in kinds
++            payload = _last_payload(conn, tid, "owner_restart_lost")
++            assert payload["owner_death_pid"] == DEAD_OWNER and payload["infrastructure"] is True
++            assert payload["owner_exit"] == "unclean"
++            outcome, error = conn.execute(
++                "SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++            assert outcome == "reclaimed" and f"pid {DEAD_OWNER}" in error
++            assert kbd.check_respawn_guard(conn, tid) == "owner_restart_cooldown"
++        assert not conn.execute("SELECT 1 FROM tasks WHERE idempotency_key LIKE 'systemic-crash:%'").fetchone()
++
++
++def test_owner_pid_gone_without_a_ledger_record_requeues_too(board, monkeypatch):
++    with kbc.connect() as conn:
++        pids = [82001, 82002, 82003]
++        tids = [_claim(conn, kb.create_task(conn, title=f"card {p}", assignee="default"), p, board) for p in pids]
++        _reaped(monkeypatch, pids)
++        assert kbd.detect_crashed_workers(conn) == []
++        for tid in tids:
++            assert (_task(conn, tid).status, _task(conn, tid).consecutive_failures) == ("ready", 0)
++            assert _last_payload(conn, tid, "owner_restart_lost")["owner_exit"] == "pid_changed"
++
++
++@pytest.mark.parametrize("reason, requeued", [("owner gone: gateway shutdown", True),
++                                              ("managed_worker_failed", False)])
++def test_a_worker_lost_note_counts_only_when_it_names_the_owner_going_away(board, monkeypatch, reason, requeued):
++    board["output"]["text"] = ""
++    _ledger(board, DEAD_OWNER)
++    with kbc.connect() as conn:
++        tid = _claim(conn, kb.create_task(conn, title="card", assignee="default"), 87001, board)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "worker_lost", {"reason": reason, "bound": False},
++                             run_id=_task(conn, tid).current_run_id)
++        _reaped(monkeypatch, [87001])
++        assert kbd.detect_crashed_workers(conn) == ([] if requeued else [tid])
++        assert _task(conn, tid).consecutive_failures == (0 if requeued else 1)
++
++
++def test_owner_still_alive_is_not_an_owner_death(board, monkeypatch):
++    # Control: the admitting owner is this live process, so the refusal is not its death.
++    from hermes_cli.process_identity import worker_birth
++    me = os.getpid()
++    with kbc.connect() as conn:
++        tid = _claim(conn, kb.create_task(conn, title="card", assignee="default"), 83001, board,
++                     owner_pid=me, birth=worker_birth(psutil.Process(me)))
++        _reaped(monkeypatch, [83001])
++        assert kbd.detect_crashed_workers(conn) == [tid]
++        assert _task(conn, tid).consecutive_failures == 1
++        assert "owner_restart_lost" not in _kinds(conn, tid)
++
++
++def test_a_card_in_flight_at_two_consecutive_unclean_deaths_is_charged(board, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", "0")
++    second_owner = 50001
++    _ledger(board, DEAD_OWNER)
++    with kbc.connect() as conn:
++        tids = [kb.create_task(conn, title=f"card {i}", assignee="default") for i in range(3)]
++        first = [84001, 84002, 84003]
++        for tid, pid in zip(tids, first):
++            _claim(conn, tid, pid, board)
++        _reaped(monkeypatch, first)
++        assert kbd.detect_crashed_workers(conn) == []
++        # The next owner life dies uncleanly too, with the same cards in flight again.
++        _ledger(board, second_owner)
++        bystander = kb.create_task(conn, title="bystander", assignee="default")
++        second = [85001, 85002, 85003, 85004]
++        for tid, pid in zip(tids + [bystander], second):
++            _claim(conn, tid, pid, board, owner_pid=second_owner)
++        _reaped(monkeypatch, second)
++        assert sorted(kbd.detect_crashed_workers(conn)) == sorted(tids)
++        for tid in tids:
++            task = _task(conn, tid)
++            assert task.consecutive_failures == 1
++            payload = _last_payload(conn, tid, "crashed")
++            assert payload["owner_death_pid"] == second_owner and payload["owner_death_repeat"] == DEAD_OWNER
++            # Charged normally, not as a systemic owner-less trip.
++            assert task.status == "ready" and "gave_up" not in _kinds(conn, tid)
++        # A card only in flight at the second death is still a bystander.
++        assert (_task(conn, bystander).status, _task(conn, bystander).consecutive_failures) == ("ready", 0)
++
++
++def test_a_systemic_crash_opens_one_fix_card_the_tripped_cards_wait_on(board, monkeypatch):
++    board["output"]["text"] = "ImportError: cannot import name 'frobnicate' from 'hermes_cli.foo'"
++    with kbc.connect() as conn:
++        pids = [86001, 86002, 86003]
++        tids = [_claim(conn, kb.create_task(conn, title=f"card {p}", assignee="default"), p, board) for p in pids]
++        _reaped(monkeypatch, pids)
++        assert sorted(kbd.detect_crashed_workers(conn)) == sorted(tids)
++        fixes = conn.execute("SELECT id, idempotency_key FROM tasks WHERE idempotency_key LIKE 'systemic-crash:%'"
++                             ).fetchall()
++        assert len(fixes) == 1
++        fix_id = fixes[0][0]
++        for tid in tids:
++            assert _task(conn, tid).status == "triage"
++            assert _last_payload(conn, tid, "gave_up")["fix_card"] == fix_id
++            assert not has_sticky_block(conn, tid)
++            assert [p for p, _ in kb.parent_states(conn, tid)] == [fix_id]
++        fix = _task(conn, fix_id)
++        assert all(tid in (fix.body or "") for tid in tids)
++
++        # Second tick, same fingerprint: no duplicate, the new cards wait on the same fix card.
++        more_pids = [86004, 86005, 86006]
++        more = [_claim(conn, kb.create_task(conn, title=f"card {p}", assignee="default"), p, board) for p in more_pids]
++        _reaped(monkeypatch, more_pids)
++        assert sorted(kbd.detect_crashed_workers(conn)) == sorted(more)
++        assert conn.execute("SELECT count(*) FROM tasks WHERE idempotency_key LIKE 'systemic-crash:%'"
++                            ).fetchone()[0] == 1
++        for tid in more:
++            assert _last_payload(conn, tid, "gave_up")["fix_card"] == fix_id
++            assert [p for p, _ in kb.parent_states(conn, tid)] == [fix_id]
++        assert any(all(t in c.body for t in more) for c in kb.list_comments(conn, fix_id))
++
++        # The tripped cards hold while the fix card is open and resume once it is done.
++        kb.recompute_ready(conn)
++        assert _task(conn, tids[0]).status == "triage"
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (fix_id,))
++        kb.recompute_ready(conn)
++        assert all(_task(conn, t).status == "ready" for t in tids + more)
++        assert fixes[0][1] == fix_key(_fingerprint_of(conn, tids[0]))
++
++
++def _fingerprint_of(conn, tid):
++    return kbd._error_fingerprint(conn.execute(
++        "SELECT error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
++
++
++def _task(conn, tid):
++    task = kb.get_task(conn, tid)
++    assert task is not None
++    return task
+-- 
+2.55.0
+
