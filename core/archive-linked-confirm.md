@@ -18,7 +18,7 @@ shell root) with the lines as `details`:
 
 - **Core Kanban check**: the row's own `kanban_active` + `kanban_blocked` counts (the backend sums them over the
   compression lineage, so they match the sidebar badge; see [kanban-session-links.md](kanban-session-links.md)).
-  Fresh evidence needs no extra request. Patch **0389** refreshes missing, expired or unknown evidence before warning: it captures the row owner (omitted connection = registry primary), walks ancestry and queries `/api/session-kanban-tasks` with that connection/profile pinned. The whole refresh is bounded to 2.5 seconds. Read failures, malformed ancestry/task responses, stale replicas and unknown obligations remain uncertain; a successful empty answer archives without a spurious task warning.
+  A fresh row with zero counts needs no extra request; a fresh row that claims work is read live (see source `3ee37f99fb` below). Patch **0389** refreshes missing, expired or unknown evidence before warning: it captures the row owner (omitted connection = registry primary), walks ancestry and queries `/api/session-kanban-tasks` with that connection/profile pinned. The whole refresh is bounded to 2.5 seconds. Read failures, malformed ancestry/task responses, stale replicas and unknown obligations remain uncertain; a successful empty answer archives without a spurious task warning.
 - **Plugin guards**: new `ctx.registerArchiveGuard(guard)` on the plugin context. The guard receives
   `{ sessionId, session, ids, profile, connectionId }` (the row's owning gateway, so cross-gateway rows are
   checked on their own gateway). Guards run in parallel. Each is capped at 2.5 s, and one that throws or times out
@@ -90,3 +90,7 @@ and the data-specific check (machines) stays in a plugin.
 ## Follow-up patches (0615)
 
 **0615** (`dd4f150218`): the archive preflight read Kanban task status with 2 s per read / 2.5 s overall and reported "task status unknown" whenever the backend was slower. Reads now allow 6 s, retry once on a timeout, within a 14 s budget. Code: `apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts`; test: `confirm-linked-archive.test.ts`.
+
+## Follow-up source commit (3ee37f99fb, not yet mirrored as a patch)
+
+`kanban_active` also counts settled cards whose chat close-out has not run (chat-closeout's waiting source), so a finished chat could warn "7 open" with nothing open. `refreshArchiveTasks` now reads `/api/session-kanban-tasks` whenever a fresh row claims work: an empty read archives without asking, a live result replaces the row's count, and a failed read keeps the row's count. Tests: `confirm-linked-archive.test.ts` (settled-only, live-count and failed-read cases).
