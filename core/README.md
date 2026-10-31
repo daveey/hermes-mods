@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1415 patches, one entry per non-merge source commit through `160518392aaf58cec3b8ac04d9712e635b05fdf5`.
+1427 patches, one entry per non-merge source commit through `1b20db1838e748ce13cbc974fcaa6681cff13da8`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -24,10 +24,21 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `6bb377a51d5c8e279a7a5e34d717d653d421d064`; current merge-base: `ef35e8b9e1a8bc7f0efb50e4f2d68f1ec052f6a8`.
 Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with an explicit upstream-merge bridge immediately before patch 1328. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-The snapshot's full verifier exits 0 with [mirror-replay-1415.json](mirror-replay-1415.json) (one hash-pinned bridge) and [mirror-policy-1415.json](mirror-policy-1415.json).
-The current snapshot's executed checks are in [mirror-1415-verification.md](mirror-1415-verification.md), with its policy [mirror-policy-1415.json](mirror-policy-1415.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+The snapshot's full verifier exits 0 with [mirror-replay-1427.json](mirror-replay-1427.json) (one hash-pinned bridge) and [mirror-policy-1427.json](mirror-policy-1427.json).
+The current snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1416–1427
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Checkpoint reclamation](mirror-runtime-follow-ups-1416.md) | 1416 | Reclaim pending size work with auto-prune disabled; niced maintenance and daily over-cap health error. |
+| [New-session plugin refresh](mirror-runtime-follow-ups-1416.md) | 1417–1419 | Refresh changed enablement at agent build; post-pass cache signature and empty-root equivalence. |
+| [Advisory BuildKit cache exports](mirror-runtime-follow-ups-1416.md) | 1420 | Ignore optional cache-export failure, not build failure. |
+| [Managed worker warning synchronization](mirror-runtime-follow-ups-1416.md) | 1421 | Await asynchronous warning publication in the lineage regression. |
+| [Routeless heavy-work placement](mirror-runtime-follow-ups-1416.md) | 1422–1424 | Route portable heavy work while preserving explicit pins and host-bound work. |
+| [Offline DNS retry wait](offline-dns-retry-wait.md) | 1425–1427 | Cumulative per-request awake-time DNS wait, bounded probes, interrupts and cron error metadata. |
 
 ## Mirror follow-ups 1382–1415
 
@@ -179,7 +190,7 @@ python3 -B core/verify_mirror.py \
   --policy core/mirror-policy-NNNN.json
 ```
 
-For the 1415 snapshot, also pass `--replay-plan core/mirror-replay-1415.json` and use `--policy core/mirror-policy-1415.json`.
+For the 1427 snapshot, also pass `--replay-plan core/mirror-replay-1427.json` and use `--policy core/mirror-policy-1427.json`.
 This explicit opt-in pins the historical replay start and a bridge's boundary by source SHA, its source merge and its diff by SHA-256. Starts and merge IDs must be full commit IDs; merge ancestry, boundary membership and unique boundaries are validated. Bridge paths are relative to the plan, without parent traversal. Each uninterrupted patch segment is replayed in published order, then the bridge is applied with `git apply --index --3way` and committed. No source patch is skipped; final tree comparison is unchanged. The merge label documents provenance; the diff hash binds the reviewed public bridge (which may contain normalization), not an automatically regenerated source diff.
 
 Exit 0 is the acceptance step for every mirror pass; record its JSON line in the snapshot's
@@ -976,3 +987,4 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [1375-entry mirror snapshot](mirror-1375-verification.md) | verification report | Appends 1369–1375; full inventory, replay and tree acceptance with the snapshot-bound policy and replay plan. |
 | [1381-entry mirror snapshot](mirror-1381-verification.md) | verification report | Appends 1376–1381; full replay/tree acceptance and 60 passing targeted source tests. |
 | [1415-entry mirror snapshot](mirror-1415-verification.md) | verification report | Appends 1382–1415; full replay/tree acceptance with two re-pinned historical fingerprints. |
+| [1427-entry mirror snapshot](mirror-1427-verification.md) | verification report | Appends 1416–1427 through offline DNS retry wait; full inventory, replay and normalized-tree verification. |

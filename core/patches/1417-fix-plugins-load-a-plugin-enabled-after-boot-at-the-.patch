@@ -1,0 +1,394 @@
+From 3edd79398068fd6ac0ce110a5e1f020dfd51ffe9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:45:06 +0000
+Subject: [PATCH] fix(plugins): load a plugin enabled after boot at the next
+ new-session agent build [daveey]
+
+A long-lived process discovered plugins once: discover_and_load returns early once _discovered is
+set, and hermes plugins enable nudges only the host-level serve backend and the gateway socket. A
+per-profile serve --isolated backend that booted before an enable never registered the plugin's
+hooks until it restarted (nine every-host guards stayed out of ten hub backends on 10-30).
+
+PluginManager now keeps the pre-sweep fingerprint (and a cheap precheck) of the inputs it swept.
+refresh_if_inputs_changed() re-runs the forced pass load_and_go_live uses (under _GO_LIVE_LOCK +
+_discovery_lock) only when they changed. tui_gateway _make_agent and the gateway's
+_build_fresh_agent call it before building a new session's agent, never mid-turn. Unchanged
+inputs cost one precheck stat pass: median 2.4 ms on the hub's 55-plugin default home.
+
+Also corrects the delegation router comment that claimed the next scan picks such a plugin up.
+---
+ gateway/session_execution.py                  |   4 +
+ hermes_cli/plugins.py                         |  27 ++++
+ hermes_cli/plugins_refresh.py                 |  55 +++++++
+ hermes_cli/plugins_snapshot.py                |  35 +++++
+ hermes_cli/web_routers/delegation.py          |   3 +-
+ .../test_make_agent_plugin_refresh.py         | 140 ++++++++++++++++++
+ tui_gateway/agent_factory.py                  |   5 +
+ 7 files changed, 268 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/plugins_refresh.py
+ create mode 100644 tests/tui_gateway/test_make_agent_plugin_refresh.py
+
+diff --git a/gateway/session_execution.py b/gateway/session_execution.py
+index 5732fb60ab1..e4ca5dc5f8e 100644
+--- a/gateway/session_execution.py
++++ b/gateway/session_execution.py
+@@ -158,6 +158,10 @@ class GatewaySessionAgentMixin:
+         from gateway.session_policy import policy_for_source
+         from gateway.session_worker_construct import session_prefill
+         policy = policy_for_source(runner, src)
++        # [daveey] A plugin enabled after the gateway booted loads before a fresh agent snapshots its
++        # tools (this session's home is bound here); a no-op stat check when nothing changed.
++        from hermes_cli.plugins import refresh_plugins_for_new_session
++        refresh_plugins_for_new_session()
+         return ctx.AIAgent(
+             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
+             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index e87c99f1005..999e171beb4 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -1091,6 +1091,10 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+         self.home_path = Path(self.scope_key)
+         self._discovery_lock = threading.RLock()
+         self._discovered: bool = False
++        # [daveey] Inputs the last completed sweep read (``plugins_snapshot.fingerprint`` / ``precheck``,
++        # taken pre-sweep): ``refresh_if_inputs_changed`` compares against them at a session boundary.
++        self._swept_fingerprint: Optional[str] = None
++        self._swept_precheck: Optional[str] = None
+         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
+         # the installed scope may then hold plugin-supplied names, and a later discovery that finds NO
+         # enabled plugin source (plugin removed / disabled) must still reconcile once to drop them.
+@@ -1232,6 +1236,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+                 self._discovered = True
+                 return
+             hook_stamp = plugins_snapshot.fingerprint(self.home_path)  # [daveey] pre-sweep, for record_hooks
++            precheck_stamp = plugins_snapshot.precheck(self.home_path)
+             # Flag set up front as a re-entrancy guard (register() can trigger discovery again) but
+             # reset on failure so a failed scan is NOT cached as "discovered with an empty registry"
+             # — callers swallow the exception and would be stranded on the early return above.
+@@ -1257,10 +1262,19 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+             except BaseException:
+                 self._discovered = False
+                 raise
++            self._swept_fingerprint, self._swept_precheck = hook_stamp, precheck_stamp
+             plugins_snapshot.record_hooks(hook_stamp, self, self.home_path)  # best-effort, never raises
+         # Outside the lock: a listener (the gateway's re-wire) may read the registry from another thread.
+         self._notify_plugin_loaded(loaded_before)
+ 
++    def refresh_if_inputs_changed(self) -> bool:
++        """[daveey] At a NEW-session agent build in a long-lived process (serve, gateway): rerun discovery
++        (forced, like ``load_and_go_live``) when its inputs changed since the last sweep, so a plugin
++        enabled after boot loads without a restart. True when a pass ran. Never call it mid-turn.
++        See :mod:`hermes_cli.plugins_refresh`."""
++        from hermes_cli.plugins_refresh import refresh_if_inputs_changed
++        return refresh_if_inputs_changed(self)
++
+     def _re_register_config_hooks_after_force(self) -> None:
+         """Restore config-owned shell hooks/outbound webhooks after a force clear; each guarded
+         independently so one failing does not skip the other."""
+@@ -2103,6 +2117,19 @@ def get_plugin_error_classification(
+     return winner
+ 
+ 
++def refresh_plugins_for_new_session() -> bool:
++    """[daveey] :meth:`PluginManager.refresh_if_inputs_changed` for the active home's manager; never
++    raises (an agent build must not fail on it)."""
++    try:
++        from agent.safe_worker_policy import safe_worker_enabled
++        if safe_worker_enabled():
++            return False
++        return get_plugin_manager().refresh_if_inputs_changed()
++    except Exception:
++        logger.warning("plugin refresh before a new-session agent build failed", exc_info=True)
++        return False
++
++
+ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
+     """Return the global manager after idempotent (or ``force``d) discovery."""
+     manager = get_plugin_manager()
+diff --git a/hermes_cli/plugins_refresh.py b/hermes_cli/plugins_refresh.py
+new file mode 100644
+index 00000000000..93568e48812
+--- /dev/null
++++ b/hermes_cli/plugins_refresh.py
+@@ -0,0 +1,55 @@
++"""Session-boundary plugin refresh for long-lived processes. [daveey]
++
++A ``PluginManager`` discovers once: ``discover_and_load`` returns early once ``_discovered`` is set.
++``hermes plugins enable`` nudges only the host-level serve backend (its rendezvous record) and the
++gateway's control socket, so a per-profile ``hermes serve --isolated`` backend (a Desktop chat over
++SSH) that booted before the enable never loaded the plugin until it restarted: nine every-host
++guards enabled on the hub on 10-30 stayed out of all ten per-profile backends.
++
++:func:`refresh_if_inputs_changed` closes that gap where it is safe to: when a long-lived process
++builds the agent for a NEW session (``tui_gateway`` ``_make_agent``, the gateway's
++``_build_fresh_agent``), never mid-turn. It compares the discovery inputs against those the last
++sweep read and, only when they differ, runs the same forced pass ``load_and_go_live`` runs, under
++the same ``_GO_LIVE_LOCK`` + ``_discovery_lock``. Cost when nothing changed: one
++``plugins_snapshot.precheck`` (stat of config.yaml, .env and each top-level plugin dir); the full
++``fingerprint`` (~15-20 ms on the hub's plugin tree) runs only when the precheck moved.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++
++def refresh_if_inputs_changed(manager: Any) -> bool:
++    """Force-rediscover ``manager``'s plugins when their inputs changed since its last sweep. True when
++    a forced pass ran; False when the manager never discovered (its first lazy discovery reads the
++    current inputs anyway), the inputs are unchanged, or they could not be read."""
++    from hermes_cli import plugins_snapshot
++    from hermes_cli.plugins_loader import in_plugin_load_worker
++
++    if not manager._discovered or manager._swept_fingerprint is None or in_plugin_load_worker():
++        return False
++    home = manager.home_path
++    pre = plugins_snapshot.precheck(home)
++    if pre is not None and pre == manager._swept_precheck:
++        return False
++    stamp = plugins_snapshot.fingerprint(home)
++    if stamp is None:
++        return False
++    if stamp == manager._swept_fingerprint:
++        manager._swept_precheck = pre  # e.g. a __pycache__ dir appeared: nothing discovery reads moved
++        return False
++    from hermes_cli.plugins import _join_background_discovery
++    from hermes_cli.plugins_activation import _GO_LIVE_LOCK
++
++    _join_background_discovery()
++    with _GO_LIVE_LOCK, manager._discovery_lock:
++        if manager._swept_fingerprint == stamp:
++            return False  # another session's build swept these inputs while we waited
++        logger.info("plugin inputs for %s changed since the last discovery; reloading plugins for a new "
++                    "session", home)
++        manager.discover_and_load(force=True)
++    return True
+diff --git a/hermes_cli/plugins_snapshot.py b/hermes_cli/plugins_snapshot.py
+index 291914063a7..2bcaad7b867 100644
+--- a/hermes_cli/plugins_snapshot.py
++++ b/hermes_cli/plugins_snapshot.py
+@@ -172,6 +172,41 @@ def fingerprint(home: Optional[Path] = None) -> Optional[str]:
+         return None
+ 
+ 
++def precheck(home: Optional[Path] = None) -> Optional[str]:
++    """[daveey] A cheap subset of :func:`fingerprint`'s inputs (~1 ms against ~15-20 ms on the hub's real
++    plugin tree): the discovery env flags, config.yaml and .env (``hermes plugins enable`` writes
++    ``plugins.enabled``), the user plugin root's entries and each top-level plugin dir's manifest and
++    ``__init__.py``. Unchanged means a long-lived process skips the full fingerprint at a session
++    boundary; a deep in-place edit of a plugin module is the one input it misses. None when it cannot
++    be computed (callers then compute the full fingerprint)."""
++    try:
++        from hermes_cli import plugins as _plugins
++
++        home = Path(home) if home is not None else get_hermes_home()
++        parts: list = [str(home), [[name, os.environ.get(name)] for name in _ENV_INPUTS]]
++        for name in ("config.yaml", ".env"):
++            parts.append(_stat_entry(home / name, name))
++        roots = [Path(_plugins.get_bundled_plugins_dir()), home / "plugins"]
++        if _plugins._env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
++            roots.append(Path.cwd() / ".hermes" / "plugins")
++        for root in roots:
++            try:
++                names = sorted(n for n in os.listdir(root) if n not in _SKIP_DIRS)
++            except OSError as exc:
++                parts.append([str(root), "missing", exc.errno])
++                continue
++            parts.append(_stat_entry(root, str(root)))
++            for name in names:
++                entry = root / name
++                parts.append(_stat_entry(entry, name))  # follows a symlinked plugin to its directory
++                for leaf in ("plugin.yaml", "plugin.yml", "__init__.py"):
++                    parts.append(_stat_entry(entry / leaf, f"{name}/{leaf}"))
++        return hashlib.sha256(json.dumps(parts, default=str).encode()).hexdigest()
++    except Exception:
++        logger.debug("plugin discovery precheck failed", exc_info=True)
++        return None
++
++
+ def builtin_collision() -> Optional[str]:
+     """Why the live (discovered) plugin set may change built-in toolset membership, or None."""
+     import toolsets
+diff --git a/hermes_cli/web_routers/delegation.py b/hermes_cli/web_routers/delegation.py
+index 0a4cba09b22..0b2ec4f1cc0 100644
+--- a/hermes_cli/web_routers/delegation.py
++++ b/hermes_cli/web_routers/delegation.py
+@@ -64,7 +64,8 @@ def _registered_backends() -> list[dict[str, Any]]:
+     from agent.delegation_registry import DEFAULT_BACKEND as builtin
+     from hermes_cli.plugins import discover_plugins
+ 
+-    discover_plugins()  # idempotent; a plugin enabled after boot loads on the next scan
++    discover_plugins()  # idempotent: once discovered it never rescans; a plugin enabled after boot
++    # loads at the next new-session agent build (refresh_plugins_for_new_session) or an activation nudge
+     # ``description`` is the provider's ``summary``: the one line a backend picker shows for it.
+     return [{**asdict(b), "builtin": b.name == builtin} for b in list_backends()]
+ 
+diff --git a/tests/tui_gateway/test_make_agent_plugin_refresh.py b/tests/tui_gateway/test_make_agent_plugin_refresh.py
+new file mode 100644
+index 00000000000..09ead5d5f8f
+--- /dev/null
++++ b/tests/tui_gateway/test_make_agent_plugin_refresh.py
+@@ -0,0 +1,140 @@
++"""A plugin enabled after a long-lived process booted loads at its next NEW-session agent build. [daveey]
++
++``PluginManager.discover_and_load`` returns early once ``_discovered`` is set, and ``hermes plugins
++enable`` nudges only the host-level serve backend and the gateway socket: a per-profile ``hermes serve
++--isolated`` backend that booted before the enable never registered the plugin's hooks until it
++restarted (nine every-host guards stayed out of ten hub backends on 10-30). ``_make_agent`` (serve /
++TUI) and the gateway's ``_build_fresh_agent`` now call ``refresh_plugins_for_new_session`` first, which
++re-runs the forced pass only when the discovery inputs changed since the last sweep.
++"""
++
++from __future__ import annotations
++
++import types
++from types import SimpleNamespace
++
++import pytest
++
++import hermes_yaml as yaml
++from hermes_cli import plugins as plugins_mod
++from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++_GUARD = """
++def _guard(tool_name=None, **_kw):
++    return None
++
++def register(ctx):
++    ctx.register_hook("pre_tool_call", _guard)
++"""
++
++
++def _add_enabled_plugin(home, name: str) -> None:
++    plugin_dir = home / "plugins" / name
++    plugin_dir.mkdir(parents=True)
++    (plugin_dir / "plugin.yaml").write_text(yaml.safe_dump({"name": name, "version": "0.1.0"}), encoding="utf-8")
++    (plugin_dir / "__init__.py").write_text(_GUARD, encoding="utf-8")
++    cfg_path = home / "config.yaml"
++    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
++    cfg.setdefault("plugins", {}).setdefault("enabled", []).append(name)
++    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
++
++
++def _hook_owners(manager, hook: str) -> set[str]:
++    return {getattr(cb, "__module__", "") for cb in manager._hooks.get(hook, [])}
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / "profile"
++    (home / "plugins").mkdir(parents=True)
++    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": []}}), encoding="utf-8")
++    bundled = tmp_path / "bundled"
++    bundled.mkdir()
++    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))  # no bundled plugins: a fast, exact registry
++    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
++    plugins_mod._reset_plugin_managers_for_tests()
++    token = set_hermes_home_override(home)
++    yield home
++    reset_hermes_home_override(token)
++    plugins_mod._reset_plugin_managers_for_tests()
++
++
++@pytest.fixture
++def sweeps(home, monkeypatch):
++    """The discovered manager for ``home`` plus a counter of real discovery sweeps after boot."""
++    manager = plugins_mod.get_plugin_manager()
++    manager.discover_and_load()
++    assert manager._discovered and manager._swept_fingerprint is not None
++    count = {"n": 0}
++    inner = manager._discover_and_load_inner
++
++    def counted():
++        count["n"] += 1
++        return inner()
++
++    monkeypatch.setattr(manager, "_discover_and_load_inner", counted)
++    return manager, count
++
++
++def _build_tui_agent(monkeypatch):
++    from tui_gateway import server
++    monkeypatch.setattr(server, "_resolve_agent_model_runtime", lambda *_a: ("test-model", {}))
++    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: None)
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
++    monkeypatch.setattr("run_agent.AIAgent", lambda **kw: types.SimpleNamespace(model=kw.get("model")))
++    server._make_agent("sid", "session-key")
++
++
++def _build_gateway_agent():
++    from gateway.session_execution import GatewaySessionAgentMixin
++    turn = GatewaySessionAgentMixin.__new__(GatewaySessionAgentMixin)
++    turn._runner = SimpleNamespace(session_authority=None, _prefill_messages=None, _service_tier=None,
++                                   _session_db=None, _refresh_fallback_model=lambda: None, config=None)
++    source = SimpleNamespace(chat_id="c", user_id="u", user_id_alt=None, user_name=None, chat_name=None,
++                             chat_type="dm", thread_id=None, platform=None)
++    turn._ctx = SimpleNamespace(source=source, user_config={}, enabled_toolsets=[], disabled_toolsets=None,
++                                session_id="c", session_key="k", AIAgent=lambda **kw: kw)
++    turn._build_fresh_agent({"model": "m", "runtime": {}}, "local", None, 1, None, {}, False)
++
++
++def test_new_session_build_loads_a_plugin_enabled_after_boot(sweeps, home, monkeypatch):
++    manager, count = sweeps
++    assert "refresh_probe_guard" not in _hook_owners(manager, "pre_tool_call")
++    _add_enabled_plugin(home, "refresh_probe_guard")
++
++    _build_tui_agent(monkeypatch)
++
++    assert count["n"] == 1
++    assert "refresh_probe_guard" in manager._plugins
++    assert any("refresh_probe_guard" in owner for owner in _hook_owners(manager, "pre_tool_call"))
++
++
++def test_unchanged_inputs_run_no_forced_pass(sweeps, monkeypatch):
++    _manager, count = sweeps
++    for _ in range(3):
++        _build_tui_agent(monkeypatch)
++    assert count["n"] == 0
++    assert plugins_mod.refresh_plugins_for_new_session() is False
++
++
++def test_gateway_fresh_agent_build_loads_a_plugin_enabled_after_boot(sweeps, home, monkeypatch):
++    from gateway import session_policy
++    monkeypatch.setattr(session_policy, "policy_for_source", lambda runner, source: None)
++    manager, count = sweeps
++    _build_gateway_agent()
++    assert count["n"] == 0  # unchanged inputs: no pass
++    _add_enabled_plugin(home, "gateway_probe_guard")
++
++    _build_gateway_agent()
++    _build_gateway_agent()  # the second build sees the inputs the first one swept
++
++    assert count["n"] == 1
++    assert any("gateway_probe_guard" in owner for owner in _hook_owners(manager, "pre_tool_call"))
++
++
++def test_an_undiscovered_manager_is_left_to_lazy_discovery(home):
++    manager = plugins_mod.get_plugin_manager()
++    assert not manager._discovered
++    assert manager.refresh_if_inputs_changed() is False
++    assert not manager._discovered
+diff --git a/tui_gateway/agent_factory.py b/tui_gateway/agent_factory.py
+index 8fe0355a19a..fa27f9bfe20 100644
+--- a/tui_gateway/agent_factory.py
++++ b/tui_gateway/agent_factory.py
+@@ -642,6 +642,11 @@ def _make_agent(
+     for _mod in ("hermes_cli.mcp_startup", "tui_gateway.entry"):
+         with contextlib.suppress(Exception):
+             importlib.import_module(_mod).wait_for_mcp_discovery()
++    # [daveey] A plugin enabled after this process booted (hermes plugins enable reaches neither a
++    # per-profile ``serve --isolated`` backend nor ``_discovered``'s early return) loads here, at a
++    # session boundary, before the agent snapshots its tools; a no-op stat check when nothing changed.
++    from hermes_cli.plugins import refresh_plugins_for_new_session
++    refresh_plugins_for_new_session()
+     cfg = _load_cfg()
+     # Load hooks alongside the same profile config used to construct this agent.
+     from agent.shell_hooks import register_from_config
+-- 
+2.55.0
+

@@ -1,0 +1,252 @@
+From 5e591d80bdf24c4f6624fdd95ecca302c876e58b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:52:29 +0000
+Subject: [PATCH] refactor(plugins): move refresh_plugins_for_new_session and
+ error-classification dispatch out of plugins.py [daveey]
+
+plugins.py is over its 2000-line target and may only shrink: the session-boundary refresh helper
+lives in plugins_refresh.py, and get_plugin_error_classification moves to
+plugins_error_classification.py (re-exported from plugins.py, so agent.error_classifier and its
+tests resolve it unchanged).
+---
+ gateway/session_execution.py                  |  2 +-
+ hermes_cli/plugins.py                         | 69 +------------------
+ hermes_cli/plugins_error_classification.py    | 67 ++++++++++++++++++
+ hermes_cli/plugins_refresh.py                 | 14 ++++
+ hermes_cli/web_routers/delegation.py          |  2 +-
+ .../test_make_agent_plugin_refresh.py         |  3 +-
+ tui_gateway/agent_factory.py                  |  2 +-
+ 7 files changed, 88 insertions(+), 71 deletions(-)
+ create mode 100644 hermes_cli/plugins_error_classification.py
+
+diff --git a/gateway/session_execution.py b/gateway/session_execution.py
+index e4ca5dc5f8e..5978cedf808 100644
+--- a/gateway/session_execution.py
++++ b/gateway/session_execution.py
+@@ -160,7 +160,7 @@ class GatewaySessionAgentMixin:
+         policy = policy_for_source(runner, src)
+         # [daveey] A plugin enabled after the gateway booted loads before a fresh agent snapshots its
+         # tools (this session's home is bound here); a no-op stat check when nothing changed.
+-        from hermes_cli.plugins import refresh_plugins_for_new_session
++        from hermes_cli.plugins_refresh import refresh_plugins_for_new_session
+         refresh_plugins_for_new_session()
+         return ctx.AIAgent(
+             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 999e171beb4..92e8f960125 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -2061,73 +2061,8 @@ def get_pre_verify_continue_message(
+     return None
+ 
+ 
+-def get_plugin_error_classification(
+-    *, provider: str = "", model: str = "", status_code: Optional[int] = None, error_type: str = "",
+-    error_code: str = "", error_message: str = "", error_body: Optional[dict[str, Any]] = None,
+-    error: Optional[BaseException] = None, approx_tokens: int = 0, context_length: int = 0,
+-    num_messages: int = 0,
+-) -> Optional[dict[str, Any]]:
+-    """Consult ``transform_api_error_classification`` hooks BEFORE the built-in classifier.
+-    Run-all-then-pick-first: the first valid result in registration order wins, losing valid results
+-    warn (conflicts visible, not shadowed). Returns a sanitized dict (``reason`` -> ``FailoverReason``,
+-    hint flags -> bool, ``message`` capped at 500) or ``None``. Privacy: inputs may be unredacted.
+-
+-    A callback returns ``None`` to decline, or a dict with a required ``"reason"`` (a
+-    :class:`agent.error_classifier.FailoverReason` member or its string name) plus optional recovery-hint
+-    overrides. Dispatch is run-all-then-pick-first: ``invoke_hook`` runs every registered callback with
+-    failures isolated, then the first result carrying a valid reason wins in registration order — mirroring
+-    :func:`get_pre_tool_call_block_message`, invalid or irrelevant returns are silently ignored so a
+-    misbehaving plugin degrades to a no-op. When more than one callback returns a valid classification, the
+-    losing results are skipped with a runtime warning (the #64714 skipped-transform rule) so conflicting
+-    provider plugins are visible in logs instead of silently shadowed.
+-    """
+-    from agent.error_classifier import FailoverReason
+-    hook_results = invoke_hook(
+-        "transform_api_error_classification", provider=provider, model=model,
+-        status_code=status_code, error_type=error_type, error_code=error_code,
+-        error_message=error_message, error_body=error_body if isinstance(error_body, dict) else {},
+-        error=error, approx_tokens=approx_tokens, context_length=context_length,
+-        num_messages=num_messages,
+-    )
+-
+-    def _reason(result: Any) -> Any:
+-        reason = result.get("reason") if isinstance(result, dict) else None
+-        if isinstance(reason, str):
+-            with suppress(ValueError):
+-                return FailoverReason(reason.strip().lower())
+-            return None
+-        return reason if isinstance(reason, FailoverReason) else None
+-
+-    valid = [(result, reason) for result in hook_results if (reason := _reason(result)) is not None]
+-    if not valid:
+-        return None
+-    result, reason = valid[0]
+-    winner: dict[str, Any] = {"reason": reason}
+-    for key in ("retryable", "should_compress", "should_rotate_credential", "should_fallback"):
+-        if key in result:
+-            winner[key] = bool(result[key])
+-    message = result.get("message")
+-    if isinstance(message, str) and message.strip():
+-        winner["message"] = message.strip()[:500]
+-    if isinstance(result.get("error_context"), dict):
+-        winner["error_context"] = result["error_context"]
+-    if len(valid) > 1:
+-        logger.warning("transform_api_error_classification: skipped %d valid classification(s) after the "
+-                       "first result in registration order won (run-all-then-pick-first)", len(valid) - 1)
+-    return winner
+-
+-
+-def refresh_plugins_for_new_session() -> bool:
+-    """[daveey] :meth:`PluginManager.refresh_if_inputs_changed` for the active home's manager; never
+-    raises (an agent build must not fail on it)."""
+-    try:
+-        from agent.safe_worker_policy import safe_worker_enabled
+-        if safe_worker_enabled():
+-            return False
+-        return get_plugin_manager().refresh_if_inputs_changed()
+-    except Exception:
+-        logger.warning("plugin refresh before a new-session agent build failed", exc_info=True)
+-        return False
++# Moved to a topical sibling; re-exported (agent.error_classifier and tests resolve it here).
++from hermes_cli.plugins_error_classification import get_plugin_error_classification
+ 
+ 
+ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
+diff --git a/hermes_cli/plugins_error_classification.py b/hermes_cli/plugins_error_classification.py
+new file mode 100644
+index 00000000000..00fa7f47a7a
+--- /dev/null
++++ b/hermes_cli/plugins_error_classification.py
+@@ -0,0 +1,67 @@
++"""``transform_api_error_classification`` dispatch, split out of :mod:`hermes_cli.plugins` (which
++re-exports it)."""
++
++from __future__ import annotations
++
++import logging
++from contextlib import suppress
++from typing import Any, Optional
++
++logger = logging.getLogger("hermes_cli.plugins")
++
++
++def get_plugin_error_classification(
++    *, provider: str = "", model: str = "", status_code: Optional[int] = None, error_type: str = "",
++    error_code: str = "", error_message: str = "", error_body: Optional[dict[str, Any]] = None,
++    error: Optional[BaseException] = None, approx_tokens: int = 0, context_length: int = 0,
++    num_messages: int = 0,
++) -> Optional[dict[str, Any]]:
++    """Consult ``transform_api_error_classification`` hooks BEFORE the built-in classifier.
++    Run-all-then-pick-first: the first valid result in registration order wins, losing valid results
++    warn (conflicts visible, not shadowed). Returns a sanitized dict (``reason`` -> ``FailoverReason``,
++    hint flags -> bool, ``message`` capped at 500) or ``None``. Privacy: inputs may be unredacted.
++
++    A callback returns ``None`` to decline, or a dict with a required ``"reason"`` (a
++    :class:`agent.error_classifier.FailoverReason` member or its string name) plus optional recovery-hint
++    overrides. Dispatch is run-all-then-pick-first: ``invoke_hook`` runs every registered callback with
++    failures isolated, then the first result carrying a valid reason wins in registration order — mirroring
++    :func:`get_pre_tool_call_block_message`, invalid or irrelevant returns are silently ignored so a
++    misbehaving plugin degrades to a no-op. When more than one callback returns a valid classification, the
++    losing results are skipped with a runtime warning (the #64714 skipped-transform rule) so conflicting
++    provider plugins are visible in logs instead of silently shadowed.
++    """
++    from agent.error_classifier import FailoverReason
++    from hermes_cli.plugins import invoke_hook  # resolved at call time: tests patch it there
++    hook_results = invoke_hook(
++        "transform_api_error_classification", provider=provider, model=model,
++        status_code=status_code, error_type=error_type, error_code=error_code,
++        error_message=error_message, error_body=error_body if isinstance(error_body, dict) else {},
++        error=error, approx_tokens=approx_tokens, context_length=context_length,
++        num_messages=num_messages,
++    )
++
++    def _reason(result: Any) -> Any:
++        reason = result.get("reason") if isinstance(result, dict) else None
++        if isinstance(reason, str):
++            with suppress(ValueError):
++                return FailoverReason(reason.strip().lower())
++            return None
++        return reason if isinstance(reason, FailoverReason) else None
++
++    valid = [(result, reason) for result in hook_results if (reason := _reason(result)) is not None]
++    if not valid:
++        return None
++    result, reason = valid[0]
++    winner: dict[str, Any] = {"reason": reason}
++    for key in ("retryable", "should_compress", "should_rotate_credential", "should_fallback"):
++        if key in result:
++            winner[key] = bool(result[key])
++    message = result.get("message")
++    if isinstance(message, str) and message.strip():
++        winner["message"] = message.strip()[:500]
++    if isinstance(result.get("error_context"), dict):
++        winner["error_context"] = result["error_context"]
++    if len(valid) > 1:
++        logger.warning("transform_api_error_classification: skipped %d valid classification(s) after the "
++                       "first result in registration order won (run-all-then-pick-first)", len(valid) - 1)
++    return winner
+diff --git a/hermes_cli/plugins_refresh.py b/hermes_cli/plugins_refresh.py
+index 93568e48812..4a8cc0d13fd 100644
+--- a/hermes_cli/plugins_refresh.py
++++ b/hermes_cli/plugins_refresh.py
+@@ -53,3 +53,17 @@ def refresh_if_inputs_changed(manager: Any) -> bool:
+                     "session", home)
+         manager.discover_and_load(force=True)
+     return True
++
++
++def refresh_plugins_for_new_session() -> bool:
++    """:func:`refresh_if_inputs_changed` for the active home's manager; never raises (an agent build
++    must not fail on it). Call it before building a NEW session's agent, never mid-turn."""
++    try:
++        from agent.safe_worker_policy import safe_worker_enabled
++        from hermes_cli.plugins import get_plugin_manager
++        if safe_worker_enabled():
++            return False
++        return refresh_if_inputs_changed(get_plugin_manager())
++    except Exception:
++        logger.warning("plugin refresh before a new-session agent build failed", exc_info=True)
++        return False
+diff --git a/hermes_cli/web_routers/delegation.py b/hermes_cli/web_routers/delegation.py
+index 0b2ec4f1cc0..5c20ba99d50 100644
+--- a/hermes_cli/web_routers/delegation.py
++++ b/hermes_cli/web_routers/delegation.py
+@@ -65,7 +65,7 @@ def _registered_backends() -> list[dict[str, Any]]:
+     from hermes_cli.plugins import discover_plugins
+ 
+     discover_plugins()  # idempotent: once discovered it never rescans; a plugin enabled after boot
+-    # loads at the next new-session agent build (refresh_plugins_for_new_session) or an activation nudge
++    # loads at the next new-session agent build (plugins_refresh) or an activation nudge
+     # ``description`` is the provider's ``summary``: the one line a backend picker shows for it.
+     return [{**asdict(b), "builtin": b.name == builtin} for b in list_backends()]
+ 
+diff --git a/tests/tui_gateway/test_make_agent_plugin_refresh.py b/tests/tui_gateway/test_make_agent_plugin_refresh.py
+index 09ead5d5f8f..2ab1f64520e 100644
+--- a/tests/tui_gateway/test_make_agent_plugin_refresh.py
++++ b/tests/tui_gateway/test_make_agent_plugin_refresh.py
+@@ -115,7 +115,8 @@ def test_unchanged_inputs_run_no_forced_pass(sweeps, monkeypatch):
+     for _ in range(3):
+         _build_tui_agent(monkeypatch)
+     assert count["n"] == 0
+-    assert plugins_mod.refresh_plugins_for_new_session() is False
++    from hermes_cli.plugins_refresh import refresh_plugins_for_new_session
++    assert refresh_plugins_for_new_session() is False
+ 
+ 
+ def test_gateway_fresh_agent_build_loads_a_plugin_enabled_after_boot(sweeps, home, monkeypatch):
+diff --git a/tui_gateway/agent_factory.py b/tui_gateway/agent_factory.py
+index fa27f9bfe20..bba108d4d9e 100644
+--- a/tui_gateway/agent_factory.py
++++ b/tui_gateway/agent_factory.py
+@@ -645,7 +645,7 @@ def _make_agent(
+     # [daveey] A plugin enabled after this process booted (hermes plugins enable reaches neither a
+     # per-profile ``serve --isolated`` backend nor ``_discovered``'s early return) loads here, at a
+     # session boundary, before the agent snapshots its tools; a no-op stat check when nothing changed.
+-    from hermes_cli.plugins import refresh_plugins_for_new_session
++    from hermes_cli.plugins_refresh import refresh_plugins_for_new_session
+     refresh_plugins_for_new_session()
+     cfg = _load_cfg()
+     # Load hooks alongside the same profile config used to construct this agent.
+-- 
+2.55.0
+

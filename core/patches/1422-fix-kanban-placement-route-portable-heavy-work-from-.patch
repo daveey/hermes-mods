@@ -1,0 +1,170 @@
+From eb3f116f65aa416d2487a3bc457cef73c37efa40 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 07:09:35 +0000
+Subject: [PATCH] fix(kanban-placement): route portable heavy work from a
+ routeless gateway (hub) to heavy_route worker
+
+heavy_route was read only after a route target existed, so the hub kept every heavy card local
+and worker-1 (pickup=explicit) never saw one. Add _routeless_heavy with portable-eligibility
+checks and HOME_GATEWAY_MARKERS; explicit pins, courier cards, host-specific work unchanged.
+---
+ hermes_cli/kanban_placement.py            | 58 ++++++++++++++++++++
+ tests/hermes_cli/test_kanban_placement.py | 66 +++++++++++++++++++++++
+ 2 files changed, 124 insertions(+)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 84bcc12858a..5eb6dafd562 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -308,6 +308,59 @@ def _heavy_marker(title: str, body: str, cfg: _Cfg) -> Optional[str]:
+     return None
+ 
+ 
++# Work that only makes sense on the gateway that owns it (the hub, for a routeless gateway): its checkout and
++# state, credentials broker, cron control plane, Kanban DB, Board/gateway admin. Used only for ``_routeless_heavy``.
++HOME_GATEWAY_MARKERS = (
++    r"~/\.hermes\b", r"/home/ubuntu/\.hermes\b", r"\bkanban\.db\b", r"\bcron ?(job|jobs|tab)?\b",
++    r"\btoken-broker\b", r"\bhermes-sync\b", r"\bhermes-hub\b", r"\bon the hub\b", r"\bthe hub's\b",
++    r"\bgateway (restart|config|service)\b", r"\bsystemctl\b", r"\blaunchd\b",
++)
++
++
++def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
++                     machine_ok: Optional[Callable[[str], bool]]) -> Optional[dict]:
++    """Placement for heavy, portable work created on a gateway with no ``route`` entry (the hub): None keeps it
++    here on the gateway's own host. Portable means: scratch workspace on the default board, an assignee this
++    config places, no option a worker cannot carry, only carried ``requires`` and no gateway ``needs``, no
++    local-only marker, no marker naming the home gateway's own state (:data:`HOME_GATEWAY_MARKERS`, extended
++    by ``extra_home_markers``), a heavy marker, and a worker that is an active pickup machine."""
++    worker = c.heavy_target(self_gw)
++    if not worker:
++        return None
++    if (args.get("workspace_kind") or "scratch") != "scratch":
++        return None
++    board = args.get("board")
++    if board and board != "default":
++        return None
++    if (args.get("assignee") or "default") not in c.assignees():
++        return None
++    if any(args.get(k) not in (None, "", [], False) for k in UNCARRIED_OPTIONS):
++        return None
++    reqs = args.get("requires") or []
++    reqs = [reqs] if isinstance(reqs, str) else list(reqs)
++    if any(reg.is_gateway_need(r) for r in reqs):
++        return None
++    if any(str(r) not in c.carried_requires() for r in reqs):
++        return None
++    title, body = args.get("title") or "", args.get("body") or ""
++    if _local_marker(title, body, args.get("skills"), c):
++        return None
++    full = f"{title}\n{body}"
++    extra = c.raw.get("extra_home_markers")
++    pats = list(HOME_GATEWAY_MARKERS) + (list(extra) if isinstance(extra, list) else [])
++    for p in pats:
++        try:
++            if re.search(p, full, re.IGNORECASE):
++                return None
++        except re.error:
++            continue
++    heavy = _heavy_marker(title, body, c)
++    if not heavy or not (machine_ok or _machine_picks_up)(worker):
++        return None
++    return {"where": "local", "runs_on": [f"machine:{worker}"],
++            "why": f"heavy work ({heavy}): runs on {worker} through the Board lease"}
++
++
+ def _machine_picks_up(name: str) -> bool:
+     """``name`` is an active machine in the Board registry that is not held (draining) and has not turned
+     pickup off. The Board registry does not publish ``pickup`` today (10-28: every entry lacked it, the hub
+@@ -541,6 +594,11 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+             # liveness check below refuses a gateway that is unknown or not live.
+             target = pin
+         if not target:
++            # A gateway with no ``route`` entry (the hub) can still send portable heavy work to a worker node.
++            if not explicit and origin_intent is None and c.heavy_target(self_gw):
++                d = _routeless_heavy(args, c, self_gw, machine_ok)
++                if d:
++                    return d
+             return {"where": "local", "why": "no placement route for this gateway"}
+         if origin_intent is not None:
+             return {"where": "local", "why": "courier creation for another gateway"}
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 73857645049..9e33f2d83b6 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1359,6 +1359,72 @@ def test_heavy_route_machine_check_reads_the_board_registry(monkeypatch, entry,
+     assert kp._machine_picks_up("worker-1") is ok
+ 
+ 
++# --- the hub (no route entry) sends portable heavy work to the worker ---------------------------------------
++# Gap: heavy_route was only read after a route target existed, so the hub (routeless) kept every heavy card
++# on itself and worker-1's explicit pickup never saw one.
++
++HUB_HEAVY = {"route": {"macbook": "hub"}, "heavy_route": {"hub": "worker-1"}}
++
++
++def _hub(args, **kw):
++    kw.setdefault("cfg", HUB_HEAVY)
++    kw.setdefault("self_gw", "hub")
++    kw.setdefault("machine_ok", PICKS_UP)
++    return decide(args, **kw)
++
++
++@pytest.mark.parametrize("args", [
++    {"title": "Run the regression tests for the parser"},
++    {"title": "CI red", "body": "Reproduce with scripts/run_tests.sh tests/hermes_cli/ -j 4"},
++    {"title": "Benchmark the tokenizer", "requires": ["terminal", "file", "git"]},
++    {"title": "Run the benchmark", "parents": ["t_1"]},
++])
++def test_hub_origin_portable_heavy_work_runs_on_the_worker(args):
++    d = _hub(args)
++    assert d["where"] == "local" and d["runs_on"] == ["machine:worker-1"] and "defer" not in d, d
++    assert d["why"].startswith("heavy work")
++
++
++@pytest.mark.parametrize("args", [
++    {"title": "Light summary of CI failures"},                                  # not heavy
++    {"title": "Run the regression tests on hermes-hub"},                        # names the hub host
++    {"title": "pytest the hub", "body": "read ~/.hermes/kanban.db while it runs"},   # host state
++    {"title": "Run pytest", "body": "then edit the cron jobs"},                 # cron control plane
++    {"title": "Run pytest", "body": "use token-broker exec to fetch a key"},    # credentials broker
++    {"title": "Run pytest", "workspace_kind": "dir", "workspace_path": "/home/ubuntu/code/x"},
++    {"title": "Run pytest", "workspace_kind": "worktree", "workspace_path": "/home/ubuntu/code/x"},
++    {"title": "Run pytest", "board": "links"},
++    {"title": "Run pytest", "requires": ["host_repo"]},                          # checkout on this host
++    {"title": "Run pytest", "requires": ["aws:acct:ec2-describe"]},             # gateway capability
++    {"title": "Run pytest", "initial_status": "blocked"},
++    {"title": "Run pytest", "project": "hermes"},
++    {"title": "Run pytest", "assignee": "alpha"},
++    {"title": "Fix flaky macOS test in the pytest suite"},                      # Mac-only
++    {"title": "Run pytest", "skills": ["macos-performance-triage"]},
++])
++def test_hub_origin_host_specific_or_light_work_stays_on_the_hub(args):
++    d = _hub(args)
++    assert d["where"] == "local" and "runs_on" not in d, d
++
++
++def test_hub_origin_heavy_work_stays_when_the_worker_does_not_pick_up_or_is_not_configured():
++    assert "runs_on" not in _hub({"title": "Run pytest"}, machine_ok=lambda name: False)
++    assert "runs_on" not in _hub({"title": "Run pytest"}, cfg={"route": {"macbook": "hub"}})
++    assert "runs_on" not in _hub({"title": "Run pytest"}, cfg={"heavy_route": {"macbook": "worker-1"}})
++
++
++def test_hub_origin_explicit_pins_and_courier_cards_win_over_heavy_routing():
++    assert "runs_on" not in _hub({"title": "Run pytest", "placement": "local"})
++    assert "runs_on" not in _hub({"title": "Run pytest", "placement": "macbook"})
++    assert "runs_on" not in _hub({"title": "Run pytest"}, origin_intent={"x": 1})
++
++
++def test_hub_origin_extra_home_markers_extend_the_host_specific_list():
++    cfg = {**HUB_HEAVY, "extra_home_markers": [r"\bsecret-lab\b"]}
++    assert "runs_on" not in _hub({"title": "Run pytest in secret-lab"}, cfg=cfg)
++    assert _hub({"title": "Run pytest in the open"}, cfg=cfg)["runs_on"] == ["machine:worker-1"]
++
++
+ # --- explicit pin to a live gateway that is not this gateway's route target ---------------------------
+ # From the hub (no route entry) placement='macbook' was refused "no placement route for this gateway", so
+ # kanban_create could not reach the MacBook at all. [daveey]
+-- 
+2.55.0
+

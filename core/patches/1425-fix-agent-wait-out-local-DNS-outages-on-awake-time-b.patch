@@ -1,0 +1,926 @@
+From d232e94baa9cccb4be6f67eff130f2cf19fd1950 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 07:13:14 +0000
+Subject: [PATCH] fix(agent): wait out local DNS outages on awake time before
+ retrying [daveey]
+
+---
+ agent/agent_init.py                         |   6 +
+ agent/retry_utils.py                        | 157 ++++++++++++
+ agent/turn_api_error.py                     |  14 ++
+ agent/turn_offline_wait.py                  |  98 ++++++++
+ agent/turn_retry_state.py                   |   2 +
+ cli-config.yaml.example                     |   7 +
+ cron/scheduler.py                           |  21 +-
+ hermes_cli/config_defaults.py               |   5 +
+ tests/agent/test_offline_wait.py            | 250 ++++++++++++++++++++
+ tests/agent/test_offline_wait_boundaries.py | 113 +++++++++
+ tests/cron/test_cron_offline_wait.py        |  93 ++++++++
+ 11 files changed, 764 insertions(+), 2 deletions(-)
+ create mode 100644 agent/turn_offline_wait.py
+ create mode 100644 tests/agent/test_offline_wait.py
+ create mode 100644 tests/agent/test_offline_wait_boundaries.py
+ create mode 100644 tests/cron/test_cron_offline_wait.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 46bbc84066a..0afc34f268e 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1319,6 +1319,12 @@ def _apply_agent_section(agent, _agent_cfg):
+         agent._auto_recovery_cycles = max(int(_agent_section.get("auto_recovery_cycles", 5)), 0)
+     except (TypeError, ValueError):
+         agent._auto_recovery_cycles = 5
++    # Awake seconds an API call may wait for a lost LOCAL network (DNS fails on this machine, e.g. a
++    # laptop's dark wake) before its attempts are spent (agent/turn_offline_wait.py). 0 disables.
++    try:
++        agent._offline_wait_seconds = max(float(_agent_section.get("offline_wait_seconds", 900)), 0.0)
++    except (TypeError, ValueError):
++        agent._offline_wait_seconds = 900.0
+ 
+ 
+ def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:
+diff --git a/agent/retry_utils.py b/agent/retry_utils.py
+index fc1d702f263..b215fd099a0 100644
+--- a/agent/retry_utils.py
++++ b/agent/retry_utils.py
+@@ -4,6 +4,7 @@ Jittered delays (vs. fixed exponential) prevent thundering-herd retry spikes
+ when many sessions hit the same rate-limited provider concurrently.
+ """
+ 
++import logging
+ import random
+ import re
+ import threading
+@@ -193,3 +194,159 @@ def provider_retry_after_seconds(error: Any) -> Optional[float]:
+             nested = body.get("error")
+             value = parse_retry_after_seconds((nested if isinstance(nested, dict) else body).get("retry_after"))
+     return value if value is not None and value > 0 else None
++
++
++# ── Waiting out a local network loss ────────────────────────────────────────────────────────────
++# A laptop that sleeps mid-turn wakes briefly ("dark wake" on macOS) with no working network: every
++# retry fails DNS at once, so a retry budget counted in attempts or wall-clock seconds is gone in one
++# 3 s wake (self-heal cron-b459306dea). The retry loop calls ``wait_for_network`` instead of spending an
++# attempt when the error's cause chain shows a LOCAL resolution/network failure. Its budget is awake
++# time (``time.monotonic`` pauses while macOS/Linux sleep, see ``AwakeIdleMeter``).
++DEFAULT_OFFLINE_WAIT_SECONDS = 900.0
++OFFLINE_POLL_MIN_S = 5.0
++OFFLINE_POLL_MAX_S = 30.0
++# A host that resolves whenever the machine has working DNS: it tells "this machine is offline"
++# apart from "the provider's host name does not resolve" (a typo or a dead custom endpoint).
++NETWORK_CONTROL_HOST = "github.com"
++_RESOLVE_TIMEOUT_S = 5.0
++_OFFLINE_SLICE_S = 0.2
++_logger = logging.getLogger(__name__)
++
++
++def is_local_network_error(error: Any) -> bool:
++    """True when *error* or anything in its ``__cause__``/``__context__`` chain is a local DNS or
++    network-down failure (``socket.gaierror``, ENETUNREACH, or SDK text naming one). Refused or reset
++    connections and timeouts are the far end's doing and stay ordinary retryable errors."""
++    import errno as _errno
++    import socket as _socket
++    from agent.api_error_summary import _NETWORK_RESOLUTION_MARKERS
++
++    seen: set[int] = set()
++    current = error
++    while current is not None and id(current) not in seen and len(seen) < 16:
++        seen.add(id(current))
++        if isinstance(current, _socket.gaierror):
++            return True
++        if isinstance(current, OSError) and getattr(current, "errno", None) == _errno.ENETUNREACH:
++            return True
++        if any(marker in str(current).lower() for marker in _NETWORK_RESOLUTION_MARKERS):
++            return True
++        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
++    return False
++
++
++# libc resolution is not cancellable. Bound abandoned probes process-wide so a stuck resolver
++# cannot accumulate a new native thread on every poll in every turn.
++_dns_slots = threading.BoundedSemaphore(8)
++
++
++def host_resolves(host: str, timeout: float = _RESOLVE_TIMEOUT_S, *, is_interrupted=None) -> bool:
++    """Bounded, interruptible DNS observation; timed-out native lookups retain their slot until exit."""
++    import socket as _socket
++
++    interrupted = is_interrupted or (lambda: False)
++    if interrupted() or timeout <= 0 or not _dns_slots.acquire(blocking=False):
++        return False
++    outcome: dict[str, bool] = {}
++    done = threading.Event()
++
++    def _lookup() -> None:
++        try:
++            outcome["ok"] = bool(_socket.getaddrinfo(host, 443, type=_socket.SOCK_STREAM))
++        except (OSError, UnicodeError):
++            outcome["ok"] = False
++        finally:
++            _dns_slots.release()
++            done.set()
++
++    worker = threading.Thread(target=_lookup, name="offline-dns-probe", daemon=True)
++    try:
++        worker.start()
++    except BaseException:
++        _dns_slots.release()
++        raise
++    deadline = time.monotonic() + timeout
++    while not done.is_set():
++        remaining = deadline - time.monotonic()
++        if interrupted() or remaining <= 0:
++            return False
++        done.wait(min(_OFFLINE_SLICE_S, remaining))
++    return bool(outcome.get("ok"))
++
++
++def provider_host(base_url: Any) -> str:
++    """The host name of *base_url* ("" when it has none)."""
++    from urllib.parse import urlparse
++
++    try:
++        return urlparse(str(base_url or "")).hostname or ""
++    except ValueError:
++        return ""
++
++
++def wait_for_network(
++    host: str, *, budget_s: float, is_interrupted: Any = None, on_tick: Any = None, on_wait: Any = None,
++    resolve: Any = None, control_host: str = NETWORK_CONTROL_HOST,
++) -> tuple[str, float]:
++    """Wait until *host* resolves again, for at most *budget_s* seconds of AWAKE time.
++
++    Returns ``(outcome, awake_seconds_spent)``; outcome is ``"online"`` (it resolves again: retry
++    without spending an attempt), ``"already_online"`` (it resolved at once: the failure is not the
++    network's, count the attempt), ``"misconfigured"`` (the control host resolves but the provider's
++    does not: logs an ERROR and returns at once), ``"interrupted"``, ``"exhausted"`` or ``"disabled"``.
++    Polls every OFFLINE_POLL_MIN_S..OFFLINE_POLL_MAX_S seconds in short slices so *is_interrupted*
++    is honoured promptly; *on_tick(awake_spent_s)* runs about every 30 s of waiting (liveness)."""
++    is_interrupted = is_interrupted or (lambda: False)
++    if not host or budget_s <= 0:
++        return "disabled", 0.0
++    if is_interrupted():
++        return "interrupted", 0.0
++    started = time.monotonic()
++
++    def elapsed():
++        return max(0.0, time.monotonic() - started)
++
++    def lookup(name):
++        if is_interrupted() or elapsed() >= budget_s:
++            return False
++        if resolve is not None:
++            return resolve(name)
++        return host_resolves(name, timeout=min(_RESOLVE_TIMEOUT_S, budget_s - elapsed()),
++                             is_interrupted=is_interrupted)
++
++    if lookup(host):
++        return "already_online", elapsed()
++    if control_host and control_host != host and lookup(control_host):
++        _logger.error(
++            "provider host does not resolve while network is up: %s (control host %s resolves) — "
++            "check the provider base_url", host, control_host,
++        )
++        return "misconfigured", elapsed()
++    _logger.warning(
++        "offline — waiting for network: %s and %s do not resolve; waiting up to %.0fs of awake time",
++        host, control_host, budget_s,
++    )
++    if on_wait is not None and not is_interrupted():
++        on_wait()
++    spent = elapsed()
++    delay = OFFLINE_POLL_MIN_S
++    next_tick = 30.0
++    while spent < budget_s:
++        slice_end = min(budget_s, spent + delay)
++        while spent < slice_end:
++            if is_interrupted():
++                return "interrupted", elapsed()
++            time.sleep(min(_OFFLINE_SLICE_S, slice_end - spent))
++            spent = elapsed()
++        if on_tick is not None and spent >= next_tick:
++            next_tick = spent + 30.0
++            on_tick(spent)
++        if is_interrupted():
++            return "interrupted", elapsed()
++        if lookup(host):
++            spent = elapsed()
++            _logger.info("network is back: %s resolves after %.0fs of awake waiting", host, spent)
++            return "online", spent
++        spent = elapsed()
++        delay = min(delay * 1.5, OFFLINE_POLL_MAX_S)
++    return "interrupted" if is_interrupted() else "exhausted", elapsed()
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index d0017152925..439409d2871 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
+ 
+ from agent.api_error_summary import is_provider_stream_parse_error
+ from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
++from agent.turn_offline_wait import wait_out_offline
+ from agent.turn_overflow import recover_from_overflow
+ from agent.turn_recovery import (
+     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, free_tier_cooldown_ends_turn,
+@@ -63,6 +64,10 @@ def handle_api_error(
+     _provider_overflow_recovery_pending = False
+ 
+     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ApiErrorVerdict:
++        if isinstance(result, dict) and result.get("failed") is True:
++            # The provider's exception type, so callers that re-raise the failure (cron) keep it:
++            # a transient APIConnectionError must not turn into a bare RuntimeError (cron-b459306dea).
++            result.setdefault("error_type", type(api_error).__name__)
+         return ApiErrorVerdict(
+             action=action, thinking_spinner=thinking_spinner, messages=messages,
+             active_system_prompt=active_system_prompt, conversation_history=conversation_history,
+@@ -142,6 +147,15 @@ def handle_api_error(
+         reason=classified.reason.value,
+     )
+ 
++    # This machine lost its network (DNS fails locally, e.g. a laptop's dark wake): wait for it to
++    # come back on awake time before consuming retry or credential-rotation recovery budgets.
++    _offline = wait_out_offline(
++        agent, api_error, _retry, messages=messages, conversation_history=conversation_history,
++        api_call_count=api_call_count,
++    )
++    if _offline is not None:
++        return _verdict(*_offline)
++
+     _recovered, recovered_with_pool = recover_after_classification(
+         agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
+         messages=messages, api_messages=api_messages,
+diff --git a/agent/turn_offline_wait.py b/agent/turn_offline_wait.py
+new file mode 100644
+index 00000000000..6b3b4792278
+--- /dev/null
++++ b/agent/turn_offline_wait.py
+@@ -0,0 +1,98 @@
++"""Wait out a local DNS outage inside the turn's retry loop.
++
++Laptop dark wakes may have no working DNS. Wait on an awake-time budget instead of exhausting
++provider retries or rotating healthy credentials. DNS success is only a signal to retry the API,
++not proof of reachability: cached DNS, proxies, raw-IP endpoints and connection failures with
++working resolution remain on the ordinary bounded retry path.
++
++The budget is per model request (including repeated outages on that request), not per entire turn.
++"""
++
++from __future__ import annotations
++
++import logging
++import math
++from typing import Any, Optional
++
++logger = logging.getLogger("agent.conversation_loop")
++
++# How the user stops the wait on this surface (cron has nobody to tell).
++_STOP_HINTS = {"cli": "press Esc to stop", "tui": "press Esc to stop", "desktop": "press Esc to stop",
++               "api_server": "cancel the request to stop", "cron": ""}
++_DEFAULT_STOP_HINT = "send /stop to cancel"
++
++
++def offline_wait_budget(agent: Any) -> float:
++    """Configured ``agent.offline_wait_seconds`` (0 disables)."""
++    from agent.retry_utils import DEFAULT_OFFLINE_WAIT_SECONDS
++
++    value = getattr(agent, "_offline_wait_seconds", DEFAULT_OFFLINE_WAIT_SECONDS)
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return DEFAULT_OFFLINE_WAIT_SECONDS
++    return max(float(value), 0.0) if math.isfinite(value) else DEFAULT_OFFLINE_WAIT_SECONDS
++
++
++def offline_notice(agent: Any, host: str) -> str:
++    hint = _STOP_HINTS.get(str(getattr(agent, "platform", "") or "").lower(), _DEFAULT_STOP_HINT)
++    text = f"⏳ offline — waiting for network ({host} does not resolve); the turn resumes when it is back"
++    return f"{text}; {hint}" if hint else text
++
++
++def wait_out_offline(
++    agent: Any, api_error: Any, _retry: Any, *, messages: Any, conversation_history: Any,
++    api_call_count: int,
++) -> Optional[tuple[str, Optional[dict[str, Any]]]]:
++    """``("continue", None)`` when the network came back (retry the SAME attempt, uncounted),
++    ``("break", None)`` for a steering correction mid-wait, ``("return", result)`` when the user
++    stopped the wait, ``None`` when this is not a local network loss or the wait does not apply."""
++    from agent.retry_utils import is_local_network_error, provider_host, wait_for_network
++
++    if not is_local_network_error(api_error):
++        return None
++    remaining = offline_wait_budget(agent) - float(getattr(_retry, "offline_wait_spent_s", 0.0) or 0.0)
++    host = provider_host(getattr(agent, "base_url", "") or "")
++    if remaining <= 0 or not host:
++        return None
++
++    announced = []
++
++    def _announce_once() -> None:
++        if announced:
++            return
++        announced.append(True)
++        notice = offline_notice(agent, host)
++        agent._emit_diagnostic_status(notice)
++        agent._emit_diagnostic_wait(notice)
++
++    def _tick(spent: float) -> None:
++        _announce_once()
++        # Keep the gateway / cron inactivity watchdogs from reaping a turn that is only waiting.
++        agent._touch_activity(f"offline — waiting for network ({spent:.0f}s awake)")
++
++    def _interrupted() -> bool:
++        return bool(getattr(agent, "_interrupt_requested", False))
++
++    agent._touch_activity("offline — waiting for network")
++    outcome, spent = wait_for_network(host, budget_s=remaining, is_interrupted=_interrupted,
++                                     on_tick=_tick, on_wait=_announce_once)
++    _retry.offline_wait_spent_s = float(getattr(_retry, "offline_wait_spent_s", 0.0) or 0.0) + spent
++    if outcome == "online":
++        logger.info("%sNetwork is back after %.0fs offline — retrying the same attempt", agent.log_prefix, spent)
++        if announced:
++            agent._emit_diagnostic_status("✅ network is back — resuming")
++        return "continue", None
++    if outcome == "interrupted":
++        from agent.turn_recovery import abort_turn_on_interrupt
++
++        if agent.clear_interrupt(preserve_redirect=True):
++            _retry.restart_with_redirected_messages = True
++            return "break", None
++        return "return", abort_turn_on_interrupt(
++            agent, messages, conversation_history, api_call_count,
++            abort_message="Interrupt detected while waiting for the network, aborting.",
++            interrupt_text="Operation interrupted: waiting for the network to come back.",
++        )
++    if outcome == "exhausted":
++        logger.warning("%sStill offline after %.0fs of awake waiting — falling back to normal retries",
++                       agent.log_prefix, float(getattr(_retry, "offline_wait_spent_s", 0.0)))
++    return None
+diff --git a/agent/turn_retry_state.py b/agent/turn_retry_state.py
+index bd5000b6f6e..0d84af75dd0 100644
+--- a/agent/turn_retry_state.py
++++ b/agent/turn_retry_state.py
+@@ -48,6 +48,8 @@ class TurnRetryState:
+     auth_failover_attempted: bool = False
+     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
+     auto_recovery_cycles_used: int = 0
++    # Awake seconds this API call already waited for a lost local network (agent.offline_wait_seconds caps it).
++    offline_wait_spent_s: float = 0.0
+ 
+     # Restart signals (read by the outer loop after the attempt)
+     restart_with_compressed_messages: bool = False
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index a14f2e03126..227e4308d8f 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -1346,6 +1346,13 @@ agent:
+   # Set 0 to disable (default 5).
+   # auto_recovery_cycles: 5
+ 
++  # When an API call fails because this machine has no network (DNS fails for
++  # the provider and for a control host, e.g. a laptop waking briefly from
++  # sleep), Hermes waits up to this many seconds of AWAKE time for the network
++  # to come back ("offline — waiting for network"), then re-sends the same
++  # request without spending a retry. Esc stops the wait. 0 disables.
++  # offline_wait_seconds: 900
++
+   # After the agent edits code without fresh passing verification, nudge it to
+   # verify before finishing. Off by default (false). Set true to force it on
+   # everywhere, or "auto" for the surface-aware mode: on for interactive
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 3e2e426a45d..bd7eac8b028 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2144,6 +2144,22 @@ def _run_agent_with_watchdog(
+     return result
+ 
+ 
++class AgentTurnFailed(RuntimeError):
++    """The agent's own failed result, re-raised by the cron run. ``error_type`` keeps the provider
++    exception's class name (``APIConnectionError``...) so the failure is booked and logged as that,
++    not as a bare ``RuntimeError`` (self-heal cron-b459306dea: the coach detector skips transient
++    connection errors by type, and the lost type made it file a laptop going offline as a defect)."""
++
++    def __init__(self, message: str, *, error_type: str = ""):
++        super().__init__(message)
++        self.error_type = error_type
++
++
++def _job_error_message(exc: BaseException) -> str:
++    """``"<type>: <message>"`` for a failed run, the agent's provider error type when it has one."""
++    return f"{getattr(exc, 'error_type', '') or type(exc).__name__}: {exc!s}"
++
++
+ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgent) -> str:
+     """Deliverable final response from a ``run_conversation`` result. Raises RuntimeError on
+     `failed=True`/`completed=False`: the error text may sit in `final_response` and would otherwise
+@@ -2157,7 +2173,8 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
+     final_response_text = (result.get("final_response") or "").strip()
+     max_iteration_summary = is_max_iteration_handoff(result)
+     if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+-        raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
++        raise AgentTurnFailed(result.get("error") or final_response_text or "agent reported failure",
++                              error_type=str(result.get("error_type") or ""))
+     if max_iteration_summary:
+         logger.warning(
+             "Job '%s' reached the iteration limit but produced a final fallback response; "
+@@ -2842,7 +2859,7 @@ def run_job(
+         return True, output, final_response, None
+ 
+     except (Exception, ConfigBackendUnavailable) as e:  # the plane being down fails THIS fire only
+-        error_msg = f"{type(e).__name__}: {e!s}"
++        error_msg = _job_error_message(e)
+         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
+         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index baacc40939b..981e669089a 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -134,6 +134,11 @@ DEFAULT_CONFIG = {
+         # visible "retrying automatically" countdown instead of ending the turn. Esc/interrupt stops
+         # the wait; auth/format/billing/policy errors never enter. 0 disables.
+         "auto_recovery_cycles": 5,
++        # When an API call fails because THIS machine has no network (DNS fails for the provider and
++        # a control host, e.g. a laptop waking briefly from sleep), wait up to this many seconds of
++        # awake time for the network to return before spending a retry attempt. Shows "offline —
++        # waiting for network"; Esc/interrupt stops it. 0 disables.
++        "offline_wait_seconds": 900,
+         # Seconds the Codex/Responses stream may keep reading after its terminal frame so the relay
+         # finalizer can run. Relays that never close the SSE socket after response.completed would
+         # otherwise wedge the turn until the idle watchdog discards the already-billed response
+diff --git a/tests/agent/test_offline_wait.py b/tests/agent/test_offline_wait.py
+new file mode 100644
+index 00000000000..a87260bdd40
+--- /dev/null
++++ b/tests/agent/test_offline_wait.py
+@@ -0,0 +1,250 @@
++"""A laptop losing DNS between model calls waits without spending retry attempts.
++
++The regression includes a real local HTTP provider, wrapped DNS failures, and a clock whose
++wall time advances across sleep while its awake clock barely moves.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import socket
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from tests.e2e.core.history._helpers import NO_BACKGROUND_REVIEW, OFFLINE_CONFIG
++from tests.fakes.fake_llm_provider import FakeLLMServer, Text, write_hermes_home
++
++_OFFLINE_HOST = "llm.offline-test.invalid"
++_DARKWAKE_GAIERROR = (8, "nodename nor servname provided, or not known")
++
++
++class _FlakyDNS:
++    """``socket.getaddrinfo`` for a host whose network is gone for the first ``offline_lookups``
++    lookups (of any host this fake owns), then back. Real lookups pass through for other hosts."""
++
++    def __init__(self, offline_lookups: int, owned=(_OFFLINE_HOST, "github.com"), after_ok: int = 0):
++        self.remaining = offline_lookups
++        self.after_ok = after_ok  # lookups that succeed BEFORE the outage starts (mid-run drop)
++        self.owned = set(owned)
++        self.lookups = 0
++        self._real = socket.getaddrinfo
++
++    def __call__(self, host, port, *args, **kwargs):
++        if host not in self.owned:
++            return self._real(host, port, *args, **kwargs)
++        self.lookups += 1
++        if self.after_ok > 0:
++            self.after_ok -= 1
++            return self._real("127.0.0.1", port, *args, **kwargs)
++        if self.remaining > 0:
++            self.remaining -= 1
++            raise socket.gaierror(*_DARKWAKE_GAIERROR)
++        return self._real("127.0.0.1", port, *args, **kwargs)
++
++
++def _fast_offline_polls(monkeypatch):
++    import agent.retry_utils as ru
++    monkeypatch.setattr(ru, "OFFLINE_POLL_MIN_S", 0.01, raising=False)
++    monkeypatch.setattr(ru, "OFFLINE_POLL_MAX_S", 0.02, raising=False)
++
++
++def _turn(monkeypatch, dns: _FlakyDNS, *, offline_wait: int | None = None):
++    from run_agent import AIAgent
++
++    monkeypatch.setattr(socket, "getaddrinfo", dns)
++    home = Path(os.environ["HERMES_HOME"])
++    extra = "  auto_recovery_cycles: 0\n"  # the old ladder must not be what rescues the turn
++    if offline_wait is not None:
++        extra += f"  offline_wait_seconds: {offline_wait}\n"
++    with FakeLLMServer([Text("answered")]) as srv:
++        base_url = srv.base_url.replace("127.0.0.1", _OFFLINE_HOST)
++        # write_hermes_home's ``agent:`` block is last-but-telemetry; append our agent keys under it.
++        write_hermes_home(home, base_url, extra_config=OFFLINE_CONFIG + NO_BACKGROUND_REVIEW)
++        cfg = (home / "config.yaml").read_text()
++        (home / "config.yaml").write_text(cfg.replace("agent:\n", "agent:\n" + extra, 1))
++        agent = AIAgent(provider="custom", base_url=base_url, api_key="sk-fake", model="fake-model",
++                        session_id="offline-wait", quiet_mode=True, platform="cli", skip_memory=True)
++        try:
++            result = agent.run_conversation("hi", conversation_history=[], task_id="t")
++        finally:
++            agent.close()
++        served = len(srv.main_requests())
++    return result, served
++
++
++def test_turn_survives_dns_outage_without_spending_retries(monkeypatch):
++    """gaierror until the network returns, then the SAME attempt goes through: the turn answers,
++    and the provider saw exactly one request (no attempt was burned while offline)."""
++    _fast_offline_polls(monkeypatch)
++    import agent.turn_api_error as errors
++
++    def no_rotation(*args, **kwargs):
++        pytest.fail("local DNS outage must wait before credential recovery")
++
++    monkeypatch.setattr(errors, "recover_after_classification", no_rotation)
++    dns = _FlakyDNS(offline_lookups=40)
++    result, served = _turn(monkeypatch, dns)
++    assert result.get("completed") and result.get("final_response") == "answered", result
++    assert served == 1
++    assert dns.remaining == 0  # the outage really happened and was waited out
++
++
++def test_offline_wait_disabled_keeps_the_old_failure(monkeypatch):
++    """``agent.offline_wait_seconds: 0`` is the undo switch: the turn fails as before."""
++    _fast_offline_polls(monkeypatch)
++    result, served = _turn(monkeypatch, _FlakyDNS(offline_lookups=40), offline_wait=0)
++    assert result.get("failed"), result
++    assert served == 0
++
++
++# ---------------------------------------------------------------------------------------------
++# wait_for_network: awake-time budget, interrupts, misconfiguration
++
++
++class _Clock:
++    """Fake clocks for ``agent.retry_utils.time``: each sleep advances the monotonic (awake)
++    clock by ``awake_per_sleep`` and the wall clock by ``wall_per_sleep`` (host sleep)."""
++
++    def __init__(self, awake_per_sleep: float, wall_per_sleep: float):
++        self.mono = 1000.0
++        self.wall = 1_800_000_000.0
++        self.awake_per_sleep, self.wall_per_sleep = awake_per_sleep, wall_per_sleep
++        self.sleeps = 0
++
++    def install(self, monkeypatch):
++        import agent.retry_utils as ru
++        fake = SimpleNamespace(**vars(time))
++        fake.monotonic = lambda: self.mono
++        fake.time = lambda: self.wall
++        fake.sleep = self._sleep
++        monkeypatch.setattr(ru, "time", fake)
++
++    def _sleep(self, s):
++        self.sleeps += 1
++        self.mono += self.awake_per_sleep
++        self.wall += self.wall_per_sleep
++
++
++def _resolver(fail_first: int, control_ok: bool = False):
++    calls = {"provider": 0, "control": 0}
++
++    def resolve(host):
++        if host == "github.com":
++            calls["control"] += 1
++            return control_ok
++        calls["provider"] += 1
++        return calls["provider"] > fail_first
++    return resolve, calls
++
++
++def test_wait_for_network_returns_online_after_four_failed_lookups(monkeypatch):
++    from agent.retry_utils import wait_for_network
++    _Clock(awake_per_sleep=0.2, wall_per_sleep=0.2).install(monkeypatch)
++    resolve, calls = _resolver(fail_first=4)
++    outcome, spent = wait_for_network("api.example.com", budget_s=900, resolve=resolve)
++    assert outcome == "online"
++    assert calls["provider"] == 5 and 0 < spent < 900
++
++
++def test_wall_clock_jump_with_no_awake_time_does_not_exhaust(monkeypatch):
++    """A laptop asleep for hours between polls: the wall clock jumps 10 min per poll slice but
++    only 0.05 s of awake time passes. A 60 s budget must survive hundreds of such slices."""
++    from agent.retry_utils import wait_for_network
++    clock = _Clock(awake_per_sleep=0.05, wall_per_sleep=600.0)
++    clock.install(monkeypatch)
++    resolve, _ = _resolver(fail_first=3)
++    outcome, spent = wait_for_network("api.example.com", budget_s=60, resolve=resolve)
++    assert outcome == "online", (outcome, spent)
++    assert clock.wall - 1_800_000_000.0 > 3600  # hours of wall time went by
++    assert spent < 60
++
++
++def test_wait_for_network_exhausts_on_awake_budget(monkeypatch):
++    from agent.retry_utils import wait_for_network
++    _Clock(awake_per_sleep=1.0, wall_per_sleep=1.0).install(monkeypatch)
++    resolve, _ = _resolver(fail_first=10**9)
++    outcome, spent = wait_for_network("api.example.com", budget_s=120, resolve=resolve)
++    assert outcome == "exhausted" and 120 <= spent < 160
++
++
++def test_wait_budget_caps_poll_and_counts_initial_dns(monkeypatch):
++    from agent.retry_utils import wait_for_network
++    clock = _Clock(awake_per_sleep=0.2, wall_per_sleep=0.2)
++    clock.install(monkeypatch)
++
++    def slow_dns(host):
++        clock.mono += 0.4
++        return False
++
++    outcome, spent = wait_for_network("api.example.com", budget_s=1.0, resolve=slow_dns)
++    assert outcome == "exhausted"
++    assert 1.0 <= spent <= 1.01
++    assert clock.mono - 1000 <= 1.01
++
++
++def test_interrupt_before_dns_does_not_lookup(monkeypatch):
++    from agent.retry_utils import wait_for_network
++
++    def forbidden(host):
++        pytest.fail("interrupted wait must not start DNS")
++
++    assert wait_for_network("api.example.com", budget_s=900, resolve=forbidden,
++                            is_interrupted=lambda: True) == ("interrupted", 0.0)
++
++
++def test_wait_for_network_honours_interrupt(monkeypatch):
++    from agent.retry_utils import wait_for_network
++    clock = _Clock(awake_per_sleep=0.2, wall_per_sleep=0.2)
++    clock.install(monkeypatch)
++    resolve, _ = _resolver(fail_first=10**9)
++    outcome, _spent = wait_for_network("api.example.com", budget_s=900, resolve=resolve,
++                                       is_interrupted=lambda: clock.sleeps >= 3)
++    assert outcome == "interrupted" and clock.sleeps <= 4
++
++
++def test_provider_host_not_resolving_while_network_is_up_logs_error_and_does_not_wait(monkeypatch, caplog):
++    from agent.retry_utils import wait_for_network
++    clock = _Clock(awake_per_sleep=1.0, wall_per_sleep=1.0)
++    clock.install(monkeypatch)
++    resolve, _calls = _resolver(fail_first=10**9, control_ok=True)
++    with caplog.at_level(logging.WARNING, logger="agent.retry_utils"):
++        outcome, spent = wait_for_network("api.typo-example.com", budget_s=900, resolve=resolve)
++    assert outcome == "misconfigured" and clock.sleeps == 0 and spent == 0
++    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
++    assert len(errors) == 1
++    assert errors[0].getMessage().startswith("provider host does not resolve while network is up")
++
++
++def test_both_hosts_failing_logs_one_offline_warning(monkeypatch, caplog):
++    from agent.retry_utils import wait_for_network
++    _Clock(awake_per_sleep=0.2, wall_per_sleep=0.2).install(monkeypatch)
++    resolve, _ = _resolver(fail_first=3)
++    with caplog.at_level(logging.WARNING, logger="agent.retry_utils"):
++        outcome, _ = wait_for_network("api.example.com", budget_s=900, resolve=resolve)
++    assert outcome == "online"
++    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
++    assert len(msgs) == 1 and "offline — waiting for network" in msgs[0]
++
++
++@pytest.mark.parametrize("make,expected", [
++    (lambda: socket.gaierror(*_DARKWAKE_GAIERROR), True),
++    (lambda: OSError(101, "Network is unreachable"), True),
++    (lambda: ConnectionError("[Errno 8] nodename nor servname provided, or not known"), True),
++    (lambda: TimeoutError("read timed out"), False),
++    (lambda: ConnectionRefusedError(61, "Connection refused"), False),
++])
++def test_is_local_network_error_walks_the_cause_chain(make, expected):
++    from agent.retry_utils import is_local_network_error
++    inner = make()
++    try:
++        try:
++            raise inner
++        except Exception as e:
++            raise RuntimeError("Connection error.") from e
++    except RuntimeError as wrapped:
++        assert is_local_network_error(wrapped) is expected
++        assert is_local_network_error(inner) is expected
+diff --git a/tests/agent/test_offline_wait_boundaries.py b/tests/agent/test_offline_wait_boundaries.py
+new file mode 100644
+index 00000000000..50fd5991401
+--- /dev/null
++++ b/tests/agent/test_offline_wait_boundaries.py
+@@ -0,0 +1,113 @@
++"""Bounded DNS observation and per-request wait ownership."""
++import socket
++import threading
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from agent import retry_utils as ru
++from agent.turn_offline_wait import offline_wait_budget, wait_out_offline
++from agent.turn_retry_state import TurnRetryState
++
++
++def test_hung_dns_observation_is_interruptible_and_threads_are_bounded(monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    slots = threading.BoundedSemaphore(1)
++    monkeypatch.setattr(ru, "_dns_slots", slots)
++    calls = []
++
++    def stuck(*args, **kwargs):
++        calls.append(args)
++        entered.set()
++        assert release.wait(10)
++        return [(socket.AF_INET,)]
++
++    monkeypatch.setattr(socket, "getaddrinfo", stuck)
++    try:
++        # Interrupt only after the resolver really entered its blocked native-call seam.
++        assert not ru.host_resolves("example.com", is_interrupted=entered.is_set)
++        assert entered.is_set()
++        for _ in range(10):
++            assert not ru.host_resolves("example.com", timeout=0.01)
++        assert len(calls) == 1
++    finally:
++        release.set()
++        assert slots.acquire(timeout=10)
++        slots.release()
++
++
++def test_dns_timeout_returns_without_waiting_for_native_lookup(monkeypatch):
++    release = threading.Event()
++    slots = threading.BoundedSemaphore(1)
++    monkeypatch.setattr(ru, "_dns_slots", slots)
++
++    def stuck(*args, **kwargs):
++        assert release.wait(10)
++        return []
++
++    monkeypatch.setattr(socket, "getaddrinfo", stuck)
++    try:
++        assert not ru.host_resolves("example.com", timeout=0.01)
++        assert not slots.acquire(blocking=False)  # unresolved thread still owns its slot
++    finally:
++        release.set()
++        assert slots.acquire(timeout=10)
++        slots.release()
++
++
++def _agent():
++    return SimpleNamespace(_offline_wait_seconds=10, base_url="https://api.example.com/v1",
++                           platform="desktop", log_prefix="", _interrupt_requested=False,
++                           _touch_activity=Mock(), _emit_diagnostic_status=Mock(),
++                           _emit_diagnostic_wait=Mock(), clear_interrupt=Mock(return_value=False))
++
++
++def _wait(agent, state):
++    return wait_out_offline(agent, socket.gaierror(8, "offline"), state,
++                            messages=[], conversation_history=[], api_call_count=2)
++
++
++def test_repeated_outages_share_one_request_budget_and_feed_watchdog(monkeypatch):
++    agent, state = _agent(), TurnRetryState()
++    budgets = []
++
++    def wait(host, *, budget_s, is_interrupted, on_tick, on_wait):
++        budgets.append(budget_s)
++        assert not is_interrupted()
++        on_tick(6)
++        return ("online", 6) if len(budgets) == 1 else ("exhausted", 4)
++
++    monkeypatch.setattr(ru, "wait_for_network", wait)
++    assert _wait(agent, state) == ("continue", None)
++    assert _wait(agent, state) is None
++    assert _wait(agent, state) is None
++    assert budgets == [10, 4]
++    assert state.offline_wait_spent_s == 10
++    assert any("6s awake" in c.args[0] for c in agent._touch_activity.call_args_list)
++    assert any("network is back" in c.args[0] for c in agent._emit_diagnostic_status.call_args_list)
++
++
++@pytest.mark.parametrize("outcome", ["already_online", "misconfigured", "disabled"])
++def test_non_offline_verdict_falls_through_to_normal_retries(monkeypatch, outcome):
++    monkeypatch.setattr(ru, "wait_for_network", lambda *a, **k: (outcome, 0))
++    assert _wait(_agent(), TurnRetryState()) is None
++
++
++@pytest.mark.parametrize("redirect", [False, True])
++def test_interrupt_preserves_redirect_or_returns_abort(monkeypatch, redirect):
++    from agent import turn_recovery
++    agent, state = _agent(), TurnRetryState()
++    agent.clear_interrupt.return_value = redirect
++    monkeypatch.setattr(ru, "wait_for_network", lambda *a, **k: ("interrupted", 1))
++    abort = Mock(return_value={"interrupted": True, "completed": False})
++    monkeypatch.setattr(turn_recovery, "abort_turn_on_interrupt", abort)
++    result = _wait(agent, state)
++    assert result == (("break", None) if redirect else ("return", abort.return_value))
++    assert state.restart_with_redirected_messages is redirect
++    assert abort.call_count == (0 if redirect else 1)
++
++
++@pytest.mark.parametrize("value", [float("inf"), float("nan"), True, "900"])
++def test_wait_budget_rejects_nonfinite_and_non_numeric_config(value):
++    assert offline_wait_budget(SimpleNamespace(_offline_wait_seconds=value)) == 900
+diff --git a/tests/cron/test_cron_offline_wait.py b/tests/cron/test_cron_offline_wait.py
+new file mode 100644
+index 00000000000..16b855b9c51
+--- /dev/null
++++ b/tests/cron/test_cron_offline_wait.py
+@@ -0,0 +1,93 @@
++"""A cron run whose host loses DNS mid-run waits for the network and finishes ``ok``.
++
++The first model call succeeds, its tool call takes DNS away, and the second model call must
++wait it out. The unreachable rerun ladder cannot rescue a job that already made a model call.
++"""
++import json
++import os
++import subprocess
++import sys
++from datetime import timedelta
++from pathlib import Path
++
++from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall, write_hermes_home
++
++_HOST = "llm.offline-test.invalid"
++
++_TICK = '''
++import json, os, socket, sys
++from pathlib import Path
++
++_real = socket.getaddrinfo
++marker = Path(os.environ["OFFLINE_MARKER"])
++state = {"remaining": int(os.environ["OFFLINE_LOOKUPS"])}
++
++def _getaddrinfo(host, port, *a, **k):
++    if host in ("llm.offline-test.invalid", "github.com"):
++        if marker.exists() and state["remaining"] > 0:  # the job's tool call took the network away
++            state["remaining"] -= 1
++            raise socket.gaierror(8, "nodename nor servname provided, or not known")
++        return _real("127.0.0.1", port, *a, **k)
++    return _real(host, port, *a, **k)
++
++socket.getaddrinfo = _getaddrinfo
++import agent.retry_utils as ru
++ru.OFFLINE_POLL_MIN_S, ru.OFFLINE_POLL_MAX_S = 0.01, 0.02
++from cron import scheduler, scheduler_authority
++from tests.cron.conftest import owner_execution_runner
++scheduler_authority.run_canonical_job = owner_execution_runner()
++scheduler.tick(verbose=False, sync=True)
++print(json.dumps({"remaining": state["remaining"], "marker": marker.exists()}))
++'''
++
++
++def _run_offline_job(tmp_path, agent_extra=""):
++    from hermes_time import now
++
++    home = tmp_path / "home"
++    marker = home / "offline-now.txt"
++    script = [ToolCall("write_file", {"path": str(marker), "content": "network gone\n"}), Text("done")]
++    with FakeLLMServer(script) as srv:
++        base_url = srv.base_url.replace("127.0.0.1", _HOST)
++        write_hermes_home(home, base_url)
++        cfg = (home / "config.yaml").read_text()
++        (home / "config.yaml").write_text(cfg.replace("agent:\n", "agent:\n  auto_recovery_cycles: 0\n" + agent_extra, 1))
++        (home / "cron").mkdir()
++        (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{
++            "id": "offline", "name": "offline probe", "prompt": "write the note",
++            "schedule": {"kind": "interval", "minutes": 240},
++            "next_run_at": (now() - timedelta(minutes=1)).isoformat(),
++            "enabled": True, "state": "scheduled", "deliver": "local",
++            "repeat": {"times": None, "completed": 0}}]}))
++        env = {k: v for k, v in os.environ.items()
++               if not k.startswith(("HERMES_", "_HERMES_"))
++               and not k.endswith(("_API_KEY", "_TOKEN"))}
++        env.update(HERMES_HOME=str(home), PYTHONPATH=str(Path(__file__).resolve().parents[2]),
++                   OFFLINE_MARKER=str(marker), OFFLINE_LOOKUPS="40")
++        result = subprocess.run([sys.executable, "-c", _TICK], env=env, stdin=subprocess.DEVNULL,
++                                capture_output=True, text=True, timeout=240, check=False)
++        served = len(srv.main_requests())
++    assert result.returncode == 0, result.stdout + result.stderr
++    report = json.loads(result.stdout.strip().splitlines()[-1])
++    job = json.loads((home / "cron" / "jobs.json").read_text())["jobs"][0]
++    logs = "\n".join(p.read_text(errors="replace") for p in sorted((home / "logs").glob("*.log")))
++    return report, job, served, result.stderr + logs
++
++
++def test_cron_run_that_goes_offline_mid_run_still_finishes_ok(tmp_path):
++    report, job, served, result = _run_offline_job(tmp_path)
++    assert report == {"remaining": 0, "marker": True}, report  # the outage happened mid-run
++    assert job.get("last_status") == "ok", (job, result[-3000:])
++    assert served == 2  # tool-call turn + the answer after the wait; nothing burned offline
++
++
++def test_offline_failure_keeps_the_provider_error_type(tmp_path):
++    """With the wait off (``agent.offline_wait_seconds: 0``) the run still fails, but the failure is
++    booked as the provider's ``APIConnectionError``, not a bare ``RuntimeError``: the coach detector
++    skips transient connection errors by type and filed this one as a defect (cron-b459306dea)."""
++    _report, job, _served, result = _run_offline_job(tmp_path, "  offline_wait_seconds: 0\n")
++    assert job.get("last_status") == "error", job
++    assert str(job.get("last_error") or "").startswith("APIConnectionError: Hermes can't reach the model provider"), job
++    # The ERROR record the coach detector reads (it skips APIConnectionError, files RuntimeError).
++    assert "Job 'offline probe' failed: APIConnectionError: " in result, result[-3000:]
++    assert "Job 'offline probe' failed: RuntimeError" not in result
+-- 
+2.55.0
+

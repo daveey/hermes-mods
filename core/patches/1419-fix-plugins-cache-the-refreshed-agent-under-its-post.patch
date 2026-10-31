@@ -1,0 +1,215 @@
+From 8b518c03e7864952a2917e75b564d4e72fa18665 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 06:22:42 +0000
+Subject: [PATCH] fix(plugins): cache the refreshed agent under its post-pass
+ signature; empty plugin root reads as absent [daveey]
+
+CI on #423 rebuilt the first turn's agent on the next turn (api_authority_daemon, relay_authority,
+session_authority). The gateway creates an empty <home>/plugins after boot discovery, which moved
+the fingerprint and forced a pass at the first fresh build; the agent was then cached under the
+pre-pass signature, so the next turn missed. An empty plugin root now fingerprints like a missing
+one, and the gateway refreshes in _resolve_turn_agent's fresh-build branch and recomputes the
+signature when a pass ran.
+---
+ gateway/session_execution.py                  | 17 +++--
+ hermes_cli/plugins_refresh.py                 |  2 +-
+ hermes_cli/plugins_snapshot.py                | 18 ++++-
+ .../test_make_agent_plugin_refresh.py         | 72 ++++++++++++++++---
+ 4 files changed, 91 insertions(+), 18 deletions(-)
+
+diff --git a/gateway/session_execution.py b/gateway/session_execution.py
+index 5978cedf808..91f944e28b6 100644
+--- a/gateway/session_execution.py
++++ b/gateway/session_execution.py
+@@ -158,10 +158,6 @@ class GatewaySessionAgentMixin:
+         from gateway.session_policy import policy_for_source
+         from gateway.session_worker_construct import session_prefill
+         policy = policy_for_source(runner, src)
+-        # [daveey] A plugin enabled after the gateway booted loads before a fresh agent snapshots its
+-        # tools (this session's home is bound here); a no-op stat check when nothing changed.
+-        from hermes_cli.plugins_refresh import refresh_plugins_for_new_session
+-        refresh_plugins_for_new_session()
+         return ctx.AIAgent(
+             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
+             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
+@@ -225,6 +221,19 @@ class GatewaySessionAgentMixin:
+         if found.evicted is not None:
+             self._release_evicted_agent(found.evicted)
+         if agent is None:
++            # [daveey] A plugin enabled after the gateway booted loads before a fresh agent snapshots its
++            # tools (this session's home is bound here); a no-op stat check when nothing changed. A pass
++            # that ran can change what the signature reads (plugin toolsets), so recompute it: caching the
++            # new agent under the pre-pass signature made the very next turn miss and rebuild it.
++            from hermes_cli.plugins_refresh import refresh_plugins_for_new_session
++            if refresh_plugins_for_new_session():
++                sig = runner._agent_config_signature(
++                    turn_route["model"], turn_route["runtime"], ctx.enabled_toolsets, combined_ephemeral,
++                    cache_keys=runner._extract_cache_busting_config(ctx.user_config),
++                    user_id=getattr(ctx.source, "user_id", None),
++                    user_id_alt=getattr(ctx.source, "user_id_alt", None),
++                    skip_context_files=skip_context_files,
++                )
+             from tools.delegate_tool_config import gateway_delegation_inline, gateway_delegation_inline_scope
+             # delegation.gateway_mode from this turn's own (profile-scoped) config and the chat's resolved interim
+             # setting (never muted for a heartbeat turn, which shares the user's session and its cached agent);
+diff --git a/hermes_cli/plugins_refresh.py b/hermes_cli/plugins_refresh.py
+index 4a8cc0d13fd..6c4de2ede11 100644
+--- a/hermes_cli/plugins_refresh.py
++++ b/hermes_cli/plugins_refresh.py
+@@ -8,7 +8,7 @@ guards enabled on the hub on 10-30 stayed out of all ten per-profile backends.
+ 
+ :func:`refresh_if_inputs_changed` closes that gap where it is safe to: when a long-lived process
+ builds the agent for a NEW session (``tui_gateway`` ``_make_agent``, the gateway's
+-``_build_fresh_agent``), never mid-turn. It compares the discovery inputs against those the last
++``_resolve_turn_agent`` before a fresh build), never mid-turn. It compares the discovery inputs against those the last
+ sweep read and, only when they differ, runs the same forced pass ``load_and_go_live`` runs, under
+ the same ``_GO_LIVE_LOCK`` + ``_discovery_lock``. Cost when nothing changed: one
+ ``plugins_snapshot.precheck`` (stat of config.yaml, .env and each top-level plugin dir); the full
+diff --git a/hermes_cli/plugins_snapshot.py b/hermes_cli/plugins_snapshot.py
+index 2bcaad7b867..e43c110952c 100644
+--- a/hermes_cli/plugins_snapshot.py
++++ b/hermes_cli/plugins_snapshot.py
+@@ -110,8 +110,18 @@ def _site_entry(path: Path, label: str) -> list:
+     return [label, [_stat_entry(path / n, n) for n in names]]
+ 
+ 
++def _root_is_empty(root: Path) -> bool:
++    """True when ``root`` is missing or holds nothing but skipped dirs: discovery loads the same
++    (nothing) from either, so a process creating an empty ``<home>/plugins`` after boot must not
++    read as a changed input."""
++    try:
++        return not any(n not in _SKIP_DIRS for n in os.listdir(root))
++    except OSError:
++        return True
++
++
+ def _walk_root(root: Path, label: str, out: list) -> None:
+-    if not root.is_dir():
++    if not root.is_dir() or _root_is_empty(root):
+         out.append([label, "absent"])
+         return
+     seen: set[tuple[int, int]] = set()
+@@ -192,8 +202,10 @@ def precheck(home: Optional[Path] = None) -> Optional[str]:
+         for root in roots:
+             try:
+                 names = sorted(n for n in os.listdir(root) if n not in _SKIP_DIRS)
+-            except OSError as exc:
+-                parts.append([str(root), "missing", exc.errno])
++            except OSError:
++                names = []
++            if not names:  # missing and empty load the same (nothing): see _root_is_empty
++                parts.append([str(root), "absent"])
+                 continue
+             parts.append(_stat_entry(root, str(root)))
+             for name in names:
+diff --git a/tests/tui_gateway/test_make_agent_plugin_refresh.py b/tests/tui_gateway/test_make_agent_plugin_refresh.py
+index 2ab1f64520e..77cec64c07c 100644
+--- a/tests/tui_gateway/test_make_agent_plugin_refresh.py
++++ b/tests/tui_gateway/test_make_agent_plugin_refresh.py
+@@ -4,7 +4,7 @@
+ enable`` nudges only the host-level serve backend and the gateway socket: a per-profile ``hermes serve
+ --isolated`` backend that booted before the enable never registered the plugin's hooks until it
+ restarted (nine every-host guards stayed out of ten hub backends on 10-30). ``_make_agent`` (serve /
+-TUI) and the gateway's ``_build_fresh_agent`` now call ``refresh_plugins_for_new_session`` first, which
++TUI) and the gateway's ``_resolve_turn_agent`` fresh-build branch now call ``refresh_plugins_for_new_session`` first, which
+ re-runs the forced pass only when the discovery inputs changed since the last sweep.
+ """
+ 
+@@ -86,16 +86,39 @@ def _build_tui_agent(monkeypatch):
+     server._make_agent("sid", "session-key")
+ 
+ 
+-def _build_gateway_agent():
++def _gateway_turn(manager, cache: dict, builds: list):
++    """A gateway turn whose agent-cache signature reads the loaded plugin set, as a plugin toolset in
++    ``enabled_toolsets`` does, so a pass that loads a plugin changes the signature."""
++    import threading
++
+     from gateway.session_execution import GatewaySessionAgentMixin
+     turn = GatewaySessionAgentMixin.__new__(GatewaySessionAgentMixin)
++
++    def sig(*_a, **_kw):
++        return tuple(sorted(manager._plugins))
++
++    def agent(**kw):
++        builds.append(kw)
++        return SimpleNamespace(max_iterations=kw.get("max_iterations"))
++
+     turn._runner = SimpleNamespace(session_authority=None, _prefill_messages=None, _service_tier=None,
+-                                   _session_db=None, _refresh_fallback_model=lambda: None, config=None)
++                                   _session_db=None, _refresh_fallback_model=lambda: None, config=None,
++                                   _agent_config_signature=sig, _extract_cache_busting_config=lambda _c: {},
++                                   _agent_cache=cache, _agent_cache_lock=threading.Lock(),
++                                   _enforce_agent_cache_cap=lambda: None,
++                                   _init_cached_agent_for_turn=lambda *_a: None,
++                                   _apply_fallback_chain_to_agent=lambda *_a: None)
+     source = SimpleNamespace(chat_id="c", user_id="u", user_id_alt=None, user_name=None, chat_name=None,
+                              chat_type="dm", thread_id=None, platform=None)
+     turn._ctx = SimpleNamespace(source=source, user_config={}, enabled_toolsets=[], disabled_toolsets=None,
+-                                session_id="c", session_key="k", AIAgent=lambda **kw: kw)
+-    turn._build_fresh_agent({"model": "m", "runtime": {}}, "local", None, 1, None, {}, False)
++                                session_id="c", session_key="k", AIAgent=agent, _interrupt_depth=0,
++                                interim_assistant_messages_enabled=False)
++    return turn
++
++
++def _gateway_turn_agent(manager, cache: dict, builds: list):
++    turn = _gateway_turn(manager, cache, builds)
++    return turn._resolve_turn_agent({"model": "m", "runtime": {}}, "local", None, 1, None, {})
+ 
+ 
+ def test_new_session_build_loads_a_plugin_enabled_after_boot(sweeps, home, monkeypatch):
+@@ -123,16 +146,45 @@ def test_gateway_fresh_agent_build_loads_a_plugin_enabled_after_boot(sweeps, hom
+     from gateway import session_policy
+     monkeypatch.setattr(session_policy, "policy_for_source", lambda runner, source: None)
+     manager, count = sweeps
+-    _build_gateway_agent()
++    builds: list = []
++    _gateway_turn_agent(manager, {}, builds)
+     assert count["n"] == 0  # unchanged inputs: no pass
+     _add_enabled_plugin(home, "gateway_probe_guard")
+ 
+-    _build_gateway_agent()
+-    _build_gateway_agent()  # the second build sees the inputs the first one swept
+-
+-    assert count["n"] == 1
++    cache: dict = {}
++    first, reused = _gateway_turn_agent(manager, cache, builds)
++    assert not reused and count["n"] == 1
+     assert any("gateway_probe_guard" in owner for owner in _hook_owners(manager, "pre_tool_call"))
+ 
++    # The pass changed the signature; the new agent is cached under the post-pass one, so the
++    # session's next turn reuses it instead of rebuilding (the identity daemon tests saw a rebuild).
++    second, reused = _gateway_turn_agent(manager, cache, builds)
++    assert reused and second is first
++    assert count["n"] == 1 and len(builds) == 2
++
++
++def test_an_empty_plugin_dir_created_after_boot_runs_no_pass(tmp_path, monkeypatch):
++    """A process creating an empty ``<home>/plugins`` after boot discovery (the gateway does) loads
++    nothing new, so it must not force a pass: on CI that pass made the first turn's agent miss the
++    cache on the next turn."""
++    home = tmp_path / "profile"
++    home.mkdir()
++    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": []}}), encoding="utf-8")
++    bundled = tmp_path / "bundled"
++    bundled.mkdir()
++    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))
++    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
++    plugins_mod._reset_plugin_managers_for_tests()
++    token = set_hermes_home_override(home)
++    try:
++        manager = plugins_mod.get_plugin_manager()
++        manager.discover_and_load()
++        (home / "plugins" / "__pycache__").mkdir(parents=True)
++        assert manager.refresh_if_inputs_changed() is False
++    finally:
++        reset_hermes_home_override(token)
++        plugins_mod._reset_plugin_managers_for_tests()
++
+ 
+ def test_an_undiscovered_manager_is_left_to_lazy_discovery(home):
+     manager = plugins_mod.get_plugin_manager()
+-- 
+2.55.0
+

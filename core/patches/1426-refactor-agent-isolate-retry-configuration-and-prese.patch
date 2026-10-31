@@ -1,0 +1,140 @@
+From 41bdcbbda0f530148cd4318f8316cd0e96c914ad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 07:17:50 +0000
+Subject: [PATCH] refactor(agent): isolate retry configuration and preserve DNS
+ thread scope [daveey]
+
+---
+ agent/agent_init.py                   | 20 ++------------------
+ agent/agent_init_retries.py           | 16 ++++++++++++++++
+ agent/retry_utils.py                  |  3 ++-
+ hermes_cli/config_defaults.py         | 17 ++---------------
+ hermes_cli/config_defaults_retries.py | 13 +++++++++++++
+ 5 files changed, 35 insertions(+), 34 deletions(-)
+ create mode 100644 agent/agent_init_retries.py
+ create mode 100644 hermes_cli/config_defaults_retries.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 0afc34f268e..8422a85a9c7 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1307,24 +1307,8 @@ def _apply_agent_section(agent, _agent_cfg):
+     # platform_hints: <platform>: {append|replace}, stored verbatim (agent/system_prompt.py).
+     agent._platform_hint_overrides = _cfg_dict(_agent_cfg, "platform_hints")
+ 
+-    # App-level API retry count (wraps each model API call). Default 3; 1 = single attempt.
+-    try:
+-        _api_retries = max(int(_agent_section.get("api_max_retries", 3)), 1)
+-    except (TypeError, ValueError):
+-        _api_retries = 3
+-    agent._api_max_retries = _api_retries
+-    # Bounded post-exhaustion auto-recovery cycles once retries AND the fallback chain are spent
+-    # on a transient outage (agent/turn_recovery_autorecover.py). 0 disables the ladder.
+-    try:
+-        agent._auto_recovery_cycles = max(int(_agent_section.get("auto_recovery_cycles", 5)), 0)
+-    except (TypeError, ValueError):
+-        agent._auto_recovery_cycles = 5
+-    # Awake seconds an API call may wait for a lost LOCAL network (DNS fails on this machine, e.g. a
+-    # laptop's dark wake) before its attempts are spent (agent/turn_offline_wait.py). 0 disables.
+-    try:
+-        agent._offline_wait_seconds = max(float(_agent_section.get("offline_wait_seconds", 900)), 0.0)
+-    except (TypeError, ValueError):
+-        agent._offline_wait_seconds = 900.0
++    from agent.agent_init_retries import apply_retry_config
++    apply_retry_config(agent, _agent_section)
+ 
+ 
+ def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:
+diff --git a/agent/agent_init_retries.py b/agent/agent_init_retries.py
+new file mode 100644
+index 00000000000..3b041ed7ba9
+--- /dev/null
++++ b/agent/agent_init_retries.py
+@@ -0,0 +1,16 @@
++"""Initialize per-request provider and offline retry budgets."""
++
++
++def apply_retry_config(agent, section):
++    try:
++        agent._api_max_retries = max(int(section.get("api_max_retries", 3)), 1)
++    except (TypeError, ValueError):
++        agent._api_max_retries = 3
++    try:
++        agent._auto_recovery_cycles = max(int(section.get("auto_recovery_cycles", 5)), 0)
++    except (TypeError, ValueError):
++        agent._auto_recovery_cycles = 5
++    try:
++        agent._offline_wait_seconds = max(float(section.get("offline_wait_seconds", 900)), 0.0)
++    except (TypeError, ValueError):
++        agent._offline_wait_seconds = 900.0
+diff --git a/agent/retry_utils.py b/agent/retry_utils.py
+index b215fd099a0..2eaf7144ba1 100644
+--- a/agent/retry_utils.py
++++ b/agent/retry_utils.py
+@@ -259,7 +259,8 @@ def host_resolves(host: str, timeout: float = _RESOLVE_TIMEOUT_S, *, is_interrup
+             _dns_slots.release()
+             done.set()
+ 
+-    worker = threading.Thread(target=_lookup, name="offline-dns-probe", daemon=True)
++    from agent.memory_provider import spawn_context_thread
++    worker = spawn_context_thread(_lookup, name="offline-dns-probe", daemon=True)
+     try:
+         worker.start()
+     except BaseException:
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 981e669089a..2828966fecb 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -5,6 +5,7 @@ docs of config.yaml.
+ """
+ 
+ from hermes_cli.config_defaults_auxiliary import _aux
++from hermes_cli.config_defaults_retries import AGENT_RETRY_DEFAULTS
+ 
+ #: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
+ #: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
+@@ -124,21 +125,7 @@ DEFAULT_CONFIG = {
+         # many slow/unreachable MCP servers.
+         # See #63078.
+         "build_wait_timeout": 600,
+-        # Hermes-level retry attempts for API errors (connection drops, timeouts, 5xx) wrapping the
+-        # whole call; the OpenAI SDK also retries transient errors (max_retries=2). Set 1 for fast
+-        # failover to fallback providers; raise to tolerate longer provider hiccups.
+-        "api_max_retries": 3,
+-        # Once api_max_retries AND the fallback chain are spent on a transient outage (5xx,
+-        # overloaded/529, connect/read timeouts) with nothing delivered yet, wait and retry this many
+-        # more cycles (jittered 15/30/60/60/60s; a provider Retry-After wins up to 120s) with a
+-        # visible "retrying automatically" countdown instead of ending the turn. Esc/interrupt stops
+-        # the wait; auth/format/billing/policy errors never enter. 0 disables.
+-        "auto_recovery_cycles": 5,
+-        # When an API call fails because THIS machine has no network (DNS fails for the provider and
+-        # a control host, e.g. a laptop waking briefly from sleep), wait up to this many seconds of
+-        # awake time for the network to return before spending a retry attempt. Shows "offline —
+-        # waiting for network"; Esc/interrupt stops it. 0 disables.
+-        "offline_wait_seconds": 900,
++        **AGENT_RETRY_DEFAULTS,
+         # Seconds the Codex/Responses stream may keep reading after its terminal frame so the relay
+         # finalizer can run. Relays that never close the SSE socket after response.completed would
+         # otherwise wedge the turn until the idle watchdog discards the already-billed response
+diff --git a/hermes_cli/config_defaults_retries.py b/hermes_cli/config_defaults_retries.py
+new file mode 100644
+index 00000000000..6318db4bb02
+--- /dev/null
++++ b/hermes_cli/config_defaults_retries.py
+@@ -0,0 +1,13 @@
++"""Defaults for per-request retry and local DNS-outage recovery."""
++
++AGENT_RETRY_DEFAULTS = {
++    # Hermes attempts wrapping each model call (SDK retries are additional). 1 = fast failover.
++    "api_max_retries": 3,
++    # After attempts AND fallback are spent on transient failures, allow this many recovery cycles.
++    # Uses jittered 15/30/60/60/60s waits; provider Retry-After wins up to 120s. 0 disables.
++    "auto_recovery_cycles": 5,
++    # DNS fails for provider AND control host: wait this many awake seconds per model request,
++    # without spending attempts or credential recovery. Shows "offline — waiting for network".
++    # Interrupt stops the wait. 0 disables. Working DNS leaves ordinary provider retries intact.
++    "offline_wait_seconds": 900,
++}
+-- 
+2.55.0
+

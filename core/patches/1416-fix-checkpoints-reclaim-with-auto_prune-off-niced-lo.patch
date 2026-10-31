@@ -1,0 +1,451 @@
+From 9fc3fce2ba3a24c18ba77a58f10f5c617e600b74 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:50:38 +0000
+Subject: [PATCH] fix(checkpoints): reclaim with auto_prune off, niced long gc,
+ daily stuck-over-cap ERROR [daveey]
+
+Follows 7dfcf91c967 (take path touches only its own project and defers the gc). What
+that leaves: only the periodic prune frees space, and on the MacBook it never did.
+
+- auto_prune: false turned off the size cap too: with no periodic run the deferred gc
+  (.gc-pending) never happened and the store sat at 15 GB against a 500 MB cap. A pending
+  gc now gets a size-only run (retention_days=0, never deletes a project) at most once
+  per min_interval_hours.
+- Pruner(maintenance=True) (periodic prune + `hermes checkpoints prune`) runs its gc
+  under `nice -n 10` with MAINTENANCE_GC_TIMEOUT (1800 s) instead of 3x the
+  tool timeout: 90 s killed a 14 GB gc in its prune phase on every run.
+- enforce_size gcs after 1, 2, 4, ... rewrites instead of after every rewrite: with a gc
+  that now completes (minutes on a GB store), one per rewrite over ~800 projects would
+  hold the store lock, and skip every checkpoint, for hours. At most 2x the needed drops.
+- check_store_health: once a day, ERROR `checkpoint store over cap: X GB / Y MB, last
+  prune Z` when the store is over 2x its cap and no prune ran for 48 h (or ever), so the
+  self-heal lane files it. The size walk is gated by its daily marker.
+
+Tests (test_checkpoint_size_pending.py): 7 of 9 fail on 7dfcf91c967 (auto_prune-off
+prune skipped; no health check; maintenance reclaim killed at 3x timeout; no nice;
+151 gcs for 150 drops).
+Self-heal agent-23a0c3b69f.
+---
+ tests/tools/test_checkpoint_size_pending.py | 207 ++++++++++++++++++++
+ tools/checkpoint_maintenance.py             |  73 ++++++-
+ tools/checkpoint_manager.py                 |   6 +-
+ tools/checkpoint_pruning.py                 |  32 ++-
+ 4 files changed, 302 insertions(+), 16 deletions(-)
+ create mode 100644 tests/tools/test_checkpoint_size_pending.py
+
+diff --git a/tests/tools/test_checkpoint_size_pending.py b/tests/tools/test_checkpoint_size_pending.py
+new file mode 100644
+index 00000000000..590573fb975
+--- /dev/null
++++ b/tests/tools/test_checkpoint_size_pending.py
+@@ -0,0 +1,207 @@
++"""An over-cap store must not make every checkpoint pay one Git call per project.
++
++Regression for agent-23a0c3b69f: a 15 GB store against a 500 MB cap made each checkpoint run
++``rev-list`` for all ~780 projects (``Pruner.drop_one_round``) and time out at 30 s under load,
++while the only step that frees space (``git gc``) lived in a periodic prune gated on
++``checkpoints.auto_prune``, which was off, and whose gc was killed at 90 s on a 14 GB store. The
++take path touches only its own project (``Pruner.drop_oldest_once``) and defers the gc
++(``.gc-pending``); the periodic prune reclaims even with ``auto_prune: false``, its gc runs niced
++with a maintenance-length timeout, and a daily ERROR names a store stuck over its cap.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import time
++
++import hermes_yaml as yaml
++import pytest
++
++import tools.checkpoint_manager as checkpoints
++from hermes_constants import get_hermes_home
++from tools import checkpoint_maintenance
++
++from tools.checkpoint_pruning import GC_PENDING_NAME, Pruner
++
++
++def _write_config(**section) -> None:
++    home = get_hermes_home()
++    home.mkdir(parents=True, exist_ok=True)
++    (home / "config.yaml").write_text(yaml.safe_dump({"checkpoints": section}), encoding="utf-8")
++
++
++def _over_cap_store(tmp_path, monkeypatch, projects: int):
++    """``projects`` projects with two snapshots each, plus one 1.3 MB incompressible blob."""
++    tmp_path.mkdir(parents=True, exist_ok=True)
++    base = tmp_path / "checkpoints"
++    monkeypatch.setattr(checkpoints, "CHECKPOINT_BASE", base)
++    manager = checkpoints.CheckpointManager(enabled=True, max_total_size_mb=0)
++    for index in range(projects):
++        work = tmp_path / f"project-{index:03d}"
++        work.mkdir()
++        if index == 0:
++            (work / "blob.bin").write_bytes(os.urandom(1_300_000))
++        for turn in range(2):
++            (work / "note.txt").write_text(f"{index}-{turn}", encoding="utf-8")
++            manager.new_turn()
++            assert manager.ensure_checkpoint(str(work), f"seed-{turn}")
++    assert checkpoints._dir_size_bytes(checkpoints._store_path(base)) > 1024 * 1024
++    return base, manager
++
++
++def _git_calls_for_one_checkpoint(tmp_path, monkeypatch, projects: int) -> int:
++    _base, manager = _over_cap_store(tmp_path, monkeypatch, projects)
++    manager.max_total_size_mb = 1
++    target = tmp_path / "project-000"
++    (target / "note.txt").write_text("the checkpoint under test", encoding="utf-8")
++    manager.new_turn()
++    calls = []
++    original = checkpoints._run_git
++
++    def counting(args, *rest, **kwargs):
++        calls.append(args[0])
++        return original(args, *rest, **kwargs)
++
++    with monkeypatch.context() as patch:
++        patch.setattr(checkpoints, "_run_git", counting)
++        assert manager.ensure_checkpoint(str(target), "measured")
++    return len(calls)
++
++
++def test_over_cap_checkpoint_cost_does_not_grow_with_project_count(tmp_path, monkeypatch):
++    few = _git_calls_for_one_checkpoint(tmp_path / "few", monkeypatch, 5)
++    many = _git_calls_for_one_checkpoint(tmp_path / "many", monkeypatch, 50)
++    assert many == few, f"5 projects: {few} git calls, 50 projects: {many} git calls"
++
++
++def test_periodic_prune_enforces_the_cap_with_auto_prune_off(tmp_path, monkeypatch):
++    """The MacBook path: ``auto_prune: false``, store over its cap, never pruned."""
++    base, manager = _over_cap_store(tmp_path, monkeypatch, 3)
++    manager.max_total_size_mb = 1
++    target = tmp_path / "project-000"
++    (target / "blob.bin").unlink()
++    (target / "note.txt").write_text("blob deleted", encoding="utf-8")
++    manager.new_turn()
++    assert manager.ensure_checkpoint(str(target), "newest")
++    store = checkpoints._store_path(base)
++    assert (store / GC_PENDING_NAME).exists()
++    _write_config(enabled=True, auto_prune=False, max_total_size_mb=1)
++
++    gc_calls = []
++    original = checkpoints._run_git
++
++    def spy(args, *rest, **kwargs):
++        if args[0] == "gc":
++            gc_calls.append(kwargs)
++        return original(args, *rest, **kwargs)
++
++    monkeypatch.setattr(checkpoint_maintenance, "_run_git", spy)
++    out = checkpoint_maintenance.auto_prune_from_config()
++    assert out.get("skipped") is False, out
++    assert out["result"]["errors"] == 0, out
++    assert (base / ".last_prune").exists()
++    assert checkpoints._dir_size_bytes(store) <= 1024 * 1024
++    assert not (store / GC_PENDING_NAME).exists()
++    # The maintenance gc is niced and gets the long maintenance budget, not 3x the tool timeout.
++    assert gc_calls and all(c.get("timeout", 0) >= 1800 and c.get("low_priority") for c in gc_calls)
++    # auto_prune is off: retention never deleted a project (the size cap may still trim history).
++    assert manager.list_checkpoints(str(tmp_path / "project-002"))
++
++
++def test_auto_prune_off_without_pending_size_work_stays_skipped(tmp_path, monkeypatch):
++    base, _ = _over_cap_store(tmp_path, monkeypatch, 1)
++    _write_config(enabled=True, auto_prune=False, max_total_size_mb=500)
++    assert checkpoint_maintenance.auto_prune_from_config().get("skipped") is True
++    assert not (base / ".last_prune").exists()
++
++
++@pytest.mark.parametrize("last_prune_age_h", [None, 72])
++def test_store_stuck_over_cap_logs_one_error_per_day(tmp_path, monkeypatch, caplog, last_prune_age_h):
++    base, _ = _over_cap_store(tmp_path, monkeypatch, 1)  # ~1.3 MB store > 2 x 0.5 MB cap
++    if last_prune_age_h is not None:
++        (base / ".last_prune").write_text(str(time.time() - last_prune_age_h * 3600), encoding="utf-8")
++    caplog.set_level(logging.ERROR, logger="tools.checkpoint_maintenance")
++    assert checkpoint_maintenance.check_store_health(base, cap_mb=0.5) is True
++    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
++    assert len(errors) == 1 and errors[0].startswith("checkpoint store over cap: "), errors
++    assert ("last prune never" in errors[0]) == (last_prune_age_h is None)
++    caplog.clear()
++    assert checkpoint_maintenance.check_store_health(base, cap_mb=0.5) is False  # once a day
++    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
++
++
++def test_store_health_quiet_when_pruned_recently_or_under_cap(tmp_path, monkeypatch, caplog):
++    base, _ = _over_cap_store(tmp_path, monkeypatch, 1)
++    caplog.set_level(logging.ERROR, logger="tools.checkpoint_maintenance")
++    assert checkpoint_maintenance.check_store_health(base, cap_mb=500) is False  # under the cap
++    (base / ".last_prune").write_text(str(time.time() - 3600), encoding="utf-8")
++    assert checkpoint_maintenance.check_store_health(base, cap_mb=0.5) is False  # pruned 1h ago
++    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
++
++
++def test_maintenance_reclaim_outlasts_three_tool_timeouts(tmp_path, monkeypatch):
++    """The MacBook gc took longer than 3 x 30 s and was killed in its prune phase every run."""
++    store = tmp_path / "store"
++    store.mkdir()
++    (store / GC_PENDING_NAME).touch()
++    gc_seconds = 3 * checkpoints._GIT_TIMEOUT + 60
++
++    def fake_git(args, _store, _cwd, timeout=checkpoints._GIT_TIMEOUT, **kwargs):
++        if args[0] == "gc" and timeout < gc_seconds:
++            return False, "", f"git timed out after {timeout}s"
++        return True, "", ""
++
++    tool_path = Pruner(fake_git, store, str(tmp_path), checkpoints._GIT_TIMEOUT, lambda _p: 0, "refs/hermes/")
++    with pytest.raises(Exception):
++        tool_path.reclaim()
++    assert (store / GC_PENDING_NAME).exists()
++    maintenance = Pruner(fake_git, store, str(tmp_path), checkpoints._GIT_TIMEOUT, lambda _p: 0, "refs/hermes/",
++                         maintenance=True)
++    maintenance.reclaim()
++    assert not (store / GC_PENDING_NAME).exists()
++
++
++def test_low_priority_git_runs_under_nice(tmp_path, monkeypatch):
++    seen = []
++    real_run = checkpoints.subprocess.run
++
++    def spy(cmd, *args, **kwargs):
++        seen.append(cmd)
++        return real_run(cmd, *args, **kwargs)
++
++    monkeypatch.setattr(checkpoints.subprocess, "run", spy)
++    ok, out, _ = checkpoints._run_git(["--version"], tmp_path, str(tmp_path), low_priority=True)
++    assert ok and out.startswith("git version")
++    assert seen[-1][1:3] == ["-n", "10"] and seen[-1][0].endswith("nice")
++
++
++def test_enforce_size_gcs_log_times_not_once_per_project(tmp_path):
++    """One gc per rewrite held the store lock for hours on a ~800-project store (each gc minutes)."""
++    store = tmp_path / "store"
++    store.mkdir()
++    refs = {f"refs/hermes/{i:03d}": ["a", "b", "c"] for i in range(200)}
++    state = {"gcs": 0, "rewrites": 0}
++
++    def fake_git(args, _store, _cwd, **kwargs):
++        verb = args[0]
++        if verb == "for-each-ref":
++            return True, "\n".join(refs), ""
++        if verb == "rev-list":
++            return True, "\n".join(refs[args[-1]]), ""
++        if verb == "log":
++            return True, "tree\x00date\x00date\x00msg", ""
++        if verb == "commit-tree":
++            return True, "new", ""
++        if verb == "update-ref":
++            refs[args[1]] = refs[args[1]][1:]
++            state["rewrites"] += 1
++        if verb == "gc":
++            state["gcs"] += 1
++        return True, "", ""
++
++    # The store fits once 150 snapshots are gone (measured only after a gc).
++    size = lambda _p: 0 if state["gcs"] > 1 and state["rewrites"] >= 150 else 10
++    pruner = Pruner(fake_git, store, str(tmp_path), 30, size, "refs/hermes/", maintenance=True)
++    assert pruner.enforce_size(5) is True
++    assert state["gcs"] <= 10, state  # 1 initial + log2(150) batches, not one per rewrite
++    assert state["rewrites"] < 300, state  # at most twice the needed drops
+diff --git a/tools/checkpoint_maintenance.py b/tools/checkpoint_maintenance.py
+index 575c1dc183f..bd5fbb121d5 100644
+--- a/tools/checkpoint_maintenance.py
++++ b/tools/checkpoint_maintenance.py
+@@ -344,7 +344,8 @@ def _prune_checkpoints(
+ 
+         from tools.checkpoint_pruning import Pruner, PruneError
+ 
+-        pruner = Pruner(_run_git, store, str(base), _GIT_TIMEOUT, _dir_size_bytes, _REFS_PREFIX)
++        pruner = Pruner(_run_git, store, str(base), _GIT_TIMEOUT, _dir_size_bytes, _REFS_PREFIX,
++                        maintenance=True)
+         try:
+             if result["deleted_orphan"] + result["deleted_stale"] or pruner.gc_pending():
+                 pruner.reclaim()
+@@ -426,22 +427,80 @@ def auto_prune_from_config() -> dict[str, object]:
+     """``maybe_auto_prune_checkpoints`` driven by the ``checkpoints:`` config section — the one
+     startup/housekeeping entry point for the CLI and the gateway. ``delete_orphans`` is never
+     honoured unattended: a missing workdir is ambiguous (deleted vs. unmounted share); orphan
+-    cleanup is only via explicit ``hermes checkpoints prune``. Never raises."""
++    cleanup is only via explicit ``hermes checkpoints prune``. Never raises.
++
++    ``auto_prune: false`` turns off retention (deleting whole projects), not the size cap: the take
++    path only drops snapshots and defers the gc (``.gc-pending``), so with no periodic gc the store
++    never shrinks (a laptop sat at 15 GB against a 500 MB cap). A pending gc therefore still gets a
++    size-only run (retention_days=0) at most once per ``min_interval_hours``. Either way a store
++    stuck far over its cap logs one ERROR a day (``check_store_health``)."""
+     try:
+         from hermes_cli.config import load_config
++        from tools.checkpoint_pruning import GC_PENDING_NAME
++
+         cfg = load_config().get("checkpoints") or {}
+-        if not cfg.get("auto_prune", False):
+-            return {"skipped": True}
+-        return maybe_auto_prune_checkpoints(
+-            retention_days=int(cfg.get("retention_days", 7)),
++        cap_mb = int(cfg.get("max_total_size_mb", 500))
++        retention_days = int(cfg.get("retention_days", 7))
++        if not cfg.get("auto_prune", True):
++            base = _resolve_checkpoint_base()
++            if not (_store_path(base) / GC_PENDING_NAME).exists():
++                check_store_health(base, cap_mb)
++                return {"skipped": True}
++            retention_days = 0  # size cap only: never delete a project when retention is off
++        out = maybe_auto_prune_checkpoints(
++            retention_days=retention_days,
+             min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+             delete_orphans=False,
+-            max_total_size_mb=int(cfg.get("max_total_size_mb", 500)))
++            max_total_size_mb=cap_mb)
++        check_store_health(_resolve_checkpoint_base(), cap_mb)
++        return out
+     except Exception as exc:
+         logger.debug("checkpoint auto-maintenance skipped: %s", exc)
+         return {"skipped": True, "error": str(exc)}
+ 
+ 
++_HEALTH_MARKER_NAME = ".last_health_check"
++_HEALTH_INTERVAL_S = 24 * 3600
++_HEALTH_PRUNE_STALE_S = 48 * 3600
++
++
++def check_store_health(base: Path, cap_mb: float) -> bool:
++    """At most once a day: log an ERROR when the store is over twice its cap and no prune has run
++    for 48 h (or ever), so the self-heal lane files it. The size walk itself is gated by the daily
++    marker, so the housekeeping tick stays cheap. Returns whether it reported."""
++    if cap_mb <= 0:
++        return False
++    store = _store_path(base)
++    if not (store / "HEAD").exists():
++        return False
++    now = time.time()
++    marker = base / _HEALTH_MARKER_NAME
++    try:
++        if now - float(marker.read_text(encoding="utf-8-sig").strip()) < _HEALTH_INTERVAL_S:
++            return False
++    except (OSError, ValueError):
++        pass
++    try:
++        marker.write_text(str(now), encoding="utf-8")
++    except OSError:
++        pass
++    size = _dir_size_bytes(store)
++    cap_bytes = cap_mb * 1024 * 1024
++    if size <= 2 * cap_bytes:
++        return False
++    try:
++        last = float((base / _PRUNE_MARKER_NAME).read_text(encoding="utf-8-sig").strip())
++    except (OSError, ValueError):
++        last = None
++    if last is not None and now - last < _HEALTH_PRUNE_STALE_S:
++        return False
++    when = "never" if last is None else f"{(now - last) / 3600:.0f} h ago"
++    logger.error("checkpoint store over cap: %.2f GB / %g MB, last prune %s (%s); "
++                 "set checkpoints.auto_prune: true or run `hermes checkpoints prune`",
++                 size / 1024 ** 3, cap_mb, when, store)
++    return True
++
++
+ def checkpoint_footprint_notice() -> Optional[str]:
+     """One-line notice when ``/rollback`` checkpoints are on and their store sits at or above
+     ``checkpoints.max_total_size_mb``, else None. Checkpoints were on by default for a while
+diff --git a/tools/checkpoint_manager.py b/tools/checkpoint_manager.py
+index 5a09f4647ba..21f22294f6c 100644
+--- a/tools/checkpoint_manager.py
++++ b/tools/checkpoint_manager.py
+@@ -363,14 +363,14 @@ def _run_git(
+     allowed_returncodes: Optional[set[int]] = None,
+     index_file: Optional[Path] = None,
+     extra_env: Optional[dict[str, str]] = None,
+-    input_text: Optional[str] = None,
++    input_text: Optional[str] = None, low_priority: bool = False,
+ ) -> tuple[bool, str, str]:
+     """Run a git command against the shared store.  Returns (ok, stdout, stderr).
+ 
+     ``allowed_returncodes`` suppresses error logging for known/expected non-zero
+     exits while preserving the normal ``ok = (returncode == 0)`` contract.
+     Example: ``git diff --cached --quiet`` returns 1 when changes exist.
+-    ``input_text`` is written to git's stdin (otherwise stdin is closed).
++    ``input_text`` is written to git's stdin (otherwise stdin is closed); ``low_priority`` = ``nice -n 10``.
+     """
+     normalized_working_dir = _normalize_path(working_dir)
+     if not normalized_working_dir.exists():
+@@ -389,7 +389,7 @@ def _run_git(
+     git = shutil.which("git", path=env.get("PATH", ""))
+     if git is None:
+         return False, "", "git is not installed or not on PATH"
+-    cmd = [git, *args]
++    cmd = [nice, "-n", "10", git, *args] if low_priority and (nice := shutil.which("nice")) else [git, *args]
+     allowed_returncodes = allowed_returncodes or set()
+ 
+     try:
+diff --git a/tools/checkpoint_pruning.py b/tools/checkpoint_pruning.py
+index 55fb74b7928..e120f5a31fe 100644
+--- a/tools/checkpoint_pruning.py
++++ b/tools/checkpoint_pruning.py
+@@ -17,6 +17,12 @@ GC_STALE_AFTER_S = 48 * 3600
+ GC_STALE_REPORTED: set[str] = set()  # stores already warned about, once per process
+ 
+ 
++# Seconds a maintenance ``git gc`` may run. It only runs off the tool-call path (periodic prune,
++# ``hermes checkpoints prune``), so it is sized for a multi-GB loose store on a loaded laptop: the
++# old 3x tool timeout (90 s) killed a 14 GB gc in its prune phase every time, so it never shrank.
++MAINTENANCE_GC_TIMEOUT = 1800
++
++
+ def store_lock_path(base: Path) -> Path:
+     base = base.resolve()
+     return base.with_name(f".{base.name}.lock")
+@@ -46,6 +52,8 @@ class Pruner:
+     timeout: int
+     dir_size: Callable[[Path], int]
+     refs_prefix: str
++    # Maintenance callers (never the take path): the gc runs niced with MAINTENANCE_GC_TIMEOUT.
++    maintenance: bool = False
+ 
+     def _git(self, args: list[str], **kwargs) -> str:
+         ok, output, error = self.run_git(args, self.store, self.cwd, **kwargs)
+@@ -57,7 +65,10 @@ class Pruner:
+         """Full ``git gc`` — tens of seconds on a GB store, so only the periodic prune calls it.
+         A ref rewrite that ran without it leaves a marker so the next prune reclaims."""
+         self._git(["reflog", "expire", "--expire=now", "--all"])
+-        self._git(["gc", "--prune=now", "--quiet"], timeout=self.timeout * 3)
++        if self.maintenance:
++            self._git(["gc", "--prune=now", "--quiet"], timeout=MAINTENANCE_GC_TIMEOUT, low_priority=True)
++        else:
++            self._git(["gc", "--prune=now", "--quiet"], timeout=self.timeout * 3)
+         # Bare stores must remain usable when gc packs all refs.
+         for name in ("refs/heads", "branches"):
+             (self.store / name).mkdir(parents=True, exist_ok=True)
+@@ -167,16 +178,25 @@ class Pruner:
+         if self.dir_size(self.store) <= cap_bytes:
+             return True
+         refs = self._git(["for-each-ref", "--format=%(refname)", self.refs_prefix]).splitlines()
+-        # Keep the existing round-robin policy, remeasure after EACH rewrite.
+-        # Twenty rounds bound maintenance when many large histories remain.
++        # Round-robin, oldest snapshot per project. The size only moves after a gc, and a gc of a
++        # GB store takes minutes, so gc after 1, 2, 4, ... rewrites: O(log projects) gcs per round
++        # (one per rewrite held the store lock for hours over ~800 projects) and at most twice the
++        # needed drops. Twenty rounds bound maintenance when many large histories remain.
+         for _ in range(20):
+-            changed = False
++            changed, pending, batch = False, 0, 1
+             for ref in refs:
+                 commits = self._commits(ref)
+                 if len(commits) <= 1:
+                     continue
+-                self._rewrite(ref, commits, commits[1:], gc=True)
+-                changed = True
++                self._rewrite(ref, commits, commits[1:], gc=False)
++                changed, pending = True, pending + 1
++                if pending >= batch:
++                    self.reclaim()
++                    pending, batch = 0, batch * 2
++                    if self.dir_size(self.store) <= cap_bytes:
++                        return True
++            if pending:
++                self.reclaim()
+                 if self.dir_size(self.store) <= cap_bytes:
+                     return True
+             if not changed:
+-- 
+2.55.0
+
