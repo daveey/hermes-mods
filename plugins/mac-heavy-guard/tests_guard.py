@@ -191,6 +191,35 @@ def _script(tmp_path, body, name="ci.sh"):
     return f
 
 
+def test_heredoc_non_executable_notes_are_not_a_script(tmp_path):
+    notes = tmp_path / "notes.md"
+    notes.write_text("(ask-eve pytest; x)\n")
+    notes.chmod(0o644)
+    assert guard.check_shell(f"python3 - <<'EOF'\nopen('{notes}')\nEOF") is None
+
+
+@pytest.mark.parametrize("form", ["absolute", "relative", "home"])
+def test_direct_notes_require_execute_permission(tmp_path, monkeypatch, form):
+    notes = tmp_path / "notes.md"
+    notes.write_text("(ask-eve pytest; x)\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    command = {"absolute": str(notes), "relative": "./notes.md", "home": "~/notes.md"}[form]
+    notes.chmod(0o644)
+    assert guard.check_shell(command, cwd=str(tmp_path)) is None
+    notes.chmod(0o755)
+    assert guard.check_shell(command, cwd=str(tmp_path)) == (
+        f"{command} → the whole pytest suite (no test path)")
+
+
+@pytest.mark.parametrize("shell", ["bash", "sh", "zsh", "dash", "source", "."])
+def test_explicit_shell_reads_non_executable_notes(tmp_path, shell):
+    notes = tmp_path / "notes.md"
+    notes.write_text("(ask-eve pytest; x)\n")
+    notes.chmod(0o644)
+    assert guard.check_shell(f"{shell} ./notes.md", cwd=str(tmp_path)) == (
+        "./notes.md → the whole pytest suite (no test path)")
+
+
 SCRIPT_BODIES = ["python3 -m pytest -q -p no:cacheprovider\n", "npm ci --prefix workers/upload\n"]
 
 

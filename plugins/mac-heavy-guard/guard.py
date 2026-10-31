@@ -287,6 +287,11 @@ def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optiona
             return why, (test[1] if test else None), cwd
         ref = _script_arg(argv)
         if ref and depth < SCRIPT_MAX_DEPTH:
+            if os.path.basename(argv[0]) not in SHELLS | {"source", "."}:
+                # Direct execution requires an executable file; quoted data paths do not.
+                full = _cd(cwd, ref)
+                if not os.path.isfile(full) or not os.access(full, os.X_OK):
+                    continue
             body = _read_script(ref, cwd)
             if body:
                 inner = _scan(body, cwd, depth + 1, True)
