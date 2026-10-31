@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Detect processes stranded on deleted SQLite WAL/SHM sidecars (Linux).
 
-A process that lost its POSIX locks on kanban.db (some in-process raw open()/close() of the db file cancels them)
-can have its -wal/-shm unlinked under it by another process's checkpoint/cleanup. It keeps reading a dead WAL
-generation: every Kanban read fails ('disk I/O error') until it restarts. This scans /proc/*/fd for symlinks to
-`kanban.db-wal (deleted)`, `kanban.db-shm (deleted)`, `state.db-wal (deleted)`, `state.db-shm (deleted)` under
-HERMES_HOME (boards and profiles included) and files ONE Kanban card per (host, pid, pid start time, db).
+A process that loses POSIX locks can retain a stale WAL generation, but deleted descriptors alone do not prove
+that cause or any read failure. This scans /proc/*/fd for deleted kanban.db/state.db WAL/SHM under HERMES_HOME
+and files ONE Kanban card per (host, pid, pid start time, db). Entire absent profile homes are excluded as
+retired-reader cleanup, not live-database restart incidents.
 
     stranded_sqlite_watch.py [--dry-run] [--json] [--home PATH]
 
@@ -75,6 +74,17 @@ def scan(home: Optional[str] = None, proc: str = "/proc") -> list:
             if not path.startswith(root) or not path.endswith(SIDECARS):
                 continue
             db = path.rsplit("-", 1)[0]
+            relative = Path(db).relative_to(root).parts
+            if len(relative) >= 3 and relative[0] == "profiles":
+                # Entire absent profile (tombstoned or otherwise retired): retained readers
+                # need lifecycle cleanup, not a live-db corruption/restart incident.
+                # Do not suppress a missing DB inside a still-existing profile home.
+                try:
+                    (Path(root) / "profiles" / relative[1]).stat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass  # unknown ownership state: retain the finding
             try:
                 ctime = os.stat(fd).st_ctime  # follows the fd to the unlinked inode: ctime ~ when it was deleted
             except OSError:
@@ -105,17 +115,18 @@ def card_body(host: str, f: dict) -> str:
 {side}
 
 ## What it means
-This process still holds WAL/SHM sidecars that another process deleted. It reads a dead WAL generation: its reads of
-this db fail (`sqlite3.OperationalError: disk I/O error`) or return stale data until it restarts. Usual cause: the
-process lost its POSIX locks (an in-process raw open()/close() of the db file cancels them), so another process saw
-no reader and removed the sidecars.
+This process still holds deleted WAL/SHM sidecars. This can indicate a stale generation for a live database,
+but the descriptor evidence alone does not establish read failures, corruption, the deleting actor, or POSIX
+lock loss. Entire absent profile homes are excluded as retired-reader cleanup; recheck ownership before acting.
 
 ## Remediation
 1. Do NOT touch the live db or its sidecars (no delete, copy-over or checkpoint by hand).
-2. Gracefully restart that process when it is idle (no running turn/worker), then confirm it no longer holds a
-   `(deleted)` sidecar: `ls -l /proc/{f['pid']}/fd | grep deleted`.
-3. Core fix: the kanban OFD lock guard (`hermes_cli/kanban_lockguard.py`) so in-process opens never drop the locks.
-   If this recurs with the guard deployed, find which code path opened the db file raw.
+2. Verify that the profile/database is still live and reproduce any read error safely. For an absent retired
+   profile, close/evict cached readers rather than requesting a service restart.
+3. If live reads are stranded, gracefully restart only the affected process when idle (no running turn/worker),
+   then confirm it no longer holds deleted sidecars.
+4. If POSIX lock loss is independently established for Kanban, inspect the kanban OFD lock guard
+   (`hermes_cli/kanban_lockguard.py`) and raw db opens. Retired-reader lifecycle is a separate failure class.
 """
 
 

@@ -2,6 +2,17 @@
 
 One nudge bus for Hermes, so coaching panels never pile up. It has two channels.
 
+### Deleted SQLite sidecar monitor
+
+`stranded_sqlite_watch.py` scans Linux procfs for retained deleted database WAL/SHM descriptors.
+It excludes entire absent profile homes (including tombstoned profiles) as retired-reader cleanup,
+not live-database restart incidents. Missing databases inside existing profiles still alert, as do live
+board databases. Descriptor evidence alone does not establish corruption, read failures or POSIX lock loss;
+new cards require ownership/read verification before an idle-only restart. No database files are changed.
+Coverage: `tests/test_stranded_sqlite_retired.py` checks missing/tombstoned/live/live-with-missing-db profiles;
+`tests/test_stranded_sqlite_watch.py` retains real child-process deleted-sidecar detection and mock-only filing.
+
+
 ## Agent channel (invisible to you)
 
 The plugin watches the agent's own tool calls. When it spots a known anti-pattern, it attaches a one-line hint to the
