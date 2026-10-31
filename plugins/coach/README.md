@@ -229,7 +229,7 @@ one back: `drafts.Drafts(<coach dir>).for_event(<log record>)`, or `grep <draft_
 Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` and `COACH_REPLY_THRESHOLDS`
 (`rule=th,...` per-rule overrides; defaults `report_only=0.5` for the second opinion, `report_only_screen=0.85`, `report_only_capped=0.92`). Needs core
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
-file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
+file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates). A turn it did not run on logs `reply_skipped` with a `reason`: `turn_failed` (core's "This turn did not complete" / "Your request was not processed" reply, so the host never called `pre_verify`), `pre_verify_not_called`, `empty_reply`, `no_session`, `rules_off` or `error:<type>` (cron turns are never checked and never logged). A nudge whose outcome re-check could not run logs `reply_nudge_outcome_skipped` (`turn_changed`, `error:<type>`). `report_only_scored` carries the turn's `platform`.
 Fork turns (background review, side questions) are never judged: core skips `pre_verify` when the agent has
 `_turn_origin` set (fork commit "skip the pre_verify user-reply gate for fork turns"), and `pre_verify` /
 `envelope_gate` return early on a `turn_origin` kwarg without touching the session's pending nudge

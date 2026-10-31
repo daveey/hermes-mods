@@ -378,6 +378,15 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     def post_llm_call(session_id="", assistant_response=None, platform="", parent_session_id="", **_):
         try:
+            if session_id and _pv_seen.get(session_id) != coach.turn_number(session_id):
+                text = assistant_response if isinstance(assistant_response, str) else ""
+                _skipped(session_id, platform,
+                         "turn_failed" if _load("reply_check").turn_failed(text) else
+                         "empty_reply" if not text.strip() else "pre_verify_not_called")
+                _pv_seen[session_id] = coach.turn_number(session_id)  # once per turn
+        except Exception as exc:
+            log.debug("coach post_llm_call skip: %s", exc)
+        try:
             if session_id and isinstance(assistant_response, str) and assistant_response.strip():
                 ask, log_lines = coach.turn_context(session_id)
                 log_lines = list(log_lines or [])[-30:]
@@ -389,6 +398,21 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 store._update(session_id, lambda s: s.__setitem__("loop", loop))
         except Exception as exc:
             log.debug("coach post_llm_call: %s", exc)
+
+    # session -> coach turn number of its last attempt-0 pre_verify, so post_llm_call can tell a turn the host never
+    # handed to the reply check (an error exit, an interrupted turn) from one it checked. Process-local on purpose:
+    # pre_verify and post_llm_call of one turn run in the same process.
+    _pv_seen: dict = {}
+
+    def _skipped(session_id, platform, reason, **extra):
+        """Log why a turn got no reply check (`reply_skipped`). Cron turns are never checked by design: not logged."""
+        if platform in ("cron",):
+            return
+        try:
+            store.log({"event": "reply_skipped", "session_id": session_id or "", "platform": platform or "",
+                       "reason": reason, "turn": coach.turn_number(session_id) if session_id else None, **extra})
+        except Exception as exc:
+            log.debug("coach reply_skipped: %s", exc)
 
     def pre_verify(session_id="", platform="", attempt=0, final_response="", changed_paths=None, turn_origin=None,
                    **_):
@@ -407,11 +431,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         user-reply gate for fork turns"); this is the plugin-side guard for any host that passes the marker."""
         if turn_origin:
             return None
+        if session_id and not attempt:
+            _pv_seen[session_id] = coach.turn_number(session_id)
         try:
             rc = _load("reply_check")
             budget = rc.start_budget()
         except Exception as exc:
             log.debug("coach pre_verify budget: %s", exc)
+            _skipped(session_id, platform, f"error:budget:{type(exc).__name__}")
             return None
         token = rc.use_budget(budget)
         try:
@@ -473,7 +500,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     return {"action": "continue", "message": msg}
             if attempt and session_id and final_response and platform not in ("cron",):
                 _nudge_outcome(session_id, final_response)
-            if attempt or not session_id or not final_response or platform in ("cron",):
+            if attempt or platform in ("cron",):
+                return None
+            if not session_id or not final_response:
+                _skipped(session_id, platform, "no_session" if not session_id else "empty_reply")
                 return None
             rc = _load("reply_check")
             cfg = rc.settings()
@@ -495,6 +525,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             if sub:
                 only = [r for r in only if r not in rc.SUBAGENT_EXEMPT_RULES]
             if not only:
+                _skipped(session_id, platform, "rules_off")
                 return None
             th_unv = so.setting("diff_review_threshold")
             thresholds = dict(cfg.get("thresholds") or {})
@@ -551,7 +582,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            human_asks=lambda: rc.session_human_asks(session_id),
                            audit=lambda event: store.log({**event, "session_id": session_id,
                                                           "turn": coach.turn_number(session_id),
-                                                          "notice": rc.notice_turn(ask)}),
+                                                          "notice": rc.notice_turn(ask), "platform": platform}),
                            report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK),
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
@@ -593,6 +624,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             return {"action": "continue", "message": hit["nudge"]}
         except Exception as exc:
             log.debug("coach pre_verify: %s", exc)
+            if not attempt:
+                _skipped(session_id, platform, f"error:{type(exc).__name__}", detail=str(exc)[:200])
             return None
 
     # The host bounds this callback with its own budget (cores that honour per-callback budgets; others ignore it)
@@ -608,7 +641,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         try:
             st = coach.loop_state(session_id)
             n = st.get("outcome_nudge")
-            if not n or n.get("turn") != coach.turn_number(session_id):
+            if not n:
+                return
+            if n.get("turn") != coach.turn_number(session_id):
+                store.log({"event": "reply_nudge_outcome_skipped", "session_id": session_id, "rule": n.get("rule", ""),
+                           "reason": "turn_changed", "nudge_turn": n.get("turn"), "turn": coach.turn_number(session_id)})
                 return
             st.pop("outcome_nudge", None)  # once per nudge, whatever happens below
             rule = n.get("rule") or "handoff"
@@ -626,6 +663,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                        "evidence": res["evidence"], "reply": (final_response or "")[:300]})
         except Exception as exc:
             log.debug("coach nudge outcome: %s", exc)
+            try:
+                store.log({"event": "reply_nudge_outcome_skipped", "session_id": session_id,
+                           "reason": f"error:{type(exc).__name__}", "detail": str(exc)[:200]})
+            except Exception:
+                pass
 
     return coach, {"pre_final_gate": goal_gate, "pre_final_gate:compute_envelope": envelope_gate,
                    "pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,

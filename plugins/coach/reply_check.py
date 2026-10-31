@@ -1045,6 +1045,15 @@ HUMAN_CONFIRM_FLOOR = 0.60
 HUMAN_FLOOR_PLATFORMS = ("desktop",)
 
 
+# Core's own replies for a turn that errored or never ran (no model reply, so no pre_verify): logged as reply_skipped
+# reason "turn_failed", not as a coach gap.
+TURN_FAILED_RE = re.compile(r"^\s*(?:This turn did not complete\.|Your request was not processed\.)")
+
+
+def turn_failed(reply: str) -> bool:
+    return bool(TURN_FAILED_RE.match(reply or ""))
+
+
 def human_confirm_floor(platform: str) -> Optional[float]:
     """The lower report_only confirm floor for this turn's platform, or None (CONFIRM_FLOOR applies). check() still
     keeps CONFIRM_FLOOR for notice turns on these platforms."""
