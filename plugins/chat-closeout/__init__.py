@@ -682,9 +682,16 @@ def file_card(title: str, body: str, key: str) -> str:
         assignee = (load_config_readonly().get("kanban") or {}).get("orchestrator_profile") or "default"
     except Exception:
         pass
-    text = (f"{body}\n\nchat-closeout watchdog incident `{key}`.\n\nFix: use cross_session send into the chat "
-            "from a Desktop-connected gateway, or the close-out waker, to run its close-out turn. "
-            "Inspect why the close-out waker / unseen-result sweeper did not deliver (gui.log, errors.log). "
+    # A worker's cross_session send into a human chat is refused by core. The old text said "use cross_session
+    # send into the chat" as if it delivered; the worker on t_01a18f20b8f29e9e followed it, was refused and parked
+    # instead of verifying. The refusal only arms the card's FINAL SEND line (as ask-gate's chat_delivery says). [daveey]
+    text = (f"{body}\n\nchat-closeout watchdog incident `{key}`.\n\nFix: first `cross_session read` the chat "
+            "(retained compacted rows included) to check whether it already reported these cards' results; if it "
+            "did, record that row as evidence. If not, inspect why the close-out waker / unseen-result sweeper did "
+            "not deliver (gui.log, errors.log) and fix that path. To deliver text from a Kanban worker: a worker's "
+            "cross_session send never reaches the chat (core refuses it); call it once only so the refusal "
+            "subscribes the chat to your card, then kanban_complete with a line `FINAL SEND for <chat ref>: "
+            "<text>`, which the chat receives when your card completes. "
             "This is agent work: do not block on the user to resume a chat. Complete this card once the "
             "chat has reported its cards' results; the watchdog also closes it when its condition clears.")
     with connect_closing() as conn:

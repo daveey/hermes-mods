@@ -260,7 +260,12 @@ def test_recovery_body_names_agent_routes(incident):
     _, tid = raise_unseen(incident)
     with connect() as conn:
         body = kb.get_task(conn, tid).body
-    assert 'cross_session' in body and 'close-out waker' in body
+    assert 'cross_session read' in body and 'close-out waker' in body
+    # Core refuses Kanban workers sending into a human chat: the body must never present that send as a
+    # delivery route, only as the refusal that arms FINAL SEND.
+    assert 'use cross_session send' not in body.lower()
+    assert 'never reaches the chat (core refuses it)' in body and 'FINAL SEND for <chat ref>' in body
+    assert body.index('cross_session read') < body.index('FINAL SEND')
     assert 'open the chat' not in body.lower()
     assert 'do not block on the user' in body.lower()
 
