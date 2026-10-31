@@ -211,6 +211,12 @@ comments and your own grep commands (desktop.log echoes tool-call arguments) quo
 often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
 the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
 
+A live check that makes a Hermes detector fire on purpose (a failing command run 3x, a fake complaint) starts the
+session's first prompt with `[selfheal-probe]`, e.g. `hermes chat -q '[selfheal-probe] run <cmd> three times'`.
+The coach's self-heal lane then logs `selfheal_detect` with `probe: true` plus `selfheal_skip why=probe` and files no
+defect card; read those two lines as the proof. Never clean up by deleting `selfheal_pending` rows by hand: a
+deferred retry refiles the probe later.
+
 ### 7. Write it down
 
 Put the chain where the fix lives: PR body, issue resolution, card comment, or postmortem doc. Use this shape:
