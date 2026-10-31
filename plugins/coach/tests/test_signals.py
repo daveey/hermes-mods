@@ -1297,6 +1297,37 @@ def test_free_text_message_keeps_the_fingerprint_it_had_before():
     assert _fp_of("ValueError: bad value 123 for x") == _fp_of("ValueError: bad value 456 for x")
 
 
+# ── a git timeout's verb is part of the error fingerprint (agent-23a0c3b69f) ──
+def _git_timeout_tb(cmd):
+    return ["2026-10-30 17:13:48,000 ERROR [20261030_171348_aaaaaa] tools.checkpoint_manager: "
+            f"git timed out after 30s in /Users/you/work/t_1/mods: {cmd}",
+            "Traceback (most recent call last):",
+            '  File "/home/you/.hermes/hermes-agent/tools/checkpoint_manager.py", line 402, in _run_git',
+            "    result = subprocess.run(",
+            '  File "/opt/homebrew/lib/python3.14/subprocess.py", line 1280, in _check_timeout',
+            "    raise TimeoutExpired(",
+            "subprocess.TimeoutExpired: Command '['git']' timed out after 30 seconds"]
+
+
+def _git_fp(cmd):
+    (row,) = sg.parse_errors(_git_timeout_tb(cmd))
+    return row["fp"]
+
+
+def test_git_timeouts_of_different_steps_get_different_fingerprints():
+    add = _git_fp("/opt/homebrew/bin/git add -A -- .")
+    rev = _git_fp("/opt/homebrew/bin/git rev-list --reverse refs/hermes/fa5246b628e9fa44")
+    gc = _git_fp("/usr/bin/nice -n 10 /usr/bin/git gc --prune=now --quiet")
+    assert len({add, rev, gc}) == 3
+    # the same step in another folder / on another ref stays one defect
+    assert rev == _git_fp("/usr/bin/git rev-list --reverse refs/hermes/e009524edf0d5d92")
+    assert gc == _git_fp("/usr/bin/git gc --prune=now --quiet")
+
+
+def test_non_git_timeout_message_keeps_its_fingerprint():
+    assert sg._git_step("Command timed out after 30s") == ()
+
+
 # ── a nudge whose revision never reached the user (self-heal agent-77325213e1: a background-review fork) ─────
 
 def _fork_home(tmp_path, revised, rows):

@@ -190,6 +190,17 @@ def _reason_code(exc_line: str) -> tuple:
     return (msg,) if REASON_CODE_RE.match(msg) else ()
 
 
+GIT_TIMEOUT_STEP_RE = re.compile(r"git timed out after \d+s in [^:]*: (?:\S*\bnice -n -?\d+ )?\S*\bgit ([a-z][a-z-]*)")
+
+
+def _git_step(msg: str) -> tuple:
+    """A `git timed out` error names its git verb (`rev-list`, `add`, `gc`): one traceback (subprocess ->
+    _run_git) serves every git step, so without it a fix for one step looked like it covered the others
+    (agent-23a0c3b69f: the `git add` fix left the store-wide `rev-list` loop). -> ("git:<verb>",) or ()."""
+    m = GIT_TIMEOUT_STEP_RE.search(msg or "")
+    return (f"git:{m.group(1)}",) if m else ()
+
+
 def home_tilde(s: str) -> str:
     return re.sub(r"/(?:Users|home)/[^/\s\"']+", "~", s or "")
 
@@ -410,7 +421,8 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         sym = f"{exc_type.split('.')[-1]} in {where}" + (f" [{plug}]" if plug else "") + f": {r['msg'][:90]}"
         out.append({"kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
                     "details": details[-1500:],
-                    "fp": fp(comp, "tb", exc_type, *_reason_code(exc_line), *[f"{a}:{b}" for a, b in inner])})
+                    "fp": fp(comp, "tb", exc_type, *_reason_code(exc_line), *_git_step(r["msg"]),
+                          *[f"{a}:{b}" for a, b in inner])})
     return out
 
 
