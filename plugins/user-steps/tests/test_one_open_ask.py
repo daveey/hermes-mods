@@ -290,6 +290,17 @@ def test_tool_exact_retry_returns_the_open_request_unchanged(plugin, tmp_path):
     assert not store.get(OWNER, first['requestId']).get('resolution')  # a retry is never a decision
 
 
+def test_tool_identical_body_with_new_provenance_is_a_separate_request(plugin):
+    # Same body but a source the open request does not carry: not a retry of it, so it is not absorbed and the
+    # new provenance is not dropped.
+    first = publish(plugin, {'request': payload_of(approval('Approve the notify fix?'))})['request']
+    body = payload_of(approval('Approve the notify fix?'))
+    ref = {'gatewayId': OWNER['gatewayId'], 'profile': OWNER['profile'], 'type': 'message', 'id': 'msg-77'}
+    body['aliases'] = [ref]
+    again = publish(plugin, {'request': body})
+    assert again['request']['requestId'] != first['requestId'], again
+
+
 def test_tool_same_title_with_a_different_complete_plan_keeps_both_and_says_so(plugin):
     # Reviewer L5: "Approve the plan." for plan B must not overwrite plan A in place.
     first = publish(plugin, {'request': payload_of(approval('Approve the migration plan.', markdown='Migrate DB A.'))})

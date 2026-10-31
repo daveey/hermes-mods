@@ -414,7 +414,8 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
             body_keys = ('schemaVersion', 'kind', 'title', 'scope', 'limits', 'exclusions', 'outcomes', 'choices',
                          'state')
             probe = core.validate_action(json.loads(json.dumps(payload)))
-            exact = [r for r in undecided if r not in fold and all(r.get(k) == probe.get(k) for k in body_keys)]
+            exact = [r for r in undecided if r not in fold and all(r.get(k) == probe.get(k) for k in body_keys)
+                     and all(a in r['aliases'] for a in probe.get('aliases') or [])]
             if not fold and exact:
                 # The same request re-sent (lost response, retried tool call): nothing new to publish.
                 out = _published(owner, exact[-1])
