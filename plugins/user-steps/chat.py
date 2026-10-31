@@ -135,7 +135,7 @@ _BACK_KIND = {'approval': 'approve', 'choice': 'choose', 'input': 'input', 'exte
 
 
 def duplicate_open(core, store, limit=2000):
-    """Sessions holding more than one open request for one decision (the one-tile rule, core.same_open_ask).
+    """Sessions holding more than one open request for one decision (the one-tile rule, core.restates_open_ask detector).
 
     Each open/needs_context undecided request is a candidate (text = title, kind mapped back to
     approve/choose/input/do) against the earlier open ones of its session; an exact ask_key(title) match
@@ -166,7 +166,7 @@ def duplicate_open(core, store, limit=2000):
             if hit is None:
                 cand = {'text': ask['title'], 'kind': _BACK_KIND.get(r['kind'], 'input'),
                         'options': ask['labels'], 'verbatim_span': ''}
-                hit = core.same_open_ask(cand, asks)
+                hit = core.restates_open_ask(cand, asks)
             if hit is not None:
                 head = root[hit['id']]
                 root[ask['id']] = head
@@ -182,7 +182,7 @@ def duplicate_open(core, store, limit=2000):
 
 
 def cross_session_duplicates(core, store, limit=2000):
-    """Open requests in different sessions that same_open_ask treats as one decision.
+    """Open requests in different sessions that core.restates_open_ask flags as one decision.
 
     One entry per pair (idempotent on the two request ids), within one namespace
     (gateway + profile). Read-only. Returns [{namespace, ids, sessions}].
@@ -213,7 +213,7 @@ def cross_session_duplicates(core, store, limit=2000):
             for prev in asks[:i]:
                 if prev['session'] == ask['session']:
                     continue
-                if core.same_open_ask(cand, [prev]) is None:
+                if core.restates_open_ask(cand, [prev]) is None:
                     continue
                 pair = tuple(sorted((prev['id'], ask['id'])))
                 if pair in seen:

@@ -153,6 +153,13 @@ def test_missing_plan_returns_agent_work(monkeypatch, env):
     complete = dict(broken, outcomes={'approve':'Apply exactly this plan','revise':'Change plan','decline':'Do nothing'},
         choices=[{'id':e, 'label':e, 'effect':e} for e in ('approve','revise','decline')])
     st.revise(OWNER, broken['requestId'], 1, complete)
+    # A ready approval with the same title, but not published by this turn: an equal title is not provenance.
+    assert plugin.publication_buffer(session_id='session', final_response='Approve?')['hold']
+    # The producer tool publishes (revises) it in this turn: the reply relays its own request.
+    body = {k: v for k, v in complete.items() if k not in ('owner', 'requestId', 'revision')}
+    out = json.loads(plugin.publish_action_request({'request': body, 'requestId': broken['requestId'],
+                                                    'expectedRevision': 2}, 'session'))
+    assert out['request']['revision'] == 3, out
     assert plugin.publication_buffer(session_id='session', final_response='Approve?') is None
     monkeypatch.setattr(plugin.core, 'extract', lambda *_, **__: {'steps': [{'kind': 'choose', 'text': QUESTION}]})
     assert plugin.publication_buffer(session_id='session', final_response=QUESTION) is None
@@ -184,15 +191,34 @@ def test_clarification_answer_outcome_contract(env):
 
 
 def test_explicit_producer_question_not_duplicated(env, tmp_path):
+    # The producer published this question in this very turn (server-recorded turn_requests): the reply that
+    # relays it is not a second ask.
     st, r, db = env
     r.update(requestId='00000000-0000-0000-0000-000000000088', aliases=[])
     st.create(OWNER, r)
     ledger = core.Ledger(tmp_path / 'ledger', db)
     out = core.process_reply(QUESTION, 'session', ledger=ledger, action_store=st, action_owner=OWNER,
         llm=lambda *_: json.dumps({'steps':[{'text':QUESTION, 'kind':'choose',
-            'options':['open a pull request', 'something else'], 'verbatim_span':QUESTION}]}))
+            'options':['open a pull request', 'something else'], 'verbatim_span':QUESTION}]}),
+        turn_requests={r['requestId']})
     assert out['steps'] == []
     assert len(st.requests(OWNER)) == 2
+
+
+def test_same_title_as_an_earlier_producer_question_is_its_own_ask(env, tmp_path):
+    # No provenance (published in an earlier turn, not cited, not marked as a repeat): an equal title is a
+    # different request, never folded into the open one.
+    st, r, db = env
+    r.update(requestId='00000000-0000-0000-0000-000000000088', aliases=[])
+    st.create(OWNER, r)
+    before = st.get(OWNER, r['requestId'])
+    ledger = core.Ledger(tmp_path / 'ledger', db)
+    out = core.process_reply(QUESTION, 'session', ledger=ledger, action_store=st, action_owner=OWNER,
+        llm=lambda *_: json.dumps({'steps':[{'text':QUESTION, 'kind':'choose',
+            'options':['open a pull request', 'something else'], 'verbatim_span':QUESTION}]}))
+    assert len(out['steps']) == 1 and out['steps'][0]['requestId'] != r['requestId']
+    assert len(st.requests(OWNER)) == 3
+    assert st.get(OWNER, r['requestId']) == before
 
 
 def test_pending_button_decision_cannot_be_retired(env):

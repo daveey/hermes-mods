@@ -283,45 +283,47 @@ the lock-free pass, `requests()` hiding withdrawn rows, REST filtering and dismi
 hook context, the plan gate, and the extraction guard (scoped and unscoped
 declarations, quoted questions, and the exact reply that produced a stale approval ask).
 
-## One decision, one tile
+## One decision, one tile (by provenance, never by title)
 
-The aux model rewords every restatement of an ask ("Decide on t_X: ..." becomes
-"Decide whether to ... (t_X)"), so exact action identity alone minted a new request
-and tile for every reply that mentioned an open ask (3-5 tiles per decision in live
-chats). `same_open_ask` (core.py) maps a re-ask to the ONE open, undecided request
-of the same session it repeats, and the reply is framed onto that tile instead:
+Two open requests with the same title are two requests. Equal or similar titles,
+shared card ids, overlapping words and matching menu labels are never identity
+(implementation plan acceptance #2: no fuzzy dedup; missing identity does not trigger
+fuzzy dedup). `same_open_ask` (core.py) frames an extracted ask onto an existing
+open, undecided request of the same session only with exact provenance:
 
-- its text or evidence sentence IS an open request's title (markdown, list marks and
-  end punctuation ignored), or the same evidence sentence an open ask was extracted
-  from in an earlier reply;
-- the model listed that sentence under `repeats` for an open id (the prompt now lists
-  producer-published requests as open steps and says a restatement is a repeat);
-- it names exactly one Kanban card, and an open request of the same kind names only
-  that card;
-- it is the approve/change/decline menu and exactly one open approval exists (or
-  that sentence was already read as one approval).
+- the extractor listed that exact sentence under `repeats` for the open id (request id
+  or extracted step id; the prompt lists producer-published requests as open steps);
+- the evidence sentence (30+ characters, 5+ words) is the sentence an open ask was
+  extracted from in an EARLIER reply;
+- the request was published or revised by the `action_request` tool in this very turn
+  (server-recorded `turn_requests`; reset when the next turn starts), and the ask
+  restates its title or is the approve/change/decline menu of the only such approval;
+- the same sentence of this reply was already read as an approval (one sentence, one
+  approval).
 
-Anything else stays a separate ask: a different kind on the same card, a menu next
-to two open approvals, two asks read from one sentence of one reply. Decided,
-withdrawn and closed requests are never a target, so asking again after a decision
-or withdrawal is still a fresh ask. The final-reply plan gate uses the same matcher,
-so a reworded restatement of a published approval no longer holds the reply.
+Everything else is its own request: a same-title ask in a later reply that the model
+did not mark as a repeat, a reworded ask naming the same card, a menu with the labels
+of an approval from an earlier turn. Decided, withdrawn and closed requests are never a
+target. The final-reply plan gate uses the same matcher, so a restated approval from
+an earlier turn holds the reply and the nudge asks the agent to revise THAT request by
+its requestId (which is turn provenance). `restates_open_ask` keeps the old heuristics
+for the duplicate detectors only (`chat.py`, `stale_watch.py`); their cards tell the
+agent to withdraw only when the source proves a re-ask.
 
-Card and menu rules also need the same words: two different asks about one card
-("register a runner for t_X" / "delete t_X's stale branch") stay separate, a card
-named only in the evidence sentence anchors nothing, and a menu must share the
-approval's labels and topic. Evidence-sentence rules need a specific sentence (30+
-characters, 5+ words), so "Let me know which you prefer." merges nothing.
-
-`action_request`: a new request whose title (20+ characters) matches an open,
-undecided, card-free request of the session revises that request in place when it
-is provably the same ask (an extracted or plan-less tile, or the same plan re-sent)
-and withdraws older such duplicates (`by: agent`, `Duplicate of <id>`). A complete
-plan with a different scope under the same title is published separately and the
-result's `note` names the other open request to withdraw if it is replaced. The
-in-place revision is refused if a decision was recorded meanwhile
-(`revise(..., undecided=True)`), and the request is then published as new: the
-decision wins. A request that says, unscoped, that it asks nothing (title "No
+`action_request`: a new request revises an open, undecided, card-free request of the
+session in place only when it cites that request's own extracted step: an exact
+qualified `user_step` ref (`gatewayId`, `profile`, `id` of this owner) in `aliases` or
+`scope.sourceRefs`. Refs of another gateway, profile or session fold nothing. An exact
+re-send of an open request (same kind, title, scope, limits, exclusions, outcomes,
+choices, state: a lost response or retried call) returns that request unchanged with
+a note. A same-title request is published separately and the `note` names the open
+same-title requests so the agent can withdraw one it replaces; nothing is withdrawn
+automatically. The in-place revision is refused if a decision was recorded meanwhile
+(`revise(..., undecided=True)`), and the request is then published as new without the
+decided request's refs: the decision wins. If the cited request was only revised
+meanwhile (stale revision, still undecided), the call fails with 409 naming that
+request, so one source step never gets a second tile. Citing steps of two open
+requests at once is refused. A request that says, unscoped, that it asks nothing (title "No
 decision needed: ...", scope "Settled, nothing to decide.") is never published: a
 revision (with `expectedRevision`) withdraws the request, a new one is refused with
 the withdraw instruction. None of this records a decision or grants anything.
@@ -496,7 +498,8 @@ skips are not live mutation or end-to-end verification.
 
 `stale_watch.py` opens one Kanban card (idempotency key `user-steps-stale:<requestId>`) for each open clarification whose
 user reply is older than 1 h (the `/ping` `stale.answeredOpen` set), and one card per pair of open requests in
-different sessions that `same_open_ask` treats as the same decision (key `user-steps:dup:<namespace>:<id>:<id>`).
+different sessions that `restates_open_ask` flags as possibly the same decision (key `user-steps:dup:<namespace>:<id>:<id>`).
+Overlap is not identity: the card asks the agent to withdraw only when the source proves a relay.
 Run it periodically on every gateway, since action
 stores are per host: `python3 ~/.hermes/plugins/user-steps/stale_watch.py` (`--dry-run`, `--min-age SECONDS`).
 Tests: `tests/test_stale_watch.py` (2 h reply -> one card; rerun -> no duplicate; retired -> none; CLI args;
@@ -512,12 +515,16 @@ first tool starts); this card is the net for when that recovery misses. Tests: `
 
 A reply that only lists decisions waiting in other chats, queues or cards is a status report. A step whose
 evidence sits in that paragraph is not minted, unless the span itself is a direct request and does not contain
-the digest marker. The extractor receives up to 30 titles of open asks in other sessions
-(`ELSEWHERE`); a sentence mapped to one of those titles is neither minted nor framed.
-Before publishing extracted steps, a deterministic read rechecks **all** undecided
-other-session titles in the same gateway/profile namespace, without the prompt's
-recency cap. Exact normalized candidate-title or specific evidence-sentence equality
-suppresses publication even when the extractor omits its `elsewhere` mapping. This
+the digest marker. In a turn a runtime notice started (a Kanban notice, owner wake or
+chat-closeout row: relay provenance) the extractor receives up to 30 titles of open asks
+in other sessions (`ELSEWHERE`); a sentence mapped to one of those titles is neither
+minted nor framed. Before publishing extracted steps in such a turn, a deterministic read
+rechecks **all** undecided other-session titles in the same gateway/profile
+namespace, without the prompt's recency cap. Exact normalized candidate-title or
+specific evidence-sentence equality suppresses that relay even when the extractor
+omits its `elsewhere` mapping. In a turn the user started, the prompt lists no other
+chats and an equal title in another chat is no source association: the ask is
+published as this chat's own request. This
 never adopts or frames another session's request or changes its state, revision or decisions.
 Unrelated asks, other namespaces and retired requests remain independent. This is a
 publication-time snapshot, not atomic concurrent-session admission or fuzzy matching.
