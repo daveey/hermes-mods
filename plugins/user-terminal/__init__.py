@@ -15,7 +15,9 @@ Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
   runner.sh   the show-and-run script the window executes
   confirm     present -> the runner asks y/N first (see confirm_mode)
   output.log  everything printed while the command ran (via script(1))
-  status.json {"status": "running"|"ran"|"declined", "exit_code": n}
+  status.json {"status": "waiting_for_user"|"running"|"ran"|"declined"|"failed", "exit_code": n}
+              "failed" = no terminal could be opened (with error, job_id and any osascript diagnosis); the
+              runner refuses to run a job already marked failed, so a window that opens late runs nothing.
 
   origin.txt  who asked, for a request relayed from another gateway (shown by the runner)
 
@@ -100,6 +102,10 @@ RUNNER = r"""#!/bin/bash
 JOB="$1"
 B=$'\e[1m'; D=$'\e[2m'; Y=$'\e[33m'; G=$'\e[32m'; R=$'\e[31m'; C=$'\e[36m'; N=$'\e[0m'
 status() { printf '%s' "$1" > "$JOB/status.json.tmp" && mv "$JOB/status.json.tmp" "$JOB/status.json"; }
+if grep -q '"status": *"failed"' "$JOB/status.json" 2>/dev/null; then
+  echo "Hermes already gave up on this window (it did not open in time) and told the agent; not running it."
+  sleep 2; exit 0
+fi
 if [ -s "$JOB/origin.txt" ]; then printf '\e]0;Hermes (%s) wants to run a command\a' "$(head -n1 "$JOB/origin_short.txt" 2>/dev/null)"; else printf '\e]0;Hermes wants to run a command\a'; fi
 clear
 W=$(tput cols 2>/dev/null || echo 100); W=$(( W > 120 ? 120 : W )); W=$(( W < 40 ? 40 : W ))
@@ -244,11 +250,92 @@ def _center(app: str) -> str:
     return _CENTER.replace("{app}", _osa_quote(app))
 
 
+OSA_TIMEOUT = 20
+
+
+def _responsible_pid(pid: int) -> int | None:
+    """macOS's TCC-responsible pid for ``pid`` (libSystem's responsibility_get_pid_responsible_for_pid; an
+    in-process call, no subprocess). None where the call does not exist or fails."""
+    try:
+        import ctypes
+
+        fn = ctypes.CDLL(None).responsibility_get_pid_responsible_for_pid
+        fn.restype, fn.argtypes = ctypes.c_int, [ctypes.c_int]
+        r = int(fn(int(pid)))
+        return r if r > 0 else None
+    except Exception:
+        return None
+
+
+def _proc_info(pid: int) -> tuple[int, str] | None:
+    """(ppid, executable path) of a live process via ps, bounded to 2 s. None if unknown."""
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(int(pid))], capture_output=True, text=True,
+                             timeout=2).stdout.strip()
+        ppid, comm = out.split(None, 1)
+        return int(ppid), comm.strip()
+    except Exception:
+        return None
+
+
+def osa_diagnosis() -> dict:
+    """Who macOS asks the Automation (TCC) question for when osascript hangs. osascript is spawned without
+    disclaiming responsibility, so it inherits this process's responsible process; that is read from the OS.
+    The parent chain is informational only (TCC attributes to the responsible process, not the parent)."""
+    me = os.getpid()
+    rpid = _responsible_pid(me)
+    if rpid is None:
+        resp: dict[str, Any] = {"status": "unknown", "why": "responsibility_get_pid_responsible_for_pid unavailable"}
+    else:
+        info = _proc_info(rpid)
+        resp = {"status": "known", "pid": rpid, "source": "responsibility_get_pid_responsible_for_pid",
+                "name": Path(info[1]).name if info else None, "path": info[1] if info else None}
+    chain, pid = [], me
+    for _ in range(8):  # bounded walk
+        info = _proc_info(pid)
+        if not info:
+            break
+        chain.append({"pid": pid, "name": Path(info[1]).name})
+        if info[0] <= 1:
+            break
+        pid = info[0]
+    return {"responsible_process": resp, "ancestry_not_definitive": chain}
+
+
+def _diagnosis_text(d: dict) -> str:
+    r = d.get("responsible_process") or {}
+    if r.get("status") == "known":
+        who = f"{r.get('name') or 'unknown name'} (pid {r.get('pid')}, via {r.get('source')})"
+    else:
+        who = f"unknown ({r.get('why') or 'not retrievable'})"
+    chain = " <- ".join(f"{c['name']}[{c['pid']}]" for c in d.get("ancestry_not_definitive") or []) or "unknown"
+    return (f"TCC responsible process: {who}. Process ancestry (not definitive for TCC): {chain}. A hang like this "
+            f"is commonly a pending macOS Automation consent prompt or a busy app; not confirmed.")
+
+
+class OpenFailed(RuntimeError):
+    def __init__(self, msg: str, diagnosis: dict | None = None):
+        super().__init__(msg)
+        self.diagnosis = diagnosis
+
+
+def _osascript(script: str) -> None:
+    try:
+        subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True,
+                       timeout=OSA_TIMEOUT, env=launch_env())
+    except subprocess.TimeoutExpired:
+        d = osa_diagnosis()
+        raise OpenFailed(f"osascript timed out after {OSA_TIMEOUT}s. {_diagnosis_text(d)}", d) from None
+    except subprocess.CalledProcessError as e:
+        err = str(e.stderr or e.output or "").strip()
+        raise OpenFailed(f"osascript exited {e.returncode}: {err or 'no stderr'}") from None
+
+
 def _open_terminal_app(shell_cmd: str) -> str:
     script = (f'tell application "Terminal"\nset t to do script {_osa_quote(shell_cmd)}\nset w to front window\n'
               f'set number of columns of w to {COLS}\nset number of rows of w to {ROWS}\nactivate\nend tell\n'
               + _center("Terminal"))
-    subprocess.run(["osascript", "-e", script], check=True, capture_output=True, timeout=20, env=launch_env())
+    _osascript(script)
     return "Terminal"
 
 
@@ -256,14 +343,14 @@ def _open_iterm(shell_cmd: str) -> str:
     script = ('tell application "iTerm"\nactivate\nset w to (create window with default profile command '
               + _osa_quote(shell_cmd) + f')\ntell current session of w\nset columns to {COLS}\nset rows to {ROWS}\n'
               'end tell\nend tell\n' + _center("iTerm"))
-    subprocess.run(["osascript", "-e", script], check=True, capture_output=True, timeout=20, env=launch_env())
+    _osascript(script)
     return "iTerm"
 
 
 def open_window(job: Path) -> str:
     run_cmd = f"/bin/bash {shlex.quote(str(job / 'runner.sh'))} {shlex.quote(str(job))}"
     shell_cmd = _unset_prefix() + run_cmd + "; exit"  # typed into an interactive shell (Terminal.app, cmux)
-    errors = []
+    errors, diagnosis = [], None
     for k in terminal_order():
         try:
             if k == "cmux":
@@ -274,7 +361,8 @@ def open_window(job: Path) -> str:
                 return _open_terminal_app(shell_cmd)
         except Exception as e:  # fall through to the next terminal
             errors.append(f"{k}: {e}")
-    raise RuntimeError("; ".join(errors) or "no terminal available")
+            diagnosis = getattr(e, "diagnosis", None) or diagnosis
+    raise OpenFailed("; ".join(errors) or "no terminal available", diagnosis)
 
 
 # ---------------------------------------------------------------- jobs
@@ -380,14 +468,42 @@ def _interrupted() -> bool:
         return False
 
 
+FINAL = ("ran", "declined", "failed")
+
+
+def fail_job(job: Path, error: str, diagnosis: dict | None = None) -> dict:
+    """Persist ``failed`` (atomic rename) so later waits and resumes end at once instead of polling a job
+    no window will ever answer."""
+    st: dict[str, Any] = {"status": "failed", "error": error, "job_id": job.name}
+    if diagnosis:
+        st["diagnosis"] = diagnosis
+    tmp = job / f".status.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(json.dumps(st))
+    os.replace(tmp, job / "status.json")
+    return st
+
+
+def _open_or_fail(job: Path, prefix: str) -> tuple[str | None, dict | None]:
+    """(terminal, None) or (None, failed result) with the failure already on disk."""
+    try:
+        return open_window(job), None
+    except Exception as e:
+        fail_job(job, f"{prefix}: {e}", getattr(e, "diagnosis", None))
+        return None, wait_for(job, 0)
+
+
 def wait_for(job: Path, wait_s: float) -> dict:
     deadline = time.time() + wait_s
     st = read_status(job)
-    while st.get("status") not in ("ran", "declined") and time.time() < deadline and not _interrupted():
+    while st.get("status") not in FINAL and time.time() < deadline and not _interrupted():
         time.sleep(0.5)
         st = read_status(job)
     result: dict[str, Any] = {"ok": True, "job_id": job.name, **st}
-    if st.get("status") not in ("ran", "declined"):
+    if st.get("status") == "failed":
+        result["ok"] = False
+        result["note"] = ("No terminal window could be opened, so nothing ran. Report the error; do not hand the "
+                          "command to the user to paste.")
+    elif st.get("status") not in ("ran", "declined"):
         result["status"] = "pending" if st.get("status") != "running" else "running"
         result["note"] = ("Still waiting (user hasn't answered, or the command is still running). Call "
                           "run_in_user_terminal with this job_id to keep waiting.")
@@ -419,10 +535,9 @@ def handle(args: dict, **_kw: Any) -> str:
         if not os.path.isdir(cwd):
             return _err(f"cwd does not exist: {cwd}")
         job = create_job(command, str(args.get("reason") or ""), cwd)
-        try:
-            where = open_window(job)
-        except Exception as e:
-            return _err(f"could not open a terminal window: {e}")
+        where, failed = _open_or_fail(job, "could not open a terminal window")
+        if failed:
+            return json.dumps(failed)
         res = wait_for(job, wait_s)
         res["terminal"] = where
         return json.dumps(res)
@@ -491,10 +606,9 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
     if not os.path.isdir(cwd):
         return {"ok": False, "error": f"cwd does not exist on the Mac: {cwd}"}
     job = create_job(command, str(reason or ""), cwd, origin)
-    try:
-        where = open_window(job)
-    except Exception as e:
-        return {"ok": False, "error": f"could not open a terminal window on the Mac: {e}"}
+    where, failed = _open_or_fail(job, "could not open a terminal window on the Mac")
+    if failed:
+        return failed
     return {"ok": True, "job_id": job.name, "status": "waiting_for_user", "terminal": where}
 
 
@@ -721,14 +835,14 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
             left = deadline - time.time()
             res = relay_once(base, device, {"job_id": job_id, "wait_s": int(max(0, min(POLL_S, left)))}, sender,
                              POLL_S + 30)
-            if not res.get("ok") or res.get("status") in ("ran", "declined") or time.time() >= deadline:
+            if not res.get("ok") or res.get("status") in FINAL or time.time() >= deadline:
                 break
             if _interrupted():
                 break
         res = {**res, "job_id": job_id, "device": device}
         if terminal:
             res["terminal"] = terminal
-        if res.get("ok") and res.get("status") not in ("ran", "declined"):
+        if res.get("ok") and res.get("status") not in FINAL:
             res["note"] = (f"Still waiting on `{device}` (the owner hasn't answered, or the command is still "
                            f"running). Call run_in_user_terminal with this job_id to keep waiting.")
         return json.dumps(res)

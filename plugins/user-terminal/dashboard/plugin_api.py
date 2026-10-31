@@ -2,6 +2,7 @@
 
 POST /api/plugins/user-terminal/start   {command, reason, cwd, origin: {gateway, profile, session_id, title}}
                                         -> {ok, job_id, status: "waiting_for_user", terminal} | {ok: false, error}
+                                           | {ok: false, status: "failed", job_id, error[, diagnosis]} (no window opened)
 GET  /api/plugins/user-terminal/status/{job_id}?gateway=<origin gateway>&wait_s=<=25
                                         -> the local tool's result shape (status ran|declined|pending|running, ...)
 

@@ -525,3 +525,187 @@ def test_iterm_command_env_unsets_identity(worker, monkeypatch):
     script = calls[0][0][2]
     pre = script.split("runner.sh")[0]
     assert "env -u HERMES_KANBAN_TASK" in pre and "-u HERMES_KANBAN_RUN_ID" in pre
+
+
+
+# ---- every opener failed: the job is persisted as failed (never left waiting_for_user) and waits end at once
+
+def _all_openers_fail(monkeypatch):
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["iterm", "terminal"])
+
+    def boom(name):
+        def f(*_a, **_k):
+            raise RuntimeError(f"{name} refused")
+        return f
+
+    monkeypatch.setattr(ut, "_open_iterm", boom("iterm"))
+    monkeypatch.setattr(ut, "_open_terminal_app", boom("terminal"))
+
+
+def _only_job(d: Path) -> Path:
+    jobs = [p for p in d.iterdir() if p.is_dir()]
+    assert len(jobs) == 1, jobs
+    return jobs[0]
+
+
+def _assert_failed_status(job: Path, *needles: str) -> dict:
+    st = json.loads((job / "status.json").read_text())
+    assert st["status"] == "failed" and st["job_id"] == job.name, st
+    for n in needles:
+        assert n in st["error"], st
+    assert not list(job.glob("*.tmp")) and not list(job.glob(".status*"))  # no torn/temp write left behind
+    return st
+
+
+def test_handle_all_openers_fail_persists_failed_and_resume_returns_at_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    _all_openers_fail(monkeypatch)
+    t = time.time()
+    out = json.loads(ut.handle({"command": "true", "cwd": str(tmp_path), "wait_s": 3}))
+    assert time.time() - t < 1.5
+    job = _only_job(tmp_path / "jobs")
+    _assert_failed_status(job, "iterm refused", "terminal refused")  # on disk first: not left waiting_for_user
+    assert out["ok"] is False and out["status"] == "failed" and out["job_id"] == job.name, out
+    assert "iterm refused" in out["error"] and "terminal refused" in out["error"]
+    t = time.time()
+    again = json.loads(ut.handle({"job_id": job.name, "wait_s": 3}))  # resume: no 3 s wait on a dead job
+    assert time.time() - t < 1.5
+    assert again["ok"] is False and again["status"] == "failed" and again["job_id"] == job.name
+    assert "iterm refused" in again["error"]
+
+
+def test_start_relayed_all_openers_fail_persists_failed_and_status_returns_at_once(remote, monkeypatch, tmp_path):
+    _, mac = remote
+    _all_openers_fail(monkeypatch)
+    res = ut.start_relayed("true", "why", str(tmp_path), ORIGIN)
+    job = _only_job(mac)
+    _assert_failed_status(job, "terminal refused")  # on disk first: not left waiting_for_user
+    assert res["ok"] is False and res["status"] == "failed" and res["job_id"] == job.name, res
+    assert "on the Mac" in res["error"] and "terminal refused" in res["error"]
+    t = time.time()
+    st = ut.relayed_status(job.name, "nous-1", 3)  # the courier's resume path
+    assert time.time() - t < 1.5
+    assert st["ok"] is False and st["status"] == "failed" and st["job_id"] == job.name
+
+
+def test_wait_for_treats_failed_as_terminal(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("true", "", str(tmp_path))
+    ut.fail_job(job, "x broke")
+    t = time.time()
+    res = ut.wait_for(job, 3)
+    assert time.time() - t < 1.5
+    assert res == {**res, "ok": False, "status": "failed", "error": "x broke", "job_id": job.name}
+    assert "note" in res and "pending" not in res["note"]
+
+
+def test_fail_job_writes_atomically(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("true", "", str(tmp_path))
+    seen = []
+    real = ut.os.replace
+    monkeypatch.setattr(ut.os, "replace", lambda a, b: (seen.append((Path(a).parent, Path(b).name)), real(a, b)))
+    ut.fail_job(job, "e")
+    assert seen == [(job, "status.json")]
+
+
+@needs_bsd_script
+def test_runner_refuses_a_job_already_marked_failed(tmp_path, monkeypatch):
+    """A window that opens late (osascript timed out, then the user approved Automation) must not run a job the
+    agent was already told failed: it would run twice if the agent retried."""
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    marker = tmp_path / "RAN"
+    job = ut.create_job(f"touch {marker}", "", str(tmp_path))
+    ut.fail_job(job, "timed out")
+    screen = _drive(job, [], timeout=5)
+    assert not marker.exists() and b"not running it" in screen
+    assert ut.read_status(job)["status"] == "failed"
+
+
+def test_remote_round_trip_reports_mac_open_failure(remote, monkeypatch, tmp_path):
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    _all_openers_fail(monkeypatch)
+    c = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    c.start()
+    try:
+        out = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 5}))
+    finally:
+        c.stop.set()
+    job = _only_job(mac)
+    _assert_failed_status(job, "terminal refused")
+    assert out["ok"] is False and out["status"] == "failed" and out["job_id"] == job.name, out
+
+
+# ---- osascript timeout: name the TCC-responsible process when the OS tells us, labelled unknown otherwise
+
+def _osa_timeout(monkeypatch):
+    def fake_run(argv, **kw):
+        if argv and argv[0] == "osascript":
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    monkeypatch.setattr(ut.subprocess, "run", fake_run)
+
+
+def test_osascript_timeout_names_responsible_process(tmp_path, monkeypatch):
+    _osa_timeout(monkeypatch)
+    monkeypatch.setattr(ut, "_responsible_pid", lambda pid: 4242)
+    monkeypatch.setattr(ut, "_proc_info", lambda pid: {4242: (1, "/Applications/Example Host.app/Contents/MacOS/Example Host"),
+                                                       ut.os.getpid(): (777, "python3"),
+                                                       777: (4242, "zsh")}.get(pid))
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["terminal"])
+    job = tmp_path / "job"
+    job.mkdir()
+    with pytest.raises(RuntimeError) as ei:
+        ut.open_window(job)
+    msg = str(ei.value)
+    assert "osascript timed out after 20s" in msg
+    assert "TCC responsible process: Example Host (pid 4242" in msg and "responsibility_get_pid_responsible_for_pid" in msg
+    assert "not definitive" in msg and "zsh" in msg  # ancestry is shown, but labelled as not the TCC answer
+    assert "tell application" not in msg  # the AppleScript body is not dumped into the error
+
+
+def test_osascript_timeout_responsible_unknown_is_labelled(tmp_path, monkeypatch):
+    _osa_timeout(monkeypatch)
+    monkeypatch.setattr(ut, "_responsible_pid", lambda pid: None)
+    monkeypatch.setattr(ut, "_proc_info", lambda pid: None)
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["iterm"])
+    job = tmp_path / "job"
+    job.mkdir()
+    with pytest.raises(RuntimeError) as ei:
+        ut.open_window(job)
+    msg = str(ei.value)
+    assert "iterm: osascript timed out" in msg and "TCC responsible process: unknown" in msg
+
+
+def test_osascript_timeout_persists_diagnosis_in_failed_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    _osa_timeout(monkeypatch)
+    monkeypatch.setattr(ut, "_responsible_pid", lambda pid: 4242)
+    monkeypatch.setattr(ut, "_proc_info", lambda pid: (1, "/x/Example Host") if pid == 4242 else None)
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["terminal"])
+    out = json.loads(ut.handle({"command": "true", "cwd": str(tmp_path), "wait_s": 3}))
+    st = _assert_failed_status(_only_job(tmp_path / "jobs"), "osascript timed out")
+    assert out["status"] == "failed" and st["diagnosis"]["responsible_process"]["name"] == "Example Host"
+    assert st["diagnosis"]["responsible_process"]["source"] == "responsibility_get_pid_responsible_for_pid"
+
+
+def test_osascript_error_includes_stderr(tmp_path, monkeypatch):
+    def fake_run(argv, **kw):
+        raise subprocess.CalledProcessError(1, argv, output="", stderr="execution error: Not authorized to send Apple events to Terminal. (-1743)")
+    monkeypatch.setattr(ut.subprocess, "run", fake_run)
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["terminal"])
+    job = tmp_path / "job"
+    job.mkdir()
+    with pytest.raises(RuntimeError) as ei:
+        ut.open_window(job)
+    assert "-1743" in str(ei.value)
+
+
+def test_responsible_pid_lookup_is_real_or_none():
+    """Bounded real OS read (no window): a pid on macOS, None where the call does not exist."""
+    r = ut._responsible_pid(os.getpid())
+    assert r is None or (isinstance(r, int) and r > 0)
+    if sys.platform == "darwin":
+        assert r is not None and ut._proc_info(r) is not None
