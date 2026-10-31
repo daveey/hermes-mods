@@ -1,0 +1,304 @@
+From f8c39f0e5421788632dbe9fac0b01201b19f4dca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 02:23:35 +0000
+Subject: [PATCH] fix(kanban): receipt-gated reconcile for wrong-local
+ refused-send tui subscriptions [daveey]
+
+A worker refused a send into a bare @session ref for a chat on another
+gateway got a platform='tui' row on its own board. Nothing local can
+drain it, so _unseen_on counts it forever and the chat-closeout watchdog
+files a false unseen incident, though the owner gateway already delivered
+the result via the hub link (incident t_01a18f20b8f29e9e).
+
+reconcile_refused_sub removes such a row only when the chat is not local,
+the owner gateway/profile is known, the hub route exists, every pending
+event is a completion and the owner's transcript lineage holds the exact
+remote:<gw>:<profile>/<board>/<task>:<event> notice key. The row snapshot
+and pending events are rechecked under the writer txn; every other case
+leaves the row retryable. The producer fix (owner resolution before
+subscribing) is in hermes-mods session-mentions.
+---
+ hermes_cli/kanban_db_notify.py                |   4 +-
+ hermes_cli/kanban_notify_reconcile.py         | 100 ++++++++++++
+ .../test_kanban_notify_reconcile.py           | 147 ++++++++++++++++++
+ 3 files changed, 250 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_notify_reconcile.py
+ create mode 100644 tests/hermes_cli/test_kanban_notify_reconcile.py
+
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index b73c4684a65..d315234ad5a 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -286,7 +286,9 @@ def remove_notify_sub(
+     chat_id: str,
+     thread_id: Optional[str] = None,
+ ) -> bool:
+-    with _kb.write_txn(conn):
++    # Pure composition primitive: reconciliation validates receipt + row snapshot
++    # and retires the subscription in one outer transaction.
++    with _kb.write_txn(conn, allow_nested=True):
+         cur = conn.execute(
+             "DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+             _sub_key(task_id, platform, chat_id, thread_id),
+diff --git a/hermes_cli/kanban_notify_reconcile.py b/hermes_cli/kanban_notify_reconcile.py
+new file mode 100644
+index 00000000000..7773deee9ea
+--- /dev/null
++++ b/hermes_cli/kanban_notify_reconcile.py
+@@ -0,0 +1,100 @@
++"""Receipt-gated retirement of historical wrong-local refused-send subscriptions. [daveey]
++
++Before session-mentions resolved a refused chat's owner, a Kanban worker refused a send into a bare
++``@session:<profile>/<id>`` ref for a chat on ANOTHER gateway got a ``platform='tui'`` row on its own
++board here. Nothing on this gateway can drain it (the unloaded-session sweeper only finds local chats),
++so ``kanban_session_activity._unseen_on`` counts it forever and the chat-closeout watchdog files a
++false "unseen" incident, while the chat's owner gateway already delivered the result through the
++``platform='hub'`` link (incident t_01a18f20b8f29e9e, 2026-10-30).
++
++This maintenance API never sends, wakes, or advances cursors. Callers supply readers backed by the
++authoritative destination gateway (its own session store, not a replica). A row is removed only when
++the chat is not local, the owner is known, the hub route exists, every pending event is a completion
++and the owner's transcript lineage holds its exact ``remote:<gw>:<profile>/<board>/<task>:<event>``
++notice key. Any other outcome leaves the row (and its unseen count) in place, retryable.
++"""
++from __future__ import annotations
++
++from collections.abc import Callable
++import logging
++import sqlite3
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli.kanban_session_activity import UNSEEN_KINDS
++
++
++def reconcile_refused_sub(
++    conn: sqlite3.Connection, *, task_id: str, chat_id: str, thread_id: str = "",
++    source_gateway: str, source_profile: str, board: str,
++    local_session_exists: Callable[[str, str], bool],
++    owner: Callable[[str, str], tuple[str, str] | None],
++    delivered_keys: Callable[[str, str, str, set[str]], set[str]],
++) -> str:
++    """Remove one erroneous tui row only after exact remote receipt readback.
++
++    ``owner(profile, chat)`` must check the owner gateway's session store; None
++    means unknown. ``local_session_exists`` must raise on unreadable stores.
++    ``delivered_keys`` reads transcript event keys across compression lineage,
++    not admission/ledger status or free text. All three are read-only readers.
++    The correct hub subscription must already exist. Re-check the complete row
++    and event range under the writer txn so racing completion/claim cannot lose
++    a notice. Outcomes are stable diagnostics; repeated success is ``absent``.
++    """
++    key = (task_id, "tui", chat_id, thread_id)
++    row = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?", key).fetchone()
++    if row is None:
++        return "absent"
++    snapshot = dict(row)
++    if notify._decode_notify_delivery_metadata(snapshot["delivery_metadata"]).get("reason") != "send_refused":
++        return "provenance_mismatch"
++    if snapshot.get("inflight_from") is not None:
++        return "inflight"
++    profile = snapshot.get("notifier_profile") or "default"
++    try:
++        if local_session_exists(profile, chat_id):
++            return "local_owner"
++        destination = owner(profile, chat_id)
++        if not destination or destination[0] == source_gateway or destination[1] != profile:
++            return "unknown_owner"
++        gateway, profile = destination
++        hub_chat = f"{gateway}/{profile}/{chat_id}"
++        if not _hub_sub(conn, task_id, hub_chat, thread_id):
++            return "missing_remote_route"
++        events = _pending(conn, task_id, snapshot["last_event_id"])
++        if not events:  # nothing unseen: harmless, and no receipt can justify touching it
++            return "nothing_pending"
++        # This API only reconciles completed notices with stable remote event keys.
++        # Other event kinds need their own receipt identity, never a cursor guess.
++        if any(kind != "completed" for _, kind in events):
++            return "unsupported_events"
++        keys = {f"remote:{source_gateway}:{source_profile}/{board}/{task_id}:{eid}" for eid, _ in events}
++        if not keys <= delivered_keys(gateway, profile, chat_id, keys):
++            return "missing_receipt"
++    except Exception:  # caller-supplied cross-gateway readers: any failure means "no evidence", never a removal
++        logging.getLogger(__name__).exception("notify reconcile: evidence unavailable for %s/%s", task_id, chat_id)
++        return "evidence_unavailable"
++    with kb.write_txn(conn):
++        current = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?", key).fetchone()
++        if current is None:
++            return "absent"
++        if dict(current) != snapshot or _pending(conn, task_id, snapshot["last_event_id"]) != events:
++            return "changed_retry"
++        if not _hub_sub(conn, task_id, hub_chat, thread_id):
++            return "changed_retry"
++        notify.remove_notify_sub(conn, task_id=task_id, platform="tui", chat_id=chat_id, thread_id=thread_id)
++        kb._append_event(conn, task_id, "notify_reconciled", {"reason": "remote_transcript_receipt", "chat_id": chat_id,
++                                                        "owner": gateway, "event_keys": sorted(keys)})
++    return "reconciled"
++
++
++def _pending(conn, task_id, cursor):
++    ph = ",".join("?" for _ in UNSEEN_KINDS)
++    return [(r[0], r[1]) for r in conn.execute(
++        f"SELECT id, kind FROM task_events WHERE task_id=? AND id>? AND kind IN ({ph}) ORDER BY id",
++        (task_id, cursor, *UNSEEN_KINDS))]
++
++
++def _hub_sub(conn, task_id, chat_id, thread_id):
++    return conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform='hub' AND chat_id=? AND thread_id=?",
++                        (task_id, chat_id, thread_id)).fetchone() is not None
+diff --git a/tests/hermes_cli/test_kanban_notify_reconcile.py b/tests/hermes_cli/test_kanban_notify_reconcile.py
+new file mode 100644
+index 00000000000..9e127505ac6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_notify_reconcile.py
+@@ -0,0 +1,147 @@
++"""Read-only hub+origin evidence followed by transactional subscription retirement."""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as notify
++from hermes_cli.kanban_notify_reconcile import reconcile_refused_sub
++from hermes_cli.kanban_session_activity import _unseen_on
++from hermes_state import SessionDB
++
++CHAT = "s_origin"
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    with kbc.connect_closing() as conn, SessionDB(tmp_path / "origin.db") as db:
++        tid = kb.create_task(conn, title="result", assignee="default")
++        db.create_session(CHAT, "desktop")
++        notify.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT,
++                              notifier_profile="default", delivery_metadata={"reason": "send_refused"})
++        notify.add_notify_sub(conn, task_id=tid, platform="hub", chat_id=f"remote/default/{CHAT}")
++        with kb.write_txn(conn):
++            eid = kb._append_event(conn, tid, "completed", {"summary": "result"})
++        eid = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++        key = f"remote:source:default/default/{tid}:{eid}"
++        args = dict(task_id=tid, chat_id=CHAT, source_gateway="source", source_profile="default", board="default",
++                    local_session_exists=lambda p, s: False,
++                    owner=lambda p, s: ("remote", p) if db.get_session(s) else None,
++                    delivered_keys=lambda g, p, s, keys: db.kanban_notice_keys_delivered(s, keys))
++        yield conn, db, tid, key, args
++
++
++def receipt(db, key):
++    return db.record_kanban_notice(CHAT, "result", {"notice_id": key, "kanban_event_keys": [key]})
++
++
++def test_receipt_retires_only_phantom_without_redelivery(world):
++    conn, db, tid, key, args = world
++    assert _unseen_on(conn) == {CHAT: 1}
++    assert reconcile_refused_sub(conn, **args) == "missing_receipt"
++    first, inserted = receipt(db, key)
++    assert inserted
++    assert reconcile_refused_sub(conn, **args) == "reconciled"
++    assert _unseen_on(conn) == {}
++    assert reconcile_refused_sub(conn, **args) == "absent"
++    assert receipt(db, key) == (first, False)
++    assert len(db.get_messages(CHAT)) == 1
++    assert [(r["platform"], r["chat_id"]) for r in notify.list_notify_subs(conn, tid)] == [("hub", f"remote/default/{CHAT}")]
++
++
++def _fail(*_a):
++    raise OSError("offline")
++
++
++_CASES = {
++    "local": ("local_owner", {"local_session_exists": lambda p, s: True}),
++    "unknown": ("unknown_owner", {"owner": lambda p, s: None}),
++    "unreadable": ("evidence_unavailable", {"delivered_keys": _fail}),
++    "owner_unreadable": ("evidence_unavailable", {"owner": _fail}),
++    "wrong_profile": ("unknown_owner", {"owner": lambda p, s: ("remote", "other")}),
++    "no_receipt": ("missing_receipt", {}),
++}
++
++
++@pytest.mark.parametrize("case", sorted(_CASES))
++def test_unknown_or_undelivered_remains_unseen_and_retryable(world, case):
++    conn, db, _tid, _key, args = world
++    expected, overrides = _CASES[case]
++    args.update(overrides)
++    assert reconcile_refused_sub(conn, **args) == expected
++    assert _unseen_on(conn) == {CHAT: 1}
++    assert db.get_messages(CHAT) == []
++
++
++def test_racing_completion_does_not_get_discarded(world):
++    conn, db, tid, key, args = world
++    receipt(db, key)
++    def raced(g, p, s, keys):
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "completed", {"summary": "another result"})
++        return db.kanban_notice_keys_delivered(s, keys)
++    args["delivered_keys"] = raced
++    assert reconcile_refused_sub(conn, **args) == "changed_retry"
++    assert _unseen_on(conn) == {CHAT: 1}
++
++
++def test_earlier_event_text_is_not_receipt(world):
++    conn, db, _tid, key, args = world
++    receipt(db, key + "-earlier")
++    assert reconcile_refused_sub(conn, **args) == "missing_receipt"
++    assert _unseen_on(conn) == {CHAT: 1}
++
++
++def test_receipt_in_compacted_ancestor_counts_once(world):
++    """The origin compressed the chat after the notice landed: the receipt lives on the compacted parent,
++    the owner reads it through lineage from the tip, and a re-delivery attempt still dedupes."""
++    conn, db, _tid, key, args = world
++    first, inserted = receipt(db, key)
++    assert inserted
++    db.end_session(CHAT, "compression")
++    db.create_session("s_tip", "desktop", parent_session_id=CHAT)
++    args["delivered_keys"] = lambda g, p, s, keys: db.kanban_notice_keys_delivered("s_tip", keys)
++    assert reconcile_refused_sub(conn, **args) == "reconciled"
++    assert _unseen_on(conn) == {}
++    again, inserted = db.record_kanban_notice("s_tip", "result", {"notice_id": key, "kanban_event_keys": [key]})
++    assert (again, inserted) == (first, False)
++    notices = [m for sid in (CHAT, "s_tip") for m in db.get_messages(sid)]
++    assert len(notices) == 1
++
++
++def test_drained_row_is_left_alone(world):
++    conn, db, tid, key, args = world
++    receipt(db, key)
++    eid = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++    with kb.write_txn(conn):
++        conn.execute("UPDATE kanban_notify_subs SET last_event_id=? WHERE task_id=? AND platform='tui'", (eid, tid))
++    assert reconcile_refused_sub(conn, **args) == "nothing_pending"
++    assert len(notify.list_notify_subs(conn, tid, platform="tui")) == 1
++
++
++def test_genuine_local_row_is_not_reconciled_and_stays_unseen(world):
++    """A refused send into a chat on THIS gateway is real local work: never retired, still counted."""
++    conn, db, _tid, key, args = world
++    receipt(db, key)
++    args["local_session_exists"] = lambda p, s: True
++    assert reconcile_refused_sub(conn, **args) == "local_owner"
++    assert _unseen_on(conn) == {CHAT: 1}
++
++
++def test_missing_hub_route_keeps_row(world):
++    conn, db, tid, key, args = world
++    receipt(db, key)
++    notify.remove_notify_sub(conn, task_id=tid, platform="hub", chat_id=f"remote/default/{CHAT}")
++    assert reconcile_refused_sub(conn, **args) == "missing_remote_route"
++    assert _unseen_on(conn) == {CHAT: 1}
++
++
++def test_row_without_refusal_provenance_is_untouched(world):
++    conn, db, tid, key, args = world
++    receipt(db, key)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE kanban_notify_subs SET delivery_metadata=NULL WHERE task_id=? AND platform='tui'", (tid,))
++    assert reconcile_refused_sub(conn, **args) == "provenance_mismatch"
++    assert _unseen_on(conn) == {CHAT: 1}
+-- 
+2.55.0
+

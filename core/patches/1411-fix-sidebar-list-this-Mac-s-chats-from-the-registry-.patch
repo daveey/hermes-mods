@@ -1,0 +1,242 @@
+From d86463b05cdc253a96c8eeba9c99fe796e3bac3f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 22:41:35 -0700
+Subject: [PATCH] fix(sidebar): list this Mac's chats from the registry primary
+ while the window is on another gateway [daveey]
+
+withPrimaryRecents compared the window's request connection with
+primaryGatewayConnectionId(), which names the window's own primary SOCKET.
+Switching the window to the hub re-homes that socket, so both named the hub,
+no local recents were fetched, and every local row fell out of $sessions.
+Pinned local rows survived only through the keep set as frozen copies: their
+kanban_* stamps refreshed (refreshRetainedKanban) but turn_live, message_count
+and outcome did not. A stale turn_live from an ended turn kept the parked chat
+20261026_170127_f07c32 painting "working" instead of its stored grey waiting
+outcome (session status audit 2026-10-30 22:25 PDT; renderer row turn_live:true
++ 68 msgs vs backend no lease + 53 msgs; $sessions held 50 hub rows + 2 pinned
+local rows, no other local row).
+
+ownRecentsConnection() now resolves "this Mac" as the registry primary (the
+window's primary socket only without a registry) and reads a local-kind target
+passively, so a remote-only client never spawns a local serve for it.
+---
+ apps/desktop/src/api/sessions.ts              |  3 +
+ .../app/session/hooks/primary-recents.test.ts | 21 +++++-
+ .../src/app/session/hooks/primary-recents.ts  | 18 +++++
+ .../hooks/use-session-list-actions.test.tsx   | 68 +++++++++++++++++++
+ .../session/hooks/use-session-list-actions.ts |  9 +--
+ 5 files changed, 114 insertions(+), 5 deletions(-)
+
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index 1c0ac0a96cc..b1520661847 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -230,6 +230,8 @@ export interface SidebarSessionsRequest {
+   messagingExclude: string[]
+   /** [daveey] Ask this connection instead of the window's (the primary's own recents while the window is remote). */
+   connectionId?: string
++  /** [daveey] Never spawn the target backend for this read (this device's list while the window is remote). */
++  passive?: boolean
+ }
+ 
+ // The batched /sidebar endpoint shipped later than the per-slice route, so a
+@@ -336,6 +338,7 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
+   try {
+     result = await hermesApi<SidebarSessionsResponse>({
+       ...(req.connectionId ? { connectionId: req.connectionId } : profileScoped()),
++      ...(req.passive ? { passive: true } : {}),
+       path: `/api/profiles/sessions/sidebar?${params.toString()}`,
+       timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
+     })
+diff --git a/apps/desktop/src/app/session/hooks/primary-recents.test.ts b/apps/desktop/src/app/session/hooks/primary-recents.test.ts
+index b7d4f14cafb..254576babb1 100644
+--- a/apps/desktop/src/app/session/hooks/primary-recents.test.ts
++++ b/apps/desktop/src/app/session/hooks/primary-recents.test.ts
+@@ -1,8 +1,9 @@
+ import { describe, expect, it, vi } from 'vitest'
+ 
++import type { DesktopConnectionsRegistry } from '@/global'
+ import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+ 
+-import { mergePrimaryRecents, withPrimaryRecents } from './primary-recents'
++import { mergePrimaryRecents, ownRecentsConnection, withPrimaryRecents } from './primary-recents'
+ 
+ const row = (id: string, over: Partial<SessionInfo> = {}): SessionInfo =>
+   ({ id, message_count: 3, profile: 'default', title: id, ...over }) as SessionInfo
+@@ -62,3 +63,21 @@ describe('withPrimaryRecents', () => {
+     ])
+   })
+ })
++
++describe('ownRecentsConnection', () => {
++  const registry = (primary: string, kind: 'local' | 'ssh'): DesktopConnectionsRegistry =>
++    ({ connections: [{ id: primary, kind, label: primary }], primary, version: 1 }) as DesktopConnectionsRegistry
++
++  it('names the registry primary, not the window primary socket that moved to the hub', () => {
++    expect(ownRecentsConnection(registry('local', 'local'), 'hermes-hub')).toEqual({ connectionId: 'local', passive: true })
++  })
++
++  it('reads a remote registry primary actively', () => {
++    expect(ownRecentsConnection(registry('mini', 'ssh'), 'hermes-hub')).toEqual({ connectionId: 'mini', passive: false })
++  })
++
++  it('falls back to the window primary without a registry (legacy topology)', () => {
++    expect(ownRecentsConnection(null, 'local')).toEqual({ connectionId: 'local', passive: true })
++    expect(ownRecentsConnection(null, 'hermes-hub')).toEqual({ connectionId: 'hermes-hub', passive: false })
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/primary-recents.ts b/apps/desktop/src/app/session/hooks/primary-recents.ts
+index 453f99aaa64..12778d50e2d 100644
+--- a/apps/desktop/src/app/session/hooks/primary-recents.ts
++++ b/apps/desktop/src/app/session/hooks/primary-recents.ts
+@@ -1,5 +1,23 @@
++import type { DesktopConnectionsRegistry } from '@/global'
+ import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+ 
++/**
++ * [daveey] Which connection holds "this Mac's own chats": the registry primary, falling back to the window's primary
++ * socket only without a registry. Switching the window to another gateway re-homes its primary SOCKET there, so
++ * `primaryGatewayConnectionId()` then names that gateway too: it matched the window's connection, no local row was
++ * listed, and pinned local rows lived on as frozen keep-set copies (a stale `turn_live` blanked a parked chat's
++ * grey waiting stripe). A local-kind target is read passively: an absent local backend is no reason to spawn one.
++ */
++export function ownRecentsConnection(
++  registry: DesktopConnectionsRegistry | null | undefined,
++  windowPrimary: string
++): { connectionId: string; passive: boolean } {
++  const connectionId = registry?.primary?.trim() || windowPrimary
++  const kind = registry?.connections?.find(entry => entry.id === connectionId)?.kind
++
++  return { connectionId, passive: kind === 'local' || (!kind && connectionId === 'local') }
++}
++
+ /**
+  * [daveey] The sidebar list follows the window's connection. While the window is on another gateway (the hub), that
+  * list carries none of this Mac's own chats, so `mergeOfflineFallback` kept painting them from the cold-start boot
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+index 8f2408c209c..e910200b212 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+@@ -3,9 +3,12 @@ import { act, cleanup, render, renderHook } from '@testing-library/react'
+ import { Suspense } from 'react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
++import type { DesktopConnectionsRegistry } from '@/global'
+ import { type SessionInfo, setApiRequestConnection, type SidebarSessionsResponse } from '@/hermes'
+ import hubSyncPlugin from '@/plugins/hub-sync/plugin'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $cronJobs, setCronJobs } from '@/store/cron'
++import { setPrimaryGatewayConnectionId } from '@/store/gateway'
+ import {
+   beginGatewaySwitch,
+   endGatewaySwitch,
+@@ -240,6 +243,71 @@ describe("this Mac's own chats while the window is on another gateway", () => {
+     expect(painted[0].offline_synced_at).toBeUndefined()
+   })
+ 
++  // [daveey] Switching the window to the hub re-homes its primary SOCKET there, so primaryGatewayConnectionId()
++  // named the hub, the window and "primary" matched and no local row was listed. Pinned local rows then survived
++  // only through the keep set as frozen copies (a stale `turn_live` from an ended turn kept a parked chat from
++  // painting its grey waiting stripe; audit 2026-10-30, 20261026_170127_f07c32). This Mac is the registry primary.
++  it("lists the registry primary's recents when the window's primary socket moved to the hub", async () => {
++    setApiRequestConnection('hermes-hub')
++    setPrimaryGatewayConnectionId('hermes-hub', 'remote')
++    $connectionsRegistry.set({
++      connections: [
++        { id: 'local', kind: 'local', label: 'This device' },
++        { id: 'hermes-hub', kind: 'ssh', label: 'Hub' }
++      ],
++      primary: 'local',
++      version: 1
++    } as DesktopConnectionsRegistry)
++    listSidebarSessions.mockImplementation((req: { connectionId?: string }) =>
++      Promise.resolve(
++        req.connectionId === 'local'
++          ? sidebar({ sessions: [row('parked-chat', { pinned: true })] })
++          : sidebar({ sessions: [row('h1', { connection_id: 'hermes-hub' })] })
++      )
++    )
++    $sessions.set([row('parked-chat', { connection_id: 'local', pinned: true, turn_live: true })])
++    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++
++    try {
++      await act(async () => {
++        await result.current.refreshSessions()
++      })
++
++      expect(listSidebarSessions).toHaveBeenCalledTimes(2)
++      // This device is observational here: an absent local backend is no reason to spawn one.
++      expect(listSidebarSessions.mock.calls[1][0]).toMatchObject({ connectionId: 'local', passive: true })
++      const parked = $sessions.get().find(s => s.id === 'parked-chat')
++      expect(parked).toMatchObject({ connection_id: 'local' })
++      expect(parked?.turn_live).toBeUndefined()
++    } finally {
++      setPrimaryGatewayConnectionId(null)
++      $connectionsRegistry.set(null)
++    }
++  })
++
++  it('asks once when the registry primary is the window connection', async () => {
++    setApiRequestConnection('hermes-hub')
++    setPrimaryGatewayConnectionId('hermes-hub', 'remote')
++    $connectionsRegistry.set({
++      connections: [{ id: 'hermes-hub', kind: 'ssh', label: 'Hub' }],
++      primary: 'hermes-hub',
++      version: 1
++    } as DesktopConnectionsRegistry)
++    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('h1', { connection_id: 'hermes-hub' })] }))
++    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++
++    try {
++      await act(async () => {
++        await result.current.refreshSessions()
++      })
++
++      expect(listSidebarSessions).toHaveBeenCalledTimes(1)
++    } finally {
++      setPrimaryGatewayConnectionId(null)
++      $connectionsRegistry.set(null)
++    }
++  })
++
+   it('keeps the hub page when the primary list fails', async () => {
+     setApiRequestConnection('hermes-hub')
+     listSidebarSessions.mockImplementation((req: { connectionId?: string }) =>
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+index ea8e3d34e74..afb43c0cbf5 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+@@ -9,6 +9,7 @@ import {
+   SIDEBAR_EXCLUDED_SOURCES
+ } from '@/lib/session-source'
+ import { markSidebarLive } from '@/store/boot-snapshot'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { gatewayActivationEpoch, pinnedPrimaryGatewayConnectionId, primaryGatewayConnectionId } from '@/store/gateway'
+ import {
+   $pinnedSessionIds,
+@@ -61,7 +62,7 @@ import { $sessionTiles, $workingSessionIds, getRecentlySettledSessionIds } from
+ 
+ import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'
+ 
+-import { withPrimaryRecents } from './primary-recents'
++import { ownRecentsConnection, withPrimaryRecents } from './primary-recents'
+ import { refreshRetainedKanban, withKanbanEvidence } from './refresh-retained-kanban'
+ 
+ /** [daveey] Backoff for re-listing while a failed list leaves owners stale (last value repeats). */
+@@ -407,10 +408,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+ 
+         // [daveey] A window on another gateway still lists this Mac's own chats live (see primary-recents.ts).
+         const fetchPage = () => {
+-          const primary = primaryGatewayConnectionId()
++          const own = ownRecentsConnection($connectionsRegistry.get(), primaryGatewayConnectionId())
+ 
+-          return withPrimaryRecents(listSidebarSessions(pageRequest), requestConnection, primary, () =>
+-            listSidebarSessions({ ...pageRequest, connectionId: primary })
++          return withPrimaryRecents(listSidebarSessions(pageRequest), requestConnection, own.connectionId, () =>
++            listSidebarSessions({ ...pageRequest, connectionId: own.connectionId, passive: own.passive })
+           )
+         }
+ 
+-- 
+2.55.0
+

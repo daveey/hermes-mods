@@ -1,6 +1,6 @@
 # websockets keepalive drops Hermes already handles log one INFO line
 
-Patch: 0622 (daveey/hermes `52ea3523cd`).
+Patches: 0622 (daveey/hermes `52ea3523cd`), 1415 (`160518392aa`, handshake-timeout race).
 
 ## Why
 
@@ -28,6 +28,20 @@ Recurrence: same class as the Oct 14 fix for Desktop socket keepalive noise (tui
   daveey/hermes 687f63c0e9), fixed one site at a time. This fix covers every site and gates new ones.
 ```
 
+## Why (1415: handshake timeout race)
+
+```
+Problem: errors.log on the MacBook 2026-10-30 17:10 PT (load 45-63): "ERROR websockets.client: unexpected internal
+  error" with EOFError("stream ended"), twice, while Kanban board feed sockets timed out mid-handshake and reconnected.
+Why 1: connect() hit open_timeout under load and closed the stream while the library's reader thread was still
+  delivering the handshake response into it; the thread's EOFError is logged by the library as an internal error.
+Why 2: the callers already handle it (TimeoutError, reconnect); the ERROR is library noise from a race.
+Why 3: ws_logger demoted only the one message "keepalive ping failed" (0622), so this message kept ERROR.
+Root (happened): a one-message allow list; the next library message of the same class needed another fix.
+Root (not caught): no test drove a handshake timeout against a slow response.
+Recurrence: agent-ac35b4d534 (0622); this defect is agent-93fde87ded.
+```
+
 ## Behavior
 
 - A websockets connection whose peer stops answering keepalive pings logs, instead of
@@ -35,16 +49,26 @@ Recurrence: same class as the Oct 14 fix for Desktop socket keepalive noise (tui
   `keepalive ping failed (ConnectionClosedError: ...); the connection is closed and the caller handles it`.
   `hermes_logging` pins `websockets` at WARNING, so in practice this line is dropped and only the caller's own
   line (e.g. FeedWatcher's INFO "feed socket closed ... reconnecting") records the drop.
-- Every other websockets record (parser failures, "unexpected internal error", server handler errors) keeps
-  its level and traceback.
+- A connect() that gives up on `open_timeout` while the library's reader thread is still feeding the handshake
+  response into the already-closed stream makes websockets log `ERROR unexpected internal error` with
+  `EOFError("stream ended")` (library race, reproduced on websockets 15.0.1 and 17.4 with no Hermes code). Since
+  1415 that record is one INFO line on the same logger (cause included, no traceback); `connect()` still raises
+  `TimeoutError` to the caller, which reconnects.
+- Every other websockets record (parser failures, server handler errors) keeps its level and traceback. So does
+  any other exception under "unexpected internal error": a `ValueError`, or an `EOFError` with a different
+  message, stays ERROR with `exc_info`.
 - A real socket failure still closes the connection, raises in the caller, and is handled as before.
 
 ## How it works
 
 `hermes_cli/ws_logging.py`: `ws_logger(side="client")` returns a `logging.LoggerAdapter` around
 `logging.getLogger(f"websockets.{side}")` (so existing level/handler config still applies; websockets accepts
-any LoggerLike). Its `log()` rewrites only `level >= ERROR` records whose message is exactly
-`"keepalive ping failed"`: drops `exc_info`, logs INFO with the active exception's type and text.
+any LoggerLike). Its `log()` rewrites only `level >= ERROR` records whose message is a key of `_HANDLED` and whose active
+exception satisfies that key's predicate: drops `exc_info`, logs INFO with the exception's type and text.
+`_HANDLED` is a dict message -> exception predicate (1415 changed it from a message set):
+`"keepalive ping failed"`: any exception; `"unexpected internal error"`:
+`type(exc) is EOFError and exc.args == ("stream ended",)` (exact type and message, so subclasses and other
+EOFErrors are not swallowed).
 
 Every production `websockets` `connect()`/`serve()` passes `logger=ws_logger()` (`ws_logger("server")` for
 `serve`). `gateway/platforms/yuanbao.py` dials with `ping_interval=None` (no keepalive thread, so no such
@@ -75,6 +99,10 @@ connect = None`). The ratchet blocks new findings; existing ones are grandfather
   and traceback; WARNING/DEBUG pass through; the library logger's level still filters.
 - `tests/scripts/test_code_health_ws_rule.py`: HX015 shapes (sync/async/legacy, aliases, splat without logger,
   optional-import fallback, serve) and scope (production yes, tests/evals no).
+- `tests/hermes_cli/test_ws_logging.py::test_handshake_timeout_racing_the_response_logs_no_error` (1415): real local
+  server, client socket reads stalled 0.5 s, `open_timeout=0.2`; asserts `TimeoutError` and zero ERROR records.
+  Red on `3ee37f99fb5` with the production traceback, green after. A sibling test pins `ValueError` and
+  `EOFError` with other messages at ERROR with `exc_info`.
 - Existing suites of every touched module passed (579 tests across 27 files, incl. buzz, simplex, relay transport,
   google_meet, browser CDP/supervisor, STT/TTS streaming, tui_gateway).
 - Untested: the asyncio and legacy keepalive paths are covered only by the shared adapter test, not by a live
@@ -83,12 +111,15 @@ connect = None`). The ratchet blocks new findings; existing ones are grandfather
 ## Applying
 
 Applies after 0610 (which adds HX014 to the same rule table). New module + one-keyword edits per call site.
+1415 edits `hermes_cli/ws_logging.py` and its test; apply after 0622.
 
 ## Gotchas
 
 - `hermes_logging` pins `websockets` at WARNING, so the demoted INFO line is normally invisible; the caller's own
   log line is the record of the drop. Tests that need to see it must lower `websockets.client` themselves.
 - yuanbao stays a grandfathered HX015 finding (no keepalive); touching its connect call means adding `logger=`.
+- 1415 only recognises the exact `EOFError("stream ended")`; a new library wording of the same race would show as ERROR
+  again until `_HANDLED` is extended.
 - Does not address why the Board server drops all feed sockets together several times a day.
 
 ## Plugin?

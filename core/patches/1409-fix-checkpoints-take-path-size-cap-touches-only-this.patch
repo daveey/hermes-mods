@@ -1,0 +1,258 @@
+From 543784761bdadaaf2b82ece7321df3ae71f2a1ef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:11:31 +0000
+Subject: [PATCH] fix(checkpoints): take-path size cap touches only this
+ project, once per pending gc [daveey]
+
+A checkpoint over checkpoints.max_total_size_mb ran drop_one_round: for-each-ref
+plus one rev-list (and a rewrite) per project ref inside the tool call, on every
+take, because the gc that would shrink the store is deferred to the periodic
+prune. On a laptop with auto_prune off (no prune ever ran) the 15 GB store never
+shrank, every take walked 779 refs (one rev-list hit the 30 s timeout under
+load), and 778 of 779 projects were flattened to a single snapshot.
+
+- drop_oldest_once(ref, cap): drop the oldest snapshot of the current project
+  only, and not while .gc-pending marks an earlier drop the gc has not reclaimed
+  (the size cannot move until then). Store-wide round-robin stays in enforce_size.
+- trim(): bounded rev-list --max-count probe before reading the full history.
+- .gc-pending keeps the mtime of the first deferral; a marker older than 48 h
+  logs one WARNING per process naming the store and `hermes checkpoints prune`.
+
+Tests (test_checkpoint_size_cap.py), all three fail on the base: an over-cap take
+never reads another project's ref; a second over-cap take before the prune drops
+nothing; a days-old pending gc is reported once.
+---
+ tests/tools/test_checkpoint_size_cap.py | 87 +++++++++++++++++++++++++
+ tools/checkpoint_manager.py             |  8 ++-
+ tools/checkpoint_pruning.py             | 65 +++++++++++++-----
+ 3 files changed, 142 insertions(+), 18 deletions(-)
+
+diff --git a/tests/tools/test_checkpoint_size_cap.py b/tests/tools/test_checkpoint_size_cap.py
+index f81c4225690..94a65674a40 100644
+--- a/tests/tools/test_checkpoint_size_cap.py
++++ b/tests/tools/test_checkpoint_size_cap.py
+@@ -1,6 +1,7 @@
+ """Real history retention and failure propagation at the public pruning callers."""
+ from __future__ import annotations
+ 
++import contextlib
+ import os
+ 
+ import pytest
+@@ -74,6 +75,92 @@ def test_snapshot_over_cap_drops_one_round_and_leaves_the_gc_to_the_prune(histor
+     assert (project / "small.txt").read_text(encoding="utf-8") == "4"
+ 
+ 
++@contextlib.contextmanager
++def _recording_git():
++    calls = []
++    original = checkpoints._run_git
++
++    def record(args, *rest, **kwargs):
++        calls.append(list(args))
++        return original(args, *rest, **kwargs)
++
++    with pytest.MonkeyPatch.context() as patcher:
++        patcher.setattr(checkpoints, "_run_git", record)
++        yield calls
++
++
++def test_snapshot_over_cap_never_reads_or_rewrites_another_projects_history(history):
++    """A take over the cap costs O(1) Git calls: it never walks every project's ref. A store with
++    hundreds of projects ran one ``rev-list`` per ref inside the tool call (30 s timeouts on a loaded
++    laptop) and, turn after turn, flattened every project to a single snapshot."""
++    _, first, manager = history
++    other = next(first.parent / name for name in ("project-a", "project-b") if first.name != name)
++    other.mkdir()
++    for index in range(3):
++        (other / "small.txt").write_text(str(index), encoding="utf-8")
++        manager.new_turn()
++        assert manager.ensure_checkpoint(str(other), f"other-{index}")
++    before = manager.list_checkpoints(str(other))
++    other_ref = checkpoints._ref_name(checkpoints._project_hash(str(other)))
++
++    manager.max_total_size_mb = 1
++    (first / "new.txt").write_text("new snapshot", encoding="utf-8")
++    manager.new_turn()
++    with _recording_git() as calls:
++        assert manager.ensure_checkpoint(str(first), "newest")
++
++    assert not [c for c in calls if c[0] == "for-each-ref"], calls
++    assert not [c for c in calls if other_ref in c], calls
++    assert manager.list_checkpoints(str(other)) == before
++
++
++def test_snapshot_does_not_drop_again_while_the_last_drop_awaits_its_gc(history):
++    """Until a gc reclaims the last drop the store size cannot move, so a second over-cap take
++    must not drop another snapshot: re-measuring an unchanged store every turn erased history."""
++    _, project, manager = history
++    manager.max_total_size_mb = 1
++    for index in range(3):
++        (project / "new.txt").write_text(f"new {index}", encoding="utf-8")
++        manager.new_turn()
++        assert manager.ensure_checkpoint(str(project), f"newest-{index}")
++    reasons = [row["reason"] for row in manager.list_checkpoints(str(project))]
++    # One drop (the large oldest) for the whole gc cycle; every later snapshot is kept.
++    assert reasons == [f"newest-{i}" for i in reversed(range(3))] + [f"small-{i}" for i in reversed(range(5))]
++
++    (project / "new.txt").write_text("again", encoding="utf-8")
++    manager.new_turn()
++    with _recording_git() as calls:
++        assert manager.ensure_checkpoint(str(project), "again")
++    assert not [c for c in calls if c[0] == "for-each-ref"], calls
++    # Only the bounded count probe of this project's own ref; no full history walk.
++    assert all(any(a.startswith("--max-count=") for a in c) for c in calls if c[0] == "rev-list"), calls
++    assert len([c for c in calls if c[0] == "update-ref"]) == 1  # the new snapshot only
++    assert len(manager.list_checkpoints(str(project))) == 9
++
++
++def test_gc_pending_for_days_is_reported_once(history, caplog):
++    """A store whose deferred gc never runs (checkpoints.auto_prune off) says so, once per process."""
++    import logging
++    import time as _time
++    from tools.checkpoint_pruning import GC_PENDING_NAME, GC_STALE_REPORTED
++
++    base, project, manager = history
++    store = checkpoints._store_path(base)
++    marker = store / GC_PENDING_NAME
++    marker.touch()
++    old = _time.time() - 3 * 86400
++    os.utime(marker, (old, old))
++    GC_STALE_REPORTED.clear()
++    caplog.set_level(logging.WARNING, logger="tools.checkpoint_manager")
++    for index in range(2):
++        (project / "new.txt").write_text(f"n{index}", encoding="utf-8")
++        manager.new_turn()
++        assert manager.ensure_checkpoint(str(project), f"n{index}")
++    hits = [r for r in caplog.records if "hermes checkpoints prune" in r.getMessage()]
++    assert len(hits) == 1, [r.getMessage() for r in caplog.records]
++    assert str(store) in hits[0].getMessage()
++
++
+ def test_reclaim_stops_before_touching_another_projects_history(history):
+     base, first, manager = history
+     # Real ref sorting chooses the first victim. Pick the other project so
+diff --git a/tools/checkpoint_manager.py b/tools/checkpoint_manager.py
+index fa761f6256c..5a09f4647ba 100644
+--- a/tools/checkpoint_manager.py
++++ b/tools/checkpoint_manager.py
+@@ -1953,11 +1953,13 @@ class CheckpointManager:
+         pruner = Pruner(_run_git, store, working_dir, _GIT_TIMEOUT, _dir_size_bytes, _REFS_PREFIX)
+         try:
+             pruner.trim(ref, self.max_snapshots)
+-            if pruner.drop_one_round(self.max_total_size_mb * 1024 * 1024):
+-                logger.info("Checkpoint store exceeded %d MB — dropped the oldest snapshot per project; "
+-                            "space is reclaimed by the next prune", self.max_total_size_mb)
++            if pruner.drop_oldest_once(ref, self.max_total_size_mb * 1024 * 1024):
++                logger.info("Checkpoint store exceeded %d MB — dropped the oldest snapshot of %s; "
++                            "space is reclaimed by the next prune", self.max_total_size_mb, working_dir)
+         except (PruneError, OSError) as exc:
+             logger.warning("Checkpoint pruning stopped: %s", exc)
++        if notice := pruner.stale_gc_notice():
++            logger.warning(notice)
+ 
+ 
+ def format_checkpoint_list(checkpoints: list[dict], directory: str) -> str:
+diff --git a/tools/checkpoint_pruning.py b/tools/checkpoint_pruning.py
+index 889e4bf0d8a..55fb74b7928 100644
+--- a/tools/checkpoint_pruning.py
++++ b/tools/checkpoint_pruning.py
+@@ -13,6 +13,8 @@ class PruneError(RuntimeError):
+ 
+ 
+ GC_PENDING_NAME = ".gc-pending"
++GC_STALE_AFTER_S = 48 * 3600
++GC_STALE_REPORTED: set[str] = set()  # stores already warned about, once per process
+ 
+ 
+ def store_lock_path(base: Path) -> Path:
+@@ -67,12 +69,39 @@ class Pruner:
+     def gc_pending(self) -> bool:
+         return (self.store / GC_PENDING_NAME).exists()
+ 
++    def gc_pending_age(self) -> float | None:
++        """Seconds since a take-path rewrite first deferred its gc, or None when none is pending."""
++        import time
++
++        try:
++            return max(0.0, time.time() - (self.store / GC_PENDING_NAME).stat().st_mtime)
++        except OSError:
++            return None
++
++    def stale_gc_notice(self) -> str | None:
++        """One warning per store per process when the deferred gc has waited past two default
++        prune intervals: only the periodic prune reclaims, so it is not running (auto_prune off),
++        the store keeps its size and, over the cap, no further snapshot is dropped until it does."""
++        age = self.gc_pending_age()
++        if age is None or age <= GC_STALE_AFTER_S or str(self.store) in GC_STALE_REPORTED:
++            return None
++        GC_STALE_REPORTED.add(str(self.store))
++        return (f"Checkpoint store {self.store} has waited {age / 3600:.0f} h for a gc that only the "
++                "periodic prune runs (is checkpoints.auto_prune off?); run `hermes checkpoints prune` "
++                "to reclaim it")
++
+     def _mark_gc_pending(self) -> None:
++        # O_CREAT without utime: the mtime keeps the FIRST deferral, so its age says how long the
++        # store has waited for a reclaim (touch() would reset it on every rewrite).
+         try:
+-            (self.store / GC_PENDING_NAME).touch()
++            os.close(os.open(self.store / GC_PENDING_NAME, os.O_CREAT | os.O_WRONLY, 0o644))
+         except OSError:
+             pass
+ 
++    def _count_at_most(self, ref: str, limit: int) -> int:
++        """Commits on ``ref``, counted only up to ``limit``: bounded whatever the history length."""
++        return len(self._git(["rev-list", f"--max-count={max(1, limit)}", ref]).splitlines())
++
+     def _commits(self, ref: str) -> list[str]:
+         commits = self._git(["rev-list", "--reverse", ref]).splitlines()
+         if not commits:
+@@ -103,25 +132,31 @@ class Pruner:
+             self._mark_gc_pending()
+ 
+     def trim(self, ref: str, keep_count: int) -> None:
+-        """Snapshot-count budget on the checkpoint-take path: rewrites the ref, defers the gc."""
+-        commits = self._commits(ref)
++        """Snapshot-count budget on the checkpoint-take path: rewrites the ref, defers the gc.
++        A bounded probe first, so a ref within budget costs one short ``rev-list``."""
+         keep_count = max(1, keep_count)
++        if self._count_at_most(ref, keep_count + 1) <= keep_count:
++            return
++        commits = self._commits(ref)
+         if len(commits) > keep_count:
+             self._rewrite(ref, commits, commits[-keep_count:], gc=False)
+ 
+-    def drop_one_round(self, cap_bytes: int) -> bool:
+-        """Over the cap on the take path: drop the oldest snapshot of every project once and
+-        defer the gc. One round per checkpoint converges over turns; the full loop measured
+-        against an unchanging pack once flattened every project to a single snapshot."""
+-        if cap_bytes <= 0 or self.dir_size(self.store) <= cap_bytes:
++    def drop_oldest_once(self, ref: str, cap_bytes: int) -> bool:
++        """Over the cap on the take path: drop the oldest snapshot of THIS project only, and only
++        when no earlier drop still awaits its gc. Until the periodic prune reclaims, the store's
++        size cannot move, so re-measuring it every turn and dropping again only erased history
++        (a laptop store ended with 778 of 779 projects at one snapshot and still 14 GB), and a
++        round over every project's ref ran one ``rev-list`` per project inside the tool call.
++        Store-wide round-robin with a gc per round stays in ``enforce_size``."""
++        if cap_bytes <= 0 or self.gc_pending():
+             return False
+-        changed = False
+-        for ref in self._git(["for-each-ref", "--format=%(refname)", self.refs_prefix]).splitlines():
+-            commits = self._commits(ref)
+-            if len(commits) > 1:
+-                self._rewrite(ref, commits, commits[1:], gc=False)
+-                changed = True
+-        return changed
++        if self._count_at_most(ref, 2) < 2 or self.dir_size(self.store) <= cap_bytes:
++            return False
++        commits = self._commits(ref)
++        if len(commits) < 2:
++            return False
++        self._rewrite(ref, commits, commits[1:], gc=False)
++        return True
+ 
+     def enforce_size(self, cap_bytes: int) -> bool:
+         """Periodic prune: gc per round (the measurement only moves after a repack) until the
+-- 
+2.55.0
+

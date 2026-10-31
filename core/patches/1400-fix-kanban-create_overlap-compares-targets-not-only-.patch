@@ -1,0 +1,613 @@
+From f5a83d2f11d5389a94bc61d8e210532ed7100dc8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 00:01:36 +0000
+Subject: [PATCH] fix(kanban): create_overlap compares targets, not only title
+ words [daveey]
+
+Overlap audit t_01a189c70884fa59 (MacBook + mini, 24 h) and its hub leg
+(t_01a189b2d186a986): 12 of 16 refusal groups (108 attempts) were false.
+Every logged why was "titles share N words (...)" on boilerplate while
+the cards named different targets.
+
+Problem: kanban_create refused e.g. "daveey-mini: gateway 45464 may run
+stale hermes-mods plugins" against MacBook "David-MBP: gateway 81967 ..."
+(7 retries), "BB-1155 ... mini ... disk" against "BB-1197, BB-1202,
+BB-1205 ... metta3 ... disk" (85 retries), the mini probe leg against
+the MacBook leg, "daveey/hermes-mods" red CI against "daveey/hermes"
+green CI, and a waiter against the producer it parks on.
+Why 1: _reasons matches on shared title words (>=3, >=50%) alone.
+  Evidence: logged why lines name only the shared words.
+Why 2: nothing compares which machine/process/ticket/repo each title
+  names; those tokens are what differ in every false pair.
+Root (happened): the match decision has no notion of target identity.
+Root (not caught): the regression fixtures only covered board-slug
+  references (004623277d, e4180d7535), no same-template/different-target
+  pairs and no cross-gateway pairs.
+
+Fix: distinct_target() vetoes a match when both titles name a target in
+one class and the sets are disjoint: repo (owner/repo; a title with none
+uses its body's single repo), host (MacBook/MBP/David-MBP, mini/
+daveey-mini, hermes-hub, metta<N>, ...), process (gateway|pid <n>),
+ticket (ABC-123, #123 but not run/job #n). A differing sha alone never
+vetoes (a newer revision of the same check is the same owner's work);
+it does only when one title inverts the other's check (removal vs not).
+Same target stays refused, remote-owned too: no gateway exemption.
+waits_on(): a create that parks/waits on a card or names it producer/
+parent is not its duplicate.
+
+Also: under a HERMES_KANBAN_DB pin every board slug resolves to the
+pinned file, so one card came back once per board, labelled with each
+board's slug (hub 10-30 08:04:58Z, 12:05:05Z, 7x). Read each resolved
+file once under the board that owns it; the pin itself is unchanged.
+
+Case 5 ("Fix remaining Inbox poster conformance", 10-29 17:54 PDT):
+replaying the exact create over each kanban_overlap.py revision gives
+the exact 7 matches on d0cc66e9f4..004623277d and none from e4180d7535;
+the creating session started 16:25:11 PDT, before the MacBook applied
+e4180d7535 at 16:29:43. Stale caller, already fixed in source; its
+fixture passes on base and pins that.
+
+Tests: tests/tools/test_kanban_create_overlap_url_slug.py, real titles
+and bodies from the audit evidence; 21 fail on base, all pass; true
+duplicate controls (PR181, v12 round, drain capability owner, same
+host/pid, same incident, same repo, same/newer-sha check) pass on both.
+---
+ hermes_cli/kanban_overlap.py                  | 148 +++++++-
+ .../test_kanban_create_overlap_url_slug.py    | 330 ++++++++++++++++++
+ 2 files changed, 468 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index 16c90ea129f..8e813d5b99c 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -22,7 +22,10 @@ equals a board slug does not count.
+ Never matched: closed cards (a replica's stale legacy ``<board>/<id>`` row never outvotes its qualified
+ ``<profile>/<board>/<id>`` twin), the creator's own card, the new card's parents, cards the same chat or the same
+ worker created (fan-out), the waiting card a capability-owner create quotes, and another capability-owner
+-card for that same waiting card. A missing or unreadable replica is skipped and logged, never a block.
++card for that same waiting card, a card the new one parks/waits on or names as its producer or parent, and a
++card that names a different target (:func:`distinct_target`: another repo, host, process or ticket, or an
++inverted check at another revision; a newer sha alone is not a different target). Each card counts once per
++gateway. A missing or unreadable replica is skipped and logged, never a block.
+ ``kanban.create_overlap_check: false`` turns the check off.
+ """
+ 
+@@ -30,8 +33,10 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import os
+ import re
+ import sqlite3
++from pathlib import Path
+ from typing import Callable, Iterable, Optional
+ 
+ _log = logging.getLogger(__name__)
+@@ -128,20 +133,136 @@ def _reasons(card: dict, new_words: set[str], title: str, body: str, target_boar
+     return reasons, score
+ 
+ 
+-def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
++# Target identity (overlap audit t_01a189c70884fa59). Shared title words say two cards are the same KIND of work;
++# they do not say it is the same target. 108 refusals in 24 h matched on boilerplate while each title named a
++# different machine, process or ticket: ``David-MBP: gateway 78233 may run stale hermes-mods plugins`` vs
++# ``daveey-mini: gateway 16839 may run stale hermes-mods plugins``, a mini probe leg vs its MacBook leg,
++# ``BB-1155 ... mini`` vs ``BB-1197, BB-1202, BB-1205 ... metta3``. A class only decides when BOTH titles carry it.
++_HOST_ALIASES = {
++    "macbook": "macbook", "mbp": "macbook", "david-mbp": "macbook", "test-key-gen": "macbook",
++    "mini": "mini", "daveey-mini": "mini", "mac-mini": "mini", "davids-mac-mini-1": "mini",
++    "hermes-hub": "hub",
++}
++# Bare "hub" is not a host here: it is also the BB hub (on the mini) and "for hub t_..." quotes a card.
++_HOST_PART_ALIASES = {"mbp": "macbook", "macbook": "macbook", "mini": "mini"}
++_HOST_PATTERN = re.compile(r"(?:metta|worker|gpu|bb-linux)-?\d+")
++_TASK_REF = re.compile(r"(?:\b[a-z][\w.-]*[/ ](?:[\w-]+/)?)?\bt_[0-9a-f]{8,16}\b")
++_PROCESS = re.compile(r"\b(?:gateway|pid|process|backend|serve|worker)[\s=:#]*(\d{2,})\b")
++_TICKET = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
++_ISSUE = re.compile(r"(?<!\brun )(?<!\bjob )(?<!\bbuild )(?<!\battempt )#(\d+)\b")
++_REVISION = re.compile(r"\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}\b")
++# A newer revision of the same check is the same owner's work, so a differing sha alone never makes cards
++# distinct. It does when one title inverts the other's acceptance (da19695 removes OWNER_ASK_KEYS; the
++# a2dadd6 probe expects it present).
++_REPO_OWNERS = ("daveey", "metta-ai", "nousresearch", "softmax-ai")
++_REPO = re.compile(r"(?<![\w./~@-])(?:https?://)?(?:github\.com/)?((?:" + "|".join(_REPO_OWNERS)
++                   + r")/[a-z0-9][\w.-]*?)(?=[.,;:)'`\"]*(?:\s|$)|/(?:actions|pull|issues|commit|tree|blob)\b)")
++_INVERTS = frozenset(
++    "remove removes removed removal removing revert reverts reverted drop drops dropped delete deletes deleted "
++    "deletion without disable disables disabled rollback".split())
++
++
++def target_identity(title: str, gateways: Iterable[str] = ()) -> dict[str, frozenset[str]]:
++    """The targets a title names, by class: ``host``, ``process``, ``ticket``, ``revision``."""
++    raw = title or ""
++    low = _TASK_REF.sub(" ", raw.lower())
++    hosts = set()
++    dynamic = {g.lower() for g in gateways if g and g.lower() not in {"hub", "local"}}
++    for tok in re.findall(r"[a-z0-9][a-z0-9.-]*[a-z0-9]|[a-z0-9]", low):
++        if tok in _HOST_ALIASES:
++            hosts.add(_HOST_ALIASES[tok])
++        elif tok in dynamic or _HOST_PATTERN.fullmatch(tok):
++            hosts.add(tok)
++        else:
++            hosts.update(_HOST_PART_ALIASES[p] for p in tok.split("-") if p in _HOST_PART_ALIASES)
++    tickets = set(_TICKET.findall(_TASK_REF.sub(" ", raw))) | {f"#{n}" for n in _ISSUE.findall(low)}
++    return {"host": frozenset(hosts), "process": frozenset(_PROCESS.findall(low)),
++            "ticket": frozenset(t.upper() for t in tickets), "revision": frozenset(_REVISION.findall(low))}
++
++
++def repos(text: str) -> frozenset[str]:
++    """GitHub ``owner/repo`` slugs, bare or in a URL (``daveey/hermes-mods`` is not ``daveey/hermes``)."""
++    return frozenset(_REPO.findall((text or "").lower()))
++
++
++def _repo_of(title: str, body: str) -> frozenset[str]:
++    """A card's repo: the title's slugs, else the body's when it names exactly one (the bb_bridge card
++    "Main CI red since effa0d25f: repair the hub suite on main" names me/myapp only in its body)."""
++    named = repos(title)
++    if named:
++        return named
++    in_body = repos(body)
++    return in_body if len(in_body) == 1 else frozenset()
++
++
++def waits_on(card_id: str, title: str, body: str) -> bool:
++    """The new card names ``card_id`` as what it parks or waits on, or as its producer or parent: a waiter is
++    not a duplicate of its producer (hub 10-30 14:19:41Z, overridden 4 s later)."""
++    cid = re.escape(card_id or "")
++    if not cid:
++        return False
++    pat = (rf"\b(?:park(?:s|ed|ing)?|wait(?:s|ed|ing)?|blocked|depend(?:s|ing)?)\s+on\s+(?:[\w.@-]+[ /]){{0,3}}"
++           rf"{cid}\b|\b(?:producer|parent)\b[^.\n]{{0,40}}\b{cid}\b")
++    return bool(re.search(pat, f"{title or ''}\n{body or ''}", re.IGNORECASE))
++
++
++def distinct_target(new_title: str, card_title: str, gateways: Iterable[str] = (), *, new_body: str = "",
++                    card_body: str = "") -> Optional[str]:
++    """Why two cards name different targets (a repo, a machine, a process lifetime, a ticket, an inverted
++    check at another revision), else None. Same-target pairs, and pairs where either side names no target in
++    a class, are left to the word-overlap rules."""
++    a, b = target_identity(new_title, gateways), target_identity(card_title, gateways)
++    ra, rb = _repo_of(new_title, new_body), _repo_of(card_title, card_body)
++    if ra and rb and not ra & rb:
++        return f"repo {'/'.join(sorted(ra))} != {'/'.join(sorted(rb))}"
++    for cls in ("host", "process", "ticket"):
++        if a[cls] and b[cls] and not a[cls] & b[cls]:
++            return f"{cls} {'/'.join(sorted(a[cls]))} != {'/'.join(sorted(b[cls]))}"
++    if a["revision"] and b["revision"] and not a["revision"] & b["revision"]:
++        if bool(words(new_title) & _INVERTS) != bool(words(card_title) & _INVERTS):
++            return f"revision {'/'.join(sorted(a['revision']))} inverts {'/'.join(sorted(b['revision']))}"
++    return None
++
++
++def _board_files() -> Iterable[tuple[str, Path]]:
++    """``(board, db file)`` for each board, each file once, named after the board that owns it.
++
++    Board paths resolve through ``kanban_db_path``, so a fenced worker stays on its ``HERMES_KANBAN_DB`` pin
++    (workers do not read other boards). Under that pin every slug resolves to the one pinned file: read once
++    per board, its cards came back once per board, each copy labelled with another board's slug (hub 10-30
++    08:04:58Z and 12:05:05Z: one default card listed 7 times, as default/askeve/bb/runners/...)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_boards import list_boards
++
++    def real(path: Path) -> Path:
++        try:
++            return path.resolve()
++        except OSError:
++            return path
++
++    slugs = [meta.get("slug") or kb.DEFAULT_BOARD for meta in list_boards(include_archived=False)]
++    owner = {real(kb.board_own_db_path(slug)): slug for slug in slugs}
++    pinned = os.environ.get("HERMES_KANBAN_BOARD", "").strip() or kb.DEFAULT_BOARD
++    read: set[Path] = set()
++    for slug in slugs:
++        path = kb.kanban_db_path(board=slug)
++        key = real(path)
++        if key in read:
++            continue
++        read.add(key)
++        yield owner.get(key) or (pinned if key != real(kb.board_own_db_path(slug)) else slug), path
++
++
++def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
+     from hermes_cli.kanban_session_activity import cached_ro
+     marks = ",".join("?" * len(OPEN))
+-    for meta in list_boards(include_archived=False):
+-        slug = meta.get("slug") or kb.DEFAULT_BOARD
+-        path = kb.kanban_db_path(board=slug)
++    for slug, path in _board_files():
+         if not path.exists():
+             continue
+         try:
+             with cached_ro(path) as c:
+                 rows = c.execute(
+-                    "SELECT t.id, t.title, t.status, t.session_id, (SELECT json_extract(e.payload, "
++                    "SELECT t.id, t.title, t.body, t.status, t.session_id, (SELECT json_extract(e.payload, "
+                     "'$.creator_task_id') FROM task_events e WHERE e.task_id = t.id AND e.kind = 'created' "
+                     f"LIMIT 1), t.idempotency_key FROM tasks t WHERE t.status IN ({marks})", OPEN).fetchall()
+                 try:
+@@ -155,8 +276,9 @@ def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
+         chats: dict[str, set[str]] = {}
+         for tid, sess in links:
+             chats.setdefault(tid, set()).add(sess)
+-        for tid, title, status, sess, creator, key in rows:
++        for tid, title, body, status, sess, creator, key in rows:
+             yield {"id": tid, "board": slug, "gateway": self_gw or "local", "status": status, "title": title,
++                   "body": body or "",
+                    "session_id": sess, "creator_task_id": creator, "local": True, "key_family": key_family(key),
+                    "chats": sorted(chats.get(tid, set()) | ({sess} if sess else set()))}
+ 
+@@ -196,7 +318,8 @@ def _replica_cards(self_gw: Optional[str]) -> Iterable[dict]:
+         seen.add(key)
+         sessions = [s for s in (t.get("sessions") or []) if isinstance(s, dict)]
+         yield {"id": t["id"], "board": t.get("board") or "default", "gateway": t.get("gateway") or gw,
+-               "status": t.get("status"), "title": t.get("title") or "", "local": False,
++               "status": t.get("status"), "title": t.get("title") or "", "body": t.get("body") or "",
++               "local": False,
+                "session_id": next((s.get("session") for s in sessions if s.get("rel") == "created"), None),
+                "creator_task_id": None, "key_family": None,
+                "chats": sorted({str(s["session"]) for s in sessions if s.get("session")})}
+@@ -244,7 +367,7 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+         skip = set(parents) | ({self_tid} if self_tid else set())
+         waiting = capability_owner_waiting_id(title, body)
+         new_words = words(title)
+-        out = []
++        out, seen = [], set()
+         cards = [*_local_cards(self_gw), *_replica_cards(self_gw)]
+         gateways = {g for g in (self_gw, *(c["gateway"] for c in cards)) if g}
+         if gateways & {"hub", "hermes-hub"}:
+@@ -254,8 +377,13 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+                     or (waiting and _sibling_owner(card.get("title") or "", waiting))
+                     or (session_id and card["session_id"] == session_id)
+                     or (self_tid and card["creator_task_id"] == self_tid)
+-                    or (family and card.get("key_family") == family)):
++                    or (family and card.get("key_family") == family)
++                    or (card["gateway"], card["id"]) in seen
++                    or waits_on(card["id"], title, body)
++                    or distinct_target(title, card.get("title") or "", gateways,
++                                       new_body=body, card_body=card.get("body") or "")):
+                 continue
++            seen.add((card["gateway"], card["id"]))
+             reasons, score = _reasons(card, new_words, title, body, target_board, gateways)
+             if reasons:
+                 out.append({**{k: card[k] for k in ("id", "board", "gateway", "status", "title", "chats")},
+diff --git a/tests/tools/test_kanban_create_overlap_url_slug.py b/tests/tools/test_kanban_create_overlap_url_slug.py
+index 3e8a366dde3..8c49e5c8c15 100644
+--- a/tests/tools/test_kanban_create_overlap_url_slug.py
++++ b/tests/tools/test_kanban_create_overlap_url_slug.py
+@@ -216,3 +216,333 @@ def test_a_refusal_matching_only_remote_cards_logs_which_cards(macbook_hermes, c
+     assert out.get("code") == "create_overlap", out
+     line = next(r.getMessage() for r in caplog.records if "create overlap: refused" in r.getMessage())
+     assert f"macbook/hermes/{TIMEOUTS[0]} (titles share" in line, line
++
++
++# --- Target identity: overlap audit t_01a189c70884fa59 (MacBook + mini, 10-29 16:28 to 10-30 16:30 PDT) and
++# the hub leg of t_01a189b2d186a986. Titles, ids and bodies are the real ones from the audit evidence
++# (~/.hermes/kanban/evidence/overlap-audit-t_01a189c70884fa59 on hermes-hub); every logged refusal read
++# "titles share N words (...)" while the two cards named a different machine, process, ticket or repo.
++
++def _stale_body(host: str, home: str, pid: str) -> str:
++    # hermes-sync mods_stale_gateways card body (macbook t_01a18c71f9f14e95, mini t_01a18c6600fac4b6).
++    return (f"hermes-sync on {host} detected a possibly stale gateway: home={home}, pid={pid}, "
++            "started_at=1793354546.0. Enabled public plugin commits newer than this process: [...]. Disk changes "
++            "do not reload imported modules.\n\nRecheck this exact process lifetime and enabled plugin paths first; "
++            "close as superseded if it restarted.")
++
++
++_MBP = ("David-MBP", "/Users/me/.hermes")
++_MINI = ("daveey-mini", "/Users/me/.bb-hermes")
++# (creating gateway, refused pid, named gateway, named card id, named pid, refusals in the window)
++STALE_PAIRS = [
++    ("macbook", "78233", "mini", "t_01a18c6600fac4b6", "16839", 1),
++    ("macbook", "80333", "mini", "t_01a18d648a285b10", "8782", 1),
++    ("mini", "1722", "macbook", "t_01a18c71f9f14e95", "78233", 2),
++    ("mini", "45464", "macbook", "t_01a18c9822bfac2b", "81967", 7),
++    ("mini", "38406", "macbook", "t_01a18d71a1e0761a", "80333", 1),
++    ("mini", "65326", "macbook", "t_01a18d8df5c3d471", "58702", 1),
++    ("mini", "52330", "macbook", "t_01a18e14e1d3a943", "12906", 2),
++    ("mini", "82697", "macbook", "t_01a18e598b369a6c", "47337", 5),
++]
++
++
++def _stale(gw: str, pid: str) -> tuple[str, str]:
++    host, home = _MBP if gw == "macbook" else _MINI
++    return f"{host}: gateway {pid} may run stale hermes-mods plugins", _stale_body(host, home, pid)
++
++
++def _as(monkeypatch, gw):
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: gw)
++
++
++def _remote(gw, tid, title, status="ready", board="default", body=""):
++    return (gw, f"default/{board}/{tid}",
++            {"id": tid, "board": board, "title": title, "status": status, "gateway": gw, "body": body})
++
++
++def _local(board, tid, title, status="ready", body=""):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_boards as kbb
++    from hermes_cli import kanban_db_connect as kbc
++    if board != "default" and not kb.board_exists(board):
++        kbb.create_board(board)
++    conn = kbc.connect(board=board)
++    try:
++        made = kb.create_task(conn, title=title, assignee="default", session_id="other-chat")
++        conn.execute("UPDATE tasks SET id = ?, status = ?, body = ? WHERE id = ?", (tid, status, body, made))
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def _ids(out):
++    return [m["id"] for m in out.get("matches") or []]
++
++
++@pytest.mark.parametrize(("gw", "pid", "other_gw", "other_id", "other_pid", "count"), STALE_PAIRS,
++                         ids=[f"{p[0]}-{p[1]}->{p[3]}" for p in STALE_PAIRS])
++def test_stale_gateway_card_for_another_host_is_not_a_duplicate(home, tmp_path, monkeypatch, gw, pid, other_gw,
++                                                                 other_id, other_pid, count):
++    _as(monkeypatch, gw)
++    _replica(tmp_path, [_remote(other_gw, other_id, _stale(other_gw, other_pid)[0],
++                                body=_stale(other_gw, other_pid)[1])])
++    out = _create(*_stale(gw, pid))
++    assert out.get("ok") is True, out
++
++
++@pytest.mark.parametrize(("gw", "pid", "other_gw"), [(p[0], p[1], p[2]) for p in STALE_PAIRS[:3]])
++def test_stale_gateway_card_for_the_same_process_is_still_refused_even_when_remote(home, tmp_path, monkeypatch,
++                                                                                    gw, pid, other_gw):
++    """Same host + same pid = same process lifetime. The open card lives on the other gateway: a remote owner
++    of the same target is still an owner, so gateway alone exempts nothing."""
++    _as(monkeypatch, other_gw)
++    _replica(tmp_path, [_remote(gw, "t_01a1aaaaaaaaaaaa", _stale(gw, pid)[0], body=_stale(gw, pid)[1])])
++    out = _create(*_stale(gw, pid))
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == ["t_01a1aaaaaaaaaaaa"]
++
++
++PROBE_MBP = ("t_01a18bf8331bbc3e",
++             "Probe: report hermes-mods HEAD + user-steps asks DB journal_mode on the MacBook (for t_01a18bee20c483ea)",
++             "Read-only probe for hub card t_01a18bee20c483ea (live check of hermes-mods f4dcf7a, user-steps WAL fix). "
++             "Run on THIS machine and change nothing:")
++PROBE_MINI_TITLE = ("Probe: report hermes-mods HEAD + user-steps asks DB journal_mode on the mini "
++                    "(for hub t_01a18bee20c483ea)")
++
++
++def test_probe_leg_for_another_host_is_admitted(home, tmp_path, monkeypatch):
++    _as(monkeypatch, "mini")
++    _replica(tmp_path, [_remote("macbook", *PROBE_MBP[:2], body=PROBE_MBP[2])])
++    out = _create(PROBE_MINI_TITLE, PROBE_MBP[2])
++    assert out.get("ok") is True, out
++
++
++def test_probe_leg_repeated_for_the_same_host_is_refused(home, tmp_path, monkeypatch):
++    _as(monkeypatch, "mini")
++    _replica(tmp_path, [_remote("macbook", *PROBE_MBP[:2], body=PROBE_MBP[2])])
++    out = _create(PROBE_MBP[1].replace("(for t_", "(for hub t_"), PROBE_MBP[2])
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == [PROBE_MBP[0]]
++
++
++METTA3_DISK = ("t_01a18aa41b48edfd", "BB-1197, BB-1202, BB-1205: Fleet: metta3 still critically low on disk",
++               "# BB-1197, BB-1202, BB-1205: Fleet: metta3 still critically low on disk\n\nFiled by bb_bridge (mini).")
++MINI_DISK = "BB-1155: Fleet: mini still critically low on disk after cleanup"
++
++
++def test_mini_disk_incident_is_not_the_metta3_incident(home, monkeypatch):
++    """85 refusals in the window: the bb_bridge retried the mini incident against the metta3 card all day."""
++    _as(monkeypatch, "mini")
++    _local("bb", *METTA3_DISK[:2], body=METTA3_DISK[2])
++    out = _create(MINI_DISK, f"# {MINI_DISK}\n\nFiled by bb_bridge (mini).", board="bb")
++    assert out.get("ok") is True, out
++
++
++def test_same_disk_incident_is_still_refused(home, monkeypatch):
++    _as(monkeypatch, "mini")
++    _local("bb", "t_01a1bbbbbbbbbbbb", MINI_DISK)
++    out = _create("BB-1155: Fleet: mini still critically low on disk", "Filed by bb_bridge (mini).", board="bb")
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == ["t_01a1bbbbbbbbbbbb"]
++
++
++OLD_PROBE = ("t_01a18a31382540dd",
++             "Verify MacBook runs hermes-mods a2dadd6 (inbox ask_contract RETRY_SHAPE + OWNER_ASK_KEYS)",
++             "On the MacBook: grep -c \"RETRY_SHAPE\\|OWNER_ASK_KEYS\" ~/code/hermes-mods/plugins/inbox/ask_contract.py "
++             "(expect >=2) and git -C ~/code/hermes-mods merge-base --is-ancestor a2dadd6 HEAD.")
++NEW_PROBE_TITLE = "Verify MBP hermes-mods has da19695 (Inbox OWNER_ASK_KEYS removal) + live self-attest refusal"
++NEW_PROBE_BODY = (  # hub state.db message 369525, abridged to its acceptance lines
++    "Parent: hub card t_01a189a30ea5c64d (Inbox zero-junk). hermes-mods main da19695 removes the OWNER_ASK_KEYS "
++    "key-prefix exemption from plugins/inbox/ask_contract.py.\n\nDo on the MacBook:\n"
++    "1) `git -C ~/code/hermes-mods merge-base --is-ancestor da19695 HEAD; echo $?` must print 0.\n"
++    "2) `grep -c OWNER_ASK_KEYS ~/code/hermes-mods/plugins/inbox/ask_contract.py` must print 0.\n"
++    "3) Live probe ... Expect AgentOwnedPost with ask_self_attested.")
++
++
++def test_probe_with_the_opposite_acceptance_at_a_new_revision_is_admitted(home, tmp_path, monkeypatch):
++    _as(monkeypatch, "macbook")
++    _replica(tmp_path, [_remote("hub", *OLD_PROBE[:2], body=OLD_PROBE[2])])
++    out = _create(NEW_PROBE_TITLE, NEW_PROBE_BODY)
++    assert out.get("ok") is True, out
++
++
++@pytest.mark.parametrize("title", [
++    "Verify MBP runs hermes-mods a2dadd6 (Inbox RETRY_SHAPE + OWNER_ASK_KEYS present)",  # same revision
++    "Verify MacBook runs hermes-mods b1c2d3e (inbox ask_contract RETRY_SHAPE + OWNER_ASK_KEYS)",  # newer sha, same check
++])
++def test_same_check_is_refused_at_the_same_or_a_newer_revision(home, tmp_path, monkeypatch, title):
++    """A differing sha alone is not a different target: only an inverted check is."""
++    _as(monkeypatch, "macbook")
++    _replica(tmp_path, [_remote("hub", *OLD_PROBE[:2], body=OLD_PROBE[2])])
++    out = _create(title, "")
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == [OLD_PROBE[0]]
++
++
++# Case 5: refused 10-29 17:54:20 PDT on the MacBook against 7 cards on its hermes board (event 178460; why lost).
++# Replaying this exact create over every kanban_overlap.py revision: d0cc66e9f4..004623277d emit exactly these 7
++# ("the new card names board 'hermes'", from `daveey/hermes` in the body); e4180d7535 and later emit none. The
++# creating session started 16:25:11 PDT, before the MacBook applied e4180d7535 at 16:29:43: a long-lived pre-fix
++# caller. This fixture passes on the base too; it pins the source fix.
++INBOX_CARDS = [
++    ("t_01a189a30ea5c64d", "Inbox zero-junk: build ask-contract gate + poster registry (approved plan, all 8 steps)",
++     "ready"),
++    ("t_01a18a1665b82b4e", "Inbox refused: X DM sent to nobody", "ready"),
++    ("t_14e7a3b9", "Roll out Linux pod to remaining 2 office boxes and verify all 3", "scheduled"),
++    ("t_44bdffdf", "Nov 20: post Inbox card proposing to delete stopped nous-1", "scheduled"),
++    ("t_01a189f6faa00f1f", "Inbox zero-junk: 7-day live audit (target 0 junk cards reached David)", "todo"),
++    ("t_01a18502b6c809ba", "Disk H3 follow-through: land #1880/#1899, split #1885 into 3 PRs, put the mini guard back "
++     "on main", "scheduled"),
++    ("t_e5cfb7c4", "Identity P5 · matched room voice may approve Personal; kid/guest scopes (S2); TV/media guard (S4); "
++     "shadow week then enforce", "scheduled"),
++]
++CONFORMANCE_TITLE = "Fix remaining Inbox poster conformance: worktree-GC and guard-conformance sources"
++CONFORMANCE_BODY = (  # MacBook state.db message 679603, verbatim
++    "Found during t_01a189f218eb5437's full cross-repo poster conformance. Command HERMES_POSTER_ROOTS=<private "
++    "state>:<pr source>:<live scripts>:<origin/main mail snapshot> PYTHONPATH=<core> <runtime> -m pytest "
++    "plugins/inbox/tests/test_poster_conformance.py: unregistered Inbox posters mac-worktree-gc "
++    "(home/bin/mac-worktree-gc.py:668), guard-conformance (home/scripts/guard_conformance.py:154; live scripts "
++    "same). These are outside this task's named billing/X/mail/Bluesky source fixes. Root cause evidence boundary: "
++    "they still contain literal Inbox post paths; do not register them just to make conformance green. Trace "
++    "producer branches and use five-whys; agent-fixable errors -> idempotent Kanban, genuinely owner-only proposals "
++    "-> explicit registered ask contract if justified. TDD each branch, no live alert writes from tests; "
++    "commit/push/deploy source, then full cross-repo conformance must pass. Private source lives daveey/hermes "
++    "state; hub can use sparse scratch checkout and Mac deploy capability handoff if required. Do not edit "
++    "unrelated shared clone changes. No David decision needed.")
++
++
++def test_producer_callsite_repair_is_not_owned_by_the_seven_hermes_board_cards(home, monkeypatch):
++    _as(monkeypatch, "macbook")
++    for tid, title, status in INBOX_CARDS:
++        _local("hermes", tid, title, status)
++    out = _create(CONFORMANCE_TITLE, CONFORMANCE_BODY,
++                  idempotency_key="inbox-source-conformance:mac-worktree-gc:guard-conformance")
++    assert out.get("ok") is True, out
++
++
++def test_same_producer_callsite_repair_is_still_refused(home, monkeypatch):
++    _as(monkeypatch, "macbook")
++    _local("hermes", "t_01a1cccccccccccc", "Inbox poster conformance: fix worktree-GC and guard-conformance sources")
++    out = _create(CONFORMANCE_TITLE, CONFORMANCE_BODY)
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == ["t_01a1cccccccccccc"]
++
++
++# True duplicates in the audit window: still refused.
++def test_true_duplicate_pr181_review_and_landing_is_refused(home, tmp_path, monkeypatch):
++    _as(monkeypatch, "macbook")
++    _replica(tmp_path, [_remote("hub", "t_01a18be87f37e1e0",
++                                "Ask Eve #181: exact-head QA/Eve review and privacy-safe PR landing", "scheduled")])
++    out = _create("Ask Eve PR #181: wait for Eve review, then privacy-safe merge and readback",
++                  "Review https://github.com/Metta-AI/ask-eve/pull/181.")
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == ["t_01a18be87f37e1e0"]
++
++
++def test_true_duplicate_v12_bounded_round_is_refused(home, tmp_path, monkeypatch):
++    _as(monkeypatch, "macbook")
++    _replica(tmp_path, [_remote("hub", "t_01a18c8a1c8bb4f0", "Ask Eve #17: wait for Eve's approval of the v12 plan, "
++                                "then run the one bounded v12 round she ruled", "scheduled")])
++    out = _create("Ask Eve #17: cosplay kit v12 (one bounded content-only round), starting only once Eve approves "
++                  "the posted plan", "")
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == ["t_01a18c8a1c8bb4f0"]
++
++
++def test_true_duplicate_drain_stall_capability_owner_is_refused(home, monkeypatch):
++    _as(monkeypatch, "macbook")
++    _local("default", "t_01a18a9592debbf6", "Investigate >14 min stall in tests/test_core_drain_{pause,window,idle} "
++           "on Mac, then rerun 5 normal + 10 loaded rounds")
++    out = _create("Capability owner: host:macbook for hub/t_01a18aa072495a1d (Investigate >14 min stall in "
++                  "tests/test_core_drain_{pause,window,idle} on Mac, t)",
++                  "Capability owner card for waiting card hub/t_01a18aa072495a1d: run on the MacBook.")
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == ["t_01a18a9592debbf6"]
++
++
++# Hub leg (t_01a189b2d186a986), hub kanban.db create_overlap events 10-30.
++GREEN_CI = ("t_01a1815d5433bfac", "Verify green main CI: daveey/hermes (after 992410c3)",
++            "Do not mark done until a green push CI run exists for daveey/hermes main.")
++BB_CI = ("t_01a18bf68c413297", "Main CI red since effa0d25f: repair the hub suite on main",
++         "# Main CI red since effa0d25f: repair the hub suite on main\n\nFiled by bb_bridge (mini). ... Run: "
++         "https://github.com/me/myapp/actions/runs/41019672826. Use the me/myapp PR flow.")
++
++
++def test_red_ci_for_another_repo_is_admitted(home):
++    _local("default", *GREEN_CI[:2], "scheduled", body=GREEN_CI[2])  # 06:00:32Z refusal
++    out = _create("Fix red main CI: daveey/hermes-mods (since 4dd226d6)", "")
++    assert out.get("ok") is True, out
++
++
++@pytest.mark.parametrize("since", ["2bc71d8f", "1a221b37"])  # 02:31:55Z and 04:53:23Z: correct refusals
++def test_red_ci_for_the_same_repo_is_still_refused(home, since):
++    _local("default", *GREEN_CI[:2], "scheduled", body=GREEN_CI[2])
++    out = _create(f"Fix red main CI: daveey/hermes (since {since})", "")
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == [GREEN_CI[0]]
++
++
++def test_red_ci_refusal_does_not_co_match_another_repos_card(home, tmp_path):
++    """11:01:55Z: the refusal was right, but it also named the mini bb card about me/myapp."""
++    _local("default", *GREEN_CI[:2], "scheduled", body=GREEN_CI[2])
++    _replica(tmp_path, [_remote("mini", *BB_CI[:2], board="bb", body=BB_CI[2])])
++    out = _create("Fix red main CI: daveey/hermes (since a8ff96df)", "")
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == [GREEN_CI[0]]
++
++
++PRODUCER = ("t_01a18d2db718c3d1",
++            "SCRATCH producer for live proof of hub t_01a18d1a8a7cb162 (do not run; archived by it)",
++            "Scratch card, no assignee so nothing dispatches it. The hub card t_01a18d1a8a7cb162 completes and "
++            "archives it through the hermes-hub relay.")
++
++
++@pytest.mark.parametrize("title", [
++    "SCRATCH waiter for live proof of t_01a18d1a8a7cb162 (parks on macbook t_01a18d2db718c3d1; archived by it)",
++    "SCRATCH waiter: live proof of t_01a18d1a8a7cb162, park on macbook t_01a18d2db718c3d1",
++])
++def test_waiter_that_parks_on_its_producer_is_not_its_duplicate(home, tmp_path, title):
++    _replica(tmp_path, [_remote("macbook", *PRODUCER[:2], body=PRODUCER[2])])
++    out = _create(title, "")
++    assert out.get("ok") is True, out
++
++
++def test_second_producer_is_still_refused(home, tmp_path):
++    _replica(tmp_path, [_remote("macbook", *PRODUCER[:2], body=PRODUCER[2])])
++    out = _create("SCRATCH producer for live proof of hub t_01a18d1a8a7cb162 (do not run)", "")
++    assert out.get("code") == "create_overlap", out
++    assert _ids(out) == [PRODUCER[0]]
++
++
++def test_pinned_board_db_is_read_once_under_its_own_board_name(home, monkeypatch):
++    """Hub 10-30 08:04:58Z / 12:05:05Z: under a HERMES_KANBAN_DB pin (a worker) every board slug resolves to the
++    pinned default DB, so one default card came back once per hub board (default/askeve/bb/runners/...). The pin
++    itself stays: a fenced worker still reads only its pinned file."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_overlap as ko
++    _local("default", "t_01a18bcc47c3fb66", "Main CI red: tmux missing on runners", "running")
++    for slug in ("askeve", "bb", "runners", "worker-load"):
++        _local(slug, f"t_01a1{slug[:4].encode().hex()}dddd", f"{slug} unrelated chores")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_home() / "kanban.db"))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    with kb.pin_first_board_resolution():
++        matches = ko.find(title="Main CI red: tmux missing on runners + 4 gateway/tools test failures "
++                                "(run 41016178444)", body="", target_board="default", session_id=None,
++                          self_tid=None, parents=[])
++    assert [(m["board"], m["id"]) for m in matches] == [("default", "t_01a18bcc47c3fb66")], matches
++
++
++@pytest.mark.parametrize(("a", "b", "distinct"), [
++    ("David-MBP: gateway 78233 may run stale hermes-mods plugins",
++     "daveey-mini: gateway 16839 may run stale hermes-mods plugins", True),
++    ("David-MBP: gateway 78233 may run stale hermes-mods plugins",
++     "David-MBP: gateway 78233 may run stale hermes-mods plugins", False),
++    ("Desktop backend timeouts on David-MBP: 51 in 30 min", "David-MBP desktop backend timeouts again: 40 in 30 min",
++     False),
++    ("Fix flake X (seen in run #123)", "Fix flake X (seen in run #456)", False),
++    ("Probe on the mini (for hub t_01a18bee20c483ea)", "Probe on the hub (for macbook t_01a18bee20c483ea)", False),
++])
++def test_distinct_target_classes(a, b, distinct):
++    from hermes_cli.kanban_overlap import distinct_target
++    assert bool(distinct_target(a, b, {"hub", "macbook", "mini"})) is distinct
+-- 
+2.55.0
+

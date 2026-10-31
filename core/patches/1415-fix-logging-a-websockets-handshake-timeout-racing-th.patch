@@ -1,0 +1,188 @@
+From 160518392aaf58cec3b8ac04d9712e635b05fdf5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:58:30 +0000
+Subject: [PATCH] fix(logging): a websockets handshake timeout racing the
+ response logs one INFO line, not ERROR + traceback [daveey]
+
+connect() giving up on open_timeout while its reader thread is still feeding the handshake response
+makes websockets log 'unexpected internal error' with EOFError('stream ended') at ERROR (library race,
+reproduced on 15.0.1 and 17.4 without Hermes code). connect() has already raised TimeoutError, which
+every caller handles, so errors.log showed a handled reconnect as a crash and self-heal filed it
+(agent-93fde87ded).
+
+ws_logger's allow list becomes message -> exception predicate: 'keepalive ping failed' (any exception)
+and 'unexpected internal error' only for EOFError('stream ended'). Any other internal error keeps ERROR
+and its traceback. Regression test drives the real race with a local server and a stalled client
+socket; a second test pins ValueError / other EOFError messages at ERROR.
+---
+ hermes_cli/ws_logging.py            | 50 ++++++++++++++------
+ tests/hermes_cli/test_ws_logging.py | 73 ++++++++++++++++++++++++++++-
+ 2 files changed, 107 insertions(+), 16 deletions(-)
+
+diff --git a/hermes_cli/ws_logging.py b/hermes_cli/ws_logging.py
+index fe720f382b3..739aef3a03e 100644
+--- a/hermes_cli/ws_logging.py
++++ b/hermes_cli/ws_logging.py
+@@ -1,33 +1,53 @@
+ """The logger every Hermes websockets connection passes as ``logger=``.
+ 
+-websockets' keepalive thread/task reports a peer that stopped answering pings with
+-``logger.error("keepalive ping failed", exc_info=True)``. By then the library has already failed the
+-connection, and the caller's next ``recv``/``send`` raises ``ConnectionClosed``, which every Hermes call
+-site handles (reconnect, end the stream, fall back to polling). Logged at ERROR with a traceback, that
+-handled drop reads in errors.log like an unhandled crash, and self-heal files it as a defect.
+-
+-``ws_logger()`` wraps the library's own logger (same name, so level and handler config still apply),
+-turns that one message into a single INFO line naming the cause, and passes every other record through at
+-its real level. ``scripts/code_health`` rule HX015 flags a websockets ``connect()`` without ``logger=``,
+-so a new call site cannot reintroduce the ERROR.
++websockets logs some failures it has already turned into a closed connection at ERROR with a traceback.
++The caller sees them as an exception every Hermes call site handles (reconnect, end the stream, fall back to
++polling), but in errors.log they read like an unhandled crash, and self-heal files them as defects:
++
++- ``"keepalive ping failed"``: the peer stopped answering pings; the library fails the connection and the
++  caller's next ``recv``/``send`` raises ``ConnectionClosed``.
++- ``"unexpected internal error"`` with ``EOFError("stream ended")``: ``connect()`` gave up on the opening
++  handshake (``open_timeout``, typical on a loaded host) and closed the stream while its reader thread was
++  still feeding the handshake response into it. ``connect()`` has already raised ``TimeoutError`` to the
++  caller. This race is inside websockets (reproduced on 15.0.1 and 17.4 with no Hermes code). Any other
++  exception under that message is a real internal error and keeps ERROR and its traceback.
++
++``ws_logger()`` wraps the library's own logger (same name, so level and handler config still apply), turns
++exactly those (message, exception) pairs into a single INFO line naming the cause, and passes every other
++record through at its real level. ``scripts/code_health`` rule HX015 flags a websockets ``connect()`` without
++``logger=``, so a new call site cannot reintroduce the ERROR.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+ import sys
+-from typing import Any
++from typing import Any, Callable, Optional
+ 
+-_HANDLED = frozenset({"keepalive ping failed"})
++
++def _any_exception(exc: Optional[BaseException]) -> bool:
++    return True
++
++
++def _closed_stream_eof(exc: Optional[BaseException]) -> bool:
++    return type(exc) is EOFError and exc.args == ("stream ended",)
++
++
++# message -> predicate on the exception being handled; a record is demoted only when both match.
++_HANDLED: dict[str, Callable[[Optional[BaseException]], bool]] = {
++    "keepalive ping failed": _any_exception,
++    "unexpected internal error": _closed_stream_eof,
++}
+ 
+ 
+ class _HandledDropAdapter(logging.LoggerAdapter):
+     def log(self, level: int, msg: Any, *args: Any, **kwargs: Any) -> None:
+         if level >= logging.ERROR and isinstance(msg, str) and msg in _HANDLED:
+             exc = sys.exc_info()[1]
+-            kwargs.pop("exc_info", None)
+-            level, msg, args = logging.INFO, "%s (%s: %s); the connection is closed and the caller handles it", (
+-                msg, type(exc).__name__ if exc else "no exception", exc)
++            if _HANDLED[msg](exc):
++                kwargs.pop("exc_info", None)
++                level, msg, args = logging.INFO, "%s (%s: %s); the connection is closed and the caller handles it", (
++                    msg, type(exc).__name__ if exc else "no exception", exc)
+         super().log(level, msg, *args, **kwargs)
+ 
+ 
+diff --git a/tests/hermes_cli/test_ws_logging.py b/tests/hermes_cli/test_ws_logging.py
+index a0be87abd72..8e281f4c03f 100644
+--- a/tests/hermes_cli/test_ws_logging.py
++++ b/tests/hermes_cli/test_ws_logging.py
+@@ -1,10 +1,18 @@
+-"""hermes_cli.ws_logging: the one handled websockets failure becomes an INFO line; everything else keeps its level."""
++"""hermes_cli.ws_logging: handled websockets failures become one INFO line; everything else keeps its level."""
+ 
+ from __future__ import annotations
+ 
+ import logging
++import socket
++import threading
++
++import pytest
++from websockets.exceptions import ConnectionClosed
++from websockets.sync.client import ClientConnection, connect
++from websockets.sync.server import serve
+ 
+ from hermes_cli.ws_logging import ws_logger
++from tests.waiting import wait_until
+ 
+ 
+ def _raise_and_log(log, msg):
+@@ -44,3 +52,66 @@ def test_level_config_of_the_library_logger_still_applies(caplog):
+         assert caplog.records == []  # demoted to INFO, below the library logger's WARNING floor
+     finally:
+         logging.getLogger("websockets.client").setLevel(logging.NOTSET)
++
++
++class _StalledRecvSocket(socket.socket):
++    """A client socket whose reader is descheduled right after it reads the handshake response (a loaded host):
++    it holds those bytes until ``released`` is set. The test sets it once connect() has given up on
++    open_timeout and closed the stream (close_socket; connect() joins this reader before raising), so the late response is
++    fed into the already-closed stream on every run."""
++
++    def __init__(self, *args):
++        super().__init__(*args)
++        self.released = threading.Event()
++
++    def recv(self, n, *args):
++        data = super().recv(n, *args)
++        if data:
++            self.released.wait(timeout=10)
++        return data
++
++
++def test_handshake_timeout_racing_the_response_logs_no_error(caplog, monkeypatch):
++    caplog.set_level(logging.DEBUG, logger="websockets")  # hermes_logging pins it at WARNING
++    socks = []
++    close_socket = ClientConnection.close_socket
++
++    def close_then_release(self):
++        close_socket(self)
++        for s in socks:
++            s.released.set()
++
++    monkeypatch.setattr(ClientConnection, "close_socket", close_then_release)
++
++    def handler(ws):
++        try:
++            ws.recv()
++        except ConnectionClosed:
++            pass
++
++    with serve(handler, "127.0.0.1", 0, logger=ws_logger("server")) as server:
++        threading.Thread(target=server.serve_forever, daemon=True).start()
++        port = server.socket.getsockname()[1]
++        sock = _StalledRecvSocket(socket.AF_INET, socket.SOCK_STREAM)
++        sock.connect(("127.0.0.1", port))
++        socks.append(sock)
++        with pytest.raises(TimeoutError):
++            connect(f"ws://127.0.0.1:{port}", sock=sock, open_timeout=0.2, logger=ws_logger())
++        wait_until(lambda: any(r.getMessage().startswith("unexpected internal error") for r in caplog.records),
++                   what="the reader thread's late-response record")
++        server.shutdown()
++    errors = [(r.name, r.getMessage()) for r in caplog.records if r.levelno >= logging.ERROR]
++    assert errors == []
++    [rec] = [r for r in caplog.records if r.getMessage().startswith("unexpected internal error")]
++    assert rec.levelno == logging.INFO and not rec.exc_info and "EOFError: stream ended" in rec.getMessage()
++
++
++def test_internal_error_from_another_exception_keeps_error_and_traceback(caplog):
++    caplog.set_level(logging.DEBUG, logger="websockets")
++    for exc in (ValueError("bad frame"), EOFError("something else")):
++        try:
++            raise exc
++        except Exception:
++            ws_logger().error("unexpected internal error", exc_info=True)
++    assert [(r.levelno, type(r.exc_info[1]).__name__) for r in caplog.records] == [
++        (logging.ERROR, "ValueError"), (logging.ERROR, "EOFError")]
+-- 
+2.55.0
+

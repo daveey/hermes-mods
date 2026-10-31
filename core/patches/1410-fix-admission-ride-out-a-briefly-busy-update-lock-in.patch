@@ -1,0 +1,520 @@
+From 84e23547d456abc03c894c6ae42776d84278ad8a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:27:42 +0000
+Subject: [PATCH] fix(admission): ride out a briefly busy update lock instead
+ of refusing turns [daveey]
+
+A busy admission.lock (hermes-sync's state read, its hold write, a Kanban claim
+through its commit) got the same refusal as a real update hold after one 50 ms
+try, so a Desktop message, notification or goal turn was dropped and logged as
+'Update admission unavailable' with a TimeoutError traceback (agent-6f2f71c662).
+
+- admission_fence: lock timeout raises AdmissionBusy(TimeoutError).
+- backend_retirement.reservation(busy_wait_s=0.5) / begin_background_review
+  retry AdmissionBusy in 50 ms tries; a hold or retirement still refuses at once.
+  prompt.admit (under the session resume lock) passes busy_wait_s=0 and warm
+  session.resume uses single_lock_try(), so both keep one 50 ms try.
+- A final busy refusal logs one WARNING 'update admission lock busy for Ns (no
+  update hold)' without a traceback; recovered contention logs DEBUG.
+- prompt.submit / side-agent 5035 text says 'briefly busy; retry' for that case.
+---
+ hermes_cli/admission_fence.py              |  11 +-
+ hermes_cli/backend_retirement.py           |  97 ++++++++++++--
+ tests/hermes_cli/test_admission_fence.py   | 144 +++++++++++++++++++++
+ tests/tui_gateway/test_prompt_admission.py |  17 +++
+ tui_gateway/methods_prompt.py              |   6 +-
+ tui_gateway/methods_prompt_admission.py    |   3 +-
+ tui_gateway/session_auto_continue.py       |   6 +-
+ tui_gateway/session_lifecycle.py           |   8 +-
+ tui_gateway/turn_admission.py              |  14 +-
+ 9 files changed, 277 insertions(+), 29 deletions(-)
+
+diff --git a/hermes_cli/admission_fence.py b/hermes_cli/admission_fence.py
+index cfbbd0a4a01..7843826c5aa 100644
+--- a/hermes_cli/admission_fence.py
++++ b/hermes_cli/admission_fence.py
+@@ -19,6 +19,15 @@ CAPABILITY = {"version": 1, "supported": SUPPORTED, "scope": "installation-root"
+ HOLD_MESSAGE = "Hermes update admission is paused or busy; retry shortly (or after the update completes)."
+ 
+ 
++class AdmissionBusy(TimeoutError):
++    """admission.lock is held by another process past the caller's timeout; no hold is implied.
++
++    [daveey] Ordinary holders (hermes-sync's state read, its hold write with fsyncs, a Kanban claim
++    through its commit) can keep the lock past 50 ms on a loaded Mac. Callers that may wait retry on
++    this type (backend_retirement); it subclasses TimeoutError, so an ``except TimeoutError`` still
++    fails closed."""
++
++
+ @contextmanager
+ def admission_lock(home, *, timeout=10.0):
+     import fcntl
+@@ -34,7 +43,7 @@ def admission_lock(home, *, timeout=10.0):
+                 break
+             except BlockingIOError:
+                 if time.monotonic() >= deadline:
+-                    raise TimeoutError("Hermes update admission lock is busy") from None
++                    raise AdmissionBusy("Hermes update admission lock is busy") from None
+                 time.sleep(0.01)
+         yield root
+     finally:
+diff --git a/hermes_cli/backend_retirement.py b/hermes_cli/backend_retirement.py
+index b2837d3a52c..f66f4c2c36e 100644
+--- a/hermes_cli/backend_retirement.py
++++ b/hermes_cli/backend_retirement.py
+@@ -5,11 +5,75 @@ close the check/use race: every source of new work must reserve admission before
+ """
+ 
+ from contextlib import contextmanager
++from contextvars import ContextVar
+ import logging
+ import secrets
+ import threading
+ import time
+ 
++# [daveey] A busy admission.lock is not an update hold (agent-6f2f71c662): hermes-sync's state read,
++# its hold write and Kanban claims hold it past one 50 ms try on a loaded Mac, and every such refusal
++# dropped a typed message, notification or goal turn. Turn sources retry a busy lock (50 ms tries) for up
++# to BUSY_WAIT_S; a real hold or a retiring backend still refuses at once. The one caller that reserves
++# under the session resume lock (prompt.admit) passes busy_wait_s=0 and keeps a single try.
++BUSY_WAIT_S = 0.5
++_refusal: ContextVar = ContextVar("update_admission_refusal", default=None)
++_busy_wait_override: ContextVar = ContextVar("update_admission_busy_wait", default=None)
++_log = logging.getLogger(__name__)
++
++
++@contextmanager
++def single_lock_try():
++    """Reservations made inside (this context only) take one short lock try, no busy-lock retry.
++
++    For code that reserves while holding the session resume lock without owning the call site's
++    signature (warm session.resume scheduling auto-continue)."""
++    token = _busy_wait_override.set(0.0)
++    try:
++        yield
++    finally:
++        _busy_wait_override.reset(token)
++
++
++def last_refusal():
++    """Why this context's latest ``reservation`` refused: "retiring", "held", "busy", "unavailable", or None."""
++    return _refusal.get()
++
++
++def refusal_text():
++    """The 5035 text for the latest refusal in this context."""
++    if _refusal.get() == "busy":
++        return "update admission is briefly busy (another Hermes process holds the update lock); retry"
++    return "backend is retiring or update admission is paused; retry after the update"
++
++
++def _reserve(root, busy_wait_s, what):
++    """``admission_fence.reserve`` that rides out a briefly busy lock. Returns (reservation | None, reason).
++
++    Each try keeps reserve's own 50 ms lock cap, so a caller never blocks longer than busy_wait_s + 50 ms.
++    A hold returns (None, "held") at once; any other fence error fails closed with its traceback."""
++    from hermes_cli import admission_fence
++
++    started = time.monotonic()
++    tries = 0
++    while True:
++        tries += 1
++        try:
++            pending = admission_fence.reserve(root)
++        except admission_fence.AdmissionBusy:
++            waited = time.monotonic() - started
++            if waited >= busy_wait_s:
++                _log.warning("%s unavailable: update admission lock busy for %.1fs (no update hold)", what, waited)
++                return None, "busy"
++            continue
++        except (OSError, TimeoutError):
++            _log.warning("%s unavailable", what, exc_info=True)
++            return None, "unavailable"
++        if tries > 1:
++            _log.debug("update admission lock was busy for %.2fs; %s after %d tries",
++                       time.monotonic() - started, "admitted" if pending is not None else "held", tries)
++        return pending, (None if pending is not None else "held")
++
+ # [daveey] Background reviews (the post-turn memory/skill review fork) run on a daemon thread with
+ # no session turn lease and no admission reservation, so the idle proof read a backend mid-review
+ # as idle and retirement hard-interrupted the review mid-call (2026-10-28 04:38, two reviews lost).
+@@ -81,15 +145,12 @@ class RetirementFence:
+         if the call outlasts the window, the window expires rather than killing it.
+         """
+         from hermes_constants import get_default_hermes_root, get_hermes_home
+-        from hermes_cli.admission_fence import reserve, SUPPORTED
++        from hermes_cli.admission_fence import SUPPORTED
+ 
+         pending = None
+         if SUPPORTED:
+-            try:
+-                pending = reserve(get_default_hermes_root(home=get_hermes_home()))
+-            except (OSError, TimeoutError):
+-                logging.getLogger(__name__).warning("Review update admission unavailable", exc_info=True)
+-                return None
++            pending, _reason = _reserve(get_default_hermes_root(home=get_hermes_home()), BUSY_WAIT_S,
++                                        "Review update admission")
+             if pending is None:
+                 return None
+         with self._lock:
+@@ -131,30 +192,38 @@ class RetirementFence:
+                 self.release()
+ 
+     @contextmanager
+-    def reservation(self, home=None):
++    def reservation(self, home=None, *, busy_wait_s=None):
+         """Compose process retirement with the cross-process update reservation.
+ 
+         Neither lock is held while acquiring the other, or while callers hold
+         session locks. The pending reservation remains visible until publication.
++        A briefly busy admission.lock is retried for ``busy_wait_s`` (default
++        BUSY_WAIT_S; 0 = one 50 ms try, for callers holding the session resume
++        lock, also forced by ``single_lock_try()``); the refusal reason is
++        readable afterwards through ``last_refusal()``.
+         """
+         from hermes_constants import get_default_hermes_root, get_hermes_home
+-        from hermes_cli.admission_fence import reserve, HOLD_MESSAGE, SUPPORTED
++        from hermes_cli.admission_fence import HOLD_MESSAGE, SUPPORTED
+ 
++        if busy_wait_s is None:
++            override = _busy_wait_override.get()
++            busy_wait_s = BUSY_WAIT_S if override is None else override
+         if not SUPPORTED:
+             with self.work() as admitted:
++                _refusal.set(None if admitted else "retiring")
+                 yield admitted
+             return
+ 
+         admitted = self.acquire()
+         pending = None
+         try:
++            reason = "retiring"
+             if admitted:
+-                try:
+-                    pending = reserve(get_default_hermes_root(home=home or get_hermes_home()))
+-                except (OSError, TimeoutError):
+-                    logging.getLogger(__name__).warning("Update admission unavailable", exc_info=True)
+-                if pending is None:
+-                    logging.getLogger(__name__).info(HOLD_MESSAGE)
++                pending, reason = _reserve(get_default_hermes_root(home=home or get_hermes_home()),
++                                           busy_wait_s, "Update admission")
++                if reason == "held":
++                    _log.info(HOLD_MESSAGE)
++            _refusal.set(reason)
+             yield admitted and pending is not None
+         finally:
+             try:
+diff --git a/tests/hermes_cli/test_admission_fence.py b/tests/hermes_cli/test_admission_fence.py
+index d7180d0269c..6be3802ec4c 100644
+--- a/tests/hermes_cli/test_admission_fence.py
++++ b/tests/hermes_cli/test_admission_fence.py
+@@ -30,6 +30,150 @@ def _lock_child(home, ready, finish):
+         finish.wait(20)
+ 
+ 
++def _timed_lock_child(home, ready, hold_s):
++    import time
++    with af.admission_lock(home):
++        ready.set()
++        time.sleep(hold_s)  # health: allow HX013 -- how long another process holds the lock IS the contention under test
++
++
++def _spawn_lock_holder(home, hold_s):
++    ctx = multiprocessing.get_context("spawn")
++    ready = ctx.Event()
++    child = ctx.Process(target=_timed_lock_child, args=(home, ready, hold_s))
++    child.start()
++    assert ready.wait(20)
++    return child
++
++
++def _reap(child):
++    if child.is_alive():
++        child.kill()
++    child.join(10)
++
++
++def _busy_records(caplog):
++    return [r for r in caplog.records if r.name == "hermes_cli.backend_retirement" and r.levelno >= 30]
++
++
++def test_reservation_survives_lock_briefly_busy_without_hold(tmp_path, caplog):
++    """[daveey] Another process holding admission.lock for 200 ms (no update hold) must not refuse a
++    turn: hermes-sync's state read and Kanban claims hold it that long on a loaded Mac (agent-6f2f71c662)."""
++    import logging
++    caplog.set_level(logging.DEBUG, logger="hermes_cli.backend_retirement")
++    child = _spawn_lock_holder(tmp_path, 0.2)
++    try:
++        fence = RetirementFence()
++        with fence.reservation(tmp_path) as admitted:
++            assert admitted
++            assert not child.is_alive() or af.state(tmp_path)["reservations"] == 1
++        assert not _busy_records(caplog)
++    finally:
++        _reap(child)
++    assert af.state(tmp_path)["reservations"] == 0
++
++
++def test_reservation_refuses_long_busy_lock_with_one_warning(tmp_path, caplog):
++    import logging
++    import time
++    caplog.set_level(logging.DEBUG, logger="hermes_cli.backend_retirement")
++    child = _spawn_lock_holder(tmp_path, 2.0)
++    try:
++        fence = RetirementFence()
++        started = time.monotonic()
++        with fence.reservation(tmp_path) as admitted:
++            elapsed = time.monotonic() - started
++            assert not admitted
++        assert 0.45 <= elapsed < 1.5
++        records = _busy_records(caplog)
++        assert len(records) == 1, [r.getMessage() for r in records]
++        message = records[0].getMessage()
++        assert "update admission lock busy for" in message and "no update hold" in message
++        assert records[0].exc_info is None
++        from hermes_cli.backend_retirement import last_refusal
++        assert last_refusal() == "busy"
++        assert fence.active_count() == 0
++    finally:
++        _reap(child)
++
++
++def test_hold_refuses_at_once_without_busy_retry(tmp_path, caplog):
++    import logging
++    import time
++    caplog.set_level(logging.DEBUG, logger="hermes_cli.backend_retirement")
++    af.set_hold(tmp_path)
++    fence = RetirementFence()
++    started = time.monotonic()
++    with fence.reservation(tmp_path, busy_wait_s=5.0) as admitted:
++        assert not admitted
++    assert time.monotonic() - started < 0.3
++    assert not _busy_records(caplog)
++    from hermes_cli.backend_retirement import last_refusal
++    assert last_refusal() == "held"
++
++
++def test_zero_busy_wait_makes_one_short_try(tmp_path):
++    """The prompt-admission path holds the session resume lock: it keeps a single 50 ms try."""
++    import time
++    child = _spawn_lock_holder(tmp_path, 2.0)
++    try:
++        fence = RetirementFence()
++        started = time.monotonic()
++        with fence.reservation(tmp_path, busy_wait_s=0) as admitted:
++            assert not admitted
++        assert time.monotonic() - started < 0.3
++        session = {"history_lock": threading.RLock(), "profile_home": str(tmp_path)}
++        from hermes_cli import backend_retirement
++        real = backend_retirement.retirement
++        backend_retirement.retirement = fence
++        try:
++            started = time.monotonic()
++            with server._session_turn_admission(session, busy_wait_s=0) as admitted:
++                assert not admitted
++            assert time.monotonic() - started < 0.3
++        finally:
++            backend_retirement.retirement = real
++        from hermes_cli.backend_retirement import single_lock_try
++        started = time.monotonic()
++        with single_lock_try():
++            with fence.reservation(tmp_path) as admitted:
++                assert not admitted
++        assert time.monotonic() - started < 0.3
++    finally:
++        _reap(child)
++
++
++def test_busy_refusal_text_says_briefly_busy(tmp_path, monkeypatch):
++    """prompt.submit's 5035 names a busy lock as briefly busy, not as a paused update."""
++    from hermes_cli import backend_retirement
++    fence = RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session = {"history_lock": threading.RLock(), "profile_home": str(tmp_path), "session_key": "k"}
++    child = _spawn_lock_holder(tmp_path, 2.0)
++    try:
++        error, _ = server._lock_in_submit_turn("r", "s", session, "hi", {}, False, None, None, None)
++    finally:
++        _reap(child)
++    assert error["error"]["code"] == 5035
++    assert "briefly busy" in error["error"]["message"]
++    af.set_hold(tmp_path)
++    error, _ = server._lock_in_submit_turn("r", "s", session, "hi", {}, False, None, None, None)
++    assert "update admission is paused" in error["error"]["message"]
++
++
++def test_background_review_survives_briefly_busy_lock(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    child = _spawn_lock_holder(tmp_path, 0.2)
++    try:
++        fence = RetirementFence()
++        hold = fence.begin_background_review()
++        assert hold is not None
++        fence.end_background_review(hold)
++    finally:
++        _reap(child)
++
++
+ def test_hold_refuses_and_existing_reservation_survives(tmp_path):
+     reservation = af.reserve(tmp_path)
+     assert af.state(tmp_path)["reservations"] == 1
+diff --git a/tests/tui_gateway/test_prompt_admission.py b/tests/tui_gateway/test_prompt_admission.py
+index 8930df72e1e..78bf3c9a312 100644
+--- a/tests/tui_gateway/test_prompt_admission.py
++++ b/tests/tui_gateway/test_prompt_admission.py
+@@ -125,6 +125,23 @@ def test_turn_adopts_admission_row_without_duplicate_and_limits_recovery_to_no_t
+     assert [m["role"] for m in db.get_messages(params["stored_session_id"])] == ["user", "assistant"]
+ 
+ 
++def test_admission_under_resume_lock_makes_one_short_lock_try(owner, monkeypatch):
++    """[daveey] prompt.admit reserves while holding the session resume lock, so it must not take the
++    busy-lock retry other turn sources get (agent-6f2f71c662): busy_wait_s=0 on that path only."""
++    from hermes_cli import backend_retirement
++    _, _session, params, _ = owner
++    seen = []
++    real = backend_retirement.retirement.reservation
++
++    def recording(home=None, **kwargs):
++        seen.append(kwargs.get("busy_wait_s", "default"))
++        return real(home, **kwargs)
++
++    monkeypatch.setattr(backend_retirement.retirement, "reservation", recording)
++    assert "result" in call("prompt.admit", params)
++    assert seen and seen[0] == 0
++
++
+ def test_normal_submit_claim_cannot_overwrite_admitted_turn(owner):
+     _, session, params, _ = owner
+     assert "result" in call("prompt.admit", params)
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 71027b1d38f..14bcf4df3e3 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -805,7 +805,8 @@ def _lock_in_submit_turn(
+     fields = {}
+     with _session_turn_admission(session) as admitted:
+         if not admitted:
+-            return _err(rid, 5035, "backend is retiring or update admission is paused; retry after the update"), fields
++            from hermes_cli.backend_retirement import refusal_text
++            return _err(rid, 5035, refusal_text()), fields
+         if session.get("running"):
+             return _err(rid, 4009, "session busy", {"reason": "turn_claim_busy"}), fields
+         # A watch session's run lives in the PARENT turn (own running flag False); typing
+@@ -1505,7 +1506,8 @@ def _spawn_side_agent(
+             _clear_session_context(session_tokens)
+ 
+     if _start_session_work(run, name=f"side-agent-{task_id}", home=session.get("profile_home")) is None:
+-        return _err(rid, 5035, "backend is retiring or update admission is paused; retry after the update")
++        from hermes_cli.backend_retirement import refusal_text
++        return _err(rid, 5035, refusal_text())
+     return _ok(rid, {"task_id": task_id})
+ 
+ 
+diff --git a/tui_gateway/methods_prompt_admission.py b/tui_gateway/methods_prompt_admission.py
+index a82790439f7..d4ac68a0a03 100644
+--- a/tui_gateway/methods_prompt_admission.py
++++ b/tui_gateway/methods_prompt_admission.py
+@@ -157,7 +157,8 @@ def submit_admission(rid, params):
+                 return _reply(server, rid, params, prior)
+             with server._session_resume_lock:
+                 sid, session = _live_owner(server, params, home)
+-                with server._session_turn_admission(session) as admitted:
++                # busy_wait_s=0: never wait out a busy update lock while holding the resume lock.
++                with server._session_turn_admission(session, busy_wait_s=0) as admitted:
+                     if not admitted:
+                         return server._err(rid, 5035, "backend is retiring")
+                     _live_owner(server, params, home)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 90bce6ac57f..bbdffe46b69 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -36,7 +36,11 @@ def _resume_reuse_live_locked(ctx, sid: str, session: dict) -> dict:
+     if not ctx.lazy and not session.get("running") and not session.get("resume_hydrating"):
+         from tui_gateway.update_pause import _detect_skew
+         if _detect_skew() is None:
+-            if (continuation := _maybe_schedule_auto_continue(sid, session, ctx.target)) is not None:
++            # Caller holds _session_resume_lock: one short update-lock try, never the busy-lock retry.
++            from hermes_cli.backend_retirement import single_lock_try
++            with single_lock_try():
++                continuation = _maybe_schedule_auto_continue(sid, session, ctx.target)
++            if continuation is not None:
+                 payload["auto_continue"] = continuation
+     if ctx.defer_history:
+         payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index b68f808dac8..9231c9a5d6e 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -13,17 +13,17 @@ from .method_ctx import bind_module
+ 
+ 
+ @contextlib.contextmanager
+-def _session_turn_admission(session: dict):
++def _session_turn_admission(session: dict, *, busy_wait_s=None):
+     """Retain admission from the running claim through terminal cleanup."""
+     from tui_gateway.turn_admission import admission
+-    with admission(session) as admitted:
++    with admission(session, busy_wait_s=busy_wait_s) as admitted:
+         yield admitted
+ 
+ 
+-def _start_session_work(target, *, name: str, session: dict | None = None, home=None):
++def _start_session_work(target, *, name: str, session: dict | None = None, home=None, busy_wait_s=None):
+     """Adopt accepted admission, or reserve fresh work, through worker cleanup."""
+     from tui_gateway.turn_admission import start_work
+-    return start_work(target, name=name, session=session, home=home)
++    return start_work(target, name=name, session=session, home=home, busy_wait_s=busy_wait_s)
+ 
+ 
+ def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> list[str]:
+diff --git a/tui_gateway/turn_admission.py b/tui_gateway/turn_admission.py
+index a6b163d774f..f5d85a02553 100644
+--- a/tui_gateway/turn_admission.py
++++ b/tui_gateway/turn_admission.py
+@@ -32,9 +32,11 @@ class TurnAdmission:
+                 self.reservation.__exit__(None, None, None)
+ 
+ 
+-def acquire(home=None):
++def acquire(home=None, *, busy_wait_s=None):
+     from hermes_cli.backend_retirement import retirement
+-    reservation = retirement.reservation(home)
++    # busy_wait_s=None keeps the fence's default busy-lock retry; 0 is one short try (resume-lock callers).
++    reservation = (retirement.reservation(home) if busy_wait_s is None
++                   else retirement.reservation(home, busy_wait_s=busy_wait_s))
+     if not reservation.__enter__():
+         reservation.__exit__(None, None, None)
+         return None
+@@ -64,8 +66,8 @@ def settle(session):
+ 
+ 
+ @contextmanager
+-def admission(session):
+-    token = acquire(session.get("profile_home"))
++def admission(session, *, busy_wait_s=None):
++    token = acquire(session.get("profile_home"), busy_wait_s=busy_wait_s)
+     with session["history_lock"]:
+         claimed = token is not None and not session.get("running")
+         if claimed:
+@@ -188,7 +190,7 @@ def start_build_work(session, target, *, delay=None):
+         raise
+ 
+ 
+-def start_work(target, *, name, session=None, home=None):
++def start_work(target, *, name, session=None, home=None, busy_wait_s=None):
+     from agent.memory_provider import spawn_context_thread
+     if session is not None:
+         with session["history_lock"]:
+@@ -201,7 +203,7 @@ def start_work(target, *, name, session=None, home=None):
+     else:
+         token = None
+     if token is None:
+-        token = acquire(home or (session or {}).get("profile_home"))
++        token = acquire(home or (session or {}).get("profile_home"), busy_wait_s=busy_wait_s)
+         if token is not None and session is not None:
+             with session["history_lock"]:
+                 existing = session.get(_KEY)
+-- 
+2.55.0
+

@@ -1,0 +1,214 @@
+From b8600f6f813a615fea7ad7ba038cc7f67c94ae35 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 03:13:06 +0000
+Subject: [PATCH] fix(update): keep the upstream-sync REFUSED line visible
+ under its diagnostics [daveey]
+
+Exact-head review of 0ce9e610db0: hermes update printed only the gate's last 4
+lines, so the new evidence lines pushed REFUSED, its run URL and the failing job
+out of view. Print from the last verdict line (capped at 40 lines) when it is
+older than the last 4. Also: a timed-out log read is an unavailable log (not a
+whole-diagnostics fault); a non-dict nightly state is 'lookup unavailable'.
+---
+ hermes_cli/update_cmd_git.py                  | 19 ++++++-
+ scripts/ci/upstream_sync_diagnostics.py       | 12 ++++-
+ .../test_update_upstream_gate_report.py       | 43 +++++++++++++++
+ .../ci/test_upstream_sync_diagnostics.py      | 53 +++++++++++++++----
+ 4 files changed, 115 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_upstream_gate_report.py
+
+diff --git a/hermes_cli/update_cmd_git.py b/hermes_cli/update_cmd_git.py
+index 55a889e667d..40fc7e02557 100644
+--- a/hermes_cli/update_cmd_git.py
++++ b/hermes_cli/update_cmd_git.py
+@@ -353,11 +353,28 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path, head: str = "HEAD")
+     except (OSError, subprocess.SubprocessError) as exc:
+         print(f"  ✗ Upstream sync gate failed to run: {exc}")
+         return False
+-    for line in (proc.stdout or proc.stderr or "").strip().splitlines()[-4:]:
++    for line in _gate_report(proc.stdout or proc.stderr or ""):
+         print(f"    {line}")
+     return proc.returncode == 0
+ 
+ 
++_GATE_VERDICTS = ("REFUSED", "NOT YET", "LANDED")
++_GATE_REPORT_LINES = 40
++
++
++def _gate_report(output: str) -> list[str]:
++    """The gate's tail: its last 4 lines, widened back to the last verdict line when the evidence lines a REFUSED
++    prints under it (upstream_sync_diagnostics) would push that verdict out of view; capped."""
++    lines = output.strip().splitlines()
++    verdicts = [i for i, line in enumerate(lines) if line.startswith(_GATE_VERDICTS)]
++    start = len(lines) - 4
++    if verdicts and verdicts[-1] < start:
++        start = verdicts[-1]
++    shown = lines[max(start, 0):][:_GATE_REPORT_LINES]
++    hidden = len(lines) - max(start, 0) - len(shown)
++    return shown + ([f"… {hidden} more line(s)"] if hidden > 0 else [])
++
++
+ def _offer_upstream_remote(git_cmd: list[str], cwd: Path, *, assume_yes: bool, input_fn) -> bool:
+     """Prompt to add ``upstream`` and add it; False when the user declined, the run is non-interactive, or add failed.
+ 
+diff --git a/scripts/ci/upstream_sync_diagnostics.py b/scripts/ci/upstream_sync_diagnostics.py
+index 42878e041d0..01f38843d71 100644
+--- a/scripts/ci/upstream_sync_diagnostics.py
++++ b/scripts/ci/upstream_sync_diagnostics.py
+@@ -85,7 +85,10 @@ def _jobs(gh_repo, run_id, request) -> list[dict]:
+ 
+ 
+ def _log(gh_repo, job_id, gh) -> str | None:
+-    proc = gh("api", f"repos/{gh_repo}/actions/jobs/{job_id}/logs", reason="upstream sync gate: read a failed job log")
++    try:
++        proc = gh("api", f"repos/{gh_repo}/actions/jobs/{job_id}/logs", reason="upstream sync gate: read a failed job log")
++    except (OSError, subprocess.SubprocessError):  # a read that timed out is an unavailable log, like a 410
++        return None
+     return proc.stdout if proc.returncode == 0 else None
+ 
+ 
+@@ -157,9 +160,14 @@ def nightly_owner(ids, *, state_path: Path | None = None, board=None) -> str:
+     ids = sorted(set(ids))
+     key = failure_key(ids)
+     state = json.loads(state_path.read_text(encoding="utf-8-sig"))  # corrupt/unreadable raises: never "no owner"
+-    rec = (state.get("cards") or {}).get(key)
++    cards = state.get("cards", {}) if isinstance(state, dict) else None  # no key yet: nothing filed
++    if not isinstance(cards, dict):
++        raise ValueError(f"{state_path} has no nightly-e2e card map")
++    rec = cards.get(key)
+     if not rec:
+         return ""
++    if not isinstance(rec, dict) or not rec.get("id"):
++        raise ValueError(f"{state_path} card record for {key} is malformed: {rec!r}")
+     card = (board or NightlyBoard("hermes")).card(rec["id"])
+     if card is None:  # CliBoard.card answers None for a failed `hermes kanban show`: unknown, not "no owner"
+         raise RuntimeError(f"nightly card {rec['id']} for {key} is unreadable on this host's board")
+diff --git a/tests/hermes_cli/test_update_upstream_gate_report.py b/tests/hermes_cli/test_update_upstream_gate_report.py
+new file mode 100644
+index 00000000000..97f33dd8881
+--- /dev/null
++++ b/tests/hermes_cli/test_update_upstream_gate_report.py
+@@ -0,0 +1,43 @@
++"""What `hermes update` shows of the upstream-sync gate's output: the verdict stays visible.
++
++The gate (scripts/ci/upstream_sync.py) prints evidence lines under a red sync's REFUSED line
++(scripts/ci/upstream_sync_diagnostics.py). The updater used to print only the last 4 lines, so those
++evidence lines pushed the REFUSED line, its run URL and the failing job out of view. The gate here is a
++spawned fixture script, so the real subprocess path runs."""
++from hermes_cli import update_cmd_git
++
++
++def _gate(tmp_path, stdout_lines, code):
++    gate = tmp_path / "scripts" / "ci" / "upstream_sync.py"
++    gate.parent.mkdir(parents=True)
++    gate.write_text(f"import sys\nprint({chr(10).join(stdout_lines)!r})\nsys.exit({code})\n")
++    return gate
++
++
++def test_refused_line_and_evidence_survive_long_diagnostics(tmp_path, capsys):
++    diagnostics = ["  required job failure: Full suite / e2e https://ci.example/job/21 — 9 failing test(s)",
++                   *[f"      - tests/e2e/test_{n}.py::test_x" for n in range(9)],
++                   "  main baseline: bbbbbbbbbb (the sync's first parent, on main)",
++                   "  e2e: main-baseline failure: 9 failing test(s) also fail on main bbbbbbbbbb",
++                   "  nightly-e2e owner for this exact failing set: t_owner (running)"]
++    _gate(tmp_path, ["LANDED: an earlier candidate", "REFUSED: the full suite failed on aaaaaaaaaa: "
++                     "https://ci.example/run/20", *diagnostics], 1)
++    assert update_cmd_git._sync_fork_with_upstream(["git"], tmp_path) is False
++    out = capsys.readouterr().out
++    assert "REFUSED: the full suite failed on aaaaaaaaaa: https://ci.example/run/20" in out
++    assert "required job failure: Full suite / e2e" in out and "t_owner (running)" in out
++    assert "LANDED: an earlier candidate" not in out  # starts at the last verdict
++
++
++def test_short_gate_output_is_still_its_last_four_lines(tmp_path, capsys):
++    _gate(tmp_path, ["one", "LANDED x", "two", "NOT YET: staged y", "three"], 2)
++    assert update_cmd_git._sync_fork_with_upstream(["git"], tmp_path) is False
++    out = capsys.readouterr().out
++    assert "one" not in out and all(s in out for s in ("LANDED x", "two", "NOT YET: staged y", "three"))
++
++
++def test_report_is_capped():
++    lines = ["REFUSED: red", *[f"  line {n}" for n in range(100)]]
++    shown = update_cmd_git._gate_report("\n".join(lines))
++    assert shown[0] == "REFUSED: red" and len(shown) == update_cmd_git._GATE_REPORT_LINES + 1
++    assert shown[-1] == f"… {101 - update_cmd_git._GATE_REPORT_LINES} more line(s)"
+diff --git a/tests/scripts/ci/test_upstream_sync_diagnostics.py b/tests/scripts/ci/test_upstream_sync_diagnostics.py
+index aa9580b0f59..2e1f74663a1 100644
+--- a/tests/scripts/ci/test_upstream_sync_diagnostics.py
++++ b/tests/scripts/ci/test_upstream_sync_diagnostics.py
+@@ -398,28 +398,63 @@ def test_unavailable_candidate_log_makes_owner_lookup_unknown_not_no_owner(tmp_p
+     assert "nightly owner lookup unknown" in out and "no open nightly-e2e card matches" not in out
+ 
+ 
+-def test_corrupt_nightly_state_is_lookup_unavailable_not_no_owner(tmp_path, monkeypatch, capsys):
++@pytest.mark.parametrize("state_text", ["{not json", "[]", '{"cards": []}', '{"cards": {"KEY": "t_x"}}'])
++def test_corrupt_nightly_state_is_lookup_unavailable_not_no_owner(tmp_path, monkeypatch, capsys, state_text):
+     out = _real_owner_explain(FakeGitHub(**nightly_at(BASE, "failure", log(A))), tmp_path, monkeypatch, capsys,
+-                              "{not json")
++                              state_text.replace("KEY", failure_key([A])))
+     assert "main-baseline failure" in out
+     assert "nightly owner lookup unavailable" in out and "no open nightly-e2e card matches" not in out
+ 
+ 
+-CRASH_SECTION = ("\n2026-10-30T16:48:05Z === 1 file where the interpreter CRASHED mid-run (native fault — a real bug, "
+-                 "not a collection error; the tests that did run are not counted) ===\n"
+-                 "2026-10-30T16:48:05Z   tests/e2e/core/test_session.py\n")
+-TIMEOUT_SECTION = "\n2026-10-30T16:48:05Z (900s exceeded; process tree SIGKILL'd)\n"
++def test_timed_out_log_read_is_an_unavailable_log(tmp_path, monkeypatch, capsys):
++    github = FakeGitHub(**nightly_at(BASE, "failure", log(A)))
++    plain = github.gh
++
++    def gh(*args, reason=None):
++        if "/jobs/21/" in args[1]:
++            raise subprocess.TimeoutExpired(["gh", *args], 120)
++        return plain(*args, reason=reason)
++
++    github.gh = gh
++    out = explain(github, tmp_path, monkeypatch, capsys)
++    assert "diagnostics unavailable" not in out and "no failing test id parsed" in out
++    assert "main baseline:" in out  # the remaining evidence is still read
++
++
++WHOLE_FILE_HEADERS = [
++    "=== 1 file where the interpreter CRASHED mid-run (native fault — a real bug, not a collection error; "
++    "the tests that did run are not counted) ===",
++    "=== 2 files that FAILED AT IMPORT/COLLECTION (0 tests ran) ===",
++    "=== 1 file where no tests ran (timeout before collection, pytest usage error, etc.) ===",
++    "=== ✗ NO TESTS RAN — 0 collected across 3 files ===",
++    "(900s exceeded; process tree SIGKILL'd)",
++]
+ 
+ 
+-@pytest.mark.parametrize("section", [CRASH_SECTION, TIMEOUT_SECTION])
+-def test_baseline_whole_file_failure_never_yields_candidate_only(tmp_path, monkeypatch, capsys, section):
++@pytest.mark.parametrize("header", WHOLE_FILE_HEADERS)
++def test_baseline_whole_file_failure_never_yields_candidate_only(tmp_path, monkeypatch, capsys, header):
+     """Main crashed/timed out in A's file (no per-test line) and failed B: A failing on the candidate is unknown."""
+-    github = FakeGitHub(**nightly_at(BASE, "failure", log(B) + section))
++    github = FakeGitHub(**nightly_at(BASE, "failure", log(B) + f"\n2026-10-30T16:48:05Z {header}\n"))
+     out = explain(github, tmp_path, monkeypatch, capsys)
+     assert "candidate-only failure observed" not in out
+     assert "e2e: baseline comparison unknown for 1 test(s)" in out
+ 
+ 
++@pytest.mark.parametrize("header", ["=== 1 file with test failures ===", "=== 1 file with pytest ERRORs (fixture "
++                                    "setup/teardown; grep '^ERROR ' in the failure output) ==="])
++def test_per_test_failure_sections_keep_the_id_set_complete(tmp_path, monkeypatch, capsys, header):
++    github = FakeGitHub(**nightly_at(BASE, "failure", log(B) + f"\n2026-10-30T16:48:05Z {header}\n"))
++    assert "candidate-only failure observed" in explain(github, tmp_path, monkeypatch, capsys)
++
++
++CRASH_SECTION = f"\n2026-10-30T16:48:05Z {WHOLE_FILE_HEADERS[0]}\n2026-10-30T16:48:05Z   tests/e2e/core/test_session.py\n"
++
++
++def test_no_required_failure_points_at_the_run(tmp_path, monkeypatch, capsys):
++    out = explain(FakeGitHub(cand_jobs=candidate_jobs(e2e="success")), tmp_path, monkeypatch, capsys)
++    assert "no required job failed (missing required job evidence or a non-required failure): see the run" in out
++
++
+ def test_candidate_whole_file_failure_is_not_matched_to_an_owner(tmp_path, monkeypatch, capsys):
+     github = FakeGitHub(**nightly_at(BASE, "failure", log(A)))
+     github.logs[21] = log(A) + CRASH_SECTION
+-- 
+2.55.0
+

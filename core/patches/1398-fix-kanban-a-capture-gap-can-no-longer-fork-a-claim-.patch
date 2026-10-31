@@ -1,0 +1,401 @@
+From 097b54f5e25499aff88692fac3fa916274427c88 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 03:50:44 +0000
+Subject: [PATCH] fix(kanban): a capture gap can no longer fork a claim's run;
+ complete --force closes a parked card [daveey] (#409)
+
+* fix(kanban): a capture gap can no longer fork a claim's run; complete --force closes a parked card [daveey]
+
+Live (hub, 2026-10-30 23:43): a probe with a temp HERMES_HOME that inherited a worker's HERMES_KANBAN_DB
+opened the live board, read sync as off from its empty home and dropped every capture trigger for ~50 s.
+A claim in that gap left the lease's run uid in kanban_sync_state.pending_run_uid; the run row got another
+uid, the Board's echo made a second (pending_sync) run row with the lease uid (one dispatch, two runs, the
+first orphaned `running`), and the next local run insert on any card -- a manual `kanban complete` -- took the
+stale pending uid: UNIQUE constraint failed: task_runs.uid.
+
+- install_or_remove keeps the triggers of a board attached to the Board service unless that home's config
+  explicitly turns sync off (enabled: false, or a boards list without it); it logs instead.
+- claim_and_open_run writes the lease's run uid into the run row itself (no pending hand-off through the
+  insert trigger), clears any stale pending uid, and adopts a pending_sync placeholder of that uid when the
+  Board's echo was pulled before the claim txn.
+- complete_task(force=True) also closes a `scheduled` card, so `hermes kanban complete --force` finishes a
+  parked placement-forwarded card and archives its placed copy (#371's path) without an unblock race.
+
+* fix(kanban): workflow allows scheduled -> done, matching force-complete of a parked card [daveey]
+---
+ hermes_cli/kanban_admission.py                |  37 +++--
+ hermes_cli/kanban_db.py                       |   6 +-
+ hermes_cli/kanban_db_sync.py                  |  49 ++++++-
+ hermes_cli/kanban_workflow.py                 |   2 +-
+ tests/hermes_cli/test_kanban_placement.py     |  34 ++++-
+ .../test_kanban_sync_capture_gap.py           | 138 ++++++++++++++++++
+ 6 files changed, 246 insertions(+), 20 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_capture_gap.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 6c4742fca86..f322dfc7ef7 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -22,20 +22,35 @@ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, even
+     )
+     if cur.rowcount != 1:
+         return None
+-    kb._sync.stage_claim(conn, task_id, gate)
++    run_uid = kb._sync.stage_claim(conn, task_id, gate)
+     trow = conn.execute(
+         "SELECT assignee, max_runtime_seconds, current_step_key FROM tasks WHERE id = ?", (task_id,),
+     ).fetchone()
+-    run_cur = conn.execute(
+-        """
+-        INSERT INTO task_runs (
+-            task_id, profile, step_key, status, claim_lock, claim_expires, max_runtime_seconds, started_at
+-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+-        """,
+-        (task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
+-         lock, expires, trow["max_runtime_seconds"] if trow else None, now),
+-    )
+-    run_id = run_cur.lastrowid
++    fields = (trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
++              lock, expires, trow["max_runtime_seconds"] if trow else None, now)
++    # The lease's run uid goes into the row itself, so the run is the one the Board granted even when no
++    # capture trigger is installed (see ``stage_claim``). A Board echo of this claim pulled before this txn left
++    # a ``pending_sync`` placeholder with that uid: that row becomes the run, never a second one. [daveey]
++    placeholder = conn.execute(
++        "SELECT id FROM task_runs WHERE uid = ? AND task_id = ? AND status = 'pending_sync'", (run_uid, task_id),
++    ).fetchone() if run_uid else None
++    if placeholder is not None:
++        run_id = placeholder[0]
++        conn.execute(
++            "UPDATE task_runs SET profile = ?, step_key = ?, status = 'running', claim_lock = ?, claim_expires = ?, "
++            "max_runtime_seconds = ?, started_at = ? WHERE id = ?", (*fields, run_id),
++        )
++    else:
++        uid_col, uid_val = (", uid", (run_uid,)) if run_uid else ("", ())
++        run_cur = conn.execute(
++            f"""
++            INSERT INTO task_runs (
++                task_id, profile, step_key, status, claim_lock, claim_expires, max_runtime_seconds, started_at{uid_col}
++            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?{', ?' if run_uid else ''})
++            """,
++            (task_id, *fields, *uid_val),
++        )
++        run_id = run_cur.lastrowid
+     conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
+     kb._append_event(
+         conn, task_id, "claimed",
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 0f9fc48ce5f..ea3963d1690 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2796,9 +2796,7 @@ def complete_task(
+                    SET status       = 'done',
+                        result       = ?,
+                        completed_at = ?,
+-                       claim_lock   = NULL,
+-                       claim_expires= NULL,
+-                       worker_pid   = NULL,
++                       claim_lock   = NULL, claim_expires = NULL, worker_pid = NULL,
+                        block_kind   = NULL,
+                        human_request = NULL,
+                        block_recurrences = 0
+@@ -2806,6 +2804,8 @@ def complete_task(
+                    AND status IN ('running', 'ready', 'blocked', 'review')
+                 """
+         params: tuple = (result, now, task_id)
++        if force:  # [daveey] --force also closes a parked (e.g. placement-forwarded) card; its copy is archived below
++            sql = sql.replace("'review')", "'review', 'scheduled')")
+         if expected_run_id is not None:
+             sql += " AND current_run_id = ?"
+             params = (*params, int(expected_run_id))
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 14867507a9e..598727708d1 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -361,6 +361,15 @@ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+         _SYNCED_PATHS.discard(db_path)
+         if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                         "AND name LIKE 'kanban_sync_%' LIMIT 1").fetchone():
++            if _attached(conn) and not _explicitly_off(db_path):
++                # [daveey] A process whose kanban home has no sync setting (a probe with a temp HERMES_HOME that
++                # inherited a worker's HERMES_KANBAN_DB) must not detach a board the Board service owns: the gap it
++                # opened left a claim's run uid uncaptured, so the Board's echo made a second run row and the next
++                # local run insert failed UNIQUE(task_runs.uid). Detaching takes `kanban.sync.enabled: false` (or a
++                # `boards` list without this board) in that home, or `set_mode(conn, "off")`.
++                _log.warning("kanban sync: %s is attached to the Board service but this process's kanban home "
++                             "(%s) does not enable sync; leaving its capture triggers in place", db_path, _home_hint())
++                return
+             drop_triggers(conn)
+         return
+     conn.executescript(SYNC_SCHEMA_SQL)
+@@ -399,6 +408,32 @@ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+     _SYNCED_PATHS.add(db_path)
+ 
+ 
++def _attached(conn: sqlite3.Connection) -> bool:
++    """The file is bound to a Board-service board (not a ``local:`` id) and not detached to ``off``."""
++    try:
++        row = conn.execute("SELECT board_id, mode FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.Error:
++        return False
++    return bool(row) and not str(row[0]).startswith("local:") and row[1] != "off"
++
++
++def _explicitly_off(db_path: str) -> bool:
++    """The kanban home's config says sync is off for this board, as opposed to saying nothing (no config, no
++    ``kanban.sync``, unreadable)."""
++    cfg = sync_config()
++    if "enabled" in cfg and not cfg.get("enabled"):
++        return True
++    return bool(cfg.get("enabled")) and not board_selected(db_path)
++
++
++def _home_hint() -> str:
++    try:
++        from hermes_cli import kanban_db
++        return str(kanban_db.kanban_home())
++    except Exception:  # health: allow BLE001 -- log hint only
++        return "?"
++
++
+ def _queue_rows(conn: sqlite3.Connection, table: str, ids: list[int]) -> None:
+     """Queue full-row upserts for ``ids`` (rows a capture trigger never saw)."""
+     fields = "json_object(" + ", ".join(
+@@ -732,17 +767,23 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+     return ClaimGate(min(expires, deadline), lease=lease, ids=ids)
+ 
+ 
+-def stage_claim(conn: sqlite3.Connection, task_id: str, gate: Optional[ClaimGate]) -> None:
++def stage_claim(conn: sqlite3.Connection, task_id: str, gate: Optional[ClaimGate]) -> Optional[str]:
+     """Inside the claim txn, after the CAS won: mirror the lease onto the task
+-    and reserve its run uid for the run row the caller inserts next."""
++    and return its run uid for the run row the caller inserts next.
++
++    [daveey] The caller writes that uid into the run row itself. Handing it over through
++    ``kanban_sync_state.pending_run_uid`` (consumed by the insert trigger) failed whenever the trigger was missing:
++    the uid stayed pending, the Board's echo of the claim made a second run row with it, and the next local run
++    insert, on any card, failed UNIQUE(task_runs.uid). A stale pending uid is cleared here as well."""
+     if gate is None or gate.lease is None:
+-        return
++        return None
+     lease = gate.lease
+-    conn.execute("UPDATE kanban_sync_state SET pending_run_uid = ?", (lease.run_uid,))
++    conn.execute("UPDATE kanban_sync_state SET pending_run_uid = NULL WHERE pending_run_uid IS NOT NULL")
+     conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ?, "
+                  "lease_version = COALESCE(?, lease_version) WHERE id = ?",
+                  (gate._ids[1], lease.expires_ms, lease.version, task_id))
+     gate.consumed = True
++    return lease.run_uid
+ 
+ 
+ def _renewal_due(task_id: str, lease_expires_ms: int, ttl_s: int) -> bool:
+diff --git a/hermes_cli/kanban_workflow.py b/hermes_cli/kanban_workflow.py
+index 8f3ca6badbe..01991ff0e8b 100644
+--- a/hermes_cli/kanban_workflow.py
++++ b/hermes_cli/kanban_workflow.py
+@@ -125,7 +125,7 @@ DEFAULT_WORKFLOW = Workflow(
+     manual=_frozen_manual({
+         "triage": ("todo", "ready"),
+         "todo": ("triage", "scheduled", "ready"),
+-        "scheduled": ("triage", "todo", "ready"),
++        "scheduled": ("triage", "todo", "ready", "done"),  # done: force-complete a parked card
+         "ready": ("triage", "todo", "scheduled", "blocked", "review", "done"),
+         "running": ("triage", "todo", "scheduled", "ready", "blocked", "review", "done"),
+         "blocked": ("triage", "todo", "scheduled", "ready", "done"),
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 062efee7c8c..73857645049 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1497,13 +1497,45 @@ def test_refused_and_plain_completion_do_not_forward(mac, monkeypatch):
+     from hermes_cli import kanban_db_connect as kbc
+     with kbc.connect_closing() as conn:
+         child = _forwarded_card(mac, monkeypatch, conn)
+-        assert not kb.complete_task(conn, child, summary="Still scheduled", force=True)
++        assert not kb.complete_task(conn, child, summary="Still scheduled")  # parked: only --force closes it
+         plain = kb.create_task(conn, title="plain", assignee="default")
+         kb.recompute_ready(conn)
+         assert kb.complete_task(conn, plain, summary="Local only", force=True)
+         assert mac["calls"] == []
+ 
+ 
++def _cli(*argv: str) -> int:
++    import argparse
++    from hermes_cli import kanban as kc
++    top = argparse.ArgumentParser()
++    kc.build_parser(top.add_subparsers(dest="cmd"))
++    return kc.kanban_command(top.parse_args(["kanban", *argv]))
++
++
++@pytest.mark.parametrize("unblock_first", [False, True])
++def test_cli_force_complete_of_parked_forwarded_card_archives_its_copy(mac, monkeypatch, capsys, unblock_first):
++    """The real deferred-placement lifecycle (claim -> placement_forwarded with remote_task_id -> scheduled),
++    then the operator's `hermes kanban complete --force`, from where the card sits (scheduled) or after an
++    unblock (ready)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        assert kb.get_task(conn, child).status == "scheduled"
++        assert kpf.state(conn, child)["remote_task_id"] == HUB_TID
++        if unblock_first:
++            assert kb.unblock_task(conn, child)
++    assert _cli("complete", child, "--force", "--summary", "Finished by hand") == 0, capsys.readouterr()
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, child).status == "done"
++        kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (child,))]
++        assert "placement_archive_forwarded" in kinds, kinds
++        assert kpf.archive_forward_view(conn, child)["status"] == "pending"
++    assert [a[1:6] for a in _archive_requests(mac)] == [["request", "hub", "tasks", f"default/default/{HUB_TID}",
++                                                          "archive"]]
++
++
+ def test_archiving_a_forwarded_card_archives_the_remote_copy(mac, monkeypatch):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_gap.py b/tests/hermes_cli/test_kanban_sync_capture_gap.py
+new file mode 100644
+index 00000000000..1d9ce9899d4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_capture_gap.py
+@@ -0,0 +1,138 @@
++"""A capture gap on an attached board must not fork a claim's run.
++
++Live failure (hermes-hub, 2026-10-30 23:43): a probe script run by a Kanban worker set ``HERMES_HOME`` to a temp dir
++but inherited the worker's ``HERMES_KANBAN_DB`` (the live board). Its kanban home had no ``kanban.sync`` setting, so
++opening the board dropped every capture trigger. A dispatcher claim inside that ~50 s gap left the lease's run uid
++in ``kanban_sync_state.pending_run_uid`` (no insert trigger consumed it), the run row got a different uid, the
++Board's echo of the claim then made a second ``pending_sync`` run row with the lease uid (one dispatch, two runs; the
++crash ended the wrong one and the first stayed ``running`` forever), and the next local run insert on ANY card
++(a manual ``kanban complete``) took the stale pending uid and failed ``UNIQUE constraint failed: task_runs.uid``.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, BOARD = "hub", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def live(kanban_home, svc):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    previous = sync.set_lease_client(ksc.HubLeaseClient(svc.hub(ME)))
++    try:
++        yield conn
++    finally:
++        sync.set_lease_client(previous)
++        conn.close()
++
++
++def _triggers(conn) -> set[str]:
++    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' "
++                                       "AND name LIKE 'kanban_sync_%'")}
++
++
++def _round(kanban_home, svc):
++    res = ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    assert res.error is None and (res.push is None or res.push.rejected == 0)
++    return res
++
++
++def _reopen_from_foreign_home(tmp_path, monkeypatch, db, *, config: str | None) -> None:
++    """A fresh process whose HERMES_HOME is a temp dir but whose HERMES_KANBAN_DB pins the live board."""
++    other = tmp_path / "probe-home"
++    other.mkdir(exist_ok=True)
++    if config is not None:
++        (other / "config.yaml").write_text(config)
++    monkeypatch.setenv("HERMES_HOME", str(other))
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    kb._INITIALIZED_PATHS.clear()
++    sync._SYNCED_PATHS.clear()
++    with kbc.connect_closing(db):
++        pass
++
++
++@pytest.mark.parametrize("config", [None, "model: x\n", "kanban:\n  dispatch_interval_seconds: 5\n"])
++def test_a_process_whose_home_says_nothing_about_sync_keeps_an_attached_boards_triggers(
++        live, kanban_home, tmp_path, monkeypatch, config):
++    db = kanban_home / "kanban.db"
++    before = _triggers(live)
++    assert before
++    _reopen_from_foreign_home(tmp_path, monkeypatch, db, config=config)
++    assert _triggers(live) == before
++
++
++@pytest.mark.parametrize("config", ["kanban:\n  sync:\n    enabled: false\n",
++                                    "kanban:\n  sync:\n    enabled: true\n    boards: [other]\n"])
++def test_an_explicit_off_still_detaches_an_attached_board(live, kanban_home, tmp_path, monkeypatch, config):
++    _reopen_from_foreign_home(tmp_path, monkeypatch, kanban_home / "kanban.db", config=config)
++    assert _triggers(live) == set()
++
++
++def test_a_claim_without_capture_triggers_keeps_one_run_and_leaves_no_pending_uid(live, kanban_home, svc):
++    tid = kb.create_task(live, title="claimed in a capture gap", assignee="worker")
++    other = kb.create_task(live, title="completed by hand afterwards", assignee="worker")
++    _round(kanban_home, svc)
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)  # the gap: some process detached the board
++    claimed = kb.claim_task(live, tid, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++    assert claimed is not None
++    lease_uid = svc.board(BOARD)["leases"][tid]["run_uid"]
++    run = live.execute("SELECT id, uid FROM task_runs WHERE id = ?", (claimed.current_run_id,)).fetchone()
++    assert run["uid"] == lease_uid
++    assert live.execute("SELECT pending_run_uid FROM kanban_sync_state").fetchone()[0] is None
++    # The gap closes (the next normal process reinstalls the triggers) and the Board's echo comes back.
++    kb._INITIALIZED_PATHS.clear()
++    with kbc.connect_closing(kanban_home / "kanban.db"):
++        pass
++    assert _triggers(live)
++    _round(kanban_home, svc)
++    runs = live.execute("SELECT id, uid, status FROM task_runs WHERE task_id = ?", (tid,)).fetchall()
++    assert [(r["id"], r["uid"]) for r in runs] == [(run["id"], lease_uid)], [dict(r) for r in runs]
++    assert kb.get_task(live, tid).current_run_id == run["id"]
++    # The next local run insert, on another card, is not handed the claim's uid.
++    assert kb.complete_task(live, other, summary="done by hand", force=True)
++    assert len({r[0] for r in live.execute("SELECT uid FROM task_runs")}) == \
++        live.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
++
++
++def test_a_board_echo_pulled_before_the_claim_txn_is_adopted_as_the_run(live, kanban_home, svc, monkeypatch):
++    """The lease grant's echo can land between ``claim_gate`` and the claim transaction; its placeholder row is
++    the run, not a second one."""
++    tid = kb.create_task(live, title="echo first", assignee="worker")
++    _round(kanban_home, svc)
++    real_gate = sync.claim_gate
++
++    def gate_then_pull(conn, task_id, expires, lane="ready"):
++        gate = real_gate(conn, task_id, expires, lane)
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE kanban_sync_state SET applying = 1")
++            sync._local_run_id(conn, gate.lease.run_uid, task_id)
++            conn.execute("UPDATE kanban_sync_state SET applying = 0")
++        return gate
++
++    monkeypatch.setattr(sync, "claim_gate", gate_then_pull)
++    claimed = kb.claim_task(live, tid, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++    assert claimed is not None
++    runs = live.execute("SELECT id, uid, status FROM task_runs WHERE task_id = ?", (tid,)).fetchall()
++    assert len(runs) == 1 and runs[0]["status"] == "running" and runs[0]["id"] == claimed.current_run_id
+-- 
+2.55.0
+

@@ -1,0 +1,111 @@
+From 3ee37f99fb537f85fe53faf8146029829338b77d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 21:57:55 -0700
+Subject: [PATCH] fix(desktop): confirm archive warnings with a live task read
+ [daveey]
+
+A finished chat (12 done, green) showed "Kanban tasks: 7 open" in the archive
+dialog while no card was open.
+
+Why 1: the dialog printed the row's kanban_active=7 (desktop.log 21:32:49,
+kanban_waiting_on lists 7 done/archived cards).
+Why 2: annotate_kanban_activity adds chat-closeout's pending ids to
+kanban_active, so the sidebar stays "waiting" until the close-out turn runs.
+That count means "the chat owes a closing answer", not "tasks are open".
+Why 3: the wake that would clear it was refused twice ("has another live
+owner", 04:32 and 04:42 UTC) and only ran at 04:52, so the state lasted 20 min.
+Why 4: refreshArchiveTasks returned early on any fresh row, so the live read of
+/api/session-kanban-tasks, which lists only open cards, never ran.
+Why not caught: every test of the fresh path used a zero count or a real open
+card; none had a fresh row whose count holds pending close-outs.
+
+Fix: a fresh row that claims work is now read live before warning. An empty
+read archives without asking; a failed read keeps the row's count.
+
+Tests: confirm-linked-archive.test.ts adds settled-only, live-count and
+failed-read cases; the first two fail without this change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../confirm-linked-archive.test.ts            | 38 +++++++++++++++++++
+ .../refresh-archive-tasks.ts                  | 10 +++--
+ 2 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
+index 544394c60e5..b49d2f6113b 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
+@@ -111,3 +111,41 @@ it('retries a timed-out read once instead of reporting unknown', async () => {
+   expect(sessionCalls).toBe(2)
+   expect($confirmRequest.get()).toBeNull()
+ })
++
++const nowSeconds = () => Date.now() / 1000
++
++it('archives without asking when a fresh row only counts settled cards awaiting close-out', async () => {
++  const row = { id: 'settled', connection_id: 'owner', profile: 'work', kanban_active: 7, kanban_observed_at: nowSeconds() } as SessionInfo
++
++  const api = vi.fn(async ({ path }) => path.startsWith('/api/sessions/') ? { id: 'settled', parent_session_id: null } : { tasks: [] })
++
++  vi.stubGlobal('hermesDesktop', { api })
++  await expect(confirmLinkedArchive('settled', row, 'work', en.desktop)).resolves.toBe(true)
++  expect($confirmRequest.get()).toBeNull()
++})
++
++it('asks with the live count, not the row count, when a fresh row claims work', async () => {
++  const row = { id: 'mixed', connection_id: 'owner', profile: 'work', kanban_active: 7, kanban_observed_at: nowSeconds() } as SessionInfo
++
++  const api = vi.fn(async ({ path }) => path.startsWith('/api/sessions/')
++    ? { id: 'mixed', parent_session_id: null }
++    : { tasks: [{ id: 'task', status: 'running' }, { id: 'ask', status: 'blocked' }] })
++
++  vi.stubGlobal('hermesDesktop', { api })
++  const pending = confirmLinkedArchive('mixed', row, 'work', en.desktop)
++  await vi.waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++  expect($confirmRequest.get()?.details).toEqual([{ label: 'Kanban tasks', value: '1 open · 1 blocked' }])
++  settleConfirm(false)
++  await expect(pending).resolves.toBe(false)
++})
++
++it('keeps a fresh row\'s count when the live read fails', async () => {
++  const row = { id: 'offline', connection_id: 'owner', profile: 'work', kanban_active: 2, kanban_observed_at: nowSeconds() } as SessionInfo
++
++  vi.stubGlobal('hermesDesktop', { api: vi.fn(async () => { throw new Error('503') }) })
++  const pending = confirmLinkedArchive('offline', row, 'work', en.desktop)
++  await vi.waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++  expect($confirmRequest.get()?.details).toEqual([{ label: 'Kanban tasks', value: '2 open' }])
++  settleConfirm(false)
++  await expect(pending).resolves.toBe(false)
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+index deeee979706..632c9513a6c 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+@@ -13,9 +13,13 @@ const isTimeout = (error: unknown) => /timed out/i.test(String((error as Error)?
+ 
+ /** Expired sidebar evidence is a reason to read, not evidence of unfinished work.
+  * Capture the row owner before awaiting; never borrow the foreground gateway.
+- * Failed/malformed reads remain unknown, including incomplete ancestry. */
++ * Failed/malformed reads remain unknown, including incomplete ancestry.
++ * A fresh row that claims work is read too: its `kanban_active` also counts settled cards still waiting for the chat's
++ * close-out, which the task list leaves out, so only the read says what is open. If that read fails, the row stands. */
+ export async function refreshArchiveTasks(id: string, session: SessionInfo | undefined, profile: string | undefined): Promise<SessionInfo | undefined> {
+-  if (hasFreshKanbanObservation(session) && !session?.kanban_unknown && !session?.kanban_remote_stale) {
++  const fresh = hasFreshKanbanObservation(session) && !session?.kanban_unknown && !session?.kanban_remote_stale
++
++  if (fresh && !session?.kanban_active && !session?.kanban_blocked) {
+     return session
+   }
+ 
+@@ -24,7 +28,7 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+     profile: profile || session?.profile || 'default'
+   }
+ 
+-  const unknown = { ...session, kanban_unknown: true } as SessionInfo
++  const unknown = (fresh ? session : { ...session, kanban_unknown: true }) as SessionInfo
+   let settled = false
+ 
+   // An unknown verdict reaches the user as "Task status unavailable". Record
+-- 
+2.55.0
+

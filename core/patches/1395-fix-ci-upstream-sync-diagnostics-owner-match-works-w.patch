@@ -1,0 +1,370 @@
+From 38b04a4a255cecb318b6dc4325b79589c94ee1ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 03:04:36 +0000
+Subject: [PATCH] fix(ci): upstream-sync diagnostics: owner match works with
+ real kanban show, incomplete logs stay unknown [daveey]
+
+Exact-head review of ad6bc7467e1 found:
+- kanban show --json has no idempotency_key, so owner matching never succeeded live.
+  Provenance is now state key->id + created_by nightly-e2e + open + the body listing
+  exactly the set (a key, when a board returns one, must still match).
+- An unparsed/unavailable candidate e2e log printed 'no open card matches'; now 'owner
+  lookup unknown'. A corrupt state file raises into 'lookup unavailable'.
+- Whole-file crash/collection/no-tests/timeout sections mark a log's id set incomplete,
+  so main-side crashes can no longer yield 'candidate-only'.
+- Oldest nightlies after the base are read first; log reads share a 300 s budget.
+---
+ scripts/ci/upstream_sync_diagnostics.py       |  67 ++++++++--
+ .../ci/test_upstream_sync_diagnostics.py      | 120 ++++++++++++++++--
+ 2 files changed, 162 insertions(+), 25 deletions(-)
+
+diff --git a/scripts/ci/upstream_sync_diagnostics.py b/scripts/ci/upstream_sync_diagnostics.py
+index 63e78224f62..42878e041d0 100644
+--- a/scripts/ci/upstream_sync_diagnostics.py
++++ b/scripts/ci/upstream_sync_diagnostics.py
+@@ -17,11 +17,14 @@ failure only when a complete run of that job kind at the base (every job finishe
+ job's ids parsed) did not fail it; that is an observation, not proof that upstream caused it (tests flake). Anything
+ else is "baseline comparison unknown". The e2e failing set is then matched against the nightly reporter's cards
+ (``~/.hermes/state/nightly-e2e.json``, key = ``nightly_e2e.failure_key``): a card is named only when it is open, was
+-created by nightly-e2e and carries that exact key.
++created by nightly-e2e, is the state's card for that exact key and its body lists exactly that set. An e2e set that
++was not fully parsed (no ids, or a whole-file crash/timeout in the log) gets "owner lookup unknown".
+ """
+ from __future__ import annotations
+ 
++import json
+ import re
++import subprocess
+ import sys
+ import time
+ from dataclasses import dataclass, field
+@@ -29,7 +32,7 @@ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+ from flaky_kanban import OPEN
+-from nightly_e2e import DEFAULT_STATE, SETTLE_ERRORS, NightlyBoard, failure_key, failing_tests, load_state
++from nightly_e2e import DEFAULT_STATE, MAX_LISTED, SETTLE_ERRORS, NightlyBoard, failure_key, failing_tests
+ 
+ CI_WORKFLOW = ".github/workflows/ci.yaml"
+ NIGHTLY_WORKFLOW = ".github/workflows/nightly-e2e.yml"
+@@ -37,6 +40,11 @@ NIGHTLY_RUNS_CHECKED = 10
+ TESTED_SHA = re.compile(r"Z Testing \S+ = ([0-9a-f]{40})\s*$", re.MULTILINE)
+ SLICE = re.compile(r"^Run tests \((affected, )?\d+/\d+\)$")
+ LISTED = 20
++# run_tests_parallel.py fails whole files without per-test FAILED lines (crash, import/collection error, nothing ran,
++# file timeout): a log carrying one of these does not name every failing test, so its id set is incomplete.
++WHOLE_FILE_FAILURE = re.compile(r"=== \d+ files? (?:where the interpreter CRASHED|that FAILED AT IMPORT/COLLECTION"
++                                r"|where no tests ran)|=== ✗ NO TESTS RAN|s exceeded; process tree SIGKILL'd")
++LOG_BUDGET_SECONDS = 300.0  # total time spent reading job logs; later reads count as unavailable
+ 
+ 
+ def job_kind(name: str) -> str | None:
+@@ -53,7 +61,7 @@ class JobEvidence:
+     conclusion: str
+     url: str
+     ids: list[str] = field(default_factory=list)
+-    ids_known: bool = True  # a failed job whose log was read and named at least one test
++    ids_known: bool = True  # a failed job whose log was read and names every failing test
+ 
+ 
+ @dataclass
+@@ -87,7 +95,7 @@ def _evidence(gh_repo, job, gh) -> JobEvidence:
+         return ev
+     log = _log(gh_repo, job["id"], gh) if ev.conclusion == "failure" else None
+     ev.ids = failing_tests(log or "")
+-    ev.ids_known = bool(ev.ids)
++    ev.ids_known = bool(ev.ids) and not WHOLE_FILE_FAILURE.search(log or "")
+     return ev
+ 
+ 
+@@ -114,8 +122,9 @@ def baseline_runs(gh_repo, base, base_time: str, request, gh) -> list[dict]:
+     nightly = [r for page in request(f"repos/{gh_repo}/actions/workflows/nightly-e2e.yml/runs?event=workflow_dispatch"
+                                      f"&status=completed&created=%3E%3D{base_time}&per_page=100")
+                for r in page["workflow_runs"]]
++    # Oldest first: once main moves past the base, the nightlies that tested it are the earliest in this window.
+     nightly = sorted((r for r in nightly if r.get("path") == NIGHTLY_WORKFLOW and r.get("event") == "workflow_dispatch"
+-                      and r.get("status") == "completed"), key=lambda r: r["id"], reverse=True)
++                      and r.get("status") == "completed"), key=lambda r: r["id"])
+     found += [run for run in nightly[:NIGHTLY_RUNS_CHECKED] if _tested_sha(gh_repo, run["id"], request, gh) == base]
+     return sorted((r for r in found if r.get("status") == "completed"), key=lambda r: r["id"], reverse=True)
+ 
+@@ -132,20 +141,32 @@ def baseline(gh_repo, runs, kind, request, gh) -> BaselineEvidence | None:
+     return None
+ 
+ 
++def _lists_exactly(body: str, ids: list[str]) -> bool:
++    """The reporter's card body names this failing set: its count line and every listed id (nightly_e2e._card_body)."""
++    return f"Failing tests ({len(ids)}):" in body and all(f"- `{i}`" in body for i in ids[:MAX_LISTED])
++
++
+ def nightly_owner(ids, *, state_path: Path | None = None, board=None) -> str:
+-    """The open nightly-e2e card filed for exactly this failing set, else ''. Board errors raise."""
++    """The open nightly-e2e card filed for exactly this failing set, else ''. Unreadable state or board raises.
++
++    Provenance: the reporter's state maps ``failure_key`` -> card id, the card was created by nightly-e2e, and its body
++    lists exactly these ids. ``kanban show --json`` carries no idempotency key; a board that returns one must match."""
+     state_path = Path(state_path or DEFAULT_STATE)
+     if not ids or not state_path.exists():
+         return ""
+-    key = failure_key(list(ids))
+-    rec = load_state(state_path)["cards"].get(key)
++    ids = sorted(set(ids))
++    key = failure_key(ids)
++    state = json.loads(state_path.read_text(encoding="utf-8-sig"))  # corrupt/unreadable raises: never "no owner"
++    rec = (state.get("cards") or {}).get(key)
+     if not rec:
+         return ""
+     card = (board or NightlyBoard("hermes")).card(rec["id"])
+     if card is None:  # CliBoard.card answers None for a failed `hermes kanban show`: unknown, not "no owner"
+         raise RuntimeError(f"nightly card {rec['id']} for {key} is unreadable on this host's board")
++    idem = card.get("idempotency_key")
+     if (card.get("status") in OPEN and card.get("created_by") == "nightly-e2e"
+-            and str(card.get("idempotency_key") or "").startswith(f"nightly-e2e:{key}:")):
++            and (idem is None or str(idem).startswith(f"nightly-e2e:{key}:"))
++            and _lists_exactly(str(card.get("body") or ""), ids)):
+         return f"{card['id']} ({card['status']})"
+     return ""
+ 
+@@ -177,13 +198,15 @@ def compare(kind, failed: list[JobEvidence], base: str, evidence: BaselineEviden
+                      f"({evidence.url}) is incomplete (skipped/affected-only slices or unparsed failures)")
+     if not known:
+         state = "also failed" if any(j.conclusion == "failure" for j in evidence.jobs) else "passed"
+-        lines.append(f"  {kind}: baseline comparison unknown for a required job with no parsed test ids; main "
+-                     f"{short}'s {kind} {state} ({evidence.url})")
++        lines.append(f"  {kind}: baseline comparison unknown for a required job whose failing tests were not all "
++                     f"parsed; main {short}'s {kind} {state} ({evidence.url})")
+     return lines
+ 
+ 
+-def _owner_lines(candidate_ids, main_ids) -> list[str]:
++def _owner_lines(candidate_ids, main_ids, complete: bool) -> list[str]:
+     """The candidate's exact e2e set's owner; main's set's owner only when main fails a different set."""
++    if not candidate_ids or not complete:
++        return ["  nightly owner lookup unknown: the candidate's e2e failing set was not fully parsed from its log"]
+     if not Path(DEFAULT_STATE).exists():
+         return [f"  nightly owner lookup unavailable: no nightly-e2e state on this host ({DEFAULT_STATE}; "
+                 "it runs on hermes-hub)"]
+@@ -199,6 +222,18 @@ def _owner_lines(candidate_ids, main_ids) -> list[str]:
+     return lines
+ 
+ 
++def budgeted(gh, seconds: float, clock=time.monotonic):
++    """``gh`` until ``seconds`` have passed, then a failed read: diagnostics never hold the gate for long."""
++    deadline = clock() + seconds
++
++    def call(*args, **kwargs):
++        if clock() >= deadline:
++            return subprocess.CompletedProcess(args, 1, "", "diagnostics log-read budget spent")
++        return gh(*args, **kwargs)
++
++    return call
++
++
+ def fork_point(repo, head: str, main: str, git) -> tuple[str, str]:
+     """(sha, how): the main this sync was built on. Its first parent when that is on main, else the merge-base."""
+     first = git(repo, "rev-parse", f"{head}^1")
+@@ -209,12 +244,15 @@ def fork_point(repo, head: str, main: str, git) -> tuple[str, str]:
+ 
+ def explain(repo, cand, main: str, gh_repo: str, request, gh, *, required, git) -> None:
+     """Print the evidence lines for a red candidate (module doc). Raises on unreadable CI; the caller catches."""
++    gh = budgeted(gh, LOG_BUDGET_SECONDS)
+     failed = candidate_failures(gh_repo, cand.run_id, request, gh, required)
+     if not failed:
+-        print("  no required job failed: the run lacked required self-hosted job evidence, see the run")
++        print("  no required job failed (missing required job evidence or a non-required failure): see the run")
+         return
+     for job in failed:
+         tests = f" — {len(job.ids)} failing test(s){_listing(job.ids)}" if job.ids else " — no failing test id parsed"
++        if job.ids and not job.ids_known:
++            tests += "\n      (incomplete: the log also has whole-file crash/timeout/collection failures)"
+         print(f"  required job {job.conclusion}: {job.name} {job.url}{tests}")
+     base, how = fork_point(repo, cand.head, main, git)
+     print(f"  main baseline: {base[:10]} ({how})")
+@@ -229,5 +267,6 @@ def explain(repo, cand, main: str, gh_repo: str, request, gh, *, required, git)
+             print(line)
+         if kind == "e2e":
+             main_ids = sorted(evidence.failed_ids) if evidence else []
+-            for line in _owner_lines(sorted({i for j in of_kind for i in j.ids}), main_ids):
++            for line in _owner_lines(sorted({i for j in of_kind for i in j.ids}), main_ids,
++                                     all(j.ids_known for j in of_kind)):
+                 print(line)
+diff --git a/tests/scripts/ci/test_upstream_sync_diagnostics.py b/tests/scripts/ci/test_upstream_sync_diagnostics.py
+index 593498ade2c..aa9580b0f59 100644
+--- a/tests/scripts/ci/test_upstream_sync_diagnostics.py
++++ b/tests/scripts/ci/test_upstream_sync_diagnostics.py
+@@ -3,12 +3,14 @@ owner. Diagnostics are evidence only: they never change the gate's verdict and n
+ main already has. GitHub's API is a fixture; the job logs are real pytest summary line shapes."""
+ import json
+ import subprocess
++import sys
++from typing import Any
+ 
+ import pytest
+ 
+ from scripts.ci import upstream_sync as sync
+ from scripts.ci import upstream_sync_diagnostics as diag
+-from scripts.ci.nightly_e2e import failure_key
++from scripts.ci.nightly_e2e import _card_body, failure_key
+ 
+ BASE = "b" * 40
+ OTHER = "c" * 40
+@@ -86,7 +88,7 @@ class FakeGitHub:
+         return subprocess.CompletedProcess(args, 0, text, "")
+ 
+ 
+-def nightly_at(base, e2e_conclusion, e2e_log, run_id=50):
++def nightly_at(base, e2e_conclusion, e2e_log, run_id=50) -> dict[str, Any]:
+     """A nightly run that verifiably tested ``base`` (its Resolve ref log), with its e2e verdict and log."""
+     return dict(
+         nightlies=[nightly_run(run_id)],
+@@ -189,7 +191,8 @@ def test_unparsed_candidate_failure_states_baseline_fact_without_attribution(tmp
+     github.logs[21] = "2026-10-30T16:48:05Z Error: the job ran out of disk\n"
+     out = explain(github, tmp_path, monkeypatch, capsys)
+     assert "no failing test id parsed" in out
+-    assert "baseline comparison unknown for a required job with no parsed test ids" in out and "also failed" in out
++    assert "baseline comparison unknown for a required job whose failing tests were not all parsed" in out
++    assert "also failed" in out
+     assert "candidate-only" not in out
+ 
+ 
+@@ -222,22 +225,33 @@ def test_no_nightly_state_on_this_host_is_unavailable_not_no_owner(tmp_path, mon
+     assert "no open nightly-e2e card matches" not in out
+ 
+ 
+-@pytest.mark.parametrize("status,creator,key_matches,expected", [
+-    ("running", "nightly-e2e", True, True), ("blocked", "nightly-e2e", True, True),
+-    ("done", "nightly-e2e", True, False), ("archived", "nightly-e2e", True, False),
+-    ("running", "default", True, False), ("running", "nightly-e2e", False, False),
++def card_body(ids):
++    """The body the nightly reporter files for this failing set (its real renderer)."""
++    entry = {"ref": "main", "sha": BASE, "dispatched_at": BASE_TIME, "url": "https://ci.example/run/50"}
++    return _card_body("failed", entry, sorted(ids), "=== Summary: 1 failed ===")
++
++
++@pytest.mark.parametrize("status,creator,idem,body_ids,expected", [
++    ("running", "nightly-e2e", "match", (A, B), True), ("blocked", "nightly-e2e", "match", (A, B), True),
++    ("running", "nightly-e2e", None, (A, B), True),  # `kanban show --json` returns no idempotency key
++    ("done", "nightly-e2e", "match", (A, B), False), ("archived", "nightly-e2e", "match", (A, B), False),
++    ("running", "default", "match", (A, B), False), ("running", "nightly-e2e", "other", (A, B), False),
++    ("running", "nightly-e2e", None, (A,), False), ("running", "nightly-e2e", None, (A, B, PY), False),
+ ])
+-def test_owner_requires_open_nightly_provenance_and_the_exact_fingerprint(tmp_path, status, creator, key_matches,
++def test_owner_requires_open_nightly_provenance_and_the_exact_fingerprint(tmp_path, status, creator, idem, body_ids,
+                                                                            expected):
+     key = failure_key([A, B])
+     state = tmp_path / "nightly.json"
+     state.write_text(json.dumps({"cards": {key: {"id": "t_owner", "n": 1}}}))
++    keys = {"match": f"nightly-e2e:{key}:1", "other": "nightly-e2e:failed-000000000000:1"}
+ 
+     class Board:
+         def card(self, card_id):
+             assert card_id == "t_owner"
+-            return {"id": card_id, "status": status, "created_by": creator,
+-                    "idempotency_key": f"nightly-e2e:{key if key_matches else 'failed-000000000000'}:1"}
++            card = {"id": card_id, "status": status, "created_by": creator, "body": card_body(body_ids)}
++            if idem:
++                card["idempotency_key"] = keys[idem]
++            return card
+ 
+     assert bool(diag.nightly_owner([B, A], state_path=state, board=Board())) is expected
+     assert diag.nightly_owner([A], state_path=state, board=Board()) == ""  # a subset is a different set
+@@ -341,7 +355,7 @@ def test_owner_of_mains_different_set_is_never_labelled_exact(tmp_path, monkeypa
+     key = failure_key([A])
+     state.write_text(json.dumps({"cards": {key: {"id": "t_main", "n": 1}}}))
+     board = StateBoard({"t_main": {"id": "t_main", "status": "running", "created_by": "nightly-e2e",
+-                                   "idempotency_key": f"nightly-e2e:{key}:1"}})
++                                   "body": card_body([A])}})
+     monkeypatch.setattr(diag, "DEFAULT_STATE", state)
+     monkeypatch.setattr(diag, "NightlyBoard", lambda *a, **k: board)
+     cand = sync.Candidate("a" * 40, "red", "https://ci.example/run/20", 0, run_id=20)
+@@ -351,3 +365,87 @@ def test_owner_of_mains_different_set_is_never_labelled_exact(tmp_path, monkeypa
+     assert "no open nightly-e2e card matches this exact e2e failing set" in out
+     assert "main's own e2e failing set (a different set) is owned by nightly-e2e card t_main (running)" in out
+     assert "owner for this exact failing set" not in out
++
++
++def test_owner_found_through_the_real_kanban_show_json_shape(tmp_path):
++    """The board is a spawned `hermes` fixture printing `kanban show --json`'s field set (no idempotency_key)."""
++    key = failure_key([A, B])
++    state = tmp_path / "nightly.json"
++    state.write_text(json.dumps({"cards": {key: {"id": "t_owner", "n": 1}}}))
++    task = {"id": "t_owner", "title": "Nightly e2e RED on main", "body": card_body([A, B]), "assignee": "default",
++            "status": "ready", "created_by": "nightly-e2e", "created_at": BASE_TIME, "skills": []}
++    fake = tmp_path / "hermes"
++    fake.write_text(f"#!{sys.executable}\nimport json, sys\nassert sys.argv[1:] == ['kanban', 'show', 't_owner', "
++                    f"'--json'], sys.argv\nprint(json.dumps({{'task': {task!r}, 'comments': []}}))\n")
++    fake.chmod(0o755)
++    assert diag.nightly_owner([A, B], state_path=state, board=diag.NightlyBoard(str(fake))) == "t_owner (ready)"
++
++
++def _real_owner_explain(github, tmp_path, monkeypatch, capsys, state_text):
++    state = tmp_path / "nightly-e2e.json"
++    state.write_text(state_text)
++    monkeypatch.setattr(diag, "DEFAULT_STATE", state)
++    monkeypatch.setattr(diag, "NightlyBoard", lambda *a, **k: StateBoard({}))
++    cand = sync.Candidate("a" * 40, "red", "https://ci.example/run/20", 0, run_id=20)
++    diag.explain(tmp_path, cand, "main", "example/fork", github.request, github.gh,
++                 required=sync.REQUIRED_JOBS, git=fake_git)
++    return capsys.readouterr().out
++
++
++def test_unavailable_candidate_log_makes_owner_lookup_unknown_not_no_owner(tmp_path, monkeypatch, capsys):
++    out = _real_owner_explain(_with(_nightly_green(), logs={21: None}), tmp_path, monkeypatch, capsys, "{}")
++    assert "no failing test id parsed" in out
++    assert "nightly owner lookup unknown" in out and "no open nightly-e2e card matches" not in out
++
++
++def test_corrupt_nightly_state_is_lookup_unavailable_not_no_owner(tmp_path, monkeypatch, capsys):
++    out = _real_owner_explain(FakeGitHub(**nightly_at(BASE, "failure", log(A))), tmp_path, monkeypatch, capsys,
++                              "{not json")
++    assert "main-baseline failure" in out
++    assert "nightly owner lookup unavailable" in out and "no open nightly-e2e card matches" not in out
++
++
++CRASH_SECTION = ("\n2026-10-30T16:48:05Z === 1 file where the interpreter CRASHED mid-run (native fault — a real bug, "
++                 "not a collection error; the tests that did run are not counted) ===\n"
++                 "2026-10-30T16:48:05Z   tests/e2e/core/test_session.py\n")
++TIMEOUT_SECTION = "\n2026-10-30T16:48:05Z (900s exceeded; process tree SIGKILL'd)\n"
++
++
++@pytest.mark.parametrize("section", [CRASH_SECTION, TIMEOUT_SECTION])
++def test_baseline_whole_file_failure_never_yields_candidate_only(tmp_path, monkeypatch, capsys, section):
++    """Main crashed/timed out in A's file (no per-test line) and failed B: A failing on the candidate is unknown."""
++    github = FakeGitHub(**nightly_at(BASE, "failure", log(B) + section))
++    out = explain(github, tmp_path, monkeypatch, capsys)
++    assert "candidate-only failure observed" not in out
++    assert "e2e: baseline comparison unknown for 1 test(s)" in out
++
++
++def test_candidate_whole_file_failure_is_not_matched_to_an_owner(tmp_path, monkeypatch, capsys):
++    github = FakeGitHub(**nightly_at(BASE, "failure", log(A)))
++    github.logs[21] = log(A) + CRASH_SECTION
++    out = _real_owner_explain(github, tmp_path, monkeypatch, capsys, "{}")
++    assert "main-baseline failure" in out  # the parsed id is still compared
++    assert "nightly owner lookup unknown" in out and "no open nightly-e2e card matches" not in out
++
++
++def test_the_oldest_nightlies_after_the_base_are_read_first(tmp_path, monkeypatch, capsys):
++    """Main moved on: twelve later nightlies tested other shas; only the oldest one tested the base."""
++    base = nightly_at(BASE, "failure", log(A), run_id=100)
++    nightlies, jobs, logs = list(base["nightlies"]), dict(base["jobs"]), dict(base["logs"])
++    for n in range(1, 13):
++        rid = 100 + 10 * n
++        nightlies.append(nightly_run(rid))
++        jobs[rid] = [job(rid + 1, "Resolve ref", "success")]
++        logs[rid + 1] = f"2026-10-31T00:42:42Z Testing main = {OTHER}\n"
++    out = explain(FakeGitHub(nightlies=nightlies, jobs=jobs, logs=logs), tmp_path, monkeypatch, capsys)
++    assert "main-baseline failure" in out and "https://ci.example/run/100" in out
++
++
++def test_spent_log_budget_reads_as_unavailable():
++    ticks = iter([0.0, 1.0, 301.0])
++    calls = []
++    gh = diag.budgeted(lambda *a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0, "log", ""), 300,
++                       clock=lambda: next(ticks))
++    assert gh("api", "x").returncode == 0
++    late = gh("api", "y")
++    assert late.returncode == 1 and "budget" in late.stderr and calls == [("api", "x")]
+-- 
+2.55.0
+

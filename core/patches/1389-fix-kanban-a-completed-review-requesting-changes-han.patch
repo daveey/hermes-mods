@@ -1,0 +1,138 @@
+From 801824d02a388333d681517439d02606ef60833c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 03:11:51 +0000
+Subject: [PATCH] fix(kanban): a completed review requesting changes hands the
+ PR back to its author [daveey]
+
+---
+ hermes_cli/kanban_dependency_review.py        | 47 +++++++++++++++----
+ .../test_kanban_dependency_review.py          | 43 +++++++++++++++++
+ 2 files changed, 80 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index ae4da2e3183..fd35ccd0d9d 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -93,20 +93,47 @@ def _exact_head(data) -> bool:
+     )
+ 
+ 
+-def _reviewed_pr(conn, parent_id, parked_at, owner_run_id):
+-    """Repair evidence: changes_required plus reviewed_sha and the PR URL."""
++_CHANGES_VERDICTS = frozenset({"changes_required", "request_changes", "requested_changes", "changes_requested"})
++_SUMMARY_VERDICT = re.compile(r"\bVERDICT:\s*(REQUEST(?:ED)?[_ -]CHANGES|CHANGES[_ -](?:REQUIRED|REQUESTED))\b", re.IGNORECASE)
++_SUMMARY_PR_NUM = re.compile(r"\bPR\s*#(\d+)", re.IGNORECASE)
++
++
++def _requests_changes(row, data) -> bool:
++    """True when the completed review's verdict is a change request.
++
++    Reviewers write ``verdict: REQUEST_CHANGES`` (or only ``approved: false`` plus a
++    ``VERDICT: REQUEST_CHANGES`` summary line), not the literal ``changes_required``.
++    """
++    verdict = data.get("verdict")
++    if isinstance(verdict, str) and verdict.strip():
++        return re.sub(r"[\s-]+", "_", verdict.strip().lower()) in _CHANGES_VERDICTS
++    if data.get("approved") is not False:
++        return False
++    return bool(_SUMMARY_VERDICT.search(row["summary"] or ""))
++
++
++def _reviewed_prs(conn, parent_id, parked_at, owner_run_id, captured: set[str]) -> set[str]:
++    """Repair evidence: a change request at an exact head, bound to one PR.
++
++    A named ``pr`` is the only PR covered. With none, the authenticated checkpoint
++    is the binding, unless the summary names ``PR #N`` that matches none of it.
++    """
+     from hermes_cli import kanban_db as kb
+ 
+     row = _completed_review_run(conn, parent_id, parked_at, owner_run_id)
+     if row is None:
+-        return None
++        return set()
+     data = kb._json_dict(row["metadata"])
+     sha = data.get("reviewed_sha")
+-    pr = _named_pr(data)
+-    if (data.get("verdict") != "changes_required" or not isinstance(sha, str)
+-            or not _SHA.fullmatch(sha) or pr is None):
+-        return None
+-    return pr
++    if not isinstance(sha, str) or not _SHA.fullmatch(sha) or not _requests_changes(row, data):
++        return set()
++    named = _named_pr(data)
++    if named is not None:
++        return {named}
++    nums = set(_SUMMARY_PR_NUM.findall(row["summary"] or ""))
++    if nums:
++        return {u for u in captured if u.rsplit("/", 1)[-1] in nums}
++    return set(captured)
+ 
+ 
+ def _approval_prs(conn, parent_id, parked_at, owner_run_id, captured: set[str]) -> set[str]:
+@@ -161,10 +188,10 @@ def resumes_review(conn, task_id, pr_urls):
+     parked_at = kb._to_epoch(row["created_at"])
+     if parked_at is None:
+         return False
+-    reviewed = {_reviewed_pr(conn, p, parked_at, row["id"]) for p in parents}
++    captured_set = {u.rstrip("/").lower() for u in captured}
++    reviewed = set().union(*(_reviewed_prs(conn, p, parked_at, row["id"], captured_set) for p in parents))
+     if urls.issubset(reviewed):
+         return True
+-    captured_set = {u.rstrip("/").lower() for u in captured}
+     # Every parent must authorize. One exact-head approval does not cover a
+     # sibling that never reviewed, and a named unrelated PR does not cover
+     # the checkpoint set.
+diff --git a/tests/hermes_cli/test_kanban_dependency_review.py b/tests/hermes_cli/test_kanban_dependency_review.py
+index adda3fe340d..fb37c901cf5 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review.py
++++ b/tests/hermes_cli/test_kanban_dependency_review.py
+@@ -119,3 +119,46 @@ def test_new_pr_after_exact_head_approval_stays_held(board):
+     finish_reviews(board, reviews, metadata={"verdict": "APPROVE", "head": HEAD})
+     worker_comment(board, task, "dev", "Opened a new head " + PR + "9")
+     assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++SHA = "c" * 40
++
++
++def _finish(board, reviews, metadata, summary):
++    for review in reviews:
++        kb.claim_task(board, review)
++        run = kb.get_task(board, review).current_run_id
++        assert kb.complete_task(board, review, summary=summary, expected_run_id=run, metadata=metadata)
++    kb.recompute_ready(board)
++
++
++@pytest.mark.parametrize("metadata,summary", [
++    ({"verdict": "REQUEST_CHANGES", "reviewed_sha": SHA, "approved": False}, "VERDICT: REQUEST_CHANGES on PR #10"),
++    ({"verdict": "request-changes", "reviewed_sha": SHA, "pr": PR}, "Review complete"),
++    ({"approved": False, "reviewed_sha": SHA}, "VERDICT: REQUEST_CHANGES on PR #10 at " + SHA),
++])
++def test_review_request_changes_hands_pr_back_to_author(board, metadata, summary):
++    """Production shape: reviewers write REQUEST_CHANGES, not changes_required, and no ``pr``.
++    The author's own later PR comment must not re-arm the hold; one continuation only."""
++    task, reviews = parked(board)
++    _finish(board, reviews, metadata, summary)
++    worker_comment(board, task, "dev", "Waiting on review of " + PR)
++    assert dispatch.check_respawn_guard(board, task) is None
++    assert kb.claim_task(board, task) is not None
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    assert kb.reclaim_task(board, task, reason="Worker died", signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("metadata,summary", [
++    ({"verdict": "REQUEST_CHANGES", "reviewed_sha": SHA, "pr": PR + "1"}, "x"),
++    ({"verdict": "REQUEST_CHANGES", "reviewed_sha": SHA}, "VERDICT: REQUEST_CHANGES on PR #99"),
++    ({"verdict": "REQUEST_CHANGES"}, "no exact head"),
++    ({"verdict": "approved", "reviewed_sha": "short"}, "VERDICT: REQUEST_CHANGES"),
++    ({"approved": False}, "Looks fine, nothing about a verdict"),
++])
++def test_review_request_changes_for_other_pr_or_without_head_stays_held(board, metadata, summary):
++    task, reviews = parked(board)
++    _finish(board, reviews, metadata, summary)
++    worker_comment(board, task, "dev", "Waiting on review of " + PR)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
+-- 
+2.55.0
+

@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1381 patches, one entry per non-merge source commit through `b1af31437760e139cc4729fdbd513ca9c276e8f8`.
+1415 patches, one entry per non-merge source commit through `160518392aaf58cec3b8ac04d9712e635b05fdf5`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -24,10 +24,49 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `6bb377a51d5c8e279a7a5e34d717d653d421d064`; current merge-base: `ef35e8b9e1a8bc7f0efb50e4f2d68f1ec052f6a8`.
 Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with an explicit upstream-merge bridge immediately before patch 1328. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-The snapshot's full verifier exits 0 with [mirror-replay-1381.json](mirror-replay-1381.json) (one hash-pinned bridge) and [mirror-policy-1381.json](mirror-policy-1381.json).
-The current snapshot's executed checks are in [mirror-1381-verification.md](mirror-1381-verification.md), with its policy [mirror-policy-1381.json](mirror-policy-1381.json) (previous snapshots: [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+The snapshot's full verifier exits 0 with [mirror-replay-1415.json](mirror-replay-1415.json) (one hash-pinned bridge) and [mirror-policy-1415.json](mirror-policy-1415.json).
+The current snapshot's executed checks are in [mirror-1415-verification.md](mirror-1415-verification.md), with its policy [mirror-policy-1415.json](mirror-policy-1415.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1382–1415
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Cron fixture cleanup scope](kanban-claim-scope-and-review-fixes.md) | 1382 | Test tool/CLI creator-scoped fixture archive authority, source `88e03dbdf9` |
+| [Nightly E2E acceptance markers](nightly-e2e-acceptance-markers.md) | 1383 | Name tested refs and scope acceptance fixture alerts; source `ba77f929233d` |
+| [Nightly E2E production isolation](nightly-e2e-acceptance-markers.md) | 1384 | Preserve pending main incidents and strip inherited creator identity; source `da4cba694371` |
+| [Nightly E2E owner-run pairing](nightly-e2e-acceptance-markers.md) | 1385 | Pair fixture owner task with its live run and strip ordinary-create run identity; source `8092734fd79e` |
+| [Nightly E2E fixture requirements](nightly-e2e-acceptance-markers.md) | 1386 | Declare fixture agent creates with --no-requires; source `8d9612cd7f24` |
+| [Inherited enclosing run scope](kanban-claim-scope-and-review-fixes.md) | 1387 | Accept a submitter's mismatched run scope only when shared by the gateway, source `154de342db` |
+| [Receipt-gated notify reconcile](kanban-notify-reconcile.md) | 1388 | `reconcile_refused_sub` retires wrong-local refused-send tui subs only on exact owner transcript receipt, source `f8c39f0e` |
+| [Review change-request handback](kanban-claim-scope-and-review-fixes.md) | 1389 | Recognize completed change-request evidence for one authenticated PR repair continuation, source `801824d02a` |
+| [Nightly E2E current-run selection](nightly-e2e-acceptance-markers.md) | 1390 | Select the show payload current run, refuse ambiguity, and skip dotenv-dependent tests when absent; source `85ca95df9102` |
+| [Flaky test docstring ordering](nightly-e2e-acceptance-markers.md) | 1391 | Restore docstring before dependency skip in the CLI board regression; source `12369ec78f7c` |
+| [Kanban show current run JSON](nightly-e2e-acceptance-markers.md) | 1392 | Serialize current_run_id with an in-process real show regression; source `e205e8367bdb` |
+| [Upstream-sync refusal diagnostics](upstream-sync-refused-diagnostics.md) | 1393 | Name required jobs/tests and compare exact main-baseline evidence without changing REFUSED; source `a219c0c52cae`. |
+| [Upstream-sync evidence selection](upstream-sync-refused-diagnostics.md) | 1394 | Prefer main first parent, share baseline discovery and distinguish main-set ownership; source `f8989e8d7313`. |
+| [Upstream-sync owner matching](upstream-sync-refused-diagnostics.md) | 1395 | Match CLI-shaped nightly cards, keep incomplete logs unknown and budget log reads; source `38b04a4a255c`. |
+| [Updater refusal visibility](upstream-sync-refused-diagnostics.md) | 1396 | Preserve gate verdict under diagnostics, tolerate log timeouts and validate state maps; source `b8600f6f813a`. |
+| [Updater evidence-first report cap](upstream-sync-refused-diagnostics.md) | 1397 | Drop test-ID listing lines before evidence when the gate report exceeds its cap; source `2947ddb1f550`. |
+| [Claim UID and parked completion](kanban-claim-scope-and-review-fixes.md) | 1398 | Keep lease/run identity through capture gaps and force-complete scheduled cards with archive forwarding, source `097b54f5e2` |
+| [Reader recovery observation order](kanban-claim-scope-and-review-fixes.md) | 1399 | Snapshot handles before reading live shared-memory identity, source `c6acc8f8e4` |
+| [create_overlap compares targets](kanban-create-overlap-targets.md) | 1400 | `kanban_create` overlap check vetoes matches naming a different repo, host, process or inverted-check revision; waiter exemption; one read per pinned board file, source `f5a83d2f11` |
+| [create_overlap target veto narrowed](kanban-create-overlap-targets.md) | 1401 | Drops ticket-number veto; whole-token hosts, gateway/pid-only process, stricter repo/inversion/waits_on rules, source `13205355ab` |
+| [create_overlap ignores ports, gpu indices, repo asides](kanban-create-overlap-targets.md) | 1402 | Ports, `gpuN`, `metta-3` spelling and one-off body repo mentions no longer distinguish targets; wider negated waits, source `29b193a1dc` |
+| [OSC11 straggler test deflake](mirror-runtime-follow-ups-1382.md) | 1403 | Straggler written from the tcsetattr restore, no sleep race; `20f46da` |
+| [Archive warnings use live task read](mirror-runtime-follow-ups-1382.md) | 1404 | Fresh rows claiming open Kanban work are re-read live before the archive warning; `3ee37f9` |
+| [Windows attach e2e upload non-blocking](mirror-runtime-follow-ups-1382.md) | 1405 | Failure-artifact upload continue-on-error, 1-day retention; `88a09ef` |
+| [Artifact uploads never decide a check](mirror-runtime-follow-ups-1382.md) | 1406 | Test pins continue-on-error uploads and no download-artifact behind the required gate; `5286331` |
+| [Retired worker generation logs a warning](mirror-runtime-follow-ups-1382.md) | 1407 | Interrupted-turn stale_generation and lease release log WARNING, not ERROR; `4885a5e` |
+| [Machine-pin create explanation](kanban-claim-scope-and-review-fixes.md) | 1408 | Preserve machine-specific Board-lease reason in tool create placement output and logs, source `e3bd1c8cd1` |
+| [Checkpoint size cap touches only this project](mirror-runtime-follow-ups-1382.md) | 1409 | Take-path cap drops one snapshot of this project per pending gc; stale-gc warning; `5437847` |
+| [Admission rides out a busy update lock](mirror-runtime-follow-ups-1382.md) | 1410 | AdmissionBusy retry up to 0.5 s; holds still refuse at once; `84e2354` |
+| [Sidebar lists this Mac's chats from registry primary](mirror-runtime-follow-ups-1382.md) | 1411 | Own recents read from the registry primary, passive for local; `d86463b` |
+| [Reconcile_notify supervisor op](kanban-notify-reconcile.md) | 1412 | Worker-filed `reconcile_notify` op; non-worker executor reads owner receipts via hermes-hub, two-phase, source `d739a5e2` |
+| [Reconcile executor hub_cli_path](kanban-notify-reconcile.md) | 1413 | Executor resolves hermes-hub through `hub_cli_path()` instead of `HERMES_HUB_BIN`, source `816682ae` |
+| [Reconcile executor lockguard-exempt](kanban-notify-reconcile.md) | 1414 | Marks executor's read-only `state.db`/`hub.db` opens `noqa: kanban-lockguard`, source `2b855ee2` |
+| [Handshake-timeout race logs INFO](websockets-keepalive-logging.md) | 1415 | `unexpected internal error` + `EOFError("stream ended")` from a connect() timing out mid-handshake becomes one INFO line; other exceptions keep ERROR; `_HANDLED` is now message -> predicate, source `160518392a`. |
 
 ## Mirror follow-ups 1376–1381
 
@@ -140,7 +179,7 @@ python3 -B core/verify_mirror.py \
   --policy core/mirror-policy-NNNN.json
 ```
 
-For the 1381 snapshot, also pass `--replay-plan core/mirror-replay-1381.json` and use `--policy core/mirror-policy-1381.json`.
+For the 1415 snapshot, also pass `--replay-plan core/mirror-replay-1415.json` and use `--policy core/mirror-policy-1415.json`.
 This explicit opt-in pins the historical replay start and a bridge's boundary by source SHA, its source merge and its diff by SHA-256. Starts and merge IDs must be full commit IDs; merge ancestry, boundary membership and unique boundaries are validated. Bridge paths are relative to the plan, without parent traversal. Each uninterrupted patch segment is replayed in published order, then the bridge is applied with `git apply --index --3way` and committed. No source patch is skipped; final tree comparison is unchanged. The merge label documents provenance; the diff hash binds the reviewed public bridge (which may contain normalization), not an automatically regenerated source diff.
 
 Exit 0 is the acceptance step for every mirror pass; record its JSON line in the snapshot's
@@ -510,7 +549,7 @@ not something the public fixture CI can perform without the source repository.
 | [process-exit-log-noise.md](process-exit-log-noise.md) | 0620 | A process exit mid-turn logs one line, not a traceback, in the pre-final gate, tool executor and errors.log. |
 | [test-host-slot-cap.md](test-host-slot-cap.md) | 0607 0702 | xdist workers are capped per host test slot (and by the host's `tests.xdist_workers`); a full `max_in_progress` is reported as idle, not stuck. |
 | [hub-project-groups.md](hub-project-groups.md) | 0626 0627 | Every gateway's project groups come from the hub replica when that gateway can't be reached (or before it answers), so an asleep gateway's groups stay; another gateway's declared project can be renamed or themed from here as a hub shared field, applied by its owner when it wakes (`hermes project tree` / `project update`). |
-| [websockets-keepalive-logging.md](websockets-keepalive-logging.md) | 0622 | A websockets peer that stops answering pings is a handled drop: every Hermes connection passes `logger=ws_logger()`, so the library's `ERROR keepalive ping failed` + traceback becomes one INFO line (errors.log and self-heal stay quiet; Kanban sync still reconnects). code_health HX015 flags a new `connect()`/`serve()` without `logger=`. |
+| [websockets-keepalive-logging.md](websockets-keepalive-logging.md) | 0622, 1415 | A websockets peer that stops answering pings is a handled drop: every Hermes connection passes `logger=ws_logger()`, so the library's `ERROR keepalive ping failed` + traceback becomes one INFO line (errors.log and self-heal stay quiet; Kanban sync still reconnects). code_health HX015 flags a new `connect()`/`serve()` without `logger=`. 1415 also demotes the library's `unexpected internal error` / `EOFError("stream ended")` handshake-timeout race to INFO. |
 | [desktop-planned-exit-notice.md](desktop-planned-exit-notice.md) | 0972 | A backend stopped by a core update (live update marker) shows a quiet "Updating Hermes…" notice instead of the red "stopped working in the background" card, never fails the boot overlay; crash cards dedupe by id and clear when the backend serves again. |
 | [desktop-remote-update-pause.md](desktop-remote-update-pause.md) | 0605 0606 | While a remote gateway runs its own `hermes update`, its SSH dials pause per host: requests and prewarm fail fast from the cached refusal and one probe per backoff window (2–30 s) checks for the end, instead of a new SSH control master per request (53 in 108 s on 2026-10-27); the connection comes back once. |
 | [desktop-remote-dial-backoff.md](desktop-remote-dial-backoff.md) | 0618 | A remote that cannot be dialed (host down, refused, SSH timeout, rejected credentials) is remembered by the same gate as 0605: requests and prewarm fail fast from the cached error and one probe per backoff window (2–60 s) checks for it, instead of one SSH control master and a 15 s wait per request (11 dials, 36 stalled requests in 2 min on 2026-10-27); Reload and retry, apply/save and a reachable Test dial at once. |
@@ -936,3 +975,4 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [1368-entry mirror snapshot](mirror-1368-verification.md) | verification report | Appends 1327–1368; `verify_mirror.py` exits 0 with policy [mirror-policy-1368.json](mirror-policy-1368.json). |
 | [1375-entry mirror snapshot](mirror-1375-verification.md) | verification report | Appends 1369–1375; full inventory, replay and tree acceptance with the snapshot-bound policy and replay plan. |
 | [1381-entry mirror snapshot](mirror-1381-verification.md) | verification report | Appends 1376–1381; full replay/tree acceptance and 60 passing targeted source tests. |
+| [1415-entry mirror snapshot](mirror-1415-verification.md) | verification report | Appends 1382–1415; full replay/tree acceptance with two re-pinned historical fingerprints. |

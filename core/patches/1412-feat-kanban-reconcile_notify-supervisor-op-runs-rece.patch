@@ -1,0 +1,1134 @@
+From d739a5e2b1499f67a668e21add59e4c12f88a187 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:14:50 +0000
+Subject: [PATCH] feat(kanban): reconcile_notify supervisor op runs
+ receipt-gated reconcile_refused_sub outside the worker fence [daveey]
+
+A Kanban worker cannot run kanban_notify_reconcile.reconcile_refused_sub: every
+worker subprocess is write-fenced. It now files kanban_supervisor_request op
+{op: reconcile_notify, task_id, chat_id, thread_id?} (no evidence fields) and the
+non-worker executor (dispatcher tick / supervisor-requests --drain) runs it.
+
+hermes_cli/kanban_notify_reconcile_exec.py reads the evidence itself from the
+owner gateway: a hermes-hub notice-receipts request (client >= 1.9.24) against the
+owner's own session store, for the exact pending remote:<gw>:<profile>/<board>/
+<task>:<event> keys; candidate owner from the task's hub subscription. Phase 1
+mints and queues one read per (gw, profile, chat) and parks the request in phase
+awaiting_owner; phase 2 polls hub.db sent rows each drain without spending
+delivery attempts. Only a done answer whose envelope and echo match backs the
+unchanged reconcile_refused_sub; every other outcome (no receipt, unknown owner,
+unreadable local store, local chat, owner read failed, owner silent 24 h,
+mismatch, new completion since the read) keeps the row. Never sends, wakes or
+moves cursors. Results land as supervisor_request_* event + comment.
+
+Kanban t_01a190436c055e7d.
+---
+ hermes_cli/kanban_notify_reconcile_exec.py    | 407 ++++++++++++++
+ hermes_cli/kanban_supervisor_requests.py      |  49 +-
+ .../test_kanban_notify_reconcile_exec.py      | 500 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |  16 +-
+ 4 files changed, 963 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_notify_reconcile_exec.py
+ create mode 100644 tests/hermes_cli/test_kanban_notify_reconcile_exec.py
+
+diff --git a/hermes_cli/kanban_notify_reconcile_exec.py b/hermes_cli/kanban_notify_reconcile_exec.py
+new file mode 100644
+index 00000000000..04f13123617
+--- /dev/null
++++ b/hermes_cli/kanban_notify_reconcile_exec.py
+@@ -0,0 +1,407 @@
++"""Non-worker executor for ``reconcile_notify`` supervisor requests. [daveey]
++
++``kanban_notify_reconcile.reconcile_refused_sub`` retires a wrong-local ``platform='tui'``
++``send_refused`` subscription for a chat another gateway owns, but it mutates the board, and every
++Kanban worker process is write-fenced (``kanban_db_fence``). A worker therefore files a
++``kanban_supervisor_request`` op ``{"op": "reconcile_notify", "task_id", "chat_id", "thread_id"?}`` and
++the dispatcher (or ``hermes kanban supervisor-requests --drain``) runs it here. The request names the row
++only: no evidence is accepted from the worker.
++
++Evidence is read from the owner gateway itself, through a hermes-hub request (client >= 1.9.24):
++``sessions/<profile>/<chat>`` action ``notice-receipts`` with the exact pending
++``remote:<self gw>:<profile>/<board>/<task>:<event>`` keys. The owner answers from its own session store
++(core's lineage-aware ``SessionDB.kanban_notice_keys_delivered``); the courier only lets the request's
++``to_gw`` post the result, and the result lands in this host's hub.db ``sent`` row.
++
++Two phases, so the dispatcher tick never blocks on another machine:
++
++1. :func:`start` (after acceptance) picks the candidate owner from the task's existing ``platform='hub'``
++   subscription (``<gw>/<profile>/<chat>``, exactly one other gateway), mints one read id per
++   (gateway, profile, chat), stores them in the request's ``result_json`` (phase ``awaiting_owner``) and
++   queues the reads. The request stays ``accepted``.
++2. :func:`poll` (every drain) takes waiting requests by compare-and-swap, without spending a delivery
++   attempt, and reads the ``sent`` rows. ``done`` with a matching envelope and echo is the only evidence;
++   it backs the readers of the unchanged ``reconcile_refused_sub``. Any other owner outcome, a missing
++   answer past :data:`OWNER_DEADLINE_S`, or a mismatch keeps the row (retryable by a new request).
++
++Never sends, wakes a chat, or moves a cursor. The requester gets the usual ``supervisor_request_*`` event
++and comment through ``kanban_supervisor_requests._finish``.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import secrets
++import shutil
++import sqlite3
++import subprocess
++import time
++from pathlib import Path
++from typing import Optional
++
++_log = logging.getLogger(__name__)
++
++OP = "reconcile_notify"
++PHASE = "awaiting_owner"
++ACTION = "notice-receipts"
++OWNER_DEADLINE_S = 24 * 3600  # a sleeping laptop answers late; the courier keeps a request 7 days
++MAX_KEYS = 50  # the owner's per-request limit (hermes-hub notice_keys)
++HUB_TIMEOUT_S = 30
++_FIELDS = {"op", "task_id", "chat_id", "thread_id"}
++_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
++_FAILED = ("rejected", "expired", "failed", "quarantined")
++
++
++# --- request shape ---------------------------------------------------------------------------------
++
++def normalize_op(i: int, op: dict) -> dict:
++    from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++    extra = set(op) - _FIELDS
++    if extra:
++        raise SupervisorRequestError("invalid_ops", f"op {i}: {OP} takes only task_id, chat_id, thread_id "
++                                     f"(no evidence fields; the executor reads the owner itself): {sorted(extra)}")
++    task, chat = str(op.get("task_id") or "").strip(), str(op.get("chat_id") or "").strip()
++    thread = str(op.get("thread_id") or "").strip()
++    if not task or not _NAME.fullmatch(chat):
++        raise SupervisorRequestError("invalid_ops", f"op {i}: {OP} needs task_id and a plain chat_id")
++    return {"op": OP, "task_id": task, "chat_id": chat, "thread_id": thread}
++
++
++def label(op: dict) -> str:
++    if op.get("op") == OP:
++        return f"{OP} {op['task_id']} tui:{op['chat_id']}" + (f"#{op['thread_id']}" if op.get("thread_id") else "")
++    return f"{op['op']} {op['parent_id']} -> {op['child_id']}"
++
++
++def _tui_row(conn, op):
++    return conn.execute(
++        "SELECT * FROM kanban_notify_subs WHERE task_id=? AND platform='tui' AND chat_id=? AND thread_id=?",
++        (op["task_id"], op["chat_id"], op["thread_id"])).fetchone()
++
++
++def preflight_op(conn: sqlite3.Connection, op: dict) -> dict:
++    """``supervisor`` for a send_refused tui row, ``noop`` when the row is gone, else ``refused``."""
++    from hermes_cli import kanban_db_notify as notify
++    verdict = dict(op)
++    if conn.execute("SELECT 1 FROM tasks WHERE id=?", (op["task_id"],)).fetchone() is None:
++        return {**verdict, "verdict": "refused", "reason": f"unknown task {op['task_id']}"}
++    row = _tui_row(conn, op)
++    if row is None:
++        return {**verdict, "verdict": "noop", "reason": "no tui subscription for that chat"}
++    reason = notify._decode_notify_delivery_metadata(row["delivery_metadata"]).get("reason")
++    if reason != "send_refused":
++        return {**verdict, "verdict": "refused", "reason": f"only send_refused rows are reconciled (this one: {reason})"}
++    return {**verdict, "verdict": "supervisor"}
++
++
++# --- local identity and readers --------------------------------------------------------------------
++
++def publisher(conn: sqlite3.Connection) -> tuple[str, str]:
++    """(profile, board) under which hermes-hub publishes this board's tasks, from the db file path."""
++    from hermes_constants import get_default_hermes_root
++    row = next((r for r in conn.execute("PRAGMA database_list") if r[1] == "main"), None)
++    if not row or not row[2]:
++        raise ValueError("board database has no file")
++    path, root = Path(row[2]).resolve(), get_default_hermes_root().resolve()
++    homes = {root: "default"}
++    if (root / "profiles").is_dir():
++        homes.update({p.resolve(): p.name for p in (root / "profiles").iterdir() if p.is_dir()})
++    if path.name == "kanban.db" and path.parent in homes:
++        return homes[path.parent], "default"
++    if path.name == "kanban.db" and path.parent.parent.name == "boards" and path.parents[3] in homes \
++            and path.parents[2].name == "kanban":
++        return homes[path.parents[3]], path.parent.name
++    raise ValueError(f"board {path} is not under a hermes-hub published home ({root})")
++
++
++def local_session_exists(_profile: str, chat: str) -> bool:
++    """Whether any profile's session store on THIS host has ``chat``. An unreadable store raises."""
++    from hermes_constants import get_default_hermes_root
++    root = get_default_hermes_root()
++    stores = [root / "state.db"]
++    if (root / "profiles").is_dir():
++        stores += sorted(p / "state.db" for p in (root / "profiles").iterdir() if p.is_dir())
++    for store in stores:
++        if not store.exists():
++            continue
++        conn = sqlite3.connect(f"file:{store}?mode=ro", uri=True, timeout=10)
++        try:
++            if conn.execute("SELECT 1 FROM sessions WHERE id=?", (chat,)).fetchone():
++                return True
++        finally:
++            conn.close()
++    return False
++
++
++def _hub_candidates(conn, op, self_gw) -> list[tuple[str, str]]:
++    """(gateway, profile) of the task's hub subscriptions for this chat on another gateway."""
++    out = []
++    for (chat_id,) in conn.execute(
++            "SELECT chat_id FROM kanban_notify_subs WHERE task_id=? AND platform='hub' AND thread_id=?",
++            (op["task_id"], op["thread_id"])):
++        parts = str(chat_id).split("/")
++        if len(parts) == 3 and parts[2] == op["chat_id"] and parts[0] != self_gw and all(map(_NAME.fullmatch, parts)):
++            out.append((parts[0], parts[1]))
++    return sorted(set(out))
++
++
++# --- hermes-hub boundary ---------------------------------------------------------------------------
++
++def _hub_bin() -> str:
++    return os.environ.get("HERMES_HUB_BIN") or shutil.which("hermes-hub") or str(Path.home() / ".local/bin/hermes-hub")
++
++
++def _run_hub(argv: list[str]) -> tuple[int, str, str]:
++    """The hermes-hub CLI (argv boundary; tests replace this)."""
++    try:
++        p = subprocess.run([_hub_bin(), *argv], capture_output=True, text=True, encoding="utf-8", errors="replace",
++                           timeout=HUB_TIMEOUT_S, check=False)
++        return p.returncode, p.stdout, p.stderr
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return 127, "", str(exc)
++
++
++def _queue(read: dict) -> Optional[str]:
++    """Queue (idempotently: same id, same envelope) one owner read. Returns an error that ends the request."""
++    rc, out, err = _run_hub(["request", read["to_gw"], "sessions", f"{read['profile']}/{read['chat']}", ACTION,
++                             "--arg", "keys=" + ",".join(read["keys"]), "--id", read["id"]])
++    if rc == 0:
++        return None
++    text = (err or out or f"exit {rc}").strip()[:300]
++    if "request_id_conflict" in text or "unknown_gateway" in text:
++        return f"owner read {read['id']} could not be queued: {text}"
++    _log.warning("notify reconcile: queueing owner read %s failed (%s); retrying next drain", read["id"], text)
++    return None
++
++
++def _sent(read_id: str) -> Optional[dict]:
++    from hermes_cli.kanban_capability_registry import hub_db_path
++    path = hub_db_path()
++    if not path.exists():
++        return None
++    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
++    try:
++        row = conn.execute("SELECT body, state, result FROM sent WHERE id=?", (read_id,)).fetchone()
++    finally:
++        conn.close()
++    if row is None:
++        return None
++    return {"body": json.loads(row[0] or "{}"), "state": row[1],
++            "result": json.loads(row[2]) if row[2] else None}
++
++
++def _evidence(read: dict, sent: dict) -> dict:
++    """The owner's answer, only if the stored envelope and the result's echo match this read exactly."""
++    body, res = sent["body"], sent["result"]
++    want = {"id": read["id"], "to_gw": read["to_gw"], "coll": "sessions", "key": f"{read['profile']}/{read['chat']}",
++            "action": ACTION, "args": {"keys": ",".join(read["keys"])}}
++    if any(body.get(k) != v for k, v in want.items()):
++        raise ValueError(f"owner read {read['id']}: stored envelope does not match")
++    if not isinstance(res, dict) or res.get("code") != "notice_receipts" or res.get("profile") != read["profile"] \
++            or res.get("session") != read["chat"] or res.get("keys") != read["keys"] \
++            or type(res.get("session_exists")) is not bool or not isinstance(res.get("delivered"), list) \
++            or not set(res["delivered"]) <= set(read["keys"]):
++        raise ValueError(f"owner read {read['id']}: answer does not echo the request")
++    return res
++
++
++# --- phases ----------------------------------------------------------------------------------------
++
++def _save(conn, req, executor, state: dict, now: int) -> bool:
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        cur = conn.execute(
++            "UPDATE supervisor_requests SET result_json=?, lease_expires=? WHERE id=? AND status='accepted' AND executor=?",
++            (json.dumps(state), now + _lease(), req["id"], executor))
++    return cur.rowcount == 1
++
++
++def _lease() -> int:
++    from hermes_cli.kanban_supervisor_requests import LEASE_SECONDS
++    return LEASE_SECONDS
++
++
++def _reconcile(conn, op, ident, *, owner_ans: Optional[dict] = None, read: Optional[dict] = None) -> str:
++    from hermes_cli.kanban_notify_reconcile import reconcile_refused_sub
++
++    def owner(profile, chat):
++        if owner_ans is None or read is None or chat != read["chat"] or profile != read["profile"] or not owner_ans["session_exists"]:
++            return None
++        return read["to_gw"], profile
++
++    def delivered(gw, profile, chat, keys):
++        if read is None or owner_ans is None or (gw, profile, chat) != (read["to_gw"], read["profile"], read["chat"]) \
++                or not set(keys) <= set(read["keys"]):
++            raise ValueError("pending notices changed since the owner was asked")
++        return set(owner_ans["delivered"]) & set(keys)
++
++    return reconcile_refused_sub(conn, task_id=op["task_id"], chat_id=op["chat_id"], thread_id=op["thread_id"],
++                                 source_gateway=ident["gateway"], source_profile=ident["profile"],
++                                 board=ident["board"], local_session_exists=local_session_exists,
++                                 owner=owner, delivered_keys=delivered)
++
++
++def start(conn: sqlite3.Connection, req: dict, executor: str, *, now: Optional[int] = None) -> str:
++    """Phase 1. Returns the request status (``awaiting_owner`` while it waits)."""
++    from hermes_cli.kanban_capability_registry import self_gateway
++    from hermes_cli.kanban_notify_reconcile import _pending
++    now = int(time.time()) if now is None else now
++    ops = req["ops"]
++    gw = self_gateway()
++    try:
++        profile, board = publisher(conn)
++    except ValueError as exc:
++        return _end(conn, req, executor, "failed", [{**o, "outcome": "not_applied"} for o in ops], str(exc))
++    if not gw:
++        return _end(conn, req, executor, "failed", [{**o, "outcome": "not_applied"} for o in ops],
++                    "this host has no hermes-hub gateway identity")
++    ident = {"gateway": gw, "profile": profile, "board": board}
++    results: list[Optional[dict]] = [None] * len(ops)
++    reads: dict[tuple, dict] = {}
++    for i, op in enumerate(ops):
++        cands = _hub_candidates(conn, op, gw)
++        row = _tui_row(conn, op)
++        if row is None or len(cands) != 1:
++            # No (or no single) remote route: reconcile_refused_sub gives the canonical outcome without
++            # any owner evidence (absent, provenance_mismatch, local_owner, unknown_owner, ...).
++            results[i] = {**op, "outcome": _reconcile(conn, op, ident)}
++            if len(cands) > 1:
++                results[i]["detail"] = "hub routes on several gateways: " + ", ".join(g for g, _ in cands)
++            continue
++        to_gw, owner_profile = cands[0]
++        if owner_profile != (row["notifier_profile"] or "default"):
++            results[i] = {**op, "outcome": "unknown_owner", "detail": "hub route names another profile"}
++            continue
++        events = _pending(conn, op["task_id"], row["last_event_id"])
++        if not events or any(kind != "completed" for _, kind in events):
++            # Same outcomes reconcile_refused_sub gives; no receipt can justify these, so the owner is not asked.
++            results[i] = {**op, "outcome": "unsupported_events" if events else "nothing_pending"}
++            continue
++        keys = [f"remote:{gw}:{profile}/{board}/{op['task_id']}:{eid}" for eid, _ in events]
++        read = reads.setdefault((to_gw, owner_profile, op["chat_id"]), {
++            "id": f"nr-{gw}-{req['id']}-{secrets.token_hex(6)}-{len(reads)}", "to_gw": to_gw,
++            "profile": owner_profile, "chat": op["chat_id"], "keys": [], "ops": []})
++        read["keys"] = sorted(set(read["keys"]) | set(keys))
++        read["ops"].append(i)
++    if any(len(r["keys"]) > MAX_KEYS for r in reads.values()):
++        return _end(conn, req, executor, "rejected", [{**o, "outcome": "not_applied"} for o in ops],
++                    f"more than {MAX_KEYS} pending notices for one chat; split the request")
++    if not reads:
++        return _end(conn, req, executor, "done", results, None)
++    state = {"phase": PHASE, "deadline": now + OWNER_DEADLINE_S, "ident": ident,
++             "reads": list(reads.values()), "results": results}
++    if not _save(conn, req, executor, state, now):
++        return "lost_lease"
++    for read in state["reads"]:
++        error = _queue(read)
++        if error:
++            return _end(conn, req, executor, "failed", _kept(ops, results, "evidence_unavailable"), error)
++    return PHASE
++
++
++def _kept(ops, results, outcome, detail=None):
++    return [r or {**o, "outcome": outcome, **({"detail": detail} if detail else {})} for o, r in zip(ops, results)]
++
++
++def _end(conn, req, executor, status, results, error) -> str:
++    from hermes_cli.kanban_supervisor_requests import _finish
++    return status if _finish(conn, req, executor, status, results=results, error=error) else "lost_lease"
++
++
++def _take(conn, rid: int, holder: Optional[str], executor: str, now: int) -> Optional[dict]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_supervisor_requests import _row
++    with kb.write_txn(conn):
++        cur = conn.execute(
++            "UPDATE supervisor_requests SET executor=?, lease_expires=? WHERE id=? AND status='accepted' "
++            "AND COALESCE(executor,'')=?", (executor, now + _lease(), rid, holder or ""))
++        if cur.rowcount != 1:
++            return None
++        return _row(conn.execute("SELECT * FROM supervisor_requests WHERE id=?", (rid,)).fetchone())
++
++
++def awaiting(conn: sqlite3.Connection) -> list:
++    return conn.execute(
++        "SELECT id, executor, lease_expires FROM supervisor_requests WHERE status='accepted' AND result_json IS NOT NULL "
++        "AND json_valid(result_json) AND json_extract(result_json, '$.phase')=? ORDER BY id", (PHASE,)).fetchall()
++
++
++def poll(conn: sqlite3.Connection, executor: str, *, now: Optional[int] = None) -> list[tuple[int, str]]:
++    """Phase 2 over every waiting request. Does not spend delivery attempts."""
++    from hermes_cli.kanban_supervisor_requests import (SupervisorRequestError, _executor_dead,
++                                                       _non_worker_refusal)
++    refusal = _non_worker_refusal()
++    if refusal:
++        raise SupervisorRequestError("worker_context", refusal)
++    now = int(time.time()) if now is None else now
++    processed = []
++    for rid, holder, lease in awaiting(conn):
++        if holder != executor and lease and int(lease) > now and not _executor_dead(holder):
++            continue  # another live executor polls it
++        req = _take(conn, int(rid), holder, executor, now)
++        if req is None:
++            continue
++        try:
++            status = _advance(conn, req, executor, now)
++        except Exception as exc:  # health: allow BLE001 -- recorded on the request; the row is kept
++            _log.exception("notify reconcile request %s failed", rid)
++            from hermes_cli.kanban_supervisor_requests import _row
++            fresh = _row(conn.execute("SELECT * FROM supervisor_requests WHERE id=?", (int(rid),)).fetchone())
++            saved = (fresh.get("result") or {}).get("results") or [None] * len(req["ops"])  # incl. reads settled earlier
++            status = _end(conn, req, executor, "failed", _kept(req["ops"], saved, "evidence_unavailable"),
++                          f"{type(exc).__name__}: {exc}"[:500])
++        if status != PHASE:
++            processed.append((int(rid), status))
++    return processed
++
++
++def _advance(conn, req, executor, now) -> str:
++    state = req["result"]
++    ops, results, ident = req["ops"], list(state["results"]), state["ident"]
++    waiting = []
++    for read in state["reads"]:
++        if all(results[i] is not None for i in read["ops"]):
++            continue  # settled on an earlier poll; re-running it would relabel a retired row "absent"
++        try:
++            sent = _sent(read["id"])
++        except (sqlite3.Error, ValueError) as exc:
++            _log.warning("notify reconcile: reading owner read %s failed (%s); retrying next drain", read["id"], exc)
++            waiting.append(read)
++            continue
++        if sent is None:
++            error = _queue(read)  # never queued (hub CLI was down): same id, same envelope
++            if error:
++                for i in read["ops"]:
++                    results[i] = {**ops[i], "outcome": "evidence_unavailable", "detail": error}
++                continue
++            waiting.append(read)
++        elif sent["state"] == "done":
++            try:
++                ans = _evidence(read, sent)
++            except ValueError as exc:
++                for i in read["ops"]:
++                    results[i] = {**ops[i], "outcome": "evidence_unavailable", "detail": str(exc)}
++                continue
++            for i in read["ops"]:
++                results[i] = {**ops[i], "outcome": _reconcile(conn, ops[i], ident, owner_ans=ans, read=read),
++                              "owner": read["to_gw"]}
++            if not _save(conn, req, executor, {**state, "results": results}, now):
++                return "lost_lease"  # rows this read retired stay retired; the report is the new holder's
++        elif sent["state"] in _FAILED:
++            err = (sent["result"] or {}).get("code") or (sent["result"] or {}).get("error") or sent["state"]
++            for i in read["ops"]:
++                results[i] = {**ops[i], "outcome": "evidence_unavailable",
++                              "detail": f"owner {read['to_gw']} read {sent['state']}: {err}"[:300]}
++        else:
++            waiting.append(read)
++    if waiting and now < int(state["deadline"]):
++        state = {**state, "results": results}
++        return PHASE if _save(conn, req, executor, state, now) else "lost_lease"
++    if waiting:
++        names = ", ".join(sorted({r["to_gw"] for r in waiting}))
++        return _end(conn, req, executor, "failed", _kept(ops, results, "evidence_unavailable",
++                                                         f"owner {names} did not answer"),
++                    f"owner {names} did not answer within {OWNER_DEADLINE_S // 3600} h; rows kept")
++    return _end(conn, req, executor, "done", results, None)
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index 12593da3334..1aaac12f10f 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -22,6 +22,9 @@ This module is the narrow contract between the two:
+   A crash after acceptance leaves the row ``accepted``; the lease expiring (or the
+   executor pid being gone on this host) puts it back up for redelivery, and ops are
+   idempotent (an edge already present/absent counts as applied).
++* **reconcile_notify** ops (``kanban_notify_reconcile_exec``) retire a wrong-local refused-send tui
++  subscription. Their execution waits on the owner gateway's own receipt read (phase
++  ``awaiting_owner``), which ``drain`` polls without spending delivery attempts.
+ * **Receipt**: every transition appends a ``supervisor_request_*`` event, and the
+   terminal one a comment, on the requester's card. A requester parked ``scheduled`` is
+   woken, also when it parks only after the result landed. A result never completes, unblocks or releases the requester; a rejected or
+@@ -44,7 +47,9 @@ MAX_OPS = 20
+ MAX_ATTEMPTS = 5
+ LEASE_SECONDS = 120
+ EXECUTOR_FRESH_SECONDS = 300
+-OPS = ("link", "unlink")  # link: preview only (dry_run); a request carries unlink ops
++OPS = ("link", "unlink", "reconcile_notify")  # link: preview only (dry_run); a request carries unlink ops
++# reconcile_notify: retire a wrong-local refused-send tui subscription on owner-read receipts
++# (hermes_cli/kanban_notify_reconcile_exec.py). A request carries only those, or only edge ops.
+ ACTIVE = ("pending", "accepted")
+ TERMINAL = ("done", "rejected", "failed")
+ COMMENT_AUTHOR = "kanban-supervisor"
+@@ -108,6 +113,10 @@ def normalize_ops(ops: Any) -> list[dict]:
+         if not isinstance(op, dict):
+             raise SupervisorRequestError("invalid_ops", f"op {i} is not an object")
+         kind = str(op.get("op") or "").strip()
++        if kind == "reconcile_notify":
++            from hermes_cli import kanban_notify_reconcile_exec as nrx
++            out.append(nrx.normalize_op(i, op))
++            continue
+         parent = str(op.get("parent_id") or "").strip()
+         child = str(op.get("child_id") or "").strip()
+         if kind not in OPS:
+@@ -115,9 +124,20 @@ def normalize_ops(ops: Any) -> list[dict]:
+         if not parent or not child or parent == child:
+             raise SupervisorRequestError("invalid_ops", f"op {i}: distinct parent_id and child_id are required")
+         out.append({"op": kind, "parent_id": parent, "child_id": child})
++    if len({o["op"] == "reconcile_notify" for o in out}) > 1:
++        raise SupervisorRequestError("invalid_ops", "a request carries only reconcile_notify ops or only edge ops")
+     return out
+ 
+ 
++def _is_reconcile(ops: list[dict]) -> bool:
++    return bool(ops) and ops[0].get("op") == "reconcile_notify"
++
++
++def op_label(op: dict) -> str:
++    from hermes_cli import kanban_notify_reconcile_exec as nrx
++    return nrx.label(op)
++
++
+ def dedupe_key(requester: str, ops: list[dict]) -> str:
+     return hashlib.sha256(json.dumps([requester, ops], sort_keys=True).encode()).hexdigest()
+ 
+@@ -182,6 +202,11 @@ def preflight(conn: sqlite3.Connection, requester: str, ops: list[dict]) -> list
+     """Per-op verdict: ``self`` (the worker may do it with kanban_link/unlink itself),
+     ``supervisor`` (in scope, needs the executor), ``noop`` (already in that state) or
+     ``refused`` with a reason. Ops are simulated in order on the current graph."""
++    if _is_reconcile(ops):
++        # No creator-scope rule: the owner-read receipt gate is the safety (it only retires a row the
++        # owner gateway proves delivered), and any worker may hit a phantom unseen row on any card.
++        from hermes_cli import kanban_notify_reconcile_exec as nrx
++        return [nrx.preflight_op(conn, op) for op in ops]
+     edges = _edges(conn)
+     verdicts = []
+     for op in ops:
+@@ -300,7 +325,7 @@ def submit(conn: sqlite3.Connection, *, env_task: Optional[str], env_run: Option
+             "only unlinks")
+     if refused:
+         raise SupervisorRequestError(
+-            "refused", "; ".join(f"{v['op']} {v['parent_id']} -> {v['child_id']}: {v['reason']}" for v in refused))
++            "refused", "; ".join(f"{op_label(v)}: {v['reason']}" for v in refused))
+     own = [v for v in verdicts if v["verdict"] == "self"]
+     if own:
+         raise SupervisorRequestError(
+@@ -383,9 +408,11 @@ def _accept_next(conn: sqlite3.Connection, executor: str, now: int,
+ 
+     with kb.write_txn(conn):
+         for r in conn.execute(
+-                "SELECT id, status, executor, lease_expires FROM supervisor_requests "
++                "SELECT id, status, executor, lease_expires, result_json FROM supervisor_requests "
+                 "WHERE status IN ('pending','accepted') ORDER BY id ASC").fetchall():
+             rid, status, holder, lease = int(r[0]), r[1], r[2], r[3]
++            if status == "accepted" and _awaiting_owner(r[4]):
++                continue  # waiting on another gateway: polled (kanban_notify_reconcile_exec.poll), no attempt spent
+             if status == "accepted" and lease and int(lease) > now and not _executor_dead(holder):
+                 continue  # a live executor holds it: stays queued for that executor
+             attempts = int(conn.execute("SELECT attempts FROM supervisor_requests WHERE id=?",
+@@ -407,6 +434,13 @@ def _accept_next(conn: sqlite3.Connection, executor: str, now: int,
+     return None
+ 
+ 
++def _awaiting_owner(raw: Optional[str]) -> bool:
++    try:
++        return isinstance(raw, str) and json.loads(raw).get("phase") == "awaiting_owner"
++    except (ValueError, AttributeError):
++        return False
++
++
+ def _finish(conn: sqlite3.Connection, req: dict, executor: str, status: str, *,
+             results: list[dict], error: Optional[str]) -> bool:
+     from hermes_cli import kanban_db as kb
+@@ -425,7 +459,7 @@ def _finish(conn: sqlite3.Connection, req: dict, executor: str, status: str, *,
+             payload["error"] = error
+         kb._append_event(conn, requester, f"supervisor_request_{status}", payload)
+         lines = [f"Supervisor request #{rid} {status} (executor {executor})."]
+-        lines += [f"- {r['op']} {r['parent_id']} -> {r['child_id']}: {r['outcome']}"
++        lines += [f"- {op_label(r)}: {r['outcome']}"
+                   + (f" ({r['detail']})" if r.get("detail") else "") for r in results]
+         if error:
+             lines.append(f"Error: {error}")
+@@ -475,6 +509,9 @@ def _rewake_late_parkers(conn: sqlite3.Connection) -> None:
+ def _execute(conn: sqlite3.Connection, req: dict, executor: str, board: Optional[str]) -> str:
+     requester = req["requester_task_id"]
+     ops = req["ops"]
++    if _is_reconcile(ops):
++        from hermes_cli import kanban_notify_reconcile_exec as nrx
++        return nrx.start(conn, req, executor)
+     # Scope is re-checked against the board as it is now, not as it was at submit time.
+     gone = requester_refusal(conn, requester)
+     verdicts = preflight(conn, requester, ops)
+@@ -545,6 +582,8 @@ def drain(conn: sqlite3.Connection, *, board: Optional[str] = None, role: str =
+             _finish(conn, req, executor, "failed", results=[], error=f"{type(exc).__name__}: {exc}"[:500])
+             status = "failed"
+         processed.append((req["id"], status))
++    from hermes_cli import kanban_notify_reconcile_exec as nrx
++    processed += nrx.poll(conn, executor, now=now)
+     return {"executor": executor, "processed": processed}
+ 
+ 
+@@ -605,7 +644,7 @@ def cli_command(args) -> int:
+     if processed is not None:
+         print(f"executor {processed['executor']}: processed {processed['processed'] or 'nothing'}")
+     for r in rows:
+-        ops = ", ".join(f"{o['op']} {o['parent_id']}->{o['child_id']}" for o in r["ops"] or [])
++        ops = ", ".join(op_label(o) for o in r["ops"] or [])
+         print(f"#{r['id']} {r['status']:<8} {r['requester_task_id']} [{ops}]"
+               + (f" error: {r['error']}" if r.get("error") else ""))
+     return 0
+diff --git a/tests/hermes_cli/test_kanban_notify_reconcile_exec.py b/tests/hermes_cli/test_kanban_notify_reconcile_exec.py
+new file mode 100644
+index 00000000000..27a55dfedd4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_notify_reconcile_exec.py
+@@ -0,0 +1,500 @@
++"""reconcile_notify supervisor requests: worker request -> non-worker executor -> owner-read receipt. [daveey]
++
++Every test runs on an isolated board, session stores and hub.db under ``tmp_path``. The hermes-hub CLI
++is replaced at its argv boundary (``_run_hub``, or a fake ``HERMES_HUB_BIN`` script for the cross-process
++test); owner answers are written into the hub.db ``sent`` table the way the courier's ``fetch_outcomes``
++writes them.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_notify_reconcile_exec as nrx
++from hermes_cli import kanban_supervisor_requests as ksr
++from hermes_cli.kanban_session_activity import _unseen_on
++
++REPO = Path(__file__).resolve().parents[2]
++CHAT = "20261026_235722_bef6c6"
++OWNER = "macbook"
++SENT = ("CREATE TABLE IF NOT EXISTS sent (id TEXT PRIMARY KEY, body TEXT, state TEXT, result TEXT, "
++        "created_at REAL, done_at REAL, posted INTEGER DEFAULT 0)")
++
++
++@pytest.fixture
++def world(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    hub = tmp_path / "hub-state"
++    hub.mkdir()
++    mail = tmp_path / "mail.json"
++    mail.write_text(json.dumps({"gateway": "hub"}))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.setenv("HERMES_HUB_STATE", str(hub))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(mail))
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    db = kb.kanban_db_path()
++    assert str(db).startswith(str(tmp_path)), db  # never the live board
++    (home / "state.db").touch()
++    sqlite3.connect(home / "state.db").execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)").connection.commit()
++    conn = kbc.connect()
++    try:
++        requester = kb.create_task(conn, title="verify unseen", assignee="default", created_by="default")
++        tasks, keys = [], []
++        for name in ("a", "b"):
++            tid = kb.create_task(conn, title=name, assignee="default")
++            notify.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT, notifier_profile="default",
++                                  delivery_metadata={"reason": "send_refused"})
++            notify.add_notify_sub(conn, task_id=tid, platform="hub", chat_id=f"{OWNER}/default/{CHAT}")
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, "completed", {"summary": name})
++            eid = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++            tasks.append(tid)
++            keys.append(f"remote:hub:default/default/{tid}:{eid}")
++        kb.claim_task(conn, requester)
++        run_id = kb._current_run_id(conn, requester)
++    finally:
++        conn.close()
++    calls = []
++
++    def fake_hub(argv):
++        calls.append(argv)
++        return _queue_like_courier(hub / "hub.db", argv)
++    monkeypatch.setattr(nrx, "_run_hub", fake_hub)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", requester)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return {"requester": requester, "run_id": run_id, "tasks": tasks, "keys": keys, "hub_db": hub / "hub.db",
++            "home": home, "db": str(db), "tmp": tmp_path, "calls": calls}
++
++
++def _queue_like_courier(path: Path, argv: list[str]) -> tuple[int, str, str]:
++    """``hermes-hub request <gw> <coll> <key> <action> --arg K=V --id ID``: the courier's local queue row."""
++    gw, coll, key, action = argv[1:5]
++    args = dict(a.split("=", 1) for a in argv[argv.index("--arg") + 1:argv.index("--arg") + 2])
++    rid = argv[argv.index("--id") + 1]
++    body = {"id": rid, "to_gw": gw, "coll": coll, "key": key, "action": action, "args": args}
++    c = sqlite3.connect(path)
++    c.execute(SENT)
++    c.execute("INSERT INTO sent (id, body, state, created_at) VALUES (?, ?, 'local', ?) ON CONFLICT(id) DO NOTHING",
++              (rid, json.dumps(body), time.time()))
++    stored = json.loads(c.execute("SELECT body FROM sent WHERE id=?", (rid,)).fetchone()[0])
++    c.commit()
++    c.close()
++    if stored != body:
++        return 2, "", "request_id_conflict: request id already used for a different envelope"
++    return 0, rid + "\n", ""
++
++
++def _answer(w, *, state="done", delivered=None, session_exists=True, result=None, mutate=None):
++    """The owner's outcome, written into ``sent`` the way fetch_outcomes does."""
++    c = sqlite3.connect(w["hub_db"])
++    rows = c.execute("SELECT id, body FROM sent").fetchall()
++    assert rows, "no owner read was queued"
++    for rid, raw in rows:
++        body = json.loads(raw)
++        keys = body["args"]["keys"].split(",")
++        res = result if result is not None else {
++            "code": "notice_receipts", "profile": body["key"].split("/")[0], "session": body["key"].split("/")[1],
++            "keys": keys, "session_exists": session_exists,
++            "delivered": keys if delivered is None else [k for k in keys if k in delivered]}
++        if mutate:
++            mutate(body, res)
++        c.execute("UPDATE sent SET state=?, result=?, body=? WHERE id=?",
++                  (state, json.dumps(res), json.dumps(body), rid))
++    c.commit()
++    c.close()
++
++
++def _as_executor(monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++
++
++def _ops(w, tasks=None):
++    return [{"op": "reconcile_notify", "task_id": t, "chat_id": CHAT} for t in (tasks or w["tasks"])]
++
++
++def _tool(args):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_supervisor_request(args))
++
++
++def _tui_rows(conn, w):
++    return conn.execute("SELECT task_id FROM kanban_notify_subs WHERE platform='tui' AND chat_id=?",
++                        (CHAT,)).fetchall()
++
++
++def _file_and_start(w, monkeypatch, ops=None):
++    out = _tool({"ops": ops or _ops(w)})
++    assert out["ok"] and out["status"] == "pending", out
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        first = ksr.drain(conn)
++    assert first["processed"] == [(out["request_id"], nrx.PHASE)]
++    return out["request_id"]
++
++
++def _finish(w):
++    with kbc.connect() as conn:
++        return ksr.drain(conn)["processed"], ksr.get_request(conn, ksr.list_requests(conn)[0]["id"])
++
++
++# --- request -> apply ------------------------------------------------------------------------------
++
++def test_owner_receipt_retires_the_rows_and_reports_on_the_requester(world, monkeypatch):
++    w = world
++    with kbc.connect() as conn:
++        assert _unseen_on(conn) == {CHAT: 2}
++    rid = _file_and_start(w, monkeypatch)
++    # One owner read for the chat, carrying both exact keys; nothing removed yet.
++    assert len(w["calls"]) == 1
++    argv = w["calls"][0]
++    assert argv[:5] == ["request", OWNER, "sessions", f"default/{CHAT}", "notice-receipts"]
++    assert argv[argv.index("--arg") + 1] == "keys=" + ",".join(sorted(w["keys"]))
++    with kbc.connect() as conn:
++        assert _unseen_on(conn) == {CHAT: 2}
++        assert ksr.drain(conn)["processed"] == []  # owner has not answered: still waiting, no attempt spent
++        assert ksr.get_request(conn, rid)["attempts"] == 1
++    _answer(w)
++    processed, req = _finish(w)
++    assert processed == [(rid, "done")]
++    assert [r["outcome"] for r in req["result"]] == ["reconciled", "reconciled"]
++    with kbc.connect() as conn:
++        assert _tui_rows(conn, w) == []
++        assert _unseen_on(conn) == {}
++        hub_rows = conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE platform='hub'").fetchone()[0]
++        assert hub_rows == 2  # the real route is untouched
++        for tid in w["tasks"]:
++            (payload,) = [e.payload for e in kb.list_events(conn, tid) if e.kind == "notify_reconciled"]
++            assert payload["owner"] == OWNER
++        kinds = [e.kind for e in kb.list_events(conn, w["requester"]) if e.kind.startswith("supervisor_request_")]
++        assert kinds == ["supervisor_request_queued", "supervisor_request_accepted", "supervisor_request_done"]
++        comment = kb.list_comments(conn, w["requester"])[-1]
++        assert comment.author == ksr.COMMENT_AUTHOR
++        assert f"reconcile_notify {w['tasks'][0]} tui:{CHAT}: reconciled" in comment.body
++        assert kb.get_task(conn, w["requester"]).status == "running"  # never releases the requester
++
++
++def test_no_receipt_keeps_the_row(world, monkeypatch):
++    w = world
++    _file_and_start(w, monkeypatch)
++    _answer(w, delivered=[w["keys"][0]])
++    _processed, req = _finish(w)
++    assert [r["outcome"] for r in req["result"]] == ["reconciled", "missing_receipt"]
++    with kbc.connect() as conn:
++        assert [r[0] for r in _tui_rows(conn, w)] == [w["tasks"][1]]
++        assert _unseen_on(conn) == {CHAT: 1}
++
++
++def test_unknown_owner_session_keeps_the_rows(world, monkeypatch):
++    w = world
++    _file_and_start(w, monkeypatch)
++    _answer(w, session_exists=False)
++    _processed, req = _finish(w)
++    assert {r["outcome"] for r in req["result"]} == {"unknown_owner"}
++    with kbc.connect() as conn:
++        assert _unseen_on(conn) == {CHAT: 2}
++
++
++@pytest.mark.parametrize("hub_chats", [[], [f"{OWNER}/default/{CHAT}", f"mini/default/{CHAT}"]])
++def test_no_single_remote_route_keeps_the_row_without_asking(world, monkeypatch, hub_chats):
++    w = world
++    with kbc.connect() as conn:
++        with kb.write_txn(conn):
++            conn.execute("DELETE FROM kanban_notify_subs WHERE platform='hub'")
++        for chat in hub_chats:
++            notify.add_notify_sub(conn, task_id=w["tasks"][0], platform="hub", chat_id=chat)
++    out = _tool({"ops": _ops(w, w["tasks"][:1])})
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        assert ksr.drain(conn)["processed"] == [(out["request_id"], "done")]
++        assert ksr.get_request(conn, out["request_id"])["result"][0]["outcome"] in ("unknown_owner", "missing_remote_route")
++        assert _unseen_on(conn) == {CHAT: 2}
++    assert w["calls"] == []
++
++
++def test_unreadable_local_store_keeps_the_row(world, monkeypatch):
++    w = world
++    _file_and_start(w, monkeypatch)
++    _answer(w)
++    (w["home"] / "state.db").unlink()
++    (w["home"] / "state.db").mkdir()  # exists, cannot be opened as a database
++    _processed, req = _finish(w)
++    assert {r["outcome"] for r in req["result"]} == {"evidence_unavailable"}
++    with kbc.connect() as conn:
++        assert _unseen_on(conn) == {CHAT: 2}
++
++
++def test_a_local_chat_keeps_the_row(world, monkeypatch):
++    w = world
++    prof = w["home"] / "profiles" / "work"
++    prof.mkdir(parents=True)
++    c = sqlite3.connect(prof / "state.db")
++    c.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
++    c.execute("INSERT INTO sessions VALUES (?)", (CHAT,))
++    c.commit()
++    c.close()
++    _file_and_start(w, monkeypatch)
++    _answer(w)
++    _processed, req = _finish(w)
++    assert {r["outcome"] for r in req["result"]} == {"local_owner"}
++
++
++@pytest.mark.parametrize("what", ["envelope", "echo_keys", "echo_session", "extra_delivered"])
++def test_an_answer_that_does_not_match_the_read_keeps_the_rows(world, monkeypatch, what):
++    w = world
++    _file_and_start(w, monkeypatch)
++
++    def mutate(body, res):
++        if what == "envelope":
++            body["to_gw"] = "mini"
++        elif what == "echo_keys":
++            res["keys"] = res["keys"][:1]
++        elif what == "echo_session":
++            res["session"] = "other"
++        else:
++            res["delivered"] = res["delivered"] + ["remote:hub:default/default/t_x:1"]
++    _answer(w, mutate=mutate)
++    _processed, req = _finish(w)
++    assert {r["outcome"] for r in req["result"]} == {"evidence_unavailable"}
++    with kbc.connect() as conn:
++        assert _unseen_on(conn) == {CHAT: 2}
++
++
++@pytest.mark.parametrize("state", ["rejected", "expired", "failed", "quarantined"])
++def test_a_failed_owner_read_finishes_at_once_and_keeps_the_rows(world, monkeypatch, state):
++    w = world
++    rid = _file_and_start(w, monkeypatch)
++    _answer(w, state=state, result={"code": "owner_reader_unavailable", "error": "boom"})
++    processed, req = _finish(w)
++    assert processed == [(rid, "done")]
++    assert {r["outcome"] for r in req["result"]} == {"evidence_unavailable"}
++    assert "owner_reader_unavailable" in req["result"][0]["detail"]
++    with kbc.connect() as conn:
++        assert _unseen_on(conn) == {CHAT: 2}
++
++
++def test_owner_silent_past_the_deadline_fails_and_keeps_the_rows(world, monkeypatch):
++    w = world
++    rid = _file_and_start(w, monkeypatch)
++    with kbc.connect() as conn:
++        assert nrx.poll(conn, "x:1:dispatcher", now=int(time.time()) + nrx.OWNER_DEADLINE_S - 60) == []
++        out = ksr.drain(conn, now=int(time.time()) + nrx.OWNER_DEADLINE_S + 3600)
++        assert out["processed"] == [(rid, "failed")]
++        req = ksr.get_request(conn, rid)
++        assert "did not answer" in req["error"]
++        assert _unseen_on(conn) == {CHAT: 2}
++
++
++def test_new_completion_after_the_read_is_not_retired_on_old_evidence(world, monkeypatch):
++    w = world
++    _file_and_start(w, monkeypatch)
++    _answer(w)
++    with kbc.connect() as conn, kb.write_txn(conn):
++        kb._append_event(conn, w["tasks"][0], "completed", {"summary": "again"})
++    _processed, req = _finish(w)
++    assert [r["outcome"] for r in req["result"]] == ["evidence_unavailable", "reconciled"]
++    with kbc.connect() as conn:
++        assert [r[0] for r in _tui_rows(conn, w)] == [w["tasks"][0]]
++
++
++def test_executor_crash_and_restarts_reuse_the_read_and_spend_no_attempts(world, monkeypatch):
++    w = world
++    rid = _file_and_start(w, monkeypatch)
++    with kbc.connect() as conn:
++        with kb.write_txn(conn):  # the accepting executor died; its lease is long gone
++            conn.execute("UPDATE supervisor_requests SET executor='gone-host:1:dispatcher', lease_expires=1")
++        for _ in range(ksr.MAX_ATTEMPTS + 1):
++            assert ksr.drain(conn, now=int(time.time()) + 3600)["processed"] == []
++        req = ksr.get_request(conn, rid)
++        assert req["status"] == "accepted" and req["attempts"] == 1
++    assert len({c[c.index("--id") + 1] for c in w["calls"]}) == 1  # one owner read, never a second id
++    _answer(w)
++    processed, req = _finish(w)
++    assert processed == [(rid, "done")] and {r["outcome"] for r in req["result"]} == {"reconciled"}
++
++
++def test_a_read_the_hub_cli_could_not_queue_is_queued_again_with_the_same_id(world, monkeypatch):
++    w = world
++    queued = []
++    monkeypatch.setattr(nrx, "_run_hub", lambda argv: queued.append(argv) or (1, "", "hub.db locked"))
++    rid = _file_and_start(w, monkeypatch)
++    monkeypatch.setattr(nrx, "_run_hub", lambda argv: queued.append(argv) or _queue_like_courier(w["hub_db"], argv))
++    with kbc.connect() as conn:
++        assert ksr.drain(conn)["processed"] == []
++    assert len(queued) >= 2 and all(q == queued[0] for q in queued)  # retried each drain, same id + envelope
++    c = sqlite3.connect(w["hub_db"])
++    assert c.execute("SELECT COUNT(*) FROM sent").fetchone()[0] == 1
++    _answer(w)
++    processed, _req = _finish(w)
++    assert processed == [(rid, "done")]
++
++
++def test_a_preseeded_read_id_conflict_fails_and_keeps_the_rows(world, monkeypatch):
++    w = world
++    monkeypatch.setattr(nrx, "_run_hub", lambda argv: (2, "", "request_id_conflict: request id already used"))
++    out = _tool({"ops": _ops(w)})
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        assert ksr.drain(conn)["processed"] == [(out["request_id"], "failed")]
++        assert _unseen_on(conn) == {CHAT: 2}
++
++
++def test_two_owner_reads_settle_independently_and_report_what_each_did(world, monkeypatch):
++    w = world
++    with kbc.connect() as conn:  # second task's chat is owned by another gateway
++        with kb.write_txn(conn):
++            conn.execute("UPDATE kanban_notify_subs SET chat_id='chat_two' WHERE task_id=? AND platform='tui'",
++                         (w["tasks"][1],))
++            conn.execute("UPDATE kanban_notify_subs SET chat_id='mini/default/chat_two' WHERE task_id=? "
++                         "AND platform='hub'", (w["tasks"][1],))
++    ops = [{"op": "reconcile_notify", "task_id": w["tasks"][0], "chat_id": CHAT},
++           {"op": "reconcile_notify", "task_id": w["tasks"][1], "chat_id": "chat_two"}]
++    rid = _file_and_start(w, monkeypatch, ops)
++    assert sorted(c[1] for c in w["calls"]) == ["macbook", "mini"]
++    c = sqlite3.connect(w["hub_db"])
++    (mac_id,) = [r for (r, b) in c.execute("SELECT id, body FROM sent") if json.loads(b)["to_gw"] == OWNER]
++    c.close()
++    _answer(w)  # both answered, but hide mini's answer for now
++    c = sqlite3.connect(w["hub_db"])
++    c.execute("UPDATE sent SET state='sent' WHERE id<>?", (mac_id,))
++    c.commit()
++    with kbc.connect() as conn:
++        assert ksr.drain(conn)["processed"] == []
++        assert ksr.drain(conn)["processed"] == []  # a later poll must not relabel the retired row "absent"
++    c.execute("UPDATE sent SET state='done' WHERE id<>?", (mac_id,))
++    c.commit()
++    c.close()
++    processed, req = _finish(w)
++    assert processed == [(rid, "done")]
++    assert [r["outcome"] for r in req["result"]] == ["reconciled", "reconciled"]
++    assert [r["owner"] for r in req["result"]] == ["macbook", "mini"]
++
++
++def test_a_transient_hub_db_error_waits_instead_of_failing(world, monkeypatch):
++    w = world
++    rid = _file_and_start(w, monkeypatch)
++    _answer(w)
++    real = nrx._sent
++    monkeypatch.setattr(nrx, "_sent", lambda i: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
++    with kbc.connect() as conn:
++        assert ksr.drain(conn)["processed"] == []
++        assert ksr.get_request(conn, rid)["status"] == "accepted"
++    monkeypatch.setattr(nrx, "_sent", real)
++    processed, req = _finish(w)
++    assert processed == [(rid, "done")] and {r["outcome"] for r in req["result"]} == {"reconciled"}
++
++
++# --- request shape -------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("op", [
++    {"op": "reconcile_notify", "task_id": "t", "chat_id": CHAT, "delivered": ["k"]},
++    {"op": "reconcile_notify", "task_id": "t", "chat_id": CHAT, "owner": "macbook"},
++    {"op": "reconcile_notify", "task_id": "t", "chat_id": "a/b"},
++    {"op": "reconcile_notify", "chat_id": CHAT},
++])
++def test_submit_refuses_evidence_fields_and_bad_rows(world, op):
++    out = _tool({"ops": [op]})
++    assert not out.get("ok") and out["code"] == "invalid_ops", out
++
++
++def test_submit_refuses_mixed_ops(world):
++    out = _tool({"ops": _ops(world)[:1] + [{"op": "unlink", "parent_id": "a", "child_id": "b"}]})
++    assert out["code"] == "invalid_ops" and "only" in out["error"]
++
++
++def test_preflight_verdicts(world):
++    w = world
++    with kbc.connect() as conn:
++        notify.add_notify_sub(conn, task_id=w["requester"], platform="tui", chat_id=CHAT,
++                              delivery_metadata={"reason": "origin"})
++    out = _tool({"dry_run": True, "ops": _ops(w, w["tasks"][:1]) + [
++        {"op": "reconcile_notify", "task_id": w["requester"], "chat_id": CHAT},
++        {"op": "reconcile_notify", "task_id": w["tasks"][1], "chat_id": "other"},
++        {"op": "reconcile_notify", "task_id": "t_missing", "chat_id": CHAT}]})
++    assert [v["verdict"] for v in out["ops"]] == ["supervisor", "refused", "noop", "refused"]
++    out = _tool({"ops": [{"op": "reconcile_notify", "task_id": w["tasks"][1], "chat_id": "other"}]})
++    assert out["code"] == "no_supervisor_needed"
++
++
++# --- the fence stays -----------------------------------------------------------------------------
++
++def test_a_worker_cannot_run_the_executor_or_the_mutation(world, monkeypatch):
++    from hermes_cli.kanban_notify_reconcile import reconcile_refused_sub
++    w = world
++    rid = _tool({"ops": _ops(w)})["request_id"]
++    with kbc.connect() as conn:  # HERMES_KANBAN_TASK is set: a dispatcher worker
++        with pytest.raises(ksr.SupervisorRequestError, match="worker_context"):
++            ksr.drain(conn)
++        with pytest.raises(ksr.SupervisorRequestError, match="worker_context"):
++            nrx.poll(conn, "x")
++        assert ksr.dispatcher_drain(conn) == []
++        assert ksr.get_request(conn, rid)["status"] == "pending"
++    # Every Kanban worker subprocess inherits the write fence for its board root: the library mutation
++    # itself is refused there, with every reader saying "deliver".
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(w["home"]))
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_OWNER", raising=False)
++    with kbc.connect() as conn:
++        with pytest.raises(PermissionError):
++            reconcile_refused_sub(conn, task_id=w["tasks"][0], chat_id=CHAT, source_gateway="hub",
++                                  source_profile="default", board="default",
++                                  local_session_exists=lambda p, s: False, owner=lambda p, s: (OWNER, p),
++                                  delivered_keys=lambda g, p, s, keys: set(keys))
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
++    with kbc.connect() as conn:
++        assert _unseen_on(conn) == {CHAT: 2}
++
++
++# --- across processes: worker tool -> separate CLI executor -> real argv boundary -----------------
++
++FAKE_HUB = '''#!{py}
++import json, sqlite3, sys, time
++sys.path.insert(0, {tests!r})
++from test_kanban_notify_reconcile_exec import _queue_like_courier
++rc, out, err = _queue_like_courier(__import__("pathlib").Path({db!r}), sys.argv[1:])
++sys.stdout.write(out); sys.stderr.write(err); sys.exit(rc)
++'''
++
++
++def _cli_drain(w, hub_bin):
++    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN_")}
++    env.update(HERMES_HOME=str(w["home"]), HOME=str(w["tmp"]), HERMES_KANBAN_DB=w["db"], PYTHONPATH=str(REPO),
++               HERMES_HUB_BIN=str(hub_bin))
++    return subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", "supervisor-requests", "--drain", "--json"],
++                          cwd=str(REPO), env=env, capture_output=True, text=True, timeout=180, check=False)
++
++
++def test_end_to_end_through_a_separate_executor_process_and_the_hub_cli(world, monkeypatch):
++    from tools.registry import registry
++    import tools.kanban_tools  # registers the tool
++    w = world
++    hub_bin = w["tmp"] / "hermes-hub"
++    hub_bin.write_text(FAKE_HUB.format(py=sys.executable, tests=str(Path(__file__).parent), db=str(w["hub_db"])))
++    hub_bin.chmod(0o755)
++    out = json.loads(registry.dispatch("kanban_supervisor_request", {"ops": _ops(w)}))
++    assert out["ok"] and out["status"] == "pending", out
++    first = _cli_drain(w, hub_bin)
++    assert first.returncode == 0, first.stderr[-2000:]
++    assert json.loads(first.stdout[first.stdout.index("{"):])["drained"]["processed"] == [[out["request_id"], nrx.PHASE]]
++    _answer(w)
++    second = _cli_drain(w, hub_bin)
++    assert second.returncode == 0, second.stderr[-2000:]
++    report = json.loads(second.stdout[second.stdout.index("{"):])
++    assert report["drained"]["processed"] == [[out["request_id"], "done"]]
++    with kbc.connect() as conn:
++        assert _unseen_on(conn) == {}
++        assert ksr.get_request(conn, out["request_id"])["status"] == "done"
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 83e8d742fa5..8bcaa4049eb 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -940,20 +940,28 @@ KANBAN_SUPERVISOR_REQUEST_SCHEMA = _schema(
+         "(self), need the supervisor (supervisor), it is already so (noop), or it "
+         "is refused (cards another task created, cycles), and whether an executor is live. After a real request, park "
+         "with kanban_schedule (or kanban_block kind='time') naming the request id; "
+-        "it wakes you on the result."
++        "it wakes you on the result. "
++        "Op reconcile_notify {task_id, chat_id, thread_id?} instead asks the executor to retire a "
++        "wrong-local platform='tui' send_refused notify subscription for a chat another gateway owns "
++        "(a phantom 'unseen' count): the executor asks the owner gateway itself which notices it holds and "
++        "removes the row only on its receipt, else keeps it. Pass no evidence; a request carries only "
++        "reconcile_notify ops or only edge ops."
+     ),
+     {
+         "ops": {
+             "type": "array",
+-            "description": "Edge edits, applied in order (max 20).",
++            "description": "Edge edits applied in order, or reconcile_notify ops (max 20).",
+             "items": {
+                 "type": "object",
+                 "properties": {
+-                    "op": {"type": "string", "enum": ["link", "unlink"]},
++                    "op": {"type": "string", "enum": ["link", "unlink", "reconcile_notify"]},
+                     "parent_id": {"type": "string"},
+                     "child_id": {"type": "string"},
++                    "task_id": {"type": "string", "description": "reconcile_notify: the subscribed task."},
++                    "chat_id": {"type": "string", "description": "reconcile_notify: the tui row's chat (session id)."},
++                    "thread_id": {"type": "string", "description": "reconcile_notify: the row's thread, if any."},
+                 },
+-                "required": ["op", "parent_id", "child_id"],
++                "required": ["op"],
+             },
+         },
+         "reason": _prop("string", "Why the graph must change (recorded on the request)."),
+-- 
+2.55.0
+

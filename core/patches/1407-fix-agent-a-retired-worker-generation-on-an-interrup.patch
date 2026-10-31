@@ -1,0 +1,270 @@
+From 4885a5ee02b6c298a0dfd3da6eaaf3ed42290609 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:20:22 +0000
+Subject: [PATCH] fix(agent): a retired worker generation on an interrupted
+ turn logs a warning, not an ERROR traceback [daveey]
+
+A gateway restart/core update retires a Kanban worker's generation mid-turn; the
+runtime store then refuses every write with stale_generation. finalize_turn's
+cleanup guard and the turn lease release logged that planned fence as an ERROR
+with a traceback, so the self-heal detector filed each update as a persistence
+defect (agent-e6d3339cbe).
+
+- runtime_session_store.is_retired_generation_error: matches only the store's own
+  WorkerPersistenceError/RuntimeStoreError('stale_generation').
+- _guarded_cleanup(interrupted=...): an interrupted turn's retired-generation error
+  is one WARNING line, still recorded in cleanup_errors. Uninterrupted turns and any
+  other error stay ERROR + traceback.
+- DurableTurnLease.release: a retired-generation refusal is a WARNING (the owner
+  drops the row itself); other failures stay ERROR.
+Tests pin both the quiet path and that real faults stay loud.
+---
+ agent/runtime_session_store.py                | 13 +++
+ agent/turn_facade_lease.py                    |  6 ++
+ agent/turn_finalizer.py                       | 17 +++-
+ tests/agent/test_turn_facade_lease.py         | 42 +++++++++
+ .../test_turn_finalizer_cleanup_guard.py      | 86 +++++++++++++++++++
+ 5 files changed, 161 insertions(+), 3 deletions(-)
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index 1bc8c1d9557..e7cca9764f7 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -48,6 +48,19 @@ class WorkerPersistenceError(RuntimeError):
+     pass
+ 
+ 
++def is_retired_generation_error(exc) -> bool:
++    """True for the store's ``stale_generation`` fence: the owner retired this worker generation
++    (gateway restart / core update), so every later write is refused by design. Matches only the
++    store's own error types, never a bare string, so an unrelated error stays a fault."""
++    if isinstance(exc, WorkerPersistenceError):
++        return str(exc).strip() == 'stale_generation'
++    try:
++        from hermes_state_runtime import RuntimeStoreError
++    except ImportError:
++        return False
++    return isinstance(exc, RuntimeStoreError) and str(exc).strip() == 'stale_generation'
++
++
+ def _receipt_timeout_s():
+     from hermes_state_runtime import worker_receipt_timeout_s
+     return worker_receipt_timeout_s()
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index 78d66269027..2abdd551dfc 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -172,6 +172,7 @@ class DurableTurnLease:
+         abandoned (so this process's next turn can take the row) and a daemon thread retries the
+         DELETE until the lease would have expired anyway, so other processes are not kept waiting."""
+         from hermes_state_errors import classify_persistence_error
++        from agent.runtime_session_store import is_retired_generation_error
+         agent = self.agent
+         try:
+             self.db.release_session_turn_lease(self.session_id, self.holder)
+@@ -182,6 +183,11 @@ class DurableTurnLease:
+                     self.session_id, exc,
+                 )
+                 self._start_release_retry()
++            elif is_retired_generation_error(exc):
++                # The owner retired this worker generation (restart/update) and drops its rows itself.
++                logger.warning(
++                    "Session turn lease release skipped: worker generation retired: %s", self.session_id,
++                )
+             else:
+                 logger.error("Failed to release session turn lease: %s", self.session_id, exc_info=True)
+         if getattr(agent, "_active_session_turn_lease_holder", None) == self.holder:
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index 70d87cc37a8..e1ddb309060 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -114,13 +114,24 @@ def _invoke_hook_safely(name: str, logger: logging.Logger, **kwargs) -> list:
+         return []
+ 
+ 
+-def _guarded_cleanup(label: str, fn: Callable[[], Any], errors: list[str], logger) -> None:
++def _guarded_cleanup(
++    label: str, fn: Callable[[], Any], errors: list[str], logger, *, interrupted: bool = False,
++) -> None:
+     """Post-loop cleanup must never lose the response: each step is guarded
+-    independently and errors surface via ``cleanup_errors`` (#8049)."""
++    independently and errors surface via ``cleanup_errors`` (#8049).
++
++    An interrupted turn whose worker generation the owner retired (restart/update) gets the
++    store's ``stale_generation`` fence on every write: that is the planned shutdown, so it is a
++    one-line WARNING, still recorded in ``cleanup_errors``. Anything else stays an ERROR traceback."""
+     try:
+         fn()
+     except Exception as err:
+         errors.append(f"{label}: {err}")
++        if interrupted:
++            from agent.runtime_session_store import is_retired_generation_error
++            if is_retired_generation_error(err):
++                logger.warning("finalize_turn: _%s skipped: generation retired (interrupted turn)", label)
++                return
+         logger.error("finalize_turn: _%s failed: %s", label, err, exc_info=True)
+ 
+ 
+@@ -802,7 +813,7 @@ def finalize_turn(
+             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
+         agent._persist_session(messages, conversation_history)
+ 
+-    _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
++    _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger, interrupted=interrupted)
+ 
+     # Keep the gateway's separate in-memory history snapshot current even on
+     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
+diff --git a/tests/agent/test_turn_facade_lease.py b/tests/agent/test_turn_facade_lease.py
+index 52000ca3f9e..c7f4d89de97 100644
+--- a/tests/agent/test_turn_facade_lease.py
++++ b/tests/agent/test_turn_facade_lease.py
+@@ -357,3 +357,45 @@ def test_refresh_after_a_lapse_retries_a_locked_renewal(tmp_path, monkeypatch):
+         assert db.session_turn_lease_expires_at("s1", "h") > clock.time()
+     finally:
+         db.close()
++
++
++class _RefusingDb(_Db):
++    def __init__(self, error):
++        super().__init__()
++        self.error = error
++
++    def release_session_turn_lease(self, session_id, holder):
++        raise self.error
++
++
++def _release_records(db, caplog, monkeypatch):
++    import logging
++    monkeypatch.setattr(
++        "agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0)
++    )
++    agent = _agent(db)
++    lease = _admit(agent).lease
++    caplog.set_level(logging.DEBUG, logger="run_agent")
++    caplog.clear()
++    lease.release()
++    assert agent._active_session_turn_lease_holder is None
++    return [r for r in caplog.records if "release" in r.getMessage().lower()]
++
++
++def test_release_refused_by_a_retired_generation_is_a_warning(caplog, monkeypatch):
++    """The owner retired this worker generation (restart/update): the row is already its to drop."""
++    import logging
++    from agent.runtime_session_store import WorkerPersistenceError
++
++    records = _release_records(_RefusingDb(WorkerPersistenceError("stale_generation")), caplog, monkeypatch)
++    assert [r.levelno for r in records] == [logging.WARNING]
++    assert records[0].exc_info is None
++
++
++def test_release_other_failure_stays_an_error(caplog, monkeypatch):
++    import logging
++    from agent.runtime_session_store import WorkerPersistenceError
++
++    records = _release_records(_RefusingDb(WorkerPersistenceError("outbox_full")), caplog, monkeypatch)
++    assert [r.levelno for r in records] == [logging.ERROR]
++    assert records[0].exc_info is not None
+diff --git a/tests/agent/test_turn_finalizer_cleanup_guard.py b/tests/agent/test_turn_finalizer_cleanup_guard.py
+index ab73cedc873..aaae26ec9ed 100644
+--- a/tests/agent/test_turn_finalizer_cleanup_guard.py
++++ b/tests/agent/test_turn_finalizer_cleanup_guard.py
+@@ -8,6 +8,7 @@ for must still be returned.  Previously any of those raised straight out of
+ traceback and lost the whole turn.
+ """
+ 
++import logging
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -207,3 +208,88 @@ def test_persist_disabled_turn_skips_session_end_hook(
+     assert ("on_session_end" in calls) == ("on_session_end" in expected_calls)
+ 
+ 
++
++
++# --- a retired worker generation on an interrupted turn is an expected fence -----------------
++# A gateway restart/core update retires the Kanban worker's generation mid-turn; every later
++# write is refused ``stale_generation``. On an interrupted turn that is the planned shutdown, not
++# a persistence fault, so it must not log an ERROR traceback (the self-heal detector files those).
++
++
++class _StaleGenerationAgent(_StubAgent):
++    def __init__(self, error):
++        super().__init__(raise_in=())
++        self._error = error
++
++    def _persist_session(self, *a, **k):
++        raise self._error
++
++
++def _finalize(agent, *, interrupted):
++    messages = [{"role": "user", "content": "do a thing"}]
++    return finalize_turn(
++        agent,
++        final_response=None,
++        api_call_count=1,
++        interrupted=interrupted,
++        failed=False,
++        messages=messages,
++        conversation_history=None,
++        effective_task_id="task-1",
++        turn_id="turn-1",
++        user_message="do a thing",
++        original_user_message="do a thing",
++        _should_review_memory=False,
++        _turn_exit_reason="interrupted_by_user" if interrupted else "unknown",
++    )
++
++
++def _persist_records(caplog):
++    return [r for r in caplog.records if "_persist_session" in r.getMessage()]
++
++
++def test_interrupted_turn_stale_generation_is_a_warning_without_traceback(caplog):
++    from agent.runtime_session_store import WorkerPersistenceError
++
++    caplog.set_level(logging.DEBUG)
++    result = _finalize(_StaleGenerationAgent(WorkerPersistenceError("stale_generation")), interrupted=True)
++    records = _persist_records(caplog)
++    assert [r.levelno for r in records] == [logging.WARNING]
++    assert records[0].exc_info is None
++    assert "generation retired (interrupted turn)" in records[0].getMessage()
++    # Still recorded for the caller.
++    assert result["cleanup_errors"] == ["persist_session: stale_generation"]
++
++
++def test_interrupted_turn_runtime_store_stale_generation_is_a_warning(caplog):
++    from hermes_state_runtime import RuntimeStoreError
++
++    caplog.set_level(logging.DEBUG)
++    _finalize(_StaleGenerationAgent(RuntimeStoreError("stale_generation")), interrupted=True)
++    assert [r.levelno for r in _persist_records(caplog)] == [logging.WARNING]
++
++
++def test_uninterrupted_turn_stale_generation_stays_an_error(caplog):
++    from agent.runtime_session_store import WorkerPersistenceError
++
++    caplog.set_level(logging.DEBUG)
++    _finalize(_StaleGenerationAgent(WorkerPersistenceError("stale_generation")), interrupted=False)
++    records = _persist_records(caplog)
++    assert [r.levelno for r in records] == [logging.ERROR]
++    assert records[0].exc_info is not None
++
++
++@pytest.mark.parametrize(
++    "error_factory",
++    [
++        lambda: RuntimeError("sqlite database is locked"),
++        lambda: __import__("agent.runtime_session_store", fromlist=["x"]).WorkerPersistenceError("outbox_full"),
++        lambda: RuntimeError("stale_generation"),  # right text, wrong type: not a store fence
++    ],
++)
++def test_interrupted_turn_other_errors_stay_errors_with_traceback(caplog, error_factory):
++    caplog.set_level(logging.DEBUG)
++    _finalize(_StaleGenerationAgent(error_factory()), interrupted=True)
++    records = _persist_records(caplog)
++    assert [r.levelno for r in records] == [logging.ERROR]
++    assert records[0].exc_info is not None
+-- 
+2.55.0
+
