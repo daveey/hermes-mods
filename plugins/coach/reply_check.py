@@ -83,6 +83,10 @@ REPORT_RE = re.compile(
     r"|\b(?:didn|haven|hasn|aren|isn|won|can)(?:'|’)?t\b"
     r"|\bneeds? (?:conversion|extending|fixing|a fix|work|to be (?:fixed|updated|converted|extended))\b"
     r"|\brefus(?:es|ing)\b|\bcontinues? to (?:alert|fail|error|break|show)\b|\bone limit\b|\blimitation\b"
+    # Caveat endings: a checkable or doable item left as a disclaimer or an offer (\"I did not look at X\", \"one limit to
+    # know\", \"say if you want that one closed too\"). Candidates only: the judge and second opinion decide.
+    r"|\b(?:I|we)(?:'ve| have)? (?:did not|didn'?t|have not|haven'?t|won'?t|will not|never) (?:yet )?(?:actually )?(?:check|look|test|verif|confirm|try|run|read|inspect)\w*\b"
+    r"|\b(?:say|tell me|let me know) if you(?:'d)? (?:want|like|need)\b"
     # Leftovers named by likeness, not by a status word (bot-dc58243931: "O-7 through O-11 have the same
     # old-approval problem").
     r"|\b(?:have|has) the same (?:[\w-]+ ){0,3}?(?:problem|issue|bug|defect|failure|error)s?\b"
@@ -1012,6 +1016,18 @@ CONFIRM_DAILY_CAP = 250
 # nudge; the screen alone agreed with the second opinion on only 57% of its hits) or "nudge" (the old screen fallback,
 # held to report_only_capped). COACH_REPORT_ONLY_FALLBACK overrides. Kanban worker turns always skip (capped_nudge).
 REPORT_ONLY_FALLBACK = "skip"
+# Desktop human (non-notice) turns reach the second opinion from a lower screen p: the Oct 30 re-measure found 28% of
+# David's typed question turns still stopping at the diagnosis, and the 0.75 floor recalled only 0.31 of them held-out
+# (0.49 at 0.60, P 0.91). The second opinion and the one-nudge-per-turn cap bound the false-positive cost. Notice turns
+# and every other platform (Kanban workers, CLI, TUI, subagents) keep CONFIRM_FLOOR: the re-measure covers Desktop only.
+HUMAN_CONFIRM_FLOOR = 0.60
+HUMAN_FLOOR_PLATFORMS = ("desktop",)
+
+
+def human_confirm_floor(platform: str) -> Optional[float]:
+    """The lower report_only confirm floor for this turn's platform, or None (CONFIRM_FLOOR applies). check() still
+    keeps CONFIRM_FLOOR for notice turns on these platforms."""
+    return HUMAN_CONFIRM_FLOOR if (platform or "") in HUMAN_FLOOR_PLATFORMS else None
 
 
 def confirm_system() -> str:
@@ -1435,6 +1451,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           shadow: bool = False, log: Optional[Callable[[dict], None]] = None,
           thresholds: Optional[dict] = None,
           confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = 0.5,
+          human_confirm_floor: Optional[float] = None,
           kanban_down: Optional[bool] = None,
           human_asks: Optional[Callable[[], list]] = None,
           audit: Optional[Callable[[dict], None]] = None,
@@ -1454,7 +1471,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     `thresholds` ({rule: th}) overrides `threshold` per rule; with it, the top rule among those over their own
     threshold wins.
     `confirm() -> (p, evidence) | None` is the report_only second opinion (aux task `coach_report_only`, real tool
-    arguments): when the screen's report_only p is >= `confirm_floor`, its p replaces the screen's and is compared with
+    arguments): when the screen's report_only p is >= `confirm_floor` (`human_confirm_floor` for non-notice turns, when given), its p replaces the screen's and is compared with
     thresholds["report_only"]; None (daily cap hit, error) falls back to the screen's p against
     thresholds["report_only_screen"] (default: the report_only threshold), raised to thresholds["report_only_capped"]
     when a second opinion was due but unavailable. Without `confirm` nothing changes.
@@ -1552,6 +1569,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     th_scr = ths.get("report_only_screen", ths.get("report_only", threshold))
     th_ro = th_scr
     screen_p = v["report_only"]
+    if human_confirm_floor is not None and not notice_turn(user_ask):
+        confirm_floor = human_confirm_floor
     confirm_attempted = "report_only" in cands and confirm is not None and screen_p >= confirm_floor
     if confirm_attempted and confirm is not None:
         try:

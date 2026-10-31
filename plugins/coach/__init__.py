@@ -539,6 +539,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            wake=lambda: rc.wake_sources(session_id, log_lines),
                            screen=screen, screen_below=s1.below(), shadow=m == "shadow", log=s1.log,
                            confirm=confirm, confirm_floor=rc.CONFIRM_FLOOR,
+                           human_confirm_floor=rc.human_confirm_floor(platform),  # Desktop non-notice: 0.60
                            kanban_down=kanban_down,
                            # a Kanban worker turn has no user to push back: a capped second opinion skips the nudge
                            capped_nudge=platform != "kanban",
