@@ -272,17 +272,27 @@ def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = 
 
 # ---- L1 + L4 ------------------------------------------------------------------------------------------
 _WRAP = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
+# Runtime-written user rows carry these display_kinds (the set user-steps uses for the same question).
+_RUNTIME_KINDS = frozenset({"kanban_notice", "auto_continue"})
 
 
 def _human_text(msg: str) -> str | None:
-    """The part of a 'user' message David actually typed (None for tool notices / kanban completion pings)."""
+    """The part of a 'user' message David actually typed (None for runtime notices and agent relays)."""
     m = _WRAP.search(msg or "")
-    if m:
-        return m.group(1)
-    s = (msg or "").strip()
-    if not s or s.startswith("[IMPORTANT:") or re.match(r"^[✔✖⚠]\s*\[", s) or s.startswith("[SYSTEM"):
+    s = (m.group(1) if m else (msg or "")).strip()
+    if not s or core.runtime_notice(s):
         return None
     return s
+
+
+def _runtime_turn(user_message: str, history: list) -> bool:
+    """This turn's message is the newest user row and core stamped it runtime-written (display_kind)."""
+    for m in reversed(history if isinstance(history, list) else []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            content = m.get("content")
+            return ((m.get("display_kind") or "") in _RUNTIME_KINDS and isinstance(content, str)
+                    and content.strip()[:200] == (user_message or "").strip()[:200])
+    return False
 
 
 def pre_llm_call(session_id: str = "", user_message: str = "", conversation_history: list | None = None,
@@ -295,14 +305,15 @@ def pre_llm_call(session_id: str = "", user_message: str = "", conversation_hist
     try:
         LOG.reset(session_id)
         hist = [m.get("content") for m in (conversation_history or []) if isinstance(m, dict) and m.get("role") == "user"
-                and isinstance(m.get("content"), str)]
-        users = [t for t in (_human_text(h) for h in hist + [user_message or ""]) if t]
+                and isinstance(m.get("content"), str) and (m.get("display_kind") or "") not in _RUNTIME_KINDS]
+        runtime = _runtime_turn(user_message or "", conversation_history or [])
+        users = [t for t in (_human_text(h) for h in hist + ([] if runtime else [user_message or ""])) if t]
         LOG.set_users(session_id, users)
         # Workflow state accepts the entire direct user message only. The legacy
         # answer extractor unwraps embedded text and is not provenance for a stop
         # or resume. Wrapped steering requires a trusted transport event adapter.
         directive = ledger().record_workflow_directive(session_id, user_message or "")
-        if not directive:
+        if not directive and not runtime:
             _record_answers(session_id, _human_text(user_message or ""), conversation_history or [],
                             raw_message=user_message or "")
         block = core.l1_block(session_id, ledger())

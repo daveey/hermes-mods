@@ -670,6 +670,8 @@ class Ledger:
         c.execute("create temp table answer_scope (session text primary key)")
         c.executemany("insert or ignore into answer_scope values (?)",
                       ((sid,) for sid in answer_lineage(session)))
+        # Rows a pre-fix process recorded from a runtime notice stay invisible to every read.
+        c.create_function("runtime_notice", 1, lambda text: int(runtime_notice(text)), deterministic=True)
 
     @staticmethod
     def _answer_rows(rows) -> list[dict]:
@@ -690,10 +692,10 @@ class Ledger:
             self._scope(c, session)
             base = ("select a.ts, a.session, a.topic, a.answer, a.card_id, r.answer_id "
                     "from answered a join answer_scope s on s.session=a.session "
-                    "left join retired_answers r on r.answer_id=a.id ")
-            terminal = c.execute(base + "where r.answer_id is not null "
+                    "left join retired_answers r on r.answer_id=a.id where not runtime_notice(a.answer) and ")
+            terminal = c.execute(base + "r.answer_id is not null "
                                  "order by a.ts desc, a.id desc limit ?", (limit,)).fetchall()
-            ordinary = c.execute(base + "where r.answer_id is null and a.ts>=? "
+            ordinary = c.execute(base + "r.answer_id is null and a.ts>=? "
                                  "order by a.ts desc, a.id desc limit ?",
                                  (time.time() - window_s, limit)).fetchall()
             return self._answer_rows(terminal + ordinary)
@@ -718,6 +720,7 @@ class Ledger:
                     "select a.ts, a.session, a.topic, a.answer, a.card_id, r.answer_id "
                     "from answered a join answer_scope s on s.session=a.session "
                     "join retired_answers r on r.answer_id=a.id where action_key(a.topic)=? "
+                    "and not runtime_notice(a.answer) "
                     "order by a.ts desc, a.id desc limit 1", (key,)).fetchone()
                 if row is not None:
                     rows.append(row)
@@ -853,6 +856,17 @@ _STRONG_DISMISS = re.compile(
 
 def looks_like_answer(msg: str) -> bool:
     return bool(_ANSWERISH.search(msg or ""))
+
+
+# Runtime and agent-written user turns: "[chat-closeout] ...", "[owner-wake] ...", "[Message from another Hermes
+# session ...]", "[System note: ...]", "⏸ [hub:default] ... blocked", "✔ [default] ... done". A prefix deny-list let
+# each new notice type through as "David answered" (89 false ledger rows on two hosts); a typed reply doesn't open
+# with "[" or "<" (user-steps' answer-evidence rule), so the shape is closed instead.
+_RUNTIME_NOTICE = re.compile(r"^\s*(?:[\[<]|[\u2714\u2716\u26a0\u23f8]\ufe0f?\s*\[)")
+
+
+def runtime_notice(text: str | None) -> bool:
+    return bool(_RUNTIME_NOTICE.match(text or ""))
 
 
 def is_strong_dismissal(msg: str) -> bool:
