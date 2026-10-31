@@ -18,6 +18,7 @@ import pytest
 _spec = importlib.util.spec_from_file_location("user_terminal", Path(__file__).with_name("__init__.py"))
 ut = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ut)
+_REAL_SPAWN = ut.spawn_watchdog
 
 
 def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
@@ -50,6 +51,11 @@ def _confirm_env(monkeypatch):
     monkeypatch.delenv("HERMES_USER_TERMINAL_CONFIRM", raising=False)
     # No detached watchdogs from unit tests (they would judge fake runner pids); _watch() runs the real one.
     monkeypatch.setattr(ut, "spawn_watchdog", lambda job: None, raising=False)
+    # Runner-started watchdogs are covered by test_runner_starts_one_watchdog_before_the_command.
+    monkeypatch.setenv("HERMES_USER_TERMINAL_RUNNER_WATCHDOG", "0")
+    for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_BOARD",
+              "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_USER_TERMINAL_MAX_WAIT_MINUTES"):
+        monkeypatch.delenv(k, raising=False)  # this suite may itself run inside a Kanban worker
 
 
 # The job runner wraps the command in BSD/macOS `script -q FILE cmd...`; util-linux `script` takes
@@ -773,9 +779,10 @@ def _wait_status(job: Path, wanted: tuple, timeout: float = 10) -> dict:
 
 def _simulate_runner_started(job: Path, status: str) -> None:
     """What a runner leaves behind once it took the start gate (no pty: works on every platform)."""
-    (job / "opened").write_text("12345\n")
+    # a live pid: resume paths now reconcile, and a dead runner pid would (correctly) become "abandoned"
+    (job / "opened").write_text(f"{os.getpid()}\n")
     (job / "start.lock").mkdir()
-    (job / "start.lock" / "owner").write_text("runner 12345\n")
+    (job / "start.lock" / "owner").write_text(f"runner {os.getpid()}\n")
     st = {"status": status} if status == "running" else {"status": "ran", "exit_code": 0}
     (job / "status.json").write_text(json.dumps(st))
 
@@ -1082,14 +1089,19 @@ def test_watchdog_withdraws_when_card_finished_or_newer_run(tmp_path, monkeypatc
 
 
 def test_watchdog_max_age(tmp_path, monkeypatch):
+    # Max age is resolved when the job is created and persisted in meta.json: the detached watchdog may not be
+    # able to import Hermes config, so it gets no env here and must still expire the job.
+    monkeypatch.setenv("HERMES_USER_TERMINAL_MAX_WAIT_MINUTES", "2")
     db = _board(tmp_path, "blocked", None)
     job = _owned_job(tmp_path, monkeypatch, db)
     meta = json.loads((job / "meta.json").read_text())
+    assert meta["max_wait_minutes"] == 2
     meta["created"] = time.time() - 3 * 60
     (job / "meta.json").write_text(json.dumps(meta))
-    _watch(job, 3, {"HERMES_USER_TERMINAL_MAX_WAIT_MINUTES": "2"})
+    (job / "opened").write_text("")  # a window announced itself (no launch-grace failure)
+    _watch(job, 3, {"HERMES_USER_TERMINAL_MAX_WAIT_MINUTES": ""})
     st = ut.wait_for(job, 0)
-    assert st["status"] == "withdrawn" and "2 minutes" in st["reason"]
+    assert st["status"] == "withdrawn" and st["reason"] == "expired after 2 min; ask again if still needed"
 
 
 def test_watchdog_dead_runner_becomes_abandoned_but_not_before_launch(tmp_path, monkeypatch):
@@ -1113,3 +1125,235 @@ def test_remote_withdraw_is_refused_not_resumed(remote, monkeypatch):
     monkeypatch.setattr(ut, "owner_refusal", lambda sid: None)
     res = json.loads(ut.handle_remote({"action": "withdraw", "job_id": "x", "reason": "r", "wait_s": 1}))
     assert res["ok"] is False and "withdraw is not available" in res["error"]
+
+
+
+# ---------------------------------------------------------------- owned prompts: contract corrections
+
+def test_create_job_records_card_owner_in_meta_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_card")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "5")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    job = ut.create_job("echo hi", "r", str(tmp_path))  # no owner= : create_job resolves it itself
+    meta = json.loads((job / "meta.json").read_text())
+    assert meta["owner"] == {"kind": "card", "board": "default", "task_id": "t_card", "run_id": 5}
+    assert meta["board_db"] == str(tmp_path / "kanban.db")
+    legacy = json.loads((job / "owner.json").read_text())  # sidecar kept for compatibility
+    assert legacy["kind"] == "kanban" and legacy["task"] == "t_card"
+
+
+def test_create_job_without_card_owns_by_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-9")
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    assert json.loads((job / "meta.json").read_text())["owner"] == {"kind": "session", "session_id": "sess-9"}
+
+
+def test_non_default_board_db_resolves_under_kanban_home(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_db", None)  # no core: the fallback resolver
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_card")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ops")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "root"))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    meta = json.loads((job / "meta.json").read_text())
+    assert meta["owner"]["board"] == "ops"
+    assert meta["board_db"] == str(tmp_path / "root" / "kanban" / "boards" / "ops" / "kanban.db")
+
+
+def test_board_db_prefers_core_resolver(tmp_path, monkeypatch):
+    import types
+    core = types.ModuleType("hermes_cli.kanban_db")
+    core.kanban_db_path = lambda board=None: tmp_path / f"core-{board}.db"
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_db", core)
+    assert ut.board_db_path("ops") == str(tmp_path / "core-ops.db")
+
+
+def test_watch_interval_defaults_to_15s():
+    import inspect
+    assert ut.WATCH_INTERVAL_S == 15
+    assert inspect.signature(ut.watchdog).parameters["interval"].default == ut.WATCH_INTERVAL_S
+
+
+@pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "0", "-3", "abc", "1e400"])
+def test_max_wait_minutes_must_be_finite_and_positive(monkeypatch, raw):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_MAX_WAIT_MINUTES", raw)
+    assert ut.max_wait_minutes() == 120.0
+
+
+def test_expiry_reason_is_exact(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setenv("HERMES_USER_TERMINAL_MAX_WAIT_MINUTES", "30")
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    meta = json.loads((job / "meta.json").read_text())
+    meta["created"] -= 31 * 60
+    (job / "meta.json").write_text(json.dumps(meta))
+    (job / "opened").write_text("")
+    st = ut.watch_once(job, {})
+    assert st["status"] == "withdrawn" and st["reason"] == "expired after 30 min; ask again if still needed"
+
+
+def _age(job: Path, secs: float, drop_new_keys: bool = False) -> None:
+    meta = json.loads((job / "meta.json").read_text())
+    meta["created"] = time.time() - secs
+    if drop_new_keys:  # a job written before owners existed (e.g. 20261031-090513-2e0275)
+        meta = {k: meta[k] for k in ("command", "reason", "cwd", "origin", "created")}
+        (job / "owner.json").unlink(missing_ok=True)
+    (job / "meta.json").write_text(json.dumps(meta))
+
+
+def test_resume_reconciles_job_whose_window_never_started(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    young = ut.create_job("echo hi", "r", str(tmp_path))
+    old = ut.create_job("echo hi", "r", str(tmp_path))
+    _age(old, ut.LAUNCH_GRACE_S + 5)
+    res = json.loads(ut.handle({"job_id": old.name, "wait_s": 1}))
+    assert res["status"] == "failed" and res["ok"] is False
+    assert (old / "start.lock").is_dir()  # a window that opens late refuses
+    res = json.loads(ut.handle({"job_id": young.name, "wait_s": 1}))
+    assert res["status"] == "pending"  # inside the launch grace: kept
+
+
+def test_any_call_sweeps_legacy_stale_jobs_without_watchdog(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    legacy = ut.create_job("echo hi", "r", str(tmp_path))
+    _age(legacy, 7 * 3600, drop_new_keys=True)
+    windowed = ut.create_job("echo hi", "r", str(tmp_path))
+    _age(windowed, 7 * 3600, drop_new_keys=True)
+    (windowed / "opened").write_text("")  # a window announced itself but never ran it
+    monkeypatch.setattr(ut, "open_window", lambda job: "Terminal")
+    json.loads(ut.handle({"command": "echo new", "cwd": str(tmp_path), "wait_s": 1}))
+    assert ut.read_status(legacy)["status"] == "failed"
+    assert json.loads((legacy / "status.json").read_text())["status"] == "failed"
+    st = ut.read_status(windowed)
+    assert st["status"] == "withdrawn" and st["reason"] == "expired after 120 min; ask again if still needed"
+
+
+@pytest.fixture
+def victim():
+    """A process in its own group that dies on SIGTERM/SIGUSR1/SIGKILL: proof of any stray signal."""
+    p = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    yield p
+    p.kill()
+    p.wait()
+
+
+def test_withdraw_never_signals_legacy_pid_only_files(tmp_path, monkeypatch, victim):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    (job / "opened").write_text(f"{victim.pid}\n")
+    (job / "cmd.pgid").write_text(f"{victim.pid}\n")
+    ut.withdraw_job(job, "gone")
+    time.sleep(0.3)
+    assert victim.poll() is None, "a PID-only (unverified) process was signalled"
+
+
+def test_withdraw_never_signals_pid_whose_start_time_differs(tmp_path, monkeypatch, victim):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    stale = "Mon Jan  1 00:00:00 2001"
+    (job / "runners").write_text(f"{victim.pid} {stale}\n")
+    (job / "opened").write_text(f"{victim.pid}\n")
+    (job / "cmd.pgid").write_text(f"{victim.pid} {stale}\n")
+    ut.withdraw_job(job, "gone")
+    time.sleep(0.3)
+    assert victim.poll() is None, "a reused pid (start time mismatch) was signalled"
+
+
+def test_withdraw_signals_verified_command_group(tmp_path, monkeypatch, victim):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    (job / "cmd.pgid").write_text(f"{victim.pid} {ut._proc_start(victim.pid)}\n")
+    ut.withdraw_job(job, "gone")
+    assert victim.wait(5) is not None
+
+
+@pytest.mark.parametrize("end", ["withdraw", "abandon"])
+def test_status_json_reads_back_terminal_after_kill(tmp_path, monkeypatch, end):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    # the runner passed its gate just before the final gate was taken and writes "running" during the kill
+    monkeypatch.setattr(ut, "_kill_command", lambda j, secs=3.0: (j / "status.json").write_text('{"status":"running"}'))
+    st = ut.withdraw_job(job, "gone") if end == "withdraw" else ut.mark_abandoned(job, "window closed")
+    on_disk = json.loads((job / "status.json").read_text())
+    assert on_disk["status"] == st["status"] and on_disk["status"] in ("withdrawn", "abandoned")
+
+
+def test_one_watchdog_per_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    cmd = [sys.executable, str(Path(ut.__file__)), "--watchdog", str(job), "30", "0.2"]
+    first = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not (job / "watchdog.lock" / "owner").exists():
+            time.sleep(0.05)
+        second = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        assert second.returncode == 0 and "already watched" in second.stderr
+        assert first.poll() is None
+        ut.withdraw_job(job, "done")
+        assert first.wait(10) == 0
+        assert not (job / "watchdog.lock").exists()  # released on exit
+    finally:
+        first.kill()
+
+
+def test_watchdog_crash_is_logged_not_swallowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    (job / "meta.json").write_text("[1, 2]")  # corrupt: not an object
+    r = subprocess.run([sys.executable, str(Path(ut.__file__)), "--watchdog", str(job), "2", "0.2"],
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode != 0 and "Traceback" in r.stderr
+
+
+def test_spawn_failure_is_logged(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+
+    def boom(*a, **k):
+        raise OSError("no python here")
+    monkeypatch.setattr(ut.subprocess, "Popen", boom)
+    _REAL_SPAWN(job)
+    assert "no python here" in (job / "watchdog.log").read_text()
+
+
+def test_spawned_watchdog_logs_to_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    (job / "meta.json").write_text("[1, 2]")
+    _REAL_SPAWN(job)
+    deadline = time.time() + 15
+    while time.time() < deadline and "Traceback" not in ((job / "watchdog.log").read_text()
+                                                         if (job / "watchdog.log").exists() else ""):
+        time.sleep(0.1)
+    assert "Traceback" in (job / "watchdog.log").read_text()
+
+
+def test_board_check_logs_unreadable_board(tmp_path, caplog):
+    db = tmp_path / "kanban.db"
+    db.write_bytes(b"not a sqlite file at all" * 100)
+    with caplog.at_level("WARNING"):
+        assert ut._board_check({"task": "t_card", "db": str(db)}, time.time()) is None
+    assert "board" in caplog.text.lower()
+
+
+@needs_bsd_script
+def test_runner_starts_one_watchdog_before_the_command(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_USER_TERMINAL_RUNNER_WATCHDOG", raising=False)
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("", "r", str(tmp_path))  # create_job() direct: no handle() spawn
+    (job / "cmd.sh").write_text(f"[ -d {job}/watchdog.lock ] && cat {job}/watchdog.lock/owner > {tmp_path}/seen\n")
+    try:
+        _drive(job, ["\n"])
+        seen = (tmp_path / "seen").read_text().split() if (tmp_path / "seen").exists() else []
+        assert seen and seen[0].isdigit(), "no watchdog held the job when its command ran"
+    finally:
+        for line in [(job / "watchdog.lock" / "owner")]:
+            try:
+                os.kill(int(line.read_text().split()[0]), 9)
+            except (OSError, ValueError, IndexError):
+                pass
