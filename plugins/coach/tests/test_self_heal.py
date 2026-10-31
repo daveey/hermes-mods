@@ -158,6 +158,38 @@ def test_finished_reply_quoting_a_placeholder_is_not_interrupted():
         assert sh.machine_signal(reply, ["-> terminal(grep -rn x)"]) is None, reply
 
 
+# agent-6eb3a51e94: every repeated tool error got the one fixed symptom "same tool error repeated" (one fingerprint
+# for unrelated failures) and the error text was dropped, so the investigation card saw only the reply tail.
+DISK_IO = ["-> terminal(sqlite3 /home/u/.hermes/kanban.db 'select 1')",
+           "   <- ERROR exit 1: Error: disk I/O error (10)"] * 3
+OVERLAP = ["-> kanban_create(title='fix t_01a18e0f85fa5317', assignee=default)",
+           "   <- ERROR create_overlap: refused, open card t_01a18f450bc2683c covers it"] * 3
+
+
+def test_repeat_failure_fingerprint_is_per_tool_and_error():
+    a, b = sh.machine_signal("done", DISK_IO), sh.machine_signal("done", OVERLAP)
+    assert a["kind"] == b["kind"] == "repeat_failure"
+    assert a["fingerprint"] != b["fingerprint"]
+    assert "terminal" in a["symptom"] and "disk" in a["symptom"]
+    assert "kanban_create" in b["symptom"] and "create_overlap" in b["symptom"]
+    # the same error with different card ids, paths and numbers is one defect
+    other = ["-> kanban_create(title='other', assignee=default)",
+             "   <- ERROR create_overlap: refused, open card t_01a1999999999999 covers it"] * 3
+    assert sh.machine_signal("done", other)["fingerprint"] == b["fingerprint"]
+    io2 = ["-> terminal(sqlite3 /tmp/x/kanban.db 'select 2')", "   <- ERROR exit 1: Error: disk I/O error (522)"] * 3
+    assert sh.machine_signal("done", io2)["fingerprint"] == a["fingerprint"]
+    # the same error text from two different tools is two defects
+    io3 = [x.replace("-> terminal(", "-> execute_code(") for x in DISK_IO]
+    assert sh.machine_signal("done", io3)["fingerprint"] != a["fingerprint"]
+
+
+def test_repeat_failure_hit_carries_the_error_line_and_command():
+    hit = sh.machine_signal("done", OVERLAP)
+    ev = hit["evidence"]
+    assert "create_overlap: refused" in ev and "kanban_create(" in ev and "3x" in ev
+    assert "create_overlap: refused" in hit["details"]
+
+
 def test_resume_note_user_turn_files_backend_stopped_signal():
     note = ("[System note: Your previous turn was interrupted mid-run — the app or its backend process stopped "
             "before the turn could finish. Some of the work may already be complete; check the current state "

@@ -1363,3 +1363,62 @@ def test_template_head_falls_back_to_the_status_only_evidence_quote(tmp_path):
     rows = [{**{k: v for k, v in _tpl_nudge(i, f"s{i % 2}").items() if k != "ask_head"}, "evidence": ev}
             for i in range(3)]
     assert len(_templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW))) == 1
+
+
+# ── provider 5xx whose body is a proxy/CDN HTML page (agent-ee16fb8bb9) ─────────────────────────────────────
+
+def _html_502_record():
+    """The hub's 2026-10-30 11:42:45 errors.log record, byte for byte (CRLF HTML body from Cloudflare): the
+    exception line reads `anthropic.InternalServerError: <html>` and the status is only on lines 2-4."""
+    return (FIX / "errors-html-502.txt").read_bytes().decode().split("\n")
+
+
+def test_provider_5xx_with_html_proxy_body_is_transient():
+    lines = _html_502_record()
+    assert any(l.startswith("anthropic.InternalServerError: <html>") for l in lines)
+    assert sg.parse_errors(lines) == []
+
+
+@pytest.mark.parametrize("title", ["503 Service Temporarily Unavailable", "504 Gateway Time-out",
+                                   "500 Internal Server Error"])
+def test_provider_5xx_html_variants_are_transient(title):
+    lines = [f"2026-10-30 11:42:45,778 ERROR agent.chat_completion_helpers: Streaming failed before delivery: <html>",
+             "Traceback (most recent call last):",
+             '  File "/home/you/.hermes/hermes-agent/agent/chat_completion_helpers.py", line 3410, in _open',
+             "    return manager.__enter__()",
+             "anthropic.InternalServerError: <html>\r", f"<head><title>{title}</title></head>\r", "</html>"]
+    assert sg.parse_errors(lines) == []
+
+
+def test_non_provider_exception_mentioning_502_on_later_lines_still_files():
+    """Control: the multi-line skip is scoped to provider exception types; our own error whose message spans
+    lines that mention 502 / Bad Gateway is still a defect."""
+    lines = ["2026-10-30 11:42:45,778 ERROR agent.chat_completion_helpers: lookup failed",
+             "Traceback (most recent call last):",
+             '  File "/home/you/.hermes/hermes-agent/agent/chat_completion_helpers.py", line 10, in _pick',
+             "    return table[key]",
+             "KeyError: 'route'",
+             "known keys: <title>502 Bad Gateway</title> Service Unavailable 503"]
+    assert len(sg.parse_errors(lines)) == 1
+
+
+def test_provider_error_without_5xx_in_body_still_files():
+    """A provider error whose HTML body carries no 5xx status (or a 4xx page) is not skipped as transient."""
+    lines = ["2026-10-30 11:42:45,778 ERROR agent.chat_completion_helpers: Streaming failed before delivery: <html>",
+             "Traceback (most recent call last):",
+             '  File "/home/you/.hermes/hermes-agent/agent/chat_completion_helpers.py", line 3410, in _open',
+             "    return manager.__enter__()",
+             "anthropic.BadRequestError: <html>\r", "<head><title>400 Bad Request</title></head>\r", "</html>"]
+    assert len(sg.parse_errors(lines)) == 1
+
+
+def test_worker_crash_with_html_5xx_body_is_transient():
+    lines = ["managed worker failed", "Traceback (most recent call last):",
+             '  File "/home/you/.hermes/hermes-agent/agent/managed_worker.py", line 464, in main',
+             "    execute(frame, channel)",
+             "anthropic.InternalServerError: <html>\r", "<head><title>502 Bad Gateway</title></head>\r",
+             "<center><h1>502 Bad Gateway</h1></center>\r", "</html>"]
+    log = [f"[pid 41] {l}" for l in lines]
+    assert sg.parse_worker_crashes(log) == []
+    ctl = [f"[pid 42] {l}" for l in lines[:4] + ["KeyError: 'route'", "<title>502 Bad Gateway</title>"]]
+    assert len(sg.parse_worker_crashes(ctl)) == 1

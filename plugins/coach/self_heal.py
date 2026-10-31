@@ -250,12 +250,89 @@ def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
         v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
              "symptom": "turn interrupted before finishing"}
     else:
-        errs = [ERR_LINE_RE.search(x).group(1)[:80] for x in _err_lines(log)]
-        rep = next((e for e in set(errs) if e and errs.count(e) >= 3), None)
+        rep = repeated_tool_error(log)
         if not rep:
             return None
-        v = {"p_defect": 0.85, "kind": "repeat_failure", "component": "agent", "symptom": "same tool error repeated"}
+        # The id is the tool plus the normalized error (agent-6eb3a51e94: one fixed label lumped every repeated error
+        # into one defect, and the card only saw the reply tail).
+        v = {"p_defect": 0.85, "kind": "repeat_failure", "component": "agent",
+             "symptom": f"repeated {rep['tool']} error: {rep['error'][:60]}".rstrip(),
+             "tool": rep["tool"], "error": rep["error"], "evidence": rep["evidence"], "details": rep["details"]}
     return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal"}
+
+
+_TOOL_CALL_RE = re.compile(r"^\s*->\s*([\w.:-]+)\(")
+_ERR_NORM = [
+    (re.compile(r"\bt_[0-9a-f]{6,}\b", re.I), " "),  # card ids
+    (re.compile(r"\b\d{8}_\d{6}_[0-9a-z]+\b", re.I), " "),  # session ids
+    (re.compile(r"(?<![\w/])(?:~|\.{1,2})?/[\w.@+~-]+(?:/[\w.@+~-]*)*"), " "),  # paths (not "I/O")
+    (re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,}\b", re.I), " "),  # hex shas/ids
+    (re.compile(r"\d+"), " "),
+    (re.compile(r"\(\s*\)|\[\s*\]"), " "),
+    (re.compile(r"\s+"), " "),
+]
+
+
+def normalize_error(err: str) -> str:
+    """Error text with the parts that vary between occurrences of one error (ids, paths, hex, numbers) removed."""
+    t = str(err or "")
+    for rx, sub in _ERR_NORM:
+        t = rx.sub(sub, t)
+    return t.strip(" :,;.-")
+
+
+def repeated_tool_error(log) -> Optional[dict]:
+    """The first (tool, normalized error) pair seen 3+ times in one turn's tool log, with the call and error lines.
+    -> {tool, error, count, call, line, evidence, details} or None."""
+    seen: dict = {}
+    tool, call = "tool", ""
+    for ln in log or []:
+        ln = str(ln)
+        m = _TOOL_CALL_RE.match(ln)
+        if m:
+            tool, call = m.group(1), ln.strip()
+            continue
+        e = ERR_LINE_RE.search(ln)
+        if not e:
+            continue
+        norm = normalize_error(e.group(1)[:200])
+        if not norm:
+            continue
+        rec = seen.setdefault((tool, norm), {"tool": tool, "error": norm, "count": 0, "calls": []})
+        rec["count"] += 1
+        rec["calls"].append((call, e.group(1).strip()))
+        rec["call"], rec["line"] = call, e.group(1).strip()
+    rep = next((r for r in seen.values() if r["count"] >= 3), None)
+    if not rep:
+        return None
+    rep["evidence"] = (f"{rep['tool']} failed {rep['count']}x with the same error: {rep['line'][:160]} "
+                       f"(last call: {rep['call'][:120]})")
+    rep["details"] = "\n".join(f"{c[:200]}\n   <- ERROR {x[:200]}" for c, x in rep.pop("calls")[-4:])
+    return rep
+
+
+# Words too generic to tie a card to a signal hit, and tools too generic to count on their own.
+_RELEVANCE_STOP = set("error errors failed failure refused cannot could unable found exit code tool repeated turn "
+                      "with before after while finishing stopped open card file line none null true false call "
+                      "result".split())
+_GENERIC_TOOLS = {"tool", "terminal", "execute_code", "read_file", "write_file", "patch", "search_files", "tool_call",
+                  "delegate_task", "browser_exec", "process_manage"}
+
+
+def signal_terms(d: dict) -> set:
+    """Words a card must mention to own this machine-signal defect: the tool (unless generic) and the error's
+    content words, else the symptom's content words."""
+    text = d.get("error") if d.get("kind") == "repeat_failure" else d.get("symptom")
+    terms = {w for w in re.findall(r"[a-z][a-z0-9_]+", str(text or "").lower())
+             if len(w) >= 4 and w not in _RELEVANCE_STOP and w not in _STOP}
+    if d.get("tool") and str(d["tool"]).lower() not in _GENERIC_TOOLS:
+        terms.add(str(d["tool"]).lower())
+    return terms
+
+
+def card_relevant(card: dict, terms: set) -> bool:
+    text = " ".join(str(card.get(k) or "") for k in ("title", "body")).lower()
+    return bool(text) and any(t in text for t in terms)
 
 
 def is_resume_note(user_text) -> bool:
@@ -1564,11 +1641,15 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
             except sqlite3.Error:
                 continue
         try:
+            cols = {c[1] for c in db.execute("PRAGMA table_info(tasks)")}
+            body = "substr(body, 1, 4000)" if "body" in cols else "NULL"
             for r in db.execute(
-                    f"SELECT id, title, status, created_at FROM tasks WHERE status IN ({marks}) AND created_at >= ? "
+                    f"SELECT id, title, status, created_at, {body} FROM tasks WHERE status IN ({marks}) "
+                    "AND created_at >= ? "
                     "AND (session_id = ? OR id IN (SELECT task_id FROM kanban_notify_subs WHERE chat_id = ?))",
                     (*ADOPT_STATUSES, int(since), session_id, session_id)):
-                rows.append({"id": r[0], "title": r[1], "status": r[2], "created_at": r[3], "board": board})
+                rows.append({"id": r[0], "title": r[1], "status": r[2], "created_at": r[3], "board": board,
+                             "body": r[4]})
         except sqlite3.Error:
             pass
         finally:
@@ -1703,6 +1784,17 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
                     "commit": fix["sha"], "adopted": True}
     if not cards:
         return None
+    if d.get("source") == "signal":
+        # A machine signal names no fix of its own: the session's next card is often unrelated work (an Ask Eve test
+        # was once adopted as the owner of a repeated kanban error). Adopt only a card that names the tool or error.
+        terms = signal_terms(d)
+        relevant = [x for x in cards if card_relevant(x, terms)]
+        if not relevant:
+            store.log({"event": "selfheal_adopt_skipped", "why": "no session card names the signal's tool or error",
+                       "fingerprint": fp, "session_id": sid, "terms": sorted(terms)[:12],
+                       "candidates": [x["id"] for x in cards]})
+            return None
+        cards = relevant
     c = cards[0]
     lane = LaneState(store.root)
     st = lane.get(fp)
