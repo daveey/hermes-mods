@@ -697,6 +697,9 @@ INBOX_TYPE = "selfheal"
 RESULT_TYPE = "selfheal-result"  # legacy Inbox card type; results are no longer posted (see RESULTS_DIR)
 RESULTS_DIR = "selfheal-results"  # <coach>/selfheal-results/<fp>.md: finished-work proof, never an Inbox card
 SELF = "~/code/hermes-mods/plugins/coach/self_heal.py"  # how cards and Inbox actions call this file on the hub
+# The event commands briefs print pin HERMES_HOME: a card's terminal keeps env between calls, and a repro that ran
+# `export HERMES_HOME=$(mktemp -d)` sent `event proposed` to a scratch lane that reported success (plugin-129c2f2518).
+SELF_EVENT = f'HERMES_HOME="$HOME/.hermes" python3 {SELF} event'
 FP_RE = re.compile(r"^[a-z]+-[0-9a-f]{8,}$")
 
 
@@ -1008,11 +1011,11 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
    with a file:line, log line, db row or quote; label guesses `(hypothesis)`; branch "why it happened" and "why
    nothing caught it"; stop at a process/guard/design gap Hermes controls. Post the chain as a comment on this card.
 3. A real defect already owned by another card is a duplicate, NOT not_defect. Record
-   `python3 {SELF} event duplicate {fp} --owner <owner-card> --note "<evidence>"`,
+   `{SELF_EVENT} duplicate {fp} --owner <owner-card> --note "<evidence>"`,
    then complete this card as a duplicate. Post nothing to the Inbox; the owner retains the real defect.
    Not a real defect (expected behaviour, user's own setting, outside world with nothing to guard)? Only after you
    checked the user's complaint itself, not just the detector's trigger. Run
-   `python3 {SELF} event not_defect {fp} --note "<why>"` and complete this card with a
+   `{SELF_EVENT} not_defect {fp} --note "<why>"` and complete this card with a
    result that starts with "not a defect:". Post nothing to the Inbox.
 4. Otherwise write the proposal to {proposal} (markdown, <= 3500 chars, plain words, no jargon) with exactly these
    sections:
@@ -1021,7 +1024,7 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
    **Plan**: the exact changes (files/skills/config), the regression test (fails before, passes after), the
    detection guard, and what gets verified live after shipping.
    **Cost / risk**, then **Undo**: how to revert. The first line is a one-line title: what is broken.
-   Do NOT post it to the Inbox. Record it: `python3 {SELF} event proposed {fp}`
+   Do NOT post it to the Inbox. Record it: `{SELF_EVENT} proposed {fp}`
    (the lane auto-approves it within 5 minutes and files the fix card from this proposal).
 5. Complete this card with the proposal's first line as the summary. Do not start the fix.
 """
@@ -1048,7 +1051,7 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
 
 ## Acceptance (all of it, in order)
 1. Re-check the defect still reproduces on the current code (it may have been fixed meanwhile: then say so, run
-   `python3 {SELF} event not_defect {fp} --note "already fixed by <sha>"` and stop).
+   `{SELF_EVENT} not_defect {fp} --note "already fixed by <sha>"` and stop).
 2. Write the regression test FIRST and show it FAILING on the current code (paste the failing output in a card
    comment).
 3. Make the fix from the plan (root level, not just the symptom) and the detection guard. Show the same test
@@ -1058,7 +1061,7 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
 6. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post` for a finished fix
    (David archived those unread and the inbox muted the poster). Write `result.md` (what changed with commits,
    the red/green test output, the live proof, and the undo command) and run
-   `python3 {SELF} event fixed {fp} --note "<commit sha>" --result result.md`.
+   `{SELF_EVENT} fixed {fp} --note "<commit sha>" --result result.md`.
    That stores the result under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed; the card's
    kanban_complete summary carries it too. Nothing reaches the Inbox.
 7. Complete the card. If something irreversible or external blocks the fix, kanban_block with the exact ask instead.
@@ -2362,6 +2365,10 @@ class FixPending(Exception):
         self.state, self.entry = state, entry
 
 
+class UnknownFingerprint(ValueError):
+    """`event` refused: this lane has no entry for the fingerprint (wrong HERMES_HOME, typo)."""
+
+
 EVENT_STATUS = {"proposed": "proposed", "fixed": "fixed", "not_defect": "not_defect", "reverted": "reverted",
                 "declined": "declined", "duplicate": "approved"}
 
@@ -2384,15 +2391,20 @@ def resolve_event_card(card: str, st: dict) -> str:
 
 
 def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None, now: Optional[float] = None,
-                 owner: str = "", result: str = "") -> dict:
+                 owner: str = "", result: str = "", require_known: bool = False) -> dict:
     """`self_heal.py event <kind> <fp>`: cards report their lifecycle; logged as selfheal_<kind>.
     `result` (a file path, `fixed` only) is copied to <coach>/selfheal-results/<fp>.md: the quiet home for
-    finished work (the Inbox is for decisions only)."""
+    finished work (the Inbox is for decisions only). `require_known` (the CLI) refuses a fingerprint this lane never
+    filed: an event sent to the wrong lane (a scratch HERMES_HOME left exported in the card's terminal) used to
+    create an orphan entry there, print success, and leave the real entry to go stale (plugin-129c2f2518)."""
     store = _store(store)
     now = now or time.time()
     if kind not in EVENT_STATUS:
         raise ValueError(f"unknown event {kind}; one of {sorted(EVENT_STATUS)}")
     lane = LaneState(store.root)
+    if require_known and fp not in lane.read():
+        raise UnknownFingerprint(f"unknown fingerprint {fp} in {lane.path}: not recorded. Is HERMES_HOME pointing at a "
+                                 f"scratch dir? Rerun with HERMES_HOME=\"$HOME/.hermes\".")
     st = lane.get(fp)
     card = resolve_event_card(card, st)
     if kind == "duplicate" and (not _CARD_ID.fullmatch(owner) or owner == card):
@@ -2483,6 +2495,20 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
             continue
         ks = card_status(card, st.get("board"), runner)
         if ks not in ENDED:
+            continue
+        proposal = Path(store.root) / "selfheal" / fp / "proposal.md"
+        try:
+            p_mtime = proposal.stat().st_mtime if status == "filed" and ks == "done" else 0.0
+        except OSError:
+            p_mtime = 0.0
+        if p_mtime and p_mtime >= (st.get("filed_at") or 0):
+            # The investigation finished and wrote this generation's proposal, but its `event proposed` never reached
+            # this lane (plugin-129c2f2518: an exported scratch HERMES_HOME sent it to a temp lane that reported
+            # success). The proposal is the evidence: record it as proposed so sync() files the fix card.
+            lane.update(fp, status="proposed", proposed_at=p_mtime)
+            store.log({"event": "selfheal_proposed", "fingerprint": fp, "card": card, "via": "reconcile",
+                       "note": f"card {ks} without reporting; proposal.md found", "component": st.get("component")})
+            done.append((fp, f"proposed (card {card} {ks}, proposal.md found)"))
             continue
         lane.update(fp, status="stale", closed_at=now)
         store.log({"event": "selfheal_stale", "fingerprint": fp, "card": card, "was": status, "kanban": ks,
@@ -2769,7 +2795,11 @@ def main(argv=None) -> int:
         print(json.dumps(file_fix(a.fp)))
     elif a.cmd == "event":
         try:
-            e = record_event(a.kind, a.fp, a.card, a.note, owner=a.owner, result=a.result)
+            e = record_event(a.kind, a.fp, a.card, a.note, owner=a.owner, result=a.result, require_known=True)
+        except UnknownFingerprint as exc:
+            print(json.dumps({"fingerprint": a.fp, "error": str(exc)}))
+            print(f"self_heal event: {exc}", file=sys.stderr)
+            sys.exit(4)
         except FixPending as fx:
             s = fx.state
             print(json.dumps({"fingerprint": a.fp, "status": fx.entry.get("status"), "fix_pending": True,

@@ -31,7 +31,8 @@ core = load("coach_core_brief_cmds_test", ROOT / "core.py")
 
 NOW = 1792660000.0
 INV, FIX, OWNER = "t_0000aaaa", "t_0000bbbb", "t_0000cccc"
-CMD = re.compile(r"`(python3 \S*self_heal\.py event [^`]+)`")
+CMD = re.compile(r"`(?:HERMES_HOME=\"\$HOME/\.hermes\" )?(python3 \S*self_heal\.py event [^`]+)`")
+FULL_CMD = re.compile(r"`((?:HERMES_HOME=\"\$HOME/\.hermes\" )?python3 \S*self_heal\.py event [^`]+)`")
 
 # what a worker's tool-child shell holds: the scrubbed env (no HERMES_KANBAN_TASK)
 TOOL_CHILD_ENV = {"HERMES_KANBAN_WORKSPACE": "/tmp/ws", "HERMES_KANBAN_BOARD": "default"}
@@ -96,17 +97,20 @@ def test_terminal_entry_real_bash_runs_each_investigation_command_verbatim(tmp_p
     """terminal path: a real `bash -c` with the scrubbed tool-child env (no HERMES_KANBAN_TASK) runs the line."""
     import os
     import subprocess
-    home = tmp_path / "home"
+    # The card's terminal still has a repro's `export HERMES_HOME=<scratch>` (plugin-129c2f2518): the pinned
+    # command must reach the real lane at $HOME/.hermes anyway.
+    home = tmp_path / ".hermes"
     store = core.Store(home / "coach")
     d = defect()
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path), "HERMES_HOME": str(home),
-           **TOOL_CHILD_ENV, "HERMES_KANBAN_WORKER_TASK": INV}
-    for cmd in commands(sh.investigation_brief(d)):
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path),
+           "HERMES_HOME": str(tmp_path / "scratch-home"), **TOOL_CHILD_ENV, "HERMES_KANBAN_WORKER_TASK": INV}
+    for cmd in FULL_CMD.findall(sh.investigation_brief(d)):
         sh.LaneState(store.root).update(d["fingerprint"], status="filed", card=INV)
         line = _fill(cmd).replace("python3 " + sh.SELF, f"{shlex.quote(sys.executable)} "
                                                         f"{shlex.quote(str(ROOT / 'self_heal.py'))}")
         p = subprocess.run(["bash", "-c", line], env=env, capture_output=True, text=True, timeout=60)
         assert p.returncode == 0, (cmd, p.stderr)
+    assert not (tmp_path / "scratch-home" / "coach" / "selfheal_lane.json").exists()
     (dup,) = _log(store, "selfheal_adopted_owner")
     assert dup["duplicate_card"] == INV and dup["card"] == OWNER
     assert _log(store, "selfheal_proposed")[0]["card"] == INV
@@ -167,3 +171,23 @@ def test_briefs_never_reference_the_scrubbed_variable():
     d = defect()
     for brief in (sh.investigation_brief(d), sh.fix_brief(d["fingerprint"], {"card": INV})):
         assert "$HERMES_KANBAN_TASK" not in brief and "${HERMES_KANBAN_TASK}" not in brief
+
+
+def test_every_brief_event_command_pins_hermes_home():
+    d = defect()
+    for brief in (sh.investigation_brief(d), sh.fix_brief(d["fingerprint"], {"card": INV})):
+        full = FULL_CMD.findall(brief)
+        assert full and all(c.startswith('HERMES_HOME="$HOME/.hermes" python3 ') for c in full), full
+
+
+def test_event_on_a_fingerprint_this_lane_never_filed_exits_nonzero(lane, capsys):
+    """A wrong lane (scratch HERMES_HOME) used to create an orphan entry and print success."""
+    store, _d = lane
+    with pytest.raises(SystemExit) as ex:
+        sh.main(["event", "proposed", "plugin-0123456789", "--card", INV])
+    assert ex.value.code == 4
+    cap = capsys.readouterr()
+    assert "unknown fingerprint plugin-0123456789" in cap.err and str(Path(store.root)) in cap.err
+    assert "plugin-0123456789" not in sh.LaneState(store.root).read()
+    log = Path(store.root) / "log.jsonl"
+    assert not log.exists() or _log(store, "selfheal_proposed") == []

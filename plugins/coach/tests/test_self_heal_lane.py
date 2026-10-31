@@ -1140,6 +1140,58 @@ def test_unreadable_card_status_never_marks_stale(store):
     assert sh.reconcile(store, runner=Runner(fail=True), now=NOW + 600) == []
 
 
+def _write_proposal(store, fp, mtime):
+    p = Path(store.root) / "selfheal" / fp / "proposal.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("title\n**What happened**\n")
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_done_investigation_whose_event_was_lost_but_wrote_a_proposal_reconciles_to_proposed(store):
+    """plugin-129c2f2518: the card's `event proposed` went to a scratch lane; its proposal.md is the evidence."""
+    b = Board()
+    d = defect()
+    fp = d["fingerprint"]
+    card = sh.file_defect(d, store=store, m="live", runner=b, now=NOW, cfg=HUB, budget_fn=OPEN)["card"]
+    _write_proposal(store, fp, NOW + 300)
+    b.finish(card, "done")
+    done = dict(sh.reconcile(store, runner=b, now=NOW + 600))
+    assert done[fp].startswith("proposed")
+    st = sh.LaneState(store.root).get(fp)
+    assert st["status"] == "proposed" and st["proposed_at"] == NOW + 300
+    (p,) = ev(store, "selfheal_proposed")
+    assert p["via"] == "reconcile" and p["card"] == card
+    assert ev(store, "selfheal_stale") == []
+    # and the next sync pass files its fix card
+    fixed = []
+    out = dict(sh.sync(store, runner=b, now=NOW + 900, auto=True,
+                       fixer=lambda f, **kw: fixed.append(f) or {"card": "t_0000f1f1"}))
+    assert fixed == [fp] and out[fp] == "auto -> t_0000f1f1"
+
+
+@pytest.mark.parametrize("proposal", ["missing", "older generation"])
+def test_done_investigation_without_a_fresh_proposal_still_goes_stale(store, proposal):
+    b = Board()
+    d = defect()
+    fp = d["fingerprint"]
+    card = sh.file_defect(d, store=store, m="live", runner=b, now=NOW, cfg=HUB, budget_fn=OPEN)["card"]
+    if proposal == "older generation":
+        _write_proposal(store, fp, NOW - 86400)
+    b.finish(card, "done")
+    assert dict(sh.reconcile(store, runner=b, now=NOW + 600))[fp].startswith("stale (filed")
+
+
+def test_archived_investigation_with_a_proposal_is_not_resurrected(store):
+    b = Board()
+    d = defect()
+    fp = d["fingerprint"]
+    card = sh.file_defect(d, store=store, m="live", runner=b, now=NOW, cfg=HUB, budget_fn=OPEN)["card"]
+    _write_proposal(store, fp, NOW + 300)
+    b.finish(card, "archived")
+    assert dict(sh.reconcile(store, runner=b, now=NOW + 600))[fp].startswith("stale (filed")
+
+
 # ── origin session already queued a fix card ──
 def _owner(cards):
     return lambda sid, since: sorted((c for c in cards if c["created_at"] >= since), key=lambda c: -c["created_at"])
