@@ -176,7 +176,7 @@ export function projectStrip(ledger, kanbanItems) {
       (it.board || 'default') === (ledger?.card?.board || 'default')))
     .slice()
     .sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0))
-    .map(it => ({ type: 'card', key: `c:${it.connectionId || it.gateway ? `${it.connectionId || it.gateway}:` : ''}${it.board || 'default'}:${it.id}`, item: it }))
+    .map(it => ({ type: 'card', key: `c:${it.connectionId || it.gateway ? `${it.connectionId || it.gateway}:` : ''}${it.profile ? `${it.profile}:` : ''}${it.board || 'default'}:${it.id}`, item: it }))
   return [...steps, ...cards]
 }
 
@@ -586,7 +586,20 @@ function StepRow({ step, sessionId }) {
   })
 }
 
-export function Strip() {
+/** Same Kanban card by exact qualified identity: id + board + owner (connection, else gateway) and, when both
+ *  say, profile. Missing owner on either side is not a match (fail open to showing both, never to merging). */
+export function sameCard(a, b) {
+  if (!a || !b || !str(a.id) || str(a.id) !== str(b.id)) return false
+  if ((str(a.board) || 'default') !== (str(b.board) || 'default')) return false
+  const ca = str(a.connectionId), cb = str(b.connectionId)
+  if (ca && cb) { if (ca !== cb) return false } else {
+    const ga = str(a.gatewayId || a.gateway), gb = str(b.gatewayId || b.gateway)
+    if (!ga || !gb || ga !== gb) return false
+  }
+  return !(a.profile && b.profile && str(a.profile) !== str(b.profile))
+}
+
+export function Strip({ hideCards = [] } = {}) {
   const [snap, setSnap] = useState(snapshot)
   const focused = useValue(host.state.focusedStoredSessionId)
   useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
@@ -596,7 +609,8 @@ export function Strip() {
   useEffect(() => { void refresh() }, [focused, scope])
   if (!focused || snap.stored !== focused || (snap.scope && snap.scope !== scope)) return null
   const requests = canonical.scope === scope ? canonical.requests : []
-  const rows = projectStrip(snap.ledger, snap.kanban).filter(row => !requestForSource(requests, row.type === 'card'
+  const hidden = Array.isArray(hideCards) ? hideCards : []
+  const rows = projectStrip(snap.ledger, snap.kanban).filter(row => !(row.type === 'card' && hidden.some(c => sameCard(c, row.item)))).filter(row => !requestForSource(requests, row.type === 'card'
     ? { gatewayId: row.item.gatewayId || row.item.gateway, profile: row.item.profile, type: 'kanban', board: row.item.board, id: row.item.id }
     : { gatewayId: row.step.requestOwner?.gatewayId || row.step.gatewayId || row.step.owner?.gatewayId, profile: row.step.requestOwner?.profile || row.step.profile || row.step.owner?.profile, type: 'user_step', id: row.step.id }))
   const issues = (snap.issues || []).filter(i => !isDismissed(i))

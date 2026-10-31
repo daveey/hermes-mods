@@ -7,6 +7,7 @@ them. These tests use generic fixtures (example.com-style names, no live ids).
 import importlib.util
 import json
 import uuid
+import pytest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,7 +49,7 @@ def env(tmp_path):
     return core.ActionStore(tmp_path / 'actions.sqlite3'), core.Ledger(tmp_path / 'ledger', tmp_path / 'missing.db')
 
 
-def run(store, ledger, text, steps, *, elsewhere=None, repeats=None, seen=None, session='session-a'):
+def run(store, ledger, text, steps, *, elsewhere=None, repeats=None, seen=None, session='session-a', user_msg=''):
     payload = {'steps': steps, 'resolved': []}
     if elsewhere is not None:
         payload['elsewhere'] = elsewhere
@@ -60,8 +61,12 @@ def run(store, ledger, text, steps, *, elsewhere=None, repeats=None, seen=None, 
             seen.append(user)
         return json.dumps(payload)
 
-    return core.process_reply(text, session, ledger=ledger, action_store=store,
+    return core.process_reply(text, session, ledger=ledger, action_store=store, user_msg=user_msg,
                               action_owner=dict(OWNER, storedSessionId=session), llm=llm)
+
+
+# A runtime notice started the turn: the reply relays an ask that lives in another chat (relay provenance).
+NOTICE = '\u23f8 [default] @default Kanban t_aaaa1111 blocked: approve deploying build 412 to the test environment'
 
 
 def titles(store, owner):
@@ -192,7 +197,8 @@ def test_exact_elsewhere_title_suppressed_without_model_mapping_beyond_prompt_ca
     sentence = 'Can you approve the deployment described in the other chat?'
     seen = []
     out = run(store, ledger, sentence,
-              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}], seen=seen)
+              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}], seen=seen,
+              user_msg=NOTICE)
     assert seen and title not in seen[0]
     assert out['steps'] == []
     assert titles(store, OWNER) == []
@@ -212,7 +218,7 @@ def test_elsewhere_title_created_during_extraction_is_rechecked(tmp_path):
         return json.dumps({'steps': [{'text': title, 'kind': 'approve',
                                      'verbatim_span': sentence, 'options': []}], 'resolved': []})
     out = core.process_reply(sentence, 'session-a', ledger=ledger, action_store=store,
-                             action_owner=OWNER, llm=llm)
+                             action_owner=OWNER, llm=llm, user_msg=NOTICE)
     assert out['steps'] == []
     assert titles(store, OWNER) == []
     assert ledger.read('session-a')['steps'] == []
@@ -224,11 +230,29 @@ def test_exact_elsewhere_evidence_suppressed_without_adopting_owner(tmp_path):
     original = store.create(OTHER, _approval(OTHER, title))
     before = store.get(OTHER, original['requestId'])
     out = run(store, ledger, title, [{'text': 'Deployment permission for the test environment',
-                                     'kind': 'approve', 'verbatim_span': title, 'options': []}])
+                                     'kind': 'approve', 'verbatim_span': title, 'options': []}], user_msg=NOTICE)
     assert out['steps'] == []
     assert ledger.read('session-a')['steps'] == []
     assert titles(store, OWNER) == []
     assert store.get(OTHER, original['requestId']) == before
+
+
+@pytest.mark.parametrize('typed', ['', 'Can you also get the deploy approved here?'])
+def test_equal_elsewhere_title_in_a_user_turn_is_its_own_request(tmp_path, typed):
+    # No relay provenance: the user started this turn (or the hook missed its message). An equal title in
+    # another chat is not a source association, so this chat's ask is published as its own request, and the
+    # other chat's request is untouched (no adoption, no decision, no operation).
+    store, ledger = env(tmp_path)
+    title = 'Approve deploying build 412 to the test environment'
+    original = store.create(OTHER, _approval(OTHER, title))
+    before = store.get(OTHER, original['requestId'])
+    sentence = title + '?'
+    out = run(store, ledger, sentence,
+              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}], user_msg=typed)
+    assert len(out['steps']) == 1 and out['steps'][0]['requestId'] != original['requestId']
+    assert titles(store, OWNER) == [title]
+    assert store.get(OTHER, original['requestId']) == before
+    assert all(not r.get('resolution') for r in store.requests(OWNER))
 
 
 def test_identical_title_in_other_namespace_does_not_suppress(tmp_path):
@@ -238,7 +262,7 @@ def test_identical_title_in_other_namespace_does_not_suppress(tmp_path):
         store.create(owner, _approval(owner, title))
     sentence = title + '?'
     out = run(store, ledger, sentence,
-              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}])
+              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}], user_msg=NOTICE)
     assert len(out['steps']) == 1
     assert titles(store, OWNER) == [title]
 
@@ -250,6 +274,6 @@ def test_retired_elsewhere_title_does_not_suppress(tmp_path):
     store.withdraw(OTHER, original['requestId'], by='agent', reason='No longer needed')
     sentence = title + '?'
     out = run(store, ledger, sentence,
-              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}])
+              [{'text': title, 'kind': 'approve', 'verbatim_span': sentence, 'options': []}], user_msg=NOTICE)
     assert len(out['steps']) == 1
     assert titles(store, OWNER) == [title]
