@@ -139,6 +139,18 @@ def fp(component: str, *parts) -> str:
     return f"{re.sub(r'[^a-z]', '', component.lower()) or 'other'}-{h10(component, *parts)}"
 
 
+REASON_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
+
+
+def _reason_code(exc_line: str) -> tuple:
+    """A wrapper exception whose whole message is one identifier-like token (`WorkerPersistenceError:
+    owner_unavailable`) carries its cause in that token, so it joins the fingerprint. Free-text messages stay out
+    (ids and paths vary per occurrence). -> (code,) or ()."""
+    m = EXC_RE.match(exc_line or "")
+    msg = ((m.group(2) if m else "") or "").strip()
+    return (msg,) if REASON_CODE_RE.match(msg) else ()
+
+
 def home_tilde(s: str) -> str:
     return re.sub(r"/(?:Users|home)/[^/\s\"']+", "~", s or "")
 
@@ -348,7 +360,8 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             continue
         sym = f"{exc_type.split('.')[-1]} in {where}" + (f" [{plug}]" if plug else "") + f": {r['msg'][:90]}"
         out.append({"kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
-                    "details": details[-1500:], "fp": fp(comp, "tb", exc_type, *[f"{a}:{b}" for a, b in inner])})
+                    "details": details[-1500:],
+                    "fp": fp(comp, "tb", exc_type, *_reason_code(exc_line), *[f"{a}:{b}" for a, b in inner])})
     return out
 
 

@@ -1527,6 +1527,26 @@ def test_commit_for_another_component_is_not_a_fix(store, tmp_path, monkeypatch)
     assert out["action"] == "filed" and len(r.creates()) == 1
 
 
+def test_window_commit_touching_no_traceback_file_is_not_adopted(store, tmp_path, monkeypatch):
+    """A time-window `fix(<component>)` commit that touches none of the traceback's files is not the fix."""
+    _real_adoption_env(monkeypatch, tmp_path)
+    d = defect(at=NOW - 60, host="macbook", component="desktop", complaint_at=NOW - 3600,
+               details='ERROR x: boom\nTraceback (most recent call last):\n  File "/h/gateway/session_store.py", line 3, in f')
+    repo, sha = _fork_repo_with_commit(tmp_path, "fix(desktop): unrelated sessions change", NOW - 3200)
+    monkeypatch.setenv("COACH_FORK_REPO", str(repo))
+    p = tmp_path / "data" / "macbook" / "default" / f"{d['session_id']}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"id": d["session_id"], "host": "macbook", "user_turns": [], "last_reply": "ok",
+                             "last_activity_at": NOW - 3000}))
+    assert sh.session_commit_fix(d, NOW - 3600, data=tmp_path / "data", repo=repo) is None
+    r = Runner()
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and not ev(store, "selfheal_adopted_owner")
+    # the same commit, when its diff does touch a traceback file, is adopted
+    d2 = {**d, "details": d["details"].replace("session_store.py", "f")}
+    assert sh.session_commit_fix(d2, NOW - 3600, data=tmp_path / "data", repo=repo)["sha"] == sha
+
+
 # ── cards filed before the no-Inbox rule keep their old `hermes inbox post` step (defect plugin-0001f0af0f) ──
 class BodyBoard(Board):
     """Board whose `show --json` also returns each card's body."""

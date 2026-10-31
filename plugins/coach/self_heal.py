@@ -1631,7 +1631,8 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
     """A fix the origin session shipped as a bare commit (no kanban card): a commit on the fork's origin/main made
     after `since` that (a) the session's digest names by sha, or (b) landed inside the session's active window
     (since .. last_activity_at + slack) as a `fix` whose subject names the defect's component, e.g.
-    `fix(desktop): ...` for component=desktop. Window+component is what catches a digest whose truncated last_reply
+    `fix(desktop): ...` for component=desktop, and (when the defect carries a traceback) whose diff touches a file
+    named in it. Window+component is what catches a digest whose truncated last_reply
     never names the sha. -> {sha, at, subject} or None."""
     sid, host, comp = d.get("session_id"), d.get("host"), (d.get("component") or "").lower()
     if not sid:
@@ -1657,9 +1658,15 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
         for sha, ts, subj in commits:
             if any(sha.startswith(n) for n in named):
                 return {"sha": sha, "at": ts, "subject": subj, "via": "named"}
+        # A traceback defect names the files it fails in: a window match must touch one of them, or it is just
+        # whatever fix landed nearby (a sessions `--source` change was once adopted as the fix for a lease error).
+        tb_files = {os.path.basename(p) for p in re.findall(r'File "([^"]+)"', str(d.get("details") or ""))}
         for sha, ts, subj in sorted(commits, key=lambda c: c[1]):
             head = subj.lower()
             if ts <= until and head.startswith("fix") and comp and re.search(r"\b%s\b" % re.escape(comp), head):
+                if tb_files and not tb_files & {os.path.basename(f) for f in
+                                                _git_lines(repo, "show", "--name-only", "--format=", sha)}:
+                    continue
                 return {"sha": sha, "at": ts, "subject": subj, "via": "window"}
     return None
 

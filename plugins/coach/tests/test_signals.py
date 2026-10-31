@@ -1174,3 +1174,34 @@ def test_fresh_hold_with_done_cards_still_files(tmp_path):
     assert sh.kanban_trigger_closed(d, home=h, now=NOW) is None
     # the held cards are not a per-card trigger (their finishing must never drop a fresh hold)
     assert sh.kanban_trigger(d) is None
+
+
+# ── the exception's reason code is part of the error fingerprint ──
+def _wrapper_tb(exc_line, own="/home/you/.hermes/hermes-agent/gateway/session_store.py"):
+    return ["2026-10-29 23:36:00,000 ERROR [20261029_233600_aaaaaa] gateway.run: Failed to release session turn lease",
+            "Traceback (most recent call last):",
+            f'  File "{own}", line 10, in release_turn',
+            "    raise WorkerPersistenceError(reason)", exc_line]
+
+
+def _fp_of(exc_line):
+    (row,) = sg.parse_errors(_wrapper_tb(exc_line))
+    return row["fp"]
+
+
+def test_reason_code_exceptions_with_the_same_frames_get_different_fingerprints():
+    assert _fp_of("WorkerPersistenceError: owner_unavailable") != _fp_of("WorkerPersistenceError: worker_receipt_timeout")
+
+
+def test_same_reason_code_with_different_session_ids_keeps_one_fingerprint():
+    a = _fp_of("WorkerPersistenceError: owner_unavailable")
+    assert a == _fp_of("WorkerPersistenceError: owner_unavailable ")
+    assert _fp_of("WorkerPersistenceError: owner_unavailable (session 20261029_1)") == \
+        _fp_of("WorkerPersistenceError: owner_unavailable (session 20261030_2)")
+
+
+def test_free_text_message_keeps_the_fingerprint_it_had_before():
+    (row,) = sg.parse_errors(_wrapper_tb("ValueError: bad value 123 for x"))
+    old = sg.fp(row["component"], "tb", "ValueError", "session_store.py:release_turn")
+    assert row["fp"] == old
+    assert _fp_of("ValueError: bad value 123 for x") == _fp_of("ValueError: bad value 456 for x")
