@@ -350,7 +350,8 @@ export function askSummary(item, rewritten) {
   return checklist(item, rewritten).steps[0]
 }
 
-export const detailKey = t => `${t?.connectionId || t?.gateway ? `${str(t.connectionId || t.gateway)}:` : ''}${str(t?.board) || 'default'}:${str(t?.id)}`
+// Owner (connection, else gateway) + profile when known + board + id. Unqualified rows keep the old key shape.
+export const detailKey = t => `${t?.connectionId || t?.gateway ? `${str(t.connectionId || t.gateway)}:` : ''}${str(t?.profile) ? `${str(t.profile)}@` : ''}${str(t?.board) || 'default'}:${str(t?.id)}`
 
 export const HANDBACK = 'When you\u2019re done, click Done \u2192 unblock (or Reply & unblock to send the agent an answer).'
 const HANDBACK_RE = /\bunblock\b/i
@@ -436,7 +437,8 @@ export function withOwnerRoute(t, route, connectionId) {
   const row = { ...t, connectionId }
   if (!route?.connectionId || !str(route.profile) || connectionId !== route.connectionId) return row
   if (t.gateway || t.connectionId || t.profile === null || t.ownership_state === 'unknown') return row
-  return { ...row, profile: t.profile || route.profile }
+  // readProfile: the profile this row was read through; its detail is read through the same route.
+  return { ...row, profile: t.profile || route.profile, readProfile: route.profile }
 }
 
 /** Live lists on every registered gateway, plus hub session links for cross-host
@@ -472,8 +474,15 @@ export async function sessionTasks(ids, call = api, registry = () => host.connec
       }
     }
   } catch { /* hub plugin is optional */ }
-  // Live records win over replicas, including cards which have since unblocked.
-  for (const t of live.flat()) rows.set(detailKey(t), t)
+  // Live records win over replicas, including cards which have since unblocked: a replica of the same
+  // connection/board/id gives way unless it names a different profile (then it is a different card).
+  for (const t of live.flat()) {
+    for (const [k, r] of rows) {
+      if (r.connectionId === t.connectionId && (str(r.board) || 'default') === (str(t.board) || 'default') &&
+          str(r.id) === str(t.id) && (!str(r.profile) || str(r.profile) === str(t.profile))) rows.delete(k)
+    }
+    rows.set(detailKey(t), t)
+  }
   return answered ? [...rows.values()] : null
 }
 
@@ -622,7 +631,7 @@ async function loadDetails(tasks) {
         }
         try {
           if (t.gateway && !t.connectionId) return
-          const data = await api(taskPath(t.id, t.board), { connectionId: t.connectionId, timeoutMs: 8_000 })
+          const data = await api(taskPath(t.id, t.board), { connectionId: t.connectionId, ...(t.readProfile ? { profile: t.readProfile } : {}), timeoutMs: 8_000 })
           if (data?.task?.status) t.status = data.task.status
           details.set(k, { at: now, data })
         } catch (e) {

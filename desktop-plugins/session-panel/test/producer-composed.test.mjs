@@ -183,13 +183,58 @@ test('producer: an owner without a profile-qualified route leaves items unqualif
 test('producer: explicit backend ownership is never overwritten by the read route', () => {
   const route = { connectionId: 'C1', profile: 'default' }
   const q = blocked.withOwnerRoute
-  assert.deepEqual(q({ id: 'a' }, route, 'C1'), { id: 'a', connectionId: 'C1', profile: 'default' })
+  assert.deepEqual(q({ id: 'a' }, route, 'C1'), { id: 'a', connectionId: 'C1', profile: 'default', readProfile: 'default' })
   assert.equal(q({ id: 'a', profile: 'work' }, route, 'C1').profile, 'work')
   assert.equal(q({ id: 'a', profile: null }, route, 'C1').profile, null, 'explicitly unknown stays unknown')
   assert.equal(q({ id: 'a', ownership_state: 'unknown' }, route, 'C1').profile, undefined)
   assert.equal(q({ id: 'a', gateway: 'G2' }, route, 'C1').profile, undefined, 'replica rows of other gateways keep their own owner')
   assert.equal(q({ id: 'a' }, route, 'C2').profile, undefined, 'another connection is not the owner route')
   assert.equal(q({ id: 'a' }, { connectionId: 'C1', profile: '' }, 'C1').profile, undefined)
+})
+
+test('producer: live/replica rows differing only by profile stay two cards; an unqualified replica gives way to live', async () => {
+  const route = { connectionId: 'C1', profile: 'work' }
+  const read = replica => blocked.sessionTasks(new Set(['S1']), async (path, opts) => {
+    if (path.includes('hub-sync')) return { tasks: replica }
+    return { tasks: opts.connectionId === 'C1' ? [coreRow({ id: 'collision' })] : [] }
+  }, async () => [{ id: 'C1' }], () => undefined, route)
+  const both = await read([{ ...coreRow({ id: 'collision' }), local: true, profile: 'other', ownership_state: 'qualified' }])
+  assert.deepEqual(both.map(r => r.profile).sort(), ['other', 'work'], 'a different explicit profile is a different card')
+  const one = await read([{ ...coreRow({ id: 'collision' }), local: true, profile: null, ownership_state: 'unknown' }])
+  assert.deepEqual(one.map(r => r.profile), ['work'], 'live owner record wins over unqualified replica discovery')
+  const items = blocked.blockedItems(both.map(r => ({ ...r, status: 'blocked' })), new Map(both.map(r => [blocked.detailKey(r), detail(r)])))
+  assert.equal(items.length, 2)
+  assert.equal(steps.sameCard(items[0], items[1]), false)
+})
+
+test('producer: detail evidence is read through the same owner profile route as the list', async () => {
+  host.state.focusedSessionOwner.value = { connectionId: 'C1', profile: 'work' }
+  host.state.profile.value = 'work'
+  const calls = []
+  window.hermesDesktop = { api: async req => {
+    calls.push(req)
+    const { path, profile } = req
+    if (path.startsWith('/api/sessions/')) return { id: 'S1', parent_session_id: null }
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: req.connectionId === 'C1' ? [coreRow()] : [] }
+    if (path.startsWith('/api/plugins/hub-sync/')) throw new Error('none')
+    // A profile-sensitive owner: only the work route sees this card blocked.
+    if (path.startsWith('/api/plugins/kanban/tasks/')) return profile === 'work' ? detail(coreRow()) : { task: { ...detail(coreRow()).task, status: 'ready' }, events: [] }
+    if (path.startsWith('/api/plugins/blocked-panel/ping')) return { ok: false }
+    return {}
+  } }
+  const dispose = blocked.default.register({ register() {} })
+  try {
+    await blocked.refresh(true)
+    const d = calls.filter(c => c.path.startsWith('/api/plugins/kanban/tasks/'))
+    assert.ok(d.length && d.every(c => c.connectionId === 'C1' && c.profile === 'work'), JSON.stringify(d))
+    const items = window.__blockedPanel.snapshot.items
+    assert.equal(items.length, 1)
+    assert.equal(items[0].profile, 'work')
+  } finally {
+    dispose()
+    host.state.focusedSessionOwner.value = { connectionId: 'C1', profile: 'default' }
+    host.state.profile.value = 'default'
+  }
 })
 
 test('done', () => { root.unmount() })
