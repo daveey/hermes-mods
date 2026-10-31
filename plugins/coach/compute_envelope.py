@@ -1,4 +1,8 @@
-"""Compute envelope: catch an agent asking a human to approve small GPU compute or spend.
+"""Compute envelope: coach both needless small-rental asks and agent-set spend authority.
+
+`authority(text, user_texts)` complements the under-use classifier below: it holds
+unsupported GPU cap / multi-GPU declarations once, without treating historical
+spend or genuine requests for approval as a new spending commitment.
 
 The standing rule (~/AGENTS.md, rent-machine skill): once the user has said go on a job that needs a GPU, an agent
 may rent ONE single-GPU machine up to $25 total without asking (cheapest by $ per finished run, hard cap,
@@ -68,7 +72,8 @@ def enabled() -> bool:
 def totals(text: str) -> list[float]:
     """Dollar totals named in the text; hourly rates ($0.45/h) are not totals."""
     out = []
-    for m in MONEY_RE.finditer(text or ""):
+    text = re.sub(r"\b(\d[\d,]*(?:\.\d+)?)\s+USD\b", r"$\1", text or "", flags=re.I)
+    for m in MONEY_RE.finditer(re.sub(r"\bUSD\s*", "$", text, flags=re.I)):
         if m.group(4):
             continue
         v = float(m.group(1).replace(",", "") + ("." + m.group(2) if m.group(2) else ""))
@@ -94,9 +99,70 @@ def classify(text: str, envelope: Optional[float] = None) -> Optional[dict]:
     return None
 
 
+AUTH_MULTI_RE = re.compile(
+    r"\b(?!(?:4090|5090)\b)(?:[2-9]|[1-9]\d+)\s*(?:x|×|-)?\s*"
+    r"(?:gpus?|h100s?|h200s?|a100s?|b200s?|b300s?|l40s?|a6000s?|nodes?)\b|"
+    r"\b(?:h100|h200|a100|b200|b300|4090|gpu)s?\s*[x×]\s*(?:[2-9]|[1-9]\d+)\b|"
+    r"\bmulti[- ]?(?:gpu|node)\b|\b(?:two|three|four|five|six|seven|eight|nine|ten|multiple)\s+"
+    r"(?:(?:h100|h200|a100|l40s)\s+)?gpus?\b|\b(?:two|three|four|multiple)\s+l40s\b", re.I)
+REQUEST_RE = re.compile(r"\b(?:do you approve|please approve|approve|approval needed|may i|should i|shall i|can i|"
+                        r"awaiting approval|pending approval|need(?:s)? approval|ask\w* (?:you |for )|"
+                        r"would you|reply .*approve)\b", re.I)
+PAST_RE = re.compile(r"\b(?:spent|cost was|previous cap|previous budget|had a|rented|destroyed|"
+                     r"yesterday|last week|last run|used \d+ GPUs|ran on)\b", re.I)
+DENY_RE = re.compile(r"\b(?:do not|don't|not approved|no approval|never|deny|denied|refuse)\b", re.I)
+BRIEF_RE = re.compile(r"# Kanban task|\[IMPORTANT:|\[System|<system|task notification|subagent result", re.I)
+
+
+def authority(text: str, user_texts=()) -> Optional[dict]:
+    """Detect declarations; user-only scope is supplied by the native capture hook.
+
+    This is a one-shot coaching check, not a purchasing authorization mechanism.
+    Remote/worker briefs and unknown provenance cannot grant an exemption.
+    """
+    if not TOPIC_RE.search(text or ""):
+        return None
+    users = [part for u in user_texts if not BRIEF_RE.search(u)
+             for part in re.split(r"(?<=[.?!;])\s+|\n+", u)
+             if not DENY_RE.search(part) and not re.search(r"\?|\b(?:why|whether)\b", part, re.I)]
+    approved = [v for user in users for v in totals(user)]
+    multi_approved = any(AUTH_MULTI_RE.search(u) and re.search(
+        r"\b(?:approve|allow|go ahead|you may|rent|use)\b", u, re.I) for u in users)
+    # A cap label followed by its value on the next line is one declaration.
+    text = re.sub(r"\b(cap|budget|limit)\s*\n\s*(?=USD|\$)", r"\1 ", text, flags=re.I)
+    for sent in SENTENCE_SPLIT_RE.split(text):
+        commitment = re.search(r"\b(?:I|we) (?:will|set|am setting|are setting|have set)\b", sent, re.I)
+        if not commitment and (REQUEST_RE.search(sent) or PAST_RE.search(sent) or DENY_RE.search(sent)
+                or (re.search(r"\bneeds?\b", sent, re.I) and REQUEST_RE.search(text))):
+            continue
+        amounts = totals(sent) if re.search(r"\b(?:cap|budget|limit|up to|spend)\b", sent, re.I) else []
+        count_text = MONEY_RE.sub("money", re.sub(r"\bUSD\s*", "$", sent, flags=re.I))
+        count_text = re.sub(r"\bnot\s+multi[- ]gpu\b", "single GPU", count_text, flags=re.I)
+        multi = bool(AUTH_MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", count_text)))
+        # The task's approved policy accepts either matching dollars or explicit
+        # multi-GPU permission. Never let a smaller dollar figure grant a larger cap.
+        dollar_ok = bool(approved and amounts) and max(approved) >= max(amounts)
+        if multi_approved or dollar_ok:
+            continue
+        if (amounts and max(amounts) > envelope_usd()) or multi:
+            return {"sentence": sent[:300], "usd": max(amounts) if amounts else None,
+                    "cap": envelope_usd(), "rule": "compute_authority"}
+    return None
+
+
+def authority_note(hit: dict) -> str:
+    return ('[coach] Compute authority: the agent-set GPU cap has no matching user approval. '
+            'AGENTS.md: "Once I\'ve said go on a job that needs a GPU, you may rent ONE single-GPU '
+            'machine up to $25 total without asking"; "Ask only above $25 total or for multi-GPU / multi-node." '
+            'Calibrate inside that envelope first, then ask for an explicit number with a blocked card. '
+            'Do not treat your own reply or a dispatched card body as spend authority.')
+
+
 def block_text(tool_name: str, args: Any) -> str:
     """The human-facing text of a kanban_block call (direct, or through the deferred `tool_call`), else ''."""
     a = args if isinstance(args, dict) else {}
+    if tool_name == "kanban_create":
+        return str(a.get("body") or "")
     if tool_name == "kanban_block":
         hr = a.get("human_request")
         return " \n".join(s for s in (str(a.get("reason") or ""),

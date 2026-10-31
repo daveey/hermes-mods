@@ -55,8 +55,21 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     coach = rules.AgentCoach(checkout if checkout is not None else rules.default_live_checkout(), signals=store)
     goal_gate = _load("goal_disposition").build_gate(store)
 
+    authority_users: dict = {}
+
     def pre_llm_call(session_id="", user_message=None, platform="", parent_session_id="", conversation_history=None,
                      **_):
+        # Capture before other optional coaching work. Never use tool/assistant claims,
+        # worker briefs, or an unverified remote-origin link as user authority.
+        try:
+            rows = _load("goal_scope").recover_scope(
+                session_id, user_message, conversation_history,
+                canonical_user_content=_.get("canonical_user_content"))
+            authority_users[session_id] = [r.get("content") for r in rows
+                                          if isinstance(r.get("content"), str)]
+        except Exception as exc:
+            authority_users[session_id] = []
+            log.debug("coach compute authority scope unavailable: %s", exc)
         try:
             if not session_id:
                 return None
@@ -122,20 +135,21 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             ce = _load("compute_envelope")
             if not ce.enabled():
                 return None
-            hit = ce.classify(text)
+            hit = ce.authority(text, authority_users.get(session_id, ())) or ce.classify(text)
             if not hit:
                 return None
-            key = (session_id or "", where)
+            rule = hit.get("rule", "compute_envelope")
+            key = (session_id or "", where, rule)
             if key in envelope_told or not may_hold:
                 if key in envelope_told:
-                    store.log({"event": "agent_fault", "rule": "compute_envelope", "session_id": session_id,
+                    store.log({"event": "agent_fault", "rule": rule, "session_id": session_id,
                                "where": where, "evidence": hit["sentence"][:200]})
                 return None
             envelope_told.add(key)
-            store.log({"event": "agent_hint" if where == "block" else "reply_nudge", "rule": "compute_envelope",
+            store.log({"event": "agent_hint" if where == "block" else "reply_nudge", "rule": rule,
                        "session_id": session_id, "where": where, "p": 1.0, "usd": hit.get("usd"),
                        "evidence": hit["sentence"][:200]})
-            return ce.note(hit, where)
+            return ce.authority_note(hit) if rule == "compute_authority" else ce.note(hit, where)
         except Exception as exc:
             log.debug("coach compute_envelope: %s", exc)
             return None
@@ -152,7 +166,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     envelope_gate.assess_before_holds = True
 
     def pre_tool_call(tool_name="", args=None, session_id="", **_):
-        if tool_name in ("kanban_block", "tool_call"):
+        if tool_name in ("kanban_block", "kanban_create", "tool_call"):
             try:
                 text = _load("compute_envelope").block_text(tool_name, args)
             except Exception as exc:

@@ -73,6 +73,21 @@ per session and surface holds the block / the turn once with a note to rent with
 Origin: defect agent-962f3f10ff, where three blocks and an "approve $20 / use metta1 directly" menu left a ~$5-10
 experiment blocked for 5 days; `tests/test_compute_envelope.py` replays both verbatim. Env:
 `COACH_COMPUTE_ENVELOPE=0` turns it off, `COACH_COMPUTE_ENVELOPE_USD` changes the cap (default 25).
+**Compute authority (`compute_envelope.py`; same hook, rule `compute_authority`).**
+The other side of the envelope holds agent-declared GPU/rental caps above $25 or multi-GPU plans once,
+including `kanban_create.body`, direct/deferred `kanban_block`, the reply's `pre_final_gate` and its
+`pre_verify` backstop. User-only conversation scope is recovered with `goal_scope.recover_scope` (native
+capture and verified compression ancestry); assistant/tool claims, dispatched briefs and unknown/remote
+origin evidence do not grant an exemption. Matching user dollars or explicit multi-GPU permission exempt
+the declaration. Questions, denials and injected task/skill wrappers are not approval; teardown caveats
+in a separate clause do not erase it. Genuine approval requests and historical spend reports pass.
+The nudge quotes the standing single-GPU/$25 rule and directs calibration inside it, then a blocked card
+asking for a number. A repeat logs `agent_fault` and passes: this is deterministic coaching, not a hard
+purchase or budget authorization boundary. Ambiguous language can still require agent judgment.
+Tests: `tests/test_compute_authority.py` covers all three surfaces, deferred creation, the reply backstop,
+$215 approval, $20 caps, past spend, provenance, numeric/word GPU counts, and one-shot behavior;
+`tests/test_compute_envelope.py` preserves the original under-use behavior.
+
 **Block-time handoff (`pre_tool_call` on `kanban_block` / `kanban_create` / `tool_call`).** A Kanban ask to the user
 ends the worker's run before the reply check below ever runs. So a `kanban_block` with kind `needs_input`/`capability`
 or a `human_request`, or a `kanban_create` with a `human_request` (direct or through `tool_call`), is judged with the
