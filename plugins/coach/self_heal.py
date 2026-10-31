@@ -1741,7 +1741,68 @@ def _git_lines(repo: Path, *args: str) -> list:
     return p.stdout.splitlines() if p.returncode == 0 else []
 
 
-def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo: Optional[Path] = None) -> Optional[dict]:
+def _traceback_commit_fix(d: dict, since: float, repo: Path, now: float) -> Optional[dict]:
+    """Without a digest, require an edit to the last frame's literal raise or its direct if guard.
+
+    A same-file edit elsewhere (even in the same diff hunk) is not evidence. Use parent-source AST spans and
+    zero-context removed lines, not message context in `git show` (which also includes unrelated nearby edits).
+    """
+    import ast
+    frames = re.findall(r'File "([^"]+)"', str(d.get("details") or ""))
+    sig = error_signature(d)
+    msg = (sig or {}).get("exc_msg")
+    if not frames or not msg or len(msg) < SIGNATURE_MIN_MSG:
+        return None
+    frame_func = re.findall(r'File "[^"]+", line \d+, in ([^\n]+)', str(d.get("details") or ""))
+    func = frame_func[-1].strip() if frame_func else None
+    lower = (d.get("detected_at") or _detected_at(d) or since) - 86400
+    for ln in reversed(_git_lines(repo, "log", "origin/main", f"--since={int(lower)}",
+                                  f"--until={int(now)}", "--format=%H\t%ct\t%s")):
+        sha, _, rest = ln.partition("\t")
+        ts, _, subject = rest.partition("\t")
+        if not ts.isdigit() or not lower <= int(ts) <= now or not subject.lower().startswith("fix"):
+            continue
+        files = _git_lines(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha)
+        for fname in files:
+            # Match the full repository-relative suffix, never only a shared basename.
+            if not (frames[-1] == fname or frames[-1].endswith("/" + fname)):
+                continue
+            source = "\n".join(_git_lines(repo, "show", f"{sha}^:{fname}"))
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            spans = set()
+            parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+            for parent in ast.walk(tree):
+                for node in ast.iter_child_nodes(parent):
+                    if not isinstance(node, ast.Raise) or not node.exc:
+                        continue
+                    scope = parents.get(node)
+                    while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        scope = parents.get(scope)
+                    if func and (scope.name if scope else "<module>") != func:
+                        continue
+                    if not any(isinstance(n, ast.Constant) and n.value == msg for n in ast.walk(node.exc)):
+                        continue
+                    spans.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+                    if isinstance(parent, ast.If) and node in parent.body:
+                        spans.update(range(parent.test.lineno, (parent.test.end_lineno or parent.test.lineno) + 1))
+            if not spans:
+                continue
+            diff = _git_lines(repo, "diff", "--no-ext-diff", "--no-textconv", "--unified=0", sha + "^", sha,
+                              "--", fname)
+            for line in diff:
+                hunk = re.match(r"@@ -(\d+)(?:,(\d+))? \+", line)
+                if hunk:
+                    start, count = int(hunk[1]), int(hunk[2] or 1)
+                    if spans.intersection(range(start, start + count)):
+                        return {"sha": sha, "at": int(ts), "subject": subject, "via": "commit_no_session"}
+    return None
+
+
+def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo: Optional[Path] = None,
+                       now: Optional[float] = None) -> Optional[dict]:
     """A fix the origin session shipped as a bare commit (no kanban card): a commit on the fork's origin/main made
     after `since` that (a) the session's digest names by sha, or (b) landed inside the session's active window
     (since .. last_activity_at + slack) as a `fix` whose subject names the defect's component, e.g.
@@ -1749,16 +1810,18 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
     named in it. Window+component is what catches a digest whose truncated last_reply
     never names the sha. -> {sha, at, subject} or None."""
     sid, host, comp = d.get("session_id"), d.get("host"), (d.get("component") or "").lower()
-    if not sid:
-        return None
     root = Path(data) if data else Path(os.environ.get("COACH_DATA") or Path.home() / "code" / "hermes-coach-data")
-    paths = sorted(root.glob(f"{host}/*/{sid}.json")) if host else sorted(root.glob(f"*/*/{sid}.json"))
+    paths = (sorted(root.glob(f"{host}/*/{sid}.json")) if host else sorted(root.glob(f"*/*/{sid}.json"))) if sid else []
     repo = Path(repo) if repo else _fork_repo()
+    has_digest = False
     for path in paths:
         try:
             dg = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
+        if not isinstance(dg, dict):
+            continue
+        has_digest = True
         until = (dg.get("last_activity_at") or since) + SESSION_COMMIT_SLACK_S
         commits = []  # (sha, committer ts, subject) on origin/main since the complaint
         for ln in _git_lines(repo, "log", "origin/main", f"--since={int(since)}", "--format=%H\t%ct\t%s"):
@@ -1782,6 +1845,8 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
                                                 _git_lines(repo, "show", "--name-only", "--format=", sha)}:
                     continue
                 return {"sha": sha, "at": ts, "subject": subj, "via": "window"}
+    if not has_digest:
+        return _traceback_commit_fix(d, since, repo, time.time() if now is None else now)
     return None
 
 
@@ -1789,28 +1854,30 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     """If the defect's origin session created/subscribed an active card after the complaint, record the newest as the
     lane's fix_card (approved) and log `selfheal_adopted_owner`. -> result dict, or None to go on and file."""
     sid = d.get("session_id")
-    if not sid or (owner_fn is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1"):
+    if owner_fn is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1":
         return None
     since = d.get("complaint_at") or ((d.get("at") or now) - ADOPT_LOOKBACK_S)
     try:
-        cards = (owner_fn or session_owned_cards)(sid, since)
-        if not cards and owner_fn is None:  # not on this hub's boards: the origin host's cards, named in its digest
+        cards = (owner_fn or session_owned_cards)(sid, since) if sid else []
+        if not cards and owner_fn is None and sid:  # not on this hub's boards: the origin host's cards, named in its digest
             cards = digest_owner_cards(d, d.get("complaint_at") or d.get("at") or since)
     except Exception as exc:
         store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
         return None
     if not cards and owner_fn is None:  # no card: the session may have fixed it with a bare commit
         try:
-            fix = session_commit_fix(d, d.get("complaint_at") or d.get("at") or since)
+            fix = session_commit_fix(d, d.get("complaint_at") or d.get("at") or since, now=now)
         except Exception as exc:
             store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
             fix = None
         if fix:
-            record_event("fixed", fp, note=f"fixed by origin session in commit {fix['sha'][:12]}: {fix['subject']}"[:300],
+            origin = "matching traceback" if fix["via"] == "commit_no_session" else f"origin session {sid}"
+            record_event("fixed", fp, note=f"fixed by {origin} in commit {fix['sha'][:12]}: {fix['subject']}"[:300],
                          store=store, now=now)
-            store.log({"event": "selfheal_adopted_owner", "via": "session_commit", "fingerprint": fp,
-                       "commit": fix["sha"], "match": fix["via"], "session_id": sid})
-            return {"action": "skip", "why": f"origin session {sid} already fixed it in commit {fix['sha'][:12]}",
+            store.log({"event": "selfheal_adopted_owner",
+                       "via": "commit_no_session" if fix["via"] == "commit_no_session" else "session_commit",
+                       "fingerprint": fp, "commit": fix["sha"], "match": fix["via"], "session_id": sid})
+            return {"action": "skip", "why": f"{origin} already fixed it in commit {fix['sha'][:12]}",
                     "commit": fix["sha"], "adopted": True}
     if not cards:
         return None

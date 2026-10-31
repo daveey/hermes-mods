@@ -589,6 +589,16 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   session intentionally count as the same complaint. Tests: `tests/test_self_heal_complaint_turn.py` exercises the
   backstop/hook pair (red before the guard), distinct turns, legacy state, timestamp boundaries, quote normalization,
   cross-session isolation and closed-owner policies. Shadow mode remains non-mutating (no simulated lane state).
+- **Already-landed fixes without a digest:** if a defect has no session ID or no readable session digest, a
+  `fix…` commit on the core fork's `origin/main` can close it without an investigation. The search covers detection
+  minus 24 hours through filing time. The diff must edit the last traceback frame's repository-relative file and
+  literal-message raise statement, or that raise's directly enclosing `if` condition. The function must match when
+  named by the frame; unrelated same-file edits and duplicate messages in other functions do not count. The lane
+  records `fixed` and logs `selfheal_adopted_owner via=commit_no_session`. Readable-digest session matching keeps its
+  existing named-SHA/window/component policy. Tests: `tests/test_no_session_commit.py` uses actual temporary git
+  histories for message/guard edits, absent/broken digests, wrong file/function/message, time bounds and session
+  policy isolation. This intentionally does not infer fixes from arbitrary nearby code, dynamic messages or outer
+  guards.
 - **SQLite incidents:** `database disk image is malformed`, `KanbanDbCorruptError`, and `file is not a database`
   share a fingerprint by source host, normalized DB path and UTC event-hour. Explicit `db_path` wins, then a path
   in evidence; pathless Kanban tracebacks default to `~/.hermes/kanban.db`. Other pathless SQLite errors are not
