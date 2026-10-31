@@ -33,6 +33,24 @@ class Kpi(unittest.TestCase):
         self.assertEqual(ro.trigger(turn(1), lab("na", wanted=False)), "human-question")
         self.assertEqual(ro.trigger(turn(1, user="fix it"), lab("na", wanted=True)), "human-action")
 
+    def test_automated_prompts_are_events_not_human_turns(self):
+        # Seen as "human" in the Oct 30 re-measure (56 of 270 human-trigger turns): blocked/failed Kanban notices,
+        # owner-wake and coach nudges, and the session-audit close-out prompt. None of them is typed by the user.
+        for user in ("⏸ [default] @default Kanban t_1 blocked: load acceptance not met",
+                     "⏸ [hub:default] @default Kanban t_2 blocked: Partial: PR-B merged",
+                     "✖ [default] @default Kanban t_3 failed — spawn error",
+                     "✓ [default] @default Kanban t_4 done — shipped",
+                     "[owner-wake] Card(s) this chat owns parked for a reason only an agent can clear",
+                     "[coach] Your message ends on a problem you could fix without fixing it",
+                     "Close-out check from Sam's session audit (2026-10-29). This chat isn't cleanly in a state"):
+            with self.subTest(user=user):
+                self.assertEqual(ro.trigger(turn(1, user=user), lab("report_only", wanted=True)), "event")
+        # Anchored: a typed question that mentions a notice or the coach is still a human turn.
+        for user in ("why did the ⏸ [default] notice say blocked?", "what did [coach] mean by that?",
+                     "can you run the close-out check from the session audit?"):
+            with self.subTest(user=user):
+                self.assertEqual(ro.trigger(turn(1, user=user), lab("report_only")), "human-question")
+
     def test_rates_split_by_family_and_trigger(self):
         turns = [turn(i, "gpt-6-astra") for i in range(10)] + [turn(10 + i) for i in range(10)] + \
                 [turn(20, "gpt-6-astra", user="[chat-closeout] x"), turn(21, "gpt-6-astra", user="[chat-closeout] y")]

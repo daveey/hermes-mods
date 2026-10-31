@@ -72,8 +72,12 @@ an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix
 status check or FYI).
 """
 
-EVENT_RX = re.compile(r"^\s*(\[chat-closeout\]|✔ \[|✖ \[|⚠|\[ASYNC DELEGATION|\[Continuing toward|\[Session babysitter\]|"
-                      r"\[False-stop|\[Goal|\[Kanban|\[Desktop|\[Inbox)", re.S)
+# Automated prompts that arrive as user rows. Kanban notices start with a status glyph (✔ done, ✖ failed, ⏸ blocked);
+# owner-wake and coach nudges and the session-audit close-out prompt are injected by plugins/jobs, not typed. Missing
+# any of these filed 56 of 270 "human" turns in the Oct 30 re-measure under the human-question/-action split.
+EVENT_RX = re.compile(r"^\s*(\[chat-closeout\]|[✔✓✖✗⏸]\s*\[|⚠|\[ASYNC DELEGATION|\[Continuing toward|"
+                      r"\[Session babysitter\]|\[False-stop|\[Goal|\[Kanban|\[Desktop|\[Inbox|\[owner-wake\]|\[coach\]|"
+                      r"Close-out check from \S+ session audit)", re.S)
 SYNTHETIC_RX = re.compile(r"^\s*(\[(IMPORTANT|System|SYSTEM|Background|background|OUT-OF-BAND|Delegat|Subagent|Process|Cron|"
                           r"Goal|Context|Note|Kanban|Cross-session|CROSS)|<(system|task-notification|memory-context)|"
                           r"Background process|\[Message from|\[Delegation)", re.S)
