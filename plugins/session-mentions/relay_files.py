@@ -430,6 +430,47 @@ def _default_add_sub(**kw: Any) -> None:
         kbn.add_notify_sub(conn, **kw)
 
 
+def _subscription_owner(profile: str, gw: str, sid: str, me: str) -> tuple[str, str] | None:
+    """``(profile, gateway)`` a refused chat's subscription must route to, or None when unknown.
+
+    An explicit other-gateway ref keeps its route. A chat in this gateway's ``profile`` state.db is local.
+    A bare ref absent here resolves through the hermes-hub replica only when exactly one OTHER gateway holds
+    ``profile/sid`` (not moved). Missing, unreadable, ambiguous or self-only replica rows return None, so no
+    local ``tui`` row is ever written for a chat this gateway does not have. [daveey]
+    """
+    if gw and gw != me:
+        return profile, gw
+    home = _hermes_home()
+    root = home.parent.parent if home.parent.name == "profiles" else home
+    local = root if profile == "default" else root / "profiles" / profile
+    if _query_source(local / "state.db", "SELECT id FROM sessions WHERE id = ?", (sid,)):
+        return (profile, me) if me else None
+    if gw:  # explicitly this gateway, but no such chat here
+        return None
+    path = replica_db()
+    if not path.is_file():
+        return None
+    try:
+        conn = _ro_connect(path)
+        try:
+            rows = conn.execute(
+                "SELECT gw, key, data FROM replica WHERE coll = 'sessions' AND key GLOB ?", (f"*/{sid}",)
+            ).fetchall()
+        finally:
+            conn.close()
+        owners = set()
+        for row_gw, key, raw in rows:
+            data = json.loads(raw)
+            if (data.get("profile") or str(key).split("/", 1)[0]) == profile and not data.get("moved_to"):
+                owners.add(norm_name(row_gw))
+    except Exception:
+        return None
+    if len(owners) != 1:
+        return None
+    owner = next(iter(owners))
+    return (profile, owner) if owner and owner != me else None
+
+
 def subscribe_refused_chat(target: Any, task: str, *, add_sub=None, this_gateway: str | None = None) -> str | None:
     """Subscribe the chat a worker was refused into to the worker's OWN card, notify mode. Idempotent
     (add_notify_sub keys on task+platform+chat). Same-gateway chat -> ``tui:<sid>``; chat on another gateway
@@ -440,6 +481,12 @@ def subscribe_refused_chat(target: Any, task: str, *, add_sub=None, this_gateway
         return None
     profile, gw, sid = parsed
     me = norm_name(this_gateway if this_gateway is not None else _this_gateway())
+    # Source discovery (session_source) also finds a bare id on ANOTHER gateway; never turn that into a
+    # source-local tui row nothing here can drain. Unknown/ambiguous ownership subscribes nothing.
+    resolved = _subscription_owner(profile, gw, sid, me)
+    if resolved is None:
+        return None
+    profile, gw = resolved
     add = add_sub or _default_add_sub
     try:
         if gw and gw != me:

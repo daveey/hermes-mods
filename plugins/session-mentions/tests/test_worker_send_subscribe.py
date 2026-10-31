@@ -43,6 +43,12 @@ def isolated_board(monkeypatch):
     # the isolated Kanban home instead. TemporaryDirectory cleans up on failure.
     with TemporaryDirectory(prefix="session-mentions-test-", dir=Path.home()) as directory:
         board_home = Path(directory)
+        monkeypatch.setenv("HERMES_HOME", str(board_home))
+        monkeypatch.setattr(rf, "_hermes_home", lambda: board_home)
+        import sqlite3
+        with sqlite3.connect(board_home / "state.db") as conn:
+            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT)")
+            conn.executemany("INSERT INTO sessions VALUES (?, 'desktop')", [("20261027_133954_1b6eae",), ("abc123",)])
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
         monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
@@ -186,3 +192,68 @@ def test_default_add_sub_refuses_a_task_this_board_does_not_own(monkeypatch, iso
     assert [r[0] for r in rows] == [mine]
     monkeypatch.setattr(rf, "_this_gateway", lambda: "hub")
     assert rf.subscribe_refused_chat(LOCAL, "t_foreign") is None
+
+
+def replica(monkeypatch, tmp_path, owners):
+    import sqlite3
+    path = tmp_path / "hub.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, data TEXT)")
+        for gw, profile, sid in owners:
+            conn.execute("INSERT INTO replica VALUES (?, 'sessions', ?, ?)",
+                         (gw, f"{profile}/{sid}", json.dumps({"source": "desktop", "profile": profile})))
+    monkeypatch.setattr(rf, "replica_db", lambda: path)
+    return path
+
+
+def test_bare_remote_discovery_does_not_create_local_unseen(subs, tmp_path, monkeypatch):
+    replica(monkeypatch, tmp_path, [("remote", "default", "s_remote")])
+    for _ in range(2):
+        assert "subscribed" in rf.worker_send_refusal("@session:default/s_remote")
+    assert list(subs.rows) == [("t_worker", "hub", "remote/default/s_remote")]
+
+
+@pytest.mark.parametrize("owners", [[], [("remote", "other", "s_unknown")],
+    [("one", "default", "s_unknown"), ("two", "default", "s_unknown")]])
+def test_unknown_or_ambiguous_owner_does_not_subscribe(subs, tmp_path, monkeypatch, owners):
+    replica(monkeypatch, tmp_path, owners)
+    assert rf.subscribe_refused_chat("@session:default/s_unknown", "t_worker") is None
+    assert subs.rows == {}
+
+
+def test_unreadable_replica_does_not_subscribe(subs, tmp_path, monkeypatch):
+    path = tmp_path / "broken.db"
+    path.write_text("not sqlite")
+    monkeypatch.setattr(rf, "replica_db", lambda: path)
+    assert rf.subscribe_refused_chat("@session:default/s_unknown", "t_worker") is None
+    assert subs.rows == {}
+
+
+def test_real_discovery_to_completion_leaves_no_undrainable_local_unseen(monkeypatch, isolated_board, tmp_path):
+    """Composition the old tests mocked away: REAL session_source discovery of a bare ref in the hub replica,
+    the refusal's subscription on a real board, then completion. The remote chat must get the hub route only,
+    so this gateway's unseen map (what the chat-closeout watchdog reads) never counts it; a genuinely local
+    chat refused the same way still counts as unseen until it is handed the result."""
+    kb = pytest.importorskip("hermes_cli.kanban_db")
+    kbc = pytest.importorskip("hermes_cli.kanban_db_connect")
+    kbn = pytest.importorskip("hermes_cli.kanban_db_notify")
+    ksa = pytest.importorskip("hermes_cli.kanban_session_activity")
+
+    path = replica(monkeypatch, tmp_path, [("macbook", "default", "s_remote")])
+    import sqlite3
+    with sqlite3.connect(path) as conn:  # session_source reads $.source from the replica row
+        conn.execute("UPDATE replica SET data=json_set(data, '$.source', 'desktop')")
+    monkeypatch.setattr(rf, "_this_gateway", lambda: "hub")
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="default")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    assert rf.session_source("@session:default/s_remote") == "desktop"  # real discovery, not a mock
+    assert "subscribed" in rf.worker_send_refusal("@session:default/s_remote")
+    assert "subscribed" in rf.worker_send_refusal(LOCAL)
+    with kbc.connect_closing() as conn:
+        kb.complete_task(conn, tid, summary="done")
+        rows = sorted((r["platform"], r["chat_id"]) for r in kbn.list_notify_subs(conn, tid))
+        unseen = ksa._unseen_on(conn)
+    assert rows == [("hub", "macbook/default/s_remote"), ("tui", "20261027_133954_1b6eae")]
+    assert unseen == {"20261027_133954_1b6eae": 1}
