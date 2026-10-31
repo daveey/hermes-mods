@@ -837,6 +837,27 @@ def _ro_connect(path, timeout=10):
         return c
 
 
+# agent-ee1b1162bc: a subagent's final reply is a report to its parent agent, which reads and acts on it. Holding it
+# as report_only/status_only pushes the child outside its brief and files defects for a handoff the brief asked for.
+SUBAGENT_EXEMPT_RULES = ("report_only", "status_only")
+
+
+def is_subagent(session_id: str) -> bool:
+    """True when state.db records this session as a delegate_task child (sessions.source = 'subagent'). Uses source,
+    not parent_session_id: compression sets that column too. Any failure (no db, no row) is False (fail-open)."""
+    if not session_id:
+        return False
+    try:
+        db = _ro_connect(_hermes_home() / 'state.db', timeout=1)
+        try:
+            row = db.execute("select source from sessions where id=?", (session_id,)).fetchone()
+        finally:
+            db.close()
+        return bool(row) and str(row[0] or "").lower() == "subagent"
+    except Exception:
+        return False
+
+
 def _lineage(session_id: str, depth: int = 12) -> list[str]:
     """session_id plus its compression ancestors (compression rotates ids; a watcher started before a
     rotation is keyed by the old id)."""

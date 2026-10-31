@@ -1070,6 +1070,33 @@ def _unsent_draft_signal(r: dict, why: str) -> dict:
 INTERRUPT_RE = re.compile(r"^\s*(?:Operation interrupted\b|An automated delivery was interrupted\b)")
 
 
+def subagent_session(home: Path, n: dict) -> bool:
+    """True when the nudged session is a delegate_task child: the nudge record says platform 'subagent', or some
+    profile's state.db has sessions.source = 'subagent' for it. Its reply is a report to the parent agent, which owns
+    the follow-up and is judged itself, so it is not a user-facing defect (self_heal.user_facing; agent-ee1b1162bc).
+    Unreadable db / no row = False (file as before)."""
+    if str(n.get("platform") or "").lower() == "subagent":
+        return True
+    sid = n.get("session_id") or ""
+    if not sid:
+        return False
+    for _prof, h in homes(home):
+        db = h / "state.db"
+        if not db.is_file():
+            continue
+        try:
+            c = _ro(db)
+            try:
+                row = c.execute("select source from sessions where id=?", (sid,)).fetchone()
+            finally:
+                c.close()
+        except sqlite3.Error:
+            continue
+        if row:
+            return str(row[0] or "").lower() == "subagent"
+    return False
+
+
 def _turn_lost(home: Path, n: dict) -> bool:
     """True when the nudged session's visible transcript after the nudge ends in an interruption marker with no later
     final assistant reply (the turn was killed, so no reply_nudge_outcome can be logged). Any doubt (session not
@@ -1240,13 +1267,17 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                                    f"{r.get('n') or 2}nd confirmed failure: {issue}"[:1500],
                         "fp": fp("agent", "fixloop", r.get("session_id") or "", issue[:80])})
         elif r.get("event") == "reply_nudge" and rule in OUTCOME_RULES and (rule == "handoff" or r.get("outcome")):
-            pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id")}, "ts": at})
+            pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id", "platform")},
+                            "ts": at})
         elif r.get("event") == "reply_nudge_outcome" and rule in OUTCOME_RULES:
             n = next((n for n in pending if _outcome_matches(n, r)), None)
             if n is None:
                 continue
             pending.remove(n)
-            if r.get("resolved") is not True:  # only an explicit "resolved" clears it
+            if r.get("resolved") is not True and subagent_session(home, n):
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "session_id": n.get("session_id") or "",
+                                  "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id")})
+            elif r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"
                 why = f"the revised reply {still} (outcome p={r.get('p')})"
                 rec = {**n, "reply": r.get("reply") or ""}
@@ -1257,6 +1288,12 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
     keep = []
     for n in pending:
         if now - float(n.get("ts") or 0) > HANDOFF_GRACE_S:
+            if subagent_session(home, n):
+                # agent-ee1b1162bc: a subagent's report to its parent agent is not a user-facing defect (any rule)
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "reason": "no_outcome",
+                                  "session_id": n.get("session_id") or "", "rule": n.get("rule"),
+                                  "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id")})
+                continue
             if _turn_lost(home, n):
                 # agent-fb58ec3a8f: the turn died after the nudge (gateway restart), so no final reply ran and no
                 # outcome can come. Gateway/drain signals own that restart; it is not an agent that ignored a nudge.

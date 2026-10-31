@@ -489,6 +489,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                      if so.setting("diff_review") and "unverified" in rc.prefilter(final_response)
                      and coach.loop_state(session_id).get("diff_reviewed") != coach.turn_number(session_id) else {})
             only = list(cfg["rules"]) + (["unverified"] if repos and "unverified" not in cfg["rules"] else [])
+            # agent-ee1b1162bc: a subagent reports to its parent agent, whose own final reply is judged; report_only
+            # (incl. unverified_owner) and status_only don't hold the child. Its other rules still run.
+            sub = platform == "subagent" or rc.is_subagent(session_id)
+            if sub:
+                only = [r for r in only if r not in rc.SUBAGENT_EXEMPT_RULES]
             if not only:
                 return None
             th_unv = so.setting("diff_review_threshold")
@@ -557,6 +562,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 if "unverified" not in cfg["rules"]:  # added only for the review: fall back to the next real rule
                     v = hit["verdict"]
                     rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response)
+                            and not (sub and r in rc.SUBAGENT_EXEMPT_RULES)
                             and v.get(r, 0) >= rc.rule_threshold(r, v, cfg.get("thresholds") or {}, cfg["threshold"])
                             and r != "unwatched" and not (r == "report_only" and rc.report_only_guard(ask, final_response, log_lines))]
                     hit = None
@@ -569,13 +575,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 guard = rc.report_only_guard(ask, final_response, log_lines)
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response), "ask_len": len(ask or ""),
-                           **({"guard": guard} if guard else {})})
+                           **({"guard": guard} if guard else {}), **({"subagent": True} if sub else {})})
                 return None
             tracked = hit["rule"] in rc.RULES
             out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
                           "p": hit["p"], "evidence": hit["evidence"], "ask_len": len(ask or ""),
                           # signals.template_holds groups on it: one rule holding the same fixed text in many chats
-                          "ask_head": " ".join((ask or "").split())[:40],
+                          "ask_head": " ".join((ask or "").split())[:40], "platform": platform,
                           **({"reason": hit["reason"]} if hit.get("reason") else {}),
                           **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref(),
                           **({"outcome": True} if tracked else {})}
