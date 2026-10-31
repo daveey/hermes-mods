@@ -1,15 +1,17 @@
 """Mac-side routes for run_in_user_terminal jobs relayed from a gateway with no screen.
 
 POST /api/plugins/user-terminal/start   {command, reason, cwd, origin: {gateway, profile, session_id, title}}
-                                        -> {ok, job_id, status: "waiting_for_user", terminal} | {ok: false, error}
-                                           | {ok: false, status: "failed", job_id, error[, diagnosis]} (no window opened)
+                                        -> {ok, job_id, status: "waiting_for_user"|"running"|"ran"|"declined", terminal[, opener_warning]}
+                                           | {ok: false, error}
+                                           | {ok: false, status: "failed", job_id, error[, diagnosis]} (no window started it; nothing ran)
 GET  /api/plugins/user-terminal/status/{job_id}?gateway=<origin gateway>&wait_s=<=25
-                                        -> the local tool's result shape (status ran|declined|pending|running, ...)
+                                        -> the local tool's result shape (status ran|declined|pending|running|failed, ...)
 
 Called by the session-mentions Desktop courier on THIS Mac's own backend, after it claimed a
 ``user_terminal`` request from another gateway's outbox. ``origin.gateway`` is the courier's name for the
 connection it drained (not something the remote agent chose), and a job is only readable with that same
-gateway name. Nothing runs until the owner types y in the window (runner.sh).
+gateway name. With user_terminal.confirm remote|all nothing runs until the owner types y in the window
+(runner.sh); with the default (off) it runs as soon as the window opens.
 
 Routes are mounted once per backend, so they stay thin: the plugin module is re-executed whenever
 ``__init__.py`` changes on disk.

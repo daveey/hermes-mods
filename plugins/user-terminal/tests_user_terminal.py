@@ -709,3 +709,220 @@ def test_responsible_pid_lookup_is_real_or_none():
     assert r is None or (isinstance(r, int) and r > 0)
     if sys.platform == "darwin":
         assert r is not None and ut._proc_info(r) is not None
+
+
+# ---- single-start gate: an opener that errors after its window started must not cause a second run or a false
+# "failed / nothing ran"; fail_job and every runner contend for the same atomic gate (mkdir start.lock).
+
+def _spawn_runner(job: Path):
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["SHELL"] = "/bin/bash"
+        os.execv("/bin/bash", ["/bin/bash", str(job / "runner.sh"), str(job)])
+    return pid, fd
+
+
+def _read_until(fd: int, needle: bytes, timeout: float = 10, buf: bytes = b"") -> bytes:
+    deadline = time.time() + timeout
+    while needle not in buf and time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+    return buf
+
+
+def _finish(pid: int, fd: int, answers=(), timeout: float = 15) -> bytes:
+    """Answer each 'Press Enter' with the next answer and reap the runner."""
+    buf, pending, deadline = b"", list(answers), time.time() + timeout
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        if pending and b"Press Enter" in buf:
+            os.write(fd, pending.pop(0).encode())
+    try:  # never hang the suite on a runner still waiting at a prompt
+        os.kill(pid, 9)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+    return buf
+
+
+def _wait_status(job: Path, wanted: tuple, timeout: float = 10) -> dict:
+    deadline = time.time() + timeout
+    st = ut.read_status(job)
+    while st.get("status") not in wanted and time.time() < deadline:
+        time.sleep(0.05)
+        st = ut.read_status(job)
+    return st
+
+
+def _simulate_runner_started(job: Path, status: str) -> None:
+    """What a runner leaves behind once it took the start gate (no pty: works on every platform)."""
+    (job / "opened").write_text("12345\n")
+    (job / "start.lock").mkdir()
+    (job / "start.lock" / "owner").write_text("runner 12345\n")
+    st = {"status": status} if status == "running" else {"status": "ran", "exit_code": 0}
+    (job / "status.json").write_text(json.dumps(st))
+
+
+def _openers(monkeypatch, first):
+    """iterm = `first(job)`; terminal = counts calls and fails. Returns the terminal call list."""
+    calls = []
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["iterm", "terminal"])
+    monkeypatch.setattr(ut, "_open_iterm", lambda shell_cmd: first(Path(shell_cmd.split()[-1].strip("'"))))
+
+    def term(shell_cmd):
+        calls.append(shell_cmd)
+        raise RuntimeError("terminal refused")
+    monkeypatch.setattr(ut, "_open_terminal_app", term)
+    return calls
+
+
+def _timeout_after(status):
+    def opener(job):
+        _simulate_runner_started(job, status)
+        raise ut.OpenFailed("osascript timed out after 20s. TCC responsible process: unknown (x).",
+                            {"responsible_process": {"status": "unknown"}})
+    return opener
+
+
+@pytest.mark.parametrize("status", ["running", "ran"])
+def test_handle_opener_raises_after_runner_started_preserves_status_and_no_fallback(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    calls = _openers(monkeypatch, _timeout_after(status))
+    out = json.loads(ut.handle({"command": "true", "cwd": str(tmp_path), "wait_s": 1}))
+    job = _only_job(tmp_path / "jobs")
+    assert calls == []  # no second opener once a runner holds the gate
+    assert ut.read_status(job)["status"] == status  # not overwritten with failed
+    assert out["ok"] is True and out["status"] == status and out["terminal"] == "iTerm", out
+    assert "osascript timed out" in out["opener_warning"]
+    assert "nothing ran" not in json.dumps(out)
+    again = json.loads(ut.handle({"job_id": job.name, "wait_s": 1}))  # resume path
+    assert again["ok"] is True and again["status"] == status
+
+
+@pytest.mark.parametrize("status", ["running", "ran"])
+def test_start_relayed_opener_raises_after_runner_started_preserves_status(remote, monkeypatch, tmp_path, status):
+    _, mac = remote
+    calls = _openers(monkeypatch, _timeout_after(status))
+    res = ut.start_relayed("true", "why", str(tmp_path), ORIGIN)
+    job = _only_job(mac)
+    assert calls == [] and ut.read_status(job)["status"] == status
+    assert res["ok"] is True and res["job_id"] == job.name and res["status"] == status, res
+    st = ut.relayed_status(job.name, "nous-1", 1)  # the courier's resume path
+    assert st["ok"] is True and st["status"] == status and "osascript timed out" in st["opener_warning"]
+
+
+def test_opener_raises_then_window_appears_within_grace_stops_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setattr(ut, "OPEN_GRACE_S", 2.0, raising=False)
+
+    def late(job):  # osascript gave up, but the window shows up a moment later
+        threading.Timer(0.3, lambda: (job / "opened").write_text("1\n")).start()
+        raise ut.OpenFailed("osascript timed out after 20s.")
+    calls = _openers(monkeypatch, late)
+    out = json.loads(ut.handle({"command": "true", "cwd": str(tmp_path), "wait_s": 1}))
+    job = _only_job(tmp_path / "jobs")
+    assert calls == [] and out["ok"] is True and out["status"] == "pending", out
+    assert ut.read_status(job)["status"] == "waiting_for_user" and not (job / "start.lock").exists()
+
+
+def test_all_openers_fail_takes_the_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    _all_openers_fail(monkeypatch)
+    out = json.loads(ut.handle({"command": "true", "cwd": str(tmp_path), "wait_s": 1}))
+    job = _only_job(tmp_path / "jobs")
+    _assert_failed_status(job, "iterm refused", "terminal refused")
+    assert (job / "start.lock").is_dir() and "fail_job" in (job / "start.lock" / "owner").read_text()
+    assert out["ok"] is False and out["status"] == "failed" and "nothing ran" in out["note"]
+
+
+@pytest.mark.parametrize("status", ["running", "ran", "declined"])
+def test_fail_job_never_overwrites_a_started_or_decided_job(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("true", "", str(tmp_path))
+    if status == "declined":
+        (job / "start.lock").mkdir()
+        (job / "status.json").write_text(json.dumps({"status": "declined"}))
+    else:
+        _simulate_runner_started(job, status)
+    st = ut.fail_job(job, "late error")
+    assert st["status"] == status and ut.read_status(job)["status"] == status
+    assert "late error" not in json.dumps(ut.read_status(job))
+
+
+@needs_bsd_script
+def test_real_runner_started_then_opener_raises_runs_once(tmp_path, monkeypatch):
+    """Real runner.sh in a pty plays the window the opener created before osascript timed out (Finder centring)."""
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setattr(ut, "confirm_mode", lambda: "off")
+    marker = tmp_path / "RAN"
+    screens = []
+
+    def opener(job):
+        threading.Thread(target=lambda: screens.append(_drive(job, ["\n"])), daemon=True).start()
+        _wait_status(job, ("running", "ran"))
+        raise ut.OpenFailed("osascript timed out after 20s.")
+
+    def term(shell_cmd):  # a fallback would start a second runner on the same job
+        job = Path(shell_cmd.split("runner.sh' ")[-1].split(";")[0].strip("'"))
+        calls.append(1)
+        threading.Thread(target=lambda: screens.append(_drive(job, ["\n"])), daemon=True).start()
+        return "Terminal"
+
+    calls = []
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["iterm", "terminal"])
+    monkeypatch.setattr(ut, "_open_iterm", lambda c: opener(Path(c.split()[-1].strip("'"))))
+    monkeypatch.setattr(ut, "_open_terminal_app", term)
+    out = json.loads(ut.handle({"command": f"echo once >> {marker}", "cwd": str(tmp_path), "wait_s": 15}))
+    time.sleep(1)
+    assert calls == [] and out["status"] == "ran" and out["exit_code"] == 0, out
+    assert marker.read_text() == "once\n"
+
+
+@needs_bsd_script
+@pytest.mark.parametrize("answer", ["y\n", "n\n"])
+def test_confirm_waiting_then_fail_job_then_answer_never_runs(tmp_path, monkeypatch, answer):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    marker = tmp_path / "RAN"
+    job = ut.create_job(f"touch {marker}", "", str(tmp_path), confirm=True)
+    pid, fd = _spawn_runner(job)
+    screen = _read_until(fd, b"Run it?")
+    assert b"Run it?" in screen
+    st = ut.fail_job(job, "osascript timed out after 20s.")  # Hermes gives up while the prompt waits
+    assert st["status"] == "failed"
+    os.write(fd, answer.encode())
+    screen += _finish(pid, fd, timeout=8)
+    assert not marker.exists() and not (job / "output.log").exists()
+    assert ut.read_status(job)["status"] == "failed" and b"not running it" in screen
+
+
+@needs_bsd_script
+def test_duplicate_runners_run_the_command_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    marker = tmp_path / "RAN"
+    job = ut.create_job(f"echo once >> {marker}; sleep 1", "", str(tmp_path), confirm=False)
+    a, b = _spawn_runner(job), _spawn_runner(job)
+    sa, sb = _finish(*a, answers=["\n"]), _finish(*b, answers=["\n"])
+    assert marker.read_text() == "once\n"
+    assert ut.read_status(job) == {"status": "ran", "exit_code": 0}
+    assert len((job / "opened").read_text().split()) == 2  # both windows announced themselves
+    assert (b"not running it" in sa) != (b"not running it" in sb)
+
+
+def test_center_is_best_effort_inside_the_open_script():
+    for script in (ut._center("Terminal"), ut._center("iTerm")):
+        assert script.strip().startswith("try") and "with timeout of" in script and script.strip().endswith("end try")

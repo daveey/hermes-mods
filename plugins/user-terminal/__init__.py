@@ -16,9 +16,15 @@ Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
   confirm     present -> the runner asks y/N first (see confirm_mode)
   output.log  everything printed while the command ran (via script(1))
   status.json {"status": "waiting_for_user"|"running"|"ran"|"declined"|"failed", "exit_code": n}
-              "failed" = no terminal could be opened (with error, job_id and any osascript diagnosis); the
-              runner refuses to run a job already marked failed, so a window that opens late runs nothing.
-
+              "failed" = no window started the command (with error, job_id and any osascript diagnosis). It is
+              written only by fail_job() after it wins start.lock, so "nothing ran" is proven, never assumed.
+  opened      one line per runner that started (a window exists); the opener stops trying other apps once
+              it sees this, even if its osascript call then errored (e.g. timed out centring the window)
+  start.lock  the single-start gate (atomic mkdir; owner file says who). runner.sh takes it right before it
+              runs the command (after any y/N) or records a decline; fail_job() takes it before declaring
+              failed. Only the winner acts: a second window, or a window that opens after Hermes gave up,
+              runs nothing, and fail_job() never overwrites a running/ran/declined job.
+  open_warning.txt  the opener's error when its window started anyway (returned as opener_warning)
   origin.txt  who asked, for a request relayed from another gateway (shown by the runner)
 
 Terminal choice: iTerm > Terminal.app > cmux; env HERMES_USER_TERMINAL = iterm | terminal | cmux tries that one first.
@@ -100,12 +106,21 @@ SCHEMA = {
 
 RUNNER = r"""#!/bin/bash
 JOB="$1"
+printf '%s\n' "$$" >> "$JOB/opened"   # evidence for the opener: a window exists (stops its fallback)
 B=$'\e[1m'; D=$'\e[2m'; Y=$'\e[33m'; G=$'\e[32m'; R=$'\e[31m'; C=$'\e[36m'; N=$'\e[0m'
-status() { printf '%s' "$1" > "$JOB/status.json.tmp" && mv "$JOB/status.json.tmp" "$JOB/status.json"; }
-if grep -q '"status": *"failed"' "$JOB/status.json" 2>/dev/null; then
-  echo "Hermes already gave up on this window (it did not open in time) and told the agent; not running it."
+status() { printf '%s' "$1" > "$JOB/.status.$$.tmp" && mv "$JOB/.status.$$.tmp" "$JOB/status.json"; }
+refuse() {
+  if grep -q '"status": *"failed"' "$JOB/status.json" 2>/dev/null; then
+    echo "Hermes already gave up on this window (it did not open in time) and told the agent; not running it."
+  else
+    echo "Another window already took this job; not running it."
+  fi
   sleep 2; exit 0
-fi
+}
+# The single-start gate, shared with fail_job() in Python: whoever creates start.lock decides (run, decline or
+# failed). mkdir is atomic, so two windows, or a window and Hermes giving up, can never both win.
+gate() { mkdir "$JOB/start.lock" 2>/dev/null || refuse; echo "runner $$" > "$JOB/start.lock/owner"; }
+if grep -q '"status": *"failed"' "$JOB/status.json" 2>/dev/null; then refuse; fi
 if [ -s "$JOB/origin.txt" ]; then printf '\e]0;Hermes (%s) wants to run a command\a' "$(head -n1 "$JOB/origin_short.txt" 2>/dev/null)"; else printf '\e]0;Hermes wants to run a command\a'; fi
 clear
 W=$(tput cols 2>/dev/null || echo 100); W=$(( W > 120 ? 120 : W )); W=$(( W < 40 ? 40 : W ))
@@ -124,14 +139,14 @@ if [ -f "$JOB/confirm" ]; then
     read -r -p "${B}Run it? [y/N]${N} " ans
     case "$ans" in
       y|Y|yes|YES) break ;;
-      ""|n|N|no|NO) status '{"status":"declined"}'; echo "${R}Declined — told Hermes.${N}"; sleep 2; exit 0 ;;
+      ""|n|N|no|NO) gate; status '{"status":"declined"}'; echo "${R}Declined — told Hermes.${N}"; sleep 2; exit 0 ;;
     esac
   done
-else
-  echo "${D}Running now. Ctrl-C cancels.${N}"
 fi
-echo "${D}──────────────────────────────────────────${N}"
+gate   # immediately before running: after the y/N answer, so a job Hermes gave up on meanwhile never runs
 status '{"status":"running"}'
+[ -f "$JOB/confirm" ] || echo "${D}Running now. Ctrl-C cancels.${N}"
+echo "${D}──────────────────────────────────────────${N}"
 cd "$(cat "$JOB/cwd.txt")" || { status '{"status":"ran","exit_code":1,"error":"cwd not found"}'; read -r -p "cwd not found. Enter to close. "; exit 1; }
 SH="${SHELL:-/bin/zsh}"
 /usr/bin/script -q "$JOB/output.log" /bin/bash -c "\"$SH\" -l \"$JOB/cmd.sh\"; echo \$? > \"$JOB/rc\""
@@ -234,8 +249,12 @@ def _osa_quote(s: str) -> str:
 
 COLS, ROWS = 110, 34   # the confirm window: wide enough that the wrapped text is not re-wrapped, centred on screen
 
-# AppleScript: centre window `w` of the frontmost app on the main screen, keeping its size.
+# AppleScript: centre window `w` of the frontmost app on the main screen, keeping its size. Best effort: the window
+# and its runner already exist by now, so a Finder that is busy, denied or awaiting Automation consent must not turn
+# this into an "open failed" (that used to start a second window on the same job).
 _CENTER = """
+try
+with timeout of 5 seconds
 tell application "Finder" to set {sx, sy, sw, sh} to bounds of window of desktop
 tell application {app} to set {x1, y1, x2, y2} to bounds of w
 set ww to x2 - x1
@@ -243,6 +262,8 @@ set wh to y2 - y1
 set nx to (sw - ww) div 2
 set ny to (sh - wh) div 3
 tell application {app} to set bounds of w to {nx, ny, nx + ww, ny + wh}
+end timeout
+end try
 """
 
 
@@ -347,10 +368,33 @@ def _open_iterm(shell_cmd: str) -> str:
     return "iTerm"
 
 
+OPEN_GRACE_S = 2.0  # after an osascript error, how long to watch for the window's runner before trying the next app
+
+
+def window_started(job: Path) -> bool:
+    """Evidence a runner exists for this job: it announced itself, took the start gate, or wrote a status."""
+    return ((job / "opened").exists() or (job / "start.lock").exists()
+            or read_status(job).get("status") not in ("waiting_for_user", "unknown"))
+
+
+def _await_window(job: Path, secs: float) -> bool:
+    deadline = time.time() + secs
+    while True:
+        if window_started(job):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
 def open_window(job: Path) -> str:
+    """Open one window running this job. An opener that raises after its window started (osascript timed out
+    centring it, say) counts as opened: the next app is never tried, so the job never gets a second window.
+    osascript errors get a bounded OPEN_GRACE_S watch for a late window; other errors are checked once."""
     run_cmd = f"/bin/bash {shlex.quote(str(job / 'runner.sh'))} {shlex.quote(str(job))}"
     shell_cmd = _unset_prefix() + run_cmd + "; exit"  # typed into an interactive shell (Terminal.app, cmux)
     errors, diagnosis = [], None
+    names = {"cmux": "cmux", "iterm": "iTerm", "terminal": "Terminal"}
     for k in terminal_order():
         try:
             if k == "cmux":
@@ -359,9 +403,15 @@ def open_window(job: Path) -> str:
                 return _open_iterm(_env_unset_prefix() + run_cmd)  # iTerm execs it directly, no shell
             if k == "terminal":
                 return _open_terminal_app(shell_cmd)
-        except Exception as e:  # fall through to the next terminal
+        except Exception as e:  # fall through to the next terminal, unless this one's window started anyway
             errors.append(f"{k}: {e}")
             diagnosis = getattr(e, "diagnosis", None) or diagnosis
+            if _await_window(job, OPEN_GRACE_S if isinstance(e, OpenFailed) else 0):
+                try:
+                    (job / "open_warning.txt").write_text("; ".join(errors))
+                except OSError:
+                    pass
+                return names.get(k, k)
     raise OpenFailed("; ".join(errors) or "no terminal available", diagnosis)
 
 
@@ -472,8 +522,16 @@ FINAL = ("ran", "declined", "failed")
 
 
 def fail_job(job: Path, error: str, diagnosis: dict | None = None) -> dict:
-    """Persist ``failed`` (atomic rename) so later waits and resumes end at once instead of polling a job
-    no window will ever answer."""
+    """Declare the job ``failed`` only if Hermes wins the single-start gate (``mkdir start.lock``, the same gate
+    runner.sh takes right before it runs or records a decline). Winning proves no window started or declined the
+    command, and any window that opens later refuses to run it. Losing means a runner owns the job: its status
+    (running/ran/declined) is left untouched and returned. The failed status is written atomically (tmp + rename)
+    so waits and resumes end at once instead of polling a job no window will ever answer."""
+    try:
+        (job / "start.lock").mkdir()
+    except FileExistsError:
+        return read_status(job)
+    (job / "start.lock" / "owner").write_text(f"fail_job {os.getpid()}\n")
     st: dict[str, Any] = {"status": "failed", "error": error, "job_id": job.name}
     if diagnosis:
         st["diagnosis"] = diagnosis
@@ -484,11 +542,18 @@ def fail_job(job: Path, error: str, diagnosis: dict | None = None) -> dict:
 
 
 def _open_or_fail(job: Path, prefix: str) -> tuple[str | None, dict | None]:
-    """(terminal, None) or (None, failed result) with the failure already on disk."""
+    """(terminal, None) or (None, failed result) with the failure already on disk. If a runner took the job
+    while the openers were failing, fail_job leaves it alone and this reports the window as opened."""
     try:
         return open_window(job), None
     except Exception as e:
-        fail_job(job, f"{prefix}: {e}", getattr(e, "diagnosis", None))
+        st = fail_job(job, f"{prefix}: {e}", getattr(e, "diagnosis", None))
+        if st.get("status") != "failed":
+            try:
+                (job / "open_warning.txt").write_text(str(e))
+            except OSError:
+                pass
+            return "unknown (a window started although its opener reported an error)", None
         return None, wait_for(job, 0)
 
 
@@ -499,10 +564,17 @@ def wait_for(job: Path, wait_s: float) -> dict:
         time.sleep(0.5)
         st = read_status(job)
     result: dict[str, Any] = {"ok": True, "job_id": job.name, **st}
+    try:
+        warn = (job / "open_warning.txt").read_text().strip()
+        if warn:
+            result["opener_warning"] = warn  # the window opened, but its opener reported this
+    except OSError:
+        pass
     if st.get("status") == "failed":
         result["ok"] = False
-        result["note"] = ("No terminal window could be opened, so nothing ran. Report the error; do not hand the "
-                          "command to the user to paste.")
+        result["note"] = ("No terminal window started this command, so nothing ran (Hermes holds the job's start "
+                          "gate; a window that opens late refuses it). Report the error; do not hand the command "
+                          "to the user to paste.")
     elif st.get("status") not in ("ran", "declined"):
         result["status"] = "pending" if st.get("status") != "running" else "running"
         result["note"] = ("Still waiting (user hasn't answered, or the command is still running). Call "
@@ -609,7 +681,14 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
     where, failed = _open_or_fail(job, "could not open a terminal window on the Mac")
     if failed:
         return failed
-    return {"ok": True, "job_id": job.name, "status": "waiting_for_user", "terminal": where}
+    res = wait_for(job, 0)  # usually waiting_for_user -> pending; running/ran when the opener erred late
+    out = {"ok": True, "job_id": job.name, "status": "waiting_for_user", "terminal": where}
+    if res.get("status") in ("running", "ran", "declined"):
+        out.update({k: v for k, v in res.items() if k not in ("note",)})
+        out["terminal"] = where
+    if res.get("opener_warning"):
+        out["opener_warning"] = res["opener_warning"]
+    return out
 
 
 def relayed_status(job_id: str, gateway: str, wait_s: float) -> dict:
