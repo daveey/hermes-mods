@@ -18,6 +18,16 @@ the event compatibility path. This classification never authorizes execution.
 - Details, reply comments, unblock PATCHes, and rewrite requests use that owner.
   The core drawer hook receives its third, owner-connection argument. An unknown
   owner cannot fall through to active-gateway writes or a legacy local popup.
+- Profile qualification: core's local `/api/session-kanban-tasks` rows carry no
+  profile, gateway or connection. The focused owner's connection is read through
+  the owner profile (`ownerRoute()`, the same rule as session-tasks'
+  `focusedRoute`), and only those untagged rows inherit that profile
+  (`withOwnerRoute`, mirroring session-tasks' `withLocalRoute`). Rows naming their
+  own owner (replica `gateway`, explicit `profile`, `profile: null`,
+  `ownership_state: "unknown"`) and rows read on any other connection keep what
+  they have, so user-steps' exact `sameCard` fails open (shows both) rather than
+  merging. Without this, the session panel's chip and the strip's legacy card for
+  one card never matched and the card rendered twice.
 - Replica discovery is not actionable evidence: an unavailable owner remains a
   visible operational item with its assignee. Live owner status overrides stale
   replica status. Failed detail refresh discards expired evidence.
@@ -40,6 +50,12 @@ node --test --test-reporter=tap desktop-plugins/blocked-panel/test/*.test.mjs de
 an injected Desktop bridge: colliding IDs, remote focused-session profile, replica
 discovery, owner details, comment-before-unblock routing, drawer ownership, unknown
 owners, canonical evidence parity, and stale replica status. No live writes occur.
+
+`desktop-plugins/session-panel/test/producer-composed.test.mjs` registers
+session-tasks, blocked-panel, user-steps and session-panel together against a
+bridge answering with core's real row shapes (no profile on local rows) and
+asserts the rendered DOM: the exact same card once, a separate canonical request
+tile, gateway/board/profile collisions kept, and legacy cards with Open card only.
 
 Downstream consumers must also use connection-qualified React/deduplication keys;
 receiving a qualified snapshot alone does not fix a consumer's own unqualified key.
