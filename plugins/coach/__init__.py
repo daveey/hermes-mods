@@ -566,6 +566,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             tracked = hit["rule"] in rc.RULES
             out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
                           "p": hit["p"], "evidence": hit["evidence"],
+                          # signals.template_holds groups on it: one rule holding the same fixed text in many chats
+                          "ask_head": " ".join((ask or "").split())[:40],
                           **({"reason": hit["reason"]} if hit.get("reason") else {}),
                           **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref(),
                           **({"outcome": True} if tracked else {})}

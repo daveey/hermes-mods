@@ -1078,7 +1078,70 @@ def _coach_log(home: Path, rec: dict) -> None:
         pass
 
 
-def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
+# One reply_check rule holding replies whose user turn opens with the same text, in several chats: the rule is firing
+# on a fixed prompt (automation text), not on what users ask (agent-21185525f4: 5 of the hub's 8 status_only holds
+# opened with "[Kanban close-out]", in 4 chats, and nothing noticed). Filed once per (rule, opening); later hits ride
+# comment_open_card onto the open card instead of filing again.
+TEMPLATE_HOLD_N = 3
+TEMPLATE_HOLD_CHATS = 2
+TEMPLATE_HOLD_S = 7 * 86400
+TEMPLATE_HEAD = 40
+_ASKED_RE = re.compile(r'^asked "(.*?)"; ')
+
+
+def _ask_head(r: dict) -> str:
+    """The first TEMPLATE_HEAD chars of the held turn's user text: the row's ask_head, else (rows from an older
+    plugin) the status_only evidence quote. '' when unknown."""
+    head = r.get("ask_head")
+    if not head:
+        m = _ASKED_RE.match(str(r.get("evidence") or ""))
+        head = m.group(1) if m else ""
+    return " ".join(str(head).split())[:TEMPLATE_HEAD]
+
+
+def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") -> List[dict]:
+    """nudges: this pass's reply_nudge rows. Keeps a 7-day window in cur["coach_template"] across passes."""
+    st = cur.get("coach_template") or {}
+    evs = [e for e in st.get("ev") or [] if e.get("at", 0) > now - TEMPLATE_HOLD_S]
+    filed = {k: v for k, v in (st.get("filed") or {}).items() if v > now - TEMPLATE_HOLD_S}
+    for r in nudges:
+        head = _ask_head(r)
+        at = float(r.get("ts") or now)
+        if len(head) < 12 or at <= now - TEMPLATE_HOLD_S:
+            continue
+        evs.append({"at": at, "rule": r.get("rule") or "", "head": head, "sid": r.get("session_id") or ""})
+    out = []
+    new_keys = {(r.get("rule") or "", _ask_head(r).lower()) for r in nudges}
+    groups: Dict[Tuple[str, str], List[dict]] = {}
+    for e in evs:
+        groups.setdefault((e["rule"], e["head"].lower()), []).append(e)
+    for (rule, _), mine in groups.items():
+        head = mine[-1]["head"]
+        chats = sorted({e["sid"] for e in mine if e["sid"]})
+        key = h10(rule, head.lower())
+        if len(mine) < TEMPLATE_HOLD_N or len(chats) < TEMPLATE_HOLD_CHATS:
+            continue
+        if key in filed and (rule, head.lower()) not in new_keys:
+            continue  # filed already; only a new hit adds a comment
+        filed.setdefault(key, now)
+        out.append({"kind": "coach", "component": "agent", "at": max(e["at"] for e in mine), "session_id": "",
+                    "symptom": f"coach {rule} held {len(mine)} replies whose user turn has the same opening text "
+                               f"\"{head}\" in {len(chats)} chats: the rule is firing on a fixed (automation) prompt",
+                    "details": (f"{len(mine)} holds in {len(chats)} chats within {TEMPLATE_HOLD_S // 86400} days "
+                                f"on {host or 'this host'} (coach/log.jsonl reply_nudge, rule={rule}). Opening: "
+                                f"\"{head}\". Chats: {', '.join(chats[:10])}. Check whether the opening is a Hermes-"
+                                f"written prompt the rule should skip (reply_check.notice_turn) or a real pattern."
+                                )[:1500],
+                    "fp": fp("agent", "template-hold", rule, head.lower()),
+                    "comment_open_card": True})
+    if evs or filed:
+        cur["coach_template"] = {"ev": evs[-500:], "filed": filed}
+    else:
+        cur.pop("coach_template", None)
+    return out
+
+
+def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     """fixloop_card events file at once. A reply_check nudge (any rule in OUTCOME_RULES) is the guard WORKING (the
     agent was sent back to fix its reply), so it files only when its reply_nudge_outcome says the revised reply still
     fails the same rule, or when no outcome arrived within HANDOFF_GRACE_S (crash, a lost continuation): an ignored
@@ -1087,6 +1150,7 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
     outcome live in cur["coach_handoff_pending"] across passes."""
     out = []
     pending: List[dict] = list(cur.get("coach_handoff_pending") or [])
+    nudges: List[dict] = []
     for ln in read_new(home / "coach" / "log.jsonl", cur, "coach", now):
         if '"fixloop_card"' not in ln and '"reply_nudge' not in ln:
             continue
@@ -1098,6 +1162,8 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
         if at < now - BACKFILL_S:
             continue
         rule = r.get("rule")
+        if r.get("event") == "reply_nudge" and rule:
+            nudges.append(r)
         if r.get("event") == "fixloop_card":
             issue = str(r.get("issue") or "a fix that keeps failing")
             out.append({"kind": "coach", "component": "agent", "at": at, "session_id": r.get("session_id") or "",
@@ -1138,6 +1204,7 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
         cur["coach_handoff_pending"] = keep
     else:
         cur.pop("coach_handoff_pending", None)
+    out += template_holds(cur, nudges, now, host)
     return out
 
 
@@ -1149,7 +1216,7 @@ def collect(home: Path, cur: dict, host: str, now: Optional[float] = None) -> Li
                      ("cron", lambda: collect_cron(home, cur, now, host)),
                      ("kanban", lambda: collect_kanban(home, cur, now, host)),
                      ("gateway", lambda: collect_gateway(home, cur, now, host)),
-                     ("coach", lambda: collect_coach(home, cur, now))):
+                     ("coach", lambda: collect_coach(home, cur, now, host))):
         try:
             sigs = fn()
         except Exception as exc:  # one broken source never stops the others

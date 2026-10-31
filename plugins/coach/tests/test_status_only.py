@@ -133,6 +133,8 @@ def test_pre_verify_hook_nudges_the_real_turn_once(tmp_path, monkeypatch):
     assert judged == []
     logged = [json.loads(l) for l in (root / "log.jsonl").read_text().splitlines()]
     assert any(r.get("event") == "reply_nudge" and r.get("rule") == "status_only" for r in logged)
+    # the row carries the ask's opening text, which the repeated-template detector (signals.py) groups on
+    assert [r.get("ask_head") for r in logged if r.get("event") == "reply_nudge"] == ["whya re we waiting for 8h?"]
     # the retry (attempt 1) is never nudged again
     assert hooks["pre_verify"](session_id=sid, platform="desktop", attempt=1, final_response=REAL[1][1]) is None
 

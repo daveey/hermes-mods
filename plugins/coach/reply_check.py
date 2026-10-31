@@ -246,7 +246,11 @@ PROGRESS_ASK_RE = re.compile(
 # A wall only the user (or an outside party) can clear, named in the reply: then a status turn is the right answer.
 WALL_RE = re.compile(
     r"\bonly you\b|\bneeds? (?:you|your)\b|\byour (?:password|approval|login|2fa|decision|click|hands)\b"
-    r"|\b(?:billing|payment|spending limit|outage)\b|\bphysical(?:ly)?\b|\bsign(?:ed)? in\b|\blog(?:ged)? in\b", re.I)
+    r"|\b(?:billing|payment|spending limit|outage)\b|\bphysical(?:ly)?\b|\bsign(?:ed)? in\b|\blog(?:ged)? in\b"
+    # a decision only the user can grant, named as such (agent-73e6b1a688: "authorization to narrow the completion
+    # criteria ... I cannot waive that requirement")
+    r"|\b(?:authori[sz]ation|permission|sign-?off) to \w+"
+    r"|\bI (?:can(?:no|['’])t|am not able to) (?:waive|authori[sz]e|approve)\b", re.I)
 # Card bookkeeping (reopen/unblock/comment/show/list, cross-gateway reads) and reads: not a step on the work itself.
 CARD_TOOLS = ("kanban_show", "kanban_list", "kanban_comment", "kanban_unblock", "kanban_heartbeat", "kanban_link",
               "kanban_unlink", "kanban_block", "kanban_schedule", "kanban_attachments", "cross_task", "cross_session",
@@ -287,8 +291,13 @@ def _tool_kind(line: str) -> Optional[str]:
 
 
 def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> Optional[str]:
-    """Evidence string when a progress/finish ask got a turn of card bookkeeping only, else None."""
-    if not PROGRESS_ASK_RE.search(user_ask or "") or not (reply or "").strip():
+    """Evidence string when a progress/finish ask got a turn of card bookkeeping only, else None.
+
+    A Hermes-written prompt (notice_turn: [Kanban close-out], [chat-closeout], owner-wake ...) is never the user asking
+    about progress: its fixed wording ("what you are still waiting on") and the card asks it quotes ("unblock =
+    complete it") matched the progress pattern on every close-out (agent-21185525f4). report_only and the judge
+    still review those turns."""
+    if notice_turn(user_ask) or not PROGRESS_ASK_RE.search(user_ask or "") or not (reply or "").strip():
         return None
     kinds = [k for k in (_tool_kind(l) for l in tool_log or []) if k]
     if "work" in kinds or "card" not in kinds:
@@ -926,7 +935,7 @@ def confirm_system() -> str:
 
 
 NOTICE_RE = re.compile(
-    r"^\s*(?:\[(?:chat-closeout|false-stop recovery|owner-wake|goal continuation|babysitter)[^\]]*\]"
+    r"^\s*(?:\[(?:chat-closeout|kanban close-out|false-stop recovery|owner-wake|goal continuation|babysitter)[^\]]*\]"
     r"|[✔✓]\s*\[[^\]\n]+\]\s*@[^\n]+\bKanban\b)", re.I)
 
 

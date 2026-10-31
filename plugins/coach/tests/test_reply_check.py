@@ -749,3 +749,99 @@ def test_judged_report_only_after_own_card_closed_uses_the_closed_card_template(
     plain = rc.check(reply, "work kanban task", CLOSED_LOG[1:], llm, threshold=0.7, card_status=lambda cid: None)
     assert "variant" not in plain and plain["nudge"] == rc.NUDGES["report_only"].format(evidence="not watching the new run")
     assert rc.nudge_for("report_only", "e", kanban_down=True, card_closed=True) == rc.REPORT_ONLY_KANBAN_DOWN.format(evidence="e")
+
+
+# ── status_only on Hermes-written prompts (self-heal agent-21185525f4, agent-73e6b1a688, agent-f573a1f951) ──────
+# The [Kanban close-out] and [chat-closeout] prompts are automation, not the user asking "why are we still waiting":
+# status_only held correct close-out summaries in 4 hub chats and 2 MacBook chats (10-28..10-30).
+import os  # noqa: E402
+
+CORE = Path(os.environ.get("HERMES_AGENT_DIR") or Path.home() / ".hermes" / "hermes-agent")
+CLOSEOUT_PROMPT = (  # state.db row 459940, @session:default/20261030_184904_51cda4 (hub)
+    "[Kanban close-out] The Kanban notice above reached this chat and no turn followed it. Act on it now: check "
+    "what the card delivered or why it stopped, fix or follow up on anything an agent can, then end with a short "
+    "summary for the user, the decision you need from them, or what you are still waiting on.")
+CLOSEOUT_REPLY = (
+    "The \"Active workers\" panel is fixed on your MacBook and pinned so it won't revert.\n\n- **Pin:** the plugin is "
+    "installed from your fork at commit `96b44c7`.\n- The pin card is scheduled: it switches back when upstream PR #3 "
+    "releases.")
+CLOSEOUT_LOG = ['-> cross_task({"action": "show", "task": "@task:default@macbook/t_01a18ecf672c9235"})',
+                '-> cross_task({"action": "show", "task": "@task:default@macbook/t_01a18ec57362f026"})']
+
+
+def _closeout_core():
+    spec = importlib.util.spec_from_file_location("t_chat_closeout_core", HERE.parent / "chat-closeout" / "core.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _ask_relay_prompt():
+    """The real producer's [chat-closeout] ask-relay prompt for t_82f0fe15 (@session:default/20261023_144828_86fa15),
+    whose verbatim ask line carries "unblock = complete it"."""
+    cc = _closeout_core()
+    card = {"id": "t_82f0fe15", "status": "blocked", "block_kind": "needs_input",
+            "title": "Model balancing 5: merge, deploy and prove routing on every gateway and Babybear",
+            "human_request": json.dumps({
+                "action": "Reply 'accept scoped' to close t_82f0fe15 as scoped-verified (unblock = complete it, "
+                          "remaining gaps stay on their owner cards), or provide Gemini/Grok grants/funding to "
+                          "continue. Archive = drop the card.",
+                "why_human": "Four-provider completion needs Gemini/Grok grants and funding that only David can "
+                             "supply, and the goal judge refuses scoped completion.",
+                "interaction": "reply", "scope": "t_82f0fe15 model-balancing fleet rollout",
+                "evidence": "PR #2139 landed as 4f2b1efd6; Gemini/Grok grants absent."})}
+    return cc.ask_relay_prompt({"batch": ["t_82f0fe15"]}, {"t_82f0fe15": card}, ["t_82f0fe15"])
+
+
+def test_status_only_skips_the_kanban_closeout_prompt():
+    assert rc.PROGRESS_ASK_RE.search(CLOSEOUT_PROMPT)  # the template itself says "still waiting on"
+    assert rc.status_only(CLOSEOUT_PROMPT, CLOSEOUT_REPLY, CLOSEOUT_LOG) is None
+    llm = lambda s, p: json.dumps({k: 0 for k in rc.RULES})
+    hit = rc.check(CLOSEOUT_REPLY, CLOSEOUT_PROMPT, CLOSEOUT_LOG, llm, only=["status_only"])
+    assert not hit or hit["rule"] != "status_only"
+
+
+def test_status_only_skips_the_chat_closeout_ask_relay_quoting_unblock_complete_it():
+    prompt = _ask_relay_prompt()
+    assert prompt.startswith("[chat-closeout]") and "unblock = complete it" in prompt
+    reply = ("The specific wall is **permission to narrow the completion criteria**: close the rollout card with "
+             "Gemini/Grok coverage and outstanding live checks explicitly incomplete, rather than satisfy the "
+             "original full-fleet acceptance.\n\nI can’t treat silence as that permission or mark those checks "
+             "passed.")
+    assert rc.status_only(prompt, reply, ['-> cross_task({"action": "show", "task": "t_82f0fe15"})']) is None
+
+
+def test_status_only_accepts_a_named_authorization_wall_after_a_human_ask():
+    reply = ("The specific wall is **authorization to narrow the completion criteria**: the card requires "
+             "four-provider verification, but only the scoped rollout is verified. I cannot waive that requirement "
+             "or authorize additional provider spending myself.")
+    assert rc.status_only("why are we still waiting on t_82f0fe15?", reply, ["-> kanban_show(t_82f0fe15)"]) is None
+    assert rc.status_only("any update?", "I need your permission to drop the Grok route.",
+                          ["-> kanban_show(t_x)"]) is None
+
+
+def test_status_only_still_fires_on_the_human_ask_about_a_card():
+    ask = "why are we still waiting on kanban card t_82f0fe15?"  # 10-28 ask, @session:default/20261028_080753_ba1741
+    reply = "Card t_82f0fe15 is ready and its reviewer is alive; CI is still running."
+    hit = rc.status_only(ask, reply, ["-> kanban_show(t_82f0fe15)"])
+    assert hit and "kanban_show" in hit
+    # a human typing the close-out tag mid-sentence is still a human ask (only anchored envelopes are notices)
+    assert rc.status_only("so why is the [Kanban close-out] still waiting?", reply, ["-> kanban_show(t_x)"])
+
+
+def test_notice_turn_recognizes_every_prompt_producer_text():
+    """Drift guard: the producers' real text, not a copy. A new prompt envelope must be added to NOTICE_RE."""
+    path = CORE / "tui_gateway" / "notice_guarantee.py"
+    assert path.is_file(), f"core checkout missing: set HERMES_AGENT_DIR (looked at {path})"
+    import ast
+    tree = ast.parse(path.read_text())
+    texts = [ast.literal_eval(n.value) for n in ast.walk(tree) if isinstance(n, ast.Assign)
+             and any(getattr(t, "id", "") == "CLOSEOUT_TEXT" for t in n.targets)]
+    assert texts, "notice_guarantee.CLOSEOUT_TEXT not found"
+    cc = _closeout_core()
+    for text in texts + [cc.TAG + " anything", _ask_relay_prompt(),
+                         cc.closeout_prompt({"batch": ["t_x"]}, {"t_x": {"status": "done", "title": "x"}})]:
+        assert rc.notice_turn(text), text[:60]
+    sh = _mod("self_heal")  # the complaint lane must not read them as user complaints either
+    for text in texts + [_ask_relay_prompt()]:
+        assert sh.SYNTHETIC_RE.match(text), text[:60]

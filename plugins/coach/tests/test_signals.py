@@ -1304,3 +1304,62 @@ def test_revision_check_without_state_db_files_as_agent_defect(tmp_path):
                                        "reply": "A revision long enough to compare with stored rows."}])
     got = sg.collect_coach(h, {}, NOW)
     assert len(got) == 1 and got[0]["component"] == "agent"
+
+
+# ── one reply_check rule holding the same fixed text across chats (self-heal agent-21185525f4) ─────────────────
+# 5 of the hub's 8 status_only holds since 10-28 began with the same "[Kanban close-out]" prompt, in 4 chats, and
+# nothing noticed until one revision failed too. Rows log `ask_head` (the first 40 chars of the user turn).
+
+TPL = "[Kanban close-out] The Kanban notice abo"
+
+
+def _tpl_nudge(i, sid, head=TPL, rule="status_only", ts=None):
+    return {"ts": NOW - 3 * 86400 + i * 3600 if ts is None else ts, "event": "reply_nudge", "session_id": sid,
+            "rule": rule, "p": 1.0, "evidence": "x", "ask_head": head, "outcome": True}
+
+
+def _templates(sigs):
+    return [s for s in sigs if s["kind"] == "coach" and "same opening text" in s["symptom"]]
+
+
+def test_rule_holding_one_template_in_three_turns_across_two_chats_files_one_card(tmp_path):
+    rows = [_tpl_nudge(0, "s1"), _tpl_nudge(1, "s2")]
+    h = _coach_home(tmp_path, rows)
+    cur = {}
+    assert _templates(sg.collect_coach(h, cur, NOW)) == []  # 2 holds: not yet
+    with (h / "coach" / "log.jsonl").open("a") as f:
+        f.write(json.dumps(_tpl_nudge(2, "s1")) + "\n")
+    got = _templates(sg.collect_coach(h, cur, NOW + 60))
+    assert len(got) == 1
+    s = got[0]
+    assert "status_only" in s["symptom"] and TPL in s["symptom"] and s["comment_open_card"] is True
+    assert "3 holds" in s["details"] and "2 chats" in s["details"]
+    first_fp = s["fp"]
+    # a later hit of the same template keeps the fingerprint and rides comment_open_card (a comment, not a new card)
+    with (h / "coach" / "log.jsonl").open("a") as f:
+        f.write(json.dumps(_tpl_nudge(3, "s3")) + "\n")
+    again = _templates(sg.collect_coach(h, cur, NOW + 120))
+    assert len(again) == 1 and again[0]["fp"] == first_fp and again[0]["comment_open_card"] is True
+    assert sg.to_defect(again[0])["comment_open_card"] is True
+
+
+def test_template_holds_need_two_chats_seven_days_and_the_same_rule(tmp_path):
+    one_chat = [_tpl_nudge(i, "s1") for i in range(4)]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path / "a", one_chat), {}, NOW)) == []
+    old = [_tpl_nudge(0, "s1", ts=NOW - 8 * 86400), _tpl_nudge(1, "s2"), _tpl_nudge(2, "s3")]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path / "b", old), {}, NOW)) == []
+    mixed = [_tpl_nudge(0, "s1"), _tpl_nudge(1, "s2", rule="report_only"), _tpl_nudge(2, "s3")]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path / "c", mixed), {}, NOW)) == []
+    human = [_tpl_nudge(0, "s1", head="why is it slow"), _tpl_nudge(1, "s2", head="whats going on"),
+             _tpl_nudge(2, "s3", head="any update?")]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path / "d", human), {}, NOW)) == []
+    no_head = [{k: v for k, v in _tpl_nudge(i, f"s{i}").items() if k != "ask_head"} for i in range(3)]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path / "e", no_head), {}, NOW)) == []
+
+
+def test_template_head_falls_back_to_the_status_only_evidence_quote(tmp_path):
+    """Rows from backends still on the old plugin carry no ask_head; status_only's evidence quotes the ask."""
+    ev = 'asked "[Kanban close-out] The Kanban notice above reached this chat and no turn followe"; this turn only ran x'
+    rows = [{**{k: v for k, v in _tpl_nudge(i, f"s{i % 2}").items() if k != "ask_head"}, "evidence": ev}
+            for i in range(3)]
+    assert len(_templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW))) == 1
