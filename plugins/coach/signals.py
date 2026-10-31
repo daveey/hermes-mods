@@ -86,6 +86,36 @@ SKIP_LOGGERS = re.compile(r"^(agent\.tool_executor|tools\.terminal_tool|tools\.c
 TRANSIENT_RE = re.compile(r"RateLimitError|rate_limit_error|\b429\b|overloaded_error|\b529\b|APIConnectionError|"
                           r"APITimeoutError|ReadTimeout|ConnectTimeout|RemoteProtocolError|CancelledError|"
                           r"KeyboardInterrupt|InternalServerError.*\b5\d\d\b", re.I)
+# A provider status error whose body is a proxy/CDN HTML page (Cloudflare's "502 Bad Gateway" in front of
+# api.anthropic.com): the SDK uses the raw body as the message, so the exception line reads `...ServerError: <html>`
+# and the status sits on the body's later lines (agent-ee16fb8bb9). Only provider exception types get this
+# multi-line look, so our own exception whose message happens to mention 502 still files.
+PROVIDER_STATUS_EXC_RE = re.compile(r"(?:^|\.)(?:\w*ServerError|APIStatusError)$")
+PROXY_5XX_RE = re.compile(r"<title>\s*5\d\d\b|\b5\d\d\s+(?:Bad Gateway|Service|Gateway|Internal Server Error)|"
+                          r"Bad Gateway|Service (?:Temporarily )?Unavailable|Gateway Time-?out|"
+                          r"Error code: 5\d\d\b|\bstatus(?:_code)?[\s:=]+5\d\d\b", re.I)
+EXC_BODY_LINES, EXC_BODY_CHARS = 20, 2000
+
+
+def _exc_body(block: List[str], exc_line: str) -> str:
+    """The exception message's continuation lines after `exc_line` in its traceback block (an HTML error page,
+    a multi-line provider message), capped at EXC_BODY_LINES lines / EXC_BODY_CHARS chars."""
+    if not exc_line or exc_line not in block:
+        return ""
+    i = len(block) - 1 - block[::-1].index(exc_line)
+    return "\n".join(block[i + 1:i + 1 + EXC_BODY_LINES])[:EXC_BODY_CHARS]
+
+
+def provider_5xx(exc_type: str, exc_line: str, body: str) -> bool:
+    """A provider status error (by exception type) whose message, including its continuation lines, carries a
+    5xx status or a proxy 5xx page marker. Transient: core retries it; a real outage files via retry-exhausted."""
+    if not PROVIDER_STATUS_EXC_RE.search(exc_type or ""):
+        return False
+    text = (exc_line or "") + "\n" + (body or "")
+    return bool(PROXY_5XX_RE.search(text) or TRANSIENT_RE.search(text)
+                or re.search(r"InternalServerError[\s\S]{0,600}?\b5\d\d\b", text))
+
+
 PLUGIN_PATH_RE = re.compile(r"/plugins/([\w.\-]+)/")
 # CPython refusing new work while the process exits (Desktop quit, update, restart mid-turn): the turn's thread
 # outlived the main thread. Exit noise, not a defect (agent-9a2a3cc05d); core logs it as one line since c5153adda1.
@@ -336,7 +366,8 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                                    "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
                                                                    + block))[-1500:]})
             continue
-        if TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line):
+        if (TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line)
+                or provider_5xx(exc_type, exc_line, _exc_body(block, exc_line))):
             continue
         last = exc_line or next((l for l in reversed(block) if l and not l[0].isspace()), "")  # socket.gaierror
         if CONNECT_FAIL_RE.match(r["msg"]) and (NETWORK_EXC_RE.match(last) or NETWORK_RE.match(last)):
@@ -514,11 +545,13 @@ def parse_worker_crashes(lines: List[str]) -> List[dict]:
         if not tbs:
             continue
         tail = blk[tbs[-1]:]
-        em = next((m for l in reversed(tail) for m in [WORKER_EXC_RE.match(l)] if m), None)
+        em_i, em = next(((i, m) for i in range(len(tail) - 1, -1, -1) for m in [WORKER_EXC_RE.match(tail[i])] if m),
+                        (-1, None))
         if em is None:
             continue
         exc, msg = em.group(1), em.group(2)
-        if TRANSIENT_RE.search(f"{exc}: {msg}") or EXIT_NOISE_RE.search(msg):
+        if (TRANSIENT_RE.search(f"{exc}: {msg}") or EXIT_NOISE_RE.search(msg)
+                or provider_5xx(exc, tail[em_i], _exc_body(tail, tail[em_i]))):
             continue
         crash = {"pid": pid, "exc": exc, "msg": msg, "block": tail}
         if pid in stamps:
