@@ -1211,7 +1211,9 @@ def test_resume_reconciles_job_whose_window_never_started(tmp_path, monkeypatch)
     old = ut.create_job("echo hi", "r", str(tmp_path))
     _age(old, ut.LAUNCH_GRACE_S + 5)
     res = json.loads(ut.handle({"job_id": old.name, "wait_s": 1}))
-    assert res["status"] == "failed" and res["ok"] is False
+    # Contract change: no window after the launch grace is "abandoned" with the start gate fenced first ("failed"
+    # stays for real opener errors, test_opener_error_still_reports_failed).
+    assert res["status"] == "abandoned" and res["ok"] is False
     assert (old / "start.lock").is_dir()  # a window that opens late refuses
     res = json.loads(ut.handle({"job_id": young.name, "wait_s": 1}))
     assert res["status"] == "pending"  # inside the launch grace: kept
@@ -1226,8 +1228,8 @@ def test_any_call_sweeps_legacy_stale_jobs_without_watchdog(tmp_path, monkeypatc
     (windowed / "opened").write_text("")  # a window announced itself but never ran it
     monkeypatch.setattr(ut, "open_window", lambda job: "Terminal")
     json.loads(ut.handle({"command": "echo new", "cwd": str(tmp_path), "wait_s": 1}))
-    assert ut.read_status(legacy)["status"] == "failed"
-    assert json.loads((legacy / "status.json").read_text())["status"] == "failed"
+    assert ut.read_status(legacy)["status"] == "abandoned"  # fenced then abandoned (was "failed")
+    assert json.loads((legacy / "status.json").read_text())["status"] == "abandoned"
     st = ut.read_status(windowed)
     assert st["status"] == "withdrawn" and st["reason"] == "expired after 120 min; ask again if still needed"
 
@@ -1357,3 +1359,258 @@ def test_runner_starts_one_watchdog_before_the_command(tmp_path, monkeypatch):
                 os.kill(int(line.read_text().split()[0]), 9)
             except (OSError, ValueError, IndexError):
                 pass
+
+
+# ---------------------------------------------------------------- abandonment, identities, legacy runners
+
+# The runner.sh shipped before start/final gates, runners identities and the withdraw trap existed (the shape of
+# job 20261031-090513-2e0275): it never writes opened/runners, ignores start.lock and the withdraw marker.
+LEGACY_RUNNER = r"""#!/bin/bash
+JOB="$1"
+status() { printf '%s' "$1" > "$JOB/status.json.tmp" && mv "$JOB/status.json.tmp" "$JOB/status.json"; }
+status '{"status":"running"}'
+cd "$(cat "$JOB/cwd.txt")" || exit 1
+/usr/bin/script -q "$JOB/output.log" /bin/bash -c "/bin/bash \"$JOB/cmd.sh\"; echo \$? > \"$JOB/rc\""
+status "{\"status\":\"ran\",\"exit_code\":$(cat "$JOB/rc" 2>/dev/null || echo 1)}"
+"""
+
+
+def _legacy_job(tmp_path, age_s: float) -> Path:
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    (job / "runner.sh").write_text(LEGACY_RUNNER)
+    (job / "watchdog.sh").unlink()
+    _age(job, age_s, drop_new_keys=True)
+    return job
+
+
+def test_unstarted_job_past_grace_is_fenced_then_abandoned_not_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    _age(job, ut.LAUNCH_GRACE_S + 5)
+    st = ut.watch_once(job, {})
+    assert st["status"] == "abandoned" and "nothing ran" in st["reason"]
+    assert (job / "start.lock" / "owner").read_text().split()[0] == "fence"  # a late window refuses
+    assert json.loads((job / "status.json").read_text())["status"] == "abandoned"
+    assert ut.wait_for(job, 0)["ok"] is False
+
+
+@needs_bsd_script
+def test_late_window_after_fence_never_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    ran = tmp_path / "ran"
+    job = ut.create_job(f"touch {ran}", "r", str(tmp_path))
+    _age(job, ut.LAUNCH_GRACE_S + 5)
+    assert ut.watch_once(job, {})["status"] == "abandoned"
+    screen = _drive(job, [])
+    assert not ran.exists()
+    assert b"Hermes already gave up" in screen
+    assert ut.read_status(job)["status"] == "abandoned"
+
+
+def test_opener_error_still_reports_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+
+    def boom(job):
+        raise ut.OpenFailed("osascript exited 1: nope")
+    monkeypatch.setattr(ut, "open_window", boom)
+    res = json.loads(ut.handle({"command": "echo hi", "cwd": str(tmp_path), "wait_s": 1}))
+    assert res["status"] == "failed" and "nope" in res["error"]  # the real opener error, not "abandoned"
+
+
+def test_legacy_stale_2e0275_shape_becomes_abandoned(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    legacy = _legacy_job(tmp_path, 7 * 3600)  # waiting_for_user, no opened/start.lock/owner, older than max age
+    monkeypatch.setattr(ut, "open_window", lambda job: "Terminal")
+    ut.handle({"command": "echo new", "cwd": str(tmp_path), "wait_s": 1})  # any call sweeps
+    st = ut.read_status(legacy)
+    assert st["status"] == "abandoned", st
+    assert (legacy / "start.lock").is_dir()
+
+
+def test_dead_runner_is_abandoned_before_owner_or_expiry(tmp_path, monkeypatch):
+    db = _board(tmp_path, "done", None)  # the card is finished AND the job is past max age
+    job = _owned_job(tmp_path, monkeypatch, db)
+    _age(job, 7 * 3600)
+    p = subprocess.Popen(["true"])
+    p.wait()
+    (job / "runners").write_text(f"{p.pid} Mon Jan  1 00:00:00 2001\n")
+    (job / "opened").write_text(f"{p.pid}\n")
+    (job / "start.lock").mkdir()
+    (job / "start.lock" / "owner").write_text(f"runner {p.pid}\n")
+    (job / "status.json").write_text(json.dumps({"status": "running"}))
+    st = ut.watch_once(job, {})
+    assert st["status"] == "abandoned", st
+
+
+@needs_bsd_script
+def test_runner_and_python_identities_match_across_locale_and_tz(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setenv("TZ", "America/Los_Angeles")  # the Hermes process
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+    job = ut.create_job("sleep 4", "r", str(tmp_path))
+    pid, fd = pty.fork()
+    if pid == 0:  # the terminal window: another zone and locale
+        os.environ.update({"SHELL": "/bin/bash", "TZ": "Asia/Kolkata", "LC_ALL": "fr_FR.UTF-8", "LANG": "fr_FR.UTF-8"})
+        os.execv("/bin/bash", ["/bin/bash", str(job / "runner.sh"), str(job)])
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline and not (job / "cmd.pgid").exists():
+            if select.select([fd], [], [], 0.1)[0]:
+                os.read(fd, 4096)
+        runners = ut.runner_idents(job)
+        assert runners and all(ut._same_process(p, s) for p, s in runners.items()), (runners, ut._proc_start(pid))
+        ident = ut._cmd_ident(job)
+        assert ident and ut._same_process(*ident), (ident, ut._proc_start(ident[0]) if ident else None)
+        assert ut.watch_once(job, {}) is None  # a live runner is never judged dead
+    finally:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        ident = ut._cmd_ident(job)
+        if ident:
+            subprocess.run(["pkill", "-9", "-g", str(ident[0])], check=False)
+
+
+def test_board_check_quotes_uri_path(tmp_path):
+    d = tmp_path / "we?ird#dir %41"
+    d.mkdir()
+    db = _board(d, "done", None)
+    assert ut._board_check({"task_id": "t_card", "db": str(db)}, time.time()) == "card t_card is done"
+
+
+def test_board_check_falls_back_to_rw_query_only_when_ro_fails(tmp_path, monkeypatch):
+    import sqlite3
+    db = _board(tmp_path, "done", None)
+    before = db.read_bytes()
+    real, uris = sqlite3.connect, []
+
+    def connect(database, *a, **k):
+        uris.append(str(database))
+        if "mode=ro" in str(database):  # what a WAL db does while its -wal/-shm sidecars are gone
+            raise sqlite3.OperationalError("unable to open database file")
+        return real(database, *a, **k)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    assert ut._board_check({"task_id": "t_card", "db": str(db)}, time.time()) == "card t_card is done"
+    assert any(u.endswith("mode=rw") for u in uris) and not any("rwc" in u for u in uris)
+    assert db.read_bytes() == before
+
+
+def test_ro_connect_is_query_only_and_never_creates(tmp_path):
+    import sqlite3
+    db = _board(tmp_path, "done", None)
+    c = ut._ro_connect(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            c.execute("INSERT INTO tasks VALUES ('x', 'ready', NULL)")
+    finally:
+        c.close()
+    missing = tmp_path / "nope.db"
+    with pytest.raises(sqlite3.Error):
+        ut._ro_connect(missing)
+    assert not missing.exists()
+
+
+def test_withdraw_without_command_does_not_wait(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    t = time.time()
+    assert ut.withdraw_job(job, "gone")["status"] == "withdrawn"
+    assert time.time() - t < 1.0  # no cmd.pgid after the final gate: no command can still be launching
+
+
+def test_withdraw_escalates_to_sigkill_for_verified_group(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    p = subprocess.Popen(["/bin/bash", "-c", "trap '' TERM; while :; do sleep 0.1; done"], start_new_session=True)
+    try:
+        time.sleep(0.3)
+        (job / "cmd.pgid").write_text(f"{p.pid} {ut._proc_start(p.pid)}\n")
+        ut.withdraw_job(job, "gone")
+        assert p.wait(5) == -9
+    finally:
+        try:
+            os.killpg(p.pid, 9)
+        except (ProcessLookupError, PermissionError):  # already gone (macOS reports EPERM for a reaped group)
+            pass
+
+
+def test_kill_command_never_signals_own_group(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    me = os.getpgrp()
+    (job / "cmd.pgid").write_text(f"{me} {ut._proc_start(me)}\n")
+    sent = []
+    monkeypatch.setattr(ut.os, "killpg", lambda pg, sig: sent.append((pg, sig)))
+    ut._kill_command(job, 0.3)
+    assert sent == []
+
+
+def _fake_legacy_runner(job: Path) -> subprocess.Popen:
+    """A process whose argv is the legacy window's (bash runner.sh JOB) without running the command."""
+    return subprocess.Popen(["/bin/bash", "-c", "sleep 30; :", str(job / "runner.sh"), str(job)],
+                            start_new_session=True)
+
+
+def test_withdraw_live_legacy_runner_is_unsupported_not_withdrawn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = _legacy_job(tmp_path, 60)
+    (job / "status.json").write_text(json.dumps({"status": "running"}))
+    p = _fake_legacy_runner(job)
+    try:
+        time.sleep(0.3)
+        res = json.loads(ut.handle({"action": "withdraw", "job_id": job.name, "reason": "card done"}))
+        assert res["ok"] is False and res["status"] == "running" and "legacy" in res["error"], res
+        assert not (job / "withdraw").exists() and not (job / "final.lock").exists()
+        _age(job, 7 * 3600)  # past max age: still must not claim withdrawn while the old window lives
+        assert ut.watch_once(job, {}) is None or ut.read_status(job)["status"] == "running"
+        assert ut.read_status(job)["status"] == "running"
+    finally:
+        os.killpg(p.pid, 9)
+        p.wait()
+    st = ut.watch_once(job, {})  # the old window is gone: abandoned
+    assert st and st["status"] == "abandoned", st
+
+
+def test_unblock_in_same_second_before_request_keeps_prompt(tmp_path, monkeypatch):
+    import sqlite3
+    db = _board(tmp_path, "blocked", None)
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'unblocked', ?)",
+                (int(time.time()) + 1,))  # same (or a later) second as the request, but written BEFORE it
+    con.commit()
+    con.close()
+    job = _owned_job(tmp_path, monkeypatch, db)
+    meta = json.loads((job / "meta.json").read_text())
+    assert isinstance(meta.get("board_event_cursor"), int)
+    assert ut.watch_once(job, {}) is None
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'unblocked', ?)",
+                (int(time.time()),))
+    con.commit()
+    con.close()
+    st = ut.watch_once(job, {})
+    assert st and st["status"] == "withdrawn" and "unblocked" in st["reason"]
+
+
+def test_legacy_owner_without_cursor_keeps_timestamp_fallback(tmp_path):
+    import sqlite3
+    db = _board(tmp_path, "blocked", None)
+    created = time.time() - 60
+    owner = {"kind": "card", "task_id": "t_card", "db": str(db)}
+    assert ut._board_check(owner, created) is None
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'unblocked', ?)",
+                (int(time.time()),))
+    con.commit()
+    con.close()
+    assert ut._board_check(owner, created) == "card t_card was unblocked after this request"
+
+
+def test_identity_recorded_by_pre_fix_runner_still_verifies(tmp_path, monkeypatch, victim):
+    # A window started before runner.sh pinned LC_ALL=C TZ=UTC recorded lstart in its own locale/zone; that live
+    # runner must not read as dead (abandoned) after the upgrade. A different start time still never matches.
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    old = " ".join(subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(victim.pid)], capture_output=True,
+                                  text=True).stdout.split())
+    assert old and old != ut._proc_start(victim.pid)
+    assert ut._same_process(victim.pid, old)
+    assert not ut._same_process(victim.pid, "Mon Jan  1 00:00:00 2001")
