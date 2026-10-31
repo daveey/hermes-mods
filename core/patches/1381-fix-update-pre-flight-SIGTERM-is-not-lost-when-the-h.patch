@@ -1,0 +1,116 @@
+From b1af31437760e139cc4729fdbd513ca9c276e8f8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 02:28:01 +0000
+Subject: [PATCH] fix(update): pre-flight SIGTERM is not lost when the handler
+ fires inside a weakref callback (#405)
+
+The SIGTERM handler raised SystemExit from an arbitrary bytecode; inside a weakref
+callback/__del__ (import machinery) that exception is reported as 'Exception ignored' and
+dropped, so the copy ran on to its lock deadline. The handler now also sets a flag the
+progress callback and the off-thread wait poll. Reproduced ~1/130 with a SIGSTOP/SIGCONT
+duty cycle; 0/1000 after.
+---
+ hermes_cli/backup_sqlite.py                   | 23 ++++++++++++++-
+ .../test_backup_preflight_staging.py          | 28 +++++++++++++++++++
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/backup_sqlite.py b/hermes_cli/backup_sqlite.py
+index dbe58cdffa1..f5681191360 100644
+--- a/hermes_cli/backup_sqlite.py
++++ b/hermes_cli/backup_sqlite.py
+@@ -19,6 +19,24 @@ from typing import Optional
+ logger = logging.getLogger(__name__)
+ 
+ 
++# Set by the SIGTERM handler. A Python signal handler runs between arbitrary bytecodes, including
++# inside a weakref callback or __del__ (import machinery, GC), where the SystemExit it raises is
++# reported as "Exception ignored" and swallowed -- the pre-flight would then run on past the
++# deadline. Every long loop therefore also polls this flag and raises from a normal frame.
++_terminate_signal: Optional[int] = None
++
++
++def _on_sigterm(signum: int, _frame) -> None:
++    global _terminate_signal
++    _terminate_signal = signum
++    sys.exit(128 + signum)
++
++
++def _raise_if_terminated() -> None:
++    if _terminate_signal is not None:
++        raise SystemExit(128 + _terminate_signal)
++
++
+ class _SQLiteBackupTimeout(RuntimeError):
+     """Raised when a SQLite snapshot remains busy past its deadline."""
+ 
+@@ -131,6 +149,7 @@ class _OffThreadCopy:
+     def run(self) -> None:
+         self.thread.start()
+         while self.thread.is_alive():
++            _raise_if_terminated()
+             self.thread.join(0.05)
+         if self._error is not None:
+             raise self._error
+@@ -175,9 +194,11 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
+                               check_same_thread=False)
+         backup_conn = sqlite3.connect(str(dst), check_same_thread=False)
+         busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
++        _raise_if_terminated()
+ 
+         def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:
+             nonlocal busy_deadline
++            _raise_if_terminated()
+             now = time.monotonic()
+             if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                 if now >= busy_deadline:
+@@ -265,7 +286,7 @@ def preflight_state_db(home: Path, *, busy_timeout_seconds: float = 10.0) -> dic
+ if __name__ == "__main__":
+     # The Desktop stops a pre-flight past its deadline with SIGTERM; exit through
+     # the staging cleanup instead of dying with a full-size .partial left behind.
+-    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
++    signal.signal(signal.SIGTERM, _on_sigterm)
+     # Optional argv[2]: tests hold the source locked as a barrier and need the lock wait to outlast a starved runner.
+     _busy = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
+     print(json.dumps(preflight_state_db(Path(sys.argv[1]), busy_timeout_seconds=_busy)))
+diff --git a/tests/hermes_cli/test_backup_preflight_staging.py b/tests/hermes_cli/test_backup_preflight_staging.py
+index 46719653cd8..1d5e1e7f9f8 100644
+--- a/tests/hermes_cli/test_backup_preflight_staging.py
++++ b/tests/hermes_cli/test_backup_preflight_staging.py
+@@ -63,6 +63,34 @@ def test_sigterm_mid_copy_removes_the_staging_copy(tmp_path):
+     assert _staging(home) == []
+ 
+ 
++@pytest.mark.platforms("posix")
++def test_a_sigterm_swallowed_by_a_weakref_callback_still_stops_the_copy(tmp_path):
++    """Python runs the signal handler between arbitrary bytecodes, and a SystemExit raised inside a
++    weakref callback or __del__ is printed as "Exception ignored" and dropped. The handler must
++    therefore also leave a flag the copy loop polls, or the pre-flight outlives its deadline."""
++    home = _home_with_db(tmp_path, 10, journal_mode="DELETE")
++    driver = (
++        "import runpy, signal, sys, weakref\n"
++        "ns = runpy.run_path(sys.argv[1], run_name='not_main')\n"
++        "class Box: pass\n"
++        "def swallowed(_ref):\n"
++        "    ns['_on_sigterm'](signal.SIGTERM, None)  # the handler firing inside a weakref callback\n"
++        "box = Box(); ref = weakref.ref(box, swallowed); del box\n"
++        "assert ns['_on_sigterm'].__globals__['_terminate_signal'] == signal.SIGTERM\n"
++        "ns['preflight_state_db'](__import__('pathlib').Path(sys.argv[2]), busy_timeout_seconds=600)\n")
++    holder = sqlite3.connect(home / "state.db", isolation_level=None)
++    holder.execute("BEGIN EXCLUSIVE")
++    try:
++        proc = subprocess.run([sys.executable, "-I", "-S", "-c", driver, str(SCRIPT), str(home)],
++                              capture_output=True, timeout=60, check=False)
++    finally:
++        holder.execute("ROLLBACK")
++        holder.close()
++    # The swallowed SystemExit is reported, not raised; the copy must still stop on its own.
++    assert proc.returncode == 128 + signal.SIGTERM, proc.stderr
++    assert _staging(home) == []
++
++
+ def _staged_bytes(home: Path) -> int:
+     return sum(p.stat().st_size for p in home.glob("state.db.pre-update-emergency-*.partial") if p.exists())
+ 
+-- 
+2.55.0
+

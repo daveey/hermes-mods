@@ -1,10 +1,35 @@
 # CI, runner and regression-test hardening
 
-This document covers **only 1303, 1304, 1306, 1307, 1308, 1309, 1317, 1320, 1321 and 1322**. Each entry describes its actual source diff, not everything advertised by its commit subject.
+This document covers **1303, 1304, 1306, 1307, 1308, 1309, 1317, 1320, 1321, 1322 and 1381**. Each entry describes its actual source diff, not everything advertised by its commit subject.
 
 **Verification boundary:** source tests inspected, not executed in this mirror pass. Assertions described below are source contracts, not newly observed passing results. No cloud image was built, runner deployed, workflow dispatched or application launched for this documentation.
 
 **Applying the patches:** apply the whole numbered series, in order, at the fork merge-base for the frozen snapshot, using `git am -3 --empty=keep`. These are not standalone patches or a ten-patch independent bundle. Earlier patches supply their implementations, fixtures and workflow infrastructure. Use the mirror inventory and verification policy to identify the correct merge-base; do not start at a newer upstream tip. Per-entry Applying notes below describe integration requirements, not a substitute application order.
+
+## 1381 — Preserve SIGTERM through swallowed callback exceptions
+
+Source: `b1af31437760e139cc4729fdbd513ca9c276e8f8`; follow-up to the standalone preflight interruption tests in 1303/1304. This section's executed checks are separate from the historical verification boundary above.
+
+### Behavior
+
+A SIGTERM received during the standalone SQLite preflight still stops copying and cleans its staging files if Python swallows the signal handler's `SystemExit` inside a weakref callback.
+
+### How it works / Code
+
+`hermes_cli/backup_sqlite.py::_on_sigterm` records the signal before exiting. `_raise_if_terminated` checks that in-process flag before backup starts, inside SQLite backup progress, and while `_OffThreadCopy.run` waits for its worker. The standalone entry installs this handler. The flag is not reset for reuse after termination.
+
+### Tests
+
+Executed at the source above: `tests/hermes_cli/test_backup_preflight_staging.py` — **4 passed**.
+
+- `test_a_sigterm_swallowed_by_a_weakref_callback_still_stops_the_copy` invokes the handler inside a real weakref callback in isolated Python, holds the source database locked, then asserts exit `128 + SIGTERM` and no staging files.
+- `test_sigterm_mid_copy_removes_the_staging_copy` sends a real signal to the standalone script mid-copy and asserts signal exit, empty stdout and staging cleanup.
+
+The Desktop end-to-end updater and a separate direct off-thread flag-poll regression were not exercised here. Command and aggregate results: [mirror-1381-verification.md](mirror-1381-verification.md).
+
+### Applying / Gotchas / Plugin?
+
+Use the README's complete bridge-aware replay procedure; earlier backup patches are prerequisites. Python can swallow exceptions raised inside callbacks, so raising in the handler alone is insufficient. This is core standalone backup handling, not a plugin.
 
 ## 1303 — Keep the interrupted-backup test inside its lock barrier
 
