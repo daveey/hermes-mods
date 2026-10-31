@@ -424,7 +424,11 @@ _MONEY = r"(?:api\s+)?(?:credits?|credit balance|billing|funds|balance|budget|sp
 CREDIT_ASK_RE = re.compile(
     r"console\.anthropic\.com/settings/(?:billing|plans)|platform\.openai\.com/(?:settings/organization/|account/)?billing"
     r"|\b(?:add|buy|purchase|top[- ]?up|load|refill|fund|increase|raise)\b[^.\n]{0,60}?\$?\d*[^.\n]{0,20}?\b" + _MONEY +
-    r"|\b(?:credits?|balance)\b[^.\n]{0,40}\b(?:add|top[- ]?up|refill|buy|purchase)\b"
+    # noun first ("credit needs to be added", "a top-up is needed"): only a stated need counts, so descriptions like
+    # "credits that predated the purchase" or "credit purchases, auto top-up" do not (backtest 2026-10-31)
+    r"|\b(?:credits?|balance)\b[^.\n]{0,40}?\b(?:(?:needs?|must|should|has\s+to|have\s+to)\s+(?:to\s+)?(?:be\s+)?"
+    r"(?:added|topped[- ]up|refilled|bought|purchased|increased|raised)|needs?\s+(?:a\s+|another\s+)?(?:top[- ]?up|refill)"
+    r"|(?:top[- ]?up|refill|purchase)s?\s+(?:is|are|was|were)\s+(?:needed|required|necessary))\b"
     r"|\b(?:add|buy|purchase|top[- ]?up|load|refill|fund)\s+(?:about |around |roughly |another |~)?\$\d"
     r"|\bmoney ask\b",
     re.I)
@@ -448,6 +452,11 @@ NON_LLM_BILLING_RE = re.compile(
     r"|\b" + _OTHER + r"(?:\s+account)?\s+" + _BILL + r"\b"
     r"|\b" + _BILL + _PREP + _OTHER + r"\b", re.I)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n")
+# Money wording that is an ask on its own; budget/balance/funds/billing/spend limit are engineering words too ("retry
+# budget", "memory budget", "time budget") and need LLM billing context nearby (self-heal agent-ddabb16633). A top-up
+# counts as the noun, not as the verb that opens the match ("top-up went through; I'll check the balance").
+_STRONG_MONEY_RE = re.compile(r"\bcredits?\b|\$\s?\d|console\.anthropic\.com|platform\.openai\.com|\bmoney ask\b", re.I)
+_TOPUP_NOUN_RE = re.compile(r"\btop[- ]?ups?\b", re.I)
 
 
 def _nearest(rx: "re.Pattern", scope: str, a: int, b: int) -> Optional[int]:
@@ -459,7 +468,9 @@ def _nearest(rx: "re.Pattern", scope: str, a: int, b: int) -> Optional[int]:
 def _about_llm_credit(text: str, m: "re.Match") -> bool:
     """The money wording at m may be about LLM provider credit. Its sentence decides first, then its paragraph: the
     billing target nearest the ask wins (LLM credit/quota wording = yes; GitHub Actions/AWS/Vast/Cloudflare billing =
-    no). A scope naming neither defers outward, never to other paragraphs; a bare "add $250 of credit" still counts."""
+    no). A scope naming neither defers outward, never to other paragraphs. With no billing context at all, only strong
+    money wording counts (credit(s), a $ amount, a top-up noun, a billing URL): a bare "add $250 of credit" does, a bare
+    budget/balance/funds/billing ("raise the retry budget", "load on the memory budget") does not."""
     p0 = text.rfind("\n\n", 0, m.start()) + 1
     p1 = text.find("\n\n", m.end())
     p1 = len(text) if p1 < 0 else p1
@@ -471,7 +482,7 @@ def _about_llm_credit(text: str, m: "re.Match") -> bool:
         llm, other = _nearest(LLM_CREDIT_RE, scope, a, b), _nearest(NON_LLM_BILLING_RE, scope, a, b)
         if llm is not None or other is not None:
             return other is None or (llm is not None and llm <= other)
-    return True
+    return bool(_STRONG_MONEY_RE.search(m.group(0)) or _TOPUP_NOUN_RE.search(m.group(0), 1))
 
 
 # Only an ask counts, not a mention of one (live false positive 2026-10-29: a reply describing this rule, '"Raise the
@@ -488,7 +499,11 @@ _META_RE = re.compile(
     r"|\bfalse\s+(?:alarm|positive|negative)s?\b|\bcredit_ask\b"
     r"|\b(?:the|this|that|its|my|our)\s+(?:detector|regex|rule|check)(?:[\u2019']s)?(?:\s+regex)?\s+(?:still\s+)?"
     r"(?:matched|matches|caught|catches|fires|fired|flags|flagged|triggers|triggered)\b"
-    r"|\b(?:an?|the)\s+(?:real|genuine|actual|plain|bare)\s+(?:ask|request)\b", re.I)
+    r"|\b(?:an?|the)\s+(?:real|genuine|actual|plain|bare)\s+(?:ask|request)\b"
+    # another actor's ask reported back ("the eval chat asked you to add $250", "a card asking you to buy API credit
+    # is refused"); "I asked you to..." is a restated ask and still counts
+    r"|\b(?:card|post|request|reply|chat|message|block|session|eval|agent|worker)s?\s+(?:that\s+|which\s+)?"
+    r"(?:asks?|asked|asking)\s+(?:you|david|the\s+user)\s+to\b", re.I)
 # A clause that directly requests the ask ("...; please add $50", "so can you top up") is an ask whatever the rest of
 # its sentence says. Only explicit request words count: a bare clause-initial verb also opens "false alarm: add ...".
 _CLAUSE_CUT = re.compile(r"[;:,()\u2013\u2014]|\s-\s")
@@ -530,7 +545,17 @@ CREDIT_NEGATED_RE = re.compile(
     r"|\b(?:don[\u2019']t|doesn[\u2019']t|do\s+not|does\s+not|won[\u2019']t|will\s+not|never|no\s+longer)\s+"
     r"need(?:s|ed)?\b" + _NEG_GAP + r"\b" + _NEG_MONEY + r"\b"
     r"|\b" + _NEG_MONEY + r"\b(?:\s+[\w-]+){0,2}?\s+(?:is|are|was|were)(?:n[\u2019']t|\s+not|\s+no\s+longer)\s+" +
-    _NOT_NEEDED + r"\b",
+    _NOT_NEEDED + r"\b"
+    # denials of an ask (self-heal agent-ddabb16633: "My reply had no credit or purchase ask"): "no credit (or X) ask",
+    # "not a credit ask", "no purchase", "I'm not asking you to buy ... credit", "I didn't ask you to buy credit"
+    r"|\bno\s+(?:credit|money|purchase|payment|spend(?:ing)?|top[- ]?up)s?\s+(?:or\s+[\w-]+\s+)?(?:ask|request)s?\b"
+    r"|\bnot\s+an?\s+(?:credit|money|purchase|payment|spend(?:ing)?|billing)\s+(?:ask|request)\b|\bno\s+purchases?\b"
+    r"|\b(?:not|never|didn[\u2019']t|did\s+not|don[\u2019']t|do\s+not|won[\u2019']t|will\s+not)\s+"
+    r"(?:ask(?:s|ed|ing)?|request(?:s|ed|ing)?)\s+(?:you\s+|david\s+|the\s+user\s+)?(?:to|for)\b" + _NEG_GAP + r"\b" +
+    _NEG_MONEY + r"\b"
+    # attribution, not money: "a Co-authored-by line to get credit"
+    r"|\b(?:get|gets|getting|got|take|takes|took|give|gives|gave|given|deserves?|claim)\s+"
+    r"(?:the\s+|some\s+|full\s+|proper\s+)?credit\b",
     re.I)
 CREDIT_ASK_NUDGE = (
     "[coach] credit_ask: your reply asks the user to add or buy API credit (\"{evidence}\"), but this turn never tried "
@@ -1533,3 +1558,65 @@ def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[
         return None
     ev = (v.get("evidence") or "see the block reason")[:200]
     return {"p": v["handoff"], "evidence": ev, "nudge": BLOCK_HANDOFF_NUDGE.format(evidence=ev)}
+
+
+# ---- backtest: rerun a deterministic rule over real replies ------------------------------------------------------------
+# `python3 reply_check.py backtest credit_ask --days 14` prints every assistant reply in state.db (and every held draft in
+# <coach>/drafts.jsonl) that the rule would hold, so a regex change is measured against real replies, not hand-picked
+# strings (self-heal agent-ddabb16633: three credit_ask false-positive repairs in 3 days, each fixing one phrase).
+BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job": laptop_job}
+
+
+def backtest(rule: str, days: float, db=None, drafts=None) -> list:
+    """[(source, session_id, evidence)] for replies newer than `days` that `rule` holds (tool log ignored)."""
+    from pathlib import Path
+    fn = BACKTEST_RULES[rule]
+    since = time.time() - days * 86400
+    home = _hermes_home()
+    db = Path(db) if db else home / "state.db"
+    drafts = Path(drafts) if drafts else home / "coach" / "drafts.jsonl"
+    hits = []
+    if db.exists():
+        conn = _ro_connect(db)
+        try:
+            for mid, sid, content in conn.execute(
+                    "select id, session_id, content from messages where role='assistant' and timestamp > ? "
+                    "and content is not null and content != '' order by id", (since,)):
+                ev = fn(content)
+                if ev:
+                    hits.append((f"msg:{mid}", sid, ev))
+        finally:
+            conn.close()
+    if drafts.exists():
+        for line in drafts.read_text(errors="replace").splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or float(d.get("ts") or 0) < since:
+                continue
+            ev = fn(str(d.get("draft") or ""))
+            if ev:
+                hits.append((f"draft:{d.get('draft_id')}", str(d.get("session_id") or ""), ev))
+    return hits
+
+
+def main(argv=None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="reply_check.py")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    bt = sub.add_parser("backtest", help="rerun a deterministic reply rule over state.db replies and held drafts")
+    bt.add_argument("rule", choices=sorted(BACKTEST_RULES))
+    bt.add_argument("--days", type=float, default=14)
+    bt.add_argument("--db", help="state.db (default <HERMES_HOME>/state.db)")
+    bt.add_argument("--drafts", help="drafts.jsonl (default <HERMES_HOME>/coach/drafts.jsonl)")
+    a = ap.parse_args(argv)
+    hits = backtest(a.rule, a.days, a.db, a.drafts)
+    for src, sid, ev in hits:
+        print(f"{src}\t{sid}\t{' '.join(str(ev).split())[:160]}")
+    print(f"{a.rule}: {len(hits)} hit(s) in the last {a.days:g} day(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,6 +1,7 @@
 """credit_ask (self-heal agent-fe419d4901): a reply asking the user to buy API credit while the turn never tried the
 Hermes account pool is held deterministically, before the judge."""
 import importlib.util
+import json
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -167,6 +168,7 @@ def test_pool_llm_mirror_matches_coach():
     h = importlib.util.module_from_spec(spec2)
     spec2.loader.exec_module(h)
     for name in ("CREDIT_ASK_RE", "LLM_CREDIT_RE", "NON_LLM_BILLING_RE", "_SENTENCE_END", "_QUOTED_RE", "_META_RE",
+                 "CREDIT_NEGATED_RE", "_STRONG_MONEY_RE",
                  "_CLAUSE_CUT", "_DIRECT_RE"):
         a, b = getattr(rc, name), getattr(h, name)
         assert (a.pattern, a.flags) == (b.pattern, b.flags), name
@@ -174,5 +176,82 @@ def test_pool_llm_mirror_matches_coach():
     for fn in ("_nearest", "_about_llm_credit", "_mentioned_not_asked", "_is_llm_credit_ask"):
         assert inspect.getsource(getattr(rc, fn)) == inspect.getsource(getattr(h, fn)), fn
     for r in (META_REPLY, "Please add Anthropic API credit, the credit balance is too low.",
-              "Raise the GitHub Actions spending limit to $50 so CI can run.") + MUST_FIRE:
+              "Raise the GitHub Actions spending limit to $50 so CI can run.") + MUST_FIRE + NOT_ASKS + MUST_STILL_FIRE:
         assert bool(rc.credit_ask(r, [])) == bool(h.credit_ask("kanban_block", {"reason": r})), r
+
+
+# Self-heal agent-ddabb16633 (hermes-hub 2026-10-30 13:46 PT): a PR merge-delta review asked for no money, yet the
+# rule held "load on the tmpfs and memory budget" (a CI tmpfs/memory reserve) and then held the corrected reply on
+# its denial "no credit or purchase ask". Root: a weak money word (budget/balance/funds/billing) with no billing
+# context counted as an LLM credit ask by default.
+INCIDENT_DRAFT = ("  - It spawns a real `gateway ensure`, which adds some load on the tmpfs and memory budget. Static review "
+                  "found no conflict with the memory reserve or the stall probe.")
+INCIDENT_REVISED = ("This flag is a false positive. My reply had no credit or purchase ask and made no LLM or API calls, so "
+                    "there was nothing to move to the pool. \"Load on the tmpfs and memory budget\" means the CI runner's "
+                    "1G tmpfs and the memory reserve the PR adds, not API credit.")
+NOT_ASKS = (INCIDENT_DRAFT, INCIDENT_REVISED,
+            "I couldn't raise the retry budget, so I left it as is.",
+            "Now look at the reap loop and main to add a time budget.",
+            "The MacBook's load (56-60) multiplies it several times, well past the 30 s budget.",
+            "Add a two-hook test with an earlier hold and exhausted model-iteration budget.",
+            "I'm not asking you to buy or add any API credit.",
+            "I didn't ask you to buy credit, and nothing in this turn needed an LLM call.",
+            "0.13 service credits used, no purchase.",
+            "That is not a credit ask.",
+            "At 01:37 the eval chat asked you to add about $250 to each of the Anthropic and OpenAI billing accounts.",
+            "A blocked card asking you to buy API credit is refused once.",
+            "It can add a `Co-authored-by` line to get credit.",
+            "It excludes about $5.9 of service credits that predated the $25 purchase.")
+MUST_STILL_FIRE = ("- add at least $5 of pay-per-use credit",
+                   "Please buy API credit so the eval can run.",
+                   "Add about $250 to each of the Anthropic and OpenAI billing accounts.",
+                   "The eval stopped; buy credits and I'll rerun it.",
+                   "Please raise the Anthropic budget so the eval can finish.",
+                   "No credits left, so a top-up is needed.",
+                   "I asked you to add $250 of Anthropic credit yesterday; the eval is still waiting.",
+                   "The OpenAI credit balance needs a top-up before the rerun.",
+                   "The Anthropic credit needs to be topped up.")
+
+
+def test_engineering_budgets_and_denials_are_not_credit_asks():
+    for r in NOT_ASKS:
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_real_money_asks_still_fire_after_the_budget_fix():
+    for r in MUST_STILL_FIRE:
+        assert rc.credit_ask(r, []), r
+
+
+CORPUS = json.loads((Path(__file__).parent / "fixtures" / "credit_ask_corpus.json").read_text())["items"]
+
+
+def test_labelled_corpus_full_recall_and_no_new_false_positives():
+    """Every past hit of the rule on real replies, labelled: all asks fire; no not_ask fires except a listed residual."""
+    assert len(CORPUS) >= 25
+    missed = [c["text"] for c in CORPUS if c["label"] == "ask" and not rc.credit_ask(c["text"], [])]
+    false = [c["text"] for c in CORPUS if c["label"] == "not_ask" and not c.get("residual") and rc.credit_ask(c["text"], [])]
+    assert not missed, missed
+    assert not false, false
+
+
+def test_backtest_cli_reruns_the_rule_over_state_db_and_drafts(tmp_path, capsys):
+    import sqlite3
+    import time as _t
+    db = tmp_path / "state.db"
+    c = sqlite3.connect(db)
+    c.execute("create table messages (id integer primary key, session_id text, role text, content text, timestamp real)")
+    now = _t.time()
+    c.executemany("insert into messages (session_id, role, content, timestamp) values (?,?,?,?)", [
+        ("s1", "assistant", "Add about $250 of Anthropic API credit so the eval can run.", now - 60),
+        ("s1", "user", "Add about $250 of Anthropic API credit so the eval can run.", now - 60),
+        ("s2", "assistant", "I couldn't raise the retry budget.", now - 60),
+        ("s3", "assistant", "Please add $100 of OpenAI credit.", now - 30 * 86400)])
+    c.commit()
+    c.close()
+    drafts = tmp_path / "drafts.jsonl"
+    drafts.write_text(json.dumps({"draft_id": "d_1", "session_id": "s4", "ts": now, "draft": "Buy credits now."}) + "\n")
+    assert rc.main(["backtest", "credit_ask", "--days", "14", "--db", str(db), "--drafts", str(drafts)]) == 0
+    out = capsys.readouterr().out
+    assert "s1" in out and "s4" in out and "s2" not in out and "s3" not in out
+    assert "2 hit(s)" in out

@@ -118,3 +118,17 @@ def test_quoted_or_reported_credit_ask_is_not_held():
               "The API still fires 429s, so please top up OpenAI credit.",
               "Please add Anthropic credit so the detector job can run."):
         assert h.credit_ask("kanban_block", {"reason": r}), r
+
+
+# Self-heal agent-ddabb16633: engineering budgets and denials were held as credit asks (mirrors coach reply_check).
+def test_engineering_budget_and_denial_blocks_are_not_held():
+    h = fresh()
+    for r in ("The CI job adds load on the tmpfs and memory budget; unblock once the runner is resized.",
+              "I couldn't raise the retry budget; please recreate the card with max_retries=5.",
+              "Add a time budget to the reap loop, then unblock.",
+              "This is no credit or purchase ask: approve the merge.",
+              "I'm not asking you to buy or add any API credit; approve the PR."):
+        assert h.credit_ask("kanban_block", {"reason": r}) is None, r
+    for r in ("Add at least $5 of pay-per-use credit, then unblock.", "Buy API credit, then unblock.",
+              "Please raise the Anthropic budget so the eval can finish."):
+        assert h.credit_ask("kanban_block", {"reason": r}), r

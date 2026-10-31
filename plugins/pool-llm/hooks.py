@@ -27,7 +27,11 @@ _MONEY = r"(?:api\s+)?(?:credits?|credit balance|billing|funds|balance|budget|sp
 CREDIT_ASK_RE = re.compile(
     r"console\.anthropic\.com/settings/(?:billing|plans)|platform\.openai\.com/(?:settings/organization/|account/)?billing"
     r"|\b(?:add|buy|purchase|top[- ]?up|load|refill|fund|increase|raise)\b[^.\n]{0,60}?\$?\d*[^.\n]{0,20}?\b" + _MONEY +
-    r"|\b(?:credits?|balance)\b[^.\n]{0,40}\b(?:add|top[- ]?up|refill|buy|purchase)\b"
+    # noun first ("credit needs to be added", "a top-up is needed"): only a stated need counts, so descriptions like
+    # "credits that predated the purchase" or "credit purchases, auto top-up" do not (backtest 2026-10-31)
+    r"|\b(?:credits?|balance)\b[^.\n]{0,40}?\b(?:(?:needs?|must|should|has\s+to|have\s+to)\s+(?:to\s+)?(?:be\s+)?"
+    r"(?:added|topped[- ]up|refilled|bought|purchased|increased|raised)|needs?\s+(?:a\s+|another\s+)?(?:top[- ]?up|refill)"
+    r"|(?:top[- ]?up|refill|purchase)s?\s+(?:is|are|was|were)\s+(?:needed|required|necessary))\b"
     r"|\b(?:add|buy|purchase|top[- ]?up|load|refill|fund)\s+(?:about |around |roughly |another |~)?\$\d"
     r"|\bmoney ask\b",
     re.I)
@@ -51,6 +55,11 @@ NON_LLM_BILLING_RE = re.compile(
     r"|\b" + _OTHER + r"(?:\s+account)?\s+" + _BILL + r"\b"
     r"|\b" + _BILL + _PREP + _OTHER + r"\b", re.I)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n")
+# Money wording that is an ask on its own; budget/balance/funds/billing/spend limit are engineering words too ("retry
+# budget", "memory budget", "time budget") and need LLM billing context nearby (self-heal agent-ddabb16633). A top-up
+# counts as the noun, not as the verb that opens the match ("top-up went through; I'll check the balance").
+_STRONG_MONEY_RE = re.compile(r"\bcredits?\b|\$\s?\d|console\.anthropic\.com|platform\.openai\.com|\bmoney ask\b", re.I)
+_TOPUP_NOUN_RE = re.compile(r"\btop[- ]?ups?\b", re.I)
 
 
 def _nearest(rx: "re.Pattern", scope: str, a: int, b: int) -> Optional[int]:
@@ -62,7 +71,9 @@ def _nearest(rx: "re.Pattern", scope: str, a: int, b: int) -> Optional[int]:
 def _about_llm_credit(text: str, m: "re.Match") -> bool:
     """The money wording at m may be about LLM provider credit. Its sentence decides first, then its paragraph: the
     billing target nearest the ask wins (LLM credit/quota wording = yes; GitHub Actions/AWS/Vast/Cloudflare billing =
-    no). A scope naming neither defers outward, never to other paragraphs; a bare "add $250 of credit" still counts."""
+    no). A scope naming neither defers outward, never to other paragraphs. With no billing context at all, only strong
+    money wording counts (credit(s), a $ amount, a top-up noun, a billing URL): a bare "add $250 of credit" does, a bare
+    budget/balance/funds/billing ("raise the retry budget", "load on the memory budget") does not."""
     p0 = text.rfind("\n\n", 0, m.start()) + 1
     p1 = text.find("\n\n", m.end())
     p1 = len(text) if p1 < 0 else p1
@@ -74,7 +85,7 @@ def _about_llm_credit(text: str, m: "re.Match") -> bool:
         llm, other = _nearest(LLM_CREDIT_RE, scope, a, b), _nearest(NON_LLM_BILLING_RE, scope, a, b)
         if llm is not None or other is not None:
             return other is None or (llm is not None and llm <= other)
-    return True
+    return bool(_STRONG_MONEY_RE.search(m.group(0)) or _TOPUP_NOUN_RE.search(m.group(0), 1))
 
 
 # Only an ask counts, not a mention of one (live false positive 2026-10-29: a reply describing this rule, '"Raise the
@@ -91,7 +102,11 @@ _META_RE = re.compile(
     r"|\bfalse\s+(?:alarm|positive|negative)s?\b|\bcredit_ask\b"
     r"|\b(?:the|this|that|its|my|our)\s+(?:detector|regex|rule|check)(?:[\u2019']s)?(?:\s+regex)?\s+(?:still\s+)?"
     r"(?:matched|matches|caught|catches|fires|fired|flags|flagged|triggers|triggered)\b"
-    r"|\b(?:an?|the)\s+(?:real|genuine|actual|plain|bare)\s+(?:ask|request)\b", re.I)
+    r"|\b(?:an?|the)\s+(?:real|genuine|actual|plain|bare)\s+(?:ask|request)\b"
+    # another actor's ask reported back ("the eval chat asked you to add $250", "a card asking you to buy API credit
+    # is refused"); "I asked you to..." is a restated ask and still counts
+    r"|\b(?:card|post|request|reply|chat|message|block|session|eval|agent|worker)s?\s+(?:that\s+|which\s+)?"
+    r"(?:asks?|asked|asking)\s+(?:you|david|the\s+user)\s+to\b", re.I)
 # A clause that directly requests the ask ("...; please add $50", "so can you top up") is an ask whatever the rest of
 # its sentence says. Only explicit request words count: a bare clause-initial verb also opens "false alarm: add ...".
 _CLAUSE_CUT = re.compile(r"[;:,()\u2013\u2014]|\s-\s")
@@ -118,6 +133,34 @@ def _mentioned_not_asked(text: str, m: "re.Match") -> bool:
 def _is_llm_credit_ask(text: str, m: "re.Match") -> bool:
     """m is an ask (not a quoted or reported mention) about LLM provider credit."""
     return not _mentioned_not_asked(text, m) and _about_llm_credit(text, m)
+
+
+# Copied from plugins/coach/reply_check.py (CREDIT_NEGATED_RE); keep the two in step.
+# A sentence saying credit is NOT needed is not an ask (live false positive 2026-10-29: "So no credit top-up is
+# needed."). Only explicit not-needed forms are blanked before the search, so "No credits left, so a top-up is
+# needed", "No need to wait; add $250 of credit" and "... but add $250" still hold.
+_NEG_MONEY = r"(?:api\s+)?(?:credits?|credit balance|billing|funds|budget|money|top[- ]?up)"
+_NOT_NEEDED = r"(?:needed|required|necessary)"
+_NEG_GAP = r"(?:(?!\b(?:but|except|only|just|unless|until)\b)[^.\n;:,\u2013\u2014]){0,40}?"
+CREDIT_NEGATED_RE = re.compile(
+    r"\bno\s+(?:more\s+|extra\s+|additional\s+|new\s+)?" + _NEG_MONEY +
+    r"\b(?:\s+[\w-]+){0,2}?(?:\s+(?:is|are|was|were|gets|will\s+be))?\s+" + _NOT_NEEDED + r"\b"
+    r"|\bno\s+need\s+(?:to|for)\b" + _NEG_GAP + r"\b" + _NEG_MONEY + r"\b"
+    r"|\b(?:don[\u2019']t|doesn[\u2019']t|do\s+not|does\s+not|won[\u2019']t|will\s+not|never|no\s+longer)\s+"
+    r"need(?:s|ed)?\b" + _NEG_GAP + r"\b" + _NEG_MONEY + r"\b"
+    r"|\b" + _NEG_MONEY + r"\b(?:\s+[\w-]+){0,2}?\s+(?:is|are|was|were)(?:n[\u2019']t|\s+not|\s+no\s+longer)\s+" +
+    _NOT_NEEDED + r"\b"
+    # denials of an ask (self-heal agent-ddabb16633: "My reply had no credit or purchase ask"): "no credit (or X) ask",
+    # "not a credit ask", "no purchase", "I'm not asking you to buy ... credit", "I didn't ask you to buy credit"
+    r"|\bno\s+(?:credit|money|purchase|payment|spend(?:ing)?|top[- ]?up)s?\s+(?:or\s+[\w-]+\s+)?(?:ask|request)s?\b"
+    r"|\bnot\s+an?\s+(?:credit|money|purchase|payment|spend(?:ing)?|billing)\s+(?:ask|request)\b|\bno\s+purchases?\b"
+    r"|\b(?:not|never|didn[\u2019']t|did\s+not|don[\u2019']t|do\s+not|won[\u2019']t|will\s+not)\s+"
+    r"(?:ask(?:s|ed|ing)?|request(?:s|ed|ing)?)\s+(?:you\s+|david\s+|the\s+user\s+)?(?:to|for)\b" + _NEG_GAP + r"\b" +
+    _NEG_MONEY + r"\b"
+    # attribution, not money: "a Co-authored-by line to get credit"
+    r"|\b(?:get|gets|getting|got|take|takes|took|give|gives|gave|given|deserves?|claim)\s+"
+    r"(?:the\s+|some\s+|full\s+|proper\s+)?credit\b",
+    re.I)
 
 
 def _strings(v: Any):
@@ -196,6 +239,7 @@ def credit_ask(tool_name: str, args: Any) -> Optional[str]:
             continue
         # each field is its own paragraph, so one field never lends billing context to an unrelated other field
         text = "\n\n".join(_strings(a))
+        text = CREDIT_NEGATED_RE.sub(lambda n: " " * len(n.group(0)), text)
         m = next((m for m in CREDIT_ASK_RE.finditer(text) if _is_llm_credit_ask(text, m)), None)
         if m:
             return m.group(0)
