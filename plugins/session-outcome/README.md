@@ -79,6 +79,8 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - the gate asks once and passes the second miss (by nudge tag and by the in-memory backup), passes after a tool
   call, on a summary, on an undecided judge, and when a wait or an open step outranks;
 - non-interactive sources (cron, slack, Kanban worker) get no tool and no gate; tui and cli do;
+- a Desktop chat's turn admitted via the gateway `local` platform (no bound source) gets the tool from its
+  session row, the same predicate the gate uses, so the gate never asks for a call the chat cannot make;
 - the no-core no-op path.
 
 User-steps' `open_steps`, `add_step` and the assent-echo filter are tested in
