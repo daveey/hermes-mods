@@ -95,8 +95,15 @@ PROXY_5XX_RE = re.compile(r"<title>\s*5\d\d\b|\b5\d\d\s+(?:Bad Gateway|Service|G
                           r"Bad Gateway|Service (?:Temporarily )?Unavailable|Gateway Time-?out|"
                           r"Error code: 5\d\d\b|\bstatus(?:_code)?[\s:=]+5\d\d\b", re.I)
 EXC_BODY_LINES, EXC_BODY_CHARS = 20, 2000
-# Match only core's final offline exception, never generic DNS failures or a message quoting it.
-OFFLINE_EXC = "RuntimeError: Hermes can't reach the model provider. You may be offline."
+# Match only core's final offline exception, never generic DNS failures or a message quoting it. OFFLINE_MSG is core's
+# exact sentence (agent/api_error_summary.py `_summarize_api_error`; test_offline_message_matches_core pins it to the
+# producer). Callers re-wrap it (session_cron raises RuntimeError(result) -> "RuntimeError: RuntimeError: ..."), and
+# older cores stop after "You may be offline.", so allow repeated RuntimeError prefixes and the optional last sentence,
+# but nothing before or after (gateway-88d6cacec0: an exact match on the short text never matched a real line).
+OFFLINE_MSG = "Hermes can't reach the model provider. You may be offline. Check your internet connection and try again."
+_OFFLINE_HEAD, _OFFLINE_TAIL = OFFLINE_MSG.split(" Check ", 1)
+OFFLINE_EXC_RE = re.compile(r"(?:RuntimeError: )+" + re.escape(_OFFLINE_HEAD)
+                            + r"(?: " + re.escape("Check " + _OFFLINE_TAIL) + r")?")
 # The turn loop's terminal refusal (agent/conversation_loop.py): the turn dies on it with no traceback, so nothing else
 # files it (agent-c46bf512ae: 15 turns died on "Chat ownership lease is unavailable" and raised nothing). Provider
 # HTTP errors and provider stalls ride the same line; the provider/credit lanes own those.
@@ -417,7 +424,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                                    "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
                                                                    + block))[-1500:]})
             continue
-        if (TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line) or exc_line == OFFLINE_EXC
+        if (TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line) or OFFLINE_EXC_RE.fullmatch(exc_line)
                 or provider_5xx(exc_type, exc_line, _exc_body(block, exc_line))):
             continue
         last = exc_line or next((l for l in reversed(block) if l and not l[0].isspace()), "")  # socket.gaierror

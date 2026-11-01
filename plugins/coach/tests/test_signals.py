@@ -102,6 +102,79 @@ def test_offline_cron_summary_is_not_a_defect(traceback):
     assert sg.parse_errors(lines) == []
 
 
+# Core's real offline sentence (agent/api_error_summary.py `_summarize_api_error`). Pinned here so the suite runs
+# without core; test_offline_message_matches_core's producer fails if core rewords it.
+CORE_OFFLINE_MSG = ("Hermes can't reach the model provider. You may be offline. "
+                    "Check your internet connection and try again.")
+
+
+def _core_offline_message():
+    """Call core's producer with a real DNS failure and return the user-facing summary it builds."""
+    import os
+    root = Path(os.environ.get("HERMES_TEST_CORE") or Path.home() / ".hermes/hermes-agent")
+    src = root / "agent/api_error_summary.py"
+    if not src.exists():
+        if os.environ.get("HERMES_TEST_CORE"):
+            raise AssertionError(f"HERMES_TEST_CORE set but {src} is missing")
+        pytest.skip("Hermes core checkout not found")
+    sys.path.insert(0, str(root))
+    try:
+        from agent.api_error_summary import ApiErrorSummaryMixin
+    finally:
+        sys.path.remove(str(root))
+    err = RuntimeError("Connection error.")
+    err.__cause__ = OSError(8, "nodename nor servname provided, or not known")
+    return ApiErrorSummaryMixin._summarize_api_error(err)
+
+
+def test_offline_message_matches_core():
+    # Detection guard: the filter below keys on this sentence; a core rewording must break this test, not
+    # silently turn the filter dead again (gateway-88d6cacec0: the filter matched a shortened, invented text).
+    assert _core_offline_message() == CORE_OFFLINE_MSG
+    assert sg.OFFLINE_MSG == CORE_OFFLINE_MSG
+
+
+# The real MacBook gateway record (gateway.log 2026-10-30 20:35): session_cron re-raises the cron run's error,
+# so the exception line carries two "RuntimeError: " prefixes and core's full sentence.
+SESSION_CRON_TB = [
+    "2026-10-30 20:35:30,309 ERROR gateway.session_authority: Admitted turn 43969aeb035241e1a21079aae3538c75 failed",
+    "Traceback (most recent call last):",
+    '  File "/home/you/.hermes/hermes-agent/gateway/session_authority.py", line 1252, in _execute_claimed',
+    "    return await execute_finite_admission(self, ref, row), 'completed'",
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    '  File "/home/you/.hermes/hermes-agent/gateway/session_finite.py", line 81, in execute_finite_admission',
+    "    return await execute_admission(authority, ref, row)",
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    '  File "/home/you/.hermes/hermes-agent/gateway/session_ingress.py", line 242, in execute_admission',
+    "    return await execute(authority, ref, row, policy)",
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    '  File "/home/you/.hermes/hermes-agent/gateway/session_cron.py", line 312, in execute',
+    "    raise RuntimeError(result[3] or 'cron execution failed')",
+]
+
+
+@pytest.mark.parametrize("message", [
+    f"RuntimeError: {CORE_OFFLINE_MSG}",
+    f"RuntimeError: RuntimeError: {CORE_OFFLINE_MSG}",
+    "RuntimeError: RuntimeError: Hermes can't reach the model provider. You may be offline.",
+])
+def test_core_offline_sentence_is_not_a_defect(message):
+    lines = ["2026-10-22 08:00:00,000 ERROR cron.scheduler: Job 'example-monitor' failed",
+             "Traceback (most recent call last):",
+             '  File "/home/you/.hermes/hermes-agent/cron/scheduler.py", line 10, in run_job',
+             message]
+    assert sg.parse_errors(lines) == []
+
+
+def test_session_cron_offline_traceback_is_not_a_defect():
+    assert sg.parse_errors(SESSION_CRON_TB + [f"RuntimeError: RuntimeError: {CORE_OFFLINE_MSG}"]) == []
+
+
+def test_session_cron_other_runtime_error_still_files():
+    sigs = sg.parse_errors(SESSION_CRON_TB + ["RuntimeError: RuntimeError: cron job script exited 2"])
+    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("RuntimeError in execute (session_cron.py)")
+
+
 @pytest.mark.parametrize("traceback", [False, True])
 def test_provider_dns_misconfiguration_is_a_defect(traceback):
     message = ("provider host does not resolve while network is up: api.example.com "
@@ -123,6 +196,9 @@ def test_provider_dns_misconfiguration_is_a_defect(traceback):
     "(control host github.com resolves) — check the provider base_url",
     "RuntimeError: unexpected failure; Hermes can't reach the model provider. You may be offline.",
     "ValueError: Hermes can't reach the model provider. You may be offline.",
+    f"ValueError: {CORE_OFFLINE_MSG}",
+    f"RuntimeError: {CORE_OFFLINE_MSG} Retrying with a different base_url failed too.",
+    f"RuntimeError: RuntimeError: unexpected failure; {CORE_OFFLINE_MSG}",
 ])
 def test_offline_suppression_does_not_hide_other_errors(message):
     lines = ["2026-10-22 08:00:00,000 ERROR cron.scheduler: Job 'example-monitor' failed",
