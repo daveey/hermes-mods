@@ -63,6 +63,10 @@ Probe **all models on all credentials** and report the matrix. Partial availabil
 - For each account that succeeds live but remains blocked locally, use `hermes auth reset anthropic <exact-entry-id>`; this clears model cooldowns without rotating tokens. Leave genuinely failing accounts untouched. Read back pool state, then exercise `hermes chat --provider anthropic -m <tested-model> --oneshot --ignore-rules -t '' --max-turns 1 --run-budget 45 -Q -q 'Reply with exactly: pool-ok. Do not use any tools.'` and confirm the logged provider is Anthropic, not a fallback.
 - An enabled `fast-rate-limit-fallback` plugin may still be inactive: run its `check.py` with the managed Hermes Python and inspect `wrappers_active`. After upgrades, AST compatibility guards can disable wrappers while the plugin list still reports enabled. Do not replace compatibility fingerprints without auditing changed core behavior and rerunning regression tests.
 
+### Managed workers versus direct CLI
+
+When a direct CLI call rotates successfully but a Kanban/managed turn repeats one account's 429, inspect the agent-construction handoff before changing grants or relay state. Carry the resolver's `credential_pool` along with its bearer into the managed agent; preserve explicit launch-key authority, fallback-provider boundaries and deferred class routing. Test real managed construction followed by real pool recovery for both providers. A CLI probe can persist cooldowns and make later managed probes pass without fixing rotation: live acceptance must begin with an authorized reset of a known-walled first row and show 429 → account switch → completion within the same managed run. Do not treat an unscoped `all exhausted or empty` log line as evidence that the requested provider is out.
+
 ### 3b. Verify account-selection and rotation plugins together
 
 - Test actual configured PluginManager discovery with both account-selection and fast-rate-limit-fallback enabled, not just each plugin's isolated suite. Wrapping a shared recovery function can make another plugin's fingerprint guard refuse installation even when core source is unchanged.
