@@ -51,7 +51,8 @@ Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
 Owned prompts: each job gets one detached job-local watchdog (this file run with --watchdog, polling every 15 s,
 bounded to max age + 2 min). handle() spawns it and runner.sh starts it (and waits for it) before the command,
 so a job made by create_job() directly is covered too; watchdog.lock keeps it to one per job. Every
-run_in_user_terminal call (new or resume) also sweeps non-final jobs, so old jobs without a watchdog are
+run_in_user_terminal call (new or resume) also sweeps jobs, including final outcomes whose blocked asks still
+need reconciliation, so old jobs without a watchdog are
 reconciled: no window after LAUNCH_GRACE_S -> start gate fenced, then abandoned (nothing ran). It withdraws the job
 at once when the owning card is done/archived or a later unattached run ends with completed, blocked, scheduled
 or review_requested. All other outcomes (including NULL/unknown) get grace, not immediate withdrawal. Board
@@ -285,7 +286,12 @@ def worker_identity_keys() -> tuple[str, ...]:
 def launch_env() -> dict[str, str]:
     """os.environ without the Kanban worker identity: the environment for every app this plugin launches."""
     drop = set(worker_identity_keys())
-    return {k: v for k, v in os.environ.items() if k not in drop}
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    import sys
+    core = getattr(sys.modules.get("hermes_cli"), "__file__", None)
+    if core:
+        env["HERMES_USER_TERMINAL_CORE_ROOT"] = str(Path(core).resolve().parent.parent)
+    return env
 
 
 def _unset_prefix() -> str:
@@ -1350,7 +1356,125 @@ def _runner_gone(job: Path, st: dict, seen: dict, legacy: bool) -> bool:
     return True
 
 
+def _kanban_api():
+    """Lazy core access for a bare-Python watchdog; never replace active modules.
+
+    Detached launchers carry the parent's core root. Older jobs use the installed
+    root. Only a fresh core graph activates its committed dependency environment;
+    an already-loaded backend keeps its own modules and dependency selection.
+    """
+    import importlib.util
+    import sys
+
+    if "hermes_cli" not in sys.modules:
+        spec = importlib.util.find_spec("hermes_cli")
+        if spec is None:
+            root = _home()
+            if root.parent.name == "profiles":
+                root = root.parent.parent
+            candidates = [os.environ.get("HERMES_USER_TERMINAL_CORE_ROOT"),
+                          os.environ.get("HERMES_CORE_CHECKOUT"), root / "hermes-agent",
+                          Path.home() / ".hermes" / "hermes-agent"]
+            for candidate in candidates:
+                if candidate and (Path(candidate) / "hermes_cli" / "__init__.py").is_file():
+                    sys.path.insert(0, str(Path(candidate).resolve()))
+                    spec = importlib.util.find_spec("hermes_cli")
+                    break
+        if spec is None or not spec.origin:
+            raise ImportError("user-terminal watchdog cannot locate Hermes core")
+        root = Path(spec.origin).resolve().parent.parent
+        # Unlike hermes_bootstrap this does not relaunch or change the command.
+        from pm.environments import activate_dependencies
+        activate_dependencies(root)
+    from hermes_cli import kanban_db
+    from hermes_cli.kanban_human_request_migration import classify_parked_request
+    return kanban_db, classify_parked_request
+
+
+def reconcile_closed_ask(job: Path, st: dict) -> None:
+    """Amend only the action of a still-parked owner; errors never change job results.
+
+    One board transaction covers eligibility, classification and the per-job audit
+    marker. The attachment lock serializes against a resumed run's publication.
+    Core write_txn enforces descendant fences; no worker identity is removed here.
+    """
+    status = st.get("status")
+    if status not in ("failed", "abandoned") and not (
+            status == "withdrawn" and str(st.get("reason", "")).startswith("expired after ")):
+        return
+    con = None
+    locked = False
+    try:
+        import sqlite3
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        _, owner = _job_meta_owner(job)
+        task, path = owner.get("task_id") or owner.get("task"), owner.get("db")
+        if owner.get("kind") != "card" or not task or not path:
+            return
+        # Leave worker guards intact; the already-detached watchdog owns retries.
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return
+        locked = _attach_lock(job)
+        if not locked:
+            return
+        att = read_attachment(job, owner)
+        original_run = owner.get("run_id")
+        if att and (original_run is None or int(att["run_id"]) > int(original_run)):
+            return
+        db, classify = _kanban_api()
+        db._assert_not_delegated_child_mutation(Path(path))
+        # Never create or migrate a board merely to reconcile a job.
+        from hermes_cli.kanban_lockguard import connect
+        con = connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        marker = f"[user-terminal:closed:{job.name}]"
+        with db.write_txn(con):
+            row = con.execute("SELECT status, current_run_id, human_request FROM tasks WHERE id=?",
+                              (task,)).fetchone()
+            if not row or row["status"] != "blocked" or row["current_run_id"] is not None:
+                return
+            request = json.loads(row["human_request"]) if row["human_request"] else None
+            if not isinstance(request, dict) or not isinstance(request.get("action"), str):
+                return
+            if con.execute("SELECT 1 FROM task_comments WHERE task_id=? AND instr(body, ?)>0",
+                           (task, marker)).fetchone():
+                return
+            # Final-file mtime also gives old jobs a stable end time across retries.
+            final = job / "final.lock" / "result.json"
+            ended = (final if final.exists() else job / "status.json").stat().st_mtime
+            local = datetime.fromtimestamp(ended, ZoneInfo("America/Los_Angeles"))
+            action = (f"window closed {local:%H:%M %Z}. Unblock = agent reopens window; "
+                      "archive = drop request.")
+            amended = {**request, "action": action}
+            cause = st.get("reason") or st.get("error") or status
+            reason = f"Terminal job {job.name} ended: {status}: {cause}; {local.isoformat()}"
+            if classify(con, task, human_request=amended, actor="user-terminal", reason=reason):
+                stored = con.execute("SELECT human_request FROM tasks WHERE id=?", (task,)).fetchone()[0]
+                if json.loads(stored) != amended:
+                    raise ValueError("classification altered fields beyond human_request.action")
+                db.add_comment(con, task, "user-terminal", f"{marker} {reason}. {action}")
+    except Exception:
+        log.exception("user_terminal: blocked ask reconciliation failed for %s; will retry on sweep", job.name)
+    finally:
+        try:
+            if con is not None:
+                con.close()
+            if locked:
+                _attach_unlock(job)
+        except Exception:
+            log.exception("user_terminal: reconciliation cleanup failed for %s", job.name)
+
+
 def watch_once(job: Path, seen: dict) -> dict | None:
+    result = _watch_once(job, seen)
+    if result and result.get("status") in FINAL:
+        reconcile_closed_ask(job, result)
+    return result
+
+
+def _watch_once(job: Path, seen: dict) -> dict | None:
     """One watchdog / sweep pass. Returns the final status if the job is (now) over, else None (a non-final dict
     when a withdrawal could not be done, e.g. a live legacy runner).
 
@@ -1395,14 +1519,12 @@ def watch_once(job: Path, seen: dict) -> dict | None:
 
 
 def sweep_jobs(skip: Path | None = None) -> None:
-    """Reconcile every non-final job (old ones may have no watchdog). Cheap for finished jobs; never raises."""
+    """Reconcile jobs including old final outcomes whose blocked asks may still be stale; never raises."""
     try:
         jobs = [p for p in jobs_dir().iterdir() if p.is_dir() and p != skip]
     except OSError:
         return
     for job in jobs:
-        if (job / "final.lock").exists():
-            continue
         try:
             watch_once(job, {})
         except Exception:
@@ -1477,7 +1599,9 @@ def watchdog(job: Path, interval: float = WATCH_INTERVAL_S, max_s: float | None 
 def _watchdog_script() -> str:
     import sys
 
-    return (f"#!/bin/bash\n# this job's watchdog (one per job; see watchdog.lock)\n"
+    root = launch_env().get("HERMES_USER_TERMINAL_CORE_ROOT", "")
+    export = f"export HERMES_USER_TERMINAL_CORE_ROOT={shlex.quote(root)}\n" if root else ""
+    return (f"#!/bin/bash\n# this job's watchdog (one per job; see watchdog.lock)\n" + export +
             f"exec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} --watchdog \"$1\"\n")
 
 
