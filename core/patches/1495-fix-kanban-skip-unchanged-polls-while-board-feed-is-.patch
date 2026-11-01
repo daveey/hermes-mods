@@ -1,0 +1,278 @@
+From f9032bae52d2683e28eeee808bbb3d86cd9e7fef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:55:18 +0000
+Subject: [PATCH] fix(kanban): skip unchanged polls while board feed is
+ connected [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              |  17 ++-
+ hermes_cli/kanban_sync_work.py                |  30 +++-
+ .../test_kanban_sync_connected_feed.py        | 133 ++++++++++++++++++
+ 3 files changed, 173 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_connected_feed.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 01778d2e9bd..2fc5fe26059 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -726,9 +726,11 @@ class FeedWatcher:
+     ``ping_s`` and reconnects with backoff; polling still covers a closed socket."""
+ 
+     def __init__(self, ident: Identity, board: str, wake: threading.Event, keep_running: Callable[[], bool],
+-                 ping_s: float = 25.0, on_change: Optional[Callable[[str], None]] = None) -> None:
++                 ping_s: float = 25.0, on_change: Optional[Callable[[str], None]] = None,
++                 on_state: Optional[Callable[[str, bool], None]] = None) -> None:
+         self.ident, self.board, self.wake, self.keep_running, self.ping_s = ident, board, wake, keep_running, ping_s
+         self.on_change = on_change
++        self.on_state = on_state
+         self.frames = 0
+ 
+     def url(self) -> str:
+@@ -750,6 +752,8 @@ class FeedWatcher:
+                                                              "user-agent": "hermes-kanban-sync/1"},
+                              open_timeout=HTTP_TIMEOUT_S, logger=ws_logger()) as ws:
+                     backoff = 1.0
++                    if self.on_state is not None:
++                        self.on_state(self.board, True)
+                     if self.on_change is not None:
+                         self.on_change(self.board)
+                         self.wake.set()  # reconnects must catch changes missed while disconnected
+@@ -769,6 +773,8 @@ class FeedWatcher:
+                                 self.on_change(self.board)
+                             self.wake.set()
+             except Exception as exc:  # health: allow BLE001 -- any socket failure: back off and reconnect; polling covers the gap
++                if self.on_state is not None:
++                    self.on_state(self.board, False)
+                 _log.info("kanban sync: %s feed socket closed (%s: %s); reconnecting in %.0fs",
+                           self.board, type(exc).__name__, exc, backoff)
+                 deadline = time.monotonic() + backoff
+@@ -945,8 +951,9 @@ def wait_for_work(wake: threading.Event, paths: Iterable[Path], period: float,
+ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = None,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
+     """The gateway's sync loop (call from a worker thread). Installs the lease client for primary boards, holds one
+-    feed socket per synced board, and runs a round when the Board reports a change, a local change is waiting, or
+-    the poll period passes."""
++    feed socket per synced board. Connected boards pull on feed/local invalidation; disconnected boards and
++    failed pulls retain the poll period. An independent full recovery audits all boards at least every 60s
++    (or the configured period if longer), subject to in-flight IO and the next poll tick."""
+     try:
+         ident = load_identity()
+     except SyncUnavailable as exc:
+@@ -967,11 +974,13 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+         boards = board_paths()
+         for slug, _path in boards:
+             if slug not in watchers or not watchers[slug].is_alive():
+-                watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed)
++                watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed,
++                                      on_state=work.feed_state)
+                 watchers[slug] = threading.Thread(target=watcher.run, daemon=True, name=f"kanban-feed-{slug}")
+                 watchers[slug].start()
+         selected = work.select(boards, time.monotonic(), outbox_pending)
+         for r in sync_all_once(hub, boards=selected):
++            work.finished(r.board, not r.error)
+             if r.push and (r.push.sent or r.push.rejected):
+                 _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+                           r.push.sent, r.push.rejected)
+diff --git a/hermes_cli/kanban_sync_work.py b/hermes_cli/kanban_sync_work.py
+index d613f661da3..035736636c9 100644
+--- a/hermes_cli/kanban_sync_work.py
++++ b/hermes_cli/kanban_sync_work.py
+@@ -1,4 +1,4 @@
+-"""Board-specific feed invalidation, with a fixed full-recovery deadline."""
++"""Feed-keyed invalidation, disconnected polling and independent full recovery."""
+ from __future__ import annotations
+ 
+ import threading
+@@ -10,6 +10,9 @@ class SyncWork:
+     def __init__(self, period: float) -> None:
+         self.period = period
+         self.deadline = 0.0
++        self._recovery_deadline = 0.0
++        self._connected: set[str] = set()
++        self._failed: set[str] = set()
+         self._lock = threading.Lock()
+         self._dirty: set[str] = set()
+         self._known: set[tuple[str, Path]] = set()
+@@ -18,17 +21,38 @@ class SyncWork:
+         with self._lock:
+             self._dirty.add(board)
+ 
++    def feed_state(self, board: str, connected: bool) -> None:
++        with self._lock:
++            if connected:
++                self._connected.add(board)
++            else:
++                self._connected.discard(board)
++
++    def finished(self, board: str, success: bool) -> None:
++        # Only the sync thread owns this set; feed callbacks never clear retries.
++        if success:
++            self._failed.discard(board)
++        else:
++            self._failed.add(board)
++
+     def select(self, boards: list[tuple[str, Path]], now: float,
+                pending: Callable[[list[Path]], bool]) -> list[tuple[str, Path]]:
+         # Consume before starting IO: an event arriving during that IO remains dirty
+         # for the next round, even if its event notification is coalesced.
+         with self._lock:
+             dirty, self._dirty = self._dirty, set()
++            connected = self._connected.copy()
+         current = set(boards)
+         new = current - self._known
+         self._known = current
+-        if now >= self.deadline:
++        poll = now >= self.deadline
++        if poll:
+             self.deadline = now + self.period
++        if now >= self._recovery_deadline:
++            # Connected boards invalidate through feed frames, not a timer-only TTL.
++            # Retain an independent safety audit for an undetected missed frame.
++            self._recovery_deadline = now + max(60.0, self.period)
+             return boards
+         return [(slug, path) for slug, path in boards
+-                if (slug, path) in new or slug in dirty or pending([path])]
++                if (slug, path) in new or slug in dirty
++                or (poll and (slug not in connected or slug in self._failed)) or pending([path])]
+diff --git a/tests/hermes_cli/test_kanban_sync_connected_feed.py b/tests/hermes_cli/test_kanban_sync_connected_feed.py
+new file mode 100644
+index 00000000000..9ae61072ffb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_connected_feed.py
+@@ -0,0 +1,133 @@
++"""Connected feed generations replace unchanged fallback pulls, not delivery."""
++from pathlib import Path
++from types import SimpleNamespace
++import threading
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++
++
++def test_real_feed_publishes_connected_and_disconnected_state():
++    from websockets.sync.server import serve
++    close_socket = threading.Event()
++    connected = threading.Event()
++    disconnected = threading.Event()
++    stop = threading.Event()
++    states = []
++    changes = []
++
++    def handler(ws):
++        if close_socket.wait(10):
++            ws.close()
++
++    def state(board, live):
++        states.append((board, live))
++        if live:
++            connected.set()
++        else:
++            stop.set()
++            disconnected.set()
++
++    with serve(handler, '127.0.0.1', 0) as server:
++        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
++        server_thread.start()
++        ident = client.Identity(f'http://127.0.0.1:{server.socket.getsockname()[1]}', 'test', 'gateway')
++        watcher = client.FeedWatcher(ident, 'one', threading.Event(), lambda: not stop.is_set(),
++                                     on_change=changes.append, on_state=state)
++        thread = threading.Thread(target=watcher.run, daemon=True)
++        thread.start()
++        try:
++            assert connected.wait(5)
++            close_socket.set()
++            assert disconnected.wait(5)
++            assert states == [('one', True), ('one', False)]
++            assert changes == ['one']
++        finally:
++            stop.set()
++            close_socket.set()
++            server.shutdown()
++            thread.join(5)
++            server_thread.join(5)
++        assert not thread.is_alive()
++
++
++def test_failed_pull_retries_without_new_feed_and_success_clears_retry():
++    from hermes_cli.kanban_sync_work import SyncWork
++    work = SyncWork(5)
++    boards = [('one', Path('one')), ('two', Path('two'))]
++    for slug, _ in boards:
++        work.feed_state(slug, True)
++    assert work.select(boards, 100, lambda _: False) == boards
++    # Model a failed GET after the feed event was consumed, no further events.
++    getattr(work, 'finished', lambda *args: None)('one', False)
++    assert work.select(boards, 101, lambda _: False) == []
++    assert work.select(boards, 105, lambda _: False) == boards[:1]
++    work.finished('one', True)
++    assert work.select(boards, 110, lambda _: False) == []
++    # The independent safety audit cannot be postponed by frequent events.
++    work.changed('one')
++    assert work.select(boards, 159, lambda _: False) == boards[:1]
++    assert work.select(boards, 160, lambda _: False) == boards
++
++
++@pytest.mark.parametrize('fail_first', [False, True])
++def test_connected_feed_skips_unchanged_poll_and_observes_next_change(monkeypatch, fail_first):
++    boards = [(s, Path(s)) for s in ('connected', 'offline')]
++    clock = [100.0]
++    rounds = [[]]
++    callbacks = {}
++    pending = set()
++    monkeypatch.setattr(client, 'load_identity', lambda: client.Identity('https://example.com', 'test', 'gateway'))
++    monkeypatch.setattr(client, 'board_paths', lambda: boards)
++    monkeypatch.setattr(client.sync, 'set_lease_client', lambda _: None)
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda _: None)
++    monkeypatch.setattr(client, 'reconcile_links', lambda *args: None)
++    monkeypatch.setattr(client, 'outbox_pending', lambda paths: any(p in pending for p in paths))
++    monkeypatch.setattr(client, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
++    from hermes_cli import machine_metrics
++    monkeypatch.setattr(machine_metrics, 'Reporter', lambda _: SimpleNamespace(report_due=lambda: None))
++
++    class Watcher:
++        def __init__(self, ident, board, wake, keep_running, **kwargs):
++            callbacks[board] = kwargs
++            if board == 'connected':
++                kwargs.get('on_state', lambda *a: None)(board, True)
++        def run(self):
++            pass
++
++    class Thread:
++        def __init__(self, **kwargs):
++            pass
++        def start(self):
++            pass
++        def is_alive(self):
++            return True
++
++    monkeypatch.setattr(client, 'threading', SimpleNamespace(Thread=Thread, Event=threading.Event))
++    monkeypatch.setattr(client, 'FeedWatcher', Watcher)
++    def sync_board(slug, *args):
++        rounds[-1].append(slug)
++        error = 'temporary GET failure' if fail_first and slug == 'connected' and len(rounds) == 1 else None
++        return client.RoundResult(board=slug, mode='primary', error=error)
++    monkeypatch.setattr(client, 'sync_board', sync_board)
++    def wait(*args):
++        n = len(rounds)
++        clock[0] = [105, 106, 107, 110, 111, 112, 160][n-1]
++        if n == 2:
++            callbacks['connected']['on_change']('connected')
++        if n == 3:
++            pending.add(Path('connected'))
++        if n == 4:
++            pending.clear()
++            callbacks['connected'].get('on_state', lambda *a: None)('connected', False)
++        if n == 5:
++            callbacks['connected'].get('on_state', lambda *a: None)('connected', True)
++            callbacks['connected']['on_change']('connected')
++        rounds.append([])
++        return 'period'
++    monkeypatch.setattr(client, 'wait_for_work', wait)
++    client.run_forever(lambda: len(rounds) < 8, interval=5)
++    assert rounds[:7] == [
++        ['connected', 'offline'], ['connected', 'offline'] if fail_first else ['offline'], ['connected'], ['connected'],
++        ['connected', 'offline'], ['connected'], [],
++    ]
+-- 
+2.55.0
+

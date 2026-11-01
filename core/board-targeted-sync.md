@@ -6,6 +6,8 @@ A feed change wakes synchronization for that board, not every known board. Newly
 
 Unchanged outbox checks reuse their answer using the same SQLite connection's `data_version`; a committed change is read on the next tick. Replacement of the database or a read error invalidates the cached answer. This is not a timer-only cache.
 
+Connected feeds now suppress unchanged fallback polls. Disconnected feeds and failed HTTP rounds retain the configured poll cadence; feed changes, reconnects and local outbox writes still select the next tick. An independent full recovery runs every 60 seconds (or the configured period if longer), without postponement by events.
+
 ## How it works
 
 `SyncWork` retains a locked dirty-board set and consumes it before I/O. `FeedWatcher` marks its board on connection/reconnection and received change frames. The sync loop unions dirty/new boards with locally pending outboxes and passes the selection into `sync_all_once`. Periodic recovery keeps a fixed deadline independent of frequent event wakes.
@@ -14,7 +16,7 @@ Unchanged outbox checks reuse their answer using the same SQLite connection's `d
 
 - `hermes_cli/kanban_sync_work.py`: selection and deadline state.
 - `hermes_cli/kanban_sync_client.py`: feed callback, selected rounds and `_BoardWatch` answer invalidation.
-- Patches 1493–1494; originating PR #500.
+- Patches 1493–1495; originating PRs #500 and #502.
 
 ## Tests
 
@@ -26,6 +28,8 @@ Executed with the canonical core runner: 21 sync/metrics/worker-node test files,
 - Cache-disabled mutation fails both unchanged-query cases; restored code passes. The pre-fix integration test pulled all sibling boards and failed.
 
 ## Applying
+
+Patch 1495 passed 314 tests across 22 sync/metrics/worker-node files and all 15 check gates. Exact head `f9032bae52d2683e28eeee808bbb3d86cd9e7fef` passed all eight Python CI shards and [the required aggregate](https://github.com/daveey/hermes/actions/runs/41313658015/job/124874240085). `test_kanban_sync_connected_feed.py` exercises unchanged healthy-feed ticks, next changes/local writes, disconnect fallback, reconnect selection, failed-round retry and independent recovery. A real WebSocket server exercises connect/disconnect state publication. Actual wire reconnection is not separately tested. Both unchanged-poll and lost-retry regressions were observed RED before their fixes.
 
 Apply as part of the verified full mirror series; see the README's current replay recipe. These patches depend on earlier synchronization changes.
 
