@@ -25,7 +25,8 @@ Every gh/git call is bounded by CALL_TIMEOUT_S, so a hung call can't outlive the
 --dispatch: on a stall, `gh workflow run` each --workflow (at most twice) and
 keep waiting instead of exiting 1.
 
-Run it from inside the repo checkout (needs `git` and an authenticated `gh`).
+Run it from inside the repo checkout (needs `git` and an authenticated `gh`). From any other directory,
+--gh-repo OWNER/NAME uses that repo's ~/code/<name> checkout; without one it exits 1 at once.
 Start it as a background process with completion notification and end the turn:
 it prints only state changes and one final line.
 """
@@ -171,20 +172,46 @@ def list_runs(repo: Path, branch: str, workflows: list[str], slug: str | None = 
     return runs
 
 
-def resolve_repo(repo: Path) -> Path:
-    """--repo is a local checkout. An `owner/name` slug (a common mix-up) maps to ~/code/<name> when that checkout's
-    origin is the same GitHub repo; otherwise fail with a clear message instead of a git traceback."""
-    if repo.is_dir():
+def is_checkout(path: Path) -> bool:
+    out = subprocess.run(["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
+def checkout_for(slug: str) -> Path | None:
+    """~/code/<name> when that checkout's `origin` is the GitHub repo `slug` (OWNER/NAME), else None.
+
+    The origin is compared as a parsed OWNER/NAME, not by suffix: a suffix test took `xme/proj` for `me/proj`."""
+    parts = slug.strip("/").split("/")
+    if len(parts) != 2 or not all(parts):
+        return None
+    guess = Path.home() / "code" / parts[1]
+    if guess.is_dir() and (gh_repo(guess) or "").lower() == "/".join(parts).lower():
+        return guess
+    return None
+
+
+def resolve_repo(repo: Path, slug: str | None = None) -> Path:
+    """The checkout to run git in. `repo` is --repo (default: the current directory); `slug` is --gh-repo.
+
+    - a directory inside a git checkout is used as is;
+    - an `owner/name` slug given as --repo (a common mix-up) maps to its ~/code/<name> checkout;
+    - a directory that is not a checkout (e.g. a wait started from ~) uses the ~/code/<name> checkout of --gh-repo.
+      It used to be passed through unchecked, so the wait died on its first `git fetch` with a traceback;
+    - anything else exits 1 at once with a clear message, before any git or gh call."""
+    if repo.is_dir() and is_checkout(repo):
         return repo
-    parts = str(repo).strip("/").split("/")
-    if len(parts) == 2 and all(parts):
-        guess = Path.home() / "code" / parts[1]
-        if guess.is_dir():
-            out = subprocess.run(["git", "-C", str(guess), "remote", "get-url", "origin"], capture_output=True, text=True)
-            url = out.stdout.strip().removesuffix(".git").lower()
-            if out.returncode == 0 and url.endswith("/".join(parts).lower()):
-                return guess
-    raise SystemExit(f"--repo {repo}: not a local checkout. Pass the checkout path (e.g. ~/code/<name>), not owner/name.")
+    if not repo.is_dir():
+        guess = checkout_for(str(repo))
+        if guess is not None:
+            return guess
+        raise SystemExit(f"--repo {repo}: not a local checkout. Pass the checkout path (e.g. ~/code/<name>), not owner/name.")
+    guess = checkout_for(slug) if slug else None
+    if guess is not None:
+        print(f"{repo} is not a git checkout; using {guess}, the checkout of {slug}", file=sys.stderr, flush=True)
+        return guess
+    hint = f"; no ~/code/<name> checkout has origin {slug}" if slug else ""
+    raise SystemExit(f"--repo {repo}: not a git checkout{hint}. Run this from inside the repo's checkout or pass "
+                     "--repo <checkout path>.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -200,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dispatch", action="store_true")
     p.add_argument("--gh-repo", help="OWNER/NAME for gh (default: the checkout's origin remote)")
     a = p.parse_args(argv)
-    repo = resolve_repo(a.repo)
+    repo = resolve_repo(a.repo, a.gh_repo)
     slug = a.gh_repo or gh_repo(repo)
 
     def fetch():

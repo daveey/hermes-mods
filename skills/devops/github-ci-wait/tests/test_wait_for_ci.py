@@ -67,19 +67,25 @@ class ResolveRepoTests(unittest.TestCase):
         self.home = Path(tempfile.mkdtemp())
         self.old_home = os.environ.get("HOME")
         os.environ["HOME"] = str(self.home)
+        # A temp dir that happens to sit inside some checkout must still count as "not a checkout".
+        self.old_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.home.parent)
         repo = self.home / "code" / "proj"
         repo.mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:me/proj.git"], check=True)
         self.repo = repo
+        self.plain = self.home / "plain"  # a directory that is not a checkout, like ~
+        self.plain.mkdir()
 
     def tearDown(self):
         import os
         import shutil
-        if self.old_home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self.old_home
+        for key, old in (("HOME", self.old_home), ("GIT_CEILING_DIRECTORIES", self.old_ceiling)):
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
         shutil.rmtree(self.home, ignore_errors=True)
 
     def test_checkout_path_is_used_as_is(self):
@@ -92,6 +98,55 @@ class ResolveRepoTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as e:
             w.resolve_repo(Path("someone/proj"))
         self.assertIn("not a local checkout", str(e.exception))
+
+    def test_plain_directory_with_gh_repo_uses_that_repos_checkout(self):
+        # A wait started from ~ with --gh-repo used to be handed ~ itself and died on its first `git fetch`.
+        self.assertEqual(w.resolve_repo(self.plain, "me/proj"), self.repo)
+
+    def test_plain_directory_without_a_matching_checkout_fails_clearly(self):
+        for slug in (None, "someone/proj"):
+            with self.assertRaises(SystemExit) as e:
+                w.resolve_repo(self.plain, slug)
+            self.assertIn("not a git checkout", str(e.exception))
+
+    def test_origin_must_match_exactly_not_by_suffix(self):
+        import subprocess
+        subprocess.run(["git", "-C", str(self.repo), "remote", "set-url", "origin", "git@github.com:xme/proj.git"],
+                       check=True)
+        with self.assertRaises(SystemExit):
+            w.resolve_repo(Path("me/proj"))
+        with self.assertRaises(SystemExit):
+            w.resolve_repo(self.plain, "me/proj")
+
+    def _main_in_plain_cwd(self, argv, git_side_effect=None):
+        import os
+        from unittest import mock
+        old = os.getcwd()
+        os.chdir(self.plain)
+        try:
+            with mock.patch.object(w, "git", side_effect=git_side_effect) as git:
+                try:
+                    w.main(argv)
+                except (SystemExit, RuntimeError) as e:
+                    return git, e
+                return git, None
+        finally:
+            os.chdir(old)
+
+    def test_cli_from_a_plain_cwd_runs_git_in_the_gh_repo_checkout(self):
+        # Entry path: the CLI with --repo omitted, i.e. the current directory.
+        def stop(repo, *args):
+            raise RuntimeError("stop after the first git call")
+        git, err = self._main_in_plain_cwd(["abc1234", "--gh-repo", "me/proj", "--once"], stop)
+        self.assertIsInstance(err, RuntimeError)
+        self.assertEqual(git.call_args_list[0].args[0], self.repo)
+        self.assertEqual(git.call_args_list[0].args[1], "fetch")
+
+    def test_cli_from_a_plain_cwd_without_a_checkout_exits_before_any_git_call(self):
+        git, err = self._main_in_plain_cwd(["abc1234", "--gh-repo", "someone/proj", "--once"])
+        self.assertIsInstance(err, SystemExit)
+        self.assertIn("not a git checkout", str(err))
+        git.assert_not_called()
 
 
 class GhRepoTests(unittest.TestCase):
@@ -214,7 +269,7 @@ class BoundedCallTests(unittest.TestCase):
 
         def fake_git(repo, *args):
             return "c" * 40 if args[0] == "rev-parse" else ""
-        with mock.patch.object(w, "resolve_repo", side_effect=lambda p: p), \
+        with mock.patch.object(w, "resolve_repo", side_effect=lambda p, slug=None: p), \
                 mock.patch.object(w, "git", side_effect=fake_git), \
                 mock.patch.object(w, "make_contains", return_value=lambda commit, sha: True), \
                 mock.patch.object(w, "list_runs", side_effect=listings), \

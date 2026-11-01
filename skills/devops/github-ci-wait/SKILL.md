@@ -42,6 +42,8 @@ branch, check the pinned branch back out, and carry on in a worktree.
 ## Use the script
 
 `scripts/wait_for_ci.py` (in this skill's dir). Run it from inside the repo checkout; it needs `git` and an authenticated `gh`.
+From any other directory (e.g. `~`), `--gh-repo OWNER/NAME` makes it use that repo's `~/code/<name>` checkout (exact
+`origin` match); with no such checkout it exits 1 at once, before any git or gh call.
 
 ```bash
 S=<this skill dir>/scripts/wait_for_ci.py
