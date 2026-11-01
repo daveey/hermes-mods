@@ -1,0 +1,409 @@
+From 12f4138d509d41276a2646eed23590de2963adc1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 06:21:02 +0000
+Subject: [PATCH] perf(profiles): reuse unchanged session scans without a TTL
+ [daveey]
+
+---
+ hermes_cli/profile_session_scan_cache.py      |  80 +++++++++++
+ hermes_cli/web_routers/profiles.py            |  32 +++--
+ .../test_profile_session_scan_cache.py        |  95 +++++++++++++
+ .../test_profiles_sessions_scan_cache.py      | 132 ++++++++++++++++++
+ 4 files changed, 327 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/profile_session_scan_cache.py
+ create mode 100644 tests/hermes_cli/test_profile_session_scan_cache.py
+ create mode 100644 tests/hermes_cli/test_profiles_sessions_scan_cache.py
+
+diff --git a/hermes_cli/profile_session_scan_cache.py b/hermes_cli/profile_session_scan_cache.py
+new file mode 100644
+index 00000000000..3efc5161413
+--- /dev/null
++++ b/hermes_cli/profile_session_scan_cache.py
+@@ -0,0 +1,80 @@
++"""Bounded, change-keyed DB projections for aggregate session polls (no TTL).
++
++The caller holds the scan lock for *all* operations. Observer connections never
++hold a read transaction, and only observe data_version: every writer (including
++writers in this process) uses another connection. Reopening an observer discards
++its projections, since data_version is comparable only on the same connection.
++"""
++import copy
++import sqlite3
++from collections import OrderedDict
++from pathlib import Path
++
++
++def _identity(path):
++    stat = path.stat()
++    return stat.st_dev, stat.st_ino
++
++
++class ProfileSessionScanCache:
++    def __init__(self, max_profiles=64, max_queries=16):
++        self.max_profiles = max_profiles
++        self.max_queries = max_queries
++        self._profiles = OrderedDict()
++
++    def _drop(self, path):
++        entry = self._profiles.pop(path, None)
++        if entry is not None:
++            entry[1].close()
++
++    def clear(self):
++        for path in list(self._profiles):
++            self._drop(path)
++
++    def _observe(self, path):
++        identity = _identity(path)
++        entry = self._profiles.get(path)
++        if entry is not None and entry[0] != identity:
++            self._drop(path)
++            entry = None
++        if entry is None:
++            conn = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True,
++                                   check_same_thread=False, isolation_level=None, timeout=0)
++            entry = (identity, conn, OrderedDict())
++            self._profiles[path] = entry
++        self._profiles.move_to_end(path)
++        while len(self._profiles) > self.max_profiles:
++            self._drop(next(iter(self._profiles)))
++        version = entry[1].execute('PRAGMA data_version').fetchone()[0]
++        # Include identity to notice a file replacement between the two probes.
++        return entry, (identity, version)
++
++    def read(self, home, key, scan):
++        if home is None:
++            return scan()
++        path = (Path(home) / 'state.db').absolute()
++        try:
++            entry, before = self._observe(path)
++        except (OSError, sqlite3.Error):
++            self._drop(path)
++            return scan()  # preserve the normal missing/corrupt/retry error path
++        queries = entry[2]
++        cached = queries.get(key)
++        if cached is not None and cached[0] == before:
++            queries.move_to_end(key)
++            return copy.deepcopy(cached[1])
++        # Invalidate before scanning, including when a failed scan returns None.
++        for old in [k for k, value in queries.items() if value[0] != before]:
++            del queries[old]
++        result = scan()
++        try:
++            after_entry, after = self._observe(path)
++        except (OSError, sqlite3.Error):
++            self._drop(path)
++            return result
++        if result is not None and after_entry is entry and before == after:
++            queries[key] = (before, copy.deepcopy(result))
++            queries.move_to_end(key)
++            while len(queries) > self.max_queries:
++                queries.popitem(last=False)
++        return result
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 1944c715237..65c7435545a 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
+ from fastapi import APIRouter, HTTPException, Query
+ 
+ from hermes_cli.session_listing import automated_session_sources, stamp_automated, subagent_listing_scope
++from hermes_cli.profile_session_scan_cache import ProfileSessionScanCache
+ from hermes_cli.web_deps import late
+ from hermes_cli.config import get_process_hermes_home
+ from hermes_cli.profiles import ProfileIdentitySettlementPending
+@@ -459,14 +460,15 @@ def _csv_list(value: Optional[str]) -> list[str]:
+ 
+ 
+ _PROFILE_SESSION_SCAN_LOCK = threading.Lock()
++_PROFILE_SESSION_SCAN_CACHE = ProfileSessionScanCache()
+ 
+ 
+-def _read_serial_profile_db(name, home, errors, read):
+-    # Parallel aggregate polls amplify SQLite scan CPU. Serialize only the DB
+-    # phase, not activity annotation or serialization; never cache fresh rows.
+-    # Acquire before opening a connection, retaining the caller's profile context.
++def _read_serial_profile_db(name, home, errors, read, cache_key):
++    # Keep PR476's serialization, including observer access across AnyIO threads.
++    # Cache only DB projections; time/config/activity stamps remain per-request.
+     with _PROFILE_SESSION_SCAN_LOCK:
+-        return _read_profile_db(name, home, errors, read)
++        return _PROFILE_SESSION_SCAN_CACHE.read(
++            home, cache_key, lambda: _read_profile_db(name, home, errors, read))
+ 
+ 
+ @sessions_router.get("/api/profiles/sessions")
+@@ -507,18 +509,24 @@ def get_profiles_sessions(
+     errors: list[dict[str, str]] = []
+     now = time.time()
+     for name, home in targets:
+-        def _read(db, name=name, home=home):
+-            include_subagents, exclude = subagent_listing_scope(
+-                home, source=filters["source"], sources=filters["sources"],
+-                exclude_sources=filters["exclude_sources"])
+-            scoped = {**filters, "exclude_sources": exclude, "include_subagents": include_subagents}
++        include_subagents, exclude = subagent_listing_scope(
++            home, source=filters["source"], sources=filters["sources"],
++            exclude_sources=filters["exclude_sources"])
++        scoped = {**filters, "exclude_sources": exclude, "include_subagents": include_subagents}
++        cache_key = (per_profile, order, full, tuple(
++            (key, tuple(value) if isinstance(value, list) else value) for key, value in scoped.items()))
++
++        def _read(db):
+             rows = db.list_sessions_rich(
+                 limit=per_profile, offset=0, order_by_last_active=order == "recent",
+                 # Same SQL-level blob skip as /api/sessions.
+                 compact_rows=not full, include_pinned=True, **scoped)
+-            totals[name] = db.session_count(exclude_children=True, **scoped)
++            return rows, db.session_count(exclude_children=True, **scoped)
++
++        result = _read_serial_profile_db(name, home, errors, _read, cache_key)
++        if result:
++            rows, totals[name] = result
+             merged.extend(stamp_automated(_tag_rows(rows, name, now), home))
+-        _read_serial_profile_db(name, home, errors, _read)
+ 
+     sort_key = "last_active" if order == "recent" else "started_at"
+     merged.sort(key=lambda s: s.get(sort_key) or s.get("started_at") or 0, reverse=True)
+diff --git a/tests/hermes_cli/test_profile_session_scan_cache.py b/tests/hermes_cli/test_profile_session_scan_cache.py
+new file mode 100644
+index 00000000000..d1a782135c7
+--- /dev/null
++++ b/tests/hermes_cli/test_profile_session_scan_cache.py
+@@ -0,0 +1,95 @@
++"""Observer lifetime and failure semantics on disposable SQLite stores."""
++import sqlite3
++
++import pytest
++
++from hermes_cli.profile_session_scan_cache import ProfileSessionScanCache
++
++
++@pytest.fixture
++def cache():
++    cache = ProfileSessionScanCache(max_profiles=1, max_queries=2)
++    yield cache
++    cache.clear()
++
++
++def store(home):
++    home.mkdir(exist_ok=True)
++    conn = sqlite3.connect(home / 'state.db', isolation_level=None)
++    conn.execute('CREATE TABLE item(value)')
++    conn.execute('INSERT INTO item VALUES (1)')
++    return conn
++
++
++@pytest.mark.parametrize('journal', ['wal', 'delete'])
++def test_commits_not_rollbacks_invalidate(cache, tmp_path, journal):
++    with store(tmp_path) as writer:
++        writer.execute(f'PRAGMA journal_mode={journal}')
++        calls = []
++
++        def scan():
++            calls.append(True)
++            return [writer.execute('SELECT value FROM item').fetchone()[0]]
++
++        assert cache.read(tmp_path, (), scan) == [1]
++        writer.execute('BEGIN')
++        writer.execute('UPDATE item SET value=2')
++        writer.execute('ROLLBACK')
++        assert cache.read(tmp_path, (), scan) == [1]
++        assert len(calls) == 1
++        writer.execute('UPDATE item SET value=3')
++        assert cache.read(tmp_path, (), scan) == [3]
++        assert len(calls) == 2
++    writer.close()
++
++
++def test_missing_error_recovery_and_replacement(cache, tmp_path):
++    calls = []
++
++    def scan():
++        calls.append(True)
++        path = tmp_path / 'state.db'
++        if not path.exists():
++            return None
++        with sqlite3.connect(path) as conn:
++            value = conn.execute('SELECT value FROM item').fetchone()[0]
++        conn.close()
++        return [value]
++
++    assert cache.read(tmp_path, (), scan) is None
++    writer = store(tmp_path)
++    writer.close()
++    assert cache.read(tmp_path, (), scan) == [1]
++    assert cache.read(tmp_path, (), scan) == [1]
++    replacement = tmp_path / 'replacement'
++    writer = store(replacement)
++    writer.execute('UPDATE item SET value=2')
++    writer.close()
++    (replacement / 'state.db').replace(tmp_path / 'state.db')
++    assert cache.read(tmp_path, (), scan) == [2]
++    (tmp_path / 'state.db').unlink()
++    assert cache.read(tmp_path, (), scan) is None
++    assert len(calls) == 4
++
++
++def test_lru_eviction_closes_observers_and_does_not_reuse_versions(cache, tmp_path):
++    one, two = tmp_path / 'one', tmp_path / 'two'
++    for home in (one, two):
++        store(home).close()
++    calls = []
++
++    def scan():
++        calls.append(True)
++        return [{'value': len(calls)}]
++
++    first = cache.read(one, 'a', scan)
++    first[0]['value'] = -1
++    assert cache.read(one, 'a', scan) == [{'value': 1}]
++    conn = next(iter(cache._profiles.values()))[1]
++    cache.read(two, 'a', scan)
++    with pytest.raises(sqlite3.ProgrammingError):
++        conn.execute('SELECT 1')
++    assert cache.read(one, 'a', scan) == [{'value': 3}]
++    cache.read(one, 'b', scan)
++    cache.read(one, 'c', scan)
++    assert cache.read(one, 'a', scan) == [{'value': 6}]
+diff --git a/tests/hermes_cli/test_profiles_sessions_scan_cache.py b/tests/hermes_cli/test_profiles_sessions_scan_cache.py
+new file mode 100644
+index 00000000000..bc3e5dca7ac
+--- /dev/null
++++ b/tests/hermes_cli/test_profiles_sessions_scan_cache.py
+@@ -0,0 +1,132 @@
++"""Unchanged polls reuse DB scans, not time-sensitive activity annotations."""
++import threading
++from concurrent.futures import ThreadPoolExecutor
++from types import SimpleNamespace
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli.web_routers import profiles
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def listing(tmp_path, monkeypatch):
++    db = SessionDB(tmp_path / 'state.db')
++    db.create_session('first', source='cli')
++    monkeypatch.setattr(profiles, '_profile_targets', lambda _: [('default', tmp_path)])
++    for name in ('kanban', 'goal', 'cron', 'background', 'turn'):
++        monkeypatch.setattr(profiles, f'annotate_{name}_activity', lambda rows: None)
++    monkeypatch.setattr(profiles, 'annotate_review_wait', lambda rows: None)
++    scans = []
++    original = profiles._read_profile_db
++
++    def read(*args):
++        scans.append(args[0])
++        return original(*args)
++
++    monkeypatch.setattr(profiles, '_read_profile_db', read)
++    app = FastAPI()
++    app.include_router(profiles.sessions_router)
++    with TestClient(app) as client:
++        yield client, db, scans
++    db.close()
++    with profiles._PROFILE_SESSION_SCAN_LOCK:
++        profiles._PROFILE_SESSION_SCAN_CACHE.clear()
++
++
++def poll(client, **params):
++    response = client.get('/api/profiles/sessions', params=params)
++    assert response.status_code == 200
++    result = response.json()
++    assert result['errors'] == []
++    return result
++
++
++def test_unchanged_poll_reuses_scan_but_next_write_is_visible(listing):
++    client, db, scans = listing
++    first = poll(client)
++    assert [row['id'] for row in first['sessions']] == ['first']
++    assert poll(client) == first
++    assert len(scans) == 1
++    db.create_session('second', source='cli')
++    changed = poll(client)
++    assert {row['id'] for row in changed['sessions']} == {'first', 'second'}
++    assert changed['total'] == 2
++    assert len(scans) == 2
++    assert poll(client) == changed
++    assert len(scans) == 2
++
++
++def test_query_variants_and_live_annotations(listing, monkeypatch):
++    client, db, scans = listing
++    db.create_session('cron', source='cron')
++    first = poll(client, source='cli', full=True)
++    assert [row['id'] for row in first['sessions']] == ['first']
++    assert [row['id'] for row in poll(client, source='cron')['sessions']] == ['cron']
++    assert poll(client, source='cli', full=True) == first
++    assert len(scans) == 2
++    # Expiry and activity are live even with no DB mutation and no cache TTL.
++    monkeypatch.setattr(profiles, 'time', SimpleNamespace(time=lambda: 9999999999))
++    monkeypatch.setattr(profiles, 'annotate_goal_activity',
++                        lambda rows: rows[0].update(goal_state='running'))
++    again = poll(client, source='cli', full=True)
++    assert again['sessions'][0]['is_active'] is False
++    assert again['sessions'][0]['goal_state'] == 'running'
++    monkeypatch.setattr(profiles, 'annotate_goal_activity', lambda rows: None)
++    assert 'goal_state' not in poll(client, source='cli', full=True)['sessions'][0]
++    assert len(scans) == 2
++
++
++def test_effective_config_filter_and_profile_roster_are_live(listing, monkeypatch, tmp_path):
++    client, db, scans = listing
++    db.create_session('child', source='subagent', parent_session_id='first',
++                      model_config={'_delegate_from': 'first'})
++    assert [row['id'] for row in poll(client)['sessions']] == ['first']
++    monkeypatch.setattr(profiles, 'subagent_listing_scope', lambda *a, **kw: (True, None))
++    assert {row['id'] for row in poll(client)['sessions']} == {'first', 'child'}
++    assert len(scans) == 2
++    other_home = tmp_path / 'other'
++    other_home.mkdir()
++    with SessionDB(other_home / 'state.db') as other:
++        other.create_session('other', source='cli')
++        monkeypatch.setattr(profiles, '_profile_targets',
++                            lambda _: [('default', tmp_path), ('other', other_home)])
++        assert poll(client)['profile_totals'] == {'default': 2, 'other': 1}
++    assert len(scans) == 3
++
++
++def test_concurrent_unchanged_polls_share_one_scan(listing):
++    client, _db, scans = listing
++    barrier = threading.Barrier(4)
++
++    def request(_):
++        barrier.wait(timeout=10)
++        return poll(client)
++
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        results = list(pool.map(request, range(4)))
++    assert all(result['total'] == 1 for result in results)
++    assert len(scans) == 1
++
++
++def test_write_during_scan_cannot_publish_stale_generation(listing, monkeypatch):
++    client, db, scans = listing
++    original = profiles._read_profile_db
++    fired = False
++
++    def racing(*args):
++        nonlocal fired
++        result = original(*args)
++        if not fired:
++            fired = True
++            db.create_session('during-scan', source='cli')
++        return result
++
++    monkeypatch.setattr(profiles, '_read_profile_db', racing)
++    assert poll(client)['total'] == 1
++    assert poll(client)['total'] == 2
++    assert len(scans) == 2
++    assert poll(client)['total'] == 2
++    assert len(scans) == 2
+-- 
+2.55.0
+
