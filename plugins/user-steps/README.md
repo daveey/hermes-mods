@@ -525,6 +525,18 @@ turn-end hook). Tests: `tests/test_clarify_early.py`.
 
 ## Tests
 
+Verify standalone CI separately from the core-enabled suite: local auto-discovery can
+otherwise hide accidental core dependencies. From `plugins/user-steps`, run this
+with both `--python 3.11` and `--python 3.14`:
+
+```sh
+HERMES_CORE_DIR=/nonexistent PYTHONPATH= uv run --no-project --python 3.14 --with pytest --with pyyaml --with fastapi --with httpx python -m pytest -q -p no:cacheprovider tests
+```
+
+Deleted-owner tests supply only the profile-discovery module seam; they still run
+real SQLite reconciliation, GET `/requests`, and `pre_llm_call` without core installed.
+The fixture restores its module entries and package attribute after each case.
+
 From the repository root:
 
 ```sh

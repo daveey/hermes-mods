@@ -1,5 +1,7 @@
 """Deleted-chat retirement uses positive local owner-store evidence only."""
 import sqlite3
+import sys
+from types import ModuleType
 
 import pytest
 
@@ -8,7 +10,19 @@ from test_withdrawal import complete_request, core, decision, OWNER
 
 @pytest.fixture
 def owner_env(tmp_path, monkeypatch):
-    from hermes_cli import profiles
+    # These tests replace profile discovery, not the SQLite/reconciliation path.
+    # Keep that seam available in standalone CI without requiring a core install.
+    try:
+        import hermes_cli
+    except ModuleNotFoundError as exc:
+        if exc.name != 'hermes_cli':
+            raise
+        hermes_cli = ModuleType('hermes_cli')
+        hermes_cli.__path__ = []
+        monkeypatch.setitem(sys.modules, 'hermes_cli', hermes_cli)
+    profiles = ModuleType('hermes_cli.profiles')
+    monkeypatch.setitem(sys.modules, 'hermes_cli.profiles', profiles)
+    monkeypatch.setattr(hermes_cli, 'profiles', profiles, raising=False)
 
     profile_home = tmp_path / 'owner-profile'
     profile_home.mkdir()
@@ -18,8 +32,8 @@ def owner_env(tmp_path, monkeypatch):
         c.execute('INSERT INTO sessions VALUES (?)', (OWNER['storedSessionId'],))
     monkeypatch.setattr(core, 'home', lambda: tmp_path / 'wrong-profile')
     monkeypatch.setattr(core, 'server_owner', lambda sid: dict(OWNER, storedSessionId=sid))
-    monkeypatch.setattr(profiles, 'profile_exists', lambda name: name == OWNER['profile'])
-    monkeypatch.setattr(profiles, 'get_profile_dir', lambda name: profile_home)
+    monkeypatch.setattr(profiles, 'profile_exists', lambda name: name == OWNER['profile'], raising=False)
+    monkeypatch.setattr(profiles, 'get_profile_dir', lambda name: profile_home, raising=False)
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
     ledger = core.Ledger(tmp_path / 'ledger', db)
     return store, ledger, db
