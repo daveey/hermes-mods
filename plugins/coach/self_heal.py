@@ -30,6 +30,16 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+if __package__:
+    from .reply_check import render_tool_log
+else:  # Standalone plugin/cron/CLI loader.
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("_selfheal_reply_check", Path(__file__).with_name("reply_check.py"))
+    assert _spec and _spec.loader
+    _reply_check = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_reply_check)
+    render_tool_log = _reply_check.render_tool_log
+
 COMPONENTS = ("agent", "desktop", "plugin", "cron", "kanban", "bot", "gateway", "provider", "browser", "bb", "other")
 
 OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
@@ -536,7 +546,10 @@ def _with_profile(system: str) -> str:
 
 
 def _log_text(tool_log, n=25, chars=2500) -> str:
-    return "\n".join(str(x)[:200] for x in (tool_log or [])[-n:])[:chars] or "(no tool calls)"
+    """The newest of the last `n` calls (each cut to 200 chars), oldest first, within `chars`. Slicing the joined
+    log kept its oldest calls, so a long turn's final actions (kanban_create/comment) never reached the judge."""
+    calls = [str(x)[:200] for x in (tool_log or [])[-n:]]
+    return render_tool_log(calls, chars) if calls else "(no tool calls)"
 
 
 def complaint_prompt(prev_reply: str, user_text, tool_log=None, context: str = "") -> str:
