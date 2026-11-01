@@ -1268,14 +1268,18 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     # Producer-published asks are tiles too: the model must see them to report a restatement as a repeat.
     # Their ids only feed "repeats"; ledger resolution below ignores any step that has a requestId.
     listed = list(opened)
+    tiles = {s['id']: tile_texts(s) for s in opened if s.get('id')}
     if action_store is not None:
         mirrored = {s.get('requestId') for s in opened}
-        listed += [{'id': a['id'], 'kind': a['kind'], 'text': a['title']}
-                   for a in open_asks(action_store, action_owner) if a['id'] not in mirrored]
+        for a in open_asks(action_store, action_owner):
+            if a['id'] not in mirrored:
+                listed.append({'id': a['id'], 'kind': a['kind'], 'text': a['title']})
+                tiles[a['id']] = tile_texts(a)
     # Blocked cards' own asks: listed so the model can name a relay of one as a repeat (its id is never a ledger
     # step, so it is never resolved here and never framed).
     card_asks = [e for e in card_asks or () if isinstance(e, dict) and e.get('kind') == KANBAN_ASK]
-    listed += [{'id': e['id'], 'kind': e['kind'], 'text': e['text']} for e in card_asks]
+    listed += [{'id': e['id'], 'kind': e['kind'], 'text': card_ask_listing(e)} for e in card_asks]
+    tiles.update({e['id']: tile_texts(e) for e in card_asks})
     # Other chats' open asks are only a relay source in a turn a runtime notice started (relay provenance). In a
     # turn the user started, an equal or similar title elsewhere is no source association: never suppress by it.
     relay = _runtime_message(user_msg)
@@ -1283,7 +1287,17 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     res = extract(reply, listed, user_msg, llm, continuity=True, elsewhere=elsewhere)
     card_ids = {e['id'] for e in card_asks}
     res["resolved"] = [x for x in res["resolved"] if x not in card_ids]  # a card's ask is never resolved from chat
-    card_hits = [(s, card_ask_for(s, card_asks, res.get("repeats") or ())) for s in res["steps"]]
+    # A repeat the reply does not corroborate is neither framed nor mapped: the other rules judge that sentence.
+    # (``_still_asked`` already ran inside extract on the model's raw repeats and is unchanged.)
+    res["repeats"], uncorroborated = split_repeats(res.get("repeats") or (), tiles, reply)
+    if uncorroborated:
+        with ledger.edit(root) as d:
+            log_ = d.setdefault("repeat_checks", [])
+            for r in uncorroborated:
+                log_.append({"verdict": "repeat_uncorroborated", "tile": r.get("id"),
+                             "verbatim_span": r.get("verbatim_span"), "session": session_id, "at": now})
+            del log_[:-50]
+    card_hits = [(s, card_ask_for(s, card_asks, res.get("repeats") or (), reply)) for s in res["steps"]]
     restated = [(s, e) for s, e in card_hits if e is not None]
     res["steps"] = [s for s, e in card_hits if e is None]
     # The model may also leave a relay out of "steps" and report it only as a repeat of the card's id: record that
@@ -1359,7 +1373,7 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                         or (len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5 and span in other_keys)):
                     continue
                 if action_store is not None:
-                    same = same_open_ask(candidate, asks, res.get("repeats") or (), mapped, turn_requests)
+                    same = same_open_ask(candidate, asks, res.get("repeats") or (), mapped, turn_requests, reply=text)
                     if same is not None:
                         # A re-ask of an open tile: frame it onto that tile, never mint a second one.
                         mapped.setdefault(ask_key(candidate["verbatim_span"]), same)
@@ -1397,6 +1411,7 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             step = by_id.get(r["id"])
             if step is not None and all(p.get("id") != step["id"] for p in published) \
                     and locate(text, r["verbatim_span"]) is not None \
+                    and repeat_corroborated(r["verbatim_span"], _paragraph(text, r["verbatim_span"]), tile_texts(step)) \
                     and ask_key(r.get("verbatim_span")) not in mapped_spans:
                 published.append({**step, "verbatim_span": r["verbatim_span"]})
     if published and framed:
@@ -1564,14 +1579,16 @@ def kanban_asks(session_id: str, user_msg: str = "", *, boards=None, db: Optiona
             ids = linked | named
             if not ids:
                 continue
+            cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+            title_col = "title" if "title" in cols else "''"
             rows = c.execute(
-                f"SELECT id, human_request FROM tasks WHERE status='blocked' AND human_request IS NOT NULL "
-                f"AND id IN ({','.join('?' * len(ids))})", tuple(sorted(ids))).fetchall()
+                f"SELECT id, human_request, {title_col} FROM tasks WHERE status='blocked' "
+                f"AND human_request IS NOT NULL AND id IN ({','.join('?' * len(ids))})", tuple(sorted(ids))).fetchall()
         except sqlite3.Error:
             continue
         finally:
             c.close()
-        for tid, raw in rows:
+        for tid, raw, title in rows:
             try:
                 hr = json.loads(raw) if isinstance(raw, str) else None
             except ValueError:
@@ -1582,30 +1599,87 @@ def kanban_asks(session_id: str, user_msg: str = "", *, boards=None, db: Optiona
                 continue
             labels = [str(ch.get("label")) for ch in (hr.get("choices") or []) if isinstance(ch, dict) and ch.get("label")]
             out.append({"id": f"kanban:{slug}:{tid}", "kind": KANBAN_ASK, "text": action, "board": slug,
-                        "task_id": tid, "labels": labels})
+                        "task_id": tid, "labels": labels, "title": str(title or "").strip()})
     return out
 
 
-def card_ask_for(candidate: dict, entries: list[dict], repeats=()) -> Optional[dict]:
+def card_ask_listing(entry: dict) -> str:
+    """How the extractor prompt shows a card's ask: ``card <id> "<title>": ask: <action>``. Relays name the card by
+    its title topic ("unblock the fseventsd card"), so the model needs the title to see a relay as a repeat."""
+    title = str(entry.get("title") or "").replace('"', "'").strip()
+    return f'card {entry.get("task_id")}' + (f' "{title}"' if title else "") + f': ask: {entry.get("text")}'
+
+
+# Generic words a relay shares with any card's title: never enough to say which card a relay names.
+_GENERIC_CARD_WORDS = frozenset({"card", "cards", "agent", "window", "request", "macbook", "hermes", "prompt",
+                                 "terminal"})
+# Function words and the decision verbs themselves: not content, so they identify no card either.
+_FUNCTION_WORDS = frozenset({
+    "unblock", "unblocks", "archive", "archives", "approve", "that", "this", "these", "those", "then", "than",
+    "with", "from", "into", "onto", "when", "what", "which", "where", "while", "your", "yours", "it's", "have",
+    "been", "will", "once", "only", "still", "there", "their", "they", "them", "about", "after", "before",
+    "should", "would", "could", "also", "just", "more", "some", "each", "does", "done", "need", "needs", "here",
+    "it'll", "you're", "let's", "over", "under", "back", "again", "both", "either", "please"})
+_CARD_DECISION = re.compile(r"\b(?:unblock|archive)\b", re.I)
+_CARD_NOUN = re.compile(r"\bcards?\b", re.I)
+# "Unblock X, then approve Y" / "Unblock X and approve Y": the follow-on is the card's own next step.
+_FOLLOW_ON = re.compile(r"\s*(?:[,;]\s*)?\b(?:and then|then|and|after that)\b\s+|\s*;\s+", re.I)
+_CARD_TITLE_OVERLAP = 0.5
+
+
+def _distinctive(text) -> set:
+    return {w for w in _words(text) if w not in _GENERIC_CARD_WORDS and w not in _FUNCTION_WORDS}
+
+
+def _first_action(text) -> str:
+    t = str(text or "")
+    m = _FOLLOW_ON.search(t)
+    return t[:m.start()].strip(" ,;") if m and m.start() > 0 else ""
+
+
+def _names_card(named: set, task_id) -> bool:
+    tid = str(task_id or "")
+    return bool(tid) and any(tid == n or tid.startswith(n) for n in named)
+
+
+def card_ask_for(candidate: dict, entries: list[dict], repeats=(), reply: str = "") -> Optional[dict]:
     """The blocked card's ask ``candidate`` (an extracted step) restates, or None.
 
-    Covered when: the model marked this exact sentence as a repeat of the card's entry; the step's text or
-    sentence contains the card's ask (or a specific sentence of the reply is part of it); its menu offers at
-    least two of the card's choice labels; or most of the step's own words are the ask's words (a paraphrase),
-    which needs at least three content words on both sides so a short generic ask never matches."""
+    Covered when: the model marked this exact sentence as a repeat of the card's entry and the sentence (or its
+    paragraph) corroborates it (``repeat_corroborated``); the step's text or sentence contains the card's ask (or a
+    specific sentence of the reply is part of it); its menu offers at least two of the card's choice labels; most
+    of the step's own words are the ask's words (a paraphrase), which needs at least three content words on both
+    sides so a short generic ask never matches. For an entry that carries the card's title, also: the step tells
+    the user to unblock or archive a card and shares a distinctive word with exactly one listed card's title (or
+    names its id); or at least half its words are the card's title plus ask words. A compound step ("Unblock X and
+    approve the Touch ID prompt") is covered when its first action is: the follow-on is the card's own next step."""
     cards = [e for e in entries or () if e.get("kind") == KANBAN_ASK]
     if not cards:
         return None
+    hit = _card_ask_match(candidate, cards, repeats, reply)
+    if hit is not None:
+        return hit
+    first = {"text": _first_action(candidate.get("text")), "verbatim_span": _first_action(candidate.get("verbatim_span")),
+             "options": []}
+    if first["text"] or first["verbatim_span"]:
+        return _card_ask_match(first, cards, (), "")
+    return None
+
+
+def _card_ask_match(candidate: dict, cards: list[dict], repeats=(), reply: str = "") -> Optional[dict]:
     text, span = ask_key(candidate.get("text")), ask_key(candidate.get("verbatim_span"))
     by_id = {e["id"]: e for e in cards}
     if len(span) >= _ASK_KEY_MIN:
         for r in repeats or ():
-            if isinstance(r, dict) and r.get("id") in by_id and ask_key(r.get("verbatim_span")) == span:
+            if isinstance(r, dict) and r.get("id") in by_id and ask_key(r.get("verbatim_span")) == span \
+                    and repeat_corroborated(candidate.get("verbatim_span"), _paragraph(reply, candidate.get("verbatim_span")),
+                                            tile_texts(by_id[r["id"]])):
                 return by_id[r["id"]]
     long_span = len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5
     options = {ask_key(o) for o in candidate.get("options") or [] if ask_key(o)}
+    raw = f"{candidate.get('text') or ''} {candidate.get('verbatim_span') or ''}"
     mine = _words(candidate.get("text")) | _words(candidate.get("verbatim_span"))
-    named = set(_CARD_ID.findall(f"{candidate.get('text') or ''} {candidate.get('verbatim_span') or ''}"))
+    named = set(_CARD_ID.findall(raw))
     for e in reversed(cards):
         action = ask_key(e["text"])
         if len(action) >= _ASK_KEY_MIN and (action in text or action in span):
@@ -1619,15 +1693,101 @@ def card_ask_for(candidate: dict, entries: list[dict], repeats=()) -> Optional[d
             share = len(mine & theirs) / len(mine)
             if share >= _CARD_ASK_OVERLAP or (e.get("task_id") in named and share >= 0.4):
                 return e
-    return None
+    titled = [e for e in cards if str(e.get("title") or "").strip()]
+    if _CARD_DECISION.search(raw) and (_CARD_NOUN.search(raw) or named):
+        topic = _distinctive(raw)
+        hits = [e for e in titled if (topic & _distinctive(e.get("title"))) or _names_card(named, e.get("task_id"))]
+        if len(hits) == 1:
+            return hits[0]
+    hits = [e for e in titled if len(mine) >= 3 and len(_words(e["title"]) | _words(e["text"])) >= 3
+            and len(mine & (_words(e["title"]) | _words(e["text"]))) / len(mine) >= _CARD_TITLE_OVERLAP]
+    return hits[0] if len(hits) == 1 else None  # two cards that fit equally well: the relay names neither
+
+
+# ---- repeat corroboration ---------------------------------------------------------------------------------
+# The extractor's "repeats" named the session's only open tile for unrelated status paragraphs (MacBook chat
+# ..bef6c6: four report paragraphs rendered as the CuaDriver tile). A repeat is acted on (framed onto the tile,
+# or mapped onto it) only when the reply itself corroborates it; otherwise the other rules judge the sentence.
+
+_REPEAT_MIN_SHARED = 2
+# A topic-free reminder ("They'll stay in your list until you answer them", "That one is still yours to call")
+# can only point at an open ask: none of its words name a subject of its own. Such a sentence corroborates a
+# repeat by itself; a sentence with a topic must share it with the tile.
+_REMINDER_WORDS = frozenset({
+    "stay", "stays", "list", "until", "answer", "answered", "call", "whenever", "wait", "waiting", "pending",
+    "decide", "decision", "queue", "tile", "they'll", "they're", "ready", "rush", "urgent", "later", "time",
+    "anytime", "yet", "still", "whatever", "think", "free", "take", "look"})
+_REMINDER_MAX_WORDS = 15
+
+
+def _topic_free(span) -> bool:
+    t = str(span or "").strip()
+    if not t or len(t.split()) > _REMINDER_MAX_WORDS or _CARD_ID.search(t):
+        return False
+    return not {w for w in _words(t) if w not in _FUNCTION_WORDS and w not in _REMINDER_WORDS}
+
+
+def tile_texts(tile: dict) -> list[str]:
+    """What identifies an open tile: its text/title, the sentence it was extracted from, a card's title and id."""
+    out = [tile.get(k) for k in ("text", "title", "verbatim_span", "task_id")]
+    step = tile.get("step")
+    if isinstance(step, dict):
+        out += [step.get("text"), step.get("verbatim_span")]
+    return [str(x) for x in out if x]
+
+
+def _paragraph(reply: str, span) -> str:
+    if not reply or not span:
+        return ""
+    block = locate(reply, str(span))
+    return block["text"] if block else ""
+
+
+def repeat_corroborated(span, paragraph, texts) -> bool:
+    """The sentence (or its paragraph) backs the model's claim that it repeats this tile: it quotes the tile's
+    text or sentence (a normalized substring of at least ``_RESTATE_MIN_CHARS``), shares at least two content words
+    with it, or names the same card id. A short topic-free reminder (``_topic_free``) names nothing else, so it
+    corroborates by itself."""
+    if _topic_free(span):
+        return True
+    mine = f"{span or ''}\n{paragraph or ''}"
+    body = _norm(mine).replace('"', "")
+    for t in texts or ():
+        q = _norm(str(t or "")).replace('"', "")
+        if len(q) >= _RESTATE_MIN_CHARS and q in body:
+            return True
+    theirs = set()
+    for t in texts or ():
+        theirs |= _words(t)
+    if len(_words(mine) & theirs) >= _REPEAT_MIN_SHARED:
+        return True
+    ids = set(_CARD_ID.findall(" ".join(str(t) for t in texts or ())))
+    return bool(ids & set(_CARD_ID.findall(mine)))
+
+
+def split_repeats(repeats, tiles: dict, reply: str) -> tuple[list, list]:
+    """(corroborated, uncorroborated) model repeats. ``tiles`` maps a listed id to its ``tile_texts``. A repeat of
+    an id not listed is kept as is (the callers already ignore unknown ids)."""
+    kept, dropped = [], []
+    for r in repeats or ():
+        if not isinstance(r, dict):
+            continue
+        texts = tiles.get(r.get("id"))
+        if texts is None or repeat_corroborated(r.get("verbatim_span"), _paragraph(reply, r.get("verbatim_span")),
+                                                texts):
+            kept.append(r)
+        else:
+            dropped.append(r)
+    return kept, dropped
 
 
 def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None,
-                  turn_requests=()) -> Optional[dict]:
+                  turn_requests=(), reply: str = "") -> Optional[dict]:
     """The open ask ``candidate`` (an extracted step) provably repeats, or None (it is its own ask).
 
     Exact provenance only, never title, word or menu similarity on its own:
-    - the model marked this exact sentence as a repeat of an open id (request id or extracted step id);
+    - the model marked this exact sentence as a repeat of an open id (request id or extracted step id) and the
+      sentence or its paragraph corroborates it (``repeat_corroborated``);
     - the evidence sentence (a specific one) is the sentence an open extracted ask came from in an EARLIER reply;
     - the request was published or revised by the producer tool in this very turn (``turn_requests``,
       server-recorded) and the candidate restates its title, or is the approve/change/decline menu of the only
@@ -1648,7 +1808,9 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
             ids[a['step']['id']] = a
     if len(span) >= _ASK_KEY_MIN:
         for r in repeats or ():
-            if isinstance(r, dict) and r.get('id') in ids and ask_key(r.get('verbatim_span')) == span:
+            if isinstance(r, dict) and r.get('id') in ids and ask_key(r.get('verbatim_span')) == span \
+                    and repeat_corroborated(candidate.get('verbatim_span'),
+                                            _paragraph(reply, candidate.get('verbatim_span')), tile_texts(ids[r['id']])):
                 return ids[r['id']]
     # One sentence can carry two different asks: the same-sentence rule is for LATER replies only.
     hit = pick([a for a in asks if long_span and a['step'] is not None and not a.get('fresh')
@@ -1678,7 +1840,8 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
     return None
 
 
-def restates_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None) -> Optional[dict]:
+def restates_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None,
+                      reply: str = "") -> Optional[dict]:
     """Detector only (chat.py duplicate watchers): the open ask ``candidate`` looks like it restates, or None.
 
     NEVER an identity: nothing may be framed onto, folded into or suppressed by this match, because title,
@@ -1710,7 +1873,9 @@ def restates_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Opt
             ids[a['step']['id']] = a
     if len(span) >= _ASK_KEY_MIN:
         for r in repeats or ():
-            if isinstance(r, dict) and r.get('id') in ids and ask_key(r.get('verbatim_span')) == span:
+            if isinstance(r, dict) and r.get('id') in ids and ask_key(r.get('verbatim_span')) == span \
+                    and repeat_corroborated(candidate.get('verbatim_span'),
+                                            _paragraph(reply, candidate.get('verbatim_span')), tile_texts(ids[r['id']])):
                 return ids[r['id']]
     kind = _EXTRACTED_KIND.get(candidate.get('kind'), 'input')
     cards = set(_CARD_ID.findall(str(candidate.get('text') or '')))

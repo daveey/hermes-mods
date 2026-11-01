@@ -276,21 +276,26 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     # publish a second, unlinked one).
     card_asks = _card_asks(session_id, _USER_MSG.get(session_id, ''))
     res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks]
-                       + [{'id': e['id'], 'kind': e['kind'], 'text': e['text']} for e in card_asks],
+                       + [{'id': e['id'], 'kind': e['kind'], 'text': core.card_ask_listing(e)} for e in card_asks],
                        '', aux_llm, continuity=True, elsewhere=core.elsewhere_titles(store, owner) if relay else [])
     approvals = [s for s in res.get('steps', []) if s['kind'] == 'approve']
     if not approvals:
         return None
+    # An uncorroborated model repeat maps nothing (core.split_repeats): the other rules judge that sentence.
+    tiles = {a['id']: core.tile_texts(a) for a in open_asks}
+    tiles.update({a['step']['id']: core.tile_texts(a) for a in open_asks if a.get('step') and a['step'].get('id')})
+    tiles.update({e['id']: core.tile_texts(e) for e in card_asks})
+    res['repeats'] = core.split_repeats(res.get('repeats') or (), tiles, final_response)[0]
     ready = {r['requestId'] for r in store.requests(owner)
              if r['kind'] == 'approval' and r['state'] == 'open' and r['scope']['complete'] and not r.get('resolution')
              and {'approve', 'revise', 'decline'} <= {c['effect'] for c in r['choices']}}
     mapped: dict = {}
 
     def covered(step):
-        if core.card_ask_for(step, card_asks, res.get('repeats') or ()) is not None:
+        if core.card_ask_for(step, card_asks, res.get('repeats') or (), final_response) is not None:
             return True
         same = core.same_open_ask(step, open_asks, res.get('repeats') or (), mapped,
-                                  _TURN_PUBLISHED.get(session_id, ()))
+                                  _TURN_PUBLISHED.get(session_id, ()), reply=final_response)
         if same is not None:
             mapped.setdefault(core.ask_key(step.get('verbatim_span')), same)
         return same is not None and same['id'] in ready

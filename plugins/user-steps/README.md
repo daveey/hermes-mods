@@ -302,7 +302,8 @@ fuzzy dedup). `same_open_ask` (core.py) frames an extracted ask onto an existing
 open, undecided request of the same session only with exact provenance:
 
 - the extractor listed that exact sentence under `repeats` for the open id (request id
-  or extracted step id; the prompt lists producer-published requests as open steps);
+  or extracted step id; the prompt lists producer-published requests as open steps),
+  and the reply corroborates it (below);
 - the evidence sentence (30+ characters, 5+ words) is the sentence an open ask was
   extracted from in an EARLIER reply;
 - the request was published or revised by the `action_request` tool in this very turn
@@ -340,6 +341,20 @@ the withdraw instruction. None of this records a decision or grants anything.
 `tests/test_one_open_ask.py` replays each live duplicate and the adversarial
 review's keep-both cases.
 
+**A model repeat needs corroboration.** The extractor named the session's only open
+tile (the CuaDriver Accessibility step) as the "repeat" of four unrelated status
+paragraphs, and each rendered as that tile with its buttons. `core.split_repeats` now
+keeps a repeat only when the sentence or its paragraph backs it up
+(`repeat_corroborated`): it quotes the tile's text or extracted sentence (a normalized
+substring of 20+ characters), shares at least two content words with the tile's text,
+sentence and title, names the same card id, or is a short topic-free reminder ("They'll
+stay in your list until you answer them": no content word of its own). An
+uncorroborated repeat is neither framed onto the tile nor mapped by `same_open_ask`,
+`restates_open_ask` or `card_ask_for`; the other rules judge the sentence, and the
+ledger's `repeat_checks` list records `{verdict: 'repeat_uncorroborated', tile, ...}`
+(last 50 kept). `_still_asked` (which keeps a step open) still reads the raw repeats.
+Tests: `tests/test_relay_corroboration.py`.
+
 ### A blocked Kanban card's own ask
 
 A blocked card with a `human_request` already is the request in **For you**. A reply
@@ -350,21 +365,30 @@ answered, the other went stale. `core.kanban_asks` now lists, on every live loca
 `human_request` that are linked to this chat's lineage (`kanban_notify_subs.chat_id`)
 or named by id in this turn's runtime message (chat-closeout or Kanban notice; a card id
 the user typed adds nothing). Each is an open ask
-`{id: 'kanban:<board>:<task_id>', kind: 'kanban_ask', text: human_request.action}` for
+`{id: 'kanban:<board>:<task_id>', kind: 'kanban_ask', text: human_request.action, title}` for
 both the extraction hook (`transform_llm_output` → `process_reply`) and the plan gate
-(`publication_buffer`). A step that `card_ask_for` matches to one (the model listed the
-sentence as a repeat of that id; the step contains the ask, or a specific sentence of it;
-its menu offers two of the card's choice labels; or 60%+ of its content words, at least
-three, are the ask's words) publishes nothing (a relay the model reports only under
-"repeats" with the card's id is recorded the same way), is not framed, does not hold the gate, and
-is recorded in the session ledger's `card_asks` list as
+(`publication_buffer`); the prompt shows it as `card <task_id> "<title>": ask: <action>`.
+A step that `card_ask_for` matches to one (the model listed the sentence as a repeat of
+that id and the reply corroborates it; the step contains the ask, or a specific sentence
+of it; its menu offers two of the card's choice labels; 60%+ of its content words, at
+least three, are the ask's words; it tells the user to unblock or archive a card ("unblock"/"archive"
+plus "card" or a card id) and shares a distinctive word with exactly one listed card's
+title, or names its id (generic words such as card, agent, window, request, macbook,
+hermes, prompt, terminal and function words identify nothing); or half its words are
+exactly one card's title plus ask words) publishes nothing. A compound step ("Unblock
+the fseventsd card, then approve Touch ID in the terminal window") is covered when its
+first action is: the follow-on is the card's own next step. Such a step is not framed,
+does not hold the gate, and is recorded (a relay the model reports only under "repeats"
+with the card's id is recorded the same way) in the session ledger's `card_asks` list as
 `{verdict: 'restates_card_ask', card, board, ...}` (last 50 kept). Word overlap is
 allowed here, unlike between requests, because the card's link to this chat (or the
 notice naming it) is the provenance, and the match only suppresses: it never answers,
 decides, edits or unblocks the card. Once the card leaves `blocked` (unblocked, done,
 archived) its ask leaves the list and a later re-ask publishes as before; steps that
 match no card behave as before, and an unreadable board lists nothing (fail open).
-Tests: `tests/test_card_asks.py`.
+Tests: `tests/test_card_asks.py`, and `tests/test_relay_corroboration.py` for relays that
+name the card by its title topic (the live fseventsd relay; two cards, one named; an
+unknown topic still publishes) on both the extraction hook and the gate.
 
 ## Limits
 
