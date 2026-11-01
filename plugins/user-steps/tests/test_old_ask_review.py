@@ -94,6 +94,54 @@ def store_snapshot(store):
 
 # ---- selection ------------------------------------------------------------------------------------------
 
+
+def unstamped_revision(env, owner=OWNER):
+    st = env['store']
+    r = make(st, 200, owner=owner)
+    st.revise(owner, r['requestId'], 1, r)
+    with st._tx() as c:
+        c.execute('DELETE FROM lifecycle')
+    return r
+
+
+def test_unstamped_revision_uses_old_owner_last_turn_bound(env):
+    r = unstamped_revision(env)
+    before = store_snapshot(env['store'])
+    board = Board()
+    assert review(env, board) == [r['requestId']]
+    body = next(iter(board.cards.values()))['body']
+    assert 'asked on or before 2027-01-11 17:00 PST' in body
+    assert '(revision 2)' in body
+    assert store_snapshot(env['store']) == before
+
+
+@pytest.mark.parametrize('age', [1, 71, 72])
+def test_unstamped_revision_waits_until_last_turn_bound_exceeds_72h(env, age):
+    r = unstamped_revision(env)
+    with sqlite3.connect(env['db']) as c:
+        c.execute('UPDATE messages SET timestamp=?', (NOW - age * H,))
+    assert review(env, Board()) == []
+    assert review(env, Board(), now=NOW + (73 - age) * H) == [r['requestId']]
+
+
+@pytest.mark.parametrize('case', ['foreign', 'unknown-profile', 'missing-session', 'no-messages', 'unreadable'])
+def test_unstamped_revision_skips_unproven_owner_bound(env, case):
+    r = unstamped_revision(env)
+    # First prove the same request is eligible when its local owner is known.
+    assert review(env, Board()) == [r['requestId']]
+    kw = {}
+    if case == 'foreign':
+        kw['local_gateway'] = 'install:other'
+    elif case == 'unknown-profile':
+        kw['owner_db'] = lambda o: None
+    elif case == 'unreadable':
+        env['db'].write_bytes(b'not sqlite')
+    else:
+        with sqlite3.connect(env['db']) as c:
+            c.execute('DELETE FROM ' + ('sessions' if case == 'missing-session' else 'messages'))
+    assert review(env, Board(), **kw) == []
+
+
 def test_only_undecided_asks_older_than_72h_are_listed(env):
     st = env['store']
     old = make(st, 80)

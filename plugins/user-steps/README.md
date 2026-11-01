@@ -245,7 +245,11 @@ Retirement paths and evidence review:
   undecided, non-card-bound asks older than 72 hours that were not reviewed in the last
   seven days. The card includes request IDs/titles, owner-chat titles/last-turn times,
   and linked/named card states. Legacy revision-1 requests can use their matching ledger
-  timestamp; unknown current-revision ages are kept without guessing.
+  timestamp. Without a current-revision timestamp, a known local owner chat's last turn
+  bounds the ask as "asked on or before" that turn; only bounds older than 72 hours
+  qualify. Foreign/unknown/unreadable owners and chats without messages are skipped.
+  `tests/test_old_ask_review.py` covers revision-2 missing lifecycle rows, recent and
+  exact-72-hour bounds, owner isolation, labelled output and read-only selection.
   The worker withdraws only with evidence of terminal related work, a decision elsewhere
   (quoted), an expired window, a fixture, or agent-owned work it has done or filed.
   Otherwise it marks the request reviewed and keeps it. Use:

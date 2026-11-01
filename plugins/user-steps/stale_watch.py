@@ -235,12 +235,13 @@ def _legacy_asked_at(core, owner, body):
         return None  # missing/unreadable evidence is not proof of age
 
 
-def old_asks(core, store, now=None, *, min_age=OLD_ASK_AGE, window=REVIEW_WINDOW):
+def old_asks(core, store, now=None, *, min_age=OLD_ASK_AGE, window=REVIEW_WINDOW,
+             local_gateway=None, owner_db=None):
     """Undecided requests asked more than ``min_age`` ago and not marked reviewed within ``window``. Read-only.
 
     Undecided: open/needs_context, no resolution, no recorded operation for the current revision. Requests bound
     to a decision card are skipped (that card is the ask; withdrawal refuses them). A request with no recorded
-    ask time is skipped: its age is unproven."""
+    ask time uses its known local owner's last turn as an upper bound; unknown owners are skipped."""
     now = time.time() if now is None else now
     out = []
     with store._read() as c:
@@ -262,16 +263,22 @@ def old_asks(core, store, now=None, *, min_age=OLD_ASK_AGE, window=REVIEW_WINDOW
             if any(a.get('type') == 'kanban' for a in body.get('aliases', [])):
                 continue
             owner = {'gatewayId': gateway, 'profile': profile, 'storedSessionId': session}
-            # A missing revision stamp is usable only for an original legacy ask.
+            # Never date a later revision from an earlier revision's stamp or ledger.
             if asked_rev != rev and not (rev == 1 and asked_rev is None):
-                continue
+                asked = None
             if asked is None:
                 asked = _legacy_asked_at(core, owner, body)
-            if asked is None or now - asked <= min_age:
+            bound = asked is None
+            if bound:
+                facts = chat_facts(core, owner, local_gateway=local_gateway or _local_gateway(core),
+                                   owner_db=owner_db or (lambda o: _owner_db(core, o)))
+                asked = facts.get('lastTurnAt') if facts['status'] == 'found' else None
+            if (not isinstance(asked, (int, float)) or not 0 < asked < float('inf')
+                    or now - asked <= min_age):
                 continue
             out.append({'requestId': rid, 'title': body.get('title') or '', 'namespace': ns, 'revision': rev,
                         'owner': {'gatewayId': gateway, 'profile': profile, 'storedSessionId': session},
-                        'askedAt': asked, 'request': body})
+                        'askedAt': asked, 'askedAtUpperBound': bound, 'request': body})
     return out
 
 
@@ -369,7 +376,8 @@ def _item_lines(it):
     else:
         chat_line = f['status']
     lines = [f"- **{it['requestId']}**: {it['title']}",
-             f"  - Asked: {_pt(it['askedAt'])} (revision {it['revision']})",
+             f"  - {'asked on or before' if it.get('askedAtUpperBound') else 'Asked:'} "
+             f"{_pt(it['askedAt'])} (revision {it['revision']})",
              f"  - Owner chat: {o['profile']} / {o['storedSessionId']} ({o['gatewayId']}): {chat_line}"]
     cards = it.get('cards') or []
     lines.append('  - Cards: ' + ('; '.join(f"{c['id']} [{c['board']}] {c['status']} ({c['link']}): {c['title']}"
@@ -408,7 +416,7 @@ def review_old_asks(core, store, now=None, create=None, *, local_gateway=None, o
     if create is None:
         raise ValueError('review_old_asks needs a card creator')
     now = time.time() if now is None else now
-    items = old_asks(core, store, now=now)
+    items = old_asks(core, store, now=now, local_gateway=local_gateway, owner_db=owner_db)
     if not items:
         return []
     owner_db = owner_db or (lambda o: _owner_db(core, o))
