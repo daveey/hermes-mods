@@ -77,7 +77,10 @@ async def test_gateway_exact_scope_and_final_read(owned, monkeypatch, tmp_path, 
 @pytest.mark.asyncio
 async def test_real_process_exit_watcher_batch_and_public_gate(owned, monkeypatch, tmp_path):
     """No forged completion/acceptance: real child exit -> watcher -> native queue -> guard."""
+    import shlex
     import sys
+    # The macOS production interpreter lives in "Hermes Python.app": unquoted, the shell runs
+    # ".../Hermes" and exits 127 instead of printing 123456.
     # A live-armed watcher runs in an empty context (arm_process_watcher), so it cannot see the
     # fixture's context-local profile scope. A single-profile gateway resolves its launch profile
     # from the process env, so the env names the fixture home too; otherwise the completion
@@ -86,7 +89,7 @@ async def test_real_process_exit_watcher_batch_and_public_gate(owned, monkeypatc
     from gateway.session_context import scoped_current_session_id
     runner, adapter, registry, running, entry, _, _ = owned
     with scoped_current_session_id(entry.session_id):
-        bootstrap = registry.spawn_local(f"{sys.executable} -c 'print(123456)'",
+        bootstrap = registry.spawn_local(f"{shlex.quote(sys.executable)} -c 'print(123456)'",
                                          session_key=entry.session_key)
         bootstrap.notify_on_complete = True
     try:

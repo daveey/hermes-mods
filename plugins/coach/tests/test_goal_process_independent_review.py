@@ -52,6 +52,7 @@ def test_new_canonical_user_during_consumer_read_rejects(owned, tmp_path, monkey
 
 @pytest.mark.parametrize("outcome", [False, None, "exception"])
 def test_refused_native_completion_remains_retryable(consumer, monkeypatch, outcome):
+    import shlex
     import sys
     from gateway.session_context import scoped_current_session_id
     from tui_gateway import server
@@ -66,7 +67,7 @@ def test_refused_native_completion_remains_retryable(consumer, monkeypatch, outc
             assert not thread.is_alive()
     with scoped_current_session_id("origin"):
         process = registry.spawn_local(
-            f"exec {sys.executable} -c 'pass'", session_key="origin")
+            f"exec {shlex.quote(sys.executable)} -c 'pass'", session_key="origin")
         process.notify_on_complete = True
     assert process._completion_event.wait(5)
     event = registry.completion_queue.get(timeout=5)

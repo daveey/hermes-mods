@@ -1,5 +1,6 @@
 """Native producer + actual consumer + canonical latest row at the public gate."""
 import importlib.util
+import shlex
 import socket
 import sqlite3
 import sys
@@ -34,7 +35,7 @@ def owned(consumer, tmp_path, monkeypatch):
     agent._current_turn_id = "native-turn"
     with bind_subagent_parent(agent), scoped_current_session_id("origin"):
         uid = capture(agent)
-        p = registry.spawn_local(f"exec {sys.executable} -c 'import threading; threading.Event().wait(60)'",
+        p = registry.spawn_local(f"exec {shlex.quote(sys.executable)} -c 'import threading; threading.Event().wait(60)'",
                                  session_key="origin")
         p.notify_on_complete = True
     state = SessionDB(tmp_path / "state.db")
