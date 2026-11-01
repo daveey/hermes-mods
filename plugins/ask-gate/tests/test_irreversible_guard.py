@@ -70,11 +70,15 @@ def test_regex_needs_both_verb_and_object(gate):
         assert not rx.search(a), a
 
 
-def test_other_verdicts_on_irreversible_asks_are_unchanged(gate):
+def test_other_verdicts_on_irreversible_asks_are_unchanged(gate, monkeypatch):
     asks = ["Please rotate the leaked API key for the example service.",
             "Delete the old S3 bucket backups.",
             "Cancel the SaaS subscription for the analytics tool."]
-    stub = llm_returning([("already_answered", "David declined this in his profile"),
+    decision = "Do not rotate the leaked API key for the example service."
+    monkeypatch.setattr(gate.judge_mod, "standing_decisions", lambda: decision)
+    stub = llm_returning([("already_answered", "David declined this in his profile", "",
+                          {"source": "profile", "source_quote": decision, "request_quote": asks[0],
+                           "explanation": "Same example service key rotation; the user declined it."}),
                           ("unverified", "nothing checked the backups exist", "aws s3 ls s3://example-backups"),
                           ("ok", "his decision")])
     vs = _judge(gate, asks, stub)

@@ -62,7 +62,8 @@ def llm_returning(verdicts):
 
     def fn(system, user):
         seen.append((system, user))
-        return json.dumps({"asks": [{"i": i, "verdict": v[0], "reason": v[1], "how": v[2] if len(v) > 2 else ""}
+        return json.dumps({"asks": [{"i": i, "verdict": v[0], "reason": v[1], "how": v[2] if len(v) > 2 else "",
+                                    **({"equivalence": v[3]} if len(v) > 3 else {})}
                                     for i, v in enumerate(verdicts)]})
     fn.seen = seen
     return fn

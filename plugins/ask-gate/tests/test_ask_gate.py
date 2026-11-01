@@ -122,10 +122,13 @@ def test_I1_I2_unverified_and_agent_can_do_are_held(board, gate):
 
 
 def test_I4_repeat_of_answered_ask_sees_ledger_and_user_message(gate):
-    gate.ledger().add("Superhuman subscription and access", FIX["I4"]["ledger"][0]["answer"], session="s1")
-    gate.LOG.set_users("s1", FIX["I4"]["users"])
+    answer = "I cancelled the Superhuman subscription already; stop offering to cancel it."
+    gate.ledger().add("Superhuman subscription and access", answer, session="s1")
+    gate.LOG.set_users("s1", FIX["I4"]["users"] + [answer])
     asks = gate.core.find_asks(FIX["I4"]["reply"])
-    stub = llm_returning([("already_answered", "he said it was handled")] * len(asks))
+    stub = llm_returning([("already_answered", "subscription cancellation was completed", "",
+                          {"source": "messages", "source_quote": answer, "request_quote": ask,
+                           "explanation": "Both concern cancelling the same Superhuman subscription."}) for ask in asks])
     gate.LLM = stub
     r = gate.pre_final_gate(session_id="s1", platform="tui", final_response=FIX["I4"]["reply"], attempt=0)
     assert r["hold"] and "already_answered" in r["nudge"]
@@ -465,7 +468,7 @@ def test_retrospective_waiting_is_not_an_ask(gate, text):
     assert gate.core.find_asks(text) == []
 
 
-def test_llm_already_done_needs_a_done_card_in_the_database(gate, board):
+def test_llm_already_done_needs_matching_action_not_any_done_card(gate, board):
     board("t_aaaaaaaa", "blocked")
     gate.LLM = llm_returning([("already_done", "it looks finished", "")])
     assert gate.pre_final_gate(session_id="s1", platform="tui",
@@ -474,7 +477,8 @@ def test_llm_already_done_needs_a_done_card_in_the_database(gate, board):
     gate.LLM = llm_returning([("already_done", "same card", "")])
     r = gate.pre_final_gate(session_id="s1", platform="tui",
                             final_response="Card t_bbbbbbbb finished earlier. Can you confirm the result?", attempt=0)
-    assert r and r["hold"]
+    # Completion does not establish that the separate confirmation action was performed.
+    assert r is None
 
 
 # ---- incident cards (verbatim kanban_create args from the transcript) and the deterministic ledger match ----
@@ -496,20 +500,22 @@ def test_I1_I2_cards_pass_the_checked_gate_only_with_real_evidence(gate):
     assert r is None or "refused after the judge" in r["message"]
 
 
-def test_I4_repeat_is_caught_by_the_ledger_without_any_model_call(gate):
+def test_I4_ledger_overlap_requires_model_action_comparison(gate):
     gate.ledger().add("cancel the Superhuman subscription", "already handled, i keep completing it", session="s1")
-    stub = llm_returning([("ok", "")])
+    stub = llm_returning([("ok", "different requested action")])
     gate.LLM = stub
     r = gate.pre_final_gate(session_id="s1", platform="tui", final_response=FIX["I4"]["reply"], attempt=0)
-    assert r["hold"] and "already_answered" in r["nudge"] and "Superhuman" in r["nudge"]
+    assert r is None
+    assert "cancel the Superhuman subscription" in stub.seen[0][1]
 
 
-def test_ledger_match_needs_two_distinctive_words(gate):
+def test_ledger_overlap_alone_never_holds_without_model(gate):
     j = gate.judge_mod
     led = [{"topic": "cancel the Superhuman subscription", "answer": "handled"}]
-    assert j.ledger_match(["Should I rotate the GitHub token?"], led) == {}
-    assert j.ledger_match(["Want me to rotate the Superhuman token?"], led) == {}   # one shared word only
-    assert 0 in j.ledger_match(["Cancelling the Superhuman subscription is up to you."], led)
+    for ask in ["Should I rotate the GitHub token?", "Want me to rotate the Superhuman token?",
+                "Cancelling the Superhuman subscription is up to you."]:
+        assert j.judge([ask], tools_text="", user_msgs=[], card_status={}, ledger=led,
+                       ledger_text="", caps="", llm=None)[0]["verdict"] == "ok"
 
 
 def test_register_wires_all_hooks_and_declares_buffering(gate):

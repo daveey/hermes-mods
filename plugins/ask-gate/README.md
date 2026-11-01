@@ -85,7 +85,43 @@ reports, reversal how-tos ("To take it down, run …") and quoted speech. user-s
 steps. Replay on real replies (private set): 19/19 hand-offs caught, 0/73 false alarms; 2 of ~2,000 recent replies
 match, both in turns that had opened a terminal (exempt).
 
-Deterministic first: an ask naming a card that is `done`/`archived` in the database is `already_done` without any model call.
+Deterministic completion is limited to an exact stale target claim such as
+`Still waiting on you: **t_1234abcd**.` whose card is done/archived. A card ID in prose or
+`human_request.evidence` is contextual evidence, not proof that the requested action is complete.
+Two shared ledger-topic words and numeric decision labels are likewise not action identity.
+
+**Semantic repeat/completion checks.** Non-exact `already_answered` and `already_done` candidates
+receive one additional model evaluation comparing subject, requested action, object and scope.
+This runs on both ordinary asks and explicit structured requests, before the latter's refusal.
+The model must cite a verbatim source quote, a quote from the indexed ask, and an explanation of
+subject/action/scope correspondence in an `equivalence` object. Code checks the source category
+and quote provenance; the model, not word overlap or caller claims, judges semantic equivalence.
+Card context includes titles as well as status/results. Different labels and equivalent paraphrases
+can still be repeats; a different action on the same topic need not be.
+
+A corrected verdict is evaluated under the existing safety rules. An unsupported repeat becomes
+`ok` on the ordinary fail-open path, but `unverified` with a safe correction on the structured path;
+it does not automatically authorize that request. Non-repeat denials in a mixed batch are retained.
+Malformed initial structured output remains rejected. An initial provider outage retains the existing
+unavailable-judge handling; a failed recheck after a structured negative instead refuses as `unverified`,
+never as `JudgeUnavailable`. Ordinary recheck failures release only the repeat candidates, retaining
+independent denials. Provenance comes from structured inputs passed by `judge`, not headings parsed
+from the prompt; headings inside asks, drafts or tool output cannot manufacture or truncate sources.
+Structured request quotes match the decoded action. Label-only quotes and card ID/status alone do not
+establish equivalence; completion quotes must come from a completed card's title/result or tool evidence.
+
+Tests: `tests/test_scope_equivalence.py` and `tests/test_repeat_recheck_review.py` cover ordinary and
+serialized requests, paraphrases, provenance, safety corrections, and failure cases. The latter also
+exercises direct and deferred create/block calls through core dispatch and pre-dispatch guards, with
+an isolated catalog, the real ask-gate hook and stubbed execution (no card writes). These are injected
+model-output fixtures, not a live-model accuracy evaluation or live plugin-discovery test.
+
+Review regression chain: the recheck exception previously shared the initial-call outage handler,
+so a negative followed by a timeout became `JudgeUnavailable` and the hook accepted it. Separating
+those phases preserves the initial outage contract without discarding a produced negative. Separately,
+prompt-heading parsing treated untrusted draft text as source boundaries; out-of-band source data
+removes that trust gap. The earlier outage test expected the erroneous exception policy, and provenance
+tests did not inject headings. The new review regressions reproduced both failures before the fixes.
 
 The judge sees: the ask sentences, this turn's tool calls and results, the last 30 user messages, live status of every
 card id mentioned, the ledger, and a **capability sheet generated at runtime** (token-broker scope names and tiers —
@@ -107,7 +143,8 @@ cancel, deactivate, transfer, pay, purchase, buy, refund) and an object noun (ke
 credential, account, subscription, repo, repository, bucket, database, backup, payment, invoice, card, domain, funds,
 money). On the ordinary path (`judge()`) and the structured path (`structured_llm`), an `agent_can_do` on such an ask
 becomes `ok` with the reason "irreversible: David's decision" and one `irreversible_kept` line in `ask-gate.jsonl`.
-`already_answered`, `already_done` and `unverified` are left alone. Control: a missing-permission ask with a
+`already_answered` and `already_done` still require the scope/evidence checks above; the irreversible-action
+rule itself leaves them and `unverified` alone. Control: a missing-permission ask with a
 `*-minter` scope still gets `agent_can_do`. Tests: `tests/test_irreversible_guard.py`.
 
 **Standing decisions.** `build_user_prompt` adds a "DAVID'S STANDING DECISIONS (user profile)" section built from the
