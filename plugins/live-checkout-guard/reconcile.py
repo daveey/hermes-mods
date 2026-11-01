@@ -1,6 +1,12 @@
-"""Archive-verified, worktree-only recovery (no fetch, stash, reset or live index writes).
+"""Archive-verified file reconciliation and separate locked stash retirement.
 
-Usage: python reconcile.py --archive DIR --published SHA --path relative/path
+Stash modes: --prepare-stash-retirement, --retire-stashes --oid FULL_OID (repeatable),
+or --recover-stash-retirement; each requires --archive DIR. See README.md for the
+stash manifest, bundle verification and fail-closed recovery boundaries. These
+modes never write checkout files, the live index or HEAD.
+
+File mode (no fetch, stash, reset or live index writes):
+python reconcile.py --archive DIR --published SHA --path relative/path
 Repeat --path for an explicitly selected set; --root defaults to ~/code/hermes-mods.
 The caller fetches origin/main first. The archive must contain manifest.json with
 head/origin/status/untracked, changes.patch (git diff --binary HEAD), and
