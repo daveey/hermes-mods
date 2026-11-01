@@ -70,6 +70,8 @@ Do not pin a jump-host workaround solely because its SSH port answers. If that p
 
 Validate a full post-change timeout window while the client remains active; preserve the detector's raw count and timestamps, not only its threshold verdict. A zero-timeout window proves recovery during that window, not that intermittent network loss cannot recur. Keep that distinction in the completion report and retain existing recurrence detection.
 
+If static direct/jump overrides alternate between healthy and stalled, use bounded end-to-end payload admission rather than another permanent pin. Race independent uncompressed transfers, accept only a complete successful payload, and cancel the loser immediately; waiting for every probe spends the caller's SSH ConnectTimeout on the already-known bad path. Serialize concurrent selections with a short positive/negative cache. A ProxyCommand receives SIGHUP when its caller exits: handle HUP/TERM/INT without an ownership gap between spawning and recording probe children, then kill/reap their process groups. Test with real stalled children and signals, not only mocked Popen. Keep helper stdout exclusively for SSH bytes, disable inherited proxy recursion, retain strict known-host verification, and use a connect-only timeout for the final byte-stream transport (an nc idle timeout breaks quiet sessions). Verify concurrent large application responses through the client's actual forward, not only small health checks. Fail-closed route admission can suppress timeout logs while still disconnected, so require successful application reads as well as a zero detector count.
+
 ## What you may fix without asking
 
 - `collect.py clean --apply` (can take several minutes: run it in the background and wait for it, not in a
