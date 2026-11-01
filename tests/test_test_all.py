@@ -220,8 +220,9 @@ class TestAll(unittest.TestCase):
             self.assertEqual(site, self.root / 'python-3.14')
             install.assert_called_once_with(
                 ['/bin/uv', 'pip', 'install', '-q', '--python', '/fake/python with spaces',
-                 '--target', str(site), 'pytest', 'pytest-asyncio', 'pyyaml', 'fastapi', 'httpx', 'psutil', 'anthropic==0.125.0'], check=True)
-            for name in ('pytest', 'pytest_asyncio', 'yaml', 'fastapi', 'httpx', 'psutil', 'anthropic'):
+                 '--target', str(site), 'pytest', 'pytest-asyncio', 'pytest-xdist', 'pyyaml', 'ruamel.yaml',
+                 'fastapi', 'httpx', 'psutil', 'anthropic==0.125.0'], check=True)
+            for name in ('pytest', 'pytest_asyncio', 'xdist', 'yaml', 'ruamel', 'fastapi', 'httpx', 'psutil', 'anthropic'):
                 (site / name).mkdir(parents=True)
             metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
             metadata.parent.mkdir()
@@ -246,6 +247,30 @@ class TestAll(unittest.TestCase):
             ensure('/fake/python with spaces', core)
             self.assertEqual(install.call_count, 4)
             self.assertIn('anthropic==0.126.0', install.call_args.args[0])
+
+    def test_test_site_without_ruamel_or_xdist_is_repaired(self):
+        # Core's hermes_yaml imports ruamel, and coach tests run a nested `pytest -n 2`: a site built before
+        # both were provisioned failed 11 coach tests on Mac py3.14 that pass under the core venv.
+        runner = runpy.run_path(str(RUNNER))
+        ensure = runner['ensure_test_site']
+        with patch.dict(ensure.__globals__, {'TEST_SITE': self.root, 'python_version': lambda py: '3.14.9'}), \
+                patch('shutil.which', return_value='/bin/uv'), patch('subprocess.run') as install:
+            site = self.root / 'python-3.14'
+            for name in ('pytest', 'pytest_asyncio', 'yaml', 'fastapi', 'httpx', 'psutil', 'anthropic'):
+                (site / name).mkdir(parents=True)
+            metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
+            metadata.parent.mkdir()
+            metadata.write_text('Name: anthropic\nVersion: 0.125.0\n')
+            ensure('/fake/python')
+            self.assertEqual(install.call_count, 1)
+            self.assertIn('ruamel.yaml', install.call_args.args[0])
+            self.assertIn('pytest-xdist', install.call_args.args[0])
+            (site / 'ruamel').mkdir()
+            ensure('/fake/python')
+            self.assertEqual(install.call_count, 2)  # still no xdist
+            (site / 'xdist').mkdir()
+            ensure('/fake/python')
+            self.assertEqual(install.call_count, 2)
 
     def test_test_site_finds_user_uv_or_reports_missing_installer(self):
         runner = runpy.run_path(str(RUNNER))
