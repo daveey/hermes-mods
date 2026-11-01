@@ -13,6 +13,19 @@ Coverage: `tests/test_stranded_sqlite_retired.py` checks missing/tombstoned/live
 `tests/test_stranded_sqlite_watch.py` retains real child-process deleted-sidecar detection and mock-only filing.
 
 
+## Traceback attribution
+
+Bug detection decodes JSON tool envelopes before inspecting frame paths and exception tails.
+Bundled Python under `tools/python-*/lib` is not Hermes source. For `execute_code`,
+executor frames above the last `<cell>` frame do not establish a core defect; real Hermes
+frames below that boundary still do. Successful cell output quoting a traceback is ignored.
+Qualified exception names are retained instead of collapsing distinct failures to `traceback`.
+
+Regression coverage: `tests/test_bug_traceback_attribution.py` exercises raw/dict/JSON/guidance-suffixed
+results, three JSON parsing failure shapes, true core failures, and observer recording.
+`tests/test_agent_channel.py` retains the existing raw traceback and infrastructure/refusal checks.
+This changes defect attribution, not the execution or parsing of caller code.
+
 ## Agent channel (invisible to you)
 
 The plugin watches the agent's own tool calls. When it spots a known anti-pattern, it attaches a one-line hint to the

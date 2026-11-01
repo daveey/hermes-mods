@@ -1093,12 +1093,31 @@ def bug_signature(tool: str, result: Any, status: Optional[str], error_type: Opt
                   error_message: Optional[str]) -> Optional[str]:
     """A normalized signature when this failure looks like a Hermes bug (not the agent's own mistake)."""
     text = str(error_message or "")
-    raw = result if isinstance(result, str) else json.dumps(result, default=str) if result is not None else ""
-    frame = TRACE_HERMES_RE.search(raw) or TRACE_HERMES_RE.search(text)
-    if frame:
-        last = re.findall(r"\n\s*([A-Z][A-Za-z]+(?:Error|Exception)[^\n]{0,120})", raw + "\n" + text)
-        head = last[-1] if last else "traceback"
-        return _normalize_sig(f"{tool}: {head}")
+    d = _as_dict(result) or _leading_dict(result)
+    # Decode the envelope first: JSON escaping hides both frame quotes and newlines.
+    payloads = [v for k in ("error", "output", "stderr") if isinstance(v := d.get(k), str)]
+    if not d and isinstance(result, str):
+        payloads.append(result)
+    payloads.append(text)
+    if tool == "execute_code" and d.get("status") == "success" and not d.get("error"):
+        return None  # A successful cell may be reading someone else's traceback.
+    cell_failure = False
+    for payload in payloads:
+        cells = list(re.finditer(r'^\s*File "<cell>",', payload, re.M))
+        if tool == "execute_code" and cells:
+            cell_failure = True
+            # The executor above the cell is infrastructure, not the failing code.
+            payload = payload[cells[-1].start():]
+        frames = [m for m in TRACE_HERMES_RE.finditer(payload)
+                  if not re.search(r'/tools/python-[^/]+/(?:lib|Lib)/', m.group())]
+        # Bundled Python lives under .hermes/tools, but stdlib is not Hermes code.
+        if frames:
+            last = re.findall(
+                r"^((?:[\w]+\.)*[A-Z][\w]*(?:Error|Exception):[^\n]{0,120})", payload, re.M)
+            head = last[-1] if last else "traceback"
+            return _normalize_sig(f"{tool}: {head}")
+    if cell_failure:
+        return None  # An exception type alone cannot reclassify a caller failure.
     if status == "error" and error_type and (EXC_NAME_RE.match(error_type) or error_type == "thread_missing_result"):
         return _normalize_sig(f"{tool}: {error_type}: {text}")
     if status == "error" and tool in HERMES_INFRA_TOOLS:
