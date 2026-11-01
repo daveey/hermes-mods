@@ -345,7 +345,8 @@ both the extraction hook (`transform_llm_output` → `process_reply`) and the pl
 (`publication_buffer`). A step that `card_ask_for` matches to one (the model listed the
 sentence as a repeat of that id; the step contains the ask, or a specific sentence of it;
 its menu offers two of the card's choice labels; or 60%+ of its content words, at least
-three, are the ask's words) publishes nothing, is not framed, does not hold the gate, and
+three, are the ask's words) publishes nothing (a relay the model reports only under
+"repeats" with the card's id is recorded the same way), is not framed, does not hold the gate, and
 is recorded in the session ledger's `card_asks` list as
 `{verdict: 'restates_card_ask', card, board, ...}` (last 50 kept). Word overlap is
 allowed here, unlike between requests, because the card's link to this chat (or the

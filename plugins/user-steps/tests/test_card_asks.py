@@ -156,6 +156,15 @@ def test_model_marked_repeat_of_the_card_publishes_no_request(plugin, monkeypatc
     assert live(plugin) == []
 
 
+def test_relay_reported_only_as_a_repeat_of_the_card_is_recorded(plugin, monkeypatch, boards):
+    # The live extractor often leaves the relay out of "steps" and names the card's id under "repeats".
+    add_card(boards['default'])
+    turn(plugin, monkeypatch, CLOSEOUT, VERBATIM, [], repeats=[{'id': f'kanban:default:{CARD}', 'verbatim_span': VERBATIM}])
+    assert live(plugin) == []
+    assert [(r['verdict'], r['card'], r['verbatim_span']) for r in ledger_card_asks(plugin)] == \
+        [('restates_card_ask', CARD, VERBATIM)]
+
+
 def test_a_different_new_ask_in_the_same_reply_is_still_published(plugin, monkeypatch, boards):
     add_card(boards['default'])
     other = 'Want me to deploy build 412 to the test environment?'

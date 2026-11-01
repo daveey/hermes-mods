@@ -1286,6 +1286,14 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     card_hits = [(s, card_ask_for(s, card_asks, res.get("repeats") or ())) for s in res["steps"]]
     restated = [(s, e) for s, e in card_hits if e is not None]
     res["steps"] = [s for s, e in card_hits if e is None]
+    # The model may also leave a relay out of "steps" and report it only as a repeat of the card's id: record that
+    # too, so every restatement shows in the ledger whichever way the extractor reported it.
+    by_id, hit_ids = {e['id']: e for e in card_asks}, {e['id'] for _, e in restated}
+    for rep in res.get("repeats") or ():
+        e = by_id.get(rep.get("id")) if isinstance(rep, dict) else None
+        if e is not None and e['id'] not in hit_ids:
+            hit_ids.add(e['id'])
+            restated.append(({"text": None, "verbatim_span": rep.get("verbatim_span")}, e))
     published, resolved = [], []
     text = reply
     changed = False
