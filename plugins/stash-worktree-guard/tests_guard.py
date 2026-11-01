@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -397,6 +398,346 @@ def test_fragment_parse_failure_without_restore_is_not_refused(multi):
     assert not _blocked(f'echo "$(case a in a) git -C {wt} stash list;; esac)"', main)
 
 
+# --- Scalar argv and unsupported expansion boundaries ---
+
+@pytest.mark.parametrize("template", [
+    'S=stash; git -C {wt} $S pop',
+    'OP=pop; git -C {wt} stash "$OP"',
+    'G=git; S=stash; OP=pop; $G -C {wt} "$S" "$OP"',
+    'git() {{ command git -C {wt} "$@"; }}; git stash pop',
+    'C="git -C {wt} stash pop"; $C',
+])
+def test_expanded_restore_argv(multi, template):
+    main, wt = multi
+    cmd = template.format(wt=wt)
+    assert _blocked(cmd, main)
+    # The hook is non-mutating, and the refused command is a real restore in bash.
+    assert _stash_count(main) == 1
+    assert (wt / "f.txt").read_text() == "base\n"
+    subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
+    assert _stash_count(main) == 0
+    assert (wt / "f.txt").read_text() == "stashed\n"
+
+
+@pytest.mark.parametrize("where", ["main", "single"])
+def test_scalar_argv_allow_controls(multi, single, where):
+    main, wt = multi
+    repo = {"main": main, "single": single}[where]
+    cmd = f'G=git; S=stash; OP=pop; $G -C {repo} "$S" "$OP" 2>&1'
+    assert not _blocked(cmd, wt)
+
+
+@pytest.mark.parametrize("template", [
+    'env -C {wt} git stash pop',
+    'nice -n 5 git -C {wt} stash pop',
+    'stdbuf -oL git -C {wt} stash pop',
+    'command -p git -C {wt} stash pop',
+    'exec -a git git -C {wt} stash pop',
+    'coproc git -C {wt} stash pop; wait',
+    '/usr/bin/env -C {wt} git stash pop',
+    'W=env; $W -C {wt} git stash pop',
+])
+def test_wrapper_options_are_not_silently_dropped(multi, template):
+    main, wt = multi
+    cmd = template.format(wt=wt)
+    assert _blocked(cmd, main)
+    # The hook is non-mutating, and the refused command is a real restore in bash.
+    assert _stash_count(main) == 1
+    assert (wt / "f.txt").read_text() == "base\n"
+    subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
+    assert _stash_count(main) == 0
+    assert (wt / "f.txt").read_text() == "stashed\n"
+
+
+def test_ansi_c_quote_cannot_hide_substitution(multi):
+    main, wt = multi
+    cmd = "echo $'it\\'s'\"$(git -C " + str(wt) + " stash pop)\"$'it\\'s'"
+    assert _blocked(cmd, main)
+    # ANSI-C quoting is outside the scalar grammar, even when the apparent restore
+    # would otherwise be same-branch. Do not trust boundaries from the ordinary lexer.
+    assert _blocked(f"echo $'plain'; git -C {main} stash pop", wt)
+
+
+@pytest.mark.parametrize("prefix", ["export", "declare -x", "typeset -x"])
+def test_exported_git_selection_overrides_even_absolute_C(multi, prefix):
+    main, wt = multi
+    gitdir = (wt / '.git').read_text().strip().removeprefix('gitdir: ')
+    cmd = f'{prefix} GIT_DIR={gitdir} GIT_WORK_TREE={wt}; git -C {main} stash pop'
+    assert _blocked(cmd, main)
+
+
+def test_prefix_git_selection_overrides_even_absolute_C(multi):
+    main, wt = multi
+    gitdir = (wt / '.git').read_text().strip().removeprefix('gitdir: ')
+    assert _blocked(f'GIT_DIR={gitdir} GIT_WORK_TREE={wt} git -C {main} stash pop', main)
+
+
+def test_cdpath_relative_target_is_unknown(multi, single):
+    main, wt = multi
+    (single / 'target').mkdir()
+    (wt.parent / 'target').symlink_to(wt, target_is_directory=True)
+    cmd = f'CDPATH={wt.parent}; cd target; git stash pop'
+    assert _blocked(cmd, single)
+    assert not _blocked(f'CDPATH={wt.parent}; cd {main}; git stash pop', wt)
+
+
+def test_expansion_globbing_is_not_a_scalar(multi):
+    main, wt = multi
+    (main / 'stash').touch()
+    assert _blocked(f"S='sta*'; git -C {wt} $S pop", main)
+
+
+def test_prefix_cdpath_is_not_ignored(multi, single):
+    main, wt = multi
+    (single / 'target').mkdir()
+    (wt.parent / 'target').symlink_to(wt, target_is_directory=True)
+    assert _blocked(f'CDPATH={wt.parent} cd target; git stash pop', single)
+
+
+# --- Composition: fallback order, function precedence, sticky alternate selection ---
+
+def _gitdir(wt):
+    return (wt / ".git").read_text().strip().removeprefix("gitdir: ")
+
+
+def _assert_real_restore(cmd, main, wt):
+    """Refused, guard left the fixture untouched, and bash really restores main's stash in wt."""
+    assert _blocked(cmd, main), cmd
+    assert _stash_count(main) == 1
+    assert (wt / "f.txt").read_text() == "base\n"
+    proc = subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV)
+    assert proc.returncode == 0, proc.stderr
+    assert _stash_count(main) == (1 if "apply" in cmd else 0)  # apply keeps the entry
+    assert (wt / "f.txt").read_text() == "stashed\n"
+
+
+@pytest.mark.parametrize("template", [
+    # Uncertain fragments fall back to text evidence; it must not depend on word order.
+    'OP=pop; S=stash; env -C {wt} git "$S" "$OP"',
+    'OP=apply; S=stash; nice -n 5 git -C {wt} "$S" "$OP"',
+    'OP=pop; S=stash; stdbuf -oL git -C {wt} "$S" "$OP"',
+    "OP=pop; S=stash; echo $'hi'; git -C {wt} \"$S\" \"$OP\"",
+    "OP=pop; S=stash; git -C {wt} \"$S\" \"$OP\"; echo $'hi'",
+    # Equivalent evidence spelled through split scalars, quotes, or ANSI-C escapes.
+    'A=sta; B=sh; OP=pop; env -C {wt} git "$A$B" "$OP"',
+    "A=sta; B=sh; OP=pop; echo $'hi'; git -C {wt} \"${{A}}${{B}}\" \"$OP\"",
+    "echo $'hi'; git -C {wt} st'a'sh p\\op",
+    "echo $'hi'; git -C {wt} $'\\x73tash' $'\\160op'",
+])
+def test_uncertain_fallback_is_order_and_spelling_independent(multi, template):
+    main, wt = multi
+    _assert_real_restore(template.format(wt=wt), main, wt)
+
+
+@pytest.mark.parametrize("template", [
+    # Bash resolves functions before PATH, so wrapper names are ordinary function names.
+    'env() {{ git -C {wt} stash pop; }}; env true',
+    'timeout() {{ git -C {wt} stash pop; }}; timeout 5 true',
+    'nice() {{ git -C {wt} stash pop; }}; nice -n 5 true',
+    'function nohup {{ git -C {wt} stash pop; }}; nohup true',
+    'stdbuf() {{ git -C {wt} stash pop; }}; stdbuf -oL true',
+    'sudo() {{ git -C {wt} stash pop; }}; sudo true',
+    # Non-POSIX bash lets a function shadow even `command` and `exec`.
+    'command() {{ git -C {wt} stash pop; }}; command true',
+    'exec() {{ git -C {wt} stash pop; }}; exec true',
+    'E=env; env() {{ git -C {wt} stash pop; }}; $E true',
+    # `command` still bypasses a shadowing function and runs the real restore.
+    'git() {{ :; }}; command git -C {wt} stash pop',
+])
+def test_functions_resolve_before_wrapper_names(multi, template):
+    main, wt = multi
+    _assert_real_restore(template.format(wt=wt), main, wt)
+
+
+def test_function_precedence_allow_controls(multi, single):
+    main, wt = multi
+    # The function shadows the wrapper: the wrapped restore never runs in bash.
+    cmd = f'env() {{ :; }}; env git -C {wt} stash pop'
+    assert not _blocked(cmd, main)
+    subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
+    assert _stash_count(main) == 1
+    # Same-branch and single-worktree restores through a shadowing function stay allowed.
+    assert not _blocked(f'timeout() {{ git -C {main} stash pop; }}; timeout 5 true', wt)
+    assert not _blocked(f'env() {{ git -C {single} stash pop; }}; env true', wt)
+    assert not _blocked(f'git() {{ :; }}; command git -C {main} stash pop', wt)
+    # Non-restoring function bodies are not refused.
+    assert not _blocked(f'env() {{ git -C {wt} stash list; }}; env true', main)
+
+
+@pytest.mark.parametrize("template", [
+    "git --git-dir={gitdir} --work-tree={wt} -C {main} stash pop",
+    "git --git-dir {gitdir} --work-tree {wt} -C {main} stash pop",
+    "git --work-tree={wt} --git-dir={gitdir} -C {main} stash apply",
+    "git --git-dir={gitdir} -C {main} --work-tree {wt} stash pop",
+    "git -C {main} --git-dir={gitdir} --work-tree={wt} -C {main} stash pop",
+])
+def test_cli_alternate_selection_is_sticky_across_C(multi, template):
+    main, wt = multi
+    cmd = template.format(gitdir=_gitdir(wt), wt=wt, main=main)
+    _assert_real_restore(cmd, main, wt)
+
+
+def test_alternate_selection_controls(multi, single):
+    main, wt = multi
+    # Plain absolute -C stays trusted; redirection and non-restoring ops are unaffected.
+    assert not _blocked(f"git -C {main} stash pop 2>&1 >/dev/null", wt)
+    assert not _blocked(f"git -C {single} stash pop", wt)
+    assert not _blocked(f"git --git-dir={_gitdir(wt)} --work-tree={wt} -C {main} stash list", main)
+
+
+# --- Unknown wrapper/Git argv, brace expansion, builtin and logical cwd ---
+
+def _symlink_into_main(main, wt):
+    """wt/l -> main/d: logically wt/l/.. is wt (other), physically it is main."""
+    (main / "d").mkdir()
+    (wt / "l").symlink_to(main / "d", target_is_directory=True)
+
+
+UNKNOWN_ARGV_RESTORES = [
+    # Long timeout options are parsed, not mistaken for the command.
+    "timeout --foreground 10 git -C {wt} stash pop",
+    "timeout --signal=TERM 10 git -C {wt} stash pop",
+    "timeout --kill-after=5 --preserve-status 10 git -C {wt} stash pop",
+    "timeout -v -s KILL 10s git -C {wt} stash apply",
+    # Unquoted brace expansion is not a literal word.
+    "git -C {wt} {{stash,pop}}",
+    # builtin/command run the cd builtin.
+    "builtin cd {wt}; git stash pop",
+    "command cd {wt}; git stash pop",
+    "builtin pushd {wt} >/dev/null; git stash pop",
+    # Unknown op values (printf -v, read, $(...), arrays, "$@", ${X:-y}) with and
+    # without wrappers or ANSI-C text.
+    'printf -v OP %s%s%s p o p; git -C {wt} stash "$OP"',
+    'printf -v OP %s%s%s p o p; git -C {wt} stash "$OP" -q',
+    'printf -v OP %s%s%s p o p; nice -n 5 git -C {wt} stash "$OP"',
+    "printf -v OP %s%s%s p o p; echo $'hi'; git -C {wt} stash \"$OP\"",
+    "printf -v OP %s%s%s p o p; echo $'hi'; nice -n 5 git -C {wt} stash \"$OP\"",
+    'printf -v OP %s%s%s p o p; timeout --foreground 5 git -C {wt} stash "$OP"',
+    'printf -v S %s%s st ash; printf -v OP %s%s%s p o p; git -C {wt} "$S" "$OP"',
+    'printf -v S %s%s st ash; printf -v OP %s%s%s p o p; stdbuf -oL git -C {wt} "$S" "$OP"',
+    'read -r OP <<< pop; git -C {wt} stash "$OP"',
+    'OP=$(echo pop); env -C {wt} git stash "$OP"',
+    'A=(stash pop); git -C {wt} "${{A[@]}}"',
+    'set -- stash pop; git -C {wt} "$@"',
+    'git -C {wt} stash "${{OP:-pop}}"',
+    # Git global options with a separate argument, and config-injected aliases.
+    "git --namespace foo -C {wt} stash pop",
+    "git --no-optional-locks -C {wt} stash pop",
+    "git -c alias.p='stash pop' -C {wt} p",
+    # Generic command runners.
+    "echo pop | xargs git -C {wt} stash",
+    "flock {main}/.lk git -C {wt} stash pop",
+    "setsid -w git -C {wt} stash pop",
+    "find {main}/f.txt -exec git -C {wt} stash pop \\;",
+    # Temporary bindings read by cd.
+    "cd {main}; OLDPWD={wt} cd - >/dev/null; git stash pop",
+    "HOME={wt} cd; git stash pop",
+]
+
+
+@pytest.mark.parametrize("template", UNKNOWN_ARGV_RESTORES)
+def test_unknown_argv_and_wrapper_restores_are_refused(multi, template):
+    main, wt = multi
+    _assert_real_restore(template.format(wt=wt, main=main), main, wt)
+
+
+@pytest.mark.parametrize("template", [
+    "cd {wt}/l/..; git stash pop",
+    "cd {wt}/l; cd ..; git stash pop",
+    "pushd {wt}/l/.. >/dev/null; git stash pop",
+])
+def test_logical_cd_through_symlink_is_not_resolved_physically(multi, template):
+    main, wt = multi
+    _symlink_into_main(main, wt)
+    _assert_real_restore(template.format(wt=wt, main=main), main, wt)
+
+
+@pytest.mark.parametrize("template", [
+    # Not executed: bash would fail or the shape is a usage error, but argv is unknown.
+    "git -C {wt} stash{{,}} pop",
+    "git -C {wt} st{{a,}}sh pop",
+    "git -C {wt} stash p{{o,}}p",
+    'printf -v OP %s%s%s p o p; git -C {wt} stash -q "$OP"',
+    "git --shallow-file x -C {wt} stash pop",
+    "git --attr-source HEAD -C {wt} stash pop",
+    "git --frobnicate foo -C {wt} stash pop",
+    "timeout --frobnicate 10 git -C {wt} stash pop",
+    "timeout 1e3 git -C {wt} stash pop",
+    'git -C {wt} -c "$CFG" p',
+    "W=x; $UNKNOWN -C {wt} git stash \"$OP\"",
+])
+def test_unsupported_argv_forms_fail_closed(multi, template):
+    main, wt = multi
+    assert _blocked(template.format(wt=wt, main=main), main)
+
+
+_BASES = [
+    'printf -v OP %s%s%s p o p; {deco}git -C {wt} stash "$OP"',
+    'printf -v S %s%s st ash; printf -v OP %s%s%s p o p; {deco}git -C {wt} "$S" "$OP"',
+    "{deco}git -C {wt} {{stash,pop}}",
+    "{deco}git --namespace foo -C {wt} stash pop",
+    "OP=pop; S=stash; {deco}git -C {wt} \"$S\" \"$OP\"",
+]
+_DECORATIONS = [
+    "", "echo $'hi'; ", "nice -n 5 ", "timeout --foreground 5 ", "stdbuf -oL ",
+    "env -i PATH=\"$PATH\" ", "echo $'hi'; nice -n 5 ", "flock /tmp/lk ", "command -p ",
+]
+
+
+@pytest.mark.parametrize("deco", _DECORATIONS)
+@pytest.mark.parametrize("base", _BASES)
+def test_added_uncertainty_never_turns_a_refusal_into_allow(multi, base, deco):
+    main, wt = multi
+    assert _blocked(base.format(wt=wt, deco=""), main)
+    assert _blocked(base.format(wt=wt, deco=deco), main), deco
+
+
+def test_round3_allow_controls(multi, single):
+    main, wt = multi
+    for cmd in (
+        # same-branch / single-worktree restores through the newly modeled forms
+        f"timeout 10 git -C {main} stash pop",
+        f"timeout --foreground -k 5 10 git -C {main} stash pop",
+        f"builtin cd {main}; git stash pop",
+        f"builtin cd {single}; git stash pop",
+        f"git --namespace foo -C {main} stash pop",
+        f"git --no-pager -C {main} stash pop 2>&1 >/dev/null",
+        f"git -C {main} stash pop stash@{{0}}",
+        f"git -c core.editor=true -C {main} stash pop",
+        f"pushd {single} >/dev/null; git stash pop",
+        f"cd {main}/../repo; git stash pop",
+    ):
+        assert not _blocked(cmd, wt), cmd
+    for cmd in (
+        # non-restoring commands with unknown or wrapped argv
+        f"timeout --foreground 10 git -C {wt} stash list",
+        f"git -C {wt} stash list stash@{{0}}",
+        f"printf -v OP %s%s%s l i st; git -C {wt} stash list",
+        f"nice -n 5 git -C {wt} stash list",
+        f"printf $'x\\ty\\n'; git -C {wt} stash list",
+        f"echo pop | xargs -n1 git -C {wt} log -1",
+        f"find {main} -name '*.txt' -print",
+        f"git -c alias.p='stash pop' -C {main} log -1",
+        'git log --format="%H" -1 "$X"',
+        'git commit -m "$MSG"',
+        f'git -C {wt} stash -m "$MSG"',
+        f"echo $'x'; git -C {wt} stash push -m \"$MSG\"",
+        f"echo $'x'; git -C {wt} stash -m \"$MSG\"",
+    ):
+        assert not _blocked(cmd, main), cmd
+
+
+def test_logical_cd_allow_controls(multi):
+    main, wt = multi
+    _symlink_into_main(main, wt)
+    # Physical cd lands in main (same branch); a symlink without `..` is unambiguous.
+    assert not _blocked(f"cd -P {wt}/l/..; git stash pop", wt)
+    assert not _blocked(f"cd {wt}/l; cd {main}; git stash pop", wt)
+    assert not _blocked(f"cd {wt}/l; git stash list", main)
+    # The tracked logical cwd is still exact: wt/l is inside main's checkout.
+    assert not _blocked(f"cd {wt}/l; git stash pop", wt)
+
+
 # --- Bounds: state cap, step budget, unexpected analyzer exception ---
 
 def _subdirs(repo, n):
@@ -439,3 +780,237 @@ def test_unexpected_analyzer_exception_fails_closed(multi, monkeypatch):
     monkeypatch.setattr(guard._Analyzer, "simple", boom)
     assert _blocked(same_branch, wt)
     assert not _blocked(f"git -C {main} stash list", wt)
+
+
+# --- Review round 4: shell entry points, splitting, program names, config ---
+
+ROUND4_RESTORES = [
+    # A hashed name runs its path; unset does not clear the hash table; a function wins.
+    "hash -p /usr/bin/git g; unset g; g -C {wt} stash pop",
+    "g() {{ git -C {wt} stash pop; }}; hash -p /bin/true g; g",
+    # IFS changes how an unquoted scalar splits.
+    "IFS=x; A=stashxpop; git -C {wt} $A",
+    "IFS=_; A=stash_pop; git -C {wt} $A",
+    "read -r IFS <<< x; A=stashxpop; git -C {wt} $A",
+    # Backslash-newline is removed before tokenizing.
+    "git -C {wt} sta\\\nsh pop",
+    "git -C {wt} \\\nstash pop",
+    # Shell option clusters and `--` before the -c script.
+    "bash -ec 'git -C {wt} stash pop'",
+    "bash -lc 'git -C {wt} stash pop'",
+    "sh -c -- 'git -C {wt} stash pop'",
+    "bash -o pipefail -c 'git -C {wt} stash pop'",
+    # A shell reading its script from stdin or a file the guard does not see.
+    "echo 'git -C {wt} stash pop' | bash",
+    "cat <<'EOF' | bash\ngit -C {wt} stash pop\nEOF",
+    "bash <(echo 'git -C {wt} stash pop')",
+    "echo 'git -C {wt} stash pop' > {main}/.git/s.sh; bash {main}/.git/s.sh",
+    # set -a exports every later assignment.
+    "set -a; GIT_DIR={gd}; GIT_WORK_TREE={wt}; git stash pop",
+    "set -o allexport; GIT_DIR={gd}; GIT_WORK_TREE={wt}; git stash pop",
+    "set -a; GIT_DIR={gd}; GIT_WORK_TREE={wt}; bash -c 'git stash pop'",
+    # Programs that are git under another name.
+    "cd {wt} && $(git --exec-path)/git-stash pop",
+    "cd {wt} && /usr/lib/git-core/git-stash pop",
+    "hash -p /usr/bin/git g; g -C {wt} stash pop",
+    # Unlisted programs that run their argv.
+    "prlimit --nofile=1024 git -C {wt} stash pop",
+    "setpriv --inh-caps=-all git -C {wt} stash pop",
+    # Config injected through include files or config-file environment.
+    "printf '[alias]\\n\\tp = stash pop\\n' > {main}/.git/inc; git -c include.path={main}/.git/inc -C {wt} p",
+    "printf '[alias]\\n\\tp = stash pop\\n' > {main}/.git/inc; GIT_CONFIG_GLOBAL={main}/.git/inc git -C {wt} p",
+    "mkdir -p {main}/.git/h; printf '[alias]\\n\\tp = stash pop\\n' > {main}/.git/h/.gitconfig; HOME={main}/.git/h git -C {wt} p",
+]
+
+
+def _gitdir(wt):
+    return (wt / ".git").read_text().strip().removeprefix("gitdir: ")
+
+
+@pytest.mark.parametrize("template", ROUND4_RESTORES)
+def test_round4_restores_are_refused(multi, template):
+    main, wt = multi
+    cmd = template.format(wt=wt, main=main, gd=_gitdir(wt))
+    if "/usr/lib/git-core/" in cmd and not Path("/usr/lib/git-core/git-stash").exists():
+        cmd = cmd.replace("/usr/lib/git-core/git-stash", "$(git --exec-path)/git-stash")
+    for prog in ("prlimit", "setpriv"):
+        if cmd.startswith(prog) and not shutil.which(prog):
+            assert _blocked(cmd, main), cmd
+            return
+    _assert_real_restore(cmd, main, wt)
+
+
+def test_round4_allow_controls(multi, single):
+    main, wt = multi
+    for cmd in (
+        f"bash -ec 'git -C {main} stash pop'",
+        f"bash -lc 'cd {single} && git stash pop'",
+        f"sh -c -- 'git -C {main} stash pop'",
+        f"IFS=x; A=stash; git -C {main} $A pop",
+        f"git -C {main} sta\\\nsh pop",
+        f"set -a; X=1; git -C {main} stash pop",
+        f"cd {main} && /usr/lib/git-core/git-stash pop",
+        f"git -c include.path=/dev/null -C {main} log -1",
+        f"git -c include.path=/dev/null -C {main} stash pop",
+        f"echo hi # comment \\\ngit -C {main} stash pop",
+    ):
+        assert not _blocked(cmd, wt), cmd
+    for cmd in (
+        f"bash -ec 'git -C {wt} stash list'",
+        f"echo 'git -C {wt} log' | bash",
+        "bash scripts/test.sh",
+        "cat f | bash",
+        f"IFS=x; A=stash; git -C {wt} $A list",
+        f"prlimit --nofile=1024 git -C {wt} stash list",
+        f"hash -p /usr/bin/git g; g -C {wt} stash list",
+        f"git -c include.path=/dev/null -C {wt} log -1",
+        f"HOME=/tmp git -C {wt} log -1",
+        'git commit -m "fix stash pop handling"',
+        'grep -rn "stash pop" .',
+        "echo git stash pop",
+        f"set -a; GIT_PAGER=cat; git -C {wt} stash list",
+    ):
+        assert not _blocked(cmd, main), cmd
+    # Documented conservative refusal: a restore behind an unmodeled program runs in an
+    # unknown repo, even when that repo would be the same branch.
+    assert _blocked(f"prlimit --nofile=1024 git -C {main} stash pop", wt)
+
+
+def test_round4_conservative_refusals(multi):
+    main, wt = multi
+    # Static only: these programs may be absent, or run elsewhere (ssh).
+    for cmd in (
+        f"numactl --localalloc git -C {wt} stash pop",
+        f"eatmydata git -C {wt} stash pop",
+        f"ssh host git -C {wt} stash pop",
+        # Same-branch restores next to a shell reading an unseen script.
+        "git stash pop; cat f | bash",
+        f"bash x.sh; git -C {main} stash pop",
+    ):
+        assert _blocked(cmd, main), cmd
+
+
+def test_round4_comment_does_not_continue_line(multi):
+    main, wt = multi
+    # In bash a backslash inside a comment does not join the next line: the git line runs.
+    _assert_real_restore(f"echo hi # note \\\ngit -C {wt} stash pop", main, wt)
+
+
+# --- Review round 5: hash table, allexport/keyword, namerefs, pipes, interpreters ---
+
+ROUND5_RESTORES = [
+    # A hashed name is forgotten by hash -r/-d, an assignment to PATH, or set +h.
+    "hash -p /bin/echo git; hash -r; git -C {wt} stash pop",
+    "hash -p /bin/echo git; hash -d git; git -C {wt} stash pop",
+    "hash -p /bin/echo git; PATH=$PATH; git -C {wt} stash pop",
+    "set +h; hash -p /bin/echo git; git -C {wt} stash pop",
+    "P=$(command -v git); hash -p $P g; g -C {wt} stash pop",
+    "hash -p$(command -v git) g; g -C {wt} stash pop",
+    "BASH_CMDS[g]=$(command -v git); g -C {wt} stash pop",
+    # allexport exports only later assignments; `set x -a` sets positionals, not -a.
+    "cd {wt}; D={main}; set -a; bash -c 'git -C \"$D\" stash pop'",
+    "cd {wt}; set x -a; D={main}; bash -c 'git -C \"$D\" stash pop'",
+    "set -eo allexport; GIT_DIR={gd}; GIT_WORK_TREE={wt}; git stash pop",
+    "shopt -so allexport; GIT_DIR={gd}; GIT_WORK_TREE={wt}; git stash pop",
+    "bash -a -c 'GIT_DIR={gd}; GIT_WORK_TREE={wt}; git stash pop'",
+    "bash -o allexport -c 'GIT_DIR={gd}; GIT_WORK_TREE={wt}; git stash pop'",
+    "set -k; git GIT_DIR={gd} GIT_WORK_TREE={wt} stash pop",
+    "declare -n R=IFS; R=x; A=stashxpop; git -C {wt} $A",
+    # Shell input the guard does not read as a script.
+    "printf 'git -C %s stash pop\\n' {wt} | bash 3<<<x",
+    "printf 'git -C {wt} %s%s pop\\n' sta sh | bash",
+    "source <(echo 'git -C {wt} stash pop')",
+    ". /dev/stdin <<< 'git -C {wt} stash pop'",
+    "printf 'git -C %s stash pop' {wt} > {main}/.git/s; bash -- {main}/.git/s",
+    # Programs that run git or a shell from their argv.
+    "busybox sh -c 'g\"\"it -C {wt} stash pop'",
+    "perl -e 'system(\"git -C {wt} stash pop\")'",
+    "python3 -c 'import os; os.system(\"git -C {wt} stash pop\")'",
+    "G=git; nice $G -C {wt} stash pop",
+    "G=git; prlimit --nofile=1024 $G -C {wt} stash pop",
+    "S=git-stash; cd {wt} && setpriv --inh-caps=-all $(git --exec-path)/$S pop",
+    # An alias written earlier in the same command.
+    "git config alias.p 'stash pop' && git -C {wt} p",
+]
+
+
+@pytest.mark.parametrize("template", ROUND5_RESTORES)
+def test_round5_restores_are_refused(multi, template):
+    main, wt = multi
+    cmd = template.format(wt=wt, main=main, gd=_gitdir(wt))
+    needs = [p for p in ("prlimit", "setpriv", "busybox", "perl", "python3") if p in cmd.split()
+             or f"{p} " in cmd]
+    if any(not shutil.which(p) for p in needs):
+        assert _blocked(cmd, main), cmd
+        return
+    _assert_real_restore(cmd, main, wt)
+
+
+def test_round5_allow_controls(multi):
+    main, wt = multi
+    for cmd in (
+        f"hash -p /bin/echo e; git -C {main} stash pop",
+        f"set -a; D={main}; bash -c 'git -C \"$D\" stash pop'",
+        f"shopt -so allexport; X=1; git -C {main} stash pop",
+        f"set -k; git -C {main} stash pop",
+        f"python3 -m pytest -q && git -C {main} stash pop",
+        f"python3 -c 'print(1)' && git -C {main} stash pop",
+        f"make \"$TARGET\" && git -C {main} stash pop",
+        f"declare -n ref=arr; git -C {main} stash pop",
+        f"git config alias.st status && git -C {main} st",
+        f"echo pop | bash -c cat",
+        f"printf 'hello\\n' | bash; git -C {main} stash list",
+        f"git config user.name x && git -C {main} stash pop",
+        f"git -c core.editor=true -c core.pager=cat -C {main} stash pop",
+        f"x=\"$(git -C {main} stash list)\"; PS4='+ '; git -C {main} stash pop",
+        f'gh pr create --title x --body "then run git -C {wt} stash pop"',
+        f"sed -i 's|old|git -C {wt} stash pop|' notes.md",
+    ):
+        assert not _blocked(cmd, main), cmd
+
+
+# --- Review round 6: programs and settings that run a string, implicit bash code ---
+
+ROUND6_RESTORES = [
+    # Programs that run a string argument as shell code.
+    "echo x | sed 'e git -C {wt} stash pop'",
+    "echo 'git -C {wt} stash pop' | sed 's/^//e'",
+    "make -f /dev/null --eval 'all:;git -C {wt} stash pop' all",
+    "vim -es -u NONE -c '!git -C {wt} stash pop' -c 'qa!'",
+    "echo 'system(q(git -C {wt} stash pop))' | perl",
+    # BASH_CMDS set without a plain assignment.
+    "declare BASH_CMDS[g]=$(command -v git); g -C {wt} stash pop",
+    "printf -v 'BASH_CMDS[g]' %s $(command -v git); g -C {wt} stash pop",
+    # Code bash runs implicitly.
+    "command_not_found_handle() {{ git -C {wt} stash pop; }}; nosuchcmd_xyz; true",
+    "PS4='$(git -C {wt} stash pop >&2)'; set -x; true",
+    "x='$(git -C {wt} stash pop)'; echo \"${{x@P}}\"",
+    "x='a[$(git -C {wt} stash pop >/dev/null; echo 0)]'; (( x )); true",
+    "printf 'a\\n' | mapfile -t -C 'git -C {wt} stash pop; :' -c 1 arr",
+    "printf 'cd {wt}\\n' > {main}/.git/env.sh; BASH_ENV={main}/.git/env.sh bash -c 'git stash pop'",
+    "printf 'cd {wt}\\n' > {main}/.git/rc; bash --rcfile {main}/.git/rc -ic 'git stash pop'",
+    # Git running a program from config or the environment.
+    "git -c diff.external='git -C {wt} stash pop #' diff --ext-diff 'stash@{{0}}^1' 'stash@{{0}}'",
+    "GIT_EXTERNAL_DIFF='git -C {wt} stash pop #' git diff --ext-diff 'stash@{{0}}^1' 'stash@{{0}}'",
+    "mkdir -p {main}/.git/hk && printf '#!/bin/sh\\nunset GIT_DIR GIT_INDEX_FILE\\n"
+    "git -C {wt} stash pop\\n' > {main}/.git/hk/pre-commit"
+    " && chmod +x {main}/.git/hk/pre-commit && git -c core.hooksPath={main}/.git/hk commit -q"
+    " --allow-empty -m x",
+    # Escape-encoded text piped to a shell.
+    "printf '\\x67it -C {wt} \\x73tash \\x70op' | bash",
+    "printf 'git -C {wt} st\\141sh p\\157p' | bash",
+    # A shell alias defined in the same command.
+    "shopt -s expand_aliases\nalias g='git -C {wt}'\ng stash pop",
+]
+
+
+@pytest.mark.parametrize("template", ROUND6_RESTORES)
+def test_round6_restores_are_refused(multi, template):
+    main, wt = multi
+    cmd = template.format(wt=wt, main=main, gd=_gitdir(wt))
+    first = cmd.split()[0]
+    needs = [p for p in ("vim", "perl", "make", "sed") if p in cmd.split()]
+    if any(not shutil.which(p) for p in needs) or first == "vim":
+        assert _blocked(cmd, main), cmd  # static only: vim may be absent or interactive
+        return
+    _assert_real_restore(cmd, main, wt)
