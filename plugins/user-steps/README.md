@@ -330,6 +330,31 @@ the withdraw instruction. None of this records a decision or grants anything.
 `tests/test_one_open_ask.py` replays each live duplicate and the adversarial
 review's keep-both cases.
 
+### A blocked Kanban card's own ask
+
+A blocked card with a `human_request` already is the request in **For you**. A reply
+that relays it (a chat-closeout turn told to pass the ask on, a Kanban blocked notice)
+used to mint a second, unlinked tile with the card's choices; whichever one the user
+answered, the other went stale. `core.kanban_asks` now lists, on every live local board
+(`kanban/boards/_archived` skipped), the cards with status `blocked` and a
+`human_request` that are linked to this chat's lineage (`kanban_notify_subs.chat_id`)
+or named by id in this turn's runtime message (chat-closeout or Kanban notice; a card id
+the user typed adds nothing). Each is an open ask
+`{id: 'kanban:<board>:<task_id>', kind: 'kanban_ask', text: human_request.action}` for
+both the extraction hook (`transform_llm_output` → `process_reply`) and the plan gate
+(`publication_buffer`). A step that `card_ask_for` matches to one (the model listed the
+sentence as a repeat of that id; the step contains the ask, or a specific sentence of it;
+its menu offers two of the card's choice labels; or 60%+ of its content words, at least
+three, are the ask's words) publishes nothing, is not framed, does not hold the gate, and
+is recorded in the session ledger's `card_asks` list as
+`{verdict: 'restates_card_ask', card, board, ...}` (last 50 kept). Word overlap is
+allowed here, unlike between requests, because the card's link to this chat (or the
+notice naming it) is the provenance, and the match only suppresses: it never answers,
+decides, edits or unblocks the card. Once the card leaves `blocked` (unblocked, done,
+archived) its ask leaves the list and a later re-ask publishes as before; steps that
+match no card behave as before, and an unreadable board lists nothing (fail open).
+Tests: `tests/test_card_asks.py`.
+
 ## Limits
 
 Routes under `/api/plugins/user-steps`:

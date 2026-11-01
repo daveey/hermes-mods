@@ -226,25 +226,35 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
             except Exception as exc:
                 log.warning("user-steps reconcile failed; still recording this reply's asks: %r", exc)
                 _trace(hook="transform", session=session_id, platform=platform, reconcile_error=repr(exc)[:300])
+        user_msg = _USER_MSG.pop(session_id, "")
         out = core.process_reply(
-            response_text, session_id, user_msg=_USER_MSG.pop(session_id, ""), llm=aux_llm, ledger=_ledger(),
+            response_text, session_id, user_msg=user_msg, llm=aux_llm, ledger=_ledger(),
             cards=None, framed=_framed(session_id),
             action_store=core.ActionStore(timeout=HOOK_DB_TIMEOUT) if action_owner else None,
             action_owner=action_owner, turn_requests=_TURN_PUBLISHED.pop(session_id, set()),
-            session_ref=f"@session:{_profile()}/{session_id}")
+            session_ref=f"@session:{_profile()}/{session_id}", card_asks=_card_asks(session_id, user_msg))
         if out.get("error"):
             log.warning("user-steps extractor fell back to regex: %s", out["error"])
         if out.get("dropped"):
             log.info("user-steps dropped %d terminal-doable step(s): %s", len(out["dropped"]), out["dropped"])
         _trace(hook="transform", session=session_id, platform=platform, source=out.get("source"),
                new=[s["id"] for s in out.get("steps", [])], resolved=out.get("resolved"),
-               framed=out.get("text") is not None, error=out.get("error"),
+               framed=out.get("text") is not None, error=out.get("error"), card_asks=out.get("card_asks"),
                dropped_terminal=out.get("dropped") or None)
         return out.get("text")
     except Exception as exc:
         _trace(hook="transform", session=session_id, platform=platform, exception=repr(exc)[:300])
         log.exception("user-steps transform failed")
         return None  # fail open: the reply is shown unchanged
+
+
+def _card_asks(session_id: str, user_msg: str) -> list[dict]:
+    """Blocked cards' own asks this reply may relay (core.kanban_asks). A failed read lists none: fail open."""
+    try:
+        return core.kanban_asks(session_id, user_msg)
+    except Exception as exc:
+        _trace(hook="card_asks", session=session_id, error=repr(exc)[:300])
+        return []
 
 
 def publication_buffer(session_id='', platform='', final_response='', attempt=0,
@@ -262,7 +272,11 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     # Other chats' titles are relay context only in a turn a runtime notice started (relay provenance); in a
     # turn the user started an overlapping title elsewhere must not drop this reply's approval from the gate.
     relay = core._runtime_message(_USER_MSG.get(session_id, ''))
-    res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks],
+    # A blocked card's own ask is a request too: a reply relaying it needs no new approval (no hold, no nudge to
+    # publish a second, unlinked one).
+    card_asks = _card_asks(session_id, _USER_MSG.get(session_id, ''))
+    res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks]
+                       + [{'id': e['id'], 'kind': e['kind'], 'text': e['text']} for e in card_asks],
                        '', aux_llm, continuity=True, elsewhere=core.elsewhere_titles(store, owner) if relay else [])
     approvals = [s for s in res.get('steps', []) if s['kind'] == 'approve']
     if not approvals:
@@ -273,6 +287,8 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     mapped: dict = {}
 
     def covered(step):
+        if core.card_ask_for(step, card_asks, res.get('repeats') or ()) is not None:
+            return True
         same = core.same_open_ask(step, open_asks, res.get('repeats') or (), mapped,
                                   _TURN_PUBLISHED.get(session_id, ()))
         if same is not None:

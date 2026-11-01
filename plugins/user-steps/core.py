@@ -1229,11 +1229,13 @@ NO_LONGER_NEEDED = "No longer needed"
 def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optional[LLM] = None,
                   ledger: Ledger, cards: Optional[Cards] = None, framed: bool = True,
                   session_ref: str = "", now: Optional[float] = None,
-                  action_store=None, action_owner=None, turn_requests=()) -> dict:
+                  action_store=None, action_owner=None, turn_requests=(), card_asks=()) -> dict:
     """Run one final reply through the pipeline. Returns {text (None = unchanged), steps, resolved, source}.
 
     ``turn_requests``: ids of requests the producer tool published or revised for this session in the turn
-    this reply ends (server-recorded provenance). Only those can absorb a title or menu restatement."""
+    this reply ends (server-recorded provenance). Only those can absorb a title or menu restatement.
+    ``card_asks``: ``kanban_asks`` entries (blocked cards' own asks linked to this chat or named by the turn's
+    runtime message). A step restating one publishes nothing; the ledger records it as ``restates_card_ask``."""
     # A positive retirement finding must survive later persistence/card failures.
     # Local state is not model-supplied and grants no reopen/execution authority.
     retired = []
@@ -1241,7 +1243,7 @@ def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optio
         return _process_reply(reply, session_id, user_msg=user_msg, llm=llm, ledger=ledger,
                               cards=cards, framed=framed, session_ref=session_ref, now=now,
                               retired=retired, action_store=action_store, action_owner=action_owner,
-                              turn_requests=turn_requests)
+                              turn_requests=turn_requests, card_asks=card_asks)
     except Exception:
         if not retired:
             raise
@@ -1252,7 +1254,7 @@ def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optio
 def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[LLM],
                    ledger: Ledger, cards: Optional[Cards], framed: bool,
                    session_ref: str, now: Optional[float], retired: list,
-                   action_store=None, action_owner=None, turn_requests=()) -> dict:
+                   action_store=None, action_owner=None, turn_requests=(), card_asks=()) -> dict:
     """Reconcile exact actions under the source lock before creation/publication.
 
     Resolution is suppression-only. Neither model metadata nor a later repeated
@@ -1270,14 +1272,32 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         mirrored = {s.get('requestId') for s in opened}
         listed += [{'id': a['id'], 'kind': a['kind'], 'text': a['title']}
                    for a in open_asks(action_store, action_owner) if a['id'] not in mirrored]
+    # Blocked cards' own asks: listed so the model can name a relay of one as a repeat (its id is never a ledger
+    # step, so it is never resolved here and never framed).
+    card_asks = [e for e in card_asks or () if isinstance(e, dict) and e.get('kind') == KANBAN_ASK]
+    listed += [{'id': e['id'], 'kind': e['kind'], 'text': e['text']} for e in card_asks]
     # Other chats' open asks are only a relay source in a turn a runtime notice started (relay provenance). In a
     # turn the user started, an equal or similar title elsewhere is no source association: never suppress by it.
     relay = _runtime_message(user_msg)
     elsewhere = elsewhere_titles(action_store, action_owner) if action_store is not None and relay else []
     res = extract(reply, listed, user_msg, llm, continuity=True, elsewhere=elsewhere)
+    card_ids = {e['id'] for e in card_asks}
+    res["resolved"] = [x for x in res["resolved"] if x not in card_ids]  # a card's ask is never resolved from chat
+    card_hits = [(s, card_ask_for(s, card_asks, res.get("repeats") or ())) for s in res["steps"]]
+    restated = [(s, e) for s, e in card_hits if e is not None]
+    res["steps"] = [s for s, e in card_hits if e is None]
     published, resolved = [], []
     text = reply
     changed = False
+    if restated:
+        # The card's own ask is the request: nothing is minted, framed or held for it. Record why, bounded.
+        with ledger.edit(root) as d:
+            log_ = d.setdefault("card_asks", [])
+            for s, e in restated:
+                log_.append({"verdict": "restates_card_ask", "card": e["task_id"], "board": e["board"],
+                             "id": e["id"], "text": s.get("text"), "verbatim_span": s.get("verbatim_span"),
+                             "session": session_id, "at": now})
+            del log_[:-50]
     if res["steps"] or res["resolved"]:
         # Re-read after extraction under Ledger.edit's flock. Resolve, match,
         # budget, and append in one transaction; never decide from opened above.
@@ -1376,7 +1396,9 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     if changed or resolved:
         sync_card(ledger, root, session_id, session_ref or f"@session:default/{session_id}", cards)
     return {"text": text if text != reply else None, "steps": published, "resolved": resolved, "source": res["source"],
-            "dropped": res.get("dropped") or [], **({"error": res["error"]} if res.get("error") else {})}
+            "dropped": res.get("dropped") or [],
+            **({"card_asks": [e["id"] for _, e in restated]} if restated else {}),
+            **({"error": res["error"]} if res.get("error") else {})}
 
 
 _WORTH = re.compile(
@@ -1489,6 +1511,107 @@ def open_asks(store, owner, steps=()) -> list[dict]:
              'labels': [c.get('label') for c in r.get('choices', [])]}
             for r in store.requests(owner)
             if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
+
+
+# ---- a blocked Kanban card's own ask ----------------------------------------------------------------------
+# A blocked card with a human_request already IS the request in For you. A reply that relays it (a chat-closeout
+# "tell the user once", a Kanban blocked notice) minted a second, unlinked tile for the same decision: whichever
+# David answered, the other went stale (MacBook us_c9a2e43afb restating t_01a195f002051277). These entries let the
+# extractor and the gate see those asks; a step that restates one publishes nothing. Read-only: a card's ask is
+# never answered, decided, edited or unblocked from here.
+
+KANBAN_ASK = 'kanban_ask'
+_CARD_ASK_OVERLAP = 0.6
+
+
+def _card_notice(user_msg: str) -> bool:
+    """A runtime turn that may name cards whose asks this reply relays. ``_runtime_message`` misses a bare
+    "[chat-closeout]" (its ``chat-cl\\b`` needs a word end), which reaches the hook unlabeled when the row has no
+    display_kind; that check is left as is for its other callers."""
+    return _runtime_message(user_msg) or (user_msg or "").lstrip().startswith("[chat-closeout]")
+
+
+def kanban_asks(session_id: str, user_msg: str = "", *, boards=None, db: Optional[Path] = None) -> list[dict]:
+    """[{id: 'kanban:<board>:<task_id>', kind: 'kanban_ask', text: human_request.action, ...}] for blocked cards
+    with a human_request on every live local board that are linked to this session's lineage
+    (kanban_notify_subs.chat_id) or named in this turn's runtime message (chat-closeout, Kanban notice).
+    An unreadable board contributes nothing (fail open: the reply's asks publish as before)."""
+    if not session_id:
+        return []
+    chats = set(lineage(session_id, db)) | {session_id}
+    named = set(_CARD_ID.findall(user_msg or "")) if _card_notice(user_msg) else set()
+    out: list[dict] = []
+    for slug, path in (boards if boards is not None else kanban_boards()):
+        try:
+            c = _ro_connect(path, timeout=2)
+        except sqlite3.Error:
+            continue
+        try:
+            marks = ",".join("?" * len(chats))
+            try:
+                linked = {r[0] for r in c.execute(
+                    f"SELECT DISTINCT task_id FROM kanban_notify_subs WHERE chat_id IN ({marks})", tuple(chats))}
+            except sqlite3.Error:
+                linked = set()
+            ids = linked | named
+            if not ids:
+                continue
+            rows = c.execute(
+                f"SELECT id, human_request FROM tasks WHERE status='blocked' AND human_request IS NOT NULL "
+                f"AND id IN ({','.join('?' * len(ids))})", tuple(sorted(ids))).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            c.close()
+        for tid, raw in rows:
+            try:
+                hr = json.loads(raw) if isinstance(raw, str) else None
+            except ValueError:
+                hr = None
+            hr = hr if isinstance(hr, dict) else {}
+            action = str(hr.get("action") or "").strip()
+            if not action:
+                continue
+            labels = [str(ch.get("label")) for ch in (hr.get("choices") or []) if isinstance(ch, dict) and ch.get("label")]
+            out.append({"id": f"kanban:{slug}:{tid}", "kind": KANBAN_ASK, "text": action, "board": slug,
+                        "task_id": tid, "labels": labels})
+    return out
+
+
+def card_ask_for(candidate: dict, entries: list[dict], repeats=()) -> Optional[dict]:
+    """The blocked card's ask ``candidate`` (an extracted step) restates, or None.
+
+    Covered when: the model marked this exact sentence as a repeat of the card's entry; the step's text or
+    sentence contains the card's ask (or a specific sentence of the reply is part of it); its menu offers at
+    least two of the card's choice labels; or most of the step's own words are the ask's words (a paraphrase),
+    which needs at least three content words on both sides so a short generic ask never matches."""
+    cards = [e for e in entries or () if e.get("kind") == KANBAN_ASK]
+    if not cards:
+        return None
+    text, span = ask_key(candidate.get("text")), ask_key(candidate.get("verbatim_span"))
+    by_id = {e["id"]: e for e in cards}
+    if len(span) >= _ASK_KEY_MIN:
+        for r in repeats or ():
+            if isinstance(r, dict) and r.get("id") in by_id and ask_key(r.get("verbatim_span")) == span:
+                return by_id[r["id"]]
+    long_span = len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5
+    options = {ask_key(o) for o in candidate.get("options") or [] if ask_key(o)}
+    mine = _words(candidate.get("text")) | _words(candidate.get("verbatim_span"))
+    named = set(_CARD_ID.findall(f"{candidate.get('text') or ''} {candidate.get('verbatim_span') or ''}"))
+    for e in reversed(cards):
+        action = ask_key(e["text"])
+        if len(action) >= _ASK_KEY_MIN and (action in text or action in span):
+            return e
+        if long_span and span in action:
+            return e
+        if len(options) >= 2 and len(options & {ask_key(x) for x in e.get("labels") or []}) >= 2:
+            return e
+        theirs = _words(e["text"])
+        if len(mine) >= 3 and len(theirs) >= 3:
+            share = len(mine & theirs) / len(mine)
+            if share >= _CARD_ASK_OVERLAP or (e.get("task_id") in named and share >= 0.4):
+                return e
+    return None
 
 
 def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None,
