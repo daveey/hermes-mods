@@ -22,12 +22,20 @@ never to the user.
 from __future__ import annotations
 
 import contextvars
+import importlib.util
 import json
 import math
 import os
 import re
 import time
 from typing import Any, Callable, Optional
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_cache_spec = importlib.util.spec_from_file_location("_coach_module_cache", _HERE / "module_cache.py")
+assert _cache_spec and _cache_spec.loader
+_cache = importlib.util.module_from_spec(_cache_spec)
+_cache_spec.loader.exec_module(_cache)
 
 HANDOFF_RE = re.compile(
     r"(\b(please|you(?:'ll| will)? need to|you can now|can you|could you|go to|open|click|tap|drag|paste|"
@@ -1864,14 +1872,7 @@ def block_time_enabled() -> bool:
     raw: Any = os.environ.get("COACH_BLOCK_TIME")
     if raw is None:
         try:
-            from importlib import util as _u
-            import sys as _sys
-            so = _sys.modules.get("_coach_second_opinion")
-            if so is None:
-                spec = _u.spec_from_file_location("_coach_second_opinion_bt",
-                                                  os.path.join(os.path.dirname(__file__), "second_opinion.py"))
-                so = _u.module_from_spec(spec)
-                spec.loader.exec_module(so)
+            so = _cache.load_sibling(_HERE, "second_opinion")
             raw = so._config_settings().get("block_time")
         except Exception:
             raw = None

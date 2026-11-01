@@ -12,7 +12,6 @@ POST /file-bug {session_id, sig}             -> {board: "hermes", cards}
 GET  /stats?days=7                           -> per-rule shown/accepted/dismissed/digest + precision (KPI 4)
 """
 import importlib.util
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -44,19 +43,16 @@ def bug_board(kb=None) -> Optional[str]:
         return None
 
 
+_HERE = Path(__file__).resolve().parents[1]
+_cache_spec = importlib.util.spec_from_file_location("_coach_module_cache", _HERE / "module_cache.py")
+assert _cache_spec and _cache_spec.loader
+_cache = importlib.util.module_from_spec(_cache_spec)
+_cache_spec.loader.exec_module(_cache)
+
+
 def _core():
-    """core.py, reloaded when the file changes (edits apply without a backend restart)."""
-    name = "_coach_core_api"
-    path = Path(__file__).resolve().parents[1] / "core.py"
-    mtime = path.stat().st_mtime
-    mod = sys.modules.get(name)
-    if mod is None or getattr(mod, "_mtime", None) != mtime:
-        spec = importlib.util.spec_from_file_location(name, path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mod
-        spec.loader.exec_module(mod)
-        mod._mtime = mtime
-    return mod
+    """core.py, using the same checkout cache as the agent hooks."""
+    return _cache.load_sibling(_HERE, "core")
 
 
 class SessionBody(BaseModel):

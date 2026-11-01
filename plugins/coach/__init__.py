@@ -62,25 +62,16 @@ def _last_assistant(history) -> str:
     return ""
 
 
+# Bootstrap the stateless helper without relying on a package name or sys.path.
+_cache_spec = importlib.util.spec_from_file_location("_coach_module_cache", _HERE / "module_cache.py")
+assert _cache_spec and _cache_spec.loader
+_cache = importlib.util.module_from_spec(_cache_spec)
+_cache_spec.loader.exec_module(_cache)
+
+
 def _load(name: str):
-    """Load a sibling module once; re-exec it when the file changed, so a plugin reload
-    (activate / discover_and_load(force=True)) picks up edits instead of the cached copy."""
-    # Installed and worktree copies can be discovered concurrently. A name-only
-    # cache lets either copy replace the other's module (and live collaborators).
-    key = f"_coach_{name}_{hashlib.sha256(str(_HERE).encode()).hexdigest()}"
-    path = _HERE / f"{name}.py"
-    try:
-        mtime = path.stat().st_mtime_ns
-    except OSError:
-        mtime = None
-    mod = sys.modules.get(key)
-    if mod is None or getattr(mod, "_coach_mtime", None) != mtime:
-        spec = importlib.util.spec_from_file_location(key, path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[key] = mod
-        spec.loader.exec_module(mod)
-        setattr(mod, "_coach_mtime", mtime)
-    return mod
+    """Load a checkout-local sibling, including its mtime hot reload."""
+    return _cache.load_sibling(_HERE, name)
 
 
 def _adopt(live: dict, coach, rules) -> int:

@@ -76,19 +76,16 @@ SYNTHETIC_RE = re.compile(r"^\s*(\[[A-Z][A-Za-z -]{2,40}(:|\]| —)|You've reach
 OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
 
 
+_HERE = Path(__file__).resolve().parent
+_cache_spec = importlib.util.spec_from_file_location("_coach_module_cache", _HERE / "module_cache.py")
+assert _cache_spec and _cache_spec.loader
+_cache = importlib.util.module_from_spec(_cache_spec)
+_cache_spec.loader.exec_module(_cache)
+
+
 def curriculum_mod():
-    """Sibling curriculum.py, re-executed when the file changes (same reload rule as __init__._load)."""
-    name = "_coach_curriculum"
-    path = Path(__file__).resolve().parent / "curriculum.py"
-    mtime = path.stat().st_mtime_ns
-    mod = sys.modules.get(name)
-    if mod is None or getattr(mod, "_coach_mtime", None) != mtime:
-        spec = importlib.util.spec_from_file_location(name, path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mod
-        spec.loader.exec_module(mod)
-        mod._coach_mtime = mtime
-    return mod
+    """Sibling curriculum.py, using the same checkout cache as __init__._load."""
+    return _cache.load_sibling(_HERE, "curriculum")
 
 
 def hermes_home() -> Path:

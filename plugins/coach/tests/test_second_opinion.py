@@ -189,7 +189,7 @@ def test_committed_change_this_turn_is_reviewed(tmp_path, env, depth, foreign_lo
         import shutil
         other = tmp_path / "other-coach"
         other.mkdir()
-        for name in ("__init__.py", "reply_check.py"):
+        for name in ("__init__.py", "reply_check.py", "module_cache.py"):
             shutil.copyfile(HERE / name, other / name)
         local = _mod("coach_local_probe")
         expected = local._load("reply_check")
