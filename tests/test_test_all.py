@@ -335,7 +335,9 @@ class TestAll(unittest.TestCase):
         runner = runpy.run_path(str(RUNNER))
         py = self.root / 'Python App/python'
         py.parent.mkdir()
-        py.symlink_to(sys.executable)
+        # A venv's python can be a copied binary that finds its stdlib only through the pyvenv.cfg beside it (the
+        # macOS 3.11 bridge venv): link its base interpreter, as an override outside any venv would be.
+        py.symlink_to(os.path.realpath(getattr(sys, '_base_executable', None) or sys.executable))
         suite = dict(name='shell', cmd=['sh', '-ec', '{py} -c "print(123)"'])
         result = runner['run_suite'](suite, str(py), None, 10, self.root, self.root)
         self.assertEqual(result['status'], 'PASS', result)
