@@ -205,15 +205,19 @@ def test_unauthorized_sender_is_held_then_admitted_once_policy_allows(env, monke
     run(env, monkeypatch, body)
 
 
-def test_session_without_gateway_route_is_never_receipted(env, monkeypatch):
+def test_session_without_gateway_route_uses_trusted_producer_ingress(env, monkeypatch):
     async def body(c):
-        # A legacy inline TUI conversation: a state.db row, no local receipt, no gateway route.
+        from pathlib import Path
+        from hermes_state_producer_admission import read_producer_admission
+        # A legacy inline TUI conversation: no local receipt or gateway route.
         c.authority.db.create_session('inline-tui-session', source='tui')
         job = _job(env, 'inline-tui-session')
-        await _sweep()
-        state = _pending(job)
-        assert state['kind'] == 'blocked' and state['reason'] == 'no_gateway_route'
-        assert not (job / 'completion-receipt.json').exists()
+        await _sweep(2)
+        receipt = json.loads((job / 'completion-receipt.json').read_text())
+        assert receipt['status'] == 'admitted'
+        assert receipt['ingress'] == 'producer_completion'
+        row = read_producer_admission(producer=receipt['producer'], profile_home=Path(c.authority.db.db_path).parent)
+        assert row['outcome'] == 'admitted' and row['status'] == 'queued'
         assert _producer_rows(c.authority, 'inline-tui-session', job) == []
     run(env, monkeypatch, body)
 
