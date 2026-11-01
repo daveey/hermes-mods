@@ -150,6 +150,24 @@ def test_live_checkout_hint_ignores_merge_base(tmp_path):
     assert not rules.touches_live_checkout("terminal", {"command": f"cd {live} && git merge-base --is-ancestor abc HEAD"}, live)
 
 
+def test_live_checkout_hint_ignores_mutating_words_inside_arguments(tmp_path):
+    """A mutating word glued to a revision, path or option value is an argument, not a git subcommand.
+    `cat-file -e "$sha^{commit}"` (a read-only ancestry probe) fired the live_checkout hint on 2026-11-01."""
+    tlc = rules.touches_live_checkout
+    live = (tmp_path / "hermes-agent"); live.mkdir(); live = live.resolve()
+    for cmd in (f'if git -C {live} cat-file -e "$s^{{commit}}" 2>/dev/null; then echo present; fi',
+                f"git -C {live} cat-file -t abc123^{{commit}}",
+                f"git -C {live} rev-parse --verify -q HEAD^{{commit}}",
+                f"git -C {live} show HEAD:docs/checkout.md | head",
+                f"git -C {live} log --format=%H --grep=merge -3"):
+        assert tlc("terminal", {"command": cmd}, live) is None, cmd
+    for cmd in (f"git -C {live} commit -am wip",
+                f"git -C {live} -c user.name=x commit -m y",
+                f"git --no-pager -C {live} stash pop",
+                f"git -C {live} bisect reset"):
+        assert tlc("terminal", {"command": cmd}, live) == str(live), cmd
+
+
 def test_live_checkout_ignores_read_only_redirects(tmp_path):
     tlc = rules.touches_live_checkout
     live = (tmp_path / "hermes-agent")
