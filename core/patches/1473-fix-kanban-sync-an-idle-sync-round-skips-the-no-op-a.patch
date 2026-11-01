@@ -1,0 +1,442 @@
+From 89d37cbc0a451e1835a214bbbb97f0f497b5583f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:03:41 -0700
+Subject: [PATCH] fix(kanban-sync): an idle sync round skips the no-op apply,
+ unchanged repair scans and per-poll connection opens [daveey]
+
+Gateway profile 2026-10-31 (example-investigation, SIGUSR2 Python frames + native sample): the Board sync loop was
+the largest idle consumer in the Desktop gateway's executor (~10% of a core):
+- pull() ran apply_remote_changes on every empty feed page, a write transaction rewriting applying/cursor to the
+  same values on every board every 5 s round;
+- repair_partition_links toggled applying whenever a foreign edge to a card outside this file existed (forever);
+- the pure repair scans (partition links, remote parents, divergence, missing children, lost placeholder links)
+  re-read both files every round: ~330 ms CPU per round on the MacBook's default board;
+- outbox_pending opened a fresh connection (schema re-parse) per board every 0.5 s: ~13 ms per pass.
+
+Now an empty page with an unmoved cursor and applying=0 returns without a transaction; partition repair toggles
+applying only for edges it will insert; sync_board skips the repair scans when their inputs are unchanged (live
+file PRAGMA data_version on a kept read connection, replica inode+cursor, mode, gateway, placement config), read
+before the scans so any commit during or after them re-arms the next round; outbox_pending reuses one kept
+read-only connection per board file, reopened when the file is replaced. No TTL: every skip is keyed on state.
+---
+ hermes_cli/kanban_sync_client.py              | 142 ++++++++++++--
+ hermes_cli/kanban_sync_partition_repair.py    |  13 +-
+ tests/hermes_cli/kanban_sync_support.py       |   2 +
+ .../hermes_cli/test_kanban_sync_idle_round.py | 182 ++++++++++++++++++
+ 4 files changed, 317 insertions(+), 22 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_idle_round.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index ab19792d0b..cfed658cf7 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -25,6 +25,7 @@ from __future__ import annotations
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ import json
+ import logging
++import os
+ import re
+ import sqlite3
+ import threading
+@@ -520,6 +521,11 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+             changes = own_partition(conn, changes, partition)
+         changes = without_pending(changes, pending_task_fields(conn))
+         nxt = int(page.get("next", cursor))
++        if not page.get("changes") and nxt == cursor and not page.get("more") and not _applying(conn):
++            # An idle poll: no change, same cursor. The apply would only rewrite ``applying`` and ``cursor`` to
++            # the values they hold, a write transaction (WAL frame, fsync, observer wake) every round on every
++            # board for nothing. [daveey]
++            return total
+         # [daveey] The pre-filter above can miss a local edit committed after it read the outbox (a claim in
+         # flight): ``local_pending_wins`` checks again inside the apply transaction.
+         sync.apply_remote_changes(conn, changes, new_cursor=nxt, board=board, observers=observers,
+@@ -530,6 +536,10 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+             return total
+ 
+ 
++def _applying(conn: sqlite3.Connection) -> bool:
++    return bool((sync.sync_state(conn) or {}).get("applying"))
++
++
+ def resync(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool, partition: Optional[str] = None) -> int:
+     """Rebuild from the service snapshot (every live row, paged per table), then resume the feed at its head.
+     ``partition`` keeps only that gateway's cards (a primary board's live file)."""
+@@ -617,13 +627,17 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+                 resync(live, hub, slug, observers=True, partition=gateway)
+         replica = open_shadow(slug, gateway)
+         try:
+-            from hermes_cli.kanban_sync_partition_repair import repair_partition_links
+-            repair_partition_links(live, replica, gateway)
+-            if mode == "primary" and sync.refresh_remote_parents(live, replica):
+-                sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
+-            result.repaired = repair_divergence(live, replica, gateway)
+-            repair_missing_children(live, replica, gateway)
+-            retire_lost_placeholder_links(live, replica, gateway)
++            inputs = _repair_inputs(path, replica, mode, gateway)
++            if inputs is None or _REPAIRED.get(str(path)) != inputs:
++                from hermes_cli.kanban_sync_partition_repair import repair_partition_links
++                repair_partition_links(live, replica, gateway)
++                if mode == "primary" and sync.refresh_remote_parents(live, replica):
++                    sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
++                result.repaired = repair_divergence(live, replica, gateway)
++                repair_missing_children(live, replica, gateway)
++                retire_lost_placeholder_links(live, replica, gateway)
++                if inputs is not None:
++                    _REPAIRED[str(path)] = inputs
+             if mode == "primary":
+                 heal_clobbered_completions(live)
+         finally:
+@@ -770,18 +784,112 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str) -> None:
+             _log.warning("kanban sync: chat links for %s failed (%s: %s)", slug, type(exc).__name__, exc)
+ 
+ 
+-def outbox_pending(paths: Iterable[Path]) -> bool:
+-    """True when any synced board has a local change waiting to be pushed (one cheap read-only query each)."""
+-    for path in paths:
++class _BoardWatch:
++    """One long-lived read-only connection per board file, for the sync loop's cheap questions.
++
++    ``outbox_pending`` runs every 0.5 s on every synced board. Opening a connection per call re-read the schema
++    each time (about 13 ms of CPU per pass over 10 boards, 2.5% of a core in the gateway, 2026-10-31). A kept
++    connection answers the same indexed query in microseconds. ``PRAGMA data_version`` on a kept connection moves
++    whenever any other connection (any process, or this one's own writers) commits to the file, which is what
++    lets ``sync_board`` skip repair scans whose inputs did not change. A file replaced on disk (new inode) is
++    reopened, with a new generation so its restarted ``data_version`` never equals an old one. [daveey]"""
++
++    MAX = 64
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._conns: dict[str, tuple[tuple[int, int], sqlite3.Connection, int]] = {}
++        self._gen = 0
++
++    def _conn(self, path: Path) -> Optional[tuple[sqlite3.Connection, int]]:
++        key = os.path.realpath(path)
+         try:
+-            conn = _kanban_lockguard.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
++            st = os.stat(key)
++        except OSError:
++            self._drop(key)
++            return None
++        ent = self._conns.get(key)
++        if ent is not None and ent[0] == (st.st_dev, st.st_ino):
++            return ent[1], ent[2]
++        self._drop(key)
++        if len(self._conns) >= self.MAX:
++            self._drop(next(iter(self._conns)))
++        conn = _kanban_lockguard.connect(f"{Path(key).as_uri()}?mode=ro", uri=True, timeout=1,
++                                         check_same_thread=False)
++        self._gen += 1
++        self._conns[key] = ((st.st_dev, st.st_ino), conn, self._gen)
++        return conn, self._gen
++
++    def _drop(self, key: str) -> None:
++        ent = self._conns.pop(key, None)
++        if ent is not None:
+             try:
+-                if conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1").fetchone():
+-                    return True
+-            finally:
+-                conn.close()
+-        except sqlite3.Error:
+-            continue
++                ent[1].close()
++            except sqlite3.Error:
++                pass
++
++    def query(self, path: Path, sql: str) -> Optional[tuple[int, Any]]:
++        """(generation, first row) or None when the file cannot be read."""
++        with self._lock:
++            try:
++                got = self._conn(path)
++                if got is None:
++                    return None
++                conn, gen = got
++                return gen, conn.execute(sql).fetchone()
++            except sqlite3.Error:
++                self._drop(os.path.realpath(path))
++                return None
++
++    def version(self, path: Path) -> Optional[tuple[int, int]]:
++        got = self.query(path, "PRAGMA data_version")
++        return None if got is None or got[1] is None else (got[0], int(got[1][0]))
++
++    def reset(self) -> None:
++        with self._lock:
++            for key in list(self._conns):
++                self._drop(key)
++
++
++_WATCH = _BoardWatch()
++# Per board file: the inputs the last completed repair pass saw (see ``_repair_inputs``).
++_REPAIRED: dict[str, tuple] = {}
++
++
++def reset_board_watch() -> None:
++    """Tests: close the kept connections and forget completed repair passes."""
++    _WATCH.reset()
++    _REPAIRED.clear()
++
++
++def _repair_inputs(live_path: Path, replica: sqlite3.Connection, mode: str, gateway: str) -> Optional[tuple]:
++    """Everything the pure repair scans (partition links, remote parents, divergence, missing children, lost
++    placeholder links) read: the live file's commit version, the replica's identity and feed cursor, the mode, the
++    gateway and the placement config. Equal inputs give the same answer, so an idle round skips the scans (about
++    300 ms of CPU per round on the MacBook's default board, 2026-10-31). Read before the scans: a commit landing
++    during or after them moves the live version, so the next round scans again. The replica is written only by its
++    own pull (``cursor`` moves, or a rebuild makes a new file) and the ``pulled_at`` stamp, which the scans never
++    read. None (cannot tell) always scans. [daveey]"""
++    live_version = _WATCH.version(live_path)
++    if live_version is None:
++        return None
++    try:
++        replica_file = Path(replica.execute("PRAGMA database_list").fetchone()[2])
++        st = os.stat(replica_file)
++        cursor = int((sync.sync_state(replica) or {}).get("cursor") or 0)
++        from hermes_cli.kanban_placement import config
++        placement = json.dumps(config(), sort_keys=True, default=str)
++    except (OSError, sqlite3.Error, TypeError, ValueError):
++        return None
++    return live_version, (st.st_dev, st.st_ino, cursor), mode, gateway, placement
++
++
++def outbox_pending(paths: Iterable[Path]) -> bool:
++    """True when any synced board has a local change waiting to be pushed (one indexed read on a kept connection)."""
++    for path in paths:
++        got = _WATCH.query(path, "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1")
++        if got is not None and got[1]:
++            return True
+     return False
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_partition_repair.py b/hermes_cli/kanban_sync_partition_repair.py
+index 0660b0e276..1b8d8f8e05 100644
+--- a/hermes_cli/kanban_sync_partition_repair.py
++++ b/hermes_cli/kanban_sync_partition_repair.py
+@@ -36,14 +36,17 @@ def repair_partition_links(live: sqlite3.Connection, replica: sqlite3.Connection
+             "SELECT table_name, row_uid FROM kanban_sync_outbox WHERE state IN ('pending', 'rejected') "
+             "UNION SELECT table_name, row_uid FROM kanban_sync_tombstones")}
+         present = {r[0] for r in live.execute("SELECT id FROM tasks")}
++        # Only edges that will be inserted toggle ``applying``: an edge to a card not in this file stays a
++        # candidate every round, and an unconditional toggle rewrote the sync state (a WAL commit) each round for
++        # nothing. [daveey]
++        todo = [(parent, child) for parent, child in edges if child in present and not any(
++            key in held for key in (("task_links", f"{parent}>{child}"), ("tasks", parent), ("tasks", child)))]
++        if not todo:
++            return []
+         applying = sync.sync_state(live)["applying"]
+         live.execute("UPDATE kanban_sync_state SET applying = 1")
+-        for parent, child in edges:
++        for parent, child in todo:
+             uid = f"{parent}>{child}"
+-            if child not in present:
+-                continue
+-            if any(key in held for key in (("task_links", uid), ("tasks", parent), ("tasks", child))):
+-                continue
+             if live.execute("INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                             (parent, child)).rowcount:
+                 restored.append(uid)
+diff --git a/tests/hermes_cli/kanban_sync_support.py b/tests/hermes_cli/kanban_sync_support.py
+index 62365694ad..bdac3f3bc4 100644
+--- a/tests/hermes_cli/kanban_sync_support.py
++++ b/tests/hermes_cli/kanban_sync_support.py
+@@ -25,6 +25,8 @@ def kanban_home(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+     sync.consume_dispatcher_wake()
++    from hermes_cli import kanban_sync_client
++    kanban_sync_client.reset_board_watch()  # kept read connections and repair memos belong to one test's files
+     return home
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_idle_round.py b/tests/hermes_cli/test_kanban_sync_idle_round.py
+new file mode 100644
+index 0000000000..5ee0115ddb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_idle_round.py
+@@ -0,0 +1,182 @@
++"""An idle sync round must cost nothing it does not need: no write to the live board, no repeat of repair scans
++whose inputs did not change, no connection opened per outbox poll. Gateway profile 2026-10-31 (example-investigation):
++the Board sync loop was the gateway's main idle CPU (about 300 ms of repair scans per 5 s round, a no-op write
++transaction per board per round, 10 connection opens every 0.5 s)."""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_lockguard
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "macbook", "mini", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _round(kanban_home, svc):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++
++
++def _version(watch: sqlite3.Connection) -> int:
++    return watch.execute("PRAGMA data_version").fetchone()[0]
++
++
++def _settle(live, svc, kanban_home, mode):
++    sync.set_mode(live, mode)
++    parent = kb.create_task(live, title="parent", assignee="worker")
++    child = kb.create_task(live, title="child", assignee="worker")
++    kb.link_tasks(live, parent, child)
++    for _ in range(3):
++        _round(kanban_home, svc)
++    return parent, child
++
++
++def _spy(monkeypatch, names):
++    calls = {n: 0 for n in names}
++    for name in names:
++        real = getattr(ksc, name)
++
++        def wrapped(*a, _real=real, _name=name, **k):
++            calls[_name] += 1
++            return _real(*a, **k)
++        monkeypatch.setattr(ksc, name, wrapped)
++    return calls
++
++
++REPAIRS = ("repair_divergence", "repair_missing_children", "retire_lost_placeholder_links")
++
++
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_an_idle_round_commits_nothing_to_the_live_board(live, svc, kanban_home, mode):
++    _settle(live, svc, kanban_home, mode)
++    # A foreign parent edge whose child is not in this file stays a partition-repair candidate forever.
++    _other = svc.hub(OTHER)
++    hlc = f"{int(time.time() * 1000):013d}-0000-{OTHER}"
++    _other.ops(BOARD, [
++        {"client_op_id": "o-p", "op": "upsert", "table": "tasks", "uid": "t_foreign", "hlc": hlc,
++         "fields": {"title": "foreign", "status": "ready", "created_at": 1}},
++        {"client_op_id": "o-c", "op": "upsert", "table": "tasks", "uid": "t_foreign_child", "hlc": hlc,
++         "fields": {"title": "foreign child", "status": "todo", "created_at": 1}},
++        {"client_op_id": "o-l", "op": "upsert", "table": "task_links", "uid": "t_foreign>t_foreign_child", "hlc": hlc,
++         "fields": {"parent_id": "t_foreign", "child_id": "t_foreign_child"}}])
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    watch = sqlite3.connect(kanban_home / "kanban.db")
++    try:
++        before = _version(watch)
++        for _ in range(3):
++            _round(kanban_home, svc)
++        assert _version(watch) == before, "an idle sync round wrote to the live board"
++    finally:
++        watch.close()
++
++
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_repair_scans_run_once_per_change_not_every_round(live, svc, kanban_home, monkeypatch, mode):
++    _settle(live, svc, kanban_home, mode)
++    calls = _spy(monkeypatch, REPAIRS)
++    for _ in range(4):
++        _round(kanban_home, svc)
++    assert max(calls.values()) <= 1, f"repairs re-ran with unchanged inputs: {calls}"
++
++    # A local write (any connection) re-arms them.
++    seen = dict(calls)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET title = 'renamed' WHERE title = 'parent'")
++    _round(kanban_home, svc)
++    assert all(calls[n] == seen[n] + 1 for n in REPAIRS), calls
++
++    # So does a remote change pulled into the replica (its cursor moves).
++    seen = dict(calls)
++    for _ in range(3):
++        _round(kanban_home, svc)
++    settled = dict(calls)
++    svc.hub(OTHER).ops(BOARD, [{"client_op_id": "o-x", "op": "upsert", "table": "tasks", "uid": "t_remote",
++                                "hlc": f"{int(time.time() * 1000):013d}-0000-{OTHER}",
++                                "fields": {"title": "remote", "status": "ready", "created_at": 1}}])
++    _round(kanban_home, svc)
++    assert all(calls[n] == settled[n] + 1 for n in REPAIRS), calls
++
++
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_a_capture_gap_after_idle_rounds_is_still_healed(live, svc, kanban_home, mode):
++    parent, _child = _settle(live, svc, kanban_home, mode)
++    for _ in range(3):
++        _round(kanban_home, svc)
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)  # an uncaptured write: only the repair scans can find it
++        live.execute("UPDATE tasks SET title = 'gap edit' WHERE id = ?", (parent,))
++    sync.install_triggers(live)
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    assert svc.board(BOARD)["rows"]["tasks"][parent]["title"] == "gap edit"
++
++
++def test_outbox_poll_keeps_one_connection_per_board_and_sees_new_work(live, kanban_home, monkeypatch):
++    path = kanban_home / "kanban.db"
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++    opened = []
++    real = kanban_lockguard.connect
++    monkeypatch.setattr(kanban_lockguard, "connect", lambda *a, **k: opened.append(a) or real(*a, **k))
++    for _ in range(20):
++        assert ksc.outbox_pending([path]) is False
++    assert len(opened) == 1, f"outbox poll opened {len(opened)} connections"
++    kb.create_task(live, title="new local work", assignee="worker")  # captured into the outbox by trigger
++    assert ksc.outbox_pending([path]) is True
++    assert len(opened) == 1
++
++
++def test_outbox_poll_reopens_a_replaced_board_file(live, kanban_home):
++    path = kanban_home / "kanban.db"
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++    assert ksc.outbox_pending([path]) is False
++    live.close()
++    other = kanban_home / "other.db"
++    conn = kbc.connect(other)
++    try:
++        ksc.ensure_identity(conn, BOARD, ME)
++        kb.create_task(conn, title="pending here", assignee="worker")
++    finally:
++        conn.close()
++    for suffix in ("", "-wal", "-shm"):
++        p = kanban_home / f"kanban.db{suffix}"
++        if p.exists():
++            p.unlink()
++    other.rename(path)
++    for suffix in ("-wal", "-shm"):
++        q = kanban_home / f"other.db{suffix}"
++        if q.exists():
++            q.rename(kanban_home / f"kanban.db{suffix}")
++    assert ksc.outbox_pending([path]) is True
++    assert ksc.outbox_pending([kanban_home / "missing.db"]) is False
+-- 
+2.55.0
+

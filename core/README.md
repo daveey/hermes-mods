@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1469 patches, one entry per non-merge source commit through `3241b23316a66eb4d41c26078cd92411f0f295bc`.
+1474 patches, one entry per non-merge source commit through `e572a3832043fdfc39bd5e43685e666852f94989`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -24,10 +24,18 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `016b76da3a8a88e28775e08b6ca2846f471b8eda`; current merge-base: `c419cf7c864ac0ee511dbd9f7091a8bba0b567ee`.
 Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430 and 1432. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-The snapshot's full verifier exits 0 with [mirror-replay-1469.json](mirror-replay-1469.json) (three hash-pinned bridges) and [mirror-policy-1469.json](mirror-policy-1469.json). Executed checks and normalization review: [mirror-1469-verification.md](mirror-1469-verification.md).
+The snapshot's full verifier exits 0 with [mirror-replay-1474.json](mirror-replay-1474.json) (three hash-pinned bridges) and [mirror-policy-1474.json](mirror-policy-1474.json). Executed checks and normalization review: [mirror-1474-verification.md](mirror-1474-verification.md); preceding snapshot: [mirror-1469-verification.md](mirror-1469-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1470–1474
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Runtime polling and teardown](mirror-runtime-follow-ups-1470.md) | 1470–1473 | Uncached aggregate scan serialization, exited-process teardown, refresh-only notice memo and state-keyed idle Board sync. |
+| [Composable metadata-only ask classification](composable-metadata-ask-classification.md) | 1474 | Classification and audit comments share an outer transaction; rollback preserves metadata and execution state. |
+| [1474-entry mirror verification](mirror-1474-verification.md) | verification report | Complete inventory, unchanged three-bridge replay and normalized final tree. |
 
 ## Mirror follow-ups 1428–1469
 
@@ -767,7 +775,7 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1469-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the three bridges at the boundaries in `mirror-replay-1469.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
+For the current **1474-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the three bridges at the boundaries in `mirror-replay-1474.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
 
 ```bash
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1

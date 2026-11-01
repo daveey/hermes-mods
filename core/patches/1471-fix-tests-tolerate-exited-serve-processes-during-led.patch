@@ -1,0 +1,110 @@
+From 422870dba2873eb220a958521af033fa2976b452 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 04:34:20 +0000
+Subject: [PATCH] fix(tests): tolerate exited serve processes during ledger
+ teardown [daveey]
+
+---
+ .../test_isolated_serve_ledger_marker.py      | 73 ++++++++++++++++++-
+ 1 file changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/tests/hermes_cli/test_isolated_serve_ledger_marker.py b/tests/hermes_cli/test_isolated_serve_ledger_marker.py
+index 7ce2381d45..98791c0a74 100644
+--- a/tests/hermes_cli/test_isolated_serve_ledger_marker.py
++++ b/tests/hermes_cli/test_isolated_serve_ledger_marker.py
+@@ -6,6 +6,7 @@ of the host singleton on the CLI side, so the ledger row must carry that fact as
+ for Desktop to honour it too. Real processes against a temp ``HERMES_HOME``; no mocks.
+ """
+ 
++from contextlib import suppress
+ import json
+ import os
+ import socket
+@@ -42,16 +43,80 @@ def _await_ledger_row(ledger, proc, log, *, timeout=45):
+ 
+ def _stop(proc):
+     if proc.poll() is None:
+-        parent = psutil.Process(proc.pid)
+-        family = [*parent.children(recursive=True), parent]
++        family = []
++        # A live snapshot does not keep the launcher or its children alive.
++        with suppress(psutil.NoSuchProcess):
++            parent = psutil.Process(proc.pid)
++            family = [*parent.children(recursive=True), parent]
+         for p in family:
+-            p.terminate()
++            with suppress(psutil.NoSuchProcess):
++                p.terminate()
+         _, alive = psutil.wait_procs(family, timeout=5)
+         for p in alive:
+-            p.kill()
++            with suppress(psutil.NoSuchProcess):
++                p.kill()
+     proc.wait(timeout=10)
+ 
+ 
++@pytest.mark.parametrize("phase", ["lookup", "terminate", "kill"])
++def test_stop_tolerates_exit_between_observation_and_signal(monkeypatch, phase):
++    # Reap a real process at the observation/signal boundary, not after a timer.
++    proc = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
++    original_process = psutil.Process
++    original_signal = getattr(original_process, phase) if phase != "lookup" else None
++    raced = []
++
++    def reap():
++        proc.kill()
++        proc.wait(timeout=10)
++        raced.append(proc.pid)
++
++    def signal(process):
++        if process.pid == proc.pid:
++            reap()
++        assert original_signal is not None
++        return original_signal(process)
++
++    def lookup(pid):
++        if pid == proc.pid:
++            # The live-system signal guard also queries psutil; don't recurse.
++            monkeypatch.setattr(psutil, "Process", original_process)
++            reap()
++        return original_process(pid)
++
++    try:
++        if phase == "lookup":
++            monkeypatch.setattr(psutil, "Process", lookup)
++        else:
++            monkeypatch.setattr(original_process, phase, signal)
++            if phase == "kill":
++                # Keep the child alive through the grace phase to exercise escalation.
++                monkeypatch.setattr(original_process, "terminate", lambda process: None)
++                monkeypatch.setattr(psutil, "wait_procs", lambda family, timeout: ([], family))
++        _stop(proc)
++        assert raced == [proc.pid]
++        assert proc.returncode is not None
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++        proc.wait(timeout=10)
++        assert proc.stdin is not None
++        proc.stdin.close()
++
++
++def test_stop_terminates_a_live_process():
++    proc = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
++    try:
++        _stop(proc)
++        assert proc.returncode is not None
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++        proc.wait(timeout=10)
++        assert proc.stdin is not None
++        proc.stdin.close()
++
++
+ def test_isolated_serve_ledger_row_is_marked_and_ordinary_serve_is_not(tmp_path):
+     home = tmp_path / "home"
+     home.mkdir()
+-- 
+2.55.0
+

@@ -1,0 +1,132 @@
+From a243ae3f82130a4c560ce0887505b64036f95550 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 19:51:32 -0700
+Subject: [PATCH] fix(profiles): serialize aggregate session scan bursts
+ without caching [daveey]
+
+---
+ hermes_cli/web_routers/profiles.py            | 13 ++-
+ ...st_profiles_sessions_scan_serialization.py | 80 +++++++++++++++++++
+ 2 files changed, 92 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_profiles_sessions_scan_serialization.py
+
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 6f9ebcfbff..1944c71523 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -458,6 +458,17 @@ def _csv_list(value: Optional[str]) -> list[str]:
+     return [s.strip() for s in (value or "").split(",") if s.strip()]
+ 
+ 
++_PROFILE_SESSION_SCAN_LOCK = threading.Lock()
++
++
++def _read_serial_profile_db(name, home, errors, read):
++    # Parallel aggregate polls amplify SQLite scan CPU. Serialize only the DB
++    # phase, not activity annotation or serialization; never cache fresh rows.
++    # Acquire before opening a connection, retaining the caller's profile context.
++    with _PROFILE_SESSION_SCAN_LOCK:
++        return _read_profile_db(name, home, errors, read)
++
++
+ @sessions_router.get("/api/profiles/sessions")
+ def get_profiles_sessions(
+     # ``le=500`` caps the page size — this endpoint fans out across EVERY profile's state.db.
+@@ -507,7 +518,7 @@ def get_profiles_sessions(
+                 compact_rows=not full, include_pinned=True, **scoped)
+             totals[name] = db.session_count(exclude_children=True, **scoped)
+             merged.extend(stamp_automated(_tag_rows(rows, name, now), home))
+-        _read_profile_db(name, home, errors, _read)
++        _read_serial_profile_db(name, home, errors, _read)
+ 
+     sort_key = "last_active" if order == "recent" else "started_at"
+     merged.sort(key=lambda s: s.get(sort_key) or s.get("started_at") or 0, reverse=True)
+diff --git a/tests/hermes_cli/test_profiles_sessions_scan_serialization.py b/tests/hermes_cli/test_profiles_sessions_scan_serialization.py
+new file mode 100644
+index 0000000000..d5963f1fbd
+--- /dev/null
++++ b/tests/hermes_cli/test_profiles_sessions_scan_serialization.py
+@@ -0,0 +1,80 @@
++"""The uncached aggregate list must not multiply SQLite work during poll bursts."""
++import threading
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli.web_routers import profiles
++
++
++def test_route_serializes_scans_without_caching_or_losing_query_params(monkeypatch):
++    app = FastAPI()
++    app.include_router(profiles.sessions_router)
++    active = 0
++    maximum = 0
++    calls = []
++    guard = threading.Lock()
++    overlap = threading.Event()
++    first = threading.Event()
++    release = threading.Event()
++
++    def targets(label, home, errors, read):
++        nonlocal active, maximum
++        with guard:
++            active += 1
++            maximum = max(maximum, active)
++            index = len(calls)
++            calls.append(label)
++            if active > 1:
++                overlap.set()
++        if index == 0:
++            first.set()
++            assert release.wait(10)
++        with guard:
++            active -= 1
++        return []
++
++    monkeypatch.setattr(profiles, '_profile_targets', lambda label: [('default', None)])
++    monkeypatch.setattr(profiles, '_read_profile_db', targets)
++    monkeypatch.setattr(profiles, '_corrupt_profile_stores', lambda targets: {})
++    for name in ('kanban', 'goal', 'cron', 'background', 'turn'):
++        monkeypatch.setattr(profiles, f'annotate_{name}_activity', lambda rows: None)
++    monkeypatch.setattr(profiles, 'annotate_review_wait', lambda rows: None)
++    ready = threading.Barrier(5)
++
++    def request(limit):
++        ready.wait(timeout=10)
++        with TestClient(app) as client:
++            response = client.get('/api/profiles/sessions', params={'limit': limit})
++            assert response.status_code == 200
++            return response.json()
++
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        futures = [pool.submit(request, limit) for limit in (20, 20, 50, 100)]
++        ready.wait(timeout=10)
++        try:
++            assert first.wait(10)
++            # Baseline deterministically enters another scan while the first is held.
++            # This backstop is not the invariant: maximum and every scan result are.
++            overlap.wait(2)
++        finally:
++            release.set()
++        results = [future.result(timeout=10) for future in futures]
++    assert maximum == 1
++    assert len(calls) == 4  # identical polls aren't served stale cached results
++    assert [r['limit'] for r in results] == [20, 20, 50, 100]
++    with TestClient(app) as client:
++        assert client.get('/api/profiles/sessions?limit=20').status_code == 200
++    assert len(calls) == 5
++
++
++def test_scan_exception_releases_admission(monkeypatch):
++    def fail(name, home, errors, read):
++        raise RuntimeError('failed scan')
++    monkeypatch.setattr(profiles, '_profile_targets', lambda label: [('default', None)])
++    monkeypatch.setattr(profiles, '_read_profile_db', fail)
++    for _ in range(2):
++        with pytest.raises(RuntimeError, match='failed scan'):
++            profiles.get_profiles_sessions(limit=20, offset=0)
+-- 
+2.55.0
+
