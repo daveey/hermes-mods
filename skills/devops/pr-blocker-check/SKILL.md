@@ -35,6 +35,10 @@ The user requires each one fixed or refuted in its thread, bots included: reply 
 re-request the reviewer yourself (`gh api -X POST repos/O/R/pulls/N/requested_reviewers -f 'reviewers[]=<login>'`)
 instead of blocking on it.
 
+An unanswered `hermes-ci-review-bot` "⚠️ Warnings" section on the PR's head (no later non-bot comment) blocks
+every merge path, including a bare `gh pr merge`: fix it or refute it in a PR comment first (`hermes-core-wt ship`
+enforces this; `--bot-reply "<why>"` posts the refutation).
+
 `checks_pending` with the new head's run stuck `pending` (no jobs) usually means an older run is holding the
 workflow's concurrency group. Cancelled runs do this when an `if: always()` gate or report job
 ("All required checks pass", timing report, aggregate) still waits for a busy runner, and a main group
