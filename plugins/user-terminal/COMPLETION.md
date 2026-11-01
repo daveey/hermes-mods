@@ -29,11 +29,15 @@ Tests exercise the gateway's local CLI and GUI admission paths, including cold
 owner restoration, compression-tip ownership, all five final states, missing
 sessions, immutable payload retry, and wrong-profile isolation. Model execution
 is suppressed in these isolated tests; they do not prove live chat delivery.
-Legacy inline TUI without a gateway authority is not covered by this delivery
-adapter. It retains the pending result rather than submitting fabricated viewer
-input. Native messaging sessions and remote-courier completion are not yet
-verified. Real iTerm chat/worker acceptance and deployed-backend verification
-remain required before this change is considered complete.
+Native messaging tests now exercise borrowed committed-route provenance,
+current authorization/profile checks, deduplication, and transient/blocked retry
+backoff. Previously adopted legacy CLI/TUI history uses the local receipt even
+without a viewer. Unadopted inline TUI history remains pending: core adoption
+requires authenticated owner transport and refuses a live inline owner. Tests
+preserve those fences rather than fabricating viewer identity. A core trusted
+producer ingress is still required for that case; this is incomplete scope, not
+an accepted limitation. Remote-courier completion, real iTerm chat/worker
+acceptance, and deployed-backend verification remain unverified.
 
 ## Tests
 
@@ -44,6 +48,8 @@ checkout and `HERMES_DISABLE_LAZY_INSTALLS=1`:
 python -m pytest -q -p no:cacheprovider --confcutdir=plugins/user-terminal \
   plugins/user-terminal/tests/test_completed_jobs.py \
   plugins/user-terminal/tests/test_session_completion.py \
+  plugins/user-terminal/tests/test_native_completion.py \
+  plugins/user-terminal/tests/test_legacy_completion.py \
   plugins/user-terminal/tests/test_completion_lifecycle.py \
   plugins/user-terminal/tests/test_closed_asks.py
 ```
