@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 if __package__:
-    from .reply_check import render_tool_log
+    from .reply_check import CROSS_SESSION_HEADER, CROSS_SESSION_RE, render_tool_log
 else:  # Standalone plugin/cron/CLI loader.
     import importlib.util
     _spec = importlib.util.spec_from_file_location("_selfheal_reply_check", Path(__file__).with_name("reply_check.py"))
@@ -39,6 +39,8 @@ else:  # Standalone plugin/cron/CLI loader.
     _reply_check = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_reply_check)
     render_tool_log = _reply_check.render_tool_log
+    CROSS_SESSION_HEADER = _reply_check.CROSS_SESSION_HEADER
+    CROSS_SESSION_RE = _reply_check.CROSS_SESSION_RE
 
 COMPONENTS = ("agent", "desktop", "plugin", "cron", "kanban", "bot", "gateway", "provider", "browser", "bb", "other")
 
@@ -47,7 +49,7 @@ OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF
 # Keep coordination notices out of the user-complaint lane. Their underlying failures
 # belong to the machine-signal collector, not a second complaint filed by the recipient.
 SYNTHETIC_RE = re.compile(
-    r"^\s*(?:\[Message from another Hermes session(?:\s|\])|\[chat-closeout\]|"
+    r"^\s*(?:" + CROSS_SESSION_RE + r"|\[chat-closeout\]|"
     r"⏸\ufe0f?\s+\[[^\]\n]+\]\s+(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
     r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum|[✔✓✗✖⚠] )")
 # `[coach]` nudges are stored as user-role turns but are the coach's own text (agent-3ba1979f34): whether the nudge

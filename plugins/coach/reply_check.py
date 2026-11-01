@@ -1130,9 +1130,16 @@ def confirm_system() -> str:
     return CONFIRM_SYS + (f"\n\nUSER ENVIRONMENT (what this user's agents can reach):\n{prof}" if prof.strip() else "")
 
 
+# Core's cross_session relay header (tui_gateway/human_input.py CROSS_SESSION_HEADER): a helper session's message
+# delivered into this chat as a user-role turn. self_heal.SYNTHETIC_RE builds its branch from the same constant, and
+# test_report_only_notices ties both to core (agent-83837b58db: relays were judged as David's own request).
+CROSS_SESSION_HEADER = "[Message from another Hermes session"
+CROSS_SESSION_RE = re.escape(CROSS_SESSION_HEADER) + r"(?:\s|\])"
+
 NOTICE_RE = re.compile(
     r"^\s*(?:\[(?:chat-closeout|kanban close-out|false-stop recovery|owner-wake|goal continuation|babysitter)[^\]]*\]"
-    r"|[✔✓]\s*\[[^\]\n]+\]\s*@[^\n]+\bKanban\b)", re.I)
+    r"|[✔✓]\s*\[[^\]\n]+\]\s*@[^\n]+\bKanban\b"
+    r"|" + CROSS_SESSION_RE + r")", re.I)
 
 
 def notice_turn(user_ask: str) -> bool:
@@ -1150,9 +1157,10 @@ NOTICE_CONTEXT = """AUTOMATED NOTICE, not a human request for a read-only status
 handoff; it does not establish that this agent acted on each unresolved item. Evaluate each unresolved agent-fixable
 leftover independently: finishing the main repair does not excuse a separate verification or deployment gap.
 An existing owner counts only with evidence this turn of recent progress on that specific work, not merely a running
-status or a message sent to it. Do not assume a generic card lookup checked every cited owner. A queued card can be a
-legitimate capacity wait when the turn actually checked capacity/progress; a real timed soak or physical-user-only
-check is not report_only. A newly assigned concrete fix still counts as started.
+status or a message sent to it. A session's own progress report delivered as this notice is such evidence for that one
+session only, never for other owners or leftovers. Do not assume a generic card lookup checked every cited owner.
+A queued card can be a legitimate capacity wait when the turn actually checked capacity/progress; a real timed soak
+or physical-user-only check is not report_only. A newly assigned concrete fix still counts as started.
 When only unit tests passed and live verification remains, check whether a live check or an attributable future-event
 check is actually armed. Merely saying 'the next event will test it' is not an armed check. Do not require unsafe live
 side effects, a physical device, or bypassing an explicit scope restriction. Score only from the shown evidence.
