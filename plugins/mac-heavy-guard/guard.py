@@ -20,8 +20,10 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
+from urllib.parse import quote
 from typing import Iterator, Optional
 
 OPT_OUT = "MAC_HEAVY_OK"
@@ -170,7 +172,71 @@ def _is_run_tests(token: str) -> bool:
     return not any(c.isspace() for c in token) and os.path.basename(token) in RUN_TESTS
 
 
-def check_argv(argv: list[str]) -> Optional[str]:
+def _large_copy(name: str, args: list[str], cwd: Optional[str]) -> Optional[str]:
+    """Inspect explicit local source files only; never expand unknown shell syntax."""
+    # shlex leaves redirections in argv; they are not copy operands.
+    clean = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        redirect = re.match(r"^\d*[<>]+", arg)
+        if redirect:
+            skip = redirect.end() == len(arg)
+            continue
+        clean.append(arg)
+    args = clean
+    if name == "dd":
+        sources = [a[3:] for a in args if a.startswith("if=")]
+    else:
+        operands = []
+        target_dir = False
+        options = True
+        i = 0
+        value_flags = {
+            "cp": {"-t", "--target-directory", "-S", "--suffix"},
+            "rsync": {"-e", "--rsh", "--exclude", "--include", "--filter", "-f",
+                      "--exclude-from", "--include-from", "--files-from", "--log-file",
+                      "--backup-dir", "--suffix", "--rsync-path", "--bwlimit"},
+            "ditto": {"--arch", "--bom", "--rsrcFork"},
+        }[name]
+        while i < len(args):
+            a = args[i]
+            i += 1
+            if options and a == "--":
+                options = False
+            elif options and a.startswith("-"):
+                flag = a.split("=", 1)[0]
+                if name == "cp" and (flag in ("-t", "--target-directory") or a.startswith("-t")):
+                    target_dir = True
+                if a in value_flags:
+                    i += 1
+            else:
+                operands.append(a)
+        sources = operands if target_dir else operands[:-1]
+    for source in sources:
+        path = re.sub(r"\$\{HOME\}|\$HOME(?![A-Za-z_0-9])", lambda _: os.environ.get("HOME", "$HOME"), source)
+        if any(c in path for c in "$`*?[]{}") or (path.startswith("~") and not path.startswith("~/")):
+            continue
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path):
+            path = os.path.join(cwd or os.getcwd(), path)
+        try:
+            info = os.stat(path)
+        except (OSError, ValueError):
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_size < 2 * 1024**3:
+            continue
+        advice = "Use read-only in-place access instead of copying."
+        if path.lower().endswith((".db", ".sqlite", ".sqlite3")):
+            uri = "file:" + quote(os.path.abspath(path), safe="/") + "?mode=ro"
+            advice += f" For SQLite: sqlite3 {shlex.quote(uri)} with indexed queries (session_id or an id range)."
+        return f"{name} source {path!r} ({info.st_size / 1024**3:.2f} GiB; {info.st_size} bytes). {advice}"
+    return None
+
+
+def check_argv(argv: list[str], cwd: Optional[str] = None) -> Optional[str]:
     first = os.path.basename(argv[0])
     if (PY.match(first) or first in SHELLS) and len(argv) > 1 and _is_run_tests(argv[1]):
         argv = argv[1:]
@@ -181,6 +247,8 @@ def check_argv(argv: list[str]) -> Optional[str]:
         return None
     name, args = os.path.basename(argv[0]), argv[1:]
     sub = args[0] if args else ""
+    if name in ("cp", "rsync", "ditto", "dd"):
+        return _large_copy(name, args, cwd)
     if name == "cargo":
         if sub in ("build", "b", "test", "t", "bench", "run", "r", "install", "clippy") and (
                 "--release" in args or "-r" in args[1:] or "--profile=release" in args):
@@ -279,9 +347,9 @@ def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optiona
             continue
         if OPT_OUT in env:
             continue
-        why = check_argv(argv)
+        why = check_argv(argv, cwd)
         if not why and in_script:  # `step pytest python3 -m pytest -q`: a heavy command passed as arguments
-            why = next((w for w in (check_argv(argv[k:]) for k in range(1, len(argv))) if w), None)
+            why = next((w for w in (check_argv(argv[k:], cwd) for k in range(1, len(argv))) if w), None)
         if why:
             test = None if in_script else _py_test(argv)
             return why, (test[1] if test else None), cwd

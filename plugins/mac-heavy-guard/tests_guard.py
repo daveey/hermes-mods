@@ -33,6 +33,83 @@ def blocked(tool, **args):
     return plugin._pre_tool_call(tool_name=tool, args=args) is not None
 
 
+@pytest.fixture
+def copy_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    folder = tmp_path / ".hermes"
+    folder.mkdir()
+    for name, size in (("state.db", 3 * 1024**3), ("small", 1024**2)):
+        with (folder / name).open("wb") as f:
+            f.truncate(size)  # sparse: no multi-GB allocation or copy
+    return tmp_path
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp ~/.hermes/state.db /tmp/x",
+    "cp $HOME/.hermes/state.db /tmp/x",
+    "cp ${HOME}/.hermes/state.db /tmp/x",
+    "rsync -a ~/.hermes/state.db /tmp/x",
+    "ditto ~/.hermes/state.db /tmp/x",
+    "dd if=~/.hermes/state.db of=/tmp/x",
+])
+def test_large_copy_refused(copy_home, cmd):
+    result = plugin._pre_tool_call(tool_name="terminal", args={"command": cmd})
+    assert result and result["action"] == "block"
+    for text in (str(copy_home / ".hermes/state.db"), "3.00 GiB", "3221225472",
+                 "sqlite3", "mode=ro", "indexed", "MAC_HEAVY_OK=1"):
+        assert text in result["message"]
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp ~/.hermes/small /tmp/x",
+    "MAC_HEAVY_OK=1 cp ~/.hermes/state.db /tmp/x",
+    "cp $S/a /tmp/x",
+    "cp ~/.hermes/* /tmp/x",
+    "cp ~/.hermes/small ~/.hermes/state.db",
+    "dd if=~/.hermes/small of=~/.hermes/state.db",
+    "rsync -a ~/.hermes/small ~/.hermes/state.db",
+    "ditto ~/.hermes/small ~/.hermes/state.db",
+])
+def test_large_copy_allow_controls(copy_home, cmd):
+    assert not blocked("terminal", command=cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp ~/.hermes/small ~/.hermes/state.db > /tmp/log",
+    "cp ~/.hermes/small ~/.hermes/state.db 2>/tmp/log",
+])
+def test_large_copy_destination_with_redirection(copy_home, cmd):
+    assert not blocked("terminal", command=cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp .hermes/state.db /tmp/x",
+    "cp -t /tmp .hermes/small .hermes/state.db",
+    "rsync -e ssh .hermes/small .hermes/state.db /tmp/x",
+    "ditto --arch arm64 .hermes/state.db /tmp/x",
+])
+def test_large_copy_cwd_and_options(copy_home, cmd):
+    assert blocked("terminal", command=cmd, workdir=str(copy_home))
+
+
+def test_large_copy_boundary_and_same_path_small(copy_home):
+    path = copy_home / ".hermes/state.db"
+    for size, expected in ((2 * 1024**3, True), (2 * 1024**3 - 1, False), (1024**2, False)):
+        with path.open("r+b") as f:
+            f.truncate(size)
+        assert blocked("terminal", command="cp ~/.hermes/state.db /tmp/x") == expected
+
+
+def test_large_copy_claude_hook(copy_home):
+    result = _hook("cp ~/.hermes/state.db /tmp/x", env_extra={"HOME": str(copy_home)})
+    assert result.returncode == 2 and "3.00 GiB" in result.stderr
+
+
+def test_large_copy_non_mac(copy_home, monkeypatch):
+    monkeypatch.setattr(guard.sys, "platform", "linux")
+    assert not blocked("terminal", command="cp ~/.hermes/state.db /tmp/x")
+
+
 HEAVY = [
     "cargo build --release",
     "cd ~/code/app && cargo build --release --target x86_64-apple-darwin",
