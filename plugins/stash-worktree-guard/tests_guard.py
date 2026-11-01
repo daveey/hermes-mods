@@ -240,3 +240,202 @@ def test_missing_stash_is_not_a_block(multi):
     main, wt = multi
     git("stash", "clear", cwd=main)
     assert block("terminal", command=f"git -C {wt} stash pop") is None
+
+
+# --- Bounded shell state: groups, pipelines, background, mutations, substitutions ---
+
+def _blocked(cmd, cwd):
+    got = block("terminal", command=cmd, workdir=str(cwd))
+    return bool(got and got["action"] == "block")
+
+
+# (command template, workdir key, expected blocked). {wt}/{main}/{single} are real repos:
+# main is on the stash's branch, wt is a second worktree on `other`, single has one worktree.
+SHELL_STATE_CASES = [
+    # Grouping: a subshell's cd scopes its own commands, never the parent.
+    ("(cd {wt} && git stash pop)", "main", True),
+    ("(cd {wt}; git stash apply)", "main", True),
+    ("(cd {main} && git stash pop)", "wt", False),
+    ("(cd {single} && git stash pop)", "wt", False),
+    ("(cd {main}); git stash pop", "wt", True),
+    ("{{ cd {wt}; git stash pop; }}", "main", True),
+    ("{{ cd {wt}; }}; git stash pop", "main", True),
+    # Background and pipeline elements run in subshells: their cd does not leak.
+    ("cd {single} & git stash pop", "wt", True),
+    ("cd {single} | true; git stash pop", "wt", True),
+    ("cd {single} |& cat; git stash pop", "wt", True),
+    ("git -C {wt} stash list |& git -C {wt} stash pop", "main", True),
+    # Redirections are not control separators.
+    ("git -C {main} stash pop 2>&1 | tail -3", "wt", False),
+    ("git -C {wt} stash pop 2>&1 | tail -3", "main", True),
+    ("cd {single} >/dev/null 2>&1; git stash pop", "wt", False),
+    ("cd {single} &>/dev/null; git stash pop", "wt", False),
+    ("cd {wt} &>/dev/null; git stash pop", "main", True),
+    # Variable mutations the guard does not model invalidate the binding.
+    ("WT={single}; WT+=/../wt; cd \"$WT\"; git stash pop", "main", True),
+    ("WT={single}; unset WT; cd \"$WT\"; git stash pop", "wt", True),
+    ("WT={single}; declare -x WT={wt}; cd \"$WT\"; git stash pop", "main", True),
+    ("WT={single}; read WT </dev/null; cd \"$WT\"; git stash pop", "wt", True),
+    ("WT={single}; eval \"cd {wt}\"; git stash pop", "main", True),
+    ("f() {{ cd {wt}; }}; f; git stash pop", "main", True),
+    # Directory stack: popd's destination is not inferred.
+    ("pushd {single}; popd; git stash pop", "wt", True),
+    ("pushd {single} >/dev/null && git stash pop", "wt", False),
+    # Command substitutions are inspected (never executed) in an inherited, isolated scope.
+    ("x=$(git stash pop)", "wt", True),
+    ("x=\"$(git stash pop)\"", "wt", True),
+    ("x=`git stash pop`", "wt", True),
+    ("echo \"$(cd {wt} && git stash pop)\"", "main", True),
+    ("WT={wt}; x=\"$(cd \"$WT\" && git stash pop)\"", "main", True),
+    ("cat <(git -C {wt} stash pop)", "main", True),
+    ("x=\"$(cd {single} && git stash pop)\"", "wt", False),
+    ("x=$(cd {single}); git stash pop", "wt", True),
+    # Case/compound separators: ;; ;& ;;& and if/then are command boundaries.
+    ("case x in x) git -C {wt} stash pop;; esac", "main", True),
+    ("case x in x) true;& y) git -C {wt} stash pop;; esac", "main", True),
+    ("case x in x) true;;& *) git -C {wt} stash pop;; esac", "main", True),
+    ("case x in x) git -C {single} stash pop;; esac", "wt", False),
+    ("if true; then git -C {wt} stash pop; fi", "main", True),
+    ("cd {single}; case \"$1\" in a) cd {wt};; esac; git stash pop", "wt", True),
+    ("false && cd {single}; git stash pop", "wt", True),
+    ("cd {single} || exit 1; git stash pop", "wt", False),
+]
+
+
+@pytest.mark.parametrize("template,where,expected", SHELL_STATE_CASES,
+                         ids=[c[0] for c in SHELL_STATE_CASES])
+def test_bounded_shell_state(multi, single, template, where, expected):
+    main, wt = multi
+    cmd = template.format(wt=wt, main=main, single=single)
+    cwd = {"main": main, "wt": wt}[where]
+    assert _blocked(cmd, cwd) is expected, cmd
+
+
+def test_nested_shell_exhaustion_fails_closed(multi):
+    import shlex
+    main, wt = multi
+    cmd = f"git -C {wt} stash pop"
+    for _ in range(12):
+        cmd = "bash -c " + shlex.quote(cmd)
+    assert _blocked(cmd, main)
+    deep = f"git -C {wt} stash pop"
+    for _ in range(12):
+        deep = f"echo \"$({deep})\""
+    assert _blocked(deep, main)
+    # Function recursion: every analyzed level is same-branch, but the exhausted level
+    # still contains a restore, so it is refused rather than dropped.
+    assert _blocked(f"f() {{ git -C {main} stash pop; f; }}; f", wt)
+    assert _blocked("f() { f; }; f; git stash pop", main)
+    # A shallow same-branch nesting keeps working.
+    assert not _blocked("bash -c " + shlex.quote(f"git -C {main} stash pop"), wt)
+
+
+@pytest.mark.parametrize("template,where,expected", [
+    ("bash <<EOF\ncd {wt}\ngit stash pop\nEOF", "main", True),
+    ("cat <<'EOF'\ngit stash pop\nEOF\ngit -C {main} stash pop", "wt", False),
+    ("G=git; $G stash pop", "wt", True),
+    ("$(echo git) stash pop", "main", True),
+    ("trap 'git stash pop' EXIT", "main", True),
+    ("source ./env.sh; git stash pop", "main", True),
+    ("for d in {wt}; do cd $d; done; git stash pop", "main", True),
+    ("git stash pop ; )", "main", True),  # unparseable: fail closed
+])
+def test_other_shell_entry_points(multi, template, where, expected):
+    main, wt = multi
+    cmd = template.format(wt=wt, main=main)
+    assert _blocked(cmd, {"main": main, "wt": wt}[where]) is expected, cmd
+
+
+def test_execute_code_shell_state(multi, single, monkeypatch):
+    main, wt = multi
+    monkeypatch.setenv("TERMINAL_CWD", str(main))
+    got = block("execute_code", code=f'terminal("(cd {wt} && git stash pop)")')
+    assert got and got["action"] == "block"
+    assert block("execute_code", code=f'terminal("cd {single} & git stash pop")') is None
+    monkeypatch.setenv("TERMINAL_CWD", str(wt))
+    got = block("execute_code", code='terminal(\'x="$(git stash pop)"\')')
+    assert got and got["action"] == "block"
+    got = block("execute_code", code=f'terminal("cd {single} & git stash pop")')
+    assert got and got["action"] == "block"
+    assert block("execute_code", code=f'terminal("cd {single} >/dev/null 2>&1; git stash pop")') is None
+
+
+# --- Uncertainty: a parse failure in a fragment taints the whole command ---
+
+CASE_IN_SUBST = 'echo "$(case a in a) git -C {wt} stash pop;; esac)"'
+
+
+def _stash_count(repo):
+    out = subprocess.run(["git", "-C", str(repo), "stash", "list"], capture_output=True, text=True, check=True)
+    return len(out.stdout.splitlines())
+
+
+def test_quoted_case_substitution_fails_closed_terminal(multi):
+    main, wt = multi
+    cmd = CASE_IN_SUBST.format(wt=wt)
+    got = block("terminal", command=cmd, workdir=str(main))
+    assert got and got["action"] == "block", cmd
+    assert "Save a patch instead" in got["message"]
+    # The shape is a real restore: bash pops main's stash into the `other` worktree.
+    assert _stash_count(main) == 1
+    subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
+    assert _stash_count(main) == 0
+    assert (wt / "f.txt").read_text() == "stashed\n"
+
+
+def test_quoted_case_substitution_fails_closed_execute_code(multi, monkeypatch):
+    main, wt = multi
+    monkeypatch.setenv("TERMINAL_CWD", str(main))
+    code = "terminal('" + CASE_IN_SUBST.format(wt=wt) + "')"
+    got = block("execute_code", code=code)
+    assert got and got["action"] == "block", code
+
+
+def test_fragment_parse_failure_without_restore_is_not_refused(multi):
+    main, wt = multi
+    # Uncertainty refuses only textual restores: a non-restoring stash is still allowed.
+    assert not _blocked(f'echo "$(case a in a) git -C {wt} stash list;; esac)"', main)
+
+
+# --- Bounds: state cap, step budget, unexpected analyzer exception ---
+
+def _subdirs(repo, n):
+    for k in range(n):
+        (repo / f"d{k}").mkdir()
+    return [repo / f"d{k}" for k in range(n)]
+
+
+def _case_cd(single, dirs):
+    arms = " ".join(f"{k}) cd {d};;" for k, d in enumerate(dirs))
+    return f'cd {single}; case "$1" in {arms} esac; git stash pop'
+
+
+def test_state_cap_collapses_to_unknown(multi, single, monkeypatch):
+    _main, wt = multi
+    dirs = _subdirs(single, guard.MAX_STATES + 4)
+    # Every possible cwd is inside the single-worktree repo; only the cap makes cwd unknown.
+    assert not _blocked(_case_cd(single, dirs[:3]), wt)
+    assert _blocked(_case_cd(single, dirs), wt)
+    monkeypatch.setattr(guard, "MAX_STATES", 1000)
+    assert not _blocked(_case_cd(single, dirs), wt)
+
+
+def test_step_budget_fails_closed(multi):
+    main, wt = multi
+    same_branch = f"git -C {main} stash pop"
+    assert not _blocked("true; " * 10 + same_branch, wt)
+    assert _blocked("true; " * guard.MAX_STEPS + same_branch, wt)
+    assert not _blocked("true; " * guard.MAX_STEPS + f"git -C {main} stash list", wt)
+
+
+def test_unexpected_analyzer_exception_fails_closed(multi, monkeypatch):
+    main, wt = multi
+    same_branch = f"git -C {main} stash pop"
+    assert not _blocked(same_branch, wt)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("analyzer defect")
+
+    monkeypatch.setattr(guard._Analyzer, "simple", boom)
+    assert _blocked(same_branch, wt)
+    assert not _blocked(f"git -C {main} stash list", wt)
