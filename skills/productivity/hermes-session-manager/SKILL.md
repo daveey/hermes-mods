@@ -5,10 +5,7 @@ description: Use when a Hermes session is asked to act as the user's session man
 
 # Hermes session manager
 
-You are the front desk for the user's Hermes sessions and Kanban cards. Three promises:
-**reply fast** (never block a turn on long work), **nothing stalls silently** (every stuck or
-waiting item gets surfaced or unstuck), and **close the loop** (finished work is reported and
-archived).
+Route quickly, recover stalled work, and verify closeout in the originating session.
 
 ## Per user message: route first
 
@@ -64,7 +61,15 @@ say what's running, never what needs the user.
 - For a completion sweep ("get all sessions green"), inspect each remaining deliverable and why it stopped,
   then resolve authorized asks and resume concrete work. If a recipient only relays the instruction back,
   direct it to produce the missing artifact in its own session; a coordination reply is not execution.
-  Reuse existing cards and keep real observation, physical, privacy and spend gates intact.
+  Reuse existing cards; preserve physical, privacy and spend gates.
+- For David's soak-only waits, run the existing check immediately rather than wait out an observation window.
+  Record his duration waiver on the card, report the actual window, and close on checked evidence—not a
+  fabricated full-soak pass. Repair failing checks without another soak-only delay. Quota resets, unfinished
+  implementation and third-party locks are not soaks; never shorten real data-retention periods to test expiry.
+- Before undoing a model migration, recover the original user instructions from the tool that performed it:
+  Hermes `state.db` does not contain Claude Code's `~/.claude/projects/*/*.jsonl` user messages. Read the
+  timestamped user rows and distinguish existing-card migration from later new-card defaults; a commit message
+  or an incomplete search cannot establish that prior pins should be restored.
 - Verify execution after dispatch: `cross_session.send` can return `delivered=true, status=streaming`
   while agent initialization subsequently fails. Read back the exact message, then require a new tool
   operation or substantive conclusion; correlate a silent chat's runtime ID with `logs/errors.log`.
@@ -78,8 +83,8 @@ say what's running, never what needs the user.
   relevant instead of claiming implementation success. Archiving is not a substitute for this conclusion.
 - Keep genuine unfinished work open. Only irreducible human actions become blocked cards with
   `human_request`; delegated judgment does not supply credentials, physical evidence or extra spend.
-- Verify completion with a fresh `sessions outcome <id> --json` after derivation, not only an immediate
-  `session_outcome` declaration/readback: live card links can restore `waiting`. Trace remote links to the
+- Verify completion with `hermes sessions outcome <id> --refresh --json`, then read it back; without
+  `--refresh` the command only reads stored state. Live card links can restore `waiting` after a done declaration. Trace remote links to the
   owner's `kanban notify-list <task> --json` and the card's named canonical origin. Remove only a demonstrably
   obsolete observer via supported `notify-unsubscribe`, sync owner and consumer, then re-read the derived
   outcome; preserve canonical ownership and unmet acceptance. If a child-context mutation fence refuses the
