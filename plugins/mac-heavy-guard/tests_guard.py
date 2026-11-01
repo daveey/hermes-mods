@@ -56,7 +56,8 @@ def test_large_copy_refused(copy_home, cmd):
     result = plugin._pre_tool_call(tool_name="terminal", args={"command": cmd})
     assert result and result["action"] == "block"
     for text in (str(copy_home / ".hermes/state.db"), "3.00 GiB", "3221225472",
-                 "sqlite3", "mode=ro", "indexed", "MAC_HEAVY_OK=1"):
+                 "sqlite3", "mode=ro", "indexed", "MAC_HEAVY_OK=1",
+                 "PRAGMA query_only=ON", "state.db?mode=rw"):  # the fallback when mode=ro can't open a WAL db
         assert text in result["message"]
 
 

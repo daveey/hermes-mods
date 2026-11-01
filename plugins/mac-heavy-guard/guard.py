@@ -230,8 +230,13 @@ def _large_copy(name: str, args: list[str], cwd: Optional[str]) -> Optional[str]
             continue
         advice = "Use read-only in-place access instead of copying."
         if path.lower().endswith((".db", ".sqlite", ".sqlite3")):
-            uri = "file:" + quote(os.path.abspath(path), safe="/") + "?mode=ro"
-            advice += f" For SQLite: sqlite3 {shlex.quote(uri)} with indexed queries (session_id or an id range)."
+            base = "file:" + quote(os.path.abspath(path), safe="/")
+            uri = base + "?mode=ro"
+            # mode=ro can't open a WAL db whose -wal/-shm sidecars are gone (tests/test_sqlite_ro_guard.py),
+            # so name the read-only rw fallback as well.
+            fallback = f"sqlite3 -cmd 'PRAGMA query_only=ON' {shlex.quote(base + '?mode=rw')}"
+            advice += (f" For SQLite: sqlite3 {shlex.quote(uri)} with indexed queries (session_id or an id range);"
+                       f" if that says 'unable to open database file', {fallback}.")
         return f"{name} source {path!r} ({info.st_size / 1024**3:.2f} GiB; {info.st_size} bytes). {advice}"
     return None
 
