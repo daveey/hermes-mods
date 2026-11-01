@@ -38,6 +38,22 @@ def pytest_configure(config):
     if not config.option.basetemp:
         config.option.basetemp = str(Path(_COLLECTION_HOME.name) / 'pytest')
     _GUARD.allow(config.option.basetemp)
+    config.addinivalue_line('markers', 'platforms(*specs, arch=None, arch_negate=False): run only on hosts '
+                                       "matching a spec (core's tests/_fixtures/platform_gating.py)")
+
+
+def pytest_collection_modifyitems(config, items):
+    # Core's own conftest applies platforms(...) gating, but scripts/test-all runs this suite with its own
+    # rootdir, so only this conftest loads: Linux-only tests (core's http_readback) ran and failed on macOS.
+    # Reuse core's gate rather than a copy that can drift from it.
+    try:
+        from tests._fixtures.platform_gating import _platforms_gate_reason
+    except ImportError:  # no core on the path, or a core from before the fixture split
+        return
+    for item in items:
+        reason = _platforms_gate_reason(item)
+        if reason is not None:
+            item.add_marker(pytest.mark.skip(reason=reason))
 
 
 @pytest.hookimpl(trylast=True)
