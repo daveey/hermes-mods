@@ -2,16 +2,61 @@
 
 The job directory is a producer outbox; the authority's admission receipt is the
 exactly-once boundary. Never synthesize viewer input or execute from a watchdog.
+
+Routing (``resolve``): the job records only the owning session id. Its logical
+owner (compression root) is resolved to the route that conversation is on now:
+
+* LOCAL gateway chats (Desktop/CLI/GUI over the gateway) and messaging
+  conversations a chat moved past (detached) ride ``local_automation_v1`` on the
+  live session's own source, restoring a cold local receipt first.
+* Native messaging routes borrow the connector provenance of the route's last
+  committed human turn (as core's route wakes and process completions do),
+  re-checked against today's adapter, profile and authorization.
+* Previously adopted legacy CLI/TUI history uses the same local receipt, even
+  with no connected viewer. Unadopted inline history stays pending: core's
+  ``resolve_local_target`` requires an authenticated owner transport and refuses
+  an active inline owner. A producer must not fabricate that transport or bypass
+  its liveness fence. API-server sessions and moved routes also stay pending;
+  none is receipted as delivered.
+
+Retries are classified. ``Unavailable`` (process-local or transient) and
+``Blocked`` (route/support) both leave the outbox pending; a job-specific failure
+records a per-job backoff in ``completion-pending.json`` and each distinct reason
+is logged once per job.
 """
 import asyncio
+import concurrent.futures
 import fcntl
 import json
+import logging
 import os
+import time
 from pathlib import Path
+from types import SimpleNamespace
+
+log = logging.getLogger('user_terminal.completion')
+
+PENDING = 'completion-pending.json'
+BACKOFF_BASE_S = 15.0
+BACKOFF_CAP_S = {'transient': 120.0, 'blocked': 600.0}
+# Store refusals that clear by themselves (drain, restart, writer contention).
+TRANSIENT_REASONS = frozenset({'runtime_draining', 'stale_epoch', 'stale_generation', 'storage_unavailable',
+                               'queue_full', 'revision_conflict', 'admission_started', 'unknown_execution'})
 
 
 class Unavailable(RuntimeError):
-    pass
+    """Not admitted now; the reconciler retries. ``kind``: transient | blocked."""
+    kind = 'transient'
+
+    def __init__(self, reason, detail=''):
+        super().__init__(f'{reason}: {detail}' if detail else reason)
+        self.reason, self.detail = reason, detail
+
+
+class Blocked(Unavailable):
+    """The route cannot take the notice as things stand (unsupported surface, moved route,
+    unauthorized sender, disconnected adapter). Pending, logged once, slower retry."""
+    kind = 'blocked'
 
 
 def runtime(home):
@@ -36,40 +81,202 @@ def save(path, value):
     os.replace(tmp, path)
 
 
-async def admit(runner, authority, payload):
-    from hermes_state_runtime import find_session_admission
+def _read_json(path):
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def classify(exc):
+    """The retry class of a failed attempt, as an ``Unavailable``."""
+    if isinstance(exc, Unavailable):
+        return exc
+    from hermes_state_runtime import RuntimeStoreError
+    if isinstance(exc, RuntimeStoreError):
+        detail = ' '.join(x for x in (exc.field, exc.detail) if x)
+        return (Unavailable if exc.reason in TRANSIENT_REASONS else Blocked)('store_' + exc.reason, detail)
+    if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)):
+        return Unavailable('admission_timeout', 'the gateway loop did not answer in time')
+    if isinstance(exc, (concurrent.futures.CancelledError, asyncio.CancelledError)):
+        return Unavailable('admission_cancelled', 'the gateway loop cancelled the attempt')
+    import sqlite3
+    if isinstance(exc, sqlite3.OperationalError):
+        return Unavailable('sqlite_busy', str(exc)[:200])
+    return Blocked('unexpected_' + type(exc).__name__, str(exc)[:200])
+
+
+def _defer(job, err, cause=None):
+    """Record a failed attempt and its backoff; log each distinct reason once per job."""
+    path = job / PENDING
+    prior = _read_json(path) or {}
+    now = time.time()
+    attempts = int(prior.get('attempts') or 0) + 1
+    delay = min(BACKOFF_CAP_S[err.kind], BACKOFF_BASE_S * 2 ** min(attempts - 1, 10))
+    logged = list(prior.get('logged') or [])
+    key = f'{err.kind}:{err.reason}'
+    if key not in logged:
+        logged.append(key)
+        if cause is not None and cause is not err and err.reason.startswith('unexpected_'):
+            log.warning('user_terminal: completion %s pending (%s)', job.name, err, exc_info=cause)
+        elif err.kind == 'blocked':
+            log.warning('user_terminal: completion %s pending (%s); retrying with backoff', job.name, err)
+        else:
+            log.info('user_terminal: completion %s pending (%s); retrying', job.name, err)
+    save(path, {'kind': err.kind, 'reason': err.reason, 'detail': err.detail, 'attempts': attempts,
+                'first_at': prior.get('first_at') or now, 'last_at': now, 'next_at': now + delay,
+                'logged': logged})
+
+
+def _admitted_row(db, owner, identity):
+    """This producer's admission on *owner*, whichever route principal admitted it (a route
+    that moved after admission must not hide it and cause a second one)."""
+    from hermes_state_runtime import list_session_admissions
+    for row in list_session_admissions(db, session_id=owner, pending_only=False):
+        if row['request_id'] == identity and str(row['principal_id']).startswith('automation:'):
+            return row
+    return None
+
+
+def _has_local_receipt(db, sid):
+    from hermes_state_local import local_receipt
+    from hermes_state_runtime import RuntimeStoreError
+    try:
+        local_receipt(db, sid)
+    except RuntimeStoreError:
+        return False
+    return True
+
+
+def _recorded_route(db, sid):
+    """The gateway route recorded on the conversation's transcript tip (or its root)."""
+    tip = db.get_compression_tip(sid) or sid
+    for candidate in dict.fromkeys((tip, sid)):
+        row = db.get_session(candidate) or {}
+        if row.get('session_key'):
+            return row['session_key']
+    return None
+
+
+def _live_local(authority, sid):
     from gateway.session_local_recovery import restore_local_session
-    from gateway.session_detached import route_entry
-    from gateway.platforms.event import MessageEvent, MessageType
-    sid = await asyncio.to_thread(authority.logical_owner, payload['session_id'])
-    identity = payload['identity']
-    # Missing is terminal only after consulting the actual profile authority.
-    if await asyncio.to_thread(authority.db.get_session, sid) is None:
-        return {'status': 'missing', 'session_id': sid}
     live = authority.sessions.get(sid)
     if live is None:
         restore_local_session(authority, sid)
         live = authority.sessions[sid]
-    row = await asyncio.to_thread(find_session_admission, authority.db,
-        principal_id='automation:' + live.route, session_id=sid, request_id=identity)
+    return live
+
+
+def resolve(runner, authority, sid):
+    """Where the logical conversation *sid* takes a producer turn now. Runs on the gateway loop
+    (a cold local restore publishes into the authority's live map)."""
+    from gateway.config import Platform
+    from gateway.session_detached import detached_route_of, route_entry
+    db = authority.db
+    live = authority.sessions.get(sid)
+    if live is None and _has_local_receipt(db, sid):
+        live = _live_local(authority, sid)
+    route = live.route if live is not None and live.route else _recorded_route(db, sid)
+    if not route:
+        raise Blocked('no_gateway_route', 'the session has no gateway route (legacy inline TUI or a '
+                      'non-gateway session); there is no durable producer admission path for it')
+    entry = route_entry(authority, route)
+    if entry is None or entry.origin is None:
+        raise Blocked('route_not_found', route)
+    if entry.suspended:
+        raise Blocked('route_suspended', route)
+    if authority.logical_owner(entry.session_id) != sid:
+        # /new, /resume or a handoff moved the route on; the closed conversation fails closed,
+        # as core's own pinned completions do.
+        raise Blocked('route_moved', 'the route now names another conversation')
+    if live is not None and detached_route_of(live.source):
+        return SimpleNamespace(kind='local', owner=sid, route=route, entry=entry, live=live)
+    if entry.origin.platform == Platform.LOCAL:
+        owner = entry.origin.chat_id  # the local receipt the FIFO is keyed by (kept across /new)
+        live = _live_local(authority, owner)
+        if live.route != route:
+            raise Blocked('route_moved', 'the local session is on another route')
+        return SimpleNamespace(kind='local', owner=owner, route=route, entry=entry, live=live)
+    if entry.origin.platform == Platform.API_SERVER:
+        raise Blocked('unsupported_surface', 'api_server sessions take no producer admissions')
+    return SimpleNamespace(kind='native', owner=sid, route=route, entry=entry, live=live)
+
+
+def _owned_profile(runner, route, home):
+    """Under multiplexing a messaging route belongs to the profile its key names; it must be
+    the job's own (the plugin-injection boundary)."""
+    if getattr(getattr(runner, 'config', None), 'multiplex_profiles', False) is not True:
+        return True
+    from hermes_state_keys import profile_from_session_key
+    served = runner._served_profile_for_home(home)
+    return served is not None and profile_from_session_key(route) == served
+
+
+async def _admit_local(runner, authority, target, payload, home):
+    from gateway.platforms.event import MessageEvent, MessageType
+    live = target.live
+    adapter = runner._adapter_for_source(live.source)
+    if adapter is None:
+        raise Blocked('adapter_unavailable', 'no local session adapter')
+    event = MessageEvent(text=payload['text'], message_type=MessageType.TEXT,
+        source=live.source, internal=True, allow_gateway_control=False,
+        message_id=payload['identity'],
+        metadata={'gateway_session_key': live.route, 'gateway_session_id': target.entry.session_id})
+    async with runner._plugin_injection_scope(live.source, home=home):
+        await authority.admit_automation(adapter, event, payload['identity'])
+
+
+async def _admit_native(runner, authority, target, payload, home):
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.session_automation import committed_route_envelope
+    from gateway.session_envelope import restore_native
+    if not _owned_profile(runner, target.route, home):
+        raise Blocked('foreign_profile', "the route belongs to another profile than the job's")
+    envelope = await asyncio.to_thread(committed_route_envelope, authority, target.entry)
+    if envelope is None:
+        raise Blocked('no_committed_turn', 'the route has no committed human turn to borrow provenance from')
+    # The route's committed source, which ``snapshot_automation`` re-derives and compares.
+    restored = restore_native({'text': payload['text'], 'native_text_v1': {
+        k: v for k, v in envelope.items() if k != 'media'}}, runner)
+    source = restored.source
+    adapter = runner._adapter_for_source(source)
+    if adapter is None:
+        raise Blocked('adapter_unavailable', f'no connected {source.platform.value} adapter')
+    # Host code never widens access: today's allowlists must still admit the borrowed sender.
+    if not runner._is_user_authorized_for_source(source, allow_adapter_delegation=False):
+        raise Blocked('unauthorized', 'the route sender is not authorized by current gateway policy')
+    event = MessageEvent(text=payload['text'], message_type=MessageType.TEXT, source=source, internal=True,
+        allow_gateway_control=False, message_id=payload['identity'],
+        metadata={'gateway_session_key': target.route, 'gateway_session_id': target.entry.session_id})
+    async with runner._plugin_injection_scope(source, home=home):
+        await authority.admit_automation(adapter, event, payload['identity'])
+
+
+async def admit(runner, authority, payload):
+    db = authority.db
+    home = Path(db.db_path).parent
+    sid = await asyncio.to_thread(authority.logical_owner, payload['session_id'])
+    identity = payload['identity']
+    # Missing is terminal only after consulting the actual profile authority.
+    if await asyncio.to_thread(db.get_session, sid) is None:
+        return {'status': 'missing', 'session_id': sid}
+    owner = sid
+    row = await asyncio.to_thread(_admitted_row, db, sid, identity)
     if row is None:
-        entry = route_entry(authority, live.route)
-        if (entry is None or authority.logical_owner(sid) != sid or
-                (entry.session_id != sid and authority.db.get_compression_tip(sid) != entry.session_id)):
-            raise Unavailable('session route changed')
-        event = MessageEvent(text=payload['text'], message_type=MessageType.TEXT,
-            source=live.source, internal=True, allow_gateway_control=False,
-            message_id=identity,
-            metadata={'gateway_session_key': live.route, 'gateway_session_id': entry.session_id})
-        async with runner._plugin_injection_scope(live.source, home=Path(authority.db.db_path).parent):
-            await authority.admit_automation(runner._adapter_for_source(live.source), event, identity)
-        row = await asyncio.to_thread(find_session_admission, authority.db,
-            principal_id='automation:' + live.route, session_id=sid, request_id=identity)
+        target = resolve(runner, authority, sid)
+        owner = target.owner
+        if owner != sid:
+            row = await asyncio.to_thread(_admitted_row, db, owner, identity)
+        if row is None:
+            admit_target = _admit_local if target.kind == 'local' else _admit_native
+            await admit_target(runner, authority, target, payload, home)
+            row = await asyncio.to_thread(_admitted_row, db, owner, identity)
     if row is None:
-        raise Unavailable('admission not committed')
+        raise Unavailable('admission_not_committed')
     if row['payload'].get('text') != payload['text'] or row['request_id'] != identity:
-        raise Unavailable('admission payload mismatch')
-    return {'status': 'admitted', 'admission_id': row['admission_id'], 'session_id': sid}
+        raise Blocked('admission_payload_mismatch')
+    return {'status': 'admitted', 'admission_id': row['admission_id'], 'session_id': owner}
 
 
 def deliver(job, status, owner, home, clean_output):
@@ -78,6 +285,10 @@ def deliver(job, status, owner, home, clean_output):
     receipt = job / 'completion-receipt.json'
     if receipt.exists():
         return
+    pending = _read_json(job / PENDING)
+    if pending and float(pending.get('next_at') or 0) > time.time():
+        raise Unavailable('backoff')
+    # Process-local: another process may own this home's gateway, so no per-job state here.
     runner, authority = runtime(home)
     loop = runner._gateway_loop
     if loop is None or loop.is_closed() or not runner._running:
@@ -113,5 +324,18 @@ def deliver(job, status, owner, home, clean_output):
                          f'exit_code: {status.get("exit_code")}\nOutput tail:\n{tail}')}
             save(outbox, payload)
         # Timeout does not cancel an admitted turn. A retry consults the same key.
-        result = asyncio.run_coroutine_threadsafe(admit(runner, authority, payload), loop).result(timeout=20)
+        future = asyncio.run_coroutine_threadsafe(admit(runner, authority, payload), loop)
+        try:
+            result = future.result(timeout=20)
+        except Exception as exc:
+            err = classify(exc)
+            _defer(job, err, exc)
+            if err is exc:
+                raise
+            raise err from exc
         save(receipt, result)
+        prior = _read_json(job / PENDING)
+        if prior:
+            log.info('user_terminal: completion %s %s after %s deferred attempt(s)', job.name,
+                     result.get('status'), prior.get('attempts'))
+            (job / PENDING).unlink(missing_ok=True)

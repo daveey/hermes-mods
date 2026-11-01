@@ -454,6 +454,9 @@ def test_register_picks_remote_handler_without_a_screen(monkeypatch):
         def register_hook(self, *a):
             pass
 
+    # Lifecycle is covered separately; registration must not start a host thread
+    # against the test process's real plugin registry.
+    monkeypatch.setattr(ut, "start_reconciler", lambda ctx: None)
     monkeypatch.setattr(ut, "has_screen", lambda: False)
     ut.register(Ctx())
     assert got["handler"] is ut.handle_remote and got["schema"]["parameters"] == ut.SCHEMA["parameters"]
