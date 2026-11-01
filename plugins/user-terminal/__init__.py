@@ -53,9 +53,10 @@ bounded to max age + 2 min). handle() spawns it and runner.sh starts it (and wai
 so a job made by create_job() directly is covered too; watchdog.lock keeps it to one per job. Every
 run_in_user_terminal call (new or resume) also sweeps non-final jobs, so old jobs without a watchdog are
 reconciled: no window after LAUNCH_GRACE_S -> start gate fenced, then abandoned (nothing ran). It withdraws the job
-at once when the owning card is done/archived or a run later than the acknowledged one ended without re-attaching
-(task_runs.ended_at; board sqlite opened mode=ro + query_only; a card still blocked on the same run keeps its
-prompt). An ``unblocked`` event after the acknowledged event cursor, or a later run still going, starts the re-attach
+at once when the owning card is done/archived or a later unattached run ends with completed, blocked, scheduled
+or review_requested. All other outcomes (including NULL/unknown) get grace, not immediate withdrawal. Board
+sqlite is opened mode=ro + query_only; a card still blocked on the same run keeps its prompt. An ``unblocked``
+event after the acknowledged event cursor, or any later run, starts the re-attach
 grace ``user_terminal.reattach_grace_minutes`` (default 10, env HERMES_USER_TERMINAL_REATTACH_GRACE_MINUTES; resolved
 at creation into meta.json), measured from the earliest such board event so polls never extend it; past it the job
 is withdrawn. The owning card's current live run re-attaches with run_in_user_terminal(job_id=...): before any
@@ -977,14 +978,19 @@ def _as_int(v: Any) -> int | None:
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
+# Only these core lifecycle outcomes express a decision to stop using an unattached
+# request. Infrastructure failures, continuation, NULL and future outcomes get grace.
+_UNATTACHED_STOP_OUTCOMES = frozenset({"completed", "blocked", "scheduled", "review_requested"})
+
+
 def _board_check(owner: dict, created: float, attachment: dict | None = None,
                  grace_minutes: float | None = None, now: float | None = None) -> str | None:
     """Reason the owning card no longer wants this prompt, or None. Read-only (_ro_connect: mode=ro, else
     mode=rw + query_only); an unreadable board is logged, never written to.
 
     Immediate: the card is done/completed/archived, or a run later than the acknowledged one (the attached run,
-    else the creating run) has ENDED without re-attaching. Grace: an unblock after the acknowledged event cursor
-    (the attachment's, else the one taken at creation) or a later run that is still going starts the re-attach
+    else the creating run) has ENDED with an explicit stop outcome without re-attaching. Grace: an unblock after
+    the acknowledged event cursor (the attachment's, else the creation cursor) or any other later run starts re-attach
     grace, measured from the EARLIEST such board event, so polls can never extend it; past it -> withdrawn."""
     import sqlite3
 
@@ -1025,7 +1031,7 @@ def _board_check(owner: dict, created: float, attachment: dict | None = None,
                 for rid, started, ended, outcome in con.execute(
                         "SELECT id, started_at, ended_at, outcome FROM task_runs WHERE task_id=? AND id>? ORDER BY id",
                         (task, mine)).fetchall():
-                    if ended is not None:
+                    if ended is not None and outcome in _UNATTACHED_STOP_OUTCOMES:
                         return (f"card {task}'s later run {rid} ended ({outcome or 'no outcome'}) without "
                                 f"re-attaching to this request")
                     pending.append((float(started if started is not None else created),
@@ -1177,28 +1183,30 @@ def attach_job(job: Path, session_id: str | None = None) -> dict:
         return no(f"the caller's board is not the board of card {task}")
     if not Path(str(db)).exists():
         return no(f"board db {db} does not exist")
-    con = None
-    try:
-        con = _ro_connect(db)
-        row = con.execute("SELECT status, current_run_id FROM tasks WHERE id=?", (task,)).fetchone()
-        if not row:
-            return no(f"card {task} is not on its board")
-        if row[1] is None or int(row[1]) != run:
-            return no(f"run {run} is not the current run of card {task} (current: {row[1]})")
-        if _has_table(con, "task_runs"):
-            r = con.execute("SELECT task_id, ended_at FROM task_runs WHERE id=?", (run,)).fetchone()
-            if not r or r[0] != task or r[1] is not None:
-                return no(f"run {run} is not a live run of card {task}")
-        cursor = int(con.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
-    except (sqlite3.Error, TypeError, ValueError) as e:
-        log.warning("user_terminal: attach of %s could not read board db %s: %s", job.name, db, e)
-        return no(f"could not read the board: {e}")
-    finally:
-        if con is not None:
-            con.close()
     if not _attach_lock(job):
         return no("another attach of this job is in progress")
     try:
+        # Validate the live/current run AFTER taking the decision lock. An infra
+        # end retains grace but must never authorize a stale caller to acknowledge it.
+        con = None
+        try:
+            con = _ro_connect(db)
+            row = con.execute("SELECT status, current_run_id FROM tasks WHERE id=?", (task,)).fetchone()
+            if not row:
+                return no(f"card {task} is not on its board")
+            if row[1] is None or int(row[1]) != run:
+                return no(f"run {run} is not the current run of card {task} (current: {row[1]})")
+            if _has_table(con, "task_runs"):
+                r = con.execute("SELECT task_id, ended_at FROM task_runs WHERE id=?", (run,)).fetchone()
+                if not r or r[0] != task or r[1] is not None:
+                    return no(f"run {run} is not a live run of card {task}")
+            cursor = int(con.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
+        except (sqlite3.Error, TypeError, ValueError) as e:
+            log.warning("user_terminal: attach of %s could not read board db %s: %s", job.name, db, e)
+            return no(f"could not read the board: {e}")
+        finally:
+            if con is not None:
+                con.close()
         prev = read_attachment(job, owner)
         created = float(meta.get("created") or time.time())
         why = _board_check(owner, created, prev, meta.get("reattach_grace_minutes"))
@@ -1460,7 +1468,8 @@ def _card_note(job: Path) -> str:
     return (f"If card {owner.get('task_id') or owner.get('task')} blocks to wait for the user, put this job_id in "
             f"the block reason: once the card is unblocked or a new run starts, that run must re-attach by calling "
             f"run_in_user_terminal with this job_id within {grace:g} min (user_terminal.reattach_grace_minutes), "
-            f"or the request is withdrawn; a later run that ends without re-attaching withdraws it at once.")
+            f"or the request is withdrawn; a later unattached run ending as completed, blocked, scheduled or review_requested "
+            f"withdraws it at once. Infrastructure failures, continuation and unknown outcomes keep the same grace.")
 
 
 def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:

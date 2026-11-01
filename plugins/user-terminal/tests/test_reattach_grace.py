@@ -1,9 +1,9 @@
 """Owned prompts survive a card's unblock / new run for a re-attach grace (user_terminal.reattach_grace_minutes).
 
 Contract: a card-owned job is withdrawn at once when the card is done/archived, on an explicit withdraw, at max
-age, or when a run later than the acknowledged one ENDED without re-attaching. An unblock or a new run after the
-acknowledged point starts a grace (default 10 min) measured from the earliest such board event; polls never reset
-it. The card's own current run re-attaches by calling run_in_user_terminal(job_id=...): that records a per-job
+age, or when a later unattached run ENDED as completed/blocked/scheduled/review_requested. Other outcomes retain
+the grace. An unblock or new run after the acknowledged point starts a grace (default 10 min) measured from the
+earliest such board event; polls never reset it. The card's current run re-attaches with job_id: that records a per-job
 attachment sidecar (run id + board event cursor) before any sweep/check, so the job keeps waiting/running and
 returns its result. Other cards, other boards and stale runs cannot attach.
 
@@ -248,14 +248,15 @@ def test_new_run_keeps_job_for_grace_then_withdraws_unattached(tmp_path, monkeyp
     assert st and st["status"] == "withdrawn" and "newer run (8)" in st["reason"], st
 
 
-def test_later_run_that_ended_unattached_withdraws_at_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("outcome", ["completed", "blocked", "scheduled", "review_requested"])
+def test_later_run_that_ended_unattached_withdraws_at_once(tmp_path, monkeypatch, outcome):
     db = _board(tmp_path)
     job = _owned_job(tmp_path, monkeypatch, db)
     _block(db)
     _unblock(db)
     _claim(db, 8)
     assert ut.watch_once(job, {}) is None  # within the grace
-    _end_run(db, 8, "crashed")  # run 8 ended without ever attaching
+    _end_run(db, 8, outcome)  # explicit stop decision, not an infrastructure interruption
     st = ut.watch_once(job, {})
     assert st and st["status"] == "withdrawn" and "run 8 ended" in st["reason"], st
 
@@ -303,7 +304,8 @@ def test_watchdog_and_attach_share_decision_lock(tmp_path, monkeypatch):
     assert ut.watch_once(job, {})["status"] == "withdrawn"
 
 
-def test_run_ending_before_attachment_lock_is_not_attached(tmp_path, monkeypatch):
+@pytest.mark.parametrize("outcome", ["crashed", "blocked"])
+def test_run_ending_before_attachment_lock_is_not_attached(tmp_path, monkeypatch, outcome):
     db = _board(tmp_path)
     job = _owned_job(tmp_path, monkeypatch, db)
     _block(db)
@@ -311,7 +313,7 @@ def test_run_ending_before_attachment_lock_is_not_attached(tmp_path, monkeypatch
     _claim(db, 8)
     real = ut._attach_lock
     def ending_lock(job):
-        _end_run(db, 8)
+        _end_run(db, 8, outcome)
         return real(job)
     monkeypatch.setattr(ut, "_attach_lock", ending_lock)
     res = _resume(monkeypatch, job, db)
@@ -709,7 +711,7 @@ def test_pty_unattached_end_or_grace_kills_group_and_window_says_so(tmp_path, mo
         assert ut.watch_once(job, {}) is None  # within the grace: the command keeps running
         assert not _gone(child)
         if trigger == "later_run_ended":
-            _end_run(db, 8, "crashed")
+            _end_run(db, 8, "blocked")
             want = "run 8 ended"
         else:
             _age_events(db, GRACE_S + 5)
