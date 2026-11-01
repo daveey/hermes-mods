@@ -641,6 +641,68 @@ def test_pre_verify_holds_denied_ask_once(tmp_path, monkeypatch):
     assert hooks["pre_verify"](session_id="s1", attempt=1, final_response=reply) is None
 
 
+# ---- agent-5c9b041010: the agent unblocked the ask's card this turn; a lagging board copy still said "blocked" ----
+_CB_ASK = {"id": "t_cb53310d", "title": "Watch health check", "action": "Open the Health app on the watch and tap Allow"}
+_CB_REPLY = ("It doesn't need you either: the health check reads the hub data directly. I added that correction to "
+             "the card and unblocked it.")
+
+
+def test_denied_ask_skips_an_ask_whose_card_the_agent_cleared_this_turn():
+    asks = lambda: [dict(_CB_ASK)]  # noqa: E731  (the stale replica still lists it)
+    for log in (['-> kanban_unblock({"task_id": "t_cb53310d", "reason": "agent can do it"})'],
+                ['-> tool_call({"calls": [{"name": "kanban_unblock", "arguments": {"task_id": "t_cb53310d4e"}}]})'],
+                ["-> terminal(ssh hub hermes kanban unblock t_cb53310d)"],
+                ['-> kanban_complete({"task_id": "t_cb53310d", "summary": "done"})'],
+                ['-> kanban_archive({"task_id": "t_cb53310d"})'],
+                ['-> kanban_schedule({"task_id": "t_cb53310d", "reason": "SCHEDULED_UNTIL=x"})'],
+                ['-> cross_task({"action": "unblock", "task_id": "t_cb53310d", "gateway": "hub"})']):
+        assert any(c.startswith("t_cb53310d") for c in rc.cleared_cards(log)), log
+        assert rc.check(_CB_REPLY, "health check?", log, _zero_judge, human_asks=asks) is None, log
+
+
+def test_denied_ask_still_fires_when_the_clearing_call_errored():
+    log = ['-> kanban_unblock({"task_id": "t_cb53310d"})', '   <- ERROR {"error": "not found"}']
+    assert rc.cleared_cards(log) == set()
+    hit = rc.check(_CB_REPLY, "health check?", log, _zero_judge, human_asks=lambda: [dict(_CB_ASK)])
+    assert hit and hit["rule"] == "denied_ask"
+
+
+def test_denied_ask_still_fires_when_another_card_was_cleared():
+    log = ['-> kanban_unblock({"task_id": "t_99aa00bb"})', "-> kanban_show(t_cb53310d)",
+           '-> kanban_comment({"task_id": "t_cb53310d", "body": "unblock soon"})']
+    hit = rc.check(_CB_REPLY, "health check?", log, _zero_judge, human_asks=lambda: [dict(_CB_ASK)])
+    assert hit and hit["rule"] == "denied_ask" and hit["asks"] == ["t_cb53310d"]
+    res = rc.nudge_outcome("denied_ask", _CB_REPLY, "health check?", log, _zero_judge,
+                           human_asks=lambda: [dict(_CB_ASK)])
+    assert res["resolved"] is False and res["asks"] == ["t_cb53310d"]
+    ok = rc.nudge_outcome("denied_ask", _CB_REPLY, "health check?", ['-> kanban_unblock({"task_id": "t_cb53310d"})'],
+                          _zero_judge, human_asks=lambda: [dict(_CB_ASK)])
+    assert ok["resolved"] is True
+
+
+def test_denied_ask_nudge_and_outcome_records_carry_the_ask_ids(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("coach_init_rc_da2", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core = mod._load("core")
+    rcl = mod._load("reply_check")
+    monkeypatch.setattr(rcl, "aux_judge", _zero_judge)
+    monkeypatch.setattr(rcl, "session_human_asks", lambda sid: [dict(_CB_ASK)])
+    store = core.Store(root=tmp_path / "coach")
+    _coach, hooks = mod.build(store=store, checkout=None)
+    rows = lambda: [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]  # noqa
+    hooks["pre_llm_call"](session_id="s9", user_message="what's the health check waiting on")
+    out = hooks["pre_verify"](session_id="s9", attempt=0, final_response="It's running; nothing needs you.")
+    assert out and out["action"] == "continue"
+    hooks["post_tool_call"](tool_name="kanban_unblock", args={"task_id": "t_cb53310d"}, result='{"ok": true}',
+                            session_id="s9")
+    assert hooks["pre_verify"](session_id="s9", attempt=1, final_response=_CB_REPLY) is None
+    nudge = [r for r in rows() if r["event"] == "reply_nudge"][0]
+    outc = [r for r in rows() if r["event"] == "reply_nudge_outcome"][0]
+    assert nudge["asks"] == ["t_cb53310d"]
+    assert outc["resolved"] is True and outc["asks"] == []
+
+
 def test_session_human_asks_reads_local_human_request_from_the_board(tmp_path, monkeypatch):
     """Local session_tasks rows carry no human_request: it is read from the card's board; a running card is not an ask."""
     import sqlite3

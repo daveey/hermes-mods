@@ -758,6 +758,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           "ask_head": " ".join((ask or "").split())[:40], "platform": platform,
                           **({"reason": hit["reason"]} if hit.get("reason") else {}),
                           **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref(),
+                          **({"asks": hit["asks"]} if "asks" in hit else {}),  # denied_ask: which cards (agent-5c9b041010)
                           **({"outcome": True} if tracked else {})}
             if tracked:  # judged again on attempt 1 (any rule): self-heal files the outcome, not the nudge
                 st = coach.loop_state(session_id)
@@ -814,6 +815,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                    human_asks=lambda: rc.session_human_asks(session_id))
             _log_outcome(session_id, n, "reply_nudge_outcome", p=res["p"], resolved=res["resolved"],
                          judged=res["judged"], evidence=res["evidence"], reply=(final_response or "")[:300],
+                         **({"asks": res["asks"]} if "asks" in res else {}),
                          **({} if attempt else {"via": "recheck"}))
             n = None
         except Exception as exc:

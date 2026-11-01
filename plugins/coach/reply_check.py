@@ -430,6 +430,35 @@ def session_human_asks(session_id: str) -> list[dict]:
 _WORD = re.compile(r"[a-z0-9][a-z0-9./_-]{3,}")
 
 
+# agent-5c9b041010: a call this turn that took a card off the user (unblock/complete/archive/schedule/move), as a
+# kanban tool, a deferred tool_call, the `hermes kanban` CLI (also over ssh) or a cross_task action.
+_CLEAR_VERB = r"(?:unblock|complete|archive|schedule|move)"
+_CLEAR_RE = re.compile(
+    r"^\s*->\s*kanban_" + _CLEAR_VERB + r"\("
+    r"|[\"']name[\"']\s*:\s*[\"']kanban_" + _CLEAR_VERB + r"[\"']"
+    r"|^\s*->\s*terminal\(.*\bhermes kanban\b(?:\s+--board\s+\S+)?\s+" + _CLEAR_VERB + r"\b"
+    r"|^\s*->\s*cross_task\(.*[\"']action[\"']\s*:\s*[\"']" + _CLEAR_VERB + r"[\"']", re.I)
+_CARD_ID = re.compile(r"\bt_[0-9a-f]{6,}\b")
+
+
+def cleared_cards(tool_log: Optional[list] = None) -> set:
+    """Card ids this turn's tool log took off the user with a call that did not error."""
+    lines = list(tool_log or [])
+    out: set = set()
+    for i, line in enumerate(lines):
+        if _CLEAR_RE.search(line or ""):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not (nxt or "").lstrip().startswith("<- ERROR"):
+                out.update(_CARD_ID.findall(line))
+    return out
+
+
+def _ask_cleared(ask: dict, cleared: set) -> bool:
+    """The ask's card is one of `cleared` (short and long forms of one id match; a `gw/` prefix is ignored)."""
+    cid = str(ask.get("id") or "").rsplit("/", 1)[-1].lower()
+    return bool(cid) and any(c.startswith(cid) or cid.startswith(c) for c in cleared)
+
+
 def ask_told(reply: str, ask: dict) -> bool:
     """True when the reply already tells this ask: names its card id or title, or carries most of its action's words.
     A reply that presents the ask and then says "the other jobs don't need you" is not a denial (live false positive
@@ -1499,7 +1528,11 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
     except Exception:
         return {"p": None, "resolved": None, "evidence": "outcome check failed", "judged": seen["called"]}
     if hit:
-        return {"p": hit["p"], "resolved": False, "evidence": hit.get("evidence") or "", "judged": seen["called"]}
+        return {"p": hit["p"], "resolved": False, "evidence": hit.get("evidence") or "", "judged": seen["called"],
+                **({"asks": hit["asks"]} if "asks" in hit else {})}
+    if rule == "denied_ask":  # the ids it saw, so a later false hit names its card (agent-5c9b041010)
+        return {"p": 0.0, "resolved": True, "evidence": "denied_ask no longer fires", "judged": seen["called"],
+                "asks": []}
     if seen["called"] and not seen["v"]:
         return {"p": None, "resolved": None, "evidence": "judge gave no verdict", "judged": True}
     v = seen["v"] or {}
@@ -1566,13 +1599,17 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         asks = []
         if phrase:
             try:
-                asks = [a for a in (human_asks() or []) if not ask_told(reply, a)]
+                # an ask whose card this turn's own successful call cleared is gone, even when the board copy read
+                # here (e.g. a hub replica on another host) still says blocked (agent-5c9b041010)
+                cleared = cleared_cards(tool_log)
+                asks = [a for a in (human_asks() or []) if not ask_told(reply, a) and not _ask_cleared(a, cleared)]
             except Exception:
                 asks = []  # fail-open: an unreadable board never holds a reply
         if asks:
             listed = "; ".join(f"{a.get('title') or a.get('id')} ({a.get('id')}) needs: {a.get('action')}"
                                for a in asks[:3])
             return {"rule": "denied_ask", "p": 1.0, "evidence": phrase, "reason": "denied_ask",
+                    "asks": [str(a.get("id") or "") for a in asks],
                     "verdict": {"denied_ask": 1.0, "evidence": phrase},
                     "nudge": DENIED_ASK_NUDGE.format(evidence=phrase[:120], n=len(asks), asks=listed[:900])}
     if not only or "credit_ask" in only:
