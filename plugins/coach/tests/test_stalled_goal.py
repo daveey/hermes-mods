@@ -271,6 +271,32 @@ def test_scheduled_agent_parent_stays_stalled_goal(tmp_path, status):
     assert _incidents(sg, db)[0]["kind"] == "stalled_goal"
 
 
+@pytest.mark.parametrize("status,kind", [("todo", "needs_input"), ("ready", "needs_input"),
+                                         ("review", "needs_input"), ("todo", "time")])
+def test_answered_ask_on_the_delivery_card_stays_a_stall(tmp_path, status, kind):
+    # core's unblock_task keeps block_kind (only complete_task clears it): once the ask is answered and the card is
+    # back in agent work, its old kind must not hide that it has not moved since
+    sg = _mod()
+    db = _mini(tmp_path / "kanban.db", [
+        {"id": "t_deliv", "title": "Ship the result", "status": status, "created_at": OLD, "block_kind": kind},
+        {"id": "t_agent", "title": "Agent step", "status": "todo", "created_at": OLD},
+    ], [["t_agent", "t_deliv"]])
+    stalls = sg.find_stalls([db], now=NOW, h=1, n=1)
+    assert [s["card"] for s in stalls] == ["t_deliv"]
+    assert _incidents(sg, db)[0]["kind"] == "stalled_goal"
+
+
+def test_parked_human_kind_on_the_delivery_card_is_still_an_intended_wait(tmp_path):
+    sg = _mod()
+    for status in ("blocked", "triage"):
+        db = _mini(tmp_path / status / "kanban.db", [
+            {"id": "t_deliv", "title": "Ship the result", "status": status, "created_at": OLD,
+             "block_kind": "needs_input"},
+            {"id": "t_agent", "title": "Agent step", "status": "todo", "created_at": OLD},
+        ], [["t_agent", "t_deliv"]])
+        assert sg.find_stalls([db], now=NOW, h=1, n=1) == [], status
+
+
 def test_delivery_card_blocked_with_only_a_human_request_is_not_a_stall(tmp_path):
     sg = _mod()
     db = _mini(tmp_path / "kanban.db", [

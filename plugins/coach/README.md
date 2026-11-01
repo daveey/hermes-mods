@@ -510,9 +510,12 @@ delivery card *moved*. Defect agent-38a817308d: the rollout card of a 5-card gra
 (any `task_chat_links` kind) plus everything downstream of them (`task_links` children; not parents or siblings,
 because boards share parents and an undirected walk merges unrelated graphs). A delivery card is an open sink of
 that graph with at least one parent. It is stalled when its status is `todo`/`ready`/`triage`/`blocked`/`review`
-(not running, not `scheduled`, not a human wait: `block_kind` `needs_input`/`time`, or `blocked` with a
-`human_request`), its last status event and last run start are older than `COACH_STALLED_GOAL_HOURS` (default 24),
-and the graph's other cards started at least `COACH_STALLED_GOAL_RUNS` (default 20) runs since then.
+(not running, not `scheduled`, not a human wait: `block_kind` `needs_input`/`time` on a `blocked`/`triage` card, or
+`blocked` with a `human_request`), its last status event and last run start are older than `COACH_STALLED_GOAL_HOURS`
+(default 24), and the graph's other cards started at least `COACH_STALLED_GOAL_RUNS` (default 20) runs since then.
+Core's `unblock_task` keeps `block_kind` on purpose (only `complete_task` clears it), so on a `todo`/`ready`/`review`
+delivery card a `needs_input` kind is the ask that was already answered: it still counts as a stall
+(`test_answered_ask_on_the_delivery_card_stays_a_stall`).
 
 A delivery card whose only remaining wall is a human is not a stall. The open-ancestor frontier is the nearest
 ancestors that are not done or archived and whose own parents are all done or archived (open intermediates are

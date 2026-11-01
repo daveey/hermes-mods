@@ -10,7 +10,8 @@ those cards through task_links. Delivery cards: open sinks of the graph (no open
 parent. A delivery card is stalled when
 
   * its status is todo/ready/triage/blocked/review (not running, scheduled = an intended wait, a human block
-    `block_kind` needs_input/time or status blocked with a human_request, done, archived), and
+    `block_kind` needs_input/time while blocked/triage or status blocked with a human_request, done, archived;
+    core keeps block_kind after an unblock, so on a todo/ready/review card it is an answered ask), and
   * its last status event (created/promoted/claimed/spawned/completed/blocked/unblocked/scheduled/...) and last run
     start are older than COACH_STALLED_GOAL_HOURS (default 24), and
   * the graph's OTHER cards started at least COACH_STALLED_GOAL_RUNS runs (default 20) since then, and
@@ -51,6 +52,8 @@ STATUS_EVENTS = ("created", "promoted", "claimed", "spawned", "completed", "bloc
                  "continued", "status", "goal_verified")
 HUMAN_WAITS = ("needs_input", "time")
 AGENT_STATUSES = ("running", "scheduled", "ready", "todo")  # a frontier card in one of these is not a human wall
+# Agent-work statuses where a carried block_kind is history: core keeps it across unblock_task.
+ANSWERED_KIND_STATUSES = ("running", "ready", "todo", "review")
 CLOSED = ("done", "archived")
 MAX_GRAPH = 400
 
@@ -61,10 +64,15 @@ def _has_request(raw) -> bool:
 
 
 def card_human_wait(info: Optional[dict]) -> bool:
-    """The card itself is an intended human wait, whatever else it is doing."""
+    """The card itself is an intended human wait.
+
+    ``block_kind`` counts only while the card is parked. Core's ``unblock_task`` keeps it on purpose (only
+    ``complete_task`` clears it), so on a running/ready/todo/review card a needs_input/time kind is the ask that was
+    already answered, not a wait: counting it hid a delivery card that sat untouched after its unblock.
+    """
     if not info:
         return False
-    if info.get("block_kind") in HUMAN_WAITS:
+    if info.get("block_kind") in HUMAN_WAITS and info.get("status") not in ANSWERED_KIND_STATUSES:
         return True
     return info.get("status") == "blocked" and _has_request(info.get("human_request"))
 
