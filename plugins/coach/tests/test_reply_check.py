@@ -1054,3 +1054,123 @@ def test_outcome_judge_and_nudge_agree_on_stalled_owner():
                            threshold=0.7, thresholds=rc.settings()["thresholds"])
     assert systems and all(clause in s for s in systems)
     assert out["resolved"] is False
+
+
+# ── self-heal agent-1f34642d7f: a no-tool follow-up turn is judged with the checks made one turn earlier, and a
+# leftover the user chose to defer is not an agent-fixable report_only. Synthetic paraphrase of the 2026-10-31 case.
+PREV_RICH = ['-> tool_call({"calls": [{"name": "action_request", "arguments": {"withdraw": {"requestId": "req-1"}}}]})',
+             '-> cross_task({"action": "read", "target": "t_p5card"})',
+             '-> cross_task({"action": "comment", "target": "t_cicost", "body": "measurement wakes Nov 2"})']
+PREV_REPLY = ("Reconciled the cards and withdrew the obsolete request. Voice gate: closed under your explicit decision "
+              "to publish the shadow results and defer enforcement.")
+FOLLOWUP = ("Already reconciled: the stale request is withdrawn; P5 is done under the user's explicit rescope "
+            "(shadow report published, enforcement deferred, not a passing enforcement result); the CI-cost card waits "
+            "on a measurement scheduled for Nov 2.")
+
+
+def _prev(gap_s=6.0):
+    return {"reply": PREV_REPLY, "rich": PREV_RICH, "ended_at": 1000.0, "gap_s": gap_s}
+
+
+def test_prev_turn_section_only_for_a_near_no_tool_followup():
+    sec = rc.prev_turn_section(_prev(), [])
+    assert "PREVIOUS TURN TOOL LOG" in sec and "action_request" in sec and "t_cicost" in sec
+    assert "defer enforcement" in sec  # the previous reply's head
+    assert rc.prev_turn_section(_prev(), ["-> terminal(ls)"])  # one call is still "fewer than 2"
+    assert rc.prev_turn_section(_prev(), ["-> terminal(ls)", "-> terminal(pwd)"]) == ""  # this turn checked itself
+    assert rc.prev_turn_section(_prev(gap_s=601), []) == ""  # stale: more than 10 min between the turns
+    assert rc.prev_turn_section(None, []) == ""
+    assert rc.prev_turn_section({**_prev(), "rich": [], "reply": ""}, []) == ""  # nothing to show
+    long_prev = {**_prev(), "rich": [f"-> terminal(step {i} " + "x" * 300 + ")" for i in range(40)],
+                 "reply": "y" * 5000}
+    sec = rc.prev_turn_section(long_prev, [])
+    assert "step 39" in sec  # newest calls kept
+    assert len(sec) < rc.PREV_TURN_LOG_CHARS + rc.PREV_TURN_REPLY_CHARS + 400
+
+
+def test_judge_and_confirm_prompts_carry_the_previous_turn():
+    for build in (rc.judge_prompt, rc.confirm_prompt):
+        with_prev = build("[Message from another Hermes session] wrap up", [], FOLLOWUP, prev_turn=_prev())
+        assert "PREVIOUS TURN TOOL LOG" in with_prev and "t_cicost" in with_prev
+        assert with_prev.index("PREVIOUS TURN TOOL LOG") < with_prev.index("AGENT'S FINAL MESSAGE")
+        assert "PREVIOUS TURN" not in build("wrap up", [], FOLLOWUP, prev_turn=_prev(gap_s=900))
+        assert "PREVIOUS TURN" not in build("wrap up", ["-> a()", "-> b()"], FOLLOWUP, prev_turn=_prev())
+        assert build("wrap up", [], FOLLOWUP) == build("wrap up", [], FOLLOWUP, prev_turn=None)
+
+
+def test_rubrics_exempt_a_leftover_the_user_chose_to_defer():
+    for text in (rc.REPORT_ONLY_RULE, rc.CONFIRM_SYS):
+        assert "chose to defer, rescope or skip" in text
+        assert "previous turn" in text  # the decision must be recorded in a tool log the judge can see
+    assert rc.REPORT_ONLY_RULE in rc.judge_system()
+
+
+def test_check_and_nudge_outcome_pass_the_previous_turn_to_the_judge():
+    z = {k: 0 for k in rc.RULES}
+    llm, calls = _judge({**z, "report_only": 0.1, "evidence": "deferred by the user"})
+    rc.check(FOLLOWUP + " Not fixed.", "wrap up", [], llm, only=["report_only"], prev_turn=_prev())
+    assert calls and "PREVIOUS TURN TOOL LOG" in calls[-1]
+    llm, calls = _judge({**z, "report_only": 0.1, "evidence": "deferred by the user"})
+    res = rc.nudge_outcome("report_only", FOLLOWUP + " Not fixed.", "wrap up", [], llm, prev_turn=_prev())
+    assert calls and "PREVIOUS TURN TOOL LOG" in calls[-1] and res["resolved"] is True
+
+
+def _prev_hooks(tmp_path, monkeypatch, name):
+    monkeypatch.delenv("COACH_REPLY_RULES", raising=False)
+    monkeypatch.setenv("COACH_SYSTEM_ONE", "off")
+    monkeypatch.setenv("COACH_STALLED_GOAL", "0")
+    spec = importlib.util.spec_from_file_location(name, HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core = mod._load("core")
+    rcl = mod._load("reply_check")
+    judged, confirmed = [], []
+    z = {k: 0 for k in rcl.RULES}
+    monkeypatch.setattr(rcl, "aux_judge", lambda s, p: judged.append(p) or json.dumps(
+        {**z, "report_only": 0.93, "evidence": "enforcement deferred"}))
+    monkeypatch.setattr(rcl, "aux_confirm", lambda s, p: confirmed.append(p) or json.dumps(
+        {"outcome": "report_only", "agent_fixable": True, "quote": "enforcement deferred"}))
+    coach, hooks = mod.build(store=core.Store(root=tmp_path / "coach"), checkout=None)
+    return coach, hooks, judged, confirmed
+
+
+def _two_turns(coach, hooks, sid, age_prev_by=0.0):
+    hooks["pre_llm_call"](session_id=sid, user_message="reconcile the audit cards", platform="desktop")
+    for name, args in (("cross_task", {"action": "read", "target": "t_p5card"}),
+                       ("cross_task", {"action": "comment", "target": "t_cicost", "body": "measurement wakes Nov 2"})):
+        hooks["post_tool_call"](session_id=sid, tool_name=name, args=args, result="{}")
+    hooks["post_llm_call"](session_id=sid, assistant_response=PREV_REPLY, platform="desktop")
+    coach.loop_state(sid)["last_end"] -= age_prev_by
+    hooks["pre_llm_call"](session_id=sid, user_message="[Message from another Hermes session] wrap up",
+                          platform="desktop")
+    return hooks["pre_verify"](session_id=sid, platform="desktop", attempt=0, final_response=FOLLOWUP + " Not fixed.")
+
+
+def test_live_hooks_show_the_previous_turn_to_screen_confirm_and_outcome(tmp_path, monkeypatch):
+    coach, hooks, judged, confirmed = _prev_hooks(tmp_path, monkeypatch, "coach_prev_turn1")
+    out = _two_turns(coach, hooks, "sp1")
+    assert out and out["action"] == "continue"  # the fake judges still fire: this pins the prompts, not the verdict
+    assert judged and "PREVIOUS TURN TOOL LOG" in judged[0] and "t_cicost" in judged[0]
+    assert confirmed and "PREVIOUS TURN TOOL LOG" in confirmed[0] and "defer enforcement" in confirmed[0]
+    hooks["pre_verify"](session_id="sp1", platform="desktop", attempt=1,
+                        final_response=FOLLOWUP + " Still not fixed.")  # the revision
+    assert len(judged) >= 2 and "PREVIOUS TURN TOOL LOG" in judged[-1]
+
+
+def test_live_hooks_leave_the_previous_turn_out_past_ten_minutes(tmp_path, monkeypatch):
+    coach, hooks, judged, confirmed = _prev_hooks(tmp_path, monkeypatch, "coach_prev_turn2")
+    _two_turns(coach, hooks, "sp2", age_prev_by=700)
+    assert judged and all("PREVIOUS TURN" not in p for p in judged + confirmed)
+
+
+def test_honored_deferral_fixtures_reach_the_judge_with_their_previous_turn():
+    # live-judged by eval/report_only_eval.py-style replays; offline, pin that each row reaches the report_only judge
+    # (prefilter candidate, no scope guard) and that rows with a previous turn show it to both judges
+    fx = json.loads((HERE / "tests" / "fixtures" / "report_only_honored_deferral.json").read_text())
+    assert {f["expect"] for f in fx} == {True, False}
+    for f in fx:
+        assert "report_only" in rc.prefilter(f["reply"]), f["id"]
+        assert rc.report_only_guard(f["user"], f["reply"], f["log"]) is None, f["id"]
+        if f.get("prev_turn"):
+            assert "PREVIOUS TURN TOOL LOG" in rc.judge_prompt(f["user"], f["log"], f["reply"], prev_turn=f["prev_turn"])
+            assert "PREVIOUS TURN TOOL LOG" in rc.confirm_prompt(f["user"], f["log"], f["reply"], prev_turn=f["prev_turn"])

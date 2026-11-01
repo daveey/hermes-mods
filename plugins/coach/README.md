@@ -245,6 +245,20 @@ session" without checking it; the judge scored that reply 0.60 and 0.75 against 
 (762-row labeled set: 1 fire, a gold positive, 0 held-out fires; 30 days of hub replies: 1 fire, the incident). The
 explicit scope-limit guard and `COACH_REPLY_RULES` without `report_only` turn it off.
 
+**Previous turn and honored deferrals (agent-1f34642d7f).** A relay asked a chat to wrap up; its no-tool reply summed
+up the card reads and withdrawal it had made one turn earlier (6 s before) and named the user's own decision to defer
+enforcement. Both judges saw only this turn's empty tool log, so the second opinion quoted the deferral as a leftover
+and the revision's outcome check failed on "no tool calls". Now, when this turn made fewer than 2 tool calls and began
+at most 10 min after the previous reply (`PREV_TURN_*` in `reply_check.py`; `AgentCoach.prev_turn`, recorded at
+`turn_end`), the screen, the second opinion and the nudge outcome see a `PREVIOUS TURN TOOL LOG` section (that turn's
+real-argument log, at most 2,000 chars, plus the first 800 chars of its reply). Both rubrics score an item the user
+chose to defer, rescope or skip LOW / not agent-fixable only when the reply names the decision and a shown tool log
+records it; an agent's own choice to wait, a schedule, a bare "the user deferred it", or a latest ask to finish it does
+not count. Tests: `tests/test_reply_check.py` (section on/off by gap and tool count, prompt wiring through `check`,
+`nudge_outcome` and the live hooks), fixtures `tests/fixtures/report_only_honored_deferral.json` (1 negative,
+2 positives). Live replay of the incident draft: second opinion 0.9 → 0.1 (3/3), outcome 0.75 → ≤0.4; old vs new on
+11 fixtures + 32 recent confirmed drafts: recall 1.0 both, precision within run-to-run noise.
+
 **Closed cards (agent-a806f203ab).** A Kanban worker called `kanban_complete`, then an operator note reopened the work
 in the same turn; it pushed a fix and ended with CI unwatched, a proof never run and a done card named as "owner".
 Three changes: (1) when this turn's tool log shows a `kanban_complete` that did not error (tool, deferred `tool_call`

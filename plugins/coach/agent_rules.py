@@ -1253,6 +1253,22 @@ class AgentCoach:
             s["plan_due"] = False
         s["loop"]["last_reply"] = reply[-4000:]
         s["loop"]["last_log"] = list(s["turn_log"])[-25:]
+        # the reply check of a no-tool follow-up turn reads these (prev_turn; self-heal agent-1f34642d7f)
+        s["loop"]["last_head"] = reply[:800] if isinstance(reply, str) else ""
+        s["loop"]["last_rich"] = list(s.get("turn_rich") or [])[-25:]
+        s["loop"]["last_end"] = time.time()
+
+    def prev_turn(self, sid: str) -> Optional[dict]:
+        """The previous turn of this session for the reply check: {"reply" (its first 800 chars), "rich" (its tool log
+        with real arguments), "ended_at", "gap_s" (from its end to this turn's start)}, or None before any turn ended.
+        A follow-up turn that only sums up checks made a turn earlier is judged with them (agent-1f34642d7f)."""
+        lp = self._s(sid)["loop"]
+        end = lp.get("last_end")
+        if not end:
+            return None
+        start = self._s(sid).get("turn_t0") or time.time()
+        return {"reply": lp.get("last_head") or "", "rich": list(lp.get("last_rich") or []), "ended_at": end,
+                "gap_s": max(0.0, start - end)}
 
     def loop_state(self, sid: str) -> dict:
         return self._s(sid)["loop"]

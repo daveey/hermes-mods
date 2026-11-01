@@ -742,6 +742,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             screen = ((lambda cands: s1.reply_screen(cands, ask, log_lines, final_response, rc.profile_text()))
                       if m != "off" else None)
             judged = {}
+            # a no-tool follow-up is judged with the checks of the turn before it (agent-1f34642d7f)
+            prev = coach.prev_turn(session_id)
 
             def draft_ref() -> dict:
                 """Store the judged draft once per turn (drafts.py: redacted, capped) and return the field that links a
@@ -770,7 +772,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 if used >= cap:
                     store.log({"event": "report_only_confirm_capped", "session_id": session_id, "used": used, "cap": cap})
                     return None
-                raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), final_response))
+                raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), final_response,
+                                                                            prev_turn=prev))
                 res = rc.parse_confirm(raw)
                 store.log({"event": "report_only_confirm", "session_id": session_id, "ok": res is not None,
                            "p": res[0] if res else None, "evidence": res[1] if res else "", **draft_ref()})
@@ -790,6 +793,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                                           "turn": coach.turn_number(session_id),
                                                           "notice": rc.notice_turn(ask), "platform": platform}),
                            report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK),
+                           prev_turn=prev,
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
@@ -878,7 +882,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                    threshold=n.get("threshold", 0.7), thresholds=n.get("thresholds") or None,
                                    wake=lambda: rc.wake_sources(session_id, log_lines),
                                    kanban_down=n.get("kanban_down"),
-                                   human_asks=lambda: rc.session_human_asks(session_id))
+                                   human_asks=lambda: rc.session_human_asks(session_id),
+                                   prev_turn=coach.prev_turn(session_id))
             _log_outcome(session_id, n, "reply_nudge_outcome", p=res["p"], resolved=res["resolved"],
                          judged=res["judged"], evidence=res["evidence"], reply=(final_response or "")[:300],
                          **({"asks": res["asks"]} if "asks" in res else {}),

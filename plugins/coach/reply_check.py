@@ -988,7 +988,9 @@ STALLED_OWNER = ("A card that can't start (failed attempts, quota, no eligible r
 
 
 JUDGE_SYS = """You review an AI agent's final message for a turn, right before the turn ends, for a power user who wants
-the agent to self-serve and to verify its own work. Judge ONLY from the evidence shown. Score five independent
+the agent to self-serve and to verify its own work. Judge ONLY from the evidence shown. A PREVIOUS TURN TOOL LOG, when
+shown, holds the checks the agent made one turn earlier (this turn made almost none and followed it within minutes):
+count them as checks the agent made, as if this turn had made them. Score five independent
 probabilities (0-1):
 
 - handoff: the message asks the USER to perform a step (click, sign in, run a command, paste, approve a dialog,
@@ -1062,7 +1064,12 @@ probabilities (0-1):
   they can make, and the message says so; the message is a plan the user asked for; no unresolved problem is left;
   or the user asked a status question ("is this done?", "why isn't it green?") and the only open item is a card,
   job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and is
-  working as designed: a legitimate wait is not a problem.
+  working as designed: a legitimate wait is not a problem; or the open item is one the user
+  chose to defer, rescope or skip, the message names that decision, and the tool log (this turn or
+  the previous turn) shows where it is recorded (a card read or comment carrying the decision): honoring the
+  user's own decision is not a leftover. Only the user's own recorded decision counts: an agent's own choice to wait,
+  a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and a latest request
+  asking the agent to finish it overrides an earlier deferral.
 
 Calibrate: 0.8+ means you'd bet the user will push back ("do it yourself" / "just do it" / "you have access"; for
 report_only: "fix it" / "why aren't you fixing this?").
@@ -1078,13 +1085,14 @@ CONFIRM_SYS = """You label the final reply an AI agent gave its user at the end 
 The TOOL LOG shows the REAL arguments of the turn's tool calls (kanban_create title and body, delegate_task goals, patched
 paths, commands). Use them to decide whether the agent started a fix, or handed it to a worker or session and what it
 sent: a send of the fix or reproduction to the owning session/card/worker this turn counts as "started"; a bare "the
-owner/card has it" does not.
+owner/card has it" does not. A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent made one turn earlier
+(this turn made almost none and followed it within minutes): count them as the agent's own checks.
 
 Return ONLY one JSON object:
 {"problem": true|false, "agent_fixable": true|false|null, "outcome": "<outcome>", "user_wanted_action": true|false, "quote": "<=20 words from the reply"}
 
 - problem: true if the reply mentions a defect, failure, bug, blocker, stale/wrong state, or something not working or not done that is STILL UNRESOLVED when the reply ends ("not fixed", "still broken", "remaining work", "X is outdated", "Y failed", "waiting on CI"). false if no unresolved problem is mentioned. A card, job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and working as designed is not a problem by itself.
-- agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false.
+- agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false. An item the user chose to defer, rescope or skip is false when the reply names that decision and a tool log shown (this turn or the previous turn) records it (a card read or comment carrying the decision); acting on it would override the user. Only the user's own recorded decision counts: an agent's own choice to wait, a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and the latest request asking the agent to finish it overrides an earlier deferral.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
   "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it.
@@ -1195,7 +1203,7 @@ def render_tool_log(tool_log: list[str], budget: int) -> str:
     return "\n".join(lines)
 
 
-def confirm_prompt(user_ask: str, rich_log: list[str], reply: str) -> str:
+def confirm_prompt(user_ask: str, rich_log: list[str], reply: str, prev_turn: Optional[dict] = None) -> str:
     log = render_tool_log(rich_log, 7000)
     ask = user_ask or ""
     notice = notice_turn(ask)
@@ -1203,7 +1211,38 @@ def confirm_prompt(user_ask: str, rich_log: list[str], reply: str) -> str:
     request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else request_excerpt(ask)
     context = f"{NOTICE_CONTEXT}\n\n" if notice else ""
     return (f"{context}USER'S REQUEST (latest):\n{request}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
-            f"truncated):\n{log}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
+            f"truncated):\n{log}\n\n{prev_turn_section(prev_turn, rich_log)}"
+            f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
+
+
+# A follow-up turn that only sums up what the agent checked one turn earlier (a relay or notice asking it to wrap up)
+# made no tool calls of its own, so a this-turn-only log made every claim look unchecked (self-heal agent-1f34642d7f).
+# When this turn made fewer than PREV_TURN_MAX_TOOLS calls and began at most PREV_TURN_MAX_GAP_S after the previous
+# reply, the judges also see that turn's tool log and the head of its reply.
+PREV_TURN_MAX_TOOLS = 2
+PREV_TURN_MAX_GAP_S = 600
+PREV_TURN_LOG_CHARS = 2000
+PREV_TURN_REPLY_CHARS = 800
+
+
+def prev_turn_section(prev_turn: Optional[dict], tool_log: list[str]) -> str:
+    """The PREVIOUS TURN section of a judge prompt (ends with a blank line), or "" when it does not apply."""
+    if not isinstance(prev_turn, dict) or len(tool_log or []) >= PREV_TURN_MAX_TOOLS:
+        return ""
+    g = prev_turn.get("gap_s")
+    try:
+        gap = float(g) if g is not None else None
+    except (TypeError, ValueError):
+        gap = None
+    if gap is None:
+        return ""
+    rich = [str(x) for x in (prev_turn.get("rich") or [])]
+    head = str(prev_turn.get("reply") or "")[:PREV_TURN_REPLY_CHARS]
+    if gap > PREV_TURN_MAX_GAP_S or not (rich or head.strip()):
+        return ""
+    return (f"PREVIOUS TURN TOOL LOG (the agent's own checks one turn earlier, which ended {int(gap)} s before this "
+            f"turn; oldest first, truncated):\n{render_tool_log(rich, PREV_TURN_LOG_CHARS) if rich else '(none)'}\n\n"
+            f"PREVIOUS TURN'S FINAL MESSAGE (head):\n{head}\n\n")
 
 
 def parse_confirm(raw: str) -> Optional[tuple]:
@@ -1374,10 +1413,10 @@ def judge_system() -> str:
                         if prof.strip() else "")
 
 
-def judge_prompt(user_ask: str, tool_log: list[str], reply: str) -> str:
+def judge_prompt(user_ask: str, tool_log: list[str], reply: str, prev_turn: Optional[dict] = None) -> str:
     log = render_tool_log(tool_log, 5000)
     return (f"USER'S REQUEST (latest):\n{request_excerpt(user_ask)}\n\nTOOL LOG THIS TURN (oldest first, truncated):\n"
-            f"{log}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
+            f"{log}\n\n{prev_turn_section(prev_turn, tool_log)}AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
 def parse_verdict(raw: str) -> Optional[dict]:
@@ -1530,7 +1569,7 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
 def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
                   threshold: float = 0.8, thresholds: Optional[dict] = None,
                   wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
-                  human_asks: Optional[Callable[[], list]] = None) -> dict:
+                  human_asks: Optional[Callable[[], list]] = None, prev_turn: Optional[dict] = None) -> dict:
     """After a nudge of any rule: does the REVISED final reply (with the whole turn's tool log, revision included)
     still trip the same rule? Re-runs check() limited to that rule, same judge and thresholds (agent-3ba1979f34).
     Returns {"p", "resolved", "evidence", "judged"}; resolved=None when the judge gave no usable verdict or the check
@@ -1546,7 +1585,7 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
         return raw
     try:
         hit = check(reply, user_ask, tool_log, judge, threshold=threshold, only=[rule], thresholds=thresholds,
-                    wake=wake, kanban_down=kanban_down, human_asks=human_asks)
+                    wake=wake, kanban_down=kanban_down, human_asks=human_asks, prev_turn=prev_turn)
     except Exception:
         return {"p": None, "resolved": None, "evidence": "outcome check failed", "judged": seen["called"]}
     if hit:
@@ -1591,8 +1630,11 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           audit: Optional[Callable[[dict], None]] = None,
           card_status: Optional[Callable[[str], Optional[str]]] = None,
           capped_nudge: bool = True,
-          report_only_fallback: str = REPORT_ONLY_FALLBACK) -> Optional[dict]:
+          report_only_fallback: str = REPORT_ONLY_FALLBACK,
+          prev_turn: Optional[dict] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `prev_turn` (AgentCoach.prev_turn): the previous turn's tool log and reply head, shown to the judge when this turn
+    made almost no tool calls and followed it within minutes (prev_turn_section; agent-1f34642d7f).
     `capped_nudge=False` (Kanban worker turns): when the report_only second opinion was due but unavailable (daily
     cap, error), the screen alone never nudges (audit source "screen_capped_skip").
     `report_only_fallback` ("skip", the default, or "nudge") does the same for every other turn: "skip" audits the
@@ -1695,7 +1737,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                     log({"name": "coach_reply", "screen": sp, "skipped_llm": True})
                 return None
             cands = kept
-    v = parse_verdict(llm(judge_system(), judge_prompt(user_ask, tool_log, reply)))
+    v = parse_verdict(llm(judge_system(), judge_prompt(user_ask, tool_log, reply, prev_turn=prev_turn)))
     if sp and log:
         log({"name": "coach_reply", "screen": sp, "skipped_llm": False, "shadow": shadow,
              "llm": {r: v[r] for r in sp} if v else None, "would_drop": [r for r in sp if sp[r] < screen_below]})
