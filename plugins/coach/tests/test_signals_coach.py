@@ -288,3 +288,147 @@ def test_guard_finds_an_outcome_the_matcher_missed(tmp_path):
     _append(h, {**RESOLVED, "rule": "confirm"})  # a rule mismatch: the matcher can't pair it
     assert _coach(sg.collect_coach(h, cur, NOW + 918 + sg.HANDOFF_GRACE_S + 5)) == []
     assert [r for r in _log(h) if r.get("event") == "nudge_outcome_late" and r.get("nudge_id") == NID]
+
+
+# agent-a8d0c8c1ed: a Hermes update paused the nudged turn at a step boundary and restarted the backend (its open
+# nudges lived only in memory). The turn resumed on core's pause note (tui_gateway/update_pause.py pause_note) and
+# finished, but no outcome could come any more, so collect_coach filed "nudge got no outcome". Replays that shape.
+PAUSE_NOTE = ("[System note: Your previous turn was interrupted mid-run \u2014 it was paused at a step boundary for a "
+              "Hermes update. Every tool result above is complete; continue with the next step and don't redo "
+              "finished steps. The paused request was:]\n\n")
+RESUMED = [("assistant", "", '[{"name": "kanban_show"}]', 20),
+           ("tool", "{...}", None, 21),
+           ("user", PAUSE_NOTE + "[Kanban notice] t_1 completed", None, 240),
+           ("assistant", "", '[{"name": "patch"}]', 260),
+           ("tool", "ok", None, 261),
+           ("assistant", "", '[{"name": "terminal"}]', 300),
+           ("tool", "12 passed", None, 330),
+           ("assistant", "Fixed bb_bridge.py, pushed it and checked the mini.", None, 600)]
+
+
+def _lost(h):
+    return [r for r in _log(h) if r.get("event") == "nudge_outcome_lost"]
+
+
+def test_incident_turn_resumed_after_update_pause_is_lost_not_ignored(tmp_path):
+    h = _home(tmp_path, RESUMED)
+    cur = {}
+    assert _coach(sg.collect_coach(h, cur, LATE)) == []
+    lost = _lost(h)
+    assert len(lost) == 1 and lost[0]["reason"] == "resumed_after_restart" and lost[0]["session_id"] == SID
+    assert _coach(sg.collect_coach(h, cur, LATE + 3600)) == []
+    assert len(_lost(h)) == 1  # closed once, never refiled
+
+
+def test_kanban_notice_row_with_the_resume_note_appended_is_lost_too(tmp_path):
+    rows = [(r, ("[Kanban notice] t_2 blocked\n\n" + PAUSE_NOTE + "go on") if r == "user" else c, t, dt)
+            for r, c, t, dt in RESUMED]
+    h = _home(tmp_path, rows)
+    assert _coach(sg.collect_coach(h, {}, LATE)) == []
+    assert [r["reason"] for r in _lost(h)] == ["resumed_after_restart"]
+
+
+def test_resume_note_in_a_later_turn_after_the_nudged_reply_still_files(tmp_path):
+    """The nudged turn answered (no outcome logged); a later turn was paused: the nudge still files."""
+    h = _home(tmp_path, [("assistant", "Here is the revised summary.", None, 60),
+                         ("user", "thanks, now the next thing", None, 120),
+                         ("assistant", "", '[{"name": "terminal"}]', 130),
+                         ("user", PAUSE_NOTE + "thanks, now the next thing", None, 300),
+                         ("assistant", "Done.", None, 400)])
+    got = _coach(sg.collect_coach(h, {}, LATE))
+    assert len(got) == 1 and "no outcome" in got[0]["symptom"]
+
+
+def test_ordinary_next_ask_with_no_outcome_still_files_after_grace(tmp_path):
+    h = _home(tmp_path, [("assistant", "", '[{"name": "terminal"}]', 30),
+                         ("user", "also check the mini please", None, 200),
+                         ("assistant", "Checked the mini.", None, 260)])
+    cur = {}
+    assert _coach(sg.collect_coach(h, cur, NOW + 60)) == []
+    got = _coach(sg.collect_coach(h, cur, LATE))
+    assert len(got) == 1 and "nudge got no outcome (no revised reply)" in got[0]["symptom"]
+    assert _lost(h) == []
+
+
+def _dead_pid():
+    import subprocess
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
+
+
+def _home_nudge(tmp_path, nudge, messages):
+    h = _home(tmp_path, messages)
+    (h / "coach" / "log.jsonl").write_text(json.dumps(nudge) + "\n")
+    return h
+
+
+ANSWERED = [("assistant", "", '[{"name": "terminal"}]', 30), ("assistant", "Here is the revised summary.", None, 90)]
+
+
+def test_nudge_from_a_backend_that_is_gone_is_lost(tmp_path):
+    n = {**NUDGE, "pid": _dead_pid(), "host": sg.short_host()}
+    h = _home_nudge(tmp_path, n, ANSWERED)
+    assert _coach(sg.collect_coach(h, {}, LATE)) == []
+    assert [r["reason"] for r in _lost(h)] == ["backend_restarted"]
+
+
+def test_nudge_whose_pid_now_belongs_to_a_newer_process_is_lost(tmp_path):
+    """Restart that reused the pid: the live process started after the nudge (NOW lies in the past)."""
+    import os
+    n = {**NUDGE, "pid": os.getpid(), "host": sg.short_host()}
+    h = _home_nudge(tmp_path, n, ANSWERED)
+    assert _coach(sg.collect_coach(h, {}, LATE)) == []
+    assert [r["reason"] for r in _lost(h)] == ["backend_restarted"]
+
+
+def test_nudge_from_the_still_running_backend_files(tmp_path):
+    import os
+    import time as _t
+    now = _t.time()
+    n = {**NUDGE, "ts": now, "pid": os.getpid(), "host": sg.short_host(), "proc_start": sg.proc_start(os.getpid())}
+    h = _home(tmp_path)
+    (h / "coach" / "log.jsonl").write_text(json.dumps(n) + "\n")
+    got = _coach(sg.collect_coach(h, {}, now + sg.HANDOFF_GRACE_S + 1))
+    assert len(got) == 1 and "no outcome" in got[0]["symptom"]
+    assert _lost(h) == []
+
+
+def test_nudge_stamped_on_another_host_skips_the_pid_check(tmp_path):
+    n = {**NUDGE, "pid": _dead_pid(), "host": "some-other-host"}
+    h = _home_nudge(tmp_path, n, ANSWERED)
+    assert len(_coach(sg.collect_coach(h, {}, LATE))) == 1
+
+
+def test_open_nudge_of_a_gone_backend_is_closed_lost(tmp_path):
+    """close_open_nudges uses the same verdict: the open record gets its delivery + outcome once."""
+    n = {**NUDGE, "nudge_id": "n_gone", "pid": _dead_pid(), "host": sg.short_host()}
+    h = _home_nudge(tmp_path, n, ANSWERED)
+    cur = {}
+    sg.collect_coach(h, cur, LATE)
+    recs = [r for r in _log(h) if r.get("nudge_id") == "n_gone" and r.get("event") != "reply_nudge"]
+    assert sorted(r["event"] for r in recs) == ["nudge_outcome_lost", "reply_nudge_undelivered"]
+    assert not cur.get("coach_nudge_open")
+
+
+def test_proc_start_matches_this_process():
+    import os
+    import time as _t
+    st = sg.proc_start(os.getpid())
+    assert st is not None and st <= _t.time() + 1
+    assert sg.proc_start(_dead_pid()) is None
+
+
+def test_store_stamps_backend_identity_on_reply_nudge(tmp_path):
+    import os
+    spec = importlib.util.spec_from_file_location("coach_core_stamp_test", ROOT / "core.py")
+    core = importlib.util.module_from_spec(spec)
+    sys.modules["coach_core_stamp_test"] = core
+    spec.loader.exec_module(core)
+    st = core.Store(root=tmp_path)
+    st.log({"event": "reply_nudge", "session_id": "s", "rule": "report_only"})
+    st.log({"event": "reply_checked", "session_id": "s"})
+    a, b = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert a["pid"] == os.getpid() and a["host"] == sg.short_host()
+    assert abs(a["proc_start"] - sg.proc_start(os.getpid())) <= 2
+    assert "pid" not in b

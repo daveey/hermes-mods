@@ -109,6 +109,48 @@ def is_still_broken(text: str) -> bool:
     return bool(t.strip()) and not SYNTHETIC_RE.match(t) and bool(STILL_BROKEN_RE.search(t[:1500]))
 
 
+def proc_start(pid) -> Optional[float]:
+    """Epoch start time of process `pid` (about 1 s precision), None when no such process or unknown. Stdlib only:
+    /proc on Linux, `ps -o lstart=` elsewhere (macOS). signals.py uses the same function to tell whether the
+    backend that logged a reply_nudge is still the one running under that pid."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    stat = Path(f"/proc/{pid}/stat")
+    if Path("/proc/stat").exists():
+        try:
+            text = stat.read_text()
+            ticks = int(text[text.rfind(")") + 2:].split()[19])
+            btime = next(int(ln.split()[1]) for ln in Path("/proc/stat").read_text().splitlines()
+                         if ln.startswith("btime "))
+            return btime + ticks / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError, IndexError, StopIteration):
+            return None
+    try:
+        import subprocess
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5,
+                             env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+        return time.mktime(time.strptime(" ".join(out.split()), "%a %b %d %H:%M:%S %Y")) if out else None
+    except Exception:
+        return None
+
+
+_IDENTITY: dict = {}
+
+
+def backend_identity() -> dict:
+    """pid, short host name and process start time of this backend (cached; stamped on every reply_nudge)."""
+    if _IDENTITY.get("pid") != os.getpid():  # recomputed after a fork
+        _IDENTITY.clear()
+        st = proc_start(os.getpid())
+        _IDENTITY.update({"pid": os.getpid(), "host": os.uname().nodename.split(".")[0],
+                          **({"proc_start": round(st, 1)} if st else {})})
+    return dict(_IDENTITY)
+
+
 class Store:
     """File-backed state shared by the agent hooks and the dashboard API (they may run in different processes)."""
 
@@ -153,6 +195,10 @@ class Store:
 
     def log(self, rec: dict) -> None:
         try:
+            if rec.get("event") == "reply_nudge":
+                # signals.collect_coach reads it: a nudge whose backend has gone can never get an outcome
+                # (agent-a8d0c8c1ed: open nudges live only in backend memory and a restart drops them)
+                rec = {**backend_identity(), **rec}
             self.root.mkdir(parents=True, exist_ok=True)
             with (self.root / "log.jsonl").open("a") as f:
                 f.write(json.dumps({"ts": self.clock(), **rec}) + "\n")

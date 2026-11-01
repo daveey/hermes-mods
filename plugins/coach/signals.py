@@ -1056,6 +1056,8 @@ NUDGE_OUTCOME = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_sub
 # reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
 OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
                  "credit_ask", "laptop_job")
+# The backend identity core.Store.log stamps on each reply_nudge (agent-a8d0c8c1ed); see backend_gone.
+BACKEND_KEYS = ("pid", "host", "proc_start")
 NUDGE_WHAT = {"handoff": "agent handed the user a step it could do itself"}
 
 
@@ -1180,12 +1182,68 @@ FAILED_TURN_NOTICES = frozenset({
 })
 
 
+_core_mod = None
+_resume_prefix_cache: List[str] = []
+
+
+def _core():
+    global _core_mod
+    if _core_mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_coach_core_signals", SELF_DIR / "core.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _core_mod = mod
+    return _core_mod
+
+
+def proc_start(pid) -> Optional[float]:
+    """core.proc_start: the same clock the backend stamps on its reply_nudge rows."""
+    return _core().proc_start(pid)
+
+
+def _resume_prefix() -> str:
+    """Core's resume note prefix (crash recovery or update pause), owned by self_heal.RESUME_NOTE_PREFIX."""
+    if not _resume_prefix_cache:
+        _resume_prefix_cache.append(_self_heal().RESUME_NOTE_PREFIX)
+    return _resume_prefix_cache[0]
+
+
+def backend_gone(n: dict) -> bool:
+    """agent-a8d0c8c1ed: the backend that logged nudge `n` no longer runs, so its in-memory open nudge (and the
+    outcome it would log) is gone for good. Judged only for a nudge stamped on this host with a pid: the pid has no
+    process, or the process under it is not the one that logged the nudge (start time differs from the stamp, or,
+    with no stamp, it started after the nudge). Unknown = False (files as before)."""
+    pid = n.get("pid")
+    if not pid or not n.get("host") or n.get("host") != short_host():
+        return False
+    st = proc_start(pid)
+    if st is None:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
+        return False  # alive but its start time is unreadable: can't tell
+    ref = n.get("proc_start")
+    if ref:
+        return abs(st - float(ref)) > 5
+    return st > float(n.get("ts") or 0) + 5
+
+
+def _nudge_lost(home: Path, n: dict) -> Optional[str]:
+    return _turn_lost(home, n) or ("backend_restarted" if backend_gone(n) else None)
+
+
 def _turn_lost(home: Path, n: dict) -> Optional[str]:
     """Why the nudged turn died, or None. The nudged turn is the transcript after the nudge up to the next user row (a
     later turn's reply is not the nudged turn's outcome). It is lost when it ends on an interruption marker
     ("interrupted") or on core's failed-turn boundary row ("failed_turn") with no final assistant reply after it (the
-    turn was killed, so no reply_nudge_outcome can be logged). Any doubt (session not found, unreadable db) is None:
-    the nudge files as before (fail-open)."""
+    turn was killed, so no reply_nudge_outcome can be logged), or when the next user row is core's resume note
+    ("resumed_after_restart": the backend stopped or paused for an update before the nudged turn's final reply, so
+    the open nudge died with it even though the resumed turn went on; agent-a8d0c8c1ed). Any doubt (session not
+    found, unreadable db) is None: the nudge files as before (fail-open)."""
     sid, ts = n.get("session_id") or "", float(n.get("ts") or 0)
     if not sid:
         return None
@@ -1208,6 +1266,8 @@ def _turn_lost(home: Path, n: dict) -> Optional[str]:
         lost = seen = None
         for role, content, tool_calls, display_kind in rows:
             if role == "user":
+                if lost is not False and _resume_prefix() in str(content or ""):
+                    return "resumed_after_restart"  # no final reply yet, then core resumed the chat
                 if seen:
                     break  # the next turn began: only the nudged turn decides
                 continue
@@ -1423,7 +1483,7 @@ def close_open_nudges(home: Path, opened: dict, now: float) -> None:
         age = now - float(n.get("ts") or 0)
         if age <= HANDOFF_GRACE_S:
             continue
-        why = _turn_lost(home, n) or ("never_rechecked" if age > NUDGE_OPEN_S else None)
+        why = _nudge_lost(home, n) or ("never_rechecked" if age > NUDGE_OPEN_S else None)
         if not why:
             continue
         base = {"ts": now, "session_id": n.get("session_id") or "", "rule": n.get("rule") or "", "reason": why,
@@ -1468,7 +1528,8 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
             nudges.append(r)
         nid = r.get("nudge_id")
         if nid and r.get("event") == "reply_nudge":
-            opened[nid] = {**{k: r.get(k) for k in ("session_id", "rule", "draft_id", "platform")}, "nudge_id": nid,
+            opened[nid] = {**{k: r.get(k) for k in ("session_id", "rule", "draft_id", "platform") + BACKEND_KEYS},
+                           "nudge_id": nid,
                            "ts": at, "d": 0, "o": 0}
         elif nid and r.get("event") in NUDGE_DELIVERY:
             if nid in opened:
@@ -1490,7 +1551,7 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                         "fp": fp("agent", "fixloop", r.get("session_id") or "", issue[:80])})
         elif r.get("event") == "reply_nudge" and rule in OUTCOME_RULES and (rule == "handoff" or r.get("outcome")):
             pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id", "platform",
-                                                     "nudge_id")},
+                                                     "nudge_id") + BACKEND_KEYS},
                             "ts": at})
         elif r.get("event") == "reply_nudge_outcome" and rule in OUTCOME_RULES:
             n = next((n for n in pending if _outcome_matches(n, r)), None)
@@ -1520,10 +1581,10 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                                   "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"), **_nid(n)})
                 _mark(opened, n, "o")
                 continue
-            lost = _turn_lost(home, n)
+            lost = _nudge_lost(home, n)
             if lost:
-                # agent-fb58ec3a8f / agent-c46bf512ae: the turn died after the nudge (gateway restart, a failed-turn
-                # boundary), so no final reply ran and no outcome can come. The restart/error signals own that
+                # agent-fb58ec3a8f / agent-c46bf512ae / agent-a8d0c8c1ed: the turn died after the nudge (gateway
+                # restart, a failed-turn boundary, an update pause, the backend that held the nudge is gone), so no final reply ran and no outcome can come. The restart/error signals own that
                 # death; it is not an agent that ignored a nudge.
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_lost", "reason": lost,
                                   "session_id": n.get("session_id") or "", "rule": n.get("rule") or "handoff",
