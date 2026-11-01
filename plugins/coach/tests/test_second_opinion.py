@@ -170,8 +170,9 @@ def test_unverified_with_repo_change_runs_one_diff_review(tmp_path, env, repo):
     assert any(r["event"] == "diff_review" and r["ok"] and r["findings"] == 1 for r in logged)
 
 
+@pytest.mark.parametrize("foreign_load", [False, True], ids=["ordinary", "other-checkout"])
 @pytest.mark.parametrize("depth", ["short", "long"])
-def test_committed_change_this_turn_is_reviewed(tmp_path, env, depth):
+def test_committed_change_this_turn_is_reviewed(tmp_path, env, depth, foreign_load):
     # "long": the `cd` path alone outruns the tool logs' command cuts (140 / 300 chars), so the `git commit` is only
     # seen uncut (the case that made this test pass or fail by the length of pytest's basetemp).
     repo = _make_repo(tmp_path / "r" if depth == "short" else tmp_path / ("d" * 200) / ("e" * 200) / "repo")
@@ -182,8 +183,24 @@ def test_committed_change_this_turn_is_reviewed(tmp_path, env, depth):
     subprocess.run(cmd, shell=True, check=True)
     hooks["post_tool_call"](tool_name="terminal", args={"command": cmd}, result="{}", session_id="s1")
     assert depth == "short" or len(cmd) > 400
+    if foreign_load:
+        # Plugin discovery can load the installed checkout between our patching the
+        # judge and pre_verify. Do not let its sibling cache evict this checkout's.
+        import shutil
+        other = tmp_path / "other-coach"
+        other.mkdir()
+        for name in ("__init__.py", "reply_check.py"):
+            shutil.copyfile(HERE / name, other / name)
+        local = _mod("coach_local_probe")
+        expected = local._load("reply_check")
+        spec = importlib.util.spec_from_file_location("coach_other_probe", other / "__init__.py")
+        assert spec and spec.loader
+        foreign = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(foreign)
+        foreign._load("reply_check")
+        assert local._load("reply_check") is expected, "another checkout evicted the patched judge"
     out = hooks["pre_verify"](session_id="s1", attempt=0, final_response=REPLY, changed_paths=[])
-    assert out and len(reviewed) == 1 and "+    return a * b" in reviewed[0]
+    assert out and len(reviewed) == 1 and "+    return a * b" in reviewed[0], (judged, reviewed, list(store.read_log()))
 
 
 def test_no_review_without_repo_change(tmp_path, env):

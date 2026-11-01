@@ -522,6 +522,25 @@ frontier card that is `running`, `scheduled`, `ready` or `todo` is agent work, s
 
 Measured 2026-10-28 on the hub (its own boards plus the MacBook replica), before the frontier split: 8 distinct stalled delivery cards, among them this defect's rollout card (122 h, 168 runs by its own chat's cards). After the split, a card whose open-ancestor frontier is entirely a human wait is `waiting_on_human` instead; a frontier card that is running, scheduled, ready or todo keeps it a stall. Tests: `tests/test_stalled_goal.py`, on the real graph's rows copied from the replica (`tests/fixtures/stalled_goal_balancer.json`, titles scrubbed) plus synthetic frontiers (human wait walked past an open intermediate, blocked with a human_request and no block_kind, mixed frontier, scheduled/todo/ready/running agent parent).
 
+### Checkout-local sibling cache
+
+The sibling loader keys modules by canonical source directory as well as module name. Discovering an installed
+copy while another checkout has a review in flight no longer evicts that checkout's judge/reviewer. Symlink
+aliases of one directory still share modules, and changed files still reload within that directory.
+
+Failure chain: intermittent committed-change tests returned `None` → `pre_verify` caught the auth-store test
+seat belt → the real judge ran instead of the patched judge → discovery of another checkout replaced the
+process-wide `_coach_reply_check` entry → the next mtime check re-executed the test copy and lost its collaborator.
+The root was cache identity based only on the sibling name; timestamp equality could also reuse the *wrong*
+checkout's module. Single-checkout tests and a swallowed exception hid the interleaving. The earlier long-command
+retention fix remains necessary but did not address this independent cause.
+
+Tests: `test_second_opinion.py` forces another checkout's load before reviewing a real commit, for both short and
+long command paths, retaining the original diff assertion. `test_module_cache.py` covers equal timestamps,
+symlink identity and same-source reload. `test_nudge_reload.py` retains registered-hook handover coverage.
+The new interleaving cases fail on the old loader; disabling commit-directory detection still fails all four
+committed-change cases. No retries, increased deadlines or skipped variants are used.
+
 ### Second opinions that run (`second_opinion.py`)
 
 The two checkpoints above used to be advice only ("consider a second opinion", "verify it"). With these settings on,

@@ -65,7 +65,9 @@ def _last_assistant(history) -> str:
 def _load(name: str):
     """Load a sibling module once; re-exec it when the file changed, so a plugin reload
     (activate / discover_and_load(force=True)) picks up edits instead of the cached copy."""
-    key = f"_coach_{name}"
+    # Installed and worktree copies can be discovered concurrently. A name-only
+    # cache lets either copy replace the other's module (and live collaborators).
+    key = f"_coach_{name}_{hashlib.sha256(str(_HERE).encode()).hexdigest()}"
     path = _HERE / f"{name}.py"
     try:
         mtime = path.stat().st_mtime_ns

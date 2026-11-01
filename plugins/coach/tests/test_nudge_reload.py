@@ -213,7 +213,9 @@ def test_handover_logging_failure_never_discards_shared_sessions(env, monkeypatc
     [n] = events("reply_nudge")
     [state] = sys.modules[LIVE_KEY].homes.values()
     sessions = state["sessions"]
-    core = sys.modules["_coach_core"]
+    core = next(mod for mod in list(sys.modules.values())
+                if getattr(mod, "__file__", None) == str(HERE / "core.py")
+                and getattr(mod, "_coach_mtime", None) is not None)
     original = core.Store.log
 
     def log(self, row):
