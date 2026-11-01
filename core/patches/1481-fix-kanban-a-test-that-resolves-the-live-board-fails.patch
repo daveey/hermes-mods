@@ -1,0 +1,349 @@
+From 606b4c1d1d65ce7631a60d86046ce5e0d64fd31c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:31:28 -0800
+Subject: [PATCH] fix(kanban): a test that resolves the live board fails before
+ touching it [daveey]
+
+Problem: at 00:49-00:50 PST on 11-01, three cards (t_f6b0a5ea, t_13317706,
+t_4d53a0f1: title "x", assignee test-worker, a "Press the pair button" ask)
+were written to the MacBook's live ~/.hermes/kanban.db by a pytest run.
+
+Why 1: the run resolved kanban_db_path() to ~/.hermes/kanban.db. Evidence: a
+reproduction with the fixture's env shows the path is ~/.hermes/kanban.db
+when the worker pin is inherited, and the tmp board when it is cleared.
+Why 2: the board fixture set HERMES_HOME and Path.home only. HERMES_KANBAN_DB,
+which the dispatcher injects into every worker, outranks both
+(kanban_db._board_path). Evidence: test_kanban_ask_resolved_check.py@d046b382:31-42.
+Why 3: the fixture was copied to ~/.hermes/cache/scratch/arc/probe_test.py and
+run with `pytest --rootdir=. <scratch file>` (session 20261101_004634_1ec5d6).
+That file is outside tests/, so tests/conftest.py never loaded: no
+HERMES_KANBAN_* strip, no sandbox, no _kanban_write_guard. The worker's
+descendant fence refused the first run (PermissionError at 00:49:41). The
+next two runs cleared it with `env -u HERMES_DELEGATED_CHILD_CONTEXT`.
+Why 4: the only kanban real-root guard lived in tests/conftest.py, so it
+applied only to files under tests/. state.db has a choke point in production
+code (hermes_state._ensure_test_isolation), armed by PYTEST_* env or pytest
+ancestry. kanban_db_connect.connect had nothing equivalent.
+Root (happened): the kanban live-board refusal lived in conftest, not at the
+connect() choke point. The fixture also relied on conftest for isolation.
+Root (not caught): the conftest guard denied a single root. Its test probed
+the real root itself, and no test ran a kanban fixture without conftest.
+Recurrence: third time. #69283 added the conftest guard, and the 10-28 hub
+incident added the HERMES_KANBAN_* strip. Both were conftest-only, so this
+out-of-tree path stayed open.
+
+Countermeasures:
+- symptom: the board fixture clears every HERMES_KANBAN_* variable, sets
+  HERMES_KANBAN_HOME to its tmp home, and asserts that kanban_db_path() is
+  inside that home before init_db. Proof: run with --noconftest and an
+  inherited fake pin, the file passes 40/40 and the pin file is never
+  created. The old fixture created it.
+- root: hermes_state_guard.ensure_kanban_test_isolation runs at the top of
+  kanban_db_connect.connect() and init_db(). In a pytest-context process it
+  refuses <account root>/kanban.db and <root>/kanban/boards/<slug>/kanban.db
+  before any mkdir or open. The account root comes from passwd, not $HOME.
+- conftest: _kanban_write_guard now denies the captured kanban root, the
+  real Hermes root (even when a pre-set HERMES_KANBAN_HOME moved the kanban
+  root) and the inherited HERMES_KANBAN_DB pin file.
+- detection: tests/hermes_cli/test_kanban_production_board_guard.py. A fake
+  account root stands in for the live one, so a failing guard writes only
+  to tmp. It covers connect, init_db and explicit-path refusal, a control
+  board beside the live one, the incident shape replayed as an out-of-tree
+  pytest file with --noconftest, and the conftest multi-root deny.
+  RED: 4 failed, 1 passed (control) with the connect() calls and the
+  multi-root match removed. GREEN: 5 passed.
+---
+ hermes_cli/kanban_db_connect.py               |   3 +
+ hermes_state_guard.py                         |  41 +++++++
+ tests/conftest.py                             |  24 +++-
+ .../test_kanban_ask_resolved_check.py         |   9 +-
+ .../test_kanban_production_board_guard.py     | 114 ++++++++++++++++++
+ 5 files changed, 185 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_production_board_guard.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 18aec10a66..1c7b23c0d2 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -22,6 +22,7 @@ from dataclasses import dataclass
+ from dataclasses import field
+ from agent.deadline import poll_until
+ from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
++from hermes_state_guard import ensure_kanban_test_isolation
+ from pathlib import Path
+ from typing import Any
+ from typing import Optional
+@@ -889,6 +890,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
+     ``<root>/kanban/current`` -> ``default``)."""
+     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
++    ensure_kanban_test_isolation(path)
+     from agent.delegation_context import kanban_path_is_fenced
+     if kanban_path_is_fenced(path):
+         # Reads must not enter schema/backfill write transactions. Never create a
+@@ -976,6 +978,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
+     migration pass — callers that know the on-disk schema may have drifted
+     (tests writing legacy event kinds, external upgrades) use it to force it."""
+     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
++    ensure_kanban_test_isolation(path)
+     _refuse_dead_board_resurrection(path, board)
+     path.parent.mkdir(parents=True, exist_ok=True)
+     # Clear the cache entry so connect() re-runs schema + migrations.
+diff --git a/hermes_state_guard.py b/hermes_state_guard.py
+index 916d7a5861..f88e06c6df 100644
+--- a/hermes_state_guard.py
++++ b/hermes_state_guard.py
+@@ -126,6 +126,47 @@ def _is_production_state_db(resolved: Path, root: Path) -> bool:
+     return len(parts) == 3 and parts[0] == "profiles"
+ 
+ 
++def _account_hermes_root() -> Optional[Path]:
++    """The OS account's own Hermes root, from the password database on POSIX: tests rebind ``HOME`` to a
++    tempdir, which would move ``_real_platform_state_root`` onto their own boards. [daveey]"""
++    if sys.platform == "win32":
++        return _real_platform_state_root()
++    try:
++        import pwd
++
++        return (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes").resolve()
++    except (ImportError, KeyError, OSError):
++        return _real_platform_state_root()
++
++
++def _is_production_kanban_db(resolved: Path, root: Path) -> bool:
++    """*resolved* is the shared board ``<root>/kanban.db`` or a named board ``<root>/kanban/boards/<slug>/kanban.db``."""
++    try:
++        parts = resolved.relative_to(root).parts
++    except ValueError:
++        return False
++    return parts == ("kanban.db",) or (len(parts) == 4 and parts[:2] == ("kanban", "boards") and parts[3] == "kanban.db")
++
++
++def ensure_kanban_test_isolation(db_path: Path) -> None:
++    """Raise before any mkdir/open when a pytest-context process (env OR ancestry) resolves a production
++    Kanban board. The tests/conftest.py guard covers only files under ``tests/``: a pytest file elsewhere
++    (an agent's scratch probe) or ``--noconftest`` inherits a worker's ``HERMES_KANBAN_DB`` pin and wrote
++    live cards (t_f6b0a5ea, t_13317706, t_4d53a0f1). This choke point needs no conftest. [daveey]"""
++    if not _in_test_context():
++        return
++    root = _account_hermes_root()
++    if root is None:
++        return
++    resolved = Path(db_path).expanduser().resolve()
++    if _is_production_kanban_db(resolved, root):
++        raise RuntimeError(
++            f"live-system guard: a test resolved the production kanban board {resolved} (under the account's "
++            f"Hermes root {root}). Isolate HERMES_KANBAN_HOME and clear HERMES_KANBAN_DB/HERMES_KANBAN_BOARD "
++            "in the fixture, and run tests from the repo's tests/ tree so its conftest sandbox applies."
++        )
++
++
+ # Test-only SessionDB instance registry. Under the hermetic suite every
+ # successfully constructed SessionDB is added to this WeakSet so the autouse
+ # teardown in tests/conftest.py (_close_leaked_session_dbs) can close whatever
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 8ba94a073c..315ce8f84c 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -67,6 +67,8 @@ _version_info._cached_version_info = _version_info.VersionInfo(
+ # otherwise the deny-list would point at the throwaway tempdir and the guard
+ # would silently stop protecting the operator's actual ~/.hermes (#69385).
+ _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
++# A Kanban worker's board pin (the LIVE kanban.db): stripped below, but denied by the write guard too.
++_PRE_SANDBOX_KANBAN_DB = os.environ.get("HERMES_KANBAN_DB", "").strip()
+ _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+ 
+ # Capture before any test fixture can override Path.home()/LOCALAPPDATA.
+@@ -853,6 +855,19 @@ def _capture_real_kanban_root() -> Path:
+ _REAL_KANBAN_ROOT = _capture_real_kanban_root()
+ 
+ 
++def _kanban_deny_paths(kanban_root: Path, hermes_root: Path, pinned_db: str) -> tuple[Path, ...]:
++    """Every live location the kanban write guard refuses: the captured kanban root, the real Hermes
++    root even when a pre-set HERMES_KANBAN_HOME moved the kanban root elsewhere, and the inherited
++    HERMES_KANBAN_DB pin file wherever it lives. One root alone left the other two writable. [daveey]"""
++    paths = {kanban_root.resolve(), hermes_root.resolve()}
++    if pinned_db:
++        paths.add(Path(pinned_db).expanduser().resolve())
++    return tuple(sorted(paths))
++
++
++_REAL_KANBAN_DENY = _kanban_deny_paths(_REAL_KANBAN_ROOT, _real_test_root, _PRE_SANDBOX_KANBAN_DB)
++
++
+ @pytest.fixture(autouse=True)
+ def _kanban_write_guard(_hermetic_environment, monkeypatch):
+     """Fail-closed guard: refuse kanban writes that target the REAL root.
+@@ -893,14 +908,13 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
+                 .expanduser()
+                 .resolve()
+             )
+-        try:
+-            resolved.relative_to(_REAL_KANBAN_ROOT)
+-        except ValueError:
+-            # Resolved path is NOT under the real root — safe to write.
++        hit = next((p for p in _REAL_KANBAN_DENY if resolved.is_relative_to(p)), None)
++        if hit is None:
++            # Resolved path is NOT under a live root or the inherited pin — safe to write.
+             return _orig_connect(db_path, *args, **kwargs)
+         raise RuntimeError(
+             f"kanban_write_guard: kanban DB path resolved to {resolved}, "
+-            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
++            f"which is under the REAL kanban location {hit}. "
+             f"Hermetic isolation has been bypassed — refusing to write "
+             f"to the real ~/.hermes. See #69283."
+         )
+diff --git a/tests/hermes_cli/test_kanban_ask_resolved_check.py b/tests/hermes_cli/test_kanban_ask_resolved_check.py
+index 6150c3875c..c0257beba6 100644
+--- a/tests/hermes_cli/test_kanban_ask_resolved_check.py
++++ b/tests/hermes_cli/test_kanban_ask_resolved_check.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import json
++import os
+ import time
+ from collections.abc import Iterator
+ from pathlib import Path
+@@ -31,11 +32,17 @@ ASK = {"action": "Press the pair button on the watch. Unblock = finish pairing;
+ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+     home = tmp_path / ".hermes"
+     home.mkdir()
++    # Own every input to board resolution: a Kanban worker's HERMES_KANBAN_DB pin outranks HERMES_HOME, and a
++    # copy of this fixture run outside tests/ (no conftest) wrote three cards to the live board that way.
++    for key in [k for k in os.environ if k.startswith("HERMES_KANBAN_")]:
++        monkeypatch.delenv(key)
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    db = kb.kanban_db_path().resolve()
++    assert db.is_relative_to(home.resolve()), f"board resolved outside the test's home: {db}"
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
+     yield tmp_path
+diff --git a/tests/hermes_cli/test_kanban_production_board_guard.py b/tests/hermes_cli/test_kanban_production_board_guard.py
+new file mode 100644
+index 0000000000..f443982a11
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_production_board_guard.py
+@@ -0,0 +1,114 @@
++"""A test that resolves a production kanban board fails before anything touches it. [daveey]
++
++Incident: a copy of a kanban test fixture, run from a scratch dir outside ``tests/`` with a Kanban worker's
++inherited ``HERMES_KANBAN_DB`` pin, wrote three cards (t_f6b0a5ea, t_13317706, t_4d53a0f1) to the live board.
++No conftest was loaded, so neither the sandbox nor ``_kanban_write_guard`` ran. Every case here stands a
++fake account root in for the real one, so a guard that fails writes into ``tmp_path``, never the live board.
++"""
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++import hermes_state_guard
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++@pytest.fixture
++def account_root(tmp_path, monkeypatch) -> Path:
++    root = (tmp_path / "account" / ".hermes").resolve()
++    root.mkdir(parents=True)
++    monkeypatch.setattr(hermes_state_guard, "_account_hermes_root", lambda: root)
++    return root
++
++
++@pytest.mark.parametrize("parts", [("kanban.db",), ("kanban", "boards", "ops", "kanban.db")])
++def test_connect_and_init_refuse_a_production_board_before_touching_it(account_root, monkeypatch, parts):
++    live = account_root.joinpath(*parts)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))           # the inherited worker pin
++    for opener in (kbc.connect, kbc.init_db, lambda: kbc.connect(live)):
++        with pytest.raises(RuntimeError, match="production kanban board"):
++            opener()
++    assert sorted(account_root.rglob("*")) == []                   # no file, no sidecar, no board dir
++
++
++def test_a_board_beside_the_production_one_still_opens(account_root, tmp_path, monkeypatch):
++    workspace_db = account_root / "kanban" / "workspaces" / "t_x" / "kanban.db"
++    elsewhere = tmp_path / "own" / "kanban.db"
++    for db in (workspace_db, elsewhere):
++        monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++        with kbc.connect_closing() as conn:
++            kb.create_task(conn, title="t", assignee="w")
++        assert db.exists()
++
++
++_OUT_OF_TREE_PROBE = '''
++from pathlib import Path
++
++import pytest
++
++import hermes_state_guard
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++ACCOUNT_ROOT = Path({root!r})
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    # The incident's fixture: HERMES_HOME and Path.home only, the worker's HERMES_KANBAN_DB pin left alone.
++    monkeypatch.setattr(hermes_state_guard, "_account_hermes_root", lambda: ACCOUNT_ROOT)
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    yield tmp_path
++
++
++def test_incident_shape_is_refused(board):
++    assert kb.kanban_db_path() == ACCOUNT_ROOT / "kanban.db"
++    with pytest.raises(RuntimeError, match="production kanban board"):
++        kb.init_db()
++    with pytest.raises(RuntimeError, match="production kanban board"):
++        with kbc.connect_closing() as conn:
++            kb.create_task(conn, title="x", assignee="test-worker")
++'''
++
++
++def test_pytest_file_outside_tests_without_conftest_is_refused(account_root, tmp_path):
++    scratch = tmp_path / "scratch"
++    scratch.mkdir()
++    probe = scratch / "probe_test.py"
++    probe.write_text(textwrap.dedent(_OUT_OF_TREE_PROBE.format(root=str(account_root))))
++    # The child's own pytest must arm the guard: drop our isolation marker and the parent's PYTEST_* vars.
++    env = {k: v for k, v in os.environ.items() if k != "HERMES_TEST_ISOLATION" and not k.startswith("PYTEST_")}
++    env["HERMES_KANBAN_DB"] = str(account_root / "kanban.db")
++    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPO), env.get("PYTHONPATH", "")]))
++    run = subprocess.run(
++        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--noconftest", "-o", "addopts=",
++         "--rootdir", str(scratch), str(probe)],
++        cwd=scratch, env=env, capture_output=True, text=True, timeout=240, check=False,
++    )
++    assert run.returncode == 0 and "1 passed" in run.stdout, run.stdout + run.stderr
++    assert sorted(account_root.rglob("*")) == []
++
++
++def test_conftest_guard_denies_real_root_and_pin_when_kanban_home_moved(tmp_path, monkeypatch):
++    import tests.conftest as conftest_mod
++
++    moved, real, pin = tmp_path / "moved", tmp_path / "real" / ".hermes", tmp_path / "pinned" / "kanban.db"
++    deny = conftest_mod._kanban_deny_paths(moved, real, str(pin))
++    assert {moved.resolve(), real.resolve(), pin.resolve()} <= set(deny)
++    monkeypatch.setattr(conftest_mod, "_REAL_KANBAN_DENY", deny)
++    for db in (real / "kanban.db", pin, moved / "kanban.db"):
++        with pytest.raises(RuntimeError, match="kanban_write_guard"):
++            kbc.connect(db)
++        assert not db.exists() and not db.parent.exists()
+-- 
+2.54.0 (Apple Git-157)
+

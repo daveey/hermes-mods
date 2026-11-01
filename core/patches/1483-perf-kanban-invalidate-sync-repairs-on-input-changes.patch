@@ -1,0 +1,284 @@
+From c11f90d244d480a7fc42cedc28609e20b7226d0f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 09:39:34 +0000
+Subject: [PATCH] perf(kanban): invalidate sync repairs on input changes, not
+ dispatch clocks [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              | 31 ++++-----
+ hermes_cli/kanban_sync_repair_revision.py     | 49 +++++++++++++
+ .../hermes_cli/test_kanban_sync_idle_round.py | 62 +++++++++++++++++
+ .../test_kanban_sync_repair_revision.py       | 68 +++++++++++++++++++
+ 4 files changed, 194 insertions(+), 16 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_repair_revision.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_repair_revision.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index cfed658cf7..8a27bc5578 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -625,6 +625,8 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+             except Resync:
+                 _log.warning("kanban sync: %s live cursor below the retention floor; rebuilding from a snapshot", slug)
+                 resync(live, hub, slug, observers=True, partition=gateway)
++        from hermes_cli.kanban_sync_repair_revision import ensure_revision
++        ensure_revision(live)
+         replica = open_shadow(slug, gateway)
+         try:
+             inputs = _repair_inputs(path, replica, mode, gateway)
+@@ -789,10 +791,10 @@ class _BoardWatch:
+ 
+     ``outbox_pending`` runs every 0.5 s on every synced board. Opening a connection per call re-read the schema
+     each time (about 13 ms of CPU per pass over 10 boards, 2.5% of a core in the gateway, 2026-10-31). A kept
+-    connection answers the same indexed query in microseconds. ``PRAGMA data_version`` on a kept connection moves
+-    whenever any other connection (any process, or this one's own writers) commits to the file, which is what
+-    lets ``sync_board`` skip repair scans whose inputs did not change. A file replaced on disk (new inode) is
+-    reopened, with a new generation so its restarted ``data_version`` never equals an old one. [daveey]"""
++    connection answers the same indexed query in microseconds. Repair scans use a transactional
++    input-table revision rather than data_version: dispatcher-clock commits must not invalidate them.
++    A file replaced on disk (new inode) is reopened with a new generation, so a restored revision
++    never equals a cached key for the old file. [daveey]"""
+ 
+     MAX = 64
+ 
+@@ -841,10 +843,6 @@ class _BoardWatch:
+                 self._drop(os.path.realpath(path))
+                 return None
+ 
+-    def version(self, path: Path) -> Optional[tuple[int, int]]:
+-        got = self.query(path, "PRAGMA data_version")
+-        return None if got is None or got[1] is None else (got[0], int(got[1][0]))
+-
+     def reset(self) -> None:
+         with self._lock:
+             for key in list(self._conns):
+@@ -864,15 +862,16 @@ def reset_board_watch() -> None:
+ 
+ def _repair_inputs(live_path: Path, replica: sqlite3.Connection, mode: str, gateway: str) -> Optional[tuple]:
+     """Everything the pure repair scans (partition links, remote parents, divergence, missing children, lost
+-    placeholder links) read: the live file's commit version, the replica's identity and feed cursor, the mode, the
+-    gateway and the placement config. Equal inputs give the same answer, so an idle round skips the scans (about
+-    300 ms of CPU per round on the MacBook's default board, 2026-10-31). Read before the scans: a commit landing
+-    during or after them moves the live version, so the next round scans again. The replica is written only by its
+-    own pull (``cursor`` moves, or a rebuild makes a new file) and the ``pulled_at`` stamp, which the scans never
+-    read. None (cannot tell) always scans. [daveey]"""
+-    live_version = _WATCH.version(live_path)
+-    if live_version is None:
++    placeholder links) read: a transactional revision of the live input tables, schema version,
++    replica identity/feed cursor, mode, gateway and placement config. Dispatcher clock writes are
++    deliberately not inputs. Read before the scans so concurrent relevant commits re-arm the next
++    round. Replica writes are its own pull (cursor moves or rebuild replaces the file) and the
++    pulled_at stamp, which the scans never read. None (cannot tell) always scans. [daveey]"""
++    got = _WATCH.query(live_path, "SELECT revision, schema_version FROM kanban_repair_revision, "
++                      "pragma_schema_version WHERE id = 1")
++    if got is None or got[1] is None:
+         return None
++    live_version = (got[0], tuple(got[1]))
+     try:
+         replica_file = Path(replica.execute("PRAGMA database_list").fetchone()[2])
+         st = os.stat(replica_file)
+diff --git a/hermes_cli/kanban_sync_repair_revision.py b/hermes_cli/kanban_sync_repair_revision.py
+new file mode 100644
+index 0000000000..d9f5f740cb
+--- /dev/null
++++ b/hermes_cli/kanban_sync_repair_revision.py
+@@ -0,0 +1,49 @@
++"""Transactional invalidation for the sync client's repair scans, not dispatcher bookkeeping."""
++
++from __future__ import annotations
++
++import sqlite3
++
++# These are the live inputs of partition links, remote parents, divergence, missing
++# children and placeholder retirement. Keep independent of the capture triggers:
++# repairing writes made while capture is absent is the reason these scans exist.
++TABLES = (
++    "tasks", "task_runs", "task_links", "task_chat_links",
++    "kanban_sync_outbox", "kanban_sync_tombstones", "kanban_sync_remote_parents",
++)
++REVISION_TABLE = "kanban_repair_revision"
++
++
++def ensure_revision(conn: sqlite3.Connection) -> None:
++    """Install/repair the counter and its triggers atomically on an existing synced board.
++
++    No write transaction on the normal path. Triggers use a separate prefix so
++    capture disable/reinstall cannot create an invisible repair-input change.
++    Schema changes also enter the reader's key, including a removed trigger.
++    """
++    expected = {
++        f"kanban_repair_{table}_{op.lower()}":
++        f"CREATE TRIGGER kanban_repair_{table}_{op.lower()} AFTER {op} ON {table} "
++        f"BEGIN UPDATE {REVISION_TABLE} SET revision = revision + 1 WHERE id = 1; END"
++        for table in TABLES for op in ("INSERT", "UPDATE", "DELETE")
++    }
++    found = dict(conn.execute(
++        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'kanban_repair_*'"))
++    has_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
++                             (REVISION_TABLE,)).fetchone()
++    if all(found.get(name) == sql for name, sql in expected.items()) and has_table and conn.execute(
++        f"SELECT 1 FROM {REVISION_TABLE} WHERE id = 1"
++    ).fetchone():
++        return
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute(f"CREATE TABLE IF NOT EXISTS {REVISION_TABLE} "
++                     "(id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL)")
++        conn.execute(f"INSERT OR IGNORE INTO {REVISION_TABLE} VALUES (1, 0)")
++        # A capture gap or replaced definition must invalidate even if no data
++        # write was observed while the trigger was absent.
++        conn.execute(f"UPDATE {REVISION_TABLE} SET revision = revision + 1 WHERE id = 1")
++        for name, sql in expected.items():
++            if found.get(name) != sql:
++                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++                conn.execute(sql)
+diff --git a/tests/hermes_cli/test_kanban_sync_idle_round.py b/tests/hermes_cli/test_kanban_sync_idle_round.py
+index 5ee0115ddb..83ba1ad496 100644
+--- a/tests/hermes_cli/test_kanban_sync_idle_round.py
++++ b/tests/hermes_cli/test_kanban_sync_idle_round.py
+@@ -141,6 +141,68 @@ def test_a_capture_gap_after_idle_rounds_is_still_healed(live, svc, kanban_home,
+     assert svc.board(BOARD)["rows"]["tasks"][parent]["title"] == "gap edit"
+ 
+ 
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_dispatch_clock_commits_do_not_repeat_unchanged_repairs(live, svc, kanban_home, monkeypatch, mode):
++    _settle(live, svc, kanban_home, mode)
++    with kbc.write_txn(live):
++        live.execute("CREATE TABLE kanban_dispatch_stamp (id INTEGER PRIMARY KEY, at INTEGER)")
++    for _ in range(3):
++        _round(kanban_home, svc)
++    calls = _spy(monkeypatch, REPAIRS)
++    for stamp in range(4):
++        with kbc.write_txn(live):
++            live.execute("INSERT OR REPLACE INTO kanban_dispatch_stamp VALUES (1, ?)", (stamp,))
++        _round(kanban_home, svc)
++    assert not any(calls.values()), f"dispatch bookkeeping repeated repair scans: {calls}"
++
++
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_repair_revision_rolls_back_and_tracks_other_connection(live, svc, kanban_home, monkeypatch, mode):
++    parent, _ = _settle(live, svc, kanban_home, mode)
++    for _ in range(3):
++        _round(kanban_home, svc)
++    calls = _spy(monkeypatch, REPAIRS)
++    writer = sqlite3.connect(kanban_home / "kanban.db", isolation_level=None)
++    try:
++        writer.execute("BEGIN IMMEDIATE")
++        writer.execute("UPDATE tasks SET title = 'rolled back' WHERE id = ?", (parent,))
++        writer.rollback()
++        _round(kanban_home, svc)
++        assert not any(calls.values())
++        writer.execute("UPDATE tasks SET title = 'committed' WHERE id = ?", (parent,))
++        _round(kanban_home, svc)
++        assert all(n == 1 for n in calls.values()), calls
++    finally:
++        writer.close()
++
++
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_write_during_repair_is_not_cached_as_already_repaired(live, svc, kanban_home, monkeypatch, mode):
++    parent, _ = _settle(live, svc, kanban_home, mode)
++    real = ksc.retire_lost_placeholder_links
++    wrote = False
++
++    def concurrent_write(*args):
++        nonlocal wrote
++        result = real(*args)
++        if not wrote:
++            wrote = True
++            with kbc.write_txn(live):
++                # Suppress capture without DDL: schema_version cannot mask a lost revision.
++                live.execute("UPDATE kanban_sync_state SET applying = 1")
++                live.execute("UPDATE tasks SET title = 'during repair' WHERE id = ?", (parent,))
++                live.execute("UPDATE kanban_sync_state SET applying = 0")
++        return result
++
++    monkeypatch.setattr(ksc, "retire_lost_placeholder_links", concurrent_write)
++    ksc._REPAIRED.clear()
++    _round(kanban_home, svc)
++    assert wrote
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    assert svc.board(BOARD)["rows"]["tasks"][parent]["title"] == "during repair"
++
++
+ def test_outbox_poll_keeps_one_connection_per_board_and_sees_new_work(live, kanban_home, monkeypatch):
+     path = kanban_home / "kanban.db"
+     with kbc.write_txn(live):
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_revision.py b/tests/hermes_cli/test_kanban_sync_repair_revision.py
+new file mode 100644
+index 0000000000..1446921c19
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_repair_revision.py
+@@ -0,0 +1,68 @@
++"""Repair invalidation is independent of capture and transactionally covers every input table."""
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_sync_repair_revision as revision
++
++
++@pytest.fixture
++def board(tmp_path):
++    conn = sqlite3.connect(tmp_path / "board.db", isolation_level=None)
++    for table in revision.TABLES:
++        conn.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, value TEXT)")
++    revision.ensure_revision(conn)
++    yield conn
++    conn.close()
++
++
++def _value(conn):
++    return conn.execute("SELECT revision FROM kanban_repair_revision WHERE id = 1").fetchone()[0]
++
++
++@pytest.mark.parametrize("table", revision.TABLES)
++def test_each_input_mutation_invalidates_but_rollback_does_not(board, table):
++    before = _value(board)
++    board.execute(f"INSERT INTO {table} VALUES (1, 'before')")
++    assert _value(board) > before
++    before = _value(board)
++    board.execute(f"UPDATE {table} SET value = 'after'")
++    assert _value(board) > before
++    before = _value(board)
++    board.execute("BEGIN")
++    board.execute(f"DELETE FROM {table}")
++    board.rollback()
++    assert _value(board) == before
++    board.execute(f"DELETE FROM {table}")
++    assert _value(board) > before
++
++
++def test_install_is_read_only_when_intact_and_repairs_missing_trigger(board):
++    before = board.total_changes
++    revision.ensure_revision(board)
++    assert board.total_changes == before
++    board.execute("DROP TRIGGER kanban_repair_tasks_update")
++    board.execute("INSERT INTO tasks VALUES (1, 'gap')")
++    before = _value(board)
++    revision.ensure_revision(board)
++    assert _value(board) > before
++    before = _value(board)
++    board.execute("UPDATE tasks SET value = 'observed'")
++    assert _value(board) > before
++
++
++def test_additional_triggers_do_not_cause_perpetual_reinstallation(board):
++    board.execute("CREATE TRIGGER kanban_repair_future AFTER INSERT ON tasks BEGIN SELECT 1; END")
++    before = board.total_changes
++    for _ in range(3):
++        revision.ensure_revision(board)
++    assert board.total_changes == before
++
++
++def test_install_recovers_a_removed_revision_table(board):
++    board.execute("DROP TABLE kanban_repair_revision")
++    revision.ensure_revision(board)
++    before = _value(board)
++    board.execute("INSERT INTO tasks VALUES (1, 'observed')")
++    assert _value(board) > before
+-- 
+2.54.0 (Apple Git-157)
+

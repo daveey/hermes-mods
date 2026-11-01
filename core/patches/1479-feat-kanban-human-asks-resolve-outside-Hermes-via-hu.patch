@@ -1,0 +1,2085 @@
+From f73a1f8466771180f4156084bc8e87edbba75cde Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:34:16 -0700
+Subject: [PATCH] feat(kanban): human asks resolve outside Hermes via
+ human_request.resolved_check [daveey]
+
+A blocked card's human_request may carry resolved_check (+ resolved_check_every): a probe that exits 0 once
+David's step happened anywhere. It runs once at filing (exit 0 refuses as ask_already_resolved, other
+failures as resolved_check_broken, inline secrets as resolved_check_secret), then the dispatcher's
+condition-wake sweep probes it while the card is blocked; one exit 0 comments and unblocks normally,
+repeated failures comment once and stop.
+
+Filing runs on every entry path in the card's sweep context: kanban_block / kanban_create tools, hermes
+kanban block (every --ids card checked before any is blocked) / create / block --metadata-only, and the
+dashboard PATCH and bulk updates. A create probes before the card exists with the target board pin and the
+assignee's env but no HERMES_KANBAN_TASK (never the creator's ids); an idempotent retry runs nothing.
+
+Synced boards: the filing gateway runs the probe (probe_host); a worker node keeps its blocked copy; a
+lost probe is restored once, then commented once; permanently stopped probes take no write txn. A relayed
+ask's worker notes resolved_check_alive; a silent probe host gets one home-board comment, never an unblock
+or a second probe.
+---
+ hermes_cli/kanban.py                          |  23 +-
+ hermes_cli/kanban_ask_resolved.py             | 452 +++++++++++++
+ hermes_cli/kanban_db.py                       |  14 +-
+ hermes_cli/kanban_db_connect.py               |   1 +
+ hermes_cli/kanban_db_creation.py              |   4 +-
+ hermes_cli/kanban_human_request.py            |  55 ++
+ hermes_cli/kanban_human_request_migration.py  |   6 +-
+ hermes_cli/kanban_parser.py                   |   3 +-
+ hermes_cli/kanban_wake_check.py               |  82 ++-
+ hermes_cli/kanban_worker_node.py              |   6 +-
+ plugins/kanban/dashboard/plugin_api.py        |  17 +-
+ .../dashboard/plugin_api_human_request.py     |  22 +-
+ .../test_kanban_ask_resolved_check.py         | 629 ++++++++++++++++++
+ .../test_kanban_ask_resolved_sync.py          | 280 ++++++++
+ tools/kanban_tools.py                         |   6 +-
+ tools/kanban_tools_schemas.py                 |  11 +
+ website/docs/user-guide/features/kanban.md    |  52 ++
+ 17 files changed, 1608 insertions(+), 55 deletions(-)
+ create mode 100644 hermes_cli/kanban_ask_resolved.py
+ create mode 100644 tests/hermes_cli/test_kanban_ask_resolved_check.py
+ create mode 100644 tests/hermes_cli/test_kanban_ask_resolved_sync.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index ce21a4e7b8..164c7d0f96 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -482,12 +482,19 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_skill_check import UnknownSkillError
+         from hermes_cli.kanban_capabilities import RequiresDeclarationMissing, declaration_required
+         from hermes_cli.kanban_worker_node import MachinePinRefused, check_machine_pins
++        from hermes_cli.kanban_ask_resolved import AskFilingRefused, check_create_filing, create_context
++        assignee = (args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
++                    or _cli_default_assignee(args))
+         try:
++            # [daveey] A blocked ask's resolved_check runs once first, as the sweep will run it for this assignee
++            # and workspace: already met or broken refuses the create. A key hit returns the card: no probe.
++            check_create_filing(getattr(args, "human_request", None),
++                                None if idem_hit else getattr(args, "initial_status", None),
++                                context=create_context(conn, ws_path, assignee))
+             check_machine_pins(conn, getattr(args, "runs_on", None))  # explicit pins need pickup [daveey]
+             task_id = kb.create_task(
+                 conn, title=args.title, body=body,
+-                assignee=args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+-                or _cli_default_assignee(args),
++                assignee=assignee,
+                 session_id=session_id, requires=getattr(args, "requires", None),
+                 # [daveey] Same declaration gate as the kanban_create tool, for agent/worker shells only.
+                 require_declaration=(in_worker or _agent_invoked()) and declaration_required(),
+@@ -511,7 +518,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             )
+         except WorktreeWorkspaceConfigError as exc:
+             return _err(f"kanban: --workspace: {exc}", 2)
+-        except (CapabilityMismatchError, UnknownSkillError, RequiresDeclarationMissing, MachinePinRefused) as exc:
++        except (CapabilityMismatchError, UnknownSkillError, RequiresDeclarationMissing, MachinePinRefused,
++                AskFilingRefused) as exc:
+             return _err(f"kanban: {exc.code}: {exc}", 2)
+         except (PinProviderUnresolvedError, ModelProviderMismatchError) as exc:
+             return _err(f"kanban: {exc}", 2)
+@@ -1321,6 +1329,15 @@ def _cmd_block(args: argparse.Namespace) -> int:
+         return routed
+     from hermes_cli.kanban_human_request import validate_human_request
+     request = validate_human_request(getattr(args, "human_request", None), kind=kind)
++    from hermes_cli.kanban_ask_resolved import filing_refusal, resolved_check
++    refused_ask = None
++    if resolved_check(request)[0]:  # [daveey] run per card before any ask is filed, as the sweep will run it
++        with kbc.connect_closing() as conn:
++            refused_ask = filing_refusal(conn, _bulk_ids(args), request)
++    if refused_ask:
++        tid, filed = refused_ask
++        return _err(f"kanban block: {filed}" + (f" (card {tid}; nothing was blocked)"
++                                                 if len(_bulk_ids(args) or ()) > 1 else ""), 2)
+     if getattr(args, "metadata_only", False):
+         from hermes_cli.kanban_human_request_migration import classify_cli_request
+         return classify_cli_request(args, request, reason)
+diff --git a/hermes_cli/kanban_ask_resolved.py b/hermes_cli/kanban_ask_resolved.py
+new file mode 100644
+index 0000000000..60658fccb0
+--- /dev/null
++++ b/hermes_cli/kanban_ask_resolved.py
+@@ -0,0 +1,452 @@
++"""Human asks that resolve outside Hermes: ``human_request.resolved_check``. [daveey]
++
++A blocked card's ask can name a probe that exits 0 once David's step happened anywhere (he pressed the device's
++pair button, flipped the Settings toggle), so the card does not sit blocked until he also clicks unblock.
++
++* Exit codes are literal: 0 = the asked-for state holds, 1 = not yet, anything else (exit >= 2, a timeout, a
++  probe that could not start) = the probe failed. Output is never read for meaning, only quoted.
++* Filing runs the probe once, synchronously, before the write (``filing_error``), in the cwd and env the sweep
++  will use for that card (``filing_context``): exit 1 = the ask is filed; exit 0 = refused (``ALREADY_RESOLVED``)
++  so the worker continues instead of asking; anything else = refused as ``BROKEN`` with the output tail. The
++  command filed is the command stored: a probe that redaction would change is refused (``kanban_human_request``).
++* A filed ask registers one ``task_wake_checks`` row with ``purpose='ask_resolved'`` (``sync_row``), and the
++  filing event names this gateway as ``probe_host`` on a synced board. The dispatcher's condition-wake sweep
++  (``kanban_wake_check.run_due_wake_checks``) probes it while the card is ``blocked`` with the same runner,
++  concurrency cap and failure count as a park's ``wake_check``, and the same placement rules: a worker node keeps
++  a blocked copy whose probe it runs (``kanban_worker_node.evict``); a board that lost the probe of an ask it
++  filed re-registers it once (``RESTORED_EVENT``), and a second loss comments once (``LOST_EVENT``) and stops.
++  A worker node's copy says ``ALIVE_EVENT`` at most every ``ALIVE_EVERY`` while it probes; when the probe host
++  of a relayed ask has been silent past that plus two intervals, the home board comments once
++  (``SILENT_EVENT``). It never runs another gateway's probe and never unblocks for it: the card stays blocked on
++  David's ask, which is the safe default when nothing watches the probe.
++* A create files the ask before the card exists, so its filing run has the target board's pin, the assignee
++  profile's env and the workspace cwd, but no ``HERMES_KANBAN_TASK`` (the sweep's runs have it). A probe that
++  needs its own card id is filed with ``kanban block`` after the create. An idempotent create that returns an
++  existing card runs no probe.
++* One exit 0 appends an ``ask_resolved`` event, comments, and unblocks through the normal unblock path
++  (``ready``, or ``todo`` behind an open parent). ``BROKEN_AFTER`` failures in a row comment once, drop the probe
++  and leave the card blocked: a broken probe never answers for David and is never restored.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++import time
++import uuid
++from pathlib import Path
++from typing import Any, Optional
++
++PURPOSE = "ask_resolved"
++EVENT = "ask_resolved"
++BROKEN_EVENT = "resolved_check_broken"
++ALREADY_RESOLVED = "ask_already_resolved"
++BROKEN = "resolved_check_broken"
++AUTHOR = "kanban-dispatcher"
++RESTORED_EVENT = "resolved_check_restored"
++LOST_EVENT = "resolved_check_lost"
++ALIVE_EVENT = "resolved_check_alive"
++SILENT_EVENT = "resolved_check_host_silent"
++
++
++def _request(value: Any) -> Optional[dict]:
++    if isinstance(value, str):
++        try:
++            value = json.loads(value)
++        except ValueError:
++            return None
++    return value if isinstance(value, dict) else None
++
++
++def resolved_check(value: Any) -> tuple[Optional[str], Optional[int]]:
++    """``(cmd, every)`` of a stored/validated human_request, or ``(None, None)``."""
++    req = _request(value) or {}
++    cmd = req.get("resolved_check")
++    if not isinstance(cmd, str) or not cmd.strip():
++        return None, None
++    from hermes_cli.kanban_human_request import RESOLVED_CHECK_EVERY_DEFAULT
++    every = req.get("resolved_check_every")
++    return cmd.strip(), every if isinstance(every, int) and not isinstance(every, bool) else RESOLVED_CHECK_EVERY_DEFAULT
++
++
++# --- filing --------------------------------------------------------------------------------------
++
++def refusal_code(message: str) -> Optional[str]:
++    from hermes_cli.kanban_human_request import RESOLVED_CHECK_SECRET
++
++    return next((c for c in (ALREADY_RESOLVED, BROKEN, RESOLVED_CHECK_SECRET) if (message or "").startswith(c)), None)
++
++
++def filing_context(conn: sqlite3.Connection, task_id: str) -> dict:
++    """``cwd``/``env`` the sweep will probe ``task_id`` with, so the filing run sees what the sweep sees."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_wake_check as kwc
++
++    task = kb.get_task(conn, task_id)
++    db_path = kbc._main_db_file(conn)
++    if task is None or not db_path:
++        return {}
++    return {"cwd": kwc.probe_cwd(task.workspace_path), "env": kwc._probe_env(task, str(db_path))}
++
++
++def filing_refusal(conn: sqlite3.Connection, task_ids: Any, human_request: Any) -> Optional[tuple[str, str]]:
++    """``(task_id, refusal)`` for the first of ``task_ids`` whose own probe context refuses the ask, else None.
++    Every card is checked before any is touched: cards differ in workspace and assignee, so one card's pass
++    says nothing about another's. Unknown ids are skipped (the transition refuses them)."""
++    from hermes_cli import kanban_db as kb
++
++    if not resolved_check(human_request)[0]:
++        return None
++    for tid in task_ids or ():
++        if not tid or kb.get_task(conn, tid) is None:
++            continue
++        err = filing_error(human_request, **filing_context(conn, tid))
++        if err:
++            return tid, err
++    return None
++
++
++def filing_error(human_request: Any, *, cwd: Optional[str] = None, env: Optional[dict] = None) -> Optional[str]:
++    """Run the ask's ``resolved_check`` once before it is filed. None = file it (exit 1, or no probe); else the
++    refusal text, starting with ``ALREADY_RESOLVED`` (exit 0) or ``BROKEN`` (anything else). Raises ValueError
++    on an invalid request (including a probe that would not be stored as given)."""
++    from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_human_request import validate_human_request
++
++    cmd, _every = resolved_check(validate_human_request(human_request))
++    if not cmd:
++        return None
++    env = dict(env if env is not None else os.environ)
++    if env.get("HERMES_KANBAN_TASK"):
++        env["HERMES_KANBAN_WAKE_PROBE"] = "1"
++    rc, out = kwc._run_probe(("ask-filing", cmd), cmd, cwd or str(Path.home()), env)
++    tail = kwc._tail(out)
++    if rc == 1:
++        return None
++    if rc == 0:
++        return (f"{ALREADY_RESOLVED}: the asked-for state already holds; don\u2019t ask, continue the work. "
++                f"human_request.resolved_check `{cmd}` exited 0 at filing. Probe output: {tail!r}")
++    return (f"{BROKEN}: human_request.resolved_check `{cmd}` was run once at filing and exited {rc}, so it could "
++            "never say the ask is done. Exit codes: 0 = David's step is done, 1 = not yet, anything else = "
++            f"broken. Fix the probe or drop resolved_check. Output tail: {tail!r}")
++
++
++class AskFilingRefused(ValueError):
++    """``filing_error`` as an exception for the CLI create path; ``code`` is the refusal code."""
++
++    def __init__(self, message: str):
++        self.code = refusal_code(message) or BROKEN
++        super().__init__(message[len(self.code) + 2:] if message.startswith(self.code + ": ") else message)
++
++
++def create_context(conn: Optional[sqlite3.Connection], workspace_path: Any, assignee: Any) -> dict:
++    """``filing_context`` for a card not created yet: the sweep's cwd for that workspace and the sweep's env for
++    that assignee on ``conn``'s board, minus the card id that does not exist yet (no ``HERMES_KANBAN_TASK``; the
++    creator's own run/claim/session ids are cleared as the sweep clears them)."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_wake_check as kwc
++
++    cwd = kwc.probe_cwd(workspace_path if isinstance(workspace_path, str) else None)
++    db_path = kbc._main_db_file(conn) if conn is not None else None
++    if not db_path:
++        return {"cwd": cwd}
++    return {"cwd": cwd, "env": kwc.probe_env(None, assignee if isinstance(assignee, str) else None, str(db_path))}
++
++
++def idempotent_hit(conn: sqlite3.Connection, idempotency_key: Any) -> bool:
++    """Whether a create with this key returns an existing card (``create_task``'s own lookup): then nothing is
++    filed, so the filing probe must not run again on a retry."""
++    if not idempotency_key:
++        return False
++    return conn.execute("SELECT 1 FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1",
++                        (idempotency_key,)).fetchone() is not None
++
++
++def create_filing_error(human_request: Any, initial_status: Optional[str], *,
++                        context: Optional[dict] = None) -> Optional[str]:
++    """``filing_error`` for an ask that lands ``blocked``. A probe that would not be stored as given
++    (``ResolvedCheckRefused``: the tool paths store the ask redacted, so the write's own validation would only
++    see the redacted command) is refused here on any status; any other invalid request is left to the write's
++    own validation (``create_task`` / ``block_task``), which refuses it before anything is filed."""
++    from hermes_cli.kanban_human_request import ResolvedCheckRefused, validate_human_request
++
++    try:
++        validate_human_request(human_request)
++    except ResolvedCheckRefused as exc:
++        return str(exc)
++    except ValueError:
++        return None
++    if initial_status != "blocked":
++        return None
++    try:
++        return filing_error(human_request, **(context or {}))
++    except ValueError:
++        return None
++
++
++def check_create_filing(human_request: Any, initial_status: Optional[str], *, context: Optional[dict] = None) -> None:
++    """Raise ``AskFilingRefused`` when a blocked create's resolved_check already passes or is broken."""
++    err = create_filing_error(human_request, initial_status, context=context)
++    if err:
++        raise AskFilingRefused(err)
++
++
++def ask_checks(human_request: Any, initial_status: Optional[str] = "blocked", *,
++               context: Optional[dict] = None) -> tuple:
++    """``_check`` args for the tool entry points: the ask-line lint, then (for an ask that will land blocked)
++    the filing probe in ``context`` (``filing_context`` / ``create_context``). An invalid request is left to the
++    transition's own validation."""
++    from hermes_cli.kanban_block_policy import ask_lint_check
++
++    lint = ask_lint_check(human_request)
++    if not lint[0]:
++        return lint
++    err = create_filing_error(human_request, initial_status, context=context)
++    return err is None, err or "", refusal_code(err or "")
++
++
++def create_ask_check(conn: sqlite3.Connection, args: dict, assignee: Optional[str]) -> tuple:
++    """``ask_checks`` for the kanban_create tool on the board it writes to: the ask-line lint and the secret
++    refusal always; the filing probe (in ``create_context``) only when the create files a new card, never on a
++    retry whose ``idempotency_key`` returns the existing one."""
++    request, status = args.get("human_request"), str(args.get("initial_status") or "running")
++    if idempotent_hit(conn, args.get("idempotency_key")):
++        status = None
++    context = create_context(conn, args.get("workspace_path"), assignee) if resolved_check(request)[0] else None
++    return ask_checks(request, status, context=context)
++
++
++def filing_fields(conn: sqlite3.Connection, human_request: Any) -> dict:
++    """Keys for the filing event: on a synced board, the gateway that ran the filing probe runs the sweep's."""
++    from hermes_cli import kanban_wake_check as kwc
++
++    if not resolved_check(human_request)[0]:
++        return {}
++    host = kwc.own_gateway(conn)
++    return {"probe_host": host} if host else {}
++
++
++# --- state row -----------------------------------------------------------------------------------
++
++def store_request(conn: sqlite3.Connection, task_id: str, human_request: Optional[dict]) -> None:
++    """Write the card's human_request and (re)register its resolved_check probe. Caller holds the write txn."""
++    conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?",
++                 (json.dumps(human_request) if human_request else None, task_id))
++    sync_row(conn, task_id)
++
++
++def sync_row(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None, due_now: bool = False) -> None:
++    """A ``blocked`` card whose ask has a resolved_check gets one ``ask_resolved`` probe row, first due one
++    interval after filing (filing just ran it; ``due_now`` for a restored probe, which nobody ran while it was
++    lost); any other card loses its ``ask_resolved`` row. In the txn."""
++    row = conn.execute("SELECT status, human_request FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    cmd, every = resolved_check(row[1]) if row is not None and row[0] == "blocked" else (None, None)
++    try:
++        conn.execute("DELETE FROM task_wake_checks WHERE task_id = ? AND purpose = ?", (task_id, PURPOSE))
++    except sqlite3.OperationalError:  # board predating ask probes; init_db migrates it
++        return
++    if not cmd or every is None:
++        return
++    now = int(time.time()) if now is None else int(now)
++    conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
++    conn.execute(
++        "INSERT INTO task_wake_checks (task_id, cmd, every, next_at, fails, generation, purpose) "
++        "VALUES (?, ?, ?, ?, 0, ?, ?)",
++        (task_id, cmd, int(every), now if due_now else now + int(every), uuid.uuid4().hex, PURPOSE))
++
++
++# --- sweep result --------------------------------------------------------------------------------
++
++def satisfied_note(cmd: str, tail: str) -> str:
++    return (f"David's ask was satisfied outside Hermes (probe `{cmd}` exited 0: `{tail}`). "
++            "Verify the state and continue; don't redo the asked action.")
++
++
++def broken_note(cmd: str, rc: Any, fails: int, tail: str) -> str:
++    return (f"This ask's resolved_check `{cmd}` failed {fails} times in a row (last rc {rc}): `{tail}`. It is no "
++            "longer probed and the card stays blocked on David's ask; re-file the ask with a fixed resolved_check "
++            "(exit 0 = done, 1 = not yet) if it should resume on its own.")
++
++
++def _current(conn: sqlite3.Connection, task_id: str, cmd: str, generation: str) -> Optional[dict]:
++    from hermes_cli import kanban_wake_check as kwc
++
++    state = kwc.get_state(conn, task_id)
++    row = conn.execute("SELECT status, human_request FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if (state is None or state.get("purpose") != PURPOSE or state["cmd"] != cmd or state["generation"] != generation
++            or row is None or row[0] != "blocked" or resolved_check(row[1])[0] != cmd):
++        return None
++    return state
++
++
++def _unblock(conn: sqlite3.Connection, task_id: str, cmd: str, generation: str, tail: str) -> Optional[str]:
++    from hermes_cli import kanban_db as kb
++
++    def precondition(c: sqlite3.Connection) -> Optional[str]:
++        if _current(c, task_id, cmd, generation) is None:
++            return "stale"
++        kb._append_event(c, task_id, EVENT, {"cmd": cmd, "rc": 0, "output": tail})
++        c.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
++        return None
++
++    ok = kb.unblock_task(conn, task_id, comment=(AUTHOR, satisfied_note(cmd, tail)),
++                         event_extra={"via": EVENT}, precondition=precondition)
++    return EVENT if ok else None
++
++
++def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str, *, generation: str,
++                 now: Optional[int] = None) -> Optional[str]:
++    """Record one ``ask_resolved`` probe result, reading ``rc`` literally (0 done, 1 not yet, else failed).
++    Returns ``EVENT`` (unblocked), ``BROKEN_EVENT`` (gave up) or None. A result for a row that is no longer the
++    card's (re-filed, unblocked, archived) is dropped."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++
++    now = int(time.time()) if now is None else int(now)
++    tail = kwc._tail(out)
++    if rc == 0:
++        return _unblock(conn, task_id, cmd, generation, tail)
++    with kb.write_txn(conn):
++        state = _current(conn, task_id, cmd, generation)
++        if state is None:
++            return None
++        nxt = now + int(state["every"])
++        if rc == 1:
++            conn.execute("UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, next_at = ? "
++                         "WHERE task_id = ?", (now, tail, nxt, task_id))
++            note_alive(conn, task_id, cmd, now)
++            return None
++        fails = int(state["fails"] or 0) + 1
++        rc_col = rc if isinstance(rc, int) else -1
++        if fails < kwc.BROKEN_AFTER:
++            conn.execute("UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, fails = ?, next_at = ? "
++                         "WHERE task_id = ?", (now, rc_col, tail, fails, nxt, task_id))
++            note_alive(conn, task_id, cmd, now)
++            return None
++        conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
++        kb._append_event(conn, task_id, BROKEN_EVENT, {"cmd": cmd, "rc": rc, "fails": fails, "output": tail})
++        kb.add_comment(conn, task_id, AUTHOR, broken_note(cmd, rc, fails, tail))
++        return BROKEN_EVENT
++
++
++# --- lost probes (synced boards) -----------------------------------------------------------------
++
++def note_alive(conn: sqlite3.Connection, task_id: str, cmd: str, now: int) -> None:
++    """On a worker node's copy, say (at most every ``ALIVE_EVERY``) that the relayed ask probe still runs, so
++    the home board can tell a live remote probe from a silent one (``kanban_wake_check._note_alive`` for
++    parks). In the caller's txn."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++
++    if not kwc.foreign_copy(conn, task_id):
++        return
++    last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind IN (?, 'blocked')",
++                        (task_id, ALIVE_EVENT)).fetchone()[0] or 0
++    if now - int(last) >= kwc.ALIVE_EVERY:
++        kb._append_event(conn, task_id, ALIVE_EVENT, {"cmd": cmd, "host": kwc.own_gateway(conn)})
++
++
++def silent_note(host: str, cmd: str, minutes: int) -> str:
++    return (f"This ask's resolved_check `{cmd}` runs on {host}, the gateway that filed it, and {host} has not "
++            f"reported it for {minutes} min, so it may not be watched. The card stays blocked on David's ask; "
++            "unblock it when his step is done.")
++
++def lost_note(cmd: str) -> str:
++    return (f"This ask's resolved_check `{cmd}` went missing twice while the card was blocked, so it is no longer "
++            "probed; the card stays blocked on David's ask. Re-file the ask (kanban block --metadata-only "
++            "--human-request) if it should resume on its own.")
++
++
++def reconcile(conn: sqlite3.Connection, *, now: Optional[int] = None) -> dict:
++    """Keep each blocked ask's probe row in step with its stored ask. A row whose card no longer carries that
++    resolved_check is dropped. A blocked ask with a resolved_check but no probe row on this board (evicted copy,
++    a row lost to an older sweep or core) is restored once per filing when this board runs it: its filing event
++    names this gateway as ``probe_host``, or names none on a card this gateway owns. A probe lost again after a
++    restore comments once (``LOST_EVENT``) and stays off; a probe that exhausted its failures
++    (``BROKEN_EVENT``) or already resolved the ask is never restored, and takes no write txn. A relayed ask whose
++    probe host went silent comments once (``SILENT_EVENT``). Never unblocks. Returns ids per outcome."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++
++    out: dict = {"restored": [], "lost": [], "dropped": [], "silent": []}
++    now = int(time.time()) if now is None else int(now)
++    try:
++        rows = conn.execute(
++            "SELECT w.task_id, w.cmd, t.human_request FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
++            "WHERE w.purpose = ? AND t.status = 'blocked'", (PURPOSE,)).fetchall()
++        missing = conn.execute(
++            "SELECT t.id FROM tasks t LEFT JOIN task_wake_checks w ON w.task_id = t.id WHERE t.status = 'blocked' "
++            "AND w.task_id IS NULL AND t.human_request LIKE '%\"resolved_check\"%'").fetchall()
++    except sqlite3.OperationalError:
++        return out
++    stale = [r[0] for r in rows if resolved_check(r[2])[0] != r[1]]
++    if stale:
++        with kb.write_txn(conn):
++            for tid in stale:
++                sync_row(conn, tid)
++                out["dropped"].append(tid)
++    if not missing:
++        return out
++    own = kwc.own_gateway(conn)
++    foreign = kwc.foreign_ids(conn, own)
++    terminal = (BROKEN_EVENT, EVENT, LOST_EVENT)
++
++    def after(tid: str, filed_id: int, kinds: tuple) -> bool:
++        m = ",".join("?" for _ in kinds)
++        return conn.execute(f"SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN ({m}) LIMIT 1",
++                            (tid, filed_id, *kinds)).fetchone() is not None
++
++    for (tid,) in missing:
++        filed = conn.execute("SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind = 'blocked' "
++                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++        if filed is None:
++            continue
++        filed_id, payload, filed_at = int(filed[0]), kb._json_dict(filed[1]), int(filed[2] or 0)
++        host = payload.get("probe_host")
++        if host and own and host != own:
++            # Another gateway runs this ask's probe. On its home board, say once when that host went silent;
++            # a worker node's copy of another gateway's card is left alone. Never run it here, never unblock.
++            if tid in foreign or after(tid, filed_id, (SILENT_EVENT, *terminal)):
++                continue
++            row = conn.execute("SELECT human_request FROM tasks WHERE id = ?", (tid,)).fetchone()
++            cmd, every = resolved_check(row[0]) if row is not None else (None, None)
++            if not cmd:
++                continue
++            last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND id > ? AND kind = ?",
++                                (tid, filed_id, ALIVE_EVENT)).fetchone()[0]
++            silent = now - max(filed_at, int(last or 0))
++            if silent <= kwc.ALIVE_EVERY + 2 * int(every) + kwc.SILENT_GRACE:
++                continue
++            with kb.write_txn(conn):
++                st = conn.execute("SELECT status, human_request FROM tasks WHERE id = ?", (tid,)).fetchone()
++                if (st is None or st[0] != "blocked" or resolved_check(st[1])[0] != cmd
++                        or after(tid, filed_id, (SILENT_EVENT, *terminal))):
++                    continue
++                kb._append_event(conn, tid, SILENT_EVENT, {"cmd": cmd, "probe_host": host, "silent_seconds": silent,
++                                                            "filed_event_id": filed_id})
++                kb.add_comment(conn, tid, AUTHOR, silent_note(host, cmd, silent // 60))
++                out["silent"].append(tid)
++            continue
++        if tid in foreign and not host:
++            continue  # a legacy copy: its home board runs this ask's probe
++        # Read-only first: a probe that stopped for good (broken, resolved, lost twice) takes no write txn.
++        if after(tid, filed_id, terminal):
++            continue
++        restored = after(tid, filed_id, (RESTORED_EVENT,))
++        with kb.write_txn(conn):
++            row = conn.execute("SELECT status, human_request FROM tasks WHERE id = ?", (tid,)).fetchone()
++            cmd = resolved_check(row[1])[0] if row is not None and row[0] == "blocked" else None
++            if (not cmd or kwc.get_state(conn, tid) is not None or after(tid, filed_id, terminal)
++                    or after(tid, filed_id, (RESTORED_EVENT,)) != restored):
++                continue
++            if not restored:
++                sync_row(conn, tid, now=now, due_now=True)
++                kb._append_event(conn, tid, RESTORED_EVENT, {"cmd": cmd, "filed_event_id": filed_id,
++                                                              **({"probe_host": host} if host else {})})
++                out["restored"].append(tid)
++            else:
++                kb._append_event(conn, tid, LOST_EVENT, {"cmd": cmd, "filed_event_id": filed_id})
++                kb.add_comment(conn, tid, AUTHOR, lost_note(cmd))
++                out["lost"].append(tid)
++    return out
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index db00ad161e..78cddbedde 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1012,7 +1012,7 @@ CREATE TABLE IF NOT EXISTS task_wake_checks (
+     last_rc   INTEGER,
+     last_out  TEXT,
+     fails     INTEGER NOT NULL DEFAULT 0,
+-    generation TEXT
++    generation TEXT, purpose TEXT NOT NULL DEFAULT 'wake'  -- 'wake' (park) | 'ask_resolved' (kanban_ask_resolved)
+ );
+ 
+ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
+@@ -3206,7 +3206,7 @@ def _refuse_untimed_probe(kind: Optional[str], wake_check: Optional[str], clock_
+         f"refused: {what} only applies to a timed park (kind='time', a SCHEDULED_UNTIL=<ISO8601> "
+         f"reason, or an agent-owned block with no human_request). This block (kind={kind!r}) would "
+         f"land '{'todo' if kind == 'dependency' else 'blocked'}' and drop the {what}, so nothing "
+-        "would run it. Use kind='time' to wait on it, or drop it for a human ask.")
++        "would run it. Use kind='time' to wait on it; for a human ask, put it in human_request.resolved_check.")
+ 
+ 
+ def _clear_meta(clear_blocker: bool) -> dict:
+@@ -3248,6 +3248,7 @@ def block_task(
+     ``comment`` (``(author, body)``) is written in the same txn, before the transition event,
+     and only when the block lands (``kanban_reason_comment``).
+     """
++    from hermes_cli.kanban_ask_resolved import filing_fields, store_request, sync_row
+     from hermes_cli.kanban_human_request import reject_timed_request, validate_human_request
+     from hermes_cli.kanban_reason_comment import reason_comment
+     human_request = validate_human_request(human_request, kind=kind)
+@@ -3302,8 +3303,9 @@ def block_task(
+             ).rowcount
+             if classified != 1:
+                 return False
++            sync_row(conn, task_id)
+             payload = {"kind": kind, "reason": reason, "classified_in_place": True,
+-                       "human_request": human_request}
++                       "human_request": human_request, **filing_fields(conn, human_request)}
+             if requested_kind == "assignment":
+                 payload.update(requested_kind=requested_kind, rekind_reason=rekind_reason)
+             if kind == "assignment":
+@@ -3356,7 +3358,6 @@ def block_task(
+         if rekind_reason:
+             payload["requested_kind"] = requested_kind
+             payload["rekind_reason"] = rekind_reason
+-        blocker_id = normalize_blocker_id(blocker_id)
+         if blocker_id:
+             payload["blocker_id"] = blocker_id
+             if (new_status == "triage" and _row_get(cur_row, "block_kind") == payload.get("kind") == kind
+@@ -3375,9 +3376,8 @@ def block_task(
+             conn, task_id, expected_run_id, kind, new_status, set_sql, params, payload,
+         ):
+             return False
+-        conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?",
+-                     (json.dumps(human_request) if human_request else None, task_id))
+-        payload["human_request"] = human_request
++        store_request(conn, task_id, human_request)
++        payload.update(human_request=human_request, **(filing_fields(conn, human_request) if new_status == "blocked" else {}))
+         from hermes_cli.kanban_shared_blockers import CLEAR_FLAG
+         run_meta = {**({"blocker_id": blocker_id} if blocker_id else {}), **_clear_meta(clear_blocker)}
+         if clear_blocker:
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 80ab83c94f..18aec10a66 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1097,6 +1097,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+     """Add columns introduced after v1 to legacy DBs (called via ``init_db``)."""
+     if _table_exists(conn, "task_wake_checks"):
+         _add_column_if_missing(conn, "task_wake_checks", "generation", "generation TEXT")
++        _add_column_if_missing(conn, "task_wake_checks", "purpose", "purpose TEXT NOT NULL DEFAULT 'wake'")
+     cols = _column_names(conn, "tasks")
+     for name, ddl in _BASE_TASK_COLUMNS + _EARLY_TASK_COLUMNS:
+         if name not in cols:
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index a7192299c2..c0abd2c785 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -32,9 +32,11 @@ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+         block_kind = "needs_input" if human_request else None
+         conn.execute("UPDATE tasks SET human_request = ?, block_kind = ? WHERE id = ?",
+                      (json.dumps(human_request) if human_request else None, block_kind, task_id))
++        from hermes_cli.kanban_ask_resolved import filing_fields, sync_row
++        sync_row(conn, task_id)  # an ask with resolved_check gets its probe row [daveey]
+         payload = {
+             "reason": "initial_status", "status": "blocked", "actor": created_by or "user",
+-            "human_request": human_request,
++            "human_request": human_request, **filing_fields(conn, human_request),
+         }
+         if block_kind:
+             payload["kind"] = block_kind
+diff --git a/hermes_cli/kanban_human_request.py b/hermes_cli/kanban_human_request.py
+index e511acb4a2..6cbb6f0e6d 100644
+--- a/hermes_cli/kanban_human_request.py
++++ b/hermes_cli/kanban_human_request.py
+@@ -45,9 +45,64 @@ def validate_human_request(value: Any, *, kind: str | None = None) -> dict | Non
+     request = {field: value[field].strip() for field in FIELDS}
+     if value.get("choices") is not None:
+         request["choices"] = _validate_choices(value["choices"])
++    request.update(_validate_resolved_check(value))
+     return request
+ 
+ 
++# [daveey] ``resolved_check``: a probe that exits 0 once David's step happened outside Hermes (kanban_ask_resolved).
++RESOLVED_CHECK_EVERY_DEFAULT, RESOLVED_CHECK_EVERY_MIN, RESOLVED_CHECK_EVERY_MAX = 900, 120, 21600
++RESOLVED_CHECK_MAX_CHARS = 2000
++RESOLVED_CHECK_SECRET = "resolved_check_secret"
++
++
++class ResolvedCheckRefused(ValueError):
++    """A resolved_check refused before or at filing; ``code`` is the stable refusal code (``kanban_ask_resolved``).
++    ``str()`` is the whole message, starting with the code; tool handlers render ``tool_error_fields``."""
++
++    def __init__(self, message: str, code: str):
++        self.code = code
++        self.tool_error_fields = {"rejection": code}
++        super().__init__(message)
++
++
++def _refuse_secret(cmd: str) -> None:
++    """The stored ask is redacted (``kanban_db.redact_review_value``) and the sweep runs the stored text, so a
++    probe whose redacted form differs would be stored broken, and with its secret if it were not redacted. Refuse
++    it before anything runs it; the message shows only the redacted form."""
++    from agent.redact import redact_sensitive_text
++
++    redacted = redact_sensitive_text(cmd, force=True)
++    if redacted == cmd:
++        return
++    raise ResolvedCheckRefused(
++        f"{RESOLVED_CHECK_SECRET}: human_request.resolved_check contains a secret or a credential-shaped value "
++        f"(stored it would read `{redacted}`, a different command), so it was not run or filed. Never inline a "
++        "secret: put the check in a script the probe runs (e.g. `sh ~/bin/check-pairing.sh`) that fetches the "
++        "secret itself (`aws secretsmanager get-secret-value ...`, token-broker), or read a header file "
++        "(`curl -H @$HOME/.hub-auth ...`).", RESOLVED_CHECK_SECRET)
++
++
++def _validate_resolved_check(value: dict) -> dict:
++    cmd, every = value.get("resolved_check"), value.get("resolved_check_every")
++    if cmd is None:
++        if every is not None:
++            raise ValueError("human_request resolved_check_every needs a resolved_check")
++        return {}
++    if not isinstance(cmd, str) or not cmd.strip():
++        raise ValueError("human_request resolved_check must be a non-empty shell command string")
++    if len(cmd.strip()) > RESOLVED_CHECK_MAX_CHARS:
++        raise ValueError(f"human_request resolved_check is longer than {RESOLVED_CHECK_MAX_CHARS} chars; "
++                         "put it in a script")
++    _refuse_secret(cmd)  # the raw text: redact(raw) == raw is what makes the stored command the filed one
++    if every is None:
++        every = RESOLVED_CHECK_EVERY_DEFAULT
++    if (not isinstance(every, int) or isinstance(every, bool)
++            or not RESOLVED_CHECK_EVERY_MIN <= every <= RESOLVED_CHECK_EVERY_MAX):
++        raise ValueError(f"human_request resolved_check_every must be an integer number of seconds between "
++                         f"{RESOLVED_CHECK_EVERY_MIN} and {RESOLVED_CHECK_EVERY_MAX}")
++    return {"resolved_check": cmd.strip(), "resolved_check_every": every}
++
++
+ def needs_human(value: Any, *, kind: str | None = None) -> bool:
+     """Defensive read-side predicate shared by local and replica consumers."""
+     try:
+diff --git a/hermes_cli/kanban_human_request_migration.py b/hermes_cli/kanban_human_request_migration.py
+index bef0b1ff6b..d7250c12dd 100644
+--- a/hermes_cli/kanban_human_request_migration.py
++++ b/hermes_cli/kanban_human_request_migration.py
+@@ -1,5 +1,4 @@
+ """Explicit, audited classification of legacy parked cards; never unblock them."""
+-import json
+ import os
+ 
+ from hermes_cli.kanban_human_request import validate_human_request
+@@ -33,11 +32,12 @@ def classify_parked_request(conn, task_id: str, *, human_request: dict | None,
+         if row is None or row["status"] not in ("blocked", "triage") or row["current_run_id"] is not None:
+             return False
+         request = validate_human_request(human_request, kind=row["block_kind"])
+-        conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?",
+-                     (json.dumps(request) if request else None, task_id))
++        from hermes_cli.kanban_ask_resolved import filing_fields, store_request
++        store_request(conn, task_id, request)  # adds, changes or removes the resolved_check probe [daveey]
+         db._append_event(conn, task_id, "blocked", {
+             "human_request": request, "kind": row["block_kind"], "reason": reason,
+             "actor": actor, "classified_in_place": True, "metadata_only": True,
++            **(filing_fields(conn, request) if row["status"] == "blocked" else {}),
+         })
+         return True
+ 
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index b875b780a7..87aef07cdf 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -95,7 +95,8 @@ def _bulk_ids(verb: str):
+ 
+ _TASK_ID = _arg("task_id")
+ _HUMAN_REQUEST = _arg("--human-request", type=json.loads, metavar="JSON", default=argparse.SUPPRESS,
+-                      help="Explicit human request evidence (action, why_human, interaction, scope, evidence); never authorization")
++                      help="Explicit human request evidence (action, why_human, interaction, scope, evidence; optional "
++                           "choices, resolved_check, resolved_check_every); never authorization")
+ 
+ 
+ def _WAKE_CHECK_ARGS():
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 85791f4073..0b6e2f03a8 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -440,11 +440,17 @@ def set_check(conn: sqlite3.Connection, task_id: str, cmd: Optional[str], every:
+ 
+ 
+ def _row_dict(row) -> dict:
+-    keys = ("task_id", "cmd", "every", "next_at", "last_at", "last_rc", "last_out", "fails", "generation")
++    keys = ("task_id", "cmd", "every", "next_at", "last_at", "last_rc", "last_out", "fails", "generation", "purpose")
+     return {k: row[i] for i, k in enumerate(keys)}
+ 
+ 
+-_SELECT = "SELECT task_id, cmd, every, next_at, last_at, last_rc, last_out, fails, generation FROM task_wake_checks"
++_SELECT = ("SELECT task_id, cmd, every, next_at, last_at, last_rc, last_out, fails, generation, purpose "
++           "FROM task_wake_checks")
++# [daveey] Which status each probe purpose runs in: a park's wake_check while ``scheduled``, a human ask's
++# resolved_check (``kanban_ask_resolved``) while ``blocked``. A row whose card left that status is stale.
++PURPOSE_STATUS = {"wake": "scheduled", "ask_resolved": "blocked"}
++_LIVE_ROW = ("((w.purpose = 'ask_resolved' AND t.status = 'blocked') "
++             "OR (w.purpose IS NOT 'ask_resolved' AND t.status = 'scheduled'))")
+ 
+ 
+ def get_state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+@@ -480,7 +486,8 @@ def describe_state(state: dict, *, now: Optional[int] = None) -> str:
+             else f"last run {stamp(state['last_at'])} (last rc {state.get('last_rc')})")
+     fails = f", {state['fails']} failing in a row" if state.get("fails") else ""
+     due = "due now" if state["next_at"] <= now else f"next {stamp(state['next_at'])}"
+-    return f"`{state['cmd']}` every {state['every']}s; {last}{fails}; {due}"
++    what = "ask resolved_check " if state.get("purpose") == "ask_resolved" else ""
++    return f"{what}`{state['cmd']}` every {state['every']}s; {last}{fails}; {due}"
+ 
+ 
+ # --- probe runner -------------------------------------------------------------------------
+@@ -534,14 +541,14 @@ def _tail(text: str) -> str:
+     return text[-OUTPUT_TAIL_CHARS:]
+ 
+ 
+-def _profile_home(task) -> Optional[str]:
++def _profile_home(assignee: Optional[str], task_id: Optional[str] = None) -> Optional[str]:
+     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+ 
+     try:
+-        profile = normalize_profile_name(task.assignee) if task.assignee else None
++        profile = normalize_profile_name(assignee) if assignee else None
+         return str(resolve_profile_env(profile)) if profile else None
+     except (FileNotFoundError, ValueError, OSError):
+-        logger.debug("wake check: no profile home for %s", task.id, exc_info=True)
++        logger.debug("wake check: no profile home for %s", task_id, exc_info=True)
+         return None
+ 
+ 
+@@ -549,23 +556,38 @@ def _probe_env(task, db_path: str) -> dict:
+     """The assignee profile's env (``served_profile_child_env``: its HERMES_HOME and its own
+     secrets, never the launch profile's) plus the board pin, so ``hermes kanban show`` in a
+     probe reads the card's board."""
++    return probe_env(task.id, task.assignee, db_path)
++
++
++def probe_env(task_id: Optional[str], assignee: Optional[str], db_path: str) -> dict:
++    """``_probe_env`` by parts. ``task_id=None`` [daveey] is a card not created yet (an ask filed at create,
++    ``kanban_ask_resolved.create_context``): the env has no ``HERMES_KANBAN_TASK`` at all, never the
++    creating worker's own card id."""
+     from agent.secret_scope import UnscopedSecretError
+     from tools.environments.local import served_profile_child_env
+ 
+-    home = _profile_home(task)
++    home = _profile_home(assignee, task_id)
+     try:
+         env = served_profile_child_env(target_home=home, inherit_credentials=True)
+     except UnscopedSecretError:  # multiplex with no profile home: no credentials, not the launcher's
+-        logger.debug("wake check: no secret scope for %s", task.id, exc_info=True)
++        logger.debug("wake check: no secret scope for %s", task_id, exc_info=True)
+         env = served_profile_child_env(target_home=home, inherit_credentials=False)
+-    for key in ("HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_SESSION_ID", "HERMES_KANBAN_BOARD"):
++    for key in ("HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_SESSION_ID", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_TASK"):
+         env.pop(key, None)
+-    env["HERMES_KANBAN_TASK"] = task.id
++    if task_id:
++        env["HERMES_KANBAN_TASK"] = task_id
+     env["HERMES_KANBAN_DB"] = db_path
+     env["HERMES_KANBAN_WAKE_PROBE"] = "1"  # wait-check's implicit --from applies only to probe runs [daveey]
+     return env
+ 
+ 
++def probe_cwd(workspace_path: Optional[str]) -> str:
++    """The cwd a card's probe runs in: its workspace when that is an existing absolute dir, else home."""
++    ws = workspace_path
++    return ws if ws and os.path.isabs(ws) and os.path.isdir(ws) else str(Path.home())
++
++
+ def _run_probe(key: tuple[str, str], cmd: str, cwd: str, env: dict) -> tuple[Any, str]:
+     """``(rc, output)``; rc is ``"timeout"`` when the probe outlived ``PROBE_TIMEOUT_SECONDS``."""
+     try:
+@@ -702,12 +724,13 @@ def producer_note(hit: dict) -> str:
+             "`--from <that status>`. Those statuses count as met, so without it the probe passes at once.")
+ 
+ 
+-def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str) -> Any:
++def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str,
++                     purpose: str = "wake") -> Any:
+     key = (db_path, task_id)
+     try:
+         rc, out = _run_probe(key, cmd, cwd, env)
+         diag = None
+-        if rc == 0:
++        if rc == 0 and purpose != "ask_resolved":  # an ask's exit 0 is read literally (kanban_ask_resolved)
+             # One stray exit 0 must not wake a card (a stolen wait status once read as 0): confirm
+             # with a second run and wake only if it passes again. The second result is what counts.
+             first = {"first_rc": rc, "first_output": _tail(out)}
+@@ -716,6 +739,10 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+         from hermes_cli import kanban_db_connect as kbc
+         conn = kbc.connect(Path(db_path))
+         try:
++            if purpose == "ask_resolved":
++                from hermes_cli import kanban_ask_resolved as kar
++                kar.apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation)
++                return rc
+             answered = None
+             if rc == 1 and not output_error(out):
+                 # [daveey] The probe says "not yet" but the hermes-hub request this park names is answered:
+@@ -752,7 +779,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+         state = get_state(conn, task_id)
+         status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         if (state is None or state["cmd"] != cmd or state["generation"] != generation
+-                or status is None or status[0] != "scheduled"):
++                or state.get("purpose") == "ask_resolved" or status is None or status[0] != "scheduled"):
+             return None
+         rc_col = rc if isinstance(rc, int) else -1
+         if rc == 0:
+@@ -852,19 +879,23 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+         try:
+             stale = conn.execute(
+                 "SELECT w.task_id FROM task_wake_checks w LEFT JOIN tasks t ON t.id = w.task_id "
+-                "WHERE t.status IS NOT 'scheduled'").fetchall()
++                f"WHERE t.id IS NULL OR NOT {_LIVE_ROW}").fetchall()
+         except sqlite3.OperationalError:
+             return {"submitted": [], "in_flight": 0}
+         if stale:
+             with kb.write_txn(conn):
+                 for row in stale:
+-                    conn.execute("DELETE FROM task_wake_checks WHERE task_id = ? AND task_id NOT IN "
+-                                 "(SELECT id FROM tasks WHERE status = 'scheduled')", (row[0],))
++                    conn.execute("DELETE FROM task_wake_checks WHERE task_id = ? AND task_id IN (SELECT w.task_id "
++                                 "FROM task_wake_checks w LEFT JOIN tasks t ON t.id = w.task_id "
++                                 f"WHERE t.id IS NULL OR NOT {_LIVE_ROW})", (row[0],))
+         restore_missing_checks(conn, now=ts)  # [daveey] a park whose probe never reached this board
++        from hermes_cli import kanban_ask_resolved as kar
++        kar.reconcile(conn, now=ts)  # [daveey] an ask's probe row follows its stored ask; a lost one is restored
+         due = conn.execute(
+-            "SELECT w.task_id, w.cmd, w.every, w.generation FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
+-            "WHERE t.status = 'scheduled' AND w.next_at <= ? ORDER BY w.next_at", (ts,)).fetchall()
+-        for task_id, cmd, every, generation in due:
++            "SELECT w.task_id, w.cmd, w.every, w.generation, w.purpose FROM task_wake_checks w "
++            f"JOIN tasks t ON t.id = w.task_id WHERE {_LIVE_ROW} AND w.next_at <= ? ORDER BY w.next_at",
++            (ts,)).fetchall()
++        for task_id, cmd, every, generation, purpose in due:
+             key = (db_path, task_id)
+             with _LOCK:
+                 busy = sum(1 for f in _IN_FLIGHT.values() if not f.done())
+@@ -881,14 +912,15 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+             with kb.write_txn(conn):
+                 claimed = conn.execute(
+                     "UPDATE task_wake_checks SET next_at = ?, generation = ? "
+-                    "WHERE task_id = ? AND cmd = ? AND generation IS ? AND next_at <= ? "
+-                    "AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = 'scheduled')",
+-                    (ts + int(every), claim, task_id, cmd, generation, ts, task_id))
++                    "WHERE task_id = ? AND cmd = ? AND generation IS ? AND next_at <= ? AND purpose IS ? "
++                    "AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ?)",
++                    (ts + int(every), claim, task_id, cmd, generation, ts, purpose, task_id,
++                     PURPOSE_STATUS.get(purpose, "scheduled")))
+                 if claimed.rowcount != 1:
+                     continue
+-            ws = task.workspace_path
+-            cwd = ws if ws and os.path.isabs(ws) and os.path.isdir(ws) else str(Path.home())
+-            fut = _pool().submit(_probe_and_apply, db_path, task_id, cmd, cwd, _probe_env(task, db_path), now, claim)
++            cwd = probe_cwd(task.workspace_path)
++            fut = _pool().submit(_probe_and_apply, db_path, task_id, cmd, cwd, _probe_env(task, db_path), now, claim,
++                                 purpose)
+             with _LOCK:
+                 _IN_FLIGHT[key] = fut
+             submitted.append(task_id)
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 414e4da986..cf9d5bcdf9 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -252,8 +252,10 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     # [daveey] A scheduled copy whose wake_check this gateway runs stays until it wakes: the probe row is
+     # machine-local, and evicting the copy let the stale sweep delete it, so the card slept until its clock
+     # (t_01a18c12ba6895b8). Its wake is a status write the Board carries to the home board.
+-    keep = (" AND NOT (status = 'scheduled' AND EXISTS (SELECT 1 FROM task_wake_checks w WHERE w.task_id = tasks.id))"
+-            if probes else "")
++    # A blocked copy whose ask resolved_check this gateway runs (it filed the ask) stays the same way.
++    keep = (" AND NOT EXISTS (SELECT 1 FROM task_wake_checks w WHERE w.task_id = tasks.id AND "
++            "((tasks.status = 'scheduled' AND w.purpose IS NOT 'ask_resolved') "
++            "OR (tasks.status = 'blocked' AND w.purpose = 'ask_resolved')))" if probes else "")
+     rows = conn.execute(
+         "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ? AND claim_lock IS NULL "
+         "AND status != 'running'" + keep, (own,)).fetchall()
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 9cfdf03e2d..ce20bb10b9 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -40,6 +40,7 @@ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_workspace as kbw
+ from hermes_cli import kanban_diagnostics as kd
+ from plugins.kanban.dashboard.board_diagnostics import _attach_diagnostics, _warnings_summary_from_diagnostics
++from plugins.kanban.dashboard.plugin_api_human_request import ask_filing_refusal, classify_request
+ from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
+ 
+ log = logging.getLogger(__name__)
+@@ -739,13 +740,6 @@ def _validate_request_entry(payload) -> None:
+                 raise ValueError("human_request/block_kind require blocked status or metadata_only classification")
+ 
+ 
+-def _classify_request(conn, task_id, payload, actor: str) -> bool:
+-    from hermes_cli.kanban_human_request_migration import classify_parked_request
+-
+-    return classify_parked_request(conn, task_id, human_request=payload.human_request,
+-                                   actor=actor, reason=payload.block_reason)
+-
+-
+ _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
+ 
+ 
+@@ -888,9 +882,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
+     actor = classification_actor(request) if payload.metadata_only else ""
+     with _board_conn(board) as (board, conn):
+         _require_task(conn, task_id)
++        if (refusal := ask_filing_refusal(conn, task_id, payload)):
++            raise _conflict(refusal)
+         if payload.metadata_only:
+             with _value_error_400():
+-                if not _classify_request(conn, task_id, payload, actor):
++                if not classify_request(conn, task_id, payload, actor):
+                     raise _conflict("classification requires parked card without a current run")
+         # For a combined assignee+review patch, request_review must capture the
+         # current implementer before the task is routed to the reviewer.
+@@ -1030,8 +1026,11 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board:
+ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict, actor: str = "") -> None:
+     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
+     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
++    if (refusal := ask_filing_refusal(conn, tid, payload)):
++        entry.update(ok=False, error=refusal)
++        return
+     if payload.metadata_only:
+-        if not _classify_request(conn, tid, payload, actor):
++        if not classify_request(conn, tid, payload, actor):
+             entry.update(ok=False, error="classification requires parked card without a current run")
+         return
+     if payload.archive:
+diff --git a/plugins/kanban/dashboard/plugin_api_human_request.py b/plugins/kanban/dashboard/plugin_api_human_request.py
+index 5d9529341d..776a53c7b7 100644
+--- a/plugins/kanban/dashboard/plugin_api_human_request.py
++++ b/plugins/kanban/dashboard/plugin_api_human_request.py
+@@ -1,4 +1,6 @@
+-"""Trusted actor resolution for audited human-request classification."""
++"""Trusted actor resolution for audited human-request classification, and the request writes it gates."""
++from typing import Optional
++
+ from fastapi import HTTPException, Request
+ 
+ 
+@@ -20,3 +22,21 @@ def classification_actor(request: Request) -> str:
+         assert session is not None  # enforced by the canonical gate above
+         return f"dashboard:{session.provider}:{session.user_id}"
+     return "dashboard:loopback-token"
++
++
++def classify_request(conn, task_id, payload, actor: str) -> bool:
++    from hermes_cli.kanban_human_request_migration import classify_parked_request
++
++    return classify_parked_request(conn, task_id, human_request=payload.human_request,
++                                   actor=actor, reason=payload.block_reason)
++
++
++def ask_filing_refusal(conn, task_id: str, payload) -> Optional[str]:
++    """[daveey] An ask filed with a ``resolved_check`` (block or metadata-only) runs it once first, in the card's
++    sweep context, as every other filing path does (``kanban_ask_resolved``): exit 0 or a broken probe refuses."""
++    if not (payload.metadata_only or payload.status == "blocked"):
++        return None
++    from hermes_cli.kanban_ask_resolved import filing_refusal
++
++    hit = filing_refusal(conn, [task_id], payload.human_request)
++    return hit[1] if hit else None
+diff --git a/tests/hermes_cli/test_kanban_ask_resolved_check.py b/tests/hermes_cli/test_kanban_ask_resolved_check.py
+new file mode 100644
+index 0000000000..16966dafc7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ask_resolved_check.py
+@@ -0,0 +1,629 @@
++"""A human ask can carry ``resolved_check``: a probe that says David's step already happened outside Hermes
++(he pressed the device button, flipped the Settings toggle), so the card resumes without his unblock. [daveey]
++
++Entry paths: the kanban_block tool, the kanban_create tool (initial_status=blocked), ``hermes kanban block
++--human-request`` (one card or ``--ids``), ``hermes kanban create --initial-status blocked``, ``hermes kanban
++block --metadata-only --human-request`` (add/change/remove), and the dashboard's PATCH /tasks/{id} and POST
++/tasks/bulk (status=blocked or metadata_only).
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import time
++from collections.abc import Iterator
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_ask_resolved as kar
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli.kanban_human_request import validate_human_request
++
++ASK = {"action": "Press the pair button on the watch. Unblock = finish pairing; archive = drop the watch.",
++       "why_human": "physical button on David's device", "interaction": "physical",
++       "scope": "watch pairing", "evidence": "hub shows the watch unpaired"}
++
++
++@pytest.fixture
++def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    yield tmp_path
++    kwc._shutdown_for_tests()
++
++
++def _flag(tmp: Path) -> Path:
++    return tmp / "paired-flag"
++
++
++def _probe(flag: Path) -> str:
++    return f"test -f {flag} && cat {flag} || exit 1"
++
++
++def _ask(cmd: str, **extra) -> dict:
++    return {**ASK, "resolved_check": cmd, **extra}
++
++
++def _running(conn, monkeypatch=None) -> str:
++    tid = kb.create_task(conn, title="pair watch", assignee="test-worker")
++    kb.claim_task(conn, tid)
++    if monkeypatch is not None:
++        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, tid)))
++    return tid
++
++
++def _row(conn, tid):
++    row = conn.execute("SELECT cmd, every, purpose, fails FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone()
++    return tuple(row) if row else None
++
++
++def _events(conn, tid, kind):
++    return [e for e in kb.list_events(conn, tid) if e.kind == kind]
++
++
++def cli(*args):
++    from hermes_cli import kanban
++    from hermes_cli.kanban_parser import build_parser
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    return kanban.kanban_command(parser.parse_args(["kanban", *args]))
++
++
++# --- validation ------------------------------------------------------------------------------
++
++def test_validation_defaults_and_bounds():
++    req = validate_human_request(_ask("exit 1"))
++    assert req["resolved_check"] == "exit 1" and req["resolved_check_every"] == 900
++    assert validate_human_request(_ask("exit 1", resolved_check_every=120))["resolved_check_every"] == 120
++    assert validate_human_request(_ask("exit 1", resolved_check_every=21600))["resolved_check_every"] == 21600
++    assert "resolved_check" not in validate_human_request(ASK)
++    for bad in (_ask("exit 1", resolved_check_every=119), _ask("exit 1", resolved_check_every=21601),
++                _ask("exit 1", resolved_check_every=True), _ask("exit 1", resolved_check_every="900"),
++                _ask("   "), _ask(7), {**ASK, "resolved_check_every": 900}, _ask("x" * 2001)):
++        with pytest.raises(ValueError):
++            validate_human_request(bad)
++
++
++# --- filing: synchronous probe once ------------------------------------------------------------
++
++def test_tool_block_files_ask_with_resolved_check(board, monkeypatch):
++    from tools import kanban_tools as kt
++    flag = _flag(board)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn, monkeypatch)
++        out = json.loads(kt._handle_block({"reason": "need the button", "kind": "needs_input",
++                                           "human_request": _ask(_probe(flag), resolved_check_every=300)}))
++        assert out.get("ok") is True, out
++        assert kb.get_task(conn, tid).status == "blocked"
++        assert _row(conn, tid) == (_probe(flag), 300, kar.PURPOSE, 0)
++        assert kwc.describe_state(kwc.get_state(conn, tid)).startswith("ask resolved_check `")
++
++
++@pytest.mark.parametrize("cmd,code,needle", [
++    ("echo already-paired", kar.ALREADY_RESOLVED, "already-paired"),
++    ("echo probe-blew-up; exit 2", kar.BROKEN, "probe-blew-up"),
++])
++def test_tool_block_refuses_resolved_or_broken_probe(board, monkeypatch, cmd, code, needle):
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        tid = _running(conn, monkeypatch)
++        out = json.loads(kt._handle_block({"reason": "need the button", "kind": "needs_input",
++                                           "human_request": _ask(cmd)}))
++        assert out.get("rejection") == code, out
++        assert needle in out["error"]
++        if code == kar.ALREADY_RESOLVED:
++            assert "the asked-for state already holds; don\u2019t ask, continue the work" in out["error"]
++        assert kb.get_task(conn, tid).status == "running"
++        assert _row(conn, tid) is None
++
++
++def test_tool_create_blocked_files_or_refuses(board):
++    from tools import kanban_tools as kt
++    flag = _flag(board)
++    base = {"title": "Pair the watch", "initial_status": "blocked", "requires": [], "placement": "local"}
++    out = json.loads(kt._handle_create({**base, "human_request": _ask(_probe(flag))}))
++    assert out.get("ok") is True, out
++    with kbc.connect_closing() as conn:
++        tid = out["task_id"]
++        assert kb.get_task(conn, tid).status == "blocked"
++        assert _row(conn, tid) == (_probe(flag), 900, kar.PURPOSE, 0)
++        count = len(kb.list_tasks(conn))
++    refused = json.loads(kt._handle_create({**base, "title": "Pair again", "human_request": _ask("true")}))
++    assert refused.get("rejection") == kar.ALREADY_RESOLVED, refused
++    with kbc.connect_closing() as conn:
++        assert len(kb.list_tasks(conn)) == count
++
++
++def test_cli_block_files_or_refuses(board, capsys):
++    flag = _flag(board)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        other = _running(conn)
++    assert cli("block", other, "need the button", "--kind", "needs_input",
++               "--human-request", json.dumps(_ask("echo done-already"))) == 2
++    assert kar.ALREADY_RESOLVED in capsys.readouterr().err
++    assert cli("block", tid, "need the button", "--kind", "needs_input",
++               "--human-request", json.dumps(_ask(_probe(flag)))) == 0
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "blocked"
++        assert _row(conn, tid) == (_probe(flag), 900, kar.PURPOSE, 0)
++        assert kb.get_task(conn, other).status == "running" and _row(conn, other) is None
++
++
++def test_cli_create_blocked_files_or_refuses(board, capsys):
++    flag = _flag(board)
++    assert cli("create", "Pair", "--initial-status", "blocked", "--human-request", json.dumps(_ask("true"))) == 2
++    assert f"{kar.ALREADY_RESOLVED}: the asked-for state already holds" in capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        assert not kb.list_tasks(conn)
++    assert cli("create", "Pair", "--initial-status", "blocked", "--human-request",
++               json.dumps(_ask(_probe(flag))), "--json") == 0
++    tid = json.loads(capsys.readouterr().out)["id"]
++    with kbc.connect_closing() as conn:
++        assert _row(conn, tid) == (_probe(flag), 900, kar.PURPOSE, 0)
++
++
++def test_cli_metadata_only_adds_changes_and_removes_check(board, capsys):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Legacy", assignee="owner", initial_status="blocked", lint_blocked=False)
++    a, b = _probe(board / "a"), _probe(board / "b")
++    assert cli("block", tid, "Reviewed", "--metadata-only", "--human-request", json.dumps(_ask(a))) == 0
++    with kbc.connect_closing() as conn:
++        assert _row(conn, tid) == (a, 900, kar.PURPOSE, 0)
++    assert cli("block", tid, "Reviewed", "--metadata-only", "--human-request",
++               json.dumps(_ask(b, resolved_check_every=600))) == 0
++    with kbc.connect_closing() as conn:
++        assert _row(conn, tid) == (b, 600, kar.PURPOSE, 0)
++    assert cli("block", tid, "Reviewed", "--metadata-only", "--human-request", json.dumps(_ask("true"))) == 2
++    assert kar.ALREADY_RESOLVED in capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        assert _row(conn, tid) == (b, 600, kar.PURPOSE, 0)
++    assert cli("block", tid, "Reviewed", "--metadata-only", "--human-request", json.dumps(ASK)) == 0
++    with kbc.connect_closing() as conn:
++        assert _row(conn, tid) is None
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_human_block_with_bare_wake_check_is_still_refused(board, monkeypatch):
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        tid = _running(conn, monkeypatch)
++        out = json.loads(kt._handle_block({"reason": "need the button", "kind": "needs_input",
++                                           "human_request": ASK, "wake_check": "exit 1"}))
++        assert "error" in out and "resolved_check" in out["error"], out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++# --- sweep -------------------------------------------------------------------------------------
++
++def _blocked_ask(conn, cmd, every=120, parents=()):
++    tid = kb.create_task(conn, title="pair watch", assignee="test-worker", parents=list(parents),
++                         initial_status="blocked", human_request=validate_human_request(
++                             _ask(cmd, resolved_check_every=every)))
++    return tid
++
++
++def test_sweep_unblocks_when_ask_satisfied_outside_hermes(board):
++    flag = _flag(board)
++    with kbc.connect_closing() as conn:
++        tid = _blocked_ask(conn, _probe(flag))
++        now = int(time.time())
++        kwc.run_due_wake_checks(conn, now=now + 200, wait=True)
++        assert kb.get_task(conn, tid).status == "blocked"
++        assert kwc.get_state(conn, tid)["last_rc"] == 1
++        flag.write_text("watch paired\n")
++        kwc.run_due_wake_checks(conn, now=now + 400, wait=True)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready"
++        ev = _events(conn, tid, kar.EVENT)
++        assert len(ev) == 1 and ev[0].payload["cmd"] == _probe(flag) and ev[0].payload["rc"] == 0
++        assert "watch paired" in ev[0].payload["output"]
++        bodies = [c.body for c in kb.list_comments(conn, tid)]
++        assert (f"David's ask was satisfied outside Hermes (probe `{_probe(flag)}` exited 0: `watch paired`). "
++                "Verify the state and continue; don't redo the asked action.") in bodies
++        assert _events(conn, tid, "unblocked")
++        assert _row(conn, tid) is None
++
++
++def test_sweep_unblock_waits_in_todo_behind_open_parent(board):
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="parent", assignee="test-worker")
++        tid = _blocked_ask(conn, f"test -f {board / 'p'} || exit 1", parents=[parent])
++        (board / "p").write_text("x")
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 200, wait=True)
++        assert kb.get_task(conn, tid).status == "todo"
++        assert _events(conn, tid, kar.EVENT)
++
++
++def test_sweep_stale_rows_dropped_on_archive_and_manual_unblock(board):
++    with kbc.connect_closing() as conn:
++        archived = _blocked_ask(conn, "exit 1")
++        unblocked = _blocked_ask(conn, "exit 1")
++        assert _row(conn, archived) and _row(conn, unblocked)
++        assert kb.archive_task(conn, archived)
++        assert kb.unblock_task(conn, unblocked)
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 200, wait=True)
++        assert _row(conn, archived) is None and _row(conn, unblocked) is None
++        assert not _events(conn, unblocked, kar.EVENT)
++
++
++def test_scheduled_wake_check_still_wakes_next_to_ask_rows(board):
++    flag = _flag(board)
++    flag.write_text("ok")
++    with kbc.connect_closing() as conn:
++        ask = _blocked_ask(conn, "exit 1")
++        parked = kb.create_task(conn, title="t", assignee="worker")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parked,))
++        kb.claim_task(conn, parked, claimer="worker")
++        assert kb.schedule_task(conn, parked, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                                wake_check=_probe(flag), check_every=120)
++        assert _row(conn, parked)[2] == "wake"
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 200, wait=True)
++        assert kb.get_task(conn, parked).status == "ready" and _events(conn, parked, "condition_met")
++        assert kb.get_task(conn, ask).status == "blocked" and _row(conn, ask)[2] == kar.PURPOSE
++
++
++def test_broken_resolved_check_comments_once_and_never_unblocks(board):
++    script = board / "probe.sh"
++    script.write_text("exit 1\n")
++    with kbc.connect_closing() as conn:
++        tid = _blocked_ask(conn, f"sh {script}")
++        script.write_text("echo kaput; exit 2\n")
++        now = int(time.time())
++        for i in range(kwc.BROKEN_AFTER - 1):
++            kwc.run_due_wake_checks(conn, now=now + 200 * (i + 1), wait=True)
++            assert kwc.get_state(conn, tid)["fails"] == i + 1
++        kwc.run_due_wake_checks(conn, now=now + 200 * kwc.BROKEN_AFTER, wait=True)
++        kwc.run_due_wake_checks(conn, now=now + 200 * (kwc.BROKEN_AFTER + 2), wait=True)
++        assert kb.get_task(conn, tid).status == "blocked"
++        broken = _events(conn, tid, kar.BROKEN_EVENT)
++        assert len(broken) == 1 and "kaput" in broken[0].payload["output"]
++        notes = [c.body for c in kb.list_comments(conn, tid) if "resolved_check" in c.body]
++        assert len(notes) == 1 and "kaput" in notes[0]
++        assert _row(conn, tid) is None and not _events(conn, tid, kar.EVENT)
++
++
++def test_legacy_wake_checks_table_gains_purpose(board):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        with kb.write_txn(conn):
++            conn.execute("ALTER TABLE task_wake_checks DROP COLUMN purpose")
++            conn.execute("INSERT INTO task_wake_checks (task_id, cmd, every, next_at) VALUES (?, 'exit 1', 900, 0)",
++                         (tid,))
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        assert _row(conn, tid)[2] == "wake"
++
++
++# --- literal exit codes ------------------------------------------------------------------------
++
++@pytest.mark.parametrize("cmd,want", [
++    ("echo 'error: looks bad but means not yet'; exit 1", None),
++    ("echo 'Traceback (most recent call last)'; exit 0", kar.ALREADY_RESOLVED),
++    ("echo 'stale_age=99s gateway=hub'; exit 3", kar.BROKEN),
++    ("exit 127", kar.BROKEN),
++])
++def test_filing_reads_exit_codes_literally(board, cmd, want):
++    err = kar.filing_error(_ask(cmd))
++    assert (kar.refusal_code(err) if err else None) == want, err
++
++
++def test_filing_timeout_is_broken(board, monkeypatch):
++    monkeypatch.setattr(kwc, "PROBE_TIMEOUT_SECONDS", 1)
++    err = kar.filing_error(_ask("sleep 5; exit 1"))
++    assert err and err.startswith(kar.BROKEN) and "timeout" in err
++
++
++def test_sweep_reads_exit_codes_literally(board):
++    script = board / "probe.sh"
++    with kbc.connect_closing() as conn:
++        tid = _blocked_ask(conn, f"sh {script}")
++        now = int(time.time())
++        script.write_text("echo 'No such file or directory'; exit 1\n")    # still just "not yet"
++        kwc.run_due_wake_checks(conn, now=now + 200, wait=True)
++        state = kwc.get_state(conn, tid)
++        assert state["last_rc"] == 1 and state["fails"] == 0
++        script.write_text("echo 'stale_age=120s gateway=hub'; exit 3\n")  # a failure, not "unknown"
++        kwc.run_due_wake_checks(conn, now=now + 400, wait=True)
++        assert kwc.get_state(conn, tid)["fails"] == 1
++        script.write_text("echo 'error: but it is done'; exit 0\n")       # exit 0 is done
++        kwc.run_due_wake_checks(conn, now=now + 600, wait=True)
++        assert kb.get_task(conn, tid).status == "ready" and _events(conn, tid, kar.EVENT)
++
++
++def test_sweep_exit_0_runs_the_probe_once(board):
++    count = board / "runs"
++    with kbc.connect_closing() as conn:
++        tid = _blocked_ask(conn, f"echo x >> {count}; test -f {board / 'go'} || exit 1")
++        (board / "go").write_text("")
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 200, wait=True)
++        assert kb.get_task(conn, tid).status == "ready"
++    assert count.read_text().count("x") == 1
++
++
++# --- filing-vs-stored parity -----------------------------------------------------------------------
++
++def _workspace_task(conn, ws: Path, monkeypatch=None) -> str:
++    tid = kb.create_task(conn, title="pair watch", assignee="test-worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET workspace_kind = 'dir', workspace_path = ? WHERE id = ?", (str(ws), tid))
++    kb.claim_task(conn, tid)
++    if monkeypatch is not None:
++        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, tid)))
++    return tid
++
++
++def _parity_probe(tid_var: str = "$HERMES_KANBAN_TASK") -> str:
++    # exit 1 ("not yet") only when it runs where and as the sweep runs it: the card's workspace, its board pin.
++    return f'test -f here-marker && [ -n "$HERMES_KANBAN_DB" ] && [ -n "{tid_var}" ] && exit 1; exit 2'
++
++
++def test_tool_block_files_in_the_sweeps_cwd_and_env(board, monkeypatch):
++    from tools import kanban_tools as kt
++    ws = board / "ws"
++    ws.mkdir()
++    (ws / "here-marker").write_text("")
++    with kbc.connect_closing() as conn:
++        tid = _workspace_task(conn, ws, monkeypatch)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    out = json.loads(kt._handle_block({"reason": "need the button", "kind": "needs_input",
++                                       "human_request": _ask(_parity_probe())}))
++    assert out.get("ok") is True, out
++    with kbc.connect_closing() as conn:
++        assert _row(conn, tid)[0] == _parity_probe()
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 1000, wait=True)
++        state = kwc.get_state(conn, tid)
++        assert state["last_rc"] == 1 and state["fails"] == 0                 # the sweep agrees with filing
++
++
++def test_cli_block_files_in_the_sweeps_cwd_and_env(board, monkeypatch, capsys):
++    ws = board / "ws"
++    ws.mkdir()
++    (ws / "here-marker").write_text("")
++    with kbc.connect_closing() as conn:
++        tid = _workspace_task(conn, ws)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    assert cli("block", tid, "need the button", "--kind", "needs_input",
++               "--human-request", json.dumps(_ask(_parity_probe()))) == 0, capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "blocked" and _row(conn, tid)[0] == _parity_probe()
++
++
++SECRET_PROBE = "curl -sf -H 'Authorization: Bearer sk-ant-api03-" + "a" * 40 + "' https://hub.local/paired"
++
++
++def test_secret_probe_refused_on_tool_paths_before_running(board, monkeypatch):
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        tid = _running(conn, monkeypatch)
++    out = json.loads(kt._handle_block({"reason": "need the button", "kind": "needs_input",
++                                       "human_request": _ask(SECRET_PROBE)}))
++    assert "error" in out and "resolved_check_secret" in out["error"] and "sk-ant-api03-aaaa" not in out["error"]
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++    created = json.loads(kt._handle_create({"title": "Pair", "initial_status": "blocked", "requires": [],
++                                            "placement": "local", "human_request": _ask(SECRET_PROBE)}))
++    assert "error" in created and "resolved_check_secret" in created["error"], created
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running" and _row(conn, tid) is None
++        assert [t.id for t in kb.list_tasks(conn)] == [tid]
++
++
++def test_secret_probe_refused_on_cli_paths(board, capsys):
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++    for args in (("block", tid, "need the button", "--kind", "needs_input"),
++                 ("create", "Pair", "--initial-status", "blocked")):
++        try:
++            rc, msg = cli(*args, "--human-request", json.dumps(_ask(SECRET_PROBE))), ""
++        except ValueError as exc:
++            rc, msg = "raised", str(exc)
++        msg += capsys.readouterr().err
++        assert rc != 0 and "resolved_check_secret" in msg and "sk-ant-api03-aaaa" not in msg, (args, rc, msg)
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running" and _row(conn, tid) is None
++        assert [t.id for t in kb.list_tasks(conn)] == [tid]
++
++
++def test_padded_probe_stores_exactly_what_filing_ran(board, monkeypatch):
++    from tools import kanban_tools as kt
++    flag = _flag(board)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn, monkeypatch)
++    out = json.loads(kt._handle_block({"reason": "need the button", "kind": "needs_input",
++                                       "human_request": _ask("  " + _probe(flag) + "\n")}))
++    assert out.get("ok") is True, out
++    with kbc.connect_closing() as conn:
++        stored = json.loads(conn.execute("SELECT human_request FROM tasks WHERE id = ?", (tid,)).fetchone()[0])
++        assert stored["resolved_check"] == _probe(flag) == _row(conn, tid)[0]
++
++
++# --- synced board: probe_host on the filing event ----------------------------------------------------
++
++def test_filing_event_names_probe_host_on_a_synced_board(board):
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute("CREATE TABLE IF NOT EXISTS kanban_sync_state (gateway_id TEXT)")
++            conn.execute("DELETE FROM kanban_sync_state")
++            conn.execute("INSERT INTO kanban_sync_state (gateway_id) VALUES ('macbook')")
++        tid = _blocked_ask(conn, "exit 1")
++        assert _events(conn, tid, "blocked")[-1].payload["probe_host"] == "macbook"
++        plain = kb.create_task(conn, title="no probe", assignee="w", initial_status="blocked",
++                               human_request=validate_human_request(ASK))
++        assert "probe_host" not in _events(conn, plain, "blocked")[-1].payload
++
++
++# --- every card's own context, before any transition (CLI --ids) ------------------------------------
++
++def test_cli_bulk_block_checks_every_cards_context_before_blocking_any(board, monkeypatch, capsys):
++    good, bare = board / "good", board / "bare"
++    good.mkdir()
++    bare.mkdir()
++    (good / "here-marker").write_text("")
++    with kbc.connect_closing() as conn:
++        first = _workspace_task(conn, good)
++        second = _workspace_task(conn, bare)   # its probe would be broken in its own workspace
++    probe = "test -f here-marker && exit 1; exit 2"
++    assert cli("block", first, "need the button", "--ids", second, "--kind", "needs_input",
++               "--human-request", json.dumps(_ask(probe))) == 2
++    err = capsys.readouterr().err
++    assert kar.BROKEN in err and second in err
++    with kbc.connect_closing() as conn:
++        for tid in (first, second):
++            assert kb.get_task(conn, tid).status == "running" and _row(conn, tid) is None
++    (bare / "here-marker").write_text("")
++    assert cli("block", first, "need the button", "--ids", second, "--kind", "needs_input",
++               "--human-request", json.dumps(_ask(probe))) == 0, capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        assert all(kb.get_task(conn, t).status == "blocked" and _row(conn, t)[0] == probe for t in (first, second))
++
++
++# --- create: the sweep's env for a card that does not exist yet ---------------------------------------
++
++def _create_env_probe(db: str) -> str:
++    # exit 1 only with the target board pinned and none of the creator's own card/run/claim/session ids.
++    return (f'[ "$HERMES_KANBAN_DB" = "{db}" ] && [ -z "$HERMES_KANBAN_TASK" ] && [ -z "$HERMES_KANBAN_RUN_ID" ] '
++            '&& [ -z "$HERMES_KANBAN_CLAIM_LOCK" ] && [ -z "$HERMES_SESSION_ID" ] && exit 1; exit 2')
++
++
++def test_tool_create_files_in_the_sweeps_env_without_the_creators_ids(board, monkeypatch):
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        _running(conn, monkeypatch)                      # a worker creating a card: its own task/run ids are set
++        db = str(kbc._main_db_file(conn))
++    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "creator-claim")
++    monkeypatch.setenv("HERMES_SESSION_ID", "creator-session")
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    out = json.loads(kt._handle_create({"title": "Pair the watch", "initial_status": "blocked", "requires": [],
++                                        "placement": "local", "human_request": _ask(_create_env_probe(db))}))
++    assert out.get("ok") is True, out
++    with kbc.connect_closing() as conn:
++        assert _row(conn, out["task_id"])[0] == _create_env_probe(db)
++
++
++def test_cli_create_files_in_the_sweeps_env_without_the_creators_ids(board, monkeypatch, capsys):
++    with kbc.connect_closing() as conn:
++        db = str(kbc._main_db_file(conn))
++    for key, value in (("HERMES_KANBAN_RUN_ID", "7"), ("HERMES_KANBAN_CLAIM_LOCK", "c"),
++                       ("HERMES_SESSION_ID", "s")):
++        monkeypatch.setenv(key, value)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    assert cli("create", "Pair", "--initial-status", "blocked", "--human-request",
++               json.dumps(_ask(_create_env_probe(db))), "--json") == 0, capsys.readouterr().err
++    tid = json.loads(capsys.readouterr().out)["id"]
++    with kbc.connect_closing() as conn:
++        assert _row(conn, tid)[0] == _create_env_probe(db)
++
++
++# --- create: an idempotent retry returns the card and runs no probe -----------------------------------
++
++def _counting_probe(tmp: Path) -> str:
++    return f"echo run >> {tmp / 'runs'}; test -f {tmp / 'done'} && exit 0; exit 1"
++
++
++def test_tool_create_retry_with_idempotency_key_runs_no_probe(board):
++    from tools import kanban_tools as kt
++    args = {"title": "Pair the watch", "initial_status": "blocked", "requires": [], "placement": "local",
++            "idempotency_key": "pair-watch", "human_request": _ask(_counting_probe(board))}
++    first = json.loads(kt._handle_create(args))
++    assert first.get("ok") is True, first
++    (board / "done").write_text("")        # the probe would now refuse a new filing as already resolved
++    again = json.loads(kt._handle_create(args))
++    assert again.get("ok") is True and again["task_id"] == first["task_id"], again
++    assert (board / "runs").read_text().count("run") == 1
++
++
++def test_cli_create_retry_with_idempotency_key_runs_no_probe(board, capsys):
++    argv = ("create", "Pair", "--initial-status", "blocked", "--idempotency-key", "pair-watch",
++            "--human-request", json.dumps(_ask(_counting_probe(board))), "--json")
++    assert cli(*argv) == 0, capsys.readouterr().err
++    tid = json.loads(capsys.readouterr().out)["id"]
++    (board / "done").write_text("")
++    assert cli(*argv) == 0, capsys.readouterr().err
++    assert json.loads(capsys.readouterr().out)["id"] == tid
++    assert (board / "runs").read_text().count("run") == 1
++
++
++# --- dashboard: PATCH and bulk run the filing probe too -------------------------------------------------
++
++@pytest.fixture
++def dashboard(board, monkeypatch):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++
++    from hermes_cli import web_server
++    from plugins.kanban.dashboard import plugin_api as api
++    monkeypatch.setattr(web_server, "_SESSION_TOKEN", "test-dashboard-token")  # metadata_only needs the gate
++    app = FastAPI()
++    app.include_router(api.router, prefix="/api/plugins/kanban")
++    return TestClient(app, headers={"Authorization": "Bearer test-dashboard-token"})
++
++
++@pytest.mark.parametrize("cmd,code", [("echo already-paired", kar.ALREADY_RESOLVED), ("exit 2", kar.BROKEN)])
++def test_dashboard_patch_block_refuses_before_any_change(board, dashboard, cmd, code):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="pair watch", assignee="test-worker")
++    r = dashboard.patch(f"/api/plugins/kanban/tasks/{tid}", json={
++        "status": "blocked", "block_kind": "needs_input", "block_reason": "need the button",
++        "assignee": "someone-else", "human_request": _ask(cmd)})
++    assert r.status_code == 409 and r.json()["detail"].startswith(code), r.text
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and task.assignee == "test-worker" and _row(conn, tid) is None
++    flag = _flag(board)
++    r = dashboard.patch(f"/api/plugins/kanban/tasks/{tid}", json={
++        "status": "blocked", "block_kind": "needs_input", "block_reason": "need the button",
++        "human_request": _ask(_probe(flag))})
++    assert r.status_code == 200, r.text
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "blocked" and _row(conn, tid)[0] == _probe(flag)
++
++
++def test_dashboard_metadata_only_refuses_a_met_probe(board, dashboard):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Legacy", assignee="owner", initial_status="blocked", lint_blocked=False)
++    r = dashboard.patch(f"/api/plugins/kanban/tasks/{tid}", json={
++        "metadata_only": True, "block_reason": "Reviewed", "human_request": _ask("true")})
++    assert r.status_code == 409 and r.json()["detail"].startswith(kar.ALREADY_RESOLVED), r.text
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).human_request is None and _row(conn, tid) is None
++
++
++def test_dashboard_bulk_checks_each_card_in_its_own_context(board, dashboard):
++    good, bare = board / "good", board / "bare"
++    good.mkdir()
++    bare.mkdir()
++    (good / "here-marker").write_text("")
++    with kbc.connect_closing() as conn:
++        ids = []
++        for ws in (good, bare):
++            tid = kb.create_task(conn, title="pair watch", assignee="test-worker")
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET workspace_kind = 'dir', workspace_path = ? WHERE id = ?",
++                             (str(ws), tid))
++            ids.append(tid)
++    probe = "test -f here-marker && exit 1; exit 2"
++    r = dashboard.post("/api/plugins/kanban/tasks/bulk", json={
++        "ids": ids, "status": "blocked", "block_kind": "needs_input", "block_reason": "need the button",
++        "human_request": _ask(probe)})
++    assert r.status_code == 200, r.text
++    ok, refused = r.json()["results"]
++    assert ok["ok"] is True, ok
++    assert refused["ok"] is False and refused["error"].startswith(kar.BROKEN), refused
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, ids[0]).status == "blocked" and _row(conn, ids[0])[0] == probe
++        assert kb.get_task(conn, ids[1]).status == "ready" and _row(conn, ids[1]) is None
+diff --git a/tests/hermes_cli/test_kanban_ask_resolved_sync.py b/tests/hermes_cli/test_kanban_ask_resolved_sync.py
+new file mode 100644
+index 0000000000..4ea0cf7b92
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ask_resolved_sync.py
+@@ -0,0 +1,280 @@
++"""An ask's ``resolved_check`` keeps exactly one live probe on a synced board: on the gateway that filed the ask. [daveey]
++
++``task_wake_checks`` is machine-local and never syncs. A worker node that runs another gateway's card and files a
++human ask on it keeps its blocked copy while it runs the probe (``kanban_worker_node.evict``), and its unblock is a
++status write the Board carries home. The home board never starts another gateway's ask probe. A board that loses
++the probe of an ask it filed re-registers it once; a second loss comments once and stops. A probe that exhausted
++its failures is never resurrected by that restore. A relayed ask whose probe host stops reporting gets one
++comment on the home board, never an unblock and never a second probe there.
++"""
++from __future__ import annotations
++
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_ask_resolved as kar
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli.kanban_human_request import validate_human_request
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, WORKER, Gateway
++
++ASK = {"action": "Press the pair button on the watch. Unblock = finish pairing; archive = drop the watch.",
++       "why_human": "physical button on David's device", "interaction": "physical",
++       "scope": "watch pairing", "evidence": "hub shows the watch unpaired"}
++
++
++def _probe(flag: Path) -> str:
++    return f"test -f {flag} && cat {flag} || exit 1"
++
++
++def _ask(cmd=None, every=300):
++    return validate_human_request({**ASK, **({"resolved_check": cmd, "resolved_check_every": every} if cmd else {})})
++
++
++def _events(conn, tid, kind):
++    return [e for e in kb.list_events(conn, tid) if e.kind == kind]
++
++
++def _status(conn, tid):
++    task = kb.get_task(conn, tid)
++    return task.status if task else None
++
++
++def _settle():
++    deadline = time.monotonic() + 30
++    while kwc.in_flight() and time.monotonic() < deadline:
++        time.sleep(0.05)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch):
++    svc = FakeService(lease_runs=True)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    sync.consume_dispatcher_wake()
++    home = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    yield home, worker
++    kwc._shutdown_for_tests()
++    for g in (home, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _relayed_ask(home, worker, request):
++    """Home creates a card, the worker runs it, files a human ask on it and pushes the block."""
++    home.enter()
++    tid = kb.create_task(home.conn, title="runs on the worker", assignee="default", runs_on=["linux"])
++    home.round()
++    worker.round()
++    worker.tick()
++    assert _status(worker.conn, tid) == "running"
++    run_id = kb.get_task(worker.conn, tid).current_run_id
++    assert kb.block_task(worker.conn, tid, reason="need the button", kind="needs_input",
++                         expected_run_id=run_id, human_request=request)
++    worker.round()
++    return tid
++
++
++def test_a_relayed_ask_keeps_one_live_probe_and_its_unblock_reaches_the_home_board(gws, tmp_path):
++    home, worker = gws
++    flag = tmp_path / "flag"
++    tid = _relayed_ask(home, worker, _ask(_probe(flag)))
++    assert _events(worker.conn, tid, "blocked")[-1].payload["probe_host"] == WORKER
++    worker.tick()   # pickup evicts finished copies; the sweep runs
++    worker.tick()
++    _settle()
++    assert _status(worker.conn, tid) == "blocked", "the worker evicted its copy, and with it the only ask probe"
++    state = kwc.get_state(worker.conn, tid)
++    assert state is not None and state["purpose"] == kar.PURPOSE and state["cmd"] == _probe(flag)
++
++    home.round()
++    assert _status(home.conn, tid) == "blocked"
++    assert _events(home.conn, tid, "blocked")[-1].payload["probe_host"] == WORKER
++    home.enter()
++    kwc.run_due_wake_checks(home.conn, now=int(time.time()) + 400, wait=True)
++    assert kwc.get_state(home.conn, tid) is None                     # exactly one probe: the worker's
++    assert not _events(home.conn, tid, kar.RESTORED_EVENT) and not _events(home.conn, tid, kar.LOST_EVENT)
++
++    flag.write_text("watch paired\n")
++    worker.enter()
++    kwc.run_due_wake_checks(worker.conn, now=int(time.time()) + 301, wait=True)
++    assert _status(worker.conn, tid) == "ready"
++    worker.round()
++    home.round()
++    assert _status(home.conn, tid) == "ready"
++    assert "watch paired" in _events(home.conn, tid, kar.EVENT)[-1].payload["output"]
++
++
++def test_a_relayed_ask_without_resolved_check_is_still_evicted(gws, tmp_path):
++    home, worker = gws
++    tid = _relayed_ask(home, worker, _ask())
++    worker.tick()
++    worker.tick()
++    assert _status(worker.conn, tid) is None
++    home.round()
++    assert _status(home.conn, tid) == "blocked"
++
++
++def test_a_relayed_ask_probe_reports_alive_to_the_home_board(gws, tmp_path):
++    home, worker = gws
++    tid = _relayed_ask(home, worker, _ask(_probe(tmp_path / "flag")))
++    worker.enter()
++    kwc.run_due_wake_checks(worker.conn, now=int(time.time()) + 301, wait=True)   # just filed: no alive note
++    assert _events(worker.conn, tid, kar.ALIVE_EVENT) == []
++    kwc.run_due_wake_checks(worker.conn, now=int(time.time()) + kwc.ALIVE_EVERY + 601, wait=True)
++    assert _events(worker.conn, tid, kar.ALIVE_EVENT)[-1].payload["host"] == WORKER
++    worker.round()
++    home.round()
++    assert _events(home.conn, tid, kar.ALIVE_EVENT)
++
++
++def test_the_home_board_comments_once_when_a_relayed_asks_probe_host_went_silent(gws, tmp_path):
++    home, worker = gws
++    flag = tmp_path / "flag"
++    tid = _relayed_ask(home, worker, _ask(_probe(flag)))   # the worker never probes again
++    home.round()
++    home.enter()
++    now = int(time.time())
++    assert kar.reconcile(home.conn, now=now + kwc.ALIVE_EVERY)["silent"] == []
++    silent = now + kwc.ALIVE_EVERY + 2 * 300 + kwc.SILENT_GRACE + 5
++    assert kar.reconcile(home.conn, now=silent)["silent"] == [tid]
++    assert kar.reconcile(home.conn, now=silent + 3600)["silent"] == []          # once
++    assert _status(home.conn, tid) == "blocked"                                  # never unblocks for David
++    assert kwc.get_state(home.conn, tid) is None                                 # never probes on the wrong host
++    ev = _events(home.conn, tid, kar.SILENT_EVENT)
++    assert len(ev) == 1 and ev[0].payload["probe_host"] == WORKER
++    notes = [c.body for c in kb.list_comments(home.conn, tid) if "has not reported" in c.body]
++    assert len(notes) == 1 and WORKER in notes[0] and _probe(flag) in notes[0]
++    # The worker still runs its probe, and its exit 0 still resumes the card everywhere.
++    flag.write_text("watch paired\n")
++    worker.enter()
++    kwc.run_due_wake_checks(worker.conn, now=int(time.time()) + 301, wait=True)
++    worker.round()
++    home.round()
++    assert _status(home.conn, tid) == "ready"
++
++
++# --- one board: lost, restored, exhausted ------------------------------------------------------------------------
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        yield conn
++    kwc._shutdown_for_tests()
++
++
++def _blocked(conn, cmd, every=120):
++    return kb.create_task(conn, title="pair watch", assignee="worker", initial_status="blocked",
++                          human_request=_ask(cmd, every))
++
++
++def _lose(conn, tid):
++    with kb.write_txn(conn):
++        conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (tid,))
++
++
++def test_a_lost_ask_probe_is_restored_once_due_now_then_a_second_loss_comments_once(board, tmp_path):
++    flag = tmp_path / "flag"
++    tid = _blocked(board, _probe(flag))
++    _lose(board, tid)
++    now = int(time.time())
++    kwc.run_due_wake_checks(board, now=now, wait=True)
++    restored = _events(board, tid, kar.RESTORED_EVENT)
++    assert len(restored) == 1 and restored[0].payload["cmd"] == _probe(flag)
++    state = kwc.get_state(board, tid)
++    assert state["purpose"] == kar.PURPOSE and state["last_rc"] == 1   # due at once: it already ran
++    kwc.run_due_wake_checks(board, now=now + 1, wait=True)
++    assert len(_events(board, tid, kar.RESTORED_EVENT)) == 1             # idempotent while present
++
++    _lose(board, tid)
++    for i in range(3):
++        kwc.run_due_wake_checks(board, now=now + 10 + i, wait=True)
++    assert _status(board, tid) == "blocked"
++    assert kwc.get_state(board, tid) is None
++    assert len(_events(board, tid, kar.LOST_EVENT)) == 1
++    notes = [c.body for c in kb.list_comments(board, tid) if "went missing twice" in c.body]
++    assert len(notes) == 1 and _probe(flag) in notes[0]
++
++
++def test_an_exhausted_probe_is_never_restored_until_the_ask_is_refiled(board, tmp_path):
++    script = tmp_path / "probe.sh"
++    script.write_text("echo kaput; exit 2\n")
++    tid = _blocked(board, f"sh {script}")
++    now = int(time.time())
++    for i in range(kwc.BROKEN_AFTER):
++        kwc.run_due_wake_checks(board, now=now + 200 * (i + 1), wait=True)
++    assert len(_events(board, tid, kar.BROKEN_EVENT)) == 1 and kwc.get_state(board, tid) is None
++    for i in range(3):
++        kwc.run_due_wake_checks(board, now=now + 5000 + 200 * i, wait=True)
++    assert kwc.get_state(board, tid) is None
++    assert not _events(board, tid, kar.RESTORED_EVENT) and not _events(board, tid, kar.LOST_EVENT)
++    assert _status(board, tid) == "blocked" and not _events(board, tid, kar.EVENT)
++
++    # Re-filing with a fixed probe (metadata-only) starts it again.
++    from hermes_cli.kanban_human_request_migration import classify_parked_request
++    script.write_text("exit 1\n")
++    assert classify_parked_request(board, tid, human_request=_ask(f"sh {script}", 120), actor="op",
++                                   reason="fixed probe")
++    assert kwc.get_state(board, tid)["purpose"] == kar.PURPOSE
++
++
++def test_a_row_whose_stored_ask_changed_follows_the_ask(board, tmp_path):
++    """A synced write (or any writer that bypasses ``store_request``) changed the stored ask: the row follows it."""
++    a, b = _probe(tmp_path / "a"), _probe(tmp_path / "b")
++    tid = _blocked(board, a)
++    import json
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET human_request = ? WHERE id = ?", (json.dumps(_ask(b, 600)), tid))
++    kar.reconcile(board)
++    state = kwc.get_state(board, tid)
++    assert state["cmd"] == b and state["every"] == 600
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET human_request = ? WHERE id = ?", (json.dumps(_ask()), tid))
++    kar.reconcile(board)
++    assert kwc.get_state(board, tid) is None
++    # A stale result for the old command never unblocks the card.
++    (tmp_path / "a").write_text("x")
++    assert kar.apply_result(board, tid, a, 0, "x", generation="g") is None
++    assert _status(board, tid) == "blocked"
++
++
++def test_a_permanently_stopped_probe_takes_no_write_txn(board, tmp_path, monkeypatch):
++    script = tmp_path / "probe.sh"
++    script.write_text("echo kaput; exit 2\n")
++    broken = _blocked(board, f"sh {script}")
++    now = int(time.time())
++    for i in range(kwc.BROKEN_AFTER):
++        kwc.run_due_wake_checks(board, now=now + 200 * (i + 1), wait=True)
++    lost = _blocked(board, "exit 1")
++    for _ in range(2):
++        _lose(board, lost)
++        kar.reconcile(board, now=now)
++    assert _events(board, broken, kar.BROKEN_EVENT) and _events(board, lost, kar.LOST_EVENT)
++
++    writes = []
++    real = kb.write_txn
++    monkeypatch.setattr(kb, "write_txn", lambda conn, *a, **k: writes.append(1) or real(conn, *a, **k))
++    for i in range(3):
++        out = kar.reconcile(board, now=now + 10_000 + i)
++        assert not any(out.values()), out
++    assert writes == []
++    restorable = _blocked(board, "exit 1")
++    _lose(board, restorable)
++    writes.clear()
++    assert kar.reconcile(board, now=now + 20_000)["restored"] == [restorable] and len(writes) == 1
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 6b9de5c590..95f2a35df0 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -25,7 +25,7 @@ from tools.kanban_tools_placement import (_local_placement, _machine_placement,
+                                           _placement_refused, _runs_where)
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_park_args import _blocker_id_arg, _clear_blocker_arg
+-from hermes_cli.kanban_block_policy import ask_lint_check
++from hermes_cli.kanban_ask_resolved import ask_checks, create_ask_check, filing_context
+ from tools import kanban_tools_completion as _kc, kanban_tools_create_args as _ca
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+@@ -1216,7 +1216,7 @@ def _handle_block(args: dict, **kw) -> str:
+         _standing_wait_guard(kb, conn, tid, kind, args.get("human_request"), reason)
+         _park_guard(conn, tid, "block", wake, reason=reason, kind=kind, blocker_id=blocker_id,
+                     human_request=args.get("human_request"))
+-        _check(*ask_lint_check(args.get("human_request")))  # the ask line must say unblock/archive [daveey]
++        _check(*ask_checks(args.get("human_request"), context=filing_context(conn, tid)))  # lint + probe [daveey]
+         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+                            blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1], awaiting=awaiting,
+                            clock_only=wake[2], human_request=kb.redact_review_value(args.get("human_request")),
+@@ -1643,7 +1643,6 @@ def _handle_create(args: dict, **kw) -> str:
+     """Create a (child) task; orchestrator workers use this to fan out."""
+     _reject_delegated_child_mutation("kanban_create")
+     title = _require_text(args, "title")
+-    _check(*ask_lint_check(args.get("human_request")))  # the ask line must say unblock/archive [daveey]
+     assignee = args.get("assignee") or _persisted_identity()
+     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
+     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
+@@ -1673,6 +1672,7 @@ def _handle_create(args: dict, **kw) -> str:
+         return tool_error(f"{exc.code}: {exc}")
+     human_action_now = _parse_bool_arg(args, "human_action_now")
+     with _board(args.get("board")) as (kb, conn):
++        _check(*create_ask_check(conn, args, str(assignee)))  # ask line, then its filing probe [daveey]
+         # Never infer approval from prose or silently turn a human gate into
+         # dispatchable work. Ask the creator to distinguish a future dependency
+         # from a human action that can actually be taken while parents are open.
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 5a5fcbefb0..b6ebae3110 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -268,6 +268,17 @@ HUMAN_REQUEST = {
+                 "value": {"type": "string", "minLength": 1, "maxLength": 120}},
+                 "required": ["label", "value"], "additionalProperties": False},
+         },
++        "resolved_check": {"type": "string", "minLength": 1, "maxLength": 2000, "description": (
++            "Optional shell probe (bash -lc, 30 s) that tells when David's step is done even if he never "
++            "unblocks: exit 0 = done, 1 = not yet, anything else = broken. It runs once when you file the "
++            "ask: exit 0 refuses the ask (ask_already_resolved: the state already holds, continue the work), "
++            "a broken probe is refused (resolved_check_broken). While the card is blocked the dispatcher "
++            "re-runs it every resolved_check_every seconds; exit 0 unblocks the card with a comment telling "
++            "the next run to verify and continue, not redo the step. Examples: device button "
++            "`curl -sf http://hub.local:8080/api/devices/watch | jq -e '.paired == true'`; Settings toggle "
++            "`defaults read com.apple.AppleMultitouchTrackpad Clicking 2>/dev/null | grep -qx 1`.")},
++        "resolved_check_every": {"type": "integer", "minimum": 120, "maximum": 21600, "description": (
++            "Seconds between resolved_check runs while blocked (default 900).")},
+     },
+     "required": ["action", "why_human", "interaction", "scope", "evidence"],
+     "additionalProperties": False,
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index afe4082fbb..982069e949 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -439,6 +439,58 @@ Probe state is in the `task_wake_checks` table and shown by `kanban show`,
+ the worker context and the board API; `kanban diagnostics` flags failing or
+ overdue probes, and parks more than 2 h out that have neither.
+ 
++Human asks that resolve outside Hermes: a blocked card's `human_request` may
++carry `resolved_check` (a shell command) and `resolved_check_every` (seconds,
++default 900, 120–21600). Use it when David's step leaves a readable trace, so
++the card resumes when he does the step even if he never clicks unblock. A
++device button:
++
++```json
++{"action": "Press the pair button on the watch. Unblock = finish pairing; archive = drop the watch.",
++ "why_human": "physical button on David's device", "interaction": "physical",
++ "scope": "watch pairing", "evidence": "hub lists the watch as unpaired",
++ "resolved_check": "curl -sf http://hub.local:8080/api/devices/watch | jq -e '.paired == true'"}
++```
++
++A Settings toggle works the same way, e.g. "turn on Tap to click" with
++`"resolved_check": "defaults read com.apple.AppleMultitouchTrackpad Clicking 2>/dev/null | grep -qx 1"`.
++Exit codes are read literally: 0 = the step is done, 1 = not yet, anything
++else (exit 2 or higher, a 30 s timeout, a probe that cannot start) = broken; the
++output is only quoted, never interpreted. The probe runs once, synchronously,
++when the ask is filed (`kanban_block`, `kanban_create` with
++`initial_status="blocked"`, `hermes kanban create|block --human-request`,
++`hermes kanban block --metadata-only --human-request`, the dashboard's
++blocked/metadata-only PATCH and bulk updates), in the cwd and profile env the
++dispatcher will use for that card; a bulk block runs it for every card before
++any is blocked. A create runs it before the card exists: same board pin,
++assignee env and workspace cwd, but no `HERMES_KANBAN_TASK` (file a probe that
++needs its own card id with `kanban block` after the create), and a create whose
++`idempotency_key` returns an existing card runs nothing. Exit 1 files it; exit 0 refuses the
++ask with `ask_already_resolved` (the asked-for state already holds: don't ask,
++continue the work); anything else refuses it with `resolved_check_broken` and
++the output tail. A probe containing a secret or credential-shaped value is
++refused (`resolved_check_secret`): asks are stored redacted, so the stored
++command would differ from the one that ran. While the card stays `blocked` the
++dispatcher runs it with the same runner, concurrency cap and failure count as a
++park's `wake_check` (state row in `task_wake_checks` with
++`purpose='ask_resolved'`). One exit 0 appends an `ask_resolved` event, comments
++that the ask was satisfied outside Hermes, and unblocks the card the normal way
++(`ready`, or `todo` behind an open parent). Three failures in a row append
++`resolved_check_broken`, comment once and stop probing; the card stays blocked,
++is never unblocked by a broken probe, and the probe is not restored until the
++ask is re-filed. A plain `wake_check` on a human block is still refused: the
++ask's probe goes in `human_request.resolved_check`.
++
++On a synced board the probe runs on the gateway that filed the ask (its filing
++event names it as `probe_host`). A worker node keeps its blocked copy while it
++runs that probe; a board that loses the probe of an ask it filed re-registers it
++once (`resolved_check_restored`, due at once), and a second loss comments once
++(`resolved_check_lost`) and stops probing. Another gateway's ask probe is never
++started here. The probing worker node notes `resolved_check_alive` at most every
++3 h; when the home board has heard nothing from it for that long plus two
++intervals and 15 min, it comments once (`resolved_check_host_silent`) and leaves
++the card blocked on David's ask.
++
+ For an external GitHub PR wait, use the installed runtime's read-only probe:
+ 
+ ```text
+-- 
+2.54.0 (Apple Git-157)
+

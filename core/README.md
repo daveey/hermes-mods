@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1478 patches, one entry per non-merge source commit through `a229655398887f15a65ab2a838f243611462a65d`.
+1484 patches, one entry per non-merge source commit through `c21fe3290319da26cf0ebfa563e53aad7ff0ac2c`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -24,10 +24,19 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip and current merge-base: `a4994d4ead8f9c915b485cec5689909b349a49df`.
 Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432 and 1478. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-Current replay: [mirror-replay-1478.json](mirror-replay-1478.json) (four hash-pinned bridges) and [mirror-policy-1478.json](mirror-policy-1478.json). Executed checks: [mirror-1478-verification.md](mirror-1478-verification.md); preceding snapshot: [mirror-1476-verification.md](mirror-1476-verification.md).
+Current replay: [mirror-replay-1484.json](mirror-replay-1484.json) (four hash-pinned bridges, unchanged from 1478) and [mirror-policy-1484.json](mirror-policy-1484.json). Executed checks: [mirror-1484-verification.md](mirror-1484-verification.md); preceding snapshots: [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1479–1484
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Human asks that resolve outside Hermes](kanban-ask-resolved-check.md) | 1479, 1480, 1482, 1484 | `human_request.resolved_check`: filing probe on every block/create/CLI/metadata/dashboard path, `ask_resolved` sweep unblock, failure limit, synced-board probe ownership. |
+| [Tests cannot open the production Kanban board](kanban-production-board-guard.md) | 1481 | Pytest-context refusal at `connect()`/`init_db()` plus wider conftest deny and isolated board fixture. |
+| [Sync repair revision](kanban-sync-repair-revision.md) | 1483 | Repair scans invalidate on input-table writes, not dispatcher clock commits. |
+| [1484-entry mirror verification](mirror-1484-verification.md) | verification report | Complete inventory, unchanged four-bridge replay and normalized final tree. |
 
 ## Mirror follow-ups 1477–1478
 
@@ -790,7 +799,7 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1478-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the four bridges at the boundaries in `mirror-replay-1478.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
+For the current **1484-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the four bridges at the boundaries in `mirror-replay-1484.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
 
 ```bash
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
@@ -808,7 +817,7 @@ git commit -m 'Explicit upstream merge bridge before 1432'
 git am -3 --empty=keep "${patches[@]:1431:46}"
 git apply --index --3way "$MODS/core/bridges/upstream-through-7dc18193.diff"
 git commit -m 'Explicit upstream merge bridge before 1478'
-git am -3 --empty=keep "${patches[@]:1477:1}"
+git am -3 --empty=keep "${patches[@]:1477:7}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.
