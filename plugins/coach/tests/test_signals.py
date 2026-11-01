@@ -1474,6 +1474,34 @@ def test_template_head_falls_back_to_the_status_only_evidence_quote(tmp_path):
     assert len(_templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW))) == 1
 
 
+
+# ── one notice fanned out to several chats, and rules that judge notices on purpose (agent-efb7407bb5) ───────
+# The hub filed "report_only held 3 replies ... '✔ [default] @default Kanban t_01a1941a27' in 3 chats": one card's
+# done notice reached its 3 subscriber chats (one prompt, not a template), and report_only judges notices on purpose.
+
+NOTICE_HEAD = "✔ [default] @default Kanban t_01a1941a27"
+RELAY_HEAD = "[Message from another Hermes session @"
+
+
+def test_one_notice_held_in_three_chats_is_one_prompt_not_a_template(tmp_path):
+    rows = [{**_tpl_nudge(i, f"s{i}"), "ask_len": 812, "ask_fp": "a1b2c3d4e5"} for i in range(3)]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW)) == []
+
+
+@pytest.mark.parametrize("head", [NOTICE_HEAD, RELAY_HEAD])
+def test_report_only_holds_on_notice_openings_file_nothing(tmp_path, head):
+    """report_only judges Kanban notices and session relays on purpose (reply_check NOTICE_CONTEXT)."""
+    rows = [{**_tpl_nudge(i, f"s{i}", head=head, rule="report_only"), "ask_len": 500 + i, "ask_fp": f"fp{i:08d}"}
+            for i in range(3)]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW)) == []
+
+
+def test_status_only_distinct_closeout_prompts_still_file_one_card(tmp_path):
+    rows = [{**_tpl_nudge(i, f"s{i % 2}"), "ask_len": 400 + i, "ask_fp": f"fp{i:08d}"} for i in range(3)]
+    got = _templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW))
+    assert len(got) == 1 and "3 holds" in got[0]["details"] and "2 chats" in got[0]["details"]
+
+
 # ── provider 5xx whose body is a proxy/CDN HTML page (agent-ee16fb8bb9) ─────────────────────────────────────
 
 def _html_502_record():

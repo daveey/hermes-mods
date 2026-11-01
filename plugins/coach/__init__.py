@@ -756,6 +756,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           "p": hit["p"], "evidence": hit["evidence"], "ask_len": len(ask or ""),
                           # signals.template_holds groups on it: one rule holding the same fixed text in many chats
                           "ask_head": " ".join((ask or "").split())[:40], "platform": platform,
+                          # ...and counts distinct prompts by it: one notice fanned out to N chats is one prompt
+                          "ask_fp": hashlib.sha1((ask or "").encode("utf-8", "replace")).hexdigest()[:10],
                           **({"reason": hit["reason"]} if hit.get("reason") else {}),
                           **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref(),
                           **({"asks": hit["asks"]} if "asks" in hit else {}),  # denied_ask: which cards (agent-5c9b041010)

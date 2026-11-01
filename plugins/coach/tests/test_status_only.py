@@ -5,6 +5,7 @@ verified ready" while the rollout card sat unstarted for 4 days, until the user 
 ASKS and REPLIES are the session's real text (coach digest + the chat read by the investigation card). The tool logs
 are not in the digest; they are rebuilt from what each reply says it did (reopen/unblock, show, comment, cross-gateway
 reads), in the coach's own tool-log line format."""
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -135,6 +136,9 @@ def test_pre_verify_hook_nudges_the_real_turn_once(tmp_path, monkeypatch):
     assert any(r.get("event") == "reply_nudge" and r.get("rule") == "status_only" for r in logged)
     # the row carries the ask's opening text, which the repeated-template detector (signals.py) groups on
     assert [r.get("ask_head") for r in logged if r.get("event") == "reply_nudge"] == ["whya re we waiting for 8h?"]
+    # ...and a hash of the whole ask, so one notice fanned out to N chats counts as one prompt (agent-efb7407bb5)
+    assert [r.get("ask_fp") for r in logged if r.get("event") == "reply_nudge"] == [
+        hashlib.sha1("whya re we waiting for 8h?".encode()).hexdigest()[:10]]
     # the retry (attempt 1) is never nudged again
     assert hooks["pre_verify"](session_id=sid, platform="desktop", attempt=1, final_response=REAL[1][1]) is None
 

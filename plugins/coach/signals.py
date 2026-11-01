@@ -1233,6 +1233,43 @@ TEMPLATE_HOLD_CHATS = 2
 TEMPLATE_HOLD_S = 7 * 86400
 TEMPLATE_HEAD = 40
 _ASKED_RE = re.compile(r'^asked "(.*?)"; ')
+# Rules that judge Hermes-written notices on purpose (report_only reads Kanban notices and session relays with
+# reply_check.NOTICE_CONTEXT, 58f6f810): a notice opening there is the rule working, not firing on a template
+# (agent-efb7407bb5). status_only skips notices (83e86f83), so a notice opening there is still a real bug.
+NOTICE_JUDGING_RULES = {"report_only"}
+_RELAY_HEAD = "[message from another hermes session"
+_rc_mod = None
+
+
+def _reply_check():
+    global _rc_mod
+    if _rc_mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_coach_reply_check_signals", SELF_DIR / "reply_check.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _rc_mod = mod
+    return _rc_mod
+
+
+def _notice_head(head: str) -> bool:
+    """A Hermes-written opening (notice envelope, worker prompt or session relay), judged on the 40-char head."""
+    if head.lower().startswith(_RELAY_HEAD):
+        return True
+    try:
+        return bool(_reply_check().automation_prompt(head))
+    except Exception:  # noqa: BLE001 - a broken sibling must not stop the collector
+        return False
+
+
+def _prompt_id(r: dict, sid: str, at: float) -> str:
+    """Which prompt a hold judged: the row's ask_fp (hash of the whole ask). Older rows: (chat, ask length), or
+    the hold itself when even ask_len is missing. One notice fanned out to N chats shares one ask_fp."""
+    if r.get("ask_fp"):
+        return str(r["ask_fp"])
+    if r.get("ask_len") is not None:
+        return f"{sid}:{r['ask_len']}"
+    return f"{sid}:{at}"
 
 
 def _ask_head(r: dict) -> str:
@@ -1255,7 +1292,9 @@ def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") ->
         at = float(r.get("ts") or now)
         if len(head) < 12 or at <= now - TEMPLATE_HOLD_S:
             continue
-        evs.append({"at": at, "rule": r.get("rule") or "", "head": head, "sid": r.get("session_id") or ""})
+        sid = r.get("session_id") or ""
+        evs.append({"at": at, "rule": r.get("rule") or "", "head": head, "sid": sid,
+                    "fp": _prompt_id(r, sid, at)})
     out = []
     new_keys = {(r.get("rule") or "", _ask_head(r).lower()) for r in nudges}
     groups: Dict[Tuple[str, str], List[dict]] = {}
@@ -1263,9 +1302,13 @@ def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") ->
         groups.setdefault((e["rule"], e["head"].lower()), []).append(e)
     for (rule, _), mine in groups.items():
         head = mine[-1]["head"]
+        if rule in NOTICE_JUDGING_RULES and _notice_head(head):
+            continue  # the rule judges notices on purpose: a notice opening is not a misfire
         chats = sorted({e["sid"] for e in mine if e["sid"]})
+        # distinct prompts, not holds: one notice delivered to N subscriber chats is one prompt
+        prompts = {e.get("fp") or f"{e['sid']}:{e['at']}" for e in mine}
         key = h10(rule, head.lower())
-        if len(mine) < TEMPLATE_HOLD_N or len(chats) < TEMPLATE_HOLD_CHATS:
+        if len(prompts) < TEMPLATE_HOLD_N or len(chats) < TEMPLATE_HOLD_CHATS:
             continue
         if key in filed and (rule, head.lower()) not in new_keys:
             continue  # filed already; only a new hit adds a comment
@@ -1275,8 +1318,10 @@ def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") ->
                                f"\"{head}\" in {len(chats)} chats: the rule is firing on a fixed (automation) prompt",
                     "details": (f"{len(mine)} holds in {len(chats)} chats within {TEMPLATE_HOLD_S // 86400} days "
                                 f"on {host or 'this host'} (coach/log.jsonl reply_nudge, rule={rule}). Opening: "
-                                f"\"{head}\". Chats: {', '.join(chats[:10])}. Check whether the opening is a Hermes-"
-                                f"written prompt the rule should skip (reply_check.notice_turn) or a real pattern."
+                                f"\"{head}\" ({len(prompts)} distinct prompts). Chats: {', '.join(chats[:10])}. "
+                                f"Check whether the opening is a Hermes-written prompt this rule should not judge "
+                                f"(status_only skips reply_check.notice_turn; report_only judges notices on purpose) "
+                                f"or a real pattern."
                                 )[:1500],
                     "fp": fp("agent", "template-hold", rule, head.lower()),
                     "comment_open_card": True})
