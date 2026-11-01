@@ -94,6 +94,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_STATE", str(state))
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
     for k in list(os.environ):
         if k.startswith(("HERMES_SESSION_", "MAC_OPS_")):
             monkeypatch.delenv(k)
@@ -506,6 +507,298 @@ def test_pending_file_is_private_and_old_pinned_copies_are_collected(env):
     call(tn.tool_copy, host="mini", direction="put", remote_path="/tmp/q", local_name="q", content="two",
          reason="second put")
     assert not old.exists() and len(list(d.iterdir())) == 1
+
+
+# ---- workload policy: real broker -> runner subprocess, no target network
+
+POLICY = {"version": 1, "protected_addresses": ["192.0.2.10"],
+          "protected_aliases": ["laptop.example"],
+          "routing_message": "Route portable work to CI; macOS work to a dedicated build Mac."}
+
+
+@pytest.fixture
+def workload(env, tmp_path, monkeypatch):
+    policy = Path.home() / ".hermes" / "tailnet" / "workload-policy.json"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(json.dumps(POLICY))
+    # DNS and key-directory instrumentation are inherited by the real child process.
+    # No DNS query or SSH connection can reach a real machine in this suite.
+    probes = tmp_path / "probes"
+    probes.mkdir()
+    (probes / "sitecustomize.py").write_text('''
+import os, socket, tempfile
+original = tempfile.mkdtemp
+def tracked(*a, **kw):
+    open(os.environ["FAKE_STATE"] + "/key-dir.log", "a").write("created\\n")
+    return original(*a, **kw)
+tempfile.mkdtemp = tracked
+def resolve(host, port, *a, **kw):
+    addresses = {"dns-alias.example": "192.0.2.10", "laptop.example": "192.0.2.10", "ci.example": "192.0.2.20"}
+    if host not in addresses:
+        raise socket.gaierror("test DNS: unknown host")
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addresses[host], port or 0))]
+socket.getaddrinfo = resolve
+''')
+    monkeypatch.setenv("PYTHONPATH", str(probes))
+    env.policy = policy
+    return env
+
+
+def runner_job(env, command="xcodebuild build", addr="192.0.2.10", **extra):
+    return dict(target={"addr": addr, "user": "me"}, mode="exec", command=command,
+                known_hosts=str(env.home / "tailnet" / "known_hosts"), **extra)
+
+
+def direct_runner(env, job, runner=None):
+    import subprocess
+    p = subprocess.run([tn.broker_bin(), "exec", "--scope", "user/tailnet-ssh-key", "--",
+                        sys.executable, str(runner or HERE / "runner.py")],
+                       input=json.dumps(job), text=True, capture_output=True, timeout=15)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+def assert_refused(env, result, reason):
+    assert result["rc"] != 0, result
+    assert reason in result["stderr"], result
+    assert result["ran"] is False
+    assert env.ssh_log() == []
+    assert not (env.state / "key-dir.log").exists()
+
+
+def test_direct_runner_protects_build_before_creating_key(workload):
+    assert_refused(workload, direct_runner(workload, runner_job(workload)), "workload policy")
+
+
+@pytest.mark.parametrize("addr", ["192.0.2.10.", "::ffff:192.0.2.10", "LAPTOP.EXAMPLE.",
+                                  "dns-alias.example", "DNS-ALIAS.EXAMPLE."])
+def test_protected_address_spellings_and_resolution(workload, addr):
+    assert_refused(workload, direct_runner(workload, runner_job(workload, addr=addr)), "workload policy")
+
+
+@pytest.mark.parametrize("raw", ["{", "null", "[]", "{}", json.dumps(dict(POLICY, version=2)),
+                                 json.dumps(dict(POLICY, protected_addresses="192.0.2.10")),
+                                 json.dumps(dict(POLICY, protected_addresses=["not-an-ip"])),
+                                 json.dumps(dict(POLICY, protected_aliases=[""])),
+                                 json.dumps(dict(POLICY, routing_message=""))])
+def test_malformed_policy_fails_closed(workload, raw):
+    workload.policy.write_text(raw)
+    assert_refused(workload, direct_runner(workload, runner_job(workload, command="hostname")),
+                   "invalid workload policy")
+
+
+def test_policy_read_error_fails_closed(workload):
+    workload.policy.unlink()
+    workload.policy.mkdir()
+    assert_refused(workload, direct_runner(workload, runner_job(workload, command="hostname")),
+                   "invalid workload policy")
+
+
+def test_unresolved_target_fails_closed_with_policy(workload):
+    assert_refused(workload, direct_runner(workload, runner_job(workload, addr="unknown.example")),
+                   "cannot resolve target")
+
+
+@pytest.mark.parametrize("addr", ["192.0.2.20", "ci.example"])
+def test_unprotected_ci_build_passes(workload, addr):
+    assert direct_runner(workload, runner_job(workload, addr=addr))["rc"] == 0
+    assert len(workload.ssh_log()) == 1
+    # Pin DNS to the inspected IP; local SSH configuration cannot redirect it.
+    argv = workload.ssh_log()[0]["argv"]
+    assert "me@192.0.2.20" in argv and argv[:2] == ["-F", "/dev/null"]
+
+
+def test_absent_policy_compatible(env):
+    assert direct_runner(env, runner_job(env))["rc"] == 0
+
+
+def test_plugin_entry_uses_canonical_policy_and_reports_no_run(workload):
+    workload.policy.write_text(json.dumps(dict(POLICY, protected_addresses=["100.1.1.1"])))
+    # A profile-local policy cannot replace the canonical machine-wide policy.
+    (workload.home / "tailnet" / "workload-policy.json").write_text("{}")
+    workload.session()
+    result = call(tn.tool_exec, host="mini", command="xcodebuild build", reason="test policy")
+    assert not result["ok"] and not result["ran"]
+    assert POLICY["routing_message"] in result["error"]
+    assert workload.ssh_log() == []
+    assert not (workload.state / "key-dir.log").exists()
+
+
+@pytest.mark.parametrize("command", [
+    "xcodebuild", "xcodebuild -scheme Example", "xcodebuild test", "xcodebuild build-for-testing",
+    "xcodebuild test-without-building", "xcodebuild archive", "xcodebuild -version build",
+    "xcrun --sdk macosx xcodebuild build", "xcrun simctl boot device", "xcrun simctl create name type",
+    "xcrun simctl install booted app", "xcrun simctl bootstatus booted -b",
+    "swift build", "swift test", "swift --package-path pkg build", "cargo build", "cargo test",
+    "cargo +stable build", "cargo b", "cargo t", "cargo build --profile dev",
+    "docker build .", "docker compose build", "pytest", "python -m pytest", "npm test", "uv sync",
+    "bash -lc 'env MAC_HEAVY_OK=1 cargo build'", "env MAC_HEAVY_OK=1 pytest",
+    "nice -n 10 bash -lc 'xcodebuild test'", "hostname; cargo test", "cd repo && swift build",
+])
+def test_protected_heavy_classifiers(workload, command):
+    workload.monkeypatch.setenv("MAC_HEAVY_OK", "1")
+    workload.monkeypatch.setenv("MAC_HEAVY_GUARD", "0")
+    job = runner_job(workload, command=command, workload_policy={}, protected=False, mac_heavy_ok=True)
+    assert_refused(workload, direct_runner(workload, job), "workload policy")
+
+
+@pytest.mark.parametrize("command", [
+    "hostname", "df -h", "du -sh ~/Library/Developer", "rm -rf ~/Library/Developer/Xcode/DerivedData/old",
+    "xcodebuild -version", "xcodebuild -list", "xcodebuild -showBuildSettings", "xcodebuild clean",
+    "xcrun simctl list", "xcrun simctl delete unavailable", "xcrun simctl shutdown all",
+    "env MAC_HEAVY_OK=1 bash -lc 'xcrun simctl list'", "pytest tests/test_one.py", "docker ps",
+    "echo 'cargo build'",
+])
+def test_protected_light_commands_pass(workload, command):
+    assert direct_runner(workload, runner_job(workload, command=command))["rc"] == 0
+    assert len(workload.ssh_log()) == 1
+
+
+def test_protected_classifier_missing_fails_closed(workload, tmp_path):
+    import shutil
+    runner = tmp_path / "isolated" / "tailnet" / "runner.py"
+    runner.parent.mkdir(parents=True)
+    shutil.copyfile(HERE / "runner.py", runner)
+    assert_refused(workload, direct_runner(workload, runner_job(workload, command="hostname"), runner),
+                   "classifier unavailable")
+
+
+def test_unprotected_does_not_need_classifier(workload, tmp_path):
+    import shutil
+    runner = tmp_path / "isolated" / "tailnet" / "runner.py"
+    runner.parent.mkdir(parents=True)
+    shutil.copyfile(HERE / "runner.py", runner)
+    assert direct_runner(workload, runner_job(workload, addr="192.0.2.20"), runner)["rc"] == 0
+
+
+@pytest.mark.parametrize("command", [
+    "rsync -a source/ dest/", "rsync --max-size=1m source/ dest/", "scp file elsewhere:file",
+    "cp small.txt other.txt", "ditto source dest", "tar -xf archive.tar", "tar xzf archive.tgz",
+    "tar --extract --file archive.tar", "bash -lc 'env MAC_HEAVY_OK=1 cp -R src dst'",
+    "unzip archive.zip", "dd if=/dev/zero of=large bs=1m count=4096",
+    "curl -o large https://example.com/large", "wget https://example.com/large",
+    "rclone copy source dest", "sftp other.example", "install large /opt/large",
+])
+def test_unbounded_exec_transfers_redirect(workload, command):
+    assert_refused(workload, direct_runner(workload, runner_job(workload, command=command)), "tailnet_copy")
+
+
+@pytest.mark.parametrize("size,limit,allowed", [(2, 2, True), (3, 2, False),
+                                              (1024**3 - 1, 2 * 1024**3, True),
+                                              (1024**3, 2 * 1024**3, False),
+                                              (2 * 1024**3, 8 * 1024**3, False)])
+def test_protected_put_caps(workload, size, limit, allowed):
+    local = workload.state / "upload"
+    with local.open("wb") as f:
+        f.truncate(size)  # sparse: no multi-GB allocation or transfer
+    job = runner_job(workload)
+    job.update(mode="put", local=str(local), remote="/tmp/upload", max_bytes=limit)
+    result = direct_runner(workload, job)
+    if allowed:
+        assert result["rc"] == 0
+        assert workload.ssh_log()[0]["prog"] == "scp"
+    else:
+        assert_refused(workload, result, "size limit")
+
+
+@pytest.mark.parametrize("limit", [1, 25 * 1024**2, 8 * 1024**3])
+def test_protected_get_refused_without_preflight(workload, limit):
+    job = runner_job(workload)
+    job.update(mode="get", local=str(workload.state / "download"), remote="/tmp/data", max_bytes=limit)
+    assert_refused(workload, direct_runner(workload, job), "remote size")
+
+
+def test_plugin_protected_copy_get_refused(workload):
+    workload.policy.write_text(json.dumps(dict(POLICY, protected_addresses=["100.1.1.1"])))
+    workload.session()
+    result = call(tn.tool_copy, host="mini", direction="get", remote_path="/tmp/data", local_name="data",
+                  reason="test bounded get")
+    assert not result["ran"] and "remote size" in result["error"]
+    assert workload.ssh_log() == []
+
+
+def test_plugin_protected_copy_small_put_passes(workload):
+    workload.policy.write_text(json.dumps(dict(POLICY, protected_addresses=["100.1.1.1"])))
+    workload.session()
+    result = call(tn.tool_copy, host="mini", direction="put", remote_path="/tmp/data", local_name="data",
+                  content="tiny", reason="test bounded put")
+    assert result["ok"] and result["ran"]
+    assert workload.ssh_log()[0]["prog"] == "scp"
+
+
+def test_approved_plugin_workload_refusal_is_not_waiting_for_approval(workload):
+    workload.policy.write_text(json.dumps(dict(POLICY, protected_addresses=["100.1.1.1"])))
+    workload.session(ctype="channel", chat="C0CHAN", user="U0OTHER")
+    rid = call(tn.tool_exec, host="mini", command="cargo build", reason="test policy")["request_id"]
+    (workload.state / f"approved-{rid}").write_text("1")
+    result = call(tn.tool_exec, host="mini", request_id=rid)
+    assert not result["ran"] and "workload policy" in result.get("error", "")
+    assert result.get("status") != "waiting_for_approval"
+    assert workload.ssh_log() == []
+
+
+def test_resolution_used_once_and_pinned(workload):
+    probes = Path(os.environ["PYTHONPATH"])
+    site = probes / "sitecustomize.py"
+    site.write_text(site.read_text() + '''
+resolutions = 0
+def changing_dns(host, port, *a, **kw):
+    global resolutions
+    resolutions += 1
+    ip = "192.0.2.20" if resolutions == 1 else "192.0.2.10"
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+socket.getaddrinfo = changing_dns
+''')
+    assert direct_runner(workload, runner_job(workload, addr="ci.example"))["rc"] == 0
+    assert "me@192.0.2.20" in workload.ssh_log()[0]["argv"]
+
+
+@pytest.mark.parametrize("command", ["cargo build '", "bash -lc \"cargo build '\""])
+def test_unparseable_shell_fails_closed(workload, command):
+    assert_refused(workload, direct_runner(workload, runner_job(workload, command=command)), "cannot classify")
+
+
+def test_classifier_failure_is_closed(workload, tmp_path):
+    import shutil
+    runner = tmp_path / "plugins" / "tailnet" / "runner.py"
+    runner.parent.mkdir(parents=True)
+    shutil.copyfile(HERE / "runner.py", runner)
+    classifier = runner.parent.parent / "mac-heavy-guard" / "guard.py"
+    classifier.parent.mkdir()
+    classifier.write_text("raise RuntimeError('broken classifier')")
+    assert_refused(workload, direct_runner(workload, runner_job(workload, command="hostname"), runner),
+                   "classifier unavailable")
+
+
+@pytest.mark.parametrize("addr", ["LAPTOP.EXAMPLE.", "DNS-ALIAS.EXAMPLE.", "192.0.2.10."])
+def test_protected_light_aliases_pass(workload, addr):
+    assert direct_runner(workload, runner_job(workload, command="hostname", addr=addr))["rc"] == 0
+    assert "me@192.0.2.10" in workload.ssh_log()[0]["argv"]
+
+
+def test_remote_scripts_are_not_read_from_gateway(workload):
+    script = workload.state / "remote-script.sh"
+    script.write_text("cargo build\n")
+    assert direct_runner(workload, runner_job(workload, command=f"bash {script}"))["rc"] == 0
+
+
+def test_policy_applies_if_any_dns_answer_is_protected(workload):
+    site = Path(os.environ["PYTHONPATH"]) / "sitecustomize.py"
+    site.write_text(site.read_text() + '''
+def mixed_dns(host, port, *a, **kw):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))
+            for ip in ("192.0.2.20", "192.0.2.10")]
+socket.getaddrinfo = mixed_dns
+''')
+    assert_refused(workload, direct_runner(workload, runner_job(workload, addr="mixed.example")),
+                   "workload policy")
+
+
+def test_policy_accepts_ipv4_mapped_ipv6_literal(workload):
+    workload.policy.write_text(json.dumps(dict(POLICY, protected_addresses=["::ffff:192.0.2.10"])))
+    result = direct_runner(workload, runner_job(workload, command="hostname"))
+    assert result["rc"] == 0, result
+    assert len(workload.ssh_log()) == 1
 
 
 # ---- registration

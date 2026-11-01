@@ -335,7 +335,7 @@ def run_via_broker(scope: str, reason: str, job: dict, *, request_id: str = "", 
         try:
             out = json.loads(lines[-1])
             if isinstance(out, dict) and "rc" in out:
-                out["ran"] = True
+                out.setdefault("ran", True)
                 return out
         except ValueError:
             pass
@@ -483,7 +483,7 @@ def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, 
                          ran=False)
         # run exactly what was requested, for the requester that asked for it
         res = run_via_broker(inv.approval_scope, p["reason"], p["payload"], request_id=rid, timeout=p["timeout"])
-        if res.get("ran"):
+        if res.get("ran") or res.get("blocked"):
             pending.pop(rid, None)
             _pending_save(pending)
         else:
