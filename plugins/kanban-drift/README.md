@@ -24,4 +24,6 @@ state for restart-safe dedup. Do not enable another consumer for the same target
 
 `scripts/test-all -k kanban-drift` exercises dirty-dirty, dirty-clean-dirty, restart, unavailable,
 closed-card renewal, crash-after-create recovery, command failures and duplicate suppression.
-All card writes use an isolated fake tool sink; tests cannot post live repair alerts.
+All card writes use isolated sinks (including a native-tool integration test with an explicitly
+isolated canonical Kanban path); tests cannot post live repair alerts. Malformed command output
+retains the exit code and bounded stderr diagnostic, while still failing unavailable.

@@ -80,6 +80,7 @@ class Monitor:
 
 
 def collect(argv, timeout=90):
+    result = None
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         report = json.loads(result.stdout)
@@ -89,7 +90,10 @@ def collect(argv, timeout=90):
             raise ValueError("failed command claimed clean")
         return report
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        return {"clean": False, "unavailable": True, "error": str(exc)}
+        report = {"clean": False, "unavailable": True, "error": str(exc)}
+        if result is not None:
+            report.update(exit_code=result.returncode, stderr=result.stderr[-2000:])
+        return report
 
 
 def native_tool(name, args):

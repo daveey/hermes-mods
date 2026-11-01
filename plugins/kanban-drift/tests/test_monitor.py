@@ -141,6 +141,13 @@ def test_main_owner_guard_before_state_write(tmp_path, monkeypatch):
     assert not state.exists()
 
 
+def test_malformed_command_preserves_exit_diagnostic():
+    report = monitor.collect([sys.executable, "-c", "import sys; print('fixture refusal', file=sys.stderr); sys.exit(23)"])
+    assert report["unavailable"]
+    assert report["exit_code"] == 23
+    assert report["stderr"] == "fixture refusal\n"
+
+
 def test_invalid_output_and_unreachable_are_unavailable():
     assert monitor.collect([sys.executable, "-c", "print('not json')"])["unavailable"]
     assert monitor.collect(["/nonexistent/drift-fixture"])["unavailable"]
