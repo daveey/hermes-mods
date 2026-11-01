@@ -18,6 +18,17 @@ import os
 import re
 from typing import Any, Callable, Optional
 
+if __package__:
+    from .reply_check import render_tool_log
+else:  # Standalone plugin/eval loader.
+    import importlib.util
+    from pathlib import Path
+    _spec = importlib.util.spec_from_file_location("_fixloop_reply_check", Path(__file__).with_name("reply_check.py"))
+    assert _spec and _spec.loader
+    _reply_check = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_reply_check)
+    render_tool_log = _reply_check.render_tool_log
+
 PREFILTER_RE = re.compile(
     r"\b(still|again|same (?:error|issue|problem|thing|bug)|didn'?t (?:work|fix|help|change)|doesn'?t (?:work|help)|"
     r"not (?:working|fixed|loading|showing|updating|there)|isn'?t (?:working|fixed|there)|nope|broken|no change|"
@@ -47,9 +58,9 @@ Return ONLY JSON: {"p_failed_fix": p, "issue": "<=8 words naming what is still b
 
 
 def judge_prompt(prev_reply: str, prev_log: list[str], user_text: str) -> str:
-    log = "\n".join(prev_log[-25:]) or "(none recorded)"
+    log = render_tool_log(prev_log[-25:], 3000) if prev_log else "(none recorded)"
     return (f"AGENT'S PREVIOUS FINAL MESSAGE:\n{(prev_reply or '')[-3000:]}\n\n"
-            f"AGENT'S TOOL CALLS IN THAT TURN (truncated):\n{log[:3000]}\n\n"
+            f"AGENT'S TOOL CALLS IN THAT TURN (truncated):\n{log}\n\n"
             f"USER'S NEW MESSAGE:\n{(user_text or '')[:1500]}")
 
 

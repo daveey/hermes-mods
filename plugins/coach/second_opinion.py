@@ -37,6 +37,16 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+if __package__:
+    from .reply_check import render_tool_log
+else:  # Standalone plugin/eval loader.
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("_opinion_reply_check", Path(__file__).with_name("reply_check.py"))
+    assert _spec and _spec.loader
+    _reply_check = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_reply_check)
+    render_tool_log = _reply_check.render_tool_log
+
 _TRUE = ("1", "on", "true", "yes")
 _FALSE = ("0", "off", "false", "no", "")
 
@@ -300,10 +310,10 @@ command or step>"}  (at most 5 findings)"""
 
 
 def review_prompt(ask: str, reply: str, log_lines: list, diffs: dict[str, str]) -> str:
-    log = "\n".join(list(log_lines or [])[-40:]) or "(no tool calls)"
+    log = render_tool_log(list(log_lines or []), 5000) if log_lines else "(no tool calls)"
     d = "\n\n".join(f"### repo {root}\n{txt}" for root, txt in diffs.items())
     return (f"USER'S REQUEST:\n{(ask or '')[:1500]}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}\n\n"
-            f"TOOL LOG (truncated):\n{log[:5000]}\n\nGIT DIFF THIS TURN:\n{d}")
+            f"TOOL LOG (truncated):\n{log}\n\nGIT DIFF THIS TURN:\n{d}")
 
 
 def aux_review(system: str, prompt: str, timeout: float = 120, settings: Optional[dict] = None) -> str:

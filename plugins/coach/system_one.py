@@ -16,6 +16,15 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+if __package__:
+    from .reply_check import render_tool_log
+else:  # Standalone plugin/eval loader.
+    _spec = importlib.util.spec_from_file_location("_screen_reply_check", Path(__file__).with_name("reply_check.py"))
+    assert _spec and _spec.loader
+    _reply_check = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_reply_check)
+    render_tool_log = _reply_check.render_tool_log
+
 SCREENED_RULES = ("handoff", "confirm")   # rules with backtest evidence; unverified/unwatched are never screened
 
 
@@ -70,7 +79,7 @@ FIX_Q = {"failed_fix": {
 
 def fix_state(prev_reply: str, prev_log: list, user_text: str) -> dict:
     return {"agent_previous_final_message": (prev_reply or "")[-3000:],
-            "agent_tool_calls_that_turn": "\n".join((prev_log or [])[-25:])[:3000],
+            "agent_tool_calls_that_turn": render_tool_log((prev_log or [])[-25:], 3000) if prev_log else "",
             "user_new_message": (user_text or "")[:1500]}
 
 
@@ -99,7 +108,7 @@ REPLY_Q = {
 def reply_state(user_ask: str, tool_log: list, reply: str, profile: str = "") -> dict:
     return {"user_environment": (profile or "")[:4000],
             "user_request": (user_ask or "")[:1500],
-            "tool_log": "\n".join((tool_log or [])[-40:])[:5000],
+            "tool_log": render_tool_log(tool_log, 5000) if tool_log else "",
             "agent_final_message": (reply or "")[:4000]}
 
 
