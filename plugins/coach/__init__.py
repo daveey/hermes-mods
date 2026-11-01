@@ -10,6 +10,7 @@ import threading
 import os
 import time
 import sys
+import types
 import uuid
 from pathlib import Path
 
@@ -23,6 +24,29 @@ _OUTCOME_EVENTS = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_s
 # this first checks the log for that record, so a nudge never gets two.
 _NUDGE_LATE_S = 14 * 60
 _HERE = Path(__file__).resolve().parent
+# Process-wide handover of the coach's live per-session state across plugin reloads (see _live_state).
+_LIVE_KEY = "_coach_live_state"
+
+
+def _live_state(root) -> dict:
+    """The live state of the coach registered for this home, shared by every build() of this process.
+
+    hermes-sync's mods-reload force-reloads the plugin in running gateways/serves whenever a coach file changes: the
+    manager purges this package and calls register() again, often in the middle of a turn. A fresh build() used to
+    start from empty sessions (turn counter, ask, tool log, pending nudges, outcome slot), so a nudge the old build
+    had just returned got no delivery and no outcome record, its revision was never judged and the signals sweep
+    filed it as ignored. The state lives under a sys.modules key outside the plugin namespace (the purge leaves it),
+    one entry per resolved coach store root, so two profiles' coaches in one process never share sessions."""
+    reg = sys.modules.get(_LIVE_KEY)
+    if reg is None or not isinstance(getattr(reg, "homes", None), dict):
+        reg = types.ModuleType(_LIVE_KEY)
+        reg.__dict__["homes"] = {}
+        sys.modules[_LIVE_KEY] = reg
+    try:
+        key = str(Path(root).resolve())
+    except OSError:
+        key = str(root)
+    return reg.__dict__["homes"].setdefault(key, {})  # dict.setdefault: atomic under the GIL
 
 
 def _last_assistant(history) -> str:
@@ -57,17 +81,55 @@ def _load(name: str):
     return mod
 
 
-def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, selfheal_confirm="auto"):
+def _adopt(live: dict, coach, rules) -> int:
+    """Point a new build's AgentCoach at the live sessions of the previous build of this process (plugin reload).
+    Fills per-session keys this AgentCoach version creates and the old one did not (agent_rules may have changed in
+    the same reload). Returns the number of nudges carried over still waiting for a record."""
+    sessions = live.setdefault("sessions", coach.sessions)
+    if sessions is coach.sessions:
+        return 0
+    blank = rules.AgentCoach()
+    for sid, s in list(sessions.items()):
+        if isinstance(s, dict):
+            for k, v in blank._s(sid).items():
+                s.setdefault(k, v)
+            if not isinstance(s.get("loop"), dict):
+                s["loop"] = {"fails": []}
+    coach.sessions = sessions
+    open_ids: set = set()
+    for s in list(sessions.values()):  # old in-flight hooks may add sessions during this telemetry scan
+        loop = s.get("loop") if isinstance(s, dict) else {}
+        p = loop.get("pending_nudge") if isinstance(loop, dict) else None
+        if isinstance(p, dict):
+            open_ids.update([p.get("nudge_id") or "legacy"] if "turn" in p else p)
+        o = loop.get("outcome_nudge") if isinstance(loop, dict) else None
+        if isinstance(o, dict):
+            open_ids.add(o.get("nudge_id") or "outcome")
+    return len(open_ids)
+
+
+def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, selfheal_confirm="auto", live=None):
     """The three hook callbacks around one AgentCoach (exposed for tests). `selfheal_sync` runs the self-heal
-    detectors inline (tests); in production they run in a daemon thread so a judge call never delays a turn."""
+    detectors inline (tests); in production they run in a daemon thread so a judge call never delays a turn.
+    `live` (register() passes _live_state(store.root)) carries the per-session coach state across rebuilds of the
+    same process, so a plugin reload mid-turn keeps the turn's open nudges; None = private state (tests)."""
     core, rules = _load("core"), _load("agent_rules")
     store = store or core.Store()
     coach = rules.AgentCoach(checkout if checkout is not None else rules.default_live_checkout(), signals=store)
     goal_gate = _load("goal_disposition").build_gate(store)
+    shared: dict = live if live is not None else {}
+    try:
+        adopted_sessions = len(live.get("sessions") or {}) if live is not None else 0
+        carried = _adopt(shared, coach, rules)
+        if adopted_sessions:
+            store.log({"event": "coach_state_adopted", "sessions": adopted_sessions, "open_nudges": carried})
+    except Exception as exc:  # telemetry/schema faults must not erase the old build's live ownership
+        log.debug("coach live state handover: %s", exc)
+        coach.sessions = shared.setdefault("sessions", coach.sessions)
 
-    authority_users: dict = {}
+    authority_users: dict = shared.setdefault("authority_users", {})
     # session -> dollar totals the user approved by answering a priced ask with a bare yes ("approved").
-    authority_asked: dict = {}
+    authority_asked: dict = shared.setdefault("authority_asked", {})
 
     def pre_llm_call(session_id="", user_message=None, platform="", parent_session_id="", conversation_history=None,
                      **_):
@@ -148,7 +210,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             log.debug("coach transform_tool_result: %s", exc)
             return None
 
-    envelope_told: set = set()  # (session_id, where) already given the compute-envelope note
+    # (session_id, where) already given the compute-envelope note
+    envelope_told: set = shared.setdefault("envelope_told", set())
 
     # ── nudge records: every reply_nudge gets a nudge_id, and exactly one delivery record (reply_nudge_delivered |
     # _undelivered | _abandoned) and one outcome record (reply_nudge_outcome | nudge_outcome_lost |
@@ -304,7 +367,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             pass
         return {"action": "block", "message": rules.block_message(what, coach.checkout)}
 
-    block_held: set = set()  # (session_id, card) whose human-facing block was held once (agent-19492bff76)
+    # (session_id, card) whose human-facing block was held once (agent-19492bff76)
+    block_held: set = shared.setdefault("block_held", set())
 
     def _block_handoff(session_id, tool_name, args):
         """A Kanban ask to the user that the agent could plausibly do itself: hold it ONCE per session and card with
@@ -537,7 +601,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     # session -> coach turn number of its last attempt-0 pre_verify, so post_llm_call can tell a turn the host never
     # handed to the reply check (an error exit, an interrupted turn) from one it checked. Process-local on purpose:
     # pre_verify and post_llm_call of one turn run in the same process.
-    _pv_seen: dict = {}
+    _pv_seen: dict = shared.setdefault("pv_seen", {})  # shared across a reload: the same turn's post_llm_call
 
     def _skipped(session_id, platform, reason, **extra):
         """Log why a turn got no reply check (`reply_skipped`). Cron turns are never checked by design: not logged."""
@@ -841,6 +905,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
 
 def register(ctx) -> None:
-    _, hooks = build()
+    store = _load("core").Store()
+    _, hooks = build(store=store, live=_live_state(store.root))
     for name, fn in hooks.items():
         ctx.register_hook(name.split(":", 1)[0], fn)  # "event:label" = a second callback on the same event

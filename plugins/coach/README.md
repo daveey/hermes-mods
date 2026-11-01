@@ -301,7 +301,12 @@ Every `reply_nudge` (any rule, compute_envelope/compute_authority included) carr
 exactly one delivery record (`reply_nudge_delivered` | `_undelivered` | `_abandoned`) and exactly one outcome record
 (`reply_nudge_outcome` | `nudge_outcome_lost` | `nudge_outcome_untracked` for rules no judge re-checks |
 `nudge_outcome_subagent` | `nudge_outcome_missing`), each carrying that `nudge_id`. A session can hold several open
-nudges at once. Nudges whose backend never checks the session again (exit, reload) are closed by
+nudges at once. A plugin reload (hermes-sync `mods-reload` re-runs `register()` in running gateways/serves) keeps
+them: `register()` hands the process's live per-session coach state (turn counter, ask, tool log, open nudges,
+outcome slot, once-per-session sets) to the new build, one entry per coach home, and logs `coach_state_adopted`
+(`sessions`, `open_nudges`), so a nudge whose continuation runs on the new build is still delivered and judged
+(`tests/test_nudge_reload.py`). Reloads into this version from an older `__init__.py` start fresh once: the old build
+never published its state. Nudges whose backend never checks the session again (process exit) are closed by
 `signals.collect_coach`: at `HANDOFF_GRACE_S` when the turn provably died, else after `NUDGE_OPEN_S` (3 h) with
 `reason: never_rechecked`; a late in-process close after that logs `reply_nudge_record_late` instead of a second
 record. Tests: `tests/test_nudge_records.py`.
