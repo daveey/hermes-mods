@@ -40,8 +40,27 @@ The plugin freezes the text and reads back the producer receipt before recording
 local success. Core's `admitted` means durable queueing, not a completed model
 turn; `routed` uses the existing gateway FIFO with the same identity, `missing`
 is terminal, and `retry` backs off. The plugin does not adopt legacy sessions or
-fabricate authenticated owner transport. Remote-courier completion, real iTerm
-chat/worker acceptance, and deployed-backend verification remain unverified.
+fabricate authenticated owner transport. Remote-courier completion remains
+unverified and is not claimed by this change.
+
+Live acceptance on November 1, 2026 (PST) used real iTerm windows, the existing
+Desktop SSH backend, and two real dispatcher worker runs:
+- The Desktop chat ended its first turn at 11:16:05 before the command was
+  released. One trusted `process_complete` row arrived at 11:16:43, followed by
+  the model's result acknowledgment at 11:16:47 (`ran`, exit code 0).
+- The worker blocked on its exact job. The command finished at 11:16:02;
+  the plugin atomically commented and unblocked it at 11:16:06. A fresh worker
+  reattached that same job and confirmed `ran/0` with the expected output.
+- Both fixture windows were identified in iTerm and closed; the throwaway chat
+  was deleted and the completed fixture card archived.
+- The gateway acknowledged normal plugin rediscovery, and the Desktop backend
+  acknowledged its supported activation endpoint. Neither was force-restarted.
+
+The final installed-core targeted suite passed 116 tests after rebase. The full
+plugin/root suite previously passed 331 tests with one archived-core launcher
+skip; rerunning that closed-ask suite with an explicit watchdog interpreter
+passed all 38 tests without skips. Private task evidence retains the exact
+job/session IDs, admission metadata, event order, and cleanup readbacks.
 
 ## Tests
 
