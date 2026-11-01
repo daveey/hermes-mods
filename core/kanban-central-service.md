@@ -55,7 +55,8 @@ to verify. With one source of truth it is the card's status.
 ### Selective rejection resolution and fleet drift consumer
 
 The rejection-resolution client change is merged in fork PR #499 through `6110db6d1b1`
-(public patches **1488–1492**), but remains staged for fleet rollout (deployment acceptance pending).
+(public patches **1488–1492**). Normal rollout has reached three of four configured gateways;
+final fleet acceptance remains pending the fourth gateway's existing supervision-recovery dependency.
 Core code: `hermes_cli/kanban_sync_rejections.py`, `kanban_sync_client.py` and `kanban_sync_cli.py`.
 Apply through the complete [mirror series](README.md#applying); this is core sync logic, not a plugin.
 Exact-head CI: [required checks](https://github.com/daveey/hermes/actions/runs/41306900906/job/124853534264).
@@ -83,8 +84,12 @@ and durable per-board incident state. Two consecutive dirty samples create one a
 repair card through native tools; subsequent changed reports refresh it. Restart preserves the
 incident key, clean resets the streak, unavailable breaks the streak without clearing the incident,
 and a closed card permits a new incident after two new dirty samples. Target commands, credentials,
-owner gateway, schedule and rollback metadata remain host-local. Deployment is still commissioning;
-legacy laptop soak jobs remain until independent replacement acceptance, not merely publication.
+owner gateway, schedule and rollback metadata remain host-local. The single hub deployment is enabled
+at a 30-minute cadence. A real production-state scheduler tick sampled all four configured gateways
+successfully; unavailable and dirty remain distinct. The formerly rejected inventory read back empty
+with its captured audit events unchanged. Post-rollout per-row classification was reconstructed from
+fresh authoritative evidence and local guards, not presented as uncaptured daemon transaction receipts.
+Legacy laptop soak jobs remain until independent replacement acceptance, not merely publication.
 
 Tests: `tests/hermes_cli/test_kanban_sync_rejections.py` covers normal sync and the CLI dirty-to-clean
 flow, preserved audits, idempotence, lagging replicas, pending creation, service errors, compacted
