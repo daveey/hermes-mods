@@ -62,8 +62,25 @@ still shows junk.
 - *No test/probe cards:* titles/keys that look like tests or probes (`TEST:`, `e2e routing probe`, `SCRATCH`,
   `safe to ignore`, keys like `x-post:TEST3`, `bsky-routing-probe:`) are refused (`JunkPost`), and so is any post
   from a pytest run (or `HERMES_INBOX_TEST=1`) into a real `~/.hermes` / `~/.bb-hermes` home.
-- *Detection:* `junk_audit.py` (daily hub cron `inbox-junk-audit`) reads every gateway's Inbox through
-  `hermes-hub inbox --all --json` and opens one Kanban card per day when junk still got through.
+- *Detection:* `junk_audit.py` (existing daily hub cron) reads `hermes-hub inbox --all --json`.
+  `strict_counts` reports **every** untouched archive, test/status card, and poster missing from shipped
+  `posters.yaml`, plus their union (`junk_items`). Publication drafts are not exempt. Legacy streak/repost
+  diagnostics stay separate; admission's mute threshold is unchanged. `strict_findings` identifies each row.
+  The seven-day scope includes cards created in the window **or** older cards archived in it. Archive freshness
+  uses `resolved_at` within 24 hours, not creation or replica `updated_at`. Unknown decision times are counted
+  as a coverage gap, not guessed fresh. Output states exact bounds, retained-input count, shipped-registry
+  scope (remote extras not observed), and title/key/action scope (body only when supplied).
+  Fresh findings reuse `inbox-junk-audit:<family>:owner`; new evidence is appended once and read back. A done
+  owner's already-recorded evidence is not refiled; genuinely new evidence gets a deduplicated successor.
+  Failed creation, missing IDs/readback, or failed refusal draining reports an error and exits nonzero.
+  `--dry-run` does not file cards, drain refusals, or mutate Inbox history.
+
+Why this is separate: the old audit copied the operational consecutive-archive rule, so accepted rows hid
+scattered archives and single archives never met its threshold. Creation-only freshness also missed delayed
+archives. Existing tests checked muting, not the strict acceptance metric. `tests/test_strict_audit.py` covers
+single/scattered and delayed archives, missing timestamps, test/status/registry union counts, legitimate
+publication/spend/login asks, actual UTC-midnight dedup, active/done owner lifecycles, and filing/drain failures.
+These are isolated fixtures, not permission to inject synthetic cards into a live Inbox.
 Tests: `tests/test_store.py` (streak, reset, sidebar archive, window, re-key), `tests/test_mute_paths.py` (CLI, tool, REST).
 
 **Agent-fixable refusal** (`store.agent_fixable_reason`): before any card exists, a post from an agent-fixable

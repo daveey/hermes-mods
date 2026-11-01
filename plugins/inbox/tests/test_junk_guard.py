@@ -253,12 +253,10 @@ def test_junk_audit_files_one_kanban_card_per_poster_family():
              item(key="x-dm:TEST-1", title="TEST: dm", created_at=now - 3600, state="resolved"),
              item(key="x-dm:TEST-2", title="TEST: dm2", created_at=now - 3600, state="resolved")]
     res = audit.audit(items, now)
-    calls = []
-
-    class P:
-        returncode, stdout, stderr = 0, '{"id": "t_fam"}', ""
-
-    made = audit.file_cards(res, now, runner=lambda argv, **kw: calls.append((argv, kw)) or P())
+    from audit_fixtures import BoardRunner
+    runner = BoardRunner()
+    made = audit.file_cards(res, now, runner=runner)
+    calls = [(a, kw) for a, kw in runner.calls if a[2] == "create"]
     assert sorted(made) == ["gh-actions-billing", "x-dm"]
     keys = [a[a.index("--idempotency-key") + 1] for a, _ in calls]
     assert len(set(keys)) == 2 and all(k.startswith("inbox-junk-audit:") for k in keys)

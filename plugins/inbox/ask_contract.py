@@ -140,6 +140,20 @@ def missing_poster_hint(home, type_name=None):
             f"families allowed to post type {t!r}: {', '.join(fams) or 'none (register one in posters.yaml)'}")
 
 
+def status_reason(row, actions, title="", body=""):
+    """Shared admission/audit status classifier; resolve-typed publication quotes are not notices."""
+    if _SENT_NOTICE.search(title or ""):
+        return "content_status"
+    if any(a.get("kind") == "resolve" for a in actions):
+        if row.get("owner") in AGENT_OWNERS and not row.get("defect_titles"):
+            if _STATUS.search(_QUOTED.sub(" ", title or "")):
+                return "content_status"
+        return None
+    if _STATUS.search(title or "") or _STATUS.search(body or ""):
+        return "content_status"
+    return None
+
+
 def reason(*, home, poster, ask, actions, type_name="default", title="", body="", key="",
            from_human_request=False, **_):
     if _is_test(title) or _is_test(str(key or "")):
@@ -154,20 +168,17 @@ def reason(*, home, poster, ask, actions, type_name="default", title="", body=""
         return "poster_missing_keyed" if family(poster) == "key" else "poster_unregistered"
     if type_name not in row["allowed_types"] and "*" not in row["allowed_types"]:
         return "poster_type_forbidden"
-    if _SENT_NOTICE.search(title or ""):
-        return "content_status"
+    status = status_reason(row, actions, title, body)
+    if status:
+        return status
     if any(a.get("kind") == "resolve" for a in actions):
         # A decision type carries its own ask, but for an agent-owned poster it is no way around the wording
         # backstop: "Detector misses replies" on an engine-budget card is still agent work.
         if row.get("owner") in AGENT_OWNERS and not row.get("defect_titles"):
             own = _QUOTED.sub(" ", title or "")  # quoted third-party text (a reply draft's tweet) is not ours
-            if _STATUS.search(own):
-                return "content_status"
             if _DEFECT.search(own):
                 return "content_defect"
         return None
-    if _STATUS.search(title) or _STATUS.search(body):
-        return "content_status"
     if not ask:
         return "ask_missing"
     if not isinstance(ask, dict) or ask.get("interaction") not in INTERACTIONS:
