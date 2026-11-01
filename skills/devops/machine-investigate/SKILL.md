@@ -1,6 +1,6 @@
 ---
 name: machine-investigate
-description: Use when a machine in the fleet is saturated (high CPU load, RAM, low disk) and you must find out what is doing it, fix what is safe, and ask about the rest. Started by the Runners panel's Investigate button; also usable by hand.
+description: Use when a host is saturated or a job hangs. Find and fix.
 version: 1.0.0
 author: daveey
 license: MIT
@@ -15,6 +15,7 @@ metadata:
 
 You run ON the machine being investigated (the card was placed there). The card body has the panel's numbers
 at click time. Script: `scripts/collect.py` in this skill (stdlib only).
+A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow `references/stuck-jobs.md`.
 
 ## Procedure
 
@@ -54,7 +55,8 @@ at click time. Script: `scripts/collect.py` in this skill (stdlib only).
 Never signal a live Hermes gateway, its launcher/wrapper, or a Desktop serve/dashboard backend,
 including SIGUSR2, SIGQUIT, SIGABRT and SIGKILL. Only signal 0 is a safe existence probe.
 For a stack sample use `sample <pid> 5` on macOS or
-`py-spy dump --nonblocking --pid <pid>` on Linux. Do not substitute a signal if sampling is unavailable.
+`py-spy dump --nonblocking --pid <pid>` on Linux, under `sudo -n` for a process that isn't your descendant (Yama
+ptrace_scope refuses it otherwise). Do not substitute a signal if sampling is unavailable.
 For a gateway restart use
 `python3 ~/.hermes/sync-runner/hermes-sync pause-turns --timeout 180 -- hermes gateway restart`.
 The backend-restart-guard enforces recognized literal signal commands on both Hermes and Claude Bash;
