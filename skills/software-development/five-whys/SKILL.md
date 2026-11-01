@@ -322,6 +322,7 @@ Countermeasures:
   file). The next sync silently reverts the fix. Before editing, check what syncs into the file (rsync jobs, mtimes
   with whole-second precision, a "mirror" note). Land the fix at the source, or hand it to whoever owns the source.
   Report it as not done until it's there.
+- For execute_code traceback alerts, recover the complete decoded tool envelope and originating cell before grouping incidents. Bundled Python lives under `.hermes/tools/python-*/lib`, so a generic `/tools/` frame match misattributes stdlib failures to Hermes; executor frames above `<cell>` likewise do not prove a core defect. Test raw, dict, JSON and guidance-suffixed envelopes, qualified exception tails, genuine core calls below the cell boundary, and successful cells quoting historical tracebacks. Replay stored results into an isolated sink, not the live defect ledger.
 - Closing a "not a bug" verdict with no why-chain. If the same false alarm keeps getting filed, the filer, tagger or
   classifier is the bug.
 
