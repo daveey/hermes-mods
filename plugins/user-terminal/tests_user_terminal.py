@@ -991,7 +991,7 @@ def _watch(job: Path, secs: float = 3.0, env: dict | None = None) -> None:
                    timeout=secs + 20, capture_output=True)
 
 
-def _board(tmp_path: Path, status="blocked", run=None) -> Path:
+def _board(tmp_path: Path, status="blocked", run=None, run_started_ago=None) -> Path:
     import sqlite3
     db = tmp_path / "kanban.db"
     con = sqlite3.connect(db)
@@ -999,6 +999,11 @@ def _board(tmp_path: Path, status="blocked", run=None) -> Path:
     con.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
                 "payload TEXT, created_at INTEGER)")
     con.execute("INSERT INTO tasks VALUES ('t_card', ?, ?)", (status, run))
+    if run_started_ago is not None:  # the card's current run, as core's task_runs records it
+        con.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, status TEXT NOT NULL, "
+                    "started_at INTEGER NOT NULL, ended_at INTEGER, outcome TEXT)")
+        con.execute("INSERT INTO task_runs (id, task_id, status, started_at) VALUES (?, 't_card', 'running', ?)",
+                    (run, int(time.time() - run_started_ago)))
     con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'blocked', ?)",
                 (int(time.time()) - 600,))
     con.commit()
@@ -1114,8 +1119,10 @@ def test_watchdog_keeps_same_blocked_run_then_withdraws_on_unblock(tmp_path, mon
     _watch(job, 1.5)
     assert ut.read_status(job)["status"] == "waiting_for_user"  # still blocked, same run: kept
     con = sqlite3.connect(db)
+    # Contract amended (reattach grace): an unblock starts a re-attach grace (default 10 min); only once it has
+    # passed with no run re-attaching is the prompt withdrawn (tests/test_reattach_grace.py covers the grace).
     con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'unblocked', ?)",
-                (int(time.time()),))
+                (int(time.time()) - 11 * 60,))
     con.execute("UPDATE tasks SET status='ready'")
     con.commit()
     con.close()
@@ -1126,7 +1133,9 @@ def test_watchdog_keeps_same_blocked_run_then_withdraws_on_unblock(tmp_path, mon
 
 @pytest.mark.parametrize("status,run", [("done", None), ("archived", None), ("running", 9)])
 def test_watchdog_withdraws_when_card_finished_or_newer_run(tmp_path, monkeypatch, status, run):
-    db = _board(tmp_path, status, run)
+    # Contract amended (reattach grace): a newer run withdraws once it has run past the 10 min re-attach grace
+    # without re-attaching; done/archived stay immediate.
+    db = _board(tmp_path, status, run, run_started_ago=11 * 60 if run else None)
     job = _owned_job(tmp_path, monkeypatch, db)
     _watch(job, 3)
     assert ut.wait_for(job, 0)["status"] == "withdrawn"
@@ -1627,8 +1636,10 @@ def test_unblock_in_same_second_before_request_keeps_prompt(tmp_path, monkeypatc
     assert isinstance(meta.get("board_event_cursor"), int)
     assert ut.watch_once(job, {}) is None
     con = sqlite3.connect(db)
+    # Contract amended (reattach grace): the unblock written after the request withdraws once the 10 min grace
+    # has passed. Its timestamp is older than the one above, so only the event cursor tells them apart.
     con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'unblocked', ?)",
-                (int(time.time()),))
+                (int(time.time()) - 11 * 60,))
     con.commit()
     con.close()
     st = ut.watch_once(job, {})
@@ -1638,15 +1649,21 @@ def test_unblock_in_same_second_before_request_keeps_prompt(tmp_path, monkeypatc
 def test_legacy_owner_without_cursor_keeps_timestamp_fallback(tmp_path):
     import sqlite3
     db = _board(tmp_path, "blocked", None)
-    created = time.time() - 60
+    created = time.time() - 20 * 60
     owner = {"kind": "card", "task_id": "t_card", "db": str(db)}
     assert ut._board_check(owner, created) is None
     con = sqlite3.connect(db)
     con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'unblocked', ?)",
-                (int(time.time()),))
+                (int(created) - 5,))  # before the request: never counts
+    con.commit()
+    assert ut._board_check(owner, created) is None
+    # Contract amended (reattach grace): an unblock after the request withdraws once the 10 min grace has passed.
+    con.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_card', 'unblocked', ?)",
+                (int(time.time()) - 11 * 60,))
     con.commit()
     con.close()
-    assert ut._board_check(owner, created) == "card t_card was unblocked after this request"
+    why = ut._board_check(owner, created)
+    assert why and why.startswith("card t_card was unblocked") and "grace" in why
 
 
 def test_identity_recorded_by_pre_fix_runner_still_verifies(tmp_path, monkeypatch, victim):

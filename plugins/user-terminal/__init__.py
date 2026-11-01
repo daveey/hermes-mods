@@ -36,6 +36,7 @@ Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
               means a later id; jobs without it fall back to created_at >= the creation second).
               create_job() records the owner itself.
   owner.json  legacy sidecar of the owner ({kind: kanban, task, run_id, board, db}); read only when meta has none
+  attachment.json  the owning card's run that re-attached (see Owned prompts); attachment.lock guards its writes
   runners     one line per runner: "pid lstart" (its identity; ps run with LC_ALL=C TZ=UTC on both sides so a
               window's locale/zone cannot make a live runner look dead). Signals go only to a pid whose current
               start time matches; a pid with no recorded identity (legacy job) is never signalled.
@@ -51,9 +52,17 @@ Owned prompts: each job gets one detached job-local watchdog (this file run with
 bounded to max age + 2 min). handle() spawns it and runner.sh starts it (and waits for it) before the command,
 so a job made by create_job() directly is covered too; watchdog.lock keeps it to one per job. Every
 run_in_user_terminal call (new or resume) also sweeps non-final jobs, so old jobs without a watchdog are
-reconciled: no window after LAUNCH_GRACE_S -> start gate fenced, then abandoned (nothing ran). It withdraws the job when the owning card is done/archived, got an ``unblocked``
-event after the job was created, or has a newer current_run_id (board sqlite opened mode=ro + query_only; a
-card still blocked on the same run keeps its prompt); when it is older than ``user_terminal.max_wait_minutes``
+reconciled: no window after LAUNCH_GRACE_S -> start gate fenced, then abandoned (nothing ran). It withdraws the job
+at once when the owning card is done/archived or a run later than the acknowledged one ended without re-attaching
+(task_runs.ended_at; board sqlite opened mode=ro + query_only; a card still blocked on the same run keeps its
+prompt). An ``unblocked`` event after the acknowledged event cursor, or a later run still going, starts the re-attach
+grace ``user_terminal.reattach_grace_minutes`` (default 10, env HERMES_USER_TERMINAL_REATTACH_GRACE_MINUTES; resolved
+at creation into meta.json), measured from the earliest such board event so polls never extend it; past it the job
+is withdrawn. The owning card's current live run re-attaches with run_in_user_terminal(job_id=...): before any
+sweep/check, attach_job() writes JOB/attachment.json ({task_id, board_db, run_id, event_cursor, attached_at}; tmp +
+rename under the attachment.lock mkdir lock; meta.json's original owner never changes), which moves the acknowledged
+run/cursor forward. Other cards, other boards and stale or ended runs cannot attach. It also withdraws a job
+when it is older than ``user_terminal.max_wait_minutes``
 (default 120, env HERMES_USER_TERMINAL_MAX_WAIT_MINUTES; finite and > 0, else 120; reason "expired after N min;
 ask again if still needed"); or on ``action: withdraw`` (job_id, reason). Withdrawal
 kills the command's process group (e.g. a sudo waiting for its password), keeps the window's TTY, records
@@ -104,6 +113,7 @@ log = logging.getLogger("user_terminal")
 WATCH_INTERVAL_S = 15.0
 LAUNCH_GRACE_S = 90.0  # >= 3 openers x OSA_TIMEOUT (20 s) + open grace: a window that never started by then never will
 DEFAULT_MAX_WAIT_MIN = 120.0
+DEFAULT_REATTACH_GRACE_MIN = 10.0
 
 
 def _home() -> Path:
@@ -132,8 +142,11 @@ SCHEMA = {
         "the user to copy/paste a command; call this instead. The window shows `reason`, `cwd` and the "
         "exact `command`, runs it right away (no y/N step; the user can Ctrl-C it), and this tool returns status "
         "(ran/declined/pending/withdrawn/abandoned), exit_code and the output. Jobs expire after "
-        "user_terminal.max_wait_minutes (default 120), including running commands. Use action=withdraw "
-        "with job_id and reason when changing course. The user can type into the window if the "
+        "user_terminal.max_wait_minutes (default 120), including running commands. If a request is no longer "
+        "needed, withdraw it immediately: action=withdraw with job_id and reason. A Kanban card's request "
+        "survives the card being unblocked or moving to a new run for user_terminal.reattach_grace_minutes "
+        "(default 10): the resumed run re-attaches by calling again with the job_id (put it in the block "
+        "reason); otherwise it is withdrawn. The user can type into the window if the "
         "command prompts. If it is still pending after `wait_s`, call again with only `job_id` to keep waiting."
     ),
     "parameters": {
@@ -621,7 +634,8 @@ def create_job(command: str, reason: str, cwd: str, origin: dict | None = None,
                                                 "origin": origin if full else None, "created": time.time(),
                                                 "owner": owner, "board_db": board_db,
                                                 "board_event_cursor": cursor,
-                                                "max_wait_minutes": max_wait_minutes()}))
+                                                "max_wait_minutes": max_wait_minutes(),
+                                                "reattach_grace_minutes": reattach_grace_minutes()}))
     (job / "owner.json").write_text(json.dumps(_legacy_owner(owner, board_db)))
     return job
 
@@ -889,6 +903,28 @@ def max_wait_minutes() -> float:
     return f
 
 
+def reattach_grace_minutes() -> float:
+    """How long a card-owned request survives the card being unblocked or moving to a new run without that run
+    re-attaching (``user_terminal.reattach_grace_minutes``, env HERMES_USER_TERMINAL_REATTACH_GRACE_MINUTES;
+    finite and > 0, else 10)."""
+    v: Any = os.environ.get("HERMES_USER_TERMINAL_REATTACH_GRACE_MINUTES", "")
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+
+        c = ((load_config() or {}).get("user_terminal") or {}).get("reattach_grace_minutes")
+        if c is not None and str(c).strip():
+            v = c
+    except Exception:
+        pass
+    f = _valid_minutes(v)
+    if f is None:
+        if str(v).strip():
+            log.warning("user_terminal.reattach_grace_minutes=%r is not a finite positive number; using %g", v,
+                        DEFAULT_REATTACH_GRACE_MIN)
+        return DEFAULT_REATTACH_GRACE_MIN
+    return f
+
+
 def expiry_reason(minutes: float) -> str:
     return f"expired after {minutes:g} min; ask again if still needed"
 
@@ -933,9 +969,23 @@ def board_event_cursor(db: str | None) -> int | None:
             con.close()
 
 
-def _board_check(owner: dict, created: float) -> str | None:
+def _has_table(con, name: str) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _as_int(v: Any) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _board_check(owner: dict, created: float, attachment: dict | None = None,
+                 grace_minutes: float | None = None, now: float | None = None) -> str | None:
     """Reason the owning card no longer wants this prompt, or None. Read-only (_ro_connect: mode=ro, else
-    mode=rw + query_only); an unreadable board is logged, never written to."""
+    mode=rw + query_only); an unreadable board is logged, never written to.
+
+    Immediate: the card is done/completed/archived, or a run later than the acknowledged one (the attached run,
+    else the creating run) has ENDED without re-attaching. Grace: an unblock after the acknowledged event cursor
+    (the attachment's, else the one taken at creation) or a later run that is still going starts the re-attach
+    grace, measured from the EARLIEST such board event, so polls can never extend it; past it -> withdrawn."""
     import sqlite3
 
     task, db = owner.get("task_id") or owner.get("task"), owner.get("db")
@@ -944,6 +994,9 @@ def _board_check(owner: dict, created: float) -> str | None:
     if not Path(db).exists():
         log.warning("user_terminal: board db %s for card %s does not exist", db, task)
         return None
+    att = attachment or {}
+    grace = _valid_minutes(grace_minutes) or reattach_grace_minutes()
+    now = time.time() if now is None else now
     con = None
     try:
         con = _ro_connect(db)
@@ -953,18 +1006,40 @@ def _board_check(owner: dict, created: float) -> str | None:
         status, cur = row
         if status in ("done", "completed", "archived"):
             return f"card {task} is {status}"
-        cursor = owner.get("event_cursor")
-        if isinstance(cursor, int) and not isinstance(cursor, bool):  # exact: events written after the request
-            ev = con.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='unblocked' AND id>? LIMIT 1",
+        pending: list[tuple[float, str]] = []  # (board time it started, reason once the grace is over)
+        cursor = _as_int(att.get("event_cursor")) if att else _as_int(owner.get("event_cursor"))
+        if cursor is not None:  # exact: events written after the request / the last attach
+            ev = con.execute("SELECT MIN(created_at) FROM task_events WHERE task_id=? AND kind='unblocked' AND id>?",
                              (task, cursor)).fetchone()
         else:  # jobs from before the cursor: whole-second timestamp (an unblock in the same second counts)
-            ev = con.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='unblocked' AND created_at>=? "
-                             "LIMIT 1", (task, int(created))).fetchone()
-        if ev:
-            return f"card {task} was unblocked after this request"
-        mine = owner.get("run_id")
-        if mine is not None and cur is not None and int(cur) > int(mine):
-            return f"card {task} moved on to a newer run ({cur})"
+            ev = con.execute("SELECT MIN(created_at) FROM task_events WHERE task_id=? AND kind='unblocked' AND "
+                             "created_at>=?", (task, int(created))).fetchone()
+        if ev and ev[0] is not None:
+            pending.append((float(ev[0]), f"card {task} was unblocked"))
+        mine = _as_int(att.get("run_id")) if att else None
+        if mine is None:
+            mine = owner.get("run_id")
+            mine = int(mine) if isinstance(mine, (int, str)) and str(mine).isdigit() else None
+        if mine is not None:
+            if _has_table(con, "task_runs"):
+                for rid, started, ended, outcome in con.execute(
+                        "SELECT id, started_at, ended_at, outcome FROM task_runs WHERE task_id=? AND id>? ORDER BY id",
+                        (task, mine)).fetchall():
+                    if ended is not None:
+                        return (f"card {task}'s later run {rid} ended ({outcome or 'no outcome'}) without "
+                                f"re-attaching to this request")
+                    pending.append((float(started if started is not None else created),
+                                    f"card {task} moved on to a newer run ({rid})"))
+            elif cur is not None and int(cur) > mine:  # a board without task_runs: the run's first event
+                ev = con.execute("SELECT MIN(created_at) FROM task_events WHERE task_id=? AND run_id=?",
+                                 (task, int(cur))).fetchone()
+                start = float(ev[0]) if ev and ev[0] is not None else created
+                pending.append((start, f"card {task} moved on to a newer run ({cur})"))
+        if pending:
+            start, what = min(pending)
+            if now - start >= grace * 60:
+                return (f"{what} {max(0.0, (now - start) / 60):.0f} min ago and no run re-attached to this "
+                        f"request within the {grace:g} min grace")
         return None
     except sqlite3.Error as e:
         log.warning("user_terminal: could not read board db %s for card %s: %s", db, task, e)
@@ -993,6 +1068,153 @@ def _job_meta_owner(job: Path) -> tuple[dict, dict]:
         if owner.get("kind") == "kanban":
             owner = {**owner, "kind": "card", "task_id": owner.get("task")}
     return meta, owner if isinstance(owner, dict) else {}
+
+
+ATTACH_LOCK_WAIT_S = 3.0
+
+
+def _same_db(a: Any, b: Any) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return os.path.realpath(str(a)) == os.path.realpath(str(b))
+    except (OSError, ValueError):
+        return False
+
+
+def read_attachment(job: Path, owner: dict | None = None) -> dict | None:
+    """The job's attachment sidecar (JOB/attachment.json: the run of the OWNING card that re-attached with
+    run_in_user_terminal(job_id=...) and the board event cursor at that moment). A record naming another card or
+    board is ignored: only attach_job() writes it, and only after authenticating the caller."""
+    try:
+        att = json.loads((job / "attachment.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(att, dict) or _as_int(att.get("run_id")) is None:
+        return None
+    if owner is None:
+        _, owner = _job_meta_owner(job)
+    task = owner.get("task_id") or owner.get("task")
+    if not task or att.get("task_id") != task or not _same_db(att.get("board_db"), owner.get("db")):
+        log.warning("user_terminal: ignoring attachment of %s: it names another card or board", job.name)
+        return None
+    return att
+
+
+def _attach_lock(job: Path) -> bool:
+    """attachment.lock: atomic mkdir, owner "pid lstart" (the watchdog.lock convention). A lock whose owner is
+    gone is stale and broken; a live holder is waited for up to ATTACH_LOCK_WAIT_S."""
+    lock = job / "attachment.lock"
+    me = f"{os.getpid()} {_proc_start(os.getpid())}"
+    deadline = time.time() + ATTACH_LOCK_WAIT_S
+    import fcntl
+
+    while True:
+        # A stable guard inode serializes stale-owner inspection with replacement. Without it,
+        # two contenders can both inspect the dead owner and the second steals the first's new lock.
+        with (job / "attachment.guard").open("a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            try:
+                lock.mkdir()
+                (lock / "owner").write_text(me + "\n")
+                return True
+            except FileExistsError:
+                pass
+            try:
+                ident = _parse_ident((lock / "owner").read_text().strip())
+            except OSError:
+                ident = None
+            stale = False
+            if ident is None:
+                try:
+                    stale = time.time() - lock.stat().st_mtime >= 5
+                except OSError:
+                    continue
+            elif ident[0] != os.getpid() and not _same_process(*ident):
+                stale = True
+            if stale:
+                shutil.rmtree(lock)
+                continue
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
+def _attach_unlock(job: Path) -> None:
+    import fcntl
+
+    with (job / "attachment.guard").open("a") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        shutil.rmtree(job / "attachment.lock")
+
+
+def attach_job(job: Path, session_id: str | None = None) -> dict:
+    """Re-attach a card-owned job to the caller's run: run_in_user_terminal(job_id=...) calls this BEFORE any sweep
+    or check, so a resumed run never withdraws its own request. Only the owning card's current, live run on the
+    same board db may attach (worker env HERMES_KANBAN_TASK/RUN_ID + the board db the caller resolves); the
+    original owner in meta.json is never changed. Records JOB/attachment.json (tmp + rename, under
+    attachment.lock): {task_id, board_db, run_id, event_cursor, attached_at}. {} when the job is not card-owned or
+    already final; else {"attached": bool, ...} with "why" when refused."""
+    import sqlite3
+
+    if not job.is_dir() or (job / "final.lock").exists() or read_status(job).get("status") in FINAL:
+        return {}
+    meta, owner = _job_meta_owner(job)
+    if owner.get("kind") != "card":
+        return {}
+    task, db = owner.get("task_id") or owner.get("task"), owner.get("db")
+    caller = job_owner(session_id)
+
+    def no(why: str) -> dict:
+        return {"attached": False, "why": why}
+    if caller.get("task_id") != task:  # a chat session (kind "session") has no task_id
+        who = f"card {caller.get('task_id')}" if caller.get("kind") == "card" else "a caller that is not a Kanban worker"
+        return no(f"this request belongs to card {task}; {who} cannot re-attach it")
+    run = _as_int(caller.get("run_id"))
+    if run is None:
+        return no("the caller has no HERMES_KANBAN_RUN_ID")
+    if not db or not _same_db(board_db_path(str(caller.get("board") or "default")), db):
+        return no(f"the caller's board is not the board of card {task}")
+    if not Path(str(db)).exists():
+        return no(f"board db {db} does not exist")
+    con = None
+    try:
+        con = _ro_connect(db)
+        row = con.execute("SELECT status, current_run_id FROM tasks WHERE id=?", (task,)).fetchone()
+        if not row:
+            return no(f"card {task} is not on its board")
+        if row[1] is None or int(row[1]) != run:
+            return no(f"run {run} is not the current run of card {task} (current: {row[1]})")
+        if _has_table(con, "task_runs"):
+            r = con.execute("SELECT task_id, ended_at FROM task_runs WHERE id=?", (run,)).fetchone()
+            if not r or r[0] != task or r[1] is not None:
+                return no(f"run {run} is not a live run of card {task}")
+        cursor = int(con.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        log.warning("user_terminal: attach of %s could not read board db %s: %s", job.name, db, e)
+        return no(f"could not read the board: {e}")
+    finally:
+        if con is not None:
+            con.close()
+    if not _attach_lock(job):
+        return no("another attach of this job is in progress")
+    try:
+        prev = read_attachment(job, owner)
+        created = float(meta.get("created") or time.time())
+        why = _board_check(owner, created, prev, meta.get("reattach_grace_minutes"))
+        if why:  # already over (done, a later run ended, or the grace ran out): attaching cannot revive it
+            return no(why)
+        if prev and int(prev["run_id"]) > run:
+            return no(f"run {prev['run_id']} of card {task} is already attached")
+        if prev and int(prev["run_id"]) == run:
+            cursor = max(cursor, _as_int(prev.get("event_cursor")) or 0)
+        rec = {"task_id": task, "board_db": db, "run_id": run, "event_cursor": cursor, "attached_at": time.time()}
+        tmp = job / f".attachment.{uuid.uuid4().hex[:8]}.tmp"
+        tmp.write_text(json.dumps(rec))
+        os.replace(tmp, job / "attachment.json")
+        return {"attached": True, "run_id": run, "event_cursor": cursor}
+    finally:
+        _attach_unlock(job)
 
 
 def _fence_abandon(job: Path, why: str) -> dict | None:
@@ -1058,9 +1280,16 @@ def watch_once(job: Path, seen: dict) -> dict | None:
     if _runner_gone(job, st, seen, legacy):
         return mark_abandoned(job, "the terminal window closed before the command finished")
     if owner.get("kind") == "card":
-        why = _board_check(owner, created)
-        if why:
-            return withdraw_job(job, why)
+        # Serialize the board decision with attachment publication: a stale sidecar read must
+        # never withdraw a job whose resumed owner attached before the grace deadline.
+        if not _attach_lock(job):
+            return None
+        try:
+            why = _board_check(owner, created, read_attachment(job, owner), meta.get("reattach_grace_minutes"))
+            if why:
+                return withdraw_job(job, why)
+        finally:
+            _attach_unlock(job)
     limit = _valid_minutes(meta.get("max_wait_minutes")) or max_wait_minutes()
     if age > limit * 60:
         return withdraw_job(job, expiry_reason(limit))
@@ -1219,6 +1448,21 @@ def _reconcile(job: Path) -> None:
         log.exception("user_terminal: reconciling %s failed", job)
 
 
+def _card_note(job: Path) -> str:
+    """Blocked-ask guidance for a card-owned pending request."""
+    try:
+        meta, owner = _job_meta_owner(job)
+    except ValueError:
+        return ""
+    if owner.get("kind") != "card":
+        return ""
+    grace = _valid_minutes(meta.get("reattach_grace_minutes")) or reattach_grace_minutes()
+    return (f"If card {owner.get('task_id') or owner.get('task')} blocks to wait for the user, put this job_id in "
+            f"the block reason: once the card is unblocked or a new run starts, that run must re-attach by calling "
+            f"run_in_user_terminal with this job_id within {grace:g} min (user_terminal.reattach_grace_minutes), "
+            f"or the request is withdrawn; a later run that ends without re-attaching withdraws it at once.")
+
+
 def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
     """Wait for a final status. reconcile=True (poll/resume) also runs a watchdog pass now and every
     WATCH_INTERVAL_S, so a job whose watchdog never started (or died) still ends."""
@@ -1256,7 +1500,11 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
     elif st.get("status") not in ("ran", "declined"):
         result["status"] = "pending" if st.get("status") != "running" else "running"
         result["note"] = ("Still waiting (user hasn't answered, or the command is still running). Call "
-                          "run_in_user_terminal with this job_id to keep waiting.")
+                          "run_in_user_terminal with this job_id to keep waiting. If it is no longer needed, "
+                          "withdraw it immediately (action=withdraw, this job_id, a reason).")
+        card_note = _card_note(job)
+        if card_note:
+            result["note"] += " " + card_note
     log = job / "output.log"
     if log.exists():
         out = clean_output(log.read_text(errors="replace"))
@@ -1270,8 +1518,14 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
 
 def handle(args: dict, session_id: str | None = None, **_kw: Any) -> str:
     try:
+        attached: dict = {}
+        withdraw = str(args.get("action") or "").strip().lower() == "withdraw"
+        resume_id = str(args.get("job_id") or "").strip()
+        if resume_id and not withdraw and (jobs_dir() / Path(resume_id).name).is_dir():
+            # before the sweep and the job's own check: a resumed owning run never withdraws its own request
+            attached = attach_job(jobs_dir() / Path(resume_id).name, session_id)
         sweep_jobs(skip=jobs_dir() / Path(str(args.get("job_id") or "x")).name)
-        if str(args.get("action") or "").strip().lower() == "withdraw":
+        if withdraw:
             job_id = str(args.get("job_id") or "").strip()
             job = jobs_dir() / Path(job_id).name
             if not job_id or not job.is_dir():
@@ -1285,7 +1539,10 @@ def handle(args: dict, session_id: str | None = None, **_kw: Any) -> str:
             job = jobs_dir() / Path(job_id).name
             if not job.is_dir():
                 return _err(f"unknown job_id {job_id}")
-            return json.dumps(wait_for(job, wait_s, reconcile=True))
+            res = wait_for(job, wait_s, reconcile=True)
+            if attached:
+                res["attachment"] = attached
+            return json.dumps(res)
         command = str(args.get("command") or "").strip()
         if not command:
             return _err("command is required (or job_id to resume waiting)")
