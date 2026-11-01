@@ -1,0 +1,86 @@
+From 1428a74978f00f7a1738d21f4748dbdb45f48c29 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 04:55:25 -0700
+Subject: [PATCH] fix(kanban): reuse materialized row metadata in sync repair
+ [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              |  9 ++--
+ .../hermes_cli/test_kanban_sync_row_fields.py | 44 +++++++++++++++++++
+ 2 files changed, 50 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_row_fields.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index b284864eb17..f6488f6be4d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -843,10 +843,13 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+ 
+ def _row_fields(conn: sqlite3.Connection, table: str, row: sqlite3.Row) -> dict:
+     out: dict[str, Any] = {}
+-    for column in sync.captured_columns(conn, table):
+-        if column not in sync.SYNCED_COLUMNS[table]:
++    # Every caller already materialized SELECT *: the row carries its schema.
++    # Re-reading table_info here issued thousands of PRAGMAs per idle repair round.
++    skip = sync.LOCAL_COLUMNS[table] | sync.KEY_COLUMNS[table] | sync.SERVER_COLUMNS.get(table, frozenset())
++    allowed = sync.SYNCED_COLUMNS[table] - skip
++    for column, value in zip(row.keys(), row):
++        if column not in allowed:
+             continue
+-        value = row[column]
+         if (table, column) in sync.REF_COLUMNS:
+             ref = conn.execute("SELECT uid FROM task_runs WHERE id = ?", (value,)).fetchone() if value is not None else None
+             value = ref[0] if ref else None
+diff --git a/tests/hermes_cli/test_kanban_sync_row_fields.py b/tests/hermes_cli/test_kanban_sync_row_fields.py
+new file mode 100644
+index 00000000000..77724eaf357
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_row_fields.py
+@@ -0,0 +1,44 @@
++"""A sync round must not rediscover the schema for every already-materialized row."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++
++
++def test_row_fields_reuses_row_metadata_without_sql():
++    with sqlite3.connect(":memory:") as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute("CREATE TABLE tasks (id, title, body, worker_pid, created_on, future_field)")
++        conn.executemany("INSERT INTO tasks VALUES (?, 'title', ?, 12, 'gw', 'private')",
++                         [(str(i), b"body") for i in range(100)])
++        rows = conn.execute("SELECT * FROM tasks").fetchall()
++        statements = []
++        conn.set_trace_callback(statements.append)
++        for row in rows:
++            assert client._row_fields(conn, "tasks", row) == {"title": "title", "body": {"$blob": "626f6479"}}
++        assert statements == []
++        # No process-global schema cache may hide newly present synced columns.
++        conn.execute("ALTER TABLE tasks ADD COLUMN status DEFAULT 'ready'")
++        row = conn.execute("SELECT * FROM tasks LIMIT 1").fetchone()
++        statements.clear()
++        assert client._row_fields(conn, "tasks", row)["status"] == "ready"
++        assert statements == []
++
++
++@pytest.mark.parametrize("table,ref,wire", [("tasks", "current_run_id", "current_run_uid"),
++                                           ("task_events", "run_id", "run_uid")])
++@pytest.mark.parametrize("value,expected", [(1, "run-one"), (2, None), (None, None)])
++def test_row_fields_keeps_reference_resolution(table, ref, wire, value, expected):
++    with sqlite3.connect(":memory:") as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute("CREATE TABLE task_runs (id, uid)")
++        conn.execute("INSERT INTO task_runs VALUES (1, 'run-one')")
++        conn.execute(f"CREATE TABLE {table} (id, {ref})")
++        conn.execute(f"INSERT INTO {table} VALUES ('row-one', ?)", (value,))
++        row = conn.execute(f"SELECT * FROM {table}").fetchone()
++        statements = []
++        conn.set_trace_callback(statements.append)
++        assert client._row_fields(conn, table, row) == {wire: expected}
++        assert len(statements) == (0 if value is None else 1)
++        assert all(s.startswith("SELECT uid FROM task_runs") for s in statements)
+-- 
+2.55.0
+

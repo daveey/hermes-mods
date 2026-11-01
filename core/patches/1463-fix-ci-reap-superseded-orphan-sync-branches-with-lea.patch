@@ -1,0 +1,342 @@
+From 3afbed9bb8823a278d6320baf7bf3f292fa3d48b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:47:27 +0000
+Subject: [PATCH] fix(ci): reap superseded orphan sync branches with leases
+ [daveey]
+
+---
+ scripts/ci/upstream_sync.py                   |  29 ++--
+ scripts/ci/upstream_sync_superseded.py        |  48 +++++-
+ .../scripts/ci/test_upstream_sync_orphans.py  | 137 ++++++++++++++++++
+ 3 files changed, 201 insertions(+), 13 deletions(-)
+ create mode 100644 tests/scripts/ci/test_upstream_sync_orphans.py
+
+diff --git a/scripts/ci/upstream_sync.py b/scripts/ci/upstream_sync.py
+index cb9e412c45a..8b6d2ab66a5 100644
+--- a/scripts/ci/upstream_sync.py
++++ b/scripts/ci/upstream_sync.py
+@@ -22,7 +22,8 @@ Each call also lands any earlier staged candidate that went green (hosts that me
+ different times converge on one tested sync), keeps at most one candidate in CI, and stops staging
+ for RED_BACKOFF_S after a red run so a broken upstream does not loop full suites. Last, every call closes
+ open sync PRs whose head's parents main already contains (scripts/ci/upstream_sync_superseded.py), with
+-a comment naming that main; a fault there is printed and never changes the exit code.
++a comment naming that main, and lease-deletes superseded staging branches without open PRs.
++This call's staged/landing candidates are protected; cleanup faults never change the exit code.
+ 
+ Exit codes: 0 landed (or already on main), 1 refused (red, conflict, protection refusal, error),
+ 2 not yet (staged, pending, throttled, landing PR waiting for its required check): run it again
+@@ -262,7 +263,7 @@ def required_check(gh_repo, sha, request) -> tuple[str, str]:
+     return "red", f'"{REQUIRED_CHECK}" concluded {run.get("conclusion")} on {sha[:10]} {where}'.rstrip()
+ 
+ 
+-def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli) -> int:
++def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli, protected=None) -> int:
+     """Put the tested head on main through its PR, merged once the required check is green on exactly it."""
+     main = _fetch_main(repo)
+     if _parents_on_main(repo, cand.head, main):
+@@ -277,6 +278,8 @@ def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli
+         if tree.returncode or not (tree.stdout or "").split("\n", 1)[0].strip():
+             print(f"REFUSED: tested sync {cand.head[:10]} conflicts with main {main[:10]}; stage a new candidate")
+             return REFUSED
++    if protected is not None:
++        protected.add(cand.head)
+     pr = _land_pr(repo, cand, gh_repo, request, gh)
+     where = f"PR #{pr['number']} {pr.get('html_url', '')}".rstrip()
+     verdict, detail = required_check(gh_repo, cand.head, request)
+@@ -307,11 +310,11 @@ def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli
+     return LANDED
+ 
+ 
+-def _land_other_greens(repo, found, head, main, *, gh_repo, request, gh) -> bool:
++def _land_other_greens(repo, found, head, main, *, gh_repo, request, gh, protected=None) -> bool:
+     landed = False
+     for cand in found.values():
+         if cand.status == "green" and cand.head != head and not _is_ancestor(repo, cand.head, main):
+-            landed = land(repo, cand, gh_repo=gh_repo, request=request, gh=gh) == LANDED or landed
++            landed = land(repo, cand, gh_repo=gh_repo, request=request, gh=gh, protected=protected) == LANDED or landed
+     return landed
+ 
+ 
+@@ -354,7 +357,7 @@ def _explain_red(repo, cand: Candidate, main: str, gh_repo: str, request, gh) ->
+         print(f"  diagnostics unavailable: {exc!r}")
+ 
+ 
+-def _close_superseded(repo, gh_repo, request, gh) -> None:
++def _close_superseded(repo, gh_repo, request, gh, protected=()) -> None:
+     """Close open sync PRs a landed sync made redundant (upstream_sync_superseded). Never changes the verdict."""
+     try:
+         if __package__:  # imported as scripts.ci.upstream_sync (tests)
+@@ -362,7 +365,8 @@ def _close_superseded(repo, gh_repo, request, gh) -> None:
+         else:  # run as a script: scripts/ci is sys.path[0]
+             import upstream_sync_superseded as superseded
+ 
+-        superseded.close_superseded(repo, gh_repo, request, gh, run=_run, env=_gate_env("stage"), prefix=BRANCH_PREFIX)
++        superseded.close_superseded(repo, gh_repo, request, gh, run=_run, env=_gate_env("stage"),
++                                    prefix=BRANCH_PREFIX, protected=protected)
+     except Exception as exc:  # health: allow BLE001 -- housekeeping only: any fault is printed, the verdict stands
+         print(f"  superseded sync PRs: cleanup failed: {exc!r}")
+ 
+@@ -372,18 +376,20 @@ def advance(repo: Path, head: str | None, *, gh_repo: str, request=github_pages,
+ 
+     Every call then closes open sync PRs whose parents main already holds, including any this call's landing
+     made redundant."""
+-    verdict = _advance(repo, head, gh_repo=gh_repo, request=request, gh=gh, now=now)
+-    _close_superseded(repo, gh_repo, request, gh)
++    protected = set()
++    verdict = _advance(repo, head, gh_repo=gh_repo, request=request, gh=gh, now=now, protected=protected)
++    _close_superseded(repo, gh_repo, request, gh, protected)
+     return verdict
+ 
+ 
+-def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now) -> int:
++def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now, protected) -> int:
+     now = time.time() if now is None else now
+     try:
+         if head is not None:
+             head = git(repo, "rev-parse", "--verify", f"{head}^{{commit}}")
+         found = candidates(gh_repo, request)
+-        landed_other = _land_other_greens(repo, found, head, _fetch_main(repo), gh_repo=gh_repo, request=request, gh=gh)
++        landed_other = _land_other_greens(repo, found, head, _fetch_main(repo), gh_repo=gh_repo, request=request,
++                                         gh=gh, protected=protected)
+         if head is None:
+             return LANDED if landed_other else NOT_YET
+         main = _fetch_main(repo)
+@@ -395,9 +401,10 @@ def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now) ->
+             return LANDED
+         cand = found.get(head)
+         if cand is None:
++            protected.add(head)
+             return _stage_or_wait(repo, head, found, now)
+         if cand.status == "green":
+-            return land(repo, cand, gh_repo=gh_repo, request=request, gh=gh)
++            return land(repo, cand, gh_repo=gh_repo, request=request, gh=gh, protected=protected)
+         if cand.status == "red":
+             print(f"REFUSED: the full suite failed on {head[:10]}: {cand.url}")
+             _explain_red(repo, cand, main, gh_repo, request, gh)
+diff --git a/scripts/ci/upstream_sync_superseded.py b/scripts/ci/upstream_sync_superseded.py
+index 86df3362a70..6290daa2d34 100644
+--- a/scripts/ci/upstream_sync_superseded.py
++++ b/scripts/ci/upstream_sync_superseded.py
+@@ -1,4 +1,4 @@
+-"""Close open sync PRs that a landed sync made redundant (scripts/ci/upstream_sync.py housekeeping).
++"""Clean superseded sync PRs and orphan staging refs (upstream_sync.py housekeeping).
+ 
+ An open PR main <- sync/upstream-<X> from this repo is superseded once a freshly fetched origin/main
+ contains every parent of X (X is a merge). This is the gate's supersession policy, not tree equality.
+@@ -6,6 +6,8 @@ Such a PR is
+ commented (naming the main sha that holds the parents), closed, and its branch deleted only if it
+ still points at X. Anything else (forks, other branches, single-parent heads, a parent main lacks,
+ a moved branch) stays open. Every fault is printed and skipped: this never changes the gate's verdict.
++Orphan sync refs need no open PR (on any base) and all head parents on main. Delete with a lease
++on the listed SHA; exclude this invocation's staged/landing candidates and refs handled as PRs.
+ """
+ from __future__ import annotations
+ 
+@@ -66,7 +68,45 @@ def _close(repo, pr, parents, gh_repo, main, gh, run, env) -> bool:
+     return True
+ 
+ 
+-def close_superseded(repo, gh_repo, request, gh, *, run, env, prefix) -> None:
++def _delete_orphans(repo, gh_repo, request, main, *, run, env, prefix, protected, excluded):
++    # Any open PR, including one targeting a release branch, vetoes orphan cleanup.
++    pages = request(f"repos/{gh_repo}/pulls?state=open&per_page=100")
++    open_refs = {str((pr.get("head") or {}).get("ref") or "")
++                 for page in pages for pr in page if isinstance(pr, dict)}
++    open_refs.update(excluded)  # Do not retry a failed PR deletion against a newly moved head.
++    open_refs.update(prefix + sha for sha in protected)  # Protect the ref even if its head moved before listing.
++    listed = run(repo, "ls-remote", "--heads", "origin", f"refs/heads/{prefix}*")
++    if listed.returncode:
++        raise RuntimeError(f"could not list origin sync branches: {listed.stderr}")
++    deleted = failed = checked = 0
++    for line in listed.stdout.splitlines():
++        sha, ref = line.split()
++        if not SHA.fullmatch(sha) or not ref.startswith(f"refs/heads/{prefix}"):
++            continue
++        if ref.removeprefix("refs/heads/") in open_refs or sha in protected:
++            continue
++        checked += 1
++        try:
++            if run(repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode:
++                run(repo, "fetch", "-q", "origin", ref)
++            ancestry = run(repo, "rev-list", "--parents", "-n1", sha)
++            if ancestry.returncode:
++                raise RuntimeError(f"could not read listed head {sha}: {ancestry.stderr}")
++            parents = ancestry.stdout.split()[1:]
++            if not parents or any(run(repo, "merge-base", "--is-ancestor", p, main).returncode for p in parents):
++                continue
++            result = run(repo, "push", "-q", f"--force-with-lease={ref}:{sha}", "origin", f":{ref}", env=env)
++            if result.returncode:
++                raise RuntimeError((result.stderr or result.stdout).strip()[-300:])
++            deleted += 1
++            print(f"DELETED superseded sync branch {ref} at {sha}: main {main} contains every parent")
++        except Exception as exc:  # health: allow BLE001 -- one branch cannot stop housekeeping or change the verdict
++            failed += 1
++            print(f"  superseded sync branch {ref} at {sha}: branch kept: {exc}")
++    print(f"superseded sync branches: {deleted} deleted, {failed} failed ({checked} orphan(s) checked)")
++
++
++def close_superseded(repo, gh_repo, request, gh, *, run, env, prefix, protected=()) -> None:
+     try:
+         pulls = _open_sync_prs(gh_repo, request, prefix)
+     except Exception as exc:  # health: allow BLE001 -- housekeeping only: any fault is printed, the gate goes on
+@@ -80,6 +120,8 @@ def close_superseded(repo, gh_repo, request, gh, *, run, env, prefix) -> None:
+     failed = 0
+     for pr in pulls:
+         try:
++            if (pr.get("head") or {}).get("sha") in protected:
++                continue
+             why, parents = _kept_because(repo, pr, gh_repo, main, run, prefix)
+             if why:
+                 print(f"  sync PR #{pr.get('number')} stays open: {why}")
+@@ -95,3 +137,5 @@ def close_superseded(repo, gh_repo, request, gh, *, run, env, prefix) -> None:
+         print(f"superseded sync PRs: cleanup incomplete ({closed} closed, {failed} failed)")
+     elif not closed:
+         print(f"superseded sync PRs: none superseded ({len(pulls)} open sync PR(s) checked against main {main[:10]})")
++    _delete_orphans(repo, gh_repo, request, main, run=run, env=env, prefix=prefix, protected=protected,
++                    excluded={str((pr.get("head") or {}).get("ref") or "") for pr in pulls})
+diff --git a/tests/scripts/ci/test_upstream_sync_orphans.py b/tests/scripts/ci/test_upstream_sync_orphans.py
+new file mode 100644
+index 00000000000..c540fb32d08
+--- /dev/null
++++ b/tests/scripts/ci/test_upstream_sync_orphans.py
+@@ -0,0 +1,137 @@
++"""Real origin refs exercise orphan cleanup, leases and per-item fault isolation."""
++import pytest
++
++from scripts.ci import upstream_sync as sync
++from tests.scripts.ci.test_upstream_sync import FakeActions, commit, gate, git, make_world, merge_upstream, upstream_commit
++from tests.scripts.ci.test_upstream_sync_superseded import (
++    assert_closed, branch, host, landed_elsewhere, open_pr, other_merge,
++)
++
++
++@pytest.fixture
++def world(tmp_path):
++    return make_world(tmp_path)
++
++
++def orphan(root, sha):
++    ref = sync.BRANCH_PREFIX + sha
++    git(host(root), "push", "-q", "origin", f"{sha}:refs/heads/{ref}")
++    return ref
++
++
++def test_orphan_deleted_without_pr(world, capsys):
++    root, checkout, main0, up, actions = landed_elsewhere(world)
++    sha = other_merge(root, main0, up, "abandoned staging")
++    ref = orphan(root, sha)
++    assert gate(checkout, None, actions) == sync.NOT_YET
++    assert not branch(root, ref)
++    out = capsys.readouterr().out
++    assert f"DELETED superseded sync branch refs/heads/{ref} at {sha}" in out
++    assert "superseded sync branches: 1 deleted, 0 failed" in out
++
++
++def test_orphan_missing_parent_kept(world):
++    root, checkout, main0, up, actions = landed_elsewhere(world)
++    clone = host(root)
++    git(clone, "checkout", "-q", "--detach", main0)
++    fork = commit(clone, {"fork.txt": "unlanded"}, "fork")
++    sha = other_merge(root, fork, up, "missing fork parent")
++    ref = orphan(root, sha)
++    assert gate(checkout, None, actions) == sync.NOT_YET
++    assert branch(root, ref) == sha
++
++
++@pytest.mark.parametrize("move_candidate", [False, True])
++def test_staged_candidate_kept_when_main_moves_before_cleanup(world, move_candidate):
++    root, checkout = world
++    up = upstream_commit(root, {"u.txt": "u"}, "upstream")
++    main0 = git(checkout, "rev-parse", "HEAD")
++    head = merge_upstream(checkout)
++    actions = FakeActions(root / "origin.git", root)
++    request = actions.request
++
++    def landed_before_cleanup(endpoint):
++        if "/pulls?" in endpoint:
++            twin = other_merge(root, main0, up, "concurrent landed twin")
++            git(host(root), "push", "-q", "origin", f"{twin}:refs/heads/main")
++            if move_candidate:
++                git(host(root), "push", "-q", "-f", "origin", f"{twin}:refs/heads/{sync.BRANCH_PREFIX}{head}")
++        return request(endpoint)
++
++    assert sync.advance(checkout, head, gh_repo="example/fork", request=landed_before_cleanup,
++                        gh=actions.gh) == sync.NOT_YET
++    expected = git(root / "origin.git", "rev-parse", "main") if move_candidate else head
++    assert branch(root, sync.BRANCH_PREFIX + head) == expected
++
++
++def test_orphan_moved_after_listing_lease_refused_and_continues(world, monkeypatch, capsys):
++    root, checkout, main0, up, actions = landed_elsewhere(world)
++    heads = sorted(other_merge(root, main0, up, name) for name in ("first", "second"))
++    refs = [orphan(root, sha) for sha in heads]
++    for ref in refs:
++        git(checkout, "fetch", "-q", "origin", ref)
++    original = sync._run
++    raced = []
++
++    def run(repo, *args, **kwargs):
++        result = original(repo, *args, **kwargs)
++        if args[:2] == ("ls-remote", "--heads"):
++            git(host(root), "push", "-q", "-f", "origin", f"{main0}:refs/heads/{refs[0]}")
++            raced.append(True)
++        return result
++
++    monkeypatch.setattr(sync, "_run", run)
++    assert gate(checkout, None, actions) == sync.NOT_YET
++    assert raced and branch(root, refs[0]) == main0
++    assert not branch(root, refs[1])
++    out = capsys.readouterr().out
++    assert "branch kept" in out and "stale info" in out
++    assert "superseded sync branches: 1 deleted, 1 failed" in out
++
++
++@pytest.mark.parametrize("failure", ["exception", "nonzero"])
++def test_first_pr_comment_failure_does_not_stop_second(world, capsys, failure):
++    root, checkout, main0, up, actions = landed_elsewhere(world)
++    first, second = [open_pr(root, actions, other_merge(root, main0, up, name)) for name in ("first", "second")]
++    gh = actions.gh
++
++    def comment_fails(*args, **kwargs):
++        if args[:3] == ("pr", "comment", str(first["number"])):
++            if failure == "exception":
++                raise OSError("first comment transport failed")
++            import subprocess
++            return subprocess.CompletedProcess(args, 1, "", "first comment transport failed")
++        return gh(*args, **kwargs)
++
++    assert sync.advance(checkout, None, gh_repo="example/fork", request=actions.request,
++                        gh=comment_fails) == sync.NOT_YET
++    assert first["state"] == "open" and branch(root, first["head"]["ref"])
++    assert_closed(root, second)
++    assert "first comment transport failed" in capsys.readouterr().out
++
++
++def test_landing_candidate_kept_after_create_error_and_concurrent_landing(world):
++    root, checkout = world
++    up = upstream_commit(root, {"u.txt": "u"}, "upstream")
++    main0 = git(checkout, "rev-parse", "HEAD")
++    head = merge_upstream(checkout)
++    actions = FakeActions(root / "origin.git", root)
++    assert gate(checkout, head, actions) == sync.NOT_YET
++    actions.ci()
++
++    def create_fails(*args, **kwargs):
++        assert args[:2] == ("pr", "create")
++        twin = other_merge(root, main0, up, "concurrent landed twin")
++        git(host(root), "push", "-q", "origin", f"{twin}:refs/heads/main")
++        raise OSError("create transport failed")
++
++    assert sync.advance(checkout, None, gh_repo="example/fork", request=actions.request,
++                        gh=create_fails) == sync.REFUSED
++    assert branch(root, sync.BRANCH_PREFIX + head) == head
++
++
++def test_open_release_pr_is_not_an_orphan(world):
++    root, checkout, main0, up, actions = landed_elsewhere(world)
++    pr = open_pr(root, actions, other_merge(root, main0, up, "release sync"), base="release")
++    assert gate(checkout, None, actions) == sync.NOT_YET
++    assert pr["state"] == "open" and branch(root, pr["head"]["ref"])
+-- 
+2.55.0
+

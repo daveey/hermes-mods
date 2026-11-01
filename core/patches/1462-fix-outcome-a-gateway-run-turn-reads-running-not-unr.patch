@@ -1,0 +1,158 @@
+From 4f888ab00d604433f760878e09f5b8644c5b634e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:37:30 -0700
+Subject: [PATCH] fix(outcome): a gateway-run turn reads running, not
+ unresolved{interrupted} [daveey]
+
+_live_turn only read the Desktop/TUI interrupted-turn marker. Turns the messaging
+gateway runs (Desktop chats on the local platform included) never write it; they
+hold gateway_routing.active_turn_token instead. Any refresh mid-turn (the status
+auditor's outcome-audit --refresh, every 10 min) saw the chat end on a user/tool
+row and stored unresolved{interrupted}, and the auditor filed it after two runs
+that both landed inside live turns (session 20261023_144828_86fa15, 10-31).
+
+Now a routing entry for the tip with an active-turn token younger than 6 h, whose
+routing scope's gateway is running (gateway.status.get_running_pid, no cleanup),
+counts as a live turn. A crashed gateway's leftover token reads not-live.
+---
+ hermes_state_outcome.py                    | 52 +++++++++++++++++++-
+ tests/hermes_state/test_session_outcome.py | 56 ++++++++++++++++++++++
+ 2 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index cc5e4c59296..db55d359509 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -228,12 +228,60 @@ def _text(content: Any) -> str:
+ 
+ 
+ def _live_turn(db: Any, sid: str) -> bool:
+-    """A turn is live while its interrupted-turn marker exists and the process that wrote it is alive."""
++    """A turn is live while its interrupted-turn marker exists and the process that wrote it is alive, or
++    while a running messaging gateway holds the chat's durable active-turn token (gateway-run turns, the
++    Desktop ``local`` platform included, never write the TUI marker)."""
+     from tui_gateway.turn_marker import marker_writer_state, read_turn_marker
+ 
+     home = Path(db.db_path).parent
+     marker = read_turn_marker(home, sid)
+-    return bool(marker) and marker_writer_state(marker) == "alive"
++    if marker and marker_writer_state(marker) == "alive":
++        return True
++    return _guarded("gateway turn", sid, lambda: _gateway_turn_live(db, sid), False)
++
++
++# [daveey] A gateway turn token older than this is a leaked marker (its CAS clear failed), not a live turn.
++_GATEWAY_TURN_MAX_AGE_S = 6 * 3600.0
++
++
++def _gateway_turn_live(db: Any, sid: str) -> bool:
++    """[daveey] A gateway routing entry for ``sid`` carries ``active_turn_token`` (``mark_turn_active`` at
++    turn start, CAS-cleared at its end) and the gateway owning that routing scope is running. A crashed
++    gateway leaves the token behind until its next start recovers it, so a dead gateway reads not-live."""
++    rows = db._read_all(
++        "SELECT scope, entry_json FROM gateway_routing WHERE json_extract(entry_json, '$.session_id') = ?"
++        " AND json_extract(entry_json, '$.active_turn_token') IS NOT NULL", (sid,))
++    now = time.time()
++    for row in rows:
++        try:
++            entry = json.loads(row["entry_json"] or "{}")
++        except ValueError:
++            continue
++        started = _iso_epoch(entry.get("active_turn_started_at"))
++        if started is None or now - started > _GATEWAY_TURN_MAX_AGE_S:
++            continue
++        scope = str(row["scope"] or "")
++        gateway_home = Path(scope).parent if scope else Path(db.db_path).parent
++        if _gateway_running(gateway_home):
++            return True
++    return False
++
++
++def _iso_epoch(value: Any) -> Optional[float]:
++    from datetime import datetime
++
++    if not isinstance(value, str) or not value:
++        return None
++    try:
++        return datetime.fromisoformat(value).timestamp()
++    except ValueError:
++        return None
++
++
++def _gateway_running(home: Path) -> bool:
++    from gateway.status import get_running_pid
++
++    return get_running_pid(home / "gateway.pid", cleanup_stale=False) is not None
+ 
+ 
+ def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 6770a3c0258..ba06cdd3215 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -86,6 +86,62 @@ def test_2_live_turn_is_running(db):
+     assert so.derive_outcome("chat", db=db)["kind"] == "done"
+ 
+ 
++def _gateway_turn(db, tmp_path, *, started_at=None, token: str | None = "tok", sid="chat"):
++    from datetime import UTC, datetime
++
++    started = datetime.now(UTC) if started_at is None else started_at
++    entry = {"session_id": sid, "active_turn_token": token, "active_turn_started_at": started.isoformat()}
++    db.save_gateway_routing_entry(f"agent:main:local:dm:{sid}", json.dumps(entry),
++                                  scope=str(tmp_path / "gwhome" / "sessions"))
++
++
++def test_2_gateway_run_turn_is_running(db, tmp_path, monkeypatch):
++    """A turn the messaging gateway runs (Desktop ``local`` platform too) writes no TUI marker, only the
++    routing entry's active-turn token: mid-turn it ends on a user/tool row and must read running, not
++    unresolved{interrupted}."""
++    homes = []
++    monkeypatch.setattr(so, "_gateway_running", lambda home: homes.append(home) or True)
++    say(db, "user", "what's left?")
++    assert so.derive_outcome("chat", db=db).get("reason") == "interrupted"
++    _gateway_turn(db, tmp_path)
++    assert so.refresh_outcome("chat", "manual", db=db)["kind"] == "running"
++    assert homes[-1] == tmp_path / "gwhome"
++    assert so.derive_outcome("chat", db=db, ignore_live_turn=True)["reason"] == "interrupted"
++
++
++def test_2_gateway_turn_token_of_a_dead_gateway_is_not_running(db, tmp_path, monkeypatch):
++    monkeypatch.setattr(so, "_gateway_running", lambda home: False)
++    say(db, "user", "what's left?")
++    _gateway_turn(db, tmp_path)
++    out = so.derive_outcome("chat", db=db)
++    assert (out["kind"], out.get("reason")) == ("unresolved", "interrupted")
++
++
++def test_2_gateway_turn_token_cleared_or_stale_or_other_chat_is_not_running(db, tmp_path, monkeypatch):
++    from datetime import UTC, datetime, timedelta
++
++    monkeypatch.setattr(so, "_gateway_running", lambda home: True)
++    say(db, "user", "what's left?")
++    _gateway_turn(db, tmp_path, token=None)
++    assert so.derive_outcome("chat", db=db)["kind"] == "unresolved"
++    _gateway_turn(db, tmp_path, started_at=datetime.now(UTC) - timedelta(hours=7))
++    assert so.derive_outcome("chat", db=db)["kind"] == "unresolved"
++    _gateway_turn(db, tmp_path, sid="other")
++    assert so.derive_outcome("chat", db=db)["kind"] == "unresolved"
++
++
++def test_2_gateway_running_reads_that_homes_pid_record(tmp_path, monkeypatch):
++    import gateway.status as gs
++
++    seen = []
++    monkeypatch.setattr(gs, "get_running_pid", lambda path, cleanup_stale=True: seen.append(
++        (path, cleanup_stale)) or 4242)
++    assert so._gateway_running(tmp_path) is True
++    assert seen == [(tmp_path / "gateway.pid", False)]
++    monkeypatch.setattr(gs, "get_running_pid", lambda path, cleanup_stale=True: None)
++    assert so._gateway_running(tmp_path) is False
++
++
+ def test_3_blocked_human_card_is_a_decision_with_its_choices(db, board):
+     add_card(board, "t_ask", "chat", "blocked", HUMAN_REQUEST)
+     add_card(board, "t_run", "chat", "running")
+-- 
+2.55.0
+

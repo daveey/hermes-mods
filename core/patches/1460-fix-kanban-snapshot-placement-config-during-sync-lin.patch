@@ -1,0 +1,134 @@
+From baf8e00d843e5d764b58402154892f1eb55f1964 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:20:29 -0700
+Subject: [PATCH] fix(kanban): snapshot placement config during sync link
+ retirement [daveey]
+
+---
+ hermes_cli/kanban_placement.py                |  9 +++--
+ hermes_cli/kanban_sync_client.py              |  5 ++-
+ .../test_kanban_placeholder_batch_cost.py     | 40 +++++++++++++++++++
+ .../test_kanban_sync_placeholder_links.py     | 19 +++++++++
+ 4 files changed, 68 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placeholder_batch_cost.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 84b19da0f35..3496a1f0174 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -263,12 +263,15 @@ def config() -> dict:
+         return {}
+ 
+ 
+-def is_placeholder_session(value: str) -> bool:
+-    """Placement attribution IDs must never become notification destinations."""
++def is_placeholder_session(value: str, *, placement_config: Optional[dict] = None) -> bool:
++    """Placement attribution IDs must never become notification destinations.
++
++    Batch callers may supply a per-pass snapshot to avoid reloading configuration per row.
++    """
+     session = str(value or "").rsplit("/", 1)[-1]
+     if session.startswith(DEFAULT_CREATOR_SESSION):
+         return True
+-    configured = config().get("creator_session")
++    configured = (config() if placement_config is None else placement_config).get("creator_session")
+     values = configured.values() if isinstance(configured, dict) else (configured,)
+     return bool(session) and session in values
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index f6488f6be4d..c087a85f549 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1119,10 +1119,11 @@ def retire_lost_placeholder_links(live: sqlite3.Connection, shadow: sqlite3.Conn
+     good: a shadow-only ``task_chat_links`` mismatch at pending=0 (238 rows on the hub, 2026-10-30). Real chat links
+     missing from live are left alone, so the diff keeps reporting them. Returns the number of deletes queued."""
+     from hermes_cli.kanban_db_connect import write_txn
+-    from hermes_cli.kanban_placement import is_placeholder_session
++    from hermes_cli.kanban_placement import config, is_placeholder_session
++    placement_config = config()
+     lost = [(u, s) for u, s in shadow.execute(
+         "SELECT uid, chat_session FROM task_chat_links WHERE chat_gateway = ? AND uid IS NOT NULL", (gateway,))
+-        if is_placeholder_session(s)]
++        if is_placeholder_session(s, placement_config=placement_config)]
+     if not lost:
+         return 0
+     queued = 0
+diff --git a/tests/hermes_cli/test_kanban_placeholder_batch_cost.py b/tests/hermes_cli/test_kanban_placeholder_batch_cost.py
+new file mode 100644
+index 00000000000..ba3e61ae500
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placeholder_batch_cost.py
+@@ -0,0 +1,40 @@
++"""Batch placeholder classification must not rediscover config for every chat link."""
++import sqlite3
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_sync_client as sync_client
++
++
++def test_retirement_reads_placement_config_once_per_pass(monkeypatch):
++    loader = Mock(return_value={"creator_session": "some-placeholder"})
++    monkeypatch.setattr(placement, "config", loader)
++    with sqlite3.connect(":memory:") as shadow, sqlite3.connect(":memory:") as live:
++        shadow.execute("CREATE TABLE task_chat_links(uid TEXT, chat_session TEXT, chat_gateway TEXT)")
++        shadow.executemany("INSERT INTO task_chat_links VALUES (?, ?, 'macbook')",
++                           [(str(i), f"real-chat-{i}") for i in range(1000)])
++        assert sync_client.retire_lost_placeholder_links(live, shadow, "macbook") == 0
++        assert loader.call_count == 1
++        loader.return_value = {"creator_session": {"hub": "different-placeholder"}}
++        assert sync_client.retire_lost_placeholder_links(live, shadow, "macbook") == 0
++        assert loader.call_count == 2  # fresh on next pass, not a process-wide stale cache
++
++
++@pytest.mark.parametrize("cfg,value,expected", [
++    ({}, "kanban-placement-macbook", True),
++    ({}, "@session:default@hub/kanban-placement-any", True),
++    ({"creator_session": "custom"}, "@session:default@hub/custom", True),
++    ({"creator_session": {"hub": "custom", "mini": "other"}}, "other", True),
++    ({"creator_session": {"hub": "custom"}}, "real-chat", False),
++    ({}, "", False),
++    ({}, "real-chat", False),
++])
++def test_snapshot_matches_default_classifier(monkeypatch, cfg, value, expected):
++    loader = Mock(return_value=cfg)
++    monkeypatch.setattr(placement, "config", loader)
++    assert placement.is_placeholder_session(value) is expected
++    loader.reset_mock()
++    assert placement.is_placeholder_session(value, placement_config=cfg) is expected
++    loader.assert_not_called()
+diff --git a/tests/hermes_cli/test_kanban_sync_placeholder_links.py b/tests/hermes_cli/test_kanban_sync_placeholder_links.py
+index 7ff7c17716f..04d11c109eb 100644
+--- a/tests/hermes_cli/test_kanban_sync_placeholder_links.py
++++ b/tests/hermes_cli/test_kanban_sync_placeholder_links.py
+@@ -148,6 +148,25 @@ def test_a_real_chat_link_lost_from_live_stays_a_reported_mismatch(live, svc, ka
+     assert _diff(live)["child_mismatch"] == {"task_chat_links": 1}
+ 
+ 
++@pytest.mark.parametrize("creator", ["custom-placeholder", {"macbook": "custom-placeholder"}])
++def test_configured_placeholder_retires_after_config_change(live, svc, kanban_home, monkeypatch, creator):
++    from hermes_cli import kanban_placement
++    monkeypatch.setattr(kanban_placement, "config", dict)
++    tid = kb.create_task(live, title="configured", assignee="worker")
++    custom = _insert_link(live, tid, "custom-placeholder")
++    real = _insert_link(live, tid, "real-chat")
++    _settle(kanban_home, svc)
++    _uncaptured_delete(live, custom)
++    _uncaptured_delete(live, real)
++    _settle(kanban_home, svc)
++    assert _board_live(svc, custom) and _board_live(svc, real)
++    monkeypatch.setattr(kanban_placement, "config", lambda: {"creator_session": creator})
++    _settle(kanban_home, svc)
++    assert not _board_live(svc, custom)
++    assert _board_live(svc, real)
++    assert _diff(live)["child_mismatch"] == {"task_chat_links": 1}
++
++
+ def test_a_delete_under_applying_is_not_captured(live):
+     assert "kanban_sync_task_chat_links_del" in sync.wanted_triggers(live)
+     tid = kb.create_task(live, title="copy", assignee="worker")
+-- 
+2.55.0
+

@@ -1,0 +1,271 @@
+From b92048a2e0556115f268a8ad62e11ef885f21bcf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:45:23 +0000
+Subject: [PATCH] fix(ci): stop every sandboxed process before removing
+ plugin-sandbox scratch
+
+Reaping bwrap did not mean the sandbox was gone: its PID 1 is SIGKILLed by
+--die-with-parent only as bwrap exits and the kernel empties the PID namespace
+asynchronously, so the wrapper removed the overlay copy while a sandboxed
+process still wrote into it and a plugin-sandbox-* dir survived the job's
+`timeout 600` (CI job 124558089350). The wrapper now takes pidfds of bwrap's
+child before killing bwrap, SIGKILLs it and waits (bounded, 30s) for it to
+exit before removing scratch. A pidfd_send_signal error other than ESRCH is
+logged and the bounded wait still runs instead of escaping cleanup.
+
+GNU timeout signals the wrapper and then its whole process group. bwrap was in
+that group, died of the group SIGTERM before the wrapper could find the
+sandbox's PID 1, and the cleanup above was skipped. bwrap now starts in its own
+session (start_new_session=True) so only the wrapper is signalled, and the
+wrapper ignores further SIGTERM/SIGINT once it starts tearing down, so the
+second signal cannot raise inside the cleanup.
+
+Tests: the fake-bwrap regression runs in both launch shapes (SIGTERM to the
+wrapper alone, and through GNU timeout's group signalling); the timeout shape
+fails without the new session. A unit test covers EPERM (logged, bounded wait,
+fds closed) and ESRCH.
+---
+ scripts/ci/plugin_validation_sandbox.py    |  83 ++++++++++++++++-
+ tests/ci/test_plugin_validation_sandbox.py | 102 +++++++++++++++++++++
+ 2 files changed, 183 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/ci/plugin_validation_sandbox.py b/scripts/ci/plugin_validation_sandbox.py
+index 60d1204d51a..6944df306c8 100644
+--- a/scripts/ci/plugin_validation_sandbox.py
++++ b/scripts/ci/plugin_validation_sandbox.py
+@@ -66,6 +66,7 @@ import subprocess
+ import sys
+ import tempfile
+ import threading
++import time
+ from pathlib import Path
+ 
+ EXIT_SETUP = 125
+@@ -571,6 +572,67 @@ def remove_tree(path: Path) -> None:
+     shutil.rmtree(path, ignore_errors=True)
+ 
+ 
++def _ppid(pid: str) -> int | None:
++    try:
++        with open(f"/proc/{pid}/stat", "rb") as f:
++            return int(f.read().rpartition(b")")[2].split()[1])  # comm may hold spaces and ')'
++    except (OSError, ValueError, IndexError):
++        return None
++
++
++def _child_pidfds(parent: int) -> list[int]:
++    """pidfds of ``parent``'s children: bwrap's one child is the sandbox's PID 1.
++
++    Taken while bwrap is still alive. ``pidfd_open`` pins the pid; the ppid read
++    after it proves the pid was not reaped and reused in between (an exited child
++    is kept: its pidfd only ever reports that it exited).
++    """
++    out = []
++    for pid in (p for p in os.listdir("/proc") if p.isdigit() and _ppid(p) == parent):
++        try:
++            fd = os.pidfd_open(int(pid))
++        except OSError:
++            continue  # already reaped
++        if _ppid(pid) in (parent, None):
++            out.append(fd)
++        else:
++            os.close(fd)
++    return out
++
++
++def _kill_and_wait(pidfds: list[int], timeout: float) -> bool:
++    """SIGKILL each sandbox PID 1 and wait for it to exit; False if one outlives ``timeout``.
++
++    Reaping bwrap does not mean the sandbox is gone: its PID 1 gets SIGKILL (from
++    --die-with-parent) only as bwrap exits, and the kernel then kills the rest of
++    the PID namespace asynchronously, so a sandboxed process can still be writing
++    into the overlay copy after ``proc.wait()`` returns. PID 1 only finishes exiting
++    once every other process in its namespace has exited and been reaped, so its
++    pidfd turning readable is the point after which nothing writes into scratch.
++    """
++    poller = select.poll()
++    for fd in pidfds:
++        try:
++            signal.pidfd_send_signal(fd, signal.SIGKILL)  # windows-footgun: ok — Linux-only script, main() refuses other platforms
++        except ProcessLookupError:
++            pass  # already exited; its pidfd is readable
++        except OSError as exc:  # e.g. EPERM: still wait, bounded, for --die-with-parent's kill
++            _log(f"could not SIGKILL a sandboxed process: {exc}")
++        poller.register(fd, select.POLLIN)
++    pending = set(pidfds)
++    end = time.monotonic() + timeout
++    while pending:
++        left = end - time.monotonic()
++        if left <= 0:
++            break
++        for fd, _ in poller.poll(left * 1000):
++            poller.unregister(fd)
++            pending.discard(fd)
++    for fd in pidfds:
++        os.close(fd)
++    return not pending
++
++
+ def run_host(args) -> int:
+     env = dict(os.environ)
+     if not args.command:
+@@ -592,7 +654,14 @@ def run_host(args) -> int:
+     proxy = None
+     proc = None
+ 
++    def _quiet() -> None:
++        # `timeout` signals the wrapper twice (it, then its process group): a second
++        # SystemExit raised inside the finally below would skip the cleanup.
++        signal.signal(signal.SIGTERM, signal.SIG_IGN)
++        signal.signal(signal.SIGINT, signal.SIG_IGN)
++
+     def _terminate(signum, _frame):
++        _quiet()
+         raise SystemExit(128 + signum)
+ 
+     signal.signal(signal.SIGTERM, _terminate)
+@@ -609,16 +678,26 @@ def run_host(args) -> int:
+         # bwrap itself gets no inherited secrets either (it does not need any).
+         # bwrap's own setup failures exit 1 like a failing command; either way the
+         # caller sees a nonzero status and the entry fails.
+-        proc = subprocess.Popen(argv, env={"PATH": "/usr/bin:/bin"}, close_fds=True)
++        # Own session: `timeout 600` signals its whole process group, and a group
++        # SIGTERM that also reached bwrap killed it before the wrapper could take
++        # pidfds of the sandbox, so the cleanup below never stopped the sandbox.
++        # Now only the wrapper is signalled, and it tears bwrap down below.
++        # detached-spawn: ok — --die-with-parent kills bwrap with the wrapper; the session only keeps group signals off it
++        proc = subprocess.Popen(argv, env={"PATH": "/usr/bin:/bin"}, close_fds=True, start_new_session=True)
+         # health: allow HX006 -- this wait IS the sandboxed command's runtime; the caller bounds it (the job's `timeout 600`) and SIGTERM/SIGINT tear the namespace down below
+         return proc.wait()
+     finally:
++        _quiet()
+         if proc is not None and proc.poll() is None:
++            inits = _child_pidfds(proc.pid)
+             proc.kill()  # bwrap's PID namespace (every sandboxed process) dies with it
+             try:
+-                proc.wait(timeout=30)  # reaped before its scratch (the overlay copy) is removed
++                proc.wait(timeout=30)
+             except subprocess.TimeoutExpired:
+                 pass
++            # Scratch (the overlay copy) is removed only once nothing in the sandbox can write to it.
++            if not _kill_and_wait(inits, timeout=30):
++                _log("sandboxed processes outlived 30s; scratch removal may be incomplete")
+         if proxy:
+             proxy.close()
+         remove_tree(scratch)
+diff --git a/tests/ci/test_plugin_validation_sandbox.py b/tests/ci/test_plugin_validation_sandbox.py
+index 60ca3e236d8..c8a7e7a3258 100644
+--- a/tests/ci/test_plugin_validation_sandbox.py
++++ b/tests/ci/test_plugin_validation_sandbox.py
+@@ -526,6 +526,108 @@ def test_the_jobs_timeout_kills_the_whole_sandbox(work):
+     assert list(home.iterdir()) == []
+ 
+ 
++def _dead(pid: int) -> bool:
++    try:
++        stat = Path(f"/proc/{pid}/stat").read_bytes()
++    except OSError:
++        return True
++    return stat.rpartition(b")")[2].split()[0] == b"Z"
++
++
++@pytest.mark.parametrize("launch", ["wrapper", "timeout"])
++def test_scratch_is_removed_only_after_every_sandboxed_process_exits(work, launch):
++    """Regression (CI job 124558089350): reaping bwrap does not mean the sandbox is
++    gone. The kernel kills the rest of its PID namespace only after bwrap exits, so
++    the overlay copy was removed while a sandboxed process still wrote into it and a
++    plugin-sandbox-* dir survived the job's timeout. A fake bwrap makes that window
++    as wide as it gets: its one child (the sandbox's PID 1) keeps writing into the
++    copy and is not killed with it. The wrapper must stop that child before it
++    exits and leave no scratch behind.
++
++    ``wrapper`` sends SIGTERM to the wrapper alone. ``timeout`` is the job's shape:
++    GNU ``timeout`` signals the wrapper and then its whole process group, which
++    used to reach bwrap too and kill it before the wrapper could find the
++    sandbox's PID 1. The child ignores SIGTERM as a PID-namespace init does for
++    signals from outside its namespace."""
++    if launch == "timeout" and not shutil.which("timeout"):
++        pytest.skip("GNU timeout not installed")
++    home = work / "pm-home"
++    home.mkdir()
++    ready, stop = work / "writer.pid", work / "writer.stop"
++    fake = work / "fake-bwrap"
++    fake.write_text(textwrap.dedent(f"""\
++        #!{sys.executable}
++        import os, signal, sys, time
++        argv = sys.argv[1:]
++        copy = next(argv[i + 1] for i, a in enumerate(argv) if a == "--bind" and argv[i + 2] == {str(home)!r})
++        child = os.fork()
++        if child == 0:
++            signal.signal(signal.SIGTERM, signal.SIG_IGN)
++            end, i = time.monotonic() + 60, 0
++            while time.monotonic() < end and not os.path.exists({str(stop)!r}):
++                i += 1
++                os.makedirs(f"{{copy}}/w/{{i}}", exist_ok=True)
++                if i == 1:
++                    with open({str(ready)!r} + ".tmp", "w") as f:
++                        f.write(str(os.getpid()))
++                    os.rename({str(ready)!r} + ".tmp", {str(ready)!r})
++            os._exit(0)
++        os.waitpid(child, 0)
++        """))
++    fake.chmod(0o755)
++    cmd = [sys.executable, "-I", str(SCRIPT), "--bwrap", str(fake), "--no-network",
++           "--overlay", str(home), "--overlay-mode", "copy", "--", "true"]
++    if launch == "timeout":
++        # SIGTERM to `timeout` runs the same handler as its expiry (signal the
++        # child, then the group); a long duration keeps the test off the clock.
++        cmd = ["timeout", "3600", *cmd]
++    proc = subprocess.Popen(cmd, env={**os.environ, "RUNNER_TEMP": str(work)}, stdin=subprocess.DEVNULL)
++    try:
++        wait_until(ready.exists, timeout=20, what="the sandboxed writer starting")
++        writer = int(ready.read_text())
++        proc.send_signal(15)
++        assert proc.wait(timeout=60) == 128 + 15
++        assert _dead(writer), "the wrapper exited while a sandboxed process still ran"
++        assert not list(work.glob("plugin-sandbox-*"))
++        assert list(home.iterdir()) == []
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait()
++        stop.touch()  # a writer that outlived a broken wrapper is no longer ours to signal
++
++
++@pytest.mark.parametrize("error, exits", [(PermissionError(1, "Operation not permitted"), False),
++                                          (PermissionError(1, "Operation not permitted"), True),
++                                          (ProcessLookupError(3, "No such process"), True)],
++                         ids=["eperm-still-running", "eperm-then-exits", "esrch"])
++def test_cleanup_survives_a_failed_sigkill(monkeypatch, capsys, error, exits):
++    """A pidfd_send_signal failure must not escape the wrapper's cleanup (which
++    would skip removing scratch): ESRCH means the process already exited; any
++    other error is logged and the wait for the process still runs, bounded."""
++    child = subprocess.Popen(["sleep", "60"])
++    fd = os.pidfd_open(child.pid)
++
++    def fail(_fd, _sig):
++        if exits:
++            child.kill()  # it dies anyway (bwrap's --die-with-parent / already gone)
++        raise error
++
++    monkeypatch.setattr(sandbox.signal, "pidfd_send_signal", fail)
++    try:
++        start = time.monotonic()
++        assert sandbox._kill_and_wait([fd], timeout=2) is exits
++        if not exits:
++            assert time.monotonic() - start >= 2
++        with pytest.raises(OSError):
++            os.fstat(fd)  # closed either way
++        logged = "could not SIGKILL" in capsys.readouterr().err
++        assert logged is isinstance(error, PermissionError)
++    finally:
++        child.kill()
++        child.wait()
++
++
+ def _kernel_overlay() -> bool:
+     bwrap = shutil.which("bwrap")
+     return bool(bwrap) and sandbox.overlay_mode(bwrap, "auto") == "kernel"
+-- 
+2.55.0
+

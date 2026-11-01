@@ -1,0 +1,135 @@
+From a14ddb77118bab1ad3b50da77ad4d52c6d3be383 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 09:48:25 -0700
+Subject: [PATCH] perf(state): index multi-segment lineage receipts [daveey]
+
+---
+ hermes_state_common.py                        | 10 +++
+ hermes_state_local.py                         |  4 +-
+ .../hermes_state/test_local_lineage_index.py  | 70 +++++++++++++++++++
+ 3 files changed, 82 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_state/test_local_lineage_index.py
+
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 70100b1d74e..7ebeec8034d 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -448,6 +448,12 @@ def emit_session_deleted(db, deleted_ids, *, reason, primary=None, sessions_dir=
+ _FTS_TRIGGERS = ("messages_fts_insert", "messages_fts_delete", "messages_fts_update",
+                  "messages_fts_trigram_insert", "messages_fts_trigram_delete", "messages_fts_trigram_update")
+ 
++# Shared literally with the partial index: a bound GLOB parameter cannot prove
++# its predicate to SQLite. CASE keeps malformed receipts writable and unindexed.
++LOCAL_LINEAGE_PREDICATE_SQL = (
++    "key GLOB 'gateway.local_policy.v1:*' AND "
++    "CASE WHEN json_valid(value) THEN json_array_length(value, '$.lineage') > 1 ELSE 0 END")
++
+ SCHEMA_SQL = """
+ CREATE TABLE IF NOT EXISTS schema_version (
+     version INTEGER NOT NULL
+@@ -783,6 +789,10 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(
+ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+     ON async_delegations(delivery_state, completed_at);
+ """
++# Receipt JSON can include a large launch policy. Index only multi-segment
++# receipts so unrelated writes do not force listings to parse every policy again.
++SCHEMA_SQL += ("CREATE INDEX IF NOT EXISTS idx_state_meta_local_lineage ON state_meta(key) WHERE "
++               + LOCAL_LINEAGE_PREDICATE_SQL + ";\n")
+ 
+ # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
+ # sessions_runtime_ledger_delete_guard: every delete path in this release retires a session's ledger rows
+diff --git a/hermes_state_local.py b/hermes_state_local.py
+index fd39d4c1bf1..02e06899202 100644
+--- a/hermes_state_local.py
++++ b/hermes_state_local.py
+@@ -312,9 +312,9 @@ def local_lineage_index(conn):
+     roots of earlier reset segments (filtered in SQL, before paging); ``heads`` maps the latest
+     reset segment to ``(owner, lineage)`` for the row that represents the conversation. A delete
+     of that row removes the whole lineage (``hermes_state_mutation_guards.delete_targets``)."""
++    from hermes_state_common import LOCAL_LINEAGE_PREDICATE_SQL
+     superseded, heads = set(), {}
+-    rows = conn.execute("SELECT value FROM state_meta WHERE key GLOB ? AND json_valid(value) "
+-                        "AND json_array_length(value, '$.lineage') > 1", (POLICY_PREFIX + '*',)).fetchall()
++    rows = conn.execute("SELECT value FROM state_meta WHERE " + LOCAL_LINEAGE_PREDICATE_SQL).fetchall()
+     for (raw,) in rows:
+         receipt = json.loads(raw)
+         owner, lineage = receipt.get('session_id'), receipt.get('lineage')
+diff --git a/tests/hermes_state/test_local_lineage_index.py b/tests/hermes_state/test_local_lineage_index.py
+new file mode 100644
+index 00000000000..e9b2b3592cb
+--- /dev/null
++++ b/tests/hermes_state/test_local_lineage_index.py
+@@ -0,0 +1,70 @@
++"""Lineage enumeration must stay bounded when unrelated writes invalidate its cache."""
++import json
++
++from hermes_state import SessionDB
++from hermes_state_local import POLICY_PREFIX, _cached_local_lineage_index, local_lineage_index
++
++
++def test_unrelated_writes_do_not_rescan_single_segment_receipts(tmp_path):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        conn = db._conn
++        assert conn is not None
++        raw = json.dumps({'session_id': 'single', 'lineage': ['single'], 'policy': 'x' * 12000})
++        conn.executemany('INSERT INTO state_meta VALUES (?,?)',
++                         [(POLICY_PREFIX + str(i), raw) for i in range(1000)])
++        conn.commit()
++        with db._read_ctx() as reader:
++            assert _cached_local_lineage_index(db, reader) == (set(), {})
++            for i in range(3):
++                conn.execute('INSERT OR REPLACE INTO state_meta VALUES (?,?)', ('unrelated', str(i)))
++                conn.commit()
++                steps = []
++                reader.set_progress_handler(lambda: steps.append(1) or 0, 100)
++                try:
++                    assert _cached_local_lineage_index(db, reader) == (set(), {})
++                finally:
++                    reader.set_progress_handler(None, 0)
++                # Bound executed work, not wall-clock time on a busy CI runner.
++                assert len(steps) < 10, len(steps)
++    finally:
++        db.close()
++
++
++def test_index_upgrade_and_receipt_mutations_preserve_projection(tmp_path):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    assert db._conn is not None
++    db._conn.execute('DROP INDEX IF EXISTS idx_state_meta_local_lineage')
++    db.close()
++    db = SessionDB(db_path=path)
++    try:
++        conn = db._conn
++        assert conn is not None
++        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='idx_state_meta_local_lineage'").fetchone()
++        db.create_session('owner', source='cli')
++        db.create_session('head', source='cli')
++        conn.execute("UPDATE sessions SET end_reason='session_reset' WHERE id='owner'")
++        odd_values = ['malformed', '[]', '{}', 'null', '{"lineage":"text"}',
++                      '{"lineage":{}}', '{"lineage":["owner",1]}']
++        conn.executemany('INSERT INTO state_meta VALUES (?,?)',
++                         [(POLICY_PREFIX + str(i), raw) for i, raw in enumerate(odd_values)])
++        key = POLICY_PREFIX + 'owner'
++        conn.execute('INSERT INTO state_meta VALUES (?,?)', (key, json.dumps(
++            {'session_id': 'owner', 'lineage': ['owner', 'head']})))
++        conn.commit()
++        expected = ({'owner'}, {'head': ('owner', ['owner', 'head'])})
++        assert local_lineage_index(conn) == expected
++        conn.execute('BEGIN')
++        conn.execute('UPDATE state_meta SET value=? WHERE key=?', ('broken', key))
++        assert local_lineage_index(conn) == (set(), {})
++        conn.rollback()
++        assert local_lineage_index(conn) == expected
++        conn.execute('BEGIN')
++        conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
++        assert local_lineage_index(conn) == (set(), {})
++        conn.rollback()
++        conn.execute('DROP INDEX idx_state_meta_local_lineage')
++        assert local_lineage_index(conn) == expected  # legacy/read-only fallback
++    finally:
++        db.close()
+-- 
+2.55.0
+

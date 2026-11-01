@@ -1,0 +1,264 @@
+From fed0dfc45f9063955dcfeb637629a78ae98ee333 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:39:52 +0000
+Subject: [PATCH] fix(kanban): park triage directly without a claimable
+ intermediate state [daveey]
+
+---
+ hermes_cli/kanban_db_schedule.py            |   8 +-
+ hermes_cli/kanban_dependency_review.py      |   4 +-
+ hermes_cli/kanban_timed_park.py             |   6 +-
+ tests/hermes_cli/test_kanban_triage_park.py | 139 ++++++++++++++++++++
+ tools/kanban_tools.py                       |   4 +-
+ 5 files changed, 154 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_triage_park.py
+
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 41512d04e4f..9048bf66a86 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -24,7 +24,9 @@ def schedule_task(
+     ``AwaitingError``, and a third park on one premise escalates to an owner card instead.
+ 
+     ``comment`` (``(author, body)``) is written in the same txn and only when the park lands
+-    (``kanban_reason_comment``); ``human_answer_refusal`` explains the human-answer refusal."""
++    (``kanban_reason_comment``); ``human_answer_refusal`` explains the human-answer refusal.
++    Triage parks reset the dispatcher failure streak without an intermediate dispatchable
++    status; block-loop recurrence evidence is retained, as on unblock."""
+     from hermes_cli.kanban_reason_comment import reason_comment
+     with _kb.write_txn(conn), reason_comment(conn, task_id, comment) as noted:
+         if _kb._awaiting_human_answer(conn, task_id):
+@@ -50,12 +52,14 @@ def schedule_task(
+         sql = """
+             UPDATE tasks
+                SET status       = 'scheduled',
++                   consecutive_failures = CASE WHEN status = 'triage' THEN 0 ELSE consecutive_failures END,
++                   last_failure_error = CASE WHEN status = 'triage' THEN NULL ELSE last_failure_error END,
+                    human_request = NULL,
+                    claim_lock   = NULL,
+                    claim_expires= NULL,
+                    worker_pid   = NULL
+              WHERE id = ?
+-               AND status IN ('todo', 'ready', 'running', 'blocked')
++               AND status IN ('todo', 'ready', 'running', 'blocked', 'triage')
+         """
+         if expected_run_id is not None:
+             sql += " AND current_run_id = ?"
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index a6c931df44a..6185a6786dc 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -53,9 +53,11 @@ def apply_block_update(conn, task_id, expected_run_id, kind, new_status, set_sql
+     sql = f"""
+         UPDATE tasks
+            SET status = '{new_status}', claim_lock = NULL, claim_expires = NULL,
++               consecutive_failures = CASE WHEN status = 'triage' THEN 0 ELSE consecutive_failures END,
++               last_failure_error = CASE WHEN status = 'triage' THEN NULL ELSE last_failure_error END,
+                worker_pid = NULL, {set_sql}
+          WHERE id = ?
+-           AND (status IN ('running', 'ready') OR (status = 'review' AND ? = 'assignment'))
++           AND (status IN ('running', 'ready', 'triage') OR (status = 'review' AND ? = 'assignment'))
+     """
+     params = (*params, task_id, kind)
+     if expected_run_id is not None:
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index 7b509fa3bd0..916add34c1c 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -139,7 +139,7 @@ def park(
+     awaiting=None, blocker_id: Optional[str] = None, run_metadata: Optional[dict] = None,
+     blocker_wake: bool = False, probe_host: Optional[str] = None,
+ ) -> bool:
+-    """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn.
++    """``running``/``ready``/``triage`` -> ``scheduled`` with a wake. Caller holds the write txn.
+     ``from_untyped_block``: an untyped ``blocked`` card with no live run (classify-in-place) instead.
+     ``awaiting`` names the producer (``kanban_awaiting.gate``: refused or escalated otherwise).
+ 
+@@ -158,7 +158,7 @@ def park(
+     else:
+         wake_at = scheduled_until(reason, now=now) or now + DEFAULT_WAKE_SECONDS
+     guard = ("status = 'blocked' AND block_kind IS NULL AND current_run_id IS NULL" if from_untyped_block
+-             else "status IN ('running', 'ready')")
++             else "status IN ('running', 'ready', 'triage')")
+     if blocker_wake:
+         record = {"kind": "clock", "inferred": True, "shared_blocker": blocker_id}
+     else:
+@@ -172,6 +172,8 @@ def park(
+     wake_check, check_every = kwc.validate_park(
+         wake_at=wake_at, wake_check=wake_check, check_every=check_every, clock_only=clock_only)
+     sql = ("UPDATE tasks SET status = 'scheduled', human_request = NULL, claim_lock = NULL, claim_expires = NULL, "
++           "consecutive_failures = CASE WHEN status = 'triage' THEN 0 ELSE consecutive_failures END, "
++           "last_failure_error = CASE WHEN status = 'triage' THEN NULL ELSE last_failure_error END, "
+            f"worker_pid = NULL WHERE id = ? AND {guard}")
+     params: tuple = (task_id,)
+     if expected_run_id is not None:
+diff --git a/tests/hermes_cli/test_kanban_triage_park.py b/tests/hermes_cli/test_kanban_triage_park.py
+new file mode 100644
+index 00000000000..82813794eb6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_triage_park.py
+@@ -0,0 +1,139 @@
++"""Supervisor parks must not expose a triage card to a remote dispatcher."""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_continuation as continuation
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatcher
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(key, raising=False)
++    from tests.hermes_cli.kanban_sync_support import write_sync_config
++    write_sync_config(home, True)
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        yield conn
++
++
++def _triage(conn):
++    parent = kb.create_task(conn, title="finished prerequisite", assignee="default")
++    assert kb.complete_task(conn, parent, summary="finished")
++    tid = kb.create_task(conn, title="remote wait", assignee="default", parents=[parent],
++                         triage=True, runs_on=["machine:other"])
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET consecutive_failures=2, last_failure_error='crashed', "
++                     "block_kind='transient', block_recurrences=1 WHERE id=?", (tid,))
++    return tid
++
++
++def _park(conn, tid, op, surface):
++    args = {"reason": "soak window", "clock_only": True, "awaiting": {"kind": "clock"}}
++    if op == "block":
++        args["kind"] = "time"
++    if surface == "db":
++        return getattr(kb, op + "_task")(conn, tid, **args)
++    if surface == "tool":
++        from tools import kanban_tools
++        result = json.loads(getattr(kanban_tools, "_handle_" + op)({"task_id": tid, **args}))
++        assert result.get("ok"), result
++        return True
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers(dest="command"))
++    argv = ["kanban", op, tid, "soak window", "--clock-only", "--awaiting", '{"kind":"clock"}']
++    if op == "block":
++        argv += ["--kind", "time"]
++    return cli.kanban_command(parser.parse_args(argv)) == 0
++
++
++@pytest.mark.parametrize("surface", ["db", "cli", "tool"])
++@pytest.mark.parametrize("op", ["schedule", "block"])
++def test_triage_parks_atomically_before_dispatch(board, op, surface):
++    tid = _triage(board)
++    before = len(kb.list_events(board, tid))
++    # Observe every status UPDATE, including intermediate states inside a transaction.
++    board.executescript("CREATE TABLE status_trace(status TEXT); CREATE TRIGGER trace_status "
++                        "AFTER UPDATE OF status ON tasks BEGIN "
++                        "INSERT INTO status_trace VALUES (NEW.status); END;")
++    assert _park(board, tid, op, surface)
++    task = kb.get_task(board, tid)
++    assert task.status == "scheduled"
++    assert json.loads(board.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0]) == ["machine:other"]
++    assert task.consecutive_failures == 0
++    assert task.last_failure_error is None
++    assert task.block_recurrences == 1
++    assert [r[0] for r in board.execute("SELECT status FROM status_trace")] == ["scheduled"]
++    events = kb.list_events(board, tid)[before:]
++    assert [e.kind for e in events if e.kind != "commented"] == ["scheduled"]
++    wake = next(e.payload["wake_at"] for e in events if e.kind == "scheduled")
++    assert continuation.wake_due_continuations(board, now=wake - 1) == []
++    spawned = []
++    dispatcher.dispatch_once(board, spawn_fn=lambda *a, **kw: spawned.append(a))
++    assert not spawned
++    assert kb.get_task(board, tid).status == "scheduled"
++    assert not {"unblocked", "promoted", "claimed"}.intersection(e.kind for e in kb.list_events(board, tid)[before:])
++    assert continuation.wake_due_continuations(board, now=wake) == [tid]
++    assert kb.get_task(board, tid).status == "ready"
++
++
++def test_triage_can_be_blocked_for_evidenced_human_action(board):
++    tid = _triage(board)
++    ask = {"action": "Unlock the iPhone", "why_human": "needs Face ID", "interaction": "physical",
++           "scope": "one unlock", "evidence": "device locked"}
++    assert kb.block_task(board, tid, kind="needs_input", reason="device locked", human_request=ask)
++    task = kb.get_task(board, tid)
++    assert task.status == "blocked"
++    assert task.consecutive_failures == 0 and task.last_failure_error is None
++
++
++@pytest.mark.parametrize("op", ["schedule", "block"])
++@pytest.mark.parametrize("status", ["done", "archived", "review"])
++def test_terminal_and_review_parks_stay_refused(board, op, status):
++    tid = _triage(board)
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++    before = kb.list_events(board, tid)
++    assert not _park(board, tid, op, "db")
++    assert kb.get_task(board, tid).status == status
++    assert kb.list_events(board, tid) == before
++
++
++@pytest.mark.parametrize("op", ["schedule", "block"])
++def test_stale_run_cannot_park_triage(board, op):
++    tid = _triage(board)
++    kwargs = {"kind": "time"} if op == "block" else {}
++    assert not getattr(kb, op + "_task")(board, tid, reason="soak", clock_only=True,
++                                          expected_run_id=999, **kwargs)
++    assert kb.get_task(board, tid).status == "triage"
++    assert kb.get_task(board, tid).consecutive_failures == 2
++
++
++@pytest.mark.parametrize("op", ["schedule", "block"])
++@pytest.mark.parametrize("kwargs", [
++    {"awaiting": {"kind": "human"}},
++    {"awaiting": {"kind": "external", "ref": "vendor-ticket"}},
++    {"awaiting": {"kind": "external", "ref": "vendor-ticket"}, "wake_check": "exit 2"},
++])
++def test_triage_park_guards_preserved(board, op, kwargs):
++    tid = _triage(board)
++    args = {"kind": "time"} if op == "block" else {}
++    before = kb.list_events(board, tid)
++    with pytest.raises(ValueError):
++        getattr(kb, op + "_task")(board, tid, reason="waiting", **args, **kwargs)
++    assert kb.get_task(board, tid).status == "triage"
++    assert kb.get_task(board, tid).consecutive_failures == 2
++    assert kb.list_events(board, tid) == before
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 3d43431ee13..6b9de5c590d 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1221,7 +1221,7 @@ def _handle_block(args: dict, **kw) -> str:
+                            blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1], awaiting=awaiting,
+                            clock_only=wake[2], human_request=kb.redact_review_value(args.get("human_request")),
+                            clear_blocker=clear_blocker)
+-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
++        _check(ok, f"could not block {tid} (unknown id or not in running/ready/triage)")
+         escalated = _escalated(kb, conn, tid)
+         if escalated:
+             return escalated
+@@ -1280,7 +1280,7 @@ def _handle_schedule(args: dict, **kw) -> str:
+             wake_check=wake[0], check_every=wake[1], clock_only=wake[2], awaiting=awaiting,
+             clear_blocker=clear_blocker)
+         _check(ok, "" if ok else krc.human_answer_refusal(conn, tid, "schedule")
+-               or f"could not schedule {tid} (unknown id, or not in todo/ready/running/blocked)")
++               or f"could not schedule {tid} (unknown id, or not in todo/ready/running/blocked/triage)")
+         escalated = _escalated(kb, conn, tid)
+         if escalated:
+             return escalated
+-- 
+2.55.0
+

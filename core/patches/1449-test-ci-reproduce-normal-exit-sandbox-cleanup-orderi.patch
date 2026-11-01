@@ -1,0 +1,168 @@
+From c74774100deac66e13b407733604f8a4215f1482 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:35:33 +0000
+Subject: [PATCH] test(ci): reproduce normal-exit sandbox cleanup ordering
+ [daveey]
+
+---
+ .github/workflows/sandbox-lifecycle-proof.yml |  28 +++++
+ tests/ci/test_plugin_sandbox_normal_exit.py   | 112 ++++++++++++++++++
+ 2 files changed, 140 insertions(+)
+ create mode 100644 .github/workflows/sandbox-lifecycle-proof.yml
+ create mode 100644 tests/ci/test_plugin_sandbox_normal_exit.py
+
+diff --git a/.github/workflows/sandbox-lifecycle-proof.yml b/.github/workflows/sandbox-lifecycle-proof.yml
+new file mode 100644
+index 00000000000..2229ac64b73
+--- /dev/null
++++ b/.github/workflows/sandbox-lifecycle-proof.yml
+@@ -0,0 +1,28 @@
++name: Sandbox lifecycle proof
++on:
++  push:
++    branches: ['sandbox-proof/**']
++  workflow_dispatch:
++permissions:
++  contents: read
++jobs:
++  real-isolation:
++    runs-on: [self-hosted, hermes-hub]
++    timeout-minutes: 20
++    steps:
++      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
++        with:
++          fetch-depth: 0
++          persist-credentials: false
++      - uses: ./.github/actions/setup-pm
++        with:
++          test-environment: 'true'
++      - name: Verify real non-root runner
++        run: |
++          test "$(id -u)" != 0
++          bwrap --version
++          uname -a
++      - name: Regression against b92048a2
++        run: |
++          git show b92048a2e0556115f268a8ad62e11ef885f21bcf:scripts/ci/plugin_validation_sandbox.py > scripts/ci/plugin_validation_sandbox.py
++          HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/ci/test_plugin_sandbox_normal_exit.py -v
+diff --git a/tests/ci/test_plugin_sandbox_normal_exit.py b/tests/ci/test_plugin_sandbox_normal_exit.py
+new file mode 100644
+index 00000000000..5fcc33e905f
+--- /dev/null
++++ b/tests/ci/test_plugin_sandbox_normal_exit.py
+@@ -0,0 +1,112 @@
++"""Real bwrap regression: cleanup must precede neither namespace exit nor writers."""
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++
++import pytest
++
++from tests.ci import test_plugin_validation_sandbox as helpers
++from tests.ci.test_plugin_validation_sandbox import SCRIPT, needs_isolation
++
++pytestmark = pytest.mark.platforms("linux")
++
++
++@pytest.fixture
++def work(tmp_path):
++    yield from helpers.work.__wrapped__(tmp_path)
++
++
++@needs_isolation
++def test_normal_exit_quiesces_namespace_before_remove_tree(work):
++    # Both sides handshake through FIFOs in the private overlay. The daemon is
++    # released only at remove_tree entry, never by a scheduling sleep.
++    home = work / "overlay"
++    home.mkdir()
++    payload = home / "payload.py"
++    payload.write_text(textwrap.dedent('''\
++        import os
++        import sys
++        from pathlib import Path
++        home = Path(sys.argv[1])
++        os.mkfifo(home / "release")
++        ready_r, ready_w = os.pipe()
++        if os.fork() == 0:
++            os.close(ready_r)
++            os.setsid()
++            if os.fork() != 0:
++                os._exit(0)
++            gate = os.open(home / "release", os.O_RDWR)
++            (home / "namespace").write_text(os.readlink("/proc/self/ns/pid"))
++            os.write(ready_w, b"r")
++            os.close(ready_w)
++            os.read(gate, 1)
++            (home / "after-remove-entry").write_text("writer ran")
++            os.write(2, b"AFTER_REMOVE_WRITE\\n")
++            os._exit(0)
++        os.close(ready_w)
++        assert os.read(ready_r, 1) == b"r"
++        os.wait()
++    '''))
++    probe = work / "probe.py"
++    probe.write_text(textwrap.dedent('''\
++        import errno
++        import importlib.util
++        import json
++        import os
++        import sys
++        from pathlib import Path
++        spec = importlib.util.spec_from_file_location("sandbox", sys.argv[1])
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++        original = mod.remove_tree
++        observations = []
++        def remove(path):
++            copy = path / "copy0" / "overlay"
++            observation = {"reader_alive": False, "namespace_alive": []}
++            try:
++                fd = os.open(copy / "release", os.O_WRONLY | os.O_NONBLOCK)
++            except OSError as exc:
++                assert exc.errno == errno.ENXIO, exc
++            else:
++                observation["reader_alive"] = True
++                try:
++                    os.write(fd, b"g")
++                except BrokenPipeError:
++                    pass
++                finally:
++                    os.close(fd)
++            namespace = (copy / "namespace").read_text()
++            for entry in Path("/proc").glob("[0-9]*/ns/pid"):
++                try:
++                    if os.readlink(entry) == namespace:
++                        observation["namespace_alive"].append(str(entry))
++                except FileNotFoundError:
++                    pass
++                except PermissionError:
++                    pass  # unrelated host processes, not this uid's sandbox
++            observation["late_file"] = (copy / "after-remove-entry").exists()
++            observations.append(observation)
++            original(path)
++        mod.remove_tree = remove
++        statuses = []
++        for _ in range(30):
++            statuses.append(mod.main(["--no-network", "--overlay", sys.argv[2],
++                "--overlay-mode", "copy", "--", "/usr/bin/python3", "-I", "-S",
++                sys.argv[2] + "/payload.py", sys.argv[2]]))
++        print(json.dumps({"observations": observations, "statuses": statuses}))
++    '''))
++    result = subprocess.run([sys.executable, "-I", str(probe), str(SCRIPT), str(home)],
++                            env={**os.environ, "RUNNER_TEMP": str(work)},
++                            capture_output=True, text=True, timeout=120, check=False)
++    assert result.returncode == 0, result.stderr
++    evidence = json.loads(result.stdout)
++    assert evidence["statuses"] == [0] * 30, result.stderr
++    assert len(evidence["observations"]) == 30
++    assert not any(o["reader_alive"] or o["namespace_alive"] or o["late_file"]
++                   for o in evidence["observations"]), evidence
++    assert "AFTER_REMOVE_WRITE" not in result.stderr, result.stderr
++    assert not list(work.glob("plugin-sandbox-*"))
+-- 
+2.55.0
+

@@ -1,7 +1,7 @@
 # "Stopped by <login>": a client Stop names who stopped the turn
 
 Patches: `patches/0126-feat-tui-name-who-stopped-a-turn-and-leave-a-visible.patch`; 1323 (SSH-attached Desktop reads
-"Desktop"; every Stop names its gesture).
+"Desktop"; every Stop names its gesture); 1431 (`d9e0c56cb2`, Escape inside the contenteditable composer).
 
 What you see: when a running turn is stopped from a client, the chat ends with a system line such as
 "Stopped by alice" (a remote client logged in as `alice`, for example a phone app) or "turn stopped" (the local
@@ -33,6 +33,9 @@ just went quiet and looked stuck. The gateway log also names who sent each Stop.
   (a Stop that raced the end); or the turn was interrupted by the system (reapers, lease loss, shutdown), since only a
   client Stop records an issuer. The recorded issuer is always consumed when the turn ends.
 - No config keys.
+- Patch 1431 makes Escape inside the real contenteditable `ChatBar` send `esc` exactly once while busy.
+  An idle composer does not cancel. The separate `useComposerEscCancel` hook covers non-editor focus;
+  testing that hook alone does not exercise the editor's own key handler.
 
 ## How it works
 
@@ -46,7 +49,8 @@ just went quiet and looked stuck. The gateway log also names who sent each Stop.
   carry it.
 - Desktop: `apps/desktop/src/lib/stop-origin.ts` (`StopOrigin`, `interruptParams(sessionId, origin)`, which drops a
   non-string such as a MouseEvent when a cancel handler is wired to `onClick`). Call sites: `cancelRun(origin)` in
-  `use-prompt-actions/index.ts` (fed `stop_button` by `use-composer-submit.ts`, `esc` by `use-composer-esc-cancel.ts`,
+  `use-prompt-actions/index.ts` (fed `stop_button` by `use-composer-submit.ts`, `esc` by the contenteditable
+  `ChatBar` handler in `composer/index.tsx` via `haltRun('esc')` and separately by `use-composer-esc-cancel.ts`,
   `send_now` by `use-composer-queue.ts`, `transcript` by `app/chat/index.tsx`), `session-tile-actions.ts`
   (`tile`/`tile:esc`), `use-session-tile-delegate.ts` (`interruptSession(id, origin='tile')`), `slash.ts` (`slash`),
   `use-session-actions/index.ts` (`delete`), `rewind.ts` (`rewind`), `plugins/hermes-bots/group-rounds.ts`.
@@ -67,6 +71,8 @@ just went quiet and looked stuck. The gateway log also names who sent each Stop.
 - `tui_gateway/methods_session_interrupt.py`: `_STOP_NOTICE_KIND`, `_stop_issuer_label`, `_note_stop_issuer`,
   `_record_stop_notice`, call in the `session.interrupt` handler.
 - `tui_gateway/prompt_turn.py`: call in `_run_prompt_submit`.
+- `apps/desktop/src/app/chat/composer/index.tsx`: editor Escape calls `haltRun('esc')` when busy and not awaiting input.
+- `apps/desktop/src/app/chat/composer/editor-esc-origin.test.tsx`: mounted real `ChatBar` regression (patch 1431).
 - `apps/desktop/src/lib/chat-messages/hydration.ts`, `apps/desktop/src/types/hermes.ts`,
   `apps/desktop/e2e/core/oracle.ts`.
 
@@ -106,6 +112,17 @@ rewind → `rewind`), `session-tile-actions.test.ts` (`tile`, `tile:esc`), `use-
 `canonical-protocol.test.ts` (stripped on the canonical wire). Untested: the `transcript` origin (assistant runtime
 cancel in `app/chat/index.tsx`).
 
+Patch 1431 adds `apps/desktop/src/app/chat/composer/editor-esc-origin.test.tsx`: it mounts the real `ChatBar`
+with runtime, router and i18n providers, focuses the rich editor and dispatches Escape. The busy case asserts
+`onCancel` is called exactly once with `esc`; the idle case asserts no cancel. This covers the editor entry
+path, unlike the separate `use-composer-esc-cancel.test.tsx` hook tests for non-editor focus.
+
+Source verification supplied by the implementation owner: **70 targeted tests passed** across
+`editor-esc-origin`, `use-composer-esc-cancel` and `use-composer-submit`; the exact original head
+`953727537d` had CI **SUCCESS**, and PR #438 merged as `d9e0c56cb2`. These are attributed source results,
+not reruns by this mirror. A mounted jsdom regression is not live Desktop proof; that check belongs to the
+implementation owner and is not asserted here.
+
 Desktop, `apps/desktop/src/lib/chat-messages.test.ts` "renders a client Stop notice as a system line naming who
 stopped the turn" (passes): hydrated `turn_stopped` rows become system messages showing `display_text`, or "turn
 stopped" without it.
@@ -115,6 +132,10 @@ than `session.interrupt` (e.g. a slash command), and the live Desktop showing th
 covers history hydration only).
 
 ## Applying
+
+Patch 1431 extends patch 1323's origin plumbing; apply it after those existing composer/stop-origin changes
+using the current [series applying recipe](README.md#applying). It is not a standalone implementation of
+Stop attribution. This mirror documents the patch and does not claim a new source-test run or app rebuild.
 
 Standalone: new code in `methods_session_interrupt.py`, one call in `prompt_turn.py`, and three small Desktop edits.
 It relies on `_transport_auth_user_id`, `_submit_row_target_key` and the `display_kind`/`display_metadata` message
@@ -128,6 +149,8 @@ merge-base `4957bbd0a0` (Oct 17, 2026 PT).
 - The label is the login, not a device name. Two devices on the same login read the same. To tell which door
   stopped a turn, read `origin=` on the `session.interrupt:` line in agent.log (or `stop_origin` on the notice row).
 - The canonical session protocol drops `origin`; a Stop over it logs nothing gesture-specific.
+- Editor Escape and non-editor Escape are distinct entry paths. A hook-only test cannot prove the contenteditable
+  path forwards the gesture. Patch 1431 fixes the editor path without changing the key binding or Stop-button origin.
 - A local Stop with no login says "Desktop" even if it came from another local client.
 
 ## Plugin?

@@ -1,0 +1,347 @@
+From ffc499f672bde03ce0e467526c40e4812b4aa4ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 09:23:23 +0000
+Subject: [PATCH] ci(plugin-catalog): diff from trees on the blobless fork
+ checkout; admit upstream-synced entries by content [daveey]
+
+pinned-source-validate on the private fork died before validating anything
+(run 41184050808, upstream sync PR #430): `git diff` rename detection lazily
+fetched an old blob from the promisor remote after checkout had removed the
+token (persist-credentials: false) -> "could not read Username" / "could not
+fetch 8d99fe66... from promisor remote". Upstream's repo is public, so the
+anonymous lazy fetch only ever worked there.
+
+- Both diffs run with --no-renames: --name-only needs trees only, a rename
+  lists as delete-old + add-new so the new path still reaches the gate, and
+  the data-only check now sees both paths of a moved file. No credential
+  comes back into the job that runs plugin code.
+- An upstream sync lands upstream's catalog entries with upstream's core. A
+  mixed PR is admitted only when EVERY changed entry is identical (mode and
+  blob) to the PR's merge-base with upstream main, fetched anonymously.
+  One entry of the PR's own -- new, edited, re-pinned to an older upstream
+  version, or mode-swapped -- keeps the data-only rejection; an unreachable
+  upstream fails closed. Branch names play no part, and every entry is still
+  validated at its pin.
+- The workflow now also runs when it changes itself.
+
+Tests run the real step against a blobless clone with an unreachable
+promisor (RED on main with the exact promisor error, GREEN here), a legit
+upstream sync, four hostile mixed-admission variants and the fail-closed
+upstream. Mode comparison is mutation-checked.
+---
+ .github/workflows/plugin-catalog-ci.yml       |  64 ++++--
+ .../ci/test_plugin_catalog_ci_confinement.py  | 190 ++++++++++++++++--
+ 2 files changed, 229 insertions(+), 25 deletions(-)
+
+diff --git a/.github/workflows/plugin-catalog-ci.yml b/.github/workflows/plugin-catalog-ci.yml
+index e5c65668eba..8e54e2081d9 100644
+--- a/.github/workflows/plugin-catalog-ci.yml
++++ b/.github/workflows/plugin-catalog-ci.yml
+@@ -14,6 +14,8 @@ on:
+   pull_request:
+     paths:
+       - "plugin-catalog/**"
++      # A change to the gate itself runs the gate it changes.
++      - ".github/workflows/plugin-catalog-ci.yml"
+ 
+ permissions:
+   contents: read
+@@ -61,6 +63,10 @@ jobs:
+ 
+       - name: Find changed catalog entries
+         id: changed
++        env:
++          # Public upstream, fetched anonymously for the upstream-sync check.
++          UPSTREAM_REPO: https://github.com/NousResearch/hermes-agent.git
++          GIT_TERMINAL_PROMPT: "0"
+         run: |
+           set -euo pipefail
+           # HEAD is the PR merge commit: diffing it against its first parent is
+@@ -70,10 +76,16 @@ jobs:
+             echo "::error::expected the pull_request merge commit as HEAD"
+             exit 1
+           fi
+-          # Added + modified + renamed + typechanged entry files only; deletions
+-          # and removed.yaml have nothing to clone. A rename or file->symlink
+-          # change that slipped past this list would skip the supply-chain gate.
+-          CHANGED=$(git diff --name-only --diff-filter=AMRT 'HEAD^1' HEAD \
++          # Added + modified + typechanged entry files only; deletions and
++          # removed.yaml have nothing to clone. A file->symlink change that
++          # slipped past this list would skip the supply-chain gate.
++          # --no-renames: this checkout is blobless and its token is already
++          # removed (persist-credentials: false), so rename detection's
++          # similarity check would lazily fetch old blobs from the private fork
++          # and die on a credential prompt. Tree entries alone answer
++          # --name-only, and a rename lists as delete-old + add-new, so the new
++          # path still reaches the gate.
++          CHANGED=$(git diff --no-renames --name-only --diff-filter=AMT 'HEAD^1' HEAD \
+             -- 'plugin-catalog/*.yaml' 'plugin-catalog/*.yml')
+           # The grep can only shrink the list and runs on its own so a git diff
+           # failure still fails the step instead of looking like "no changes".
+@@ -85,16 +97,44 @@ jobs:
+             # hermes) resolves from the PR checkout, so an entry PR that also
+             # touches tooling could neuter the gate vetting it. Contributor
+             # email maps are data the gate never executes; README/policy/CI PRs
+-            # with no entry change skip this check.
+-            ALL=$(git diff --name-only 'HEAD^1' HEAD)
++            # with no entry change skip this check. Without renames, both the
++            # old and the new path of a moved file count here.
++            ALL=$(git diff --no-renames --name-only 'HEAD^1' HEAD)
+             OUTSIDE=$(printf '%s' "$ALL" | grep -vE '^(plugin-catalog|contributors/emails)/' || true)
+             if [ -n "$OUTSIDE" ]; then
+-              echo "::error::catalog entry PRs may only touch plugin-catalog/** and contributors/emails/**, found:"
+-              # Filenames are PR-controlled; a newline in one could smuggle a
+-              # workflow command into the log.
+-              printf '%s' "$OUTSIDE" | tr '\0\n' ' '
+-              echo
+-              exit 1
++              # (fork) An upstream sync lands upstream's catalog entries together
++              # with upstream's core in one merge. Such a PR passes only if EVERY
++              # changed entry is identical (mode and blob) to the newest upstream
++              # commit it contains, its merge-base with upstream main, which
++              # upstream's own catalog gate admitted. Provenance is the content,
++              # never the branch name: a single entry of the PR's own (new,
++              # re-pinned or edited) keeps the data-only rule, and an unreachable
++              # upstream fails closed. Every entry is still validated below.
++              UNTRUSTED="$CHANGED"
++              if git fetch --quiet --no-tags --filter=blob:none "$UPSTREAM_REPO" \
++                    '+refs/heads/main:refs/catalog-gate/upstream' </dev/null \
++                  && UPSTREAM_BASE=$(git merge-base HEAD refs/catalog-gate/upstream); then
++                UNTRUSTED=$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do
++                    [ -z "$f" ] && continue
++                    ours=$(git ls-tree HEAD -- "$f" | cut -f1)
++                    theirs=$(git ls-tree "$UPSTREAM_BASE" -- "$f" | cut -f1)
++                    if [ -z "$ours" ] || [ "$ours" != "$theirs" ]; then printf '%s\n' "$f"; fi
++                  done)
++              else
++                echo "::warning::could not resolve upstream main; no entry counts as upstream-admitted"
++              fi
++              if [ -n "$UNTRUSTED" ]; then
++                echo "::error::catalog entry PRs may only touch plugin-catalog/** and contributors/emails/**, found:"
++                # Filenames are PR-controlled; a newline in one could smuggle a
++                # workflow command into the log.
++                printf '%s' "$OUTSIDE" | tr '\0\n' ' '
++                echo
++                echo "Entries not identical to upstream main's merge-base:"
++                printf '%s' "$UNTRUSTED" | tr '\0\n' ' '
++                echo
++                exit 1
++              fi
++              echo "Upstream sync: every changed entry matches upstream $UPSTREAM_BASE; non-catalog changes allowed."
+             fi
+           fi
+ 
+diff --git a/tests/ci/test_plugin_catalog_ci_confinement.py b/tests/ci/test_plugin_catalog_ci_confinement.py
+index 9c92d11fa1e..c40544113db 100644
+--- a/tests/ci/test_plugin_catalog_ci_confinement.py
++++ b/tests/ci/test_plugin_catalog_ci_confinement.py
+@@ -282,6 +282,43 @@ def _typechange(repo):
+ 
+ 
+ NEW = {"plugin-catalog/new.yaml": "name: new\n"}
++UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
++
++
++def _step_env(name_prefix: str) -> dict:
++    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
++    for job in data["jobs"].values():
++        for step in job["steps"]:
++            if step.get("name", "").startswith(name_prefix):
++                return {k: str(v) for k, v in (step.get("env") or {}).items()}
++    raise LookupError(name_prefix)
++
++
++def _pr_merge(repo: Path) -> None:
++    """Shape of GitHub's pull_request checkout: a merge commit of branch `pr`
++    whose first parent is the base tip, checked out detached."""
++    _git(repo, "checkout", "-q", "main")
++    _git(repo, "merge", "-q", "--no-ff", "-m", "merge", "pr")
++    _git(repo, "checkout", "-q", "--detach")
++
++
++def _find_changed(tmp_path: Path, repo: Path, upstream: Path | None = None):
++    """Run the changed-entries step with its workflow env. The step's upstream
++    URL is rewritten to the `upstream` fixture, or to a missing path when None."""
++    out = tmp_path / "gh-output.txt"
++    out.write_text("", encoding="utf-8")
++    env = _step_env("Find changed catalog")
++    target = upstream if upstream is not None else tmp_path / "no-upstream"
++    env = {
++        **os.environ, **env, "GITHUB_OUTPUT": str(out),
++        "GIT_CONFIG_COUNT": "1",
++        "GIT_CONFIG_KEY_0": f"url.{target.as_uri()}.insteadOf",
++        # Fallback so the harness also runs an older workflow copy (RED proof).
++        "GIT_CONFIG_VALUE_0": env.get("UPSTREAM_REPO", UPSTREAM_URL),
++    }
++    res = _run(_step("Find changed catalog"), tmp_path, repo, env)
++    lines = out.read_text(encoding="utf-8").splitlines()
++    return res, [f for f in lines if f and "__EOF__" not in f and f != "files<<__EOF__"]
+ 
+ 
+ @pytest.mark.parametrize("change, rc, listed, text", [
+@@ -304,22 +341,149 @@ def test_changed_entries_step(tmp_path, change, rc, listed, text):
+     repo = tmp_path / "pr"
+     _write(repo, {"plugin-catalog/old.yaml": "name: old\n", "plugin-catalog/README.md": "rules\n"})
+     _git(repo, "init", "-qb", "main")
+-    base = _commit(repo, "base")
++    _commit(repo, "base")
+     _git(repo, "checkout", "-qb", "pr")
+     change(repo)
+     _commit(repo, "pr")
+-    # Shape of GitHub's pull_request checkout: a merge commit whose first parent
+-    # is the base tip (also origin/main, for the merge-base form of the step).
+-    _git(repo, "checkout", "-q", "main")
+-    _git(repo, "merge", "-q", "--no-ff", "-m", "merge", "pr")
+-    _git(repo, "checkout", "-q", "--detach")
+-    _git(repo, "update-ref", "refs/remotes/origin/main", base)
+-    out = tmp_path / "gh-output.txt"
+-    out.touch()
+-    res = _run(_step("Find changed catalog"), tmp_path, repo,
+-               {**os.environ, "GITHUB_OUTPUT": str(out)})
++    _pr_merge(repo)
++    res, files = _find_changed(tmp_path, repo)
+     assert res.returncode == rc, res.stdout + res.stderr
+-    lines = out.read_text(encoding="utf-8").splitlines()
+-    assert [f for f in lines if f and "__EOF__" not in f and f != "files<<__EOF__"] == listed
++    assert files == listed
+     if text:
+         assert text in res.stdout
++
++
++# ── upstream sync through the changed-entries step ───────────────────────────
++
++CORE = "".join(f"line {i}\n" for i in range(40))
++
++
++def _sync_fixture(tmp_path: Path, pr_change=None) -> tuple[Path, Path]:
++    """Upstream U0 -> U1 -> U2 and a fork synced to U1 whose PR branch merges U2.
++
++    U1 re-pins old.yaml (the fork's base already has it); U2 adds up.yaml,
++    re-pins old.yaml again and moves + edits a core file, so the merge mixes
++    entries with core and a git rename candidate. `pr_change` runs on the PR
++    branch after the upstream merge.
++    """
++    up = tmp_path / "upstream"
++    _write(up, {"plugin-catalog/old.yaml": "name: old\n", "core/tool.py": CORE})
++    _git(up, "init", "-qb", "main")
++    _commit(up, "U0")
++    _write(up, {"plugin-catalog/old.yaml": "name: old\nsha: 2\n"})
++    _commit(up, "U1")
++    fork = tmp_path / "pr"
++    _git(tmp_path, "clone", "-q", str(up), str(fork))
++    _write(fork, {"fork.txt": "fork-local\n"})
++    _commit(fork, "fork main")
++    _write(up, {"plugin-catalog/up.yaml": "name: up\nsha: 1\n",
++                "plugin-catalog/old.yaml": "name: old\nsha: 3\n"})
++    _git(up, "mv", "core/tool.py", "core/moved.py")
++    (up / "core" / "moved.py").write_text(CORE + "edited\n", encoding="utf-8")
++    _commit(up, "U2")
++    _git(fork, "checkout", "-qb", "pr")
++    _git(fork, "fetch", "-q", str(up), "main")
++    _git(fork, "merge", "-q", "--no-ff", "-m", "sync", "FETCH_HEAD")
++    if pr_change:
++        pr_change(fork)
++        _commit(fork, "pr change")
++    _pr_merge(fork)
++    _git(fork, "remote", "remove", "origin")
++    return up, fork
++
++
++def _own_entry(repo):
++    _write(repo, {"plugin-catalog/evil.yaml": "name: evil\nsha: 6\n"})
++
++
++def _edited_upstream_entry(repo):
++    _write(repo, {"plugin-catalog/up.yaml": "name: up\nsha: evil\n"})
++
++
++def _stale_upstream_version(repo):
++    # Exactly U0's old.yaml: admitted upstream once, but not what U2 pins now.
++    _write(repo, {"plugin-catalog/old.yaml": "name: old\n"})
++
++
++def _mode_swapped_upstream_entry(repo):
++    # Same blob id as upstream's up.yaml, but a symlink (mode 120000).
++    (repo / "plugin-catalog" / "up.yaml").unlink()
++    (repo / "plugin-catalog" / "up.yaml").symlink_to("name: up\nsha: 1\n")
++
++
++SYNCED = ["plugin-catalog/old.yaml", "plugin-catalog/up.yaml"]
++
++
++def test_upstream_sync_of_entries_with_core_passes(tmp_path):
++    """Upstream's admitted entries may land beside upstream's core, and still
++    reach the pinned-source gate."""
++    up, fork = _sync_fixture(tmp_path)
++    res, files = _find_changed(tmp_path, fork, upstream=up)
++    assert res.returncode == 0, res.stdout + res.stderr
++    assert files == SYNCED
++    assert "Upstream sync: every changed entry matches upstream" in res.stdout
++
++
++@pytest.mark.parametrize("change, culprit", [
++    (_own_entry, "plugin-catalog/evil.yaml"),
++    (_edited_upstream_entry, "plugin-catalog/up.yaml"),
++    (_stale_upstream_version, "plugin-catalog/old.yaml"),
++    (_mode_swapped_upstream_entry, "plugin-catalog/up.yaml"),
++], ids=lambda c: c if isinstance(c, str) else c.__name__.lstrip("_"))
++def test_hostile_mixed_admission_inside_a_sync_fails(tmp_path, change, culprit):
++    """Riding an upstream merge must not admit an entry upstream never had at
++    that commit: any one such entry restores the data-only rule for the PR."""
++    up, fork = _sync_fixture(tmp_path, change)
++    res, files = _find_changed(tmp_path, fork, upstream=up)
++    assert res.returncode == 1, res.stdout + res.stderr
++    assert "may only touch plugin-catalog/**" in res.stdout
++    untrusted = res.stdout.split("Entries not identical to upstream", 1)[1]
++    assert culprit in untrusted
++    assert files == []
++
++
++def test_unreachable_upstream_fails_closed(tmp_path):
++    _, fork = _sync_fixture(tmp_path)
++    res, files = _find_changed(tmp_path, fork, upstream=None)
++    assert res.returncode == 1, res.stdout + res.stderr
++    assert "could not resolve upstream main" in res.stdout
++    assert files == []
++
++
++def _entry_rename_with_edit(tmp_path: Path) -> tuple[None, Path]:
++    repo = tmp_path / "pr"
++    _write(repo, {"plugin-catalog/old.yaml": "name: old\n" + "# pad\n" * 20})
++    _git(repo, "init", "-qb", "main")
++    _commit(repo, "base")
++    _git(repo, "checkout", "-qb", "pr")
++    _git(repo, "mv", "plugin-catalog/old.yaml", "plugin-catalog/renamed.yaml")
++    (repo / "plugin-catalog" / "renamed.yaml").write_text(
++        "name: old\nsha: 2\n" + "# pad\n" * 20, encoding="utf-8")
++    _commit(repo, "pr")
++    _pr_merge(repo)
++    return None, repo
++
++
++@pytest.mark.parametrize("scenario, listed", [
++    (_entry_rename_with_edit, ["plugin-catalog/renamed.yaml"]),
++    (_sync_fixture, SYNCED),
++], ids=["entry-rename-with-edit", "upstream-sync"])
++def test_blobless_checkout_of_a_private_fork_needs_no_credentials(tmp_path, scenario, listed):
++    """CI checks out blobless and then drops the token, so a lazy blob fetch
++    from the private fork hits a credential prompt. The step must answer from
++    trees alone: here the promisor remote is unreachable, as the token-less
++    https remote is in CI."""
++    up, src = scenario(tmp_path)
++    _git(src, "config", "uploadpack.allowFilter", "true")
++    head = _git(src, "rev-parse", "HEAD")
++    clone = tmp_path / "blobless"
++    _git(tmp_path, "clone", "-q", "--filter=blob:none", "--no-checkout", src.as_uri(), str(clone))
++    _git(clone, "checkout", "-q", "--detach", head)
++    _git(clone, "remote", "set-url", "origin", "https://fixture.invalid/private-fork.git")
++    # HEAD^1's blobs really are missing: reading one would need the remote.
++    missing = _git(clone, "rev-list", "--objects", "--missing=print", "HEAD^1")
++    assert any(line.startswith("?") for line in missing.splitlines())
++    res, files = _find_changed(tmp_path, clone, upstream=up)
++    assert res.returncode == 0, res.stdout + res.stderr
++    assert "promisor remote" not in res.stderr
++    assert files == listed
+-- 
+2.55.0
+

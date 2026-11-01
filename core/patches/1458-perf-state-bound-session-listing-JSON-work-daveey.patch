@@ -1,0 +1,163 @@
+From f7bc2d30afe36f1c772442b877c3f0272094963a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 12:32:29 -0700
+Subject: [PATCH] perf(state): bound session listing JSON work [daveey]
+
+---
+ hermes_state_common.py                        |  7 ++
+ hermes_state_sessions.py                      | 14 +--
+ .../test_session_list_json_work.py            | 94 +++++++++++++++++++
+ 3 files changed, 108 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_state/test_session_list_json_work.py
+
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 7ebeec8034d..5fe9f6f0dd0 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -935,6 +935,13 @@ CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started
+ """
+ 
+ 
++# Store the exact marker expressions used by list/count predicates, not a TTL projection.
++# Unrelated writes and heartbeats do not re-parse model_config; marker writes update the index.
++DEFERRED_INDEX_SQL += (
++    "CREATE INDEX IF NOT EXISTS idx_sessions_list_markers ON sessions(archived, hidden, "
++    + ", ".join(_sql_json_extract('model_config', f'$.{marker}')
++                for marker in ('_delegate_from', '_branched_from', '_reset_from')) + ");\n")
++
+ # ── Deferred FTS rebuild bookkeeping (schema v23) ──
+ # While a background index rebuild is pending, two state_meta keys define
+ # which message rows are currently IN the FTS indexes:
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+index 33e04c3b52e..b560f777e58 100644
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -1372,18 +1372,18 @@ class SessionSessionsMixin:
+             # Unless a search needs every row's chain (it matches a row's own id and
+             # title through it), only rows that HAVE a child seed the walk. A
+             # childless row's chain is itself alone, so its MAX is just its own
+-            # last_active, which the outer COALESCE reads directly. Seeding every
+-            # admitted row made the CTE + GROUP BY materialise the whole table on
+-            # every page: ~12s of a 13s list on a 25k-session store where 1 row had
+-            # a child, at LIMIT 1 or 200.
++            # last_active, which the outer COALESCE reads directly.
++            # Drive from distinct parent ids via idx_sessions_parent, then look up each seed by PK.
++            # A correlated EXISTS still parsed every childless row's JSON before rejecting it.
+             id_needle = (id_query or "").strip().lower()
+             search_needle = (search_query or "").strip().lower()
+-            seed_where = where_sql if (id_needle or search_needle) else _where_sql(where_clauses + [
+-                "EXISTS (SELECT 1 FROM sessions _seed_c WHERE _seed_c.parent_session_id = s.id)"])
++            seed_from = "sessions s" if (id_needle or search_needle) else (
++                "(SELECT DISTINCT parent_session_id FROM sessions WHERE parent_session_id IS NOT NULL) roots "
++                "CROSS JOIN sessions s ON s.id = roots.parent_session_id")
+             outer_where, id_params = self._chain_search_where(where_sql, id_needle, search_needle)
+             query = f"""
+                 WITH RECURSIVE chain(root_id, cur_id) AS (
+-                    SELECT s.id, s.id FROM sessions s {seed_where}
++                    SELECT s.id, s.id FROM {seed_from} {where_sql}
+                     UNION ALL
+                     SELECT c.root_id, child.id
+                     FROM chain c
+diff --git a/tests/hermes_state/test_session_list_json_work.py b/tests/hermes_state/test_session_list_json_work.py
+new file mode 100644
+index 00000000000..68e7a65c44c
+--- /dev/null
++++ b/tests/hermes_state/test_session_list_json_work.py
+@@ -0,0 +1,94 @@
++"""Idle sidebar polls must not parse every childless row twice."""
++import sqlite3
++
++import pytest
++
++from hermes_state import SessionDB
++
++
++def test_recent_chain_seed_does_not_parse_childless_rows(tmp_path):
++    with SessionDB(db_path=tmp_path / 'state.db') as db:
++        # No index-dependent shortcut: also cover a legacy read-only database.
++        assert db._conn is not None
++        db._conn.execute('DROP INDEX IF EXISTS idx_sessions_list_markers')
++        db._conn.executemany(
++            "INSERT INTO sessions(id,source,started_at,model_config) VALUES(?, 'cli', ?, '{}')",
++            [(f'root-{i}', i + 1) for i in range(500)])
++        calls = []
++        with sqlite3.connect(':memory:') as native:
++            def valid(value):
++                calls.append(value)
++                return native.execute('SELECT json_valid(?)', (value,)).fetchone()[0]
++            with db._read_ctx() as conn:
++                conn.create_function('json_valid', 1, valid, deterministic=True)
++            db.list_sessions_rich(limit=500, compact_rows=True)
++            outer_calls = len(calls)
++            assert outer_calls > 0
++            calls.clear()
++            rows = db.list_sessions_rich(limit=10, order_by_last_active=True, compact_rows=True)
++        assert [row['id'] for row in rows] == [f'root-{i}' for i in range(499, 489, -1)]
++        # Compare the same filter without a chain; SQL may evaluate a marker more than once.
++        assert len(calls) <= outer_calls + 50, (len(calls), outer_calls)
++
++
++def test_unchanged_count_uses_stored_marker_values(tmp_path):
++    with SessionDB(db_path=tmp_path / 'state.db') as db:
++        assert db._conn is not None
++        db._conn.executemany(
++            "INSERT INTO sessions(id,source,started_at,model_config) VALUES(?, 'cli', ?, '{}')",
++            [(f'root-{i}', i + 1) for i in range(500)])
++        calls = []
++        with sqlite3.connect(':memory:') as native:
++            def valid(value):
++                calls.append(value)
++                return native.execute('SELECT json_valid(?)', (value,)).fetchone()[0]
++            with db._read_ctx() as conn:
++                conn.create_function('json_valid', 1, valid, deterministic=True)
++            for i in range(3):
++                db._conn.execute('INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)', ('unrelated', str(i)))
++                assert db.session_count(exclude_children=True) == 500
++        assert len(calls) < 50, len(calls)
++
++
++@pytest.mark.parametrize('scope', [
++    {}, {'include_subagents': True}, {'include_children': True}, {'include_archived': True},
++    {'archived_only': True}, {'include_pinned': True}, {'source': 'cli'}, {'sources': ['cli', 'local']},
++    {'exclude_sources': ['cli']}, {'min_message_count': 1}, {'id_query': 'row'}, {'search_query': 'row'},
++    {'local_created_sources': ['desktop']},
++])
++def test_marker_index_upgrade_preserves_legacy_listing(tmp_path, scope):
++    path = tmp_path / 'state.db'
++    configs = [None, '{broken', '[]', '"scalar"', '{}', '{"_delegate_from": null}',
++               '{"\\u005fdelegate_from": "parent"}', '{"_branched_from": "parent"}',
++               '{"_reset_from": "parent"}', b'{"_delegate_from":"parent"}']
++    with SessionDB(db_path=path) as db:
++        assert db._conn is not None
++        db._conn.execute('DROP INDEX idx_sessions_list_markers')
++        db._conn.execute("INSERT INTO sessions(id, source, started_at, end_reason) VALUES('parent','cli',1,'compression')")
++        db._conn.executemany(
++            "INSERT INTO sessions(id,source,created_source,started_at,model_config,parent_session_id,"
++            "archived,pinned,hidden,message_count,title) VALUES(?,?,'desktop',?,?,?,?,?,?,?,?)",
++            [(f'row-{i}', 'cli' if i % 2 else 'local', i + 2, config, 'parent' if i % 2 else None,
++              int(i == 4), int(i == 4), int(i == 3), i, f'row {i}') for i, config in enumerate(configs)])
++    def listing(db):
++        return db.list_sessions_rich(limit=100, order_by_last_active=True, compact_rows=True, **scope)
++    # Read-only legacy databases remain usable and do not migrate themselves.
++    with SessionDB(db_path=path, read_only=True) as db:
++        before = listing(db)
++        count = db.session_count(exclude_children=True)
++        assert db._conn.execute("SELECT 1 FROM sqlite_master WHERE name='idx_sessions_list_markers'").fetchone() is None
++    with SessionDB(db_path=path) as db:
++        assert db._conn.execute("SELECT 1 FROM sqlite_master WHERE name='idx_sessions_list_markers'").fetchone()
++        assert listing(db) == before
++        assert db.session_count(exclude_children=True) == count
++        # Transactional expression values must follow writes and roll back with their rows.
++        db._conn.execute('BEGIN')
++        db._conn.execute("UPDATE sessions SET model_config=? WHERE id='parent'", ('{"_delegate_from":"parent"}',))
++        from hermes_state_sessions import _session_filter_where
++        clauses, params = _session_filter_where(exclude_children=True)
++        assert db._conn.execute('SELECT count(*) FROM sessions s WHERE ' + ' AND '.join(clauses), params).fetchone()[0] == count - 1
++        db._conn.rollback()
++        assert db.session_count(exclude_children=True) == count
++        assert listing(db) == before
++        db._conn.execute("UPDATE sessions SET model_config=? WHERE id='parent'", ('{"_delegate_from":"parent"}',))
++        assert db.session_count(exclude_children=True) == count - 1
+-- 
+2.55.0
+

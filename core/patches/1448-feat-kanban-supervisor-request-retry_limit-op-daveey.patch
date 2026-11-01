@@ -1,0 +1,583 @@
+From b015c287ec58d46abecc9a10f045d66f89f90cdc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:21:12 +0000
+Subject: [PATCH] feat(kanban): supervisor-request retry_limit op [daveey]
+
+A worker that created a flaky card had no supported route to widen its retry
+breaker after creation: the worker shell is fenced from 'hermes kanban edit'
+and kanban_supervisor_request only had link/unlink/reconcile_notify/resume.
+
+New op {op: retry_limit, task_id, max_retries 1-10} (bools refused), its own
+request family. Scope: only a live card the requester created, never the
+requester's own card (self_scope), never archived/done targets. The non-worker
+executor re-checks scope and the requester at execution, applies through
+kanban_db_operator.edit_operator_fields only (one 'edited' event), reports
+old/new/readback, and marks the target with a supervisor_retry_limit event so
+a redelivered request reports already_applied instead of writing twice.
+kanban_create's cap now comes from the same MAX_RETRY_LIMIT.
+---
+ hermes_cli/kanban_retry_limit_exec.py         | 148 +++++++++++
+ hermes_cli/kanban_supervisor_requests.py      |  30 ++-
+ .../test_kanban_retry_limit_exec.py           | 244 ++++++++++++++++++
+ tools/kanban_tools_create_args.py             |   2 +-
+ tools/kanban_tools_schemas.py                 |  12 +-
+ 5 files changed, 428 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_retry_limit_exec.py
+ create mode 100644 tests/hermes_cli/test_kanban_retry_limit_exec.py
+
+diff --git a/hermes_cli/kanban_retry_limit_exec.py b/hermes_cli/kanban_retry_limit_exec.py
+new file mode 100644
+index 00000000000..3d5eb53c018
+--- /dev/null
++++ b/hermes_cli/kanban_retry_limit_exec.py
+@@ -0,0 +1,148 @@
++"""Supervisor ``retry_limit`` op: set the retry breaker on a card the requester created. [daveey]
++
++A worker that fans out a flaky card (a runner job, a CI probe) may need a wider retry breaker
++than the config default, but ``kanban_create`` only sets it at creation and the worker shell is
++fenced from ``hermes kanban edit`` (``_is_delegated_child_cli_mutation``). ``retry_limit`` is
++the edit route, executed by the existing non-worker supervisor-request executor
++(:mod:`hermes_cli.kanban_supervisor_requests`) through the operator API
++:func:`hermes_cli.kanban_db_operator.edit_operator_fields`, which writes only ``max_retries`` and
++appends the ordinary ``edited`` event. It is deliberately narrow:
++
++* **Only cards the requester created.** ``creator_task_id`` is stamped by the kernel from the
++  creating worker's own task. Not the creator chain, not siblings, not grandchildren.
++* **Never the requester's own card** (``self_scope``): a worker must not widen its own breaker.
++* **Bounded.** ``max_retries`` is an int 1..``MAX_RETRY_LIMIT``; bools are refused.
++* **Live cards only.** Archived or done targets, and a finished requester, are refused.
++
++Execution re-checks scope and the requester against the board as it is now. Each applied op
++appends a ``supervisor_retry_limit`` event carrying the request id, so a redelivered request
++(crash after the write, before the receipt) reports ``already_applied`` instead of writing twice.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any, Optional
++
++OP = "retry_limit"
++MAX_RETRY_LIMIT = 10
++MARK = "supervisor_retry_limit"
++_DEAD_STATUSES = ("archived", "done")
++
++
++def normalize_op(i: int, op: dict) -> dict:
++    from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++    tid = str(op.get("task_id") or "").strip()
++    if not tid:
++        raise SupervisorRequestError("invalid_ops", f"op {i}: retry_limit needs task_id")
++    extra = set(op) - {"op", "task_id", "max_retries"}
++    if extra:
++        raise SupervisorRequestError(
++            "invalid_ops", f"op {i}: retry_limit takes only task_id and max_retries (got {sorted(extra)})")
++    n: Any = op.get("max_retries")
++    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= MAX_RETRY_LIMIT:
++        raise SupervisorRequestError(
++            "invalid_ops", f"op {i}: retry_limit max_retries must be an integer 1-{MAX_RETRY_LIMIT} (got {n!r})")
++    return {"op": OP, "task_id": tid, "max_retries": int(n)}
++
++
++def label(op: dict) -> str:
++    return f"retry_limit {op.get('task_id')} -> {op.get('max_retries')}"
++
++
++def _current(conn: sqlite3.Connection, target: str) -> Optional[int]:
++    row = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (target,)).fetchone()
++    return row[0] if row else None
++
++
++def refusal(conn: sqlite3.Connection, requester: str, target: str) -> Optional[str]:
++    """None when ``target`` is a live card the requester created (and not the requester itself)."""
++    from hermes_cli.kanban_supervisor_requests import _created_by_task
++    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (target,)).fetchone()
++    if row is None:
++        return f"unknown task {target}"
++    if target == requester:
++        return "self_scope: a card cannot change its own retry breaker"
++    if row[0] in _DEAD_STATUSES:
++        return f"{target} is {row[0]}"
++    if _created_by_task(conn, target) != requester:
++        return (f"{target} was not created by {requester}; retry_limit only edits cards this task "
++                "created (not its creator chain, siblings or their children)")
++    return None
++
++
++def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
++    verdict = {**op}
++    found = refusal(conn, requester, op["task_id"])
++    if found:
++        verdict.update(verdict="refused", reason=found)
++    elif _current(conn, op["task_id"]) == op["max_retries"]:
++        verdict.update(verdict="noop", reason=f"max_retries is already {op['max_retries']}")
++    else:
++        verdict.update(verdict="supervisor")
++    return verdict
++
++
++def _marks(conn: sqlite3.Connection, target: str) -> list[dict]:
++    rows = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
++                        (target, MARK)).fetchall()
++    out = []
++    for (raw,) in rows:
++        try:
++            data = json.loads(raw) if raw else {}
++        except (TypeError, ValueError):
++            continue
++        if isinstance(data, dict):
++            out.append(data)
++    return out
++
++
++def applied_by(conn: sqlite3.Connection, target: str, request_id: int) -> bool:
++    return any(m.get("request_id") == request_id for m in _marks(conn, target))
++
++
++def execute(conn: sqlite3.Connection, req: dict, executor: str) -> str:
++    """Apply a retry_limit request's ops (re-checked now); record the receipt via ``_finish``."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_operator as kdo
++    from hermes_cli import kanban_supervisor_requests as ksr
++
++    requester, rid = req["requester_task_id"], int(req["id"])
++    gone = ksr.requester_refusal(conn, requester)
++    results: list[dict] = []
++    error: Optional[str] = None
++    for op in req["ops"]:
++        target, want = op["task_id"], op["max_retries"]
++        if applied_by(conn, target, rid):
++            results.append({**op, "outcome": "already_applied", "readback": _current(conn, target)})
++            continue
++        found = gone or refusal(conn, requester, target)
++        if error or found:
++            detail = found or "an earlier op failed"
++            results.append({**op, "outcome": "not_applied", "detail": detail})
++            error = error or detail
++            continue
++        old = _current(conn, target)
++        if old == want:
++            # Already so: this request's write landed before a crash took the mark with it, or another
++            # route set the same value. Either way the requested state holds; never write twice.
++            results.append({**op, "outcome": "already_applied", "readback": old})
++            continue
++        try:
++            changes = kdo.edit_operator_fields(conn, target, max_retries=want)
++        except kdo.KanbanEditRefused as exc:
++            changes, error = None, str(exc)
++        readback = _current(conn, target)
++        if changes is None or readback != want:
++            error = error or f"edit_operator_fields did not set {target}.max_retries to {want}"
++            results.append({**op, "outcome": "failed", "detail": error, "readback": readback})
++            continue
++        with kb.write_txn(conn):
++            kb._append_event(conn, target, MARK, {"request_id": rid, "by": requester, "executor": executor,
++                                                  "old": old, "new": want})
++        results.append({**op, "outcome": "applied", "old": old, "new": want, "readback": readback})
++    applied = any(r["outcome"] in ("applied", "already_applied") for r in results)
++    status = "done" if not error else (
++        "failed" if applied or any(r["outcome"] == "failed" for r in results) else "rejected")
++    ksr._finish(conn, req, executor, status, results=results, error=error)
++    return status
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index 99e5c5de3b1..f676461a107 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -28,6 +28,8 @@ This module is the narrow contract between the two:
+ * **resume** ops (``kanban_resume_exec``) requeue the card that spawned the requester when the
+   continuation budget parked it (``continuation_exhausted``), through ``kanban_db.unblock_task``.
+   Never a human-gated card; scope is the requester's creator chain; capped per target.
++* **retry_limit** ops (``kanban_retry_limit_exec``) set ``max_retries`` (1-10) on a card the requester
++  created, never its own, through ``kanban_db_operator.edit_operator_fields``.
+ * **Receipt**: every transition appends a ``supervisor_request_*`` event, and the
+   terminal one a comment, on the requester's card. A requester parked ``scheduled`` is
+   woken, also when it parks only after the result landed. A result never completes, unblocks or releases the requester; a rejected or
+@@ -50,10 +52,11 @@ MAX_OPS = 20
+ MAX_ATTEMPTS = 5
+ LEASE_SECONDS = 120
+ EXECUTOR_FRESH_SECONDS = 300
+-OPS = ("link", "unlink", "reconcile_notify", "resume")  # link: preview only (dry_run); a request carries unlink ops
++OPS = ("link", "unlink", "reconcile_notify", "resume", "retry_limit")  # link: preview only (dry_run); a request carries unlink ops
+ # reconcile_notify: retire a wrong-local refused-send tui subscription on owner-read receipts
+ # (hermes_cli/kanban_notify_reconcile_exec.py). A request carries only those, or only edge ops.
+ # resume: requeue a continuation_exhausted card in the requester's creator chain (kanban_resume_exec.py).
++# retry_limit: set max_retries on a card the requester created (kanban_retry_limit_exec.py).
+ ACTIVE = ("pending", "accepted")
+ TERMINAL = ("done", "rejected", "failed")
+ COMMENT_AUTHOR = "kanban-supervisor"
+@@ -125,6 +128,10 @@ def normalize_ops(ops: Any) -> list[dict]:
+             from hermes_cli import kanban_resume_exec as rx
+             out.append(rx.normalize_op(i, op))
+             continue
++        if kind == "retry_limit":
++            from hermes_cli import kanban_retry_limit_exec as rlx
++            out.append(rlx.normalize_op(i, op))
++            continue
+         parent = str(op.get("parent_id") or "").strip()
+         child = str(op.get("child_id") or "").strip()
+         if kind not in OPS:
+@@ -134,18 +141,26 @@ def normalize_ops(ops: Any) -> list[dict]:
+         out.append({"op": kind, "parent_id": parent, "child_id": child})
+     if len({_family(o) for o in out}) > 1:
+         raise SupervisorRequestError(
+-            "invalid_ops", "a request carries only reconcile_notify ops, only resume ops, or only edge ops")
++            "invalid_ops", "a request carries only reconcile_notify ops, only resume ops, only retry_limit ops, "
++            "or only edge ops")
+     return out
+ 
+ 
++_OWN_FAMILIES = ("reconcile_notify", "resume", "retry_limit")
++
++
+ def _family(op: dict) -> str:
+-    return op["op"] if op.get("op") in ("reconcile_notify", "resume") else "edge"
++    return op["op"] if op.get("op") in _OWN_FAMILIES else "edge"
+ 
+ 
+ def _is_resume(ops: list[dict]) -> bool:
+     return bool(ops) and ops[0].get("op") == "resume"
+ 
+ 
++def _is_retry_limit(ops: list[dict]) -> bool:
++    return bool(ops) and ops[0].get("op") == "retry_limit"
++
++
+ def _is_reconcile(ops: list[dict]) -> bool:
+     return bool(ops) and ops[0].get("op") == "reconcile_notify"
+ 
+@@ -154,6 +169,9 @@ def op_label(op: dict) -> str:
+     if op.get("op") == "resume":
+         from hermes_cli import kanban_resume_exec as rx
+         return rx.label(op)
++    if op.get("op") == "retry_limit":
++        from hermes_cli import kanban_retry_limit_exec as rlx
++        return rlx.label(op)
+     from hermes_cli import kanban_notify_reconcile_exec as nrx
+     return nrx.label(op)
+ 
+@@ -230,6 +248,9 @@ def preflight(conn: sqlite3.Connection, requester: str, ops: list[dict]) -> list
+     if _is_resume(ops):
+         from hermes_cli import kanban_resume_exec as rx
+         return [rx.preflight_op(conn, requester, op) for op in ops]
++    if _is_retry_limit(ops):
++        from hermes_cli import kanban_retry_limit_exec as rlx
++        return [rlx.preflight_op(conn, requester, op) for op in ops]
+     edges = _edges(conn)
+     verdicts = []
+     for op in ops:
+@@ -538,6 +559,9 @@ def _execute(conn: sqlite3.Connection, req: dict, executor: str, board: Optional
+     if _is_resume(ops):
+         from hermes_cli import kanban_resume_exec as rx
+         return rx.execute(conn, req, executor)
++    if _is_retry_limit(ops):
++        from hermes_cli import kanban_retry_limit_exec as rlx
++        return rlx.execute(conn, req, executor)
+     # Scope is re-checked against the board as it is now, not as it was at submit time.
+     gone = requester_refusal(conn, requester)
+     verdicts = preflight(conn, requester, ops)
+diff --git a/tests/hermes_cli/test_kanban_retry_limit_exec.py b/tests/hermes_cli/test_kanban_retry_limit_exec.py
+new file mode 100644
+index 00000000000..ce37fecaf9c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_retry_limit_exec.py
+@@ -0,0 +1,244 @@
++"""Supervisor ``retry_limit`` op: a worker sets the retry breaker on a card it created. [daveey]
++
++Reproduces the runners-board gap: card t_01a192e86a794e59 needed ``max_retries=5`` but a worker
++had no supported route to set it (``kanban_create`` had no such field, and the worker shell is
++fenced from ``hermes kanban edit``). Every test runs on an isolated board under ``tmp_path``.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_supervisor_requests as ksr
++
++
++@pytest.fixture
++def board(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    assert str(kb.kanban_db_path()).startswith(str(tmp_path))
++    conn = kbc.connect()
++    try:
++        requester = kb.create_task(conn, title="shepherd", assignee="default", created_by="default")
++        child = kb.create_task(conn, title="flaky runner job", assignee="default", created_by="default",
++                               creator_task_id=requester)
++        other = kb.create_task(conn, title="another shepherd", assignee="default")
++        foreign = kb.create_task(conn, title="someone else's card", assignee="default", creator_task_id=other)
++        grandchild = kb.create_task(conn, title="grandchild", assignee="default", creator_task_id=child)
++        kb.claim_task(conn, requester)
++        run_id = kb._current_run_id(conn, requester)
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", requester)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return {"requester": requester, "child": child, "foreign": foreign, "grandchild": grandchild,
++            "run_id": run_id}
++
++
++def _tool(args):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_supervisor_request(args))
++
++
++def _req(tid, n=5, **extra):
++    return {"ops": [{"op": "retry_limit", "task_id": tid, "max_retries": n, **extra}],
++            "reason": "runner card needs a wider breaker"}
++
++
++def _as_executor(monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++
++
++def _drain():
++    with kbc.connect_closing() as conn:
++        return ksr.drain(conn, role="test")
++
++
++def _max_retries(tid):
++    with kbc.connect_closing() as conn:
++        return conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++
++
++def _request(rid) -> dict:
++    with kbc.connect_closing() as conn:
++        req = ksr.get_request(conn, rid)
++    assert req is not None
++    return req
++
++
++# --- authorized apply ----------------------------------------------------------------------------
++
++def test_in_scope_retry_limit_applies_and_reads_back(board, monkeypatch):
++    dry = _tool({**_req(board["child"]), "dry_run": True})
++    assert dry["ops"][0]["verdict"] == "supervisor", dry
++    out = _tool(_req(board["child"]))
++    assert out["ok"] and out["status"] == "pending", out
++    assert _max_retries(board["child"]) is None
++    _as_executor(monkeypatch)
++    assert _drain()["processed"] == [(out["request_id"], "done")]
++    req = _request(out["request_id"])
++    assert req["status"] == "done", req
++    (res,) = req["result"]
++    assert res["outcome"] == "applied" and res["old"] is None and res["new"] == 5 and res["readback"] == 5, res
++    assert _max_retries(board["child"]) == 5
++    with kbc.connect_closing() as conn:
++        edited = [e.payload for e in kb.list_events(conn, board["child"]) if e.kind == "edited"]
++    assert edited and edited[-1]["changes"] == {"max_retries": {"old": None, "new": 5}}, edited
++
++
++def test_lowering_an_existing_breaker_reports_old_value(board, monkeypatch):
++    out = _tool(_req(board["child"], 3))
++    _as_executor(monkeypatch)
++    _drain()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", board["requester"])
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(board["run_id"]))
++    out = _tool(_req(board["child"], 7))
++    _as_executor(monkeypatch)
++    _drain()
++    (res,) = _request(out["request_id"])["result"]
++    assert (res["old"], res["new"], res["readback"]) == (3, 7, 7), res
++
++
++# --- scope ---------------------------------------------------------------------------------------
++
++def test_own_card_is_refused(board):
++    dry = _tool({**_req(board["requester"]), "dry_run": True})
++    assert dry["ops"][0]["verdict"] == "refused" and "self_scope" in dry["ops"][0]["reason"], dry
++    out = _tool(_req(board["requester"]))
++    assert out.get("code") == "refused" and "self_scope" in out["error"], out
++    assert _max_retries(board["requester"]) is None
++
++
++@pytest.mark.parametrize("which", ["foreign", "grandchild"])
++def test_card_this_task_did_not_create_is_refused(board, which):
++    dry = _tool({**_req(board[which]), "dry_run": True})
++    assert dry["ops"][0]["verdict"] == "refused", dry
++    out = _tool(_req(board[which]))
++    assert out.get("code") == "refused", out
++    assert _max_retries(board[which]) is None
++
++
++def test_unknown_target_is_refused(board):
++    out = _tool(_req("t_nope"))
++    assert out.get("code") == "refused" and "unknown task" in out["error"], out
++
++
++@pytest.mark.parametrize("end", ["archived", "done"])
++def test_archived_or_done_target_is_refused(board, end):
++    with kbc.connect_closing() as conn:
++        if end == "archived":
++            assert kb.archive_task(conn, board["child"])
++        else:
++            assert kb.complete_task(conn, board["child"], result="x", summary="finished")
++    out = _tool(_req(board["child"]))
++    assert out.get("code") == "refused" and end in out["error"], out
++
++
++# --- validation ----------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("bad", [0, 11, -3, True, False, "5", 2.5, None])
++def test_out_of_range_or_non_int_is_invalid(board, bad):
++    out = _tool(_req(board["child"], bad))
++    assert out.get("code") == "invalid_ops" and "max_retries" in out["error"], out
++
++
++def test_missing_task_id_or_extra_field_is_invalid(board):
++    out = _tool({"ops": [{"op": "retry_limit", "max_retries": 5}]})
++    assert out.get("code") == "invalid_ops", out
++    out = _tool(_req(board["child"], parent_id=board["requester"]))
++    assert out.get("code") == "invalid_ops", out
++
++
++def test_equal_value_is_noop(board, monkeypatch):
++    _tool(_req(board["child"], 4))
++    _as_executor(monkeypatch)
++    _drain()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", board["requester"])
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(board["run_id"]))
++    dry = _tool({**_req(board["child"], 4), "dry_run": True})
++    assert dry["ops"][0]["verdict"] == "noop", dry
++    out = _tool(_req(board["child"], 4))
++    assert out.get("code") == "no_supervisor_needed", out
++
++
++@pytest.mark.parametrize("other", [
++    {"op": "resume", "task_id": "t_x"},
++    {"op": "unlink", "parent_id": "t_a", "child_id": "t_b"},
++])
++def test_mixed_families_are_refused(board, other):
++    out = _tool({"ops": [{"op": "retry_limit", "task_id": board["child"], "max_retries": 5}, other]})
++    assert out.get("code") == "invalid_ops" and "retry_limit" in out["error"], out
++
++
++def test_schema_declares_the_op():
++    from tools.kanban_tools_schemas import KANBAN_SUPERVISOR_REQUEST_SCHEMA as S
++    item = S["parameters"]["properties"]["ops"]["items"]["properties"]
++    assert "retry_limit" in item["op"]["enum"] and item["max_retries"]["type"] == "integer"
++    assert "Op retry_limit {task_id, max_retries 1-10}" in S["description"]
++
++
++# --- execution re-checks the board as it is now ----------------------------------------------------
++
++def test_scope_lost_between_submit_and_execute_is_rejected(board, monkeypatch):
++    out = _tool(_req(board["child"]))
++    with kbc.connect_closing() as conn:
++        assert kb.archive_task(conn, board["child"])
++    _as_executor(monkeypatch)
++    _drain()
++    req = _request(out["request_id"])
++    assert req["status"] == "rejected" and "archived" in req["error"], req
++    assert req["result"][0]["outcome"] == "not_applied"
++    assert _max_retries(board["child"]) is None
++
++
++def test_requester_finished_before_execute_is_rejected(board, monkeypatch):
++    out = _tool(_req(board["child"]))
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, board["requester"], result="x", summary="finished")
++    _as_executor(monkeypatch)
++    _drain()
++    req = _request(out["request_id"])
++    assert req["status"] == "rejected" and "requester" in req["error"], req
++    assert _max_retries(board["child"]) is None
++
++
++def test_redelivery_after_apply_reports_already_applied(board, monkeypatch):
++    out = _tool(_req(board["child"]))
++    _as_executor(monkeypatch)
++    real_finish = ksr._finish
++    monkeypatch.setattr(ksr, "_finish", lambda *a, **k: False)  # crash after the write, before the receipt
++    with kbc.connect_closing() as conn:
++        ksr.drain(conn, role="crashy")
++    assert _max_retries(board["child"]) == 5
++    assert _request(out["request_id"])["status"] == "accepted"
++    monkeypatch.setattr(ksr, "_finish", real_finish)
++    import time as _t
++    with kbc.connect_closing() as conn:  # lease expired: redelivered
++        ksr.drain(conn, role="test", now=int(_t.time()) + ksr.LEASE_SECONDS + 5)
++    req = _request(out["request_id"])
++    assert req["status"] == "done", req
++    (res,) = req["result"]
++    assert res["outcome"] == "already_applied" and res["readback"] == 5, res
++    with kbc.connect_closing() as conn:
++        edited = [e for e in kb.list_events(conn, board["child"]) if e.kind == "edited"]
++    assert len(edited) == 1  # applied once
++
++
++def test_worker_context_cannot_execute(board):
++    _tool(_req(board["child"]))
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ksr.SupervisorRequestError) as exc:
++            ksr.drain(conn, role="test")
++    assert exc.value.code == "worker_context"
++    assert _max_retries(board["child"]) is None
+diff --git a/tools/kanban_tools_create_args.py b/tools/kanban_tools_create_args.py
+index 7c2a5816d94..9083a5cd714 100644
+--- a/tools/kanban_tools_create_args.py
++++ b/tools/kanban_tools_create_args.py
+@@ -6,7 +6,6 @@ from __future__ import annotations
+ 
+ from typing import Any, Optional
+ 
+-MAX_RETRY_LIMIT = 10  # the widest retry breaker an agent may set
+ # Fields read back from a freshly created card into the kanban_create result.
+ CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id", "human_request")
+ 
+@@ -15,6 +14,7 @@ def max_retries_arg(args: dict) -> Optional[int]:
+     """``kanban_create``'s ``max_retries``: None when omitted, else an int 1..MAX_RETRY_LIMIT (bools
+     refused). One cap for create and the supervisor ``retry_limit`` op. Checked before placement, so
+     an invalid value never reaches a remote create."""
++    from hermes_cli.kanban_retry_limit_exec import MAX_RETRY_LIMIT
+     from tools.kanban_tools import _check  # lazy: kanban_tools imports this module
+ 
+     value: Any = args.get("max_retries")
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 0b46d8f416b..5a5fcbefb0c 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -955,20 +955,24 @@ KANBAN_SUPERVISOR_REQUEST_SCHEMA = _schema(
+         "(continuation_exhausted triage block) and nothing else: never a card waiting on a human "
+         "(needs_input/capability/human_request), never more than twice per card. It runs the ordinary "
+         "unblock, so parent gating applies (ready, or todo while a parent is open); the result reads back "
+-        "the target's status. A request carries only resume ops."
++        "the target's status. A request carries only resume ops. "
++        "Op retry_limit {task_id, max_retries 1-10} asks the executor to set the retry breaker on a card "
++        "THIS task created (never this card itself); a request carries only retry_limit ops."
+     ),
+     {
+         "ops": {
+             "type": "array",
+-            "description": "Edge edits applied in order, reconcile_notify ops, or resume ops (max 20).",
++            "description": "Edge edits applied in order, reconcile_notify ops, resume ops, or retry_limit ops (max 20).",
+             "items": {
+                 "type": "object",
+                 "properties": {
+-                    "op": {"type": "string", "enum": ["link", "unlink", "reconcile_notify", "resume"]},
++                    "op": {"type": "string", "enum": ["link", "unlink", "reconcile_notify", "resume", "retry_limit"]},
+                     "parent_id": {"type": "string"},
+                     "child_id": {"type": "string"},
+                     "task_id": {"type": "string", "description": "reconcile_notify: the subscribed task; "
+-                                                                 "resume: the card to requeue."},
++                                                                 "resume: the card to requeue; "
++                                                                 "retry_limit: the card to edit."},
++                    "max_retries": {"type": "integer", "description": "retry_limit: the new breaker, 1-10."},
+                     "chat_id": {"type": "string", "description": "reconcile_notify: the tui row's chat (session id)."},
+                     "thread_id": {"type": "string", "description": "reconcile_notify: the row's thread, if any."},
+                 },
+-- 
+2.55.0
+

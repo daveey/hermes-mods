@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1427 patches, one entry per non-merge source commit through `1b20db1838e748ce13cbc974fcaa6681cff13da8`.
+1469 patches, one entry per non-merge source commit through `3241b23316a66eb4d41c26078cd92411f0f295bc`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -22,12 +22,25 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `6bb377a51d5c8e279a7a5e34d717d653d421d064`; current merge-base: `ef35e8b9e1a8bc7f0efb50e4f2d68f1ec052f6a8`.
-Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with an explicit upstream-merge bridge immediately before patch 1328. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-The snapshot's full verifier exits 0 with [mirror-replay-1427.json](mirror-replay-1427.json) (one hash-pinned bridge) and [mirror-policy-1427.json](mirror-policy-1427.json).
-The current snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+Upstream exclusion tip: `016b76da3a8a88e28775e08b6ca2846f471b8eda`; current merge-base: `c419cf7c864ac0ee511dbd9f7091a8bba0b567ee`.
+Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430 and 1432. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
+The snapshot's full verifier exits 0 with [mirror-replay-1469.json](mirror-replay-1469.json) (three hash-pinned bridges) and [mirror-policy-1469.json](mirror-policy-1469.json). Executed checks and normalization review: [mirror-1469-verification.md](mirror-1469-verification.md).
+The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1428–1469
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Catalog isolation and deterministic fixtures](mirror-ci-follow-ups-1428.md) | 1428, 1438–1441, 1449–1452, 1455, 1468 | Trusted-base catalog admission, sandbox subreaper acknowledgment and deterministic process/cron/quota tests. |
+| [Recorded routing and runtime follow-ups](mirror-runtime-follow-ups-1428.md) | 1429, 1444–1445, 1458–1459, 1461–1462, 1467 | Recorded-route restoration, failed-build sweeping, indexed lineage, sleep observation, bounded listing, activity/liveness and reentrant WAL guard. |
+| [Nightly red ownership](nightly-e2e.md) | 1430, 1432 | One red owner per alert intent and advisory pinned-reporter freshness. |
+| [Composer editor Escape origin](turn-stop-notice.md) | 1431 | Real contenteditable ChatBar calls haltRun('esc'); mounted busy/idle regression complements non-editor hook. |
+| [Kanban runtime follow-ups](mirror-kanban-follow-ups-1428.md) | 1433–1437, 1446–1448, 1453–1454, 1456–1457, 1460, 1464–1466 | Scoped continuation/retry requests, target-policy inspection, historical review evidence, adopted-origin notices, direct triage parking and bounded sync repair. |
+| [Superseded upstream sync cleanup](upstream-sync-land-via-pr.md) | 1442–1443, 1463 | Close stale sync PRs, refuse superseded resolution restaging and lease-delete eligible orphan refs. |
+| [Offline cron child dependencies](offline-dns-retry-wait.md) | 1469 | Restore test-interpreter dependency paths after real child bootstrap; no production or physical-event claim. |
+| [1469-entry mirror verification](mirror-1469-verification.md) | verification report | Complete inventory, three-bridge replay and normalized final tree. |
 
 ## Mirror follow-ups 1416–1427
 
@@ -190,7 +203,7 @@ python3 -B core/verify_mirror.py \
   --policy core/mirror-policy-NNNN.json
 ```
 
-For the 1427 snapshot, also pass `--replay-plan core/mirror-replay-1427.json` and use `--policy core/mirror-policy-1427.json`.
+For the 1469 snapshot, also pass `--replay-plan core/mirror-replay-1469.json` and use `--policy core/mirror-policy-1469.json`.
 This explicit opt-in pins the historical replay start and a bridge's boundary by source SHA, its source merge and its diff by SHA-256. Starts and merge IDs must be full commit IDs; merge ancestry, boundary membership and unique boundaries are validated. Bridge paths are relative to the plan, without parent traversal. Each uninterrupted patch segment is replayed in published order, then the bridge is applied with `git apply --index --3way` and committed. No source patch is skipped; final tree comparison is unchanged. The merge label documents provenance; the diff hash binds the reviewed public bridge (which may contain normalization), not an automatically regenerated source diff.
 
 Exit 0 is the acceptance step for every mirror pass; record its JSON line in the snapshot's
@@ -697,7 +710,7 @@ not something the public fixture CI can perform without the source repository.
 | [hidden-preview-open.md](hidden-preview-open.md) | 0118 0119 | An agent in a chat you're not viewing (including another profile's) gets "opened" only once its preview page has actually loaded off screen, so its next read/act works and focusing the chat shows the same page |
 | [kanban-soft-deadline.md](kanban-soft-deadline.md) | 0121 | Kanban workers near their runtime cap checkpoint with `kanban_continue` and a fresh run resumes from it instead of being killed and counted as a failure; long waits hand off with a wake time instead of polling |
 | [kanban-worktree-validation.md](kanban-worktree-validation.md) | 0122 | `kanban_create` / `hermes kanban create` reject a worktree workspace that can never resolve, naming the fix; such a card blocks on its first spawn failure instead of burning retries |
-| [turn-stop-notice.md](turn-stop-notice.md) | 0126, 1323 | A turn stopped from a client ends with a visible "Stopped by <login>" line, and the log names who sent the Stop; an SSH-attached Desktop reads "Stopped by Desktop", and the session.interrupt log line + turn_stopped metadata carry the Stop gesture (stop_button/esc/tile/slash/delete/plugin:<id>) |
+| [turn-stop-notice.md](turn-stop-notice.md) | 0126, 1323, 1431 | A client Stop names its issuer and gesture; SSH Desktop reads "Stopped by Desktop". Editor Escape calls haltRun('esc'), independently of the non-editor Escape hook, with a mounted real ChatBar regression. |
 | [kanban-open-task-hook.md](kanban-open-task-hook.md) | 0127 | `window.__hermesKanbanOpenTask(taskId, board?, gateway?)` lets disk plugins open a card's drawer on its own board and gateway |
 | [review-evidence-gate.md](review-evidence-gate.md) | 0129 | `auxiliary.background_review.require_evidence` makes background skill review edit a skill only when a specific moment in the conversation justifies it; "Nothing to save." becomes a neutral outcome |
 | [kanban-block-instructions.md](kanban-block-instructions.md) | 0130 | `kanban_block`'s `reason` asks for ask-first, numbered, concrete unblock steps (what the blocked-panel Desktop plugin shows above the composer) |
@@ -754,7 +767,7 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1368-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, apply patches 0001–1327, apply and commit `core/bridges/error-card-v2.diff`, then apply patches 1328–1368. Do not start at the new merge-base or apply the entire glob without the bridge. Example (Bash, with this repository's absolute path in `MODS`):
+For the current **1469-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the three bridges at the boundaries in `mirror-replay-1469.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
 
 ```bash
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
@@ -763,7 +776,13 @@ patches=("$MODS"/core/patches/*.patch)
 git am -3 --empty=keep "${patches[@]:0:1327}"
 git apply --index --3way "$MODS/core/bridges/error-card-v2.diff"
 git commit -m 'Explicit upstream error-card-v2 merge bridge'
-git am -3 --empty=keep "${patches[@]:1327:54}"
+git am -3 --empty=keep "${patches[@]:1327:102}"
+git apply --index --3way "$MODS/core/bridges/upstream-04422ac2f04.diff"
+git commit -m 'Explicit upstream merge bridge before 1430'
+git am -3 --empty=keep "${patches[@]:1429:2}"
+git apply --index --3way "$MODS/core/bridges/upstream-fef6b4fb42f.diff"
+git commit -m 'Explicit upstream merge bridge before 1432'
+git am -3 --empty=keep "${patches[@]:1431:38}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

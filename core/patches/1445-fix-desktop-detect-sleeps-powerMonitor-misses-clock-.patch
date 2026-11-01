@@ -1,0 +1,373 @@
+From c4b8e717be8341830ca3e17dc460368e7abef1b0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 22:19:45 -0700
+Subject: [PATCH] fix(desktop): detect sleeps powerMonitor misses (clock gap)
+ and absorb connect failures across a sleep/wake
+
+On 2026-10-30 macOS sent 'resume' only at the first DarkWake after a clamshell sleep (17:08); 4.5 h of
+Maintenance Sleep/DarkWake cycles and the 21:31:30 DarkWake->FullWake emitted no suspend/resume, so the
+power-settle gate stayed open: reads in flight at the freeze timed out at the wake (session-mentions/outbox
+after 10000ms) and pollers hit tunnels still rebuilding (Remote backend ... is down).
+
+- PowerSettleGate.observeClock(): a 5 s unref'd ticker; a >30 s wall-clock gap = a missed sleep -> wake()
+  (settle window + stagger), logged as '[power-settle] clock-gap wake'.
+- absorbFailure(): a background GET whose connect failed (timeout/refused/remote down) while crossing a
+  suspend or clock gap, or within 60 s of a wake, rejects as PowerSettlingError (no failure line; next poll
+  retries); one summary line counts them when the grace ends. Server errors, POSTs and foreground reads are
+  never absorbed.
+- Tests: one per path in power-settle.test.ts (gap wake, admit notices gap, regular ticks not a wake,
+  classifier, in-flight across freeze, across suspend, reconnect grace + summary, non-absorb cases, ticker
+  wiring, main.ts wiring).
+---
+ apps/desktop/electron/main.ts              |   8 +-
+ apps/desktop/electron/power-settle.test.ts | 120 ++++++++++++++++++++-
+ apps/desktop/electron/power-settle.ts      | 100 ++++++++++++++++-
+ 3 files changed, 220 insertions(+), 8 deletions(-)
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 1e22c4d88ca..751d39e0316 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -438,7 +438,7 @@ import {
+   undialedSshRouteSeeds
+ } from './plugin-profile-routes'
+ import { createPortalSession, resolvePortalBaseUrl } from './portal-session'
+-import { attachPowerSettle, isPowerSettlingError, PowerSettleGate } from './power-settle'
++import { attachPowerSettle, isPowerSettlingError, PowerSettleGate, PowerSettlingError } from './power-settle'
+ import { readPreUpdateBackupEnabled } from './pre-update-backup-config'
+ import { registerPreparedSubmissions } from './prepared-submissions'
+ import { capturePreviewContents } from './preview-capture'
+@@ -16391,9 +16391,9 @@ ipcMain.handle('hermes:api', async (_event, request) => {
+       return { [HERMES_API_EXPECTED_404]: String((error as any)?.message ?? error) }
+     }
+ 
+-    // A background read skipped while the Mac sleeps never dialed; the wake line in power-settle counts them.
+-    if (isPowerSettlingError(error)) {
+-      throw error
++    // Skipped while asleep, or a connect failure across a sleep/wake (power-settle.ts counts both): no stack line.
++    if (isPowerSettlingError(error) || powerSettleGate.absorbFailure(request, error)) {
++      throw isPowerSettlingError(error) ? error : new PowerSettlingError()
+     }
+ 
+     // Persist the failure (full stack) before the rejection crosses to the
+diff --git a/apps/desktop/electron/power-settle.test.ts b/apps/desktop/electron/power-settle.test.ts
+index c4edb6f247d..436e7b696e7 100644
+--- a/apps/desktop/electron/power-settle.test.ts
++++ b/apps/desktop/electron/power-settle.test.ts
+@@ -6,7 +6,11 @@ import { describe, expect, it } from 'vitest'
+ import {
+   attachPowerSettle,
+   isBackgroundRead,
++  isConnectFailure,
+   isPowerSettlingError,
++  POWER_CLOCK_GAP_MS,
++  POWER_CLOCK_TICK_MS,
++  POWER_RECONNECT_GRACE_MS,
+   POWER_SETTLE_MS,
+   PowerSettleGate
+ } from './power-settle'
+@@ -126,13 +130,118 @@ describe('PowerSettleGate', () => {
+   })
+ })
+ 
++const timeout = new Error('Timed out connecting to Hermes backend after 10000ms')
++
++// Stay awake for `ms`: advance in regular ticks, as the 5 s ticker does, so no clock gap is seen.
++function tickFor(h: ReturnType<typeof harness>, ms: number) {
++  for (let left = ms; left > 0; left -= POWER_CLOCK_TICK_MS) {
++    h.advance(Math.min(POWER_CLOCK_TICK_MS, left))
++    h.gate.observeClock()
++  }
++}
++
++describe('clock-gap wake (sleep without a powerMonitor event)', () => {
++  it('a tick gap longer than the threshold opens a settle window and logs one line', async () => {
++    const { gate, sleeps, advance } = harness()
++    const lines: string[] = []
++    gate.setLog(line => lines.push(line))
++    advance(POWER_CLOCK_GAP_MS + 1_000)
++    gate.observeClock()
++    expect(gate.settling()).toBe(true)
++    expect(lines).toEqual([expect.stringContaining('[power-settle] clock-gap wake: no tick for 31s')])
++    expect(lines[0]).not.toMatch(/Timed out connecting/)
++    void gate.admit(poll)
++    expect(sleeps).toHaveLength(1)
++  })
++
++  it('admit itself notices the gap (first read after the freeze is held, not dialed)', async () => {
++    const { gate, sleeps, advance } = harness()
++    advance(POWER_CLOCK_GAP_MS * 10)
++    void gate.admit(poll)
++    expect(sleeps).toHaveLength(1)
++  })
++
++  it('regular ticks are not a wake', () => {
++    const h = harness()
++    tickFor(h, 20 * POWER_CLOCK_TICK_MS)
++    expect(h.gate.settling()).toBe(false)
++  })
++})
++
++describe('absorbFailure', () => {
++  it('classifies connect-level failures only', () => {
++    expect(isConnectFailure(timeout)).toBe(true)
++    expect(isConnectFailure(new Error('Remote backend "conn:hermes-hub::default" is down (dispatch probe failed)'))).toBe(true)
++    expect(isConnectFailure(new Error('connect ECONNREFUSED 127.0.0.1:58232'))).toBe(true)
++    expect(isConnectFailure(new Error('500: internal error'))).toBe(false)
++  })
++
++  it('absorbs a background read that was in flight when the Mac froze (timer expired at the thaw)', () => {
++    const { gate, advance } = harness()
++    advance(POWER_CLOCK_GAP_MS + 10_000) // frozen; the request timeout fires on unfreeze, before any tick
++    expect(gate.absorbFailure(poll, timeout)).toBe(true)
++    expect(gate.settling()).toBe(true)
++  })
++
++  it('absorbs a read failing while suspended', () => {
++    const { gate } = harness()
++    gate.suspend()
++    expect(gate.absorbFailure(poll, timeout)).toBe(true)
++  })
++
++  it('absorbs remote-down failures during the reconnect grace after a wake, and logs one summary after it', () => {
++    const h = harness()
++    const { gate } = h
++    const lines: string[] = []
++    gate.setLog(line => lines.push(line))
++    gate.wake()
++    tickFor(h, 20_000)
++    const down = new Error('Remote backend "conn:hermes-hub::default" is down (dispatch probe failed: Timed out connecting)')
++    expect(gate.absorbFailure(poll, down)).toBe(true)
++    expect(lines).toEqual([])
++    tickFor(h, POWER_RECONNECT_GRACE_MS)
++    expect(lines).toEqual(['[power-settle] 1 background read(s) failed to connect across a sleep/wake; absorbed'])
++  })
++
++  it('does not absorb when awake past the grace, for foreground or writes, or for server errors', () => {
++    const h = harness()
++    const { gate } = h
++    gate.wake()
++    tickFor(h, POWER_RECONNECT_GRACE_MS + 1)
++    expect(gate.absorbFailure(poll, timeout)).toBe(false)
++    gate.wake()
++    expect(gate.absorbFailure({ ...poll, priority: 'foreground' }, timeout)).toBe(false)
++    expect(gate.absorbFailure({ ...poll, method: 'POST' }, timeout)).toBe(false)
++    expect(gate.absorbFailure(poll, new Error('500: boom'))).toBe(false)
++  })
++})
++
+ describe('attachPowerSettle', () => {
++  it('starts an unref\'d clock ticker that drives observeClock', () => {
++    const monitor = { on: () => undefined }
++    const { gate, advance } = harness()
++    const ticks: Array<{ fn: () => void; ms: number }> = []
++    let unrefd = false
++    attachPowerSettle(gate, monitor, undefined, {
++      setInterval: (fn, ms) => {
++        ticks.push({ fn, ms })
++
++        return { unref: () => (unrefd = true) }
++      }
++    })
++    expect(ticks.map(t => t.ms)).toEqual([POWER_CLOCK_TICK_MS])
++    expect(unrefd).toBe(true)
++    advance(POWER_CLOCK_GAP_MS + 1)
++    ticks[0].fn()
++    expect(gate.settling()).toBe(true)
++  })
++
+   it('wires suspend/resume/unlock-screen and logs the skipped count on resume', async () => {
+     const listeners = new Map<string, () => void>()
+     const monitor = { on: (event: string, fn: () => void) => listeners.set(event, fn) }
+     const { gate } = harness()
+     const lines: string[] = []
+-    attachPowerSettle(gate, monitor, line => lines.push(line))
++    attachPowerSettle(gate, monitor, line => lines.push(line), { setInterval: () => ({}) })
+ 
+     listeners.get('suspend')!()
+     expect(gate.suspended).toBe(true)
+@@ -162,11 +271,18 @@ describe('main.ts wiring', () => {
+ 
+   it('does not write a failure line (stack) for a skipped background read', () => {
+     const handler = main.slice(main.indexOf("ipcMain.handle('hermes:api'"))
+-    const skip = handler.indexOf('if (isPowerSettlingError(error))')
++    const skip = handler.indexOf('if (isPowerSettlingError(error) ||')
+     expect(skip).toBeGreaterThan(0)
+     expect(skip).toBeLessThan(handler.indexOf('rememberLog(formatApiRequestFailure(request, error))'))
+   })
+ 
++  it('absorbs a sleep-crossing connect failure before writing the failure line', () => {
++    const handler = main.slice(main.indexOf("ipcMain.handle('hermes:api'"))
++    const absorb = handler.indexOf('powerSettleGate.absorbFailure(request, error)')
++    expect(absorb).toBeGreaterThan(0)
++    expect(absorb).toBeLessThan(handler.indexOf('rememberLog(formatApiRequestFailure(request, error))'))
++  })
++
+   it('attaches the gate to powerMonitor and clears a stale suspend on window focus', () => {
+     const register = main.slice(main.indexOf('function registerPowerResumeListeners()'))
+     expect(register).toContain('attachPowerSettle(powerSettleGate, powerMonitor, rememberLog)')
+diff --git a/apps/desktop/electron/power-settle.ts b/apps/desktop/electron/power-settle.ts
+index dddc97b6aad..62ca23f0ea7 100644
+--- a/apps/desktop/electron/power-settle.ts
++++ b/apps/desktop/electron/power-settle.ts
+@@ -15,9 +15,27 @@
+ // User-driven work is never held: anything that is not a GET, or that carries priority 'foreground', passes through.
+ // A user action (window focus, a foreground request) while still marked suspended counts as a wake, so a missed
+ // 'resume' cannot hold background reads forever.
++//
++// 2026-10-30: macOS only sent 'resume' at the FIRST DarkWake after a clamshell sleep (17:08); the next 4.5 h of
++// Maintenance Sleep / DarkWake cycles and the final DarkWake -> FullWake (21:31:30) emitted neither 'suspend' nor
++// 'resume', so the gate stayed open: reads in flight when the Mac froze expired at the next wake (21:31:26
++// session-mentions/outbox, "after 10000ms") and the pollers ran into tunnels still rebuilding (21:31:38-48
++// "Remote backend ... is down"). So the gate also
++// - treats a wall-clock gap (no tick for CLOCK_GAP_MS while a 5 s ticker runs) as a missed sleep -> wake;
++// - absorbs a background read's connect failure (timeout / remote down / refused) when the Mac slept while the read
++//   was in flight (it times out the moment the process thaws), or within RECONNECT_GRACE_MS after a wake while
++//   tunnels reconnect. It fails as PowerSettlingError (the next poll retries) and is counted in one summary line
++//   when the grace ends.
+ 
+ export const POWER_SETTLE_MS = 15_000
+ export const POWER_SETTLE_SPREAD_MS = 10_000
++export const POWER_CLOCK_TICK_MS = 5_000
++export const POWER_CLOCK_GAP_MS = 30_000
++export const POWER_RECONNECT_GRACE_MS = 60_000
++
++// Connect-level failures a sleep or a tunnel rebuild produces. A server answer (HTTP status) never matches.
++const CONNECT_FAILURE_RE =
++  /Timed out connecting to Hermes backend|Remote backend .* is down|ECONNREFUSED|ECONNRESET|EPIPE|ETIMEDOUT|socket hang up|SSH operation .* timed out/
+ 
+ export const POWER_SETTLING_CODE = 'POWER_SETTLING'
+ 
+@@ -52,6 +70,13 @@ export interface PowerSettleOptions {
+   sleep?: (ms: number) => Promise<void>
+   settleMs?: number
+   spreadMs?: number
++  clockGapMs?: number
++  reconnectGraceMs?: number
++}
++
++/** True for a failure at the connect layer (timeout, refused, remote down), not a server response. */
++export function isConnectFailure(error: unknown): boolean {
++  return CONNECT_FAILURE_RE.test(String((error as { message?: unknown } | null)?.message ?? error ?? ''))
+ }
+ 
+ /** True for a request the gate may hold: a background (non-foreground) GET. */
+@@ -67,7 +92,13 @@ export class PowerSettleGate {
+   readonly #sleep: (ms: number) => Promise<void>
+   readonly #settleMs: number
+   readonly #spreadMs: number
++  readonly #clockGapMs: number
++  readonly #reconnectGraceMs: number
+   #suspended = false
++  #lastTick: number
++  #lastWakeAt = -Infinity
++  #absorbed = 0
++  #log?: (line: string) => void
+   #settleUntil = 0
+   #held = 0
+   #skipped = 0
+@@ -81,6 +112,59 @@ export class PowerSettleGate {
+     this.#sleep = options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
+     this.#settleMs = options.settleMs ?? POWER_SETTLE_MS
+     this.#spreadMs = options.spreadMs ?? POWER_SETTLE_SPREAD_MS
++    this.#clockGapMs = options.clockGapMs ?? POWER_CLOCK_GAP_MS
++    this.#reconnectGraceMs = options.reconnectGraceMs ?? POWER_RECONNECT_GRACE_MS
++    this.#lastTick = this.#now()
++  }
++
++  setLog(log: ((line: string) => void) | undefined): void {
++    this.#log = log
++  }
++
++  /**
++   * Called every POWER_CLOCK_TICK_MS by attachPowerSettle, and before every decision. A gap longer than clockGapMs
++   * means the process was frozen (the Mac slept) without a powerMonitor event: start a settle window as on 'resume'.
++   * Also writes the reconnect-grace summary once the grace after a wake has passed.
++   */
++  observeClock(): void {
++    const now = this.#now()
++    const gap = now - this.#lastTick
++    this.#lastTick = now
++
++    if (gap > this.#clockGapMs) {
++      const { skipped } = this.wake()
++      this.#log?.(
++        `[power-settle] clock-gap wake: no tick for ${Math.round(gap / 1000)}s (sleep without a resume event); ` +
++          `${skipped} skipped; staggering background reads`
++      )
++    }
++
++    if (this.#absorbed > 0 && now - this.#lastWakeAt >= this.#reconnectGraceMs) {
++      this.#log?.(`[power-settle] ${this.#absorbed} background read(s) failed to connect across a sleep/wake; absorbed`)
++      this.#absorbed = 0
++    }
++  }
++
++  /**
++   * A background read failed. True if it is a connect-level failure while suspended or within the reconnect grace
++   * after a wake (including a wake this call itself detects from a clock gap: a read in flight when the Mac froze
++   * times out the moment it thaws). The caller then throws PowerSettlingError instead of logging a failure; the
++   * next poll retries. False for a real failure that must be logged.
++   */
++  absorbFailure(request: PowerSettleRequest | null | undefined, error: unknown): boolean {
++    if (!isBackgroundRead(request) || !isConnectFailure(error)) {
++      return false
++    }
++
++    this.observeClock()
++
++    if (!this.#suspended && this.#now() - this.#lastWakeAt >= this.#reconnectGraceMs) {
++      return false
++    }
++
++    this.#absorbed += 1
++
++    return true
+   }
+ 
+   get suspended(): boolean {
+@@ -96,7 +180,9 @@ export class PowerSettleGate {
+    * the held/skipped counts. */
+   wake(): { held: number; skipped: number } {
+     this.#suspended = false
+-    this.#settleUntil = this.#now() + this.#settleMs
++    this.#lastWakeAt = this.#now()
++    this.#lastTick = this.#lastWakeAt
++    this.#settleUntil = this.#lastWakeAt + this.#settleMs
+     const counts = { held: this.#held, skipped: this.#skipped }
+     this.#held = 0
+     this.#skipped = 0
+@@ -125,6 +211,8 @@ export class PowerSettleGate {
+    * while suspended. During the settle window a background read waits until the window ends plus a random spread.
+    */
+   async admit(request: PowerSettleRequest | null | undefined): Promise<void> {
++    this.observeClock()
++
+     if (!isBackgroundRead(request)) {
+       if (request?.priority === 'foreground') {
+         this.noteActive()
+@@ -173,12 +261,20 @@ export interface PowerSettleMonitor {
+   on(event: string, listener: () => void): unknown
+ }
+ 
++export interface PowerSettleTimers {
++  setInterval(fn: () => void, ms: number): { unref?: () => unknown }
++}
++
+ /** Wire the gate to Electron's powerMonitor. `log` gets one line per wake with the held/skipped counts. */
+ export function attachPowerSettle(
+   gate: PowerSettleGate,
+   powerMonitor: PowerSettleMonitor,
+-  log?: (line: string) => void
++  log?: (line: string) => void,
++  timers: PowerSettleTimers = globalThis
+ ) {
++  gate.setLog(log)
++  // A wall-clock gap between ticks is a sleep powerMonitor did not report (DarkWake/Maintenance Sleep cycles).
++  timers.setInterval(() => gate.observeClock(), POWER_CLOCK_TICK_MS).unref?.()
+   powerMonitor.on('suspend', () => gate.suspend())
+ 
+   powerMonitor.on('resume', () => {
+-- 
+2.55.0
+

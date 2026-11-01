@@ -1,0 +1,152 @@
+From 44dee4180898e4b915d1ab672cf9a9defccccec3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:17:49 -0700
+Subject: [PATCH] fix(kanban): an adopted remote card's done/blocked notice
+ reaches its origin chat [daveey]
+
+The remote-notice index and sweep read only sessions[rel=shepherd]. A card attached to a chat by
+kanban_origin_adopt names that chat only in origin_bindings, so its origin never got a done notice,
+never summarised, and its outcome stayed unresolved{no_summary} (hub t_example123 -> MacBook
+20260102_120000_example; 7 of 238 bound cards on the MacBook replica). Both paths now also index
+origin_bindings[].origin for this gateway, one notice per chat.
+---
+ .../tui_gateway/test_kanban_remote_notices.py | 69 +++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 34 ++++++---
+ 2 files changed, 95 insertions(+), 8 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_notices.py b/tests/tui_gateway/test_kanban_remote_notices.py
+index f6922fc2ae7..88642260436 100644
+--- a/tests/tui_gateway/test_kanban_remote_notices.py
++++ b/tests/tui_gateway/test_kanban_remote_notices.py
+@@ -717,3 +717,72 @@ def test_every_delivered_ack_has_a_transcript_row_after_a_stale_settle(tmp_path)
+     # Settled for every reader: the ledger skip used by the sweep and collect treats it as done.
+     with contextlib.closing(krn._ledger(ledger)) as c:
+         assert krn._ledger_settled(c, (CHAT,), f"hub/{moved['key']}", state)
++
++
++def _adopted(card, origin_session, *, gateway="macbook", shepherd=False):
++    """``card`` re-shaped as an adopted card: its chat is named only by an ``origin_bindings`` marker."""
++    task = card["task"]
++    task["origin_bindings"] = [{"binding_id": "binding-x", "version": 1, "task_record_key": card["key"],
++                                "origin": {"gateway": gateway, "profile": "default", "session": origin_session},
++                                "owner": {"board": "default", "gateway": "hub", "profile": "default",
++                                          "task_id": task["id"]}}]
++    if not shepherd:
++        task["sessions"] = [{"gw": "macbook", "profile": "default", "session": OTHER, "rel": "shepherd"}]
++    return card
++
++
++def test_sweep_notifies_the_origin_chat_of_an_adopted_card(tmp_path):
++    """[daveey] An adopted card's origin chat gets the done notice although no shepherd link names it
++    (hub t_example123 reached five unrelated shepherds and never chat 20260102_120000_example)."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    replica = _hub(tmp_path, [_adopted(_card("t_adopted", CHAT, status="done", at=now - 4), CHAT)])
++    krn._reset_for_tests()
++    with SessionDB(tmp_path / "state.db") as db:
++        for sid in (CHAT, OTHER):
++            db.create_session(sid, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield db, sid
++
++        got = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=tmp_path / "ledger.db", now=now)
++        assert sorted(d["session_id"] for d in got) == sorted([CHAT, OTHER])
++        assert [m["display_kind"] for m in db.get_messages(CHAT)] == ["kanban_notice"]
++        assert "t_adopted" in db.get_messages(CHAT)[0]["content"]
++
++
++def test_poller_collect_returns_the_adopted_cards_notice_to_its_origin_chat(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    replica = _hub(tmp_path, [_adopted(_card("t_adopted_poll", CHAT, status="done", at=now - 4), CHAT)])
++    krn._reset_for_tests()
++    got = krn.collect(CHAT, "default", hub_db=replica, ledger=tmp_path / "ledger.db", now=now)
++    assert [g["ref"].rsplit("/", 1)[-1] for g in got] == ["t_adopted_poll"]
++
++
++def test_origin_that_is_also_a_shepherd_gets_one_notice_and_foreign_origins_none(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    both = _adopted(_card("t_both", CHAT, status="done", at=now - 4), CHAT, shepherd=True)
++    foreign = _adopted(_card("t_foreign", OTHER, status="done", at=now - 4), CHAT, gateway="mini")
++    foreign["task"]["sessions"] = []
++    replica = _hub(tmp_path, [both, foreign])
++    krn._reset_for_tests()
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield db, sid
++
++        got = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=tmp_path / "ledger.db", now=now)
++        assert [(d["session_id"], d["task_id"]) for d in got] == [(CHAT, "t_both")]
++        assert len(db.get_messages(CHAT)) == 1
++    assert [g["ref"].rsplit("/", 1)[-1] for g in krn.collect(CHAT, "default", hub_db=replica,
++                                                               ledger=tmp_path / "ledger2.db", now=now)] == ["t_both"]
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 96fe23d79c8..6fcb80b4d92 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -139,16 +139,35 @@ def _index(path: Path) -> tuple[str, dict]:
+             continue
+         if not isinstance(task, dict) or task.get("status") not in _TERMINAL or not task.get("id"):
+             continue
+-        links = task.get("sessions") if isinstance(task.get("sessions"), list) else []
+-        for link in links:
+-            if (isinstance(link, dict) and link.get("gw") == me and link.get("rel") in LINK_RELS
+-                    and link.get("session") and not _released(link)):
+-                index.setdefault((str(link.get("profile") or "default"), str(link["session"])), []).append(
+-                    {"gw": str(gw), "key": str(key), "task": task})
++        for chat in _linked_chats(task, me):
++            index.setdefault(chat, []).append({"gw": str(gw), "key": str(key), "task": task})
+     _index_memo = (str(path), sig, me, index)
+     return me, index
+ 
+ 
++def _linked_chats(task: dict, me: str) -> list[tuple[str, str]]:
++    """``(profile, session)`` of this gateway's chats a remote card notifies: its unreleased shepherd links, and
++    the origin chat of every origin binding (``kanban_origin_adopt``) naming this gateway. [daveey]
++
++    An adopted card carries its origin only as an ``origin_bindings`` marker; the owner publishes no shepherd link
++    for it unless a hub subscription happens to exist. Reading only ``sessions`` left that origin chat with no
++    done notice at all, so it never summarised the finished work and its outcome stayed ``unresolved{no_summary}``
++    (hub card t_example123 -> MacBook chat 20260102_120000_example, 2026-10-31: the notice reached five unrelated
++    shepherd transcripts and not the chat that asked for the work)."""
++    out: list[tuple[str, str]] = []
++    links = task.get("sessions")
++    for link in links if isinstance(links, list) else ():
++        if (isinstance(link, dict) and link.get("gw") == me and link.get("rel") in LINK_RELS
++                and link.get("session") and not _released(link)):
++            out.append((str(link.get("profile") or "default"), str(link["session"])))
++    bindings = task.get("origin_bindings")
++    for binding in bindings if isinstance(bindings, list) else ():
++        origin = binding.get("origin") if isinstance(binding, dict) else None
++        if isinstance(origin, dict) and origin.get("gateway") == me and origin.get("session"):
++            out.append((str(origin.get("profile") or "default"), str(origin["session"])))
++    return list(dict.fromkeys(out))  # one notice per chat even when a chat is both origin and shepherd
++
++
+ def _released(link: dict) -> bool:
+     """[daveey] The owner released this chat's link: its notices stop (session-outcome fan-out filter)."""
+     from tui_gateway.notice_fanout import link_released
+@@ -807,8 +826,7 @@ def _sweep_cards(rows: list[tuple], me: str):
+         done = task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice
+         if not done and task.get("status") != "blocked":
+             continue
+-        links = [link for link in task.get("sessions") or [] if isinstance(link, dict)
+-                 and link.get("rel") == "shepherd" and link.get("gw") == me and not _released(link)]
++        links = [{"profile": profile, "session": sid} for profile, sid in _linked_chats(task, me)]
+         if not links:
+             continue
+         yield owner, key, task, links
+-- 
+2.55.0
+

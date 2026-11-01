@@ -1,0 +1,88 @@
+From 23853747bd0f52c6f95f910f791333b6a5b367ef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:29:07 -0700
+Subject: [PATCH] fix(gateway): session.active_list reports a running turn's
+ last activity, not the session start [daveey]
+
+The session authority's active_list stamped last_active = ended_at or started_at. Desktop marks a
+working row stalled (red) once last_active is 5+ min old, so every turn in a chat older than 5 min read
+as quiet for days (the status auditor saw 'quiet for 692904s' on a turn making API calls). Read the
+freshest activity (durable heartbeat or newest message) in the listing's batch query instead.
+---
+ gateway/session_active_list.py              |  6 +++++-
+ gateway/session_live_listing.py             |  5 +++++
+ tests/gateway/test_authority_active_list.py | 16 ++++++++++++++++
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/session_active_list.py b/gateway/session_active_list.py
+index f55d3acbbe4..61d6fdd5820 100644
+--- a/gateway/session_active_list.py
++++ b/gateway/session_active_list.py
+@@ -36,8 +36,12 @@ async def active_list(connection, ref, params):
+         if row.get('source') in INTERNAL_LISTING_SOURCES or entry.closed:
+             continue
+         sid, started = entry.session_id, float(row.get('started_at') or 0)
++        # [daveey] The freshest activity, not the session start: Desktop paints a working row stalled
++        # (red) once ``last_active`` is 5+ min old, so ``started_at`` turned every turn in a chat older
++        # than that into a days-quiet stall. Heartbeats land every <=60 s while a tool runs.
++        last = max(float(row.get('ended_at') or 0), float(row.get('last_active') or 0)) or started
+         rows.append({'current': sid == current, 'id': sid, 'session_key': sid,
+-                     'last_active': float(row.get('ended_at') or started), 'started_at': started,
++                     'last_active': last, 'started_at': started,
+                      'message_count': int(row.get('message_count') or 0),
+                      'model': str(row.get('model') or ''), 'preview': '', 'title': row.get('title') or '',
+                      'source': row.get('source'), 'status': _status(entry.live, entry.handle, entry.pending)})
+diff --git a/gateway/session_live_listing.py b/gateway/session_live_listing.py
+index 864276b73e3..2d6be93b7be 100644
+--- a/gateway/session_live_listing.py
++++ b/gateway/session_live_listing.py
+@@ -38,14 +38,19 @@ class LiveEntry:
+ def _store_facts(db, session_ids):
+     """Worker thread: ``{sid: row}`` and ``{sid: [pending admission]}`` for *session_ids*, in two reads.
+ 
++    ``last_active`` is the session's freshest activity (the agent's durable heartbeat or its newest
++    message, else ``started_at``): ``session.active_list`` reports it for a running turn. [daveey]
++
+     ``target_ended_at`` is the local receipt target's ``ended_at`` (``closed_and_unviewed``'s read):
+     SQLite extracts the target from the receipt, so no receipt is parsed in Python. A malformed or
+     non-local receipt reads as no target, as ``_local_target`` does."""
++    from hermes_state_common import _sql_session_last_active
+     from hermes_state_local import POLICY_PREFIX
+     ids = json.dumps(list(session_ids))
+     with db._read_ctx() as conn:
+         rows = conn.execute(
+             "SELECT s.id, s.source, s.title, s.started_at, s.ended_at, s.message_count, s.model, s.hidden, "
++            f"{_sql_session_last_active('s')} AS last_active, "
+             "s.archived, s.runtime_revision, s.runtime_generation, "
+             "(SELECT t.ended_at FROM state_meta m JOIN sessions t ON t.id = CASE WHEN json_valid(m.value) "
+             "THEN json_extract(m.value, '$.entry.session_id') END WHERE m.key = ? || s.id) AS target_ended_at "
+diff --git a/tests/gateway/test_authority_active_list.py b/tests/gateway/test_authority_active_list.py
+index c344c918159..2459d5c012f 100644
+--- a/tests/gateway/test_authority_active_list.py
++++ b/tests/gateway/test_authority_active_list.py
+@@ -62,6 +62,22 @@ async def test_a_running_turn_reads_working_until_it_settles(owner):
+     assert (await owner.active())['chat']['status'] == 'idle'
+ 
+ 
++@pytest.mark.asyncio
++async def test_a_running_turn_reports_its_last_activity_not_the_session_start(owner):
++    # Desktop paints a working row stalled (red) once ``last_active`` is 5+ min old. Reporting the
++    # session's ``started_at`` made every turn in a chat older than 5 min read as quiet for days.
++    db = owner.authority.db
++    started = (await owner.active())['chat']['started_at']
++    old = started - 8 * 86400
++    db._write_sql('UPDATE sessions SET started_at = ? WHERE id = ?', (old, 'chat'))
++    await owner.submit('hi')
++    stamp = started + 30.0  # a tool heartbeat (``AIAgent._touch_activity``) mid-turn
++    db.touch_session_activity('chat', stamp, description='tool heartbeat')
++    row = (await owner.active())['chat']
++    assert (row['status'], row['started_at']) == ('working', pytest.approx(old)), row
++    assert row['last_active'] >= stamp, row
++
++
+ @pytest.mark.asyncio
+ async def test_a_row_names_its_source(owner):
+     # Desktop's poll can see a messaging turn settle before its messaging row loads; the source
+-- 
+2.55.0
+

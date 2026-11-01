@@ -19,8 +19,9 @@ Builds on [Nightly E2E dispatch and actionable reports](nightly-e2e.md).
   They never relabel unmarked production-main entries or overwrite existing markers.
 - Main, individual non-main refs, and acceptance labels have separate card scopes.
   Identical failure sets in different scopes do not update production cards;
-  green comments stay in their own scope. A subset is a different fingerprint,
-  not a duplicate of the larger failing-test set.
+  green comments stay in their own scope. Since [1430](nightly-e2e.md), all red
+  results within one scope update its one open red owner, including subsets,
+  supersets and disjoint sets; the earlier per-fingerprint behavior is superseded.
 - Fixture creates pair `HERMES_KANBAN_TASK` with the owner's live
   `HERMES_KANBAN_RUN_ID` and pass `--no-requires`. Ordinary creates strip both
   inherited identity variables and retain the default assignee.
@@ -81,8 +82,10 @@ In `tests/ci/test_nightly_e2e.py`:
   comments touch only the acceptance card (1383).
 - `test_nightly_board_keeps_auto_assigned_production_routing`: create argv uses
   assignee `default` (1383).
-- `test_subset_of_failing_tests_is_a_separate_fingerprint_and_card`: a smaller
-  failing set files another card without comments on the first (1383).
+- 1430 replaces the earlier separate-fingerprint subset test with
+  `test_subset_of_failing_tests_comments_on_the_open_red_card`: a smaller
+  failing set comments on the existing scoped owner. See [nightly E2E](nightly-e2e.md)
+  for migration and delta coverage; that follow-up was not rerun in this mirror pass.
 - `test_acceptance_flags_are_validated_together`: missing partner flags, unknown
   owner, and invalid marker raise `SystemExit` (1383).
 - `test_acceptance_owner_must_be_the_running_worker_task`: foreign owner versus

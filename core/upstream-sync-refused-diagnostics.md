@@ -42,11 +42,25 @@ validation that every expected slice number was returned. Whole-file crash, coll
 no-tests and timeout markers make failed-log ID sets incomplete; overlapping parsed IDs
 can still be reported as baseline failures, but missing IDs cannot establish candidate-only.
 
-1395 ownership uses the local nightly state fingerprint-to-card mapping, an open status
-from `flaky_kanban.OPEN`, `created_by == nightly-e2e`, and reporter-body count/list checks.
-The body check looks for the total count and the first `MAX_LISTED` sorted IDs, not a
-full body parser. A missing idempotency key is allowed (the CLI JSON shape omits it);
-if returned, it must match the fingerprint prefix. 1396 validates the state/card-map shape.
+1395 introduced fingerprint-to-card ownership; **1430** (`7737f2331c81`) updates it
+for [one red owner per alert scope](nightly-e2e.md). The main-scope `red` record's
+latest `failing` IDs are authoritative over its initial body and stale legacy records.
+Owners must have a status in `flaky_kanban.OPEN`, have `created_by == nightly-e2e`,
+match the state's card ID, and belong to main, not an acceptance scope. This diagnostic
+lookup retains the explicit OPEN set; the reporter's own `_is_open` uses the broader
+neither-done-nor-archived rule. Legacy fingerprint records still require
+body count/list evidence. A missing board idempotency key is allowed because the CLI
+JSON shape omits it; a returned key must match creation provenance, including an
+adopted legacy identity. `_owner_identity` validates saved identities and can recover
+an older adoption fingerprint only from the complete original body. 1396 validates
+the state/card-map shape.
+
+1430's source tests in `tests/scripts/ci/test_upstream_sync_diagnostics.py` cover
+latest-set versus initial-body lookup, adopted legacy identities, unrelated provenance,
+acceptance exclusion, invalid saved identities and red-record precedence over legacy
+state. These tests were inspected, not rerun in this mirror pass. Apply 1430 after
+its predecessors using the full replay procedure; it changes diagnostic ownership,
+not the refusal verdict or landing gate. No plugin is involved.
 
 Log reads share a 300-second elapsed-time budget checked before each call. This is not
 an interrupting deadline for an in-flight request or for API pagination. 1396 treats

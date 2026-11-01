@@ -1,0 +1,159 @@
+From 89d227c572b3247a1ef1a1d8887105e6bc75abea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 18:43:51 +0000
+Subject: [PATCH] fix(kanban): inspect assignee policy outside caller frozen
+ config [daveey]
+
+---
+ hermes_cli/config_effective.py                | 15 +++-
+ hermes_cli/kanban_capabilities.py             |  4 +-
+ tests/hermes_cli/test_kanban_capabilities.py  |  2 +-
+ .../test_kanban_worker_capabilities.py        | 68 +++++++++++++++++++
+ 4 files changed, 85 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_worker_capabilities.py
+
+diff --git a/hermes_cli/config_effective.py b/hermes_cli/config_effective.py
+index 55ff6fcce6b..cff5fb260c5 100644
+--- a/hermes_cli/config_effective.py
++++ b/hermes_cli/config_effective.py
+@@ -69,6 +69,19 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
+         return _effective(snapshot)
+     if config_path is None:
+         config_path = _config.get_config_path()
++    return load_profile_config_effective(config_path, fail_closed=fail_closed, record_backup=True)
++
++
++def load_profile_config_effective(
++    config_path: Path, *, fail_closed: bool = False, record_backup: bool = False,
++) -> dict[str, Any]:
++    """Inspect a profile's current policy, NOT the calling worker's session authority.
++
++    Assignment preflight needs the assignee's configuration even inside a frozen worker.
++    Session/runtime readers must keep using ``load_user_config_effective``; this read-only
++    projection neither replaces nor unbinds their snapshot. The caller binds the target's
++    home and secret scopes, just as for an explicit-path user-config read. [daveey]
++    """
+     path_key = str(config_path)
+     with _config._CONFIG_LOCK:
+         user_sig, cache_sig = _config._load_config_cache_sig(config_path)
+@@ -98,7 +111,7 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
+                 # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).
+                 # Only for the ACTIVE home — a read of another profile's file (doctor, TUI cwd lookup)
+                 # must not create backups/ inside that profile.
+-                if config_path == _config.get_config_path():
++                if record_backup and config_path == _config.get_config_path():
+                     from hermes_cli.config_backups import backup_config
+                     backup_config(config_path, "good")
+ 
+diff --git a/hermes_cli/kanban_capabilities.py b/hermes_cli/kanban_capabilities.py
+index 0673c709106..0766415828f 100644
+--- a/hermes_cli/kanban_capabilities.py
++++ b/hermes_cli/kanban_capabilities.py
+@@ -290,7 +290,7 @@ def _profile_capabilities(assignee: str, required: list[str] | None = None) -> s
+     lets the toolset lookup skip plugin discovery when a recorded one already grants it."""
+     from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+     from hermes_cli.config_backend import read_config_doc_readonly
+-    from hermes_cli.config_effective import load_user_config_effective
++    from hermes_cli.config_effective import load_profile_config_effective
+     from hermes_cli.profiles import resolve_profile_env
+     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+     from tools.terminal_scope import build_profile_terminal_scope, reset_terminal_scope, set_terminal_scope
+@@ -303,7 +303,7 @@ def _profile_capabilities(assignee: str, required: list[str] | None = None) -> s
+     with ExitStack() as stack:
+         stack.callback(reset_hermes_home_override, set_hermes_home_override(str(home)))
+         stack.callback(reset_secret_scope, set_secret_scope(build_profile_secret_scope(home)))
+-        config = load_user_config_effective(config_path, fail_closed=True)
++        config = load_profile_config_effective(config_path, fail_closed=True)
+         _check_policy_shape(config)
+         terminal = build_profile_terminal_scope(home)
+         # Effective config includes managed overlays and expanded values; the terminal
+diff --git a/tests/hermes_cli/test_kanban_capabilities.py b/tests/hermes_cli/test_kanban_capabilities.py
+index 527d3ad9fb6..61da9146d96 100644
+--- a/tests/hermes_cli/test_kanban_capabilities.py
++++ b/tests/hermes_cli/test_kanban_capabilities.py
+@@ -97,7 +97,7 @@ def test_unreadable_policy_fails_closed(profiles, monkeypatch):
+     profiles("coder", LOCAL)
+     def denied(*args, **kwargs):
+         raise PermissionError("denied")
+-    monkeypatch.setattr(config_effective, "load_user_config_effective", denied)
++    monkeypatch.setattr(config_effective, "load_profile_config_effective", denied)
+     with pytest.raises(CapabilityMismatchError):
+         validate_assignment("coder", requires=["terminal"])
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_capabilities.py b/tests/hermes_cli/test_kanban_worker_capabilities.py
+new file mode 100644
+index 00000000000..ad3f476b9ff
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_capabilities.py
+@@ -0,0 +1,68 @@
++"""Admission must inspect the assignee, not the creating worker's frozen policy.
++
++Regression for the Upkeep release child: a shell-capable creator admitted a cli=[]
++assignee, whose retry then rejected every capable profile as tool-less.
++"""
++import json
++from pathlib import Path
++import subprocess
++import sys
++import textwrap
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++@pytest.mark.parametrize("caller_tools", [[], ["terminal", "file"]])
++@pytest.mark.parametrize("target_tools", [[], ["terminal", "file"], ["hermes-cli"]])
++def test_frozen_worker_create_uses_target_policy(tmp_path, caller_tools, target_tools):
++    home = tmp_path / ".hermes"
++    target = home / "profiles" / "ci-sweeper"
++    target.mkdir(parents=True)
++    config = {"platform_toolsets": {"cli": target_tools}, "terminal": {"backend": "local"}}
++    (target / "config.yaml").write_text(json.dumps(config))
++    # Both default and a named profile must resolve independently of the caller.
++    (home / "config.yaml").write_text(json.dumps(config))
++    snapshot = {"platform_toolsets": {"cli": caller_tools}, "terminal": {"backend": "docker"}}
++    script = tmp_path / "probe.py"
++    script.write_text(f"import sys; sys.path.insert(0, {str(ROOT)!r})\n" + textwrap.dedent(f"""
++        import json
++        from pathlib import Path
++        from agent.safe_worker_policy import _bind_worker_config, worker_config_snapshot
++        snapshot = {snapshot!r}
++        _bind_worker_config(snapshot)
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.kanban_capabilities import CapabilityMismatchError
++        from hermes_cli.config_effective import load_user_config_effective
++        from hermes_cli.config import load_config_readonly
++        kb.init_db()
++        from hermes_cli.kanban_db_connect import connect_closing
++        with connect_closing() as conn:
++            for assignee in ('default', 'ci-sweeper'):
++                before = conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
++                try:
++                    tid = kb.create_task(conn, title='Release containing approved SHA; no app install',
++                                         assignee=assignee, requires=['terminal', 'git'])
++                except CapabilityMismatchError as exc:
++                    assert not {bool(target_tools)!r}, str(exc)
++                    assert exc.missing == ['terminal', 'git'], exc.missing
++                    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == before
++                else:
++                    assert {bool(target_tools)!r}, 'tool-less release worker was admitted'
++                    assert kb.get_task(conn, tid).requires == ['terminal', 'git']
++        # Inspection must not write backups or change the worker's own execution authority.
++        assert not list(Path({str(home)!r}).rglob('backups/config'))
++        assert worker_config_snapshot() == snapshot
++        assert load_user_config_effective()['platform_toolsets'] == snapshot['platform_toolsets']
++        assert load_config_readonly()['platform_toolsets'] == snapshot['platform_toolsets']
++        print('TARGET_POLICY_OK')
++    """))
++    from tests.gateway.fixtures.local_recovery_probe import child_env
++    env = child_env()
++    env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path), HERMES_HOME=str(home),
++               HERMES_DISABLE_LAZY_INSTALLS="1")
++    proc = subprocess.run([sys.executable, str(script)], cwd=ROOT, env=env,
++                          capture_output=True, text=True, timeout=90, check=False)
++    assert proc.returncode == 0, proc.stdout + proc.stderr
++    assert "TARGET_POLICY_OK" in proc.stdout
+-- 
+2.55.0
+

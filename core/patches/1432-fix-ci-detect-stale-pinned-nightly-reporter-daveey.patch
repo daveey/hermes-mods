@@ -1,0 +1,297 @@
+From 8abb9e18b42bb0978fe8c5dd5c98e998650aee0e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 12:00:55 +0000
+Subject: [PATCH] fix(ci): detect stale pinned nightly reporter [daveey]
+
+---
+ scripts/ci/nightly_e2e.py              |  73 ++++++++++++-
+ tests/ci/test_nightly_e2e.py           |   5 +
+ tests/ci/test_nightly_e2e_pin.py       | 136 +++++++++++++++++++++++++
+ tests/ci/test_nightly_e2e_red_cards.py |   5 +
+ 4 files changed, 218 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ci/test_nightly_e2e_pin.py
+
+diff --git a/scripts/ci/nightly_e2e.py b/scripts/ci/nightly_e2e.py
+index c14928a99eb..a15a2a52ea8 100644
+--- a/scripts/ci/nightly_e2e.py
++++ b/scripts/ci/nightly_e2e.py
+@@ -716,6 +716,68 @@ def _settle_error(
+         return False, f"{BOARD_FAILED}, kept pending: settle error {err!r}; filing the card: {board_err!r}"
+ 
+ 
++DEFAULT_CORE = Path.home() / ".hermes" / "hermes-agent"
++PIN_FILES = ("nightly_e2e.py", "flaky_kanban.py")
++
++
++def _pin_git(core: Path, *args: str) -> bytes:
++    return subprocess.run(
++        ["git", "-C", str(core), *args], capture_output=True, check=True, timeout=15
++    ).stdout
++
++
++def check_pin(board: Any, state: dict[str, Any], *, core: Path, now: float) -> str | None:
++    """Check immutable exports, not an in-checkout reporter. Never fetch in a cron tick."""
++    running = Path(__file__).resolve()
++    core = core.expanduser().resolve()
++    if running.is_relative_to(core):
++        return None
++    # Freeze the ref so an updater fetch cannot mix content, blob IDs and dates from different heads.
++    main = _pin_git(core, "rev-parse", "origin/main").decode().strip()
++    blobs, stale = [], []
++    for name in PIN_FILES:
++        path = f"scripts/ci/{name}"
++        content = _pin_git(core, "show", f"{main}:{path}")
++        blobs.append(_pin_git(core, "rev-parse", f"{main}:{path}").decode().strip())
++        if hashlib.sha256((running.parent / name).read_bytes()).digest() != hashlib.sha256(content).digest():
++            changed = int(_pin_git(core, "log", "-1", "--format=%ct", main, "--", path))
++            if now - changed > 2 * 3600:
++                stale.append(name)
++    if not stale:
++        return None
++    key = "nightly-e2e:stale-pin:" + ":".join(blobs)
++    body = (
++        f"Nightly reporter pin `{running.parent.name}` lags main `{main}`. "
++        f"Files changed more than 2 h ago: {', '.join(stale)}.\n\n"
++        f"On hermes-hub, export BOTH scripts/ci/nightly_e2e.py and scripts/ci/flaky_kanban.py "
++        f"from `{main}` in `{core}` to `~/.hermes/lib/nightly-e2e/{main[:12]}/` "
++        "using git show <sha>:scripts/ci/<file>. Point SCRIPT in BOTH "
++        "`~/.hermes/scripts/nightly_e2e_dispatch.py` and `~/.hermes/scripts/nightly_e2e_report.py` "
++        "there. Verify both pinned SHA-256 hashes against main and the real report cron is ok and silent. "
++        "Do not move the live core checkout."
++    )
++    # Separate from run cards: a green nightly must not imply that the deployment drift is repaired.
++    pins = state.setdefault("pin_cards", {})
++    if key in pins:
++        rec = pins[key]
++        card_id = rec["id"]
++        if rec["body"] != body and _is_open(board, card_id):
++            board.comment(card_id, body)
++            rec["body"] = body
++            return f"stale pin: updated {card_id} (main {main})"
++        return None
++    try:
++        card_id = board.create("Re-pin hermes-hub nightly e2e reporter", body, key)
++    except CreateRefused as refused:
++        card_id = board.create(
++            "Re-pin hermes-hub nightly e2e reporter", body, key,
++            distinct_from=[str(m["id"]) for m in refused.matches if m.get("id")],
++            distinct_reason="deployment drift for these main blobs, not a nightly test failure",
++        )
++    pins[key] = {"id": card_id, "body": body}
++    return f"stale pin: filed {card_id} (main {main})"
++
++
+ def report(
+     gh: GitHub,
+     board: Any,
+@@ -723,8 +785,16 @@ def report(
+     *,
+     now: float,
+     acceptance: tuple[str, str] | None = None,
++    core: Path | None = None,
+ ) -> list[str]:
+     out: list[str] = []
++    try:
++        note = check_pin(board, state, core=core or DEFAULT_CORE, now=now)
++        if note:
++            out.append(note)
++    except Exception as err:  # health: allow BLE001 -- advisory failures must log one line and never skip settlement
++        # This advisory must never prevent pending runs from settling, even for a bug in the check itself.
++        out.append(f"pin check failed (continuing): {err!r}")
+     still: list[dict[str, Any]] = []
+     for entry in list(state["pending"]):
+         # Label runs recorded before the flag existed, but never a production-main run: that incident stays real.
+@@ -776,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
+         default="main",
+         help="dispatch: the ref whose nightly-e2e.yml runs (default main)",
+     )
++    ap.add_argument("--core", type=Path, default=DEFAULT_CORE, help="core checkout for the pinned reporter freshness check")
+     ap.add_argument("--state", type=Path, default=DEFAULT_STATE)
+     ap.add_argument("--hermes", default="hermes")
+     ap.add_argument(
+@@ -801,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
+                 f"nightly-e2e: dispatched {entry['ref']} = {entry['sha']}: {entry['url'] or 'run not visible yet'}"
+             )
+             return 0
+-        lines = report(gh, board, state, now=now, acceptance=acceptance)
++        lines = report(gh, board, state, now=now, acceptance=acceptance, core=args.core)
+     if lines:  # silent when nothing is pending: a no-agent cron job with empty stdout stays quiet
+         print("nightly-e2e:\n" + "\n".join(lines))
+     return 1 if any(BOARD_FAILED in line for line in lines) else 0
+diff --git a/tests/ci/test_nightly_e2e.py b/tests/ci/test_nightly_e2e.py
+index 80e68561530..b6521942a53 100644
+--- a/tests/ci/test_nightly_e2e.py
++++ b/tests/ci/test_nightly_e2e.py
+@@ -116,6 +116,11 @@ class FakeBoard:
+         self.cards[cid]["comments"].append(body)
+ 
+ 
++@pytest.fixture(autouse=True)
++def in_checkout(monkeypatch):
++    monkeypatch.setattr(ne, "DEFAULT_CORE", ROOT)
++
++
+ @pytest.fixture
+ def env():
+     return FakeGitHub(), FakeBoard(), ne.load_state(Path("/nonexistent/state.json"))
+diff --git a/tests/ci/test_nightly_e2e_pin.py b/tests/ci/test_nightly_e2e_pin.py
+new file mode 100644
+index 00000000000..11d4049115a
+--- /dev/null
++++ b/tests/ci/test_nightly_e2e_pin.py
+@@ -0,0 +1,136 @@
++"""Real Git content/age checks at the report entry point; no live board or checkout."""
++from __future__ import annotations
++
++import os
++import subprocess
++
++import pytest
++
++from tests.ci.test_nightly_e2e import T0, FakeBoard, FakeGitHub, _dispatch, ne
++
++
++def git(core, *args, age=10800):
++    env = {**os.environ, "GIT_AUTHOR_DATE": f"{int(T0 - age)} +0000",
++           "GIT_COMMITTER_DATE": f"{int(T0 - age)} +0000"}
++    return subprocess.run(["git", "-C", str(core), *args], env=env, check=True,
++                          capture_output=True).stdout.decode().strip()
++
++
++@pytest.fixture
++def pin(tmp_path, monkeypatch):
++    core = tmp_path / "core"
++    source = core / "scripts" / "ci"
++    source.mkdir(parents=True)
++    deployed = tmp_path / "lib" / "nightly-e2e" / "abcdef123456"
++    deployed.mkdir(parents=True)
++    for name in ("nightly_e2e.py", "flaky_kanban.py"):
++        (source / name).write_bytes(b"# original\r\n")
++        (deployed / name).write_bytes(b"# original\r\n")
++    git(core, "init")
++    git(core, "config", "user.email", "test@example.invalid")
++    git(core, "config", "user.name", "Test")
++    git(core, "add", ".")
++    git(core, "commit", "-m", "base")
++    git(core, "update-ref", "refs/remotes/origin/main", "HEAD")
++    monkeypatch.setattr(ne, "__file__", str(deployed / "nightly_e2e.py"))
++    monkeypatch.setattr(ne, "DEFAULT_CORE", core)
++    return core, source, deployed, FakeGitHub(), FakeBoard(), ne.load_state(tmp_path / "state.json")
++
++
++def change(core, source, name, age):
++    (source / name).write_bytes(b"# newer\n")
++    git(core, "add", ".")
++    git(core, "commit", "-m", "main change", age=age)
++    git(core, "update-ref", "refs/remotes/origin/main", "HEAD")
++
++
++def test_identical_pin_is_silent(pin):
++    _core, _source, _deployed, gh, board, state = pin
++    assert ne.report(gh, board, state, now=T0) == []
++    assert board.created == []
++
++
++@pytest.mark.parametrize("name", ["nightly_e2e.py", "flaky_kanban.py"])
++def test_stale_pin_files_exactly_one_card_on_two_reports(pin, name):
++    core, source, deployed, gh, board, state = pin
++    change(core, source, name, 7201)
++    ne.report(gh, board, state, now=T0)
++    ne.report(gh, board, state, now=T0 + 1)
++    assert len(board.created) == 1
++    card = next(iter(board.cards.values()))
++    assert card["comments"] == []
++    assert deployed.name in card["body"]
++    assert git(core, "rev-parse", "origin/main") in card["body"]
++    for filename in ("nightly_e2e.py", "flaky_kanban.py"):
++        assert git(core, "rev-parse", f"origin/main:scripts/ci/{filename}") in card["key"]
++    assert "nightly_e2e_dispatch.py" in card["body"]
++    assert "nightly_e2e_report.py" in card["body"]
++    assert state["cards"] == {}
++
++
++@pytest.mark.parametrize("age", [7199, 7200])
++def test_recent_main_change_does_not_file(pin, age):
++    core, source, _deployed, gh, board, state = pin
++    change(core, source, "nightly_e2e.py", age)
++    assert ne.report(gh, board, state, now=T0) == []
++    assert board.created == []
++
++
++def test_pin_check_exception_still_settles_run(pin, monkeypatch):
++    _core, _source, _deployed, gh, board, state = pin
++    entry = _dispatch(gh, state)
++    gh.finish(entry["run_id"], "success")
++    def broken(*args, **kwargs):
++        raise AssertionError("broken\ncheck")
++    monkeypatch.setattr(ne, "check_pin", broken)
++    lines = ne.report(gh, board, state, now=T0)
++    assert state["pending"] == []
++    assert len(lines) == 2
++    assert "pin check failed" in lines[0] and "\n" not in lines[0]
++    assert "green" in lines[1]
++
++
++def test_in_checkout_skips_check(pin, monkeypatch):
++    core, source, _deployed, gh, board, state = pin
++    monkeypatch.setattr(ne, "__file__", str(source / "nightly_e2e.py"))
++    git(core, "update-ref", "-d", "refs/remotes/origin/main")
++    assert ne.report(gh, board, state, now=T0) == []
++
++
++def test_real_git_error_still_settles(pin):
++    core, _source, _deployed, gh, board, state = pin
++    git(core, "update-ref", "-d", "refs/remotes/origin/main")
++    entry = _dispatch(gh, state)
++    gh.finish(entry["run_id"], "success")
++    lines = ne.report(gh, board, state, now=T0)
++    assert len(lines) == 2
++    assert "pin check failed" in lines[0]
++    assert "green" in lines[1]
++    assert state["pending"] == []
++
++
++def test_refresh_only_when_main_identity_changes(pin):
++    core, source, _deployed, gh, board, state = pin
++    change(core, source, "nightly_e2e.py", 10800)
++    ne.report(gh, board, state, now=T0)
++    assert ne.report(gh, board, state, now=T0 + 1) == []
++    git(core, "commit", "--allow-empty", "-m", "unrelated main advance")
++    git(core, "update-ref", "refs/remotes/origin/main", "HEAD")
++    ne.report(gh, board, state, now=T0 + 2)
++    assert len(board.created) == 1
++    assert len(next(iter(board.cards.values()))["comments"]) == 1
++
++
++def test_cli_core_is_forwarded(pin, monkeypatch, tmp_path, capsys):
++    core, source, _deployed, gh, board, _state = pin
++    change(core, source, "nightly_e2e.py", 10800)
++    monkeypatch.setattr(ne, "NightlyBoard", lambda *a: board)
++    monkeypatch.setattr(ne, "RestGitHub", lambda *a: gh)
++    monkeypatch.setattr(ne, "_token", lambda: "test")
++    monkeypatch.setattr(ne.time, "time", lambda: T0)
++    monkeypatch.setattr(ne, "DEFAULT_CORE", tmp_path / "not-a-repo")
++    args = ["report", "--core", str(core), "--state", str(tmp_path / "cli.json")]
++    assert ne.main(args) == 0
++    assert ne.main(args) == 0
++    assert len(board.created) == 1
++    assert "pin check failed" not in capsys.readouterr().out
+diff --git a/tests/ci/test_nightly_e2e_red_cards.py b/tests/ci/test_nightly_e2e_red_cards.py
+index 70b9040001e..304bc7c61fa 100644
+--- a/tests/ci/test_nightly_e2e_red_cards.py
++++ b/tests/ci/test_nightly_e2e_red_cards.py
+@@ -21,6 +21,11 @@ from tests.ci.test_nightly_e2e import OWNER, T0, FakeBoard, FakeGitHub, _dispatc
+ A, B, C, D = (f"tests/e2e/{n}.py::t" for n in "abcd")
+ 
+ 
++@pytest.fixture(autouse=True)
++def in_checkout(monkeypatch):
++    monkeypatch.setattr(ne, "DEFAULT_CORE", Path(__file__).resolve().parents[2])
++
++
+ @pytest.fixture
+ def env():
+     return FakeGitHub(), FakeBoard(), ne.load_state(Path("/nonexistent/state.json"))
+-- 
+2.55.0
+

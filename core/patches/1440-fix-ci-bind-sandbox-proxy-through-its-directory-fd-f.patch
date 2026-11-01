@@ -1,0 +1,123 @@
+From 717aa66d413673b356e23d2c76daf27f575b95a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:02:37 +0000
+Subject: [PATCH] fix(ci): bind sandbox proxy through its directory fd for long
+ temp paths [daveey]
+
+---
+ scripts/ci/plugin_validation_sandbox.py    | 23 ++++++++-
+ tests/ci/test_plugin_validation_sandbox.py | 57 ++++++++++++++++++++++
+ 2 files changed, 78 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/ci/plugin_validation_sandbox.py b/scripts/ci/plugin_validation_sandbox.py
+index 702a9b3868b..60d1204d51a 100644
+--- a/scripts/ci/plugin_validation_sandbox.py
++++ b/scripts/ci/plugin_validation_sandbox.py
+@@ -316,6 +316,26 @@ class EgressPolicy:
+         return addrs
+ 
+ 
++def _bind_unix(sock: socket.socket, path: str) -> None:
++    """Bind ``sock`` at ``path`` (mode 0600) however deep ``path`` is.
++
++    sun_path holds 108 bytes, and the scratch dir lives under ``$RUNNER_TEMP`` /
++    ``$TMPDIR``, which can be arbitrarily deep. Instead of moving the socket to a
++    shared short directory, bind through ``/proc/self/fd/<dirfd>/<name>``: the
++    kernel resolves the magic link to the very directory we opened (our private
++    0700 mkdtemp dir, opened O_NOFOLLOW so a swapped-in symlink is refused), so
++    the socket lands at ``path`` with a short address. One code path for every
++    depth, so the tests exercise exactly what CI runs.
++    """
++    parent, name = os.path.split(path)
++    dfd = os.open(parent, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
++    try:
++        sock.bind(f"/proc/self/fd/{dfd}/{name}")
++        os.chmod(f"/proc/self/fd/{dfd}/{name}", 0o600)
++    finally:
++        os.close(dfd)
++
++
+ class EgressProxy:
+     """CONNECT-only proxy on a Unix socket; one thread per tunnel."""
+ 
+@@ -327,8 +347,7 @@ class EgressProxy:
+         self.idle = idle
+         self.slots = threading.BoundedSemaphore(self.MAX_TUNNELS)
+         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+-        self.sock.bind(path)
+-        os.chmod(path, 0o600)
++        _bind_unix(self.sock, path)
+         self.sock.listen(64)
+         self.closed = False
+         threading.Thread(target=self._serve, daemon=True).start()
+diff --git a/tests/ci/test_plugin_validation_sandbox.py b/tests/ci/test_plugin_validation_sandbox.py
+index b12b74e8bf6..60ca3e236d8 100644
+--- a/tests/ci/test_plugin_validation_sandbox.py
++++ b/tests/ci/test_plugin_validation_sandbox.py
+@@ -169,6 +169,63 @@ def test_a_bwrap_that_skips_the_namespaces_is_caught_by_the_inner_self_check(wor
+     assert not marker.exists()
+ 
+ 
++def _deep_dir(base: Path) -> Path:
++    """A real directory whose proxy.sock path is far past sun_path's 108 bytes,
++    like the CI runner's pytest TMPDIR (/var/tmp/hermes-pytest-…/pytest-of-…/…)."""
++    deep = base / ("d" * 60) / ("e" * 60)
++    deep.mkdir(parents=True, mode=0o700)
++    assert len(str(deep / "plugin-sandbox-xxxxxxxx" / "proxy.sock")) > 120
++    return deep
++
++
++def test_the_proxy_binds_and_serves_under_a_deep_runner_temp(work):
++    """Regression: a deep $RUNNER_TEMP/$TMPDIR made the wrapper die with 'AF_UNIX
++    path too long' before bwrap ran. A fake bwrap stands in so this runs without
++    namespaces: it gets the real host socket from `--bind <src> INNER_SOCKET`,
++    checks it is 0600, and speaks CONNECT to it (the policy must still answer)."""
++    deep = _deep_dir(work)
++    result = work / "result.json"
++    fake = work / "fake-bwrap"
++    fake.write_text(textwrap.dedent(f"""\
++        #!{sys.executable}
++        import json, os, socket, stat, sys
++        argv = sys.argv[1:]
++        src = next(argv[i - 1] for i, a in enumerate(argv) if a == {sandbox.INNER_SOCKET!r})
++        d = os.open(os.path.dirname(src), os.O_PATH | os.O_DIRECTORY)
++        s = socket.socket(socket.AF_UNIX)
++        s.connect(f"/proc/self/fd/{{d}}/{{os.path.basename(src)}}")
++        s.sendall(b"CONNECT 169.254.169.254:443 HTTP/1.1\\r\\n\\r\\n")
++        reply = s.recv(64).split(b"\\r\\n")[0].decode()
++        st = os.stat(src)
++        json.dump({{"src": src, "mode": oct(stat.S_IMODE(st.st_mode)),
++                    "is_socket": stat.S_ISSOCK(st.st_mode), "reply": reply}},
++                  open({str(result)!r}, "w"))
++        """))
++    fake.chmod(0o755)
++    r = run("--bwrap", str(fake), "--", "true", env={"RUNNER_TEMP": str(deep)})
++    assert "AF_UNIX" not in r.stderr, r.stderr
++    assert r.returncode == 0, (r.returncode, r.stderr)
++    seen = json.loads(result.read_text())
++    assert seen["src"].startswith(str(deep) + "/plugin-sandbox-"), seen   # in its private scratch, not a shared dir
++    assert seen["is_socket"] and seen["mode"] == "0o600", seen
++    assert seen["reply"].startswith("HTTP/1.1 403"), seen
++    assert "denied CONNECT 169.254.169.254:443" in r.stderr
++    assert not list(deep.glob("plugin-sandbox-*")), "scratch left behind"
++
++
++def test_the_proxy_socket_is_never_bound_through_a_symlinked_dir(work):
++    """The short fd-relative bind opens the scratch dir O_NOFOLLOW: a symlink in
++    its place is refused rather than followed to wherever it points."""
++    deep = _deep_dir(work)
++    target = work / "elsewhere"
++    target.mkdir()
++    link = deep / "scratch"
++    link.symlink_to(target)
++    with pytest.raises(OSError):
++        sandbox.EgressProxy(str(link / "proxy.sock"), sandbox.EgressPolicy({443}, []))
++    assert not (target / "proxy.sock").exists()
++
++
+ @pytest.mark.parametrize("name", ["GH_TOKEN", "GITHUB_TOKEN", "ACTIONS_RUNTIME_TOKEN", "AWS_SECRET_ACCESS_KEY",
+                                   "SSH_AUTH_SOCK", "RUNNER_TEMP", "NPM_TOKEN", "HTTPS_PROXY"])
+ def test_credential_env_names_are_refused_even_when_requested(work, name):
+-- 
+2.55.0
+

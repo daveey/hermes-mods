@@ -1,0 +1,241 @@
+From 656f8d54860e5b6bd8eab7e9c3246b0c3f34cb4c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:20:36 +0000
+Subject: [PATCH] feat(kanban): kanban_create accepts max_retries [daveey]
+
+Workers had no supported way to set a card's retry breaker: kanban_create had
+no max_retries and the worker shell is fenced from 'hermes kanban edit'.
+kanban_create now takes max_retries (int 1-10, bools refused, omitted = NULL),
+validated before placement, and passes it to kb.create_task. hermes-hub
+create-task cannot carry it, so a card using it stays local on auto placement
+and an explicit pin to another gateway is refused (placement_unavailable)
+instead of silently dropping the breaker. The validator lives in the new
+tools/kanban_tools_create_args.py (with CREATED_FIELDS moved there) to keep
+the kanban_tools facade under its size cap.
+---
+ hermes_cli/kanban_placement.py            |  3 +-
+ tests/hermes_cli/test_kanban_placement.py | 20 ++++++++++
+ tests/tools/test_kanban_tools.py          | 48 +++++++++++++++++++++++
+ tools/kanban_tools.py                     | 10 ++---
+ tools/kanban_tools_create_args.py         | 26 ++++++++++++
+ tools/kanban_tools_schemas.py             |  4 ++
+ 6 files changed, 105 insertions(+), 6 deletions(-)
+ create mode 100644 tools/kanban_tools_create_args.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 88440745d57..84b19da0f35 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -147,7 +147,8 @@ DEFAULT_HEAVY_MARKERS = (
+ # The routed target's own host named in the card: that work belongs on the target, not a worker.
+ TARGET_HOST_MARKERS = (r"\bhermes-hub\b", r"\bon the hub\b", r"\bthe hub's\b")
+ # kanban_create options hermes-hub create-task cannot carry: a card using them stays local.
+-UNCARRIED_OPTIONS = ("initial_status", "human_request", "workspace_path", "project", "project_id", "tenant")
++UNCARRIED_OPTIONS = ("initial_status", "human_request", "workspace_path", "project", "project_id", "tenant",
++                     "max_retries")  # hermes-hub create-task has no retry breaker option [daveey]
+ # kanban_create options a hermes-hub client with `create-task --option KEY=JSON` carries to the card.
+ # (hermes-hub also allows reasoning_effort, but kanban_create has no such parameter.)
+ CARRIED_OPTIONS = ("skills", "max_runtime_seconds", "priority", "model", "provider", "goal_mode",
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index e28dfd5baac..7f0d26a9371 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -84,6 +84,7 @@ def test_options_a_new_client_carries_go_to_the_target(extra):
+     ({"human_request": {"action": "x"}}, "human_request"),
+     ({"tenant": "acme"}, "tenant"),
+     ({"goal_mode": True, "tenant": "acme"}, "tenant"),
++    ({"max_retries": 5}, "max_retries"),  # hermes-hub create-task has no retry breaker option [daveey]
+ ])
+ def test_options_no_client_carries_stay_local(extra, why):
+     d = decide({"title": "Fix the flaky test", **extra}, carries=True)
+@@ -681,6 +682,25 @@ def test_pin_to_the_routed_target_that_the_hub_refuses_is_an_error_not_local(mac
+     assert _local_count() == 0
+ 
+ 
++def test_max_retries_card_stays_local_with_its_breaker(mac):
++    """hermes-hub create-task cannot carry max_retries: the card is created here, breaker intact. [daveey]"""
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "max_retries": 5}))
++    assert out["ok"] and out["task_id"] and "placed" not in out, out
++    assert mac["calls"] == [] and _local_count() == 1
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        assert conn.execute("SELECT max_retries FROM tasks WHERE id=?", (out["task_id"],)).fetchone()[0] == 5
++
++
++def test_max_retries_card_pinned_to_the_hub_is_refused_not_created(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hub",
++                                        "max_retries": 5}))
++    assert not out.get("ok") and out["code"] == "placement_unavailable" and "max_retries" in out["error"], out
++    assert mac["calls"] == [] and _local_count() == 0
++
++
+ @pytest.mark.parametrize("pin", ["local", "here", "macbook"])
+ def test_pin_local_or_own_gateway_still_creates_locally(mac, pin):
+     from tools import kanban_tools as kt
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index d134a35cc5d..8a12ddc1047 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -833,6 +833,54 @@ def test_create_happy_path(worker_env):
+         conn.close()
+ 
+ 
++def _max_retries_of(tid):
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        return conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    finally:
++        conn.close()
++
++
++def test_create_persists_max_retries(worker_env):
++    """kanban_create carries the retry breaker a worker could otherwise only get from the fenced CLI. [daveey]"""
++    from tools import kanban_tools as kt
++    d = json.loads(kt._handle_create({"title": "flaky runner card", "assignee": "peer", "max_retries": 5}))
++    assert d["ok"] is True, d
++    assert _max_retries_of(d["task_id"]) == 5
++
++
++def test_create_omitted_max_retries_is_null(worker_env):
++    from tools import kanban_tools as kt
++    d = json.loads(kt._handle_create({"title": "plain card", "assignee": "peer"}))
++    assert d["ok"] is True, d
++    assert _max_retries_of(d["task_id"]) is None
++
++
++@pytest.mark.parametrize("bad", [0, 11, -1, True, "five", 2.5])
++def test_create_refuses_out_of_range_max_retries(worker_env, bad):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
++    finally:
++        conn.close()
++    d = json.loads(kt._handle_create({"title": "bad breaker", "assignee": "peer", "max_retries": bad}))
++    assert d.get("ok") is not True and "max_retries must be an integer 1-10" in d.get("error", ""), d
++    conn = kbc.connect()
++    try:
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before  # nothing created
++    finally:
++        conn.close()
++
++
++def test_create_schema_declares_max_retries():
++    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
++    props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
++    assert props["max_retries"]["type"] == "integer"
++
++
+ @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
+ @pytest.mark.parametrize("target_scoped", [False, True])
+ def test_create_explicit_scratch_ignores_ambient_board_project(
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index c70408f8881..3d43431ee13 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -26,7 +26,7 @@ from tools.kanban_tools_placement import (_local_placement, _machine_placement,
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_park_args import _blocker_id_arg, _clear_blocker_arg
+ from hermes_cli.kanban_block_policy import ask_lint_check
+-from tools import kanban_tools_completion as _kc
++from tools import kanban_tools_completion as _kc, kanban_tools_create_args as _ca
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+@@ -562,7 +562,6 @@ _COMMENT_FIELDS = ("author", "body", "created_at")
+ _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
+ _ATTACHMENT_FIELDS = tuple(
+     "id filename content_type size uploaded_by stored_path created_at".split())
+-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id", "human_request")
+ 
+ 
+ def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
+@@ -1659,6 +1658,7 @@ def _handle_create(args: dict, **kw) -> str:
+         _parse_bool_arg(args, "goal_mode"))
+     model_override, provider_override = args.get("model"), args.get("provider")
+     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
++    max_retries = _ca.max_retries_arg(args)
+     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+     # [daveey] Validate the origin binding BEFORE the card exists: a binding the origin gateway can never
+     # read back is the silent "cards exist but the chat shows none" failure.
+@@ -1766,7 +1766,7 @@ def _handle_create(args: dict, **kw) -> str:
+             creator_task_id=self_tid,
+             idempotency_key=args.get("idempotency_key"),
+             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+-            requires=args.get("requires"), runs_on=runs_on,
++            requires=args.get("requires"), runs_on=runs_on, max_retries=max_retries,
+             require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
+             model_override=model_override, provider_override=provider_override,
+             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+@@ -1778,7 +1778,7 @@ def _handle_create(args: dict, **kw) -> str:
+             # Reject a worktree path the dispatcher could never resolve now, to the
+             # creator, instead of burning spawn retries on it later. [daveey]
+             validate_workspace=True, validate_skills=True)
+-        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
++        landed = _fields(kb.get_task(conn, new_tid), _ca.CREATED_FIELDS)
+         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+         extra = {}
+@@ -1802,7 +1802,7 @@ def _handle_create(args: dict, **kw) -> str:
+             placed = preflight(conn, new_tid, board=args.get("board"))
+             if placed:
+                 extra["capability_placement"] = placed
+-                landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
++                landed = _fields(kb.get_task(conn, new_tid), _ca.CREATED_FIELDS)
+         if runs_on is not None:
+             # Say where the card runs: a pin rewritten to runs_on otherwise reads like an ignored pin,
+             # and a caller that archives and re-creates it makes a duplicate. [daveey]
+diff --git a/tools/kanban_tools_create_args.py b/tools/kanban_tools_create_args.py
+new file mode 100644
+index 00000000000..7c2a5816d94
+--- /dev/null
++++ b/tools/kanban_tools_create_args.py
+@@ -0,0 +1,26 @@
++"""Argument validators and constants for ``kanban_create``. [daveey]
++
++Split out of tools/kanban_tools.py to keep that facade under its size cap.
++"""
++from __future__ import annotations
++
++from typing import Any, Optional
++
++MAX_RETRY_LIMIT = 10  # the widest retry breaker an agent may set
++# Fields read back from a freshly created card into the kanban_create result.
++CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id", "human_request")
++
++
++def max_retries_arg(args: dict) -> Optional[int]:
++    """``kanban_create``'s ``max_retries``: None when omitted, else an int 1..MAX_RETRY_LIMIT (bools
++    refused). One cap for create and the supervisor ``retry_limit`` op. Checked before placement, so
++    an invalid value never reaches a remote create."""
++    from tools.kanban_tools import _check  # lazy: kanban_tools imports this module
++
++    value: Any = args.get("max_retries")
++    if value is None:
++        return None
++    _check(isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_RETRY_LIMIT,
++           f"max_retries must be an integer 1-{MAX_RETRY_LIMIT} (got {value!r}); omit it for the "
++           "config/default breaker. Nothing changed.", rejection="invalid_args")
++    return int(value)
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 0deace722a8..0b46d8f416b 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -772,6 +772,10 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "dispatcher SIGTERMs the worker and re-queues the "
+                 "task with outcome='timed_out'."
+         )),
++        "max_retries": _prop("integer", (
++            "Retry circuit breaker for this card (1-10): the dispatcher blocks it on the Nth "
++            "consecutive failure instead of respawning. Omit for the config/default breaker."
++        )),
+         "human_request": HUMAN_REQUEST,
+         "initial_status": {
+             "type": "string",
+-- 
+2.55.0
+

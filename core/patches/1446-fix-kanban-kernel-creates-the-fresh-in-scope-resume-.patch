@@ -1,0 +1,420 @@
+From 9a0e9afa40dfe7d301e971f82337310aec02d960 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:30:18 +0000
+Subject: [PATCH] fix(kanban): kernel creates the fresh in-scope resume
+ requester for a continuation_exhausted park [daveey]
+
+The supervisor resume op needs a requester within 3 creator hops of the target AND created after
+its current park. A parked card cannot create one and every older card predates the park, so no
+card could ever pass both fences (layers t_01a19084a3b36956). Each dispatcher tick now creates
+one recovery card per resumable continuation_exhausted park (creator_task_id=target,
+created_by=kanban-recovery, idempotency key recovery:<target>:<park event id>). All resume fences
+are unchanged. No card for human-gated, non-exhausted, budget-spent or recovery cards; the stale
+triage sweep waits while the park's recovery card is open.
+---
+ hermes_cli/kanban_block_policy.py             |   7 +-
+ hermes_cli/kanban_resume_requester.py         | 114 +++++++++
+ hermes_cli/kanban_triage_sweep.py             |   7 +-
+ .../test_kanban_resume_requester.py           | 223 ++++++++++++++++++
+ 4 files changed, 346 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_resume_requester.py
+ create mode 100644 tests/hermes_cli/test_kanban_resume_requester.py
+
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index bf115017ec7..9ca729a278a 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -334,10 +334,13 @@ def sweep_standing_asks(conn: sqlite3.Connection) -> list[str]:
+ 
+ 
+ def sweep_blocked_cards(conn: sqlite3.Connection, result) -> None:
+-    """Dispatcher-tick entry for both blocked-card sweeps; each is isolated so one failing never skips the other."""
++    """Dispatcher-tick entry for the parked-card sweeps; each is isolated so one failing never skips the others.
++    The third gives each continuation_exhausted park its resume requester (``kanban_resume_requester``)."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_resume_requester import ensure_recovery_cards
+     for name, sweep, out in (("agent-owned block", sweep_agent_owned_blocks, result.agent_block_escalated),
+-                             ("standing-ask recheck", sweep_standing_asks, result.ask_rechecked)):
++                             ("standing-ask recheck", sweep_standing_asks, result.ask_rechecked),
++                             ("resume requester", ensure_recovery_cards, [])):
+         try:
+             out.extend(sweep(conn))
+         except sqlite3.Error:
+diff --git a/hermes_cli/kanban_resume_requester.py b/hermes_cli/kanban_resume_requester.py
+new file mode 100644
+index 00000000000..1338eafa122
+--- /dev/null
++++ b/hermes_cli/kanban_resume_requester.py
+@@ -0,0 +1,114 @@
++"""Kernel-made recovery requester for continuation_exhausted parks. [daveey]
++
++The supervisor ``resume`` op (:mod:`hermes_cli.kanban_resume_exec`) only accepts a requester in
++the target's creator chain (<= ``MAX_CREATOR_HOPS``) that was created AFTER the target's current
++park. A parked card has no live run, so it cannot create that card itself, and every card made
++before the park fails the freshness fence by design. Without this module nothing could ever pass
++both fences, so the op was unreachable.
++
++Each dispatcher tick, :func:`ensure_recovery_cards` finds cards whose current park passes
++:func:`kanban_resume_exec.exhaustion_refusal` (a continuation_exhausted rekind written by the
++refused run, no human gate, no live run, nothing moved it since) and creates ONE recovery card per
++park: ``creator_task_id=<target>`` (1 hop), ``created_by=kanban-recovery``, idempotency key
++``recovery:<target>:<park blocked event id>``. It is post-park and in scope by construction, so it
++may file ``resume`` through the ordinary supervisor request path; every fence of that path
++(scope, freshness, human gate, exhaustion, ``MAX_RESUMES``) still runs unchanged at execution.
++
++Not created: for a card whose resume budget is spent (the request would be refused), for a card
++that is itself a kernel recovery card (no recursion), or twice for the same park. While the
++recovery card is open the stale-triage sweep leaves the target alone (:func:`open_recovery_card`):
++that card is its producer.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++CREATED_BY = "kanban-recovery"
++EVENT = "resume_requester_created"
++
++
++def _key(target: str, park_id: int) -> str:
++    return f"recovery:{target}:{park_id}"
++
++
++def _body(target: str, title: str, park_id: int) -> str:
++    return (
++        f"Card {target} ({title!r}) used up its consecutive-continuation budget and the kernel parked it "
++        f"(continuation_exhausted, park event {park_id}). It has no run, and no worker can unblock it. "
++        "This card was created by the kernel for that park, so it is the one card allowed to ask for a "
++        "supervisor resume of it.\n\n"
++        f"1. Read {target}: its last checkpoints, comments and runs (`kanban_show(task_id='{target}')`). "
++        "Decide whether it was making progress and only needs more runs, or is looping.\n"
++        "2. Making progress: file `kanban_supervisor_request(ops=[{\"op\": \"resume\", \"task_id\": "
++        f"\"{target}\"}}], reason=\"<evidence it is progressing>\")`. The non-worker executor re-checks the "
++        "park and applies it; read the receipt back with `kanban_show` (supervisor_requests) and confirm "
++        f"{target} is ready or todo.\n"
++        f"3. Looping or too big for one card: do not resume. Split the remaining work into child cards "
++        f"(`kanban_create`, parents as needed) and record on {target} why it was split.\n"
++        f"4. Comment on {target} with what you did and the request receipt, then complete this card.\n\n"
++        "A human gate (needs_input / human_request) on the target is never resumed by this path."
++    )
++
++
++def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
++    return conn.execute(
++        "SELECT id, title, assignee, tenant, created_by FROM tasks "
++        "WHERE status IN ('triage', 'blocked') AND current_run_id IS NULL AND human_request IS NULL "
++        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = tasks.id AND e.kind = 'continuation_exhausted')"
++    ).fetchall()
++
++
++def _event_for_park(conn: sqlite3.Connection, target: str, park_id: int) -> Optional[str]:
++    for (raw,) in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC", (target, EVENT)):
++        try:
++            data = json.loads(raw) if raw else {}
++        except (TypeError, ValueError):
++            continue
++        if isinstance(data, dict) and data.get("park_event_id") == park_id:
++            return data.get("recovery_task_id")
++    return None
++
++
++def open_recovery_card(conn: sqlite3.Connection, target: str) -> Optional[str]:
++    """The kernel recovery card for ``target``'s CURRENT park while it is still open, else None."""
++    from hermes_cli import kanban_resume_exec as rx
++    rec = _event_for_park(conn, target, rx._park_event_id(conn, target))
++    if not rec:
++        return None
++    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (rec,)).fetchone()
++    return rec if row and row[0] not in ("done", "archived") else None
++
++
++def ensure_recovery_cards(conn: sqlite3.Connection) -> list[str]:
++    """Create the missing recovery card for every resumable continuation_exhausted park. Returns new ids."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_resume_exec as rx
++
++    made: list[str] = []
++    for row in _candidates(conn):
++        target = row["id"]
++        if row["created_by"] == CREATED_BY or rx.exhaustion_refusal(conn, target):
++            continue
++        park_id = rx._park_event_id(conn, target)
++        if _event_for_park(conn, target, park_id) or len(rx._resume_events(conn, target)) >= rx.MAX_RESUMES:
++            continue
++        try:
++            rec = kb.create_task(
++                conn, title=f"Recover {target}: continuation budget exhausted"[:200],
++                body=_body(target, row["title"] or "", park_id), assignee=row["assignee"] or "default",
++                created_by=CREATED_BY, workspace_kind="scratch", tenant=row["tenant"],
++                idempotency_key=_key(target, park_id), creator_task_id=target,
++            )
++        except (sqlite3.Error, ValueError):
++            logger.exception("kanban: recovery card for %s failed", target)
++            continue
++        with kb.write_txn(conn):
++            kb._append_event(conn, target, EVENT, {"recovery_task_id": rec, "park_event_id": park_id})
++        made.append(rec)
++    return made
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 636ed24a12a..c6580590235 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -103,7 +103,7 @@ def sweep_stale_triage(
+     "specify or park with a probe" brief. A card is eligible once per triage entry: never swept, or a
+     ``TRIAGE_ENTRY_EVENTS`` event newer than its last ``triage_swept``. Past ``TRIAGE_SWEEP_CAP`` sweeps
+     in ``TRIAGE_SWEEP_CAP_WINDOW`` it is capped instead (see :func:`_cap`). Cards with an open human
+-    request are left alone. Returns swept task ids."""
++    request, or an open kernel recovery card for their current park, are left alone. Returns swept task ids."""
+     now = int(now if now is not None else time.time())
+     cutoff = now - older_than
+     swept: list[str] = []
+@@ -118,9 +118,10 @@ def sweep_stale_triage(
+         f"AND c.id > COALESCE((SELECT MAX(n.id) FROM task_events n WHERE n.task_id = t.id AND n.kind IN ({_MARKS})), 0))",
+         (cutoff, *TRIAGE_ENTRY_EVENTS, *TRIAGE_ENTRY_EVENTS),
+     ).fetchall()
++    from hermes_cli.kanban_resume_requester import open_recovery_card
+     for row in rows:
+-        if row["human_request"]:
+-            continue
++        if row["human_request"] or open_recovery_card(conn, row["id"]):
++            continue  # a human owns it, or its kernel recovery card is its producer
+         recent = conn.execute(
+             "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'triage_swept' AND created_at > ?",
+             (row["id"], now - TRIAGE_SWEEP_CAP_WINDOW),
+diff --git a/tests/hermes_cli/test_kanban_resume_requester.py b/tests/hermes_cli/test_kanban_resume_requester.py
+new file mode 100644
+index 00000000000..7749b0e7245
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_resume_requester.py
+@@ -0,0 +1,223 @@
++"""Kernel-made recovery requester for continuation_exhausted parks. [daveey]
++
++Reproduces layers t_01a19084a3b36956: parked continuation_exhausted in triage, no requester could pass
++both the scope fence (<= 3 creator hops) and the freshness fence (created after the park), because
++the parked card cannot create one and every older card predates the park. The dispatcher tick now
++creates that requester. Every test runs on an isolated board under ``tmp_path``.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_resume_exec as rx
++from hermes_cli import kanban_resume_requester as rr
++from hermes_cli import kanban_supervisor_requests as ksr
++from hermes_cli import kanban_triage_sweep as ts
++
++EXHAUSTED = "continuation_exhausted: split the work or reset the continuation budget"
++
++
++def _exhaust(conn, tid):
++    assert kb.claim_task(conn, tid) is not None
++    run = kb._current_run_id(conn, tid)
++    out = kc.continue_task(conn, tid, checkpoint="partial", expected_run_id=run, max_continuations=0)
++    assert out["reason_code"] == "continuation_exhausted", out
++    assert kb.block_task(conn, tid, kind="transient", reason=EXHAUSTED, expected_run_id=run)
++    assert kb.get_task(conn, tid).status == "triage"
++
++
++@pytest.fixture
++def board(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    assert str(kb.kanban_db_path()).startswith(str(tmp_path))
++    with kbc.connect() as conn:
++        target = kb.create_task(conn, title="layers 2-8", assignee="default", created_by="default")
++        _exhaust(conn, target)
++    return {"target": target}
++
++
++def _tick(conn):
++    from hermes_cli import kanban_db_dispatch as kbd
++    return kbd.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None).supervisor_requests
++
++
++def _recovery_cards(conn, target):
++    return [r[0] for r in conn.execute(
++        "SELECT id FROM tasks WHERE created_by = ? AND status != 'archived' ORDER BY "
++        "(SELECT MIN(e.id) FROM task_events e WHERE e.task_id = tasks.id AND e.kind = 'created')",
++        (rr.CREATED_BY,)) if ksr._created_by_task(conn, r[0]) == target]
++
++
++def _as_worker(monkeypatch, conn, tid):
++    assert kb.claim_task(conn, tid) is not None
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, tid)))
++
++
++def _as_executor(monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++
++
++def _resume(tid):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_supervisor_request(
++        {"ops": [{"op": "resume", "task_id": tid}], "reason": "progressing; needs more runs"}))
++
++
++def _via_resume(conn, tid):
++    return [e.payload for e in kb.list_events(conn, tid)
++            if e.kind == "unblocked" and (e.payload or {}).get("via") == rx.VIA]
++
++
++# --- new path --------------------------------------------------------------------------------
++
++def test_tick_creates_one_fresh_in_scope_requester_and_its_resume_applies(board, monkeypatch):
++    target = board["target"]
++    with kbc.connect() as conn:
++        park = rx._park_event_id(conn, target)
++        _tick(conn)
++        _tick(conn)  # idempotent: one card per park
++        cards = _recovery_cards(conn, target)
++        assert len(cards) == 1, cards
++        rec = cards[0]
++        task = kb.get_task(conn, rec)
++        assert (task.status, task.assignee, task.created_by) == ("ready", "default", rr.CREATED_BY)
++        assert target in task.body and "kanban_supervisor_request" in task.body
++        assert conn.execute("SELECT idempotency_key FROM tasks WHERE id = ?", (rec,)).fetchone()[0] == \
++            f"recovery:{target}:{park}"
++        assert [e.payload for e in kb.list_events(conn, target) if e.kind == rr.EVENT] == [
++            {"recovery_task_id": rec, "park_event_id": park}]
++        # in scope (1 hop) and post-park by construction; every fence passes
++        assert rx.refusal(conn, rec, target) is None
++        assert kb.get_task(conn, target).status == "triage"  # creating the card moves nothing
++        _as_worker(monkeypatch, conn, rec)
++    out = _resume(target)
++    assert out["ok"] and out["status"] == "pending", out
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        assert _tick(conn) == [(out["request_id"], "done")]
++        req = ksr.get_request(conn, out["request_id"])
++        assert req["status"] == "done" and req["result"][0]["outcome"] == "applied", req
++        assert kb.get_task(conn, target).status == "ready"
++        assert _via_resume(conn, target) == [{"via": rx.VIA, "request_id": out["request_id"], "by": rec}]
++        _tick(conn)
++        assert _recovery_cards(conn, target) == [rec]  # released: no new card
++
++
++def test_a_new_park_gets_a_new_requester_and_the_old_one_is_stale(board, monkeypatch):
++    target = board["target"]
++    with kbc.connect() as conn:
++        _tick(conn)
++        (first,) = _recovery_cards(conn, target)
++        _as_worker(monkeypatch, conn, first)
++    out = _resume(target)
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        assert _tick(conn) == [(out["request_id"], "done")]
++        _exhaust(conn, target)  # ran out of budget again
++        assert "predates" in rx.refusal(conn, first, target)  # stale requester, not made for this park
++        _tick(conn)
++        cards = _recovery_cards(conn, target)
++        assert len(cards) == 2 and cards[0] == first, cards
++        assert rx.refusal(conn, cards[1], target) is None
++
++
++# --- preserved refusals ----------------------------------------------------------------------
++
++def test_human_gated_target_gets_no_requester_and_a_resume_is_refused(board, monkeypatch):
++    target = board["target"]
++    with kbc.connect() as conn:
++        _tick(conn)
++        (rec,) = _recovery_cards(conn, target)
++        with kb.write_txn(conn):  # a human gate lands on the parked card after the requester exists
++            conn.execute("UPDATE tasks SET block_kind = 'needs_input', human_request = ? WHERE id = ?",
++                         (json.dumps({"action": "pick A or B"}), target))
++        _as_worker(monkeypatch, conn, rec)
++    out = _resume(target)
++    assert out["code"] == "refused" and "human_gate" in out["error"], out
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, target).status == "triage"
++        gated = kb.create_task(conn, title="gated", assignee="default")
++        _exhaust(conn, gated)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET block_kind = 'needs_input', human_request = ? WHERE id = ?",
++                         (json.dumps({"action": "decide"}), gated))
++        _as_executor(monkeypatch)
++        _tick(conn)
++        assert _recovery_cards(conn, gated) == []
++
++
++def test_non_exhausted_park_gets_no_requester_and_is_refused(board, monkeypatch):
++    with kbc.connect() as conn:
++        other = kb.create_task(conn, title="flaky", assignee="default")
++        assert kb.claim_task(conn, other) is not None
++        assert kb.block_task(conn, other, kind="transient", reason="flaky network",
++                             expected_run_id=kb._current_run_id(conn, other))
++        _tick(conn)
++        assert _recovery_cards(conn, other) == []
++        child = kb.create_task(conn, title="fresh child", assignee="default", creator_task_id=other)
++        assert "not a continuation_exhausted block" in rx.refusal(conn, child, other)
++
++
++def test_requester_is_out_of_scope_for_any_other_card(board, monkeypatch):
++    with kbc.connect() as conn:
++        foreign = kb.create_task(conn, title="someone else's card", assignee="default")
++        _exhaust(conn, foreign)
++        _tick(conn)
++        (rec,) = _recovery_cards(conn, board["target"])
++        _as_worker(monkeypatch, conn, rec)
++    out = _resume(foreign)
++    assert out["code"] == "refused" and "creator chain" in out["error"], out
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, foreign).status == "triage"
++
++
++def test_spent_resume_budget_and_recovery_cards_get_no_requester(board, monkeypatch):
++    target = board["target"]
++    for _ in range(rx.MAX_RESUMES):
++        with kbc.connect() as conn:
++            _tick(conn)
++            rec = _recovery_cards(conn, target)[-1]
++            _as_worker(monkeypatch, conn, rec)
++        out = _resume(target)
++        _as_executor(monkeypatch)
++        with kbc.connect() as conn:
++            assert _tick(conn) == [(out["request_id"], "done")]
++            _exhaust(conn, target)
++    with kbc.connect() as conn:
++        before = _recovery_cards(conn, target)
++        _tick(conn)
++        assert _recovery_cards(conn, target) == before  # budget spent: the request would be refused
++        nested = kb.create_task(conn, title="recover", assignee="default", created_by=rr.CREATED_BY,
++                                creator_task_id=target)
++        _exhaust(conn, nested)  # a recovery card that itself exhausts gets no recursive card
++        _tick(conn)
++        assert _recovery_cards(conn, nested) == []
++
++
++def test_triage_sweep_waits_while_the_recovery_card_is_open(board, monkeypatch):
++    target = board["target"]
++    with kbc.connect() as conn:
++        _tick(conn)
++        (rec,) = _recovery_cards(conn, target)
++        far = 10 ** 10
++        assert ts.sweep_stale_triage(conn, now=far) == []
++        assert kb.get_task(conn, target).status == "triage"
++        assert kb.claim_task(conn, rec) is not None
++        assert kb.complete_task(conn, rec, result="split the work instead")
++        assert ts.sweep_stale_triage(conn, now=far) == [target]  # its producer finished: normal sweep
+-- 
+2.55.0
+

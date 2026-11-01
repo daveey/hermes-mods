@@ -1,6 +1,6 @@
 # Offline DNS retry wait
 
-Patches **1425–1427**, frozen source `1b20db1838e748ce13cbc974fcaa6681cff13da8`.
+Patches **1425–1427, 1469**, frozen source `3241b23316a66eb4d41c26078cd92411f0f295bc`.
 
 ## Behavior
 
@@ -31,11 +31,15 @@ These are source tests carried by the patches, **not rerun in this mirror pass**
 - `tests/agent/test_offline_wait_boundaries.py`: hung native DNS is bounded and observation is interruptible; timeout does not await native completion; repeated outages share one request budget and feed the watchdog; non-offline verdicts fall through; redirects/aborts and invalid configuration.
 - `tests/cron/test_cron_offline_wait.py`: `test_cron_run_that_goes_offline_mid_run_still_finishes_ok` and `test_offline_failure_keeps_the_provider_error_type` exercise the cron path.
 
-The public mirror's independently executed inventory, replay and normalized-tree checks are recorded in [mirror-1427-verification.md](mirror-1427-verification.md). A real Mac sleep/wake acceptance run is **not proved by these simulated-clock tests and is not claimed here**.
+Patch 1469 changes only `tests/cron/test_cron_offline_wait.py`: the child imports real `hermes_bootstrap` first, then restores parent test-interpreter site/dist-packages from `OFFLINE_TEST_DEPENDENCY_SITES`. This keeps pytest available after a borrowed-home PM re-exec; production bootstrap, fences and assertions are unchanged.
+
+Implementation-owner evidence (not rerun by this mirror): managed fresh-home RED had two `ModuleNotFoundError: pytest` failures; GREEN had 29 passing tests (two real fake-server scheduler/DNS cases plus 27 agent tests), also 29 in the developer worktree. Recovery asserts `remaining=0`, `marker=true`, job `ok` and two served requests; disabled wait retains `APIConnectionError`. PR #473 merged as `3241b23316a6`, with the required aggregate successful on exact tested head `d9540a16e1d772442e28df8103f5f5afb812e6b1`.
+
+The public mirror's independently executed inventory, replay and normalized-tree checks are recorded in [mirror-1469-verification.md](mirror-1469-verification.md). Physical-event acceptance remains **NO_PROOF**: a real Mac sleep/wake run is not proved by simulated-clock or harness tests and is not claimed here.
 
 ## Applying
 
-Use the full bridge-aware series recipe in [README.md](README.md#applying), with the 1427 policy and replay plan. These patches depend on prior retry/configuration changes and are not advertised as independently applicable.
+Use the full bridge-aware series recipe in [README.md](README.md#applying), with the 1469 policy and replay plan. These patches depend on prior retry/configuration changes and are not advertised as independently applicable.
 
 ## Gotchas
 

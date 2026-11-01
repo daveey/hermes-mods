@@ -1,0 +1,2878 @@
+From 6e4b83dd22c26644b4b6f54cd7c5d086552436d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 13:45:10 +0000
+Subject: [PATCH] fix(ci): validate catalog data with trusted base tooling and
+ isolated plugins [daveey]
+
+---
+ .github/workflows/plugin-catalog-ci.yml       | 338 ++++++-
+ scripts/ci/plugin_validation_sandbox.py       | 712 +++++++++++++++
+ tests/ci/test_fast_runner_routing.py          |  21 +
+ .../ci/test_plugin_catalog_ci_confinement.py  | 834 +++++++++++++++++-
+ tests/ci/test_plugin_validation_sandbox.py    | 629 +++++++++++++
+ 5 files changed, 2441 insertions(+), 93 deletions(-)
+ create mode 100644 scripts/ci/plugin_validation_sandbox.py
+ create mode 100644 tests/ci/test_plugin_validation_sandbox.py
+
+diff --git a/.github/workflows/plugin-catalog-ci.yml b/.github/workflows/plugin-catalog-ci.yml
+index 8e54e2081d9..d6b8df7da01 100644
+--- a/.github/workflows/plugin-catalog-ci.yml
++++ b/.github/workflows/plugin-catalog-ci.yml
+@@ -9,6 +9,23 @@ name: Plugin Catalog CI
+ #                            reachable in the entry's repo, and the plugin
+ #                            at that exact commit must pass
+ #                            `hermes plugins validate`.
++#
++# Trusted base, untrusted data. A PR's catalog files are the only thing either
++# job takes from the PR, and only as bytes: each job reads them out of the PR
++# merge commit's tree into $RUNNER_TEMP as regular files, deletes the PR
++# checkout, and checks out the merge commit's first parent (the base branch tip
++# GitHub merged into) in its place. Everything the gate executes after that
++# (the structural validator, the setup-pm and retry actions, the PM-built
++# hermes, the sandbox wrapper, the payload scanner) is the base's, so a PR can
++# neither rewrite the validator that judges its own entries nor run its own
++# scanner, action or core outside the sandbox. Limit: this workflow file itself
++# runs from the PR (pull_request event), so a PR editing it is stopped only by
++# review of the workflow, not by anything here.
++#
++# Bootstrap: each job's "Confirm the trusted checkout" lists the tools it will
++# run and fails if the base lacks one, never falling back to the PR's copy. A
++# PR that adds a tool (the sandbox wrapper, say) changes no entry, so neither
++# job runs that tool for it; entry PRs need a base that already has it.
+ 
+ on:
+   pull_request:
+@@ -27,8 +44,87 @@ jobs:
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
++          # The merge commit and its first parent, the trusted base.
++          fetch-depth: 2
+           persist-credentials: false # this job is read-only
+ 
++      - name: Export the PR's catalog data
++        id: data
++        run: |
++          set -euo pipefail
++          if ! git rev-parse -q --verify 'HEAD^2' >/dev/null; then
++            echo "::error::expected the pull_request merge commit as HEAD"
++            exit 1
++          fi
++          # Every file under plugin-catalog/ in the merged tree, read from the
++          # tree (never the worktree) and written as a regular file. A symlink
++          # or submodule there would have the validator read something other
++          # than the bytes that land, so it fails here instead.
++          DATA="${RUNNER_TEMP:?}/catalog-data"
++          rm -rf -- "$DATA"
++          mkdir -p -- "$DATA/plugin-catalog"
++          LIST=$(mktemp)
++          git ls-tree -r -z --full-tree \
++            --format='%(objectmode) %(objecttype) %(objectname)%x09%(path)' HEAD -- plugin-catalog/ > "$LIST"
++          BAD=0
++          while IFS= read -r -d '' rec; do
++            meta=${rec%%$'\t'*} path=${rec#*$'\t'}
++            case "/$path/" in */../*|*/./*|*//*) BAD=1; continue ;; esac
++            case "$meta" in
++              "100644 blob "*|"100755 blob "*)
++                mkdir -p -- "$DATA/$(dirname -- "$path")"
++                git cat-file blob "${meta##* }" > "$DATA/$path" ;;
++              *) BAD=1 ;;
++            esac
++          done < "$LIST"
++          rm -f -- "$LIST"
++          if [ "$BAD" -ne 0 ]; then
++            echo "::error::plugin-catalog/ may only hold regular files"
++            exit 1
++          fi
++          {
++            echo "base=$(git rev-parse 'HEAD^1')"
++            echo "dir=$DATA/plugin-catalog"
++          } >> "$GITHUB_OUTPUT"
++
++      - name: Drop the PR checkout
++        run: |
++          set -euo pipefail
++          # Nothing of the PR may stay where the gate executes from; its catalog
++          # bytes were exported above.
++          find "${GITHUB_WORKSPACE:?}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
++
++      - name: Check out the trusted base
++        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
++        with:
++          ref: ${{ steps.data.outputs.base }}
++          persist-credentials: false
++
++      - name: Confirm the trusted checkout
++        env:
++          TRUSTED_BASE: ${{ steps.data.outputs.base }}
++          # Every workspace file this job executes.
++          TRUSTED_TOOLS: scripts/validate_plugin_catalog.py .github/actions/retry/action.yml
++        run: |
++          set -euo pipefail
++          if [ "$(git rev-parse HEAD)" != "${TRUSTED_BASE:?}" ] \
++              || [ -n "$(git status --porcelain --ignored --untracked-files=all)" ]; then
++            echo "::error::the workspace is not exactly the trusted base $TRUSTED_BASE"
++            exit 1
++          fi
++          # Bootstrap: a base from before a tool was added cannot run it, and
++          # the PR's copy is never a fallback. The PR that adds a tool changes
++          # no entry, so it never reaches the step that runs it; an entry PR on
++          # an older base fails here and passes once rebased.
++          MISSING=""
++          for tool in ${TRUSTED_TOOLS:?}; do
++            if [ -L "$tool" ] || [ ! -f "$tool" ]; then MISSING="$MISSING $tool"; fi
++          done
++          if [ -n "$MISSING" ]; then
++            echo "::error::the trusted base $TRUSTED_BASE predates this gate (missing:$MISSING); rebase the PR onto its base branch"
++            exit 1
++          fi
++
+       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+         with:
+           python-version: "3.11"
+@@ -39,22 +135,29 @@ jobs:
+           command: pip install ruamel.yaml==0.18.17
+ 
+       - name: Validate catalog files (structural)
++        env:
++          CATALOG_DATA: ${{ steps.data.outputs.dir }}
+         run: |
+           set -euo pipefail
+-          # Validating the whole directory is simpler than diffing and keeps
+-          # the invariant that EVERYTHING in plugin-catalog/ stays valid.
+-          python3 scripts/validate_plugin_catalog.py plugin-catalog/
++          # The base's validator over the PR's exported catalog. Validating the
++          # whole directory keeps the invariant that EVERYTHING in
++          # plugin-catalog/ stays valid.
++          python3 -I scripts/validate_plugin_catalog.py "${CATALOG_DATA:?}/"
+ 
+   pinned-source-validate:
++    # [daveey] Plugin code runs only inside bubblewrap (see the validate step).
++    # hermes-hub is served only by the tfgar-hub group: one throwaway VM per job
++    # from the runner AMI, whose provision.sh (hosts/hermes-ci-runners/packer)
++    # installs bubblewrap, persists kernel.apparmor_restrict_unprivileged_userns=0
++    # and fails the image build unless the runner user can start bwrap. The
++    # sandbox step below proves it on every run and fails closed if not.
+     runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 30
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
+-          # Full commit graph + tags, blobs on demand: the diff below needs the
+-          # merge commit's first parent, and Hermes resolves its own version
+-          # from the release tags merged into HEAD. A shallow checkout reports
+-          # "unknown", which plugins checking the host version reject (omh).
++          # Full commit graph, blobs on demand: the admission check below needs
++          # the merge commit's first parent and its upstream merge-bases.
+           fetch-depth: 0
+           filter: blob:none
+           # `hermes plugins validate` below runs pinned-repo code; keep the
+@@ -92,36 +195,70 @@ jobs:
+           CHANGED=$(printf '%s' "$CHANGED" | grep -v '/removed\.yaml$' || true)
+ 
+           if [ -n "$CHANGED" ]; then
+-            # Admission PRs must be data-only: the gate's own enforcement code
+-            # (this workflow, the validator, the composite actions, the built
+-            # hermes) resolves from the PR checkout, so an entry PR that also
+-            # touches tooling could neuter the gate vetting it. Contributor
+-            # email maps are data the gate never executes; README/policy/CI PRs
+-            # with no entry change skip this check. Without renames, both the
+-            # old and the new path of a moved file count here.
+-            ALL=$(git diff --no-renames --name-only 'HEAD^1' HEAD)
+-            OUTSIDE=$(printf '%s' "$ALL" | grep -vE '^(plugin-catalog|contributors/emails)/' || true)
++            # Entry PRs are data-only: an entry PR that also changes anything
++            # outside the data dirs is refused, unless it is an upstream sync.
++            # The gate never executes the PR's other files (every tool below
++            # runs from the trusted base), so this keeps review of an entry PR
++            # to its entries, not the gate's integrity. Contributor email maps
++            # are data; README/policy/CI PRs with no entry change skip this.
++            # Without renames, both the old and the new path of a moved file
++            # count here. Paths are read NUL-delimited: git quotes an unusual
++            # name in line output.
++            PATHS_Z=$(mktemp)
++            git diff -z --no-renames --name-only 'HEAD^1' HEAD > "$PATHS_Z"
++            OUTSIDE=$(while IFS= read -r -d '' f; do
++                case "$f" in plugin-catalog/*|contributors/emails/*) ;; *) printf '%s\n' "$f" ;; esac
++              done < "$PATHS_Z")
++            rm -f -- "$PATHS_Z"
+             if [ -n "$OUTSIDE" ]; then
+               # (fork) An upstream sync lands upstream's catalog entries together
+-              # with upstream's core in one merge. Such a PR passes only if EVERY
+-              # changed entry is identical (mode and blob) to the newest upstream
+-              # commit it contains, its merge-base with upstream main, which
+-              # upstream's own catalog gate admitted. Provenance is the content,
+-              # never the branch name: a single entry of the PR's own (new,
+-              # re-pinned or edited) keeps the data-only rule, and an unreachable
+-              # upstream fails closed. Every entry is still validated below.
+-              UNTRUSTED="$CHANGED"
+-              if git fetch --quiet --no-tags --filter=blob:none "$UPSTREAM_REPO" \
+-                    '+refs/heads/main:refs/catalog-gate/upstream' </dev/null \
+-                  && UPSTREAM_BASE=$(git merge-base HEAD refs/catalog-gate/upstream); then
++              # with upstream's core in one merge. OLD_UP is the base's (HEAD^1)
++              # merge-base with upstream main, NEW_UP the merge commit's, and the
++              # PR must advance it. Every changed ENTRY must then be upstream's
++              # own OLD_UP..NEW_UP change to an entry the fork had not modified
++              # (base == OLD_UP, result == NEW_UP, NEW_UP != OLD_UP), so a sync
++              # can neither restore a fork-deleted entry, overwrite or revert a
++              # fork-local pin, nor slip in an entry of its own. The rest of the
++              # merge (core, actions, scanners, conflict resolutions) is not
++              # checked here: none of it is executed by this gate. Trees alone
++              # answer (mode + object id), so the blobless checkout needs no
++              # credential, and anything unresolvable fails closed. Every
++              # admitted entry is still validated below.
++              tree_entry() {
++                local out
++                out=$(git --literal-pathspecs ls-tree -z --format='%(objectmode) %(objectname)' \
++                        "$1" -- "$2" | tr -d '\0') || return 1
++                printf '%s' "$out"
++              }
++              upstream_entry() {
++                local head new base old
++                head=$(tree_entry HEAD "$1") && new=$(tree_entry "$NEW_UP" "$1") \
++                  && base=$(tree_entry 'HEAD^1' "$1") && old=$(tree_entry "$OLD_UP" "$1") || return 1
++                [ -n "$head" ] && [ "$head" = "$new" ] && [ "$base" = "$old" ] && [ "$new" != "$old" ]
++              }
++              one_base() {
++                local bases
++                bases=$(git merge-base --all "$1" refs/catalog-gate/upstream) || return 1
++                [ -n "$bases" ] && [ "$(printf '%s\n' "$bases" | wc -l)" -eq 1 ] || return 1
++                printf '%s' "$bases"
++              }
++              ADMIT_REASON="" OLD_UP="" NEW_UP=""
++              if ! git fetch --quiet --no-tags --filter=blob:none "$UPSTREAM_REPO" \
++                    '+refs/heads/main:refs/catalog-gate/upstream' </dev/null; then
++                ADMIT_REASON="could not resolve upstream main"
++              elif ! OLD_UP=$(one_base 'HEAD^1') || ! NEW_UP=$(one_base HEAD); then
++                ADMIT_REASON="no single merge-base with upstream main"
++              elif [ "$OLD_UP" = "$NEW_UP" ] || ! git merge-base --is-ancestor "$OLD_UP" "$NEW_UP"; then
++                ADMIT_REASON="the PR does not advance the base's upstream merge-base $OLD_UP"
++              fi
++              if [ -n "$ADMIT_REASON" ]; then
++                echo "::warning::$ADMIT_REASON; not an upstream sync"
++                UNTRUSTED="$CHANGED"
++              else
+                 UNTRUSTED=$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do
+                     [ -z "$f" ] && continue
+-                    ours=$(git ls-tree HEAD -- "$f" | cut -f1)
+-                    theirs=$(git ls-tree "$UPSTREAM_BASE" -- "$f" | cut -f1)
+-                    if [ -z "$ours" ] || [ "$ours" != "$theirs" ]; then printf '%s\n' "$f"; fi
++                    upstream_entry "$f" || printf '%s\n' "$f"
+                   done)
+-              else
+-                echo "::warning::could not resolve upstream main; no entry counts as upstream-admitted"
+               fi
+               if [ -n "$UNTRUSTED" ]; then
+                 echo "::error::catalog entry PRs may only touch plugin-catalog/** and contributors/emails/**, found:"
+@@ -129,44 +266,137 @@ jobs:
+                 # workflow command into the log.
+                 printf '%s' "$OUTSIDE" | tr '\0\n' ' '
+                 echo
+-                echo "Entries not identical to upstream main's merge-base:"
++                echo "Entries that are not upstream's change to a fork-unmodified entry:"
+                 printf '%s' "$UNTRUSTED" | tr '\0\n' ' '
+                 echo
+                 exit 1
+               fi
+-              echo "Upstream sync: every changed entry matches upstream $UPSTREAM_BASE; non-catalog changes allowed."
++              echo "Upstream sync: every changed entry is upstream $OLD_UP..$NEW_UP verbatim on a fork-unmodified entry."
+             fi
++
++            # The candidates, as the only bytes the validation below takes from
++            # the PR: each entry's blob from the merge commit's tree, written as
++            # a regular file outside the workspace (which is about to become the
++            # base). A non-regular entry (symlink, submodule) is not exported and
++            # fails validation as "not a regular file".
++            # No credential needed: these are HEAD's blobs, which actions/checkout
++            # fetched for the worktree while its token was still configured. Any
++            # other blob would be a lazy fetch from the private fork without a
++            # token, which fails the step (closed), never prompts.
++            CAND="${RUNNER_TEMP:?}/catalog-candidates"
++            rm -rf -- "$CAND"
++            mkdir -p -- "$CAND"
++            while IFS= read -r f; do
++              [ -z "$f" ] && continue
++              case "/$f/" in */../*|*/./*|*//*) continue ;; esac
++              rec=$(git --literal-pathspecs ls-tree -z --format='%(objectmode) %(objecttype) %(objectname)' \
++                      HEAD -- "$f" | tr -d '\0')
++              case "$rec" in
++                "100644 blob "*|"100755 blob "*)
++                  mkdir -p -- "$CAND/$(dirname -- "$f")"
++                  git cat-file blob "${rec##* }" > "$CAND/$f" ;;
++              esac
++            done <<< "$CHANGED"
++            echo "candidates=$CAND" >> "$GITHUB_OUTPUT"
+           fi
+ 
+           echo "Changed catalog entries:"
+           echo "${CHANGED:-<none>}"
+           {
++            echo "base=$(git rev-parse 'HEAD^1')"
+             echo 'files<<__EOF__'
+             echo "$CHANGED"
+             echo '__EOF__'
+           } >> "$GITHUB_OUTPUT"
+ 
+-      - name: Prepare Hermes from the PR's own checkout
++      - name: Drop the PR checkout
++        if: steps.changed.outputs.files != ''
++        run: |
++          set -euo pipefail
++          # Nothing of the PR may stay where the gate executes from: its
++          # candidate entries were exported above, its other files are never run.
++          find "${GITHUB_WORKSPACE:?}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
++
++      - name: Check out the trusted base
++        if: steps.changed.outputs.files != ''
++        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
++        with:
++          ref: ${{ steps.changed.outputs.base }}
++          # Full commit graph + tags, blobs on demand: Hermes resolves its own
++          # version from the release tags merged into HEAD. A shallow checkout
++          # reports "unknown", which plugins checking the host version reject (omh).
++          fetch-depth: 0
++          filter: blob:none
++          persist-credentials: false
++
++      - name: Confirm the trusted checkout
++        if: steps.changed.outputs.files != ''
++        env:
++          TRUSTED_BASE: ${{ steps.changed.outputs.base }}
++          # Every workspace file this job executes.
++          TRUSTED_TOOLS: >-
++            scripts/ci/plugin_validation_sandbox.py scripts/scan_plugin_payloads.py
++            .github/actions/setup-pm/action.yml
++        run: |
++          set -euo pipefail
++          if [ "$(git rev-parse HEAD)" != "${TRUSTED_BASE:?}" ] \
++              || [ -n "$(git status --porcelain --ignored --untracked-files=all)" ]; then
++            echo "::error::the workspace is not exactly the trusted base $TRUSTED_BASE"
++            exit 1
++          fi
++          # Bootstrap, as in the structural job: never the PR's copy of a tool.
++          MISSING=""
++          for tool in ${TRUSTED_TOOLS:?}; do
++            if [ -L "$tool" ] || [ ! -f "$tool" ]; then MISSING="$MISSING $tool"; fi
++          done
++          if [ -n "$MISSING" ]; then
++            echo "::error::the trusted base $TRUSTED_BASE predates this gate (missing:$MISSING); rebase the PR onto its base branch"
++            exit 1
++          fi
++
++      - name: Prepare Hermes from the trusted base
+         if: steps.changed.outputs.files != ''
+         uses: ./.github/actions/setup-pm
+         with:
+           toolchain: python
+           extras: '[]'
+ 
++      - name: Prove the plugin validation sandbox
++        if: steps.changed.outputs.files != ''
++        run: |
++          set -euo pipefail
++          # The runner AMI ships bubblewrap with unprivileged user namespaces
++          # allowed (see runs-on); nothing is installed or reconfigured here. A
++          # runner without them fails this step: the exact wrapper the validate
++          # step uses never runs a command it could not isolate (exit 125 setup,
++          # 126 self-check, bwrap's own 1), so a broken host fails once, here.
++          echo "kernel.apparmor_restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
++          python3 -I scripts/ci/plugin_validation_sandbox.py --no-network -- /bin/true
++          echo "plugin sandbox ok ($(bwrap --version))"
++
+       - name: Clone each entry at its pinned sha and validate
+         if: steps.changed.outputs.files != ''
+         env:
+           CHANGED_FILES: ${{ steps.changed.outputs.files }}
++          # The PR's entry bytes, exported from its tree before the checkout
++          # became the trusted base. The workspace holds no PR file.
++          CATALOG_CANDIDATES: ${{ steps.changed.outputs.candidates }}
+           # A hostile repo URL must never block the job on a credential prompt.
+           GIT_TERMINAL_PROMPT: "0"
+           # `gh attestation verify` (README rule 17) reads the attestation from
+-          # GitHub and needs a token. Read-only default token; the step runs
+-          # pinned-repo code, so nothing broader is exposed here.
++          # GitHub and needs a token. Read-only default token. Plugin code
++          # (`hermes plugins validate --install-deps`) runs only inside
++          # scripts/ci/plugin_validation_sandbox.py: a cleared environment and
++          # its own user/PID/mount/net namespaces, so neither this shell's
++          # environment nor any host process or credential file is visible to
++          # it, and nothing it starts outlives it. The token stays out here for
++          # the attestation check, which reads the read-only clone afterwards.
+           GH_TOKEN: ${{ github.token }}
+         run: |
+           set -euo pipefail
+           FAILED=0
+           WORKROOT=$(realpath "$(mktemp -d)")
++          CAND_ROOT=$(realpath -e -- "${CATALOG_CANDIDATES:?}")
+           # Entries arrive on fd 3, not stdin: `hermes plugins validate` executes
+           # plugin-declared install code that could otherwise read stdin and
+           # silently drain the remaining entry list.
+@@ -174,8 +404,12 @@ jobs:
+             [ -z "$entry" ] && continue
+             echo "::group::validate $entry"
+ 
+-            # A symlinked or missing entry file is not a catalog entry.
+-            if [ -L "$entry" ] || [ ! -f "$entry" ]; then
++            # A symlinked, missing or out-of-tree entry file is not a catalog
++            # entry. The export writes regular files only; this re-checks the
++            # bytes the parsers below read.
++            ENTRY_FILE="$CAND_ROOT/$entry"
++            case "/$entry/" in */../*|*/./*|*//*) ENTRY_FILE="" ;; esac
++            if [ -z "$ENTRY_FILE" ] || [ -L "$ENTRY_FILE" ] || [ ! -f "$ENTRY_FILE" ]; then
+               echo "::error file=$entry::catalog entry must be a regular file"
+               FAILED=1; echo "::endgroup::"; continue
+             fi
+@@ -184,10 +418,10 @@ jobs:
+             # PR-controlled, so the entry is rejected here before anything uses
+             # them -- the clone must be remote-only and the subdir a plain
+             # relative path, or the pinned sha ends up validating files outside
+-            # the pinned commit. `python3 -I` keeps the PR checkout's own
+-            # modules off sys.path (cwd is the PR tree) so it cannot shadow the
+-            # parser's imports; ruamel.yaml comes from installed packages.
+-            PARSED=$(python3 -I - "$entry" <<'PYEOF'
++            # the pinned commit. `python3 -I` keeps the cwd's modules off
++            # sys.path so nothing there can shadow the parser's imports;
++            # ruamel.yaml comes from installed packages.
++            PARSED=$(python3 -I - "$ENTRY_FILE" <<'PYEOF'
+           import re
+           import shlex
+           import sys
+@@ -295,8 +529,18 @@ jobs:
+               FAILED=1; echo "::endgroup::"; continue
+             fi
+ 
+-            # Manifest schema + declared-vs-registered capability check.
+-            if ! timeout 600 hermes plugins validate --install-deps "$PLUGIN_DIR" </dev/null; then
++            # Manifest schema + declared-vs-registered capability check. This
++            # runs the plugin's own code, so only in the sandbox: the checkout
++            # and the clone read-only, the PM home writable but discarded on
++            # exit (nothing can poison the hermes later entries use), only the
++            # PM variables forwarded, egress only to public HTTPS via the
++            # wrapper's proxy. A sandbox that cannot be built fails the entry.
++            if ! timeout 600 python3 -I "$GITHUB_WORKSPACE/scripts/ci/plugin_validation_sandbox.py" \
++                --ro "$GITHUB_WORKSPACE" --ro "$CLONE_DIR" --overlay "${HERMES_HOME:?setup-pm exports HERMES_HOME}" \
++                --env PATH --env HERMES_HOME --env HERMES_RUNTIME_DIR --env HERMES_PYTHON \
++                --env VIRTUAL_ENV --env PYTHONPATH --env PYTHONUTF8 \
++                --chdir "$GITHUB_WORKSPACE" \
++                -- hermes plugins validate --install-deps "$PLUGIN_DIR" </dev/null; then
+               echo "::error file=$entry::hermes plugins validate failed"
+               FAILED=1; echo "::endgroup::"; continue
+             fi
+@@ -309,7 +553,7 @@ jobs:
+             # GitHub build-provenance attestation tying it to this repo's own
+             # workflow at the pinned source digest; those paths are exempted here
+             # and verified below. No stdin: the parser must not drain the entry fd.
+-            ATTESTED=$(python3 -I - "$entry" <<'PYEOF' </dev/null
++            ATTESTED=$(python3 -I - "$ENTRY_FILE" <<'PYEOF' </dev/null
+           import re, shlex, sys
+           from ruamel.yaml import YAML
+           try:
+@@ -366,7 +610,7 @@ jobs:
+             if [ "$ATT_OK" -ne 1 ]; then
+               FAILED=1; echo "::endgroup::"; continue
+             fi
+-            if ! PAYLOAD=$(python3 "$GITHUB_WORKSPACE/scripts/scan_plugin_payloads.py" "$PLUGIN_DIR" </dev/null); then
++            if ! PAYLOAD=$(python3 -I "$GITHUB_WORKSPACE/scripts/scan_plugin_payloads.py" "$PLUGIN_DIR" </dev/null); then
+               # Filenames are repo-controlled: strip newlines so none can forge a
+               # workflow command in the log.
+               echo "::error file=$entry::unscannable executable payload (README rule 17): $(printf '%s' "$PAYLOAD" | tr '\n' ';')"
+diff --git a/scripts/ci/plugin_validation_sandbox.py b/scripts/ci/plugin_validation_sandbox.py
+new file mode 100644
+index 00000000000..702a9b3868b
+--- /dev/null
++++ b/scripts/ci/plugin_validation_sandbox.py
+@@ -0,0 +1,712 @@
++#!/usr/bin/env python3
++"""Run untrusted plugin validation in a credential-free bubblewrap sandbox.
++
++``hermes plugins validate --install-deps`` imports and runs third-party plugin
++code. The catalog job's shell also holds ``GH_TOKEN`` (for ``gh attestation
++verify``), and a same-user child can read a sibling's ``/proc/<pid>/environ``
++or ptrace it, so dropping the variable from one subprocess's environment is no
++boundary. This wrapper runs the command in fresh user, PID, mount, network,
++IPC, UTS and cgroup namespaces:
++
++* its own ``/proc``: no host process (the token-bearing shell, the runner) is
++  visible, so nothing can be read from or signalled in one;
++* an empty root with only ``/usr`` (+ merged-usr links), a fixed ``/etc``
++  allowlist, an empty tmpfs ``$HOME`` and ``/tmp``, and the paths the caller
++  names: ``--ro`` read-only, ``--overlay`` writable with the writes thrown
++  away on exit (the PM home, so a plugin cannot poison the interpreter the
++  host shell runs next): bwrap's overlayfs where bwrap >= 0.10 has it, else a
++  per-run copy (Ubuntu 24.04's bwrap 0.9.0). Paths that are or contain credential stores, the
++  runner's file-command files, ``/run`` sockets, or a checkout with persisted
++  git credentials are refused;
++* a cleared environment: only ``--env`` names the caller lists, and names that
++  look like credentials are refused even when listed;
++* no host network: only loopback. Dependency downloads leave through an HTTPS
++  CONNECT proxy that this wrapper serves on a Unix socket bound into the
++  sandbox. It resolves names on the host and connects only to globally
++  routable addresses on allowed ports, so IMDS (169.254.169.254), loopback
++  services and private ranges stay unreachable, and DNS rebinding cannot
++  switch the target after the check (the checked address is the one dialled).
++  IPv6 forms that carry an IPv4 address (NAT64 ``64:ff9b::/96``, IPv4-mapped
++  and -compatible) are judged by that IPv4 address, and a dial that lands on
++  one of the host's own addresses (src == dst) is dropped;
++* ``--die-with-parent`` + PID namespace: no background child outlives the run.
++
++Fail closed: if bwrap is missing or cannot create the namespaces, or the
++process inside cannot prove its namespaces differ from the host's, the command
++never runs and the wrapper exits 125 (setup) or 126 (self-check). Otherwise the
++exit status is the command's.
++
++Not covered (by design, see the report on the PR): a kernel exploit from inside
++the sandbox, and anything the command prints to stdout/stderr (it reaches the
++job log as before).
++
++Usage (the catalog job)::
++
++    python3 -I scripts/ci/plugin_validation_sandbox.py \
++        --ro "$GITHUB_WORKSPACE" --ro "$CLONE_DIR" --overlay "$HERMES_HOME" \
++        --env PATH --env HERMES_HOME --env HERMES_RUNTIME_DIR --env HERMES_PYTHON \
++        --env VIRTUAL_ENV --env PYTHONPATH --env PYTHONUTF8 --chdir "$GITHUB_WORKSPACE" \
++        -- hermes plugins validate --install-deps "$PLUGIN_DIR"
++
++Stdlib only: it runs under ``python3 -I`` before any project code is trusted.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ipaddress
++import os
++import re
++import select
++import shutil
++import signal
++import socket
++import stat
++import subprocess
++import sys
++import tempfile
++import threading
++from pathlib import Path
++
++EXIT_SETUP = 125
++EXIT_SELFCHECK = 126
++
++# Inside the sandbox.
++INNER_DIR = "/run/hermes-sandbox"
++INNER_SCRIPT = f"{INNER_DIR}/sandbox.py"
++INNER_SOCKET = f"{INNER_DIR}/proxy.sock"
++SANDBOX_HOME = "/home/sandbox"
++PROXY_PORT = 3128
++
++NAMESPACES = ("user", "pid", "net", "mnt", "ipc", "uts")
++
++# Env names never forwarded, even when asked for: they are or carry credentials, or
++# point at a host socket / runner file-command file.
++_FORBIDDEN_ENV = re.compile(
++    r"(TOKEN|SECRET|PASSW|CREDENTIAL|PRIVATE|_KEY$|^KEY$|AUTH|COOKIE|SESSION)"
++    r"|^(AWS_|AZURE_|GOOGLE_|GCP_|GH_|GITHUB_|ACTIONS_|RUNNER_|INPUT_|STATE_|DOCKER_"
++    r"|SSH_|GPG_|KUBECONFIG$|NETRC$|DBUS_|XDG_RUNTIME_DIR$|HERMES_TOKEN|NPM_CONFIG__AUTH)",
++    re.IGNORECASE,
++)
++
++# /etc entries a Python/uv/npm toolchain needs. Never the whole of /etc: it can hold
++# host credentials (gitconfig credential helpers, environment, sudoers.d, ...).
++_ETC_ALLOWLIST = (
++    "passwd", "group", "nsswitch.conf", "hosts", "host.conf", "gai.conf", "localtime",
++    "ld.so.cache", "ld.so.conf", "ld.so.conf.d", "alternatives", "ssl", "ca-certificates",
++    "ca-certificates.conf", "pki", "crypto-policies", "mime.types", "os-release",
++    "lsb-release", "debian_version", "protocols", "services",
++)
++
++# Home-relative credential stores a bound path must never be, contain, or sit inside.
++_HOME_SECRETS = (
++    ".ssh", ".aws", ".azure", ".gnupg", ".docker", ".kube", ".netrc", ".git-credentials",
++    ".config/gh", ".config/gcloud", ".config/hub", ".npmrc", ".pypirc", ".hermes",
++    ".local/share/keyrings", ".password-store",
++)
++
++_PROXY_ENV_NAMES = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
++                    "ALL_PROXY", "all_proxy", "npm_config_https_proxy", "npm_config_proxy")
++
++
++class SetupError(Exception):
++    """The sandbox cannot be built safely; the command must not run."""
++
++
++# ─── host side: policy for caller-named paths ───────────────────────────────────
++
++def _real(path: str) -> Path:
++    return Path(os.path.realpath(path))
++
++
++def _is_within(child: Path, parent: Path) -> bool:
++    return child == parent or parent in child.parents
++
++
++def _home_dirs(env: dict[str, str]) -> set[str]:
++    """$HOME, the passwd home of this uid, and root's: the homes a bind must not expose."""
++    import pwd  # Linux-only script (main() refuses other platforms); keep the import lazy
++
++    uid = os.getuid()  # windows-footgun: ok — Linux-only script, main() refuses other platforms
++    return {h for h in (env.get("HOME", ""), pwd.getpwuid(uid).pw_dir, "/root") if h}
++
++
++def _kind(path: Path) -> str | None:
++    """One of "dir", "file" (regular), "other", None (absent), "unknown" (cannot stat).
++
++    Never raises: a non-root runner cannot stat inside ``/root`` (``/root/.ssh``),
++    and ``Path.is_dir``/``exists`` raise PermissionError there before Python 3.14.
++    Callers treat "unknown" as the unsafe answer.
++    """
++    try:
++        mode = os.stat(path).st_mode
++    except (FileNotFoundError, NotADirectoryError):
++        return None
++    except OSError:
++        return "unknown"
++    return "dir" if stat.S_ISDIR(mode) else "file" if stat.S_ISREG(mode) else "other"
++
++
++def sensitive_paths(env: dict[str, str]) -> list[Path]:
++    """Host locations that a bound path must not be, contain, or sit inside."""
++    out: list[Path] = []
++    for home in _home_dirs(env):
++        out.extend(_real(os.path.join(home, rel)) for rel in _HOME_SECRETS)
++    for name in ("GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE",
++                 "GITHUB_STEP_SUMMARY", "GITHUB_EVENT_PATH"):
++        if env.get(name):
++            out.append(_real(env[name]))
++    # The runner's own registration credentials live at its root.
++    for name in ("RUNNER_TEMP", "RUNNER_WORKSPACE", "RUNNER_TOOL_CACHE"):
++        if env.get(name):
++            for parent in _real(env[name]).parents:
++                for marker in (".credentials", ".credentials_rsaparams", ".runner"):
++                    if _kind(parent / marker) is not None:  # unknown counts as present
++                        out.append(parent / marker)
++    out.extend(Path(p) for p in ("/run", "/var/run", "/proc", "/sys", "/dev", "/etc",
++                                 "/var/lib/docker", "/var/lib/containerd"))
++    return out
++
++
++def check_bind_path(path: str, env: dict[str, str]) -> Path:
++    real = _real(path)
++    if _kind(real) != "dir":
++        raise SetupError(f"bind path is not a directory: {path}")
++    if real == Path("/") or len(real.parts) < 3:
++        raise SetupError(f"refusing to expose a top-level directory: {real}")
++    if real in {_real(h) for h in _home_dirs(env)}:
++        raise SetupError(f"refusing to expose a home directory: {real}")
++    for secret in sensitive_paths(env):
++        if _is_within(secret, real):
++            raise SetupError(f"refusing to expose {real}: it contains {secret}")
++        # Path-only, no stat: a secret this user cannot even stat still counts.
++        if _is_within(real, secret):
++            raise SetupError(f"refusing to expose {real}: it is inside {secret}")
++    git_config = real / ".git" / "config"
++    kind = _kind(git_config)
++    if kind is not None:
++        try:
++            if kind != "file":
++                raise OSError(f"not a readable regular file ({kind})")
++            text = git_config.read_text(encoding="utf-8-sig", errors="replace").lower()
++        except OSError as exc:
++            raise SetupError(f"refusing to expose {real}: cannot vet its .git/config: {exc}") from exc
++        if "extraheader" in text or "authorization" in text or re.search(r"https://[^/\s]+:[^/\s]+@", text):
++            raise SetupError(f"refusing to expose {real}: its .git/config carries credentials")
++    return real
++
++
++def check_env_name(name: str) -> None:
++    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
++        raise SetupError(f"invalid env name: {name!r}")
++    if _FORBIDDEN_ENV.search(name) or name in _PROXY_ENV_NAMES:
++        raise SetupError(f"refusing to forward env {name}: it may carry a credential or host endpoint")
++
++
++# ─── host side: the egress proxy ────────────────────────────────────────────────
++
++def _log(message: str) -> None:
++    # One line, printable only: the target text is plugin-controlled and the log is
++    # parsed for workflow commands.
++    safe = "".join(c if c.isprintable() else "?" for c in message)[:300]
++    print(f"plugin-sandbox: {safe}", file=sys.stderr, flush=True)
++
++
++def _relay(a: socket.socket, b: socket.socket, idle: float) -> None:
++    socks = [a, b]
++    try:
++        while True:
++            ready, _, _ = select.select(socks, [], [], idle)
++            if not ready:
++                return
++            for s in ready:
++                data = s.recv(65536)
++                if not data:
++                    return
++                (b if s is a else a).sendall(data)
++    except OSError:
++        return
++    finally:
++        for s in socks:
++            try:
++                s.close()
++            except OSError:
++                pass
++
++
++# IPv6 prefixes whose low 32 bits are an IPv4 destination: NAT64 (RFC 6052 well-known
++# prefix; a VPC with DNS64/NAT64 routes it to a NAT gateway that dials the IPv4) and the
++# deprecated IPv4-compatible form. ``ipaddress`` calls both global whatever IPv4 they carry.
++_IPV4_EMBEDDING = (ipaddress.IPv6Network("64:ff9b::/96"), ipaddress.IPv6Network("::/96"))
++
++
++def _public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
++    if isinstance(ip, ipaddress.IPv6Address):
++        if ip.ipv4_mapped:
++            ip = ip.ipv4_mapped
++        elif any(ip in net for net in _IPV4_EMBEDDING):
++            if not _public(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)):
++                return False
++    return ip.is_global and not ip.is_multicast
++
++
++def _is_self_connection(sock: socket.socket) -> bool:
++    """True when the dial landed on one of this host's own addresses.
++
++    Linux routes a connection to a local address through ``lo`` with that same
++    address as the source, so src == dst. A runner whose public (or global IPv6)
++    address sits on its interface would otherwise expose its own listeners.
++    """
++    try:
++        local, peer = sock.getsockname()[0], sock.getpeername()[0]
++    except OSError:
++        return True
++    return ipaddress.ip_address(str(local).split("%")[0]) == ipaddress.ip_address(str(peer).split("%")[0])
++
++
++def _dial(addresses: list[tuple[str, int]]) -> socket.socket | str:
++    """Connect to the first reachable checked address (never a re-resolve), or say why not."""
++    for address in addresses:
++        try:
++            upstream = socket.create_connection(address, timeout=15)
++        except OSError:
++            continue
++        if _is_self_connection(upstream):
++            upstream.close()
++            return f"{address[0]} is this host"
++        return upstream
++    return "unreachable"
++
++
++class EgressPolicy:
++    def __init__(self, ports: set[int], hosts: list[str]):
++        self.ports = ports
++        self.hosts = [h.lower().lstrip(".") for h in hosts]
++
++    def host_allowed(self, host: str) -> bool:
++        if not self.hosts:
++            return True
++        host = host.lower().rstrip(".")
++        return any(host == h or host.endswith("." + h) for h in self.hosts)
++
++    def resolve(self, host: str, port: int) -> list[tuple[str, int]] | str:
++        """The checked addresses to dial (in resolver order), or a denial reason."""
++        if port not in self.ports:
++            return f"port {port} not allowed"
++        if not re.fullmatch(r"[A-Za-z0-9.\-]{1,253}|\[[0-9A-Fa-f:.]+\]", host):
++            return "malformed host"
++        host = host.strip("[]")
++        if not self.host_allowed(host):
++            return "host not allowed"
++        try:
++            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
++        except OSError as exc:
++            return f"resolve failed: {exc.__class__.__name__}"
++        addrs = []
++        for _family, _t, _p, _c, sockaddr in infos:
++            ip = ipaddress.ip_address(str(sockaddr[0]).split("%")[0])
++            # Any internal answer denies the name: a public name resolving to an
++            # internal address is exactly how IMDS/loopback would be reached.
++            if not _public(ip):
++                return f"resolves to non-public address {ip}"
++            if (str(ip), port) not in addrs:
++                addrs.append((str(ip), port))
++        if not addrs:
++            return "no address"
++        return addrs
++
++
++class EgressProxy:
++    """CONNECT-only proxy on a Unix socket; one thread per tunnel."""
++
++    MAX_TUNNELS = 64
++    HEAD_LIMIT = 8192
++
++    def __init__(self, path: str, policy: EgressPolicy, idle: float = 300.0):
++        self.policy = policy
++        self.idle = idle
++        self.slots = threading.BoundedSemaphore(self.MAX_TUNNELS)
++        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        self.sock.bind(path)
++        os.chmod(path, 0o600)
++        self.sock.listen(64)
++        self.closed = False
++        threading.Thread(target=self._serve, daemon=True).start()
++
++    def close(self) -> None:
++        self.closed = True
++        try:
++            self.sock.close()
++        except OSError:
++            pass
++
++    def _serve(self) -> None:
++        while not self.closed:
++            try:
++                client, _ = self.sock.accept()
++            except OSError:
++                return
++            if not self.slots.acquire(blocking=False):
++                client.close()
++                continue
++            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
++
++    def _handle(self, client: socket.socket) -> None:
++        try:
++            client.settimeout(30)
++            head = b""
++            while b"\r\n\r\n" not in head:
++                chunk = client.recv(1024)
++                if not chunk:
++                    return
++                head += chunk
++                if len(head) > self.HEAD_LIMIT:
++                    client.sendall(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")
++                    return
++            line = head.split(b"\r\n", 1)[0].decode("latin-1")
++            m = re.fullmatch(r"CONNECT (\S+):(\d{1,5}) HTTP/1\.[01]", line)
++            if not m:
++                _log(f"denied non-CONNECT request {line[:120]!r}")
++                client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
++                return
++            host, port = m.group(1), int(m.group(2))
++            target = self.policy.resolve(host, port)
++            if isinstance(target, str):
++                _log(f"denied CONNECT {host}:{port} ({target})")
++                client.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
++                return
++            upstream = _dial(target)
++            if isinstance(upstream, str):
++                _log(f"denied CONNECT {host}:{port} ({upstream})")
++                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
++                return
++            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
++            rest = head.split(b"\r\n\r\n", 1)[1]
++            if rest:
++                upstream.sendall(rest)
++            client.settimeout(None)
++            upstream.settimeout(None)
++            _relay(client, upstream, self.idle)
++        except OSError:
++            pass
++        finally:
++            try:
++                client.close()
++            except OSError:
++                pass
++            self.slots.release()
++
++
++# ─── host side: build and run bwrap ─────────────────────────────────────────────
++
++def host_namespaces() -> dict[str, str]:
++    out = {}
++    for ns in NAMESPACES:
++        try:
++            out[ns] = os.readlink(f"/proc/self/ns/{ns}")
++        except OSError as exc:
++            raise SetupError(f"cannot read host {ns} namespace: {exc}") from exc
++    return out
++
++
++def _inner_python() -> tuple[str, list[str]]:
++    """An interpreter for the in-sandbox init, plus any extra ro mount it needs."""
++    for candidate in ("/usr/bin/python3", "/usr/local/bin/python3"):
++        if os.access(candidate, os.X_OK):
++            return candidate, []
++    exe = os.path.realpath(sys.executable)
++    prefix = os.path.realpath(sys.base_prefix)
++    return exe, [prefix]
++
++
++def overlay_mode(bwrap: str, requested: str) -> str:
++    """kernel: bwrap's own overlayfs (>= 0.10); copy: a per-run snapshot."""
++    if requested != "auto":
++        return requested
++    try:
++        text = subprocess.run([bwrap, "--help"], capture_output=True, text=True, encoding="utf-8",
++                              errors="replace", timeout=30, check=False).stdout
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        raise SetupError(f"cannot run {bwrap}: {exc}") from exc
++    return "kernel" if "--overlay-src" in text else "copy"
++
++
++def _system_mounts() -> list[str]:
++    """The fixed host view: merged-usr links, /usr, an /etc allowlist, private tmpfs dirs."""
++    argv: list[str] = []
++    for top in ("bin", "sbin", "lib", "lib32", "lib64", "libx32"):
++        host = Path("/") / top
++        if host.is_symlink():
++            argv += ["--symlink", os.readlink(host), f"/{top}"]
++        elif host.is_dir():
++            argv += ["--ro-bind", str(host), f"/{top}"]
++    argv += ["--ro-bind", "/usr", "/usr"]
++    for name in _ETC_ALLOWLIST:
++        argv += ["--ro-bind-try", f"/etc/{name}", f"/etc/{name}"]
++    # no-tmp: ok — these are the sandbox's own empty tmpfs mounts, not host scratch paths.
++    argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/dev/shm", "--tmpfs", "/tmp",
++             "--tmpfs", "/run", "--dir", INNER_DIR, "--tmpfs", "/home", "--dir", SANDBOX_HOME,
++             "--tmpfs", "/var", "--dir", "/var/tmp"]
++    return argv
++
++
++def _overlay_mounts(bwrap: str, requested_mode: str, overlays: list[Path], scratch: Path) -> list[str]:
++    """Writable views of ``overlays`` whose writes never reach the host paths."""
++    argv: list[str] = []
++    mode = overlay_mode(bwrap, requested_mode) if overlays else "none"
++    for i, path in enumerate(overlays):
++        if mode == "kernel":
++            upper, work = scratch / f"overlay{i}" / "upper", scratch / f"overlay{i}" / "work"
++            upper.mkdir(parents=True)
++            work.mkdir(parents=True)
++            argv += ["--overlay-src", str(path), "--overlay", str(upper), str(work), str(path)]
++            continue
++        # bwrap < 0.10 (Ubuntu 24.04 ships 0.9.0) has no --overlay: give the sandbox a
++        # private copy at the same path instead. Same contract, paid in disk and time.
++        copy = scratch / f"copy{i}" / path.name
++        copy.parent.mkdir(parents=True)
++        try:
++            r = subprocess.run(["cp", "-a", "--reflink=auto", "--", str(path), str(copy)],
++                               capture_output=True, text=True, encoding="utf-8", errors="replace",
++                               timeout=600, check=False)
++        except subprocess.TimeoutExpired as exc:
++            raise SetupError(f"snapshot of {path} timed out") from exc
++        if r.returncode != 0:
++            raise SetupError(f"cannot snapshot {path}: {r.stderr.strip()[-300:]}")
++        argv += ["--bind", str(copy), str(path)]
++    return argv
++
++
++def _inner_env(args, env: dict[str, str]) -> dict[str, str]:
++    """The sandbox's whole environment: fixed basics, vetted forwards, the proxy."""
++    # no-tmp: ok — TMPDIR names the sandbox's private tmpfs, not a host path.
++    inner = {"HOME": SANDBOX_HOME, "TMPDIR": "/tmp", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
++             "PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/local/bin:/usr/bin:/bin",
++             "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"}
++    for name in args.env:
++        check_env_name(name)
++        if name in env:
++            inner[name] = env[name]
++    for item in args.setenv:
++        name, sep, value = item.partition("=")
++        if not sep:
++            raise SetupError(f"--setenv needs NAME=VALUE: {item!r}")
++        check_env_name(name)
++        inner[name] = value
++    if not args.no_network:
++        url = f"http://127.0.0.1:{PROXY_PORT}"
++        inner.update({n: url for n in _PROXY_ENV_NAMES})
++        inner.update({"NO_PROXY": "", "no_proxy": ""})
++    return inner
++
++
++def bwrap_argv(args, scratch: Path, env: dict[str, str]) -> list[str]:
++    bwrap = args.bwrap or shutil.which("bwrap")
++    if not bwrap:
++        raise SetupError("bubblewrap (bwrap) is not installed")
++    ro = [check_bind_path(p, env) for p in args.ro]
++    overlays = [check_bind_path(p, env) for p in args.overlay]
++    chdir = _real(args.chdir) if args.chdir else Path(SANDBOX_HOME)
++    if args.chdir and not any(_is_within(chdir, p) for p in ro + overlays):
++        raise SetupError(f"--chdir {chdir} is not inside a bound path")
++
++    argv = [bwrap, "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
++            "--new-session", "--cap-drop", "ALL", "--clearenv", "--hostname", "plugin-sandbox"]
++    if os.getuid() == 0:  # windows-footgun: ok — Linux-only script, main() refuses other platforms
++        # Never hand plugin code uid 0, not even a namespaced one.
++        argv += ["--uid", "65534", "--gid", "65534"]
++    argv += _system_mounts()
++    python, extra_ro = _inner_python()
++    for path in [*extra_ro, *map(str, ro)]:
++        argv += ["--ro-bind", path, path]
++    argv += _overlay_mounts(bwrap, args.overlay_mode, overlays, scratch)
++    argv += ["--ro-bind", os.path.realpath(__file__), INNER_SCRIPT]
++    if not args.no_network:
++        argv += ["--bind", str(scratch / "proxy.sock"), INNER_SOCKET]
++    for name, value in _inner_env(args, env).items():
++        argv += ["--setenv", name, value]
++    argv += ["--chdir", str(chdir), "--", python, "-I", "-S", INNER_SCRIPT, "--inner"]
++    argv += [f"--host-ns={ns}:{ident}" for ns, ident in host_namespaces().items()]
++    if args.no_network:
++        argv += ["--no-network"]
++    return argv + ["--", *args.command]
++
++
++def remove_tree(path: Path) -> None:
++    """Delete the scratch dir even where the sandbox left it unlistable (chmod 000 dirs).
++
++    Every dir in it is ours, so chmod works on it whatever its mode: open each one
++    up top-down (never through a symlink), then remove the tree.
++    """
++    pending = [str(path)]
++    while pending:
++        directory = pending.pop()
++        try:
++            if not stat.S_ISDIR(os.lstat(directory).st_mode):
++                continue
++            os.chmod(directory, stat.S_IRWXU)
++            with os.scandir(directory) as entries:
++                pending.extend(e.path for e in entries if e.is_dir(follow_symlinks=False))
++        except OSError:
++            continue
++    shutil.rmtree(path, ignore_errors=True)
++
++
++def run_host(args) -> int:
++    env = dict(os.environ)
++    if not args.command:
++        print("plugin-sandbox: no command given", file=sys.stderr)
++        return EXIT_SETUP
++    try:
++        # Refuse bad requests before creating anything on the host.
++        for path in [*args.ro, *args.overlay]:
++            check_bind_path(path, env)
++        for name in args.env:
++            check_env_name(name)
++    except SetupError as exc:
++        print(f"plugin-sandbox: {exc}", file=sys.stderr)
++        return EXIT_SETUP
++    base = env.get("RUNNER_TEMP", "")
++    if not os.path.isdir(base):
++        base = tempfile.gettempdir()
++    scratch = Path(tempfile.mkdtemp(prefix="plugin-sandbox-", dir=base))
++    proxy = None
++    proc = None
++
++    def _terminate(signum, _frame):
++        raise SystemExit(128 + signum)
++
++    signal.signal(signal.SIGTERM, _terminate)
++    signal.signal(signal.SIGINT, _terminate)
++    try:
++        try:
++            argv = bwrap_argv(args, scratch, env)
++            if not args.no_network:
++                policy = EgressPolicy(set(args.allow_port or [443]), args.allow_host)
++                proxy = EgressProxy(str(scratch / "proxy.sock"), policy)
++        except (SetupError, OSError) as exc:
++            print(f"plugin-sandbox: {exc}", file=sys.stderr)
++            return EXIT_SETUP
++        # bwrap itself gets no inherited secrets either (it does not need any).
++        # bwrap's own setup failures exit 1 like a failing command; either way the
++        # caller sees a nonzero status and the entry fails.
++        proc = subprocess.Popen(argv, env={"PATH": "/usr/bin:/bin"}, close_fds=True)
++        # health: allow HX006 -- this wait IS the sandboxed command's runtime; the caller bounds it (the job's `timeout 600`) and SIGTERM/SIGINT tear the namespace down below
++        return proc.wait()
++    finally:
++        if proc is not None and proc.poll() is None:
++            proc.kill()  # bwrap's PID namespace (every sandboxed process) dies with it
++            try:
++                proc.wait(timeout=30)  # reaped before its scratch (the overlay copy) is removed
++            except subprocess.TimeoutExpired:
++                pass
++        if proxy:
++            proxy.close()
++        remove_tree(scratch)
++
++
++# ─── inside the sandbox ─────────────────────────────────────────────────────────
++
++def _forward(listener: socket.socket) -> None:
++    while True:
++        try:
++            client, _ = listener.accept()
++        except OSError:
++            return
++        try:
++            upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            upstream.connect(INNER_SOCKET)
++        except OSError:
++            client.close()
++            continue
++        threading.Thread(target=_relay, args=(client, upstream, 300.0), daemon=True).start()
++
++
++def self_check(host_ns: dict[str, str]) -> str | None:
++    for ns in NAMESPACES:
++        try:
++            mine = os.readlink(f"/proc/self/ns/{ns}")
++        except OSError as exc:
++            return f"cannot read {ns} namespace: {exc}"
++        if ns not in host_ns:
++            return f"host {ns} namespace not provided"
++        if mine == host_ns[ns]:
++            return f"{ns} namespace is shared with the host"
++    leaked = sorted(n for n in os.environ if _FORBIDDEN_ENV.search(n) and n not in _PROXY_ENV_NAMES)
++    if leaked:
++        return f"credential-like env reached the sandbox: {', '.join(leaked)}"
++    pids = [p for p in os.listdir("/proc") if p.isdigit()]
++    if len(pids) > 8:
++        return f"{len(pids)} processes visible: /proc is not private"
++    return None
++
++
++def run_inner(argv: list[str]) -> int:
++    parser = argparse.ArgumentParser(prog="plugin-sandbox --inner")
++    parser.add_argument("--inner", action="store_true")
++    parser.add_argument("--host-ns", action="append", default=[])
++    parser.add_argument("--no-network", action="store_true")
++    parser.add_argument("command", nargs=argparse.REMAINDER)
++    args = parser.parse_args(argv)
++    command = args.command[1:] if args.command[:1] == ["--"] else args.command
++    host_ns = dict(item.split(":", 1) for item in args.host_ns)
++    problem = self_check(host_ns)
++    if problem:
++        print(f"plugin-sandbox: self-check failed, not running the command: {problem}",
++              file=sys.stderr, flush=True)
++        return EXIT_SELFCHECK
++    if not args.no_network:
++        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++        listener.bind(("127.0.0.1", PROXY_PORT))
++        listener.listen(64)
++        threading.Thread(target=_forward, args=(listener,), daemon=True).start()
++    try:
++        child = subprocess.Popen(command)
++    except OSError as exc:
++        print(f"plugin-sandbox: cannot start {command[:1]}: {exc}", file=sys.stderr)
++        return 127
++    signal.signal(signal.SIGTERM, lambda *_: child.terminate())
++    # health: allow HX006 -- the sandboxed command's runtime; bwrap dies with the host wrapper, which the caller bounds
++    return child.wait()
++
++
++# ─── entry ──────────────────────────────────────────────────────────────────────
++
++def parse_host_args(argv: list[str]):
++    parser = argparse.ArgumentParser(description="Run a command in a credential-free bubblewrap sandbox.")
++    parser.add_argument("--ro", action="append", default=[], metavar="DIR",
++                        help="expose DIR read-only at the same path")
++    parser.add_argument("--overlay", action="append", default=[], metavar="DIR",
++                        help="expose DIR writable at the same path; writes are discarded on exit")
++    parser.add_argument("--env", action="append", default=[], metavar="NAME",
++                        help="forward this host env var (credential-like names are refused)")
++    parser.add_argument("--setenv", action="append", default=[], metavar="NAME=VALUE")
++    parser.add_argument("--chdir", metavar="DIR", help="working directory (inside a bound path)")
++    parser.add_argument("--allow-port", action="append", type=int, metavar="PORT",
++                        help="egress port the proxy may dial (default: 443 only)")
++    parser.add_argument("--allow-host", action="append", default=[], metavar="DOMAIN",
++                        help="restrict egress to these domains and their subdomains (default: any public host)")
++    parser.add_argument("--no-network", action="store_true", help="loopback only, no proxy")
++    parser.add_argument("--overlay-mode", choices=("auto", "kernel", "copy"), default="auto",
++                        help="how --overlay is provided (default: kernel overlayfs when bwrap supports it)")
++    parser.add_argument("--bwrap", help=argparse.SUPPRESS)  # tests: a broken/fake bwrap
++    parser.add_argument("command", nargs=argparse.REMAINDER)
++    args = parser.parse_args(argv)
++    if args.command[:1] == ["--"]:
++        args.command = args.command[1:]
++    return args
++
++
++def main(argv: list[str] | None = None) -> int:
++    argv = sys.argv[1:] if argv is None else argv
++    if argv[:1] == ["--inner"]:
++        return run_inner(argv)
++    if sys.platform != "linux":
++        print("plugin-sandbox: Linux only", file=sys.stderr)
++        return EXIT_SETUP
++    return run_host(parse_host_args(argv))
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/ci/test_fast_runner_routing.py b/tests/ci/test_fast_runner_routing.py
+index fe390a5f341..eec68990bb1 100644
+--- a/tests/ci/test_fast_runner_routing.py
++++ b/tests/ci/test_fast_runner_routing.py
+@@ -171,6 +171,27 @@ def test_e2e_upgrade_runs_only_on_bwrap_capable_slots():
+                 assert (wf, name) == ("tests.yml", "e2e-upgrade")
+ 
+ 
++def test_plugin_catalog_sandbox_runs_on_the_runner_ami_without_host_setup():
++    # Plugin code in pinned-source-validate runs only inside bubblewrap. Its lane
++    # (hermes-hub, now only tfgar-hub VMs) boots the runner AMI, so the AMI's own
++    # build must keep proving bwrap for the runner user; the job installs and
++    # reconfigures nothing and fails closed through the wrapper's own proof.
++    job = _workflows()["plugin-catalog-ci.yml"]["jobs"]["pinned-source-validate"]
++    assert _labels(job) == ["self-hosted", "hermes-hub"]
++    provision = (ROOT / "hosts/hermes-ci-runners/packer/provision.sh").read_text(encoding="utf-8")
++    assert "apt-get install -y bubblewrap" in provision
++    assert "echo 'kernel.apparmor_restrict_unprivileged_userns = 0' > /etc/sysctl.d/" in provision
++    assert "sudo -u ubuntu bwrap --ro-bind / / --unshare-user --unshare-net true ||" in provision
++    names = [s.get("name") for s in job["steps"]]
++    proof = job["steps"][names.index("Prove the plugin validation sandbox")]
++    assert names.index("Prove the plugin validation sandbox") < names.index("Clone each entry at its pinned sha and validate")
++    assert proof["if"] == "steps.changed.outputs.files != ''"
++    assert "python3 -I scripts/ci/plugin_validation_sandbox.py --no-network -- /bin/true" in proof["run"]
++    assert "set -euo pipefail" in proof["run"] and "|| true" not in proof["run"]
++    for step in job["steps"]:
++        assert not re.search(r"\b(sudo|sysctl -w|apt-get)\b", step.get("run", "")), step.get("name")
++
++
+ def test_e2e_upgrade_has_release_tags_for_n_minus_1():
+     # N-1 = `git describe --tags --abbrev=0 --match 'v20[0-9][0-9].*' HEAD~1`. The fork
+     # carries no release tags, so without upstream's the git/core shards fail
+diff --git a/tests/ci/test_plugin_catalog_ci_confinement.py b/tests/ci/test_plugin_catalog_ci_confinement.py
+index c40544113db..8851e008d40 100644
+--- a/tests/ci/test_plugin_catalog_ci_confinement.py
++++ b/tests/ci/test_plugin_catalog_ci_confinement.py
+@@ -5,8 +5,15 @@ fixture git repos: the changed-entries step against a PR merge commit, and the
+ pinned-source step against an origin repo served under an https URL through a
+ git ``url.insteadOf`` rewrite. One case per closed bypass, plus the legitimate
+ flows that must keep passing.
++
++Both jobs take only catalog bytes from the PR: they export them from the merge
++commit's tree, drop the PR checkout and check out the merge commit's first
++parent (the trusted base) before running any tool. The pipeline tests below run
++that whole sequence, with ``actions/checkout`` emulated by a git clone, and
++prove a PR's own scanner, sandbox wrapper, validator, action or core never runs.
+ """
+ 
++import json
+ import os
+ import subprocess
+ import sys
+@@ -23,18 +30,32 @@ ROOT = Path(__file__).resolve().parents[2]
+ WORKFLOW = Path(os.environ.get(
+     "CATALOG_CI_WORKFLOW", ROOT / ".github/workflows/plugin-catalog-ci.yml"))
+ REPO_URL = "https://fixture.invalid/repo"
++PINNED_JOB = "pinned-source-validate"
+ 
+ 
+-def _step(name_prefix: str) -> str:
++def _job_steps(job: str | None = None):
+     data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+-    for job in data["jobs"].values():
+-        for step in job["steps"]:
+-            if step.get("name", "").startswith(name_prefix):
+-                # The workflow expands ${{ github.base_ref }} before bash sees it.
+-                return step["run"].replace("${{ github.base_ref }}", "main")
++    for name, spec in data["jobs"].items():
++        if job is None or name == job:
++            yield from spec["steps"]
++
++
++def _find_step(name_prefix: str, job: str | None = None) -> dict:
++    for step in _job_steps(job):
++        if step.get("name", "").startswith(name_prefix):
++            return step
+     raise LookupError(name_prefix)
+ 
+ 
++def _step(name_prefix: str, job: str | None = None) -> str:
++    # The workflow expands ${{ github.base_ref }} before bash sees it.
++    return _find_step(name_prefix, job)["run"].replace("${{ github.base_ref }}", "main")
++
++
++def _step_env(name_prefix: str, job: str | None = None) -> dict:
++    return {k: str(v) for k, v in (_find_step(name_prefix, job).get("env") or {}).items()}
++
++
+ def _git(cwd: Path, *args: str) -> str:
+     return subprocess.run(
+         ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+@@ -54,7 +75,7 @@ def _run(script_text: str, tmp_path: Path, cwd: Path, env: dict) -> subprocess.C
+     script.write_text(script_text, encoding="utf-8")
+     return subprocess.run(
+         ["bash", str(script)], env=env, cwd=cwd,
+-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, check=False)
++        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300, check=False)
+ 
+ 
+ # ── pinned-source step ────────────────────────────────────────────────────────
+@@ -71,8 +92,18 @@ def origin(tmp_path):
+     return repo
+ 
+ 
++def _cand(tmp_path: Path) -> Path:
++    """Where the changed-entries step exports the PR's entry bytes."""
++    return tmp_path / "cand"
++
++
++def _rel(tmp_path: Path, entry: Path) -> str:
++    return entry.relative_to(_cand(tmp_path)).as_posix()
++
++
+ def _entry(tmp_path: Path, name: str, sha: str, **fields) -> Path:
+-    path = tmp_path / name
++    path = _cand(tmp_path) / "plugin-catalog" / name
++    path.parent.mkdir(parents=True, exist_ok=True)
+     path.write_text(yaml.safe_dump(
+         {"repo": REPO_URL, "sha": sha, "subdir": "plugin", **fields}), encoding="utf-8")
+     return path
+@@ -85,16 +116,54 @@ def _planted(tmp_path: Path) -> Path:
+     return planted
+ 
+ 
+-def _gate(tmp_path: Path, origin: Path, entries: list[Path],
+-          hermes_stub: str = "#!/bin/sh\nexit 0\n") -> subprocess.CompletedProcess:
+-    bin_dir = tmp_path / "bin"
+-    bin_dir.mkdir(exist_ok=True)
++SANDBOX_STUB = """\
++#!/usr/bin/env python3
++# Stand-in for scripts/ci/plugin_validation_sandbox.py: record the call, then run
++# the command after `--` unconfined with the caller's full environment, as the
++# old unsandboxed step did. SANDBOX_STUB_EXIT forces a setup failure instead.
++import json, os, sys
++with open(os.environ["SANDBOX_STUB_LOG"], "a", encoding="utf-8") as fh:
++    fh.write(json.dumps(sys.argv[1:]) + "\\n")
++if os.environ.get("SANDBOX_STUB_EXIT"):
++    sys.exit(int(os.environ["SANDBOX_STUB_EXIT"]))
++argv = sys.argv[1:]
++os.execvp(argv[argv.index("--") + 1], argv[argv.index("--") + 1:])
++"""
++
++
++def _gate(tmp_path: Path, origin: Path, entries: list, *,
++          hermes_stub: str = "#!/bin/sh\nexit 0\n", sandbox: str = "stub",
++          extra_env: dict | None = None, workspace: Path | None = None,
++          candidates: Path | None = None) -> subprocess.CompletedProcess:
++    """Run the pinned-source step. sandbox="stub" swaps in a recording,
++    unconfined wrapper (no bubblewrap needed); sandbox="real" runs the real
++    wrapper from this checkout, with `hermes` inside the PM home as setup-pm
++    puts it. `workspace` runs the step from that checkout as-is (its own
++    scanner and wrapper); entries are paths under `candidates` (default:
++    the fixture candidate dir) or already candidate-relative strings."""
++    pm_home = tmp_path / "pmhome"
++    bin_dir = (pm_home if sandbox == "real" else tmp_path) / "bin"
++    bin_dir.mkdir(parents=True, exist_ok=True)
+     stub = bin_dir / "hermes"
+     stub.write_text(hermes_stub, encoding="utf-8")
+     stub.chmod(0o755)
++    cand = candidates or _cand(tmp_path)
++    cand.mkdir(parents=True, exist_ok=True)
++    if workspace is None:
++        workspace = ROOT
++        if sandbox == "stub":
++            workspace = tmp_path / "workspace"
++            (workspace / "scripts" / "ci").mkdir(parents=True, exist_ok=True)
++            scan = workspace / "scripts" / "scan_plugin_payloads.py"
++            if not scan.exists():
++                scan.symlink_to(ROOT / "scripts" / "scan_plugin_payloads.py")
++            (workspace / "scripts" / "ci" / "plugin_validation_sandbox.py").write_text(
++                SANDBOX_STUB, encoding="utf-8")
++    names = [e if isinstance(e, str) else e.relative_to(cand).as_posix() for e in entries]
+     env = {
+         **os.environ,
+-        "CHANGED_FILES": "\n".join(str(e) for e in entries),
++        "CHANGED_FILES": "\n".join(names),
++        "CATALOG_CANDIDATES": str(cand),
+         "TMPDIR": str(tmp_path / "mktmp"),
+         # The test interpreter first: the step's `python3 -I` parser needs
+         # ruamel.yaml from site-packages, as setup-pm provides it in CI.
+@@ -102,11 +171,16 @@ def _gate(tmp_path: Path, origin: Path, entries: list[Path],
+         # CI runs the step from the hermes-agent checkout; `-I` must ignore this.
+         "PYTHONPATH": str(ROOT),
+         "GIT_TERMINAL_PROMPT": "0",
+-        "GITHUB_WORKSPACE": str(ROOT),
++        "GITHUB_WORKSPACE": str(workspace),
++        "HERMES_HOME": str(pm_home),
++        "SANDBOX_STUB_LOG": str(tmp_path / "sandbox-calls.jsonl"),
+         "GIT_CONFIG_COUNT": "1",
+         "GIT_CONFIG_KEY_0": f"url.{origin.as_uri()}.insteadOf",
+         "GIT_CONFIG_VALUE_0": REPO_URL,
++        **(extra_env or {}),
+     }
++    pm_home.mkdir(exist_ok=True)
++    (tmp_path / "mktmp").mkdir(exist_ok=True)
+     return _run(_step("Clone each entry"), tmp_path, tmp_path, env)
+ 
+ 
+@@ -145,11 +219,18 @@ def _log_forging_repo(tp, origin, sha):
+ 
+ 
+ def _symlinked_entry_file(tp, origin, sha):
+-    link = tp / "link.yaml"
+-    link.symlink_to(_entry(tp, "real.yaml", sha))
++    real = _entry(tp, "real.yaml", sha)
++    link = real.with_name("link.yaml")
++    link.symlink_to(real.name)
+     return link, "must be a regular file"
+ 
+ 
++def _entry_outside_the_candidates(tp, origin, sha):
++    # A listed name that climbs out of the candidate dir is never read.
++    _entry(tp, "real.yaml", sha)
++    return "plugin-catalog/../plugin-catalog/real.yaml", "must be a regular file"
++
++
+ def _self_updater_in_spaced_dir(tp, origin, sha):
+     (origin / "plugin" / "evil dir").mkdir()
+     (origin / "plugin" / "evil dir" / "dl.js").write_text(
+@@ -176,8 +257,8 @@ def _log_forging_filename(tp, origin, sha):
+ 
+ 
+ def _shadowed_parser_import(tp, origin, sha):
+-    # cwd is the PR checkout; without `python3 -I` this shlex.py shadows the
+-    # stdlib (first imported by the parser itself) and swallows the verdict.
++    # cwd holds a shlex.py; without `python3 -I` it shadows the stdlib (first
++    # imported by the parser itself) and swallows the verdict.
+     (tp / "shlex.py").write_text(
+         "def quote(s):\n"
+         "    if s.startswith('repo must'):\n"
+@@ -188,8 +269,8 @@ def _shadowed_parser_import(tp, origin, sha):
+ 
+ @pytest.mark.parametrize("case", [
+     _traversal_subdir, _symlinked_subdir, _symlink_behind_in_clone_link, _tag_object_sha,
+-    _newline_sha, _log_forging_repo, _symlinked_entry_file, _self_updater_in_spaced_dir,
+-    _bundled_native_binary, _committed_bytecode,
++    _newline_sha, _log_forging_repo, _symlinked_entry_file, _entry_outside_the_candidates,
++    _self_updater_in_spaced_dir, _bundled_native_binary, _committed_bytecode,
+     _log_forging_filename, _shadowed_parser_import,
+ ], ids=lambda f: f.__name__.lstrip("_"))
+ def test_bypass_fails_the_gate(tmp_path, origin, case):
+@@ -222,9 +303,9 @@ def test_one_entry_cannot_skip_or_impersonate_the_others(tmp_path, origin):
+                 hermes_stub="#!/bin/sh\ncat >/dev/null\nexit 0\n")
+     assert res.returncode != 0, res.stdout + res.stderr
+     assert "catalog entry parser failed" in res.stdout
+-    assert f"PASS: {ok}" in res.stdout
+-    assert f"PASS: {ok2}" in res.stdout
+-    assert f"PASS: {crash}" not in res.stdout
++    assert f"PASS: {_rel(tmp_path, ok)}" in res.stdout
++    assert f"PASS: {_rel(tmp_path, ok2)}" in res.stdout
++    assert f"PASS: {_rel(tmp_path, crash)}" not in res.stdout
+ 
+ 
+ @pytest.mark.parametrize("fields", [
+@@ -240,7 +321,7 @@ def test_legit_entry_passes_the_gate(tmp_path, origin, fields):
+     entry = _entry(tmp_path, "ok.yaml", _git(origin, "rev-parse", "HEAD"), **fields)
+     res = _gate(tmp_path, origin, [entry])
+     assert res.returncode == 0, res.stdout + res.stderr
+-    assert f"PASS: {entry}" in res.stdout
++    assert f"PASS: {_rel(tmp_path, entry)}" in res.stdout
+ 
+ 
+ @pytest.mark.parametrize("mut", [
+@@ -253,7 +334,8 @@ def test_structural_and_pinned_gates_agree(tmp_path, origin, mut):
+     data = {"name": "parity-plugin", "description": "d", "maintainer": "o",
+             "repo": REPO_URL, "sha": _git(origin, "rev-parse", "HEAD"),
+             "subdir": "plugin", **mut}
+-    entry = tmp_path / "parity.yaml"
++    entry = _cand(tmp_path) / "plugin-catalog" / "parity.yaml"
++    entry.parent.mkdir(parents=True)
+     entry.write_text(yaml.safe_dump(data), encoding="utf-8")
+     structural = subprocess.run(
+         [sys.executable, str(ROOT / "scripts/validate_plugin_catalog.py"), str(entry)],
+@@ -285,15 +367,6 @@ NEW = {"plugin-catalog/new.yaml": "name: new\n"}
+ UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
+ 
+ 
+-def _step_env(name_prefix: str) -> dict:
+-    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+-    for job in data["jobs"].values():
+-        for step in job["steps"]:
+-            if step.get("name", "").startswith(name_prefix):
+-                return {k: str(v) for k, v in (step.get("env") or {}).items()}
+-    raise LookupError(name_prefix)
+-
+-
+ def _pr_merge(repo: Path) -> None:
+     """Shape of GitHub's pull_request checkout: a merge commit of branch `pr`
+     whose first parent is the base tip, checked out detached."""
+@@ -302,6 +375,29 @@ def _pr_merge(repo: Path) -> None:
+     _git(repo, "checkout", "-q", "--detach")
+ 
+ 
++def _runner_temp(tmp_path: Path) -> Path:
++    path = tmp_path / "runner-temp"
++    path.mkdir(exist_ok=True)
++    return path
++
++
++def _outputs(tmp_path: Path) -> dict:
++    """The step's $GITHUB_OUTPUT, heredoc values included."""
++    lines = (tmp_path / "gh-output.txt").read_text(encoding="utf-8").splitlines()
++    out, i = {}, 0
++    while i < len(lines):
++        key, sep, value = lines[i].partition("=")
++        if not sep and "<<" in lines[i]:
++            key, delim = lines[i].split("<<", 1)
++            end = lines.index(delim, i + 1)
++            out[key] = lines[i + 1:end]
++            i = end + 1
++            continue
++        out[key] = value
++        i += 1
++    return out
++
++
+ def _find_changed(tmp_path: Path, repo: Path, upstream: Path | None = None):
+     """Run the changed-entries step with its workflow env. The step's upstream
+     URL is rewritten to the `upstream` fixture, or to a missing path when None."""
+@@ -311,14 +407,31 @@ def _find_changed(tmp_path: Path, repo: Path, upstream: Path | None = None):
+     target = upstream if upstream is not None else tmp_path / "no-upstream"
+     env = {
+         **os.environ, **env, "GITHUB_OUTPUT": str(out),
++        "RUNNER_TEMP": str(_runner_temp(tmp_path)),
+         "GIT_CONFIG_COUNT": "1",
+         "GIT_CONFIG_KEY_0": f"url.{target.as_uri()}.insteadOf",
+         # Fallback so the harness also runs an older workflow copy (RED proof).
+         "GIT_CONFIG_VALUE_0": env.get("UPSTREAM_REPO", UPSTREAM_URL),
+     }
+     res = _run(_step("Find changed catalog"), tmp_path, repo, env)
+-    lines = out.read_text(encoding="utf-8").splitlines()
+-    return res, [f for f in lines if f and "__EOF__" not in f and f != "files<<__EOF__"]
++    return res, [f for f in _outputs(tmp_path).get("files", []) if f]
++
++
++def _assert_candidates_are_the_tree_bytes(tmp_path: Path, repo: Path, files: list[str]) -> None:
++    """Each listed entry is exported as a regular file with its exact blob, or
++    (a non-regular tree entry) not at all; nothing else is exported."""
++    cand = Path(_outputs(tmp_path)["candidates"])
++    exported = {p.relative_to(cand).as_posix() for p in cand.rglob("*") if not p.is_dir()}
++    assert not any((cand / p).is_symlink() for p in exported)
++    regular = set()
++    for f in files:
++        mode = _git(repo, "ls-tree", "--format=%(objectmode)", "HEAD", "--", f)
++        if mode in ("100644", "100755"):
++            regular.add(f)
++            blob = subprocess.run(["git", "cat-file", "blob", f"HEAD:{f}"], cwd=repo,
++                                  check=True, capture_output=True).stdout
++            assert (cand / f).read_bytes() == blob, f
++    assert exported == regular
+ 
+ 
+ @pytest.mark.parametrize("change, rc, listed, text", [
+@@ -335,7 +448,8 @@ def _find_changed(tmp_path: Path, repo: Path, upstream: Path | None = None):
+ ], ids=["rename", "typechange", "entry-plus-tooling", "sha-bump",
+         "entry-plus-email-map", "readme-docs-ci-only"])
+ def test_changed_entries_step(tmp_path, change, rc, listed, text):
+-    """Renames and typechanges must reach the pinned gate; an entry PR that also
++    """Renames and typechanges must reach the pinned gate (a typechanged entry
++    as a missing candidate, which the gate rejects); an entry PR that also
+     touches tooling fails before any clone, while email maps and entry-free
+     policy PRs stay green."""
+     repo = tmp_path / "pr"
+@@ -351,6 +465,26 @@ def test_changed_entries_step(tmp_path, change, rc, listed, text):
+     assert files == listed
+     if text:
+         assert text in res.stdout
++    if listed:
++        _assert_candidates_are_the_tree_bytes(tmp_path, repo, listed)
++        assert _outputs(tmp_path)["base"] == _git(repo, "rev-parse", "HEAD^1")
++
++
++def test_a_typechanged_entry_fails_the_pinned_gate(tmp_path, origin):
++    repo = tmp_path / "pr"
++    _write(repo, {"plugin-catalog/old.yaml": "name: old\n"})
++    _git(repo, "init", "-qb", "main")
++    _commit(repo, "base")
++    _git(repo, "checkout", "-qb", "pr")
++    _typechange(repo)
++    _commit(repo, "pr")
++    _pr_merge(repo)
++    res, files = _find_changed(tmp_path, repo)
++    assert res.returncode == 0, res.stdout + res.stderr
++    gate = _gate(tmp_path, origin, files, candidates=Path(_outputs(tmp_path)["candidates"]))
++    assert gate.returncode != 0
++    assert "must be a regular file" in gate.stdout
++    assert "PASS" not in gate.stdout
+ 
+ 
+ # ── upstream sync through the changed-entries step ───────────────────────────
+@@ -416,12 +550,23 @@ SYNCED = ["plugin-catalog/old.yaml", "plugin-catalog/up.yaml"]
+ 
+ def test_upstream_sync_of_entries_with_core_passes(tmp_path):
+     """Upstream's admitted entries may land beside upstream's core, and still
+-    reach the pinned-source gate."""
++    reach the pinned-source gate as exactly upstream's bytes."""
+     up, fork = _sync_fixture(tmp_path)
+     res, files = _find_changed(tmp_path, fork, upstream=up)
+     assert res.returncode == 0, res.stdout + res.stderr
+     assert files == SYNCED
+-    assert "Upstream sync: every changed entry matches upstream" in res.stdout
++    assert "Upstream sync: every changed entry is upstream" in res.stdout
++    _assert_candidates_are_the_tree_bytes(tmp_path, fork, files)
++
++
++def _rejected(res, files, *, entries=()):
++    out = res.stdout
++    assert res.returncode == 1, out + res.stderr
++    assert files == []
++    assert "may only touch plugin-catalog/**" in out
++    listed = out.split("Entries that are not upstream's change", 1)[1]
++    for e in entries:
++        assert e in listed, out
+ 
+ 
+ @pytest.mark.parametrize("change, culprit", [
+@@ -435,11 +580,7 @@ def test_hostile_mixed_admission_inside_a_sync_fails(tmp_path, change, culprit):
+     that commit: any one such entry restores the data-only rule for the PR."""
+     up, fork = _sync_fixture(tmp_path, change)
+     res, files = _find_changed(tmp_path, fork, upstream=up)
+-    assert res.returncode == 1, res.stdout + res.stderr
+-    assert "may only touch plugin-catalog/**" in res.stdout
+-    untrusted = res.stdout.split("Entries not identical to upstream", 1)[1]
+-    assert culprit in untrusted
+-    assert files == []
++    _rejected(res, files, entries=[culprit])
+ 
+ 
+ def test_unreachable_upstream_fails_closed(tmp_path):
+@@ -471,8 +612,8 @@ def _entry_rename_with_edit(tmp_path: Path) -> tuple[None, Path]:
+ def test_blobless_checkout_of_a_private_fork_needs_no_credentials(tmp_path, scenario, listed):
+     """CI checks out blobless and then drops the token, so a lazy blob fetch
+     from the private fork hits a credential prompt. The step must answer from
+-    trees alone: here the promisor remote is unreachable, as the token-less
+-    https remote is in CI."""
++    trees and HEAD's checked-out blobs alone: here the promisor remote is
++    unreachable, as the token-less https remote is in CI."""
+     up, src = scenario(tmp_path)
+     _git(src, "config", "uploadpack.allowFilter", "true")
+     head = _git(src, "rev-parse", "HEAD")
+@@ -487,3 +628,604 @@ def test_blobless_checkout_of_a_private_fork_needs_no_credentials(tmp_path, scen
+     assert res.returncode == 0, res.stdout + res.stderr
+     assert "promisor remote" not in res.stderr
+     assert files == listed
++    _assert_candidates_are_the_tree_bytes(tmp_path, clone, files)
++
++
++# ── upstream delta admission: entries strict, the rest never executed ─────────
++# Regressions for the PR #434 review: matching entry blobs alone could not tell
++# an upstream sync from a PR that restores a fork-deleted entry or overwrites a
++# fork-local pin. The rest of a sync (core, tooling, conflict resolutions) is
++# admitted: the gate runs none of it (see the trusted-base pipeline below).
++
++U0_FILES = {
++    "plugin-catalog/a.yaml": "name: a\nsha: 1\n",
++    "plugin-catalog/b.yaml": "name: b\nsha: 1\n",
++    "core/tool.py": CORE,
++    "scripts/scan_plugin_payloads.py": "scan v0\n",
++    ".github/actions/setup-pm/action.yml": "setup v0\n",
++}
++
++
++def _delta_fixture(tmp_path: Path, *, fork=None, upstream=None, pr=None,
++                   merge_opts: tuple = (), files: dict | None = None) -> tuple[Path, Path]:
++    """Upstream U0 (`files`), a fork synced to U0 whose main applies `fork`,
++    upstream U1 applying `upstream` (none: upstream never advances), and a PR
++    branch that merges upstream main with `merge_opts` and then applies `pr`."""
++    up = tmp_path / "upstream"
++    _write(up, files or U0_FILES)
++    _git(up, "init", "-qb", "main")
++    _commit(up, "U0")
++    repo = tmp_path / "pr"
++    _git(tmp_path, "clone", "-q", str(up), str(repo))
++    _write(repo, {"fork.txt": "fork-local\n"})
++    if fork:
++        fork(repo)
++    _commit(repo, "fork main")
++    if upstream:
++        upstream(up)
++        _commit(up, "U1")
++    _git(repo, "checkout", "-qb", "pr")
++    _git(repo, "fetch", "-q", str(up), "main")
++    _git(repo, "merge", "-q", "--no-ff", *merge_opts, "-m", "sync", "FETCH_HEAD")
++    if pr:
++        pr(repo)
++        _commit(repo, "pr change")
++    _pr_merge(repo)
++    _git(repo, "remote", "remove", "origin")
++    return up, repo
++
++
++def _up_repins_a(r):
++    _write(r, {"plugin-catalog/a.yaml": "name: a\nsha: 2\n"})
++
++
++def _up_repins_a_and_tooling(r):
++    _write(r, {"plugin-catalog/a.yaml": "name: a\nsha: 2\n",
++               "scripts/scan_plugin_payloads.py": "scan v1\n",
++               ".github/actions/setup-pm/action.yml": "setup v1\n",
++               "core/tool.py": CORE + "upstream\n", "core/new.py": "new\n"})
++
++
++def test_upstream_delta_including_gate_tooling_is_admitted(tmp_path):
++    """Upstream's own scanner/action/core changes may land verbatim with its entries."""
++    up, repo = _delta_fixture(tmp_path, upstream=_up_repins_a_and_tooling)
++    res, files = _find_changed(tmp_path, repo, upstream=up)
++    assert res.returncode == 0, res.stdout + res.stderr
++    assert files == ["plugin-catalog/a.yaml"]
++    assert "Upstream sync: every changed entry is upstream" in res.stdout
++
++
++def _fork_deletes_a(r):
++    (r / "plugin-catalog" / "a.yaml").unlink()
++
++
++def _restore_a(r):
++    _write(r, {"plugin-catalog/a.yaml": U0_FILES["plugin-catalog/a.yaml"]})
++
++
++def test_restoring_a_fork_deleted_entry_without_an_upstream_advance_fails(tmp_path):
++    up, repo = _delta_fixture(
++        tmp_path, fork=_fork_deletes_a,
++        pr=lambda r: (_restore_a(r), _write(r, {"core/tool.py": CORE + "evil\n"})))
++    res, files = _find_changed(tmp_path, repo, upstream=up)
++    _rejected(res, files, entries=["plugin-catalog/a.yaml"])
++    assert "does not advance the base's upstream merge-base" in res.stdout
++
++
++def test_restoring_a_fork_deleted_entry_inside_a_real_sync_fails(tmp_path):
++    up, repo = _delta_fixture(
++        tmp_path, fork=_fork_deletes_a,
++        upstream=lambda r: _write(r, {"core/tool.py": CORE + "upstream\n"}), pr=_restore_a)
++    res, files = _find_changed(tmp_path, repo, upstream=up)
++    _rejected(res, files, entries=["plugin-catalog/a.yaml"])
++
++
++def test_a_sync_cannot_overwrite_a_fork_local_pin_with_upstreams(tmp_path):
++    """The fork re-pinned a.yaml; upstream re-pins it too. Taking upstream's
++    version verbatim would silently drop the fork's decision."""
++    up, repo = _delta_fixture(
++        tmp_path, fork=lambda r: _write(r, {"plugin-catalog/a.yaml": "name: a\nsha: fork\n"}),
++        upstream=lambda r: (_up_repins_a(r), _write(r, {"core/tool.py": CORE + "upstream\n"})),
++        merge_opts=("-X", "theirs"))
++    res, files = _find_changed(tmp_path, repo, upstream=up)
++    _rejected(res, files, entries=["plugin-catalog/a.yaml"])
++
++
++def test_a_sync_cannot_revert_a_fork_local_pin_upstream_never_changed(tmp_path):
++    up, repo = _delta_fixture(
++        tmp_path, fork=lambda r: _write(r, {"plugin-catalog/a.yaml": "name: a\nsha: fork\n"}),
++        upstream=lambda r: _write(r, {"plugin-catalog/b.yaml": "name: b\nsha: 2\n",
++                                      "core/tool.py": CORE + "upstream\n"}),
++        pr=_restore_a)
++    res, files = _find_changed(tmp_path, repo, upstream=up)
++    _rejected(res, files, entries=["plugin-catalog/a.yaml"])
++    assert "plugin-catalog/b.yaml" not in res.stdout.split("Entries that", 1)[1]
++
++
++def _fork_edits_core_head(r):
++    _write(r, {"core/tool.py": "fork line\n" + CORE[CORE.index("\n") + 1:]})
++
++
++@pytest.mark.parametrize("merge_opts", [(), ("-X", "theirs")], ids=["three-way-merge", "upstream-verbatim"])
++def test_a_sync_resolving_a_fork_modified_core_path_is_admitted(tmp_path, merge_opts):
++    """Real syncs resolve core conflicts the fork's own way. That resolution is
++    never executed by the gate, so it does not hold back upstream's entries."""
++    up, repo = _delta_fixture(
++        tmp_path, fork=_fork_edits_core_head,
++        upstream=lambda r: (_up_repins_a(r), _write(r, {"core/tool.py": CORE + "upstream\n"})),
++        merge_opts=merge_opts)
++    res, files = _find_changed(tmp_path, repo, upstream=up)
++    assert res.returncode == 0, res.stdout + res.stderr
++    assert files == ["plugin-catalog/a.yaml"]
++
++
++# ── the gate runs only the trusted base's tools ───────────────────────────────
++
++def _tool_files() -> dict[str, str]:
++    """The base's gate tooling: the real scanner and validator, the recording
++    sandbox stand-in, and placeholders for an action and core."""
++    return {
++        "scripts/scan_plugin_payloads.py":
++            (ROOT / "scripts" / "scan_plugin_payloads.py").read_text(encoding="utf-8"),
++        "scripts/validate_plugin_catalog.py":
++            (ROOT / "scripts" / "validate_plugin_catalog.py").read_text(encoding="utf-8"),
++        "scripts/ci/plugin_validation_sandbox.py": SANDBOX_STUB,
++        ".github/actions/setup-pm/action.yml": "setup v0\n",
++        ".github/actions/retry/action.yml": "retry v0\n",
++        "core/tool.py": CORE,
++    }
++
++
++def _pinned(sha: str, name: str = "a") -> str:
++    return yaml.safe_dump({"name": name, "description": "d", "maintainer": "o",
++                           "repo": REPO_URL, "sha": sha, "subdir": "plugin"})
++
++
++def _marker_script(marker: Path) -> str:
++    """Python an attacker would put in a tool: leaves proof it ran, then
++    reports success."""
++    return f"open({str(marker)!r}, 'w').write('ran')\nimport sys\nsys.exit(0)\n"
++
++
++def _pr_checkout(tmp_path: Path, src: Path) -> Path:
++    """What the PR job's first actions/checkout leaves: the merge commit."""
++    ws = tmp_path / "ws"
++    _git(tmp_path, "clone", "-q", "--no-checkout", str(src), str(ws))
++    _git(ws, "checkout", "-q", "--detach", _git(src, "rev-parse", "HEAD"))
++    return ws
++
++
++def _switch_to_trusted_base(tmp_path: Path, src: Path, ws: Path, job: str, base: str,
++                            *, confirmed: bool = True) -> subprocess.CompletedProcess:
++    """Run the job's drop step, emulate `Check out the trusted base` (an
++    actions/checkout of the step's ref into the emptied workspace), then run
++    the job's confirm step with its workflow env."""
++    env = {**os.environ, "GITHUB_WORKSPACE": str(ws)}
++    drop = _run(_step("Drop the PR checkout", job), tmp_path, ws, env)
++    assert drop.returncode == 0, drop.stdout + drop.stderr
++    assert ws.is_dir() and not any(ws.iterdir())
++    checkout = _find_step("Check out the trusted base", job)
++    assert checkout["uses"].startswith("actions/checkout@")
++    assert checkout["with"]["ref"] == _step_env("Confirm the trusted checkout", job)["TRUSTED_BASE"]
++    _git(tmp_path, "clone", "-q", "--no-checkout", str(src), str(ws))
++    _git(ws, "checkout", "-q", "--detach", base)
++    confirm = _run(_step("Confirm the trusted checkout", job), tmp_path, ws,
++                   {**env, **_step_env("Confirm the trusted checkout", job), "TRUSTED_BASE": base})
++    if confirmed:
++        assert confirm.returncode == 0, confirm.stdout + confirm.stderr
++    return confirm
++
++
++def _pinned_pipeline(tmp_path, origin, src, up, *, trusted: bool = True):
++    """Changed-entries step on the PR checkout, the switch to the trusted base,
++    then the pinned-source step from whatever the workspace then holds."""
++    ws = _pr_checkout(tmp_path, src)
++    res, files = _find_changed(tmp_path, ws, upstream=up)
++    assert res.returncode == 0, res.stdout + res.stderr
++    out = _outputs(tmp_path)
++    assert "candidates" in out, (res.stdout, res.stderr, out)
++    if trusted:
++        _switch_to_trusted_base(tmp_path, src, ws, PINNED_JOB, out["base"])
++    gate = _gate(tmp_path, origin, files, workspace=ws, candidates=Path(out["candidates"]))
++    return files, out, ws, gate
++
++
++INJECTIONS = {
++    "scanner": "scripts/scan_plugin_payloads.py",
++    "sandbox-wrapper": "scripts/ci/plugin_validation_sandbox.py",
++    "validator": "scripts/validate_plugin_catalog.py",
++    "setup-pm-action": ".github/actions/setup-pm/action.yml",
++    "core-edit": "core/tool.py",
++    "new-core-file": "hermes_cli/new_module.py",
++}
++
++
++def _injecting_sync(tmp_path, origin, pin: str, injected: dict[str, str]):
++    # The base pins the plugin's first commit; upstream re-pins it to `pin`.
++    sha0 = _git(origin, "rev-list", "--max-parents=0", "HEAD")
++    files = {**_tool_files(), "plugin-catalog/a.yaml": _pinned(sha0),
++             "plugin-catalog/b.yaml": _pinned(sha0, "b")}
++    return _delta_fixture(
++        tmp_path, files=files,
++        upstream=lambda r: _write(r, {"plugin-catalog/a.yaml": _pinned(pin),
++                                      "core/tool.py": CORE + "upstream\n"}),
++        pr=lambda r: _write(r, injected))
++
++
++@pytest.mark.parametrize("path", INJECTIONS.values(), ids=INJECTIONS.keys())
++def test_a_syncs_own_tool_or_core_change_never_runs(tmp_path, origin, path):
++    """A sync may carry any core or tooling bytes of its own (the admission
++    allows it), but none of them reaches the gate's execution path: the
++    workspace the tools run from is exactly the base, the injected code leaves
++    no trace, and the base's sandbox stand-in is the one that ran."""
++    marker = tmp_path / "INJECTED-CODE-RAN"
++    # A new commit of the same plugin tree for upstream to re-pin.
++    _git(origin, "commit", "-q", "--allow-empty", "-m", "re-pin")
++    pin = _git(origin, "rev-parse", "HEAD")
++    up, src = _injecting_sync(tmp_path, origin, pin, {path: _marker_script(marker)})
++    files, out, ws, gate = _pinned_pipeline(tmp_path, origin, src, up)
++    assert files == ["plugin-catalog/a.yaml"]
++    assert gate.returncode == 0, gate.stdout + gate.stderr
++    assert "PASS: plugin-catalog/a.yaml" in gate.stdout
++    assert not marker.exists()
++    base = out["base"]
++    assert _git(ws, "rev-parse", "HEAD") == base
++    on_base = subprocess.run(["git", "cat-file", "blob", f"{base}:{path}"], cwd=ws,
++                             capture_output=True, check=False)
++    if on_base.returncode == 0:
++        assert (ws / path).read_bytes() == on_base.stdout
++    else:
++        assert not (ws / path).exists()
++    (call,) = _calls(tmp_path)
++    assert call[call.index("--") + 1:][:3] == ["hermes", "plugins", "validate"]
++
++
++def test_a_syncs_own_scanner_cannot_wave_a_payload_through(tmp_path, origin):
++    """Upstream's re-pin carries committed bytecode; the PR's scanner would
++    pass anything. The base's scanner runs and rejects the entry."""
++    marker = tmp_path / "INJECTED-CODE-RAN"
++    (origin / "plugin" / "mod.pyc").write_bytes(b"\x00" * 16)
++    pin = _commit(origin, "bytecode")
++    up, src = _injecting_sync(tmp_path, origin, pin,
++                              {"scripts/scan_plugin_payloads.py": _marker_script(marker)})
++    files, _, _, gate = _pinned_pipeline(tmp_path, origin, src, up)
++    assert files == ["plugin-catalog/a.yaml"]
++    assert gate.returncode != 0
++    assert "unscannable executable payload" in gate.stdout
++    assert "PASS" not in gate.stdout
++    assert not marker.exists()
++
++
++def test_control_without_the_trusted_checkout_the_injected_scanner_runs(tmp_path, origin):
++    """Control for the two cases above: run the same pipeline from the PR's
++    checkout and the injected scanner runs and passes the bytecode, so the
++    marker's absence there means the trusted checkout kept it out."""
++    marker = tmp_path / "INJECTED-CODE-RAN"
++    (origin / "plugin" / "mod.pyc").write_bytes(b"\x00" * 16)
++    pin = _commit(origin, "bytecode")
++    up, src = _injecting_sync(tmp_path, origin, pin,
++                              {"scripts/scan_plugin_payloads.py": _marker_script(marker)})
++    _, _, _, gate = _pinned_pipeline(tmp_path, origin, src, up, trusted=False)
++    assert marker.exists()
++    assert gate.returncode == 0, gate.stdout + gate.stderr
++
++
++def test_executed_actions_resolve_only_after_the_trusted_checkout():
++    """`uses: ./...` actions (setup-pm, retry) load from the workspace when the
++    step runs and cannot be executed by this harness; in both jobs every one of
++    them must come after the switch to the trusted base."""
++    for job in ("structural", PINNED_JOB):
++        steps = list(_job_steps(job))
++        names = [s.get("name", "") for s in steps]
++        switch = names.index("Check out the trusted base")
++        assert names[switch - 1] == "Drop the PR checkout"
++        assert names[switch + 1] == "Confirm the trusted checkout"
++        local = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("./")]
++        assert local, job
++        assert all(i > switch for i in local), (job, local, switch)
++
++
++def test_the_bootstrap_check_lists_every_workspace_tool_the_job_runs():
++    """`Confirm the trusted checkout` refuses a base missing any listed tool;
++    every `./` action and every workspace script a later step runs is listed."""
++    import re
++    for job in ("structural", PINNED_JOB):
++        steps = list(_job_steps(job))
++        names = [s.get("name", "") for s in steps]
++        listed = set(_step_env("Confirm the trusted checkout", job)["TRUSTED_TOOLS"].split())
++        used = set()
++        for s in steps[names.index("Confirm the trusted checkout") + 1:]:
++            if str(s.get("uses", "")).startswith("./"):
++                used.add(s["uses"][2:] + "/action.yml")
++            used.update(re.findall(r"(scripts/[\w./-]+\.py)", s.get("run", "")))
++        assert used and used == listed, (job, used, listed)
++        assert all((ROOT / t).is_file() for t in listed), job
++
++
++def _base_without(path: str) -> dict[str, str]:
++    """The base's tooling from before `path` was added."""
++    files = _tool_files()
++    files.pop(path)
++    return files
++
++
++def test_an_entry_on_a_base_without_the_sandbox_fails_closed(tmp_path, origin):
++    """An admitted entry whose base predates the sandbox wrapper: the confirm
++    step refuses the base rather than run anything, and the PR's own wrapper
++    (carried in by the sync) is never a fallback."""
++    marker = tmp_path / "INJECTED-CODE-RAN"
++    sandbox = "scripts/ci/plugin_validation_sandbox.py"
++    sha0 = _git(origin, "rev-list", "--max-parents=0", "HEAD")
++    _git(origin, "commit", "-q", "--allow-empty", "-m", "re-pin")
++    pin = _git(origin, "rev-parse", "HEAD")
++    files = {**_base_without(sandbox), "plugin-catalog/a.yaml": _pinned(sha0)}
++    up, src = _delta_fixture(
++        tmp_path, files=files,
++        upstream=lambda r: _write(r, {"plugin-catalog/a.yaml": _pinned(pin)}),
++        pr=lambda r: _write(r, {sandbox: _marker_script(marker)}))
++    ws = _pr_checkout(tmp_path, src)
++    res, listed = _find_changed(tmp_path, ws, upstream=up)
++    assert res.returncode == 0, res.stdout + res.stderr
++    assert listed == ["plugin-catalog/a.yaml"]
++    out = _outputs(tmp_path)
++    confirm = _switch_to_trusted_base(tmp_path, src, ws, PINNED_JOB, out["base"], confirmed=False)
++    assert confirm.returncode != 0
++    assert f"predates this gate (missing: {sandbox})" in confirm.stdout
++    assert not (ws / sandbox).exists()
++    assert not marker.exists()
++
++
++def test_the_pr_that_adds_the_sandbox_bootstraps(tmp_path):
++    """The PR introducing the wrapper (with this workflow and its tests) lands on
++    a base without it: it changes no entry, so the pinned job stops after
++    `Find changed catalog entries` (every later step is gated on its files) and
++    the structural job, whose tools the base has, passes on the base's tools."""
++    sandbox = "scripts/ci/plugin_validation_sandbox.py"
++    src = tmp_path / "src"
++    _write(src, _base_without(sandbox) | {"plugin-catalog/a.yaml": _pinned("a" * 40)})
++    _git(src, "init", "-qb", "main")
++    _commit(src, "base")
++    _git(src, "checkout", "-qb", "pr")
++    _write(src, {sandbox: SANDBOX_STUB,
++                 ".github/workflows/plugin-catalog-ci.yml": WORKFLOW.read_text(encoding="utf-8"),
++                 "tests/ci/test_plugin_validation_sandbox.py": "def test(): pass\n"})
++    _commit(src, "pr")
++    _pr_merge(src)
++    res, files = _find_changed(tmp_path, src)
++    assert res.returncode == 0, res.stdout + res.stderr
++    assert files == []
++    assert "candidates" not in _outputs(tmp_path)
++    steps = list(_job_steps(PINNED_JOB))
++    after = steps[[s.get("name") for s in steps].index("Find changed catalog entries") + 1:]
++    assert after and all(s.get("if") == "steps.changed.outputs.files != ''" for s in after)
++    structural, ws = _structural(tmp_path, src)
++    assert structural.returncode == 0, structural.stdout + structural.stderr
++    assert not (ws / sandbox).exists()
++
++
++# ── structural job: the base's validator judges the PR's catalog ─────────────
++
++def _structural(tmp_path: Path, src: Path, *, trusted: bool = True):
++    ws = _pr_checkout(tmp_path, src)
++    out_file = tmp_path / "gh-output.txt"
++    out_file.write_text("", encoding="utf-8")
++    env = {**os.environ, "GITHUB_OUTPUT": str(out_file),
++           "RUNNER_TEMP": str(_runner_temp(tmp_path)), "GITHUB_WORKSPACE": str(ws)}
++    export = _run(_step("Export the PR's catalog data", "structural"), tmp_path, ws, env)
++    if export.returncode != 0:
++        return export, ws
++    out = _outputs(tmp_path)
++    if trusted:
++        _switch_to_trusted_base(tmp_path, src, ws, "structural", out["base"])
++    validate = _run(_step("Validate catalog files (structural)", "structural"), tmp_path, ws,
++                    {**env, "CATALOG_DATA": out["dir"],
++                     "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}"})
++    return validate, ws
++
++
++def _structural_fixture(tmp_path: Path, pr_files: dict[str, str], pr=None) -> Path:
++    src = tmp_path / "src"
++    _write(src, {**_tool_files(), "plugin-catalog/a.yaml": _pinned("a" * 40)})
++    _git(src, "init", "-qb", "main")
++    _commit(src, "base")
++    _git(src, "checkout", "-qb", "pr")
++    _write(src, pr_files)
++    if pr:
++        pr(src)
++    _commit(src, "pr")
++    _pr_merge(src)
++    return src
++
++
++@pytest.mark.parametrize("entry, ok", [
++    (_pinned("b" * 40, "b"), True),
++    ("name: NOT VALID\n", False),
++], ids=["valid-entry", "invalid-entry"])
++def test_a_pr_cannot_replace_the_validator_that_judges_it(tmp_path, entry, ok):
++    marker = tmp_path / "INJECTED-CODE-RAN"
++    src = _structural_fixture(tmp_path, {
++        "plugin-catalog/b.yaml": entry,
++        "scripts/validate_plugin_catalog.py": _marker_script(marker)})
++    res, _ = _structural(tmp_path, src)
++    assert (res.returncode == 0) == ok, res.stdout + res.stderr
++    if not ok:
++        assert "b.yaml" in res.stdout + res.stderr
++    assert not marker.exists()
++
++
++def test_control_the_structural_harness_detects_the_injected_validator(tmp_path):
++    marker = tmp_path / "INJECTED-CODE-RAN"
++    src = _structural_fixture(tmp_path, {
++        "plugin-catalog/b.yaml": "name: NOT VALID\n",
++        "scripts/validate_plugin_catalog.py": _marker_script(marker)})
++    res, _ = _structural(tmp_path, src, trusted=False)
++    assert res.returncode == 0
++    assert marker.exists()
++
++
++def test_a_symlink_in_the_catalog_fails_the_structural_export(tmp_path):
++    def link(r):
++        (r / "plugin-catalog" / "x.yaml").symlink_to("/etc/hostname")
++    src = _structural_fixture(tmp_path, {}, pr=link)
++    res, _ = _structural(tmp_path, src)
++    assert res.returncode != 0
++    assert "may only hold regular files" in res.stdout
++
++
++# ── real fork history: the syncs the gate must keep admitting ─────────────────
++
++REAL_SYNCS = {
++    # Merge of upstream c88ccd08c8 into the fork: three upstream re-pins beside
++    # 276 core paths, some resolved the fork's own way.
++    "2aabfa57b9659d5041f9074199cf90c90de1f12f": [
++        "plugin-catalog/birkin-mnemosyne.yaml", "plugin-catalog/kiwi.yaml",
++        "plugin-catalog/llmslim.yaml"],
++    # Landing of a tested sync branch: core only, no entry change.
++    "3234d338163f98492ff72d21d247bbf8c65c1293": [],
++}
++
++
++def _object_store() -> Path | None:
++    try:
++        common = _git(ROOT, "rev-parse", "--path-format=absolute", "--git-common-dir")
++    except subprocess.CalledProcessError:
++        return None
++    return Path(common) / "objects"
++
++
++def _missing_history(sha: str) -> str | None:
++    store = _object_store()
++    if store is None:
++        return "not a git checkout"
++    r = subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=ROOT,
++                       capture_output=True, check=False)
++    return None if r.returncode == 0 else f"{sha[:10]} is not in this checkout's history"
++
++
++def _borrowing_repo(path: Path, refs: dict[str, str]) -> Path:
++    """An empty repo that reads this checkout's objects (no copy) and has
++    only the given refs."""
++    _git(path.parent, "init", "-q", str(path))
++    (path / ".git" / "objects" / "info" / "alternates").write_text(f"{_object_store()}\n")
++    for ref, sha in refs.items():
++        if ref == "HEAD":
++            _git(path, "update-ref", "--no-deref", "HEAD", sha)
++        else:
++            _git(path, "update-ref", ref, sha)
++    return path
++
++
++@pytest.mark.parametrize("sync", REAL_SYNCS, ids=lambda s: s[:10])
++def test_real_fork_syncs_are_admitted(tmp_path, sync):
++    """Each real sync merge, checked out as the PR merge commit (first parent
++    the fork's main, second the upstream it merged), against an upstream whose
++    main is that upstream commit: admitted, with exactly upstream's entries
++    exported as the only PR bytes."""
++    if why := _missing_history(sync):
++        pytest.skip(why)
++    parents = _git(ROOT, "rev-list", "--parents", "-n", "1", sync).split()[1:]
++    pr = _borrowing_repo(tmp_path / "pr", {"refs/heads/main": parents[0], "HEAD": sync})
++    up = _borrowing_repo(tmp_path / "upstream", {"refs/heads/main": parents[1]})
++    res, files = _find_changed(tmp_path, pr, upstream=up)
++    assert res.returncode == 0, res.stdout + res.stderr
++    assert files == REAL_SYNCS[sync]
++    if files:
++        assert "Upstream sync: every changed entry is upstream" in res.stdout
++        _assert_candidates_are_the_tree_bytes(tmp_path, pr, files)
++
++
++# ── plugin code runs only in the sandbox ──────────────────────────────────────
++
++SENTINEL = "ghs_CATALOG_GATE_TOKEN_SENTINEL"
++LEAK_PROBE = f"""#!/bin/sh
++# Stand-in for the plugin code `hermes plugins validate --install-deps` runs.
++plugin="$4"
++if env | grep -q {SENTINEL}; then echo "LEAK in env"; exit 1; fi
++for f in /proc/[0-9]*/environ; do
++  if grep -q {SENTINEL} "$f" 2>/dev/null; then echo "LEAK via $f"; exit 1; fi
++done
++if touch "$plugin/written-by-plugin" 2>/dev/null; then echo "CLONE WRITABLE"; exit 1; fi
++touch "$HERMES_HOME/poisoned-by-plugin" 2>/dev/null || true
++echo "probe clean"
++"""
++PM_ENV = ["PATH", "HERMES_HOME", "HERMES_RUNTIME_DIR", "HERMES_PYTHON", "VIRTUAL_ENV",
++          "PYTHONPATH", "PYTHONUTF8"]
++
++
++def _calls(tmp_path: Path) -> list[list[str]]:
++    log = tmp_path / "sandbox-calls.jsonl"
++    if not log.exists():
++        return []
++    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
++
++
++def test_validate_runs_only_inside_the_sandbox(tmp_path, origin):
++    """The one command that runs plugin code goes through the wrapper, with the
++    clone read-only, the PM home as a discarded overlay and only PM variables."""
++    entry = _entry(tmp_path, "ok.yaml", _git(origin, "rev-parse", "HEAD"))
++    res = _gate(tmp_path, origin, [entry], extra_env={"GH_TOKEN": SENTINEL})
++    assert res.returncode == 0, res.stdout + res.stderr
++    (call,) = _calls(tmp_path)
++    opts, command = call[:call.index("--")], call[call.index("--") + 1:]
++    assert command[:4] == ["hermes", "plugins", "validate", "--install-deps"]
++    plugin_dir = Path(command[4])
++    pairs = list(zip(opts[::2], opts[1::2]))
++    ro = [Path(v) for k, v in pairs if k == "--ro"]
++    assert any(plugin_dir.is_relative_to(p) and p.is_relative_to(tmp_path / "mktmp") for p in ro), call
++    assert [v for k, v in pairs if k == "--overlay"] == [str(tmp_path / "pmhome")]
++    assert sorted(v for k, v in pairs if k == "--env") == sorted(PM_ENV)
++    assert not any(k == "--setenv" for k, _ in pairs)
++    assert SENTINEL not in " ".join(call)
++
++
++def test_a_sandbox_that_cannot_be_built_fails_the_entry(tmp_path, origin):
++    entry = _entry(tmp_path, "ok.yaml", _git(origin, "rev-parse", "HEAD"))
++    res = _gate(tmp_path, origin, [entry], extra_env={"SANDBOX_STUB_EXIT": "125"})
++    assert res.returncode != 0
++    assert "hermes plugins validate failed" in res.stdout
++    assert "PASS" not in res.stdout
++
++
++def test_leak_probe_control_detects_the_token_without_isolation(tmp_path, origin):
++    """Control for the isolation case below: run unconfined (the stub wrapper),
++    the probe sees the step's GH_TOKEN, so its silence under bwrap means something."""
++    entry = _entry(tmp_path, "ok.yaml", _git(origin, "rev-parse", "HEAD"))
++    res = _gate(tmp_path, origin, [entry], hermes_stub=LEAK_PROBE, extra_env={"GH_TOKEN": SENTINEL})
++    assert res.returncode != 0
++    assert "LEAK" in res.stdout
++
++
++def _bwrap_isolation_unavailable() -> str | None:
++    """Judged by bwrap itself with the wrapper's namespace flags, never by the
++    wrapper: a broken wrapper must fail the case below, not skip it."""
++    import shutil
++    bwrap = shutil.which("bwrap")
++    if not bwrap:
++        return "bubblewrap is not installed"
++    argv = [bwrap, "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
++            "--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev"]
++    for top in ("bin", "lib", "lib64"):
++        host = Path("/") / top
++        if host.is_symlink():
++            argv += ["--symlink", os.readlink(host), f"/{top}"]
++        elif host.is_dir():
++            argv += ["--ro-bind", str(host), f"/{top}"]
++    r = subprocess.run([*argv, "true"], capture_output=True, text=True, timeout=60, check=False)
++    if r.returncode != 0:
++        return f"this kernel refuses unprivileged user/net namespaces: {r.stderr.strip()[-200:]}"
++    return None
++
++
++@pytest.mark.skipif((_why := _bwrap_isolation_unavailable()) is not None, reason=str(_why))
++def test_plugin_code_in_the_real_step_sees_no_token_and_cannot_write(tmp_path, origin):
++    """The real step and the real wrapper: the plugin stand-in finds the token
++    neither in its environment nor in any visible process, cannot write the
++    pinned clone, and its PM-home write is discarded; the entry then passes."""
++    entry = _entry(tmp_path, "ok.yaml", _git(origin, "rev-parse", "HEAD"))
++    res = _gate(tmp_path, origin, [entry], hermes_stub=LEAK_PROBE, sandbox="real",
++                extra_env={"GH_TOKEN": SENTINEL})
++    out = res.stdout + res.stderr
++    assert res.returncode == 0, out
++    assert "probe clean" in out
++    assert f"PASS: {_rel(tmp_path, entry)}" in res.stdout
++    assert not (tmp_path / "pmhome" / "poisoned-by-plugin").exists()
+diff --git a/tests/ci/test_plugin_validation_sandbox.py b/tests/ci/test_plugin_validation_sandbox.py
+new file mode 100644
+index 00000000000..b12b74e8bf6
+--- /dev/null
++++ b/tests/ci/test_plugin_validation_sandbox.py
+@@ -0,0 +1,629 @@
++"""Behavior of scripts/ci/plugin_validation_sandbox.py, the boundary that keeps the
++catalog job's GH_TOKEN (and every other host credential) away from plugin code that
++``hermes plugins validate --install-deps`` runs.
++
++Every case executes the real wrapper. The isolation cases need a host where an
++unprivileged process can create user namespaces (``bwrap --unshare-user
++--unshare-net``). Every Linux CI lane of the fork runs on the runner AMI
++(hosts/hermes-ci-runners/packer/provision.sh), which ships bwrap with the AppArmor
++restriction lifted, so under GitHub Actions on Linux they must run: a runner that
++cannot isolate fails them instead of skipping. Elsewhere (a developer's Ubuntu
++24.04 with the restriction on) they skip with the kernel's reason. The fail-closed
++and refusal cases need no bwrap and run everywhere.
++
++``PLUGIN_SANDBOX_E2E=1`` additionally drives the real ``hermes plugins validate
++--install-deps`` through the wrapper against a PM home prepared by setup-pm
++(``HERMES_HOME``/``VIRTUAL_ENV``/``PYTHONPATH`` as the catalog job exports them).
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++import shutil
++import socket
++import subprocess
++import sys
++import tempfile
++import textwrap
++import time
++from pathlib import Path
++
++import pytest
++
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.platforms("linux")
++
++ROOT = Path(__file__).resolve().parents[2]
++SCRIPT = ROOT / "scripts" / "ci" / "plugin_validation_sandbox.py"
++SENTINEL = "ghs_PLUGIN_SANDBOX_SENTINEL"
++
++
++def _load():
++    spec = importlib.util.spec_from_file_location("plugin_validation_sandbox", SCRIPT)
++    assert spec is not None and spec.loader is not None
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++sandbox = _load()
++
++
++def run(*args: str, env: dict | None = None, timeout: int = 120, **kw) -> subprocess.CompletedProcess:
++    full_env = {**os.environ, **(env or {})}
++    return subprocess.run([sys.executable, "-I", str(SCRIPT), *args], env=full_env, timeout=timeout,
++                          capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False, **kw)
++
++
++def _isolation_unavailable() -> str | None:
++    """Why this host cannot run the isolation cases, judged by bwrap ITSELF with the
++    wrapper's namespace flags, never by the wrapper: a broken wrapper must fail these
++    tests, not skip them."""
++    if sys.platform != "linux":
++        return "Linux only"
++    bwrap = shutil.which("bwrap")
++    if not bwrap:
++        return "bubblewrap is not installed"
++    argv = [bwrap, "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
++            "--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev"]
++    for top in ("bin", "lib", "lib64"):
++        host = Path("/") / top
++        if host.is_symlink():
++            argv += ["--symlink", os.readlink(host), f"/{top}"]
++        elif host.is_dir():
++            argv += ["--ro-bind", str(host), f"/{top}"]
++    r = subprocess.run([*argv, "true"], capture_output=True, text=True, timeout=60, check=False)
++    if r.returncode != 0:
++        return f"this kernel refuses unprivileged user/net namespaces: {r.stderr.strip()[-200:]}"
++    return None
++
++
++ISOLATION_SKIP = _isolation_unavailable()
++# CI (scripts/run_tests.sh forwards GITHUB_ACTIONS) never turns a missing sandbox
++# into a green skip: the isolation cases run and fail on their own evidence.
++REQUIRE_ISOLATION = sys.platform == "linux" and os.environ.get("GITHUB_ACTIONS") == "true"
++needs_isolation = pytest.mark.skipif(ISOLATION_SKIP is not None and not REQUIRE_ISOLATION,
++                                     reason=str(ISOLATION_SKIP))
++
++
++@pytest.mark.skipif(not REQUIRE_ISOLATION, reason="only CI (GITHUB_ACTIONS on Linux) must provide isolation")
++def test_ci_linux_runners_can_isolate():
++    """The one-line reason a CI runner fails the isolation cases below."""
++    assert ISOLATION_SKIP is None, f"this CI runner cannot run the plugin sandbox: {ISOLATION_SKIP}"
++
++
++@pytest.fixture
++def work(tmp_path):
++    """A scratch dir the wrapper may expose. tmp_path can sit inside a refused tree
++    (a developer's ~/.hermes scratch), so fall back to /var/tmp there."""
++    try:
++        sandbox.check_bind_path(str(tmp_path), dict(os.environ))
++        yield tmp_path
++        return
++    except sandbox.SetupError:
++        pass
++    path = Path(tempfile.mkdtemp(prefix="sandbox-test-", dir="/var/tmp"))
++    try:
++        yield path
++    finally:
++        shutil.rmtree(path, ignore_errors=True)
++
++
++def _py(code: str) -> list[str]:
++    # The base interpreter (not a venv shim), isolated: only the stdlib is needed.
++    return [os.path.realpath(sys.executable), "-I", "-c", textwrap.dedent(code)]
++
++
++def _python_mounts() -> list[str]:
++    """--ro mounts that make this interpreter usable inside the sandbox."""
++    prefix = Path(os.path.realpath(sys.base_prefix))
++    return [] if prefix.parts[1:2] == ("usr",) else ["--ro", str(prefix)]
++
++
++def _public_https_reachable() -> bool:
++    try:
++        socket.create_connection(("pypi.org", 443), timeout=5).close()
++        return True
++    except OSError:
++        return False
++
++
++# ─── fail closed (no bwrap needed) ──────────────────────────────────────────────
++
++def test_broken_bwrap_never_runs_the_command(work):
++    marker = work / "ran"
++    r = run("--bwrap", "/bin/false", "--", "sh", "-c", f"touch {marker}")
++    assert r.returncode != 0
++    assert not marker.exists()
++
++
++def test_missing_bwrap_is_a_setup_failure(work):
++    marker = work / "ran"
++    r = run("--bwrap", "", "--", "sh", "-c", f"touch {marker}", env={"PATH": str(work)})
++    assert r.returncode == sandbox.EXIT_SETUP, r.stderr
++    assert "bwrap" in r.stderr
++    assert not marker.exists()
++
++
++def test_a_bwrap_that_skips_the_namespaces_is_caught_by_the_inner_self_check(work):
++    """A bwrap that 'succeeds' without isolating (wrong build, a shim) must not run
++    the command: the in-sandbox init compares its namespaces with the host's."""
++    marker = work / "ran"
++    fake = work / "fake-bwrap"
++    fake.write_text(textwrap.dedent(f"""\
++        #!{sys.executable}
++        import os, sys
++        argv = sys.argv[1:]
++        rest = argv[argv.index("--") + 1:]
++        rest = [{str(SCRIPT)!r} if a == {sandbox.INNER_SCRIPT!r} else a for a in rest]
++        os.execv(rest[0], rest)
++        """))
++    fake.chmod(0o755)
++    r = run("--bwrap", str(fake), "--no-network", "--", "sh", "-c", f"touch {marker}",
++            env={"GH_TOKEN": SENTINEL})
++    assert r.returncode == sandbox.EXIT_SELFCHECK, (r.returncode, r.stderr)
++    assert "namespace is shared with the host" in r.stderr
++    assert not marker.exists()
++
++
++@pytest.mark.parametrize("name", ["GH_TOKEN", "GITHUB_TOKEN", "ACTIONS_RUNTIME_TOKEN", "AWS_SECRET_ACCESS_KEY",
++                                  "SSH_AUTH_SOCK", "RUNNER_TEMP", "NPM_TOKEN", "HTTPS_PROXY"])
++def test_credential_env_names_are_refused_even_when_requested(work, name):
++    marker = work / "ran"
++    r = run("--env", name, "--", "sh", "-c", f"touch {marker}", env={name: SENTINEL})
++    assert r.returncode == sandbox.EXIT_SETUP
++    assert f"refusing to forward env {name}" in r.stderr
++    assert not marker.exists()
++
++
++def test_home_and_top_level_dirs_are_refused(work):
++    for path in (os.path.expanduser("~"), "/", "/home", "/usr"):
++        r = run("--ro", path, "--", "true")
++        assert r.returncode == sandbox.EXIT_SETUP, path
++        assert "refusing to expose" in r.stderr, (path, r.stderr)
++
++
++def test_runner_file_commands_and_credential_stores_are_refused(work):
++    temp = work / "_temp"
++    cmds = temp / "_runner_file_commands"
++    cmds.mkdir(parents=True)
++    (cmds / "set_env_x").write_text("")
++    (temp / "setup-pm").mkdir()
++    env = {"GITHUB_ENV": str(cmds / "set_env_x")}
++    r = run("--overlay", str(temp), "--", "true", env=env)
++    assert r.returncode == sandbox.EXIT_SETUP and "contains" in r.stderr, r.stderr
++    # A sibling of the file-command dir is fine as far as this rule goes.
++    sandbox.check_bind_path(str(temp / "setup-pm"), {**os.environ, **env})
++
++    home = work / "home"
++    (home / ".ssh" / "keys").mkdir(parents=True)
++    r = run("--ro", str(home / ".ssh" / "keys"), "--", "true", env={"HOME": str(home)})
++    assert r.returncode == sandbox.EXIT_SETUP and "inside" in r.stderr, r.stderr
++
++
++def test_a_checkout_with_persisted_git_credentials_is_refused(work):
++    repo = work / "checkout"
++    (repo / ".git").mkdir(parents=True)
++    (repo / ".git" / "config").write_text(
++        '[http "https://github.com/"]\n\textraheader = AUTHORIZATION: basic eC1hY2Nlc3M=\n')
++    r = run("--ro", str(repo), "--", "true")
++    assert r.returncode == sandbox.EXIT_SETUP
++    assert ".git/config carries credentials" in r.stderr
++
++
++def _interpreters() -> list[str]:
++    """This interpreter, plus the system one a runner's bare `python3 -I` may be
++    (Ubuntu 24.04: 3.12, whose Path.is_dir raises PermissionError where 3.14 says False)."""
++    out = [os.path.realpath(sys.executable)]
++    system = "/usr/bin/python3"
++    if os.access(system, os.X_OK) and os.path.realpath(system) not in out:
++        out.append(os.path.realpath(system))
++    return out
++
++
++@pytest.mark.parametrize("python", _interpreters())
++def test_unstatable_secret_paths_do_not_crash_the_path_policy(work, python):
++    """A non-root runner cannot stat inside /root (or another unreadable home): the
++    policy must still decide (bwrap is reached here), never die with a traceback,
++    and a .git/config it cannot read is refused rather than trusted."""
++    locked_home = work / "locked-home"
++    (locked_home / ".ssh").mkdir(parents=True)
++    exposed = work / "exposed"
++    exposed.mkdir()
++    unreadable = work / "unreadable-checkout"
++    (unreadable / ".git").mkdir(parents=True)
++    (unreadable / ".git" / "config").write_text("[core]\n")
++    (unreadable / ".git" / "config").chmod(0)
++    locked_home.chmod(0)
++    try:
++        env = {**os.environ, "HOME": str(locked_home)}
++        r = subprocess.run([python, "-I", str(SCRIPT), "--bwrap", "/bin/false", "--no-network",
++                            "--ro", str(exposed), "--", "true"], env=env, timeout=120,
++                           capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False)
++        assert "Traceback" not in r.stderr, r.stderr
++        assert r.returncode == 1, (r.returncode, r.stderr)   # /bin/false as bwrap: the policy passed
++        r = subprocess.run([python, "-I", str(SCRIPT), "--bwrap", "/bin/false", "--no-network",
++                            "--ro", str(unreadable), "--", "true"], env=env, timeout=120,
++                           capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False)
++        assert "Traceback" not in r.stderr, r.stderr
++        if os.getuid() != 0:  # root reads a mode-000 file
++            assert r.returncode == sandbox.EXIT_SETUP, (r.returncode, r.stderr)
++            assert "cannot vet its .git/config" in r.stderr
++    finally:
++        locked_home.chmod(0o700)
++        (unreadable / ".git" / "config").chmod(0o600)
++
++
++# ─── egress policy (no bwrap needed) ────────────────────────────────────────────
++
++@pytest.mark.parametrize("host,port,reason", [
++    ("169.254.169.254", 443, "non-public"),   # EC2/GCP/Azure metadata
++    ("127.0.0.1", 443, "non-public"),
++    ("localhost", 443, "non-public"),
++    ("10.0.0.5", 443, "non-public"),
++    ("100." "64.1.1", 443, "non-public"),        # CGNAT / Tailscale
++    ("[::1]", 443, "non-public"),
++    ("[::ffff:169.254.169.254]", 443, "non-public"),
++    ("[fd00:ec2::254]", 443, "non-public"),   # EC2 metadata over IPv6
++    # IPv6 spellings of an internal IPv4 that `ipaddress` calls global: NAT64 (a VPC
++    # with DNS64 routes 64:ff9b::/96 to a NAT gateway that dials the IPv4 inside the
++    # VPC) and IPv4-compatible.
++    ("[64:ff9b::a9fe:a9fe]", 443, "non-public"),
++    ("[64:ff9b::a00:5]", 443, "non-public"),
++    ("[::a9fe:a9fe]", 443, "non-public"),
++    ("2852039166", 443, "non-public"),         # 169.254.169.254 as one decimal number
++    ("0x7f.1", 443, "non-public"),             # 127.0.0.1 in inet_aton shorthand
++    ("pypi.org", 22, "port 22 not allowed"),
++    ("bad host", 443, "malformed"),
++])
++def test_egress_policy_denies_internal_targets_and_other_ports(host, port, reason):
++    verdict = sandbox.EgressPolicy({443}, []).resolve(host, port)
++    assert isinstance(verdict, str) and reason in verdict, verdict
++
++
++def test_nat64_of_a_public_ipv4_stays_allowed():
++    """The embedded-IPv4 rule judges the IPv4, it does not ban NAT64 outright."""
++    verdict = sandbox.EgressPolicy({443}, []).resolve("[64:ff9b::808:808]", 443)  # 8.8.8.8
++    assert verdict == [("64:ff9b::808:808", 443)], verdict
++
++
++def test_a_dial_that_lands_on_this_host_is_refused():
++    """Policy is judged on addresses; a runner whose public address sits on its own
++    interface would still be 'public'. The dial itself is refused when the kernel
++    routed it to a local address (src == dst)."""
++    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    listener.bind(("0.0.0.0", 0))
++    listener.listen(4)
++    port = listener.getsockname()[1]
++    targets = ["127.0.0.1"]
++    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    try:
++        probe.connect(("192.0.2.1", 9))  # no packet: only picks the primary interface address
++        targets.append(probe.getsockname()[0])
++    except OSError:
++        pass
++    finally:
++        probe.close()
++    try:
++        for ip in targets:
++            assert sandbox._dial([(ip, port)]) == f"{ip} is this host", ip
++    finally:
++        listener.close()
++
++
++@pytest.mark.skipif(not _public_https_reachable(), reason="host has no route to pypi.org:443")
++def test_a_dial_to_a_public_host_is_not_mistaken_for_this_host():
++    addresses = sandbox.EgressPolicy({443}, []).resolve("pypi.org", 443)
++    assert isinstance(addresses, list), addresses
++    upstream = sandbox._dial(addresses)
++    assert isinstance(upstream, socket.socket), upstream
++    upstream.close()
++
++
++def test_scratch_removal_survives_dirs_the_sandbox_made_unlistable(work):
++    """The overlay copy is writable by plugin code, which can chmod 000 its dirs; the
++    runner user (not root) must still remove it, or every entry leaves a PM-home copy."""
++    scratch = work / "plugin-sandbox-x"
++    deep = scratch / "copy0" / "home" / "trap" / "deep"
++    deep.mkdir(parents=True)
++    (deep / "f").write_text("x")
++    for d in (deep, deep.parent, deep.parent.parent):
++        d.chmod(0)
++    sandbox.remove_tree(scratch)
++    assert not scratch.exists()
++
++
++def test_egress_host_allowlist_matches_domains_and_subdomains_only():
++    policy = sandbox.EgressPolicy({443}, ["pythonhosted.org", "pypi.org"])
++    assert policy.host_allowed("files.pythonhosted.org")
++    assert policy.host_allowed("pypi.org")
++    assert not policy.host_allowed("evilpypi.org")
++    assert not policy.host_allowed("pypi.org.evil.com")
++    assert policy.resolve("example.com", 443) == "host not allowed"
++
++
++# ─── isolation (needs unprivileged namespaces) ──────────────────────────────────
++
++@needs_isolation
++def test_token_bearing_same_user_process_and_host_files_are_invisible(work):
++    """The job shell holds GH_TOKEN; a plugin running as the same uid must see no
++    process of the host (so no /proc/<pid>/environ, no ptrace/kill target), no
++    unbound host file, and no credential in its own environment."""
++    secret_dir = work / "secret"
++    secret_dir.mkdir()
++    (secret_dir / "token").write_text(SENTINEL)
++    exposed = work / "exposed"
++    exposed.mkdir()
++    sibling = subprocess.Popen(["sleep", "120"], env={**os.environ, "GH_TOKEN": SENTINEL})
++    # A host-side abstract Unix socket (no filesystem path, so no bind can hide it):
++    # only a separate network namespace keeps it out of reach.
++    abstract = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++    abstract_name = f"\0plugin-sandbox-test-{os.getpid()}"
++    abstract.bind(abstract_name)
++    abstract.listen(1)
++    try:
++        probe = f"""
++            import ctypes, glob, json, os, socket
++            def read(p):
++                try:
++                    return open(p, "rb").read()
++                except OSError:
++                    return b""
++            try:
++                os.kill({sibling.pid}, 0); kill = "reachable"
++            except ProcessLookupError:
++                kill = "no such process"
++            except PermissionError:
++                kill = "permission"
++            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            try:
++                s.connect({abstract_name!r}); abstract = "connected"
++            except OSError as exc:
++                abstract = type(exc).__name__
++            libc = ctypes.CDLL(None, use_errno=True)
++            nested_userns = libc.unshare(0x10000000) == 0  # CLONE_NEWUSER: the way back to capabilities
++            print(json.dumps({{
++                "environ_hits": [p for p in glob.glob("/proc/*/environ") if {SENTINEL!r}.encode() in read(p)],
++                "cmdline": sorted(read(p).replace(b"\\0", b" ").decode() for p in glob.glob("/proc/[0-9]*/cmdline")),
++                "own_env": {SENTINEL!r} in json.dumps(dict(os.environ)),
++                "secret_file": os.path.exists({str(secret_dir / "token")!r}),
++                "exposed": os.path.isdir({str(exposed)!r}),
++                "home": os.listdir(os.environ["HOME"]),
++                "kill_sibling": kill,
++                "docker_sock": os.path.exists("/var/run/docker.sock") or os.path.exists("/run/docker.sock"),
++                "abstract_socket": abstract,
++                "nested_userns": nested_userns,
++                "sys": os.path.exists("/sys/fs/cgroup"),
++            }}))
++        """
++        r = run(*_python_mounts(), "--ro", str(exposed), "--no-network", "--", *_py(probe),
++                env={"GH_TOKEN": SENTINEL, "GITHUB_TOKEN": SENTINEL})
++        assert r.returncode == 0, r.stderr
++        seen = json.loads(r.stdout.strip().splitlines()[-1])
++        assert seen["environ_hits"] == []
++        assert not any("sleep 120" in c for c in seen["cmdline"]), seen["cmdline"]
++        assert len(seen["cmdline"]) <= 4, seen["cmdline"]   # bwrap init, the init script, the probe
++        assert seen["own_env"] is False
++        assert seen["secret_file"] is False
++        assert seen["exposed"] is True
++        assert seen["home"] == []
++        assert seen["kill_sibling"] == "no such process"
++        assert seen["docker_sock"] is False
++        assert seen["abstract_socket"] == "ConnectionRefusedError"
++        assert seen["nested_userns"] is False
++        assert seen["sys"] is False
++    finally:
++        abstract.close()
++        sibling.kill()
++        sibling.wait()
++
++
++def _unique_sleep() -> str:
++    """A sleep duration no other process uses, so its cmdline identifies it on the host."""
++    return str(400000 + (os.getpid() * 7919 + time.time_ns()) % 500000)
++
++
++def _alive(duration: str) -> list[str]:
++    out = []
++    for p in Path("/proc").glob("[0-9]*/cmdline"):
++        try:
++            if p.read_bytes() == f"sleep\0{duration}\0".encode():
++                out.append(p.parent.name)
++        except OSError:
++            pass
++    return out
++
++
++@needs_isolation
++def test_background_children_die_with_the_sandbox(work):
++    """A plugin's install hook can fork a daemon that would wait for the token step;
++    it must die when the validated command exits, even one that left the session."""
++    n = _unique_sleep()
++    proc = subprocess.Popen([sys.executable, "-I", str(SCRIPT), "--no-network", "--", "sh", "-c",
++                             f"sleep {n} & (setsid sleep {n} &); sleep 3; exit 0"], stdin=subprocess.DEVNULL)
++    wait_until(lambda: len(_alive(n)) == 2, timeout=20, what="both background children started")
++    assert proc.wait(timeout=60) == 0
++    wait_until(lambda: not _alive(n), timeout=10, what="background children dying with the sandbox")
++
++
++@needs_isolation
++def test_the_jobs_timeout_kills_the_whole_sandbox(work):
++    """The job wraps the call in `timeout 600`: SIGTERM to the wrapper must take
++    every sandboxed process down and remove the scratch dir."""
++    n = _unique_sleep()
++    home = work / "pm-home"
++    home.mkdir()
++    # The command keeps writing into its overlay copy while the wrapper is torn down.
++    proc = subprocess.Popen([sys.executable, "-I", str(SCRIPT), "--no-network", "--overlay", str(home),
++                             "--overlay-mode", "copy", "--", "sh", "-c",
++                             f"sleep {n} & i=0; while :; do i=$((i+1)); mkdir -p {home}/w/$i; done & sleep {n}"],
++                            env={**os.environ, "RUNNER_TEMP": str(work)}, stdin=subprocess.DEVNULL)
++    wait_until(lambda: len(_alive(n)) == 2, timeout=20, what="the sandboxed command starting")
++    proc.send_signal(15)
++    assert proc.wait(timeout=20) == 128 + 15
++    wait_until(lambda: not _alive(n), timeout=10, what="every sandboxed process dying")
++    assert not list(work.glob("plugin-sandbox-*"))
++    assert list(home.iterdir()) == []
++
++
++def _kernel_overlay() -> bool:
++    bwrap = shutil.which("bwrap")
++    return bool(bwrap) and sandbox.overlay_mode(bwrap, "auto") == "kernel"
++
++
++@needs_isolation
++@pytest.mark.parametrize("mode", [
++    "copy",
++    pytest.param("kernel", marks=pytest.mark.skipif(not _kernel_overlay(), reason="bwrap < 0.10 has no --overlay")),
++])
++def test_overlay_writes_are_discarded_and_ro_paths_are_immutable(work, mode):
++    home = work / "pm-home"
++    (home / "bin").mkdir(parents=True)
++    (home / "bin" / "python3").write_text("original")
++    clone = work / "clone"
++    clone.mkdir()
++    (clone / "plugin.yaml").write_text("name: x\n")
++    script = (f"echo poisoned > {home}/bin/python3 && mkdir {home}/new && "
++              f"cat {home}/bin/python3 && "
++              f"if rm {clone}/plugin.yaml 2>/dev/null || touch {clone}/x 2>/dev/null; then echo CLONE_WRITABLE; fi")
++    r = run("--overlay", str(home), "--overlay-mode", mode, "--ro", str(clone), "--no-network", "--", "sh", "-c", script,
++            env={"RUNNER_TEMP": str(work)})
++    assert r.returncode == 0, r.stderr
++    assert "poisoned" in r.stdout          # writable inside
++    assert "CLONE_WRITABLE" not in r.stdout
++    assert (home / "bin" / "python3").read_text() == "original"
++    assert not (home / "new").exists()
++    assert sorted(p.name for p in clone.iterdir()) == ["plugin.yaml"]
++    assert not list(work.glob("plugin-sandbox-*")), "scratch (overlay upper) left behind"
++
++
++@needs_isolation
++def test_no_route_to_host_loopback_or_metadata_and_proxy_refuses_them(work):
++    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    listener.bind(("127.0.0.1", 0))
++    listener.listen(1)
++    port = listener.getsockname()[1]
++    probe = f"""
++        import json, socket
++        def direct(host, port):
++            try:
++                socket.create_connection((host, port), timeout=3).close(); return "connected"
++            except OSError as exc:
++                return type(exc).__name__
++        def via_proxy(line):
++            s = socket.create_connection(("127.0.0.1", 3128), timeout=10)
++            s.sendall(line.encode() + b"\\r\\n\\r\\n")
++            return s.recv(64).split(b"\\r\\n")[0].decode()
++        print(json.dumps({{
++            "direct_host_listener": direct("127.0.0.1", {port}),
++            "direct_metadata": direct("169.254.169.254", 80),
++            "proxy_host_listener": via_proxy("CONNECT 127.0.0.1:{port} HTTP/1.1"),
++            "proxy_metadata": via_proxy("CONNECT 169.254.169.254:443 HTTP/1.1"),
++            "proxy_localhost": via_proxy("CONNECT localhost:443 HTTP/1.1"),
++            "proxy_plain_http": via_proxy("GET http://169.254.169.254/latest/meta-data/ HTTP/1.1"),
++            "proxy_other_port": via_proxy("CONNECT example.com:22 HTTP/1.1"),
++        }}))
++    """
++    try:
++        r = run(*_python_mounts(), "--", *_py(probe))
++    finally:
++        listener.close()
++    assert r.returncode == 0, r.stderr
++    seen = json.loads(r.stdout.strip().splitlines()[-1])
++    assert seen["direct_host_listener"] == "ConnectionRefusedError"   # the sandbox's own empty loopback
++    assert seen["direct_metadata"] in ("OSError", "TimeoutError")  # ENETUNREACH: no route at all
++    assert seen["proxy_host_listener"].startswith("HTTP/1.1 403")
++    assert seen["proxy_metadata"].startswith("HTTP/1.1 403")
++    assert seen["proxy_localhost"].startswith("HTTP/1.1 403")
++    assert seen["proxy_plain_http"].startswith("HTTP/1.1 405")
++    assert seen["proxy_other_port"].startswith("HTTP/1.1 403")
++    assert "denied CONNECT 169.254.169.254:443" in r.stderr
++
++
++@needs_isolation
++@pytest.mark.skipif(not _public_https_reachable(), reason="host has no route to pypi.org:443")
++def test_dependency_downloads_reach_public_https_through_the_proxy(work):
++    probe = """
++        import urllib.request
++        with urllib.request.urlopen("https://pypi.org/simple/six/", timeout=30) as resp:
++            print(resp.status, b"six-1.16.0" in resp.read())
++    """
++    r = run(*_python_mounts(), "--", *_py(probe))
++    assert r.returncode == 0, r.stderr
++    assert r.stdout.split() == ["200", "True"], r.stdout
++
++    # The same fetch with the proxy's host allowlist excluding pypi fails closed.
++    r = run(*_python_mounts(), "--allow-host", "example.com", "--", *_py(probe))
++    assert r.returncode != 0
++    assert "denied CONNECT pypi.org:443 (host not allowed)" in r.stderr
++
++
++# ─── the real validator through the wrapper (opt-in, needs a setup-pm home) ─────
++
++def _tree_manifest(root: Path) -> list[tuple[str, str, int, int, int]]:
++    """(path, kind, size, mtime_ns, mode) for every entry: any write shows up."""
++    out = []
++    for dirpath, dirnames, filenames in os.walk(root):
++        for name in [*dirnames, *filenames]:
++            p = Path(dirpath) / name
++            st = p.lstat()
++            kind = "l" if p.is_symlink() else "d" if p.is_dir() else "f"
++            out.append((str(p.relative_to(root)), kind, st.st_size, st.st_mtime_ns, st.st_mode))
++    return sorted(out)
++
++
++@needs_isolation
++@pytest.mark.skipif(os.environ.get("PLUGIN_SANDBOX_E2E") != "1",
++                    reason="set PLUGIN_SANDBOX_E2E=1 in a setup-pm prepared shell")
++def test_hermes_plugins_validate_install_deps_runs_isolated(work):
++    """The catalog job's exact command: a plugin that fails import on any sign of the
++    token must pass inside the wrapper, fail outside it (the control), install its
++    declared dependency over the proxy, and leave the PM home unchanged."""
++    hermes_home = Path(os.environ["HERMES_HOME"])
++    checkout = Path(os.environ.get("PYTHONPATH") or ROOT)  # the tree `hermes` runs from
++    plugin = work / "leakprobe"
++    plugin.mkdir()
++    (plugin / "plugin.yaml").write_text(
++        "name: leakprobe\nversion: 0.1.0\ndescription: probe\npython_dependencies:\n  - cowsay==6.1\n")
++    (plugin / "__init__.py").write_text(textwrap.dedent(f"""\
++        import glob, os
++        import cowsay  # installed by --install-deps; absent from the base environment
++        def _read(p):
++            try:
++                return open(p, "rb").read()
++            except OSError:
++                return b""
++        hits = [p for p in glob.glob("/proc/*/environ") if {SENTINEL!r}.encode() in _read(p)]
++        if hits or {SENTINEL!r} in str(os.environ):
++            raise RuntimeError("LEAK " + repr(hits))
++        def register(ctx):
++            pass
++        """))
++    env = {"GH_TOKEN": SENTINEL}
++    names = ["PATH", "HERMES_HOME", "HERMES_RUNTIME_DIR", "HERMES_PYTHON", "VIRTUAL_ENV", "PYTHONPATH", "PYTHONUTF8"]
++    before = _tree_manifest(hermes_home)
++    assert not [p for p in before if "cowsay" in p[0]]
++    r = run("--ro", str(checkout), "--ro", str(plugin), "--overlay", str(hermes_home),
++            *[a for n in names for a in ("--env", n)], "--chdir", str(checkout),
++            "--", "hermes", "plugins", "validate", "--install-deps", str(plugin), env=env, timeout=600)
++    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
++    assert "capability probe — register() ran in isolation" in r.stdout
++    # The install (and every log/state write `hermes` made) stayed in the throwaway view.
++    assert _tree_manifest(hermes_home) == before
++
++    # Control: the same leak check without the sandbox must trip, or the pass above
++    # proves nothing. It runs unsandboxed, so it does write Hermes state (logs) into
++    # HERMES_HOME; it has no dependency, so it installs nothing there.
++    control_plugin = work / "leakprobe-control"
++    shutil.copytree(plugin, control_plugin)
++    init = control_plugin / "__init__.py"
++    init.write_text(init.read_text().replace("import cowsay", "pass  #"))
++    (control_plugin / "plugin.yaml").write_text("name: leakprobe\nversion: 0.1.0\ndescription: probe\n")
++    control = subprocess.run(["hermes", "plugins", "validate", str(control_plugin)], cwd=checkout,
++                             env={**os.environ, **env}, capture_output=True, text=True, timeout=600,
++                             stdin=subprocess.DEVNULL, check=False)
++    assert control.returncode != 0
++    assert "LEAK" in control.stdout + control.stderr
+-- 
+2.55.0
+

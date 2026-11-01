@@ -1,0 +1,123 @@
+From 548d136b7000fcc07c25e9135085a8386eb903ec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 16:59:31 +0000
+Subject: [PATCH] fix(ci): never re-stage or land superseded sync resolutions
+ [daveey]
+
+---
+ scripts/ci/upstream_sync.py                   | 13 +++++++
+ scripts/ci/upstream_sync_superseded.py        |  5 ++-
+ .../ci/test_upstream_sync_superseded.py       | 39 +++++++++++++++++++
+ 3 files changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/ci/upstream_sync.py b/scripts/ci/upstream_sync.py
+index d083d8244da..cb9e412c45a 100644
+--- a/scripts/ci/upstream_sync.py
++++ b/scripts/ci/upstream_sync.py
+@@ -177,6 +177,13 @@ def _fetch_main(repo) -> str:
+     return git(repo, "rev-parse", "refs/remotes/origin/main")
+ 
+ 
++def _parents_on_main(repo, head, main) -> bool:
++    """A merge whose parents already landed is superseded, even with unique resolution content."""
++    result = _run(repo, "rev-list", "--parents", "-n1", head)
++    parents = result.stdout.split()[1:]
++    return result.returncode == 0 and len(parents) >= 2 and all(_is_ancestor(repo, p, main) for p in parents)
++
++
+ def _adds_nothing(repo, head, main) -> bool:
+     """Merging ``head`` into ``main`` changes no file (a twin of a sync that already landed)."""
+     tree = _run(repo, "merge-tree", "--write-tree", "--no-messages", main, head)
+@@ -258,6 +265,9 @@ def required_check(gh_repo, sha, request) -> tuple[str, str]:
+ def land(repo, cand: Candidate, *, gh_repo: str, request=github_pages, gh=gh_cli) -> int:
+     """Put the tested head on main through its PR, merged once the required check is green on exactly it."""
+     main = _fetch_main(repo)
++    if _parents_on_main(repo, cand.head, main):
++        print(f"LANDED: sync {cand.head[:10]} is superseded; main {main} contains every parent")
++        return LANDED
+     if _is_ancestor(repo, cand.head, main):
+         return LANDED
+     if not _is_ancestor(repo, main, cand.head):
+@@ -377,6 +387,9 @@ def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now) ->
+         if head is None:
+             return LANDED if landed_other else NOT_YET
+         main = _fetch_main(repo)
++        if _parents_on_main(repo, head, main):
++            print(f"LANDED: sync {head[:10]} is superseded; main {main} contains every parent")
++            return LANDED
+         if _is_ancestor(repo, head, main) or _adds_nothing(repo, head, main):
+             print(f"LANDED: main already has everything {head[:10]} brings")
+             return LANDED
+diff --git a/scripts/ci/upstream_sync_superseded.py b/scripts/ci/upstream_sync_superseded.py
+index 8a5ada331f9..86df3362a70 100644
+--- a/scripts/ci/upstream_sync_superseded.py
++++ b/scripts/ci/upstream_sync_superseded.py
+@@ -1,7 +1,8 @@
+ """Close open sync PRs that a landed sync made redundant (scripts/ci/upstream_sync.py housekeeping).
+ 
+ An open PR main <- sync/upstream-<X> from this repo is superseded once a freshly fetched origin/main
+-contains every parent of X (X is a merge): landing X would bring nothing main lacks. Such a PR is
++contains every parent of X (X is a merge). This is the gate's supersession policy, not tree equality.
++Such a PR is
+ commented (naming the main sha that holds the parents), closed, and its branch deleted only if it
+ still points at X. Anything else (forks, other branches, single-parent heads, a parent main lacks,
+ a moved branch) stays open. Every fault is printed and skipped: this never changes the gate's verdict.
+@@ -49,7 +50,7 @@ def _kept_because(repo, pr, gh_repo, main, run, prefix) -> tuple[str, list[str]]
+ def _close(repo, pr, parents, gh_repo, main, gh, run, env) -> bool:
+     number, sha, ref = str(pr["number"]), pr["head"]["sha"], pr["head"]["ref"]
+     body = (f"Superseded: main {main} already contains every parent of this sync's head {sha} "
+-            f"({', '.join(parents)}), so landing it would bring nothing new. Closed by scripts/ci/upstream_sync.py.")
++            f"({', '.join(parents)}). Closed by scripts/ci/upstream_sync.py under the all-parent supersession policy.")
+     for verb, extra in (("comment", ("--body", body)), ("close", ())):
+         done = gh("pr", verb, number, "-R", gh_repo, *extra, reason=f"upstream sync gate: {verb} a superseded sync PR")
+         if done.returncode:
+diff --git a/tests/scripts/ci/test_upstream_sync_superseded.py b/tests/scripts/ci/test_upstream_sync_superseded.py
+index 6c2e8f60a53..ab87115e4f8 100644
+--- a/tests/scripts/ci/test_upstream_sync_superseded.py
++++ b/tests/scripts/ci/test_upstream_sync_superseded.py
+@@ -159,3 +159,42 @@ def test_github_failures_are_logged_and_the_gate_continues(world, capsys):
+     assert first["state"] == second["state"] == "closed"
+     assert branch(root, first["head"]["ref"]) == branch(root, second["head"]["ref"]) == moved_to
+     assert "branch kept" in out
++
++
++def test_superseded_resolution_is_not_reopened_or_landed(world):
++    root, checkout, main0, up, actions = landed_elsewhere(world)
++    candidate = other_merge(root, main0, up, "different resolution")
++    clone = host(root)
++    git(clone, "checkout", "-q", "--detach", candidate)
++    (clone / "resolution.txt").write_text("unique resolution\n")
++    git(clone, "add", "resolution.txt")
++    git(clone, "commit", "-q", "--amend", "--no-edit")
++    candidate = git(clone, "rev-parse", "HEAD")
++    pr = open_pr(root, actions, candidate)
++    git(checkout, "fetch", "-q", "origin", pr["head"]["ref"])
++    before = main_of(root)
++    assert not sync._adds_nothing(checkout, candidate, before)
++    actions.ci()
++    assert actions.runs[0]["conclusion"] == "success"
++    actions.aggregate = None
++    for head in (None, None, candidate):
++        assert gate(checkout, head, actions) == sync.LANDED
++        assert_closed(root, pr)
++        assert len(actions.pulls) == 1 and main_of(root) == before
++    actions.aggregate = ("completed", "success")
++    assert gate(checkout, None, actions) == sync.LANDED
++    assert len(actions.pulls) == 1 and main_of(root) == before
++    actions.runs.clear()  # explicit --head with no recorded CI must not re-stage either
++    assert gate(checkout, candidate, actions) == sync.LANDED
++    assert not staged(root, candidate)
++
++
++def test_missing_fork_parent_keeps_sync_open(world):
++    root, checkout, main0, up, actions = landed_elsewhere(world)
++    clone = host(root)
++    git(clone, "checkout", "-q", "--detach", main0)
++    fork = commit(clone, {"fork-only.txt": "not on main\n"}, "unlanded fork work")
++    candidate = other_merge(root, fork, up, "sync with unlanded fork parent")
++    pr = open_pr(root, actions, candidate)
++    assert gate(checkout, None, actions) == sync.NOT_YET
++    assert pr["state"] == "open" and pr["comments"] == [] and staged(root, candidate)
+-- 
+2.55.0
+

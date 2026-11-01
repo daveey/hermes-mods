@@ -1,0 +1,908 @@
+From 7737f2331c81405bacee8b33c51329b245780299 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:25:24 +0000
+Subject: [PATCH] fix(ci): retain one nightly red owner per alert intent
+ [daveey]
+
+---
+ scripts/ci/nightly_e2e.py                     | 248 ++++++++++---
+ scripts/ci/upstream_sync_diagnostics.py       |  50 ++-
+ tests/ci/test_nightly_e2e.py                  |  16 +-
+ tests/ci/test_nightly_e2e_red_cards.py        | 326 ++++++++++++++++++
+ .../ci/test_upstream_sync_diagnostics.py      |  86 +++++
+ 5 files changed, 660 insertions(+), 66 deletions(-)
+ create mode 100644 tests/ci/test_nightly_e2e_red_cards.py
+
+diff --git a/scripts/ci/nightly_e2e.py b/scripts/ci/nightly_e2e.py
+index 6069b990c49..c14928a99eb 100644
+--- a/scripts/ci/nightly_e2e.py
++++ b/scripts/ci/nightly_e2e.py
+@@ -10,8 +10,10 @@ hermes-hub from two Hermes cron jobs (never from a laptop, never a GitHub ``sche
+ 
+ Reporting (``report``), always within ``DEADLINE_HOURS`` of the dispatch:
+ 
+-* failed      -> ONE Kanban card per distinct set of failing test ids (sha1 of the sorted ids). A later failing run
+-                 with the same ids comments on that open card instead of filing another. Body: run link + tests.
++* failed      -> ONE open red card per alert scope (below). A later failing run of that scope comments on it with
++                 the run link and the newly failing / no longer failing / still failing test IDs against the last
++                 run it reported, whatever the overlap (subset, superset, disjoint). Once that card is done or
++                 archived, the next red run files the next generation. Body: run link + tests.
+ * not finished in time / cancelled / never started -> ONE "did not run" card, later occurrences comment on it.
+ * green while a card of ours is open -> comment the green run on every open one.
+ * GitHub (or the board) keeps erroring -> retried every tick; past the deadline the run gets the "did not run" card
+@@ -22,9 +24,12 @@ Alert intent: titles name the tested ref ("RED on <ref>"). Cards of a non-main r
+ ``--acceptance-marker LABEL --acceptance-owner-task t_...`` (dispatch, or report to label already-pending runs),
+ say "acceptance fixture; do not repair main" / "not a current main incident" and request no repair; the owner is
+ recorded as creator_task_id so the owner's cleanup can archive them. Each intent (main, ref, acceptance marker)
+-keeps its own cards: production main alerts are unchanged (default assignee, "Fix main" instruction). Dedupe is the
+-exact sorted failing-test-ID set within an intent; a subset or superset is a different fingerprint and a new card by
+-design, not a dedupe defect.
++keeps its own cards: production main alerts are unchanged (default assignee, "Fix main" instruction).
++
++The fingerprint version filed a card per exact failing set, so one incident whose failures shifted kept opening new
++red cards. Its state (``failed-<sha1>`` records, no IDs) migrates on the next red run of each scope: an open legacy
++card is reused (other open ones of the scope get one "superseded" comment), its baseline is the fingerprint's set if
++the run hashes to it or the body's test list if that hashes to it, else it is reported as unknown.
+ 
+ Both commands hold an exclusive flock on ``<state>.lock`` from loading the state to saving it, so the 02:00 dispatch
+ and a report tick that overlap cannot overwrite each other's ``pending`` (hub-only, so fcntl is enough).
+@@ -53,7 +58,7 @@ from pathlib import Path
+ from typing import Any, Iterator, Protocol
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+-from flaky_kanban import OPEN, CliBoard, CreateRefused
++from flaky_kanban import CliBoard, CreateRefused
+ 
+ REPO = "daveey/hermes"
+ WORKFLOW = "nightly-e2e.yml"
+@@ -318,8 +323,7 @@ def scope_of(entry: dict[str, Any]) -> str:
+     """Alert intent: ``main`` (production), ``ref:<ref>`` (a historical/other ref) or ``acceptance:<marker>``.
+ 
+     Only production ``main`` cards are repair work. Each scope has its own cards, so a fixture or historical-ref
+-    run never comments on, or is deduped into, a production card. Within a scope the dedupe is unchanged: the
+-    sorted failing-test-ID set. A subset/superset of those IDs is a different fingerprint and files a new card.
++    run never comments on, or is deduped into, a production card. Within a scope there is one open red card.
+     """
+     if entry.get("acceptance_marker"):
+         return f"acceptance:{entry['acceptance_marker']}"
+@@ -380,9 +384,10 @@ def _card_body_main(
+         return (
+             f"The nightly e2e (the same `e2e` job the upstream-sync gate runs) is RED at `{entry['ref']}`.\n\n"
+             f"Run: {url}\n{head}\n\n{summary}\n\nFailing tests ({len(ids)}):\n{tests}\n\n"
+-            f"{action}Later failing nightlies of the same scope with these exact tests are added to this card as "
+-            "comments (a different set of failing tests, even a subset, is a separate fingerprint and card by "
+-            "design); a green run is commented here too. Filed by scripts/ci/nightly_e2e.py on hermes-hub."
++            f"{action}Later failing nightlies of the same scope are added to this card as comments listing newly "
++            "failing, no longer failing and still failing tests (one open red card per scope; a red run after this "
++            "card is done or archived files a new one); a green run is commented here too. "
++            "Filed by scripts/ci/nightly_e2e.py on hermes-hub."
+         )
+     if not production:
+         return (
+@@ -397,6 +402,36 @@ def _card_body_main(
+     )
+ 
+ 
++def _is_open(board: Any, card_id: str) -> bool:
++    status = board.status(card_id)
++    if status is None:
++        raise RuntimeError(f"nightly card {card_id} status is unreadable; refusing to replace its owner")
++    return status not in {"done", "archived"}
++
++
++def _create(
++    board: Any, entry: dict[str, Any], key: str, n: int, title: str, body: str, reason: str
++) -> str:
++    owner = entry.get("acceptance_owner")
++    extra = {"creator_task_id": owner} if owner else {}
++    try:
++        return board.create(title, body, f"nightly-e2e:{key}:{n}", **extra)
++    except CreateRefused as refused:
++        return board.create(
++            title,
++            body,
++            f"nightly-e2e:{key}:{n}",
++            distinct_from=[str(m.get("id")) for m in refused.matches if m.get("id")],
++            distinct_reason=reason,
++            **extra,
++        )
++
++
++def _noted(entry: dict[str, Any], text: str) -> str:
++    note = _scope_note(entry)
++    return f"{note}\n{text}" if note else text
++
++
+ def _file_or_update(
+     board: Any,
+     state: dict[str, Any],
+@@ -408,31 +443,161 @@ def _file_or_update(
+ ) -> str:
+     """Comment on this scope+key's open card, else file a new one. Returns what happened, with the card id."""
+     key = _scoped_key(entry, key)
+-    note = _scope_note(entry)
+-    if note:
+-        comment = f"{note}\n{comment}"
+-    owner = entry.get("acceptance_owner")
+-    extra = {"creator_task_id": owner} if owner else {}
+     rec = state["cards"].get(key)
+-    if rec and board.status(rec["id"]) in OPEN:
+-        board.comment(rec["id"], comment)
++    if rec and _is_open(board, rec["id"]):
++        board.comment(rec["id"], _noted(entry, comment))
+         return f"updated {rec['id']} ({key})"
+     n = (rec or {}).get("n", 0) + 1
+-    try:
+-        card_id = board.create(title, body, f"nightly-e2e:{key}:{n}", **extra)
+-    except CreateRefused as refused:
+-        card_id = board.create(
+-            title,
+-            body,
+-            f"nightly-e2e:{key}:{n}",
+-            distinct_from=[str(m.get("id")) for m in refused.matches if m.get("id")],
+-            distinct_reason="the nightly e2e finding for this exact set of failing tests",
+-            **extra,
+-        )
++    card_id = _create(board, entry, key, n, title, body, "the nightly e2e finding for this alert scope")
+     state["cards"][key] = {"id": card_id, "n": n, "scope": scope_of(entry)}
+     return f"filed {card_id} ({key})"
+ 
+ 
++# --- red cards: one open card per alert scope -------------------------------------------------------------------
++#
++# State record under _scoped_key(entry, RED_KEY): {"id", "n" (generation), "scope", "failing": the failing IDs the
++# card's last comment (or body) reported, None when unknown}. "failing" is written only after that comment lands, so
++# a failed comment is retried next tick against the same baseline. Records the fingerprint version wrote
++# ("failed-<sha1 of the sorted IDs>", one card per exact set, no IDs) are migrated by the next red run of their scope.
++
++RED_KEY = "red"
++LEGACY_RED_KEY = re.compile(r"(?:^|\|)failed-[0-9a-f]{12}$")
++BODY_IDS = re.compile(r"^Failing tests \((\d+)\):\n((?:- `[^`\n]+`(?:\n|$))+)", re.MULTILINE)
++LISTED_ID = re.compile(r"^- `([^`\n]+)`$", re.MULTILINE)
++
++
++def _rec_scope(key: str, rec: dict[str, Any]) -> str:
++    # Records filed before scopes existed carry no "scope" and only ever named main.
++    return rec.get("scope") or (key.rsplit("|", 1)[0] if "|" in key else "main")
++
++
++def _legacy_red(state: dict[str, Any], scope: str) -> list[tuple[str, dict[str, Any]]]:
++    return [
++        (k, r)
++        for k, r in sorted(state["cards"].items())
++        if LEGACY_RED_KEY.search(k) and _rec_scope(k, r) == scope
++    ]
++
++
++def _legacy_baseline(board: Any, key: str, rec: dict[str, Any], ids: list[str]) -> list[str] | None:
++    """The failing IDs a legacy card stands for: its fingerprint when the current run hashes to it, else the
++    body's full test list if that list hashes to the fingerprint (a truncated or edited list does not); else None."""
++    fingerprint = key.rsplit("|", 1)[-1]
++    if failure_key(ids) == fingerprint:
++        return sorted(ids)
++    m = BODY_IDS.search((board.card(rec["id"]) or {}).get("body") or "")
++    if m:
++        listed = LISTED_ID.findall(m.group(2))
++        if len(listed) == int(m.group(1)) and failure_key(listed) == fingerprint:
++            return sorted(listed)
++    return None
++
++
++def _id_section(name: str, ids: list[str]) -> str:
++    listed = "\n".join(f"- `{t}`" for t in ids[:MAX_LISTED]) or "- none"
++    if len(ids) > MAX_LISTED:
++        listed += f"\n- … and {len(ids) - MAX_LISTED} more (see the run log)"
++    return f"{name} ({len(ids)}):\n{listed}"
++
++
++def _red_comment(entry: dict[str, Any], before: list[str] | None, ids: list[str], summary: str) -> str:
++    head = f"Nightly e2e is RED again: {entry.get('url')} (`{entry['ref']}` = `{entry['sha']}`).\n{summary}\n\n"
++    if before is None:
++        return _noted(entry, head + (
++            "Baseline unknown: this card was filed before the reporter recorded failing test IDs, and its body "
++            "could not be matched to its fingerprint, so this run cannot be split into newly / no longer / still "
++            "failing. Later runs are compared against this one.\n\n" + _id_section("Failing now", ids)
++        ))
++    now, prev = set(ids), set(before)
++    sections = [
++        _id_section("Newly failing", sorted(now - prev)),
++        _id_section("No longer failing", sorted(prev - now)),
++        _id_section("Still failing", sorted(now & prev)),
++    ]
++    return _noted(entry, head + "\n\n".join(sections))
++
++
++def _adopt_legacy(
++    board: Any, state: dict[str, Any], entry: dict[str, Any], ids: list[str]
++) -> tuple[str, list[str] | None, str] | None:
++    """(card id, baseline, creation key) of the open fingerprint-era card this scope keeps, or None.
++
++    The card whose fingerprint is the current set wins, else the first by key. Every other open one is told where
++    results now go and dropped from state before the update is posted, so a retry never re-posts that notice."""
++    open_legacy = [(k, r) for k, r in _legacy_red(state, scope_of(entry)) if _is_open(board, r["id"])]
++    if not open_legacy:
++        return None
++    fingerprint = failure_key(ids)
++    open_legacy.sort(key=lambda kr: kr[0].rsplit("|", 1)[-1] != fingerprint)  # stable: key order otherwise
++    (key, kept), *duplicates = open_legacy
++    for dup_key, dup in duplicates:
++        board.comment(dup["id"], _noted(entry, (
++            f"Superseded by {kept['id']}: the nightly e2e now keeps one red card per alert scope, and later results "
++            "for this scope are posted there. This duplicate can be closed."
++        )))
++        del state["cards"][dup_key]
++    return kept["id"], _legacy_baseline(board, key, kept, ids), f"nightly-e2e:{key}:{kept['n']}"
++
++
++def _report_red(
++    board: Any, state: dict[str, Any], entry: dict[str, Any], ids: list[str], summary: str
++) -> str:
++    """Comment the scope's open red card with the delta to its last failing set, else file the next generation."""
++    key = _scoped_key(entry, RED_KEY)
++    rec = state["cards"].get(key)
++    if rec and _is_open(board, rec["id"]):
++        target: tuple[str, list[str] | None, str] | None = (
++            rec["id"], rec.get("failing"), rec["idempotency_key"]
++        )
++    else:
++        target = _adopt_legacy(board, state, entry, ids)
++    n = (rec or {}).get("n", 0)
++    if target is None:
++        n += 1
++        card_id = _create(
++            board, entry, key, n, _title(entry, ids, ""), _card_body("failed", entry, ids, summary),
++            "the nightly e2e red card of this alert scope (the previous one is closed)",
++        )
++        done = f"filed {card_id} ({key})"
++        creation_key = f"nightly-e2e:{key}:{n}"
++    else:
++        card_id, before, creation_key = target
++        board.comment(card_id, _red_comment(entry, before, ids, summary))
++        done = f"updated {card_id} ({key})"
++    for legacy_key, _ in _legacy_red(state, scope_of(entry)):  # migrated (or closed): never consulted again
++        del state["cards"][legacy_key]
++    state["cards"][key] = {
++        "id": card_id, "n": n, "scope": scope_of(entry), "failing": sorted(ids),
++        "idempotency_key": creation_key,
++    }
++    return done
++
++
++def _report_green(board: Any, state: dict[str, Any], entry: dict[str, Any]) -> str:
++    """Comment the green run once on every open card of the scope; a red card also hears what stopped failing."""
++    scope, notes = scope_of(entry), []
++    for key, rec in sorted(state["cards"].items()):
++        if (
++            _rec_scope(key, rec) != scope
++            or rec["id"] in notes
++            or rec.get("green_run") == entry.get("run_id")  # already told, before a later card's comment failed
++            or not _is_open(board, rec["id"])
++        ):
++            continue
++        text = (
++            f"Nightly e2e is GREEN: {entry.get('url')} (`{entry['ref']}` = `{entry['sha']}`). "
++            "Close this card if the cause is fixed."
++        )
++        if rec.get("failing"):
++            text += "\n\n" + _id_section("No longer failing", rec["failing"])
++        board.comment(rec["id"], _noted(entry, text))
++        rec["green_run"] = entry.get("run_id")
++        if "failing" in rec:
++            rec["failing"] = []
++        notes.append(rec["id"])
++    return "green" + (f"; commented on {', '.join(notes)}" if notes else "")
++
++
+ def _e2e_job(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+     named = [
+         j
+@@ -496,18 +661,7 @@ def _settle(
+     job = _e2e_job(gh.jobs(entry["run_id"]))
+     job_conclusion = (job or {}).get("conclusion") or conclusion
+     if job_conclusion == "success":
+-        notes = []
+-        note = _scope_note(entry)
+-        for key, rec in sorted(state["cards"].items()):
+-            if rec.get("scope", "main") == scope_of(entry) and board.status(rec["id"]) in OPEN:
+-                board.comment(
+-                    rec["id"],
+-                    (f"{note}\n" if note else "")
+-                    + f"Nightly e2e is GREEN: {url} (`{entry['ref']}` = `{entry['sha']}`). "
+-                    "Close this card if the cause is fixed.",
+-                )
+-                notes.append(rec["id"])
+-        return True, "green" + (f"; commented on {', '.join(notes)}" if notes else "")
++        return True, _report_green(board, state, entry)
+     if job_conclusion == "failure":
+         log = gh.job_log(job["id"]) if job else ""
+         ids = failing_tests(log)
+@@ -517,17 +671,7 @@ def _settle(
+             ids = [
+                 "(no failing test id parsed: the e2e job failed outside pytest, see the run)"
+             ]
+-        key = failure_key(ids)
+-        return True, "failed: " + _file_or_update(
+-            board,
+-            state,
+-            entry,
+-            key,
+-            _title(entry, ids, ""),
+-            _card_body("failed", entry, ids, summary),
+-            f"Nightly e2e failed again with the same {len(ids)} test(s): {url} "
+-            f"(`{entry['ref']}` = `{entry['sha']}`).\n{summary}",
+-        )
++        return True, "failed: " + _report_red(board, state, entry, ids, summary)
+     return True, f"{job_conclusion or conclusion}: " + _file_or_update(
+         board,
+         state,
+diff --git a/scripts/ci/upstream_sync_diagnostics.py b/scripts/ci/upstream_sync_diagnostics.py
+index 01f38843d71..13ae83b73dd 100644
+--- a/scripts/ci/upstream_sync_diagnostics.py
++++ b/scripts/ci/upstream_sync_diagnostics.py
+@@ -16,9 +16,10 @@ A failing id that also failed there is a main-baseline failure: upstream did not
+ failure only when a complete run of that job kind at the base (every job finished, full Python slices, every failed
+ job's ids parsed) did not fail it; that is an observation, not proof that upstream caused it (tests flake). Anything
+ else is "baseline comparison unknown". The e2e failing set is then matched against the nightly reporter's cards
+-(``~/.hermes/state/nightly-e2e.json``, key = ``nightly_e2e.failure_key``): a card is named only when it is open, was
+-created by nightly-e2e, is the state's card for that exact key and its body lists exactly that set. An e2e set that
+-was not fully parsed (no ids, or a whole-file crash/timeout in the log) gets "owner lookup unknown".
++(``~/.hermes/state/nightly-e2e.json``): only open main-scope cards created by nightly-e2e qualify. The red record's
++latest ``failing`` set is authoritative, not its initial body. Legacy fingerprint records still require that body
++proof. A supplied board idempotency key must match creation provenance, including an adopted legacy identity.
++An e2e set that was not fully parsed (no ids, or a whole-file crash/timeout) gets "owner lookup unknown".
+ """
+ from __future__ import annotations
+ 
+@@ -149,11 +150,38 @@ def _lists_exactly(body: str, ids: list[str]) -> bool:
+     return f"Failing tests ({len(ids)}):" in body and all(f"- `{i}`" in body for i in ids[:MAX_LISTED])
+ 
+ 
++def _owner_identity(card: dict, rec: dict, key: str) -> bool:
++    """Match the creation key, including a fingerprint-era card adopted into the red slot."""
++    idem = card.get("idempotency_key")
++    if idem is None:  # kanban show --json omits it; state id and creator still bind the card
++        return True
++    expected = f"nightly-e2e:{key}:{rec.get('n')}"
++    if key != "red":
++        return idem == expected
++    saved = rec.get("idempotency_key")
++    if saved is not None:
++        return (isinstance(saved, str)
++                and re.fullmatch(r"nightly-e2e:(?:red|failed-[0-9a-f]{12}):[1-9][0-9]*", saved) is not None
++                and (not saved.startswith("nightly-e2e:red:") or saved == expected)
++                and idem == saved)
++    if idem == expected:
++        return True
++    # Early red records did not retain adoption provenance. Only a complete original
++    # body can recover its fingerprint; never accept an arbitrary failed-* prefix.
++    match = re.fullmatch(r"nightly-e2e:(failed-[0-9a-f]{12}):[1-9][0-9]*", str(idem))
++    body = re.search(r"^Failing tests \((\d+)\):\n((?:- `[^`\n]+`(?:\n|$))+)",
++                     str(card.get("body") or ""), re.MULTILINE)
++    if not match or not body:
++        return False
++    listed = re.findall(r"^- `([^`\n]+)`$", body[2], re.MULTILINE)
++    return len(listed) == int(body[1]) and failure_key(listed) == match[1]
++
++
+ def nightly_owner(ids, *, state_path: Path | None = None, board=None) -> str:
+     """The open nightly-e2e card filed for exactly this failing set, else ''. Unreadable state or board raises.
+ 
+-    Provenance: the reporter's state maps ``failure_key`` -> card id, the card was created by nightly-e2e, and its body
+-    lists exactly these ids. ``kanban show --json`` carries no idempotency key; a board that returns one must match."""
++    The main red record binds the latest exact set to a card; old state binds a fingerprint and body instead.
++    ``kanban show --json`` carries no idempotency key; a board that returns one must match creation provenance."""
+     state_path = Path(state_path or DEFAULT_STATE)
+     if not ids or not state_path.exists():
+         return ""
+@@ -163,18 +191,22 @@ def nightly_owner(ids, *, state_path: Path | None = None, board=None) -> str:
+     cards = state.get("cards", {}) if isinstance(state, dict) else None  # no key yet: nothing filed
+     if not isinstance(cards, dict):
+         raise ValueError(f"{state_path} has no nightly-e2e card map")
++    key = "red" if "red" in cards else key
+     rec = cards.get(key)
+     if not rec:
+         return ""
+     if not isinstance(rec, dict) or not rec.get("id"):
+         raise ValueError(f"{state_path} card record for {key} is malformed: {rec!r}")
++    if rec.get("scope", "main") != "main":
++        return ""
++    if key == "red" and (not isinstance(rec.get("failing"), list) or set(rec["failing"]) != set(ids)):
++        return ""
+     card = (board or NightlyBoard("hermes")).card(rec["id"])
+     if card is None:  # CliBoard.card answers None for a failed `hermes kanban show`: unknown, not "no owner"
+         raise RuntimeError(f"nightly card {rec['id']} for {key} is unreadable on this host's board")
+-    idem = card.get("idempotency_key")
+-    if (card.get("status") in OPEN and card.get("created_by") == "nightly-e2e"
+-            and (idem is None or str(idem).startswith(f"nightly-e2e:{key}:"))
+-            and _lists_exactly(str(card.get("body") or ""), ids)):
++    if (card.get("id") == rec["id"] and card.get("status") in OPEN and card.get("created_by") == "nightly-e2e"
++            and _owner_identity(card, rec, key)
++            and (key == "red" or _lists_exactly(str(card.get("body") or ""), ids))):
+         return f"{card['id']} ({card['status']})"
+     return ""
+ 
+diff --git a/tests/ci/test_nightly_e2e.py b/tests/ci/test_nightly_e2e.py
+index 9773e02768b..80e68561530 100644
+--- a/tests/ci/test_nightly_e2e.py
++++ b/tests/ci/test_nightly_e2e.py
+@@ -92,6 +92,8 @@ class FakeBoard:
+         self.created: list[tuple] = []
+ 
+     def card(self, cid):
++        if cid in self.cards:
++            return {"id": cid, **self.cards[cid]}
+         return {"id": cid} if cid == OWNER else None
+ 
+     def create(self, title, body, key, *, distinct_from=None, distinct_reason=None, creator_task_id=None):
+@@ -294,7 +296,7 @@ def test_second_failure_with_same_tests_updates_the_card(env):
+     assert "https://gh/run/101" in board.cards["t_1"]["comments"][0]
+ 
+ 
+-def test_different_failing_tests_get_their_own_card(env):
++def test_different_failing_tests_update_the_one_open_red_card(env):
+     gh, board, state = env
+     _dispatch(gh, state)
+     gh.finish(100, "failure", _log("tests/e2e/a.py::t"))
+@@ -302,7 +304,9 @@ def test_different_failing_tests_get_their_own_card(env):
+     _dispatch(gh, state, now=T0 + 20)
+     gh.finish(101, "failure", _log("tests/e2e/a.py::t", "tests/e2e/b.py::t"))
+     ne.report(gh, board, state, now=T0 + 30)
+-    assert len(board.cards) == 2
++    assert len(board.cards) == 1
++    (comment,) = board.cards["t_1"]["comments"]
++    assert "https://gh/run/101" in comment and "tests/e2e/b.py::t" in comment
+ 
+ 
+ def test_archived_card_is_replaced_not_commented(env):
+@@ -541,14 +545,16 @@ def test_python_input_defaults_on_and_gates_only_the_python_lanes():
+     assert tests["jobs"]["e2e"]["if"] == "inputs.e2e"
+ 
+ 
+-def test_subset_of_failing_tests_is_a_separate_fingerprint_and_card(env):
++def test_subset_of_failing_tests_comments_on_the_open_red_card(env):
++    """Obsolete contract was a card per exact failing set; the red card is now one per alert scope."""
+     gh, board, state = env
+     for i, ids in enumerate([["tests/e2e/a.py::t", "tests/e2e/b.py::t"], ["tests/e2e/a.py::t"]]):
+         _dispatch(gh, state, now=T0 + i * 60)
+         gh.finish(100 + i, "failure", _log(*ids))
+         ne.report(gh, board, state, now=T0 + i * 60 + 10)
+-    assert len(board.cards) == 2
+-    assert not any(c["comments"] for c in board.cards.values())
++    assert len(board.cards) == 1
++    (comment,) = board.cards["t_1"]["comments"]
++    assert "https://gh/run/101" in comment
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/ci/test_nightly_e2e_red_cards.py b/tests/ci/test_nightly_e2e_red_cards.py
+new file mode 100644
+index 00000000000..70b9040001e
+--- /dev/null
++++ b/tests/ci/test_nightly_e2e_red_cards.py
+@@ -0,0 +1,326 @@
++"""scripts/ci/nightly_e2e.py: one open red card per alert scope, with the failing-set delta in each comment.
++
++The previous contract filed a card per exact failing-test set, so a subset/superset/disjoint failure on main opened a
++second (third, ...) open red card for the same incident. Now each scope (main, ref:<ref>, acceptance:<marker>) has
++one red card; later red runs comment the run URL plus newly failing / no longer failing / still failing IDs, and a
++red run after that card is done or archived files the next generation. State written by the fingerprint version
++(``failed-<sha1>`` records, no IDs) is migrated: an open legacy card is reused, its baseline recovered from its
++body when that body hashes to the legacy fingerprint, and labelled unknown otherwise.
++"""
++
++from __future__ import annotations
++
++import re
++import time
++from pathlib import Path
++
++import pytest
++
++from tests.ci.test_nightly_e2e import OWNER, T0, FakeBoard, FakeGitHub, _dispatch, _log, _raise, ne
++
++A, B, C, D = (f"tests/e2e/{n}.py::t" for n in "abcd")
++
++
++@pytest.fixture
++def env():
++    return FakeGitHub(), FakeBoard(), ne.load_state(Path("/nonexistent/state.json"))
++
++
++def _red(gh, board, state, ids, *, i, ref="main", marker=""):
++    """Dispatch run ``100 + i`` at ``ref`` (optionally an acceptance run), fail it with ``ids`` and report it."""
++    entry = _dispatch(gh, state, ref=ref, now=T0 + i * 600)
++    if marker:
++        entry["acceptance_marker"], entry["acceptance_owner"] = marker, OWNER
++    gh.finish(entry["run_id"], "failure", _log(*ids))
++    return ne.report(gh, board, state, now=T0 + i * 600 + 10)
++
++
++def _green(gh, board, state, *, i, ref="main"):
++    entry = _dispatch(gh, state, ref=ref, now=T0 + i * 600)
++    gh.finish(entry["run_id"], "success")
++    return ne.report(gh, board, state, now=T0 + i * 600 + 10)
++
++
++def _section(comment: str, name: str) -> list[str]:
++    m = re.search(rf"^{name} \((\d+)\):\n((?:- .*(?:\n|$))*)", comment, re.MULTILINE)
++    assert m, f"no {name!r} section in:\n{comment}"
++    ids = re.findall(r"^- `([^`]+)`$", m.group(2), re.MULTILINE)
++    assert len(ids) == int(m.group(1)), comment
++    return ids
++
++
++def _delta(comment: str) -> tuple[list[str], list[str], list[str]]:
++    return (_section(comment, "Newly failing"), _section(comment, "No longer failing"),
++            _section(comment, "Still failing"))
++
++
++@pytest.mark.parametrize(
++    "first,second,delta",
++    [
++        ([A, B], [A], ([], [B], [A])),  # subset
++        ([A], [A, B], ([B], [], [A])),  # superset
++        ([A], [C], ([C], [A], [])),  # disjoint
++        ([A, B], [A, B], ([], [], [A, B])),  # identical
++    ],
++    ids=["subset", "superset", "disjoint", "identical"],
++)
++def test_any_later_red_comments_on_the_one_open_card_with_exact_delta(env, first, second, delta):
++    gh, board, state = env
++    _red(gh, board, state, first, i=0)
++    lines = _red(gh, board, state, second, i=1)
++    assert list(board.cards) == ["t_1"] and "updated t_1" in lines[0]
++    (comment,) = board.cards["t_1"]["comments"]
++    assert "https://gh/run/101" in comment
++    assert _delta(comment) == delta
++
++
++@pytest.mark.parametrize("legacy", [False, True])
++@pytest.mark.parametrize("outcome", ["red", "green"])
++def test_unreadable_owner_is_retried_not_replaced_or_forgotten(env, legacy, outcome):
++    gh, board, state = env
++    if legacy:
++        _legacy(board, state, [A])
++    else:
++        _red(gh, board, state, [A], i=0)
++    status = board.status
++    board.status = lambda cid: None
++    lines = (_red(gh, board, state, [B], i=1) if outcome == "red"
++             else _green(gh, board, state, i=1))
++    assert "retrying" in lines[0]
++    assert len(board.cards) == 1 and len(state["pending"]) == 1
++    board.status = status
++    ne.report(gh, board, state, now=T0 + 620)
++    assert len(board.cards) == 1 and state["pending"] == []
++    assert len(board.cards["t_1"]["comments"]) == 1
++
++
++def test_latest_failing_ids_are_the_next_baseline(env):
++    gh, board, state = env
++    _red(gh, board, state, [A], i=0)
++    _red(gh, board, state, [A, B], i=1)
++    _red(gh, board, state, [B, C], i=2)
++    assert list(board.cards) == ["t_1"]
++    assert _delta(board.cards["t_1"]["comments"][1]) == ([C], [A], [B])
++    assert state["cards"]["red"]["failing"] == [B, C]
++
++
++@pytest.mark.parametrize("closed", ["done", "archived"])
++def test_red_after_the_card_is_closed_files_the_next_generation(env, closed):
++    gh, board, state = env
++    _red(gh, board, state, [A], i=0)
++    board.cards["t_1"]["status"] = closed
++    _red(gh, board, state, [B], i=1)
++    assert list(board.cards) == ["t_1", "t_2"] and board.cards["t_1"]["comments"] == []
++    assert [k for _, k in board.created] == ["nightly-e2e:red:1", "nightly-e2e:red:2"]
++    assert B in board.cards["t_2"]["body"] and "https://gh/run/101" in board.cards["t_2"]["body"]
++    _red(gh, board, state, [B, C], i=2)  # the new generation is the open card now
++    assert len(board.cards) == 2 and _delta(board.cards["t_2"]["comments"][0]) == ([C], [], [B])
++
++
++def test_main_historical_and_acceptance_scopes_keep_separate_red_cards(env):
++    gh, board, state = env
++    _red(gh, board, state, [A], i=0)
++    _red(gh, board, state, [B], i=1, ref="29953696677a")
++    _red(gh, board, state, [C], i=2, marker="scope-check")
++    assert len(board.cards) == 3
++    _red(gh, board, state, [D], i=3)  # disjoint from every scope's set: still only main's card hears of it
++    assert _delta(board.cards["t_1"]["comments"][0]) == ([D], [A], [])
++    assert board.cards["t_2"]["comments"] == [] and board.cards["t_3"]["comments"] == []
++    _red(gh, board, state, [A], i=4, ref="29953696677a")
++    assert len(board.cards["t_1"]["comments"]) == 1
++    (ref_comment,) = board.cards["t_2"]["comments"]
++    assert _delta(ref_comment) == ([A], [B], []) and "does not establish a current main incident" in ref_comment
++
++
++def test_did_not_run_keeps_its_own_card_and_leaves_the_red_baseline(env):
++    gh, board, state = env
++    _red(gh, board, state, [A], i=0)
++    entry = _dispatch(gh, state, now=T0 + 600)
++    gh.finish(entry["run_id"], "cancelled")
++    ne.report(gh, board, state, now=T0 + 610)
++    assert len(board.cards) == 2 and "did not run" in board.cards["t_2"]["title"].lower()
++    assert board.cards["t_1"]["comments"] == []
++    _red(gh, board, state, [A, B], i=2)
++    assert len(board.cards) == 2 and _delta(board.cards["t_1"]["comments"][0]) == ([B], [], [A])
++
++
++def test_green_lists_what_stopped_failing_and_resets_the_baseline(env):
++    gh, board, state = env
++    _red(gh, board, state, [A, B], i=0)
++    _green(gh, board, state, i=1)
++    (green,) = board.cards["t_1"]["comments"]
++    assert "GREEN" in green and "https://gh/run/101" in green
++    assert _section(green, "No longer failing") == [A, B]
++    _red(gh, board, state, [A], i=2)
++    assert _delta(board.cards["t_1"]["comments"][1]) == ([A], [], [])
++
++
++# --- failed comment retry ----------------------------------------------------------------------------------------
++
++
++class FlakyCommentBoard(FakeBoard):
++    def __init__(self):
++        super().__init__()
++        self.fail_next = 0
++
++    def comment(self, cid, body, board=None):
++        if self.fail_next:
++            self.fail_next -= 1
++            raise RuntimeError("hermes kanban comment failed (1): db locked")
++        super().comment(cid, body, board)
++
++
++def test_failed_red_comment_keeps_run_pending_and_baseline_until_it_lands():
++    gh, board, state = FakeGitHub(), FlakyCommentBoard(), ne.load_state(Path("/nonexistent/state.json"))
++    _red(gh, board, state, [A], i=0)
++    board.fail_next = 1
++    lines = _red(gh, board, state, [B], i=1)
++    assert "retrying" in lines[0] and [e["run_id"] for e in state["pending"]] == [101]
++    assert board.cards["t_1"]["comments"] == [] and state["cards"]["red"]["failing"] == [A]
++    ne.report(gh, board, state, now=T0 + 600 + 20)  # next tick
++    assert state["pending"] == [] and list(board.cards) == ["t_1"]
++    (comment,) = board.cards["t_1"]["comments"]
++    assert "https://gh/run/101" in comment and _delta(comment) == ([B], [A], [])
++    assert state["cards"]["red"]["failing"] == [B]
++
++
++def test_failed_green_comment_does_not_reset_the_baseline():
++    gh, board, state = FakeGitHub(), FlakyCommentBoard(), ne.load_state(Path("/nonexistent/state.json"))
++    _red(gh, board, state, [A], i=0)
++    board.fail_next = 1
++    lines = _green(gh, board, state, i=1)
++    assert "retrying" in lines[0] and state["cards"]["red"]["failing"] == [A]
++    ne.report(gh, board, state, now=T0 + 600 + 20)
++    (green,) = board.cards["t_1"]["comments"]
++    assert _section(green, "No longer failing") == [A] and state["cards"]["red"]["failing"] == []
++
++
++# --- migration of fingerprint state ------------------------------------------------------------------------------
++
++
++def _legacy(board, state, ids, *, ref="main", marker="", scope_field=True, body=None):
++    """A card and state record exactly as the fingerprint version filed them (``failed-<sha1>``, no IDs)."""
++    entry = {"ref": ref, "sha": "a" * 40, "dispatched_at": T0 - 86400, "url": "https://gh/run/1"}
++    if marker:
++        entry["acceptance_marker"], entry["acceptance_owner"] = marker, OWNER
++    key = ne._scoped_key(entry, ne.failure_key(ids))
++    cid = board.create(ne._title(entry, ids, ""), body if body is not None else
++                       ne._card_body("failed", entry, ids, "=== Summary ==="), f"nightly-e2e:{key}:1")
++    state["cards"][key] = {"id": cid, "n": 1, **({"scope": ne.scope_of(entry)} if scope_field else {})}
++    return cid, key
++
++
++@pytest.mark.parametrize("scope_field", [True, False], ids=["scoped-record", "pre-scope-record"])
++def test_open_legacy_card_is_reused_with_baseline_recovered_from_its_body(env, scope_field):
++    gh, board, state = env
++    cid, key = _legacy(board, state, [A, B], scope_field=scope_field)
++    _red(gh, board, state, [A, C], i=0)
++    assert list(board.cards) == [cid]
++    (comment,) = board.cards[cid]["comments"]
++    assert "https://gh/run/100" in comment and _delta(comment) == ([C], [B], [A])
++    assert key not in state["cards"] and state["cards"]["red"]["id"] == cid
++    assert state["cards"]["red"]["failing"] == [A, C]
++    assert state["cards"]["red"]["idempotency_key"] == f"nightly-e2e:{key}:1"
++    _red(gh, board, state, [B], i=1)
++    assert state["cards"]["red"]["idempotency_key"] == f"nightly-e2e:{key}:1"
++
++
++def test_legacy_baseline_known_from_fingerprint_when_ids_match(env):
++    gh, board, state = env
++    cid, _key = _legacy(board, state, [A], body="(body lost)")
++    _red(gh, board, state, [A], i=0)
++    assert list(board.cards) == [cid] and _delta(board.cards[cid]["comments"][0]) == ([], [], [A])
++
++
++@pytest.mark.parametrize("body", ["(body lost)", "Failing tests (2):\n- `tests/e2e/x.py::t`\n- `tests/e2e/y.py::t`\n"],
++                         ids=["no-list", "list-not-matching-fingerprint"])
++def test_unrecoverable_legacy_baseline_is_labelled_unknown(env, body):
++    gh, board, state = env
++    cid, _key = _legacy(board, state, [A, B], body=body)
++    _red(gh, board, state, [C], i=0)
++    (comment,) = board.cards[cid]["comments"]
++    assert "baseline unknown" in comment.lower() and "https://gh/run/100" in comment
++    assert _section(comment, "Failing now") == [C]
++    assert "Newly failing" not in comment and "No longer failing" not in comment
++    _red(gh, board, state, [C, D], i=1)  # the comment recorded a real baseline for the next run
++    assert _delta(board.cards[cid]["comments"][1]) == ([D], [], [C])
++
++
++def test_several_open_legacy_cards_collapse_to_one_and_green_comments_once(env):
++    gh, board, state = env
++    first, _ = _legacy(board, state, [A, B])
++    second, _ = _legacy(board, state, [A])
++    _red(gh, board, state, [A], i=0)
++    assert len(board.cards) == 2  # nothing new filed
++    # the card whose fingerprint matches is reused; the duplicate is pointed at it and dropped from state
++    assert _delta(board.cards[second]["comments"][0]) == ([], [], [A])
++    (superseded,) = board.cards[first]["comments"]
++    assert second in superseded and "superseded" in superseded.lower()
++    assert [k for k in state["cards"]] == ["red"]
++    _green(gh, board, state, i=1)
++    assert sum("GREEN" in c for c in board.cards[second]["comments"]) == 1
++    assert not any("GREEN" in c for c in board.cards[first]["comments"])
++
++
++def test_green_before_any_migrating_red_comments_each_open_legacy_card_once(env):
++    gh, board, state = env
++    cid, _ = _legacy(board, state, [A])
++    _green(gh, board, state, i=0)
++    assert [c.count("GREEN") for c in board.cards[cid]["comments"]] == [1]
++
++
++def test_closed_legacy_card_is_not_reused_and_next_generation_is_filed(env):
++    gh, board, state = env
++    cid, key = _legacy(board, state, [A])
++    board.cards[cid]["status"] = "done"
++    _red(gh, board, state, [A], i=0)
++    assert len(board.cards) == 2 and board.cards[cid]["comments"] == []
++    assert key not in state["cards"] and state["cards"]["red"]["failing"] == [A]
++
++
++def test_legacy_cards_migrate_only_within_their_own_scope(env):
++    gh, board, state = env
++    acc, acc_key = _legacy(board, state, [A], marker="scope-check")
++    hist, hist_key = _legacy(board, state, [A], ref="29953696677a")
++    _red(gh, board, state, [A], i=0)
++    assert len(board.cards) == 3 and board.cards[acc]["comments"] == [] and board.cards[hist]["comments"] == []
++    assert acc_key in state["cards"] and hist_key in state["cards"]
++    _red(gh, board, state, [B], i=1, ref="29953696677a")
++    assert len(board.cards) == 3 and _delta(board.cards[hist]["comments"][0]) == ([B], [A], [])
++    assert board.cards[acc]["comments"] == []
++
++
++def test_failed_migration_comment_keeps_legacy_record_and_retries_on_the_same_card():
++    gh, board, state = FakeGitHub(), FlakyCommentBoard(), ne.load_state(Path("/nonexistent/state.json"))
++    cid, key = _legacy(board, state, [A])
++    board.fail_next = 1
++    lines = _red(gh, board, state, [B], i=0)
++    assert "retrying" in lines[0] and key in state["cards"] and "red" not in state["cards"]
++    ne.report(gh, board, state, now=T0 + 20)
++    assert list(board.cards) == [cid] and _delta(board.cards[cid]["comments"][0]) == ([B], [A], [])
++    assert key not in state["cards"] and state["cards"]["red"]["id"] == cid
++
++
++def test_red_card_state_survives_the_cli_state_file(tmp_path, monkeypatch):
++    gh, board, path = FakeGitHub(), FakeBoard(), tmp_path / "state.json"
++    monkeypatch.setenv("GH_TOKEN", "x")
++    monkeypatch.setattr(ne, "RestGitHub", lambda *a: gh)
++    monkeypatch.setattr(ne, "NightlyBoard", lambda *a: board)
++    for rid, ids in [(100, [A]), (101, [B])]:
++        assert ne.main(["dispatch", "--state", str(path)]) == 0
++        gh.finish(rid, "failure", _log(*ids))
++        assert ne.main(["report", "--state", str(path)]) == 0
++    assert list(board.cards) == ["t_1"] and _delta(board.cards["t_1"]["comments"][0]) == ([B], [A], [])
++    assert ne.load_state(path)["cards"]["red"]["failing"] == [B]
++
++
++def test_persistent_board_error_on_red_update_past_deadline_still_never_drops_the_run():
++    gh, board, state = FakeGitHub(), FakeBoard(), ne.load_state(Path("/nonexistent/state.json"))
++    _red(gh, board, state, [A], i=0)
++    entry = _dispatch(gh, state, now=time.time() - 5 * 3600)
++    gh.finish(entry["run_id"], "failure", _log(B))
++    board.comment = _raise(RuntimeError("db locked"))
++    board.create = _raise(RuntimeError("db locked"))
++    lines = ne.report(gh, board, state, now=time.time())
++    assert ne.BOARD_FAILED in lines[0] and [e["run_id"] for e in state["pending"]] == [101]
++    assert state["cards"]["red"]["failing"] == [A]
+diff --git a/tests/scripts/ci/test_upstream_sync_diagnostics.py b/tests/scripts/ci/test_upstream_sync_diagnostics.py
+index 2e1f74663a1..c5d5e987d37 100644
+--- a/tests/scripts/ci/test_upstream_sync_diagnostics.py
++++ b/tests/scripts/ci/test_upstream_sync_diagnostics.py
+@@ -258,6 +258,92 @@ def test_owner_requires_open_nightly_provenance_and_the_exact_fingerprint(tmp_pa
+     assert diag.nightly_owner([], state_path=state, board=Board()) == ""
+ 
+ 
++@pytest.mark.parametrize("identity", ["nightly-e2e:red:3", None])
++@pytest.mark.parametrize("body_ids", [(A, B), (A,)])
++def test_red_owner_uses_latest_set_not_initial_body(tmp_path, body_ids, identity):
++    state = tmp_path / "nightly.json"
++    state.write_text(json.dumps({"cards": {"red": {
++        "id": "t_owner", "n": 3, "scope": "main", "failing": [B, A],
++    }}}))
++    board = StateBoard({"t_owner": {
++        "id": "t_owner", "status": "running", "created_by": "nightly-e2e",
++        "idempotency_key": identity, "body": card_body(body_ids),
++    }})
++    assert diag.nightly_owner([A, B], state_path=state, board=board) == "t_owner (running)"
++    assert diag.nightly_owner([A], state_path=state, board=board) == ""
++    assert diag.nightly_owner([A, B, PY], state_path=state, board=board) == ""
++
++
++@pytest.mark.parametrize("saved_identity", [False, True])
++def test_red_owner_keeps_adopted_legacy_identity(tmp_path, saved_identity):
++    identity = f"nightly-e2e:{failure_key([A])}:4"
++    rec = {"id": "t_owner", "n": 0, "scope": "main", "failing": [B]}
++    if saved_identity:
++        rec["idempotency_key"] = identity
++    state = tmp_path / "nightly.json"
++    state.write_text(json.dumps({"cards": {"red": rec}}))
++    board = StateBoard({"t_owner": {
++        "id": "t_owner", "status": "running", "created_by": "nightly-e2e",
++        "idempotency_key": identity, "body": "edited body" if saved_identity else card_body([A]),
++    }})
++    assert diag.nightly_owner([B], state_path=state, board=board) == "t_owner (running)"
++    assert diag.nightly_owner([A], state_path=state, board=board) == ""
++
++
++@pytest.mark.parametrize("change", [
++    {"created_by": "default"}, {"idempotency_key": "nightly-e2e:timeout:3"},
++    {"idempotency_key": "nightly-e2e:red:2"},
++    {"idempotency_key": f"nightly-e2e:{failure_key([PY])}:4"},
++    {"idempotency_key": "nightly-e2e:acceptance|red:3"}, {"status": "done"},
++    {"id": "t_unrelated"},
++])
++def test_red_owner_rejects_unrelated_provenance(tmp_path, change):
++    state = tmp_path / "nightly.json"
++    state.write_text(json.dumps({"cards": {"red": {
++        "id": "t_owner", "n": 3, "scope": "main", "failing": [B],
++    }}}))
++    card = {"id": "t_owner", "status": "running", "created_by": "nightly-e2e",
++            "idempotency_key": "nightly-e2e:red:3", "body": card_body([A]), **change}
++    assert diag.nightly_owner([B], state_path=state, board=StateBoard({"t_owner": card})) == ""
++
++
++@pytest.mark.parametrize("key", ["red", "acceptance|red", failure_key([B])])
++def test_acceptance_record_is_not_main_owner(tmp_path, key):
++    state = tmp_path / "nightly.json"
++    state.write_text(json.dumps({"cards": {key: {
++        "id": "t_owner", "n": 1, "scope": "acceptance", "failing": [B],
++    }}}))
++    card = {"id": "t_owner", "status": "running", "created_by": "nightly-e2e", "body": card_body([B])}
++    assert diag.nightly_owner([B], state_path=state, board=StateBoard({"t_owner": card})) == ""
++
++
++@pytest.mark.parametrize("saved,actual", [
++    (f"nightly-e2e:{failure_key([A])}:4", f"nightly-e2e:{failure_key([A])}:5"),
++    ("nightly-e2e:acceptance|red:3", "nightly-e2e:acceptance|red:3"),
++    ("nightly-e2e:timeout:3", "nightly-e2e:timeout:3"),
++    ("nightly-e2e:red:2", "nightly-e2e:red:2"),
++])
++def test_saved_red_identity_cannot_authorize_an_unrelated_card(tmp_path, saved, actual):
++    state = tmp_path / "nightly.json"
++    state.write_text(json.dumps({"cards": {"red": {
++        "id": "t_owner", "n": 3, "scope": "main", "failing": [B], "idempotency_key": saved,
++    }}}))
++    card = {"id": "t_owner", "status": "running", "created_by": "nightly-e2e",
++            "idempotency_key": actual, "body": card_body([A])}
++    assert diag.nightly_owner([B], state_path=state, board=StateBoard({"t_owner": card})) == ""
++
++
++@pytest.mark.parametrize("latest", [None, [], [A]])
++def test_red_latest_set_is_authoritative_over_stale_legacy_record(tmp_path, latest):
++    state = tmp_path / "nightly.json"
++    state.write_text(json.dumps({"cards": {
++        "red": {"id": "t_owner", "n": 1, "scope": "main", "failing": latest},
++        failure_key([B]): {"id": "t_old", "n": 1},
++    }}))
++    card = {"id": "t_old", "status": "running", "created_by": "nightly-e2e", "body": card_body([B])}
++    assert diag.nightly_owner([B], state_path=state, board=StateBoard({"t_old": card})) == ""
++
++
+ def gate_world(monkeypatch, tmp_path):
+     monkeypatch.setattr(diag, "DEFAULT_STATE", tmp_path / "nightly-e2e.json")
+     (tmp_path / "nightly-e2e.json").write_text("{}")
+-- 
+2.55.0
+

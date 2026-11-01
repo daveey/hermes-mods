@@ -1,0 +1,418 @@
+From f133056b6d84defc9c5a7a739eccc01adc0d42d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:44:56 +0000
+Subject: [PATCH] fix(kanban): resume re-checks inside unblock's write txn;
+ recovery card must postdate the park; imperative-only authority regex
+ [daveey]
+
+Review of d104444: preflight ran outside the unblock transaction, so a
+needs_input ask landing mid-drain was released and its human_request erased
+(reproduced). unblock_task gains precondition=, evaluated first under BEGIN
+IMMEDIATE; resume passes its full refusal check there.
+
+Also: an ancestor may only be resumed by a card created after its current
+continuation_exhausted park; the authority regex matches imperative asks only
+(kanban_unblock, un-block, move .. to ready, release/reopen, raise the
+continuation limit) and no longer refuses history like 'was unblocked by t_x';
+a legacy authority repair's refusal names the archive escape; readback faults
+after a committed apply are reported, not swallowed.
+---
+ hermes_cli/kanban_assignment_routing.py       | 20 +++-
+ hermes_cli/kanban_db.py                       | 11 ++-
+ hermes_cli/kanban_resume_exec.py              | 94 ++++++++++++++-----
+ .../test_kanban_assignment_routing.py         | 41 +++++++-
+ .../test_kanban_supervisor_resume.py          | 59 +++++++++++-
+ 5 files changed, 188 insertions(+), 37 deletions(-)
+
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index 18375bcead2..46e12828ad7 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -43,19 +43,28 @@ class ExecutionAuthorityMismatch(AssignmentRoutingError):
+ 
+ # A worker of ANY profile is fenced from moving another card through its lifecycle, so a block
+ # asking for that is an execution-authority gap, not a profile mismatch: reassigning cannot fix it.
++_ID = r'(t_[0-9a-f]{8,16})\b'
++# Imperative ask forms only (base verb, also inside kanban_unblock / unblock_task): "unblock t_x",
++# "kanban_unblock(t_x)", "re-queue t_x", "move t_x back to ready", "t_x needs an unblock". Past and
++# progressive forms ("was unblocked by t_x", "promotion of t_x") describe history, not an ask.
++_VERB = r'(?<![A-Za-z])(?:kanban_)?(?:un-?block|re-?queue|promote|reopen|release)(?![A-Za-z])'
+ _OTHER_CARD_TRANSITION = re.compile(
+-    r'\b(?:unblock\w*|re-?queue\w*|promot\w*|resum\w*)\b[^.;\n]{0,120}?\b(t_[0-9a-f]{8,16})\b'
+-    r'|\b(t_[0-9a-f]{8,16})\b[^.;\n]{0,120}?\b(?:unblock\w*|re-?queue\w*|promot\w*)\b',
++    _VERB + r'[^\n]{0,80}?' + _ID
++    + r'|(?<![A-Za-z])resume\s+(?:card\s+|task\s+)?' + _ID
++    + r'|(?<![A-Za-z])move\s+' + _ID + r'[^\n]{0,30}?\bto\s+(?:ready|todo)\b'
++    + r'|' + _ID + r'[^\n.;]{0,40}?' + _VERB,
+     re.IGNORECASE,
+ )
+-_BUDGET_RESET = re.compile(r'\breset\w*\b[^.;\n]{0,40}\bcontinuation (?:budget|limit|streak)\b', re.IGNORECASE)
++_BUDGET_RESET = re.compile(
++    r'\b(?:reset|raise|increase|extend|clear|lift)\b[^\n]{0,40}?\bcontinuation[_ ](?:budget|limit|streak|count)\b',
++    re.IGNORECASE)
+ 
+ 
+ def execution_authority_need(task_id, reason):
+     """The other card ids a block asks to move through its lifecycle (or ``['<budget>']`` for a
+     continuation-budget reset), else ``[]``. Profile mismatches return ``[]``."""
+     text = reason or ''
+-    ids = [a or b for a, b in _OTHER_CARD_TRANSITION.findall(text)]
++    ids = [next(g for g in m if g) for m in _OTHER_CARD_TRANSITION.findall(text)]
+     ids = [i for i in dict.fromkeys(ids) if i != task_id]
+     if not ids and _BUDGET_RESET.search(text):
+         ids = ['<budget>']
+@@ -69,7 +78,8 @@ def _authority_error(task_id, needs):
+         'assignment repair cannot fix it and none was recorded. For a card the continuation budget '
+         'parked, file kanban_supervisor_request ops=[{"op": "resume", "task_id": "<id>"}] (the '
+         'non-worker executor re-checks scope and refuses human-gated cards); a card waiting on a '
+-        'human stays with that human.'
++        'human stays with that human. A repair card already filed for such an ask cannot complete: '
++        'archive it (an archived parent no longer gates the original), then file that request.'
+     )
+ 
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 821fc4e0eff..2e0f526e15d 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -27,7 +27,7 @@ import time
+ from contextvars import ContextVar, Token
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Iterable, Optional
++from typing import Any, Callable, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+@@ -3736,16 +3736,21 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
+ 
+ 
+ def unblock_task(conn: sqlite3.Connection, task_id: str, *, comment: Optional[tuple[str, str]] = None,
+-                 event_extra: Optional[dict] = None) -> bool:
++                 event_extra: Optional[dict] = None,
++                 precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None) -> bool:
+     """``blocked``/``scheduled``/``triage`` -> its resumable phase (parent
+     re-gated; ``review`` when that is where it left off), closing any leaked run
+     first. ``triage`` is accepted so a card a block loop escalated can go back
+     to work without the specifier/decomposer rewriting it. ``comment`` is written in the same
+     txn and only when the unblock lands (``kanban_reason_comment``). ``event_extra`` is merged
+-    into the ``unblocked`` event in that txn (audit provenance, e.g. a supervisor request). [daveey]"""
++    into the ``unblocked`` event in that txn (audit provenance, e.g. a supervisor request).
++    ``precondition`` runs first inside the write txn; a returned refusal string aborts with
++    ``False`` and no change, so a caller's checks cannot go stale before the write. [daveey]"""
+     from hermes_cli.kanban_reason_comment import reason_comment
+     now = int(time.time())
+     with write_txn(conn), reason_comment(conn, task_id, comment) as noted:
++        if precondition is not None and precondition(conn):
++            return False
+         resume_status = (
+             _resume_status_from_events(conn, task_id)
+             if _task_status(conn, task_id) in ("blocked", "triage")
+diff --git a/hermes_cli/kanban_resume_exec.py b/hermes_cli/kanban_resume_exec.py
+index cf8735315c9..6fba62ea28e 100644
+--- a/hermes_cli/kanban_resume_exec.py
++++ b/hermes_cli/kanban_resume_exec.py
+@@ -19,8 +19,9 @@ lifecycle API :func:`kanban_db.unblock_task`. It is deliberately narrow:
+   ``capability`` block is refused (``human_gate``). Prose on a card that a decision "is
+   resolved" is not the human's unblock; that transition stays with the human.
+ * **Scope by provenance.** The target is the requester's own creator chain (the stuck card
+-  spawned the recovery card, directly or through at most ``MAX_CREATOR_HOPS`` - 1 cards), or a
+-  card the requester created. ``creator_task_id`` is stamped by the kernel from the creating
++  spawned the recovery card, directly or through at most ``MAX_CREATOR_HOPS`` - 1 cards) and the
++  requester was created after the target's current park (a recovery card for THIS park), or the
++  target is a card the requester created. ``creator_task_id`` is stamped by the kernel from the creating
+   worker's own task, not supplied by the worker.
+ * **Bounded.** At most ``MAX_RESUMES`` supervisor resumes per target, ever. The 12-run
+   continuation limit itself is unchanged; the unblock only ends the trailing ``continued``
+@@ -28,7 +29,8 @@ lifecycle API :func:`kanban_db.unblock_task`. It is deliberately narrow:
+ * **Parent gating and graph untouched.** ``unblock_task`` re-gates on parents (``ready`` or
+   ``todo``); this op adds and removes no edges.
+ 
+-Execution re-checks everything against the board as it is then. A redelivered request (crash
++Execution re-checks everything inside the unblock's own write transaction
++(``unblock_task(precondition=...)``), so a human gate that lands mid-drain cannot be erased. A redelivered request (crash
+ after apply) finds its own ``unblocked`` event and reports ``already_applied``; anything else
+ that no longer qualifies fails closed.
+ """
+@@ -38,11 +40,12 @@ import json
+ import sqlite3
+ from typing import Optional
+ 
++from hermes_cli.kanban_continuation import HUMAN_BLOCK_KINDS
++
+ OP = "resume"
+ MAX_RESUMES = 2
+ MAX_CREATOR_HOPS = 3
+ VIA = "supervisor_resume"
+-HUMAN_BLOCK_KINDS = ("needs_input", "capability")
+ RESUMABLE_STATUSES = ("triage", "blocked")
+ # Events that move a card between lifecycle phases. The exhausted ``blocked`` event must be the
+ # newest of these, so a card that was already released (and maybe parked again for another
+@@ -141,20 +144,51 @@ def exhaustion_refusal(conn: sqlite3.Connection, target: str) -> Optional[str]:
+     return None
+ 
+ 
++def _created_event_id(conn: sqlite3.Connection, task_id: str) -> int:
++    row = conn.execute("SELECT MIN(id) FROM task_events WHERE task_id = ? AND kind = 'created'",
++                       (task_id,)).fetchone()
++    return int(row[0]) if row and row[0] is not None else 0
++
++
++def _park_event_id(conn: sqlite3.Connection, target: str) -> int:
++    row = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
++                       (target,)).fetchone()
++    return int(row[0]) if row and row[0] is not None else 0
++
++
++def _recovery_refusal(conn: sqlite3.Connection, requester: str, target: str) -> Optional[str]:
++    """An ancestor may be resumed only by a card created for THIS park (after its exhaustion block)."""
++    if _creator(conn, target) == requester:
++        return None  # a card the requester created; the requester owns it
++    if _created_event_id(conn, requester) <= _park_event_id(conn, target):
++        return (f"{requester} predates {target}'s current continuation_exhausted park; only a recovery "
++                "card created for this park may resume it")
++    return None
++
++
++def refusal(conn: sqlite3.Connection, requester: str, target: str) -> Optional[str]:
++    """Every precondition, read from the board as it is now. ``execute`` runs this inside the
++    unblock's write transaction, so nothing can change between the check and the write."""
++    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (target,)).fetchone()
++    if row is None:
++        return f"unknown task {target}"
++    if row[0] == "archived":
++        return f"{target} is archived"
++    found = (scope_refusal(conn, requester, target) or exhaustion_refusal(conn, target)
++             or _recovery_refusal(conn, requester, target))
++    if found is None and len(_resume_events(conn, target)) >= MAX_RESUMES:
++        found = (f"resume_budget_exhausted: {target} was already supervisor-resumed {MAX_RESUMES} times; "
++                 "split the work instead of resuming it again")
++    return found
++
++
+ def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
+-    target = op["task_id"]
+     verdict = {**op}
+-    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (target,)).fetchone()
+-    refusal = (None if row else f"unknown task {target}") or (
+-        f"{target} is archived" if row[0] == "archived" else None)
+-    refusal = refusal or scope_refusal(conn, requester, target) or exhaustion_refusal(conn, target)
+-    if refusal is None and len(_resume_events(conn, target)) >= MAX_RESUMES:
+-        refusal = (f"resume_budget_exhausted: {target} was already supervisor-resumed {MAX_RESUMES} times; "
+-                   "split the work instead of resuming it again")
+-    if refusal:
+-        verdict.update(verdict="refused", reason=refusal)
+-    else:
+-        verdict.update(verdict="supervisor")
++    refusal_text = refusal(conn, requester, op["task_id"])
++    if refusal_text:
++        verdict.update(verdict="refused", reason=refusal_text)
++        return verdict
++    verdict.update(verdict="supervisor")
+     return verdict
+ 
+ 
+@@ -165,6 +199,13 @@ def _readback(conn: sqlite3.Connection, target: str) -> dict:
+             "unsatisfied_parents": [p for p, _ in kb.unsatisfied_parents(conn, target)]}
+ 
+ 
++def _safe_readback(conn: sqlite3.Connection, target: str) -> dict:
++    try:
++        return _readback(conn, target)
++    except Exception as exc:  # the write already committed; a readback fault must not hide it
++        return {"readback_error": f"{type(exc).__name__}: {exc}"}
++
++
+ def execute(conn: sqlite3.Connection, req: dict, executor: str) -> str:
+     """Apply a resume request's ops (re-checked now); record the receipt via ``_finish``."""
+     from hermes_cli import kanban_db as kb
+@@ -177,7 +218,7 @@ def execute(conn: sqlite3.Connection, req: dict, executor: str) -> str:
+     for op in req["ops"]:
+         target = op["task_id"]
+         if applied_by(conn, target, rid):
+-            results.append({**op, "outcome": "already_applied", **_readback(conn, target)})
++            results.append({**op, "outcome": "already_applied", **_safe_readback(conn, target)})
+             continue
+         verdict = {"verdict": "refused", "reason": gone} if gone else preflight_op(conn, requester, op)
+         if error or verdict["verdict"] != "supervisor":
+@@ -187,13 +228,24 @@ def execute(conn: sqlite3.Connection, req: dict, executor: str) -> str:
+             continue
+         note = (f"Resumed by supervisor request #{rid} from {requester} (executor {executor}): the "
+                 "continuation budget had parked this card. Parent gating applies; acceptance unchanged.")
+-        ok = kb.unblock_task(conn, target, comment=(ksr.COMMENT_AUTHOR, note),
++        late: list[str] = []
++
++        def recheck(c, _t=target):
++            found = ksr.requester_refusal(c, requester) or refusal(c, requester, _t)
++            if found:
++                late.append(found)
++            return found
++
++        ok = kb.unblock_task(conn, target, comment=(ksr.COMMENT_AUTHOR, note), precondition=recheck,
+                              event_extra={"via": VIA, "request_id": rid, "by": requester})
+-        if ok and applied_by(conn, target, rid):
+-            results.append({**op, "outcome": "applied", **_readback(conn, target)})
++        if late:
++            error = late[0]
++            results.append({**op, "outcome": "not_applied", "detail": error})
++        elif ok and applied_by(conn, target, rid):
++            results.append({**op, "outcome": "applied", **_safe_readback(conn, target)})
+         else:
+             error = f"unblock_task did not move {target}"
+-            results.append({**op, "outcome": "failed", "detail": error, **_readback(conn, target)})
++            results.append({**op, "outcome": "failed", "detail": error, **_safe_readback(conn, target)})
+     applied = any(r["outcome"] in ("applied", "already_applied") for r in results)
+     status = "done" if not error else ("failed" if applied or any(r["outcome"] == "failed" for r in results)
+                                        else "rejected")
+diff --git a/tests/hermes_cli/test_kanban_assignment_routing.py b/tests/hermes_cli/test_kanban_assignment_routing.py
+index 6d105283c10..ad9cdd67ead 100644
+--- a/tests/hermes_cli/test_kanban_assignment_routing.py
++++ b/tests/hermes_cli/test_kanban_assignment_routing.py
+@@ -353,11 +353,43 @@ _AUTHORITY_REASON = (
+     'tool unblocks. Route to a non-worker supervisor.')
+ 
+ 
+-@pytest.mark.parametrize('reason', [
++_AUTHORITY_ASKS = [
+     _AUTHORITY_REASON,
+     'Need someone to requeue t_0123456789abcdef after the fix',
+     'Please reset the continuation budget so the work can resume',
+-])
++    'Call kanban_unblock on t_0123456789abcdef',
++    'kanban_unblock(t_0123456789abcdef) is fenced here',
++    'un-block t_0123456789abcdef',
++    'Move t_0123456789abcdef back to ready',
++    'Release t_0123456789abcdef from triage',
++    'Reopen t_0123456789abcdef',
++    'Unblock the stuck card. Its id is t_0123456789abcdef',
++    'Raise the continuation limit for this card',
++    'reset continuation_budget',
++]
++_PROFILE_MISMATCHES = [
++    'Worker lacks terminal tools', 'Wrong worker', 'Profile mismatch',
++    'Need the repo checkout that t_0123456789abcdef pushed',
++    'Needs the codex profile; resumes from t_0123456789abcdef checkpoint',
++    'Parent t_0123456789abcdef was promoted but this needs the gpu profile',
++    'This card was unblocked by t_0123456789abcdef but the worker lacks terminal tools',
++    'Promotion of t_0123456789abcdef is waiting; wrong worker',
++]
++
++
++@pytest.mark.parametrize('reason', _AUTHORITY_ASKS)
++def test_execution_authority_need_matches_asks(reason):
++    from hermes_cli import kanban_assignment_routing as ar
++    assert ar.execution_authority_need('t_ffffffffffffffff', reason), reason
++
++
++@pytest.mark.parametrize('reason', _PROFILE_MISMATCHES)
++def test_execution_authority_need_ignores_profile_mismatch_history(reason):
++    from hermes_cli import kanban_assignment_routing as ar
++    assert ar.execution_authority_need('t_ffffffffffffffff', reason) == [], reason
++
++
++@pytest.mark.parametrize('reason', _AUTHORITY_ASKS[:3])
+ def test_execution_authority_ask_is_refused_not_reassigned(board, reason):
+     """Reproduction (t_01a191a2b59741ef): an assignment block asking for another card's unblock got an
+     assignment repair that only swapped profiles; every profile's worker has the same fence."""
+@@ -374,8 +406,7 @@ def test_execution_authority_ask_is_refused_not_reassigned(board, reason):
+                             (tid,)).fetchone()
+ 
+ 
+-@pytest.mark.parametrize('reason', ['Worker lacks terminal tools', 'Wrong worker', 'Profile mismatch',
+-                                    'Need the repo checkout that t_0123456789abcdef pushed'])
++@pytest.mark.parametrize('reason', _PROFILE_MISMATCHES)
+ def test_profile_mismatch_still_routes_and_names_no_authority(board, reason):
+     from hermes_cli import kanban_assignment_routing as ar
+     conn, _ = board
+@@ -401,7 +432,7 @@ def test_legacy_authority_repair_cannot_complete_on_profile_existence_alone(boar
+         m.setattr(ar, 'execution_authority_need', lambda *a: [])  # the pre-fix route
+         assert kb.block_task(conn, tid, kind='assignment', reason=_AUTHORITY_REASON)
+     repair_id = payload(conn, tid)['supervisor_task_id']
+-    with pytest.raises(ar.ExecutionAuthorityMismatch):
++    with pytest.raises(ar.ExecutionAuthorityMismatch, match='archive it'):
+         kb.complete_task(conn, repair_id, result='Verified profile supervisor exists')
+     assert kb.get_task(conn, repair_id).status != 'done'
+     # Control: a real profile-mismatch repair still completes once its profile verifies.
+diff --git a/tests/hermes_cli/test_kanban_supervisor_resume.py b/tests/hermes_cli/test_kanban_supervisor_resume.py
+index 64ac4a9bcbf..29cef98c4e5 100644
+--- a/tests/hermes_cli/test_kanban_supervisor_resume.py
++++ b/tests/hermes_cli/test_kanban_supervisor_resume.py
+@@ -295,19 +295,72 @@ def test_resume_cannot_be_mixed_with_edge_ops_or_extra_fields(board):
+     assert extra["code"] == "invalid_ops"
+ 
+ 
++def _new_recovery(conn, monkeypatch, target, title="recover again"):
++    rec = kb.create_task(conn, title=title, assignee="default", creator_task_id=target)
++    kb.claim_task(conn, rec)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", rec)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, rec)))
++    return rec
++
++
++def test_recovery_card_from_an_earlier_park_cannot_resume_the_next_one(board, monkeypatch):
++    out = _tool(_resume(board["target"]))
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        assert _tick(conn) == [(out["request_id"], "done")]
++        _exhaust(conn, board["target"])  # it ran out of budget again
++    monkeypatch.setenv("HERMES_KANBAN_TASK", board["recovery"])
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(board["run_id"]))
++    again = _tool(_resume(board["target"]))
++    assert again["code"] == "refused" and "predates" in again["error"], again
++
++
+ def test_per_target_cap_bounds_repeated_resumes(board, monkeypatch):
+     for n in range(rx.MAX_RESUMES):
++        if n:
++            with kbc.connect() as conn:
++                _new_recovery(conn, monkeypatch, board["target"], f"recover {n}")
+         out = _tool(_resume(board["target"]))
++        assert out["ok"], out
+         _as_executor(monkeypatch)
+         with kbc.connect() as conn:
+             assert _tick(conn) == [(out["request_id"], "done")]
+-            _exhaust(conn, board["target"])  # it ran out of budget again
+-        monkeypatch.setenv("HERMES_KANBAN_TASK", board["recovery"])
+-        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(board["run_id"]))
++            _exhaust(conn, board["target"])
++    with kbc.connect() as conn:
++        _new_recovery(conn, monkeypatch, board["target"], "recover once more")
+     out = _tool(_resume(board["target"]))
+     assert out["code"] == "refused" and "resume_budget_exhausted" in out["error"], out
+ 
+ 
++def test_human_gate_landing_inside_execution_is_not_erased(board, monkeypatch):
++    """Race (review finding): a needs_input ask lands after the executor's first read but before
++    its write. The in-transaction precondition must see it and leave the human ask intact."""
++    out = _tool(_resume(board["target"]))
++    _as_executor(monkeypatch)
++    real = rx.preflight_op
++
++    def racing_preflight(conn, requester, op):
++        verdict = real(conn, requester, op)
++        other = kbc.connect()
++        try:
++            with kb.write_txn(other):
++                other.execute("UPDATE tasks SET status='blocked', block_kind='needs_input', human_request=? "
++                              "WHERE id=?", (json.dumps({"action": "pick A or B"}), op["task_id"]))
++        finally:
++            other.close()
++        return verdict
++
++    monkeypatch.setattr(rx, "preflight_op", racing_preflight)
++    with kbc.connect() as conn:
++        assert _tick(conn) == [(out["request_id"], "rejected")]
++        task = kb.get_task(conn, board["target"])
++        assert (task.status, task.block_kind) == ("blocked", "needs_input")
++        assert task.human_request["action"] == "pick A or B"
++        assert "human_gate" in ksr.get_request(conn, out["request_id"])["error"]
++        assert _resume_events(conn, board["target"]) == []
++        assert not any(c.author == ksr.COMMENT_AUTHOR for c in kb.list_comments(conn, board["target"]))
++
++
+ # --- crash retry -----------------------------------------------------------------------------
+ 
+ _CRASH_AFTER_APPLY = """
+-- 
+2.55.0
+

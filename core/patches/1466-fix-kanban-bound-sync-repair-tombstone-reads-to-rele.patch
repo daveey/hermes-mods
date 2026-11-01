@@ -1,0 +1,130 @@
+From 1e6b8c54d7088a9c2169a4effe43879b5823e321 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:09:05 -0700
+Subject: [PATCH] fix(kanban): bound sync repair tombstone reads to relevant
+ tables [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              | 12 ++-
+ .../test_kanban_sync_repair_history_cost.py   | 79 +++++++++++++++++++
+ 2 files changed, 87 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_repair_history_cost.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index c087a85f549..ab19792d0bd 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1093,8 +1093,12 @@ def repair_missing_children(live: sqlite3.Connection, shadow: sqlite3.Connection
+     with write_txn(live):
+         held = {(t, u) for t, u in live.execute(
+             "SELECT table_name, row_uid FROM kanban_sync_outbox WHERE state IN ('pending', 'rejected')")}
+-        held |= {(t, u) for t, u in live.execute("SELECT table_name, row_uid FROM kanban_sync_tombstones")}
+-        held |= {(t, u) for t, u in shadow.execute("SELECT table_name, row_uid FROM kanban_sync_tombstones")}
++        # Event deletion history can dwarf the links. The tombstone PK starts with table_name;
++        # read only the types consulted below, retaining task tombstones as a settlement veto.
++        tombstones_sql = ("SELECT table_name, row_uid FROM kanban_sync_tombstones "
++                          "WHERE table_name IN ('tasks', 'task_links', 'task_chat_links')")
++        held |= {(t, u) for t, u in live.execute(tombstones_sql)}
++        held |= {(t, u) for t, u in shadow.execute(tombstones_sql)}
+         settled = {r[0] for r in live.execute("SELECT id, sync_version FROM tasks WHERE sync_version IS NOT NULL")
+                    if seen.get(r[0]) == r[1] and ("tasks", r[0]) not in held}
+         for table in ("task_links", "task_chat_links"):
+@@ -1132,8 +1136,8 @@ def retire_lost_placeholder_links(live: sqlite3.Connection, shadow: sqlite3.Conn
+         held = {u for t, u in live.execute(
+             "SELECT table_name, row_uid FROM kanban_sync_outbox WHERE state IN ('pending', 'rejected')")
+             if t == "task_chat_links"}
+-        held |= {u for t, u in live.execute("SELECT table_name, row_uid FROM kanban_sync_tombstones")
+-                 if t == "task_chat_links"}
++        held |= {r[0] for r in live.execute(
++            "SELECT row_uid FROM kanban_sync_tombstones WHERE table_name = 'task_chat_links'")}
+         now_ms = time.time_ns() // 1_000_000
+         for uid, _session in lost:
+             if uid in have or uid in held:
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_history_cost.py b/tests/hermes_cli/test_kanban_sync_repair_history_cost.py
+new file mode 100644
+index 00000000000..b9659cfec02
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_repair_history_cost.py
+@@ -0,0 +1,79 @@
++"""Repair work must scale with relevant links, not historical event deletions."""
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_placement
++from hermes_cli import kanban_sync_client as client
++
++
++def _db():
++    conn = sqlite3.connect(":memory:", isolation_level=None)
++    conn.row_factory = sqlite3.Row
++    conn.executescript("""
++        CREATE TABLE tasks(id TEXT PRIMARY KEY, sync_version INTEGER, created_on TEXT);
++        CREATE TABLE task_links(uid TEXT, parent_id TEXT, child_id TEXT);
++        CREATE TABLE task_chat_links(uid TEXT, task_id TEXT, chat_session TEXT, chat_gateway TEXT);
++        CREATE TABLE kanban_sync_tombstones(table_name TEXT, row_uid TEXT, deleted_at INTEGER,
++                                           PRIMARY KEY(table_name, row_uid));
++        CREATE TABLE kanban_sync_outbox(op_id TEXT, table_name TEXT, row_uid TEXT, op TEXT,
++            fields TEXT, base_version INTEGER, hlc TEXT, created_at INTEGER, state TEXT DEFAULT 'pending');
++        INSERT INTO tasks VALUES ('parent', 1, 'macbook'), ('child', 1, 'macbook');
++    """)
++    return conn
++
++
++def _run(live, shadow, retirement):
++    if retirement:
++        return client.retire_lost_placeholder_links(live, shadow, "macbook")
++    return client.repair_missing_children(live, shadow, "macbook")
++
++
++@pytest.mark.parametrize("retirement", [False, True])
++@pytest.mark.parametrize("history_side", ["live", "shadow"])
++def test_unrelated_tombstone_history_has_bounded_vm_work(monkeypatch, retirement, history_side):
++    monkeypatch.setattr(kanban_placement, "config", dict)
++    with closing(_db()) as live, closing(_db()) as shadow:
++        shadow.execute("INSERT INTO task_chat_links VALUES ('gone', 'child', 'kanban-placement-macbook', 'macbook')")
++        history = live if history_side == "live" else shadow
++        history.executemany("INSERT INTO kanban_sync_tombstones VALUES ('task_events', ?, 1)",
++                            [(str(i),) for i in range(10000)])
++        ticks = []
++        for conn in (live, shadow):
++            conn.set_progress_handler(lambda: ticks.append(1) or 0, 1000)
++        _run(live, shadow, retirement)
++        for conn in (live, shadow):
++            conn.set_progress_handler(None, 0)
++        assert len(ticks) < 10, f"repair scanned unrelated history: {len(ticks)}k VM steps"
++        if retirement:
++            assert [tuple(r) for r in live.execute("SELECT op, row_uid FROM kanban_sync_outbox")] == [("delete", "gone")]
++
++
++@pytest.mark.parametrize("side", ["live", "shadow"])
++@pytest.mark.parametrize("table,uid", [("tasks", "child"), ("task_links", "parent>child"),
++                                      ("task_chat_links", "chat")])
++def test_relevant_tombstones_still_veto_missing_child_repair(side, table, uid):
++    with closing(_db()) as live, closing(_db()) as shadow:
++        live.execute("INSERT INTO task_links VALUES ('parent>child', 'parent', 'child')")
++        live.execute("INSERT INTO task_chat_links VALUES ('chat', 'child', 'real-chat', 'macbook')")
++        tombstones = live if side == "live" else shadow
++        tombstones.execute("INSERT INTO kanban_sync_tombstones VALUES (?, ?, 1)", (table, uid))
++        client.repair_missing_children(live, shadow, "macbook")
++        queued = {r[0] for r in live.execute("SELECT row_uid FROM kanban_sync_outbox")}
++        expected = set() if table == "tasks" else {"parent>child", "chat"} - {uid}
++        assert queued == expected
++
++
++def test_retirement_preserves_tombstone_and_inflight_vetoes(monkeypatch):
++    monkeypatch.setattr(kanban_placement, "config", dict)
++    with closing(_db()) as live, closing(_db()) as shadow:
++        for uid in ("deleted", "pending", "rejected", "free"):
++            shadow.execute("INSERT INTO task_chat_links VALUES (?, 'child', 'kanban-placement-macbook', 'macbook')", (uid,))
++        live.execute("INSERT INTO kanban_sync_tombstones VALUES ('task_chat_links', 'deleted', 1)")
++        live.execute("INSERT INTO kanban_sync_tombstones VALUES ('task_events', 'free', 1)")
++        for state in ("pending", "rejected"):
++            live.execute("INSERT INTO kanban_sync_outbox(table_name, row_uid, state) VALUES ('task_chat_links', ?, ?)",
++                         (state, state))
++        assert client.retire_lost_placeholder_links(live, shadow, "macbook") == 1
++        assert [r[0] for r in live.execute("SELECT row_uid FROM kanban_sync_outbox WHERE op = 'delete'")] == ["free"]
+-- 
+2.55.0
+
