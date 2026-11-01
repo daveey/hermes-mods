@@ -150,3 +150,10 @@ the repo root does not work: plugins reuse test-module names, some need a core c
 `-j N`, `--timeout SECS`, `--list`, `--hermes-core PATH` (overrides `HERMES_CORE_CHECKOUT`, then
 `~/.hermes/hermes-agent`). `tests/integration_f3` runs whenever core is found; only a missing core skips it
 with a reason. Proof that one broken plugin is reported by name: `python3 -m pytest -q tests/test_test_all.py`.
+The versioned test dependency cache includes `anthropic==0.125.0`, matching core's supported SDK;
+a missing or different cached SDK triggers provisioning. This is a test dependency pin, not an interpreter
+pin. Account-usage's cold-process teardown test retains the parent's dependency paths while isolating HOME.
+Detached-worktree checks for the repaired harnesses:
+`scripts/test-all -k backend-restart-guard -k cpu-load-guard -k runners -k account-usage`.
+The CPU guard's pytest fixture discovers the worktree via an isolated plugin home, retaining the
+exact module-identity, registered-hook, deny/allow and no-busy-loop assertions.

@@ -59,6 +59,11 @@ def test_core_auth_source_prefers_the_explicit_override(tmp_path, monkeypatch):
 def api(monkeypatch, tmp_path):
     # Execute the exact core auth implementation, not a permissive mock.
     core = resolve_core_auth_source()
+    # Auth now lazily imports dashboard_auth during requests. Keep the selected
+    # core importable for the fixture lifetime, after mods' plugins package so
+    # core's own plugins package cannot shadow the implementation under test.
+    if (core.parent / '__init__.py').is_file():
+        monkeypatch.setattr(sys, 'path', [*sys.path, str(core.resolve().parents[1])])
     tree = ast.parse(core.read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
              ('_require_token', '_has_valid_session_token')]

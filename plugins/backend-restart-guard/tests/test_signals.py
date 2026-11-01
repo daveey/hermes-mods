@@ -146,3 +146,15 @@ for name, template, denied in CASES:
         def test(self, template=template, denied=denied, path=path):
             getattr(self, path)(self.command(template), denied)
         setattr(Signals, 'test_' + path + '_' + name, test)
+
+# The methods belong to Signals; the last loop-local binding is not a free
+# pytest test (it requires unittest's self).
+del test
+
+
+def test_generated_case_inventory():
+    expected = {'test_' + path + '_' + name
+                for name, _, _ in CASES for path in ('hermes', 'claude')}
+    assert expected <= set(vars(Signals))
+    assert len(expected) == len(CASES) * 2
+    assert 'test' not in globals()

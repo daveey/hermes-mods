@@ -171,11 +171,23 @@ class TestAll(unittest.TestCase):
             self.assertEqual(site, self.root / 'python-3.14')
             install.assert_called_once_with(
                 ['/bin/uv', 'pip', 'install', '-q', '--python', '/fake/python with spaces',
-                 '--target', str(site), 'pytest', 'pytest-asyncio', 'pyyaml', 'fastapi', 'httpx', 'psutil'], check=True)
-            for name in ('pytest', 'pytest_asyncio', 'yaml', 'fastapi', 'httpx', 'psutil'):
+                 '--target', str(site), 'pytest', 'pytest-asyncio', 'pyyaml', 'fastapi', 'httpx', 'psutil', 'anthropic==0.125.0'], check=True)
+            for name in ('pytest', 'pytest_asyncio', 'yaml', 'fastapi', 'httpx', 'psutil', 'anthropic'):
                 (site / name).mkdir(parents=True)
+            metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
+            metadata.parent.mkdir()
+            metadata.write_text('Name: anthropic\nVersion: 0.125.0\n')
             ensure('/fake/python with spaces')
             self.assertEqual(install.call_count, 1)
+            # A cache from before SDK provisioning must be repaired, not reused.
+            (site / 'anthropic').rmdir()
+            ensure('/fake/python with spaces')
+            self.assertEqual(install.call_count, 2)
+            self.assertIn('anthropic==0.125.0', install.call_args.args[0])
+            (site / 'anthropic').mkdir()
+            metadata.write_text('Name: anthropic\nVersion: 2.3.0\n')
+            ensure('/fake/python with spaces')
+            self.assertEqual(install.call_count, 3)
 
     def test_test_site_finds_user_uv_or_reports_missing_installer(self):
         runner = runpy.run_path(str(RUNNER))

@@ -134,9 +134,21 @@ if __name__ == "__main__":
     main()
 
 
-def test_worker_runtime_blocks_40_loop_and_allows_pytest():
+def test_worker_runtime_blocks_40_loop_and_allows_pytest(tmp_path, monkeypatch):
     """Collected only when pytest can see this file. Skips without the worker runtime."""
     import pytest
 
     pytest.importorskip("hermes_cli")
-    main()
+    # Discover this worktree through the real loader, not the installed copy.
+    # Keep main() unchanged so standalone execution still verifies live identity.
+    home = tmp_path / 'home'
+    (home / 'plugins').mkdir(parents=True)
+    (home / 'plugins' / 'cpu-load-guard').symlink_to(HERE, target_is_directory=True)
+    (home / 'config.yaml').write_text('plugins:\n  enabled: [cpu-load-guard]\n')
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    from hermes_cli.plugins import get_plugin_manager
+    manager = get_plugin_manager()
+    try:
+        main()
+    finally:
+        manager.unload()
