@@ -1458,6 +1458,35 @@ def _kanban_api():
     return kanban_db, classify_parked_request
 
 
+def _ask_bound_to_job(con, task: str, meta: dict, owner: dict, ended: float) -> bool:
+    """The card's current ask was set while this job's window was live.
+
+    The latest ``blocked`` event not written by this plugin is what set the current
+    ask (a block or another actor's metadata-only edit). It must fall between the
+    job's creation and its end, and come from the job's run when both are known.
+    An older job, or an ask set after the window closed, is unrelated: no write.
+    """
+    try:
+        created = float(meta.get("created") or "")
+    except (TypeError, ValueError):
+        return False
+    for run_id, payload, at in con.execute(
+            "SELECT run_id, payload, created_at FROM task_events WHERE task_id=? AND kind='blocked' "
+            "ORDER BY id DESC", (task,)):
+        try:
+            data = json.loads(payload) if payload else {}
+        except ValueError:
+            data = {}
+        if isinstance(data, dict) and data.get("actor") == "user-terminal":
+            continue
+        # Event times are whole seconds; allow the truncation either side.
+        if not (int(created) - 1 <= int(at) <= ended + 1):
+            return False
+        own = _as_int(owner.get("run_id"))
+        return run_id is None or own is None or int(run_id) == own
+    return False
+
+
 def reconcile_closed_ask(job: Path, st: dict) -> None:
     """Amend only the action of a still-parked owner; errors never change job results.
 
@@ -1476,7 +1505,7 @@ def reconcile_closed_ask(job: Path, st: dict) -> None:
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
-        _, owner = _job_meta_owner(job)
+        meta, owner = _job_meta_owner(job)
         task, path = owner.get("task_id") or owner.get("task"), owner.get("db")
         if owner.get("kind") != "card" or not task or not path:
             return
@@ -1511,9 +1540,14 @@ def reconcile_closed_ask(job: Path, st: dict) -> None:
             # Final-file mtime also gives old jobs a stable end time across retries.
             final = job / "final.lock" / "result.json"
             ended = (final if final.exists() else job / "status.json").stat().st_mtime
+            if not _ask_bound_to_job(con, task, meta, owner, ended):
+                return
             local = datetime.fromtimestamp(ended, ZoneInfo("America/Los_Angeles"))
-            action = (f"window closed {local:%H:%M %Z}. Unblock = agent reopens window; "
-                      "archive = drop request.")
+            purpose = " ".join(str(meta.get("reason") or "").split())
+            if len(purpose) > 80:
+                purpose = purpose[:79].rstrip() + "…"
+            action = (f"window closed {local:%H:%M %Z}" + (f" (it was for: {purpose})" if purpose else "")
+                      + ". Unblock = agent reopens window; archive = drop request.")
             amended = {**request, "action": action}
             cause = st.get("reason") or st.get("error") or status
             reason = f"Terminal job {job.name} ended: {status}: {cause}; {local.isoformat()}"

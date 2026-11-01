@@ -11,10 +11,18 @@ blocked ask pointing at a window that is gone.
 write can be repaired on a later call. The job's final outcome is never changed
 by board-reconciliation success or failure.
 
-For a still-blocked card with no current run and no later-run attachment:
+For a still-blocked card with no current run and no later-run attachment, and
+only when the card's current ask was set while this job's window was live:
 
-- Set only `human_request.action` to `window closed HH:MM PDT. Unblock = agent
-  reopens window; archive = drop request.` The timezone is `America/Los_Angeles`,
+- The binding: the latest `blocked` task event not written by this plugin (a
+  block, or another actor's metadata-only edit) must fall between the job's
+  `created` time and its end time, and carry the job's run id when both are
+  known. A job that failed while the card was running, an ask set before the
+  window opened or after it closed, an ask from another run, or a card with no
+  block event at all gets no write: the window is not what the card waits on.
+- Set only `human_request.action` to `window closed HH:MM PDT (it was for:
+  <the job's reason, up to 80 chars>). Unblock = agent reopens window; archive =
+  drop request.` The timezone is `America/Los_Angeles`,
   so winter uses PST. The final result file's mtime supplies a stable end time
   for old jobs as well as new ones.
 - Preserve all other request fields, including decision choices. Read back the
@@ -67,6 +75,13 @@ Coverage:
 - Exact no-write snapshots for ineligible owner/job states and write-fence refusal.
 - Atomic rollback on comment failure, followed by successful final-path retry.
 - Fresh standalone `__init__.py --watchdog` import and loaded-module identity.
+- Ask binding (review round 1): a job that failed while the card ran, then a
+  later block on an unrelated ask by the same run, a later run, or another
+  actor's metadata-only edit, gets no write on any later sweep; so does a card
+  with no block event, a block before the window opened, or a block in the window
+  by another run. A sweep after this plugin's own amendment reads past its event
+  and still dedups. On `99ab1291` the six unrelated-ask/binding cases fail (they
+  rewrite the ask); all 42 closed-ask + opener tests pass with the binding.
 
 Baseline `0ef1c614`: the six watch/sweep positive cases and four new-outcome cases
 fail (10 failures); all 12 no-write cases pass. The baseline fixture borrows only

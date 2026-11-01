@@ -51,7 +51,23 @@ def board(monkeypatch):
         owner = {"kind": "card", "board": "default", "task_id": "t_card", "run_id": 7}
         monkeypatch.setattr(ut, "board_db_path", lambda b: str(path))
         job = ut.create_job("true", "fixture", str(root), owner=owner)
+        # The window opened at 14:00 and run 7 blocked on it at 14:05 (both PDT).
+        meta = json.loads((job / "meta.json").read_text())
+        meta["created"] = at(14, 0)
+        (job / "meta.json").write_text(json.dumps(meta))
+        add_block(path, at(14, 5), 7, {"human_request": REQUEST, "kind": "human"})
         yield path, job, db
+
+
+def at(hour, minute, winter=False):
+    return datetime(2026, 1 if winter else 10, 15, hour, minute,
+                    tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()
+
+
+def add_block(path, when, run_id, payload):
+    with sqlite3.connect(path) as con:
+        con.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "VALUES ('t_card', ?, 'blocked', ?, ?)", (run_id, json.dumps(payload), int(when)))
 
 
 def snapshot(path):
@@ -63,8 +79,7 @@ def snapshot(path):
 def final(job, status="withdrawn", reason="expired after 120 min; ask again if still needed", winter=False):
     st = {"status": status, "reason": reason, "job_id": job.name}
     assert ut._take_final(job, st)
-    stamp = datetime(2026, 1 if winter else 10, 15, 14, 37,
-                     tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()
+    stamp = at(14, 37, winter)
     os.utime(job / "final.lock" / "result.json", (stamp, stamp))
     return st
 
@@ -86,7 +101,7 @@ def test_closed_ask_reconciles_once_preserving_every_other_field(board, status, 
         con.row_factory = sqlite3.Row
         row = con.execute("SELECT * FROM tasks").fetchone()
         request = json.loads(row["human_request"])
-        assert request == {**REQUEST, "action": "window closed 14:37 PDT. Unblock = agent reopens window; archive = drop request."}
+        assert request == {**REQUEST, "action": "window closed 14:37 PDT (it was for: fixture). Unblock = agent reopens window; archive = drop request."}
         comments = con.execute("SELECT body FROM task_comments").fetchall()
         assert len(comments) == 1
         assert all(x in comments[0][0] for x in (job.name, status, reason, "2026-10-15T14:37:00-07:00"))
@@ -104,6 +119,10 @@ def test_closed_ask_reconciles_once_preserving_every_other_field(board, status, 
 
 def test_winter_uses_pst(board):
     path, job, _ = board
+    meta = json.loads((job / "meta.json").read_text())
+    meta["created"] = at(14, 0, winter=True)
+    (job / "meta.json").write_text(json.dumps(meta))
+    add_block(path, at(14, 5, winter=True), 7, {"human_request": REQUEST})
     final(job, winter=True)
     ut.watch_once(job, {})
     with sqlite3.connect(path) as con:
@@ -200,3 +219,59 @@ def test_standalone_watchdog_bootstraps_real_core(board):
                             text=True, capture_output=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert len(snapshot(path)["task_comments"]) == 1, result.stderr
+
+
+UNRELATED = {**REQUEST, "action": "Pick A or B for the schema. Unblock = A; archive = B."}
+
+
+@pytest.mark.parametrize("later_run", [7, 8, None])
+def test_old_job_never_rewrites_a_later_unrelated_ask(board, later_run):
+    """The job failed while the card ran; the card later blocked on something else (same run, a later run,
+    or another actor's metadata-only edit). The old job's window is not what the card waits on."""
+    path, job, _ = board
+    with sqlite3.connect(path) as con:
+        con.execute("DELETE FROM task_events")
+        con.execute("UPDATE tasks SET status='running', current_run_id=7, human_request=NULL")
+    final(job, "failed", "could not open a terminal window")
+    ut.sweep_jobs()
+    assert not snapshot(path)["task_comments"]
+    with sqlite3.connect(path) as con:
+        con.execute("UPDATE tasks SET status='blocked', current_run_id=NULL, human_request=?",
+                    (json.dumps(UNRELATED),))
+    payload = {"human_request": UNRELATED, "kind": "human"}
+    if later_run is None:
+        payload.update(actor="agent", metadata_only=True)
+    add_block(path, at(14, 50), later_run, payload)
+    before = snapshot(path)
+    ut.sweep_jobs()
+    ut.sweep_jobs()
+    assert snapshot(path) == before
+
+
+@pytest.mark.parametrize("case", ["no_block_event", "block_before_window", "other_run_in_window"])
+def test_ask_not_set_during_this_window_has_zero_writes(board, case):
+    path, job, _ = board
+    with sqlite3.connect(path) as con:
+        con.execute("DELETE FROM task_events")
+    if case == "block_before_window":
+        add_block(path, at(13, 0), 7, {"human_request": REQUEST})
+    elif case == "other_run_in_window":
+        add_block(path, at(14, 5), 9, {"human_request": REQUEST})
+    final(job)
+    before = snapshot(path)
+    ut.sweep_jobs()
+    assert snapshot(path) == before
+
+
+def test_own_amendment_does_not_hide_the_binding_block(board):
+    """A later sweep reads past this plugin's own metadata-only event and still dedups by marker."""
+    path, job, _ = board
+    final(job)
+    ut.sweep_jobs()
+    with sqlite3.connect(path) as con:
+        kinds = [json.loads(p).get("actor") for (p,) in con.execute(
+            "SELECT payload FROM task_events WHERE kind='blocked' ORDER BY id")]
+    assert kinds[-1] == "user-terminal"
+    before = snapshot(path)
+    ut.sweep_jobs()
+    assert snapshot(path) == before
