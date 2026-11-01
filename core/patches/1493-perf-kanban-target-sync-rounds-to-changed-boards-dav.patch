@@ -1,0 +1,354 @@
+From ee254b034f8b4a8c42aec5e1aafe6622c5f7fb27 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:36:12 +0000
+Subject: [PATCH] perf(kanban): target sync rounds to changed boards [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              |  42 ++++--
+ hermes_cli/kanban_sync_work.py                |  34 +++++
+ tests/hermes_cli/test_kanban_sync_client.py   |   5 +-
+ .../test_kanban_sync_targeted_rounds.py       | 131 ++++++++++++++++++
+ 4 files changed, 202 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_work.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 0e396505d08..eb26c879a65 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -697,12 +697,13 @@ def publish_pickup_if_changed(hub: Any, *, now: Optional[float] = None) -> bool:
+     return True
+ 
+ 
+-def sync_all_once(hub: Optional[Hub] = None) -> list[RoundResult]:
++def sync_all_once(hub: Optional[Hub] = None, *,
++                  boards: Optional[list[tuple[str, Path]]] = None) -> list[RoundResult]:
+     ident = load_identity() if hub is None else hub.ident
+     hub = hub or Hub(ident)
+     publish_pickup_if_changed(hub)
+     results = []
+-    for slug, path in board_paths():
++    for slug, path in board_paths() if boards is None else boards:
+         try:
+             results.append(sync_board(slug, path, hub, ident.gateway))
+         except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable) as exc:
+@@ -717,8 +718,9 @@ class FeedWatcher:
+     ``ping_s`` and reconnects with backoff; polling still covers a closed socket."""
+ 
+     def __init__(self, ident: Identity, board: str, wake: threading.Event, keep_running: Callable[[], bool],
+-                 ping_s: float = 25.0) -> None:
++                 ping_s: float = 25.0, on_change: Optional[Callable[[str], None]] = None) -> None:
+         self.ident, self.board, self.wake, self.keep_running, self.ping_s = ident, board, wake, keep_running, ping_s
++        self.on_change = on_change
+         self.frames = 0
+ 
+     def url(self) -> str:
+@@ -740,6 +742,9 @@ class FeedWatcher:
+                                                              "user-agent": "hermes-kanban-sync/1"},
+                              open_timeout=HTTP_TIMEOUT_S, logger=ws_logger()) as ws:
+                     backoff = 1.0
++                    if self.on_change is not None:
++                        self.on_change(self.board)
++                        self.wake.set()  # reconnects must catch changes missed while disconnected
+                     while self.keep_running():
+                         try:
+                             raw = ws.recv(timeout=self.ping_s)
+@@ -752,6 +757,8 @@ class FeedWatcher:
+                             continue
+                         if kind in ("changes", "changed", "resync"):
+                             self.frames += 1
++                            if self.on_change is not None:
++                                self.on_change(self.board)
+                             self.wake.set()
+             except Exception as exc:  # health: allow BLE001 -- any socket failure: back off and reconnect; polling covers the gap
+                 _log.info("kanban sync: %s feed socket closed (%s: %s); reconnecting in %.0fs",
+@@ -807,6 +814,7 @@ class _BoardWatch:
+         self._lock = threading.Lock()
+         self._conns: dict[str, tuple[tuple[int, int], sqlite3.Connection, int]] = {}
+         self._gen = 0
++        self._answers: dict[str, tuple[int, str, Any]] = {}
+ 
+     def _conn(self, path: Path) -> Optional[tuple[sqlite3.Connection, int]]:
+         key = os.path.realpath(path)
+@@ -828,6 +836,7 @@ class _BoardWatch:
+         return conn, self._gen
+ 
+     def _drop(self, key: str) -> None:
++        self._answers.pop(key, None)
+         ent = self._conns.pop(key, None)
+         if ent is not None:
+             try:
+@@ -835,7 +844,7 @@ class _BoardWatch:
+             except sqlite3.Error:
+                 pass
+ 
+-    def query(self, path: Path, sql: str) -> Optional[tuple[int, Any]]:
++    def query(self, path: Path, sql: str, *, unchanged_ok: bool = False) -> Optional[tuple[int, Any]]:
+         """(generation, first row) or None when the file cannot be read."""
+         with self._lock:
+             try:
+@@ -843,7 +852,17 @@ class _BoardWatch:
+                 if got is None:
+                     return None
+                 conn, gen = got
+-                return gen, conn.execute(sql).fetchone()
++                key = os.path.realpath(path)
++                version = conn.execute("PRAGMA data_version").fetchone()[0] if unchanged_ok else None
++                cached = self._answers.get(key)
++                if unchanged_ok and cached is not None and cached[:2] == (version, sql):
++                    return gen, cached[2]
++                answer = conn.execute(sql).fetchone()
++                if unchanged_ok:
++                    # Version is read BEFORE the query: a concurrent commit may cause
++                    # one extra read, but cannot publish a stale answer as current.
++                    self._answers[key] = (version, sql, answer)
++                return gen, answer
+             except sqlite3.Error:
+                 self._drop(os.path.realpath(path))
+                 return None
+@@ -891,7 +910,8 @@ def _repair_inputs(live_path: Path, replica: sqlite3.Connection, mode: str, gate
+ def outbox_pending(paths: Iterable[Path]) -> bool:
+     """True when any synced board has a local change waiting to be pushed (one indexed read on a kept connection)."""
+     for path in paths:
+-        got = _WATCH.query(path, "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1")
++        got = _WATCH.query(path, "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1",
++                           unchanged_ok=True)
+         if got is not None and got[1]:
+             return True
+     return False
+@@ -929,6 +949,8 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+     period = float(interval or sync.sync_config().get("interval_seconds") or DEFAULT_INTERVAL_S)
+     _log.info("kanban sync: running as gateway %s against %s (feed sockets; poll every %.1fs)", ident.gateway, ident.url, period)
+     wake = threading.Event()
++    from hermes_cli.kanban_sync_work import SyncWork
++    work = SyncWork(period)
+     watchers: dict[str, threading.Thread] = {}
+     next_links = 0.0
+     from hermes_cli.machine_metrics import Reporter
+@@ -937,10 +959,11 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+         boards = board_paths()
+         for slug, _path in boards:
+             if slug not in watchers or not watchers[slug].is_alive():
+-                watcher = FeedWatcher(ident, slug, wake, keep_running)
++                watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed)
+                 watchers[slug] = threading.Thread(target=watcher.run, daemon=True, name=f"kanban-feed-{slug}")
+                 watchers[slug].start()
+-        for r in sync_all_once(hub):
++        selected = work.select(boards, time.monotonic(), outbox_pending)
++        for r in sync_all_once(hub, boards=selected):
+             if r.push and (r.push.sent or r.push.rejected):
+                 _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+                           r.push.sent, r.push.rejected)
+@@ -948,7 +971,8 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+             reconcile_links(boards, ident.gateway)
+             next_links = time.monotonic() + LINKS_EVERY_S
+         metrics.report_due()
+-        wait_for_work(wake, [p for _s, p in boards], period, keep_running)
++        remaining = max(0.0, work.deadline - time.monotonic())
++        wait_for_work(wake, [p for _s, p in boards], remaining, keep_running)
+ 
+ 
+ # --- import ---------------------------------------------------------------------------------------
+diff --git a/hermes_cli/kanban_sync_work.py b/hermes_cli/kanban_sync_work.py
+new file mode 100644
+index 00000000000..d613f661da3
+--- /dev/null
++++ b/hermes_cli/kanban_sync_work.py
+@@ -0,0 +1,34 @@
++"""Board-specific feed invalidation, with a fixed full-recovery deadline."""
++from __future__ import annotations
++
++import threading
++from pathlib import Path
++from collections.abc import Callable
++
++
++class SyncWork:
++    def __init__(self, period: float) -> None:
++        self.period = period
++        self.deadline = 0.0
++        self._lock = threading.Lock()
++        self._dirty: set[str] = set()
++        self._known: set[tuple[str, Path]] = set()
++
++    def changed(self, board: str) -> None:
++        with self._lock:
++            self._dirty.add(board)
++
++    def select(self, boards: list[tuple[str, Path]], now: float,
++               pending: Callable[[list[Path]], bool]) -> list[tuple[str, Path]]:
++        # Consume before starting IO: an event arriving during that IO remains dirty
++        # for the next round, even if its event notification is coalesced.
++        with self._lock:
++            dirty, self._dirty = self._dirty, set()
++        current = set(boards)
++        new = current - self._known
++        self._known = current
++        if now >= self.deadline:
++            self.deadline = now + self.period
++            return boards
++        return [(slug, path) for slug, path in boards
++                if (slug, path) in new or slug in dirty or pending([path])]
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 495d28bedf1..d639f2db773 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -831,7 +831,9 @@ def test_feed_watcher_wakes_the_loop_on_a_change_frame_and_keeps_the_socket_aliv
+         threading.Thread(target=server.serve_forever, daemon=True).start()
+         wake = threading.Event()
+         ident = ksc.Identity(url=f"http://127.0.0.1:{port}", key="gw-key", gateway=ME)
+-        watcher = ksc.FeedWatcher(ident, BOARD, wake, lambda: not stop.is_set(), ping_s=0.2)
++        changed_boards = []
++        watcher = ksc.FeedWatcher(ident, BOARD, wake, lambda: not stop.is_set(), ping_s=0.2,
++                                  on_change=changed_boards.append)
+         t = threading.Thread(target=watcher.run, daemon=True)
+         t.start()
+         try:
+@@ -841,6 +843,7 @@ def test_feed_watcher_wakes_the_loop_on_a_change_frame_and_keeps_the_socket_aliv
+                 time.sleep(0.05)
+             assert seen["auth"] == "Bearer gw-key" and seen["path"] == f"/v2/boards/{BOARD}/ws"
+             assert seen["pings"] >= 1 and watcher.frames == 1  # hello is not a change
++            assert changed_boards == [BOARD, BOARD]  # connection recovery, then the change frame
+         finally:
+             stop.set()
+             server.shutdown()
+diff --git a/tests/hermes_cli/test_kanban_sync_targeted_rounds.py b/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+new file mode 100644
+index 00000000000..3b76cba8edb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+@@ -0,0 +1,131 @@
++"""Event wakes must not pull unchanged sibling boards."""
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++
++
++def test_feed_wake_only_pulls_changed_board_and_local_outbox(monkeypatch):
++    boards = [(name, Path(name)) for name in ('one', 'two', 'three')]
++    wake_by_board = {}
++    rounds = []
++    pending = set()
++    clock = [100.0]
++    monkeypatch.setattr(client, 'load_identity', lambda: client.Identity('https://example.com', 'test', 'gateway'))
++    monkeypatch.setattr(client, 'board_paths', lambda: boards)
++    monkeypatch.setattr(client.sync, 'set_lease_client', lambda _: None)
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda _: None)
++    monkeypatch.setattr(client, 'reconcile_links', lambda *args: None)
++    monkeypatch.setattr(client, 'outbox_pending', lambda paths: any(p in pending for p in paths))
++    monkeypatch.setattr(client, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
++    from hermes_cli import machine_metrics
++    monkeypatch.setattr(machine_metrics, 'Reporter', lambda _: SimpleNamespace(report_due=lambda: None))
++
++    class Watcher:
++        def __init__(self, ident, board, wake, keep_running, **kwargs):
++            wake_by_board[board] = lambda: (kwargs.get('on_change', lambda _: None)(board), wake.set())
++        def run(self):
++            pass
++
++    class Thread:
++        def __init__(self, **kwargs):
++            pass
++        def start(self):
++            pass
++        def is_alive(self):
++            return True
++
++    import threading
++    monkeypatch.setattr(client, 'threading', SimpleNamespace(Thread=Thread, Event=threading.Event))
++    monkeypatch.setattr(client, 'FeedWatcher', Watcher)
++    def sync_board(slug, *args):
++        rounds[-1].append(slug)
++        return client.RoundResult(board=slug, mode='primary')
++    monkeypatch.setattr(client, 'sync_board', sync_board)
++    def keep_running():
++        return len(rounds) < 4
++    def wait(*args):
++        if len(rounds) == 1:
++            wake_by_board['one']()
++        elif len(rounds) == 2:
++            pending.add(Path('three'))
++            wake_by_board['two']()
++        clock[0] += 1
++        rounds.append([])
++        return 'remote'
++    monkeypatch.setattr(client, 'wait_for_work', wait)
++    rounds.append([])
++    client.run_forever(keep_running, interval=30)
++    assert rounds[:3] == [['one', 'two', 'three'], ['one'], ['two', 'three']]
++
++
++def test_events_during_io_and_periodic_recovery_are_not_lost():
++    from hermes_cli.kanban_sync_work import SyncWork
++    work = SyncWork(30)
++    boards = [('one', Path('one')), ('two', Path('two'))]
++    assert work.select(boards, 100, lambda _: False) == boards
++    assert work.select(boards, 101, lambda _: False) == []
++    work.changed('one')
++    assert work.select(boards, 102, lambda _: False) == boards[:1]
++    # Arrival after selection (while the network call is in flight).
++    work.changed('one')
++    assert work.select(boards, 103, lambda _: False) == boards[:1]
++    work.changed('one')
++    assert work.select(boards, 130, lambda _: False) == boards
++    assert work.select(boards, 131, lambda _: False) == []
++    added = boards + [('three', Path('three'))]
++    assert work.select(added, 132, lambda _: False) == added[2:]
++
++
++@pytest.mark.parametrize('journal', ['DELETE', 'WAL'])
++def test_unchanged_outbox_does_not_query_and_commit_is_seen_next_tick(tmp_path, journal):
++    import sqlite3
++    path = tmp_path / 'board.db'
++    writer = sqlite3.connect(path)
++    writer.execute(f'PRAGMA journal_mode={journal}')
++    writer.execute('CREATE TABLE kanban_sync_outbox (state TEXT)')
++    writer.commit()
++    watch = client._BoardWatch()
++    sql = "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1"
++    try:
++        assert watch.query(path, sql, unchanged_ok=True)[1] is None
++        conn = next(iter(watch._conns.values()))[1]
++        traced = []
++        conn.set_trace_callback(traced.append)
++        assert watch.query(path, sql, unchanged_ok=True)[1] is None
++        assert traced == ['PRAGMA data_version']
++        writer.execute("INSERT INTO kanban_sync_outbox VALUES ('pending')")
++        writer.commit()
++        assert watch.query(path, sql, unchanged_ok=True)[1] == (1,)
++        assert sql in traced
++    finally:
++        watch.reset()
++        writer.close()
++
++
++def test_outbox_cache_reopens_replaced_file_and_retries_query_errors(tmp_path):
++    import sqlite3
++    path = tmp_path / 'board.db'
++    replacement = tmp_path / 'replacement.db'
++    sql = "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1"
++    watch = client._BoardWatch()
++    try:
++        with sqlite3.connect(path) as writer:
++            writer.execute('CREATE TABLE unrelated (value TEXT)')
++        assert watch.query(path, sql, unchanged_ok=True) is None
++        with sqlite3.connect(path) as writer:
++            writer.execute('CREATE TABLE kanban_sync_outbox (state TEXT)')
++        first = watch.query(path, sql, unchanged_ok=True)
++        assert first is not None and first[1] is None
++        # Replace only this isolated, rollback-journal fixture; never a live WAL DB.
++        with sqlite3.connect(replacement) as writer:
++            writer.execute('CREATE TABLE kanban_sync_outbox (state TEXT)')
++            writer.execute("INSERT INTO kanban_sync_outbox VALUES ('pending')")
++        replacement.replace(path)
++        replaced = watch.query(path, sql, unchanged_ok=True)
++        assert replaced is not None and replaced[1] == (1,)
++        assert replaced[0] != first[0]
++    finally:
++        watch.reset()
+-- 
+2.55.0
+
