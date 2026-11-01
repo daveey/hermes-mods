@@ -152,7 +152,9 @@ SCHEMA = {
         "needed, withdraw it immediately: action=withdraw with job_id and reason. A Kanban card's request "
         "survives the card being unblocked or moving to a new run for user_terminal.reattach_grace_minutes "
         "(default 10): the resumed run re-attaches by calling again with the job_id (put it in the block "
-        "reason); otherwise it is withdrawn. The user can type into the window if the "
+        "reason); otherwise it is withdrawn. For a card blocked on this job, say: Authenticate in the window; "
+        "the card resumes by itself when the command finishes. Unblock = resume without the result; "
+        "archive = abandon. A declined command leaves the card blocked. The user can type into the window if the "
         "command prompts. If it is still pending after `wait_s`, call again with only `job_id` to keep waiting."
     ),
     "parameters": {
@@ -733,7 +735,7 @@ def create_job(command: str, reason: str, cwd: str, origin: dict | None = None,
     (job / "status.json").write_text(json.dumps({"status": "waiting_for_user"}))
     (job / "meta.json").write_text(json.dumps({"command": command, "reason": reason, "cwd": cwd,
                                                 "origin": origin if full else None, "created": time.time(),
-                                                "owner": owner, "board_db": board_db,
+                                                "owner": owner, "home": str(_home().resolve()), "board_db": board_db,
                                                 "board_event_cursor": cursor,
                                                 "max_wait_minutes": max_wait_minutes(),
                                                 "reattach_grace_minutes": reattach_grace_minutes()}))
@@ -1631,10 +1633,146 @@ def reconcile_closed_ask(job: Path, st: dict, busy_timeout: float = 2.0) -> bool
             log.exception("user_terminal: reconciliation cleanup failed for %s", job.name)
 
 
+def reconcile_completed_card(job: Path, st: dict) -> None:
+    """Atomically comment/unblock only the still-blocked, explicitly named job.
+
+    The board transaction is the dedup record; a crash before/after it is safe to
+    retry. Keep the attachment lock and descendant fences of closed-ask handling.
+    """
+    if st.get("status") not in ("ran", "declined") or os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    con = None
+    locked = False
+    try:
+        import sqlite3
+        from zoneinfo import ZoneInfo
+
+        _, owner = _job_meta_owner(job)
+        task, path = owner.get("task_id") or owner.get("task"), owner.get("db")
+        if owner.get("kind") != "card" or not task or not path:
+            return
+        locked = _attach_lock(job)
+        if not locked:
+            return
+        att = read_attachment(job, owner)
+        original = _as_int(owner.get("run_id"))
+        if att and (original is None or att["run_id"] > original):
+            return
+        db, _ = _kanban_api()
+        db._assert_not_delegated_child_mutation(Path(path))
+        from hermes_cli.kanban_lockguard import connect
+        con = connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        marker = f"[user-terminal:completed:{job.name}]"
+        pattern = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(job.name) + r"(?![A-Za-z0-9_-])")
+
+        def eligible(conn):
+            row = conn.execute("SELECT status, current_run_id, human_request FROM tasks WHERE id=?", (task,)).fetchone()
+            if not row or row["status"] != "blocked" or row["current_run_id"] is not None:
+                return "owner not blocked"
+            # unblock_task stages its reason comment before calling the precondition;
+            # that one pending row is not a previous delivery (and rolls back on refusal).
+            count = conn.execute("SELECT count(*) FROM task_comments WHERE task_id=? AND instr(body,?)>0", (task, marker)).fetchone()[0]
+            if count > (1 if st["status"] == "ran" else 0):
+                return "already reconciled"
+            # Only the current block reason counts, never historical mentions.
+            event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1", (task,)).fetchone()
+            payload = json.loads(event[0] or "{}") if event else {}
+            reason = payload.get("reason", "") if isinstance(payload, dict) else ""
+            if not pattern.search(str(row["human_request"] or "")) and not pattern.search(str(reason)):
+                return "block does not name job"
+            return None
+
+        final = job / "final.lock" / "result.json"
+        ended = (final if final.exists() else job / "status.json").stat().st_mtime
+        local = datetime.fromtimestamp(ended, ZoneInfo("America/Los_Angeles"))
+        comment = (f"{marker} Terminal job {job.name}: {st['status']}, exit_code={st.get('exit_code')}; "
+                   f"finished {local:%Y-%m-%d %H:%M:%S %Z}. "
+                   + ("Resuming automatically; re-attach with this job_id to read the result."
+                      if st["status"] == "ran" else "User declined; card remains blocked. Do not rerun unasked."))
+        if st["status"] == "ran":
+            db.unblock_task(con, task, precondition=eligible, comment=("user-terminal", comment),
+                            event_extra={"actor": "user-terminal", "job_id": job.name})
+        else:
+            with db.write_txn(con):
+                if eligible(con) is None:
+                    db.add_comment(con, task, "user-terminal", comment)
+    except Exception:
+        log.exception("user_terminal: completed-card reconciliation failed for %s; will retry on sweep", job.name)
+    finally:
+        if con is not None:
+            con.close()
+        if locked:
+            _attach_unlock(job)
+
+
+_COMPLETION = None
+
+
+def _completion_module():
+    global _COMPLETION
+    import importlib.util
+    if _COMPLETION is None:
+        spec = importlib.util.spec_from_file_location(__name__ + "._completion", Path(__file__).with_name("completion.py"))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # Publish only after execution. A new plugin generation gets its own module.
+        _COMPLETION = module
+    return _COMPLETION
+
+
+def reconcile_session(job: Path, st: dict) -> None:
+    meta, owner = _job_meta_owner(job)
+    if owner.get("kind") != "session":
+        return
+    home = _home().resolve()
+    recorded_home = meta.get("home")
+    if recorded_home:
+        if Path(recorded_home).resolve() != home:
+            return
+    elif job.parent.resolve() != (home / "cache" / "user-terminal").resolve():
+        return  # An old shared override has no provable profile owner.
+    try:
+        _completion_module().deliver(job, st, owner, home, clean_output)
+    except _completion_module().Unavailable:
+        pass  # Only the live owner can admit; its periodic sweep will retry.
+    except Exception:
+        log.exception("user_terminal: session completion pending for %s", job.name)
+
+
+def start_reconciler(ctx):
+    """Host-local old-watchdog/late-block recovery, owned by the plugin lifecycle."""
+    import threading
+    import contextvars
+    # Managed tools and detached watchdogs must not become execution owners.
+    if any(os.environ.get(k) for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_MANAGED_WORKER")):
+        return
+    stop = threading.Event()
+    home = _home()
+    def run():
+        while not stop.wait(WATCH_INTERVAL_S):
+            try:
+                # Registration precedes publication; wait until the real owner is ready.
+                from hermes_cli import plugins
+                if (plugins._published_gateway_message_injector is not None or
+                        plugins._published_tui_message_injector is not None):
+                    sweep_jobs()
+            except _completion_module().Unavailable:
+                continue
+            except Exception:
+                log.exception("user_terminal: completion reconciliation pass failed")
+    ctx.on_unload(stop.set)
+    context = contextvars.copy_context()
+    threading.Thread(target=lambda: context.run(run), name="user-terminal-reconcile", daemon=True).start()
+
+
 def watch_once(job: Path, seen: dict) -> dict | None:
     result = _watch_once(job, seen)
     if result and result.get("status") in FINAL:
         seen["reconciled"] = reconcile_closed_ask(job, result, seen.get("busy_timeout", 2.0))
+        reconcile_completed_card(job, result)
+        reconcile_session(job, result)
     return result
 
 
@@ -1697,6 +1835,27 @@ def _watch_once(job: Path, seen: dict) -> dict | None:
     return None
 
 
+def _completed_card_needs_sweep(job: Path, st: dict) -> bool:
+    """Cheap read-only filter; the mutation path still rechecks under its transaction."""
+    if st.get("status") not in FINAL:
+        return True
+    _, owner = _job_meta_owner(job)
+    if owner.get("kind") != "card" or not owner.get("db"):
+        return True
+    con = _ro_connect(owner["db"])
+    try:
+        task = owner.get("task_id") or owner.get("task")
+        row = con.execute("SELECT status,current_run_id FROM tasks WHERE id=?", (task,)).fetchone()
+        if not row or row[0] != "blocked" or row[1] is not None:
+            return False
+        marker = f"[user-terminal:{'completed' if st.get('status') in ('ran', 'declined') else 'closed'}:{job.name}]"
+        if con.execute("SELECT 1 FROM task_comments WHERE task_id=? AND instr(body,?)>0 LIMIT 1", (task, marker)).fetchone():
+            return False
+        return True
+    finally:
+        con.close()
+
+
 def sweep_jobs(skip: Path | None = None) -> None:
     """Reconcile jobs including old final outcomes whose blocked asks may still be stale; never raises."""
     try:
@@ -1705,7 +1864,8 @@ def sweep_jobs(skip: Path | None = None) -> None:
         return
     for job in jobs:
         try:
-            watch_once(job, {})
+            if _completed_card_needs_sweep(job, read_status(job)):
+                watch_once(job, {})
         except Exception:
             log.exception("user_terminal: reconciling %s failed", job)
 
@@ -1869,7 +2029,9 @@ def _card_note(job: Path) -> str:
         return ""
     grace = _valid_minutes(meta.get("reattach_grace_minutes")) or reattach_grace_minutes()
     return (f"If card {owner.get('task_id') or owner.get('task')} blocks to wait for the user, put this job_id in "
-            f"the block reason: once the card is unblocked or a new run starts, that run must re-attach by calling "
+            f"the block reason. Tell the user: Authenticate in the window; the card resumes by itself when "
+            f"the command finishes. Unblock = resume without the result; archive = abandon. "
+            f"A declined command leaves the card blocked. Once the card resumes, that run must re-attach by calling "
             f"run_in_user_terminal with this job_id within {grace:g} min (user_terminal.reattach_grace_minutes), "
             f"or the request is withdrawn; a later unattached run ending as completed, blocked, scheduled or review_requested "
             f"withdraws it at once. Infrastructure failures, continuation and unknown outcomes keep the same grace.")
@@ -2330,6 +2492,7 @@ def register(ctx) -> None:
     ctx.register_tool(name="run_in_user_terminal", toolset=TOOLSET, schema=SCHEMA, handler=handle, emoji="🖥️",
                       description="Open a terminal on the user's screen, confirm there, run, return output")
     ctx.register_hook("transform_terminal_output", transform_terminal_output)
+    start_reconciler(ctx)
 
 
 if __name__ == "__main__":
