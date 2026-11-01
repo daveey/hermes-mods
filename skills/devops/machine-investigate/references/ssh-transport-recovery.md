@@ -1,0 +1,7 @@
+# SSH transport recovery: adaptive direct/jump selector
+
+Read this when changing or testing an existing adaptive direct/jump SSH selector (a ProxyCommand helper that
+chooses between a direct route and a jump-host route per connection). The general transport rules
+(bounded payload probes, no pin on a port check alone, application reads as proof) stay in `SKILL.md`.
+
+For an existing adaptive direct/jump SSH selector, use bounded end-to-end payload admission when static direct/jump overrides alternate between healthy and stalled. Race independent uncompressed transfers, accept only a complete successful payload, and cancel the loser immediately; waiting for every probe spends the caller's SSH ConnectTimeout on the already-known bad path. Serialize concurrent selections with a short positive/negative cache. A ProxyCommand receives SIGHUP when its caller exits: handle HUP/TERM/INT without an ownership gap between spawning and recording probe children, then kill/reap their process groups. Test with real stalled children and signals, not only mocked Popen. Keep helper stdout exclusively for SSH bytes, disable inherited proxy recursion, retain strict known-host verification, and use a connect-only timeout for the final byte-stream transport (an nc idle timeout breaks quiet sessions). Verify concurrent large application responses through the client's actual forward, not only small health checks. Fail-closed route admission can suppress timeout logs while still disconnected, so require successful application reads as well as a zero detector count.

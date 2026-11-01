@@ -21,7 +21,8 @@ A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow
 
 1. `python3 <skill>/scripts/collect.py install-recorder --apply` (macOS: makes sure the load recorder runs here,
    so the next spike is attributed; no-op elsewhere or when already loaded).
-2. `python3 <skill>/scripts/collect.py report > /tmp/investigate-$(date +%s).json` and read it. The home `du`
+2. `out="${TMPDIR:-$HOME/.hermes/cache/scratch}/investigate-$(date +%s).json"; mkdir -p "$(dirname "$out")" &&
+   python3 <skill>/scripts/collect.py report > "$out"` and read it. The home `du`
    can take a few minutes; use `--no-du` only for a CPU-only question. It has:
    - `load`, `cpus`, `cpu_pct` (= load1 / cores, what the panel shows), `memory`
    - `processes.top`: top processes with parent `chain`, top-level `root` app and `owner`
@@ -68,9 +69,9 @@ Compare authenticated request timings on the backend host with the same requests
 
 Do not pin a jump-host workaround solely because its SSH port answers. If that pin later stalls while the direct route succeeds, remove the harmful override and reconnect only the affected transport masters, not healthy backend processes. Read back effective SSH configuration, the actual master's remote socket, and authenticated application responses.
 
-Validate a full post-change timeout window while the client remains active; preserve the detector's raw count and timestamps, not only its threshold verdict. A zero-timeout window proves recovery during that window, not that intermittent network loss cannot recur. Keep that distinction in the completion report and retain existing recurrence detection.
+When the task requires a full post-change timeout window, measure it while the client remains active; if the user disallows a soak, report only the observed interval and do not claim the full window passed. Preserve the detector's raw count and timestamps, not only its threshold verdict. A zero-timeout window proves recovery during that window, not that intermittent network loss cannot recur. Keep that distinction in the completion report and retain existing recurrence detection.
 
-If static direct/jump overrides alternate between healthy and stalled, use bounded end-to-end payload admission rather than another permanent pin. Race independent uncompressed transfers, accept only a complete successful payload, and cancel the loser immediately; waiting for every probe spends the caller's SSH ConnectTimeout on the already-known bad path. Serialize concurrent selections with a short positive/negative cache. A ProxyCommand receives SIGHUP when its caller exits: handle HUP/TERM/INT without an ownership gap between spawning and recording probe children, then kill/reap their process groups. Test with real stalled children and signals, not only mocked Popen. Keep helper stdout exclusively for SSH bytes, disable inherited proxy recursion, retain strict known-host verification, and use a connect-only timeout for the final byte-stream transport (an nc idle timeout breaks quiet sessions). Verify concurrent large application responses through the client's actual forward, not only small health checks. Fail-closed route admission can suppress timeout logs while still disconnected, so require successful application reads as well as a zero detector count.
+For an existing adaptive direct/jump SSH selector, use bounded end-to-end payload admission when static direct/jump overrides alternate between healthy and stalled; read `references/ssh-transport-recovery.md` before changing or testing that selector (racing, cancellation, cache, ProxyCommand signal cleanup, transport timeouts). Whatever the route mechanism, verify concurrent large application responses through the client's actual forward, not only small health checks, and require successful application reads as well as a zero detector count: fail-closed route admission can suppress timeout logs while still disconnected.
 
 ## What you may fix without asking
 
