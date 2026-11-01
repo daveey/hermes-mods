@@ -17,10 +17,12 @@ Never write your own watcher that follows "the newest run" (`gh run list -L 1`) 
 (`gh run watch <id>`). On a busy branch, concurrency groups replace pending runs and most end `cancelled`.
 The run that actually builds your commit is often one started by someone else's later push. Newest-run
 watchers miss it and wait for hours while the session looks idle. Ask instead whether any successful run, or
-any release tag, *contains* your commit.
+any release tag, *contains* your commit. Tag-mode success establishes containment only, not that CI passed
+or release assets were published; verify the workflow and required release artifacts separately.
 
 When a branch uses ONE serialized concurrency group (in-flight always finishes, only the newest pending waits), a
-pending run that keeps getting `cancelled` with zero jobs never started. Find the holder: `gh api
+pending run that keeps getting `cancelled` with zero jobs may have been superseded before execution; corroborate
+with concurrency configuration, cancellation evidence and replacement timing before classifying it. Find a possible holder: `gh api
 "repos/R/actions/runs?branch=main&status=in_progress"` and look for an old run whose last job sat in a runner
 backlog. To time a full run (capacity acceptance), designate the first run that STARTS after the holder completes,
 and record both `created_at`→completed (wall, queue included) and `run_started_at`→completed (exec). A "CI finishes in
@@ -82,8 +84,7 @@ How to run it from an agent:
   check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
   next run starts with `--once` again.
 - Before telling the user something is "waiting on CI/the release", run `--once`. It has often shipped already.
-- On exit 1, investigate the printed run (`gh run view <id> --log-failed`). If an earlier commit by
-  someone else broke it, say whose.
+- On exit 1, investigate the printed run (`gh run view <id> -R OWNER/REPO --log-failed`). Empty failed-step logs do not prove that a job never started or lost its runner. Check the command's exit status/stderr, run attempts, paginated jobs, full logs and annotations via each job's `check_run_url`; missing evidence is not a diagnosis. See `references/workflow-history-audit.md`. Attribute an earlier breaking commit only after verifying its diff and ancestry.
 - Don't cancel another session's queued run to get yours through: the queued run will contain your
   commit too.
 
@@ -111,6 +112,7 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 
 ## Notes
 
+- Auditing a workflow's history (green-window soak, "every run since D", promoting a lane to required): `references/workflow-history-audit.md`. Not `gh run list -L N`: on a busy workflow it drops the oldest runs.
 - For JS fixture isolation on CI, keep TMPDIR roots short (for example `/tmp/wc.XXXXXX`): nesting a `RUNNER_TEMP/workspace-checks.*` root under Vitest plus gateway control sockets can exceed AF_UNIX path limits and surface as `listen EINVAL` followed by a timeout. Exercise a real nested Unix socket, executable helper, original failure status, and cleanup through the actual workflow shell. Container `sudo` does not prove mount permission; inspect mount failure and `/dev/shm` noexec/capacity. Reconcile runner label migration before changing retired container hosts; the next real job must prove tmpfs selection and memory reserve on the serving fleet.
 
 - `gh` repo: the script passes `-R OWNER/NAME` from the checkout's `origin` remote to every `gh` call (override
@@ -134,8 +136,6 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
   Root fix: `if: ${{ !cancelled() }}` and run gate/report jobs on a light runner label; PRs pick it up only after
   rebasing, so keep the sweep running until then. Before adding concurrency rules, grep the workflows; they may
   already exist.
-- Release tags are the most reliable signal when a repo publishes them: a tag on a commit that contains yours
-  means CI built and released your change, whichever run did it.
 - A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
   maps to) takes precedence; check the repo's AGENTS.md first.
 - Match full-suite shard counts to the reusable workflow's timeout envelope. Reducing an eight-shard matrix to two while retaining the same per-job timeout can cancel every Python job even when e2e is green. Keep the gate's required exact job names, workflow matrix, and test fake synchronized; never count cancelled shards as green or compensate by weakening assertions.
