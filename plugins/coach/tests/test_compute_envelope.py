@@ -8,7 +8,54 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("text", [
+    "Can I spend $20 on an H100 for the approval gate eval?",
+    "May I rent an H100 for $20 to rerun the approval check eval?",
+    "Should I rent a 4090 for $15 to test the GPU-spend approval check?",
+    "OK to rent an A100 for $18 so the approval gate tests can run?",
+])
+def test_permission_ask_naming_check_is_still_flagged(text):
+    spec = importlib.util.spec_from_file_location("ce_permission", HERE / "compute_envelope.py")
+    ce = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ce)
+    assert ce.classify(text) is not None
+
+
+@pytest.mark.parametrize("prefix", ["", "  ", "- ", "* ", "+ ", "1. ", "2) ", "• "])
+@pytest.mark.parametrize("ask", [
+    "May I", "Can I", "Could I", "Should I", "Shall I",
+    "May we", "Can we", "Could we", "Should we", "Shall we",
+    "OK to", "Okay to", "Is it OK to", "Is it okay to",
+])
+def test_permission_ask_prefixes_override_meta(prefix, ask):
+    spec = importlib.util.spec_from_file_location("ce_prefix", HERE / "compute_envelope.py")
+    ce = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ce)
+    assert ce.classify(prefix + ask + " rent an H100 for $20 for the approval gate eval?")
+
+
+@pytest.mark.parametrize("text,flagged", [
+    ("May I rent a 4090 on Vast for $12 to rerun the eval?", True),
+    ("Can I spend $20 on an H100 for the eval?", True),
+    ('- The new one came from a GPU-spend approval check, not a "stops at the diagnosis" check.', False),
+    ("The GPU-spend approval check fired on my last reply.", False),
+    ("Can I spend $40 on an H100 for the eval?", False),
+    ('The coach flagged "May I rent a 4090 for $12?" as a spend ask.', False),
+    ("Can I spend $40 on an H100 for the approval gate eval?", False),
+    ("May I rent 2x H100 for $20 for the approval gate eval?", False),
+    ("May I get the SSH key to rent an H100 for the approval gate eval?", False),
+])
+def test_permission_ask_meta_controls(text, flagged):
+    spec = importlib.util.spec_from_file_location("ce_controls", HERE / "compute_envelope.py")
+    ce = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ce)
+    assert bool(ce.classify(text)) is flagged
+
 
 REAL_BLOCK_REASON = (
     "Slurm is unavailable on metta1 (no config/slurmd; sinfo/squeue fail since at least 10-24), so the only existing "

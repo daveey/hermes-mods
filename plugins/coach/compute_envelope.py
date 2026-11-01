@@ -51,6 +51,11 @@ GPU_HOURS_RE = re.compile(r"\bgpu[- ]?h(?:ours?|rs?)?\b", re.I)
 META_RE = re.compile(
     r"\bcompute envelope\b|\bcoach\b|\bguard\b|\benvelope\b|"
     r"\b(?:approval|authority|spend|compute)[- ](?:check|gate|rule|detector)s?\b", re.I)
+# A leading permission request is still an ask when its purpose names the guard.
+# Anchor after list markers/whitespace, not quotes or prose describing someone else's ask.
+PERMISSION_START_RE = re.compile(
+    r"^\s*(?:(?:[-*+•]|\d+[.)])\s+)*"
+    r"(?:(?:may|can|could|should|shall)\s+(?:i|we)\b|(?:is\s+it\s+)?(?:ok|okay)\s+to\b)", re.I)
 MULTI_RE = re.compile(
     r"\b(?:[2-9]|[1-9]\d+)\s*(?:x|×|-)?\s*(?:gpus?|h100s?|h200s?|a100s?|b200s?|b300s?|4090s?|l40s?|a6000s?)\b|"
     r"\b(?:h100|h200|a100|b200|b300|4090|gpu)s?\s*[x×]\s*(?:[2-9]|[1-9]\d+)\b|"
@@ -96,7 +101,7 @@ def classify(text: str, envelope: Optional[float] = None) -> Optional[dict]:
         return None
     for sent in SENTENCE_SPLIT_RE.split(text):
         if (ASK_RE.search(sent) and COMPUTE_RE.search(sent) and not CREDENTIAL_RE.search(sent)
-                and not META_RE.search(sent)):
+                and (not META_RE.search(sent) or PERMISSION_START_RE.match(sent))):
             return {"sentence": sent.strip()[:300], "usd": max(money) if money else None, "cap": cap}
     return None
 
