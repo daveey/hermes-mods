@@ -20,7 +20,8 @@ Usage:
   scripts/test-all --hermes-core PATH   override the core checkout (default $HERMES_CORE_CHECKOUT,
                                         then ~/.hermes/hermes-agent); F3 runs whenever core is found
 
-Python: $HERMES_MODS_PYTHON, else <core>/.venv/bin/python, else the current interpreter.
+Python: $HERMES_MODS_PYTHON, else <core>/.venv/bin/python, else production
+(macOS signed Python 3.14 / Linux gateway launcher), else the current interpreter (warned).
 Suites are discovered from the tree; SUITE_OVERRIDES below holds the few that need a
 different command or are skipped with a reason.
 """
@@ -28,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import json
 import os
+import shlex
 import re
 import shutil
 import subprocess
@@ -67,18 +70,34 @@ SUITE_OVERRIDES: dict[str, dict] = {
 }
 
 # pyyaml etc. that core's venv lacks but several suites import. Appended LAST on PYTHONPATH, so it
-# only fills gaps and never shadows the interpreter's own packages.
+# follows repo/core imports. Isolated override environments opt out via no_core_path.
 # Env that marks "this process is an agent worker": a test that builds its own temp Kanban board
 # or hermes home must not inherit it (core fences Kanban writes of delegated children).
 SCRUB_ENV_PREFIXES = ("HERMES_KANBAN", "HERMES_DELEGATED", "HERMES_SUPERVISED", "HERMES_ORIGIN")
 TEST_SITE = Path.home() / ".cache" / "hermes-mods-test-site"  # must be outside the Hermes home
 
 
-def ensure_test_site() -> Path:
-    if not (TEST_SITE / "pytest").is_dir() and shutil.which("uv"):
-        subprocess.run(["uv", "pip", "install", "-q", "--python", "3.14", "--target", str(TEST_SITE),
-                        "pytest", "pytest-asyncio", "pyyaml"], check=True)
-    return TEST_SITE
+def python_version(py: str) -> str:
+    return subprocess.check_output(
+        [py, "-c", "import platform; print(platform.python_version())"], text=True).strip()
+
+
+def test_site(py: str) -> Path:
+    # Never reuse extension modules built for a different Python minor version.
+    return TEST_SITE / ("python-" + ".".join(python_version(py).split(".")[:2]))
+
+
+def ensure_test_site(py: str) -> Path:
+    site = test_site(py)
+    if not all((site / name).is_dir() for name in ("pytest", "pytest_asyncio", "yaml", "fastapi", "httpx", "psutil")):
+        uv = shutil.which("uv")
+        if not uv and (Path.home() / ".local/bin/uv").is_file():
+            uv = str(Path.home() / ".local/bin/uv")
+        if not uv:
+            raise RuntimeError("test-all: uv is required to build the selected Python's test dependencies")
+        subprocess.run([uv, "pip", "install", "-q", "--python", py, "--target", str(site),
+                        "pytest", "pytest-asyncio", "pyyaml", "fastapi", "httpx", "psutil"], check=True)
+    return site
 
 
 SUMMARY_RE = re.compile(r"\b\d+ (passed|failed|error|errors|skipped|deselected|xfailed)\b|no tests ran|^Ran \d+ tests?")
@@ -92,12 +111,42 @@ def find_core(arg: str | None) -> tuple[Path | None, bool]:
     return None, False
 
 
+def production_python(core: Path | None) -> str | None:
+    if sys.platform == "darwin":
+        candidate = Path.home() / "Applications/Hermes Python.app/Contents/MacOS/python3.14"
+        return str(candidate) if candidate.is_file() else None
+    if sys.platform.startswith("linux") and core:
+        launcher = core / ".hermes/bin/hermes"
+        if launcher.is_file():
+            try:
+                # Use the gateway's published resolution boundary, not a guessed venv/cache path.
+                command = json.loads(subprocess.check_output(
+                    [str(launcher), "--print-runtime-command"], text=True, timeout=30))
+                if isinstance(command, list) and command and isinstance(command[0], str):
+                    if Path(command[0]).is_file():
+                        return command[0]
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass  # The visibly labelled current-interpreter fallback below remains usable.
+    return None
+
+
+def select_python(core: Path | None) -> tuple[str, bool]:
+    override = os.environ.get("HERMES_MODS_PYTHON")
+    if override:
+        candidate = str(Path(override).expanduser())
+        if Path(candidate).is_file():
+            return candidate, False
+        if found := shutil.which(override):
+            return found, False
+    if core and (core / ".venv" / "bin" / "python").is_file():
+        return str(core / ".venv" / "bin" / "python"), False
+    if production := production_python(core):
+        return production, False
+    return sys.executable, True
+
+
 def find_python(core: Path | None) -> str:
-    if os.environ.get("HERMES_MODS_PYTHON"):
-        return os.environ["HERMES_MODS_PYTHON"]
-    if core and (core / ".venv" / "bin" / "python").exists():
-        return str(core / ".venv" / "bin" / "python")
-    return sys.executable
+    return select_python(core)[0]
 
 
 def test_files(d: Path) -> list[Path]:
@@ -138,25 +187,26 @@ def discover(root: Path, core: Path | None, explicit_core: bool) -> list[dict]:
     return suites
 
 
-def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT) -> dict:
+def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT, site: Path | None = None) -> dict:
     res = {"name": s["name"], "status": "", "rc": None, "secs": 0.0, "tail": "", "reason": s.get("skip", "")}
     if s.get("skip"):
         res["status"] = "SKIP"
         return res
+    site = site or test_site(py)
     env = {k: v for k, v in os.environ.items() if not k.startswith(SCRUB_ENV_PREFIXES)}
     env["HERMES_DISABLE_LAZY_INSTALLS"] = "1"  # core's bootstrap otherwise re-execs the interpreter: silent exit 1
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     # cwd is the repo root (as in CI), so `from plugins.<name> import ...` resolves; each suite
     # still gets its own process, so same-named test modules in different plugins never collide.
     use_core = bool(core) and not s.get("no_core_path")
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(root), str(core) if use_core else "", str(TEST_SITE) if use_core else ""]))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(root), str(core) if use_core else "", str(site) if not s.get("no_core_path") else ""]))
     hub = next((c for c in (root.parent / "hermes-hub", root.parent / "hub") if (c / "client/hermes_hub.py").is_file()), None)
     if hub:
         env.setdefault("HERMES_HUB_CLIENT_REAL", str(hub / "client/hermes_hub.py"))
     if core:
         env.setdefault("HERMES_CORE_CHECKOUT", str(core))
     cwd = root / s["cwd"] if s.get("cwd") else root
-    cmd = [x.replace("{py}", py).replace("{core}", str(core or "")).replace("{site}", str(TEST_SITE)) for x in s["cmd"]] if s.get("cmd") else \
+    cmd = [x.replace("{py}", shlex.quote(py) if s["cmd"][0] == "sh" else py).replace("{core}", str(core or "")).replace("{site}", str(site)) for x in s["cmd"]] if s.get("cmd") else \
         [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(s["dir"]), *s["args"], *s["targets"]]
     t0 = time.time()
     try:
@@ -201,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(a.root).resolve()
     core, explicit_core = find_core(a.core)
-    py = find_python(core)
+    py, fallback = select_python(core)
     suites = discover(root, core, explicit_core=explicit_core)
     if a.match:
         suites = [s for s in suites if any(m in s["name"] for m in a.match)]
@@ -212,12 +262,16 @@ def main(argv: list[str] | None = None) -> int:
     if not suites:
         print("test-all: no suites matched", file=sys.stderr)
         return 2
-    ensure_test_site()
-    print(f"test-all: {len(suites)} suites, -j{a.jobs}, python={py}, core={core}", flush=True)
+    version = python_version(py)
+    site = ensure_test_site(py) if any(not s.get("skip") for s in suites) else test_site(py)
+    warning = f"NOT the production interpreter ({version})" if fallback else ""
+    print(f"test-all: {len(suites)} suites, -j{a.jobs}, python={py} ({version}), core={core}", flush=True)
+    if warning:
+        print(warning, flush=True)
 
     results = []
     with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
-        futs = [ex.submit(run_suite, s, py, core, a.timeout, root) for s in suites]
+        futs = [ex.submit(run_suite, s, py, core, a.timeout, root, site) for s in suites]
         for f in cf.as_completed(futs):
             r = f.result()
             results.append(r)
@@ -238,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
     counts = {k: sum(1 for r in results if r["status"] == k) for k in ("PASS", "SKIP", "FAIL", "SILENT-EXIT", "TIMEOUT")}
     print("\ntest-all: " + ", ".join(f"{v} {k}" for k, v in counts.items() if v)
           + (" -- FAILED: " + ", ".join(r["name"] for r in bad) if bad else " -- OK"))
+    if warning:
+        print(warning)
     return 1 if bad else 0
 
 

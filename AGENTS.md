@@ -55,7 +55,11 @@ A new guard also belongs in private `home/plugins-every-host.txt`; export must n
      `~/code/hermes/hermes-sync run`. It replaces the `~/.hermes` copy with a link (the old copy is
      kept in `~/.hermes/.hermes-sync-trash/`) and removes the copy from the private repo.
 3. Test the worktree copy before publication; verify linked registration after deployment. The whole-repo gate is `scripts/test-all`
-   (exit 0 = every suite passed; `-k <plugin>` for one). Never a bare `pytest` at the root. On the MacBook run
+   (exit 0 = every suite passed; `-k <plugin>` for one). Python selection is `$HERMES_MODS_PYTHON`,
+   then `<core>/.venv/bin/python`, then production (macOS signed Python 3.14; Linux gateway launcher's
+   managed Python), then the invoking interpreter with a warning in both header and summary. The header
+   prints the chosen version; test dependencies are cached per Python minor version. Never a bare `pytest`
+   at the root. On the MacBook run
    only the targeted suite (`-k`); the full run belongs on the hub. A new plugin's tests are picked up
    automatically; one with a non-pytest runner gets an entry in `SUITE_OVERRIDES` in that script.
 4. `git add` + `git commit` (the pre-commit hook runs gitleaks and the private denylist; enable it

@@ -101,6 +101,116 @@ class TestAll(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('skipped tests/integration_f3: needs a core checkout', r.stdout)
 
+    def test_python_selection_order_with_fake_paths(self):
+        runner = runpy.run_path(str(RUNNER))
+        core = self.root / 'core'
+        venv = core / '.venv/bin/python'
+        production = self.root / 'Applications/Hermes Python.app/Contents/MacOS/python3.14'
+        override = self.root / 'override-python'
+        for p in (venv, production, override):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch()
+        with patch('pathlib.Path.home', return_value=self.root), patch('sys.platform', 'darwin'), \
+                patch.dict(os.environ, {'HERMES_MODS_PYTHON': str(override)}):
+            self.assertEqual(runner['select_python'](core), (str(override), False))
+            override.unlink()  # a missing override is not a candidate
+            self.assertEqual(runner['select_python'](core), (str(venv), False))
+            os.environ.pop('HERMES_MODS_PYTHON')
+            venv.unlink()
+            self.assertEqual(runner['select_python'](core), (str(production), False))
+            production.unlink()
+            self.assertEqual(runner['select_python'](core), (sys.executable, True))
+
+    def test_linux_uses_gateway_launcher_resolution(self):
+        runner = runpy.run_path(str(RUNNER))
+        core = self.root / 'core'
+        launcher = core / '.hermes/bin/hermes'
+        launcher.parent.mkdir(parents=True)
+        launcher.touch()
+        production = self.root / 'managed-python'
+        production.touch()
+        import json
+        with patch('sys.platform', 'linux'), patch.dict(os.environ, {'HERMES_MODS_PYTHON': ''}), \
+                patch('subprocess.check_output', return_value=json.dumps([str(production), '-I'])) as command:
+            self.assertEqual(runner['select_python'](core), (str(production), False))
+            command.assert_called_once_with([str(launcher), '--print-runtime-command'], text=True, timeout=30)
+        with patch('sys.platform', 'linux'), patch('subprocess.check_output', return_value='invalid json'):
+            self.assertIsNone(runner['production_python'](core))
+
+    def test_fallback_warning_in_header_and_final_summary(self):
+        import contextlib
+        import io
+        runner = runpy.run_path(str(RUNNER))
+        make_tree(self.root, {'ok': 'def test_ok(): pass'})
+        main = runner['main']
+        output = io.StringIO()
+        for fallback in (True, False):
+            output.seek(0)
+            output.truncate()
+            with patch.dict(main.__globals__, {
+                'select_python': lambda core: ('/fake/python', fallback),
+                'python_version': lambda py: '3.14.9',
+                'ensure_test_site': lambda py: self.root,
+                'run_suite': lambda *args: dict(name='plugins/ok', status='PASS', secs=0, reason=''),
+            }), contextlib.redirect_stdout(output):
+                self.assertEqual(main(['--root', str(self.root)]), 0)
+            lines = output.getvalue().splitlines()
+            self.assertIn('python=/fake/python (3.14.9)', lines[0])
+            warning = 'NOT the production interpreter (3.14.9)'
+            self.assertEqual(lines.count(warning), 2 if fallback else 0)
+            if fallback:
+                self.assertEqual(lines[1], warning)
+                self.assertEqual(lines[-1], warning)
+
+    def test_test_site_is_versioned_and_installed_for_selected_python(self):
+        runner = runpy.run_path(str(RUNNER))
+        ensure = runner['ensure_test_site']
+        with patch.dict(ensure.__globals__, {'TEST_SITE': self.root, 'python_version': lambda py: '3.14.9'}), \
+                patch('shutil.which', return_value='/bin/uv'), patch('subprocess.run') as install:
+            site = ensure('/fake/python with spaces')
+            self.assertEqual(site, self.root / 'python-3.14')
+            install.assert_called_once_with(
+                ['/bin/uv', 'pip', 'install', '-q', '--python', '/fake/python with spaces',
+                 '--target', str(site), 'pytest', 'pytest-asyncio', 'pyyaml', 'fastapi', 'httpx', 'psutil'], check=True)
+            for name in ('pytest', 'pytest_asyncio', 'yaml', 'fastapi', 'httpx', 'psutil'):
+                (site / name).mkdir(parents=True)
+            ensure('/fake/python with spaces')
+            self.assertEqual(install.call_count, 1)
+
+    def test_test_site_finds_user_uv_or_reports_missing_installer(self):
+        runner = runpy.run_path(str(RUNNER))
+        ensure = runner['ensure_test_site']
+        uv = self.root / '.local/bin/uv'
+        uv.parent.mkdir(parents=True)
+        uv.touch()
+        with patch.dict(ensure.__globals__, {'TEST_SITE': self.root / 'cache', 'python_version': lambda py: '3.14.9'}), \
+                patch('pathlib.Path.home', return_value=self.root), patch('shutil.which', return_value=None), \
+                patch('subprocess.run') as install:
+            ensure('/fake/python')
+            self.assertEqual(install.call_args.args[0][0], str(uv))
+            uv.unlink()
+            with self.assertRaisesRegex(RuntimeError, 'uv is required'):
+                ensure('/fake/python')
+
+    def test_shell_override_quotes_interpreter_with_spaces(self):
+        runner = runpy.run_path(str(RUNNER))
+        py = self.root / 'Python App/python'
+        py.parent.mkdir()
+        py.symlink_to(sys.executable)
+        suite = dict(name='shell', cmd=['sh', '-ec', '{py} -c "print(123)"'])
+        result = runner['run_suite'](suite, str(py), None, 10, self.root, self.root)
+        self.assertEqual(result['status'], 'PASS', result)
+        self.assertEqual(result['tail'], '123')
+
+    def test_isolated_override_does_not_inherit_test_site(self):
+        runner = runpy.run_path(str(RUNNER))
+        suite = dict(name='isolated', no_core_path=True,
+                     cmd=[sys.executable, '-c', 'import os; print(os.environ["PYTHONPATH"])'])
+        result = runner['run_suite'](suite, sys.executable, self.root / 'core', 10,
+                                     self.root, self.root / 'test-site')
+        self.assertEqual(result['status'], 'PASS', result)
+        self.assertEqual(result['tail'], str(self.root))
+
     def test_default_core_checkout_is_discovered(self):
         runner = runpy.run_path(str(RUNNER))
         core = self.root / '.hermes' / 'hermes-agent'
