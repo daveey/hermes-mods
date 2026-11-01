@@ -90,6 +90,10 @@ REPORT_RE = re.compile(
     # Leftovers named by likeness, not by a status word (bot-dc58243931: "O-7 through O-11 have the same
     # old-approval problem").
     r"|\b(?:have|has) the same (?:[\w-]+ ){0,3}?(?:problem|issue|bug|defect|failure|error)s?\b"
+    # Owners that can't run (agent-0bab362bcd: "both start attempts failed ... queued behind the quota reset; it starts
+    # by itself after that"). Candidates only: the judge applies STALLED_OWNER.
+    r"|\bstarts? (?:up )?(?:by|on) (?:it|them)sel(?:f|ves)\b|\b(?:start |run )?attempts? (?:have |had )?(?:both |all )?failed\b"
+    r"|\bqueued behind\b|\bno eligible (?:\w+ )?routes?\b|\b(?:quota|limit) resets?\b"
     r"|\bsame (?:[\w-]+ )?(?:problem|issue|bug) (?:applies|exists|affects)\b|\b(?:are|is) also (?:affected|broken)\b"
     # A workaround handed to the user instead of a fix ("if the job holds one, pressing 'Post now' ... will work").
     r"|\bif\b[^.\n]{0,120}?,\s*(?:pressing|clicking|running|re-?running|tapping)\b[^.\n]{0,120}?\bwill (?:work|fix|clear)"
@@ -977,6 +981,12 @@ def wake_sources(session_id: str, tool_log: Optional[list] = None) -> list[str]:
     return found
 
 
+# agent-0bab362bcd: one clause shared by the report_only nudges and both report_only judges, so a card that can't run
+# fails the same bar at nudge time and at outcome time.
+STALLED_OWNER = ("A card that can't start (failed attempts, quota, no eligible route) is not a started fix: do it in "
+                 "this chat if your model can, or re-place it (`placement`) on a gateway with capacity, and say which.")
+
+
 JUDGE_SYS = """You review an AI agent's final message for a turn, right before the turn ends, for a power user who wants
 the agent to self-serve and to verify its own work. Judge ONLY from the evidence shown. Score five independent
 probabilities (0-1):
@@ -1037,6 +1047,10 @@ probabilities (0-1):
     "the other session owns remediation", "fix work will start once the hold is lifted", "it's waiting until ..." score
     HIGH (0.7+) unless the tool log shows this turn's check of that owner (kanban_show, process poll, reading its
     session) and the message reports what the check found. A message SENT to an owner is not a check that it moves.
+  * Owners that can't run. The nudge tells the agent: """ + STALLED_OWNER + """ So a message whose named fix card has
+    failed or crashed start attempts, is parked behind a quota or routing wall ("No eligible deep routes"), or "starts
+    by itself" after a reset scores HIGH (0.7+) even when the tool log checked that card, unless the tool log shows
+    the agent did the work this turn or re-placed the card on a gateway that can run it, and the message says which.
   * Small or optional leftovers still count. A closing "one limit / one gap / one small thing", "I left that alone",
     "optional tidy-up", "I didn't touch it", "haven't checked X", "needs a restart / the next sync to take effect", "not
     posted" about something the agent could do or check with its access scores 0.7+, even when the main work is done
@@ -1073,7 +1087,7 @@ Return ONLY one JSON object:
 - agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
-  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run.
+  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it.
   "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how), possibly asking for a go-ahead.
   "offered": only a vague offer ("want me to fix it?", "I can look into it") with no concrete solution.
   "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.
@@ -1393,8 +1407,8 @@ NUDGES = {
     "report_only": ("[coach] Your message ends on a problem you could fix ({evidence}) without fixing it, starting a "
                     "fix or proposing one. The user wants problems fixed, not reported, and standing approval covers "
                     "fixes. Fix it now if it's small or reversible. Otherwise start it (kanban_create with acceptance "
-                    "criteria, linked to this chat) and name the card. If it really is the user's call, propose the "
-                    "exact fix. Don't end on the diagnosis."),
+                    "criteria, linked to this chat) and name the card. " + STALLED_OWNER + " If it really is the "
+                    "user's call, propose the exact fix. Don't end on the diagnosis."),
 }
 # The session's Kanban tools can't read the board (core's "corrupt" refusal or PR #125's unreliable-view error), so
 # kanban_create from this session fails too: asking for it leaves the agent with no action that works.
@@ -1406,7 +1420,7 @@ REPORT_ONLY_KANBAN_DOWN = (
     "run `sqlite3 -readonly <board db> 'pragma quick_check'` from the terminal (read-only, no approval). If it says "
     "ok, the board is fine and this backend has a stale view: name the owner card (`hermes kanban list`/`show` in "
     "the terminal still works) or ask for the restart of this backend with action_request. If it is not ok, report "
-    "that output and ask for recovery with action_request. Don't end on the diagnosis.")
+    "that output and ask for recovery with action_request. " + STALLED_OWNER + " Don't end on the diagnosis.")
 
 
 def kanban_db_down(tool_log: list[str]) -> bool:

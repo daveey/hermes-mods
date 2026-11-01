@@ -1015,3 +1015,42 @@ def test_capability_block_with_needs_is_not_a_human_ask():
     hr = {"action": "Tap the key. Unblock = go; archive = drop.", "why_human": "physical", "interaction": "physical",
           "scope": "x", "evidence": "y"}
     assert rc.human_block("kanban_block", {**args, "human_request": hr}, "t_x")
+
+
+# agent-0bab362bcd: a revised reply named a fix card whose start attempts had failed and that was parked behind the
+# hub's quota reset ("starts by itself after that"). The nudge accepted any named card; the outcome judge did not.
+STALLED_OWNER_REPLY = ("The nudge-records fix is the hub card t_01a19430f4deb16b. Both start attempts failed and it is "
+                       "queued behind the hub's weekly quota reset; it starts by itself after that.")
+STALLED_OWNER_LOG = ["-> kanban_show(t_01a19430f4deb16b)",
+                     "   <- {\"status\": \"ready\", \"runs\": [{\"outcome\": \"crashed\", \"error\": \"Worker could not start: "
+                     "ModelRoutingError: No eligible deep routes under billing/capability policy\"}]}"]
+
+
+def _stalled_clause():
+    clause = getattr(rc, "STALLED_OWNER", "")
+    for part in ("can't start", "failed attempts", "quota", "no eligible route", "not a started fix",
+                 "in this chat", "placement", "gateway with capacity"):
+        assert part in clause, f"STALLED_OWNER lacks {part!r}: {clause!r}"
+    return clause
+
+
+def test_report_only_nudge_rejects_stalled_owner():
+    clause = _stalled_clause()
+    assert clause in rc.nudge_for("report_only", "e")
+    assert clause in rc.nudge_for("report_only", "e", kanban_down=True)
+
+
+def test_outcome_judge_and_nudge_agree_on_stalled_owner():
+    clause = _stalled_clause()
+    # the same words reach both judges: the screen/outcome judge's report_only rule and the second opinion
+    assert clause in rc.JUDGE_SYS and clause in rc.REPORT_ONLY_RULE and clause in rc.CONFIRM_SYS
+    systems = []
+    assert "report_only" in rc.prefilter(STALLED_OWNER_REPLY)  # the outcome stage reaches the judge at all
+
+    def llm(system, prompt):
+        systems.append(system)
+        return json.dumps({"report_only": 0.91, "evidence": "both start attempts failed; starts by itself after reset"})
+    out = rc.nudge_outcome("report_only", STALLED_OWNER_REPLY, "why are coach nudges missing?", STALLED_OWNER_LOG, llm,
+                           threshold=0.7, thresholds=rc.settings()["thresholds"])
+    assert systems and all(clause in s for s in systems)
+    assert out["resolved"] is False
