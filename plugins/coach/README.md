@@ -790,7 +790,12 @@ plus the rotated `desktop.log.1..3`), grouped by request path with ids folded to
 (default 30; config.yaml `coach.backend_timeouts.threshold` / `.window_minutes`, env
 `COACH_BACKEND_TIMEOUTS_THRESHOLD`, or `--threshold`) it runs `hermes kanban create --idempotency-key
 backend-timeouts:<host>:<date>` with the counts, top paths, load average and backend `ps` CPU; later firings that day
-comment on the same card at most once an hour (state in `<HERMES_HOME>/coach/backend_timeouts/state.json`). The
+comment on the same card at most once an hour while it remains open (state in
+`<HERMES_HOME>/coach/backend_timeouts/state.json`). Before throttling or commenting, the watcher reads the
+card's status. Done, archived, or unreadable destinations start a new card with suffix `:2`, then `:3`,
+and a line naming the preceding card; the daily state tracks the newest destination and sequence. Tests
+cover open-card comments/throttling, done/archived recurrences, lookup failures, and a second recurrence.
+The
 card's acceptance is a fresh 30-min window with zero timeouts after the fix, not a restart. No Inbox items; stdout is
 empty while healthy. `--dry-run` prints the JSON report and files nothing; `--hours` prints a per-hour histogram of
 every timeout still in the logs. Tests: `tests/test_backend_timeouts.py` (40 lines file one card, 5 file none, a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch desktop.log for Desktop->backend timeouts and file ONE Kanban card per host per day above a threshold.
+"""Watch desktop.log for Desktop->backend timeouts and file a Kanban card per incident above a threshold.
 
 The Desktop app logs every failed backend call as `<local stamp> [hermes] [hermes:api GET /api/...] Error: Timed out
 connecting to Hermes backend after Nms`. A CPU-starved `hermes serve` produced ~1,200 of those an hour on 2026-10-27
@@ -13,7 +13,8 @@ Failed/unsupported power probes suppress nothing.
 
 Above the threshold (default 30 in 30 min; config.yaml `coach.backend_timeouts.threshold` / `.window_minutes`, env
 COACH_BACKEND_TIMEOUTS_THRESHOLD, or --threshold) it runs `hermes kanban create --idempotency-key
-backend-timeouts:<host>:<date>`; a later firing the same day comments on that card (at most once an hour).
+backend-timeouts:<host>:<date>`; later firings comment only while that card remains open (at most once an hour).
+Closed or unreadable cards start a recurrence with a :2, :3, ... key suffix.
 --dry-run prints the report and files nothing. --hours prints a per-hour histogram of every timeout still in the
 logs (for checking past bursts). No Inbox items. Exit 0 unless the scan itself crashes.
 """
@@ -316,44 +317,73 @@ def save_state(home: Path, st: dict) -> None:
     os.replace(tmp, p)
 
 
+def _card_status(runner: Callable, tid: str) -> Optional[str]:
+    """A failed or malformed read must not hide a recurrence behind a stale ID."""
+    try:
+        r = _run(runner, ["hermes", "kanban", "show", tid, "--json"])
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+        status = data["task"]["status"]
+        return status if isinstance(status, str) and status else None
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
+        return None
+
+
 def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, threshold: int, window_min: int,
               runner: Callable) -> dict:
-    """Create (or find, via the idempotency key) today's card; a repeat firing comments at most once an hour."""
-    key = card_key(host, now)
+    """Reuse only an open destination; closed/unreadable cards start a numbered recurrence."""
+    daily_key = card_key(host, now)
     st = load_state(home)
-    ent = st.get(key) or {}
+    ent = st.get(daily_key) or {}
+    sequence = int(ent.get("sequence") or 1)
+    key = daily_key if sequence == 1 else f"{daily_key}:{sequence}"
     now_s = now.timestamp()
     tid = ent.get("task_id")
     existed = bool(tid)
-    if not tid:
+    previous = ""
+    while True:
+        if tid:
+            status = _card_status(runner, tid)
+            if status is not None and status not in {"done", "archived"}:
+                break
+            previous = (f"\nEarlier card `{tid}` closed ({status}).\n" if status else
+                        f"\nEarlier card `{tid}` has unreadable status; treating it as closed.\n")
+            sequence += 1
+            key = f"{daily_key}:{sequence}"
         r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
                           "--created-by", "backend-timeouts-watch", "--body-file", "-", "--json",
-                          card_title(host, rep, window_min)], card_body(host, rep, probe, threshold, window_min))
+                          card_title(host, rep, window_min)],
+                 card_body(host, rep, probe, threshold, window_min) + previous)
         if r.returncode != 0:
             return {"key": key, "action": "create_failed", "rc": r.returncode,
                     "out": ((r.stdout or "") + (r.stderr or ""))[-300:]}
         try:
             d = json.loads(r.stdout)
             tid = d.get("id")
+            if not isinstance(tid, str) or not tid:
+                raise ValueError("missing task id")
             created = float(d.get("created_at") or now_s)
         except (ValueError, TypeError, AttributeError):
             return {"key": key, "action": "create_unparsed", "out": (r.stdout or "")[-300:]}
         existed = created < now_s - 120  # the key returned a card made by an earlier run (state file lost)
-        ent = {"task_id": tid, "created": now_s if not existed else created, "last_comment": 0}
+        ent = {"task_id": tid, "sequence": sequence,
+               "created": now_s if not existed else created, "last_comment": 0}
         if not existed:
             ent["last_comment"] = now_s
-            st[key] = ent
+            st[daily_key] = ent
             save_state(home, st)
             return {"key": key, "action": "created", "task_id": tid}
+        # Recovered idempotent destinations need the same lifecycle check as cached ones.
     if now_s - float(ent.get("last_comment") or 0) < COMMENT_EVERY_S:
-        st[key] = ent
+        st[daily_key] = ent
         save_state(home, st)
         return {"key": key, "action": "throttled", "task_id": tid}
     text = (f"Still firing at {now.strftime('%H:%M')} on {host}: {rep['count']} timeouts in {window_min} min "
             f"(threshold {threshold}).\nTop paths:\n{_paths_md(rep)}\n{_host_md(probe)}")
     r = _run(runner, ["hermes", "kanban", "comment", tid, "--author", "backend-timeouts-watch", text])
     ent["last_comment"] = now_s
-    st[key] = ent
+    st[daily_key] = ent
     save_state(home, st)
     return {"key": key, "action": "commented" if r.returncode == 0 else "comment_failed", "task_id": tid,
             "existed": existed}

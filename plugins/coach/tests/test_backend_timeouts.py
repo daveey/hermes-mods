@@ -52,6 +52,8 @@ class Runner:
 
     def __init__(self):
         self.calls, self.keys = [], {}
+        self.statuses = {}
+        self.show_failure = None
 
     def __call__(self, argv, input=None, **kw):
         self.calls.append((argv, input))
@@ -61,6 +63,14 @@ class Runner:
             tid = self.keys.setdefault(key, f"t_{len(self.keys):08x}")
             d = {"id": tid} if new else {"id": tid, "created_at": NOW.timestamp() - 3600}  # an old card
             return SimpleNamespace(returncode=0, stdout=json.dumps(d), stderr="")
+        if argv[:3] == ["hermes", "kanban", "show"]:
+            assert argv[4:] == ["--json"]
+            if isinstance(self.show_failure, Exception):
+                raise self.show_failure
+            if self.show_failure is not None:
+                return self.show_failure
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                {"task": {"id": argv[3], "status": self.statuses.get(argv[3], "running")}}), stderr="")
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     def creates(self):
@@ -127,6 +137,50 @@ def test_lost_state_still_comments_on_the_existing_card(tmp_path, capsys):
     assert run(tmp_path, r, now=NOW + timedelta(minutes=10)) == 0
     capsys.readouterr()
     assert len(r.keys) == 1 and len(r.comments()) == 1  # the key returned the old card: comment, no duplicate
+
+
+@pytest.mark.parametrize('status', ['done', 'archived'])
+@pytest.mark.parametrize('lose_state', [False, True])
+def test_closed_card_opens_recurrence(tmp_path, status, lose_state):
+    r = Runner()
+    write_log(tmp_path, 40)
+    run(tmp_path, r)
+    r.statuses['t_00000000'] = status
+    if lose_state:
+        bt.state_path(tmp_path).unlink()
+    run(tmp_path, r, now=NOW + timedelta(minutes=10))
+    key = bt.card_key('David-MBP', NOW)
+    assert list(r.keys) == [key, key + ':2']
+    assert 't_00000000' in r.creates()[-1][1]
+    assert 'closed' in r.creates()[-1][1]
+    assert not r.comments()
+    assert bt.load_state(tmp_path)[key]['task_id'] == 't_00000001'
+    later = NOW + timedelta(minutes=71)
+    write_log(tmp_path, 40, now=later)
+    run(tmp_path, r, now=later)
+    assert r.comments()[-1][0][3] == 't_00000001'
+    r.statuses['t_00000001'] = 'done'
+    run(tmp_path, r, now=later + timedelta(minutes=1))
+    assert list(r.keys) == [key, key + ':2', key + ':3']
+    assert 't_00000001' in r.creates()[-1][1]
+
+
+@pytest.mark.parametrize('failure', [
+    SimpleNamespace(returncode=1, stdout='', stderr='unavailable'),
+    SimpleNamespace(returncode=0, stdout='not json', stderr=''),
+    SimpleNamespace(returncode=0, stdout='{}', stderr=''),
+    subprocess.TimeoutExpired('hermes', 120),
+    FileNotFoundError('hermes'),
+])
+def test_status_lookup_failure_opens_recurrence(tmp_path, failure):
+    r = Runner()
+    write_log(tmp_path, 40)
+    run(tmp_path, r)
+    r.show_failure = failure
+    run(tmp_path, r, now=NOW + timedelta(minutes=10))
+    assert list(r.keys)[-1] == bt.card_key('David-MBP', NOW) + ':2'
+    assert 't_00000000' in r.creates()[-1][1]
+    assert not r.comments()
 
 
 def test_next_day_opens_a_new_card(tmp_path, capsys):
