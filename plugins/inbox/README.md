@@ -43,7 +43,11 @@ Other `.claude` sources and unregistered posters in authoritative files remain c
 posts counted): when a family's last 2 closed cards in the window were archived with no action, a new card is
 refused with `PosterMuted` and one Kanban card `inbox-muted:<family>` is filed. Updates to an already-open card
 with the same key still go through. After fixing the producer: `hermes inbox unmute '<family>' --fix-commit <sha>`
-(a commit SHA or GitHub commit URL is required and recorded).
+(a commit SHA or GitHub commit URL is required and recorded). David's decision resets the streak: a resolved card,
+or an accepted card whose outcome is a type-specific action (`post` on an X draft, `draft`, `send_1`). A generic
+`do_it` or an accept with no action id does not. Every `PosterMuted` refusal, on both the normal and the
+conditional (`if_absent`/`expected`) path, goes through `_check_mute`/`_check_junk_mute`, which file the owner
+card first; an AST test in `tests/test_mute_paths.py` fails on any other `raise PosterMuted`.
 
 **Junk** (`hermes inbox junk <session_id>`, `POST /items/{id}/junk`, the trash button on a Desktop row): archives the
 card, mutes its family + key prefix, and files a five-whys Kanban card (`inbox-junk:<family>:<prefix>`) with the
