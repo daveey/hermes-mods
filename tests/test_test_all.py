@@ -33,6 +33,25 @@ class TestAll(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
 
+    def test_session_outcome_reports_real_core_results_even_on_success(self):
+        make_tree(self.root, {"session-outcome": """
+            import os
+            def test_real_core_visible():
+                assert os.environ['HERMES_DISABLE_LAZY_INSTALLS'] == '1'
+                assert os.environ['HERMES_CORE_CHECKOUT']
+        """})
+        # More than the usual 40-line failure tail: don't truncate the early integration result.
+        with (self.root / 'plugins/session-outcome/test_load.py').open('a') as f:
+            for i in range(45):
+                f.write(f'\ndef test_extra_{i}():\n    pass\n')
+        core = self.root / 'core'
+        core.mkdir()
+        (core / 'hermes_bootstrap.py').touch()
+        r = run(self.root, '-k', 'session-outcome', '--hermes-core', str(core))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('test_real_core_visible PASSED', r.stdout)
+        self.assertIn('46 passed', r.stdout)
+
     def test_same_named_test_modules_do_not_collide_and_all_pass(self):
         make_tree(self.root, {"a": "def test_a():\n    assert True\n", "b": "def test_b():\n    assert True\n"})
         r = run(self.root)

@@ -90,16 +90,22 @@ the outcome and feeds core the two things only plugins know: open user decisions
 User-steps' `open_steps`, `add_step` and the assent-echo filter are tested in
 `plugins/user-steps/tests/test_outcome_helpers.py`.
 
-`tests/test_real_core.py` runs the gate against the REAL `hermes_state_outcome` from the session-outcome core
-worktree (`HERMES_OUTCOME_CORE_DIR`, default `~/code/_wt/session-outcome`) on a temp HERMES_HOME state.db: a live
-turn marker doesn't hide the reply, a non-summary is held once, a summary passes, an undecided judge falls back to
-core's heuristic, and an open user-steps step makes core say `decision`. It skips without that checkout or core's
-deps, so run it with the Hermes venv:
+`tests/test_real_core.py` requires the REAL `hermes_state_outcome` from `HERMES_OUTCOME_CORE_DIR`,
+then `HERMES_CORE_CHECKOUT`, then `~/.hermes/hermes-agent`. It uses a temp HERMES_HOME state.db and sets
+`HERMES_DISABLE_LAZY_INSTALLS=1` before importing core, so this library test cannot relaunch pytest into
+production dependencies. Missing core or dependencies fail rather than skip. A live turn marker doesn't hide
+the reply; a non-summary is held once; a judged summary passes; core's heuristic still returns done on judge
+outage but the gate holds; and an open user-steps step makes core say `decision` while the gate still holds a
+NO reply (including the regression assertion added with the provider-suppression fix).
 
 ```sh
-uv run --with pytest python -m pytest -q -p no:cacheprovider plugins/session-outcome/tests
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q -p no:cacheprovider plugins/session-outcome/tests
+scripts/test-all -k session-outcome
 ```
+
+The runner prints named real-core results and skip reasons even on success. Both real-core tests must pass;
+only the separate opt-in live model suite may skip. The runner's output retention is regression-tested in
+`tests/test_test_all.py`. Use `HERMES_MODS_PYTHON` to select a dependency-equipped interpreter if the discovered
+core `.venv` is not suitable; missing imports are errors, not a passing coverage gap.
 
 `tests/test_judge_live.py` replays the real prompt on the real pool fast tier (3 runs per case, all must agree):
 replies that were misjudged (the scheduled-cron answer) plus NO cases (promises to report later, a question back, an

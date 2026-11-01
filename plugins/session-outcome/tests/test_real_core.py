@@ -1,8 +1,8 @@
 """The gate against the REAL hermes_state_outcome (not the fake), on a temp HERMES_HOME state.db.
 
-Core checkout: HERMES_OUTCOME_CORE_DIR, else ~/code/_wt/session-outcome (the session-outcome core worktree).
-Skips when that checkout has no hermes_state_outcome.py. Run it with the Hermes venv so core's deps import:
-  ~/.hermes/hermes-agent/venv/bin/python -m pytest -q plugins/session-outcome/tests/test_real_core.py
+Core checkout: HERMES_OUTCOME_CORE_DIR, HERMES_CORE_CHECKOUT, or ~/.hermes/hermes-agent.
+Missing core/dependencies fail rather than silently remove integration coverage.
+Run with a dependency-equipped interpreter via scripts/test-all -k session-outcome.
 """
 import importlib
 import importlib.util
@@ -13,16 +13,17 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE = Path(os.environ.get("HERMES_OUTCOME_CORE_DIR") or Path.home() / "code" / "_wt" / "session-outcome")
-
-pytestmark = pytest.mark.skipif(not (CORE / "hermes_state_outcome.py").is_file(),
-                                reason=f"no session-outcome core checkout at {CORE}")
+CORE = Path(os.environ.get("HERMES_OUTCOME_CORE_DIR") or os.environ.get("HERMES_CORE_CHECKOUT")
+            or Path.home() / ".hermes" / "hermes-agent").expanduser()
 
 SUMMARY = "Rebased the branch, fixed the two failing tests and pushed; CI is green on the new head."
 
 
 @pytest.fixture
 def real(tmp_path, monkeypatch):
+    assert (CORE / "hermes_state_outcome.py").is_file(), f"missing real core at {CORE}"
+    # This is a library test, not a launch: never provision/re-exec for the disposable home.
+    monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
     for k in ("HERMES_KANBAN_TASK", "HERMES_SESSION_OUTCOME_OFF", "HERMES_PLATFORM", "HERMES_SESSION_PLATFORM"):
@@ -36,7 +37,7 @@ def real(tmp_path, monkeypatch):
         so = importlib.import_module("hermes_state_outcome")
         import hermes_state  # noqa: F401
     except ImportError as exc:
-        pytest.skip(f"core deps missing in this interpreter (use the Hermes venv): {exc}")
+        pytest.fail(f"real-core dependencies missing in {sys.executable}: {exc}")
     assert Path(so.__file__).resolve().parent == CORE.resolve()
     import hermes_state
 
@@ -79,12 +80,13 @@ def test_gate_against_real_core(real, monkeypatch):
     plugin._llm = lambda s, u: "YES"
     assert gate(plugin, SUMMARY) is None
 
-    # judge can't tell -> core's heuristic decides: a long closing report passes, a short line is held
+    # Core may use its heuristic on judge outage, but the gate requires a declaration.
     def down(s, u):
         raise RuntimeError("pool down")
     plugin._llm = down
     plugin._JUDGED.clear()
-    assert gate(plugin, SUMMARY + " ") is None
+    assert so.derive_outcome("chat", ignore_live_turn=True, pending_reply=SUMMARY)["kind"] == "done"
+    assert gate(plugin, SUMMARY + " ")["hold"]
     assert gate(plugin, "Hmm?")["hold"]
 
 
