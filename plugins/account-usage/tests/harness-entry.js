@@ -1,6 +1,6 @@
 import React from 'react'
 import {createRoot} from 'react-dom/client'
-import plugin from '/Users/daveey/.hermes/desktop-plugins/account-usage/plugin.js'
+import plugin from '../../../desktop-plugins/account-usage/plugin.js'
 import {host} from './harness-sdk.js'
 const rows=new Map(), calls=[], deferred=[]
 const row=id=>rows.get(id)||{session_id:id,provider:'anthropic',model:'same-model',revision:0,account_id:null,state:'empty'}

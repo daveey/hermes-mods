@@ -12,8 +12,8 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-sys.path.insert(0, '/Users/daveey/.hermes/hermes-agent')
-import hermes_bootstrap  # noqa: F401
+from core_path import use_core
+use_core()
 from agent.credential_pool import CredentialPool, PooledCredential
 from agent.client_lifecycle import ClientLifecycleMixin
 

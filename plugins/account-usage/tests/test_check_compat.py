@@ -67,11 +67,59 @@ class CheckCompat(unittest.TestCase):
 class InstalledCore(unittest.TestCase):
     """The pins in this checkout match the core this host runs. Red = re-audit before shipping."""
     def test_pins_match_installed_core(self):
-        core = Path.home() / '.hermes' / 'hermes-agent'
-        if not (core / 'agent').is_dir():
-            self.skipTest('no installed Hermes core on this host')
+        from core_path import core_path
+        core = core_path()
         report = check_compat.check(core)
         self.assertTrue(report['ok'], json.dumps(report['drift'], indent=2))
+
+
+class CoreImportIsolation(unittest.TestCase):
+    def probe(self, route, code):
+        import os
+        from core_path import core_path
+        core = core_path()
+        with tempfile.TemporaryDirectory() as scratch:
+            home = Path(scratch) / 'home'
+            home.mkdir()
+            env = {'HOME': str(home), 'TMPDIR': scratch, 'PATH': os.defpath,
+                   'PYTHONPATH': str(Path(__file__).parent),
+                   'HERMES_HOME': str(Path(scratch) / 'state')}
+            if route == 'explicit':
+                env['HERMES_TEST_CORE'] = str(core)
+            elif route == 'pythonpath':
+                env['PYTHONPATH'] += os.pathsep + str(core)
+            elif route == 'fallback':
+                (home / '.hermes').mkdir()
+                (home / '.hermes' / 'hermes-agent').symlink_to(core, target_is_directory=True)
+            else:
+                env['HERMES_TEST_CORE'] = str(home / 'missing-core')
+            if route == 'fallback':
+                # Editable installs can expose core even without PYTHONPATH. Force
+                # only the discovery miss so this case exercises the home fallback.
+                code = ('import core_path; from unittest.mock import patch; '
+                        'with_fallback = patch.object(core_path.importlib.util, "find_spec", return_value=None); '
+                        'with_fallback.start(); core_path.use_core(); with_fallback.stop(); ' + code)
+            result = subprocess.run([sys.executable, '-B', '-c', code], env=env,
+                                    capture_output=True, text=True, timeout=60)
+            self.assertFalse((home / '.hermes' / 'installs').exists())
+            self.assertNotIn('preparing dependencies', result.stdout + result.stderr)
+            return result
+
+    def test_core_resolution_routes_do_not_bootstrap(self):
+        for route in ('explicit', 'pythonpath', 'fallback'):
+            with self.subTest(route=route):
+                result = self.probe(route, 'from core_path import use_core; use_core(); '
+                    'import test_selection, test_request_selection, test_selection_backend; '
+                    'import os; assert os.environ["HERMES_DISABLE_LAZY_INSTALLS"] == "1"; '
+                    'print("imports ok")')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('imports ok', result.stdout)
+
+    def test_missing_explicit_core_fails_loudly(self):
+        result = self.probe('missing', 'import test_selection')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Hermes test core not found', result.stderr)
+        self.assertIn('HERMES_TEST_CORE', result.stderr)
 
 
 if __name__ == '__main__':

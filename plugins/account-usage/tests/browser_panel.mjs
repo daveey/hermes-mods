@@ -1,11 +1,14 @@
 import {build} from './harness-deps/node_modules/esbuild/lib/main.js'
 import {chromium} from './harness-deps/node_modules/playwright/index.mjs'
 import {createServer} from 'node:http'
-import {writeFile} from 'node:fs/promises'
+import {mkdir} from 'node:fs/promises'
+import {tmpdir} from 'node:os'
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 const dir=path.dirname(fileURLToPath(import.meta.url))
+const artifacts=process.env.HERMES_TEST_ARTIFACTS || path.join(tmpdir(),'account-usage-tests')
+await mkdir(artifacts,{recursive:true})
 const out=await build({entryPoints:[path.join(dir,'harness-entry.js')],bundle:true,write:false,format:'esm',nodePaths:[path.join(dir,'harness-deps/node_modules')],alias:{'@hermes/plugin-sdk':path.join(dir,'harness-sdk.js')}})
 const server=createServer((req,res)=>{res.setHeader('Content-Type',req.url==='/app.js'?'text/javascript':'text/html');res.end(req.url==='/app.js'?out.outputFiles[0].text:'<!doctype html><html><head><meta charset="utf-8"><style>body{font:14px system-ui;background:#202124;color:#eee;--border:#555;--accent:#8ac;--ui-accent:#8ac;--ui-text-tertiary:#aaa;padding:30px}section{box-sizing:border-box;padding:18px;border:1px solid #555;margin-top:20px}button{color:inherit;background:transparent;cursor:pointer}button:focus-visible{outline:2px solid #8ac}h1{font-size:16px}</style></head><body><h1>SYNTHETIC HARNESS — real plugin, mocked host/API</h1><div id="root"></div><script type="module" src="/app.js"></script></body></html>')})
 await new Promise(r=>server.listen(0,'127.0.0.1',r))
@@ -46,7 +49,7 @@ try {
  await page.getByRole('button',{name:'Try Spent account next',exact:true}).click()
  await page.getByRole('alert').filter({hasText:'out of quota'}).waitFor()
  assert.equal((await page.evaluate(()=>window.fixture.calls)).filter(c=>c.method==='PUT').length,putsBefore,'blocked rows never PUT'); evidence.push('Quota row -> refusal, no PUT')
- await page.screenshot({path:'/Users/daveey/.hermes/local-fixes/account-usage-selection/ui-harness-refusal.png',fullPage:true})
+ await page.screenshot({path:path.join(artifacts,'ui-harness-refusal.png'),fullPage:true})
  await page.getByRole('button',{name:'Try GPT account next',exact:true}).click()
  await page.getByRole('alert').filter({hasText:'provider'}).waitFor(); evidence.push('Wrong provider -> readable refusal')
  await page.evaluate(()=>{window.fixture.refuse=true}); await choose.click()
@@ -80,7 +83,7 @@ try {
  assert.equal(await page.getByText('Next to try',{exact:true}).count(),0);evidence.push('Foreign connection owner fails closed visibly')
  await page.evaluate(()=>{window.fixture.host.state.focusedSessionOwner.set({connectionId:'local',profile:'default'});window.fixture.focus('runtime-a')})
  await page.getByText('Next to try',{exact:true}).waitFor()
- await page.screenshot({path:'/Users/daveey/.hermes/local-fixes/account-usage-selection/ui-harness.png',fullPage:true})
+ await page.screenshot({path:path.join(artifacts,'ui-harness.png'),fullPage:true})
  // Panel stays a bounded width and long cause text wraps inside it (no horizontal overflow).
  const box=await page.evaluate(()=>{const sec=document.querySelector('section[aria-label="Account usage popover"]');const r=sec.getBoundingClientRect();return {w:r.width,overflow:sec.scrollWidth-sec.clientWidth,rows:[...sec.querySelectorAll('.hermes-au-why')].map(e=>e.getBoundingClientRect().right<=r.right+0.5)}})
  assert.ok(box.w<=460,`popover width ${box.w}`); assert.equal(box.overflow,0); assert.ok(box.rows.every(Boolean)); evidence.push(`Popover bounded at ${box.w}px; long cause text wraps`)
@@ -97,7 +100,7 @@ try {
  await signIn.click(); assert.deepEqual(await page.evaluate(()=>window.__nav),['/settings?tab=providers']); evidence.push('Dead grant -> Sign in again opens Settings › Providers')
  const posts=(await page.evaluate(()=>window.fixture.calls)).filter(c=>c.path==='/reconnect')
  assert.deepEqual(posts.map(c=>[c.method,c.body.provider,c.body.account_id]),[['POST','openai-codex','inventory-expired'],['POST','openai-codex','inventory-dead']])
- await page.screenshot({path:'/Users/daveey/.hermes/cache/scratch/account-usage-reconnect.png',fullPage:true})
+ await page.screenshot({path:path.join(artifacts,'account-usage-reconnect.png'),fullPage:true})
  const calls=await page.evaluate(()=>window.fixture.calls)
  assert.ok(calls.filter(c=>c.method==='PUT').every(c=>c.body.session_id==='runtime-a'))
  assert.ok(!calls.some(c=>c.method==='PUT'&&c.body.account_id==='inventory-cooling'))

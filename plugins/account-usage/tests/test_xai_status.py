@@ -4,7 +4,8 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path.home() / ".hermes" / "hermes-agent"))
+from core_path import use_core
+use_core()
 PLUGIN = Path(__file__).parents[1]
 
 

@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, '/Users/daveey/.hermes/hermes-agent')
-import hermes_bootstrap
+from core_path import use_core
+use_core()
 sys.path.insert(0, str(Path(__file__).parent))
 from test_request_selection import selection, entry, unmanaged
 from hermes_cli.active_sessions import try_acquire_active_session
@@ -469,7 +469,7 @@ class Backend(unittest.TestCase):
         import signal
         import subprocess
         from hermes_cli import active_sessions as registry
-        code = ('import os,sys,time; import hermes_bootstrap\n'
+        code = ('import os,sys,time\n'
                 'from hermes_cli.active_sessions import try_acquire_active_session as t\n'
                 f'l, r = t(session_id="held", surface="desktop", config={{}}, registry_home={str(self.home)!r}, '
                 'metadata={"live_session_id": "rt"}, track_liveness=True)\n'

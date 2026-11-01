@@ -7,8 +7,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, '/Users/daveey/.hermes/hermes-agent')
-import hermes_bootstrap  # noqa
+from core_path import use_core
+use_core()
 from agent.credential_pool import PooledCredential
 from agent.account_usage_cache import _identity_id_for
 
