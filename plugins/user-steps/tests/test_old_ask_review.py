@@ -444,7 +444,8 @@ def test_original_legacy_ledger_age_creates_review_without_stamping(env, monkeyp
     st.revise(OWNER, r['requestId'], 1, r)
     with st._tx() as c:
         c.execute('UPDATE lifecycle SET created_at=NULL, asked_revision=NULL')
-    assert sw.old_asks(core, st, now=NOW) == []
+    # This tests legacy evidence alone, without a provable owner-chat bound.
+    assert sw.old_asks(core, st, now=NOW, local_gateway=GW, owner_db=lambda o: None) == []
 
 
 def test_old_review_does_not_suppress_new_revision(env):
@@ -489,7 +490,8 @@ def test_legacy_fallback_requires_exact_owner_alias(env, monkeypatch, field, val
     r = make(env['store'], 80, aliases=[alias])
     with env['store']._tx() as c:
         c.execute('UPDATE lifecycle SET created_at=NULL, asked_revision=NULL')
-    assert sw.old_asks(core, env['store'], now=NOW) == []
+    # A mismatched legacy alias supplies no age; no owner-chat evidence is available.
+    assert sw.old_asks(core, env['store'], now=NOW, local_gateway=GW, owner_db=lambda o: None) == []
 
 
 def test_dry_run_store_never_initializes_and_rejects_writes(env, monkeypatch):
@@ -510,6 +512,8 @@ def test_dry_run_store_never_initializes_and_rejects_writes(env, monkeypatch):
 
 def test_cli_dry_run_uses_read_only_store(env, monkeypatch, capsys):
     sentinel = object()
+    monkeypatch.setattr(sw, '_local_gateway', lambda c: GW)
+    monkeypatch.setattr(sw.os, 'execve', lambda *a: pytest.fail('fixture must not recover a live runtime'))
     monkeypatch.setattr(sw, '_read_only_store', lambda c: sentinel)
     monkeypatch.setattr(sw, '_store', lambda c: pytest.fail('no writable store'))
     def run(c, chat, store, **kw):
