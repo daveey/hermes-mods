@@ -123,6 +123,50 @@ def test_pending_then_resume(tmp_path, monkeypatch):
     assert out["status"] == "ran"
 
 
+@needs_bsd_script
+def test_withdrawn_close_prompt_ignores_late_notification(tmp_path, monkeypatch):
+    """A kill notification arriving after script exited must not start a second close prompt."""
+    import signal
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("true", "test", str(tmp_path))
+    (job / "withdraw").write_text("already stopped")
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv("/bin/bash", ["/bin/bash", str(job / "runner.sh"), str(job)])
+    buf = b""
+    reaped = False
+    try:
+        end = time.monotonic() + 10
+        while b"Press Enter" not in buf and time.monotonic() < end:
+            if select.select([fd], [], [], .1)[0]:
+                buf += os.read(fd, 4096)
+        assert b"Press Enter" in buf
+        os.kill(pid, signal.SIGUSR1)
+        end = time.monotonic() + .5
+        while time.monotonic() < end:
+            if select.select([fd], [], [], .05)[0]:
+                buf += os.read(fd, 4096)
+        assert buf.count(b"Hermes withdrew this request:") == 1
+        os.write(fd, b"\n")
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            if select.select([fd], [], [], .05)[0]:
+                try:
+                    buf += os.read(fd, 4096)
+                except OSError:
+                    pass
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                reaped = True
+                break
+            time.sleep(.05)
+        assert reaped, "one Enter must close the window"
+    finally:
+        if not reaped:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        os.close(fd)
+
+
 def test_clean_output_strips_ansi():
     assert ut.clean_output("\x1b[31mred\x1b[0m\r\nprogress 10%\rprogress 100%\n") == "red\nprogress 100%"
 

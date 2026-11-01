@@ -131,7 +131,9 @@ SCHEMA = {
         "first for anything destructive. Never tell "
         "the user to copy/paste a command; call this instead. The window shows `reason`, `cwd` and the "
         "exact `command`, runs it right away (no y/N step; the user can Ctrl-C it), and this tool returns status "
-        "(ran/declined/pending), exit_code and the output. The user can type into the window if the "
+        "(ran/declined/pending/withdrawn/abandoned), exit_code and the output. Jobs expire after "
+        "user_terminal.max_wait_minutes (default 120), including running commands. Use action=withdraw "
+        "with job_id and reason when changing course. The user can type into the window if the "
         "command prompts. If it is still pending after `wait_s`, call again with only `job_id` to keep waiting."
     ),
     "parameters": {
@@ -164,6 +166,7 @@ status() { [ -d "$JOB/final.lock" ] && return 0; printf '%s' "$1" > "$JOB/.statu
 # job's final status, so a withdrawal is never overwritten by "ran" (and vice versa).
 final() { mkdir "$JOB/final.lock" 2>/dev/null || return 1; printf '%s' "$1" > "$JOB/final.lock/result.json"; printf '%s' "$1" > "$JOB/.status.$$.tmp" && mv "$JOB/.status.$$.tmp" "$JOB/status.json"; }
 withdrawn_msg() {
+  trap '' USR1  # teardown can notify after script exits; never interrupt/re-enter the close prompt
   echo; echo "${B}${Y}Hermes withdrew this request: $(head -c 2000 "$JOB/withdraw" 2>/dev/null | tr -s '\n' ' ' | sed 's/ *$//'). Nothing else to do here.${N}"
   read -r -t 600 -p "Press Enter to close. " </dev/tty; exit 0
 }
