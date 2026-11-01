@@ -1,0 +1,338 @@
+From 4cab5360c3ea630703986b9eb166cd5bf1bccbcc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:12:13 +0000
+Subject: [PATCH] fix(kanban): selectively retire proven obsolete rejections
+ [daveey]
+
+---
+ hermes_cli/kanban_sync_cli.py                 |   5 +-
+ hermes_cli/kanban_sync_client.py              |   7 +
+ hermes_cli/kanban_sync_rejections.py          | 122 ++++++++++++++++++
+ tests/hermes_cli/kanban_sync_fake_board.py    |   9 ++
+ .../hermes_cli/test_kanban_sync_rejections.py | 120 +++++++++++++++++
+ 5 files changed, 262 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_sync_rejections.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_rejections.py
+
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index eb3e00226b1..b954ae060a9 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -89,11 +89,14 @@ def _diff(args: argparse.Namespace) -> int:
+     live = kbc.connect(_path(slug))
+     shadow = ksc.open_shadow(slug, ident.gateway)
+     try:
++        refresh_error = None
+         try:  # compare against the service's current state, not the replica's last round
+             ksc.pull(shadow, ksc.Hub(ident), slug, observers=False)
+         except (ksc.HubError, ksc.Resync, OSError) as exc:
+-            print(f"kanban sync: could not refresh the replica first ({exc}); comparing with its last round")
++            refresh_error = str(exc)
+         report = ksc.diff(live, shadow, ident.gateway)
++        if refresh_error is not None:
++            report.update(clean=False, unavailable=True, refresh_error=refresh_error)
+     finally:
+         live.close()
+         shadow.close()
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 0e396505d08..bc1c2dccf5f 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -127,6 +127,11 @@ class Hub:
+         from urllib.parse import quote
+         return self._call("GET", f"/v2/boards/{board}/snapshot?table={table}&after={quote(after)}&limit={limit}")
+ 
++    def row_evidence(self, board: str, table: str, uid: str) -> dict:
++        """Exact authoritative row/deletion/history evidence, never a replica lookup."""
++        from urllib.parse import urlencode
++        return self._call("GET", f"/v2/boards/{board}/evidence?" + urlencode({"table": table, "uid": uid}))
++
+     def leases(self, board: str, body: dict) -> dict:
+         return self._call("POST", f"/v2/boards/{board}/leases", body)
+ 
+@@ -650,6 +655,8 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+             if mode == "primary":
+                 heal_clobbered_completions(live)
+         result.push = push(live, hub, slug, gateway, primary=mode == "primary")
++        from hermes_cli.kanban_sync_rejections import resolve_rejections
++        resolve_rejections(live, hub, slug)
+         return result
+     finally:
+         live.close()
+diff --git a/hermes_cli/kanban_sync_rejections.py b/hermes_cli/kanban_sync_rejections.py
+new file mode 100644
+index 00000000000..e1af49c760c
+--- /dev/null
++++ b/hermes_cli/kanban_sync_rejections.py
+@@ -0,0 +1,122 @@
++"""Conservative selective outbox retirement; rejection audit events are immutable here."""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_db_connect import write_txn
++
++
++def _local(conn, table, uid):
++    if table == "task_links":
++        parent, sep, child = uid.partition(">")
++        if not sep:
++            return None
++        row = conn.execute("SELECT * FROM task_links WHERE parent_id=? AND child_id=?", (parent, child)).fetchone()
++    else:
++        key = "id" if table == "tasks" else "uid"
++        row = conn.execute(f"SELECT * FROM {table} WHERE {key}=?", (uid,)).fetchone()
++    return row
++
++
++def _inputs(conn, rejected):
++    """Include translated references and pending/tombstone guards in the compare-and-delete snapshot."""
++    from hermes_cli import kanban_sync_client as client
++    table, uid = rejected["table_name"], rejected["row_uid"]
++    row = _local(conn, table, uid)
++    fields = client._row_fields(conn, table, row) if row else None
++    original = json.loads(rejected["fields"])
++    task = uid if table == "tasks" else (fields or original).get("task_id")
++    identities = {(table, uid)}
++    if task:
++        identities.add(("tasks", task))
++    pending, tombs = [], []
++    for tab, key in sorted(identities):
++        pending.extend(tuple(r) for r in conn.execute(
++            "SELECT * FROM kanban_sync_outbox WHERE table_name=? AND row_uid=? AND state='pending'", (tab, key)))
++        tombs.extend(tuple(r) for r in conn.execute(
++            "SELECT * FROM kanban_sync_tombstones WHERE table_name=? AND row_uid=?", (tab, key)))
++    parent = _local(conn, "tasks", task) if task else None
++    parent_ops = [tuple(r) for r in conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (task,))] if task else []
++    return {"row": dict(row) if row else None, "fields": fields, "task": task,
++            "parent": dict(parent) if parent else None, "parent_ops": parent_ops,
++            "pending": pending, "tombstones": tombs}
++
++
++def _evidence(hub, board, table, uid):
++    from hermes_cli.kanban_sync_client import SyncUnavailable
++    e = hub.row_evidence(board, table, uid)
++    if (e.get("table"), e.get("uid")) != (table, uid) or not isinstance(e.get("head"), int):
++        raise SyncUnavailable("authoritative evidence identity/head mismatch")
++    return e
++
++
++def _classify(op, before, evidence, parent_evidence):
++    from hermes_cli import kanban_sync_client as client
++    if before["pending"] or before["tombstones"]:
++        return "unresolved", "pending local work or local tombstone"
++    fields = client._wire_fields(op["table_name"], json.loads(op["fields"]))
++    remote, local = evidence.get("row"), before["row"]
++    if op["op"] in ("upsert", "import") and evidence.get("state") == "live" and remote and local:
++        version = remote.get("version")
++        if (remote.get("uid") != op["row_uid"] or not isinstance(version, int)
++                or version < (op.get("base_version") or 0)):
++            return "unresolved", "authoritative identity/version does not cover rejected write"
++        if op["table_name"] == "tasks" and local.get("sync_version") != version:
++            return "unresolved", "local task has not settled at authoritative version"
++        if local.get("current_run_id") is not None and before["fields"].get("current_run_uid") is None:
++            return "unresolved", "local run reference cannot be translated"
++        if fields and all(k in before["fields"] and k in remote and before["fields"][k] == remote[k] for k in fields):
++            return "superseded", "authoritative row equals current local values for every rejected wire field"
++    if (op["table_name"] == "task_chat_links" and op["op"] in ("upsert", "import")
++            and parent_evidence and parent_evidence.get("state") == "never_existed"
++            and parent_evidence.get("floor") == 0 and parent_evidence.get("row") is None
++            and parent_evidence.get("tombstone") is None and before["parent"] is None
++            and not before["parent_ops"] and evidence.get("state") == "never_existed"
++            and evidence.get("floor") == 0 and evidence.get("row") is None
++            and evidence.get("tombstone") is None):
++        return "moot", "authoritative unpruned history has no task/link; no local task, create or tombstone"
++    return "unresolved", "no proof of supersession or mootness; do not replay historical intent"
++
++
++def resolve_rejections(conn: sqlite3.Connection, hub, board: str) -> list[dict]:
++    """Fresh service reads, followed by transactional revalidation; never trust a replica or replay old writes.
++
++    A legacy service without the evidence route leaves rejections visible. Network calls run outside
++    the write transaction. Any local change during the read vetoes retirement until the next round.
++    """
++    from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
++    ops = [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox WHERE state='rejected' ORDER BY op_id")]
++    reports = []
++    for op in ops:
++        report = {"op_id": op["op_id"], "table": op["table_name"], "row_uid": op["row_uid"],
++                  "fields": sorted(json.loads(op["fields"])), "classification": "unresolved", "action": "retained"}
++        reports.append(report)
++        if op["table_name"] not in sync.SYNCED_COLUMNS:
++            report["proof"] = "unknown synced table"
++            continue
++        before = _inputs(conn, op)
++        try:
++            evidence = _evidence(hub, board, op["table_name"], op["row_uid"])
++            parent = _evidence(hub, board, "tasks", before["task"]) if (
++                op["table_name"] == "task_chat_links" and before["task"]) else None
++        except (HubError, SyncUnavailable, OSError, AttributeError, ValueError) as exc:
++            report["proof"] = f"authoritative evidence unavailable: {exc}"
++            continue
++        report["evidence"] = evidence
++        if parent:
++            report["parent_evidence"] = parent
++        classification, proof = _classify(op, before, evidence, parent)
++        report.update(classification=classification, proof=proof)
++        if classification == "unresolved":
++            continue
++        with write_txn(conn):
++            current = conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (op["op_id"],)).fetchone()
++            if current is None or dict(current) != op or _inputs(conn, op) != before:
++                report.update(classification="unresolved", proof="local state changed during evidence read")
++                continue
++            conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id=? AND state='rejected'", (op["op_id"],))
++            report["action"] = "retired"
++    return reports
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 7d59c0e59a4..061203d30d4 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -152,6 +152,15 @@ class FakeHub:
+         more = len([c for c in b["changes"] if c["seq"] > since]) > len(page)
+         return {"changes": copy.deepcopy(page), "next": page[-1]["seq"] if page else since, "head": b["seq"], "more": more}
+ 
++    def row_evidence(self, board: str, table: str, uid: str) -> dict:
++        self._check()
++        b = self.svc.board(board)
++        row = copy.deepcopy(b["rows"].get(table, {}).get(uid))
++        state = ("deleted" if row.get("deleted_at") is not None else "live") if row else (
++            "unknown" if b["floor"] else "never_existed")
++        return {"table": table, "uid": uid, "state": state, "row": row,
++                "tombstone": None, "floor": b["floor"], "head": b["seq"]}
++
+     def snapshot_page(self, board: str, table: str, after: str = "", limit: int = 1000) -> dict:
+         self._check()
+         b = self.svc.board(board)
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+new file mode 100644
+index 00000000000..ac3aeeaa379
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -0,0 +1,120 @@
++"""Selective rejection retirement uses authoritative evidence, never replica absence."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli.test_kanban_sync_client import BOARD, ME, OTHER, kanban_home, live, svc
++
++
++def reject_status(live, svc):
++    tid = kb.create_task(live, title="contested", assignee="worker")
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    svc.board(BOARD)["leases"][tid] = {"task_id": tid, "holder": OTHER, "run_uid": "other-run", "expires": 9e15}
++    sync.set_mode(live, "primary")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
++    client.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    assert client.status(live)["rejected"] == 1
++    return tid
++
++
++def test_normal_sync_retires_superseded_keeps_audit_and_is_idempotent(live, svc, kanban_home):
++    reject_status(live, svc)
++    audits = [tuple(r) for r in live.execute("SELECT * FROM task_events WHERE kind='sync_rejected'")]
++    assert audits
++    client.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    assert client.status(live)["rejected"] == 0
++    assert [tuple(r) for r in live.execute("SELECT * FROM task_events WHERE kind='sync_rejected'")] == audits
++    client.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    shadow = client.open_shadow(BOARD, ME)
++    try:
++        assert client.diff(live, shadow, ME)["clean"]
++    finally:
++        shadow.close()
++
++
++def test_matching_lagging_replica_cannot_retire_unresolved(live, svc, kanban_home):
++    tid = reject_status(live, svc)
++    client._pull_replica(BOARD, svc.hub(ME), ME)
++    svc.board(BOARD)["rows"]["tasks"][tid]["status"] = "done"
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    result = resolve_rejections(live, svc.hub(ME), BOARD)
++    assert result[0]["classification"] == "unresolved"
++    assert client.status(live)["rejected"] == 1
++    shadow = client.open_shadow(BOARD, ME)
++    try:
++        assert not client.diff(live, shadow, ME)["clean"]
++    finally:
++        shadow.close()
++
++
++def ghost(live):
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,state,last_error) "
++                     "VALUES ('ghost-op','task_chat_links','ghost-link','upsert',?,'',1,'rejected','not_found')",
++                     (json.dumps({"task_id": "t_ghost", "released": 1}),))
++
++
++def test_unknown_task_link_retired_by_normal_sync(live, svc, kanban_home):
++    ghost(live)
++    client.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    assert client.status(live)["rejected"] == 0
++
++
++@pytest.mark.parametrize("offline", [False, True])
++def test_cli_diff_does_not_report_clean_from_failed_refresh(live, svc, kanban_home, monkeypatch, capsys, offline):
++    from argparse import Namespace
++    from hermes_cli import kanban_sync_cli as cli
++    client.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    monkeypatch.setattr(cli, "_board", lambda args: BOARD)
++    monkeypatch.setattr(cli, "_path", lambda slug: kanban_home / "kanban.db")
++    monkeypatch.setattr(client, "load_identity", lambda: svc.hub(ME).ident)
++    monkeypatch.setattr(client, "Hub", lambda ident: svc.hub(ME))
++    svc.offline = offline
++    rc = cli._diff(Namespace(json=True))
++    report = json.loads(capsys.readouterr().out)
++    assert report["clean"] is (not offline)
++    assert rc == int(offline)
++    assert bool(report.get("unavailable")) is offline
++
++
++def test_concurrent_edit_vetoes_retirement(live, svc, monkeypatch):
++    reject_status(live, svc)
++    hub = svc.hub(ME)
++    original = hub.row_evidence
++
++    def read_then_change(*args):
++        evidence = original(*args)
++        with kbc.write_txn(live):
++            live.execute("UPDATE kanban_sync_outbox SET attempts=attempts+1 WHERE state='rejected'")
++        return evidence
++
++    monkeypatch.setattr(hub, "row_evidence", read_then_change)
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    report = resolve_rejections(live, hub, BOARD)
++    assert report[0]["classification"] == "unresolved"
++    assert "changed" in report[0]["proof"]
++    assert client.status(live)["rejected"] == 1
++
++
++@pytest.mark.parametrize("veto", ["pending_create", "deleted", "history_compacted", "service_error"])
++def test_moot_requires_proven_never_existed(live, svc, veto):
++    ghost(live)
++    if veto == "pending_create":
++        with kbc.write_txn(live):
++            live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                         "VALUES ('create-op','tasks','t_ghost','upsert','{}','',2)")
++    elif veto == "deleted":
++        svc.board(BOARD)["rows"].setdefault("tasks", {})["t_ghost"] = {"uid": "t_ghost", "deleted_at": 5}
++    elif veto == "history_compacted":
++        svc.board(BOARD)["floor"] = 1
++    else:
++        svc.offline = True
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    result = resolve_rejections(live, svc.hub(ME), BOARD)
++    assert result[0]["classification"] == "unresolved"
++    assert client.status(live)["rejected"] == 1
+-- 
+2.55.0
+

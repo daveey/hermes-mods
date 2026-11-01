@@ -54,7 +54,12 @@ to verify. With one source of truth it is the card's status.
 
 ### Selective rejection resolution and fleet drift consumer
 
-The rejection-resolution client change is staged in fork PR #499 (deployment acceptance pending).
+The rejection-resolution client change is merged in fork PR #499 through `6110db6d1b1`
+(public patches **1488–1492**), but remains staged for fleet rollout (deployment acceptance pending).
+Core code: `hermes_cli/kanban_sync_rejections.py`, `kanban_sync_client.py` and `kanban_sync_cli.py`.
+Apply through the complete [mirror series](README.md#applying); this is core sync logic, not a plugin.
+Exact-head CI: [required checks](https://github.com/daveey/hermes/actions/runs/41306900906/job/124853534264).
+Mirror-pass test evidence is in [snapshot 1492](mirror-1492-verification.md).
 Rejected outbox operations remain dirty until there is fresh authoritative evidence that each
 operation is superseded or moot. The normal sync round performs selective retirement after push;
 it deletes only the guarded rejected outbox row, never its `sync_rejected` audit events. It does
