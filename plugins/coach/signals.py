@@ -1074,14 +1074,15 @@ def _handoff_signal(r: dict, why: str) -> dict:
 
 
 def _outcome_matches(n: dict, o: dict) -> bool:
-    """The reply_nudge_outcome `o` judges the revision of nudge `n`: same session, same draft when both carry one,
-    and logged within the grace window after the nudge."""
+    """The reply_nudge_outcome `o` judges the revision of nudge `n`: same session and rule, same draft when both carry
+    one. When both carry a nudge_id the id decides, with no time limit (agent-98f77b1ca9: a report_only fix that ran
+    15+ min logged its outcome after the window); only id-less records fall back to the grace window."""
     if (o.get("session_id") or "") != (n.get("session_id") or ""):
         return False
     if (o.get("rule") or "handoff") != (n.get("rule") or "handoff"):
         return False
-    if n.get("nudge_id") and o.get("nudge_id") and n["nudge_id"] != o["nudge_id"]:
-        return False
+    if n.get("nudge_id") and o.get("nudge_id"):
+        return n["nudge_id"] == o["nudge_id"]
     if n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"]:
         return False
     dt = float(o.get("ts") or 0) - float(n.get("ts") or 0)
@@ -1379,6 +1380,38 @@ def _mark(opened: dict, n: dict, key: str) -> None:
         opened[n["nudge_id"]][key] = 1
 
 
+def nudge_due(n: dict, now: float) -> bool:
+    """A pending nudge past its wait for an outcome. An id-less nudge waits HANDOFF_GRACE_S from the nudge. A nudge with
+    a nudge_id gets its delivery record when its next final reply runs, so its clock starts there: HANDOFF_GRACE_S
+    after delivery, or NUDGE_OPEN_S when it is never delivered (the same bound close_open_nudges uses)."""
+    if not n.get("nudge_id"):
+        return now - float(n.get("ts") or 0) > HANDOFF_GRACE_S
+    if n.get("delivered_ts"):
+        return now - float(n["delivered_ts"]) > HANDOFF_GRACE_S
+    return now - float(n.get("ts") or 0) > NUDGE_OPEN_S
+
+
+def logged_outcome(home: Path, nid: str) -> Optional[dict]:
+    """The first outcome record (any NUDGE_OUTCOME event) for nudge_id `nid` in <home>/coach/log.jsonl, or None. The
+    guard before a no-outcome signal: an outcome the matcher missed is a coach bug, not an ignored nudge."""
+    if not nid:
+        return None
+    try:
+        with (home / "coach" / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if nid not in ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("nudge_id") == nid and r.get("event") in NUDGE_OUTCOME:
+                    return r
+    except OSError:
+        pass
+    return None
+
+
 def close_open_nudges(home: Path, opened: dict, now: float) -> None:
     """Write the missing delivery / outcome record of every nudge whose backend will never write it: its turn provably
     died (_turn_lost, from HANDOFF_GRACE_S on) or it is still open after NUDGE_OPEN_S (the backend exited or reloaded
@@ -1437,8 +1470,12 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
         if nid and r.get("event") == "reply_nudge":
             opened[nid] = {**{k: r.get(k) for k in ("session_id", "rule", "draft_id", "platform")}, "nudge_id": nid,
                            "ts": at, "d": 0, "o": 0}
-        elif nid and nid in opened and r.get("event") in NUDGE_DELIVERY:
-            opened[nid]["d"] = 1
+        elif nid and r.get("event") in NUDGE_DELIVERY:
+            if nid in opened:
+                opened[nid]["d"] = 1
+            for p in pending:  # the outcome clock of an id nudge starts at its delivery (nudge_due)
+                if p.get("nudge_id") == nid and not p.get("delivered_ts"):
+                    p["delivered_ts"] = at
         elif nid and nid in opened and r.get("event") in NUDGE_OUTCOME:
             opened[nid]["o"] = 1
         if nid and r.get("event") in NUDGE_OUTCOME and r.get("event") != "reply_nudge_outcome":
@@ -1493,9 +1530,22 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                                   "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"), **_nid(n)})
                 _mark(opened, n, "o")
                 continue
+            if not nudge_due(n, now):
+                keep.append(n)  # an id nudge whose turn still runs: its clock starts at delivery
+                continue
+            late = logged_outcome(home, str(n.get("nudge_id") or ""))
+            if late is not None:
+                # detection guard: an outcome for this nudge_id exists, so the matcher missed it; never file it
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_late", "session_id": n.get("session_id") or "",
+                                  "rule": n.get("rule"), "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
+                                  "outcome_event": late.get("event"), "outcome_ts": late.get("ts"), **_nid(n)})
+                _mark(opened, n, "o")
+                continue
             _mark(opened, n, "filed")
+            since = "its delivery" if n.get("delivered_ts") else "the nudge"
+            wait = HANDOFF_GRACE_S if (not n.get("nudge_id") or n.get("delivered_ts")) else NUDGE_OPEN_S
             out.append(_handoff_signal({**n, "no_outcome": True},
-                                       f"no outcome logged within {HANDOFF_GRACE_S // 60} min of the nudge"))
+                                       f"no outcome logged within {wait // 60} min of {since}"))
         else:
             keep.append(n)
     if keep:

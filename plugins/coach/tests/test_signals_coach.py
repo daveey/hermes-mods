@@ -203,3 +203,88 @@ def test_reply_in_the_nudged_turn_after_a_tool_still_files(tmp_path):
                                ("assistant", "Here is the revised summary.", None, 60, None)])
     got = _coach(sg.collect_coach(h, {}, LATE))
     assert len(got) == 1 and "no outcome" in got[0]["symptom"]
+
+
+# ── self-heal agent-98f77b1ca9: a nudge carrying a nudge_id is matched by id, not by a 15-min window ────────────
+# The report_only nudge's turn spent 918 s doing the fix; its delivery (+918 s) and resolved outcome (+926 s) were
+# logged after HANDOFF_GRACE_S, so the collector filed "no outcome" for a nudge that worked.
+NID = "n_synthetic98f7"
+ID_NUDGE = {**NUDGE, "nudge_id": NID}
+DELIVERED = {"ts": NOW + 918, "event": "reply_nudge_delivered", "session_id": SID, "rule": "report_only",
+             "nudge_id": NID, "via": "continuation"}
+RESOLVED = {"ts": NOW + 926, "event": "reply_nudge_outcome", "session_id": SID, "rule": "report_only",
+            "draft_id": "d1", "nudge_id": NID, "resolved": True, "p": 0.1, "reply": "Fixed and verified."}
+WORKING = [("assistant", "", '[{"name": "terminal"}]', 30), ("tool", "ok", None, 400)]
+
+
+def _append(h, *rows):
+    with (h / "coach" / "log.jsonl").open("a") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def _id_home(tmp_path, messages=WORKING):
+    h = _home(tmp_path, messages)
+    (h / "coach" / "log.jsonl").write_text(json.dumps(ID_NUDGE) + "\n")
+    return h
+
+
+def test_id_nudge_with_outcome_after_the_grace_files_nothing(tmp_path):
+    h = _id_home(tmp_path)
+    cur = {}
+    assert _coach(sg.collect_coach(h, cur, NOW + 910)) == []  # past 900 s, still undelivered: pending
+    _append(h, DELIVERED, RESOLVED)
+    assert _coach(sg.collect_coach(h, cur, NOW + 930)) == []
+    assert not cur.get("coach_handoff_pending")
+    assert _coach(sg.collect_coach(h, cur, NOW + sg.NUDGE_OPEN_S + 60)) == []
+
+
+def test_id_outcome_matches_by_id_with_no_time_limit():
+    late = {**RESOLVED, "ts": NOW + 5000}
+    assert sg._outcome_matches({**ID_NUDGE}, late)
+    assert not sg._outcome_matches({**ID_NUDGE}, {**late, "nudge_id": "n_other"})
+    assert not sg._outcome_matches(dict(NUDGE), {**late, "nudge_id": None})  # no id: 15-min window
+
+
+def test_undelivered_id_nudge_with_a_live_turn_waits_until_nudge_open(tmp_path):
+    h = _id_home(tmp_path)
+    cur = {}
+    assert _coach(sg.collect_coach(h, cur, NOW + 20 * 60)) == []
+    assert cur.get("coach_handoff_pending")
+    got = _coach(sg.collect_coach(h, cur, NOW + sg.NUDGE_OPEN_S + 1))
+    assert len(got) == 1 and "no outcome" in got[0]["symptom"]
+
+
+def test_delivered_id_nudge_files_grace_after_delivery(tmp_path):
+    h = _id_home(tmp_path)
+    cur = {}
+    _append(h, DELIVERED)
+    assert _coach(sg.collect_coach(h, cur, NOW + 918 + sg.HANDOFF_GRACE_S - 5)) == []
+    got = _coach(sg.collect_coach(h, cur, NOW + 918 + sg.HANDOFF_GRACE_S + 5))
+    assert len(got) == 1 and "no outcome" in got[0]["symptom"]
+
+
+def test_id_nudge_whose_turn_died_is_still_closed_as_lost_at_the_grace(tmp_path):
+    h = _id_home(tmp_path, INTERRUPTED)
+    assert _coach(sg.collect_coach(h, {}, LATE)) == []
+    assert [r for r in _log(h) if r.get("event") == "nudge_outcome_lost" and r.get("nudge_id") == NID]
+
+
+def test_no_id_nudge_keeps_the_15_min_rule(tmp_path):
+    h = _home(tmp_path, WORKING)
+    cur = {}
+    assert _coach(sg.collect_coach(h, cur, NOW + 600)) == []
+    _append(h, {**RESOLVED, "nudge_id": None, "ts": NOW + 926})
+    got = _coach(sg.collect_coach(h, cur, NOW + 930))
+    assert len(got) == 1 and "no outcome" in got[0]["symptom"]
+
+
+def test_guard_finds_an_outcome_the_matcher_missed(tmp_path):
+    """Detection guard: before filing no-outcome, the log is re-read for an outcome with the same nudge_id."""
+    h = _id_home(tmp_path)
+    cur = {}
+    _append(h, DELIVERED)
+    sg.collect_coach(h, cur, NOW + 920)  # reads the delivery; the outcome below lands in an already-read offset
+    _append(h, {**RESOLVED, "rule": "confirm"})  # a rule mismatch: the matcher can't pair it
+    assert _coach(sg.collect_coach(h, cur, NOW + 918 + sg.HANDOFF_GRACE_S + 5)) == []
+    assert [r for r in _log(h) if r.get("event") == "nudge_outcome_late" and r.get("nudge_id") == NID]

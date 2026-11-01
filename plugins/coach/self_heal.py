@@ -916,6 +916,29 @@ def host_name() -> str:
 
 
 HANDOFF_GRACE_S = 15 * 60  # same as signals.HANDOFF_GRACE_S
+NUDGE_OPEN_S = 3 * 3600  # same as signals.NUDGE_OPEN_S
+DELIVERY_EVENTS = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")  # signals.NUDGE_DELIVERY
+
+
+def _nudge_pairs(n: dict, o: dict) -> bool:
+    """Same matching as signals._outcome_matches: a shared nudge_id decides with no time limit (agent-98f77b1ca9);
+    id-less records need the same draft and an outcome within the grace window."""
+    if o.get("session_id") != n.get("session_id"):
+        return False
+    if n.get("nudge_id") and o.get("nudge_id"):
+        return n["nudge_id"] == o["nudge_id"]
+    return (not (n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"])
+            and -5 <= float(o.get("ts") or 0) - float(n.get("ts") or 0) <= HANDOFF_GRACE_S)
+
+
+def _nudge_waiting(n: dict, delivered: dict, now: float) -> bool:
+    """Same as `not signals.nudge_due`: an id nudge's clock starts at its delivery record (NUDGE_OPEN_S if none)."""
+    t = float(n.get("ts") or 0)
+    if not n.get("nudge_id"):
+        return now - t <= HANDOFF_GRACE_S
+    if n["nudge_id"] in delivered:
+        return now - delivered[n["nudge_id"]] <= HANDOFF_GRACE_S
+    return now - t <= NUDGE_OPEN_S
 
 
 def handoff_nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days: int = 7) -> dict:
@@ -926,7 +949,7 @@ def handoff_nudge_counts(root: Optional[Path] = None, now: Optional[float] = Non
     root = Path(root) if root is not None else coach_root()
     now = time.time() if now is None else now
     since = now - days * 86400
-    nudges, outcomes = [], []
+    nudges, outcomes, delivered = [], [], {}  # delivered: nudge_id -> ts of its first delivery record
     try:
         with (root / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
             for ln in f:
@@ -938,21 +961,20 @@ def handoff_nudge_counts(root: Optional[Path] = None, now: Optional[float] = Non
                     continue
                 if r.get("rule") != "handoff" or float(r.get("ts") or 0) < since:
                     continue
+                if r.get("event") in DELIVERY_EVENTS and r.get("nudge_id"):
+                    delivered.setdefault(r["nudge_id"], float(r.get("ts") or 0))
                 (nudges if r.get("event") == "reply_nudge" else
                  outcomes if r.get("event") == "reply_nudge_outcome" else []).append(r)
     except OSError:
         pass
     c = {"days": days, "nudges": len(nudges), "resolved": 0, "still_handed_off": 0, "no_outcome": 0, "waiting": 0}
     for n in nudges:
-        t = float(n.get("ts") or 0)
-        o = next((o for o in outcomes if o.get("session_id") == n.get("session_id")
-                  and not (n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"])
-                  and -5 <= float(o.get("ts") or 0) - t <= HANDOFF_GRACE_S), None)
+        o = next((o for o in outcomes if _nudge_pairs(n, o)), None)
         if o is not None:
             outcomes.remove(o)
             c["resolved" if o.get("resolved") is True else "still_handed_off"] += 1
         else:
-            c["waiting" if now - t <= HANDOFF_GRACE_S else "no_outcome"] += 1
+            c["waiting" if _nudge_waiting(n, delivered, now) else "no_outcome"] += 1
     c["filed"] = c["still_handed_off"] + c["no_outcome"]
     return c
 
@@ -970,7 +992,7 @@ def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days:
     root = Path(root) if root is not None else coach_root()
     now = time.time() if now is None else now
     since = now - days * 86400
-    nudges, outcomes = [], []
+    nudges, outcomes, delivered = [], [], {}  # delivered: nudge_id -> ts of its first delivery record
     try:
         with (root / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
             for ln in f:
@@ -982,6 +1004,8 @@ def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days:
                     continue
                 if r.get("rule") not in OUTCOME_RULES or float(r.get("ts") or 0) < since:
                     continue
+                if r.get("event") in DELIVERY_EVENTS and r.get("nudge_id"):
+                    delivered.setdefault(r["nudge_id"], float(r.get("ts") or 0))
                 (nudges if r.get("event") == "reply_nudge" else
                  outcomes if r.get("event") == "reply_nudge_outcome" else []).append(r)
     except OSError:
@@ -992,17 +1016,14 @@ def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days:
         c = out.setdefault(rule, {"nudges": 0, "resolved": 0, "still_failing": 0, "no_outcome": 0, "waiting": 0,
                                   "untracked": 0, "filed": 0})
         c["nudges"] += 1
-        t = float(n.get("ts") or 0)
-        o = next((o for o in outcomes if o.get("session_id") == n.get("session_id") and o.get("rule") == rule
-                  and not (n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"])
-                  and -5 <= float(o.get("ts") or 0) - t <= HANDOFF_GRACE_S), None)
+        o = next((o for o in outcomes if o.get("rule") == rule and _nudge_pairs(n, o)), None)
         if o is not None:
             outcomes.remove(o)
             k = "resolved" if o.get("resolved") is True else "still_failing"
         elif rule != "handoff" and not n.get("outcome"):
             k = "untracked"
         else:
-            k = "waiting" if now - t <= HANDOFF_GRACE_S else "no_outcome"
+            k = "waiting" if _nudge_waiting(n, delivered, now) else "no_outcome"
         c[k] += 1
         c["filed"] = c["still_failing"] + c["no_outcome"]
     return out

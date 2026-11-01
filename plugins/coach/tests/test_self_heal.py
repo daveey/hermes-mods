@@ -664,6 +664,28 @@ def test_handoff_nudge_counts_show_resolved_versus_filed(tmp_path):
                  "filed": 2}
 
 
+def test_nudge_counts_pair_a_late_id_outcome_and_wait_for_delivery(tmp_path):
+    """agent-98f77b1ca9: the status counters match by nudge_id with no time limit, like signals.collect_coach,
+    and an id nudge's wait starts at its delivery record (NUDGE_OPEN_S while undelivered)."""
+    now = 1792660000.0
+    rows = [
+        {"ts": now - 5000, "event": "reply_nudge", "rule": "report_only", "session_id": "a", "nudge_id": "n1",
+         "outcome": True},
+        {"ts": now - 5000 + 918, "event": "reply_nudge_delivered", "rule": "report_only", "session_id": "a",
+         "nudge_id": "n1"},
+        {"ts": now - 5000 + 926, "event": "reply_nudge_outcome", "rule": "report_only", "session_id": "a",
+         "nudge_id": "n1", "resolved": True},
+        {"ts": now - 1200, "event": "reply_nudge", "rule": "report_only", "session_id": "b", "nudge_id": "n2",
+         "outcome": True},                                                   # undelivered, live: waiting
+        {"ts": now - 4000, "event": "reply_nudge", "rule": "report_only", "session_id": "c", "nudge_id": "n3",
+         "outcome": True},
+        {"ts": now - 3000, "event": "reply_nudge_delivered", "rule": "report_only", "session_id": "c",
+         "nudge_id": "n3"},                                                  # delivered 50 min ago: no outcome
+    ]
+    (tmp_path / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    c = sh.nudge_counts(tmp_path, now=now)["report_only"]
+    assert (c["resolved"], c["waiting"], c["no_outcome"], c["filed"]) == (1, 1, 1, 1), c
+
 # ── gateway-9aaf151a15: core's update-pause note is a planned pause, not a backend crash ──
 def _pause_note(prompt="fix the panel"):
     """The exact text of tui_gateway/update_pause.py pause_note() (no killed jobs)."""
