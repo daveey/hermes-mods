@@ -92,13 +92,21 @@ including `kanban_create.body`, direct/deferred `kanban_block`, the reply's `pre
 `pre_verify` backstop. User-only conversation scope is recovered with `goal_scope.recover_scope` (native
 capture and verified compression ancestry); assistant/tool claims, dispatched briefs and unknown/remote
 origin evidence do not grant an exemption. Matching user dollars or explicit multi-GPU permission exempt
-the declaration. Questions, denials and injected task/skill wrappers are not approval; teardown caveats
+the declaration. A bare yes ("approved", "yes", "go ahead") to a priced ask exempts up to the figure
+that ask named (`answered_asks`): the ask must be an asking sentence ("Approve or decline $36 total ...",
+"May I rent ... up to $40?") in the assistant text the reply directly answers (tool rows skipped, another
+user row breaks the pair). Declarations ("I will rent with a $3,000 cap"), the assistant's own or retold
+"approved", an unpriced question in the same message, conditions ("approved, but ...") and runtime rows
+inherit nothing; "Approve $50 or $100?" + yes credits $50. Only typed user text counts anywhere: notice
+and relay rows (`[chat-closeout] ...`, `⏸ [hub:default] ...`) never grant dollars, even when they quote
+the ask. Questions, denials and injected task/skill wrappers are not approval; teardown caveats
 in a separate clause do not erase it. Genuine approval requests and historical spend reports pass.
 The nudge quotes the standing single-GPU/$25 rule and directs calibration inside it, then a blocked card
 asking for a number. A repeat logs `agent_fault` and passes: this is deterministic coaching, not a hard
 purchase or budget authorization boundary. Ambiguous language can still require agent judgment.
 Tests: `tests/test_compute_authority.py` covers all three surfaces, deferred creation, the reply backstop,
-$215 approval, $20 caps, past spend, provenance, numeric/word GPU counts, and one-shot behavior;
+$215 approval, $20 caps, past spend, provenance, numeric/word GPU counts, one-shot behavior, and the
+answered-ask flow with its negatives;
 `tests/test_compute_envelope.py` preserves the original under-use behavior.
 
 **Block-time handoff (`pre_tool_call` on `kanban_block` / `kanban_create` / `tool_call`).** A Kanban ask to the user

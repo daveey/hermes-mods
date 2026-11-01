@@ -112,20 +112,104 @@ PAST_RE = re.compile(r"\b(?:spent|cost was|previous cap|previous budget|had a|re
                      r"yesterday|last week|last run|used \d+ GPUs|ran on)\b", re.I)
 DENY_RE = re.compile(r"\b(?:do not|don't|not approved|no approval|never|deny|denied|refuse)\b", re.I)
 BRIEF_RE = re.compile(r"# Kanban task|\[IMPORTANT:|\[System|<system|task notification|subagent result", re.I)
+# Only text the user typed carries authority. Runtime notices and agent relays arrive as user rows and quote other
+# people's figures ("[chat-closeout] ... Approve or decline $36 total", "⏸ [hub:default] ... blocked: approve $36");
+# a typed reply doesn't open with "[" or "<" (user-steps' answer-evidence rule). Steers arrive wrapped.
+STEER_RE = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
+NOTICE_RE = re.compile(r"^\s*(?:[\[<]|[\u2714\u2716\u26a0\u23f8]\ufe0f?\s*\[)")
+# A bare yes: every word is an affirmative ("approved", "yes, approved", "ok do it"). Anything else (a figure, a
+# condition, a question, "not", "but", "only") is not a bare yes and inherits nothing.
+AFFIRM_RE = re.compile(r"^(?:(?:yes|yep|yeah|yup|ok|okay|sure|approved?|i approve|go ahead|go|do it|ship it|lgtm|"
+                       r"proceed|confirmed|sounds good|please|thanks|\U0001f44d)[\s,.!]*)+$", re.I)
+# An unpriced question in the answered message: the yes may answer that one instead.
+OTHER_ASK_RE = re.compile(r"\?|\b(?:want me to|should i|shall i|may i|can i|do you want|would you like|"
+                          r"let me know)\b", re.I)
+# A sentence that asks the user to approve ("Approve or decline $36 total ...", "May I rent ... up to $36?"). Narrower
+# than REQUEST_RE: "I approve $3000" and "you approved $215 last week" are declarations, never an ask to answer.
+ASK_USER_RE = re.compile(
+    r"^\W*(?:please\s+)?approve\b|\b(?:do|can|could|will|would) you approve\b|\bplease approve\b|"
+    r"\b(?:may|can|should|shall) (?:i|we)\b|\bapproval (?:needed|required)\b|\bneeds? (?:your )?approval\b|"
+    r"\b(?:awaiting|pending) (?:your )?approval\b|\breply\b.*\bapprove\b", re.I)
+DECLARED_RE = re.compile(r"\b(?:i|we)\s+(?:have\s+|had\s+)?approved?\b|"
+                         r"\b(?:you|he|she|they|david|the user)\s+(?:have\s+|has\s+|had\s+)?approved\b", re.I)
 
 
-def authority(text: str, user_texts=()) -> Optional[dict]:
+def typed_text(text: Any) -> Optional[str]:
+    """The part of a user row the user typed; None for runtime notices, agent relays and briefs."""
+    if not isinstance(text, str):
+        return None
+    m = STEER_RE.search(text)
+    s = (m.group(1) if m else text).strip()
+    return None if not s or NOTICE_RE.match(s) or BRIEF_RE.search(s) else s
+
+
+def _content(row: dict) -> str:
+    c = row.get("content")
+    if isinstance(c, list):
+        c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+    return c if isinstance(c, str) else ""
+
+
+def _priced_asks(message: str) -> list[float]:
+    """Totals `message` asks the user to approve; none when a yes could be answering an unpriced question."""
+    credited = []
+    for sent in SENTENCE_SPLIT_RE.split(message or ""):
+        sent = sent.strip().lstrip(">").strip()
+        money = sorted(set(totals(sent)))
+        if money and ASK_USER_RE.search(sent) and not DECLARED_RE.search(sent) and not PAST_RE.search(sent):
+            # "Approve $50 or $100?" + "yes" approves the smaller figure only.
+            credited.append(money[0] if len(money) > 1 and re.search(r"\bor\b", sent, re.I) else money[-1])
+        elif OTHER_ASK_RE.search(sent):
+            return []
+    return credited
+
+
+def answered_asks(history, user_message=None, is_user_evidence=None) -> list[float]:
+    """Dollar totals the user approved by answering a priced ask with a bare yes.
+
+    The AGENTS.md flow is "ask for an explicit number with a blocked card"; the user's "approved" carries no figure
+    of its own, so the figure comes from the ask it directly answers: the nearest assistant text before the reply
+    (tool rows skipped; another user row in between breaks the pair). Only asking sentences count, never an
+    assistant's declaration or a retold approval, and only a typed reply (`is_user_evidence`, display_kind, shape).
+    """
+    rows = [r for r in (history or []) if isinstance(r, dict)]
+    if isinstance(user_message, str) and user_message.strip() and not (
+            rows and rows[-1].get("role") == "user" and _content(rows[-1]).strip() == user_message.strip()):
+        rows.append({"role": "user", "content": user_message})
+    out: list[float] = []
+    for i, row in enumerate(rows):
+        if row.get("role") != "user" or (row.get("display_kind") or "") not in ("", "steer"):
+            continue
+        try:
+            if is_user_evidence is not None and not is_user_evidence(row):
+                continue
+        except Exception:
+            continue
+        reply = typed_text(_content(row))
+        if not reply or not AFFIRM_RE.match(reply):
+            continue
+        for prev in reversed(rows[:i]):
+            if prev.get("role") == "user":
+                break
+            if prev.get("role") == "assistant" and _content(prev).strip():
+                out.extend(_priced_asks(_content(prev)))
+                break
+    return out
+
+
+def authority(text: str, user_texts=(), asked=()) -> Optional[dict]:
     """Detect declarations; user-only scope is supplied by the native capture hook.
 
     This is a one-shot coaching check, not a purchasing authorization mechanism.
-    Remote/worker briefs and unknown provenance cannot grant an exemption.
+    Remote/worker briefs and unknown provenance cannot grant an exemption. `asked` holds figures the user approved
+    by answering a priced ask with a bare yes (`answered_asks`).
     """
     if not TOPIC_RE.search(text or ""):
         return None
-    users = [part for u in user_texts if not BRIEF_RE.search(u)
-             for part in re.split(r"(?<=[.?!;])\s+|\n+", u)
+    users = [part for u in user_texts for t in [typed_text(u)] if t
+             for part in re.split(r"(?<=[.?!;])\s+|\n+", t)
              if not DENY_RE.search(part) and not re.search(r"\?|\b(?:why|whether)\b", part, re.I)]
-    approved = [v for user in users for v in totals(user)]
+    approved = [v for user in users for v in totals(user)] + [float(v) for v in asked or ()]
     multi_approved = any(AUTH_MULTI_RE.search(u) and re.search(
         r"\b(?:approve|allow|go ahead|you may|rent|use)\b", u, re.I) for u in users)
     # A cap label followed by its value on the next line is one declaration.

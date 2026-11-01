@@ -56,6 +56,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     goal_gate = _load("goal_disposition").build_gate(store)
 
     authority_users: dict = {}
+    # session -> dollar totals the user approved by answering a priced ask with a bare yes ("approved").
+    authority_asked: dict = {}
 
     def pre_llm_call(session_id="", user_message=None, platform="", parent_session_id="", conversation_history=None,
                      **_):
@@ -70,6 +72,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             authority_users[session_id] = []
             log.debug("coach compute authority scope unavailable: %s", exc)
+        try:
+            # The figure comes from the assistant's ask; the authority from the user's own typed yes to it.
+            authority_asked[session_id] = list(_load("compute_envelope").answered_asks(
+                conversation_history, user_message, is_user_evidence=_load("goal_scope").is_evidence_row))
+        except Exception as exc:
+            authority_asked[session_id] = []
+            log.debug("coach compute authority answered asks unavailable: %s", exc)
         try:
             if not session_id:
                 return None
@@ -135,7 +144,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             ce = _load("compute_envelope")
             if not ce.enabled():
                 return None
-            hit = ce.authority(text, authority_users.get(session_id, ())) or ce.classify(text)
+            hit = (ce.authority(text, authority_users.get(session_id, ()), authority_asked.get(session_id, ()))
+                   or ce.classify(text))
             if not hit:
                 return None
             rule = hit.get("rule", "compute_envelope")

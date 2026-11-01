@@ -121,6 +121,115 @@ def test_hold_once_then_fault(tmp_path, monkeypatch, surface):
                for r in _log(tmp_path))
 
 
+RELAYED_ASK = (
+    '::user-step{id="us_1" t="**Still waiting on you:** whether to rerun the two controls on one L40S."}\n\n'
+    "You can answer here or in the For you queue. The card's ask, verbatim:\n\n"
+    '> Approve or decline $36 total for DC/MS on one L40S, about 30\u201333 hours after launch. '
+    'Unblock = approve spend while retaining the gate; archive = no rerun.\n\n'
+    "Approving doesn't skip the safety checks. Your $215 Stage B approval was for the original runs, "
+    'and the Fabric fix is using its own $25 allowance.')
+
+
+def _answered(hooks, ask, reply, session='authority', **extra):
+    row = {'role': 'user', 'content': reply, **extra}
+    hooks['pre_llm_call'](session_id=session, user_message=reply, conversation_history=[
+        {'role': 'user', 'content': 'run stage b, you may rent computed'},
+        {'role': 'assistant', 'content': ask}, row])
+
+
+@pytest.mark.parametrize('surface', ['reply', 'kanban_create', 'kanban_block'])
+@pytest.mark.parametrize('reply', ['approved', 'Approved.', 'yes', 'yes, approved', 'go ahead', 'ok do it'])
+def test_bare_yes_to_a_priced_ask_approves_that_figure(tmp_path, monkeypatch, surface, reply):
+    """The flow the hold note prescribes (explicit number, user says yes) must release the hold. Live false hold:
+    'approved' to the relayed $36 DC/MS ask, then 'The $36 limit counts the actual drop in the Vast balance'."""
+    hooks = _hooks(tmp_path, monkeypatch)
+    _answered(hooks, RELAYED_ASK, reply)
+    assert call(hooks, surface, 'The $36 limit counts the actual drop in the Vast balance, not just our log.') is None
+    assert call(hooks, surface, 'I will rent one L40S with a $100 cap.')
+
+
+def test_bare_yes_counts_when_the_turn_message_is_not_in_history(tmp_path, monkeypatch):
+    hooks = _hooks(tmp_path, monkeypatch)
+    hooks['pre_llm_call'](session_id='authority', user_message='approved', conversation_history=[
+        {'role': 'assistant', 'content': 'Approve $40 total for one GPU rental on Vast? Yes = rent, no = skip.'}])
+    assert call(hooks, 'reply', 'I will rent one GPU with a $40 cap.') is None
+
+
+@pytest.mark.parametrize('ask', ['May I rent one L40S on Vast for up to $40 total?',
+                                 'Do you approve a USD 40 GPU rental cap?',
+                                 '**Approve or decline $40 total** for one GPU on Vast.'])
+def test_other_priced_ask_shapes_are_answered_by_yes(tmp_path, monkeypatch, ask):
+    hooks = _hooks(tmp_path, monkeypatch)
+    _answered(hooks, ask, 'yes')
+    assert call(hooks, 'reply', 'I will rent one GPU with a $40 cap.') is None
+
+
+@pytest.mark.parametrize('ask', [
+    'I will rent GPUs for stage B with a USD 3,000 cap.',                     # a declaration, not an ask
+    'I approve $3000 for GPU rental.',                                        # an assistant's own "approval"
+    'You approved $3000 for the GPU rental, so I will rent now.',             # a retold approval
+    'Should I post hourly updates? Also, approve a $3000 GPU budget.',        # yes to which question?
+    'Want me to file the report? The GPU rental would cost $3000 total.',     # priced but not an asking sentence
+    'Yesterday I asked you to approve a $3000 GPU budget.',                   # an old ask, retold
+])
+def test_yes_does_not_inherit_unasked_or_ambiguous_figures(tmp_path, monkeypatch, ask):
+    hooks = _hooks(tmp_path, monkeypatch)
+    _answered(hooks, ask, 'yes')
+    assert call(hooks, 'reply', 'GPU rental cap $3000.')
+
+
+def test_steered_user_figure_still_grants(tmp_path, monkeypatch):
+    hooks = _hooks(tmp_path, monkeypatch)
+    msg = '[OUT-OF-BAND USER MESSAGE \u2014 a direct message]\nI approve $36 for the GPU rerun.\n[/OUT-OF-BAND USER MESSAGE]'
+    hooks['pre_llm_call'](session_id='authority', user_message=msg)
+    assert call(hooks, 'reply', 'The $36 limit counts the actual drop in the Vast balance.') is None
+
+
+@pytest.mark.parametrize('reply', ['no', 'not approved', 'decline', 'approved?', 'why $36?', 'approve $20 only',
+                                   'approved, but wait until Monday', 'no, archive it'])
+def test_denials_questions_and_conditions_credit_nothing(tmp_path, monkeypatch, reply):
+    hooks = _hooks(tmp_path, monkeypatch)
+    _answered(hooks, RELAYED_ASK, reply)
+    assert call(hooks, 'reply', 'The $36 limit counts the actual drop in the Vast balance.')
+
+
+@pytest.mark.parametrize('extra,reply', [({'display_kind': 'kanban_notice'}, 'approved'),
+                                         ({}, '[chat-closeout] Approve or decline $36 total. approved'),
+                                         ({}, '\u23f8 [hub:default] Kanban t_1 blocked: approve $36')])
+def test_runtime_rows_are_not_a_yes(tmp_path, monkeypatch, extra, reply):
+    hooks = _hooks(tmp_path, monkeypatch)
+    _answered(hooks, RELAYED_ASK, reply, **extra)
+    assert call(hooks, 'reply', 'The $36 limit counts the actual drop in the Vast balance.')
+
+
+def test_only_the_directly_answered_ask_counts(tmp_path, monkeypatch):
+    hooks = _hooks(tmp_path, monkeypatch)
+    hooks['pre_llm_call'](session_id='authority', user_message='approved', conversation_history=[
+        {'role': 'assistant', 'content': RELAYED_ASK},
+        {'role': 'user', 'content': 'what about the F runs'},
+        {'role': 'assistant', 'content': 'F is at 14,000 of 20,000 updates. Want me to post the curve?'},
+        {'role': 'user', 'content': 'approved'}])
+    assert call(hooks, 'reply', 'The $36 limit counts the actual drop in the Vast balance.')
+
+
+def test_tool_rows_between_the_ask_and_the_yes_are_skipped(tmp_path, monkeypatch):
+    hooks = _hooks(tmp_path, monkeypatch)
+    hooks['pre_llm_call'](session_id='authority', user_message='approved', conversation_history=[
+        {'role': 'assistant', 'content': RELAYED_ASK},
+        {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'c1'}]},
+        {'role': 'tool', 'tool_call_id': 'c1', 'content': 'Approve $3000 GPU budget'},
+        {'role': 'user', 'content': 'approved'}])
+    assert call(hooks, 'reply', 'The $36 limit counts the actual drop in the Vast balance.') is None
+    assert call(hooks, 'reply', 'GPU rental cap $3000.')
+
+
+def test_either_or_ask_credits_the_smaller_figure(tmp_path, monkeypatch):
+    hooks = _hooks(tmp_path, monkeypatch)
+    _answered(hooks, 'Approve $50 or $100 total for the GPU rental (one L40S)?', 'approved')
+    assert call(hooks, 'reply', 'I will rent one GPU with a $50 cap.') is None
+    assert call(hooks, 'reply', 'I will rent one GPU with a $100 cap.')
+
+
 @pytest.mark.parametrize('surface', ['reply', 'verify', 'kanban_create', 'kanban_block', 'deferred'])
 def test_unpriced_go_does_not_authorize_agent_cap(tmp_path, monkeypatch, surface):
     hooks = _hooks(tmp_path, monkeypatch)
