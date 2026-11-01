@@ -147,8 +147,10 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
     option was deliberately not taken, a reminder that an already-open request "needs a Mac name, or
     'Wait'" (published as a duplicate of that request, more than once), and a "Still to do: I queued a card
     that will ..." note about agent work (he asked "is this waiting for me?").
-  - Never wrap agent progress or a queued card's plan in a `::user-step` directive; it renders as a For you ask
-    with an answer box. Say what the card is doing in plain prose and that nothing needs him.
+  - A `::user-step` directive holds only the one action he must take, never agent progress, a queued card's plan
+    or background facts about other cards: it renders as a For you ask with an answer box. Say those in plain prose
+    and that nothing needs him. Never reuse an open request's `us_…` id for other text: that id is the request's
+    alias, so an answer there lands on that request.
   - State settled facts as statements. Put a genuine decision in one `action_request`; when one is already
     open, don't restate it at all: the For you panel already shows it. Even a neutral closing list ("You still
     have two decisions in For you: …") or a "Your choices: Yes / Change / No" block gets published as a duplicate.
