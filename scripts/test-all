@@ -22,6 +22,9 @@ Usage:
 
 Python: $HERMES_MODS_PYTHON, else <core>/.venv/bin/python, else production
 (macOS signed Python 3.14 / Linux gateway launcher), else the current interpreter (warned).
+Test tools go in ~/.cache/hermes-mods-test-site/python-X.Y/site-packages (outside the Hermes home). For an
+interpreter outside core's own venv (the macOS production one) that site also gets core's runtime dependencies,
+resolved with core's [tool.uv] overrides, so suites import core there as they do under the hub's core venv.
 Suites are discovered from the tree; SUITE_OVERRIDES below holds the few that need a
 different command or are skipped with a reason.
 """
@@ -112,13 +115,44 @@ def python_version(py: str) -> str:
 
 
 def test_site(py: str) -> Path:
-    # Never reuse extension modules built for a different Python minor version.
-    return TEST_SITE / ("python-" + ".".join(python_version(py).split(".")[:2]))
+    # Never reuse extension modules built for a different Python minor version. The leaf is a real
+    # `site-packages` component: coach's transport tests forward only such sys.path entries to the child
+    # processes they spawn, and on the macOS production interpreter this site holds core's dependencies.
+    return TEST_SITE / ("python-" + ".".join(python_version(py).split(".")[:2])) / "site-packages"
 
 
 def find_uv() -> str | None:
     return shutil.which('uv') or (str(Path.home() / '.local/bin/uv')
                                  if (Path.home() / '.local/bin/uv').is_file() else None)
+
+
+CORE_DEPS_STAMP = ".core-deps"
+CORE_OVERRIDES = ".core-overrides.txt"
+
+
+def core_runtime_deps(py: str, core: Path | None) -> tuple[list[str], list[str]]:
+    """Core's declared runtime deps and its uv overrides, unless `py` lives inside core (core's own venv).
+
+    Core's venv already has them. Any other interpreter (the macOS production one, a Linux tools python, an
+    override) has only this site: core's installed env lives under the Hermes home, which coach's home guard
+    forbids tests to open. Without them suites fail at collection there (dotenv, requests, cryptography) while
+    passing on the hub's core venv. The overrides are core's [tool.uv] override-dependencies: its exact pins
+    only resolve with them (browser-harness pins pillow==12.3.0, core overrides it to 13.0.0). Paths are
+    compared unresolved: a venv's python symlinks to the very interpreter that lacks the venv's packages.
+    """
+    if core is None or os.path.abspath(py).startswith(os.path.abspath(core) + os.sep):
+        return [], []
+    try:
+        project = tomllib.loads((core / "pyproject.toml").read_text())
+    except (OSError, ValueError):
+        return [], []
+
+    def strings(items: object) -> list[str]:
+        return [s.strip() for s in items if isinstance(s, str) and s.strip()] if isinstance(items, list) else []
+
+    deps = strings(project.get("project", {}).get("dependencies"))
+    overrides = strings(project.get("tool", {}).get("uv", {}).get("override-dependencies")) if deps else []
+    return deps, overrides
 
 
 def ensure_test_site(py: str, core: Path | None = None, uv: str | None = '') -> Path:
@@ -127,15 +161,31 @@ def ensure_test_site(py: str, core: Path | None = None, uv: str | None = '') -> 
     sdk_versions = {d.version for d in distributions(path=[str(site)])
                     if d.metadata['Name'].lower() == 'anthropic'}
     # ruamel: core's hermes_yaml imports it. xdist: coach tests run a nested `pytest -n 2`.
-    if sdk_versions != {version} or not all((site / name).is_dir() for name in (
-            "pytest", "pytest_asyncio", "xdist", "yaml", "ruamel", "fastapi", "httpx", "psutil", "anthropic")):
+    core_deps, core_overrides = core_runtime_deps(py, core)
+    wanted = "\n".join(["[dependencies]", *core_deps, "[overrides]", *core_overrides, ""]) if core_deps else None
+    stamp = site / CORE_DEPS_STAMP
+    try:
+        stamped = stamp.read_text()
+    except OSError:
+        stamped = None
+    if sdk_versions != {version} or (wanted is not None and stamped != wanted) or not all(
+            (site / name).is_dir() for name in (
+                "pytest", "pytest_asyncio", "xdist", "yaml", "ruamel", "fastapi", "httpx", "psutil", "anthropic")):
         if uv == '':
             uv = find_uv()
         if not uv:
             raise RuntimeError("test-all: uv is required to build the selected Python's test dependencies")
-        subprocess.run([uv, "pip", "install", "-q", "--python", py, "--target", str(site),
-                        "pytest", "pytest-asyncio", "pytest-xdist", "pyyaml", "ruamel.yaml", "fastapi", "httpx", "psutil",
-                        f"anthropic=={version}"], check=True)
+        cmd = [uv, "pip", "install", "-q", "--python", py, "--target", str(site),
+               "pytest", "pytest-asyncio", "pytest-xdist", "pyyaml", "ruamel.yaml", "fastapi", "httpx", "psutil",
+               f"anthropic=={version}", *core_deps]
+        if core_overrides:
+            site.mkdir(parents=True, exist_ok=True)
+            (site / CORE_OVERRIDES).write_text("".join(f"{line}\n" for line in core_overrides))
+            cmd += ["--override", str(site / CORE_OVERRIDES)]
+        subprocess.run(cmd, check=True)
+        if wanted is not None:
+            site.mkdir(parents=True, exist_ok=True)
+            stamp.write_text(wanted)
     return site
 
 

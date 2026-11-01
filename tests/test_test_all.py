@@ -217,7 +217,9 @@ class TestAll(unittest.TestCase):
         with patch.dict(ensure.__globals__, {'TEST_SITE': self.root, 'python_version': lambda py: '3.14.9'}), \
                 patch('shutil.which', return_value='/bin/uv'), patch('subprocess.run') as install:
             site = ensure('/fake/python with spaces')
-            self.assertEqual(site, self.root / 'python-3.14')
+            # A real site-packages component: coach's isolated_env forwards only those sys.path entries to the
+            # children its transport tests spawn (they need core's deps, which live here on macOS).
+            self.assertEqual(site, self.root / 'python-3.14' / 'site-packages')
             install.assert_called_once_with(
                 ['/bin/uv', 'pip', 'install', '-q', '--python', '/fake/python with spaces',
                  '--target', str(site), 'pytest', 'pytest-asyncio', 'pytest-xdist', 'pyyaml', 'ruamel.yaml',
@@ -248,29 +250,77 @@ class TestAll(unittest.TestCase):
             self.assertEqual(install.call_count, 4)
             self.assertIn('anthropic==0.126.0', install.call_args.args[0])
 
-    def test_test_site_without_ruamel_or_xdist_is_repaired(self):
+    def test_test_site_missing_any_required_package_is_repaired(self):
         # Core's hermes_yaml imports ruamel, and coach tests run a nested `pytest -n 2`: a site built before
         # both were provisioned failed 11 coach tests on Mac py3.14 that pass under the core venv.
         runner = runpy.run_path(str(RUNNER))
         ensure = runner['ensure_test_site']
+        required = {'ruamel': 'ruamel.yaml', 'xdist': 'pytest-xdist'}
         with patch.dict(ensure.__globals__, {'TEST_SITE': self.root, 'python_version': lambda py: '3.14.9'}), \
                 patch('shutil.which', return_value='/bin/uv'), patch('subprocess.run') as install:
-            site = self.root / 'python-3.14'
-            for name in ('pytest', 'pytest_asyncio', 'yaml', 'fastapi', 'httpx', 'psutil', 'anthropic'):
+            site = self.root / 'python-3.14' / 'site-packages'
+            for name in ('pytest', 'pytest_asyncio', 'yaml', 'fastapi', 'httpx', 'psutil', 'anthropic', *required):
                 (site / name).mkdir(parents=True)
             metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
             metadata.parent.mkdir()
             metadata.write_text('Name: anthropic\nVersion: 0.125.0\n')
             ensure('/fake/python')
+            self.assertEqual(install.call_count, 0)  # complete site: reused
+            for count, (module_dir, requirement) in enumerate(required.items(), start=1):
+                (site / module_dir).rmdir()
+                ensure('/fake/python')
+                self.assertEqual(install.call_count, count, module_dir)
+                self.assertIn(requirement, install.call_args.args[0])
+                (site / module_dir).mkdir()
+            ensure('/fake/python')
+            self.assertEqual(install.call_count, len(required))
+
+    def test_test_site_carries_core_runtime_deps_unless_running_core_venv(self):
+        # The macOS production interpreter (any interpreter outside core's venv) sees only this site: core's own
+        # deps live under the Hermes home, which coach's home guard forbids. Without core's [project].dependencies,
+        # 13 coach files failed collection on Mac py3.14 (dotenv, then requests) and remote-screen (cryptography);
+        # without core's [tool.uv] overrides those exact pins don't resolve (browser-harness vs Pillow 13).
+        runner = runpy.run_path(str(RUNNER))
+        ensure = runner['ensure_test_site']
+        core = self.root / 'core'
+        core.mkdir()
+        (core / 'uv.lock').write_text('[[package]]\nname = "anthropic"\nversion = "0.125.0"\n')
+        pyproject = core / 'pyproject.toml'
+
+        def declare(*deps):
+            pyproject.write_text('[project]\ndependencies = [' + ', '.join(f"'{d}'" for d in deps) + ']\n\n'
+                                 '[tool.uv]\noverride-dependencies = ["Pillow==13.0.0"]\n')
+
+        deps = ['python-dotenv==1.2.4; python_version >= "3.14"', 'requests==2.34.2', 'browser-harness==0.1.13']
+        declare(*deps)
+        production = '/fake/production/python3.14'
+        with patch.dict(ensure.__globals__, {'TEST_SITE': self.root / 'cache', 'python_version': lambda py: '3.14.9'}), \
+                patch('shutil.which', return_value='/bin/uv'), patch('subprocess.run') as install:
+            site = ensure(production, core)
+            overrides = site / '.core-overrides.txt'
+            argv = install.call_args.args[0]
             self.assertEqual(install.call_count, 1)
-            self.assertIn('ruamel.yaml', install.call_args.args[0])
-            self.assertIn('pytest-xdist', install.call_args.args[0])
-            (site / 'ruamel').mkdir()
-            ensure('/fake/python')
-            self.assertEqual(install.call_count, 2)  # still no xdist
-            (site / 'xdist').mkdir()
-            ensure('/fake/python')
+            self.assertEqual(argv[argv.index('anthropic==0.125.0') + 1:], [*deps, '--override', str(overrides)])
+            self.assertEqual(overrides.read_text(), 'Pillow==13.0.0\n')
+            for name in ('pytest', 'pytest_asyncio', 'xdist', 'yaml', 'ruamel', 'fastapi', 'httpx', 'psutil', 'anthropic'):
+                (site / name).mkdir(parents=True)
+            metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
+            metadata.parent.mkdir()
+            metadata.write_text('Name: anthropic\nVersion: 0.125.0\n')
+            ensure(production, core)
+            self.assertEqual(install.call_count, 1)  # same core deps: reused
+            declare(*deps, 'rich==14.3.4')
+            ensure(production, core)
+            self.assertEqual(install.call_count, 2)  # core added a dependency: re-provisioned
+            self.assertIn('rich==14.3.4', install.call_args.args[0])
+            # Interpreters inside core (the hub's .venv, the macOS venv/ bridge) already have core's deps.
+            for venv in ('.venv', 'venv'):
+                ensure(str(core / venv / 'bin' / 'python'), core)
             self.assertEqual(install.call_count, 2)
+            (site / 'xdist').rmdir()
+            ensure(str(core / '.venv' / 'bin' / 'python'), core)
+            self.assertEqual(install.call_count, 3)
+            self.assertEqual(install.call_args.args[0][-1], 'anthropic==0.125.0')
 
     def test_test_site_finds_user_uv_or_reports_missing_installer(self):
         runner = runpy.run_path(str(RUNNER))
