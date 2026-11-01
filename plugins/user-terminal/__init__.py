@@ -116,6 +116,7 @@ log = logging.getLogger("user_terminal")
 WATCH_INTERVAL_S = 15.0
 RECONCILE_RETRY_INTERVAL_S = 60.0  # the watchdog's own retry of a failed closed-ask reconcile...
 RECONCILE_RETRY_WINDOW_S = 600.0  # ...for up to 10 min, then the tool handler's sweep_jobs takes over
+WATCHDOG_BUSY_TIMEOUT_S = 30.0  # the detached watchdog's board lock wait (the live board is often busy > 2 s)
 LAUNCH_GRACE_S = 90.0  # >= 3 openers x OSA_TIMEOUT (20 s) + open grace: a window that never started by then never will
 DEFAULT_MAX_WAIT_MIN = 120.0
 DEFAULT_REATTACH_GRACE_MIN = 10.0
@@ -1504,7 +1505,7 @@ def _bound_block_id(con, task: str, meta: dict, owner: dict, ended: float) -> in
     return None
 
 
-def reconcile_closed_ask(job: Path, st: dict) -> bool:
+def reconcile_closed_ask(job: Path, st: dict, busy_timeout: float = 2.0) -> bool:
     """Amend only the action of a still-parked owner; errors never change job results.
 
     Returns False only when an attempt raised (the watchdog retries those); True when the
@@ -1548,7 +1549,7 @@ def reconcile_closed_ask(job: Path, st: dict) -> bool:
         from hermes_cli.kanban_human_request import validate_human_request
         # Never create or migrate a board merely to reconcile a job.
         from hermes_cli.kanban_lockguard import connect
-        con = connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=2)
+        con = connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=busy_timeout)
         con.row_factory = sqlite3.Row
         marker = f"[user-terminal:closed:{job.name}]"
         # Final-file mtime also gives old jobs a stable end time across retries.
@@ -1633,7 +1634,7 @@ def reconcile_closed_ask(job: Path, st: dict) -> bool:
 def watch_once(job: Path, seen: dict) -> dict | None:
     result = _watch_once(job, seen)
     if result and result.get("status") in FINAL:
-        seen["reconciled"] = reconcile_closed_ask(job, result)
+        seen["reconciled"] = reconcile_closed_ask(job, result, seen.get("busy_timeout", 2.0))
     return result
 
 
@@ -1645,7 +1646,7 @@ def _retry_reconcile(job: Path, result: dict, seen: dict) -> None:
     deadline = time.time() + RECONCILE_RETRY_WINDOW_S
     while time.time() < deadline:
         time.sleep(RECONCILE_RETRY_INTERVAL_S)
-        if reconcile_closed_ask(job, result):
+        if reconcile_closed_ask(job, result, seen.get("busy_timeout", 2.0)):
             log.info("user_terminal: blocked ask reconciliation for %s succeeded on retry", job.name)
             return
     log.error("user_terminal: blocked ask reconciliation for %s still failing after %g s; "
@@ -1756,7 +1757,8 @@ def watchdog(job: Path, interval: float = WATCH_INTERVAL_S, max_s: float | None 
         print(f"user_terminal watchdog: {job.name} is already watched; exiting", file=sys.stderr)
         return read_status(job)
     try:
-        seen: dict = {}
+        # The detached watchdog may wait out a busy board; the tool handler's sweep keeps 2 s.
+        seen: dict = {"busy_timeout": WATCHDOG_BUSY_TIMEOUT_S}
         if max_s is None:
             meta, _ = _job_meta_owner(job)
             limit = _valid_minutes(meta.get("max_wait_minutes")) or max_wait_minutes()

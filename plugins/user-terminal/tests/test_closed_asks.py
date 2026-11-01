@@ -398,3 +398,26 @@ def test_block_landing_between_check_and_classify_keeps_the_newer_ask(board, mon
     before = snapshot(path)
     ut.sweep_jobs()
     assert snapshot(path) == before
+
+
+def test_watchdog_waits_out_a_busy_board_the_sweep_does_not(board, monkeypatch):
+    """The detached watchdog waits up to WATCHDOG_BUSY_TIMEOUT_S for the board's write lock;
+    the tool handler's sweep keeps its 2 s wait."""
+    path, job, db = board
+    final(job)
+    from hermes_cli import kanban_lockguard
+    seen = []
+    real = kanban_lockguard.connect
+
+    def spy(*a, **k):
+        seen.append(k.get("timeout"))
+        return real(*a, **k)
+    monkeypatch.setattr(kanban_lockguard, "connect", spy)
+    ut.sweep_jobs()
+    with sqlite3.connect(path) as con:
+        con.execute("DELETE FROM task_comments")
+        con.execute("UPDATE tasks SET human_request=?", (json.dumps(REQUEST),))
+    ut.watchdog(job, interval=0.05, max_s=1)
+    # (core helpers may open their own short-timeout connections; only the plugin's board opens count)
+    assert seen[0] == 2.0 and ut.WATCHDOG_BUSY_TIMEOUT_S == 30.0 and 30.0 in seen
+    assert len(snapshot(path)["task_comments"]) == 1

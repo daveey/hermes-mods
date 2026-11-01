@@ -76,7 +76,10 @@ the final job result unchanged.
 raised. The watchdog then retries every `RECONCILE_RETRY_INTERVAL_S` (60 s) for
 up to `RECONCILE_RETRY_WINDOW_S` (10 min), logging each failure once with its
 exception text, then logs `leaving it to the next sweep` and exits; after that
-only `sweep_jobs` (run by the tool handler) retries.
+only `sweep_jobs` (run by the tool handler) retries. The watchdog waits up to
+`WATCHDOG_BUSY_TIMEOUT_S` (30 s) for the board's write lock (the first live run
+hit `database is locked` with a 2 s wait and recovered on the 60 s retry); the
+tool handler's sweep keeps 2 s so a busy board never stalls a prompt.
 
 **Interpreter.** `watchdog.sh` and `spawn_watchdog` both exec `watchdog_python()`,
 the gateway's own `sys.executable` (on macOS the signed `Hermes Python.app`
