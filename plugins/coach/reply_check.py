@@ -186,6 +186,37 @@ def unverified_owner(reply: str, tool_log: Optional[list] = None) -> Optional[st
     return m.group(0).strip()
 
 
+# agent-a3c36a6f70: a fix left dead "until the dashboard's next restart" (the dashboard imports plugin_api.py once at
+# startup) with no restart and no card. The screen scored that ending 0.72, under the 0.75 confirm floor, so the second
+# opinion never ran. A reply ending on such a deferral is a report_only candidate and always gets the second opinion,
+# unless this turn ran a restart (pause-turns, systemctl/launchctl, the gateway helper) or filed a card that did not
+# error. The second opinion still decides; this only stops the screen's score from skipping it.
+RESTART_DEFERRAL_RE = re.compile(
+    r"\buntil\b[^.\n]{0,80}?\b(?:re-?start(?:s|ed)?|reboot(?:s|ed)?|reloads?|reloaded)\b"
+    r"|\b(?:after|on|at|with|from) (?:the |its |their |a )?next (?:\w+ )?(?:re-?start|reboot|reload)\b",
+    re.I)
+RESTART_ACTION_RE = re.compile(
+    r"^\s*->.*(?:\bsystemctl\b[^\n]{0,120}\brestart\b|\blaunchctl\s+kickstart\b|\bpause-turns\b"
+    r"|\bgateway-idle-restart\b|\bhermes\s+gateway\s+restart\b|\bkanban_create\b|\bhermes\s+kanban\s+create\b)",
+    re.I)
+
+
+def restart_deferral(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The phrase when the reply's ending leaves a change inactive until some later restart and this turn neither
+    restarted anything nor filed a card (a call followed by an ``<- ERROR`` line does not count), else None."""
+    tail = (reply or "")[-1500:]
+    m = next((m for m in RESTART_DEFERRAL_RE.finditer(tail) if not _quoted(tail, m.start(), m.end())), None)
+    if not m:
+        return None
+    lines = list(tool_log or [])
+    for i, line in enumerate(lines):
+        if RESTART_ACTION_RE.search(line or ""):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not (nxt or "").lstrip().startswith("<- ERROR"):
+                return None
+    return m.group(0).strip()
+
+
 # agent-a806f203ab: a Kanban worker called kanban_complete, then an operator note reopened the work in the same turn.
 # It pushed a fix and ended with CI unwatched and a proof never run, because nothing wakes a closed card and the
 # report_only nudge only offered "fix it now or kanban_create". card_closed() picks the closed-card nudge.
@@ -859,7 +890,7 @@ def prefilter(reply: str) -> list[str]:
         out.append("unverified")
     if WAIT_RE.search(r[-1200:]):
         out.append("unwatched")
-    if REPORT_RE.search(r[-1500:]):
+    if REPORT_RE.search(r[-1500:]) or RESTART_DEFERRAL_RE.search(r[-1500:]):
         out.append("report_only")
     return out
 
@@ -1715,6 +1746,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     cands = [r for r in prefilter(reply) if not only or r in only]
     if "report_only" in cands and scoped:
         cands.remove("report_only")
+    # agent-a3c36a6f70: a fix left inactive "until the next restart" gets the second opinion whatever its scores
+    forced = ("report_only" in cands and confirm is not None and restart_deferral(reply, tool_log)) or None
     if "unwatched" in cands:
         try:
             if wake is None or wake():
@@ -1730,7 +1763,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         except Exception:
             sp = None
     if sp:
-        kept = [r for r in cands if r not in sp or sp[r] >= screen_below]
+        kept = [r for r in cands if r not in sp or sp[r] >= screen_below or (forced and r == "report_only")]
         if not shadow:
             if not kept:
                 if log:
@@ -1751,7 +1784,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     screen_p = v["report_only"]
     if human_confirm_floor is not None and not notice_turn(user_ask):
         confirm_floor = human_confirm_floor
-    confirm_attempted = "report_only" in cands and confirm is not None and screen_p >= confirm_floor
+    confirm_attempted = "report_only" in cands and confirm is not None and (screen_p >= confirm_floor or bool(forced))
     if confirm_attempted and confirm is not None:
         try:
             c2 = confirm()
@@ -1778,6 +1811,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "confirm_attempted": confirm_attempted, "floor": confirm_floor,
                    "source": v.get("report_only_src", "screen"), "final_p": v["report_only"],
                    "threshold": th_ro, "passing": v["report_only"] >= th_ro and not suppressed,
+                   **({"forced": "restart_deferral"} if forced and confirm_attempted else {}),
                    **({"suppressed": "unconfirmed"} if suppressed else {})})
         except Exception:
             pass  # telemetry never changes a verdict
