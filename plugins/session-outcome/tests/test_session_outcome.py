@@ -534,11 +534,24 @@ def test_gate_fails_open_on_old_core_signature(plugin, fake, monkeypatch):
 def test_gate_passes_when_decision_or_wait_outranks(plugin, fake):
     fake.derived["S1"] = {"kind": "waiting", "on": [{"kind": "card", "id": "t_1"}]}
     assert gate(plugin) is None
-    del fake.derived["S1"]
+    fake.derived["S1"] = {"kind": "decision", "items": [{"id": "card:t_2", "question": "Ship?", "card_id": "t_2"}]}
+    assert gate(plugin) is None  # a card's own ask outlives the reply: it still outranks
+
+
+def test_gate_open_user_step_does_not_vouch_for_the_reply(plugin, fake):
+    # macbook 20261026_205117_f67f0d: two open steps made the gate's derive say "decision", so it passed a reply the
+    # judge calls NO; user-steps' transform (after the gate) resolved both steps from that same reply ("answered in
+    # chat", 1 s later) and the chat fell to unresolved{no_summary} with nobody asked to declare.
     call(plugin, {"kind": "decide", "items": [{"question": "A or B?", "choices": [
         {"label": "A", "value": "a"}, {"label": "B", "value": "b"}]}]})
     plugin._CALLED.clear()
-    assert gate(plugin) is None  # open step -> decision
+    assert fake.derive_outcome("S1", ignore_live_turn=True)["kind"] == "decision"  # outside the gate it counts
+    plugin._llm = lambda s, u: "NO"
+    held = gate(plugin, "Routed it to the clips session; it's queued there.")
+    assert held and held["hold"]
+    plugin._llm = lambda s, u: "YES"
+    assert gate(plugin, "Published the shadow result and closed the card; nothing needs you.") is None
+    assert plugin.provider("S1")["decision_items"]  # the skip is scoped to the gate's derive only
 
 
 # ---- interactive only -----------------------------------------------------------------------------------

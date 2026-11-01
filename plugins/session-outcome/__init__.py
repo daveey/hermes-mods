@@ -10,7 +10,8 @@ Contract: side-session-notes session-outcome-contract.md, "Mods". Core owns stor
 - an outcome judge: is the last assistant message a closing summary? Pool model, ``fast`` tier, thinking off, 6 s budget,
   None (core falls back to its heuristic) on any failure or timeout.
 - ``pre_final_gate``: a reply with no ``session_outcome`` call that would end ``unresolved{no_summary}`` is held
-  once with a request for the call. So is a reply the judge could not rule on (timeout, error, unclear answer) that
+  once with a request for the call (open user-steps steps don't count there: the reply may resolve them after the
+  gate). So is a reply the judge could not rule on (timeout, error, unclear answer) that
   only core's heuristic called a summary: a later refresh whose judge works can still say NO, so the agent declares
   the outcome instead. Never loops: the second miss passes.
 
@@ -347,6 +348,13 @@ def provider(session_id: str) -> Optional[dict]:
     us = _user_steps()
     if us is None or not session_id:
         return None
+    scope = _GATE_SCOPE.get()
+    if scope is not None and scope.get("skip_steps"):
+        # The gate asks what the reply leaves behind. user-steps closes the steps a reply answers in its own
+        # transform_llm_output, which runs AFTER this gate: counted here, they made the gate see "decision", pass
+        # the reply undeclared, and the chat fell to unresolved{no_summary} once that same reply resolved them
+        # (macbook 20261026_205117_f67f0d, two "answered in chat" steps closed 1 s after the gate passed).
+        return None
     try:
         steps = us.open_steps(session_id)
     except Exception:
@@ -596,10 +604,11 @@ def _asked_this_turn(session_id: str, msgs: list, attempt: int) -> bool:
 def _would_be_no_summary(api, session_id: str, reply: str) -> bool:
     """Would this reply leave the chat unresolved{no_summary}, now or on a later refresh? Core's own derivation
     answers, skipping the live turn this gate runs inside and treating the unsaved candidate as the last assistant
-    message (it calls the judge, cached, with the gate's longer budget). A ``done`` that only core's heuristic gave
+    message (it calls the judge, cached, with the gate's longer budget). Open user-steps steps are left out: the
+    reply itself may resolve them after this gate runs, so they never vouch for it (cards still outrank). A ``done`` that only core's heuristic gave
     because the judge gave up counts as at risk: a later refresh whose judge works can flip it to no_summary with
     nobody asked. A core that can't derive, or any error, never holds."""
-    scope: dict = {}
+    scope: dict = {"skip_steps": True}  # see provider(): this reply may resolve them after the gate
     token = _GATE_SCOPE.set(scope)
     try:
         out = api.derive_outcome(session_id, ignore_live_turn=True, pending_reply=reply) or {}

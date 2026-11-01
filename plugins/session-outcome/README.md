@@ -35,7 +35,10 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - **`pre_final_gate`** (buffered): when the turn made no `session_outcome` call, it asks core
   `derive_outcome(sid, ignore_live_turn=True, pending_reply=<the candidate reply>)`. Only
   `unresolved{no_summary}` holds the reply, once, with a request for the call. Core's own precedence decides, so
-  decisions, waits and mutes pass. Inside the gate the judge gets a 15 s budget (6 s elsewhere): the gate runs in a
+  card decisions, waits and mutes pass. Open user-steps steps do not: in the gate's derive the provider returns
+  nothing, because user-steps resolves the steps a reply answers in its own `transform_llm_output`, which runs
+  after this gate (counted, they let an undeclared reply pass as `decision`, and the chat fell to
+  `unresolved{no_summary}` a second later when that reply resolved them). Inside the gate the judge gets a 15 s budget (6 s elsewhere): the gate runs in a
   busy Desktop serve process under a 30 s hook limit, with the reply already buffered. When the judge still gives
   up (timeout, error, no YES/NO) and only core's heuristic called the reply a summary, the gate also holds once.
   A later refresh whose judge works (the auditor's CLI `outcome-audit --refresh`) could otherwise flip that
@@ -77,7 +80,8 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - the judge gets the user's latest real request (synthetic rows and the nudge skipped, capped), or none;
 - the default pool path turns thinking off (`pool-llm` `complete(thinking=...)` puts it in the Anthropic body);
 - the gate asks once and passes the second miss (by nudge tag and by the in-memory backup), passes after a tool
-  call, on a summary, on an undecided judge, and when a wait or an open step outranks;
+  call, on a summary, on an undecided judge, and when a wait or a card's ask outranks; an open user-steps step
+  does not vouch for the reply (a NO reply is held, a YES passes), and outside the gate the step still counts;
 - non-interactive sources (cron, slack, Kanban worker) get no tool and no gate; tui and cli do;
 - a Desktop chat's turn admitted via the gateway `local` platform (no bound source) gets the tool from its
   session row, the same predicate the gate uses, so the gate never asks for a call the chat cannot make;

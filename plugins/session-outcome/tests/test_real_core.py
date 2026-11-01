@@ -95,4 +95,9 @@ def test_open_step_makes_real_core_say_decision(real, monkeypatch):
     us.add_step("chat", "Ship it now?", ["Yes", "Later"])
     out = so.derive_outcome("chat", ignore_live_turn=True, pending_reply="Looking at it.")
     assert out["kind"] == "decision" and out["items"][0]["question"] == "Ship it now?"
-    assert gate(plugin, "Looking at it.") is None
+    # The reply may resolve that step after the gate (user-steps' transform): the gate judges the reply itself.
+    held = gate(plugin, "Looking at it.")
+    assert held and held["hold"]
+    plugin._llm = lambda s, u: "YES"
+    plugin._JUDGED.clear()
+    assert gate(plugin, SUMMARY) is None
