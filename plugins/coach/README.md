@@ -96,7 +96,12 @@ origin evidence do not grant an exemption. Matching user dollars or explicit mul
 the declaration. A bare yes ("approved", "yes", "go ahead") to a priced ask exempts up to the figure
 that ask named (`answered_asks`): the ask must be an asking sentence ("Approve or decline $36 total ...",
 "May I rent ... up to $40?") in the assistant text the reply directly answers (tool rows skipped, another
-user row breaks the pair). Declarations ("I will rent with a $3,000 cap"), the assistant's own or retold
+user row, a compaction summary or an observed row breaks the pair). The pair counts after compaction too:
+for a would-be hold only, the check also reads the session's persisted display transcript
+(`goal_scope.display_transcript`: core's display projection over the verified compression lineage, compaction
+generations folded, rewound rows left out; another profile's session or one over 20,000 rows reads as empty),
+because compaction moves an answered ask out of the live window but the approval does not expire with the
+context. Each read logs `authority_persisted_read` (`ok`, `usd`); a failed read credits nothing. Declarations ("I will rent with a $3,000 cap"), the assistant's own or retold
 "approved", an unpriced question in the same message, conditions ("approved, but ...") and runtime rows
 inherit nothing; "Approve $50 or $100?" + yes credits $50. Only typed user text counts anywhere: notice
 and relay rows (`[chat-closeout] ...`, `⏸ [hub:default] ...`) never grant dollars, even when they quote
@@ -107,7 +112,10 @@ asking for a number. A repeat logs `agent_fault` and passes: this is determinist
 purchase or budget authorization boundary. Ambiguous language can still require agent judgment.
 Tests: `tests/test_compute_authority.py` covers all three surfaces, deferred creation, the reply backstop,
 $215 approval, $20 caps, past spend, provenance, numeric/word GPU counts, one-shot behavior, and the
-answered-ask flow with its negatives;
+answered-ask flow with its negatives; `tests/test_compute_authority_persisted.py` replays the 2026-11-01 live
+false hold (David's "approved" to the $36 ask, compacted out of the window, then "Spend so far is $0.56 of the
+$36") through a real SessionDB on all three surfaces, and covers a rewound yes, an unpriced ask, a summary in
+the live or persisted transcript, the read only on a would-be hold, a failed read, and the empty cases;
 `tests/test_compute_envelope.py` preserves the original under-use behavior.
 
 **Block-time handoff (`pre_tool_call` on `kanban_block` / `kanban_create` / `tool_call`).** A Kanban ask to the user

@@ -210,6 +210,21 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     # (session_id, where) already given the compute-envelope note
     envelope_told: set = shared.setdefault("envelope_told", set())
 
+    def _persisted_asks(session_id) -> list:
+        """Figures the user approved with a bare yes to a priced ask that compaction moved out of the live window
+        (compute_envelope.persisted_asks over the persisted transcript). Read only for a would-be compute-authority
+        hold; logged, so a cleared hold is visible in the coach log. A failed read credits nothing."""
+        if not session_id:
+            return []
+        try:
+            got = list(_load("compute_envelope").persisted_asks(session_id, _load("goal_scope")))
+        except Exception as exc:
+            store.log({"event": "authority_persisted_read", "session_id": session_id, "ok": False,
+                       "error": f"{type(exc).__name__}: {exc}"[:200]})
+            return []
+        store.log({"event": "authority_persisted_read", "session_id": session_id, "ok": True, "usd": got[:20]})
+        return got
+
     # ── nudge records: every reply_nudge gets a nudge_id, and exactly one delivery record (reply_nudge_delivered |
     # _undelivered | _abandoned) and one outcome record (reply_nudge_outcome | nudge_outcome_lost |
     # nudge_outcome_untracked; signals.collect_coach adds nudge_outcome_subagent / _missing and closes nudges whose
@@ -295,7 +310,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             ce = _load("compute_envelope")
             if not ce.enabled():
                 return None
-            hit = (ce.authority(text, authority_users.get(session_id, ()), authority_asked.get(session_id, ()))
+            hit = (ce.authority(text, authority_users.get(session_id, ()), authority_asked.get(session_id, ()),
+                                persisted=lambda: _persisted_asks(session_id))
                    or ce.classify(text))
             if not hit:
                 return None

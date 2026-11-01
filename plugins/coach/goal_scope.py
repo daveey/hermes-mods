@@ -281,6 +281,34 @@ def recover_scope(session_id, user_message, history, *, canonical_user_content=N
     return rows
 
 
+def display_transcript(session_id, max_rows=20000):
+    """The session's persisted display transcript, in order: what the user saw.
+
+    Core's one display projection (`get_messages_as_conversation(include_ancestors, include_compacted)`): the
+    verified compression lineage only (never a /branch or reset parent), in-place compaction generations folded
+    once, rewound rows (the user took them back) and model-only rows left out. Compaction moves rows out of the
+    live window, not out of this. Read-only. [] (unknown, never a partial read) for a missing session, another
+    profile's session, or a lineage over `max_rows` display rows.
+    """
+    from hermes_constants import get_hermes_home
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_state import SessionDB
+
+    path = Path(get_hermes_home()) / 'state.db'
+    if not session_id or not path.exists():
+        return []
+    db = SessionDB(path, read_only=True)
+    try:
+        current = db.get_session(session_id)
+        if not current or dict(current).get('profile_name') != get_active_profile_name():
+            return []
+        if db.get_resume_message_count(session_id) > max_rows:
+            return []
+        return db.get_messages_as_conversation(session_id, include_ancestors=True, include_compacted=True)
+    finally:
+        db.close()
+
+
 def resolve_scope(session_id, contexts, turn_messages=None):
     """Resolve a cache miss after rotation, or recover a fresh-process request.
 

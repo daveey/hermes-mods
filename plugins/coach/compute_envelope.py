@@ -171,13 +171,26 @@ def _priced_asks(message: str) -> list[float]:
     return credited
 
 
+def _not_answerable(row: dict) -> bool:
+    """A row a typed yes cannot be answering: a compaction summary (the user never saw it as an ask, and it
+    paraphrases older asks) or an observed row. Core's own summary test, with a prefix fallback outside core."""
+    if row.get("observed") or row.get("_compressed_summary"):
+        return True
+    try:
+        from agent.context_compressor import is_compaction_summary_message
+        return bool(is_compaction_summary_message(row))
+    except Exception:
+        return _content(row).lstrip().startswith(("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]:"))
+
+
 def answered_asks(history, user_message=None, is_user_evidence=None) -> list[float]:
     """Dollar totals the user approved by answering a priced ask with a bare yes.
 
     The AGENTS.md flow is "ask for an explicit number with a blocked card"; the user's "approved" carries no figure
     of its own, so the figure comes from the ask it directly answers: the nearest assistant text before the reply
-    (tool rows skipped; another user row in between breaks the pair). Only asking sentences count, never an
-    assistant's declaration or a retold approval, and only a typed reply (`is_user_evidence`, display_kind, shape).
+    (tool rows skipped; another user row, a compaction summary or an observed row in between breaks the pair). Only
+    asking sentences count, never an assistant's declaration or a retold approval, and only a typed reply
+    (`is_user_evidence`, display_kind, shape).
     """
     rows = [r for r in (history or []) if isinstance(r, dict)]
     if isinstance(user_message, str) and user_message.strip() and not (
@@ -196,7 +209,7 @@ def answered_asks(history, user_message=None, is_user_evidence=None) -> list[flo
         if not reply or not AFFIRM_RE.match(reply):
             continue
         for prev in reversed(rows[:i]):
-            if prev.get("role") == "user":
+            if prev.get("role") == "user" or _not_answerable(prev):
                 break
             if prev.get("role") == "assistant" and _content(prev).strip():
                 out.extend(_priced_asks(_content(prev)))
@@ -204,13 +217,36 @@ def answered_asks(history, user_message=None, is_user_evidence=None) -> list[flo
     return out
 
 
-def authority(text: str, user_texts=(), asked=()) -> Optional[dict]:
+def persisted_asks(session_id: str, scope) -> list[float]:
+    """`answered_asks` over the session's persisted display transcript (`scope` is the coach's goal_scope module).
+
+    Compaction moves an answered ask out of the live window the hook sees, but the approval it recorded does not
+    expire with the context: the pair is still in what the user saw. Only typed replies count, as in the window.
+    """
+    return answered_asks(scope.display_transcript(session_id), None, is_user_evidence=scope.is_evidence_row)
+
+
+def authority(text: str, user_texts=(), asked=(), persisted=None) -> Optional[dict]:
     """Detect declarations; user-only scope is supplied by the native capture hook.
 
     This is a one-shot coaching check, not a purchasing authorization mechanism.
     Remote/worker briefs and unknown provenance cannot grant an exemption. `asked` holds figures the user approved
-    by answering a priced ask with a bare yes (`answered_asks`).
+    by answering a priced ask with a bare yes (`answered_asks`). `persisted` (callable -> more such figures, from
+    the persisted transcript) is read only for a would-be hold: most replies never get that far, and the read
+    costs a transcript projection. A failed read credits nothing.
     """
+    hit = _authority(text, user_texts, asked)
+    if hit and persisted is not None:
+        try:
+            more = [float(v) for v in persisted() or ()]
+        except Exception:
+            more = []
+        if more:
+            hit = _authority(text, user_texts, [*(asked or ()), *more])
+    return hit
+
+
+def _authority(text: str, user_texts=(), asked=()) -> Optional[dict]:
     if not TOPIC_RE.search(text or ""):
         return None
     users = [part for u in user_texts for t in [typed_text(u)] if t
