@@ -39,6 +39,8 @@ STALE_QUEUING_S = 300  # a task claim older than this had a crashed claimant; ac
 # Noise breaker: a poster whose last MUTE_AFTER closed cards (within MUTE_WINDOW_S) were all archived
 # with no action is refused, and one Kanban card is filed to fix that poster. David's Archive is the signal.
 MUTE_AFTER = 2
+# Accepted outcomes that are not a decision: the generic Do it, or a legacy accept with no action id.
+GENERIC_ACCEPTS = frozenset({"", "do_it"})
 MUTE_WINDOW_S = 7 * 86400
 # Archive sticks: a re-post of a key whose newest card David archived (no action) inside this window is refused
 # and filed as one Kanban card instead; `hermes inbox unarchive-key <key>` releases it early (bb-ce4c46ed94).
@@ -570,8 +572,7 @@ class Inbox:
             side = self._side()
             db = self._sessions()
             try:
-                if self._junk_muted(side, poster, key):
-                    raise PosterMuted(f"poster family {policy.family(poster)!r} key prefix is muted as Junk")
+                self._check_junk_mute(side, poster, key, title, body)
                 existing = self._open_by_key(side, db, key) if key else None
                 if existing:
                     sid = existing
@@ -611,17 +612,7 @@ class Inbox:
                         f"archived for {ARCHIVE_STICK_S // 86400} days. Route this to Kanban (a card was filed: "
                         f"inbox-archived-key:{key}); if it is truly a new decision, `hermes inbox unarchive-key "
                         f"{key!r}` first.")
-                group = poster_group(poster)
-                # Only a self-named sender is muted. A key-family name ("key · x-dm") is attribution: those flows
-                # (one key per DM/post) are covered per key by the archive rule above, where Archive = dismissed.
-                ignored = self._ignored_streak(side, db, poster, now) if named else 0
-                if ignored >= MUTE_AFTER:
-                    self._file_mute_card(policy_module().family(poster) or group, title, body)
-                    raise PosterMuted(
-                        f"poster family {policy_module().family(poster) or group!r} is muted: its last {ignored} inbox cards were archived with no "
-                        f"action, so its posts are noise to David. Route what it reports to a Kanban card "
-                        f"(an agent fixes it) and post to the Inbox only a decision David alone can make. "
-                        f"Unmute after fixing the poster: `hermes inbox unmute {policy_module().family(poster) or group!r} --fix-commit <sha>`.")
+                self._check_mute(side, db, poster, named, title, body, now)
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
                 rt = routing_module()
@@ -753,8 +744,7 @@ class Inbox:
                           inherited_cwd, model, prompt_label, snap, fvals, legacy, now,
                           if_absent, expected, ask):
         with self._atomic() as (conn, db):
-            if self._junk_muted(conn, poster, key):
-                raise PosterMuted(f"poster family {policy_module().family(poster)!r} key prefix is muted as Junk")
+            self._check_junk_mute(conn, poster, key, title, body)
             current = self._snapshot(conn, key)
             conflict = (current is not None) if if_absent else (
                 current is None or current["state"] != "open" or current["item_state"] != "open" or
@@ -777,8 +767,7 @@ class Inbox:
 
             writer: Any = Writer()
             if current is None:
-                if named and self._ignored_streak(conn, writer, poster, now) >= MUTE_AFTER:
-                    raise PosterMuted(f"poster {poster!r} is muted; fix it before unmuting")
+                self._check_mute(conn, writer, poster, named, title, body, now)
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
                 rt = routing_module()
@@ -827,22 +816,58 @@ class Inbox:
             return {"applied": True, "session_id": sid, "updated": current is not None,
                     "snapshot": self._snapshot(conn, key)}
 
+    def _check_junk_mute(self, side, poster, key, title, body) -> None:
+        """Refuse a Junk-muted family/prefix. Every mute refusal has an owner card (here the Junk card)."""
+        if not self._junk_muted(side, poster, key):
+            return
+        family = policy_module().family(poster)
+        prefix = (key or "").split(":", 1)[0]
+        self._file_card(
+            f"Inbox refused a post muted as Junk: {family} / {prefix}",
+            (f"David marked a `{family}` card with key prefix `{prefix}` as Junk, and it posted again. Fix the "
+             f"producer (what an agent can fix goes to Kanban), then clear the Junk mute.\n\n"
+             f"Refused post:\n\n**{title}**\n\n{body[:3000]}"),
+            f"inbox-junk:{family}:{prefix}")
+        raise PosterMuted(f"poster family {family!r} key prefix is muted as Junk")
+
+    def _check_mute(self, side, db, poster, named, title, body, now) -> None:
+        """Noise breaker for every post path: file the inbox-muted:<family> owner card, then refuse.
+
+        Only a self-named sender is muted. A key-family name ("key · x-dm") is attribution: those flows
+        (one key per DM/post) are covered per key by the archive rule, where Archive = dismissed.
+        """
+        if not named:
+            return
+        ignored = self._ignored_streak(side, db, poster, now)
+        if ignored < MUTE_AFTER:
+            return
+        family = policy_module().family(poster) or poster_group(poster)
+        self._file_mute_card(family, title, body)
+        raise PosterMuted(
+            f"poster family {family!r} is muted: its last {ignored} inbox cards were archived with no "
+            f"action, so its posts are noise to David. Route what it reports to a Kanban card "
+            f"(an agent fixes it) and post to the Inbox only a decision David alone can make. "
+            f"Unmute after fixing the poster: `hermes inbox unmute {family!r} --fix-commit <sha>`.")
+
     def _ignored_streak(self, side, db, poster: Optional[str], now: float) -> int:
         """Count archived-untouched by stable family, including unlabelled legacy rows.
 
-        A generic 'Do it' on a repair is not a human decision: only an actual
-        resolved decision resets the streak. An unmute has an explicit fix receipt.
+        A generic 'Do it' on a repair is not a human decision. A resolved decision, or an
+        accepted type-specific action (e.g. `post` on a draft), is one and resets the streak.
+        An unmute has an explicit fix receipt.
         """
         family = policy_module().family(poster)
         row = side.execute("SELECT unmuted_at FROM unmutes WHERE poster=? AND fix_commit IS NOT NULL", (family,)).fetchone()
         since = max(now - MUTE_WINDOW_S, float(row["unmuted_at"]) if row else 0.0)
         streak = 0
-        for r in side.execute("SELECT session_id, state, poster FROM items WHERE created_at>=? "
+        for r in side.execute("SELECT session_id, state, poster, outcome FROM items WHERE created_at>=? "
                               "ORDER BY created_at DESC, rowid DESC", (since,)):
             if policy_module().family(r["poster"]) != family:
                 continue
             if r["state"] == "resolved":
                 break
+            if r["state"] == "accepted" and (r["outcome"] or "") not in GENERIC_ACCEPTS:
+                break  # David picked a type-specific action (post, draft, send_1): a real decision
             if r["state"] in ("accepted", "queuing"):
                 continue
             s = db.get_session(r["session_id"])

@@ -119,3 +119,89 @@ def test_owner_decisions_still_post(monkeypatch, tmp_path):
     inbox.post("Unblock t_y?", "Which DB?", "Unblock kanban card t_y with answer: use Postgres.",
                poster="kanban · hands digest", ask=ASK)
     assert len(inbox.list()) == 2
+
+
+# ── typed decisions reset the streak; every mute refusal has an owner card (self-heal cron-3299286b9a) ──
+
+def _typed_env(tmp_path, monkeypatch):
+    """A real store whose conditional path (`if_absent`) is the one x_reply_watch uses."""
+    sys.path.insert(0, str(HERE / "tests"))
+    from test_store import store as st
+    from hermes_state import SessionDB
+    from ask_fixtures import decision_inbox, register_test_posters
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db._inbox_keep_open = True
+    clock = {"t": 1_000_000.0}
+    register_test_posters(tmp_path)
+    cards = []
+    inbox = decision_inbox(st.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"],
+                                    task_creator=lambda **kw: cards.append(kw) or "t_mute"))
+    inbox.types.define("draft-post", {
+        "label": "Draft", "fields": {"text": {"required": True}},
+        "actions": [{"id": "post", "label": "Post", "kind": "prompt", "prompt": "Publish {text}"}]})
+    return st, inbox, db, clock, cards
+
+
+def _seq(inbox, clock, outcomes, type_="draft-post", poster="p"):
+    for i, how in enumerate(outcomes):
+        clock["t"] += 10
+        kw = dict(type=type_, fields={"text": f"t{i}"}) if type_ != "default" else {}
+        sid = inbox.post(f"Draft {i}", "b", "Do it", key=f"draft:{i}", poster=poster, **kw)["session_id"]
+        clock["t"] += 1
+        if how == "archive":
+            inbox.archive(sid)
+        else:
+            inbox.act(sid, how)
+    clock["t"] += 10
+
+
+def test_typed_accept_breaks_ignored_streak(tmp_path, monkeypatch):
+    """archived, accepted(post), archived: David's 'post' is a decision, so the next draft lands."""
+    st, inbox, db, clock, cards = _typed_env(tmp_path, monkeypatch)
+    _seq(inbox, clock, ["archive", "post", "archive"])
+    out = inbox.post("Draft new", "b", "Do it", key="draft:new", poster="p", type="draft-post",
+                     fields={"text": "n"}, if_absent=True)
+    assert out["applied"] is True
+    db.close()
+
+
+def test_generic_do_it_does_not_break_streak(tmp_path, monkeypatch):
+    """archived, accepted(do_it), archived: a generic Do it is not a decision; still muted."""
+    st, inbox, db, clock, cards = _typed_env(tmp_path, monkeypatch)
+    _seq(inbox, clock, ["archive", "do_it", "archive"], type_="default")
+    with pytest.raises(st.PosterMuted):
+        inbox.post("Again", "b", "Do it", key="draft:new", poster="p", if_absent=True)
+    db.close()
+
+
+def test_conditional_mute_files_owner_card(tmp_path, monkeypatch):
+    """A conditional post refused as muted files the inbox-muted:<family> owner card (was silent)."""
+    st, inbox, db, clock, cards = _typed_env(tmp_path, monkeypatch)
+    _seq(inbox, clock, ["archive", "archive"])
+    with pytest.raises(st.PosterMuted):
+        inbox.post("Draft new", "b", "Do it", key="draft:new", poster="p", type="draft-post",
+                   fields={"text": "n"}, if_absent=True)
+    assert [c["idempotency_key"] for c in cards] == ["inbox-muted:p"]
+    db.close()
+
+
+def test_every_poster_muted_raise_goes_through_check_helpers():
+    """Detection guard: a `raise PosterMuted` outside the owner-filing helpers is a silent mute path."""
+    import ast
+    tree = ast.parse((HERE / "store.py").read_text())
+    allowed = {"_check_mute", "_check_junk_mute"}
+    bad = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Raise) and node.exc is not None:
+                exc = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+                if isinstance(exc, ast.Name) and exc.id == "PosterMuted" and fn.name not in allowed:
+                    bad.append(f"{fn.name}:{node.lineno}")
+    assert not bad, f"raise PosterMuted outside {sorted(allowed)}: {bad}"
+    helpers = {f.name: f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name in allowed}
+    assert set(helpers) == allowed
+    for name, f in helpers.items():  # each helper files a card before raising
+        calls = {n.func.attr for n in ast.walk(f) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        assert calls & {"_file_card", "_file_mute_card"}, name
