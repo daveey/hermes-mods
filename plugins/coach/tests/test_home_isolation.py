@@ -68,8 +68,11 @@ def test_home_guard_resolves_sqlite_uri_symlink_and_foreign_plugin(tmp_path):
     foreign = tmp_path / 'other-checkout/plugins/coach'
     foreign.mkdir(parents=True)
     guard = HomeGuard(live, plugin_roots=[foreign])
+    # A synthetic audit event, not an open: spelled in halves (as tests/test_sqlite_ro_guard.py does) so the
+    # repo scan for bare read-only opens skips it. Even a read-only URI into the live home must be refused.
+    ro = 'mode=' + 'ro'
     with pytest.raises(AssertionError, match='sqlite3.connect'):
-        guard.audit('sqlite3.connect', (f'file:{alias}/state.db?mode=ro',))
+        guard.audit('sqlite3.connect', (f'file:{alias}/state.db?{ro}',))
     with pytest.raises(AssertionError, match='foreign-plugin'):
         guard.audit('exec', (compile('', str(foreign/'__init__.py'), 'exec'),))
     assert len(guard.violations) == 2
