@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from test_selection_backend import Backend
+from module_override import module_override
 from test_request_selection import entry
 from types import SimpleNamespace
 from unittest.mock import patch, Mock
@@ -167,7 +168,7 @@ class Execution(unittest.TestCase):
         integration.install()
         self.addCleanup(integration.unload)
         manager = SimpleNamespace(_middleware={'llm_execution': [integration.middleware]}, _report_hook_failure=Mock())
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}), patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+        with module_override('tui_gateway.server', self.server), patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
                 patch.object(self.s.SelectionService, 'consume_for_agent', side_effect=[OSError('fixture storage failure'), None]):
             for attempt in range(2):
                 with self.assertRaises(self.s.SelectionRejected):
@@ -187,7 +188,7 @@ class Execution(unittest.TestCase):
         self.addCleanup(self.s._install_failures.pop, integration.home, None)
         next_call = Mock(return_value='sent')
         def run():
-            with patch.dict(sys.modules, {'tui_gateway.server': self.server}), \
+            with module_override('tui_gateway.server', self.server), \
                     patch.object(integration, 'calling_agent', return_value=self.agent), \
                     patch.object(self.s, 'owner_scope', side_effect=RuntimeError('core drift')):
                 return integration.middleware(next_call=next_call, request='req', turn_id='turn')
@@ -225,7 +226,7 @@ class Execution(unittest.TestCase):
         def switch(agent, model):
             agent.model = model
         switch = integration.route_wrapper(switch)
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}):
+        with module_override('tui_gateway.server', self.server):
             switch(self.agent, 'different')
             switch(self.agent, 'claude-fixture')
         self.assertEqual(service.get('runtime-A')['state'], 'rejected')
@@ -306,7 +307,7 @@ class Execution(unittest.TestCase):
         a._interruptible_streaming_api_call = lambda req, **kw: sent.append(self.s.current_snapshot(a)) or 'ok'
         manager = SimpleNamespace(_middleware={'llm_execution': [integration.middleware]}, _report_hook_failure=Mock())
         from agent.turn_api_call import perform_api_call
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}), patch('hermes_cli.plugins._delivery_manager', return_value=manager):
+        with module_override('tui_gateway.server', self.server), patch('hermes_cli.plugins._delivery_manager', return_value=manager):
             perform_api_call(a, api_kwargs={'model': a.model}, _original_api_kwargs={},
                 _llm_middleware_trace=[], _moa_prepared_request=None, _retry=SimpleNamespace(), thinking_spinner=None,
                 retry_count=1, api_call_count=2, api_request_id='retry', effective_task_id='t', turn_id='turn', interrupted=False)
@@ -334,7 +335,7 @@ class Execution(unittest.TestCase):
         self.addCleanup(integration.unload)
         manager = PluginManager()
         manager._middleware['llm_execution'] = [integration.middleware]
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}), patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+        with module_override('tui_gateway.server', self.server), patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
                 patch.object(httpx.Client, 'send', side_effect=AssertionError('provider must not be called')) as send, \
                 patch('agent.turn_api_error.interruptible_backoff_sleep', return_value=False):
             result = a.run_conversation('hi')
@@ -387,7 +388,7 @@ class Execution(unittest.TestCase):
                 'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}}
             data = 'event: response.completed\ndata: '+json.dumps({'type': 'response.completed', 'response': response})+'\n\n'
             return httpx.Response(200, request=request, headers={'content-type': 'text/event-stream'}, content=data.encode())
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}), patch('hermes_cli.plugins._delivery_manager', return_value=manager), patch.object(httpx.Client, 'send', send):
+        with module_override('tui_gateway.server', self.server), patch('hermes_cli.plugins._delivery_manager', return_value=manager), patch.object(httpx.Client, 'send', send):
             for stream, soft in ((False, False), (True, False), (True, True)):
                 a._disable_streaming = not stream
                 a._credential_pool = pool = CredentialPool('openai-codex', rows)
@@ -461,7 +462,7 @@ class Execution(unittest.TestCase):
                 ('message_stop', {'type': 'message_stop'})]
             data = ''.join('event: '+name+'\ndata: '+json.dumps(event)+'\n\n' for name, event in events)
             return httpx.Response(200, request=request, headers={'content-type': 'text/event-stream'}, content=data.encode())
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}), patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+        with module_override('tui_gateway.server', self.server), patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
                 patch.object(httpx.Client, 'send', send), patch.object(anthropic_adapter, '_custom_provider_extra_headers', return_value={}), \
                 patch.object(anthropic_adapter, '_get_claude_code_version', return_value='0.0.fixture'):
             for stream in (False, True):
@@ -496,7 +497,7 @@ class Execution(unittest.TestCase):
         def hostile(next_call, request, **context):
             return next_call({**request, 'extra_headers': {'Authorization': 'Bearer other'}})
         manager = SimpleNamespace(_middleware={'llm_execution': [integration.middleware, hostile]}, _report_hook_failure=Mock())
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}), patch('hermes_cli.plugins._delivery_manager', return_value=manager):
+        with module_override('tui_gateway.server', self.server), patch('hermes_cli.plugins._delivery_manager', return_value=manager):
             with self.assertRaisesRegex(self.s.SelectionRejected, 'identity headers'):
                 perform_api_call(a, api_kwargs={'model': a.model}, _original_api_kwargs={},
                     _llm_middleware_trace=[], _moa_prepared_request=None, _retry=SimpleNamespace(), thinking_spinner=None,
@@ -529,7 +530,7 @@ class Execution(unittest.TestCase):
         integration.install()
         self.addCleanup(integration.unload)
         manager = SimpleNamespace(_middleware={'llm_execution': [integration.middleware]}, _report_hook_failure=Mock())
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}), patch('hermes_cli.plugins._delivery_manager', return_value=manager):
+        with module_override('tui_gateway.server', self.server), patch('hermes_cli.plugins._delivery_manager', return_value=manager):
             perform_api_call(other, api_kwargs={}, _original_api_kwargs={}, _llm_middleware_trace=[], _moa_prepared_request=None,
                 _retry=SimpleNamespace(), thinking_spinner=None, retry_count=0, api_call_count=0,
                 api_request_id='other', effective_task_id='t', turn_id='turn', interrupted=False)
@@ -554,7 +555,7 @@ class Execution(unittest.TestCase):
         self.agent._has_pending_redirect = lambda: False
         self.agent._interruptible_streaming_api_call = lambda req, **kw: sent.append(self.s.current_snapshot(self.agent)) or 'ok'
         manager = SimpleNamespace(_middleware={'llm_execution': [integration.middleware]}, _report_hook_failure=Mock())
-        with patch.dict(sys.modules, {'tui_gateway.server': self.server}), patch('hermes_cli.plugins._delivery_manager', return_value=manager):
+        with module_override('tui_gateway.server', self.server), patch('hermes_cli.plugins._delivery_manager', return_value=manager):
             for n in range(3):
                 if n == 2:
                     self.agent._account_usage_retry_snapshot = ('turn', sent[0])

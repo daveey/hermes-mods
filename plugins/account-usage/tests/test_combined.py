@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch, Mock
 sys.path.insert(0, str(Path(__file__).parent))
 from test_selection_backend import Backend
+from module_override import module_override
 
 
 class Combined(unittest.TestCase):
@@ -222,7 +223,7 @@ class Combined(unittest.TestCase):
                             finish_reason='stop')], model=a.model, usage=None)
                     fallback = SimpleNamespace(api_key='fixture-fallback', base_url='https://api.z.ai/api/paas/v4',
                         _custom_headers=None, default_headers=None)
-                    with patch.dict(sys.modules, {'tui_gateway.server': self.server}), \
+                    with module_override('tui_gateway.server', self.server), \
                             patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
                             patch.object(a, '_interruptible_api_call', side_effect=api_call), \
                             patch.object(a, '_persist_session'), patch.object(a, '_save_trajectory'), \

@@ -21,13 +21,52 @@ Keep temporary directories under your scratch root and remove them after inspect
 bootstrap transitively. Direct core imports do not need the application launcher.
 The child-process registry test also imports core directly.
 
-Verified on Linux with core `20478baa674`: all 13 modules, **264 passed and 70
-subtests passed** (previous coverage: 262 and 67). The added subprocess cases cover
+Verified on Linux with core `a229655398887f15a65ab2a838f243611462a65d`:
+**267 passed and 70 subtests passed**, with no relay shutdown diagnostics. The
+peer fallback runner passed **104 tests** against the same core. The prior isolated
+core `20478baa674` run passed 264 tests and 70 subtests. Subprocess cases cover
 explicit path, PYTHONPATH, home fallback, and readable missing-core failure.
-The scratch HOME contained no files and no runtime was provisioned. An AnyIO pytest
-deprecation warning and existing relay teardown diagnostics are separate from
-isolation. Compatibility pins remain unchanged: newer unaudited core revisions
-must still fail the live-core check, not skip it.
+
+## Compatibility audit
+
+The full diff from `20478baa674` to `a22965539888` changes two pinned files:
+
+- `agent/chat_completion_helpers.py`: classify `StreamLifetimeExceeded` with
+  transport timeouts via `_as_lifetime_error`, and mark an unwound attempt released
+  before close/backoff. The wrapped interruptible entry points, credential
+  factories, context propagation and client ownership boundaries are unchanged.
+- `agent/turn_recovery.py`: forward `api_error` to `exhausted_copy` for the terminal
+  error headline. Recovery routing and credential selection are unchanged.
+
+Only these two new byte digests were appended to `execution-compatibility.json`;
+older audited hashes remain valid. No runtime selection code or peer manifest
+changed. `test_pin_lists.py` retains unknown/malformed/missing-source rejection,
+while `test_combined.py` exercises real plugin discovery, both load/unload orders,
+long-reset rotation/fallback and home alias composition. The compatibility guard
+correctly caught this drift: a newer core is not implicitly trusted.
+
+## Relay teardown regression
+
+Observed with nemo-relay 0.10.3: pytest reported success, then native session close
+logged `scope handle not found` and `root scope cannot be removed`.
+
+- Why did scope identity break? Turn fixtures used `patch.dict(sys.modules, ...)`
+  to substitute one gateway module. Exiting it restores the **entire** module map,
+  removing dependencies lazily imported by the real turn while retained Relay
+  objects still reference them. Pre-importing Relay prevented the failure; a
+  standalone real Relay session/turn/shutdown also closed cleanly.
+- Why was that rollback used? The fixture treated the module cache as an ordinary
+  fixture dictionary rather than process-lifetime dependency identity. All such
+  server substitutions now use `module_override`, restoring only the target key.
+- Why was it not caught? The errors appeared after pytest's success summary, at
+  process exit. The new cold-subprocess regression reads stdout/stderr after exit
+  and fails on those diagnostics, without suppressing logging or exceptions.
+
+Restoring the old substitution makes the new regression fail (1 failed, 2 passed);
+with the fix all three new cases pass. They also verify target restoration after
+an exception, absent-key cleanup and preservation of unrelated late imports.
+The complete suite has no teardown diagnostics. No core/dependency change or
+warning filter was needed.
 
 The browser harness now imports the repository's desktop plugin and puts screenshots
 under `HERMES_TEST_ARTIFACTS` or the system temporary directory. Those path edits

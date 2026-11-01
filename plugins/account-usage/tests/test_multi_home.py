@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from test_install_cause import InstallCause
+from module_override import module_override
 from test_request_selection import entry
 
 
@@ -159,7 +160,7 @@ class MultiHome(InstallCause):
                 agent._build_anthropic_client_for_key = Mock(side_effect=lambda key: sent.append(key) or SimpleNamespace(default_headers={'x-api-key': key[1]}))
                 def next_call(request):
                     return M._create_request_anthropic_client(agent, reason='fixture')
-                with patch.dict(sys.modules, {'tui_gateway.server': fixture.server}), \
+                with module_override('tui_gateway.server', fixture.server), \
                         patch.object(own, 'calling_agent', return_value=agent), \
                         patch.object(foreign, 'calling_agent', side_effect=AssertionError('foreign middleware reached')):
                     foreign.middleware(next_call=lambda req: own.middleware(next_call=next_call, request=req, turn_id=label), request={})
