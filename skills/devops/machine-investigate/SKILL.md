@@ -62,6 +62,14 @@ For a gateway restart use
 The backend-restart-guard enforces recognized literal signal commands on both Hermes and Claude Bash;
 its fail-open discovery and lexical limits are not permission to bypass it.
 
+## Remote backend timeouts: separate compute from transport
+
+Compare authenticated request timings on the backend host with the same requests through the client's actual SSH forward before attributing timeouts to CPU. Probe independent direct and jump-host routes with a bounded payload transfer, then isolate each hop; a successful TCP port check proves reachability, not end-to-end delivery. Corroborate a stalled route with socket retransmission/queue evidence, and leave the physical loss point unknown unless measured.
+
+Do not pin a jump-host workaround solely because its SSH port answers. If that pin later stalls while the direct route succeeds, remove the harmful override and reconnect only the affected transport masters, not healthy backend processes. Read back effective SSH configuration, the actual master's remote socket, and authenticated application responses.
+
+Validate a full post-change timeout window while the client remains active; preserve the detector's raw count and timestamps, not only its threshold verdict. A zero-timeout window proves recovery during that window, not that intermittent network loss cannot recur. Keep that distinction in the completion report and retain existing recurrence detection.
+
 ## What you may fix without asking
 
 - `collect.py clean --apply` (can take several minutes: run it in the background and wait for it, not in a
