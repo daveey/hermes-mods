@@ -1117,15 +1117,42 @@ Apply these distinctions before selecting the outcome; a resolved primary issue 
 unattended leftover as fixed. Keep the same JSON schema."""
 
 
+def render_tool_log(tool_log: list[str], budget: int) -> str:
+    """Keep the newest call excerpts, in chronological order, inside the prompt budget.
+
+    Bound each call independently so a verbose read cannot crowd out later actions.
+    Keep both ends of oversized calls (tool/arguments and result), marking the gap.
+    Never slice the joined log: that can silently discard the newest evidence.
+    """
+    if not tool_log:
+        return "(no tool calls this turn)"
+    omitted = "[older tool calls omitted]"
+    gap = "\n[tool call middle omitted]\n"
+    retained = []
+    used = len(omitted) + 1  # Reserve a line for an explicit history omission.
+    for call in reversed(tool_log[-40:]):
+        if len(call) > 1000:
+            call = call[:700] + gap + call[-(1000 - 700 - len(gap)):]
+        cost = len(call) + bool(retained)
+        if used + cost > budget:
+            break
+        retained.append(call)
+        used += cost
+    lines = list(reversed(retained))
+    if len(retained) < len(tool_log):
+        lines.insert(0, omitted)
+    return "\n".join(lines)
+
+
 def confirm_prompt(user_ask: str, rich_log: list[str], reply: str) -> str:
-    log = "\n".join(rich_log[-40:]) or "(no tool calls this turn)"
+    log = render_tool_log(rich_log, 7000)
     ask = user_ask or ""
     notice = notice_turn(ask)
     # Notices put the closeout/action instruction after long handoffs. Keep both ends within the same budget.
     request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else request_excerpt(ask)
     context = f"{NOTICE_CONTEXT}\n\n" if notice else ""
     return (f"{context}USER'S REQUEST (latest):\n{request}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
-            f"truncated):\n{log[:7000]}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
+            f"truncated):\n{log}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
 def parse_confirm(raw: str) -> Optional[tuple]:
@@ -1297,9 +1324,9 @@ def judge_system() -> str:
 
 
 def judge_prompt(user_ask: str, tool_log: list[str], reply: str) -> str:
-    log = "\n".join(tool_log[-40:]) or "(no tool calls this turn)"
+    log = render_tool_log(tool_log, 5000)
     return (f"USER'S REQUEST (latest):\n{request_excerpt(user_ask)}\n\nTOOL LOG THIS TURN (oldest first, truncated):\n"
-            f"{log[:5000]}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
+            f"{log}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
 def parse_verdict(raw: str) -> Optional[dict]:
