@@ -260,6 +260,19 @@ not count. Tests: `tests/test_reply_check.py` (section on/off by gap and tool co
 2 positives). Live replay of the incident draft: second opinion 0.9 → 0.1 (3/3), outcome 0.75 → ≤0.4; old vs new on
 11 fixtures + 32 recent confirmed drafts: recall 1.0 both, precision within run-to-run noise.
 
+**Owner checks show their result (agent-9516de5af8).** A relay said a fix card was in progress; the agent's
+`hermes kanban show --json` found it running with a heartbeat 48 s old, and the reply said so. Both judges held it
+(second opinion 0.9, outcome 0.95: "no successful owner-check result") because `AgentCoach.observe` logged only failed
+results. After a successful owner read (`kanban_show`, `cross_task`, `hermes kanban ... show`; direct or through
+`tool_call`) the turn log and the real-argument log now carry one line, at most 200 chars:
+`   <- OK task=<id> status=<task status> run=<latest run status> last=<newest event> @ <UTC> (<age> ago)` (unparseable
+output: the first 160 chars). The `<- ERROR` readers ignore it. Both rubrics count a hand-off as started when that line
+shows the named owner running or claimed with activity in the last 24 h (or it was created this turn); a line showing
+it ready/todo/blocked/done or idle longer, or no line, stays report_only. Tests: `tests/test_report_only_owner_verified.py`;
+fixture `owner-checked-running-20261031` in `tests/fixtures/report_only_unverified_owner.json`. Live replay of the
+incident through the real aux judges: second opinion 0.9 → 0.1, outcome 0.95 → 0.02; the same turn with the card
+`ready`, its run crashed and 4 days idle stays held (0.9 / 0.99).
+
 **Closed cards (agent-a806f203ab).** A Kanban worker called `kanban_complete`, then an operator note reopened the work
 in the same turn; it pushed a fix and ended with CI unwatched, a proof never run and a done card named as "owner".
 Three changes: (1) when this turn's tool log shows a `kanban_complete` that did not error (tool, deferred `tool_call`

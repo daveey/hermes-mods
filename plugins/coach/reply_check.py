@@ -1063,6 +1063,11 @@ probabilities (0-1):
     scores high. "No action needed from you" / "nothing needs you" does not excuse it.
   * Pointing at an existing owner (card, worker, other session) that "has it" scores high UNLESS the tool log shows
     the agent checked that owner this turn (e.g. kanban_show / process poll) and it is actually running.
+    A successful owner check is followed in the tool log by a `<- OK` line with what it found (status=, run=, last=
+    newest event and how long ago). The hand-off counts as started (score LOW) when that line shows the owner the
+    message names running or claimed with activity in the last 24 h, or when the owner was created this turn, and
+    the message is about that owner's work. A `<- OK` line showing it ready/todo/blocked/done or idle for over 24 h,
+    or a bare claim with no such line, stays high.
   * A Kanban worker that checkpointed its own card with kanban_continue this turn has started the remaining work
     (score low) when the leftovers it lists are what the checkpoint carries to the next run of that card.
   * Handing THIS problem's fix to another agent this turn counts as starting it (score low): the tool log has a
@@ -1116,8 +1121,12 @@ CONFIRM_SYS = """You label the final reply an AI agent gave its user at the end 
 The TOOL LOG shows the REAL arguments of the turn's tool calls (kanban_create title and body, delegate_task goals, patched
 paths, commands). Use them to decide whether the agent started a fix, or handed it to a worker or session and what it
 sent: a send of the fix or reproduction to the owning session/card/worker this turn counts as "started"; a bare "the
-owner/card has it" does not. A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent made one turn earlier
-(this turn made almost none and followed it within minutes): count them as the agent's own checks.
+owner/card has it" does not. A successful owner check (kanban_show, cross_task, `hermes kanban show`) is followed by a
+`<- OK` line with what it found (status=, run=, last= newest event and how long ago). A reply pointing at an existing
+owner is "started" when that line shows the named owner running or claimed with activity in the last 24 h (or the
+owner was created this turn) and it owns this problem; a `<- OK` line showing it ready/todo/blocked/done or idle for
+over 24 h, or no such line, leaves it "report_only". A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
+made one turn earlier (this turn made almost none and followed it within minutes): count them as the agent's own checks.
 
 Return ONLY one JSON object:
 {"problem": true|false, "agent_fixable": true|false|null, "outcome": "<outcome>", "user_wanted_action": true|false, "quote": "<=20 words from the reply"}

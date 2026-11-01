@@ -1228,6 +1228,101 @@ def rich_tool_line(tool: str, args: dict, arg: str = "") -> str:
         pass
     return f"-> {tool}({arg[:140]})"
 
+# agent-9516de5af8: observe logged only FAILED results (`<- ERROR`), so the report_only judges saw a failed owner lookup
+# and nothing from the one that found the card running, and held a true "the fix card is running" reply. After a
+# successful owner read (kanban_show, cross_task, `hermes kanban show`; direct or via tool_call) one `<- OK` line says
+# what it found. `<- ERROR` readers in reply_check look only for that prefix, so they ignore it.
+OWNER_READ_TOOLS = ("kanban_show", "cross_task")
+_OWNER_READ_CLI = re.compile(r"\bhermes\s+kanban\b[^\n]*\bshow\b")
+OK_LINE_MAX = 200
+
+
+def owner_read_call(tool: str, args: Any) -> bool:
+    name = (tool or "").rsplit("__", 1)[-1]
+    a = args if isinstance(args, dict) else {}
+    if name in OWNER_READ_TOOLS:
+        return True
+    if name == "tool_call":
+        return any(str((c or {}).get("name") or "").rsplit("__", 1)[-1] in OWNER_READ_TOOLS
+                   for c in (a.get("calls") or []) if isinstance(c, dict))
+    if name == "terminal":
+        return bool(_OWNER_READ_CLI.search(str(a.get("command") or "")))
+    return False
+
+
+def _tasks_in(obj: Any, depth: int = 0) -> list:
+    """(task, runs, events) for each Kanban task found in a tool result (JSON strings inside fields are parsed)."""
+    if depth > 5:
+        return []
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s[:1] in "{[":
+            try:
+                return _tasks_in(json.loads(s), depth + 1)
+            except Exception:
+                return []
+        return []
+    if isinstance(obj, list):
+        return [t for x in obj[:10] for t in _tasks_in(x, depth + 1)]
+    if not isinstance(obj, dict):
+        return []
+    t = obj.get("task")
+    if isinstance(t, dict) and t.get("status"):
+        return [(t, obj.get("runs") or [], obj.get("events") or [])]
+    if str(obj.get("id") or "").startswith("t_") and obj.get("status"):
+        return [(obj, obj.get("runs") or [], obj.get("events") or [])]
+    return [x for v in obj.values() if isinstance(v, (dict, list, str)) for x in _tasks_in(v, depth + 1)]
+
+
+def _ago(secs: float) -> str:
+    secs = max(0, int(secs))
+    for unit, size, limit in (("s", 1, 90), ("m", 60, 90 * 60), ("h", 3600, 48 * 3600)):
+        if secs < limit:
+            return f"{secs // size}{unit}"
+    return f"{secs // 86400}d"
+
+
+def _ts(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f / 1000 if f > 1e12 else f
+
+
+def _task_summary(task: dict, runs: list, events: list, now: float) -> str:
+    parts = [f"task={task.get('id')}" if task.get("id") else "", f"status={task.get('status')}"]
+    runs = [r for r in runs if isinstance(r, dict)]
+    if runs:
+        last = max(runs, key=lambda r: (_ts(r.get("started_at")) or 0, r.get("id") or 0))
+        parts.append(f"run={last.get('status')}")
+    evs = [e for e in events if isinstance(e, dict) and _ts(e.get("created_at"))]
+    if evs:
+        e = max(evs, key=lambda e: _ts(e.get("created_at")) or 0)
+        at = _ts(e.get("created_at")) or 0
+        parts.append(f"last={e.get('kind')} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(at))} ({_ago(now - at)} ago)")
+    return " ".join(p for p in parts if p)
+
+
+def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None) -> Optional[str]:
+    """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls."""
+    if not owner_read_call(tool, args):
+        return None
+    now = time.time() if now is None else now
+    try:
+        found = _tasks_in(result if isinstance(result, (dict, list)) else str(result or ""))
+        if found:
+            body = " | ".join(_task_summary(t, r, e, now) for t, r, e in found[:2])
+        else:
+            d = _as_dict(result)
+            text = str((d or {}).get("output") or (d or {}).get("result") or result or "")
+            m = re.search(r"^\s*status:\s+(\S+)", text, re.M)
+            body = (f"status={m.group(1)} " if m else "") + " ".join(text.split())[:160]
+    except Exception:
+        return None
+    return f"   <- OK {body}"[:OK_LINE_MAX]
+
+
 class AgentCoach:
     def __init__(self, checkout: Optional[Path] = None, signals=None, clock: Callable[[], float] = time.monotonic):
         self.checkout = checkout
@@ -1395,6 +1490,11 @@ class AgentCoach:
             s.setdefault("turn_commits", deque(maxlen=20)).append(f"-> terminal({arg[:8000]})")
         if failed(tool, result, status):
             s["turn_log"].append(f"   <- ERROR {str(result)[:120]}")
+        else:
+            ok = owner_result_line(tool, args, result)
+            if ok:  # what a successful owner check found, for the report_only judges (agent-9516de5af8)
+                s["turn_log"].append(ok)
+                s.setdefault("turn_rich", deque(maxlen=60)).append(ok)
         if is_kanban_call(tool, args):  # sticky across turns until the next Kanban call answers
             s["kanban_db_down"] = bool(failed(tool, result, status) and KANBAN_DB_DOWN.search(str(result)))
 
