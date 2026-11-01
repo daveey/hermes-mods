@@ -63,13 +63,25 @@ TRAILER_RE = re.compile(r"\n?\s*(?:\[user-steps\]|--- Attached Context ---|Sessi
 PROBE_RE = re.compile(r"^\s*(?:\[selfheal-probe\]|Live test of a detector\b)", re.I)
 
 
+def hermes_home(home: Optional[Path] = None) -> Path:
+    """An explicit `home` (authoritative), else core get_hermes_home(): task override > HERMES_HOME > platform default."""
+    if home:
+        return Path(home).expanduser()
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return Path(get_hermes_home())
+    except Exception:
+        env = os.environ.get("HERMES_HOME", "").strip()
+        return Path(env).expanduser() if env else Path.home() / ".hermes"
+
+
 def first_user_message(session_id: str, home: Optional[Path] = None) -> Optional[str]:
     """The session's first stored user message (cleaned) from <HERMES_HOME>/state.db; None when the session has no
     user row on this host or the db cannot be read (fail-open: the caller treats that as not a probe)."""
     if not session_id:
         return None
     import sqlite3
-    path = Path(home or os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "state.db"
+    path = hermes_home(home) / "state.db"
     if not path.is_file():
         return None
     try:
@@ -1365,7 +1377,7 @@ def budget(board: Optional[str] = None, now: Optional[float] = None,
     now = now or time.time()
     out = {"usd": None, "cap": USD_DAY, "running": None, "ok_usd": False,
            "ok_running": False, "available": False, "why": "", "reserved": None}
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    home = hermes_home()
     b = board or os.environ.get("COACH_KANBAN_BOARD") or "default"
     try:
         eb = _budget_mod()
@@ -1746,7 +1758,7 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
     if not session_id:
         return []
     import sqlite3
-    home = Path(home) if home else Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    home = hermes_home(home)
     dbs = [(None, home / "kanban.db")] + [(p.parent.name, p) for p in sorted((home / "kanban" / "boards").glob("*/kanban.db"))]
     marks = ",".join("?" * len(ADOPT_STATUSES))
     rows: list = []
@@ -2088,7 +2100,8 @@ def signature_owned_cards(sig: dict, home: Optional[Path] = None) -> list:
 
 
 def _kanban_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    """Base of signals.board_dbs labels (signals scans its --home, default HERMES_HOME), not core's kanban root."""
+    return hermes_home()
 
 
 def _board_dbs(home: Path) -> list:
@@ -2627,7 +2640,7 @@ def cron_job_state(fp: str, st: dict, home: Optional[Path] = None) -> Optional[d
         spec.loader.exec_module(sig)
     except Exception:
         return None
-    home = Path(home) if home else Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    home = hermes_home(home)
     for prof, h in sig.homes(home):
         try:
             j = json.loads((h / "cron" / "jobs.json").read_text())

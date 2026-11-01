@@ -110,12 +110,37 @@ def _ro(path) -> sqlite3.Connection:
 
 
 def home(h: Optional[str] = None) -> Path:
-    return Path(h or os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    """Hermes home: an explicit `h`, else core get_hermes_home() (task override > HERMES_HOME > platform default)."""
+    if h:
+        return Path(h).expanduser()
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return Path(get_hermes_home())
+    except Exception:
+        env = os.environ.get("HERMES_HOME", "").strip()
+        return Path(env).expanduser() if env else Path.home() / ".hermes"
+
+
+def kanban_root(h: Optional[Path] = None) -> Path:
+    """Board root like core kanban_db.kanban_home(): an explicit `h`, else HERMES_KANBAN_HOME, else the default Hermes
+    root (boards are shared across profiles, so a profile's HERMES_HOME is not the board root)."""
+    if h:
+        return Path(h).expanduser()
+    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    try:
+        from hermes_constants import get_default_hermes_root  # type: ignore
+        return Path(get_default_hermes_root())
+    except Exception:
+        return home()
 
 
 def board_dbs(h: Optional[Path] = None, replicas: bool = False) -> list:
-    """[(board slug or None for default, path, owned)] for this home; replicas are other gateways' boards."""
-    h = h or home()
+    """[(board slug or None for default, path, owned)] for this home; replicas are other gateways' boards.
+    Enumerates like core kanban_session_activity._board_db_paths: HERMES_KANBAN_DB (a worker's one-board pin) is not
+    the default board, so it never relabels or hides the default board."""
+    h = kanban_root(h)
     out = [(None, h / "kanban.db", True)]
     out += [(p.parent.name, p, True) for p in sorted((h / "kanban" / "boards").glob("*/kanban.db"))]
     if replicas:

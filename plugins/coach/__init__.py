@@ -179,7 +179,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             # (or the next turn). The fix-loop judge is prefilter-gated and its hint matters before the first patch,
             # so it stays inline.
             prev = coach.loop_state(session_id).get("last_reply") or ""
-            threading.Thread(target=_lesson_bg, args=(session_id, user_message, prev), daemon=True).start()
+            # Check before scheduling: a disabled call must not wake after its caller's
+            # temporary environment has been restored and start an auxiliary LLM call.
+            if os.environ.get("COACH_LESSONS", "1").strip().lower() not in ("0", "off", "false", "no"):
+                threading.Thread(target=_lesson_bg, args=(session_id, user_message, prev), daemon=True).start()
             _selfheal_run(_selfheal_complaint, session_id, user_message,
                           prev or _last_assistant(conversation_history), platform, parent_session_id,
                           list(coach.loop_state(session_id).get("last_log") or []),

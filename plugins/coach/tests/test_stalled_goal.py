@@ -150,6 +150,7 @@ def test_origin_chat_gets_one_takeover_message_and_the_card_one_comment(tmp_path
     import time
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     write_board(home / "kanban.db", FIXTURE, shift=int(time.time()) - CUTOFF)
     hooks, comments, root = _hooks(tmp_path, monkeypatch)
     out = hooks["pre_llm_call"](session_id=SID, user_message="what are you doing?", platform="desktop")
@@ -168,6 +169,7 @@ def test_hook_is_quiet_for_an_unrelated_session(tmp_path, monkeypatch):
     import time
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     write_board(home / "kanban.db", FIXTURE, shift=int(time.time()) - CUTOFF)
     hooks, comments, _ = _hooks(tmp_path, monkeypatch)
     out = hooks["pre_llm_call"](session_id="20261101_000000_aaaaaa", user_message="hi", platform="desktop")

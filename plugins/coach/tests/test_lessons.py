@@ -48,6 +48,7 @@ def test_hint_text():
 
 
 def test_hook_records_lesson(tmp_path, monkeypatch):
+    monkeypatch.setenv("COACH_LESSONS", "1")  # opt in with the fake judge below
     ispec = importlib.util.spec_from_file_location("coach_init_ls", HERE / "__init__.py")
     mod = importlib.util.module_from_spec(ispec)
     ispec.loader.exec_module(mod)

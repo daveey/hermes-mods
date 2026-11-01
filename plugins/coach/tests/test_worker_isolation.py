@@ -12,6 +12,7 @@ def test_inherited_worker_context_is_isolated(tmp_path):
     shutil.copyfile(Path(__file__).with_name("conftest.py"), suite / "conftest.py")
     # conftest's autouse gateway reaper imports this sibling helper.
     shutil.copyfile(Path(__file__).with_name("gateway_reaper.py"), suite / "gateway_reaper.py")
+    shutil.copyfile(Path(__file__).with_name("home_guard.py"), suite / "home_guard.py")
     (suite / "test_probe.py").write_text('''
 import os
 from pathlib import Path
@@ -25,7 +26,9 @@ def test_isolated(tmp_path, monkeypatch):
     assert "HERMES_KANBAN_FUTURE_PIN" not in os.environ
     assert Path(os.environ["HERMES_KANBAN_HOME"]) == tmp_path
     assert Path(os.environ["HERMES_KANBAN_DB"]) == tmp_path / "kanban.db"
-    assert os.environ["HERMES_HOME"] == "unchanged-profile-home"
+    assert Path(os.environ["HERMES_HOME"]) == tmp_path
+    assert Path(os.environ["HERMES_RUNTIME_DIR"]) == tmp_path / "tools"
+    assert os.environ["COACH_LESSONS"] == "0"
     # A test can still opt into a synthetic worker/board context explicitly.
     monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "test-task")

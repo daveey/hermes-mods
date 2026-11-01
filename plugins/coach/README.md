@@ -555,6 +555,39 @@ symlink identity and same-source reload. `test_nudge_reload.py` retains register
 The new interleaving cases fail on the old loader; disabling commit-directory detection still fails all four
 committed-change cases. No retries, increased deadlines or skipped variants are used.
 
+### Hermetic coach tests and lesson scheduling
+
+Disabled lessons are checked **before** scheduling `_lesson_bg`, not only when its worker eventually runs.
+Tests default both collection and each test to an owned `HERMES_HOME`, isolate `HERMES_KANBAN_HOME`/DB and
+`HERMES_RUNTIME_DIR`, and disable lessons unless a test explicitly supplies a fake judge. Coach threads are
+joined before the shared monkeypatch fixture restores its judges/environment. The existing lazy-install,
+gateway-reaping and System One protections remain.
+
+`tests/home_guard.py` audits `open`, `sqlite3.connect` and executed module files. Real home state and installed
+foreign plugins are refused, with a ledger checked even when production catches the exception. Late worker
+violations propagate to the xdist controller. Test-owned directories remain writable; the selected core,
+interpreter and installation manifest are read-only source/dependency exceptions, never SQLite exceptions.
+This is a Python-process seatbelt, not an OS sandbox or a subprocess audit hook.
+
+Failure chain: a hook scheduled a lesson while its flag was off → the worker ran after monkeypatch restored the
+flag → the real auxiliary call resolved task concurrency → core lazily discovered live plugins. The earlier
+checkout-cache fix prevented module eviction, not the work that triggered discovery. The missing home default
+also let ordinary state/config readers consume real data. Not caught: fixtures isolated only the board pin,
+background work had no test owner, and fail-open readers hid side effects. The scheduling check, isolated homes,
+thread teardown and independent audit ledger remove those causes rather than retrying the flaky assertion.
+
+State readers use core's task-aware home; `stalled_goal` board enumeration follows the shared kanban root
+(`HERMES_KANBAN_HOME`), not a profile home. Explicit home arguments remain authoritative. Like core's board
+enumerator, a worker's one-board `HERMES_KANBAN_DB` pin does not relabel that board as the default.
+
+Tests: `test_home_isolation.py` covers disabled/enabled scheduling, the audit ledger, URI/symlink/foreign-plugin
+paths and read-only runtime exceptions. `test_home_guard_lifecycle.py` runs real serial and `-n 2` subprocesses
+with a swallowed post-test violation and clean controls. `test_state_paths.py` exercises supplied/task-override
+state homes and shared kanban enumeration. `test_worker_isolation.py` checks inherited pins are replaced by
+fixture-owned homes; `test_lessons.py` explicitly opts into its fake judge. The disabled-scheduling regression
+fails on the prior implementation. No behavior assertions are relaxed; the old assertion that HERMES_HOME
+remains inherited is replaced by the stricter new isolation contract.
+
 ### Second opinions that run (`second_opinion.py`)
 
 The two checkpoints above used to be advice only ("consider a second opinion", "verify it"). With these settings on,

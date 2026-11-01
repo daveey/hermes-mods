@@ -1429,7 +1429,8 @@ def _hermes_home():
         return get_hermes_home()
     except Exception:
         from pathlib import Path
-        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        env = os.environ.get("HERMES_HOME", "").strip()  # an empty HERMES_HOME is unset (core), never the cwd
+        return Path(env).expanduser() if env else Path.home() / ".hermes"
 
 
 def profile_text() -> str:
