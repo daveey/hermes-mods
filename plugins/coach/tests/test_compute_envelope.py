@@ -130,6 +130,16 @@ def test_credential_asks_and_finished_reports_are_left_alone(tmp_path, monkeypat
                                   session_id="w4") is None
 
 
+def test_named_approval_check_is_not_a_spend_ask():
+    spec = importlib.util.spec_from_file_location("coach_ce_named_check", HERE / "compute_envelope.py")
+    ce = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ce)
+    assert ce.classify(
+        '- The new one came from a GPU-spend approval check, not a "stops at the diagnosis" check.'
+    ) is None
+    assert ce.classify("May I rent a 4090 on Vast for $12?") is not None
+
+
 def test_classifier_cases():
     spec = importlib.util.spec_from_file_location("coach_ce_mod", HERE / "compute_envelope.py")
     ce = importlib.util.module_from_spec(spec)
