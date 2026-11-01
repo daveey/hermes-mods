@@ -1,9 +1,13 @@
 ---
 name: hermes-session-manager
-description: Use when a Hermes session is asked to act as the user's session manager / dispatcher - "manage my sessions", "what's blocked on me", "archive finished sessions", "make sure things are moving", "keep an eye on my chats and cards" - and on every sweep wakeup of a session that already has that role.
+description: "Use when a Hermes chat manages sessions, cards, blockers."
 ---
 
 # Hermes session manager
+
+Triggers: "manage my sessions", "what's blocked on me", "archive finished sessions", "make sure things are moving",
+"keep an eye on my chats and cards"; every sweep wakeup of a session that already has this role. Claude Code desktop
+sessions (`start_session`/`SendMessage`) use `concierge` instead.
 
 Route quickly, recover stalled work, and verify closeout in the originating session.
 
