@@ -1,6 +1,6 @@
 ---
 name: claude-usage-diagnostics
-description: "Use when Claude/Codex usage runs out or accounts show red."
+description: "Use when Claude/Codex quota is out or no route is eligible."
 version: 1.0.0
 author: Hermes Agent (curator)
 license: MIT
@@ -16,6 +16,7 @@ metadata:
 
 - The user reports being "out of Claude usage", or desktop sessions stick on "rate limited — resets in ~X" and endlessly retry.
 - New Hermes sessions silently fall back to another provider (e.g. codex) instead of using Claude.
+- Kanban workers fail before starting with `Worker could not start: ModelRouting…` and errors.log says `No eligible <class> routes under billing/capability policy` (step 3).
 - A Claude account "should have plenty left" per the usage modal but calls still 429 — the contradiction needs reconciling with evidence.
 
 Diagnose from **evidence, in this order**: (1) the verbatim API error in session transcripts, (2) a live model×account probe **calibrated against a known-good client**, (3) the running session inventory. Consult the usage modal last, and never rely on it alone. Every claim you report must point to a verified measurement. If the claim can't be measured, say it's unverified.
@@ -54,7 +55,7 @@ Probe **all models on all credentials** and report the matrix. Partial availabil
 
 - `hermes auth list` — per-credential status and cooldown timers. `model_cooldowns` in `auth.json` are **per model**: a credential benched for opus still serves other models.
 - `hermes auth refresh anthropic <n>` re-mints tokens and clears stale cooldowns — run it once to rule out drift, then re-probe. It will not lift genuine API 429s.
-- When every credential is benched for the requested model, resolution raises "No Anthropic credentials found" and the gateway falls back to the configured fallback provider. That is correct behavior — the pool DID rotate through everything first; say so plainly instead of implying rotation failed.
+- When every credential is benched for the requested model, resolution raises "No Anthropic credentials found" and the gateway falls back to the configured fallback provider. That is correct behavior — the pool DID rotate through everything first; say so plainly instead of implying rotation failed. A card pinned to one model does not fall back: once that model's pool is exhausted, its worker dies before inference with `No eligible <class> routes under billing/capability policy` while cards on other providers keep starting. Treat that pattern as a possible quota wall, not proof of a routing bug: check every account's `seven_day` on the usage endpoint (step 2), alongside the verbatim error and model×account probe, before attributing it to routing code or recent commits, even when a deploy landed minutes before the first failure. If quota evidence does not explain it, inspect billing/capability policy and route eligibility rather than assuming exhaustion. Pools are per gateway, so a chat on another host still serving that model says nothing about this host's accounts. Cards that gave up during the wall need a way back: count them from `gave_up` events, not from an owner card's list, and follow the kanban-orchestrator skill's stuck-card recovery reference (provider quota).
 
 ### 3a. Healthy live account skipped by Hermes
 
