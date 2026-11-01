@@ -117,10 +117,8 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 - Auditing a workflow's history (green-window soak, "every run since D", promoting a lane to required): `references/workflow-history-audit.md`. Not `gh run list -L N`: on a busy workflow it drops the oldest runs.
 - For JS fixture isolation on CI, keep TMPDIR roots short (for example `/tmp/wc.XXXXXX`): nesting a `RUNNER_TEMP/workspace-checks.*` root under Vitest plus gateway control sockets can exceed AF_UNIX path limits and surface as `listen EINVAL` followed by a timeout. Exercise a real nested Unix socket, executable helper, original failure status, and cleanup through the actual workflow shell. Container `sudo` does not prove mount permission; inspect mount failure and `/dev/shm` noexec/capacity. Reconcile runner label migration before changing retired container hosts; the next real job must prove tmpfs selection and memory reserve on the serving fleet.
 
-- `gh` repo: the script passes `-R OWNER/NAME` from the checkout's `origin` remote to every `gh` call (override
-  with `--gh-repo`). Before that, in a fork checkout that also has an `upstream` remote, a bare `gh run list`
-  read the upstream repo's runs. The fork's commit was never found, and every wait ended "stalled" with no run
-  named. Any hand-run `gh run`/`gh pr` in such a checkout needs `-R` too.
+- In a fork checkout with an `upstream` remote, a bare `gh run`/`gh pr` reads the upstream repo's runs, so a
+  hand-run one needs `-R OWNER/NAME` (the script passes it from `origin`; override with `--gh-repo`).
 
 - `--repo` is a LOCAL checkout path (the script runs `git -C <repo> fetch`). An `owner/name` slug resolves to `~/code/<name>` only when that checkout's origin is the same repo; anything else exits with "not a local checkout". Run it from inside the checkout or pass the path.
 
@@ -138,6 +136,9 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
   Root fix: `if: ${{ !cancelled() }}` and run gate/report jobs on a light runner label; PRs pick it up only after
   rebasing, so keep the sweep running until then. Before adding concurrency rules, grep the workflows; they may
   already exist.
+- A gate on the CURRENT head that sits `queued` is not a latch: it waits for a free runner with its labels. Read
+  them first (`gh api repos/O/R/actions/jobs/<id> --jq .labels`; the id ends the check's `detailsUrl`), then
+  diagnose that label's pool per `references/self-hosted-runner-migration.md` (Pitfalls, saturation by label).
 - A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
   maps to) takes precedence; check the repo's AGENTS.md first.
 - Match full-suite shard counts to the reusable workflow's timeout envelope. Reducing an eight-shard matrix to two while retaining the same per-job timeout can cancel every Python job even when e2e is green. Keep the gate's required exact job names, workflow matrix, and test fake synchronized; never count cancelled shards as green or compensate by weakening assertions.
