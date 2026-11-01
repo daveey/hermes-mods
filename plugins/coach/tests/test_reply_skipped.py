@@ -110,3 +110,6 @@ def test_a_failed_nudge_outcome_is_logged(tmp_path, monkeypatch):
     hooks["pre_verify"](session_id="g", platform="desktop", attempt=1, final_response=REPLY + " Filed a card.")
     sk = [r for r in _log(store) if r["event"] == "reply_nudge_outcome_skipped"]
     assert sk and sk[0]["reason"] == "error:TimeoutError"
+    [n] = [r for r in _log(store) if r["event"] == "reply_nudge"]
+    oc = [r for r in _log(store) if r["event"] == "reply_nudge_outcome" and r.get("nudge_id") == n["nudge_id"]]
+    assert len(oc) == 1 and oc[0]["resolved"] is None  # the nudge still gets its one outcome record (filed)

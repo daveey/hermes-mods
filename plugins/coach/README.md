@@ -292,8 +292,19 @@ verdict, fail-open). The deadline is the host's own (`hermes_cli.plugins.current
 (30s) from the call's start, so the check still fits. Delivery is recorded, not assumed: `reply_nudge` is logged only
 when the nudge is returned before the deadline (with `elapsed_s`, `budget_s`, `host_timeout_s`);
 `reply_nudge_abandoned` when the host already gave up (result discarded, no continuation); `reply_nudge_delivered`
-once the continuation reaches `pre_verify` again in the same turn (attempt >= 1); `reply_nudge_undelivered` when the
-next check comes from a later turn instead. Dispatch-level tests: `tests/test_pre_verify_deadline.py`.
+once the continuation reaches `pre_verify` again in the same turn (attempt >= 1, or attempt 0 on a different reply:
+core restarts its verify attempts after a mid-turn compaction); `reply_nudge_undelivered` (with `reason`) when the turn
+ends without that check (`turn_failed`, `turn_ended`, `empty_reply`) or a later turn starts first (`next_turn`: a
+notice or the user superseded the continuation). Dispatch-level tests: `tests/test_pre_verify_deadline.py`.
+
+Every `reply_nudge` (any rule, compute_envelope/compute_authority included) carries a `nudge_id`, and ends with
+exactly one delivery record (`reply_nudge_delivered` | `_undelivered` | `_abandoned`) and exactly one outcome record
+(`reply_nudge_outcome` | `nudge_outcome_lost` | `nudge_outcome_untracked` for rules no judge re-checks |
+`nudge_outcome_subagent` | `nudge_outcome_missing`), each carrying that `nudge_id`. A session can hold several open
+nudges at once. Nudges whose backend never checks the session again (exit, reload) are closed by
+`signals.collect_coach`: at `HANDOFF_GRACE_S` when the turn provably died, else after `NUDGE_OPEN_S` (3 h) with
+`reason: never_rechecked`; a late in-process close after that logs `reply_nudge_record_late` instead of a second
+record. Tests: `tests/test_nudge_records.py`.
 
 ### Goal disposition (`pre_final_gate`, experimental and default off)
 

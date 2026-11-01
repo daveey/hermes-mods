@@ -3,15 +3,25 @@ User channel = dashboard/plugin_api.py + desktop-plugins/coach (one-button panel
 from __future__ import annotations
 
 import datetime
+import hashlib
 import importlib.util
 import logging
 import threading
 import os
 import time
 import sys
+import uuid
 from pathlib import Path
 
 log = logging.getLogger("coach")
+
+# Nudge record events (see build(): one delivery and one outcome record per reply_nudge, by nudge_id).
+_DELIVERY_EVENTS = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")
+_OUTCOME_EVENTS = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_subagent", "nudge_outcome_untracked",
+                   "nudge_outcome_missing")
+# signals.collect_coach may close a nudge from HANDOFF_GRACE_S (15 min) on; an in-process close of a nudge older than
+# this first checks the log for that record, so a nudge never gets two.
+_NUDGE_LATE_S = 14 * 60
 _HERE = Path(__file__).resolve().parent
 
 
@@ -98,6 +108,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             if not st.get("last_reply") and isinstance(rec.get("loop"), dict):
                 st.update(rec["loop"])
             turn = rec.get("turns") or coach.turn_number(session_id)
+            # a nudge of an earlier turn whose continuation was never checked (a notice or the user's next message
+            # superseded it, the turn died): no check can come for it now
+            _close_open(session_id, "next_turn", "turn_changed", before_turn=coach.turn_number(session_id))
             # Lessons judge nearly every message, so it runs in the background; its hint rides the next tool result
             # (or the next turn). The fix-loop judge is prefilter-gated and its hint matters before the first patch,
             # so it stays inline.
@@ -137,9 +150,87 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     envelope_told: set = set()  # (session_id, where) already given the compute-envelope note
 
-    def _envelope(session_id, where, text, may_hold=True):
+    # ── nudge records: every reply_nudge gets a nudge_id, and exactly one delivery record (reply_nudge_delivered |
+    # _undelivered | _abandoned) and one outcome record (reply_nudge_outcome | nudge_outcome_lost |
+    # nudge_outcome_untracked; signals.collect_coach adds nudge_outcome_subagent / _missing and closes nudges whose
+    # backend never checked the session again). A session may hold several open nudges (loop["pending_nudge"]:
+    # nudge_id -> entry), each closed by the first of: the continuation's check (attempt >= 1, or an attempt-0 check
+    # of a different reply in the same turn: core restarts its verify attempts after a mid-turn compaction), the end
+    # of the turn (post_llm_call), or the next turn (pre_llm_call).
+
+    def _new_nudge_id() -> str:
+        return "n_" + uuid.uuid4().hex[:16]
+
+    def _sig(text) -> str:
+        return hashlib.sha1(" ".join(str(text or "").split()).encode("utf-8", "replace")).hexdigest()[:12]
+
+    def _ids(n: dict) -> dict:
+        return {k: n[k] for k in ("nudge_id", "draft_id") if n.get(k)}
+
+    def _closed_elsewhere(n: dict, events: tuple) -> bool:
+        """The signals sweep already wrote this record for the nudge (it closes nudges open past NUDGE_OPEN_S): a
+        late in-process close must not add a second one. Only scanned for nudges that old, so normally free."""
+        nid, at = n.get("nudge_id"), float(n.get("at") or 0)
+        if not nid or not at or time.time() - at < _NUDGE_LATE_S:
+            return False
+        try:
+            with (store.root / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+                return any(nid in ln and any(f'"{e}"' in ln for e in events) for ln in f)
+        except OSError:
+            return False
+
+    def _log_delivery(session_id, n, event, **extra):
+        late = _closed_elsewhere(n, _DELIVERY_EVENTS)
+        store.log({"event": "reply_nudge_record_late" if late else event, **({"would_be": event} if late else {}),
+                   "session_id": session_id, "rule": n.get("rule", ""),
+                   "secs": round(time.time() - float(n.get("at") or time.time()), 1), **_ids(n), **extra})
+
+    def _log_outcome(session_id, n, event, **extra):
+        late = _closed_elsewhere(n, _OUTCOME_EVENTS)
+        store.log({"event": "reply_nudge_record_late" if late else event, **({"would_be": event} if late else {}),
+                   "session_id": session_id, "rule": n.get("rule") or "handoff", **_ids(n), **extra})
+
+    def _pending(session_id, create=False) -> dict:
+        st = coach.loop_state(session_id)
+        p = st.get("pending_nudge")
+        if isinstance(p, dict) and "turn" in p:  # one slot, from an older plugin's persisted loop state
+            p = st["pending_nudge"] = {p.get("nudge_id") or "legacy": p}
+        if not isinstance(p, dict):
+            if not create:
+                return {}
+            p = st["pending_nudge"] = {}
+        return p
+
+    def _park_nudge(session_id, rec, final_response):
+        """Wait for this nudge's continuation (closed by _nudge_delivery / _close_open)."""
+        nid = rec.get("nudge_id") or _new_nudge_id()
+        _pending(session_id, create=True)[nid] = {
+            "nudge_id": nid, "turn": coach.turn_number(session_id), "rule": rec.get("rule", ""), "at": time.time(),
+            "sig": _sig(final_response), **({"draft_id": rec["draft_id"]} if rec.get("draft_id") else {})}
+
+    def _close_open(session_id, delivery_reason, outcome_reason, before_turn=None):
+        """No continuation check can come for these nudges any more: the turn ended (before_turn None) or a later
+        turn began (before_turn = its number; only older nudges close). Fail-open."""
+        try:
+            st = coach.loop_state(session_id)
+            p = _pending(session_id)
+            for nid, n in list(p.items()):
+                if before_turn is None or int(n.get("turn") or 0) < before_turn:
+                    p.pop(nid, None)
+                    _log_delivery(session_id, n, "reply_nudge_undelivered", reason=delivery_reason)
+            o = st.get("outcome_nudge")
+            if o and (before_turn is None or int(o.get("turn") or 0) < before_turn):
+                st.pop("outcome_nudge", None)
+                _log_outcome(session_id, o, "nudge_outcome_lost", reason=outcome_reason, nudge_turn=o.get("turn"),
+                             turn=coach.turn_number(session_id))
+        except Exception as exc:
+            log.debug("coach close open nudges: %s", exc)
+
+    def _envelope(session_id, where, text, may_hold=True, sink=None):
         """Compute-envelope check (compute_envelope.py). First hit per session/surface -> the note (the caller holds
-        the block / the reply); a repeat after the note goes through and is logged as an agent fault."""
+        the block / the reply); a repeat after the note goes through and is logged as an agent fault. A reply hit is a
+        reply_nudge with its own nudge_id (returned in `sink["rec"]` so the caller parks it for delivery); no judge
+        re-checks the revision, so its outcome record (`nudge_outcome_untracked`) is written with it."""
         try:
             ce = _load("compute_envelope")
             if not ce.enabled():
@@ -156,9 +247,16 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                "where": where, "evidence": hit["sentence"][:200]})
                 return None
             envelope_told.add(key)
-            store.log({"event": "agent_hint" if where == "block" else "reply_nudge", "rule": rule,
-                       "session_id": session_id, "where": where, "p": 1.0, "usd": hit.get("usd"),
-                       "evidence": hit["sentence"][:200]})
+            rec = {"event": "agent_hint" if where == "block" else "reply_nudge", "rule": rule,
+                   "session_id": session_id, "where": where, "p": 1.0, "usd": hit.get("usd"),
+                   "evidence": hit["sentence"][:200]}
+            if where != "block":
+                rec["nudge_id"] = _new_nudge_id()
+            store.log(rec)
+            if where != "block":
+                _log_outcome(session_id, rec, "nudge_outcome_untracked", reason="rule_not_judged")
+                if sink is not None:
+                    sink["rec"] = rec
             return ce.authority_note(hit) if rule == "compute_authority" else ce.note(hit, where)
         except Exception as exc:
             log.debug("coach compute_envelope: %s", exc)
@@ -170,7 +268,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         (`turn_origin` set: background review, side question) is not a reply to the user: never judged."""
         if turn_origin or attempt or not session_id or platform in ("cron",) or not isinstance(final_response, str):
             return None
-        msg = _envelope(session_id, "reply", final_response)
+        sink: dict = {}
+        msg = _envelope(session_id, "reply", final_response, sink=sink)
+        if msg and sink.get("rec"):
+            _park_nudge(session_id, sink["rec"], final_response)  # the continuation's next check delivers it
         return {"hold": True, "nudge": msg} if msg else None
 
     envelope_gate.assess_before_holds = True
@@ -402,6 +503,16 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     def post_llm_call(session_id="", assistant_response=None, platform="", parent_session_id="", **_):
         try:
+            if session_id:
+                # The turn is over: a nudge still open got no checked continuation (failed turn, a continuation that
+                # never reached pre_verify). Closed before the loop state is persisted below.
+                text = assistant_response if isinstance(assistant_response, str) else ""
+                why = ("turn_failed" if _load("reply_check").turn_failed(text) else
+                       "empty_reply" if not text.strip() else "turn_ended")
+                _close_open(session_id, why, why)
+        except Exception as exc:
+            log.debug("coach post_llm_call close nudges: %s", exc)
+        try:
             if session_id and _pv_seen.get(session_id) != coach.turn_number(session_id):
                 text = assistant_response if isinstance(assistant_response, str) else ""
                 _skipped(session_id, platform,
@@ -467,26 +578,27 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         token = rc.use_budget(budget)
         try:
             if session_id:
-                _nudge_delivery(session_id, attempt)
+                _nudge_delivery(session_id, attempt, final_response)
             out: dict = {}
             res = _reply_check(session_id, platform, attempt, final_response, changed_paths, out)
             if not (isinstance(res, dict) and res.get("action") == "continue"):
                 return res
-            rec = out.get("rec") or {"event": "reply_nudge", "session_id": session_id, "rule": out.get("rule", "")}
+            rec = out.get("rec") or out.get("logged_rec") or {"event": "reply_nudge", "session_id": session_id,
+                                                              "rule": out.get("rule", "")}
+            rec.setdefault("nudge_id", _new_nudge_id())
             timing = {"elapsed_s": round(budget.elapsed(), 2), "budget_s": budget.own_s,
                       "host_timeout_s": budget.host_timeout_s}
-            turn = coach.turn_number(session_id)
             if budget.abandoned():
                 st = coach.loop_state(session_id)
-                if (st.get("outcome_nudge") or {}).get("turn") == turn:
+                if (st.get("outcome_nudge") or {}).get("nudge_id") == rec["nudge_id"]:
                     st.pop("outcome_nudge", None)  # no continuation will come for it
                 store.log({**rec, "event": "reply_nudge_abandoned", **timing})
                 return None
             if out.get("rec"):
                 store.log({**rec, **timing})
-            coach.loop_state(session_id)["pending_nudge"] = {
-                "turn": turn, "rule": rec.get("rule", ""), "at": time.time(),
-                **({"draft_id": rec["draft_id"]} if rec.get("draft_id") else {})}
+                if not rec.get("outcome"):  # no judge re-checks this rule's revision: its outcome is known now
+                    _log_outcome(session_id, rec, "nudge_outcome_untracked", reason="rule_not_judged")
+            _park_nudge(session_id, rec, final_response)
             return res
         except Exception as exc:
             log.debug("coach pre_verify: %s", exc)
@@ -494,22 +606,25 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         finally:
             rc.reset_budget(token)
 
-    def _nudge_delivery(session_id, attempt):
-        """Close the pending nudge of this session: delivered when pre_verify runs again in its turn (the agent
-        continued), undelivered when the next check belongs to a later turn."""
+    def _nudge_delivery(session_id, attempt, final_response=None):
+        """Close this session's open nudges at a reply check: delivered when the check is the nudge's continuation
+        (attempt >= 1, or attempt 0 of the same turn on a different reply: core restarts its verify attempts after a
+        mid-turn compaction); undelivered when the check belongs to a later turn. The same draft checked again at
+        attempt 0 is not a continuation yet."""
         try:
-            st = coach.loop_state(session_id)
-            n = st.get("pending_nudge")
-            if not n:
+            p = _pending(session_id)
+            if not p:
                 return
-            turn = coach.turn_number(session_id)
-            if n.get("turn") == turn and not attempt:
-                return  # a repeated attempt-0 check in the same turn: no continuation yet
-            st.pop("pending_nudge", None)
-            store.log({"event": "reply_nudge_delivered" if n.get("turn") == turn else "reply_nudge_undelivered",
-                       "session_id": session_id, "rule": n.get("rule", ""),
-                       "secs": round(time.time() - float(n.get("at") or time.time()), 1),
-                       **({"draft_id": n["draft_id"]} if n.get("draft_id") else {})})
+            turn, sig = coach.turn_number(session_id), _sig(final_response)
+            for nid, n in list(p.items()):
+                if n.get("turn") == turn:
+                    if not attempt and (not n.get("sig") or n["sig"] == sig):
+                        continue  # a repeated attempt-0 check of the nudged draft: no continuation yet
+                    p.pop(nid, None)
+                    _log_delivery(session_id, n, "reply_nudge_delivered", via="continuation" if attempt else "recheck")
+                else:
+                    p.pop(nid, None)
+                    _log_delivery(session_id, n, "reply_nudge_undelivered", reason="next_turn")
         except Exception as exc:
             log.debug("coach nudge delivery: %s", exc)
 
@@ -518,12 +633,15 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         if the nudge is returned in time); out["rule"] names the source of any other continue."""
         try:
             if session_id and final_response and platform not in ("cron",):
-                msg = _envelope(session_id, "reply", final_response, may_hold=not attempt)
+                sink: dict = {}
+                msg = _envelope(session_id, "reply", final_response, may_hold=not attempt, sink=sink)
                 if msg:
-                    out["rule"] = "compute_envelope"
+                    out["rule"] = (sink.get("rec") or {}).get("rule") or "compute_envelope"
+                    if sink.get("rec"):
+                        out["logged_rec"] = sink["rec"]
                     return {"action": "continue", "message": msg}
-            if attempt and session_id and final_response and platform not in ("cron",):
-                _nudge_outcome(session_id, final_response)
+            if session_id and final_response and platform not in ("cron",):
+                _nudge_outcome(session_id, final_response, attempt)
             if attempt or platform in ("cron",):
                 return None
             if not session_id or not final_response:
@@ -633,7 +751,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            **({"guard": guard} if guard else {}), **({"subagent": True} if sub else {})})
                 return None
             tracked = hit["rule"] in rc.RULES
-            out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
+            nid = _new_nudge_id()
+            out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"], "nudge_id": nid,
                           "p": hit["p"], "evidence": hit["evidence"], "ask_len": len(ask or ""),
                           # signals.template_holds groups on it: one rule holding the same fixed text in many chats
                           "ask_head": " ".join((ask or "").split())[:40], "platform": platform,
@@ -641,8 +760,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref(),
                           **({"outcome": True} if tracked else {})}
             if tracked:  # judged again on attempt 1 (any rule): self-heal files the outcome, not the nudge
-                coach.loop_state(session_id)["outcome_nudge"] = {
-                    "turn": coach.turn_number(session_id), "rule": hit["rule"], "ask": ask,
+                st = coach.loop_state(session_id)
+                old = st.get("outcome_nudge")
+                if old:  # an earlier nudge of this turn still waiting for its revision: it never gets one now
+                    _log_outcome(session_id, old, "nudge_outcome_lost", reason="superseded")
+                st["outcome_nudge"] = {
+                    "turn": coach.turn_number(session_id), "rule": hit["rule"], "ask": ask, "nudge_id": nid,
+                    "at": time.time(), "sig": _sig(final_response),
                     "log": list(log_lines)[-25:], "kanban_down": kanban_down,
                     "threshold": cfg["threshold"], "thresholds": thresholds, **draft_ref()}
             return {"action": "continue", "message": hit["nudge"]}
@@ -658,19 +782,26 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     except Exception as exc:
         log.debug("coach pre_verify host timeout: %s", exc)
 
-    def _nudge_outcome(session_id, final_response):
-        """Attempt >= 1 after this turn's reply_check nudge (any rule): re-run that rule once on the revised reply and
-        the turn's tool log (same judge and thresholds), log a reply_nudge_outcome, never nudge again. Fail-open.
-        Self-heal files the outcome (signals.collect_coach), not the nudge (agent-e278947864, agent-3ba1979f34)."""
+    def _nudge_outcome(session_id, final_response, attempt=1):
+        """The continuation's check after this turn's reply_check nudge (any rule; attempt >= 1, or attempt 0 on a
+        different reply after a mid-turn compaction): re-run that rule once on the revised reply and the turn's tool
+        log (same judge and thresholds), log a reply_nudge_outcome, never nudge again. Fail-open, but a nudge taken
+        off the loop state always gets its outcome record. Self-heal files the outcome (signals.collect_coach), not
+        the nudge (agent-e278947864, agent-3ba1979f34)."""
+        n = None
         try:
             st = coach.loop_state(session_id)
             n = st.get("outcome_nudge")
             if not n:
                 return
             if n.get("turn") != coach.turn_number(session_id):
-                store.log({"event": "reply_nudge_outcome_skipped", "session_id": session_id, "rule": n.get("rule", ""),
-                           "reason": "turn_changed", "nudge_turn": n.get("turn"), "turn": coach.turn_number(session_id)})
+                st.pop("outcome_nudge", None)
+                _log_outcome(session_id, n, "nudge_outcome_lost", reason="turn_changed", nudge_turn=n.get("turn"),
+                             turn=coach.turn_number(session_id))
                 return
+            if not attempt and (not n.get("sig") or n["sig"] == _sig(final_response)):
+                n = None
+                return  # the nudged draft checked again: its revision has not come yet
             st.pop("outcome_nudge", None)  # once per nudge, whatever happens below
             rule = n.get("rule") or "handoff"
             rc = _load("reply_check")
@@ -681,15 +812,22 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                    wake=lambda: rc.wake_sources(session_id, log_lines),
                                    kanban_down=n.get("kanban_down"),
                                    human_asks=lambda: rc.session_human_asks(session_id))
-            store.log({"event": "reply_nudge_outcome", "rule": rule, "session_id": session_id,
-                       **({"draft_id": n["draft_id"]} if n.get("draft_id") else {}),
-                       "p": res["p"], "resolved": res["resolved"], "judged": res["judged"],
-                       "evidence": res["evidence"], "reply": (final_response or "")[:300]})
+            _log_outcome(session_id, n, "reply_nudge_outcome", p=res["p"], resolved=res["resolved"],
+                         judged=res["judged"], evidence=res["evidence"], reply=(final_response or "")[:300],
+                         **({} if attempt else {"via": "recheck"}))
+            n = None
         except Exception as exc:
             log.debug("coach nudge outcome: %s", exc)
             try:
                 store.log({"event": "reply_nudge_outcome_skipped", "session_id": session_id,
-                           "reason": f"error:{type(exc).__name__}", "detail": str(exc)[:200]})
+                           "reason": f"error:{type(exc).__name__}", "detail": str(exc)[:200],
+                           **(_ids(n) if n else {})})
+                if n and "outcome_nudge" not in coach.loop_state(session_id):
+                    # taken off but not judged: its outcome record says so, and resolved=None (not True) still
+                    # files it in signals.collect_coach, as an outcome check that failed always did
+                    _log_outcome(session_id, n, "reply_nudge_outcome", p=None, resolved=None, judged=False,
+                                 evidence=f"outcome check error: {type(exc).__name__}",
+                                 reply=(final_response or "")[:300])
             except Exception:
                 pass
 

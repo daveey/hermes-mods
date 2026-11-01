@@ -1039,6 +1039,13 @@ def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
 
 
 HANDOFF_GRACE_S = 15 * 60  # a nudge waits this long for its reply_nudge_outcome before it files anyway
+# Every reply_nudge carrying a nudge_id ends with one delivery and one outcome record (coach/__init__.py writes them
+# while the backend lives). A nudge still open this long was never checked again (the backend exited or reloaded):
+# collect_coach writes what is missing. A provably dead turn (_turn_lost) is closed from HANDOFF_GRACE_S on.
+NUDGE_OPEN_S = 3 * 3600
+NUDGE_DELIVERY = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")
+NUDGE_OUTCOME = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_subagent", "nudge_outcome_untracked",
+                 "nudge_outcome_missing")
 # reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
 OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
                  "credit_ask", "laptop_job")
@@ -1065,6 +1072,8 @@ def _outcome_matches(n: dict, o: dict) -> bool:
     if (o.get("session_id") or "") != (n.get("session_id") or ""):
         return False
     if (o.get("rule") or "handoff") != (n.get("rule") or "handoff"):
+        return False
+    if n.get("nudge_id") and o.get("nudge_id") and n["nudge_id"] != o["nudge_id"]:
         return False
     if n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"]:
         return False
@@ -1309,6 +1318,40 @@ def confirm_cap_check(cur: dict, capped: List[dict], now: float, host: str = "")
     return out
 
 
+def _nid(n: dict) -> dict:
+    return {"nudge_id": n["nudge_id"]} if n.get("nudge_id") else {}
+
+
+def _mark(opened: dict, n: dict, key: str) -> None:
+    if n.get("nudge_id") in opened:
+        opened[n["nudge_id"]][key] = 1
+
+
+def close_open_nudges(home: Path, opened: dict, now: float) -> None:
+    """Write the missing delivery / outcome record of every nudge whose backend will never write it: its turn provably
+    died (_turn_lost, from HANDOFF_GRACE_S on) or it is still open after NUDGE_OPEN_S (the backend exited or reloaded
+    and never checked the session again). Closed nudges leave `opened`."""
+    for nid, n in list(opened.items()):
+        if n.get("d") and n.get("o"):
+            del opened[nid]
+            continue
+        age = now - float(n.get("ts") or 0)
+        if age <= HANDOFF_GRACE_S:
+            continue
+        why = _turn_lost(home, n) or ("never_rechecked" if age > NUDGE_OPEN_S else None)
+        if not why:
+            continue
+        base = {"ts": now, "session_id": n.get("session_id") or "", "rule": n.get("rule") or "", "reason": why,
+                "nudge_id": nid, "nudge_ts": n.get("ts"), "by": "signals",
+                **({"draft_id": n["draft_id"]} if n.get("draft_id") else {})}
+        if not n.get("d"):
+            _coach_log(home, {**base, "event": "reply_nudge_undelivered"})
+        if not n.get("o"):
+            _coach_log(home, {**base, "event": "nudge_outcome_missing" if why == "never_rechecked" else "nudge_outcome_lost",
+                              **({"filed": True} if n.get("filed") else {})})
+        del opened[nid]
+
+
 def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     """fixloop_card events file at once. A reply_check nudge (any rule in OUTCOME_RULES) is the guard WORKING (the
     agent was sent back to fix its reply), so it files only when its reply_nudge_outcome says the revised reply still
@@ -1320,8 +1363,10 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
     pending: List[dict] = list(cur.get("coach_handoff_pending") or [])
     nudges: List[dict] = []
     capped: List[dict] = []
+    opened: dict = dict(cur.get("coach_nudge_open") or {})  # nudge_id -> nudge still missing a delivery/outcome record
     for ln in read_new(home / "coach" / "log.jsonl", cur, "coach", now):
-        if '"fixloop_card"' not in ln and '"reply_nudge' not in ln and '"report_only_confirm_capped"' not in ln:
+        if ('"fixloop_card"' not in ln and '"reply_nudge' not in ln and '"report_only_confirm_capped"' not in ln
+                and '"nudge_outcome_' not in ln):
             continue
         try:
             r = json.loads(ln)
@@ -1336,6 +1381,17 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
         rule = r.get("rule")
         if r.get("event") == "reply_nudge" and rule:
             nudges.append(r)
+        nid = r.get("nudge_id")
+        if nid and r.get("event") == "reply_nudge":
+            opened[nid] = {**{k: r.get(k) for k in ("session_id", "rule", "draft_id", "platform")}, "nudge_id": nid,
+                           "ts": at, "d": 0, "o": 0}
+        elif nid and nid in opened and r.get("event") in NUDGE_DELIVERY:
+            opened[nid]["d"] = 1
+        elif nid and nid in opened and r.get("event") in NUDGE_OUTCOME:
+            opened[nid]["o"] = 1
+        if nid and r.get("event") in NUDGE_OUTCOME and r.get("event") != "reply_nudge_outcome":
+            # the backend closed it without a revision (dead/ended turn): not an agent that ignored the nudge
+            pending = [n for n in pending if n.get("nudge_id") != nid]
         if r.get("event") == "fixloop_card":
             issue = str(r.get("issue") or "a fix that keeps failing")
             out.append({"kind": "coach", "component": "agent", "at": at, "session_id": r.get("session_id") or "",
@@ -1344,7 +1400,8 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                                    f"{r.get('n') or 2}nd confirmed failure: {issue}"[:1500],
                         "fp": fp("agent", "fixloop", r.get("session_id") or "", issue[:80])})
         elif r.get("event") == "reply_nudge" and rule in OUTCOME_RULES and (rule == "handoff" or r.get("outcome")):
-            pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id", "platform")},
+            pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id", "platform",
+                                                     "nudge_id")},
                             "ts": at})
         elif r.get("event") == "reply_nudge_outcome" and rule in OUTCOME_RULES:
             n = next((n for n in pending if _outcome_matches(n, r)), None)
@@ -1353,7 +1410,9 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
             pending.remove(n)
             if r.get("resolved") is not True and subagent_session(home, n):
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "session_id": n.get("session_id") or "",
-                                  "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id")})
+                                  "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
+                                  **_nid(n)})
+                _mark(opened, n, "o")
             elif r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"
                 why = f"the revised reply {still} (outcome p={r.get('p')})"
@@ -1369,7 +1428,8 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                 # agent-ee1b1162bc: a subagent's report to its parent agent is not a user-facing defect (any rule)
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "reason": "no_outcome",
                                   "session_id": n.get("session_id") or "", "rule": n.get("rule"),
-                                  "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id")})
+                                  "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"), **_nid(n)})
+                _mark(opened, n, "o")
                 continue
             lost = _turn_lost(home, n)
             if lost:
@@ -1378,8 +1438,10 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                 # death; it is not an agent that ignored a nudge.
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_lost", "reason": lost,
                                   "session_id": n.get("session_id") or "", "rule": n.get("rule") or "handoff",
-                                  "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id")})
+                                  "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"), **_nid(n)})
+                _mark(opened, n, "o")
                 continue
+            _mark(opened, n, "filed")
             out.append(_handoff_signal({**n, "no_outcome": True},
                                        f"no outcome logged within {HANDOFF_GRACE_S // 60} min of the nudge"))
         else:
@@ -1388,6 +1450,11 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
         cur["coach_handoff_pending"] = keep
     else:
         cur.pop("coach_handoff_pending", None)
+    close_open_nudges(home, opened, now)
+    if opened:
+        cur["coach_nudge_open"] = opened
+    else:
+        cur.pop("coach_nudge_open", None)
     out += template_holds(cur, nudges, now, host)
     out += confirm_cap_check(cur, capped, now, host)
     return out
