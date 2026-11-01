@@ -775,3 +775,40 @@ def test_kanban_db_write_hint_lands_on_the_same_call_via_transform(tmp_path, mon
     c = coach(tmp_path)
     c.check_kanban_db_write("s1", "terminal", {"command": "sqlite3 kanban.db 'DELETE FROM task_events WHERE id=3'"})
     assert "contract_waiver" in (c.take("s1") or "")
+
+
+# desktop-13785ebc41: an inline rating page sent 333 ratings in one hermes.send (over the 500-char cap), ignored the
+# {ok:false} ack, and promised localStorage saving the sandboxed frame blocks; every rating was lost. Writing such a
+# widget gets the widget rules once per file, on the write_file/patch result itself.
+_WIDGET_UNCHECKED = "<button onclick=\"hermes.send(JSON.stringify(ratings))\">Submit</button>"
+_WIDGET_STORAGE = ("<script>localStorage.setItem('r', JSON.stringify(r));"
+                   "async function go(){const a = await window.hermes.send('rate 1 5'); if(!a.ok) show(a.error)}</script>")
+_WIDGET_CLEAN = ("<script>async function go(c){for (const part of c){const a = await window.hermes.send(part);"
+                 "if(!a.ok) show(a.error)}}\nfunction one(){hermes.send('next').then(a => a.ok || show(a.error))}"
+                 "</script><button data-hermes-send=\"refresh\">R</button>")
+
+
+@pytest.mark.parametrize("content, issue", [(_WIDGET_UNCHECKED, "never reads"), (_WIDGET_STORAGE, "localStorage")])
+def test_widget_send_hint_fires_on_unchecked_send_or_storage(tmp_path, content, issue):
+    c = coach(tmp_path)
+    args = {"path": "/tmp/rate/ratings.html", "content": content}
+    c.check_widget_send("s1", "write_file", args)
+    hint = c.take("s1") or ""
+    assert issue in hint and "500 characters" in hint and "{ok:false" in hint and "ratings.html" in hint
+    c.check_widget_send("s1", "write_file", args)
+    assert c.take("s1") is None  # once per file
+
+
+def test_widget_send_hint_quiet_on_clean_widget_and_non_widgets(tmp_path):
+    c = coach(tmp_path)
+    c.check_widget_send("s1", "write_file", {"path": "/tmp/w.html", "content": _WIDGET_CLEAN})
+    c.check_widget_send("s1", "write_file", {"path": "/tmp/notes.md", "content": _WIDGET_UNCHECKED})
+    c.check_widget_send("s1", "write_file", {"path": "/tmp/plain.html", "content": "<script>localStorage.x=1</script>"})
+    c.check_widget_send("s1", "terminal", {"command": "echo hermes.send(x) > a.html"})
+    assert c.take("s1") is None
+
+
+def test_widget_send_hint_covers_patch_and_observe(tmp_path):
+    c = coach(tmp_path)
+    c.observe("s1", "patch", {"path": "/tmp/w.htm", "old_string": "a", "new_string": _WIDGET_UNCHECKED}, OK)
+    assert "never reads" in (c.take("s1") or "")

@@ -68,6 +68,12 @@ HINTS = {
     "plan_first": ("Plan Before You Build: this is a new build request and the user has not seen a plan yet. Stop "
                    "editing, post the plan (approach, files, how it gets tested) as your reply and end the turn for "
                    "the user's go. Someone else's approval (a reviewer, a cut PR) does not replace it."),
+    "widget_send": ("{path} is a chat widget that calls hermes.send but {issue}. Widget rules: hermes.send takes at "
+                    "most 500 characters and one per second, and returns a Promise of {{ok:true}} or "
+                    "{{ok:false,error,retryAfterMs}}: await it, retry after retryAfterMs when throttled, show the "
+                    "user any other failure, and send large data in chunks. The frame is sandboxed, so "
+                    "localStorage/sessionStorage are unavailable: keep state with yourself (write it into the "
+                    "widget's file) and never promise local saving."),
 }
 
 # plan_first: a new build ask (a build verb plus a real spec), not a fix/bug report and not already a go.
@@ -690,6 +696,36 @@ KANBAN_DB_RE = re.compile(r"kanban[\w./-]*\.db\b|\bkanban\.db\b", re.I)
 KANBAN_SQL_WRITE_RE = re.compile(r"\b(UPDATE\s+(tasks|task_runs|task_events)\b|INSERT\s+(OR\s+\w+\s+)?INTO\s+"
                                  r"(tasks|task_runs|task_events)\b|DELETE\s+FROM\s+(tasks|task_runs|task_events)\b)",
                                  re.I)
+
+
+_WIDGET_FILE_RE = re.compile(r"\.(?:html?|xhtml)$", re.I)
+_WIDGET_SEND_RE = re.compile(r"\bhermes\.send\s*\(")
+_WIDGET_STORAGE_RE = re.compile(r"\b(?:localStorage|sessionStorage)\b")
+
+
+def widget_send_issue(tool: str, args: dict) -> Optional[tuple[str, str]]:
+    """(path, issue) when a write_file/patch to an .html file calls hermes.send( and either never reads a call's
+    result (no `await`/`return` just before it and no `.then(` soon after) or uses localStorage/sessionStorage;
+    else None (desktop-13785ebc41). data-hermes-send attributes alone never count: they are fire-and-forget by
+    design, and the frame now shows their refusals itself."""
+    if tool == "write_file":
+        text = str(args.get("content") or "")
+    elif tool == "patch":
+        text = str(args.get("new_string") or "")
+    else:
+        return None
+    path = str(args.get("path") or "")
+    if not _WIDGET_FILE_RE.search(path) or not _WIDGET_SEND_RE.search(text):
+        return None
+    for m in _WIDGET_SEND_RE.finditer(text):
+        before = text[max(0, m.start() - 40):m.start()]
+        before = re.sub(r"window\.$", "", before.rstrip())
+        if re.search(r"\b(?:await|return)\s*$", before) or ".then(" in text[m.end():m.end() + 400]:
+            continue
+        return Path(path).name, "never reads its {ok} result, so a refused send fails silently"
+    if _WIDGET_STORAGE_RE.search(text):
+        return Path(path).name, "relies on localStorage/sessionStorage, which the sandboxed frame blocks"
+    return None
 
 
 def writes_kanban_db(tool: str, args: dict) -> bool:
@@ -1323,6 +1359,15 @@ class AgentCoach:
         if sid and writes_kanban_db(tool, args if isinstance(args, dict) else {}):
             self._fire(self._s(sid), sid, "kanban_db_write", "session")
 
+    def check_widget_send(self, sid: str, tool: str, args: Any) -> None:
+        """widget_send rule (once per widget file): a chat widget that ignores hermes.send's ack or relies on browser
+        storage. Also run from transform_tool_result so the hint lands on the write itself."""
+        if not sid:
+            return
+        hit = widget_send_issue(tool, args if isinstance(args, dict) else {})
+        if hit:
+            self._fire(self._s(sid), sid, "widget_send", hit[0], path=hit[0], issue=hit[1])
+
     def check_plan_first(self, sid: str, tool: str, args: Any) -> None:
         """plan_first rule for one call (also run from transform_tool_result, so the hint lands on this call)."""
         if not sid:
@@ -1377,6 +1422,7 @@ class AgentCoach:
         # live_checkout (once per session)
         self.check_live(sid, tool, args)
         self.check_kanban_db_write(sid, tool, args)
+        self.check_widget_send(sid, tool, args)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
         if tool == "clarify":
             d = _as_dict(result) or {}
