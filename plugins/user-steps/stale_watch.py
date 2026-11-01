@@ -3,6 +3,10 @@
 
 Detection countermeasure for desktop-1321064734. Run periodically on EVERY gateway (action stores
 are per host), e.g. from cron: `python3 ~/.hermes/plugins/user-steps/stale_watch.py`.
+The CLI checks gateway identity before any store access. A bare Python automatically re-execs once
+through the installed `hermes --print-runtime-command` runtime (including bootstrap and dependencies);
+keep the launcher installed at ~/.local/bin/hermes or on PATH. Unavailable identity is JSON status 503
+(process exit 2), never a foreign-owner 409; neither withdrawal nor review writes in that case.
 
 Reads chat.answered_open() (the set behind /ping stale.answeredOpen) directly, no HTTP or token. For
 each request whose user reply is older than --min-age (default 1 h) it creates an agent-owned Kanban
@@ -24,6 +28,9 @@ card-bound requests and owners not on this gateway) or `--reviewed ID --reason .
 old_ask_reviews; hides the request from the review for 7 days, it stays open).
 """
 import argparse
+import ast
+import os
+import shutil
 import importlib.util
 import json
 import sqlite3
@@ -269,10 +276,7 @@ def old_asks(core, store, now=None, *, min_age=OLD_ASK_AGE, window=REVIEW_WINDOW
 
 
 def _local_gateway(core):
-    try:
-        return core.server_owner('old-ask-review')['gatewayId']
-    except Exception:
-        return None  # unknown identity: every owner is treated as foreign (nothing read, nothing withdrawn)
+    return core.server_owner('old-ask-review')['gatewayId']
 
 
 def _owner_db(core, owner):
@@ -388,6 +392,9 @@ def review_card(items, now):
             f"   `python3 {script} --withdraw <id> --reason \"<why>\" --evidence \"<card id / quote / date>\"`\n"
             f"2. Otherwise keep it: `python3 {script} --reviewed <id> --reason \"<why it is still a live ask>\" "
             f"--evidence \"<what you checked>\"` (hides it from this review for 7 days; it stays open for the user).\n"
+            f"These python3 commands automatically re-exec through the installed Hermes launcher if needed. "
+            f"A 503 gateway-identity error is an agent runtime problem: repair the launcher/runtime and retry; "
+            f"do not record a kept review because of that error. "
             f"Never decide a request for the user. Withdrawal is refused for recorded decisions and card-bound "
             f"requests. A chat that is on another gateway, unknown or unreadable is not evidence: keep those.\n"
             f"Source: plugins/user-steps/stale_watch.py (old-ask review).")
@@ -530,6 +537,53 @@ def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_car
     return opened
 
 
+def _runtime_command(argv):
+    """Ask the installed launcher to resolve/lease its runtime; never pin a dependency generation."""
+    launcher = Path.home() / '.local' / 'bin' / 'hermes'
+    if not launcher.is_file():
+        found = shutil.which('hermes')
+        if not found:
+            raise RuntimeError('installed hermes launcher not found')
+        launcher = Path(found)
+    result = subprocess.run([str(launcher), '--print-runtime-command', '--module', 'runpy'],
+                            text=True, capture_output=True, timeout=30, check=True)
+    cmd = json.loads(result.stdout)
+    if (not isinstance(cmd, list) or len(cmd) != 4 or not all(isinstance(x, str) for x in cmd)
+            or cmd[1:3] != ['-I', '-c']):
+        raise ValueError('unsupported hermes runtime command')
+    tree = ast.parse(cmd[3])
+    entry = tree.body[-1]
+    expected = ast.parse("runpy.run_module('runpy', run_name='__main__', alter_sys=True)").body[0]
+    if ast.dump(entry) != ast.dump(expected):
+        raise ValueError('unsupported hermes runtime entry point')
+    # Retain the launcher's bootstrap, home selection and dependency lease exactly; replace only the entry.
+    tree.body[-1:] = ast.parse("sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')").body
+    cmd[3] = ast.unparse(tree)
+    return [*cmd, str(Path(__file__).resolve()), *argv]
+
+
+def _require_identity(core, argv=None):
+    try:
+        gateway = _local_gateway(core)
+        if not gateway:
+            raise ValueError('Missing gateway identity')
+        return gateway
+    except Exception as exc:
+        cause = exc.__cause__ or exc
+        recovery = ''
+        if argv is not None and not os.environ.get('USER_STEPS_RUNTIME_REEXEC'):
+            try:
+                cmd = _runtime_command(argv)
+                env = dict(os.environ, USER_STEPS_RUNTIME_REEXEC='1')
+                os.execve(cmd[0], cmd, env)
+            except Exception as retry_exc:
+                recovery = f'; runtime recovery failed: {retry_exc}'
+        raise core.ActionError(
+            f'gateway identity unavailable under {sys.executable}: {cause}{recovery}; '
+            'retry python3 ~/.hermes/plugins/user-steps/stale_watch.py with the same arguments '
+            'after restoring the installed hermes launcher (hermes --print-runtime-command)', 503) from exc
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--min-age', type=int, default=MIN_AGE, help='seconds since the user reply (default 3600)')
@@ -546,13 +600,18 @@ def main(argv=None):
     if a.withdraw and a.reviewed:
         print(json.dumps({'error': 'use --withdraw or --reviewed, not both'}))
         return 2
+    try:
+        local_gateway = _require_identity(core, sys.argv[1:] if argv is None else argv)
+    except core.ActionError as exc:
+        print(json.dumps({'error': str(exc), 'status': exc.status}))
+        return 2
     if a.withdraw or a.reviewed:
-        store = _store(core)
         try:
+            store = _store(core)
             if a.withdraw:
                 owner = _find(core, store, a.withdraw)[0]
                 v = withdraw_old(core, store, a.withdraw, reason=a.reason, evidence=a.evidence,
-                                 local_gateway=_local_gateway(core), ledger=_ledger(core, owner))
+                                 local_gateway=local_gateway, ledger=_ledger(core, owner))
                 print(json.dumps({'withdrawn': v}))
             else:
                 print(json.dumps({'reviewed': mark_reviewed(core, store, a.reviewed, reason=a.reason,

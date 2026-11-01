@@ -252,6 +252,14 @@ Retirement paths and evidence review:
   `stale_watch.py --withdraw <requestId> --reason <text> --evidence <text>`
   (records `by='hygiene'`; refuses recorded decisions and card-bound requests), or
   `stale_watch.py --reviewed <requestId> --reason <text> --evidence <text>`.
+  Run these as `python3 ~/.hermes/plugins/user-steps/stale_watch.py <arguments>` on the owning gateway.
+  Before accessing any store the CLI checks identity and, if unavailable, re-execs once through the installed
+  `hermes --print-runtime-command` launcher runtime, retaining its bootstrap/dependency selection and arguments.
+  No install hash or dependency-generation path is pinned. If recovery fails, JSON status **503** (exit 2)
+  names the interpreter/cause; neither mutation writes. Repair the runtime and retry rather than marking
+  the ask kept. Only a known, different gateway gets **409** on withdrawal.
+  `tests/test_stale_watch_runtime.py` exercises bare-interpreter re-exec, both mutation failure paths with
+  unchanged stores, bounded recovery failures, detection preflight and genuine foreign-owner rejection.
   Review timestamps are revision-specific. `--dry-run` is read-only and cannot be combined
   with either mutation command. `tests/test_old_ask_review.py` covers selection, daily
   card creation, owner/card metadata, CLI refusal/withdrawal and retained-request reviews.
