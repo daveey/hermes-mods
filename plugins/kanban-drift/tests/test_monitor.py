@@ -100,6 +100,47 @@ def test_command_contract(code, payload, available):
     assert bool(report.get("unavailable")) is (not available)
 
 
+def test_native_tools_create_readback_and_restart_dedup(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    # The native tool's canonical path, not just HERMES_HOME, must be isolated.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("platform_toolsets:\n  cli: [terminal, file, kanban]\nterminal:\n  backend: local\n")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    path = kb.kanban_db_path()
+    assert path.is_relative_to(tmp_path)
+    from agent.delegation_context import kanban_path_is_fenced
+    assert not kanban_path_is_fenced(path)
+    conn = kbc.connect(path)
+    conn.close()
+    state = tmp_path / "drift.json"
+    m = monitor.Monitor(state, monitor.native_tool)
+    assert m.sample("fixture/default", DIRTY)["card"] is None
+    card = m.sample("fixture/default", DIRTY)["card"]
+    result = monitor.native_tool("kanban_show", {"task_id": card, "board": "default"})
+    assert result["task"]["title"] == "Repair persistent Kanban sync drift: fixture/default"
+    assert monitor.Monitor(state, monitor.native_tool).sample("fixture/default", DIRTY)["card"] == card
+    conn = kbc.connect(path)
+    try:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_main_owner_guard_before_state_write(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import kanban_sync_client as client
+    config = tmp_path / "config.json"
+    state = tmp_path / "state.json"
+    config.write_text(json.dumps({"owner_gateway": "owner", "state_path": str(state), "targets": {}}))
+    monkeypatch.setattr(sys, "argv", ["monitor", "--config", str(config)])
+    monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="other"))
+    with pytest.raises(RuntimeError, match="owner gateway"):
+        monitor.main()
+    assert not state.exists()
+
+
 def test_invalid_output_and_unreachable_are_unavailable():
     assert monitor.collect([sys.executable, "-c", "print('not json')"])["unavailable"]
     assert monitor.collect(["/nonexistent/drift-fixture"])["unavailable"]
