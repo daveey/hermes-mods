@@ -468,7 +468,97 @@ def _await_window(job: Path, secs: float) -> bool:
         time.sleep(0.1)
 
 
+def _signed_opener_python() -> Path | None:
+    """Optional installed app; never request a grant or install an app here."""
+    import plistlib
+
+    app = Path(os.environ.get("HERMES_USER_TERMINAL_OPENER_APP") or
+               str(Path.home() / "Applications" / "Hermes Python.app"))
+    try:
+        info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+        binary = app / "Contents/MacOS" / info["CFBundleExecutable"]
+        if binary.is_file():
+            return binary
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _open_via_launchd(job: Path, python: Path, caller: dict) -> str:
+    """Relay only opening, not job ownership, to a one-shot GUI launchd process."""
+    import plistlib
+
+    job = job.resolve()
+    label = "org.hermes.user-terminal.opener." + uuid.uuid4().hex
+    target = f"gui/{os.getuid()}/{label}"
+    result = job / "opener-result.json"
+    plist = job / "opener.plist"
+    env = {k: v for k, v in launch_env().items() if k in
+           ("HOME", "PATH", "HERMES_HOME", "HERMES_USER_TERMINAL", "HERMES_USER_TERMINAL_OPENER_APP")}
+    plist.write_bytes(plistlib.dumps({
+        "Label": label, "ProgramArguments": [str(python), str(Path(__file__).resolve()), "--open-window", str(job)],
+        "RunAtLoad": True, "KeepAlive": False, "EnvironmentVariables": env,
+        "StandardOutPath": str(job / "opener.log"), "StandardErrorPath": str(job / "opener.log"),
+    }))
+    try:
+        subprocess.run(["/bin/launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
+                       check=True, capture_output=True, text=True, timeout=10)
+        deadline = time.monotonic() + 3 * (OSA_TIMEOUT + OPEN_GRACE_S) + 20
+        while time.monotonic() < deadline:
+            if result.exists():
+                data = json.loads(result.read_text())
+                if data.get("ok"):
+                    return data["terminal"]
+                raise OpenFailed(data.get("error") or "signed opener failed", data.get("diagnosis") or caller)
+            if window_started(job):
+                return "signed app (runner started)"
+            time.sleep(0.1)
+        try:
+            caller = json.loads((job / "opener-responsibility.json").read_text())
+        except (OSError, ValueError):
+            pass
+        raise OpenFailed("signed opener timed out. " + _diagnosis_text(caller), caller)
+    except subprocess.SubprocessError as e:
+        raise OpenFailed(f"signed opener launch failed: {e}. " + _diagnosis_text(caller), caller) from e
+    finally:
+        # No persistent job/service, including on failure. A late runner still shares start.lock.
+        try:
+            subprocess.run(["/bin/launchctl", "bootout", target], capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("user_terminal: opener cleanup failed for %s: %s", target, e)
+
+
 def open_window(job: Path) -> str:
+    python = _signed_opener_python()
+    if python is None:
+        return _open_window_direct(job)
+    caller = osa_diagnosis()
+    (job / "opener-caller.json").write_text(json.dumps(caller))
+    responsible = (caller.get("responsible_process") or {}).get("path")
+    if python is not None and (not responsible or Path(responsible).resolve() != python.resolve()):
+        return _open_via_launchd(job, python, caller)
+    return _open_window_direct(job)
+
+
+def opener_main(job: Path) -> int:
+    """Fresh signed process: record actual OS responsibility before any Apple Events."""
+    diagnosis = osa_diagnosis()
+    (job / "opener-responsibility.json").write_text(json.dumps(diagnosis))
+    try:
+        python = _signed_opener_python()
+        responsible = (diagnosis.get("responsible_process") or {}).get("path")
+        if python is None or not responsible or Path(responsible).resolve() != python.resolve():
+            raise OpenFailed("launchd opener did not acquire signed-app responsibility", diagnosis)
+        result = {"ok": True, "terminal": _open_window_direct(job), "diagnosis": diagnosis}
+    except Exception as e:
+        result = {"ok": False, "error": str(e), "diagnosis": getattr(e, "diagnosis", None) or diagnosis}
+    tmp = job / "opener-result.tmp"
+    tmp.write_text(json.dumps(result))
+    tmp.replace(job / "opener-result.json")
+    return 0 if result["ok"] else 1
+
+
+def _open_window_direct(job: Path) -> str:
     """Open one window running this job. An opener that raises after its window started (osascript timed out
     centring it, say) counts as opened: the next app is never tried, so the job never gets a second window.
     osascript errors get a bounded OPEN_GRACE_S watch for a late window; other errors are checked once."""
@@ -1932,5 +2022,7 @@ def register(ctx) -> None:
 if __name__ == "__main__":
     import sys as _sys
 
+    if len(_sys.argv) == 3 and _sys.argv[1] == "--open-window":
+        _sys.exit(opener_main(Path(_sys.argv[2])))
     if len(_sys.argv) >= 3 and _sys.argv[1] == "--watchdog":  # --watchdog JOB [max_s] [interval]
         _sys.exit(watchdog_main(_sys.argv[2:]))

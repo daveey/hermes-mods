@@ -48,6 +48,9 @@ def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
 
 @pytest.fixture(autouse=True)
 def _confirm_env(monkeypatch):
+    # This suite tests direct terminal fallback. Responsibility routing has its own
+    # suite; never discover a developer's installed app behind mocked subprocesses.
+    monkeypatch.setattr(ut, "_signed_opener_python", lambda: None, raising=False)
     monkeypatch.delenv("HERMES_USER_TERMINAL_CONFIRM", raising=False)
     # No detached watchdogs from unit tests (they would judge fake runner pids); _watch() runs the real one.
     monkeypatch.setattr(ut, "spawn_watchdog", lambda job: None, raising=False)
