@@ -13,11 +13,11 @@ owner (compression root) is resolved to the route that conversation is on now:
   committed human turn (as core's route wakes and process completions do),
   re-checked against today's adapter, profile and authorization.
 * Previously adopted legacy CLI/TUI history uses the same local receipt, even
-  with no connected viewer. Unadopted inline history stays pending: core's
-  ``resolve_local_target`` requires an authenticated owner transport and refuses
-  an active inline owner. A producer must not fabricate that transport or bypass
-  its liveness fence. API-server sessions and moved routes also stay pending;
-  none is receipted as delivered.
+  with no connected viewer. Unadopted inline history enters core's trusted
+  producer ingress without a published gateway, including while an inline owner
+  is active. Core queues the notice for its owning runtime; this plugin neither
+  adopts the session nor executes its turn. Routed sessions retain the gateway
+  authority, and moved routes stay pending rather than being marked delivered.
 
 Retries are classified. ``Unavailable`` (process-local or transient) and
 ``Blocked`` (route/support) both leave the outbox pending; a job-specific failure
@@ -279,6 +279,38 @@ async def admit(runner, authority, payload):
     return {'status': 'admitted', 'admission_id': row['admission_id'], 'session_id': owner}
 
 
+def admit_producer(payload, home):
+    """Core owns legacy routing and durability; no gateway publication is needed to queue.
+
+    None means routed, not delivered. Read back the same producer after admission
+    (and before a retry) so a lost acknowledgment cannot create a second notice.
+    """
+    try:
+        from hermes_state_producer_admission import (
+            admit_producer_completion, read_producer_admission, payload_digest)
+    except ImportError as exc:
+        raise Unavailable('producer_ingress_unavailable') from exc
+    args = {'producer': payload['identity'], 'profile_home': Path(home)}
+    result = read_producer_admission(**args)
+    if result['outcome'] == 'absent':
+        result = admit_producer_completion(**args, stored_session_id=payload['session_id'], text=payload['text'])
+        if result['outcome'] == 'admitted':
+            result = read_producer_admission(**args)
+    outcome = result['outcome']
+    if outcome == 'admitted':
+        if result.get('payload_digest') != payload_digest(payload['text']):
+            raise Blocked('admission_payload_mismatch')
+        return {'status': 'admitted', 'session_id': result['owner'],
+                'producer': payload['identity'], 'ingress': 'producer_completion'}
+    if outcome == 'routed':
+        return None
+    if outcome == 'missing':
+        return {'status': 'missing', 'session_id': payload['session_id'], 'reason': result.get('reason')}
+    if outcome == 'retry':
+        raise Unavailable('producer_' + result.get('reason', 'retry'))
+    raise Unavailable('producer_admission_not_committed')
+
+
 def deliver(job, status, owner, home, clean_output):
     if owner.get('kind') != 'session' or not owner.get('session_id'):
         return
@@ -288,17 +320,6 @@ def deliver(job, status, owner, home, clean_output):
     pending = _read_json(job / PENDING)
     if pending and float(pending.get('next_at') or 0) > time.time():
         raise Unavailable('backoff')
-    # Process-local: another process may own this home's gateway, so no per-job state here.
-    runner, authority = runtime(home)
-    loop = runner._gateway_loop
-    if loop is None or loop.is_closed() or not runner._running:
-        raise Unavailable('gateway loop unavailable')
-    try:
-        current = asyncio.get_running_loop()
-    except RuntimeError:
-        current = None
-    if current is loop:
-        raise Unavailable('delivery requires off-loop caller')
     with (job / 'completion.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -323,10 +344,22 @@ def deliver(job, status, owner, home, clean_output):
                          f'job_id: {job.name}\nstatus: {status["status"]}\n'
                          f'exit_code: {status.get("exit_code")}\nOutput tail:\n{tail}')}
             save(outbox, payload)
-        # Timeout does not cancel an admitted turn. A retry consults the same key.
-        future = asyncio.run_coroutine_threadsafe(admit(runner, authority, payload), loop)
         try:
-            result = future.result(timeout=20)
+            result = admit_producer(payload, home)
+            if result is None:  # Core says routed: retain the gateway's existing authority/FIFO.
+                runner, authority = runtime(home)
+                loop = runner._gateway_loop
+                if loop is None or loop.is_closed() or not runner._running:
+                    raise Unavailable('gateway loop unavailable')
+                try:
+                    current = asyncio.get_running_loop()
+                except RuntimeError:
+                    current = None
+                if current is loop:
+                    raise Unavailable('delivery requires off-loop caller')
+                # Timeout does not cancel an admitted turn. A retry consults the same key.
+                future = asyncio.run_coroutine_threadsafe(admit(runner, authority, payload), loop)
+                result = future.result(timeout=20)
         except Exception as exc:
             err = classify(exc)
             _defer(job, err, exc)

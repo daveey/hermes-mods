@@ -32,12 +32,16 @@ is suppressed in these isolated tests; they do not prove live chat delivery.
 Native messaging tests now exercise borrowed committed-route provenance,
 current authorization/profile checks, deduplication, and transient/blocked retry
 backoff. Previously adopted legacy CLI/TUI history uses the local receipt even
-without a viewer. Unadopted inline TUI history remains pending: core adoption
-requires authenticated owner transport and refuses a live inline owner. Tests
-preserve those fences rather than fabricating viewer identity. A core trusted
-producer ingress is still required for that case; this is incomplete scope, not
-an accepted limitation. Remote-courier completion, real iTerm chat/worker
-acceptance, and deployed-backend verification remain unverified.
+without a viewer. Unadopted CLI/TUI history enters core's trusted
+`hermes_state_producer_admission` ingress, including with an active inline owner
+or no published gateway. This requires core's trusted producer ingress (landed
+in `c4565ec4d728`); a missing API leaves the job pending, not falsely delivered.
+The plugin freezes the text and reads back the producer receipt before recording
+local success. Core's `admitted` means durable queueing, not a completed model
+turn; `routed` uses the existing gateway FIFO with the same identity, `missing`
+is terminal, and `retry` backs off. The plugin does not adopt legacy sessions or
+fabricate authenticated owner transport. Remote-courier completion, real iTerm
+chat/worker acceptance, and deployed-backend verification remain unverified.
 
 ## Tests
 
@@ -59,6 +63,12 @@ rollback/retry, late block, repeated-pass dedup, and unrelated-card exclusion.
 `test_session_completion.py` uses real core authority and SQLite admission, not a
 mocked notification helper. `test_completion_lifecycle.py` covers host publication,
 plugin unload, managed-worker exclusion, and foreign profile isolation.
+`test_legacy_completion.py` uses real core SQLite ingress to verify both sweep
+and final-watch entry points for CLI/TUI, active/cold owners, with/without gateway
+publication, missing sessions, lost admission replies, retry backoff, and frozen
+text deduplication. Adopted history still uses the gateway automation FIFO;
+unauthenticated adoption and active-inline-owner adoption remain refused.
+These tests verify queued admission, not core's subsequent inline turn execution.
 
 ## Why the result was lost
 
