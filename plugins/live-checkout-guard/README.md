@@ -93,10 +93,15 @@ live index or HEAD. Raw `git stash` mutations remain refused. Raw `update-ref` o
 live checkout. The helper is an ordinary maintained script, not a blanket shell
 allowlist or a guard-disable switch.
 
-Use Python 3 on Linux or macOS and a Git version supporting prepared `update-ref`
-transactions and `rev-parse --show-ref-format` (tested on Git 2.55 on Linux; the
-complete helper has not yet been exercised on macOS). Only the files ref backend
-is supported; shallow repositories are refused.
+Use Python 3.9 or newer on Linux or macOS (an unqualified `python3` is 3.9 on stock
+macOS; older interpreters are refused by `reconcile.py` with exit 2 and by
+`stash_retirement.py` at import, before the lock or any archive/ref write) and a Git
+version supporting prepared `update-ref` transactions and `rev-parse
+--show-ref-format` (tested on Git 2.55 on Linux, and the full helper test suite on
+macOS with Apple Git 2.54 and `/usr/bin/python3` 3.9.6). Only the files ref backend
+is supported; shallow repositories
+are refused. The `live-checkout-guard` GitHub workflow runs the helper suites on
+Python 3.9 and 3.14.
 
 The existing archive directory must be **outside** the checkout and Git directory.
 Its `manifest.json` is a JSON list with one row for **every** current stash:
@@ -158,8 +163,14 @@ stash's disposition by itself.
 
 Tests: `tests/test_stash_retirement.py` exercises archive rejection, independent
 bundle recovery after GC, native writer races, lost replies, process death,
-partial commits and unchanged checkout/index/HEAD. `tests/test_retirement_cli.py`
-exercises all three CLI modes plus terminal/execute-code guard checks. Existing
+partial commits and unchanged checkout/index/HEAD; `TransactionPipeLifecycleTests`
+covers repeated EOF/wait, retry after a wait timeout (child left alive, never
+killed), stderr retention and no use of `Popen.communicate` (on Python 3.9 it
+flushed the already-closed stdin after a committed deletion, then failed again on
+retry). `tests/test_retirement_cli.py` exercises all three CLI modes on the running
+interpreter and on Python 3.9 (`HERMES_MODS_PY39` or `python3.9`; skipped locally
+when absent, a failure under `CI`), the pre-mutation old-interpreter refusal, plus
+terminal/execute-code guard checks. Existing
 `tests_reconcile.py` retains the separate file-reconciliation constraints.
 
 ## Limitations (best-effort, not a sandbox)

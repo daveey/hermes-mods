@@ -2,8 +2,10 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 
 # Reuse only the synthetic fixture, not its test classes.
@@ -35,6 +37,46 @@ class TestCLI(Base):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(json.loads(p.stdout), {'completed': [], 'aborted': []})
         self.assertEqual(self.checkout(), self.before_checkout)
+
+    def test_old_python_refused_before_any_mutation(self):
+        # Preflight runs before argparse, the lock or any archive/ref write.
+        stub = ('import runpy, sys; sys.version_info = (3, 8, 18, "final", 0); '
+                'sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")')
+        before = sorted(p.name for p in self.archive.iterdir())
+        for mode in (('--prepare-stash-retirement',), ('--retire-stashes', '--oid', self.oids[0]),
+                     ('--recover-stash-retirement',)):
+            with self.subTest(mode=mode):
+                p = subprocess.run([sys.executable, '-c', stub, str(HERE / 'reconcile.py'), '--root', str(self.root),
+                                    '--archive', str(self.archive), *mode], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn('needs Python 3.9 or newer', p.stderr)
+                self.assertEqual(self.stack(), self.before_stack)
+                self.assertEqual(self.checkout(), self.before_checkout)
+                self.assertEqual(sorted(x.name for x in self.archive.iterdir()), before)
+                self.assertFalse((self.home / '.hermes-sync.lock').exists())
+
+    def test_prepare_retire_recover_on_oldest_supported_python(self):
+        """The advertised invocation is an unqualified python3 (3.9 on stock macOS)."""
+        py = os.environ.get('HERMES_MODS_PY39') or shutil.which('python3.9')
+        if not py:
+            if os.environ.get('CI'):
+                self.fail('CI must provide Python 3.9 (python3.9 or HERMES_MODS_PY39)')
+            raise unittest.SkipTest('no Python 3.9 interpreter found')
+        ver = subprocess.run([py, '-c', 'import sys; print(sys.version_info[:2])'], capture_output=True, text=True)
+        self.assertEqual(ver.stdout.strip(), '(3, 9)', ver.stderr)
+        run = lambda *a: subprocess.run([py, str(HERE / 'reconcile.py'), '--root', str(self.root),
+                                         '--archive', str(self.archive), *a], capture_output=True, text=True)
+        p = run('--prepare-stash-retirement')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = run('--retire-stashes', '--oid', self.oids[1])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)['retired'], [self.oids[1]])
+        self.assertEqual([r.split()[0] for r in self.stack()], [o for o in self.oids if o != self.oids[1]])
+        p = run('--recover-stash-retirement')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout), {'completed': [], 'aborted': []})
+        self.assertEqual(self.checkout(), self.before_checkout)
+        self.assertEqual(self.hermes_refs(), [])
 
     def test_bad_cli_combinations_never_mutate(self):
         for args in [('--retire-stashes',), ('--oid', self.oids[0]),

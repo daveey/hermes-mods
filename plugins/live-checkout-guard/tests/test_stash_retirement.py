@@ -53,7 +53,9 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='stash-retire-test-')
         self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        # macOS: /var -> /private/var. Absolute manifest rows spelled through a symlinked
+        # archive parent are refused today (fail-closed; tracked separately), so use the real path.
+        self.base = Path(self.tmp.name).resolve()
         self.root = self.base / 'repo'
         self.root.mkdir()
         self.archive = self.base / 'archive'
@@ -1690,6 +1692,93 @@ class PartialCommitTests(Base):
         self.assertEqual(self.stack(), [])
         self.assertEqual(len(self.mod.recover(self.root, self.archive)['completed']), 1)
         self.assert_retired([self.target])
+
+
+class TransactionPipeLifecycleTests(Base):
+    """update-ref pipe lifecycle on every supported Python (3.9's Popen.communicate
+    flushed an already-closed stdin and could not be retried after that failure)."""
+
+    def txn(self):
+        txn = self.mod._Transaction(self.root)
+        self.addCleanup(self._reap, txn)
+        return txn
+
+    def _reap(self, txn):
+        try:
+            os.kill(txn.proc.pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        txn.close_and_wait(timeout=10)
+
+    def test_close_stdin_then_close_and_wait_repeatedly(self):
+        txn = self.txn()
+        txn.expect('start')
+        txn.close_stdin()
+        txn.close_stdin()
+        self.assertIsNone(txn.proc.stdin)
+        first = txn.close_and_wait()
+        self.assertTrue(txn.exited())
+        self.assertEqual(txn.proc.returncode, 0, first)
+        self.assertEqual(txn.close_and_wait(), first)
+        self.assertEqual(txn.close_and_wait(timeout=0), first)
+        txn.send('abort')  # after EOF: a no-op, never an AttributeError
+        txn.abort()
+        self.assert_unchanged()
+
+    def test_never_uses_popen_communicate(self):
+        def refuse(*a, **k):
+            raise AssertionError('Popen.communicate is not retry-safe on Python 3.9')
+        with patch.object(subprocess.Popen, 'communicate', refuse):
+            txn = self.txn()
+            txn.expect('start')
+            txn.close_stdin()
+            self.assertEqual(txn.close_and_wait(), 'exit 0')
+            txn.abort()
+
+    def test_stderr_kept_across_repeated_waits(self):
+        txn = self.txn()
+        txn.send('bogus-command')
+        first = txn.close_and_wait()
+        self.assertTrue(txn.exited())
+        self.assertNotEqual(txn.proc.returncode, 0)
+        self.assertIn('bogus', first)
+        self.assertEqual(txn.close_and_wait(), first)
+        self.assertEqual(txn.readline(0.1), b'')  # drained pipe: no reply, no ValueError
+
+    def test_timeout_leaves_child_alive_then_retry_reaps_it(self):
+        txn = self.txn()
+        txn.expect('start')
+        os.kill(txn.proc.pid, signal.SIGSTOP)
+        note = txn.close_and_wait(timeout=0.5)
+        self.assertIn('still running', note)
+        self.assertIn('never killed', note)
+        self.assertFalse(txn.exited())
+        self.assertIn('still running', txn.close_and_wait(timeout=0.2))  # retry after a timeout
+        txn.send('abort')  # stdin already detached: no AttributeError
+        os.kill(txn.proc.pid, signal.SIGCONT)
+        self.assertEqual(txn.close_and_wait(timeout=30), 'exit 0')
+        self.assertEqual(txn.proc.returncode, 0)
+        self.assert_unchanged()
+
+    def test_exited_child_with_pipes_held_elsewhere_returns_promptly(self):
+        # Stand-in child (not Git): exits at once while a background holder keeps the pipes.
+        txn = object.__new__(self.mod._Transaction)
+        txn.root, txn._buf, txn._err = self.root, b'', b''
+        txn.proc = subprocess.Popen(['sh', '-c', 'sleep 30 & echo held-err >&2; exit 3'],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    bufsize=0, start_new_session=True)
+        self.addCleanup(lambda: os.killpg(txn.proc.pid, signal.SIGKILL) if txn.proc.poll() is not None else None)
+        started = time.monotonic()
+        self.assertEqual(txn.close_and_wait(timeout=20), 'held-err')
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(txn.proc.returncode, 3)
+        self.assertEqual(txn.close_and_wait(timeout=20), 'held-err')
+
+    def test_import_refuses_python_older_than_contract(self):
+        with patch.object(sys, 'version_info', (3, 8, 18, 'final', 0)):
+            with self.assertRaisesRegex(RuntimeError, r'needs Python 3\.9 or newer.*nothing was changed'):
+                load_module()
+        self.assertEqual(self.mod.MIN_PYTHON, (3, 9))
 
 
 if __name__ == '__main__':

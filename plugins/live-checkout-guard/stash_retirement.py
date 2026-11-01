@@ -120,9 +120,18 @@ import re
 import select
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
+
+# Interpreter contract: the supported entry point is an unqualified ``python3``, which is
+# Python 3.9 on stock macOS (Xcode/CommandLineTools). 3.9 is the oldest tested version
+# (CI matrix); anything older is refused at import, before any lock, archive or ref write.
+MIN_PYTHON = (3, 9)
+if sys.version_info < MIN_PYTHON:
+    raise RuntimeError('stash retirement needs Python %d.%d or newer, not %s; nothing was changed'
+                       % (MIN_PYTHON + (sys.version.split()[0],)))
 
 VERSION = 1  # rows without a 'bundle' part fail the strict row-key check; re-run prepare
 FORMAT = 'hermes-stash-retirement-manifest'
@@ -790,6 +799,7 @@ class _Transaction:
     def __init__(self, root):
         self.root = root
         self._buf = b''
+        self._err = b''
         try:
             self.proc = subprocess.Popen(_argv(root, ['update-ref', '--stdin']), stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_env(),
@@ -798,13 +808,19 @@ class _Transaction:
             raise RetirementError('git update-ref could not run: ' + str(exc)) from exc
 
     def send(self, line):
+        stdin = self.proc.stdin
+        if stdin is None:
+            return  # EOF already sent: Git rolls back an uncommitted transaction.
         try:
-            _write_all(self.proc.stdin.fileno(), line.encode() + b'\n')
+            _write_all(stdin.fileno(), line.encode() + b'\n')
         except (BrokenPipeError, ValueError, OSError, RetirementError):
             pass  # The reply check reports the failure with Git's stderr.
 
     def readline(self, timeout):
         deadline = time.monotonic() + timeout
+        if self.proc.stdout is None or self.proc.stdout.closed:
+            line, sep, self._buf = self._buf.partition(b'\n')
+            return line + sep  # drained: no further reply can arrive
         fd = self.proc.stdout.fileno()
         while b'\n' not in self._buf:
             left = deadline - time.monotonic()
@@ -830,21 +846,57 @@ class _Transaction:
             raise RetirementError(f'update-ref {command} failed: {self.close_and_wait()}')
 
     def close_stdin(self):
+        """Send EOF once. The pipe is detached from the Popen so nothing (including
+        Popen.communicate on Python 3.9, which flushes stdin unconditionally) ever
+        touches the closed file again. Idempotent."""
+        stdin, self.proc.stdin = self.proc.stdin, None
+        if stdin is None:
+            return
         try:
-            if self.proc.stdin and not self.proc.stdin.closed:
-                self.proc.stdin.close()
-        except OSError:
+            stdin.close()
+        except (OSError, ValueError):
             pass
 
     def close_and_wait(self, timeout=None):
-        """EOF, then wait (bounded, no kill). Returns Git's stderr or a 'still running' note."""
+        """EOF, then wait (bounded, no kill). Returns Git's stderr or a 'still running' note.
+
+        Drains stdout/stderr with select + os.read and reaps with Popen.wait instead
+        of Popen.communicate, whose per-version internal state is not safe to retry
+        after a failure or a timeout. Safe to call repeatedly: stderr accumulates on
+        the instance and pipes closed at EOF are skipped on the next call."""
         self.close_stdin()
+        deadline = time.monotonic() + (TXN_TIMEOUT if timeout is None else timeout)
+        streams = {s.fileno(): s for s in (self.proc.stdout, self.proc.stderr) if s is not None and not s.closed}
+        err_fd = self.proc.stderr.fileno() if self.proc.stderr is not None and not self.proc.stderr.closed else None
+        while streams:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                if self.proc.poll() is None:
+                    return self._still_running()
+                break  # Git exited; a hook grandchild may still hold the pipes.
+            ready, _, _ = select.select(list(streams), [], [], min(left, 1.0))
+            if not ready and self.proc.poll() is not None:
+                break  # Git exited and wrote nothing more for 1s; something else holds the pipes.
+            for fd in ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b''
+                if not chunk:
+                    streams.pop(fd).close()
+                elif fd == err_fd:
+                    self._err += chunk
+                else:
+                    self._buf += chunk
         try:
-            _, err = self.proc.communicate(timeout=TXN_TIMEOUT if timeout is None else timeout)
+            self.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            return (f'update-ref pid {self.proc.pid} is still running and holds the sync lock; '
-                    'it was left to finish (never killed)')
-        return (err or b'').decode(errors='replace').strip() or f'exit {self.proc.returncode}'
+            return self._still_running()
+        return self._err.decode(errors='replace').strip() or f'exit {self.proc.returncode}'
+
+    def _still_running(self):
+        return (f'update-ref pid {self.proc.pid} is still running and holds the sync lock; '
+                'it was left to finish (never killed)')
 
     def exited(self):
         return self.proc.poll() is not None

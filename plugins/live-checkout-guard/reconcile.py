@@ -22,6 +22,14 @@ refuse observed new writers; arbitrary noncooperating filesystem writers cannot
 be locked out portably. Each replacement is atomic, not the whole multi-file set.
 Successful operations append reconcile-audit.jsonl inside the archive.
 """
+import sys
+
+MIN_PYTHON = (3, 9)  # oldest tested; stock macOS python3 is 3.9
+if sys.version_info < MIN_PYTHON:  # preflight: refuse before parsing or touching anything
+    sys.stderr.write('reconcile.py needs Python %d.%d or newer, not %s; nothing was changed\n'
+                     % (MIN_PYTHON + (sys.version.split()[0],)))
+    sys.exit(2)
+
 import argparse
 from datetime import datetime, timezone
 import json
