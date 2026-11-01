@@ -1589,6 +1589,119 @@ def test_withdraw_escalates_to_sigkill_for_verified_group(tmp_path, monkeypatch)
             pass
 
 
+def _wait_pid_file(path: Path, timeout: float = 5.0) -> int:
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            txt = path.read_text().strip()
+            if txt.isdigit():
+                return int(txt)
+        except OSError:
+            pass
+        time.sleep(0.05)
+    raise AssertionError(f"no pid in {path}")
+
+
+def _proc_gone(pid: int, timeout: float) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if not ut._pid_alive(pid) or "Z" in subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)],
+                                                           capture_output=True, text=True).stdout:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _killpg_quiet(pg: int) -> None:
+    try:
+        os.killpg(pg, 9)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+# The member ignores TERM (like a sudo deferring it inside pam_authenticate); bash/sleep inherit the ignore.
+_STUBBORN = "trap '' TERM; while :; do sleep 0.1; done"
+
+
+def test_withdraw_kills_term_ignoring_member_after_leader_dies_on_term(tmp_path, monkeypatch):
+    """(a) the session leader exits on SIGTERM, a group member ignores it: the member must not survive."""
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    pidf = tmp_path / "member.pid"
+    p = subprocess.Popen(["/bin/bash", "-c", f"/bin/bash -c \"{_STUBBORN}\" & echo $! > {pidf}; wait"],
+                         start_new_session=True)
+    # Reap the leader the moment it exits, as script(1) does for its child: an unreaped zombie leader still
+    # "verifies" and would hide the bug.
+    reaper = threading.Thread(target=p.wait, daemon=True)
+    reaper.start()
+    try:
+        member = _wait_pid_file(pidf)
+        time.sleep(0.3)
+        (job / "cmd.pgid").write_text(f"{p.pid} {ut._proc_start(p.pid)}\n")
+        assert os.getpgid(member) == p.pid
+        assert ut.withdraw_job(job, "gone")["status"] == "withdrawn"
+        reaper.join(5)
+        assert p.returncode == -15  # the leader died of the SIGTERM
+        assert _proc_gone(member, 5.0), "TERM-ignoring group member survived the withdrawal"
+    finally:
+        _killpg_quiet(p.pid)
+
+
+def test_withdraw_kills_member_when_leader_already_exited(tmp_path, monkeypatch):
+    """(b) the leader exited before the withdrawal while a member lives on in its group."""
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    pidf = tmp_path / "member.pid"
+    p = subprocess.Popen(["/bin/bash", "-c", f"/bin/bash -c \"{_STUBBORN}\" & echo $! > {pidf}; sleep 0.5"],
+                         start_new_session=True)
+    try:
+        member = _wait_pid_file(pidf)
+        (job / "cmd.pgid").write_text(f"{p.pid} {ut._proc_start(p.pid)}\n")
+        p.wait(5)  # leader exited and reaped: its identity no longer verifies
+        assert not ut._same_process(p.pid, (job / "cmd.pgid").read_text().split(None, 1)[1].strip())
+        assert ut._pid_alive(member) and os.getpgid(member) == p.pid
+        assert ut.withdraw_job(job, "gone")["status"] == "withdrawn"
+        assert _proc_gone(member, 5.0), "group member survived a withdrawal after its leader had exited"
+    finally:
+        _killpg_quiet(p.pid)
+
+
+def test_kill_command_leaderless_group_needs_every_member_verified(tmp_path, monkeypatch):
+    """Leader gone: the group is signalled only when every live member is in the recorded session and started at
+    or after the recorded leader; otherwise (pid/pgid reuse) nothing is signalled."""
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("echo hi", "r", str(tmp_path))
+    leader_start = "Sun Nov  1 07:08:54 2026"
+    (job / "cmd.pgid").write_text(f"424242 {leader_start}\n")
+    monkeypatch.setattr(ut, "_same_process", lambda pid, lstart: False)
+    starts = {"later": "Sun Nov  1 07:08:55 2026", "same": "Sun Nov  1 07:08:54 2026",
+              "earlier": "Sun Nov  1 07:08:53 2026"}
+    cases = [
+        ([(501, 424242, "later"), (502, 424242, "same")], True),
+        ([(501, 424242, "later"), (502, 999, "later")], False),   # other session: not our group
+        ([(501, 424242, "later"), (502, 424242, "earlier")], False),  # born before the leader: reused pgid
+        ([], False),
+    ]
+    for members, expect in cases:
+        sent = []
+        monkeypatch.setattr(ut, "_group_members", lambda pg, m=members: [pid for pid, _, _ in m] if pg == 424242
+                            else [])
+        monkeypatch.setattr(ut.os, "getsid", lambda pid, m=members: {p: s for p, s, _ in m}[pid])
+        monkeypatch.setattr(ut, "_proc_start", lambda pid, inherit=False, m=members:
+                            starts[{p: k for p, _, k in m}[pid]])
+        monkeypatch.setattr(ut.os, "killpg", lambda pg, sig: sent.append((pg, sig)))
+        ut._kill_command(job, 0.2)
+        assert bool(sent) is expect, (members, sent)
+        assert all(pg == 424242 for pg, _ in sent)
+    sent = []  # the leader pid is alive but not the recorded leader (reused): never signalled
+    monkeypatch.setattr(ut, "_pid_alive", lambda pid: pid == 424242)
+    monkeypatch.setattr(ut, "_group_members", lambda pg: [501])
+    monkeypatch.setattr(ut.os, "getsid", lambda pid: 424242)
+    monkeypatch.setattr(ut, "_proc_start", lambda pid, inherit=False: starts["later"])
+    ut._kill_command(job, 0.2)
+    assert sent == []
+
+
 def test_kill_command_never_signals_own_group(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
     job = ut.create_job("echo hi", "r", str(tmp_path))

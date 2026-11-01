@@ -102,6 +102,7 @@ import signal
 import subprocess
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -849,24 +850,90 @@ def runner_idents(job: Path) -> dict[int, str]:
     return out
 
 
+def _group_members(pgid: int) -> list[int] | None:
+    """Live (non-zombie) pids whose process group is ``pgid``; None when ps fails (unknown: callers then
+    never signal on the strength of it)."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,pgid=,stat="], capture_output=True, text=True, timeout=3,
+                             env=_ps_env())
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    pids = []
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit() and int(parts[1]) == pgid \
+                and not parts[2].startswith("Z"):
+            pids.append(int(parts[0]))
+    return pids
+
+
+def _lstart_epoch(lstart: str) -> float | None:
+    """A ps lstart rendered in LC_ALL=C TZ=UTC (see _ps_env) as epoch seconds; None if it is in another form."""
+    try:
+        return datetime.strptime(" ".join(lstart.split()), "%a %b %d %H:%M:%S %Y").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _leaderless_group_verified(ident: tuple[int, str]) -> bool:
+    """The recorded command group outlived its session leader: True only when it has live members and every one
+    is in the recorded session (sid == recorded pgid) and started at or after the recorded leader, and no process
+    holds the leader pid (one that does is not the recorded leader, i.e. a reused pid leading its own session).
+    A process in another session cannot be in this group. Anything unknown (ps failed, an unparseable time) reads
+    as not verified; a member that exits mid-check is skipped. Residual: a reused pid whose new session leader has
+    already exited again, leaving later-born members, would pass; that needs the exact pid to be recycled into a
+    session leader within the job's lifetime and is accepted."""
+    pgid, lstart = ident
+    if _pid_alive(pgid):  # the leader pid is held by a process that is not the recorded leader: a reused pid,
+        return False      # and any group/session it leads is not ours
+    born = _lstart_epoch(lstart)
+    members = _group_members(pgid)
+    if born is None or not members:
+        return False
+    for pid in members:
+        try:
+            if os.getsid(pid) != pgid:
+                return False
+        except ProcessLookupError:
+            continue  # exited meanwhile
+        except OSError:
+            return False
+        start = _proc_start(pid)
+        if not start:
+            continue  # exited meanwhile
+        t = _lstart_epoch(start)
+        if t is None or t < born:
+            return False
+    return True
+
+
+def _group_signalable(ident: tuple[int, str]) -> bool:
+    return _same_process(*ident) or _leaderless_group_verified(ident)
+
+
 def _kill_command(job: Path, secs: float = 3.0) -> None:
     """Kill the command's process group (script(1)'s session leader and every child, e.g. sleep or a waiting
-    sudo), then tell the runner (SIGUSR1) to show the withdrawal; the runner and its window stay open. Only
-    processes whose recorded identity (pid + start time) still matches are signalled: never a bare pid, never
-    this process's own group. SIGTERM, then SIGKILL after ``secs`` while the leader still verifies.
+    sudo), then tell the runner (SIGUSR1) to show the withdrawal; the runner and its window stay open. Only a
+    verified group is signalled: its recorded leader (pid + start time) still matches, or, once the leader has
+    exited, every remaining member is in the recorded session and started no earlier than the leader. Never a
+    bare pid, never this process's own group. SIGTERM, then SIGKILL after ``secs`` while any member remains (a
+    member can outlive the leader by ignoring or deferring TERM, e.g. sudo inside pam_authenticate).
 
     Callers hold final.lock. The command's shell writes cmd.pgid and only then checks final.lock (exit if taken),
     so one read here is race-free: no cmd.pgid now means the command either never starts or ends by itself."""
     ident = _cmd_ident(job)
-    if ident and ident[0] != os.getpgrp() and _same_process(*ident):
+    if ident and ident[0] != os.getpgrp() and _group_signalable(ident):
         try:
             os.killpg(ident[0], signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
         deadline = time.time() + secs
-        while time.time() < deadline and _same_process(*ident):
+        while time.time() < deadline and (_same_process(*ident) or _group_members(ident[0]) != []):
             time.sleep(0.1)
-        if _same_process(*ident):
+        if _group_signalable(ident):
             try:
                 os.killpg(ident[0], signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
