@@ -231,7 +231,36 @@ ask; a server-side re-render of a legacy row keeps the original time; a revision
 written by a process that predates the stamp is treated as fresh. Each errs toward
 keeping an ask.
 
-Three triggers:
+Retirement paths and evidence review:
+
+- **deleted owner**: `reconcile_moot` withdraws an undecided request by `system` with
+  reason `its chat no longer exists` after a successful read confirms the session is absent
+  from its known local owner profile's `state.db`. Unknown profiles, foreign gateways,
+  missing databases, read errors and locks keep the ask. Recorded decisions and bound
+  decision cards remain untouched. Any existing chat's GET or hook also checks other
+  undecided owners in the current local profile, since a deleted chat cannot read its own
+  queue. Other profiles and gateways are not swept. `tests/test_owner_gone.py` covers
+  these boundaries, the actual router path, and the hook path.
+- **hygiene review**: `stale_watch.py` files one local Kanban review card per PT day for
+  undecided, non-card-bound asks older than 72 hours that were not reviewed in the last
+  seven days. The card includes request IDs/titles, owner-chat titles/last-turn times,
+  and linked/named card states. Legacy revision-1 requests can use their matching ledger
+  timestamp; unknown current-revision ages are kept without guessing.
+  The worker withdraws only with evidence of terminal related work, a decision elsewhere
+  (quoted), an expired window, a fixture, or agent-owned work it has done or filed.
+  Otherwise it marks the request reviewed and keeps it. Use:
+  `stale_watch.py --withdraw <requestId> --reason <text> --evidence <text>`
+  (records `by='hygiene'`; refuses recorded decisions and card-bound requests), or
+  `stale_watch.py --reviewed <requestId> --reason <text> --evidence <text>`.
+  Review timestamps are revision-specific. `--dry-run` is read-only and cannot be combined
+  with either mutation command. `tests/test_old_ask_review.py` covers selection, daily
+  card creation, owner/card metadata, CLI refusal/withdrawal and retained-request reviews.
+
+**Live fixture rule:** publish test requests only in scratch chats, then delete those chats
+in `finally`. Deleted-owner reconciliation retires their undecided requests on the next
+`GET /requests` or `pre_llm_call`. Never publish live fixtures in persistent chats.
+
+Existing card/user triggers:
 
 - **system**: `reconcile_moot` runs on every `GET /requests` and every
   `pre_llm_call`, in one deferred read with a 2 s busy timeout (no write lock

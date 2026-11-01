@@ -1927,8 +1927,8 @@ class ActionError(ValueError):
         self.status = status
 
 
-# Who may withdraw an ask: the board/reconciler (system), the owning chat (agent), the person (user).
-WITHDRAW_BY = ('system', 'agent', 'user')
+# Withdrawal actors: board/reconciler (system), owning chat (agent), person (user), explicit cleanup (hygiene).
+WITHDRAW_BY = ('system', 'agent', 'user', 'hygiene')
 
 
 def _iso(ts) -> str:
@@ -3011,9 +3011,88 @@ def _asked_at(store: "ActionStore", owner: dict, request: dict, life: Optional[d
     return life["created_at"]
 
 
+def _absent_owner_sessions(owner: dict, sessions) -> set:
+    """Subset of ``sessions`` positively missing from the local owner profile's state.db, in ONE read.
+
+    Only the owner's own gateway counts, and only a profile that exists. A missing store/profile,
+    foreign gateway, or failed/locked read is not evidence of deletion: any failure returns set().
+    Do not use _row: it intentionally conflates missing sessions with read failures.
+    """
+    sessions = list(dict.fromkeys(s for s in sessions if isinstance(s, str) and s))
+    if not sessions:
+        return set()
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+
+        local = server_owner(sessions[0])
+        if owner['gatewayId'] != local['gatewayId'] or not profile_exists(owner['profile']):
+            return set()
+        db = _state_db(Path(get_profile_dir(owner['profile'])))
+        c = _ro_connect(db, timeout=2)
+        try:
+            present = set()
+            for i in range(0, len(sessions), 500):  # stay under SQLite's bound-parameter limit
+                chunk = sessions[i:i + 500]
+                present.update(row[0] for row in c.execute(
+                    f"SELECT id FROM sessions WHERE id IN ({','.join('?' * len(chunk))})", chunk))
+            return set(sessions) - present
+        finally:
+            c.close()
+    except Exception:
+        return set()
+
+
+def _owner_chat_absent(owner: dict) -> bool:
+    """True only after a successful read of the known local owner's profile store."""
+    return owner['storedSessionId'] in _absent_owner_sessions(owner, [owner['storedSessionId']])
+
+
+_CHAT_GONE = 'its chat no longer exists'
+
+
+def _retire_orphan_owners(store: "ActionStore", ledger: "Ledger", owner: dict, now: float) -> None:
+    """Withdraw undecided asks of OTHER deleted chats in the supplied owner's namespace (same gateway and
+    profile, which must be this server's current ones). A deleted chat never reads its own queue (the
+    dashboard 404s an unknown session), so any surviving chat's read or turn retires them.
+
+    One grouped read lists the other sessions with undecided requests, one state.db read finds which are
+    gone; only those get a per-session candidate read. moot_candidates already skips card-bound requests and
+    the withdrawal transaction refuses recorded decisions. Results stay out of the caller's list: they are
+    not the supplied chat's notices. Never recurses into reconcile_moot. Best effort: errors keep every ask.
+    """
+    try:
+        local = server_owner(owner['storedSessionId'])
+        if (owner['gatewayId'], owner['profile']) != (local['gatewayId'], local['profile']):
+            return
+        with store._read() as c:
+            sessions = [row[0] for row in c.execute(
+                "SELECT DISTINCT session FROM requests WHERE namespace=? AND session<>? "
+                "AND state IN ('open','needs_context') AND resolution IS NULL",
+                (store._ns(owner), owner['storedSessionId']))]
+        for sid in sorted(_absent_owner_sessions(owner, sessions)):
+            other = dict(owner, storedSessionId=sid)
+            try:
+                for r, _life in store.moot_candidates(other):
+                    try:
+                        withdraw_request(store, ledger, other, r['requestId'], by='system', reason=_CHAT_GONE,
+                                         expected_revision=r['revision'], now=now)
+                    except ActionError:
+                        pass  # a recorded decision or revised request wins the race
+            except Exception:
+                logging.getLogger('user-steps').warning('deleted-chat ask sweep deferred for one session')
+    except Exception:
+        logging.getLogger('user-steps').warning('deleted-chat ask sweep deferred')
+
+
 def reconcile_moot(store: "ActionStore", ledger: "Ledger", owner: dict, *, boards=None,
                    now: Optional[float] = None) -> list[dict]:
-    """Withdraw (by=system) each undecided ask whose linked work is over.
+    """Withdraw (by=system) each undecided ask whose chat is deleted or linked work is over.
+
+    Other deleted chats in this owner's gateway/profile namespace are retired too (_retire_orphan_owners),
+    but only the supplied chat's withdrawals are returned.
+    Chat deletion requires a successful owner-profile state.db read on this gateway. An unknown
+    profile, absent database, or failed/locked read never establishes deletion. Bound decision cards
+    and recorded decisions remain excluded by moot_candidates and the withdrawal transaction.
 
     Every card the ask names must resolve on exactly one readable local board; at least one of them was
     waiting on someone when the ask was made; every such card is done or archived after the ask, or (the request
@@ -3026,8 +3105,19 @@ def reconcile_moot(store: "ActionStore", ledger: "Ledger", owner: dict, *, board
     out: list[dict] = []
     conns: dict = {}
     steps: Optional[dict] = None
+    _retire_orphan_owners(store, ledger, owner, now)
     try:
-        for r, life in store.moot_candidates(owner):
+        candidates = store.moot_candidates(owner)
+        owner_gone = bool(candidates) and _owner_chat_absent(owner)
+        for r, life in candidates:
+            if owner_gone:
+                try:
+                    out.append(withdraw_request(store, ledger, owner, r['requestId'], by='system',
+                                                reason=_CHAT_GONE,
+                                                expected_revision=r['revision'], now=now))
+                except ActionError:
+                    pass  # a recorded decision or revised request wins the race
+                continue
             if steps is None and any(a.get("type") == "user_step" for a in r.get("aliases", [])):
                 try:
                     steps = {s.get("id"): s for s in ledger.read(owner["storedSessionId"]).get("steps", []) if s.get("id")}

@@ -13,10 +13,20 @@ It also opens one card (key `user-steps-failed-decision:<operationId>`) for a de
 admitted turn ended in a failed-turn boundary before any tool ran and that nothing continued (no
 auto-continue row, no later user message) within FAILED_DECISION_MIN_AGE (self-heal desktop-3a6213ce74:
 a backend restart killed the turn, the tile had already closed, and the decision silently never ran).
+
+Old-ask review (cron runs only, not run()'s default): at most one card a day (key
+`user-steps-old-asks:<PT date>`) lists undecided requests asked more than 72 h ago and not marked reviewed in the
+last 7 days, with the owner chat's title and last turn (PT) and its linked/named card states. It is created on this
+gateway's board through the kanban_create tool handler (placement='local', requires declared), never the CLI. The
+watcher decides and withdraws nothing. The reviewing worker uses the sanctioned CLI:
+`--withdraw ID --reason ... --evidence ...` (core.withdraw_request by=hygiene; refused for recorded decisions,
+card-bound requests and owners not on this gateway) or `--reviewed ID --reason ... [--evidence ...]` (side table
+old_ask_reviews; hides the request from the review for 7 days, it stays open).
 """
 import argparse
 import importlib.util
 import json
+import sqlite3
 import subprocess
 import sys
 import time
@@ -155,7 +165,348 @@ def create_card(c):
     return p.stdout.strip()
 
 
-def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_card):
+# ---- old-ask review: one local card a day; withdrawal only through the sanctioned CLI with evidence ----------
+
+OLD_ASK_AGE = 72 * 3600
+REVIEW_WINDOW = 7 * 86400
+REVIEW_KEY = 'user-steps-old-asks:'
+REVIEW_REQUIRES = ['terminal', 'kanban']
+PT = 'America/Los_Angeles'
+_REVIEWS_DDL = ('CREATE TABLE IF NOT EXISTS old_ask_reviews (namespace TEXT, id TEXT, revision INTEGER, '
+                'reviewed_at REAL, reason TEXT, evidence TEXT, PRIMARY KEY(namespace,id))')
+
+
+def _pt(ts, fmt='%Y-%m-%d %H:%M %Z'):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.fromtimestamp(ts, ZoneInfo(PT)).strftime(fmt)
+
+
+def _reviewed(c):
+    """Reviews apply only to the reviewed revision; never create the side table on read."""
+    try:
+        return {(r[0], r[1], r[2]): r[3] for r in c.execute(
+            'SELECT namespace, id, revision, reviewed_at FROM old_ask_reviews')}
+    except sqlite3.OperationalError:
+        return {}
+
+
+def _review_ledger(core, owner):
+    """Read the known local owner's ledger, including non-default profiles; never initialize a store."""
+    if owner['gatewayId'] != _local_gateway(core):
+        return None
+    db = _owner_db(core, owner)
+    return core.Ledger(Path(db).parent / 'user-steps', db=db) if db is not None else None
+
+
+def _legacy_asked_at(core, owner, body):
+    """Only original revisions can inherit legacy evidence. Later unstamped revisions have unknown age."""
+    if body.get('revision') != 1:
+        return None
+    aliases = [a for a in body.get('aliases', []) if a.get('type') == 'user_step'
+               and a.get('gatewayId') == owner['gatewayId'] and a.get('profile') == owner['profile']]
+    if not aliases:
+        return None
+    ledger = _review_ledger(core, owner)
+    if ledger is None:
+        return None
+    try:
+        data = ledger._read_strict(ledger.root(owner['storedSessionId']), legacy=True)
+        times = []
+        for alias in aliases:
+            matches = [s for s in data['steps'] if s.get('id') == alias.get('id')]
+            if len(matches) != 1:
+                continue
+            step = matches[0]
+            if step.get('requestId') not in (None, body['requestId']):
+                continue
+            ts = step.get('created')
+            if isinstance(ts, (int, float)) and 0 < ts < float('inf'):
+                times.append(ts)
+        return max(times) if times else None
+    except (OSError, ValueError, LookupError):
+        return None  # missing/unreadable evidence is not proof of age
+
+
+def old_asks(core, store, now=None, *, min_age=OLD_ASK_AGE, window=REVIEW_WINDOW):
+    """Undecided requests asked more than ``min_age`` ago and not marked reviewed within ``window``. Read-only.
+
+    Undecided: open/needs_context, no resolution, no recorded operation for the current revision. Requests bound
+    to a decision card are skipped (that card is the ask; withdrawal refuses them). A request with no recorded
+    ask time is skipped: its age is unproven."""
+    now = time.time() if now is None else now
+    out = []
+    with store._read() as c:
+        reviewed = _reviewed(c)
+        rows = c.execute("SELECT r.namespace, r.id, r.session, r.revision, v.body, l.created_at, l.asked_revision FROM requests r "
+                         "JOIN revisions v ON v.namespace=r.namespace AND v.id=r.id AND v.revision=r.revision "
+                         "LEFT JOIN lifecycle l ON l.namespace=r.namespace AND l.id=r.id "
+                         "WHERE r.state IN ('open','needs_context') AND r.resolution IS NULL ORDER BY r.rowid").fetchall()
+        for ns, rid, session, rev, raw, asked, asked_rev in rows:
+            if now - reviewed.get((ns, rid, rev), float('-inf')) < window:
+                continue
+            if c.execute('SELECT 1 FROM operations WHERE namespace=? AND request=? AND revision=?',
+                         (ns, rid, rev)).fetchone():
+                continue
+            try:
+                body, (gateway, profile) = json.loads(raw), json.loads(ns)
+            except (ValueError, TypeError):
+                continue
+            if any(a.get('type') == 'kanban' for a in body.get('aliases', [])):
+                continue
+            owner = {'gatewayId': gateway, 'profile': profile, 'storedSessionId': session}
+            # A missing revision stamp is usable only for an original legacy ask.
+            if asked_rev != rev and not (rev == 1 and asked_rev is None):
+                continue
+            if asked is None:
+                asked = _legacy_asked_at(core, owner, body)
+            if asked is None or now - asked <= min_age:
+                continue
+            out.append({'requestId': rid, 'title': body.get('title') or '', 'namespace': ns, 'revision': rev,
+                        'owner': {'gatewayId': gateway, 'profile': profile, 'storedSessionId': session},
+                        'askedAt': asked, 'request': body})
+    return out
+
+
+def _local_gateway(core):
+    try:
+        return core.server_owner('old-ask-review')['gatewayId']
+    except Exception:
+        return None  # unknown identity: every owner is treated as foreign (nothing read, nothing withdrawn)
+
+
+def _owner_db(core, owner):
+    """The owner profile's state.db on this install, or None when the profile is unknown."""
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+        if not profile_exists(owner['profile']):
+            return None
+        return core._state_db(Path(get_profile_dir(owner['profile'])))
+    except Exception:
+        return None
+
+
+def chat_facts(core, owner, *, local_gateway, owner_db):
+    """{'status', 'title', 'lastTurnAt'} for the owner chat. Never guesses: a foreign gateway, unknown profile or
+    failed read is reported as such."""
+    if not local_gateway or owner['gatewayId'] != local_gateway:
+        return {'status': 'on another gateway (not read)'}
+    db = owner_db(owner)
+    if db is None:
+        return {'status': 'unknown profile (not read)'}
+    try:
+        c = core._ro_connect(db, timeout=2)
+        try:
+            row = c.execute('SELECT title FROM sessions WHERE id=?', (owner['storedSessionId'],)).fetchone()
+            if row is None:
+                return {'status': 'not found in the owner store'}
+            last = c.execute('SELECT max(timestamp) FROM messages WHERE session_id=?',
+                             (owner['storedSessionId'],)).fetchone()[0]
+        finally:
+            c.close()
+    except Exception as exc:
+        return {'status': f'unreadable ({type(exc).__name__})'}
+    return {'status': 'found', 'title': row[0], 'lastTurnAt': last}
+
+
+def linked_cards(core, request, owner, boards):
+    """(cards, problems): owner/origin tasks.session_id plus tui notification chat links and named cards.
+
+    Older boards can lack either link surface. Preserve named-card results and explicit unknown-read notes.
+    Subscriptions are context, not proof that a chat owns or has completed the task."""
+    named = {tid for _b, tid in core._watched_cards(request, owner, {})}
+    cards, problems = [], []
+    for slug, path in boards:
+        try:
+            c = core._ro_connect(path, timeout=2)
+            try:
+                rows = [r for tid in sorted(named) for r in c.execute(
+                    'SELECT id, title, status FROM tasks WHERE id=?', (tid,)).fetchall()]
+                columns = {r[1] for r in c.execute('PRAGMA table_info(tasks)')}
+                if 'session_id' in columns:
+                    rows += c.execute('SELECT id, title, status FROM tasks WHERE session_id=? ORDER BY id',
+                                      (owner['storedSessionId'],)).fetchall()
+                else:
+                    problems.append(f'board {slug} origin chat links unavailable (no tasks.session_id)')
+                subcols = {r[1] for r in c.execute('PRAGMA table_info(kanban_notify_subs)')}
+                if subcols:
+                    try:
+                        params = [owner['storedSessionId']]
+                        profile = ''
+                        if 'notifier_profile' in subcols:
+                            profile = ' AND (s.notifier_profile=? OR s.notifier_profile IS NULL)'
+                            params.append(owner['profile'])
+                        rows += c.execute('SELECT t.id, t.title, t.status FROM tasks t JOIN kanban_notify_subs s '
+                                          "ON s.task_id=t.id WHERE s.platform='tui' AND s.chat_id=?" + profile,
+                                          params).fetchall()
+                    except sqlite3.Error as exc:
+                        problems.append(f'board {slug} subscription chat links unreadable ({type(exc).__name__})')
+                else:
+                    problems.append(f'board {slug} subscription chat links unavailable (no kanban_notify_subs)')
+            finally:
+                c.close()
+        except Exception as exc:
+            problems.append(f'board {slug} unreadable ({type(exc).__name__})')
+            continue
+        seen = {(x['board'], x['id']) for x in cards}
+        for tid, title, status in rows:
+            if (slug, tid) not in seen:
+                seen.add((slug, tid))
+                cards.append({'board': slug, 'id': tid, 'title': title, 'status': status,
+                              'link': 'named by the ask' if tid in named else 'linked to the chat'})
+    return cards, problems
+
+
+def _item_lines(it):
+    o, f = it['owner'], it['chat']
+    if f['status'] == 'found':
+        last = _pt(f['lastTurnAt']) if f.get('lastTurnAt') else 'no messages'
+        chat_line = f"\"{f.get('title') or '(untitled)'}\", last turn {last}"
+    else:
+        chat_line = f['status']
+    lines = [f"- **{it['requestId']}**: {it['title']}",
+             f"  - Asked: {_pt(it['askedAt'])} (revision {it['revision']})",
+             f"  - Owner chat: {o['profile']} / {o['storedSessionId']} ({o['gatewayId']}): {chat_line}"]
+    cards = it.get('cards') or []
+    lines.append('  - Cards: ' + ('; '.join(f"{c['id']} [{c['board']}] {c['status']} ({c['link']}): {c['title']}"
+                                            for c in cards) if cards else 'none found'))
+    for p in it.get('problems') or []:
+        lines.append(f'  - Note: {p}')
+    return lines
+
+
+def review_card(items, now):
+    script = '~/.hermes/plugins/user-steps/stale_watch.py'
+    listing = '\n'.join(line for it in items for line in _item_lines(it)) or '- (none)'
+    body = (f"User-steps requests still undecided more than 72 h after they were asked, not reviewed in the last "
+            f"7 days (action store on this host). The watcher withdrew and decided nothing.\n\n{listing}\n\n"
+            f"For EACH request, read the owner chat and the cards above, then do exactly one:\n"
+            f"1. Withdraw it only with evidence, one of: a linked or named card is done or archived and the ask was "
+            f"about it; it was decided elsewhere (quote the user's words and where); its time window expired (say "
+            f"when); it is a test fixture (say which); or it asks the user for agent work (then do that work or file "
+            f"a card for it first, and cite it).\n"
+            f"   `python3 {script} --withdraw <id> --reason \"<why>\" --evidence \"<card id / quote / date>\"`\n"
+            f"2. Otherwise keep it: `python3 {script} --reviewed <id> --reason \"<why it is still a live ask>\" "
+            f"--evidence \"<what you checked>\"` (hides it from this review for 7 days; it stays open for the user).\n"
+            f"Never decide a request for the user. Withdrawal is refused for recorded decisions and card-bound "
+            f"requests. A chat that is on another gateway, unknown or unreadable is not evidence: keep those.\n"
+            f"Source: plugins/user-steps/stale_watch.py (old-ask review).")
+    return {'title': f'user-steps: review {len(items)} undecided request(s) older than 72 h', 'body': body,
+            'idempotency_key': REVIEW_KEY + _pt(now, '%Y-%m-%d'), 'assignee': 'default',
+            'placement': 'local', 'requires': list(REVIEW_REQUIRES)}
+
+
+def review_old_asks(core, store, now=None, create=None, *, local_gateway=None, owner_db=None, boards=None):
+    """Create (via ``create``) at most one review card for today's old asks; return the listed request ids."""
+    if create is None:
+        raise ValueError('review_old_asks needs a card creator')
+    now = time.time() if now is None else now
+    items = old_asks(core, store, now=now)
+    if not items:
+        return []
+    owner_db = owner_db or (lambda o: _owner_db(core, o))
+    boards = core.kanban_boards() if boards is None else boards
+    for it in items:
+        it['chat'] = chat_facts(core, it['owner'], local_gateway=local_gateway, owner_db=owner_db)
+        it['cards'], it['problems'] = linked_cards(core, it['request'], it['owner'], boards)
+    create(review_card(items, now))  # idempotent on the daily key
+    return [it['requestId'] for it in items]
+
+
+def create_review_card(c, registry=None):
+    """Create the card through the kanban_create tool handler (not the CLI), pinned to this board."""
+    if registry is None:
+        import tools.kanban_tools  # noqa: F401  registers kanban_create
+        from tools.registry import registry
+    entry, schema = registry.get_entry('kanban_create'), registry.get_schema('kanban_create')
+    props = ((schema or {}).get('parameters') or {}).get('properties') or {}
+    missing = [k for k in ('placement', 'requires', 'idempotency_key') if k not in props]
+    if entry is None or missing:
+        raise RuntimeError(f'kanban_create tool unavailable or lacks {missing}: refusing to create the review card')
+    args = {k: c[k] for k in ('title', 'body', 'assignee', 'idempotency_key', 'placement', 'requires')}
+    out = entry.handler(args)
+    try:
+        res = json.loads(out) if isinstance(out, str) else out
+    except ValueError:
+        raise RuntimeError(f'kanban_create returned non-JSON: {str(out)[:300]}')
+    if not isinstance(res, dict) or res.get('error') or not res.get('task_id'):
+        raise RuntimeError(f'kanban_create failed: {str(out)[:500]}')
+    return res['task_id']
+
+
+def _find(core, store, rid):
+    with store._read() as c:
+        rows = c.execute('SELECT namespace, session, revision, state FROM requests WHERE id=?', (rid,)).fetchall()
+    if len(rows) != 1:
+        raise core.ActionError('Unknown request' if not rows else 'Ambiguous request id', 404)
+    ns, session, rev, state = rows[0]
+    gateway, profile = json.loads(ns)
+    return {'gatewayId': gateway, 'profile': profile, 'storedSessionId': session}, ns, rev, state
+
+
+def _need(core, value, what):
+    if not isinstance(value, str) or not value.strip():
+        raise core.ActionError(f'{what} required')
+    return value.strip()
+
+
+def withdraw_old(core, store, rid, *, reason, evidence, local_gateway, ledger=None, now=None):
+    """Sanctioned hygiene withdrawal: by=hygiene with reason and evidence. Refused for recorded decisions and
+    card-bound requests (ActionStore.withdraw), and for owners not on this gateway or an unknown identity."""
+    reason, evidence = _need(core, reason, 'Reason'), _need(core, evidence, 'Evidence')
+    owner, _ns, rev, _state = _find(core, store, rid)
+    if not local_gateway or owner['gatewayId'] != local_gateway:
+        raise core.ActionError('Request owner is not on this gateway; not withdrawn', 409)
+    return core.withdraw_request(store, ledger, owner, rid, by='hygiene', reason=reason, evidence=evidence,
+                                 expected_revision=rev, now=now)
+
+
+def mark_reviewed(core, store, rid, *, reason, evidence=None, now=None):
+    """Record that a reviewer kept an open request (hides it from the review for REVIEW_WINDOW). Not a decision."""
+    reason = _need(core, reason, 'Reason')
+    now = time.time() if now is None else now
+    owner, ns, rev, state = _find(core, store, rid)
+    if state not in ('open', 'needs_context'):
+        raise core.ActionError('Request is not open', 409)
+    with store._tx() as c:
+        c.execute(_REVIEWS_DDL)
+        c.execute('INSERT INTO old_ask_reviews VALUES (?,?,?,?,?,?) ON CONFLICT(namespace,id) DO UPDATE SET '
+                  'revision=excluded.revision, reviewed_at=excluded.reviewed_at, reason=excluded.reason, '
+                  'evidence=excluded.evidence', (ns, rid, rev, now, reason[:300], (evidence or '').strip()[:500]))
+    return {'requestId': rid, 'revision': rev, 'reviewedAt': now, 'reason': reason[:300]}
+
+
+def _store(core):
+    return core.ActionStore()
+
+
+def _read_only_store(core):
+    """No ActionStore initialization/migrations; every query is enforced read-only, including legacy _tx reads."""
+    store = core.ActionStore.__new__(core.ActionStore)
+    store.path = core.home() / 'user-steps' / 'actions.sqlite3'
+    store.timeout = 30
+
+    def connect():
+        c = core._ro_connect(store.path, timeout=store.timeout)
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA query_only=ON')
+        return c
+
+    store._connect = connect
+    store._tx = store._read
+    return store
+
+
+def _ledger(core, owner):
+    """The legacy step ledger only for the current profile's chats; another profile's ledger lives elsewhere."""
+    try:
+        from hermes_cli.profiles import current_profile_name
+        return core.Ledger() if current_profile_name() == owner['profile'] else None
+    except Exception:
+        return None
+
+
+def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_card, review_create=None):
     now = time.time() if now is None else now
     opened = []
     for item in chat.answered_open(core, store, db):
@@ -172,6 +523,10 @@ def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_car
     for f in failed_decisions(core, store, db, now=now):
         create(failed_decision_card(f))  # one card per operation; idempotent on its key
         opened.append('failed-decision:' + f['operationId'])
+    if review_create is not None:
+        listed = review_old_asks(core, store, now=now, create=review_create, local_gateway=_local_gateway(core))
+        if listed:
+            opened.append('old-asks:' + _pt(now, '%Y-%m-%d'))
     return opened
 
 
@@ -179,10 +534,38 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--min-age', type=int, default=MIN_AGE, help='seconds since the user reply (default 3600)')
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--withdraw', metavar='ID', help='withdraw one request (by=hygiene); needs --reason and --evidence')
+    ap.add_argument('--reviewed', metavar='ID', help='keep one open request; hides it from the old-ask review 7 days')
+    ap.add_argument('--reason')
+    ap.add_argument('--evidence')
     a = ap.parse_args(argv)
-    core, chat = _load('core'), _load('chat')
+    if a.dry_run and (a.withdraw or a.reviewed):
+        print(json.dumps({'error': '--dry-run cannot be combined with --withdraw or --reviewed'}))
+        return 2
+    core = _load('core')
+    if a.withdraw and a.reviewed:
+        print(json.dumps({'error': 'use --withdraw or --reviewed, not both'}))
+        return 2
+    if a.withdraw or a.reviewed:
+        store = _store(core)
+        try:
+            if a.withdraw:
+                owner = _find(core, store, a.withdraw)[0]
+                v = withdraw_old(core, store, a.withdraw, reason=a.reason, evidence=a.evidence,
+                                 local_gateway=_local_gateway(core), ledger=_ledger(core, owner))
+                print(json.dumps({'withdrawn': v}))
+            else:
+                print(json.dumps({'reviewed': mark_reviewed(core, store, a.reviewed, reason=a.reason,
+                                                            evidence=a.evidence)}))
+        except core.ActionError as exc:
+            print(json.dumps({'error': str(exc), 'status': exc.status}))
+            return 2
+        return 0
+    chat = _load('chat')
     create = (lambda c: print(json.dumps(c))) if a.dry_run else create_card
-    ids = run(core, chat, core.ActionStore(), min_age=a.min_age, create=create)
+    review_create = (lambda c: print(json.dumps(c))) if a.dry_run else create_review_card
+    store = _read_only_store(core) if a.dry_run else _store(core)
+    ids = run(core, chat, store, min_age=a.min_age, create=create, review_create=review_create)
     print(json.dumps({'cards': ids}))
     return 0
 
