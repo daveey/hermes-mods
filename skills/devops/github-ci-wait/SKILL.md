@@ -267,6 +267,8 @@ or closed-unmerged (wake to reconcile; neither is acceptance), 2 = evidence/auth
 
 ## Adding helper scripts to a repo
 
+For cross-repository integration tests, wire every required environment path into the actual CI suite step, not only a local test command. An existing companion checkout does not export its paths automatically. Retain real-producer tests and add a workflow regression tying the export to that checkout before the test runner; verify the green branch run rather than replacing the producer with a mock or skip.
+
 Before choosing a directory for a new tool, read the CI workflows' `on.push.paths` and any plan step's path rules. A
 script under a shared or product directory (e.g. `shared/`, `lib/`) can trigger a full rebuild and release of every
 product on push. Put agent tooling where no release workflow watches (often `tools/`), and confirm by checking that
