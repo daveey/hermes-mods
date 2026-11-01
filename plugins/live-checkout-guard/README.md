@@ -50,6 +50,39 @@ Kill switch: `LIVE_CHECKOUT_GUARD=0`. Paths are compared after `realpath`, so sy
   Install: `python3 plugins/live-checkout-guard/claude_hook.py --install [--settings PATH]` (idempotent; default
   `~/.claude/settings.json`). Exit 2 blocks; bad input fails open.
 
+## Fenced core updates
+
+Agent `terminal` and literal `execute_code` shell calls may not run a mutating
+`hermes update`, locally or through SSH. Bare executables, absolute/tilde paths,
+`python -m hermes_cli.main`, profile selection, shell `-c`/`eval`, and the common
+wrappers above are recognized. This is independent of the command's cwd.
+
+Core updates belong to each host's fenced route: the hub's
+`hermes-core-update.timer` (every 10 minutes, drain-first and batched) and
+`hermes-sync` drain windows on Macs. Direct updates can bypass drain intent,
+restart active work, and contend with the scheduled updater. A card waiting for a
+commit should use a scheduled wake check, substituting its actual SSH destination:
+
+```sh
+ssh <hub> 'git -C ~/.hermes/hermes-agent merge-base --is-ancestor <sha> HEAD'
+```
+
+Allowed read-only flags, verified against `hermes update --help`: `-h`, `--help`,
+`--check`, `--plan`, `--list-venv-holders`, `--install-id`. Neither `--yes` nor
+`--no-gateway-restart` is read-only. Grep patterns, SQLite LIKE strings, echo text
+and heredocs written as data do not trigger the update rule; heredocs/herestrings
+fed to a shell or SSH are checked as executable input.
+
+For a **user-approved update only**, prefix the specific command with
+`HERMES_UPDATE_OK=1`. It can prefix the updater, its SSH command, or its shell
+wrapper. It does not authorize subsequent commands after `;` or `&&`, does not
+read an inherited environment value, and does not bypass checkout-write checks.
+
+Tests: `tests_update.py` exercises terminal and execute_code for blocked and
+allowed forms, including both incident SSH spellings, every read-only flag,
+text-only mentions, shell input, and override scoping. Run
+`scripts/test-all -k live-checkout-guard`.
+
 ## Archive-verified stash retirement
 
 The maintained `reconcile.py` helper also supports stash retirement. This is a separate
@@ -137,7 +170,9 @@ exercises all three CLI modes plus terminal/execute-code guard checks. Existing
 - `execute_code` with non-literal paths/commands (built strings, loop variables, imports of other modules) is not inspected;
   only literal arguments are. A tool called by name through another route (e.g. an MCP tool that writes files) is not covered.
 - Subshell/`cd` scoping is flattened: `(cd root; …)` leaves later segments thinking cwd is root (can over-block);
-  heredoc bodies are scanned as if they were commands (can over-block text containing `git commit` while cwd is root).
+  checkout-write checks scan heredoc bodies as if they were commands (can over-block text containing
+  `git commit` while cwd is root). The separate update rule skips data heredocs. It remains lexical:
+  unusual shell grammars, arbitrary scripts and dynamic commands are not a security boundary.
 - Wrapper option tables cover the common wrappers above; an unknown wrapper or option that takes a value can still hide
   the real command.
 - The session cwd is read only from a core already loaded in the hook's process (it always is inside Hermes);

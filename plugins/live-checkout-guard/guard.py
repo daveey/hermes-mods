@@ -73,6 +73,13 @@ def in_root(path: str, cwd: Optional[str] = None) -> bool:
 
 
 def message(why: str) -> str:
+    if why == "unfenced hermes update":
+        return ("[live-checkout-guard] Refused: unfenced hermes update. Core updates go through each "
+                "host's fenced route: the hub's hermes-core-update.timer (every 10 min, drain-first, "
+                "batched) and hermes-sync's drain windows on the Macs. To wait for a commit, schedule "
+                "the card with a wake check like `ssh <hub> 'git -C ~/.hermes/hermes-agent "
+                "merge-base --is-ancestor <sha> HEAD'`. Read-only update flags are allowed. "
+                "Escape hatch: prefix the command with HERMES_UPDATE_OK=1 for a user-approved update only.")
     r = root_label()
     return (f"[live-checkout-guard] Refused: {why}.\n"
             f"{r} is the live checkout that the sync job and other agents load from; edit it in place and "
@@ -240,7 +247,7 @@ def _strip_wrappers(words: list[str], cwd: str) -> tuple[list[str], str, dict]:
         w = words[0]
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", w, re.S)
         if m:
-            if m.group(1) in {"GIT_DIR", "GIT_WORK_TREE"}:
+            if m.group(1) in {"GIT_DIR", "GIT_WORK_TREE", "HERMES_UPDATE_OK"}:
                 git_env[m.group(1)] = m.group(2)
             words = words[1:]
             continue
@@ -355,9 +362,9 @@ def _check_words(words: list[str], cwd: str, git_env: dict) -> tuple[Optional[st
     if cmd in SHELLS:
         script = _shell_c_script(args)
         if script is not None:
-            return check_shell(script, cwd), cwd
+            return check_shell(script, cwd, _update_checked=True), cwd
     if cmd == "eval" and args:
-        return check_shell(" ".join(args), cwd), cwd
+        return check_shell(" ".join(args), cwd, _update_checked=True), cwd
     if cmd == "git":
         return _check_git(args, cwd, git_env), cwd
     if cmd == "ln":  # only the link being created matters; a source inside the root is just read
@@ -390,8 +397,146 @@ def _check_words(words: list[str], cwd: str, git_env: dict) -> tuple[Optional[st
     return None, cwd
 
 
-def check_shell(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
+# Flags verified against `hermes update --help`; none of the backup/restart flags is read-only.
+UPDATE_READ_ONLY = {"-h", "--help", "--check", "--plan", "--list-venv-holders", "--install-id"}
+SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopPQRSWw")
+
+
+def _update_tokens(source: str) -> list[str]:
+    # Preserve quoted newlines as data; turn only unquoted command boundaries into
+    # semicolons. shlex otherwise consumes the newline terminating a comment.
+    cooked, quote, escaped, comment = [], "", False, False
+    for char in source:
+        if comment:
+            if char == "\n":
+                cooked.append(" ; ")
+                comment = False
+            continue
+        if escaped:
+            cooked.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            cooked.append(char)
+            escaped = True
+        elif char in {"'", '"'} and (not quote or quote == char):
+            quote = "" if quote else char
+            cooked.append(char)
+        elif char == "#" and not quote and (not cooked or cooked[-1][-1:].isspace()):
+            comment = True
+        elif char == "\n" and not quote:
+            cooked.append(" ; ")
+        else:
+            cooked.append(char)
+    lex = shlex.shlex("".join(cooked), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        return list(lex)
+    except ValueError:
+        return _tokens(source)
+
+
+def _update_source(source: str) -> str:
+    """Remove heredoc data, not following commands. This pass is update-only: existing
+    checkout-write analysis deliberately retains its conservative heredoc behavior."""
+    lines, pending = [], []
+    for line in source.splitlines(keepends=True):
+        if pending:
+            delimiter, strip_tabs, execute = pending[0]
+            candidate = line.rstrip("\r\n")
+            if (candidate.lstrip("\t") if strip_tabs else candidate) == delimiter:
+                pending.pop(0)
+            elif execute:
+                lines.append(line)
+            continue
+        lines.append(line)
+        toks = _update_tokens(line)
+        words, _, assignments = _strip_wrappers(toks[:], os.getcwd())
+        execute = bool(words and os.path.basename(words[0]) in SHELLS | {"ssh"}
+                       and assignments.get("HERMES_UPDATE_OK") != "1")
+        for i, token in enumerate(toks[:-1]):
+            if token == "<<" and "$((" not in line:
+                delimiter = toks[i + 1]
+                pending.append((delimiter.lstrip("-"), delimiter.startswith("-"), execute))
+    return "".join(lines)
+
+
+def _ssh_script(args: list[str]) -> str:
+    """SSH concatenates remote argv with spaces; options before the host belong to SSH."""
+    i, host_seen = 0, False
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            i += 1
+            if host_seen:
+                break
+            continue
+        if not arg.startswith("-") or arg == "-":
+            if host_seen:
+                break
+            host_seen = True
+            i += 1
+            continue
+        for j, flag in enumerate(arg[1:], 1):
+            if flag in SSH_VALUE_OPTIONS:
+                if j == len(arg) - 1:
+                    i += 1
+                break
+        i += 1
+    return " ".join(args[i:])
+
+
+def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0) -> Optional[str]:
+    """Inspect command positions, not arbitrary strings mentioning an update.
+    Explicit approval is scoped to one command and its nested shell/SSH payload."""
+    if depth > 20:
+        return None
+    for seg in _segments(_update_tokens(_update_source(source))):
+        words, _ = _redirect_targets(seg)
+        while words and words[0] in {"{", "!", "then", "do", "else", "elif", "if", "while", "until"}:
+            words = words[1:]
+        words, _, assignments = _strip_wrappers(words, cwd)
+        if not words:
+            continue
+        allowed = assignments.get("HERMES_UPDATE_OK", "1" if approved else "0") == "1"
+        cmd, args = os.path.basename(words[0]), words[1:]
+        if cmd == "hermes":
+            cli = args
+        elif re.fullmatch(r"python(?:\d+(?:\.\d+)*)?t?", cmd):
+            cli = []
+            for i, arg in enumerate(args):
+                if arg == "-m" and args[i + 1:i + 2] == ["hermes_cli.main"]:
+                    cli = args[i + 2:]
+                    break
+                if arg == "-mhermes_cli.main":
+                    cli = args[i + 1:]
+                    break
+        else:
+            cli = []
+        while cli and (cli[0] in {"-p", "--profile"} or cli[0].startswith("--profile=")):
+            cli = cli[1:] if cli[0].startswith("--profile=") else cli[2:]
+        if cli and cli[0] == "update" and not allowed and not UPDATE_READ_ONLY.intersection(cli[1:]):
+            return "unfenced hermes update"
+        script = None
+        if cmd == "ssh":
+            script = _ssh_script(args)
+        elif cmd in SHELLS:
+            script = _shell_c_script(args)
+        elif cmd == "eval":
+            script = " ".join(args)
+        if cmd in SHELLS | {"ssh"} and "<<<" in args:
+            i = args.index("<<<")
+            script = args[i + 1] if i + 1 < len(args) else script
+        if script and (why := _check_update(script, cwd, allowed, depth + 1)):
+            return why
+    return None
+
+
+def check_shell(cmd: str, cwd: Optional[str] = None, *, _update_checked: bool = False) -> Optional[str]:
     cwd = os.path.expanduser(cwd) if cwd else os.getcwd()
+    if not _update_checked and (why := _check_update(cmd, cwd)):
+        return why
     if not cmd.strip():
         return None
     for seg in _segments(_tokens(cmd)):
