@@ -1,0 +1,166 @@
+From bd56a1fce7f3da8833331614de9fc4368054cd5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 17:31:41 +0000
+Subject: [PATCH] fix(kanban): retire cleared queued hold evidence before
+ admission [daveey]
+
+---
+ hermes_cli/kanban_diagnostics.py              | 20 ++++--
+ hermes_cli/kanban_shared_blockers.py          | 12 +++-
+ .../test_kanban_cleared_ready_hold.py         | 70 +++++++++++++++++++
+ 3 files changed, 93 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_cleared_ready_hold.py
+
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index d703b2c9807..85d183ca7f8 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -731,10 +731,14 @@ def _foreign_machines(task, cfg) -> list[str]:
+ 
+ 
+ def _ready_hold_reason(task, events, cfg) -> Optional[str]:
+-    """Why a ready card is deliberately not claimed: its last event is ``respawn_guarded`` (the
+-    dispatcher is holding it), or it is pinned to a foreign machine this hub never runs. [daveey]"""
++    """Last observed guard or current foreign-machine pin, not a live admission verdict.
++
++    Capacity checks can precede pickup/guard evaluation, leaving old guard history on a
++    replica-only card. A same-second clear must outrank the guard it retired.
++    """
+     evs = list(events or [])
+-    if evs and _event_kind(max(evs, key=_event_ts)) == "respawn_guarded":
++    latest = max(evs, key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0)) if evs else None
++    if latest is not None and _event_kind(latest) == "respawn_guarded":
+         return "respawn_guarded"
+     if _foreign_machines(task, cfg):
+         return "foreign_runs_on"
+@@ -822,9 +826,13 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+         return []
+     return [Diagnostic(
+         kind="held_in_ready", severity="warning",
+-        title=f"Ready {int(age / 60)}m, held ({reason})",
+-        detail=f"Not stranded: {reason}. A respawn_guarded hold ends at its cap; a foreign "
+-               f"machine:* pin waits for that machine (or a re-file).",
++        title=(f"Ready {int(age / 60)}m, last observed hold ({reason})" if reason == "respawn_guarded"
++               else f"Ready {int(age / 60)}m, held ({reason})"),
++        detail=("The last recorded dispatch decision was a guard hold; the current hold is not verified. "
++                "A cleared blocker, capacity limit, or missing pickup can leave this historical event "
++                "unchanged. Check the execution machine's current dispatcher verdict."
++                if reason == "respawn_guarded" else
++                "A foreign machine:* pin waits for that machine (or a re-file)."),
+         actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
+         first_seen_at=since, last_seen_at=since, count=1,
+         data={"ready_since": since, "age_seconds": int(age), "hold_reason": reason,
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 93f8915d489..4b0a8260fb5 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -473,8 +473,8 @@ def shared_blocker_guard(
+ 
+ 
+ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+-    """Wake ``blocked`` and ``scheduled`` cards behind a blocker that later evidence cleared.
+-    Returns task ids."""
++    """Wake parked cards and retire ready/review hold evidence after a clear.
++    Returns only task ids whose lane changed (ready/review cards remain queued)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
+ 
+@@ -487,12 +487,18 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+             if asserted > st.cleared_at or tid == by_task:
+                 continue
+             row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+-            if row is None or row["status"] not in ("blocked", "scheduled"):
++            if row is None or row["status"] not in ("blocked", "scheduled", "ready", "review"):
+                 continue
+             if _already_saw_clear(conn, kb, tid, st):
+                 continue
+             payload = {"blocker_id": st.blocker_id, "cleared_by_task": by_task, "cleared_by_run": by_run,
+                        "cleared_via": st.cleared_via or "run"}
++            if row["status"] in ("ready", "review"):
++                # Admission may be capacity-limited before the guard is evaluated again.
++                # Retire the historical hold without changing lanes or bypassing admission.
++                with kb.write_txn(conn):
++                    kb._append_event(conn, tid, CLEARED_EVENT, payload)
++                continue
+             if row["status"] == "blocked":
+                 if not kb.unblock_task(conn, tid):
+                     continue
+diff --git a/tests/hermes_cli/test_kanban_cleared_ready_hold.py b/tests/hermes_cli/test_kanban_cleared_ready_hold.py
+new file mode 100644
+index 00000000000..7dc9634e53c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_cleared_ready_hold.py
+@@ -0,0 +1,70 @@
++"""A clear retires ready-card hold evidence even while capacity prevents admission."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_diagnostics as kd
++from hermes_cli import kanban_shared_blockers as ksb
++from tests.hermes_cli import test_kanban_shared_blockers as shared
++
++kanban_home = shared.kanban_home
++spawns = shared.spawns
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_clear_retires_ready_hold_before_capacity_and_dispatches_next_tick(kanban_home, spawns, monkeypatch, lane):
++    _, spawn = spawns
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
++    with kbc.connect_closing() as conn:
++        held = shared._blocked_behind(conn, "held")
++        probe = shared._blocked_behind(conn, "probe")
++        shared._age_runs(conn, 60)
++        kb.unblock_task(conn, held)
++        kb.unblock_task(conn, probe)
++        kb.claim_task(conn, probe)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, held))
++        # Actual dispatcher guard writes the history, not a fabricated diagnostic event.
++        first = kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert (held, ksb.GUARD_REASON) in first.respawn_guarded
++        assert not ksb.release_cleared_blockers(conn)
++        assert kb.complete_task(conn, probe, result="wall gone")
++        busy = kb.create_task(conn, title="unrelated worker", assignee="default")
++        kb.claim_task(conn, busy)
++        capped = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=1)
++        assert capped.at_capacity and not capped.spawned
++        assert kb.get_task(conn, held).status == lane
++        marks = conn.execute("SELECT * FROM task_events WHERE task_id = ? AND kind = ?",
++                             (held, ksb.CLEARED_EVENT)).fetchall()
++        assert len(marks) == 1
++        events = kb.list_events(conn, held)
++        assert kd._ready_hold_reason(kb.get_task(conn, held), events, {}) is None
++        assert not ksb.release_cleared_blockers(conn)  # one marker per clear, no tick spam
++        assert kb.complete_task(conn, busy, result="slot available")
++        admitted = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=1)
++        assert [tid for tid, *_ in admitted.spawned] == [held]
++        assert not admitted.respawn_guarded
++
++
++def test_historical_guard_diagnostic_does_not_claim_current_hold():
++    task = {"id": "t_history", "status": "ready", "assignee": "default", "created_at": 1}
++    events = [{"kind": "respawn_guarded", "created_at": 10,
++               "payload": {"reason": "shared_blocker"}}]
++    diags = kd.compute_task_diagnostics(task, events, [], now=4000)
++    held = next(d for d in diags if d.kind == "held_in_ready")
++    assert "last observed" in held.title.lower()
++    assert "current" in held.detail.lower() and "not verified" in held.detail.lower()
++    assert "not stranded" not in held.detail.lower()
++
++
++@pytest.mark.parametrize("reverse", [False, True])
++def test_same_second_clear_outranks_guard_regardless_of_list_order(reverse):
++    events = [{"id": 11, "created_at": 100, "kind": "respawn_guarded"},
++              {"id": 12, "created_at": 100, "kind": ksb.CLEARED_EVENT}]
++    if reverse:
++        events.reverse()
++    assert kd._ready_hold_reason({}, events, {}) is None
++    # Later assertion is still a real hold; a historical imported high id cannot win.
++    events.append({"id": 1, "created_at": 101, "kind": "respawn_guarded"})
++    assert kd._ready_hold_reason({}, events, {}) == "respawn_guarded"
+-- 
+2.55.0
+

@@ -1,0 +1,520 @@
+From db08b4371c46ea966f3994c070438007e1869b54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:55:27 +0000
+Subject: [PATCH] fix(kanban): never subscribe, inherit, link or notify a
+ Kanban worker transcript [daveey]
+
+Hub card t_a989e5e0 held five MacBook worker-transcript shepherd subs (copied on link
+from t_ae24b36d via _inherit_notify_subs); on done the unloaded/remote sweep wrote its
+notice into each transcript and every wake was refused (session.resume 4132).
+
+- add_notify_sub refuses hub/tui subs on a local-<sha256> receipt session
+- _owning_sub_clause never inherits a worker-transcript sub (rows written earlier)
+- chat-link reconcile never writes and retires shepherd links on worker sessions
+- remote sweep (_deliver_link) settles worker targets with swept reason
+  worker_transcript: no row, no wake; the unloaded sweep drops such a sub
+  (receipt id or SessionDB.is_kanban_owned_session)
+---
+ hermes_cli/kanban_chat_links.py               |  20 ++-
+ hermes_cli/kanban_db_notify.py                |  23 ++-
+ tests/hermes_cli/test_kanban_chat_links.py    |  22 +++
+ .../test_kanban_notify_inheritance.py         |  58 +++++++
+ .../test_kanban_worker_transcript_notices.py  | 151 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |  39 ++++-
+ tui_gateway/kanban_unloaded.py                |   8 +-
+ tui_gateway/notice_fanout.py                  |  21 +++
+ 8 files changed, 331 insertions(+), 11 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_worker_transcript_notices.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index be486eece7e..f7e24fb833d 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -34,6 +34,13 @@ def link_uid(task_id: str, gateway: str, profile: Optional[str], session: str, k
+     return f"{task_id}:{gateway}:{profile or '-'}:{session}:{kind}"
+ 
+ 
++def _worker_shepherd(session: Any, kind: str) -> bool:
++    """A shepherd link on a headless receipt session (Kanban worker / cron transcript): never a chat. [daveey]
++    A ``created`` link from a worker stays: it records which run made the card, it wakes nothing."""
++    from hermes_cli.kanban_db_notify import is_headless_session
++    return kind == "shepherd" and is_headless_session(session)
++
++
+ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str, Any]]:
+     """Links from this board file's own data: creating chats and ``tui`` shepherd subscriptions."""
+     from hermes_cli.kanban_session_activity import _counted_sub_clause
+@@ -42,7 +49,7 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+ 
+     def add(task_id: str, session: str, kind: str, created_at: Any) -> None:
+         from hermes_cli.kanban_placement import is_placeholder_session
+-        if is_placeholder_session(session):
++        if is_placeholder_session(session) or _worker_shepherd(session, kind):
+             return
+         uid = link_uid(task_id, gateway, None, session, kind)
+         out[uid] = {"uid": uid, "task_id": task_id, "chat_gateway": gateway, "chat_profile": None,
+@@ -71,9 +78,9 @@ def _ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
+         if card.get("board") != board or card.get("origin_gateway") not in (None, gateway) or not card.get("session"):
+             continue
+         from hermes_cli.kanban_placement import is_placeholder_session
+-        if is_placeholder_session(card["session"]):
+-            continue
+         kind = "created" if card.get("via") == "origin" else "shepherd"
++        if is_placeholder_session(card["session"]) or _worker_shepherd(card["session"], kind):
++            continue
+         profile = card.get("origin_profile")
+         uid = link_uid(card["id"], gateway, profile, card["session"], kind)
+         out[uid] = {"uid": uid, "task_id": card["id"], "chat_gateway": gateway, "chat_profile": profile,
+@@ -96,12 +103,13 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     if ledger:
+         want.update(_ledger_links(board, gateway))
+     from hermes_cli.kanban_placement import is_placeholder_session
+-    rows = conn.execute("SELECT uid, released, chat_session FROM task_chat_links WHERE chat_gateway = ?",
++    rows = conn.execute("SELECT uid, released, chat_session, kind FROM task_chat_links WHERE chat_gateway = ?",
+                         (gateway,)).fetchall()
+     have = {r[0]: r[1] for r in rows}
+     # A placement attribution id is not a chat: its link is deleted (captured, so the Board drops it too), never
+-    # merely released; a released one still counted in every diff and replica read.
+-    placeholders = {r[0] for r in rows if is_placeholder_session(r[2])}
++    # merely released; a released one still counted in every diff and replica read. A worker transcript's
++    # shepherd link is no chat either (its wakes are refused). [daveey]
++    placeholders = {r[0] for r in rows if is_placeholder_session(r[2]) or _worker_shepherd(r[2], r[3])}
+     added = changed = released = retired = 0
+     with write_txn(conn):
+         for uid in placeholders - set(want):
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index d315234ad5a..cd32855e6c3 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ import json
++import re
+ import sqlite3
+ import time
+ from pathlib import Path
+@@ -40,6 +41,18 @@ _SCALAR_TYPES = (str, int, float, bool)
+ _SUB_KEY_WHERE = "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
+ 
+ 
++# A ``local-<sha256>`` session id is a headless LOCAL creation receipt (``hermes_state_keys.local_identity``): a
++# Kanban worker run, cron job or one-shot, never an interactive chat. Its notices are never read and a wake is
++# refused (``session.resume`` 4132 for workers), so it is never a notify destination. [daveey]
++_HEADLESS_SESSION = re.compile(r"local-[0-9a-f]{64}")
++_HEADLESS_GLOB = "local-" + "[0-9a-f]" * 64
++
++
++def is_headless_session(chat_id: Any) -> bool:
++    """True for a headless receipt session id, bare (``tui``) or ``<gw>/<profile>/<session>`` (``hub``)."""
++    return bool(_HEADLESS_SESSION.fullmatch(str(chat_id or "").rsplit("/", 1)[-1]))
++
++
+ def _sub_key(task_id: str, platform: str, chat_id: str, thread_id: Optional[str]) -> tuple:
+     return (task_id, platform, chat_id, thread_id or "")
+ 
+@@ -100,7 +113,7 @@ def add_notify_sub(
+     ``MAX(task_events.id)``) so the notifier never replays history at boot.
+     """
+     from hermes_cli.kanban_placement import is_placeholder_session
+-    if platform in ("hub", "tui") and is_placeholder_session(chat_id):
++    if platform in ("hub", "tui") and (is_placeholder_session(chat_id) or is_headless_session(chat_id)):
+         return
+     valid_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
+     # api_server is stateless: the adapter has no send(), the wake self-post IS
+@@ -814,8 +827,12 @@ def _owning_sub_clause() -> str:
+     observers = ", ".join(f"'{r}'" for r in OBSERVER_SUB_REASONS)
+     reason = ("CASE WHEN json_valid(s.delivery_metadata) "
+               "THEN json_extract(s.delivery_metadata, '$.reason') END")
+-    return (f"COALESCE({reason} IN ({observers}), 0) = 0 AND ({reason} IS NOT NULL OR s.platform != 'hub' "
+-            f"OR s.created_at <= COALESCE(p.created_at, 0) + {LEGACY_ORIGIN_BIND_WINDOW_S})")
++    # A headless receipt session (worker/cron transcript) is never a destination, whatever its reason: a row
++    # written before ``add_notify_sub`` refused them must not spread to children (``is_headless_session``).
++    headless = (f"(s.platform IN ('hub', 'tui') AND (s.chat_id GLOB '{_HEADLESS_GLOB}' "
++                f"OR s.chat_id GLOB '*/{_HEADLESS_GLOB}'))")
++    return (f"COALESCE({reason} IN ({observers}), 0) = 0 AND NOT {headless} AND ({reason} IS NOT NULL "
++            f"OR s.platform != 'hub' OR s.created_at <= COALESCE(p.created_at, 0) + {LEGACY_ORIGIN_BIND_WINDOW_S})")
+ 
+ 
+ # Late-bound origin namespace (see module docstring); imported LAST so this
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index 9f8278d9f4a..4977302ae19 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -65,6 +65,28 @@ def test_reconcile_writes_created_and_shepherd_links_once_and_through_capture(li
+     assert (mine, "s_watcher", "shepherd", 1) in _links(live)
+ 
+ 
++WORKER = "local-" + "7c" * 32  # a Kanban worker / cron receipt session: never a chat
++
++
++def test_a_worker_transcript_gets_no_shepherd_link_and_an_old_one_is_retired(live, monkeypatch):
++    """Hub card t_a989e5e0: worker transcripts held shepherd subs/links, so its notice and wake went to sessions that
++    refuse them (4132). A worker's shepherd link is never written and an existing one is deleted; a worker's
++    ``created`` link (which run made the card) stays."""
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [_ledger_row("t_remote", WORKER)])
++    mine = kb.create_task(live, title="mine", assignee="worker", session_id=WORKER)
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) VALUES (?, 'tui', ?, 1)",
++                     (mine, WORKER))  # an older process wrote it before add_notify_sub refused workers
++        live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) VALUES (?, 'tui', 's_chat', 1)",
++                     (mine,))
++        live.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, released, "
++                     "created_at) VALUES (?, 't_old', ?, NULL, ?, 'shepherd', 0, 1)",
++                     (links.link_uid("t_old", ME, None, WORKER, "shepherd"), ME, WORKER))
++    out = links.reconcile(live, "default", ME)
++    assert out["retired"] == 1
++    assert _links(live) == {(mine, WORKER, "created", 0), (mine, "s_chat", "shepherd", 0)}
++
++
+ def test_reconcile_carries_this_gateways_ledger_links_and_their_release(live, monkeypatch):
+     rows = [_ledger_row("t_remote1", "s_chat"), _ledger_row("t_remote2", "s_chat", via="origin"),
+             _ledger_row("t_other_board", "s_chat", board="runners")]
+diff --git a/tests/hermes_cli/test_kanban_notify_inheritance.py b/tests/hermes_cli/test_kanban_notify_inheritance.py
+index 566d0d8dfeb..b3d30936ef1 100644
+--- a/tests/hermes_cli/test_kanban_notify_inheritance.py
++++ b/tests/hermes_cli/test_kanban_notify_inheritance.py
+@@ -8,6 +8,7 @@ binding's ``origin``, legacy rows written in the creating call) plus the creator
+ The DM-routing columns of what IS inherited stay covered by test_kanban_notify.py (issue #73030).
+ """
+ import argparse
++import json
+ import time
+ from pathlib import Path
+ 
+@@ -87,6 +88,63 @@ def test_shepherd_observer_subs_not_inherited_by_child(kanban_home, path):
+         conn.close()
+ 
+ 
++WORKER = "local-" + "7c" * 32  # a headless receipt session: a Kanban worker (or cron) run, never a chat
++
++
++def _worker_rows(conn, parent):
++    """Subs on worker transcripts an older process wrote before ``add_notify_sub`` refused them. They carry OWNING
++    reasons (a worker-created card's ``create``, an origin bound to a worker), so provenance alone would copy them."""
++    with kb.write_txn(conn):
++        for platform, chat, reason in (("hub", f"macbook/default/{WORKER}", "origin"), ("tui", WORKER, "create")):
++            conn.execute(
++                "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, delivery_metadata, "
++                "created_at, last_event_id) VALUES (?, ?, ?, '', ?, ?, 0)",
++                (parent, platform, chat, json.dumps({"reason": reason}), int(time.time())))
++
++
++@pytest.mark.parametrize("path", ["link", "parents", "creator"])
++def test_worker_transcript_subs_never_reach_a_child(kanban_home, path):
++    """Hub card t_a989e5e0: linking it under t_ae24b36d (2026-10-27 14:15:47Z, ``link_tasks`` ->
++    ``_inherit_notify_subs``) copied five MacBook worker-transcript shepherd subs onto it; its done notice then
++    went into five transcripts whose wakes were refused (4132). No inheritance path copies a worker sub."""
++    conn = kbc.connect()
++    try:
++        parent = kb.create_task(conn, title="rollout", assignee="default", session_id="creator")
++        kbn.add_notify_sub(conn, task_id=parent, platform="tui", chat_id="creator",
++                           notifier_profile="default", delivery_metadata={"reason": "create"})
++        _worker_rows(conn, parent)
++        assert len(kbn.list_notify_subs(conn, parent)) == 3
++        if path == "link":
++            child = kb.create_task(conn, title="later", assignee="w")
++            kb.link_tasks(conn, parent, child)
++        elif path == "parents":
++            child = kb.create_task(conn, title="gated", assignee="w", parents=[parent])
++        else:
++            child = kb.create_task(conn, title="fan-out", assignee="w", creator_task_id=parent)
++        assert _sub_keys(conn, child) == [("tui", "creator")]
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("platform, chat", [("hub", f"macbook/default/{WORKER}"), ("tui", WORKER)])
++def test_worker_transcript_is_never_subscribed(kanban_home, platform, chat):
++    """hermes-hub's ``shepherd`` action runs ``notify-subscribe --platform hub`` for whatever session the requester
++    names; MacBook workers' cross_task reads made 69 such requests for their own transcripts (hub req_ledger,
++    2026-10-29..30). A worker transcript is refused; a chat (control) is subscribed."""
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="card", assignee="default")
++    finally:
++        conn.close()
++    _subscribe_cli(tid, platform, chat)
++    _subscribe_cli(tid, platform, chat.replace(WORKER, "20261026_110445_20914b"))
++    conn = kbc.connect()
++    try:
++        assert [c for _p, c in _sub_keys(conn, tid)] == [chat.replace(WORKER, "20261026_110445_20914b")]
++    finally:
++        conn.close()
++
++
+ def test_decompose_child_does_not_inherit_observer_subs(kanban_home):
+     conn, parent = _shepherd_parent(observers=3)
+     try:
+diff --git a/tests/tui_gateway/test_kanban_worker_transcript_notices.py b/tests/tui_gateway/test_kanban_worker_transcript_notices.py
+new file mode 100644
+index 00000000000..d2955307858
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_worker_transcript_notices.py
+@@ -0,0 +1,151 @@
++"""A Kanban worker transcript never gets a card notice or a wake. [daveey]
++
++Hub card t_a989e5e0 finished 2026-10-31 17:37:58Z. Five MacBook worker transcripts of another card held hermes-hub
++shepherd subs on it (copied onto it when it was linked under t_ae24b36d), so the MacBook's unloaded sweeper wrote the
++done notice into each transcript and tried to wake each one; every wake was refused (``session.resume`` 4132: "is a
++Kanban worker transcript"). A worker transcript is a ``local-<sha256>`` receipt id, or (older workers) a session its
++store tags ``kanban``. Both sweeps now settle such a target without a row or a wake; the remote one records it in the
++ledger with a ``swept`` reason so no later pass offers it again.
++"""
++
++import contextlib
++import sqlite3
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_state import SessionDB
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import kanban_unloaded as ku
++from tui_gateway.kanban_remote_notices import sweep_remote_notices
++
++from tests.tui_gateway.test_kanban_remote_notices import _hub, _ledger_row
++
++CHAT = "20261026_110445_20914b"
++RECEIPT_WORKER = "local-" + "7c" * 32
++OLD_WORKER = "20261026_132706_2fca70"  # a pre-receipt worker id: only its ``kanban`` source tells
++TID = "t_a989e5e0"
++REF = f"hub/default/default/{TID}"
++
++
++def _done_card(now):
++    task = {"id": TID, "status": "done", "title": "rollout", "board": "default", "assignee": "default",
++            "completed_at": now - 60,
++            "completion_notice": {"event_id": 9123, "payload": {"summary": "shipped"}},
++            "sessions": [{"gw": "macbook", "profile": "default", "session": sid, "rel": "shepherd"}
++                         for sid in (CHAT, RECEIPT_WORKER, OLD_WORKER)]}
++    return {"key": f"default/default/{TID}", "task": task}
++
++
++def _store(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session(CHAT, "desktop")
++    db.create_session(RECEIPT_WORKER, "kanban")
++    db.create_session(OLD_WORKER, "kanban")
++    return db
++
++
++def _notices(db, sid):
++    return [m for m in db.get_messages(sid) if m.get("display_kind") == "kanban_notice"]
++
++
++class _Waker:
++    grace_s = 30.0
++
++    def __init__(self):
++        self.tips = []
++
++    def deliver(self, tip, text, metadata, task, at, *, persist, started):
++        self.tips.append(tip)
++        return "persisted" if persist() else "deferred"
++
++
++def _swept(ledger):
++    with contextlib.closing(sqlite3.connect(ledger)) as conn:
++        return {row[0]: row[1] for row in conn.execute("SELECT session, reason FROM swept")}
++
++
++def test_remote_sweep_settles_worker_transcripts_without_a_row_or_a_wake(tmp_path):
++    now = time.time()
++    replica = _hub(tmp_path, [_done_card(now)])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    waker = _Waker()
++    with _store(tmp_path) as db:
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield (db, db.get_compression_tip(sid) or sid) if db.get_session(sid) else (None, None)
++
++        out = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger,
++                                   now=now, waker=waker)
++
++        assert waker.tips == [CHAT] and [item["session_id"] for item in out] == [CHAT]
++        assert len(_notices(db, CHAT)) == 1
++        assert _notices(db, RECEIPT_WORKER) == [] and _notices(db, OLD_WORKER) == []
++        for worker in (RECEIPT_WORKER, OLD_WORKER):
++            row = _ledger_row(ledger, worker, REF)
++            assert row["delivered"] == krn.SETTLED and row["settled"] == "worker_transcript"
++            assert row["holder_pid"] is None
++        assert _swept(ledger) == {CHAT: "delivered", RECEIPT_WORKER: "worker_transcript",
++                                  OLD_WORKER: "worker_transcript"}
++
++        krn._reset_for_tests()  # a restarted backend: the ledger keeps them settled
++        assert sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger,
++                                    now=now, waker=waker) == []
++        assert waker.tips == [CHAT]
++        assert _notices(db, RECEIPT_WORKER) == [] and _notices(db, OLD_WORKER) == []
++
++
++def test_passive_remote_sweep_writes_no_row_into_a_worker_transcript(tmp_path):
++    """Without a waker (row-only path) the worker transcripts get nothing either; the chat still gets its row."""
++    now = time.time()
++    replica = _hub(tmp_path, [_done_card(now)])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    with _store(tmp_path) as db:
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield (db, sid) if db.get_session(sid) else (None, None)
++
++        out = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger, now=now)
++
++        assert [item["session_id"] for item in out] == [CHAT]
++        assert _notices(db, RECEIPT_WORKER) == [] and _notices(db, OLD_WORKER) == []
++        assert _ledger_row(ledger, OLD_WORKER, REF)["settled"] == "worker_transcript"
++
++
++def test_unloaded_local_sweep_drops_a_sub_on_a_worker_transcript(tmp_path):
++    """The local (``tui``) sweep: a sub on a worker transcript gets no row and no wake, and the sub is removed;
++    the chat on the same card is still woken."""
++    db = _store(tmp_path)
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="local card", assignee="worker")
++        for chat in (CHAT, OLD_WORKER):
++            kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat)
++        kb.complete_task(conn, tid, summary="shipped")
++    finally:
++        conn.close()
++
++    @contextlib.contextmanager
++    def opener(chat_id):
++        yield (db, db.get_compression_tip(chat_id) or chat_id) if db.get_session(chat_id) else (None, None)
++
++    calls = []
++
++    def wake(session_id, text, metadata):
++        calls.append(session_id)
++        return "started"
++
++    ku._reset_wake_budget_for_tests()
++    with db:
++        ku.sweep_once(set(), now=time.time() + 3600, session_db=opener, wake=wake, spawn=lambda job: job(),
++                      holders=list)
++        assert calls == [CHAT]
++        assert _notices(db, OLD_WORKER) == []
++    conn = kbc.connect()
++    try:
++        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, tid)] == [CHAT]
++    finally:
++        conn.close()
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 6fcb80b4d92..dca666529b2 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -904,6 +904,39 @@ def _persist_claimed(session_db, profile: str, sid: str, text: str, metadata: di
+     return True
+ 
+ 
++def _settle_unread(ledger, *, session: str, ref: str, state: str, now: float, notice_key: str, swept_key: tuple,
++                   reason: str) -> bool:
++    """Record a notice no chat will read (its target is a worker transcript) as SETTLED, with a ``swept`` row of
++    ``reason``: no transcript row, no wake, and no later pass offers it again. An existing claim in flight or a
++    DELIVERED row is left as it is. Returns whether this call settled it. Never raises. [daveey]
++
++    Hub card t_a989e5e0 (2026-10-31): its done notice was written into five MacBook worker transcripts that held
++    shepherd subs, and the wake of each was refused (``session.resume`` 4132)."""
++    try:
++        with contextlib.closing(_ledger(ledger)) as conn:
++            with conn:
++                before = conn.total_changes
++                conn.execute(
++                    "INSERT OR IGNORE INTO notices (session, ref, state, at, delivered, notice_key, legacy_seen, "
++                    "settled) VALUES (?,?,?,?,?,?,1,?)", (session, ref, state, now, SETTLED, notice_key, reason))
++                if conn.total_changes == before:
++                    conn.execute(
++                        "UPDATE notices SET delivered=?, settled=?, notice_key=IFNULL(notice_key, ?) "
++                        "WHERE session=? AND ref=? AND state=? AND delivered=0 AND holder_pid IS NULL",
++                        (SETTLED, reason, notice_key, session, ref, state))
++                changed = conn.total_changes != before
++                if changed:
++                    _swept_row(conn, swept_key, reason)
++        if changed:
++            logger.info("remote kanban notice %s %s not delivered to %s: %s", ref, state, session, reason)
++        else:
++            _remember_delivered(tuple(swept_key))
++        return changed
++    except Exception:
++        logger.debug("remote kanban: settling an unread notice failed", exc_info=True)
++        return False
++
++
+ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session_db, ledger, settled,
+                   delivered: list, swept: list, waker=None, observed_at=None, now=None) -> None:
+     """Deliver one fresh notice unless the memo or the ledger already settled it. A failed write is not remembered.
+@@ -931,9 +964,13 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+         with session_db(profile, sid) as (db, tip):
+             if db is None or not text:
+                 return
+-            from tui_gateway.notice_fanout import chat_skip_reason
++            from tui_gateway.notice_fanout import chat_skip_reason, worker_transcript_reason
+             if chat_skip_reason(db, sid) is not None:  # [daveey] archived chat or a copy moved to another gateway
+                 return
++            if (why := worker_transcript_reason(db, sid)) is not None:
++                _settle_unread(ledger, session=sid, ref=ref, state=state, now=now or time.time(),
++                               notice_key=event_key, swept_key=memo_key, reason=why)
++                return
+             if settled((sid, tip), ref, state):
+                 _remember_delivered(memo_key)
+                 return
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 4720c09e746..3b123ac96bc 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -379,9 +379,15 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+                     logger.info("Dropped notify sub for archived %s/%s: no store holds chat %s",
+                                 slug, ident["task_id"], ident["chat_id"])
+             return None
+-        from tui_gateway.notice_fanout import chat_skip_reason
++        from tui_gateway.notice_fanout import chat_skip_reason, worker_transcript_reason
+         skip = chat_skip_reason(db, sub["chat_id"])  # [daveey] archived / moved copy: the notice goes nowhere
++        # [daveey] A worker transcript never reads a notice and refuses the wake (4132): no row, and its sub goes.
++        worker = skip is None and worker_transcript_reason(db, sub["chat_id"]) is not None
++        skip = "worker_transcript" if worker else skip
+         old, new, claimed = _kbn.claim_unseen_events_for_sub(conn, kinds=kinds, durable=skip is None, **ident)
++        if worker:
++            with contextlib.suppress(Exception):
++                _kbn.remove_notify_sub(conn, **ident)
+         if not claimed:
+             return None  # a live poller or another sweeper got there first
+     if skip is not None:
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 3e629bd1dea..fee3c822615 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -59,6 +59,27 @@ def chat_skip_reason(db: Any, chat_id: str) -> Optional[str]:
+     return None
+ 
+ 
++WORKER_TRANSCRIPT = "worker_transcript"
++
++
++def worker_transcript_reason(db: Any, chat_id: str) -> Optional[str]:
++    """``"worker_transcript"`` when ``chat_id`` is a headless run, not a chat: a ``local-<sha256>`` receipt id
++    (Kanban worker, cron, one-shot) or a session this store tags ``kanban`` (older worker ids look like chats).
++    A notice there is never read and its wake is always refused (``session.resume`` code 4132). [daveey]
++
++    Hub card t_a989e5e0 (2026-10-31): five MacBook worker transcripts of another card held shepherd subs on it, so
++    its done notice was written into all five and each wake was refused. Never raises (unknown = a chat)."""
++    from hermes_cli.kanban_db_notify import is_headless_session
++    if is_headless_session(chat_id):
++        return WORKER_TRANSCRIPT
++    probe = getattr(db, "is_kanban_owned_session", None)
++    try:
++        return WORKER_TRANSCRIPT if probe is not None and probe(chat_id) is True else None
++    except sqlite3.Error:
++        logger.debug("worker-transcript probe failed for %s", chat_id, exc_info=True)
++        return None
++
++
+ def link_released(link: Any) -> bool:
+     """A replica ``sessions[]`` link (or ``task_chat_links`` row) the owner released: no notices go there."""
+     return isinstance(link, dict) and str(link.get("released") or "0").lower() not in ("0", "false", "")
+-- 
+2.55.0
+

@@ -1,0 +1,242 @@
+From 9810bd36fa5398ceffdc1d2c93123e4d5409544b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:19:00 +0000
+Subject: [PATCH] fix(kanban): retain ended-run evidence across worker eviction
+ [daveey]
+
+---
+ hermes_cli/kanban_run_tombstones.py           | 36 ++++++++
+ hermes_cli/kanban_worker_node.py              |  2 +
+ hermes_cli/kanban_worker_scope.py             | 10 +--
+ .../test_kanban_evicted_run_scope.py          | 88 +++++++++++++++++++
+ .../hermes_cli/test_kanban_run_tombstones.py  | 39 ++++++++
+ 5 files changed, 170 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_run_tombstones.py
+ create mode 100644 tests/hermes_cli/test_kanban_evicted_run_scope.py
+ create mode 100644 tests/hermes_cli/test_kanban_run_tombstones.py
+
+diff --git a/hermes_cli/kanban_run_tombstones.py b/hermes_cli/kanban_run_tombstones.py
+new file mode 100644
+index 00000000000..4fbdd65bb73
+--- /dev/null
++++ b/hermes_cli/kanban_run_tombstones.py
+@@ -0,0 +1,36 @@
++"""Machine-local ended-run evidence, retained across foreign-copy eviction.
++
++Run IDs in systemd scope names are local SQLite IDs, not Board run UIDs. Keep
++that mapping in the same database, atomically with eviction; a Board replica's
++numeric run ID is not interchangeable. This table deliberately has neither sync
++capture nor a task foreign key. Absence is never evidence that a run ended.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++
++_TABLE = "kanban_ended_run_tombstones"
++
++
++def retain_ended_runs(conn: sqlite3.Connection, task_id: str) -> None:
++    """Called inside eviction's write transaction, before deleting task_runs."""
++    conn.execute(f"CREATE TABLE IF NOT EXISTS {_TABLE} ("
++                 "task_id TEXT NOT NULL, run_id INTEGER NOT NULL, ended_at INTEGER NOT NULL, "
++                 "worker_pid INTEGER, PRIMARY KEY (task_id, run_id))")
++    conn.execute(f"INSERT OR IGNORE INTO {_TABLE} (task_id, run_id, ended_at, worker_pid) "
++                 "SELECT task_id, id, ended_at, worker_pid FROM task_runs "
++                 "WHERE task_id = ? AND ended_at IS NOT NULL", (task_id,))
++
++
++def ended_run(conn: sqlite3.Connection, task_id: str, run_id: int):
++    """Live rows win (including open runs); old databases need no read-side DDL."""
++    row = conn.execute("SELECT ended_at, worker_pid FROM task_runs WHERE id = ? AND task_id = ?",
++                       (run_id, task_id)).fetchone()
++    if row is not None:
++        return row
++    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_TABLE,)).fetchone()
++    if not exists:
++        return None
++    return conn.execute(f"SELECT ended_at, worker_pid FROM {_TABLE} WHERE run_id = ? AND task_id = ?",
++                        (run_id, task_id)).fetchone()
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index cf9d5bcdf9a..811a4ff4715 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -272,6 +272,8 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+                     "SELECT 1 FROM kanban_sync_outbox WHERE state != 'rejected' AND (row_uid = ? OR "
+                     "json_extract(fields, '$.task_id') = ?) LIMIT 1", (tid, tid)).fetchone():
+                 continue
++            from hermes_cli.kanban_run_tombstones import retain_ended_runs
++            retain_ended_runs(conn, tid)
+             for table in present:
+                 conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (tid,))
+             # The copy's own edges go with it; an edge from it to a card still in this file belongs to that child
+diff --git a/hermes_cli/kanban_worker_scope.py b/hermes_cli/kanban_worker_scope.py
+index 2eba08c271d..92e1a561541 100644
+--- a/hermes_cli/kanban_worker_scope.py
++++ b/hermes_cli/kanban_worker_scope.py
+@@ -253,8 +253,9 @@ def stop_ended_run_scopes(
+     """Stop the systemd scopes of this board's runs that ended ``grace_seconds`` ago.
+ 
+     Throttled to one sweep per ``RUN_SCOPE_SWEEP_INTERVAL_SECONDS`` per board unless
+-    ``force``. A run whose row is not on this board, whose retained worker is still
+-    alive (``reap_terminal_workers`` owns that), or whose scope holds this process is
++    ``force``. A run with neither a row nor an eviction tombstone on this board,
++    whose retained worker is still alive (``reap_terminal_workers`` owns that),
++    or whose scope holds this process is
+     left alone. Returns one record per scope acted on (also logged and booked as a
+     ``run_scope_stopped`` event). Never raises.
+     """
+@@ -280,9 +281,8 @@ def stop_ended_run_scopes(
+             if parsed is None:
+                 continue
+             task_id, run_id = parsed
+-            row = conn.execute(
+-                "SELECT ended_at, worker_pid FROM task_runs WHERE id = ? AND task_id = ?",
+-                (run_id, task_id)).fetchone()
++            from hermes_cli.kanban_run_tombstones import ended_run
++            row = ended_run(conn, task_id, run_id)
+             if row is None or row[0] is None or int(row[0]) > cutoff:
+                 continue
+             if row[1] is not None and kb._pid_alive(int(row[1])):
+diff --git a/tests/hermes_cli/test_kanban_evicted_run_scope.py b/tests/hermes_cli/test_kanban_evicted_run_scope.py
+new file mode 100644
+index 00000000000..aa2c4b409cb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_evicted_run_scope.py
+@@ -0,0 +1,88 @@
++"""Evicting a foreign copy must not discard the proof needed to reap its scope."""
++import json
++import subprocess
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli import kanban_worker_scope as kws
++from tests.hermes_cli import test_kanban_worker_node as node_tests
++from tests.hermes_cli.test_kanban_run_scope_stop import FakeSystemd, _dead_pid, _start
++
++
++@pytest.fixture
++def svc():
++    return node_tests.svc.__wrapped__()
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    yield from node_tests.gws.__wrapped__(tmp_path, monkeypatch, svc)
++
++
++def _placed_run(gws):
++    home, worker = gws
++    tid = node_tests._hub_card(home, runs_on=["machine:worker-1"])
++    worker.round()
++    worker.enter()
++    dead = _dead_pid()
++    kbd.dispatch_once(worker.conn, spawn_fn=lambda *a, **k: dead, board="default")
++    run = kb._current_run_id(worker.conn, tid)
++    return tid, run, f"hermes-worker-kanban-{tid}-run-{run}.scope"
++
++
++@pytest.mark.parametrize("persist", [False, True])
++def test_evicted_ended_run_reaped_after_grace(gws, tmp_path, monkeypatch, persist):
++    home, worker = gws
++    systemd = FakeSystemd(tmp_path, monkeypatch)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    tid, run, unit = _placed_run(gws)
++    with subprocess.Popen(["sleep", "3600"]) as child:
++        try:
++            systemd.add(unit, [child.pid])
++            if persist:
++                (worker.home / "processes.json").write_text(json.dumps([
++                    {"pid": child.pid, "host_start_time": _start(child.pid), "persist_on_release": True}
++                ]))
++            assert kb.complete_task(worker.conn, tid, result="done", expected_run_id=run)
++            ended = worker.conn.execute("SELECT ended_at FROM task_runs WHERE id=?", (run,)).fetchone()[0]
++            worker.round()
++            home.round()
++            worker.enter()
++            wn.evict(worker.conn)
++            assert kb.get_task(worker.conn, tid) is None
++            assert worker.conn.execute("SELECT 1 FROM task_runs WHERE id=? AND task_id=?", (run, tid)).fetchone() is None
++            assert kws.stop_ended_run_scopes(worker.conn, force=True) == []
++            monkeypatch.setattr(time, "time", lambda: ended + kws.RUN_SCOPE_STOP_GRACE_SECONDS + 1)
++            records = kws.stop_ended_run_scopes(worker.conn, force=True)
++            assert systemd.stops == ([] if persist else [unit])
++            assert [r["systemd_unit"] for r in records] == ([] if persist else [unit])
++            assert child.poll() is None  # FakeSystemd records stops; never touches host scopes.
++        finally:
++            child.terminate()
++            child.wait(timeout=10)
++
++
++def test_open_home_run_with_live_lease_is_not_stopped(gws, svc, tmp_path, monkeypatch):
++    home, worker = gws
++    systemd = FakeSystemd(tmp_path, monkeypatch)
++    tid, _run, unit = _placed_run(gws)
++    worker.round()
++    home.round()
++    assert svc.board("default")["leases"][tid]["expires"] > time.time() * 1000
++    assert home.conn.execute("SELECT ended_at FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] is None
++    worker.enter()
++    assert tid not in wn.evict(worker.conn)
++    with subprocess.Popen(["sleep", "3600"]) as child:
++        try:
++            systemd.add(unit, [child.pid])
++            assert kws.stop_ended_run_scopes(worker.conn, grace_seconds=0, force=True) == []
++            assert systemd.stops == []
++            assert child.poll() is None
++        finally:
++            child.terminate()
++            child.wait(timeout=10)
+diff --git a/tests/hermes_cli/test_kanban_run_tombstones.py b/tests/hermes_cli/test_kanban_run_tombstones.py
+new file mode 100644
+index 00000000000..08449b6e800
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_run_tombstones.py
+@@ -0,0 +1,39 @@
++"""Local cleanup evidence is transactional and never substitutes for an open run."""
++import sqlite3
++
++from hermes_cli.kanban_run_tombstones import ended_run, retain_ended_runs
++
++
++def test_legacy_missing_and_open_rows_are_not_ended():
++    with sqlite3.connect(":memory:") as conn:
++        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, ended_at INTEGER, worker_pid INTEGER)")
++        assert ended_run(conn, "t", 1) is None
++        conn.execute("INSERT INTO task_runs VALUES (1, 't', NULL, NULL)")
++        retain_ended_runs(conn, "t")
++        assert conn.execute("SELECT count(*) FROM kanban_ended_run_tombstones").fetchone()[0] == 0
++        conn.execute("UPDATE task_runs SET ended_at=100")
++        retain_ended_runs(conn, "t")
++        conn.execute("UPDATE task_runs SET ended_at=NULL")
++        assert ended_run(conn, "t", 1) == (None, None)
++        conn.execute("DELETE FROM task_runs")
++        assert ended_run(conn, "t", 1) == (100, None)
++        assert ended_run(conn, "other", 1) is None
++
++
++def test_retention_rolls_back_with_eviction(tmp_path):
++    path = tmp_path / "board.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, ended_at INTEGER, worker_pid INTEGER)")
++        conn.execute("INSERT INTO task_runs VALUES (1, 't', 100, NULL)")
++        conn.commit()
++        conn.execute("BEGIN IMMEDIATE")
++        retain_ended_runs(conn, "t")
++        conn.execute("DELETE FROM task_runs")
++        conn.rollback()
++        assert ended_run(conn, "t", 1) == (100, None)
++        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_ended_run_tombstones'").fetchone()
++        with conn:
++            retain_ended_runs(conn, "t")
++            conn.execute("DELETE FROM task_runs")
++    with sqlite3.connect(path) as reopened:
++        assert ended_run(reopened, "t", 1) == (100, None)
+-- 
+2.55.0
+

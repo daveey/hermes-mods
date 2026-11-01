@@ -1,0 +1,229 @@
+From 42af4d197cec7d8baf75698b7bf26dbd578a21eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:06:47 +0000
+Subject: [PATCH] fix(kanban): recover own chat links on foreign copies
+ [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              |   3 +-
+ hermes_cli/kanban_sync_partition_repair.py    |  53 +++++++
+ .../test_kanban_sync_copy_chat_links.py       | 131 ++++++++++++++++++
+ 3 files changed, 186 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_copy_chat_links.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 2fc5fe26059..044b38c57e8 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -644,8 +644,9 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+             ensure_revision(live)
+             inputs = _repair_inputs(path, replica, mode, gateway)
+             if inputs is None or _REPAIRED.get(str(path)) != inputs:
+-                from hermes_cli.kanban_sync_partition_repair import repair_partition_links
++                from hermes_cli.kanban_sync_partition_repair import repair_partition_chat_links, repair_partition_links
+                 repair_partition_links(live, replica, gateway)
++                repair_partition_chat_links(live, replica, gateway)
+                 if mode == "primary" and sync.refresh_remote_parents(live, replica):
+                     sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
+                 result.repaired = repair_divergence(live, replica, gateway)
+diff --git a/hermes_cli/kanban_sync_partition_repair.py b/hermes_cli/kanban_sync_partition_repair.py
+index 1b8d8f8e05b..d80390d564a 100644
+--- a/hermes_cli/kanban_sync_partition_repair.py
++++ b/hermes_cli/kanban_sync_partition_repair.py
+@@ -54,3 +54,56 @@ def repair_partition_links(live: sqlite3.Connection, replica: sqlite3.Connection
+     if restored:
+         sync.wake_dispatcher()
+     return restored
++
++
++def repair_partition_chat_links(live: sqlite3.Connection, replica: sqlite3.Connection, gateway: str) -> list[str]:
++    """Recover this gateway's chats on picked-up foreign cards, never local edits or deletions.
++
++    Eviction removes the copy's links without tombstones; pickup omits them and the feed cursor has
++    already consumed their history. Restore only absent rows from the freshly pulled replica, without
++    echoing an upload or changing the card/claim. Other gateways' chats remain replica-only.
++    """
++    from hermes_cli.kanban_placement import is_placeholder_session
++
++    if sync.board_mode(live) != "primary":
++        return []
++    # Read rows, deletion guards and their cursor in ONE SQLite snapshot. The live pull may
++    # already have consumed a newer delete for an absent row, without leaving a tombstone.
++    candidates = replica.execute(
++        "SELECT l.*, s.cursor AS replica_cursor FROM task_chat_links l CROSS JOIN kanban_sync_state s "
++        "WHERE l.chat_gateway = ? AND l.uid IS NOT NULL AND NOT EXISTS "
++        "(SELECT 1 FROM kanban_sync_tombstones d WHERE "
++        "(d.table_name = 'task_chat_links' AND d.row_uid = l.uid) OR "
++        "(d.table_name = 'tasks' AND d.row_uid = l.task_id))", (gateway,)).fetchall()
++    if not candidates:
++        return []
++    restored = []
++    with write_txn(live):
++        state = sync.sync_state(live) or {}
++        if int(candidates[0]["replica_cursor"] or 0) < int(state.get("cursor") or 0):
++            return []
++        foreign = {r[0] for r in live.execute(
++            "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ?", (gateway,))}
++        existing = {r[0] for r in live.execute("SELECT uid FROM task_chat_links")}
++        held = {(t, u) for t, u in live.execute(
++            "SELECT table_name, row_uid FROM kanban_sync_outbox WHERE state IN ('pending', 'rejected') "
++            "AND table_name IN ('tasks', 'task_chat_links') UNION "
++            "SELECT table_name, row_uid FROM kanban_sync_tombstones "
++            "WHERE table_name IN ('tasks', 'task_chat_links')")}
++        todo = [row for row in candidates
++                if row["task_id"] in foreign and row["uid"] not in existing
++                and not is_placeholder_session(row["chat_session"])
++                and ("tasks", row["task_id"]) not in held
++                and ("task_chat_links", row["uid"]) not in held]
++        if todo:
++            applying = (sync.sync_state(live) or {})["applying"]
++            live.execute("UPDATE kanban_sync_state SET applying = 1")
++            for row in todo:
++                live.execute(
++                    "INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, "
++                    "kind, released, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++                    tuple(row[c] for c in ("uid", "task_id", "chat_gateway", "chat_profile", "chat_session",
++                                          "kind", "released", "created_at")))
++                restored.append(row["uid"])
++            live.execute("UPDATE kanban_sync_state SET applying = ?", (applying,))
++    return restored
+diff --git a/tests/hermes_cli/test_kanban_sync_copy_chat_links.py b/tests/hermes_cli/test_kanban_sync_copy_chat_links.py
+new file mode 100644
+index 00000000000..7a5911ef1fa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_copy_chat_links.py
+@@ -0,0 +1,131 @@
++"""A picked-up foreign card retains this gateway's authoritative chat links."""
++
++import pytest
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_db_connect import write_txn
++from hermes_cli.kanban_sync_partition_repair import repair_partition_chat_links
++from tests.hermes_cli.test_kanban_cross_gateway_parents import (
++    BOARD, ME, _other, _round, kanban_home, live, svc,
++)
++from tests.hermes_cli.test_kanban_sync_foreign_chat_links import _diff, _foreign_copy
++
++__all__ = ["kanban_home", "live", "svc"]
++
++
++def test_round_recovers_own_chat_links_consumed_before_foreign_pickup(live, svc, kanban_home):
++    _foreign_copy(live, svc, kanban_home)
++    uid = f"t_foreign:{ME}:default:old-chat:shepherd"
++    _other(svc, "own-chat", "task_chat_links", uid,
++           {"task_id": "t_foreign", "chat_gateway": ME, "chat_profile": "default",
++            "chat_session": "old-chat", "kind": "shepherd", "released": 1, "created_at": 2})
++    # Consume the feed while the foreign card is absent, then pick it up again.
++    from hermes_cli import kanban_worker_node as wn
++    with write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("UPDATE tasks SET status = 'done' WHERE id = 't_foreign'")
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    assert wn.evict(live) == ["t_foreign"]
++    _round(kanban_home, svc)
++    replica = ksc.open_shadow(BOARD, ME)
++    try:
++        assert wn.import_cards(live, replica, ["t_foreign"]) == ["t_foreign"]
++    finally:
++        replica.close()
++    assert _diff(live)["child_mismatch"] == {"task_chat_links": 1}
++    outbox_before = [tuple(r) for r in live.execute("SELECT * FROM kanban_sync_outbox")]
++    _round(kanban_home, svc)
++    row = live.execute("SELECT released, chat_profile FROM task_chat_links WHERE uid=?", (uid,)).fetchone()
++    assert row is not None
++    assert tuple(row) == (1, "default")
++    assert _diff(live)["child_mismatch"] == {}
++    assert [tuple(r) for r in live.execute("SELECT * FROM kanban_sync_outbox")] == outbox_before
++    _round(kanban_home, svc)
++    assert live.execute("SELECT COUNT(*) FROM task_chat_links WHERE uid=?", (uid,)).fetchone()[0] == 1
++
++
++@pytest.mark.parametrize("barrier", ["pending-link", "rejected-link", "pending-task", "rejected-task",
++                                     "live-link-tombstone", "shadow-link-tombstone", "live-task-tombstone",
++                                     "shadow-task-tombstone", "existing", "placeholder", "shadow-mode",
++                                     "absent-task", "own-task", "other-chat"])
++def test_repair_preserves_scope_edits_deletions_and_audits(live, svc, kanban_home, barrier):
++    _foreign_copy(live, svc, kanban_home)
++    uid = f"t_foreign:{ME}:default:old-chat:shepherd"
++    replica = ksc.open_shadow(BOARD, ME)
++    try:
++        session = "kanban-placement:test" if barrier == "placeholder" else "old-chat"
++        gateway = "elsewhere" if barrier == "other-chat" else ME
++        with write_txn(replica):
++            replica.execute(
++                "INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++                "VALUES (?, 't_foreign', ?, 'default', ?, 'shepherd', 1, 2)", (uid, gateway, session))
++        if barrier.startswith(("pending-", "rejected-")):
++            state, target = barrier.split("-")
++            table, row_uid = ("tasks", "t_foreign") if target == "task" else ("task_chat_links", uid)
++            with write_txn(live):
++                live.execute("INSERT INTO kanban_sync_outbox "
++                             "(op_id,table_name,row_uid,op,fields,hlc,created_at,state,last_error) "
++                             "VALUES ('held',?,?, 'delete','{}','',1,?,'preserve audit')", (table,row_uid,state))
++        elif barrier.endswith("tombstone"):
++            side, target, _ = barrier.split("-")
++            conn = live if side == "live" else replica
++            table, row_uid = ("tasks", "t_foreign") if target == "task" else ("task_chat_links", uid)
++            with write_txn(conn):
++                conn.execute("INSERT INTO kanban_sync_tombstones (table_name,row_uid,deleted_at) VALUES (?,?,1)",
++                             (table,row_uid))
++        elif barrier == "existing":
++            with write_txn(live):
++                live.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_session,kind,released,created_at) "
++                             "VALUES (?, 't_foreign', ?, 'old-chat', 'shepherd', 0, 3)", (uid,ME))
++        elif barrier == "shadow-mode":
++            sync.set_mode(live, "shadow")
++        elif barrier in ("absent-task", "own-task"):
++            with write_txn(live):
++                live.execute("UPDATE kanban_sync_state SET applying=1")
++                if barrier == "absent-task":
++                    live.execute("DELETE FROM tasks WHERE id='t_foreign'")
++                else:
++                    live.execute("UPDATE tasks SET created_on=? WHERE id='t_foreign'", (ME,))
++                live.execute("UPDATE kanban_sync_state SET applying=0")
++        tables = ("tasks", "task_chat_links", "kanban_sync_outbox", "kanban_sync_tombstones", "kanban_sync_state")
++        before = {t: [tuple(r) for r in live.execute(f"SELECT * FROM {t}")] for t in tables}
++        assert repair_partition_chat_links(live, replica, ME) == []
++        assert {t: [tuple(r) for r in live.execute(f"SELECT * FROM {t}")] for t in tables} == before
++    finally:
++        replica.close()
++
++
++def test_delete_between_replica_and_live_pulls_does_not_resurrect_link(live, svc, kanban_home, monkeypatch):
++    _foreign_copy(live, svc, kanban_home)
++    uid = f"t_foreign:{ME}:default:racing-chat:shepherd"
++    _other(svc, "racing-chat", "task_chat_links", uid,
++           {"task_id": "t_foreign", "chat_gateway": ME, "chat_profile": "default",
++            "chat_session": "racing-chat", "kind": "shepherd", "released": 1, "created_at": 2})
++    # The live cursor already consumed this link while the card was absent.
++    ksc._pull_replica(BOARD, svc.hub(ME), ME)
++    replica = ksc.open_shadow(BOARD, ME)
++    try:
++        cursor = sync.sync_state(replica)["cursor"]
++    finally:
++        replica.close()
++    with write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET cursor=?", (cursor,))
++    original = ksc.pull
++    deleted = False
++
++    def racing_pull(conn, hub, board, **kwargs):
++        nonlocal deleted
++        if kwargs.get("partition") == ME and not deleted:
++            result = hub.ops(board, [{"client_op_id": "racing-delete", "op": "delete",
++                                     "table": "task_chat_links", "uid": uid, "fields": {}}])
++            assert result["results"][0]["status"] == "applied"
++            deleted = True
++        return original(conn, hub, board, **kwargs)
++
++    monkeypatch.setattr(ksc, "pull", racing_pull)
++    for _ in range(3):
++        _round(kanban_home, svc)
++        assert live.execute("SELECT 1 FROM task_chat_links WHERE uid=?", (uid,)).fetchone() is None
++    assert deleted
++    assert _diff(live)["clean"]
+-- 
+2.55.0
+

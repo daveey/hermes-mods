@@ -1,6 +1,6 @@
 # Catalog CI isolation and deterministic regression fixtures
 
-Covers **1428, 1438, 1439, 1440, 1441, 1449, 1450, 1451, 1452, 1455, 1468**.
+Covers **1428, 1438, 1439, 1440, 1441, 1449, 1450, 1451, 1452, 1455, 1468**, plus the sandbox startup-cancellation follow-up **1502** (last section).
 Related CI changes are documented in [nightly E2E](nightly-e2e.md) (1430, 1432)
 and [upstream-sync landing](upstream-sync-land-via-pr.md) (1442, 1443, 1463).
 
@@ -113,3 +113,13 @@ Catalog validation needs a Linux runner with bubblewrap and permitted unprivileg
 ## Plugin?
 
 No. These are core repository CI workflows, their sandbox helper and regression tests. The sandbox executes third-party plugin validation but is not itself an installable agent plugin.
+
+## Follow-up patch (1502): startup-cancellation regression
+
+**1502** (`ac1d014219`, `test(ci): checkpoint cancellation before sandbox init setup (#460)`). Test plus workflow only; `scripts/ci/plugin_validation_sandbox.py` is unchanged.
+
+- **Behavior covered.** A run cancelled (SIGTERM or SIGINT) during sandbox startup must not let a cloned PID-namespace init escape teardown. In the race, the launcher is stopped before the bubblewrap `exec`, and the caller's `kill()` is stopped after the old descendant scan. Real bubblewrap then clones the PID namespace and blocks before `do_init`'s parent-death signal. The test requires exit status `128 + signum`, a namespace init that is already dead when `remove_tree` is entered, the init reaped by the time `run_host` returns, and no `plugin-sandbox-*` scratch left behind.
+- **How it works.** `tests/ci/test_plugin_sandbox_startup.py` (new, `platforms("linux")`, `needs_isolation`) runs the real sandbox module through a probe script. It wraps `subprocess.Popen` to insert an observation-only checkpoint into the `--supervise` child, and SIGSTOPs the killer inside `Popen.kill` for the gate. It also wraps `remove_tree` to record, via a pidfd, whether init is dead. A gate executable stands in for `--bwrap`: it SIGSTOPs itself, then `exec`s `/usr/bin/bwrap` with `--block-fd` on a FIFO and `--info-fd` so that the test learns the init pid. The docstring states that no sandbox lifecycle operation is mocked or replaced. Cleanup SIGKILLs init through the pidfd and SIGCONTs the stopped pids, so a failing run leaves nothing stopped.
+- **Workflow.** `.github/workflows/sandbox-lifecycle-proof.yml` adds the new file ahead of the normal-exit, lifecycle and validation suites, with `HERMES_TEST_FILE_RETRIES=0`.
+- **Tests.** `test_startup_cancel_reaps_init_before_cleanup[SIGTERM|SIGINT]`. It needs non-root execution (`os.getuid() != 0` is asserted), `/usr/bin/bwrap` and unprivileged namespaces. It was **not run for this mirror**, and the workflow was not dispatched. The patch does not say whether this test was red on the base before an implementation fix; read it as a regression guard for the 1450 subreaper behavior, not as evidence that a fix was made here.
+- **Gotchas.** The checkpoint depends on procfs details (`/proc/<pid>/stat` state `T`, `/proc/<pid>/wchan` reading `pipe_read`/`anon_pipe_read`). On a kernel that reports a different wait channel, the test hangs until its 30 s `wait_until` timeout instead of failing on the race itself.

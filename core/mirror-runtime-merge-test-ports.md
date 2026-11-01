@@ -38,3 +38,12 @@ These patches change expectations, so they hide a regression if the underlying f
 ## Could this be a plugin instead?
 
 No: they are test-only (plus one comment and one sidebar filter argument).
+
+## Follow-up patch (1497): browser-hint test imports at collection time
+
+**1497** (`4c884bdd31`, `test(desktop): collect browser hint imports before behavior deadline`), test-only.
+
+- **Behavior.** `apps/desktop/src/lib/keybinds/browser-hints.test.tsx` (the 0987-era test that the first-run tip, tooltips and keybind settings show the resolved browser binding, remaps included) no longer runs `vi.resetModules()` in `beforeEach` and six cold `await import(...)` calls inside its 15 s test body. It imports `KeybindSettings`, `TipBubble`, `TipKeybindLabel`, `I18nProvider`, `TIP_CATALOG` and `setBinding` statically. Its host setup (`localStorage.clear()`, `dataset.hermesDesktopHost = 'browser'`) runs in `vi.hoisted`, before those imports are evaluated. No product code changes.
+- **How it works.** The keybind defaults read the host flag and saved bindings when their module initializes, so the host must be staged before the imports run. Before this patch, a cold renderer import inside the test could use up the behavior deadline. Collection-time imports move that cost outside the timed test, and `vi.hoisted` keeps the "browser host" input ahead of module initialization.
+- **Tests.** The one test (`renders the resolved browser binding in the first-run tip, tooltips and settings, including remaps`) keeps its assertions, and its body is now synchronous. It was not run for this mirror.
+- **Gotchas.** The module-level setup now runs once per file, not before each test. A second test added to this file that needs a different host or freshly loaded modules would have to reset them itself.

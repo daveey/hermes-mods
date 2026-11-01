@@ -1,0 +1,189 @@
+From d6eb66511ee18188a0cd02291b1972f1bed24f3b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 00:51:12 +0000
+Subject: [PATCH] fix(kanban): classify model-edit authority before supervisor
+ routing [daveey]
+
+---
+ hermes_cli/kanban_assignment_routing.py       | 36 ++++++-
+ .../test_kanban_assignment_model_authority.py | 97 +++++++++++++++++++
+ 2 files changed, 129 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_assignment_model_authority.py
+
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index 46e12828ad7..652c0048ac0 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -60,18 +60,46 @@ _BUDGET_RESET = re.compile(
+     re.IGNORECASE)
+ 
+ 
++# Model edits require the same non-worker authority as lifecycle edits. A new
++# profile cannot grant it. Bound matches to one clause and imperative verb forms.
++_MODEL_FIELD = r'\b(?:model|provider|pin|model_override|provider_override)\b'
++_EDIT_VERB = r'(?<![A-Za-z])(?:change|set|clear|edit|replace|remove)(?![A-Za-z])'
++_CLAUSE = r'[^\n.;]{0,100}?'
++_OTHER_CARD_MODEL_EDIT = re.compile(
++    _EDIT_VERB + _CLAUSE + _ID + _CLAUSE + _MODEL_FIELD
++    + r'|' + _EDIT_VERB + _CLAUSE + _MODEL_FIELD + _CLAUSE + _ID
++    + r'|' + _ID + r"(?:'s)?\s+needs?\s+(?:a\s+)?" + _MODEL_FIELD
++    + r'\s+(?:change|edit|replacement)\b', re.IGNORECASE,
++)
++
++
++def _model_edit_need(task_id, reason):
++    ids = [next(g for g in m if g) for m in _OTHER_CARD_MODEL_EDIT.findall(reason or '')]
++    return [i for i in dict.fromkeys(ids) if i != task_id]
++
++
+ def execution_authority_need(task_id, reason):
+     """The other card ids a block asks to move through its lifecycle (or ``['<budget>']`` for a
+     continuation-budget reset), else ``[]``. Profile mismatches return ``[]``."""
+     text = reason or ''
+     ids = [next(g for g in m if g) for m in _OTHER_CARD_TRANSITION.findall(text)]
+-    ids = [i for i in dict.fromkeys(ids) if i != task_id]
++    ids = [i for i in dict.fromkeys([*ids, *_model_edit_need(task_id, text)]) if i != task_id]
+     if not ids and _BUDGET_RESET.search(text):
+         ids = ['<budget>']
+     return ids
+ 
+ 
+-def _authority_error(task_id, needs):
++def _authority_error(task_id, needs, reason=None):
++    if _model_edit_need(task_id, reason):
++        return ExecutionAuthorityMismatch(
++            f'execution_authority_mismatch: task {task_id} asks to edit another card model/provider '
++            f'({", ".join(needs)}). Every worker profile has the same mutation fence; '
++            'assignment repair cannot grant non-worker authority and none was recorded. '
++            'No supported supervisor model-edit operation exists. Preserve mandatory model pins '
++            'and subscription billing policy; recover availability through the existing owner '
++            'or an authorized non-worker operator, not another profile or repeated repair cards. '
++            'A legacy repair cannot complete on profile existence alone; archive it before '
++            'recovering through the appropriate owner.')
+     return ExecutionAuthorityMismatch(
+         f'execution_authority_mismatch: task {task_id} asks to move another card '
+         f'({", ".join(needs)}) through its lifecycle. That is fenced for every worker profile, so an '
+@@ -153,7 +181,7 @@ def validate_repair_completion(conn, task_id):
+         if isinstance(data, dict) and data.get('supervisor_task_id') == task_id:
+             needs = execution_authority_need(original.id, data.get('reason'))
+             if needs:
+-                raise _authority_error(original.id, needs)
++                raise _authority_error(original.id, needs, data.get('reason'))
+             break
+     validate_assignment(original.assignee, requires=original.requires,
+                         workspace_kind=original.workspace_kind,
+@@ -169,7 +197,7 @@ def route(conn, task, payload):
+     key = _SUPERVISOR_PREFIX + task.id
+     needs = execution_authority_need(task.id, payload.get('reason'))
+     if needs:
+-        raise _authority_error(task.id, needs)
++        raise _authority_error(task.id, needs, payload.get('reason'))
+     own_key = conn.execute('SELECT idempotency_key FROM tasks WHERE id=?', (task.id,)).fetchone()[0]
+     previous = conn.execute('SELECT id FROM tasks WHERE idempotency_key=?', (key,)).fetchone()
+     if (own_key or '').startswith(_SUPERVISOR_PREFIX) or previous:
+diff --git a/tests/hermes_cli/test_kanban_assignment_model_authority.py b/tests/hermes_cli/test_kanban_assignment_model_authority.py
+new file mode 100644
+index 00000000000..5da660fb4e8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_assignment_model_authority.py
+@@ -0,0 +1,97 @@
++"""A model-edit authority gap must not masquerade as missing supervisor capacity."""
++import pytest
++
++from hermes_cli import kanban_assignment_routing as ar
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_assignment_routing as routing_tests
++
++board = routing_tests.board
++
++OTHER = 't_0123456789abcdef'
++
++
++@pytest.mark.parametrize('reason', [
++    f'Change {OTHER} model pin to an available subscription route',
++    f'Set model on {OTHER} to gpt-6-astra',
++    f'Clear the provider override on task {OTHER}',
++    f'Edit {OTHER}\'s unavailable Opus/Anthropic pin',
++    f'Need non-worker card-edit authority to change {OTHER}\'s unavailable Opus/Anthropic pin to an available subscription route',
++    f'Use kanban set-model {OTHER}',
++    f'{OTHER} needs a model change',
++])
++def test_model_edit_is_authority_need(reason):
++    assert ar.execution_authority_need('t_ffffffffffffffff', reason) == [OTHER]
++
++
++@pytest.mark.parametrize('reason', [
++    f'The model on {OTHER} was changed yesterday; wrong worker',
++    f'Changed model pin on {OTHER}; worker lacks terminal tools',
++    f'Inspect {OTHER} model and provider without changing them',
++    f'Need the model output that {OTHER} produced',
++])
++def test_model_history_is_not_authority_need(reason):
++    assert ar.execution_authority_need('t_ffffffffffffffff', reason) == []
++
++
++def test_own_model_edit_not_other_card():
++    assert ar.execution_authority_need(OTHER, f'Change {OTHER} model pin') == []
++
++
++@pytest.mark.parametrize('candidate', ['eligible', 'absent', 'ineligible'])
++def test_model_authority_refused_before_candidate_selection(board, candidate):
++    conn, home = board
++    if candidate == 'absent':
++        (home / 'config.yaml').write_text('kanban:\n  orchestrator_profile: missing\n')
++    elif candidate == 'ineligible':
++        (home / 'profiles/supervisor/config.yaml').write_text(
++            'agent:\n  disabled_toolsets: [kanban]\n')
++    tid = kb.create_task(conn, title='Recover owner', assignee='worker', created_by='worker')
++    before = kb.get_task(conn, tid)
++    with pytest.raises(ar.ExecutionAuthorityMismatch) as exc:
++        kb.block_task(conn, tid, kind='assignment',
++                      reason=f'Change {OTHER} model pin to an available subscription route')
++    message = str(exc.value)
++    assert 'model' in message and 'non-worker' in message
++    assert 'ops=[{"op": "resume"' not in message
++    after = kb.get_task(conn, tid)
++    assert before is not None and after is not None
++    assert (after.status, after.assignee, after.model_override, after.provider_override) == (
++        before.status, before.assignee, before.model_override, before.provider_override)
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++    assert not conn.execute('SELECT 1 FROM task_links').fetchone()
++
++
++def test_legacy_model_edit_repair_cannot_release_original(board, monkeypatch):
++    import json
++
++    conn, _ = board
++    tid = kb.create_task(conn, title='Recover owner', assignee='worker', created_by='creator')
++    with monkeypatch.context() as m:
++        m.setattr(ar, 'execution_authority_need', lambda *a: [])
++        assert kb.block_task(conn, tid, kind='assignment', reason=f'Change {OTHER} model pin')
++    raw = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC",
++        (tid,),
++    ).fetchone()[0]
++    repair_id = json.loads(raw)['supervisor_task_id']
++    with pytest.raises(ar.ExecutionAuthorityMismatch, match='model/provider'):
++        kb.complete_task(conn, repair_id, result='Profile exists')
++    assert kb.get_task(conn, tid).status == 'todo'
++    assert kb.get_task(conn, repair_id).status != 'done'
++
++
++def test_tool_model_edit_refusal_is_typed(board, monkeypatch):
++    import json
++
++    from tools import kanban_tools as tools
++    from tools.registry import registry
++
++    conn, _ = board
++    tid = kb.create_task(conn, title='Recover owner', assignee='worker', created_by='creator')
++    monkeypatch.setattr(tools, '_worker_guard', lambda *args: tid)
++    monkeypatch.setattr(tools, '_worker_run_id', lambda *args: None)
++    result = json.loads(registry.dispatch('kanban_block', {
++        'task_id': tid, 'kind': 'assignment', 'reason': f'Change {OTHER} model pin',
++    }))
++    assert result['code'] == 'execution_authority_mismatch'
++    assert kb.get_task(conn, tid).status == 'ready'
+-- 
+2.55.0
+

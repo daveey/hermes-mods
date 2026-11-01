@@ -1,0 +1,348 @@
+From 7eb73319b83250348fc9a590f6540e83cf598c94 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:39:54 +0000
+Subject: [PATCH] fix(gateway): isolate control loop diagnostics failures from
+ the listener [daveey]
+
+Watchdog construction/start now runs after the bind try-block as best-effort
+diagnostics: a failure keeps the bound listener serving, stops any partially
+started watchdog (cancelling its scheduled heartbeat), clears the ref, and
+logs "Control loop diagnostics unavailable" with the exception class only.
+
+_beat catches only the task-snapshot exception: the heartbeat due time is
+always refreshed and the beat rescheduled, the last good snapshot is kept
+with its own timestamp, and task_snapshot_error carries the class name only.
+Before any good snapshot the warning reports age None and "unavailable".
+
+Pending connection tasks are held in a server-owned set and discarded on
+completion, so the loop's weak task refs cannot drop a suspended handler.
+
+Tests: tests/gateway/test_control_diagnostics_lifecycle.py (4 of 5 red on
+4229beed96e, all green after).
+---
+ gateway/control_diagnostics.py                |  39 +++-
+ gateway/control_socket.py                     |  30 ++-
+ .../test_control_diagnostics_lifecycle.py     | 178 ++++++++++++++++++
+ 3 files changed, 232 insertions(+), 15 deletions(-)
+ create mode 100644 tests/gateway/test_control_diagnostics_lifecycle.py
+
+diff --git a/gateway/control_diagnostics.py b/gateway/control_diagnostics.py
+index 4e8296afd16..9d5525a8ce6 100644
+--- a/gateway/control_diagnostics.py
++++ b/gateway/control_diagnostics.py
+@@ -134,6 +134,12 @@ class LoopWatchdog:
+         self._lock = threading.Lock()
+         self._last_warning = float("-inf")
+         self._heartbeat = None
++        # Liveness (``_due``) is refreshed on every beat; the task snapshot is best-effort and
++        # keeps its own timestamp, so a failing snapshot never looks like a blocked loop.
++        self._due = None
++        self._snapshot_at = None
++        self._tasks = "unavailable"
++        self._snapshot_error = None
+         from agent.memory_provider import spawn_context_thread
+         self.thread = spawn_context_thread(self._watch, name="control-loop-diagnostics", daemon=True)
+ 
+@@ -145,13 +151,21 @@ class LoopWatchdog:
+         if self._stop.is_set():
+             return
+         # asyncio task enumeration and get_stack are ONLY called on their owning loop.
+-        stacks = "\n".join(
+-            "task\n" + "\n".join(_frame_location(f) for f in task.get_stack(limit=16))
+-            for task in itertools.islice(asyncio.all_tasks(self.loop), 64))
++        try:
++            stacks = "\n".join(
++                "task\n" + "\n".join(_frame_location(f) for f in task.get_stack(limit=16))
++                for task in itertools.islice(asyncio.all_tasks(self.loop), 64))
++            error = None
++        except Exception as exc:  # health: allow BLE001 -- best-effort snapshot; traceback may hold request data
++            # Class name only: the message or traceback may carry request data.
++            stacks, error = None, type(exc).__name__
++        now = time.monotonic()
+         with self._lock:
+-            self._snapshot_at = time.monotonic()
+-            self._due = self._snapshot_at + self.interval
+-            self._tasks = stacks
++            self._due = now + self.interval
++            self._snapshot_error = error
++            if stacks is not None:
++                self._snapshot_at = now
++                self._tasks = stacks
+         self._heartbeat = self.loop.call_later(self.interval, self._beat)
+ 
+     def _watch(self):
+@@ -161,19 +175,24 @@ class LoopWatchdog:
+     def _check(self):
+         now = time.monotonic()
+         with self._lock:
+-            delay, tasks, age = now - self._due, self._tasks, now - self._snapshot_at
++            if self._due is None:
++                return
++            delay, tasks, error = now - self._due, self._tasks, self._snapshot_error
++            age = None if self._snapshot_at is None else now - self._snapshot_at
+         if delay <= self.threshold or now - self._last_warning < self.repeat_interval:
+             return
+         self._last_warning = now
+         threads = _thread_stacks()
+         if self._stop.is_set():
+             return
++        age_ms = None if age is None else age * 1000
+         logger.warning(
+             "Control event loop blocked delay_ms=%.1f; live thread stacks:\n%s\n"
+-            "last loop-owned task snapshot age_ms=%.1f:\n%s",
+-            delay * 1000, threads, age * 1000, tasks,
++            "last loop-owned task snapshot age_ms=%s error=%s:\n%s",
++            delay * 1000, threads, "unavailable" if age_ms is None else f"{age_ms:.1f}",
++            error or "none", tasks,
+             extra=dict(delay_ms=delay * 1000, thread_stacks=threads, task_stacks=tasks,
+-                       task_snapshot_age_ms=age * 1000))
++                       task_snapshot_age_ms=age_ms, task_snapshot_error=error))
+ 
+     def stop(self):
+         self._stop.set()
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index 8d36fd76bcf..7141eb22999 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -303,6 +303,9 @@ class GatewayControlServer:
+         from gateway.control_diagnostics import ControlDiagnostics
+         self._diagnostics = ControlDiagnostics()
+         self._loop_watchdog = None
++        # Strong refs: the loop holds tasks only weakly, so a pending connection task suspended
++        # on a reader nothing else references could otherwise be garbage collected.
++        self._connection_tasks: set[asyncio.Task] = set()
+         self.ticket_store = None
+         self.private_handlers = {}
+         self._server: Optional[asyncio.AbstractServer] = None
+@@ -321,15 +324,30 @@ class GatewayControlServer:
+         """Bind and start serving. Returns True on success, False otherwise."""
+         try:
+             started = await (self._start_windows() if _IS_WINDOWS else self._start_posix())
+-            if started:
+-                from gateway.control_diagnostics import LoopWatchdog
+-                self._loop_watchdog = LoopWatchdog(asyncio.get_running_loop())
+-                self._loop_watchdog.start()
+-            return started
+         except Exception as exc:
+             await self.stop()
+             logger.warning("Gateway control socket failed to start: %s", exc)
+             return False
++        if started:
++            self._start_loop_diagnostics()
++        return started
++
++    def _start_loop_diagnostics(self) -> None:
++        """Best-effort: a diagnostics failure never closes the already-bound listener."""
++        watchdog = None
++        try:
++            from gateway.control_diagnostics import LoopWatchdog
++            watchdog = LoopWatchdog(asyncio.get_running_loop())
++            watchdog.start()
++        except Exception as exc:  # health: allow BLE001 -- optional diagnostics must not close the listener; class-only log
++            if watchdog is not None:  # cancel the heartbeat a partial start scheduled
++                with contextlib.suppress(Exception):
++                    watchdog.stop()
++            self._loop_watchdog = None
++            # Class only: the message may carry environment detail.
++            logger.warning("Control loop diagnostics unavailable (%s)", type(exc).__name__)
++            return
++        self._loop_watchdog = watchdog
+ 
+     async def _start_posix(self) -> bool:
+         bind_path, pointer_file = resolve_server_socket_path(self._home)
+@@ -528,6 +546,8 @@ class GatewayControlServer:
+     def _connection_accepted(self, reader, writer):
+         timing = self._diagnostics.accepted()
+         task = asyncio.create_task(self._handle_connection(reader, writer, timing))
++        self._connection_tasks.add(task)
++        task.add_done_callback(self._connection_tasks.discard)
+         # Also accounts for cancellation before the coroutine's first instruction.
+         def completed(_):
+             if timing.finish():
+diff --git a/tests/gateway/test_control_diagnostics_lifecycle.py b/tests/gateway/test_control_diagnostics_lifecycle.py
+new file mode 100644
+index 00000000000..eb23eced87f
+--- /dev/null
++++ b/tests/gateway/test_control_diagnostics_lifecycle.py
+@@ -0,0 +1,178 @@
++"""Control diagnostics must never take down the control listener or silence itself."""
++import asyncio
++import gc
++import json
++import logging
++import threading
++import types
++import weakref
++
++import pytest
++
++from gateway.control_socket import GatewayControlServer
++
++
++async def _exchange(server):
++    reader, writer = await asyncio.open_unix_connection(str(server._bind_path))
++    try:
++        writer.write(json.dumps({"verb": "status"}).encode() + b"\n")
++        await writer.drain()
++        return json.loads(await asyncio.wait_for(reader.readline(), 5))
++    finally:
++        writer.close()
++        await writer.wait_closed()
++
++
++@pytest.mark.platforms("posix")
++def test_watchdog_thread_start_failure_keeps_listener_serving(tmp_path, monkeypatch, caplog):
++    from gateway import control_diagnostics
++
++    def broken_start(self):
++        raise RuntimeError("can't start new thread")
++
++    async def run():
++        server = GatewayControlServer(tmp_path, verb_handlers={"status": lambda: {"alive": True}})
++        original_init = control_diagnostics.LoopWatchdog.__init__
++        made = []
++
++        def init(self, loop):
++            original_init(self, loop)
++            self.thread.start = types.MethodType(broken_start, self.thread)
++            made.append(self)
++
++        monkeypatch.setattr(control_diagnostics.LoopWatchdog, "__init__", init)
++        assert await server.start()
++        try:
++            assert server._loop_watchdog is None
++            # The partially started watchdog scheduled a heartbeat; it must be cancelled.
++            assert made and made[0]._stop.is_set()
++            assert made[0]._heartbeat is None or made[0]._heartbeat.cancelled()
++            assert (await _exchange(server))["result"]["alive"]
++        finally:
++            await server.stop()
++
++    with caplog.at_level(logging.WARNING):
++        asyncio.run(run())
++    assert "Control loop diagnostics unavailable" in caplog.text
++    assert "can't start new thread" not in caplog.text
++
++
++@pytest.mark.platforms("posix")
++def test_watchdog_construction_failure_keeps_listener_serving(tmp_path, monkeypatch, caplog):
++    from gateway import control_diagnostics
++
++    def broken_init(self, loop):
++        raise RuntimeError("no context thread")
++
++    monkeypatch.setattr(control_diagnostics.LoopWatchdog, "__init__", broken_init)
++
++    async def run():
++        server = GatewayControlServer(tmp_path, verb_handlers={"status": lambda: {"alive": True}})
++        assert await server.start()
++        try:
++            assert server._loop_watchdog is None
++            assert (await _exchange(server))["result"]["alive"]
++        finally:
++            await server.stop()
++
++    with caplog.at_level(logging.WARNING):
++        asyncio.run(run())
++    assert "Control loop diagnostics unavailable" in caplog.text
++
++
++def test_snapshot_failure_keeps_heartbeat_and_marks_snapshot_historical(monkeypatch, caplog):
++    from gateway import control_diagnostics as diagnostics
++
++    clock = [0.0]
++    monkeypatch.setattr(diagnostics, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
++    original = asyncio.all_tasks
++    fail = [False]
++
++    def tasks(loop):
++        if fail[0]:
++            raise RuntimeError("PRIVATE-SNAPSHOT-DETAIL")
++        return original(loop)
++
++    monkeypatch.setattr(asyncio, "all_tasks", tasks)
++
++    def check(watchdog):
++        thread = threading.Thread(target=watchdog._check)
++        thread.start()
++        thread.join(3)
++        assert not thread.is_alive()
++
++    async def run():
++        watchdog = diagnostics.LoopWatchdog(asyncio.get_running_loop())
++        watchdog.repeat_interval = 0.0
++        watchdog._beat()  # good snapshot at t=0
++        try:
++            fail[0] = True
++            clock[0] = 5.0
++            watchdog._heartbeat.cancel()
++            watchdog._beat()  # loop is alive at t=5 but the snapshot fails
++            assert watchdog._heartbeat is not None and not watchdog._heartbeat.cancelled()
++            check(watchdog)  # due = 5.25, now = 5: a live loop must not warn
++            assert "Control event loop blocked" not in caplog.text
++            clock[0] = 7.0
++            check(watchdog)  # genuinely late: warns with the historical snapshot labelled
++        finally:
++            watchdog.stop()
++
++    with caplog.at_level(logging.WARNING):
++        asyncio.run(run())
++    record, = [r for r in caplog.records if "Control event loop blocked" in r.getMessage()]
++    assert record.task_snapshot_age_ms == pytest.approx(7000)
++    assert record.task_snapshot_error == "RuntimeError"
++    assert "run" in record.task_stacks
++    assert "PRIVATE-SNAPSHOT-DETAIL" not in caplog.text
++
++
++def test_first_snapshot_failure_reports_unavailable(monkeypatch, caplog):
++    from gateway import control_diagnostics as diagnostics
++
++    clock = [0.0]
++    monkeypatch.setattr(diagnostics, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
++
++    def tasks(loop):
++        raise RuntimeError("PRIVATE")
++
++    monkeypatch.setattr(asyncio, "all_tasks", tasks)
++
++    async def run():
++        watchdog = diagnostics.LoopWatchdog(asyncio.get_running_loop())
++        watchdog._beat()
++        try:
++            assert watchdog._heartbeat is not None
++            clock[0] = 3.0
++            thread = threading.Thread(target=watchdog._check)
++            thread.start()
++            thread.join(3)
++        finally:
++            watchdog.stop()
++
++    with caplog.at_level(logging.WARNING):
++        asyncio.run(run())
++    record, = [r for r in caplog.records if "Control event loop blocked" in r.getMessage()]
++    assert record.task_snapshot_age_ms is None
++    assert record.task_stacks == "unavailable"
++    assert "PRIVATE" not in caplog.text
++
++
++def test_pending_connection_task_is_strongly_referenced(tmp_path):
++    from unittest.mock import Mock
++
++    async def run():
++        server = GatewayControlServer(tmp_path)
++        task = server._connection_accepted(asyncio.StreamReader(), Mock())
++        ref = weakref.ref(task)
++        del task
++        await asyncio.sleep(0)  # now suspended in readline() on a reader only it references
++        gc.collect()
++        task = ref()
++        assert task is not None, "pending connection task was garbage collected"
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert server._diagnostics.in_flight == 0
++
++    asyncio.run(run())
+-- 
+2.55.0
+

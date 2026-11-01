@@ -1,0 +1,548 @@
+From 69f23d4c694dc0077145ec7fdaee3355f89dfe8a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:13:40 +0000
+Subject: [PATCH] feat(kanban): supervisor-request archive op for orphaned
+ unstarted descendants [daveey]
+
+A worker had no supported route to cancel a card its task did not create
+directly: standing card S created owner B, B created QA card C, B was archived
+when its PR closed, and C sat TODO with nobody able to cancel it.
+kanban_archive refused (C's creator is B, not S), kanban_block(kind=assignment)
+answered no_capable_supervisor (same profile), and the supervisor-request
+schema had no archive op, so only an unscoped operator could clean it up
+(Ask Eve QA t_01a1947dae56913a).
+
+New op {op: archive, task_id}, its own request family, executed by the
+existing non-worker supervisor executor through kanban_db.archive_task. Scope:
+the target's creator chain must reach the requester within 3 hops through
+cards that are all done or archived (a live intermediate owns it); cards the
+requester created directly are refused with a pointer to kanban_archive; self,
+foreign, unknown, done/archived and claimed/running targets are refused. The
+executor re-checks scope and target state at execution, records the request id
+on the archived event, and a redelivered request reports already_applied.
+kanban_archive's worker scope is unchanged.
+---
+ hermes_cli/kanban_archive_exec.py            | 166 +++++++++++++++
+ hermes_cli/kanban_supervisor_requests.py     |  26 ++-
+ tests/hermes_cli/test_kanban_archive_exec.py | 204 +++++++++++++++++++
+ tools/kanban_tools_schemas.py                |  16 +-
+ 4 files changed, 405 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_archive_exec.py
+ create mode 100644 tests/hermes_cli/test_kanban_archive_exec.py
+
+diff --git a/hermes_cli/kanban_archive_exec.py b/hermes_cli/kanban_archive_exec.py
+new file mode 100644
+index 00000000000..14b82141992
+--- /dev/null
++++ b/hermes_cli/kanban_archive_exec.py
+@@ -0,0 +1,166 @@
++"""Supervisor ``archive`` op: cancel an unstarted card orphaned in the requester's creator tree. [daveey]
++
++A worker may archive an unclaimed card its own task created (``kanban_archive``), but not a
++grandchild: when the requester created card B, B created card C, and B is then archived or done,
++nobody owns C any more. ``kanban_archive`` from the requester is refused (C's creator is B), B
++cannot act (it is finished), and ``kanban_block(kind='assignment')`` answers
++``no_capable_supervisor`` because the creator and assignee profile are the same. The only way out
++was an operator archiving C by hand. (Ask Eve QA card t_01a1947dae56913a: its creator
++t_01a19446d2578c6a was archived when the PR it reviewed was closed, and the standing card that
++created that creator could not cancel it.)
++
++``archive`` is that cancellation route, executed by the existing non-worker supervisor-request
++executor (:mod:`hermes_cli.kanban_supervisor_requests`) through :func:`kanban_db.archive_task`.
++It is deliberately narrow:
++
++* **Only an orphaned descendant.** Walking ``creator_task_id`` up from the target must reach the
++  requester within ``MAX_CREATOR_HOPS``, and every card between them must be archived or done (a
++  live intermediate still owns the target and archives it itself). A card the requester created
++  directly is refused with a pointer to ``kanban_archive``: the worker can do that itself.
++* **Never the requester's own card** (``self_scope``), never a card outside its creator tree.
++* **Unstarted cards only.** The target must be unclaimed (no claim, no worker pid, no current run)
++  and not done or archived: this cancels work, it never stops a running worker.
++
++Execution re-checks scope, target state and the requester against the board as it is now. The
++``archived`` event carries the request id; a redelivered request whose target is already archived
++reports ``already_applied`` instead of writing twice.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Optional
++
++OP = "archive"
++MAX_CREATOR_HOPS = 3
++VIA = "supervisor archive request"
++_FINISHED = ("archived", "done")
++_UNSTARTED = ("todo", "ready", "scheduled", "blocked", "triage")
++
++
++def normalize_op(i: int, op: dict) -> dict:
++    from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++    tid = str(op.get("task_id") or "").strip()
++    if not tid:
++        raise SupervisorRequestError("invalid_ops", f"op {i}: archive needs task_id")
++    extra = set(op) - {"op", "task_id"}
++    if extra:
++        raise SupervisorRequestError("invalid_ops", f"op {i}: archive takes only task_id (got {sorted(extra)})")
++    return {"op": OP, "task_id": tid}
++
++
++def label(op: dict) -> str:
++    return f"archive {op.get('task_id')}"
++
++
++def _status(conn: sqlite3.Connection, target: str) -> Optional[str]:
++    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (target,)).fetchone()
++    return row[0] if row else None
++
++
++def _scope_refusal(conn: sqlite3.Connection, requester: str, target: str) -> Optional[str]:
++    """None when ``target`` is an orphaned descendant of ``requester`` in the creator tree."""
++    from hermes_cli.kanban_supervisor_requests import _created_by_task
++    if target == requester:
++        return "self_scope: a card cannot archive itself; finish it with kanban_complete"
++    creator = _created_by_task(conn, target)
++    if creator == requester:
++        return (f"{target} was created by {requester}: archive it yourself with kanban_archive "
++                "(no supervisor needed)")
++    chain: list[str] = []
++    node = creator
++    for _ in range(MAX_CREATOR_HOPS):
++        if not node:
++            break
++        if node == requester:
++            live = [c for c in chain if _status(conn, c) not in _FINISHED]
++            if live:
++                return (f"{target}'s creator {live[0]} is still open, status={_status(conn, live[0])}; "
++                        "that card owns it and archives it itself")
++            return None
++        chain.append(node)
++        node = _created_by_task(conn, node)
++    return (f"{target} is not in {requester}'s creator tree (<= {MAX_CREATOR_HOPS} hops); archive only "
++            "cancels an orphaned card created by a finished card this task created")
++
++
++def _state_refusal(conn: sqlite3.Connection, target: str) -> Optional[str]:
++    row = conn.execute("SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
++                       (target,)).fetchone()
++    if row is None:
++        return f"unknown task {target}"
++    status, claim, pid, run = row
++    if status in _FINISHED:
++        return f"{target} is {status}"
++    if status not in _UNSTARTED or claim or pid or run:
++        return (f"{target} is claimed or running (status={status}); archive only cancels an unstarted "
++                "card and never stops a worker")
++    return None
++
++
++def refusal(conn: sqlite3.Connection, requester: str, target: str) -> Optional[str]:
++    if _status(conn, target) is None:
++        return f"unknown task {target}"
++    return _scope_refusal(conn, requester, target) or _state_refusal(conn, target)
++
++
++def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
++    verdict = {**op}
++    target = op["task_id"]
++    if _status(conn, target) == "archived" and _scope_refusal(conn, requester, target) is None:
++        verdict.update(verdict="noop", reason=f"{target} is already archived")
++        return verdict
++    found = refusal(conn, requester, target)
++    if found:
++        verdict.update(verdict="refused", reason=found)
++    else:
++        verdict.update(verdict="supervisor")
++    return verdict
++
++
++def applied_by(conn: sqlite3.Connection, target: str, request_id: int) -> bool:
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived'",
++                               (target,)):
++        try:
++            data = json.loads(raw) if raw else {}
++        except (TypeError, ValueError):
++            continue
++        if isinstance(data, dict) and data.get("supervisor_request_id") == request_id:
++            return True
++    return False
++
++
++def execute(conn: sqlite3.Connection, req: dict, executor: str) -> str:
++    """Archive each op's target (re-checked now); record the receipt via ``_finish``."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_supervisor_requests as ksr
++
++    requester, rid = req["requester_task_id"], int(req["id"])
++    gone = ksr.requester_refusal(conn, requester)
++    results: list[dict] = []
++    error: Optional[str] = None
++    for op in req["ops"]:
++        target = op["task_id"]
++        if applied_by(conn, target, rid):
++            results.append({**op, "outcome": "already_applied", "readback": _status(conn, target)})
++            continue
++        found = gone or refusal(conn, requester, target)
++        if error or found:
++            detail = found or "an earlier op failed"
++            results.append({**op, "outcome": "not_applied", "detail": detail, "readback": _status(conn, target)})
++            error = error or detail
++            continue
++        ok = kb.archive_task(conn, target, via=f"{VIA} {rid} by {requester}",
++                             event_extra={"supervisor_request_id": rid, "requested_by": requester,
++                                          "executor": executor})
++        readback = _status(conn, target)
++        if not ok or readback != "archived":
++            error = f"archive_task did not archive {target} (readback {readback})"
++            results.append({**op, "outcome": "failed", "detail": error, "readback": readback})
++            continue
++        results.append({**op, "outcome": "applied", "readback": readback})
++    applied = any(r["outcome"] in ("applied", "already_applied") for r in results)
++    status = "done" if not error else (
++        "failed" if applied or any(r["outcome"] == "failed" for r in results) else "rejected")
++    ksr._finish(conn, req, executor, status, results=results, error=error)
++    return status
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index f676461a107..f8ae1e88bc0 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -30,6 +30,8 @@ This module is the narrow contract between the two:
+   Never a human-gated card; scope is the requester's creator chain; capped per target.
+ * **retry_limit** ops (``kanban_retry_limit_exec``) set ``max_retries`` (1-10) on a card the requester
+   created, never its own, through ``kanban_db_operator.edit_operator_fields``.
++* **archive** ops (``kanban_archive_exec``) cancel an unstarted card orphaned in the requester's creator
++  tree (created by a finished card the requester created), through ``kanban_db.archive_task``.
+ * **Receipt**: every transition appends a ``supervisor_request_*`` event, and the
+   terminal one a comment, on the requester's card. A requester parked ``scheduled`` is
+   woken, also when it parks only after the result landed. A result never completes, unblocks or releases the requester; a rejected or
+@@ -52,11 +54,12 @@ MAX_OPS = 20
+ MAX_ATTEMPTS = 5
+ LEASE_SECONDS = 120
+ EXECUTOR_FRESH_SECONDS = 300
+-OPS = ("link", "unlink", "reconcile_notify", "resume", "retry_limit")  # link: preview only (dry_run); a request carries unlink ops
++OPS = ("link", "unlink", "reconcile_notify", "resume", "retry_limit", "archive")  # link: preview only (dry_run); a request carries unlink ops
+ # reconcile_notify: retire a wrong-local refused-send tui subscription on owner-read receipts
+ # (hermes_cli/kanban_notify_reconcile_exec.py). A request carries only those, or only edge ops.
+ # resume: requeue a continuation_exhausted card in the requester's creator chain (kanban_resume_exec.py).
+ # retry_limit: set max_retries on a card the requester created (kanban_retry_limit_exec.py).
++# archive: cancel an unstarted orphaned descendant in the requester's creator tree (kanban_archive_exec.py).
+ ACTIVE = ("pending", "accepted")
+ TERMINAL = ("done", "rejected", "failed")
+ COMMENT_AUTHOR = "kanban-supervisor"
+@@ -132,6 +135,10 @@ def normalize_ops(ops: Any) -> list[dict]:
+             from hermes_cli import kanban_retry_limit_exec as rlx
+             out.append(rlx.normalize_op(i, op))
+             continue
++        if kind == "archive":
++            from hermes_cli import kanban_archive_exec as ax
++            out.append(ax.normalize_op(i, op))
++            continue
+         parent = str(op.get("parent_id") or "").strip()
+         child = str(op.get("child_id") or "").strip()
+         if kind not in OPS:
+@@ -142,11 +149,11 @@ def normalize_ops(ops: Any) -> list[dict]:
+     if len({_family(o) for o in out}) > 1:
+         raise SupervisorRequestError(
+             "invalid_ops", "a request carries only reconcile_notify ops, only resume ops, only retry_limit ops, "
+-            "or only edge ops")
++            "only archive ops, or only edge ops")
+     return out
+ 
+ 
+-_OWN_FAMILIES = ("reconcile_notify", "resume", "retry_limit")
++_OWN_FAMILIES = ("reconcile_notify", "resume", "retry_limit", "archive")
+ 
+ 
+ def _family(op: dict) -> str:
+@@ -161,6 +168,10 @@ def _is_retry_limit(ops: list[dict]) -> bool:
+     return bool(ops) and ops[0].get("op") == "retry_limit"
+ 
+ 
++def _is_archive(ops: list[dict]) -> bool:
++    return bool(ops) and ops[0].get("op") == "archive"
++
++
+ def _is_reconcile(ops: list[dict]) -> bool:
+     return bool(ops) and ops[0].get("op") == "reconcile_notify"
+ 
+@@ -172,6 +183,9 @@ def op_label(op: dict) -> str:
+     if op.get("op") == "retry_limit":
+         from hermes_cli import kanban_retry_limit_exec as rlx
+         return rlx.label(op)
++    if op.get("op") == "archive":
++        from hermes_cli import kanban_archive_exec as ax
++        return ax.label(op)
+     from hermes_cli import kanban_notify_reconcile_exec as nrx
+     return nrx.label(op)
+ 
+@@ -251,6 +265,9 @@ def preflight(conn: sqlite3.Connection, requester: str, ops: list[dict]) -> list
+     if _is_retry_limit(ops):
+         from hermes_cli import kanban_retry_limit_exec as rlx
+         return [rlx.preflight_op(conn, requester, op) for op in ops]
++    if _is_archive(ops):
++        from hermes_cli import kanban_archive_exec as ax
++        return [ax.preflight_op(conn, requester, op) for op in ops]
+     edges = _edges(conn)
+     verdicts = []
+     for op in ops:
+@@ -562,6 +579,9 @@ def _execute(conn: sqlite3.Connection, req: dict, executor: str, board: Optional
+     if _is_retry_limit(ops):
+         from hermes_cli import kanban_retry_limit_exec as rlx
+         return rlx.execute(conn, req, executor)
++    if _is_archive(ops):
++        from hermes_cli import kanban_archive_exec as ax
++        return ax.execute(conn, req, executor)
+     # Scope is re-checked against the board as it is now, not as it was at submit time.
+     gone = requester_refusal(conn, requester)
+     verdicts = preflight(conn, requester, ops)
+diff --git a/tests/hermes_cli/test_kanban_archive_exec.py b/tests/hermes_cli/test_kanban_archive_exec.py
+new file mode 100644
+index 00000000000..0c3a7136c4d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_archive_exec.py
+@@ -0,0 +1,204 @@
++"""Supervisor ``archive`` op: cancel an unstarted card orphaned in the requester's creator tree. [daveey]
++
++Reproduces the Ask Eve dead end: standing card S created owner B, B created QA card C, B was
++archived when its PR closed, and S had no supported route to cancel C (``kanban_archive`` refused:
++C was not created by S; ``kanban_block(kind='assignment')``: ``no_capable_supervisor``). Every
++test runs on an isolated board under ``tmp_path``.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_supervisor_requests as ksr
++
++
++@pytest.fixture
++def board(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    assert str(kb.kanban_db_path()).startswith(str(tmp_path))
++    conn = kbc.connect()
++    try:
++        standing = kb.create_task(conn, title="standing", assignee="default", created_by="default")
++        owner = kb.create_task(conn, title="owner", assignee="default", creator_task_id=standing)
++        qa = kb.create_task(conn, title="qa", assignee="default", creator_task_id=owner)
++        live_owner = kb.create_task(conn, title="live owner", assignee="default", creator_task_id=standing)
++        live_qa = kb.create_task(conn, title="live owner's qa", assignee="default", creator_task_id=live_owner)
++        other = kb.create_task(conn, title="another standing", assignee="default")
++        other_owner = kb.create_task(conn, title="other owner", assignee="default", creator_task_id=other)
++        foreign = kb.create_task(conn, title="foreign qa", assignee="default", creator_task_id=other_owner)
++        # The safety edge the standing card put on QA: QA stays todo behind the never-ending standing card.
++        kb.link_tasks(conn, standing, qa)
++        assert kb.archive_task(conn, owner)
++        assert kb.archive_task(conn, other_owner)
++        kb.claim_task(conn, standing)
++        run_id = kb._current_run_id(conn, standing)
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", standing)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return {"standing": standing, "owner": owner, "qa": qa, "live_owner": live_owner, "live_qa": live_qa,
++            "foreign": foreign, "run_id": run_id}
++
++
++def _tool(args):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_supervisor_request(args))
++
++
++def _req(tid, **extra):
++    return {"ops": [{"op": "archive", "task_id": tid, **extra}], "reason": "Eve cancelled the QA; PR closed"}
++
++
++def _as_executor(monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++
++
++def _drain():
++    with kbc.connect_closing() as conn:
++        return ksr.drain(conn, role="test")
++
++
++def _status(tid):
++    with kbc.connect_closing() as conn:
++        return conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++
++
++def _runs(tid):
++    with kbc.connect_closing() as conn:
++        return conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0]
++
++
++def _request(rid) -> dict:
++    with kbc.connect_closing() as conn:
++        req = ksr.get_request(conn, rid)
++    assert req is not None
++    return req
++
++
++# --- the dead end this op removes ------------------------------------------------------------------
++
++def test_worker_archive_still_refuses_the_grandchild(board):
++    """No widening of kanban_archive itself: the worker route stays refused."""
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_archive({"task_id": board["qa"]}))
++    assert not out.get("ok", False) and "refusing to archive" in json.dumps(out), out
++    assert _status(board["qa"]) == "todo"
++
++
++# --- authorized cancellation ---------------------------------------------------------------------
++
++def test_orphaned_grandchild_is_archived_by_the_executor(board, monkeypatch):
++    dry = _tool({**_req(board["qa"]), "dry_run": True})
++    assert dry["ops"][0]["verdict"] == "supervisor", dry
++    out = _tool(_req(board["qa"]))
++    assert out["ok"] and out["status"] == "pending", out
++    assert _status(board["qa"]) == "todo"  # the worker call itself changes nothing
++    _as_executor(monkeypatch)
++    assert _drain()["processed"] == [(out["request_id"], "done")]
++    req = _request(out["request_id"])
++    (res,) = req["result"]
++    assert res["outcome"] == "applied" and res["readback"] == "archived", res
++    assert _status(board["qa"]) == "archived"
++    assert _runs(board["qa"]) == 0
++    with kbc.connect_closing() as conn:
++        ev = [e.payload for e in kb.list_events(conn, board["qa"]) if e.kind == "archived"]
++    assert ev and ev[-1] and ev[-1]["supervisor_request_id"] == out["request_id"], ev
++    assert ev[-1]["requested_by"] == board["standing"] and ev[-1]["source_status"] == "todo", ev
++    assert _status(board["standing"]) == "running"  # the receipt never completes the requester
++
++
++def test_redelivered_request_reports_already_applied(board, monkeypatch):
++    out = _tool(_req(board["qa"]))
++    _as_executor(monkeypatch)
++    _drain()
++    req = _request(out["request_id"])
++    from hermes_cli import kanban_archive_exec as ax
++    seen: list[dict] = []
++    monkeypatch.setattr(ksr, "_finish", lambda conn, req, executor, status, **kw: seen.append({"status": status, **kw}))
++    with kbc.connect_closing() as conn:
++        assert ax.applied_by(conn, board["qa"], out["request_id"])
++        assert ax.execute(conn, req, "test:redeliver") == "done"
++    (res,) = seen[-1]["results"]
++    assert res["outcome"] == "already_applied" and res["readback"] == "archived", res
++    with kbc.connect_closing() as conn:
++        assert sum(e.kind == "archived" for e in kb.list_events(conn, board["qa"])) == 1
++
++
++# --- unauthorized refusal ------------------------------------------------------------------------
++
++def test_card_created_directly_is_pointed_at_kanban_archive(board):
++    out = _tool(_req(board["live_owner"]))
++    assert out.get("code") == "refused" and "kanban_archive" in out["error"], out
++    assert _status(board["live_owner"]) != "archived"
++
++
++def test_grandchild_of_a_live_creator_is_refused(board):
++    out = _tool(_req(board["live_qa"]))
++    assert out.get("code") == "refused" and "still open" in out["error"], out
++    assert _status(board["live_qa"]) != "archived"
++
++
++def test_card_outside_the_creator_tree_is_refused(board):
++    out = _tool(_req(board["foreign"]))
++    assert out.get("code") == "refused" and "creator tree" in out["error"], out
++    assert _status(board["foreign"]) != "archived"
++
++
++def test_self_and_unknown_are_refused(board):
++    out = _tool(_req(board["standing"]))
++    assert out.get("code") == "refused" and "self_scope" in out["error"], out
++    out = _tool(_req("t_nope"))
++    assert out.get("code") == "refused" and "unknown task" in out["error"], out
++
++
++def test_claimed_grandchild_is_refused_and_never_stopped(board, monkeypatch):
++    with kbc.connect_closing() as conn:
++        kb.unlink_tasks(conn, board["standing"], board["qa"])
++        kb.recompute_ready(conn)
++        assert kb.claim_task(conn, board["qa"])
++    out = _tool(_req(board["qa"]))
++    assert out.get("code") == "refused" and "claimed or running" in out["error"], out
++    assert _status(board["qa"]) == "running"
++
++
++def test_scope_is_rechecked_at_execution(board, monkeypatch):
++    """A target claimed between submit and drain is not archived."""
++    out = _tool(_req(board["qa"]))
++    with kbc.connect_closing() as conn:
++        kb.unlink_tasks(conn, board["standing"], board["qa"])
++        kb.recompute_ready(conn)
++        assert kb.claim_task(conn, board["qa"])
++    _as_executor(monkeypatch)
++    assert _drain()["processed"] == [(out["request_id"], "rejected")]
++    (res,) = _request(out["request_id"])["result"]
++    assert res["outcome"] == "not_applied" and "claimed or running" in res["detail"], res
++    assert _status(board["qa"]) == "running"
++
++
++def test_a_worker_cannot_drain_the_request(board):
++    _tool(_req(board["qa"]))
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ksr.SupervisorRequestError):
++            ksr.drain(conn, role="test")
++    assert _status(board["qa"]) == "todo"
++
++
++def test_archive_ops_do_not_mix_with_other_families(board):
++    out = _tool({"ops": [{"op": "archive", "task_id": board["qa"]},
++                         {"op": "unlink", "parent_id": board["standing"], "child_id": board["qa"]}]})
++    assert out.get("code") == "invalid_ops", out
++    out = _tool(_req(board["qa"], parent_id=board["standing"]))
++    assert out.get("code") == "invalid_ops", out
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 720a50f5314..1d79b88e7bf 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -970,21 +970,29 @@ KANBAN_SUPERVISOR_REQUEST_SCHEMA = _schema(
+         "unblock, so parent gating applies (ready, or todo while a parent is open); the result reads back "
+         "the target's status. A request carries only resume ops. "
+         "Op retry_limit {task_id, max_retries 1-10} asks the executor to set the retry breaker on a card "
+-        "THIS task created (never this card itself); a request carries only retry_limit ops."
++        "THIS task created (never this card itself); a request carries only retry_limit ops. "
++        "Op archive {task_id} asks the executor to cancel (archive) an UNSTARTED card orphaned in this "
++        "task's creator tree: created by a card this task created (up to 3 hops) whose creator(s) are all "
++        "done or archived, so no live card owns it. Cards this task created directly are refused (use "
++        "kanban_archive), as are claimed/running/done cards and anything outside the tree; a request "
++        "carries only archive ops."
+     ),
+     {
+         "ops": {
+             "type": "array",
+-            "description": "Edge edits applied in order, reconcile_notify ops, resume ops, or retry_limit ops (max 20).",
++            "description": "Edge edits applied in order, reconcile_notify ops, resume ops, retry_limit ops, "
++                           "or archive ops (max 20).",
+             "items": {
+                 "type": "object",
+                 "properties": {
+-                    "op": {"type": "string", "enum": ["link", "unlink", "reconcile_notify", "resume", "retry_limit"]},
++                    "op": {"type": "string", "enum": ["link", "unlink", "reconcile_notify", "resume", "retry_limit",
++                                                         "archive"]},
+                     "parent_id": {"type": "string"},
+                     "child_id": {"type": "string"},
+                     "task_id": {"type": "string", "description": "reconcile_notify: the subscribed task; "
+                                                                  "resume: the card to requeue; "
+-                                                                 "retry_limit: the card to edit."},
++                                                                 "retry_limit: the card to edit; "
++                                                                 "archive: the card to cancel."},
+                     "max_retries": {"type": "integer", "description": "retry_limit: the new breaker, 1-10."},
+                     "chat_id": {"type": "string", "description": "reconcile_notify: the tui row's chat (session id)."},
+                     "thread_id": {"type": "string", "description": "reconcile_notify: the row's thread, if any."},
+-- 
+2.55.0
+

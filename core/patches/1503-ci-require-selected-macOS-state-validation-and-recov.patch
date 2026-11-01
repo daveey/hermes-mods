@@ -1,0 +1,1500 @@
+From 4936cd1f0a55f2ea5561303c116a99ba942a787f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:09:08 +0000
+Subject: [PATCH] ci: require selected macOS state validation and recover
+ runner loss
+
+---
+ .github/actions/detect-changes/action.yml   |   3 +
+ .github/workflows/ci.yaml                   |  59 +-
+ .github/workflows/hermes-state-macos.yml    |  19 +-
+ .github/workflows/hermes-state-recovery.yml |  58 ++
+ scripts/ci/classify_changes.py              |  15 +
+ scripts/ci/recover_macos_runner.py          | 264 +++++++++
+ scripts/ci/required_results.py              |  35 ++
+ tests/ci/test_classify_changes.py           |  18 +-
+ tests/ci/test_macos_state_routing.py        | 182 +++++++
+ tests/ci/test_recover_macos_runner.py       | 566 ++++++++++++++++++++
+ tests/ci/test_required_results.py           |   1 +
+ 11 files changed, 1203 insertions(+), 17 deletions(-)
+ create mode 100644 .github/workflows/hermes-state-recovery.yml
+ create mode 100644 scripts/ci/recover_macos_runner.py
+ create mode 100644 tests/ci/test_macos_state_routing.py
+ create mode 100644 tests/ci/test_recover_macos_runner.py
+
+diff --git a/.github/actions/detect-changes/action.yml b/.github/actions/detect-changes/action.yml
+index 01b488a1b49..d6fc2584038 100644
+--- a/.github/actions/detect-changes/action.yml
++++ b/.github/actions/detect-changes/action.yml
+@@ -72,6 +72,9 @@ outputs:
+   catalog:
+     description: Run the plugin-catalog tests (catalog-only diffs run these instead of the Python suite).
+     value: ${{ steps.classify.outputs.catalog }}
++  hermes_state:
++    description: Run tests/hermes_state/ on the macOS mini (state modules/tests, test harness, dependency manifests).
++    value: ${{ steps.classify.outputs.hermes_state }}
+ 
+ runs:
+   using: composite
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 4de65b273f5..ceab27fc88a 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -2,13 +2,13 @@ name: CI
+ 
+ # Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
+ # calls the sub-workflows that a PR can actually affect. A final
+-# ``all-checks-pass`` gate job aggregates results so branch protection only
+-# needs to require a single check.
++# ``all-checks-pass`` gate job keeps the v2 aggregate; the separately named
++# macOS state required (v1) consumer also fails closed on unknown selection.
+ #
+ # Sub-workflows are triggered via ``workflow_call`` and keep their own job
+ # definitions, matrices, and concurrency settings. They no longer have
+-# ``push:`` / ``pull_request:`` triggers of their own — everything flows
+-# through this file.
++# ``push:`` / ``pull_request:`` triggers of their own, except hermes-state-macos:
++# it keeps standalone main validation, masked out of this workflow on main pushes.
+ #
+ # SECURITY: this workflow runs PR-controlled actions, workflows, and code.
+ # Do not add ``secrets: inherit`` or GitHub App credentials here. Trusted
+@@ -107,6 +107,7 @@ jobs:
+       e2e_upgrade: ${{ steps.gate-lanes.outputs.e2e_upgrade }}
+       e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
+       e2e_desktop_update: ${{ steps.gate-lanes.outputs.e2e_desktop_update }}
++      hermes_state: ${{ steps.gate-lanes.outputs.hermes_state }}
+       event_name: ${{ github.event_name }}
+       python_changed: ${{ steps.python-plan.outputs.changed }}
+       python_slices: ${{ steps.python-plan.outputs.slices }}
+@@ -125,11 +126,15 @@ jobs:
+         # Overwrite the classifier outputs with 'true' when inputs.release. The E2E
+         # lanes are forced off unless this is a release run or a manual dispatch
+         # (whose empty diff already turns every lane on): never on a pull request
+-        # or a push to main, whatever the diff or labels say.
++        # or a push to main, whatever the diff or labels say. The macOS state lane
++        # is off on a main push (hermes-state-macos.yml's own push trigger runs main, so
++        # a main push never runs the suite twice on the one mini runner) and on for
++        # a dispatch or a release.
+         id: gate-lanes
+         env:
+           RELEASE: ${{ inputs.release }}
+           EVENT_NAME: ${{ github.event_name }}
++          TEST_REF: ${{ inputs.commit || github.ref }}
+           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
+         run: |
+           python3 - <<'PY'
+@@ -141,6 +146,9 @@ jobs:
+               for lane, value in values.items():
+                   if lane.startswith('e2e') and not e2e_allowed:
+                       value = 'false'
++                  elif (lane == 'hermes_state' and os.environ['EVENT_NAME'] == 'push'
++                        and os.environ['TEST_REF'] == 'refs/heads/main' and not release):
++                      value = 'false'
+                   elif release and value in ('true', 'false'):
+                       value = 'true'
+                   if '\n' in value or '\r' in value:
+@@ -292,6 +300,21 @@ jobs:
+     with:
+       commit: ${{ inputs.commit }}
+ 
++  hermes-state-macos:
++    name: hermes_state (macOS)
++    needs: detect
++    # tests/hermes_state/ on the self-hosted macOS mini, for a same-repository
++    # PR that touches the state modules, their tests, the harness or the
++    # dependency manifests (and every dispatch / release). A fork PR never runs
++    # on the mini: the job skips, and macos-state-required below then fails the
++    # selected lane, so a fork change to that surface cannot merge on a skip.
++    # Main pushes skip here (detect turns the lane off); the workflow's own push
++    # trigger runs main.
++    if: needs.detect.outputs.hermes_state == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
++    uses: ./.github/workflows/hermes-state-macos.yml
++    with:
++      commit: ${{ inputs.commit }}
++
+   bootstrap-installer:
+     name: Bootstrap installer
+     needs: detect
+@@ -499,6 +522,7 @@ jobs:
+       - js-tests
+       - rust-tests
+       - remote-backends
++      - hermes-state-macos
+       - catalog-tests
+       - bootstrap-installer
+       - e2e-desktop
+@@ -548,6 +572,31 @@ jobs:
+           if [ "$RELEASE" = true ]; then args+=(--release); fi
+           printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py "${args[@]}"
+ 
++  # ─────────────────────────────────────────────────────────────────────
++  # The macOS state lane's own required check. A separate, always-running
++  # consumer, so the protect-main ruleset can require the mini's suite by name
++  # without bumping the aggregate's version: a PR that detect selects for the
++  # lane (hermes_state == 'true') needs the lane's success, and a missing,
++  # skipped, failed or cancelled lane fails it. Only an explicitly unselected
++  # lane ('false') may skip. A detect that did not succeed fails closed: the
++  # selection is unknown. Logic and tests: scripts/ci/required_results.py
++  # --macos-state, tests/ci/test_required_results.py.
++  # ─────────────────────────────────────────────────────────────────────
++  macos-state-required:
++    name: macOS state required (v1)
++    needs: [detect, hermes-state-macos]
++    if: ${{ always() }}
++    runs-on: [self-hosted, hermes-hub]
++    timeout-minutes: 10
++    steps:
++      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
++        with:
++          ref: ${{ inputs.commit || github.sha }}
++      - name: Require the selected macOS state lane
++        env:
++          NEEDS: ${{ toJSON(needs) }}
++        run: printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py --macos-state
++
+   # ─────────────────────────────────────────────────────────────────────
+   # CI timing report: collect per-job/step durations from the GitHub API,
+   # cache them on main (as a baseline), and on PRs generate an HTML diff
+diff --git a/.github/workflows/hermes-state-macos.yml b/.github/workflows/hermes-state-macos.yml
+index 2c3f2319d67..a3c0947e331 100644
+--- a/.github/workflows/hermes-state-macos.yml
++++ b/.github/workflows/hermes-state-macos.yml
+@@ -10,8 +10,9 @@ name: hermes_state (macOS)
+ # work dir, one job at a time. GitHub-hosted runners are not used (account
+ # billing refusal), so this lane does not depend on billing.
+ #
+-# NON-BLOCKING: deliberately not called from ci.yaml and not in its aggregate
+-# gate. After a week of green main runs, add it as a required check.
++# ci.yaml calls this for selected same-repository PRs and release/dispatch runs.
++# Its macOS state required (v1) consumer requires success when selected.
++# Main pushes run here directly; CI masks its duplicate call only on main pushes.
+ #
+ # HERMES_HOME points at a throwaway temp dir so the lane can never touch the
+ # live ~/.hermes of anything else running on the mini.
+@@ -20,24 +21,34 @@ on:
+   push:
+     branches: [main, 'ci-probe/**']
+   workflow_dispatch:
++  workflow_call:
++    inputs:
++      commit:
++        description: Commit to test. Empty keeps the triggering commit.
++        type: string
++        default: ''
+ 
+ permissions:
+   contents: read
+ 
+ concurrency:
+-  group: hermes-state-macos-${{ github.ref }}
+-  # Let a running main suite finish even when pushes arrive faster than it runs.
++  # Collapse queued standalone pushes, but never supersede a required caller.
++  group: ${{ github.workflow == 'hermes_state (macOS)' && github.event_name == 'push' && format('hermes-state-macos-push-{0}', github.ref) || format('hermes-state-macos-{0}-{1}-{2}', github.run_id, github.run_attempt, inputs.commit || github.sha) }}
+   cancel-in-progress: false
+ 
+ jobs:
+   hermes-state-macos:
+     name: tests/hermes_state (macOS, mini)
++    # Defense in depth for other callers: fork PR code never reaches the mini.
++    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+     runs-on: [self-hosted, macOS, hermes-state]
+     # Include cold environment provisioning and reduced-priority shared-host work.
+     timeout-minutes: 90
+     steps:
+       - name: Checkout code
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
++        with:
++          ref: ${{ inputs.commit || github.sha }}
+ 
+       - name: Run tests/hermes_state
+         shell: bash
+diff --git a/.github/workflows/hermes-state-recovery.yml b/.github/workflows/hermes-state-recovery.yml
+new file mode 100644
+index 00000000000..256ae8857b9
+--- /dev/null
++++ b/.github/workflows/hermes-state-recovery.yml
+@@ -0,0 +1,58 @@
++name: hermes_state runner-loss recovery
++
++# When the mini's self-hosted runner drops a hermes_state (macOS) job (for
++# example a macOS update restarting the host: run 41003441463, annotation "The
++# self-hosted runner lost communication with the server. ..."), rerun that
++# run's failed jobs once. rerun-failed-jobs also reruns their dependents, so
++# CI's "macOS state required (v1)" and "All required checks pass (v2)"
++# aggregates are re-evaluated on the new attempt.
++#
++# SECURITY: workflow_run runs this file from the default branch with a write
++# token. It checks out only this workflow's own revision (github.workflow_sha),
++# never the failed run's head, and downloads no artifacts. Nothing from the
++# event payload is interpolated into a shell: the script reads
++# $GITHUB_EVENT_PATH and re-reads every fact from the API. Its gates (exact
++# repository and head repository, approved workflow path, first attempt, exact
++# macOS job on mini-hermes-state-1, exact runner-loss annotation, re-read before
++# the POST) and tests: scripts/ci/recover_macos_runner.py,
++# tests/ci/test_recover_macos_runner.py.
++
++on:
++  workflow_run:
++    workflows: ['CI', 'hermes_state (macOS)']
++    types: [completed]
++
++permissions: {}
++
++concurrency:
++  # One recovery at a time per failed run; never cancel one mid-decision. A
++  # second event for the same run waits, then sees run_attempt 2 and stops.
++  group: hermes-state-recovery-${{ github.event.workflow_run.id }}
++  cancel-in-progress: false
++
++jobs:
++  recover:
++    name: Rerun a runner-lost macOS state job
++    # Cheap pre-filter only; the script re-checks all of it against the API.
++    if: >-
++      github.repository == 'daveey/hermes'
++      && github.event.workflow_run.conclusion == 'failure'
++      && github.event.workflow_run.run_attempt == 1
++      && github.event.workflow_run.head_repository.full_name == 'daveey/hermes'
++    runs-on: [self-hosted, hermes-hub]
++    timeout-minutes: 10
++    permissions:
++      actions: write
++      checks: read
++      contents: read
++    steps:
++      - name: Checkout this workflow's trusted revision
++        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
++        with:
++          ref: ${{ github.workflow_sha }}
++          persist-credentials: false
++
++      - name: Rerun failed jobs if the runner was lost
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: python3 scripts/ci/recover_macos_runner.py --event "$GITHUB_EVENT_PATH"
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index 0cf8973bec3..af8e76f7ad6 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -51,6 +51,11 @@ Lanes:
+   sshd container and the runner's Docker daemon (remote-backends.yml). Every
+   other test of those backends is mocked, so a change to the backends, the
+   terminal tool, or the real-backend tests runs it on the PR.
++* ``hermes_state`` — tests/hermes_state/ on the real macOS mini
++  (hermes-state-macos.yml): the state modules, their tests, the shared pytest
++  harness and the dependency manifests. An empty diff, a ``.github/`` change or
++  a list at the compare API's 300-file cap runs it. ci.yaml's ``detect`` turns
++  it off on a non-release main push: the standalone workflow already runs main.
+ 
+ ``docker``, ``nix`` and the E2E lanes take most of the larger-runner minutes.
+ An ordinary product change does not start them on a pull request. Every push
+@@ -252,6 +257,12 @@ _PY_TEST_HARNESS = (
+     "scripts/run_tests_parallel.py",
+     "scripts/run_tests_host_slots.py",
+ )
++# The macOS state lane (hermes-state-macos.yml runs tests/hermes_state/ on the mini):
++# hermes_state.py and every hermes_state_* sibling, their tests, the shared pytest harness
++# that runs them, and the dependency manifests they import through.
++_HERMES_STATE_PATHS = ("hermes_state", "tests/hermes_state/", *_PY_TEST_HARNESS, *_DEP_MANIFESTS)
++# The compare API returns at most this many files, so a list this long may be truncated.
++COMPARE_FILE_CAP = 300
+ # Both Desktop suites package the app and share this harness (the update
+ # suite imports the core suite's harness and provider).
+ _DESKTOP_E2E_SHARED = (
+@@ -676,6 +687,9 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
+         "rust": any(_is_rust(f) for f in files),
+         "remote_backends": any(f.startswith(_REMOTE_BACKEND_PATHS) for f in files),
+         "catalog": catalog,
++        # A capped list may omit the state files, so it runs the lane.
++        "hermes_state": len(files) >= COMPARE_FILE_CAP
++        or any(f.startswith(_HERMES_STATE_PATHS) for f in files),
+         **{lane: run_e2e or on for lane, on in _slow_lanes(files).items()},
+     }
+     consumers = [c for f in files for c in _SHARED_FIXTURE_CONSUMERS.get(f, ())]
+@@ -698,6 +712,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
+         ret["rust"] = True
+         ret["remote_backends"] = True
+         ret["catalog"] = True
++        ret["hermes_state"] = True
+         ret.update(dict.fromkeys(_slow_lanes([]), True))
+     return ret
+ 
+diff --git a/scripts/ci/recover_macos_runner.py b/scripts/ci/recover_macos_runner.py
+new file mode 100644
+index 00000000000..1a4e74c8aa6
+--- /dev/null
++++ b/scripts/ci/recover_macos_runner.py
+@@ -0,0 +1,264 @@
++#!/usr/bin/env python3
++"""Rerun a macOS state job once when the mini's self-hosted runner was lost.
++
++Called by .github/workflows/hermes-state-recovery.yml on ``workflow_run``
++(completed) for CI and hermes_state (macOS). That workflow checks out only its
++own trusted revision (``github.workflow_sha``) and runs this file; it never
++checks out the failed run's head or downloads its artifacts.
++
++A run is rerun (``POST .../rerun-failed-jobs``, which also reruns the failed
++jobs' dependents, so the downstream required aggregates are re-evaluated) only
++when ALL of these hold, read from the API, not only from the event payload:
++
++* repository and head repository are exactly ``daveey/hermes``;
++* the workflow file is one of the approved paths;
++* the run is attempt 1, completed, conclusion ``failure``;
++* attempt 1 has exactly one job with the approved macOS job name for that
++  workflow, it ran on ``mini-hermes-state-1``, failed, no step reports a
++  failure, and every failure annotation on it is GitHub's exact runner-loss
++  message;
++* every other non-successful job in attempt 1 is a known downstream aggregate
++  (which rerun-failed-jobs reruns anyway as a dependent);
++* immediately before the POST the run is re-read and is still attempt 1,
++  completed, failure (a second event for the same run sees attempt 2 and stops).
++
++Anything else is a skip with a logged reason. Test/assertion failures carry a
++``Process completed with exit code N`` annotation and a failed step, so they are
++never rerun. Standard library only; the GitHub client shells out to ``gh api``
++with an argument vector (no shell), using GH_TOKEN from the workflow env.
++
++Tests: tests/ci/test_recover_macos_runner.py.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++from dataclasses import dataclass
++from typing import Any, Protocol
++
++TRUSTED_REPOSITORY = "daveey/hermes"
++RUNNER_NAME = "mini-hermes-state-1"
++MACOS_JOB = "tests/hermes_state (macOS, mini)"
++
++# Approved workflow file -> exact job name of the macOS lane in that workflow,
++# and the jobs downstream of it that may fail only because it failed.
++WORKFLOWS: dict[str, dict[str, Any]] = {
++    ".github/workflows/hermes-state-macos.yml": {
++        "job": MACOS_JOB,
++        "downstream": frozenset(),
++    },
++    ".github/workflows/ci.yaml": {
++        # Reusable call: "<caller job name> / <called job name>".
++        "job": f"hermes_state (macOS) / {MACOS_JOB}",
++        "downstream": frozenset({"All required checks pass (v2)", "macOS state required (v1)"}),
++    },
++}
++
++# GitHub's annotation text for a lost self-hosted runner, verbatim from run
++# 41003441463 (check run 123892862167), read back 2026-11-01.
++RUNNER_LOSS_MESSAGES = frozenset({
++    "The self-hosted runner lost communication with the server. Verify the machine is "
++    "running and has a healthy network connection. Anything in your workflow that "
++    "terminates the runner process, starves it for CPU/Memory, or blocks its network "
++    "access can cause this error.",
++})
++
++_OK_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
++_PER_PAGE = 100
++_MAX_PAGES = 50
++
++
++class Api(Protocol):
++    def get(self, path: str) -> Any: ...
++    def post(self, path: str) -> Any: ...
++
++
++class ApiError(RuntimeError):
++    pass
++
++
++class GhApi:
++    """GitHub REST via ``gh api``; argv only, never a shell."""
++
++    def __init__(self, gh: str = "gh") -> None:
++        self.gh = gh
++
++    def _call(self, args: list[str]) -> Any:
++        proc = subprocess.run([self.gh, "api", *args], capture_output=True, text=True, check=False, timeout=60)
++        if proc.returncode != 0:
++            raise ApiError(f"gh api {args[-1]} failed ({proc.returncode}): {proc.stderr.strip()[:500]}")
++        return json.loads(proc.stdout) if proc.stdout.strip() else {}
++
++    def get(self, path: str) -> Any:
++        return self._call(["-H", "Accept: application/vnd.github+json", path])
++
++    def post(self, path: str) -> Any:
++        return self._call(["-X", "POST", "-H", "Accept: application/vnd.github+json", path])
++
++
++@dataclass(frozen=True)
++class Decision:
++    action: str  # "rerun" | "skip"
++    reason: str
++    run_id: int | None = None
++    dry_run: bool = False
++
++    def as_dict(self) -> dict[str, Any]:
++        return {"action": self.action, "reason": self.reason, "run_id": self.run_id,
++                "dry_run": self.dry_run}
++
++
++def _skip(reason: str, run_id: int | None = None) -> Decision:
++    return Decision("skip", reason, run_id)
++
++
++def _full_name(obj: Any) -> str | None:
++    return obj.get("full_name") if isinstance(obj, dict) else None
++
++
++def _run_problem(run: Any, repository: str) -> str | None:
++    """Why this run is not a first-attempt failed run of an approved workflow."""
++    if not isinstance(run, dict):
++        return "run payload is not an object"
++    if _full_name(run.get("repository")) != repository:
++        return f"repository {_full_name(run.get('repository'))!r} is not {repository!r}"
++    if _full_name(run.get("head_repository")) != repository:
++        return f"head repository {_full_name(run.get('head_repository'))!r} is not {repository!r}"
++    if run.get("path") not in WORKFLOWS:
++        return f"workflow path {run.get('path')!r} is not approved"
++    if run.get("run_attempt") != 1:
++        return f"run attempt is {run.get('run_attempt')!r}, not 1"
++    if run.get("status") != "completed":
++        return f"run status is {run.get('status')!r}, not completed"
++    if run.get("conclusion") != "failure":
++        return f"run conclusion is {run.get('conclusion')!r}, not failure"
++    return None
++
++
++def _paginate(api: Api, base: str, key: str | None) -> list[Any]:
++    items: list[Any] = []
++    for page in range(1, _MAX_PAGES + 1):
++        body = api.get(f"{base}?per_page={_PER_PAGE}&page={page}")
++        chunk = body.get(key, []) if key else body
++        if not isinstance(chunk, list):
++            raise ApiError(f"{base}: page {page} is not a list")
++        items.extend(chunk)
++        total = body.get("total_count") if key else None
++        if not chunk or len(chunk) < _PER_PAGE or (total is not None and len(items) >= total):
++            return items
++    raise ApiError(f"{base}: more than {_MAX_PAGES} pages")
++
++
++def _job_problem(job: dict[str, Any], annotations: list[Any]) -> str | None:
++    """Why this macOS job failure is not a pure runner loss."""
++    if job.get("run_attempt") != 1:
++        return f"job attempt is {job.get('run_attempt')!r}, not 1"
++    if job.get("status") != "completed" or job.get("conclusion") != "failure":
++        return f"job is {job.get('status')!r}/{job.get('conclusion')!r}, not completed/failure"
++    if job.get("runner_name") != RUNNER_NAME:
++        return f"job ran on {job.get('runner_name')!r}, not {RUNNER_NAME!r}"
++    failed_steps = [s.get("name") for s in job.get("steps") or [] if s.get("conclusion") == "failure"]
++    if failed_steps:
++        return f"step(s) failed: {failed_steps}"
++    failures = [a for a in annotations if isinstance(a, dict) and a.get("annotation_level") == "failure"]
++    if not failures:
++        return "no failure annotation on the job"
++    other = [a.get("message") for a in failures if a.get("message") not in RUNNER_LOSS_MESSAGES]
++    if other:
++        return f"failure annotation is not a runner loss: {other[0]!r}"
++    return None
++
++
++def recover(event: dict[str, Any], api: Api, *, repository: str = TRUSTED_REPOSITORY,
++            dry_run: bool = False) -> Decision:
++    if repository != TRUSTED_REPOSITORY:
++        return _skip(f"repository {repository!r} is not {TRUSTED_REPOSITORY!r}")
++    if event.get("action") != "completed":
++        return _skip(f"event action {event.get('action')!r} is not completed")
++    payload_run = event.get("workflow_run")
++    problem = _run_problem(payload_run, repository)
++    if problem or not isinstance(payload_run, dict):
++        return _skip(f"event: {problem}")
++    run_id = payload_run.get("id")
++    if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
++        return _skip(f"run id {run_id!r} is not a positive integer")
++
++    run_path = f"repos/{repository}/actions/runs/{run_id}"
++    run = api.get(run_path)
++    problem = _run_problem(run, repository) or (
++        None if run.get("id") == run_id else f"API returned run {run.get('id')!r}")
++    if problem:
++        return _skip(f"api: {problem}", run_id)
++    if run.get("path") != payload_run.get("path"):
++        return _skip("api workflow path differs from the event", run_id)
++    spec = WORKFLOWS[run["path"]]
++
++    jobs = _paginate(api, f"{run_path}/attempts/1/jobs", "jobs")
++    targets = [j for j in jobs if j.get("name") == spec["job"]]
++    if len(targets) != 1:
++        return _skip(f"expected exactly one {spec['job']!r} job, found {len(targets)}", run_id)
++    target = targets[0]
++    for job in jobs:
++        if job is target:
++            continue
++        if job.get("status") != "completed":
++            return _skip(f"job {job.get('name')!r} is {job.get('status')!r}", run_id)
++        if job.get("conclusion") not in _OK_CONCLUSIONS and job.get("name") not in spec["downstream"]:
++            return _skip(f"other job {job.get('name')!r} concluded {job.get('conclusion')!r}", run_id)
++    if not isinstance(target.get("id"), int):
++        return _skip("macOS job id is not an integer", run_id)
++    annotations = _paginate(api, f"repos/{repository}/check-runs/{target['id']}/annotations", None)
++    problem = _job_problem(target, annotations)
++    if problem:
++        return _skip(f"macOS job: {problem}", run_id)
++
++    # Duplicate safety: another event (or a person) may have rerun it already.
++    problem = _run_problem(api.get(run_path), repository)
++    if problem:
++        return _skip(f"re-read before rerun: {problem}", run_id)
++    # An old PR rerun joins CI's per-PR concurrency group and could cancel the
++    # current head. Refuse obsolete or unidentifiable PRs before mutation.
++    if run.get("event") == "pull_request":
++        pulls = run.get("pull_requests") or []
++        if len(pulls) != 1 or not isinstance(pulls[0].get("number"), int):
++            return _skip("PR identity is missing or ambiguous", run_id)
++        pull = api.get(f"repos/{repository}/pulls/{pulls[0]['number']}")
++        if pull.get("state") != "open" or (pull.get("head") or {}).get("sha") != run.get("head_sha"):
++            return _skip("PR closed or head superseded", run_id)
++    reason = f"runner lost on {RUNNER_NAME}; rerunning failed jobs of attempt 1"
++    if dry_run:
++        return Decision("rerun", reason, run_id, dry_run=True)
++    api.post(f"{run_path}/rerun-failed-jobs")
++    return Decision("rerun", reason, run_id)
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n", 1)[0])
++    parser.add_argument("--event", default=os.environ.get("GITHUB_EVENT_PATH"),
++                        help="workflow_run event JSON (default: $GITHUB_EVENT_PATH)")
++    parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
++    parser.add_argument("--dry-run", action="store_true", help="decide but do not POST")
++    args = parser.parse_args(argv)
++    if not args.event:
++        parser.error("--event or GITHUB_EVENT_PATH is required")
++    with open(args.event, encoding="utf-8") as fh:
++        event = json.load(fh)
++    try:
++        decision = recover(event, GhApi(), repository=args.repository, dry_run=args.dry_run)
++    except (ApiError, json.JSONDecodeError) as exc:
++        print(json.dumps({"action": "error", "reason": str(exc)}), file=sys.stderr)
++        return 1
++    print(json.dumps(decision.as_dict()))
++    summary = os.environ.get("GITHUB_STEP_SUMMARY")
++    if summary:
++        with open(summary, "a", encoding="utf-8") as fh:
++            fh.write(f"Runner-loss recovery: **{decision.action}** - {decision.reason}\n")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/ci/required_results.py b/scripts/ci/required_results.py
+index bec5df8722a..75e83bc78c1 100644
+--- a/scripts/ci/required_results.py
++++ b/scripts/ci/required_results.py
+@@ -41,8 +41,34 @@ _UPDATE_CONSUMER_LANES = {
+     "e2e-desktop-update": ("e2e_desktop_update",),
+     "remote-backends": ("remote_backends",),
+     "catalog-tests": ("catalog",),
++    "hermes-state-macos": ("hermes_state",),
+ }
+ 
++# ci.yaml's ``macOS state required (v1)`` consumer: the macOS state lane and its selector.
++MACOS_STATE_JOB = "hermes-state-macos"
++MACOS_STATE_LANE = "hermes_state"
++
++
++def evaluate_macos_state(needs: dict[str, dict[str, Any]] | None) -> dict[str, Any]:
++    """Verdict for ``macOS state required``: ``ok`` plus a one-line ``reason``.
++
++    A selected lane must succeed; only an explicitly unselected one may skip.
++    A detect that did not succeed, or a selection that is neither ``'true'`` nor
++    ``'false'``, fails closed: whether the lane was required is unknown.
++    """
++    entries = needs or {}
++    detect = entries.get("detect") or {}
++    if detect.get("result") != "success":
++        return {"ok": False, "reason": f"detect {detect.get('result') or 'missing'}: lane selection unknown"}
++    selected = (detect.get("outputs") or {}).get(MACOS_STATE_LANE)
++    lane = (entries.get(MACOS_STATE_JOB) or {}).get("result") or "missing"
++    if selected == "true":
++        return {"ok": lane == "success", "reason": f"{MACOS_STATE_LANE} selected, {MACOS_STATE_JOB} {lane}"}
++    if selected == "false":
++        return {"ok": lane in ("skipped", "success"),
++                "reason": f"{MACOS_STATE_LANE} not selected, {MACOS_STATE_JOB} {lane}"}
++    return {"ok": False, "reason": f"{MACOS_STATE_LANE} selection {selected!r}: lane selection unknown"}
++
+ 
+ def evaluate_gate(
+     needs: dict[str, dict[str, Any]] | None,
+@@ -102,9 +128,18 @@ def main(argv: list[str] | None = None) -> int:
+         action="store_true",
+         help="Strict mode: a skipped excluded job is the only tolerated skip.",
+     )
++    parser.add_argument(
++        "--macos-state",
++        action="store_true",
++        help="Judge only the macOS state lane (ci.yaml's macOS state required check).",
++    )
+     args = parser.parse_args(argv)
+ 
+     needs = json.load(sys.stdin)
++    if args.macos_state:
++        verdict = evaluate_macos_state(needs)
++        print(("" if verdict["ok"] else "::error::") + verdict["reason"])
++        return 0 if verdict["ok"] else 1
+     verdict = evaluate_gate(needs, release=args.release)
+     compact = compact_results(needs)
+ 
+diff --git a/tests/ci/test_classify_changes.py b/tests/ci/test_classify_changes.py
+index 7f876639a2f..5db80f31179 100644
+--- a/tests/ci/test_classify_changes.py
++++ b/tests/ci/test_classify_changes.py
+@@ -49,12 +49,13 @@ DEFAULT = {
+     "rust": True,
+     "remote_backends": True,
+     "catalog": True,
++    "hermes_state": True,
+ }
+ 
+ SLOW_LANES = {"docker", "nix", "e2e", "e2e_upgrade", "e2e_desktop_core", "e2e_desktop_update"}
+ 
+ 
+-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, docker_meta=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, remote_backends=False, catalog=False) -> dict[str, bool]:
++def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, docker_meta=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, remote_backends=False, catalog=False, hermes_state=False) -> dict[str, bool]:
+     # python_prod tracks python except for tests-only diffs; default it to
+     # python so the majority of cases don't need to spell it out.
+     #
+@@ -84,6 +85,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
+         "rust": rust,
+         "remote_backends": remote_backends,
+         "catalog": catalog,
++        "hermes_state": hermes_state,
+     }
+ 
+ 
+@@ -115,9 +117,9 @@ CASES = {
+     # install, so they start those slow lanes on the PR itself.
+     "dep manifest → python": (
+         ["pyproject.toml"],
+-        _lanes(python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True, docker=True, nix=True, e2e_upgrade=True),
++        _lanes(python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True, docker=True, nix=True, e2e_upgrade=True, hermes_state=True),
+     ),
+-    "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True, docker=True, nix=True, e2e_upgrade=True)),
++    "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True, docker=True, nix=True, e2e_upgrade=True, hermes_state=True)),
+     "ts package → frontend": (["apps/desktop/src/app.tsx"], _lanes(frontend=True)),
+     "ui-tui → frontend": (["ui-tui/src/entry.ts"], _lanes(frontend=True)),
+     # Lockfile bump shifts every TS package's tree, but not the Python suite.
+@@ -253,11 +255,11 @@ CASES = {
+     # The shared harness can break every Python E2E suite.
+     "conftest → python + desktop_updater + python e2e": (
+         ["tests/conftest.py"],
+-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True),
++        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True, hermes_state=True),
+     ),
+     "conftest fixture module → python + desktop_updater + python e2e": (
+         ["tests/_fixtures/platform_gating.py"],
+-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True),
++        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True, hermes_state=True),
+     ),
+     "tests + prod source → both lanes": (
+         ["tests/agent/test_foo.py", "agent/x.py"],
+@@ -269,11 +271,11 @@ CASES = {
+     # .py/.pth payloads are what it scans for).
+     "test runner script → python_prod stays on": (
+         ["scripts/run_tests_parallel.py"],
+-        _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True),
++        _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True, hermes_state=True),
+     ),
+     # Supply-chain lanes
+     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
+-    "setup.py → scan": (["setup.py"], _lanes(python=True, scan=True, docker=True, nix=True, e2e_upgrade=True)),
++    "setup.py → scan": (["setup.py"], _lanes(python=True, scan=True, docker=True, nix=True, e2e_upgrade=True, hermes_state=True)),
+     # Files CODEOWNERS owns carry no lane of their own: they only route as code.
+     "mcp catalog manifest → python only": (
+         ["optional-mcps/foo/manifest.yaml"],
+@@ -368,7 +370,7 @@ CASES = {
+         ["tests/e2e/core/sqlite/test_torture.py"],
+         _lanes(python=True, python_prod=False, scan=True, e2e=True),
+     ),
+-    "state db → e2e": (["hermes_state_wal.py"], _lanes(python=True, scan=True, e2e=True)),
++    "state db → e2e": (["hermes_state_wal.py"], _lanes(python=True, scan=True, e2e=True, hermes_state=True)),
+     "upgrade suite → e2e_upgrade, not e2e": (
+         ["tests/e2e/core/upgrade/pm/test_pm_lifecycle.py"],
+         _lanes(python=True, python_prod=False, scan=True, e2e_upgrade=True),
+diff --git a/tests/ci/test_macos_state_routing.py b/tests/ci/test_macos_state_routing.py
+new file mode 100644
+index 00000000000..364a87d388f
+--- /dev/null
++++ b/tests/ci/test_macos_state_routing.py
+@@ -0,0 +1,182 @@
++"""Replay the macOS state lane's real workflow wiring, without running a mini job."""
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import hermes_yaml
++import pytest
++
++from scripts.ci.classify_changes import classify
++from scripts.ci.required_results import evaluate_macos_state
++from tests.ci import _gha_expr as gha, workflow_steps
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def workflow(name):
++    doc = hermes_yaml.safe_load((ROOT / '.github/workflows' / name).read_text())
++    doc['on'] = doc.get('on', doc.get(True, {}))
++    return doc
++
++
++def context(event='pull_request', ref='refs/pull/1/merge', release=False, fork=False):
++    return {'github': {'event_name': event, 'ref': ref, 'sha': 'trigger-sha',
++                       'run_id': '123', 'run_attempt': '1', 'repository': 'owner/repo',
++                       'event': {'pull_request': {'head': {'repo': {
++                           'full_name': 'fork/repo' if fork else 'owner/repo'}}}}},
++            'inputs': {'release': release, 'commit': ''},
++            '__status__': {'always': lambda: True}}
++
++
++def detect(paths, ctx):
++    raw = {key: gha.to_string(value) for key, value in classify(paths).items()}
++    action = hermes_yaml.safe_load((ROOT / '.github/actions/detect-changes/action.yml').read_text())
++    outputs = {key: gha.render(value['value'], {'steps': {'classify': {'outputs': raw}}})
++               for key, value in action['outputs'].items()}
++    job = workflow('ci.yaml')['jobs']['detect']
++    ctx['steps'] = {'classify': {'outputs': outputs}}
++    step = next(step for step in job['steps'] if step.get('id') == 'gate-lanes')
++    ctx['steps']['gate-lanes'] = {'outputs': workflow_steps.outputs(step, ctx)}
++    return {key: gha.render(value, ctx) for key, value in job['outputs'].items()}
++
++
++@pytest.mark.parametrize('event,ref,release,selected', [
++    ('push', 'refs/heads/main', False, False),
++    ('push', 'refs/heads/other', False, True),
++    ('push', 'refs/heads/main', True, True),
++    ('workflow_dispatch', 'refs/heads/main', False, True),
++    ('workflow_call', 'refs/heads/main', True, True),
++    ('pull_request', 'refs/pull/1/merge', False, True),
++])
++def test_only_nonrelease_main_push_is_masked(event, ref, release, selected):
++    assert detect([], context(event, ref, release))['hermes_state'] == gha.to_string(selected)
++
++
++def test_release_forces_unselected_lane_and_explicit_commit_is_not_masked():
++    assert detect(['README.md'], context(release=True))['hermes_state'] == 'true'
++    ctx = context('push', 'refs/heads/main')
++    ctx['inputs']['commit'] = 'candidate-sha'
++    assert detect([], ctx)['hermes_state'] == 'true'
++
++
++@pytest.mark.parametrize('paths,selected', [
++    (['hermes_state.py'], True), (['hermes_state_sessions.py'], True),
++    (['tests/hermes_state/test_state.py'], True), (['tests/conftest.py'], True),
++    (['scripts/run_tests.sh'], True), (['scripts/run_tests_parallel.py'], True),
++    (['scripts/run_tests_host_slots.py'], True), (['tests/_fixtures/state.py'], True),
++    (['pyproject.toml'], True), (['uv.lock'], True), (['setup.py'], True),
++    (['.github/workflows/ci.yaml'], True), ([], True),
++    ([f'docs/{i}.md' for i in range(300)], True),
++    ([f'docs/{i}.md' for i in range(299)], False),
++    (['README.md'], False), (['run_agent.py'], False),
++])
++@pytest.mark.parametrize('fork', [False, True])
++def test_classifier_action_detect_and_caller_chain(paths, selected, fork):
++    ctx = context(fork=fork)
++    outputs = detect(paths, ctx)
++    assert outputs['hermes_state'] == gha.to_string(selected)
++    ctx['needs'] = {'detect': {'result': 'success', 'outputs': outputs}}
++    job = workflow('ci.yaml')['jobs']['hermes-state-macos']
++    assert gha.condition(job['if'], ctx) is (selected and not fork)
++    result = 'success' if selected and not fork else 'skipped'
++    ctx['needs']['hermes-state-macos'] = {'result': result}
++    assert evaluate_macos_state(ctx['needs'])['ok'] is (not selected or not fork)
++
++
++def test_reusable_contract_commit_and_independent_concurrency():
++    ci = workflow('ci.yaml')
++    caller = ci['jobs']['hermes-state-macos']
++    child = workflow(Path(caller['uses']).name)
++    assert 'workflow_call' in child['on']
++    assert child['on']['workflow_call']['inputs']['commit']['default'] == ''
++    contexts = [context('push', 'refs/heads/main'), context('workflow_dispatch', 'refs/heads/main')]
++    contexts[1]['github']['run_id'] = '124'
++    contexts[1]['inputs']['commit'] = 'admitted-sha'
++    groups = []
++    for ctx in contexts:
++        ctx['inputs'] = {key: gha.render(value, ctx) for key, value in caller['with'].items()}
++        job = child['jobs']['hermes-state-macos']
++        checkout = next(step for step in job['steps'] if workflow_steps.is_checkout(step))
++        assert gha.render(checkout['with']['ref'], ctx) == (ctx['inputs']['commit'] or 'trigger-sha')
++        groups.append(gha.render(child['concurrency']['group'], ctx))
++    assert groups[0] != groups[1]
++    assert child['concurrency']['cancel-in-progress'] is False
++    assert ci['jobs']['all-checks-pass']['name'] == 'All required checks pass (v2)'
++    consumer = ci['jobs']['macos-state-required']
++    assert consumer['name'] == 'macOS state required (v1)'
++    assert set(consumer['needs']) == {'detect', 'hermes-state-macos'}
++    assert gha.condition(consumer['if'], context())
++
++
++def test_standalone_pushes_collapse_without_superseding_required_calls():
++    group = workflow('hermes-state-macos.yml')['concurrency']['group']
++    def render(workflow_name, run_id, event='push'):
++        ctx = context(event, 'refs/heads/main')
++        ctx['github'].update(workflow=workflow_name, run_id=run_id, sha=f'sha-{run_id}')
++        return gha.render(group, ctx)
++    assert render('hermes_state (macOS)', 1) == render('hermes_state (macOS)', 2)
++    assert render('CI', 1) != render('CI', 2)
++    assert render('CI', 1) != render('hermes_state (macOS)', 1)
++    assert render('hermes_state (macOS)', 1, 'workflow_dispatch') != render('hermes_state (macOS)', 2, 'workflow_dispatch')
++
++
++@pytest.mark.parametrize('selected', ['true', 'false', None, '', 'TRUE', 0, 1, True, False])
++@pytest.mark.parametrize('result', ['success', 'skipped', 'failure', 'cancelled', None])
++def test_required_consumer_executes_real_cli(selected, result):
++    needs = {'detect': {'result': 'success', 'outputs': {'hermes_state': selected}}}
++    if result is not None:
++        needs['hermes-state-macos'] = {'result': result}
++    ctx = context()
++    ctx['needs'] = needs
++    consumer = workflow('ci.yaml')['jobs']['macos-state-required']
++    step = next(step for step in consumer['steps'] if 'run' in step)
++    proc = subprocess.run(['bash', '-eo', 'pipefail', '-c', gha.render(step['run'], ctx)],
++                          cwd=ROOT, text=True, capture_output=True, timeout=30, check=False,
++                          env={**os.environ, 'PATH': str(Path(sys.executable).parent) + os.pathsep + os.environ['PATH'],
++                               **{k: gha.to_string(gha.render(v, ctx)) for k, v in step['env'].items()}})
++    ok = (selected == 'true' and result == 'success') or (selected == 'false' and result in ('success', 'skipped'))
++    assert proc.returncode == (0 if ok else 1), proc.stdout + proc.stderr
++    assert ('::error::' in proc.stdout) is not ok
++
++
++@pytest.mark.parametrize('result', ['failure', 'cancelled', 'skipped', None])
++def test_unknown_detection_fails_closed(result):
++    needs: dict = {'hermes-state-macos': {'result': 'success'}}
++    if result is not None:
++        needs['detect'] = {'result': result, 'outputs': {'hermes_state': 'false'}}
++    assert not evaluate_macos_state(needs)['ok']
++    assert not evaluate_macos_state({})['ok']
++    assert not evaluate_macos_state(None)['ok']
++
++
++@pytest.mark.parametrize('fork', [False, True])
++def test_reusable_job_also_rejects_fork_prs(fork):
++    child = workflow('hermes-state-macos.yml')['jobs']['hermes-state-macos']
++    assert gha.condition(child['if'], context(fork=fork)) is not fork
++
++
++@pytest.mark.parametrize('code', [0, 1])
++def test_suite_launch_receipt_and_failure_propagation(tmp_path, code):
++    """Execute shell wiring; receipt taskpolicy's launch boundary, not native macOS execution."""
++    job = workflow('hermes-state-macos.yml')['jobs']['hermes-state-macos']
++    step = next(step for step in job['steps'] if 'run' in step)
++    workflow_steps.required(step, context())
++    receipt = tmp_path / 'receipt.json'
++    shim = '''taskpolicy() {
++      "$REPLAY_PYTHON" -c 'import json,os,sys; from pathlib import Path; Path(os.environ["RECEIPT"]).write_text(json.dumps({"args": sys.argv[1:], "home": os.environ["HERMES_HOME"], "exists": Path(os.environ["HERMES_HOME"]).is_dir()}))' "$@"
++      return "$SUITE_EXIT"
++    }
++    '''
++    proc = subprocess.run(['bash', '-eo', 'pipefail', '-c', shim + step['run']],
++                          cwd=ROOT, capture_output=True, text=True, timeout=30, check=False,
++                          env={**os.environ, **step.get('env', {}), 'RUNNER_TEMP': str(tmp_path),
++                               'REPLAY_PYTHON': sys.executable, 'RECEIPT': str(receipt),
++                               'SUITE_EXIT': str(code)})
++    assert proc.returncode == code, proc.stderr
++    call = json.loads(receipt.read_text())
++    assert call['args'] == ['-c', 'utility', 'scripts/run_tests.sh', 'tests/hermes_state/', '-j', '2']
++    assert call['exists']
++    assert Path(call['home']).parent == tmp_path
++    assert not Path(call['home']).exists(), 'throwaway home must be removed on failure too'
+diff --git a/tests/ci/test_recover_macos_runner.py b/tests/ci/test_recover_macos_runner.py
+new file mode 100644
+index 00000000000..ec455110453
+--- /dev/null
++++ b/tests/ci/test_recover_macos_runner.py
+@@ -0,0 +1,566 @@
++"""Behavior tests for scripts/ci/recover_macos_runner.py (macOS runner-loss recovery).
++
++Fixture provenance: the RUNNER_LOSS_* and TEST_FAILURE_* payloads below are trimmed
++copies of REAL historical GitHub API responses, captured 2026-11-01 with
++``gh api`` (a scoped GitHub credential) from daveey/hermes:
++
++* run 41003441463 attempt 1 (runner lost after a macOS update on the mini):
++  ``actions/runs/41003441463``, ``.../attempts/1/jobs``,
++  ``check-runs/123892862167/annotations``;
++* run 40751299089 attempt 1 (an ordinary test failure):
++  ``actions/runs/40751299089``, ``.../attempts/1/jobs``,
++  ``check-runs/123038389129/annotations``.
++
++They are historical evidence, not a live API read; every API call in these tests
++goes to an in-memory fake. Fields the script does not read were dropped.
++"""
++
++from __future__ import annotations
++
++import copy
++import importlib.util
++import json
++import sys
++from pathlib import Path
++
++import pytest
++from ruamel.yaml import YAML
++
++SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "recover_macos_runner.py"
++
++_spec = importlib.util.spec_from_file_location("recover_macos_runner", SCRIPT)
++assert _spec is not None and _spec.loader is not None
++recover = importlib.util.module_from_spec(_spec)
++sys.modules[_spec.name] = recover  # dataclasses resolve their module by name
++_spec.loader.exec_module(recover)
++
++WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
++RECOVERY_WORKFLOW = WORKFLOWS / "hermes-state-recovery.yml"
++_YAML = YAML(typ="safe")
++
++REPO = "daveey/hermes"
++_REPO_OBJ = {"full_name": REPO}
++
++# --- run 41003441463: runner lost communication (real, historical) -----------------
++RUNNER_LOSS_RUN = {
++    "id": 41003441463, "name": "hermes_state (macOS)",
++    "path": ".github/workflows/hermes-state-macos.yml", "event": "push",
++    "status": "completed", "conclusion": "failure", "run_attempt": 1,
++    "head_branch": "main", "head_sha": "d72202494966a92e772ebe5546beba613de2504c",
++    "workflow_id": 399465002, "repository": _REPO_OBJ, "head_repository": _REPO_OBJ,
++}
++RUNNER_LOSS_JOBS = {"total_count": 1, "jobs": [{
++    "id": 123892862167, "run_id": 41003441463, "run_attempt": 1,
++    "name": "tests/hermes_state (macOS, mini)", "status": "completed",
++    "conclusion": "failure", "runner_name": "mini-hermes-state-1",
++    "labels": ["self-hosted", "macOS", "hermes-state"],
++    "steps": [
++        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"},
++        {"number": 2, "name": "Checkout code", "status": "completed", "conclusion": "success"},
++        {"number": 3, "name": "Run tests/hermes_state", "status": "in_progress", "conclusion": None},
++        {"number": 6, "name": "Post Checkout code", "status": "pending", "conclusion": None},
++    ],
++}]}
++RUNNER_LOSS_MESSAGE = (
++    "The self-hosted runner lost communication with the server. Verify the machine is "
++    "running and has a healthy network connection. Anything in your workflow that "
++    "terminates the runner process, starves it for CPU/Memory, or blocks its network "
++    "access can cause this error."
++)
++RUNNER_LOSS_ANNOTATIONS = [{
++    "path": ".github", "start_line": 1, "end_line": 1, "annotation_level": "failure",
++    "title": "", "message": RUNNER_LOSS_MESSAGE, "raw_details": "",
++}]
++
++
++class FakeApi:
++    """In-memory stand-in for the gh client: GET by exact path, records POSTs."""
++
++    def __init__(self, routes):
++        self.routes = routes
++        self.gets: list[str] = []
++        self.posts: list[str] = []
++
++    def get(self, path):
++        self.gets.append(path)
++        value = self.routes[path]
++        if callable(value):
++            value = value()
++        return copy.deepcopy(value)
++
++    def post(self, path):
++        self.posts.append(path)
++        return {}
++
++
++def _event(run):
++    return {"action": "completed", "workflow_run": copy.deepcopy(run)}
++
++
++def _routes(run, jobs, annotations):
++    rid = run["id"]
++    routes = {
++        f"repos/{REPO}/actions/runs/{rid}": run,
++        f"repos/{REPO}/actions/runs/{rid}/attempts/1/jobs?per_page=100&page=1": jobs,
++        f"repos/{REPO}/actions/runs/{rid}/attempts/1/jobs?per_page=100&page=2": {
++            "total_count": jobs["total_count"], "jobs": []},
++    }
++    routes[f"repos/{REPO}/pulls/123"] = {"state": "open", "head": {"sha": run["head_sha"]}}
++    for job_id, anns in annotations.items():
++        routes[f"repos/{REPO}/check-runs/{job_id}/annotations?per_page=100&page=1"] = anns
++        routes[f"repos/{REPO}/check-runs/{job_id}/annotations?per_page=100&page=2"] = []
++    return routes
++
++
++def test_historical_runner_loss_reruns_failed_jobs_once():
++    api = FakeApi(_routes(RUNNER_LOSS_RUN, RUNNER_LOSS_JOBS,
++                          {123892862167: RUNNER_LOSS_ANNOTATIONS}))
++    decision = recover.recover(_event(RUNNER_LOSS_RUN), api, repository=REPO)
++    assert decision.action == "rerun", decision.reason
++    assert api.posts == [f"repos/{REPO}/actions/runs/41003441463/rerun-failed-jobs"]
++
++
++# --- run 40751299089: ordinary test failure (real, historical) ---------------------
++TEST_FAILURE_RUN = {
++    "id": 40751299089, "name": "hermes_state (macOS)",
++    "path": ".github/workflows/hermes-state-macos.yml", "event": "push",
++    "status": "completed", "conclusion": "failure", "run_attempt": 1,
++    "head_sha": "a24e27850bf64e8e04a562620de1bd051e4d194f",
++    "repository": _REPO_OBJ, "head_repository": _REPO_OBJ,
++}
++TEST_FAILURE_JOBS = {"total_count": 1, "jobs": [{
++    "id": 123038389129, "run_id": 40751299089, "run_attempt": 1,
++    "name": "tests/hermes_state (macOS, mini)", "status": "completed",
++    "conclusion": "failure", "runner_name": "mini-hermes-state-1",
++    "labels": ["self-hosted", "macOS", "hermes-state"],
++    "steps": [
++        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"},
++        {"number": 2, "name": "Checkout code", "status": "completed", "conclusion": "success"},
++        {"number": 3, "name": "Run tests/hermes_state", "status": "completed", "conclusion": "failure"},
++        {"number": 6, "name": "Post Checkout code", "status": "completed", "conclusion": "success"},
++        {"number": 7, "name": "Complete job", "status": "completed", "conclusion": "success"},
++    ],
++}]}
++TEST_FAILURE_ANNOTATIONS = [{
++    "path": ".github", "start_line": 893, "end_line": 893, "annotation_level": "failure",
++    "title": "", "message": "Process completed with exit code 1.", "raw_details": "",
++}]
++
++
++def _loss(run_changes=None, job_changes=None, annotations=None, extra_jobs=()):
++    """The real runner-loss fixtures, optionally altered for one negative case."""
++    run = {**RUNNER_LOSS_RUN, **(run_changes or {})}
++    jobs = copy.deepcopy(RUNNER_LOSS_JOBS)
++    jobs["jobs"][0].update(job_changes or {})
++    jobs["jobs"].extend(copy.deepcopy(list(extra_jobs)))
++    jobs["total_count"] = len(jobs["jobs"])
++    anns = RUNNER_LOSS_ANNOTATIONS if annotations is None else annotations
++    return run, FakeApi(_routes(run, jobs, {jobs["jobs"][0]["id"]: anns}))
++
++
++def _ci_run_with_loss():
++    """CI-run variant (DOCUMENTED FIXTURE, not a captured CI run: no CI-run runner
++    loss exists in history). The macOS job is the real 41003441463 job payload under
++    ci.yaml's reusable-call name; the two aggregates fail because it failed."""
++    run = {**RUNNER_LOSS_RUN, "id": 42000000001, "name": "CI", "event": "pull_request",
++           "path": ".github/workflows/ci.yaml", "pull_requests": [{"number": 123}]}
++    mac = copy.deepcopy(RUNNER_LOSS_JOBS["jobs"][0])
++    mac.update(id=900001, run_id=run["id"],
++               name="hermes_state (macOS) / tests/hermes_state (macOS, mini)")
++    jobs = [
++        {"id": 900000, "run_attempt": 1, "name": "Detect changes", "status": "completed",
++         "conclusion": "success", "runner_name": "hub-1", "steps": []},
++        mac,
++        {"id": 900002, "run_attempt": 1, "name": "macOS state required (v1)", "status": "completed",
++         "conclusion": "failure", "runner_name": "hub-2", "steps": []},
++        {"id": 900003, "run_attempt": 1, "name": "All required checks pass (v2)", "status": "completed",
++         "conclusion": "failure", "runner_name": "hub-3", "steps": []},
++        {"id": 900004, "run_attempt": 1, "name": "Desktop E2E", "status": "completed",
++         "conclusion": "skipped", "runner_name": None, "steps": []},
++    ]
++    return run, jobs
++
++
++def _ci_api(run, jobs):
++    return FakeApi(_routes(run, {"total_count": len(jobs), "jobs": jobs},
++                           {900001: RUNNER_LOSS_ANNOTATIONS}))
++
++
++# --- decisions -------------------------------------------------------------------
++
++def test_historical_test_failure_is_never_rerun():
++    api = FakeApi(_routes(TEST_FAILURE_RUN, TEST_FAILURE_JOBS,
++                          {123038389129: TEST_FAILURE_ANNOTATIONS}))
++    decision = recover.recover(_event(TEST_FAILURE_RUN), api, repository=REPO)
++    assert decision.action == "skip"
++    assert "step(s) failed" in decision.reason
++    assert api.posts == []
++
++
++def test_exit_code_annotation_alone_is_not_a_runner_loss():
++    # Even without a failed step, an assertion-style annotation blocks the rerun.
++    run, api = _loss(annotations=RUNNER_LOSS_ANNOTATIONS + TEST_FAILURE_ANNOTATIONS)
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and "not a runner loss" in decision.reason
++    assert api.posts == []
++
++
++@pytest.mark.parametrize("message", [
++    "The self-hosted runner lost communication with the server",
++    "The self-hosted runner lost communication with the server.",
++    RUNNER_LOSS_MESSAGE + " ",
++    RUNNER_LOSS_MESSAGE.lower(),
++])
++def test_runner_loss_message_must_match_exactly(message):
++    run, api = _loss(annotations=[{**RUNNER_LOSS_ANNOTATIONS[0], "message": message}])
++    assert recover.recover(_event(run), api, repository=REPO).action == "skip"
++    assert api.posts == []
++
++
++def test_no_failure_annotation_is_not_a_runner_loss():
++    run, api = _loss(annotations=[{**RUNNER_LOSS_ANNOTATIONS[0], "annotation_level": "warning"}])
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and "no failure annotation" in decision.reason
++    assert api.posts == []
++
++
++@pytest.mark.parametrize("run_changes,fragment", [
++    ({"path": ".github/workflows/tests.yml"}, "not approved"),
++    ({"path": ".github/workflows/ci.yaml@refs/heads/evil"}, "not approved"),
++    ({"head_repository": {"full_name": "attacker/hermes"}}, "head repository"),
++    ({"head_repository": None}, "head repository"),
++    ({"repository": {"full_name": "attacker/hermes"}}, "repository"),
++    ({"run_attempt": 2}, "attempt"),
++    ({"conclusion": "cancelled"}, "conclusion"),
++    ({"conclusion": "success"}, "conclusion"),
++    ({"status": "in_progress"}, "status"),
++])
++def test_event_gates_skip_before_any_api_call(run_changes, fragment):
++    run, api = _loss(run_changes=run_changes)
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and fragment in decision.reason
++    assert api.gets == [] and api.posts == []
++
++
++@pytest.mark.parametrize("bad_id", ["41003441463", "1;rm -rf /", True, -1, None, 1.5])
++def test_non_integer_run_id_never_reaches_the_api(bad_id):
++    run, api = _loss()
++    event = _event(run)
++    event["workflow_run"]["id"] = bad_id
++    assert recover.recover(event, api, repository=REPO).action == "skip"
++    assert api.gets == [] and api.posts == []
++
++
++def test_untrusted_repository_context_is_refused():
++    run, api = _loss()
++    for repository in ("attacker/hermes", "", "daveey/hermes-fork"):
++        assert recover.recover(_event(run), api, repository=repository).action == "skip"
++    assert api.gets == [] and api.posts == []
++
++
++def test_non_completed_event_action_is_skipped():
++    run, api = _loss()
++    event = {**_event(run), "action": "requested"}
++    assert recover.recover(event, api, repository=REPO).action == "skip"
++    assert api.gets == []
++
++
++def test_api_state_overrides_a_stale_or_forged_event():
++    # Event says attempt 1 same-repo failure; the API says the head repo is a fork.
++    run, api = _loss()
++    api.routes[f"repos/{REPO}/actions/runs/{run['id']}"] = {
++        **run, "head_repository": {"full_name": "attacker/hermes"}}
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and decision.reason.startswith("api:")
++    assert api.posts == []
++
++
++@pytest.mark.parametrize("job_changes,fragment", [
++    ({"runner_name": "mini-hermes-state-2"}, "ran on"),
++    ({"runner_name": None}, "ran on"),
++    ({"name": "tests/hermes_state (macOS, mini) "}, "expected exactly one"),
++    ({"name": "hermes_state (macOS) / tests/hermes_state (macOS, mini)"}, "expected exactly one"),
++    ({"conclusion": "cancelled"}, "not completed/failure"),
++    ({"conclusion": "timed_out"}, "not completed/failure"),
++    ({"run_attempt": 2}, "attempt"),
++])
++def test_macos_job_gates(job_changes, fragment):
++    run, api = _loss(job_changes=job_changes)
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and fragment in decision.reason, decision.reason
++    assert api.posts == []
++
++
++def test_duplicate_macos_job_name_is_refused():
++    dup = {**RUNNER_LOSS_JOBS["jobs"][0], "id": 1}
++    run, api = _loss(extra_jobs=[dup])
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and "found 2" in decision.reason
++    assert api.posts == []
++
++
++def test_ci_reusable_runner_loss_reruns_with_its_aggregates():
++    run, jobs = _ci_run_with_loss()
++    api = _ci_api(run, jobs)
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "rerun", decision.reason
++    assert api.posts == [f"repos/{REPO}/actions/runs/{run['id']}/rerun-failed-jobs"]
++
++
++@pytest.mark.parametrize("state,sha", [("open", "new-head"), ("closed", RUNNER_LOSS_RUN["head_sha"])])
++def test_obsolete_pr_recovery_never_cancels_current_ci(state, sha):
++    run, jobs = _ci_run_with_loss()
++    api = _ci_api(run, jobs)
++    api.routes[f"repos/{REPO}/pulls/123"] = {"state": state, "head": {"sha": sha}}
++    assert recover.recover(_event(run), api, repository=REPO).action == "skip"
++    assert api.posts == []
++
++
++@pytest.mark.parametrize("pulls", [[], [{"number": 1}, {"number": 2}], [{}]])
++def test_unknown_pr_identity_fails_closed(pulls):
++    run, jobs = _ci_run_with_loss()
++    run["pull_requests"] = pulls
++    api = _ci_api(run, jobs)
++    assert recover.recover(_event(run), api, repository=REPO).action == "skip"
++    assert api.posts == []
++
++
++def test_ci_standalone_job_name_is_not_the_ci_lane():
++    run, jobs = _ci_run_with_loss()
++    jobs[1]["name"] = "tests/hermes_state (macOS, mini)"
++    api = _ci_api(run, jobs)
++    assert recover.recover(_event(run), api, repository=REPO).action == "skip"
++    assert api.posts == []
++
++
++@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", "action_required"])
++def test_any_other_failed_job_blocks_rerun_failed_jobs(conclusion):
++    # rerun-failed-jobs would rerun this one too: never rerun an unrelated failure.
++    run, jobs = _ci_run_with_loss()
++    jobs.append({"id": 900005, "run_attempt": 1, "name": "Tests / test (3.13)",
++                 "status": "completed", "conclusion": conclusion, "runner_name": "hub-4",
++                 "steps": []})
++    api = _ci_api(run, jobs)
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and "Tests / test (3.13)" in decision.reason
++    assert api.posts == []
++
++
++def test_aggregate_names_are_not_downstream_of_the_standalone_workflow():
++    agg = {"id": 7, "run_attempt": 1, "name": "All required checks pass (v2)", "status": "completed",
++           "conclusion": "failure", "runner_name": "hub-1", "steps": []}
++    run, api = _loss(extra_jobs=[agg])
++    assert recover.recover(_event(run), api, repository=REPO).action == "skip"
++    assert api.posts == []
++
++
++def test_jobs_are_read_for_attempt_one_across_pages():
++    run, jobs = _ci_run_with_loss()
++    filler = [{"id": 800000 + i, "run_attempt": 1, "name": f"Lane {i}", "status": "completed",
++               "conclusion": "success", "runner_name": "hub", "steps": []} for i in range(100)]
++    total = len(filler) + len(jobs)
++    api = _ci_api(run, filler)
++    base = f"repos/{REPO}/actions/runs/{run['id']}/attempts/1/jobs?per_page=100"
++    api.routes[f"{base}&page=1"] = {"total_count": total, "jobs": filler}
++    api.routes[f"{base}&page=2"] = {"total_count": total, "jobs": jobs}
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "rerun", decision.reason
++    assert f"{base}&page=2" in api.gets
++    assert all("/attempts/1/jobs" in g for g in api.gets if "/jobs" in g)
++
++
++def test_failed_job_on_a_later_page_still_blocks():
++    run, api = _loss()
++    base = f"repos/{REPO}/actions/runs/{run['id']}/attempts/1/jobs?per_page=100"
++    first = copy.deepcopy(RUNNER_LOSS_JOBS["jobs"])
++    first += [{"id": 700000 + i, "run_attempt": 1, "name": f"x{i}", "status": "completed",
++               "conclusion": "success", "steps": []} for i in range(99)]
++    api.routes[f"{base}&page=1"] = {"total_count": 101, "jobs": first}
++    api.routes[f"{base}&page=2"] = {"total_count": 101, "jobs": [
++        {"id": 1, "run_attempt": 1, "name": "late", "status": "completed",
++         "conclusion": "failure", "steps": []}]}
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and "late" in decision.reason
++    assert api.posts == []
++
++
++def test_reread_before_mutation_sees_a_new_attempt():
++    run, api = _loss()
++    path = f"repos/{REPO}/actions/runs/{run['id']}"
++    reads = iter([run, {**run, "run_attempt": 2, "status": "queued", "conclusion": None}])
++    api.routes[path] = lambda: next(reads)
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "skip" and decision.reason.startswith("re-read before rerun")
++    assert api.gets.count(path) == 2
++    assert api.posts == []
++
++
++def test_second_event_for_the_same_run_does_not_rerun_again():
++    """Serialized (cancel-in-progress: false) duplicate delivery: the first event's
++    POST starts attempt 2, so the second event's API read sees it and stops."""
++    run, api = _loss()
++    path = f"repos/{REPO}/actions/runs/{run['id']}"
++    state = {"run": dict(run)}
++    api.routes[path] = lambda: state["run"]
++    real_post = api.post
++
++    def post(path_):
++        state["run"] = {**run, "run_attempt": 2, "status": "queued", "conclusion": None}
++        return real_post(path_)
++
++    api.post = post  # type: ignore[method-assign]
++    first = recover.recover(_event(run), api, repository=REPO)
++    second = recover.recover(_event(run), api, repository=REPO)
++    assert (first.action, second.action) == ("rerun", "skip")
++    assert "attempt is 2" in second.reason
++    assert api.posts == [f"{path}/rerun-failed-jobs"]
++
++
++def test_dry_run_decides_without_posting():
++    run, api = _loss()
++    decision = recover.recover(_event(run), api, repository=REPO, dry_run=True)
++    assert (decision.action, decision.dry_run) == ("rerun", True)
++    assert api.posts == []
++
++
++# --- CLI and gh client -----------------------------------------------------------
++
++def test_main_reads_event_file_and_prints_decision(tmp_path, monkeypatch, capsys):
++    run, api = _loss()
++    event_path = tmp_path / "event.json"
++    event_path.write_text(json.dumps(_event(run)), encoding="utf-8")
++    summary = tmp_path / "summary.md"
++    monkeypatch.setattr(recover, "GhApi", lambda: api)
++    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
++    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
++    assert recover.main(["--event", str(event_path)]) == 0
++    out = json.loads(capsys.readouterr().out)
++    assert out["action"] == "rerun" and out["run_id"] == run["id"]
++    assert api.posts == [f"repos/{REPO}/actions/runs/{run['id']}/rerun-failed-jobs"]
++    assert "rerun" in summary.read_text(encoding="utf-8")
++
++
++def test_main_skip_is_success_and_api_error_is_failure(tmp_path, monkeypatch, capsys):
++    event_path = tmp_path / "event.json"
++    event_path.write_text(json.dumps(_event(TEST_FAILURE_RUN)), encoding="utf-8")
++    api = FakeApi(_routes(TEST_FAILURE_RUN, TEST_FAILURE_JOBS,
++                          {123038389129: TEST_FAILURE_ANNOTATIONS}))
++    monkeypatch.setattr(recover, "GhApi", lambda: api)
++    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
++    assert recover.main(["--event", str(event_path), "--repository", REPO]) == 0
++    assert json.loads(capsys.readouterr().out)["action"] == "skip"
++
++    class Broken(FakeApi):
++        def get(self, path):
++            raise recover.ApiError("HTTP 502")
++
++    monkeypatch.setattr(recover, "GhApi", lambda: Broken({}))
++    assert recover.main(["--event", str(event_path), "--repository", REPO]) == 1
++    assert api.posts == []
++
++
++def test_gh_client_uses_an_argv_without_a_shell(monkeypatch):
++    calls = []
++
++    class Done:
++        returncode = 0
++        stdout = '{"ok": true}'
++        stderr = ""
++
++    def fake_run(argv, **kwargs):
++        calls.append((argv, kwargs))
++        return Done()
++
++    monkeypatch.setattr(recover.subprocess, "run", fake_run)
++    client = recover.GhApi()
++    assert client.get("repos/daveey/hermes/actions/runs/1") == {"ok": True}
++    client.post("repos/daveey/hermes/actions/runs/1/rerun-failed-jobs")
++    (get_argv, get_kw), (post_argv, post_kw) = calls
++    assert get_argv[:2] == ["gh", "api"] and get_argv[-1] == "repos/daveey/hermes/actions/runs/1"
++    assert post_argv[:4] == ["gh", "api", "-X", "POST"]
++    assert post_argv[-1] == "repos/daveey/hermes/actions/runs/1/rerun-failed-jobs"
++    assert not get_kw.get("shell") and not post_kw.get("shell")
++
++
++def test_gh_client_error_raises(monkeypatch):
++    class Failed:
++        returncode = 1
++        stdout = ""
++        stderr = "HTTP 403"
++
++    monkeypatch.setattr(recover.subprocess, "run", lambda argv, **kw: Failed())
++    with pytest.raises(recover.ApiError, match="403"):
++        recover.GhApi().get("repos/daveey/hermes/actions/runs/1")
++
++
++# --- workflow wiring -------------------------------------------------------------
++
++def _wf(path):
++    return _YAML.load(path.read_text(encoding="utf-8"))
++
++
++def test_recovery_listens_to_exactly_the_approved_workflows():
++    trigger = _wf(RECOVERY_WORKFLOW)["on"]
++    assert set(trigger) == {"workflow_run"}
++    assert trigger["workflow_run"]["types"] == ["completed"]
++    names = {_wf(WORKFLOWS / p.rsplit("/", 1)[1])["name"] for p in recover.WORKFLOWS}
++    assert set(trigger["workflow_run"]["workflows"]) == names == {"CI", "hermes_state (macOS)"}
++
++
++def test_job_names_match_the_real_workflow_files():
++    mac = _wf(WORKFLOWS / "hermes-state-macos.yml")["jobs"]["hermes-state-macos"]
++    assert mac["name"] == recover.MACOS_JOB
++    ci_jobs = _wf(WORKFLOWS / "ci.yaml")["jobs"]
++    caller = ci_jobs["hermes-state-macos"]
++    assert caller["uses"] == "./.github/workflows/hermes-state-macos.yml"
++    ci_spec = recover.WORKFLOWS[".github/workflows/ci.yaml"]
++    assert ci_spec["job"] == f"{caller['name']} / {mac['name']}"
++    downstream = {j["name"] for j in ci_jobs.values()
++                  if "hermes-state-macos" in (j.get("needs") or []) and "name" in j}
++    assert set(ci_spec["downstream"]) == downstream
++
++
++def test_recovery_permissions_and_trusted_checkout():
++    wf = _wf(RECOVERY_WORKFLOW)
++    assert wf["permissions"] == {}
++    (job,) = wf["jobs"].values()
++    assert job["permissions"] == {"actions": "write", "checks": "read", "contents": "read"}
++    checkout = [s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout@")]
++    assert len(checkout) == 1
++    assert checkout[0]["with"]["ref"] == "${{ github.workflow_sha }}"
++    assert checkout[0]["with"]["persist-credentials"] is False
++    text = RECOVERY_WORKFLOW.read_text(encoding="utf-8")
++    for forbidden in ("download-artifact", "head_sha", "head_branch", "pull_request_target",
++                      "secrets."):
++        assert forbidden not in text
++
++
++def test_no_payload_interpolation_into_a_shell():
++    (job,) = _wf(RECOVERY_WORKFLOW)["jobs"].values()
++    runs = [s["run"] for s in job["steps"] if "run" in s]
++    assert runs == ['python3 scripts/ci/recover_macos_runner.py --event "$GITHUB_EVENT_PATH"']
++    for step in job["steps"]:
++        for value in (step.get("env") or {}).values():
++            assert "github.event" not in str(value)
++
++
++def test_recovery_concurrency_is_per_run_and_serialized():
++    from tests.ci import _gha_expr as gha
++
++    conc = _wf(RECOVERY_WORKFLOW)["concurrency"]
++    assert conc["cancel-in-progress"] is False
++
++    def group(rid):
++        return gha.render(conc["group"], {"github": {"event": {"workflow_run": {"id": rid}}}})
++
++    assert group(1) == group(1) != group(2)
++
++
++def test_job_prefilter_requires_trusted_first_attempt_failure():
++    (job,) = _wf(RECOVERY_WORKFLOW)["jobs"].values()
++    cond = " ".join(job["if"].split())
++    for clause in ("github.repository == 'daveey/hermes'",
++                   "github.event.workflow_run.conclusion == 'failure'",
++                   "github.event.workflow_run.run_attempt == 1",
++                   "github.event.workflow_run.head_repository.full_name == 'daveey/hermes'"):
++        assert clause in cond
+diff --git a/tests/ci/test_required_results.py b/tests/ci/test_required_results.py
+index 3355511dc3f..0455f42c379 100644
+--- a/tests/ci/test_required_results.py
++++ b/tests/ci/test_required_results.py
+@@ -43,6 +43,7 @@ def test_status_policy(job, result, ordinary, excluded, release):
+     ("e2e_desktop_update", ("e2e-desktop-update",)),
+     ("remote_backends", ("remote-backends",)),
+     ("catalog", ("catalog-tests",)),
++    ("hermes_state", ("hermes-state-macos",)),
+ ])
+ @pytest.mark.parametrize("result", ["skipped", "absent", "success"])
+ def test_selected_update_consumers_must_succeed(lane, jobs, result):
+-- 
+2.55.0
+

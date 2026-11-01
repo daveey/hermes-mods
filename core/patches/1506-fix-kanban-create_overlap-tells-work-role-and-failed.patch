@@ -1,0 +1,672 @@
+From bbf69bee2315a7c14b1ec0b66eff244322df250b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:15:37 +0000
+Subject: [PATCH] fix(kanban): create_overlap tells work role and failed-card
+ recovery apart [daveey]
+
+---
+ hermes_cli/kanban_overlap.py                  | 107 +++++-
+ tests/tools/kanban_overlap_role_cases.json    | 194 +++++++++++
+ .../tools/test_kanban_create_overlap_roles.py | 305 ++++++++++++++++++
+ 3 files changed, 602 insertions(+), 4 deletions(-)
+ create mode 100644 tests/tools/kanban_overlap_role_cases.json
+ create mode 100644 tests/tools/test_kanban_create_overlap_roles.py
+
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index b2c706bd194..8274bdeb3db 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -22,9 +22,11 @@ equals a board slug does not count.
+ Never matched: closed cards (a replica's stale legacy ``<board>/<id>`` row never outvotes its qualified
+ ``<profile>/<board>/<id>`` twin), the creator's own card, the new card's parents, cards the same chat or the same
+ worker created (fan-out), the waiting card a capability-owner create quotes, and another capability-owner
+-card for that same waiting card, a card the new one parks/waits/depends on (:func:`waits_on`), and a card
+-that names a different target (:func:`distinct_target`: another repo, host or process, or an inverted check at
+-another revision; a newer sha or another ticket number alone is not a different target). Admitted look-alikes
++card for that same waiting card, a card the new one parks/waits/depends on (:func:`waits_on`), a card whose failed
++execution the new one recovers (:func:`recovers`: ``self-heal: kanban card t_X ... failed 2x``), and a card that
++names a different target (:func:`distinct_target`: another repo, host or process, an inverted check at another
++revision, or another work role, :func:`work_role`: implement vs measure vs deliver; a newer sha or another
++ticket number alone is not a different target). Admitted look-alikes
+ are logged. Each card counts once per gateway. A missing or unreadable replica is skipped and logged, never a block.
+ ``kanban.create_overlap_check: false`` turns the check off.
+ """
+@@ -234,9 +236,94 @@ def waits_on(card_id: str, title: str, body: str) -> bool:
+                for m in _WAIT.finditer(text))
+ 
+ 
++# Work role. Shared board and vocabulary say two cards are about the same campaign; they do not say they do the
++# same JOB. "Repair Stage B evidence gaps" (implements guards) was refused against "Follow-through: send the
++# verified Stage C report", and "bb-tuner burn-down: 7-day re-measure ..." against four bb cluster fix/design
++# cards. Roles are deliberately few and explicit; a title naming two roles ("Send
++# failing: fix") has none, and an unknown role never makes cards distinct, so a vague title still meets the
++# word-overlap rules. Verifying is NOT a role apart from implementing: "Verify green main CI: daveey/hermes" owns
++# making main green, so "Fix red main CI: daveey/hermes" is its duplicate (an audit judged that refusal correct).
++# Verbs only: "delivery", "measurement" and "implementation" are what a symptom is ABOUT ("Delivery receipts
++# missing"), not a job.
++_ROLES = {
++    "implement": "fix fixes fixing repair repairs repairing implement implements implementing design redesign",
++    "measure": "measure measures measuring re-measure remeasure",
++    "deliver": "follow-through send sends sending deliver delivers delivering notify notifies relay relays",
++}
++_ROLE_OF = {w: role for role, ws in _ROLES.items() for w in ws.split()}
++_ROLE_TOKEN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")  # "failed-fix" and "bb-self-fix" are not the verb "fix"
++_ROLE_NEGATORS = frozenset({"not", "no", "never", "without", "nor", "don", "dont", "doesn", "isn", "won"})
++_ROLE_CLAUSE = re.compile(r"[.;:!?,\n]+")  # negation never reaches across a clause ("No. Fix the gate")
++_ROLE_BODY_SCAN = 600  # the opening states the job; later sections ("DELIVERY: your own worktree") are steps
++_ROLE_VERB_SLOTS = 1  # a title's job is the first word of a clause: in "Discord send retries drop" send is a noun
++_ROLE_NOT_A_WORD = re.compile(r"\d")  # "7-day re-measure", "BB-1156: fix": numbers and ids precede the verb
++# Only "implement" is read from a body: symptom-titled cards say "smallest fix" there, while "notify the owner when
++# green" or "measure before and after" in a body is a closing step of nearly any card, not its job.
++_BODY_ROLES = frozenset({"implement"})
++
++
++def _role_tokens(text: str, *, verb_slots: Optional[int] = None) -> list[tuple[str, bool]]:
++    """``(role, negated)`` per role word, in order, clause by clause. ``not a second verification campaign`` is
++    negated. With ``verb_slots`` only the first N words of each clause count (titles); numbers and ids skipped."""
++    out: list[tuple[str, bool]] = []
++    for clause in _ROLE_CLAUSE.split(_TASK_REF.sub(" ", (text or "").lower())):
++        toks = _ROLE_TOKEN.findall(clause)
++        if verb_slots is not None:
++            toks = [t for t in toks if not _ROLE_NOT_A_WORD.search(t)]
++        out += [(_ROLE_OF[t], bool(_ROLE_NEGATORS & set(toks[max(0, i - 3):i]))) for i, t in enumerate(toks)
++                if t in _ROLE_OF and (verb_slots is None or i < verb_slots)]
++    return out
++
++
++def _one_role(tokens: list[tuple[str, bool]]) -> tuple[Optional[str], bool]:
++    """``(role, ambiguous)``: the role every unnegated role word agrees on; two roles are ambiguous."""
++    named = {role for role, neg in tokens if not neg}
++    return (next(iter(named)) if len(named) == 1 else None), len(named) > 1
++
++
++def work_role(title: str, body: str = "") -> tuple[Optional[str], Optional[str]]:
++    """``(role, source)``: the one role the title names in verb position (the first words of a clause; source
++    ``title``), else the one role the body's opening names (source ``body``: bb_bridge cards title the failure and
++    put "smallest fix" in the body), else ``(None, None)``. Text naming two roles is ambiguous and has none, and an
++    ambiguous title never falls back to its body."""
++    role, ambiguous = _one_role(_role_tokens(title, verb_slots=_ROLE_VERB_SLOTS))
++    if role or ambiguous:
++        return (role, "title") if role else (None, None)
++    role, _ = _one_role(_role_tokens((body or "")[:_ROLE_BODY_SCAN]))
++    return (role, "body") if role in _BODY_ROLES else (None, None)
++
++
++# A recovery card is ABOUT a card's failed execution: the self-heal lane files "self-heal: kanban card t_X on gw/board
++# failed 2x (crashed,crashed): <t_X's title>" (coach self-heal lane). It names t_X's board and repeats its
++# title, so it matched t_X itself and was refused 8 times. Diagnosing why t_X's worker
++# died is not a second owner of t_X's work; another recovery card for t_X, or a card redoing t_X's work, still is.
++_RECOVERS = re.compile(r"\bcards?\s+(t_[0-9a-f]{8,16})\b(?:\+\d+)?(?:\s+on\s+[\w./-]+)?\s+(?:failed|crashed|stalled|"
++                       r"timed[ _]out|gave up|got stuck|is stuck|lost its worker)\b", re.IGNORECASE)
++# ... unless it says it does t_X's work itself: "card t_X crashed, take over" is a second owner of that work.
++_REDOES = re.compile(r"\b(?:take[ -]?over|takes over|taking over|redo|re-do|retry|re-run|rerun|resume|continue|"
++                     r"finish|refile|re-file|replace|replaces|instead of)\b", re.IGNORECASE)
++
++
++def recovers(card_id: str, title: str, card_title: str = "") -> bool:
++    """The new title is a recovery of ``card_id``'s failed execution (``card t_X ... failed|crashed|...``) and does
++    not say it redoes the work (``take over``, ``retry``, ``finish``...). Text after the next colon that quotes
++    ``card_title`` (self-heal appends the source title, cut short) is the source's words, not read for that."""
++    title = title or ""
++    for m in _RECOVERS.finditer(title):
++        if card_id and m.group(1).lower() == card_id.lower():
++            head, _, quoted = title[m.end():].partition(":")
++            quoted = quoted.strip().lower()
++            own = title[:m.end()] + head if quoted and (card_title or "").strip().lower().startswith(quoted) \
++                else title
++            return not _REDOES.search(own)
++    return False
++
++
+ def _identity(title: str, body: str, gateways: Iterable[str]) -> dict:
+     repo, in_title = _repo_of(title, body)
+-    return {"title": title or "", **target_identity(title, gateways), "repo": repo, "repo_in_title": in_title}
++    role, role_src = work_role(title, body)
++    return {"title": title or "", **target_identity(title, gateways), "repo": repo, "repo_in_title": in_title,
++            "role": role, "role_src": role_src}
+ 
+ 
+ def _distinct(a: dict, b: dict) -> Optional[str]:
+@@ -250,9 +337,20 @@ def _distinct(a: dict, b: dict) -> Optional[str]:
+     if (a["revision"] and b["revision"] and not a["revision"] & b["revision"]
+             and (_inverts(a["title"], b["title"]) or _inverts(b["title"], a["title"]))):
+         return f"revision {'/'.join(sorted(a['revision']))} inverts {'/'.join(sorted(b['revision']))}"
++    # A body-only role is a weak read (template text): it decides only against a role a title states. A role whose
++    # words the other title also uses is that card's subject, not a second job: "Send button disabled in BB
++    # client" (deliver?) vs "Fix send button disabled in BB client" is one defect.
++    if (a.get("role") and b.get("role") and a["role"] != b["role"]
++            and "title" in (a.get("role_src"), b.get("role_src"))
++            and not _role_words_in(a["role"], b["title"]) and not _role_words_in(b["role"], a["title"])):
++        return f"role {a['role']} != {b['role']}"
+     return None
+ 
+ 
++def _role_words_in(role: str, title: str) -> bool:
++    return any(_ROLE_OF.get(t) == role for t in _ROLE_TOKEN.findall((title or "").lower()))
++
++
+ def distinct_target(new_title: str, card_title: str, gateways: Iterable[str] = (), *, new_body: str = "",
+                     card_body: str = "") -> Optional[str]:
+     """Why two cards name different targets (a repo, a machine, a process lifetime, an inverted check at another
+@@ -425,6 +523,7 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+             if mine is None:
+                 mine = _identity(title, body, gateways)
+             admit = (f"waits on {card['id']}" if waits_on(card["id"], title, body)
++                     else f"recovers {card['id']}" if recovers(card["id"], title, card.get("title") or "")
+                      else _distinct(mine, _identity(card.get("title") or "", card.get("body") or "", gateways)))
+             if admit:
+                 # Logged so an audit can tell an admitted look-alike from a missed one.
+diff --git a/tests/tools/kanban_overlap_role_cases.json b/tests/tools/kanban_overlap_role_cases.json
+new file mode 100644
+index 00000000000..43edb3e3f09
+--- /dev/null
++++ b/tests/tools/kanban_overlap_role_cases.json
+@@ -0,0 +1,194 @@
++{
++ "_source": {
++  "_note": "PUBLIC SYNTHETIC EQUIVALENTS, not the original live text. The source commit replayed three create_overlap refusals from the creating sessions' recorded create inputs; this public mirror replaces every body and task id with short synthetic text that keeps the features the check reads (titles, board references, repo slugs, body opening, task references), so every test assertion still holds and the pre-fix code still fails the same tests.",
++  "stage_b": "synthetic: tool kanban_create args refused against two open cards of board research-collab (a running verifier and a todo report-sending follow-through)",
++  "selfheal": "synthetic: self-heal lane card (CLI `hermes kanban create` argv and the equivalent tool args) refused against its own crashed source card on mini/bb",
++  "remeasure": "synthetic: tool kanban_create args for a 7-day re-measure refused against four bb cluster fix/design cards on mini",
++  "true_duplicates": "synthetic: refusals an audit judged true duplicates; titles keep the original shape, new bodies were not recorded"
++ },
++ "stage_b": {
++  "args": {
++   "title": "Repair Stage B evidence gaps without changing frozen results",
++   "assignee": "default",
++   "requires": [
++    "terminal",
++    "file",
++    "git"
++   ],
++   "placement": "local",
++   "body": "Follow-up to completed B1 t_5a6b000000000b01. PR3 merged in daveey/research-collab. Existing Stage C t_5a6b000000000c01 independently verifies the results and report; this card IMPLEMENTS evidence-preservation and instrumentation repairs, not a second verification campaign. Own worktree off main. No rentals or retraining under this card; do not reopen or alter the completed matrix.\n\nDo: 1) add a holdout gate so held-out data opens only after tuning is frozen; 2) record per-run timing; 3) keep per-item labels in the exported records; 4) try read-only recovery of the historical evidence and report what is unrecoverable.",
++   "distinct_from": [
++    "t_5a6b000000000c01"
++   ],
++   "distinct_reason": "Stage C independently verifies existing data; this follow-up implements future holdout gating, timing instrumentation, and per-item label preservation, while attempting read-only historical evidence recovery.",
++   "idempotency_key": "stage-b-evidence-gap-repair:0a1b2c3d"
++  },
++  "creator_task_id": "t_5a6b000000000b01",
++  "cards": [
++   {
++    "id": "t_5a6b000000000c01",
++    "board": "research-collab",
++    "gateway": "hub",
++    "status": "running",
++    "title": "Stage C: independent verification of the Stage B matrix and final report",
++    "body": "Stage C: independent verification of the Stage B matrix and the final report. Parent: B1.\n\nRead PLAN.md in daveey/research-collab and the B0 and B1 handoffs. You are the independent verifier. No rentals: CPU only.\n\nVerify from raw records, not from the README:\n1. Coverage: every planned run has a terminal status.\n2. Recompute the summary tables from raw records.\n3. Merge the verified report to daveey/research-collab main."
++   },
++   {
++    "id": "t_5a6b000000000d01",
++    "board": "research-collab",
++    "gateway": "hub",
++    "status": "todo",
++    "title": "Follow-through: send the verified Stage C report to David's Stage B chats",
++    "body": "When Stage C (t_5a6b000000000c01) is done:\n1. Read Stage C's handoff. Verify that the merged PR on daveey/research-collab main and the report files exist.\n2. Send ONE message to each Stage B chat with the headline tables and the report link.\n3. Comment the delivery receipts here."
++   }
++  ]
++ },
++ "selfheal": {
++  "args": {
++   "title": "self-heal: kanban card t_5e1f000000000a91 on mini/bb failed 2x (crashed,crashed): BB-1156, BB-1164, B",
++   "body": "Self-heal investigation for defect `kanban-0000000001`. Nothing here needs a human; the standing approval of this\nlane covers the investigation AND the fix. You do NOT ship the fix yourself: you write the proposal.\n\n## Evidence (from the detector)\n- Symptom: kanban card t_5e1f000000000a91 on mini/bb failed 2x (crashed,crashed): BB-1156, BB-1164, BB-1196: Display on laptop failed: tried nonexistent artifacts\n- Component: kanban \u00b7 detector: signal (kanban, p=?)\n- Extra: board bb card t_5e1f000000000a91 status=running title=BB-1156, BB-1164, BB-1196: Display on laptop failed: tried nonexistent artifacts.show/artifacts.file hub tools\noutcomes: crashed,crashed\nerrors: pid 4242 exited with code 1 [managed worker lost: managed_worker_failed]\n\n## Do this\n1. Reproduce or confirm it LIVE, not from the transcript alone.\n2. Name 2-3 candidate roots and run the one check that tells them apart; write the five-whys chain.\n3. A real defect already owned by another card is a duplicate: record `self_heal.py event duplicate kanban-0000000001`.\n4. Otherwise write the proposal to ~/.hermes/coach/selfheal/kanban-0000000001/proposal.md and record it.\n5. Complete this card with the proposal's first line as the summary. Do not start the fix.\n",
++   "idempotency_key": "selfheal:kanban-0000000001",
++   "model": "claude-opus-5-5",
++   "provider": "anthropic",
++   "max_runtime": 3600,
++   "skills": [
++    "five-whys",
++    "hermes-mods-repo"
++   ],
++   "board": "default",
++   "assignee": "default",
++   "created_by": "self-heal"
++  },
++  "argv": [
++   "hermes",
++   "kanban",
++   "--board",
++   "default",
++   "create",
++   "self-heal: kanban card t_5e1f000000000a91 on mini/bb failed 2x (crashed,crashed): BB-1156, BB-1164, B",
++   "--body",
++   "Self-heal investigation for defect `kanban-0000000001`. Nothing here needs a human; the standing approval of this\nlane covers the investigation AND the fix. You do NOT ship the fix yourself: you write the proposal.\n\n## Evidence (from the detector)\n- Symptom: kanban card t_5e1f000000000a91 on mini/bb failed 2x (crashed,crashed): BB-1156, BB-1164, BB-1196: Display on laptop failed: tried nonexistent artifacts\n- Component: kanban \u00b7 detector: signal (kanban, p=?)\n- Extra: board bb card t_5e1f000000000a91 status=running title=BB-1156, BB-1164, BB-1196: Display on laptop failed: tried nonexistent artifacts.show/artifacts.file hub tools\noutcomes: crashed,crashed\nerrors: pid 4242 exited with code 1 [managed worker lost: managed_worker_failed]\n\n## Do this\n1. Reproduce or confirm it LIVE, not from the transcript alone.\n2. Name 2-3 candidate roots and run the one check that tells them apart; write the five-whys chain.\n3. A real defect already owned by another card is a duplicate: record `self_heal.py event duplicate kanban-0000000001`.\n4. Otherwise write the proposal to ~/.hermes/coach/selfheal/kanban-0000000001/proposal.md and record it.\n5. Complete this card with the proposal's first line as the summary. Do not start the fix.\n",
++   "--assignee",
++   "default",
++   "--idempotency-key",
++   "selfheal:kanban-0000000001",
++   "--model",
++   "claude-opus-5-5",
++   "--max-runtime",
++   "3600",
++   "--created-by",
++   "self-heal",
++   "--json",
++   "--provider",
++   "anthropic",
++   "--skill",
++   "five-whys",
++   "--skill",
++   "hermes-mods-repo"
++  ],
++  "source": {
++   "id": "t_5e1f000000000a91",
++   "board": "bb",
++   "gateway": "mini",
++   "status": "ready",
++   "title": "BB-1156, BB-1164, BB-1196: Display on laptop failed: tried nonexistent artifacts.show/artifacts.file hub tools",
++   "body": "# BB-1156, BB-1164, BB-1196: Display on laptop failed: tried nonexistent artifacts.show/artifacts.file hub tools\n\nFiled by bb_bridge (mini). Follow the `bb-self-fix` skill end to end: reproduce first (failing test on\norigin/main or a replay of the failed task), smallest fix, PR with trailers, CI `validate`, independent\nreview, merge queue, verify, then resolve each issue below with evidence and complete this card.\nFailure analysis uses the `five-whys` skill.\n\nRepo: daveey/myapp (code in ~/code/myapp, worktrees under ~/dev/myapp).\n\n## Issues\n- BB-1156: the agent called artifacts.show, which does not exist.\n- BB-1164, BB-1196: the same call, other sessions.\n"
++  }
++ },
++ "remeasure": {
++  "args": {
++   "assignee": "default",
++   "body": "This is the 7-day measurement that t_b0d0000000000000 had in its acceptance, which its 10/31 handoff skipped. Load the bb-error-burndown skill.\n\nDeploy under test: from 10/31, `bb_bridge.py` on the mini stops filing fix cards for clusters with attempts >= 2 and files a design card instead.\n\n1. If it is before 2026-11-07T23:30Z, call kanban_schedule and stop.\n2. Count cards the bridge filed on the `bb` board since the deploy, per cluster.\n3. Report fix vs design cards per cluster against the acceptance.",
++   "idempotency_key": "burndown-remeasure-20261107",
++   "placement": "local",
++   "requires": [
++    "terminal"
++   ],
++   "title": "bb-tuner burn-down: 7-day re-measure after the 10/31 failed-fix escalation deploy"
++  },
++  "cards": [
++   {
++    "id": "t_b0d0000000000001",
++    "board": "bb",
++    "gateway": "mini",
++    "status": "ready",
++    "title": "Burn-down g-cd77dccf: hub-runtime: 15:50:39 deploy of 0123456789abcdef0123456789abcdef01234567 failed: refusing",
++    "body": "# Burn-down g-cd77dccf: hub-runtime: 15:50:39 deploy of 0123456789abcdef0123456789abcdef01234567 failed: refusing\n\nFiled by bb_bridge (mini). Follow the `bb-self-fix` skill end to end: reproduce first (failing test on\norigin/main or a replay of the failed task), smallest fix, PR with trailers, CI `validate`, independent\nreview, merge queue, verify, then resolve each issue below with evidence and complete this card.\nFailure analysis uses the `five-whys` skill.\n\nRepo: daveey/myapp (code in ~/code/myapp, worktrees under ~/dev/myapp).\n\n## Issues\n- g-cd77dccf: the deploy refused to start; see the deploy log.\n"
++   },
++   {
++    "id": "t_b0d0000000000002",
++    "board": "bb",
++    "gateway": "mini",
++    "status": "ready",
++    "title": "Burn-down g-73b44ad4: hub-rpc: 2026-10-31 10:21:47,845 ERROR rpc: Shared-state request failed: updates.ios.insta",
++    "body": "# Burn-down g-73b44ad4: hub-rpc: 2026-10-31 10:21:47,845 ERROR rpc: Shared-state request failed: updates.ios.insta\n\nFiled by bb_bridge (mini). Follow the `bb-self-fix` skill end to end: reproduce first (failing test on\norigin/main or a replay of the failed task), smallest fix, PR with trailers, CI `validate`, independent\nreview, merge queue, verify, then resolve each issue below with evidence and complete this card.\nFailure analysis uses the `five-whys` skill.\n\nRepo: daveey/myapp (code in ~/code/myapp, worktrees under ~/dev/myapp).\n\n## Issues\n- g-73b44ad4: shared-state requests time out under load.\n"
++   },
++   {
++    "id": "t_b0d0000000000003",
++    "board": "bb",
++    "gateway": "mini",
++    "status": "ready",
++    "title": "Design: burn-down hermes-gateway-mini (3 failed fixes): Hermes gateway config on mini",
++    "body": "# Design: burn-down hermes-gateway-mini (3 failed fixes): Hermes gateway config on mini\n\nFiled by bb_bridge (mini): ESCALATION, not a fix card. Cluster `hermes-gateway-mini` has had 3 failed\nfixes (stop at 2), so another patch on the same approach is forbidden. This is agent-owned work.\nOnly a real hard stop per `bb-self-fix` escalates further, with the design attached.\n\n## Do, in order\n1. Read the failed attempts.\n2. Write the design.\n3. Implement it.\n\nRepo: daveey/myapp (code in ~/code/myapp, worktrees under ~/dev/myapp).\n"
++   },
++   {
++    "id": "t_b0d0000000000004",
++    "board": "bb",
++    "gateway": "mini",
++    "status": "ready",
++    "title": "Design: burn-down nsurl-timeout (6 failed fixes): NSURLErrorDomain -1001 timeouts",
++    "body": "# Design: burn-down nsurl-timeout (6 failed fixes): NSURLErrorDomain -1001 timeouts\n\nFiled by bb_bridge (mini): ESCALATION, not a fix card. Cluster `nsurl-timeout` has had 6 failed\nfixes (stop at 2), so another patch on the same approach is forbidden. This is agent-owned work.\nOnly a real hard stop per `bb-self-fix` escalates further, with the design attached.\n\n## Do, in order\n1. Read the failed attempts.\n2. Write the design.\n3. Implement it.\n\nRepo: daveey/myapp (code in ~/code/myapp, worktrees under ~/dev/myapp).\n"
++   }
++  ]
++ },
++ "true_duplicates": [
++  {
++   "title": "Fix red main CI: daveey/myapp (since f20e3ef8)",
++   "self": "hub",
++   "card": {
++    "id": "t_d0b1000000000001",
++    "board": "bb",
++    "gateway": "mini",
++    "status": "ready",
++    "title": "Main CI red since effa0d25f: repair the hub suite on main",
++    "body": "# Main CI red since effa0d25f: repair the hub suite on main\n\nFiled by bb_bridge (mini). Follow the `bb-self-fix` skill end to end: reproduce first (failing test on\norigin/main or a replay of the failed task), smallest fix, PR with trailers, CI `validate`, independent\nreview, merge queue, verify, then resolve each issue below with evidence and complete this card.\nFailure analysis uses the `five-whys` skill.\n\nRepo: daveey/myapp (code in ~/code/myapp, worktrees under ~/dev/myapp).\n\nRun: https://github.com/daveey/myapp/actions/runs/1 (main, failing).\n"
++   }
++  },
++  {
++   "title": "Demo: execute newly authorized single real-match recapture",
++   "self": "macbook",
++   "card": {
++    "id": "t_d0b1000000000002",
++    "board": "default",
++    "gateway": "hub",
++    "status": "ready",
++    "title": "Execute one newly authorized demo real-match capture",
++    "body": "The owner authorized one more real-match capture. Before capture, look for an existing owner across hub cards; if identical scope already runs, hand off to it. Scope ONE capture on hub with the existing harness."
++   }
++  },
++  {
++   "title": "BB: silent home claim run10 with room-tone stimulus, unchanged production gate",
++   "self": "hub",
++   "card": {
++    "id": "t_d0b1000000000003",
++    "board": "default",
++    "gateway": "mini",
++    "status": "running",
++    "title": "BB: silent home claim rerun with room-tone-lead bench positive at production preroll .5 (preroll 1.25 rejected)",
++    "body": "Follow-up to an earlier bench run. Preroll 1.25 was rejected; production stays at .5. Do not change thresholds, models or preroll.\n\nPlan: regenerate the bench positive with a room-tone lead, rerun the claim bench, compare with the previous run."
++   }
++  },
++  {
++   "title": "BB-1235: Repeated device_presence failure (hard, 3\u00d7 today): Desk Microphone unavailable from office-imac for 10",
++   "self": "hub",
++   "card": {
++    "id": "t_d0b1000000000004",
++    "board": "bb",
++    "gateway": "mini",
++    "status": "ready",
++    "title": "BB-1229: Repeated device_presence failure (hard, 3\u00d7 today): Desk Microphone unavailable from office-imac for 10",
++    "body": "# BB-1229: Repeated device_presence failure (hard, 3\u00d7 today): Desk Microphone unavailable from office-imac for 10\n\nFiled by bb_bridge (mini). Follow the `bb-self-fix` skill end to end: reproduce first (failing test on\norigin/main or a replay of the failed task), smallest fix, PR with trailers, CI `validate`, independent\nreview, merge queue, verify, then resolve each issue below with evidence and complete this card.\nFailure analysis uses the `five-whys` skill.\n\nRepo: daveey/myapp (code in ~/code/myapp, worktrees under ~/dev/myapp).\n\n## Issues\n- BB-1229: the presence probe lost the microphone 3 times today.\n"
++   }
++  }
++ ]
++}
+diff --git a/tests/tools/test_kanban_create_overlap_roles.py b/tests/tools/test_kanban_create_overlap_roles.py
+new file mode 100644
+index 00000000000..a3701890ce1
+--- /dev/null
++++ b/tests/tools/test_kanban_create_overlap_roles.py
+@@ -0,0 +1,305 @@
++"""create_overlap: board and vocabulary are not work role; a recovery card is not its source. [daveey]
++
++Two create_overlap audits found three refusals of separate work. Each is replayed here from
++``kanban_overlap_role_cases.json``: PUBLIC SYNTHETIC EQUIVALENTS of the original create inputs (same titles where
++they carry nothing private, short template bodies that keep what the check reads), not the original live text:
++
++- tool, hub: "Repair Stage B evidence gaps without changing frozen results" (implements holdout gating, timing
++  instrumentation, label preservation) refused against the Stage C verifier and the report-sending
++  follow-through. Only "the new card names board 'research-collab'" (``daveey/research-collab`` in the body)
++  plus the one shared word "stage" matched; the verifier was already in ``distinct_from``.
++- CLI (coach self-heal lane), 8x: "self-heal: kanban card t_X on mini/bb failed 2x (crashed,crashed): BB-1156,
++  ..." refused against t_X itself.
++- tool, MacBook: "bb-tuner burn-down: 7-day re-measure after the 10/31 failed-fix escalation deploy" refused
++  against four mini bb cluster fix/design cards, each only "the new card names board 'bb'".
++
++The true duplicates those audits confirmed stay refused, as do a second recovery card for the same source, a
++card redoing the source's work, and same-role cards in the same campaign. Verifying is deliberately not a role apart
++from implementing ("Verify green main CI" owns "Fix red main CI", test_kanban_create_overlap_url_slug.py).
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++CASES = json.loads((Path(__file__).with_name("kanban_overlap_role_cases.json")).read_text())
++STAGE_B, SELFHEAL, REMEASURE = CASES["stage_b"], CASES["selfheal"], CASES["remeasure"]
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD"):
++        monkeypatch.delenv(var, raising=False)
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    assert str(kb.kanban_db_path()).startswith(str(tmp_path))
++    return h
++
++
++def _replica(tmp_path, cards):
++    path = tmp_path / "hub-state" / "hub.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    db = sqlite3.connect(path)
++    db.execute("CREATE TABLE IF NOT EXISTS replica (gw TEXT, coll TEXT, key TEXT, data TEXT)")
++    for c in cards:
++        db.execute("INSERT INTO replica VALUES (?,?,?,?)",
++                   (c["gateway"], "tasks", f"default/{c['board']}/{c['id']}", json.dumps(c)))
++    db.commit()
++    db.close()
++
++
++def _local(board, title, body="", status=None, session="other-chat"):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_boards as kbb
++    from hermes_cli import kanban_db_connect as kbc
++    if board != kb.DEFAULT_BOARD:
++        kbb.create_board(board)
++    with kbc.connect_closing(board=board) as conn:
++        tid = kb.create_task(conn, title=title, body=body, assignee="default", session_id=session)
++        if status:
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++            conn.commit()
++    return tid
++
++
++def _tool(args):
++    from tools import kanban_tools as kt
++    keep = ("title", "body", "assignee", "distinct_from", "distinct_reason", "idempotency_key")
++    return json.loads(kt._handle_create({"requires": [], **{k: v for k, v in args.items() if k in keep}}))
++
++
++def _cli(argv, monkeypatch):
++    """The producer's exact argv, minus ``--skill`` pairs: the isolated test home has no skills installed, and the
++    skill gate would refuse before the overlap check this replays."""
++    import argparse
++    from hermes_cli import kanban as kc
++    monkeypatch.setattr(kc, "_check_dispatcher_presence", lambda **kw: (True, ""))
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    args, it = [], iter(argv[1:])
++    for a in it:
++        if a == "--skill":
++            next(it)
++            continue
++        args.append(a)
++    return kc._cmd_create(root.parse_args(args))
++
++
++def _ids(out):
++    return [m["id"] for m in out.get("matches") or []]
++
++
++# --- 1. Stage B evidence-gap implementation vs the Stage C verifier and the report sender (tool, hub) ---
++
++def _stage_b_board():
++    """The two open research-collab cards at refusal time, with their (synthetic) text."""
++    ids = {c["id"]: _local("research-collab", c["title"], c["body"], c["status"]) for c in STAGE_B["cards"]}
++    args = dict(STAGE_B["args"], distinct_from=[ids[i] for i in STAGE_B["args"]["distinct_from"]])
++    return ids, args
++
++
++def test_stage_b_evidence_repair_is_not_owned_by_the_verifier_or_the_sender(home):
++    """The original call (verifier in distinct_from) creates. Without that override only the verifier is named:
++    verifying is not a role apart from implementing (see kanban_overlap._ROLES), so that stays the caller's
++    call; the report sender (a delivery) never is."""
++    ids, args = _stage_b_board()
++    verifier, sender = (ids[c["id"]] for c in STAGE_B["cards"])
++    out = _tool(args)
++    assert out.get("ok") is True, out
++    without_override = _tool({k: v for k, v in args.items() if k not in ("distinct_from", "distinct_reason")}
++                             | {"idempotency_key": "stage-b-evidence-gap-repair:replay2"})
++    assert without_override.get("code") == "create_overlap", without_override
++    assert _ids(without_override) == [verifier] and sender not in _ids(without_override), without_override
++
++
++def test_stage_b_same_role_cards_in_the_campaign_are_still_refused(home):
++    ids, args = _stage_b_board()
++    verifier, sender = (ids[c["id"]] for c in STAGE_B["cards"])
++    second_verifier = _tool({"title": "Stage C rerun: independent verification of the Stage B matrix and report",
++                             "body": "Re-verify from raw records on daveey/research-collab.",
++                             "assignee": "default"})
++    assert second_verifier.get("code") == "create_overlap" and verifier in _ids(second_verifier), second_verifier
++    second_sender = _tool({"title": "Follow-through: send the Stage C report to David's Stage B chats",
++                           "body": "After Stage C on daveey/research-collab.", "assignee": "default"})
++    assert second_sender.get("code") == "create_overlap" and sender in _ids(second_sender), second_sender
++    repair = _local("research-collab", args["title"], args["body"], "running")
++    second_repair = _tool({"title": "Fix Stage B evidence gaps: holdout gate, timing and per-item labels",
++                           "body": "daveey/research-collab PR3 follow-up.", "assignee": "default"})
++    assert second_repair.get("code") == "create_overlap" and repair in _ids(second_repair), second_repair
++
++
++def test_original_stage_b_duplicate_campaign_is_still_refused(home):
++    """004623277d's incident: "Stage B: ..." vs running "Stage B1: run ..." (no role either side)."""
++    b1 = _local("research-collab", "Stage B1: run the frozen tuning + confirmation matrix and "
++                "held-out rescoring on rented GPUs", "Stage B / B1 of 3 on rented GPUs.")
++    out = _tool({"title": "Stage B: GPU calibration, bounded comparison campaign and verified report",
++                 "body": "David approved Stage B. Execute frozen Stage B for "
++                         "daveey/research-collab. Checked this turn: current PLAN.md read.",
++                 "assignee": "default"})
++    assert out.get("code") == "create_overlap" and b1 in _ids(out), out
++
++
++# --- 2. self-heal recovery of a crashed card vs that card (CLI, hub; source on mini/bb) ---
++
++def test_selfheal_recovery_card_is_not_refused_by_its_source_card(home, tmp_path, monkeypatch, capsys):
++    _replica(tmp_path, [SELFHEAL["source"]])
++    rc = _cli(SELFHEAL["argv"], monkeypatch)
++    captured = capsys.readouterr()
++    assert rc == 0, (rc, captured.out, captured.err)
++    assert "create_overlap" not in captured.out + captured.err
++    assert json.loads(captured.out).get("ok", True) is not False
++
++
++def test_selfheal_recovery_card_is_not_refused_by_its_source_card_via_the_tool(home, tmp_path):
++    _replica(tmp_path, [SELFHEAL["source"]])
++    out = _tool(SELFHEAL["args"])
++    assert out.get("ok") is True, out
++
++
++def test_a_second_recovery_card_for_the_same_source_is_still_refused(home, tmp_path, monkeypatch, capsys):
++    _replica(tmp_path, [SELFHEAL["source"]])
++    first = _local("default", SELFHEAL["args"]["title"], SELFHEAL["args"]["body"])  # unkeyed, from another chat
++    rc = _cli(SELFHEAL["argv"], monkeypatch)
++    captured = capsys.readouterr()
++    assert rc == 2, (rc, captured.out, captured.err)
++    refusal = json.loads(captured.out)  # --json: the refusal is the JSON result
++    assert refusal["code"] == "create_overlap" and _ids(refusal) == [first], refusal
++
++
++def test_a_card_redoing_the_source_cards_work_is_still_refused(home, tmp_path):
++    src = SELFHEAL["source"]
++    _replica(tmp_path, [src])
++    out = _tool({"title": src["title"], "body": "Refiled by bb_bridge on mini/bb.", "assignee": "default"})
++    assert out.get("code") == "create_overlap" and src["id"] in _ids(out), out
++
++
++# --- 3. burn-down 7-day re-measure vs four bb cluster fix/design cards (tool, MacBook; cards on mini/bb) ---
++
++def test_remeasure_is_not_owned_by_the_cluster_fix_and_design_cards(home, tmp_path, monkeypatch):
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: "macbook")
++    _replica(tmp_path, REMEASURE["cards"])
++    out = _tool(REMEASURE["args"])
++    assert out.get("ok") is True, out
++
++
++def test_a_second_remeasure_and_a_same_cluster_repair_are_still_refused(home, tmp_path, monkeypatch):
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: "macbook")
++    args = REMEASURE["args"]
++    first = dict(REMEASURE["cards"][0], id="t_0123456789abcdef", title=args["title"], body=args["body"])
++    _replica(tmp_path, [*REMEASURE["cards"], first])
++    again = _tool(dict(args, idempotency_key="burndown-remeasure-20261107-b"))
++    assert again.get("code") == "create_overlap" and _ids(again) == [first["id"]], again
++    nsurl = next(c for c in REMEASURE["cards"] if "nsurl-timeout" in c["title"])
++    repair = _tool({"title": "Fix burn-down nsurl-timeout: NSURLErrorDomain -1001 timeouts on the bb board",
++                    "body": "", "assignee": "default"})
++    assert repair.get("code") == "create_overlap" and nsurl["id"] in _ids(repair), repair
++
++
++# --- the true duplicates the audits confirmed stay refused ---
++
++@pytest.mark.parametrize("case", CASES["true_duplicates"], ids=lambda c: c["title"][:40])
++def test_audited_true_duplicates_are_still_refused(home, tmp_path, monkeypatch, case):
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: case["self"])
++    _replica(tmp_path, [case["card"]])
++    out = _tool({"title": case["title"], "body": case.get("body", ""), "assignee": "default"})
++    assert out.get("code") == "create_overlap" and case["card"]["id"] in _ids(out), out
++
++
++# --- unit seams ---
++
++@pytest.mark.parametrize(("title", "body", "role"), [
++    ("Repair Stage B evidence gaps without changing frozen results", "", ("implement", "title")),
++    ("Stage C: independent verification of the Stage B matrix and final report", "", (None, None)),
++    ("Verify green main CI: daveey/hermes (after 992410c3)", "", (None, None)),  # owns "Fix red main CI"
++    ("Follow-through: send the verified Stage C report to David's Stage B chats", "", ("deliver", "title")),
++    ("bb-tuner burn-down: 7-day re-measure after the 10/31 failed-fix escalation deploy", "", ("measure", "title")),
++    ("Design: burn-down nsurl-timeout (6 failed fixes): NSURLErrorDomain -1001 timeouts", "", ("implement", "title")),
++    ("Burn-down g-cd77dccf: hub-runtime: deploy failed", "Follow the `bb-self-fix` skill: smallest fix, verify",
++     ("implement", "body")),
++    ("Stage B: GPU calibration, bounded comparison campaign and verified report", "", (None, None)),
++    ("Send failing on Discord: fix the retry", "", (None, None)),  # two roles: ambiguous
++    ("Gaps", "this card is not a second verification campaign; it repairs", ("implement", "body")),
++    ("Discord send retries drop messages", "", (None, None)),  # a noun, not the job
++    ("Telegram delivery receipts missing", "", (None, None)),
++    ("Don't send the report until Stage C passes", "", (None, None)),
++    ("No. Fix the holdout gate", "", ("implement", "title")),  # negation stops at the clause
++    ("Main CI red", "When green, notify David", (None, None)),  # a closing step in a body is not the job
++    ("Gateway mini config broken", "Investigate and deliver a fix", (None, None)),  # two roles: ambiguous
++    ("Send failing: fix", "smallest fix", (None, None)),  # an ambiguous title never falls back to its body
++])
++def test_work_role(title, body, role):
++    from hermes_cli import kanban_overlap as ko
++    assert ko.work_role(title, body) == role
++
++
++def test_a_body_only_role_never_decides_against_another_body_only_role():
++    from hermes_cli import kanban_overlap as ko
++    assert ko.distinct_target("demo capture", "demo capture", new_body="measure the movie",
++                              card_body="fix the harness") is None
++    assert ko.distinct_target("Re-measure the demo capture", "demo capture", card_body="fix the harness") == \
++        "role measure != implement"
++
++
++_BB_BODY = "Follow the `bb-self-fix` skill: smallest fix, verify"
++
++
++@pytest.mark.parametrize(("new", "card", "new_body", "card_body"), [
++    ("Fix red main CI: daveey/hermes", "Verify green main CI: daveey/hermes", "",
++     "Send David the run link when it is green."),
++    ("Fix red main CI: daveey/hermes", "Main CI red: daveey/hermes", "", "When green, notify David"),
++    ("Gateway mini config broken", "Fix gateway mini config", "Investigate and deliver a fix", ""),
++    ("Discord send retries drop messages", "Discord retries drop messages", "", _BB_BODY),
++    ("Telegram delivery receipts missing", "Telegram receipts missing", "", _BB_BODY),
++    # second review: a role noun as the first word is the subject the other card fixes
++    ("Fix Telegram delivery receipts missing", "Delivery receipts missing on Telegram", "", ""),
++    ("Fix send button disabled in BB client", "Send button disabled in BB client", "", _BB_BODY),
++    ("Fix measurement drift in demo capture harness", "Measurement drift in demo capture harness", "", ""),
++    ("Repair relay: drops messages from mini gateway", "Relay drops messages from mini gateway", "", ""),
++])
++def test_role_words_that_are_not_the_job_never_split_a_duplicate(new, card, new_body, card_body):
++    """Review of the first cut: a role word in a body's closing step or a noun in a title made these distinct."""
++    from hermes_cli import kanban_overlap as ko
++    assert ko.distinct_target(new, card, new_body=new_body, card_body=card_body) is None
++    assert ko.distinct_target(card, new, new_body=card_body, card_body=new_body) is None
++
++
++def test_fix_red_main_ci_is_still_refused_by_a_verify_card_whose_body_sends_a_link(home):
++    verify = _local("default", "Verify green main CI: daveey/hermes (after 992410c3)",
++                    "Send David the run link when it is green. Do not mark done until main is green.")
++    out = _tool({"title": "Fix red main CI: daveey/hermes", "body": "", "assignee": "default"})
++    assert out.get("code") == "create_overlap" and verify in _ids(out), out
++
++
++@pytest.mark.parametrize(("title", "card", "hit"), [
++    ("self-heal: kanban card t_5e1f000000000a91 on mini/bb failed 2x (crashed,crashed): BB-1156",
++     "t_5e1f000000000a91", True),
++    ("kanban cards t_5e1f000000000a91+3 on mini/bb failed 6x (4 siblings 'load #N'): same error",
++     "t_5e1f000000000a91", True),
++    ("self-heal: kanban card t_5e1f000000000a91 on mini/bb failed 2x", "t_5e1f000000000a92", False),
++    ("BB-1156: display on laptop failed (see t_5e1f000000000a91)", "t_5e1f000000000a91", False),
++    # a title that says it does the source's work is a second owner, not a diagnosis
++    ("Retry BB-1156 display on laptop blank after wake: card t_5e1f000000000a91 crashed, take over",
++     "t_5e1f000000000a91", False),
++    ("card t_5e1f000000000a91 crashed: finish its BB-1156 work", "t_5e1f000000000a91", False),
++    # ...but the source title self-heal quotes after the colon is not read for that
++    ("self-heal: kanban card t_5e1f000000000a91 on mini/bb failed 2x (crashed,crashed): Retry logic drops",
++     "t_5e1f000000000a91", True),
++])
++def test_recovers(title, card, hit):
++    from hermes_cli import kanban_overlap as ko
++    assert ko.recovers(card, title, "Retry logic drops messages on wake") is hit
+-- 
+2.55.0
+

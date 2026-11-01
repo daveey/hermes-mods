@@ -83,3 +83,40 @@ Patch numbers now follow fork-log ordinals, not the older curated numbering. Pri
 ## Plugin?
 
 This entry mirrors an in-tree fork change. It is not a separately installable hermes-mods plugin.
+
+## Remote-assignee creation follow-up (1521)
+
+### Behavior
+
+When `runs_on` proves a Board-primary card cannot run on this machine, creation no longer rejects it
+because the local same-named profile is missing or has different tools, skills or model configuration.
+The landing machines' published capabilities still participate in create validation, and pickup
+still checks the landing profile. Requirement shape/declaration and machine-independent explicit
+model/provider compatibility remain checked. A concrete remote model pin must name its provider;
+class selectors may retain automatic routing.
+
+### How it works and Code
+
+`hermes_cli/kanban_db_creation.py::validate_create_assignment` centralizes creation checks.
+`kanban_runs_on_capabilities.runs_elsewhere` only skips local checks when routing excludes this
+machine on a primary board. Missing/empty `runs_on`, non-primary boards and unresolved registry
+state keep local checks; an explicit other-machine label needs no registry to exclude this machine.
+`kanban_capabilities.validate_assignment(check_profile=False)` validates the declared shape without
+loading local skills. `kanban_model_assignment` skips local profile configuration, and
+`kanban_pin_provider.require_remote_pin_provider` refuses provider-less concrete remote pins.
+`kanban_db.create_task` calls this combined helper. Landing workers retain their own registry
+validation and missing-pinned-skill note behavior.
+
+### Tests
+
+Source `tests/hermes_cli/test_kanban_runs_on_remote_assignee.py` covers capable/known-incapable/unknown
+remote tools, later pickup refusal, cards still eligible locally, malformed requirements, no local
+skill/profile model lookup, provider-less pin refusal, and
+`test_tool_create_with_placement_on_an_enrolled_machine_creates_the_card` through the tool entry.
+Not executed in this documentation pass; CLI/REST remote-assignee parity is not newly certified.
+
+### Applying and Gotchas
+
+Use the complete ordered [README replay recipe](README.md#applying) through 1521. Unknown published
+tools are not proof of capability: create may accept while the landing pickup gate refuses.
+Skipping a local profile check neither grants credentials nor guarantees the remote skill exists.

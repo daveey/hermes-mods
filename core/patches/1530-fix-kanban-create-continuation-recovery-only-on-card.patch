@@ -1,0 +1,100 @@
+From 7dc60085a40a289b476614c2de6392aacbaed007 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:23:41 +0000
+Subject: [PATCH] fix(kanban): create continuation recovery only on card home
+ [daveey]
+
+---
+ hermes_cli/kanban_resume_requester.py         |  8 ++-
+ .../test_kanban_resume_requester_sync.py      | 49 +++++++++++++++++++
+ 2 files changed, 55 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_resume_requester_sync.py
+
+diff --git a/hermes_cli/kanban_resume_requester.py b/hermes_cli/kanban_resume_requester.py
+index 1338eafa122..bc29d1c0867 100644
+--- a/hermes_cli/kanban_resume_requester.py
++++ b/hermes_cli/kanban_resume_requester.py
+@@ -6,7 +6,7 @@ park. A parked card has no live run, so it cannot create that card itself, and e
+ before the park fails the freshness fence by design. Without this module nothing could ever pass
+ both fences, so the op was unreachable.
+ 
+-Each dispatcher tick, :func:`ensure_recovery_cards` finds cards whose current park passes
++Each dispatcher tick, :func:`ensure_recovery_cards` finds home-owned cards whose current park passes
+ :func:`kanban_resume_exec.exhaustion_refusal` (a continuation_exhausted rekind written by the
+ refused run, no human gate, no live run, nothing moved it since) and creates ONE recovery card per
+ park: ``creator_task_id=<target>`` (1 hop), ``created_by=kanban-recovery``, idempotency key
+@@ -89,11 +89,15 @@ def ensure_recovery_cards(conn: sqlite3.Connection) -> list[str]:
+     """Create the missing recovery card for every resumable continuation_exhausted park. Returns new ids."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_resume_exec as rx
++    from hermes_cli.kanban_wake_check import foreign_ids
+ 
++    # A worker-node copy observes the same park with a different local event id.
++    # Only the home owns recovery; local idempotency cannot arbitrate across replicas.
++    copies = foreign_ids(conn)
+     made: list[str] = []
+     for row in _candidates(conn):
+         target = row["id"]
+-        if row["created_by"] == CREATED_BY or rx.exhaustion_refusal(conn, target):
++        if target in copies or row["created_by"] == CREATED_BY or rx.exhaustion_refusal(conn, target):
+             continue
+         park_id = rx._park_event_id(conn, target)
+         if _event_for_park(conn, target, park_id) or len(rx._resume_events(conn, target)) >= rx.MAX_RESUMES:
+diff --git a/tests/hermes_cli/test_kanban_resume_requester_sync.py b/tests/hermes_cli/test_kanban_resume_requester_sync.py
+new file mode 100644
+index 00000000000..9ffc72436ab
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_resume_requester_sync.py
+@@ -0,0 +1,49 @@
++"""A foreign continuation park has one home-owned requester across Board replicas."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_resume_exec as rx
++from hermes_cli import kanban_resume_requester as rr
++from tests.hermes_cli import test_kanban_worker_node as worker_node
++
++# Reuse the real multi-gateway fixture rather than mocking ownership or sync.
++gws = worker_node.gws
++svc = worker_node.svc
++
++
++@pytest.mark.parametrize("home_first", [False, True])
++def test_foreign_park_has_one_board_wide_requester(gws, svc, home_first):
++    home, worker = gws
++    home.enter()
++    target = kb.create_task(home.conn, title="foreign exhaustion", assignee="default", runs_on=["linux"])
++    home.round()
++    worker.round()
++    worker.tick()
++    worker.round()  # receive the Board lease's claimed event before parking
++    task = kb.get_task(worker.conn, target)
++    assert task is not None
++    run = task.current_run_id
++    assert run is not None
++    out = kc.continue_task(worker.conn, target, checkpoint="partial", expected_run_id=run, max_continuations=0)
++    assert out["reason_code"] == "continuation_exhausted"
++    assert kb.block_task(worker.conn, target, kind="transient", expected_run_id=run,
++                         reason="continuation_exhausted: split the work or reset the continuation budget")
++    worker.round()
++    home.round()
++    assert rx.exhaustion_refusal(home.conn, target) is None
++    assert rx.exhaustion_refusal(worker.conn, target) is None
++    # Each dispatcher can see the same park before eviction; ordering must not matter.
++    for gateway in ((home, worker) if home_first else (worker, home)):
++        gateway.enter()
++        rr.ensure_recovery_cards(gateway.conn)
++        rr.ensure_recovery_cards(gateway.conn)
++        gateway.round()
++    rows = svc.board(worker_node.BOARD)["rows"]["tasks"]
++    cards = [r for r in rows.values() if r.get("created_by") == rr.CREATED_BY]
++    assert len(cards) == 1, [(r["id"], r["created_on"]) for r in cards]
++    assert cards[0]["created_on"] == home.name
++    home.enter()
++    assert rx.refusal(home.conn, cards[0]["id"], target) is None
+-- 
+2.55.0
+

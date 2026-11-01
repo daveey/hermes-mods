@@ -4,7 +4,7 @@ Patch 0756, source `0cca76224de18271d2655b399be38f0735933534`.
 
 ## Behavior
 
-ci: run tests/hermes_state on a self-hosted macOS runner (non-blocking lane). This is the source commit's bounded change; later patches may refine it.
+ci: run tests/hermes_state on a self-hosted macOS runner (non-blocking lane). This is the source commit's bounded change; later patches may refine it. Superseded by 1503: selected PRs now call this lane from `ci.yaml` and it has its own required check, see [ci-macos-state-required.md](ci-macos-state-required.md).
 
 ## How it works
 

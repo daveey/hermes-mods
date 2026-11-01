@@ -1,0 +1,217 @@
+From ac1d0142198e7d9737d6a5b6bb79be9ca98d118d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:02:21 +0000
+Subject: [PATCH] test(ci): checkpoint cancellation before sandbox init setup
+ [daveey] (#460)
+
+---
+ .github/workflows/sandbox-lifecycle-proof.yml |   2 +-
+ tests/ci/test_plugin_sandbox_startup.py       | 186 ++++++++++++++++++
+ 2 files changed, 187 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ci/test_plugin_sandbox_startup.py
+
+diff --git a/.github/workflows/sandbox-lifecycle-proof.yml b/.github/workflows/sandbox-lifecycle-proof.yml
+index 37f97f1b16f..c4ea1a234f0 100644
+--- a/.github/workflows/sandbox-lifecycle-proof.yml
++++ b/.github/workflows/sandbox-lifecycle-proof.yml
+@@ -24,4 +24,4 @@ jobs:
+           uname -a
+       - name: Regression and lifecycle controls
+         run: |
+-          HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/ci/test_plugin_sandbox_normal_exit.py tests/ci/test_plugin_sandbox_lifecycle.py tests/ci/test_plugin_validation_sandbox.py -v
++          HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/ci/test_plugin_sandbox_startup.py tests/ci/test_plugin_sandbox_normal_exit.py tests/ci/test_plugin_sandbox_lifecycle.py tests/ci/test_plugin_validation_sandbox.py -v
+diff --git a/tests/ci/test_plugin_sandbox_startup.py b/tests/ci/test_plugin_sandbox_startup.py
+new file mode 100644
+index 00000000000..7ba3ea7ee6c
+--- /dev/null
++++ b/tests/ci/test_plugin_sandbox_startup.py
+@@ -0,0 +1,186 @@
++"""Real startup-cancellation regression: no clone may escape teardown's scan.
++
++The launcher stops before bwrap exec, and kill() stops its caller after the old
++child scan. Real bwrap then clones a PID namespace and blocks before do_init's
++PDEATHSIG. No sandbox lifecycle operation is mocked or replaced.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import select
++import signal
++import subprocess
++import sys
++import textwrap
++
++import pytest
++
++from tests.ci import test_plugin_validation_sandbox as helpers
++from tests.ci.test_plugin_validation_sandbox import SCRIPT, needs_isolation
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.platforms("linux")
++
++
++@pytest.fixture
++def work(tmp_path):
++    yield from helpers.work.__wrapped__(tmp_path)
++
++
++def _stopped(pid):
++    try:
++        return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] == "T"
++    except FileNotFoundError:
++        return False
++
++
++def _read_pid(path):
++    try:
++        return int(path.read_text())
++    except (FileNotFoundError, ValueError):
++        return None
++
++
++def _init_pid(path):
++    try:
++        return json.loads(path.read_text())["child-pid"]
++    except (FileNotFoundError, ValueError):
++        return None
++
++
++def _blocked_in_read(pid):
++    try:
++        return Path(f"/proc/{pid}/wchan").read_text().strip() in {"pipe_read", "anon_pipe_read"}
++    except FileNotFoundError:
++        return False
++
++
++def _write_probe(work):
++    probe = work / "probe.py"
++    probe.write_text(textwrap.dedent('''\
++        import importlib.util
++        import json
++        import os
++        from pathlib import Path
++        import select
++        import signal
++        import subprocess
++        import sys
++
++        source, control = sys.argv[1:3]
++        control = Path(control)
++        spec = importlib.util.spec_from_file_location("sandbox", source)
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++        original_popen = subprocess.Popen
++        class CheckpointPopen(original_popen):
++            def __init__(self, argv, *args, **kwargs):
++                # Inject the same observation-only checkpoint into the dedicated
++                # supervisor. The actual module and sandbox self-check stay real.
++                if "--supervise" in argv:
++                    i = argv.index("--supervise")
++                    argv = [*argv[:i - 1], __file__, source, str(control), *argv[i:]]
++                super().__init__(argv, *args, **kwargs)
++            def kill(self):
++                if self.args[0] == str(control / "gate") and not (control / "killer").exists():
++                    (control / "killer").write_text(str(os.getpid()))
++                    os.kill(os.getpid(), signal.SIGSTOP)
++                return super().kill()
++        subprocess.Popen = CheckpointPopen
++        original_remove = mod.remove_tree
++        def remove(path):
++            pid = int((control / "init").read_text())
++            try:
++                fd = os.pidfd_open(pid)
++            except ProcessLookupError:
++                dead = True
++            else:
++                dead = bool(select.select([fd], [], [], 0)[0])
++                os.close(fd)
++            (control / "cleanup").write_text(json.dumps({"init_dead": dead}))
++            original_remove(path)
++        mod.remove_tree = remove
++        sys.exit(mod.main(sys.argv[3:]))
++    '''))
++    gate = work / "gate"
++    gate.write_text(textwrap.dedent(f'''\
++        #!/usr/bin/python3
++        import os
++        from pathlib import Path
++        import signal
++        import sys
++        if sys.argv[1:] == ["--version"]:
++            os.execv("/usr/bin/bwrap", ["bwrap", "--version"])
++        control = Path({str(work)!r})
++        block = os.open(control / "block", os.O_RDWR)
++        info = os.open(control / "info", os.O_WRONLY | os.O_CREAT, 0o600)
++        os.set_inheritable(block, True)
++        os.set_inheritable(info, True)
++        (control / "monitor").write_text(str(os.getpid()))
++        os.kill(os.getpid(), signal.SIGSTOP)
++        os.execv("/usr/bin/bwrap", ["bwrap", "--block-fd", str(block),
++                 "--info-fd", str(info), *sys.argv[1:]])
++    '''))
++    gate.chmod(0o700)
++    os.mkfifo(work / "block")
++    return probe, gate
++
++
++@needs_isolation
++@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
++def test_startup_cancel_reaps_init_before_cleanup(work, signum):
++    assert os.getuid() != 0, "this proof must exercise real non-root bwrap"
++    probe, gate = _write_probe(work)
++    monitor = killer = init_fd = None
++    # A log file avoids a leaked init holding communicate()'s pipe open on RED.
++    with (work / "output").open("w+") as output:
++        proc = subprocess.Popen(
++            [sys.executable, "-I", str(probe), str(SCRIPT), str(work),
++             "--no-network", "--bwrap", str(gate), "--", "/bin/true"],
++            env={**os.environ, "RUNNER_TEMP": str(work)}, stdout=output, stderr=output,
++        )
++        try:
++            wait_until(lambda: _read_pid(work / "monitor"), timeout=30)
++            monitor = _read_pid(work / "monitor")
++            wait_until(lambda: _stopped(monitor), timeout=30)
++            proc.send_signal(signum)
++            wait_until(lambda: _read_pid(work / "killer"), timeout=30)
++            killer = _read_pid(work / "killer")
++            wait_until(lambda: _stopped(killer), timeout=30)
++            # Old run_host has already taken its empty descendant snapshot.
++            os.kill(monitor, signal.SIGCONT)
++            wait_until(lambda: _init_pid(work / "info"), timeout=30)
++            init = _init_pid(work / "info")
++            init_fd = os.pidfd_open(init)
++            (work / "init").write_text(str(init))
++            wait_until(lambda: _blocked_in_read(init), timeout=30)
++            assert not select.select([init_fd], [], [], 0)[0]
++            os.kill(killer, signal.SIGCONT)
++            status = proc.wait(timeout=45)
++            output.seek(0)
++            log = output.read()
++            assert status == 128 + signum, log
++            assert (work / "cleanup").exists(), log
++            observation = json.loads((work / "cleanup").read_text())
++            assert observation["init_dead"], "namespace init alive at remove_tree entry"
++            assert select.select([init_fd], [], [], 0)[0], "namespace init survived run_host"
++            assert not list(work.glob("plugin-sandbox-*"))
++        finally:
++            # Also clean the intentionally failing baseline; never leave a stopped
++            # process or namespace behind when a checkpoint/assertion fails.
++            if init_fd is not None:
++                try:
++                    signal.pidfd_send_signal(init_fd, signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++                os.close(init_fd)
++            for pid in {monitor, killer} - {None}:
++                try:
++                    os.kill(pid, signal.SIGCONT)
++                except ProcessLookupError:
++                    pass
++            if proc.poll() is None:
++                proc.kill()
++            proc.wait(timeout=10)
+-- 
+2.55.0
+

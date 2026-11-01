@@ -1,6 +1,6 @@
 # Kanban supervisor requests (durable worker graph-edit handoff)
 
-Patches: 1278 1279 1280 1281
+Patches: 1278 1279 1280 1281; follow-up 1499 (archive op, below)
 
 - `patches/1278-feat-kanban-durable-supervisor-requests-for-worker-g.patch`
 - `patches/1279-fix-kanban-supervisor-requests-refuse-link-ops-up-fr.patch`
@@ -62,7 +62,25 @@ Patches are not independent of the rest of the mirror: apply the series in order
 
 ## Gotchas
 
-- Only `unlink` ops are filed. Add new edges yourself with `kanban_link` first, then request the unlinks.
+- Only `unlink` edge ops are filed (later families add `reconcile_notify`, `resume`, `retry_limit` and, from 1499, `archive`; see [Kanban runtime follow-ups](mirror-kanban-follow-ups-1428.md) and the 1499 section below). Add new edges yourself with `kanban_link` first, then request the unlinks.
 - A request is not a release: the requester must park (`kanban_schedule` / `kanban_block kind='time'`) naming the request id to be woken, and still has to complete itself.
 - With no executor seen in 5 minutes the request stays `pending` and visible (`executor_available: false`); drain it with the operator CLI.
 - Not claimed: live deployment of the dispatcher on any host.
+
+## Follow-up patch (1499): `archive` op for an orphaned, unstarted descendant
+
+**1499** (`69f23d4c69`, `feat(kanban): supervisor-request archive op for orphaned unstarted descendants`).
+
+- **Problem.** A standing card S created owner card B, and B created a QA card C. B was archived when its PR closed, and C stayed `todo` with no supported way to cancel it: `kanban_archive` from S was refused (C's creator is B, not S), `kanban_block(kind='assignment')` returned `no_capable_supervisor` (same profile), and the request schema had no archive op. Only an unscoped operator could clear it.
+- **Behavior.** New op `{op: 'archive', task_id}` (no other keys) as its own request family: a request carries only archive ops, and mixing them with `unlink` or adding `parent_id` is `invalid_ops`. The non-worker executor archives the target through `kanban_db.archive_task`. Scope: walking `creator_task_id` up from the target must reach the requester within `MAX_CREATOR_HOPS` (3), and every card in between must be `done` or `archived` (a live intermediate owns the target: "still open" refusal). The following are refused:
+  - a card the requester created directly, with a pointer to `kanban_archive`;
+  - the requester itself (`self_scope`);
+  - a card outside the creator tree;
+  - an unknown or already `done`/`archived` target;
+  - a claimed or running target (any claim lock, worker pid or current run; status must be `todo`/`ready`/`scheduled`/`blocked`/`triage`): it cancels work and never stops a worker.
+
+  `dry_run` reports `supervisor`, or `noop` when the in-scope target is already archived. `kanban_archive`'s own worker scope is unchanged.
+- **How it works.** `hermes_cli/kanban_archive_exec.py` provides `normalize_op`, `label`, `preflight_op` and `execute`, and `kanban_supervisor_requests` dispatches to it (`OPS`, `_OWN_FAMILIES`, `_is_archive`). At execution the requester (`requester_refusal`), the scope and the target state are re-checked against the current board. The `archived` event carries `supervisor_request_id`, `requested_by` and `executor`. A redelivered request whose event is already present reports `already_applied` without a second write. A refusal at execution makes the op `not_applied` and the request `rejected` (or `failed` if an earlier op applied). The receipt never completes the requester.
+- **Code.** `hermes_cli/kanban_archive_exec.py` (new), `hermes_cli/kanban_supervisor_requests.py`, `tools/kanban_tools_schemas.py` (op enum, `task_id` description, tool description).
+- **Tests** (new `tests/hermes_cli/test_kanban_archive_exec.py`, isolated board under `tmp_path`; not run for this mirror): `test_worker_archive_still_refuses_the_grandchild` (the `kanban_archive` tool handler stays refused), `test_orphaned_grandchild_is_archived_by_the_executor` (tool `dry_run` and submit, then `ksr.drain`; event provenance; zero runs; requester still `running`), `test_redelivered_request_reports_already_applied`, `test_card_created_directly_is_pointed_at_kanban_archive`, `test_grandchild_of_a_live_creator_is_refused`, `test_card_outside_the_creator_tree_is_refused`, `test_self_and_unknown_are_refused`, `test_claimed_grandchild_is_refused_and_never_stopped`, `test_scope_is_rechecked_at_execution` (claimed between submit and drain → `rejected`), `test_a_worker_cannot_drain_the_request`, `test_archive_ops_do_not_mix_with_other_families`. The dispatcher-tick drain and the `hermes kanban supervisor-requests --drain` CLI are not exercised for this op; the tests call `ksr.drain` directly.
+- **Gotchas.** The 3-hop limit is counted from the target's creator. A deeper orphan, or one whose chain goes through a card that is still open, still needs its live owner or an operator. A target that was claimed after the request was filed is left alone, and the request is rejected rather than retried.

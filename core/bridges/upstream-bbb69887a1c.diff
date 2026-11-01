@@ -1,0 +1,2270 @@
+diff --git a/agent/i18n.py b/agent/i18n.py
+index 05f875cb55e..1edb2a6a7b4 100644
+--- a/agent/i18n.py
++++ b/agent/i18n.py
+@@ -106,6 +106,29 @@ def supported_languages(home: str | None = None) -> tuple[str, ...]:
+     return result
+ 
+ 
++@lru_cache(maxsize=4)
++def _bundled_surfaces(locales_dir: str) -> frozenset[tuple[str, str]]:
++    """``(lang, surface)`` for every bundled ``locales/<lang>[.<surface>].yaml``. Keyed by directory so a
++    ``HERMES_BUNDLED_LOCALES`` switch re-scans; cleared with the other layer views by
++    :func:`reset_language_cache`."""
++    return frozenset((lang, surface) for lang, surface, _path in i18n_layers.scan_locale_dir(Path(locales_dir)))
++
++
++def language_surfaces(home: str | None = None) -> dict[str, tuple[str, ...]]:
++    """Per language, the surfaces some layer has strings for (bundled ∪ user overlay ∪ plugin packs), in
++    ``SURFACES`` order. An overlay file or pack that loaded no strings (empty, comment-only, unparseable)
++    does not count. A renderer that bundles its own catalog for a language does not need this; for any
++    other language a missing surface means that renderer would show English."""
++    home = home or _current_home()
++    layered = {(lang, surface) for lang, surface in i18n_layers.overlay_surfaces(home) | i18n_layers.pack_surfaces()
++               if i18n_layers.overlay_layer(home, lang, surface) or i18n_layers.pack_layer(lang, surface)}
++    pairs = _bundled_surfaces(str(_locales_dir())) | layered
++    found: dict[str, set[str]] = {}
++    for lang, surface in pairs:
++        found.setdefault(lang, set()).add(surface)
++    return {lang: tuple(s for s in i18n_layers.SURFACES if s in surfaces) for lang, surfaces in found.items()}
++
++
+ def resolve_language_id(value: Any, home: str | None = None) -> str | None:
+     """Canonical supported id for a user-supplied value (code, alias, regional tag), or ``None`` when no
+     layer supplies it — the validation ``hermes config set display.language`` runs."""
+@@ -198,6 +221,7 @@ def reset_language_cache() -> None:
+     ``save_config`` changes ``display.language``, after a pack registers/unregisters, or after editing
+     an overlay file)."""
+     _config_language_cached.cache_clear()
++    _bundled_surfaces.cache_clear()
+     with _catalog_lock:
+         _catalog_cache.clear()
+         _supported_cache.clear()
+@@ -248,6 +272,7 @@ __all__ = [
+     "SUPPORTED_LANGUAGES",
+     "get_language",
+     "language_options",
++    "language_surfaces",
+     "reset_language_cache",
+     "resolve_language_id",
+     "supported_languages",
+diff --git a/agent/i18n_languages.py b/agent/i18n_languages.py
+index 519f986af4f..b160bb9d2d4 100644
+--- a/agent/i18n_languages.py
++++ b/agent/i18n_languages.py
+@@ -8,7 +8,7 @@ and fall back to the bare id.
+ 
+ from __future__ import annotations
+ 
+-from typing import TypedDict
++from typing import Iterable, TypedDict
+ 
+ 
+ class LanguageOption(TypedDict):
+@@ -16,6 +16,7 @@ class LanguageOption(TypedDict):
+     endonym: str
+     rtl: bool
+     source: str
++    surfaces: list[str]
+ 
+ 
+ # id -> (endonym, rtl). Keep sorted by id; ``en`` is listed first by ``language_options`` regardless.
+@@ -43,10 +44,12 @@ BUNDLED_SOURCE = "bundled"
+ OVERLAY_SOURCE = "overlay"
+ 
+ 
+-def describe_language(lang: str, *, pack: dict | None, overlay: bool) -> LanguageOption:
++def describe_language(lang: str, *, pack: dict | None, overlay: bool, surfaces: Iterable[str]) -> LanguageOption:
+     """One picker row. Precedence for endonym/rtl: bundled table → pack metadata → bare id / LTR.
+     ``source`` names the highest layer that supplies the language (``plugin:<name>`` > ``overlay`` >
+-    ``bundled``) so a picker can say where a language came from."""
++    ``bundled``) so a picker can say where a language came from. ``surfaces`` are the surfaces some
++    layer has strings for (``agent.i18n.language_surfaces``), so a renderer can leave out a language it
++    would only show in English."""
+     bundled = BUNDLED_LANGUAGE_INFO.get(lang)
+     endonym, rtl = bundled if bundled else ((pack or {}).get("endonym") or lang, bool((pack or {}).get("rtl")))
+     if pack is not None:
+@@ -55,18 +58,21 @@ def describe_language(lang: str, *, pack: dict | None, overlay: bool) -> Languag
+         source = OVERLAY_SOURCE
+     else:
+         source = BUNDLED_SOURCE
+-    return {"id": lang, "endonym": endonym, "rtl": rtl, "source": source}
++    return {"id": lang, "endonym": endonym, "rtl": rtl, "source": source, "surfaces": list(surfaces)}
+ 
+ 
+ def language_options() -> list[LanguageOption]:
+-    """``[{"id", "endonym", "rtl", "source"}, ...]`` for every supported language, ``en`` first then sorted
++    """``[{"id", "endonym", "rtl", "source", "surfaces"}, ...]`` for every supported language, ``en`` first then sorted
+     by id — the list ``i18n.languages`` serves and every switcher renders (endonym only, no flags)."""
+     from agent import i18n, i18n_layers
+     from hermes_constants import get_hermes_home
+ 
+-    overlay_langs = i18n_layers.overlay_languages(get_hermes_home())
++    home = get_hermes_home()
++    overlay_langs = i18n_layers.overlay_languages(home)
++    surfaces = i18n.language_surfaces(str(home))
+     return [
+-        describe_language(lang, pack=i18n_layers.pack_info(lang), overlay=lang in overlay_langs)
++        describe_language(lang, pack=i18n_layers.pack_info(lang), overlay=lang in overlay_langs,
++                          surfaces=surfaces.get(lang, ()))
+         for lang in i18n.supported_languages()
+     ]
+ 
+diff --git a/agent/i18n_layers.py b/agent/i18n_layers.py
+index d6d9a801078..8f0b8009673 100644
+--- a/agent/i18n_layers.py
++++ b/agent/i18n_layers.py
+@@ -134,7 +134,7 @@ _tokens = count(1)
+ _packs: list[PackEntry] = []
+ _pack_cache: dict[tuple[str, str], dict[str, str]] = {}
+ _overlay_cache: dict[tuple[str, str, str], dict[str, str]] = {}
+-_overlay_languages_cache: dict[str, frozenset[str]] = {}
++_overlay_files_cache: dict[str, frozenset[tuple[str, str]]] = {}
+ 
+ 
+ def _reset_facade() -> None:
+@@ -184,9 +184,14 @@ def pack_layer(lang: str, surface: str = CORE_SURFACE) -> dict[str, str]:
+         return merged
+ 
+ 
+-def pack_languages() -> frozenset[str]:
++def pack_surfaces() -> frozenset[tuple[str, str]]:
++    """``(lang, surface)`` for every registered pack layer."""
+     with _lock:
+-        return frozenset(entry.lang for entry in _packs)
++        return frozenset((entry.lang, entry.surface) for entry in _packs)
++
++
++def pack_languages() -> frozenset[str]:
++    return frozenset(lang for lang, _surface in pack_surfaces())
+ 
+ 
+ def pack_info(lang: str) -> dict[str, Any] | None:
+@@ -230,17 +235,22 @@ def overlay_layer(home: Path | str, lang: str, surface: str = CORE_SURFACE) -> d
+     return flat
+ 
+ 
+-def overlay_languages(home: Path | str) -> frozenset[str]:
+-    """Language ids that have at least one overlay file (any surface) under *home*."""
++def overlay_surfaces(home: Path | str) -> frozenset[tuple[str, str]]:
++    """``(lang, surface)`` for every overlay file under *home*."""
+     key = str(home)
+     with _lock:
+-        cached = _overlay_languages_cache.get(key)
++        cached = _overlay_files_cache.get(key)
+         if cached is not None:
+             return cached
+-    langs = frozenset(lang for lang, _surface, _path in scan_locale_dir(overlay_dir(home)))
++    found = frozenset((lang, surface) for lang, surface, _path in scan_locale_dir(overlay_dir(home)))
+     with _lock:
+-        _overlay_languages_cache[key] = langs
+-    return langs
++        _overlay_files_cache[key] = found
++    return found
++
++
++def overlay_languages(home: Path | str) -> frozenset[str]:
++    """Language ids that have at least one overlay file (any surface) under *home*."""
++    return frozenset(lang for lang, _surface in overlay_surfaces(home))
+ 
+ 
+ def surface_catalog(home: Path | str, lang: str, surface: str = CORE_SURFACE) -> dict[str, str]:
+@@ -261,7 +271,7 @@ def clear_cache() -> None:
+     with _lock:
+         _pack_cache.clear()
+         _overlay_cache.clear()
+-        _overlay_languages_cache.clear()
++        _overlay_files_cache.clear()
+ 
+ 
+ def _reset_registry_for_tests() -> None:
+@@ -289,9 +299,11 @@ __all__ = [
+     "overlay_dir",
+     "overlay_languages",
+     "overlay_layer",
++    "overlay_surfaces",
+     "pack_info",
+     "pack_languages",
+     "pack_layer",
++    "pack_surfaces",
+     "parse_locale_file",
+     "register_pack",
+     "registered_packs",
+diff --git a/apps/desktop/DESIGN.md b/apps/desktop/DESIGN.md
+index 675ea1052e3..4f0f5c54d4d 100644
+--- a/apps/desktop/DESIGN.md
++++ b/apps/desktop/DESIGN.md
+@@ -329,6 +329,9 @@ binding and hovered/focused-zone resolver as the number shortcuts.
+ 
+ Tab close buttons fade the label with a content mask, not a painted gradient.
+ The tab reads its surface token directly so glass tint is painted only once.
++Close glyphs keep a 24px hit area, including session tabs wrapped in context menus.
++`PaneTab` owns its `data-slot` marker after forwarded props so composition cannot
++disable that width or the label mask.
+ 
+ Sticky user messages clip covered scrolling content, including the gap above
+ them. Their wrappers stay unpainted; only the rounded user bubble owns a fill.
+diff --git a/apps/desktop/ENGINEERING.md b/apps/desktop/ENGINEERING.md
+index 7974846ab8e..306c9751e71 100644
+--- a/apps/desktop/ENGINEERING.md
++++ b/apps/desktop/ENGINEERING.md
+@@ -148,6 +148,24 @@ button) reach the OS browser through one explicit bridge instead:
+ Widening any of those three (partition key, trusted-click gate, scheme set)
+ reopens the gesture-less forced-navigation class the advisory closed.
+ 
++## Rendering work follows visibility and ownership
++
++- Live transcript navigation reads the session store; the shared navigation
++  context carries only the selected historical page, not every streamed delta.
++- Unchanged retained snapshots must not republish the terminal store. Closing
++  the last mounted writer must enforce the cold agent-terminal retention budget
++  even when no later output arrives.
++- Hidden terminals stay mounted and keep parsing output. Suppress only their
++  DOM rows, not the measurable host/helpers or terminal state. Do not reduce
++  scrollback or replace parser state to save painting work. WebGL surfaces remain
++  unchanged; hidden DOM-row suppression must leave fitting and font helpers measurable.
++  Register an agent-terminal writer before recovering its matching process
++  snapshot. A quiet tab can reopen after cold eviction without any new registry
++  notification; recovery must not duplicate live output or exempt cold entries
++  from the retention budget.
++- Root geometry variables are not theme changes. Authored custom CSS can depend
++  on those variables, so it must retain full repaint notifications.
++
+ ## Nous free tier: state is pulled, never latched in the renderer
+ 
+ The free tier (a Nous identity with no account, `hermes_cli/anon_auth.py`) reaches the renderer
+diff --git a/apps/desktop/src/app/chat/history-window.test.tsx b/apps/desktop/src/app/chat/history-window.test.tsx
+index 2d9f58ea6b2..a665ed031d1 100644
+--- a/apps/desktop/src/app/chat/history-window.test.tsx
++++ b/apps/desktop/src/app/chat/history-window.test.tsx
+@@ -81,6 +81,32 @@ function mount(storedId = 'stored') {
+ }
+ 
+ describe('bounded direct history runtime', () => {
++  it('keeps navigation consumers stable while a live assistant reply advances', () => {
++    const mounted = mount()
++
++    const live: ChatMessage = {
++      id: 'streaming',
++      role: 'assistant',
++      pending: true,
++      parts: [{ type: 'text', text: 'Working' }]
++    }
++
++    const prefix = mounted.view.$messages.get()
++
++    act(() => mounted.view.$messages.set([...prefix, live]))
++    const navigation = mounted.window
++
++    act(() =>
++      mounted.view.$messages.set([...prefix, { ...live, parts: [{ type: 'text', text: 'Working on the next step' }] }])
++    )
++
++    expect(mounted.window).toBe(navigation)
++    expect(mounted.runtime.thread.getState().messages.at(-1)?.content[0]).toMatchObject({
++      type: 'text',
++      text: 'Working on the next step'
++    })
++  })
++
+   it('reads one around page and selects it without replacing the live store', async () => {
+     const api = vi.spyOn(window.hermesDesktop, 'api').mockResolvedValue(page(40))
+     const mounted = mount()
+diff --git a/apps/desktop/src/app/chat/index.tsx b/apps/desktop/src/app/chat/index.tsx
+index 438d8175d58..83ad1366e37 100644
+--- a/apps/desktop/src/app/chat/index.tsx
++++ b/apps/desktop/src/app/chat/index.tsx
+@@ -421,6 +421,7 @@ export function ChatRuntimeBoundary({
+   const isHistorical = Boolean(history.page)
+   const newerAvailable = history.page?.newerAvailable ?? false
+   const { revealRow, returnToLatest } = history
++  const historicalMessages = history.page?.messages
+ 
+   const transcriptWindow = useMemo(
+     () => ({
+@@ -428,11 +429,13 @@ export function ChatRuntimeBoundary({
+       expandWindow,
+       revealRow,
+       returnToLatest,
+-      currentMessages,
++      // Live navigation reads the session store. Broadcasting the changing
++      // live tail here invalidates the entire transcript's navigation context.
++      currentMessages: historicalMessages ?? [],
+       isHistorical,
+       newerAvailable
+     }),
+-    [expandWindow, olderAvailable, revealRow, returnToLatest, currentMessages, isHistorical, newerAvailable]
++    [expandWindow, olderAvailable, revealRow, returnToLatest, historicalMessages, isHistorical, newerAvailable]
+   )
+ 
+   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
+diff --git a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+index 14517ac7009..42b7d91ecc8 100644
+--- a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+@@ -8,7 +8,16 @@ import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/s
+ import { SidebarProvider } from '@/components/ui/sidebar'
+ import { registry } from '@/contrib/registry'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+-import { $sidebarMessagingOpenIds, setSidebarAgentsGrouped, setSidebarGrouping } from '@/store/layout'
++import {
++  $pinnedSessionIds,
++  $sidebarMessagingOpenIds,
++  $sidebarProjectFilter,
++  $sidebarShowArchived,
++  $sidebarShowAutomated,
++  $sidebarStatusFilter,
++  setSidebarAgentsGrouped,
++  setSidebarGrouping
++} from '@/store/layout'
+ import { $activeGatewayProfile, $profiles, setShowAllProfiles } from '@/store/profile'
+ import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
+ import { $projectTree } from '@/store/projects'
+@@ -225,6 +234,73 @@ describe('ChatSidebar cold-start load failure', () => {
+   })
+ })
+ 
++// #146510: see SidebarPinnedEmptyState.
++describe('ChatSidebar pinned empty state under filters', () => {
++  let previousShowAutomated: boolean
++
++  beforeEach(() => {
++    previousShowAutomated = $sidebarShowAutomated.get()
++    $sidebarShowAutomated.set(true)
++    $sidebarStatusFilter.set([])
++    $sidebarProjectFilter.set([])
++    $sidebarShowArchived.set(false)
++    $pinnedSessionIds.set([])
++    $sessions.set(sessionRows.map(row => ({ ...row, kanban_observed_at: Date.now() / 1000 })))
++    $sessionsLoading.set(false)
++  })
++
++  afterEach(() => {
++    cleanup()
++    $sidebarShowAutomated.set(previousShowAutomated)
++    $sidebarStatusFilter.set([])
++    $sidebarProjectFilter.set([])
++    $sidebarShowArchived.set(false)
++    $pinnedSessionIds.set([])
++    $sessions.set([])
++    $sessionsLoading.set(true)
++  })
++
++  it('names the filter when it hides every pin', () => {
++    $sessions.set([
++      { ...sessionRows[0], kanban_observed_at: Date.now() / 1000, pinned: true },
++      { ...sessionRows[1], kanban_observed_at: Date.now() / 1000 }
++    ])
++    $pinnedSessionIds.set(['tile-one'])
++    $sidebarStatusFilter.set(['working'])
++
++    renderSidebar('/', 'chat')
++
++    expect(screen.queryByText('Tile one')).toBeNull()
++    expect(screen.queryByText('Shift-click a chat to pin')).toBeNull()
++    // Pinned and Sessions both report the filter.
++    expect(screen.getAllByText('No sessions match these filters')).toHaveLength(2)
++  })
++
++  it('keeps the pin hint when nothing is pinned and no filter is on', () => {
++    renderSidebar('/', 'chat')
++
++    expect(screen.getByText('Shift-click a chat to pin')).toBeTruthy()
++    expect(screen.queryByText('No sessions match these filters')).toBeNull()
++  })
++
++  it('keeps the pin hint when the only filter is a project id the tree does not resolve', () => {
++    $sidebarProjectFilter.set(['/repos/gone'])
++
++    renderSidebar('/', 'chat')
++
++    expect(screen.getByText('Shift-click a chat to pin')).toBeTruthy()
++  })
++
++  it('drops the pin hint in the Archived view when Pinned is empty', () => {
++    $sidebarShowArchived.set(true)
++
++    renderSidebar('/', 'chat')
++
++    expect(screen.queryByText('Shift-click a chat to pin')).toBeNull()
++    expect(screen.getAllByText('No sessions match these filters')).toHaveLength(2)
++  })
++})
++
+ // Entering a project is a scope switch: the conversation main is showing keeps
+ // its workspace, so Files/Review and the composer's Git context can't drift to
+ // the project while the transcript stays on the old chat (#72772).
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index efe2cacc10c..995ffa06b73 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -1719,7 +1719,7 @@ export function ChatSidebar({
+                 card={cardRows}
+                 contentClassName="flex flex-col gap-px rounded-lg pb-2 pt-1"
+                 dndSensors={dndSensors}
+-                emptyState={<SidebarPinnedEmptyState />}
++                emptyState={<SidebarPinnedEmptyState archived={showArchived} filtered={filtersNarrow} />}
+                 label={s.pinned}
+                 onArchiveSession={onArchiveSession}
+                 onBranchSession={onBranchSession}
+diff --git a/apps/desktop/src/app/chat/sidebar/section-states.tsx b/apps/desktop/src/app/chat/sidebar/section-states.tsx
+index 3d1058034be..62ba259c668 100644
+--- a/apps/desktop/src/app/chat/sidebar/section-states.tsx
++++ b/apps/desktop/src/app/chat/sidebar/section-states.tsx
+@@ -67,7 +67,13 @@ export function SidebarBlankState({ onNewProject }: { onNewProject: () => void }
+   )
+ }
+ 
+-export function SidebarPinnedEmptyState() {
++// Pinned resolves against the filtered list, so a filter can hide every pin.
++// Say so, like the Sessions section does: the shift-click hint reads as "you
++// have no pins" to someone whose pins are all still there (#146510).
++// `filtered` is whether a filter actually narrows the list, not whether any
++// selection is persisted: a stale project id narrows nothing. `archived` is the
++// Archived view, which swaps the pool Pinned resolves from.
++export function SidebarPinnedEmptyState({ archived, filtered }: { archived: boolean; filtered: boolean }) {
+   const { t } = useI18n()
+ 
+   return (
+@@ -75,7 +81,7 @@ export function SidebarPinnedEmptyState() {
+       <span className="grid w-3.5 shrink-0 place-items-center text-(--ui-text-quaternary)">
+         <Codicon name="pin" size="0.75rem" />
+       </span>
+-      <span>{t.sidebar.shiftClickHint}</span>
++      <span>{filtered || archived ? t.sidebar.noFilterMatches : t.sidebar.shiftClickHint}</span>
+     </div>
+   )
+ }
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-recovery.test.tsx b/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-recovery.test.tsx
+new file mode 100644
+index 00000000000..8541bdeeb0f
+--- /dev/null
++++ b/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-recovery.test.tsx
+@@ -0,0 +1,147 @@
++import { act, cleanup, render, waitFor } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { $backgroundStatusBySession, reconcileBackgroundProcesses } from '@/store/composer-status'
++
++import {
++  registerAgentTerminalWriter,
++  syncAgentTerminalSnapshot,
++  writeAgentTerminalChunk
++} from './agent-terminal-stream'
++import { $activeTerminalId, $terminals, closeTerminal, openAgentTerminal } from './terminals'
++import { useAgentTerminal } from './use-agent-terminal'
++import { TerminalWorkspace } from './workspace'
++
++const screens = vi.hoisted(() => new Map<string, string[]>())
++
++// Keep the store, workspace, attachment hook and stream real; only the xterm
++// renderer and instance chrome are replaced so each tab's writes are observable.
++vi.mock('@xterm/xterm', () => ({
++  Terminal: class {
++    readonly rows = 24
++    readonly unicode = { activeVersion: '6' }
++    readonly writes: string[] = []
++    options: Record<string, unknown>
++
++    constructor(options: Record<string, unknown>) {
++      this.options = { ...options }
++    }
++
++    open(host: HTMLElement) {
++      screens.set(host.dataset.procId!, this.writes)
++    }
++
++    write(chunk: string) {
++      this.writes.push(chunk)
++    }
++
++    attachCustomKeyEventHandler = vi.fn()
++    clearSelection = vi.fn()
++    dispose = vi.fn()
++    focus = vi.fn()
++    getSelection = vi.fn(() => '')
++    loadAddon = vi.fn()
++    onSelectionChange = vi.fn(() => ({ dispose: vi.fn() }))
++    refresh = vi.fn()
++    selectAll = vi.fn()
++  }
++}))
++
++vi.mock('@xterm/addon-fit', () => ({
++  FitAddon: class {
++    fit = vi.fn()
++  }
++}))
++
++vi.mock('@xterm/addon-unicode11', () => ({ Unicode11Addon: class {} }))
++vi.mock('@xterm/addon-web-links', () => ({ WebLinksAddon: class {} }))
++vi.mock('@xterm/addon-webgl', () => ({
++  WebglAddon: class {
++    clearTextureAtlas = vi.fn()
++    dispose = vi.fn()
++    onContextLoss = vi.fn()
++  }
++}))
++
++vi.mock('@/themes/context', () => ({
++  useTheme: () => ({ renderedMode: 'dark', theme: { terminal: {} }, themeName: 'test' })
++}))
++
++vi.mock('./instance', () => ({
++  AgentTerminalInstance: (props: { active: boolean; id: string; procId: string }) => {
++    const { hostRef } = useAgentTerminal(props)
++
++    return <div data-proc-id={props.procId} ref={hostRef} />
++  },
++  TerminalInstance: () => null
++}))
++
++afterEach(() => {
++  cleanup()
++  $terminals.set([])
++  $activeTerminalId.set(null)
++  $backgroundStatusBySession.set({})
++  screens.clear()
++  Reflect.deleteProperty(document, 'fonts')
++})
++
++describe('quiet agent terminal recovery', () => {
++  it('reopens an evicted tab from an unchanged registry exactly once while other writers remain mounted', async () => {
++    Object.defineProperty(document, 'fonts', {
++      configurable: true,
++      value: { load: vi.fn().mockResolvedValue([]) }
++    })
++    const procs = Array.from({ length: 26 }, (_, index) => ({
++      command: `quiet-command-${index}`,
++      output_tail: `snapshot-marker-${index}\r\n`,
++      session_id: `quiet-${index}`,
++      status: 'running'
++    }))
++    reconcileBackgroundProcesses('other-session', procs.slice(0, 25))
++    reconcileBackgroundProcesses('target-session', procs.slice(25))
++    const background = $backgroundStatusBySession.get()
++    const target = procs[25]!
++    const expected = `$ ${target.command}\r\n${target.output_tail}`
++
++    render(<TerminalWorkspace onAddSelectionToChat={() => {}} />)
++    await waitFor(() => expect(screens.size).toBe(26))
++    const original = screens.get(target.session_id)!
++    expect(original.join('')).toBe(expected)
++    const neighbor = screens.get(procs[24]!.session_id)!
++    const neighborOutput = neighbor.join('')
++    const tab = $terminals.get().find(entry => entry.procId === target.session_id)!
++
++    act(() => closeTerminal(tab.id))
++    expect($terminals.get()).toHaveLength(25)
++    // The remaining mounted writers already exceed the cache's 24-process
++    // budget: closing must really discard this tab, not grant a cache exemption.
++    const replay = vi.fn()
++    const stopProbe = registerAgentTerminalWriter(target.session_id, replay)
++    expect(replay).not.toHaveBeenCalled()
++    stopProbe()
++
++    act(() => openAgentTerminal(target.session_id, target.command))
++    await waitFor(() => expect(screens.get(target.session_id)).not.toBe(original))
++    const recovered = screens.get(target.session_id)!
++    expect($backgroundStatusBySession.get()).toBe(background)
++    expect(recovered.join('')).toBe(expected)
++    expect(neighbor.join('')).toBe(neighborOutput)
++    // A delayed cleanup from the old attachment must not detach its replacement.
++    stopProbe()
++
++    // Both an unchanged registry snapshot and a later snapshot containing live
++    // bytes must respect the restored fence rather than duplicate either source.
++    syncAgentTerminalSnapshot(target.session_id, target.output_tail)
++    const live = 'live-after-reopen\r\n'
++    writeAgentTerminalChunk(target.session_id, live)
++    syncAgentTerminalSnapshot(target.session_id, target.output_tail + live)
++    expect(recovered.join('')).toBe(expected + live)
++    expect(neighbor.join('')).toBe(neighborOutput)
++
++    act(() => closeTerminal($activeTerminalId.get()!))
++    const coldReplay = vi.fn()
++    const stopColdProbe = registerAgentTerminalWriter(target.session_id, coldReplay)
++    expect(coldReplay).not.toHaveBeenCalled()
++    stopColdProbe()
++  })
++})
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-stream.bound.test.ts b/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-stream.bound.test.ts
+index 067d1b86a59..ddf1c4f1d55 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-stream.bound.test.ts
++++ b/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-stream.bound.test.ts
+@@ -26,6 +26,23 @@ function runFinishedProc(id: string, chunks = 6): void {
+ }
+ 
+ describe('agent terminal retention is bounded', () => {
++  it('enforces the cold budget when mounted writers close without another output event', () => {
++    const stops = Array.from({ length: 40 }, (_, index) => registerAgentTerminalWriter(`closed-${index}`, () => {}))
++
++    for (let index = 0; index < stops.length; index++) {
++      runFinishedProc(`closed-${index}`)
++    }
++
++    for (const stop of stops) {
++      stop()
++    }
++
++    const retained = stops.map((_, index) => replay(`closed-${index}`))
++
++    expect(retained.reduce((chars, output) => chars + output.length, 0)).toBeLessThanOrEqual(2_000_000)
++    expect(retained.at(-1)).toBe(CHUNK.repeat(4))
++  })
++
+   it('a finished process does not pin its backlog for the life of the renderer', () => {
+     // 200 background commands, none mounted — the shape that grew to ~93 MB.
+     for (let i = 0; i < 200; i++) {
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-stream.ts b/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-stream.ts
+index c9b778f6cfb..82fa6fdfe28 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-stream.ts
++++ b/apps/desktop/src/app/right-sidebar/terminal/agent-terminal-stream.ts
+@@ -81,6 +81,7 @@ export function registerAgentTerminalWriter(procId: string, write: Writer): () =
+   return () => {
+     if (writers.get(procId) === write) {
+       writers.delete(procId)
++      evictColdProcs()
+     }
+   }
+ }
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/terminals.test.ts b/apps/desktop/src/app/right-sidebar/terminal/terminals.test.ts
+index 5ca4ce4b5f1..c1e97139baf 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/terminals.test.ts
++++ b/apps/desktop/src/app/right-sidebar/terminal/terminals.test.ts
+@@ -62,7 +62,9 @@ describe('terminal store persistence', () => {
+     const { $terminals, ensureAgentTerminal, updateTerminalReviveBuffer } = await loadTerminalStore()
+ 
+     const agentId = ensureAgentTerminal('proc-1', 'background task')!
++    const before = $terminals.get()
+     updateTerminalReviveBuffer(agentId, 'should be ignored')
++    expect($terminals.get()).toBe(before)
+ 
+     expect($terminals.get().find(term => term.id === agentId)?.reviveBuffer).toBeUndefined()
+     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
+@@ -81,6 +83,44 @@ describe('terminal store persistence', () => {
+     expect(stored).toBe(huge.slice(-stored.length))
+   })
+ 
++  it('does not republish an identical retained tail, including changes outside the cap', async () => {
++    const { $terminals, createTerminal, updateTerminalReviveBuffer } = await loadTerminalStore()
++    const id = createTerminal('/repo')
++    const output = 'ANSI \u001b[32m界 café\u001b[0m\r\n'.repeat(4_000)
++    updateTerminalReviveBuffer(id, output)
++    const before = $terminals.get()
++    const persisted = window.localStorage.getItem(STORAGE_KEY)
++
++    updateTerminalReviveBuffer(id, output)
++    expect($terminals.get()).toBe(before)
++    updateTerminalReviveBuffer(id, `discarded prefix\r\n${output}`)
++    expect($terminals.get()).toBe(before)
++    expect(window.localStorage.getItem(STORAGE_KEY)).toBe(persisted)
++
++    updateTerminalReviveBuffer(id, 'new output')
++    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0].reviveBuffer).toBe('new output')
++  })
++
++  it('ignores late snapshots after persistence negotiation or terminal closure', async () => {
++    const { $terminals, closeTerminal, createTerminal, markTerminalPersistent, updateTerminalReviveBuffer } =
++      await loadTerminalStore()
++
++    const id = createTerminal('/repo')
++    updateTerminalReviveBuffer(id, 'renderer history')
++    markTerminalPersistent(id)
++    const persistent = $terminals.get()
++    const saved = window.localStorage.getItem(STORAGE_KEY)
++    updateTerminalReviveBuffer(id, 'late local snapshot')
++    expect($terminals.get()).toBe(persistent)
++    expect(window.localStorage.getItem(STORAGE_KEY)).toBe(saved)
++
++    closeTerminal(id)
++    const closed = $terminals.get()
++    updateTerminalReviveBuffer(id, 'late closed snapshot')
++    expect($terminals.get()).toBe(closed)
++    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
++  })
++
+   it('clears remembered tabs when all terminals close', async () => {
+     const { closeAllTerminals, createTerminal } = await loadTerminalStore()
+ 
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/terminals.ts b/apps/desktop/src/app/right-sidebar/terminal/terminals.ts
+index 65b2c12c1a0..854240a3a84 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/terminals.ts
++++ b/apps/desktop/src/app/right-sidebar/terminal/terminals.ts
+@@ -472,12 +472,26 @@ export function markTerminalPersistent(id: string): void {
+ }
+ 
+ export function updateTerminalReviveBuffer(id: string, reviveBuffer: string): void {
++  const terminals = $terminals.get()
++  const index = terminals.findIndex(term => term.id === id)
++  const term = terminals[index]
++
++  if (!term || term.kind !== 'user' || term.persistent) {
++    return
++  }
++
+   const capped =
+     reviveBuffer.length > MAX_REVIVE_BUFFER_CHARS ? reviveBuffer.slice(-MAX_REVIVE_BUFFER_CHARS) : reviveBuffer
+ 
+-  $terminals.set(
+-    $terminals.get().map(term => (term.id === id && term.kind === 'user' && !term.persistent ? { ...term, reviveBuffer: capped } : term))
+-  )
++  // Publishing also serializes every user tab and updates workspace subscribers.
++  // Stable TUI screens can produce identical snapshots for every capture.
++  if (term.reviveBuffer === capped) {
++    return
++  }
++
++  const next = terminals.slice()
++  next[index] = { ...term, reviveBuffer: capped }
++  $terminals.set(next)
+ }
+ 
+ /** Record the shell's latest working directory for a tab so the next launch can
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/use-agent-terminal.ts b/apps/desktop/src/app/right-sidebar/terminal/use-agent-terminal.ts
+index 45ab443e875..4a0ac2fbed2 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/use-agent-terminal.ts
++++ b/apps/desktop/src/app/right-sidebar/terminal/use-agent-terminal.ts
+@@ -6,9 +6,14 @@ import { useEffect, useRef } from 'react'
+ 
+ import { writeClipboardText } from '@/lib/clipboard'
+ import { triggerHaptic } from '@/lib/haptics'
++import { $backgroundStatusBySession } from '@/store/composer-status'
+ import { useTheme } from '@/themes/context'
+ 
+-import { registerAgentTerminalWriter } from './agent-terminal-stream'
++import {
++  registerAgentTerminalWriter,
++  seedAgentTerminalCommand,
++  syncAgentTerminalSnapshot
++} from './agent-terminal-stream'
+ import { makeTerminalReader, registerTerminalReader } from './buffer'
+ import { mirrorSelection, terminalClipboardIntent } from './clipboard'
+ import { terminalLinkHandler, terminalWebLinksAddon } from './links'
+@@ -174,6 +179,17 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id:
+ 
+       // Stream live output straight into the terminal (replays backlog on attach).
+       unregister = registerAgentTerminalWriter(procId, chunk => term.write(chunk))
++      // Closing can evict the backlog while the registry stays unchanged. Pin
++      // the writer before recovering its snapshot so retention cannot evict it.
++      for (const list of Object.values($backgroundStatusBySession.get())) {
++        const item = list.find(item => item.id === procId)
++
++        if (item) {
++          seedAgentTerminalCommand(procId, item.title)
++          syncAgentTerminalSnapshot(procId, item.output ?? '')
++          break
++        }
++      }
+       unregisterReader = registerTerminalReader(id, makeTerminalReader(term))
+     }
+ 
+diff --git a/apps/desktop/src/components/assistant-ui/thread/transcript-window.tsx b/apps/desktop/src/components/assistant-ui/thread/transcript-window.tsx
+index f20329abb16..215d9a3980f 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/transcript-window.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/transcript-window.tsx
+@@ -11,7 +11,7 @@ export interface TranscriptWindowValue {
+   returnToLatest?: () => void
+   isHistorical?: boolean
+   newerAvailable?: boolean
+-  /** Exactly the selected bounded source slice, not the full live store. */
++  /** Selected historical page; live navigation reads the session store. */
+   currentMessages?: readonly ChatMessage[]
+   /** Pull a page, capturing the reader immediately before the prepend commits.
+    * A remote page resolves false on failure; callers can retry without growing
+diff --git a/apps/desktop/src/components/ui/pane-tab.test.tsx b/apps/desktop/src/components/ui/pane-tab.test.tsx
+index f76ed4142b2..7b8428cc772 100644
+--- a/apps/desktop/src/components/ui/pane-tab.test.tsx
++++ b/apps/desktop/src/components/ui/pane-tab.test.tsx
+@@ -1,6 +1,7 @@
+ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
++import { ContextMenu, ContextMenuTrigger, HERMES_CONTEXT_MENU_TRIGGER_ATTR } from './context-menu'
+ import { PaneTab, PaneTabLabel } from './pane-tab'
+ 
+ afterEach(cleanup)
+@@ -135,3 +136,24 @@ describe('PaneTab hover close button', () => {
+     expect(screen.queryByRole('button', { name: 'Close' })).toBeNull()
+   })
+ })
++
++describe('PaneTab under a context-menu trigger', () => {
++  // The trigger's injected data-slot used to replace ours, so the close-width and
++  // label-mask rules keyed on [data-slot='pane-tab'] stopped matching session tabs.
++  it('keeps its own data-slot and the menu marker', () => {
++    render(
++      <ContextMenu>
++        <ContextMenuTrigger asChild>
++          <PaneTab onClose={vi.fn()}>
++            <PaneTabLabel>tab</PaneTabLabel>
++          </PaneTab>
++        </ContextMenuTrigger>
++      </ContextMenu>
++    )
++
++    const tab = screen.getByText('tab').closest('[data-closeable]')
++
++    expect(tab?.getAttribute('data-slot')).toBe('pane-tab')
++    expect(tab?.hasAttribute(HERMES_CONTEXT_MENU_TRIGGER_ATTR)).toBe(true)
++  })
++})
+diff --git a/apps/desktop/src/components/ui/pane-tab.tsx b/apps/desktop/src/components/ui/pane-tab.tsx
+index d39d8a5ffa1..0a68c327833 100644
+--- a/apps/desktop/src/components/ui/pane-tab.tsx
++++ b/apps/desktop/src/components/ui/pane-tab.tsx
+@@ -112,7 +112,6 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
+       data-active={active}
+       data-closeable={(onClose && !vertical) || undefined}
+       data-selected={selected || undefined}
+-      data-slot="pane-tab"
+       data-vertical={vertical || undefined}
+       onClickCapture={event => {
+         // Sites whose tab activates on the label's own onClick (the preview
+@@ -151,6 +150,7 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
+       }}
+       ref={ref}
+       {...props}
++      data-slot="pane-tab"
+     >
+       <div
+         className={cn('pane-tab-content flex h-full min-w-0 max-w-full flex-1 items-center', vertical && 'contents')}
+diff --git a/apps/desktop/src/hooks/use-theme-epoch.test.tsx b/apps/desktop/src/hooks/use-theme-epoch.test.tsx
+new file mode 100644
+index 00000000000..c5be27c45f0
+--- /dev/null
++++ b/apps/desktop/src/hooks/use-theme-epoch.test.tsx
+@@ -0,0 +1,218 @@
++import { act, cleanup, render } from '@testing-library/react'
++import { useEffect } from 'react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { $accentOverride } from '@/themes/accent-override'
++import { __resetBackendSkinSync, ingestBackendSkin } from '@/themes/backend-sync'
++import { $chatFontFamily } from '@/themes/chat-font'
++import { ThemeProvider, useTheme } from '@/themes/context'
++
++import { onThemeRepaint, useThemeEpoch } from './use-theme-epoch'
++
++const root = window.document.documentElement
++const originalStyle = root.style.cssText
++const originalClass = root.className
++const disposers: Array<() => void> = []
++
++const flush = async () => {
++  await act(async () => {
++    await Promise.resolve()
++  })
++}
++
++afterEach(async () => {
++  cleanup()
++  disposers.splice(0).forEach(dispose => dispose())
++  $accentOverride.set(null)
++  $chatFontFamily.set('')
++  __resetBackendSkinSync()
++  localStorage.clear()
++  root.style.cssText = originalStyle
++  root.className = originalClass
++  delete root.dataset.hermesMode
++  delete root.dataset.hermesTheme
++  window.document.getElementById('hermes-desktop-custom-css')?.remove()
++  await flush()
++})
++
++describe('theme repaint subscriptions', () => {
++  it('ignores geometry from the first subscription, coalesces real changes, and survives re-subscription', async () => {
++    root.style.setProperty('--theme-primary', '#123456')
++    await flush()
++    const first = vi.fn()
++    const second = vi.fn()
++    const stopFirst = onThemeRepaint(first)
++    const stopSecond = onThemeRepaint(second)
++    disposers.push(stopFirst, stopSecond)
++
++    for (const value of ['10px', '20px', '']) {
++      for (const name of ['--workspace-left', '--workspace-right', '--glass-rail-edge']) {
++        if (value) {
++          root.style.setProperty(name, value)
++        } else {
++          root.style.removeProperty(name)
++        }
++      }
++
++      await flush()
++    }
++
++    expect(first).not.toHaveBeenCalled()
++    expect(second).not.toHaveBeenCalled()
++
++    // Geometry must not hide real style changes in the SAME observer batch.
++    root.style.setProperty('--workspace-left', '30px')
++    root.style.setProperty('--theme-primary', '#654321')
++    root.style.setProperty('--dt-font-sans', 'monospace')
++    await flush()
++    expect(first).toHaveBeenCalledTimes(1)
++    expect(second).toHaveBeenCalledTimes(1)
++
++    stopFirst()
++    root.style.setProperty('--theme-primary', '#456789')
++    await flush()
++    expect(first).toHaveBeenCalledTimes(1)
++    expect(second).toHaveBeenCalledTimes(2)
++    stopSecond()
++    root.style.setProperty('--theme-primary', '#abcdef')
++    await flush()
++    const resumed = vi.fn()
++    disposers.push(onThemeRepaint(resumed))
++    root.style.setProperty('--workspace-right', '45px')
++    await flush()
++    expect(resumed).not.toHaveBeenCalled()
++    root.style.setProperty('--theme-primary', '#fedcba')
++    await flush()
++    expect(resumed).toHaveBeenCalledTimes(1)
++    expect(first).toHaveBeenCalledTimes(1)
++    expect(second).toHaveBeenCalledTimes(2)
++  })
++
++  it('preserves arbitrary inline styles, removals, priority changes, and root theme attributes', async () => {
++    const repaint = vi.fn()
++    disposers.push(onThemeRepaint(repaint))
++
++    const mutations = [
++      () => root.style.setProperty('--author-token', 'rgb(1, 2, 3)'),
++      () => root.style.setProperty('--author-token', 'rgb(1, 2, 3)', 'important'),
++      () => root.style.removeProperty('--author-token'),
++      () => {
++        root.style.fontFamily = 'monospace'
++      },
++      () => root.style.setProperty('--dt-base-size', '18px'),
++      () => root.style.removeProperty('--dt-base-size'),
++      () => root.classList.toggle('dark'),
++      () => {
++        root.dataset.hermesMode = 'dark'
++      },
++      () => {
++        root.dataset.hermesTheme = 'authored'
++      },
++      // applyTheme uses these writes to announce customCSS-only edits too.
++      () => {
++        root.dataset.hermesTheme = 'authored'
++      }
++    ]
++
++    for (const [i, mutate] of mutations.entries()) {
++      mutate()
++      await flush()
++      expect(repaint).toHaveBeenCalledTimes(i + 1)
++    }
++  })
++
++  it('keeps geometry-driven authored CSS observable without changing its consumers', async () => {
++    const style = window.document.createElement('style')
++    style.id = 'hermes-desktop-custom-css'
++    style.textContent = ':root { --author-width: var(--workspace-left); }'
++    window.document.head.append(style)
++    const repaint = vi.fn()
++    disposers.push(onThemeRepaint(repaint))
++    root.style.setProperty('--workspace-left', '37px')
++    await flush()
++    expect(repaint).toHaveBeenCalledOnce()
++    style.remove()
++    root.style.setProperty('--workspace-left', '38px')
++    await flush()
++    expect(repaint).toHaveBeenCalledOnce()
++  })
++
++  it('reads the provider paint after mount, skin/mode/font/accent changes, and same-palette customCSS edits', async () => {
++    let setTheme!: (name: string) => void
++    let setDarkMode!: () => void
++    const paints = vi.fn()
++    let mounts = 0
++    let unmounts = 0
++
++    function Controls() {
++      const theme = useTheme()
++      setTheme = theme.setTheme
++      setDarkMode = () => theme.setMode('dark')
++
++      return null
++    }
++
++    function Consumer() {
++      const epoch = useThemeEpoch()
++      useEffect(() => {
++        mounts += 1
++
++        return () => {
++          unmounts += 1
++        }
++      }, [])
++      useEffect(() => {
++        paints({
++          skin: root.dataset.hermesTheme,
++          mode: root.dataset.hermesMode,
++          primary: root.style.getPropertyValue('--theme-primary'),
++          font: root.style.getPropertyValue('--dt-font-sans'),
++          css: window.document.getElementById('hermes-desktop-custom-css')?.textContent
++        })
++      }, [epoch])
++
++      return null
++    }
++
++    render(
++      <ThemeProvider>
++        <Controls />
++        <Consumer />
++      </ThemeProvider>
++    )
++    await flush()
++    expect(paints).toHaveBeenLastCalledWith(
++      expect.objectContaining({ skin: root.dataset.hermesTheme, mode: root.dataset.hermesMode })
++    )
++
++    await act(async () => setTheme('everforest'))
++    await flush()
++    expect(paints).toHaveBeenLastCalledWith(expect.objectContaining({ skin: 'everforest' }))
++    await act(async () => setDarkMode())
++    await flush()
++    expect(paints).toHaveBeenLastCalledWith(expect.objectContaining({ mode: 'dark' }))
++    await act(async () => $chatFontFamily.set('Theme Regression Font'))
++    await flush()
++    expect(paints).toHaveBeenLastCalledWith(
++      expect.objectContaining({ font: expect.stringContaining('Theme Regression Font') })
++    )
++    const beforeAccent = paints.mock.lastCall![0].primary
++    await act(async () => $accentOverride.set('#1234ab'))
++    await flush()
++    expect(paints.mock.lastCall![0].primary).not.toBe(beforeAccent)
++    await act(async () => $accentOverride.set(null))
++
++    const skin = {
++      name: 'epoch-regression',
++      colors: { background: '#000000', ui_text: '#eeeeee', ui_accent: '#ff8000' }
++    }
++
++    await act(async () => ingestBackendSkin({ ...skin, customCSS: 'body { font-weight: 400; }' }, { apply: true }))
++    await flush()
++    await act(async () => ingestBackendSkin({ ...skin, customCSS: 'body { font-weight: 600; }' }, { apply: true }))
++    await flush()
++    expect(paints).toHaveBeenLastCalledWith(expect.objectContaining({ css: 'body { font-weight: 600; }' }))
++    expect(mounts).toBe(1)
++    expect(unmounts).toBe(0)
++  })
++})
+diff --git a/apps/desktop/src/hooks/use-theme-epoch.ts b/apps/desktop/src/hooks/use-theme-epoch.ts
+index 710144ef194..5921aeaa2da 100644
+--- a/apps/desktop/src/hooks/use-theme-epoch.ts
++++ b/apps/desktop/src/hooks/use-theme-epoch.ts
+@@ -10,16 +10,58 @@ const ATTRS = ['class', 'style', 'data-hermes-mode', 'data-hermes-theme']
+ const listeners = new Set<() => void>()
+ let observer: MutationObserver | null = null
+ 
++// These root vars position chrome, not palette/font tokens. Keep every other
++// inline declaration (including arbitrary skin vars and !important) observable.
++function themeStyle(style: CSSStyleDeclaration): string {
++  let snapshot = ''
++
++  for (let i = 0; i < style.length; i += 1) {
++    const name = style.item(i)
++
++    if (name === '--workspace-left' || name === '--workspace-right' || name === '--glass-rail-edge') {
++      continue
++    }
++
++    snapshot += `${name}:${style.getPropertyValue(name)}${style.getPropertyPriority(name) ? ' !important' : ''};`
++  }
++
++  return snapshot
++}
++
+ /** Subscribe to theme repaints imperatively (ref/canvas, no re-render). */
+ export function onThemeRepaint(fn: () => void): () => void {
+   if (!observer && typeof document !== 'undefined') {
+-    observer = new MutationObserver(() => listeners.forEach(l => l()))
+-    observer.observe(document.documentElement, { attributeFilter: ATTRS, attributes: true })
++    const root = document.documentElement
++    let previousStyle = themeStyle(root.style)
++    observer = new MutationObserver(records => {
++      const nextStyle = themeStyle(root.style)
++      // applyTheme also writes these attributes when only customCSS changes.
++      // Even same-value attribute writes must still publish that repaint.
++      // Authored CSS can derive colors/fonts from geometry variables too.
++      const customCSS = document.getElementById('hermes-desktop-custom-css')?.textContent
++
++      const repaint =
++        Boolean(customCSS) || nextStyle !== previousStyle || records.some(record => record.attributeName !== 'style')
++
++      previousStyle = nextStyle
++
++      if (repaint) {
++        listeners.forEach(l => l())
++      }
++    })
++    observer.observe(root, { attributeFilter: ATTRS, attributes: true })
+   }
+ 
+   listeners.add(fn)
+ 
+-  return () => void listeners.delete(fn)
++  return () => {
++    listeners.delete(fn)
++
++    if (listeners.size === 0) {
++      observer?.disconnect()
++      observer = null
++    }
++  }
+ }
+ 
+ /** A counter that ticks on every theme repaint — depend on it to re-resolve colors. */
+diff --git a/apps/desktop/src/i18n/backend-packs.test.ts b/apps/desktop/src/i18n/backend-packs.test.ts
+index 294d34238c8..36c1853acb4 100644
+--- a/apps/desktop/src/i18n/backend-packs.test.ts
++++ b/apps/desktop/src/i18n/backend-packs.test.ts
+@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { type BackendLocaleRequest, syncBackendLocalePacks } from './backend-packs'
+ import { TRANSLATIONS } from './catalog'
+-import { languageOptions } from './languages'
++import { isSupportedLocaleValue, languageOptions } from './languages'
+ import { isRegisteredLocale, registerAppLocale, resetAppLocaleRegistry, resolveTranslations } from './registry'
+ 
+ afterEach(() => {
+@@ -65,6 +65,53 @@ describe('syncBackendLocalePacks', () => {
+     expect(isRegisteredLocale('uk')).toBe(true)
+   })
+ 
++  it('leaves out a language the backend has no Desktop strings for, and keeps rows from older backends', async () => {
++    const request = backend(
++      {
++        languages: [
++          { id: 'ko', endonym: '한국어', rtl: false, source: 'bundled', surfaces: ['core', 'tui'] },
++          { id: 'it', endonym: 'Italiano', rtl: false, source: 'plugin:hermes-lang-it', surfaces: ['core', 'desktop'] },
++          { id: 'ja', endonym: '日本語', rtl: false, source: 'bundled', surfaces: ['core', 'tui'] },
++          { id: 'uk', endonym: 'Українська' }
++        ]
++      },
++      {}
++    )
++
++    await syncBackendLocalePacks(request, 'ko')
++
++    // Picking ko here would only paint English: it is not offered and not renderable.
++    expect(isRegisteredLocale('ko')).toBe(false)
++    expect(isSupportedLocaleValue('ko')).toBe(false)
++    expect(languageOptions().map(option => option.id)).not.toContain('ko')
++    // A pack with Desktop strings, a Desktop-bundled language, and a row without `surfaces` stay.
++    expect(isRegisteredLocale('it')).toBe(true)
++    expect(isRegisteredLocale('ja')).toBe(true)
++    expect(isRegisteredLocale('uk')).toBe(true)
++  })
++
++  it('offers a language once its Desktop pack arrives', async () => {
++    const request = backend(
++      {
++        languages: [
++          {
++            id: 'ko',
++            endonym: '한국어',
++            rtl: false,
++            source: 'plugin:hermes-lang-ko',
++            surfaces: ['core', 'tui', 'desktop']
++          }
++        ]
++      },
++      { ko: { 'settings.appearance.modelPricingTitle': '모델 가격' } }
++    )
++
++    await syncBackendLocalePacks(request, 'ko')
++
++    expect(languageOptions().find(option => option.id === 'ko')).toMatchObject({ endonym: '한국어', source: 'backend' })
++    expect(resolveTranslations('ko').settings.appearance.modelPricingTitle).toBe('모델 가격')
++  })
++
+   it('is silent on a backend that predates the i18n methods and leaves the registry alone', async () => {
+     const debug = vi.spyOn(console, 'debug').mockImplementation(() => {})
+     registerAppLocale('pl', { endonym: 'Polski' }, 'backend')
+diff --git a/apps/desktop/src/i18n/backend-packs.ts b/apps/desktop/src/i18n/backend-packs.ts
+index cbaa7a34851..ed48f077f44 100644
+--- a/apps/desktop/src/i18n/backend-packs.ts
++++ b/apps/desktop/src/i18n/backend-packs.ts
+@@ -11,10 +11,12 @@
+  * leaves whatever the registry already holds (never blank the UI over i18n).
+  */
+ 
++import type { LocaleSurface } from '@hermes/shared'
+ import { isRecord } from '@hermes/shared/i18n'
+ 
+ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+ 
++import { isBundledLocale } from './catalog'
+ import { type AppLocaleRegistration, normalizeLocaleId, replaceAppLocaleSource } from './registry'
+ 
+ export type BackendLocaleRequest = <T>(method: string, params: Record<string, unknown>) => Promise<T>
+@@ -25,6 +27,16 @@ export interface BackendLanguageOption {
+   endonym?: string
+   rtl?: boolean
+   source?: string
++  /** Surfaces some backend layer has strings for. Absent on older backends. */
++  surfaces?: LocaleSurface[]
++}
++
++/** The backend lists every language it translates for any surface (core,
++ *  TUI). A language the Desktop does not bundle renders in English unless the
++ *  backend has Desktop strings for it, so only those enter the picker. Rows
++ *  without `surfaces` (older backends) are kept. */
++function hasDesktopStrings(id: string, row: BackendLanguageOption): boolean {
++  return isBundledLocale(id) || !Array.isArray(row.surfaces) || row.surfaces.includes(DESKTOP_SURFACE)
+ }
+ 
+ /** `i18n.catalog` reply: the pack + overlay layer for one surface, flat. */
+@@ -104,7 +116,7 @@ export async function syncBackendLocalePacks(
+   for (const row of languageRows(languages)) {
+     const id = normalizeLocaleId(row.id)
+ 
+-    if (id) {
++    if (id && hasDesktopStrings(id, row)) {
+       registrations.set(id, {
+         id,
+         endonym: typeof row.endonym === 'string' ? row.endonym : undefined,
+diff --git a/apps/desktop/src/i18n/context.tsx b/apps/desktop/src/i18n/context.tsx
+index 8d287a2038b..87d70663ffb 100644
+--- a/apps/desktop/src/i18n/context.tsx
++++ b/apps/desktop/src/i18n/context.tsx
+@@ -194,11 +194,12 @@ export function I18nProvider({
+           }
+ 
+           // Keep inference unsaved so OS language changes apply on the next boot
+-          // until the user explicitly picks a language.
++          // until the user explicitly picks a language. The saved ask is checked
++          // again after the probe: its pack may have arrived in the meantime.
+           const machineProfile = await window.hermesDesktop?.getMachineProfile?.().catch(() => null)
+ 
+           if (!cancelled && !userLocaleRef.current) {
+-            setLocaleState(resolveInitialLocale(undefined, machineProfile?.locale))
++            setLocaleState(resolveInitialLocale(requestedRef.current, machineProfile?.locale))
+           }
+         })
+         .catch(error => {
+diff --git a/apps/desktop/src/i18n/profile-locale.test.tsx b/apps/desktop/src/i18n/profile-locale.test.tsx
+index ef09bea74af..7504f79aa6b 100644
+--- a/apps/desktop/src/i18n/profile-locale.test.tsx
++++ b/apps/desktop/src/i18n/profile-locale.test.tsx
+@@ -4,11 +4,14 @@ import { afterEach, expect, it, vi } from 'vitest'
+ import { setApiRequestConnection } from '@/api/client'
+ import type { HermesApiRequest } from '@/global'
+ import type { HermesConfigRecord } from '@/hermes'
++import { $gateway } from '@/store/gateway'
+ import { $activeGatewayProfile } from '@/store/profile'
+-import { $connection } from '@/store/session'
++import { $connection, $gatewayState } from '@/store/session'
+ 
+ import { useI18n } from './context'
+ import { ProfileI18nProvider as I18nProvider } from './profile-provider'
++import { resetAppLocaleRegistry } from './registry'
++import { $requestedLocale } from './runtime'
+ 
+ function Probe() {
+   const { locale, setLocale, saveError, isSavingLocale } = useI18n()
+@@ -31,6 +34,10 @@ function route(profile: string, connectionId: string | null = null) {
+ 
+ afterEach(() => {
+   cleanup()
++  $gateway.set(null)
++  $gatewayState.set('idle')
++  resetAppLocaleRegistry()
++  $requestedLocale.set(null)
+   route('default')
+   Reflect.deleteProperty(window, 'hermesDesktop')
+   vi.restoreAllMocks()
+@@ -145,3 +152,99 @@ it('isolates stale reads and failed saves when the same profile moves between co
+   act(() => $connection.set({ baseUrl: 'https://second.example' } as never))
+   await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ar'))
+ })
++
++// A backend whose hermes-lang-ko pack carries Desktop strings.
++function koPackRequest() {
++  return vi.fn(async (method: string) =>
++    method === 'i18n.languages'
++      ? {
++          languages: [
++            {
++              id: 'ko',
++              endonym: '한국어',
++              rtl: false,
++              source: 'plugin:hermes-lang-ko',
++              surfaces: ['core', 'tui', 'desktop']
++            }
++          ]
++        }
++      : { lang: 'ko', surface: 'desktop', messages: { 'common.save': '저장' } }
++  )
++}
++
++// A saved `display.language: ko` with an OS-language probe the test resolves.
++function savedKoWithDeferredProbe() {
++  let resolveProfile: (profile: { locale: string }) => void = () => undefined
++
++  const machineProfile = new Promise<{ locale: string }>(resolve => {
++    resolveProfile = resolve
++  })
++
++  window.hermesDesktop = {
++    api: vi.fn(async () => ({ display: { language: 'ko' } })),
++    getMachineProfile: vi.fn(() => machineProfile)
++  } as never
++
++  return async (locale: string) => {
++    await act(async () => {
++      resolveProfile({ locale })
++      await machineProfile
++    })
++    await act(async () => undefined)
++  }
++}
++
++function mountWithOpenSocket() {
++  act(() => $gatewayState.set('open'))
++  render(
++    <I18nProvider>
++      <Probe />
++    </I18nProvider>
++  )
++}
++
++// Boot reports the socket `open` before the client is published in `$gateway`.
++// The backend-pack sync must still run once the client arrives, or a language
++// only a pack renders (ko via hermes-lang-ko) never leaves English.
++it('pulls the backend language pack once the gateway client is published after the socket opened', async () => {
++  window.hermesDesktop = { api: vi.fn(async () => ({ display: { language: 'ko' } })) } as never
++  const request = koPackRequest()
++
++  mountWithOpenSocket()
++  await waitFor(() => expect(window.hermesDesktop.api).toHaveBeenCalled())
++  expect(request).not.toHaveBeenCalled()
++
++  act(() => $gateway.set({ request } as never))
++  await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ko'))
++  expect(request).toHaveBeenCalledWith('i18n.catalog', { lang: 'ko', surface: 'desktop' })
++})
++
++// The OS-language probe can finish after the pack sync promoted the saved
++// language; the probe's answer must not replace it.
++it('keeps a pack-rendered saved language when the OS-language probe resolves after the pack', async () => {
++  const resolveProbe = savedKoWithDeferredProbe()
++
++  mountWithOpenSocket()
++  await waitFor(() => expect(window.hermesDesktop.getMachineProfile).toHaveBeenCalled())
++
++  act(() => $gateway.set({ request: koPackRequest() } as never))
++  await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ko'))
++
++  await resolveProbe('en-US')
++  expect(screen.getByTestId('locale').textContent).toBe('ko')
++})
++
++// The other order: the OS guess applies first, then the pack promotes the
++// saved language.
++it('promotes a saved pack language that arrives after the OS-language probe', async () => {
++  const resolveProbe = savedKoWithDeferredProbe()
++
++  mountWithOpenSocket()
++  await waitFor(() => expect(window.hermesDesktop.getMachineProfile).toHaveBeenCalled())
++
++  await resolveProbe('en-US')
++  expect(screen.getByTestId('locale').textContent).toBe('en')
++
++  act(() => $gateway.set({ request: koPackRequest() } as never))
++  await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ko'))
++})
+diff --git a/apps/desktop/src/i18n/profile-provider.tsx b/apps/desktop/src/i18n/profile-provider.tsx
+index 68cf45e1dd0..21fbc0fa272 100644
+--- a/apps/desktop/src/i18n/profile-provider.tsx
++++ b/apps/desktop/src/i18n/profile-provider.tsx
+@@ -33,12 +33,15 @@ export function ProfileI18nProvider({ children }: { children: ReactNode }) {
+ /**
+  * Mirror the active backend's language packs into the app-locale registry:
+  * `i18n.languages` for the switcher, `i18n.catalog {surface:'desktop'}` for the
+- * language `display.language` asks for. Re-syncs when the socket comes up,
+- * when the requested language changes, and on a profile/connection switch
+- * (whose first act is dropping the previous backend's layer — a soft
+- * re-home must not leak one profile's strings into the next).
++ * language `display.language` asks for. Re-syncs when the socket comes up or
++ * its client is published (boot reports `open` before `$gateway` is set, so
++ * the client is a dependency, not a one-off read), when the requested
++ * language changes, and on a profile/connection switch (whose first act is
++ * dropping the previous backend's layer — a soft re-home must not leak one
++ * profile's strings into the next).
+  */
+ function useBackendLocalePacks(scopeKey: string): void {
++  const gateway = useStore($gateway)
+   const gatewayState = useStore($gatewayState)
+   const requested = useStore($requestedLocale)
+   const open = gatewayState === 'open'
+@@ -48,8 +51,6 @@ function useBackendLocalePacks(scopeKey: string): void {
+   }, [scopeKey])
+ 
+   useEffect(() => {
+-    const gateway = $gateway.get()
+-
+     if (!open || !gateway) {
+       return
+     }
+@@ -65,5 +66,5 @@ function useBackendLocalePacks(scopeKey: string): void {
+     return () => {
+       current = false
+     }
+-  }, [open, requested, scopeKey])
++  }, [gateway, open, requested, scopeKey])
+ }
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 37944633f27..e2a98414283 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -52,14 +52,26 @@ describe('showsRunningArc', () => {
+     expect(showsRunningArc('needs-input')).toBe(false)
+   })
+ 
++  it('keeps the arc while subagents or background processes outlive the turn', () => {
++    expect(showsRunningArc('background')).toBe(true)
++  })
++
+   it('leaves a session that is not running unmarked', () => {
+-    expect(showsRunningArc('background')).toBe(false)
+     expect(showsRunningArc('idle')).toBe(false)
+     expect(showsRunningArc('unread')).toBe(false)
+   })
+ })
+ 
+ describe('sessionStatusStripe', () => {
++  it('keeps stored outcomes authoritative during background work, but not a live own turn', () => {
++    const decision = { kind: 'decision', summary: 'Pick A or B' } as const
++
++    expect(hasLiveTurn('background')).toBe(true)
++    expect(showsRunningArc('background')).toBe(true)
++    expect(sessionStatusStripe('background', true, false, 0, false, null, 0, 0, 0, decision as never)).toBe('stuck')
++    expect(sessionStatusStripe('working', true, false, 0, false, null, 0, 0, 0, decision as never)).toBeNull()
++  })
++
+   // [daveey] A chat that handed its work to kanban cards waits on them: grey
+   // `waiting`, never green and never blank, until they finish.
+   it('is waiting (grey) while the chat has open kanban cards', () => {
+@@ -167,8 +179,7 @@ describe('hasLiveTurn', () => {
+     }
+   })
+ 
+-  it('excludes work that outlived the turn', () => {
+-    expect(hasLiveTurn('background')).toBe(false)
++  it('excludes a finished session', () => {
+     expect(hasLiveTurn('unread')).toBe(false)
+   })
+ })
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 22183518875..7594b31fd18 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -221,9 +221,13 @@ export const $goalActiveSessionIds = computed([$sessions, $messagingSessions], (
+ export type SessionDotState = 'background' | 'draft' | 'idle' | 'needs-input' | 'stalled' | 'unread' | 'working'
+ 
+ /** The sidebar row's arc. A quiet turn is still authoritatively running, so
+- *  `stalled` keeps it; a blocking prompt drops it, because the amber dot is the
+- *  louder cue and two treatments at once fight each other. */
+-export const showsRunningArc = (state: SessionDotState): boolean => state === 'stalled' || state === 'working'
++ *  `stalled` keeps it; so does `background`, because a turn that ended on
++ *  delegate_task(background=true) or terminal(background=true) still has work
++ *  running in the session, and a row with no arc read as finished. A blocking
++ *  prompt drops it, because the amber dot is the louder cue and two treatments
++ *  at once fight each other. The dot still tells background apart (hollow). */
++export const showsRunningArc = (state: SessionDotState): boolean =>
++  state === 'background' || state === 'stalled' || state === 'working'
+ 
+ /** [daveey] The sidebar row's status stripe: `done` (green) when the agent
+  *  finished its turn and is waiting on the user — read or not, so it stays
+@@ -331,7 +335,7 @@ export const sessionStatusStripe = (
+   kanbanStalled = 0,
+   outcome: null | SessionOutcome | undefined = null
+ ): null | SessionStatusStripe => {
+-  if (!userBlocked && !hasLiveTurn(state)) {
++  if (!userBlocked && !hasOwnLiveTurn(state)) {
+     const fromOutcome = outcomeStripe(outcome)
+ 
+     if (fromOutcome) {
+@@ -411,7 +415,7 @@ export const withRowActivity = (state: SessionDotState, row: RowActivity): Sessi
+   // never saw its stream: a backend-woken close-out turn in an unopened chat, or a chat on a gateway other than the
+   // active one (only the active gateway's `session.active_list` is polled). It beats every non-live state, so the
+   // stored outcome (a red decision) yields to it like any live turn.
+-  if (row.turn_live === true && !hasLiveTurn(state)) {
++  if (row.turn_live === true && !hasOwnLiveTurn(state)) {
+     return 'working'
+   }
+ 
+@@ -427,9 +431,12 @@ export const withRowActivity = (state: SessionDotState, row: RowActivity): Sessi
+   return (settled === 'idle' || settled === 'draft') && (row.kanban_unseen ?? 0) > 0 ? 'unread' : settled
+ }
+ 
+-/** Whether this turn is the session's own, live: brighter title, and the row's
+- *  age yields to the actions menu. Wider than the arc — a turn waiting on an
+- *  answer has not ended. */
++/** [daveey] Background work keeps the session live, but is not its own turn:
++ *  it must not suppress stored outcomes or outrank a backend turn_live stamp. */
++const hasOwnLiveTurn = (state: SessionDotState): boolean =>
++  state === 'working' || state === 'stalled' || state === 'needs-input'
++
++/** Whether the session is live, including work that outlives its own turn. */
+ export const hasLiveTurn = (state: SessionDotState): boolean => showsRunningArc(state) || state === 'needs-input'
+ 
+ /** The buckets the sidebar's status filter and ordering work in. `stalled` and
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 326a651110c..b12305cc063 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -1754,6 +1754,15 @@ body.guest-pointer-lock :is(webview, iframe) {
+   pointer-events: none;
+ }
+ 
++/* Hidden DOM terminals still parse output, but their rows need no layout.
++   Keep the host and xterm helpers measurable for fitting and live font changes;
++   hiding the whole xterm would cache zero-width glyph measurements. WebGL
++   surfaces are deliberately unchanged. */
++[data-terminal].invisible .xterm-rows,
++[data-persistent-terminal][aria-hidden='true'] .xterm-rows {
++  display: none;
++}
++
+ /* Bottom clearance lives on [data-slot='aui_composer-clearance'] —
+    virtualized items unmount, so :nth-last-child can't fire reliably. */
+ 
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 8bef2fb7ba0..242bc7eb587 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -1941,19 +1941,20 @@ export interface BotRelayReplyParams {
+ export interface I18nLanguagesResult {
+   languages: LanguageOption[]
+ }
+-/** ``agent.i18n_languages.language_options`` row. ``source`` is ``bundled``, ``overlay`` or ``plugin:<name>`` — the highest layer that supplies the language. */
++/** ``agent.i18n_languages.language_options`` row. ``source`` is ``bundled``, ``overlay`` or ``plugin:<name>`` — the highest layer that supplies the language. ``surfaces`` are the surfaces some layer has strings for; a renderer leaves out a language it does not bundle and that lacks its surface, since picking it would only show English. */
+ export interface LanguageOption {
+   id: string
+   endonym: string
+   rtl: boolean
+   source: string
++  surfaces: LocaleSurface[]
+ }
++export type LocaleSurface = 'core' | 'tui' | 'desktop'
+ export interface I18nCatalogParams {
+   profile?: string | null
+   lang: string
+   surface?: LocaleSurface
+ }
+-export type LocaleSurface = 'core' | 'tui' | 'desktop'
+ /** ``messages`` is ONLY the pack + user-overlay layer for that surface (flat dotted keys); the client merges it over its bundled ``en``/``<lang>``. ``lang`` is the canonical id the request resolved to (``pt-BR`` → ``pt-br``; an unknown id resolves to ``en`` with an empty layer). */
+ export interface I18nCatalogResult {
+   lang: string
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index b046c9f7051..f7724c60cbf 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -21700,7 +21700,7 @@
+       },
+       "LanguageOption": {
+         "additionalProperties": false,
+-        "description": "``agent.i18n_languages.language_options`` row. ``source`` is ``bundled``, ``overlay`` or\n``plugin:<name>`` \u2014 the highest layer that supplies the language.",
++        "description": "``agent.i18n_languages.language_options`` row. ``source`` is ``bundled``, ``overlay`` or\n``plugin:<name>`` \u2014 the highest layer that supplies the language. ``surfaces`` are the surfaces some\nlayer has strings for; a renderer leaves out a language it does not bundle and that lacks its surface,\nsince picking it would only show English.",
+         "properties": {
+           "id": {
+             "title": "Id",
+@@ -21717,13 +21717,21 @@
+           "source": {
+             "title": "Source",
+             "type": "string"
++          },
++          "surfaces": {
++            "items": {
++              "$ref": "#/components/schemas/LocaleSurface"
++            },
++            "title": "Surfaces",
++            "type": "array"
+           }
+         },
+         "required": [
+           "id",
+           "endonym",
+           "rtl",
+-          "source"
++          "source",
++          "surfaces"
+         ],
+         "title": "LanguageOption",
+         "type": "object"
+diff --git a/contributors/emails/262245234+Horizont367@users.noreply.github.com b/contributors/emails/262245234+Horizont367@users.noreply.github.com
+new file mode 100644
+index 00000000000..54e0fc4646b
+--- /dev/null
++++ b/contributors/emails/262245234+Horizont367@users.noreply.github.com
+@@ -0,0 +1,2 @@
++Horizont367
++# PR #119077 salvage
+diff --git a/contributors/emails/ghgoodreau@protonmail.com b/contributors/emails/ghgoodreau@protonmail.com
+new file mode 100644
+index 00000000000..faf6e9cb943
+--- /dev/null
++++ b/contributors/emails/ghgoodreau@protonmail.com
+@@ -0,0 +1,2 @@
++ghgoodreau
++# Verified from upstream commit c627ec84664d43e0b18b95d9d86d8963747d56c7
+diff --git a/hermes_cli/gateway_setup_wizard.py b/hermes_cli/gateway_setup_wizard.py
+index b4940a98679..08b1eea30da 100644
+--- a/hermes_cli/gateway_setup_wizard.py
++++ b/hermes_cli/gateway_setup_wizard.py
+@@ -26,8 +26,11 @@ _PLATFORMS = [
+             "   (System Console → Integrations → Bot Accounts must be enabled)",
+             "2. Give it a username (e.g. hermes) and copy the bot token",
+             "3. Works with any self-hosted Mattermost instance — enter your server URL",
+-            "4. To find your user ID: click your avatar (top-left) → Profile",
+-            "   Your user ID is displayed there — click it to copy.",
++            "4. Find your user ID (the profile dialog does not show it):",
++            "   Admins: System Console → User Management → Users → open your user.",
++            "   Anyone: while logged in, open <server>/api/v4/users/me in a browser tab.",
++            "   With the bot token: GET <server>/api/v4/users/username/<your-username>.",
++            "   Copy the \"id\" field. /users/me with the bot token returns the bot's ID.",
+             "   ⚠ This is NOT your username — it's a 26-character alphanumeric ID.",
+             "5. To get a channel ID: click the channel name → View Info → copy the ID",
+         ],
+@@ -37,7 +40,8 @@ _PLATFORMS = [
+             {"name": "MATTERMOST_TOKEN", "prompt": "Bot token", "password": True,
+              "help": "Paste the bot token from step 2 above."},
+             {"name": "MATTERMOST_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated)",
+-             "password": False, "is_allowlist": True, "help": "Your Mattermost user ID from step 4 above."},
++             "password": False, "is_allowlist": True,
++             "help": "Your user ID from step 4 above (26 characters, not your @username)."},
+             {"name": "MATTERMOST_HOME_CHANNEL",
+              "prompt": "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)",
+              "password": False, "help": "Channel ID where Hermes delivers cron results and notifications."},
+diff --git a/plugins/platforms/mattermost/adapter.py b/plugins/platforms/mattermost/adapter.py
+index 253d65dd6f8..2ade013fa1b 100644
+--- a/plugins/platforms/mattermost/adapter.py
++++ b/plugins/platforms/mattermost/adapter.py
+@@ -676,8 +676,12 @@ def interactive_setup() -> None:
+     save_env_value("MATTERMOST_TOKEN", token)
+     print_success("Mattermost token saved")
+     print()
+-    info("🔒 Security: Restrict who can use your bot", "   To find your user ID: click your avatar → Profile",
+-         "   or use the API: GET /api/v4/users/me")
++    info("🔒 Security: Restrict who can use your bot",
++         "   Find your user ID (the profile dialog does not show it):",
++         "   Admins: System Console → User Management → Users → open your user.",
++         "   Anyone: while logged in, open <server>/api/v4/users/me in a browser tab.",
++         "   With the bot token: GET <server>/api/v4/users/username/<your-username>.",
++         "   Copy the \"id\" field. /users/me with the bot token returns the bot's ID.")
+     print()
+     allowed_users = prompt("Allowed user IDs (comma-separated, leave empty for open access)")
+     if allowed_users:
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index 7a94db71fed..be3cb24e708 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -177,7 +177,7 @@ def _bold_label_html(line: str) -> str:
+ _MEDIA_KIND_KEYS = {
+     "attachment": "platform.telegram.media.kind_attachment", "photo": "platform.telegram.media.kind_photo",
+     "voice message": "platform.telegram.media.kind_voice", "audio file": "platform.telegram.media.kind_audio",
+-    "video file": "platform.telegram.media.kind_video"}
++    "video file": "platform.telegram.media.kind_video", "video note": "platform.telegram.media.kind_video"}
+ 
+ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+ from plugins.platforms.telegram.telegram_entities import expand_link_entities
+@@ -2904,7 +2904,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
+         app.add_handler(TelegramMessageHandler(
+             filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION), self._handle_location_message))
+         app.add_handler(TelegramMessageHandler(
+-            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
++            filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+             self._handle_media_message))
+         # Topic-creation service messages carry the new topic id and no text, so no other handler sees
+         # them. They are a routing signal only (never an agent turn): see _handle_forum_topic_created.
+@@ -6238,8 +6238,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
+         """Classify a Telegram media message into a MessageType (first present attachment wins)."""
+         for attr, mtype in (
+             ("sticker", MessageType.STICKER), ("photo", MessageType.PHOTO), ("video", MessageType.VIDEO),
+-            ("audio", MessageType.AUDIO), ("voice", MessageType.VOICE)):
+-            if getattr(msg, attr):
++            ("video_note", MessageType.VIDEO), ("audio", MessageType.AUDIO), ("voice", MessageType.VOICE)):
++            if getattr(msg, attr, None):
+                 return mtype
+         return MessageType.DOCUMENT
+ 
+@@ -6310,8 +6310,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
+         """Return (telegram_file_source, filename, mime, default_kind) or Nones."""
+         if msg.photo:
+             return msg.photo[-1], "", "", "image"
+-        if msg.video:
+-            return msg.video, "", "video/mp4", "video"
++        if video := msg.video or getattr(msg, "video_note", None):
++            return video, "", "video/mp4", "video"
+         if msg.voice:
+             return msg.voice, "voice.ogg", "audio/ogg", "audio"
+         if msg.audio:
+@@ -6860,8 +6860,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
+         elif msg.audio:
+             if await self._cache_inbound_av(msg, event, msg.audio, "audio file", "audio", ".mp3", "audio/mp3"):
+                 return
+-        elif msg.video:
+-            if await self._cache_inbound_av(msg, event, msg.video, "video file", "video", ".mp4", "video/mp4"):
++        elif video := msg.video or getattr(msg, "video_note", None):
++            if await self._cache_inbound_av(msg, event, video, "video file" if msg.video else "video note", "video", ".mp4", "video/mp4"):
+                 return
+         elif msg.document and await self._cache_inbound_document(msg, event):
+             return
+diff --git a/plugins/platforms/telegram/telegram_context.py b/plugins/platforms/telegram/telegram_context.py
+index 58e26a0b236..0cb91ab651d 100644
+--- a/plugins/platforms/telegram/telegram_context.py
++++ b/plugins/platforms/telegram/telegram_context.py
+@@ -77,8 +77,8 @@ def group_reply_expected(adapter: "TelegramAdapter", message: "Message", chat_ty
+         return None if unknown else False
+     if starts_with_other_participant_mention(adapter, message):
+         return False
+-    # Words in a voice note or audio file are not in the message text, so the "?" rule cannot read them.
+-    spoken = not text and any(getattr(message, kind, None) for kind in ("voice", "audio"))
++    # Words in a voice note, video note or audio file are not in the message text, so the "?" rule cannot read them.
++    spoken = not text and any(getattr(message, kind, None) for kind in ("voice", "video_note", "audio"))
+     return None if "?" in text or spoken else False
+ 
+ 
+diff --git a/tests/agent/test_i18n_languages.py b/tests/agent/test_i18n_languages.py
+index bc1c1602eae..7d4fa53e8d9 100644
+--- a/tests/agent/test_i18n_languages.py
++++ b/tests/agent/test_i18n_languages.py
+@@ -25,16 +25,61 @@ def test_language_options_are_en_first_sorted_and_sourced(monkeypatch, tmp_path)
+     ids = [o["id"] for o in options]
+     assert ids == ["en", *sorted(ids[1:])] and set(ids) == set(i18n.SUPPORTED_LANGUAGES)
+     assert all(o["source"] == "bundled" for o in options)
+-    assert set(options[0]) == {"id", "endonym", "rtl", "source"}
++    assert set(options[0]) == {"id", "endonym", "rtl", "source", "surfaces"}
+ 
+ 
+ def test_describe_language_precedence():
+     # Pack metadata names a pack-only language; the bundled table wins for a bundled id even if a pack
+     # re-declares it; an overlay-only language is reported as such and falls back to the bare id.
+     pack = {"endonym": "Polski", "rtl": False, "source": "plugin:hermes-lang-pl"}
+-    assert describe_language("pl", pack=pack, overlay=False) == {
+-        "id": "pl", "endonym": "Polski", "rtl": False, "source": "plugin:hermes-lang-pl"}
+-    assert describe_language("ar", pack={**pack, "endonym": "Other", "rtl": False}, overlay=False)["endonym"] == "العربية"
+-    assert describe_language("ar", pack={**pack, "rtl": False}, overlay=False)["rtl"] is True
+-    assert describe_language("eo", pack=None, overlay=True) == {"id": "eo", "endonym": "eo", "rtl": False, "source": "overlay"}
+-    assert describe_language("de", pack=None, overlay=True)["source"] == "bundled"
++    assert describe_language("pl", pack=pack, overlay=False, surfaces=("core", "desktop")) == {
++        "id": "pl", "endonym": "Polski", "rtl": False, "source": "plugin:hermes-lang-pl", "surfaces": ["core", "desktop"]}
++    assert describe_language("ar", pack={**pack, "endonym": "Other", "rtl": False}, overlay=False, surfaces=())["endonym"] == "العربية"
++    assert describe_language("ar", pack={**pack, "rtl": False}, overlay=False, surfaces=())["rtl"] is True
++    assert describe_language("eo", pack=None, overlay=True, surfaces=()) == {
++        "id": "eo", "endonym": "eo", "rtl": False, "source": "overlay", "surfaces": []}
++    assert describe_language("de", pack=None, overlay=True, surfaces=())["source"] == "bundled"
++
++
++def test_language_surfaces_report_each_layer(monkeypatch, tmp_path):
++    """Bundled Korean has core + TUI strings and no Desktop catalog; a user overlay or a pack adds the
++    surface it ships. ``i18n.languages`` carries this so the Desktop can leave out a language it would
++    only show in English."""
++    import hermes_yaml as yaml
++
++    from agent import i18n_layers
++
++    home = tmp_path / "home"
++    (home / "locales").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    i18n_layers._reset_registry_for_tests()
++    i18n.reset_language_cache()
++    try:
++        surfaces = i18n.language_surfaces()
++        assert surfaces["ko"] == ("core", "tui")
++        assert surfaces["en"] == ("core",)
++
++        (home / "locales" / "ko.desktop.yaml").write_text(yaml.safe_dump({"settings": {"title": "설정"}}),
++                                                         encoding="utf-8")
++        i18n_layers.register_pack("pl", "desktop", {"settings.title": "Ustawienia"}, source="plugin:hermes-lang-pl")
++        i18n.reset_language_cache()
++        surfaces = i18n.language_surfaces()
++        assert surfaces["ko"] == ("core", "tui", "desktop")
++        assert surfaces["pl"] == ("desktop",)
++        rows = {row["id"]: row for row in i18n.language_options()}
++        assert rows["ko"]["surfaces"] == ["core", "tui", "desktop"]
++        assert rows["pl"]["surfaces"] == ["desktop"]
++        assert rows["ja"]["surfaces"] == ["core", "tui"]
++
++        # A layer that loaded no strings advertises nothing: an empty or unparseable overlay, an empty pack.
++        (home / "locales" / "ja.desktop.yaml").write_text("# nothing translated yet\n", encoding="utf-8")
++        (home / "locales" / "de.desktop.yaml").write_text("settings: [unclosed\n", encoding="utf-8")
++        i18n_layers.register_pack("uk", "desktop", {}, source="plugin:hermes-lang-uk")
++        i18n.reset_language_cache()
++        surfaces = i18n.language_surfaces()
++        assert "desktop" not in surfaces["ja"]
++        assert "desktop" not in surfaces["de"]
++        assert "desktop" not in surfaces["uk"]
++    finally:
++        i18n_layers._reset_registry_for_tests()
++        i18n.reset_language_cache()
+diff --git a/tests/agent/test_i18n_layers.py b/tests/agent/test_i18n_layers.py
+index ee3307be8e9..6aa61737e94 100644
+--- a/tests/agent/test_i18n_layers.py
++++ b/tests/agent/test_i18n_layers.py
+@@ -143,7 +143,8 @@ def test_manifest_only_pack_registers_language_and_display_language_resolves(hom
+     assert i18n.get_language() == "pl"
+     assert i18n.t(_KEY) == "Zatwierdzenie"
+     option = next(o for o in i18n.language_options() if o["id"] == "pl")
+-    assert option == {"id": "pl", "endonym": "pl", "rtl": False, "source": "plugin:hermes-lang-pl"}
++    assert option == {"id": "pl", "endonym": "pl", "rtl": False, "source": "plugin:hermes-lang-pl",
++                      "surfaces": ["core", "tui", "desktop"]}
+ 
+ 
+ def test_pack_with_register_function_and_metadata(home):
+diff --git a/tests/gateway/test_mattermost_plugin_setup.py b/tests/gateway/test_mattermost_plugin_setup.py
+index 7430b6cfde4..ec2b3369112 100644
+--- a/tests/gateway/test_mattermost_plugin_setup.py
++++ b/tests/gateway/test_mattermost_plugin_setup.py
+@@ -51,3 +51,14 @@ class TestMattermostHomeChannelClear:
+         assert "MATTERMOST_HOME_CHANNEL" not in saved
+ 
+ 
++def test_security_hint_names_a_documented_user_id_lookup(monkeypatch):
++    """The profile dialog has no user ID; the hint must not send people there."""
++    saved, removed, shown = {}, [], []
++    _patch_setup_io(monkeypatch, _PROMPTS_BLANK, saved, removed, existing={})
++    monkeypatch.setattr(cli_output_mod, "print_info", lambda line, *_a, **_kw: shown.append(line))
++    interactive_setup()
++
++    out = "\n".join(shown)
++    assert "User Management" in out
++    assert "/api/v4/users/username/" in out
++    assert "click your avatar" not in out
+diff --git a/tests/gateway/test_telegram_documents.py b/tests/gateway/test_telegram_documents.py
+index cd43f54a680..eb35258c4a4 100644
+--- a/tests/gateway/test_telegram_documents.py
++++ b/tests/gateway/test_telegram_documents.py
+@@ -67,6 +67,7 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
+     # Media flags — all None except explicit payload
+     msg.photo = photo
+     msg.video = None
++    msg.video_note = None
+     msg.audio = None
+     msg.voice = None
+     msg.sticker = None
+@@ -256,14 +257,29 @@ class TestDocumentDownloadBlock:
+         event = adapter.handle_message.call_args[0][0]
+         assert "could not be downloaded" in (event.text or "")
+ 
++    @pytest.mark.asyncio
++    async def test_video_note_failure_reply_is_localized(self, adapter, monkeypatch):
++        monkeypatch.setenv("HERMES_LANGUAGE", "de")
++        msg = _make_message()
++        msg.video_note = _make_video()
++        msg.video_note.file_size = 100
++        msg.video_note.get_file = AsyncMock(side_effect=RuntimeError("CDN down"))
++
++        await adapter._handle_media_message(_make_update(msg), MagicMock())
++
++        reply = str(msg.reply_text.await_args)
++        assert "Videodatei" in reply and "video note" not in reply
++        assert "send a video note" in adapter.handle_message.call_args[0][0].text
++
+ 
+ class TestVideoDownloadBlock:
+     @pytest.mark.asyncio
+-    async def test_native_video_is_cached(self, adapter):
++    @pytest.mark.parametrize("attr", ["video", "video_note"])
++    async def test_native_video_is_cached(self, adapter, attr):
+         file_obj = _make_file_obj(b"fake-mp4")
+-        file_obj.file_path = "videos/clip.mp4"
++        file_obj.file_path = f"{attr}s/clip.mp4"
+         msg = _make_message()
+-        msg.video = _make_video(file_obj)
++        setattr(msg, attr, _make_video(file_obj))
+         update = _make_update(msg)
+ 
+         await adapter._handle_media_message(update, MagicMock())
+@@ -273,6 +289,46 @@ class TestVideoDownloadBlock:
+         assert os.path.exists(event.media_urls[0])
+         assert event.media_types == [SUPPORTED_VIDEO_TYPES[".mp4"]]
+ 
++    def test_media_handler_accepts_video_notes(self, adapter):
++        class _Names:  # filter stand-in: | collects names; & and ~ only need to compose
++            def __init__(self, *names):
++                self.names = set(names)
++
++            def __or__(self, other):
++                return _Names(*self.names, *other.names)
++
++            __and__ = __or__
++
++            def __invert__(self):
++                return self
++
++        fake_filters = SimpleNamespace(
++            **{name: _Names(name) for name in ("TEXT", "COMMAND", "LOCATION", "VENUE", "PHOTO", "VIDEO",
++                                                "VIDEO_NOTE", "AUDIO", "VOICE")},
++            Document=SimpleNamespace(ALL=_Names("DOCUMENT")), Sticker=SimpleNamespace(ALL=_Names("STICKER")),
++            StatusUpdate=None)
++        registered = {}
++        with patch.multiple("plugins.platforms.telegram.adapter", filters=fake_filters,
++                            TelegramMessageHandler=lambda flt, callback: registered.setdefault(callback, flt)):
++            adapter._register_handlers(MagicMock())
++        assert {"VIDEO", "VIDEO_NOTE"} <= registered[adapter._handle_media_message].names
++
++    @pytest.mark.asyncio
++    async def test_reply_to_a_video_note_caches_it(self, adapter):
++        file_obj = _make_file_obj(b"fake-mp4")
++        file_obj.file_path = "video_notes/file_1.mp4"
++        replied = _make_message()
++        replied.video_note = _make_video(file_obj)
++        replied.video_note.file_size = 1024
++        msg = _make_message()
++        msg.reply_to_message = replied
++        event = MessageEvent(text="what is in this?", message_type=MessageType.TEXT)
++
++        await adapter._cache_replied_media(msg, event)
++        assert event.message_type == MessageType.VIDEO
++        assert event.media_types == ["video/mp4"]
++        assert os.path.exists(event.media_urls[0])
++
+ 
+ # ---------------------------------------------------------------------------
+ # TestMediaGroups — media group (album) buffering
+diff --git a/tests/gateway/test_telegram_group_gating.py b/tests/gateway/test_telegram_group_gating.py
+index 309fc724cf8..360e3ba7995 100644
+--- a/tests/gateway/test_telegram_group_gating.py
++++ b/tests/gateway/test_telegram_group_gating.py
+@@ -1046,6 +1046,7 @@ def _with_media(message, kind):
+     (_replying_to(_group_message("agreed"), user_id=1087968824, sender_chat=-100), None),
+     (_with_media(_group_message(None), "voice"), None),
+     (_with_media(_group_message(None), "audio"), None),
++    (_with_media(_group_message(None), "video_note"), None),
+     (_with_media(_group_message(None, caption="the fridge arrives on saturday"), "voice"), False),
+     (_with_media(_group_message(None), "photo"), False),
+ ], ids=[
+@@ -1053,7 +1054,7 @@ def _with_media(message, kind):
+     "reply-to-other-member", "opens-with-other-mention", "chatter",
+     "question", "mentions-other-mid-question", "forum-topic-root", "reply-to-unknown-author",
+     "reply-to-unknown-author-statement", "reply-to-channel-autoforward", "reply-to-anonymous-admin",
+-    "voice-note", "audio-file", "captioned-voice-chatter", "photo-without-caption",
++    "voice-note", "audio-file", "video-note", "captioned-voice-chatter", "photo-without-caption",
+ ])
+ def test_reply_expected_follows_who_the_group_message_addresses(message, expected):
+     adapter = _make_adapter(require_mention=False, mention_patterns=["hermes"])
+diff --git a/tests/hermes_cli/test_mattermost_user_id_setup.py b/tests/hermes_cli/test_mattermost_user_id_setup.py
+new file mode 100644
+index 00000000000..77320b4ab16
+--- /dev/null
++++ b/tests/hermes_cli/test_mattermost_user_id_setup.py
+@@ -0,0 +1,25 @@
++"""`hermes gateway setup` → Mattermost must name a user-ID lookup that exists.
++
++The profile dialog does not show the ID. System Console → User Management →
++Users and GET /api/v4/users/username/<username> do; /users/me with the bot
++token returns the bot's own user.
++"""
++
++import io
++
++
++def test_gateway_setup_points_at_a_documented_user_id(tmp_path, monkeypatch, capsys):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    from hermes_cli import gateway as gw
++
++    platform = next(p for p in gw._PLATFORMS if p["key"] == "mattermost")
++    monkeypatch.setattr(
++        "sys.stdin", io.StringIO("https://mm.example.com\ntok-abc\nuserid26\n")
++    )
++    gw._setup_standard_platform(dict(platform))
++
++    out = capsys.readouterr().out
++    assert "User Management" in out
++    assert "/api/v4/users/username/" in out
++    assert "click your avatar" not in out
++    assert "displayed there" not in out
+diff --git a/tests/tui_gateway/test_i18n_methods.py b/tests/tui_gateway/test_i18n_methods.py
+index 45d181fe12d..65b8f6a1fbe 100644
+--- a/tests/tui_gateway/test_i18n_methods.py
++++ b/tests/tui_gateway/test_i18n_methods.py
+@@ -42,8 +42,9 @@ def test_languages_and_catalog_serve_pack_layers_per_surface(tmp_path, monkeypat
+     languages = _call(server, "i18n.languages", {})["result"]["languages"]
+     ids = [row["id"] for row in languages]
+     assert ids == ["en", *sorted(ids[1:])]
+-    assert {"id": "pl", "endonym": "Polski", "rtl": False, "source": "plugin:hermes-lang-pl"} in languages
+-    assert {"id": "ar", "endonym": "العربية", "rtl": True, "source": "bundled"} in languages
++    assert {"id": "pl", "endonym": "Polski", "rtl": False, "source": "plugin:hermes-lang-pl",
++            "surfaces": ["core", "tui", "desktop"]} in languages
++    assert {"id": "ar", "endonym": "العربية", "rtl": True, "source": "bundled", "surfaces": ["core", "tui"]} in languages
+ 
+     core = _call(server, "i18n.catalog", {"lang": "pl"})["result"]
+     assert core == {"lang": "pl", "surface": "core", "messages": {"approval.denied": "Odrzucono"}}
+@@ -75,3 +76,94 @@ def test_catalog_answers_for_the_requested_profile_home(tmp_path, monkeypatch, c
+ 
+     assert _call(server, "i18n.catalog", {"lang": "de", "profile": "named"})["result"]["messages"] == {"approval.denied": "Nur named"}
+     assert _call(server, "i18n.catalog", {"lang": "de"})["result"]["messages"] == {}
++
++
++def test_cold_gateway_serves_an_installed_pack_before_any_agent_exists(tmp_path, monkeypatch, clean_layers):
++    """The Desktop asks for ``i18n.languages`` / ``i18n.catalog`` right after connecting, before anything
++    in the gateway has discovered plugins. An installed, enabled pack must already be in both answers."""
++    from tui_gateway import server
++    from hermes_cli import plugins as plugins_mod
++
++    home = tmp_path / "home"
++    plugin = home / "plugins" / "hermes-lang-ko"
++    (plugin / "locales").mkdir(parents=True)
++    empty_bundled = tmp_path / "bundled"
++    empty_bundled.mkdir()
++    (plugin / "plugin.yaml").write_text(yaml.safe_dump({
++        "name": "hermes-lang-ko", "version": "1.0.0", "description": "Korean pack",
++        "provides_locales": [{"id": "ko", "endonym": "한국어"}]}, allow_unicode=True), encoding="utf-8")
++    (plugin / "locales" / "ko.yaml").write_text("{}\n", encoding="utf-8")
++    (plugin / "locales" / "ko.desktop.yaml").write_text(
++        yaml.safe_dump({"settings": {"appearance": {"modelPricingTitle": "모델 가격"}}}, allow_unicode=True),
++        encoding="utf-8")
++    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": ["hermes-lang-ko"]}}), encoding="utf-8")
++    monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(server, "_hermes_home", home)
++    monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: empty_bundled)
++    i18n.reset_language_cache()
++    manager = plugins_mod.get_plugin_manager()
++    assert "ko" not in i18n_layers.pack_languages()  # nothing has loaded plugins in this home yet
++    try:
++        ko = next(row for row in _call(server, "i18n.languages", {})["result"]["languages"] if row["id"] == "ko")
++        assert ko["source"] == "plugin:hermes-lang-ko" and "desktop" in ko["surfaces"]
++        desktop = _call(server, "i18n.catalog", {"lang": "ko", "surface": "desktop"})["result"]
++        assert desktop["messages"] == {"settings.appearance.modelPricingTitle": "모델 가격"}
++    finally:
++        manager.unload()
++
++
++def test_failed_plugin_discovery_still_answers_with_bundled_languages(tmp_path, monkeypatch, clean_layers):
++    from tui_gateway import server
++    from hermes_cli import plugins as plugins_mod
++
++    def boom(force=False):
++        raise RuntimeError("plugin loader broke")
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(plugins_mod, "discover_plugins", boom)
++    i18n.reset_language_cache()
++
++    languages = _call(server, "i18n.languages", {})["result"]["languages"]
++    assert {"id": "ko", "endonym": "한국어", "rtl": False, "source": "bundled", "surfaces": ["core", "tui"]} in languages
++    assert _call(server, "i18n.catalog", {"lang": "ko", "surface": "desktop"})["result"]["messages"] == {}
++
++
++@pytest.mark.parametrize("method", ["i18n.languages", "i18n.catalog"])
++def test_slow_plugin_discovery_does_not_hold_up_other_requests(method, tmp_path, monkeypatch, clean_layers):
++    """Cold discovery loads every enabled plugin, so it runs on the RPC pool: the reader keeps serving."""
++    import queue
++    import threading
++
++    from hermes_cli import plugins as plugins_mod
++    from tui_gateway import server
++
++    class Transport:
++        def __init__(self):
++            self.frames = queue.Queue()
++
++        def write(self, frame):
++            self.frames.put(frame)
++            return True
++
++    entered, release = threading.Event(), threading.Event()
++
++    def slow_discovery(force=False):
++        entered.set()
++        assert release.wait(10)
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(plugins_mod, "discover_plugins", slow_discovery)
++    transport = Transport()
++    try:
++        params = {"lang": "ko", "surface": "desktop"} if method == "i18n.catalog" else {}
++        assert server.dispatch({"jsonrpc": "2.0", "id": "slow", "method": method, "params": params}, transport) is None
++        assert entered.wait(10)
++        pong = server.dispatch({"jsonrpc": "2.0", "id": "ping", "method": "ping", "params": {}}, transport)
++        assert pong["id"] == "ping" and "result" in pong
++    finally:
++        release.set()
++    reply = transport.frames.get(timeout=10)
++    assert reply["id"] == "slow" and "result" in reply
+diff --git a/tui_gateway/contracts/i18n.py b/tui_gateway/contracts/i18n.py
+index cf388e36e2e..86fec78af5f 100644
+--- a/tui_gateway/contracts/i18n.py
++++ b/tui_gateway/contracts/i18n.py
+@@ -20,12 +20,15 @@ class LocaleSurface(WireEnum):
+ 
+ class LanguageOption(Result):
+     """``agent.i18n_languages.language_options`` row. ``source`` is ``bundled``, ``overlay`` or
+-    ``plugin:<name>`` — the highest layer that supplies the language."""
++    ``plugin:<name>`` — the highest layer that supplies the language. ``surfaces`` are the surfaces some
++    layer has strings for; a renderer leaves out a language it does not bundle and that lacks its surface,
++    since picking it would only show English."""
+ 
+     id: str
+     endonym: str
+     rtl: bool
+     source: str
++    surfaces: list[LocaleSurface]
+ 
+ 
+ class I18nLanguagesResult(Result):
+diff --git a/tui_gateway/methods_i18n.py b/tui_gateway/methods_i18n.py
+index bec0a7b60c2..1b23e29554c 100644
+--- a/tui_gateway/methods_i18n.py
++++ b/tui_gateway/methods_i18n.py
+@@ -10,6 +10,8 @@ Bodies are rebound onto server.py's globals (method_ctx.bind_module) and referen
+ 
+ from __future__ import annotations
+ 
++import logging
++
+ from .method_ctx import HandlerRegistry, bind_module
+ 
+ _registry = HandlerRegistry()
+@@ -19,11 +21,24 @@ _profile_scoped = _registry.profile_scoped
+ _I18N_ERR = 5400
+ 
+ 
++def _load_language_packs() -> None:
++    """Plugin packs register during plugin discovery, which nothing in this process may have run yet: the
++    Desktop asks for its catalog as soon as it connects, before any agent exists. Idempotent. A failed
++    discovery still answers with the bundled and overlay layers."""
++    from hermes_cli.plugins import discover_plugins
++    try:
++        discover_plugins()
++    except Exception:
++        logging.getLogger(__name__).warning("i18n: plugin discovery failed; serving languages without plugin packs",
++                                            exc_info=True)
++
++
+ @method("i18n.languages")
+ @_profile_scoped
+ def _(rid, params: dict) -> dict:
+     from agent.i18n import language_options
+     try:
++        _load_language_packs()
+         return _ok(rid, {"languages": language_options()})
+     except Exception as e:
+         return _err(rid, _I18N_ERR, str(e))
+@@ -37,8 +52,9 @@ def _(rid, params: dict) -> dict:
+     surface = str(params.get("surface") or CORE_SURFACE)
+     if surface not in SURFACES:
+         return _err(rid, 4002, f"surface must be one of {', '.join(SURFACES)}")
+-    lang = resolve_language_id(params.get("lang", "")) or "en"
+     try:
++        _load_language_packs()
++        lang = resolve_language_id(params.get("lang", "")) or "en"
+         return _ok(rid, {"lang": lang, "surface": surface, "messages": surface_catalog(lang, surface)})
+     except Exception as e:
+         return _err(rid, _I18N_ERR, str(e))
+@@ -46,3 +62,5 @@ def _(rid, params: dict) -> dict:
+ 
+ def register(server) -> None:
+     bind_module(globals(), server, skip=("_",))
++    # A cold call runs plugin discovery, which loads every enabled plugin: keep it off the request reader.
++    server._LONG_HANDLERS = server._LONG_HANDLERS | _registry.names()
+diff --git a/website/docs/user-guide/messaging/mattermost.md b/website/docs/user-guide/messaging/mattermost.md
+index 5d86dc71c49..3f40d86dfe6 100644
+--- a/website/docs/user-guide/messaging/mattermost.md
++++ b/website/docs/user-guide/messaging/mattermost.md
+@@ -100,10 +100,21 @@ For DMs, simply open a direct message with the bot — it will be able to respon
+ 
+ ## Step 4: Find Your Mattermost User ID
+ 
+-Hermes Agent uses your Mattermost User ID to control who can interact with the bot. To find it:
++Hermes Agent uses your Mattermost User ID to control who can interact with the bot. The profile dialog (avatar → Profile) does not show it.
+ 
+-1. Click your **avatar** (top-left corner) → **Profile**.
+-2. Your User ID is displayed in the profile dialog — click it to copy.
++Use one of these (see Mattermost's [Identify a user's ID](https://docs.mattermost.com/administration-guide/configure/user-management-configuration-settings#identify-a-users-id)):
++
++1. **System Console** (system admins): **User Management** → **Users** → open your user. The ID is on the User Configuration page.
++2. **Browser** (any user): while logged in to Mattermost, open `https://your-mattermost-server/api/v4/users/me` in a new tab. The `id` field is your User ID.
++3. **API with the bot token**: look up your username. The `id` field in the response is yours:
++
++   ```bash
++   curl -s -H "Authorization: Bearer YOUR_BOT_TOKEN" \
++     https://your-mattermost-server/api/v4/users/username/YOUR_USERNAME
++   ```
++
++   Don't call `/api/v4/users/me` with the bot token: that returns the **bot's** ID, not yours.
++4. **mmctl** (system admins): `mmctl user list --all` prints one line per user: `<id>: <username> (<email>)`.
+ 
+ Your User ID is a 26-character alphanumeric string like `3uo8dkh1p7g1mfk49ear5fzs5c`.
+ 
+@@ -111,13 +122,6 @@ Your User ID is a 26-character alphanumeric string like `3uo8dkh1p7g1mfk49ear5fz
+ Your User ID is **not** your username. The username is what appears after `@` (e.g., `@alice`). The User ID is a long alphanumeric identifier that Mattermost uses internally.
+ :::
+ 
+-**Alternative**: You can also get your User ID via the API:
+-
+-```bash
+-curl -H "Authorization: Bearer YOUR_TOKEN" \
+-  https://your-mattermost-server/api/v4/users/me | jq .id
+-```
+-
+ :::tip
+ To get a **Channel ID**: click the channel name → **View Info**. The Channel ID is shown in the info panel. You'll need this if you want to set a home channel manually.
+ :::
+diff --git a/website/docs/user-guide/messaging/telegram.md b/website/docs/user-guide/messaging/telegram.md
+index c769604fdb0..066ccd2ddce 100644
+--- a/website/docs/user-guide/messaging/telegram.md
++++ b/website/docs/user-guide/messaging/telegram.md
+@@ -656,7 +656,7 @@ A bot that reads every group message can answer exactly `[SILENT]` (or another [
+ | Any other message without a `?` | Stays silent |
+ | Any other message with a `?` (it may be a question for the bot) | Replaced by the notice |
+ 
+-A message still gets the notice while the bot's own identity is unknown, or when it replies to a message whose author is unknown or that was posted as a chat (a linked channel's post, an anonymous admin). A voice note or audio file without a caption also gets the notice, because its words are not in the message text. A forum topic's root message is not a reply to another member.
++A message still gets the notice while the bot's own identity is unknown, or when it replies to a message whose author is unknown or that was posted as a chat (a linked channel's post, an anonymous admin). A voice note, video note or audio file without a caption also gets the notice, because its words are not in the message text. A forum topic's root message is not a reply to another member.
+ 
+ ### Multiple Hermes bots in one group
+ 
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/mattermost.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/mattermost.md
+index 09092a8a1ee..a27f6e1165d 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/mattermost.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/mattermost.md
+@@ -100,10 +100,21 @@ group_sessions_per_user: false
+ 
+ ## 第四步：查找你的 Mattermost 用户 ID
+ 
+-Hermes Agent 使用你的 Mattermost 用户 ID 来控制谁可以与机器人交互。查找方式：
++Hermes Agent 使用你的 Mattermost 用户 ID 来控制谁可以与机器人交互。个人资料对话框（头像 → 个人资料）里没有这个 ID。
+ 
+-1. 点击左上角的**头像** → **个人资料**。
+-2. 用户 ID 显示在个人资料对话框中——点击即可复制。
++可以用以下任一方式查找（见 Mattermost 文档 [Identify a user's ID](https://docs.mattermost.com/administration-guide/configure/user-management-configuration-settings#identify-a-users-id)）：
++
++1. **System Console**（系统管理员）：**User Management** → **Users** → 打开你自己的用户。ID 在 User Configuration 页面上。
++2. **浏览器**（任何用户）：在已登录 Mattermost 的浏览器中新开标签页，打开 `https://your-mattermost-server/api/v4/users/me`。返回里的 `id` 就是你的用户 ID。
++3. **用 bot token 调用 API**：按你的用户名查询。返回里的 `id` 是你的：
++
++   ```bash
++   curl -s -H "Authorization: Bearer YOUR_BOT_TOKEN" \
++     https://your-mattermost-server/api/v4/users/username/YOUR_USERNAME
++   ```
++
++   不要用 bot token 调用 `/api/v4/users/me`：那返回的是 **bot** 的 ID，不是你的。
++4. **mmctl**（系统管理员）：`mmctl user list --all` 会为每个用户输出一行 `<id>: <username> (<email>)`。
+ 
+ 你的用户 ID 是一个 26 位字母数字字符串，例如 `3uo8dkh1p7g1mfk49ear5fzs5c`。
+ 
+@@ -111,13 +122,6 @@ Hermes Agent 使用你的 Mattermost 用户 ID 来控制谁可以与机器人交
+ 你的用户 ID **不是**你的用户名。用户名是 `@` 后面显示的内容（例如 `@alice`）。用户 ID 是 Mattermost 内部使用的长字母数字标识符。
+ :::
+ 
+-**替代方法**：你也可以通过 API 获取用户 ID：
+-
+-```bash
+-curl -H "Authorization: Bearer YOUR_TOKEN" \
+-  https://your-mattermost-server/api/v4/users/me | jq .id
+-```
+-
+ :::tip
+ 要获取**频道 ID**：点击频道名称 → **查看信息**。频道 ID 显示在信息面板中。如果你想手动设置主频道，需要用到它。
+ :::

@@ -1,4 +1,116 @@
-# Kanban: park cards behind one shared external blocker and probe it once (patch 0141)
+# Kanban shared blockers: provider scope, clearing evidence and live owners
+
+Original feature: 0141. Follow-ups covered here: **1511–1514, 1523, 1534**.
+Later behavior below supersedes the original rule that a park without the id cleared a wall.
+
+## Behavior
+
+- `kanban_block`, `kanban_continue` and `kanban_schedule` accept `blocker_id` plus optional
+  `blocker_provider`, `blocker_model` and `blocker_lane` strings. Provider scopes the wall;
+  model/lane describe the observation, not extra restrictions or the task's future routing.
+  Invalid scope types are refused before transition. A clear and an assertion cannot be combined.
+- A scoped wall does not hold a card's known other-provider step. Unknown next routing remains
+  conservatively held. Worker context shows current route and each wall's applicability: finish
+  unrelated work, then wait at the step that needs the affected provider.
+- Explicit scope wins. Otherwise inference uses only provider-labelled wall lines in the current
+  reason/checkpoint, and only an offline-recognized model provider. Unlabelled, ambiguous or
+  service-provider errors remain board-wide. The executor's stored error, pins and profile are
+  **not** evidence of which provider the later step encountered (1512 supersedes 1511's inference).
+- Scope is the union of all assertions of an id in the 14-day lookback. Any unscoped assertion or
+  differing provider makes it board-wide. Reassert a scoped id with the same `blocker_provider`;
+  use a new id for a narrower wall.
+- A wall is open only when its newest assertion is **strictly newer** than its newest clearing
+  **and at least one live card remains behind it**. Done/archived cards cannot keep it open.
+  Losing its last owner is not itself provider-clear evidence; a later encounter can assert it again.
+- `completed`, `review_requested` and `changes_requested` runs never assert a blocker, even when
+  stale metadata still carries `blocker_id`. They cannot replace its assertion timestamp, reason
+  or provider. For a scoped wall, implicit completion/handoff evidence must come from a known
+  matching historical route. Other-provider and unknown historical routes neither probe nor
+  implicitly clear it. Explicit `clear_blocker` attestation can clear it on any route.
+- A re-park without the id says nothing about the wall. Clearing also retains the existing
+  condition-wake evidence rule: the successful check must belong to a park that carried this id.
+- One applicable probe runs at a time, with `kanban.shared_blocker_probe_seconds` spacing
+  (default 1800). A timed blocker park retains its wake/check rather than becoming an untimed wait.
+- After a clear, parked cards are released; already queued `ready`/`review` cards get one
+  `shared_blocker_cleared` marker per clear without changing lane or bypassing capacity/admission.
+  Diagnostics call an old `respawn_guarded` event the **last observed** hold, not a verified current
+  hold. Same-second ordering uses event id after timestamp.
+
+## How it works
+
+`blocker_metadata` centralizes validation and metadata propagation across block, continuation,
+explicit schedule and timed park. `blocker_states` derives assertions, clearing and live ownership
+from run/event history; the assertion scan remains bounded to 14 days. In 1534 the initial scan uses
+`run_effect`, just like the per-card walk, and `BlockerState.is_open` also requires `behind`.
+
+`apply_model_tier` records a `run_route` admission receipt even with tiering off. Historical reads
+prefer that receipt, then legacy `model_tier` events, never today's pin/config. A receipt saying
+unknown is authoritative. Next-route preview is read-only and retains unknown class allocation.
+
+1513 replaces two empty-dict fixture lambdas with `dict`. 1514 adds traceback-bearing fallback logs
+and moves attachment basename/collision helpers and the tool park guard out of large facades;
+these are refactors, not new attachment or wake semantics.
+
+## Code
+
+- `hermes_cli/kanban_shared_blockers.py`: state derivation, route evidence, guard, release and context.
+- `hermes_cli/kanban_blocker_metadata.py`, `kanban_model_tier.py`: scope and admission receipts.
+- `hermes_cli/kanban_db.py`, `kanban_continuation.py`, `kanban_db_schedule.py`, `kanban_timed_park.py`.
+- `tools/kanban_tools.py`, `kanban_tools_park_args.py`, `kanban_tools_schemas.py`.
+- `hermes_cli/kanban_diagnostics.py`: historical hold wording and timestamp/id ordering.
+- 1514 also touches `hermes_cli/kanban_db_attachment_names.py` and
+  `plugins/kanban/dashboard/plugin_api.py` for the extracted attachment helpers.
+
+## Tests
+
+Source regression coverage read from these patches; **not executed in this documentation pass**:
+
+- `tests/tools/test_kanban_blocker_metadata.py`: `test_scope_round_trip` and
+  `test_invalid_scope_refused_without_transition` parameterize all three tools;
+  `test_unlabelled_wall_never_borrows_current_receipt`,
+  `test_stored_run_error_never_borrows_current_receipt`,
+  `test_unknown_provider_label_is_not_inferred`, `test_known_model_provider_label_still_inferred`,
+  `test_explicit_scope_is_never_filtered_by_registry`, direct continuation and untyped classification cases.
+- `tests/hermes_cli/test_kanban_shared_blockers.py`: scoped next/review lanes, other-provider
+  non-probes, matching clears, conservative unknown routes, read-only retry preview, historical pins,
+  admitted route receipts with tiering off, scope union, explicit clears and reassertion guidance.
+  1534 adds `test_finished_other_route_wall_has_no_live_owner` (continue/schedule × done/archived),
+  `test_terminal_outcome_blocker_metadata_is_not_assertion` (all three clear outcomes), and
+  `test_live_owner_wall_stays_open_and_renders` (blocked/scheduled/ready/running).
+- `tests/hermes_cli/test_kanban_cleared_ready_hold.py`:
+  `test_clear_retires_ready_hold_before_capacity_and_dispatches_next_tick` covers ready/review through
+  actual dispatcher decisions with stubbed spawns; the other cases verify historical wording and
+  same-second ordering in either input list order.
+- 1513 is fixture lint only. 1514 adds no tests; its logging and extraction changes have not been
+  independently exercised here. No live provider outage, Desktop rendering or REST scope parity is claimed.
+
+## Applying
+
+Apply the complete ordered mirror using the [README replay recipe](README.md#applying), including
+its replay plan where specified. These shared dispatcher/tool files are not independent patches.
+Keep 1511 and 1512 together: the latter tightens inference and adds durable admission receipts.
+
+## Gotchas
+
+- Workers must provide a blocker id; free-form reason similarity never creates one.
+- Unknown next route means hold, whereas unknown historical route means no implicit clear evidence.
+- Ownerless expiry does not forge a clearing run; do not loosen provider matching to simulate expiry.
+- Clearing queued evidence does not mean the card has capacity or pickup on this machine.
+- Successful patch replay is not a runtime test or proof of deployment.
+
+## Plugin?
+
+No separately installable plugin: these are core dispatcher transactions, routing receipts and worker
+context. The dashboard import change in 1514 follows a core helper extraction.
+
+
+## Historical patch 0141 reference
+
+The original documentation follows for historical code/test provenance. Its open-wall and
+implicit-clearing rules are superseded by the current Behavior above; the old seven-test
+result is historical, not a rerun in this pass.
+
+### Original shared-blocker introduction (0141)
 
 Patch:
 
@@ -14,7 +126,7 @@ One card checks whether the wall is still there every 30 minutes, and the others
 away, the waiting cards go back to work by themselves, with no human unblocking each one. The motivating case
 was 93 runs on 20 cards, each finding the same Actions billing refusal.
 
-## Behavior
+### Behavior
 
 - `kanban_block` and `kanban_continue` take an optional `blocker_id`, a short slug such as
   `github-actions-billing`. Workers are told (tool schema + `KANBAN_GUIDANCE`) to set it only when the wall
@@ -43,7 +155,7 @@ was 93 runs on 20 cards, each finding the same Actions billing refusal.
   kept, and the event carries `shared_blocker_probe: true`.
 - Only blockers asserted in the last 14 days are considered.
 
-## How it works
+### How it works
 
 No schema change: the blocker state is derived from `task_runs` history each time it is needed.
 
@@ -63,7 +175,7 @@ No schema change: the blocker state is derived from `task_runs` history each tim
 - Matching on normalized error text was considered and left out: unrelated crash errors share fixed preambles,
   and block reasons written by an LLM never match verbatim.
 
-## Code
+### Code
 
 ```python
 # hermes_cli/kanban_db_dispatch.py, check_respawn_guard
@@ -81,7 +193,7 @@ kanban:
   shared_blocker_probe_seconds: 1800   # 0 = no spacing, still one probe at a time
 ```
 
-## Tests
+### Tests
 
 `tests/hermes_cli/test_kanban_shared_blockers.py` (7 tests, real temp board, dispatcher with stubbed spawns):
 
@@ -103,14 +215,14 @@ Passed on the full 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0
 on a live board, and the human-unblock-lets-it-probe-now path (`_unblocked_since_assertion`), which no test
 exercises.
 
-## Applying
+### Applying
 
 `git am -3 --empty=keep core/patches/0141-*.patch` after 0140 (both edit `tools/kanban_tools.py`). It also relies on
 earlier fork Kanban patches: `kanban_continue` (`kanban-soft-deadline.md`, 0121), the block-kind routing and
 unblock-loop triage (`kanban-block-loop-escalation.md`), and the `KANBAN_GUIDANCE` text from
 `kanban-timed-waits.md`. Apply the series in order.
 
-## Gotchas
+### Gotchas
 
 - It works only if workers set `blocker_id`. A worker that blocks with prose only is not parked, and nothing
   infers the blocker from the reason text.

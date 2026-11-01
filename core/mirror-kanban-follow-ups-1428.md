@@ -1,6 +1,6 @@
 # Kanban runtime follow-ups in the 1428–1468 mirror
 
-This document covers patches **1433–1437, 1446–1448, 1453–1454, 1456–1457, 1460, 1464–1466**. It describes their combined behavior, including later corrections, from the actual patch hunks. Patch 1468's quota-test adjustment is documented separately by the CI lane.
+This document covers patches **1433–1437, 1446–1448, 1453–1454, 1456–1457, 1460, 1464–1466**, plus the later fix **1530** (home-only recovery requester, final section). It describes their combined behavior, including later corrections, from the actual patch hunks. Patch 1468's quota-test adjustment is documented separately by the CI lane.
 
 ## Behavior
 
@@ -119,3 +119,63 @@ This documentation task did not replay the series or run the source suites. Cons
 ## Plugin?
 
 **Core patches, not a plugin.** They modify transaction-time lifecycle guards, dispatcher recovery production, request normalization/execution, tool contracts, frozen-policy readers, sync internals and gateway notice selection. A plugin may consume the public tools or request receipts, but cannot replace these internal guarantees merely by registering a hook.
+
+---
+
+## Follow-up: only the card's home creates the recovery requester (1530)
+
+Patch `1530-fix-kanban-create-continuation-recovery-only-on-card.patch` (fork `7dc60085a40a`). It fixes the
+recovery-requester producer added by 1446 (see **Continuation recovery** above).
+
+### Behavior
+
+A card that a worker node runs can be parked `continuation_exhausted`. That park then reaches both the card's home
+gateway and the worker node's copy of the Board. Before this patch, both dispatchers' `ensure_recovery_cards` could
+create a recovery card for it. Each replica records the park under a different local event id, so the idempotency
+key `recovery:<target>:<park event id>` did not catch the duplicate.
+
+Now only the card's home creates the requester. A replica skips any target it holds as a foreign copy. The result is
+one Board-wide recovery card, created on the home, whichever dispatcher ticks first.
+
+### How it works
+
+`kanban_resume_requester.ensure_recovery_cards` reads `kanban_wake_check.foreign_ids(conn)` once per call. That
+function returns the ids of tasks in this live file whose `created_on` is set and is not this gateway. The
+candidate loop then `continue`s past any target in that set, before the existing `created_by == kanban-recovery`
+and `exhaustion_refusal` checks. The module docstring now says "home-owned cards".
+
+### Code
+
+`hermes_cli/kanban_resume_requester.py`.
+
+### Tests
+
+`tests/hermes_cli/test_kanban_resume_requester_sync.py::test_foreign_park_has_one_board_wide_requester` is new and
+parametrized on `home_first`. **It was read from the diff and not executed in this mirror pass.**
+
+The test reuses the real multi-gateway `gws` and `svc` fixtures from `test_kanban_worker_node.py`. It creates a
+card on home with `runs_on=["linux"]` and lets the worker claim it. On the worker it calls `continue_task(...,
+max_continuations=0)` (which returns `continuation_exhausted`) and then `block_task(kind="transient", ...)`. After
+both sides sync it checks:
+
+- Both replicas pass `exhaustion_refusal`.
+- After each gateway runs `ensure_recovery_cards` twice, in both orders, the Board has exactly one card with
+  `created_by == kanban-recovery`, and its `created_on` is the home.
+- `refusal(home, card, target)` is `None`.
+
+### Applying
+
+Apply after 1446 in series order. The patch needs `kanban_wake_check.foreign_ids` and the worker-node sync fixtures
+from earlier patches. No config is needed.
+
+### Gotchas
+
+- **No requester while the home is down.** If the home gateway is down, nothing creates the requester; the worker
+  node never takes over that responsibility.
+- **`foreign_ids` returns an empty set when it cannot identify this gateway.** That happens when it cannot resolve
+  the gateway's own identity or the query hits a SQLite `OperationalError`. In that case no target is skipped, so a
+  misconfigured replica could still create a duplicate. That path is untested.
+
+### Plugin?
+
+No. This is a core dispatcher change.

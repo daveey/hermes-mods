@@ -1,0 +1,1041 @@
+From 84e5bc9460e9eed090046d7af8a1be7ae5233e6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:06:09 +0000
+Subject: [PATCH] fix(kanban): a worker survives a long sleep with networkless
+ DarkWakes [daveey]
+
+Runs 10712/10714 (10-30, a MacBook asleep 16:57-21:31 with DNS-less
+maintenance wakes) ended lease_lost failures although nobody else held them:
+
+- Anthropic: every stale-stream kill counted toward the cross-turn stale
+  breaker, but each kill only measured the suspend (watchdogs age on wall
+  time); the fifth DarkWake gave the worker up. A kill whose
+  wall-minus-monotonic gap grew past 30 s since the breaker last moved is now
+  not counted; the excuse never carries over to later awake kills.
+- Codex/any failed turn: in-place recovery refused at once when the claim
+  lease had lapsed during the sleep (the renewing dispatcher was asleep too).
+  worker_claim_state() now separates "lapsed" (every coordinate still ours,
+  only the expiry passed) from "lost"; recovery waits read-only, bounded by
+  300 awake seconds, for the dispatcher's holder-qualified extension. The
+  worker never extends its own lease; a release, relock or takeover is
+  "lost" and fences it out before model re-entry.
+- The dispatcher's stale sweep ran before its crash sweep and booked a dead
+  worker's own transient exit (75) as lease_lost. A host-local dead worker
+  whose authority recorded exit 75 under this claim is now left to the same
+  pass's crash sweep (neutral rate_limited requeue).
+
+Regression: tests/agent/test_kanban_darkwake_recovery.py (13 of 15 RED on
+the base, controls green; all GREEN here).
+---
+ agent/chat_completion_helpers.py              |  42 +-
+ agent/chat_completion_stale_breaker.py        |  85 ++++
+ agent/kanban_turn_recovery.py                 | 182 ++++++--
+ gateway/session_kanban.py                     |  23 +-
+ hermes_cli/kanban_db.py                       |   5 +-
+ hermes_cli/kanban_db_stale_claims.py          |  32 ++
+ tests/agent/test_kanban_darkwake_recovery.py  | 416 ++++++++++++++++++
+ tests/agent/test_kanban_turn_recovery.py      |   4 +
+ .../test_session_kanban_turn_recovery.py      |   3 +
+ 9 files changed, 705 insertions(+), 87 deletions(-)
+ create mode 100644 agent/chat_completion_stale_breaker.py
+ create mode 100644 tests/agent/test_kanban_darkwake_recovery.py
+
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 9b95550e2ea..22f7735875a 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -556,44 +556,10 @@ def _estimate_chunk_bytes(chunk: Any) -> int:
+     return size
+ 
+ 
+-# ── Cross-turn stale-call circuit breaker (#58962) ─────────────────────
+-# A session wedged against an unresponsive provider would otherwise hit the
+-# stale detector on every call forever. ``agent._consecutive_stale_streams``
+-# is bumped on every stale kill and reset only when a call completes or the
+-# provider is swapped (switch_model / try_activate_fallback /
+-# restore_primary_runtime — the streak measured the OLD provider). Past the
+-# give-up threshold, calls abort immediately with an actionable error.
+-
+-def _stale_streak(agent) -> int:
+-    try:
+-        return int(getattr(agent, "_consecutive_stale_streams", 0) or 0)
+-    except Exception:
+-        return 0
+-
+-
+-def _bump_stale_streak(agent) -> None:
+-    with contextlib.suppress(Exception):
+-        agent._consecutive_stale_streams = _stale_streak(agent) + 1
+-
+-
+-def _reset_stale_streak(agent) -> None:
+-    with contextlib.suppress(Exception):
+-        agent._consecutive_stale_streams = 0
+-
+-
+-_INTERRUPTED_WAIT_STALE_SECONDS = 30.0
+-
+-
+-def _record_interrupted_provider_wait(agent, elapsed: float, *, response_started: bool) -> bool:
+-    """Count a user-aborted pre-response stall toward the stale breaker: past the
+-    wait-notice interval an interrupt is evidence of an unresponsive attempt.
+-    Mid-response and early interrupts stay neutral."""
+-    if response_started or elapsed < _INTERRUPTED_WAIT_STALE_SECONDS:
+-        return False
+-    _bump_stale_streak(agent)
+-    logger.warning("Interrupted provider wait counted as stale after %.0fs with no output; "
+-        "consecutive stale attempts=%d.", elapsed, _stale_streak(agent))
+-    return True
++from agent.chat_completion_stale_breaker import (  # re-exported: callers use h._…
++    _INTERRUPTED_WAIT_STALE_SECONDS, _bump_stale_streak, _record_interrupted_provider_wait,
++    _reset_stale_streak, _stale_streak,
++)
+ 
+ 
+ def _report_stale_nonstream_kill(agent, api_kwargs: dict, elapsed: float, stale_timeout: float, *,
+diff --git a/agent/chat_completion_stale_breaker.py b/agent/chat_completion_stale_breaker.py
+new file mode 100644
+index 00000000000..cc42e899526
+--- /dev/null
++++ b/agent/chat_completion_stale_breaker.py
+@@ -0,0 +1,85 @@
++"""Cross-turn stale-call circuit breaker for ``agent.chat_completion_helpers`` (re-exported there)."""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++import time
++
++logger = logging.getLogger("agent.chat_completion_helpers")
++
++
++# ── Cross-turn stale-call circuit breaker (#58962) ─────────────────────
++# A session wedged against an unresponsive provider would otherwise hit the
++# stale detector on every call forever. ``agent._consecutive_stale_streams``
++# is bumped on every stale kill and reset only when a call completes or the
++# provider is swapped (switch_model / try_activate_fallback /
++# restore_primary_runtime — the streak measured the OLD provider). Past the
++# give-up threshold, calls abort immediately with an actionable error.
++
++def _stale_streak(agent) -> int:
++    try:
++        return int(getattr(agent, "_consecutive_stale_streams", 0) or 0)
++    except Exception:
++        return 0
++
++
++# [daveey] A stale kill measured across a host suspend is the sleep's, not the provider's. The stream
++# watchdogs age on wall time, so the first check after a lid close (and every networkless DarkWake
++# after it) kills the in-flight call; counting those gave up a healthy Kanban worker after five
++# maintenance wakes (run 10714). ``time.monotonic`` stops while macOS/Linux sleep, so the gap between
++# the two clocks grows by exactly the suspended time: a growth past this many seconds since the
++# breaker last moved means the host slept in between.
++_SUSPEND_SKEW_SECONDS = 30.0
++
++
++def _wall_minus_awake() -> float:
++    """Wall-clock seconds minus awake seconds: constant while awake, grows by each suspend."""
++    return time.time() - time.monotonic()
++
++
++def _mark_stale_clock(agent) -> None:
++    with contextlib.suppress(Exception):
++        agent._stale_streak_clock_skew = _wall_minus_awake()
++
++
++def _slept_since_stale_mark(agent) -> bool:
++    mark = getattr(agent, "_stale_streak_clock_skew", None)
++    if not isinstance(mark, (int, float)):
++        return False  # no baseline: no evidence of a suspend, the kill counts
++    return _wall_minus_awake() - float(mark) > _SUSPEND_SKEW_SECONDS
++
++
++def _bump_stale_streak(agent) -> None:
++    """Count one stale kill toward the cross-turn breaker, unless the host suspended since the
++    breaker last moved (that kill measured the sleep). Every call re-marks the clock gap, so the
++    excuse covers only the kill right after a suspend, never later awake kills."""
++    slept = _slept_since_stale_mark(agent)
++    _mark_stale_clock(agent)
++    if slept:
++        logger.info("Stale kill after a host suspend not counted toward the stale breaker "
++                    "(consecutive stale attempts stay %d).", _stale_streak(agent))
++        return
++    with contextlib.suppress(Exception):
++        agent._consecutive_stale_streams = _stale_streak(agent) + 1
++
++
++def _reset_stale_streak(agent) -> None:
++    with contextlib.suppress(Exception):
++        agent._consecutive_stale_streams = 0
++    _mark_stale_clock(agent)
++
++
++_INTERRUPTED_WAIT_STALE_SECONDS = 30.0
++
++
++def _record_interrupted_provider_wait(agent, elapsed: float, *, response_started: bool) -> bool:
++    """Count a user-aborted pre-response stall toward the stale breaker: past the
++    wait-notice interval an interrupt is evidence of an unresponsive attempt.
++    Mid-response and early interrupts stay neutral."""
++    if response_started or elapsed < _INTERRUPTED_WAIT_STALE_SECONDS:
++        return False
++    _bump_stale_streak(agent)
++    logger.warning("Interrupted provider wait counted as stale after %.0fs with no output; "
++        "consecutive stale attempts=%d.", elapsed, _stale_streak(agent))
++    return True
+diff --git a/agent/kanban_turn_recovery.py b/agent/kanban_turn_recovery.py
+index c15bfd61c21..180b3b8f0ec 100644
+--- a/agent/kanban_turn_recovery.py
++++ b/agent/kanban_turn_recovery.py
+@@ -186,6 +186,31 @@ def _now() -> int:
+     return int(time.time())
+ 
+ 
++#: Awake seconds a worker waits for the dispatcher to renew a lease that ran out while the host
++#: slept, before it gives up the in-place recovery (``recover_failed_kanban_turns``). The worker
++#: never renews its own lease: the dispatcher's stale sweep extends a live host-local worker's
++#: lapsed claim (``claim_extended``, reason ``pid_alive``) on its next pass, and the Board is asked
++#: first. A dispatcher pass is about a minute apart, so five minutes of awake time covers several.
++LAPSED_CLAIM_WAIT_SECONDS = 300.0
++#: Seconds between read-only re-proofs while waiting for that renewal.
++LAPSED_CLAIM_POLL_SECONDS = 15.0
++
++#: Claim proof outcomes (``worker_claim_state``).
++CLAIM_LIVE = "live"
++CLAIM_LAPSED = "lapsed"
++CLAIM_LOST = "lost"
++
++
++def _sleep(seconds: float) -> None:
++    """Backoff/poll sleep — one seam for tests (wall time; a host suspend may stretch it)."""
++    time.sleep(seconds)
++
++
++def _awake_clock() -> float:
++    """Awake seconds (``time.monotonic`` stops while the host sleeps) — the lapsed-lease budget."""
++    return time.monotonic()
++
++
+ def worker_claim_is_live(
+     *,
+     task_id: Optional[str] = None,
+@@ -196,6 +221,24 @@ def worker_claim_is_live(
+ ) -> bool:
+     """True when THIS process still owns a live, unexpired run/claim lease.
+ 
++    ``worker_claim_state(...) == "live"``; see :func:`worker_claim_state`.
++    """
++    return worker_claim_state(task_id=task_id, db_path=db_path, run_id=run_id, claim_lock=claim_lock,
++                              verify_pid=verify_pid) == CLAIM_LIVE
++
++
++def worker_claim_state(
++    *,
++    task_id: Optional[str] = None,
++    db_path: Optional[str] = None,
++    run_id: Optional[str] = None,
++    claim_lock: Optional[str] = None,
++    verify_pid: bool = True,
++) -> str:
++    """``"live"`` when THIS process still owns a live, unexpired run/claim lease; ``"lapsed"``
++    when every ownership coordinate is still ours and only the lease expiry has passed; else
++    ``"lost"``.
++
+     Verified read-only against the dispatcher-pinned board before EVERY retry.
+     All three pinned coordinates are REQUIRED — ``HERMES_KANBAN_DB``,
+     ``HERMES_KANBAN_RUN_ID``, ``HERMES_KANBAN_CLAIM_LOCK`` — and compared with
+@@ -204,18 +247,19 @@ def worker_claim_is_live(
+ 
+     The lease itself is part of the liveness contract: the canonical stale-claim
+     selector (``hermes_cli/kanban_db.py::release_stale_claims``) treats
+-    ``status='running' AND claim_expires < now`` as stale and reclaims the task,
+-    and the worker-liveness path treats an expired claim as non-live. So both
+-    the task row AND the open run row must carry an UNEXPIRED ``claim_expires``
+-    (``heartbeat_claim`` extends the task expiry and mirrors it onto the active
+-    run row). An expired lease means mutation authority has lapsed even before
+-    the reconciler processes the row; a NULL expiry is not a provable live
+-    lease either and fails closed.
++    ``status='running' AND claim_expires < now`` as stale, and the worker-liveness
++    path treats an expired claim as non-live. So both the task row AND the open run
++    row must carry an UNEXPIRED ``claim_expires`` (``heartbeat_claim`` extends the
++    task expiry and mirrors it onto the active run row) for ``"live"``. An expired
++    lease means mutation authority has lapsed; it is reported as ``"lapsed"`` (never
++    authority) so the caller can wait for the dispatcher to renew it — a host that
++    slept past the TTL froze the renewing dispatcher with it. A NULL expiry is not a
++    provable lease at all and is ``"lost"``.
+ 
+     FAIL-CLOSED: any missing coordinate, missing/unreadable DB, mismatched
+-    run/lock/pid, closed run, or expired lease returns False and the caller
+-    does not re-enter the model — an honest non-zero exit is always available,
+-    whereas mutating state under a released or expired claim is not recoverable.
++    run/lock/pid or closed run returns ``"lost"``, and the caller does not
++    re-enter the model — an honest non-zero exit is always available, whereas
++    mutating state under a released or expired claim is not recoverable.
+ 
+     An owner-side (managed) worker passes its carrier explicitly from the bound
+     worker frame instead of the env pins, and ``verify_pid=False`` because there
+@@ -225,11 +269,11 @@ def worker_claim_is_live(
+     """
+     task_id = _resolve_task_id(task_id)
+     if task_id is None:
+-        return False
++        return CLAIM_LOST
+     db_path = _kanban_db_path() if db_path is None else (db_path.strip() or None)
+     if not db_path or not Path(db_path).exists():
+         logger.warning("kanban claim check: pinned board db %r not found — not retrying in place", db_path)
+-        return False
++        return CLAIM_LOST
+     run_id_env = str(run_id if run_id is not None else os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+     lock_env = str(claim_lock if claim_lock is not None else os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+     if not run_id_env or not lock_env:
+@@ -237,9 +281,9 @@ def worker_claim_is_live(
+             "kanban claim check: missing dispatcher-pinned run-id/claim-lock carrier "
+             "— no exact authority to re-prove, not retrying in place"
+         )
+-        return False
+-    now = _now()
++        return CLAIM_LOST
+     try:
++        now = _now()
+         from hermes_cli import kanban_lockguard
+         conn = kanban_lockguard.connect(f"{Path(db_path).absolute().as_uri()}?mode=ro", uri=True)
+         try:
+@@ -250,42 +294,81 @@ def worker_claim_is_live(
+                 (task_id,),
+             ).fetchone()
+             if row is None:
+-                return False
++                return CLAIM_LOST
+             if (row["status"] or "") != "running":
+-                return False
++                return CLAIM_LOST
+             worker_pid = row["worker_pid"]
+             if verify_pid and worker_pid is not None and int(worker_pid) != os.getpid():
+-                return False
++                return CLAIM_LOST
+             # A running task with no run pointer is not proof of a live run: the
+             # dispatcher writes it on claim and clears it on release/end.
+             current_run_id = row["current_run_id"]
+             if current_run_id is None:
+-                return False
++                return CLAIM_LOST
+             if str(current_run_id) != run_id_env:
+-                return False
++                return CLAIM_LOST
+             if (row["claim_lock"] or "") != lock_env:
+-                return False
+-            if row["claim_expires"] is None or int(row["claim_expires"]) < now:
+-                return False
++                return CLAIM_LOST
++            if row["claim_expires"] is None:
++                return CLAIM_LOST
+             run = conn.execute(
+                 "SELECT ended_at, worker_pid, claim_expires FROM task_runs WHERE id = ?",
+                 (int(current_run_id),),
+             ).fetchone()
+             if run is None:
+-                return False
++                return CLAIM_LOST
+             if run["ended_at"] is not None:
+-                return False
++                return CLAIM_LOST
+             run_pid = run["worker_pid"]
+             if verify_pid and run_pid is not None and int(run_pid) != os.getpid():
+-                return False
+-            if run["claim_expires"] is None or int(run["claim_expires"]) < now:
+-                return False
+-            return True
++                return CLAIM_LOST
++            if run["claim_expires"] is None:
++                return CLAIM_LOST
++            if int(row["claim_expires"]) < now or int(run["claim_expires"]) < now:
++                return CLAIM_LAPSED
++            return CLAIM_LIVE
+         finally:
+             conn.close()
+     except Exception:
+         logger.warning("kanban claim check failed — not retrying in place", exc_info=True)
+-        return False
++        return CLAIM_LOST
++
++
++def wait_for_live_claim(
++    claim_state: Callable[[], str],
++    *,
++    sleep_fn: Optional[Callable[[float], None]] = None,
++    budget_s: Optional[float] = None,
++) -> bool:
++    """True once ``claim_state()`` proves ``"live"``; False on ``"lost"`` or when a ``"lapsed"``
++    lease is not renewed within ``budget_s`` AWAKE seconds (default
++    :data:`LAPSED_CLAIM_WAIT_SECONDS`). Read-only: the worker never extends its own lease, it only
++    waits for the dispatcher's holder-qualified extension, so a lease anyone else took over is
++    ``"lost"`` on the next proof and fences the worker out."""
++    sleep_fn = sleep_fn or _sleep
++    budget = LAPSED_CLAIM_WAIT_SECONDS if budget_s is None else max(float(budget_s), 0.0)
++    poll = max(float(LAPSED_CLAIM_POLL_SECONDS), 0.0)
++    # Bounded by polls as well as awake time, so a no-op sleep can never spin unbounded.
++    max_polls = int(budget // max(poll, 1.0)) + 1
++    started = _awake_clock()
++    polls = 0
++    while True:
++        state = claim_state()
++        if state == CLAIM_LIVE:
++            if polls:
++                logger.info("kanban claim check: lapsed lease renewed by the dispatcher after %d poll(s)", polls)
++            return True
++        if state != CLAIM_LAPSED:
++            return False
++        if polls >= max_polls or _awake_clock() - started >= budget:
++            logger.warning("kanban claim check: lease still lapsed after %.0fs awake — not retrying in place",
++                           _awake_clock() - started)
++            return False
++        if polls == 0:
++            logger.info("kanban claim check: lease lapsed (host suspend?) — waiting up to %.0fs awake "
++                        "for the dispatcher to renew it", budget)
++        polls += 1
++        sleep_fn(poll)
+ 
+ 
+ def _truncate(text: str, limit: int = 300) -> str:
+@@ -340,27 +423,41 @@ def recover_failed_kanban_turns(
+     turn_fn: Callable[[str], Any],
+     get_result: Callable[[], Any],
+     *,
+-    sleep_fn: Callable[[float], None] = time.sleep,
++    sleep_fn: Optional[Callable[[float], None]] = None,
+     emit: Optional[Callable[[str], None]] = None,
+     claim_check: Optional[Callable[[], bool]] = None,
+     task_id: Optional[str] = None,
++    claim_state: Optional[Callable[[], str]] = None,
+ ) -> int:
+     """Retry an authorised kanban worker turn in place; returns attempts made.
+ 
+     ``turn_fn(nudge)`` runs one more turn with the given synthetic user message.
+     ``get_result()`` returns the LATEST settled turn result (``None`` stops the
+     loop). Before EVERY attempt the worker must still own its live run/claim
+-    (``claim_check``, default :func:`worker_claim_is_live`); the loop is bounded
+-    by the attempt budget even when ``get_result`` never changes. The loop
+-    deliberately does NOT extend its own claim lease during the backoff —
+-    self-holding a claim is claim-lifetime policy (#95318), not this module's;
+-    if the lease expires while sleeping, the re-proof fails and the attempt is
+-    not made. ``task_id`` carries the worker identity explicitly (owner-side
+-    workers pass their bound frame's task); such callers must also pass a
+-    ``claim_check`` built from the same explicit carrier.
++    (``claim_state``, default :func:`worker_claim_state`; or a boolean
++    ``claim_check``); the loop is bounded by the attempt budget even when
++    ``get_result`` never changes. The loop deliberately does NOT extend its own
++    claim lease — self-holding a claim is claim-lifetime policy (#95318), not this
++    module's. A lease that is merely ``"lapsed"`` (every coordinate still ours, the
++    expiry passed while the host slept and froze the dispatcher that renews it) is
++    waited out read-only for the dispatcher's renewal, bounded by awake time
++    (:func:`wait_for_live_claim`); a lease that is ``"lost"`` or not renewed in time
++    stops the loop before model re-entry. ``task_id`` carries the worker identity
++    explicitly (owner-side workers pass their bound frame's task); such callers
++    must also pass a ``claim_state``/``claim_check`` built from the same explicit
++    carrier.
+     """
+     attempts = 0
+-    check = claim_check or worker_claim_is_live
++    sleep_fn = sleep_fn or _sleep
++    if claim_state is None:
++        if claim_check is not None:
++            claim_state = lambda: CLAIM_LIVE if claim_check() else CLAIM_LOST
++        else:
++            claim_state = worker_claim_state
++
++    def check() -> bool:
++        return wait_for_live_claim(claim_state, sleep_fn=sleep_fn)
++
+     while True:
+         result = get_result()
+         if not should_recover_turn(result, attempt=attempts, task_id=task_id):
+@@ -393,7 +490,12 @@ def recover_failed_kanban_turns(
+ 
+ 
+ __all__ = [
++    "CLAIM_LAPSED",
++    "CLAIM_LIVE",
++    "CLAIM_LOST",
+     "DEFAULT_MAX_RECOVERY_ATTEMPTS",
++    "LAPSED_CLAIM_POLL_SECONDS",
++    "LAPSED_CLAIM_WAIT_SECONDS",
+     "RECOVERY_DELAYS_SECONDS",
+     "build_recovery_nudge",
+     "kanban_task_id",
+@@ -402,5 +504,7 @@ __all__ = [
+     "recover_failed_kanban_turns",
+     "recovery_delay_seconds",
+     "should_recover_turn",
++    "wait_for_live_claim",
+     "worker_claim_is_live",
++    "worker_claim_state",
+ ]
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 9d068c511c5..fae7e4f1fc5 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -388,15 +388,24 @@ def _bound_claim_is_live(context):
+     """Retry proof for a managed worker: the frame's exact run/claim lease is live and unexpired,
+     and THIS interpreter is the one ``bind_worker_context`` bound to it. The run's worker_pid is
+     the dispatcher's spawned submitter here, so pid identity comes from ``worker_bound`` instead."""
+-    from agent.kanban_turn_recovery import worker_claim_is_live
+-    if not worker_claim_is_live(task_id=context['task_id'], db_path=context['db'], run_id=str(context['run_id']),
+-                                claim_lock=context['claim_lock'], verify_pid=False):
+-        return False
++    from agent.kanban_turn_recovery import CLAIM_LIVE
++    return _bound_claim_state(context) == CLAIM_LIVE
++
++
++def _bound_claim_state(context):
++    """``worker_claim_state`` for the frame's exact carrier (``live``/``lapsed``/``lost``), and
++    ``lost`` unless THIS interpreter is the one ``worker_bound`` recorded under that claim. A
++    ``lapsed`` lease is still ours in every coordinate; recovery waits for the dispatcher to renew it."""
++    from agent.kanban_turn_recovery import CLAIM_LOST, worker_claim_state
++    state = worker_claim_state(task_id=context['task_id'], db_path=context['db'], run_id=str(context['run_id']),
++                               claim_lock=context['claim_lock'], verify_pid=False)
++    if state == CLAIM_LOST:
++        return CLAIM_LOST
+     try:
+         with closing(sqlite3.connect(Path(context['db']).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+-            return _bound_worker_matches(conn, context)
++            return state if _bound_worker_matches(conn, context) else CLAIM_LOST
+     except sqlite3.Error:
+-        return False
++        return CLAIM_LOST
+ 
+ 
+ def worker_result(path, params):
+@@ -441,7 +450,7 @@ def _run_task_turns(agent, frame, history, context):
+     # carrier is this frame's bound claim, never the owner process's environment.
+     from agent.kanban_turn_recovery import recover_failed_kanban_turns
+     recover_failed_kanban_turns(recover, lambda: result, task_id=context['task_id'],
+-                                claim_check=lambda: _bound_claim_is_live(context))
++                                claim_state=lambda: _bound_claim_state(context))
+     from hermes_cli.turn_exit import turn_exit_code
+     # Only a settled turn may continue the goal loop: an exhausted or denied recovery reaches
+     # the honest exit path without re-entering the model under an unprovable claim.
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 442cf295a7e..da2e36137af 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2452,8 +2452,7 @@ def release_stale_claims(
+         started_at = _row_get(row, "worker_started_at")
+         live = host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at) and not heartbeat_stale
+         lease_lost = _sync.lease_lost(conn, row["id"], now, _resolve_claim_ttl_seconds() if live else None)  # [daveey] asks the Board
+-        if live and not lease_lost:
+-            _extend_live_stale_claim(conn, row, now)
++        if _stale_claim_kept(conn, row, now, live=live and not lease_lost, host_local=host_local, started_at=started_at):
+             continue
+ 
+         termination = _terminate_reclaimed_worker(
+@@ -4398,7 +4397,7 @@ from hermes_cli.kanban_db_workspace import (
+     _managed_scratch_path_info,
+     _scratch_workspace,
+ )
+-from hermes_cli.kanban_db_stale_claims import _extend_live_stale_claim
++from hermes_cli.kanban_db_stale_claims import _stale_claim_kept
+ from hermes_cli.kanban_db_heartbeat import heartbeat_claim
+ from hermes_cli.kanban_db_dispatch import (
+     DEFAULT_FAILURE_LIMIT,
+diff --git a/hermes_cli/kanban_db_stale_claims.py b/hermes_cli/kanban_db_stale_claims.py
+index 491cc241bee..045a7d75a2f 100644
+--- a/hermes_cli/kanban_db_stale_claims.py
++++ b/hermes_cli/kanban_db_stale_claims.py
+@@ -74,3 +74,35 @@ def _defer_reclaim_for_live_worker(
+         payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
+         payload.update(termination)
+         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
++
++
++def _exit_booked_transient(conn: sqlite3.Connection, row: sqlite3.Row, host_local: bool, started_at) -> bool:
++    """[daveey] True when a stale claim's host-local worker is already dead and its run's authority
++    recorded the transient exit (``KANBAN_RATE_LIMIT_EXIT_CODE``: requeue without a failure) under
++    this claim. ``release_stale_claims`` then leaves the run to the crash sweep of the same dispatcher
++    pass, which books exactly that exit. Reclaiming it here instead closed runs 10712/10714 as
++    ``lease_lost`` failures after their workers exited 75 in a networkless DarkWake: the stale sweep
++    runs first, and a lease that lapsed during the sleep is all it sees. A live worker, a worker with
++    no booking or another exit code, and a remote claim are untouched (the reclaim proceeds)."""
++    from hermes_cli import kanban_db as _kb
++    from hermes_cli.kanban_owner_recovery import managed_run_exit_code
++
++    pid = row["worker_pid"]
++    if not host_local or not pid or _kb._worker_alive(pid, started_at):
++        return False
++    try:
++        code = managed_run_exit_code(conn, row["id"], int(pid), row["claim_lock"])
++    except (sqlite3.Error, TypeError, ValueError):
++        return False
++    return code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE
++
++
++def _stale_claim_kept(conn: sqlite3.Connection, row: sqlite3.Row, now: int, *, live: bool, host_local: bool,
++                      started_at) -> bool:
++    """True when ``release_stale_claims`` keeps this expired claim: a live host-local worker the
++    Board still lets us hold has it extended (``_extend_live_stale_claim``), and a dead worker whose
++    transient exit is booked is left to the crash sweep (``_exit_booked_transient``)."""
++    if live:
++        _extend_live_stale_claim(conn, row, now)
++        return True
++    return _exit_booked_transient(conn, row, host_local, started_at)
+diff --git a/tests/agent/test_kanban_darkwake_recovery.py b/tests/agent/test_kanban_darkwake_recovery.py
+new file mode 100644
+index 00000000000..ea091a1cda9
+--- /dev/null
++++ b/tests/agent/test_kanban_darkwake_recovery.py
+@@ -0,0 +1,416 @@
++"""A Kanban worker survives a long sleep with networkless DarkWakes (runs 10712 / 10714).
++
++The 10-30 incident: a MacBook slept 16:57-21:31 with several maintenance DarkWakes that had no DNS.
++Two managed workers exited 75 during those wakes and the dispatcher then booked both runs
++``lease_lost`` (a failure) and gave the cards away:
++
++* 10714 (Anthropic): every stale-stream kill counted toward the cross-turn breaker, although each
++  kill only measured the sleep (the stream watchdog runs on wall time), so the fifth wake gave up.
++* 10712 (Codex): the turn failed while offline; in-place recovery found the claim lease expired
++  (the dispatcher that renews it was asleep too) and refused at once, 14 s before the dispatcher's
++  next tick would have extended it.
++* Both: the dispatcher's stale sweep ran before its crash sweep, so the worker's own transient exit
++  (75 = requeue without a failure) was overwritten by a ``lease_lost`` failure.
++
++These tests drive the real pieces: the stale breaker, the managed owner seam
++(``gateway.session_kanban.run_worker_turns``) on a real board, and the real dispatcher sweeps
++(``release_stale_claims`` with the suspend ledger, ``detect_crashed_workers``).
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
++
++# ── Anthropic path: the cross-turn stale breaker ─────────────────────
++
++
++def test_suspend_caused_stale_kills_do_not_trip_the_breaker(monkeypatch):
++    """A stale kill measured across a host suspend is the sleep's, not the provider's: eight
++    DarkWake kills in a row leave the streak at 0 and the next call is still allowed."""
++    import agent.chat_completion_helpers as h
++    import agent.chat_completion_stale_breaker as sb
++
++    monkeypatch.delenv("HERMES_STREAM_STALE_GIVEUP", raising=False)  # default 5
++    skew = {"s": 1_000.0}  # wall time minus awake time; grows by the suspended seconds
++    monkeypatch.setattr(sb, "_wall_minus_awake", lambda: skew["s"], raising=False)
++    agent = SimpleNamespace()
++    h._reset_stale_streak(agent)  # the last call before the lid closed completed
++
++    for gap in (3_600, 1_200, 900, 2_400, 600, 1_800, 300, 120):  # DarkWakes between sleeps
++        skew["s"] += gap
++        h._bump_stale_streak(agent)
++        h._check_stale_giveup(agent)  # never raises on a suspend-caused kill
++
++    assert h._stale_streak(agent) == 0
++
++
++def test_awake_stale_kills_still_trip_the_breaker(monkeypatch):
++    """Control: with no suspend in between, an unresponsive provider still gives up at 5 —
++    including right after a suspend-excused kill (the excuse does not carry over)."""
++    import agent.chat_completion_helpers as h
++    import agent.chat_completion_stale_breaker as sb
++
++    monkeypatch.delenv("HERMES_STREAM_STALE_GIVEUP", raising=False)
++    skew = {"s": 50.0}
++    monkeypatch.setattr(sb, "_wall_minus_awake", lambda: skew["s"], raising=False)
++    agent = SimpleNamespace()
++    h._reset_stale_streak(agent)
++    skew["s"] += 7_200
++    h._bump_stale_streak(agent)  # the wake kill: excused
++    assert h._stale_streak(agent) == 0
++    for _ in range(5):
++        skew["s"] += 2  # clock noise, no suspend
++        h._bump_stale_streak(agent)
++    assert h._stale_streak(agent) == 5
++    with pytest.raises(RuntimeError, match="5 consecutive stale attempts"):
++        h._check_stale_giveup(agent)
++
++
++def test_breaker_without_a_baseline_counts_the_first_kill(monkeypatch):
++    """No reset yet (fresh agent): there is no evidence of a suspend, so the kill counts."""
++    import agent.chat_completion_helpers as h
++    import agent.chat_completion_stale_breaker as sb
++
++    monkeypatch.setattr(sb, "_wall_minus_awake", lambda: 9_999.0, raising=False)
++    agent = SimpleNamespace()
++    h._bump_stale_streak(agent)
++    assert h._stale_streak(agent) == 1
++
++
++# ── Codex + Anthropic turn failures through recovery and the dispatcher ──
++
++
++@pytest.mark.parametrize(
++    ("change", "state"),
++    [
++        pytest.param({}, "live", id="unexpired"),
++        pytest.param({"claim_expires": -60}, "lapsed", id="expired-only"),
++        pytest.param({"claim_expires": -60, "claim_lock": "other:1"}, "lost", id="expired-and-relocked"),
++        pytest.param({"claim_expires": -60, "status": "ready"}, "lost", id="expired-and-released"),
++        pytest.param({"claim_expires": None}, "lost", id="null-lease"),
++    ],
++)
++def test_claim_state_separates_a_lapse_from_a_takeover(tmp_path, monkeypatch, change, state):
++    """Only a lease whose every coordinate is still ours reads ``lapsed``; anything else is ``lost``."""
++    import agent.kanban_turn_recovery as rec
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    kb.init_db()
++    path = kb.kanban_db_path()
++    with connect_closing(path) as conn:
++        tid = kb.create_task(conn, title="t")
++        task = kb.claim_task(conn, tid, claimer="me:1")
++        now = int(time.time())
++        with kb.write_txn(conn):
++            for column, value in change.items():
++                if column == "claim_expires" and value is not None:
++                    value = now + value
++                conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, tid))
++                if column == "claim_expires":
++                    conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (value, task.current_run_id))
++    got = rec.worker_claim_state(task_id=tid, db_path=str(path), run_id=str(task.current_run_id),
++                                 claim_lock="me:1", verify_pid=False)
++    assert got == state
++    assert rec.worker_claim_is_live(task_id=tid, db_path=str(path), run_id=str(task.current_run_id),
++                                    claim_lock="me:1", verify_pid=False) is (state == "live")
++
++
++_CODEX_OFFLINE = {
++    "failed": True, "failure_retryable": True, "failure_reason": "timeout",
++    "error": "APIConnectionError: Connection error. ([Errno 8] nodename nor servname provided, or not known)",
++    "final_response": "API call failed after 3 retries: Connection error.", "completed": False, "messages": [],
++}
++_ANTHROPIC_STALE = {
++    "failed": True, "failure_retryable": True, "failure_reason": "timeout",
++    "error": "Stream stalled: no data from api.anthropic.com for 180s",
++    "final_response": "API call failed after 3 retries: stream stalled", "completed": False, "messages": [],
++}
++_SUCCESS = {"failed": False, "completed": True, "final_response": "done", "messages": []}
++
++_SLEEP_S = 4 * 3600 + 33 * 60  # 16:57:52 -> 21:31:30
++
++
++@pytest.fixture
++def submitter():
++    """The dispatcher-spawned submitter process: alive the whole time the owner runs turns."""
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
++    try:
++        for _ in range(50):
++            if kbd._process_fingerprint(proc.pid):
++                break
++            time.sleep(0.05)
++        yield proc
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++@pytest.fixture
++def slept_worker(tmp_path, monkeypatch, submitter):
++    """A host-local managed run whose lease lapsed during a recorded 4.5 h sleep.
++
++    ``install(script, on_sleep)`` returns ``(run, entered, context, conn)``; ``on_sleep(n, conn,
++    context)`` runs inside every recovery wait (n = 1, 2, ...) and stands in for whatever the
++    dispatcher does meanwhile."""
++    import agent.kanban_turn_recovery as rec
++    from gateway import session_kanban
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import kanban_suspend_ledger as ledger
++    from hermes_cli.kanban_db_connect import connect
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    for key, value in (("HERMES_KANBAN_TASK", "t_foreign"), ("HERMES_KANBAN_DB", str(tmp_path / "nope.db")),
++                       ("HERMES_KANBAN_RUN_ID", "999"), ("HERMES_KANBAN_CLAIM_LOCK", "foreign")):
++        monkeypatch.setenv(key, value)
++    monkeypatch.setattr(rec, "RECOVERY_DELAYS_SECONDS", (0.0,))
++    monkeypatch.setattr("agent.skill_commands.build_preloaded_skills_prompt", lambda *a, **k: ("", [], []))
++    opened = []
++
++    def install(script, on_sleep=lambda n, conn, context: None):
++        kb.init_db()
++        path = kb.kanban_db_path()
++        assert str(path).startswith(str(tmp_path))
++        conn = connect(path)
++        opened.append(conn)
++        task_id = kb.create_task(conn, title="sleep survival", assignee="default")
++        task = kb.claim_task(conn, task_id)  # host-local claimer: this dispatcher's
++        assert task is not None
++        kbd._set_worker_pid(conn, task_id, submitter.pid, run_id=task.current_run_id, claim_lock=task.claim_lock)
++        now = int(time.time())
++        with kb.write_txn(conn):
++            kb._append_event(conn, task_id, "worker_bound",
++                             {"pid": os.getpid(), "claim_lock": task.claim_lock}, run_id=task.current_run_id)
++            # Last heartbeat and lease renewal right before the lid closed; the lease ran out asleep.
++            conn.execute("UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ?, started_at = ? WHERE id = ?",
++                         (now - 60, now - _SLEEP_S - 30, now - _SLEEP_S - 600, task_id))
++            conn.execute("UPDATE task_runs SET claim_expires = ?, last_heartbeat_at = ?, started_at = ? WHERE id = ?",
++                         (now - 60, now - _SLEEP_S - 30, now - _SLEEP_S - 600, task.current_run_id))
++        # The dispatcher's own record of the suspend (it ran right before and right after it).
++        ledger.record_dispatch_pass(conn, now=now - _SLEEP_S, interval_seconds=60)
++        ledger.record_dispatch_pass(conn, now=now - 20, interval_seconds=60)
++
++        context = {"db": str(path), "task_id": task_id, "run_id": task.current_run_id,
++                   "claim_lock": task.claim_lock, "skills": [], "context": "", "goal_mode": False,
++                   "goal_text": "g", "goal_max_turns": 2}
++        entered: list[str] = []
++        seen = {"n": 0}
++        sleeps = {"n": 0}
++
++        def fake_sleep(_seconds):
++            sleeps["n"] += 1
++            on_sleep(sleeps["n"], conn, context)
++
++        monkeypatch.setattr(rec, "_sleep", fake_sleep, raising=False)
++
++        class _Agent:
++            session_id = "s1"
++
++            def __init__(self):
++                self._session_db = self
++
++            def get_messages_as_conversation(self, _sid):
++                return [{"role": "user", "content": "from-store"}]
++
++            def run_conversation(self, message, conversation_history=None, **_kwargs):
++                entered.append(message)
++                result = script[seen["n"]]
++                seen["n"] += 1
++                return result
++
++        frame = {"text": "work", "policy": {"kanban_json": json.dumps(context)}}
++
++        def run() -> int:
++            session_kanban.run_worker_turns(_Agent(), frame, [])
++            return session_kanban.worker_exit_code(path, context)
++
++        return run, entered, context, conn
++
++    yield install
++    for conn in opened:
++        conn.close()
++
++
++def _dispatcher_tick(n, conn, context):
++    """The dispatcher's first pass after the wake: the stale sweep sees a live submitter."""
++    from hermes_cli import kanban_db as kb
++
++    if n == 1:
++        kb.release_stale_claims(conn)
++
++
++@pytest.mark.parametrize("failure", [pytest.param(_CODEX_OFFLINE, id="codex-offline"),
++                                     pytest.param(_ANTHROPIC_STALE, id="anthropic-stale")])
++def test_lapsed_lease_is_renewed_and_the_run_survives(slept_worker, failure):
++    """The turn fails in a DarkWake while the lease is lapsed. The worker waits for the dispatcher's
++    renewal instead of exiting, then recovers in place: same run, no failure counted, no second run."""
++    from hermes_cli import kanban_db as kb
++
++    run, entered, context, conn = slept_worker([failure, _SUCCESS], on_sleep=_dispatcher_tick)
++
++    assert run() == 0
++    assert len(entered) == 2 and "Do NOT start over" in entered[1]
++    events = kb.list_events(conn, context["task_id"])
++    kinds = [e.kind for e in events]
++    assert "claim_extended" in kinds
++    assert not {"reclaimed", "crashed", "timed_out", "heartbeat_stale"} & set(kinds)
++    extended = [e for e in events if e.kind == "claim_extended"][-1]
++    assert extended.payload["claim_lock"] == context["claim_lock"]
++    task = kb.get_task(conn, context["task_id"])
++    assert task.status == "running" and task.current_run_id == context["run_id"]
++    assert task.claim_lock == context["claim_lock"]
++    assert (task.consecutive_failures or 0) == 0
++    runs = conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (context["task_id"],)).fetchall()
++    assert [r[0] for r in runs] == [context["run_id"]]  # no duplicate attempt
++
++
++def _steal(n, conn, context):
++    """Another holder takes the card while this worker waits: released, then claimed elsewhere."""
++    from hermes_cli import kanban_db as kb
++
++    if n == 1:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
++                         "worker_pid=NULL, worker_started_at=NULL WHERE id=?", (context["task_id"],))
++            kb._end_run(conn, context["task_id"], outcome="reclaimed", status="reclaimed", error="stolen")
++        assert kb.claim_task(conn, context["task_id"], claimer="other-gateway:4242") is not None
++
++
++def _relock_in_place(n, conn, context):
++    """The lease is renewed, but under a different lock: not ours."""
++    from hermes_cli import kanban_db as kb
++
++    if n == 1:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET claim_lock='other-gateway:4242', claim_expires=? WHERE id=?",
++                         (int(time.time()) + 900, context["task_id"]))
++
++
++@pytest.mark.parametrize("steal", [pytest.param(_steal, id="reclaimed-and-reclaimed-elsewhere"),
++                                   pytest.param(_relock_in_place, id="renewed-under-another-lock")])
++def test_stolen_lease_stays_fenced(slept_worker, steal):
++    """A lapse is only waited out for OUR lease: once anyone else holds the card the worker never
++    re-enters the model, and the other holder's run is left alone."""
++    from hermes_cli import kanban_db as kb
++
++    run, entered, context, conn = slept_worker([_CODEX_OFFLINE, _SUCCESS], on_sleep=steal)
++
++    assert run() == KANBAN_RATE_LIMIT_EXIT_CODE
++    assert len(entered) == 1  # no recovery turn under a lease that is no longer ours
++    task = kb.get_task(conn, context["task_id"])
++    assert task.claim_lock == "other-gateway:4242"
++
++
++def test_lease_never_renewed_gives_up_after_the_awake_budget(slept_worker, monkeypatch):
++    """Nobody renews (dispatcher gone): the wait is bounded by AWAKE time and ends without a turn."""
++    import agent.kanban_turn_recovery as rec
++
++    awake = {"t": 0.0}
++    monkeypatch.setattr(rec, "_awake_clock", lambda: awake["t"])
++
++    def nobody(n, conn, context):
++        awake["t"] += rec.LAPSED_CLAIM_POLL_SECONDS
++
++    run, entered, _context, _conn = slept_worker([_CODEX_OFFLINE, _SUCCESS], on_sleep=nobody)
++
++    assert run() == KANBAN_RATE_LIMIT_EXIT_CODE
++    assert len(entered) == 1
++    assert awake["t"] >= rec.LAPSED_CLAIM_WAIT_SECONDS
++
++
++# ── the dispatcher books the worker's own transient exit ─────────────
++
++
++@pytest.fixture
++def dead_submitter():
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
++    fingerprint = None
++    for _ in range(50):
++        fingerprint = kbd._process_fingerprint(proc.pid)
++        if fingerprint:
++            break
++        time.sleep(0.05)
++    proc.kill()
++    proc.wait()
++    return proc.pid, fingerprint
++
++
++def _exited_run(conn, pid, fingerprint, *, exit_code):
++    """A host-local run whose worker already exited (``exit_code`` booked by its owner, None = no
++    booking) and whose lease lapsed while the host slept."""
++    from hermes_cli import kanban_db as kb
++
++    tid = kb.create_task(conn, title="exited", assignee="default")
++    task = kb.claim_task(conn, tid)
++    now = int(time.time())
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_pid=?, worker_started_at=?, claim_expires=?, last_heartbeat_at=?, "
++                     "started_at=? WHERE id=?", (pid, fingerprint, now - 60, now - 120, now - 3600, tid))
++        conn.execute("UPDATE task_runs SET worker_pid=?, worker_started_at=?, claim_expires=? WHERE id=?",
++                     (pid, fingerprint, now - 60, task.current_run_id))
++        kb._append_event(conn, tid, "worker_bound", {"pid": pid, "claim_lock": task.claim_lock},
++                         run_id=task.current_run_id)
++        if exit_code is not None:
++            kb._append_event(conn, tid, "worker_result", {"pid": pid, "claim_lock": task.claim_lock,
++                                                          "exit_code": exit_code, "last_output": ""},
++                             run_id=task.current_run_id)
++    return tid, task.current_run_id
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def test_transient_exit_is_booked_by_the_crash_sweep_not_as_a_failure(board, dead_submitter):
++    """The worker exited 75 (transient: requeue without a failure) and its lease lapsed. The stale
++    sweep leaves that booking to the crash sweep of the same pass: no failure, run ``rate_limited``."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    tid, run_id = _exited_run(board, *dead_submitter, exit_code=KANBAN_RATE_LIMIT_EXIT_CODE)
++
++    assert kb.release_stale_claims(board) == 0
++    assert "reclaimed" not in [e.kind for e in kb.list_events(board, tid)]
++    kbd.detect_crashed_workers(board)
++
++    outcome = board.execute("SELECT outcome FROM task_runs WHERE id=?", (run_id,)).fetchone()[0]
++    assert outcome == "rate_limited"
++    task = kb.get_task(board, tid)
++    assert task.status == "ready" and (task.consecutive_failures or 0) == 0
++
++
++def test_exit_without_a_booking_is_still_reclaimed(board, dead_submitter):
++    """Control: a dead worker that booked nothing is reclaimed by the stale sweep exactly as before."""
++    from hermes_cli import kanban_db as kb
++
++    tid, run_id = _exited_run(board, *dead_submitter, exit_code=None)
++
++    assert kb.release_stale_claims(board) == 1
++    outcome = board.execute("SELECT outcome FROM task_runs WHERE id=?", (run_id,)).fetchone()[0]
++    assert outcome == "reclaimed"
++    assert (kb.get_task(board, tid).consecutive_failures or 0) == 1
+diff --git a/tests/agent/test_kanban_turn_recovery.py b/tests/agent/test_kanban_turn_recovery.py
+index 025e9804191..2a67e3b58d1 100644
+--- a/tests/agent/test_kanban_turn_recovery.py
++++ b/tests/agent/test_kanban_turn_recovery.py
+@@ -329,6 +329,7 @@ def test_lease_expired_during_the_backoff_blocks_model_reentry(
+     _pin_carrier(clear_kanban_env, db, run_id="1", lock="lk")
+     clock = iter([1_000, 1_700])  # pre-backoff proof sees a live lease; the re-proof does not
+     monkeypatch.setattr(rec, "_now", lambda: next(clock))
++    monkeypatch.setattr(rec, "LAPSED_CLAIM_WAIT_SECONDS", 0.0)  # nobody renews it here
+     turns: list[str] = []
+     emitted: list[str] = []
+ 
+@@ -481,6 +482,9 @@ def owner_worker(tmp_path, clear_kanban_env, monkeypatch):
+                        ("HERMES_KANBAN_RUN_ID", "999"), ("HERMES_KANBAN_CLAIM_LOCK", "foreign")):
+         monkeypatch.setenv(key, value)
+     monkeypatch.setattr(rec, "RECOVERY_DELAYS_SECONDS", (0.0,))
++    # An expired lease in these tests is never renewed: deny at once instead of waiting out the
++    # lapsed-lease budget (that wait is covered by tests/agent/test_kanban_darkwake_recovery.py).
++    monkeypatch.setattr(rec, "LAPSED_CLAIM_WAIT_SECONDS", 0.0)
+     monkeypatch.setattr("agent.skill_commands.build_preloaded_skills_prompt", lambda *a, **k: ("", [], []))
+ 
+     def install(script, *, goal_mode=False, expires=None, recovery=None):
+diff --git a/tests/gateway/test_session_kanban_turn_recovery.py b/tests/gateway/test_session_kanban_turn_recovery.py
+index b3bba4c28ba..0d35f9ba756 100644
+--- a/tests/gateway/test_session_kanban_turn_recovery.py
++++ b/tests/gateway/test_session_kanban_turn_recovery.py
+@@ -70,6 +70,9 @@ def test_failed_turn_retries_in_place_from_frame_carrier(tmp_path, monkeypatch):
+ 
+ def test_unprovable_claim_denies_retry_and_goal_continuation(tmp_path, monkeypatch):
+     path, context, frame = _claimed_frame(tmp_path, monkeypatch, expired=True, goal_mode=True)
++    # Nobody renews this lapsed lease: deny at once instead of waiting out the awake budget
++    # (the wait itself is covered by tests/agent/test_kanban_darkwake_recovery.py).
++    monkeypatch.setattr(rec, "LAPSED_CLAIM_WAIT_SECONDS", 0.0)
+     goal_calls = []
+     monkeypatch.setattr("hermes_cli.goals.run_kanban_goal_loop", lambda **kw: goal_calls.append(kw))
+     agent = _Agent([dict(FAILED)])
+-- 
+2.55.0
+

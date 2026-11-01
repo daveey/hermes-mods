@@ -1,0 +1,628 @@
+From 0a86710b2584157f259ea61049fc75b6aa1f3a20 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:12:33 +0000
+Subject: [PATCH] fix(gateway): attribute control latency and blocked loops
+ [daveey]
+
+---
+ gateway/control_diagnostics.py            | 184 +++++++++++++
+ gateway/control_socket.py                 |  47 +++-
+ tests/gateway/test_control_diagnostics.py | 316 ++++++++++++++++++++++
+ 3 files changed, 542 insertions(+), 5 deletions(-)
+ create mode 100644 gateway/control_diagnostics.py
+ create mode 100644 tests/gateway/test_control_diagnostics.py
+
+diff --git a/gateway/control_diagnostics.py b/gateway/control_diagnostics.py
+new file mode 100644
+index 00000000000..4e8296afd16
+--- /dev/null
++++ b/gateway/control_diagnostics.py
+@@ -0,0 +1,184 @@
++"""Local control diagnostics; never retains request payloads or stack locals."""
++from __future__ import annotations
++
++import asyncio
++import itertools
++import json
++import sys
++import logging
++import threading
++import time
++
++logger = logging.getLogger(__name__)
++
++
++def safe_verb(raw, allowed):
++    try:
++        request = json.loads(raw)
++        verb = request.get("verb") if isinstance(request, dict) else None
++        return verb if isinstance(verb, str) and verb in allowed else "unknown"
++    except (ValueError, UnicodeError):
++        return "unknown"
++
++
++class ControlDiagnostics:
++    def __init__(self):
++        self._lock = threading.Lock()
++        self._in_flight = 0
++
++    @property
++    def in_flight(self):
++        with self._lock:
++            return self._in_flight
++
++    def accepted(self):
++        # Acceptance means the asyncio connection callback, NOT kernel accept.
++        with self._lock:
++            self._in_flight += 1
++        return RequestTiming(self, time.monotonic())
++
++    def completed(self, timing):
++        with self._lock:
++            count = self._in_flight
++            self._in_flight -= 1
++        if timing.total > 0.5 or timing.queue_wait > 0.5:
++            fields = dict(verb=timing.verb, queue_wait_ms=timing.queue_wait * 1000,
++                          run_ms=timing.run_time * 1000, total_ms=timing.total * 1000,
++                          in_flight=count)
++            logger.warning(
++                "Control request latency (callback acceptance-to-drain/completion) "
++                "verb=%s queue_wait_ms=%.1f run_ms=%.1f total_ms=%.1f in_flight=%d",
++                *fields.values(), extra=fields)
++
++
++class RequestTiming:
++    def __init__(self, owner, accepted):
++        self.owner, self.accepted = owner, accepted
++        self.verb = "unknown"
++        self.queue_wait = self.run_time = self.total = 0.0
++        self._lock = threading.Lock()
++        self._connection_done = self._work_pending = self._reported = False
++
++    def enqueue(self):
++        with self._lock:
++            self._work_pending = True
++            self._enqueued = time.monotonic()
++
++    def run(self, handler, *args):
++        started = time.monotonic()
++        with self._lock:
++            self.queue_wait = started - self._enqueued
++        try:
++            return handler(*args)
++        finally:
++            with self._lock:
++                self.run_time = time.monotonic() - started
++
++    def work_done(self, future):
++        with self._lock:
++            if future.cancelled():
++                self.queue_wait = time.monotonic() - self._enqueued
++            self._work_pending = False
++            # A cancelled connection cannot cancel an already-running Python handler.
++            # Its completion, rather than the abandoned drain, ends total latency.
++            self.total = max(self.total, time.monotonic() - self.accepted)
++            self._report_if_done()
++
++    def finish(self):
++        with self._lock:
++            if self._connection_done:
++                return False
++            self.total = time.monotonic() - self.accepted
++            self._connection_done = True
++            self._report_if_done()
++            return True
++
++    def _report_if_done(self):
++        # Cancelled connections remain in flight until any executing handler ends.
++        if self._connection_done and not self._work_pending and not self._reported:
++            self._reported = True
++            self.owner.completed(self)
++
++
++def _frame_location(frame):
++    # No locals, source lines, task reprs or names: they may contain request secrets.
++    return f"{frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}"
++
++
++def _thread_stacks():
++    stacks = []
++    for ident, frame in sys._current_frames().items():
++        locations = []
++        for _ in range(64):
++            if frame is None:
++                break
++            locations.append(_frame_location(frame))
++            frame = frame.f_back
++        stacks.append(f"thread={ident}\n" + "\n".join(locations))
++    return "\n".join(stacks)
++
++
++class LoopWatchdog:
++    """Diagnostic only. Live thread stacks plus the last loop-owned task snapshot.
++
++    A loop blocked in Python/native code must release the GIL for this thread to run.
++    This does not replace or change the long-timeout process liveness watchdog.
++    """
++    interval = 0.25
++    threshold = 1.0
++    repeat_interval = 30.0
++
++    def __init__(self, loop):
++        self.loop = loop
++        self._stop = threading.Event()
++        self._lock = threading.Lock()
++        self._last_warning = float("-inf")
++        self._heartbeat = None
++        from agent.memory_provider import spawn_context_thread
++        self.thread = spawn_context_thread(self._watch, name="control-loop-diagnostics", daemon=True)
++
++    def start(self):
++        self._beat()
++        self.thread.start()
++
++    def _beat(self):
++        if self._stop.is_set():
++            return
++        # asyncio task enumeration and get_stack are ONLY called on their owning loop.
++        stacks = "\n".join(
++            "task\n" + "\n".join(_frame_location(f) for f in task.get_stack(limit=16))
++            for task in itertools.islice(asyncio.all_tasks(self.loop), 64))
++        with self._lock:
++            self._snapshot_at = time.monotonic()
++            self._due = self._snapshot_at + self.interval
++            self._tasks = stacks
++        self._heartbeat = self.loop.call_later(self.interval, self._beat)
++
++    def _watch(self):
++        while not self._stop.wait(self.interval):
++            self._check()
++
++    def _check(self):
++        now = time.monotonic()
++        with self._lock:
++            delay, tasks, age = now - self._due, self._tasks, now - self._snapshot_at
++        if delay <= self.threshold or now - self._last_warning < self.repeat_interval:
++            return
++        self._last_warning = now
++        threads = _thread_stacks()
++        if self._stop.is_set():
++            return
++        logger.warning(
++            "Control event loop blocked delay_ms=%.1f; live thread stacks:\n%s\n"
++            "last loop-owned task snapshot age_ms=%.1f:\n%s",
++            delay * 1000, threads, age * 1000, tasks,
++            extra=dict(delay_ms=delay * 1000, thread_stacks=threads, task_stacks=tasks,
++                       task_snapshot_age_ms=age * 1000))
++
++    def stop(self):
++        self._stop.set()
++        if self._heartbeat is not None:
++            self._heartbeat.cancel()
++        if self.thread.ident is not None:
++            self.thread.join(timeout=2)
++
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index ec80437bc81..8d36fd76bcf 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -300,6 +300,9 @@ class GatewayControlServer:
+         # The real directory, as clients canonicalize it: the peer check below refuses any
+         # symlinked component, so an unresolved symlinked ~/.hermes would never mint tickets.
+         self._home = Path(home).resolve()
++        from gateway.control_diagnostics import ControlDiagnostics
++        self._diagnostics = ControlDiagnostics()
++        self._loop_watchdog = None
+         self.ticket_store = None
+         self.private_handlers = {}
+         self._server: Optional[asyncio.AbstractServer] = None
+@@ -317,7 +320,12 @@ class GatewayControlServer:
+     async def start(self) -> bool:
+         """Bind and start serving. Returns True on success, False otherwise."""
+         try:
+-            return await (self._start_windows() if _IS_WINDOWS else self._start_posix())
++            started = await (self._start_windows() if _IS_WINDOWS else self._start_posix())
++            if started:
++                from gateway.control_diagnostics import LoopWatchdog
++                self._loop_watchdog = LoopWatchdog(asyncio.get_running_loop())
++                self._loop_watchdog.start()
++            return started
+         except Exception as exc:
+             await self.stop()
+             logger.warning("Gateway control socket failed to start: %s", exc)
+@@ -375,7 +383,7 @@ class GatewayControlServer:
+         # Restrictive umask so the socket is never world-connectable, even for the instant before chmod.
+         old_umask = os.umask(0o177)
+         try:
+-            self._server = await asyncio.start_unix_server(self._handle_connection, path=str(bind_path))
++            self._server = await asyncio.start_unix_server(self._connection_accepted, path=str(bind_path))
+         finally:
+             os.umask(old_umask)
+         with contextlib.suppress(OSError):
+@@ -389,6 +397,9 @@ class GatewayControlServer:
+         return True
+     async def stop(self) -> None:
+         """Stop serving and remove the socket/pointer files."""
++        if self._loop_watchdog is not None:
++            self._loop_watchdog.stop()
++            self._loop_watchdog = None
+         if self.ticket_store is not None:
+             self.ticket_store.revoke()
+         if self._server is not None:
+@@ -514,15 +525,40 @@ class GatewayControlServer:
+         except OSError:
+             return None
+ 
+-    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
++    def _connection_accepted(self, reader, writer):
++        timing = self._diagnostics.accepted()
++        task = asyncio.create_task(self._handle_connection(reader, writer, timing))
++        # Also accounts for cancellation before the coroutine's first instruction.
++        def completed(_):
++            if timing.finish():
++                with contextlib.suppress(Exception):
++                    writer.close()
++        task.add_done_callback(completed)
++        return task
++
++    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
++                                 timing=None) -> None:
++        timing = timing or self._diagnostics.accepted()
+         try:
+             raw = await asyncio.wait_for(reader.readline(), timeout=_DEFAULT_CLIENT_TIMEOUT)
+             if not raw or len(raw) > _MAX_REQUEST_BYTES:
+                 return
+             # Handlers read disk; keep that off the loop that drives every platform
+             # adapter so a fast-polling consumer can't stall heartbeats.
+-            response = await asyncio.get_running_loop().run_in_executor(
+-                _control_executor(), self.handle_request_line, raw.rstrip(b"\n"), self._posix_peer_subject(writer))
++            from gateway.control_diagnostics import safe_verb
++            timing.verb = safe_verb(raw, self._handlers.keys() | self.private_handlers.keys() | {"session-ticket"})
++            peer = self._posix_peer_subject(writer)
++            timing.enqueue()
++            try:
++                future = _control_executor().submit(timing.run, self.handle_request_line, raw.rstrip(b"\n"), peer)
++            except BaseException:
++                from concurrent.futures import Future
++                failed = Future()
++                failed.cancel()
++                timing.work_done(failed)
++                raise
++            future.add_done_callback(timing.work_done)
++            response = await asyncio.wrap_future(future)
+             writer.write(response)
+             await asyncio.wait_for(writer.drain(), timeout=_DEFAULT_CLIENT_TIMEOUT)
+         except (TimeoutError, ConnectionError, OSError):
+@@ -530,6 +566,7 @@ class GatewayControlServer:
+         except Exception:
+             logger.debug("Control socket connection handler error", exc_info=True)
+         finally:
++            timing.finish()
+             with contextlib.suppress(Exception):
+                 writer.close()
+ 
+diff --git a/tests/gateway/test_control_diagnostics.py b/tests/gateway/test_control_diagnostics.py
+new file mode 100644
+index 00000000000..10d864de6a9
+--- /dev/null
++++ b/tests/gateway/test_control_diagnostics.py
+@@ -0,0 +1,316 @@
++"""Control latency and live blocked-loop diagnostics contracts."""
++import asyncio
++import json
++import logging
++import threading
++
++import pytest
++
++from gateway.control_socket import GatewayControlServer
++
++
++async def exchange(server, verb="status", params=None):
++    reader, writer = await asyncio.open_unix_connection(str(server._bind_path))
++    try:
++        writer.write(json.dumps({"verb": verb, "params": params}).encode() + b"\n")
++        await writer.drain()
++        return json.loads(await asyncio.wait_for(reader.readline(), 5))
++    finally:
++        writer.close()
++        await writer.wait_closed()
++
++
++def latency_records(caplog):
++    return [r for r in caplog.records if "Control request latency" in r.getMessage()]
++
++
++@pytest.mark.platforms("posix")
++def test_slow_real_verb_warns_without_parameters(tmp_path, caplog):
++    def status(params):
++        threading.Event().wait(0.6)  # health: allow HX013 -- real handler latency is the behavior under test
++        return {"done": True}
++
++    async def run():
++        server = GatewayControlServer(tmp_path, verb_handlers={"status": status})
++        assert await server.start()
++        try:
++            assert (await exchange(server, params={"secret": "NEVER-LOG-ME"}))["ok"]
++        finally:
++            await server.stop()
++
++    with caplog.at_level(logging.WARNING):
++        asyncio.run(run())
++    records = latency_records(caplog)
++    assert len(records) == 1
++    record = records[0]
++    assert record.verb == "status"
++    assert record.run_ms >= 500
++    assert record.total_ms >= record.run_ms
++    assert record.queue_wait_ms >= 0
++    assert record.in_flight >= 1
++    assert "NEVER-LOG-ME" not in caplog.text
++
++
++@pytest.mark.platforms("posix")
++def test_watchdog_captures_while_loop_blocked_and_stops(tmp_path, caplog):
++    observed = threading.Event()
++
++    class Observer(logging.Handler):
++        def emit(self, record):
++            if "Control event loop blocked" in record.getMessage():
++                observed.set()
++
++    observer = Observer()
++    log = logging.getLogger("gateway.control_diagnostics")
++    log.addHandler(observer)
++
++    async def run():
++        server = GatewayControlServer(tmp_path)
++        assert await server.start()
++        try:
++            # Deliberately blocks THIS loop; only the independent thread can release it.
++            assert observed.wait(4), "no warning captured while the loop was blocked"
++            watchdog = server._loop_watchdog
++            assert watchdog is not None
++            assert watchdog.thread.daemon
++        finally:
++            await server.stop()
++        assert not watchdog.thread.is_alive()
++        await server.stop()
++
++    try:
++        with caplog.at_level(logging.WARNING):
++            asyncio.run(run())
++    finally:
++        log.removeHandler(observer)
++    records = [r for r in caplog.records if "Control event loop blocked" in r.getMessage()]
++    assert len(records) == 1
++    assert "test_watchdog_captures_while_loop_blocked_and_stops" in records[0].thread_stacks
++    assert "run" in records[0].task_stacks
++    assert records[0].delay_ms > 1000
++
++
++@pytest.mark.platforms("posix")
++def test_saturated_executor_queue_and_fast_quiet(tmp_path, caplog):
++    from concurrent.futures import ThreadPoolExecutor
++    from unittest.mock import patch
++    from tests.waiting import async_wait_until
++
++    release = threading.Event()
++    entered = [threading.Event() for _ in range(4)]
++
++    def occupy(event):
++        event.set()
++        release.wait(5)
++
++    async def run(pool):
++        server = GatewayControlServer(tmp_path, verb_handlers={"status": lambda: {"ok": True}})
++        assert await server.start()
++        try:
++            assert (await exchange(server))["ok"]
++            assert not latency_records(caplog)
++            jobs = [pool.submit(occupy, event) for event in entered]
++            assert all(event.wait(3) for event in entered)
++            pending = asyncio.create_task(exchange(server))
++            await async_wait_until(lambda: server._diagnostics.in_flight == 1, timeout=3)
++            timer = threading.Timer(0.7, release.set)
++            timer.start()
++            try:
++                assert (await pending)["ok"]
++            finally:
++                release.set()
++                timer.join()
++            for job in jobs:
++                job.result(3)
++            assert server._diagnostics.in_flight == 0
++        finally:
++            release.set()
++            await server.stop()
++
++    with caplog.at_level(logging.WARNING), ThreadPoolExecutor(max_workers=4) as pool:
++        with patch("gateway.control_socket._control_executor", return_value=pool):
++            asyncio.run(run(pool))
++    records = latency_records(caplog)
++    assert len(records) == 1
++    assert records[0].queue_wait_ms >= 500
++    assert records[0].total_ms >= records[0].queue_wait_ms
++
++
++def test_callback_cancellation_before_start_closes_and_accounts(tmp_path):
++    from unittest.mock import Mock
++
++    async def run():
++        server = GatewayControlServer(tmp_path)
++        writer = Mock()
++        task = server._connection_accepted(asyncio.StreamReader(), writer)
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert server._diagnostics.in_flight == 0
++        writer.close.assert_called_once()
++
++    asyncio.run(run())
++
++
++def test_timing_cancelled_running_work_is_counted_until_completion(caplog):
++    from concurrent.futures import ThreadPoolExecutor
++    from gateway.control_diagnostics import ControlDiagnostics
++
++    entered, release = threading.Event(), threading.Event()
++    diagnostics = ControlDiagnostics()
++    timing = diagnostics.accepted()
++
++    def handler():
++        entered.set()
++        release.wait(3)
++        raise ValueError("private-error")
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        timing.enqueue()
++        future = pool.submit(timing.run, handler)
++        future.add_done_callback(timing.work_done)
++        try:
++            assert entered.wait(3)
++            timing.finish()
++            timing.finish()
++            assert diagnostics.in_flight == 1
++        finally:
++            release.set()
++        with pytest.raises(ValueError):
++            future.result(3)
++    assert diagnostics.in_flight == 0
++    assert "private-error" not in caplog.text
++
++
++@pytest.mark.parametrize("raw", [b'{"verb":"secret\\\\nattack"}', b'{"verb":[]}', b'[]', b'bad', b'\xff'])
++def test_unknown_verb_redacted(raw):
++    from gateway.control_diagnostics import safe_verb
++    assert safe_verb(raw, {"status"}) == "unknown"
++    assert safe_verb(b'{"verb":"status","params":{"secret":1}}', {"status"}) == "status"
++
++
++def test_watchdog_rate_limit_and_loop_owned_snapshot(monkeypatch, caplog):
++    import types
++    from gateway import control_diagnostics as diagnostics
++
++    clock = [0.0]
++    monkeypatch.setattr(diagnostics, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
++    original = asyncio.all_tasks
++    owner = threading.get_ident()
++
++    def tasks(loop):
++        assert threading.get_ident() == owner
++        return original(loop)
++
++    monkeypatch.setattr(asyncio, "all_tasks", tasks)
++
++    async def run():
++        watchdog = diagnostics.LoopWatchdog(asyncio.get_running_loop())
++        watchdog._beat()
++        try:
++            for now in (2, 3, 10, 32):
++                clock[0] = now
++                thread = threading.Thread(target=watchdog._check)
++                thread.start()
++                thread.join(3)
++                assert not thread.is_alive()
++        finally:
++            watchdog.stop()
++
++    with caplog.at_level(logging.WARNING):
++        asyncio.run(run())
++    assert len([r for r in caplog.records if "Control event loop blocked" in r.getMessage()]) == 2
++
++
++@pytest.mark.platforms("posix")
++def test_failed_start_has_no_watchdog(tmp_path):
++    async def run():
++        server = GatewayControlServer(tmp_path / "missing")
++        assert not await server.start()
++        assert server._loop_watchdog is None
++        await server.stop()
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("verb", ["status", "secret-unknown"])
++def test_callback_start_delay_included_and_error_private(tmp_path, caplog, verb):
++    from unittest.mock import AsyncMock, Mock
++
++    def status(params):
++        raise ValueError(params["secret"])
++
++    async def run():
++        server = GatewayControlServer(tmp_path, verb_handlers={"status": status})
++        reader = asyncio.StreamReader()
++        reader.feed_data(json.dumps({"verb": verb, "params": {"secret": "PRIVATE"}}).encode() + b"\n")
++        writer = Mock()
++        writer.drain = AsyncMock()
++        server._posix_peer_subject = lambda writer: None
++        task = server._connection_accepted(reader, writer)
++        threading.Event().wait(0.6)  # health: allow HX013 -- callback-to-coroutine startup delay is under test
++        await task
++        assert not json.loads(writer.write.call_args.args[0])["ok"]
++        assert server._diagnostics.in_flight == 0
++
++    with caplog.at_level(logging.WARNING):
++        asyncio.run(run())
++    record, = latency_records(caplog)
++    assert record.total_ms >= 500
++    assert record.verb == ("status" if verb == "status" else "unknown")
++    assert "PRIVATE" not in caplog.text
++    assert "secret-unknown" not in caplog.text
++
++
++def test_cancelled_queued_work_accounts_once():
++    from concurrent.futures import Future
++    from gateway.control_diagnostics import ControlDiagnostics
++
++    diagnostics = ControlDiagnostics()
++    timing = diagnostics.accepted()
++    timing.enqueue()
++    future = Future()
++    future.add_done_callback(timing.work_done)
++    assert future.cancel()
++    assert diagnostics.in_flight == 1
++    timing.finish()
++    timing.finish()
++    assert diagnostics.in_flight == 0
++
++
++def test_cancelled_connection_still_reports_slow_running_handler(tmp_path, caplog):
++    from unittest.mock import AsyncMock, Mock
++    from tests.waiting import async_wait_until
++
++    entered, release = threading.Event(), threading.Event()
++
++    def status():
++        entered.set()
++        release.wait(5)
++        return {}
++
++    async def run():
++        server = GatewayControlServer(tmp_path, verb_handlers={"status": status})
++        server._posix_peer_subject = lambda writer: None
++        reader = asyncio.StreamReader()
++        reader.feed_data(b'{"verb":"status"}\n')
++        writer = Mock(drain=AsyncMock())
++        task = server._connection_accepted(reader, writer)
++        await async_wait_until(entered.is_set, timeout=3)
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert server._diagnostics.in_flight == 1
++        timer = threading.Timer(0.6, release.set)
++        timer.start()
++        try:
++            await async_wait_until(lambda: server._diagnostics.in_flight == 0, timeout=3)
++        finally:
++            release.set()
++            timer.join()
++
++    with caplog.at_level(logging.WARNING):
++        asyncio.run(run())
++    record, = latency_records(caplog)
++    assert record.run_ms >= 500
++    assert record.total_ms >= record.run_ms
++
+-- 
+2.55.0
+

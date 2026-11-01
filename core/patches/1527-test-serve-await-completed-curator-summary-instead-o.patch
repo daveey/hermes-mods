@@ -1,0 +1,125 @@
+From 23fec17ee61252dd737bd566a5fa88586d6187b0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 17:25:24 +0000
+Subject: [PATCH] test(serve): await completed curator summary instead of
+ elapsed time [daveey]
+
+---
+ .../test_serve_skill_maintenance.py           | 57 +++++++++++++++----
+ 1 file changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/tests/hermes_cli/test_serve_skill_maintenance.py b/tests/hermes_cli/test_serve_skill_maintenance.py
+index 6b5e2c1821d..57c4d5a33f2 100644
+--- a/tests/hermes_cli/test_serve_skill_maintenance.py
++++ b/tests/hermes_cli/test_serve_skill_maintenance.py
+@@ -2,10 +2,12 @@
+ import asyncio
+ import json
+ from contextlib import suppress
+-from queue import Queue
++from threading import Event, current_thread
+ 
+ import pytest
+ 
++from tests.waiting import async_wait_until
++
+ 
+ @pytest.mark.asyncio
+ async def test_removed_sessions_keep_profile_idle_watermark(tmp_path, monkeypatch):
+@@ -55,23 +57,47 @@ async def test_removed_sessions_keep_profile_idle_watermark(tmp_path, monkeypatc
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_serve_timer_runs_due_curator_once_and_honors_pause(tmp_path, monkeypatch):
++@pytest.mark.parametrize("report_delay", [0, .5], ids=["normal", "slow-report"])
++async def test_serve_timer_runs_due_curator_once_and_honors_pause(tmp_path, monkeypatch, report_delay):
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     (tmp_path / "skills").mkdir()
+     (tmp_path / "config.yaml").write_text(
+         "curator:\n  enabled: true\n  consolidate: false\n  interval_hours: 168\n"
+         "  min_idle_hours: 0\n  prune_builtins: false\n", encoding="utf-8")
++    from agent import curator
+     from agent.curator import load_state, save_state, set_paused
+     from hermes_cli import web_server_sessions
+ 
+-    ticks = Queue()
++    report_workers = []
++    release_report = Event()
++    loop = asyncio.get_running_loop()
++    original_report = curator._write_run_report
++
++    def delayed_report(**kwargs):
++        report_workers.append(current_thread())
++        # Inject a slow report write, not an assertion/synchronization sleep.
++        loop.call_soon_threadsafe(loop.call_later, report_delay, release_report.set)
++        assert release_report.wait(30), "report release never arrived"
++        return original_report(**kwargs)
++
++    monkeypatch.setattr(curator, "_write_run_report", delayed_report)
++    ticks = asyncio.Queue()
++    phase = "paused"
+     original_maintenance = web_server_sessions._maybe_run_skill_maintenance
+ 
+     def observed_maintenance(started_at):
++        observed_phase = phase
+         try:
+             return original_maintenance(started_at)
+         finally:
+-            ticks.put(None)
++            loop.call_soon_threadsafe(ticks.put_nowait, (observed_phase, load_state()))
++
++    async def next_tick(expected_phase):
++        async with asyncio.timeout(30):
++            while True:
++                tick_phase, state = await ticks.get()
++                if tick_phase == expected_phase:
++                    return state
+ 
+     monkeypatch.setattr(web_server_sessions, "_maybe_run_skill_maintenance", observed_maintenance)
+ 
+@@ -79,27 +105,34 @@ async def test_serve_timer_runs_due_curator_once_and_honors_pause(tmp_path, monk
+     task = asyncio.create_task(web_server_sessions._auto_archive_ticker_loop(
+         interval_s=.02, initial_delay_s=0))
+     try:
+-        await asyncio.to_thread(ticks.get, True, 8)
+-        assert load_state()["run_count"] == 0
++        assert (await next_tick("paused"))["run_count"] == 0
+         # Active turns must suppress maintenance even with a zero idle threshold.
+         import tui_gateway.server as gateway
+         with gateway._sessions_lock:
+             gateway._sessions['maintenance-test'] = {"running": True}
+         set_paused(False)
++        phase = "active"
+         try:
+-            await asyncio.to_thread(ticks.get, True, 8)
+-            assert load_state()["run_count"] == 0
++            assert (await next_tick("active"))["run_count"] == 0
+         finally:
+             with gateway._sessions_lock:
+                 gateway._sessions.pop('maintenance-test', None)
+-        async with asyncio.timeout(8):
+-            while load_state()["run_count"] == 0:
+-                await asyncio.sleep(.02)
+-        await asyncio.sleep(.15)
++        # run_count is persisted BEFORE the asynchronous report/final summary.
++        # Observe the actual contract, not a guessed report completion delay.
++        await async_wait_until(
++            lambda: "consolidation off" in (load_state().get("last_run_summary") or ""),
++            timeout=30, what="curator final summary persisted")
++        phase = "finished"
++        # Exercise another real tick: the interval gate must prevent a second run.
++        assert (await next_tick("finished"))["run_count"] == 1
+         state = json.loads((tmp_path / "skills" / ".curator_state").read_text())
+         assert state["run_count"] == 1
+         assert "consolidation off" in state["last_run_summary"]
+     finally:
++        release_report.set()
+         task.cancel()
+         with suppress(asyncio.CancelledError):
+             await task
++        for worker in report_workers:
++            await asyncio.to_thread(worker.join, 30)
++            assert not worker.is_alive(), "curator report worker did not finish"
+-- 
+2.55.0
+

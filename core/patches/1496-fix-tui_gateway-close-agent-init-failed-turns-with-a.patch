@@ -1,0 +1,198 @@
+From b99f7b9137ffc4e5c877f69d59f28d2b774f4a8f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:13:12 +0000
+Subject: [PATCH] fix(tui_gateway): close agent-init-failed turns with a
+ failed_turn boundary and refresh the outcome [daveey]
+
+A prompt whose deferred agent build failed (e.g. ModelRoutingError) ended in
+_run_after_agent_ready with only the client frame and inflight snapshot. No
+agent ran, so neither the conversation-loop closer nor the gateway closer
+wrote the failed-turn boundary: the durable tail stayed the accepted user row
+and the stored outcome read unresolved{interrupted} forever.
+
+Append the assistant failed_turn boundary (FAILED_TURN_NOTICE, error_surface
+runtime/agent_init_failed, redacted error) iff the durable tail is open, and
+refresh the stored outcome (turn_end), so the chat reads turn_failed.
+Idempotent on the durable tail like the other two closers.
+---
+ .../tui_gateway/test_submit_time_user_row.py  |  6 +-
+ .../tui_gateway/test_turn_outcome_refresh.py  | 87 +++++++++++++++++++
+ tui_gateway/methods_prompt.py                 | 35 +++++++-
+ 3 files changed, 124 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tui_gateway/test_submit_time_user_row.py b/tests/tui_gateway/test_submit_time_user_row.py
+index 2ea25b67e35..e2abc21b51b 100644
+--- a/tests/tui_gateway/test_submit_time_user_row.py
++++ b/tests/tui_gateway/test_submit_time_user_row.py
+@@ -188,8 +188,12 @@ def test_failed_build_drops_the_staged_row_and_a_later_turn_never_adopts_it(monk
+         assert "_submit_user_row" not in session
+         assert agent._pending_cli_user_message is None
+         rows = db.get_messages_as_conversation(key, include_inactive=True)
++        # The failed build closed the first send with the failed-turn boundary, so the retry is a new request
++        # rather than one that repair_message_sequence would merge into the failed one.
++        from agent.turn_failure_copy import FAILED_TURN_NOTICE
+         assert [(r["role"], r["content"]) for r in rows] == [
+-            ("user", "please refactor the login page"), ("user", "please refactor the login page")]
++            ("user", "please refactor the login page"), ("assistant", FAILED_TURN_NOTICE),
++            ("user", "please refactor the login page")]
+     finally:
+         server._sessions.pop(sid, None)
+         db.close()
+diff --git a/tests/tui_gateway/test_turn_outcome_refresh.py b/tests/tui_gateway/test_turn_outcome_refresh.py
+index b78e9250f13..2761dc94dd8 100644
+--- a/tests/tui_gateway/test_turn_outcome_refresh.py
++++ b/tests/tui_gateway/test_turn_outcome_refresh.py
+@@ -138,3 +138,90 @@ def test_orphan_reap_refreshes_each_reaped_row(monkeypatch, db):
+ 
+     stored = so.get_outcome("reaped", db=db)
+     assert (stored["kind"], stored["reason"]) == ("unresolved", "interrupted")
++
++
++# ---- agent-init failure ("failed before the agent was ready") --------------------------------------------
++# The deferred build failed (ModelRoutingError and the like), so no agent ever ran the turn: neither the
++# conversation-loop closer nor the gateway closer exists on this path. The TUI turn thread itself must close
++# the accepted user row with the failed-turn boundary and refresh the stored outcome, else the chat reads
++# unresolved{interrupted} forever.
++
++def _init_failed_session(sid: str, *, error: str | None = "ModelRoutingError: No eligible deep routes") -> dict:
++    ready = threading.Event()
++    ready.set()
++    return {
++        "agent": None, "agent_ready": ready, "agent_error": error, "session_key": sid, "history": [],
++        "history_lock": threading.Lock(), "history_version": 0, "running": True, "cols": 80, "inflight_turn": None,
++    }
++
++
++@pytest.fixture
++def init_env(monkeypatch, db):
++    for name, stub in {"_emit": lambda *_a, **_k: None, "render_message": lambda _raw, _cols: None,
++                       "_session_info": lambda *_a: {}, "_get_db": lambda: db}.items():
++        monkeypatch.setattr(server, name, stub)
++    return monkeypatch
++
++
++def _failed_rows(db, sid):
++    return [m for m in db.get_messages(sid) if m.get("display_kind") == "failed_turn"]
++
++
++def test_agent_init_failure_writes_one_boundary_and_reads_turn_failed(init_env, db):
++    from agent.turn_failure_copy import FAILED_TURN_NOTICE
++
++    db.create_session("row-init", source="desktop")
++    db.append_message("row-init", role="user", content="rotate the key")
++    session = _init_failed_session("row-init")
++
++    server._run_after_agent_ready("rid", "ui-init-1", session, "rotate the key", None, None, None)
++
++    rows = _failed_rows(db, "row-init")
++    assert len(rows) == 1, rows
++    boundary = rows[0]
++    assert boundary["role"] == "assistant" and boundary["content"] == FAILED_TURN_NOTICE
++    meta = boundary.get("display_metadata") or {}
++    assert meta.get("error_surface") == {"layer": "runtime", "code": "agent_init_failed", "retryable": True}
++    assert "No eligible deep routes" in meta.get("error", "")
++    assert db.latest_conversation_role("row-init") == "assistant"
++    stored = so.get_outcome("row-init", db=db)
++    assert stored is not None and (stored["kind"], stored.get("reason")) == ("unresolved", "turn_failed")
++    assert session["running"] is False
++
++
++def test_agent_init_failure_redelivery_adds_no_second_boundary(init_env, db):
++    db.create_session("row-init2", source="desktop")
++    db.append_message("row-init2", role="user", content="rotate the key")
++
++    for _ in range(2):
++        server._run_after_agent_ready(
++            "rid", "ui-init-2", _init_failed_session("row-init2"), "rotate the key", None, None, None)
++
++    assert len(_failed_rows(db, "row-init2")) == 1
++    stored = so.get_outcome("row-init2", db=db)
++    assert (stored["kind"], stored.get("reason")) == ("unresolved", "turn_failed")
++
++
++def test_agent_init_failure_secret_in_error_is_redacted(init_env, db):
++    db.create_session("row-init3", source="desktop")
++    db.append_message("row-init3", role="user", content="hi")
++    secret = "sk-ant-api03-" + "A" * 40
++    server._run_after_agent_ready(
++        "rid", "ui-init-3", _init_failed_session("row-init3", error=f"bad key {secret}"), "hi", None, None, None)
++
++    (row,) = _failed_rows(db, "row-init3")
++    assert secret not in str(row.get("display_metadata"))
++
++
++def test_cancelled_before_ready_turn_is_unchanged(init_env, db):
++    """Control: a turn cancelled before the build finished writes no boundary (the user stopped it)."""
++    db.create_session("row-cancel", source="desktop")
++    db.append_message("row-cancel", role="user", content="rotate the key")
++    session = _init_failed_session("row-cancel", error=None)
++    session["_turn_cancel_requested"] = True
++
++    server._run_after_agent_ready("rid", "ui-cancel", session, "rotate the key", None, None, None)
++
++    assert _failed_rows(db, "row-cancel") == []
++    assert db.latest_conversation_role("row-cancel") == "user"
++    assert so.get_outcome("row-cancel", db=db) is None
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 14bcf4df3e3..52afab1ce09 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -671,6 +671,33 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
+     return error
+ 
+ 
++def _close_agent_init_failed_turn(session: dict, message: str, error_surface: dict) -> None:
++    """[daveey] Close the accepted user row of a turn whose agent build failed with the failed-turn boundary.
++
++    No agent ran, so neither ``agent/conversation_loop.py::_close_durable_failed_turn`` nor the gateway's
++    ``_hmwa_close_failed_turn`` exists on this path: without this row the chat's durable tail stays the
++    user row and its outcome reads ``unresolved{interrupted}`` forever instead of ``turn_failed``.
++    Idempotent on the DURABLE tail (``OPEN_TURN_TAIL_ROLES``), like the other two closers: a redelivery
++    or a tail another writer already closed is a no-op. No tool ran, so the copy is ``FAILED_TURN_NOTICE``.
++    Best-effort: the client frame still goes out when the store cannot be written."""
++    sid = str(session.get("session_key") or "")
++    if not sid:
++        return
++    try:
++        from agent.redact import redact_sensitive_text
++        from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, OPEN_TURN_TAIL_ROLES
++
++        with _session_db(session) as db:
++            if db is None or db.latest_conversation_role(sid) not in OPEN_TURN_TAIL_ROLES:
++                return
++            error = redact_sensitive_text(str(message or "").strip()[:2000], force=True)
++            db.append_message(
++                sid, role="assistant", content=FAILED_TURN_NOTICE, display_kind=FAILED_TURN_DISPLAY_KIND,
++                display_metadata={k: v for k, v in (("error", error), ("error_surface", error_surface)) if v})
++    except Exception:  # health: allow BLE001 -- the terminal frame must still reach the client
++        logger.warning("prompt.submit: failed-turn boundary not written for %s", sid, exc_info=True)
++
++
+ def _run_after_agent_ready(
+     rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
+     hosted_images=None, *, auto_continue=True
+@@ -691,16 +718,18 @@ def _run_after_agent_ready(
+         # without this the accepted message reads in agent.log as one that silently never ran. [daveey]
+         logger.warning("prompt.submit: turn for session %s (%s) failed before the agent was ready: %s",
+                        sid, session.get("session_key") or "", str(message)[:300])
++        surface = {"layer": "runtime", "code": "agent_init_failed", "retryable": True}
++        _close_agent_init_failed_turn(session, message, surface)
+         # Terminal frame + retained snapshot (not a bare "error" event): the snapshot is
+         # the only way resume shows this to a disconnected client.
+-        _emit_terminal_turn_error(
+-            sid, session, message,
+-            error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
++        _emit_terminal_turn_error(sid, session, message, error_surface=surface)
+         with session["history_lock"]:
+             if not owns(session):
+                 return
+             session["running"] = False
+             session["last_active"] = time.time()
++        from tui_gateway.turn_outcome import refresh_turn_outcome
++        refresh_turn_outcome(session)
+         _emit("session.info", sid, _session_info(session.get("agent"), session))
+         return
+     with session["history_lock"]:
+-- 
+2.55.0
+

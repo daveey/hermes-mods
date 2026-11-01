@@ -1,0 +1,806 @@
+From 12ab10005a4633cf5e865544178b705f8e7569a6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:48:26 +0000
+Subject: [PATCH] fix(kanban): preserve scoped blocker routing evidence
+ [daveey]
+
+---
+ hermes_cli/kanban_blocker_metadata.py         |  57 ++---
+ hermes_cli/kanban_model_tier.py               |  68 ++++-
+ hermes_cli/kanban_shared_blockers.py          |  91 +++++--
+ .../hermes_cli/test_kanban_shared_blockers.py | 232 ++++++++++++++++++
+ tests/tools/test_kanban_blocker_metadata.py   | 113 +++++++--
+ tools/kanban_tools_schemas.py                 |   7 +-
+ 6 files changed, 497 insertions(+), 71 deletions(-)
+
+diff --git a/hermes_cli/kanban_blocker_metadata.py b/hermes_cli/kanban_blocker_metadata.py
+index d131119628d..3fd23cc3ecf 100644
+--- a/hermes_cli/kanban_blocker_metadata.py
++++ b/hermes_cli/kanban_blocker_metadata.py
+@@ -23,14 +23,15 @@ def scope_fields(values):
+ 
+ def blocker_metadata(conn, task_id, *, reason=None, metadata=None, blocker_id=None,
+                      blocker_provider=None, blocker_model=None, blocker_lane=None):
+-    """Preserve explicit scope; infer only from an identified error or this run's error.
++    """Preserve explicit scope; otherwise infer it only from provider-labelled wall lines in
++    this park's own reason/checkpoint.
+ 
+-    A park's prose may describe a later reviewer/delegate's wall. Never assign the
+-    current run's provider merely because its checkpoint mentions a routing error.
+-    Only a stored error on this exact run can use its historical routing receipt.
+-    No current task pins, profile defaults, or past-run errors participate.
++    The executor's identity (this run's receipt or stored error, the card's pins, profile
++    defaults) is never borrowed: a delegated reviewer or later step can hit a wall on another
++    provider, so an unlabelled wall stays unscoped (board-wide). ``conn``/``task_id`` stay in
++    the signature for the callers.
+     """
+-    from hermes_cli.kanban_shared_blockers import normalize_blocker_id, _provider, _run_route
++    from hermes_cli.kanban_shared_blockers import normalize_blocker_id, _provider
+ 
+     meta = dict(metadata or {})
+     explicit = scope_fields(dict(zip(FIELDS, (blocker_provider, blocker_model, blocker_lane))))
+@@ -46,43 +47,37 @@ def blocker_metadata(conn, task_id, *, reason=None, metadata=None, blocker_id=No
+         raise ValueError("clear_blocker cannot be combined with blocker_id")
+     meta["blocker_id"] = bid
+     if not scope.get("blocker_provider"):
+-        inferred = _infer_scope(conn, task_id, reason, _provider, _run_route)
+-        scope = {**inferred, **scope}
++        scope = {**_error_scope(reason, _provider), **scope}
+     meta.update(scope)
+     return meta
+ 
+ 
+ def _error_scope(text, canon):
+-    # Provider-labelled error evidence can describe a different, later step.
++    """Scope named by wall lines (a wall marker AND a provider label on one line). Lines without
++    a wall marker are prose; several providers are ambiguous; a label that is not a known MODEL
++    provider (registry lookup, offline) names a service: all three give no scope (board-wide).
++    Explicit ``blocker_provider`` metadata never passes through here."""
+     lines = "\n".join(line for line in (text or "").splitlines() if _WALL.search(line))
+     providers = {canon(m) for m in _PROVIDER.findall(lines)} - {None}
+     if len(providers) != 1:
+         return {}
+-    result = {"blocker_provider": providers.pop()}
++    provider = providers.pop()
++    if not _known_model_provider(provider):
++        # e.g. "GitHub API rate limit exceeded (provider: github)": a service wall, not a model
++        # route. Scoping to a provider no worker runs on would let every card past it.
++        return {}
++    result = {"blocker_provider": provider}
+     models = set(_MODEL.findall(lines))
+     if len(models) == 1:
+         result["blocker_model"] = models.pop()
+     return result
+ 
+ 
+-def _infer_scope(conn, task_id, reason, canon, route):
+-    observed = _error_scope(reason, canon)
+-    if observed:
+-        return observed
+-    row = conn.execute(
+-        "SELECT r.id, r.error FROM task_runs r JOIN tasks t ON t.current_run_id=r.id "
+-        "WHERE t.id=? AND r.task_id=t.id AND r.ended_at IS NULL", (task_id,)).fetchone()
+-    if row is None or not _WALL.search(row["error"] or ""):
+-        return {}
+-    observed = _error_scope(row["error"], canon)
+-    if observed:
+-        return observed
+-    if _PROVIDER.search(row["error"]):
+-        return {}  # ambiguous error identity must not fall back to the worker route
+-    model, provider, lane = route(conn, task_id, row["id"])
+-    if not provider:
+-        return {}
+-    result = {"blocker_provider": provider, "blocker_lane": lane}
+-    if model:
+-        result["blocker_model"] = model
+-    return result
++def _known_model_provider(provider):
++    """Whether ``provider`` resolves in the model-provider registry (built-ins, overlays, plugin
++    profiles, cached models.dev catalog; offline). Unknown or a lookup failure is False."""
++    try:
++        from hermes_cli.providers import get_provider
++        return get_provider(provider, allow_network=False) is not None
++    except Exception:
++        return False
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 9790e32355f..af6bbae1895 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -217,9 +217,75 @@ def owner_model_pin(conn: sqlite3.Connection, task: Any) -> tuple[Optional[str],
+     return model, (args[args.index("--provider") + 1] if "--provider" in args else None)
+ 
+ 
++RUN_ROUTE_EVENT = "run_route"
++
++
++def profile_route(assignee: Any) -> tuple[Optional[str], Optional[str]]:
++    """``(model, provider)`` from the assignee profile's ``model`` block: what an unpinned worker runs.
++
++    A class selector or ``auto`` provider leaves the provider unknown (the worker allocates it).
++    Unreadable or non-profile config is ``(None, None)``: unknown, never a guess."""
++    from agent.model_routing import is_class_selector
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    config = _assignee_config(assignee) or {}
++    block = config.get("model") if isinstance(config, dict) else None
++    if isinstance(block, dict):
++        model, provider = _str(block.get("default")) or None, _str(block.get("provider")) or None
++    elif isinstance(block, str):
++        model, provider = _str(block) or None, None
++    else:
++        return None, None
++    if not model or is_class_selector(model) or (provider or "").lower() == "auto":
++        provider = None
++    return model, provider
++
++
++def effective_route(task: Any) -> tuple[Optional[str], Optional[str], str]:
++    """``(model, provider, source)`` a claimed task's worker runs with after :func:`apply_model_tier`."""
++    from agent.model_routing import is_class_selector
++    model = _str(getattr(task, "model_override", None)) or None
++    provider = _str(getattr(task, "provider_override", None)) or None
++    if model:
++        if is_class_selector(model) or (provider or "").lower() == "auto":
++            return model, None, "class"
++        return model, provider, "pin" if provider else "pin_provider_unknown"
++    model, provider = profile_route(getattr(task, "assignee", None))
++    return model, provider, "profile_default" if model else "unknown"
++
++
++def record_run_route(conn: sqlite3.Connection, task: Any, *, lane: str, reason: str) -> None:
++    """Admission receipt (``run_route`` event on this run) for every spawn, tier on or off. [daveey]
++
++    Shared-blocker scope (``kanban_shared_blockers._run_route``) reads it as the run's historical route;
++    the card's later pins and today's config never rewrite it. Unknown stays None. Never raises."""
++    run_id = getattr(task, "current_run_id", None)
++    if run_id is None:
++        return
++    try:
++        model, provider, source = effective_route(task)
++    except Exception as exc:
++        logger.debug("kanban model tier: route resolve failed for %s (%s)", getattr(task, "id", "?"), exc)
++        model, provider, source = None, None, "unknown"
++    try:
++        from hermes_cli import kanban_db as _kb
++        with _kb.write_txn(conn):
++            _kb._append_event(conn, task.id, RUN_ROUTE_EVENT, {
++                "model": model, "provider": provider, "lane": lane, "source": source, "tier_reason": reason,
++            }, run_id=run_id)
++    except Exception as exc:
++        logger.debug("kanban model tier: route receipt failed for %s (%s)", getattr(task, "id", "?"), exc)
++
++
+ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
+-    """Pin the tier's model on the in-memory ``task`` (never the DB row) and record a ``model_tier`` event.
++    """Pin the tier's model on the in-memory ``task`` (never the DB row) and record a ``model_tier`` event,
++    plus the run's resolved ``run_route`` receipt (every spawn, tier off included).
+     Returns the reason. Never raises: a failure leaves the task on its profile's model."""
++    reason = _apply_model_tier(conn, task, lane=lane, cfg=cfg)
++    record_run_route(conn, task, lane=lane, reason=reason)
++    return reason
++
++
++def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
+     try:
+         model, provider, reason = resolve_model_tier(conn, task, lane=lane, cfg=cfg)
+     except Exception as exc:
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 10021d96d25..86ac417c37f 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -39,8 +39,15 @@ nothing about the external condition, so they neither assert nor clear a blocker
+ Optional ``blocker_provider`` scopes a wall to that provider; ``blocker_model`` and
+ ``blocker_lane`` describe the observation only. Other-provider steps neither wait nor act as
+ probes/clear evidence. Routing unknown (including unallocated classes) remains conservative;
+-unscoped history keeps its board-wide behavior. Historical runs use their model_tier receipt,
+-not a card's later pin or today's tier configuration.
++unscoped history keeps its board-wide behavior. A run's route is its admission receipt
++(``run_route`` event, written by ``kanban_model_tier.apply_model_tier`` on every spawn; legacy
++runs fall back to their ``model_tier`` event), never a card's later pin or today's tier
++configuration. Under a scoped blocker a run whose route is unknown (no receipt, or a
++class/``auto`` receipt) is no implicit evidence: its completion neither clears the blocker nor
++counts as a probe (an explicit ``clear_blocker`` attestation clears it on any route). A
++card's unknown NEXT route stays conservative: the guard still holds it. The scope is the union
++over every assertion of the id in the lookback window: one assertion without a provider, or
++with a different one, keeps the id board-wide (a narrower wall needs a new id).
+ 
+ Matching on normalized error text was considered and left out: crash/timeout/protocol-violation
+ errors share fixed preambles across unrelated cards (``_error_fingerprint`` keeps 80 chars), and
+@@ -160,15 +167,35 @@ def _applies(st: BlockerState, provider: Optional[str]) -> bool:
+     return not scope or not target or scope == target
+ 
+ 
++def _run_receipt(conn, task_id, run_id) -> Optional[tuple[Optional[str], Optional[str], str]]:
++    """The run's admission receipt, or None when it has none (a run admitted before receipts).
++
++    Prefers the ``run_route`` event (every spawn, tier on or off); a legacy run falls back to its
++    ``model_tier`` event. A receipt whose provider is unknown (class, ``auto``) keeps it None."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_model_tier import RUN_ROUTE_EVENT
++    for kind in (RUN_ROUTE_EVENT, "model_tier"):
++        row = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? "
++            "ORDER BY id DESC LIMIT 1", (task_id, run_id, kind)).fetchone()
++        if row is None:
++            continue
++        payload = kb._json_dict(row[0])
++        model = _optional_text(payload.get("model"))
++        provider = _provider(payload.get("provider"))
++        if model and model.startswith("class:"):
++            provider = None
++        return model, provider, payload.get("lane") or kb._retry_status_for_run(conn, task_id, run_id)
++    return None
++
++
+ def _run_route(conn, task_id, run_id) -> tuple[Optional[str], Optional[str], str]:
+-    """Historical routing evidence, never today's tier config or a later card pin."""
++    """Historical routing evidence, never today's tier config or a later card pin. Unknown is None."""
+     from hermes_cli import kanban_db as kb
+-    row = conn.execute(
+-        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='model_tier' "
+-        "ORDER BY id DESC LIMIT 1", (task_id, run_id)).fetchone()
+-    payload = kb._json_dict(row[0]) if row else {}
+-    return (_optional_text(payload.get("model")), _provider(payload.get("provider")),
+-            payload.get("lane") or kb._retry_status_for_run(conn, task_id, run_id))
++    receipt = _run_receipt(conn, task_id, run_id)
++    if receipt is not None:
++        return receipt
++    return None, None, kb._retry_status_for_run(conn, task_id, run_id)
+ 
+ 
+ def task_route(conn, task_id) -> tuple[Optional[str], Optional[str], str]:
+@@ -186,9 +213,11 @@ def task_route(conn, task_id) -> tuple[Optional[str], Optional[str], str]:
+         wake = pending_wake(conn, task_id) or {}
+         lane = "review" if wake.get("resume_status") == "review" else "ready"
+     if task.status == "running" and task.current_run_id:
+-        model, provider, lane = _run_route(conn, task_id, task.current_run_id)
+-        if model or provider:
+-            return model, provider, lane
++        # A receipt is authoritative even when it says "unknown"; only a run admitted before
++        # receipts falls back to the read-only preview below.
++        receipt = _run_receipt(conn, task_id, task.current_run_id)
++        if receipt is not None:
++            return receipt
+     try:
+         from hermes_cli.kanban_model_assignment import _assignee_config
+         from hermes_cli.kanban_pin_provider import resolve_legacy_pin
+@@ -224,9 +253,26 @@ def task_route(conn, task_id) -> tuple[Optional[str], Optional[str], str]:
+ 
+ 
+ def _task_applies(conn, st: BlockerState, task_id: str) -> bool:
++    """Whether the blocker holds this card's next/current step: unknown routing is conservative."""
+     return not st.blocker_provider or _applies(st, task_route(conn, task_id)[1])
+ 
+ 
++def _run_is_evidence(st: BlockerState, provider: Optional[str]) -> bool:
++    """Whether a run on ``provider`` says anything about ``st``: always for an unscoped blocker;
++    for a scoped one only a KNOWN matching provider (unknown is never a clear or a probe)."""
++    if not st.blocker_provider:
++        return True
++    return provider is not None and _applies(st, provider)
++
++
++def _explicit_clear(kb, metadata) -> bool:
++    """A run carrying ``clear_blocker`` is the caller's explicit attestation that the wall is gone
++    (the documented clear path), so it clears a scoped blocker whatever the run's route: e.g. the
++    zero-duration run synthesized when a breaker-parked untyped card is classified in place has
++    no admission receipt. Only implicit evidence (a completion/handoff) needs a matching route."""
++    return kb._json_dict(metadata).get(CLEAR_FLAG) is True
++
++
+ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> dict[str, BlockerState]:
+     """Derive every recently asserted blocker's state from ``task_runs`` (read-only)."""
+     from hermes_cli import kanban_db as kb
+@@ -239,6 +285,7 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+         (now - _LOOKBACK_SECONDS,),
+     ).fetchall()
+     states: dict[str, BlockerState] = {}
++    scopes: dict[str, set[Optional[str]]] = {}
+     task_ids: set[str] = set()
+     for row in asserting:
+         bid = _meta_blocker(kb, row["metadata"])
+@@ -246,16 +293,20 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+             continue
+         st = states.setdefault(bid, BlockerState(bid))
+         ended = kb._to_epoch(row["ended_at"]) or 0
++        meta = kb._json_dict(row["metadata"])
++        scopes.setdefault(bid, set()).add(_provider(meta.get("blocker_provider")))
+         if ended >= st.asserted_at:
+             st.asserted_at = ended
+             st.reason = kb._first_line(row["summary"], 300)
+-            meta = kb._json_dict(row["metadata"])
+-            st.blocker_provider = _optional_text(meta.get("blocker_provider"))
+             st.blocker_model = _optional_text(meta.get("blocker_model"))
+             st.blocker_lane = _optional_text(meta.get("blocker_lane"))
+         task_ids.add(row["task_id"])
+     if not states:
+         return states
++    for bid, st in states.items():
++        # Union of every recent assertion: any unscoped or differing provider keeps it board-wide.
++        providers = scopes.get(bid, set())
++        st.blocker_provider = next(iter(providers)) if len(providers) == 1 else None
+     for tid in task_ids:
+         status_row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+         live = status_row is not None and status_row["status"] not in ("done", "archived")
+@@ -274,7 +325,7 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+                 if st.blocker_provider:
+                     provider = (_run_route(conn, tid, run["id"])[1] if run["ended_at"] is not None
+                                 else task_route(conn, tid)[1])
+-                applicable = _applies(st, provider)
++                applicable = _run_is_evidence(st, provider)
+                 if applicable:
+                     st.probe_starts[tid] = max(st.probe_starts.get(tid, 0), started)
+             if run["ended_at"] is None:
+@@ -286,7 +337,7 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+                     _mark_cleared(states[current[0]], tid, run["id"], ended)
+                 current, asserting_run = (bid, ended), int(run["id"])
+                 continue
+-            if effect == "pass" or not applicable:
++            if effect == "pass" or not (applicable or _explicit_clear(kb, run["metadata"])):
+                 continue
+             if current is not None and current[0] in states:
+                 _mark_cleared(states[current[0]], tid, run["id"], ended)
+@@ -520,6 +571,9 @@ def render_blocker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     lines.append("Provider-scoped walls apply only to that provider. Continue unrelated work; if a later "
+                  "step needs the affected provider, wait at that step, not before it. Model/lane on a "
+                  "blocker describe where it was observed, not additional restrictions.")
++    lines.append("Reasserting a listed id whose provider is not 'all': pass the same `blocker_provider` "
++                 "with the `blocker_id` (e.g. `blocker_provider: \"anthropic\"`). A reassertion without it, "
++                 "or with another provider, makes the id board-wide and holds every provider's cards.")
+     mine = None
+     for st in sorted(states, key=lambda s: -s.asserted_at):
+         applicable = _applies(st, provider)
+@@ -530,10 +584,13 @@ def render_blocker_context(conn: sqlite3.Connection, task_id: str) -> str:
+                  f"{'applicable' if applicable else 'not applicable'} to current route")
+         lines.append(f"- `{st.blocker_id}` ({len(st.behind)} card(s) parked): {st.reason or '(no reason)'} [{scope}]")
+     if mine is not None:
++        again = f"`blocker_id: \"{mine.blocker_id}\"`"
++        if mine.blocker_provider:
++            again += f" and `blocker_provider: \"{mine.blocker_provider}\"`"
+         lines.append("")
+         lines.append(
+             f"This run is the probe for `{mine.blocker_id}`. Check first whether it still holds. If it "
+-            f"does, end again with `blocker_id: \"{mine.blocker_id}\"`. If it is gone, carry on: "
++            f"does, end again with {again}. If it is gone, carry on: "
+             "completing or handing off clears it and wakes the other parked cards. A park without the "
+             "id does NOT clear it; if you park for another reason and saw the wall gone, pass "
+             "`clear_blocker: true`.")
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+index 66da2b1f3c6..21e3fd01516 100644
+--- a/tests/hermes_cli/test_kanban_shared_blockers.py
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -11,6 +11,7 @@ import json
+ import os
+ import time
+ from pathlib import Path
++from typing import Optional
+ 
+ import pytest
+ 
+@@ -205,12 +206,243 @@ def test_profile_class_provider_remains_unknown(kanban_home, scoped_routing, mon
+         assert ksb.shared_blocker_guard(conn, tid) == ksb.GUARD_REASON
+ 
+ 
++def test_unknown_historical_route_neither_probes_nor_clears(kanban_home):
++    """No receipt and no resolvable route: under a scoped wall the run is no evidence, while
++    the other card's unknown next route is still held (conservative)."""
++    with kbc.connect_closing() as conn:
++        a, b = _blocked_behind(conn, "a"), _blocked_behind(conn, "b")
++        _scope(conn, a)
++        _scope(conn, b)
++        kb.unblock_task(conn, a)
++        kb.claim_task(conn, a)
++        assert ksb.task_route(conn, a)[1] is None
++        assert a not in ksb.blocker_states(conn)[BID].probe_starts
++        kb.complete_task(conn, a, result="done on an unknown route")
++        st = ksb.blocker_states(conn)[BID]
++        assert st.is_open and st.cleared_by is None and set(st.behind) == {b}
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (b,))
++        assert ksb.shared_blocker_guard(conn, b, interval=1800) == ksb.GUARD_REASON
++
++
+ def test_unscoped_wall_still_holds_other_provider(kanban_home, scoped_routing):
+     with kbc.connect_closing() as conn:
+         tid = _blocked_behind(conn, "legacy")
+         assert ksb.shared_blocker_guard(conn, tid, interval=1800) == ksb.GUARD_REASON
+ 
+ 
++# --- Real admission receipts (apply_model_tier via dispatch_once), no handwritten routes. ---
++
++WALL = "anthropic-usage-limit"
++
++
++def _write_home_cfg(home: Path, *, profile_model: str, profile_provider: str = "", kanban: str = "") -> None:
++    lines = ["model:", f"  default: {profile_model}"]
++    if profile_provider:
++        lines.append(f"  provider: {profile_provider}")
++    if kanban:
++        lines += ["kanban:", *(f"  {line}" for line in kanban.splitlines())]
++    home.joinpath("config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
++def _park_behind(conn, tid: str, provider: Optional[str] = "anthropic") -> None:
++    """The worker's own park: kanban_continue(blocker_id, blocker_provider), back to ready at once."""
++    from hermes_cli.kanban_continuation import continue_task
++    meta = {"blocker_id": WALL, **({"blocker_provider": provider} if provider else {})}
++    res = continue_task(conn, tid, checkpoint="Anthropic usage limit reached for the review step",
++                        resume_after_seconds=0, metadata=meta)
++    assert res["ok"], res
++    assert kb.get_task(conn, tid).status == "ready"
++
++
++def _receipt(conn, tid):
++    from hermes_cli.kanban_model_tier import RUN_ROUTE_EVENT
++    run_id = kb.list_runs(conn, tid)[-1].id
++    rows = [e.payload for e in kb.list_events(conn, tid) if e.kind == RUN_ROUTE_EVENT and e.run_id == run_id]
++    assert rows, f"no admission receipt for {tid} run {run_id}"
++    return rows[-1]
++
++
++@pytest.mark.parametrize("profile_model, profile_provider, clears", [
++    ("gpt-5", "openai-codex", False),            # tier off, Codex profile default: not evidence
++    ("class:standard", "", False),               # class default: provider unknown, not evidence
++    ("claude-opus-4", "anthropic", True),        # control: matching provider clears
++])
++def test_admitted_route_decides_clear_evidence(kanban_home, spawns, profile_model, profile_provider, clears):
++    """A card admitted on its profile default (tier off: no model_tier event) completing must not
++    clear an Anthropic-scoped wall unless its receipt names Anthropic."""
++    _write_home_cfg(kanban_home, profile_model=profile_model, profile_provider=profile_provider)
++    _spawned, fake_spawn = spawns
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="probe card", assignee="default")
++        assert kb.claim_task(conn, tid)
++        _park_behind(conn, tid)
++        _age_runs(conn, 1900)   # past the probe interval: the card may spawn whatever its route
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == [tid]
++        receipt = _receipt(conn, tid)
++        assert receipt["model"] == profile_model and receipt["source"] == "profile_default"
++        assert receipt["provider"] == (profile_provider or None)
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == "model_tier"]   # tier off
++        st = ksb.blocker_states(conn)[WALL]
++        assert (tid in st.probe_starts) is clears
++        assert kb.complete_task(conn, tid, result="done")
++        st = ksb.blocker_states(conn)[WALL]
++        assert st.is_open is (not clears)
++
++
++@pytest.mark.parametrize("order", ["unscoped_first", "scoped_first"])
++def test_scoped_assertion_never_narrows_unscoped_same_id(kanban_home, order):
++    with kbc.connect_closing() as conn:
++        a = kb.create_task(conn, title="a", assignee="default")
++        b = kb.create_task(conn, title="b", assignee="default")
++        first, second = (None, "anthropic") if order == "unscoped_first" else ("anthropic", None)
++        for tid, provider in ((a, first), (b, second)):
++            assert kb.claim_task(conn, tid)
++            _park_behind(conn, tid, provider)
++        st = ksb.blocker_states(conn)[WALL]
++        assert st.blocker_provider is None
++        # Board-wide: a card known to run on Codex is held too.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET model_override='gpt-5', provider_override='openai-codex' WHERE id=?", (a,))
++        assert ksb.shared_blocker_guard(conn, a, interval=1800) == ksb.GUARD_REASON
++
++
++@pytest.mark.parametrize("providers, expected", [
++    (("anthropic", "openai-codex"), None),       # differing providers: board-wide
++    (("anthropic", "anthropic"), "anthropic"),   # agreeing providers keep the scope
++])
++def test_assertion_scope_union(kanban_home, providers, expected):
++    with kbc.connect_closing() as conn:
++        for i, provider in enumerate(providers):
++            tid = kb.create_task(conn, title=f"c{i}", assignee="default")
++            assert kb.claim_task(conn, tid)
++            _park_behind(conn, tid, provider)
++        assert ksb.blocker_states(conn)[WALL].blocker_provider == expected
++
++
++def test_dispatch_codex_runs_behind_anthropic_wall_and_opus_probes_after_interval(kanban_home, spawns):
++    """End to end on dispatch_once, no human unblock: Codex cards behind an Anthropic-scoped wall
++    spawn, the Opus card is held within the probe interval, and neither a Codex completion nor a
++    fresh Codex run delays or replaces the real Opus probe once the interval has passed."""
++    _write_home_cfg(kanban_home, profile_model="gpt-5", profile_provider="openai-codex")
++    seen: dict[str, tuple] = {}
++
++    def spawn(task, workspace, board=None):
++        seen[task.id] = (task.model_override, task.provider_override)
++
++    with kbc.connect_closing() as conn:
++        opus = kb.create_task(conn, title="adversarial review", assignee="default",
++                              model_override="claude-opus-4", provider_override="anthropic")
++        codex1 = kb.create_task(conn, title="impl one", assignee="default")
++        codex2 = kb.create_task(conn, title="impl two", assignee="default", priority=5)
++        for tid in (opus, codex1, codex2):
++            assert kb.claim_task(conn, tid)
++            _park_behind(conn, tid)
++
++        # Within the interval: both Codex cards spawn, Opus is held.
++        res = kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert sorted(_spawned_ids(res)) == sorted([codex1, codex2])
++        assert (opus, ksb.GUARD_REASON) in res.respawn_guarded
++        for tid in (codex1, codex2):
++            assert _receipt(conn, tid)["provider"] == "openai-codex"
++        assert not any(e.kind == "unblocked" for t in (opus, codex1, codex2) for e in kb.list_events(conn, t))
++
++        # A Codex completion is no evidence about the Anthropic wall.
++        assert kb.complete_task(conn, codex1, result="impl done")
++        st = ksb.blocker_states(conn)[WALL]
++        assert st.is_open and st.cleared_by is None and not st.probe_starts
++        res = kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert opus not in _spawned_ids(res) and (opus, ksb.GUARD_REASON) in res.respawn_guarded
++
++        # Interval passes. codex2 checkpoints (no blocker id: still behind the wall) and starts a
++        # FRESH Codex run first (higher priority, one slot), so its start is newer than the interval.
++        _age_runs(conn, 1900)
++        res = continue_task_ok(conn, codex2)
++        res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=1)
++        assert _spawned_ids(res) == [codex2]
++        st = ksb.blocker_states(conn)[WALL]
++        assert codex2 in st.behind and codex2 not in st.probe_starts
++
++        # The running Codex card is neither "a probe in flight" nor a recent probe start.
++        res = kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert _spawned_ids(res) == [opus]
++        assert seen[opus] == ("claude-opus-4", "anthropic")
++        assert _receipt(conn, opus)["provider"] == "anthropic"
++        st = ksb.blocker_states(conn)[WALL]
++        assert st.is_open and opus in st.probe_starts
++        assert not any(e.kind == "unblocked" for e in kb.list_events(conn, opus))
++
++
++def continue_task_ok(conn, tid):
++    from hermes_cli.kanban_continuation import continue_task
++    res = continue_task(conn, tid, checkpoint="impl checkpoint", resume_after_seconds=0)
++    assert res["ok"], res
++    return res
++
++
++def test_reassertion_guidance_carries_provider(kanban_home, scoped_routing):
++    """Context and the blocker_id tool description both tell a reassertion to pass blocker_provider,
++    since an unscoped reassertion widens the id to board-wide (union rule)."""
++    from tools.kanban_tools_schemas import _BLOCKER_ID_DESC
++    assert "blocker_provider" in _BLOCKER_ID_DESC and "board-wide" in _BLOCKER_ID_DESC
++    with kbc.connect_closing() as conn:
++        tid = _blocked_behind(conn, "scoped")
++        _scope(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++        ctx = ksb.render_blocker_context(conn, tid)
++        assert "This run is the probe" in ctx
++        assert f'end again with `blocker_id: "{BID}"` and `blocker_provider: "anthropic"`' in ctx
++        assert "pass the same `blocker_provider`" in ctx and "board-wide" in ctx
++        # Control: an unscoped probe is told only the id.
++        other = _blocked_behind(conn, "unscoped", blocker_id="other-wall")
++        ctx = ksb.render_blocker_context(conn, other)
++        assert 'end again with `blocker_id: "other-wall"`. ' in ctx
++
++
++@pytest.mark.parametrize("scoped", [False, True], ids=["unscoped", "scoped"])
++def test_untyped_classification_clear_blocker_synthesizes_clearing_run(kanban_home, scoped):
++    """A breaker-parked UNTYPED card (no live run) classified in place with clear_blocker=True
++    gets a synthesized closed run carrying the flag; that run clears the blocker it was behind."""
++    with kbc.connect_closing() as conn:
++        a, b = _blocked_behind(conn, "a"), _blocked_behind(conn, "b")
++        if scoped:
++            _scope(conn, a)
++            _scope(conn, b)
++        assert ksb.blocker_states(conn)[BID].is_open
++        with kb.write_txn(conn):   # the failure breaker's shape: blocked, untyped, no live run
++            conn.execute("UPDATE tasks SET status='blocked', block_kind=NULL, current_run_id=NULL "
++                         "WHERE id=?", (a,))
++        runs_before = len(kb.list_runs(conn, a))
++        assert kb.block_task(conn, a, kind="capability", reason="needs a different tool; wall gone",
++                             clear_blocker=True)
++        runs = kb.list_runs(conn, a)
++        assert len(runs) == runs_before + 1
++        synth = runs[-1]
++        assert synth.metadata == {ksb.CLEAR_FLAG: True} and synth.outcome == "blocked"
++        ev = [e for e in kb.list_events(conn, a) if e.kind == "blocked"][-1]
++        assert ev.payload["classified_in_place"] is True and ev.run_id == synth.id
++        st = ksb.blocker_states(conn)[BID]
++        assert (st.is_open, st.cleared_by) == (False, (a, synth.id)), (scoped, st)
++
++
++def test_explicit_clear_from_other_provider_run_clears_scoped_wall(kanban_home, scoped_routing):
++    """Control for the route-independent explicit clear: a Codex run's completion would not clear
++    the Anthropic-scoped wall, but its park with clear_blocker=True does."""
++    with kbc.connect_closing() as conn:
++        a, b = _blocked_behind(conn, "a"), _blocked_behind(conn, "b")
++        _scope(conn, a)
++        _scope(conn, b)
++        kb.unblock_task(conn, a)
++        assert kb.claim_task(conn, a)
++        _route_run(conn, a, "openai-codex")
++        assert kb.block_task(conn, a, kind="capability", reason="other reason; wall seen gone",
++                             clear_blocker=True)
++        st = ksb.blocker_states(conn)[BID]
++        assert not st.is_open and st.cleared_by[0] == a
++
++
+ 
+ @pytest.fixture
+ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+diff --git a/tests/tools/test_kanban_blocker_metadata.py b/tests/tools/test_kanban_blocker_metadata.py
+index fa640dcb760..d9b2dbe1516 100644
+--- a/tests/tools/test_kanban_blocker_metadata.py
++++ b/tests/tools/test_kanban_blocker_metadata.py
+@@ -74,24 +74,43 @@ def test_invalid_scope_refused_without_transition(board, tool, field):
+     assert kb.get_task(conn, tid).status == "running"
+ 
+ 
+-def route(conn, tid, error=None):
+-    with kb.write_txn(conn):
+-        rid = kb._current_run_id(conn, tid)
+-        kb._append_event(conn, tid, "model_tier", {
+-            "provider": "openai-codex", "model": "gpt-test", "lane": "ready"}, run_id=rid)
+-        if error:
+-            conn.execute("UPDATE task_runs SET error=? WHERE id=?", (error, rid))
++def route(conn, tid):
++    """The run's real admission receipt (``apply_model_tier``): this run is on Codex."""
++    from hermes_cli import kanban_model_tier as tier
++    task = kb.get_task(conn, tid)
++    tier.apply_model_tier(conn, task, lane="ready",
++                          cfg={"default_model": "gpt-test", "default_provider": "openai-codex"})
++    receipt = [e.payload for e in kb.list_events(conn, tid) if e.kind == tier.RUN_ROUTE_EVENT]
++    assert receipt and receipt[-1]["provider"] == "openai-codex"
+ 
+ 
+ @pytest.mark.parametrize("tool", ["kanban_block", "kanban_continue", "kanban_schedule"])
+-@pytest.mark.parametrize("error", ["ModelRoutingError: exact pinned route unavailable", "provider quota exceeded"])
+-def test_current_run_error_uses_receipt(board, tool, error):
++@pytest.mark.parametrize("error", ["ModelRoutingError: No eligible deep routes under billing/capability policy",
++                                   "provider quota exceeded"])
++def test_unlabelled_wall_never_borrows_current_receipt(board, tool, error):
++    """A wall marker with no provider label stays unscoped even though this run's receipt is Codex."""
+     conn, tid = board
+-    route(conn, tid, error)
++    route(conn, tid)
++    key = "checkpoint" if tool == "kanban_continue" else "reason"
++    call(tool, tid, **{key: error})
++    for data in persisted(conn, tid):
++        assert data["blocker_id"] == "provider-wall"
++        assert not set(SCOPE).intersection(data)
++
++
++@pytest.mark.parametrize("tool", ["kanban_block", "kanban_continue", "kanban_schedule"])
++def test_stored_run_error_never_borrows_current_receipt(board, tool):
++    """An unlabelled wall in this run's stored error (e.g. a delegated child's provider) is not
++    the executor's route: the receipt says Codex, but the park stays unscoped."""
++    conn, tid = board
++    route(conn, tid)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET error=? WHERE id=?",
++                     ("ModelRoutingError: No eligible deep routes", kb._current_run_id(conn, tid)))
+     call(tool, tid)
+     for data in persisted(conn, tid):
+-        assert (data["blocker_provider"], data["blocker_model"], data["blocker_lane"]) == (
+-            "openai-codex", "gpt-test", "ready")
++        assert data["blocker_id"] == "provider-wall"
++        assert not set(SCOPE).intersection(data)
+ 
+ 
+ @pytest.mark.parametrize("tool", ["kanban_block", "kanban_continue", "kanban_schedule"])
+@@ -120,8 +139,9 @@ def test_provider_labelled_error_is_not_current_run_identity(board, tool):
+ 
+ def test_explicit_scope_wins_over_error(board):
+     conn, tid = board
+-    route(conn, tid, "provider quota exceeded")
+-    call("kanban_continue", tid, **SCOPE)
++    route(conn, tid)
++    call("kanban_continue", tid, checkpoint="provider quota exceeded provider=openai-codex model=gpt-test",
++         **SCOPE)
+     assert all({key: data[key] for key in SCOPE} == SCOPE for data in persisted(conn, tid))
+ 
+ 
+@@ -147,20 +167,20 @@ def test_error_without_receipt_never_uses_current_task_pin(board):
+     conn, tid = board
+     with kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET provider_override='anthropic', model_override='claude-test' WHERE id=?", (tid,))
+-        conn.execute("UPDATE task_runs SET error='ModelRoutingError: unavailable' WHERE id=?",
+-                     (kb._current_run_id(conn, tid),))
+-    call("kanban_continue", tid)
++    call("kanban_continue", tid, checkpoint="ModelRoutingError: unavailable")
+     assert all("blocker_provider" not in data for data in persisted(conn, tid))
+ 
+ 
+ @pytest.mark.parametrize("error, expected", [
+     ("provider quota exceeded provider=anthropic model=claude-test", "anthropic"),
+     ("ModelRoutingError: provider=anthropic provider=openai-codex", None),
++    # A provider label on a line with no wall marker is prose, not wall identity.
++    ("Ran the impl on provider=openai-codex.\nLater reviewer: usage limit reached", None),
+ ])
+-def test_stored_error_identity_precedes_run_receipt(board, error, expected):
++def test_reason_identity_over_run_receipt(board, error, expected):
+     conn, tid = board
+-    route(conn, tid, error)
+-    call("kanban_continue", tid)
++    route(conn, tid)
++    call("kanban_continue", tid, checkpoint=error)
+     assert all(data.get("blocker_provider") == expected for data in persisted(conn, tid))
+ 
+ 
+@@ -182,3 +202,56 @@ def test_direct_continuation_preserves_metadata_scope(board):
+     assert continue_task(conn, tid, checkpoint="provider quota exceeded provider=openai-codex",
+                          metadata={"blocker_id": "provider-wall", **SCOPE})["ok"]
+     assert all({key: data[key] for key in SCOPE} == SCOPE for data in persisted(conn, tid))
++
++
++# --- Inference names only known MODEL providers; explicit scope is never filtered. ---
++
++@pytest.mark.parametrize("tool", ["kanban_block", "kanban_continue", "kanban_schedule"])
++@pytest.mark.parametrize("text", [
++    "GitHub API rate limit exceeded (provider: github)",
++    "rate limit exceeded provider=not-a-real-provider model=x",
++])
++def test_unknown_provider_label_is_not_inferred(board, tool, text):
++    """A service wall labelled with a non-model provider stays board-wide (unscoped)."""
++    conn, tid = board
++    route(conn, tid)
++    key = "checkpoint" if tool == "kanban_continue" else "reason"
++    call(tool, tid, **{key: text})
++    for data in persisted(conn, tid):
++        assert data["blocker_id"] == "provider-wall"
++        assert not set(SCOPE).intersection(data)
++
++
++@pytest.mark.parametrize("tool", ["kanban_block", "kanban_continue", "kanban_schedule"])
++@pytest.mark.parametrize("text, expected", [
++    ("Anthropic rate limit exceeded (provider: anthropic)", "anthropic"),
++    ("usage limit reached provider=openai-codex model=gpt-test", "openai-codex"),
++    ("usage limit reached provider=claude", "anthropic"),   # registry alias, canonical id stored
++])
++def test_known_model_provider_label_still_inferred(board, tool, text, expected):
++    conn, tid = board
++    key = "checkpoint" if tool == "kanban_continue" else "reason"
++    call(tool, tid, **{key: text})
++    for data in persisted(conn, tid):
++        assert data["blocker_provider"] == expected
++
++
++def test_unknown_and_known_label_on_wall_lines_is_ambiguous(board):
++    conn, tid = board
++    call("kanban_continue", tid, checkpoint="rate limit exceeded provider=github\n"
++                                            "usage limit reached provider=anthropic")
++    assert all("blocker_provider" not in data for data in persisted(conn, tid))
++
++
++@pytest.mark.parametrize("via", ["argument", "metadata"])
++def test_explicit_scope_is_never_filtered_by_registry(board, via):
++    """Explicit blocker_provider keeps its pre-inference compatibility, known or not."""
++    from hermes_cli.kanban_continuation import continue_task
++    conn, tid = board
++    text = "GitHub API rate limit exceeded (provider: github)"
++    if via == "argument":
++        call("kanban_continue", tid, checkpoint=text, blocker_provider="github")
++    else:
++        assert continue_task(conn, tid, checkpoint=text,
++                             metadata={"blocker_id": "provider-wall", "blocker_provider": "github"})["ok"]
++    assert all(data["blocker_provider"] == "github" for data in persisted(conn, tid))
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 4ea2f1edc19..0b4a527d194 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -291,7 +291,10 @@ _BLOCKER_ID_DESC = (
+     "Optional. Set ONLY when the wall is outside this card and would stop other "
+     "cards too (CI billing/quota refused, a provider or service outage, a release "
+     "pipeline down): a short slug such as 'github-actions-billing'. Reuse an id "
+-    "from 'Open shared blockers' in your context when it is the same wall. The "
++    "from 'Open shared blockers' in your context when it is the same wall; when that "
++    "entry is scoped (provider=X, not 'all'), pass blocker_provider=X with the reused id, "
++    "every time: a reassertion without it (or with another provider) makes the id "
++    "board-wide and holds every provider's cards. The "
+     "dispatcher then holds every ready card behind it and runs one probe card per "
+     "interval. The blocker clears only on evidence the wall is gone: a card behind "
+     "it completes or hands off for review, a park passes clear_blocker=true, a run "
+@@ -301,7 +304,7 @@ _BLOCKER_ID_DESC = (
+     "clear it: the card stays behind the blocker."
+ )
+ _CLEAR_BLOCKER_PROP = {
+-    "blocker_provider": _prop("string", "Optional provider affected by blocker_id. Other providers may proceed; omit for a provider-independent wall."),
++    "blocker_provider": _prop("string", "Optional provider affected by blocker_id. Other providers may proceed; omit for a provider-independent wall. An id asserted anywhere without a provider (or with a different one) in the last 14 days stays board-wide: use a new id for a narrower wall."),
+     "blocker_model": _prop("string", "Optional model that observed the wall (informational, not an applicability restriction)."),
+     "blocker_lane": _prop("string", "Optional lane that observed the wall (informational, not an applicability restriction)."),
+     "clear_blocker": {"type": "boolean", "description": (
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # Cross-gateway card wait fallback
 
-Patch: 0668 (a9ed7fc9ff).
+Patch: 0668 (a9ed7fc9ff); follow-ups 0873, 0874, 0878 and 1500 (Board-shadow status for evicted copies, below).
 
 ## Behavior
 
@@ -55,3 +55,13 @@ Code: `hermes_cli/kanban_wait_replica.py` (`StaleReplica`, `STALE_RC`, `stale_me
 Tests in `tests/hermes_cli/test_kanban_wait_replica.py`: `test_missing_is_error_and_stale_known_card_is_unknown_not_yet`, `test_stale_macbook_replica_is_not_marked_broken_after_three_checks`, `test_gateway_offline_past_cap_wakes_with_offline_note`, `test_schedule_awaiting_card_on_stale_replica_is_accepted`. Ran the file on fork `origin/main` `a65917ae05` for this mirror: 25 passed (that tip also contains `c3c618c3f0`). The `kanban_block` entry path is covered by **0878** (fork `c3c618c3f0`, test-only).
 
 **0878** pins `kanban_block(kind='time', awaiting=card@gateway)` against a stale replica (no `wake_check`, auto-filled probe): the hub refused this with `invalid_awaiting: ... stale replica` while a Mac slept, and 0873 fixed the behavior. A card the stale replica shows as missing is still refused (`invalid_awaiting`); an archived one is refused (`agent_action_wait`). Tests in the same file: `test_block_awaiting_card_on_stale_replica_is_accepted`, `test_block_awaiting_card_on_stale_replica_refuses_missing_or_archived`. Re-run on `a65917ae05`: 25 passed.
+
+## Follow-up patch (1500): an evicted worker copy is resolved from the Board shadow
+
+**1500** (`2448c7c1cd`, `fix(kanban): resolve evicted wait targets from Board shadow`).
+
+- **Behavior.** `kanban_wait_check.check_local("task", <id>)` (the command run locally, and over SSH by `check_remote` on the owner) used to read only the live board file. A worker gateway that had already evicted a finished foreign copy reported `error: <id> not found` (exit 2), even though the board's synced replica still held the card. A live row still wins. If the live file has no row, or does not exist, the status is read from the selected board's sync shadow (`kanban_sync_client.shadow_path(board_slug_for_path(<live db>))`, `kanban/sync-shadow/<slug>.db` under the Kanban home). The `scheduled`/`blocked` producer suffix (orphan producer) and the `parked-agent` check read the same file the status came from. `since=` still compares against that status. `kanban_awaiting.confirm_remote` inherits the change through `check_remote`: a shadow `running` row is confirmed, a shadow `done` row is `PRODUCER_DONE`, and a card in neither file is `INVALID_AWAITING`.
+- **How it works.** `_task_source(board, target)` tries `(live, shadow)` in order and returns the first path that has a row plus that row. `_producer_suffix` and `_agent_owned_park` take `source=`. A named board uses its own shadow (`other.db`), and a profile `HERMES_HOME` resolves to the canonical Kanban-home shadow. An unreadable live database is still an error (exit 2), not "absent, try the shadow". This shadow is the Board replica of this host's partition. It is not the offline-gateway replica fallback (`kanban_wait_replica`) described above.
+- **Code.** `hermes_cli/kanban_wait_check.py` (`_task_source`, `check_local`, `_producer_suffix`, `_agent_owned_park`).
+- **Tests** (new `tests/hermes_cli/test_kanban_wait_board_shadow.py`; not run for this mirror): `test_evicted_copy` (done → 0, running → 1, missing → 2; local and `check_remote` over a stubbed `subprocess.run` that runs `check_local`), `test_awaiting_validation_uses_board_status` (`confirm_remote`), `test_live_precedence_and_since`, `test_missing_live_file_still_resolves`, `test_named_board_is_not_default`, `test_profile_home_uses_canonical_board_shadow`, `test_corrupt_live_database_is_not_hidden`. The fixtures are bare `tasks(id, status)` tables, so the orphan-producer and `parked-agent` reads against a shadow file are untested, as is a real SSH round trip.
+- **Gotchas.** A stale shadow can report an old status for an evicted card. Nothing here checks the shadow's freshness, unlike the 600 s freshness rule for the offline replica.

@@ -1,0 +1,494 @@
+From 65f188f6250cf43a8a0f6295529e5e74e2209715 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:20:53 +0000
+Subject: [PATCH] fix(kanban): don't refuse a runs_on card over this machine's
+ profiles [daveey]
+
+A card whose runs_on rules this machine out (e.g. placement=hub rewritten to
+runs_on=[machine:hub]) runs with the landing machine's profile of that name.
+create_task still ran validate_assignment, the skills check, the managed model
+registry check and provider binding against THIS machine's profiles, so
+kanban_create(assignee=bb-tuner, placement=hub) from the MacBook was refused
+with 'Profile bb-tuner does not exist' although bb-tuner exists on the hub.
+
+- runs_elsewhere(conn, runs_on): machine:<other> label, or labels the registry
+  says this machine lacks (registry unreachable or not a primary: local checks).
+- create_task's assignee checks move to kanban_db_creation.validate_create_assignment.
+  For a remote card it validates only the requires shape; check_create still
+  refuses when every landing machine publishes tools that lack a need, and
+  claim_refusal re-checks tools at pickup.
+- Pinned skills defer to the landing worker (missing_pin_note), never a pickup
+  gate, so a remote card is not stranded; the model registry defers to the
+  landing dispatcher (route_model_mismatch). A vendor/provider family mismatch
+  is still refused.
+- A remote card's concrete provider-less pin is refused with the providers to
+  pass (require_remote_pin_provider): this machine's credentials can't bind it
+  and the landing dispatcher would only late-bind it at spawn.
+- Cards that can run here keep every local check.
+---
+ hermes_cli/kanban_capabilities.py             |   8 +-
+ hermes_cli/kanban_db.py                       |  18 +-
+ hermes_cli/kanban_db_creation.py              |  34 +++
+ hermes_cli/kanban_model_assignment.py         |   8 +-
+ hermes_cli/kanban_pin_provider.py             |  18 ++
+ hermes_cli/kanban_runs_on_capabilities.py     |  43 +++-
+ .../test_kanban_runs_on_remote_assignee.py    | 213 ++++++++++++++++++
+ 7 files changed, 324 insertions(+), 18 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_runs_on_remote_assignee.py
+
+diff --git a/hermes_cli/kanban_capabilities.py b/hermes_cli/kanban_capabilities.py
+index 0766415828f..4a727868afb 100644
+--- a/hermes_cli/kanban_capabilities.py
++++ b/hermes_cli/kanban_capabilities.py
+@@ -336,7 +336,7 @@ def _profile_capabilities(assignee: str, required: list[str] | None = None) -> s
+ 
+ def validate_assignment(
+     assignee: str | None, *, requires=None, workspace_kind: str = "scratch",
+-    workspace_path=None, skills=None, require_declaration: bool = False,
++    workspace_path=None, skills=None, require_declaration: bool = False, check_profile: bool = True,
+ ) -> list[str]:
+     """Return canonical, deduplicated requirements or raise CapabilityMismatchError.
+ 
+@@ -352,10 +352,16 @@ def validate_assignment(
+     ``require_declaration=True`` (agent create surfaces, when ``kanban.require_capability_declaration``
+     is on) first refuses an omitted ``requires`` (None) that nothing structured backs, with
+     :class:`RequiresDeclarationMissing`; an explicit ``[]`` passes. [daveey]
++
++    ``check_profile=False`` (a card whose ``runs_on`` rules this machine out) validates only the shape and
++    returns the declared requirements: this machine's profile of that name, and the skills it resolves, say
++    nothing about the landing machine's. [daveey]
+     """
+     if require_declaration:
+         check_declaration(requires, workspace_kind, skills=skills, assignee=assignee)
+     required = _required_capabilities(requires, workspace_kind)
++    if not check_profile:
++        return required
+     if skills:
+         extra = skill_requirements(skills, assignee)
+         if extra:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 65ad39ce0f7..8eca0b70d24 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1328,9 +1328,6 @@ def create_task(
+         )
+         if problem := worktree_workspace_problem(workspace_path, board=board):
+             raise WorktreeWorkspaceConfigError(problem)
+-    from hermes_cli.kanban_skill_check import check_task_skills
+-    check_task_skills(skills_list, assignee, enabled=validate_skills)
+-
+     now = int(time.time())
+ 
+     # Only persistent kinds inherit the board ``default_workdir``: a scratch
+@@ -1340,16 +1337,11 @@ def create_task(
+         if board_default:
+             workspace_path = str(board_default)
+ 
+-    from hermes_cli.kanban_capabilities import validate_assignment
+-    required = validate_assignment(assignee, requires=requires, workspace_kind=workspace_kind,
+-                                   workspace_path=workspace_path, skills=skills_list, require_declaration=require_declaration)
+-    from hermes_cli.kanban_runs_on_capabilities import check_create  # [daveey] where runs_on lands it
+-    check_create(conn, runs_on, assignee=assignee, requires=required, workspace_kind=workspace_kind)
+-    from hermes_cli.kanban_model_assignment import validate_model_assignment
+-    validate_model_assignment(assignee, model_override, provider_override)
+-    # [daveey] Bind a provider-less concrete pin now (or refuse), never late-bind it to config at spawn.
+-    from hermes_cli.kanban_pin_provider import resolve_pin_provider
+-    model_override, provider_override = resolve_pin_provider(model_override, provider_override, assignee=assignee)
++    from hermes_cli.kanban_db_creation import validate_create_assignment  # [daveey] runs_on-aware
++    required, model_override, provider_override = validate_create_assignment(
++        conn, assignee, runs_on=runs_on, requires=requires, workspace_kind=workspace_kind,
++        workspace_path=workspace_path, skills=skills_list, validate_skills=validate_skills,
++        require_declaration=require_declaration, model=model_override, provider=provider_override)
+     _reject_spaced_pin(model_override, provider_override)
+ 
+     # Retry once on the extremely unlikely id collision.
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index c0abd2c7853..f76fbe600d3 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -48,3 +48,37 @@ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+             kb._append_event(conn, task_id, "dependency_wait", {
+                 "reason": "parent_not_done", "parent": gating[0],
+             })
++
++
++def validate_create_assignment(conn, assignee, *, runs_on, requires, workspace_kind, workspace_path, skills,
++                               validate_skills, require_declaration, model, provider):
++    """``create_task``'s assignee checks: pinned skills, required tools (here and where ``runs_on`` lands
++    it), the model pin and its provider binding. Returns ``(required, model, provider)`` or raises.
++
++    A card whose ``runs_on`` rules this machine out runs with the landing machine's profile of that name:
++    this machine's profiles (missing, or a same-named one with other tools, skills or registry) prove
++    nothing. :func:`~hermes_cli.kanban_runs_on_capabilities.check_create` reads the landing machines'
++    published tools (``claim_refusal`` re-checks them at pickup); pinned skills load or get the
++    missing-skill note in the landing worker (``missing_pin_note``); the model registry is checked by the
++    landing dispatcher (``route_model_mismatch``). A concrete pin must name its provider, since only the
++    landing machine's credentials could bind it. [daveey]
++    """
++    from hermes_cli.kanban_capabilities import validate_assignment
++    from hermes_cli.kanban_model_assignment import validate_model_assignment
++    from hermes_cli.kanban_pin_provider import require_remote_pin_provider, resolve_pin_provider
++    from hermes_cli.kanban_runs_on_capabilities import check_create, runs_elsewhere
++    from hermes_cli.kanban_skill_check import check_task_skills
++
++    remote = runs_elsewhere(conn, runs_on)
++    check_task_skills(skills, assignee, enabled=validate_skills and not remote)
++    required = validate_assignment(assignee, requires=requires, workspace_kind=workspace_kind,
++                                   workspace_path=workspace_path, skills=skills,
++                                   require_declaration=require_declaration, check_profile=not remote)
++    check_create(conn, runs_on, assignee=assignee, requires=required, workspace_kind=workspace_kind)
++    validate_model_assignment(assignee, model, provider, local_profile=not remote)
++    if remote:
++        require_remote_pin_provider(model, provider)
++        return required, model, provider
++    # Bind a provider-less concrete pin now (or refuse), never late-bind it to config at spawn.
++    model, provider = resolve_pin_provider(model, provider, assignee=assignee)
++    return required, model, provider
+diff --git a/hermes_cli/kanban_model_assignment.py b/hermes_cli/kanban_model_assignment.py
+index b8c924f1b2a..dd2d48473ce 100644
+--- a/hermes_cli/kanban_model_assignment.py
++++ b/hermes_cli/kanban_model_assignment.py
+@@ -62,18 +62,22 @@ def _check_managed_pin(model, provider, config):
+         raise ModelPinNotInRegistryError(model, provider, exc.allowed) from exc
+ 
+ 
+-def validate_model_assignment(assignee, model, provider, *, check_registry=True):
++def validate_model_assignment(assignee, model, provider, *, check_registry=True, local_profile=True):
+     """Validate pinned models only; unknown/custom providers and models remain supported.
+ 
+     This is configuration validation, not an entitlement or credential probe. Never
+     automatically select a paid provider to repair an incompatible subscription pin.
+     Under ``model_routing.enforce_subscription_only`` the pin must also pass the registry
+     check the worker runs at startup; otherwise the card is accepted and only crashes later.
++
++    ``local_profile=False`` (a card whose ``runs_on`` rules this machine out) skips this machine's profile
++    config: the landing machine's worker runs its own registry check. Only the machine-independent
++    vendor/provider family check of an explicit provider remains. [daveey]
+     """
+     if not model:
+         return
+     model = model.strip()
+-    config = _assignee_config(assignee)
++    config = _assignee_config(assignee) if local_profile else None
+     if check_registry:
+         _check_managed_pin(model, (provider or '').strip() or None, config)
+     if not provider and assignee:
+diff --git a/hermes_cli/kanban_pin_provider.py b/hermes_cli/kanban_pin_provider.py
+index 789509fb741..d3e5b42b60b 100644
+--- a/hermes_cli/kanban_pin_provider.py
++++ b/hermes_cli/kanban_pin_provider.py
+@@ -158,6 +158,24 @@ def resolve_pin_provider(
+     raise PinProviderUnresolvedError(model, "no known provider catalog lists that id", [])
+ 
+ 
++def require_remote_pin_provider(model: Optional[str], provider: Optional[str]) -> None:
++    """Refuse a concrete provider-less pin on a card that runs on another machine. [daveey]
++
++    :func:`resolve_pin_provider` binds against THIS machine's profile and credentials, which say nothing about
++    the landing machine's, and the landing dispatcher's :func:`resolve_legacy_pin` only logs when it cannot
++    bind, so the worker would late-bind to its config at spawn (the exit-78 failure above). The creator
++    passes the provider instead; class selectors keep provider auto."""
++    model = (model or "").strip()
++    if not model or (provider or "").strip():
++        return
++    from agent.model_routing import is_class_selector
++    if is_class_selector(model):
++        return
++    known = _static_candidates(model) or _vendor_candidates(model)
++    raise PinProviderUnresolvedError(
++        model, "the card runs on another machine, whose credentials this machine cannot check", known)
++
++
+ def resolve_legacy_pin(task: Any) -> tuple[Optional[str], Optional[str]]:
+     """Dispatcher path for rows pinned before the pin-time resolver: ``(provider, error)``. Never raises."""
+     model = (getattr(task, "model_override", None) or "").strip()
+diff --git a/hermes_cli/kanban_runs_on_capabilities.py b/hermes_cli/kanban_runs_on_capabilities.py
+index de764a51b7c..c5aa5c73cc6 100644
+--- a/hermes_cli/kanban_runs_on_capabilities.py
++++ b/hermes_cli/kanban_runs_on_capabilities.py
+@@ -2,7 +2,11 @@
+ 
+ :func:`hermes_cli.kanban_capabilities.validate_assignment` reads the assignee's profile on THIS machine. A
+ card with ``runs_on`` runs on another machine, with that machine's profile of the same name, so the local
+-check proves nothing about where it will run. Two halves close that gap:
++check proves nothing about where it will run. Three pieces close that gap:
++
++* :func:`runs_elsewhere` (create): a card whose ``runs_on`` rules this machine out skips ``create_task``'s
++  checks of this machine's profiles (tools, pinned skills, model registry, provider binding). A missing or
++  different local profile of that name never refuses it; the two checks below decide.
+ 
+ * :func:`check` (create, ``kanban move``): every Board-registry machine whose labels satisfy ``runs_on`` (and,
+   for a move, is not this one) is a candidate. A candidate's profile tools are known for this machine (local
+@@ -142,6 +146,39 @@ def check_create(conn, runs_on, *, assignee: Optional[str], requires, workspace_
+     check(labels, assignee=assignee, requires=requires, workspace_kind=workspace_kind, me=wn._own(conn))
+ 
+ 
++def runs_elsewhere(conn, runs_on, *, machines: Optional[Mapping[str, Mapping[str, Any]]] = None) -> bool:
++    """True when ``runs_on`` on a Board primary rules THIS machine out, so the card can only run with another
++    machine's profile of the assignee's name. ``create_task`` then skips its checks of this machine's
++    profiles (tools, skills, model registry, provider binding) and leaves them to :func:`check_create`, the
++    landing dispatcher and :func:`claim_refusal`.
++
++    False (keep the local checks) for no ``runs_on``, ``[]`` (any machine), a board that is not a primary, or
++    labels the registry cannot settle (unreachable). A ``machine:<other>`` label needs no registry: this
++    machine only carries ``machine:<its own name>``."""
++    if runs_on is None:
++        return False
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    if sync.board_mode(conn) != "primary":
++        return False
++    labels = wn.normalize_runs_on(runs_on if isinstance(runs_on, str) else list(runs_on)) or []
++    if not labels:
++        return False
++    me = wn._own(conn)
++    if any(lab.startswith("machine:") and lab != f"machine:{me}" for lab in labels):
++        return True
++    pool = machines
++    if pool is None:
++        try:
++            reg = wn.registry()
++        except Exception:  # health: allow BLE001 -- registry unreachable: unknown, keep the local checks
++            reg = None
++        if reg is None:
++            return False
++        pool = reg.get("machines") or {}
++    return not set(labels) <= wn.effective_labels(pool.get(me), me)
++
++
+ def verdict_warning(implementer: str, task) -> dict:
+     """``{"capability_warning": ...}`` for a ``changes_requested`` event, or ``{}``.
+ 
+@@ -173,7 +210,9 @@ def claim_refusal(card: Mapping[str, Any], *, me: str = "") -> Optional[str]:
+     """None when this machine's profile can run ``card`` (a replica row), else why not.
+ 
+     The same check create runs locally, applied by the machine that would run the card. Logged once per
+-    card and reason so a card no machine can take is visible in the worker's log."""
++    card and reason so a card no machine can take is visible in the worker's log. Pinned skills are not a
++    pickup gate: a worker that cannot load one runs with the missing-skill note (``missing_pin_note``), so a
++    remote card whose create skipped the skill check is never stranded on the Board. [daveey]"""
+     assignee = card.get("assignee")
+     if not assignee:
+         return None
+diff --git a/tests/hermes_cli/test_kanban_runs_on_remote_assignee.py b/tests/hermes_cli/test_kanban_runs_on_remote_assignee.py
+new file mode 100644
+index 00000000000..cee5f6359b0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_runs_on_remote_assignee.py
+@@ -0,0 +1,213 @@
++"""A card whose ``runs_on`` excludes this machine is not refused over THIS machine's profiles. [daveey]
++
++10-31 19:12 PDT: a MacBook worker called ``kanban_create(assignee="bb-tuner", placement="hub",
++requires=[terminal, file, git])``. ``placement`` became ``runs_on=[machine:hub]``, then ``create_task`` ran the
++local ``validate_assignment`` against the MacBook's profiles and refused ("Profile 'bb-tuner' does not exist"),
++although ``bb-tuner`` exists on the hub, where the card would run.
++
++For such a card the requirement check reads the landing machines' published ``profile-tools`` records
++(:func:`kanban_runs_on_capabilities.check_create`), the skills and model-pin checks defer to the landing machine,
++and :func:`kanban_runs_on_capabilities.claim_refusal` stays the pickup backstop. Cards that can run here keep
++today's local checks.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli.kanban_capabilities import CapabilityMismatchError
++from tests.hermes_cli.test_kanban_requires_placement import WITH_KANBAN, _publish
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, MACHINES, WORKER, Gateway
++
++pytest_plugins = ["tests.hermes_cli.test_kanban_requires_placement"]  # its ``gws`` and ``svc`` fixtures
++
++PROFILE = "bb-tuner"
++NEEDS = ["terminal", "file", "git"]
++SKILL = "bb-tuning"
++
++
++def _profile(home, name=PROFILE, config=WITH_KANBAN):
++    target = home / "profiles" / name
++    target.mkdir(parents=True, exist_ok=True)
++    (target / "config.yaml").write_text(config)
++    return target
++
++
++def _count(conn):
++    return conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
++
++
++# --- 1. the landing machine's published tools cover the needs ---------------------------------------------------
++
++def test_remote_profile_covering_the_needs_is_created(gws, monkeypatch):
++    hub, _ = gws
++    _publish(monkeypatch, {WORKER: {PROFILE: {"terminal", "file", "git"}}})
++    tid = kb.create_task(hub.conn, title="tune", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"])
++    task = kb.get_task(hub.conn, tid)
++    assert task.assignee == PROFILE
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
++        f"machine:{WORKER}"]
++
++
++# --- 2. the landing machine's published tools lack one ---------------------------------------------------------
++
++def test_remote_profile_lacking_a_tool_is_refused_naming_the_machine(gws, monkeypatch):
++    from hermes_cli.kanban_runs_on_capabilities import PlacementCapabilityMismatch
++    hub, _ = gws
++    _publish(monkeypatch, {WORKER: {PROFILE: {"file"}}})
++    before = _count(hub.conn)
++    with pytest.raises(PlacementCapabilityMismatch) as caught:
++        kb.create_task(hub.conn, title="tune", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"])
++    msg = str(caught.value)
++    assert caught.value.code == "runs_on_capability_mismatch"
++    assert WORKER in msg and "terminal" in msg, msg
++    assert "does not exist" not in msg, msg  # not the local-profile error
++    assert _count(hub.conn) == before
++
++
++# --- 3. no remote record: created, and the claim gate still guards pickup ------------------------------------
++
++def test_remote_tools_unknown_creates_and_claim_gate_still_refuses(gws, svc, monkeypatch):
++    hub, worker = gws
++    _publish(monkeypatch, {})
++    tid = kb.create_task(hub.conn, title="tune", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is None, "worker-1 copied a card for a profile it does not have"
++    assert tid not in svc.board(BOARD)["leases"]
++    from hermes_cli import kanban_runs_on_capabilities as roc
++    worker.enter()
++    assert "does not exist" in (roc.claim_refusal({"id": tid, "assignee": PROFILE, "requires": json.dumps(NEEDS)})
++                                or "")
++    # Control: once worker-1 has the profile, it takes the card.
++    _profile(worker.home)
++    worker.round()
++    worker.tick()
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++
++
++# --- 4. a card that can run here keeps today's local checks --------------------------------------------------
++
++@pytest.mark.parametrize("runs_on", [None, ["linux"], [f"machine:{HUB}"]])
++def test_card_that_can_run_here_is_still_refused_for_a_missing_local_profile(gws, monkeypatch, runs_on):
++    hub, _ = gws
++    _publish(monkeypatch, {WORKER: {PROFILE: {"terminal", "file", "git"}}})
++    before = _count(hub.conn)
++    with pytest.raises(CapabilityMismatchError) as caught:
++        kb.create_task(hub.conn, title="tune", assignee=PROFILE, requires=NEEDS, runs_on=runs_on)
++    assert caught.value.code == "assignee_capability_mismatch"
++    assert "does not exist" in str(caught.value)
++    assert _count(hub.conn) == before
++
++
++def test_remote_card_still_validates_the_requires_shape(gws, monkeypatch):
++    hub, _ = gws
++    _publish(monkeypatch, {})
++    with pytest.raises(ValueError):
++        kb.create_task(hub.conn, title="tune", assignee=PROFILE, requires=["bogus"], runs_on=[f"machine:{WORKER}"])
++
++
++# --- 5a. pinned skills ---------------------------------------------------------------------------------------
++
++def test_remote_card_skill_check_does_not_read_the_local_profile(gws, svc, monkeypatch):
++    from hermes_cli.kanban_skill_check import UnknownSkillError
++    hub, worker = gws
++    _publish(monkeypatch, {WORKER: {PROFILE: {"terminal", "file", "git"}}})
++    _profile(hub.home)  # the hub has a bb-tuner too, without the skill
++    hub.enter()
++    # Control: a card that runs here is refused for the skill this machine's profile lacks.
++    with pytest.raises(UnknownSkillError):
++        kb.create_task(hub.conn, title="here", assignee=PROFILE, requires=NEEDS, skills=[SKILL], runs_on=["linux"],
++                       validate_skills=True)
++    tid = kb.create_task(hub.conn, title="there", assignee=PROFILE, requires=NEEDS, skills=[SKILL],
++                         runs_on=[f"machine:{WORKER}"], validate_skills=True)
++    assert kb.get_task(hub.conn, tid).skills == [SKILL]
++    # Deferred to the landing machine, which is not stranded by it: its bb-tuner lacks the skill too and still
++    # takes the card; its worker starts with the missing-skill note (kanban_skill_check.missing_pin_note).
++    _profile(worker.home)
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++
++
++# --- 5b. model pin -------------------------------------------------------------------------------------------
++
++def test_remote_card_model_pin_is_not_checked_against_the_local_profile(gws, monkeypatch):
++    from hermes_cli.kanban_model_assignment import ModelPinNotInRegistryError, ModelProviderMismatchError
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    hub, _ = gws
++    _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "git"}}})
++    # THIS machine's default profile runs a managed registry that does not list claude-sonnet-4-5.
++    with open(hub.home / "config.yaml", "a") as fh:
++        fh.write("model:\n  default: claude-sonnet-5-5\n  provider: anthropic\n" + _managed_yaml())
++    hub.enter()
++    with pytest.raises(ModelPinNotInRegistryError):  # control: a card that runs here
++        kb.create_task(hub.conn, title="here", assignee="default", requires=NEEDS,
++                       model_override="claude-sonnet-4-5", provider_override="anthropic")
++    tid = kb.create_task(hub.conn, title="there", assignee="default", requires=NEEDS, runs_on=[f"machine:{WORKER}"],
++                         model_override="claude-sonnet-4-5", provider_override="anthropic")
++    task = kb.get_task(hub.conn, tid)
++    assert (task.model_override, task.provider_override) == ("claude-sonnet-4-5", "anthropic")
++    # A provider/vendor family mismatch is the same on every machine: still refused.
++    with pytest.raises(ModelProviderMismatchError):
++        kb.create_task(hub.conn, title="bad", assignee="default", requires=NEEDS, runs_on=[f"machine:{WORKER}"],
++                       model_override="gpt-5", provider_override="anthropic")
++
++
++def test_remote_card_provider_less_pin_is_refused_naming_the_provider(gws, monkeypatch):
++    from hermes_cli import kanban_pin_provider as kpp
++    hub, _ = gws
++    _publish(monkeypatch, {WORKER: {PROFILE: {"terminal", "file", "git"}}})
++    # THIS machine has anthropic credentials, but they say nothing about the landing machine's.
++    monkeypatch.setattr("hermes_cli.models_detect.provider_has_credentials", lambda provider: provider == "anthropic")
++    # Control: a card that runs here binds the pin against this machine's credentials.
++    here = kb.create_task(hub.conn, title="here", assignee="default", requires=NEEDS, model_override="claude-opus-5-5")
++    assert kb.get_task(hub.conn, here).provider_override == "anthropic"
++    before = _count(hub.conn)
++    # A remote card's pin is never bound here nor left for the landing dispatcher to late-bind: refused with
++    # the providers to pass, not with the local-profile error.
++    with pytest.raises(kpp.PinProviderUnresolvedError) as caught:
++        kb.create_task(hub.conn, title="there", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"],
++                       model_override="claude-opus-5-5")
++    assert "anthropic" in str(caught.value) and "does not exist" not in str(caught.value)
++    assert _count(hub.conn) == before
++    # With the provider named, or a class selector (provider auto by design), it is created.
++    tid = kb.create_task(hub.conn, title="there", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"],
++                         model_override="claude-opus-5-5", provider_override="anthropic")
++    assert kb.get_task(hub.conn, tid).provider_override == "anthropic"
++    tid = kb.create_task(hub.conn, title="there", assignee=PROFILE, requires=NEEDS, runs_on=[f"machine:{WORKER}"],
++                         model_override="class:deep")
++    assert kb.get_task(hub.conn, tid).provider_override is None
++
++
++# --- 6. the tool entry path ----------------------------------------------------------------------------------
++
++def test_tool_create_with_placement_on_an_enrolled_machine_creates_the_card(tmp_path, monkeypatch, svc):
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import kanban_db_sync as sync
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    mac = Gateway(tmp_path, "macbook", svc, monkeypatch, pickup=False)
++    try:
++        machines = {**MACHINES, HUB: {**MACHINES[HUB], "pickup": "explicit"}}
++        wn.set_registry_fetch(lambda: {"me": "macbook", "machines": list(machines.values())})
++        _publish(monkeypatch, {HUB: {PROFILE: {"terminal", "file", "git"}}})
++        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++        out = json.loads(kt._handle_create({
++            "title": "design CI capacity", "assignee": PROFILE, "placement": HUB, "requires": NEEDS,
++            "model": "claude-opus-5-5", "provider": "anthropic"}))
++        assert not out.get("error"), out
++        tid = out["task_id"]
++        assert out.get("runs_on") == [f"machine:{HUB}"], out
++        row = mac.conn.execute("SELECT assignee, runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()
++        assert row[0] == PROFILE and json.loads(row[1]) == [f"machine:{HUB}"]
++    finally:
++        mac.conn.close()
++        sync.set_lease_client(None)
++        wn.set_registry_fetch(None)
+-- 
+2.55.0
+

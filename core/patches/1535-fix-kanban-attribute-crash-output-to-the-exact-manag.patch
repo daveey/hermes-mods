@@ -1,0 +1,126 @@
+From fc1ad576793e99e1055af201225de83e96c4380f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 17:26:34 +0000
+Subject: [PATCH] fix(kanban): attribute crash output to the exact managed run
+ [daveey]
+
+---
+ hermes_cli/kanban_db_dispatch.py              |  5 ++-
+ hermes_cli/kanban_worker_log.py               | 33 ++++++++++++++
+ .../test_kanban_managed_result_pid.py         | 43 +++++++++++++++++++
+ 3 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index fa9953e90e6..a6ab1fb6cc3 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1254,7 +1254,10 @@ def _classify_dead_worker(
+     else:
+         dead = _ou.noted(_classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board, run_id=run_id), conn, task_id, run_id, log)
+     if task_id and not dead.rate_limited:
+-        worker_output = _worker_final_output(task_id, board=board, run_id=run_id)
++        from hermes_cli.kanban_worker_log import managed_worker_output
++        worker_output = managed_worker_output(conn, task_id, run_id, pid, claimer)
++        if worker_output is None:
++            worker_output = _worker_final_output(task_id, board=board, run_id=run_id)
+         if worker_output:
+             dead.error_text += f"{WORKER_OUTPUT_SEP}{worker_output!r}"
+             dead.event_payload["worker_output"] = worker_output
+diff --git a/hermes_cli/kanban_worker_log.py b/hermes_cli/kanban_worker_log.py
+index df57fcf93ae..21149941115 100644
+--- a/hermes_cli/kanban_worker_log.py
++++ b/hermes_cli/kanban_worker_log.py
+@@ -105,6 +105,39 @@ def current_run_log(raw: str, run_id=None) -> str:
+     return body[starts[-1].start():] if starts else body
+ 
+ 
++def managed_worker_output(conn, task_id, run_id, pid, claim_lock) -> Optional[str]:
++    """Prefer an attributable receipt over the shared log, even if its output is empty.
++
++    Old submitters can still flush into the task log after a new run's start marker.
++    Read on the reclaim transaction's connection; opening another connection can deadlock.
++    A bound managed run without a receipt has no attributable text: do not trust its
++    shared log either. None is reserved for legacy/unbound callers' log fallback.
++    """
++    from hermes_cli import kanban_db as kb
++
++    if conn is None or run_id is None:
++        return None
++    bound_row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++        "AND kind='worker_bound' ORDER BY id DESC LIMIT 1", (task_id, run_id),
++    ).fetchone()
++    bound = kb._json_dict(bound_row[0]) if bound_row else {}
++    pids = {pid}
++    if bound.get('claim_lock') == claim_lock and bound.get('pid') is not None:
++        pids.add(bound['pid'])
++    rows = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++        "AND kind='worker_result' ORDER BY id DESC", (task_id, run_id),
++    )
++    for row in rows:
++        result = kb._json_dict(row[0])
++        if result.get('claim_lock') == claim_lock and result.get('pid') in pids:
++            output = result.get('last_output')
++            if isinstance(output, str):
++                return output[-400:]
++    return "" if bound_row else None
++
++
+ def _worker_final_output(task_id: str, board: Optional[str] = None, *, run_id=None) -> str:
+     """Best-effort read of a dead worker's last printed text, for the board diagnostic.
+ 
+diff --git a/tests/hermes_cli/test_kanban_managed_result_pid.py b/tests/hermes_cli/test_kanban_managed_result_pid.py
+index cfaa18dc026..a4be033e369 100644
+--- a/tests/hermes_cli/test_kanban_managed_result_pid.py
++++ b/tests/hermes_cli/test_kanban_managed_result_pid.py
+@@ -60,3 +60,46 @@ def test_managed_exit_75_requeues_rate_limited_not_crashed(conn, bound_claim, ex
+     assert outcome == expected
+     assert (tid in kbd.detect_crashed_workers._last_rate_limited) is (expected == "rate_limited")
+     assert (tid in crashed) is (expected == "crashed")
++
++
++@pytest.mark.parametrize("reply", ["Worker could not start: ModelRoutingError: no route", "", None])
++@pytest.mark.parametrize("late_result", ["old_run", "wrong_pid", "wrong_claim"])
++def test_crash_output_ignores_late_prior_run_result(conn, reply, late_result):
++    import json
++
++    tid = kb.create_task(conn, title="interleaved replies", assignee="w")
++    first = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    assert first is not None
++    old_pid = _dead_pid()
++    kbd._set_worker_pid(conn, tid, old_pid)
++    assert tid in kbd.detect_crashed_workers(conn)
++    task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    assert task is not None and task.current_run_id != first.current_run_id
++    submitter, interpreter = _dead_pid(), _dead_pid()
++    kbd._set_worker_pid(conn, tid, submitter)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "worker_bound", {
++            "pid": interpreter, "claim_lock": task.claim_lock,
++        }, run_id=task.current_run_id)
++        if reply is not None:
++            kb._append_event(conn, tid, "worker_result", {
++                "pid": interpreter, "claim_lock": task.claim_lock,
++                "exit_code": 1, "last_output": reply,
++            }, run_id=task.current_run_id)
++        kb._append_event(conn, tid, "worker_result", {
++            "pid": interpreter if late_result == "wrong_claim" else old_pid,
++            "claim_lock": "foreign" if late_result == "wrong_claim" else first.claim_lock,
++            "exit_code": 0, "last_output": "OLD REPLY",
++        }, run_id=first.current_run_id if late_result == "old_run" else task.current_run_id)
++    # The old submitter can still flush to the shared task log after B's marker.
++    with kbd._open_worker_log(task, None) as log:
++        log.write(f"{reply}\nOLD REPLY\n[kanban-worker-exit] rc=1\n".encode())
++    assert tid in kbd.detect_crashed_workers(conn)
++    error = conn.execute("SELECT error FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()[0]
++    payload = json.loads(conn.execute(
++        "SELECT payload FROM task_events WHERE run_id=? AND kind='crashed'",
++        (task.current_run_id,),
++    ).fetchone()[0])
++    assert "OLD REPLY" not in error
++    assert (reply or "") in error
++    assert payload.get("worker_output", "") == (reply or "")
+-- 
+2.55.0
+

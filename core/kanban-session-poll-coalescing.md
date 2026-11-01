@@ -28,8 +28,42 @@ Apply after 0670, before 0672, in curated series order.
 
 ## Gotchas
 
-A cold profile's poll may do one extra board read (~130 ms) while holding the flight lock. A last-good snapshot is only for overlapping requests; a failed refresh must not be reported as a fresh successful read.
+A cold profile's poll may do one extra board read (~130 ms) while holding the flight lock. Since 1520, a last-good snapshot also bounds the initiating refresh caller's wait; it keeps its original read timestamp and is not reported as a fresh successful read.
 
 ## plugin?
 
 No; the shared core session-list annotation reader.
+
+## Bounded initiating refresh (1520)
+
+### Behavior
+
+With a previous snapshot for the scope, even the caller that wins the refresh lock waits only
+`_REFRESH_WAIT_S = 1.0` for the new read. A fast read returns fresh data; a slow read returns the
+previous tuple while the helper publishes its result for the next poll. Previous data retains its
+read timestamp. A cold scope without previous data still reads inline; this is not a universal
+one-second REST deadline.
+
+### How it works and Code
+
+`hermes_cli/kanban_annotation_refresh.py::refresh_bounded` transfers the already-held lock to a
+context-propagating daemon thread and waits on an event. The helper releases the lock on success or
+failure. Fast errors reach the caller; a late background error keeps the previous read and logs it.
+`kanban_session_activity.py` records tuple identity/read time and uses that date when serving stale
+parts. `kanban_session_activity_release.py` receives the unchanged owner-terminal attestation rule
+as a file-size extraction; no release authority is broadened.
+
+### Tests
+
+Source `tests/hermes_cli/test_kanban_annotation_refresh_bounded.py` covers slow/fast refresh,
+fast/late errors and lock release, cold inline reads, real helper threads despite a stubbed
+`threading.Thread`, and `test_session_detail_route_answers_within_bound_during_slow_refresh` for
+the session-detail route. These tests were not run in this documentation pass; no live Desktop
+burst benchmark is claimed.
+
+### Applying and Gotchas
+
+Apply 1520 in the complete ordered mirror via the [README replay recipe](README.md#applying).
+The bounded wait depends on an existing same-scope snapshot. Late failures are not fresh success,
+and the underlying refresh is not cancelled when the caller stops waiting. Historical test results
+above describe earlier publication runs, not this follow-up.

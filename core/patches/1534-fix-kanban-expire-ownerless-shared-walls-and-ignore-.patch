@@ -1,0 +1,189 @@
+From 7adafaf5765f6f62332e570a15f7c1cdd02bc636 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:41:45 +0000
+Subject: [PATCH] fix(kanban): expire ownerless shared walls and ignore
+ terminal assertion metadata [daveey]
+
+---
+ hermes_cli/kanban_shared_blockers.py          | 24 +++---
+ .../hermes_cli/test_kanban_shared_blockers.py | 77 ++++++++++++++++++-
+ 2 files changed, 88 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 4b0a8260fb5..dd74f5b8779 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -6,7 +6,8 @@ pipeline down) ends its run with ``kanban_block(..., blocker_id="<slug>")`` or
+ (``blocker_id``); nothing else is stored, so the blocker's state is derived from run history:
+ 
+ * a card is **behind** blocker X while its latest run that said anything about X carries X;
+-* X was **asserted** at the newest ``ended_at`` of any run carrying X;
++* X was **asserted** at the newest ``ended_at`` of an asserting run carrying X;
++  completed/handed-off runs never assert, even if their metadata carries X;
+ * X was **cleared** only on evidence that the wall is gone, at the newest of:
+   - the ``ended_at`` of a run that followed an X-run on the same card and completed or handed
+     off (``CLEAR_OUTCOMES``);
+@@ -16,7 +17,8 @@ pipeline down) ends its run with ``kanban_block(..., blocker_id="<slug>")`` or
+     hit another wall);
+   - a ``condition_met`` event (the card's wake_check exited 0) on a card behind X, when the park
+     that set that wake_check carried X (a probe set by a park without the id may test anything);
+-* X is **open** while asserted > cleared.
++* X is **open** while asserted > cleared and at least one live card is behind it.
++  Done/archived cards cannot keep a wall open; a later encounter asserts it again.
+ 
+ A re-park WITHOUT the id (``blocked``/``scheduled``/``continued`` with no ``clear_blocker``) says
+ nothing about X: the card stays behind X and X stays open. It used to count as a clear, so a
+@@ -75,7 +77,7 @@ NEUTRAL_OUTCOMES = frozenset({
+ })
+ # Only blockers asserted this recently are considered (bounds the scan on old boards).
+ _LOOKBACK_SECONDS = 14 * 86400
+-# A run without the id that ended this way is evidence the wall is gone: the card finished,
++# A run that ended this way is evidence the wall is gone: the card finished,
+ # or handed off to review / back from review.
+ CLEAR_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested"})
+ # Run metadata / tool arg: the caller says the card's shared blocker is gone.
+@@ -90,10 +92,12 @@ def run_effect(outcome: Optional[str], metadata) -> tuple[str, Optional[str]]:
+     from hermes_cli import kanban_db as kb
+ 
+     meta = kb._json_dict(metadata)
++    if (outcome or "") in CLEAR_OUTCOMES:
++        return "clear", None
+     bid = normalize_blocker_id(meta.get("blocker_id"))
+     if bid is not None:
+         return "assert", bid
+-    if meta.get(CLEAR_FLAG) is True or (outcome or "") in CLEAR_OUTCOMES:
++    if meta.get(CLEAR_FLAG) is True:
+         return "clear", None
+     return "pass", None
+ 
+@@ -144,11 +148,7 @@ class BlockerState:
+ 
+     @property
+     def is_open(self) -> bool:
+-        return self.asserted_at > self.cleared_at
+-
+-
+-def _meta_blocker(kb, metadata) -> Optional[str]:
+-    return normalize_blocker_id(kb._json_dict(metadata).get("blocker_id"))
++        return bool(self.behind) and self.asserted_at > self.cleared_at
+ 
+ 
+ def _optional_text(value) -> Optional[str]:
+@@ -282,7 +282,7 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+ 
+     now = int(time.time()) if now is None else int(now)
+     asserting = conn.execute(
+-        "SELECT id, task_id, ended_at, metadata, summary FROM task_runs "
++        "SELECT id, task_id, ended_at, outcome, metadata, summary FROM task_runs "
+         "WHERE ended_at IS NOT NULL AND ended_at >= ? AND metadata LIKE '%\"blocker_id\"%' "
+         "ORDER BY id",
+         (now - _LOOKBACK_SECONDS,),
+@@ -291,8 +291,8 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+     scopes: dict[str, set[Optional[str]]] = {}
+     task_ids: set[str] = set()
+     for row in asserting:
+-        bid = _meta_blocker(kb, row["metadata"])
+-        if bid is None:
++        effect, bid = run_effect(row["outcome"], row["metadata"])
++        if effect != "assert" or bid is None:
+             continue
+         st = states.setdefault(bid, BlockerState(bid))
+         ended = kb._to_epoch(row["ended_at"]) or 0
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+index a526579a845..5ec54605e25 100644
+--- a/tests/hermes_cli/test_kanban_shared_blockers.py
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -52,6 +52,80 @@ def _route_run(conn, tid, provider):
+         }, run_id=kb._current_run_id(conn, tid))
+ 
+ 
++@pytest.mark.parametrize("park", ["continue", "schedule"])
++@pytest.mark.parametrize("archived", [False, True], ids=["done", "archived"])
++def test_finished_other_route_wall_has_no_live_owner(kanban_home, scoped_routing, monkeypatch, park, archived):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="implementation", assignee="default")
++        assert kb.claim_task(conn, tid)
++        _route_run(conn, tid, "openai-codex")
++        run_id = kb._current_run_id(conn, tid)
++        kbd._set_worker_pid(conn, tid, os.getpid())
++        viewer = kb.create_task(conn, title="review", assignee="default",
++                                model_override="claude-opus-4", provider_override="anthropic")
++        assert kb.claim_task(conn, viewer)
++        _route_run(conn, viewer, "anthropic")
++    with monkeypatch.context() as worker:
++        worker.setenv("HERMES_KANBAN_TASK", tid)
++        worker.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++        args = {"blocker_id": BID, "blocker_provider": "anthropic"}
++        if park == "continue":
++            result = kt._handle_continue({**args, "checkpoint": "provider wall", "resume_after_seconds": 600})
++        else:
++            result = kt._handle_schedule({**args, "reason": f"SCHEDULED_UNTIL={_future_iso(600)} provider wall"})
++        assert json.loads(result)["status"] == "scheduled", result
++    with kbc.connect_closing() as conn:
++        assert ksb.blocker_states(conn)[BID].is_open
++        assert BID in ksb.render_blocker_context(conn, viewer)
++        assert kb.unblock_task(conn, tid)
++        assert kb.claim_task(conn, tid)
++        _route_run(conn, tid, "openai-codex")
++        assert kb.complete_task(conn, tid, result="implementation done")
++        if archived:
++            assert kb.archive_task(conn, tid)
++        st = ksb.blocker_states(conn)[BID]
++        assert not st.behind and st.cleared_by is None
++        assert not st.is_open
++        assert BID not in ksb.render_blocker_context(conn, viewer)
++
++
++@pytest.mark.parametrize("outcome", ["completed", "review_requested", "changes_requested"])
++def test_terminal_outcome_blocker_metadata_is_not_assertion(kanban_home, outcome):
++    assert ksb.run_effect(outcome, {"blocker_id": BID}) == ("clear", None)
++    with kbc.connect_closing() as conn:
++        tid = _blocked_behind(conn, "implementation")
++        _scope(conn, tid)
++        _age_runs(conn, 60)
++        before = ksb.blocker_states(conn)[BID]
++        assert kb.unblock_task(conn, tid)
++        assert kb.claim_task(conn, tid)
++        _route_run(conn, tid, "anthropic")
++        with kb.write_txn(conn):
++            kb._end_run(conn, tid, outcome=outcome, summary="finished work",
++                        metadata={"blocker_id": BID})
++            conn.execute("UPDATE tasks SET status=? WHERE id=?",
++                         ("done" if outcome == "completed" else "review", tid))
++        after = ksb.blocker_states(conn)[BID]
++        assert (after.asserted_at, after.reason, after.blocker_provider) == (
++            before.asserted_at, before.reason, "anthropic")
++        assert after.cleared_by is not None and not after.is_open
++
++
++@pytest.mark.parametrize("status", ["blocked", "scheduled", "ready", "running"])
++def test_live_owner_wall_stays_open_and_renders(kanban_home, scoped_routing, status):
++    with kbc.connect_closing() as conn:
++        tid = _blocked_behind(conn, "live owner")
++        _scope(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++        viewer = kb.create_task(conn, title="review", assignee="default",
++                                model_override="claude-opus-4", provider_override="anthropic")
++        st = ksb.blocker_states(conn)[BID]
++        assert st.is_open and set(st.behind) == {tid}
++        assert BID in ksb.render_blocker_context(conn, viewer)
++        assert "applicable to current route" in ksb.render_blocker_context(conn, viewer)
++
++
+ def test_scoped_next_lane_and_context(kanban_home, scoped_routing):
+     with kbc.connect_closing() as conn:
+         tid = _blocked_behind(conn, "scoped")
+@@ -288,7 +362,8 @@ def test_admitted_route_decides_clear_evidence(kanban_home, spawns, profile_mode
+         assert (tid in st.probe_starts) is clears
+         assert kb.complete_task(conn, tid, result="done")
+         st = ksb.blocker_states(conn)[WALL]
+-        assert st.is_open is (not clears)
++        assert (st.cleared_by is not None) is clears
++        assert not st.is_open  # no live card remains, independently of clear evidence
+ 
+ 
+ @pytest.mark.parametrize("order", ["unscoped_first", "scoped_first"])
+-- 
+2.55.0
+

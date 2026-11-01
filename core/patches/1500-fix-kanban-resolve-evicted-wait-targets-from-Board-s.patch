@@ -1,0 +1,196 @@
+From 2448c7c1cdcd93c3b5423597ae7b238cca923103 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:59:37 +0000
+Subject: [PATCH] fix(kanban): resolve evicted wait targets from Board shadow
+ [daveey]
+
+---
+ hermes_cli/kanban_wait_check.py               |  33 ++++--
+ .../test_kanban_wait_board_shadow.py          | 100 ++++++++++++++++++
+ 2 files changed, 126 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wait_board_shadow.py
+
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index 566eacde262..d327994ca6c 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -56,22 +56,41 @@ def _query(path: Path, sql: str, args=()):
+     raise last  # type: ignore[misc]
+ 
+ 
++def _task_source(board, target):
++    """Live rows win; evicted worker copies remain in the selected Board shadow.
++
++    This is not the offline gateway cache in kanban_wait_replica. Unreadable
++    databases remain errors, not absence.
++    """
++    live = _db(board)
++    from hermes_cli.kanban_db_sync import board_slug_for_path
++    from hermes_cli.kanban_sync_client import shadow_path
++    slug = board_slug_for_path(str(live))
++    shadow = shadow_path(slug)
++    for path in (live, shadow):
++        if path.exists():
++            rows = _query(path, "select status from tasks where id=?", (target,))
++            if rows:
++                return path, rows
++    return live, []
++
++
+ def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DEFAULT_UNTIL,
+                 since=()) -> tuple[int, str]:
+     """``since``: statuses the target had when the waiter parked; still in one of them = not yet (exit 1), so a
+     tracker that re-parks after handling a wake waits for the NEXT change instead of waking again at once."""
+     try:
+         if kind == "task":
+-            rows = _query(_db(board), "select status from tasks where id=?", (target,))
++            source, rows = _task_source(board, target)
+             if not rows:
+                 return 2, f"error: {target} not found"
+             status = rows[0][0]
+             if status in set(since or ()):
+                 return 1, f"{target} {status} (unchanged since park)"
+-            suffix = _producer_suffix(board, target) if status in ("scheduled", "blocked") else ""
++            suffix = _producer_suffix(board, target, source=source) if status in ("scheduled", "blocked") else ""
+             if status in set(until):
+                 return 0, f"{target} {status}{suffix}"
+-            if PARKED_AGENT in set(until) and status in ("scheduled", "blocked") and _agent_owned_park(board, target):
++            if PARKED_AGENT in set(until) and status in ("scheduled", "blocked") and _agent_owned_park(board, target, source=source):
+                 return 0, f"{target} {status} (agent-owned park: nothing else will produce what it waits for)"
+             return 1, f"{target} {status}{suffix}"
+         if kind == "board-empty":
+@@ -82,21 +101,21 @@ def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DE
+     return 2, f"error: unknown check {kind!r}"
+ 
+ 
+-def _producer_suffix(board, target):
++def _producer_suffix(board, target, *, source=None):
+     from hermes_cli.kanban_session_activity import _open_ro
+     from hermes_cli.kanban_awaiting import card_orphan_reason
+-    conn = _open_ro(_db(board))
++    conn = _open_ro(source or _db(board))
+     try:
+         return " (orphan producer)" if card_orphan_reason(conn, target) else ""
+     finally:
+         conn.close()
+ 
+ 
+-def _agent_owned_park(board: Optional[str], target: str) -> bool:
++def _agent_owned_park(board: Optional[str], target: str, *, source=None) -> bool:
+     """The target parked on something only an agent can end (certain, or a legacy park that has stalled)."""
+     from hermes_cli.kanban_session_activity import _local_wait_info, _open_ro
+ 
+-    conn = _open_ro(_db(board))
++    conn = _open_ro(source or _db(board))
+     try:
+         info = _local_wait_info(conn, [target]).get(target) or {}
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_wait_board_shadow.py b/tests/hermes_cli/test_kanban_wait_board_shadow.py
+new file mode 100644
+index 00000000000..8e436462bb3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_board_shadow.py
+@@ -0,0 +1,100 @@
++"""Online worker copies may be evicted; the Board replica retains their status."""
++import sqlite3
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_awaiting as awaiting
++from hermes_cli import kanban_wait_check as wait
++
++TID = "t_123456789abcdef0"
++
++
++@pytest.fixture
++def boards(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    for path in (tmp_path / "kanban.db", tmp_path / "kanban/sync-shadow/default.db"):
++        path.parent.mkdir(parents=True, exist_ok=True)
++        with sqlite3.connect(path) as db:
++            db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY, status TEXT)")
++    return tmp_path
++
++
++def put(home, status, *, live=False):
++    path = home / ("kanban.db" if live else "kanban/sync-shadow/default.db")
++    with sqlite3.connect(path) as db:
++        db.execute("INSERT INTO tasks VALUES (?, ?)", (TID, status))
++
++
++def remote_on_fixture(monkeypatch):
++    def ssh(argv, **kwargs):
++        rc, text = wait.check_local("task", TID, board="default", until=("done",))
++        return subprocess.CompletedProcess(argv, rc, text, "")
++    monkeypatch.setattr(wait.subprocess, "run", ssh)
++
++
++@pytest.mark.parametrize("status,rc", [("done", 0), ("running", 1), (None, 2)])
++@pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
++def test_evicted_copy(boards, monkeypatch, status, rc, remote):
++    if status:
++        put(boards, status)
++    if remote:
++        remote_on_fixture(monkeypatch)
++        result = wait.check_remote("hub", "task", TID, board="default", until=("done",))
++    else:
++        result = wait.check_local("task", TID, until=("done",))
++    assert result[0] == rc, result
++    if status:
++        assert result[1].split()[:2] == [TID, status]
++
++
++@pytest.mark.parametrize("status", ["done", "running", None])
++def test_awaiting_validation_uses_board_status(boards, monkeypatch, status):
++    if status:
++        put(boards, status)
++    remote_on_fixture(monkeypatch)
++    monkeypatch.setattr(awaiting, "_REMOTE_CONFIRMED", {})
++    record = dict(kind="card", ref=TID, gateway="hub", board="default")
++    if status == "running":
++        awaiting.confirm_remote(record)
++        assert ("hub", TID) in awaiting._REMOTE_CONFIRMED
++    else:
++        with pytest.raises(awaiting.AwaitingError) as error:
++            awaiting.confirm_remote(record)
++        assert error.value.code == (awaiting.PRODUCER_DONE if status == "done" else awaiting.INVALID_AWAITING)
++
++
++def test_live_precedence_and_since(boards):
++    put(boards, "done")
++    assert wait.check_local("task", TID, since=("done",))[0] == 1
++    put(boards, "running", live=True)
++    assert wait.check_local("task", TID, until=("done",))[0] == 1
++
++
++def test_missing_live_file_still_resolves(boards):
++    put(boards, "done")
++    (boards / "kanban.db").unlink()
++    assert wait.check_local("task", TID, until=("done",))[0] == 0
++
++
++def test_named_board_is_not_default(boards):
++    put(boards, "done")
++    path = boards / "kanban/sync-shadow/other.db"
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY, status TEXT)")
++        db.execute("INSERT INTO tasks VALUES (?, 'running')", (TID,))
++    assert wait.check_local("task", TID, board="other", until=("done",))[0] == 1
++
++
++def test_profile_home_uses_canonical_board_shadow(boards, monkeypatch):
++    put(boards, "done")
++    monkeypatch.setenv("HERMES_HOME", str(boards / "profiles" / "other"))
++    assert wait.check_local("task", TID, until=("done",))[0] == 0
++
++
++def test_corrupt_live_database_is_not_hidden(boards):
++    put(boards, "done")
++    (boards / "kanban.db").write_text("not sqlite")
++    assert wait.check_local("task", TID, until=("done",))[0] == 2
+-- 
+2.55.0
+

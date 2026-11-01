@@ -1,6 +1,6 @@
 # Runtime hardening series, ordinals 1302-1326 (subset)
 
-Covers ordinals **1302, 1305, 1310, 1311, 1312, 1313, 1314, 1315, 1316, 1318, 1319, 1324, 1325, 1326** of the numbered fork series. The ordinals in between belong to other docs. Patch files are `patches/<ordinal>-<format-patch slug>.patch`; the fork commit short hash is given per section.
+Covers ordinals **1302, 1305, 1310, 1311, 1312, 1313, 1314, 1315, 1316, 1318, 1319, 1324, 1325, 1326, 1539** of the numbered fork series. The ordinals in between belong to other docs. Patch files are `patches/<ordinal>-<format-patch slug>.patch`; the fork commit short hash is given per section.
 
 Every test listed below is a test file or test case **read from the source diff only**. None were executed in this mirror pass. Nothing here was checked against a live Kubernetes cluster: the Kubernetes backend tests use an in-process fake cluster and mocked `kubernetes` client objects (see 1316).
 
@@ -233,7 +233,7 @@ No.
 
 ---
 
-## 8. Session outcomes: lost requests, crons, refused-turn replay (1315)
+## 8. Session outcomes: lost requests, crons, refused-turn replay (1315; follow-up 1539)
 
 Patch `1315-fix-sessions-a-lost-request-outranks-live-work-a-cro.patch` (fork `2185d7299c`).
 
@@ -265,6 +265,71 @@ Needs the earlier outcome/turn-marker and `agent.turn_failure_copy` work (`FAILE
 - Eight non-English locales fall back to English for the new string (listed as overlay gaps).
 
 ### Plugin?
+No.
+
+### Follow-up 1539: a settled terminal verdict is not replayed
+
+Patch `1539-fix-agent-preserve-terminal-non-retryable-verdict-fo.patch` (fork `37c70bbcaa1c`).
+
+#### Behavior
+The generic classifier initially marks some errors as retryable even though settlement later decides they cannot
+recover. Examples are a local `ValueError` or `TypeError` raised while building the request, or a request repair
+that has run out of attempts. Settlement then ends the turn on the non-retryable client-error path. That turn's
+result now always carries `failure_retryable: False`, so the refused-turn replay described above treats it as
+terminal:
+
+- The turn marker is cleared.
+- No 45 s timer is armed.
+- `_maybe_schedule_auto_continue` returns `None`.
+- The `message.complete` `error_surface.retryable` is `false`.
+
+Before this patch the result copied `classified.retryable` (`True`), so a turn that could never succeed was replayed
+through auto-continue. An error that settlement treats as retryable is unchanged. The test's `TimeoutError`, settled
+with retries exhausted, still keeps the marker and arms the 45 s timer.
+
+#### How it works
+`agent/turn_recovery.py::nonretryable_client_error_result` sets `"failure_retryable": False` instead of
+`bool(classified.retryable)`. Every caller of that builder has already decided the turn is terminal. At this fork
+tip the only caller is the `is_client_error` branch of `agent/turn_api_error.settle_unrecovered_error`, which
+covers local validation errors, an exhausted image shrink or reasoning repair, and non-retryable classified
+reasons. `failure_reason` still reports the classifier's reason.
+
+#### Code
+`agent/turn_recovery.py`.
+
+#### Tests
+`tests/tui_gateway/test_refused_turn_retry.py::test_terminal_error_auto_continue_follows_settlement` is
+parametrized over `ValueError("Account selection requires a live main chat")` → not retryable,
+`TypeError("invalid local request")` → not retryable, and `TimeoutError("request timed out")` → retryable.
+**It was read from the diff and not executed in this mirror pass.**
+
+The test uses the real `classify_api_error` and asserts that the initial verdict is `retryable is True` for all
+three errors. It runs the real `settle_unrecovered_error` (with `retry_count=1`, `max_retries=1` and a stub agent
+from `tests/agent/test_nonretryable_result_carries_verdict`) inside a stubbed agent `run`, and asserts that the
+settlement action is `"return"`. That result then goes through the real `server._run_prompt_submit`. The test then
+asserts:
+
+- The turn marker is present only when the expected outcome is retryable.
+- The timers list is `[45.0]` when retryable and `[]` otherwise.
+- `_maybe_schedule_auto_continue(...) is None` in the non-retryable case.
+- The final `message.complete` has `status == "error"` and `error == str(error)`, and its
+  `error_surface.retryable` matches the expected outcome.
+
+**Untested:** the exhausted image-shrink and reasoning-repair branches. The test covers only the local
+validation-error branch (non-retryable) and the max-retries branch (retryable).
+
+#### Applying
+Apply in series order after 1315 and the earlier work that added `failure_retryable` to the non-retryable result
+(the test imports `_Agent` from `tests/agent/test_nonretryable_result_carries_verdict.py`). This patch is separate
+from the automation-turn replay (1515), which is documented elsewhere. No config is needed.
+
+#### Gotchas
+- **`failure_reason` can still say retryable.** It keeps the classifier's reason, so a consumer that infers
+  retryability from the reason alone can still disagree with the verdict. Read `failure_retryable`.
+- **Max-retries exhaustion is a separate path.** `max_retries_exhausted_result` keeps its own verdict. This patch
+  only changes the non-retryable client-error path.
+
+#### Plugin?
 No.
 
 ---
