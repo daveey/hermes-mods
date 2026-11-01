@@ -55,8 +55,9 @@ to verify. With one source of truth it is the card's status.
 ### Selective rejection resolution and fleet drift consumer
 
 The rejection-resolution client change is merged in fork PR #499 through `6110db6d1b1`
-(public patches **1488–1492**). Normal rollout has reached three of four configured gateways;
-final fleet acceptance remains pending the fourth gateway's existing supervision-recovery dependency.
+(public patches **1488–1492**). Normal rollout has reached all four configured gateways;
+fresh ancestry and read-only inventory checks confirm the fix on each. Independent delivery
+acceptance and removal of the two obsolete laptop soak jobs remain a separate handoff.
 Core code: `hermes_cli/kanban_sync_rejections.py`, `kanban_sync_client.py` and `kanban_sync_cli.py`.
 Apply through the complete [mirror series](README.md#applying); this is core sync logic, not a plugin.
 Exact-head CI: [required checks](https://github.com/daveey/hermes/actions/runs/41306900906/job/124853534264).
@@ -89,6 +90,13 @@ at a 30-minute cadence. A real production-state scheduler tick sampled all four 
 successfully; unavailable and dirty remain distinct. The formerly rejected inventory read back empty
 with its captured audit events unchanged. Post-rollout per-row classification was reconstructed from
 fresh authoritative evidence and local guards, not presented as uncaptured daemon transaction receipts.
+The production consumer also opened one real persistent-drift repair card, refreshed that same
+incident across later samples, preserved it across a timed-out read, and subsequently observed
+clean reports after the repair shipped. The latest scheduled four-gateway sample was successful;
+all four reports were clean with zero rejected operations. Pending writes are reported separately
+and can change during active work; clean is not a promise of an idle outbox. The historical
+52-operation inventory is classified as 17 superseded and 35 moot; all 15 captured rejection
+audit events were preserved exactly. No real lost write was found among those rejected rows.
 Legacy laptop soak jobs remain until independent replacement acceptance, not merely publication.
 
 Tests: `tests/hermes_cli/test_kanban_sync_rejections.py` covers normal sync and the CLI dirty-to-clean
