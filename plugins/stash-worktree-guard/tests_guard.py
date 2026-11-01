@@ -162,6 +162,80 @@ def test_unparseable_stash_subject_fails_closed(multi, monkeypatch):
     assert "does not name a branch" in got["message"]
 
 
+def test_assignment_cd_push_pop_is_checked_before_background_promotion(multi, monkeypatch):
+    main, wt = multi
+    git("checkout", "--detach", "-q", cwd=wt)
+    monkeypatch.setenv("TMPDIR", str(wt.parent))
+    command = 'WT=$TMPDIR/wt; cd $WT; git stash -q -- f.txt; git status; git stash pop -q'
+    got = block("terminal", command=command, timeout=900)
+    assert got and got["action"] == "block"
+    assert "main" in got["message"] and "HEAD" in got["message"]
+
+
+@pytest.mark.parametrize("target", ['$UNKNOWN_STASH_REPO', '"$(mktemp -d)"', '`mktemp -d`'])
+@pytest.mark.parametrize("op", ["pop", "apply"])
+def test_unknown_target_fails_closed(multi, target, op, monkeypatch):
+    main, _wt = multi
+    monkeypatch.delenv("UNKNOWN_STASH_REPO", raising=False)
+    got = block("terminal", command=f'cd {target}; git stash {op}', workdir=str(main))
+    assert got and got["action"] == "block"
+    assert "resolve" in got["message"]
+    assert "Save a patch instead" in got["message"]
+
+
+@pytest.mark.parametrize("op", ["list", "push", "show"])
+def test_unknown_target_nonrestoring_stash_is_allowed(multi, op):
+    main, _wt = multi
+    assert block("terminal", command=f'cd "$(mktemp -d)"; git stash {op}', workdir=str(main)) is None
+
+
+def test_assigned_git_C_and_safe_expansions(multi, single, monkeypatch):
+    main, wt = multi
+    monkeypatch.setenv("HOME", str(wt.parent))
+    monkeypatch.setenv("TMPDIR", str(wt.parent))
+    for target in ('"$HOME/wt"', '"${TMPDIR}/wt"', '~/wt'):
+        got = block("terminal", command=f'M={target}; git -C "$M" stash apply')
+        assert got and got["action"] == "block"
+        assert "other" in got["message"] and "main" in got["message"]
+    for repo in (main, single):
+        assert block("terminal", command=f'M="{repo}"; git -C "$M" stash pop') is None
+
+
+def test_unknown_cwd_cannot_fall_back_to_guard_cwd(multi):
+    main, _wt = multi
+    assert block("terminal", command='cd "$MISSING"; cd relative; git stash pop', workdir=str(main))
+    # An absolute -C restores a known target; a same-branch pop remains permitted.
+    assert block("terminal", command=f'cd "$MISSING"; git -C "{main}" stash pop') is None
+
+
+def test_assignment_scope_and_tracked_pwd(multi, single, monkeypatch):
+    main, wt = multi
+    monkeypatch.setenv("PWD", str(single))
+    monkeypatch.setenv("WT", str(single))
+    for cmd in (
+        'cd "$PWD"; git stash pop',
+        f'export WT={wt}; cd "$WT"; git stash pop',
+        f'WT={wt}; WT={single} true; cd "$WT"; git stash pop',
+        f'HOME={wt.parent}; cd ~/wt; git stash pop',
+    ):
+        assert block("terminal", command=cmd, workdir=str(wt)), cmd
+    # Allow-direction controls prove assignments resolve, rather than merely fail closed.
+    for cmd in (
+        f'export WT="{single}"; cd "$WT"; git stash pop',
+        f'HOME="{single.parent}"; cd ~/only; git stash pop',
+    ):
+        assert block("terminal", command=cmd, workdir=str(wt)) is None, cmd
+
+
+def test_quoted_literal_variable_is_not_expanded(multi, single):
+    main, wt = multi
+    # Shell sees the literal directory $M, not the single-worktree value of M.
+    literal = wt.parent / "$M"
+    literal.symlink_to(wt, target_is_directory=True)
+    cmd = f"M={single}; cd '$M'; git stash pop"
+    assert block("terminal", command=cmd, workdir=str(wt.parent))
+
+
 def test_missing_stash_is_not_a_block(multi):
     main, wt = multi
     git("stash", "clear", cwd=main)
