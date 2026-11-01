@@ -150,7 +150,7 @@ class TestAll(unittest.TestCase):
             with patch.dict(main.__globals__, {
                 'select_python': lambda core: ('/fake/python', fallback),
                 'python_version': lambda py: '3.14.9',
-                'ensure_test_site': lambda py: self.root,
+                'ensure_test_site': lambda py, core, uv: self.root,
                 'run_suite': lambda *args: dict(name='plugins/ok', status='PASS', secs=0, reason=''),
             }), contextlib.redirect_stdout(output):
                 self.assertEqual(main(['--root', str(self.root)]), 0)
@@ -161,6 +161,55 @@ class TestAll(unittest.TestCase):
             if fallback:
                 self.assertEqual(lines[1], warning)
                 self.assertEqual(lines[-1], warning)
+
+    def assert_core_sdk_install(self, lock, extra, expected, warning=False):
+        import contextlib
+        import io
+        runner = runpy.run_path(str(RUNNER))
+        core = self.root / 'core'
+        core.mkdir()
+        (core / 'hermes_bootstrap.py').touch()
+        if lock is not None:
+            (core / 'uv.lock').write_text(lock)
+        (core / 'pyproject.toml').write_text(
+            '[project.optional-dependencies]\nanthropic = [' + repr(extra) + ']\n')
+        make_tree(self.root, {'ok': 'def test_ok(): pass'})
+        main = runner['main']
+        output = io.StringIO()
+        with patch.dict(main.__globals__, {
+            'TEST_SITE': self.root / 'cache',
+            'select_python': lambda core: ('/fake/python', False),
+            'python_version': lambda py: '3.14.9',
+            'run_suite': lambda *args: dict(name='plugins/ok', status='PASS', secs=0, reason=''),
+        }), patch('shutil.which', return_value='/bin/uv'), \
+                patch('subprocess.run') as install, contextlib.redirect_stderr(output):
+            self.assertEqual(main(['--root', str(self.root), '--hermes-core', str(core)]), 0)
+        self.assertIn(f'anthropic=={expected}', install.call_args.args[0])
+        if warning:
+            self.assertIn('WARNING', output.getvalue())
+            self.assertIn(f'fallback anthropic=={expected}', output.getvalue())
+        else:
+            self.assertEqual(output.getvalue(), '')
+
+    def test_core_current_lock_pin_is_installed(self):
+        self.assert_core_sdk_install('[[package]]\nname = "anthropic"\nversion = "0.125.0"\n',
+                                     'anthropic==0.124.0', '0.125.0')
+
+    def test_core_changed_lock_pin_is_installed(self):
+        self.assert_core_sdk_install('[[package]]\nname = "anthropic"\nversion = "0.126.0"\n',
+                                     'anthropic==0.125.0', '0.126.0')
+
+    def test_core_extra_exact_pin_is_installed_without_lock(self):
+        self.assert_core_sdk_install(None, 'anthropic == 0.126.0', '0.126.0')
+
+    def test_core_extra_exact_pin_is_installed_without_locked_sdk(self):
+        self.assert_core_sdk_install('version = 1\n', 'anthropic==0.126.0', '0.126.0')
+
+    def test_core_no_exact_pin_warns_and_installs_fallback(self):
+        self.assert_core_sdk_install(None, 'anthropic>=0.126.0', '0.125.0', warning=True)
+
+    def test_core_wildcard_pin_warns_and_installs_fallback(self):
+        self.assert_core_sdk_install(None, 'anthropic==0.126.*', '0.125.0', warning=True)
 
     def test_test_site_is_versioned_and_installed_for_selected_python(self):
         runner = runpy.run_path(str(RUNNER))
@@ -188,6 +237,15 @@ class TestAll(unittest.TestCase):
             metadata.write_text('Name: anthropic\nVersion: 2.3.0\n')
             ensure('/fake/python with spaces')
             self.assertEqual(install.call_count, 3)
+            # A selected core upgrade invalidates an otherwise complete old cache.
+            metadata.write_text('Name: anthropic\nVersion: 0.125.0\n')
+            core = self.root / 'core'
+            core.mkdir()
+            (core / 'uv.lock').write_text(
+                '[[package]]\nname = "anthropic"\nversion = "0.126.0"\n')
+            ensure('/fake/python with spaces', core)
+            self.assertEqual(install.call_count, 4)
+            self.assertIn('anthropic==0.126.0', install.call_args.args[0])
 
     def test_test_site_finds_user_uv_or_reports_missing_installer(self):
         runner = runpy.run_path(str(RUNNER))
@@ -203,6 +261,50 @@ class TestAll(unittest.TestCase):
             uv.unlink()
             with self.assertRaisesRegex(RuntimeError, 'uv is required'):
                 ensure('/fake/python')
+
+    def assert_uv_suite(self, on_path):
+        runner = runpy.run_path(str(RUNNER))
+        uv = self.root / ('.local/bin/uv' if not on_path else 'bin/uv')
+        uv.parent.mkdir(parents=True)
+        uv.write_text('#!/bin/sh\nprintf "1 passed\\n"\n')
+        uv.chmod(0o755)
+        with patch('pathlib.Path.home', return_value=self.root), \
+                patch('shutil.which', return_value=str(uv) if on_path else None):
+            resolved = runner['find_uv']()
+        self.assertEqual(resolved, str(uv))
+        result = runner['run_suite'](dict(name='uv-suite', cmd=['uv', 'run']),
+                                     sys.executable, None, 10, self.root, self.root, resolved)
+        self.assertEqual(result['status'], 'PASS', result)
+
+    def test_suite_uv_on_path(self):
+        self.assert_uv_suite(True)
+
+    def test_suite_uv_only_in_user_bin(self):
+        self.assert_uv_suite(False)
+
+    def test_missing_uv_and_other_executable_fail_without_losing_other_results(self):
+        import contextlib
+        import io
+        runner = runpy.run_path(str(RUNNER))
+        main = runner['main']
+        suites = [dict(name='uv-suite', cmd=['uv', 'run']),
+                  dict(name='missing-suite', cmd=[str(self.root / 'missing')]),
+                  dict(name='good-suite', cmd=[sys.executable, '-c', 'print("1 passed")'])]
+        output = io.StringIO()
+        with patch('pathlib.Path.home', return_value=self.root), \
+                patch('shutil.which', return_value=None), patch.dict(main.__globals__, {
+                    'discover': lambda *args, **kwargs: suites,
+                    'select_python': lambda core: (sys.executable, False),
+                    'ensure_test_site': lambda *args: self.root,
+                }), contextlib.redirect_stdout(output):
+            self.assertIsNone(runner['find_uv']())
+            self.assertEqual(main(['--root', str(self.root)]), 1)
+        self.assertRegex(output.getvalue(), r'FAIL\s+uv-suite')
+        self.assertRegex(output.getvalue(), r'FAIL\s+missing-suite')
+        self.assertRegex(output.getvalue(), r'PASS\s+good-suite')
+        self.assertIn('executable not found: uv', output.getvalue())
+        self.assertIn('cannot execute', output.getvalue())
+        self.assertNotIn('Traceback', output.getvalue())
 
     def test_shell_override_quotes_interpreter_with_spaces(self):
         runner = runpy.run_path(str(RUNNER))

@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -76,9 +77,33 @@ SUITE_OVERRIDES: dict[str, dict] = {
 # or hermes home must not inherit it (core fences Kanban writes of delegated children).
 SCRUB_ENV_PREFIXES = ("HERMES_KANBAN", "HERMES_DELEGATED", "HERMES_SUPERVISED", "HERMES_ORIGIN")
 TEST_SITE = Path.home() / ".cache" / "hermes-mods-test-site"  # must be outside the Hermes home
-# Match core's supported SDK (pyproject.toml anthropic extra). New major SDKs
+# Fallback only when selected core has no exact SDK pin. New major SDKs
 # change the HTTP transport and cannot be substituted into real-wire tests.
 ANTHROPIC_VERSION = "0.125.0"
+
+
+def anthropic_version(core: Path | None) -> str:
+    """Prefer the resolved lock version, then core's exact optional-extra pin."""
+    def read_toml(name: str) -> dict:
+        if core is None:
+            return {}
+        try:
+            return tomllib.loads((core / name).read_text())
+        except (OSError, ValueError):
+            return {}
+
+    versions = {p['version'] for p in read_toml('uv.lock').get('package', [])
+                if p.get('name') == 'anthropic' and isinstance(p.get('version'), str)}
+    if len(versions) == 1:
+        return versions.pop()
+    extras = read_toml('pyproject.toml').get('project', {}).get('optional-dependencies', {})
+    for requirement in extras.get('anthropic', []):
+        match = re.fullmatch(r'anthropic\s*==\s*([0-9][A-Za-z0-9.!+_-]*)', requirement.strip(), re.I)
+        if match:
+            return match[1]
+    print(f"test-all: WARNING: no exact anthropic pin in core={core}; "
+          f"using fallback anthropic=={ANTHROPIC_VERSION}", file=sys.stderr, flush=True)
+    return ANTHROPIC_VERSION
 
 
 def python_version(py: str) -> str:
@@ -91,19 +116,24 @@ def test_site(py: str) -> Path:
     return TEST_SITE / ("python-" + ".".join(python_version(py).split(".")[:2]))
 
 
-def ensure_test_site(py: str) -> Path:
+def find_uv() -> str | None:
+    return shutil.which('uv') or (str(Path.home() / '.local/bin/uv')
+                                 if (Path.home() / '.local/bin/uv').is_file() else None)
+
+
+def ensure_test_site(py: str, core: Path | None = None, uv: str | None = '') -> Path:
+    version = anthropic_version(core)
     site = test_site(py)
     sdk_versions = {d.version for d in distributions(path=[str(site)])
                     if d.metadata['Name'].lower() == 'anthropic'}
-    if sdk_versions != {ANTHROPIC_VERSION} or not all((site / name).is_dir() for name in ("pytest", "pytest_asyncio", "yaml", "fastapi", "httpx", "psutil", "anthropic")):
-        uv = shutil.which("uv")
-        if not uv and (Path.home() / ".local/bin/uv").is_file():
-            uv = str(Path.home() / ".local/bin/uv")
+    if sdk_versions != {version} or not all((site / name).is_dir() for name in ("pytest", "pytest_asyncio", "yaml", "fastapi", "httpx", "psutil", "anthropic")):
+        if uv == '':
+            uv = find_uv()
         if not uv:
             raise RuntimeError("test-all: uv is required to build the selected Python's test dependencies")
         subprocess.run([uv, "pip", "install", "-q", "--python", py, "--target", str(site),
                         "pytest", "pytest-asyncio", "pyyaml", "fastapi", "httpx", "psutil",
-                        f"anthropic=={ANTHROPIC_VERSION}"], check=True)
+                        f"anthropic=={version}"], check=True)
     return site
 
 
@@ -194,7 +224,7 @@ def discover(root: Path, core: Path | None, explicit_core: bool) -> list[dict]:
     return suites
 
 
-def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT, site: Path | None = None) -> dict:
+def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT, site: Path | None = None, uv: str | None = None) -> dict:
     res = {"name": s["name"], "status": "", "rc": None, "secs": 0.0, "tail": "", "reason": s.get("skip", "")}
     if s.get("skip"):
         res["status"] = "SKIP"
@@ -216,10 +246,18 @@ def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = RO
     cmd = [x.replace("{py}", shlex.quote(py) if s["cmd"][0] == "sh" else py).replace("{core}", str(core or "")).replace("{site}", str(site)) for x in s["cmd"]] if s.get("cmd") else \
         [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(s["dir"]), *s["args"], *s["targets"]]
     t0 = time.time()
+    if cmd[0] == 'uv':
+        if not uv:
+            res.update(status='FAIL', reason='executable not found: uv')
+            return res
+        cmd[0] = uv
     try:
         cp = subprocess.run(cmd, cwd=cwd, env=env, text=True, errors="replace", timeout=timeout,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         out, rc = cp.stdout or "", cp.returncode
+    except OSError as e:
+        res.update(status='FAIL', reason=f"cannot execute {cmd[0]}: {e.strerror}")
+        return res
     except subprocess.TimeoutExpired as e:
         out = (e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else e.stdout) or ""
         rc = None
@@ -270,7 +308,8 @@ def main(argv: list[str] | None = None) -> int:
         print("test-all: no suites matched", file=sys.stderr)
         return 2
     version = python_version(py)
-    site = ensure_test_site(py) if any(not s.get("skip") for s in suites) else test_site(py)
+    uv = find_uv()
+    site = ensure_test_site(py, core, uv) if any(not s.get("skip") for s in suites) else test_site(py)
     warning = f"NOT the production interpreter ({version})" if fallback else ""
     print(f"test-all: {len(suites)} suites, -j{a.jobs}, python={py} ({version}), core={core}", flush=True)
     if warning:
@@ -278,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
 
     results = []
     with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
-        futs = [ex.submit(run_suite, s, py, core, a.timeout, root, site) for s in suites]
+        futs = [ex.submit(run_suite, s, py, core, a.timeout, root, site, uv) for s in suites]
         for f in cf.as_completed(futs):
             r = f.result()
             results.append(r)
