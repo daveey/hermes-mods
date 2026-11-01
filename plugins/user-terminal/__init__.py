@@ -546,15 +546,17 @@ def _kanban_root() -> Path:
 def board_db_path(board: str) -> str:
     """The board's kanban.db: core ``hermes_cli.kanban_db.kanban_db_path`` when importable (honours the
     HERMES_KANBAN_DB pin, HERMES_KANBAN_HOME and named boards), else the same layout by hand."""
+    # This is the creating caller's board, not a cross-board navigation request.
+    # Preserve its DB pin even for worker-terminal callers whose TASK was scrubbed.
+    pinned = (os.environ.get("HERMES_KANBAN_DB") or "").strip()
+    if pinned:
+        return str(Path(pinned).expanduser())
     try:
         from hermes_cli.kanban_db import kanban_db_path  # type: ignore
 
         return str(kanban_db_path(board))
     except Exception:
         pass
-    pinned = (os.environ.get("HERMES_KANBAN_DB") or "").strip()
-    if pinned:
-        return pinned
     root = _kanban_root()
     return str(root / "kanban.db") if board == "default" else str(root / "kanban" / "boards" / board / "kanban.db")
 
