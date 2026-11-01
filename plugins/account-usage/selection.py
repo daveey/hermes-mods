@@ -592,6 +592,20 @@ class LeaseMissing(SelectionRejected):
     route (``consume_for_agent``)."""
 
 
+class NotSelectable(SelectionRejected):
+    """The chat can never choose an account (not a live desktop/tui main chat, e.g. a ``scratch`` proof chat).
+    ``put()`` refuses on the same check, so nothing can be queued for it: per-request consumption takes the
+    default route instead of failing the turn (self-heal agent-e744d241e7). Choosing still refuses visibly."""
+
+    def __init__(self, message, *, source=None, session_id=None):
+        super().__init__(message)
+        self.source = source
+        self.session_id = session_id
+
+
+_not_selectable_logged = set()
+
+
 def _lease_holders(entries, session_ids):
     return [f"pid={e.get('pid')} lease={str(e.get('lease_id') or '')[:8]} surface={e.get('surface')} "
             f"live={(e.get('metadata') or {}).get('live_session_id')}"
@@ -669,7 +683,8 @@ def _resolve_owner_locked(runtime_id, *, profile_home, server, agent=None):
     durable = str(session.get('session_key') or '')
     agent_id = str(getattr(main, 'session_id', '') or '')
     if not durable or not agent_id or session.get('source') not in {'desktop', 'tui'}:
-        raise SelectionRejected('Account selection requires a live main chat')
+        raise NotSelectable('Account selection requires a live main chat', source=session.get('source'),
+                            session_id=durable or runtime_id)
     # Do not call registry_snapshot: its dead-entry pruning writes the registry.
     entries = registry._read_entries(registry._state_path(home), strict=True)
     lease = session.get('active_session_lease')
@@ -1323,6 +1338,15 @@ class SelectionService:
         try:
             with owner_scope(profile_home=self.home, server=self.server, agent=agent) as owner:
                 return self._consume(owner)
+        except NotSelectable as exc:  # raised only by owner resolution: put() refuses it too, so nothing is queued
+            key = (self.home, exc.session_id)
+            if key not in _not_selectable_logged:
+                _not_selectable_logged.add(key)
+                import logging
+                logging.getLogger(__name__).info(
+                    'selection_not_selectable: source=%s session=%s; default route for this chat',
+                    exc.source, exc.session_id)
+            return None
         except LeaseMissing:  # raised only by owner resolution, never by _consume
             from pathlib import Path
             path = Path(self.home) / 'account_usage_selection.sqlite3'

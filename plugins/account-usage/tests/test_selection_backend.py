@@ -462,6 +462,42 @@ class Backend(unittest.TestCase):
             with self.assertRaises(self.s.SelectionRejected):
                 service.consume_for_agent(self.agent)  # a chosen account is never silently ignored
 
+    # --- self-heal agent-e744d241e7: a non-desktop/tui ('scratch') chat died on every turn ---
+    def test_non_selectable_source_takes_the_default_route_on_every_request(self):
+        self.lease()
+        self.record['source'] = 'scratch'  # session.create keeps the caller's source
+        service = self.s.SelectionService(self.home, server=self.server)
+        with self.assertLogs(self.s.__name__, 'INFO') as logs:
+            self.assertIsNone(service.consume_for_agent(self.agent))  # default route, no exception
+            self.assertIsNone(service.consume_for_agent(self.agent))
+        lines = [l for l in logs.output if 'selection_not_selectable' in l]
+        self.assertEqual(len(lines), 1, logs.output)  # once per session, not per request
+        self.assertIn('source=scratch', lines[0])
+
+    def test_non_selectable_source_still_refuses_a_choice_visibly(self):
+        self.lease()
+        self.record['source'] = 'scratch'
+        row = entry(source='manual')
+        self.credentials([row.to_dict()])
+        from agent.account_usage_cache import _identity_id_for
+        service = self.s.SelectionService(self.home, server=self.server)
+        with self.assertRaisesRegex(self.s.SelectionRejected, 'live main chat'):
+            service.put('runtime-A', provider='anthropic', account_id=_identity_id_for('anthropic', row),
+                        expected_revision=0)
+        with self.assertRaisesRegex(self.s.SelectionRejected, 'live main chat'):
+            service.get('runtime-A')
+
+    def test_desktop_chat_with_a_queued_choice_is_unchanged(self):
+        self.lease()
+        row = entry(source='manual')
+        self.credentials([row.to_dict()])
+        from agent.account_usage_cache import _identity_id_for
+        account_id = _identity_id_for('anthropic', row)
+        service = self.s.SelectionService(self.home, server=self.server)
+        service.put('runtime-A', provider='anthropic', account_id=account_id, expected_revision=0)
+        self.assertIsNotNone(service.consume_for_agent(self.agent))  # the chosen account is consumed
+        self.assertIsNone(service.consume_for_agent(self.agent))  # one-shot
+
     def test_suspended_owner_keeps_its_registry_entry_through_every_prune_path(self):
         """The investigation's hypothesis (a sleep/SIGSTOP lets another process prune a live owner) does not
         hold: a stopped holder stays in the registry. Guards that invariant; the selection repair above covers
