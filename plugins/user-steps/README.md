@@ -243,11 +243,21 @@ Three triggers:
   event before the ask was `blocked`, `review_requested`, `block_loop_detected` or
   `gave_up` (a reviewer's claim keeps the review wait; a worker's claim, an unblock
   or a manual promote ends it). The ask is withdrawn only when every counted card
-  is done or archived after the ask, and every other named card is finished too.
-  Unblocking does not retire an ask: agents unblock to retry, and the retry often
+  is done or archived after the ask, or its own human ask was resolved outside Hermes,
+  and every other named card is finished too. The latter requires the request to restate
+  the pending `human_request.action`, a matching `resolved_check` command with integer
+  exit code 0 in `ask_resolved`, followed by `unblocked {via: ask_resolved}`, with no
+  intervening lifecycle change or later wait. It withdraws the canonical request and
+  removes its extracted step from public `open_steps`, without approval or dispatch.
+  Ordinary unblocking does not retire an ask: agents unblock to retry, and the retry often
   hits the same wall. An unknown, ambiguous or unreadable id, a named card still
   in flight, or a card that was running when asked ("check the screenshots when it
   finishes") keeps the ask. A stale tile is recoverable; a wrongly retired ask is lost.
+  `tests/test_ask_resolved_retirement.py` exercises canonical ActionStore withdrawal,
+  `GET /requests`, extracted `open_steps`, and legacy open-asks' status-based retirement,
+  plus negative evidence, revisions, ownership, re-blocks and recorded decisions. Its
+  board fixtures mirror core's event protocol; real probe production is tested in core's
+  `test_kanban_ask_resolved_check.py`.
 - **agent**: only the owning chat, explicitly:
   `action_request {"withdraw": {"requestId", "reason"}}`. The extractor's
   `resolved` list never withdraws a canonical ask (it retires legacy steps only, as

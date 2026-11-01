@@ -2667,6 +2667,11 @@ def _ts(value) -> Optional[float]:
 _WAIT_KINDS = ("blocked", "review_requested", "block_loop_detected", "gave_up")
 _RELEASE_KINDS = ("unblocked", "completed", "archived", "changes_requested", "claimed", "promoted_manual")
 _EVENT_KINDS = _WAIT_KINDS + _RELEASE_KINDS
+# Core's ``human_request.resolved_check`` (kanban_ask_resolved): the probe exited 0, so core appended
+# ``ask_resolved`` {cmd, rc, output} and, in the same txn, ``unblocked`` {via: ask_resolved}. That is the one
+# unblock that is not a retry: David's step happened outside Hermes. Read only as evidence for _ask_resolution.
+_ASK_RESOLVED = "ask_resolved"
+_FACT_KINDS = _EVENT_KINDS + (_ASK_RESOLVED,)
 
 
 def _card_facts(task_id: str, boards: list[tuple[str, Path]], board: Optional[str] = None,
@@ -2676,7 +2681,7 @@ def _card_facts(task_id: str, boards: list[tuple[str, Path]], board: Optional[st
     None when the id is unknown or ambiguous, or when a board could not be read (it could hold a duplicate).
     ``conns`` caches one read-only connection per board for a whole pass (the caller closes them)."""
     found = []
-    marks = ",".join("?" * len(_EVENT_KINDS))
+    marks = ",".join("?" * len(_FACT_KINDS))
     for slug, path in boards:
         if board and slug != board:
             continue
@@ -2689,7 +2694,7 @@ def _card_facts(task_id: str, boards: list[tuple[str, Path]], board: Optional[st
             try:
                 row = c.execute("SELECT status, completed_at FROM tasks WHERE id=?", (task_id,)).fetchone()
                 events = c.execute(f"SELECT created_at, kind, payload FROM task_events WHERE task_id=? AND kind IN ({marks}) "
-                                   "ORDER BY created_at, id", (task_id, *_EVENT_KINDS)).fetchall() if row else []
+                                   "ORDER BY created_at, id", (task_id, *_FACT_KINDS)).fetchall() if row else []
             finally:
                 if conns is None:
                     c.close()
@@ -2717,6 +2722,8 @@ def _waiting_at(facts: dict, at: float) -> bool:
     for ts, kind, payload in facts["events"]:
         if ts > at:
             break
+        if kind not in _EVENT_KINDS:
+            continue  # evidence rows (ask_resolved) neither start nor end a wait; its `unblocked` does
         if kind in _WAIT_KINDS:
             state = True
         elif _releases(kind, payload):
@@ -2724,14 +2731,84 @@ def _waiting_at(facts: dict, at: float) -> bool:
     return state
 
 
-def _card_verdict(facts: dict, asked_at: float) -> Optional[str]:
-    """None = not counted (not waiting when asked), 'open' = its wait has not ended, else why it ended."""
+def _payload(raw) -> dict:
+    try:
+        value = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _ask_resolution(facts: dict, asked_at: float) -> Optional[dict]:
+    """{request, cmd, at} when core's resolved_check retired exactly the human ask the card was blocked on when
+    this request was asked; else None.
+
+    All of, in board event order: the card's last wait at or before ``asked_at`` is a ``blocked`` event whose
+    human_request has an action and a resolved_check (the pending ask; a metadata-only amendment is a ``blocked``
+    event too, so the latest one wins); the FIRST relevant lifecycle/proof event after the ask is ``ask_resolved`` with rc 0 and that
+    same command, immediately followed by ``unblocked`` with via=ask_resolved (an amendment, David's own unblock,
+    or any other move in between means a different ask was resolved); and nothing after it waits again (re-block,
+    review, triage, a second resolution), with the card's current status not a wait either."""
+    pending = None
+    after = []
+    for ts, kind, raw in facts["events"]:
+        if ts > asked_at:
+            after.append((ts, kind, raw))
+        elif kind == "blocked":
+            pending = _payload(raw).get("human_request")
+        elif kind in _WAIT_KINDS or kind == _ASK_RESOLVED or (kind in _RELEASE_KINDS and _releases(kind, raw)):
+            pending = None
+    if not isinstance(pending, dict) or not str(pending.get("action") or "").strip():
+        return None
+    cmd = pending.get("resolved_check")
+    if not isinstance(cmd, str) or not cmd.strip() or len(after) < 2:
+        return None
+    (at, kind, raw), (_uts, ukind, uraw) = after[0], after[1]
+    proof = _payload(raw)
+    rc = proof.get("rc")
+    if (kind != _ASK_RESOLVED or type(rc) is not int or rc != 0
+            or not isinstance(proof.get("cmd"), str) or proof["cmd"].strip() != cmd.strip()):
+        return None
+    if ukind != "unblocked" or _payload(uraw).get("via") != _ASK_RESOLVED:
+        return None
+    if any(k in _WAIT_KINDS or k == _ASK_RESOLVED for _ts2, k, _p in after[2:]):
+        return None
+    if facts["status"] in ("blocked", "triage", "review"):
+        return None
+    return {"request": pending, "cmd": cmd.strip(), "at": at}
+
+
+def _restates_card_ask(request: dict, owner: dict, steps: dict, board: str, task_id: str, human_request: dict) -> bool:
+    """Identity, not context: the request's own ask (its title, or its same-owner extracted step's text/sentence)
+    restates the card's human_request.action (``card_ask_for`` text rules). Menus are not compared: generic
+    Approve/Decline labels match any approval. A request that merely names the card asks something else."""
+    entry = {"id": f"kanban:{board}:{task_id}", "kind": KANBAN_ASK, "text": str(human_request.get("action") or ""),
+             "board": board, "task_id": task_id, "labels": []}
+    candidates = [{"text": request.get("title") or "", "verbatim_span": ""}]
+    for a in request.get("aliases", []):
+        if a.get("type") == "user_step" and a.get("gatewayId") == owner["gatewayId"] and a.get("profile") == owner["profile"]:
+            s = steps.get(a.get("id")) or {}
+            candidates.append({"text": s.get("text") or "", "verbatim_span": s.get("verbatim_span") or ""})
+    return any(card_ask_for(c, [entry]) is not None for c in candidates)
+
+
+def _card_verdict(facts: dict, asked_at: float, same_ask=None) -> Optional[str]:
+    """None = not counted (not waiting when asked), 'open' = its wait has not ended, else why it ended.
+
+    ``same_ask(human_request) -> bool``: when given, a card whose pending ask core's resolved_check retired
+    (``_ask_resolution``) has ended its wait too, but only if the request IS that ask. Any other unblock stays
+    'open': agents unblock to retry."""
     if not _waiting_at(facts, asked_at):
         return None
     status = facts["status"]
     if status in _TERMINAL and (any(kind in ("completed", "archived") for ts, kind, _ in facts["events"] if ts > asked_at)
                                 or (facts["completed_at"] or 0) > asked_at):
         return f"is {status}"
+    if same_ask is not None:
+        resolved = _ask_resolution(facts, asked_at)
+        if resolved is not None and same_ask(resolved["request"]):
+            cmd = resolved["cmd"] if len(resolved["cmd"]) <= 80 else resolved["cmd"][:77] + "..."
+            return f"had its ask resolved outside Hermes (resolved_check `{cmd}` exited 0)"
     return "open"
 
 
@@ -2774,8 +2851,9 @@ def reconcile_moot(store: "ActionStore", ledger: "Ledger", owner: dict, *, board
     """Withdraw (by=system) each undecided ask whose linked work is over.
 
     Every card the ask names must resolve on exactly one readable local board; at least one of them was
-    waiting on someone when the ask was made; every such card is done or archived after the ask; and no named
-    card is still in flight. Anything else (unknown, ambiguous or unreadable ids, a card still waiting or
+    waiting on someone when the ask was made; every such card is done or archived after the ask, or (the request
+    restating that card's own human ask) core's ``resolved_check`` retired exactly the ask it was blocked on
+    (``_ask_resolution``); and no named card is still in flight. Anything else (unknown, ambiguous or unreadable ids, a card still waiting or
     running, a recorded decision, a bound decision card) leaves the ask alone: a stale tile is recoverable
     ("Not needed"), a wrongly retired ask is lost. Runs on every For-you read and agent turn.
     """
@@ -2802,7 +2880,9 @@ def reconcile_moot(store: "ActionStore", ledger: "Ledger", owner: dict, *, board
                 if facts is None:
                     keep = True  # unknown, ambiguous or unreadable: never retire on partial knowledge
                     break
-                verdict = _card_verdict(facts, asked_at)
+                def same_ask(hr, _r=r, _board=facts["board"], _tid=tid):
+                    return _restates_card_ask(_r, owner, steps or {}, _board, _tid, hr)
+                verdict = _card_verdict(facts, asked_at, same_ask)
                 if verdict is None:
                     if facts["status"] not in _TERMINAL:
                         keep = True  # a named card is still in flight
