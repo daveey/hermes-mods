@@ -52,6 +52,43 @@ records and its error log (counts grow through the day as more boards publish):
 1 and 2 were fixes inside the current design. 3 is structural: with per-gateway authority a remote "done" is a claim
 to verify. With one source of truth it is the card's status.
 
+### Selective rejection resolution and fleet drift consumer
+
+The rejection-resolution client change is staged in fork PR #499 (deployment acceptance pending).
+Rejected outbox operations remain dirty until there is fresh authoritative evidence that each
+operation is superseded or moot. The normal sync round performs selective retirement after push;
+it deletes only the guarded rejected outbox row, never its `sync_rejected` audit events. It does
+not replay historical status or lease intent and does not use full import as cleanup.
+
+- **Superseded:** exact service row identity and current local values agree on every rejected wire
+  field. Task/run versions must match the authoritative version; missing run-UID translation,
+  pending local work or tombstones veto retirement. The complete local/op snapshot is checked again
+  inside the deletion transaction, so an intervening write remains unresolved.
+- **Moot unknown-task chat link:** the service's unpruned authoritative history proves neither task
+  nor link ever existed, and there is no local task, creation operation or tombstone. A missing
+  replica/snapshot row alone proves nothing. Compacted history remains unknown.
+- **Unavailable:** failed authoritative reads retain rejections. CLI `sync diff --json` refresh
+  failure emits `clean:false, unavailable:true`, not a clean stale-replica result.
+- **Receipts:** `RoundResult.rejection_resolutions` records per-operation classification, proof,
+  authoritative evidence and whether the operation was retired or retained.
+
+The public [kanban-drift consumer](../plugins/kanban-drift/README.md) is a script-only scheduler
+consumer, not another sync writer. One always-on gateway owns its private command configuration
+and durable per-board incident state. Two consecutive dirty samples create one agent-owned Kanban
+repair card through native tools; subsequent changed reports refresh it. Restart preserves the
+incident key, clean resets the streak, unavailable breaks the streak without clearing the incident,
+and a closed card permits a new incident after two new dirty samples. Target commands, credentials,
+owner gateway, schedule and rollback metadata remain host-local. Deployment is still commissioning;
+legacy laptop soak jobs remain until independent replacement acceptance, not merely publication.
+
+Tests: `tests/hermes_cli/test_kanban_sync_rejections.py` covers normal sync and the CLI dirty-to-clean
+flow, preserved audits, idempotence, lagging replicas, pending creation, service errors, compacted
+history, wrong identity/version, run-UID translation and concurrent writes. Service `rows.test.ts`
+covers authoritative evidence states. `plugins/kanban-drift/tests/test_monitor.py` exercises
+consecutive sampling, restarts, unavailable/closed incidents, crash-safe deduplication, subprocess
+contracts, owner refusal and native Kanban create/show on an isolated board. Fleet rollout and
+real scheduled four-host sampling are separate deployment acceptance, not established by these tests.
+
 ### Central Kanban sync: built so far (2026-10-27)
 
 - **Phase 0, the Board service** (the service repo's per-board Durable Object): deployed. Since 2026-10-27 it also
