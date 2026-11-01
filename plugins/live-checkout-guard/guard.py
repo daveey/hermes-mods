@@ -204,6 +204,16 @@ def _check_git(args: list[str], cwd: str, git_env: Optional[dict] = None) -> Opt
     elif not in_root(d) or git_dir or work_tree:
         return None  # an explicit git dir / work tree elsewhere wins over the cwd
     clean_dir = d if in_root(d) else root()
+    if sub == "update-ref":
+        # stdin can name arbitrary refs; never infer safety from shell input.
+        if "--stdin" in rest or any(
+                a == "refs/stash" or a.startswith("refs/hermes-retire/") for a in rest):
+            return f"raw git update-ref on protected stash/retirement refs in the live checkout{via}"
+    if sub == "reflog" and rest and rest[0] in {"delete", "expire", "drop", "write"}:
+        if "--all" in rest or any(
+                a == "stash" or a.startswith("stash@{") or a == "refs/stash"
+                or a.startswith("refs/stash@{") or a.startswith("refs/hermes-retire/") for a in rest[1:]):
+            return f"raw git reflog mutation on protected stash/retirement refs in the live checkout{via}"
     if sub == "stash":
         return None if rest and rest[0] in GIT_STASH_READ else f"git stash in the live checkout{via}"
     if sub == "pull":  # only a clean `git merge --ff-only origin/main` may update the live checkout

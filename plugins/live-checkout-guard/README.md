@@ -50,6 +50,85 @@ Kill switch: `LIVE_CHECKOUT_GUARD=0`. Paths are compared after `realpath`, so sy
   Install: `python3 plugins/live-checkout-guard/claude_hook.py --install [--settings PATH]` (idempotent; default
   `~/.claude/settings.json`). Exit 2 blocks; bad input fails open.
 
+## Archive-verified stash retirement
+
+The maintained `reconcile.py` helper also supports stash retirement. This is a separate
+mode from file reconciliation; it never applies a stash or writes checkout files, the
+live index or HEAD. Raw `git stash` mutations remain refused. Raw `update-ref` on
+`refs/stash` / `refs/hermes-retire/*` (and all stdin update-ref batches), and
+`reflog delete|expire|drop|write` on those refs or `--all`, are also refused in the
+live checkout. The helper is an ordinary maintained script, not a blanket shell
+allowlist or a guard-disable switch.
+
+Use Python 3 on Linux or macOS and a Git version supporting prepared `update-ref`
+transactions and `rev-parse --show-ref-format` (tested on Git 2.55 on Linux; the
+complete helper has not yet been exercised on macOS). Only the files ref backend
+is supported; shallow repositories are refused.
+
+The existing archive directory must be **outside** the checkout and Git directory.
+Its `manifest.json` is a JSON list with one row for **every** current stash:
+`{"stash":"FULL_OID","patch":"relative.patch","bytes":123,"sha256":"SHA256"}`.
+Each patch must be the complete `git stash show -p --binary --include-untracked`
+export. Preparation rejects missing or noncanonical bytes rather than regenerating
+those patches. It adds an index-parent patch and a self-contained Git bundle per
+entry, verifies each bundle by importing it into an empty scratch repository, and
+writes `retirement-manifest.json`. Bundles include full base history and may be
+large; keep this archive private wherever the repository itself is private.
+
+```sh
+python3 ~/code/hermes-mods/plugins/live-checkout-guard/reconcile.py \
+  --root ~/code/hermes-mods --archive /absolute/verified-archive \
+  --prepare-stash-retirement
+python3 ~/code/hermes-mods/plugins/live-checkout-guard/reconcile.py \
+  --root ~/code/hermes-mods --archive /absolute/verified-archive \
+  --retire-stashes --oid FULL_OID_1 --oid FULL_OID_2
+```
+
+Select only the full lowercase OIDs whose disposition is approved. No date or
+position selector is accepted. Preparation binds repository identity and the full
+ordered stack; retirement re-verifies every archive, including non-target entries.
+A prepared native Git transaction locks the stash ref, compares the stack under
+that lock, deletes the old stack and creates recovery pins. Unrelated entries are
+re-stored oldest first with their OID, parents and subject unchanged; reflog times
+and actor identity change. Concurrent entries arriving after commit are preserved.
+The helper holds `$HERMES_HOME/.hermes-sync.lock` throughout (default `~/.hermes`),
+and passes that lock to Git children so an orphaned child prevents premature recovery.
+Use the same Hermes home as the host's sync runner.
+
+Unambiguous interrupted operations recover on the next prepare/retire, or explicitly:
+
+```sh
+python3 ~/code/hermes-mods/plugins/live-checkout-guard/reconcile.py \
+  --root ~/code/hermes-mods --archive /absolute/verified-archive \
+  --recover-stash-retirement
+```
+
+Recovery never guesses that a missing commit marker means abort. Ambiguous partial
+commits, broken refs and native lock files refuse with pins retained. Do not remove
+those pins or lock files blindly. A handled Ctrl-C or timeout during restore or
+pin cleanup can kill that Git subprocess and leave native locks; the prepared
+transaction child itself is never killed by the helper. A torn journal line,
+missing commit evidence or partial commit also refuses rather than guessing.
+There is deliberately no force/resolve mode: preserve the archive, journal and
+pins, inspect the reported transaction and active Git processes, and route an
+ambiguous state to a separately reviewed maintenance repair. Do not edit the
+journal or bypass the live-checkout guard to force progress.
+Git's files backend is not power-loss atomic;
+the helper fsyncs archives, journal, refs and directories and fails closed on
+ambiguous state, but cannot promise filesystem durability beyond fsync. Successful
+retirements append OIDs and patch/index/bundle SHA-256s to
+`stash-retirement-audit.jsonl`; `stash-retirement-journal.jsonl` drives recovery.
+Audit events are at-least-once across interrupted writes; use transaction ID and
+OID to deduplicate. The source owner must read back the stash stack and unchanged
+checkout/index/HEAD after running the command. This helper does not authorize any
+stash's disposition by itself.
+
+Tests: `tests/test_stash_retirement.py` exercises archive rejection, independent
+bundle recovery after GC, native writer races, lost replies, process death,
+partial commits and unchanged checkout/index/HEAD. `tests/test_retirement_cli.py`
+exercises all three CLI modes plus terminal/execute-code guard checks. Existing
+`tests_reconcile.py` retains the separate file-reconciliation constraints.
+
 ## Limitations (best-effort, not a sandbox)
 
 - Lexical analysis only. Variables/command substitution (`cd $X`, `> $(…)`, `"$DIR"/f`), globs, `xargs`, `find -exec`,

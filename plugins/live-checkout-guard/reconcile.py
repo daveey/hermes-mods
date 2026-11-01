@@ -196,9 +196,42 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path('~/code/hermes-mods'))
     parser.add_argument('--archive', type=Path, required=True)
-    parser.add_argument('--published', required=True)
-    parser.add_argument('--path', action='append', required=True)
+    parser.add_argument('--published')
+    parser.add_argument('--path', action='append')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--prepare-stash-retirement', action='store_true',
+                       help='verify existing stash exports and add complete index archives')
+    modes.add_argument('--retire-stashes', action='store_true',
+                       help='retire exact OIDs using the prepared archive and native Git lock')
+    modes.add_argument('--recover-stash-retirement', action='store_true',
+                       help='finish an interrupted retirement without starting a new one')
+    parser.add_argument('--oid', action='append', help='full stash OID; repeat for each target')
     args = parser.parse_args()
+    retirement = args.prepare_stash_retirement or args.retire_stashes or args.recover_stash_retirement
+    if retirement:
+        if args.published or args.path:
+            parser.error('stash retirement cannot be combined with --published or --path')
+        if bool(args.oid) != bool(args.retire_stashes):
+            parser.error('--oid is required only with --retire-stashes')
+        # Load the maintained sibling, never an arbitrary module on PYTHONPATH.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'reconcile_stash_retirement', Path(__file__).resolve().with_name('stash_retirement.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        try:
+            if args.prepare_stash_retirement:
+                result = module.prepare(args.root, args.archive)
+            elif args.recover_stash_retirement:
+                result = module.recover(args.root, args.archive)
+            else:
+                result = module.retire(args.root, args.archive, args.oid)
+        except (ValueError, OSError) as exc:
+            parser.exit(1, 'stash retirement refused: ' + str(exc) + '\n')
+        print(json.dumps(result, sort_keys=True))
+        return
+    if args.oid or not args.published or not args.path:
+        parser.error('file reconciliation requires --published and --path, without --oid')
     try:
         reconcile(args.root, args.archive, args.published, args.path)
     except (ValueError, OSError, KeyError, tarfile.TarError) as exc:
