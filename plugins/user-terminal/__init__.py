@@ -114,6 +114,8 @@ CMUX_APP = Path("/Applications/cmux.app")
 CMUX_BIN = CMUX_APP / "Contents/Resources/bin/cmux"
 log = logging.getLogger("user_terminal")
 WATCH_INTERVAL_S = 15.0
+RECONCILE_RETRY_INTERVAL_S = 60.0  # the watchdog's own retry of a failed closed-ask reconcile...
+RECONCILE_RETRY_WINDOW_S = 600.0  # ...for up to 10 min, then the tool handler's sweep_jobs takes over
 LAUNCH_GRACE_S = 90.0  # >= 3 openers x OSA_TIMEOUT (20 s) + open grace: a window that never started by then never will
 DEFAULT_MAX_WAIT_MIN = 120.0
 DEFAULT_REATTACH_GRACE_MIN = 10.0
@@ -1487,17 +1489,39 @@ def _ask_bound_to_job(con, task: str, meta: dict, owner: dict, ended: float) -> 
     return False
 
 
-def reconcile_closed_ask(job: Path, st: dict) -> None:
+def _bound_block_id(con, task: str, meta: dict, owner: dict, ended: float) -> int | None:
+    """Id of the block event that set the card's current ask, when it was set during this job's window."""
+    if not _ask_bound_to_job(con, task, meta, owner, ended):
+        return None
+    for event_id, payload in con.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC", (task,)):
+        try:
+            data = json.loads(payload) if payload else {}
+        except ValueError:
+            data = {}
+        if not (isinstance(data, dict) and data.get("actor") == "user-terminal"):
+            return int(event_id)
+    return None
+
+
+def reconcile_closed_ask(job: Path, st: dict) -> bool:
     """Amend only the action of a still-parked owner; errors never change job results.
 
-    One board transaction covers eligibility, classification and the per-job audit
-    marker. The attachment lock serializes against a resumed run's publication.
+    Returns False only when an attempt raised (the watchdog retries those); True when the
+    ask is reconciled or the job/card is not eligible.
+
+    Core's classifier owns its own write transaction: it is never called inside one this
+    plugin opened, so the path composes with every core (older classifiers refuse nesting).
+    One plugin write_txn re-checks eligibility (blocked, no run, the same bound block event)
+    and writes the per-job audit comment; classify then runs in core's own transaction, and
+    a final check restores a newer ask if a block landed between the two (CLOSED-ASKS.md).
+    The attachment lock serializes against a resumed run's publication and other passes.
     Core write_txn enforces descendant fences; no worker identity is removed here.
     """
     status = st.get("status")
     if status not in ("failed", "abandoned") and not (
             status == "withdrawn" and str(st.get("reason", "")).startswith("expired after ")):
-        return
+        return True
     con = None
     locked = False
     try:
@@ -1508,56 +1532,94 @@ def reconcile_closed_ask(job: Path, st: dict) -> None:
         meta, owner = _job_meta_owner(job)
         task, path = owner.get("task_id") or owner.get("task"), owner.get("db")
         if owner.get("kind") != "card" or not task or not path:
-            return
+            return True
         # Leave worker guards intact; the already-detached watchdog owns retries.
         if os.environ.get("HERMES_KANBAN_TASK"):
-            return
+            return True
         locked = _attach_lock(job)
         if not locked:
-            return
+            return True
         att = read_attachment(job, owner)
         original_run = owner.get("run_id")
         if att and (original_run is None or int(att["run_id"]) > int(original_run)):
-            return
+            return True
         db, classify = _kanban_api()
         db._assert_not_delegated_child_mutation(Path(path))
+        from hermes_cli.kanban_human_request import validate_human_request
         # Never create or migrate a board merely to reconcile a job.
         from hermes_cli.kanban_lockguard import connect
         con = connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=2)
         con.row_factory = sqlite3.Row
         marker = f"[user-terminal:closed:{job.name}]"
-        with db.write_txn(con):
-            row = con.execute("SELECT status, current_run_id, human_request FROM tasks WHERE id=?",
+        # Final-file mtime also gives old jobs a stable end time across retries.
+        final = job / "final.lock" / "result.json"
+        ended = (final if final.exists() else job / "status.json").stat().st_mtime
+        local = datetime.fromtimestamp(ended, ZoneInfo("America/Los_Angeles"))
+        purpose = " ".join(str(meta.get("reason") or "").split())
+        if len(purpose) > 80:
+            purpose = purpose[:79].rstrip() + "…"
+        action = (f"window closed {local:%H:%M %Z}" + (f" (it was for: {purpose})" if purpose else "")
+                  + ". Unblock = agent reopens window; archive = drop request.")
+        cause = st.get("reason") or st.get("error") or status
+        reason = f"Terminal job {job.name} ended: {status}: {cause}; {local.isoformat()}"
+
+        def eligible():
+            """(request, bound block id) when this job's window still owns the card's ask, else None."""
+            row = con.execute("SELECT status, current_run_id, block_kind, human_request FROM tasks WHERE id=?",
                               (task,)).fetchone()
             if not row or row["status"] != "blocked" or row["current_run_id"] is not None:
-                return
+                return None
             request = json.loads(row["human_request"]) if row["human_request"] else None
             if not isinstance(request, dict) or not isinstance(request.get("action"), str):
-                return
-            if con.execute("SELECT 1 FROM task_comments WHERE task_id=? AND instr(body, ?)>0",
-                           (task, marker)).fetchone():
-                return
-            # Final-file mtime also gives old jobs a stable end time across retries.
-            final = job / "final.lock" / "result.json"
-            ended = (final if final.exists() else job / "status.json").stat().st_mtime
-            if not _ask_bound_to_job(con, task, meta, owner, ended):
-                return
-            local = datetime.fromtimestamp(ended, ZoneInfo("America/Los_Angeles"))
-            purpose = " ".join(str(meta.get("reason") or "").split())
-            if len(purpose) > 80:
-                purpose = purpose[:79].rstrip() + "…"
-            action = (f"window closed {local:%H:%M %Z}" + (f" (it was for: {purpose})" if purpose else "")
-                      + ". Unblock = agent reopens window; archive = drop request.")
-            amended = {**request, "action": action}
-            cause = st.get("reason") or st.get("error") or status
-            reason = f"Terminal job {job.name} ended: {status}: {cause}; {local.isoformat()}"
-            if classify(con, task, human_request=amended, actor="user-terminal", reason=reason):
-                stored = con.execute("SELECT human_request FROM tasks WHERE id=?", (task,)).fetchone()[0]
-                if json.loads(stored) != amended:
-                    raise ValueError("classification altered fields beyond human_request.action")
+                return None
+            bound = _bound_block_id(con, task, meta, owner, ended)
+            if bound is None:
+                return None
+            # Core normalization must not change anything beyond the action (checked before any write).
+            if validate_human_request({**request, "action": action}, kind=row["block_kind"]) != {
+                    **request, "action": action}:
+                raise ValueError("classification would alter fields beyond human_request.action")
+            return request, bound
+
+        # 1. Plugin transaction (no core writer that opens its own): eligibility + the audit comment.
+        with db.write_txn(con):
+            found = eligible()
+            if found is None:
+                return True
+            request, bound = found
+            if request["action"] == action:
+                return True  # already amended by an earlier pass
+            if not con.execute("SELECT 1 FROM task_comments WHERE task_id=? AND instr(body, ?)>0",
+                               (task, marker)).fetchone():
                 db.add_comment(con, task, "user-terminal", f"{marker} {reason}. {action}")
+        # 2. Core's own transaction: classify re-checks blocked/no-run atomically with its write.
+        amended = {**request, "action": action}
+        if not classify(con, task, human_request=amended, actor="user-terminal", reason=reason):
+            return True  # the card left blocked meanwhile: nothing to amend
+        # 3. A block that landed between 1 and 2 set a newer ask, which 2 overwrote: put it back.
+        with db.write_txn(con):
+            mine = con.execute("SELECT max(id) FROM task_events WHERE task_id=? AND kind='blocked'",
+                               (task,)).fetchone()[0]
+            newer = [json.loads(p) if p else {} for (p,) in con.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' AND id>? AND id<? "
+                "ORDER BY id", (task, bound, mine))]
+            newer = [d for d in newer if isinstance(d, dict) and d.get("actor") != "user-terminal"]
+            stored = json.loads(con.execute("SELECT human_request FROM tasks WHERE id=?",
+                                            (task,)).fetchone()[0] or "null")
+        if newer:
+            restore = newer[-1].get("human_request")
+            log.error("user_terminal: a block landed while %s amended %s; restoring that newer ask",
+                      job.name, task)
+            if isinstance(restore, dict):
+                classify(con, task, human_request=restore, actor="user-terminal-restore",
+                         reason=f"Terminal job {job.name}: restore the ask set while amending")
+            return True
+        if stored != amended:
+            log.error("user_terminal: classification of %s altered fields beyond human_request.action", task)
+        return True
     except Exception:
-        log.exception("user_terminal: blocked ask reconciliation failed for %s; will retry on sweep", job.name)
+        log.exception("user_terminal: blocked ask reconciliation failed for %s", job.name)
+        return False
     finally:
         try:
             if con is not None:
@@ -1571,8 +1633,23 @@ def reconcile_closed_ask(job: Path, st: dict) -> None:
 def watch_once(job: Path, seen: dict) -> dict | None:
     result = _watch_once(job, seen)
     if result and result.get("status") in FINAL:
-        reconcile_closed_ask(job, result)
+        seen["reconciled"] = reconcile_closed_ask(job, result)
     return result
+
+
+def _retry_reconcile(job: Path, result: dict, seen: dict) -> None:
+    """The watchdog's own bounded retry of a failed reconcile (each failure is logged once by
+    reconcile_closed_ask, with its exception text); after the window the sweep takes over."""
+    if seen.get("reconciled", True) or result.get("status") not in FINAL:
+        return
+    deadline = time.time() + RECONCILE_RETRY_WINDOW_S
+    while time.time() < deadline:
+        time.sleep(RECONCILE_RETRY_INTERVAL_S)
+        if reconcile_closed_ask(job, result):
+            log.info("user_terminal: blocked ask reconciliation for %s succeeded on retry", job.name)
+            return
+    log.error("user_terminal: blocked ask reconciliation for %s still failing after %g s; "
+              "leaving it to the next sweep", job.name, RECONCILE_RETRY_WINDOW_S)
 
 
 def _watch_once(job: Path, seen: dict) -> dict | None:
@@ -1690,20 +1767,29 @@ def watchdog(job: Path, interval: float = WATCH_INTERVAL_S, max_s: float | None 
         while time.time() < end:
             r = watch_once(job, seen)
             if r and r.get("status") in FINAL + ("gone",):
+                _retry_reconcile(job, r, seen)
                 return r
             time.sleep(max(0.05, min(interval, WATCH_INTERVAL_S)))
-        return watch_once(job, seen) or read_status(job)
+        r = watch_once(job, seen) or read_status(job)
+        _retry_reconcile(job, r, seen)
+        return r
     finally:
         _release_watchdog(job)
 
 
-def _watchdog_script() -> str:
+def watchdog_python() -> str:
+    """The interpreter watchdog.sh execs and spawn_watchdog runs: this (gateway) process's own Python.
+    Tests resolve the gateway's interpreter the same way (tests/test_closed_asks.py::production_python)."""
     import sys
 
+    return sys.executable
+
+
+def _watchdog_script() -> str:
     root = launch_env().get("HERMES_USER_TERMINAL_CORE_ROOT", "")
     export = f"export HERMES_USER_TERMINAL_CORE_ROOT={shlex.quote(root)}\n" if root else ""
     return (f"#!/bin/bash\n# this job's watchdog (one per job; see watchdog.lock)\n" + export +
-            f"exec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} --watchdog \"$1\"\n")
+            f"exec {shlex.quote(watchdog_python())} {shlex.quote(str(Path(__file__).resolve()))} --watchdog \"$1\"\n")
 
 
 def spawn_watchdog(job: Path) -> None:
@@ -1714,7 +1800,7 @@ def spawn_watchdog(job: Path) -> None:
     logf = None
     try:
         logf = open(job / "watchdog.log", "ab")
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--watchdog", str(job)],
+        subprocess.Popen([watchdog_python(), str(Path(__file__).resolve()), "--watchdog", str(job)],
                          stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
                          start_new_session=True, env=launch_env())
     except Exception as e:

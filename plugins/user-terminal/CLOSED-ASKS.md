@@ -25,9 +25,9 @@ only when the card's current ask was set while this job's window was live:
   drop request.` The timezone is `America/Los_Angeles`,
   so winter uses PST. The final result file's mtime supplies a stable end time
   for old jobs as well as new ones.
-- Preserve all other request fields, including decision choices. Read back the
-  classified request inside the transaction and roll back if core normalization
-  changes anything beyond the action.
+- Preserve all other request fields, including decision choices. Validate the
+  amended request with core's validator before any write and write nothing if
+  core normalization would change anything beyond the action.
 - Add one audit comment per job with its ID, status, cause and ISO end time.
   The durable `[user-terminal:closed:<job-id>]` marker deduplicates later passes.
 - Do nothing to ready/unblocked, done, archived, triage or currently running
@@ -38,20 +38,63 @@ Expiration, withdrawal, reattachment and process-kill policies are unchanged.
 This is local-board reconciliation only; remote relayed jobs still do not carry
 local board ownership (see [REMOTE.md](REMOTE.md)).
 
-## Implementation and core prerequisite
+## Implementation
 
-`reconcile_closed_ask` holds the attachment lock and a core `write_txn` around
-eligibility, marker lookup, `classify_parked_request`, readback and `add_comment`.
+`reconcile_closed_ask` holds the attachment lock (which serializes it with a
+resumed run's publication and with every other pass over the same job) and
+never calls a core writer inside a transaction it opened. Core's
+`classify_parked_request` opens its own `write_txn`; cores before the
+composable classifier (and stale editable core snapshots, see below) refuse to
+nest it, so the plugin composes with core's API in three steps:
+
+1. One plugin `write_txn` that calls no classifier: re-check eligibility
+   (blocked, no current run, a `human_request` with an action, the same bound
+   block event id), pre-validate that core normalization changes nothing but
+   the action, and add the `[user-terminal:closed:<job-id>]` audit comment once
+   (`add_comment` is a nesting composition primitive in every core).
+2. `classify_parked_request` in core's own transaction, which itself re-checks
+   blocked/no-run atomically with its write.
+3. A check that no non-plugin `blocked` event landed between the bound event and
+   the plugin's amendment. If one did (another agent re-blocked in the
+   microseconds between 1 and 2), the newer ask is classified back
+   (actor `user-terminal-restore`), so a closed window only ever leaves the ask
+   it served rewritten.
+
+Choice (decided spec option): the re-check runs immediately before core's write
+in a plugin-owned transaction, not inside core's write, because core offers no
+compare-and-swap hook into the classifier without `allow_nested`; step 3 closes
+the gap that leaves. Dedup: the comment is written once per job (marker); the
+amendment is skipped once the current action already equals the closed-window
+action. A comment failure rolls step 1 back with nothing written; a classify
+failure after the comment leaves the comment and a later pass amends the ask.
 It never issues a raw board UPDATE. Core descendant fences remain enforced;
 worker callers keep their environment/protections and leave reconciliation to
-the existing detached watchdog or a later eligible sweep. Failures are logged
-and leave the final job result unchanged.
+the detached watchdog or a later eligible sweep. Failures are logged and leave
+the final job result unchanged.
 
-**Requires a composable core classifier:**
-`hermes_cli.kanban_human_request_migration.classify_parked_request` must use
-`db.write_txn(conn, allow_nested=True)`. Older cores refuse the nested transaction;
-the plugin logs the refusal and makes no partial board change. Deploy that core
-prerequisite before claiming the reconciliation is operational.
+**Bounded retry.** `reconcile_closed_ask` returns False only when an attempt
+raised. The watchdog then retries every `RECONCILE_RETRY_INTERVAL_S` (60 s) for
+up to `RECONCILE_RETRY_WINDOW_S` (10 min), logging each failure once with its
+exception text, then logs `leaving it to the next sweep` and exits; after that
+only `sweep_jobs` (run by the tool handler) retries.
+
+**Interpreter.** `watchdog.sh` and `spawn_watchdog` both exec `watchdog_python()`,
+the gateway's own `sys.executable` (on macOS the signed `Hermes Python.app`
+twin of the launcher's runtime Python). The standalone-watchdog test resolves
+that interpreter the same way (`--print-runtime-command`, then
+`signed_python_app`), or `HERMES_USER_TERMINAL_WATCHDOG_PYTHON`, and skips with
+the reason only when none exists.
+
+Why the nested write failed on one 3.14 interpreter but not 3.11: it was the
+import, not the Python version. Run as the install's managed env venv Python
+(`installs/<id>/environments/<id>/venv/bin/python`), that venv's uv editable
+finder (`__editable___hermes_agent_*_finder`) resolves `hermes_cli` to the
+environment's build-time `workspace/` snapshot before the watchdog's core-root
+fallback runs, and that snapshot predates the composable classifier (its
+`classify_parked_request` uses a plain `write_txn`). The 3.11 core venv and the
+production `Hermes Python.app` have no such finder, so they import the live
+checkout, whose classifier opts into nesting. The three-step path works with
+either core.
 
 The standalone watchdog lazily locates the parent's core checkout (carried in
 `HERMES_USER_TERMINAL_CORE_ROOT` by both launch paths), or the installed checkout
@@ -75,6 +118,13 @@ Coverage:
 - Exact no-write snapshots for ineligible owner/job states and write-fence refusal.
 - Atomic rollback on comment failure, followed by successful final-path retry.
 - Fresh standalone `__init__.py --watchdog` import and loaded-module identity.
+- Composition with a classifier that refuses nesting (simulated pre-composable
+  core), the watchdog's own retry (classify fails once, then succeeds: one
+  comment, one amendment, one logged failure), the retry giving up after its
+  window, and a block landing between the re-check and core's classify (the
+  newer ask is restored and later sweeps write nothing). On `3e8290a5` all four
+  fail; the standalone watchdog test fails there when run as the managed env
+  venv Python (nested `write_txn` RuntimeError) and passes on `Hermes Python.app`.
 - Ask binding (review round 1): a job that failed while the card ran, then a
   later block on an unrelated ask by the same run, a later run, or another
   actor's metadata-only edit, gets no write on any later sweep; so does a card

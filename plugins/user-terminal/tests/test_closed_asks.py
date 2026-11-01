@@ -208,14 +208,44 @@ def test_loaded_core_modules_are_never_replaced(board, monkeypatch):
     assert loaded is db and sys.modules["hermes_cli"] is original
 
 
+def production_python(core: Path) -> str | None:
+    """The interpreter watchdog.sh execs: the plugin writes the gateway's own sys.executable
+    (ut.watchdog_python), and the gateway runs the launcher's runtime Python, re-exec'd into its
+    signed twin when one matches (hermes_cli._launchers.signed_python_app). Resolve it the same way,
+    never as this test runner's interpreter. HERMES_USER_TERMINAL_WATCHDOG_PYTHON overrides."""
+    override = os.environ.get("HERMES_USER_TERMINAL_WATCHDOG_PYTHON")
+    if override:
+        return override if Path(override).is_file() else None
+    launcher = core / ".hermes" / "bin" / "hermes"
+    if not launcher.is_file():
+        return None
+    out = subprocess.run([str(launcher), "--print-runtime-command"], capture_output=True, text=True, timeout=120)
+    try:
+        store = Path(json.loads(out.stdout)[0])
+    except (ValueError, IndexError, TypeError):
+        return None
+    try:
+        from hermes_cli._launchers import signed_python_app
+        exe = signed_python_app(store) or store
+    except ImportError:
+        exe = store
+    return str(exe) if exe.is_file() else None
+
+
 def test_standalone_watchdog_bootstraps_real_core(board):
     path, job, db = board
     final(job)
+    core = Path(db.__file__).resolve().parent.parent
+    python = production_python(core)
+    if python is None:
+        pytest.skip(f"no production watchdog interpreter: no runtime launcher under {core}/.hermes/bin "
+                    "and HERMES_USER_TERMINAL_WATCHDOG_PYTHON unset")
     env = ut.launch_env()
-    env["HERMES_USER_TERMINAL_CORE_ROOT"] = str(Path(db.__file__).resolve().parent.parent)
+    env["HERMES_USER_TERMINAL_CORE_ROOT"] = str(core)
     env.pop("PYTHONPATH", None)
-    # Run the exact standalone entry point, with no inherited sys.path/modules.
-    result = subprocess.run([sys.executable, str(SOURCE), "--watchdog", str(job)], env=env,
+    # Run the exact standalone entry point on the interpreter watchdog.sh execs, with no inherited
+    # sys.path/modules (the runner's own Python differed from production: 3.11 vs 3.14).
+    result = subprocess.run([python, str(SOURCE), "--watchdog", str(job)], env=env,
                             text=True, capture_output=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert len(snapshot(path)["task_comments"]) == 1, result.stderr
@@ -272,6 +302,99 @@ def test_own_amendment_does_not_hide_the_binding_block(board):
         kinds = [json.loads(p).get("actor") for (p,) in con.execute(
             "SELECT payload FROM task_events WHERE kind='blocked' ORDER BY id")]
     assert kinds[-1] == "user-terminal"
+    before = snapshot(path)
+    ut.sweep_jobs()
+    assert snapshot(path) == before
+
+
+def strict_classifier(db, classify, before=None, failures=0):
+    """A core whose classifier opens a plain write_txn (no nested opt-in), as cores before the
+    composable classifier did and as a stale editable core snapshot still does."""
+    state = {"calls": 0}
+
+    def strict(conn, task, **kw):
+        state["calls"] += 1
+        if getattr(conn, "in_transaction", False):
+            raise RuntimeError("write_txn: already inside a transaction. Nested composition must opt in "
+                               "explicitly with write_txn(conn, allow_nested=True)")
+        if state["calls"] <= failures:
+            raise sqlite3.OperationalError(f"injected classify failure {state['calls']}")
+        if before:
+            before(conn, task)
+        return classify(conn, task, **kw)
+    return strict, state
+
+
+def amendments(path):
+    with sqlite3.connect(path) as con:
+        return [p for (p,) in con.execute("SELECT payload FROM task_events WHERE kind='blocked'")
+                if json.loads(p).get("actor") == "user-terminal"]
+
+
+def test_classifier_without_nested_opt_in_still_reconciles(board, monkeypatch, caplog):
+    """The closed-ask write never calls core's classifier inside a plugin transaction."""
+    path, job, db = board
+    st = final(job)
+    real_db, classify = ut._kanban_api()
+    strict, _ = strict_classifier(real_db, classify)
+    monkeypatch.setattr(ut, "_kanban_api", lambda: (real_db, strict))
+    assert ut.watch_once(job, {}) == st
+    assert "reconciliation failed" not in caplog.text, caplog.text
+    with sqlite3.connect(path) as con:
+        request = json.loads(con.execute("SELECT human_request FROM tasks").fetchone()[0])
+    assert request == {**REQUEST, "action": "window closed 14:37 PDT (it was for: fixture). "
+                       "Unblock = agent reopens window; archive = drop request."}
+    assert len(snapshot(path)["task_comments"]) == 1 and len(amendments(path)) == 1
+
+
+def test_watchdog_retries_a_failed_reconcile_within_its_window(board, monkeypatch, caplog):
+    """classify fails once, then succeeds on the watchdog's own retry: one comment, one amendment."""
+    path, job, db = board
+    caplog.set_level("INFO", logger="user_terminal")
+    final(job)
+    real_db, classify = ut._kanban_api()
+    strict, state = strict_classifier(real_db, classify, failures=1)
+    monkeypatch.setattr(ut, "_kanban_api", lambda: (real_db, strict))
+    monkeypatch.setattr(ut, "RECONCILE_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr(ut, "RECONCILE_RETRY_WINDOW_S", 5.0)
+    ut.watchdog(job, interval=0.05, max_s=2)
+    assert state["calls"] == 2
+    assert len(snapshot(path)["task_comments"]) == 1
+    assert len(amendments(path)) == 1
+    assert caplog.text.count("reconciliation failed") == 1
+    assert "injected classify failure 1" in caplog.text
+    assert "succeeded on retry" in caplog.text
+
+
+def test_watchdog_retry_gives_up_after_its_window(board, monkeypatch, caplog):
+    path, job, db = board
+    final(job)
+    real_db, classify = ut._kanban_api()
+    strict, state = strict_classifier(real_db, classify, failures=10 ** 6)
+    monkeypatch.setattr(ut, "_kanban_api", lambda: (real_db, strict))
+    monkeypatch.setattr(ut, "RECONCILE_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr(ut, "RECONCILE_RETRY_WINDOW_S", 0.3)
+    ut.watchdog(job, interval=0.05, max_s=2)
+    assert caplog.text.count("reconciliation failed") == state["calls"] >= 3
+    assert "leaving it to the next sweep" in caplog.text
+    assert not amendments(path)
+
+
+def test_block_landing_between_check_and_classify_keeps_the_newer_ask(board, monkeypatch):
+    """Eligibility is re-checked just before core's own classify transaction; a block that lands in
+    between is detected afterwards and its newer ask is put back."""
+    path, job, db = board
+    final(job)
+    real_db, classify = ut._kanban_api()
+
+    def interleave(conn, task):
+        assert classify(conn, task, human_request=UNRELATED, actor="agent", reason="a newer ask")
+    strict, _ = strict_classifier(real_db, classify, before=interleave)
+    monkeypatch.setattr(ut, "_kanban_api", lambda: (real_db, strict))
+    ut.watch_once(job, {})
+    with sqlite3.connect(path) as con:
+        request = json.loads(con.execute("SELECT human_request FROM tasks").fetchone()[0])
+    assert request == UNRELATED
     before = snapshot(path)
     ut.sweep_jobs()
     assert snapshot(path) == before
