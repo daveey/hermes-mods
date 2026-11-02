@@ -41,7 +41,8 @@ Commands:
   route-monitor                file one monitor finding (JSON on stdin) and print whether the lane owns it now
 
 The fingerprint never contains the host for code defects (one traceback on two hosts is one defect); it does for
-per-host objects (a cron job, a card, a gateway), whose names are only unique per host.
+per-host objects (a cron job, a gateway), whose names are only unique per host. Kanban cards are not per host:
+their ids are global and their runs show up on several hosts' boards, so a card's fingerprint is its id alone.
 """
 from __future__ import annotations
 
@@ -834,7 +835,9 @@ def collect_kanban(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                             "details": home_tilde(f"board {board} card {tid} status={status} title={title}\n"
                                                   f"outcomes: {outcomes}\nerrors: {errs}")[:1500],
                             "kanban": {"board": board, "cards": [tid]},
-                            "fp": fp("kanban", host, board, tid)})
+                            # card ids are global and a card's runs sit on several hosts' boards (its home, the
+                            # gateway that ran it, a replica): host and board stay out, so it is filed once
+                            "fp": fp("kanban", "card", tid)})
                 continue
             grp.sort(key=lambda r: r[0])
             tids = [r[0] for r in grp]
@@ -850,8 +853,9 @@ def collect_kanban(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                                               f"title={stem} #N\noutcomes: {outcomes}\n"
                                               f"errors: {grp[0][5]}")[:1500],
                         "kanban": {"board": board, "cards": tids},
-                        # one fingerprint per batch+error, so siblings failing in a later pass dedupe onto it
-                        "fp": fp("kanban", host, board, "batch", stem, ek)})
+                        # one fingerprint per batch+error, so siblings failing in a later pass (or the same
+                        # batch seen from another host's board) dedupe onto it
+                        "fp": fp("kanban", "batch", stem, ek)})
     return out
 
 

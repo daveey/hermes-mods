@@ -554,6 +554,33 @@ def test_same_traceback_on_two_hosts_is_one_fingerprint(home, tmp_path):
     assert {s["fp"] for s in ca}.isdisjoint({s["fp"] for s in cb})  # per-host objects stay per host
 
 
+def test_same_kanban_card_on_two_hosts_is_one_fingerprint(tmp_path):
+    """A card's task_runs live on more than one host's board (its home + the gateway that ran it / a sync replica):
+    each host's collector must give that card one defect identity, so the hub lane files it once."""
+    err = "worker exited cleanly (rc=0) without kanban_complete — protocol violation"
+    runs = [("t_shared", "build the thing", None, "crashed", "Worker could not start: ModelRoutingError")] * 2
+    runs += [("t_other", "other card", None, "crashed", "worker died: SIGKILL")] * 2
+    for n in (14, 20):
+        runs += [(f"t_load{n}", f"load with-worker #{n}", None, "crashed", err)] * 2
+    hub, mac = tmp_path / "hub", tmp_path / "mac"
+    make_board(hub / "kanban.db", runs)
+    make_board(mac / "kanban.db", runs)
+    a = {s["kanban"]["cards"][0]: s for s in sg.collect_kanban(hub, {}, NOW, "hermes-hub")}
+    b = {s["kanban"]["cards"][0]: s for s in sg.collect_kanban(mac, {}, NOW, "macbook")}
+    assert set(a) == set(b) == {"t_shared", "t_other", "t_load14"}
+    for tid in a:  # same card (or sibling batch) from either host -> one fingerprint; host stays in the text
+        assert a[tid]["fp"] == b[tid]["fp"], tid
+        assert "hermes-hub" in a[tid]["symptom"] and "macbook" in b[tid]["symptom"]
+    assert len({s["fp"] for s in a.values()}) == 3  # distinct cards stay distinct
+    # through the filing path: the hub files the hub copy, the forwarded macbook copy lands on the same lane entry
+    store = core.Store(tmp_path / "coach")
+    got = [sh.file_defect(sg.to_defect({**s, "host": h}), store=store, m="shadow", cfg={}, now=NOW, budget_fn=OPEN)
+           for h, s in (("hermes-hub", a["t_shared"]), ("macbook", b["t_shared"]))]
+    logged = [json.loads(x) for x in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    fps = {r.get("fingerprint") for r in logged if str(r.get("event", "")).startswith("selfheal_")}
+    assert fps == {a["t_shared"]["fp"]}, (got, logged)
+
+
 def test_forward_moves_cursor_only_on_success(home):
     calls = []
 
