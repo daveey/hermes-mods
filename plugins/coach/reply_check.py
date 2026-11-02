@@ -740,10 +740,13 @@ _LJ_MAC_ONLY_RE = re.compile(
     r"\bKeychain\b|\bChrome\b|\bSafari\b|\bbrowser\b|\bApple\s+\w+|\biCloud\b|\bPhotos\b|\biMessage\b|\bMessages\s+app\b"
     r"|\bXcode\b|\bosascript\b|\bAppleScript\b|\bScreen\s+Shar|\bper-host\b|\bthis\s+Mac[\u2019']s\b|\blocal\s+state\b"
     r"|\bHermes\s+Desktop\b|\bDesktop\s+app\b|\bmacOS[- ]only\b|\bTCC\b|\bhermes-sync\b|\bdisk\b", re.I)
-# A creation verb, or an explicit plan/offer framing; "I'll check the MacBook poller" is not a proposal.
+# A creation verb, or an explicit plan/offer framing; "I'll check the MacBook poller" is not a proposal. "put"/"move"
+# propose a job only with a Mac destination ("put the refresher on the mini", "move the watcher onto the MacBook"):
+# "waiting on something that will move them: ... on the mini" and "Put differently" are not proposals (2026-11-01).
 _LJ_PROPOSE_RE = re.compile(
-    r"\b(?:build|set\s+up|setting\s+up|add|adding|create|creating|install|installing|schedul(?:e|ing)|deploy"
-    r"|put|move)\b"
+    r"\b(?:build|set\s+up|setting\s+up|add|adding|create|creating|install|installing|schedul(?:e|ing)|deploy)\b"
+    r"|\b(?:put|move)\s+(?:[^\s,.;:()]+\s+){0,4}?(?:on|onto|to|into)\s+(?:the\s+|your\s+|my\s+|David[\u2019']s\s+)?"
+    + _LJ_MACHOST + r"\b"
     r"|\bplan\s*:|\bproposal\s*:|\b(?:want|like)\s+me\s+to\b|\b(?:shall|should)\s+I\b", re.I)
 _LJ_META_RE = re.compile(r"\blaptop_job\b", re.I)
 LAPTOP_JOB_NUDGE = (

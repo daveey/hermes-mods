@@ -78,6 +78,26 @@ def test_backtest_false_positives_are_not_flagged():
         assert rc.laptop_job(text) is None, text
 
 
+# MacBook reply ~19:46 PST 2026-11-01 (@session:default/20261026_235722_bef6c6), one product name removed: it lists the
+# producers existing waits already have. "move them" is not a creation verb, so nothing here proposes a job.
+STATUS_LIST = ("The 9 still-open cards that hit this dead end are all waiting on something that will move them: a "
+               "running card, the hand-off watcher, the 22:00 quota reset on the mini, or an ask you already have.")
+
+
+def test_move_or_put_without_a_mac_destination_is_not_a_proposal():
+    for text in (STATUS_LIST,
+                 "Nothing will move these cards, including the hourly reset on the mini.",
+                 "Put differently, the watcher on the MacBook already runs every hour."):
+        assert rc.laptop_job(text) is None, text
+
+
+def test_move_or_put_onto_a_mac_is_still_a_proposal():
+    for text in ("Put the hourly refresher on the mini.",
+                 "I'd move the watcher onto the MacBook and run it every hour.",
+                 "Let's put the token refresher on your MacBook every 10 hours."):
+        assert rc.laptop_job(text), text
+
+
 def test_quoted_or_code_mention_is_not_flagged():
     for text in ("You said \"a small job on the MacBook every 10 hours\" won't work, so it runs on the hub.",
                  "The skill used to say `I'll add a cron on the MacBook every hour`.",
