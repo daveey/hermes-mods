@@ -292,6 +292,67 @@ def test_missing_stash_is_not_a_block(multi):
     assert block("terminal", command=f"git -C {wt} stash pop") is None
 
 
+# --- A restore after a push in the same command ---
+#
+# The branch check reads refs/stash before the command runs. A command that pushes and then
+# restores pops whatever stash is newest when the pop runs: its own, or one another worktree
+# pushed in between. Seen live on the hub: `git stash -q; pytest ...; git stash pop -q` in a
+# seven-worktree checkout passed because refs/stash was empty when it was checked.
+
+PUSH_THEN_RESTORE_CASES = [
+    # (command template, workdir key, clear the fixture's stash first)
+    ("git stash -q; true; git stash pop -q", "wt", True),
+    ("git stash && git stash apply", "wt", True),
+    ("git stash save -q wip; git stash pop", "wt", True),
+    ("git stash push -q -m x; git -C {wt} stash pop", "main", True),
+    # The top stash is main's own, but the pop runs after this command's push.
+    ("git stash -q; git stash pop -q", "main", False),
+    # A pop before the push is checked as usual; the one after it is not deduplicated away.
+    ("git stash pop; git stash -q; git stash pop", "main", False),
+]
+
+
+@pytest.mark.parametrize("template,where,clear", PUSH_THEN_RESTORE_CASES)
+def test_restore_after_same_command_push_refuses(multi, template, where, clear):
+    main, wt = multi
+    if clear:
+        git("stash", "clear", cwd=main)
+    cmd = template.format(main=main, wt=wt)
+    got = block("terminal", command=cmd, workdir=str({"main": main, "wt": wt}[where]))
+    assert got and got["action"] == "block", cmd
+    assert "pushes a stash" in got["message"], got["message"]
+
+
+PUSH_THEN_RESTORE_ALLOWED = [
+    # One worktree: nobody else shares refs/stash.
+    ("git stash -q; true; git stash pop -q", "single"),
+    # No push in the command: the top stash is main's own.
+    ("git stash list; git stash show; git stash pop", "main"),
+    # A push into another repository leaves this one's refs/stash alone.
+    ("git -C {single} stash -q; git -C {main} stash pop", "wt"),
+]
+
+
+@pytest.mark.parametrize("template,where", PUSH_THEN_RESTORE_ALLOWED)
+def test_restore_after_push_elsewhere_or_in_one_worktree_is_allowed(multi, single, template, where):
+    main, wt = multi
+    cmd = template.format(main=main, wt=wt, single=single)
+    cwd = {"main": main, "wt": wt, "single": single}[where]
+    assert block("terminal", command=cmd, workdir=str(cwd)) is None, cmd
+
+
+def test_push_then_restore_really_takes_a_stash_pushed_in_between(multi):
+    main, wt = multi
+    git("stash", "clear", cwd=main)
+    (wt / "f.txt").write_text("wt edit\n")
+    (main / "f.txt").write_text("main edit\n")
+    # The main worktree's push stands in for a second worker stashing between push and pop.
+    cmd = f"cd {wt} && git stash -q && git -C {main} stash -q && git stash pop -q"
+    assert _blocked(cmd, wt)
+    subprocess.run([_proof_bash(), "-c", cmd], check=True, capture_output=True, env=GIT_ENV)
+    assert (wt / "f.txt").read_text() == "main edit\n"
+
+
 # --- Bounded shell state: groups, pipelines, background, mutations, substitutions ---
 
 def _blocked(cmd, cwd):

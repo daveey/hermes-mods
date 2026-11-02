@@ -35,6 +35,8 @@ STASH_SUBS = {
     "branch", "create", "store", "export", "import",
 }
 REFUSE_OPS = {"pop", "apply"}
+# Subcommands that add an entry to refs/stash (`git stash create` only prints a commit).
+PUSH_OPS = {"push", "save", "store"}
 WRAPPERS = {"sudo", "env", "command", "exec", "time", "nice", "nohup", "stdbuf", "builtin"}
 # Wrappers that are programs, not shell builtins/keywords: the caller's state survives them.
 EXTERNAL_WRAPPERS = {"sudo", "env", "nice", "nohup", "stdbuf", "timeout"}
@@ -310,6 +312,22 @@ def worktree_count(repo: str) -> int:
     if proc is None or proc.returncode != 0:
         return 0
     return sum(1 for line in proc.stdout.splitlines() if line.startswith("worktree "))
+
+
+def common_dir(repo: str) -> Optional[str]:
+    """The git dir all of ``repo``'s worktrees share (where refs/stash lives), or None."""
+    proc = _run_git(repo, ["rev-parse", "--git-common-dir"])
+    if proc is None or proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return os.path.realpath(os.path.join(repo, proc.stdout.strip()))
+
+
+def _pushed_into(repo: str, pushed: list) -> bool:
+    """Whether a push earlier in the command may have added to ``repo``'s refs/stash."""
+    if any(p is None or p == repo for p in pushed):
+        return True
+    mine = common_dir(repo)
+    return mine is None or any(common_dir(p) == mine for p in pushed)
 
 
 def current_branch(repo: str) -> str:
@@ -1889,10 +1907,14 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
             f"`stash pop`). Quote it (`\"{word}\"`) or assign it a literal earlier in the same "
             "command."
         )
+    pushed: list = []  # repos an earlier push in this command added a stash to (None: unknown)
     for repo, op, args, _note in calls:
+        if op in PUSH_OPS:
+            pushed.append(repo)
+            continue
         if op not in REFUSE_OPS:
             continue
-        key = (repo, op, stash_ref(args))
+        key = (repo, op, stash_ref(args), bool(pushed))
         if key in seen:
             continue
         seen.add(key)
@@ -1909,6 +1931,16 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
             )
         if count == 1:
             continue
+        shown = repo.replace(str(os.path.expanduser("~")), "~", 1)
+        if pushed and _pushed_into(repo, pushed):
+            # The check below reads refs/stash before the command runs; this command changes it
+            # first, so the restore takes whichever stash is newest when it runs.
+            return (
+                f"STASH WORKTREE GUARD: blocked `git stash {op}` in {shown}: this command first pushes a "
+                f"stash, and `refs/stash` is shared by all {count} worktrees, so the {op} takes whichever "
+                "stash is newest when it runs, which can be one another worker pushed in between. "
+                + _safe_recipe()
+            )
         ref = stash_ref(args)
         subject = stash_subject(repo, ref)
         if subject is None:
@@ -1917,7 +1949,6 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
         here = current_branch(repo)
         if branch == here:
             continue
-        shown = repo.replace(str(os.path.expanduser("~")), "~", 1)
         whose = f"branch `{branch}`" if branch else "a subject that does not name a branch"
         return (
             f"STASH WORKTREE GUARD: blocked `git stash {op}` in {shown}. "

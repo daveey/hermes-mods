@@ -15,6 +15,9 @@ This plugin:
 - blocks `git stash pop` and `git stash apply` before execution when the stash's branch
   (`WIP on <branch>:` / `On <branch>:`) differs from the current branch, or its subject
   does not name a branch;
+- blocks a restore that follows a push (`git stash`, `push`, `save`, `store`) into the same
+  repository earlier in the same command, whatever refs/stash holds when it is checked: the
+  restore takes whichever stash is newest when it runs, which can be another worker's;
 - resolves scalar assignments made earlier in the command, `$HOME`, `$TMPDIR`, and `~`
   in `cd` and `git -C` paths. It preserves quoting and tracks `PWD` from the tool's cwd,
   not the agent process's potentially stale environment;
@@ -274,6 +277,15 @@ unsupported wrappers and ANSI-C, split scalars, quoted and escaped spellings),
 non-restoring shapes allowed.
 
 ## Failure analysis
+
+A same-command round trip (`git stash -q; pytest ...; git stash pop -q`) ran unrefused in a
+seven-worktree hermes-mods clone on the hub (2026-11-01 20:07 PST). It restored the worker's
+own files, but only because nobody stashed in between. The branch check read refs/stash before
+the command ran, saw it empty, and allowed the pop ("pop fails on its own"). The pop actually
+ran after the command's own push, so it took whatever stash was newest at that moment. The
+tests checked restores against the stash list that existed when the check ran. None of them
+had the command change refs/stash before its own restore. `PUSH_THEN_RESTORE_CASES`
+and `test_push_then_restore_really_takes_a_stash_pushed_in_between` cover it now.
 
 The original parser discarded assignment tokens. An unresolved `$WT` then became a
 literal nonexistent path, whose failed worktree listing returned zero. Treating zero
