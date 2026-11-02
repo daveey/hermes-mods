@@ -46,9 +46,10 @@ A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow
    `launchctl print gui/$UID/<label>` for its interval), systemd unit, or cron (`crontab -l`,
    `~/.hermes/cron/jobs.json`). Any ask to stop an owned service goes on its owner card, with measured cost.
    A loop spawning `gh`/`git`/`python` every few seconds may be a polling interval problem: find its job first.
-5. Disk: for a macOS disk question also follow `mac-disk-cleanup` (its repo-deletion rules and known big
+5. For Linux package-store pressure, inventory versioned stores before choosing native GC: an installed pnpm 9 prunes v3 but leaves v10. Use an already-cached matching native binary for each supported store, with Corepack downloads and auto-pinning disabled; never force a different major onto it or directly delete store files. Verify with an isolated native-prune fixture preserving a project hardlink and foreign-version data, then compare allocated bytes live. Native file/package counts are not reclaimed disk bytes, and a successful prune does not prove the pressure threshold cleared.
+6. Disk: for a macOS disk question also follow `mac-disk-cleanup` (its repo-deletion rules and known big
    hitters); its deletions still go through the ask below.
-6. Write the diagnosis with the `five-whys` skill: every why cites evidence from the report; stop at a
+7. Write the diagnosis with the `five-whys` skill: every why cites evidence from the report; stop at a
    process/guard/design gap.
 
 ## Live gateway stacks and restarts
