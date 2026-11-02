@@ -642,6 +642,13 @@ the operation becomes `cancelled` with `retired: {by: hygiene, reason, evidence,
 refused for an owner on another gateway or an already settled operation). Tests: `tests/test_undelivered_watch.py`
 (19 failures -> none, 20 -> one card with the error, rerun same key; closed-chat waits -> card only after 24 h;
 fresh/delivered -> none; retire settles it and stops retries; reason/evidence/gateway required).
+Retiring also closes the request's kanban decision card (`QualifiedCardDelivery.close_retired`): binding `bound` ->
+`retired` (operation = the retired one), one comment "Decided (<choiceId>) and retired by hygiene: <reason>. Nothing
+re-asks.", then archive unless other cards depend on it. Best effort: a failed close is returned as `cardsError`
+and the retirement stands. Every non-dry `stale_watch.py` pass backfills it for retired operations whose card still
+asks (this gateway's owners only; bindings holding a delivered decision or withdrawal are left alone). Tests:
+`tests/test_retired_card_close.py` (retire archives the card; dependents keep it blocked; rerun is a no-op; failed
+archive retried by the next pass; backfill closes a pre-existing stale card; other gateways skipped, errors reported).
 
 A reply that only lists decisions waiting in other chats, queues or cards is a status report. A step whose
 evidence sits in that paragraph is not minted, unless the span itself is a direct request and does not contain

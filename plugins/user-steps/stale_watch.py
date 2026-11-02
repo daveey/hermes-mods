@@ -21,7 +21,9 @@ a backend restart killed the turn, the tile had already closed, and the decision
 It also opens one card (key `user-steps-undelivered:<operationId>`) for a recorded decision never delivered: at
 least UNDELIVERED_MIN_ATTEMPTS counted failures, or UNDELIVERED_MAX_WAIT old in any state. The card carries the
 operation's redacted lastError. `--retire-operation OID --reason ... --evidence ...` settles one without delivering
-it (ActionStore.retire_operation, by=hygiene; refused for owners not on this gateway).
+it (ActionStore.retire_operation, by=hygiene; refused for owners not on this gateway). Retiring also closes the
+request's kanban decision card (binding -> 'retired', one comment, archived unless other cards depend on it), and
+every non-dry run backfills that close for earlier retirements whose card still asks (t_01a19a11276edc29).
 
 Old-ask review (cron runs only, not run()'s default): at most one card a day (key
 `user-steps-old-asks:<PT date>`) lists undecided requests asked more than 72 h ago and not marked reviewed in the
@@ -236,9 +238,11 @@ def undelivered_card(u):
             'body': body, 'idempotency_key': 'user-steps-undelivered:' + oid, 'assignee': 'default'}
 
 
-def retire_operation(core, store, oid, *, reason, evidence, local_gateway):
+def retire_operation(core, store, oid, *, reason, evidence, local_gateway, cards=None):
     """Sanctioned retirement of one undelivered decision (by=hygiene), with reason and evidence. Refused for an
-    owner not on this gateway and for a delivered/already-retired operation."""
+    owner not on this gateway and for a delivered/already-retired operation. With ``cards`` (QualifiedCardDelivery)
+    the request's decision card is closed too (cards.close_retired), best effort: a failure is returned as
+    ``cardsError`` and the next run() pass retries it (t_01a19a11276edc29)."""
     reason, evidence = _need(core, reason, 'Reason'), _need(core, evidence, 'Evidence')
     with store._read() as c:
         row = c.execute('SELECT body FROM operations WHERE id=?', (oid,)).fetchone()
@@ -247,7 +251,53 @@ def retire_operation(core, store, oid, *, reason, evidence, local_gateway):
     owner = json.loads(row[0])['owner']
     if not local_gateway or owner.get('gatewayId') != local_gateway:
         raise core.ActionError('Operation owner is not on this gateway; not retired', 409)
-    return store.retire_operation(owner, oid, by='hygiene', reason=reason[:300], evidence=evidence[:500])
+    v = store.retire_operation(owner, oid, by='hygiene', reason=reason[:300], evidence=evidence[:500])
+    if cards is not None:
+        # Best effort: the retirement stands even if the card close fails; the next run() pass retries it.
+        try:
+            v['cards'] = cards.close_retired(v['operation'])
+        except Exception as exc:
+            v['cardsError'] = f'{type(exc).__name__}: {exc}'
+    return v
+
+
+def _has_kanban_alias(op):
+    return any(a.get('type') == 'kanban' for a in ((op.get('intent') or {}).get('request') or {}).get('aliases', []))
+
+
+def retired_with_cards(store):
+    """Retired operations (dispatchState cancelled with a ``retired`` record) whose request has a kanban alias."""
+    with store._read() as c:
+        rows = [r[0] for r in c.execute('SELECT body FROM operations').fetchall()]
+    out = []
+    for raw in rows:
+        try:
+            op = json.loads(raw)
+        except ValueError:
+            continue
+        if op.get('dispatchState') == 'cancelled' and op.get('retired') and _has_kanban_alias(op):
+            out.append(op)
+    return out
+
+
+def close_retired_cards(store, cards, local_gateway=None):
+    """Backfill: close the decision card of every retired operation whose card still asks. Idempotent (a closed card
+    or a card kept blocked for its dependents is a no-op); a failure is reported per operation and retried next pass.
+    Only owners on this gateway: another gateway's boards are not ours to write."""
+    out = []
+    for op in retired_with_cards(store):
+        if local_gateway and (op.get('owner') or {}).get('gatewayId') != local_gateway:
+            continue
+        try:
+            got = cards.close_retired(op)
+        except Exception as exc:
+            out.append({'operationId': op['operationId'], 'error': f'{type(exc).__name__}: {exc}'})
+            continue
+        acted = [g for g in got if g['action'] != 'none']
+        if acted:
+            out.append({'operationId': op['operationId'],
+                        'cards': [{'id': g['ref']['id'], 'status': g['status'], 'action': g['action']} for g in acted]})
+    return out
 
 
 def create_card(c):
@@ -608,9 +658,14 @@ def _ledger(core, owner):
         return None
 
 
-def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_card, review_create=None):
+def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_card, review_create=None, cards=None,
+        local_gateway=None):
     now = time.time() if now is None else now
     opened = []
+    if cards is not None:
+        # Retired decisions must not keep asking David on the board (t_01a19a11276edc29).
+        for r in close_retired_cards(store, cards, local_gateway=local_gateway):
+            opened.append(('retired-card-error:' if r.get('error') else 'retired-card:') + r['operationId'])
     for item in chat.answered_open(core, store, db):
         if item['replyAt'] is None or now - item['replyAt'] < min_age:
             continue
@@ -710,11 +765,14 @@ def main(argv=None):
             store = _store(core)
             if a.retire_operation:
                 v = retire_operation(core, store, a.retire_operation, reason=a.reason, evidence=a.evidence,
-                                     local_gateway=local_gateway)
+                                     local_gateway=local_gateway, cards=_load('cards').QualifiedCardDelivery())
                 print(json.dumps({'retired': {'operationId': a.retire_operation,
                                               'dispatchState': v['operation']['dispatchState'],
                                               'requestState': v['request']['state'],
-                                              'retired': v['operation']['retired']}}))
+                                              'retired': v['operation']['retired'],
+                                              'cards': [{'id': g['ref']['id'], 'status': g['status'],
+                                                         'action': g['action']} for g in v.get('cards') or []],
+                                              'cardsError': v.get('cardsError')}}))
             elif a.withdraw:
                 owner = _find(core, store, a.withdraw)[0]
                 v = withdraw_old(core, store, a.withdraw, reason=a.reason, evidence=a.evidence,
@@ -731,7 +789,10 @@ def main(argv=None):
     create = (lambda c: print(json.dumps(c))) if a.dry_run else create_card
     review_create = (lambda c: print(json.dumps(c))) if a.dry_run else create_review_card
     store = _read_only_store(core) if a.dry_run else _store(core)
-    ids = run(core, chat, store, min_age=a.min_age, create=create, review_create=review_create)
+    # Dry run writes nothing, so no card closes either.
+    cards = None if a.dry_run else _load('cards').QualifiedCardDelivery()
+    ids = run(core, chat, store, min_age=a.min_age, create=create, review_create=review_create, cards=cards,
+              local_gateway=local_gateway)
     print(json.dumps({'cards': ids}))
     return 0
 

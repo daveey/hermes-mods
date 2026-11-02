@@ -382,6 +382,54 @@ class QualifiedCardDelivery:
             finally: c.close()
 
     @staticmethod
+    def retired_comment(op):
+        retired = op.get('retired') or {}
+        return (f"Decided ({(op.get('decision') or {}).get('choiceId')}) and retired by {retired.get('by') or 'hygiene'}: "
+                f"{retired.get('reason') or 'no reason recorded'}. Nothing re-asks.\n"
+                f"Operation {op['operationId']}; the recorded decision was settled without delivery.")
+
+    def close_retired(self, op):
+        """Close the decision card(s) of a request whose recorded operation was retired (ActionStore.retire_operation).
+
+        The binding moves 'bound' -> 'retired' (operation = this one) with one comment, then the card is archived
+        unless other cards wait on it (same rule as _close_decided). Idempotent: a retry after a failed archive finds
+        the binding already retired by this operation and only archives. A binding holding another outcome (a
+        delivered decision, a withdrawal, another operation) is left alone. Returns [{ref, status, action}].
+        """
+        if op.get('dispatchState') != 'cancelled' or not op.get('retired'):
+            raise RuntimeError('Only a retired operation closes its decision card')
+        request = op['intent']['request']
+        api = self._api(); out = []
+        owner = DecisionInbox._encode(op['owner'])
+        for ref in self.live_refs(request):
+            c = api.connect(self._path(ref, op['owner']))
+            try:
+                action = 'none'
+                with api.write_txn(c):
+                    self._schema(c)
+                    row = c.execute('SELECT owner,request_id,state,operation FROM user_steps_card_bindings WHERE task=?',
+                                    (ref['id'],)).fetchone()
+                    if not row or tuple(row[:2]) != (owner, op['requestId']):
+                        raise RuntimeError('Exact card binding required')
+                    mine = row[2] == 'retired' and row[3] == op['operationId']
+                    if row[2] == 'bound':
+                        c.execute("UPDATE user_steps_card_bindings SET state='retired',operation=? "
+                                  "WHERE task=? AND state='bound'", (op['operationId'], ref['id']))
+                        api.add_comment(c, ref['id'], 'user-steps', self.retired_comment(op))
+                        mine, action = True, 'retired'
+                if mine:
+                    # After the binding commit: a failed archive is retried by the next pass.
+                    before = self._task(c, ref['id'])['status']
+                    self._close_decided(api, c, ref['id'])
+                    status = self._task(c, ref['id'])['status']
+                    if status != before: action = 'archived' if action == 'none' else action + '+archived'
+                else:
+                    status = self._task(c, ref['id'])['status']
+                out.append({'ref': ref, 'status': status, 'action': action})
+            finally: c.close()
+        return out
+
+    @staticmethod
     def creation_key(request):
         """Server producer key; never infer authority from a client-supplied alias."""
         import hashlib
