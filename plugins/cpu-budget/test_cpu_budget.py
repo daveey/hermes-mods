@@ -345,7 +345,7 @@ def test_cpu_going_backwards_is_incomplete(tmp_path):
 
 # ------------------------------------------------------------------ incident dedup
 def test_incident_dedup_repeat_appends_comment_and_never_creates_second(tmp_path):
-    sim = Sim(tmp_path)
+    sim = Sim(tmp_path, repeat_min_s=1800)
     start(sim)
     sim.run(1200, 120)
     assert len(sim.runner.tasks) == 1
@@ -529,3 +529,216 @@ def test_create_overlap_refusal_is_retried_with_distinct_from(tmp_path):
     assert cb.KanbanSink(["h"], "bb", "a", runner=lambda a, s=None: (1, json.dumps({"code": "create_overlap"}))
                          ).create("k", "t", "b") is None
     assert cb.KanbanSink(["h"], "bb", "a", runner=lambda a, s=None: (1, "boom")).create("k", "t", "b") is None
+
+
+# ------------------------------------------------------------------ evidenced-idle accumulator
+def blip_stream(sim, minutes=60, pct=50.0, blip="ci"):
+    """50% idle CPU; every 10-minute window carries a 30 s activity blip (it taints that interval and the next)."""
+    start(sim)
+    for i in range(minutes * 2):
+        sim.status[blip] = "active" if i % 20 == 10 else "idle"
+        sim.step(30, pct)
+    sim.status[blip] = "idle"
+
+
+def cum_records(tmp_path):
+    out = []
+    for f in sorted(tmp_path.glob("cpu-budget-cumulative-*.jsonl")):
+        out += [json.loads(line) for line in f.read_text().splitlines()]
+    return out
+
+
+def acc_wall(sim):
+    return (sim.det._load().get("acc") or {}).get("wall_s", 0.0)
+
+
+@pytest.mark.parametrize("blip", ["ci", "conversation"])
+def test_blip_stream_window_records_stay_active_and_unchanged(tmp_path, blip):
+    # Characterization: per-window records are unchanged (a blip still spoils the whole window).
+    sim = Sim(tmp_path)
+    blip_stream(sim, blip=blip)
+    assert sim.windows() and all(w["window"] == "active" for w in sim.windows())
+
+
+@pytest.mark.parametrize("blip", ["ci", "conversation"])
+def test_blip_stream_gives_idle_cumulative_near_50pct_and_incident(tmp_path, blip):
+    # RED on 977b63b (no accumulator: 0 idle records, no incident); GREEN with the accumulator.
+    sim = Sim(tmp_path)
+    blip_stream(sim, blip=blip)
+    recs = cum_records(tmp_path)
+    assert len(recs) >= 3 and all(r["record"] == "idle_cumulative" and r["kind"] == "idle_over" for r in recs)
+    assert all(45 <= r["pct"] <= 55 and r["wall_s"] >= 600 and r["intervals"] >= 20 for r in recs)
+    assert set(recs[0]["cpu"]) == set(ARGS) and recs[0]["first_interval"] < recs[0]["last_interval"]
+    assert [t["key"] for t in sim.runner.tasks.values()] == ["cpu-budget:mini:1"]
+
+
+def test_cumulative_idle_ok_below_budget_never_reports(tmp_path):
+    sim = Sim(tmp_path)
+    blip_stream(sim, pct=20.0)
+    recs = cum_records(tmp_path)
+    assert recs and all(r["kind"] == "idle_ok" for r in recs) and not sim.runner.tasks
+
+
+def test_skipped_interval_neither_counts_nor_resets_accumulator(tmp_path):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(150, 50)
+    assert acc_wall(sim) == 150
+    sim.status["ci"] = "active"
+    sim.step(30, 50)
+    sim.status["ci"] = "idle"
+    sim.step(30, 50)  # active at the previous sample: still not idle
+    assert acc_wall(sim) == 150
+    sim.step(30, 50)
+    assert acc_wall(sim) == 180
+
+
+def _ci(sim):
+    sim.status["ci"] = "active"
+
+
+def _conv(sim):
+    sim.status["conversation"] = "active"
+
+
+def _unknown(sim):
+    sim.status["ci"] = "unknown"
+
+
+def _restart(sim):
+    sim.pids["hub"] += 7
+    sim.started["hub"] = sim.now - 5
+    sim.cpu["hub"] = 2.0
+
+
+def _pid_reuse(sim):
+    sim.started["rpc"] = sim.now - 5  # same pid, new start time
+    sim.cpu["rpc"] = 2.0
+
+
+def _exit(sim):
+    sim.absent.add("pod")
+
+
+@pytest.mark.parametrize("disturb", [_ci, _conv, _unknown, _restart, _pid_reuse, _exit])
+def test_non_idle_or_incomplete_interval_never_enters_accumulator(tmp_path, disturb):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(150, 50)
+    before = acc_wall(sim)
+    disturb(sim)
+    sim.step(30, 50)
+    assert acc_wall(sim) == before == 150
+    assert sim.det._load()["acc"]["intervals"] == 5
+
+
+def test_gap_longer_than_max_gap_never_enters_accumulator(tmp_path):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(150, 50)
+    sim.step(120, 50)  # gap > max_gap_s (90)
+    assert acc_wall(sim) == 150
+
+
+def test_ps_failure_does_not_count(tmp_path):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(150, 50)
+    sim.ps_ok = False
+    sim.step(30, 50)
+    sim.ps_ok = True
+    sim.step(30, 50)
+    assert acc_wall(sim) == 150
+
+
+def test_conversation_files_within_quiet_s_never_count(tmp_path):
+    import os
+    d = tmp_path / "turns"
+    d.mkdir()
+    f = d / "a.json"
+    f.write_text("{}")
+    sim = Sim(tmp_path / "state")
+    reg = {"fake": lambda spec, rows, now, since: ("idle", "fake"), "files_quiet": cb.probe_files_quiet}
+    probes = [{"type": "files_quiet", "kind": "conversation", "name": "c", "globs": [str(d / "*.json")], "quiet_s": 120},
+              {"type": "fake", "kind": "ci", "name": "ci"}]
+    sim.det = cb.Detector({"host": "mini", "services": SERVICES, "probes": probes}, tmp_path / "state", None,
+                          ps_fn=sim.ps, clock=lambda: sim.now, probe_registry=reg, self_pid=1)
+    os.utime(d, (T0 - 9999, T0 - 9999))
+    os.utime(f, (T0 - 9999, T0 - 9999))
+    start(sim)
+    sim.run(150, 50)
+    assert acc_wall(sim) == 150
+    os.utime(f, (sim.now + 25, sim.now + 25))  # turn file touched during the next interval
+    sim.step(30, 50)
+    assert acc_wall(sim) == 150
+    sim.run(90, 50)  # still within quiet_s of the touch
+    assert acc_wall(sim) == 150
+    sim.run(120, 50)
+    assert acc_wall(sim) > 150
+
+
+def test_max_span_discards_stale_accumulator(tmp_path):
+    sim = Sim(tmp_path, max_span_s=1800)
+    start(sim)
+    sim.run(300, 50)
+    assert acc_wall(sim) == 300
+    sim.status["ci"] = "active"
+    for _ in range(40):  # 20 min of activity: nothing counted, accumulator kept (not reset) ...
+        sim.step(30, 50)
+    assert acc_wall(sim) == 300
+    for _ in range(12):  # ... until its first interval is older than max_span_s: discarded
+        sim.step(30, 50)
+    assert acc_wall(sim) == 0
+    sim.status["ci"] = "idle"
+    sim.run(120, 50)  # a fresh accumulator starts from fresh intervals only
+    acc = sim.det._load()["acc"]
+    assert acc["first"] > T0 + 1800 and acc["wall_s"] <= 120
+    assert not cum_records(tmp_path)
+
+
+def test_rate_limit_one_comment_per_six_hours(tmp_path):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(1200, 120)
+    (tid, task), = sim.runner.tasks.items()
+    sim.run(5 * 3600, 120)  # 5 h later: same pct, still throttled
+    assert task["comments"] == []
+    sim.run(1.2 * 3600, 120)  # past 6 h since the report
+    assert len(task["comments"]) == 1 and len(sim.runner.tasks) == 1
+    sim.run(1800, 120)
+    assert len(task["comments"]) == 1
+
+
+def test_five_point_rise_bypasses_rate_limit_but_four_does_not(tmp_path):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(1200, 50)
+    (tid, task), = sim.runner.tasks.items()
+    sim.run(1200, 54)  # +4: throttled
+    assert task["comments"] == []
+    sim.run(1200, 56)  # +6 over the last reported 50: comment inside the 6 h window
+    assert len(task["comments"]) == 1
+    sim.run(1200, 57)  # +1 over the new reported value: throttled again
+    assert len(task["comments"]) == 1
+
+
+def test_first_fire_comments_on_open_owner_card_not_a_new_one(tmp_path):
+    sim = Sim(tmp_path, sink={"owner_task": "t_owner", "owner_board": "main"})
+    sim.runner.tasks["t_owner"] = {"key": "owner", "status": "running", "comments": []}
+    start(sim)
+    sim.run(1200, 120)
+    assert list(sim.runner.tasks) == ["t_owner"]
+    assert len(sim.runner.tasks["t_owner"]["comments"]) == 1
+    assert sim.runner.tasks["t_owner"]["comments"][0].startswith("first fire: cpu-budget")
+    assert all(a[a.index("--board") + 1] == "main" for a, _ in sim.runner.calls)
+    sim.run(3600, 120)  # rate limited afterwards, and never an Inbox post or second card
+    assert len(sim.runner.tasks) == 1 and len(sim.runner.tasks["t_owner"]["comments"]) == 1
+
+
+def test_closed_owner_gets_one_deduplicated_card_linking_it(tmp_path):
+    sim = Sim(tmp_path, sink={"owner_task": "t_owner", "owner_board": "main"})
+    sim.runner.tasks["t_owner"] = {"key": "owner", "status": "done", "comments": []}
+    start(sim)
+    sim.run(2400, 120)
+    new = [t for k, t in sim.runner.tasks.items() if k != "t_owner"]
+    assert len(new) == 1 and "t_owner" in new[0]["body"] and new[0]["key"] == "cpu-budget:mini:1"

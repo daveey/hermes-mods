@@ -23,6 +23,18 @@ Windows
   * ``consecutive`` (2) adjacent complete-idle windows above ``budget_pct`` (40) report an incident to
     the sink: first one creates a deduplicated Kanban card, later ones append evidence. Anything else
     resets the streak. Samples closer than ``min_interval_s`` (30) are ignored.
+Evidenced-idle accumulator (what the incident rule uses)
+  * A fully idle 10-minute window almost never happens on a busy host (CI blips, deploy restarts), so the
+    incident rule does not use windows. An interval is *counted* only if it is idle on its own: both probe
+    kinds affirmatively idle at both ends, no probe unknown, every service the same pid+start at both ends,
+    gap <= ``max_gap_s``. Counted intervals add their wall and CPU time to an accumulator; any other interval
+    is skipped (neither counted nor resetting it). At ``window_s`` of counted wall time one ``idle_cumulative``
+    record (kind ``idle_ok`` / ``idle_over`` against ``budget_pct``) goes to ``cpu-budget-cumulative-*.jsonl``
+    and the accumulator resets. An accumulator older than ``max_span_s`` is discarded.
+  * ``consecutive`` ``idle_over`` cumulative records open the incident; ``idle_ok`` resets the streak. Reports
+    go first to ``sink.owner_task`` (a comment, if its board is reachable and it is open) else to one
+    deduplicated card that links it; afterwards at most one comment per ``repeat_min_s`` (6 h) unless the pct
+    rose ``bump_pct`` points over the last reported value. Per-window records are unchanged.
 No lease/takeover code is touched; the only side effects are the state file, the evidence ledger and
 the sink (all injectable).
 """
@@ -47,7 +59,9 @@ DEFAULTS = {
     "consecutive": 2,
     "min_interval_s": 30,
     "max_gap_s": 90,
-    "repeat_min_s": 1800,
+    "repeat_min_s": 21600,   # at most one repeat comment per 6 h ...
+    "bump_pct": 5.0,         # ... unless the pct rose this many points over the last reported value
+    "max_span_s": 21600,     # an accumulator whose first interval is older than this is discarded
 }
 _SELF_RE = re.compile(r"mac-load-recorder\s+sample|cpu_budget\.py\s+--config")
 _PS_RE = re.compile(r"^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(\S+)\s*(.*)$")
@@ -249,8 +263,11 @@ class KanbanSink:
     def _base(self) -> List[str]:
         return list(self.hermes) + ["kanban", "--board", self.board]
 
-    def is_open(self, task_id: str) -> Optional[bool]:
-        code, out = self.run(self._base() + ["show", "--json", task_id], None)
+    def _base_for(self, board: Optional[str]) -> List[str]:
+        return list(self.hermes) + ["kanban", "--board", board or self.board]
+
+    def is_open(self, task_id: str, board: Optional[str] = None) -> Optional[bool]:
+        code, out = self.run(self._base_for(board) + ["show", "--json", task_id], None)
         if code != 0:
             return None
         data = self._json(out)
@@ -297,16 +314,18 @@ class KanbanSink:
         except (KeyError, TypeError):
             return None
 
-    def comment(self, task_id: str, body: str) -> bool:
-        code, _ = self.run(self._base() + ["comment", task_id, body], None)
+    def comment(self, task_id: str, body: str, board: Optional[str] = None) -> bool:
+        code, _ = self.run(self._base_for(board) + ["comment", task_id, body], None)
         return code == 0
 
 
 def format_evidence(win: dict, services: List[str], budget: float, host: str) -> str:
     per = ", ".join("%s %.1f%%" % (n, 100.0 * win["cpu"].get(n, 0.0) / win["wall_s"]) for n in services)
-    return ("cpu-budget evidence (%s): window %s..%s UTC, %.0fs wall, combined %.1f%% of one core "
-            "(budget %.0f%%), %d intervals all complete and idle-evidenced.\nper service: %s\nidle evidence: %s"
-            % (host or "host", _iso(win["start"]), _iso(win["end"]), win["wall_s"], win["pct"], budget,
+    what = ("evidenced-idle accumulation (non-idle intervals skipped) %s..%s UTC" if win.get("record") == "idle_cumulative"
+            else "window %s..%s UTC") % (_iso(win["start"]), _iso(win["end"]))
+    return ("cpu-budget evidence (%s): %s, %.0fs idle wall, combined %.1f%% of one core "
+            "(budget %.0f%%), %d intervals each complete and idle-evidenced.\nper service: %s\nidle evidence: %s"
+            % (host or "host", what, win["wall_s"], win["pct"], budget,
                win["intervals"], per, "; ".join(win.get("evidence", [])[:6])))
 
 
@@ -329,6 +348,8 @@ class Detector:
         self.sink, self.ps_fn, self.clock = sink, ps_fn, clock
         self.registry, self.self_pid = probe_registry, self_pid if self_pid is not None else os.getpid()
         self.state_path = self.state_dir / "cpu-budget-state.json"
+        sinkcfg = config.get("sink") or {}
+        self.owner_task, self.owner_board = sinkcfg.get("owner_task"), sinkcfg.get("owner_board")
 
     # state ---------------------------------------------------------
     def _load(self) -> dict:
@@ -348,6 +369,12 @@ class Detector:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         day = _dt.datetime.fromtimestamp(rec["end"], _dt.timezone.utc).strftime("%Y-%m-%d")
         with open(self.state_dir / ("cpu-budget-windows-%s.jsonl" % day), "a") as fh:
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+    def _ledger_cum(self, rec: dict) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        day = _dt.datetime.fromtimestamp(rec["end"], _dt.timezone.utc).strftime("%Y-%m-%d")
+        with open(self.state_dir / ("cpu-budget-cumulative-%s.jsonl" % day), "a") as fh:
             fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
     # one scheduler tick ------------------------------------------------
@@ -370,7 +397,7 @@ class Detector:
         if last_ts is None or "snap" not in st or now < last_ts:
             # first run, lost state, or the wall clock stepped back: re-baseline, drop the window and streak
             evaluate_idle(self.probes, rows, now, now, self.registry, None, seen)
-            st.update(last_ts=now, snap=_jsonable_snap(cur), window=None, streak=[], probe_prev=seen)
+            st.update(last_ts=now, snap=_jsonable_snap(cur), window=None, streak=[], acc=None, probe_prev=seen)
             st.pop("last_failure", None)  # failures before this fresh baseline cannot spoil its window
             self._save(st)
             return {"action": "baseline" if last_ts is None or "snap" not in st else "clock_back"}
@@ -393,11 +420,49 @@ class Detector:
             win["bad"].append("idle:" + idle)
         win["evidence"] = evidence
         st.update(last_ts=now, snap=_jsonable_snap(cur), window=win, probe_prev=seen)
+        result.update(self._accumulate(st, acc, idle, evidence, last_ts, now))
         if now - win["start"] >= self.cfg["window_s"]:
             result.update(self._close_window(st, win, now))
             st["window"] = None
         self._save(st)
         return result
+
+    def _accumulate(self, st: dict, acc: dict, idle: str, evidence: List[str], prev_ts: float, now: float) -> dict:
+        """Evidenced-idle accumulator: count only intervals idle on their own; skip the rest."""
+        a = st.get("acc")
+        if a and now - a["first"] > self.cfg["max_span_s"]:
+            a = None  # too stale to describe one coherent stretch
+        if idle != "idle" or acc["reasons"]:
+            st["acc"] = a
+            return {}
+        if not a:
+            a = {"first": prev_ts, "cpu": {}, "wall_s": 0.0, "intervals": 0}
+        a["wall_s"] += now - prev_ts
+        a["intervals"] += 1
+        a["last"] = now
+        a["evidence"] = evidence
+        for name, v in acc["cpu"].items():
+            a["cpu"][name] = a["cpu"].get(name, 0.0) + v
+        if a["wall_s"] < self.cfg["window_s"]:
+            st["acc"] = a
+            return {}
+        st["acc"] = None
+        total = sum(a["cpu"].values())
+        pct = 100.0 * total / a["wall_s"]
+        over = pct > self.cfg["budget_pct"]
+        rec = {"record": "idle_cumulative", "kind": "idle_over" if over else "idle_ok", "start": a["first"],
+               "end": now, "first_interval": a["first"], "last_interval": now, "wall_s": a["wall_s"],
+               "pct": round(pct, 2), "cpu": {k: round(v, 2) for k, v in a["cpu"].items()},
+               "intervals": a["intervals"], "evidence": a["evidence"]}
+        self._ledger_cum(rec)
+        streak = (st.get("cstreak") or []) if over else []
+        if over:
+            streak = (streak + [{"start": a["first"], "end": now, "pct": rec["pct"]}])[-self.cfg["consecutive"]:]
+        st["cstreak"] = streak
+        out = {"cumulative": rec["kind"], "cumulative_pct": rec["pct"]}
+        if over and len(streak) >= self.cfg["consecutive"]:
+            out["incident"] = self._report(st, rec, now)
+        return out
 
     def _close_window(self, st: dict, win: dict, now: float) -> dict:
         total = sum(win["cpu"].values())
@@ -410,17 +475,7 @@ class Detector:
                "cpu": {k: round(v, 2) for k, v in win["cpu"].items()}, "intervals": win["intervals"],
                "bad": win["bad"], "evidence": win["evidence"]}
         self._ledger(rec)
-        streak = st.get("streak", []) if over else []
-        if over:
-            if streak and abs(streak[-1]["end"] - win["start"]) > 2:
-                streak = []
-            streak.append({"start": win["start"], "end": now, "pct": round(pct, 2)})
-            streak = streak[-self.cfg["consecutive"]:]
-        st["streak"] = streak
-        out = {"window": kind, "pct": round(pct, 2)}
-        if over and len(streak) >= self.cfg["consecutive"]:
-            out["incident"] = self._report(st, rec, now)
-        return out
+        return {"window": kind, "pct": round(pct, 2)}
 
     def _report(self, st: dict, rec: dict, now: float) -> str:
         if self.sink is None:
@@ -428,29 +483,40 @@ class Detector:
         inc = st.get("incident") or {}
         body = format_evidence(rec, [s["name"] for s in self.services], self.cfg["budget_pct"], self.host)
         if inc.get("id"):
-            if now - inc.get("last_report", 0) < self.cfg["repeat_min_s"]:
-                return "repeat_throttled"
-            open_ = self.sink.is_open(inc["id"])
+            last_pct = inc.get("last_pct")
+            bumped = last_pct is not None and rec["pct"] >= last_pct + self.cfg["bump_pct"]
+            throttled = now - inc.get("last_report", 0) < self.cfg["repeat_min_s"] and not bumped
+            open_ = self.sink.is_open(inc["id"], inc.get("board"))
             if open_ is None:
                 return "sink_unreachable"
+            if throttled and open_:
+                return "repeat_throttled"  # a closed card is a new episode: not noise, never throttled
             if open_:
-                ok = self.sink.comment(inc["id"], "repeat: " + body)
+                ok = self.sink.comment(inc["id"], "repeat: " + body, inc.get("board"))
                 if ok:
-                    inc["last_report"] = now
+                    inc["last_report"], inc["last_pct"] = now, rec["pct"]
                     inc["repeats"] = inc.get("repeats", 0) + 1
                     st["incident"] = inc
                 return "commented" if ok else "comment_failed"
             seq = inc.get("seq", 1) + 1  # prior card was closed: this is a new episode
         else:
             seq = 1
+            if self.owner_task and self.sink.is_open(self.owner_task, self.owner_board):
+                # the breach already has an open owner: report there instead of opening a second card
+                if self.sink.comment(self.owner_task, "first fire: " + body, self.owner_board):
+                    st["incident"] = {"id": self.owner_task, "board": self.owner_board, "seq": 1, "opened": now,
+                                      "last_report": now, "last_pct": rec["pct"], "repeats": 0, "owner": True}
+                    return "commented_owner"
         key = "%s:%d" % (self.key_prefix, seq)
-        title = "BabyBear %s idle CPU over budget: combined %.0f%% of one core for 2 idle ten-minute windows" % (
+        title = "BabyBear %s idle CPU over budget: combined %.0f%% of one core for 2 evidenced-idle ten-minute spans" % (
             self.host or "host", rec["pct"])
+        link = ("\nExisting owner of this breach: %s\n" % self.owner_task) if self.owner_task else ""
         task_id = self.sink.create(key, title, "Auto-detected by cpu-budget (agent-owned; no human action "
-                                   "needed).\n\n" + body)
+                                   "needed)." + link + "\n" + body)
         if not task_id:
             return "create_failed"
-        st["incident"] = {"id": task_id, "seq": seq, "opened": now, "last_report": now, "repeats": 0}
+        st["incident"] = {"id": task_id, "seq": seq, "opened": now, "last_report": now, "last_pct": rec["pct"],
+                          "repeats": 0}
         return "created"
 
 
