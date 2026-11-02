@@ -321,6 +321,11 @@ def start(home: Path, *, stall_s: float = STALL_S, wait_for_loop_s: float = 600.
         profile = profile_trigger(home / "logs" / PROFILE_REQUEST, sink)
 
         def tick() -> None:
+            nonlocal trace
+            # Gateway listeners import the web app lazily, after the loop is running.
+            # Retry until it exists; installing once at watcher startup loses tracing.
+            if trace is None and slow_s is not None and slow_s > 0:
+                trace = _install_reqtrace(home, slow_s)
             profile()
             if trace is not None:
                 trace.tick(loop)

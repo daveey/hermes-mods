@@ -1,13 +1,13 @@
 """loop-watch: log what held a Hermes backend's event loop whenever it stalls.
 
-In a ``hermes serve`` process (Desktop backends, SSH-isolated backends) this starts a daemon thread
+In a ``hermes serve`` or ``hermes gateway run`` process this starts a daemon thread
 that probes the main asyncio loop every 0.25 s. A probe that waits >= 1 s is a stall: the thread
 samples every thread's Python stack until the loop catches up, then writes one line to agent.log
 (``loop-watch: event loop stalled …``) and the full report to ``<HERMES_HOME>/logs/loop-watch.jsonl``.
 A stalled loop answers no HTTP request at all, which the Desktop logs as "Timed out connecting to
 Hermes backend"; this names the code that held it.
 
-Config: ``HERMES_LOOP_WATCH=off`` disables; ``HERMES_LOOP_WATCH=all`` also watches non-serve
+Config: ``HERMES_LOOP_WATCH=off`` disables; ``HERMES_LOOP_WATCH=all`` also watches other
 processes; ``HERMES_LOOP_WATCH_STALL_S`` (default 1.0) sets the stall threshold.
 
 It also wraps the serve app with a slow-request tracer (reqtrace.py): a request that waits >= 1 s for
@@ -48,7 +48,8 @@ def wanted(env=None, argv=None) -> bool:
     mode = str(env.get("HERMES_LOOP_WATCH", "")).strip().lower()
     if mode in ("off", "0", "false", "no"):
         return False
-    return mode == "all" or is_serve_process(argv)
+    argv = sys.argv if argv is None else argv
+    return mode == "all" or is_serve_process(argv) or argv[1:3] == ["gateway", "run"]
 
 
 def _stall_s(env=None) -> float:

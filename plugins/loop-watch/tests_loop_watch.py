@@ -103,11 +103,15 @@ def test_find_loop_finds_running_loop_on_named_thread():
         lp.close()
 
 
-def test_gate_serve_only_by_default():
+def test_gate_web_backends_by_default():
     assert lw.wanted({}, ["-c", "serve", "--host", "127.0.0.1"])
     assert lw.wanted({}, ["/x/hermes", "serve", "--isolated"])
     assert not lw.wanted({}, ["/x/hermes", "chat"])
-    assert not lw.wanted({}, ["/x/hermes", "gateway", "run"])
+    assert lw.wanted({}, ["/x/hermes", "gateway", "run"])
+    assert lw.wanted({}, ["-c", "gateway", "run", "--external-supervisor"])
+    assert not lw.wanted({}, ["/x/hermes", "gateway", "status"])
+    assert not lw.wanted({}, ["/x/hermes", "gateway", "profile"])
+    assert not lw.wanted({"HERMES_LOOP_WATCH": "off"}, ["-c", "gateway", "run"])
     assert lw.wanted({"HERMES_LOOP_WATCH": "all"}, ["/x/hermes", "chat"])
     assert not lw.wanted({"HERMES_LOOP_WATCH": "off"}, ["-c", "serve"])
 
@@ -124,6 +128,37 @@ def test_start_wires_request_tracer_into_serve_app(tmp_path, monkeypatch):
     assert watch._install_reqtrace(tmp_path, 0) is None  # 0 disables
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server", types.SimpleNamespace())
     assert watch._install_reqtrace(tmp_path, 2.0) is None  # not a web server process
+
+
+def test_start_retries_tracer_after_lazy_webapp_load(tmp_path, monkeypatch):
+    import types
+    monkeypatch.delattr(sys, watch._STARTED_ATTR, raising=False)
+    monkeypatch.setattr(watch, "find_loop", lambda: types.SimpleNamespace(_thread_id=1))
+    ticks, installs = [], []
+    trace = types.SimpleNamespace(tick=lambda loop: ticks.append(loop))
+
+    def install(*args):
+        installs.append(args)
+        return trace if len(installs) > 1 else None
+
+    class Watch:
+        def __init__(self, *args, **kwargs):
+            pass
+        def run(self):
+            self.on_tick()
+            self.on_tick()
+
+    monkeypatch.setattr(watch, "_install_reqtrace", install)
+    monkeypatch.setattr(watch, "LoopWatch", Watch)
+    monkeypatch.setattr(watch, "profile_trigger", lambda *args: lambda: None)
+    try:
+        thread = watch.start(tmp_path)
+        thread.join(5)
+        assert not thread.is_alive()
+        assert len(installs) == 2
+        assert len(ticks) == 2
+    finally:
+        monkeypatch.delattr(sys, watch._STARTED_ATTR, raising=False)
 
 
 def test_run_calls_on_tick():
