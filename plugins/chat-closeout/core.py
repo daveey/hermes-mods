@@ -362,8 +362,16 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     back to work or left the batch is forgotten, so a later block (even for the same reason) is a new ask.
     Returns changed fields."""
     batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
+    # Old ledgers retain bare and gateway/profile/id spellings alongside newer keys.
+    # Only a found sibling IN THIS BATCH proves an absent spelling redundant; a missing
+    # sibling (or a found same-tail card elsewhere) is not evidence of completion.
+    found_parts = [i.split("/") for i in batch if cards.get(i) is not None]
+    bare_aliases = {p[-1] for p in found_parts if len(p) > 1}
+    remote_aliases = {"/".join((p[0], p[1], p[3])) for p in found_parts if len(p) == 4}
+    aliases = {i for i in batch | covered if cards.get(i) is None
+               and (i in bare_aliases or i in remote_aliases)}
     relayed = set(row.get("relayed") or [])
-    keep = {p for p in relayed if _premise_card(p) in batch
+    keep = {p for p in relayed if _premise_card(p) in batch - aliases
             and (is_unknown(cards.get(_premise_card(p))) or is_settled(cards[_premise_card(p)])
                  or ask_premise(_premise_card(p), cards[_premise_card(p)]) == p)}
     # ^ a card still parked on the very premise we told the chat about stays told, even when is_settled() is False
@@ -372,12 +380,12 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     reopened = {i for i in covered if cards.get(i) is not None and not is_settled(cards[i])}
     gone = {i for i in covered & batch if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
     out: dict[str, Any] = {}
-    if reopened or gone:
-        out["covered"] = (covered - reopened) - gone
+    if reopened or gone or aliases & covered:
+        out["covered"] = covered - reopened - gone - aliases
     if reopened:  # the same id set may settle again: its old key must not suppress the new close-out
         out.update(done_sig=None, claim_sig=None)
-    if gone:
-        out["batch"] = batch - gone
+    if gone or aliases & batch:
+        out["batch"] = batch - gone - aliases
         keep = {p for p in keep if _premise_card(p) not in gone}
     if keep != relayed:
         out["relayed"] = keep

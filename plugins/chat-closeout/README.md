@@ -34,6 +34,14 @@ New batches use local `board/task` keys and remote `gateway/profile/board/task` 
 
 A remote done/archive settles only with a fresh, verified origin release. Unknown, stale, missing and review remain unfinished; current explicit `needs_input`/`capability` blockers still produce the human ask. Local settlement behavior is unchanged. Historical bare-ID batches resolve only when unambiguous: collisions or an unreadable remote inventory remain unknown rather than borrowing local completion. Such ambiguous historical entries require explicit reconciliation, not an automatic ownership guess. Remote projection currently has no handoff summary, so the brief says `(no handoff)` rather than substituting a local result.
 
+Legacy duplicate keys are reconciled only against a found sibling in the same batch: an absent bare `id`
+is dropped when a found key ends in `/id`, and absent `gateway/profile/id` is dropped when a found
+`gateway/profile/board/id` exists. Found keys and unmatched missing keys are never dropped. This removes
+redundant batch/coverage entries, not unknown work; there is no age-based expiry (`tests/test_aliases.py`).
+The regression was retained across upgrades because turn-end unions prior batches while readers use canonical
+keys; coverage upkeep lacked alias migration. Tests now seed mixed historical/canonical batches and exercise
+wake plus turn-end, including open canonical and missing-sibling controls.
+
 ## One pending decision
 
 `core.pending_key` is the single "does this row need a close-out" answer used by the sidebar source, `pre_llm_call`,
