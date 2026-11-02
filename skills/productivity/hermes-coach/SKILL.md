@@ -153,6 +153,8 @@ Undone notices are always plain cards.
   session while one chat can hold 50 subagents.
 - Treat the coach's first report as a check of the pipeline itself: it audits the digests and finds metric bugs.
   Fix those first, before acting on its usage findings.
+- In weekly KPI audits, distinguish same-profile operator-note stamps from author provenance: `(another session)` can also label a human CLI comment. Retain ambiguous notes unless the stored writer/run proves automation. Match generated card, probe and JSON envelopes before both classification and the scanned-turn denominator; preserve real opener corrections. Replay the exact previous reply, including a leading conditional clause, when adding ask shapes. Keep descriptive UI flows and negated requests as negative controls.
+- When reconstructing delayed digest intake, use the first commit containing the exact turn, not the commit that first created its session file. Compare that arrival with the consumer checkout's reflog and the backstop lookback; upstream author time alone is not proof the consumer saw it.
 - Keyword signals (`hermes_meta` etc.) hit incidental mentions. Classify a session by title keywords or by the
   signal's share of real turns, never by a raw count ≥ N.
 - A new curriculum `adopted` test that needs a fact the digest lacks: add a counter to `call_features()` /
