@@ -256,6 +256,46 @@ class RouteToLane(unittest.TestCase):
         self.assertEqual(owned, [])
         self.assertEqual(len(rest), 3)
 
+    def detected_home(self, fps):
+        import json
+        h = self.home({})
+        (h / "coach" / "selfheal.json").write_text(json.dumps(fps))
+        return h
+
+    def test_shadow_detected_session_is_not_refiled(self):
+        # plugin-d55a1b9bb1: the detector saw s_fix's turn in shadow mode (logged, never filed), so the lane has no
+        # filing; the weekly pass must not file a fresh "unfiled fix request needs review" card for it.
+        t = self.hits()[0]["t"]
+        home = self.detected_home({"gateway-4d3f44896c": {"first": t + 2400, "last": t + 2400, "count": 1,
+                                                          "sessions": ["s_fix"], "day": "2026-10-26"}})
+        filed, detected = [], []
+        owned, rest = g.route_hits(self.hits(), home, filer=lambda d: filed.append(d) or {"action": "would_file"},
+                                   detected=detected)
+        self.assertEqual([d["session_id"] for d in filed], ["s_ask", "s_known"])  # undetected sessions still route
+        self.assertEqual([h["session"] for h in rest], ["s_ask", "s_known"])
+        self.assertEqual([(h["session"], h["detected_fp"]) for h in detected], [("s_fix", "gateway-4d3f44896c")])
+        self.assertNotIn("s_fix", [h["session"] for h in owned + rest])
+
+    def test_detection_on_another_day_still_files(self):
+        # a detection of the same session weeks earlier is a different turn: the hit still gets its review
+        t = self.hits()[0]["t"]
+        home = self.detected_home({"agent-0000000000": {"first": t - 20 * 86400, "last": t - 19 * 86400,
+                                                        "count": 2, "sessions": ["s_fix"]}})
+        filed, detected = [], []
+        owned, rest = g.route_hits(self.hits(), home, filer=lambda d: filed.append(d) or {"action": "would_file"},
+                                   detected=detected)
+        self.assertEqual(detected, [])
+        self.assertEqual([d["session_id"] for d in filed], ["s_fix", "s_ask", "s_known"])
+        self.assertEqual(len(rest), 3)
+
+    def test_detected_line_counts_skips(self):
+        hit = dict(self.hits()[0], detected_fp="gateway-4d3f44896c")
+        lines = g.detected_lines([hit])
+        self.assertIn("1 hit", lines[0])
+        self.assertIn("not a miss", lines[0])
+        self.assertIn("gateway-4d3f44896c", "\n".join(lines))
+        self.assertEqual(g.detected_lines([]), [])
+
 
 class Deliver(unittest.TestCase):
     """The weekly report never goes to the Inbox: unrouted hits -> one Kanban card, none -> nothing."""

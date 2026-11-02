@@ -360,6 +360,47 @@ def lane_sessions(home):
     return {v.get("session_id") for v in st.values() if isinstance(v, dict) and v.get("session_id")}
 
 
+DETECT_BEFORE, DETECT_AFTER = 12 * 3600, 48 * 3600  # a detection of the hit's turn lands within this window of it
+
+
+def detected_sessions(home):
+    """Sessions the self-heal detector already saw, shadow or live: <coach>/selfheal.json fingerprint -> sessions.
+    -> {session: [(fingerprint, first, last), ...]}. Shadow mode only logs, so these have no lane filing."""
+    try:
+        st = json.loads((Path(home) / "coach" / "selfheal.json").read_text())
+    except Exception:
+        return {}
+    out = {}
+    for fp, v in (st.items() if isinstance(st, dict) else ()):
+        if not isinstance(v, dict):
+            continue
+        first, last = v.get("first") or 0, v.get("last") or v.get("first") or 0
+        for s in v.get("sessions") or ():
+            out.setdefault(s, []).append((fp, first, last))
+    return out
+
+
+def detection_for(h, detected):
+    """The fingerprint that detected this hit's turn, or None. Only a detection close to the hit counts (selfheal.json
+    keeps no per-session time, so the fingerprint's first..last window must reach the hit's window): a detection of
+    the same session on another day is a different turn and the hit still gets its review."""
+    t = h.get("t") or 0
+    for fp, first, last in detected.get(h.get("session"), ()):
+        if first <= t + DETECT_AFTER and last >= t - DETECT_BEFORE:
+            return fp
+    return None
+
+
+def detected_lines(hits):
+    """Weekly-post lines for hits skipped because the detector already saw them (a jump in this count shows up)."""
+    if not hits:
+        return []
+    lines = [f"Detected (shadow/live), not a miss: {len(hits)} hit{'s' if len(hits) != 1 else ''} the self-heal "
+             "detector already saw (coach/selfheal.json), not re-filed:"]
+    lines += [f"- {fmt_ts(h['t'])} · session `{h['session']}` · `{h['detected_fp']}`: \"{quote(h, 100)}\"" for h in hits]
+    return lines
+
+
 def hit_defect(h):
     """One ask-gate hit -> a monitor finding for the self-heal lane. Missing
     filing alone does not prove a detection miss (shadow mode never files)."""
@@ -383,15 +424,23 @@ def hit_defect(h):
             "prompt": prompt, "component": comp, "session_id": h["session"], "quote": q}
 
 
-def route_hits(hits, home, filer=None, signals=None):
+def route_hits(hits, home, filer=None, signals=None, detected=None):
     """File every hit the lane does not already own. -> (owned hits, not-owned hits). In shadow mode nothing is
-    owned (file_defect only logs), so the card keeps its review prompt until the lane goes live."""
+    owned (file_defect only logs), so the card keeps its review prompt until the lane goes live. A hit whose turn the
+    detector already saw (selfheal.json, shadow or live) is neither: it is appended to ``detected`` (with
+    ``detected_fp``) and never filed, since no filing there is not a detector miss (plugin-d55a1b9bb1)."""
     signals = signals or _coach_mod("signals")
     known = lane_sessions(home)
+    seen = detected_sessions(home)
     owned, rest = [], []
     for h in hits:
         if h["session"] in known:
             owned.append(h)
+            continue
+        fp = detection_for(h, seen)
+        if fp:
+            if detected is not None:
+                detected.append(dict(h, detected_fp=fp))
             continue
         m = hit_defect(h)
         d = signals.monitor_defect(m, host=h.get("host"))
@@ -521,20 +570,26 @@ def main():
             extra = (extra or []) + ["", note]
         if a.selfheal:  # every other hit goes to the self-heal lane; the card only asks to review what it didn't take
             home = Path(a.home[0] if a.home else os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+            detected = []
             try:
-                owned, rest_lane = route_hits(lane_hits, home)
+                owned, rest_lane = route_hits(lane_hits, home, detected=detected)
             except Exception as e:
-                owned, rest_lane = [], lane_hits
+                owned, rest_lane, detected = [], lane_hits, []
                 sys.stderr.write(f"self-heal routing failed: {e}\n")
             rest = rest_lane + [h for h in rest if h["class"] == BB_CLASS]
             extra = (extra or []) + ["", f"Self-heal lane took {len(owned)} of {len(lane_hits)} Hermes/agent hits (filed or "
                                          "already open)." + (f" {len(rest_lane)} still need a review (Do it)."
                                                              if rest_lane else "")]
+            if detected:
+                extra += [""] + detected_lines(detected)
+        else:
+            detected = []
         deliver(hits, weeks[0], extra, rest, len(fix), len(bb), len(ask))
         p = marker_path(data, weeks[0])
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"posted_by": me, "posted_at": int(time.time()), ASK_CLASS: len(ask), FIX_CLASS: len(fix), BB_CLASS: len(bb),
-                                 "fix_sessions": len({h["session"] for h in fix})}) + "\n")
+                                 "fix_sessions": len({h["session"] for h in fix}),
+                                 "detected_not_refiled": len(detected)}) + "\n")
 
 
 if __name__ == "__main__":
