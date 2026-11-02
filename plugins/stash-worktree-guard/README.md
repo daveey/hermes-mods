@@ -3,6 +3,11 @@
 `refs/stash` is one ref per repository. Every linked worktree shares it, so two agents that
 `git stash` and `git stash pop` at the same time can swap diffs.
 
+This is a best-effort guard over command text, not an execution sandbox. Its refusal
+claims below apply to the forms it recognizes; **an allowed command is not proof that
+it cannot restore another branch's stash**. See [explicit out-of-scope compositions](#explicit-out-of-scope-compositions)
+for known bypasses, including commands that create their own scripts or config.
+
 This plugin:
 
 - appends a `[stash-worktree-guard]` warning to terminal output for `git stash`
@@ -167,6 +172,54 @@ nested `tool_call`. It runs before the terminal handler can promote a timeout ov
 
 Already-open sessions keep the plugin module they imported. A fresh session picks up
 new code; updating the files is not proof an existing session refreshed.
+
+## Explicit out-of-scope compositions
+
+The following are **known unblocked cross-branch restore paths**, not covered restore
+controls. Each remains out of scope; documenting them does not make them safe. Encoded
+payloads below mean base64 text whose decoded contents perform a restore. `WT` denotes
+another linked worktree and `R` a scratch directory.
+
+1. **Source a file created by a child in the same command.** For example,
+   `env A=1 sh -c 'echo ENCODED_SCRIPT | base64 -d > R/s.sh'; . R/s.sh`.
+   The analyzer does not execute the writer or read the resulting source file. Its
+   uncertainty fallback needs recognizable restore evidence in the original text;
+   encoded-only contents can leave it with none. This includes same-command writes,
+   not just files that existed before the tool call.
+2. **Unmodeled program writes followed by a Git alias/custom subcommand.** A plain
+   `sh -c` child, option-free `nice sh -c`, supported `timeout 5 sh -c`, or
+   `timeout 9 python3 -c` can decode an alias into `.git/config` or write a `git-p`
+   executable into PATH, followed by `git -C WT p`. Not every child/program marks
+   subsequent non-builtin Git subcommands as uncertain. The unsupported-wrapper
+   protection described above is narrower and does not establish general tracking of
+   filesystem effects. We deliberately do not taint aliases after *every* non-inert
+   program: that would also make ordinary sequences such as `npm test; git lg`
+   uncertain without evidence of a config change.
+3. **Exported Bash functions invoked by a new Bash process.** A function defined in
+   this command, exported with `export -f f`, and invoked with
+   `timeout -k 1 5 bash -c f` is not propagated into the analyzer's child state.
+   This limitation applies even when the function body is present in the tool text,
+   not only to functions inherited from a persistent terminal. Correct modeling would
+   need function export/import semantics; copying all functions into every child would
+   incorrectly treat unexported functions as inherited.
+4. **Dynamic Git subcommands inside `env -S` strings.** The split-string form is not
+   interpreted with env's splitting rules. In particular,
+   `env -S "git -C WT $(echo c3Rhc2g= | base64 -d) pop"` can escape both argv analysis
+   and the textual fallback. The fallback's dynamic-subcommand pattern requires a
+   character before the expansion marker; it is not a complete detector for a word
+   beginning with `$` after `git`/`git -C`. Direct ordinary Git argv analysis is a
+   separate path. This is a known parser/fallback coverage gap, not a claim that
+   split-string support could not be implemented.
+5. **Execute a generated script, including one named like a wrapper.** Decoding a
+   script to `R/nice`, making it executable and invoking `R/nice -n 5 true` does not
+   cause the analyzer to inspect its contents or verify that it is the system `nice`.
+   Earlier writes in the same command do not establish the executable's semantics.
+
+These boundaries preserve the existing bounded-analysis policy rather than adding
+broad refusals or partial new shell semantics. Do not rely on this plugin as a security
+boundary for arbitrary programs, encoded commands, mutable configuration or executable
+files. The fail-closed fallback is conditional on evidence it recognizes, not a promise
+that every unsupported form is refused.
 
 ## Tests
 
