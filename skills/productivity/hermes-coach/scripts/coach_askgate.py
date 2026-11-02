@@ -33,6 +33,16 @@ PT = ZoneInfo("America/Los_Angeles")
 SKIP = re.compile(
     r"^\s*(\[(Slack engagement|IMPORTANT:|OUT-OF-BAND|PEER MESSAGE from|Message from another Hermes session)|"
     r"(?:Go|Chose|✓ Done):|\{\s*\"(?:person|kind)\"|Without any other tools:|[✔✖✘⏸⏱🔄]\ufe0f?\s+\[)", re.I)
+# Defense in depth for old digests: generated user-role rows are not human corrections.
+GENERATED = re.compile(
+    r'^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe)\]|'
+    r'\{\s*"item"\s*:)|\(Roleplay test of our reply checker', re.I)
+def generated(text):
+    # Operator notes can carry a human's words even with an "another session"
+    # stamp. Without writer provenance, retain them for individual review.
+    return bool(GENERATED.search(text))
+
+
 OOB = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
 
 _V = r"(?:do|did|doing|check|checked|merge|nudge|investigate|investigating|figure|fix|run|handle|try|test|verify|find|look|ssh|read|open|search|review|update|click|sign|log)"
@@ -155,7 +165,7 @@ INTERACTIVE_SOURCES = {"desktop", "tui", "cli", "slack", "telegram", "discord", 
 
 def classify_fix(text):
     """The had_to_ask_fix sub-pattern of a cleaned user turn, or None. Ask-me corrections take precedence."""
-    if SKIP.match(text) or FIX_NEGATIVE.search(text) or classify(text):
+    if generated(text) or SKIP.match(text) or FIX_NEGATIVE.search(text) or classify(text):
         return None
     for name, rx in FIX_RX:
         if rx.search(text):
@@ -179,8 +189,10 @@ def clean(text):
 
 
 def classify(text):
-    if SKIP.match(text) or NEGATIVE.search(text):
+    if generated(text) or SKIP.match(text) or NEGATIVE.search(text):
         return None
+    # A complaint about the user's repeated requests is not the agent repeatedly asking.
+    text = re.sub(r"\b(?:i|we)\s+(?:had|have)\s+to\s+keep asking\b", "user repeated requests", text, flags=re.I)
     for name, rx in RX:
         if rx.search(text):
             return name
@@ -209,7 +221,7 @@ def collect(data, since_ts, until_ts):
         turns = d.get("user_turns") or []
         for i, u in enumerate(turns):
             t, text = u.get("t", 0), clean(u.get("text") or "")
-            if not (since_ts <= t < until_ts) or not text:
+            if not (since_ts <= t < until_ts) or not text or generated(text) or SKIP.match(text):
                 continue
             ws = week_start(t)
             scanned[ws] = scanned.get(ws, 0) + 1
@@ -485,10 +497,12 @@ def hand_to_bb_tuner(hits, path):
     return len(new), len(hits) - len(new)
 
 
-REVIEW_PROMPT = ("Review this week's ask-gate KPI. Fix requests (had_to_ask_fix): for each, check whether the self-heal "
-                 "lane filed it (a `selfheal:` card or Inbox proposal); if not, find why the detector missed it and fix "
-                 "the detector. Ask-me corrections: find the root cause and fix the ask-gate or the skill that should "
-                 "have prevented it.")
+REVIEW_PROMPT = ("Review this week's ask-gate KPI. First verify every hit's provenance and the preceding reply; "
+                 "generated notices, probes and quoted instructions are not human corrections. For fix requests, "
+                 "check exact self-heal filing/adoption and shadow/live evidence before calling an unfiled hit a "
+                 "detector miss. Replay unresolved cases, fix supported detector gaps and reuse existing owners. "
+                 "For genuine ask-me corrections, fix the ask-gate or skill that should have prevented them. "
+                 "Record evidence limits and account for every dropped or reclassified hit.")
 
 
 def deliver(hits, week, extra, rest, n_fix, n_bb, n_ask, run=subprocess.run):
