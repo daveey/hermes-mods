@@ -28,6 +28,16 @@ def wait_for(predicate, timeout=60):
     raise AssertionError('timed out waiting for isolated transport fixture')
 
 
+def submit_pty_text(master, output, text):
+    """Separate text from Enter after receiver progress, not sender wall time."""
+    start = len(output)
+    os.write(master, text)
+    wait_for(lambda: text in output[start:])
+    # The CLI measures native-paste debounce from buffer change, not os.write.
+    threading.Event().wait(.15)
+    os.write(master, b'\r')
+
+
 def child_main():
     import transport_child as fixture
 
@@ -141,6 +151,56 @@ def test_ws_reconnect_guarded_completion(tmp_path):
         frames.rpc('session.close', dict(session_id=snapshot['session_id']))
 
 
+def test_pty_submit_waits_for_receiver(monkeypatch):
+    """A stalled receiver must not get text and Enter in the same read."""
+    import pty
+    import tty
+    master, slave = pty.openpty()
+    tty.setraw(slave)
+    output = bytearray(b'/quit')  # stale output must not satisfy the barrier
+    received = []
+    done = threading.Event()
+    written = threading.Event()
+    real_write = os.write
+
+    def write(fd, data):
+        result = real_write(fd, data)
+        if fd == master and data == b'/quit':
+            written.set()
+        return result
+
+    monkeypatch.setattr(os, 'write', write)
+
+    def receiver():
+        assert written.wait(5)
+        # Longer than the old sender-only debounce: simulate a descheduled CLI.
+        done.wait(.3)
+        received.append(os.read(slave, 1024))
+        real_write(slave, b'/quit')
+        if select.select([slave], [], [], 5)[0]:
+            received.append(os.read(slave, 1024))
+
+    def reader():
+        while not done.is_set():
+            if select.select([master], [], [], .05)[0]:
+                output.extend(os.read(master, 1024))
+
+    threads = [threading.Thread(target=receiver), threading.Thread(target=reader)]
+    for thread in threads:
+        thread.start()
+    try:
+        submit_pty_text(master, output, b'/quit')
+        threads[0].join(6)
+        assert not threads[0].is_alive()
+        assert received == [b'/quit', b'\r']
+    finally:
+        done.set()
+        for thread in threads:
+            thread.join(6)
+        os.close(master)
+        os.close(slave)
+
+
 def test_cli_pty_ctrl_c(tmp_path):
     import pty
     home = tmp_path / 'home'
@@ -189,9 +249,7 @@ def test_cli_pty_ctrl_c(tmp_path):
                  or b'Operation interrupted:' in output)
         (home / 'provider-release').touch()
         wait_for(lambda: (home / 'provider.jsonl').exists())
-        os.write(master, b'/quit')
-        threading.Event().wait(.15)
-        os.write(master, b'\r')
+        submit_pty_text(master, output, b'/quit')
         wait_for(lambda: os.waitpid(pid, os.WNOHANG)[0] == pid)
         text = output.decode(errors='replace')
         assert TEXTS['abandoned'] not in text
@@ -205,6 +263,9 @@ def test_cli_pty_ctrl_c(tmp_path):
         assert sum(c['kind'] == 'primary' for c in calls) == 1
         assert not any(c['kind'] == 'auxiliary' and
                        c['value'].get('task') == 'coach_goal_disposition' for c in calls)
+    except AssertionError as exc:
+        # Collection fixtures remove the isolated home; keep the evidence in pytest's log.
+        raise AssertionError(f'{exc}\nPTY output: {bytes(output)!r}') from exc
     finally:
         done.set()
         try:
