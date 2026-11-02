@@ -498,6 +498,41 @@ def test_wrapper_options_are_not_silently_dropped(multi, template):
     assert (wt / "f.txt").read_text() == "stashed\n"
 
 
+# An external wrapper program (env, nice, nohup, stdbuf, sudo, timeout) runs its argv in a
+# child process: only that argv is uncertain, never the caller's cwd or variables. A
+# git-free agent command (`PY=...; env A=1 $PY ...; $PY - <<'EOF'`) was refused as an
+# unresolved `git stash pop` because the caller's state collapsed to unknown, so `$PY`
+# might have been git and, with HOME unknown, any git word an alias (2026-11-01).
+@pytest.mark.parametrize("template", [
+    "PY=/usr/bin/python3; env A=1 $PY -c 1; $PY - <<'EOF'\nprint(1)\nEOF",
+    "PY=/usr/bin/python3; env -u X $PY -c 1; $PY x.py",
+    "PY=/usr/bin/python3; nice -n 5 $PY -c 1; $PY x.py",
+    "T=/usr/bin/true; stdbuf -oL $T; $T x",
+    "T=/usr/bin/true; sudo -n $T; $T x",
+    "T=/usr/bin/true; /usr/bin/env A=1 $T; $T x",
+])
+def test_external_wrapper_keeps_caller_state(multi, template):
+    main, _wt = multi
+    assert not _blocked(template, main), template
+
+
+@pytest.mark.parametrize("template", [
+    # The wrapped argv itself stays uncertain.
+    "env A=1 git -C {wt} stash pop",
+    # The caller's state is still tracked after the wrapper.
+    "env A=1 true; cd {wt}; git stash pop",
+    "G=git; nice -n 5 true; $G -C {wt} stash pop",
+    # Config the wrapped child writes is shared state: a later alias call stays refused.
+    "env A=1 git config alias.p 'stash pop'; git -C {wt} p",
+    # Builtins and keywords run in the caller: its state stays unknown after them.
+    "command -p cd {wt}; git stash pop",
+    "time -p cd {wt}; git stash pop",
+])
+def test_external_wrapper_state_refusal_controls(multi, template):
+    main, wt = multi
+    _assert_real_restore(template.format(wt=wt), main, wt)
+
+
 def test_ansi_c_quote_cannot_hide_substitution(multi):
     main, wt = multi
     cmd = "echo $'it\\'s'\"$(git -C " + str(wt) + " stash pop)\"$'it\\'s'"

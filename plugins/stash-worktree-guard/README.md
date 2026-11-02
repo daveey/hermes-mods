@@ -49,7 +49,10 @@ This plugin:
   positional argv (`"$@"`) is not interpreted;
 - treats unsupported wrapper options/environment (`env -C`, `nice -n`, `stdbuf -oL`,
   `command -p`, `exec -a`) and `coproc` as uncertain, including absolute wrapper paths
-  and scalar wrapper names. Simple option-free wrappers remain supported. `timeout` is
+  and scalar wrapper names. Simple option-free wrappers remain supported. Only the wrapped
+  argv is uncertain after a wrapper *program* (`env`, `nice`, `nohup`, `stdbuf`, `sudo`,
+  `timeout`): it runs in a child process, so the caller's cwd and variables stay known. After
+  a builtin or keyword (`command`, `builtin`, `exec`, `time`, `coproc`) they become unknown. `timeout` is
   parsed exactly (`--foreground`, `--preserve-status`, `-v`, `-k`/`--kill-after`,
   `-s`/`--signal` in both spellings, then a numeric duration); any other shape is
   unsupported. `builtin` and `command` run the builtin that follows (`builtin cd X` changes
@@ -279,3 +282,13 @@ that runs it. `test_round6_restores_are_refused` reproduces each in bash; the ro
 allow controls now also keep `python -c`, `make "$TARGET"`, `gh pr create --body`, `sed`
 substitutions mentioning a restore, editor/pager settings and `git config alias.st
 status` allowed.
+
+A git-free agent command, `PY=…; env PYTHONDONTWRITEBYTECODE=1 … $PY x.py; $PY - <<'EOF'`, was
+refused as an unresolved `git stash pop`. Root: an unsupported wrapper collapsed the
+*caller's* whole state to unknown. The later `$PY` might then be git, and with `HOME`
+unknown any Git word might be an alias. A wrapper program runs its argv in a child process,
+so that collapse was never needed. Tests covered restores behind wrappers, not ordinary
+commands after them. `test_external_wrapper_keeps_caller_state` keeps those shapes allowed.
+`test_external_wrapper_state_refusal_controls` runs these in bash and checks they are still
+refused: the wrapped restore, state tracked after the wrapper, config written by the child,
+and builtins (`command -p cd`, `time -p cd`).

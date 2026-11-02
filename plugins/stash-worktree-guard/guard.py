@@ -36,6 +36,8 @@ STASH_SUBS = {
 }
 REFUSE_OPS = {"pop", "apply"}
 WRAPPERS = {"sudo", "env", "command", "exec", "time", "nice", "nohup", "stdbuf", "builtin"}
+# Wrappers that are programs, not shell builtins/keywords: the caller's state survives them.
+EXTERNAL_WRAPPERS = {"sudo", "env", "nice", "nohup", "stdbuf", "timeout"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 # Programs that run another argv (or a shell string) with option syntax the guard does not
 # model. Any argv suffix may be the command they run; xargs/parallel/find append words.
@@ -1394,6 +1396,11 @@ class _Analyzer:
             # Expanded words carry scalar evidence that the raw text may only hold split.
             self.fail_closed(" ".join(words + wrapper_words))
             self.shadow_argv(words, st, depth)
+            if os.path.basename(wrapper_words[0] or "") in EXTERNAL_WRAPPERS:
+                # A wrapper program runs its argv in a child process: only that argv is
+                # uncertain (analyzed above; config it writes sets config_alias there), never
+                # the caller's cwd, variables or functions.
+                return [st], [st]
             unknown = _unknown([st])
             return [unknown], [unknown]
         raw = words[len(lit) - len(kept):]
