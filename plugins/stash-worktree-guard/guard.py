@@ -22,6 +22,7 @@ environment, skips both paths.
 
 from __future__ import annotations
 
+# Running workers refresh this decision module before their next tool verdict.
 import os
 import re
 import shlex
