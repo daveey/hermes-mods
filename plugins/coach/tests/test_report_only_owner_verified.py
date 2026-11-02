@@ -145,6 +145,89 @@ def test_idle_owner_line_shows_status_and_stale_activity():
     assert "3d ago" in line, line
 
 
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+
+def _cross_task(now=None):
+    """cross_task action=read shape (state.db msg 608418, trimmed): runs/events nest INSIDE `task`, runs carry
+    outcome/summary and no timestamps, events carry an ISO `at`, task times are ISO strings. Ages are relative to
+    the call (observe reads the clock itself; a module-load NOW drifts under a long suite)."""
+    now = time.time() if now is None else now
+    return {"ok": True, "gateway": "hub-ec2", "board": "runners", "ref": f"@task:runners/{CARD}",
+            "task": {"id": CARD, "title": "K2 shared_lock rev2", "status": "ready", "assignee": "bb-tuner",
+                     "created_at": "2026-10-29T17:49:16.000Z", "started_at": "2026-10-29T17:49:23.000Z",
+                     "completed_at": None, "block_kind": "dependency", "body": "x" * 3000,
+                     "latest_summary": "Await linked fresh pinned split6 reviewer for PR2612, READY readback verified.",
+                     "parents": ["t_01a188c88da122d2"], "children": [], "link_tasks": [],
+                     "runs": [{"id": 571, "profile": "bb-tuner", "outcome": "blocked", "summary": "await split5b"},
+                              {"id": 576, "profile": "bb-tuner", "outcome": "reclaimed", "summary": "restart"},
+                              {"id": 577, "profile": "bb-tuner", "outcome": "blocked", "summary": "await split6"}],
+                     "comments": [{"author": "bb-tuner", "at": _iso(now - 3300), "body": "unit5b landed"}],
+                     "events": [{"kind": "worker_result", "at": _iso(now - 3360)},
+                                {"kind": "commented", "at": _iso(now - 2520)},
+                                {"kind": "promoted", "at": _iso(now - 2520)}]}}
+
+
+# agent-773e2f779b: a cross_task read of a ready-but-active card logged only `status=ready`, so report_only failed a
+# true "implementation is underway" reply. The OK line must carry its latest run and newest event like kanban_show's.
+def test_cross_task_real_format_shows_run_and_last_event():
+    now = 1793569920.0  # 2026-11-01T21:52Z, the reply's time; the newest event was 21:10Z
+    real = {**_cross_task(now)}
+    real["task"]["events"][-1]["at"] = "2026-11-01T21:10:25.000Z"
+    line = rules.owner_result_line("cross_task", {"action": "read", "target": f"@task:runners@hub-ec2/{CARD}"},
+                                   json.dumps(real), now=now)
+    assert "status=ready" in line and "run=blocked" in line, line
+    assert "last=promoted @ 2026-11-01T21:10Z (41m ago)" in line, line
+
+
+def test_observe_logs_cross_task_activity_direct_and_via_tool_call():
+    coach = rules.AgentCoach(None)
+    args = {"action": "read", "target": f"@task:runners@hub-ec2/{CARD}"}
+    coach.observe("s", "cross_task", args, json.dumps(_cross_task()))
+    # tool_call with one call stores the bare result; with a results wrapper the inner result is a JSON string
+    coach.observe("s", "tool_call", {"calls": [{"name": "cross_task", "arguments": args}]}, json.dumps(_cross_task()))
+    coach.observe("s", "tool_call", {"calls": [{"name": "cross_task", "arguments": args}]},
+                  json.dumps({"results": [{"name": "cross_task", "result": json.dumps(_cross_task())}]}))
+    ok = _ok_lines(coach.turn_context("s")[1])
+    assert len(ok) == 3, ok
+    for line in ok:
+        assert "status=ready" in line and "run=blocked" in line and "last=promoted" in line and "42m ago" in line, line
+        assert len(line) <= 220, line
+
+
+def test_run_without_status_shows_latest_summary():
+    res = _cross_task()
+    res["task"]["runs"] = []
+    line = rules.owner_result_line("cross_task", {"action": "read"}, json.dumps(res))
+    assert "summary=Await linked fresh pinned" in line and "last=promoted" in line, line
+
+
+def test_event_times_in_epoch_ms_and_iso_are_read():
+    assert rules._ts(1793569920000) == 1793569920
+    assert rules._ts("2026-11-01T21:10:25.000Z") == 1793567425
+    assert rules._ts("2026-11-01T21:10:25+00:00") == rules._ts("2026-11-01T21:10:25Z")
+    assert rules._ts("not a time") is None and rules._ts(None) is None
+
+
+# Detection guard: every owner-read tool has a fixture in its real result format, and each one's OK line shows the
+# newest event. Adding a tool to OWNER_READ_TOOLS without a fixture here fails, so a third format can't slip in unread.
+OWNER_READ_FIXTURES = {
+    "kanban_show": lambda: {**_show(), "worker_context": "..."},
+    "cross_task": _cross_task,
+}
+
+
+def test_every_owner_read_tool_has_a_real_format_fixture_showing_last_event():
+    assert set(rules.OWNER_READ_TOOLS) <= set(OWNER_READ_FIXTURES), (
+        f"add a real-format fixture for {set(rules.OWNER_READ_TOOLS) - set(OWNER_READ_FIXTURES)}")
+    for name in rules.OWNER_READ_TOOLS:
+        result = json.dumps(OWNER_READ_FIXTURES[name]())
+        for tool, args in ((name, {}), ("tool_call", {"calls": [{"name": name, "arguments": {}}]})):
+            line = rules.owner_result_line(tool, args, result)
+            assert line and "last=" in line and "run=" in line and "run=None" not in line, (tool, name, line)
+
+
 def test_unparseable_success_falls_back_to_result_head():
     coach = rules.AgentCoach(None)
     coach.observe("s", "terminal", {"command": f"hermes kanban show {CARD}"},

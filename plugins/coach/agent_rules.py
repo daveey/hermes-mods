@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -1268,12 +1269,19 @@ def _tasks_in(obj: Any, depth: int = 0) -> list:
         return [t for x in obj[:10] for t in _tasks_in(x, depth + 1)]
     if not isinstance(obj, dict):
         return []
+    # Result formats differ (agent-773e2f779b): kanban_show puts runs/events beside `task`, cross_task nests them
+    # inside it. Take the task's own lists when it has them, else the wrapper's.
     t = obj.get("task")
     if isinstance(t, dict) and t.get("status"):
-        return [(t, obj.get("runs") or [], obj.get("events") or [])]
+        return [(t, _own_or(t, obj, "runs"), _own_or(t, obj, "events"))]
     if str(obj.get("id") or "").startswith("t_") and obj.get("status"):
         return [(obj, obj.get("runs") or [], obj.get("events") or [])]
     return [x for v in obj.values() if isinstance(v, (dict, list, str)) for x in _tasks_in(v, depth + 1)]
+
+
+def _own_or(task: dict, outer: dict, key: str) -> list:
+    own = task.get(key)
+    return own if isinstance(own, list) and own else (outer.get(key) or [])
 
 
 def _ago(secs: float) -> str:
@@ -1285,23 +1293,53 @@ def _ago(secs: float) -> str:
 
 
 def _ts(v: Any) -> Optional[float]:
+    """Epoch seconds from epoch s/ms (number or numeric string) or an ISO-8601 string (`...Z` or with offset)."""
+    if v is None or isinstance(v, bool):
+        return None
     try:
         f = float(v)
     except (TypeError, ValueError):
-        return None
+        s = str(v).strip()
+        if not re.match(r"^\d{4}-\d\d-\d\d[T ]\d\d:\d\d", s):
+            return None
+        try:
+            d = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s)
+        except ValueError:
+            return None
+        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
     return f / 1000 if f > 1e12 else f
+
+
+# Field names per format: kanban_show runs carry `status` + epoch `started_at`, cross_task runs carry `outcome` and
+# no time; kanban_show events carry epoch `created_at`, cross_task events an ISO `at`.
+_RUN_STATE = ("status", "outcome")
+_RUN_TIME = ("started_at", "ended_at")
+_EVENT_TIME = ("created_at", "at")
+
+
+def _first(d: dict, keys: tuple) -> Any:
+    return next((d[k] for k in keys if d.get(k) not in (None, "")), None)
+
+
+def _first_ts(d: dict, keys: tuple) -> Optional[float]:
+    return next((t for t in (_ts(d.get(k)) for k in keys) if t), None)
 
 
 def _task_summary(task: dict, runs: list, events: list, now: float) -> str:
     parts = [f"task={task.get('id')}" if task.get("id") else "", f"status={task.get('status')}"]
     runs = [r for r in runs if isinstance(r, dict)]
+    state = None
     if runs:
-        last = max(runs, key=lambda r: (_ts(r.get("started_at")) or 0, r.get("id") or 0))
-        parts.append(f"run={last.get('status')}")
-    evs = [e for e in events if isinstance(e, dict) and _ts(e.get("created_at"))]
+        # newest by time when runs carry one, else by id (cross_task lists them oldest first, untimed)
+        last = max(enumerate(runs), key=lambda ir: (_first_ts(ir[1], _RUN_TIME) or 0, ir[1].get("id") or 0, ir[0]))[1]
+        state = _first(last, _RUN_STATE)
+        if state:
+            parts.append(f"run={state}")
+    if not state and task.get("latest_summary"):
+        parts.append("summary=" + " ".join(str(task["latest_summary"]).split())[:60])
+    evs = [(t, i, e) for i, e in enumerate(events) if isinstance(e, dict) for t in [_first_ts(e, _EVENT_TIME)] if t]
     if evs:
-        e = max(evs, key=lambda e: _ts(e.get("created_at")) or 0)
-        at = _ts(e.get("created_at")) or 0
+        at, _, e = max(evs, key=lambda tie: tie[:2])  # same-second events: the later-listed one is newer
         parts.append(f"last={e.get('kind')} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(at))} ({_ago(now - at)} ago)")
     return " ".join(p for p in parts if p)
 
