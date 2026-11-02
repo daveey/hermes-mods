@@ -1,4 +1,5 @@
 """Native producer + actual consumer + canonical latest row at the public gate."""
+from contextlib import closing, contextmanager, ExitStack
 import importlib.util
 import shlex
 import socket
@@ -76,17 +77,75 @@ def test_latest_canonical_scope_must_match(owned, tmp_path, sql):
         gd.validate_disposition(owned[0], owned[1], session_id="origin")
 
 
-def test_public_gate_accepts_then_keeps_existing_hold_on_stopped_consumer(owned, tmp_path, monkeypatch):
+@contextmanager
+def unchanged_databases(root):
+    """Observe committed state, including WAL, without pinning an old read snapshot.
+
+    Main-file bytes are not a no-write oracle: a concurrent SessionDB.close()
+    may checkpoint setup's WAL frames without committing any new data. Keep each
+    observer open so data_version also detects a write followed by its reversal.
+    """
+    def snapshot(conn):
+        return conn.execute("PRAGMA data_version").fetchone()[0], tuple(conn.iterdump())
+
+    with ExitStack() as stack:
+        observed = {}
+        for path in root.glob("*.db"):
+            conn = stack.enter_context(closing(sqlite3.connect(path.as_uri() + "?mode=rw", uri=True)))
+            conn.execute("PRAGMA query_only=ON")
+            observed[path] = conn, snapshot(conn)
+        yield
+        assert set(root.glob("*.db")) == set(observed), "database set changed"
+        for path, (conn, before) in observed.items():
+            assert snapshot(conn) == before, f"database changed: {path.name}"
+
+
+@pytest.mark.parametrize("restore", [False, True], ids=["write", "write-and-revert"])
+def test_unchanged_databases_detects_committed_writes(tmp_path, restore):
+    with closing(sqlite3.connect(tmp_path / "fixture.db")) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE example(value TEXT)")
+        writer.execute("INSERT INTO example VALUES ('before')")
+        writer.commit()
+        with pytest.raises(AssertionError, match="database changed: fixture.db"):
+            with unchanged_databases(tmp_path):
+                writer.execute("UPDATE example SET value='after'")
+                writer.commit()
+                if restore:
+                    writer.execute("UPDATE example SET value='before'")
+                    writer.commit()
+
+
+@pytest.fixture(params=[False, True], ids=["settled", "pending-wal"])
+def checkpoint_during_gate(request, owned, tmp_path):
+    # A real poller can hold the last writable handle across fixture setup.
+    # Leave committed frames in WAL, then checkpoint inside the gate window.
+    with closing(sqlite3.connect(tmp_path / "state.db")) as writer:
+        if request.param:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("UPDATE sessions SET title='checkpoint fixture' WHERE id='origin'")
+            writer.commit()
+
+        def checkpoint():
+            if request.param:
+                assert writer.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()[0] == 0
+        yield checkpoint
+
+
+def test_public_gate_accepts_then_keeps_existing_hold_on_stopped_consumer(
+        owned, tmp_path, monkeypatch, checkpoint_during_gate):
     events = []
     monkeypatch.setattr(gd, "settings", lambda: {"mode": "enforce"})
-    monkeypatch.setattr(gd, "aux_judge", lambda *a: owned[0])
+    def judge(*args):
+        checkpoint_during_gate()
+        return owned[0]
+    monkeypatch.setattr(gd, "aux_judge", judge)
     gate = gd.build_gate(SimpleNamespace(log=events.append))
-    before = {p: p.read_bytes() for p in tmp_path.glob("*.db")}
     args = dict(session_id="origin", final_response="The native process is continuing.",
                 turn_messages=[dict(role="user", content=REQUEST)])
-    assert gate(**args) is None
-    assert events[-1]["disposition"] == "owned_continuing"
-    assert all(p.read_bytes() == content for p, content in before.items())
+    with unchanged_databases(tmp_path):
+        assert gate(**args) is None
+        assert events[-1]["disposition"] == "owned_continuing"
     owned[3][4].set()
     with pytest.raises(ValueError):
         gate(**args, attempt=1)
