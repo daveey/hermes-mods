@@ -728,14 +728,22 @@ def _link_existing(conn, tid: str, ref: str) -> bool:
 
 
 def relink_open_cards() -> list[str]:
-    """Backfill: link every open card this watchdog filed to the chat it closes out. Leaves other cards alone."""
+    """Backfill: link each card this watchdog filed to the chat it closes out, when the card is still open or (done)
+    still has an open card its worker filed that resolves to no chat. Leaves every other card alone."""
     from hermes_cli.kanban_db_connect import connect_closing
     linked: list[str] = []
     with connect_closing() as conn:
-        rows = conn.execute("SELECT id, idempotency_key FROM tasks WHERE created_by='chat-closeout' "
-                            "AND status NOT IN ('done','archived') AND idempotency_key IS NOT NULL").fetchall()
+        rows = conn.execute(
+            "SELECT p.id, p.idempotency_key FROM tasks p WHERE p.created_by='chat-closeout' "
+            "AND p.idempotency_key IS NOT NULL AND (p.status NOT IN ('done','archived') OR EXISTS ("
+            "  SELECT 1 FROM task_events e JOIN tasks c ON c.id=e.task_id WHERE e.kind='created' "
+            "  AND json_valid(e.payload) AND json_extract(e.payload,'$.creator_task_id')=p.id "
+            "  AND c.status NOT IN ('done','archived') AND NOT EXISTS (SELECT 1 FROM task_events r "
+            "  WHERE r.task_id=c.id AND r.kind='creator_chats_resolved')))").fetchall()
         for tid, key in rows:
-            if not _WATCHDOG_KEY.match(key or ""):
+            # A resolved-and-refiled card's key carries ':resolved:<id>'; the incident is still its prefix.
+            key = (key or "").split(":resolved:")[0]
+            if not _WATCHDOG_KEY.match(key):
                 continue
             ref = _origin_ref(key)
             if ref and _link_existing(conn, tid, ref):

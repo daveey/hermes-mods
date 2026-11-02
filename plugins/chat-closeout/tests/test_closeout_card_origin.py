@@ -123,14 +123,21 @@ def test_relink_backfills_an_open_legacy_card_and_its_unresolved_child(board):
         done = kb.create_task(conn, title='chat-closeout: old', assignee='default', created_by='chat-closeout',
                               idempotency_key='chat-closeout:unseen:chat_done:1')
         kb.complete_task(conn, done, summary='x')
+        # A done closeout card (the t_01a199c830931fc5 case) whose worker's card is still open and unresolved.
+        done_parent = kb.create_task(conn, title='chat-closeout: done w/ child', assignee='default',
+                                     created_by='chat-closeout', idempotency_key='chat-closeout:unseen:chat_dp:2')
+        orphan = kb.create_task(conn, title='orphan', assignee='default', created_by='default',
+                                creator_task_id=done_parent)
+        kb.complete_task(conn, done_parent, summary='x')
         other = kb.create_task(conn, title='unrelated', assignee='default', created_by='default')
         before = conn.execute('SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?', (tid,)).fetchone()[0]
-    assert plugin.relink_open_cards() == [tid]
+    assert sorted(plugin.relink_open_cards()) == sorted([tid, done_parent])
     assert plugin.relink_open_cards() == []  # idempotent
     with connect_closing() as conn:
         sub, latest = _assert_owned_by(conn, tid, 'chat_old')
         assert sub[0] >= before  # cursor at the card's latest event when linked: no replay of earlier history
         assert (GW, 'default', 'chat_old') in _links(conn, child)
+        assert (GW, 'default', 'chat_dp') in _links(conn, orphan)
         assert not _links(conn, done) and not _links(conn, other)
 
 
