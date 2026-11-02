@@ -144,6 +144,41 @@ def test_pathname_fix_preserves_remapping_and_git_refusals(multi, cmd):
     assert guard.refuse_reason(cmd, str(multi[1])) is not None
 
 
+# Non-POSIX bash looks functions up by name even when the name contains a slash; only
+# alias and hash remapping are skipped for pathnames.
+SLASH_FUNCTION_RESTORES = [
+    "/usr/bin/python3() {{ git -C {wt} stash pop; }}; /usr/bin/python3",
+    "function /usr/bin/python3 {{ git -C {wt} stash pop; }}; /usr/bin/python3 - x",
+    "./x() {{ git -C {wt} stash pop; }}; ./x",
+    "function a/b() {{ git -C {wt} stash pop; }}; a/b",
+    "F=/usr/bin/python3; /usr/bin/python3() {{ git -C {wt} stash pop; }}; \"$F\"",
+    # `unset -v` reports an invalid identifier and leaves the function defined.
+    "/usr/bin/python3() {{ git -C {wt} stash pop; }}; unset -v /usr/bin/python3; /usr/bin/python3",
+]
+
+
+@pytest.mark.parametrize("template", SLASH_FUNCTION_RESTORES)
+def test_slash_named_functions_are_analyzed(multi, template):
+    main, wt = multi
+    assert guard.refuse_reason(template.format(wt=wt), str(wt)) is not None
+    _assert_real_restore(template.format(wt=wt), main, wt)
+
+
+def test_slash_named_function_controls(multi):
+    main, wt = multi
+    for cmd in (
+        f"/usr/bin/python3() {{ git -C {wt} stash list; }}; /usr/bin/python3",
+        f"/usr/bin/python3() {{ git -C {main} stash pop; }}; /usr/bin/python3",
+        f"/usr/bin/python3() {{ git -C {wt} stash pop; }}; command /usr/bin/python3 -c pass",
+        f"/usr/bin/python3() {{ git -C {wt} stash pop; }}; unset -f /usr/bin/python3; "
+        "/usr/bin/python3 -c pass",
+        f"./x() {{ git -C {wt} stash pop; }}; unset ./x; ./x",
+        # The hash table is never consulted for a pathname: bash reports ./g not found.
+        f"hash -p /usr/bin/git ./g; ./g -C {wt} stash pop",
+    ):
+        assert not _blocked(cmd, wt), cmd
+
+
 @pytest.fixture
 def multi(tmp_path, monkeypatch):
     """Main checkout on ``main`` plus a linked worktree on ``other``. A stash sits on ``main``."""

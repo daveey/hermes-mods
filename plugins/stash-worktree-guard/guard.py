@@ -1476,8 +1476,11 @@ class _Analyzer:
         # Bash looks a function up by the expanded command name before builtins and PATH
         # (non-POSIX mode: even `command`/`exec`/`env` can be shadowed). Wrapper stripping
         # comes only after that; a wrapped name (`command git`, `env git`) bypasses functions.
+        # A defined function runs even when its (non-POSIX) name contains a slash
+        # (`/usr/bin/python3() {...}`); only the hash table is skipped for pathnames.
         first = _expand_word(words[0], st.vars)
-        if first is not None and "/" not in first and first in st.funcs:
+        if first is not None and first in st.funcs and (
+                "/" not in first or st.funcs[first][0] != "hashed"):
             if st.funcs[first][0] == "hashed":
                 # `hash -p PATH NAME`: NAME runs PATH, unless the hash table was cleared
                 # (`hash -r`, PATH=..., set +h). Analyze both readings; keep every refusal.
@@ -1573,11 +1576,19 @@ class _Analyzer:
             return self.chdir(cmd, raw, lit, st)
         if cmd == "unset":
             new = st.copy()
+            opts = set()
+            for word in lit[1:]:
+                if word is None or not word.startswith("-") or word == "--":
+                    break
+                opts |= set(word[1:])
             for word in lit[1:]:
                 if _NAME.match(word):
                     new.vars[word] = None
                     if new.funcs.get(word, ("hashed",))[0] != "hashed":
                         new.funcs.pop(word, None)  # unset does not clear the hash table
+                elif (word and "/" in word and opts <= {"f"}
+                      and new.funcs.get(word, ("hashed",))[0] != "hashed"):
+                    new.funcs.pop(word, None)  # `unset [-f] /name` removes a slash-named function
             return [new], [new]
         if cmd in DECLARE:
             return self.declare(cmd, raw, lit, st)
