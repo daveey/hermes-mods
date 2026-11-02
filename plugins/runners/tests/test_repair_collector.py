@@ -75,11 +75,12 @@ def test_diagnosis_flag_allowed_but_mutation_refused():
     cfg['features']['management_operations'] = True
     _readonly(cfg)
     cfg['features']['management_operations'] = False
-    for flag in ('dispatch', 'workspace_jobs'):
-        cfg['features'][flag] = True
-        with pytest.raises(RuntimeError, match='observe_only_required'):
-            _readonly(cfg)
-        cfg['features'][flag] = False
+    # Dispatch belongs to the gateway jobs domain, not the observer either.
+    cfg['features']['dispatch'] = True
+    _readonly(cfg)
+    cfg['features']['workspace_jobs'] = True
+    with pytest.raises(RuntimeError, match='observe_only_required'):
+        _readonly(cfg)
 
 
 def test_status_adapter_uses_canonical_owner_db(monkeypatch, tmp_path, core_path):
