@@ -79,9 +79,17 @@ def card_key(card: dict[str, Any]) -> str:
     return f"{card.get('board') or 'default'}/{card['id']}"
 
 
-def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+# What settlement reads (is_settled, reconcile_done, the close-out key): a light read returns only these.
+SETTLE_FIELDS = ("id", "status", "block_kind", "completed_at", "board")
+
+
+def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = False) -> dict[str, dict[str, Any]]:
     """``{id: {id, status, block_kind, title, summary, completed_at, human_request, blocked_at, board}}`` for the ids
-    found on any board. ``blocked_at`` is the newest ``blocked`` event (None when the board keeps no events)."""
+    found on any board. ``blocked_at`` is the newest ``blocked`` event (None when the board keeps no events).
+
+    ``light`` (the sidebar's waiting pass, which only decides settlement) returns just ``SETTLE_FIELDS`` and skips
+    the per-card event/run subqueries and the links read. It finds and refuses exactly what the full read does: the
+    full statement is still compiled (so a board the full read can't query fails the same way), just not run."""
     want = sorted({str(i) for i in ids if i})
     found: dict[str, dict[str, Any]] = {}
     if not want:
@@ -93,48 +101,122 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dic
                        if '/' not in i or (i.count('/') == 1 and i.split('/')[0] == board)})
         if not left:
             continue
-        try:
-            conn = ro_connect(Path(path))
-        except sqlite3.Error:
+        rows, exc = _board_rows(Path(path), left, light)
+        for row in rows:
+            card = {k: v for k, v in row.items() if k != 'parents'}
+            card['board'] = board
+            if not light:
+                card['parents'] = list(row['parents'])
+            for key in (row['id'], card_key(card)):
+                if key in want:
+                    if key in found:
+                        ambiguous.add(key)
+                    found[key] = card
+        if exc is not None:
             ambiguous.update(i for i in want if '/' not in i)
-            continue
+            logger.debug("chat-closeout: card read failed on %s: %s", path, exc)
+    return {key: card for key, card in found.items() if key not in ambiguous}
+
+
+# Board reads are reused while the board's files are byte-for-byte unchanged (see _board_sig): {(path, light):
+# (signature, ids, rows)}. The sidebar's waiting pass and the waker read the same boards every few seconds, and
+# most boards sit unchanged between them.
+_board_cache: dict[tuple[str, bool], tuple[tuple, tuple, list]] = {}
+_board_cache_lock = threading.Lock()
+
+
+def _board_sig(path: Path) -> Optional[tuple]:
+    """A signature that changes with every committed write to an SQLite db: the db file's and its -wal's identity,
+    size and mtime, plus the db header's file change counter (rollback journal mode bumps it on every commit) and the
+    WAL header (a WAL reset writes new salts, so a restarted -wal of the old size still differs). None when the db
+    can't be stat'ed (no reuse)."""
+    out = []
+    for name, head in ((str(path), (24, 4)), (str(path) + "-wal", (0, 32))):
         try:
-            cols = _cols(conn, "tasks")
-            bk = "t.block_kind" if "block_kind" in cols else "NULL"
-            comp = "t.completed_at" if "completed_at" in cols else "NULL"
-            res = "t.result" if "result" in cols else "NULL"
-            hr = "t.human_request" if "human_request" in cols else "NULL"
-            has_events = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_events'").fetchone()
-            # When the current block was filed: its age goes into every relayed ask (self-heal agent-792a49aa96).
-            blk = ("(SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id AND e.kind = 'blocked')"
-                   if has_events else "NULL")
-            has_runs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone()
-            summary = (f"COALESCE((SELECT r.summary FROM task_runs r WHERE r.task_id = t.id AND r.summary IS NOT NULL "
-                       f"AND r.summary != '' ORDER BY r.id DESC LIMIT 1), {res})") if has_runs else res
-            ph = ",".join("?" for _ in left)
+            fd = os.open(name, os.O_RDONLY)
+        except FileNotFoundError:
+            if name == str(path):
+                return None
+            out.append(None)
+            continue
+        except OSError:
+            return None
+        try:
+            st = os.fstat(fd)
+            if name != str(path) and st.st_size == 0:
+                out.append(None)  # an empty -wal holds no frames: the same data as no -wal
+                continue
+            out.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                        os.pread(fd, head[1], head[0])))
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+    return tuple(out)
+
+
+def _board_rows(path: Path, left: list[str], light: bool) -> tuple[list[dict[str, Any]], Optional[Exception]]:
+    """``(rows, error)`` of one board for ``left`` (bare ids): rows read before any error, as the per-row loop
+    stored them. Reused from the last read of this board while its signature is unchanged; errors are not cached."""
+    sig = _board_sig(path)
+    ck = (str(path), light)
+    with _board_cache_lock:
+        hit = _board_cache.get(ck)
+    if sig is not None and hit is not None and hit[0] == sig and hit[1] == tuple(left):
+        return hit[2], None
+    rows: list[dict[str, Any]] = []
+    try:
+        conn = ro_connect(path)
+    except sqlite3.Error as exc:
+        return rows, exc
+    try:
+        cols = _cols(conn, "tasks")
+        bk = "t.block_kind" if "block_kind" in cols else "NULL"
+        comp = "t.completed_at" if "completed_at" in cols else "NULL"
+        res = "t.result" if "result" in cols else "NULL"
+        hr = "t.human_request" if "human_request" in cols else "NULL"
+        has_events = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_events'").fetchone()
+        # When the current block was filed: its age goes into every relayed ask (self-heal agent-792a49aa96).
+        blk = ("(SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id AND e.kind = 'blocked')"
+               if has_events else "NULL")
+        has_runs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone()
+        summary = (f"COALESCE((SELECT r.summary FROM task_runs r WHERE r.task_id = t.id AND r.summary IS NOT NULL "
+                   f"AND r.summary != '' ORDER BY r.id DESC LIMIT 1), {res})") if has_runs else res
+        ph = ",".join("?" for _ in left)
+        full = (f"SELECT t.id, t.status, t.title, {bk} AS block_kind, {comp} AS completed_at, "
+                f"{summary} AS summary, {hr} AS human_request, {blk} AS blocked_at "
+                "FROM tasks t WHERE t.id IN ({ph})")
+        links = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_links'").fetchone()
+        if light:
+            # Compile only, with one id (schema errors don't depend on the list): the full read's failures.
+            conn.execute("EXPLAIN " + full.format(ph="?"), left[:1]).fetchone()
+            if links:
+                conn.execute("EXPLAIN SELECT parent_id, child_id FROM task_links WHERE child_id IN (?) "
+                             "ORDER BY parent_id", left[:1]).fetchone()
+            for r in conn.execute(f"SELECT t.id, t.status, {bk} AS block_kind, {comp} AS completed_at "
+                                  f"FROM tasks t WHERE t.id IN ({ph})", left):
+                rows.append(dict(r))
+        else:
             # Dependency edges: the ask relay says "waits behind it" only for a card that lists the ask card as a
             # parent (self-heal agent-31a66d274a). No links table = no known edges.
             parents: dict[str, list[str]] = {}
-            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_links'").fetchone():
+            if links:
                 for pr in conn.execute(f"SELECT parent_id, child_id FROM task_links WHERE child_id IN ({ph}) "
                                        "ORDER BY parent_id", left):
                     parents.setdefault(pr[1], []).append(pr[0])
-            for r in conn.execute(f"SELECT t.id, t.status, t.title, {bk} AS block_kind, {comp} AS completed_at, "
-                                  f"{summary} AS summary, {hr} AS human_request, {blk} AS blocked_at "
-                                  f"FROM tasks t WHERE t.id IN ({ph})", left):
-                card = {**dict(r), 'board': board, 'parents': parents.get(r['id'], [])}
-                for key in (r['id'], card_key(card)):
-                    if key in want:
-                        if key in found:
-                            ambiguous.add(key)
-                        found[key] = card
-        except sqlite3.Error as exc:
-            ambiguous.update(i for i in want if '/' not in i)
-            logger.debug("chat-closeout: card read failed on %s: %s", path, exc)
-        finally:
-            conn.close()
-    return {key: card for key, card in found.items() if key not in ambiguous}
+            for r in conn.execute(full.format(ph=ph), left):
+                rows.append({**dict(r), 'parents': tuple(parents.get(r['id'], []))})
+    except sqlite3.Error as exc:
+        with _board_cache_lock:
+            _board_cache.pop(ck, None)
+        return rows, exc
+    finally:
+        conn.close()
+    if sig is not None and sig == _board_sig(path):  # unchanged while we read: the rows belong to this signature
+        with _board_cache_lock:
+            _board_cache[ck] = (sig, tuple(left), rows)
+    return rows, None
 
 
 def is_settled(card: Optional[dict[str, Any]]) -> bool:
@@ -309,18 +391,29 @@ def pending_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Option
     return key if key and key != row.get("done_sig") else None
 
 
-def _notice_matches(text: str, tid: str) -> bool:
-    """Legacy notices are local-board scoped. Never strip a remote owner to a bare id."""
-    match = re.match(r"^\s*✔\s*\[([^\]]+)\]\s+@\S+\s+Kanban\s+(\S+)\s+(done|archived)(?:\s|$)", text)
-    if not match:
-        return False
-    board, named, _ = match.groups()
+_NOTICE_DONE_RE = re.compile(r"^\s*✔\s*\[([^\]]+)\]\s+@\S+\s+Kanban\s+(\S+)\s+(done|archived)(?:\s|$)")
+
+
+def _notice_of(text: str) -> Optional[tuple[str, str]]:
+    """``(board, named card)`` of a final-notice user message, else None."""
+    match = _NOTICE_DONE_RE.match(text)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def _notice_target(tid: str) -> Optional[tuple[str, str]]:
+    """The ``(board, named)`` a notice must carry to be ``tid``'s; None when no notice can name it."""
     parts = str(tid).split('/')
     if len(parts) == 4:
-        return named == tid and board == parts[2]
+        return parts[2], str(tid)
     if len(parts) == 2:
-        return board == parts[0] and named == parts[1]
-    return len(parts) == 1 and board == 'default' and named == tid
+        return parts[0], parts[1]
+    return ('default', str(tid)) if len(parts) == 1 else None
+
+
+def _notice_matches(text: str, tid: str) -> bool:
+    """Legacy notices are local-board scoped. Never strip a remote owner to a bare id."""
+    found = _notice_of(text)
+    return found is not None and found == _notice_target(tid)
 
 
 def reconcile_done(row: dict[str, Any], cards: dict[str, dict[str, Any]],
@@ -375,40 +468,83 @@ def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: f
     ids = [i for i in dict.fromkeys(ids) if i]
     if not ids or not tid:
         return False
-    for path in state_dbs:
-        try:
-            conn = pool.get(Path(path)) if pool is not None else ro_connect(Path(path))
-        except sqlite3.Error:
-            continue
+    return any(AckIndex(path, ids).proves(tid, since, pool) for path in state_dbs)
+
+
+_ACK_COLS = {'display_kind', 'finish_reason', 'tool_calls', 'active'}
+
+
+class AckIndex:
+    """One lineage's answered final notices in one state.db, from ``lo`` on: ``{(board, named card): newest
+    answered notice time}``. ``ack_proven(tid, since)`` is "some notice naming tid at or after ``since`` was
+    followed, before the next user turn, by a successful final assistant reply after it"; that only depends on the
+    transcript suffix from ``since``, so one index answers every card of the lineage. A lower ``since`` reads just
+    the missing older slice and prepends it; nothing is read twice. Tool rows can never pair, so they are skipped.
+
+    State across a prepend: ``head_max`` is the newest qualifying reply before the first user row of what is
+    already indexed; any such reply answers the trailing notice of an older slice."""
+
+    def __init__(self, path: Path, ids: list[str]):
+        self.path, self.ids = Path(path), list(ids)
+        self.lo: Optional[float] = None
+        self.best: dict[tuple[str, str], float] = {}
+        self.head_max = float("-inf")
+        self.usable = True
+
+    def _extend(self, since: float, pool: Optional[ReadPool]) -> None:
+        conn = pool.get(self.path) if pool is not None else ro_connect(self.path)
         failed = False
         try:
-            required = {'display_kind', 'finish_reason', 'tool_calls', 'active'}
-            if not required.issubset(_cols(conn, 'messages')):
-                continue
-            ph = ",".join("?" for _ in ids)
+            if not _ACK_COLS.issubset(_cols(conn, 'messages')):
+                self.usable = False
+                return
+            ph = ",".join("?" for _ in self.ids)
+            upper = "AND timestamp < ? " if self.lo is not None else ""
+            args = (*self.ids, since) + ((self.lo,) if self.lo is not None else ())
             rows = conn.execute(f"SELECT role, content, timestamp, display_kind, finish_reason, tool_calls "
                                 f"FROM messages WHERE session_id IN ({ph}) AND active=1 "
-                                f"AND timestamp >= ? ORDER BY timestamp", (*ids, float(since))).fetchall()
-            notice_at = None
-            for r in rows:
-                text = str(r["content"] or "")
-                if r['role'] == 'user':
-                    # A different user turn breaks the causal notice/reply pair.
-                    notice_at = float(r['timestamp']) if _notice_matches(text, tid) else None
-                elif (notice_at is not None and r['role'] == 'assistant' and text.strip()
-                      and float(r['timestamp']) > notice_at
-                      and r['display_kind'] in (None, '', 'final')
-                      and r['finish_reason'] in ('stop', 'end_turn')
-                      and r['tool_calls'] in (None, '', '[]', 'null')):
-                    return True
+                                f"AND role IN ('user', 'assistant') "
+                                f"AND timestamp >= ? {upper}ORDER BY timestamp", args).fetchall()
         except sqlite3.Error:
             failed = True
+            raise
         finally:
             if pool is None:
                 conn.close()
             elif failed:
-                pool.drop(Path(path))
-    return False
+                pool.drop(self.path)
+        pending: Optional[tuple[float, Optional[tuple[str, str]]]] = None  # newest user row: (at, notice key)
+        head_max, seen_user, best = float("-inf"), False, self.best
+        for r in rows:
+            at = float(r[2])
+            if r[0] == 'user':
+                # A different user turn breaks the causal notice/reply pair.
+                pending, seen_user = (at, _notice_of(str(r[1] or ""))), True
+            elif (str(r[1] or "").strip() and r[3] in (None, '', 'final') and r[4] in ('stop', 'end_turn')
+                  and r[5] in (None, '', '[]', 'null')):
+                if pending is None:
+                    head_max = max(head_max, at)
+                elif pending[1] is not None and at > pending[0] and best.get(pending[1], float("-inf")) < pending[0]:
+                    best[pending[1]] = pending[0]
+        if pending is not None and pending[1] is not None and self.head_max > pending[0] \
+                and best.get(pending[1], float("-inf")) < pending[0]:
+            best[pending[1]] = pending[0]  # the slice's last notice, answered by the first reply of the newer rows
+        self.head_max = head_max if seen_user else max(head_max, self.head_max)
+        self.lo = since
+
+    def proves(self, tid: str, since: float, pool: Optional[ReadPool] = None) -> bool:
+        since = float(since)
+        if not self.usable:
+            return False
+        if self.lo is None or since < self.lo:
+            try:
+                self._extend(since, pool)
+            except sqlite3.Error:
+                return False  # unreadable now; a later call reads it again
+            if not self.usable:
+                return False
+        target = _notice_target(tid)
+        return target is not None and self.best.get(target, float("-inf")) >= since
 
 
 # ---- the ledger ------------------------------------------------------------------------------------------------
@@ -854,13 +990,14 @@ def notice_text(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> str:
 
 
 # ---- state.db: when did the user last type ---------------------------------------------------------------------
-def last_user_at(state_dbs: Iterable[Path], ids: Iterable[str]) -> float:
-    """Newest real user message (not a kanban/close-out notice or synthetic row) over the given session ids."""
+def last_user_at(state_dbs: Iterable[Path], ids: Iterable[str], pool: Optional[ReadPool] = None) -> float:
+    """Newest real user message (not a kanban/close-out notice or synthetic row) over the given session ids.
+    ``pool`` (one pass's connections) is reused and left open."""
     ids = [i for i in dict.fromkeys(ids) if i]
     best = 0.0
     for path in state_dbs:
         try:
-            conn = ro_connect(Path(path))
+            conn = pool.get(Path(path)) if pool is not None else ro_connect(Path(path))
         except sqlite3.Error:
             continue
         try:
@@ -873,9 +1010,11 @@ def last_user_at(state_dbs: Iterable[Path], ids: Iterable[str]) -> float:
                 best = max(best, float(r["timestamp"] or 0))
                 break
         except sqlite3.Error:
-            pass
+            if pool is not None:
+                pool.drop(Path(path))
         finally:
-            conn.close()
+            if pool is None:
+                conn.close()
     return best
 
 

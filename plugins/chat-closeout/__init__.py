@@ -111,8 +111,10 @@ def remote_cards() -> list[dict]:
     return [card for card in ksa._remote_links() if card.get('via') != 'origin'] + rows
 
 
-def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict]]] = None) -> dict:
-    cards = core.read_cards(board_paths(), ids)
+def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict]]] = None,
+               light: bool = False) -> dict:
+    """Local and remote cards by ledger key. ``light``: local cards carry only ``core.SETTLE_FIELDS``."""
+    cards = core.read_cards(board_paths(), ids, light=light)
     try:
         remote = (remote_inventory or remote_cards)()
     except Exception:
@@ -121,9 +123,16 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
         logger.debug('chat-closeout: origin projection unavailable', exc_info=True)
         return {key: card for key, card in cards.items() if '/' in key}
     want = set(ids)
+    # Every key shape ends in the card id except a legacy remote row's stored ``key`` (then card_key IS that key):
+    # only cards that could hit ``want`` pay for card_key (the inventory holds thousands of rows; a pass wants a
+    # few hundred ids).
+    tails = {str(i).rsplit('/', 1)[-1] for i in want}
     for card in remote:
+        cid = str(card['id'])
+        cards.pop(cid, None)  # ambiguous historical bare-ID ledger
+        if cid not in tails and card.get('key') not in want:
+            continue
         key = core.card_key(card)
-        cards.pop(str(card['id']), None)  # ambiguous historical bare-ID ledger
         if key in want:
             previous = cards.get(key)
             # Several origin bindings can name one owner; no unsafe first match.
@@ -132,10 +141,10 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
     return cards
 
 
-def _pass_reader() -> Callable[[list[str]], dict]:
+def _pass_reader(light: bool = False) -> Callable[[list[str]], dict]:
     """``read_cards`` for one pass over the ledger: the remote inventory (a full hub-replica projection) and the
     local boards are read once and reused for every row, not once per pending row. A failed read fails every row
-    the same way."""
+    the same way. ``light`` for a pass that only decides settlement (the sidebar's waiting source)."""
     memo: list[tuple[Optional[list[dict]], Optional[BaseException]]] = []
 
     def inventory() -> list[dict]:
@@ -162,9 +171,9 @@ def _pass_reader() -> Callable[[list[str]], dict]:
                 union["ids"] = set()
         want = set(ids)
         if not want or not want <= union["ids"]:
-            return read_cards(ids, remote_inventory=inventory)
+            return read_cards(ids, remote_inventory=inventory, light=light)
         if "cards" not in union:
-            union["cards"] = read_cards(sorted(union["ids"]), remote_inventory=inventory)
+            union["cards"] = read_cards(sorted(union["ids"]), remote_inventory=inventory, light=light)
         return {key: card for key, card in union["cards"].items() if key in want}
 
     return read
@@ -248,14 +257,27 @@ def subscribed_open_cards(session_id: str, db_paths: Optional[list[Path]] = None
 
 
 def session_proof(sid: str, tid: str, card: dict) -> bool:
-    """Transcript evidence that a finished card's final notice was delivered to the chat and answered."""
+    """Transcript evidence that a finished card's final notice was delivered to the chat and answered. Inside a
+    ``_proof_pass`` every card of one lineage is proven from one ``core.AckIndex`` per state.db (one transcript
+    read per lineage, not one per card)."""
     try:
         at = card.get("completed_at")
         if at is None:
             return False
         res = getattr(_pass_local, "res", None)
-        return core.ack_proven(state_dbs(), _lineage(sid), tid, float(at),
-                               pool=res["pool"] if res is not None else None)
+        if res is None:
+            return core.ack_proven(state_dbs(), _lineage(sid), tid, float(at))
+        ids = [i for i in dict.fromkeys(_lineage(sid)) if i]
+        if not ids or not tid:
+            return False
+        acks = res.setdefault("acks", {})
+        for path in state_dbs():
+            idx = acks.get((str(path), tuple(ids)))
+            if idx is None:
+                idx = acks[(str(path), tuple(ids))] = core.AckIndex(path, ids)
+            if idx.proves(tid, float(at), res["pool"]):
+                return True
+        return False
     except Exception:
         logger.debug("chat-closeout: ack proof unavailable", exc_info=True)
         return False
@@ -387,7 +409,8 @@ def waiting_source() -> dict[str, list[str]]:
             return hit[1]
         try:
             with _proof_pass():
-                out = core.pending_closeouts(ledger(), _pass_reader(), proof=session_proof)
+                # Settlement only: the light read skips the per-card handoff/ask subqueries nobody reads here.
+                out = core.pending_closeouts(ledger(), _pass_reader(light=True), proof=session_proof)
         except Exception:
             logger.debug("chat-closeout waiting source failed", exc_info=True)
             out = {}
@@ -439,7 +462,13 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
               read: Optional[Callable[[list[str]], dict]] = None,
               proof: Optional[Callable[[str, str, dict], bool]] = None) -> list[dict]:
     """One close-out pass over the ledger. Returns what it did (for logs/tests). One remote-inventory read per
-    tick, shared by every pending row."""
+    tick, shared by every pending row, and one ``_proof_pass`` (state.db connections, compression tips and
+    transcript proofs shared by every row, as the sidebar's waiting pass does)."""
+    with _proof_pass():
+        return _wake_tick(now=now, wake=wake, unseen=unseen, last_user=last_user, read=read, proof=proof)
+
+
+def _wake_tick(*, now, wake, unseen, last_user, read, proof) -> list[dict]:
     now = time.time() if now is None else now
     read = read or _pass_reader()
     if wake is None:
@@ -450,7 +479,7 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
     unseen = _unseen_counts() if unseen is None else unseen
     if unseen is None:
         return []
-    last_user = last_user or (lambda ids: core.last_user_at(state_dbs(), ids))
+    last_user = last_user or (lambda ids: core.last_user_at(state_dbs(), ids, pool=_pass_pool()))
     led = ledger()
     done: list[dict] = []
     for row in led.pending():
@@ -517,14 +546,30 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
     return done
 
 
+def _pass_pool() -> Optional["core.ReadPool"]:
+    res = getattr(_pass_local, "res", None)
+    return res["pool"] if res is not None else None
+
+
+@contextlib.contextmanager
+def _ro(path: Path):
+    """A read-only connection: the running pass's pooled one (left open), else a fresh one closed after use."""
+    pool = _pass_pool()
+    if pool is not None:
+        yield pool.get(path)
+        return
+    c = core.ro_connect(path)
+    try:
+        yield c
+    finally:
+        c.close()
+
+
 def _session_scope(sid: str) -> tuple[Optional[Path], str]:
     for path in state_dbs():
-        c = core.ro_connect(path)
-        try:
+        with _ro(path) as c:
             if c.execute("SELECT 1 FROM sessions WHERE id=?", (sid,)).fetchone():
                 return path, path.parent.name if path.parent.parent.name == "profiles" else "default"
-        finally:
-            c.close()
     return None, "default"
 
 
@@ -533,14 +578,12 @@ def _session_source(sid: str) -> str:
     path, _ = _session_scope(sid)
     if path is None:
         return ""
-    c = core.ro_connect(path)
     try:
-        r = c.execute("SELECT source FROM sessions WHERE id=?", (sid,)).fetchone()
+        with _ro(path) as c:
+            r = c.execute("SELECT source FROM sessions WHERE id=?", (sid,)).fetchone()
         return (r[0] or "") if r else ""
     except Exception:
         return ""
-    finally:
-        c.close()
 
 
 def _moved_owner(sid: str) -> Optional[str]:
