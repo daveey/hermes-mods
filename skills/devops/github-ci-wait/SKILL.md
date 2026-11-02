@@ -271,6 +271,8 @@ or closed-unmerged (wake to reconcile; neither is acceptance), 2 = evidence/auth
 
 ## Adding helper scripts to a repo
 
+For tests added to a stdlib `unittest discover` directory, verify actual discovery as well as imports: installing pytest fixes an import error but does not make unittest execute function-style parametrized tests. Preserve every scenario when porting fixtures to unittest and add a collection-count regression; run the exact CI command on each Python matrix version without undeclared packages.
+
 For cross-repository integration tests, wire every required environment path into the actual CI suite step, not only a local test command. An existing companion checkout does not export its paths automatically. Retain real-producer tests and add a workflow regression tying the export to that checkout before the test runner; verify the green branch run rather than replacing the producer with a mock or skip.
 
 Before choosing a directory for a new tool, read the CI workflows' `on.push.paths` and any plan step's path rules. A
