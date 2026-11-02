@@ -46,7 +46,7 @@ _ASK = re.compile(
     r"|^(?:when (?:it|the (?:review|evaluation)) completes, )?(?:david|the user) (?:reads? (?:the )?recommendation and )?decides (?:the path forward|what to do next|whether)\b"
     r"|\bplease (confirm|approve|decide|pick|choose|reply|sign|add|click|revoke|cancel)\b"
     r"|\bneeds? (?:a )?manual nudge on (?:the )?(?:kanban )?board\b"
-    r"|\b(unblock|unblocks) (it|the card|t_[0-9a-f]{8})\b",
+    r"|\b(unblock|unblocks) (it|the card|t_[0-9a-f]{8}(?:[0-9a-f]{8})?)\b",
     re.I)
 # Mentions that are not a live ask: hypotheticals, explicit "nothing for you", past/third person.
 _NOT_ASK = re.compile(

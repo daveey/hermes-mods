@@ -706,3 +706,14 @@ def test_card_ids_match_current_16_hex_ids():
     spec.loader.exec_module(core)
     assert core.card_ids("see t_01a18b22ba05938e and t_b0192d39, not t_01a18b22ba05938e9") == [
         "t_01a18b22ba05938e", "t_b0192d39"]
+
+
+# Card ids grew from 8 to 16 hex: "unblock t_<16 hex>" is the same hand-back as the legacy 8-hex form.
+@pytest.mark.parametrize("card", ["t_01a19e2574fa8b00", "t_1234abcd"])
+def test_unblock_named_card_is_an_ask_for_current_and_legacy_ids(gate, card):
+    text = f"Once the build is green, unblock {card}."
+    assert gate.core.find_asks(text) == [text]
+
+
+def test_unblock_with_a_cut_short_id_is_not_the_card_form(gate):
+    assert not gate.core._ASK.search("unblock t_01a19e2574fa")

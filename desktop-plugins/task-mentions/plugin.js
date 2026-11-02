@@ -20,7 +20,7 @@ import { host as sdkHost } from '@hermes/plugin-sdk'
 
 const PLUGIN_ID = 'task-mentions'
 const HL_NAME = 'task-mention'
-const ID_RE = /\bt_[0-9a-f]{8}\b/g
+const ID_RE = /\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b/g // legacy 8-hex and current 16-hex ids
 const SCOPE = '[data-slot="aui_thread-viewport"]'
 const CACHE_MS = 15_000
 const HOVER_DELAY_MS = 220

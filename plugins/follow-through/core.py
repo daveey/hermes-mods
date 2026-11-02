@@ -30,7 +30,6 @@ _KEEP = re.compile(
     r"\b(?:will\s+|'ll\s+)?(?:sends?|delivers?|messages?|posts?|forwards?|shares?)\b"
     r"|\bdo\s+not\s+send\s+it\b",
     re.I)
-_TASK_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
 
 
 def kept_obligation(text: str) -> bool:

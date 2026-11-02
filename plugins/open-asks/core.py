@@ -32,7 +32,7 @@ _NOT_ASK = re.compile(
     r"(waiting|needed|needs?) (on|from|for) you|nothing for you|you (already|have already)|you (said|answered|"
     r"approved|asked)|don'?t need (anything|you)|no (more|further) (input|action)|the card asks|it asked)\b",
     re.I)
-_CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
+_CARD_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")  # legacy 8-hex and current 16-hex ids
 
 
 def _strip_noise(text: str) -> str:

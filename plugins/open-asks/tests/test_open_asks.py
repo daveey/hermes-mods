@@ -156,3 +156,12 @@ def test_card_text():
     assert ASKED2 in body and "unblocks" in body and "archives" in body
     assert core.card_title([ASKED2]).startswith("ASK: Want me to")
     assert core.ask_key("s1", [ASKED2]) == core.ask_key("s1", [ASKED2.lower()])
+
+
+# Card ids grew from 8 to 16 hex; the extractor must return whole ids of both lengths, never a prefix.
+def test_card_ids_extracts_whole_current_and_legacy_ids():
+    reply = ("Your yes or no on t_01a19e2574fa8b00 is all that is left; the older card t_1234abcd is done. "
+             "Not ids: t_01a19e2574fa (12 hex), t_01a19e2574fa8b00ff (18 hex).")
+    assert core.card_ids(reply) == ["t_01a19e2574fa8b00", "t_1234abcd"]
+    # cards made minutes apart share their first 8 hex: they must stay two distinct ids
+    assert core.card_ids("t_01a19e09ae7c3790 and t_01a19e09aec77ab4") == ["t_01a19e09ae7c3790", "t_01a19e09aec77ab4"]

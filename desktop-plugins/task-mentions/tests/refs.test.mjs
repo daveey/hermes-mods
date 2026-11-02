@@ -72,3 +72,13 @@ test('sessionTarget prefers the run worker session, labels the creator fallback,
   assert.equal(m.sessionTarget({ task: { session_id: 'creator' }, runs: [] }, 'creator'), null)
   assert.deepEqual(m.sessionTarget({ task: { session_id: 'c', current_run_id: 3 }, runs: [{ id: 1, worker_session_id: 'a' }, { id: 3 }] }, ''), { id: 'a', label: 'Open worker session' })
 })
+
+test('findTaskIds links whole current 16-hex ids and legacy 8-hex ids, never a prefix', () => {
+  const text = 'see t_01a19e2574fa8b00 and t_1234abcd; not t_01a19e2574fa or t_01a19e2574fa8b00ff'
+  assert.deepEqual(m.findTaskIds(text), [
+    { id: 't_01a19e2574fa8b00', start: 4, end: 22 },
+    { id: 't_1234abcd', start: 27, end: 37 }
+  ])
+  // cards made minutes apart share their first 8 hex; each keeps its own id
+  assert.deepEqual(m.findTaskIds('t_01a19e09ae7c3790 t_01a19e09aec77ab4').map(x => x.id), ['t_01a19e09ae7c3790', 't_01a19e09aec77ab4'])
+})

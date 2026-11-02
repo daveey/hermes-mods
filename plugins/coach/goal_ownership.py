@@ -60,7 +60,7 @@ def authoritative_owner(v, evidence, session_id):
         return _process.authoritative_process(v, evidence, session_id, _ro_connect, _current_user_matches)
     if (not isinstance(ref, dict) or set(ref) != {'gateway', 'profile', 'board', 'task_id'}
             or any(not isinstance(x, str) or not x for x in ref.values())
-            or not re.fullmatch(r't_[0-9a-f]{8}', ref['task_id'])
+            or not re.fullmatch(r't_[0-9a-f]{8}(?:[0-9a-f]{8})?', ref['task_id'])
             or not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', ref['board'])):
         raise ValueError('owner_readback_unavailable')
     if ref['gateway'] != socket.gethostname():
