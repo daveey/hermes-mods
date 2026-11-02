@@ -354,6 +354,124 @@ def test_recurrence_on_the_day_it_was_filed_and_fixed_is_not_swallowed(store):
     assert again["action"] == "skip" and len(r.creates()) == n + 1
 
 
+# ── stale runtime: the code that raised never got the fix (desktop-e05d9218fa: pinned Ask Eve core) ──
+def _git(cwd, *args):
+    import subprocess
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True,
+                          env=env).stdout.strip()
+
+
+@pytest.fixture
+def fix_repo(tmp_path):
+    """repo: A (bug) -> B (fix); worktrees pinned at A and at B, like ~/.hermes/askeve-runtime/core-<sha>."""
+    repo = tmp_path / "core"
+    (repo / "tui").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "tui" / "outcome.py").write_text("def refresh(s):\n    with _session_db(s) as db:\n        return db\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "bug")
+    a = _git(repo, "rev-parse", "HEAD")
+    (repo / "tui" / "outcome.py").write_text("def refresh(s):\n    with server._session_db(s) as db:\n"
+                                             "        return db\n")
+    _git(repo, "commit", "-qam", "fix(tui): reach helpers through server")
+    b = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "worktree", "add", "-q", "--detach", str(tmp_path / "pin-a"), a)
+    _git(repo, "worktree", "add", "-q", "--detach", str(tmp_path / "pin-b"), b)
+    return SimpleNamespace(repo=repo, a=a, b=b, pin_a=tmp_path / "pin-a", pin_b=tmp_path / "pin-b")
+
+
+def _tb_defect(checkout, **kw):
+    details = ("WARNING tui_gateway.turn_outcome: turn-end outcome refresh failed for s1\nTraceback (most recent "
+               f"call last):\n  File \"{checkout}/tui/outcome.py\", line 2, in refresh\n    with _session_db(s) as "
+               "db:\n  File \"/usr/lib/python3.14/contextlib.py\", line 141, in __enter__\n"
+               "NameError: name '_get_db' is not defined")
+    return defect(symptom="NameError in _workdir_owner_db (session_workdir.py): turn-end outcome refresh failed",
+                  source="signal", kind="errors", details=details, host=sh.host_name(), **kw)
+
+
+def _fixed_with_sha(store, r, d, sha, fixed_at):
+    fp = d["fingerprint"]
+    sh.file_defect({**d, "at": fixed_at - 20000}, store=store, m="live", runner=r, now=fixed_at - 20000, cfg=HUB,
+                   budget_fn=OPEN)
+    sh.record_event("proposed", fp, "t_00000001", store=store, now=fixed_at - 19000)
+    sh.file_fix(fp, store=store, runner=r, now=fixed_at - 18000, budget_fn=OPEN)
+    sh.record_event("fixed", fp, "t_00000002", note=f"{sha[:11]} (hermes-mods abc1234)", store=store, now=fixed_at)
+    return fp
+
+
+def test_recurrence_in_a_checkout_without_the_fix_is_a_stale_runtime_not_a_failed_fix(store, fix_repo):
+    r = Runner()
+    d = _tb_defect(fix_repo.pin_a)
+    fp = _fixed_with_sha(store, r, d, fix_repo.b, FIXED_AT)
+    n = len(r.creates())
+    late = FIXED_AT + 3 * 86400
+    out = sh.file_defect({**d, "at": late}, store=store, m="live", runner=r, now=late + 60, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "stale_runtime", out
+    assert not ev(store, "selfheal_recurrence")
+    (stale,) = ev(store, "selfheal_stale_runtime")
+    assert stale["checkout"] == str(fix_repo.pin_a.resolve()) and stale["sha"] == fix_repo.b
+    (argv,) = r.creates()[n:]
+    title = argv[argv.index("create") + 1]
+    assert title.startswith(f"backport {fix_repo.b[:11]} to ") and str(fix_repo.pin_a.resolve()) in title
+    assert "(came back)" not in title
+    st = sh.LaneState(store.root).get(fp)
+    assert st["status"] == "fixed" and not st.get("recurrences")  # the fix held; that runtime never got it
+    # one card per checkout+sha: the next occurrence there files nothing new
+    again = sh.file_defect({**d, "at": late + 3600}, store=store, m="live", runner=r, now=late + 3660, cfg=HUB,
+                           budget_fn=OPEN)
+    assert again["action"] == "skip" and "backport" in again["why"] and len(r.creates()) == n + 1
+
+
+def test_recurrence_in_a_checkout_that_has_the_fix_is_still_a_recurrence(store, fix_repo):
+    r = Runner()
+    d = _tb_defect(fix_repo.pin_b)
+    fp = _fixed_with_sha(store, r, d, fix_repo.b, FIXED_AT)
+    late = FIXED_AT + 3 * 86400
+    out = sh.file_defect({**d, "at": late}, store=store, m="live", runner=r, now=late + 60, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and out["key"] == f"selfheal:{fp}:r2", out
+    assert ev(store, "selfheal_recurrence") and not ev(store, "selfheal_stale_runtime")
+
+
+def test_an_uncommitted_backport_in_the_pinned_checkout_counts_as_having_the_fix(store, fix_repo):
+    # the pin keeps its detached HEAD and applies the fix's diff on top (how the Ask Eve pin is patched)
+    r = Runner()
+    (fix_repo.pin_a / "tui" / "outcome.py").write_text((fix_repo.pin_b / "tui" / "outcome.py").read_text())
+    d = _tb_defect(fix_repo.pin_a)
+    _fixed_with_sha(store, r, d, fix_repo.b, FIXED_AT)
+    late = FIXED_AT + 3 * 86400
+    out = sh.file_defect({**d, "at": late}, store=store, m="live", runner=r, now=late + 60, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and not ev(store, "selfheal_stale_runtime"), out
+
+
+@pytest.mark.parametrize("case", ["other_host", "no_sha", "unknown_sha", "missing_path"])
+def test_stale_runtime_check_falls_back_to_recurrence_when_it_cannot_tell(store, fix_repo, case):
+    r = Runner()
+    d = _tb_defect(fix_repo.pin_a if case != "missing_path" else fix_repo.repo.parent / "gone")
+    if case == "other_host":
+        d["host"] = "some-other-host"  # a "~/" path in its traceback names that host's files, not ours
+    sha = {"no_sha": "", "unknown_sha": "0123456789abcdef0123"}.get(case, fix_repo.b)
+    fp = d["fingerprint"]
+    sh.file_defect({**d, "at": FIXED_AT - 20000}, store=store, m="live", runner=r, now=FIXED_AT - 20000, cfg=HUB,
+                   budget_fn=OPEN)
+    sh.record_event("proposed", fp, "t_00000001", store=store, now=FIXED_AT - 19000)
+    sh.file_fix(fp, store=store, runner=r, now=FIXED_AT - 18000, budget_fn=OPEN)
+    sh.record_event("fixed", fp, "t_00000002", note=sha or "PR #580", store=store, now=FIXED_AT)
+    late = FIXED_AT + 3 * 86400
+    out = sh.file_defect({**d, "at": late}, store=store, m="live", runner=r, now=late + 60, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and not ev(store, "selfheal_stale_runtime"), out
+
+
+def test_decide_reports_stale_runtime_from_a_checkout_probe(fix_repo):
+    st = {"status": "fixed", "fixed_at": FIXED_AT, "fix_shas": [fix_repo.b], "card": "t_1", "gen": 1}
+    d = _tb_defect(fix_repo.pin_a, at=FIXED_AT + 86400)
+    dec = sh.decide(d, st, FIXED_AT + 86400, {})
+    assert dec["action"] == "stale_runtime" and dec["sha"] == fix_repo.b
+    dec = sh.decide(_tb_defect(fix_repo.pin_b, at=FIXED_AT + 86400), st, FIXED_AT + 86400, {})
+    assert dec["action"] == "file" and dec["why"] == "recurrence"
+
+
 # ── budget ──
 def test_over_the_dollar_cap_defers_evidence_without_creating_a_card(store):
     r = Runner()

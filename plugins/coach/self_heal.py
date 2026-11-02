@@ -1355,7 +1355,9 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
    the red/green test output, the live proof, and the undo command) and run
    `{SELF_EVENT} fixed {fp} --note "<commit sha>" --result result.md`.
    That stores the result under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed; the card's
-   kanban_complete summary carries it too. Nothing reaches the Inbox.
+   kanban_complete summary carries it too. Nothing reaches the Inbox. Put EVERY commit sha of the fix in the
+   note (core and hermes-mods, space-separated): a later occurrence checks whether the checkout that raised it
+   contains one, and files a backport card for a stale pinned runtime instead of "the fix didn't hold".
 7. Complete the card. If something irreversible or external blocks the fix, kanban_block with the exact ask instead.
 """
 
@@ -1746,9 +1748,87 @@ def deploy_grace_s(cfg: Optional[dict] = None) -> float:
         return DEPLOY_GRACE_HOURS * 3600
 
 
+_FILE_FRAME = re.compile(r'File "([^"]+)"')
+
+
+def fix_shas(note: str) -> list:
+    """Commit shas named in a `fixed` event note (hex with at least one letter, so timestamps don't count)."""
+    out = []
+    for s in re.findall(r"\b[0-9a-f]{7,40}\b", str(note or "")):
+        if re.search(r"[a-f]", s) and s not in out:
+            out.append(s)
+    return out
+
+
+def _git_rc(repo, *args: str, stdin: Optional[str] = None) -> tuple:
+    import subprocess
+    try:
+        p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, input=stdin, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return p.returncode, p.stdout
+
+
+def _has_fix_content(top: str, sha: str, tb_rel: set) -> bool:
+    """The fix's diff is already in this checkout's working tree (a cherry-pick or an uncommitted backport on a
+    pinned HEAD): its reverse applies cleanly. Checked on the fix's files the traceback names, else its non-test
+    files; a fix that touched neither can't be judged by content."""
+    rc, out = _git_rc(top, "diff-tree", "--no-commit-id", "--name-only", "-r", sha)
+    if rc != 0:
+        return False
+    files = [f for f in out.splitlines() if f]
+    pick = [f for f in files if f in tb_rel] or [f for f in files if not re.search(r"(^|/)tests?/|(^|/)test_", f)]
+    if not pick:
+        return False
+    rc, patch = _git_rc(top, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"{sha}^", sha, "--", *pick)
+    if rc != 0 or not patch.strip():
+        return False
+    rc, _ = _git_rc(top, "apply", "-R", "--check", "-", stdin=patch)
+    return rc == 0
+
+
+def stale_checkout(d: dict, shas: list) -> Optional[dict]:
+    """A post-fix occurrence raised by code that never got the fix: a traceback frame on THIS host lives in a git
+    checkout (a pinned runtime worktree, e.g. ~/.hermes/askeve-runtime/core-<sha>) whose HEAD lacks a fix sha
+    and whose files don't carry its diff either. -> {checkout, sha, head} or None when it can't tell (no sha,
+    another host's paths, no readable checkout, a sha that checkout doesn't know) or every checkout has the fix."""
+    if not shas or not d.get("host") or d.get("host") != host_name():
+        return None
+    tops: dict = {}
+    for frame in reversed(_FILE_FRAME.findall(str(d.get("details") or ""))):
+        path = os.path.expanduser(frame)
+        if not os.path.isfile(path):
+            continue
+        rc, out = _git_rc(os.path.dirname(path), "rev-parse", "--show-toplevel")
+        top = out.strip() if rc == 0 else ""
+        if top:
+            real = os.path.realpath(path)
+            rel = os.path.relpath(real, os.path.realpath(top))
+            tops.setdefault(top, set()).add(rel)
+    for top, rel in tops.items():
+        for sha in shas:
+            rc, full = _git_rc(top, "rev-parse", "--verify", "-q", f"{sha}^{{commit}}")
+            full = full.strip()
+            if rc != 0 or not full:
+                continue  # not this repository's commit (e.g. the hermes-mods half of a fix)
+            anc, _ = _git_rc(top, "merge-base", "--is-ancestor", full, "HEAD")
+            if anc == 0 or anc is None or anc > 1:
+                continue  # contains it (or git can't tell): not stale
+            if _has_fix_content(top, full, rel):
+                continue
+            _, head = _git_rc(top, "rev-parse", "HEAD")
+            return {"checkout": top, "sha": full, "head": head.strip()}
+    return None
+
+
+def backport_key(fp: str, checkout: str, sha: str) -> str:
+    return f"selfheal:{fp}:backport:{sha[:12]}:{hashlib.sha1(checkout.encode()).hexdigest()[:8]}"
+
+
 def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
-    """Pure dedupe / suppression / recurrence decision for one defect against its lane state.
-    -> {"action": "file"|"skip"|"hold", "why", "key", "previous"}"""
+    """Dedupe / suppression / recurrence decision for one defect against its lane state. Pure except one probe:
+    a post-fix occurrence checks whether the checkout that raised it contains the fix (stale_checkout).
+    -> {"action": "file"|"skip"|"hold"|"stale_runtime", "why", "key", "previous"}"""
     fp = d["fingerprint"]
     status = st.get("status")
     if st.get("suppressed"):
@@ -1763,6 +1843,15 @@ def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
         return {"action": "skip", "why": f"closed as not a defect within {NOT_DEFECT_DAYS} days"}
     g = generation(st) + 1  # every filing gets a fresh generation, so its keys never name an earlier card
     if status == "fixed":
+        # The fix can only have failed where it runs. A pinned runtime cut before the fix still raises the old
+        # error; that is a missing backport, not "the fix didn't hold" (desktop-e05d9218fa: Ask Eve's pinned core).
+        try:
+            stale = stale_checkout(d, list(st.get("fix_shas") or []))
+        except Exception:  # health: allow BLE001 -- the probe is advisory; fall back to the time-based decision
+            stale = None
+        if stale:
+            return {"action": "stale_runtime", **stale, "key": backport_key(fp, stale["checkout"], stale["sha"]),
+                    "why": f"{stale['checkout']} (HEAD {stale['head'][:11]}) lacks fix {stale['sha'][:11]}"}
         # Judge by when it happened, not when it was processed: inside the rollout window it is most likely a
         # host still running pre-fix code. Held occurrences are deduped by time so a replay never counts twice.
         at = _detected_at(d)
@@ -2555,7 +2644,11 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         adopted = _adopt_recovery_holder(d, fp, st, store, now, runner)
         if adopted:
             return adopted
+    if st.get("status") == "fixed" and "fix_shas" not in st:  # fixed before fix_shas was stored: its note has them
+        st = lane.update(fp, fix_shas=_logged_fix_shas(store, fp))
     dec = decide(d, st, now, cfg)
+    if dec["action"] == "stale_runtime":
+        return _file_backport(d, fp, st, dec, store, m, runner, now, cfg, budget_fn)
     if dec["action"] == "hold":
         held = dec["held"] + [{"at": dec["at"], "host": d.get("host"), "source": d.get("source"), "seen": now}]
         lane.update(fp, held=held)
@@ -2648,6 +2741,91 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         store.log({"event": "selfheal_recurrence", "fingerprint": fp, "card": tid,
                    "previous": prev.get("fix_card"), "component": d.get("component")})
     return {"action": "filed", "card": tid, "key": args["idempotency_key"], "scheduled": sched}
+
+
+def _logged_fix_shas(store, fp: str) -> list:
+    """Shas from the latest `selfheal_fixed` log line of `fp` (lane entries written before `fix_shas` existed)."""
+    try:
+        lines = (Path(store.root) / "log.jsonl").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in reversed(lines):
+        if '"selfheal_fixed"' not in line or fp not in line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("event") == "selfheal_fixed" and r.get("fingerprint") == fp:
+            return fix_shas(r.get("note") or "")
+    return []
+
+
+def backport_brief(d: dict, fp: str, st: dict, dec: dict) -> str:
+    return f"""Self-heal BACKPORT for defect `{fp}`: a runtime on {d.get('host')} still raises an error that fix
+{dec['sha'][:12]} (card {st.get('fix_card') or '?'}) already removed on main. That fix held; this checkout never
+got it, so this is not a "came back" investigation.
+
+Checkout: {dec['checkout']}
+HEAD:     {dec['head']}  (does not contain {dec['sha']}, and the fix's diff is not in its working tree)
+Symptom:  {d.get('symptom')}
+
+Evidence (traceback, home shown as ~):
+```
+{str(d.get('details') or '')[-1500:]}
+```
+
+Do this:
+1. Find who owns that checkout before touching it: a RUNBOOK.md next to it, the systemd unit or process running
+   from it (`systemctl --user status`, `ps -eo pid,args | grep <checkout>`), a `git worktree list` lock reason.
+   Follow that owner's upgrade/restart rules; a pinned runtime usually keeps local edits on a detached HEAD.
+2. Backport the fix's diff without losing local edits: `git -C <repo> show {dec['sha'][:12]} -- <paths> | git -C
+   {dec['checkout']} apply --check`, then apply. Keep the change uncommitted unless the owner's rules say to
+   commit; the self-heal check treats a reverse-applicable diff as "has the fix".
+3. Prove it in that checkout's own interpreter (repro the error before, gone after); restart the runtime only when
+   its owner's rules allow it (idle), else record that it applies at the next restart.
+4. Note the backport where the owner tracks the runtime (its RUNBOOK "CURRENT" section or owner card), then
+   complete this card with the patch path and the undo (`git -C {dec['checkout']} apply -R <patch>`).
+Do not post to the Inbox. If the owner forbids the change, kanban_block with the exact ask.
+"""
+
+
+def _file_backport(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[str], runner, now: float,
+                   cfg: Optional[dict], budget_fn: Optional[Callable]) -> dict:
+    """ONE card per checkout+fix sha ("backport <sha> to <checkout>"); the fingerprint stays fixed."""
+    lane = LaneState(store.root)
+    key = dec["key"]
+    rec = {"event": "selfheal_stale_runtime", "mode": m, "fingerprint": fp, "checkout": dec["checkout"],
+           "sha": dec["sha"], "head": dec["head"], "key": key, "host": d.get("host"), "source": d.get("source"),
+           "component": d.get("component"), "previous": st.get("fix_card")}
+    backports = dict(st.get("backports") or {})
+    if backports.get(key):
+        why = f"backport already filed: {backports[key]} ({dec['why']})"
+        store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": why})
+        return {"action": "skip", "why": why}
+    r = route(d, cfg)
+    args = {"title": f"backport {dec['sha'][:11]} to {dec['checkout']}"[:200],
+            "body": backport_brief(d, fp, st, dec), "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
+            "max_runtime": FIX_RUNTIME, "skills": list(FIX_SKILLS), "board": r["board"], "assignee": "default",
+            "created_by": CREATED_BY}
+    if m != "live" or not is_hub(cfg):
+        store.log({**rec, "would_file": True, "args": args})
+        return {"action": "stale_runtime", "card": None, "key": key, "why": dec["why"]}
+    b = (budget_fn or budget)(args.get("board"), now)
+    if not b.get("ok_usd", True) or not b.get("ok_running", True):
+        why = f"backport deferred: {b.get('why') or 'self-heal budget/concurrency'}; the next occurrence retries"
+        store.log({**rec, "deferred": why})
+        return {"action": "skip", "why": why}
+    rc, out, err = _run(kanban_argv(args), runner)
+    tid = _task_id(out) if rc == 0 else None
+    if not tid:
+        why = (err or out).strip()[-300:]
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "key": key})
+        return {"action": "error", "why": why}
+    backports[key] = tid
+    lane.update(fp, backports=backports, cards=sorted(known_cards(st) | {tid}))
+    store.log({**rec, "card": tid})
+    return {"action": "stale_runtime", "card": tid, "key": key, "why": dec["why"]}
 
 
 def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budget_fn=None,
@@ -2824,7 +3002,7 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     if kind == "proposed":
         kw["proposed_at"] = now
     if kind == "fixed":
-        kw.update(fixed_at=now, fix_card=card or st.get("fix_card"), held=[])
+        kw.update(fixed_at=now, fix_card=card or st.get("fix_card"), held=[], fix_shas=fix_shas(note))
     if kind in ("not_defect", "declined"):
         kw["closed_at"] = now
     e = lane.update(fp, **kw)
