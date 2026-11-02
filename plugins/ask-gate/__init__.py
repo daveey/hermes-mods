@@ -354,6 +354,7 @@ def pre_llm_call(session_id: str = "", user_message: str = "", conversation_hist
     if not _chat_eligible(session_id, platform) or parent_session_id:
         return None
     _prewarm()
+    _SUPERSEDING_REPLY_HELD.discard(session_id)
     try:
         LOG.reset(session_id)
         hist = [m.get("content") for m in (conversation_history or []) if isinstance(m, dict) and m.get("role") == "user"
@@ -750,6 +751,8 @@ def _pr_filing_hold(session_id: str, tool_name: str, args: dict, request: dict) 
 
 # Process-local one-shot holds, like _PR_FILING_HELD: a retry of the same ask (or reply) passes this check.
 _SUPERSEDING_HELD: set[tuple[str, str, str]] = set()
+# Reply/clarify rewrites share one budget, reset by the next user turn.
+_SUPERSEDING_REPLY_HELD: set[str] = set()
 # One bounded candidate snapshot per held draft. Reconciliation names that snapshot, not the next page.
 _SUPERSEDING_ASK_SNAPSHOTS: dict[tuple[str, str, str], list[set[str]]] = {}
 
@@ -791,27 +794,22 @@ def _superseding_ask_hold(session_id: str, tool_name: str, args: dict, request: 
 
 def _superseding_reply_hold(session_id: str, text: str, attempt: int, budget: int,
                             surface: str = "reply") -> dict | None:
-    """A reply/clarify that tells David a change he named has 'no sign' of happening must name the in-flight
-    cards on that subject, or say why none is it. Held once per text; fails open."""
-    if attempt >= budget or superseding.off():
+    """Reconcile spend/change asks once per user turn, never ordinary decision reports."""
+    if attempt >= budget or superseding.off() or session_id in _SUPERSEDING_REPLY_HELD:
         return None
     try:
-        found = superseding.denials(text)
-        if not found:
+        if not superseding.decision_ask(core, text):
             return None
         users = _user_msgs(session_id)
         last = users[-1] if users else ""
-        key = (session_id, surface, core.text_hash(" ".join(found)))
-        if key in _SUPERSEDING_HELD:
-            return None
         hits = superseding.matches(core, last + "\n" + text, text)
     except Exception as e:
         core.log_event("superseding_error", tool=surface, session=session_id, error=repr(e)[:300])
         return None
     if not hits:
         return None
-    _SUPERSEDING_HELD.add(key)
-    core.log_event("superseding_held", tool=surface, session=session_id, denials=found[:3],
+    _SUPERSEDING_REPLY_HELD.add(session_id)
+    core.log_event("superseding_held", tool=surface, session=session_id,
                    cards=[(h["id"], h["score"]) for h in hits])
     return {"hold": True, "nudge": superseding.reply_message(core, hits)}
 

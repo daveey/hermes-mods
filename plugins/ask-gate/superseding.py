@@ -7,8 +7,8 @@ open or recently decided work on that subject.
 
 Deterministic and read-only: topic tokens of the ask (title + action + scope, or a reply plus the user's last
 message) are scored against every board's open cards and cards done in the last 7 days (IDF over that set, so
-words every card shares count for little). Cards the ask already names by id are dropped; what remains is the
-list the agent must name and rule out. The caller holds once per ask; a retry passes.
+words every card shares count for little). Card IDs, owned commit prefixes and distinctive title phrases
+are recognized. Reply/clarify holds are bounded per user turn; structured filings retain their own snapshot.
 """
 from __future__ import annotations
 
@@ -53,6 +53,53 @@ _DENIAL = re.compile(
     re.I)
 
 
+_CHANGE = (r"(?:go\s+ahead|proceed|ship|deploy|change|switch|keep|buy|rent|spend|pay|fund|renew|"
+           r"enable|disable|remove|replace|merge|publish|grant|run|make)")
+_DECISION = re.compile(
+    r"^(?:(?:should|shall|may|can)\s+(?:I|we)\s+" + _CHANGE
+    + r"|(?:do|would)\s+you\s+(?:want|prefer)\s+(?:(?:me|us)\s+to\s+|to\s+)?" + _CHANGE
+    + r"|(?:do|would)\s+you\s+(?:approve|authorize)\b"
+    r"|(?:please\s+)?(?:approve|authorize|decide whether|choose whether|confirm whether)\b"
+    r"|(?:I\s+)?(?:need|am waiting for|waiting for)\s+your\s+(?:approval|decision|go-ahead)\b"
+    r"|(?:is it\s+)?(?:ok|okay|fine)\s+to\s+" + _CHANGE
+    + r"|go ahead with\b|(?:keep|make|fund)\b[^.!?]*\?)", re.I)
+_SHA = re.compile(r"\b[0-9a-f]{7,40}\b", re.I)
+
+
+def decision_ask(core: Any, text: str) -> bool:
+    """Explicit prospective decision language, not approval/status vocabulary alone."""
+    return any(_DECISION.search(s) for s in core.sentences(core._strip_quotes(text)))
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", text.lower())
+
+
+def mentioned(core: Any, row: tuple, text: str, rows: list[tuple]) -> bool:
+    """Credit card-owned SHA prefixes or an unambiguous substantive title phrase."""
+    own_shas = _SHA.findall(" ".join(str(x or "") for x in (row[1], row[4], row[5])))
+    if any(a.lower().startswith(b.lower()) or b.lower().startswith(a.lower())
+           for a in own_shas for b in _SHA.findall(text)):
+        return True
+    words = _words(row[1] or "")
+    named = " " + " ".join(_words(text)) + " "
+    titles = [(r[0], " " + " ".join(_words(r[1] or "")) + " ") for r in rows]
+    stop = _ANCHOR_STOP | _ASK_STOP | core._TOPIC_STOP
+    for i in range(len(words)):
+        # Three-word phrases, or a distinctive hyphenated compound, avoid crediting
+        # generic shared words such as 'guard', 'fix', or 'branch reset'.
+        for size in (1, 3):
+            part = words[i:i + size]
+            if len(part) != size or (size == 1 and "-" not in part[0]):
+                continue
+            if not any(w not in stop for w in part):
+                continue
+            phrase = " " + " ".join(part) + " "
+            if phrase in named and sum(phrase in title for _, title in titles) == 1:
+                return True
+    return False
+
+
 def off() -> bool:
     if os.environ.get("ASK_GATE_SUPERSEDING_OFF"):
         return True
@@ -86,7 +133,8 @@ def _rows(db_paths: list[Path], connect: Callable, now: float) -> list[tuple]:
             try:
                 cols = {r[1] for r in c.execute("pragma table_info(tasks)")}
                 body = "substr(coalesce(body,''),1,%d)" % BODY_CHARS if "body" in cols else "''"
-                q = (f"select id, title, status, completed_at, {body} from tasks where "
+                result = "substr(coalesce(result,''),1,%d)" % BODY_CHARS if "result" in cols else "''"
+                q = (f"select id, title, status, completed_at, {body}, {result} from tasks where "
                      "(status not in ('done','archived') or (status='done' and coalesce(completed_at,0) > ?))")
                 out += [r for r in c.execute(q, (now - RECENT_DONE_S,))]
             finally:
@@ -127,6 +175,7 @@ def matches(core: Any, query: str, named_text: str = "", exclude: set[str] | Non
     if total <= 0:
         return []
     hits = []
+    candidate_rows = [row for row, _ in docs]
     for r, toks in docs:
         if r[0] in named:
             continue
@@ -139,7 +188,7 @@ def matches(core: Any, query: str, named_text: str = "", exclude: set[str] | Non
         if len(shared) < MIN_SHARED:
             continue
         cov = sum(idf[t] for t in shared) / total
-        if cov >= MIN_COVERAGE:
+        if cov >= MIN_COVERAGE and not mentioned(core, r, named_text, candidate_rows):
             hits.append({"id": r[0], "title": r[1] or "", "status": r[2], "completed": r[3],
                          "score": round(cov, 3), "shared": sorted(shared)[:8], "n_shared": len(shared)})
     # Open work is what can replace the ask; recently done cards show what was just decided. Open first.
@@ -172,8 +221,8 @@ def denials(text: str) -> list[str]:
 
 
 def reply_message(core: Any, hits: list[dict]) -> str:
-    return ("[ask-gate superseding_work] Your reply says there is no sign of a change the user named, but these "
-            "open or recently decided cards are on the same subject and the reply names none of them:\n"
-            + render(core, hits) + "\nSearch for the change itself, not only the user's word for it: read these "
-            "cards and say whether one of them is the change the user meant (and its status), or why none is. "
+    return ("[ask-gate superseding_work] This spend or change ask leaves related open or recently decided "
+            "cards unnamed:\n"
+            + render(core, hits) + "\nRead the related work and explain whether it replaces this ask, "
+            "or why it does not. Refer to it by card id, commit SHA, or distinctive title phrase. "
             "Then rewrite the reply. This is a one-time check.")

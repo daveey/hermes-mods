@@ -157,10 +157,13 @@ def test_reply_denying_named_change_held_with_cards(hook, gate, monkeypatch):
     _board(_home(gate) / "kanban.db", FILLER + [
         {"id": MIGRATION, "title": MIGRATION_TITLE, "body": MIGRATION_BODY, "status": "blocked"}])
     monkeypatch.setattr(gate, "_user_msgs", lambda s: ["but we just moved to EKS anyway i think?"])
-    out = hook["pre_final_gate"](session_id="s1", platform="cli", final_response=DENIAL, attempt=0)
+    # A denial alone is a report, not a spend/change decision request.
+    assert hook["pre_final_gate"](session_id="s1", platform="cli", final_response=DENIAL, attempt=0) is None
+    ask = DENIAL + " Should I switch the CI hosts to on-demand?"
+    out = hook["pre_final_gate"](session_id="s1", platform="cli", final_response=ask, attempt=0)
     assert out and out.get("hold") and MIGRATION in out["nudge"], out
     # the retry is not held again by this check
-    assert gate._superseding_reply_hold("s1", DENIAL, 1, 2) is None
+    assert gate._superseding_reply_hold("s1", ask, 1, 2) is None
 
 
 def test_reply_naming_card_not_held(hook, gate, monkeypatch):

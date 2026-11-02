@@ -359,8 +359,13 @@ Fix (`superseding.py`, deterministic, read-only, fails open):
   does not request the next six. An identical draft retry also passes. Independent filings and changed approvals
   without that reconciliation are still checked. The release (`superseding_released`) does not skip evidence,
   approval-store, retirement, judge, or core authorization/scientific gates.
-- A final reply or `clarify` question that says "no sign / no evidence / found nothing / hasn't moved" is matched
-  (with the user's last message) the same way and held once with the in-flight cards unless it names them.
+- A final reply or `clarify` question is checked only for explicit prospective spend/change decision language,
+  not for denial vocabulary alone. Reports of decisions already made pass this lint. Neutral hold wording does
+  not invent a claim about a missing migration. Replies/clarify share one hold per user turn, independent of the
+  rewritten text; the next `pre_llm_call` turn resets that budget. Other authorization checks still apply.
+- A reference can be a card ID, a 7+ hexadecimal commit prefix recorded in its title/body/result, or an
+  unambiguous title phrase (three contiguous words or a distinctive hyphenated compound). Generic overlap and
+  unrelated SHAs do not count. Title matching is lexical, not semantic paraphrase recognition.
 - Limits: this remains a lexical advisory, not proof of supersession or approval. It can miss work using unrelated
   terminology. One-shot/snapshot state is process-local; preserve a stable filing identity across rewrites. A
   restarted process has no prior hold snapshot. Already-imported agent hooks do not hot-reload from a source pull.
@@ -371,6 +376,13 @@ rewriting action/scope changed the exact query hash, and excluding already-named
 The original retry test resubmitted identical arguments with only one relevant candidate, so neither the rewrite
 nor pagination failure was exercised. Fix: distinct subject anchors plus bounded displayed-list reconciliation,
 not a session-wide or task-wide exemption.
+
+Reply regression root: the broad `found nothing` denial detector treated a completed review report as an ask;
+its hard-coded notice invented a migration denial. Hashing the matched sentence let a rewrite hold again, and
+ID-only exclusions ignored descriptive reconciliation. Earlier tests required holding a non-ask denial and
+only retried identical wording. `tests/test_superseding_reply_scope.py` uses both exact rejected log excerpts
+(full rejected drafts were not persisted), covers neutral notices, ID/SHA/title references, rewritten release,
+next-turn reset, cross-surface release, and genuine omitted-work asks. These cases fail on the old implementation.
 
 Tests: `tests/test_superseding_work.py` retains the original runner-migration create/block, cross-board,
 named-card, retry, recent/old-done, denial/reply/clarify and kill-switch tests.
