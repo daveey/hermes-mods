@@ -153,6 +153,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             # Seconds since this session's last recorded activity, read before user_turn bumps it: the length of
             # a backend stop when this turn is core's resume note (self_heal.resume_signal).
             last_seen = store.session(session_id).get("updated")
+            turn_at = store.clock()
             rec = store.user_turn(session_id, user_message) or {}
             hint = coach.turn_start(session_id, user_message, platform=platform or "",
                                     parent_session_id=parent_session_id or "",
@@ -177,7 +178,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             _selfheal_run(_selfheal_complaint, session_id, user_message,
                           prev or _last_assistant(conversation_history), platform, parent_session_id,
                           list(coach.loop_state(session_id).get("last_log") or []),
-                          (store.clock() - last_seen) if isinstance(last_seen, (int, float)) else None)
+                          (turn_at - last_seen) if isinstance(last_seen, (int, float)) else None, turn_at)
             loop_hint = _fix_loop(session_id, user_message, turn)
             stall_hint = _stalled_goal(session_id, platform)
             hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", stall_hint or "") if h)
@@ -558,11 +559,20 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         return None if selfheal_llm else sh.confirm_judge()
 
     def _selfheal_complaint(session_id, user_message, prev, platform="", parent_session_id="", tool_log=None,
-                            gap_s=None):
+                            gap_s=None, turn_at=None):
         try:
             sh = _load("self_heal")
             if not sh.user_facing(platform, parent_session_id):
                 return
+            if turn_at is not None and sh.is_pause_note(user_message):
+                # The coach file was last written when the paused turn STARTED (turn start/end only): time the pause
+                # from the turn's last assistant/tool row instead (gateway-833d39a686). Unknown stays quiet; core's
+                # 15-min stuck-pause WARNING is the backstop for a real stall.
+                gap_s = sh.pause_gap_s(session_id, turn_at)
+                if gap_s is None:
+                    store.log({"event": "selfheal_skip", "mode": sh.mode(), "session_id": session_id,
+                               "fingerprint": sh.fingerprint("gateway", "update pause did not continue in time"),
+                               "why": "pause_gap_unknown"})
             hit = sh.detect_complaint(prev or "", user_message, llm=selfheal_llm, threshold=sh.threshold(),
                                       confirm=_confirm(sh),
                                       tool_log=tool_log, gap_s=gap_s)

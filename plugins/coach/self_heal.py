@@ -75,6 +75,46 @@ def hermes_home(home: Optional[Path] = None) -> Path:
         return Path(env).expanduser() if env else Path.home() / ".hermes"
 
 
+def _ro_state(path: Path):
+    """Read-only state.db connection: mode=ro, else (a WAL db whose -wal/-shm is absent) mode=rw + query_only."""
+    import sqlite3
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        db.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        return db
+    except sqlite3.Error:
+        db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5)
+        db.execute("PRAGMA query_only=ON")
+        return db
+
+
+def pause_gap_s(session_id: str, now: float, home: Optional[Path] = None) -> Optional[float]:
+    """Seconds an update pause lasted: `now` minus the session's last assistant/tool row at or before `now` in
+    <HERMES_HOME>/state.db, i.e. when the paused turn really stopped. None when unknown (no such row, unreadable db).
+    The coach file's `updated` is no substitute: it is written at turn start and end only, so a long turn that ended
+    by pausing looks like a pause as long as the whole turn (gateway-833d39a686)."""
+    import sqlite3
+    path = hermes_home(home) / "state.db"
+    if not session_id or not path.is_file():
+        return None
+    try:
+        db = _ro_state(path)
+        try:
+            row = db.execute("SELECT max(timestamp) FROM messages WHERE session_id=? AND role IN ('assistant','tool') "
+                             "AND timestamp <= ?", (session_id, now)).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return None
+    ts = row[0] if row else None
+    return max(0.0, now - float(ts)) if isinstance(ts, (int, float)) else None
+
+
+def is_pause_note(user_text) -> bool:
+    """Core's update-pause note (a planned pause), as opposed to its crash-recovery note."""
+    return is_resume_note(user_text) and PAUSE_NOTE_MARK in clean_user(user_text)[:400]
+
+
 def first_user_message(session_id: str, home: Optional[Path] = None) -> Optional[str]:
     """The session's first stored user message (cleaned) from <HERMES_HOME>/state.db; None when the session has no
     user row on this host or the db cannot be read (fail-open: the caller treats that as not a probe)."""
@@ -85,12 +125,7 @@ def first_user_message(session_id: str, home: Optional[Path] = None) -> Optional
     if not path.is_file():
         return None
     try:
-        try:
-            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
-            db.execute("SELECT 1 FROM sqlite_master LIMIT 1")
-        except sqlite3.Error:
-            db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5)
-            db.execute("PRAGMA query_only=ON")
+        db = _ro_state(path)
         try:
             row = db.execute("SELECT content FROM messages WHERE session_id=? AND role='user' "
                              "ORDER BY timestamp, id LIMIT 1", (session_id,)).fetchone()
@@ -502,7 +537,8 @@ def is_resume_note(user_text) -> bool:
 
 def resume_signal(user_text, gap_s: Optional[float] = None) -> Optional[dict]:
     """A user turn that is core's crash-recovery note: the backend stopped mid-turn and Hermes resumed the chat.
-    `gap_s` = seconds since the session's last recorded activity (None when unknown)."""
+    `gap_s` = seconds the chat stood still (None when unknown); for a pause note, since the paused turn stopped
+    (pause_gap_s), never since it started."""
     t = clean_user(user_text)
     if not is_resume_note(t):
         return None

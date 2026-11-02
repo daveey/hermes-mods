@@ -3,7 +3,8 @@
 
 Inputs (private, from the self-correct replay; never committed here):
   turns.jsonl      every real user turn: {sid, idx, text, prev_reply, ...}   (prev_reply = agent reply before it)
-  turns2.jsonl     per-turn telemetry: {sid, idx, api_err, interrupted, repeat, no_reply, gap_s, ...}
+  turns2.jsonl     per-turn telemetry: {sid, idx, api_err, interrupted, repeat, no_reply, gap_s, pause_gap_s, ...}
+                   (pause_gap_s: for an update-pause note, seconds since the session's last assistant/tool row)
   episodes.json    incident episodes: [{eid, sid, first, last, turns: [{sid, idx}, ...]}]
   fivewhys.jsonl   per-episode verdict: {eid, real_incident, explicit_fix_ask_turn}
   fpcheck.jsonl    optional relabels of sampled "false positive" turns: {sid, idx, real_incident}
@@ -117,7 +118,10 @@ def run(a, llm=None, confirm_llm=None):
             cprev += " [… rest of this message clipped in the dataset]"
         x = X.get((t["sid"], t["idx"]), {})
         if sh.is_resume_note(t.get("text") or ""):  # production: core's resume notes skip the judge
-            sig = sh.resume_signal(t.get("text") or "", x.get("gap_s"))
+            # production times a pause note from the paused turn's last assistant/tool row (pause_gap_s), not from
+            # the coach file's turn-start stamp (gap_s); a turn set without that field stays quiet, as production does
+            gap = x.get("pause_gap_s") if sh.is_pause_note(t.get("text") or "") else x.get("gap_s")
+            sig = sh.resume_signal(t.get("text") or "", gap)
             r["c_pre"] = False
             if sig:
                 r.update(c_p=sig["p_defect"], c_kind=sig["kind"], c_comp=sig["component"], c_sym=sig["symptom"],

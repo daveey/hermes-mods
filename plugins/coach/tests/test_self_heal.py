@@ -723,6 +723,89 @@ def test_pre_llm_call_update_pause_note_files_nothing(tmp_path, on):
     assert events(tmp_path) == [] and not calls
 
 
+# ── gateway-833d39a686: a pause note is timed from when the paused turn stopped, not from when it started ──
+def _state_db(home, rows):
+    """A scratch <HERMES_HOME>/state.db holding `rows` = [(session_id, role, timestamp), ...]."""
+    import sqlite3
+    home.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(home / "state.db")
+    c.execute("create table messages (id integer primary key, session_id text, role text, content text, "
+              "timestamp real)")
+    c.executemany("insert into messages (session_id, role, content, timestamp) values (?, ?, 'x', ?)", rows)
+    c.commit()
+    c.close()
+
+
+def _long_turn_then_pause(tmp_path, monkeypatch, last_row_age_s, db=True):
+    """A turn that started 146 min ago and ran until it paused `last_row_age_s` ago; then core's pause note."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    t0 = 1_800_000_000.0
+    now = [t0]
+    store = core.Store(tmp_path / "coach", clock=lambda: now[0])
+    llm, calls = judge(0.0)  # the long turn's own message is no complaint
+    _, hooks = plugin.build(store=store, checkout=None, selfheal_sync=True, selfheal_llm=llm)
+    hooks["pre_llm_call"](session_id="s1", user_message="fix the panel")  # the long turn starts: coach file written
+    assert events(tmp_path) == []
+    judged = len(calls)
+    end = t0 + 146 * 60
+    if db:
+        _state_db(home, [("s1", "user", t0), ("s1", "assistant", t0 + 60), ("s1", "tool", end - last_row_age_s),
+                         ("other", "tool", end - 10)])
+    else:
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "state.db").write_text("not a database")
+    now[0] = end
+    hooks["pre_llm_call"](session_id="s1", user_message=_pause_note())
+    assert len(calls) == judged  # a pause note never reaches the judge
+
+
+def test_pre_llm_call_pause_after_long_turn_is_timed_from_the_pause(tmp_path, on, monkeypatch):
+    """The observed incident: a 2 h 21 min turn paused for 5 min. The pause continued in time: nothing is filed."""
+    _long_turn_then_pause(tmp_path, monkeypatch, last_row_age_s=298)
+    assert events(tmp_path) == []
+
+
+def test_pre_llm_call_pause_that_stalled_after_long_turn_still_files(tmp_path, on, monkeypatch):
+    _long_turn_then_pause(tmp_path, monkeypatch, last_row_age_s=61 * 60)
+    ev = events(tmp_path)
+    assert len(ev) == 1 and ev[0]["symptom"] == "update pause did not continue in time"
+    assert ev[0]["fingerprint"] == "gateway-833d39a686"
+    assert ev[0]["evidence"].startswith("update pause continued 61 min later.")
+
+
+def test_pre_llm_call_pause_with_unreadable_state_db_stays_quiet_and_logs_skip(tmp_path, on, monkeypatch):
+    _long_turn_then_pause(tmp_path, monkeypatch, last_row_age_s=0, db=False)
+    assert events(tmp_path) == []
+    skip = events(tmp_path, "selfheal_skip")
+    assert len(skip) == 1 and skip[0]["why"] == "pause_gap_unknown" and skip[0]["session_id"] == "s1"
+    assert skip[0]["fingerprint"] == "gateway-833d39a686"
+
+
+def test_incident_replay_times_pause_notes_from_the_pause(tmp_path):
+    """Detection guard (gateway-833d39a686): like production, the replay times a pause note by `pause_gap_s` (last
+    assistant/tool row before the note), never by the turn-start `gap_s`. Turn started 146 min ago, paused 5 min:
+    must stay quiet; a pause that stalled 61 min still fires; no pause gap at all stays quiet."""
+    ir = load("selfheal_incident_replay_pause2", ROOT / "eval" / "selfheal_incident_replay.py")
+    d = tmp_path / "data"
+    d.mkdir()
+    turns = [("q", 0, 8767, 298), ("s", 0, 8767, 61 * 60), ("u", 0, 8767, None), ("z", 0, None, None)]
+    (d / "turns.jsonl").write_text("".join(json.dumps({"sid": s, "idx": i, "text": _pause_note() if s != "z" else "hi",
+                                                       "prev_reply": "working"}) + "\n" for s, i, _, _ in turns))
+    (d / "turns2.jsonl").write_text("".join(json.dumps({"sid": s, "idx": i, "prev_log": [], "gap_s": g,
+                                                        "pause_gap_s": pg}) + "\n" for s, i, g, pg in turns))
+    (d / "episodes.json").write_text(json.dumps([{"eid": "Z", "sid": "z", "first": 0, "last": 0,
+                                                  "turns": [{"sid": "z", "idx": 0}]}]))
+    (d / "fivewhys.jsonl").write_text(json.dumps({"eid": "Z", "real_incident": True}) + "\n")
+    llm, _ = judge(0.0)
+    ir.run(type("A", (), {"hermes_root": "", "data": str(d), "out": str(tmp_path / "o"), "limit": 0, "workers": 1,
+                          "tag": "t"})(), llm=llm)
+    res = ir.score(d, ir.jl(tmp_path / "o" / "verdicts.jsonl"), 0.65, 0.65, False, relabel=False)
+    fired = {(f["sid"], f["idx"]): f for f in res["fps"]}
+    assert ("q", 0) not in fired and ("u", 0) not in fired
+    assert fired[("s", 0)]["sym"] == "update pause did not continue in time"
+
+
 def test_incident_replay_keeps_update_pause_note_quiet(tmp_path):
     """Detection guard: the replay runs resume notes through resume_signal like production; a pause note is a
     negative turn that must not fire, while a crash note still does."""
