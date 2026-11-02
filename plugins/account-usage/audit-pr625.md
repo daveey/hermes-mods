@@ -38,3 +38,14 @@ against both installed core and the candidate, including combined-plugin tests.
 These invocations also pass repo-guards. `check_compat.py` exits 0 against both
 cores, with no skipped pins. This is compatibility evidence, not a claim that
 PR 625 has merged or that existing backend processes have reloaded.
+
+## Revised candidate aadd87984178
+
+Compared `agent/turn_recovery.py` at the already-audited `c63fa491de4f`
+(SHA256 `53be24af3e94076a1ea3d540c82e682db7e373badaeb70a5f65e37d158f3f30a`)
+to `aadd87984178` (SHA256
+`ec792229d99e619a2582bf1d82f5c05df61879232c0a829a9b1bad08c22828ce`).
+The sole delta shortens the comment above `_eager_target`; complete module ASTs
+are identical. All seam conclusions above therefore remain unchanged, with no
+new credential or route fence. Append the file digest, preserving all rollout
+versions. No selection.py or fallback AST/composition pin changes are needed.
