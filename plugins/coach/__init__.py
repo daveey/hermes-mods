@@ -230,7 +230,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         try:
             got += list(_load("origin_authority").origin_asks(
                 _load("goal_scope"), _load("compute_envelope"),
-                log=lambda rec: store.log({**rec, "session_id": session_id})))
+                log=lambda rec: store.log({**rec, "session_id": session_id}),
+                durable=store.root / "origin_authority.json"))
         except Exception as exc:
             store.log({"event": "authority_origin_read", "session_id": session_id, "ok": False,
                        "error": f"{type(exc).__name__}: {exc}"[:200]})

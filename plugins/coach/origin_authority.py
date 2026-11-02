@@ -14,6 +14,13 @@ card body, comments and any agent relay never count: only the origin transcript'
   reach that gateway, the same path ``cross_session`` uses. No courier, a stale Desktop (unknown action) or a
   timeout credits nothing.
 Results are cached per origin (OK_TTL_S / FAIL_TTL_S) so repeated holds in one run do not re-read.
+
+The origin is often a laptop that sleeps (the MacBook's courier goes stale, the mini's SSH hop times out), and each
+Kanban run is a fresh process, so the in-memory cache alone would re-hold every run started while it sleeps. A
+successful read is therefore also recorded in ``<coach root>/origin_authority.json`` (figures + read time, per
+origin, DURABLE_TTL_S). A later failed read credits the figures that record holds: an approval a user typed stays
+given, and the record only ever holds figures a courier read returned (never card text). A successful read
+replaces the record, so a figure no longer in the transcript stops counting.
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ TOTAL_S = 40.0
 OK_TTL_S = 600.0
 FAIL_TTL_S = 120.0
 COURIER_FRESH_S = 20.0
+DURABLE_TTL_S = 30 * 86400.0
 
 _NAME = r"[A-Za-z0-9_.-]{1,128}"
 _CHAT_ID = re.compile(rf"^(?P<gw>{_NAME})/(?P<profile>{_NAME})/(?P<session>{_NAME})$")
@@ -171,11 +179,48 @@ def origin_rows(origin: tuple[str, str, str], scope, me: str, relay=relay_read) 
     return relay(gw, profile, session)
 
 
+def _durable_load(path: Optional[Path]) -> dict:
+    if not path:
+        return {}
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _durable_get(path: Optional[Path], ref: str, now: float) -> Optional[tuple[float, list[float]]]:
+    rec = _durable_load(path).get(ref)
+    if not isinstance(rec, dict):
+        return None
+    try:
+        at = float(rec["at"])
+        figures = [float(v) for v in rec["usd"]]
+    except (TypeError, KeyError, ValueError):
+        return None
+    return (at, figures) if now - at < DURABLE_TTL_S else None
+
+
+def _durable_put(path: Optional[Path], ref: str, figures: list[float], now: float) -> None:
+    if not path:
+        return
+    path = Path(path)
+    data = {k: v for k, v in _durable_load(path).items()
+            if isinstance(v, dict) and now - float(v.get("at") or 0) < DURABLE_TTL_S}
+    data[ref] = {"at": now, "usd": figures[:50]}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    os.replace(tmp, path)
+
+
 def origin_asks(scope, ce, *, task_id: Optional[str] = None, db_path=None, relay=relay_read, me: Optional[str] = None,
-                log: Optional[Callable[[dict], None]] = None, now: Callable[[], float] = time.time) -> list[float]:
+                log: Optional[Callable[[dict], None]] = None, now: Callable[[], float] = time.time,
+                durable: Optional[Path] = None) -> list[float]:
     """Figures the user approved, by a typed bare yes to a priced ask, in the origin chat(s) of this worker's card.
 
-    [] outside a Kanban worker, for a card with no origin chat, or when every read failed (each logged)."""
+    [] outside a Kanban worker, for a card with no origin chat, or when every read failed (each logged) and no
+    earlier successful read of that origin is on record in ``durable``."""
     task_id = task_id if task_id is not None else os.environ.get("HERMES_KANBAN_TASK", "").strip()
     if not task_id:
         return []
@@ -198,14 +243,22 @@ def origin_asks(scope, ce, *, task_id: Optional[str] = None, db_path=None, relay
             figures = [float(v) for v in ce.answered_asks(origin_rows(origin, scope, me, relay), None,
                                                           is_user_evidence=scope.is_evidence_row)]
             _cache[ref] = (now(), True, figures)
+            try:
+                _durable_put(durable, ref, figures, now())
+            except OSError:
+                pass
             if log:
                 log({"event": "authority_origin_read", "task": task_id, "origin": ref, "ok": True,
                      "usd": figures[:20]})
         except Exception as exc:
-            figures = []
-            _cache[ref] = (now(), False, [])
+            rec = _durable_get(durable, ref, now())
+            figures = rec[1] if rec else []
+            _cache[ref] = (now(), False, figures)
             if log:
-                log({"event": "authority_origin_read", "task": task_id, "origin": ref, "ok": False,
-                     "error": f"{type(exc).__name__}: {exc}"[:200]})
+                entry = {"event": "authority_origin_read", "task": task_id, "origin": ref, "ok": False,
+                         "error": f"{type(exc).__name__}: {exc}"[:200]}
+                if rec:
+                    entry.update({"recorded_usd": figures[:20], "recorded_at": rec[0]})
+                log(entry)
         out.extend(figures)
     return out

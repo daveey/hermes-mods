@@ -235,6 +235,42 @@ def test_unclaimed_read_times_out_and_withdraws(hub, monkeypatch):
     assert not list((hub.relay / 'outbox').glob('*.json'))
 
 
+def test_recorded_origin_read_credits_while_the_origin_gateway_sleeps(hub):
+    """Live: the MacBook slept (its courier stale, the mini's SSH hop timed out), so a fresh hub run could not read
+    the origin. A successful earlier read is on record and still credits only the approved figure."""
+    _macbook_chat(hub.macbook_db, APPROVED)
+    courier = hub.courier()
+    assert call(hub.hooks, 'reply', SPEND_LINE) is None
+    courier.close()
+    (hub.relay / 'couriers' / 'macbook.json').unlink()
+    record = json.loads((hub.tmp / 'coach' / 'origin_authority.json').read_text())
+    assert record[f'@session:default@macbook/{ORIGIN_SID}']['usd'] == [36.0]
+    hub.oa._cache.clear()  # a new Kanban run is a new process
+    assert call(hub.hooks, 'reply', SPEND_LINE) is None
+    assert call(hub.hooks, 'kanban_create', BIGGER)
+    last = _reads(hub.tmp)[-1]
+    assert last['ok'] is False and 'no live Desktop courier' in last['error'] and last['recorded_usd'] == [36.0]
+
+
+def test_a_fresh_read_replaces_the_record(hub):
+    (hub.tmp / 'coach').mkdir(exist_ok=True)
+    (hub.tmp / 'coach' / 'origin_authority.json').write_text(json.dumps(
+        {f'@session:default@macbook/{ORIGIN_SID}': {'at': time.time(), 'usd': [36.0]}}))
+    _macbook_chat(hub.macbook_db, [('user', 'status?'), ('assistant', 'Rerun is idle.'), ('user', 'ok')])
+    hub.courier()
+    assert call(hub.hooks, 'reply', SPEND_LINE)
+    record = json.loads((hub.tmp / 'coach' / 'origin_authority.json').read_text())
+    assert record[f'@session:default@macbook/{ORIGIN_SID}']['usd'] == []
+
+
+def test_an_expired_record_credits_nothing(hub, monkeypatch):
+    (hub.tmp / 'coach').mkdir(exist_ok=True)
+    (hub.tmp / 'coach' / 'origin_authority.json').write_text(json.dumps(
+        {f'@session:default@macbook/{ORIGIN_SID}': {'at': time.time() - hub.oa.DURABLE_TTL_S - 1, 'usd': [36.0]}}))
+    assert call(hub.hooks, 'reply', SPEND_LINE)
+    assert 'recorded_usd' not in _reads(hub.tmp)[-1]
+
+
 def test_not_a_worker_reads_no_origin(hub, monkeypatch):
     monkeypatch.delenv('HERMES_KANBAN_TASK')
     _macbook_chat(hub.macbook_db, APPROVED)

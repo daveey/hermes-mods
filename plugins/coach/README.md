@@ -110,7 +110,10 @@ paged oldest-first with compaction history, slimmed to each user row plus the la
 The same `answered_asks` rules apply, so only a typed yes in that chat counts; the card body, its comments and
 agent relays into the chat never do. No live courier for the gateway, a Desktop without `authority_read`, an
 unclaimed request (15 s) or a timeout (40 s) credits nothing; each read logs `authority_origin_read` (`origin`,
-`ok`, `usd` or `error`) and is cached per origin (10 min, failures 2 min). Declarations ("I will rent with a $3,000 cap"), the assistant's own or retold
+`ok`, `usd` or `error`) and is cached per origin (10 min, failures 2 min). A successful read is also recorded in
+`<coach root>/origin_authority.json` (30 days): the origin is often a sleeping laptop and each Kanban run is a new
+process, so a later failed read credits the figures that record holds (logged as `recorded_usd`), and the next
+successful read replaces it. Declarations ("I will rent with a $3,000 cap"), the assistant's own or retold
 "approved", an unpriced question in the same message, conditions ("approved, but ...") and runtime rows
 inherit nothing; "Approve $50 or $100?" + yes credits $50. Only typed user text counts anywhere: notice
 and relay rows (`[chat-closeout] ...`, `⏸ [hub:default] ...`) never grant dollars, even when they quote
