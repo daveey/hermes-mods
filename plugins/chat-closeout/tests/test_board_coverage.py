@@ -96,3 +96,20 @@ def test_projection_failure_still_discards_invalid_board_timer(board_world, monk
     tick(1000)
     assert led.get('chat')['batch'] == [KEY]
     assert not led.get('chat')['unlinked']
+
+
+@pytest.mark.parametrize('key', ['hub/build/t_one', 'hub/default/t_one'])
+@pytest.mark.parametrize('available', [True, False])
+def test_legacy_board_or_profile_key_cannot_claim_absence(board_world, key, available):
+    led, path = board_world
+    if available:
+        with sqlite3.connect(path) as db:
+            db.execute('INSERT INTO tasks VALUES (?, ?, ?)', ('t_one', 'todo', 'hub'))
+    else:
+        path.unlink()
+    led.write('chat', batch=[key], unlinked={key: {
+        'since': 1, 'observed': 23 * H, 'at': 1000, 'mono': 1000, 'pid': core.os.getpid()}})
+    for h in range(30):
+        assert tick(1000 + h * H) == []
+        assert led.get('chat')['batch'] == [key]
+        assert not led.get('chat')['unlinked']

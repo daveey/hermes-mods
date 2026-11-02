@@ -182,6 +182,11 @@ def _board_absence_veto(keys: set[str]) -> set[str]:
     veto: set[str] = set()
     for key in keys:
         parts = key.split('/')
+        if len(parts) == 3:
+            # Historical forms used BOTH gateway/profile/id and gateway/board/id.
+            # Without a projected canonical owner, no one board proves absence.
+            veto.add(key)
+            continue
         if len(parts) != 4:
             continue
         board = parts[2]

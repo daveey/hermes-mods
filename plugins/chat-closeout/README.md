@@ -80,7 +80,9 @@ The origin/shepherd projection only contains linked rows; freshness there does n
 Any task with that id in the shadow vetoes unlinking, regardless of status or owner, without granting settlement.
 A missing, unreadable, wrong-board, future-dated or stale shadow is uncertain, not an observed absence. These
 vetoes discard previously accumulated missing time on the first pass. Hosts without full-board coverage retain
-unresolved qualified entries rather than guessing; legacy one-/three-part resolution remains unchanged.
+unresolved qualified entries rather than guessing. An unresolved legacy three-part key is also uncertain:
+its middle part historically meant either profile or board, so no single board can prove absence until an
+inventory row supplies a canonical owner. Bare-id resolution remains unchanged.
 The Board shadow is shared across gateways/profiles (not a gateway partition); its `gateway_id` identifies the
 reader, not the owner of every task. This is why coverage is checked by board and presence by id.
 `tests/test_board_coverage.py` exercises full/light readers, first-pass reset, projection failure, >24-hour
