@@ -82,7 +82,10 @@ This plugin:
   quotes, repo unknown. These shadow passes only add refusals, so adding an unsupported
   wrapper or an ANSI-C word never turns a refused restore into an allow;
 - treats Git argv conservatively: an unknown word in the subcommand position, an unknown
-  global option (unknown arity), a splittable unknown option argument, or an alias that
+  global option (unknown arity), a splittable unknown option argument (a double-quoted
+  `$(...)`/`${...}`/backtick substitution is one word even when its own text quotes an
+  unknown variable, as in `-c http.extraHeader="... $(printf %s "$TOK" | base64)"`; a quoted
+  `"$@"` or `"${a[@]}"` still splits), or an alias that
   `-c alias.*`/`--config-env`/`GIT_CONFIG_*` may define (any non-builtin subcommand) makes
   the subcommand unknown; then any unknown word or restore evidence after it is a restore
   in an unknown repo. Known global options (`--namespace`, `--attr-source`,

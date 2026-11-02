@@ -2126,3 +2126,61 @@ def test_for_loop_over_same_branch_checkout_allows_pop(multi):
     main, _wt = multi
     cmd = f"for w in {main}; do git -C $w stash pop; done"
     assert guard.refuse_reason(cmd, str(main)) is None, cmd
+
+
+# A double-quoted command substitution never splits, even when its own text quotes an unknown
+# variable (`"$(printf x:%s "$TOK")"`): the inner quotes do not close the outer ones.
+AUTH_FETCH = ('set +x; source {env}; TOK="$GITHUB_TOKEN"; git -C {repo} -c http.extraHeader='
+              '"Authorization: Basic $(printf x-access-token:%s "$TOK" | base64 -w0)" fetch origin main')
+
+
+@pytest.mark.parametrize("cmd", [
+    AUTH_FETCH,
+    'git -C {repo} -c http.extraHeader="X: $(printf %s "$TOK")" fetch origin main',
+    'git -C {repo} -c http.extraHeader="X: ${{TOK:-"$OTHER"}}" fetch origin main',
+    'git -C {repo} -c http.extraHeader="X: `printf %s "$TOK"`" push origin HEAD',
+])
+def test_quoted_substitution_with_inner_quotes_allows_fetch(multi, cmd):
+    main, wt = multi
+    cmd = cmd.format(env=main / "missing.env", repo=wt)
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert block("terminal", command=cmd, workdir=str(main)) is None, cmd
+    assert list(guard._git_calls_noted(cmd, str(main)))[-1][:2] == (os.path.realpath(wt), cmd.split()[-3])
+
+
+@pytest.mark.parametrize("cmd", [
+    # The real restore is still refused next to the same authenticated config.
+    'TOK="$GITHUB_TOKEN"; git -C {wt} -c http.extraHeader="X: $(printf %s "$TOK")" stash pop',
+    'git -C {wt} -c a="$(printf %s "$TOK")" stash apply',
+    # An unquoted substitution may still split into the subcommand.
+    'git -C {wt} -c a=$(printf %s "$TOK") fetch',
+    'git -C {wt} -c a="x"$(printf %s "$TOK") fetch',
+    # A restore inside the quoted substitution itself is still analyzed.
+    'git -C {wt} -c a="$(git -C {wt} stash pop)" fetch',
+])
+def test_quoted_substitution_fix_keeps_restore_refusals(multi, cmd):
+    main, wt = multi
+    cmd = cmd.format(wt=wt)
+    assert guard.refuse_reason(cmd, str(main)), cmd
+    assert block("terminal", command=cmd, workdir=str(main)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    'a=(a.b=c stash pop); git -C {wt} -c "${{a[@]}}"',
+    'set -- a.b=c stash pop; git -C {wt} -c "$@"',
+    'a=(a.b=c stash pop); git -C {wt} -c "${{a[@]:0}}"',
+])
+def test_quoted_array_expansion_in_git_option_fails_closed(multi, cmd):
+    main, wt = multi
+    cmd = cmd.format(wt=wt)
+    assert guard.refuse_reason(cmd, str(main)), cmd
+    assert block("terminal", command=cmd, workdir=str(main)), cmd
+    # Proof: the quoted array really becomes `git -c a.b=c stash pop` and restores main's stash.
+    bash = _proof_bash()
+    def stashes():
+        return subprocess.run(["git", "stash", "list"], cwd=main, env=GIT_ENV, check=True,
+                              capture_output=True, text=True).stdout
+    before = stashes()
+    assert before
+    subprocess.run([bash, "-c", cmd], cwd=main, env=GIT_ENV, capture_output=True, timeout=30)
+    assert stashes() != before and (wt / "f.txt").read_text() == "stashed\n"

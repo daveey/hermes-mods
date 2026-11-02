@@ -304,6 +304,24 @@ def _splittable(raw: str) -> bool:
             quote = c if quote is None else None
         elif quote is None and c in "$`*?[{":
             return True
+        elif quote == '"' and raw.startswith("$@", i):
+            return True  # "$@" expands to one word per positional parameter
+        elif quote == '"' and (c == "`" or raw.startswith(("$(", "${"), i)):
+            # A substitution inside double quotes never splits; its own quotes do not
+            # close the outer ones, so skip it whole instead of rescanning its text.
+            start = i
+            try:
+                if c == "`":
+                    i = _skip_backtick(raw, i + 1)
+                elif raw[i + 1] == "(":
+                    i = _match_paren(raw, i + 2)
+                else:
+                    i = _match_brace(raw, i + 2)
+                    if "@" in raw[start:i]:
+                        return True  # "${a[@]}" / "${@:2}" expand to several words
+            except _ParseError:
+                return True  # unparsed: stay conservative
+            continue
         i += 1
     return False
 
