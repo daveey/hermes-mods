@@ -194,6 +194,21 @@ class ExcludeProfileGlob(unittest.TestCase):
 
 
 class DigestUserTurnClipping(unittest.TestCase):
+    def test_injected_context_does_not_displace_user_correction(self):
+        user = "I vetoed this: " + "quoted warning " * 50 + " by accident, it's approved"
+        for marker in ("Attached Context", "Context Warnings"):
+            text = user + "\n\n--- " + marker + " ---\n\n" + "external page " * 100
+            t = time.time() - 100
+            with tempfile.TemporaryDirectory() as d:
+                db = Path(d) / "state.db"
+                make_db(db, [("user", text, t, 1, 0, None, None, "u1")])
+                (dg,) = list(sd.digest_db("default", db, "test", 0))
+            turn = dg["user_turns"][0]
+            self.assertTrue(turn["text"].endswith("by accident, it's approved"))
+            self.assertNotIn("external page", turn["text"])
+            self.assertEqual(turn["text_original_chars"], len(user))
+        self.assertEqual(sd.clean_user("Discuss Attached Context in prose"), "Discuss Attached Context in prose")
+
     def test_long_user_correction_preserves_head_tail_and_budget(self):
         text = "I vetoed this: " + "quoted background " * 40 + " by accident, it is approved"
         clipped = sd.clip_user_turn(text)

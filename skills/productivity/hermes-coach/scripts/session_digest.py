@@ -27,6 +27,8 @@ PREV_HEAD, PREV_TAIL = 150, 450  # `prev` per user turn: a reply's ending (\"Don
 
 # Blocks Hermes injects into user messages; they are not the user's words.
 INJECTED = [
+    # Same footer boundary the core context-reference producer/title reader use.
+    re.compile(r"\n+--- (?:Context Warnings|Attached Context) ---\n.*", re.S),
     re.compile(r"<memory-context>.*?</memory-context>", re.S),
     re.compile(r"<system-reminder>.*?</system-reminder>", re.S),
     re.compile(r"<pasted_content[^>]*>.*?</pasted_content>", re.S),
