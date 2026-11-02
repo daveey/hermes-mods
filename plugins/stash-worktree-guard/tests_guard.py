@@ -1310,6 +1310,95 @@ def _case_cd(single, dirs):
     return f'cd {single}; case "$1" in {arms} esac; git stash pop'
 
 
+@pytest.fixture(autouse=True)
+def assert_cap_states_survive_copy(request, monkeypatch):
+    if not request.node.name.startswith("test_state_cap"):
+        return
+    original = guard._union
+
+    def checked(*groups):
+        result = original(*groups)
+        for state in result:
+            assert state.copy().key() == state.key()
+        return result
+
+    monkeypatch.setattr(guard, "_union", checked)
+
+
+@pytest.mark.parametrize("count", [16, 17, 30])
+@pytest.mark.parametrize("shape", ["tilde", "stable", "quoted", "absolute", "status"])
+def test_state_cap_join_readonly(multi, monkeypatch, count, shape):
+    main, wt = multi
+    monkeypatch.setenv("HOME", str(main.parent))
+    loop = "for s in " + " ".join(map(str, range(count))) + "; do echo $s; done; "
+    commands = {
+        "tilde": loop + "C=~/repo; git -C $C log --oneline -1",
+        "stable": f"C={main}; " + loop + "git -C $C log --oneline -1",
+        "quoted": f"C={main}; " + loop + 'git -C "$C" log --oneline -1',
+        "absolute": loop + f"C={main}; git -C $C log --oneline -1",
+        "status": loop + "git status --short",
+    }
+    assert guard.refuse_reason(commands[shape], str(wt)) is None
+
+
+@pytest.mark.parametrize("shape", ["cwd", "variable", "nonconvergent", "nameref"])
+def test_state_cap_join_restore_controls(multi, shape):
+    main, wt = multi
+    # Distinct spellings resolve to the same real worktree in the shell.
+    paths = " ".join(str(wt) + "/." * i for i in range(1, 21))
+    nums = " ".join(map(str, range(20)))
+    dirs = " ".join(map(str, _subdirs(wt, 20)))
+    commands = {
+        "cwd": f"for d in {dirs}; do cd $d; done; git stash pop",
+        "variable": f"for X in {paths}; do echo $X; done; git -C $X stash pop",
+        "nonconvergent": f"X={wt}; for s in {nums}; do X=$X/.; done; git -C $X stash pop",
+        "nameref": f"declare -n R=HOME; for s in {paths}; do R=$s; done; git -C {wt} stash pop",
+    }
+    command = commands[shape]
+    reason = guard.refuse_reason(command, str(wt))
+    assert reason
+    _assert_real_restore(command, main, wt)
+
+
+def test_state_cap_join_unknown_word_diagnostic(multi):
+    _main, wt = multi
+    values = " ".join(map(str, range(20)))
+    reason = guard.refuse_reason(
+        f"for X in {values}; do echo $X; done; git -C $X log --oneline -1", str(wt))
+    assert reason and "$X" in reason
+
+
+def test_state_cap_join_consensus_fields():
+    states = [guard._State("/same", {"HOME": "/home/test", "X": str(i)},
+                           {"X"}, {}, "/logical")
+              for i in range(17)]
+    states[0].vars["PARTIAL"] = "value"
+    joined, = guard._union(states)
+    assert joined.cwd == "/same"
+    assert joined.lcwd == "/logical"
+    assert joined.vars == {"HOME": "/home/test", "X": None, "PARTIAL": None}
+    assert joined.exported == {"X"}
+    states[-1].lcwd = "/different"
+    joined, = guard._union(states)
+    assert joined.lcwd is None
+
+
+@pytest.mark.parametrize("shape", ["nameref-loop", "nameref-no-loop", "export", "function"])
+def test_state_cap_join_adversarial_restores(multi, shape):
+    main, wt = multi
+    values = " ".join(str(wt) + "/." * i for i in range(1, 21))
+    loop = f"for s in {values}; do V=$s; done; "
+    commands = {
+        "nameref-loop": f"X={main}; declare -n R=X; for s in {values}; do R=$s; done; git -C $X stash pop",
+        "nameref-no-loop": f"X={main}; declare -n R=X; R={wt}; git -C $X stash pop",
+        "export": f"cd {wt}; X=../repo; if [ -d {main} ]; then :; else export X; fi; "
+                  + loop + "bash -c 'cd ./$X && git stash pop'",
+        "function": f"cd {main}; if [ -d {main} ]; then f() {{ cd ../wt; }}; else f() {{ :; }}; fi; "
+                    + loop + "f; git stash pop",
+    }
+    _assert_real_restore(commands[shape], main, wt)
+
+
 @pytest.mark.parametrize("declaration", ["declare -n", "declare -xn", "typeset -nx", "local -n", "local -xn"])
 @pytest.mark.parametrize("count", [0, 20])
 def test_state_cap_join_nameref_flags(multi, declaration, count):
@@ -1337,6 +1426,16 @@ def test_state_cap_join_delayed_function(multi):
     main, wt = multi
     command = ("for i in 1 2 3; do g; h; h(){ g(){ f(){ "
                + f"git -C {wt} stash pop; " + "}; }; }; done; f")
+    _assert_real_restore(command, main, wt)
+
+
+def test_state_cap_join_logical_cwd_survives_copy(multi):
+    main, wt = multi
+    (wt / "m").symlink_to(main, target_is_directory=True)
+    (wt / "repo").symlink_to(".", target_is_directory=True)
+    values = " ".join(str(wt) + "/." * i for i in range(1, 21))
+    command = (f"if [ -d {main} ]; then cd {wt}/m; else cd {main}; fi; "
+               f"for s in {values}; do V=$s; done; W=1; cd ../repo; git stash pop")
     _assert_real_restore(command, main, wt)
 
 
@@ -1825,6 +1924,20 @@ def test_builtin_hash_object_alias_does_not_pop_real_stash(multi):
 def test_all_known_builtins_ignore_alias_uncertainty(multi, name):
     main, _wt = multi
     assert guard.refuse_reason(BUILTIN_WRAPPER + "; git " + name, str(main)) is None
+
+
+def test_state_cap_exported_repository_selectors(multi):
+    main, wt = multi
+    gd = subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"],
+                                 cwd=wt, env=GIT_ENV, text=True).strip()
+    branches = "; ".join(f"[ -e /nonexistent-swg-{i} ] && x{i}=1" for i in range(5))
+    cmd = f"export GIT_DIR={gd} GIT_WORK_TREE={wt}; {branches}; git -C {main} stash pop"
+    assert _blocked(cmd, main), cmd
+    subprocess.run(["bash", "-c", cmd], cwd=main, env=GIT_ENV,
+                   check=True, capture_output=True, timeout=30)
+    assert (main / "f.txt").read_text() == "base\n"
+    assert (wt / "f.txt").read_text() == "stashed\n"
+    assert not subprocess.check_output(["git", "stash", "list"], cwd=main, env=GIT_ENV).strip()
 
 
 def test_for_loop_over_same_branch_checkout_allows_pop(multi):

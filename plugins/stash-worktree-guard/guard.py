@@ -971,7 +971,34 @@ def _union(*groups) -> list:
         for st in group:
             seen.setdefault(st.key(), st)
     out = list(seen.values())
-    return [_unknown(out)] if len(out) > MAX_STATES else out
+    if len(out) <= MAX_STATES:
+        return out
+    unknown = _unknown(out)
+    if unknown.exported & {_NAMEREF, _ANYREF}:
+        return [unknown]  # indirect assignments can invalidate any variable
+    # Export presence and function bodies are alternatives, not unionable facts.
+    # Join only partitions that agree on both; preserve shared finite-state facts.
+    parts: dict = {}
+    for st in out:
+        parts.setdefault((tuple(sorted(st.exported)), st.key()[4]), []).append(st)
+    if len(parts) > MAX_STATES:
+        return [unknown]
+    joined = []
+    for group in parts.values():
+        first = group[0]
+        st = first.copy()
+        st.cwd = first.cwd if all(s.cwd == first.cwd for s in group) else None
+        st.lcwd = first.lcwd if all(s.lcwd == first.lcwd for s in group) else None
+        # None defaults to cwd in the constructor/copy: do not manufacture a
+        # logical path on a later assignment after joining symlink alternatives.
+        if st.lcwd is None:
+            st.cwd = None
+        for name in set().union(*(s.vars for s in group)):
+            value = first.vars.get(name)
+            st.vars[name] = value if all(
+                name in s.vars and s.vars[name] == value for s in group) else None
+        joined.append(st)
+    return joined
 
 
 def _skip_wrappers(words: list[str]) -> list[str]:
