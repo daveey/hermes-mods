@@ -839,7 +839,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                                           "turn": coach.turn_number(session_id),
                                                           "notice": rc.notice_turn(ask), "platform": platform}),
                            report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK),
-                           prev_turn=prev,
+                           prev_turn=prev, platform=platform,
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
@@ -857,7 +857,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                         r = max(rest, key=lambda x: v[x])
                         hit = {"rule": r, "p": v[r], "evidence": v["evidence"],
                                "nudge": rc.nudge_for(r, v["evidence"], kanban_down=kanban_down,
-                                                     card_closed=rc.card_closed(log_lines))}
+                                                     card_closed=rc.card_closed(log_lines), platform=platform)}
             if not hit:
                 guard = rc.report_only_guard(ask, final_response, log_lines)
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,

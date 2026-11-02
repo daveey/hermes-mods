@@ -1213,6 +1213,7 @@ probabilities (0-1):
     failed or crashed start attempts, is parked behind a quota or routing wall ("No eligible deep routes"), or "starts
     by itself" after a reset scores HIGH (0.7+) even when the tool log checked that card, unless the tool log shows
     the agent did the work this turn or re-placed the card on a gateway that can run it, and the message says which.
+    A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either.
   * Small or optional leftovers still count. A closing "one limit / one gap / one small thing", "I left that alone",
     "optional tidy-up", "I didn't touch it", "haven't checked X", "needs a restart / the next sync to take effect", "not
     posted" about something the agent could do or check with its access scores 0.7+, even when the main work is done
@@ -1263,7 +1264,7 @@ Return ONLY one JSON object:
 - agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false. An item the user chose to defer, rescope or skip is false when the reply names that decision and a tool log shown (this turn or the previous turn) records it (a card read or comment carrying the decision); acting on it would override the user. Only the user's own recorded decision counts: an agent's own choice to wait, a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and the latest request asking the agent to finish it overrides an earlier deferral.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
-  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it.
+  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it. A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either.
   "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how), possibly asking for a go-ahead.
   "offered": only a vague offer ("want me to fix it?", "I can look into it") with no concrete solution.
   "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.
@@ -1650,14 +1651,29 @@ REPORT_ONLY_WHOLE_REPLY = (" The re-check reads your whole reply: any other prob
                            "pursuing', 'leaving it', 'still unexplained') needs the same: fix it, card it, or propose it.")
 
 
-def nudge_for(rule: str, evidence: str, kanban_down: bool = False, card_closed: bool = False) -> str:
+# agent-0e5f1ab1f9: a Kanban worker whose card forbade both doing the repair and re-placing it ("preserve the quota
+# reserve / independent review", "no pin changes") got only STALLED_OWNER's two exits plus "propose the exact fix",
+# which reaches nobody from a headless run. It argued and failed again. The parks lifecycle_park() accepts end the
+# turn; name them on Kanban turns (platform == "kanban") only.
+REPORT_ONLY_KANBAN_PARKS = (
+    " If the card forbids both doing it here and re-placing it, end with one of two parks. When a clock gates it "
+    "(a quota reset, a release window), park on that real time: kanban_schedule or kanban_block(kind='time', "
+    "reason='SCHEDULED_UNTIL=<the real reset, ISO> — …'). When lifting the gate is David's call (e.g. exceeding a "
+    "quota reserve), kanban_block(kind='needs_input', human_request={action, why_human, interaction, scope, "
+    "evidence}). A dependency park behind a stalled card is not an ending.")
+
+
+def nudge_for(rule: str, evidence: str, kanban_down: bool = False, card_closed: bool = False,
+              platform: str = "") -> str:
+    parks = ""
     if rule == "report_only" and kanban_down:
         tmpl = REPORT_ONLY_KANBAN_DOWN
     elif rule == "report_only" and card_closed:
         tmpl = REPORT_ONLY_CARD_CLOSED
     else:
         tmpl = NUDGES[rule]
-    text = tmpl.format(evidence=evidence or "see your last message")
+        parks = REPORT_ONLY_KANBAN_PARKS if rule == "report_only" and platform == "kanban" else ""
+    text = tmpl.format(evidence=evidence or "see your last message") + parks
     return text + REPORT_ONLY_WHOLE_REPLY if rule == "report_only" else text
 
 
@@ -1852,8 +1868,9 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           card_status: Optional[Callable[[str], Optional[str]]] = None,
           capped_nudge: bool = True,
           report_only_fallback: str = REPORT_ONLY_FALLBACK,
-          prev_turn: Optional[dict] = None, deny_quoted: bool = False) -> Optional[dict]:
+          prev_turn: Optional[dict] = None, deny_quoted: bool = False, platform: str = "") -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `platform` (the turn's platform) picks the report_only nudge's Kanban park exits (agent-0e5f1ab1f9).
     `deny_quoted` (nudge_outcome only): a denied_ask phrase inside quote marks still counts, so a correction that
     quotes its old denial resolves only by telling the ask (agent-747c4fc95b).
     `prev_turn` (AgentCoach.prev_turn): the previous turn's tool log and reply head, shown to the judge when this turn
@@ -2026,7 +2043,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     closed = best == "report_only" and card_closed(tool_log)
     return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v,
             **({"variant": "card_closed"} if closed and not down else {}),
-            "nudge": nudge_for(best, v["evidence"], kanban_down=down, card_closed=closed)}
+            "nudge": nudge_for(best, v["evidence"], kanban_down=down, card_closed=closed, platform=platform)}
 
 
 # ───────────────────────────── block-time handoff check (agent-19492bff76) ─────────────────────────────
