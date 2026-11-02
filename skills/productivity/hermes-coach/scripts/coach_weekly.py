@@ -16,6 +16,8 @@ Prints a Markdown block the coach Bot turns into reports/weekly-<date>.md:
      fix (selfheal_* coach events + `selfheal:` Kanban cards, or the hub's reports/selfheal-lane.jsonl snapshot).
   2d. Guards in shadow/off > 7 days: every mode-switched detector/guard (GUARDS) on this host stuck in shadow/off,
      with its fire count; --file-guard-cards opens one Kanban card per guard (never an Inbox card).
+  2e. Held-draft restores: replies session-outcome's gate replaced with the held answer because the model sent a stub
+     after a hold (<home>/logs/held-draft-restores.jsonl), this window vs the previous one.
   2d. report_only_rate by model family (astra / opus / sonnet / other) and trigger (human-question / human-action /
      event): the share of judged Desktop turns that end at a diagnosis of a fixable problem (coach_report_only.py,
      judge rubric from the Oct 2026 eval, bounded by the engine budget). Targets: human-question <= 10%, event <= 20%.
@@ -593,6 +595,42 @@ def section_selfheal(data, now, days, homes=None, events=None, cards=None):
     return out
 
 
+def held_draft_restores(homes, lo, hi):
+    """session-outcome's `restored held draft` events (<home>/logs/held-draft-restores.jsonl, profiles too) in [lo, hi)."""
+    out = []
+    for home in homes:
+        for p in [home / "logs" / "held-draft-restores.jsonl", *sorted(home.glob("profiles/*/logs/held-draft-restores.jsonl"))]:
+            if not p.exists():
+                continue
+            for line in p.read_text(errors="replace").splitlines():
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(r, dict) and isinstance(r.get("ts"), (int, float)) and lo <= r["ts"] < hi:
+                    out.append(r)
+    return out
+
+
+def section_held_drafts(now, days, homes=None):
+    """KPI: replies the session-outcome gate restored because the model answered its hold with a stub. Each one is
+    a full answer the user would otherwise have lost (hub 20261028_071229_45f849); a rising count means the core
+    not-shown notice is not holding and the gate's nudge needs another look."""
+    homes = selfheal_homes(homes)
+    span = days * 86400
+    cur = held_draft_restores(homes, now - span, now)
+    prev = held_draft_restores(homes, now - 2 * span, now - span)
+    out = ["## Held-draft restores (session-outcome)", ""]
+    line = (f"Held-draft restores: {len(cur)} this window (previous {len(prev)}); "
+            f"{len({r.get('session_id') for r in cur})} sessions.")
+    if cur:
+        worst = max(cur, key=lambda r: r.get("held_chars", 0) - r.get("reply_chars", 0))
+        line += (f" Largest: {worst.get('session_id')} {worst.get('held_chars')} -> {worst.get('reply_chars')} chars. "
+                 "Each is a reply that dropped its held answer after a gate hold.")
+    out.append(line)
+    return out
+
+
 # Detectors / guards that ship behind a mode switch. A guard left in shadow or off is a decision nobody made: after
 # GUARD_LIMBO_DAYS the digest lists it with its fire count and (with --file-guard-cards) opens ONE Kanban card per
 # guard to enforce or remove it. Never an Inbox card: the decision is agent work, not David's.
@@ -752,6 +790,7 @@ def main():
         import coach_report_only
         out += coach_report_only.section(a.state_db, a.days, data=data, max_turns=a.report_only_max) + [""]
     out += section_guards(a.guard_home, now, file_cards=a.file_guard_cards) + [""]
+    out += section_held_drafts(now, a.days, homes=a.home or None) + [""]
     checks = list(dict.fromkeys(a.check + canary_checks(data)))
     if checks:
         out += ["## Config-change checks", ""]

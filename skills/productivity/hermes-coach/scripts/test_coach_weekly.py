@@ -444,3 +444,39 @@ class GuardShadowAge(unittest.TestCase):
         self.section(file_cards=True, run=lambda argv, **kw: again.append(argv) or R())
         self.assertEqual([a[a.index("--idempotency-key") + 1] for a in again],
                          [a[a.index("--idempotency-key") + 1] for a in calls])  # same keys -> same cards
+
+
+class HeldDraftRestores(unittest.TestCase):
+    """KPI for session-outcome's safety net: replies restored after a gate hold (stub instead of the held answer)."""
+    NOW = 1_800_000_000.0
+    DAY = 86400.0
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+
+    def write(self, rel, rows):
+        p = self.home / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows) + "not json\n")
+
+    def section(self):
+        return "\n".join(coach_weekly.section_held_drafts(self.NOW, 7, homes=[self.home]))
+
+    def test_none(self):
+        self.assertIn("Held-draft restores: 0 this window (previous 0); 0 sessions.", self.section())
+
+    def test_counts_window_previous_and_profiles(self):
+        self.write("logs/held-draft-restores.jsonl", [
+            {"ts": self.NOW - 1 * self.DAY, "session_id": "s1", "held_chars": 3000, "reply_chars": 200},
+            {"ts": self.NOW - 2 * self.DAY, "session_id": "s1", "held_chars": 900, "reply_chars": 100},
+            {"ts": self.NOW - 10 * self.DAY, "session_id": "s0", "held_chars": 900, "reply_chars": 100},
+            {"ts": self.NOW + 1, "session_id": "future", "held_chars": 9000, "reply_chars": 1},
+        ])
+        self.write("profiles/alpha/logs/held-draft-restores.jsonl", [
+            {"ts": self.NOW - 3 * self.DAY, "session_id": "s2", "held_chars": 1200, "reply_chars": 50}])
+        out = self.section()
+        self.assertIn("Held-draft restores: 3 this window (previous 1); 2 sessions.", out)
+        self.assertIn("Largest: s1 3000 -> 200 chars.", out)
+        self.assertNotIn("future", out)
