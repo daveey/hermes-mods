@@ -3,6 +3,7 @@ import copy
 import importlib
 import json
 import pytest
+from dataclasses import replace
 from conftest import PACKAGE, core, start
 from test_native import bridge, native_card, native_project
 
@@ -375,3 +376,58 @@ def test_recover_card_intent_review_stage_after_created_implement(env):
     entry = service.recover_card_intent(row['workflow_id'], 'review')
     assert entry['state'] == 'created' and entry['recovered_from'] == 'create_intent'
     assert set(service.store.get(row['workflow_id'])['cards']) == {'implement', 'review'}
+
+
+# ------------------------------------------- bounded history and retirement
+
+def test_refusal_history_is_bounded(env):
+    service, ctx, ports = env
+    limit = core.REFUSAL_HISTORY
+    refuse(ports, 'implement', [f'code{i}' for i in range(limit + 5)])
+    row = start(service, ctx, 'work')
+    for _ in range(limit + 4):
+        row = service.reconcile()[0]
+    entry = row['cards']['implement']
+    assert entry['refusal']['code'] == f'code{limit + 4}'
+    assert len(entry['refusals']) == limit
+    assert entry['refusals'][-1]['code'] == f'code{limit + 3}'
+    assert entry['refusals'][0]['code'] == 'code4'
+
+
+def test_retired_generation_create_refused_is_absent_not_ambiguous(env):
+    service, ctx, ports = env
+    refuse(ports, 'implement', [CODE])
+    row = start(service, ctx, 'work')
+    assert row['cards']['implement']['state'] == 'create_refused'
+    old_key = row['cards']['implement']['params']['idempotency_key']
+    quiesced = []
+    ports.quiesce_generation = lambda r, old: quiesced.append(old['generation']) or True
+    followup = replace(ctx, message_id='next', thread_id=ctx.message_id)
+    row = start(service, followup, 'more work')
+    assert row['generation'] == 2 and quiesced == [1]
+    old = row['history'][0]
+    assert old['retired'] is True
+    assert old['cards']['implement']['state'] == 'refused_retired'
+    assert 'id' not in old['cards']['implement']
+    assert old['cards']['implement']['params']['idempotency_key'] == old_key
+    assert row['cards']['implement']['state'] == 'created'
+
+
+def test_retired_generation_plain_create_intent_stays_ambiguous(env):
+    service, ctx, ports = env
+    original = ports.create_card
+
+    def lost(workflow_id, stage, params):
+        if stage == 'implement':
+            raise RuntimeError('transport lost')
+        return original(workflow_id, stage, params)
+    ports.create_card = lost
+    raised = capture_raises(service)
+    row = start(service, ctx, 'work')
+    assert row['cards']['implement']['state'] == 'create_intent'
+    ports.create_card = original
+    ports.quiesce_generation = lambda r, old: True
+    followup = replace(ctx, message_id='next', thread_id=ctx.message_id)
+    row = start(service, followup, 'more work')
+    assert 'retired' not in row['history'][0] or row['history'][0]['retired'] is not True
+    assert any('Earlier ambiguous card needs operator recovery' in str(e) for e in raised)

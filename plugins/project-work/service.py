@@ -95,6 +95,7 @@ class CardCreateRefused(WorkflowError):
 
 
 STAGES = ('implement', 'review', 'release')
+REFUSAL_HISTORY = 20
 
 
 class Service:
@@ -247,6 +248,12 @@ class Service:
             for stage, entry in old.get('cards', {}).items():
                 if not entry.get('id'):
                     card_id = self.ports.recover_card(row['workflow_id'], stage, entry['params'])
+                    if not card_id and entry.get('state') == 'create_refused':
+                        # The last create was a proven refusal (a retry re-persists
+                        # create_intent first), and quiesce revoked the key: absent.
+                        entry['state'] = 'refused_retired'
+                        self.store.save(row)
+                        continue
                     if not card_id:
                         raise WorkflowError('Earlier ambiguous card needs operator recovery')
                     entry.update(id=card_id, state='created')
@@ -355,7 +362,8 @@ class Service:
         """Persist a proven native refusal; params and key are never touched."""
         entry = row['cards'][stage]
         if entry.get('refusal'):
-            entry.setdefault('refusals', []).append(entry['refusal'])
+            # Bounded: a still-refused stage is retried once per reconcile tick.
+            entry['refusals'] = (entry.get('refusals', []) + [entry['refusal']])[-REFUSAL_HISTORY:]
         entry.update(state='create_refused', refusal={
             'code': exc.code, 'error': exc.error,
             'idempotency_key': exc.idempotency_key, 'at': time.time()}, **(extra or {}))

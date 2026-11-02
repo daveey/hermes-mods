@@ -258,9 +258,15 @@ attempted). Each later normal attempt (reconcile tick) first runs the read-only,
 archived-inclusive `recover_card` and adopts a card it finds; otherwise it
 re-persists `create_intent` (keeping the refusal history) and calls `create_card`
 with the SAME params and idempotency key. Success sets `created` and the ID; a
-repeated refusal moves the previous `refusal` into the `refusals` list. Params
+repeated refusal moves the previous `refusal` into the `refusals` list, which
+keeps the last 20 entries (a still-refused stage is retried once per tick). Params
 and keys are never cleared or regenerated. An ambiguous outcome of that retry
 leaves `create_intent`, which needs the operator method below.
+
+When a newer generation retires an older one, a no-ID `create_refused` entry whose
+archived-inclusive lookup (after quiesce) is still empty becomes `refused_retired`:
+its last create was a proven refusal, so it is absent, not ambiguous. A no-ID
+`create_intent` there still needs operator recovery.
 
 ### Operator recovery of a card `create_intent`
 
@@ -372,6 +378,8 @@ Native RPC/Slack tests use deterministic fakes and are NOT live end-to-end proof
 | `recover_card_intent` refusal gives `create_refused`/`recovered_from` | `test_recover_card_intent_refusal_records_create_refused` |
 | `recover_card_intent` ambiguous exception leaves the row byte-identical | `test_recover_card_intent_ambiguous_leaves_entry_byte_identical` |
 | `recover_card_intent` refuses unapproved, wrong state, existing ID, stale generation, missing predecessor without writing | `test_recover_card_intent_refuses_without_writing` |
+| `refusals` history keeps the last 20 | `test_refusal_history_is_bounded` |
+| Retiring a generation turns a no-ID `create_refused` into `refused_retired`; a no-ID `create_intent` stays ambiguous | `test_retired_generation_create_refused_is_absent_not_ambiguous`, `test_retired_generation_plain_create_intent_stays_ambiguous` |
 
 The service tests use the fake ports; the bridge tests use fake native callables.
 A real core refusal round trip is untested here.
