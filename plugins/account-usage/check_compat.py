@@ -89,6 +89,18 @@ def _function_digests(core, keys):
     return None, 'no Python %d.%d found to compute its AST pins' % AST_PYTHON
 
 
+def core_inputs(plugin=PLUGIN):
+    """Every core path (relative, '/'-separated) check() reads: the execution pins' files plus the
+    module of each fast-rate-limit-fallback function pin. A caller that materializes a partial
+    core tree (the hub's fork-main watch) must copy all of these, or check() reports 'missing'."""
+    paths = set(json.loads((plugin / 'execution-compatibility.json').read_text()))
+    fallback = plugin.parent / 'fast-rate-limit-fallback' / 'compatibility.json'
+    if fallback.is_file():
+        for key in json.loads(fallback.read_text()):
+            paths.add(key.partition(':')[0].replace('.', '/') + '.py')
+    return sorted(paths)
+
+
 def check(core, plugin=PLUGIN):
     core = Path(core).expanduser().resolve()
     pins = json.loads((plugin / 'execution-compatibility.json').read_text())

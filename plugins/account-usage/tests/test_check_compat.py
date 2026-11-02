@@ -52,6 +52,18 @@ class CheckCompat(unittest.TestCase):
         drift = check_compat.check(self.core, self.plugin)['drift']
         self.assertEqual([d['pin'] for d in drift], ['fast-rate-limit-fallback/account-usage-compatibility.json'])
 
+    def test_core_inputs_cover_function_pin_modules(self):
+        """A partial tree built from core_inputs() must give the same verdict as the full core."""
+        digest, pins = self._write_function_pin()
+        pins.write_text(json.dumps({'agent.fn:seam': [digest], 'agent.sub.mod:f': 'x'}))
+        self.assertEqual(check_compat.core_inputs(self.plugin), ['agent/fn.py', 'agent/seam.py', 'agent/sub/mod.py'])
+        pins.write_text(json.dumps({'agent.fn:seam': [digest]}))
+        partial = self.root / 'partial'
+        for name in check_compat.core_inputs(self.plugin):
+            (partial / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(self.core / name, partial / name)
+        self.assertEqual(check_compat.check(partial, self.plugin)['drift'], [])
+
     def _write_function_pin(self):
         import ast
         source = '@staticmethod\ndef seam(x):\n    return x\n'
