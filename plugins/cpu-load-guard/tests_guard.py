@@ -94,6 +94,8 @@ CORPUS_WRAPPERS = [
     "timeout --foreground 5", "env FOO=1", "env -i", "env -u X",
     "sudo -n", "sudo -u root", "stdbuf -o0", "caffeinate -i", "command",
     "LC_ALL=C", "LC_ALL=C FOO=1", "command nice -10 timeout -s KILL 5",
+    # 86cb43a8 refused `command -p`; 012867e2/f31c3c79 dropped it unnoticed.
+    "command -p", "command -p --",
 ]
 CORPUS_PAYLOADS = [
     "yes >/dev/null", "/usr/bin/yes >/dev/null", "/bin/yes >/dev/null",
@@ -127,7 +129,37 @@ def refusal_corpus():
         for wrapper in CORPUS_WRAPPERS:
             cases.append((f"background/{payload}/{wrapper}",
                           ((wrapper + " " + payload).strip() + " & ") * 8))
+    # Backgrounded forms that carry their own `&`: a brace group with the redirect
+    # outside the braces, and a pipeline whose first stage is the burner.
+    for payload in BARE_PAYLOADS:
+        for wrapper in CORPUS_WRAPPERS:
+            cmd = (wrapper + " " + payload).strip()
+            for kind, form in bg_forms(cmd):
+                for i, position in enumerate(FANOUT_BG_POSITIONS):
+                    cases.append((f"{kind}/{payload}/{wrapper}/position-{i}",
+                                  "for i in $(seq 1 16); do " + position.format(form=form) + "\ndone"))
+                cases.append((f"background-{kind}/{payload}/{wrapper}", (form + " ") * 8))
     return cases
+
+
+# Payloads without their own redirect: the redirect or the consumer comes from the form.
+BARE_PAYLOADS = [
+    "yes", "/usr/bin/yes", "/bin/yes", "openssl speed", "dd if=/dev/zero of=/dev/null",
+    "cat /dev/zero", "sha256sum /dev/zero", "sysbench cpu run",
+]
+# Consumers that never exit early, so the burner upstream never gets SIGPIPE.
+PIPE_SINKS = ["cat >/dev/null", "sha256sum", "gzip -c >/dev/null", "wc -c"]
+# Every corpus fan-out position that can host a backgrounded command (`elif` cannot).
+FANOUT_BG_POSITIONS = [
+    "{form}", "if true; then {form} fi", "( {form} )", "{{ {form} }}",
+    "true && {form}", "printf x | {form}", "true\n{form}", "! {form}",
+]
+
+
+def bg_forms(cmd):
+    yield "brace-outside-redirect", "{ " + cmd + "; } >/dev/null &"
+    for j, sink in enumerate(PIPE_SINKS):
+        yield f"pipe-{j}", cmd + " | " + sink + " &"
 
 
 @pytest.mark.parametrize("label,cmd", refusal_corpus())
@@ -163,6 +195,20 @@ ALLOW_CORPUS = GOOD + OPTION_POLLS + [
 
 @pytest.mark.parametrize("cmd", ALLOW_CORPUS)
 def test_must_allow_corpus(cmd):
+    assert plugin.guard.check_shell(cmd) is None
+
+
+# Unbackgrounded pipelines from a burner stay allowed (installer idiom), including
+# redirections that contain `&` but do not background the pipeline.
+@pytest.mark.parametrize("cmd", [
+    "for i in $(seq 1 12); do " + body + "; done"
+    for body in [
+        "yes | head -n1", "yes | cmd 2>&1", "yes | cmd &>/dev/null", "yes | cmd >&2",
+        "command -p yes | cmd", "{ yes; } | head -n1", "yes | cmd && echo ok",
+        "command -v yes >/dev/null",
+    ]
+])
+def test_unbackgrounded_pipelines_allowed(cmd):
     assert plugin.guard.check_shell(cmd) is None
 
 

@@ -13,6 +13,14 @@ bare assignments, the supported `nice` increment forms, separate timeout option
 values and absolute burner paths. Both shell and background matchers recognize
 `openssl speed` (the existing worker threshold still applies).
 
+`command` is accepted with its `-p` and `--` options (`command -v` is a lookup and
+stays allowed). Two backgrounded forms count as burners under the same fan-out
+logic and threshold: a brace group with the redirect after the closing brace
+(`{ yes; } >/dev/null &`) and a backgrounded pipeline whose first stage is a
+burner (`yes | sha256sum &`). An unbackgrounded `yes | cmd` stays allowed, including
+redirections such as `2>&1`, `&>` and `>&2`. The corpus covers all of these in
+every fan-out position, with four never-exiting consumers as pipe sinks.
+
 Failure chain: narrowing the prefix to avoid matching `BatchMode=yes` omitted
 valid command positions and wrappers, so those burners no longer matched.
 The previous targeted examples all passed because no cross-product refusal

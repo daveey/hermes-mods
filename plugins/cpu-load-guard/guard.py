@@ -26,7 +26,7 @@ DEVNULL_SRC = r"/dev/(?:zero|urandom)"
 _BURNER_COMMAND = (
     r"(?:^|(?<=[;&|({!\n`'\"]))\s*"
     r"(?:(?:do|then|else|elif)\s+)?"
-    r"(?:(?:nohup|exec|time|setsid|command|[A-Za-z_]\w*=[^\s;&|]*"
+    r"(?:(?:nohup|exec|time|setsid|command(?:\s+(?:-p|--)(?=\s))*|[A-Za-z_]\w*=[^\s;&|]*"
     r"|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))?"
     r"|timeout(?:\s+(?:-s|--signal|-k|--kill-after)\s+[^\s;&|]+|\s+--?[\w=-]+)*"
     r"\s+\d+(?:\.\d+)?[smhd]?"
@@ -58,6 +58,26 @@ BG_BURNER_RE = re.compile(
     r"|dd\s+if=" + DEVNULL_SRC + r"\s+of=/dev/null[^;&|\n]*?&(?!&)"
     r"|cat\s+" + DEVNULL_SRC + r"\s*>\s*/dev/null[^;&|\n]*?&(?!&)"
     r"|while\s*(?::|true|\[\s*1\s*\])\s*;?\s*do\s*(?::|true)?\s*;?\s*done\s*&(?!&))",
+    re.I,
+)
+# Burners that carry their own `&` outside the command itself: `{ yes; } >/dev/null &`
+# (redirect after the closing brace) and a backgrounded pipeline whose first stage is
+# the burner (`yes | sha256sum &`). An unbackgrounded `yes | installer` stays allowed.
+_BG_HEAD = (
+    r"(?:yes\b[^;&|\n)}]*?"
+    r"|cat\s+" + DEVNULL_SRC +
+    r"|dd\s+if=" + DEVNULL_SRC + r"\s+of=/dev/null[^;&|\n)}]*?"
+    r"|(?:sha\d*sum|md5sum|gzip|bzip2|xz)\s+(?:-\w+\s+)*" + DEVNULL_SRC +
+    r"|openssl\s+speed\b[^;&|\n)}]*?"
+    r"|(?:sysbench|cpuburn|burnP6|burnK7|lookbusy)\b[^;&|\n)}]*?)"
+)
+# A trailing single `&` that is not part of `&&`, `&>` or `>&`.
+_BG_AMP = r"(?<![<>&])&(?![&>])"
+BG_FORM_RE = re.compile(
+    r"(?:^|(?<=[;&|({!\n`'\"\s]))\{" + _BURNER_COMMAND + _BG_HEAD
+    + r"\s*;\s*\}(?:\s*\d*(?:>>?|<|&>)\s*&?[^\s;&|()<>]+)*\s*" + _BG_AMP
+    + r"|" + _BURNER_COMMAND + _BG_HEAD
+    + r"\s*\|(?!\|)(?:[^;&\n()]|(?<=[<>])&|&(?=>))*?" + _BG_AMP,
     re.I,
 )
 PY_BUSY_RE = re.compile(
@@ -331,10 +351,10 @@ def _check_shell_text(text: str) -> str | None:
         for arg in _count_flag(text, r"-multi"):
             if _wide_arg(arg):
                 return f"openssl speed -multi {arg.strip()} (>= {t} of {ncpu()} cores)"
-    n_bg = len(BG_BURNER_RE.findall(text))
+    n_bg = len(BG_BURNER_RE.findall(text)) + len(BG_FORM_RE.findall(text))
     if n_bg >= t:
         return f"{n_bg} backgrounded busy loops (>= {t} of {ncpu()} cores)"
-    if SHELL_BURNER_RE.search(text) and _fan_out_wide(text):
+    if (SHELL_BURNER_RE.search(text) or BG_FORM_RE.search(text)) and _fan_out_wide(text):
         return f"a CPU burner fanned out to about one per core (>= {t} of {ncpu()} cores)"
     return None
 
