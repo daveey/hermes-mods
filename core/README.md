@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1588 patches, one entry per non-merge source commit through `02b2c78f2881a92c1c68cf423fc8780c9ff8682e`.
+1591 patches, one entry per non-merge source commit through `744ac50846c697afffec146710365547fba99cf7`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -24,10 +24,17 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d`; current merge-base: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d` (the fork merged that upstream tip in `6e2fbc15549`).
 Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523 and 1549. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-Current replay: [mirror-replay-1588.json](mirror-replay-1588.json) (six hash-pinned bridges; the sixth carries the fork's upstream-sync merge `6e2fbc15549`) and [mirror-policy-1588.json](mirror-policy-1588.json). Executed checks: [mirror-1588-verification.md](mirror-1588-verification.md); preceding snapshots: [mirror-1583-verification.md](mirror-1583-verification.md), [mirror-1539-verification.md](mirror-1539-verification.md), [mirror-1484-verification.md](mirror-1484-verification.md), [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
+Current replay: [mirror-replay-1591.json](mirror-replay-1591.json) (six hash-pinned bridges; the sixth carries the fork's upstream-sync merge `6e2fbc15549`) and [mirror-policy-1591.json](mirror-policy-1591.json). Executed checks: [mirror-1591-verification.md](mirror-1591-verification.md); preceding snapshots: [mirror-1588-verification.md](mirror-1588-verification.md), [mirror-1583-verification.md](mirror-1583-verification.md), [mirror-1539-verification.md](mirror-1539-verification.md), [mirror-1484-verification.md](mirror-1484-verification.md), [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1589–1591
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Kanban restart resume](kanban-restart-resume.md) | 1589 1590 1591 | A run requeued after its owner's restart (`owner_restart_lost`) copies the lost run's transcript into its fresh session and gets a resume note instead of the transcript tail; typed fallbacks, planned and copied off the owner loop, resumes only below 85% of the compaction threshold. |
+| [1591-entry mirror verification](mirror-1591-verification.md) | verification report | Exact inventory, complete six-bridge replay and normalized tree; no new fingerprint or bridge. |
 
 ## Mirror follow-ups 1584–1588
 
@@ -890,7 +897,7 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1588-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the six bridges at the boundaries in `mirror-replay-1588.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
+For the current **1591-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the six bridges at the boundaries in `mirror-replay-1591.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
 
 ```bash
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
@@ -1125,6 +1132,7 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Sidebar session-state fixes](sidebar-session-state-fixes.md) | 1337 1347 1359 | Cold sessions with history never read as drafts, project-tree rows carry stored outcome and mute, session-control owners resolve from the project tree. |
 | [Webapp SSH-served Desktop owner](webapp-ssh-desktop-owner-identity.md) | 1339 | Another Mac's SSH-served Desktop maps to the host owner so its archive of a hub chat stops 403ing. |
 | [Kanban owner_restart_lost](kanban-owner-restart-lost.md) | 1340 1341 1342 | A run lost to its owner's unclean death is booked uncharged; systemic crash fingerprints open one fix card. |
+| [Kanban restart resume](kanban-restart-resume.md) | 1589 1590 1591 | A run requeued after `owner_restart_lost` resumes the lost run's conversation in its fresh session, or falls back to the transcript tail with a typed reason. |
 | [Kanban placement cancellation](kanban-placement-cancellation.md) | 1348 1349 1350 1362 1363 | Completion or archive durably cancels the placed copy across crash gaps and failed sends. |
 | [API chat completions served model](api-chat-served-model.md) | 1351 1352 | Non-streaming replies name the served provider and model. |
 | [Routing: managed pin and refused route](routing-managed-pin-and-refused-route.md) | 1353 1360 | A managed pin on its own endpoint is not an override; a policy-refused route cannot block switching away. |

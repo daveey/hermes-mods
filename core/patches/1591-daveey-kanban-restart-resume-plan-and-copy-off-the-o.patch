@@ -1,0 +1,255 @@
+From 744ac50846c697afffec146710365547fba99cf7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:42:56 +0000
+Subject: [PATCH] [daveey] kanban restart resume: plan and copy off the owner
+ loop, fail-soft; skip rotated sessions; 15% headroom
+
+Review fixes: planning (transcript read, token estimate, context-length lookup that may
+probe over HTTP) now runs in the tracked off-loop write with the copy, after session
+creation, so the owner loop never blocks on it and the saved-claim/create invariant is
+untouched. Any exception is a recorded fallback (plan_failed / seed_failed), never an
+admission failure. A prior session ended by rotation compaction falls back
+(prior_session_rotated). Resume only below 85% of the owner's compaction threshold, for
+the first turn and owner/worker context-length lookup differences.
+---
+ gateway/session_kanban.py                     | 43 +++++++++----------
+ gateway/session_kanban_resume.py              | 34 +++++++++++++--
+ .../test_session_kanban_restart_resume.py     | 24 ++++++++++-
+ website/docs/user-guide/features/kanban.md    |  5 ++-
+ 4 files changed, 76 insertions(+), 30 deletions(-)
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 2bd7cf54b30..11bd595d64a 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -71,14 +71,11 @@ def build_kanban_policy(connection, params, config):
+         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
+         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
+     context['db'] = str(path)
+-    if resume_from is not None:
+-        from gateway.session_kanban_resume import compaction_threshold_tokens, plan_resume, resume_context
+-        db = getattr(authority, 'db', None)
+-        plan = plan_resume(resume_from, task=task, run_id=task.current_run_id, session_db=db,
+-                           owner_db=getattr(db, 'db_path', None), threshold_tokens=lambda: compaction_threshold_tokens(policy))
+-        context['restart_resume'] = plan
+-        if plan.get('resumed_session_id'):
+-            context['resume_context'] = resume_context(resume_base, plan)
++    if resume_from is not None:  # [daveey] planned and copied off-loop in run_task, after session creation
++        from gateway.session_kanban_resume import resume_context
++        context['restart_candidate'] = {**resume_from, 'assignee': task.assignee}
++        context['resume_context'] = resume_context(resume_base, {'prior_run_id': resume_from['prior_run_id'],
++                                                                 'run_id': task.current_run_id})
+     request = json.loads(policy.request_json)
+     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
+     return replace(policy, source='kanban', platform='cli', toolsets=tuple(sorted(set(policy.toolsets) | {'kanban'})),
+@@ -116,8 +113,8 @@ async def run_task(connection, params):
+         policy, private = build_kanban_policy(connection, params, _load_gateway_config())
+         ref = create_local_session(authority, connection.actor, {'request_id': request_id},
+                                    trusted_policy=policy, trusted_secrets=private)
+-    resume_plan = json.loads(policy.kanban_json or '{}').get('restart_resume') if not saved else None
+-    copied = await _seed_restart_resume(authority, ref.session_id, resume_plan)
++    candidate = json.loads(policy.kanban_json or '{}').get('restart_candidate') if not saved else None
++    resume_plan, copied = await _seed_restart_resume(authority, ref.session_id, policy, candidate, params['run_id'])
+     from hermes_cli.kanban_db_connect import connect_closing
+     from hermes_cli import kanban_db as kb
+     import os
+@@ -173,21 +170,21 @@ async def run_task(connection, params):
+     return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
+ 
+ 
+-async def _seed_restart_resume(authority, session_id, plan):
+-    """[daveey] Copy a restart-lost run's transcript into this run's fresh session; 0 on any failure
+-    (the worker then sees an empty history and runs today's transcript-tail context)."""
+-    if not plan or not plan.get('resumed_session_id'):
+-        return 0
++async def _seed_restart_resume(authority, session_id, policy, candidate, run_id):
++    """[daveey] Plan and copy a restart-lost run's transcript into this run's fresh session, off the owner
++    loop. ``(None, 0)`` without a candidate; a failure is a recorded fallback (the worker then sees an empty
++    history and runs today's transcript-tail context)."""
++    if not candidate:
++        return None, 0
+     from functools import partial
+-    from gateway.session_kanban_resume import seed_resumed_session
++    from types import SimpleNamespace
++    from gateway.session_kanban_resume import compaction_threshold_tokens, plan_and_seed
+     from gateway.session_runtime_workers import tracked_write
+-    try:
+-        return await tracked_write(authority, partial(seed_resumed_session, authority.db, session_id, plan))
+-    except Exception:
+-        import logging
+-        logging.getLogger(__name__).warning('Kanban restart resume: copying %s failed; fresh session',
+-                                            plan.get('resumed_session_id'), exc_info=True)
+-        return 0
++    db = authority.db
++    return await tracked_write(authority, partial(
++        plan_and_seed, candidate, task=SimpleNamespace(assignee=candidate.get('assignee')), run_id=run_id,
++        session_db=db, owner_db=getattr(db, 'db_path', None), session_id=session_id,
++        threshold_tokens=lambda: compaction_threshold_tokens(policy)))
+ 
+ 
+ def bind_worker_context(frame):
+diff --git a/gateway/session_kanban_resume.py b/gateway/session_kanban_resume.py
+index 5607cecdd88..ff05b68369d 100644
+--- a/gateway/session_kanban_resume.py
++++ b/gateway/session_kanban_resume.py
+@@ -30,6 +30,9 @@ from typing import Any, Callable, Optional
+ logger = logging.getLogger(__name__)
+ 
+ EVENT_KIND = 'restart_resume'
++# Resume only below this share of the owner's compaction threshold: room for the first turn, and slack for
++# an owner-side context-length lookup that resolves a larger window than the worker's agent does.
++RESUME_HEADROOM = 0.85
+ INTERRUPTED_TOOL_RESULT = (
+     'Interrupted by gateway restart: this tool call may or may not have run and its result was not '
+     'recorded. Re-check the current state (files, processes, remote effects) before repeating any side effect.'
+@@ -131,14 +134,16 @@ def plan_resume(candidate: Optional[dict], *, task, run_id: int, session_db, own
+         return fallback('foreign_home')
+     try:
+         with closing(sqlite3.connect(here.as_uri() + '?mode=ro', uri=True, timeout=2)) as state:
+-            row = state.execute('SELECT source, profile_name FROM sessions WHERE id=?', (sid,)).fetchone()
++            row = state.execute('SELECT source, profile_name, end_reason FROM sessions WHERE id=?', (sid,)).fetchone()
+             count = state.execute('SELECT COUNT(*) FROM messages WHERE session_id=? AND active=1', (sid,)).fetchone()[0]
+     except (OSError, sqlite3.Error):
+         return fallback('prior_session_unreadable')
+     if row is None:
+         return fallback('prior_session_missing')
+-    if tuple(row) != ('kanban', task.assignee):
++    if tuple(row[:2]) != ('kanban', task.assignee):
+         return fallback('foreign_profile')
++    if row[2] == 'compression':  # rotated by compaction (compression.in_place: false): the live transcript is a child
++        return fallback('prior_session_rotated')
+     if not count:
+         return fallback('prior_session_empty')
+     try:
+@@ -160,11 +165,32 @@ def plan_resume(candidate: Optional[dict], *, task, run_id: int, session_db, own
+     if not threshold:
+         return fallback('threshold_unknown', **{k: plan[k] for k in ('messages', 'tokens')})
+     plan['threshold'] = int(threshold)
+-    if tokens >= threshold:
++    if tokens >= threshold * RESUME_HEADROOM:
+         return fallback('over_compaction_threshold')
+     return {**plan, 'resumed_session_id': sid, 'interrupted_calls': _unanswered_tool_calls(history)}
+ 
+ 
++def plan_and_seed(candidate: dict, *, task, run_id: int, session_db, owner_db: Optional[str], session_id: str,
++                  threshold_tokens: Callable[[], Optional[int]]) -> tuple[dict, int]:
++    """Plan the resume and copy the transcript into ``session_id``; runs off the owner loop. Never raises:
++    any failure is a recorded fallback and the run starts with today's transcript-tail context."""
++    try:
++        plan = plan_resume(candidate, task=task, run_id=run_id, session_db=session_db, owner_db=owner_db,
++                           threshold_tokens=threshold_tokens)
++    except Exception:
++        logger.warning('Kanban restart resume: planning failed; fresh session', exc_info=True)
++        return {'prior_run_id': candidate.get('prior_run_id'), 'run_id': run_id,
++                'prior_session_id': candidate.get('session_id'), 'fallback': 'plan_failed'}, 0
++    if not plan.get('resumed_session_id'):
++        return plan, 0
++    try:
++        return plan, seed_resumed_session(session_db, session_id, plan)
++    except Exception:
++        logger.warning('Kanban restart resume: copying %s failed; fresh session', plan['resumed_session_id'],
++                       exc_info=True)
++        return plan, 0
++
++
+ def compaction_threshold_tokens(policy) -> Optional[int]:
+     """The built-in compressor's trigger for this run's model, from the same config parser and compressor
+     the worker's agent uses. ``None`` (fall back) when it cannot be resolved."""
+@@ -243,6 +269,8 @@ def record_resume_event(conn, task_id: str, run_id: int, plan: dict, copied: Opt
+ 
+ 
+ def resume_context(base_context: str, plan: dict) -> str:
++    """Built at policy time for every run that follows a restart loss; the worker uses it only when the
++    copied history arrived (``worker_prompt_context``)."""
+     return RESUME_NOTE.format(prior_run=plan['prior_run_id'], run_id=plan['run_id']) + base_context
+ 
+ 
+diff --git a/tests/gateway/test_session_kanban_restart_resume.py b/tests/gateway/test_session_kanban_restart_resume.py
+index bbe02da3cae..9bfbbb384b2 100644
+--- a/tests/gateway/test_session_kanban_restart_resume.py
++++ b/tests/gateway/test_session_kanban_restart_resume.py
+@@ -10,6 +10,8 @@ import json
+ import time
+ from types import SimpleNamespace
+ 
++import sqlite3
++
+ import pytest
+ 
+ from hermes_cli import kanban_db as kb
+@@ -199,6 +201,22 @@ def _broken_reader(env):
+     env.monkeypatch.setattr(env.db, 'get_messages_as_conversation', broken)
+ 
+ 
++def _broken_estimate(env):
++    def boom(*a, **kw):
++        raise TypeError('odd row')
++    env.monkeypatch.setattr('agent.usage_anchor.persisted_anchor_tokens', boom)
++
++
++def _rotated(env):
++    env.db._execute_write(lambda conn: conn.execute("UPDATE sessions SET end_reason='compression' WHERE id=?", (PRIOR,)))
++
++
++def _broken_seed(env):
++    def boom(*a, **kw):
++        raise sqlite3.OperationalError('disk I/O error')
++    env.monkeypatch.setattr('gateway.session_kanban_resume.seed_resumed_session', boom)
++
++
+ def _tiny_threshold(env):
+     env.monkeypatch.setattr('gateway.session_kanban_resume.compaction_threshold_tokens', lambda policy: 10)
+ 
+@@ -212,6 +230,9 @@ _FALLBACKS = {
+     'foreign_profile': ({'profile': 'other'}, None, None, 'foreign_profile', False),
+     'unreadable': ({}, None, _broken_reader, 'prior_session_unreadable', True),
+     'over_threshold': ({}, None, _tiny_threshold, 'over_compaction_threshold', True),
++    'plan_raises': ({}, None, _broken_estimate, 'plan_failed', True),
++    'rotated': ({}, None, _rotated, 'prior_session_rotated', True),
++    'seed_raises': ({}, None, _broken_seed, 'seed_failed', True),
+ }
+ 
+ 
+@@ -231,7 +252,6 @@ def test_each_fallback_keeps_the_tail_only_fresh_session(env, case):
+     assert 'resumed_session_id' not in run.events['restart_resume']
+     assert 'resumed_session_id' not in run.events['owner_admitted']
+     assert run.history == []  # a fresh session
+-    assert 'resume_context' not in run.context
+     prompt = worker_prompt_context(run.context, run.history)
+     # Today's context, unchanged: the tail reader applies its own checks and renders a tail where it can.
+     assert prompt == run.context['context']
+@@ -254,7 +274,7 @@ def test_a_non_restart_requeue_is_unchanged(env, kind):
+                             metadata={'exit_code': 124})
+                 conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL WHERE id=?", (tid,))
+     run = _admit_next(env, tid)
+-    assert 'restart_resume' not in run.events and 'restart_resume' not in run.context
++    assert 'restart_resume' not in run.events and 'restart_candidate' not in run.context
+     assert 'resumed_session_id' not in run.events['owner_admitted']
+     assert run.history == [] and 'resume_context' not in run.context
+ 
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 99d3847e7b8..a3a401b7c4c 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -415,7 +415,8 @@ session and `owner_admitted` marker; the old session is only read. A trailing to
+ call with no recorded result gets a synthetic "interrupted by gateway restart"
+ result rather than being replayed. The run falls back to the transcript tail when
+ the lost session is missing, empty or unreadable, belongs to another home or
+-profile, or already exceeds the model's compaction threshold. Each such run logs a
++profile, was rotated by compaction, or is already within 15% of the model's
++compaction threshold. Each such run logs a
+ `restart_resume` event carrying `resumed_session_id` (also on `owner_admitted`) or
+ its `fallback` reason. Crash, timeout and other requeues are unchanged.
+ 
+@@ -1754,7 +1755,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
+ | `worker_registered` | `{pid, started_at}` | The dispatcher died after starting the worker but before recording its pid, so the worker recorded it itself before its first model call. Liveness checks then see it and an expired claim is extended instead of spawning a second worker. A worker whose run was reclaimed before it got that far exits without working the card. |
+ | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
+ | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. An automatic reclaim counts as one non-successful attempt toward the `gave_up` breaker (a claim that never spawned a worker would otherwise loop claim → reclaim → claim forever); an operator `reclaim` resets the counter instead. |
+-| `restart_resume` | `{prior_run_id, prior_session_id, resumed_session_id?, copied_messages?, interrupted_calls?, fallback?, messages?, tokens?, threshold?}` | The owner admitted a run whose previous run was lost to a gateway restart (`owner_restart_lost`). With `resumed_session_id` the lost run's transcript was copied into this run's session; with `fallback` (`prior_session_missing`, `prior_session_empty`, `prior_session_unreadable`, `foreign_home`, `foreign_profile`, `over_compaction_threshold`, `threshold_unknown`, `seed_failed`) the run started fresh with the transcript tail. |
++| `restart_resume` | `{prior_run_id, prior_session_id, resumed_session_id?, copied_messages?, interrupted_calls?, fallback?, messages?, tokens?, threshold?}` | The owner admitted a run whose previous run was lost to a gateway restart (`owner_restart_lost`). With `resumed_session_id` the lost run's transcript was copied into this run's session; with `fallback` (`prior_session_missing`, `prior_session_empty`, `prior_session_unreadable`, `prior_session_rotated`, `foreign_home`, `foreign_profile`, `over_compaction_threshold`, `threshold_unknown`, `plan_failed`, `seed_failed`) the run started fresh with the transcript tail. |
+ | `crashed` | `{pid, claimer, exit_kind?, exit_code?, worker_output?}` | Worker PID no longer alive but TTL hadn't expired yet. `worker_output` is the tail of the worker's own log (its final response or the rendered provider error, chrome stripped, ≤ 400 chars) and is also appended to the task's `last_failure_error`, so the board shows *why* instead of only the exit code. |
+ | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+ | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
+-- 
+2.55.0
+
