@@ -297,6 +297,21 @@ fixture `owner-checked-running-20261031` in `tests/fixtures/report_only_unverifi
 incident through the real aux judges: second opinion 0.9 → 0.1, outcome 0.95 → 0.02; the same turn with the card
 `ready`, its run crashed and 4 days idle stays held (0.9 / 0.99).
 
+**Shell and execute_code owner reads count too (agent-25f447092d).** The agent read the owner card with
+`sqlite3 -readonly …/kanban.db` and its worker with `ps -p <worker_pid>`, found it running with a heartbeat 0 s old,
+and both judges held the reply anyway (0.9): only the three tool forms above wrote an `<- OK` line. A terminal or
+execute_code call now counts as an owner read when it names a card (`t_…`) or a board db, reads it in a form listed
+in `OWNER_READ_SHELL_FORMS` (`board_sql`: sqlite3 on a kanban db, `kanban_cli`: `hermes kanban show/list/tail/…`,
+`worker_ps`: `ps -p`, `pgrep`, `/proc/<pid>/status`; execute_code with sqlite3 on a kanban db counts as `board_sql`),
+and writes nothing to the board (no SQL write, no mutating `hermes kanban` verb). Its OK line is
+`<- OK task=<ids> status=<board status> last=@ <newest UTC time printed> (<age> ago) pid=<pid> alive … rows: <state rows>`.
+`reply_check.OWNER_CHECK_RE` (the deterministic `unverified` rule) counts a board-db query call line and any owner
+`<- OK` line, and both rubrics name "any successful read of the owner card's state". Tests:
+`tests/test_report_only_owner_sql_read.py` (the real incident commands: terminal path and execute_code path; board
+writes and unrelated reads get no line); detection guard
+`test_every_owner_read_shell_form_has_a_real_format_fixture` (every form in `OWNER_READ_SHELL_FORMS` needs a fixture).
+Replay of the incident through the real second-opinion judge: 0.9/0.1 → 0.1 (3/3).
+
 Queued owners (self-heal agent-9de19e15a9, 2026-11-01). A hub worker closed its crash card and named two fix cards it
 had filed 20 minutes earlier, both `ready` behind a busy queue; it commented the stall on both. Both judges held it
 (0.9, then 0.99: "Fix cards checked but ready, not running") because the rubrics put ready/todo with blocked/done as

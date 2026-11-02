@@ -228,6 +228,42 @@ def test_every_owner_read_tool_has_a_real_format_fixture_showing_last_event():
             assert line and "last=" in line and "run=" in line and "run=None" not in line, (tool, name, line)
 
 
+# agent-25f447092d: shell and execute_code owner reads (board-db SQL, kanban CLI reads, the worker's process). Every
+# form in rules.OWNER_READ_SHELL_FORMS needs a real-format fixture here whose OK line names the card and shows what it
+# found, so a new read form added without one (or one that stops producing an OK line) fails CI.
+_DB = "~/.hermes/kanban/boards/runners/kanban.db"
+OWNER_READ_SHELL_FIXTURES = {
+    "board_sql": ("terminal", {"command": f"sqlite3 -readonly {_DB} \"select status from tasks where id='{CARD}'; select "
+                                          f"kind,datetime(created_at,'unixepoch') from task_events where task_id='{CARD}' "
+                                          "order by id desc limit 2\""},
+                  lambda now: "running\nheartbeat|" + time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 60)),
+                  ("status=running", "last=@", "(60s ago)")),
+    "worker_ps": ("terminal", {"command": f"ps -o pid,etime,stat --no-headers -p $(sqlite3 -readonly {_DB} \"select "
+                                          f"worker_pid from tasks where id='{CARD}'\")"},
+                  lambda now: "2259396       01:06 Ssl", ("pid=2259396 alive",)),
+    "kanban_cli": ("terminal", {"command": f"hermes kanban --board runners list | grep {CARD}"},
+                   lambda now: f"{CARD}  running  default  fix the collapsed arm", ("status=running",)),
+}
+OWNER_READ_EXEC_FIXTURE = (
+    "execute_code", {"code": f"import sqlite3\nc = sqlite3.connect('/h/.hermes/kanban.db')\n"
+                             f"print(c.execute(\"select status from tasks where id='{CARD}'\").fetchone()[0])"},
+    lambda now: "blocked\n", ("status=blocked",))
+
+
+def test_every_owner_read_shell_form_has_a_real_format_fixture():
+    assert set(rules.OWNER_READ_SHELL_FORMS) <= set(OWNER_READ_SHELL_FIXTURES), (
+        f"add a real-format fixture for {set(rules.OWNER_READ_SHELL_FORMS) - set(OWNER_READ_SHELL_FIXTURES)}")
+    now = time.time()
+    for form, (tool, args, out, wants) in [*OWNER_READ_SHELL_FIXTURES.items(), ("exec", OWNER_READ_EXEC_FIXTURE)]:
+        assert form == "exec" or form in rules.owner_read_forms(tool, args), (form, rules.owner_read_forms(tool, args))
+        line = rules.owner_result_line(tool, args, json.dumps({"output": out(now), "exit_code": 0}), now=now)
+        assert line and CARD in line and len(line) <= rules.OK_LINE_MAX, (form, line)
+        for w in wants:
+            assert w in line, (form, w, line)
+        # the deterministic `unverified` rule reads this OK line as an owner check
+        assert rc.OWNER_CHECK_RE.search(line), (form, line)
+
+
 def test_unparseable_success_falls_back_to_result_head():
     coach = rules.AgentCoach(None)
     coach.observe("s", "terminal", {"command": f"hermes kanban show {CARD}"},

@@ -170,7 +170,11 @@ OWNER_CHECK_RE = re.compile(
     r"^\s*->\s*" + _OWNER_TOOLS + r"\("
     r"|[\"']name[\"']\s*:\s*[\"']" + _OWNER_TOOLS + r"[\"']"
     r"|^\s*->\s*terminal\(.*\bhermes kanban\b.*\b(?:show|comment|create|list|tail)\b"
-    r"|^\s*->\s*terminal\(.*\bhermes sessions?\b", re.I)
+    r"|^\s*->\s*terminal\(.*\bhermes sessions?\b"
+    # agent-25f447092d: a read-only query of the board db (terminal sqlite3 or execute_code) is an owner check too,
+    # and so is any `<- OK` owner line agent_rules.observe wrote (it writes one only after a successful owner read).
+    r"|^\s*->\s*(?:terminal|execute_code)\(.*(?:\bsqlite3\b.*kanban[\w./-]*\.db|kanban[\w./-]*\.db.*\bsqlite3\b)"
+    r"|^\s*<-\s*OK\s+(?!park=)", re.I)
 _QUOTES = "\"“”`"
 
 
@@ -1174,7 +1178,8 @@ probabilities (0-1):
     stalled card/CI/worker, work "not yet" merged/deployed/started, a gap or follow-up left for later) and stops
     scores high. "No action needed from you" / "nothing needs you" does not excuse it.
   * Pointing at an existing owner (card, worker, other session) that "has it" scores high UNLESS the tool log shows
-    the agent checked that owner this turn (e.g. kanban_show / process poll) and it is actually running.
+    the agent checked that owner this turn (any successful read of the owner card's state: kanban tools, CLI, a
+    read-only query of the board db, the worker's process) and it is actually running.
     A successful owner check is followed in the tool log by a `<- OK` line with what it found (status=, run=, last=
     newest event and how long ago). The hand-off counts as started (score LOW) when that line shows the owner the
     message names running or claimed with activity in the last 24 h; or ready or todo (queued, not picked up yet)
@@ -1237,7 +1242,8 @@ CONFIRM_SYS = """You label the final reply an AI agent gave its user at the end 
 The TOOL LOG shows the REAL arguments of the turn's tool calls (kanban_create title and body, delegate_task goals, patched
 paths, commands). Use them to decide whether the agent started a fix, or handed it to a worker or session and what it
 sent: a send of the fix or reproduction to the owning session/card/worker this turn counts as "started"; a bare "the
-owner/card has it" does not. A successful owner check (kanban_show, cross_task, `hermes kanban show`) is followed by a
+owner/card has it" does not. A successful owner check (any successful read of the owner card's state: kanban tools,
+CLI, a read-only query of the board db, the worker's process) is followed by a
 `<- OK` line with what it found (status=, run=, last= newest event and how long ago). A reply pointing at an existing
 owner is "started" when that line shows the named owner running or claimed with activity in the last 24 h, or ready or
 todo (queued, not picked up yet) with its last activity under 24 h and no failed or crashed last run (or the owner was

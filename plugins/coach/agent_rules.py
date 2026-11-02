@@ -1239,6 +1239,44 @@ OWNER_READ_TOOLS = ("kanban_show", "cross_task")
 _OWNER_READ_CLI = re.compile(r"\bhermes\s+kanban\b[^\n]*\bshow\b")
 OK_LINE_MAX = 200
 
+# agent-25f447092d: the third false hold in this class came from an owner read in neither tool form: a
+# `sqlite3 -readonly …/kanban.db` query of the card plus `ps -p <worker_pid>`. A shell or execute_code read is an
+# owner read when it names a card (`t_…`) or a board db AND reads it in one of these forms, and writes nothing to the
+# board. Each form has a real-format fixture in tests/test_report_only_owner_verified.py (detection guard).
+OWNER_READ_SHELL_FORMS = {
+    "kanban_cli": re.compile(r"\bhermes\s+kanban\b[^\n;|&]*\b(?:show|list|ls|tail|log|runs)\b"),
+    "board_sql": re.compile(r"\bsqlite3\b[^\n]*kanban[\w./-]*\.db|kanban[\w./-]*\.db[^\n]*\bsqlite3\b", re.I),
+    "worker_ps": re.compile(r"\bps\b[^\n|;]*\s-[\w]*p\b|\bpgrep\b|/proc/\$?\{?\w+\}?/(?:stat|status|cmdline)\b"),
+}
+_CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{6,}\b")
+_ANY_SQL_WRITE_RE = re.compile(r"\b(?:UPDATE\s+\w+\s+SET|INSERT\s+(?:OR\s+\w+\s+)?INTO|DELETE\s+FROM|REPLACE\s+INTO|"
+                               r"DROP\s+TABLE|ALTER\s+TABLE|VACUUM)\b", re.I)
+_KANBAN_CLI_WRITE_RE = re.compile(r"\bhermes\s+kanban\b[^\n;|&]*\b(?:complete|block|unblock|archive|create|move|"
+                                  r"comment|link|unlink|recover|assign|reclaim)\b")
+
+
+def _shell_text(name: str, a: dict) -> str:
+    return str(a.get("command") or "") if name == "terminal" else str(a.get("code") or "")
+
+
+def owner_read_forms(tool: str, args: Any) -> list:
+    """Names of OWNER_READ_SHELL_FORMS a terminal/execute_code call uses to read a card's state ([] when it is not a
+    read-only look at a named card or board)."""
+    name = (tool or "").rsplit("__", 1)[-1]
+    a = args if isinstance(args, dict) else {}
+    if name not in ("terminal", "execute_code"):
+        return []
+    text = _shell_text(name, a)
+    if not (_CARD_ID_RE.search(text) or KANBAN_DB_RE.search(text)):
+        return []
+    if writes_kanban_db(name, a) or (KANBAN_DB_RE.search(text) and _ANY_SQL_WRITE_RE.search(text)) \
+            or _KANBAN_CLI_WRITE_RE.search(text):
+        return []
+    forms = [k for k, rx in OWNER_READ_SHELL_FORMS.items() if rx.search(text)]
+    if name == "execute_code" and not forms and KANBAN_DB_RE.search(text) and re.search(r"\bsqlite3\b", text):
+        forms = ["board_sql"]
+    return forms
+
 
 def owner_read_call(tool: str, args: Any) -> bool:
     name = (tool or "").rsplit("__", 1)[-1]
@@ -1248,9 +1286,35 @@ def owner_read_call(tool: str, args: Any) -> bool:
     if name == "tool_call":
         return any(str((c or {}).get("name") or "").rsplit("__", 1)[-1] in OWNER_READ_TOOLS
                    for c in (a.get("calls") or []) if isinstance(c, dict))
-    if name == "terminal":
-        return bool(_OWNER_READ_CLI.search(str(a.get("command") or "")))
-    return False
+    if name == "terminal" and _OWNER_READ_CLI.search(str(a.get("command") or "")):
+        return True
+    return bool(owner_read_forms(name, a))
+
+
+_BOARD_STATUS_RE = re.compile(r"(?<![\w-])(running|ready|todo|blocked|done|archived|triage|scheduled|review)(?![\w-])")
+_SQL_TIME_RE = re.compile(r"\b(\d{4}-\d\d-\d\d[ T]\d\d:\d\d(?::\d\d)?)(?:\.\d+)?Z?\b")
+_PS_ROW_RE = re.compile(r"^\s*(\d{2,})\s+((?:\d+-)?(?:\d+:)?\d+:\d\d)\s+([A-Za-z][\w<+]*)\s*$")
+
+
+def _raw_owner_body(text: str, cards: list, now: float) -> str:
+    """OK-line body for a plain-text owner read (sqlite rows, ps): the cards it named, the board status and the newest
+    timestamp it printed (sqlite `datetime()` is UTC) with its age, a live worker pid, then the short state rows."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    short = [l for l in lines if len(l) <= 120]
+    parts = [f"task={','.join(cards[:2])}"] if cards else []
+    status = next((m.group(1) for l in short for m in [_BOARD_STATUS_RE.search(l)] if m), None)
+    if status:
+        parts.append(f"status={status}")
+    times = [t for l in short for m in _SQL_TIME_RE.finditer(l) for t in [_ts(m.group(1))] if t and t <= now + 120]
+    if times:
+        at = max(times)
+        parts.append(f"last=@ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(at))} ({_ago(now - at)} ago)")
+    ps = next((m for l in short for m in [_PS_ROW_RE.match(l)] if m), None)
+    if ps:
+        parts.append(f"pid={ps.group(1)} alive etime={ps.group(2)} stat={ps.group(3)}")
+    rows = [l for l in short if "|" in l or _BOARD_STATUS_RE.search(l) or _PS_ROW_RE.match(l)]
+    parts.append("rows: " + " ; ".join(rows or [" ".join(text.split())])[:160])
+    return " ".join(parts)
 
 
 def _tasks_in(obj: Any, depth: int = 0) -> list:
@@ -1357,7 +1421,13 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
             d = _as_dict(result)
             text = str((d or {}).get("output") or (d or {}).get("result") or result or "")
             m = re.search(r"^\s*status:\s+(\S+)", text, re.M)
-            body = (f"status={m.group(1)} " if m else "") + " ".join(text.split())[:160]
+            name = (tool or "").rsplit("__", 1)[-1]
+            a = args if isinstance(args, dict) else {}
+            if not m and owner_read_forms(name, a):
+                cards = list(dict.fromkeys(_CARD_ID_RE.findall(_shell_text(name, a))))
+                body = _raw_owner_body(text, cards, now)
+            else:
+                body = (f"status={m.group(1)} " if m else "") + " ".join(text.split())[:160]
     except Exception:
         return None
     return f"   <- OK {body}"[:OK_LINE_MAX]
