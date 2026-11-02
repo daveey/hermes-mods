@@ -54,11 +54,29 @@ def _db_path(board=None):
     return home / 'kanban.db'
 
 
+def _ro_connect(path, timeout=2.0):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (the dispatcher's last close deletes
+    them), so fall back to mode=rw + query_only: same data, never writes, never creates a missing db."""
+    try:
+        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=timeout)
+    except sqlite3.OperationalError:
+        conn = None
+    if conn is not None:
+        try:
+            conn.execute('select 1 from sqlite_master limit 1')
+            return conn
+        except sqlite3.OperationalError:
+            conn.close()
+    conn = sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=timeout)
+    conn.execute('PRAGMA query_only=ON')
+    return conn
+
+
 def _connect(board=None):
     path = _db_path(board)
     if not path.is_file():
         return None
-    conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=2.0)
+    conn = _ro_connect(path, timeout=2.0)
     conn.row_factory = sqlite3.Row
     return conn
 

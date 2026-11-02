@@ -72,12 +72,30 @@ def _kanban_db(path=None) -> Optional[Path]:
         return None
 
 
+def _ro_connect(path, timeout=1.0) -> sqlite3.Connection:
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (the dispatcher's last close deletes
+    them), so fall back to mode=rw + query_only: same data, never writes, never creates a missing db."""
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+    except sqlite3.OperationalError:
+        conn = None
+    if conn is not None:
+        try:
+            conn.execute("select 1 from sqlite_master limit 1")
+            return conn
+        except sqlite3.OperationalError:
+            conn.close()
+    conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
 def card_origins(task_id: str, db_path=None) -> list[tuple[str, str, str]]:
     """``(gateway, profile, session)`` of each origin chat bound to ``task_id`` (hub subs with reason origin)."""
     path = _kanban_db(db_path)
     if not task_id or path is None or not path.is_file():
         return []
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+    conn = _ro_connect(path, timeout=1)
     try:
         rows = conn.execute("SELECT chat_id, delivery_metadata FROM kanban_notify_subs "
                             "WHERE task_id = ? AND platform = 'hub'", (task_id,)).fetchall()

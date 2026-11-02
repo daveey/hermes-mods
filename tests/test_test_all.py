@@ -101,6 +101,26 @@ class TestAll(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('skipped tests/integration_f3: needs a core checkout', r.stdout)
 
+    def test_repo_guards_run_in_every_plugin_scoped_run(self):
+        """A -k run (what a worker runs before pushing one plugin) must still run the repo-wide guards: the
+        coach's bare mode=ro open shipped because `-k coach` never ran tests/test_sqlite_ro_guard.py."""
+        make_tree(self.root, {"coach": "def test_coach():\n    pass\n"})
+        tests = self.root / "tests"
+        tests.mkdir()
+        (tests / "test_sqlite_ro_guard.py").write_text("def test_guard():\n    raise SystemExit('guard ran')\n")
+        (tests / "test_top.py").write_text("def test_top():\n    pass\n")
+        runner = runpy.run_path(str(RUNNER))
+        names = {s['name']: s for s in runner['discover'](self.root, None, False)}
+        self.assertEqual(names['repo-guards']['targets'], [str(tests / 'test_sqlite_ro_guard.py')])
+        self.assertNotIn(str(tests / 'test_sqlite_ro_guard.py'), names['tests']['targets'])
+        listed = run(self.root, '-k', 'coach', '--list')
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertEqual(listed.stdout.split(), ['plugins/coach', 'repo-guards'])
+        r = run(self.root, '-k', 'coach')
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('repo-guards', r.stdout)
+        self.assertEqual(run(self.root, '-k', 'no-such-suite', '--list').stdout.split(), [])
+
     def test_python_selection_order_with_fake_paths(self):
         runner = runpy.run_path(str(RUNNER))
         core = self.root / 'core'

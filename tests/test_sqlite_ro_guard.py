@@ -8,12 +8,14 @@ query_only=ON`` opens fine, reads the same data and never creates a missing db.
 Run: ``python -m pytest tests/test_sqlite_ro_guard.py`` or ``python tests/test_sqlite_ro_guard.py``.
 """
 import importlib.util
+import os
 import re
 import sqlite3
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 # Spelled in two halves so this file does not trip its own scan.
@@ -64,6 +66,16 @@ def _load(rel, name):
     return mod
 
 
+def _plain_ro_opens(db) -> bool:
+    try:
+        c = sqlite3.connect(f"file:{db}?{NEEDLE}", uri=True)
+        c.execute("select 1 from sqlite_master limit 1")
+        c.close()
+    except sqlite3.OperationalError:
+        return False
+    return True
+
+
 class SqliteRoGuard(unittest.TestCase):
     def test_no_bare_ro_open(self):
         bad = offenders()
@@ -82,8 +94,9 @@ class SqliteRoGuard(unittest.TestCase):
                 pass
             else:
                 self.skipTest("this SQLite build opens a WAL db read-only without -wal/-shm")
-            for rel in ("plugins/open-asks/core.py", "plugins/user-steps/cards.py", "plugins/follow-through/core.py"):
-                helper = _load(rel, "_ro_guard_" + rel.split("/")[1].replace("-", "_")).__dict__.get("_ro_connect")
+            for rel in ("plugins/open-asks/core.py", "plugins/user-steps/cards.py", "plugins/follow-through/core.py",
+                        "plugins/coach/origin_authority.py", "plugins/kanban-wait-chain-guard/__init__.py"):
+                helper = _load(rel, "_ro_guard_" + rel.replace("/", "_").replace("-", "_")[:-3]).__dict__.get("_ro_connect")
                 self.assertIsNotNone(helper, f"{rel} has no _ro_connect")
                 c = helper(db, timeout=1)
                 try:
@@ -92,6 +105,36 @@ class SqliteRoGuard(unittest.TestCase):
                         c.execute("insert into t values (1)")
                 finally:
                     c.close()
+
+    def test_kanban_readers_open_a_board_whose_wal_sidecars_are_gone(self):
+        """The coach's origin-chat lookup (a hub worker's spend approval) and the wait-chain guard read kanban.db.
+        A bare ro open there raised 'unable to open database file' whenever the board's -wal/-shm were gone."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "kanban.db"
+            c = sqlite3.connect(db)
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("create table kanban_notify_subs (task_id, platform, chat_id, delivery_metadata)")
+            c.execute("insert into kanban_notify_subs values ('t_1', 'hub', 'macbook/default/s1', ?)",
+                      ('{"reason": "origin"}',))
+            c.execute("create table tasks (id)")
+            c.execute("insert into tasks values ('t_1')")
+            c.commit()
+            c.close()
+            for suffix in ("-wal", "-shm"):
+                Path(str(db) + suffix).unlink(missing_ok=True)
+            if _plain_ro_opens(db):
+                self.skipTest("this SQLite build opens a WAL db read-only without -wal/-shm")
+            oa = _load("plugins/coach/origin_authority.py", "_ro_guard_entry_origin_authority")
+            self.assertEqual(oa.card_origins("t_1", db), [("macbook", "default", "s1")])
+            wc = _load("plugins/kanban-wait-chain-guard/__init__.py", "_ro_guard_entry_wait_chain")
+            with mock.patch.dict(os.environ, {"HERMES_KANBAN_DB": str(db)}):
+                conn = wc._connect()
+            try:
+                self.assertEqual(conn.execute("select id from tasks").fetchone()["id"], "t_1")
+                with self.assertRaises(sqlite3.OperationalError):  # still read-only
+                    conn.execute("insert into tasks values ('t_2')")
+            finally:
+                conn.close()
 
     def test_helper_never_creates_a_missing_db(self):
         with tempfile.TemporaryDirectory() as tmp:
