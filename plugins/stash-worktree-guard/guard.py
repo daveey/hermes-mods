@@ -99,6 +99,9 @@ _KEYWORD = "*keyword*"      # `set -k`: assignment words anywhere in argv go to 
 _NAMEREF = "*nameref*"      # a nameref exists: an assignment may write any variable
 _CMDS = "*bash_cmds*"       # BASH_CMDS was assigned: the hash table maps unknown names
 _MARKERS = {_ALLEXPORT, _KEYWORD, _NAMEREF, _CMDS}
+# `export -f NAME` / `declare -fx NAME` (or a definition under `set -a`) puts NAME's function in
+# the environment, where a child Bash imports it: recorded in _State.exported as this + NAME.
+_FUNC_MARK = "()"
 # Interpreters whose argv may hold a program that runs git (`perl -e 'system("git …")'`).
 _INTERPRETERS = {"perl", "python", "python2", "python3", "ruby", "node", "php", "tclsh",
                  "lua", "awk", "gawk", "mawk"}
@@ -936,6 +939,7 @@ def _unknown(states) -> _State:
     for st in states:
         funcs.update(st.funcs)
         markers |= st.exported & _MARKERS  # shell options survive a loss of state
+        markers |= {e for e in st.exported if e.startswith(_FUNC_MARK)}  # so do function exports
     return _State(None, {"IFS": None} if _NAMEREF in markers else {}, markers, funcs)
 
 
@@ -1287,6 +1291,8 @@ class _Analyzer:
             for st in states:
                 new = st.copy()
                 new.funcs[node[1]] = node[2]
+                if _ALLEXPORT in new.exported:  # `set -a` exports functions defined after it too
+                    new.exported.add(_FUNC_MARK + node[1])
                 out.append(new)
             return out, out
         if kind == "simple":
@@ -1355,11 +1361,14 @@ class _Analyzer:
                         self.isolated(inner, st, depth)
 
     def child(self, st: _State, prefix: dict) -> _State:
-        """A child shell sees exported variables only; others are unknown, not inherited."""
+        """A child shell sees exported variables and exported functions only; others are
+        unknown, not inherited (a `hash -p` entry is not inherited either)."""
         variables = {k: st.vars.get(k) for k in st.exported if k in st.vars}
         variables.update(prefix)
         variables["PWD"] = st.cwd
-        return _State(st.cwd, variables, (set(st.exported) - _MARKERS) | set(prefix), {}, st.lcwd)
+        names = (e[len(_FUNC_MARK):] for e in st.exported if e.startswith(_FUNC_MARK))
+        funcs = {n: st.funcs[n] for n in names if n in st.funcs and st.funcs[n][0] != "hashed"}
+        return _State(st.cwd, variables, (set(st.exported) - _MARKERS) | set(prefix), funcs, st.lcwd)
 
     def simple(self, node, st: _State, depth: int, nested: bool = False):
         self.steps += 1
@@ -1673,6 +1682,14 @@ class _Analyzer:
             match = _ASSIGN.match(r)
             name = match[1] if match else (l if _NAME.match(l) else None)
             if name is None:
+                continue
+            if "f" in flags:
+                # `export -f NAME`, `declare -fx NAME`: NAME is a function, not a variable. Only
+                # its export attribute can change (`+x` is read as export too: fail closed).
+                if unexport:
+                    new.exported.discard(_FUNC_MARK + name)
+                elif cmd == "export" or "x" in flags:
+                    new.exported.add(_FUNC_MARK + name)
                 continue
             if "n" in flags and cmd != "export" and (
                     not match or not re.fullmatch(r"[A-Za-z_]\w*", _literal(r[match.end():]))

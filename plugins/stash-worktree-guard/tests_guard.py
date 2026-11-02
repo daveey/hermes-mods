@@ -381,6 +381,43 @@ def test_stash_branch_really_takes_another_worktrees_stash(multi):
     assert _stash_count(main) == 0  # dropped: main's worker has lost it
 
 
+# --- Functions exported to a child Bash (`export -f`, `declare -fx`, `set -a`) ---
+#
+# `timeout` cannot run a shell function, so `f() {...}; export -f f; timeout 60 bash -c f` is
+# the usual idiom. A child Bash imports exported functions from its environment, but the
+# analyzer gave every child an empty function table, so the restore inside `f` went unseen.
+
+EXPORTED_FUNCTION_CASES = [
+    # (command template, workdir key, expected blocked)
+    ("f() {{ git stash pop; }}; export -f f; timeout -k 1 5 bash -c f", "wt", True),
+    ("f() {{ git -C {wt} stash pop; }}; export -f f; bash -c f", "main", True),
+    ("f() {{ git -C {wt} stash pop; }}; declare -fx f; bash -c 'f'", "main", True),
+    ("f() {{ git -C {wt} stash pop; }}; typeset -f -x f; sh -c f", "main", True),
+    ("set -a; f() {{ git -C {wt} stash pop; }}; bash -c f", "main", True),
+    # A grandchild imports it too: the function stays in the environment.
+    ("f() {{ git -C {wt} stash pop; }}; export -f f; bash -c 'bash -c f'", "main", True),
+    # Controls: an unexported function is not visible in the child.
+    ("f() {{ git -C {wt} stash pop; }}; bash -c f", "main", False),
+    # The exported function restores this worktree's own stash.
+    ("f() {{ git stash pop; }}; export -f f; bash -c f", "main", False),
+]
+
+
+@pytest.mark.parametrize("template,where,expected", EXPORTED_FUNCTION_CASES)
+def test_exported_function_runs_in_child_shell(multi, template, where, expected):
+    main, wt = multi
+    cmd = template.format(main=main, wt=wt)
+    assert _blocked(cmd, {"main": main, "wt": wt}[where]) is expected, cmd
+
+
+def test_exported_function_really_restores_in_child_bash(multi):
+    main, wt = multi
+    cmd = f"f() {{ git -C {wt} stash pop -q; }}; export -f f; bash -c f"
+    assert _blocked(cmd, main)
+    subprocess.run([_proof_bash(), "-c", cmd], check=True, capture_output=True, env=GIT_ENV)
+    assert (wt / "f.txt").read_text() == "stashed\n"
+
+
 # --- Bounded shell state: groups, pipelines, background, mutations, substitutions ---
 
 def _blocked(cmd, cwd):

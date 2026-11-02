@@ -19,6 +19,9 @@ This plugin:
 - blocks a restore that follows a push (`git stash`, `push`, `save`, `store`) into the same
   repository earlier in the same command, whatever refs/stash holds when it is checked: the
   restore takes whichever stash is newest when it runs, which can be another worker's;
+- follows a function into a child shell when it is exported (`export -f`, `declare -fx`,
+  or defined after `set -a`), as in `f() {...}; export -f f; timeout 60 bash -c f`. A child
+  never sees an unexported function;
 - resolves scalar assignments made earlier in the command, `$HOME`, `$TMPDIR`, and `~`
   in `cd` and `git -C` paths. It preserves quoting and tracks `PWD` from the tool's cwd,
   not the agent process's potentially stale environment;
@@ -174,8 +177,12 @@ nested `tool_call`. It runs before the terminal handler can promote a timeout ov
 600 seconds to a background process. Enforcement does not depend on a subsequent
 `transform_terminal_output` warning or background completion notification.
 
-Already-open sessions keep the plugin module they imported. A fresh session picks up
-new code; updating the files is not proof an existing session refreshed.
+After a pull, hermes-sync's `mods-reload` re-activates a changed plugin in the gateway and
+in every serve/desktop-serve backend. Open sessions there use the new hooks from their next
+tool call (seen live 2026-11-01 21:13 PST in a gateway that started before both fixes). A
+Kanban worker loads plugins once, at start, and keeps that module until it exits. Updated
+files don't prove a given process refreshed: look for its
+`mods-reload: ... ok (stash-worktree-guard)` line.
 
 ## Explicit out-of-scope compositions
 
@@ -199,14 +206,7 @@ another linked worktree and `R` a scratch directory.
    filesystem effects. We deliberately do not taint aliases after *every* non-inert
    program: that would also make ordinary sequences such as `npm test; git lg`
    uncertain without evidence of a config change.
-3. **Exported Bash functions invoked by a new Bash process.** A function defined in
-   this command, exported with `export -f f`, and invoked with
-   `timeout -k 1 5 bash -c f` is not propagated into the analyzer's child state.
-   This limitation applies even when the function body is present in the tool text,
-   not only to functions inherited from a persistent terminal. Correct modeling would
-   need function export/import semantics; copying all functions into every child would
-   incorrectly treat unexported functions as inherited.
-4. **Dynamic Git subcommands inside `env -S` strings.** The split-string form is not
+3. **Dynamic Git subcommands inside `env -S` strings.** The split-string form is not
    interpreted with env's splitting rules. In particular,
    `env -S "git -C WT $(echo c3Rhc2g= | base64 -d) pop"` can escape both argv analysis
    and the textual fallback. The fallback's dynamic-subcommand pattern requires a
@@ -214,7 +214,7 @@ another linked worktree and `R` a scratch directory.
    beginning with `$` after `git`/`git -C`. Direct ordinary Git argv analysis is a
    separate path. This is a known parser/fallback coverage gap, not a claim that
    split-string support could not be implemented.
-5. **Execute a generated script, including one named like a wrapper.** Decoding a
+4. **Execute a generated script, including one named like a wrapper.** Decoding a
    script to `R/nice`, making it executable and invoking `R/nice -n 5 true` does not
    cause the analyzer to inspect its contents or verify that it is the system `nice`.
    Earlier writes in the same command do not establish the executable's semantics.
@@ -278,6 +278,13 @@ unsupported wrappers and ANSI-C, split scalars, quoted and escaped spellings),
 non-restoring shapes allowed.
 
 ## Failure analysis
+
+A function exported to a child Bash (`export -f f; timeout 5 bash -c f`) was listed above as
+an out-of-scope composition until 2026-11-01. It isn't obfuscation: `timeout` can't run a
+shell function, so this is the ordinary way to put one under a time limit. The analyzer gave
+every child shell an empty function table. Since then, only functions marked for export are
+carried into a child, and on to its children (`EXPORTED_FUNCTION_CASES`, with an unexported
+control). The four remaining items all depend on encoded or generated content.
 
 A same-command round trip (`git stash -q; pytest ...; git stash pop -q`) ran unrefused in a
 seven-worktree hermes-mods clone on the hub (2026-11-01 20:07 PST). It restored the worker's
