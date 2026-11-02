@@ -200,9 +200,12 @@ def test_reversed_registration_executes_interacting_real_holds(environment, monk
     assert rounds[1][0][2]['unresolved_fallback']['goal'] == 'Repair example app'
     assert len(out[1]) == 3
     # Only the first eligible hold supplies the next model request's nudge.
+    # Core prefixes buffered holds with its delivery notice; require both the
+    # notice and the exact winner, not merely a substring of any gate's nudge.
+    from agent.pre_final_gate import HELD_NOTICE
     for call, winner in zip(out[1][1:], [rounds[0][1], rounds[1][0]]):
         nudges = [row for row in call['messages'] if row.get('role') == 'user']
-        assert nudges[-1]['content'] == winner[2]['nudge']
+        assert nudges[-1]['content'] == f"{HELD_NOTICE}\n\n{winner[2]['nudge']}"
     assert out[5]._pre_final_gate_attempts == 2
     assert 'Unresolved goal' in out[0]['final_response']
     assert 'pre-final hold limit reached' in out[0]['final_response']
