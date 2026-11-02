@@ -120,6 +120,11 @@ class PolicyTest(unittest.TestCase):
     def test_bounded_termination(self):
         self.assertIn("**one** remediation/review cycle", self.text)
         self.assertIn("Never call this \"converged\"", self.text)
+        self.assertIn("any edit touched its scope headings", self.text)
+        self.assertIn("do not skip that stage on your own judgement", self.text)
+
+    def test_every_refuter_pinned(self):
+        self.assertIn("`model`/`provider` on **every** refutation task", self.text)
 
     def test_drift_is_read_only_and_unscheduled(self):
         self.assertIn("Drift mode (on demand, read-only)", self.text)

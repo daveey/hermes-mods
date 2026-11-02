@@ -105,7 +105,9 @@ review of an already approved design: run 5 (plus 2 if the plan is new to reader
 
 **Refutation:** for each blocker/major finding that would change the design (a consequential design claim),
 dispatch one independent refutation reviewer with the spec, the reading list, the finding text and the
-`Refutation` rubric. Keep a finding only if it survives; record the refuter's verdict either way.
+`Refutation` rubric. Keep a finding only if it survives; record the refuter's verdict either way. Pin
+`model`/`provider` on **every** refutation task, including one you add later for a minor-looking finding (a live
+run left one refuter on the default tier).
 
 ### 4. Collect and record findings
 
@@ -133,7 +135,9 @@ Default to one consolidated run: do not stop after each stage to ask the user.
 
 Bound the review to the initial pass plus **one** remediation/review cycle. After editing: re-read the spec,
 re-hash it, re-derive locations from the new headings (old line numbers are stale), then re-run only the
-stages whose scope changed, with fresh reviewers. If findings are still open, stop and report them as open
+stages whose scope changed, with fresh reviewers. A stage's scope changed when any edit touched its scope headings,
+even one you judge to be wording or numbers only: do not skip that stage on your own judgement of the edit (a live
+run skipped Design after editing `Decisions` and `Security`). If findings are still open, stop and report them as open
 with their severities. Never call this "converged" or "two clean rounds" (that is upstream's loop, not this
 one). Another pass needs a stated reason (e.g. a new design decision), not a chase for a clean report.
 
