@@ -683,9 +683,14 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   A repeated tool error files as `repeated <tool> error: <normalized error>` (card/session ids, paths, hex and numbers
   stripped; a JSON tool result is unwrapped to its error/output string), so each distinct failure is its own
   fingerprint, and its evidence (the tool, error line, count and last call) leads the defect quote. `handle()` adds it
-  itself, so a gateway that hot-reloaded `self_heal.py` under an older `__init__.py` still records it. Owner adoption for any machine signal takes a session card only when its title or
-  body names the tool (unless generic, like `terminal`) or the error's words; otherwise it files
-  (`selfheal_adopt_skipped`). Origin: agent-6eb3a51e94, one fixed label lumped every repeated error together.
+  itself, so a gateway that hot-reloaded `self_heal.py` under an older `__init__.py` still records it. Session-owner
+  adoption for any defect that is not a user complaint in that session (machine signals, the digest backstop; only
+  `complaint`/`admission` are exempt) takes a session card only with subject evidence (`card_names_defect`): its
+  title, body or idempotency key names the fingerprint, the symptom's first 80 characters or the repeated error, or
+  the non-generic tool; or its title shares max(2, a third) of the symptom's distinctive words. Otherwise it files
+  (`selfheal_adopt_skipped`). A complaint still adopts the session's card, preferring one that names the defect.
+  Origin: agent-6eb3a51e94 (an Ask Eve test owned a repeated tool error); agent-e5b6dcf428 (any one shared word,
+  "agent" or "check", let a report_only signal close against a Kanban owner-death fix).
   A backend that stops mid-turn never reaches this hook: the next user turn, core's `[System note: Your previous turn
   was interrupted mid-run` resume note, files `turn interrupted (backend stopped)` with the gap since the last activity.
   Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows

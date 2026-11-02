@@ -169,8 +169,11 @@ def test_old_alias_turn_survives_owner_refiling(store):
 def test_session_adoption_persists_turn_for_later_detector(store):
     a, b = pair()
     runner = Runner()
+    # The session card names the defect: a backstop finding needs subject evidence, not just the session
+    # (agent-e5b6dcf428). This test is about the adopted turn persisting for the later detector.
     out = sh.file_defect(a, store=store, m="live", runner=runner, now=NOW, cfg=HUB, budget_fn=OPEN,
-                         owner_fn=lambda *a: [{"id": "t_abcdef05", "status": "running", "board": None}])
+                         owner_fn=lambda *a: [{"id": "t_abcdef05", "status": "running", "board": None,
+                                               "title": "Bot fix not actually applied despite claiming done"}])
     assert out["adopted"]
     assert file(b, store, runner)["card"] == "t_abcdef05"
     assert not runner.creates()

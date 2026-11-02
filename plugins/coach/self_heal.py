@@ -449,6 +449,52 @@ def card_relevant(card: dict, terms: set) -> bool:
     return bool(text) and any(t in text for t in terms)
 
 
+# Words that recur in most self-heal and fix-card text, so sharing them says nothing about the subject.
+# agent-e5b6dcf428: "agent", "check" and "which" tied a coach report_only signal to a Kanban owner-death fix card.
+_SUBJECT_GENERIC = set("agent agents check checks coach reply replies what which that this there here have then "
+                       "than just only also into your about would should could every other same some kanban hermes "
+                       "session sessions nudge outcome issue problem fix fixed".split())
+SUBJECT_SYMPTOM_CHARS = 80  # self-heal card titles carry the symptom truncated near 100 chars
+# Sources where the origin session's next card answers a user complaint raised in that same session. For every other
+# source (machine signals, the digest backstop) the session's next card is only its next piece of work.
+SESSION_RESPONSE_SOURCES = ("complaint", "admission")
+
+
+def _norm_text(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "").lower()).strip()
+
+
+def _subject_words(text) -> set:
+    return {_stem(w) for w in re.findall(r"[a-z][a-z0-9_]+", str(text or "").lower())
+            if len(w) >= 4 and w not in _RELEVANCE_STOP and w not in _STOP and w not in _SUBJECT_GENERIC}
+
+
+def card_names_defect(card: dict, d: dict, fp: Optional[str] = None) -> bool:
+    """Subject evidence that `card` is about defect `d`, not just made by the same session: its title, body or
+    idempotency key names the fingerprint or the symptom (first SUBJECT_SYMPTOM_CHARS chars), the signal's
+    non-generic tool or its normalized error, or at least max(2, a third) of the symptom's distinctive words."""
+    fp = fp or d.get("fingerprint")
+    text = _norm_text(" ".join(str(card.get(k) or "") for k in ("title", "body", "idempotency_key")))
+    if not text:
+        return False
+    if fp and fp.lower() in text:
+        return True
+    for phrase in (d.get("symptom"), d.get("error") if d.get("kind") == "repeat_failure" else None):
+        needle = _norm_text(phrase)[:SUBJECT_SYMPTOM_CHARS].strip()
+        if len(needle) >= 12 and needle in text:
+            return True
+    tool = str(d.get("tool") or "").lower()
+    if tool and tool not in _GENERIC_TOOLS and re.search(r"(?<![a-z0-9_])%s(?![a-z0-9_])" % re.escape(tool), text):
+        return True
+    want = _subject_words(d.get("error") if d.get("kind") == "repeat_failure" else d.get("symptom"))
+    if not want:
+        return False
+    # Word overlap counts against the title (and key) only: a 4000-char body shares a couple of words with almost
+    # any symptom ("reported", "tests"), which once tied 4 unrelated defects to one user-steps card.
+    head = _subject_words(" ".join(str(card.get(k) or "") for k in ("title", "idempotency_key")))
+    return len(want & head) >= max(2, -(-len(want) // 3))
+
+
 def is_resume_note(user_text) -> bool:
     """Core's resume note (crash recovery or update pause): a machine-written turn, never a user complaint."""
     return clean_user(user_text).lstrip().startswith(RESUME_NOTE_PREFIX)
@@ -1798,13 +1844,14 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
         try:
             cols = {c[1] for c in db.execute("PRAGMA table_info(tasks)")}
             body = "substr(body, 1, 4000)" if "body" in cols else "NULL"
+            ikey = "idempotency_key" if "idempotency_key" in cols else "NULL"
             for r in db.execute(
-                    f"SELECT id, title, status, created_at, {body} FROM tasks WHERE status IN ({marks}) "
+                    f"SELECT id, title, status, created_at, {body}, {ikey} FROM tasks WHERE status IN ({marks}) "
                     "AND created_at >= ? "
                     "AND (session_id = ? OR id IN (SELECT task_id FROM kanban_notify_subs WHERE chat_id = ?))",
                     (*ADOPT_STATUSES, int(since), session_id, session_id)):
                 rows.append({"id": r[0], "title": r[1], "status": r[2], "created_at": r[3], "board": board,
-                             "body": r[4]})
+                             "body": r[4], "idempotency_key": r[5]})
         except sqlite3.Error:
             pass
         finally:
@@ -2006,17 +2053,20 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
                     "commit": fix["sha"], "adopted": True}
     if not cards:
         return None
-    if d.get("source") == "signal":
-        # A machine signal names no fix of its own: the session's next card is often unrelated work (an Ask Eve test
-        # was once adopted as the owner of a repeated kanban error). Adopt only a card that names the tool or error.
-        terms = signal_terms(d)
-        relevant = [x for x in cards if card_relevant(x, terms)]
-        if not relevant:
-            store.log({"event": "selfheal_adopt_skipped", "why": "no session card names the signal's tool or error",
-                       "fingerprint": fp, "session_id": sid, "terms": sorted(terms)[:12],
+    named = [x for x in cards if card_names_defect(x, d, fp)]
+    if d.get("source") not in SESSION_RESPONSE_SOURCES:
+        # No user complaint in that session: its next cards are just its next work (an Ask Eve test once owned a
+        # repeated kanban error; agent-e5b6dcf428's report_only signal was closed against a Kanban owner-death fix).
+        # Adopt only a card with subject evidence; sharing the session is not enough.
+        if not named:
+            store.log({"event": "selfheal_adopt_skipped", "why": "no session card names the defect",
+                       "fingerprint": fp, "session_id": sid, "source": d.get("source"),
+                       "terms": sorted(_subject_words(d.get("symptom")))[:12],
                        "candidates": [x["id"] for x in cards]})
             return None
-        cards = relevant
+        cards = named
+    elif named:
+        cards = named  # a complaint's session card that names it beats a newer unrelated one
     c = cards[0]
     lane = LaneState(store.root)
     st = lane.get(fp)
