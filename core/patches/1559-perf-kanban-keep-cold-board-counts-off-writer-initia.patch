@@ -1,0 +1,246 @@
+From b4f69efc705c2a74e72041906cad861fd86c8bca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:58:23 +0000
+Subject: [PATCH] perf(kanban): keep cold board counts off writer
+ initialization [daveey]
+
+---
+ plugins/kanban/dashboard/board_counts.py      |  20 +++
+ plugins/kanban/dashboard/board_prewarm.py     |  24 +++-
+ plugins/kanban/dashboard/plugin_api.py        |  11 +-
+ tests/plugins/test_kanban_cold_start_reads.py | 115 ++++++++++++++++++
+ 4 files changed, 157 insertions(+), 13 deletions(-)
+ create mode 100644 plugins/kanban/dashboard/board_counts.py
+ create mode 100644 tests/plugins/test_kanban_cold_start_reads.py
+
+diff --git a/plugins/kanban/dashboard/board_counts.py b/plugins/kanban/dashboard/board_counts.py
+new file mode 100644
+index 00000000000..0b4896d2e5b
+--- /dev/null
++++ b/plugins/kanban/dashboard/board_counts.py
+@@ -0,0 +1,20 @@
++"""Switcher counts need no schema reconciliation or writer initialization."""
++from contextlib import closing
++import sqlite3
++
++from hermes_cli import kanban_db
++from hermes_cli.kanban_generation import open_ro
++
++
++def board_counts(slug: str) -> dict[str, int]:
++    """Read existing tasks.status, including legacy boards; never create a store.
++
++    Use the generation-guarded query-only connection, including its missing WAL
++    sidecar fallback. Writer connect still owns integrity checks and migrations.
++    """
++    try:
++        with closing(open_ro(kanban_db.kanban_db_path(board=slug))) as conn:
++            return {status: int(count) for status, count in conn.execute(
++                "SELECT status, COUNT(*) FROM tasks GROUP BY status")}
++    except (OSError, ValueError, sqlite3.Error):
++        return {}
+diff --git a/plugins/kanban/dashboard/board_prewarm.py b/plugins/kanban/dashboard/board_prewarm.py
+index 41046414688..49099c8de7c 100644
+--- a/plugins/kanban/dashboard/board_prewarm.py
++++ b/plugins/kanban/dashboard/board_prewarm.py
+@@ -1,4 +1,4 @@
+-"""Boot-time read of the active and default boards, so the Desktop's first cold-start poll finds
++"""Boot-time read of the active, default and blocked boards, so Desktop's first cold-start poll finds
+ a snapshot (or joins this read) instead of paying connect + first-init integrity probe + the
+ full read under the burst's GIL contention. The probe still runs in ``kbc.connect`` before
+ anything is written; only the thread it runs on changes."""
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ import logging
+ import os
+ import threading
++import time
+ from typing import Optional
+ 
+ from agent.memory_provider import spawn_context_thread
+@@ -16,12 +17,28 @@ from hermes_cli import kanban_db
+ log = logging.getLogger(__name__)
+ 
+ 
++def _warm_names(api):
++    yield kanban_db.get_current_board()
++    yield kanban_db.DEFAULT_BOARD
++    # Discover only after the selected board has warmed. A failed directory
++    # scan must not discard the guaranteed active/default warm-up.
++    try:
++        for board in kanban_db.list_boards():
++            if api._board_counts(board["slug"]).get("blocked", 0):
++                yield board["slug"]
++    except Exception:
++        log.warning("kanban board prewarm discovery failed", exc_info=True)
++
++
+ def prewarm_boards(api) -> None:
+     """``api`` is the kanban plugin_api module (key and read come from the same code as GET /board)."""
+     from plugins.kanban.dashboard.board_snapshot import file_sig, prewarm
+ 
++    # Desktop's blocked-task loader reads these boards too, not only the selected
++    # board. Counts are query-only: discovery must not initialize every store.
+     seen = set()
+-    for name in (kanban_db.get_current_board(), kanban_db.DEFAULT_BOARD):
++    for name in _warm_names(api):
++        started = time.monotonic()
+         try:
+             resolved = api._resolve_board(name)
+             path = str(kanban_db.kanban_db_path(board=resolved))
+@@ -31,8 +48,9 @@ def prewarm_boards(api) -> None:
+             seen.add(key)
+             prewarm(lambda r=resolved: api._get_board_uncached(None, False, r, None, None, api._BOARD_DONE_LIMIT),
+                     key, file_sig(path))
++            log.info("kanban board prewarm finished board=%s elapsed_s=%.3f", name, time.monotonic() - started)
+         except Exception:
+-            log.debug("kanban board prewarm failed for %r", name, exc_info=True)
++            log.warning("kanban board prewarm failed for %r", name, exc_info=True)
+ 
+ 
+ def start_board_prewarm(api) -> Optional[threading.Thread]:
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index bcd48db39cb..a20091157f3 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -1583,16 +1583,7 @@ def _projects_by_id() -> dict[str, Any]:
+         return {}
+ 
+ 
+-def _board_counts(slug: str) -> dict[str, int]:
+-    """``{status: count}`` for a board; ``{}`` on a missing/empty DB."""
+-    try:
+-        if not kanban_db.kanban_db_path(board=slug).exists():
+-            return {}
+-        with closing(kbc.connect(board=slug)) as conn:
+-            rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
+-            return {r["status"]: int(r["n"]) for r in rows}
+-    except Exception:
+-        return {}
++from plugins.kanban.dashboard.board_counts import board_counts as _board_counts
+ 
+ 
+ def _default_workspace_kind(board: dict[str, Any]) -> str:
+diff --git a/tests/plugins/test_kanban_cold_start_reads.py b/tests/plugins/test_kanban_cold_start_reads.py
+new file mode 100644
+index 00000000000..f0c06925f1d
+--- /dev/null
++++ b/tests/plugins/test_kanban_cold_start_reads.py
+@@ -0,0 +1,115 @@
++"""Cold dashboard reads must not join writer initialization or miss blocked boards."""
++from contextlib import closing
++import logging
++import sqlite3
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from plugins.kanban.dashboard.board_prewarm import prewarm_boards
++from tests.plugins.test_kanban_board_read_cache import _create, _titles
++
++pytest_plugins = ["tests.plugins.test_kanban_board_read_cache"]
++
++
++def test_board_list_counts_do_not_initialize_writers(board, monkeypatch):
++    _mod, client, _ = board
++    _create("visible")
++    kb.create_board("waiting")
++    with closing(kbc.connect(board="waiting")) as conn:
++        tid = kb.create_task(conn, title="blocked", assignee="w")
++        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    initialized = []
++
++    def forbidden(*args, **kwargs):
++        initialized.append(True)
++        raise AssertionError("read-only counts entered writer initialization")
++
++    monkeypatch.setattr(kbc, "connect", forbidden)
++    response = client.get("/api/plugins/kanban/boards")
++    assert response.status_code == 200
++    counts = {b["slug"]: b["counts"] for b in response.json()["boards"]}
++    assert counts["waiting"] == {"blocked": 1}
++    assert counts["default"] == {"ready": 1}
++    assert initialized == []
++
++
++def test_counts_accept_legacy_status_only_schema_and_do_not_create(board, tmp_path, monkeypatch):
++    mod, _, _ = board
++    path = tmp_path / "legacy.db"
++    with closing(sqlite3.connect(path)) as conn:
++        conn.execute("CREATE TABLE tasks (status TEXT)")
++        conn.executemany("INSERT INTO tasks VALUES (?)", [("blocked",), ("blocked",), ("done",)])
++        conn.commit()
++    monkeypatch.setattr(kb, "kanban_db_path", lambda **kw: path)
++    assert mod._board_counts("legacy") == {"blocked": 2, "done": 1}
++    with closing(sqlite3.connect(path)) as conn:
++        assert [r[0] for r in conn.execute("SELECT name FROM sqlite_master")] == ["tasks"]
++    missing = tmp_path / "missing.db"
++    monkeypatch.setattr(kb, "kanban_db_path", lambda **kw: missing)
++    assert mod._board_counts("missing") == {}
++    assert not missing.exists()
++
++
++def test_prewarm_covers_blocked_board_poll_without_warming_every_board(board):
++    mod, client, reads = board
++    _create("default")
++    for slug in ("waiting", "quiet"):
++        kb.create_board(slug)
++        with closing(kbc.connect(board=slug)) as conn:
++            tid = kb.create_task(conn, title=slug, assignee="w")
++            if slug == "waiting":
++                conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    prewarm_boards(mod)
++    assert {args[2] for args in reads} == {"default", "waiting"}
++    before = len(reads)
++    assert _titles(client.get("/api/plugins/kanban/board?board=waiting").json()) == {"waiting"}
++    assert len(reads) == before
++
++
++def test_failed_prewarm_is_observable(board, monkeypatch, caplog):
++    mod, _, _ = board
++
++    def fail(*args):
++        raise RuntimeError("cold read failure")
++
++    monkeypatch.setattr(mod, "_get_board_uncached", fail)
++    with caplog.at_level(logging.WARNING):
++        prewarm_boards(mod)
++    assert "kanban board prewarm failed" in caplog.text
++
++
++def test_counts_connection_is_query_only_and_closed(board, monkeypatch):
++    from plugins.kanban.dashboard import board_counts
++    mod, _, _ = board
++    _create("visible")
++    opened = []
++    real = board_counts.open_ro
++
++    def capture(path):
++        conn = real(path)
++        opened.append(conn)
++        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
++        with pytest.raises(sqlite3.OperationalError, match="readonly"):
++            conn.execute("DELETE FROM tasks")
++        return conn
++
++    monkeypatch.setattr(board_counts, "open_ro", capture)
++    assert mod._board_counts("default") == {"ready": 1}
++    assert len(opened) == 1
++    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
++        opened[0].execute("SELECT 1")
++
++
++def test_discovery_failure_preserves_default_warmup(board, monkeypatch, caplog):
++    mod, client, reads = board
++    _create("default")
++
++    def fail(*args, **kwargs):
++        raise OSError("unreadable board directory")
++
++    monkeypatch.setattr(kb, "list_boards", fail)
++    with caplog.at_level(logging.WARNING):
++        prewarm_boards(mod)
++    assert "kanban board prewarm discovery failed" in caplog.text
++    assert _titles(client.get("/api/plugins/kanban/board").json()) == {"default"}
++    assert len(reads) == 1
+-- 
+2.55.0
+

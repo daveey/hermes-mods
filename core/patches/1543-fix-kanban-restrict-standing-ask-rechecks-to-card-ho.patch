@@ -1,0 +1,120 @@
+From 41b7bad881c330c5f05c06a0f365c7b4cdf8899d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:52:40 +0000
+Subject: [PATCH] fix(kanban): restrict standing ask rechecks to card home
+ [daveey]
+
+---
+ hermes_cli/kanban_block_policy.py             |  7 ++
+ .../test_kanban_ask_recheck_sync.py           | 75 +++++++++++++++++++
+ 2 files changed, 82 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_ask_recheck_sync.py
+
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index 9ca729a278a..0d97b68219a 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -295,12 +295,19 @@ def sweep_standing_asks(conn: sqlite3.Connection) -> list[str]:
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db import _json_dict
++    from hermes_cli.kanban_wake_check import foreign_ids
++
++    # Retaining a foreign copy for its host-local ask probe does not grant policy
++    # authority: event-id dedup is local, so only the card's home may recheck it.
++    copies = foreign_ids(conn)
+     moved: list[str] = []
+     rows = conn.execute(
+         "SELECT id, title, human_request FROM tasks WHERE status = 'blocked' AND human_request IS NOT NULL "
+         "AND current_run_id IS NULL").fetchall()
+     for row in rows:
+         tid = row["id"]
++        if tid in copies:
++            continue
+         request = _json_dict(row["human_request"])
+         if not request:
+             continue
+diff --git a/tests/hermes_cli/test_kanban_ask_recheck_sync.py b/tests/hermes_cli/test_kanban_ask_recheck_sync.py
+new file mode 100644
+index 00000000000..7fc82039cad
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ask_recheck_sync.py
+@@ -0,0 +1,75 @@
++"""Standing-ask policy has one home owner; executor-host resolved probes stay local."""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_ask_resolved as kar
++from hermes_cli import kanban_block_policy as policy
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_ask_resolved_sync as asks
++from tests.hermes_cli.test_kanban_worker_node import BOARD
++
++# Real gateway stores, pickup, leases and sync; only the Board transport is in-memory.
++gws = asks.gws
++
++
++@pytest.mark.parametrize("home_first", [False, True])
++def test_only_home_rechecks_a_retained_foreign_ask(gws, tmp_path, home_first):
++    home, worker = gws
++    request = asks._ask(asks._probe(tmp_path / "flag"))
++    request["action"] = "Ask your Hermes chat to rotate the key. Unblock = rotate; archive = drop."
++    tid = asks._relayed_ask(home, worker, request)
++    home.round()
++    assert worker.conn.execute("SELECT created_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == home.name
++    assert kwc.get_state(worker.conn, tid)["purpose"] == kar.PURPOSE
++    assert kwc.get_state(home.conn, tid) is None
++
++    # Both retain the blocked snapshot until their next sync; local event ids cannot arbitrate.
++    moved = {}
++    for gateway in ((home, worker) if home_first else (worker, home)):
++        gateway.enter()
++        moved[gateway.name] = policy.sweep_standing_asks(gateway.conn)
++        assert policy.sweep_standing_asks(gateway.conn) == []
++    worker.round()
++    home.round()
++    worker.round()
++    events = [e for e in home.svc.board(BOARD)["rows"]["task_events"].values()
++              if e["task_id"] == tid and e["kind"] == policy.RECHECK_EVENT]
++    assert len(events) == 1, events
++    assert moved == {home.name: [tid], worker.name: []}
++    assert kb.get_task(home.conn, tid).status == "triage"
++    assert kb.get_task(home.conn, tid).human_request is None
++    worker.enter()
++    kwc.run_due_wake_checks(worker.conn, now=int(time.time()) + 301, wait=True)
++    assert kb.get_task(worker.conn, tid).status == "triage"
++    assert kwc.get_state(worker.conn, tid) is None
++
++
++@pytest.mark.parametrize("void_ask", [False, True])
++def test_foreign_policy_skip_preserves_executor_resolved_probe(gws, tmp_path, void_ask):
++    home, worker = gws
++    flag = tmp_path / "paired"
++    request = asks._ask(asks._probe(flag))
++    if void_ask:
++        request["action"] = "Ask your Hermes chat to rotate the key. Unblock = rotate; archive = drop."
++    tid = asks._relayed_ask(home, worker, request)
++    home.round()
++    # Before home rechecks, the executor must keep probing even an invalid policy ask.
++    worker.enter()
++    assert policy.sweep_standing_asks(worker.conn) == []
++    worker.tick()
++    assert kb.get_task(worker.conn, tid).status == "blocked"
++    assert kwc.get_state(worker.conn, tid)["purpose"] == kar.PURPOSE
++    assert kwc.get_state(home.conn, tid) is None
++    flag.write_text("paired\n")
++    worker.enter()
++    kwc.run_due_wake_checks(worker.conn, now=int(time.time()) + 301, wait=True)
++    assert kb.get_task(worker.conn, tid).status == "ready"
++    worker.round()
++    home.round()
++    assert kb.get_task(home.conn, tid).status == "ready"
++    assert "paired" in asks._events(home.conn, tid, kar.EVENT)[-1].payload["output"]
++    assert not asks._events(home.conn, tid, policy.RECHECK_EVENT)
+-- 
+2.55.0
+

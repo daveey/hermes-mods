@@ -1,0 +1,628 @@
+From 673f6c936b75beb5b18d339c7878b013c4eb8652 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:11:40 +0000
+Subject: [PATCH] [daveey] CI timings: warn only when the PR's own tests
+ explain the wall-time regression
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The CI-timings review item warned on every PR whose CI wall time was >25%
+over main's. On 11-01 PRs #546, #548 and #552 were warned for +34..44%
+while the tests they added took 9.0 s, 12.7 s and 18.9 s, and #546's shard
+deltas went both ways (3/8 +183 s, 2/8 -110 s): CI-wide slowness, not the
+diffs. The warnings sat unanswered and the PRs merged with them.
+
+- run_tests_parallel.py gives each per-file pytest --durations=0
+  --durations-min=<threshold/4> and prints one '⏱ slow test case <s>s
+  <node id>' line per case >= HERMES_TEST_SLOW_CASE_S (default 10, 0 off).
+- timings_report.py reads the per-file progress lines and slow-case lines
+  from the 'Run tests (...)' job logs it already downloads, and the PR's
+  changed test files + added test functions from pulls/<n>/files.
+- A regression stays a Warning only when those files took >= 60 s or one
+  added case took >= 10 s (files and seconds named); otherwise it is Info:
+  'CI wall time +N% vs main; not attributable to this PR (its
+  added/changed test files took S s)'. No PR data = the old warning.
+- ci-timings job gets pull-requests: read for the files endpoint.
+
+Tests: tests/ci/test_timings_attribution.py,
+tests/scripts/test_run_tests_parallel_slow_cases.py (t_01a1994595adb16d)
+---
+ .github/workflows/ci.yaml                     |   1 +
+ scripts/ci/timings_report.py                  | 144 ++++++++++++++-
+ scripts/run_tests.sh                          |   4 +-
+ scripts/run_tests_parallel.py                 |  42 ++++-
+ tests/ci/test_timings_attribution.py          | 170 ++++++++++++++++++
+ .../test_run_tests_parallel_slow_cases.py     |  83 +++++++++
+ 6 files changed, 438 insertions(+), 6 deletions(-)
+ create mode 100644 tests/ci/test_timings_attribution.py
+ create mode 100644 tests/scripts/test_run_tests_parallel_slow_cases.py
+
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 1902145da27..c0fb568cc92 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -612,6 +612,7 @@ jobs:
+     permissions:
+       contents: read
+       actions: read # download completed jobs' cache transfer logs
++      pull-requests: read # the PR's changed test files, to attribute a wall-time regression (or not)
+     needs: [all-checks-pass]
+     if: ${{ !cancelled() }}
+     runs-on: [self-hosted, ci-fast]
+diff --git a/scripts/ci/timings_report.py b/scripts/ci/timings_report.py
+index a73a00f406f..be63c88205b 100644
+--- a/scripts/ci/timings_report.py
++++ b/scripts/ci/timings_report.py
+@@ -21,6 +21,7 @@ from __future__ import annotations
+ import argparse
+ import json
+ import os
++import re
+ import sys
+ import time
+ import urllib.error
+@@ -164,7 +165,8 @@ def _job_log(job_id: int, repo: str, token: str) -> str:
+         raise OSError(f"job log HTTP {error.code}") from error
+ 
+ 
+-def _collect_cache_data(jobs: list[dict], repo: str, token: str) -> dict:
++def _collect_cache_data(jobs: list[dict], repo: str, token: str, test_durations: dict | None = None) -> dict:
++    """Cache transfers from every job's log. Test-slice logs ("Run tests (...)") also fill ``test_durations``."""
+     entries, unavailable = [], []
+     seen: set[int] = set()
+     for job in jobs:
+@@ -174,15 +176,119 @@ def _collect_cache_data(jobs: list[dict], repo: str, token: str) -> dict:
+         seen.add(job_id)
+         name = " / ".join(part for part in (job["workflow_name"], job["name"]) if part)
+         try:
+-            parsed = parse_cache_log(_job_log(job_id, repo, token), job["steps"])
++            log = _job_log(job_id, repo, token)
+         except OSError as error:
+             print(f"Cache data unavailable for {name}: {error}", file=sys.stderr)
+             unavailable.append(name)
+             continue
++        parsed = parse_cache_log(log, job["steps"])
+         entries.extend(dict(entry, job=name, job_id=job_id, job_url=job["html_url"]) for entry in parsed)
++        if test_durations is not None and str(job.get("name", "")).startswith("Run tests ("):
++            files, slow = parse_test_durations(log)
++            for bucket, found in (("files", files), ("slow_cases", slow)):
++                into = test_durations.setdefault(bucket, {})
++                for key, secs in found.items():
++                    into[key] = max(secs, into.get(key, 0.0))
+     return {"entries": entries, "unavailable_jobs": unavailable}
+ 
+ 
++# ---------------------------------------------------------------------------
++# [daveey] Per-file test durations and the PR's own test changes. Together they
++# decide whether a wall-time regression is attributable to the PR (Warning) or
++# CI-wide slowness (Info). Regression: #546/#548/#552 (2026-11-01) were warned
++# for +34..44% wall time while their added tests took 9-19 s.
++# ---------------------------------------------------------------------------
++
++# A runner progress line: "[ 2.0% | ... ] ✓ tests/x/test_y.py (3✓ 1s, 1.8s)" (scripts/run_tests_parallel.py).
++_PROGRESS_RE = re.compile(r"[✓✗] (\S+\.py) \((?:[^()]*, )?(\d+(?:\.\d+)?)s\)\s*$")
++# The runner's slow-case line: "  ⏱ slow test case 12.40s tests/x/test_y.py::test_z".
++_SLOW_CASE_RE = re.compile(r"⏱ slow test case (\d+(?:\.\d+)?)s (\S+)\s*$")
++_TEST_FILE_RE = re.compile(r"(?:^|/)tests?/(?:.*/)?(?:test_[^/]*|[^/]*_test)\.py$")
++_ADDED_TEST_RE = re.compile(r"^\+\s*(?:async\s+)?def\s+(test\w*)\s*\(")
++
++# Attribution thresholds: the PR's added/changed test files in total, and one added case.
++_PR_TEST_FILES_WARN_S = 60.0
++_PR_TEST_CASE_WARN_S = 10.0
++
++
++def parse_test_durations(log: str) -> tuple[dict[str, float], dict[str, float]]:
++    """({test file: seconds}, {node id: seconds}) from a test-slice job log."""
++    files: dict[str, float] = {}
++    slow: dict[str, float] = {}
++    for line in log.splitlines():
++        m = _SLOW_CASE_RE.search(line)
++        if m:
++            slow[m.group(2)] = max(float(m.group(1)), slow.get(m.group(2), 0.0))
++            continue
++        m = _PROGRESS_RE.search(line)
++        if m:
++            files[m.group(1)] = max(float(m.group(2)), files.get(m.group(1), 0.0))
++    return files, slow
++
++
++def _pr_number_from_event() -> int | None:
++    path = os.environ.get("GITHUB_EVENT_PATH")
++    if path:
++        try:
++            with open(path, encoding="utf-8-sig") as f:
++                number = (json.load(f).get("pull_request") or {}).get("number")
++            if isinstance(number, int):
++                return number
++        except (OSError, ValueError, AttributeError):
++            pass
++    m = re.match(r"^refs/pull/(\d+)/", os.environ.get("GITHUB_REF", ""))
++    return int(m.group(1)) if m else None
++
++
++def collect_pr_changes(token: str, repo: str) -> dict | None:
++    """The PR's added/changed test files and the test functions its patch adds; None outside a PR."""
++    number = _pr_number_from_event()
++    if number is None:
++        return None
++    files = api_get(f"/repos/{repo}/pulls/{number}/files", token, params={"per_page": 100})
++    test_files: list[str] = []
++    added: dict[str, list[str]] = {}
++    for f in files if isinstance(files, list) else []:
++        name = f.get("filename", "")
++        if f.get("status") == "removed" or not _TEST_FILE_RE.search(name):
++            continue
++        test_files.append(name)
++        names = [m.group(1) for line in (f.get("patch") or "").splitlines() if (m := _ADDED_TEST_RE.match(line))]
++        if names:
++            added[name] = list(dict.fromkeys(names))
++    return {"number": number, "test_files": test_files, "added_cases": added}
++
++
++def _case_name(node_id: str) -> str:
++    """'tests/x.py::TestA::test_b[p]' -> 'test_b'."""
++    return node_id.split("::")[-1].split("[", 1)[0]
++
++
++def pr_test_attribution(timings: dict) -> dict | None:
++    """What the PR's own tests cost in this run, or None when the PR's changes are unknown."""
++    pr = timings.get("pr_changes")
++    if not isinstance(pr, dict):
++        return None
++    durations = timings.get("test_durations") or {}
++    per_file = durations.get("files") or {}
++    pr_files = list(pr.get("test_files") or [])
++    file_secs = {f: float(per_file.get(f, 0.0)) for f in pr_files}
++    added = pr.get("added_cases") or {}
++    slow_added = {
++        node: float(secs)
++        for node, secs in (durations.get("slow_cases") or {}).items()
++        if float(secs) >= _PR_TEST_CASE_WARN_S and _case_name(node) in (added.get(node.split("::", 1)[0]) or [])
++    }
++    total = round(sum(file_secs.values()), 1)
++    return {
++        "files": file_secs,
++        "not_run": [f for f in pr_files if f not in per_file],
++        "total_s": total,
++        "slow_added_cases": slow_added,
++        "attributable": total >= _PR_TEST_FILES_WARN_S or bool(slow_added),
++    }
++
++
+ def parse_ts(ts: str | None) -> datetime | None:
+     if not ts:
+         return None
+@@ -323,6 +429,15 @@ def collect_timings(token: str, repo: str, run_id: str, head_sha: str) -> dict:
+     all_jobs.sort(key=lambda j: j.get("started_at") or "")
+     _annotate_wait_times(all_jobs)
+ 
++    test_durations: dict = {"files": {}, "slow_cases": {}}
++    cache_data = _collect_cache_data(all_jobs, repo, token, test_durations)
++    try:
++        pr_changes = collect_pr_changes(token, repo)
++    except TimingsUnavailable as error:
++        # Without the PR's file list a regression cannot be attributed; the review item says so.
++        print(f"PR changes unavailable: {error}", file=sys.stderr)
++        pr_changes = None
++
+     return {
+         "run_id": run_id,
+         "head_sha": head_sha,
+@@ -331,7 +446,9 @@ def collect_timings(token: str, repo: str, run_id: str, head_sha: str) -> dict:
+                     and bool(run_info.get("event"))
+                     and run_info["event"] not in ("pull_request", "pull_request_target")),
+         "jobs": all_jobs,
+-        "cache_data": _collect_cache_data(all_jobs, repo, token),
++        "cache_data": cache_data,
++        "test_durations": test_durations,
++        "pr_changes": pr_changes,
+     }
+ 
+ 
+@@ -959,6 +1076,7 @@ def generate_review_status(
+     fragment.
+     """
+     stats = compute_stats(timings, baseline)
++    attribution = pr_test_attribution(timings) if baseline is not None else None
+ 
+     if baseline is None:
+         severity = "debug"
+@@ -966,6 +1084,7 @@ def generate_review_status(
+     else:
+         wall = stats["wall"]
+         bl_wall = stats["bl_wall"] or 0
++        pct = None
+         if bl_wall > 0:
+             pct = (wall - bl_wall) / bl_wall * 100
+             wall_str = f"Wall time {fmt_dur(wall)} vs {fmt_dur(bl_wall)} ({pct:+.1f}%)."
+@@ -985,6 +1104,19 @@ def generate_review_status(
+             wall_str += f" {stats['unchanged']} unchanged."
+         summary = wall_str
+ 
++        # [daveey] A regression is the PR's only when its own tests explain it.
++        if severity == "warning" and attribution is not None:
++            if attribution["attributable"]:
++                named = [f"{f} {s:.1f} s" for f, s in sorted(attribution["files"].items(), key=lambda kv: -kv[1])]
++                named += [f"slow added case {n} {s:.1f} s"
++                          for n, s in sorted(attribution["slow_added_cases"].items(), key=lambda kv: -kv[1])]
++                summary = (f"CI wall time {pct:+.1f}% vs main, and this PR's added/changed test files took "
++                           f"{attribution['total_s']:.1f} s: " + ", ".join(named) + ".")
++            else:
++                severity = "info"
++                summary = (f"CI wall time {pct:+.1f}% vs main; not attributable to this PR "
++                           f"(its added/changed test files took {attribution['total_s']:.1f} s)")
++
+     # Per-job delta detail (top 5 by absolute change)
+     detail_lines: list[str] = []
+     if baseline:
+@@ -1005,6 +1137,12 @@ def generate_review_status(
+         deltas.sort(reverse=True)
+         for _, name, delta_str in deltas[:5]:
+             detail_lines.append(f"- {name}: {delta_str}")
++        if attribution is not None and attribution["files"]:
++            detail_lines.append("")
++            detail_lines.append("This PR's added/changed test files in this run:")
++            for f, s in sorted(attribution["files"].items(), key=lambda kv: -kv[1]):
++                note = " (not run)" if f in attribution["not_run"] else ""
++                detail_lines.append(f"- {f}: {s:.1f} s{note}")
+ 
+     result: dict = {
+         "kind": severity,
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index 8d07b412d34..ffe709fdbd2 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -175,7 +175,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
+ #
+ #   * HERMES_TEST_HOST_SLOTS / SLOT_DIR / SLOT_HELD (host-wide cap, scripts/run_tests_host_slots.py) and
+ #   * HERMES_TEST_WORKERS / PATHS / FILE_TIMEOUT / FILE_RETRIES / SLICE /
+-#     FLAKY_REPORT are read by run_tests_parallel.py at argparse-default
++#     FLAKY_REPORT / SLOW_CASE_S are read by run_tests_parallel.py at argparse-default
+ #     time — inside the stripped environment.
+ #   * HERMES_TEST_IMAGE is read by tests/docker/conftest.py to skip its
+ #     session-scoped `docker build`. CI's docker.yml sets it to the image
+@@ -209,7 +209,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
+ # credential can leak" property stays auditable at a glance.
+ TEST_ENV=()
+ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
+-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_FLAKY_REPORT \
++  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_FLAKY_REPORT HERMES_TEST_SLOW_CASE_S \
+   HERMES_TEST_HOST_SLOTS HERMES_TEST_SLOT_DIR HERMES_TEST_SLOT_HELD \
+   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
+   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
+diff --git a/scripts/run_tests_parallel.py b/scripts/run_tests_parallel.py
+index 2317c7512c7..204881aca40 100644
+--- a/scripts/run_tests_parallel.py
++++ b/scripts/run_tests_parallel.py
+@@ -159,6 +159,42 @@ _DEFAULT_FILE_RETRIES = 1
+ # CI jobs by estimated total time, so no one job gets all the slow files.
+ _DURATIONS_FILE = "test_durations.json"
+ 
++# [daveey] Slow test cases: each per-file pytest gets ``--durations=0
++# --durations-min=<threshold/4>`` and the runner prints one
++# ``⏱ slow test case <s>s <node id>`` line per case whose setup+call+teardown
++# reaches the threshold. scripts/ci/timings_report.py reads those lines from
++# the test-slice job logs, so the CI-timings review item can tell a PR's own
++# slow new case from CI-wide slowness. 0 disables (env: HERMES_TEST_SLOW_CASE_S).
++_SLOW_CASE_SECONDS = float(os.environ.get("HERMES_TEST_SLOW_CASE_S") or 10.0)
++_DURATION_LINE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)s\s+(?:setup|call|teardown)\s+(\S.*?)\s*$")
++_DURATIONS_HEADER_RE = re.compile(r"^=+ slowest(?: \d+)? durations =+$")
++
++
++def _durations_args(pytest_args: list[str], threshold: float) -> list[str]:
++    """pytest flags that make it list the cases a slow-case line may name (none if the caller set its own)."""
++    if threshold <= 0 or any(a == "--durations" or a.startswith("--durations=") for a in pytest_args):
++        return []
++    return ["--durations=0", f"--durations-min={threshold / 4:g}"]
++
++
++def _slow_cases_from_output(output: str, threshold: float) -> dict[str, float]:
++    """{node id: setup+call+teardown seconds} for cases at or above ``threshold``, from pytest's durations list."""
++    totals: dict[str, float] = {}
++    in_section = False
++    for line in output.splitlines():
++        stripped = line.strip()
++        if _DURATIONS_HEADER_RE.match(stripped):
++            in_section = True
++            continue
++        if in_section and stripped.startswith("="):
++            in_section = False
++            continue
++        if in_section:
++            m = _DURATION_LINE_RE.match(line)
++            if m:
++                totals[m.group(2)] = round(totals.get(m.group(2), 0.0) + float(m.group(1)), 2)
++    return {node: secs for node, secs in totals.items() if secs >= threshold}
++
+ 
+ def _split_pathspec(value: str) -> list[str]:
+     """Split a separator-joined path list (``--paths``/``--files``/
+@@ -769,7 +805,8 @@ def _run_one_file_attempt(
+ 
+     ``targets`` narrows the run to those node ids of ``file`` (the retry).
+     """
+-    cmd = [sys.executable, "-m", "pytest", *(targets or [str(file)]), *pytest_args]
++    cmd = [sys.executable, "-m", "pytest", *(targets or [str(file)]), *pytest_args,
++           *_durations_args(pytest_args, _SLOW_CASE_SECONDS)]
+ 
+     # Give this subprocess its own pytest temp root.
+     #
+@@ -1804,6 +1841,9 @@ def main() -> int:
+                 file_summary=summary,
+                 subproc_wall=subproc_wall,
+             )
++            if _SLOW_CASE_SECONDS > 0:
++                for node, secs in sorted(_slow_cases_from_output(output, _SLOW_CASE_SECONDS).items()):
++                    print(f"  ⏱ slow test case {secs:.2f}s {node}", flush=True)
+             if rc != 0:
+                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
+ 
+diff --git a/tests/ci/test_timings_attribution.py b/tests/ci/test_timings_attribution.py
+new file mode 100644
+index 00000000000..30bf3599954
+--- /dev/null
++++ b/tests/ci/test_timings_attribution.py
+@@ -0,0 +1,170 @@
++"""The CI-timings review item blames a wall-time regression on a PR only when its own tests explain it.
++
++Regression (2026-11-01): PRs #546, #548 and #552 each got "⚠️ Warnings / CI timings" for a +34..44% wall time
++vs main, while the tests they added took 9.0 s, 12.7 s and 18.9 s and the per-shard deltas went both ways
++(#546: 3/8 +183 s, 2/8 -110 s). The slowdown was CI-wide; the warning sat unanswered and the PRs merged with it.
++
++Rule: a wall regression above the threshold is a Warning only when the PR's added/changed test files took
++>= 60 s in this run, or one added test case took >= 10 s; otherwise it is Info, worded as not attributable.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++from datetime import UTC, datetime
++from pathlib import Path
++
++_PATH = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "timings_report.py"
++_spec = importlib.util.spec_from_file_location("timings_report_attr", _PATH)
++assert _spec is not None and _spec.loader is not None
++_mod = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(_mod)
++
++_T0 = datetime(2025, 1, 1, tzinfo=UTC)
++
++NEW = "tests/hermes_cli/test_kanban_ask_recheck_sync.py"
++CHANGED = "tests/hermes_cli/test_kanban.py"
++
++
++def _ts(seconds: float) -> str:
++    return datetime.fromtimestamp(_T0.timestamp() + seconds, tz=UTC).isoformat().replace("+00:00", "Z")
++
++
++def _job(name: str, dur_s: float) -> dict:
++    return {"name": name, "duration_s": dur_s, "conclusion": "success", "started_at": _ts(0),
++            "completed_at": _ts(dur_s), "wait_s": 0.0}
++
++
++def _slow_ci(files: dict[str, float], slow_cases: dict[str, float] | None = None,
++             pr_files: list[str] | None = None, added: dict[str, list[str]] | None = None) -> tuple[dict, dict]:
++    """A run whose wall time is +39.5% vs main (25m30s vs 18m17s, as on #546), with fixture test timings."""
++    cur = {"run_id": "1", "head_sha": "abc", "created_at": "", "jobs": [_job("Run tests (3/8)", 1530.0)],
++           "test_durations": {"files": files, "slow_cases": slow_cases or {}},
++           "pr_changes": {"number": 546, "test_files": pr_files if pr_files is not None else [NEW],
++                          "added_cases": added if added is not None else {NEW: ["test_home_rechecks"]}}}
++    base = {"run_id": "0", "head_sha": "def", "created_at": "", "jobs": [_job("Run tests (3/8)", 1097.0)]}
++    return cur, base
++
++
++def _result(statuses: list[dict]) -> dict:
++    timing = [s for s in statuses if s["source"] == "ci timing"]
++    assert len(timing) == 1 and len(timing[0]["results"]) == 1
++    return timing[0]["results"][0]
++
++
++def test_ci_wide_slowdown_with_small_pr_files_is_info():
++    cur, base = _slow_ci({NEW: 9.0, "tests/gateway/test_session_tui_ops.py": 97.7})
++    result = _result(_mod.generate_review_status(cur, base))
++    assert result["kind"] == "info", result
++    assert result["summary"] == (
++        "CI wall time +39.5% vs main; not attributable to this PR (its added/changed test files took 9.0 s)"
++    )
++    assert f"{NEW}: 9.0 s" in result["detail"]
++
++
++def test_pr_files_totalling_60s_or_more_warn_and_name_the_files():
++    cur, base = _slow_ci({NEW: 41.0, CHANGED: 22.5, "tests/other/test_x.py": 300.0}, pr_files=[NEW, CHANGED])
++    result = _result(_mod.generate_review_status(cur, base))
++    assert result["kind"] == "warning", result
++    assert "+39.5%" in result["summary"]
++    assert "63.5 s" in result["summary"]
++    assert f"{NEW} 41.0 s" in result["summary"]
++    assert f"{CHANGED} 22.5 s" in result["summary"]
++    assert "tests/other/test_x.py" not in result["summary"]
++
++
++def test_one_added_case_of_10s_or_more_warns_and_names_it():
++    cur, base = _slow_ci({NEW: 14.0}, slow_cases={f"{NEW}::TestRecheck::test_home_rechecks[sync]": 11.2})
++    result = _result(_mod.generate_review_status(cur, base))
++    assert result["kind"] == "warning", result
++    assert f"{NEW}::TestRecheck::test_home_rechecks[sync] 11.2 s" in result["summary"]
++    assert f"{NEW} 14.0 s" in result["summary"]
++
++
++def test_slow_case_that_the_pr_did_not_add_stays_info():
++    cur, base = _slow_ci({CHANGED: 30.0}, slow_cases={f"{CHANGED}::test_old_slow": 25.0}, pr_files=[CHANGED],
++                         added={CHANGED: ["test_new_fast"]})
++    result = _result(_mod.generate_review_status(cur, base))
++    assert result["kind"] == "info", result
++    assert "took 30.0 s" in result["summary"]
++
++
++def test_without_pr_data_the_regression_still_warns():
++    cur, base = _slow_ci({NEW: 9.0})
++    cur.pop("pr_changes")
++    result = _result(_mod.generate_review_status(cur, base))
++    assert result["kind"] == "warning"
++    assert "Wall time 25m30s vs 18m17s (+39.5%)" in result["summary"]
++
++
++def test_review_status_only_reads_pr_attribution_from_the_saved_json(tmp_path, monkeypatch):
++    cur, base = _slow_ci({NEW: 9.0})
++    (tmp_path / "t.json").write_text(json.dumps(cur))
++    (tmp_path / "b.json").write_text(json.dumps(base))
++    out = tmp_path / "rs.txt"
++    monkeypatch.setattr("sys.argv", ["timings_report.py", "--from-json", str(tmp_path / "t.json"), "--baseline",
++                                     str(tmp_path / "b.json"), "--review-status-out", str(out),
++                                     "--json-out", str(tmp_path / "saved.json"),
++                                     "--review-status-only"])
++    monkeypatch.setattr(_mod, "collect_pr_changes", lambda *a, **k: (_ for _ in ()).throw(AssertionError("api")))
++    _mod.main()
++    statuses = json.loads(out.read_text().split("=", 1)[1])
++    assert _result(statuses)["kind"] == "info"
++
++
++# A real excerpt of a "Run tests (3/8)" job log (run 41344034622) plus the runner's slow-case line.
++_LOG = """\
++2026-11-01T20:05:21.1556398Z [  0.0% |     2/~8000 | ✓3 | ✗0] ✓ tests/acp_adapter/test_acp_discard_review.py (3✓, 1.8s)
++2026-11-01T20:05:21.2250867Z [  0.1% |     4/~8000 | ✓9 | ✗0] ✓ tests/acp_adapter/test_gateway_catalog_cwd.py (1✓, 1.9s)
++2026-11-01T20:06:02.0000000Z [  2.0% |   160/~8000 | ✓99 | ✗1] ✗ tests/hermes_cli/test_kanban.py (40✓ 1✗, 120.5s)
++2026-11-01T20:06:02.0000001Z   ⏱ slow test case 12.40s tests/hermes_cli/test_kanban.py::TestX::test_big[a]
++2026-11-01T20:06:03.0000000Z [  2.1% |   161/~8000 | ✓99 | ✗1] ✓ tests/tools/test_empty.py (2.0s)
++2026-11-01T20:19:11.4504416Z     108.88s  tests/tui_gateway/test_tui_gateway_server.py
++"""
++
++
++def test_parse_test_durations_reads_progress_and_slow_case_lines():
++    files, slow = _mod.parse_test_durations(_LOG)
++    assert files == {
++        "tests/acp_adapter/test_acp_discard_review.py": 1.8,
++        "tests/acp_adapter/test_gateway_catalog_cwd.py": 1.9,
++        "tests/hermes_cli/test_kanban.py": 120.5,
++        "tests/tools/test_empty.py": 2.0,
++    }
++    assert slow == {"tests/hermes_cli/test_kanban.py::TestX::test_big[a]": 12.4}
++
++
++def test_collect_pr_changes_lists_test_files_and_added_cases(monkeypatch, tmp_path):
++    event = tmp_path / "event.json"
++    event.write_text(json.dumps({"pull_request": {"number": 546}}))
++    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
++    files = [
++        {"filename": NEW, "status": "added",
++         "patch": "@@ -0,0 +1,9 @@\n+import pytest\n+\n+class TestRecheck:\n+    def test_home_rechecks(self):\n"
++                  "+        pass\n+\n+async def test_async_case():\n+    pass\n"},
++        {"filename": CHANGED, "status": "modified",
++         "patch": "@@ -10,3 +10,4 @@\n def test_old():\n-    x = 1\n+    x = 2\n+def test_new_fast():\n"},
++        {"filename": "tests/hermes_cli/test_gone.py", "status": "removed", "patch": "-def test_x():\n"},
++        {"filename": "hermes_cli/kanban.py", "status": "modified", "patch": "+def test_like_name():\n"},
++        {"filename": "tests/conftest.py", "status": "modified", "patch": "+def fixture():\n"},
++    ]
++    seen = []
++
++    def fake_api_get(path, token, params=None, list_key=None):
++        seen.append(path)
++        return files
++
++    monkeypatch.setattr(_mod, "api_get", fake_api_get)
++    pr = _mod.collect_pr_changes("tok", "daveey/hermes")
++    assert seen == ["/repos/daveey/hermes/pulls/546/files"]
++    assert pr == {"number": 546, "test_files": [NEW, CHANGED],
++                  "added_cases": {NEW: ["test_home_rechecks", "test_async_case"], CHANGED: ["test_new_fast"]}}
++
++
++def test_collect_pr_changes_outside_a_pull_request_is_none(monkeypatch, tmp_path):
++    event = tmp_path / "event.json"
++    event.write_text(json.dumps({"ref": "refs/heads/main"}))
++    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
++    monkeypatch.setattr(_mod, "api_get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no API call")))
++    assert _mod.collect_pr_changes("tok", "daveey/hermes") is None
+diff --git a/tests/scripts/test_run_tests_parallel_slow_cases.py b/tests/scripts/test_run_tests_parallel_slow_cases.py
+new file mode 100644
+index 00000000000..8785d573ca3
+--- /dev/null
++++ b/tests/scripts/test_run_tests_parallel_slow_cases.py
+@@ -0,0 +1,83 @@
++"""run_tests_parallel.py prints one ``⏱ slow test case`` line per test case at or above the threshold.
++
++The CI-timings review item (scripts/ci/timings_report.py) reads these lines from the test-slice job logs to tell
++whether a PR's own added test case is slow (>= 10 s) before it attributes a wall-time regression to the PR.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import shutil
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++_REAL = Path(__file__).resolve().parents[2] / "scripts"
++_spec = importlib.util.spec_from_file_location("run_tests_parallel_slow", _REAL / "run_tests_parallel.py")
++assert _spec is not None and _spec.loader is not None
++_mod = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(_mod)
++
++
++_OUTPUT = """\
++tests/x/test_a.py ..                                                     [100%]
++
++============================== slowest durations ===============================
++11.02s call     tests/x/test_a.py::TestA::test_slow[p1]
++1.50s setup    tests/x/test_a.py::TestA::test_slow[p1]
++4.00s call     tests/x/test_a.py::test_medium
++
++(3 durations < 2.5s hidden.  Use -vv to show these durations.)
++============================== 2 passed in 16.80s ==============================
++"""
++
++
++def test_slow_cases_sum_phases_and_keep_only_cases_over_the_threshold():
++    assert _mod._slow_cases_from_output(_OUTPUT, 10.0) == {"tests/x/test_a.py::TestA::test_slow[p1]": 12.52}
++    assert _mod._slow_cases_from_output(_OUTPUT, 4.0) == {
++        "tests/x/test_a.py::TestA::test_slow[p1]": 12.52,
++        "tests/x/test_a.py::test_medium": 4.0,
++    }
++    assert _mod._slow_cases_from_output("no durations section\n", 10.0) == {}
++
++
++def test_durations_flags_are_added_unless_disabled_or_given():
++    assert _mod._durations_args([], 10.0) == ["--durations=0", "--durations-min=2.5"]
++    assert _mod._durations_args(["-q"], 0.0) == []
++    assert _mod._durations_args(["--durations=5"], 10.0) == []
++    assert _mod._durations_args(["--durations", "5"], 10.0) == []
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="POSIX runner probe")
++def test_runner_prints_the_slow_case_line(tmp_path, monkeypatch):
++    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
++    root = tmp_path / "runner-root"
++    (root / "scripts" / "ci").mkdir(parents=True)
++    shutil.copy2(_REAL / "run_tests_parallel.py", root / "scripts")
++    shutil.copy2(_REAL / "run_tests_host_slots.py", root / "scripts")
++    shutil.copy2(_REAL / "ci" / "list_os_marked_tests.py", root / "scripts" / "ci")
++    probe_dir = tmp_path / "probe"
++    probe_dir.mkdir()
++    (probe_dir / "test_probe_slow.py").write_text(textwrap.dedent("""
++        import time
++
++        def test_sleeps():
++            time.sleep(0.6)
++
++        def test_fast():
++            pass
++    """), encoding="utf-8")
++    proc = subprocess.run(
++        [sys.executable, str(root / "scripts" / "run_tests_parallel.py"), "--paths", str(probe_dir), "-j", "1",
++         "--file-timeout", "60"],
++        cwd=probe_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
++        timeout=120, check=False, env={**__import__("os").environ, "HERMES_TEST_SLOW_CASE_S": "0.4"},
++    )
++    assert proc.returncode == 0, proc.stdout
++    lines = [ln for ln in proc.stdout.splitlines() if "⏱ slow test case" in ln]
++    assert len(lines) == 1, proc.stdout
++    assert lines[0].strip().startswith("⏱ slow test case 0.")
++    assert lines[0].endswith("test_probe_slow.py::test_sleeps"), lines[0]
+-- 
+2.55.0
+

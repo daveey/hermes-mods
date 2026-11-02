@@ -1,0 +1,194 @@
+From ca4fa11665dc749496f76239a631e7d9c3eeca09 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:17:52 +0000
+Subject: [PATCH] perf(serve): build the all-profiles project tree at boot,
+ after the kanban annotation prewarm [daveey]
+
+After b4f69efc705 fixed the board routes, the first GET /api/profiles/projects/tree after the 22:25Z hub restart
+still took 4.02 s (loop-watch), past the Desktop's 4-5 s budget. The first tree build in a new process pays the lazy
+tui_gateway.server import, one git root probe per session cwd and every profile's cold annotation scope: ~3 s
+uncontended on hermes-hub vs ~0.15-0.4 s warm, and it paid them inside the reconnect burst.
+
+The boot prewarm thread now builds the tree through the route's single-flight cache right after the annotation, so
+a poll arriving mid-build waits for it and then reads warm caches. Same daemon thread, no new one; skipped under
+HERMES_TEST_ISOLATION as before. (t_01a19864fc42f5b2)
+---
+ hermes_cli/kanban_annotation_prewarm.py       | 12 ++-
+ hermes_cli/projects_tree_prewarm.py           | 33 ++++++++
+ .../test_kanban_annotation_prewarm.py         |  3 +
+ .../hermes_cli/test_projects_tree_prewarm.py  | 82 +++++++++++++++++++
+ 4 files changed, 128 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/projects_tree_prewarm.py
+ create mode 100644 tests/hermes_cli/test_projects_tree_prewarm.py
+
+diff --git a/hermes_cli/kanban_annotation_prewarm.py b/hermes_cli/kanban_annotation_prewarm.py
+index de37e00a5e5..3ef78b86a10 100644
+--- a/hermes_cli/kanban_annotation_prewarm.py
++++ b/hermes_cli/kanban_annotation_prewarm.py
+@@ -29,12 +29,20 @@ def prewarm_annotation() -> bool:
+         return False
+ 
+ 
++def _boot_prewarm() -> None:
++    """The annotation first (every session read waits on it), then the project tree, which reads that annotation."""
++    prewarm_annotation()
++    from hermes_cli.projects_tree_prewarm import prewarm_project_tree
++
++    prewarm_project_tree()
++
++
+ def start_annotation_prewarm() -> Optional[threading.Thread]:
+-    """Run ``prewarm_annotation`` on a daemon thread (not under the test harness)."""
++    """Run the annotation and project-tree prewarms on one daemon thread (not under the test harness)."""
+     if os.environ.get("HERMES_TEST_ISOLATION"):
+         return None
+     from agent.memory_provider import spawn_context_thread
+ 
+-    thread = spawn_context_thread(prewarm_annotation, name="kanban-annotation-prewarm")
++    thread = spawn_context_thread(_boot_prewarm, name="kanban-annotation-prewarm")
+     thread.start()
+     return thread
+diff --git a/hermes_cli/projects_tree_prewarm.py b/hermes_cli/projects_tree_prewarm.py
+new file mode 100644
+index 00000000000..f5bb7b7d7ea
+--- /dev/null
++++ b/hermes_cli/projects_tree_prewarm.py
+@@ -0,0 +1,33 @@
++"""Boot-time build of the all-profiles project tree, so the Desktop's reconnect burst after a backend restart does not
++pay this process's cold tree costs under GIL contention.
++
++``GET /api/profiles/projects/tree`` builds one tree per profile. The first build in a new process pays costs that every
++later build reuses: the lazy ``tui_gateway.server`` import (~0.5 s), one ``git`` root probe per session cwd
++(``git_probe`` caches positives for the process), the per-profile kanban annotation scopes and the cold SQLite pages
++of eleven ``state.db`` files. Uncontended on hermes-hub that is ~3 s cold against ~0.15-0.4 s warm; inside the
++reconnect burst after the 22:25Z 2026-11-01 restart it took 4.02 s, past the Desktop's 4-5 s request budget
++(t_01a19864fc42f5b2).
++
++Runs after the annotation prewarm on the same daemon thread (one extra boot thread, not two), through the route's own
++single-flight cache, so a Desktop poll that arrives mid-build waits for it and then reads warm caches instead of
++starting a second cold scan. Every backend that serves the sidebar does this build on its first tree poll anyway; the
++prewarm only moves it ahead of the burst. [daveey]
++"""
++
++from __future__ import annotations
++
++import logging
++
++log = logging.getLogger(__name__)
++
++
++def prewarm_project_tree() -> bool:
++    """Build the all-profiles project tree once through the route. Never raises."""
++    try:
++        from hermes_cli.web_routers import profiles
++
++        profiles.get_profiles_projects_tree()
++        return True
++    except Exception:  # health: allow BLE001 -- best-effort warm-up; the first real read reports its own error
++        log.debug("project tree prewarm failed", exc_info=True)
++        return False
+diff --git a/tests/hermes_cli/test_kanban_annotation_prewarm.py b/tests/hermes_cli/test_kanban_annotation_prewarm.py
+index 3bdb2e6ddda..26f017db68c 100644
+--- a/tests/hermes_cli/test_kanban_annotation_prewarm.py
++++ b/tests/hermes_cli/test_kanban_annotation_prewarm.py
+@@ -56,6 +56,9 @@ def test_start_runs_prewarm_on_a_daemon_thread(monkeypatch):
+     monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
+     ran = threading.Event()
+     monkeypatch.setattr(prewarm, "prewarm_annotation", lambda: ran.set() or True)
++    from hermes_cli import projects_tree_prewarm
++
++    monkeypatch.setattr(projects_tree_prewarm, "prewarm_project_tree", lambda: True)
+     thread = prewarm.start_annotation_prewarm()
+     assert thread is not None and thread.daemon and thread.name == "kanban-annotation-prewarm"
+     thread.join(5)
+diff --git a/tests/hermes_cli/test_projects_tree_prewarm.py b/tests/hermes_cli/test_projects_tree_prewarm.py
+new file mode 100644
+index 00000000000..6641af75c08
+--- /dev/null
++++ b/tests/hermes_cli/test_projects_tree_prewarm.py
+@@ -0,0 +1,82 @@
++"""Backend boot builds the all-profiles project tree before the Desktop's reconnect burst.
++
++After the board fix (b4f69efc705), the first ``GET /api/profiles/projects/tree`` after the 22:25Z 2026-11-01 hub
++restart still took 4.02 s: the first build in a new process pays the lazy gateway import, one git probe per session
++cwd and every profile's cold annotation scope (~3 s uncontended, ~0.15-0.4 s warm), and it paid them inside the burst.
++(t_01a19864fc42f5b2) [daveey]
++"""
++
++from __future__ import annotations
++
++import threading
++from collections import OrderedDict
++
++import pytest
++
++from hermes_cli import kanban_annotation_prewarm as boot
++from hermes_cli import projects_tree_prewarm as tree_prewarm
++from hermes_cli.web_routers import profiles as profiles_routes
++
++
++def _clear_tree_cache():
++    """The route's single-flight cache lives in the decorator's closure; start every test with it empty."""
++    for cell in profiles_routes.get_profiles_projects_tree.__closure__ or ():
++        value = cell.cell_contents
++        if isinstance(value, OrderedDict):
++            value.clear()
++
++
++@pytest.fixture
++def counted_scans(monkeypatch):
++    _clear_tree_cache()
++    scans = []
++
++    def fake_trees(preview_limit=3, session_limit=2000, errors=None, *, log_label="", profile=None):
++        scans.append((preview_limit, session_limit, profile))
++        return [("default", {"projects": [], "scoped_session_ids": ["s1"]})]
++
++    monkeypatch.setattr(profiles_routes, "profile_project_trees", fake_trees)
++    yield scans
++    _clear_tree_cache()
++
++
++def test_prewarm_builds_the_tree_through_the_route(counted_scans):
++    assert tree_prewarm.prewarm_project_tree() is True
++    assert counted_scans == [(3, 2000, None)]
++
++
++def test_prewarm_never_raises(monkeypatch):
++    def boom(*_a, **_k):
++        raise RuntimeError("state.db unreadable")
++
++    monkeypatch.setattr(profiles_routes, "get_profiles_projects_tree", boom)
++    assert tree_prewarm.prewarm_project_tree() is False
++
++
++def test_boot_thread_warms_the_annotation_then_the_tree(monkeypatch):
++    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
++    order = []
++    done = threading.Event()
++    monkeypatch.setattr(boot, "prewarm_annotation", lambda: order.append("annotation") or True)
++    monkeypatch.setattr(tree_prewarm, "prewarm_project_tree", lambda: order.append("tree") or done.set() or True)
++    thread = boot.start_annotation_prewarm()
++    assert thread is not None and thread.daemon
++    thread.join(5)
++    assert done.is_set()
++    assert order == ["annotation", "tree"]
++
++
++def test_first_tree_poll_after_the_prewarm_does_not_scan_again(counted_scans, monkeypatch, _isolate_hermes_home):
++    """The point of the prewarm: the Desktop's first tree poll reads the warm result, it does not run a cold scan."""
++    from starlette.testclient import TestClient
++
++    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
++
++    monkeypatch.setattr(profiles_routes, "_SIDEBAR_CACHE_TTL_SECONDS", 60.0)
++    assert tree_prewarm.prewarm_project_tree() is True
++    client = TestClient(app)
++    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
++    resp = client.get("/api/profiles/projects/tree")
++    assert resp.status_code == 200
++    assert resp.json()["scoped_session_ids"] == ["s1"]
++    assert counted_scans == [(3, 2000, None)]
+-- 
+2.55.0
+

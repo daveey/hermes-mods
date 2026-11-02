@@ -1,0 +1,354 @@
+From c83c7fc67a49570f4d8b1c663e285d962a0ede9b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:57:19 -0800
+Subject: [PATCH] fix(kanban): preserve recovery budget across offline
+ DarkWakes [daveey]
+
+---
+ agent/kanban_turn_recovery.py                 |  63 +++++-
+ tests/agent/test_kanban_darkwake_recovery.py  | 186 ++++++++++++++++++
+ tests/agent/test_kanban_turn_recovery.py      |   5 +
+ .../test_session_kanban_turn_recovery.py      |   1 +
+ 4 files changed, 247 insertions(+), 8 deletions(-)
+
+diff --git a/agent/kanban_turn_recovery.py b/agent/kanban_turn_recovery.py
+index 180b3b8f0ec..b7eaa4e304b 100644
+--- a/agent/kanban_turn_recovery.py
++++ b/agent/kanban_turn_recovery.py
+@@ -419,6 +419,44 @@ def _emit_recovery_skipped(emit: Optional[Callable[[str], None]], task_id: Optio
+             logger.debug("kanban turn-recovery emit failed", exc_info=True)
+ 
+ 
++def wait_out_worker_offline(result: dict, check: Callable[[], bool]) -> Optional[bool]:
++    """Return True after observed offline waiting, False if online/non-network, None if fenced.
++
++    Unlike the per-request wait, this worker wait is bounded by its externally owned claim, not
++    a retry budget. Each DNS wait uses awake time, so successive networkless DarkWakes cannot
++    exhaust it. No lease is written here. DNS availability is only permission to retry, not proof
++    the provider is reachable; failures with working DNS still spend the normal bounded budget.
++    """
++    from agent.retry_utils import (
++        DEFAULT_OFFLINE_WAIT_SECONDS, NETWORK_CONTROL_HOST, host_resolves,
++        is_local_network_error, wait_for_network,
++    )
++
++    if (result.get("failure_reason") != FailoverReason.timeout.value
++            and not is_local_network_error(result.get("error") or "")):
++        return False
++    # A blocked/sinkholed control name alone is not evidence that the host is offline.
++    def resolves(_host: str) -> bool:
++        return host_resolves(NETWORK_CONTROL_HOST) or host_resolves("example.com")
++
++    if resolves(NETWORK_CONTROL_HOST):
++        return False
++    waited = False
++    while check():
++        outcome, _spent = wait_for_network(
++            NETWORK_CONTROL_HOST, budget_s=DEFAULT_OFFLINE_WAIT_SECONDS,
++            is_interrupted=lambda: not check(), resolve=resolves,
++        )
++        if outcome == "online":
++            return True
++        if outcome == "already_online":
++            return waited  # one transient failed lookup is not an uncharged retry
++        if outcome != "exhausted":
++            return None
++        waited = True
++    return None
++
++
+ def recover_failed_kanban_turns(
+     turn_fn: Callable[[str], Any],
+     get_result: Callable[[], Any],
+@@ -429,14 +467,15 @@ def recover_failed_kanban_turns(
+     task_id: Optional[str] = None,
+     claim_state: Optional[Callable[[], str]] = None,
+ ) -> int:
+-    """Retry an authorised kanban worker turn in place; returns attempts made.
++    """Retry an authorised kanban worker turn in place; returns charged (online) attempts.
+ 
+     ``turn_fn(nudge)`` runs one more turn with the given synthetic user message.
+     ``get_result()`` returns the LATEST settled turn result (``None`` stops the
+     loop). Before EVERY attempt the worker must still own its live run/claim
+     (``claim_state``, default :func:`worker_claim_state`; or a boolean
+-    ``claim_check``); the loop is bounded by the attempt budget even when
+-    ``get_result`` never changes. The loop deliberately does NOT extend its own
++    ``claim_check``); online failures are bounded by the attempt budget. Observed local DNS
++    outages on network-class failures wait without spending that budget, fenced by the claim.
++    The loop deliberately does NOT extend its own
+     claim lease — self-holding a claim is claim-lifetime policy (#95318), not this
+     module's. A lease that is merely ``"lapsed"`` (every coordinate still ours, the
+     expiry passed while the host slept and froze the dispatcher that renews it) is
+@@ -460,16 +499,24 @@ def recover_failed_kanban_turns(
+ 
+     while True:
+         result = get_result()
+-        if not should_recover_turn(result, attempt=attempts, task_id=task_id):
++        if not should_recover_turn(result, attempt=0, task_id=task_id):
+             return attempts
+         if not check():
+             _emit_recovery_skipped(emit, task_id)
+             return attempts
+-        attempts += 1
+-        delay = recovery_delay_seconds(attempts)
++        offline = wait_out_worker_offline(result, check)
++        if offline is None:
++            _emit_recovery_skipped(emit, task_id)
++            return attempts
++        if not offline and attempts >= max_recovery_attempts():
++            return attempts
++        if not offline:
++            attempts += 1
++        delay = recovery_delay_seconds(max(attempts, 1))
++        budget_note = "offline recovery uncharged" if offline else f"attempt {attempts}/{max_recovery_attempts()}"
+         message = (
+             f"[kanban] provider failure on {_resolve_task_id(task_id) or 'task'} — retrying the turn in place "
+-            f"(attempt {attempts}/{max_recovery_attempts()}) after {int(delay)}s; session context preserved"
++            f"({budget_note}) after {int(delay)}s; session context preserved"
+         )
+         logger.warning("%s", message)
+         if emit is not None:
+@@ -485,7 +532,7 @@ def recover_failed_kanban_turns(
+         if not check():
+             _emit_recovery_skipped(emit, task_id)
+             return attempts
+-        turn_fn(build_recovery_nudge(result, attempt=attempts, max_attempts=max_recovery_attempts(),
++        turn_fn(build_recovery_nudge(result, attempt=max(attempts, 1), max_attempts=max_recovery_attempts(),
+                                      task_id=task_id))
+ 
+ 
+diff --git a/tests/agent/test_kanban_darkwake_recovery.py b/tests/agent/test_kanban_darkwake_recovery.py
+index ea091a1cda9..d0c4bed24f7 100644
+--- a/tests/agent/test_kanban_darkwake_recovery.py
++++ b/tests/agent/test_kanban_darkwake_recovery.py
+@@ -141,6 +141,11 @@ _SUCCESS = {"failed": False, "completed": True, "final_response": "done", "messa
+ _SLEEP_S = 4 * 3600 + 33 * 60  # 16:57:52 -> 21:31:30
+ 
+ 
++@pytest.fixture(autouse=True)
++def online_network(monkeypatch):
++    monkeypatch.setattr("agent.retry_utils.host_resolves", lambda *a, **k: True)
++
++
+ @pytest.fixture
+ def submitter():
+     """The dispatcher-spawned submitter process: alive the whole time the owner runs turns."""
+@@ -278,6 +283,187 @@ def test_lapsed_lease_is_renewed_and_the_run_survives(slept_worker, failure):
+     assert [r[0] for r in runs] == [context["run_id"]]  # no duplicate attempt
+ 
+ 
++@pytest.mark.parametrize("failure", [pytest.param(_CODEX_OFFLINE, id="codex-offline"),
++                                     pytest.param(_ANTHROPIC_STALE, id="anthropic-stale")])
++def test_repeated_offline_darkwakes_preserve_the_run(slept_worker, monkeypatch, failure):
++    """Each DNS recovery is followed by another offline turn, beyond the ordinary retry budget."""
++    import agent.kanban_turn_recovery as rec
++    import agent.retry_utils as retry
++    from hermes_cli import kanban_db as kb
++
++    further_failures = rec.DEFAULT_MAX_RECOVERY_ATTEMPTS + 2
++    clock = {"awake": 0.0, "wall": time.time(), "offline": 0, "until": 0.0}
++
++    class Outages(list):
++        def __getitem__(self, index):
++            result = super().__getitem__(index)
++            if index:
++                assert clock["awake"] >= clock["until"], "model re-entered while still offline"
++            # The first outage outlasts even the per-request 900-awake-second wait.
++            clock["until"] = clock["awake"] + (1000 if index == 0 else 30)
++            return result
++
++    def resolve(_host, **_kwargs):
++        online = clock["awake"] >= clock["until"]
++        clock["offline"] += not online
++        return online
++
++    def darkwake(seconds):
++        clock["awake"] += seconds
++        clock["wall"] += seconds + 3600  # an hour asleep does not spend awake time
++
++    def wake(n, conn, context):
++        _dispatcher_tick(n, conn, context)
++        darkwake(15)
++
++    monkeypatch.setattr(rec, "_awake_clock", lambda: clock["awake"])
++    monkeypatch.setattr(retry, "host_resolves", resolve)
++    monkeypatch.setattr(retry, "_OFFLINE_SLICE_S", 30)
++    # Isolate fake clocks from subprocess/SQLite clocks. Only the DNS boundary and sleep
++    # are fake; real claim checks and dispatcher renewal still run against the fixture DB.
++    monkeypatch.setattr(retry, "time", SimpleNamespace(
++        monotonic=lambda: clock["awake"], time=lambda: clock["wall"], sleep=darkwake,
++    ))
++    run, entered, context, conn = slept_worker(
++        Outages([failure] * (1 + further_failures) + [_SUCCESS]), on_sleep=wake,
++    )
++
++    assert run() == 0
++    assert len(entered) == further_failures + 2
++    assert clock["offline"] >= further_failures
++    task = kb.get_task(conn, context["task_id"])
++    assert task.status == "running" and task.current_run_id == context["run_id"]
++    assert task.claim_lock == context["claim_lock"]
++    assert (task.consecutive_failures or 0) == 0
++    runs = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (context["task_id"],)).fetchall()
++    assert [row[0] for row in runs] == [context["run_id"]]
++    assert not {"reclaimed", "crashed", "timed_out", "heartbeat_stale"} & {
++        event.kind for event in kb.list_events(conn, context["task_id"])
++    }
++
++
++def test_offline_claim_loss_does_not_spend_an_attempt(monkeypatch):
++    import agent.kanban_turn_recovery as rec
++    import agent.retry_utils as retry
++
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_offline")
++    monkeypatch.delenv("HERMES_KANBAN_TURN_RECOVERY", raising=False)
++    live = {"value": True}
++
++    def resolve(_host, **_kwargs):
++        live["value"] = False
++        return False
++
++    monkeypatch.setattr(retry, "host_resolves", resolve)
++    turns, sleeps = [], []
++    attempts = rec.recover_failed_kanban_turns(
++        turns.append, lambda: _CODEX_OFFLINE, claim_check=lambda: live["value"],
++        sleep_fn=sleeps.append,
++    )
++    assert attempts == 0
++    assert turns == []
++    assert sleeps == []
++
++
++@pytest.mark.parametrize("failure,online,expected", [
++    pytest.param(_CODEX_OFFLINE, True, 3, id="online-codex-is-bounded"),
++    pytest.param(_ANTHROPIC_STALE, True, 3, id="online-anthropic-is-bounded"),
++    pytest.param({**_CODEX_OFFLINE, "failure_reason": "server_error", "error": "HTTP 500"},
++                 False, 3, id="non-network-never-probes"),
++    pytest.param({**_CODEX_OFFLINE, "failure_reason": "billing"}, False, 0, id="billing-never-probes"),
++    pytest.param({**_CODEX_OFFLINE, "interrupted": True}, False, 0, id="cancelled-never-probes"),
++    pytest.param({**_CODEX_OFFLINE, "turn_exit_reason": "max_iterations_reached(5/5)"},
++                 False, 0, id="settled-never-probes"),
++])
++def test_offline_gate_preserves_normal_retry_authority(monkeypatch, failure, online, expected):
++    import agent.kanban_turn_recovery as rec
++    import agent.retry_utils as retry
++
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
++    monkeypatch.setenv("HERMES_KANBAN_TURN_RECOVERY", "3")
++
++    def resolve(_host, **_kwargs):
++        assert online, "a non-network or unauthorized failure probed DNS"
++        return True
++
++    monkeypatch.setattr(retry, "host_resolves", resolve)
++    turns = []
++    attempts = rec.recover_failed_kanban_turns(
++        turns.append, lambda: failure, claim_check=lambda: True, sleep_fn=lambda _seconds: None,
++    )
++    assert attempts == expected
++    assert len(turns) == expected
++
++
++@pytest.mark.parametrize("steal", ["reclaim", "relock"])
++def test_offline_wait_still_fences_a_stolen_run(slept_worker, monkeypatch, steal):
++    import agent.retry_utils as retry
++
++    run, entered, context, conn = slept_worker([_CODEX_OFFLINE, _SUCCESS], on_sleep=_dispatcher_tick)
++
++    def resolve(_host, **_kwargs):
++        (_steal if steal == "reclaim" else _relock_in_place)(1, conn, context)
++        return False
++
++    monkeypatch.setattr(retry, "host_resolves", resolve)
++    assert run() == KANBAN_RATE_LIMIT_EXIT_CODE
++    assert len(entered) == 1
++
++
++def test_mixed_offline_and_online_failures_only_charge_online_attempts(monkeypatch):
++    import agent.kanban_turn_recovery as rec
++    import agent.retry_utils as retry
++
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_mixed")
++    monkeypatch.setenv("HERMES_KANBAN_TURN_RECOVERY", "3")
++    clock = {"awake": 0.0, "until": 5.0}
++    charged = []
++
++    def turn(_nudge):
++        # Alternate a real offline wait with an online timeout; never succeed.
++        charged.append(clock["until"] == 0)
++        clock["until"] = clock["awake"] + 5 if charged[-1] else 0
++
++    monkeypatch.setattr(retry, "host_resolves", lambda *a, **k: clock["awake"] >= clock["until"])
++    monkeypatch.setattr(retry, "time", SimpleNamespace(
++        monotonic=lambda: clock["awake"],
++        sleep=lambda seconds: clock.__setitem__("awake", clock["awake"] + seconds),
++    ))
++    attempts = rec.recover_failed_kanban_turns(
++        turn, lambda: _CODEX_OFFLINE, claim_check=lambda: True, sleep_fn=lambda _seconds: None,
++    )
++    assert attempts == sum(charged) == 3
++    assert charged.count(False) > rec.DEFAULT_MAX_RECOVERY_ATTEMPTS
++
++
++@pytest.mark.parametrize("dns", ["blocked-control", "single-blip"])
++def test_one_failed_control_lookup_is_not_an_offline_exemption(monkeypatch, dns):
++    import agent.kanban_turn_recovery as rec
++    import agent.retry_utils as retry
++
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
++    probes = []
++
++    def resolve(host, **_kwargs):
++        probes.append(host)
++        if dns == "blocked-control":
++            if len(probes) > 5:
++                pytest.fail("waiting on one blocked control despite working DNS")
++            return host != retry.NETWORK_CONTROL_HOST
++        return len(probes) > 1
++
++    monkeypatch.setattr(retry, "host_resolves", resolve)
++    # A blocked-control regression should fail immediately, not sleep on the real network.
++    monkeypatch.setattr(retry, "time", SimpleNamespace(monotonic=lambda: 0,
++        sleep=lambda _s: pytest.fail("unnecessary offline wait")))
++    result = {"value": _CODEX_OFFLINE}
++    attempts = rec.recover_failed_kanban_turns(
++        lambda _n: result.update(value=_SUCCESS), lambda: result["value"],
++        claim_check=lambda: True, sleep_fn=lambda _seconds: None,
++    )
++    assert attempts == 1
++
++
+ def _steal(n, conn, context):
+     """Another holder takes the card while this worker waits: released, then claimed elsewhere."""
+     from hermes_cli import kanban_db as kb
+diff --git a/tests/agent/test_kanban_turn_recovery.py b/tests/agent/test_kanban_turn_recovery.py
+index 2a67e3b58d1..fca16d76d79 100644
+--- a/tests/agent/test_kanban_turn_recovery.py
++++ b/tests/agent/test_kanban_turn_recovery.py
+@@ -51,6 +51,11 @@ KANBAN_ENV = (
+ _FAR_FUTURE_EXPIRY = 4_102_444_800
+ 
+ 
++@pytest.fixture(autouse=True)
++def online_network(monkeypatch):
++    monkeypatch.setattr("agent.retry_utils.host_resolves", lambda *a, **k: True)
++
++
+ @pytest.fixture
+ def clear_kanban_env(monkeypatch):
+     for var in KANBAN_ENV:
+diff --git a/tests/gateway/test_session_kanban_turn_recovery.py b/tests/gateway/test_session_kanban_turn_recovery.py
+index 0d35f9ba756..ec7352a93ef 100644
+--- a/tests/gateway/test_session_kanban_turn_recovery.py
++++ b/tests/gateway/test_session_kanban_turn_recovery.py
+@@ -28,6 +28,7 @@ class _Agent:
+ 
+ 
+ def _claimed_frame(tmp_path, monkeypatch, *, expired=False, goal_mode=False):
++    monkeypatch.setattr("agent.retry_utils.host_resolves", lambda *a, **k: True)
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     monkeypatch.delenv("HERMES_KANBAN_TURN_RECOVERY", raising=False)
+     # The owner/gateway process carries a FOREIGN (stale) env carrier: the proof must ignore it.
+-- 
+2.55.0
+

@@ -52,3 +52,25 @@ Apply the complete numbered patch series at the fork/upstream merge-base with `g
 ## Plugin?
 
 No, core change: it spans worker persistence, routing, exception handling, log extraction and Kanban tool authorization.
+
+## Follow-up patch (1564): retry a pre-admission storage_unavailable refusal
+
+Patch: `patches/1564-daveey-kanban-worker-retry-a-pre-admission-storage_u.patch` (`346d92ff66`, `kanban worker: retry a pre-admission storage_unavailable refusal, then exit owner-unavailable`).
+
+**Behavior.** The incident: the hub's `config.yaml` was replaced by a near-empty file, so the owner's session policy had no model and `kanban.run` answered `storage_unavailable`. The worker client treated that as a final refusal. Runs exited 1 before any admission, were booked `crashed`, and `failure_limit=2` sent unrelated cards to triage. Now, while no admission exists, a `storage_unavailable` refusal is asked again (`kanban.run` is idempotent per attempt). If the owner keeps refusing for `OWNER_WAIT_S` (180 s), the run ends owner-unavailable (exit 69). The dead-worker sweep requeues it without counting a failure. That neutral requeue is still capped by `NEUTRAL_STREAK_LIMIT` (5), and the run is still counted as a failure if the board has an `owner_admitted` marker. After an admission the refusal stays final, because a turn may be running.
+
+**How it works.** `hermes_cli/kanban_worker_client.py` adds `_HOST_REFUSAL_REASONS = {'storage_unavailable'}` and `_host_refusal(exc, claim)`, which is true only for a `GatewayRPCError` whose text is in that set while `claim.admission_id is None`. In the `run()` retry loop such a refusal is handled like a restartable error (`claim.note_refusal`, then retry). When the wait runs out, the existing owner-unavailable path raises with `owner_unavailable = True`, and the message says `kept refusing` instead of `silent`. Other RPC refusals (for example `invalid_params`) still raise at once.
+
+**Code.** `hermes_cli/kanban_worker_client.py`.
+
+**Tests.** From the patch; **not run for this mirror**. `tests/hermes_cli/test_kanban_owner_unavailable.py`:
+- `test_owner_store_refusal_before_admission_exits_owner_unavailable`: exits 69 after retrying.
+- `test_owner_store_refusal_that_heals_runs_the_claim`.
+- `test_owner_store_refusal_after_admission_stays_final`: still exits 1.
+- `test_a_card_level_owner_refusal_still_exits_1_at_once`.
+- `test_owner_store_refusals_leave_the_card_ready_with_no_failure_spent`: end to end, two refused attempts under `failure_limit=2` leave the card `ready` with 0 failures. The commit reports this test red on the parent.
+
+**Gotchas.**
+- Only `storage_unavailable` is treated as the host's fault. Other owner-side refusals are still final.
+- A host whose config stays broken still reaches the failure breaker after `NEUTRAL_STREAK_LIMIT` neutral requeues. The patch does not repair the config.
+- Apply in full-series order; standalone application is not certified.

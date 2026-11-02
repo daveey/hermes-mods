@@ -1,0 +1,321 @@
+From 29e429af34785863aa3476f50766e496913795fb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:14:12 +0000
+Subject: [PATCH] fix(kanban): resolve exact owner-wake grants across local
+ boards [daveey]
+
+---
+ hermes_cli/kanban_db.py                       |   2 +-
+ hermes_cli/kanban_requeue.py                  |  28 +++--
+ .../test_kanban_owner_wake_cross_board.py     | 100 ++++++++++++++++++
+ tests/tools/test_kanban_owner_wake_requeue.py |   3 +-
+ tools/kanban_tools.py                         |   4 +-
+ tools/kanban_tools_self_heal.py               |  65 +++++++++++-
+ 6 files changed, 179 insertions(+), 23 deletions(-)
+ create mode 100644 tests/tools/test_kanban_owner_wake_cross_board.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8eca0b70d24..828f66fff6c 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -572,7 +572,7 @@ def _descendant_may_follow_explicit_board(slug: str) -> bool:
+ def board_own_db_path(slug: Optional[str]) -> Path:
+     """The board's own ``kanban.db``, ignoring every env pin: ``<root>/kanban.db`` for
+     ``default``, else ``board_dir(slug)/kanban.db``. For read-only listings that must describe
+-    each board (``boards list`` counts), never for routing a write. [daveey]"""
++    each board (``boards list`` counts), and the exact-grant owner-wake tool resolver. [daveey]"""
+     s = _slug_or_default(slug)
+     if s == DEFAULT_BOARD:
+         return kanban_home() / "kanban.db"
+diff --git a/hermes_cli/kanban_requeue.py b/hermes_cli/kanban_requeue.py
+index 5a62c41d3f5..83c1b69e616 100644
+--- a/hermes_cli/kanban_requeue.py
++++ b/hermes_cli/kanban_requeue.py
+@@ -5,8 +5,8 @@ Moved out of ``hermes_cli/kanban.py`` (at its line cap); ``kanban`` re-exports e
+ - A self-heal fix card may unblock the single card named in its defect; a card a finished fix card created may do
+   the same (``self_heal_requeue_grant``).
+ - An owner-wake supervisor card (chat-closeout ``supervise_on_board``: ``created_by='owner-wake'``, title
+-  ``Owner wake: supervise ...``) may unblock exactly the ``- <board>/<id>`` card lines of its body on this board,
+-  only while each is in triage or blocked (``requeue_grant``).
++  ``Owner wake: supervise ...``) may unblock exactly the local ``- <board>/<id>`` card lines of its body,
++  only while each is in triage or blocked (``requeue_grant``); the tool resolves cross-board grants.
+ """
+ from __future__ import annotations
+ 
+@@ -87,21 +87,19 @@ def _is_owner_wake_supervisor(task) -> bool:
+             and (task.title or "").startswith(_OWNER_WAKE_TITLE))
+ 
+ 
+-def owner_wake_listed_cards(task, board: str) -> list[str]:
+-    """The card ids an owner-wake supervisor card's body lists on ``board``, in order.
+-
+-    Only the card-line block (the lines before the first blank line) counts, so
+-    ids cited later in the instructions are not grants. [daveey]
+-    """
++def owner_wake_listed_refs(task) -> list[tuple[str, str]]:
++    """Exact local (board, id) grants in the initial card-line block only."""
+     if not _is_owner_wake_supervisor(task):
+         return []
+     head = (task.body or "").split("\n\n", 1)[0]
+-    found = []
+-    for line in head.splitlines():
+-        m = _OWNER_WAKE_CARD_LINE.match(line)
+-        if m and m.group(1) == board:
+-            found.append(m.group(2))
+-    return list(dict.fromkeys(found))
++    return list(dict.fromkeys(
++        (m.group(1), m.group(2)) for line in head.splitlines()
++        if (m := _OWNER_WAKE_CARD_LINE.match(line))))
++
++
++def owner_wake_listed_cards(task, board: str) -> list[str]:
++    """Card ids listed for exactly this board; later prose is never a grant."""
++    return [tid for slug, tid in owner_wake_listed_refs(task) if slug == board]
+ 
+ 
+ def requeue_grant(conn, worker_task_id: str, target_id: str, *,
+@@ -136,4 +134,4 @@ def has_requeue_grant(conn, worker_task_id: str, *, board: Optional[str] = None)
+     if self_heal_requeue_grant(conn, worker_task_id)[0] is not None:
+         return True
+     worker = kb.get_task(conn, worker_task_id)
+-    return bool(owner_wake_listed_cards(worker, board or kb.get_current_board()))
++    return bool(owner_wake_listed_refs(worker))
+diff --git a/tests/tools/test_kanban_owner_wake_cross_board.py b/tests/tools/test_kanban_owner_wake_cross_board.py
+new file mode 100644
+index 00000000000..70567df8b98
+--- /dev/null
++++ b/tests/tools/test_kanban_owner_wake_cross_board.py
+@@ -0,0 +1,100 @@
++"""Owner-wake grants cross local boards without unpinning ordinary workers."""
++import json
++
++import pytest
++
++from tests.tools.test_kanban_owner_wake_requeue import (
++    _as_worker, _card, _line, _supervisor,
++)
++from tests.tools.test_kanban_owner_wake_requeue import board
++
++pytestmark = pytest.mark.usefixtures(board.__name__)
++
++
++@pytest.mark.parametrize("creator", ["owner-wake", "default"])
++@pytest.mark.parametrize("status", ["triage", "blocked", "scheduled", "running"])
++def test_cross_board_surface_and_unblock(monkeypatch, creator, status):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    kb.create_board("ops")
++    own = kbc.connect()
++    target_conn = kbc.connect(board="ops")
++    target = _card(target_conn, kb, "target", status)
++    other = _card(target_conn, kb, "unlisted", "triage")
++    sup = _supervisor(own, kb, [_line(f"ops/{target}")], created_by=creator)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    _as_worker(monkeypatch, own, kb, sup)
++    assert kb.kanban_db_path(board="ops") == kb.kanban_db_path()
++    assert kt._check_kanban_unblock() is (creator == "owner-wake")
++    shown = json.loads(kt._handle_show({"task_id": target, "board": "ops"}))
++    assert (shown.get("task", {}).get("id") == target) is (creator == "owner-wake")
++    for args in ({"task_id": other, "board": "ops"}, {"task_id": target, "board": "default"}):
++        assert not json.loads(kt._handle_unblock(args)).get("ok")
++    result = json.loads(kt._handle_unblock({"task_id": target, "board": "ops"}))
++    allowed = creator == "owner-wake" and status in ("triage", "blocked")
++    assert bool(result.get("ok")) is allowed, result
++    assert kb.get_task(target_conn, target).status == ("ready" if allowed else status)
++    assert kb.get_task(target_conn, other).status == "triage"
++    own.close()
++    target_conn.close()
++
++
++def test_cross_board_delegate_cannot_use_supervisor_grant(monkeypatch):
++    from agent.delegation_context import delegated_child_context
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    kb.create_board("ops")
++    own = kbc.connect()
++    other = kbc.connect(board="ops")
++    target = _card(other, kb, "target", "triage")
++    sup = _supervisor(own, kb, [_line(f"ops/{target}")])
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
++    _as_worker(monkeypatch, own, kb, sup)
++    with delegated_child_context():
++        assert not kt._check_kanban_unblock()
++        assert not json.loads(kt._handle_unblock({"task_id": target, "board": "ops"})).get("ok")
++        assert "task" not in json.loads(kt._handle_show({"task_id": target, "board": "ops"}))
++    assert kb.get_task(other, target).status == "triage"
++    own.close()
++    other.close()
++
++
++@pytest.mark.parametrize("board_arg", [None, "ops"])
++@pytest.mark.parametrize("stale", [False, True])
++def test_omitted_board_and_stale_run(monkeypatch, board_arg, stale):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    kb.create_board("ops")
++    with kbc.connect_closing() as own, kbc.connect_closing(board="ops") as target_conn:
++        target = _card(target_conn, kb, "target", "triage")
++        sup = _supervisor(own, kb, [_line(f"ops/{target}")])
++        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
++        _as_worker(monkeypatch, own, kb, sup)
++        if stale:
++            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
++        args = {"task_id": target, **({"board": board_arg} if board_arg else {})}
++        out = json.loads(kt._handle_unblock(args))
++        assert bool(out.get("ok")) is not stale, out
++        assert kb.get_task(target_conn, target).status == ("triage" if stale else "ready")
++
++
++def test_ambiguous_id_requires_board(monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    with kbc.connect_closing() as own:
++        target = _card(own, kb, "target", "triage")
++        sup = _supervisor(own, kb, [_line(f"default/{target}"), _line(f"ops/{target}")])
++        _as_worker(monkeypatch, own, kb, sup)
++        out = json.loads(kt._handle_unblock({"task_id": target}))
++        assert "ambiguous" in out.get("error", ""), out
++        assert kb.get_task(own, target).status == "triage"
++        assert json.loads(kt._handle_unblock({"task_id": target, "board": "default"})).get("ok")
+diff --git a/tests/tools/test_kanban_owner_wake_requeue.py b/tests/tools/test_kanban_owner_wake_requeue.py
+index a96d16acfdc..b73ad71f1a0 100644
+--- a/tests/tools/test_kanban_owner_wake_requeue.py
++++ b/tests/tools/test_kanban_owner_wake_requeue.py
+@@ -106,7 +106,8 @@ def test_supervisor_requeues_a_listed_triage_or_blocked_card(board, monkeypatch,
+     conn = kbc.connect()
+     try:
+         events = [e for e in kb.list_events(conn, a) if e.kind == "owner_wake_requeue"]
+-        assert [e.payload for e in events] == [{"by": sup, "supervisor_card": sup, "target": a}]
++        assert [e.payload for e in events] == [{
++            "by": sup, "supervisor_card": sup, "target": a, "supervisor_board": "default"}]
+     finally:
+         conn.close()
+ 
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8f209e58dba..9b56066f131 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -897,7 +897,7 @@ def _handle_show(args: dict, **kw) -> str:
+                 "task to show by default. Call kanban_list to see task ids on "
+                 "the board, then kanban_show(task_id=<id>) for full state."),
+         })
+-    with _board(args.get("board")) as (kb, conn):
++    with _granted_board(args.get("board"), tid) as (kb, conn, _):
+         task = _existing_task(kb, conn, tid)
+         return json.dumps({
+             "task": _fields(task, _TASK_FIELDS),
+@@ -2030,7 +2030,7 @@ _handle_link = _kanban_handler("kanban_link")(_graph.handle_link)
+ _handle_unlink = _kanban_handler("kanban_unlink")(_graph.handle_unlink)
+ _handle_supervisor_request = _kanban_handler("kanban_supervisor_request")(_graph.handle_supervisor_request)
+ from tools.kanban_tools_self_heal import check_unblock as _check_kanban_unblock_fn
+-from tools.kanban_tools_self_heal import handle_unblock as _handle_unblock_fn
++from tools.kanban_tools_self_heal import handle_unblock as _handle_unblock_fn, granted_board as _granted_board
+ _check_kanban_unblock = no_cache_check_fn(_check_kanban_unblock_fn)
+ _handle_unblock = _kanban_handler("kanban_unblock")(_handle_unblock_fn)
+ _TOOLS = (
+diff --git a/tools/kanban_tools_self_heal.py b/tools/kanban_tools_self_heal.py
+index 3fc1605c9cd..d087939f5a1 100644
+--- a/tools/kanban_tools_self_heal.py
++++ b/tools/kanban_tools_self_heal.py
+@@ -11,9 +11,47 @@ grow. The shell fence is unchanged; only the in-process tool has these grants:
+ from __future__ import annotations
+ 
+ import os
++from contextlib import contextmanager
+ from typing import Optional
+ 
+ 
++@contextmanager
++def granted_board(board: Optional[str], tid: str):
++    """Resolve an exact owner-wake grant, never changing the global worker pin.
++
++    Authority is read on the worker's pinned board; only the listed target is
++    opened on its own local board. Ordinary workers and descendants keep the
++    existing resolution. Omitted board is inferred only for a unique listing.
++    """
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_requeue import owner_wake_listed_refs
++
++    env_tid = os.environ.get("HERMES_KANBAN_TASK")
++    if env_tid and kt._is_dispatcher_owned_worker():
++        with kt._board(None) as (kb, own):
++            worker = kb.get_task(own, env_tid)
++            refs = [(slug, target) for slug, target in
++                    owner_wake_listed_refs(worker)
++                    if target == tid and (board is None or board == slug)]
++            kt._check(len(refs) < 2, "ambiguous owner-wake target; specify board")
++            if len(refs) == 1:
++                kt._check(worker.status == "running" and
++                          kt._worker_run_id(env_tid) is not None and
++                          worker.current_run_id == kt._worker_run_id(env_tid),
++                          "owner-wake supervisor no longer owns its current run")
++                if refs[0][0] == kb.get_current_board():
++                    yield kb, own, env_tid
++                    return
++                path = kb.board_own_db_path(refs[0][0])
++                kt._check(path.is_file(), "orchestrator-only: listed owner-wake board is not available locally")
++                with kbc.connect_closing(db_path=path) as conn:
++                    yield kb, conn, env_tid
++                return
++    with kt._board(board) as (kb, conn):
++        yield kb, conn, None
++
++
+ def check_unblock() -> bool:
+     """Orchestrators always. A worker only when it holds a requeue grant."""
+     from tools.kanban_tools import _board, _is_dispatcher_owned_worker, _visible, logger
+@@ -39,6 +77,7 @@ def _log_requeue(conn, kb, tid: str, env_tid: str, via: str, source: Optional[st
+         if via == "owner-wake-requeue":
+             kb._append_event(conn, tid, "owner_wake_requeue", {
+                 "by": env_tid, "supervisor_card": source, "target": tid,
++                "supervisor_board": kb.get_current_board(),
+             })
+         else:
+             kb._append_event(conn, tid, "self_heal_requeue", {
+@@ -56,11 +95,29 @@ def handle_unblock(args: dict, **kw) -> str:
+     tid = str(tid)
+     env_tid = os.environ.get("HERMES_KANBAN_TASK")
+     if env_tid and tid != env_tid:
+-        with kt._board(args.get("board")) as (kb, conn):
+-            from hermes_cli.kanban_requeue import requeue_grant
+-            via, source = requeue_grant(conn, env_tid, tid, board=args.get("board") or kb.get_current_board())
++        with granted_board(args.get("board"), tid) as (kb, conn, owner):
++            from hermes_cli.kanban_requeue import OWNER_WAKE_REQUEUE_STATUSES, requeue_grant
++            via, source = (("owner-wake-requeue", owner) if owner else
++                           requeue_grant(conn, env_tid, tid,
++                                         board=args.get("board") or kb.get_current_board()))
+             if via:
+-                ok = kb.unblock_task(conn, tid)
++                def precondition(current):
++                    task = kb.get_task(current, tid)
++                    if via == "owner-wake-requeue" and (
++                            task is None or task.status not in OWNER_WAKE_REQUEUE_STATUSES):
++                        return "owner-wake target must be triage or blocked"
++                    if owner:
++                        from hermes_cli.kanban_requeue import owner_wake_listed_refs
++                        with kt._board(None) as (_, own):
++                            worker = kb.get_task(own, owner)
++                            refs = [(slug, target) for slug, target in owner_wake_listed_refs(worker)
++                                    if target == tid and (args.get("board") is None or args["board"] == slug)]
++                            if (worker is None or worker.status != "running" or
++                                    worker.current_run_id != kt._worker_run_id(owner) or len(refs) != 1):
++                                return "owner-wake grant or run was revoked"
++                    return None
++
++                ok = kb.unblock_task(conn, tid, precondition=precondition)
+                 kt._check(ok, f"could not unblock {tid} (not blocked/triage/scheduled, or unknown)")
+                 _log_requeue(conn, kb, tid, env_tid, via, source)
+                 return kt._ok(task_id=tid, via=via, **kt._fields(kb.get_task(conn, tid), ("status",)))
+-- 
+2.55.0
+

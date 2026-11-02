@@ -1,0 +1,151 @@
+From 311d8339309a7606c779cb1a6b56e389f07ed269 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:35:46 +0000
+Subject: [PATCH] [daveey] Preserve live account quota across pushed OAuth
+ tokens
+
+---
+ agent/credential_pool.py                      | 16 +++--
+ agent/credential_pool_pushed.py               | 19 ++++++
+ .../test_credential_pool_pushed_quota.py      | 60 +++++++++++++++++++
+ 3 files changed, 86 insertions(+), 9 deletions(-)
+ create mode 100644 agent/credential_pool_pushed.py
+ create mode 100644 tests/agent/test_credential_pool_pushed_quota.py
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 1c73d2e29b4..da6d25ad6dc 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -1301,13 +1301,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+     def _adopt_pushed_norefresh_row(self, entry: PooledCredential) -> PooledCredential:
+         """Adopt a token pushed to disk for an OAuth row that carries no refresh_token.
+ 
+-        A minter (hub-side token authority) writes ``{access_token, expires_at_ms}`` rows with no
+-        refresh_token into this home's pool store. Such a row can never refresh itself, so a LIVE
+-        pool would otherwise keep the expired (or 401-benched) copy forever and only a fresh
+-        ``load_pool()`` would see the new token. Re-read the exact persisted row under the
+-        cross-process auth-store lock; when its access_token differs, adopt it and clear the status.
+-        Rows that do have a refresh_token, borrowed sources and token-less disk rows are left alone.
++        Re-read under the auth lock: a pushed token repairs auth failures, not live account quota.
++        Refresh-bearing, borrowed and token-less rows are left alone.
+         """
++        from agent.credential_pool_pushed import has_live_quota_mark
+         if entry.auth_type != AUTH_TYPE_OAUTH or (entry.refresh_token or "").strip():
+             return entry
+         if is_borrowed_credential_source(entry.source, self.provider):
+@@ -1325,9 +1322,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+                 if not (stored.access_token or "").strip() or stored.access_token == entry.access_token:
+                     return entry
+                 logger.debug("Pool entry %s: adopting pushed %s token (no refresh_token)", entry.id, self.provider)
+-                adopted = replace(stored, **_MARK_OK)
++                keep_quota = has_live_quota_mark(stored)
++                adopted = stored if keep_quota else replace(stored, **_MARK_OK)
+                 self._replace_entry(entry, adopted)
+-                self._persist(status_cleared_ids=[entry.id])
++                self._persist(status_cleared_ids=[] if keep_quota else [entry.id])
+                 return self._find(lambda e: e.id == adopted.id) or adopted
+         except Exception as exc:
+             logger.debug("Failed to adopt pushed %s token for entry %s: %s", self.provider, entry.id, exc)
+@@ -1522,7 +1520,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+             # No refresh_token (pushed by a minter): the only way to renew is a newer token on disk.
+             adopted = self._adopt_pushed_norefresh_row(entry)
+             if adopted is not entry:
+-                return adopted
++                return adopted if adopted.last_status == STATUS_OK else None
+         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
+             if force:
+                 self._mark_exhausted(entry, None)
+diff --git a/agent/credential_pool_pushed.py b/agent/credential_pool_pushed.py
+new file mode 100644
+index 00000000000..79777a8e9d1
+--- /dev/null
++++ b/agent/credential_pool_pushed.py
+@@ -0,0 +1,19 @@
++"""Quota policy for externally minted OAuth token replacements."""
++from __future__ import annotations
++
++import time
++
++
++def has_live_quota_mark(entry) -> bool:
++    """A new token does not replenish an account's known quota window."""
++    from agent.credential_pool import STATUS_EXHAUSTED, _parse_absolute_timestamp
++    from hermes_cli.auth_codex import _is_codex_rate_limit_shaped
++
++    reset = _parse_absolute_timestamp(entry.last_error_reset_at)
++    return (
++        entry.last_status == STATUS_EXHAUSTED
++        and entry.last_error_code not in (401, 403)
++        and reset is not None and reset > time.time()
++        and _is_codex_rate_limit_shaped(
++            entry.last_error_code, entry.last_error_reason, entry.last_error_message)
++    )
+diff --git a/tests/agent/test_credential_pool_pushed_quota.py b/tests/agent/test_credential_pool_pushed_quota.py
+new file mode 100644
+index 00000000000..3d98315be63
+--- /dev/null
++++ b/tests/agent/test_credential_pool_pushed_quota.py
+@@ -0,0 +1,60 @@
++"""Token replacement repairs authentication, not an account's quota window."""
++import json
++import time
++
++import pytest
++
++import agent.credential_pool as cp
++from hermes_cli import auth
++
++
++@pytest.mark.parametrize("code,status,delta,keep", [
++    (429, "exhausted", 3600, True),
++    (401, "dead", 3600, False),
++    (429, "exhausted", -60, False),
++])
++def test_pushed_token_quota_policy(tmp_path, monkeypatch, code, status, delta, keep):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    now = time.time()
++    row = dict(id="aaaaaa", label="example", auth_type="oauth", priority=0,
++               source="manual:hub_minted", access_token="old-dummy",
++               expires_at_ms=int((now + 7200) * 1000), last_status=status,
++               last_status_at=now - 10, last_error_code=code,
++               last_error_reason="usage_limit_reached" if code == 429 else "invalid_token",
++               last_error_reset_at=now + delta,
++               model_cooldowns={"example-model": now + 7200})
++    path = tmp_path / "auth.json"
++    path.write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": [row]}}))
++    entry = cp.PooledCredential.from_dict("openai-codex", row)
++    pool = cp.CredentialPool("openai-codex", [entry])
++    row["access_token"] = "new-dummy"
++    path.write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": [row]}}))
++    adopted = pool._adopt_pushed_norefresh_row(entry)
++    persisted = auth.read_credential_pool("openai-codex")[0]
++    assert adopted.access_token == persisted["access_token"] == "new-dummy"
++    assert adopted.model_cooldowns == persisted["model_cooldowns"] == row["model_cooldowns"]
++    assert adopted.last_status == (status if keep else "ok")
++    assert adopted.last_error_reset_at == (row["last_error_reset_at"] if keep else None)
++    assert persisted.get("last_error_code") == (code if keep else None)
++    if keep:
++        assert not persisted.get("status_cleared_at")
++        assert pool._available_entries()[0] == []
++
++
++@pytest.mark.parametrize("path", ["refresh", "select"])
++def test_refresh_does_not_lease_pushed_quota_row(tmp_path, monkeypatch, path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    now = time.time()
++    row = dict(id="aaaaaa", label="example", auth_type="oauth", priority=0,
++               source="manual:hub_minted", access_token="old-dummy",
++               expires_at_ms=int((now - 60) * 1000), last_status="ok")
++    entry = cp.PooledCredential.from_dict("anthropic", row)
++    pool = cp.CredentialPool("anthropic", [entry])
++    row.update(access_token="new-dummy", expires_at_ms=int((now + 7200) * 1000),
++               last_status="exhausted", last_status_at=now, last_error_code=429,
++               last_error_reason="usage_limit_reached", last_error_reset_at=now + 3600)
++    (tmp_path / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"anthropic": [row]}}))
++    result = pool._refresh_entry(entry, force=True) if path == "refresh" else pool.select()
++    assert result is None
++    assert pool.entries()[0].last_status == "exhausted"
++    assert auth.read_credential_pool("anthropic")[0]["last_error_reset_at"] == now + 3600
+-- 
+2.55.0
+

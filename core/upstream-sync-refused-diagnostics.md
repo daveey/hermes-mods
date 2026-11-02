@@ -136,3 +136,16 @@ Use the repository's documented full-series replay policy; this task did not ver
 - Owner lookup needs the reporter's local state and readable board; this feature does not create or update cards.
 - The updater prioritizes evidence over test IDs, but more than 40 non-listing lines can still hide later evidence.
 - These patches change diagnostics, not required jobs, branch protection, PR landing or green-check policy.
+
+## Follow-up patch (1581): upstream-conflict owner card filed in a fresh interpreter
+
+**1581** (`492162703c`, `fix(update): file the upstream-conflict owner card in a fresh interpreter`). The conflict reporter that 1581 changes (`hermes_cli/update_upstream_conflict.py`) arrived with an upstream-merge bridge, not with a numbered patch in this series.
+
+- **Behavior.** When `hermes update` hits an unattended upstream merge conflict, it files (or refreshes) one Kanban owner card, keyed on the checkout path. Before 1581 this could fail. The updater has already imported `hermes_cli.config_effective` by the time it moves the checkout. `report()` then imported the new kanban modules in the same process, the new `kanban_capabilities` asked the stale `config_effective` for `load_profile_config_effective`, and `validate_assignment` refused the card as a capability mismatch. Now the card is filed correctly. When no owner is filed, the updater prints a fixed `    Repair owner: NOT FILED` line (previously it printed nothing), which a signal detector can match.
+- **How it works.** `report()` runs `runtime_command(root, args, module="hermes_cli.update_upstream_conflict", home=get_hermes_home())` as a subprocess (60 s timeout). The new `main()` parses `--cwd`, `--upstream` and repeated `--conflict`, runs the unchanged `_report` against the board, and prints `__HERMES_UPSTREAM_CONFLICT_TASK__=<id>`. The parent returns the last marker id when the child exits 0. On any other result it logs a warning with the child's last 2,000 characters of stderr/stdout (or the `OSError`/`SubprocessError`), prints the existing `see agent.log` warning, and returns `None`. Update custody is unchanged. `_synthesize_upstream_merge` (`hermes_cli/update_cmd_git.py`) prints the `Repair owner:` line.
+- **Tests** (new `tests/hermes_cli/test_update_upstream_conflict.py`; not run for this mirror):
+  - `test_report_files_owner_despite_stale_in_process_modules`: a stale `config_effective` stub sits in `sys.modules`. `report()` must still create exactly one `upstream-merge-conflict:` card, and a second call must comment on that same card. The commit reports red before the fix and green after.
+  - `test_report_failure_is_best_effort_and_logged`: an unwritable board path returns `None`, prints the warning and logs it.
+  - `test_conflict_without_owner_prints_not_filed`: with `report` stubbed to `None` and git stubbed, the `NOT FILED` line is printed.
+  - Untested: the child timeout path, and a full `hermes update` run with a real checkout move.
+- **Gotchas.** The child inherits `HERMES_HOME` from the environment if it is set, and otherwise pins the updater's resolved home. It uses the store/bootstrap Python that `runtime_command` selects, so a broken launcher shows up as a warning plus `NOT FILED`, not as a crash.

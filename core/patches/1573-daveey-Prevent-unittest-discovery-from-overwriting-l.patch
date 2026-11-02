@@ -1,0 +1,210 @@
+From 02b548294a3aec2fe25a2bfd95010a7652eb0b7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:06:01 +0000
+Subject: [PATCH] [daveey] Prevent unittest discovery from overwriting live
+ config
+
+---
+ hermes_cli/config_backups.py              | 33 ++++++++++++++--
+ tests/__init__.py                         | 11 ++++++
+ tests/hermes_cli/test_config_backups.py   | 22 +++++++++++
+ tests/test_unittest_safety.py             | 48 +++++++++++++++++++++++
+ tests/tools/test_image_generate_schema.py | 13 +++---
+ 5 files changed, 118 insertions(+), 9 deletions(-)
+ create mode 100644 tests/test_unittest_safety.py
+
+diff --git a/hermes_cli/config_backups.py b/hermes_cli/config_backups.py
+index 0fd922aee46..8df2212a2d3 100644
+--- a/hermes_cli/config_backups.py
++++ b/hermes_cli/config_backups.py
+@@ -4,8 +4,9 @@ Every writer that wants a "before" copy of the user's config (setup wizard, corr
+ snapshot, model migrations) goes through :func:`backup_config`. Copies live in
+ ``<HERMES_HOME>/backups/config/`` — ``backups/`` is already excluded from full backups, so they
+ never nest — as ``config.yaml.<reason>.<YYYYMMDD-HHMMSS>``. A copy identical to the newest one
+-for the same reason is skipped, and only the newest ``keep`` per reason survive, so repeated
+-``hermes setup`` runs or a gateway restarting against broken YAML cannot litter the home dir.
++for the same reason is skipped, and only the newest ``keep`` per reason survive, except for
++one last-full ``good`` anchor after a top-level collapse. Repeated setup runs and gateway loads
++stay bounded without evicting the only pre-collapse recovery copy.
+ """
+ 
+ from __future__ import annotations
+@@ -66,14 +67,40 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
+         if dest.is_symlink() or dest.exists():  # never write through a planted link
+             return None
+         shutil.copy2(config_path, dest)  # config-reader: ok — file tooling, gated above
++        anchor = _last_full_good_backup([dest, *existing]) if reason == "good" else None
+         for stale in [dest, *existing][keep:]:
+-            stale.unlink(missing_ok=True)
++            if stale != anchor:
++                stale.unlink(missing_ok=True)
+         return dest
+     except OSError as exc:
+         logger.warning("Could not back up %s (%s): %s", config_path, reason, exc)
+         return None
+ 
+ 
++def _last_full_good_backup(candidates: list[Path]) -> Optional[Path]:
++    """Keep one extra recovery anchor after loss of most top-level settings.
++
++    Parseability is not completeness: repeated loads of a valid partial document
++    must not evict every pre-collapse copy. This affects retention only, never
++    automatic recovery selection. Newest wins ties; normal rotation resumes when
++    the document regains at least half the anchor's sections.
++    """
++    from utils import fast_safe_load
++
++    counts = []
++    for path in candidates:
++        try:
++            doc = fast_safe_load(path.read_text(encoding="utf-8"))
++        except Exception:
++            counts.append(0)
++        else:
++            counts.append(len(doc) if isinstance(doc, dict) else 0)
++    largest = max(counts, default=0)
++    if largest >= 10 and counts[0] * 2 < largest:
++        return candidates[counts.index(largest)]
++    return None
++
++
+ def load_newest_good_backup(config_path: Path) -> Optional[dict]:
+     """Parse the newest ``good`` backup (the file as it was at the last successful load).
+ 
+diff --git a/tests/__init__.py b/tests/__init__.py
+index e69de29bb2d..2809e9700da 100644
+--- a/tests/__init__.py
++++ b/tests/__init__.py
+@@ -0,0 +1,11 @@
++"""The repository suite requires pytest's collection-time safety fixtures."""
++
++
++def load_tests(loader, tests, pattern):
++    """Stop unittest discovery before it imports children without conftest isolation.
++
++    Explicit, self-contained unittest modules remain runnable. Repository discovery
++    bypasses credential stripping and live-state write fences as well as temporary
++    Hermes homes.
++    """
++    raise RuntimeError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")
+diff --git a/tests/hermes_cli/test_config_backups.py b/tests/hermes_cli/test_config_backups.py
+index 0ee2d235162..42e1dffd2cf 100644
+--- a/tests/hermes_cli/test_config_backups.py
++++ b/tests/hermes_cli/test_config_backups.py
+@@ -5,6 +5,28 @@ from pathlib import Path
+ from hermes_cli.config_backups import backup_config, list_config_backups
+ 
+ 
++def test_good_rotation_retains_last_full_config_after_collapse(tmp_path, monkeypatch):
++    cfg = tmp_path / "config.yaml"
++    full = "".join(f"section_{i}: enabled\n" for i in range(20))
++    cfg.write_text(full)
++    stamps = iter(f"20260101-{i:06d}" for i in range(20))
++    monkeypatch.setattr("hermes_cli.config_backups.time.strftime", lambda _fmt: next(stamps))
++    anchor = backup_config(cfg, "good", keep=2)
++    for i in range(8):
++        cfg.write_text(f"image_gen: {{model: fixture-{i}}}\n")
++        backup_config(cfg, "good", keep=2)
++    kept = list_config_backups(cfg, "good")
++    assert anchor in kept
++    assert anchor.read_text() == full
++    assert len(kept) <= 3  # rolling window plus one last-full anchor
++    assert kept[0].read_text() == "image_gen: {model: fixture-7}\n"
++    # Restoration retires the extra anchor; normal retention remains bounded.
++    cfg.write_text(full + "restored: true\n")
++    backup_config(cfg, "good", keep=2)
++    assert len(list_config_backups(cfg, "good")) == 2
++    assert not anchor.exists()
++
++
+ def test_repeat_backups_dedupe_and_rotate(tmp_path: Path, monkeypatch):
+     cfg = tmp_path / "config.yaml"
+     cfg.write_text("model: a\n")
+diff --git a/tests/test_unittest_safety.py b/tests/test_unittest_safety.py
+new file mode 100644
+index 00000000000..0f9f0d2ce25
+--- /dev/null
++++ b/tests/test_unittest_safety.py
+@@ -0,0 +1,48 @@
++"""Unittest entry paths must not clobber an inherited Hermes config.
++
++Run the historical writer only against a disposable sentinel home, never real state.
++"""
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SENTINEL = "model: sentinel\nterminal:\n  backend: local\n"
++
++
++def _run(tmp_path, args):
++    home = tmp_path / "inherited-home"
++    home.mkdir()
++    config = home / "config.yaml"
++    config.write_text(SENTINEL)
++    env = dict(os.environ, HERMES_HOME=str(home), HOME=str(tmp_path))
++    result = subprocess.run(
++        [sys.executable, "-m", "unittest", *args], cwd=ROOT, env=env,
++        capture_output=True, text=True, timeout=120, check=False,
++    )
++    return result, config
++
++
++def test_explicit_image_unittest_preserves_inherited_home(tmp_path):
++    result, config = _run(tmp_path, [
++        "tests.tools.test_image_generate_schema.TestDynamicParamGating."
++        "test_krea_3_advertises_edit_wording_and_its_own_controls", "-v",
++    ])
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert "Ran 1 test" in result.stderr
++    assert config.read_text() == SENTINEL
++
++
++@pytest.mark.parametrize("start", [".", "tests"])
++def test_repository_unittest_discovery_refuses_before_test_writes(tmp_path, start):
++    # Restrict RED to the historical writer, not thousands of unrelated tests.
++    result, config = _run(tmp_path, [
++        "discover", "-s", start, "-t", ".", "-p", "test_image_generate_schema.py",
++    ])
++    assert result.returncode != 0, result.stdout + result.stderr
++    assert "scripts/run_tests.sh" in result.stderr
++    assert config.read_text() == SENTINEL
+diff --git a/tests/tools/test_image_generate_schema.py b/tests/tools/test_image_generate_schema.py
+index 5a37018b2c6..d49e3d8ec52 100644
+--- a/tests/tools/test_image_generate_schema.py
++++ b/tests/tools/test_image_generate_schema.py
+@@ -8,6 +8,7 @@ default fails closed to text-only/no-upscale.
+ """
+ import os
+ import sys
++import tempfile
+ import unittest
+ from pathlib import Path
+ from unittest.mock import patch
+@@ -150,12 +151,12 @@ class TestDynamicParamGating(unittest.TestCase):
+         reference cap, and the schema offers Krea 3's controls and none of Krea 2's."""
+         from plugins.image_gen.krea import KreaImageGenProvider
+ 
+-        # The tool and the plugin read the same stored selection, no env override needed.
+-        home = Path(os.environ["HERMES_HOME"])
+-        home.mkdir(parents=True, exist_ok=True)
+-        (home / "config.yaml").write_text("image_gen:\n  provider: nous\n  model: krea-3\n")
+-        props = _build_dynamic_image_schema()["parameters"]["properties"]
+-        cap = KreaImageGenProvider().capabilities()["max_reference_images"]
++        # Own the home even under unittest, which never loads pytest's conftest.
++        with tempfile.TemporaryDirectory(prefix="hermes-image-schema-") as home, \
++             patch.dict(os.environ, {"HERMES_HOME": home}):
++            (Path(home) / "config.yaml").write_text("image_gen:\n  provider: nous\n  model: krea-3\n")
++            props = _build_dynamic_image_schema()["parameters"]["properties"]
++            cap = KreaImageGenProvider().capabilities()["max_reference_images"]
+         self.assertIs(props["image_url"], ig._IMAGE_URL_PARAM)
+         self.assertEqual(props["reference_image_urls"]["maxItems"], cap)
+         self.assertLessEqual({"thinking", "resolution"}, set(props))
+-- 
+2.55.0
+

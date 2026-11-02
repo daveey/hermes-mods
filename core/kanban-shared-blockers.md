@@ -1,6 +1,6 @@
 # Kanban shared blockers: provider scope, clearing evidence and live owners
 
-Original feature: 0141. Follow-ups covered here: **1511–1514, 1523, 1534**.
+Original feature: 0141. Follow-ups covered here: **1511–1514, 1523, 1534, 1557, 1567–1568**.
 Later behavior below supersedes the original rule that a park without the id cleared a wall.
 
 ## Behavior
@@ -235,3 +235,62 @@ unblock-loop triage (`kanban-block-loop-escalation.md`), and the `KANBAN_GUIDANC
 
 Plugin? No. The respawn guard, the block routing and worker-context assembly are dispatcher internals with no
 hook points.
+
+## Follow-up patch (1557): exact pins in blocker route previews
+
+Patch: `patches/1557-fix-kanban-preserve-exact-pins-in-blocker-route-prev.patch` (`cd1354a43d3`, fix(kanban): preserve
+exact pins in blocker route previews).
+
+**Behavior.** For a card with an exact model/provider pin, the shared-blocker route preview now reports the pinned
+route, the same one dispatch uses. Before, the preview applied provider-wall retiering to pinned cards, so a pinned
+card on a walled provider could preview as some other provider and slip past (or wrongly fall under) that
+provider's shared blocker.
+
+**How it works.** `task_route` in `hermes_cli/kanban_shared_blockers.py` skips `retier_for_walls` when the tier
+resolver's reason starts with `pinned` (`pinned`, `pinned+provider_resolved`, `pinned+provider_unresolved`). This
+matches the condition `kanban_model_tier` already uses at dispatch. It is a one-line change.
+
+**Tests.** `tests/hermes_cli/test_kanban_shared_blockers.py::test_pinned_wall_preview_matches_dispatch`, parametrized
+over blocker provider `openai-codex` and `anthropic`. A card pinned to `openai-codex`, with a recorded
+`openai-codex` wall, previews exactly as `apply_model_tier` routes it (`openai-codex`, lane `ready`). The guard
+parks it only behind the `openai-codex` blocker. Untested: the `review` lane and legacy pins without a provider.
+
+## Follow-up patches (1567–1568): shared-blocker sweeps fenced to the card's home gateway
+
+Patches: `patches/1567-daveey-Fence-shared-blocker-sweeps-to-card-home-auth.patch` (`1991ea4a6d0`, Fence shared
+blocker sweeps to card home authority); `patches/1568-daveey-Register-copied-board-fixture-without-importe.patch`
+(`34f09d36616`, test-only fixture fix).
+
+**Behavior.** When a card is synced to a worker node, both gateways hold a copy. Only the card's home gateway (its
+`created_on`) writes the shared clear/release and stranded-probe election. Retained executor copies still run their
+own host-local wake checks, and a wake check's clear evidence reaches home through sync. Provider scope is unchanged.
+
+**How it works.**
+- `release_cleared_blockers` skips ids in `kanban_wake_check.foreign_ids(conn)`, the cards in this file that another
+  gateway created.
+- `probe_stranded_blockers` still ranks every visible blocked candidate oldest-assertion first. If the winner is
+  foreign, it stops (`break`) and leaves the winner's home to act; it does not move on to a local card. Filtering
+  foreign cards out before the election would pick a different probe on each gateway.
+
+**Tests.** `tests/hermes_cli/test_kanban_shared_blockers_copies.py` is a two-gateway test with real stores, pickup,
+leases and sync over the in-memory Board transport (11 cases):
+- `test_only_home_releases_shared_clear_before_sync`: lanes scheduled/blocked/ready/review × either order. The clear
+  evidence comes from a real executor wake check. The worker releases nothing and writes no cleared event. Home
+  releases only scheduled/blocked cards. After sync there is exactly one cleared event, plus one comment where a
+  release happened.
+- `test_only_home_elects_stranded_probe_before_sync` (either order): only home elects. After sync there is one
+  probe-released event.
+- `test_foreign_winner_is_not_filtered_before_election`: a foreign oldest winner on the worker is not replaced by a
+  newer local card.
+
+Patch 1568 only redefines the `gws` fixture locally by wrapping the imported one, so the module no longer shadows an
+imported fixture name. The source owner reported the new cases RED on the old module and GREEN after, and 113
+affected tests passing. I did not run them for this doc.
+
+**Gotchas.** Election is consistent only if both gateways see the same candidate set. Ranking across gateways whose
+visible card sets differ is not globally serialized and is not claimed. A file with no own gateway id has no foreign
+cards (`foreign_ids` returns empty), so single-gateway boards behave as before.
+
+**Applying.** 1557 and 1567–1568 depend on the earlier shared-blocker patches and the worker-node/wake-check series
+(1568 needs `test_kanban_wake_check_home.py` and `test_kanban_worker_node.py`). Apply the full ordered series per the
+README "Applying" section. Standalone application is not certified.

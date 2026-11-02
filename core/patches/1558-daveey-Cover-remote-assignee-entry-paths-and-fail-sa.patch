@@ -1,0 +1,192 @@
+From 9e70ec54cdf2bedaec482d7d2f6e159cb8d87e99 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:54:45 +0000
+Subject: [PATCH] [daveey] Cover remote assignee entry paths and fail safe on
+ unknown labels
+
+---
+ hermes_cli/kanban_model_assignment.py         |  19 ++-
+ hermes_cli/kanban_runs_on_capabilities.py     |   8 +-
+ ...test_kanban_remote_assignee_entry_paths.py | 113 ++++++++++++++++++
+ 3 files changed, 132 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
+
+diff --git a/hermes_cli/kanban_model_assignment.py b/hermes_cli/kanban_model_assignment.py
+index dd2d48473ce..2a6da9ee0e4 100644
+--- a/hermes_cli/kanban_model_assignment.py
++++ b/hermes_cli/kanban_model_assignment.py
+@@ -108,13 +108,20 @@ def _family_mismatch(assignee, model, provider):
+ 
+ 
+ def validate_task_pin(conn, task_id, model, provider):
+-    """``set_model_override``: validate against the card's assignee, then bind a provider-less pin."""
++    """Repinning follows create's execution-host policy, including explicit remote providers."""
+     from hermes_cli.kanban_db import _reject_spaced_pin
+-    from hermes_cli.kanban_pin_provider import resolve_pin_provider
+-
+-    row = conn.execute('SELECT assignee FROM tasks WHERE id = ?', (task_id,)).fetchone()
+-    assignee = row[0] if row else None
+-    validate_model_assignment(assignee, model, provider)
++    from hermes_cli.kanban_pin_provider import require_remote_pin_provider, resolve_pin_provider
++    from hermes_cli.kanban_runs_on_capabilities import runs_elsewhere
++
++    row = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
++    assignee = row['assignee'] if row else None
++    # runs_on is a sync extension: unsynced boards need not have the column.
++    runs_on = row['runs_on'] if row and 'runs_on' in row.keys() else None
++    remote = runs_elsewhere(conn, runs_on)
++    validate_model_assignment(assignee, model, provider, local_profile=not remote)
++    if remote:
++        require_remote_pin_provider(model, provider)
++        return model, provider
+     if not provider:
+         # Same pin-time binding as create_task: resolve against the card's assignee, or refuse.
+         model, provider = resolve_pin_provider(model, None, assignee=assignee)
+diff --git a/hermes_cli/kanban_runs_on_capabilities.py b/hermes_cli/kanban_runs_on_capabilities.py
+index c5aa5c73cc6..fa2f3844543 100644
+--- a/hermes_cli/kanban_runs_on_capabilities.py
++++ b/hermes_cli/kanban_runs_on_capabilities.py
+@@ -153,7 +153,8 @@ def runs_elsewhere(conn, runs_on, *, machines: Optional[Mapping[str, Mapping[str
+     landing dispatcher and :func:`claim_refusal`.
+ 
+     False (keep the local checks) for no ``runs_on``, ``[]`` (any machine), a board that is not a primary, or
+-    labels the registry cannot settle (unreachable). A ``machine:<other>`` label needs no registry: this
++    labels the registry cannot settle (unreachable, empty, or missing this machine's entry).
++    A ``machine:<other>`` label needs no registry: this
+     machine only carries ``machine:<its own name>``."""
+     if runs_on is None:
+         return False
+@@ -176,7 +177,10 @@ def runs_elsewhere(conn, runs_on, *, machines: Optional[Mapping[str, Mapping[str
+         if reg is None:
+             return False
+         pool = reg.get("machines") or {}
+-    return not set(labels) <= wn.effective_labels(pool.get(me), me)
++    # No self entry means unknown labels, not evidence that this machine lacks them.
++    if not pool.get(me):
++        return False
++    return not set(labels) <= wn.effective_labels(pool[me], me)
+ 
+ 
+ def verdict_warning(implementer: str, task) -> dict:
+diff --git a/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py b/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
+new file mode 100644
+index 00000000000..cd1a9d868a2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
+@@ -0,0 +1,113 @@
++"""Remote-only assignment contracts across label discovery, tool/CLI create and repinning."""
++from __future__ import annotations
++
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli.kanban_capabilities import CapabilityMismatchError
++from tests.hermes_cli.test_kanban_requires_placement import _publish
++from tests.hermes_cli.test_kanban_runs_on_remote_assignee import NEEDS, PROFILE, _count
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER
++
++pytest_plugins = ["tests.hermes_cli.test_kanban_requires_placement"]
++
++
++def test_plain_label_remote_profile_creates(gws, monkeypatch):
++    hub, _ = gws
++    machines = {**MACHINES, WORKER: {**MACHINES[WORKER], "labels": ["linux", "gpu"]}}
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": list(machines.values())})
++    _publish(monkeypatch, {WORKER: {PROFILE: set(NEEDS)}})
++    tid = kb.create_task(hub.conn, title="GPU work", assignee=PROFILE, requires=NEEDS, runs_on=["gpu"])
++    assert kb.get_task(hub.conn, tid).assignee == PROFILE
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0]) == ["gpu"]
++
++
++@pytest.mark.parametrize("registry_state", ["unreachable", "empty", "missing-self"])
++def test_unknown_local_labels_keep_local_validation(gws, monkeypatch, registry_state):
++    hub, _ = gws
++    def fetch():
++        if registry_state == "unreachable":
++            raise OSError("Board unavailable")
++        return {"me": HUB, "machines": [] if registry_state == "empty" else [MACHINES[WORKER]]}
++    wn.set_registry_fetch(fetch)
++    _publish(monkeypatch, {WORKER: {PROFILE: set(NEEDS)}})
++    before = _count(hub.conn)
++    with pytest.raises(CapabilityMismatchError, match="does not exist"):
++        kb.create_task(hub.conn, title="GPU work", assignee=PROFILE, requires=NEEDS, runs_on=["gpu"])
++    assert _count(hub.conn) == before
++
++
++def test_heavy_route_remote_only_assignee(gws, monkeypatch):
++    from hermes_cli import kanban_placement as kp
++    from tools import kanban_tools as kt
++    hub, _ = gws
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++    monkeypatch.setattr(kp, "config", lambda: {"heavy_route": {HUB: WORKER}, "assignees": [PROFILE]})
++    _publish(monkeypatch, {WORKER: {PROFILE: set(NEEDS)}})
++    out = json.loads(kt._handle_create({"title": "Run regression tests", "assignee": PROFILE, "requires": NEEDS}))
++    assert not out.get("error"), out
++    assert out["placement"]["why"].startswith("heavy work"), out
++    row = hub.conn.execute("SELECT assignee, runs_on FROM tasks WHERE id=?", (out["task_id"],)).fetchone()
++    assert row[0] == PROFILE and json.loads(row[1]) == [f"machine:{WORKER}"]
++
++
++@pytest.mark.parametrize("remote", [True, False])
++def test_cli_runs_on_remote_only_assignee(gws, monkeypatch, capsys, remote):
++    from hermes_cli import kanban as kc
++    hub, _ = gws
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    _publish(monkeypatch, {WORKER: {PROFILE: set(NEEDS)}})
++    parser = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(parser.add_subparsers())
++    target = WORKER if remote else HUB
++    args = parser.parse_args(["kanban", "create", "CLI work", "--assignee", PROFILE,
++                              "--runs-on", f"machine:{target}", "--requires", "terminal", "--requires", "file",
++                              "--requires", "git", "--json"])
++    before = _count(hub.conn)
++    rc = kc.kanban_command(args)
++    output = capsys.readouterr()
++    if not remote:
++        assert rc == 2 and "does not exist" in output.err
++        assert _count(hub.conn) == before
++        return
++    assert rc == 0, output
++    out = json.loads(output.out)
++    row = hub.conn.execute("SELECT assignee, runs_on FROM tasks WHERE id=?", (out["id"],)).fetchone()
++    assert row[0] == PROFILE and json.loads(row[1]) == [f"machine:{WORKER}"]
++
++
++@pytest.mark.parametrize("remote", [True, False])
++def test_set_model_override_uses_execution_host_policy(gws, monkeypatch, remote):
++    from hermes_cli.kanban_model_assignment import ModelPinNotInRegistryError, ModelProviderMismatchError
++    from hermes_cli.kanban_pin_provider import PinProviderUnresolvedError
++    from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++    hub, _ = gws
++    with open(hub.home / "config.yaml", "a") as fh:
++        fh.write("model:\n  default: claude-sonnet-5-5\n  provider: anthropic\n" + _managed_yaml())
++    hub.enter()
++    _publish(monkeypatch, {WORKER: {"default": set(NEEDS)}})
++    tid = kb.create_task(hub.conn, title="repin", assignee="default", requires=NEEDS,
++                         runs_on=[f"machine:{WORKER if remote else HUB}"])
++    if not remote:
++        with pytest.raises(ModelPinNotInRegistryError):
++            kb.set_model_override(hub.conn, tid, "claude-sonnet-4-5", "anthropic")
++        assert kb.get_task(hub.conn, tid).model_override is None
++        return
++    assert kb.set_model_override(hub.conn, tid, "claude-sonnet-4-5", "anthropic")
++    task = kb.get_task(hub.conn, tid)
++    assert (task.model_override, task.provider_override) == ("claude-sonnet-4-5", "anthropic")
++    with pytest.raises(ModelProviderMismatchError):
++        kb.set_model_override(hub.conn, tid, "gpt-5", "anthropic")
++    monkeypatch.setattr("hermes_cli.models_detect.provider_has_credentials", lambda p: p == "anthropic")
++    with pytest.raises(PinProviderUnresolvedError):
++        kb.set_model_override(hub.conn, tid, "claude-opus-5-5")
++    assert kb.get_task(hub.conn, tid).model_override == "claude-sonnet-4-5"
++    assert kb.set_model_override(hub.conn, tid, "class:deep")
++    assert kb.get_task(hub.conn, tid).provider_override is None
++    assert kb.set_model_override(hub.conn, tid, None)
++    assert kb.get_task(hub.conn, tid).model_override is None
+-- 
+2.55.0
+

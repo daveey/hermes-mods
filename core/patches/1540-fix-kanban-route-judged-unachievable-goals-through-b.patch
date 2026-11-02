@@ -1,0 +1,964 @@
+From ac7f935cd60e253c151b8266b0a0ccc20ed340f9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:47:55 +0000
+Subject: [PATCH] fix(kanban): route judged unachievable goals through bounded
+ recovery [daveey]
+
+---
+ gateway/session_kanban.py                     |   8 +-
+ hermes_cli/cli_single_query.py                |   7 +-
+ hermes_cli/goals.py                           |  12 +-
+ hermes_cli/kanban.py                          |  10 +-
+ hermes_cli/kanban_block_routing.py            |  22 ++
+ hermes_cli/kanban_db.py                       |  20 +-
+ hermes_cli/kanban_db_schedule.py              |   3 +-
+ hermes_cli/kanban_goal_recovery.py            |  99 +++++++++
+ hermes_cli/kanban_resume_exec.py              |   5 +
+ hermes_cli/kanban_resume_requester.py         |  32 ++-
+ hermes_cli/kanban_specify.py                  |  10 +-
+ hermes_cli/kanban_triage_sweep.py             |   3 +-
+ tests/hermes_cli/test_kanban_goal_recovery.py | 123 +++++++++++
+ .../test_kanban_goal_recovery_guards.py       | 202 ++++++++++++++++++
+ .../test_kanban_goal_recovery_selection.py    |  45 ++++
+ tools/kanban_tools.py                         |  30 +--
+ tools/kanban_tools_completion.py              |  31 +++
+ 17 files changed, 615 insertions(+), 47 deletions(-)
+ create mode 100644 hermes_cli/kanban_goal_recovery.py
+ create mode 100644 tests/hermes_cli/test_kanban_goal_recovery.py
+ create mode 100644 tests/hermes_cli/test_kanban_goal_recovery_guards.py
+ create mode 100644 tests/hermes_cli/test_kanban_goal_recovery_selection.py
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index fae7e4f1fc5..eae3b9c3841 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -459,12 +459,18 @@ def _run_task_turns(agent, frame, history, context):
+     from hermes_cli.goals import run_kanban_goal_loop, DEFAULT_MAX_TURNS
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        judged_task = kb.get_task(conn, context['task_id'])
+     def status():
+         with connect_closing() as conn:
+             return kb.goal_run_status(conn, context['task_id'], context['run_id'])
+     def block(reason):
+         with connect_closing() as conn:
+             kb.block_task(conn, context['task_id'], reason=reason, expected_run_id=context['run_id'])
++    def unachievable(reason):
++        from hermes_cli.kanban_goal_recovery import park
++        with connect_closing() as conn:
++            return park(conn, judged_task, reason, expected_run_id=context['run_id'])
+     def turn(prompt):
+         nonlocal result
+         result = agent.run_conversation(prompt, conversation_history=agent._session_db.get_messages_as_conversation(agent.session_id),
+@@ -473,6 +479,6 @@ def _run_task_turns(agent, frame, history, context):
+     from hermes_cli.goals import kanban_goal_loop_turn_result
+     loop = run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=turn,
+         task_status_fn=status, block_fn=block, max_turns=context['goal_max_turns'] or DEFAULT_MAX_TURNS,
+-        first_response=result.get('final_response', ''))
++        first_response=result.get('final_response', ''), unachievable_fn=unachievable)
+     # A broken loop exits non-zero; a parked or dispatcher-owned stop keeps the settled result (rc 0).
+     return kanban_goal_loop_turn_result(result, loop)
+diff --git a/hermes_cli/cli_single_query.py b/hermes_cli/cli_single_query.py
+index cde5caffe80..da43c47483b 100644
+--- a/hermes_cli/cli_single_query.py
++++ b/hermes_cli/cli_single_query.py
+@@ -106,9 +106,14 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None,
+         with _kbc.connect_closing() as c:
+             _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
+ 
++    def _unachievable(reason: str) -> bool:
++        from hermes_cli.kanban_goal_recovery import park
++        with _kbc.connect_closing() as c:
++            return park(c, task, reason, expected_run_id=worker_run_id)
++
+     return _run_loop(
+         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
+-        task_status_fn=_task_status, block_fn=_block,
++        task_status_fn=_task_status, block_fn=_block, unachievable_fn=_unachievable,
+         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
+         log=log or (lambda m: logger.info("%s", m)),
+     )
+diff --git a/hermes_cli/goals.py b/hermes_cli/goals.py
+index 324a66875b1..67c5b917700 100644
+--- a/hermes_cli/goals.py
++++ b/hermes_cli/goals.py
+@@ -1670,6 +1670,7 @@ def run_kanban_goal_loop(
+     max_turns: int = DEFAULT_MAX_TURNS,
+     first_response: str = "",
+     log=None,
++    unachievable_fn=None,
+ ) -> dict[str, Any]:
+     """Drive a kanban worker through a Ralph-style goal loop.
+ 
+@@ -1744,7 +1745,16 @@ def run_kanban_goal_loop(
+             # re-poking an impossible goal, and never let it land in done.
+             # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
+             _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
+-            _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
++            if unachievable_fn is not None:
++                try:
++                    if _parse_failed or not unachievable_fn(reason):
++                        return _result("stopped", "unachievable park refused", failed=True)
++                except Exception as exc:
++                    logger.exception("kanban goal loop: unachievable park failed")
++                    _log(f"kanban goal loop: unachievable park failed ({exc})")
++                    return _result("stopped", "unachievable park failed", failed=True)
++            else:
++                _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
+             return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
+ 
+         if verdict == "done":
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 164c7d0f96d..4408a7693b7 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1174,6 +1174,9 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str,
+ 
+         _logging.getLogger(__name__).warning("goal judge unreachable (%s), allowing lifecycle handoff", reason)
+         return ("done", None)
++    if verdict == 'blocked' and parse_failed:
++        # An unparsed answer is not evidence that can authorize a recovery park.
++        return ('continue', reason)
+     if verdict == 'done' and not parse_failed and verified is not None and handoff_tool == 'kanban_complete':
+         from hermes_cli.kanban_goal_receipt import GoalVerification
+         verified.append(GoalVerification.for_handoff(task, evidence))
+@@ -1186,8 +1189,13 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint:
+     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
+     None to allow."""
+     tool = "kanban_request_review" if handoff.startswith("review") else "kanban_complete"
+-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence, tool, verified=verified)
++    task = kb.get_task(conn, tid)
++    verdict, rejection = _goal_mode_handoff_rejection(task, evidence, tool, verified=verified)
+     if verdict == "blocked":
++        from hermes_cli.kanban_goal_recovery import park
++        if park(conn, task, rejection, expected_run_id=_worker_run_id_for(tid)):
++            return (f"kanban: goal {handoff} of {tid} rejected: {rejection}. "
++                    "Parked in triage for bounded supervisor recovery; acceptance unchanged.")
+         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
+                 f"the goal unachievable — {rejection}. {blocked_hint}")
+     if rejection is not None:
+diff --git a/hermes_cli/kanban_block_routing.py b/hermes_cli/kanban_block_routing.py
+index 95cc8d713d5..2220378e5c3 100644
+--- a/hermes_cli/kanban_block_routing.py
++++ b/hermes_cli/kanban_block_routing.py
+@@ -4,6 +4,22 @@ from __future__ import annotations
+ import sqlite3
+ 
+ 
++def validate_block_request(human_request, kind):
++    """Validate the human request before checking the block-kind vocabulary."""
++    from hermes_cli.kanban_db import VALID_BLOCK_KINDS
++    from hermes_cli.kanban_human_request import validate_human_request
++    human_request = validate_human_request(human_request, kind=kind)
++    if kind is not None and kind not in VALID_BLOCK_KINDS:
++        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
++    return human_request
++
++
++def clear_meta(clear_blocker: bool) -> dict:
++    """Run metadata for an explicit "the shared blocker is gone" park (``kanban_shared_blockers``)."""
++    from hermes_cli.kanban_shared_blockers import CLEAR_FLAG
++    return {CLEAR_FLAG: True} if clear_blocker else {}
++
++
+ def latest_run_blocker(conn: sqlite3.Connection, task_id: str) -> str | None:
+     """Shared blocker the card is still behind: the newest closed run that said anything about
+     it (``kanban_shared_blockers.run_effect``; neutral outcomes and re-parks without the id pass)."""
+@@ -59,6 +75,12 @@ def classify_stop(conn, task_id, kind, reason, blocker_id, *, human_request=None
+     from hermes_cli.kanban_continuation_recovery import is_exhausted_budget_block
+     from hermes_cli.kanban_db import get_task
+ 
++    from hermes_cli.kanban_goal_recovery import valid_receipt
++    task = get_task(conn, task_id)
++    if (kind == 'transient' and human_request is None and task and task.status == 'running'
++            and task.human_request is None
++            and valid_receipt(conn, task_id, task.current_run_id, reason)):
++        return 'transient', 'goal_unachievable', True
+     if is_exhausted_budget_block(conn, task_id, kind, reason):
+         return "transient", "continuation_exhausted", True
+     if kind in {"capability", "assignment"} and (human_request is not None or not blocker_id):
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8eca0b70d24..e0daf93238f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3161,19 +3161,13 @@ def _refuse_untimed_probe(kind: Optional[str], wake_check: Optional[str], clock_
+         "would run it. Use kind='time' to wait on it; for a human ask, put it in human_request.resolved_check.")
+ 
+ 
+-def _clear_meta(clear_blocker: bool) -> dict:
+-    """Run metadata for an explicit "the shared blocker is gone" park (``kanban_shared_blockers``)."""
+-    from hermes_cli.kanban_shared_blockers import CLEAR_FLAG
+-    return {CLEAR_FLAG: True} if clear_blocker else {}
+-
+-
+ def block_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+     blocker_id: Optional[str] = None, wake_check: Optional[str] = None,
+     check_every: Optional[int] = None, clock_only: bool = False,
+     human_request: Optional[dict] = None, awaiting: Any = None, clear_blocker: bool = False,
+-    comment: Optional[tuple[str, str]] = None,
++    comment: Optional[tuple[str, str]] = None, goal_rejection=None,
+     blocker_provider: Optional[str] = None, blocker_model: Optional[str] = None,
+     blocker_lane: Optional[str] = None,
+ ) -> bool:
+@@ -3203,12 +3197,14 @@ def block_task(
+     and only when the block lands (``kanban_reason_comment``).
+     """
+     from hermes_cli.kanban_ask_resolved import filing_fields, store_request, sync_row
+-    from hermes_cli.kanban_human_request import reject_timed_request, validate_human_request
++    from hermes_cli.kanban_human_request import reject_timed_request
++    from hermes_cli.kanban_block_routing import clear_meta, validate_block_request
++    from hermes_cli.kanban_goal_recovery import record_block
+     from hermes_cli.kanban_reason_comment import reason_comment
+-    human_request = validate_human_request(human_request, kind=kind)
+-    if kind is not None and kind not in VALID_BLOCK_KINDS:
+-        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
++    human_request = validate_block_request(human_request, kind)
+     with write_txn(conn), reason_comment(conn, task_id, comment) as noted:
++        if not record_block(conn, task_id, goal_rejection, reason, expected_run_id, kind, human_request):
++            return False
+         cur_row = conn.execute(
+             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+         ).fetchone()
+@@ -3218,7 +3214,7 @@ def block_task(
+         validate_dependency_block(conn, task_id, kind)
+         from hermes_cli import kanban_assignment_routing as assignment_routing
+         from hermes_cli.kanban_blocker_metadata import blocker_metadata
+-        run_meta = blocker_metadata(conn, task_id, reason=reason, metadata=_clear_meta(clear_blocker),
++        run_meta = blocker_metadata(conn, task_id, reason=reason, metadata=clear_meta(clear_blocker),
+                                     blocker_id=blocker_id, blocker_provider=blocker_provider,
+                                     blocker_model=blocker_model, blocker_lane=blocker_lane)
+         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index ba2ec9e3127..fc8b54a7486 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -70,8 +70,9 @@ def schedule_task(
+             return False
+         # A card behind a shared blocker stays behind it: a park without the id says nothing about
+         # the wall (kanban_shared_blockers.run_effect) unless ``clear_blocker`` says it is gone.
++        from hermes_cli.kanban_block_routing import clear_meta
+         from hermes_cli.kanban_blocker_metadata import blocker_metadata
+-        meta = blocker_metadata(conn, task_id, reason=reason, metadata=_kb._clear_meta(clear_blocker),
++        meta = blocker_metadata(conn, task_id, reason=reason, metadata=clear_meta(clear_blocker),
+                                 blocker_id=blocker_id, blocker_provider=blocker_provider,
+                                 blocker_model=blocker_model, blocker_lane=blocker_lane)
+         run_id = _kb._end_or_synthesize_run(
+diff --git a/hermes_cli/kanban_goal_recovery.py b/hermes_cli/kanban_goal_recovery.py
+new file mode 100644
+index 00000000000..09c3fbc86da
+--- /dev/null
++++ b/hermes_cli/kanban_goal_recovery.py
+@@ -0,0 +1,99 @@
++"""Kernel-only goal-unachievable receipts and run-owned triage parks.
++
++Worker block metadata is not judge evidence. Only the judge entry points call
++``park``; its snapshot and ownership checks run in the same transaction as block.
++"""
++from dataclasses import dataclass
++from hermes_cli.kanban_goal_receipt import digest, subject
++
++EVENT = 'goal_unachievable'
++
++
++@dataclass(frozen=True)
++class GoalRejection:
++    snapshot: str
++
++
++def park(conn, task, reason, *, expected_run_id):
++    from hermes_cli import kanban_db as kb
++    if not task or expected_run_id is None:
++        return False
++    return kb.block_task(conn, task.id, kind='transient', reason=reason,
++                         expected_run_id=expected_run_id,
++                         goal_rejection=GoalRejection(digest(subject(task, reason))))
++
++
++def record_block(conn, task_id, proof, reason, expected_run_id, kind, human_request):
++    """Validate an optional rejection before the enclosing block transition."""
++    if proof is None:
++        return True
++    return (kind == 'transient' and human_request is None
++            and record(conn, task_id, proof, reason, expected_run_id))
++
++
++def record(conn, task_id, proof, reason, expected_run_id):
++    """Called only inside block_task's transaction, before any transition."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_continuation import HUMAN_BLOCK_KINDS
++    current = kb.get_task(conn, task_id)
++    if (not current or not current.goal_mode or current.status != 'running'
++            or expected_run_id is None or current.current_run_id != expected_run_id
++            or current.human_request is not None or current.block_kind in HUMAN_BLOCK_KINDS
++            or not isinstance(proof, GoalRejection)
++            or proof.snapshot != digest(subject(current, reason))):
++        return False
++    kb._append_event(conn, task_id, EVENT,
++                     {'subject': subject(current, reason), 'snapshot': proof.snapshot},
++                     run_id=expected_run_id)
++    return True
++
++
++def valid_receipt(conn, task_id, run_id, reason, *, before=None):
++    """Match the kernel receipt to this run, goal, and exact judge reason."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_resume_exec import _payload
++
++    task = kb.get_task(conn, task_id)
++    if not task or not task.goal_mode or run_id is None:
++        return False
++    row = conn.execute(
++        'SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
++        'ORDER BY id DESC LIMIT 1', (task_id, run_id, EVENT)).fetchone()
++    if not row or (before is not None and row[0] >= before):
++        return False
++    data = _payload(row[1])
++    expected = {**subject(task, reason), 'run_id': run_id, 'status': 'running'}
++    return data.get('subject') == expected and data.get('snapshot') == digest(expected)
++
++
++def recovery_assignee(task):
++    """Reuse a configured, capable profile; never manufacture a privileged worker."""
++    from pathlib import Path
++    from hermes_cli.config import load_config_readonly
++    from hermes_cli.config_backend import config_exists
++    from hermes_cli.profiles import resolve_profile_env
++    from hermes_cli.kanban_capabilities import validate_assignment, queue_assignees
++
++    cfg = load_config_readonly()
++    candidates = [task.assignee, (cfg.get('kanban') or {}).get('orchestrator_profile'), 'default']
++    queues = queue_assignees()
++    for name in dict.fromkeys(candidates):
++        if not isinstance(name, str) or not name or name in queues:
++            continue
++        try:
++            if not config_exists(Path(resolve_profile_env(name)) / 'config.yaml'):
++                continue
++            validate_assignment(name, requires=['terminal', 'file', 'kanban'], workspace_kind='scratch')
++        except (ValueError, OSError):
++            continue
++        return name
++    return None
++
++
++def current_park(conn, task_id):
++    """Keep judged goals out of generic triage re-entry, even after recovery ends."""
++    from hermes_cli.kanban_resume_exec import _payload
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
++        (task_id,)).fetchone()
++    return bool(row and _payload(row[0]).get('rekind_reason') == EVENT)
+diff --git a/hermes_cli/kanban_resume_exec.py b/hermes_cli/kanban_resume_exec.py
+index 68a1fab4d53..9e878fdc8b8 100644
+--- a/hermes_cli/kanban_resume_exec.py
++++ b/hermes_cli/kanban_resume_exec.py
+@@ -134,6 +134,11 @@ def exhaustion_refusal(conn: sqlite3.Connection, target: str) -> Optional[str]:
+         f"SELECT id, kind, run_id, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+         "ORDER BY id DESC LIMIT 1", (target, *_LIFECYCLE_KINDS)).fetchone()
+     payload = _payload(last[3]) if last else {}
++    if last and last[1] == 'blocked' and payload.get('rekind_reason') == 'goal_unachievable':
++        from hermes_cli.kanban_goal_recovery import valid_receipt
++        if valid_receipt(conn, target, last[2], payload.get('reason'), before=last[0]):
++            return None
++        return f"{target}'s goal-unachievable park lacks a valid current-run kernel receipt"
+     if not last or last[1] != "blocked" or payload.get("rekind_reason") != "continuation_exhausted":
+         return (f"{target}'s current park is not a continuation_exhausted block "
+                 f"(newest lifecycle event: {last[1] if last else 'none'})")
+diff --git a/hermes_cli/kanban_resume_requester.py b/hermes_cli/kanban_resume_requester.py
+index bc29d1c0867..d87ec80e3e0 100644
+--- a/hermes_cli/kanban_resume_requester.py
++++ b/hermes_cli/kanban_resume_requester.py
+@@ -55,11 +55,29 @@ def _body(target: str, title: str, park_id: int) -> str:
+     )
+ 
+ 
++def _goal_body(target: str, title: str, park_id: int) -> str:
++    return (
++        f"The kernel judged {target} ({title!r}) goal_unachievable (park event {park_id}). "
++        "Investigate its judge receipt, runs and evidence with kanban_show. Diagnose and remedy "
++        "the missing prerequisite using existing tools and authorized owners. Preserve the original "
++        "body, acceptance criteria, dependency graph, mandatory model/provider pins and subscription "
++        "billing policy. Do not invent profiles or use paid credentials as a workaround.\n\n"
++        "Only after proving the prerequisite repaired, file "
++        f'kanban_supervisor_request(ops=[{{"op":"resume","task_id":"{target}"}}], '
++        'reason="<repair evidence>"). The non-worker executor rechecks ownership, freshness, human '
++        "gates and the two-resume lifetime bound. Read back its receipt and the target status. "
++        "Never use raw board mutations, edit model pins, weaken acceptance, or complete/archive "
++        "the original. If not repaired, leave it parked and record the concrete unresolved cause; "
++        "do not resume speculatively or create another recovery loop. Complete this recovery card "
++        "only with the investigation/remediation evidence and resume receipt (or why it remains parked)."
++    )
++
++
+ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+     return conn.execute(
+         "SELECT id, title, assignee, tenant, created_by FROM tasks "
+         "WHERE status IN ('triage', 'blocked') AND current_run_id IS NULL AND human_request IS NULL "
+-        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = tasks.id AND e.kind = 'continuation_exhausted')"
++        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = tasks.id AND e.kind IN ('continuation_exhausted', 'goal_unachievable'))"
+     ).fetchall()
+ 
+ 
+@@ -103,9 +121,17 @@ def ensure_recovery_cards(conn: sqlite3.Connection) -> list[str]:
+         if _event_for_park(conn, target, park_id) or len(rx._resume_events(conn, target)) >= rx.MAX_RESUMES:
+             continue
+         try:
++            from hermes_cli.kanban_goal_recovery import current_park, recovery_assignee
++            task = kb.get_task(conn, target)
++            goal = current_park(conn, target)
++            assignee = recovery_assignee(task) if goal else row['assignee'] or 'default'
++            if not assignee:
++                continue
+             rec = kb.create_task(
+-                conn, title=f"Recover {target}: continuation budget exhausted"[:200],
+-                body=_body(target, row["title"] or "", park_id), assignee=row["assignee"] or "default",
++                conn, title=f"Recover {target}: {'goal unachievable' if goal else 'continuation budget exhausted'}"[:200],
++                body=(_goal_body if goal else _body)(target, row["title"] or "", park_id), assignee=assignee,
++                model_override=task.model_override, provider_override=task.provider_override,
++                requires=['terminal', 'file', 'kanban'] if goal else None,
+                 created_by=CREATED_BY, workspace_kind="scratch", tenant=row["tenant"],
+                 idempotency_key=_key(target, park_id), creator_task_id=target,
+             )
+diff --git a/hermes_cli/kanban_specify.py b/hermes_cli/kanban_specify.py
+index eefb9204675..60595259dc2 100644
+--- a/hermes_cli/kanban_specify.py
++++ b/hermes_cli/kanban_specify.py
+@@ -125,8 +125,12 @@ def _profile_author(default: str = "specifier") -> str:
+ 
+ def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
+     """``(task, "")`` when the task exists and is in triage, else ``(None, reason)``."""
++    from hermes_cli.kanban_goal_recovery import current_park
++
+     with kbc.connect_closing() as conn:
+         task = kb.get_task(conn, task_id)
++        if task is not None and task.status == "triage" and current_park(conn, task_id):
++            return None, "goal_unachievable park requires bounded supervisor recovery"
+     if task is None:
+         return None, "unknown task id"
+     if task.status != "triage":
+@@ -235,7 +239,9 @@ def specify_task(
+ 
+ 
+ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
+-    """Task ids in the triage column; ``tenant`` narrows the sweep."""
++    """Task ids eligible for specification; ``tenant`` narrows the sweep."""
++    from hermes_cli.kanban_goal_recovery import current_park
++
+     with kbc.connect_closing() as conn:
+         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
+-    return [t.id for t in tasks]
++        return [t.id for t in tasks if not current_park(conn, t.id)]
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index c6580590235..4bcc481ba7e 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -119,8 +119,9 @@ def sweep_stale_triage(
+         (cutoff, *TRIAGE_ENTRY_EVENTS, *TRIAGE_ENTRY_EVENTS),
+     ).fetchall()
+     from hermes_cli.kanban_resume_requester import open_recovery_card
++    from hermes_cli.kanban_goal_recovery import current_park
+     for row in rows:
+-        if row["human_request"] or open_recovery_card(conn, row["id"]):
++        if row["human_request"] or open_recovery_card(conn, row["id"]) or current_park(conn, row['id']):
+             continue  # a human owns it, or its kernel recovery card is its producer
+         recent = conn.execute(
+             "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'triage_swept' AND created_at > ?",
+diff --git a/tests/hermes_cli/test_kanban_goal_recovery.py b/tests/hermes_cli/test_kanban_goal_recovery.py
+new file mode 100644
+index 00000000000..c0410b67b21
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_goal_recovery.py
+@@ -0,0 +1,123 @@
++"""Goal judge parks use bounded supervisor recovery, never human asks."""
++from pathlib import Path
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_resume_exec as rx, kanban_resume_requester as rr
++from hermes_cli import kanban_triage_sweep as ts
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / '.hermes'
++    home.mkdir()
++    (home / 'config.yaml').write_text('model:\n  provider: openai-codex\n  default: gpt-5\n')
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(home))
++    for key in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_SESSION_ID'):
++        monkeypatch.delenv(key, raising=False)
++    kb._INITIALIZED_PATHS.clear()
++    assert kb.kanban_db_path().is_relative_to(tmp_path)
++    kb.init_db()
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='Deliver exact goal', body='Acceptance must stay fixed.',
++                             assignee='default', goal_mode=True)
++        assert kb.claim_task(conn, tid)
++        yield conn, tid, kb.get_task(conn, tid)
++
++
++@pytest.mark.parametrize('entry', ['kanban_complete', 'kanban_request_review'])
++def test_judge_park_creates_fresh_bounded_requester_without_changing_goal(board, monkeypatch, entry):
++    from tools import kanban_tools as kt
++    conn, tid, task = board
++    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(task.current_run_id))
++    monkeypatch.setattr(kt, '_goal_judge_available', lambda: True)
++    monkeypatch.setattr(kt, 'judge_goal', lambda **kw: ('blocked', 'Prerequisite unavailable', False, None, False))
++    with pytest.raises(kt._Reject):
++        kt._goal_gate(entry, task, tid, 'evidence')
++    parked = kb.get_task(conn, tid)
++    assert parked.status == 'triage'
++    assert parked.human_request is None and parked.current_run_id is None
++    assert parked.body == task.body
++    events = kb.list_events(conn, tid)
++    assert any(e.kind == 'goal_unachievable' and e.run_id == task.current_run_id for e in events)
++    assert next(e for e in reversed(events) if e.kind == 'blocked').payload['rekind_reason'] == 'goal_unachievable'
++    monkeypatch.delenv('HERMES_KANBAN_TASK')
++    monkeypatch.delenv('HERMES_KANBAN_RUN_ID')
++    cards = rr.ensure_recovery_cards(conn)
++    assert len(cards) == 1
++    assert rr.ensure_recovery_cards(conn) == []
++    assert rx.refusal(conn, cards[0], tid) is None
++    assert ts.sweep_stale_triage(conn, now=10**10) == []
++    assert kb.get_task(conn, tid).body == task.body
++
++
++@pytest.mark.parametrize('handoff', ['completion', 'review handoff'])
++def test_cli_gate_parks(board, monkeypatch, handoff):
++    from hermes_cli import kanban, goals
++    from agent import auxiliary_client
++    conn, tid, task = board
++    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(task.current_run_id))
++    monkeypatch.setattr(auxiliary_client, 'get_text_auxiliary_client', lambda *a: (object(), 'judge'))
++    monkeypatch.setattr(goals, 'judge_goal', lambda **kw: ('blocked', 'missing prerequisite', False, None, False))
++    assert kanban._goal_gate_error(conn, tid, 'evidence', handoff, 'block', 'continue')
++    assert kb.get_task(conn, tid).status == 'triage'
++
++
++@pytest.mark.parametrize('surface', ['cli', 'gateway'])
++def test_goal_loop_blocked_callback_parks(board, monkeypatch, surface):
++    from types import SimpleNamespace
++    from hermes_cli import goals
++    conn, tid, task = board
++    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(task.current_run_id))
++    monkeypatch.setenv('HERMES_KANBAN_GOAL_MODE', '1')
++    monkeypatch.setattr(goals, 'judge_goal', lambda *a, **kw: ('blocked', 'missing prerequisite', False, None, False))
++    if surface == 'cli':
++        from hermes_cli.cli_single_query import _run_kanban_goal_loop_q
++        _run_kanban_goal_loop_q(SimpleNamespace(), 'evidence', run_turn=lambda _: '')
++    else:
++        from gateway.session_kanban import _run_task_turns
++        agent = SimpleNamespace(session_id='test', run_conversation=lambda *a, **kw: {'final_response': 'evidence'})
++        _run_task_turns(agent, {'text': 'work'}, [], dict(skills=[], context='', task_id=tid,
++                        run_id=task.current_run_id, goal_mode=True, goal_text=task.body, goal_max_turns=3))
++    assert kb.get_task(conn, tid).status == 'triage'
++    assert rx.exhaustion_refusal(conn, tid) is None
++
++
++def test_goal_recovery_pins_and_no_triage_cycle_after_two_resumes(board, monkeypatch):
++    from hermes_cli.kanban_goal_recovery import park
++    from hermes_cli import kanban_supervisor_requests as ksr
++    conn, tid, task = board
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET model_override=?, provider_override=? WHERE id=?', ('gpt-5', 'openai-codex', tid))
++    for attempt in range(3):
++        task = kb.get_task(conn, tid)
++        assert park(conn, task, 'prerequisite unavailable', expected_run_id=task.current_run_id)
++        cards = rr.ensure_recovery_cards(conn)
++        if attempt == 2:
++            assert cards == []
++            assert ts.sweep_stale_triage(conn, now=10**10) == []
++            break
++        rec = kb.get_task(conn, cards[0])
++        assert (rec.model_override, rec.provider_override) == ('gpt-5', 'openai-codex')
++        assert 'prerequisite' in rec.body and 'acceptance' in rec.body
++        assert rx.refusal(conn, rec.id, tid) is None
++        assert kb.claim_task(conn, rec.id)
++        monkeypatch.setenv('HERMES_KANBAN_TASK', rec.id)
++        monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(kb.get_task(conn, rec.id).current_run_id))
++        import json
++        from tools import kanban_tools as kt
++        from hermes_cli import kanban_db_dispatch as dispatch
++        out = json.loads(kt._handle_supervisor_request({'ops': [{'op': 'resume', 'task_id': tid}],
++                                                       'reason': 'Prerequisite repaired and verified'}))
++        assert out['ok'], out
++        monkeypatch.delenv('HERMES_KANBAN_TASK')
++        monkeypatch.delenv('HERMES_KANBAN_RUN_ID')
++        assert dispatch.dispatch_once(conn, max_spawn=0).supervisor_requests == [(out['request_id'], 'done')]
++        assert ksr.get_request(conn, out['request_id'])['result'][0]['outcome'] == 'applied'
++        assert kb.claim_task(conn, tid)
++    assert kb.get_task(conn, tid).body == task.body
+diff --git a/tests/hermes_cli/test_kanban_goal_recovery_guards.py b/tests/hermes_cli/test_kanban_goal_recovery_guards.py
+new file mode 100644
+index 00000000000..559630a8e8a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_goal_recovery_guards.py
+@@ -0,0 +1,202 @@
++"""Safety and route contracts on an isolated board."""
++from dataclasses import replace
++import pytest
++from tests.hermes_cli.test_kanban_goal_recovery import board as board  # noqa: PLC0414 -- pytest fixture re-export
++from hermes_cli import kanban_db as kb, kanban_resume_exec as rx, kanban_resume_requester as rr
++from hermes_cli.kanban_goal_recovery import park, GoalRejection, recovery_assignee
++
++
++@pytest.mark.parametrize('defect', ['missing_run', 'stale_run', 'non_goal', 'human', 'forged', 'changed_goal'])
++def test_receipt_refuses_invalid_ownership_or_subject(board, defect):
++    conn, tid, task = board
++    run = task.current_run_id
++    if defect == 'missing_run':
++        run = None
++    elif defect == 'stale_run':
++        run += 1
++    elif defect in ('non_goal', 'human', 'changed_goal'):
++        sql = {'non_goal': 'goal_mode=0', 'human': "human_request='{}'",
++               'changed_goal': "body='Changed acceptance'"}[defect]
++        with kb.write_txn(conn):
++            conn.execute(f'UPDATE tasks SET {sql} WHERE id=?', (tid,))
++    if defect == 'forged':
++        assert not kb.block_task(conn, tid, kind='transient', reason='unavailable',
++                                 expected_run_id=run, goal_rejection=GoalRejection('forged'))
++    else:
++        assert not park(conn, task, 'unavailable', expected_run_id=run)
++    assert kb.get_task(conn, tid).status == 'running'
++    assert not any(e.kind == 'goal_unachievable' for e in kb.list_events(conn, tid))
++
++
++@pytest.mark.parametrize('defect', ['missing', 'forged', 'stale'])
++def test_resume_denies_invalid_receipt(board, defect):
++    conn, tid, task = board
++    assert park(conn, task, 'unavailable', expected_run_id=task.current_run_id)
++    with kb.write_txn(conn):
++        if defect == 'missing':
++            conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='goal_unachievable'", (tid,))
++        elif defect == 'forged':
++            conn.execute("UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='goal_unachievable'", (tid,))
++        else:
++            conn.execute("UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='goal_unachievable'", (tid,))
++    assert 'receipt' in rx.exhaustion_refusal(conn, tid)
++    assert rr.ensure_recovery_cards(conn) == []
++
++
++@pytest.mark.parametrize('surface', ['cli', 'tool'])
++def test_unparsed_blocked_judge_never_creates_receipt(board, monkeypatch, surface):
++    from hermes_cli import kanban, goals
++    from agent import auxiliary_client
++    from tools import kanban_tools as kt
++    conn, tid, task = board
++    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(task.current_run_id))
++    monkeypatch.setattr(auxiliary_client, 'get_text_auxiliary_client', lambda *a: (object(), 'judge'))
++    monkeypatch.setattr(kt, '_goal_judge_available', lambda: True)
++    def judge(*a, **kw):
++        return 'blocked', 'unparsed', True, None, False
++    monkeypatch.setattr(goals, 'judge_goal', judge)
++    monkeypatch.setattr(kt, 'judge_goal', judge)
++    if surface == 'cli':
++        assert kanban._goal_gate_error(conn, tid, 'evidence', 'completion', 'block', 'continue')
++    else:
++        with pytest.raises(kt._Reject):
++            kt._goal_gate('kanban_complete', task, tid, 'evidence', conn=conn)
++    assert kb.get_task(conn, tid).status == 'running'
++    assert not any(e.kind == 'goal_unachievable' for e in kb.list_events(conn, tid))
++
++
++@pytest.mark.parametrize('fallback', ['default', 'orchestrator', 'none'])
++def test_recovery_route_validates_existing_profiles(board, monkeypatch, tmp_path, fallback):
++    from hermes_cli import config
++    _conn, _tid, task = board
++    task = replace(task, assignee='missing-profile')
++    cfg = {'kanban': {'orchestrator_profile': 'supervisor'}}
++    monkeypatch.setattr(config, 'load_config_readonly', lambda: cfg)
++    if fallback == 'orchestrator':
++        home = tmp_path / '.hermes' / 'profiles' / 'supervisor'
++        home.mkdir(parents=True)
++        (home / 'config.yaml').write_text('platform_toolsets:\n  cli: [terminal, file, kanban]\n')
++    elif fallback == 'none':
++        (tmp_path / '.hermes' / 'config.yaml').write_text('agent:\n  disabled_toolsets: [terminal, file, kanban]\n')
++    assert recovery_assignee(task) == {'default': 'default', 'orchestrator': 'supervisor', 'none': None}[fallback]
++
++
++@pytest.mark.parametrize('surface', ['cli', 'tool'])
++@pytest.mark.parametrize('handoff', ['complete', 'request_review'])
++@pytest.mark.parametrize('judgment', ['blocked', 'parse_failed', 'transport_failed', 'absent'])
++def test_handoff_entry_receipt_contract(board, monkeypatch, surface, handoff, judgment):
++    import argparse
++    import json
++    from hermes_cli import kanban, goals
++    from tools import kanban_tools as kt
++    from tools.registry import registry
++
++    conn, tid, task = board
++    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(task.current_run_id))
++    monkeypatch.setattr('agent.auxiliary_client.get_text_auxiliary_client',
++                        lambda *a: (None, None) if judgment == 'absent' else (object(), 'judge'))
++    monkeypatch.setattr(kt, '_goal_judge_available', lambda: judgment != 'absent')
++    def judge(*a, **kw):
++        return 'blocked', 'missing prerequisite', judgment == 'parse_failed', None, judgment == 'transport_failed'
++    monkeypatch.setattr(goals, 'judge_goal', judge)
++    monkeypatch.setattr(kt, 'judge_goal', judge)
++    if surface == 'cli':
++        args = argparse.Namespace(task_ids=[tid], task_id=tid, summary='evidence', result=None, metadata=None)
++        rc = getattr(kanban, '_cmd_' + handoff)(args)
++        assert (rc != 0) == (judgment in ('blocked', 'parse_failed'))
++    else:
++        result = json.loads(registry.get_entry('kanban_' + handoff).handler({'task_id': tid, 'summary': 'evidence'}))
++        assert bool(result.get('error')) == (judgment in ('blocked', 'parse_failed')), result
++    expected = {'blocked': 'triage', 'parse_failed': 'running'}.get(
++        judgment, 'done' if handoff == 'complete' else 'review')
++    assert kb.get_task(conn, tid).status == expected
++    receipts = [e for e in kb.list_events(conn, tid) if e.kind == 'goal_unachievable']
++    assert len(receipts) == (1 if judgment == 'blocked' else 0)
++    assert kb.get_task(conn, tid).body == task.body
++
++
++@pytest.mark.parametrize('surface', ['cli', 'gateway'])
++@pytest.mark.parametrize('failure', ['parse', 'transport', 'changed_goal'])
++def test_loop_failures_never_mint_receipts(board, monkeypatch, surface, failure):
++    from types import SimpleNamespace
++    from hermes_cli import goals
++    conn, tid, task = board
++    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(task.current_run_id))
++    def judge(*a, **kw):
++        if failure == 'changed_goal':
++            with kb.write_txn(conn):
++                conn.execute('UPDATE tasks SET body=? WHERE id=?', ('New acceptance', tid))
++        return 'blocked', 'missing prerequisite', failure == 'parse', None, failure == 'transport'
++    monkeypatch.setattr(goals, 'judge_goal', judge)
++    if surface == 'cli':
++        from hermes_cli.cli_single_query import _run_kanban_goal_loop_q
++        out = _run_kanban_goal_loop_q(SimpleNamespace(), 'evidence', run_turn=lambda _: '')
++    else:
++        from gateway.session_kanban import _run_task_turns
++        agent = SimpleNamespace(session_id='test', run_conversation=lambda *a, **kw: {'final_response': 'evidence'})
++        out = _run_task_turns(agent, {'text': 'work'}, [], dict(skills=[], context='', task_id=tid,
++                              run_id=task.current_run_id, goal_mode=True, goal_text=task.body, goal_max_turns=3))
++    assert out['failed']
++    assert kb.get_task(conn, tid).status == 'running'
++    assert not any(e.kind == 'goal_unachievable' for e in kb.list_events(conn, tid))
++
++
++@pytest.mark.parametrize('change', ['human', 'acceptance', 'lifecycle'])
++def test_goal_resume_rechecks_target_after_request(board, monkeypatch, change):
++    import json
++    from hermes_cli import kanban_supervisor_requests as ksr
++    from tools import kanban_tools as kt
++    conn, tid, task = board
++    assert park(conn, task, 'missing prerequisite', expected_run_id=task.current_run_id)
++    recovery, = rr.ensure_recovery_cards(conn)
++    assert kb.claim_task(conn, recovery)
++    monkeypatch.setenv('HERMES_KANBAN_TASK', recovery)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(kb.get_task(conn, recovery).current_run_id))
++    out = json.loads(kt._handle_supervisor_request({'ops': [{'op': 'resume', 'task_id': tid}], 'reason': 'Repaired'}))
++    assert out['ok'], out
++    monkeypatch.delenv('HERMES_KANBAN_TASK')
++    monkeypatch.delenv('HERMES_KANBAN_RUN_ID')
++    with kb.write_txn(conn):
++        if change == 'human':
++            conn.execute("UPDATE tasks SET human_request='{}' WHERE id=?", (tid,))
++        elif change == 'acceptance':
++            conn.execute("UPDATE tasks SET body='Changed acceptance' WHERE id=?", (tid,))
++        else:
++            kb._append_event(conn, tid, 'reopened', {})
++    req = ksr.get_request(conn, out['request_id'])
++    assert rx.execute(conn, req, 'test-executor') == 'rejected'
++    assert kb.get_task(conn, tid).status == 'triage'
++    assert not rx._resume_events(conn, tid)
++
++
++def test_no_eligible_recovery_profile_keeps_goal_parked(board, tmp_path):
++    conn, tid, task = board
++    (tmp_path / '.hermes' / 'config.yaml').write_text('agent:\n  disabled_toolsets: [terminal, file, kanban]\n')
++    assert park(conn, task, 'missing prerequisite', expected_run_id=task.current_run_id)
++    assert rr.ensure_recovery_cards(conn) == []
++    assert kb.get_task(conn, tid).status == 'triage'
++    from hermes_cli import kanban_triage_sweep
++    assert kanban_triage_sweep.sweep_stale_triage(conn, now=10**10) == []
++
++
++def test_goal_resume_preserves_dependency_gate(board):
++    from hermes_cli import kanban_supervisor_requests as ksr
++    conn, tid, task = board
++    assert park(conn, task, 'missing prerequisite', expected_run_id=task.current_run_id)
++    recovery, = rr.ensure_recovery_cards(conn)
++    parent = kb.create_task(conn, title='Prerequisite owner', assignee='default')
++    kb.link_tasks(conn, parent, tid)
++    edges = list(conn.execute('SELECT parent_id, child_id FROM task_links'))
++    assert kb.claim_task(conn, recovery)
++    requester = kb.get_task(conn, recovery)
++    assert requester is not None
++    request = ksr.submit(conn, env_task=recovery, env_run=str(requester.current_run_id),
++                         ops=[{'op': 'resume', 'task_id': tid}], reason='Repaired')
++    assert rx.execute(conn, ksr.get_request(conn, request['request_id']), 'test-executor') == 'done'
++    assert kb.get_task(conn, tid).status == 'todo'
++    assert list(conn.execute('SELECT parent_id, child_id FROM task_links')) == edges
++    assert kb.claim_task(conn, tid) is None
++
+diff --git a/tests/hermes_cli/test_kanban_goal_recovery_selection.py b/tests/hermes_cli/test_kanban_goal_recovery_selection.py
+new file mode 100644
+index 00000000000..233dc8382e3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_goal_recovery_selection.py
+@@ -0,0 +1,45 @@
++"""Generic triage entry points cannot bypass a judged goal's recovery budget."""
++from unittest.mock import Mock
++
++from hermes_cli import kanban_db as kb, kanban_specify as spec
++from hermes_cli.kanban_goal_recovery import park
++from tests.hermes_cli.test_kanban_goal_recovery import board as board  # noqa: PLC0414 -- pytest fixture re-export
++
++
++def test_individual_specify_refuses_parked_goal_before_aux(board, monkeypatch):
++    conn, tid, task = board
++    assert park(conn, task, 'missing prerequisite', expected_run_id=task.current_run_id)
++    before = kb.get_task(conn, tid)
++    events = kb.list_events(conn, tid)
++    aux = Mock(return_value=('{"title":"Replacement", "body":"Weaker acceptance"}', ''))
++    monkeypatch.setattr(spec, '_call_aux', aux)
++
++    outcome = spec.specify_task(tid, author='operator')
++
++    assert not outcome.ok
++    assert 'goal_unachievable' in outcome.reason
++    aux.assert_not_called()
++    assert kb.get_task(conn, tid) == before
++    assert kb.list_events(conn, tid) == events
++
++
++def test_specify_all_selection_excludes_parked_goal(board):
++    conn, _tid, task = board
++    assert park(conn, task, 'missing prerequisite', expected_run_id=task.current_run_id)
++    fresh = kb.create_task(conn, title='Rough idea', triage=True)
++
++    assert spec.list_triage_ids() == [fresh]
++
++
++def test_auto_decompose_selection_excludes_previously_run_goal(board):
++    from hermes_cli import kanban_decompose as decomp
++
++    conn, tid, task = board
++    assert park(conn, task, 'missing prerequisite', expected_run_id=task.current_run_id)
++    fresh = kb.create_task(conn, title='New goal', triage=True, goal_mode=True)
++
++    assert 'already run' in (kb.decomposition_refusal(conn, tid) or '')
++    assert decomp.list_triage_ids(skip_awaiting_human=True) == [fresh]
++    parked = kb.get_task(conn, tid)
++    assert parked is not None
++    assert parked.body == task.body
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8f209e58dba..eb327f84096 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -594,27 +594,7 @@ def _goal_judge_available() -> bool:
+     return client is not None and bool(model)
+ 
+ 
+-# Per-tool guidance for a judge rejection: verdict -> message. ``{reason}``/``{tid}`` are filled in.
+-_GOAL_GATE_MESSAGES = {
+-    "kanban_complete": {
+-        "blocked": (
+-            "Goal completion rejected: judge ruled the goal unachievable — {reason}. The task "
+-            "will NOT complete silently. Either re-scope the task with kanban_edit, or record "
+-            "the block with kanban_block and hand the decision to a human / reviewer."),
+-        "continue": (
+-            "Goal completion rejected by judge: {reason}. To proceed, either: (1) provide "
+-            "explicit acceptance evidence in your summary matching the task's criteria, or (2) "
+-            "create continuation tasks with parents=[{tid}] and keep this task alive.")},
+-    "kanban_request_review": {
+-        "blocked": (
+-            "Goal review handoff rejected: judge ruled the goal unachievable — {reason}. "
+-            "Record the block with kanban_block instead of requesting review."),
+-        "continue": (
+-            "Goal review handoff rejected by judge: {reason}. Provide acceptance evidence "
+-            "matching the card before requesting review.")}}
+-
+-
+-def _goal_gate(tool_name: str, task, tid: str, evidence: str):
++def _goal_gate(tool_name: str, task, tid: str, evidence: str, *, conn=None):
+     """Goal-mode pre-handoff judge gate: a worker must not complete / request
+     review before acceptance criteria are met. ``blocked`` gets its own
+     guidance; any other non-``done`` verdict gets the ``continue`` guidance.
+@@ -647,8 +627,10 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str):
+             return
+         from hermes_cli.kanban_goal_receipt import GoalVerification
+         return GoalVerification.for_handoff(task, evidence)
++    if verdict == 'blocked' and not parse_failed:
++        _kc.park_unachievable(task, tid, reason, conn)
+     key = "blocked" if verdict == "blocked" else "continue"
+-    raise _Reject(_GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid), "goal_judge")
++    raise _Reject(_kc.GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid), "goal_judge")
+ 
+ 
+ # --- Runtime-activity → board bridges (auto-heartbeat, live comment injection) ---
+@@ -975,7 +957,7 @@ def _handle_complete(args: dict, **kw) -> str:
+         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
+         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
+         task = kb.get_task(conn, tid)
+-        goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
++        goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(), conn=conn)
+         try:
+             run_id = _worker_run_id(tid)
+             if run_id is not None and _kc.parked_by_own_run(conn, tid, run_id):
+@@ -1370,7 +1352,7 @@ def _handle_request_review(args: dict, **kw) -> str:
+                f"reviewer profile {reviewer!r} is not installed. "
+                f"Installed profiles: {', '.join(list_profile_names())}")
+     with _board(args.get("board")) as (kb, conn):
+-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
++        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary, conn=conn)
+         try:
+             ok, fail_reason = kb.request_review(
+                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
+diff --git a/tools/kanban_tools_completion.py b/tools/kanban_tools_completion.py
+index 2e8c188b5dd..8f3c210ab8b 100644
+--- a/tools/kanban_tools_completion.py
++++ b/tools/kanban_tools_completion.py
+@@ -11,6 +11,37 @@ from __future__ import annotations
+ import json
+ 
+ 
++GOAL_GATE_MESSAGES = {
++    "kanban_complete": {
++        "blocked": (
++            "Goal completion rejected: judge ruled the goal unachievable — {reason}. The task "
++            "will NOT complete silently. Either re-scope the task with kanban_edit, or record "
++            "the block with kanban_block and hand the decision to a human / reviewer."),
++        "continue": (
++            "Goal completion rejected by judge: {reason}. To proceed, either: (1) provide "
++            "explicit acceptance evidence in your summary matching the task's criteria, or (2) "
++            "create continuation tasks with parents=[{tid}] and keep this task alive.")},
++    "kanban_request_review": {
++        "blocked": (
++            "Goal review handoff rejected: judge ruled the goal unachievable — {reason}. "
++            "Record the block with kanban_block instead of requesting review."),
++        "continue": (
++            "Goal review handoff rejected by judge: {reason}. Provide acceptance evidence "
++            "matching the card before requesting review.")}}
++
++
++def park_unachievable(task, tid, reason, conn):
++    """Park a verified judge rejection using the handoff's board and worker identity."""
++    from contextlib import nullcontext
++    from hermes_cli.kanban_goal_recovery import park
++    from tools import kanban_tools as kt
++    with (nullcontext((None, conn)) if conn is not None else kt._board(None)) as (_, gate_conn):
++        parked = park(gate_conn, task, reason, expected_run_id=kt._worker_run_id(tid))
++    if parked:
++        raise kt._Reject(f'Goal judged unachievable: {reason}. Parked in triage for bounded '
++                         'supervisor recovery; acceptance is unchanged.', 'goal_judge')
++
++
+ def parked_by_own_run(conn, tid: str, run_id: int) -> bool:
+     """True when ``run_id`` is the card's latest run, ended by ``kanban_block``, and nothing has
+     claimed the card since (no current run, no claim lock, status ready/blocked)."""
+-- 
+2.55.0
+

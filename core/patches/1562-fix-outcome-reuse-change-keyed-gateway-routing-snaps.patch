@@ -1,0 +1,290 @@
+From 4ec8ddd13e516e6c86c15c2b38937b8f8e478cb9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:01:41 +0000
+Subject: [PATCH] fix(outcome): reuse change-keyed gateway routing snapshots
+ [daveey]
+
+Repeated candidate checks scanned all routing JSON: the regression trace records 20 SELECTs for 20 unchanged calls. The per-session JSON predicate introduced in 4f888ab00d6 had no shared revision projection; its outcome tests asserted liveness, not unchanged read work. Cache parsed active rows per exact DB/connection in a bounded thread-local LRU, with data_version and total_changes invalidation. Bypass transactions and recheck revisions before publishing to preserve rollback and concurrent-commit correctness. Keep age and gateway liveness checks fresh.
+
+Verified: 50 targeted tests pass through scripts/run_tests.sh; scripts/check passes. Regression is red on base, green here. Isolated 5000-row fixture, 350 calls: median process CPU 0.399s baseline versus 0.00327s cached (three samples; not a live-process CPU claim).
+---
+ hermes_state_outcome.py                       |  14 +-
+ hermes_state_routing_snapshot.py              |  62 +++++++
+ .../test_gateway_routing_snapshot.py          | 167 ++++++++++++++++++
+ 3 files changed, 234 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_state_routing_snapshot.py
+ create mode 100644 tests/hermes_state/test_gateway_routing_snapshot.py
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index e33e082c946..f675c9318f6 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -264,19 +264,15 @@ def _gateway_turn_live(db: Any, sid: str) -> bool:
+     """[daveey] A gateway routing entry for ``sid`` carries ``active_turn_token`` (``mark_turn_active`` at
+     turn start, CAS-cleared at its end) and the gateway owning that routing scope is running. A crashed
+     gateway leaves the token behind until its next start recovers it, so a dead gateway reads not-live."""
+-    rows = db._read_all(
+-        "SELECT scope, entry_json FROM gateway_routing WHERE json_extract(entry_json, '$.session_id') = ?"
+-        " AND json_extract(entry_json, '$.active_turn_token') IS NOT NULL", (sid,))
++    from hermes_state_routing_snapshot import active_routing_entries
++
++    entries = active_routing_entries(db, sid)
+     now = time.time()
+-    for row in rows:
+-        try:
+-            entry = json.loads(row["entry_json"] or "{}")
+-        except ValueError:
+-            continue
++    for routing_scope, entry in entries:
+         started = _iso_epoch(entry.get("active_turn_started_at"))
+         if started is None or now - started > _GATEWAY_TURN_MAX_AGE_S:
+             continue
+-        scope = str(row["scope"] or "")
++        scope = str(routing_scope or "")
+         gateway_home = Path(scope).parent if scope else Path(db.db_path).parent
+         if _gateway_running(gateway_home):
+             return True
+diff --git a/hermes_state_routing_snapshot.py b/hermes_state_routing_snapshot.py
+new file mode 100644
+index 00000000000..f449d397b6c
+--- /dev/null
++++ b/hermes_state_routing_snapshot.py
+@@ -0,0 +1,62 @@
++"""Change-keyed routing data for outcome polling; never cache turn liveness."""
++from collections import OrderedDict
++import json
++import threading
++from typing import Any
++
++
++_LOCAL = threading.local()
++_MAX_CONNECTIONS = 8
++
++
++def active_routing_entries(db: Any, sid: str) -> tuple:
++    """Reuse parsed routing rows only on the exact DB/connection and SQLite revision.
++
++    Readers are checked out exclusively by SessionDB. A thread-local bounded LRU
++    avoids a global lock and retains connection objects (not recyclable ids).
++    Writer fallback transactions bypass and evict the cache: total_changes does
++    not change on rollback, so publishing uncommitted rows would poison it.
++    """
++    def read(conn):
++        cache = getattr(_LOCAL, "snapshots", None)
++        if cache is None:
++            cache = _LOCAL.snapshots = OrderedDict()
++        identity = (db, conn)
++        if conn.in_transaction:
++            cache.pop(identity, None)
++            return _scan(conn).get(sid, ())
++        revision = _revision(conn)
++        cached = cache.get(identity)
++        if cached is not None and cached[0] == revision:
++            cache.move_to_end(identity)
++            return cached[1].get(sid, ())
++        cache.pop(identity, None)
++        grouped = _scan(conn)
++        # A concurrent commit between PRAGMA and SELECT must not label an older
++        # scan with a newer revision. Return this read, but don't publish it.
++        if _revision(conn) == revision and not conn.in_transaction:
++            cache[identity] = (revision, grouped)
++            while len(cache) > _MAX_CONNECTIONS:
++                cache.popitem(last=False)
++        return grouped.get(sid, ())
++
++    return db._read_retrying_ioerr(read)
++
++
++def _revision(conn):
++    return conn.execute("PRAGMA data_version").fetchone()[0], conn.total_changes
++
++
++def _scan(conn):
++    grouped = {}
++    rows = conn.execute(
++        "SELECT scope, entry_json, json_extract(entry_json, '$.session_id') AS sid"
++        " FROM gateway_routing WHERE json_extract(entry_json, '$.active_turn_token') IS NOT NULL"
++    ).fetchall()
++    for row in rows:
++        try:
++            entry = json.loads(row["entry_json"] or "{}")
++        except ValueError:
++            continue
++        grouped.setdefault(row["sid"], []).append((row["scope"], entry))
++    return {sid: tuple(entries) for sid, entries in grouped.items()}
+diff --git a/tests/hermes_state/test_gateway_routing_snapshot.py b/tests/hermes_state/test_gateway_routing_snapshot.py
+new file mode 100644
+index 00000000000..b2d5145273d
+--- /dev/null
++++ b/tests/hermes_state/test_gateway_routing_snapshot.py
+@@ -0,0 +1,167 @@
++"""Routing polling must not rescan unchanged JSON for every notice candidate."""
++import json
++from datetime import UTC, datetime
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_outcome import _gateway_turn_live
++
++
++@pytest.fixture
++def db(tmp_path):
++    store = SessionDB(tmp_path / "state.db")
++    yield store
++    store.close()
++
++
++def route(db, sid="chat", token: str | None = "tok"):
++    db.save_gateway_routing_entry("route", json.dumps({
++        "session_id": sid, "active_turn_token": token,
++        "active_turn_started_at": datetime.now(UTC).isoformat(),
++    }))
++
++
++def trace(db):
++    statements = []
++    db._read_retrying_ioerr(lambda conn: conn.set_trace_callback(statements.append))
++    return statements
++
++
++def scans(statements):
++    return [sql for sql in statements if "select" in sql.lower() and "gateway_routing" in sql.lower()]
++
++
++def test_unchanged_candidates_do_not_rescan_routing(db, monkeypatch):
++    monkeypatch.setattr("hermes_state_outcome._gateway_running", lambda home: True)
++    route(db)
++    statements = trace(db)
++    assert _gateway_turn_live(db, "chat")
++    assert len(scans(statements)) == 1
++    statements.clear()
++    for _ in range(10):
++        assert _gateway_turn_live(db, "chat")
++        assert not _gateway_turn_live(db, "other")
++    assert scans(statements) == []
++
++
++def test_committed_write_visible_next_call(db, monkeypatch):
++    monkeypatch.setattr("hermes_state_outcome._gateway_running", lambda home: True)
++    route(db)
++    assert _gateway_turn_live(db, "chat")
++    route(db, token=None)
++    assert not _gateway_turn_live(db, "chat")
++    route(db, sid="other")
++    assert _gateway_turn_live(db, "other")
++    assert not _gateway_turn_live(db, "chat")
++    db.replace_gateway_routing_entries({})
++    assert not _gateway_turn_live(db, "other")
++
++
++def test_cached_rows_recheck_age_and_gateway(db, monkeypatch):
++    import hermes_state_outcome as outcome
++
++    alive = [True]
++    monkeypatch.setattr(outcome, "_gateway_running", lambda home: alive[0])
++    route(db)
++    statements = trace(db)
++    assert _gateway_turn_live(db, "chat")
++    statements.clear()
++    alive[0] = False
++    assert not _gateway_turn_live(db, "chat")
++    alive[0] = True
++    assert _gateway_turn_live(db, "chat")
++    now = outcome.time.time()
++    monkeypatch.setattr(outcome.time, "time", lambda: now + outcome._GATEWAY_TURN_MAX_AGE_S + 1)
++    assert not _gateway_turn_live(db, "chat")
++    assert scans(statements) == []
++
++
++def test_writer_fallback_and_rollback_do_not_reuse_uncommitted_rows(db, monkeypatch):
++    monkeypatch.setattr(db, "_checkout_read_conn", lambda: None)
++    monkeypatch.setattr("hermes_state_outcome._gateway_running", lambda home: True)
++    route(db)
++    assert _gateway_turn_live(db, "chat")
++    route(db, token=None)
++    assert not _gateway_turn_live(db, "chat")
++    db._conn.execute("BEGIN")
++    db._conn.execute("UPDATE gateway_routing SET entry_json = json_set(entry_json, '$.active_turn_token', 'tok')")
++    assert _gateway_turn_live(db, "chat")
++    db._conn.rollback()
++    assert not _gateway_turn_live(db, "chat")
++    db._conn.execute("BEGIN")
++    db._conn.execute("UPDATE gateway_routing SET entry_json = json_set(entry_json, '$.active_turn_token', 'tok')")
++    db._conn.rollback()
++    assert not _gateway_turn_live(db, "chat")
++
++
++def test_homes_and_reopened_connections_are_isolated(db, tmp_path, monkeypatch):
++    monkeypatch.setattr("hermes_state_outcome._gateway_running", lambda home: True)
++    route(db)
++    assert _gateway_turn_live(db, "chat")
++    other_home = tmp_path / "other"
++    other_home.mkdir()
++    other = SessionDB(other_home / "state.db")
++    try:
++        route(other, sid="different")
++        assert not _gateway_turn_live(other, "chat")
++        assert _gateway_turn_live(other, "different")
++        assert not _gateway_turn_live(db, "different")
++        db.close()
++        statements = trace(db)
++        assert _gateway_turn_live(db, "chat")
++        assert len(scans(statements)) == 1
++    finally:
++        other.close()
++
++
++def test_pool_connections_do_not_share_data_versions(db, monkeypatch):
++    monkeypatch.setattr("hermes_state_outcome._gateway_running", lambda home: True)
++    route(db)
++    assert _gateway_turn_live(db, "chat")
++    with db._read_ctx() as first:
++        # Holding the warm reader forces a distinct connection checkout.
++        statements = trace(db)
++        assert _gateway_turn_live(db, "chat")
++        assert len(scans(statements)) == 1
++        route(db, token=None)
++        assert not _gateway_turn_live(db, "chat")
++        assert first is not db._conn
++    assert not _gateway_turn_live(db, "chat")
++
++
++def test_commit_during_scan_is_not_published_under_stale_revision(db, monkeypatch):
++    import hermes_state_routing_snapshot as snapshot
++
++    monkeypatch.setattr("hermes_state_outcome._gateway_running", lambda home: True)
++    route(db)
++    original = snapshot._scan
++    def scan_then_commit(conn):
++        grouped = original(conn)
++        route(db, token=None)
++        return grouped
++    monkeypatch.setattr(snapshot, "_scan", scan_then_commit)
++    assert _gateway_turn_live(db, "chat")
++    monkeypatch.setattr(snapshot, "_scan", original)
++    statements = trace(db)
++    assert not _gateway_turn_live(db, "chat")
++    assert len(scans(statements)) == 1
++
++
++def test_cache_evicts_old_connections(db, tmp_path, monkeypatch):
++    import hermes_state_routing_snapshot as snapshot
++
++    monkeypatch.setattr("hermes_state_outcome._gateway_running", lambda home: True)
++    monkeypatch.setattr(snapshot, "_MAX_CONNECTIONS", 2)
++    route(db)
++    assert _gateway_turn_live(db, "chat")
++    stores = [SessionDB(tmp_path / f"state-{i}.db") for i in range(2)]
++    try:
++        for store in stores:
++            assert not _gateway_turn_live(store, "chat")
++        statements = trace(db)
++        assert _gateway_turn_live(db, "chat")
++        assert len(scans(statements)) == 1
++    finally:
++        for store in stores:
++            store.close()
+-- 
+2.55.0
+

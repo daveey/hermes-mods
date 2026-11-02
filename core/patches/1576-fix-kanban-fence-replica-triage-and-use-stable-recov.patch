@@ -1,0 +1,252 @@
+From e991e74dbea29a28659031f6488880f689266ed1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 20:17:01 +0000
+Subject: [PATCH] fix(kanban): fence replica triage and use stable recovery
+ park identity [daveey]
+
+---
+ hermes_cli/kanban_resume_requester.py         |  36 ++++-
+ hermes_cli/kanban_triage_sweep.py             |   7 +
+ .../test_kanban_resume_requester_sync.py      |  10 ++
+ .../hermes_cli/test_kanban_triage_replica.py  | 126 ++++++++++++++++++
+ 4 files changed, 176 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_triage_replica.py
+
+diff --git a/hermes_cli/kanban_resume_requester.py b/hermes_cli/kanban_resume_requester.py
+index c4d9d498e19..cc335ae195f 100644
+--- a/hermes_cli/kanban_resume_requester.py
++++ b/hermes_cli/kanban_resume_requester.py
+@@ -81,20 +81,46 @@ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+     ).fetchall()
+ 
+ 
++def _park_uid(conn: sqlite3.Connection, target: str, park_id: int) -> Optional[str]:
++    from hermes_cli.kanban_db_sync import table_columns
++
++    if "uid" not in table_columns(conn, "task_events"):
++        return None  # unsynced boards retain the local integer linkage
++    row = conn.execute("SELECT uid FROM task_events WHERE task_id = ? AND id = ?",
++                       (target, park_id)).fetchone()
++    return row[0] if row else None
++
++
+ def _event_for_park(conn: sqlite3.Connection, target: str, park_id: int) -> Optional[str]:
++    from hermes_cli.kanban_wake_check import foreign_copy
++
++    park_uid = _park_uid(conn, target, park_id)
++    foreign = foreign_copy(conn, target)
+     for (raw,) in conn.execute(
+             "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC", (target, EVENT)):
+         try:
+             data = json.loads(raw) if raw else {}
+         except (TypeError, ValueError):
+             continue
+-        if isinstance(data, dict) and data.get("park_event_id") == park_id:
++        if not isinstance(data, dict):
++            continue
++        if data.get("park_event_uid"):
++            matches = data["park_event_uid"] == park_uid
++        else:
++            # Pre-UID links are only exact at home. A foreign reader cannot disprove
++            # ownership using an unrelated local integer: conservatively retain the hold.
++            matches = foreign or data.get("park_event_id") == park_id
++        if matches:
+             return data.get("recovery_task_id")
+     return None
+ 
+ 
+ def open_recovery_card(conn: sqlite3.Connection, target: str) -> Optional[str]:
+-    """The kernel recovery card for ``target``'s CURRENT park while it is still open, else None."""
++    """Open recovery for the current park; foreign pre-UID links conservatively retain their hold.
++
++    Legacy integer links are exact only at home. Triage policy also runs only at home,
++    so an ambiguous legacy hold on a retained copy cannot strand home-owned work.
++    """
+     from hermes_cli import kanban_resume_exec as rx
+     rec = _event_for_park(conn, target, rx._park_event_id(conn, target))
+     if not rec:
+@@ -142,7 +168,11 @@ def ensure_recovery_cards(conn: sqlite3.Connection) -> list[str]:
+         except (sqlite3.Error, ValueError):
+             logger.exception("kanban: recovery card for %s failed", target)
+             continue
++        payload = {"recovery_task_id": rec, "park_event_id": park_id}
++        park_uid = _park_uid(conn, target, park_id)
++        if park_uid:
++            payload["park_event_uid"] = park_uid
+         with kb.write_txn(conn):
+-            kb._append_event(conn, target, EVENT, {"recovery_task_id": rec, "park_event_id": park_id})
++            kb._append_event(conn, target, EVENT, payload)
+         made.append(rec)
+     return made
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 4bcc481ba7e..5d47c32072b 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -120,7 +120,14 @@ def sweep_stale_triage(
+     ).fetchall()
+     from hermes_cli.kanban_resume_requester import open_recovery_card
+     from hermes_cli.kanban_goal_recovery import current_park
++    from hermes_cli.kanban_wake_check import foreign_ids
++
++    # Retained executor copies have no triage policy authority. Local cap keys cannot
++    # arbitrate supervisor creation across gateways, even when neither has synced yet.
++    copies = foreign_ids(conn)
+     for row in rows:
++        if row["id"] in copies:
++            continue
+         if row["human_request"] or open_recovery_card(conn, row["id"]) or current_park(conn, row['id']):
+             continue  # a human owns it, or its kernel recovery card is its producer
+         recent = conn.execute(
+diff --git a/tests/hermes_cli/test_kanban_resume_requester_sync.py b/tests/hermes_cli/test_kanban_resume_requester_sync.py
+index 9ffc72436ab..a8b7e5500bd 100644
+--- a/tests/hermes_cli/test_kanban_resume_requester_sync.py
++++ b/tests/hermes_cli/test_kanban_resume_requester_sync.py
+@@ -47,3 +47,13 @@ def test_foreign_park_has_one_board_wide_requester(gws, svc, home_first):
+     assert cards[0]["created_on"] == home.name
+     home.enter()
+     assert rx.refusal(home.conn, cards[0]["id"], target) is None
++    # The writer publishes the blocked event's stable UID for replica readers.
++    import json
++    link = home.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (target, rr.EVENT)
++    ).fetchone()
++    park = home.conn.execute(
++        "SELECT uid FROM task_events WHERE id=?", (rx._park_event_id(home.conn, target),)
++    ).fetchone()
++    assert json.loads(link[0])["park_event_uid"] == park[0]
++    assert rr.open_recovery_card(home.conn, target) == cards[0]["id"]
+diff --git a/tests/hermes_cli/test_kanban_triage_replica.py b/tests/hermes_cli/test_kanban_triage_replica.py
+new file mode 100644
+index 00000000000..5f05841c74e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_triage_replica.py
+@@ -0,0 +1,126 @@
++"""Triage authority and recovery identity across real stores and an in-memory Board."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_resume_exec as rx
++from hermes_cli import kanban_resume_requester as rr
++from hermes_cli import kanban_triage_sweep as ts
++from tests.hermes_cli import test_kanban_worker_node as worker_node
++
++gws = worker_node.gws
++svc = worker_node.svc
++
++
++def _retained_pair(gws):
++    home, worker = gws
++    worker.enter()
++    # Unrelated local events ensure integer event identities differ across stores.
++    for n in range(7):
++        kb.create_task(worker.conn, title=f"padding {n}", triage=True)
++    home.enter()
++    target = kb.create_task(home.conn, title="retained triage", assignee="default", runs_on=["linux"])
++    home.round()
++    worker.round()
++    worker.tick()
++    worker.round()
++    home.round()
++    assert kb.get_task(worker.conn, target).current_run_id is not None
++    return home, worker, target
++
++
++def _park(home, worker, target, *, capped=False):
++    worker.enter()
++    with kb.write_txn(worker.conn):
++        worker.conn.execute("UPDATE tasks SET status='triage', current_run_id=NULL WHERE id=?", (target,))
++        if capped:
++            for _ in range(ts.TRIAGE_SWEEP_CAP):
++                kb._append_event(worker.conn, target, "triage_swept", {})
++        kb._append_event(worker.conn, target, "blocked", {"reason": "test park"})
++    worker.round()
++    home.round()
++
++
++@pytest.mark.parametrize("home_first", [False, True])
++@pytest.mark.parametrize("capped", [False, True])
++def test_only_home_sweeps_or_caps_retained_copy(gws, svc, home_first, capped):
++    home, worker, target = _retained_pair(gws)
++    _park(home, worker, target, capped=capped)
++    now = int(time.time()) + ts.TRIAGE_STALE_SECONDS + 1
++    # No inter-sweep sync: both see the same eligible idle park.
++    for gateway in ((home, worker) if home_first else (worker, home)):
++        gateway.enter()
++        swept = ts.sweep_stale_triage(gateway.conn, now=now)
++        assert (target in swept) == (gateway is home and not capped)
++        assert kb.get_task(worker.conn, target).status == "triage"
++        assert worker.conn.execute(
++            "SELECT COUNT(*) FROM tasks WHERE created_by='triage-sweep'"
++        ).fetchone()[0] == 0
++    home.round()
++    worker.round()
++    rows = svc.board(worker_node.BOARD)["rows"]
++    supervisors = [r for r in rows["tasks"].values() if r.get("created_by") == "triage-sweep"]
++    assert len(supervisors) == int(capped)
++    if capped:
++        assert supervisors[0]["created_on"] == home.name
++    assert rows["tasks"][target]["status"] == ("triage" if capped else "ready")
++
++
++@pytest.mark.parametrize("legacy", [False, True])
++def test_recovery_hold_survives_replica_local_event_ids(gws, legacy):
++    home, worker, target = _retained_pair(gws)
++    _park(home, worker, target)
++    home.enter()
++    park = rx._park_event_id(home.conn, target)
++    uid = home.conn.execute("SELECT uid FROM task_events WHERE id=?", (park,)).fetchone()[0]
++    rec = kb.create_task(home.conn, title="recovery", assignee="default", creator_task_id=target)
++    payload = {"park_event_id": park, "recovery_task_id": rec}
++    if not legacy:
++        payload["park_event_uid"] = uid
++    with kb.write_txn(home.conn):
++        kb._append_event(home.conn, target, rr.EVENT, payload)
++    home.round()
++    worker.round()
++    # Import the recovery through real pickup without running another dispatcher tick.
++    from hermes_cli import kanban_worker_node as wn
++    worker.enter()
++    wn.pickup(worker.conn, budget=None)
++    assert kb.get_task(worker.conn, rec) is not None
++    assert rx._park_event_id(worker.conn, target) != park
++    for gateway in (home, worker):
++        gateway.enter()
++        assert rr.open_recovery_card(gateway.conn, target) == rec
++        assert target not in ts.sweep_stale_triage(
++            gateway.conn, now=int(time.time()) + ts.TRIAGE_STALE_SECONDS + 1)
++    home.enter()
++    with kb.write_txn(home.conn):
++        home.conn.execute("UPDATE tasks SET status='done' WHERE id=?", (rec,))
++    home.round()
++    worker.round()
++    for gateway in (home, worker):
++        gateway.enter()
++        assert rr.open_recovery_card(gateway.conn, target) is None
++    home.enter()
++    with kb.write_txn(home.conn):
++        home.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (rec,))
++    home.round()
++    worker.round()
++    # Home releases old linkage on a new park, for both formats. Foreign legacy
++    # readers conservatively hold; stable UIDs let them distinguish parks exactly.
++    home.enter()
++    with kb.write_txn(home.conn):
++        kb._append_event(home.conn, target, "blocked", {"reason": "new park"})
++    assert rr.open_recovery_card(home.conn, target) is None
++    home.round()
++    worker.round()
++    worker.enter()
++    assert rr.open_recovery_card(worker.conn, target) == (rec if legacy else None)
++    home.enter()
++    with kb.write_txn(home.conn):
++        home.conn.execute("UPDATE tasks SET status='done' WHERE id=?", (rec,))
++    home.round()
++    worker.round()
++    for gateway in (home, worker):
++        gateway.enter()
++        assert rr.open_recovery_card(gateway.conn, target) is None
+-- 
+2.55.0
+

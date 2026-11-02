@@ -67,3 +67,54 @@ The user-steps plugin supplies the decision provider; a judge plugin is optional
 - **Code.** `tui_gateway/methods_prompt.py` (`_close_agent_init_failed_turn`, `_run_after_agent_ready`).
 - **Tests** (in the patch; not run for this mirror). `tests/tui_gateway/test_turn_outcome_refresh.py`: `test_agent_init_failure_writes_one_boundary_and_reads_turn_failed`, `test_agent_init_failure_redelivery_adds_no_second_boundary`, `test_agent_init_failure_secret_in_error_is_redacted`, `test_cancelled_before_ready_turn_is_unchanged` (control). `tests/tui_gateway/test_submit_time_user_row.py::test_failed_build_drops_the_staged_row_and_a_later_turn_never_adopts_it` now expects the boundary between the two user rows. The four new tests call `server._run_after_agent_ready` directly with stubbed `_emit`/`_session_info`; the JSON-RPC `prompt.submit` entry and Desktop rendering of the boundary are untested end to end.
 - **Gotchas.** Only the TUI gateway's deferred-build path changes; a messaging-platform gateway turn failing before its agent exists is not covered by this patch. If the session store is unwritable the outcome still reads `interrupted` (the boundary row is what makes it `turn_failed`).
+
+## Follow-up patches (1560–1562): silent cron runs, durable worker leases, cached routing scans
+
+**1560** (`a7c1f439c34`, `fix(outcome): recognize completed silent cron runs`).
+
+- **Behavior.** A cron run that answers with only a silence marker (the no-news protocol) has no prose summary, so it read `unresolved{no_summary}`. Now it reads `done` ("Scheduled run completed with nothing to report.") without calling a judge, but only when all of these hold: the session has `source=cron` and `end_reason=cron_complete`, no reply is pending, and `gateway.response_filters.is_intentional_silence_response` accepts the tail. That function accepts exactly one of `LIVE_GATEWAY_SILENT_MARKERS` (e.g. `[SILENT]`, `SILENT`, `NO_REPLY`) after trimming edge whitespace and punctuation.
+- **How it works.** `_row` now selects `end_reason`. The new case in `_derive` comes after the live-work, notice and failure checks and before the summary judge. Silence therefore never hides a failed turn, a notice tail, an interrupted tool call, running work or a blocked-on-human card.
+- **Tests** (`tests/hermes_state/test_session_outcome.py`; not run for this mirror):
+  - `test_completed_silent_cron_is_done_without_a_judge` (`[SILENT]`, `NO_REPLY`, ` SILENT `)
+  - `test_silence_alone_does_not_prove_cron_completion` (desktop + `cron_complete`, cron + no end reason, cron + `cron_incomplete_no_output`)
+  - `test_completed_silent_cron_preserves_tail_errors` (`turn_failed`, `notice_tail`, `interrupted`)
+  - `test_completed_silent_cron_preserves_live_work` (`waiting`, `decision`)
+  - `test_pending_silence_does_not_reuse_old_cron_completion`
+
+**1561** (`0f9b3b28ec6`, `fix(outcome): recognize durable worker turn leases`).
+
+- **Behavior.** Managed Kanban workers and CLI turns write neither the TUI turn marker nor a gateway routing token, so a turn that was still running could read `unresolved{interrupted}`. `_live_turn` now also counts the session's durable turn lease, read with `db.session_turn_lease_owner(sid)` on the compression root (it does not reclaim the lease). The lease counts as live when it:
+  - exists;
+  - has `expires_at` in the future;
+  - is not marked abandoned locally (`hermes_state_compression._turn_lease_abandoned`).
+
+  The store already rejects dead local owners. The check is wrapped in `_guarded`, so an error reads as not live.
+- **Tests** (`tests/hermes_state/test_session_outcome.py`; not run for this mirror):
+  - `test_2_durable_turn_without_marker_or_gateway_token_is_running`: holder formats for `kanban`, `cli`, `cron` and `desktop`, on a compressed chat's tip.
+  - `test_2_expired_durable_turn_does_not_hide_interruption`
+  - `test_2_dead_durable_turn_owner_does_not_hide_interruption`: a real child process that has exited.
+  - `test_2_other_conversation_lease_does_not_hide_interruption`
+  - `test_2_abandoned_durable_turn_is_not_running`
+  - `test_2_audit_refresh_replaces_running_after_durable_turn_releases`
+- **Gotchas.** No worker surface refreshes the outcome at the moment its lease is released. A stored `running` converges on the next audit refresh (the last test above).
+
+**1562** (`4ec8ddd13e5`, `fix(outcome): reuse change-keyed gateway routing snapshots`).
+
+- **Behavior.** `_gateway_turn_live` ran a `json_extract` scan over all of `gateway_routing` on every call; the regression trace in the commit message records 20 SELECTs for 20 unchanged calls. It now calls `hermes_state_routing_snapshot.active_routing_entries(db, sid)`, which reuses one parsed scan of every row that has an `active_turn_token`, grouped by session. Only the parsed rows are cached. Every call still checks the token's age (`_GATEWAY_TURN_MAX_AGE_S`) and whether the owning gateway is running.
+- **How it works.**
+  - The cache is a thread-local LRU of 8 entries, keyed on the exact `(db, connection)` objects. An entry is valid while `(PRAGMA data_version, conn.total_changes)` is unchanged.
+  - A connection inside a transaction skips the cache and evicts its entry, because a rollback does not move `total_changes`.
+  - The revision is read again after the scan. If a commit landed in between, the scan is returned but not cached.
+- **Tests** (`tests/hermes_state/test_gateway_routing_snapshot.py`, 8; not run for this mirror):
+  - `test_unchanged_candidates_do_not_rescan_routing`
+  - `test_committed_write_visible_next_call`
+  - `test_cached_rows_recheck_age_and_gateway`
+  - `test_writer_fallback_and_rollback_do_not_reuse_uncommitted_rows`
+  - `test_homes_and_reopened_connections_are_isolated`
+  - `test_pool_connections_do_not_share_data_versions`
+  - `test_commit_during_scan_is_not_published_under_stale_revision`
+  - `test_cache_evicts_old_connections`
+
+  The commit message reports a 5000-row fixture dropping from 0.399 s to 0.00327 s median CPU over 350 calls (source-owner reported; not a live-process measurement).
+
+**Applying.** All three patches depend on the preceding series. Apply the full ordered series as described in the README "Applying" section; applying them on their own is not certified.

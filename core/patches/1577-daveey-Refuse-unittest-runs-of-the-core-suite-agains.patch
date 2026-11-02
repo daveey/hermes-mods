@@ -1,0 +1,215 @@
+From 2745a3e2eb122977873ae59192d71c1e16a4fcfa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:56:08 +0000
+Subject: [PATCH] [daveey] Refuse unittest runs of the core suite against the
+ live Hermes home
+
+unittest never loads tests/conftest.py, so a named-module run or discovery below
+tests/ imported test modules with the operator's HERMES_HOME. Fixture failures
+(the fake EACCES in test_code_kernel_remote) reached the live errors.log and the
+coach self-heal lane filed them as defect agent-dada3769d1.
+
+tests/__init__.py now refuses, under the unittest CLI only, before any child
+module is imported, when HERMES_HOME is unset, the real root, a profile, or
+nested in it, and prints a supported isolated invocation. pytest and plain
+importers of the tests package are unaffected; isolated unittest runs still
+work and still log their warnings.
+---
+ tests/__init__.py                     |  48 ++++++++++
+ tests/test_unittest_home_isolation.py | 127 ++++++++++++++++++++++++++
+ 2 files changed, 175 insertions(+)
+ create mode 100644 tests/test_unittest_home_isolation.py
+
+diff --git a/tests/__init__.py b/tests/__init__.py
+index 2809e9700da..0ecb9a1ee63 100644
+--- a/tests/__init__.py
++++ b/tests/__init__.py
+@@ -1,4 +1,52 @@
+ """The repository suite requires pytest's collection-time safety fixtures."""
++import os
++import sys
++from pathlib import Path
++
++
++def _running_under_unittest_cli() -> bool:
++    """True for ``python -m unittest ...``; pytest and plain importers (evals, e2e seeds) are not."""
++    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
++    return getattr(spec, "name", "") in {"unittest", "unittest.__main__"}
++
++
++def _live_hermes_home():
++    """The live Hermes home this process would write to, or None for an isolated one.
++
++    Same rule as tests/conftest.py ``_hermes_home_points_at_production``: unset, the real
++    root, a profile under it, or anything nested in it (a Hermes shell's ``mktemp -d``
++    lands in ``<root>/cache/scratch``) is live.
++    """
++    try:
++        from hermes_state_guard import _real_platform_state_root
++
++        root = _real_platform_state_root() or (Path.home() / ".hermes").resolve()
++    except Exception:
++        root = (Path.home() / ".hermes").resolve()
++    value = os.environ.get("HERMES_HOME", "").strip()
++    if not value:
++        return root
++    try:
++        resolved = Path(value).expanduser().resolve()
++    except Exception:
++        return root
++    return resolved if resolved.is_relative_to(root) else None
++
++
++# unittest never loads conftest.py, so a test module imported here would log its fixtures'
++# deliberate failures (fake EACCES, cannot fork) into the live home's errors.log, where the
++# coach self-heal lane files them as real defects (agent-dada3769d1), or write the live
++# config (the 11-01 hub config wipe). Refuse before any child module is imported. Named
++# modules, discovery below tests/ and repository discovery all import this package first.
++if _running_under_unittest_cli():
++    _live = _live_hermes_home()
++    if _live is not None:
++        raise SystemExit(
++            f"Refusing to run Hermes tests under unittest against the live Hermes home {_live}:\n"
++            "unittest skips tests/conftest.py, so test fixtures would write its logs and stores.\n"
++            "Use scripts/run_tests.sh <test paths>, or give unittest a throwaway home:\n"
++            "  HERMES_HOME=$(mktemp -d -p /tmp) python -m unittest <module names>"
++        )
+ 
+ 
+ def load_tests(loader, tests, pattern):
+diff --git a/tests/test_unittest_home_isolation.py b/tests/test_unittest_home_isolation.py
+new file mode 100644
+index 00000000000..630186e6d92
+--- /dev/null
++++ b/tests/test_unittest_home_isolation.py
+@@ -0,0 +1,127 @@
++"""A bare ``python -m unittest`` run must not write test failures into a live Hermes home.
++
++pytest isolates HERMES_HOME in tests/conftest.py before any test module is imported;
++unittest never loads conftest. A unittest run that inherits the operator's home sends the
++fixtures' deliberate failures (e.g. the fake EACCES in test_code_kernel_remote) through
++hermes_logging into that home's errors.log, where the coach self-heal lane files them as
++real defects (agent-dada3769d1).
++
++Every case uses a disposable HOME, so the "production" root here is ``<tmp>/.hermes``,
++never the real one.
++"""
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++
++ROOT = Path(__file__).resolve().parents[1]
++CANARY = "canary: untouched\n"
++NOISY_TEST = (
++    "tests.tools.test_code_kernel_remote.TestSharedHostLockdown."
++    "test_spawn_locks_down_dirs_and_hides_token"
++)
++WARNING = "remote kernel spawn failed"
++
++
++def _env(tmp_path, hermes_home):
++    env = {k: v for k, v in os.environ.items()
++           if not k.startswith(("HERMES_", "PYTEST_"))}
++    env["HOME"] = str(tmp_path)
++    env["TMPDIR"] = str(tmp_path / "tmp")
++    (tmp_path / "tmp").mkdir(exist_ok=True)
++    if hermes_home is not None:
++        env["HERMES_HOME"] = str(hermes_home)
++    return env
++
++
++def _canary_home(tmp_path):
++    prod = tmp_path / ".hermes"
++    (prod / "logs").mkdir(parents=True)
++    (prod / "profiles" / "work" / "logs").mkdir(parents=True)
++    for home in (prod, prod / "profiles" / "work"):
++        (home / "logs" / "errors.log").write_text(CANARY)
++        (home / "config.yaml").write_text(CANARY)
++    return prod
++
++
++def _snapshot(prod):
++    return {str(p.relative_to(prod)): p.read_bytes()
++            for p in sorted(prod.rglob("*")) if p.is_file()}
++
++
++def _run(env, args):
++    return subprocess.run(
++        [sys.executable, "-m", "unittest", *args], cwd=ROOT, env=env,
++        capture_output=True, text=True, timeout=180, check=False,
++    )
++
++
++UNSAFE = {
++    "unset": lambda prod: None,
++    "production_root": lambda prod: prod,
++    "production_profile": lambda prod: prod / "profiles" / "work",
++}
++# Importing a module that imports hermes_cli.main attaches errors.log to the ambient home,
++# as broad discovery did in the incident; -k then runs only the fixture that warns.
++NAMED = ["-k", NOISY_TEST.rsplit(".", 1)[1],
++         "tests.hermes_cli.test_agent_env_advertisement", NOISY_TEST.rsplit(".", 2)[0]]
++ENTRY = {
++    "named": NAMED,
++    "discover_below_tests": ["discover", "-s", "tests/tools", "-t", ".",
++                             "-p", "test_code_kernel_remote.py"],
++}
++
++
++@pytest.mark.parametrize("entry", sorted(ENTRY))
++@pytest.mark.parametrize("home", sorted(UNSAFE))
++def test_unittest_against_production_home_refuses_before_writes(tmp_path, home, entry):
++    prod = _canary_home(tmp_path)
++    before = _snapshot(prod)
++    result = _run(_env(tmp_path, UNSAFE[home](prod)), ENTRY[entry])
++    out = result.stdout + result.stderr
++    assert result.returncode != 0, out
++    assert "HERMES_HOME=$(mktemp -d -p /tmp)" in out, out
++    assert _snapshot(prod) == before
++
++
++def test_unittest_with_isolated_home_runs_and_keeps_warning(tmp_path):
++    prod = _canary_home(tmp_path)
++    before = _snapshot(prod)
++    iso = tmp_path / "isolated-home"
++    iso.mkdir()
++    result = _run(_env(tmp_path, iso), NAMED)
++    out = result.stdout + result.stderr
++    assert result.returncode == 0, out
++    assert "Ran 1 test" in out
++    # The genuine warning still reaches the (isolated) home's errors.log.
++    assert WARNING in (iso / "logs" / "errors.log").read_text()
++    assert _snapshot(prod) == before
++
++
++def test_non_unittest_importers_of_tests_package_still_work(tmp_path):
++    # evals/ and apps/desktop/e2e import helpers from ``tests`` outside any runner.
++    _canary_home(tmp_path)
++    result = subprocess.run(
++        [sys.executable, "-c", "import tests; print('ok')"], cwd=ROOT,
++        env=_env(tmp_path, None), capture_output=True, text=True, timeout=60, check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert result.stdout.strip() == "ok"
++
++
++def test_production_logging_still_records_warnings(tmp_path):
++    # Control: the guard must not suppress real warnings in a non-test process.
++    prod = _canary_home(tmp_path)
++    code = (
++        "import logging, hermes_logging; hermes_logging.setup_logging(); "
++        "logging.getLogger('tools.code_kernel_remote').warning('real warning probe')"
++    )
++    result = subprocess.run(
++        [sys.executable, "-c", code], cwd=ROOT, env=_env(tmp_path, prod),
++        capture_output=True, text=True, timeout=60, check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert "real warning probe" in (prod / "logs" / "errors.log").read_text()
+-- 
+2.55.0
+

@@ -1,0 +1,203 @@
+From 492162703cbd734bba4275ea318fa5474d17d914 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:06:25 +0000
+Subject: [PATCH] fix(update): file the upstream-conflict owner card in a fresh
+ interpreter [daveey]
+
+hermes update imports hermes_cli.config_effective at startup, then moves the
+checkout. report() imported the kanban modules from the new files in that same
+process, so the new kanban_capabilities asked the stale config_effective for
+load_profile_config_effective and validate_assignment refused the card as a
+capability mismatch (mini, 2026-11-01 09:29 PT; defect kanban-c50ee42be6).
+
+report() now runs the filing in a runtime_command child pinned to the same
+HERMES_HOME and returns the id from a marker line; failures warn and log the
+child's stderr tail. A conflict with no owner now prints a fixed
+'Repair owner: NOT FILED' line for the signal detector.
+
+Test: stale config_effective stub in sys.modules; report() must still file one
+card and refresh it on the next call (red before, green after).
+---
+ hermes_cli/update_cmd_git.py                  |  4 +-
+ hermes_cli/update_upstream_conflict.py        | 56 ++++++++++++---
+ .../test_update_upstream_conflict.py          | 71 +++++++++++++++++++
+ 3 files changed, 121 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_upstream_conflict.py
+
+diff --git a/hermes_cli/update_cmd_git.py b/hermes_cli/update_cmd_git.py
+index 9c4e8ec655f..0ce3e01db52 100644
+--- a/hermes_cli/update_cmd_git.py
++++ b/hermes_cli/update_cmd_git.py
+@@ -438,8 +438,8 @@ def _synthesize_upstream_merge(git_cmd: list[str], cwd: Path, upstream: str) ->
+         if tree_proc.returncode == 1 and any(p.strip() for p in conflicts):
+             from hermes_cli.update_upstream_conflict import report
+             task_id = report(cwd, upstream, [p for p in conflicts if p.strip()])
+-            if task_id:
+-                print(f"    Repair owner: {task_id}")
++            # Fixed text: the signal detector keys on the NOT FILED line.
++            print(f"    Repair owner: {task_id}" if task_id else "    Repair owner: NOT FILED")
+         return None
+     msg = f"Merge upstream/main ({upstream[:10]}) into fork"
+     commit = _git_stdout(git_cmd, ["commit-tree", tree, "-p", head, "-p", upstream, "-m", msg], cwd)
+diff --git a/hermes_cli/update_upstream_conflict.py b/hermes_cli/update_upstream_conflict.py
+index 7f9a09acacb..3f1b50eaaf7 100644
+--- a/hermes_cli/update_upstream_conflict.py
++++ b/hermes_cli/update_upstream_conflict.py
+@@ -1,25 +1,61 @@
+ """Turn an unattended upstream merge conflict into one durable repair owner."""
+ from __future__ import annotations
+ 
++import argparse
+ import hashlib
+ import logging
++import re
++import subprocess
++import sys
+ from pathlib import Path
+ 
+ log = logging.getLogger(__name__)
+ AUTHOR = "upstream-merge"
++_RESULT = "__HERMES_UPSTREAM_CONFLICT_TASK__="
++_TIMEOUT_S = 60
+ 
+ 
+ def report(cwd: Path, upstream: str, conflicts: list[str]) -> str | None:
+-    """Best effort: card failures must remain visible without changing update custody."""
++    """Best effort: card failures must remain visible without changing update custody.
++
++    Filed in a fresh interpreter: the caller is the updater, whose ``sys.modules`` still holds the
++    pre-update code while the checkout already holds the new one. Importing the kanban modules here
++    mixed the two (new kanban_capabilities asking the old config_effective for a name it lacked) and
++    the card was refused as a capability mismatch (kanban-c50ee42be6).
++    """
++    from hermes_cli._launchers import runtime_command
++    from hermes_constants import get_hermes_home
++
++    root = Path(__file__).resolve().parents[1]
++    args = ["--cwd", str(cwd), "--upstream", upstream, *(a for p in conflicts for a in ("--conflict", p))]
+     try:
+-        from hermes_cli.kanban_db_connect import connect_closing
++        proc = subprocess.run(
++            runtime_command(root, args, module="hermes_cli.update_upstream_conflict", home=get_hermes_home()), cwd=str(root),
++            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=_TIMEOUT_S, check=False)
++        found = re.findall(rf"^{re.escape(_RESULT)}(t_\w+)$", proc.stdout or "", re.MULTILINE)
++        if proc.returncode == 0 and found:
++            return found[-1]
++        detail = f"exit {proc.returncode}: " + (proc.stderr or proc.stdout or "")[-2000:]
++    except (OSError, subprocess.SubprocessError) as exc:
++        detail = f"{type(exc).__name__}: {exc}"
++    log.warning("Could not file upstream merge conflict card (%s)", detail)
++    print("    Warning: could not file upstream merge conflict card; see agent.log")
++    return None
++
+ 
+-        with connect_closing() as conn:
+-            return _report(conn, cwd, upstream, conflicts)
+-    except Exception:  # health: allow BLE001 -- escalation must not mask the original merge refusal
+-        log.warning("Could not file upstream merge conflict card", exc_info=True)
+-        print("    Warning: could not file upstream merge conflict card; see agent.log")
+-        return None
++def main(argv: list[str] | None = None) -> int:
++    """Child entry point: file (or refresh) the owner card and print its id on a marker line."""
++    parser = argparse.ArgumentParser(prog="hermes_cli.update_upstream_conflict")
++    parser.add_argument("--cwd", required=True, type=Path)
++    parser.add_argument("--upstream", required=True)
++    parser.add_argument("--conflict", action="append", default=[])
++    ns = parser.parse_args(argv)
++    from hermes_cli.kanban_db_connect import connect_closing
++
++    with connect_closing() as conn:
++        task_id = _report(conn, ns.cwd, ns.upstream, ns.conflict)
++    print(f"{_RESULT}{task_id}", flush=True)
++    return 0
+ 
+ 
+ def _report(conn, cwd: Path, upstream: str, conflicts: list[str]) -> str:
+@@ -55,3 +91,7 @@ def _report(conn, cwd: Path, upstream: str, conflicts: list[str]) -> str:
+                  "an ancestor of origin/main, and the next unattended updater no longer reports this conflict. "
+                  "Remove the worktree after landing.",
+         )
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/hermes_cli/test_update_upstream_conflict.py b/tests/hermes_cli/test_update_upstream_conflict.py
+new file mode 100644
+index 00000000000..4d705b4aa32
+--- /dev/null
++++ b/tests/hermes_cli/test_update_upstream_conflict.py
+@@ -0,0 +1,71 @@
++"""The conflict reporter must not depend on the updater's pre-update ``sys.modules``.
++
++``hermes update`` imports ``hermes_cli.config_effective`` at startup, then moves the checkout. When
++``report()`` ran in-process, the newly pulled ``kanban_capabilities`` asked that *old* in-memory module
++for a name it did not have yet, and validate_assignment surfaced the ImportError as "Assignee 'default'
++lacks required capabilities", so no repair owner was filed (defect kanban-c50ee42be6).
++"""
++import sys
++import types
++from pathlib import Path
++
++from hermes_cli.config import save_config
++from hermes_cli.kanban_db_connect import connect_closing
++from hermes_cli import update_upstream_conflict as uuc
++
++
++def _stale_config_effective(monkeypatch):
++    # The pre-update module: present, but without ``load_profile_config_effective``.
++    stale = types.ModuleType("hermes_cli.config_effective")
++    stale.__file__ = "<stale pre-update module>"
++    monkeypatch.setitem(sys.modules, "hermes_cli.config_effective", stale)
++
++
++def test_report_files_owner_despite_stale_in_process_modules(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
++    save_config({"platform_toolsets": {"cli": ["terminal", "file"]}, "terminal": {"backend": "local"}})
++    _stale_config_effective(monkeypatch)
++    cwd = tmp_path / "checkout"
++    cwd.mkdir()
++
++    task_id = uuc.report(cwd, "a" * 40, ["a.txt"])
++
++    assert task_id and task_id.startswith("t_")
++    with connect_closing() as conn:
++        rows = conn.execute("SELECT id, idempotency_key, body FROM tasks").fetchall()
++    assert [r[0] for r in rows] == [task_id]
++    assert rows[0][1].startswith("upstream-merge-conflict:")
++    assert "a" * 40 in rows[0][2] and "a.txt" in rows[0][2]
++
++    # A second occurrence refreshes the same owner instead of creating another.
++    assert uuc.report(cwd, "b" * 40, ["a.txt"]) == task_id
++    with connect_closing() as conn:
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
++        comments = [r[0] for r in conn.execute(
++            "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)).fetchall()]
++    assert any("b" * 40 in c for c in comments)
++
++
++def test_report_failure_is_best_effort_and_logged(tmp_path, monkeypatch, capsys, caplog):
++    # A child that cannot file (unwritable board path) returns None, warns, and keeps its stderr tail.
++    blocker = tmp_path / "not-a-dir"
++    blocker.write_text("x")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(blocker / "board.db"))
++    with caplog.at_level("WARNING", logger=uuc.__name__):
++        assert uuc.report(tmp_path, "c" * 40, ["a.txt"]) is None
++    assert "could not file upstream merge conflict card" in capsys.readouterr().out
++    assert any("Could not file upstream merge conflict card" in r.getMessage() for r in caplog.records)
++
++
++def test_conflict_without_owner_prints_not_filed(monkeypatch, tmp_path, capsys):
++    from hermes_cli import update_cmd_git as ucg
++
++    monkeypatch.setattr(uuc, "report", lambda *a, **k: None)
++    calls = iter([
++        types.SimpleNamespace(returncode=1, stdout="", stderr=""),
++        types.SimpleNamespace(returncode=1, stdout="tree\na.txt\n", stderr=""),
++    ])
++    monkeypatch.setattr(ucg.subprocess, "run", lambda *a, **k: next(calls))
++    monkeypatch.setattr(ucg, "_git_stdout", lambda *a, **k: "head")
++    assert ucg._synthesize_upstream_merge(["git"], Path(tmp_path), "u" * 40) is None
++    assert "Repair owner: NOT FILED" in capsys.readouterr().out
+-- 
+2.55.0
+

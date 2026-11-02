@@ -1,0 +1,589 @@
+From d76f44fcd9d90f75f3c55d9b8dbab123816f8c33 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 19:58:46 +0000
+Subject: [PATCH] fix(routing): retain subscription quota deadlines and exact
+ pins [daveey]
+
+---
+ agent/model_routing_runtime.py                |  29 ++++-
+ agent/model_routing_unavailable.py            |  41 +++++++
+ agent/turn_api_error.py                       |  13 ++
+ gateway/session_kanban.py                     |  15 ++-
+ hermes_cli/cli_agent_setup_mixin.py           |   7 +-
+ hermes_cli/kanban_db_dispatch.py              |  12 +-
+ hermes_cli/kanban_model_tier.py               |   2 +-
+ hermes_cli/kanban_quota_receipt.py            |  36 ++++++
+ hermes_cli/turn_exit.py                       |   3 +
+ .../test_subscription_quota_exhaustion.py     | 115 ++++++++++++++++++
+ .../test_subscription_quota_receipt.py        |  44 +++++++
+ .../test_kanban_credential_startup_exit.py    |   4 +-
+ .../hermes_cli/test_kanban_provider_walls.py  |   8 +-
+ 13 files changed, 306 insertions(+), 23 deletions(-)
+ create mode 100644 agent/model_routing_unavailable.py
+ create mode 100644 hermes_cli/kanban_quota_receipt.py
+ create mode 100644 tests/agent/test_subscription_quota_exhaustion.py
+ create mode 100644 tests/gateway/test_subscription_quota_receipt.py
+
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 1811701490d..f29ad2cf64b 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -28,6 +28,8 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         from hermes_cli.config_effective import load_user_config_effective
+         config = load_user_config_effective()
+     pools = {}
++    unavailable = []
++    available = []
+     if _temporary_resolution.get():
+         state_path = ":memory:"
+ 
+@@ -40,7 +42,14 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         if key not in pools:
+             pools[key] = load_pool(route["provider"], allowed_auth_types=
+                                   {"oauth"} if route["billing"] == "subscription" else None)
+-        return pools[key].has_available(model=route["model"])
++        if pools[key].has_available(model=route["model"]):
++            available.append(route)
++            return True
++        if route["billing"] == "subscription":
++            from agent.model_routing_unavailable import quota_unavailable
++            if error := quota_unavailable(pools[key], route["model"]):
++                unavailable.append(error)
++        return False
+ 
+     failed = list(excluded)
+     resolved = {}
+@@ -68,6 +77,8 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+             prepare_runtime(resolved)
+ 
+     while True:
++        unavailable.clear()
++        available.clear()
+         try:
+             resolve_model_route(model, provider, config=config, session_id=session_id,
+                                 parent_session_id=parent_session_id, requirements=requirements,
+@@ -76,6 +87,12 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+             return resolved
+         except UnavailableCredential:
+             continue
++        except ModelRoutingError:
++            # Only credential eligibility was lost: policy/capability refusals
++            # never enter eligible(), and a prepared runtime's errors stay fatal.
++            if unavailable and not available and not resolved:
++                raise min(unavailable, key=lambda error: error.resets_at) from None
++            raise
+ 
+ 
+ def refresh_class_anthropic_token(agent):
+@@ -142,7 +159,15 @@ def verify_class_runtime(runtime, metadata):
+         return
+     pool = runtime.get("credential_pool")
+     entry = pool.current() if pool else None
+-    if entry is None or entry.auth_type != "oauth":
++    if entry is None:
++        from agent.model_routing_unavailable import quota_unavailable
++        if pool is not None and any(
++            candidate.auth_type == "oauth" and candidate.runtime_api_key == runtime["api_key"]
++            for candidate in pool.entries()
++        ) and (unavailable := quota_unavailable(pool, metadata["selected_model"])):
++            raise unavailable
++        raise ModelRoutingError("Subscription OAuth credential is unavailable; no selected pool entry")
++    if entry.auth_type != "oauth":
+         raise ModelRoutingError("Subscription routing requires an OAuth credential, never a paid API key")
+     from hermes_cli.runtime_provider import _pool_entry_api_key
+     if runtime["api_key"] != _pool_entry_api_key(entry):
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+new file mode 100644
+index 00000000000..e9992f2acb3
+--- /dev/null
++++ b/agent/model_routing_unavailable.py
+@@ -0,0 +1,41 @@
++"""Recoverable subscription capacity refusals without entering legacy paid fallback."""
++from agent.model_routing import ModelRoutingError
++
++
++class SubscriptionQuotaUnavailable(ModelRoutingError):
++    """Policy is satisfied, but its OAuth pool cannot serve until a known reset."""
++
++    status_code = 429
++
++    def __init__(self, provider, model, resets_at):
++        self.provider, self.model, self.resets_at = provider, model, resets_at
++        message = f"Subscription quota unavailable for {provider}/{model}; resets at {resets_at}"
++        self.body = {"error": {"type": "rate_limit_error", "message": message, "resets_at": resets_at}}
++        super().__init__(message)
++
++
++def quota_unavailable(pool, model):
++    """Only a known cooldown is quota evidence; empty/dead OAuth pools are not."""
++    from agent.credential_pool import STATUS_DEAD, _exhausted_until
++    from agent.credential_pool_model_cooldowns import MODEL_ENTITLEMENT_BENCH_SECONDS, model_cooldown_until
++    import time
++
++    if pool is None:
++        return None
++    now = time.time()
++    entries = [entry for entry in pool.entries() if entry.auth_type == "oauth" and entry.last_status != STATUS_DEAD]
++    waits = []
++    for entry in entries:
++        account = _exhausted_until(entry, sole_credential=len(entries) <= 1)
++        if account and account > now and entry.last_error_code != 429:
++            continue  # an auth/refresh/billing bench is not evidence of quota
++        model_reset = model_cooldown_until(entry, model)
++        if model_reset and model_reset - now >= MODEL_ENTITLEMENT_BENCH_SECONDS / 2:
++            continue  # entitlement benches do not reopen on a quota reset
++        reset = max(account or 0, model_reset or 0)
++        if reset <= now:
++            return None  # not an exhausted pool
++        waits.append(reset)
++    if waits:
++        return SubscriptionQuotaUnavailable(pool.provider, model, min(waits))
++    return None
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index 439409d2871..60ebc39cdab 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -147,6 +147,19 @@ def handle_api_error(
+         reason=classified.reason.value,
+     )
+ 
++    # A local quota refusal is not another provider response: rotating it would
++    # re-bench the last token and lose the original reset. Yield to the scheduler.
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    if isinstance(api_error, SubscriptionQuotaUnavailable):
++        return _verdict("return", max_retries_exhausted_result(
++            agent, api_error, classified, attempts=retry_count, is_rate_limited=True,
++            error_msg=str(api_error), api_kwargs=api_kwargs, api_messages=api_messages,
++            messages=messages, conversation_history=conversation_history,
++            api_call_count=api_call_count, approx_tokens=approx_tokens, provider=agent.provider,
++            base_url=agent.base_url, model=agent.model,
++            delivered=settle_delivered_partial(agent, messages, current_turn_user_idx),
++        ))
++
+     # This machine lost its network (DNS fails locally, e.g. a laptop's dark wake): wait for it to
+     # come back on awake time before consuming retry or credential-rotation recovery budgets.
+     _offline = wait_out_offline(
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index eae3b9c3841..af36cb592b1 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -278,17 +278,19 @@ def _run_worker_turns(agent, frame, history):
+                                           **({'task_id': task_id} if task_id else {}),
+                                           **({'turn_author': author} if author is not None else {}))
+     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+-    code, last_output = 1, ''
++    code, last_output, failure = 1, '', None
+     try:
+         result = _run_task_turns(agent, frame, history, context)
++        failure = result
+         code = turn_exit_code(result, kanban_worker=True)
+         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
+         return result
+     except Exception as exc:
++        failure = exc
+         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+         raise
+     finally:
+-        _record_worker_result(context, code, last_output)
++        _record_worker_result(context, code, last_output, failure)
+ 
+ 
+ def record_start_failure(frame, exc):
+@@ -299,7 +301,7 @@ def record_start_failure(frame, exc):
+         return
+     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+     _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
+-                          start_failure_line(exc))
++                          start_failure_line(exc), exc)
+     exc._kanban_failure_booked = True
+ 
+ 
+@@ -316,7 +318,7 @@ def record_worker_failure(frame, exc):
+             return
+         from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+         _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
+-                              failure_line(exc, 'Worker failed'))
++                              failure_line(exc, 'Worker failed'), exc)
+     except Exception:
+         import logging
+         logging.getLogger(__name__).debug('could not book the worker failure cause', exc_info=True)
+@@ -335,18 +337,19 @@ def start_failure_line(exc):
+     return failure_line(exc, 'Worker could not start')
+ 
+ 
+-def _record_worker_result(context, code, last_output):
++def _record_worker_result(context, code, last_output, failure=None):
+     _TURNS_DONE.set()
+     import os
+     from hermes_cli.kanban_db_connect import connect_closing
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_quota_receipt import quota_fields
+     with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+         if _bound_worker_matches(conn, context):
+             # Closing a run clears its claim/PID and replaces metadata; keep the
+             # result in the immutable attempt event stream instead.
+             kb._append_event(conn, context['task_id'], 'worker_result',
+                 {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+-                 'last_output': last_output}, run_id=context['run_id'])
++                 'last_output': last_output, **quota_fields(failure)}, run_id=context['run_id'])
+ 
+ 
+ def record_worker_loss(policy, reason, *, pid=None, bound=False):
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index 3d9da5cdde9..dccb7b997bf 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -307,13 +307,14 @@ class CLIAgentSetupMixin:
+                 if runtime is not None:
+                     _primary_exc = None
+         if runtime is None:
+-            from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+-            self._credentials_rate_limited = bool(_primary_exc) and is_rate_limited_auth_error(_primary_exc)
++            from hermes_cli.turn_exit import credential_failure_flags
++            flags = credential_failure_flags(_primary_exc)
++            self._credentials_rate_limited = flags.get("credentials_rate_limited", False)
+             # Only an explicit re-authentication requirement, or a pin the managed routing
+             # registry refuses (config; a retry never heals it), is terminal. Unknown
+             # resolver/network failures must not acquire the sticky Kanban block.
+             from agent.model_routing_managed import ManagedPinRejectedError
+-            self._credentials_terminal = ((isinstance(_primary_exc, AuthError) and _primary_exc.relogin_required)
++            self._credentials_terminal = (flags.get("credentials_terminal", False)
+                                           or isinstance(_primary_exc, ManagedPinRejectedError))
+             message = format_runtime_provider_error(_primary_exc) if _primary_exc else t("cli.startup.provider_resolution_failed")
+             if getattr(self, "tool_progress_mode", "full") == "off":
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 69ad27f0749..e13fec8ed63 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -100,7 +100,7 @@ _COMPLETION_GATE_ERROR_PREFIXES = ("PR acceptance ",)
+ DEFAULT_GUARD_HOLD_CAP_SECONDS = 30 * 60
+ DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS = 6 * 3600
+ _GUARD_HOLD_SHORT_CAP_REASONS = frozenset({"blocker_auth"})
+-_GUARD_HOLD_EXEMPT_REASONS = frozenset({"shared_blocker", "model_provider_mismatch", "model_pin_not_in_routing_registry"})
++_GUARD_HOLD_EXEMPT_REASONS = frozenset({"shared_blocker", "model_provider_mismatch", "model_pin_not_in_routing_registry", "subscription_quota_reset"})
+ 
+ 
+ def _env_seconds(name: str, default: int) -> int:
+@@ -1728,12 +1728,10 @@ def check_respawn_guard(
+         return None
+ 
+     now = int(time.time())
+-
+-    # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
+-    #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
+-    #    An infrastructure spawn refusal (#114720) shares the cooldown: the host
+-    #    condition is not the card's, so it retries forever, spaced, and never
+-    #    reaches the breaker.
++    from hermes_cli.kanban_quota_receipt import waiting_for_quota_reset
++    if waiting_for_quota_reset(conn, task_id, now):
++        return "subscription_quota_reset"
++    # Only the latest run gates admission; quota and infrastructure failures are neutral.
+     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
+     latest_run = conn.execute(
+         "SELECT outcome, ended_at, metadata FROM task_runs "
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index b94a8a47349..4663d94d262 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -305,7 +305,7 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+         elif unresolved:
+             logger.warning("kanban model tier: %s pin has no provider (%s)", getattr(task, "id", "?"), unresolved)
+             reason = "pinned+provider_unresolved"
+-    if reason not in ("off", "profile_out_of_scope"):
++    if reason not in ("off", "profile_out_of_scope") and not reason.startswith("pinned"):
+         try:
+             from hermes_cli import kanban_provider_walls as _walls
+             cfg_ = load_tier_config() if cfg is None else cfg
+diff --git a/hermes_cli/kanban_quota_receipt.py b/hermes_cli/kanban_quota_receipt.py
+new file mode 100644
+index 00000000000..5d15edcaf8d
+--- /dev/null
++++ b/hermes_cli/kanban_quota_receipt.py
+@@ -0,0 +1,36 @@
++"""Typed quota deadlines retained in attempt receipts, not provider-wide guesses."""
++import math
++
++
++def quota_fields(failure):
++    """Allowlisted, credential-free fields from a failed turn or startup exception."""
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    seen = set()
++    while isinstance(failure, BaseException) and id(failure) not in seen:
++        seen.add(id(failure))
++        if isinstance(failure, SubscriptionQuotaUnavailable):
++            failure = {'failure_reason': 'rate_limit', 'failure_resets_at': failure.resets_at}
++            break
++        failure = failure.__cause__ or failure.__context__
++    if not isinstance(failure, dict) or failure.get('failure_reason') != 'rate_limit':
++        return {}
++    reset = failure.get('failure_resets_at')
++    if type(reset) not in (float, int) or not math.isfinite(reset):
++        return {}
++    return {'failure_reason': 'rate_limit', 'failure_retryable': True, 'failure_resets_at': reset}
++
++
++def waiting_for_quota_reset(conn, task_id, now):
++    """Only the latest ended attempt's receipt can defer its next admission."""
++    from hermes_cli import kanban_db as kb
++    row = conn.execute(
++        "SELECT e.payload FROM task_runs r JOIN task_events e ON e.run_id=r.id "
++        "AND e.task_id=r.task_id AND e.kind='worker_result' "
++        "WHERE r.id=(SELECT id FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
++        "ORDER BY ended_at DESC,id DESC LIMIT 1) AND r.outcome='rate_limited' "
++        "ORDER BY e.id DESC LIMIT 1", (task_id,)).fetchone()
++    if row is None:
++        return False
++    receipt = kb._json_dict(row[0])
++    fields = quota_fields(receipt)
++    return receipt.get('exit_code') == kb.KANBAN_RATE_LIMIT_EXIT_CODE and fields.get('failure_resets_at', 0) > now
+diff --git a/hermes_cli/turn_exit.py b/hermes_cli/turn_exit.py
+index 6c145d01954..4029a6194ba 100644
+--- a/hermes_cli/turn_exit.py
++++ b/hermes_cli/turn_exit.py
+@@ -49,9 +49,12 @@ def credential_failure_flags(exc) -> dict:
+     ``AuthError`` is transient, only an explicit re-authentication requirement is terminal. The
+     cause chain is walked because agent construction wraps the resolver's error."""
+     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
+     seen = set()
+     while exc is not None and id(exc) not in seen:
+         seen.add(id(exc))
++        if isinstance(exc, SubscriptionQuotaUnavailable):
++            return {"credentials_rate_limited": True, "credentials_terminal": False}
+         if isinstance(exc, AuthError):
+             return {"credentials_rate_limited": is_rate_limited_auth_error(exc),
+                     "credentials_terminal": bool(exc.relogin_required)}
+diff --git a/tests/agent/test_subscription_quota_exhaustion.py b/tests/agent/test_subscription_quota_exhaustion.py
+new file mode 100644
+index 00000000000..02ee095c652
+--- /dev/null
++++ b/tests/agent/test_subscription_quota_exhaustion.py
+@@ -0,0 +1,115 @@
++"""An exhausted OAuth pool remains a quota wall, never a paid-auth accusation."""
++import json
++import time
++from unittest.mock import patch
++
++import anthropic
++import httpx
++import pytest
++
++from run_agent import AIAgent
++from tests.agent import test_managed_subscription as fixtures
++from tests.agent.test_class_failure_wire import completion
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.mark.parametrize('stream', [False, True])
++def test_success_then_pool_exhaustion_retains_quota_and_pin(managed, stream):
++    sent = []
++    reset = time.time() + 7200
++    original = anthropic.Anthropic
++
++    def respond(request):
++        sent.append(request)
++        body = json.loads(request.content)
++        if len(sent) > 1:
++            return httpx.Response(429, json={'type': 'error', 'error': {
++                'type': 'rate_limit_error', 'message': 'Subscription usage limit reached',
++                'resets_at': reset}})
++        if body.get('stream'):
++            return completion(body['model'])
++        return httpx.Response(200, json={'id': 'message', 'type': 'message', 'role': 'assistant',
++            'model': body['model'], 'content': [{'type': 'text', 'text': 'ok'}],
++            'stop_reason': 'end_turn', 'usage': {'input_tokens': 1, 'output_tokens': 1}})
++
++    def sdk(**kwargs):
++        kwargs.update(http_client=httpx.Client(transport=httpx.MockTransport(respond)), max_retries=0)
++        return original(**kwargs)
++
++    with patch('anthropic.Anthropic', side_effect=sdk), \
++         patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.title_generator._auto_title_enabled', return_value=False), \
++         patch('agent.turn_api_error.interruptible_backoff_sleep', return_value=None), \
++         patch('agent.turn_recovery.interruptible_backoff_sleep', return_value=None):
++        agent = AIAgent(model='anthropic-deep', provider='anthropic', session_id='quota-wire',
++                        quiet_mode=True, skip_memory=True, skip_context_files=True, max_iterations=2)
++        agent._disable_streaming = not stream
++        try:
++            assert agent.run_conversation('Say ok')['final_response'] == 'ok'
++            result = agent.run_conversation('Say ok again')
++            assert agent._credential_pool.current() is None
++            assert result.get('failure_reason') == 'rate_limit', result
++            assert result.get('failure_retryable') is True
++            assert result.get('failure_resets_at') == pytest.approx(reset, rel=0, abs=0.01)
++            assert 'paid API key' not in result.get('final_response', '')
++            assert agent.model == 'anthropic-deep'
++            assert agent.model_routing['exact_pin'] is True
++            assert agent._fallback_chain == []
++        finally:
++            agent.release_clients()
++    assert len(sent) == 2
++    assert all(r.headers.get('authorization', '').startswith('Bearer sk-ant-oat') for r in sent)
++    assert all('x-api-key' not in r.headers for r in sent)
++    assert all(json.loads(r.content)['model'] == 'anthropic-deep' for r in sent)
++
++
++def test_pinned_startup_preserves_quota_type_and_deadline(managed):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from hermes_cli.runtime_provider import resolve_runtime_provider, resolve_runtime_with_fallback
++    from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
++
++    runtime = resolve_runtime_provider(requested='anthropic', target_model='anthropic-deep',
++                                       routing_session_id='before-quota')
++    reset = time.time() + 7200
++    pool = runtime['credential_pool']
++    assert pool.mark_exhausted_and_rotate(status_code=429, model='anthropic-deep',
++        credential_id='subscription', error_context={'reset_at': reset}, failure_reason='rate_limit') is None
++    with pytest.raises(SubscriptionQuotaUnavailable) as caught:
++        resolve_runtime_with_fallback(managed, requested='anthropic', target_model='anthropic-deep',
++                                      routing_session_id='pinned-start')
++    assert caught.value.resets_at == pytest.approx(reset, rel=0, abs=0.01)
++    assert caught.value.model == 'anthropic-deep'
++    assert turn_exit_code(None, kanban_worker=True, **credential_failure_flags(caught.value)) == 75
++    wrapped = RuntimeError('agent init failed')
++    wrapped.__cause__ = caught.value
++    assert turn_exit_code(None, kanban_worker=True, **credential_failure_flags(wrapped)) == 75
++
++
++@pytest.mark.parametrize('key', ['synthetic-paid', 'sk-ant-oat-foreign'])
++def test_exhaustion_does_not_hide_foreign_runtime_credential(managed, key):
++    from agent.model_routing import ModelRoutingError
++    from agent.model_routing_runtime import verify_class_runtime
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    runtime = resolve_runtime_provider(requested='anthropic', target_model='anthropic-deep')
++    runtime['credential_pool'].mark_exhausted_and_rotate(status_code=429, model='anthropic-deep',
++        credential_id='subscription', error_context={'reset_at': time.time() + 7200})
++    runtime['api_key'] = key
++    with pytest.raises(ModelRoutingError) as caught:
++        verify_class_runtime(runtime, runtime['model_routing'])
++    assert not isinstance(caught.value, SubscriptionQuotaUnavailable)
++
++
++def test_subscription_deadline_ignores_paid_pool_rows(managed):
++    from agent.credential_pool import load_pool
++    from agent.model_routing_unavailable import quota_unavailable
++    pool = load_pool('anthropic', allowed_auth_types={'oauth'})
++    now = time.time()
++    pool.mark_exhausted_and_rotate(status_code=429, model='anthropic-deep',
++        credential_id='paid', error_context={'reset_at': now + 1800})
++    pool.mark_exhausted_and_rotate(status_code=429, model='anthropic-deep',
++        credential_id='subscription', error_context={'reset_at': now + 7200})
++    assert quota_unavailable(pool, 'anthropic-deep').resets_at == pytest.approx(now + 7200, rel=0, abs=0.01)
+diff --git a/tests/gateway/test_subscription_quota_receipt.py b/tests/gateway/test_subscription_quota_receipt.py
+new file mode 100644
+index 00000000000..32aab089b5d
+--- /dev/null
++++ b/tests/gateway/test_subscription_quota_receipt.py
+@@ -0,0 +1,44 @@
++"""Quota receipts retain the reset through worker startup and admission."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++from gateway import session_kanban
++from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
++from hermes_cli.kanban_db_connect import connect_closing
++from tests.gateway.test_kanban_result_exit import _bound_claim
++
++
++@pytest.mark.parametrize('startup', [False, True])
++def test_quota_receipt_gates_admission_until_reset(tmp_path, monkeypatch, startup):
++    now = 1_900_000_000
++    reset = now + 7200
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    path, context = _bound_claim(tmp_path, monkeypatch)
++    frame = {'policy': {'kanban_json': json.dumps(context)}}
++    if startup:
++        session_kanban.record_start_failure(frame, SubscriptionQuotaUnavailable('anthropic', 'exact-model', reset))
++    else:
++        result = {'failed': True, 'completed': False, 'failure_reason': 'rate_limit',
++                  'failure_retryable': True, 'failure_resets_at': reset}
++        monkeypatch.setattr(session_kanban, '_run_task_turns', lambda *_: result)
++        session_kanban.run_worker_turns(SimpleNamespace(), frame, [])
++    with connect_closing(path) as conn:
++        row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_result' ORDER BY id DESC LIMIT 1",
++                           (context['task_id'],)).fetchone()
++        receipt = json.loads(row[0])
++        assert receipt['exit_code'] == 75
++        assert receipt['failure_reason'] == 'rate_limit'
++        assert receipt['failure_resets_at'] == reset
++        conn.execute("UPDATE task_runs SET outcome='rate_limited',status='rate_limited',ended_at=? WHERE id=?",
++                     (now, context['run_id']))
++        conn.execute("UPDATE tasks SET status='ready',current_run_id=NULL,claim_lock=NULL,claim_expires=NULL,worker_pid=NULL WHERE id=?",
++                     (context['task_id'],))
++        conn.commit()
++        monkeypatch.setattr(kb.time, 'time', lambda: now + 600)
++        assert dispatch.check_respawn_guard(conn, context['task_id']) == 'subscription_quota_reset'
++        assert dispatch.guard_hold_cap_seconds('subscription_quota_reset') is None
++        monkeypatch.setattr(kb.time, 'time', lambda: reset + 1)
++        assert dispatch.check_respawn_guard(conn, context['task_id']) is None
+diff --git a/tests/hermes_cli/test_kanban_credential_startup_exit.py b/tests/hermes_cli/test_kanban_credential_startup_exit.py
+index f451c41bc51..9d33c416a9b 100644
+--- a/tests/hermes_cli/test_kanban_credential_startup_exit.py
++++ b/tests/hermes_cli/test_kanban_credential_startup_exit.py
+@@ -6,17 +6,19 @@ import pytest
+ import cli
+ from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE
+ from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
+ 
+ 
+ @pytest.mark.parametrize("quiet", [False, True])
+ @pytest.mark.parametrize("worker", [False, True])
+-@pytest.mark.parametrize("kind,worker_exit", [("revoked", 78), ("quota", 75), ("unknown", 1)])
++@pytest.mark.parametrize("kind,worker_exit", [("revoked", 78), ("quota", 75), ("subscription", 75), ("unknown", 1)])
+ def test_credential_resolution_exit(monkeypatch, quiet, worker, kind, worker_exit):
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+     if worker:
+         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture")
+     errors = {
++        "subscription": SubscriptionQuotaUnavailable("anthropic", "exact-model", 1_900_000_000),
+         "revoked": AuthError("fixture revoked", provider="openai-codex", code="invalid_grant", relogin_required=True),
+         "quota": AuthError("fixture quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE),
+         "unknown": RuntimeError("fixture transport"),
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index afdfc854916..ae55c3788d6 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -9,9 +9,11 @@ from hermes_cli import kanban_provider_walls as walls
+ from hermes_cli.kanban_model_tier import apply_model_tier
+ 
+ from tests.hermes_cli.test_kanban_model_tier import (
+-    OPUS, SONNET, _dispatch, _tier_events, _write_cfg, board,
++    OPUS, SONNET, _dispatch, _tier_events, _write_cfg, board as _board_fixture,
+ )
+ 
++board = _board_fixture
++
+ CODEX = "openai-codex"
+ 
+ 
+@@ -47,7 +49,7 @@ def test_keep_pattern_card_retiered_off_walled_profile_provider(board, monkeypat
+     assert "wall:openai-codex" in _tier_events(conn, tid)[-1]["reason"]
+ 
+ 
+-def test_pinned_card_on_walled_provider_moves_unless_require_model(board, monkeypatch):
++def test_pinned_card_on_walled_provider_keeps_exact_pin(board, monkeypatch):
+     _write_cfg(board, default_model=SONNET, default_provider="anthropic")
+     monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
+     walls.record_wall(CODEX, 524389, path=board / "w.json")
+@@ -56,7 +58,7 @@ def test_pinned_card_on_walled_provider_moves_unless_require_model(board, monkey
+     b = kb.create_task(conn, title="b require_model", assignee="default", model_override="gpt-6-astra",
+                        provider_override=CODEX)
+     seen = _dispatch(conn)
+-    assert seen[a][:2] == (SONNET, "anthropic")
++    assert seen[a][:2] == ("gpt-6-astra", CODEX)
+     assert seen[b][:2] == ("gpt-6-astra", CODEX)
+ 
+ 
+-- 
+2.55.0
+

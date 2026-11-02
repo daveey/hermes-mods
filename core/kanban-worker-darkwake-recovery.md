@@ -46,3 +46,33 @@ Apply in full-series order (`git am -3 --empty=keep`, [README.md](README.md) App
 ## Plugin?
 
 No. The breaker, in-place recovery and stale-claim sweep are core agent, gateway and Kanban DB paths with no plugin hook.
+
+## Follow-up patch (1544): offline DarkWakes don't spend the recovery budget
+
+Patch: `patches/1544-fix-kanban-preserve-recovery-budget-across-offline-D.patch` (`c83c7fc67a`, `fix(kanban): preserve recovery budget across offline DarkWakes`).
+
+**Behavior.** After 1509 a worker survived the lease lapse, but each networkless maintenance wake still failed one turn and spent one in-place recovery attempt, so a long sleep with several DarkWakes could use up `max_recovery_attempts()` and fail the run. Now a network-class failure seen while the host is observably offline waits for the network instead, and the retry after that wait is not charged. Failures with working DNS keep the normal bounded budget.
+
+**How it works.** New `wait_out_worker_offline(result, check)` in `agent/kanban_turn_recovery.py`:
+- It applies only when `failure_reason` is `timeout` or the error text is a local network error (`is_local_network_error`); anything else returns `False` (charged as before).
+- "Offline" needs both DNS controls to fail: `NETWORK_CONTROL_HOST` (`github.com`) and `example.com`. A single blocked or sinkholed control name is not offline.
+- It loops the shared `retry_utils.wait_for_network` in windows of `DEFAULT_OFFLINE_WAIT_SECONDS` (900 awake seconds), repeating while `check()` still says this worker owns the exact claim, and the wait is interrupted when the claim is lost.
+- It returns `True` after a real offline wait that ended online (uncharged retry), `False` when DNS came back on the first lookup (`already_online`, a one-lookup blip is charged), and `None` when the claim was lost.
+
+`recover_failed_kanban_turns` calls it before every attempt. `None` emits recovery-skipped and stops before any backoff or re-entry. An uncharged retry logs `offline recovery uncharged` in place of `attempt N/M`. The return value is now the count of charged (online) attempts, and `should_recover_turn` is asked with `attempt=0` because the loop enforces the budget itself. No lease is written. The worker still never extends its own claim.
+
+**Code.** `agent/kanban_turn_recovery.py`.
+
+**Tests.** From the patch; **not run for this mirror**. In `tests/agent/test_kanban_darkwake_recovery.py`:
+- `test_repeated_offline_darkwakes_preserve_the_run`: parametrized over a Codex connection error and an Anthropic stale stream, with simulated sleep gaps on a host-local managed run.
+- `test_offline_claim_loss_does_not_spend_an_attempt` and `test_offline_wait_still_fences_a_stolen_run` (`reclaim`, `relock`).
+- `test_offline_gate_preserves_normal_retry_authority`: online and non-network failures stay charged.
+- `test_mixed_offline_and_online_failures_only_charge_online_attempts`.
+- `test_one_failed_control_lookup_is_not_an_offline_exemption` (`blocked-control`, `single-blip`).
+
+`tests/agent/test_kanban_turn_recovery.py` and `tests/gateway/test_session_kanban_turn_recovery.py` only add an online-DNS fixture. The source owner reported 29 green in the DarkWake file (1509 baseline: 6 failed, 23 passed) and green exact-SHA CI. DNS and sleep are simulated through monkeypatched seams; no real outage was tested.
+
+**Gotchas.**
+- DNS answering is permission to retry, not proof that the provider is reachable. A provider outage while DNS works still spends attempts.
+- The offline wait has no attempt cap of its own. It is bounded only by claim ownership, so a host that stays offline keeps the run claimed until the dispatcher reclaims it.
+- Apply after 1509 in full-series order; standalone application is not certified.

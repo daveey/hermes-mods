@@ -1,0 +1,170 @@
+From a7f0ae1033ddba372bcbeee4645d76beabb26287 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:35:09 +0000
+Subject: [PATCH] test(kanban): exercise fresh owner-wake discovery and revoked
+ board grants [daveey]
+
+---
+ .../test_kanban_owner_wake_cross_board.py     | 103 ++++++++++++++++++
+ tools/kanban_tools_self_heal.py               |   9 +-
+ 2 files changed, 108 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tools/test_kanban_owner_wake_cross_board.py b/tests/tools/test_kanban_owner_wake_cross_board.py
+index 70567df8b98..3cba98ed054 100644
+--- a/tests/tools/test_kanban_owner_wake_cross_board.py
++++ b/tests/tools/test_kanban_owner_wake_cross_board.py
+@@ -1,5 +1,9 @@
+ """Owner-wake grants cross local boards without unpinning ordinary workers."""
+ import json
++import os
++import subprocess
++import sys
++
+ 
+ import pytest
+ 
+@@ -98,3 +102,102 @@ def test_ambiguous_id_requires_board(monkeypatch):
+         assert "ambiguous" in out.get("error", ""), out
+         assert kb.get_task(own, target).status == "triage"
+         assert json.loads(kt._handle_unblock({"task_id": target, "board": "default"})).get("ok")
++
++
++@pytest.mark.parametrize("creator", ["owner-wake", "default"])
++def test_fresh_worker_registry_describe_and_dispatch(monkeypatch, creator):
++    from pathlib import Path
++    Path(os.environ["HERMES_HOME"], "config.yaml").write_text(
++        "tools:\n  tool_search:\n    defer: [kanban_unblock]\n")
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    kb.create_board("ops")
++    with kbc.connect_closing() as own, kbc.connect_closing(board="ops") as target_conn:
++        target = _card(target_conn, kb, "target", "triage")
++        sup = _supervisor(own, kb, [_line(f"ops/{target}")], created_by=creator)
++        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
++        _as_worker(monkeypatch, own, kb, sup)
++        script = '''
++import json, sys
++from model_tools import get_tool_definitions
++from tools.tool_search import dispatch_tool_describe, resolve_underlying_call
++from tools.registry import registry
++defs = get_tool_definitions(enabled_toolsets=["kanban"], skip_tool_search_assembly=True)
++names = {d["function"]["name"] for d in defs}
++allowed = sys.argv[2] == "owner-wake"
++assert ("kanban_unblock" in names) is allowed, names
++described = json.loads(dispatch_tool_describe({"names": ["kanban_unblock"]}, current_tool_defs=defs))
++assert ("kanban_unblock" in described["tools"]) is allowed, described
++args = {"task_id": sys.argv[1], "board": "ops"}
++name, parsed, error = resolve_underlying_call(
++    {"calls": [{"name": "kanban_unblock", "arguments": args}]}, session_tool_names=names)
++if allowed:
++    assert name == "kanban_unblock" and error is None, error
++    shown = json.loads(registry.dispatch("kanban_show", args))
++    assert shown["task"]["id"] == sys.argv[1], shown
++    result = json.loads(registry.dispatch(name, parsed))
++    assert result["ok"] and result["status"] == "ready", result
++else:
++    assert error and name is None, (name, error)
++print("fresh registry/describe/dispatch verified", allowed)
++'''
++        result = subprocess.run([sys.executable, "-c", script, target, creator],
++                                env=os.environ.copy(), text=True, capture_output=True, timeout=90, check=False)
++        assert result.returncode == 0, result.stdout + result.stderr
++        assert kb.get_task(target_conn, target).status == ("ready" if creator == "owner-wake" else "triage")
++
++
++@pytest.mark.parametrize("change", ["board", "body", "run", "target_status"])
++def test_revocation_at_transition_boundary(monkeypatch, change):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    kb.create_board("ops")
++    with kbc.connect_closing() as own, kbc.connect_closing(board="ops") as other:
++        target = _card(other, kb, "target", "triage")
++        sup = _supervisor(own, kb, [_line(f"ops/{target}")])
++        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
++        _as_worker(monkeypatch, own, kb, sup)
++        original = kt._board
++        from contextlib import contextmanager
++
++        calls = 0
++
++        @contextmanager
++        def changed_board(board_arg):
++            nonlocal calls
++            calls += 1
++            if calls == 2:
++                if change == "target_status":
++                    other.execute("UPDATE tasks SET status='running' WHERE id=?", (target,))
++                    other.commit()
++                elif change == "run":
++                    own.execute("UPDATE tasks SET current_run_id=NULL WHERE id=?", (sup,))
++                    own.commit()
++                else:
++                    body = kb.get_task(own, sup).body
++                    own.execute("UPDATE tasks SET body=? WHERE id=?",
++                                (body.replace("ops/", "default/") if change == "board" else "revoked", sup))
++                    own.commit()
++            with original(board_arg) as result:
++                yield result
++
++        # Revoke before the handler enters its target transaction, not after it
++        # already accepted the grant. The second _board is the source recheck.
++        if change == "target_status":
++            # This variant must change before the target acquires its write lock.
++            real_unblock = kb.unblock_task
++
++            def change_target(conn, tid, **kw):
++                other.execute("UPDATE tasks SET status='running' WHERE id=?", (target,))
++                other.commit()
++                return real_unblock(conn, tid, **kw)
++
++            monkeypatch.setattr(kb, "unblock_task", change_target)
++        else:
++            monkeypatch.setattr(kt, "_board", changed_board)
++        result = json.loads(kt._handle_unblock({"task_id": target}))
++        assert not result.get("ok"), result
++        assert kb.get_task(other, target).status == ("running" if change == "target_status" else "triage")
+diff --git a/tools/kanban_tools_self_heal.py b/tools/kanban_tools_self_heal.py
+index d087939f5a1..2d2b43fc86c 100644
+--- a/tools/kanban_tools_self_heal.py
++++ b/tools/kanban_tools_self_heal.py
+@@ -41,12 +41,12 @@ def granted_board(board: Optional[str], tid: str):
+                           worker.current_run_id == kt._worker_run_id(env_tid),
+                           "owner-wake supervisor no longer owns its current run")
+                 if refs[0][0] == kb.get_current_board():
+-                    yield kb, own, env_tid
++                    yield kb, own, (env_tid, refs[0][0])
+                     return
+                 path = kb.board_own_db_path(refs[0][0])
+                 kt._check(path.is_file(), "orchestrator-only: listed owner-wake board is not available locally")
+                 with kbc.connect_closing(db_path=path) as conn:
+-                    yield kb, conn, env_tid
++                    yield kb, conn, (env_tid, refs[0][0])
+                 return
+     with kt._board(board) as (kb, conn):
+         yield kb, conn, None
+@@ -95,8 +95,9 @@ def handle_unblock(args: dict, **kw) -> str:
+     tid = str(tid)
+     env_tid = os.environ.get("HERMES_KANBAN_TASK")
+     if env_tid and tid != env_tid:
+-        with granted_board(args.get("board"), tid) as (kb, conn, owner):
++        with granted_board(args.get("board"), tid) as (kb, conn, grant):
+             from hermes_cli.kanban_requeue import OWNER_WAKE_REQUEUE_STATUSES, requeue_grant
++            owner, target_board = grant if grant else (None, None)
+             via, source = (("owner-wake-requeue", owner) if owner else
+                            requeue_grant(conn, env_tid, tid,
+                                          board=args.get("board") or kb.get_current_board()))
+@@ -113,7 +114,7 @@ def handle_unblock(args: dict, **kw) -> str:
+                             refs = [(slug, target) for slug, target in owner_wake_listed_refs(worker)
+                                     if target == tid and (args.get("board") is None or args["board"] == slug)]
+                             if (worker is None or worker.status != "running" or
+-                                    worker.current_run_id != kt._worker_run_id(owner) or len(refs) != 1):
++                                    worker.current_run_id != kt._worker_run_id(owner) or refs != [(target_board, tid)]):
+                                 return "owner-wake grant or run was revoked"
+                     return None
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,760 @@
+From 1c57026fc2c6424a46780216f948484cd533dfa1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 20:39:21 +0000
+Subject: [PATCH] fix(tui): skip unchanged replica notice scans with SQLite
+ observers [daveey]
+
+---
+ .../test_kanban_remote_idle_read.py           | 483 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |  28 +-
+ tui_gateway/kanban_remote_observations.py     |  39 +-
+ tui_gateway/kanban_replica_observer.py        | 105 ++++
+ 4 files changed, 643 insertions(+), 12 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_idle_read.py
+ create mode 100644 tui_gateway/kanban_replica_observer.py
+
+diff --git a/tests/tui_gateway/test_kanban_remote_idle_read.py b/tests/tui_gateway/test_kanban_remote_idle_read.py
+new file mode 100644
+index 00000000000..25e756d3814
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_idle_read.py
+@@ -0,0 +1,483 @@
++"""An unchanged hub replica costs the notice readers one ``PRAGMA data_version`` on a retained observer connection,
++not a replica read; every commit is read on the next poll, including one published after its WAL frames."""
++import json
++import os
++import selectors
++import sqlite3
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from tests.tui_gateway.test_kanban_remote_arrival import CHAT, OTHER, _card, _hub as _ready_hub
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import kanban_remote_observations as obs
++
++NOW = 1_800_000_000.0
++
++
++def _replica(directory, cards, mode="delete"):
++    directory.mkdir(parents=True, exist_ok=True)
++    path = _ready_hub(directory, cards)
++    with sqlite3.connect(path) as conn:
++        conn.execute(f"PRAGMA journal_mode={mode}")
++    return path
++
++
++def _index(path):
++    with krn._lock:
++        return krn._index(path)
++
++
++def _chat_keys(path, session=CHAT):
++    return sorted(card["key"] for card in _index(path)[1].get(("default", session), ()))
++
++
++def _states(fresh):
++    return sorted((key, state) for (_gw, key, state) in fresh)
++
++
++def _insert(path, card, seq):
++    with sqlite3.connect(path) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,?)", (card["key"], json.dumps(card["task"]), seq))
++
++
++def _observer():
++    from tui_gateway import kanban_replica_observer
++    return kanban_replica_observer
++
++
++def _held(replica):
++    return _observer()._observers[os.path.realpath(replica)][0]
++
++
++def _key(replica):
++    key = _observer().fingerprint(replica)
++    assert key is not None
++    return key
++
++
++def _closed(conn):
++    try:
++        conn.execute("SELECT 1")
++    except sqlite3.ProgrammingError:
++        return True
++    return False
++
++
++def _decodes(monkeypatch):
++    """Ids of the task rows ``observe`` decodes from here on."""
++    seen, real = [], obs._summary
++    monkeypatch.setattr(obs, "_summary", lambda task: seen.append(task.get("id")) or real(task))
++    return seen
++
++
++def _forbid_sqlite(monkeypatch):
++    def forbidden(*args, **kwargs):
++        pytest.fail("an unchanged replica was opened, decoded or written to the observation ledger")
++
++    monkeypatch.setattr(krn, "_ro", forbidden)
++    monkeypatch.setattr(krn, "_task_rows", forbidden)
++    monkeypatch.setattr(obs, "_persist", forbidden)
++    monkeypatch.setattr(sqlite3, "connect", forbidden)
++
++
++@pytest.mark.parametrize("mode", ["delete", "wal", "wal-writer-open"])
++def test_unchanged_replica_is_not_opened_by_either_reader(tmp_path, monkeypatch, mode):
++    replica = _replica(tmp_path, [_card("t_idle", CHAT, status="done", at=NOW)], mode.split("-")[0])
++    writer = sqlite3.connect(replica) if mode == "wal-writer-open" else None  # keeps a live -wal file
++    try:
++        if writer is not None:
++            writer.execute("UPDATE meta SET v=v WHERE k='gateway'")
++            writer.commit()
++            assert os.path.exists(f"{replica}-wal")
++        ledger = tmp_path / "ledger.db"
++        krn._reset_for_tests()
++        index = _index(replica)
++        fresh = obs.observe(replica, ledger, NOW)
++        _index(replica), obs.observe(replica, ledger, NOW)  # settle: reads that raced their own close re-read once
++        assert index[1] and fresh
++
++        traced = []
++        _held(replica).set_trace_callback(traced.append)
++        _forbid_sqlite(monkeypatch)
++        for _ in range(3):
++            assert _index(replica) == index
++            assert obs.observe(replica, ledger, NOW + krn.FRESH_S + 1) == fresh
++        assert traced and set(traced) == {"PRAGMA data_version"}  # the change key is the only statement
++    finally:
++        if writer is not None:
++            writer.close()
++
++
++@pytest.mark.parametrize("mode", ["delete", "wal"])
++def test_every_commit_is_read_on_the_next_poll(tmp_path, mode):
++    replica = _replica(tmp_path, [], mode)
++    ledger = tmp_path / "ledger.db"
++    writer = sqlite3.connect(replica)
++    try:
++        krn._reset_for_tests()
++        assert _chat_keys(replica) == [] and obs.observe(replica, ledger, NOW) == {}
++        done = _card("t_commit", CHAT, status="done", at=NOW)
++        writer.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)", (done["key"], json.dumps(done["task"])))
++        writer.commit()
++        assert _chat_keys(replica) == [done["key"]]
++        assert _states(obs.observe(replica, ledger, NOW + 1)) == [(done["key"], f"done@{int(NOW)}")]
++        blocked = _card("t_commit", CHAT, status="blocked", at=NOW + 5)
++        writer.execute("UPDATE replica SET data=?, seq=2 WHERE key=?", (json.dumps(blocked["task"]), done["key"]))
++        writer.commit()
++        assert _index(replica)[1][("default", CHAT)][0]["task"]["status"] == "blocked"
++        assert (done["key"], f"blocked@{int(NOW) + 5}") in _states(obs.observe(replica, ledger, NOW + 6))
++    finally:
++        writer.close()
++
++
++def test_metadata_only_changes_are_read(tmp_path):
++    card = _card("t_meta", CHAT, status="done", at=NOW)
++    replica = _replica(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE meta SET v='101' WHERE k='head'")
++    krn._reset_for_tests()
++    assert obs.observe(replica, ledger, NOW) == {}
++    assert obs.observe(replica, ledger, NOW) == {}
++    assert _chat_keys(replica) == [card["key"]]
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE meta SET v='101' WHERE k='cursor'")  # catch-up completes, no task row moves
++    assert _states(obs.observe(replica, ledger, NOW)) == [(card["key"], f"done@{int(NOW)}")]
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE meta SET v='hub' WHERE k='gateway'")  # the hub's own cards notify locally
++    assert _chat_keys(replica) == []
++
++
++@pytest.mark.parametrize("aggregate", ["equal", "moved"])
++@pytest.mark.parametrize("how", ["replace", "recreate"])
++def test_replaced_replica_is_reread_even_when_seqs_match(tmp_path, aggregate, how):
++    """Same keys and seqs, different contents: neither the index nor the row decode cache may survive."""
++    a, b = (_card(t, CHAT, status="done", at=NOW - i) for i, t in enumerate(("t_a", "t_b")))
++    replica = _replica(tmp_path / "live", [a, b])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert _chat_keys(replica) == sorted([a["key"], b["key"]])
++    assert len(obs.observe(replica, ledger, NOW)) == 2
++
++    moved_a = _card("t_a", OTHER, status="blocked", at=NOW + 9)  # same key and seq as a
++    if how == "replace":
++        staged = _replica(tmp_path / "stage", [moved_a, b])
++    else:
++        replica.unlink()
++        with pytest.raises(sqlite3.Error):
++            _index(replica)
++        with pytest.raises(sqlite3.Error):
++            obs.observe(replica, ledger, NOW)
++        staged = replica
++        _replica(tmp_path / "live", [moved_a, b])
++    if aggregate == "moved":
++        with sqlite3.connect(staged) as conn:
++            conn.execute("UPDATE replica SET seq=99 WHERE key=?", (b["key"],))
++    if how == "replace":
++        os.replace(staged, replica)
++
++    assert _chat_keys(replica) == [b["key"]]
++    assert _chat_keys(replica, OTHER) == [a["key"]]
++    assert (a["key"], f"blocked@{int(NOW) + 9}") in _states(obs.observe(replica, ledger, NOW + 10))
++
++
++def test_commit_during_a_read_is_read_on_the_next_poll(tmp_path, monkeypatch):
++    replica = _replica(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    late = [_card("t_late_index", CHAT, status="done", at=NOW), _card("t_late_obs", CHAT, status="done", at=NOW)]
++    real_rows, real_snapshot = krn._task_rows, obs._snapshot
++
++    def rows_then_commit(conn, *args):
++        rows = real_rows(conn, *args)
++        _insert(replica, late[0], 1)
++        return rows
++
++    def snapshot_then_commit(*args):
++        got = real_snapshot(*args)
++        _insert(replica, late[1], 2)
++        return got
++
++    krn._reset_for_tests()
++    monkeypatch.setattr(krn, "_task_rows", rows_then_commit)
++    assert _chat_keys(replica) == []
++    monkeypatch.setattr(krn, "_task_rows", real_rows)
++    assert _chat_keys(replica) == [late[0]["key"]]
++
++    monkeypatch.setattr(obs, "_snapshot", snapshot_then_commit)
++    assert [key for key, _ in _states(obs.observe(replica, ledger, NOW))] == [late[0]["key"]]
++    monkeypatch.setattr(obs, "_snapshot", real_snapshot)
++    assert [key for key, _ in _states(obs.observe(replica, ledger, NOW))] == sorted(c["key"] for c in late)
++
++
++def test_failed_reads_recover_and_unstatable_replicas_are_always_read(tmp_path, monkeypatch):
++    replica = _replica(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert _chat_keys(replica) == [] and obs.observe(replica, ledger, NOW) == {}
++    card = _card("t_recover", CHAT, status="done", at=NOW)
++    _insert(replica, card, 1)
++    real_ro = krn._ro
++
++    def unavailable(path):
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(krn, "_ro", unavailable)
++    with pytest.raises(sqlite3.Error):
++        _index(replica)
++    with pytest.raises(sqlite3.Error):
++        obs.observe(replica, ledger, NOW)
++    opened = []
++    monkeypatch.setattr(krn, "_ro", lambda path: opened.append(path) or real_ro(path))
++    assert _chat_keys(replica) == [card["key"]]
++    assert len(obs.observe(replica, ledger, NOW)) == 1
++
++    real_stat = os.stat
++
++    def stat(path, *args, **kwargs):
++        if str(path).startswith(str(replica)):
++            raise PermissionError(path)
++        return real_stat(path, *args, **kwargs)
++
++    monkeypatch.setattr(os, "stat", stat)
++    opened.clear()
++    for _ in range(2):
++        assert _chat_keys(replica) == [card["key"]]
++        assert len(obs.observe(replica, ledger, NOW)) == 1
++    assert len(opened) == 4  # no stamp, no skip
++
++
++def test_replaced_ledger_is_rewritten_on_an_unchanged_replica(tmp_path, monkeypatch):
++    card = _card("t_ledger", CHAT, status="done", at=NOW)
++    replica = _replica(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    first = obs.observe(replica, ledger, NOW)
++    sqlite3.connect(tmp_path / "new-ledger.db").close()
++    os.replace(tmp_path / "new-ledger.db", ledger)
++    persisted = []
++    real_persist = obs._persist
++    monkeypatch.setattr(obs, "_persist", lambda *a: persisted.append(a) or real_persist(*a))
++    assert obs.observe(replica, ledger, NOW) == first
++    assert len(persisted) == 1
++    with sqlite3.connect(ledger) as conn:
++        assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
++
++
++def test_replicas_at_different_paths_do_not_share_results(tmp_path):
++    one = _replica(tmp_path / "one", [_card("t_one", CHAT, status="done", at=NOW)])
++    two = _replica(tmp_path / "two", [_card("t_two", CHAT, status="blocked", at=NOW)])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    for _ in range(3):
++        for path, key, status in ((one, "t_one", "done"), (two, "t_two", "blocked")):
++            assert _chat_keys(path) == [f"default/default/{key}"]
++            assert _states(obs.observe(path, ledger, NOW)) == [(f"default/default/{key}", f"{status}@{int(NOW)}")]
++
++
++def test_unchanged_replica_still_releases_reoffers_and_expires_claims(tmp_path):
++    card = _card("t_claim", CHAT, status="done", at=NOW)
++    replica = _replica(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    first = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW)
++    assert len(first) == 1
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW + 1) == []  # held in flight
++    assert krn.release(first[0], ledger=ledger)
++    assert [c["ref"] for c in krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW + 2)] == \
++        [first[0]["ref"]]
++    assert krn.release(first[0], ledger=ledger)
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW + krn.FRESH_S + 1) == []
++
++
++def _rewrite(path, data):
++    with open(path, "r+b") as handle:  # in place: every connection maps this file
++        handle.write(data)
++        handle.truncate()
++
++
++def test_wal_commit_published_after_its_frames_is_read_on_the_next_poll(tmp_path):
++    """A WAL commit appends and syncs its frames, then publishes them in the -shm index. A poll in between sees
++    the new -wal and the old data; when the commit is published no file but the -shm changes."""
++    replica = _replica(tmp_path, [], "wal")
++    ledger = tmp_path / "ledger.db"
++    keep, writer = sqlite3.connect(replica), sqlite3.connect(replica)  # the -wal outlives every poll
++    try:
++        keep.execute("SELECT 1 FROM meta").fetchall()
++        krn._reset_for_tests()
++        assert _chat_keys(replica) == [] and obs.observe(replica, ledger, NOW) == {}
++        shm = Path(f"{replica}-shm")
++        unpublished = shm.read_bytes()
++        card = _card("t_gap", CHAT, status="done", at=NOW)
++        writer.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)", (card["key"], json.dumps(card["task"])))
++        writer.commit()
++        published = shm.read_bytes()
++        assert published != unpublished
++        _rewrite(shm, unpublished)  # back inside the gap: the frames are in -wal, the index does not cover them
++        assert _chat_keys(replica) == []
++        assert obs.observe(replica, ledger, NOW) == {}
++        _rewrite(shm, published)  # the commit becomes visible
++        assert _chat_keys(replica) == [card["key"]]
++        assert _states(obs.observe(replica, ledger, NOW + 1)) == [(card["key"], f"done@{int(NOW)}")]
++    finally:
++        writer.close()
++        keep.close()
++
++
++_WRITER = textwrap.dedent("""
++    import sqlite3, sys
++    conn = sqlite3.connect(sys.argv[1], isolation_level=None)
++    conn.execute("PRAGMA synchronous=FULL")
++    for line in sys.stdin:
++        seq, key, data = line.rstrip("\\n").split("\\t")
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,?)", (key, data, int(seq)))
++        print(seq, flush=True)
++""")
++
++
++def test_commits_from_another_process_are_each_read_after_they_return(tmp_path):
++    """Smoke: poll without pause while a separate writer process commits; once a commit returns, both readers
++    have it on the next poll (the stat-keyed draft missed 594 of 1000 in this loop)."""
++    replica = _replica(tmp_path, [], "wal")
++    ledger = tmp_path / "ledger.db"
++    writer = subprocess.Popen([sys.executable, "-c", _WRITER, str(replica)], stdin=subprocess.PIPE,
++                              stdout=subprocess.PIPE, text=True)
++    commands, acks = writer.stdin, writer.stdout
++    assert commands is not None and acks is not None
++    selector = selectors.DefaultSelector()
++    selector.register(acks, selectors.EVENT_READ)
++    try:
++        krn._reset_for_tests()
++        keys, missed = [], []
++        for i in range(150):
++            card = _card(f"t_mp{i}", CHAT, status="done", at=NOW)
++            commands.write(f"{i + 1}\t{card['key']}\t{json.dumps(card['task'])}\n")
++            commands.flush()
++            while not selector.select(0):
++                _index(replica), obs.observe(replica, ledger, NOW)
++            assert acks.readline().strip() == str(i + 1)
++            keys.append(card["key"])
++            if _chat_keys(replica) != sorted(keys) or len(obs.observe(replica, ledger, NOW)) != len(keys):
++                missed.append(i)
++        assert missed == []
++    finally:
++        commands.close()
++        writer.wait(timeout=30)
++        selector.close()
++
++
++def test_observer_is_reused_and_holds_no_snapshot(tmp_path):
++    replica = _replica(tmp_path, [_card("t_reuse", CHAT, status="done", at=NOW)], "wal")
++    writer = sqlite3.connect(replica)
++    try:
++        ro = _observer()
++        krn._reset_for_tests()
++        first = _key(replica)
++        conn = _held(replica)
++        traced = []
++        conn.set_trace_callback(traced.append)
++        assert [ro.fingerprint(replica) for _ in range(3)] == [first] * 3
++        assert _held(replica) is conn and len(ro._observers) == 1
++        assert traced == ["PRAGMA data_version"] * 3 and not conn.in_transaction
++        writer.execute("UPDATE meta SET v='102' WHERE k='head'")
++        writer.commit()
++        assert writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0  # no reader pins the WAL
++        moved = _key(replica)
++        assert moved != first and (moved.generation, moved.ident) == (first.generation, first.ident)
++        krn._reset_for_tests()
++        assert _closed(conn) and not ro._observers
++    finally:
++        writer.close()
++
++
++def test_replaced_or_missing_replica_reopens_its_observer(tmp_path):
++    card = _card("t_swap", CHAT, status="done", at=NOW)
++    replica = _replica(tmp_path / "live", [card])
++    ro = _observer()
++    krn._reset_for_tests()
++    first = _key(replica)
++    conn = _held(replica)
++    os.replace(_replica(tmp_path / "stage", [card]), replica)
++    second = _key(replica)
++    assert second.ident != first.ident and second.generation != first.generation and _closed(conn)
++    conn = _held(replica)
++    replica.unlink()
++    assert ro.fingerprint(replica) is None
++    assert _closed(conn) and os.path.realpath(replica) not in ro._observers
++    _replica(tmp_path / "live", [card])
++    assert _key(replica).generation not in (first.generation, second.generation)
++
++
++def test_observers_are_bounded_and_eviction_keeps_decoded_rows(tmp_path, monkeypatch):
++    ro = _observer()
++    replicas = [_replica(tmp_path / f"r{i}", [_card(f"t_bound{i}", CHAT, status="done", at=NOW)])
++                for i in range(ro.MAX_OBSERVERS + 1)]
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert len(obs.observe(replicas[0], ledger, NOW)) == 1
++    first, conn = _key(replicas[0]), _held(replicas[0])
++    for replica in replicas[1:]:
++        assert ro.fingerprint(replica) is not None
++    assert len(ro._observers) == ro.MAX_OBSERVERS and _closed(conn)
++    assert os.path.realpath(replicas[0]) not in ro._observers
++    late = _card("t_bound_late", CHAT, status="done", at=NOW)
++    _insert(replicas[0], late, 7)
++    decoded = _decodes(monkeypatch)
++    again = _key(replicas[0])
++    assert again.generation != first.generation and ro.file_identity(again) == ro.file_identity(first)
++    assert len(obs.observe(replicas[0], ledger, NOW)) == 2
++    assert decoded == ["t_bound_late"]  # an evicted observer is not a changed file
++
++
++def test_observer_failure_is_read_uncached_and_recovers(tmp_path, monkeypatch):
++    replica = _replica(tmp_path, [_card("t_fail", CHAT, status="done", at=NOW)], "wal")
++    ledger = tmp_path / "ledger.db"
++    ro = _observer()
++    krn._reset_for_tests()
++    index, fresh = _index(replica), obs.observe(replica, ledger, NOW)
++    first, conn = _key(replica), _held(replica)
++    real = ro._data_version
++
++    def broken(connection):
++        raise sqlite3.OperationalError("disk I/O error")
++
++    monkeypatch.setattr(ro, "_data_version", broken)
++    opened, real_ro = [], krn._ro
++    monkeypatch.setattr(krn, "_ro", lambda path: opened.append(path) or real_ro(path))
++    decoded = _decodes(monkeypatch)
++    assert ro.fingerprint(replica) is None and _closed(conn) and not ro._observers
++    for _ in range(2):
++        assert _index(replica) == index and obs.observe(replica, ledger, NOW) == fresh
++    assert len(opened) == 4 and decoded == ["t_fail", "t_fail"]  # unknown: read, keep nothing that skips
++    monkeypatch.setattr(ro, "_data_version", real)
++    recovered = _key(replica)
++    assert recovered.generation != first.generation
++    _index(replica), obs.observe(replica, ledger, NOW)
++    opened.clear()
++    assert _index(replica) == index and obs.observe(replica, ledger, NOW) == fresh and opened == []
++
++
++def test_commit_racing_a_read_keeps_unchanged_decoded_rows(tmp_path, monkeypatch):
++    kept = [_card(f"t_keep{i}", CHAT, status="done", at=NOW) for i in range(3)]
++    replica = _replica(tmp_path, kept, "wal")
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert len(obs.observe(replica, ledger, NOW)) == 3
++    new, late = (_card(t, CHAT, status="done", at=NOW) for t in ("t_new", "t_late"))
++    _insert(replica, new, 10)
++    real_snapshot = obs._snapshot
++
++    def snapshot_then_commit(*args):
++        got = real_snapshot(*args)
++        _insert(replica, late, 11)
++        return got
++
++    decoded = _decodes(monkeypatch)
++    monkeypatch.setattr(obs, "_snapshot", snapshot_then_commit)
++    assert len(obs.observe(replica, ledger, NOW)) == 4
++    monkeypatch.setattr(obs, "_snapshot", real_snapshot)
++    assert len(obs.observe(replica, ledger, NOW)) == 5
++    assert decoded == ["t_new", "t_late"]  # the same file: only rows whose seq moved are decoded again
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index dca666529b2..6a8fe4915fe 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -47,7 +47,7 @@ LINK_RELS = ("shepherd",)
+ _TERMINAL = ("done", "blocked")
+ 
+ _lock = threading.Lock()
+-_index_memo: Optional[tuple] = None  # (path, signature, me, index)
++_index_memo: Optional[tuple] = None  # (stamp, file identity, signature, me, index)
+ 
+ 
+ def hub_db_path() -> Path:
+@@ -116,17 +116,27 @@ def _canonical(rows: list[tuple]) -> list[tuple]:
+ 
+ def _index(path: Path) -> tuple[str, dict]:
+     """``(this gateway, {(profile, session): [card, ...]})`` for terminal cards owned by other gateways, cached on
+-    the replica's task-row signature (one decode per change, shared by every chat's poll)."""
++    the replica observer's change key (an unchanged replica is not read) and, for the same db file, on its task-row
++    signature (one decode per change, shared by every chat's poll)."""
+     global _index_memo
++    from tui_gateway.kanban_replica_observer import file_identity, fingerprint
++
++    stamp = fingerprint(path)
++    memo = _index_memo  # (stamp, file identity, sig, me, index), kept only from reads the key brackets
++    if stamp is not None and memo is not None and memo[0] == stamp:
++        return memo[3], memo[4]
++    _index_memo = None
+     conn = _ro(path)
+     try:
+         row = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
+         me = str(row[0]) if row and row[0] else ""
+         sig = conn.execute("SELECT COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll = 'tasks'").fetchone()
+-        memo = _index_memo
+-        if memo is not None and memo[0] == str(path) and memo[1] == sig and memo[2] == me:
+-            return me, memo[3]
++        if (memo is not None and stamp is not None and memo[1] == file_identity(stamp) and memo[2:4] == (sig, me)
++                and fingerprint(path) == stamp):
++            _index_memo = (stamp, *memo[1:])  # same file, no task row moved (a meta write or checkpoint)
++            return me, memo[4]
+         rows = _canonical(_task_rows(conn))
++        stable = stamp is not None and fingerprint(path) == stamp
+     finally:
+         conn.close()
+     index: dict[tuple[str, str], list[dict]] = {}
+@@ -141,7 +151,8 @@ def _index(path: Path) -> tuple[str, dict]:
+             continue
+         for chat in _linked_chats(task, me):
+             index.setdefault(chat, []).append({"gw": str(gw), "key": str(key), "task": task})
+-    _index_memo = (str(path), sig, me, index)
++    if stable:
++        _index_memo = (stamp, file_identity(stamp), sig, me, index)
+     return me, index
+ 
+ 
+@@ -674,11 +685,14 @@ def _record_swept(keys: list[tuple], ledger: Optional[Path], *, reason: str) ->
+ 
+ def _reset_for_tests() -> None:
+     """Forget this process's memos, as a restarted backend would (the ledger file stays)."""
+-    from tui_gateway.kanban_remote_observations import _decoded, _memo
++    from tui_gateway.kanban_remote_observations import _decoded, _decoded_files, _memo
++    from tui_gateway.kanban_replica_observer import reset as reset_observers
+ 
+     global _index_memo
++    reset_observers()
+     _memo.clear()
+     _decoded.clear()
++    _decoded_files.clear()
+     _index_memo = None
+     _delivered.clear()
+     _swept_loaded.clear()
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index d5aec777844..a2e9b0dba0a 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -54,6 +54,7 @@ def _snapshot(replica: Path, previous=None) -> tuple[bool, list[tuple] | None, t
+ # so decoding every row per change kept the notice pollers busy while Desktop sat idle. A row
+ # is re-read only when its seq moved; the summary keeps just the fields _persist reads.
+ _decoded: dict[tuple, tuple] = {}
++_decoded_files: dict[str, tuple | None] = {}  # replica -> file identity its _decoded rows came from
+ 
+ 
+ def _summary(task) -> dict | None:
+@@ -146,25 +147,53 @@ def _file_id(path: Path) -> tuple | None:
+ def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
+     """Only changed replica snapshots decode cards and touch the observation ledger.
+ 
++    An unchanged replica change key (the observer's data_version) skips the replica read entirely; a key is kept
++    only when it brackets the read. A commit racing the read keeps the decoded rows of the same db file (their
++    seqs still gate every re-decode); only a replaced file or an unknown key forgets them.
+     Cache timestamps, not freshness verdicts: a quiet replica must still age out.
+     Ledger replacement invalidates the cache; acknowledgements need not invalidate it.
+     """
+     from tui_gateway.kanban_remote_notices import ledger_path
++    from tui_gateway.kanban_replica_observer import file_identity, fingerprint
+ 
+     ledger = Path(ledger) if ledger is not None else ledger_path()
+     key = (str(replica.resolve()), str(ledger.resolve()))
++    tag = str(replica)
+     with _lock:
+-        cached = _memo.get(key)
+-        if cached is not None and cached[2] != _file_id(ledger):
++        stamp = fingerprint(replica)
++        ident = file_identity(stamp)
++        cached = _memo.get(key)  # (signature, fresh, ledger id, key or None, replica file identity)
++        if cached is not None and (cached[2] != _file_id(ledger) or cached[4] != ident):
++            _memo.pop(key)  # a replaced ledger, or a replaced/recreated/unreadable replica
+             cached = None
++        if cached is not None and stamp is not None and cached[3] == stamp:
++            return cached[1]
++        if ident is None or _decoded_files.pop(tag, None) != ident:
++            _forget_decoded(tag)  # another db file may reuse a key at an equal seq with other contents
+         ready, cards, signature = _snapshot(replica, cached[0] if cached else None)
++        after = fingerprint(replica)
++        if stamp is None or after != stamp:
++            stamp = None  # a commit raced the read: keep nothing that would skip the next poll
++            ident = ident if file_identity(after) == ident else None
++        _decoded_files[tag] = ident
++        while len(_decoded_files) > 16:
++            _forget_decoded(next(iter(_decoded_files)))
+         if not ready:
+             return {}
+         if cards is None and cached is not None:
+-            return cached[1]
+-        fresh = _persist(key[0], cards or [], ledger, now)
+-        _memo[key] = (signature, fresh, _file_id(ledger))
++            fresh = cached[1]
++        else:
++            fresh = _persist(key[0], cards or [], ledger, now)
++        if ident is not None:
++            _memo[key] = (signature, fresh, _file_id(ledger), stamp, ident)
++        else:
++            _memo.pop(key, None)
+         while len(_memo) > 16:
+             _memo.pop(next(iter(_memo)))
+         return fresh
+ 
++
++def _forget_decoded(tag: str) -> None:
++    _decoded_files.pop(tag, None)
++    for ident in [ident for ident in _decoded if ident[0] == tag]:
++        del _decoded[ident]
+diff --git a/tui_gateway/kanban_replica_observer.py b/tui_gateway/kanban_replica_observer.py
+new file mode 100644
+index 00000000000..6806811c61b
+--- /dev/null
++++ b/tui_gateway/kanban_replica_observer.py
+@@ -0,0 +1,105 @@
++"""Change keys for the hub replica from retained read-only SQLite observers. [daveey]
++
++An idle notice poll asks one retained connection per replica for ``PRAGMA data_version`` instead of reading the
++replica. A file stat is not a change key: a WAL commit appends and syncs its frames before it publishes them in
++the -shm index, so a stat taken in that gap pairs the new files with a read of the old data, and nothing the stat
++covers changes when the commit becomes visible (594 of 1000 commits from another process were never read).
++``data_version`` moves with the same visibility a read has, but only within one connection, so every key carries
++the generation of the connection that produced it.
++"""
++from __future__ import annotations
++
++import itertools
++import os
++import sqlite3
++import threading
++from collections import OrderedDict
++from typing import NamedTuple, Optional
++from urllib.parse import quote
++
++MAX_OBSERVERS = 16
++
++_lock = threading.Lock()
++_observers: OrderedDict[str, tuple] = OrderedDict()  # resolved path -> (connection, (dev, inode), generation)
++_generations = itertools.count(1)
++
++
++class Fingerprint(NamedTuple):
++    path: str
++    ident: tuple  # (dev, inode) of the db file the observer holds open
++    generation: int  # which observer connection measured data_version
++    data_version: int
++    signature: tuple  # db file (size, mtime_ns): also invalidates on a restore written under the same inode
++
++
++def fingerprint(path) -> Optional[Fingerprint]:
++    """The replica's change key, or None when unknown (read it and keep nothing that would skip the next poll).
++
++    Equal keys mean no commit was published between them. A missing, replaced or failing replica closes its
++    observer; the next call opens a new one (a new generation, so its keys never equal the old ones).
++    """
++    try:
++        real = os.path.realpath(path)
++    except (OSError, ValueError):
++        return None
++    with _lock:
++        try:
++            st = os.stat(real)
++            ident = (st.st_dev, st.st_ino)
++            held = _observers.get(real)
++            if held is not None and held[1] != ident:
++                _evict(real)  # replaced or recreated under this path
++                held = None
++            if held is None:
++                held = _open(real, ident)
++            _observers.move_to_end(real)
++            version = _data_version(held[0])
++        except (OSError, ValueError, sqlite3.Error):
++            _evict(real)
++            return None
++    return Fingerprint(real, ident, held[2], version, (st.st_size, st.st_mtime_ns))
++
++
++def file_identity(stamp: Optional[Fingerprint]) -> Optional[tuple]:
++    """``(path, dev, inode)``: equal identity means the same db file (possibly rewritten), whichever observer."""
++    return (stamp.path, *stamp.ident) if stamp is not None else None
++
++
++def reset() -> None:
++    """Close every observer (tests, and a backend forgetting its memos)."""
++    with _lock:
++        while _observers:
++            _evict(next(iter(_observers)))
++
++
++def _open(real: str, ident: tuple) -> tuple:
++    conn = sqlite3.connect(f"file:{quote(real)}?mode=ro", uri=True, timeout=1.0, check_same_thread=False,
++                           isolation_level=None)  # autocommit: no statement leaves a read transaction open
++    try:
++        conn.execute("PRAGMA query_only = ON")
++        st = os.stat(real)
++        if (st.st_dev, st.st_ino) != ident:
++            raise sqlite3.OperationalError("replica replaced while its observer opened")
++    except BaseException:
++        conn.close()
++        raise
++    held = _observers[real] = (conn, ident, next(_generations))
++    while len(_observers) > MAX_OBSERVERS:
++        _evict(next(iter(_observers)))
++    return held
++
++
++def _data_version(conn: sqlite3.Connection) -> int:
++    rows = conn.execute("PRAGMA data_version").fetchall()  # stepped to completion: the read lock is released
++    if conn.in_transaction:
++        raise sqlite3.OperationalError("observer left a transaction open")
++    return int(rows[0][0])
++
++
++def _evict(real: str) -> None:
++    held = _observers.pop(real, None)
++    if held is not None:
++        try:
++            held[0].close()
++        except sqlite3.Error:
++            pass
+-- 
+2.55.0
+

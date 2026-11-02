@@ -120,3 +120,23 @@ Not executed in this documentation pass; CLI/REST remote-assignee parity is not 
 Use the complete ordered [README replay recipe](README.md#applying) through 1521. Unknown published
 tools are not proof of capability: create may accept while the landing pickup gate refuses.
 Skipping a local profile check neither grants credentials nor guarantees the remote skill exists.
+
+## Follow-up patch (1558): remote-assignee entry paths and unknown labels
+
+**Patch:** `patches/1558-daveey-Cover-remote-assignee-entry-paths-and-fail-sa.patch` (`9e70ec54cdf`, `Cover remote assignee entry paths and fail safe on unknown labels`).
+
+**Behavior.** Repinning (`set_model_override` via `validate_task_pin`) now follows the same execution-host policy as create (1521): when the card's `runs_on` proves it runs elsewhere, the local profile's model configuration is skipped and a concrete pin must name its provider (`require_remote_pin_provider`); the explicit model/provider family check still applies. A card that runs locally keeps the full local validation, including the managed routing registry. `runs_elsewhere` now also keeps local checks when the registry returns no entry for this machine (empty registry or missing self entry), not only when it is unreachable: unknown labels are not evidence that this machine lacks them.
+
+**How it works / Code.** `hermes_cli/kanban_model_assignment.py::validate_task_pin` reads the card row (tolerating boards without the `runs_on` column), calls `runs_elsewhere`, passes `local_profile=not remote` to `validate_model_assignment`, and returns the explicit pair for remote cards. `hermes_cli/kanban_runs_on_capabilities.py::runs_elsewhere` returns False when `pool.get(me)` is empty.
+
+**Tests.** `tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py`:
+
+- `test_plain_label_remote_profile_creates` (plain `gpu` label resolved through the registry)
+- `test_unknown_local_labels_keep_local_validation` (unreachable, empty, missing-self: create refused, no row)
+- `test_heavy_route_remote_only_assignee` (tool create via heavy-route placement)
+- `test_cli_runs_on_remote_only_assignee` (CLI `--runs-on`, remote creates, local exits 2)
+- `test_set_model_override_uses_execution_host_policy` (remote repin accepted, family mismatch and provider-less pin refused, class selector and clear work; local repin refused by the registry)
+
+REST (dashboard) create and REST repin are not covered here: untested. This mirror did not run these tests.
+
+**Applying / Gotchas.** Apply the full ordered series per [README.md](README.md#applying); standalone application is not certified. A label that the registry cannot settle now always means "validate locally", so a card for a truly remote-only profile is refused at create until the registry lists this machine.

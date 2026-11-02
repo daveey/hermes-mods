@@ -1,0 +1,166 @@
+From 85ea05171a7627251f6b01b2fff2cb4bb80d2a3a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:03:32 -0800
+Subject: [PATCH] fix(kanban): route default-tier cards off a quota-walled
+ default provider [daveey]
+
+kanban.default_model is gpt-6-astra/openai-codex. When every Codex account hit its weekly cap
+(2026-11-01, reset 11-03 22:35 PST) the wall re-tier's only fallback was Codex itself, so it never
+moved a card, and nothing recorded a wall until a worker crashed at startup.
+
+- retier_for_walls tries the strong tier after default_tier and skips any fallback whose own pool
+  is exhausted now.
+- live_quota_wall reads the OAuth pool at claim time (the same evidence the startup resolver raises
+  SubscriptionQuotaUnavailable on), so no worker has to crash to learn the wall.
+- Exact pins keep their tuple (unchanged).
+---
+ hermes_cli/kanban_provider_walls.py           | 58 +++++++++++++++----
+ .../hermes_cli/test_kanban_provider_walls.py  | 54 +++++++++++++++++
+ 2 files changed, 102 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index 6cd0b0adb4f..cc099532174 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -8,7 +8,10 @@
+   ``MIN_WALL_SECONDS`` is left to the normal respawn cooldown).
+ * :func:`retier_for_walls` runs at claim time, after the tier decision. If the provider the worker would
+   run on is walled, the card moves to the configured fallback (``kanban.default_model``/``default_provider``)
+-  unless the fallback is walled too. This covers keep-pattern, review and retry tiers (which resolve to
++  unless the fallback is walled too; when it is (``default_provider`` is the walled one), the strong tier
++  (``kanban.strong_model``/``strong_provider``) is tried next. A provider also counts as walled when its OAuth
++  pool is quota-exhausted for the model right now (:func:`live_quota_wall`), so no worker has to crash first.
++  This covers keep-pattern, review and retry tiers (which resolve to
+   ``model: null`` = profile default) as well as explicit pins. A card whose body contains ``require_model``
+   keeps its pin.
+ * :func:`rate_limit_storm` counts ``rate_limited`` runs in the last hour for the alert card.
+@@ -122,20 +125,55 @@ def record_wall_for_run(conn: sqlite3.Connection, task_id: str, run_id: Optional
+ def retier_for_walls(task: Any, cfg: dict[str, Any], *, now: Optional[float] = None,
+                      path: Optional[Path] = None) -> Optional[tuple[str, str, str]]:
+     """``(model, provider, walled_provider)`` to run on instead, or None to leave the task alone."""
++    if REQUIRE_MODEL_MARKER in f"{getattr(task, 'title', '') or ''}\n{getattr(task, 'body', '') or ''}":
++        return None
+     walls = active_walls(now=now, path=path)
+-    if not walls:
++    task_model = str(getattr(task, "model_override", "") or "").strip()
++    provider = _norm(getattr(task, "provider_override", None)) or (profile_provider() if not task_model else "")
++    if not provider or provider == "auto":
+         return None
+-    if REQUIRE_MODEL_MARKER in f"{getattr(task, 'title', '') or ''}\n{getattr(task, 'body', '') or ''}":
++    if provider not in walls and not live_quota_wall(provider, task_model or profile_model()):
+         return None
+-    provider = _norm(getattr(task, "provider_override", None)) or (
+-        profile_provider() if not str(getattr(task, "model_override", "") or "").strip() else "")
+-    if provider not in walls:
++    # 2026-11-01: kanban.default_model moved to gpt-6-astra/openai-codex, so a Codex wall's only fallback was
++    # Codex itself and every default-tier card waited out a 2.3-day wall while Anthropic had room. Try the
++    # strong tier next; a fallback is usable only when its own pool can serve its model now. [daveey]
++    for key in ("default", "strong"):
++        model = str(cfg.get(f"{key}_model") or "").strip()
++        fb = _norm(cfg.get(f"{key}_provider"))
++        if not model or not fb or fb == "auto" or fb == provider or fb in walls:
++            continue
++        if live_quota_wall(fb, model):
++            continue
++        return model, fb, provider
++    return None
++
++
++def profile_model() -> str:
++    try:
++        from hermes_cli.config import load_config
++        model = (load_config() or {}).get("model") or {}
++        return str(model.get("default") or "").strip() if isinstance(model, dict) else ""
++    except Exception:
++        return ""
++
++
++def live_quota_wall(provider: str, model: str) -> Optional[float]:
++    """Reset time when ``provider``'s OAuth pool is quota-exhausted for ``model`` right now, else None.
++
++    Same evidence the worker's startup resolver raises ``SubscriptionQuotaUnavailable`` on (known 429
++    cooldowns on every live OAuth entry), read at claim time so no worker has to crash to learn it. [daveey]
++    """
++    provider = _norm(provider)
++    if not provider or provider == "auto" or not model or model.startswith("class:"):
+         return None
+-    model = str(cfg.get("default_model") or "").strip()
+-    fb = _norm(cfg.get("default_provider"))
+-    if not model or not fb or fb == "auto" or fb in walls:
++    try:
++        from agent.credential_pool import load_pool
++        from agent.model_routing_unavailable import quota_unavailable
++        unavailable = quota_unavailable(load_pool(provider, allowed_auth_types={"oauth"}), model)
++    except Exception as exc:  # never break dispatch over a pool read
++        logger.debug("kanban walls: live quota check failed for %s/%s (%s)", provider, model, exc)
+         return None
+-    return model, fb, provider
++    return float(unavailable.resets_at) if unavailable is not None else None
+ 
+ 
+ def rate_limit_storm(conn: sqlite3.Connection, *, now: Optional[float] = None) -> int:
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index ae55c3788d6..ab201d330a0 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -106,3 +106,57 @@ def test_storm_alert_opens_one_card(board):
+ 
+ def test_storm_alert_quiet_below_threshold(board):
+     assert walls.alert_on_storm(kbc.connect()) is None
++
++
++def test_default_tier_on_walled_default_provider_moves_to_strong_tier(board, monkeypatch):
++    """2026-11-01: default_model was gpt-6-astra/openai-codex; a Codex wall had only Codex as fallback."""
++    _write_cfg(board, default_model="gpt-6-astra", default_provider=CODEX,
++               strong_model=OPUS, strong_provider="anthropic")
++    monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
++    walls.record_wall(CODEX, 200714, path=board / "w.json")
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="plain card", assignee="default")
++    seen = _dispatch(conn)
++    assert seen[tid][:2] == (OPUS, "anthropic")
++    assert "wall:openai-codex" in _tier_events(conn, tid)[-1]["reason"]
++
++
++def test_live_pool_exhaustion_counts_as_wall_without_a_crash(board, monkeypatch):
++    _write_cfg(board, default_model="gpt-6-astra", default_provider=CODEX,
++               strong_model=OPUS, strong_provider="anthropic")
++    monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
++    monkeypatch.setattr(walls, "live_quota_wall",
++                        lambda p, m: time.time() + 200714 if p == CODEX else None)
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="plain card", assignee="default")
++    pinned = kb.create_task(conn, title="pinned", assignee="default", model_override="gpt-6-astra",
++                            provider_override=CODEX)
++    seen = _dispatch(conn)
++    assert seen[tid][:2] == (OPUS, "anthropic")
++    assert seen[pinned][:2] == ("gpt-6-astra", CODEX)  # exact pins keep their tuple
++
++
++def test_every_fallback_exhausted_leaves_task_on_its_route(board, monkeypatch):
++    _write_cfg(board, default_model="gpt-6-astra", default_provider=CODEX,
++               strong_model=OPUS, strong_provider="anthropic")
++    monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
++    monkeypatch.setattr(walls, "live_quota_wall", lambda p, m: time.time() + 3600)
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="plain card", assignee="default")
++    assert _dispatch(conn)[tid][:2] == ("gpt-6-astra", CODEX)
++
++
++def test_live_quota_wall_reads_the_oauth_pool(monkeypatch):
++    import agent.credential_pool as cp
++    import agent.model_routing_unavailable as mru
++    calls = []
++    monkeypatch.setattr(cp, "load_pool", lambda provider, allowed_auth_types=None: calls.append(
++        (provider, allowed_auth_types)) or object())
++    monkeypatch.setattr(mru, "quota_unavailable",
++                        lambda pool, model: mru.SubscriptionQuotaUnavailable(CODEX, model, 1793774149.0))
++    assert walls.live_quota_wall(CODEX, "gpt-6-astra") == 1793774149.0
++    assert calls == [(CODEX, {"oauth"})]
++    monkeypatch.setattr(mru, "quota_unavailable", lambda pool, model: None)
++    assert walls.live_quota_wall(CODEX, "gpt-6-astra") is None
++    assert walls.live_quota_wall("auto", "gpt-6-astra") is None
++    assert walls.live_quota_wall(CODEX, "class:deep") is None
+-- 
+2.55.0
+

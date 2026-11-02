@@ -34,3 +34,15 @@ Standalone. Useful with a token-minting hub (see hermes-cred-relay).
 ## Plugin?
 
 No. The pool's refresh path has no plugin seam.
+
+## Follow-up patch (1580): pushed tokens keep a live account quota mark
+
+**Patch:** `patches/1580-daveey-Preserve-live-account-quota-across-pushed-OAu.patch` (`311d8339309`, `Preserve live account quota across pushed OAuth tokens`).
+
+**Behavior.** A pushed token repairs authentication, not an account's quota window. When the persisted row being adopted is `exhausted` with a future `last_error_reset_at`, a rate-limit-shaped error, and a code other than 401/403, the pool adopts the new token but keeps the status, reset, error code and model cooldowns, and does not record a status clear. A 401/dead row or an expired quota mark is still adopted and cleared to OK as before. `_refresh_entry` returns None (no lease) when the adopted row is not OK, so `select()` and forced refresh do not hand out a quota-walled account.
+
+**How it works / Code.** New `agent/credential_pool_pushed.py::has_live_quota_mark(entry)` (uses `_parse_absolute_timestamp` and `auth_codex._is_codex_rate_limit_shaped`). `agent/credential_pool.py::_adopt_pushed_norefresh_row` adopts `stored` unchanged when the mark is live, else `replace(stored, **_MARK_OK)`, and persists `status_cleared_ids=[]` in the keep case.
+
+**Tests.** `tests/agent/test_credential_pool_pushed_quota.py`: `test_pushed_token_quota_policy` (429 live reset kept and unavailable; 401 dead cleared; 429 past reset cleared; model cooldowns retained in all cases) and `test_refresh_does_not_lease_pushed_quota_row` (`refresh` and `select` paths return None and keep the reset). This mirror did not run these tests.
+
+**Applying / Gotchas.** Depends on the preceding series; apply the full ordered series per [README.md](README.md#applying), standalone not certified. The mark is kept only when the row has an absolute future `last_error_reset_at`; an exhausted 429 row without a parseable reset is still cleared on adoption. Only the Codex row is tested for the keep case; the Anthropic row is tested through refresh/select.

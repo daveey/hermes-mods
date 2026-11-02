@@ -1,0 +1,205 @@
+From deacf9f25151306006482dc15895f2ce0fdd5348 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:43:08 +0000
+Subject: [PATCH] fix(watcher): seed unique projection generation atomically on
+ installation [daveey]
+
+---
+ hermes_state_projection.py                    | 26 ++++++--
+ hermes_state_schema.py                        | 33 +++++++++-
+ .../test_session_projection_revision.py       | 66 +++++++++++++++++--
+ 3 files changed, 112 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_state_projection.py b/hermes_state_projection.py
+index 1140d3656a1..1f69acfe796 100644
+--- a/hermes_state_projection.py
++++ b/hermes_state_projection.py
+@@ -29,17 +29,29 @@ SESSION_PROJECTION_SQL = "\n".join(
+ )
+ 
+ 
+-def session_projection_revision(conn):
+-    """Return a revision only when all current triggers are installed.
++# Installation and replacement of the triggers seed a fresh generation in the
++# same write transaction, so stores upgraded without later session writes never
++# share a value. Settled opens skip installation and therefore write nothing.
++SEED_SESSION_PROJECTION_SQL = _CHANGE_SQL
+ 
+-    An absent counter means zero on first installation, not missing capability.
+-    The caller holds a read transaction across capability and counter probes.
+-    """
++
++def session_projection_installed(conn) -> bool:
++    """True when all three projection triggers exist with the current bodies."""
+     names = tuple(SESSION_PROJECTION_TRIGGERS)
+     rows = conn.execute(
+         "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name IN (?, ?, ?)", names,
+     ).fetchall()
+-    if dict(rows) != SESSION_PROJECTION_TRIGGERS:
++    return dict(rows) == SESSION_PROJECTION_TRIGGERS
++
++
++def session_projection_revision(conn):
++    """Return the generation only when all current triggers and a generation exist.
++
++    A missing generation is unavailable capability (None), never a shared zero:
++    two stores without one cannot be told apart. The caller holds a read
++    transaction across capability and generation probes.
++    """
++    if not session_projection_installed(conn):
+         return None
+     row = conn.execute("SELECT value FROM state_meta WHERE key='sessions_change_seq'").fetchone()
+-    return row[0] if row else 0
++    return row[0] if row else None
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index dfc16027f74..a56313c6e0a 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -336,6 +336,36 @@ class SessionSchemaMixin:
+         if statement.strip():
+             raise sqlite3.OperationalError("incomplete DDL statement")
+ 
++    @staticmethod
++    def _ensure_session_projection(cursor: sqlite3.Cursor) -> None:
++        """Install/replace the session projection triggers and seed a fresh random generation
++        in ONE write transaction; a settled store is detected by a read probe and not written.
++
++        Seeding only here (never per open or on a timer) keeps settled opens lock-free while
++        guaranteeing every installed store carries a generation unique to it, so an in-place
++        restore of another upgraded store is visible even before any session write. The probe
++        is repeated under BEGIN IMMEDIATE so a sibling that installed first is not reseeded.
++        """
++        from hermes_state_projection import (
++            SEED_SESSION_PROJECTION_SQL, SESSION_PROJECTION_SQL, session_projection_installed,
++        )
++
++        if session_projection_installed(cursor):
++            return
++        owns = not cursor.connection.in_transaction
++        if owns:
++            cursor.execute("BEGIN IMMEDIATE")
++        try:
++            if not session_projection_installed(cursor):
++                SessionSchemaMixin._execute_ddl_skipping_settled_triggers(cursor, SESSION_PROJECTION_SQL)
++                cursor.execute(SEED_SESSION_PROJECTION_SQL)
++        except BaseException:
++            if owns:
++                cursor.execute("ROLLBACK")
++            raise
++        if owns:
++            cursor.execute("COMMIT")
++
+     @staticmethod
+     def _execute_ddl_script_transactional(cursor: sqlite3.Cursor, ddl: str) -> None:
+         """Execute a DDL script without ``executescript``'s implicit commit."""
+@@ -980,8 +1010,7 @@ class SessionSchemaMixin:
+         except sqlite3.OperationalError as exc:
+             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
+         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
+-        from hermes_state_projection import SESSION_PROJECTION_SQL
+-        self._execute_ddl_skipping_settled_triggers(cursor, SESSION_PROJECTION_SQL)
++        self._ensure_session_projection(cursor)
+ 
+         # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``
+         # without NOT NULL DEFAULT 1, so ``WHERE active = 1`` loaders hid whole histories. A
+diff --git a/tests/tui_gateway/test_session_projection_revision.py b/tests/tui_gateway/test_session_projection_revision.py
+index 4ef3947c2df..d68fb8d9247 100644
+--- a/tests/tui_gateway/test_session_projection_revision.py
++++ b/tests/tui_gateway/test_session_projection_revision.py
+@@ -107,17 +107,18 @@ def test_heartbeat_and_equal_updates_do_not_write_counter(store):
+         assert writer.execute("SELECT value FROM state_meta WHERE key='sessions_change_seq'").fetchone() == before
+ 
+ 
+-def test_first_install_zero_and_settled_open_are_read_only(tmp_path, monkeypatch):
++def test_first_install_seeds_generation_and_settled_open_is_read_only(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+     path = tmp_path / "state.db"
+     db = SessionDB(path)
+     db.close()
+     with sqlite3.connect(path) as observer:
+-        assert observer.execute("SELECT value FROM state_meta WHERE key='sessions_change_seq'").fetchone() is None
++        seeded = observer.execute("SELECT value FROM state_meta WHERE key='sessions_change_seq'").fetchone()
++        assert seeded is not None and len(seeded[0]) == 32
+         schema_before = observer.execute("PRAGMA schema_version").fetchone()
+         before = server._session_db_content_sig(path)
+         assert before[0] == "revision"
+-        assert before[-1] == 0
++        assert before[-1] == seeded[0]
+         reopened = SessionDB(path)
+         reopened.close()
+         assert observer.execute("PRAGMA schema_version").fetchone() == schema_before
+@@ -193,13 +194,70 @@ def test_upgrade_populated_store_without_counter(store):
+     upgraded.close()
+     before = server._session_db_content_sig(path)
+     assert before[0] == "revision"
+-    assert before[-1] == 0
++    assert before[-1] not in (None, 0)
+     with sqlite3.connect(path) as writer:
+         assert writer.execute("SELECT id FROM sessions").fetchall() == [('s',)]
+         writer.execute("UPDATE sessions SET title='upgraded'")
+     assert server._session_db_content_sig(path) != before
+ 
+ 
++def _pre_trigger_store(path, session_id):
++    from contextlib import closing
++
++    from hermes_state_projection import SESSION_PROJECTION_TRIGGERS
++
++    db = SessionDB(path)
++    db.create_session(session_id, source="cli")
++    db.close()
++    # Model a populated store written by a release predating the projection triggers.
++    with closing(sqlite3.connect(path)) as writer:
++        for name in SESSION_PROJECTION_TRIGGERS:
++            writer.execute(f"DROP TRIGGER {name}")
++        writer.execute("DELETE FROM state_meta WHERE key='sessions_change_seq'")
++        writer.commit()
++        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++
++
++def test_divergent_upgraded_stores_restore_in_place_invalidates(tmp_path, monkeypatch):
++    from contextlib import closing
++
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
++    server._sessions_db_sig_cache.clear()
++    server._sessions_digest_at.clear()
++    live, backup = tmp_path / "state.db", tmp_path / "backup.db"
++    _pre_trigger_store(live, "live-only")
++    _pre_trigger_store(backup, "backup-only")
++    # Upgrade both; no session writes follow, so only installation can give them a generation.
++    SessionDB(live).close()
++    SessionDB(backup).close()
++    before = server._session_db_content_sig(live)
++    assert before[0] == "revision"
++    inode = live.stat().st_ino
++    with closing(sqlite3.connect(backup)) as source, closing(sqlite3.connect(live)) as target:
++        source.backup(target)
++    assert live.stat().st_ino == inode
++    after = server._session_db_content_sig(live)
++    assert after != before
++    assert after[0] == "revision"
++    # A settled reopen of the restored store commits nothing.
++    with closing(sqlite3.connect(live)) as observer:
++        data_version = observer.execute("PRAGMA data_version").fetchone()
++        generation = observer.execute("SELECT value FROM state_meta WHERE key='sessions_change_seq'").fetchone()
++        SessionDB(live).close()
++        assert observer.execute("PRAGMA data_version").fetchone() == data_version
++        assert observer.execute(
++            "SELECT value FROM state_meta WHERE key='sessions_change_seq'").fetchone() == generation
++    assert server._session_db_content_sig(live) == after
++
++
++def test_installed_triggers_without_generation_fall_back_to_content(store):
++    path, _db = store
++    with sqlite3.connect(path) as writer:
++        writer.execute("DELETE FROM state_meta WHERE key='sessions_change_seq'")
++    fallback = server._session_db_content_sig(path)
++    assert fallback[0] == server._SESSION_SIGNATURE_FIELDS
++
++
+ def test_missing_trigger_falls_back_to_content(store):
+     path, _db = store
+     server._session_db_content_sig(path)
+-- 
+2.55.0
+

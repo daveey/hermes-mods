@@ -1,0 +1,547 @@
+From 1a92241da8b336f3ab8563458bb9146b8391d063 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 11:45:33 -0800
+Subject: [PATCH] fix(kanban): route worker-created cards to real owning chats
+ [daveey]
+
+---
+ hermes_cli/kanban.py                          |   1 +
+ hermes_cli/kanban_chat_links.py               |  13 +-
+ hermes_cli/kanban_creator_chats.py            | 158 +++++++++++++++++
+ hermes_cli/kanban_db.py                       |   8 +-
+ hermes_cli/kanban_db_graph.py                 |   2 +
+ tests/hermes_cli/test_kanban_chat_links.py    |   5 +-
+ .../test_kanban_creator_chat_backfill.py      |  47 +++++
+ .../tools/test_kanban_worker_created_chats.py | 167 ++++++++++++++++++
+ tools/kanban_tools.py                         |   2 +-
+ 9 files changed, 392 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_creator_chats.py
+ create mode 100644 tests/hermes_cli/test_kanban_creator_chat_backfill.py
+ create mode 100644 tests/tools/test_kanban_worker_created_chats.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 164c7d0f96d..eec524193c0 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -496,6 +496,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 conn, title=args.title, body=body,
+                 assignee=assignee,
+                 session_id=session_id, requires=getattr(args, "requires", None),
++                chat_origin=origin.ref if origin else getattr(args, "origin_session", None),
+                 # [daveey] Same declaration gate as the kanban_create tool, for agent/worker shells only.
+                 require_declaration=(in_worker or _agent_invoked()) and declaration_required(),
+                 created_by=args.created_by or _profile_author(),
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index f7e24fb833d..ffb1c214fcf 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -35,10 +35,9 @@ def link_uid(task_id: str, gateway: str, profile: Optional[str], session: str, k
+ 
+ 
+ def _worker_shepherd(session: Any, kind: str) -> bool:
+-    """A shepherd link on a headless receipt session (Kanban worker / cron transcript): never a chat. [daveey]
+-    A ``created`` link from a worker stays: it records which run made the card, it wakes nothing."""
++    """A headless execution receipt is provenance, never a chat destination. [daveey]"""
+     from hermes_cli.kanban_db_notify import is_headless_session
+-    return kind == "shepherd" and is_headless_session(session)
++    return is_headless_session(session)
+ 
+ 
+ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str, Any]]:
+@@ -55,6 +54,12 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+         out[uid] = {"uid": uid, "task_id": task_id, "chat_gateway": gateway, "chat_profile": None,
+                     "chat_session": session, "kind": kind, "released": 0, "created_at": int(created_at or now)}
+ 
++    for row in conn.execute(
++            "SELECT l.* FROM task_chat_links l WHERE l.chat_gateway=? AND l.kind='created' "
++            "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=l.task_id "
++            "AND e.kind='creator_chats_resolved')", (gateway,)):
++        if not _worker_shepherd(row["chat_session"], row["kind"]):
++            out[row["uid"]] = dict(row)
+     for task_id, session, created_at in conn.execute(
+             "SELECT id, session_id, created_at FROM tasks WHERE session_id IS NOT NULL AND session_id != ''"):
+         add(task_id, session, "created", created_at)
+@@ -99,6 +104,8 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     """Bring this gateway's links in ``conn`` (one board file) up to date. Writes go through the capture triggers,
+     so every new or changed link is pushed to the service. Returns counts of added/changed/released links."""
+     from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_creator_chats import backfill
++    backfill(conn)
+     want = _local_links(conn, gateway)
+     if ledger:
+         want.update(_ledger_links(board, gateway))
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+new file mode 100644
+index 00000000000..1c624e46aea
+--- /dev/null
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -0,0 +1,158 @@
++"""Resolve worker provenance into durable human chat ownership. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++MAX_DEPTH = 16
++
++
++def initialize_ownership(conn, task_id, creator_task_id, parents, created_at, chat_origin):
++    """An explicit validated origin wins over ambient worker/ancestor ownership."""
++    from hermes_cli.kanban_db_graph import inherit_creator_origin
++    from hermes_cli.kanban_db_notify import _inherit_notify_subs, is_headless_session
++    from hermes_cli.kanban_db import _append_event
++    from hermes_cli.kanban_origin import parse_origin
++    from hermes_cli.kanban_chat_links import link_uid
++
++    if not chat_origin:
++        inherit_creator_origin(conn, task_id, creator_task_id, created_at=created_at)
++        _inherit_notify_subs(conn, task_id, parents, created_at=created_at)
++        return
++    origin = parse_origin(chat_origin)
++    conn.execute("UPDATE tasks SET session_id=NULL WHERE id=?", (task_id,))
++    _append_event(conn, task_id, "creator_chats_resolved", {"explicit_origin": origin.ref})
++    if is_headless_session(origin.session):
++        return
++    conn.execute(
++        "INSERT OR IGNORE INTO kanban_notify_subs "
++        "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
++        "VALUES (?,'hub',?,'','notify',?, ?, (SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?))",
++        (task_id, origin.chat_id, json.dumps({"reason": "origin"}), created_at, task_id))
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        conn.execute(
++            "INSERT OR IGNORE INTO task_chat_links "
++            "(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++            "VALUES (?,?,?,?,?,'created',0,?)",
++            (link_uid(task_id, origin.gateway, origin.profile, origin.session, "created"), task_id,
++             origin.gateway, origin.profile, origin.session, created_at))
++
++
++def _chat_links(conn: sqlite3.Connection, task_id: str) -> list[dict]:
++    """Include legacy courier origins that have a subscription but no projected link yet."""
++    from hermes_cli.kanban_db_notify import _owning_sub_clause
++    from hermes_cli.kanban_origin import parse_origin, OriginError
++
++    rows = [dict(r) for r in conn.execute("SELECT * FROM task_chat_links WHERE task_id=?", (task_id,))]
++    known = {(r["chat_gateway"], r["chat_profile"] or "default", r["chat_session"]) for r in rows}
++    out = [r for r in rows if not r["released"]]
++    for sub in conn.execute(
++            "SELECT s.* FROM kanban_notify_subs s LEFT JOIN tasks p ON p.id=s.task_id "
++            f"WHERE s.task_id=? AND s.platform='hub' AND {_owning_sub_clause()}", (task_id,)):
++        try:
++            origin = parse_origin(sub["chat_id"])
++        except OriginError:
++            continue
++        key = (origin.gateway, origin.profile, origin.session)
++        if key not in known:
++            out.append({"task_id": task_id, "chat_gateway": origin.gateway, "chat_profile": origin.profile,
++                        "chat_session": origin.session, "created_at": sub["created_at"]})
++            known.add(key)
++    return out
++
++
++def resolve_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
++    """Nearest unreleased human links; creator edges precede dependency parents, cycles stop."""
++    from hermes_cli.kanban_db_notify import is_headless_session
++    from hermes_cli.kanban_placement import is_placeholder_session
++
++    frontier, seen = [creator_task_id], set()
++    for _depth in range(MAX_DEPTH):
++        owners, following = {}, []
++        for task_id in frontier:
++            if task_id in seen:
++                continue
++            seen.add(task_id)
++            for row in _chat_links(conn, task_id):
++                if not is_headless_session(row["chat_session"]) and not is_placeholder_session(row["chat_session"]):
++                    key = (row["chat_gateway"], row["chat_profile"], row["chat_session"])
++                    owners.setdefault(key, dict(row))
++            row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
++                               "ORDER BY id LIMIT 1", (task_id,)).fetchone()
++            payload = json.loads(row[0] or "{}") if row else {}
++            if payload.get("creator_task_id"):
++                following.append(payload["creator_task_id"])
++            following.extend(r[0] for r in conn.execute(
++                "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id", (task_id,)))
++        if owners:
++            return list(owners.values())
++        frontier = list(dict.fromkeys(t for t in following if t not in seen))
++        if not frontier:
++            break
++    return []
++
++
++def _copy_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None:
++    """Retain every delivery column, never the source card's notification cursor."""
++    hub_chat = f"{owner['chat_gateway']}/{owner['chat_profile'] or 'default'}/{owner['chat_session']}"
++    conn.execute(
++        "INSERT OR IGNORE INTO kanban_notify_subs "
++        "(task_id, platform, chat_id, thread_id, user_id, user_id_alt, chat_type, notifier_profile, "
++        "delivery_mode, delivery_metadata, created_at, last_event_id) "
++        "SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt, chat_type, notifier_profile, "
++        "delivery_mode, delivery_metadata, unixepoch(), "
++        "(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?) "
++        "FROM kanban_notify_subs WHERE task_id=? AND "
++        "((platform='hub' AND chat_id=?) OR (platform='tui' AND chat_id=?))",
++        (task_id, task_id, owner["task_id"], hub_chat, owner["chat_session"]))
++
++
++def inherit_chats(conn: sqlite3.Connection, task_id: str, creator_task_id: str) -> None:
++    """Copy a creator's real chat links inside the card creation transaction."""
++    from hermes_cli.kanban_chat_links import link_uid
++    from hermes_cli.kanban_db import _append_event
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        return
++    owners = resolve_chats(conn, creator_task_id)
++    if not owners:
++        if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='creator_chats_unresolved'",
++                            (task_id,)).fetchone():
++            _append_event(conn, task_id, "creator_chats_unresolved",
++                          {"task_id": task_id, "creator_task_id": creator_task_id, "max_depth": MAX_DEPTH})
++        return
++    _append_event(conn, task_id, "creator_chats_resolved", {"creator_task_id": creator_task_id})
++    for owner in owners:
++        conn.execute(
++            "INSERT OR IGNORE INTO task_chat_links "
++            "(uid, task_id, chat_gateway, chat_profile, chat_session, kind, released, created_at) "
++            "VALUES (?, ?, ?, ?, ?, 'created', 0, ?)",
++            (link_uid(task_id, owner["chat_gateway"], owner["chat_profile"], owner["chat_session"], "created"),
++             task_id, owner["chat_gateway"], owner["chat_profile"], owner["chat_session"], owner["created_at"]))
++        _copy_delivery(conn, task_id, owner)
++
++
++def backfill(conn: sqlite3.Connection) -> dict:
++    """Repair legacy worker creations once; unresolved rows remain discoverable and retryable."""
++    from hermes_cli.kanban_db import write_txn
++    from hermes_cli.kanban_db_notify import is_headless_session
++    from hermes_cli.kanban_placement import is_placeholder_session
++
++    rows = conn.execute(
++        "SELECT t.id, t.session_id, e.payload FROM tasks t JOIN task_events e ON e.task_id=t.id "
++        "AND e.kind='created' WHERE NOT EXISTS (SELECT 1 FROM task_events done WHERE done.task_id=t.id "
++        "AND done.kind='creator_chats_resolved')").fetchall()
++    attempted, unresolved = [], []
++    with write_txn(conn):
++        for row in rows:
++            if row["session_id"] and not (is_headless_session(row["session_id"])
++                                          or is_placeholder_session(row["session_id"])):
++                continue
++            creator = json.loads(row["payload"] or "{}").get("creator_task_id")
++            if not creator:
++                continue
++            inherit_chats(conn, row["id"], creator)
++            attempted.append(row["id"])
++            if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='creator_chats_resolved'",
++                                (row["id"],)).fetchone():
++                unresolved.append(row["id"])
++    return {"attempted": attempted, "unresolved": unresolved}
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 828f66fff6c..f6e9335c512 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1232,7 +1232,7 @@ def create_task(
+     completion_contract: Optional[str] = None,
+     validate_workspace: bool = False, validate_skills: bool = False,
+     human_request: Optional[dict] = None,
+-    origin_intent: Optional[dict] = None,
++    origin_intent: Optional[dict] = None, chat_origin: Optional[str] = None,
+     requires: Optional[list[str]] = None,
+     lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None, require_declaration: bool = False,
+ ) -> str:
+@@ -1267,7 +1267,8 @@ def create_task(
+ 
+         return create_with_origin(conn, origin_intent, creation_options)
+ 
+-    from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
++    from hermes_cli.kanban_db_graph import initial_task_state
++    from hermes_cli.kanban_creator_chats import initialize_ownership
+     from hermes_cli.kanban_pr_acceptance import validate_contract
+     from hermes_cli.kanban_human_request import validate_initial_request
+ 
+@@ -1396,8 +1397,7 @@ def create_task(
+                     human_request=human_request,
+                 )
+                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+-                inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
+-                _inherit_notify_subs(conn, task_id, parents, created_at=now)
++                initialize_ownership(conn, task_id, creator_task_id, parents, now, chat_origin)
+             return task_id
+         except sqlite3.IntegrityError:
+             if attempt == 1:
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index bb7a0339b14..3759dabd0e7 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -20,6 +20,8 @@ def inherit_creator_origin(
+         (creator_task_id, task_id),
+     )
+     _inherit_notify_subs(conn, task_id, (creator_task_id,), created_at=created_at)
++    from hermes_cli.kanban_creator_chats import inherit_chats
++    inherit_chats(conn, task_id, creator_task_id)
+ 
+ 
+ def initial_task_state(
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index 4977302ae19..cb08f5af1e9 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -70,8 +70,7 @@ WORKER = "local-" + "7c" * 32  # a Kanban worker / cron receipt session: never a
+ 
+ def test_a_worker_transcript_gets_no_shepherd_link_and_an_old_one_is_retired(live, monkeypatch):
+     """Hub card t_a989e5e0: worker transcripts held shepherd subs/links, so its notice and wake went to sessions that
+-    refuse them (4132). A worker's shepherd link is never written and an existing one is deleted; a worker's
+-    ``created`` link (which run made the card) stays."""
++    refuse them (4132). No worker link is written; provenance belongs in task events, not chat ownership."""
+     monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [_ledger_row("t_remote", WORKER)])
+     mine = kb.create_task(live, title="mine", assignee="worker", session_id=WORKER)
+     with kbc.write_txn(live):
+@@ -84,7 +83,7 @@ def test_a_worker_transcript_gets_no_shepherd_link_and_an_old_one_is_retired(liv
+                      (links.link_uid("t_old", ME, None, WORKER, "shepherd"), ME, WORKER))
+     out = links.reconcile(live, "default", ME)
+     assert out["retired"] == 1
+-    assert _links(live) == {(mine, WORKER, "created", 0), (mine, "s_chat", "shepherd", 0)}
++    assert _links(live) == {(mine, "s_chat", "shepherd", 0)}
+ 
+ 
+ def test_reconcile_carries_this_gateways_ledger_links_and_their_release(live, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_creator_chat_backfill.py b/tests/hermes_cli/test_kanban_creator_chat_backfill.py
+new file mode 100644
+index 00000000000..e8cbb2b4c98
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_creator_chat_backfill.py
+@@ -0,0 +1,47 @@
++"""Backfill worker ownership without replaying historical events. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_sync_client as sync
++from tests.hermes_cli import kanban_sync_support as support
++
++WORKER = "local-" + "cd" * 32
++
++
++@pytest.mark.parametrize("session", [WORKER, "kanban-placement-old"])
++def test_reconcile_backfills_worker_created_links_without_replay(tmp_path, monkeypatch, session):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    with kbc.connect_closing(home / "kanban.db") as conn:
++        sync.ensure_identity(conn, "default", "here")
++        parent = kb.create_task(conn, title="parent", session_id="human")
++        notify.add_notify_sub(conn, task_id=parent, platform="tui", chat_id="human", delivery_mode="wake")
++        links.reconcile(conn, "default", "here", ledger=False)
++        child = kb.create_task(conn, title="legacy", session_id=session)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
++                         (json.dumps({"creator_task_id": parent}), child))
++            kb._append_event(conn, child, "completed", {"summary": "old result"})
++            conn.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_session,kind,released,created_at) "
++                         "VALUES (?,?,'here',?,'created',0,1)",
++                         (links.link_uid(child, "here", None, WORKER, "created"), child, WORKER))
++        links.reconcile(conn, "default", "here", ledger=False)
++        assert [tuple(r) for r in conn.execute(
++            "SELECT chat_session,kind FROM task_chat_links WHERE task_id=? AND released=0", (child,))] == [
++                ("human", "created")]
++        subs = notify.list_notify_subs(conn, child)
++        assert len(subs) == 1
++        latest = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (child,)).fetchone()[0]
++        assert subs[0]["last_event_id"] == latest
++        assert notify.unseen_events_for_sub(conn, task_id=child, platform="tui", chat_id="human")[1] == []
++        links.reconcile(conn, "default", "here", ledger=False)
++        assert notify.list_notify_subs(conn, child)[0]["last_event_id"] == latest
++        assert conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (child,)).fetchone()[0] == latest
++        with kb.write_txn(conn):
++            kb._append_event(conn, child, "completed", {"summary": "future result"})
++        assert len(notify.unseen_events_for_sub(conn, task_id=child, platform="tui", chat_id="human")[1]) == 1
+diff --git a/tests/tools/test_kanban_worker_created_chats.py b/tests/tools/test_kanban_worker_created_chats.py
+new file mode 100644
+index 00000000000..9d31862360b
+--- /dev/null
++++ b/tests/tools/test_kanban_worker_created_chats.py
+@@ -0,0 +1,167 @@
++"""Worker-created cards belong to human chats, not execution receipts. [daveey]"""
++import argparse
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_chat_links as links
++from tools import kanban_tools as tools
++
++WORKER = "local-" + "ab" * 32
++CHAT = "20261101_100000_human"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_ORIGIN_SESSION",
++                "HERMES_SESSION_ID", "HERMES_SESSION_KEY", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(key, raising=False)
++    from hermes_cli import kanban_capability_registry as registry
++    monkeypatch.setattr(registry, "self_gateway", lambda: "here")
++    monkeypatch.setattr(tools, "_is_dispatcher_owned_worker", lambda: True)
++    from agent import delegation_context
++    monkeypatch.setattr(delegation_context, "is_dispatcher_owned_worker_context", lambda: True)
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    db.create_session(WORKER, source="kanban")
++    db.create_session(CHAT, source="desktop")
++    db.close()
++    from tests.hermes_cli.kanban_sync_support import write_sync_config
++    write_sync_config(home, True)
++    kb.init_db()
++    from hermes_cli import kanban_sync_client as sync
++    with kbc.connect_closing() as conn:
++        sync.ensure_identity(conn, "default", "here")
++    return home
++
++
++def create(entry, monkeypatch, capsys, origin=None):
++    if entry == "tool":
++        result = json.loads(tools._handle_create({"title": "child", "assignee": "default", "requires": [],
++                                                "origin_session": origin, "placement": "local"}))
++        assert result.get("ok"), result
++        return result["task_id"]
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    args = parser.parse_args(["kanban", "create", "child", "--assignee", "default", "--json"]
++                             + (["--origin-session", origin] if origin else []))
++    assert cli._cmd_create(args) == 0
++    return json.loads(capsys.readouterr().out)["id"]
++
++
++@pytest.mark.parametrize("entry", ["tool", "cli"])
++@pytest.mark.parametrize("gateway", ["away", "here"])
++def test_explicit_origin_overrides_worker_inheritance(home, monkeypatch, capsys, entry, gateway):
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away"}))
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="creator", session_id=CHAT)
++        notify.add_notify_sub(conn, task_id=creator, platform="tui", chat_id=CHAT)
++        links.reconcile(conn, "default", "here", ledger=False)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
++    child = create(entry, monkeypatch, capsys, origin=f"@session:research@{gateway}/explicit-chat")
++    with kbc.connect_closing() as conn:
++        links.reconcile(conn, "default", "here", ledger=False)
++        expected_sub = ("hub", f"{gateway}/research/explicit-chat")
++        assert [(s["platform"], s["chat_id"]) for s in notify.list_notify_subs(conn, child)] == [expected_sub]
++        assert [tuple(r) for r in conn.execute(
++            "SELECT chat_gateway,chat_profile,chat_session FROM task_chat_links WHERE task_id=? AND released=0",
++            (child,))] == [(gateway, "research", "explicit-chat")]
++
++
++@pytest.mark.parametrize("entry", ["tool", "cli"])
++def test_unresolved_worker_records_gap_without_a_chat(home, monkeypatch, capsys, entry):
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="unowned creator", assignee="default", session_id=WORKER)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
++    monkeypatch.setenv("HERMES_SESSION_KEY", WORKER)
++    child = create(entry, monkeypatch, capsys)
++    with kbc.connect_closing() as conn:
++        links.reconcile(conn, "default", "here", ledger=False)
++        assert not conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=?", (child,)).fetchall()
++        assert not notify.list_notify_subs(conn, child)
++        gaps = [e for e in kb.list_events(conn, child) if e.kind == "creator_chats_unresolved"]
++        assert len(gaps) == 1
++        assert gaps[0].payload["task_id"] == child
++        assert gaps[0].payload["creator_task_id"] == creator
++
++
++@pytest.mark.parametrize("entry", ["tool", "cli"])
++def test_human_created_card_keeps_chat(home, monkeypatch, capsys, entry):
++    monkeypatch.setattr(tools, "_is_dispatcher_owned_worker", lambda: False)
++    monkeypatch.setenv("HERMES_SESSION_ID", CHAT)
++    monkeypatch.setenv("HERMES_SESSION_KEY", CHAT)
++    child = create(entry, monkeypatch, capsys)
++    with kbc.connect_closing() as conn:
++        links.reconcile(conn, "default", "here", ledger=False)
++        assert [(r[0], r[1]) for r in conn.execute(
++            "SELECT chat_session, kind FROM task_chat_links WHERE task_id=? AND released=0", (child,))] == [
++                (CHAT, "created")]
++
++
++@pytest.mark.parametrize("entry", ["tool", "cli"])
++@pytest.mark.parametrize("has_link", [True, False])
++def test_worker_creation_resolves_remote_ancestor(home, monkeypatch, capsys, entry, has_link):
++    with kbc.connect_closing() as conn:
++        ancestor = kb.create_task(conn, title="ancestor", assignee="default")
++        creator = kb.create_task(conn, title="creator", assignee="default", parents=[ancestor])
++        if has_link:
++            conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                         "released, created_at) VALUES (?, ?, 'away', 'research', ?, 'created', 0, 1)",
++                         (links.link_uid(ancestor, "away", "research", CHAT, "created"), ancestor, CHAT))
++            conn.commit()
++        notify.add_notify_sub(conn, task_id=ancestor, platform="hub", chat_id=f"away/research/{CHAT}",
++                              notifier_profile="default", delivery_mode="notify+wake",
++                              delivery_metadata={"reason": "origin", "channel": "preserved"})
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
++    monkeypatch.setenv("HERMES_SESSION_KEY", WORKER)
++    child = create(entry, monkeypatch, capsys)
++    with kbc.connect_closing() as conn:
++        links.reconcile(conn, "default", "here", ledger=False)
++        owned = conn.execute("SELECT chat_gateway, chat_profile, chat_session, kind FROM task_chat_links "
++                             "WHERE task_id=? AND released=0", (child,)).fetchall()
++        assert [tuple(r) for r in owned] == [("away", "research", CHAT, "created")]
++        subs = notify.list_notify_subs(conn, child)
++        assert [(s["platform"], s["chat_id"], s["delivery_mode"]) for s in subs] == [
++            ("hub", f"away/research/{CHAT}", "notify+wake")]
++        assert subs[0]["delivery_metadata"] == {"reason": "origin", "channel": "preserved"}
++        assert not any(notify.is_headless_session(r[0]) for r in conn.execute(
++            "SELECT chat_session FROM task_chat_links WHERE task_id=?", (child,)))
++
++
++@pytest.mark.parametrize("entry", ["tool", "cli"])
++def test_worker_creation_resolves_same_gateway_chat(home, monkeypatch, capsys, entry):
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="creator", assignee="default")
++        conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                     "released, created_at) VALUES (?, ?, 'here', NULL, ?, 'created', 0, 1)",
++                     (links.link_uid(creator, "here", None, CHAT, "created"), creator, CHAT))
++        conn.commit()
++        notify.add_notify_sub(conn, task_id=creator, platform="tui", chat_id=CHAT,
++                              delivery_mode="wake", delivery_metadata={"reason": "create"})
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
++    monkeypatch.setenv("HERMES_SESSION_KEY", WORKER)
++    child = create(entry, monkeypatch, capsys)
++    with kbc.connect_closing() as conn:
++        links.reconcile(conn, "default", "here", ledger=False)
++        owned = conn.execute("SELECT chat_session, kind FROM task_chat_links WHERE task_id=? AND released=0",
++                             (child,)).fetchall()
++        assert [(r[0], r[1]) for r in owned] == [(CHAT, "created")]
++        subs = notify.list_notify_subs(conn, child)
++        assert [(s["platform"], s["chat_id"], s["delivery_mode"]) for s in subs] == [("tui", CHAT, "wake")]
++        assert not any(notify.is_headless_session(r[0]) for r in conn.execute(
++            "SELECT chat_session FROM task_chat_links WHERE task_id=?", (child,)))
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 9b56066f131..438838274e3 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1766,7 +1766,7 @@ def _handle_create(args: dict, **kw) -> str:
+             initial_status=str(args.get("initial_status") or "running"),
+             human_request=kb.redact_review_value(args.get("human_request")),
+             created_by=_persisted_identity(), session_id=session_id,
+-            origin_intent=origin_intent,
++            origin_intent=origin_intent, chat_origin=origin.ref if origin else args.get("origin_session"),
+             # Reject a worktree path the dispatcher could never resolve now, to the
+             # creator, instead of burning spawn retries on it later. [daveey]
+             validate_workspace=True, validate_skills=True)
+-- 
+2.55.0
+

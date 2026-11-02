@@ -1,0 +1,457 @@
+From 60f9d980c4a4988211a15836a344e719d93b9ca4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:54:55 +0000
+Subject: [PATCH] test(ci): fence startup checkpoint cleanup and acknowledge
+ disarming
+
+---
+ .github/workflows/sandbox-lifecycle-proof.yml |   2 +-
+ tests/ci/sandbox_startup_fixture.py           | 162 ++++++++++++++++++
+ tests/ci/test_plugin_sandbox_startup.py       |  74 +++++---
+ tests/ci/test_sandbox_startup_fixture.py      | 120 +++++++++++++
+ 4 files changed, 334 insertions(+), 24 deletions(-)
+ create mode 100644 tests/ci/sandbox_startup_fixture.py
+ create mode 100644 tests/ci/test_sandbox_startup_fixture.py
+
+diff --git a/.github/workflows/sandbox-lifecycle-proof.yml b/.github/workflows/sandbox-lifecycle-proof.yml
+index c4ea1a234f0..154c0b365a1 100644
+--- a/.github/workflows/sandbox-lifecycle-proof.yml
++++ b/.github/workflows/sandbox-lifecycle-proof.yml
+@@ -24,4 +24,4 @@ jobs:
+           uname -a
+       - name: Regression and lifecycle controls
+         run: |
+-          HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/ci/test_plugin_sandbox_startup.py tests/ci/test_plugin_sandbox_normal_exit.py tests/ci/test_plugin_sandbox_lifecycle.py tests/ci/test_plugin_validation_sandbox.py -v
++          HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/ci/test_sandbox_startup_fixture.py tests/ci/test_plugin_sandbox_startup.py tests/ci/test_plugin_sandbox_normal_exit.py tests/ci/test_plugin_sandbox_lifecycle.py tests/ci/test_plugin_validation_sandbox.py -v
+diff --git a/tests/ci/sandbox_startup_fixture.py b/tests/ci/sandbox_startup_fixture.py
+new file mode 100644
+index 00000000000..f984c94566c
+--- /dev/null
++++ b/tests/ci/sandbox_startup_fixture.py
+@@ -0,0 +1,162 @@
++"""Test-only checkpoint protocol and an out-of-process descendant ownership fence."""
++from __future__ import annotations
++
++import ctypes
++import fcntl
++import json
++import os
++from pathlib import Path
++import select
++import signal
++import subprocess
++import sys
++import time
++
++
++CHECKPOINTS = ("monitor", "killer")
++
++
++def checkpoint(control, name, before_stop=None):
++    """Return False when disarmed; acknowledge a stop by releasing its lock."""
++    control = Path(control)
++    with (control / f"{name}.lock").open("w") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        if (control / "disarmed").exists():
++            return False
++        birth = Path(f"/proc/{os.getpid()}/stat").read_text().rpartition(")")[2].split()[19]
++        _publish(control / f"{name}.identity", [os.getpid(), birth])
++        (control / name).write_text(str(os.getpid()))
++        if before_stop is not None:
++            before_stop()
++        os.kill(os.getpid(), signal.SIGSTOP)
++    return True
++
++
++def _resume(control, name):
++    try:
++        pid, birth = json.loads((control / f"{name}.identity").read_text())
++        fd = os.pidfd_open(pid)
++    except (FileNotFoundError, ProcessLookupError):
++        return
++    try:
++        try:
++            current = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[19]
++            if current == birth:
++                signal.pidfd_send_signal(fd, signal.SIGCONT)
++        except (FileNotFoundError, ProcessLookupError):
++            pass
++    finally:
++        os.close(fd)
++
++
++def disarm(control):
++    """Prevent future stops and drain stops already admitted, even before discovery."""
++    from tests.waiting import wait_until
++
++    (control / "disarmed").touch()
++    for name in CHECKPOINTS:
++        with (control / f"{name}.lock").open("w") as lock:
++            def drained():
++                try:
++                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                except BlockingIOError:
++                    _resume(control, name)
++                    return False
++                return True
++            # A single SIGCONT can arrive before SIGSTOP. Only lock acquisition
++            # acknowledges that the holder has passed the stop (or died).
++            wait_until(drained, timeout=30)
++
++
++def _publish(path, value):
++    pending = path.with_suffix(".pending")
++    pending.write_text(json.dumps(value))
++    pending.replace(path)
++
++
++def _reap_owned():
++    """Only this disposable process is a subreaper; ECHILD is the receipt."""
++    deadline = time.monotonic() + 30
++    children = Path(f"/proc/self/task/{os.getpid()}/children")
++    while True:
++        try:
++            pid, _ = os.waitpid(-1, os.WNOHANG)
++        except ChildProcessError:
++            return
++        if pid:
++            continue
++        if time.monotonic() >= deadline:
++            raise TimeoutError("test fence could not reap its descendants")
++        # Single-threaded owner: none of these unreaped children can have its PID
++        # reused between enumeration and signalling. Killing parents adopts the
++        # next generation, including setsid descendants and late namespace init.
++        for child in children.read_text().split():
++            try:
++                os.kill(int(child), signal.SIGKILL)
++            except ProcessLookupError:
++                pass
++        select.select([], [], [], 0.01)
++
++
++def _serve(control, argv):
++    libc = ctypes.CDLL(None, use_errno=True)
++    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
++        raise OSError(ctypes.get_errno(), "cannot establish test ownership fence")
++    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL)
++    _publish(control / "wrapper", proc.pid)
++    pending = b""
++    try:
++        while True:
++            status = proc.poll()
++            if status is not None:
++                _publish(control / "status", status)
++            if not select.select([0], [], [], 0.01)[0]:
++                continue
++            data = os.read(0, 4096)
++            if not data:
++                return
++            pending += data
++            while b"\n" in pending:
++                line, pending = pending.split(b"\n", 1)
++                proc.send_signal(int(line))
++    finally:
++        _reap_owned()
++        _publish(control / "reaped", True)
++
++
++class FencedProcess:
++    """Popen-like controller; the fence does nothing to descendants until close."""
++
++    def __init__(self, control, argv, **kwargs):
++        self.control = control
++        self.fence = subprocess.Popen(
++            [sys.executable, "-I", __file__, str(control), *argv],
++            stdin=subprocess.PIPE, start_new_session=True, **kwargs,
++        )
++        assert self.fence.stdin is not None
++        self.commands = self.fence.stdin
++
++    def send_signal(self, signum):
++        self.commands.write(f"{int(signum)}\n".encode())
++        self.commands.flush()
++
++    def wait(self, timeout):
++        from tests.waiting import wait_until
++
++        wait_until(lambda: (self.control / "status").exists(), timeout=timeout)
++        return json.loads((self.control / "status").read_text())
++
++    def close(self):
++        try:
++            disarm(self.control)
++        finally:
++            # EOF also works if pytest dies. The fence kills stopped children;
++            # it does not need checkpoint publication or an init pidfd to own them.
++            self.commands.close()
++            status = self.fence.wait(timeout=40)
++            assert status == 0, f"ownership fence exited {status}"
++            assert json.loads((self.control / "reaped").read_text()) is True
++
++
++if __name__ == "__main__":
++    _serve(Path(sys.argv[1]), sys.argv[2:])
+diff --git a/tests/ci/test_plugin_sandbox_startup.py b/tests/ci/test_plugin_sandbox_startup.py
+index 7ba3ea7ee6c..d996955289b 100644
+--- a/tests/ci/test_plugin_sandbox_startup.py
++++ b/tests/ci/test_plugin_sandbox_startup.py
+@@ -11,13 +11,13 @@ import os
+ from pathlib import Path
+ import select
+ import signal
+-import subprocess
+ import sys
+ import textwrap
+ 
+ import pytest
+ 
+ from tests.ci import test_plugin_validation_sandbox as helpers
++from tests.ci.sandbox_startup_fixture import FencedProcess
+ from tests.ci.test_plugin_validation_sandbox import SCRIPT, needs_isolation
+ from tests.waiting import wait_until
+ 
+@@ -59,7 +59,8 @@ def _blocked_in_read(pid):
+ 
+ def _write_probe(work):
+     probe = work / "probe.py"
+-    probe.write_text(textwrap.dedent('''\
++    fixture_dir = str(Path(__file__).parent)
++    probe.write_text(f"import sys\nsys.path.insert(0, {fixture_dir!r})\n" + textwrap.dedent('''\
+         import importlib.util
+         import json
+         import os
+@@ -68,6 +69,7 @@ def _write_probe(work):
+         import signal
+         import subprocess
+         import sys
++        from sandbox_startup_fixture import checkpoint
+ 
+         source, control = sys.argv[1:3]
+         control = Path(control)
+@@ -85,8 +87,7 @@ def _write_probe(work):
+                 super().__init__(argv, *args, **kwargs)
+             def kill(self):
+                 if self.args[0] == str(control / "gate") and not (control / "killer").exists():
+-                    (control / "killer").write_text(str(os.getpid()))
+-                    os.kill(os.getpid(), signal.SIGSTOP)
++                    checkpoint(control, "killer")
+                 return super().kill()
+         subprocess.Popen = CheckpointPopen
+         original_remove = mod.remove_tree
+@@ -113,13 +114,15 @@ def _write_probe(work):
+         import sys
+         if sys.argv[1:] == ["--version"]:
+             os.execv("/usr/bin/bwrap", ["bwrap", "--version"])
++        sys.path.insert(0, {fixture_dir!r})
++        from sandbox_startup_fixture import checkpoint
+         control = Path({str(work)!r})
+         block = os.open(control / "block", os.O_RDWR)
+         info = os.open(control / "info", os.O_WRONLY | os.O_CREAT, 0o600)
+         os.set_inheritable(block, True)
+         os.set_inheritable(info, True)
+-        (control / "monitor").write_text(str(os.getpid()))
+-        os.kill(os.getpid(), signal.SIGSTOP)
++        if not checkpoint(control, "monitor"):
++            sys.exit(0)
+         os.execv("/usr/bin/bwrap", ["bwrap", "--block-fd", str(block),
+                  "--info-fd", str(info), *sys.argv[1:]])
+     '''))
+@@ -136,7 +139,7 @@ def test_startup_cancel_reaps_init_before_cleanup(work, signum):
+     monitor = killer = init_fd = None
+     # A log file avoids a leaked init holding communicate()'s pipe open on RED.
+     with (work / "output").open("w+") as output:
+-        proc = subprocess.Popen(
++        proc = FencedProcess(work,
+             [sys.executable, "-I", str(probe), str(SCRIPT), str(work),
+              "--no-network", "--bwrap", str(gate), "--", "/bin/true"],
+             env={**os.environ, "RUNNER_TEMP": str(work)}, stdout=output, stderr=output,
+@@ -168,19 +171,44 @@ def test_startup_cancel_reaps_init_before_cleanup(work, signum):
+             assert select.select([init_fd], [], [], 0)[0], "namespace init survived run_host"
+             assert not list(work.glob("plugin-sandbox-*"))
+         finally:
+-            # Also clean the intentionally failing baseline; never leave a stopped
+-            # process or namespace behind when a checkpoint/assertion fails.
+-            if init_fd is not None:
+-                try:
+-                    signal.pidfd_send_signal(init_fd, signal.SIGKILL)
+-                except ProcessLookupError:
+-                    pass
+-                os.close(init_fd)
+-            for pid in {monitor, killer} - {None}:
+-                try:
+-                    os.kill(pid, signal.SIGCONT)
+-                except ProcessLookupError:
+-                    pass
+-            if proc.poll() is None:
+-                proc.kill()
+-            proc.wait(timeout=10)
++            # The fence stays idle until AFTER the original assertions: cleanup
++            # cannot make the intentionally failing production baseline pass.
++            try:
++                proc.close()
++            finally:
++                if init_fd is not None:
++                    os.close(init_fd)
++
++
++@needs_isolation
++@pytest.mark.parametrize("phase", ["before_monitor", "before_killer", "unknown_init"])
++def test_checkpoint_timeout_reaps_real_sandbox(work, phase):
++    """Force a controller timeout without handing any discovered PID to cleanup."""
++    assert os.getuid() != 0, "this proof must exercise real non-root bwrap"
++    probe, gate = _write_probe(work)
++    with (work / "output").open("w+") as output:
++        proc = FencedProcess(work,
++            [sys.executable, "-I", str(probe), str(SCRIPT), str(work),
++             "--no-network", "--bwrap", str(gate), "--", "/bin/true"],
++            env={**os.environ, "RUNNER_TEMP": str(work)}, stdout=output, stderr=output,
++        )
++        try:
++            with pytest.raises(TimeoutError, match="injected checkpoint timeout"):
++                if phase != "before_monitor":
++                    wait_until(lambda: _read_pid(work / "monitor"), timeout=30)
++                    wait_until(lambda: _stopped(_read_pid(work / "monitor")), timeout=30)
++                if phase == "unknown_init":
++                    proc.send_signal(signal.SIGTERM)
++                    wait_until(lambda: _read_pid(work / "killer"), timeout=30)
++                    wait_until(lambda: _stopped(_read_pid(work / "killer")), timeout=30)
++                    os.kill(_read_pid(work / "monitor"), signal.SIGCONT)
++                    wait_until(lambda: _init_pid(work / "info"), timeout=30)
++                    # Deliberately do not open init_fd or write the observation file.
++                raise TimeoutError("injected checkpoint timeout")
++        finally:
++            proc.close()
++        # The subreaper's ECHILD acknowledgment covers even unpublished children.
++        # Also independently inspect every identity that did reach publication.
++        pids = [_read_pid(work / name) for name in ("wrapper", "monitor", "killer")]
++        pids.append(_init_pid(work / "info"))
++        assert all(not Path(f"/proc/{pid}").exists() for pid in pids if pid is not None)
+diff --git a/tests/ci/test_sandbox_startup_fixture.py b/tests/ci/test_sandbox_startup_fixture.py
+new file mode 100644
+index 00000000000..396a0aea5e3
+--- /dev/null
++++ b/tests/ci/test_sandbox_startup_fixture.py
+@@ -0,0 +1,120 @@
++"""Real-process failure injection for the startup proof's own teardown protocol."""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++import select
++import signal
++import sys
++import textwrap
++
++import pytest
++
++from tests.ci import sandbox_startup_fixture as fixture
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.platforms("linux")
++
++
++def _command(control, body):
++    return [sys.executable, "-I", "-c", textwrap.dedent(f"""\
++        import os, signal, sys
++        from pathlib import Path
++        sys.path.insert(0, {str(Path(fixture.__file__).parent)!r})
++        from sandbox_startup_fixture import checkpoint
++        control = Path({str(control)!r})
++    """) + textwrap.dedent(body)]
++
++
++@pytest.mark.parametrize("name", fixture.CHECKPOINTS)
++@pytest.mark.parametrize("phase", ["before_entry", "publication_gap", "stopped"])
++def test_disarm_acknowledges_checkpoint_without_discovered_pid(tmp_path, monkeypatch, name, phase):
++    # No stopper PID is supplied to disarm. In publication_gap the first CONT
++    # deliberately arrives BEFORE SIGSTOP; it must not be mistaken for an ack.
++    command = _command(tmp_path, f"""\
++        import select
++        phase = {phase!r}
++        def before_stop():
++            if phase != "publication_gap":
++                return
++            received = []
++            signal.signal(signal.SIGCONT, lambda *_: received.append(True))
++            (control / "ready").touch()
++            while not received:
++                select.select([], [], [], 0.01)
++        if phase == "before_entry":
++            (control / "ready").touch()
++            while not (control / "disarmed").exists():
++                select.select([], [], [], 0.01)
++        admitted = checkpoint(control, {name!r}, before_stop)
++        (control / "finished").write_text(str(admitted))
++    """)
++    proc = fixture.FencedProcess(tmp_path, command)
++    real_kill = signal.pidfd_send_signal
++    continues = []
++
++    def counted_kill(pid, signum):
++        if signum == signal.SIGCONT:
++            continues.append(pid)
++        return real_kill(pid, signum)
++
++    try:
++        if phase == "stopped":
++            def stopped():
++                try:
++                    pid = int((tmp_path / name).read_text())
++                    return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] == "T"
++                except (FileNotFoundError, ValueError):
++                    return False
++            wait_until(stopped, timeout=30)
++        else:
++            wait_until(lambda: (tmp_path / "ready").exists(), timeout=30)
++        monkeypatch.setattr(fixture.signal, "pidfd_send_signal", counted_kill)
++        fixture.disarm(tmp_path)
++        # Assert acknowledgment BEFORE fence cleanup, so SIGKILL cannot hide a
++        # broken disarm protocol or make a sentinel-only mutation pass.
++        assert proc.wait(timeout=30) == 0
++        assert (tmp_path / "finished").read_text() == str(phase != "before_entry")
++        if phase == "publication_gap":
++            assert len(continues) >= 2
++    finally:
++        proc.close()
++    assert not Path(f"/proc/{proc.fence.pid}").exists()
++
++
++def test_fence_reaps_unknown_stopped_session_and_late_child(tmp_path):
++    command = _command(tmp_path, """\
++        # This tree deliberately ignores the checkpoint protocol. Ownership must
++        # survive setsid, stripped environment, and a new child after wrapper exit.
++        child = os.fork()
++        if child:
++            os._exit(0)
++        os.setsid()
++        os.environ.clear()
++        grandchild = os.fork()
++        if not grandchild:
++            (control / "grandchild").write_text(str(os.getpid()))
++            os.kill(os.getpid(), signal.SIGSTOP)
++            os._exit(0)
++        (control / "detached").write_text(str(os.getpid()))
++        os.kill(os.getpid(), signal.SIGSTOP)
++        os._exit(0)
++    """)
++    proc = fixture.FencedProcess(tmp_path, command)
++    fds = []
++    try:
++        assert proc.wait(timeout=30) == 0
++        for name in ("detached", "grandchild"):
++            wait_until(lambda: (tmp_path / name).exists() and (tmp_path / name).read_text(), timeout=30)
++            pid = int((tmp_path / name).read_text())
++            fds.append(os.pidfd_open(pid))
++        assert not select.select(fds, [], [], 0)[0], "fence must be idle until cleanup"
++    finally:
++        try:
++            proc.close()
++            assert len(select.select(fds, [], [], 0)[0]) == len(fds)
++        finally:
++            for fd in fds:
++                os.close(fd)
++    for name in ("detached", "grandchild", "wrapper"):
++        assert not Path(f"/proc/{int((tmp_path / name).read_text())}").exists()
+-- 
+2.55.0
+

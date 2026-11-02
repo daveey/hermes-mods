@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1539 patches, one entry per non-merge source commit through `37c70bbcaa1c0ce3d960ba0bd71adf237dbdf7e9`.
+1583 patches, one entry per non-merge source commit through `ca4fa11665dc749496f76239a631e7d9c3eeca09`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -22,12 +22,42 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d`; current merge-base: `c627ec84664d43e0b18b95d9d86d8963747d56c7`.
-Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478 and 1523. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-Current replay: [mirror-replay-1539.json](mirror-replay-1539.json) (five hash-pinned bridges; the fifth carries upstream merge `bbb69887a1c`) and [mirror-policy-1539.json](mirror-policy-1539.json). Executed checks: [mirror-1539-verification.md](mirror-1539-verification.md); preceding snapshots: [mirror-1484-verification.md](mirror-1484-verification.md), [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
+Upstream exclusion tip: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d`; current merge-base: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d` (the fork merged that upstream tip in `6e2fbc15549`).
+Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523 and 1549. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
+Current replay: [mirror-replay-1583.json](mirror-replay-1583.json) (six hash-pinned bridges; the sixth carries the fork's upstream-sync merge `6e2fbc15549`) and [mirror-policy-1583.json](mirror-policy-1583.json). Executed checks: [mirror-1583-verification.md](mirror-1583-verification.md); preceding snapshots: [mirror-1539-verification.md](mirror-1539-verification.md), [mirror-1484-verification.md](mirror-1484-verification.md), [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1540–1583
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Goal judge unachievable recovery](kanban-goal-handoff-judge.md) | 1540–1541 | A parsed unachievable verdict parks the goal in triage with a kernel receipt and files a bounded supervisor-recovery card; 1541 is an explicit empty duplicate source entry. |
+| [Review checkpoint identity across sync](kanban-dependency-review-continuation.md) | 1542 | Review checkpoints carry the run's stable UID so continuation survives sync run-ID remapping; a mismatched UID or remapped legacy ID stays held. |
+| [Kanban maintenance fenced to the card's home gateway](kanban-home-gateway-maintenance.md) | 1543 1551 1566 1569 1571 1572 | Standing-ask rechecks, quota releases, agent-block triage, guard-hold cap/notice and readiness/missing-parent upkeep skip foreign copies; only the home writes. |
+| [Recovery requester and replica triage stay at the target's home](kanban-home-gateway-maintenance.md) | 1570 1576 | Recovery requesters are pinned to the home machine; stale triage skips foreign copies; recovery links carry a stable `park_event_uid`. |
+| [Offline DarkWakes don't spend the recovery budget](kanban-worker-darkwake-recovery.md) | 1544 | With both DNS controls failing, a worker waits in 900 awake-second windows while it still owns the exact claim; only that wait is uncharged, blips and online failures still count. |
+| [Managed workers keep the credential rotation pool](managed-worker-credential-pool.md) | 1545–1546 | Managed workers keep the resolver's `credential_pool`, so Anthropic and Codex rotate accounts on a 429; an explicit launch key never gets a pool; fallback entries stay separate. |
+| [Owner-wake cross-board unblock grants](kanban-owner-wake-grants.md) | 1547–1548 | Owner-wake supervisors can show/unblock exactly listed (board, id) cards on any local board, with run fencing, ambiguity refusal and revocation re-checked at the write. |
+| [Worker-created card chat routing](kanban-creator-chat-routing.md) | 1549–1550 | Worker-created cards link to the nearest human owning chat (or an explicit origin), with no-replay backfill, local origin delivery and unsynced reads. |
+| [Session change watcher projection revision](session-projection-revision.md) | 1552–1553 | Triggers replace a random session-projection generation transactionally; the watcher reads it instead of re-digesting sessions; installs seed a unique generation. |
+| [Subscription quota deadlines and exact pins](subscription-quota-deadlines.md) | 1554–1556 | Exhausted OAuth pools raise a typed `SubscriptionQuotaUnavailable` with its reset; workers exit 75 and receipts hold admission until reset; exact pins kept; authorized class fallback first. |
+| [Shared blocker exact-pin route preview](kanban-shared-blockers.md) | 1557 | `task_route` skips provider-wall retiering for pinned tier reasons, so a pinned card's blocker preview matches dispatch routing. |
+| [Remote-assignee entry paths and unknown labels](mirror-0922-fix-kanban-check-requires-where-runs-on-lands-the-card-never-refuse-a-review-verdict.md) | 1558 | Repinning follows create's `runs_on` execution-host policy; an empty or self-less registry keeps local validation instead of assuming remote. |
+| [Kanban board cold counts](kanban-board-cold-counts.md) | 1559 | `/boards` counts use a read-only `query_only` connection with no writer init, migration or DB creation; prewarm covers active, default and blocked boards. |
+| [Session outcome: silent cron, durable worker leases, routing snapshots](session-outcome.md) | 1560–1562 | Completed silent cron runs read done; unexpired, non-abandoned durable turn leases count as live; gateway routing scans are cached per connection and revision. |
+| [Remote notices: replica observer change keys](kanban-remote-notice-sweep.md) | 1563 | Retained read-only SQLite observers key the replica on data_version, generation and file identity, so idle notice polls skip both aggregate scans. |
+| [Retry a pre-admission storage_unavailable refusal](kanban-worker-requeue-and-crash-records.md) | 1564 | A pre-admission `storage_unavailable` refusal is retried; after 180 s the run exits owner-unavailable and is requeued without a failure; post-admission refusal stays final. |
+| [Sandbox startup-proof fenced cleanup](mirror-ci-follow-ups-1428.md) | 1565 | Startup-proof cleanup uses a subreaper ownership fence plus lock-acknowledged checkpoint disarming (CI workflow and fixture tests). |
+| [Shared blocker home-authority fence](kanban-shared-blockers.md) | 1567–1568 | Only a card's home gateway releases cleared shared blockers or acts on a stranded-probe election win; executor copies keep local wake checks; 1568 is a test-fixture fix. |
+| [Unittest live-home guard and config-backup anchor](config-backups-live-home-guard.md) | 1573–1575 1577 | `python -m unittest` refuses the live/profile Hermes home; good config backups keep one last-full anchor after a collapse (BOM-tolerant, narrower exceptions). |
+| [Provider walls: default-tier fallback and live pool walls](kanban-provider-quota-walls.md) | 1578–1579 | Wall re-tier tries the strong tier when the default provider is walled; live OAuth pool exhaustion counts as a wall at claim; probe errors log a traceback. |
+| [Pushed OAuth tokens keep live quota marks](credential-pool-norefresh-adopt.md) | 1580 | Adopting a pushed no-refresh token keeps a live 429 exhaustion/reset and model cooldowns; refresh/select do not lease the walled row. |
+| [Upstream-conflict owner card in a fresh interpreter](upstream-sync-refused-diagnostics.md) | 1581 | `hermes update` files the upstream-merge-conflict card in a child process pinned to `HERMES_HOME` and prints "Repair owner: NOT FILED" when none is filed. |
+| [CI timings regression attribution](ci-timings-regression-warning.md) | 1582 | A CI wall-time regression stays a Warning only when the PR's own test files or added cases explain it; otherwise Info. |
+| [Boot-time project tree prewarm](annotation-prewarm.md) | 1583 | The boot prewarm thread builds `/api/profiles/projects/tree` through the route's single-flight cache right after the annotation prewarm, so the first Desktop reconnect reads a warm tree. |
+| [1583-entry mirror verification](mirror-1583-verification.md) | verification report | Exact inventory, complete six-bridge replay, empty duplicate entry 1541 and normalized tree. |
 
 ## Mirror follow-ups 1496–1539
 
@@ -849,7 +879,7 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1539-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the five bridges at the boundaries in `mirror-replay-1539.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
+For the current **1583-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the six bridges at the boundaries in `mirror-replay-1583.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
 
 ```bash
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
@@ -870,7 +900,10 @@ git commit -m 'Explicit upstream merge bridge before 1478'
 git am -3 --empty=keep "${patches[@]:1477:45}"
 git apply --index --3way "$MODS/core/bridges/upstream-bbb69887a1c.diff"
 git commit -m 'Explicit upstream merge bridge before 1523'
-git am -3 --empty=keep "${patches[@]:1522}"
+git am -3 --empty=keep "${patches[@]:1522:26}"
+git apply --index --3way "$MODS/core/bridges/upstream-6e2fbc15549.diff"
+git commit -m 'Explicit upstream merge bridge before 1549'
+git am -3 --empty=keep "${patches[@]:1548}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

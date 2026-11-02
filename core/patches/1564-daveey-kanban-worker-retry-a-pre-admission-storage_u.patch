@@ -1,0 +1,189 @@
+From 346d92ff665b567c03cb86925c9d5573970134f9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:42:04 -0800
+Subject: [PATCH] [daveey] kanban worker: retry a pre-admission
+ storage_unavailable refusal, then exit owner-unavailable
+
+hermes-hub 2026-11-01 12:33-12:38 PST: ~/.hermes/config.yaml was replaced by a near-empty file, the owner's session policy had no model, restore_policy refused it and kanban.run answered storage_unavailable. The worker client treated that as a final refusal: 17 runs exited 1 before any admission (none had an owner_admitted event), were booked crashed, and failure_limit=2 sent ten unrelated cards to triage.
+
+A kanban.run refused with storage_unavailable while no admission exists is now asked again (kanban.run is idempotent per attempt). An owner that keeps refusing for OWNER_WAIT_S ends the run with exit 69 (owner_unavailable): the dead-worker sweep requeues it without counting a failure, still bounded by NEUTRAL_STREAK_LIMIT and still counted when the board shows an owner_admitted marker. After an admission the refusal stays final, since a turn may be running.
+
+Tests (tests/hermes_cli/test_kanban_owner_unavailable.py): store refusal before admission exits 69 after retrying; a refusal that heals runs the claim; a store refusal after admission still exits 1; a card-level refusal (invalid_params) still exits 1 at once; end to end, two refused attempts under failure_limit=2 leave the card ready with 0 failures (RED on the parent: the card ends in triage).
+
+Kanban: t_01a198e56e285557 (hub)
+---
+ hermes_cli/kanban_worker_client.py            | 23 ++++-
+ .../test_kanban_owner_unavailable.py          | 98 +++++++++++++++++++
+ 2 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index 35519b0da2c..886e42fdf42 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -47,6 +47,15 @@ _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_contro
+                                       'invalid_control_response'})
+ # Past the board lock wait: the owner's session setup and receipt before and after the write.
+ ADMISSION_ANSWER_MARGIN_S = 60.0
++# [daveey] Owner refusals of ``kanban.run`` that are the host's own condition, not the card's: its
++# runtime store or session policy could not be read. hermes-hub 2026-11-01 12:33-12:38 PST: a
++# near-empty config.yaml left the session policy with no model, ``restore_policy`` refused it, and 17
++# runs exited 1 on ``storage_unavailable`` before any admission; failure_limit=2 sent ten unrelated
++# cards to triage. Before an admission the worker asks again (``kanban.run`` is idempotent per
++# attempt), and an owner that keeps refusing for ``OWNER_WAIT_S`` ends the run owner-unavailable (69:
++# requeued uncounted, bounded by ``NEUTRAL_STREAK_LIMIT``). Once admitted a turn may be running, so the
++# refusal stays final there.
++_HOST_REFUSAL_REASONS = frozenset({'storage_unavailable'})
+ 
+ 
+ def admission_answer_budget():
+@@ -153,7 +162,8 @@ async def run(params, board_db):
+         # A restart also surfaces as a refused or reset dial, a failed handshake, or an answer
+         # that never came.
+         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
+-            if not _restartable(exc):
++            host_refusal = _host_refusal(exc, claim)
++            if not (host_refusal or _restartable(exc)):
+                 raise
+             claim.note_refusal(exc)
+             if claim.silent_for() >= OWNER_WAIT_S:
+@@ -161,7 +171,8 @@ async def run(params, board_db):
+                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
+                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
+                     f' (HTTP {status})' if status else '')
+-                message = f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}'
++                verb = 'kept refusing' if host_refusal else 'silent'
++                message = f'Kanban owner {verb} for {claim.silent_for():.0f}s: {detail}'
+                 if claim.restarted:
+                     # An ADMITTED turn lost to the owner's restart: exit 76, requeued uncounted. [daveey]
+                     raise OwnerRestartLost(message) from exc
+@@ -192,6 +203,14 @@ def _restartable(exc):
+     return True
+ 
+ 
++def _host_refusal(exc, claim):
++    """True for an owner refusal that is the host's condition (``_HOST_REFUSAL_REASONS``) while no
++    admission exists: nothing ran, so asking again is safe. [daveey]"""
++    from hermes_cli.gateway_client import GatewayRPCError
++    return (claim.admission_id is None and isinstance(exc, GatewayRPCError)
++            and str(exc) in _HOST_REFUSAL_REASONS)
++
++
+ async def _discard(events):
+     while True:
+         await events.get()
+diff --git a/tests/hermes_cli/test_kanban_owner_unavailable.py b/tests/hermes_cli/test_kanban_owner_unavailable.py
+index a95fc2216c5..33aa79b9575 100644
+--- a/tests/hermes_cli/test_kanban_owner_unavailable.py
++++ b/tests/hermes_cli/test_kanban_owner_unavailable.py
+@@ -113,6 +113,79 @@ def test_a_final_owner_refusal_still_exits_1(monkeypatch, tmp_path):
+     assert kanban_worker_client._submit() == 1
+ 
+ 
++# ---------------------------------------------------------------------------
++# Worker client: the owner's own store refuses the claim.
++#
++# hermes-hub 2026-11-01 12:33-12:38 PST: ~/.hermes/config.yaml was replaced by a near-empty file, the
++# owner's session policy had no model, ``restore_policy`` refused it, and ``kanban.run`` answered
++# ``storage_unavailable``. 17 runs exited 1 before any admission, were booked ``crashed``, and
++# failure_limit=2 sent ten unrelated cards to triage (t_01a198a1a0bc778f: pids 2352620, 2384471). [daveey]
++# ---------------------------------------------------------------------------
++
++
++def _refusing_owner(reason, *, refusals=None, receipt_error=None):
++    """An owner whose ``kanban.run`` answers *reason* the first *refusals* times (``None``: always),
++    then admits; ``receipt_error`` makes each later ``prompt.receipt`` answer that reason instead."""
++    calls = {"kanban.run": 0, "prompt.receipt": 0}
++
++    @asynccontextmanager
++    async def _connect(*_, **__):
++        class _Client:
++            events = asyncio.Queue()
++
++            async def rpc(self, method, **params):
++                calls[method] = calls.get(method, 0) + 1
++                if method == "kanban.run":
++                    if refusals is None or calls[method] <= refusals:
++                        raise gateway_client.GatewayRPCError(reason, 5001, {"reason": reason})
++                    return {"session_id": "s1", "receipt": {"status": "pending", "admission_id": "a1"}}
++                if receipt_error is not None:
++                    raise gateway_client.GatewayRPCError(receipt_error, 5001, {"reason": receipt_error})
++                return {"status": "terminal", "admission_id": "a1"}
++        yield _Client()
++    return _connect, calls
++
++
++def test_owner_store_refusal_before_admission_exits_owner_unavailable(monkeypatch, tmp_path, capsys):
++    _fake_clock(monkeypatch)
++    _submit_env(monkeypatch, tmp_path)
++    connect, calls = _refusing_owner("storage_unavailable")
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++    assert kanban_worker_client._submit() == ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
++    assert calls["kanban.run"] > 1  # asked again while the host refused, not ended on the first answer
++    assert "Kanban owner kept refusing for 1" in capsys.readouterr().err
++
++
++def test_owner_store_refusal_that_heals_runs_the_claim(monkeypatch, tmp_path):
++    _fake_clock(monkeypatch)
++    _submit_env(monkeypatch, tmp_path)
++    connect, calls = _refusing_owner("storage_unavailable", refusals=3)
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++    monkeypatch.setattr(kanban_worker_client, "_exit_code", lambda receipt, params, board_db: 0)
++    assert kanban_worker_client._submit() == 0
++    assert calls["kanban.run"] == 4
++
++
++def test_owner_store_refusal_after_admission_stays_final(monkeypatch, tmp_path):
++    # Admitted: a turn may be running, so a store refusal while reading its receipt is no proof the
++    # run was turn-free; it ends the worker as before. [daveey]
++    _fake_clock(monkeypatch)
++    _submit_env(monkeypatch, tmp_path)
++    connect, calls = _refusing_owner("storage_unavailable", refusals=0, receipt_error="storage_unavailable")
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++    assert kanban_worker_client._submit() == 1
++    assert calls["prompt.receipt"] == 1
++
++
++def test_a_card_level_owner_refusal_still_exits_1_at_once(monkeypatch, tmp_path):
++    _fake_clock(monkeypatch)
++    _submit_env(monkeypatch, tmp_path)
++    connect, calls = _refusing_owner("invalid_params")
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++    assert kanban_worker_client._submit() == 1
++    assert calls["kanban.run"] == 1
++
++
+ # ---------------------------------------------------------------------------
+ # Dispatcher: the booking.
+ # ---------------------------------------------------------------------------
+@@ -212,3 +285,28 @@ def test_plain_exit_1_is_still_a_crash(home, monkeypatch):
+         kbd.detect_crashed_workers(conn)
+         assert _last_run(conn, tid)["outcome"] == "crashed"
+         assert kb.get_task(conn, tid).consecutive_failures == 1
++
++
++def test_owner_store_refusals_leave_the_card_ready_with_no_failure_spent(home, monkeypatch, tmp_path):
++    """The 11-01 hub sequence end to end: two attempts whose owner refused ``storage_unavailable``
++    under failure_limit=2. Each worker's real exit goes through the dead-worker sweep, and the card
++    stays dispatchable with its failure count unchanged (it went to triage before). [daveey]"""
++    _fake_clock(monkeypatch)
++    connect, _ = _refusing_owner("storage_unavailable")
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++    with kbc.connect() as conn:  # opened before _submit_env points HERMES_KANBAN_DB elsewhere
++        tid = _running(conn)
++        for attempt, pid in enumerate((71001, 71002)):
++            if attempt:
++                _running(conn, tid, pid=pid)
++            _submit_env(monkeypatch, tmp_path)
++            rc = kanban_worker_client._submit()
++            # _submit drops every HERMES_KANBAN_* variable (owner startup must not inherit them), the
++            # fixture's zero crash grace included; without it the sweep never reaps the dead run.
++            monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++            _exits(monkeypatch, rc)
++            kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and task.consecutive_failures == 0
++        outcomes = [r["outcome"] for r in conn.execute("SELECT outcome FROM task_runs WHERE task_id=?", (tid,))]
++        assert outcomes == ["owner_unavailable", "owner_unavailable"]
+-- 
+2.55.0
+
