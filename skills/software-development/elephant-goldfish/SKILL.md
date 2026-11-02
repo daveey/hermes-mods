@@ -72,7 +72,8 @@ Neutral task (fill the brackets; keep the wording neutral):
 > Read `<spec path>` under the heading(s) `<scope headings>`, then the source it cites and these files:
 > `<reading list>`. Apply the rubric below and report what you observe. Cite each observation by spec heading
 > and by source `path:symbol` (or `path:line` read from the file now). Zero findings is a valid result: say so
-> explicitly if you have none. Do not edit files. Rubric: `<rubric section text>`.
+> explicitly if you have none. Do not edit files. Read only the files listed here and the source they cite; do
+> not open other review reports. Rubric: `<rubric section text>`.
 > Report format: for each finding give severity (blocker/major/nit), spec location, source location if any,
 > the evidence you observed, and its consequence if unaddressed.
 
@@ -162,6 +163,8 @@ untouched.
 - Upstream EGM runs seven skills, per-stage human gates and a two-clean-round loop. This adaptation is one
   skill, a consolidated run and a bounded cycle on purpose; don't re-add the gates.
 - Small clear fixes do not need this pipeline.
+- Reviewers explore: in a live run a refuter opened an earlier `review.md` next to the spec. Keep earlier reports
+  out of the reviewed tree where possible, and mark a verdict from a reviewer that read them as not independent.
 - Paths are part of the prompt: a directory named `flawed/`, `expected/` or `mismatch/` tells the reviewer what
   to find. Keep spec, fixture and source paths neutral.
 - "Read-only" is an instruction, not enforcement: reviewers may execute source to probe behavior (useful
