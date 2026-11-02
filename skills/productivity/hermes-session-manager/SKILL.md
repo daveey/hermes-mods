@@ -70,6 +70,10 @@ say what's running, never what needs the user.
   Record his duration waiver on the card, report the actual window, and close on checked evidence—not a
   fabricated full-soak pass. Repair failing checks without another soak-only delay. Quota resets, unfinished
   implementation and third-party locks are not soaks; never shorten real data-retention periods to test expiry.
+  Recheck follow-up children created by repairs: they can reintroduce six-hour or sample-count observation waits
+  after the original duration waiver. Apply the same quoted duration-only rescope and verify real check output,
+  not just wake delivery. Keep partial-window failure, absent-workload NO_PROOF, and actual repair execution
+  separate; a child marked running needs attributable tool receipts before it counts as started recovery.
 - Before undoing a model migration, recover the original user instructions from the tool that performed it:
   Hermes `state.db` does not contain Claude Code's `~/.claude/projects/*/*.jsonl` user messages. Read the
   timestamped user rows and distinguish existing-card migration from later new-card defaults; a commit message
