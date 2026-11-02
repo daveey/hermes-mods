@@ -1226,6 +1226,76 @@ def test_for_loop_restores_still_refuse(multi, template):
     assert _blocked(cmd, main), cmd
 
 
+# Shared allow corpus: add each real false positive here, not only a one-off test.
+AWK_DIFF = r"awk '/^diff --git a\/tools\/process_registry.py/{f=1} /^diff --git/ && !/tools\/process_registry.py/{f=0} f' v1101hr_598.diff"
+READ_ONLY_ALLOW_CORPUS = [
+    AWK_DIFF,
+    AWK_DIFF.replace("awk ", "gawk ", 1),
+    AWK_DIFF.replace("awk ", "mawk ", 1),
+    # Public fixture retains the reported syntax, with personal paths/repo anonymized.
+    r'''cd /Users/you/.hermes/cache/scratch.noindex && timeout 60 gh pr diff 598 -R example/repo > v1101hr_598.diff 2>&1; timeout 60 gh pr diff 608 -R example/repo > v1101hr_608.diff 2>&1; echo "598 diff lines $(wc -l < v1101hr_598.diff) | 608 diff lines $(wc -l < v1101hr_608.diff)"; echo "== #598 tools/process_registry.py hunks:"; ''' + AWK_DIFF + r''' | grep -E '^[@+-]' | grep -v -E '^(\+\+\+|---)' | cut -c1-170 | head -60''',
+    SQLITE_LOOP_REPORTED, SQLITE_LOOP_FULL,
+    *FOR_LOOP_ALLOWED[:4], FOR_LOOP_ALLOWED[-1],
+    "[ -f x ] && echo y", "sed -n '1,5p' f",
+    "awk 'BEGIN { print \"git stash pop\" }'",
+]
+
+
+@pytest.mark.parametrize("cmd", READ_ONLY_ALLOW_CORPUS)
+def test_read_only_allow_corpus(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not _blocked(cmd, main), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "awk 'BEGIN{system(\"git stash pop\")}'",
+    "awk 'BEGIN{\"git stash pop\" | getline x}'",
+    "awk 'BEGIN{print \"\" | \"git stash pop\"}'",
+    "gawk 'BEGIN{system(\"git -C \" ENVIRON[\"TARGET\"] \" stash pop\")}'",
+    "perl -e 'system(\"git stash pop\")'",
+    "mawk 'BEGIN{system(\"git stash apply\")}'",
+    "gawk 'BEGIN{f=\"system\"; @f(\"git stash pop\")}'",
+    "gawk 'BEGIN{f=\"sys\" \"tem\"; @f(\"git -C \" ENVIRON[\"TARGET\"] \" stash pop\")}'",
+    "awk 'BEGIN{system (\"git \" \"stash \" \"pop\")}'",
+])
+def test_awk_command_primitive_refusal_controls(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, str(main)) is not None, cmd
+    assert _blocked(cmd, main), cmd
+
+
+@pytest.mark.parametrize("template", [
+    'awk "$(git -C {wt} stash pop)"',
+    "awk 'BEGIN{{print \"git stash pop\"}}' | sh",
+    "printf '%s' 'BEGIN{{system(\"git stash pop\")}}' | awk -f -",
+    "awk -f - <<'EOF'\nBEGIN{{system(\"git stash pop\")}}\nEOF",
+    "awk 'BEGIN{{system(\"git stash pop\")}} # | data'",
+])
+def test_awk_surrounding_shell_and_program_input_still_refuse(multi, template):
+    main, wt = multi
+    assert _blocked(template.format(wt=wt), main)
+
+
+@pytest.mark.parametrize("program", [
+    'BEGIN{system("git stash pop")}',
+    'BEGIN{"git stash pop" | getline x}',
+    'BEGIN{print "" | "git stash pop"}',
+    'BEGIN{f="system"; @f("git stash pop")}',
+])
+def test_awk_primitives_really_restore_cross_branch(multi, program):
+    main, wt = multi
+    executable = "gawk" if "@" in program else "awk"
+    cmd = f"{executable} '{program}'"
+    assert _blocked(cmd, wt), cmd
+    assert (wt / "f.txt").read_text() == "base\n"
+    if not shutil.which(executable):
+        pytest.skip(f"{executable} missing; refusal checked")
+    subprocess.run([executable, program], cwd=wt, env=GIT_ENV,
+                   check=True, capture_output=True, timeout=30)
+    assert (wt / "f.txt").read_text() == "stashed\n"
+
+
 def test_for_loop_over_same_branch_checkout_allows_pop(multi):
     main, _wt = multi
     cmd = f"for w in {main}; do git -C $w stash pop; done"

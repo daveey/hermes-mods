@@ -123,6 +123,11 @@ This plugin:
   it may run (`tmux new 'git …'`, `make --eval`, `vim -c '!…'`, `npx -c`). Data-only
   programs (`echo`, `grep`, `sed` without its `e` command, `gh`, `jq`, `cat`, `cp`, …)
   are exempt, so `gh pr create --body "git stash pop"` stays allowed;
+- treats `awk`, `gawk` and `mawk` program text as awk, not shell: without `system(`,
+  a pipe or gawk's `@` indirect-call syntax, it does not execute command strings.
+  When these primitives appear, string literals and restore evidence are scanned
+  conservatively (even primitives appearing in comments or data). Shell substitutions
+  around the program are still analyzed normally. Other interpreters are unchanged;
 - analyzes code bash or Git runs implicitly: assignment values (`PS4`, `${x@P}`,
   `(( x ))`), `command_not_found_handle`, `mapfile -C`, `sed` `e`, `perl`/`python`/`node`
   /`awk` program text in argv or a pipe, Git `-c`/`git config` program settings and
@@ -166,6 +171,14 @@ new code; updating the files is not proof an existing session refreshed.
 ## Tests
 
 From the repository root: `scripts/test-all -k stash-worktree-guard`.
+
+`test_read_only_allow_corpus` collects real read-only false positives (awk diff filters,
+SQLite loops, literal for-loop variables, bracket tests and sed reads). Add every future
+false-positive input to this corpus. `test_awk_command_primitive_refusal_controls` retains
+system/pipe/indirect-call controls and Perl parity; `test_awk_primitives_really_restore_cross_branch`
+executes four refused forms only in disposable repositories to prove they really restore.
+`test_awk_surrounding_shell_and_program_input_still_refuse` covers shell substitutions,
+output piped to sh, and awk programs arriving through pipes and heredocs.
 
 Restore proofs (a refused command run in bash really pops the stash into the other
 worktree) use the newest bash on the host, not PATH's first one: macOS's `/bin/bash` 3.2

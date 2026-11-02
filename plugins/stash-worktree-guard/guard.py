@@ -1541,7 +1541,20 @@ class _Analyzer:
                 raw, expanded = ["git", cmd[4:], *raw[1:]], ["git", cmd[4:], *expanded[1:]]
             self.git(raw, expanded, st, prefix, depth)
             return [st], [st]
-        if cmd not in _INERT:
+        is_awk = re.sub(r"[\d.]+$", "", cmd) in {"awk", "gawk", "mawk"}
+        awk_text = "\n".join([
+            *(_expand_word(w, st.vars) or _literal(w) for w in raw[1:]),
+            *(r[2] or r[1] for r in redirs), self.pipe_text or "",
+        ]) if is_awk else ""
+        # Awk is not shell syntax: regex negation and && cannot start a shell command.
+        # Keep a conservative primitive gate (including pipes in strings/comments), then
+        # inspect string literals plus restore evidence, never parse the awk program as sh.
+        # Gawk also permits indirect calls (@fn(...)), including an indirect system().
+        awk_runs_commands = bool(re.search(r"\bsystem\s*\(|\||@", awk_text))
+        if is_awk and awk_runs_commands:
+            for match in re.finditer(r'"((?:\\.|[^"\\])*)"', awk_text):
+                self.shadow_string(match[1], st, depth)
+        if cmd not in _INERT and not is_awk:
             # Unmodeled program: if its argv may name git or a shell, any suffix may be the
             # command it runs (`prlimit git …`, `nix develop -c git …`, `busybox sh -c …`).
             # An unknown word counts when this command made it unknown (a substitution, a
@@ -1559,9 +1572,10 @@ class _Analyzer:
                 self.shadow_string(_expand_word(w, st.vars) or _literal(w), st, depth)
         if _CMDS in st.exported and cmd not in BUILTINS_NOT_HASHED:
             self.shadow_argv(raw, st, depth, as_git=True)  # BASH_CMDS may map it to git
-        if re.sub(r"[\d.]+$", "", cmd) in _INTERPRETERS or (cmd == "sed" and any(
+        if ((re.sub(r"[\d.]+$", "", cmd) in _INTERPRETERS
+             and (not is_awk or awk_runs_commands)) or (cmd == "sed" and any(
                 re.search(r"(?:^|[;\n{}])\s*e(?:\s|;|$)|^s(.).*\1.*\1[gpwIiMm0-9]*e", w)
-                for w in lit[1:])):
+                for w in lit[1:]))):
             # Program text in argv, here-docs or a pipe may run git (`sed 's/^//e'`).
             self.evidence(" ".join([*raw[1:], *(r[2] or r[1] for r in redirs)]))
             self.evidence(self.pipe_text, loose=True)
