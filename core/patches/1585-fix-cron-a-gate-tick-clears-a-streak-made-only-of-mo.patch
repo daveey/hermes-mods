@@ -1,0 +1,416 @@
+From 6ce531f86e6f5e6746fb383bdadd2d8cb6844496 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:04:49 +0000
+Subject: [PATCH] fix(cron): a gate tick clears a streak made only of
+ monitor-source/config gate failures [daveey]
+
+hermes-hub cron 6b4342ad83d9 (ask-eve deploy-guide watcher) showed "error, 5 failures in a row"
+for hours after it recovered: four monitor-source failures (GitHub HTTP 403) and one owner
+refusal, then only healthy unchanged-monitor ticks. ba4de177bd4 lets a gate tick heal a
+fire-only streak, but a monitor-source failure set no kind flag, so it was booked
+last_error_kind="agent" and no later gate tick could clear it; the agent only wakes on change.
+
+Five whys:
+1. no_change ticks keep the last verdict (jobs._record_run_outcome keep_verdict).
+2. keep_verdict is lifted only for a "fire" streak; the 403s were booked "agent".
+3. _apply_monitor_gate's source-failure branch set neither _fire_error nor anything else.
+4. Only two kinds existed (fire, agent): pre-agent gate failures had no kind of their own.
+Not caught: tests covered fire-only streaks; nothing checked that every pre-agent failure
+return tags a kind, nor that the flag crosses the owner boundary (RUN_JOB_FLAGS).
+
+Fix:
+- New kind "gate": _apply_monitor_gate's source failure and _prepare_job_prompt's unparseable-
+  config refusal set job["_gate_error"]; it rides the cron result (RUN_JOB_FLAGS) and
+  bookkeeping passes gate_error=True to mark_job_run. A streak of only fire/gate failures is
+  cleared by a gate tick; any agent failure keeps the keep-verdict behaviour. The injection-
+  block refusal stays agent-kind by design (it re-trips on the next real wake).
+- Guard: AST test over _apply_monitor_gate, _prepare_job_prompt and run_canonical_job fails on
+  any `return (False, ...)` branch that tags neither _gate_error nor _fire_error.
+
+Tests: tests/cron/test_gated_tick_clears_gate_streak.py (8 red before, 11 green after),
+including an end-to-end real monitor script failing then recovering through the owner path.
+---
+ cron/jobs.py                                  |  29 ++-
+ cron/scheduler.py                             |   4 +
+ cron/scheduler_bookkeeping.py                 |   3 +
+ gateway/session_cron.py                       |   4 +-
+ .../test_gated_tick_clears_gate_streak.py     | 230 ++++++++++++++++++
+ 5 files changed, 262 insertions(+), 8 deletions(-)
+ create mode 100644 tests/cron/test_gated_tick_clears_gate_streak.py
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index b6ae8521868..0fe6b7e0f14 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2426,15 +2426,22 @@ def release_unadmitted_fire(
+     return _with_job(job_id, apply, False)
+ 
+ 
++# Failure kinds that never reached the agent: a later gate tick may clear a streak made only of them.
++_PRE_AGENT_ERROR_KINDS = ("fire", "gate")
++
++
+ def _record_run_outcome(
+     job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
+     status: Optional[str], now: str, *, agent_skipped: bool = False, fire_error: bool = False,
++    gate_error: bool = False,
+ ) -> None:
+     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims.
+ 
+     ``last_error_kind`` says what the current failure streak is made of: ``"fire"`` while every
+     failure in it was a fire that never reached the agent (*fire_error*: the owner refused or could
+-    not be reached before admission), ``"agent"`` once any failure in it is the agent's own."""
++    not be reached before admission), ``"gate"`` once a pre-agent gate failed in it (*gate_error*:
++    monitor source, unparseable config) and every other failure was a fire, ``"agent"`` once any
++    failure in it is the agent's own. A gate tick clears a fire/gate streak. [daveey]"""
+     job["last_run_at"] = now
+     job.pop("manual_run_at", None)
+     job.pop("manual_run_restore_at", None)
+@@ -2444,7 +2451,7 @@ def _record_run_outcome(
+     cancelled = status == "cancelled"  # an operator stop is not a failure
+     # Gated ticks keep the last real verdict, except an infra-only failure streak.
+     keep_verdict = agent_skipped and success and job.get("last_status") is not None
+-    if keep_verdict and job.get("last_error_kind") == "fire":
++    if keep_verdict and job.get("last_error_kind") in _PRE_AGENT_ERROR_KINDS:
+         keep_verdict = False
+     if not keep_verdict:
+         job["last_status"] = status or (
+@@ -2460,9 +2467,11 @@ def _record_run_outcome(
+         job["failure_streak"] = 0
+         job.pop("last_error_kind", None)
+     elif not cancelled:
+-        fire_only_so_far = (int(job.get("failure_streak") or 0) == 0
+-                            or job.get("last_error_kind") == "fire")
+-        job["last_error_kind"] = "fire" if fire_error and fire_only_so_far else "agent"
++        prior = job.get("last_error_kind") if int(job.get("failure_streak") or 0) else None
++        if not (fire_error or gate_error) or prior not in (None, *_PRE_AGENT_ERROR_KINDS):
++            job["last_error_kind"] = "agent"
++        else:
++            job["last_error_kind"] = "gate" if gate_error or prior == "gate" else "fire"
+         # Consecutive agent-failure streak; delivery failures do NOT count
+         # (scheduler._failure_streak_nudge).
+         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+@@ -2548,6 +2557,7 @@ def mark_job_run(
+     recover_consumed_fire: bool = False,
+     agent_skipped: bool = False,
+     fire_error: bool = False,
++    gate_error: bool = False,
+ ) -> bool:
+     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
+     and retire the record as a terminal completion when the repeat limit is reached. A manual run
+@@ -2574,10 +2584,14 @@ def mark_job_run(
+     ``agent_skipped``: a gate (``wakeAgent=false`` script, unchanged monitor) suppressed the agent,
+     so this successful tick is not evidence of agent health. ``last_status``, ``last_error``,
+     ``failure_streak`` and ``preflight_alerted`` keep the last real run's values, unless every
+-    failure in the streak was a *fire_error*: then the tick heals the job like a success.
++    failure in the streak was a *fire_error* or *gate_error*: then the tick heals the job like a
++    success.
+ 
+     ``fire_error``: this failed run never reached the agent (the owner gateway refused or could not
+     be reached before admission); booked as ``last_error_kind = "fire"``. [daveey]
++
++    ``gate_error``: this failed run stopped at a pre-agent gate (monitor source failure,
++    unparseable config); booked as ``last_error_kind = "gate"``. [daveey]
+     """
+     def apply(jobs, _i, job):
+         if execution_id is not None and execution_id in job.get("canonical_completions", []):
+@@ -2593,7 +2607,8 @@ def mark_job_run(
+         extra = extra_fire.is_extra(job)  # read before the outcome clears the claim
+         held = extra_fire.held_markers(job) if extra else {}
+         _record_run_outcome(job, success, error, delivery_error, status, now,
+-                            agent_skipped=agent_skipped, fire_error=fire_error)
++                            agent_skipped=agent_skipped, fire_error=fire_error,
++                            gate_error=gate_error)
+         job.update(held)  # a run-now queued mid-run is its own fire, not this one
+         if execution_id is not None:  # retire ids recovery can no longer replay; latest stays last
+             from cron.scheduler_authority import replayable_completions as live
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 8e724958b64..44659dfbefa 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1609,6 +1609,9 @@ def _apply_monitor_gate(
+         # Source failure is an ERROR, never a change: alert so a broken monitor can't silently
+         # stop watching. Stored hash untouched.
+         logger.error("Job '%s': monitor source failed: %s", job_id, _mon.error)
++        # [daveey] Pre-agent: booked last_error_kind="gate", so the next good gate tick (which proves
++        # the source works again) clears a streak made only of these.
++        job["_gate_error"] = True
+         _mon_alert = (
+             f"⚠ Cron monitor '{job_name}' source failed\n\n"
+             f"{_mon.error}\n\n"
+@@ -2456,6 +2459,7 @@ def _prepare_job_prompt(
+             require_parseable_user_config()
+         except InvalidUserConfigError as exc:
+             logger.error("Job '%s': refusing to run — %s", job_id, exc)
++            job["_gate_error"] = True  # [daveey] pre-agent: every later gate tick re-checks the config
+             return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
+ 
+     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
+diff --git a/cron/scheduler_bookkeeping.py b/cron/scheduler_bookkeeping.py
+index fc9bfe8f8fc..09121bf6e3c 100644
+--- a/cron/scheduler_bookkeeping.py
++++ b/cron/scheduler_bookkeeping.py
+@@ -88,6 +88,9 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
+         # [daveey] The fire never reached the agent (refused or unreachable before admission):
+         # booked as last_error_kind="fire", so a later gate tick may clear a streak made only of these.
+         mark_kwargs["fire_error"] = True
++    if job.pop("_gate_error", False) and not d.success:
++        # [daveey] A pre-agent gate failed (monitor source, config): booked as last_error_kind="gate".
++        mark_kwargs["gate_error"] = True
+     if job.pop("_agent_skipped", False) and d.success:
+         # [daveey] A gate tick (wakeAgent=false / unchanged monitor) says nothing about agent health:
+         # resetting the streak and alert marker here hid a job whose every woken run failed.
+diff --git a/gateway/session_cron.py b/gateway/session_cron.py
+index 7a491b24a12..43e7ecc9a56 100644
+--- a/gateway/session_cron.py
++++ b/gateway/session_cron.py
+@@ -157,7 +157,9 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
+ # never-reached model). They cross the authority boundary inside the cron result.
+ # [daveey] ``_agent_skipped``: a wake gate or unchanged monitor suppressed the agent, so the tick
+ # keeps the job's last real verdict (failure streak, alert-once marker) instead of resetting it.
+-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_agent_skipped')
++# [daveey] ``_gate_error``: a pre-agent gate (monitor source, unparseable config) failed; booked as
++# ``last_error_kind = "gate"`` so the next good gate tick may clear the streak.
++RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_agent_skipped', '_gate_error')
+ 
+ 
+ async def operation(authority, name, params, actor=None):
+diff --git a/tests/cron/test_gated_tick_clears_gate_streak.py b/tests/cron/test_gated_tick_clears_gate_streak.py
+new file mode 100644
+index 00000000000..201446a2c76
+--- /dev/null
++++ b/tests/cron/test_gated_tick_clears_gate_streak.py
+@@ -0,0 +1,230 @@
++"""A gate tick heals a failure streak made only of pre-agent gate (and fire) failures. [daveey]
++
++hermes-hub cron 6b4342ad83d9 ("ask-eve deploy-guide watcher", a monitor job) showed ``error, 5
++failures in a row`` for hours after it recovered: four monitor-source failures (GitHub HTTP 403),
++then one owner refusal (``GatewayRPCError``) during a config outage, then only healthy unchanged-
++monitor ticks. ba4de177bd4 let a gate tick clear a streak made only of fire refusals, but a monitor
++source failure was booked as an *agent* failure (``last_error_kind = "agent"``), so the streak never
++cleared: the agent only wakes when the watched output changes.
++
++A monitor-source failure never reaches the agent, and the next good gate tick proves the source
++works again. It is now flagged ``_gate_error`` (riding the cron result like ``_agent_skipped``) and
++booked ``last_error_kind = "gate"``; a gate tick clears a streak made only of gate/fire failures.
++Any agent failure in the streak keeps the keep-verdict behaviour.
++"""
++import ast
++import inspect
++import textwrap
++
++import pytest
++
++import cron.jobs as J
++import cron.scheduler as S
++from tests.cron.test_gated_tick_clears_fire_streak import (
++    _agent_failure, _fire_fault, _gate_tick, _make_due, _owner,
++)
++from tests.cron.test_tick_gateway_not_ready import (
++    _bypass_gate, _due_agent_job, _stored, cron_home as _cron_home,
++)
++
++pytestmark = pytest.mark.usefixtures("_cron_home")
++assert _cron_home  # pytest registers the imported fixture under this module-local name
++
++_MON_ERR = "monitor script failed: HTTP Error 403: rate limit exceeded"
++
++
++def _monitor_failure(monkeypatch, job_id):
++    """The owner ran the monitor gate and the source failed (what session_cron reports back)."""
++    _owner(monkeypatch, (False, "# monitor source failed\n", "alert", _MON_ERR), {"_gate_error": True})
++    _make_due(job_id)
++    S.tick(verbose=False)
++
++
++def _assert_healed(job_id):
++    healed = _stored(job_id)
++    assert healed["failure_streak"] == 0, healed
++    assert healed["last_status"] == "ok" and healed["last_error"] is None
++    assert "last_error_kind" not in healed
++    assert not healed.get("preflight_alerted"), "a future break must alert again"
++    assert healed["last_failure"]["detail"], "the sticky last-failure stamp survives"
++
++
++def test_monitor_failures_are_booked_as_gate(monkeypatch):
++    _bypass_gate(monkeypatch)
++    job_id, _slot = _due_agent_job()
++    for n in (1, 2):
++        _monitor_failure(monkeypatch, job_id)
++        stored = _stored(job_id)
++        assert stored["failure_streak"] == n and stored["last_error_kind"] == "gate"
++
++
++def test_gate_tick_clears_a_streak_made_only_of_monitor_failures(monkeypatch):
++    """(a) four monitor-source failures, then an unchanged-monitor tick."""
++    _bypass_gate(monkeypatch)
++    job_id, _slot = _due_agent_job()
++    for _ in range(4):
++        _monitor_failure(monkeypatch, job_id)
++    J.mark_preflight_alerted(job_id)
++    assert _stored(job_id)["failure_streak"] == 4
++
++    _gate_tick(monkeypatch, job_id)
++
++    _assert_healed(job_id)
++
++
++def test_gate_tick_clears_the_live_monitor_then_fire_sequence(monkeypatch):
++    """(b) the hub sequence: four monitor failures, one owner refusal, then a no_change tick."""
++    _bypass_gate(monkeypatch)
++    job_id, _slot = _due_agent_job()
++    for _ in range(4):
++        _monitor_failure(monkeypatch, job_id)
++    _owner(monkeypatch, None, refuse_submit=True)
++    _make_due(job_id)
++    S.tick(verbose=False)
++    stored = _stored(job_id)
++    assert stored["failure_streak"] == 5 and stored["last_error_kind"] in ("gate", "fire")
++
++    _gate_tick(monkeypatch, job_id)
++
++    _assert_healed(job_id)
++
++
++def test_gate_tick_keeps_a_streak_that_holds_an_agent_failure(monkeypatch):
++    """(c) an agent verdict in the streak survives a gate tick, even after later gate failures."""
++    _bypass_gate(monkeypatch)
++    job_id, _slot = _due_agent_job()
++    _agent_failure(monkeypatch, job_id)
++    _monitor_failure(monkeypatch, job_id)
++    stored = _stored(job_id)
++    assert stored["failure_streak"] == 2 and stored["last_error_kind"] == "agent"
++
++    _gate_tick(monkeypatch, job_id)
++
++    kept = _stored(job_id)
++    assert kept["failure_streak"] == 2 and kept["last_status"] == "error"
++    assert kept["last_error"] == stored["last_error"] and kept["last_error_kind"] == "agent"
++
++
++def test_fire_then_gate_streak_stays_pre_agent(monkeypatch):
++    _bypass_gate(monkeypatch)
++    _fire_fault(monkeypatch)
++    job_id, _slot = _due_agent_job()
++    S.tick(verbose=False)
++    _monitor_failure(monkeypatch, job_id)
++    assert _stored(job_id)["last_error_kind"] in ("gate", "fire")
++    _gate_tick(monkeypatch, job_id)
++    _assert_healed(job_id)
++
++
++def test_real_monitor_script_failure_then_recovery_heals_end_to_end(monkeypatch):
++    """(d) a real monitor script run by the real ``_apply_monitor_gate`` on the owner side, its job
++    flags carried back exactly as ``gateway.session_cron`` does (``RUN_JOB_FLAGS``), booked by the
++    firing scheduler's tick."""
++    from gateway.session_cron import RUN_JOB_FLAGS
++    from cron.monitor import check_monitor
++
++    home = J.HERMES_DIR
++    flag = home / "fail-now"
++    (home / "scripts" / "watch.py").write_text(
++        "import pathlib, sys\n"
++        f"if pathlib.Path({str(flag)!r}).exists():\n"
++        "    print('HTTP Error 403: rate limit exceeded'); sys.exit(1)\n"
++        "print('guide v1')\n", encoding="utf-8")
++    _bypass_gate(monkeypatch)
++    job_id, _slot = _due_agent_job("watcher")
++    J.update_job(job_id, {"monitor_script": "watch.py"})
++    assert check_monitor(_stored(job_id)).changed  # first run seeds the stored hash
++
++    from contextlib import asynccontextmanager
++    from hermes_cli import gateway_client
++
++    class OwnerRunningTheGate:
++        async def rpc(self, method, **params):
++            if method == "cron.submit":
++                return {"session_id": "s", "admission_id": "a"}
++            if method == "cron.recover":
++                return {"status": "missing"}
++            assert method == "cron.status"
++            job = dict(_stored(job_id))  # the owner's own copy, as run_job gets it
++            early, _extra, _ctx = S._apply_monitor_gate(job, job_id, job["name"], None)
++            assert early is not None, "the seeded monitor never wakes the agent here"
++            flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}
++            return {"status": "terminal", "result": list(early), "job_flags": flags}
++
++    @asynccontextmanager
++    async def connect(*_a, **_k):
++        yield OwnerRunningTheGate()
++
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++
++    flag.write_text("1")
++    for n in (1, 2, 3):
++        _make_due(job_id)
++        S.tick(verbose=False)
++        assert _stored(job_id)["failure_streak"] == n
++    assert "403" in _stored(job_id)["last_error"]
++
++    flag.unlink()
++    _make_due(job_id)
++    S.tick(verbose=False)
++
++    _assert_healed(job_id)
++
++
++# --- detection guard: every pre-agent failure return names its kind ------------------------------
++
++# Pre-agent failures deliberately booked as agent failures: a gate tick does not prove them fixed.
++# The injection block re-trips on the next real wake (the prompt/skill content is unchanged).
++_AGENT_KIND_BY_DESIGN = {("_prepare_job_prompt", "CronPromptInjectionBlocked")}
++
++
++def _untagged_failure_returns(fn):
++    """Every ``return (False, ...)`` (also ``return (False, ...), x``) in *fn* whose branch does not
++    set ``_gate_error`` / ``_fire_error`` before it, minus the by-design list."""
++    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
++    missing = []
++    for branch in ast.walk(tree):
++        bodies = [getattr(branch, "body", None), getattr(branch, "orelse", None)]
++        for body in (b for b in bodies if isinstance(b, list)):
++            for i, stmt in enumerate(body):
++                if not isinstance(stmt, ast.Return) or not isinstance(stmt.value, ast.Tuple):
++                    continue
++                first = stmt.value.elts[0] if stmt.value.elts else None
++                inner = first.elts[0] if isinstance(first, ast.Tuple) and first.elts else first
++                if not (isinstance(inner, ast.Constant) and inner.value is False):
++                    continue
++                if any("_gate_error" in ast.unparse(s) or "_fire_error" in ast.unparse(s)
++                       for s in body[:i]):
++                    continue
++                handler = (ast.unparse(branch.type)
++                           if isinstance(branch, ast.ExceptHandler) and branch.type else None)
++                if (fn.__name__, handler) not in _AGENT_KIND_BY_DESIGN:
++                    missing.append(f"{fn.__name__}:+{stmt.lineno} {ast.unparse(stmt)[:90]}")
++    return missing
++
++
++def _pre_agent_gates():
++    import cron.scheduler_authority as A
++    return [S._apply_monitor_gate, S._prepare_job_prompt, A.run_canonical_job]
++
++
++@pytest.mark.parametrize("fn", _pre_agent_gates(), ids=lambda f: f.__name__)
++def test_every_pre_agent_failure_return_tags_a_failure_kind(fn):
++    """A pre-agent failure that sets neither ``_gate_error`` nor ``_fire_error`` is booked as an
++    agent failure, which no later gate tick can clear (the bug above). Each ``return (False, ...)``
++    in the pre-agent gates must sit in a branch that flags its kind, or be listed by design."""
++    assert not _untagged_failure_returns(fn), _untagged_failure_returns(fn)
++
++
++def test_guard_sees_an_untagged_failure_return():
++    """The guard itself goes red on the pre-fix shape of the monitor source-failure branch."""
++    def _apply_monitor_gate(job, ok):
++        if not ok:
++            return (False, "doc", "alert", "err"), None, None
++        return None, None, None
++    assert _untagged_failure_returns(_apply_monitor_gate)
++
++
++def test_gate_error_rides_the_cron_result_across_the_owner_boundary():
++    from gateway.session_cron import RUN_JOB_FLAGS
++    assert "_gate_error" in RUN_JOB_FLAGS
+-- 
+2.55.0
+

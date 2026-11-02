@@ -155,3 +155,30 @@ Apply the complete numeric series from the inventory merge-base using `git am -3
 Restart and admission settlement are core-owned, not plugin replacements. Test-only entries change test harnesses and do not imply a deployed runtime fix. Private identities in mail headers and example fixtures are normalized; operational routing identifiers are retained so the series can replay faithfully.
 
 Verification: [mirror-1253-verification.md](mirror-1253-verification.md).
+
+## Follow-up patch (1585): monitor-source and config gate failures get their own kind
+
+Patch: `patches/1585-fix-cron-a-gate-tick-clears-a-streak-made-only-of-mo.patch` (`6ce531f86e`, `fix(cron): a gate tick clears a streak made only of monitor-source/config gate failures`). It extends patch 1240 above.
+
+**Behavior.** A hub cron watcher showed "error, 5 failures in a row" for hours after it recovered. The streak held four monitor-source failures (GitHub HTTP 403) and one owner refusal, followed only by healthy unchanged-monitor ticks. Patch 1240 lets a gate tick heal a fire-only streak. But a monitor-source failure set no kind flag, so it was booked `last_error_kind="agent"` and no later gate tick could clear it; the agent wakes only on a change. Now there is a third kind, `"gate"`, for a monitor-source failure in `_apply_monitor_gate` and an unparseable-config refusal in `_prepare_job_prompt`. The next good gate tick clears a streak made only of fire and gate failures. Any agent failure in the streak keeps the old keep-verdict behaviour. The prompt-injection block refusal stays agent-kind on purpose, because it re-trips on the next real wake.
+
+**How it works.**
+- `cron/scheduler.py` sets `job["_gate_error"] = True` on both pre-agent gate failures.
+- `gateway/session_cron.py` adds `_gate_error` to `RUN_JOB_FLAGS`, so the flag crosses the owner boundary with the cron result.
+- `cron/scheduler_bookkeeping.py` pops it on a failed run and passes `gate_error=True` to `mark_job_run`.
+- `cron/jobs.py`: `_PRE_AGENT_ERROR_KINDS = ("fire", "gate")`. `_record_run_outcome` lifts `keep_verdict` for either kind. A failure is booked `"agent"` once any failure in the streak is the agent's own. Otherwise it is booked `"gate"` when it is a gate error or the prior streak kind was `"gate"`, and `"fire"` when the streak is fire-only.
+
+**Code.** `cron/jobs.py`, `cron/scheduler.py`, `cron/scheduler_bookkeeping.py`, `gateway/session_cron.py`.
+
+**Tests.** In the patch; not run for this mirror. The commit reports 8 red before and 11 green after. `tests/cron/test_gated_tick_clears_gate_streak.py`:
+- `test_monitor_failures_are_booked_as_gate`
+- `test_gate_tick_clears_a_streak_made_only_of_monitor_failures`
+- `test_gate_tick_clears_the_live_monitor_then_fire_sequence`: the incident's sequence.
+- `test_gate_tick_keeps_a_streak_that_holds_an_agent_failure`
+- `test_fire_then_gate_streak_stays_pre_agent`
+- `test_real_monitor_script_failure_then_recovery_heals_end_to_end`: a real monitor script fails, then recovers, through the owner path.
+- `test_every_pre_agent_failure_return_tags_a_failure_kind` (parametrized over `_apply_monitor_gate`, `_prepare_job_prompt`, `run_canonical_job`): an AST guard that fails on any `return (False, ...)` branch tagging neither `_gate_error` nor `_fire_error`.
+- `test_guard_sees_an_untagged_failure_return`: the guard catches a planted untagged return.
+- `test_gate_error_rides_the_cron_result_across_the_owner_boundary`: `_gate_error` is in `RUN_JOB_FLAGS`.
+
+**Gotchas.** A new pre-agent failure branch must tag a kind, or the AST guard fails. An injection-block refusal is still booked `"agent"`.

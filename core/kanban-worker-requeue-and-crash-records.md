@@ -74,3 +74,47 @@ Patch: `patches/1564-daveey-kanban-worker-retry-a-pre-admission-storage_u.patch`
 - Only `storage_unavailable` is treated as the host's fault. Other owner-side refusals are still final.
 - A host whose config stays broken still reaches the failure breaker after `NEUTRAL_STREAK_LIMIT` neutral requeues. The patch does not repair the config.
 - Apply in full-series order; standalone application is not certified.
+
+## Follow-up patch (1587): host routing-registry and owner-storage refusals requeue uncounted, with one host notice
+
+Patch: `patches/1587-daveey-kanban-a-host-routing-registry-or-owner-stora.patch` (`3cd523880e`, `kanban: a host routing-registry or owner-storage refusal before any turn requeues the card uncounted, with one host notice per window`). It extends patch 1564 above.
+
+**Behavior.** A host config outage on the hub emptied `model_routing.routes`. Every managed Kanban worker the owner admitted then died in agent construction with `ManagedPinRejectedError` (an empty registry serves no pin). Each exited 1 and was booked `crashed`, and `failure_limit=2` sent unrelated cards to triage. The 1564 neutral requeue did not apply: the owner had admitted those runs, and an admitted run may have run a turn. These had not, because agent construction comes before the first turn. Now:
+- A start failure caused by the host's registry books the owner-unavailable exit (69) with a typed proof. Two causes qualify: a registry that served no eligible subscription pin to any card (`registry_empty`), or a registry that `managed_config` could not read or validate (`HostRoutingConfigError`). The dead-worker sweep requeues such an admitted run without counting a failure, still bounded by `NEUTRAL_STREAK_LIMIT`.
+- These still count: a registry that serves other pins (this card's pin is genuinely wrong), any other routing error, and any failure after the agent started.
+- A pre-admission `storage_unavailable` refusal (1564) is still requeued uncounted. It now also carries a proof that names the host fault.
+- Either host fault files ONE Kanban card per host (`<host>: host config fault, Kanban workers refused`, assignee `default`, priority 80). It is commented at most once per 15-minute window, however many cards are refused. After that card is done, a recurrence opens a fresh round card. It is never an Inbox card. A silent owner (restart drain) and a card-level owner refusal file no notice.
+
+**How it works.**
+- `agent/model_routing_managed.py`: new `HostRoutingConfigError(ModelRoutingError)`, raised by `managed_config` for a non-mapping `model_routing` or a failed `validate_policy`. `ManagedPinRejectedError.registry_empty` is true when its allowed list is empty. Callers that fail closed on `ModelRoutingError` are unchanged.
+- New `hermes_cli/kanban_host_refusal.py`:
+  - `startup_proof(exc)` walks the cause chain and returns `{kind: managed_registry_empty | managed_registry_invalid, phase: startup}`, or `None`.
+  - `preadmission_proof(reason)` maps `storage_unavailable` to `owner_storage_unavailable`.
+  - `proven(conn, task_id, run_id, claim_lock, admitted=, pid=)` accepts a proof only on the run's sole `worker_result`, under the run's claim, with exit 69. For an admitted run the result must come from the pid that `worker_bound` recorded under that claim. For an unadmitted run it must come from the run's own submitter, with nothing bound.
+  - `notify` files or comments the host card inside the sweep's write transaction and never raises into the sweep.
+- `gateway/session_kanban.py`: `record_start_failure` books exit 69 plus the proof (the new `extra` argument of `_record_worker_result`) when `startup_proof` finds one.
+- `hermes_cli/kanban_owner_unavailable.py`: in `note`, only a startup proof excuses an admitted run. A proof is stored as `host_refusal` on the event and sets the run's error text (`run_error`). `noted` calls `notify` for a requeued run that has a proof.
+- `hermes_cli/kanban_worker_client.py` and `kanban_worker_log.py` carry the refusal reason (`error.host_refusal`) and store the pre-admission proof on the submitter receipt.
+
+**Code.** `agent/model_routing_managed.py`, `gateway/session_kanban.py`, `hermes_cli/kanban_host_refusal.py`, `hermes_cli/kanban_owner_unavailable.py`, `hermes_cli/kanban_worker_client.py`, `hermes_cli/kanban_worker_log.py`.
+
+**Tests.** In the patch; not run for this mirror. `tests/hermes_cli/test_kanban_host_refusal.py`:
+- `test_repeated_empty_registry_refusals_after_admission_leave_the_card_ready_uncounted`
+- `test_host_refusals_still_reach_the_neutral_streak_breaker`
+- `test_a_genuinely_invalid_pin_counts_and_two_hit_the_failure_limit`
+- `test_an_unreadable_or_invalid_registry_at_start_is_a_host_fault` (parametrized)
+- `test_managed_config_types_only_host_registry_faults`
+- `test_an_untyped_routing_error_at_start_still_counts`
+- `test_an_invalid_registry_inside_a_turn_counts`, `test_an_empty_registry_refusal_inside_a_turn_counts`, `test_an_empty_registry_refusal_after_the_turn_counts`
+- `test_a_proof_not_written_by_the_bound_interpreter_counts`
+- `test_host_notice_dedups_across_cards_and_reappears_next_window`, `test_host_notice_opens_a_fresh_card_once_the_last_one_is_done`, `test_host_notice_never_raises_into_the_sweep`
+- `test_preadmission_storage_refusals_file_one_host_notice_per_window`, `test_startup_and_preadmission_host_faults_share_one_host_card`
+- `test_a_silent_owner_requeues_without_a_host_notice`, `test_a_card_level_owner_refusal_files_no_host_notice`
+- `test_a_preadmission_proof_from_another_pid_files_no_notice`, `test_a_preadmission_proof_does_not_excuse_an_admitted_run`
+
+`tests/hermes_cli/test_kanban_worker_start_failure_cause.py` changes only to accept the new `extra` parameter.
+
+**Gotchas.**
+- The proof is typed and tied to one process and claim; there is no text matching. A proof written by any other pid, or a run with a second `worker_result`, is booked as a normal failure.
+- The host card is a notice. The patch does not repair the config, and a host that stays broken still reaches the breaker after `NEUTRAL_STREAK_LIMIT` neutral requeues.
+- Apply in full-series order; standalone application is not certified.

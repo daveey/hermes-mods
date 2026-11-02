@@ -62,3 +62,19 @@ Depends on the preceding series (the existing timings report, cache-log parsing 
 ## Plugin?
 
 No. Core CI scripts and workflow.
+
+## Follow-up patch (1584): read slice durations from caller-prefixed job names
+
+Patch: `patches/1584-daveey-CI-timings-read-test-slice-durations-from-cal.patch` (`f1d9ee225d`, `CI timings: read test-slice durations from caller-prefixed job names`).
+
+**Behavior.** The GitHub API names the test-slice jobs of a reusable workflow in the caller run `Python tests / Run tests (8/8)`, with an empty `workflow_name`. The 1582 check `startswith("Run tests (")` therefore skipped every slice. PR #575's own bot comment said its new test files took "0.0 s (not run)"; they ran, in 1.3 s and 2.0 s. Now a slice job is recognized by its last name segment, so both `Run tests (1/8)` and `Python tests / Run tests (8/8)` match. A run where no slice log produced a single per-file duration is treated as unknown, not 0 s, so the regression stays a **Warning** instead of dropping to Info.
+
+**How it works.** `scripts/ci/timings_report.py` adds `_TEST_SLICE_JOB_RE = re.compile(r"(?:^|/ )Run tests \(")`, which `_collect_cache_data` uses in place of `startswith`. `pr_test_attribution` returns `None` (no attribution) when the per-file map is empty, so `generate_review_status` keeps the Warning.
+
+**Code.** `scripts/ci/timings_report.py`.
+
+**Tests.** In the patch; not run for this mirror. `tests/ci/test_timings_attribution.py`:
+- `test_collect_reads_durations_from_slice_jobs_named_with_the_caller_prefix`: both job-name forms are read, and a non-test job (`Python lints / ruff`) is ignored.
+- `test_no_per_file_durations_at_all_is_unknown_not_zero_seconds`: the result stays `warning` and never says `0.0 s`.
+
+**Gotchas.** A run whose slice logs all fail to parse now always keeps the Warning, even when the PR added no tests.

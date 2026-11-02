@@ -1,0 +1,94 @@
+From f1d9ee225d44a9c3ceb16b2d156709cb479f610b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:06:47 +0000
+Subject: [PATCH] [daveey] CI timings: read test-slice durations from
+ caller-prefixed job names
+
+The API names the slice jobs "Python tests / Run tests (8/8)", so the
+startswith("Run tests (") check skipped every slice and #575's own bot
+comment said its new test files took "0.0 s (not run)" (they ran: 1.3 s
+and 2.0 s). Match the last name segment, and treat a run with no per-file
+durations at all as unknown (the regression stays a Warning) instead of 0 s.
+
+Card t_01a1994595adb16d.
+---
+ scripts/ci/timings_report.py         |  9 +++++++-
+ tests/ci/test_timings_attribution.py | 31 ++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/ci/timings_report.py b/scripts/ci/timings_report.py
+index be63c88205b..27405ebefe9 100644
+--- a/scripts/ci/timings_report.py
++++ b/scripts/ci/timings_report.py
+@@ -183,7 +183,7 @@ def _collect_cache_data(jobs: list[dict], repo: str, token: str, test_durations:
+             continue
+         parsed = parse_cache_log(log, job["steps"])
+         entries.extend(dict(entry, job=name, job_id=job_id, job_url=job["html_url"]) for entry in parsed)
+-        if test_durations is not None and str(job.get("name", "")).startswith("Run tests ("):
++        if test_durations is not None and _TEST_SLICE_JOB_RE.search(str(job.get("name", ""))):
+             files, slow = parse_test_durations(log)
+             for bucket, found in (("files", files), ("slow_cases", slow)):
+                 into = test_durations.setdefault(bucket, {})
+@@ -206,6 +206,10 @@ _SLOW_CASE_RE = re.compile(r"⏱ slow test case (\d+(?:\.\d+)?)s (\S+)\s*$")
+ _TEST_FILE_RE = re.compile(r"(?:^|/)tests?/(?:.*/)?(?:test_[^/]*|[^/]*_test)\.py$")
+ _ADDED_TEST_RE = re.compile(r"^\+\s*(?:async\s+)?def\s+(test\w*)\s*\(")
+ 
++# A test-slice job. The API names a reusable-workflow job in the caller run "Python tests / Run tests (3/8)"
++# (empty workflow_name), so match the last path segment, not the start of the name.
++_TEST_SLICE_JOB_RE = re.compile(r"(?:^|/ )Run tests \(")
++
+ # Attribution thresholds: the PR's added/changed test files in total, and one added case.
+ _PR_TEST_FILES_WARN_S = 60.0
+ _PR_TEST_CASE_WARN_S = 10.0
+@@ -271,6 +275,9 @@ def pr_test_attribution(timings: dict) -> dict | None:
+         return None
+     durations = timings.get("test_durations") or {}
+     per_file = durations.get("files") or {}
++    if not per_file:
++        # No slice log yielded a single file duration: collection broke, so the PR's cost is unknown (not 0 s).
++        return None
+     pr_files = list(pr.get("test_files") or [])
+     file_secs = {f: float(per_file.get(f, 0.0)) for f in pr_files}
+     added = pr.get("added_cases") or {}
+diff --git a/tests/ci/test_timings_attribution.py b/tests/ci/test_timings_attribution.py
+index 30bf3599954..0d6b0402ba0 100644
+--- a/tests/ci/test_timings_attribution.py
++++ b/tests/ci/test_timings_attribution.py
+@@ -168,3 +168,34 @@ def test_collect_pr_changes_outside_a_pull_request_is_none(monkeypatch, tmp_path
+     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+     monkeypatch.setattr(_mod, "api_get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no API call")))
+     assert _mod.collect_pr_changes("tok", "daveey/hermes") is None
++
++
++# Regression (2026-11-01, PR #575's own bot comment): the test-slice jobs come back from the API as
++# "Python tests / Run tests (8/8)" (a reusable-workflow job in the caller run, empty workflow_name), so a
++# `startswith("Run tests (")` check skipped every slice and the item said the PR's files took "0.0 s (not run)".
++def test_collect_reads_durations_from_slice_jobs_named_with_the_caller_prefix(monkeypatch):
++    jobs = [{"job_id": 7, "name": "Python tests / Run tests (8/8)", "workflow_name": "", "conclusion": "success",
++             "steps": [], "html_url": "u"},
++            {"job_id": 8, "name": "Run tests (1/8)", "workflow_name": "Python tests", "conclusion": "success",
++             "steps": [], "html_url": "u"},
++            {"job_id": 9, "name": "Python lints / ruff", "workflow_name": "", "conclusion": "success",
++             "steps": [], "html_url": "u"}]
++    logs = {7: _LOG, 8: "2026-11-01T20:05:21Z [ 1% | 1/~9 | ✓1 | ✗0] ✓ tests/ci/test_new.py (9✓, 1.3s)\n",
++            9: "2026-11-01T20:05:21Z ✓ tests/lint_only.py (1✓, 5.0s)\n"}
++    monkeypatch.setattr(_mod, "_job_log", lambda job_id, repo, token: logs[job_id])
++    monkeypatch.setattr(_mod, "parse_cache_log", lambda log, steps: [])
++    durations: dict = {"files": {}, "slow_cases": {}}
++    _mod._collect_cache_data(jobs, "o/r", "t", durations)
++    assert durations["files"]["tests/hermes_cli/test_kanban.py"] == 120.5
++    assert durations["files"]["tests/ci/test_new.py"] == 1.3
++    assert "tests/lint_only.py" not in durations["files"]
++    assert durations["slow_cases"] == {"tests/hermes_cli/test_kanban.py::TestX::test_big[a]": 12.4}
++
++
++def test_no_per_file_durations_at_all_is_unknown_not_zero_seconds():
++    # Durations missing for the whole run means collection broke, not that the PR's tests took 0 s:
++    # the regression must not be waved through as Info.
++    cur, base = _slow_ci({})
++    result = _result(_mod.generate_review_status(cur, base))
++    assert result["kind"] == "warning", result
++    assert "0.0 s" not in result["summary"]
+-- 
+2.55.0
+

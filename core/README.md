@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1583 patches, one entry per non-merge source commit through `ca4fa11665dc749496f76239a631e7d9c3eeca09`.
+1588 patches, one entry per non-merge source commit through `02b2c78f2881a92c1c68cf423fc8780c9ff8682e`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -24,10 +24,21 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d`; current merge-base: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d` (the fork merged that upstream tip in `6e2fbc15549`).
 Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523 and 1549. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-Current replay: [mirror-replay-1583.json](mirror-replay-1583.json) (six hash-pinned bridges; the sixth carries the fork's upstream-sync merge `6e2fbc15549`) and [mirror-policy-1583.json](mirror-policy-1583.json). Executed checks: [mirror-1583-verification.md](mirror-1583-verification.md); preceding snapshots: [mirror-1539-verification.md](mirror-1539-verification.md), [mirror-1484-verification.md](mirror-1484-verification.md), [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
+Current replay: [mirror-replay-1588.json](mirror-replay-1588.json) (six hash-pinned bridges; the sixth carries the fork's upstream-sync merge `6e2fbc15549`) and [mirror-policy-1588.json](mirror-policy-1588.json). Executed checks: [mirror-1588-verification.md](mirror-1588-verification.md); preceding snapshots: [mirror-1583-verification.md](mirror-1583-verification.md), [mirror-1539-verification.md](mirror-1539-verification.md), [mirror-1484-verification.md](mirror-1484-verification.md), [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1584–1588
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [CI timings: caller-prefixed slice job names](ci-timings-regression-warning.md) | 1584 | Slice durations are read from jobs named `Python tests / Run tests (n/8)`; a run with no per-file durations is unknown, so the regression stays a Warning. |
+| [Cron gate failures heal on a gate tick](mirror-admission-and-test-followups.md) | 1585 | Monitor-source and unparseable-config failures are booked `last_error_kind="gate"`; the next good gate tick clears a fire/gate-only streak; an AST guard requires every pre-agent failure return to tag a kind. |
+| [Shell-quoted interpreter path](shell-quoted-interpreter.md) | 1586 | `shlex.quote(sys.executable)` at 12 shell-command sites (11 test fixtures, the Teams pip hint); an AST repo guard flags a bare interpreter shell word; shebangs exempt. |
+| [Host registry/storage refusals requeue uncounted](kanban-worker-requeue-and-crash-records.md) | 1587 | An empty or invalid host routing registry at worker start books exit 69 with a typed proof and requeues the admitted run uncounted; host faults file one Kanban card per host per 15-min window. |
+| [Busy admission lock defers a claim at INFO](update-admission-fence.md) | 1588 | `AdmissionBusy` in `claim_transaction` logs INFO without a traceback; real lock failures stay WARNING with `exc_info`. |
+| [1588-entry mirror verification](mirror-1588-verification.md) | verification report | Exact inventory, complete six-bridge replay and normalized tree; no new fingerprint or bridge. |
 
 ## Mirror follow-ups 1540–1583
 
@@ -716,7 +727,7 @@ not something the public fixture CI can perform without the source repository.
 | [prompt-admission.md](prompt-admission.md) | 0447, 0448, 0449, 0450, 0452 | Durable exact-owner prompt admission with atomic cancel/reopen and a projected admitted user-row event. |
 | [provider-fallback-and-token-routing.md](provider-fallback-and-token-routing.md) | 0486, 0487, 0511, 0527 | Fallback failures preserved, quota holds bounded to whole chains; routing caps compare token estimates, not bytes. |
 | [model-pill-stored-model.md](model-pill-stored-model.md) | 0473, 0484, 0495 | Composer pill and effort menu use the chat's stored model while its agent is unloaded. |
-| [update-admission-fence.md](update-admission-fence.md) | 0503 1078 | Cross-process admission fence for Desktop reservations and Kanban claims during `hermes update`. |
+| [update-admission-fence.md](update-admission-fence.md) | 0503 1078 1588 | Cross-process admission fence for Desktop reservations and Kanban claims during `hermes update`. |
 | [final-output-withhold-and-submit-survival.md](final-output-withhold-and-submit-survival.md) | 0479, 0500 | Rejected final output withheld until final transforms; an accepted submit survives a client socket drop. |
 | [scratch-home-metrics-and-ci-stability.md](scratch-home-metrics-and-ci-stability.md) | 0471, 0485, 0496, 0498, 0499, 0501, 0502, 0506, 0526, 0531 | Scratch-home isolation, shared-metrics offer never shown, and CI/portability fixes. |
 | [kanban-claim-lease-fencing.md](kanban-claim-lease-fencing.md) | 0530 0543 1072 | Reset heartbeat at claim and fence stale lease echoes with the authoritative grant version, without dropping unrelated task updates. |
@@ -879,7 +890,7 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1583-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the six bridges at the boundaries in `mirror-replay-1583.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
+For the current **1588-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the six bridges at the boundaries in `mirror-replay-1588.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
 
 ```bash
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1

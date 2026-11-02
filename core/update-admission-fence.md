@@ -52,3 +52,17 @@ No: it sits inside core admission paths.
 - Gateway: a restart requested while `<home>/core-update/intent` exists is cancelled if the intent goes away before the work drains (the update gave up), instead of relaunching the old code (`gateway/run_shutdown_restart_wait.py`, split out of `run_shutdown.py`).
 
 Code: `cron/scheduler.py`, `cron/scheduler_tick.py`, `hermes_cli/admission_fence.py`, `gateway/run_shutdown.py`, `gateway/run_shutdown_restart_wait.py`. Tests: `tests/cron/test_update_admission_hold.py` (2), `tests/gateway/test_restart_cancel_on_update_giveup.py`. Tests were added or changed by these commits; they were not re-run for this mirror.
+
+## Follow-up patch (1588): a busy admission lock defers a Kanban claim at INFO
+
+Patch: `patches/1588-fix-kanban-a-busy-admission-lock-defers-a-claim-at-I.patch` (`02b2c78f28`, `fix(kanban): a busy admission lock defers a claim at INFO, not WARNING+traceback`).
+
+**Behavior.** When another claimer (or hermes-sync) holds `admission.lock` through its commit, `claim_transaction` defers the claim to the next tick. That designed contention used to be logged as a `WARNING` with a traceback, like a real lock failure, and the coach detector filed false self-heal defects from it. Now `AdmissionBusy` logs one INFO line (`Update admission lock busy; deferring Kanban claim to the next tick`) with no traceback. `OSError` and other `TimeoutError`s keep the WARNING with `exc_info`. Claim behaviour is unchanged: the claim returns nothing and the card keeps its status.
+
+**Code.** `hermes_cli/kanban_admission.py` (`claim_transaction` catches `AdmissionBusy` before the generic `(OSError, TimeoutError)` handler).
+
+**Tests.** In the patch; not run for this mirror. `tests/hermes_cli/test_kanban_admission_contention.py`:
+- `test_busy_admission_lock_defers_quietly` (parametrized over task and review claims): with the lock held from another fd, the claim returns `None`, the card stays `ready`/`review`, there is no WARNING or `exc_info` record, and there is one INFO `lock busy` record.
+- `test_real_admission_failure_stays_loud`: a `PermissionError` from the lock still logs a WARNING carrying it.
+
+**Gotchas.** `AdmissionBusy` subclasses `TimeoutError`, so the new handler must stay before the generic one.
