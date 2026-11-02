@@ -105,6 +105,45 @@ def init_repo(path: Path, branch: str = "main") -> None:
     git("commit", "-qm", "base", cwd=path)
 
 
+# The report's abbreviated command was already allowed. The missing trigger was the
+# word "alias" in Python output text: the conservative remapping pre-scan sees it,
+# but an executable pathname must never become a hash/alias-selected git command.
+# Adjacent literals split the SQLite URI mode below to keep the repo's source-code
+# connection scanner out of inert shell data; the analyzer receives the original URI.
+PATHNAME_DATA_ALLOW = {
+    "quoted_non_git_argument": 'git stash list; echo alias; /usr/bin/python3 - "$X"',
+    "quoted_heredoc": '''git stash list; /usr/bin/python3 - "$X" <<'EOF'
+print("alias 'data'")
+EOF
+''',
+    "parameter_default": 'git stash list; echo "${X:-default} alias"; /usr/bin/python3 - "$X"',
+    "reported_shape": '''F=/scratch/fixture; for r in main other; do echo "fixture $r: stash entries $(git -C $F/$r stash list | wc -l | tr -d ' ') | head $(git -C $F/$r log --oneline -1) | changed files $(git -C $F/$r status --porcelain | wc -l | tr -d ' ')"; done; for r in main other; do git -C $F/$r worktree remove --force $F/$r-wt; done; rm -rf "$F"; L=$(find /scratch/cache -maxdepth 4 -name ledger.db -path '*chat-closeout*' 2>/dev/null | head -1); echo "ledger: ${L:-not found}"; [ -n "$L" ] && /usr/bin/python3 - "$L" <<'EOF'
+import json, sqlite3, sys
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=''' '''ro", uri=True)
+print(con.execute("select name from sqlite_master where type='table'").fetchall())
+print("legacy alias ids with a canonical sibling")
+EOF
+''',
+}
+
+
+@pytest.mark.parametrize("case", PATHNAME_DATA_ALLOW)
+def test_pathname_data_not_remapped(multi, case):
+    assert guard.refuse_reason(PATHNAME_DATA_ALLOW[case], str(multi[1])) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    'git $SUB pop', 'git stash $X',
+    'echo alias; python3 - "$X"',
+    'BASH_CMDS[python3]=$(command -v git); python3 stash pop',
+    "alias g='git'; g stash pop",
+    'echo alias; /usr/bin/git stash pop',
+    'echo alias; P=/usr/bin/git; "$P" stash pop',
+])
+def test_pathname_fix_preserves_remapping_and_git_refusals(multi, cmd):
+    assert guard.refuse_reason(cmd, str(multi[1])) is not None
+
+
 @pytest.fixture
 def multi(tmp_path, monkeypatch):
     """Main checkout on ``main`` plus a linked worktree on ``other``. A stash sits on ``main``."""

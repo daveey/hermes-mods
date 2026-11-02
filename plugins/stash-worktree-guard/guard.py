@@ -1669,7 +1669,10 @@ class _Analyzer:
             # `make --eval`, `vim -c '!…'`, `npx -c`).
             for w in raw[1:]:
                 self.shadow_string(_expand_word(w, st.vars) or _literal(w), st, depth)
-        if _CMDS in st.exported and cmd not in BUILTINS_NOT_HASHED:
+        # Alias names cannot contain '/', and command hashing only applies to bare
+        # names. Use the expanded executable, not its basename: even when data text
+        # triggered conservative remapping evidence, /usr/bin/python3 is not git.
+        if _CMDS in st.exported and "/" not in name and cmd not in BUILTINS_NOT_HASHED:
             self.shadow_argv(raw, st, depth, as_git=True)  # BASH_CMDS may map it to git
         if ((re.sub(r"[\d.]+$", "", cmd) in _INTERPRETERS
              and (not is_awk or awk_runs_commands)) or (cmd == "sed" and any(
