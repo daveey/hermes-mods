@@ -1354,7 +1354,17 @@ def test_for_loop_restores_still_refuse(multi, template):
 
 # Shared allow corpus: add each real false positive here, not only a one-off test.
 AWK_DIFF = r"awk '/^diff --git a\/tools\/process_registry.py/{f=1} /^diff --git/ && !/tools\/process_registry.py/{f=0} f' v1101hr_598.diff"
+# Reported command is analyzed only, never executed. Personal path anonymized.
+BUILTIN_REPORTED = r'''R=/Users/you/code/hermes; P=/Users/you/.hermes/cache/scratch.noindex; S=$P/v1101is; rm -rf $S; mkdir -p $S/home $S/tmp; git -C $R worktree add -q --detach $S/wt 4406b1ef28bf && cd $S/wt && git show 4406b1ef28bf^1:hermes-sync > hermes-sync && echo "RED (corrected base cb19c73c5c) hermes-sync blob $(git hash-object hermes-sync | cut -c1-12)" && timeout 300 env -i HOME=$S/home TMPDIR=$S/tmp PATH=/usr/bin:/bin LANG=en_US.UTF-8 nice -n 10 /usr/bin/python3 -m unittest tests.test_core_requeue_budget > $S/RED.log 2>&1; echo "RED exit $? | $(grep -a -E '^(Ran |OK|FAILED)' $S/RED.log | tr '\n' ' ')"; grep -a -E '^(FAIL|ERROR):' $S/RED.log | cut -c1-170; cd /Users/you; git -C $R worktree remove --force $S/wt; rm -rf $S; echo "worktrees left: $(git -C $R worktree list | grep -c v1101is)"; git -C $R show cb19c73c5c:hermes-sync > /Users/you/.hermes/cache/scratch.noindex/v1101ir_old_hs && echo "old blob $(git hash-object /Users/you/.hermes/cache/scratch.noindex/v1101ir_old_hs | cut -c1-12)"'''
+BUILTIN_WRAPPER = "timeout 5 env -i HOME=/Users/you/.hermes/cache/scratch.noindex/x PATH=/usr/bin:/bin nice -n 10 /usr/bin/python3 -m unittest t"
+BUILTIN_ALLOW_CASES = [
+    BUILTIN_REPORTED,
+    BUILTIN_WRAPPER + "; cd /Users/you; git hash-object /abs/f",
+    BUILTIN_WRAPPER + "; cd /Users/you; git cat-file -t HEAD",
+    BUILTIN_WRAPPER + "; git -C /Users/you/code/hermes hash-object /abs/f",
+]
 READ_ONLY_ALLOW_CORPUS = [
+    *BUILTIN_ALLOW_CASES,
     AWK_DIFF,
     AWK_DIFF.replace("awk ", "gawk ", 1),
     AWK_DIFF.replace("awk ", "mawk ", 1),
@@ -1420,6 +1430,35 @@ def test_awk_primitives_really_restore_cross_branch(multi, program):
     subprocess.run([executable, program], cwd=wt, env=GIT_ENV,
                    check=True, capture_output=True, timeout=30)
     assert (wt / "f.txt").read_text() == "stashed\n"
+
+
+@pytest.mark.parametrize("cmd", [
+    BUILTIN_WRAPPER + "; cd /Users/you; git frobnicate",
+    "git -c alias.x='stash pop' x",
+    "git -c alias.whatchanged='stash pop' whatchanged",
+    "git -c alias.pack-redundant='stash pop' pack-redundant",
+])
+def test_builtin_alias_refusal_controls(multi, cmd):
+    _main, wt = multi
+    assert guard.refuse_reason(cmd, str(wt)) is not None
+    assert _blocked(cmd, wt)
+
+
+def test_builtin_hash_object_alias_does_not_pop_real_stash(multi):
+    _main, wt = multi
+    def stashes():
+        return subprocess.check_output(["git", "stash", "list"], cwd=wt, env=GIT_ENV)
+    before = stashes()
+    assert before
+    git("-c", "alias.hash-object=stash pop", "hash-object", "f.txt", cwd=wt)
+    assert stashes() == before
+    assert (wt / "f.txt").read_text() == "base\n"
+
+
+@pytest.mark.parametrize("name", sorted(guard._GIT_BUILTINS - {"stash"}))
+def test_all_known_builtins_ignore_alias_uncertainty(multi, name):
+    main, _wt = multi
+    assert guard.refuse_reason(BUILTIN_WRAPPER + "; git " + name, str(main)) is None
 
 
 def test_for_loop_over_same_branch_checkout_allows_pop(multi):

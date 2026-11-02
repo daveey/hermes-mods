@@ -70,13 +70,33 @@ _GIT_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super
                  "--config-env", "--attr-source", "--shallow-file"}
 _GIT_EQ_OPTS = ("--exec-path=", "--namespace=", "--super-prefix=", "--list-cmds=",
                 "--attr-source=", "--config-env=")
-# Common builtin commands; config-injected aliases (`-c alias.x=...`) cannot shadow these.
+# Non-shadowable builtins: intersection of measured Git 2.50.1, 2.54.0 and 2.55.0
+# `git --list-cmds=builtins` inventories. Do not expand from only the newest Git:
+# a newer builtin can still be an alias on an older supported installation.
+# Exclude pack-redundant and whatchanged: Git 2.55 lists them as deprecated and
+# Documentation/config/alias.adoc allows aliases to hide deprecated commands.
 _GIT_BUILTINS = {
-    "add", "am", "apply", "blame", "branch", "checkout", "cherry-pick", "clean", "clone",
-    "commit", "config", "describe", "diff", "fetch", "format-patch", "grep", "init", "log",
-    "ls-files", "merge", "mv", "pull", "push", "rebase", "remote", "reset", "restore",
-    "rev-parse", "revert", "rm", "show", "stash", "status", "switch", "symbolic-ref", "tag",
-    "worktree",
+    "add", "am", "annotate", "apply", "archive", "backfill", "bisect", "blame", "branch",
+    "bugreport", "bundle", "cat-file", "check-attr", "check-ignore", "check-mailmap",
+    "check-ref-format", "checkout", "checkout--worker", "checkout-index", "cherry",
+    "cherry-pick", "clean", "clone", "column", "commit", "commit-graph", "commit-tree",
+    "config", "count-objects", "credential", "credential-cache", "credential-cache--daemon",
+    "credential-store", "describe", "diagnose", "diff", "diff-files", "diff-index", "diff-pairs",
+    "diff-tree", "difftool", "fast-export", "fast-import", "fetch", "fetch-pack", "fmt-merge-msg",
+    "for-each-ref", "for-each-repo", "format-patch", "fsck", "fsck-objects", "fsmonitor--daemon",
+    "gc", "get-tar-commit-id", "grep", "hash-object", "help", "hook", "index-pack", "init",
+    "init-db", "interpret-trailers", "log", "ls-files", "ls-remote", "ls-tree", "mailinfo",
+    "mailsplit", "maintenance", "merge", "merge-base", "merge-file", "merge-index", "merge-ours",
+    "merge-recursive", "merge-recursive-ours", "merge-recursive-theirs", "merge-subtree",
+    "merge-tree", "mktag", "mktree", "multi-pack-index", "mv", "name-rev", "notes", "pack-objects",
+    "pack-refs", "patch-id", "pickaxe", "prune", "prune-packed", "pull", "push", "range-diff",
+    "read-tree", "rebase", "receive-pack", "reflog", "refs", "remote", "remote-ext", "remote-fd",
+    "repack", "replace", "replay", "rerere", "reset", "restore", "rev-list", "rev-parse", "revert",
+    "rm", "send-pack", "shortlog", "show", "show-branch", "show-index", "show-ref",
+    "sparse-checkout", "stage", "stash", "status", "stripspace", "submodule--helper", "switch",
+    "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index", "update-ref",
+    "update-server-info", "upload-archive", "upload-archive--writer", "upload-pack", "var",
+    "verify-commit", "verify-pack", "verify-tag", "version", "worktree", "write-tree",
 }
 # Environment that selects another repository/stash ref, or injects config (aliases).
 _GIT_ALT_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"}

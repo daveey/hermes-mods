@@ -230,8 +230,17 @@ that every unsupported form is refused.
 From the repository root: `scripts/test-all -k stash-worktree-guard`.
 
 `test_read_only_allow_corpus` collects real read-only false positives (awk diff filters,
-SQLite loops, literal for-loop variables, bracket tests and sed reads). Add every future
-false-positive input to this corpus. `test_awk_command_primitive_refusal_controls` retains
+SQLite loops, literal for-loop variables, bracket tests, sed reads and builtin plumbing
+following timeout/env/nice). Add every future false-positive input to this corpus.
+`test_builtin_alias_refusal_controls` retains unknown and deprecated-command alias
+refusals; `test_builtin_hash_object_alias_does_not_pop_real_stash` checks real Git leaves
+the stash unchanged when an injected alias tries to shadow hash-object.
+`test_all_known_builtins_ignore_alias_uncertainty` exercises each listed non-stash name.
+The inventory is the intersection of measured Git 2.50.1, 2.54.0 and 2.55.0 builtin lists,
+minus `pack-redundant` and `whatchanged` (deprecated commands may be shadowed).
+This establishes command-name precedence only, not safety of a builtin's nested commands;
+Git runner arguments such as `for-each-repo ... x` are not modeled here.
+`test_awk_command_primitive_refusal_controls` retains
 system/pipe/indirect-call controls and Perl parity; `test_awk_primitives_really_restore_cross_branch`
 executes four refused forms only in disposable repositories to prove they really restore.
 `test_awk_surrounding_shell_and_program_input_still_refuse` covers shell substitutions,
