@@ -138,7 +138,8 @@ def provider_5xx(exc_type: str, exc_line: str, body: str) -> bool:
 PLUGIN_PATH_RE = re.compile(r"/plugins/([\w.\-]+)/")
 # CPython refusing new work while the process exits (Desktop quit, update, restart mid-turn): the turn's thread
 # outlived the main thread. Exit noise, not a defect (agent-9a2a3cc05d); core logs it as one line since c5153adda1.
-EXIT_NOISE_RE = re.compile(r"cannot schedule new futures after|can't register atexit after shutdown", re.I)
+EXIT_NOISE_RE = re.compile(r"cannot schedule new futures after|can't register atexit after shutdown|"
+                           r"sys\.meta_path is None|Python is likely shutting down", re.I)
 # A network library that logs its own auto-reconnect at ERROR with the traceback, then reconnects by itself
 # (discord.py client.py:769-781: "sometimes, discord sends us 1000 for unknown reasons so we should reconnect").
 # Not a defect unless a Hermes logger or frame is involved; a storm of them on one host/profile still files one.
@@ -617,10 +618,48 @@ def _utc(t: float) -> str:
     return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _worker_noise_lines(blk: List[str]) -> set:
+    """Indexes of report lines in a worker block that are not the worker's own death: Python's `--- Logging error
+    ---` report (marker through its `Arguments:` line) and `Exception ignored ...:` reports (through the exception
+    line ending their traceback). Workers print both while the interpreter finalizes after a clean exit
+    (kanban-96867340ba: three clean exits filed as an `Arguments: ()` crash storm)."""
+    noise, i = set(), 0
+    while i < len(blk):
+        ln = blk[i]
+        if ln.startswith("--- Logging error ---"):
+            j = i + 1
+            while j < len(blk) and not blk[j].startswith(("Arguments:", "--- Logging error ---")):
+                j += 1
+            end = j if j < len(blk) and blk[j].startswith("Arguments:") else j - 1
+            noise.update(range(i, end + 1))
+            i = end + 1
+            continue
+        if ln.startswith("Exception ignored") and i + 1 < len(blk) and blk[i + 1].startswith("Traceback ("):
+            e = _traceback_exc_index(blk, i + 1)
+            end = e if e is not None else i + 1
+            noise.update(range(i, end + 1))
+            i = end + 1
+            continue
+        i += 1
+    return noise
+
+
+def _traceback_exc_index(blk: List[str], tb: int) -> Optional[int]:
+    """Index of the exception line that ends the traceback starting at `tb`: the first unindented line after the
+    `File ...` frames (source lines and carets are indented), when it reads `Name: text`."""
+    for j in range(tb + 1, len(blk)):
+        if blk[j][:1] in (" ", "\t") or not blk[j]:
+            continue
+        return j if WORKER_EXC_RE.match(blk[j]) else None
+    return None
+
+
 def parse_worker_crashes(lines: List[str]) -> List[dict]:
-    """managed-worker.log lines -> one {pid, exc, msg, block} per pid block that holds a traceback, from its last
-    `Type: msg` line after the last `Traceback` line. Provider transients and exit noise are not crashes. A block
-    under a `[pid N] @ <UTC> core=<sha>` header also carries `t` (epoch of that header) and `core`."""
+    """managed-worker.log lines -> one {pid, exc, msg, block} per pid block that holds a traceback: the last
+    traceback that is not a logging-error or `Exception ignored` report, and its exception from the line ending
+    that traceback (never a later `Message:`/`Arguments:` line). Provider transients and exit noise are not
+    crashes. A block under a `[pid N] @ <UTC> core=<sha>` header also carries `t` (epoch of that header) and
+    `core`."""
     by_pid: Dict[str, List[str]] = {}
     stamps: Dict[str, tuple] = {}
     for ln in lines:
@@ -634,19 +673,20 @@ def parse_worker_crashes(lines: List[str]) -> List[dict]:
             by_pid.setdefault(m.group(1), []).append(m.group(2))
     out = []
     for pid, blk in by_pid.items():
-        tbs = [i for i, l in enumerate(blk) if l.startswith("Traceback (most recent call last)")]
+        noise = _worker_noise_lines(blk)
+        tbs = [i for i, l in enumerate(blk) if l.startswith("Traceback (most recent call last)") and i not in noise]
         if not tbs:
             continue
-        tail = blk[tbs[-1]:]
-        em_i, em = next(((i, m) for i in range(len(tail) - 1, -1, -1) for m in [WORKER_EXC_RE.match(tail[i])] if m),
-                        (-1, None))
-        if em is None:
+        ei = _traceback_exc_index(blk, tbs[-1])
+        if ei is None:
             continue
+        em = WORKER_EXC_RE.match(blk[ei])
         exc, msg = em.group(1), em.group(2)
         if (TRANSIENT_RE.search(f"{exc}: {msg}") or EXIT_NOISE_RE.search(msg)
-                or provider_5xx(exc, tail[em_i], _exc_body(tail, tail[em_i]))):
+                or provider_5xx(exc, blk[ei], _exc_body(blk[tbs[-1]:ei + 1 + EXC_BODY_LINES], blk[ei]))):
             continue
-        crash = {"pid": pid, "exc": exc, "msg": msg, "block": tail}
+        body = [l for k, l in enumerate(blk[ei + 1:ei + 1 + EXC_BODY_LINES], ei + 1) if k not in noise]
+        crash = {"pid": pid, "exc": exc, "msg": msg, "block": blk[tbs[-1]:ei + 1] + body}
         if pid in stamps:
             crash["t"], crash["core"] = stamps[pid]
         out.append(crash)

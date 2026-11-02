@@ -1750,6 +1750,82 @@ def test_provider_error_without_5xx_in_body_still_files():
     assert len(sg.parse_errors(lines)) == 1
 
 
+_PY = "/home/you/.hermes/tools/python-3.14/lib/python3.14"
+_HA = "/home/you/.hermes/hermes-agent"
+
+
+def _shutdown_logging_error(task, coro):
+    """One `--- Logging error ---` report a worker prints while Python finalizes (managed-worker.log, 11-02)."""
+    return ["--- Logging error ---", "Traceback (most recent call last):",
+            f'  File "{_PY}/logging/handlers.py", line 1525, in emit',
+            f'  File "{_HA}/hermes_logging.py", line 853, in prepare',
+            f'  File "{_PY}/copy.py", line 90, in copy',
+            "ImportError: sys.meta_path is None, Python is likely shutting down", "Call stack:",
+            f'  File "{_PY}/asyncio/base_events.py", line 1945, in call_exception_handler',
+            f'  File "{_HA}/tools/mcp_tool_loop.py", line 100, in _mcp_loop_exception_handler',
+            f'  File "{_PY}/asyncio/base_events.py", line 1893, in default_exception_handler',
+            f"Message: \"Task was destroyed but it is pending!\\ntask: <Task pending name='{task}' coro=<{coro}> "
+            "wait_for=<Future pending cb=[Task.task_wakeup()]>>\"",
+            "Arguments: ()"]
+
+
+def _shutdown_ignored_close():
+    return ["Exception ignored while closing generator <coroutine object MCPServerRunMixin.run at 0x75301135dcc0>:",
+            "Traceback (most recent call last):",
+            f'  File "{_HA}/tools/mcp_tool_server_run.py", line 371, in run',
+            f'  File "{_HA}/tools/mcp_tool_common.py", line 23, in __getattr__',
+            "ImportError: sys.meta_path is None, Python is likely shutting down"]
+
+
+def _clean_exit_block(pid, stamp):
+    """A worker that finished its card and exited normally, then printed shutdown noise (pids 1659809, 1676844,
+    1713161 on hermes-hub, 11-02, redacted): no `managed worker failed`, no crash."""
+    lines = (["[subagent-0] Compression threshold auto-lowered to 256,000 tokens."]
+             + _shutdown_logging_error("Task-4", "MCPServerRunMixin.run() running at mcp_tool_server_run.py:358")
+             + _shutdown_logging_error("Task-5", "MCPServerRunMixin.run() running at mcp_tool_server_run.py:358")
+             + _shutdown_ignored_close() + _shutdown_ignored_close()
+             + _shutdown_logging_error("Task-97", "Event.wait() running at asyncio/locks.py:213")
+             + _shutdown_logging_error("Task-98", "Event.wait() running at asyncio/locks.py:213"))
+    return f"[pid {pid}] @ {stamp} core=198a1a79d2\n" + "".join(f"[pid {pid}] {l}\n" for l in lines)
+
+
+def test_clean_worker_exit_with_shutdown_logging_errors_is_not_a_crash(tmp_path):
+    """kanban-96867340ba: three workers that exited cleanly but printed `--- Logging error ---` reports at
+    interpreter shutdown were filed as a storm of `Arguments: ()` crashes."""
+    blocks = [_clean_exit_block(1659809, "2026-11-02T12:05:50Z"), _clean_exit_block(1676844, "2026-11-02T12:06:24Z"),
+              _clean_exit_block(1713161, "2026-11-02T12:29:34Z")]
+    lines = "".join(blocks).splitlines()
+    assert sg.parse_worker_crashes(lines) == []
+    h, cur = _primed_worker_home(tmp_path)
+    _append_worker(h, *blocks)
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
+
+
+def test_real_worker_crash_followed_by_shutdown_noise_keeps_its_exception(tmp_path):
+    """A worker that really died and then printed shutdown logging errors still parses to its own exception,
+    and three of them still file the storm."""
+    def crashed(pid):
+        noise = _shutdown_logging_error("Task-4", "MCPServerRunMixin.run() running at x.py:358")
+        return _worker_block(pid) + "".join(f"[pid {pid}] {l}\n" for l in noise + _shutdown_ignored_close())
+    blocks = [crashed(p) for p in (201, 202, 203)]
+    got = sg.parse_worker_crashes("".join(blocks).splitlines())
+    assert [(c["pid"], c["exc"], c["msg"]) for c in got] == [
+        (p, "agent.model_routing.ModelRoutingError", MR_MSG) for p in ("201", "202", "203")]
+    h, cur = _primed_worker_home(tmp_path)
+    _append_worker(h, *blocks)
+    st = _storms(sg.collect(h, cur, "hubhost", NOW))
+    assert len(st) == 1 and "ModelRoutingError: Class selectors" in st[0]["symptom"], st
+
+
+def test_worker_exception_line_is_the_one_ending_the_traceback():
+    """The exception is the first `Name: text` line after the frames, not a later log line that looks like one."""
+    lines = ["managed worker failed", "Traceback (most recent call last):",
+             f'  File "{_HA}/agent/managed_worker.py", line 464, in main', "    execute(frame, channel)",
+             "KeyError: 'route'", "Message: 'later log noise'", "Arguments: ()"]
+    got = sg.parse_worker_crashes([f"[pid 51] {l}" for l in lines])
+    assert [(c["exc"], c["msg"]) for c in got] == [("KeyError", "'route'")]
+
+
 def test_worker_crash_with_html_5xx_body_is_transient():
     lines = ["managed worker failed", "Traceback (most recent call last):",
              '  File "/home/you/.hermes/hermes-agent/agent/managed_worker.py", line 464, in main',
