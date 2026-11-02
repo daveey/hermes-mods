@@ -183,6 +183,9 @@ ATTENTION_RE = re.compile(r"^(\S+) has been failing/reconnecting continuously fo
 # turn-side retry with no update hold, so one turn/notification/review was refused. One WARNING, no traceback.
 ADMISSION_BUSY_RE = re.compile(r"^((?:Review u|U)pdate admission) unavailable: update admission lock busy for "
                                r"([\d.]+)s \(no update hold\)")
+# Core's cron quota hold could not map a quota-class failure to a wait (cron.quota_hold.classify_failure_hold,
+# cron-0f5ca72d35): the job will re-fire into a closed provider window. One WARNING per failed run, no traceback.
+QUOTA_NOT_HELD_RE = re.compile(r"^Job '(.+?)': quota failure not held \(no usable reset deadline in ([\w.]+): ")
 RECONNECT_STORM = 20               # more than this many library reconnects in RECONNECT_WINDOW_S files one defect
 RECONNECT_WINDOW_S = 3600
 
@@ -411,6 +414,15 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                                    f"on {host or 'this host'} ({prof})",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
                         "fp": fp("agent", "admission-busy", host, prof, what)})
+            continue
+        qm = QUOTA_NOT_HELD_RE.match(r["msg"]) if r["logger"] == "cron.scheduler" else None
+        if qm:
+            job, exc_name = qm.groups()
+            out.append({"kind": "errors", "component": "cron", "at": r["at"], "session_id": r["sid"],
+                        "symptom": f"cron quota failure not held on {host or 'this host'} ({prof}): {exc_name} "
+                                   f"maps to no hold, so job '{job}' re-fires into a closed provider window",
+                        "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
+                        "fp": fp("cron", "quota-not-held", host, prof, exc_name)})
             continue
         dns = PROVIDER_DNS_RE.fullmatch(r["msg"])
         if dns and r["level"] == "ERROR" and OWN_LOGGER_RE.match(r["logger"]):

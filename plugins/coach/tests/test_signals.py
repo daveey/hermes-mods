@@ -491,6 +491,29 @@ def test_admission_busy_final_refusal_files_one_defect_without_traceback(tmp_pat
     assert len(old) == 1 and old[0]["symptom"].startswith("TimeoutError in admission_lock")
 
 
+QUOTA_NOT_HELD = ("{at},000 WARNING cron.scheduler: Job '{job}': quota failure not held (no usable reset deadline in "
+                  "RuntimeError: Subscription quota unavailable for openai-codex/gpt-6-astra; resets at None); it will "
+                  "re-fire on cadence")
+
+
+def test_cron_quota_failure_not_held_files_one_defect_per_exception_type(tmp_path):
+    """cron-0f5ca72d35: core logs one traceback-less WARNING when a cron run fails on a quota refusal its hold cannot
+    map (cron.quota_hold.classify_failure_hold). That line is the detector, one defect per host/profile/exception
+    type, not one per job or per hourly traceback."""
+    h = tmp_path / "home"
+    (h / "logs").mkdir(parents=True)
+    at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NOW - 300))
+    (h / "logs" / "errors.log").write_text("\n".join(
+        [QUOTA_NOT_HELD.format(at=at, job="x-reply-discovery")] * 2
+        + [QUOTA_NOT_HELD.format(at=at, job="bsky-reply-discovery")]) + "\n")
+    sigs = [s for s in kinds(sg.collect(h, {}, "hub", NOW), "errors") if "quota failure not held" in s["symptom"]]
+    assert len(sigs) == 1 and sigs[0]["count"] == 3, sigs
+    assert sigs[0]["component"] == "cron" and "hub" in sigs[0]["symptom"] and "RuntimeError" in sigs[0]["symptom"]
+    quoted = f"{at},000 WARNING tools.terminal: output: Job 'x': quota failure not held (no usable reset deadline in " \
+             "RuntimeError: x); it will re-fire on cadence"
+    assert sg.parse_errors([quoted]) == []
+
+
 def _reconnect_log(home, n, start):
     lines = []
     for i in range(n):
