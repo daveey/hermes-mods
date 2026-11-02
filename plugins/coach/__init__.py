@@ -638,6 +638,36 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             log.debug("coach reply_skipped: %s", exc)
 
+    def _report_only_confirm(rc, session_id, ask, reply, prev, ref=None, via=None):
+        """The report_only second opinion for `reply`, shared by pre_verify's nudge check and _nudge_outcome's
+        re-check of the revision (agent-e5b6dcf428: the outcome used to skip it and file on the screen alone).
+        Returns confirm() -> (p, evidence) | None: the strong model (aux task coach_report_only) with the turn's real
+        tool arguments; None = not made (off, daily cap reached, error). Both callers share one daily cap
+        (COACH_REPORT_ONLY_CONFIRM_CAP, counted over report_only_confirm events); `via` marks the outcome's rows."""
+        tag = {"via": via} if via else {}
+
+        def confirm():
+            if os.environ.get("COACH_REPORT_ONLY_CONFIRM", "1").strip().lower() in ("0", "off", "false", "no"):
+                return None
+            try:
+                cap = int(os.environ.get("COACH_REPORT_ONLY_CONFIRM_CAP", rc.CONFIRM_DAILY_CAP))
+            except ValueError:
+                cap = rc.CONFIRM_DAILY_CAP
+            day0 = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            used = sum(1 for r in store.read_log(since=day0) if r.get("event") == "report_only_confirm")
+            if used >= cap:
+                store.log({"event": "report_only_confirm_capped", "session_id": session_id, "used": used, "cap": cap,
+                           **tag})
+                return None
+            raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), reply,
+                                                                        prev_turn=prev))
+            res = rc.parse_confirm(raw)
+            store.log({"event": "report_only_confirm", "session_id": session_id, "ok": res is not None,
+                       "p": res[0] if res else None, "evidence": res[1] if res else "", **tag,
+                       **((ref() if callable(ref) else ref) or {})})
+            return res
+        return confirm
+
     def pre_verify(session_id="", platform="", attempt=0, final_response="", changed_paths=None, turn_origin=None,
                    **_):
         """Check the agent's final answer before the turn ends; a hit keeps the turn going with a nudge.
@@ -730,7 +760,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                         out["logged_rec"] = sink["rec"]
                     return {"action": "continue", "message": msg}
             if session_id and final_response and platform not in ("cron",):
-                _nudge_outcome(session_id, final_response, attempt)
+                _nudge_outcome(session_id, final_response, attempt, platform=platform)
             if attempt or platform in ("cron",):
                 return None
             if not session_id or not final_response:
@@ -783,26 +813,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                         judged["id"] = None
                 return {"draft_id": judged["id"]} if judged.get("id") else {}
 
-            def confirm():
-                """report_only second opinion on the strong model (aux task coach_report_only) with the turn's real
-                tool arguments. None = not made (off, daily cap reached, error): the screen's own p decides."""
-                if os.environ.get("COACH_REPORT_ONLY_CONFIRM", "1").strip().lower() in ("0", "off", "false", "no"):
-                    return None
-                try:
-                    cap = int(os.environ.get("COACH_REPORT_ONLY_CONFIRM_CAP", rc.CONFIRM_DAILY_CAP))
-                except ValueError:
-                    cap = rc.CONFIRM_DAILY_CAP
-                day0 = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-                used = sum(1 for r in store.read_log(since=day0) if r.get("event") == "report_only_confirm")
-                if used >= cap:
-                    store.log({"event": "report_only_confirm_capped", "session_id": session_id, "used": used, "cap": cap})
-                    return None
-                raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), final_response,
-                                                                            prev_turn=prev))
-                res = rc.parse_confirm(raw)
-                store.log({"event": "report_only_confirm", "session_id": session_id, "ok": res is not None,
-                           "p": res[0] if res else None, "evidence": res[1] if res else "", **draft_ref()})
-                return res
+            confirm = _report_only_confirm(rc, session_id, ask, final_response, prev, ref=draft_ref)
 
             hit = rc.check(final_response, ask, log_lines, rc.aux_judge, threshold=cfg["threshold"],
                            only=only, changed_paths=changed_paths,
@@ -864,7 +875,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     "turn": coach.turn_number(session_id), "rule": hit["rule"], "ask": ask, "nudge_id": nid,
                     "at": time.time(), "sig": _sig(final_response),
                     "log": list(log_lines)[-25:], "kanban_down": kanban_down,
-                    "threshold": cfg["threshold"], "thresholds": thresholds, **draft_ref()}
+                    "threshold": cfg["threshold"], "thresholds": thresholds, "platform": platform, **draft_ref()}
             return {"action": "continue", "message": hit["nudge"]}
         except Exception as exc:
             log.debug("coach pre_verify: %s", exc)
@@ -878,10 +889,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     except Exception as exc:
         log.debug("coach pre_verify host timeout: %s", exc)
 
-    def _nudge_outcome(session_id, final_response, attempt=1):
+    def _nudge_outcome(session_id, final_response, attempt=1, platform=""):
         """The continuation's check after this turn's reply_check nudge (any rule; attempt >= 1, or attempt 0 on a
         different reply after a mid-turn compaction): re-run that rule once on the revised reply and the turn's tool
-        log (same judge and thresholds), log a reply_nudge_outcome, never nudge again. Fail-open, but a nudge taken
+        log (same screen judge, thresholds and, for report_only, the same strong-model second opinion and daily cap as
+        the nudge: agent-e5b6dcf428), log a reply_nudge_outcome, never nudge again. Fail-open, but a nudge taken
         off the loop state always gets its outcome record. Self-heal files the outcome (signals.collect_coach), not
         the nudge (agent-e278947864, agent-3ba1979f34)."""
         n = None
@@ -903,15 +915,26 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             rc = _load("reply_check")
             ask, log_lines = coach.turn_context(session_id)
             log_lines = log_lines or n.get("log") or []
-            res = rc.nudge_outcome(rule, final_response, ask or n.get("ask") or "", log_lines, rc.aux_judge,
+            ask = ask or n.get("ask") or ""
+            prev = coach.prev_turn(session_id)
+            plat = platform or n.get("platform") or ""
+            cfg = rc.settings()
+            nid_ref = {"nudge_id": n["nudge_id"]} if n.get("nudge_id") else {}
+            res = rc.nudge_outcome(rule, final_response, ask, log_lines, rc.aux_judge,
                                    threshold=n.get("threshold", 0.7), thresholds=n.get("thresholds") or None,
                                    wake=lambda: rc.wake_sources(session_id, log_lines),
                                    kanban_down=n.get("kanban_down"),
                                    human_asks=lambda: rc.session_human_asks(session_id),
-                                   prev_turn=coach.prev_turn(session_id))
+                                   prev_turn=prev,
+                                   confirm=_report_only_confirm(rc, session_id, ask, final_response, prev,
+                                                                ref=nid_ref, via="outcome"),
+                                   confirm_floor=rc.CONFIRM_FLOOR, human_confirm_floor=rc.human_confirm_floor(plat),
+                                   report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK))
             _log_outcome(session_id, n, "reply_nudge_outcome", p=res["p"], resolved=res["resolved"],
                          judged=res["judged"], evidence=res["evidence"], reply=(final_response or "")[:300],
                          **({"asks": res["asks"]} if "asks" in res else {}),
+                         **({"src": res["src"]} if "src" in res else {}),
+                         **({"unconfirmed": True} if res.get("unconfirmed") else {}),
                          **({} if attempt else {"via": "recheck"}))
             n = None
         except Exception as exc:

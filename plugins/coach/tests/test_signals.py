@@ -1480,7 +1480,8 @@ def _fork_home(tmp_path, revised, rows):
     (role, content) for that session."""
     import sqlite3
     nudge = {**NUDGE, "rule": "report_only", "outcome": True, "evidence": "Final reports documenting limits"}
-    h = _coach_home(tmp_path, [nudge, {**_outcome(False), "rule": "report_only", "reply": revised}])
+    # src=confirm: only a strong-model (or deterministic) report_only outcome files (agent-e5b6dcf428)
+    h = _coach_home(tmp_path, [nudge, {**_outcome(False), "rule": "report_only", "src": "confirm", "reply": revised}])
     db = sqlite3.connect(h / "state.db")
     db.execute("create table messages (id integer primary key, session_id text, role text, content text,"
                " timestamp real, active integer default 1)")
@@ -1512,7 +1513,7 @@ def test_revision_present_in_the_session_still_files_as_agent_defect(tmp_path):
 
 def test_revision_check_without_state_db_files_as_agent_defect(tmp_path):
     nudge = {**NUDGE, "rule": "report_only", "outcome": True}
-    h = _coach_home(tmp_path, [nudge, {**_outcome(False), "rule": "report_only",
+    h = _coach_home(tmp_path, [nudge, {**_outcome(False), "rule": "report_only", "src": "confirm",
                                        "reply": "A revision long enough to compare with stored rows."}])
     got = sg.collect_coach(h, {}, NOW)
     assert len(got) == 1 and got[0]["component"] == "agent"

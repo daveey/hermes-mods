@@ -1030,9 +1030,22 @@ OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only",
                  "credit_ask", "laptop_job")
 
 
+def _unconfirmed_outcome(o: dict) -> bool:
+    """Same as signals.unconfirmed_outcome: a screen-only failing report_only outcome, never filed (agent-e5b6dcf428)."""
+    if (o.get("rule") or "") != "report_only" or o.get("resolved") is True:
+        return False
+    if o.get("unconfirmed"):
+        return True
+    if o.get("src"):
+        return o["src"] not in ("confirm", "closed_owner", "unverified_owner")
+    p = o.get("p")
+    return o.get("resolved") is False and isinstance(p, (int, float)) and p < 1.0
+
+
 def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days: int = 7) -> dict:
     """reply_nudges per rule over `days`, by their reply_nudge_outcome (agent-3ba1979f34): resolved (not filed),
-    still_failing / no_outcome (filed by signals.collect_coach), waiting (inside the grace window), untracked (a
+    still_failing / no_outcome (filed by signals.collect_coach), unconfirmed (a screen-only report_only outcome: not
+    filed), waiting (inside the grace window), untracked (a
     non-handoff nudge from a backend on the old plugin, no `outcome` marker: never filed). For `status`: a rule whose
     nudges never get outcomes, or never resolve, shows here."""
     root = Path(root) if root is not None else coach_root()
@@ -1060,12 +1073,13 @@ def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days:
     for n in nudges:
         rule = n["rule"]
         c = out.setdefault(rule, {"nudges": 0, "resolved": 0, "still_failing": 0, "no_outcome": 0, "waiting": 0,
-                                  "untracked": 0, "filed": 0})
+                                  "untracked": 0, "unconfirmed": 0, "filed": 0})
         c["nudges"] += 1
         o = next((o for o in outcomes if o.get("rule") == rule and _nudge_pairs(n, o)), None)
         if o is not None:
             outcomes.remove(o)
-            k = "resolved" if o.get("resolved") is True else "still_failing"
+            k = ("resolved" if o.get("resolved") is True else
+                 "unconfirmed" if _unconfirmed_outcome(o) else "still_failing")
         elif rule != "handoff" and not n.get("outcome"):
             k = "untracked"
         else:

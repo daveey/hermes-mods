@@ -143,6 +143,7 @@ def _coach_home(tmp_path, sid, source, outcome=True):
     if outcome:
         lines.append(json.dumps({"ts": NOW + 30, "event": "reply_nudge_outcome", "rule": "report_only",
                                  "session_id": sid, "draft_id": "d1", "p": 0.9, "resolved": False, "judged": True,
+                                 "src": "confirm",  # a strong-model verdict: screen-only ones never file
                                  "evidence": "another worker owns that", "reply": "x"}))
     (h / "coach" / "log.jsonl").write_text("\n".join(lines) + "\n")
     return h

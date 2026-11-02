@@ -1657,40 +1657,79 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
     return {"p": v["handoff"], "resolved": v["handoff"] < th, "evidence": v.get("evidence") or "", "judged": True}
 
 
+# report_only verdict sources that may file an outcome defect: the strong model's second opinion, or a deterministic
+# owner hit. A screen-only score (no second opinion asked, or it was due but capped/failed) is not a verdict.
+STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
+
+
 def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
                   threshold: float = 0.8, thresholds: Optional[dict] = None,
                   wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
-                  human_asks: Optional[Callable[[], list]] = None, prev_turn: Optional[dict] = None) -> dict:
+                  human_asks: Optional[Callable[[], list]] = None, prev_turn: Optional[dict] = None,
+                  confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = CONFIRM_FLOOR,
+                  human_confirm_floor: Optional[float] = None,
+                  report_only_fallback: str = REPORT_ONLY_FALLBACK) -> dict:
     """After a nudge of any rule: does the REVISED final reply (with the whole turn's tool log, revision included)
-    still trip the same rule? Re-runs check() limited to that rule, same judge and thresholds (agent-3ba1979f34).
-    Returns {"p", "resolved", "evidence", "judged"}; resolved=None when the judge gave no usable verdict or the check
-    failed (the self-heal collector then files, as it would without an outcome)."""
+    still trip the same rule? Re-runs check() limited to that rule (agent-3ba1979f34), with the screen judge `llm`,
+    the nudge's thresholds and, for report_only, the same second opinion: `confirm`, `confirm_floor`,
+    `human_confirm_floor` and `report_only_fallback` are passed to check() as pre_verify passes them
+    (agent-e5b6dcf428: the outcome used to be judged by the screen alone, a weaker judge than the nudge's).
+    Returns {"p", "resolved", "evidence", "judged"} (+ "src" for report_only: the verdict's source, see
+    STRONG_REPORT_ONLY_SRC); resolved=None when the judge gave no usable verdict or the check failed (the self-heal
+    collector then files, as it would without an outcome), and resolved=None with unconfirmed=True when the report_only
+    second opinion was due but unavailable (daily cap, error) and the screen alone would fail it: never filed."""
     if rule == "handoff":
         return handoff_outcome(reply, user_ask, tool_log, llm, threshold=threshold, thresholds=thresholds)
-    seen: dict = {"called": False, "v": None}
+    seen: dict = {"called": False, "v": None, "scored": None}
 
     def judge(system: str, prompt: str) -> str:
         seen["called"] = True
         raw = llm(system, prompt)
         seen["v"] = parse_verdict(raw)
         return raw
+
+    def audit(event: dict) -> None:
+        if event.get("event") == "report_only_scored":
+            seen["scored"] = event
+
+    def second() -> Optional[tuple]:
+        seen["c2"] = confirm() if confirm is not None else None
+        return seen["c2"]
     try:
         hit = check(reply, user_ask, tool_log, judge, threshold=threshold, only=[rule], thresholds=thresholds,
-                    wake=wake, kanban_down=kanban_down, human_asks=human_asks, prev_turn=prev_turn)
+                    wake=wake, kanban_down=kanban_down, human_asks=human_asks, prev_turn=prev_turn,
+                    confirm=second if confirm is not None else None, confirm_floor=confirm_floor,
+                    human_confirm_floor=human_confirm_floor, report_only_fallback=report_only_fallback, audit=audit)
     except Exception:
         return {"p": None, "resolved": None, "evidence": "outcome check failed", "judged": seen["called"]}
+    sc = seen["scored"] or {}
+    src = {}
+    if rule == "report_only":
+        s = ((hit or {}).get("verdict") or {}).get("report_only_src") or sc.get("source") or "screen"
+        src = {"src": s}
+        if s in ("screen_fallback", "screen_capped_skip"):
+            ths = thresholds or {}
+            th_scr = ths.get("report_only_screen", ths.get("report_only", threshold))
+            screen_p = sc.get("screen_p")
+            if hit or (screen_p is not None and screen_p >= th_scr):
+                return {"p": screen_p if screen_p is not None else (hit or {}).get("p"), "resolved": None,
+                        "unconfirmed": True, "judged": seen["called"], **src,
+                        "evidence": "report_only second opinion due but unavailable; screen alone: "
+                                    + str((seen["v"] or {}).get("evidence") or "")[:200]}
     if hit:
         return {"p": hit["p"], "resolved": False, "evidence": hit.get("evidence") or "", "judged": seen["called"],
-                **({"asks": hit["asks"]} if "asks" in hit else {})}
+                **src, **({"asks": hit["asks"]} if "asks" in hit else {})}
     if rule == "denied_ask":  # the ids it saw, so a later false hit names its card (agent-5c9b041010)
         return {"p": 0.0, "resolved": True, "evidence": "denied_ask no longer fires", "judged": seen["called"],
                 "asks": []}
     if seen["called"] and not seen["v"]:
         return {"p": None, "resolved": None, "evidence": "judge gave no verdict", "judged": True}
     v = seen["v"] or {}
-    return {"p": float(v.get(rule) or 0.0), "resolved": True,
-            "evidence": (v.get("evidence") if seen["called"] else "") or f"{rule} no longer fires",
-            "judged": seen["called"]}
+    p = float(v.get(rule) or 0.0)
+    ev = (v.get("evidence") if seen["called"] else "") or f"{rule} no longer fires"
+    if src.get("src") == "confirm" and seen.get("c2"):  # the second opinion's p and evidence, not the screen's
+        p, ev = float(seen["c2"][0]), (seen["c2"][1] or ev)
+    return {"p": p, "resolved": True, "evidence": ev, "judged": seen["called"], **src}
 
 
 def rule_threshold(rule: str, verdict: dict, thresholds: dict, default: float) -> float:

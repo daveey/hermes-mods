@@ -1056,7 +1056,9 @@ HANDOFF_GRACE_S = 15 * 60  # a nudge waits this long for its reply_nudge_outcome
 NUDGE_OPEN_S = 3 * 3600
 NUDGE_DELIVERY = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")
 NUDGE_OUTCOME = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_subagent", "nudge_outcome_untracked",
-                 "nudge_outcome_missing")
+                 "nudge_outcome_missing", "nudge_outcome_unconfirmed")
+# report_only outcome verdicts that may file (reply_check.STRONG_REPORT_ONLY_SRC; a test pins the match).
+STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 # reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
 OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
                  "credit_ask", "laptop_job")
@@ -1077,6 +1079,23 @@ def _handoff_signal(r: dict, why: str) -> dict:
             "details": (f"coach reply_check {rule} nudge (p={r.get('p')}): {ev}; {why}"
                         + (f"; revised reply: {reply}" if reply else ""))[:1500],
             "fp": fp("agent", rule, r.get("session_id") or "")}
+
+
+def unconfirmed_outcome(o: dict) -> bool:
+    """A report_only reply_nudge_outcome whose failing verdict came from the screen alone (agent-e5b6dcf428): the
+    second opinion was due but unavailable (`unconfirmed`), the record names a screen source, or it is an older
+    plugin's record with no `src` and a judged p below 1.0 (deterministic owner hits log 1.0). The screen alone agreed
+    with the strong model on only 57% of its hits, and all 9 such MacBook outcomes in a week were false defects, so
+    these are logged as nudge_outcome_unconfirmed and never filed."""
+    if (o.get("rule") or "") != "report_only" or o.get("resolved") is True:
+        return False
+    if o.get("unconfirmed"):
+        return True
+    src = o.get("src")
+    if src:
+        return src not in STRONG_REPORT_ONLY_SRC
+    p = o.get("p")
+    return o.get("resolved") is False and isinstance(p, (int, float)) and p < 1.0
 
 
 def _outcome_matches(n: dict, o: dict) -> bool:
@@ -1566,6 +1585,11 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "session_id": n.get("session_id") or "",
                                   "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
                                   **_nid(n)})
+                _mark(opened, n, "o")
+            elif unconfirmed_outcome(r):  # detection guard: a screen-only verdict is not a defect (agent-e5b6dcf428)
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_unconfirmed", "session_id": n.get("session_id") or "",
+                                  "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
+                                  "p": r.get("p"), "src": r.get("src") or "legacy_screen", **_nid(n)})
                 _mark(opened, n, "o")
             elif r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"
