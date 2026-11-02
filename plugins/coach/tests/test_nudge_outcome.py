@@ -389,3 +389,74 @@ def test_nudge_counts_puts_screen_only_report_only_outcomes_under_unconfirmed(tm
     (tmp_path / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     c = sh.nudge_counts(tmp_path, now=now)["report_only"]
     assert c["unconfirmed"] == 1 and c["still_failing"] == 0 and c["filed"] == 0
+
+
+# ── agent-e5b6dcf428 (3rd filing): the outcome's own item, not the nudge's, names and keys the defect ─────────────
+# MacBook coach log 11-02 lines 16218/16231: the nudge quoted the CI line, the revision fixed it, and the strong
+# model failed the revision on a different line. It was filed under the session-wide id agent-e5b6dcf428 quoting
+# the fixed CI line, so the lane read it as "the earlier fix didn't hold".
+
+E5_SID = "20261026_235722_bef6c6"
+E5_NUDGE = {"ts": NOW - 1900, "pid": 51050, "host": "David-MBP", "proc_start": NOW - 9000, "event": "reply_nudge",
+            "session_id": E5_SID, "rule": "report_only", "nudge_id": "n_d95d379faf674591", "p": 0.9,
+            "evidence": "Still running: main CI for the command-list fix. I'm watching it and will post the result.",
+            "platform": "desktop", "draft_id": "d_dd0ce5af121c43a4", "outcome": True}
+E5_OUT = {"ts": NOW - 60, "event": "reply_nudge_outcome", "session_id": E5_SID, "rule": "report_only",
+          "nudge_id": "n_d95d379faf674591", "draft_id": "d_dd0ce5af121c43a4", "p": 0.9, "resolved": False,
+          "judged": True, "src": "confirm",
+          "evidence": "The two 30 s connect timeouts are still unexplained. They now cost at most about 2.5 minutes",
+          "reply": "#654's main CI passed, and both machines now run it. The Discord restart gap lost nothing."}
+
+
+def _e5(tmp_path, out=E5_OUT, nudge=E5_NUDGE, name="h"):
+    h = _home(tmp_path / name, [nudge, out])
+    got = _nudges(sg.collect_coach(h, {}, NOW))
+    rows = [json.loads(l) for l in (h / "coach" / "log.jsonl").read_text().splitlines()]
+    return got, rows
+
+
+def test_replay_of_16231_quotes_the_outcome_item_under_its_own_id(tmp_path):
+    """(a) the symptom names what the revised reply still left, says it differs from the nudged line, and the id is
+    not the session-wide agent-e5b6dcf428."""
+    got, rows = _e5(tmp_path)
+    assert len(got) == 1
+    s = got[0]
+    assert "connect timeouts" in s["symptom"], s["symptom"]
+    assert "different problem" in s["symptom"]
+    assert "Still running: main CI" in s["details"]  # the nudged line stays visible as context
+    assert s["fp"] != "agent-e5b6dcf428" == sg.fp("agent", "report_only", E5_SID)
+    # detection guard: the collector logs that the outcome failed on another item than the one it nudged
+    other = [r for r in rows if r.get("event") == "nudge_outcome_other_item"]
+    assert len(other) == 1 and other[0]["nudge_id"] == "n_d95d379faf674591"
+
+
+def test_same_outcome_item_twice_keeps_one_id_and_a_different_item_gets_a_new_one(tmp_path):
+    """(b) an exact (or re-spaced/re-punctuated) repeat of the outcome's item links to the same defect; another item
+    in the same session does not."""
+    a, _ = _e5(tmp_path, name="a")
+    b, _ = _e5(tmp_path, out={**E5_OUT, "nudge_id": "n_2", "evidence": "  the two 30s connect-timeouts are STILL "
+                                                                     "unexplained. They now cost at most about 2.5 minutes"},
+               nudge={**E5_NUDGE, "nudge_id": "n_2"}, name="b")
+    c, _ = _e5(tmp_path, out={**E5_OUT, "evidence": "What's missing: a daytime source that knows which room you're in."},
+               name="c")
+    assert a[0]["fp"] == b[0]["fp"]
+    assert c[0]["fp"] != a[0]["fp"]
+
+
+def test_outcome_failure_fingerprint_is_a_function_of_the_outcome_evidence(tmp_path):
+    """Detection guard: the failed-outcome id follows the outcome's evidence, never the nudge's text."""
+    a, _ = _e5(tmp_path, name="a")
+    b, _ = _e5(tmp_path, nudge={**E5_NUDGE, "evidence": "A totally different nudged line about the build."}, name="b")
+    assert a[0]["fp"] == b[0]["fp"] == sg.fp("agent", "report_only", E5_SID, sg.item_key(E5_OUT["evidence"]))
+    # the outcome failing on the nudged line itself is a plain repeat: no "different problem" wording, no guard event
+    same, rows = _e5(tmp_path, out={**E5_OUT, "evidence": E5_NUDGE["evidence"]}, name="s")
+    assert "different problem" not in same[0]["symptom"] and "Still running" in same[0]["symptom"]
+    assert not [r for r in rows if r.get("event") == "nudge_outcome_other_item"]
+
+
+def test_report_only_nudge_says_the_recheck_reads_the_whole_reply():
+    """(c) every report_only nudge variant tells the agent that any other dropped problem fails the re-check too."""
+    for kw in ({}, {"kanban_down": True}, {"card_closed": True}):
+        t = rc.nudge_for("report_only", "x", **kw)
+        assert "The re-check reads your whole reply" in t, kw
+        assert "'not pursuing'" in t

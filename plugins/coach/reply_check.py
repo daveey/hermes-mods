@@ -1644,6 +1644,12 @@ def kanban_db_down(tool_log: list[str]) -> bool:
     return any(KANBAN_DB_DOWN.search(line or "") for line in tool_log or [])
 
 
+# agent-e5b6dcf428: the nudge quotes one item, but nudge_outcome re-judges the whole revised reply. Agents fixed the
+# quoted line and kept another dropped problem ("not pursuing them"), so the revision still failed.
+REPORT_ONLY_WHOLE_REPLY = (" The re-check reads your whole reply: any other problem you name and leave ('not "
+                           "pursuing', 'leaving it', 'still unexplained') needs the same: fix it, card it, or propose it.")
+
+
 def nudge_for(rule: str, evidence: str, kanban_down: bool = False, card_closed: bool = False) -> str:
     if rule == "report_only" and kanban_down:
         tmpl = REPORT_ONLY_KANBAN_DOWN
@@ -1651,7 +1657,8 @@ def nudge_for(rule: str, evidence: str, kanban_down: bool = False, card_closed: 
         tmpl = REPORT_ONLY_CARD_CLOSED
     else:
         tmpl = NUDGES[rule]
-    return tmpl.format(evidence=evidence or "see your last message")
+    text = tmpl.format(evidence=evidence or "see your last message")
+    return text + REPORT_ONLY_WHOLE_REPLY if rule == "report_only" else text
 
 
 # agent-a806f203ab: the worker's own card was already closed when the work reopened in the same turn.

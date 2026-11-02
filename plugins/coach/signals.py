@@ -1140,18 +1140,41 @@ BACKEND_KEYS = ("pid", "host", "proc_start")
 NUDGE_WHAT = {"handoff": "agent handed the user a step it could do itself"}
 
 
+def item_key(evidence: str) -> str:
+    """The item a verdict names: a hash of its first 80 lowercase alphanumeric chars, so re-spacing, punctuation and
+    case don't make a new item, but a different line does (agent-e5b6dcf428)."""
+    return h10(re.sub(r"[^a-z0-9]", "", str(evidence or "").lower())[:80])
+
+
 def _handoff_signal(r: dict, why: str) -> dict:
+    """`r` is the nudge record. A failed outcome adds `outcome_evidence` (what the re-check failed the revised reply
+    on): that item names and keys the defect, since one long session can fail on several unrelated items and the
+    revision may have fixed the nudged one (agent-e5b6dcf428: 3 different items filed under one session-wide id, each
+    read as "the fix didn't hold"). No-outcome filings keep the session-wide id."""
     ev = str(r.get("evidence") or "")
     rule = r.get("rule") or "handoff"
     what = NUDGE_WHAT.get(rule) or (f"coach {rule} nudge got no outcome (no revised reply)" if r.get("no_outcome")
                                     else f"agent's revised reply still failed the coach {rule} check")
     reply = str(r.get("reply") or "")
+    oev = str(r.get("outcome_evidence") or "")
+    key = None
+    if "outcome_evidence" in r:
+        item = oev or ev
+        key = item_key(item)
+        other = bool(oev) and key != item_key(ev)
+        symptom = (f"{what} (revised reply left a different problem): {item[:120]}" if other
+                   else f"{what}: {item[:120]}")
+        details = (f"coach reply_check {rule} outcome failed on: {item}; {why}"
+                   + (f" (nudged on: {ev})" if other else f"; nudge (p={r.get('p')}): {ev}"))
+    else:
+        symptom = f"{what}: {ev[:120]}"
+        details = f"coach reply_check {rule} nudge (p={r.get('p')}): {ev}; {why}"
     return {"kind": "coach", "component": "agent", "at": float(r.get("ts") or 0),
             "session_id": r.get("session_id") or "",
-            "symptom": f"{what}: {ev[:120]}",
-            "details": (f"coach reply_check {rule} nudge (p={r.get('p')}): {ev}; {why}"
-                        + (f"; revised reply: {reply}" if reply else ""))[:1500],
-            "fp": fp("agent", rule, r.get("session_id") or "")}
+            "symptom": symptom,
+            "details": (details + (f"; revised reply: {reply}" if reply else ""))[:1500],
+            "fp": (fp("agent", rule, r.get("session_id") or "", key) if key is not None
+                   else fp("agent", rule, r.get("session_id") or ""))}
 
 
 def unconfirmed_outcome(o: dict) -> bool:
@@ -1667,7 +1690,15 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
             elif r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"
                 why = f"the revised reply {still} (outcome p={r.get('p')})"
-                rec = {**n, "reply": r.get("reply") or ""}
+                rec = {**n, "reply": r.get("reply") or "",
+                       # a judged failure names its own item; resolved=None carries a status text, not an item
+                       "outcome_evidence": str(r.get("evidence") or "") if r.get("resolved") is False else ""}
+                if rec["outcome_evidence"] and item_key(rec["outcome_evidence"]) != item_key(n.get("evidence") or ""):
+                    # detection guard (agent-e5b6dcf428): the revision fixed the nudged line and failed on another
+                    _coach_log(home, {"ts": now, "event": "nudge_outcome_other_item",
+                                      "session_id": n.get("session_id") or "", "rule": rule, "nudge_ts": n.get("ts"),
+                                      "draft_id": n.get("draft_id"), "nudged": str(n.get("evidence") or "")[:200],
+                                      "outcome": rec["outcome_evidence"][:200], **_nid(n)})
                 if unsent_reply(home, str(n.get("session_id") or ""), rec["reply"]):
                     out.append(_unsent_draft_signal(rec, why))  # a fork's text: route to the coach, not the agent
                 else:

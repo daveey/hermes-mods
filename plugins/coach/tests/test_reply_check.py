@@ -263,7 +263,7 @@ def test_report_only_nudge_when_kanban_db_is_down_asks_for_owner_or_restart():
 
 def test_report_only_nudge_unchanged_without_kanban_failure():
     assert not rc.kanban_db_down(["-> kanban_show(t_x)", "-> terminal(ls)", "   <- ERROR {\"error\": \"not found\"}"])
-    assert rc.nudge_for("report_only", "e") == rc.NUDGES["report_only"].format(evidence="e")
+    assert rc.nudge_for("report_only", "e") == rc.NUDGES["report_only"].format(evidence="e") + rc.REPORT_ONLY_WHOLE_REPLY
     assert "kanban_create with acceptance criteria" in rc.nudge_for("report_only", "e", kanban_down=False)
     assert rc.nudge_for("handoff", "e", kanban_down=True) == rc.NUDGES["handoff"].format(evidence="e")
 
@@ -938,10 +938,12 @@ def test_judged_report_only_after_own_card_closed_uses_the_closed_card_template(
     llm, _ = _judge({"report_only": 0.95, "evidence": "not watching the new run"})
     hit = rc.check(reply, "work kanban task", CLOSED_LOG, llm, threshold=0.7, card_status=lambda cid: None)
     assert hit["rule"] == "report_only" and hit.get("variant") == "card_closed"
-    assert hit["nudge"] == rc.REPORT_ONLY_CARD_CLOSED.format(evidence="not watching the new run")
+    assert hit["nudge"] == rc.REPORT_ONLY_CARD_CLOSED.format(evidence="not watching the new run") + rc.REPORT_ONLY_WHOLE_REPLY
     plain = rc.check(reply, "work kanban task", CLOSED_LOG[1:], llm, threshold=0.7, card_status=lambda cid: None)
-    assert "variant" not in plain and plain["nudge"] == rc.NUDGES["report_only"].format(evidence="not watching the new run")
-    assert rc.nudge_for("report_only", "e", kanban_down=True, card_closed=True) == rc.REPORT_ONLY_KANBAN_DOWN.format(evidence="e")
+    assert "variant" not in plain and plain["nudge"] == (rc.NUDGES["report_only"].format(evidence="not watching the new run")
+                                                + rc.REPORT_ONLY_WHOLE_REPLY)
+    assert rc.nudge_for("report_only", "e", kanban_down=True, card_closed=True) == (rc.REPORT_ONLY_KANBAN_DOWN.format(evidence="e")
+            + rc.REPORT_ONLY_WHOLE_REPLY)
 
 
 # ── status_only on Hermes-written prompts (self-heal agent-21185525f4, agent-73e6b1a688, agent-f573a1f951) ──────
