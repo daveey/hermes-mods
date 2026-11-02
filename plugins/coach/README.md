@@ -101,7 +101,16 @@ for a would-be hold only, the check also reads the session's persisted display t
 (`goal_scope.display_transcript`: core's display projection over the verified compression lineage, compaction
 generations folded, rewound rows left out; another profile's session or one over 20,000 rows reads as empty),
 because compaction moves an answered ask out of the live window but the approval does not expire with the
-context. Each read logs `authority_persisted_read` (`ok`, `usd`); a failed read credits nothing. Declarations ("I will rent with a $3,000 cap"), the assistant's own or retold
+context. Each read logs `authority_persisted_read` (`ok`, `usd`); a failed read credits nothing.
+A Kanban worker's approval lives in its card's origin chat, not in its own session, so for a would-be hold
+`origin_authority.py` also reads the chat each origin sub names (`kanban_notify_subs` `platform='hub'`,
+`{"reason": "origin"}`, chat `<gateway>/<profile>/<session>`): this gateway through `display_transcript`,
+another gateway through the session-mentions Desktop relay (`authority_read`: the whole display transcript
+paged oldest-first with compaction history, slimmed to each user row plus the last assistant text before it).
+The same `answered_asks` rules apply, so only a typed yes in that chat counts; the card body, its comments and
+agent relays into the chat never do. No live courier for the gateway, a Desktop without `authority_read`, an
+unclaimed request (15 s) or a timeout (40 s) credits nothing; each read logs `authority_origin_read` (`origin`,
+`ok`, `usd` or `error`) and is cached per origin (10 min, failures 2 min). Declarations ("I will rent with a $3,000 cap"), the assistant's own or retold
 "approved", an unpriced question in the same message, conditions ("approved, but ...") and runtime rows
 inherit nothing; "Approve $50 or $100?" + yes credits $50. Only typed user text counts anywhere: notice
 and relay rows (`[chat-closeout] ...`, `⏸ [hub:default] ...`) never grant dollars, even when they quote
@@ -116,6 +125,10 @@ answered-ask flow with its negatives; `tests/test_compute_authority_persisted.py
 false hold (David's "approved" to the $36 ask, compacted out of the window, then "Spend so far is $0.56 of the
 $36") through a real SessionDB on all three surfaces, and covers a rewound yes, an unpriced ask, a summary in
 the live or persisted transcript, the read only on a would-be hold, a failed read, and the empty cases;
+`tests/test_compute_authority_origin.py` replays the hub worker of card t_01a193e011b0a776 (origin chat on
+gateway `macbook`, served by a fake Desktop courier from a real SessionDB): $36 passes on all three surfaces and
+$100 is held, a card body alone, an agent relay, an agent's retold approval and an unpriced yes credit nothing,
+and no courier, a stale Desktop and an unclaimed request all hold;
 `tests/test_compute_envelope.py` preserves the original under-use behavior.
 
 **Block-time handoff (`pre_tool_call` on `kanban_block` / `kanban_create` / `tool_call`).** A Kanban ask to the user

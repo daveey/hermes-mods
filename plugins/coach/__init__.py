@@ -213,16 +213,27 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     def _persisted_asks(session_id) -> list:
         """Figures the user approved with a bare yes to a priced ask that compaction moved out of the live window
         (compute_envelope.persisted_asks over the persisted transcript). Read only for a would-be compute-authority
-        hold; logged, so a cleared hold is visible in the coach log. A failed read credits nothing."""
+        hold; logged, so a cleared hold is visible in the coach log. A failed read credits nothing.
+
+        A Kanban worker's approval lives in its card's origin chat (often on another gateway), never in the worker's
+        own transcript or the card body: origin_authority reads that chat under the same rules (a typed yes to a
+        priced ask, or nothing)."""
         if not session_id:
             return []
+        got: list = []
         try:
             got = list(_load("compute_envelope").persisted_asks(session_id, _load("goal_scope")))
+            store.log({"event": "authority_persisted_read", "session_id": session_id, "ok": True, "usd": got[:20]})
         except Exception as exc:
             store.log({"event": "authority_persisted_read", "session_id": session_id, "ok": False,
                        "error": f"{type(exc).__name__}: {exc}"[:200]})
-            return []
-        store.log({"event": "authority_persisted_read", "session_id": session_id, "ok": True, "usd": got[:20]})
+        try:
+            got += list(_load("origin_authority").origin_asks(
+                _load("goal_scope"), _load("compute_envelope"),
+                log=lambda rec: store.log({**rec, "session_id": session_id})))
+        except Exception as exc:
+            store.log({"event": "authority_origin_read", "session_id": session_id, "ok": False,
+                       "error": f"{type(exc).__name__}: {exc}"[:200]})
         return got
 
     # ── nudge records: every reply_nudge gets a nudge_id, and exactly one delivery record (reply_nudge_delivered |
