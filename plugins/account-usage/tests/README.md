@@ -47,10 +47,13 @@ explicit path, PYTHONPATH, home fallback, and readable missing-core failure.
 - `check_compat.py` now also checks fast-rate-limit-fallback's `compatibility.json`
   function pins (stdlib AST digest, tested equal to that plugin's live fingerprint):
   the watcher had reported only the account-usage pins while the combined tests
-  failed on the fast-fallback pin.
+  failed on the fast-fallback pin. `ast.dump` differs across Python minors, so under
+  another Python (macOS `/usr/bin/python3` is 3.9) the digest is computed by a 3.14
+  interpreter (core `.venv` or `~/.hermes/tools/python-3.14.*`), else reported as
+  "not checked", never as false drift.
 - Hub run note: with `HOME` a temp dir, the `anthropic` PM extra is not found; append
   the installed extra's `site-packages` to `PYTHONPATH`. Result on core `1c96fe663f1`
-  and an `origin/main` export: **278 passed, 70 subtests**; fast-rate-limit-fallback
+  and an `origin/main` export: **279 passed, 70 subtests**; fast-rate-limit-fallback
   `run_tests.py`: **104 passed**.
 
 ### Core `a22965539888`

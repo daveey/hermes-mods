@@ -59,14 +59,50 @@ def _function_digest(core, key):
     return hashlib.sha256(ast.dump(nodes[-1], include_attributes=False).encode()).hexdigest()
 
 
+# ast.dump's node fields differ across Python minors, so the pins only reproduce under the
+# Python the Hermes runtime fingerprints with (macOS /usr/bin/python3 is 3.9).
+AST_PYTHON = (3, 14)
+
+
+def _ast_pythons(core):
+    import glob
+    yield Path(core) / '.venv' / 'bin' / 'python'
+    tools = Path.home() / '.hermes' / 'tools' / ('python-%d.%d.*' % AST_PYTHON) / 'bin' / 'python3'
+    for path in sorted(glob.glob(str(tools)), reverse=True):
+        yield Path(path)
+
+
+def _function_digests(core, keys):
+    """({key: digest}, None), or (None, why) when no AST_PYTHON interpreter is available."""
+    if sys.version_info[:2] == AST_PYTHON:
+        return {key: _function_digest(core, key) for key in keys}, None
+    for python in _ast_pythons(core):
+        if not python.is_file():
+            continue
+        try:
+            run = subprocess.run([str(python), '-I', str(Path(__file__).resolve()), '--ast-digests',
+                                  json.dumps([str(core), list(keys)])], capture_output=True, text=True, timeout=60)
+            if run.returncode == 0:
+                return json.loads(run.stdout), None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+    return None, 'no Python %d.%d found to compute its AST pins' % AST_PYTHON
+
+
 def check(core, plugin=PLUGIN):
     core = Path(core).expanduser().resolve()
     pins = json.loads((plugin / 'execution-compatibility.json').read_text())
     drift = [{'pin': 'execution-compatibility.json', **item} for item in _pins.pin_drift(core, pins)]
+    skipped = []
     fallback = plugin.parent / 'fast-rate-limit-fallback' / 'compatibility.json'
     if fallback.is_file():
-        for key, value in json.loads(fallback.read_text()).items():
-            actual = _function_digest(core, key)
+        function_pins = json.loads(fallback.read_text())
+        digests, why = _function_digests(core, list(function_pins))
+        if digests is None:
+            skipped.append({'pin': 'fast-rate-limit-fallback/compatibility.json', 'why': why})
+            digests, function_pins = {}, {}
+        for key, value in function_pins.items():
+            actual = digests.get(key, 'missing')
             if actual not in _accepted(value):
                 drift.append({'pin': 'fast-rate-limit-fallback/compatibility.json',
                               'file': key, 'expected': value, 'actual': actual})
@@ -82,14 +118,21 @@ def check(core, plugin=PLUGIN):
                               text=True, timeout=10).stdout.strip() or None
     except (OSError, subprocess.SubprocessError):
         head = None
-    return {'ok': not drift, 'core': str(core), 'core_head': head, 'drift': drift}
+    return {'ok': not drift, 'core': str(core), 'core_head': head, 'drift': drift, 'skipped': skipped}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--core', default=str(Path.home() / '.hermes' / 'hermes-agent'))
     parser.add_argument('--json', action='store_true')
+    parser.add_argument('--ast-digests', help=argparse.SUPPRESS)  # internal: [core, [keys]] under AST_PYTHON
     args = parser.parse_args(argv)
+    if args.ast_digests is not None:
+        if sys.version_info[:2] != AST_PYTHON:
+            return 3
+        core, keys = json.loads(args.ast_digests)
+        print(json.dumps({key: _function_digest(core, key) for key in keys}))
+        return 0
     if not (Path(args.core).expanduser() / 'agent').is_dir():
         print(f'cannot check: {args.core} is not a Hermes core checkout', file=sys.stderr)
         return 2
@@ -106,6 +149,9 @@ def main(argv=None):
                      ' or '.join(str(e)[:12] for e in expected) if isinstance(expected, list) and expected
                      else f'malformed pin {expected!r}')
             print(f"  {item['pin']}: {item['file']} expected {shown} got {item['actual'][:12]}")
+    if not args.json:
+        for item in report['skipped']:
+            print(f"  not checked: {item['pin']} ({item['why']})")
     return 0 if report['ok'] else 1
 
 

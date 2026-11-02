@@ -52,12 +52,35 @@ class CheckCompat(unittest.TestCase):
         drift = check_compat.check(self.core, self.plugin)['drift']
         self.assertEqual([d['pin'] for d in drift], ['fast-rate-limit-fallback/account-usage-compatibility.json'])
 
-    def test_fast_fallback_function_pins_are_checked(self):
+    def _write_function_pin(self):
         import ast
         source = '@staticmethod\ndef seam(x):\n    return x\n'
         (self.core / 'agent' / 'fn.py').write_text('def seam(): pass\n' + source)
         digest = hashlib.sha256(ast.dump(ast.parse(source).body[0], include_attributes=False).encode()).hexdigest()
         pins = self.composition.with_name('compatibility.json')
+        pins.write_text(json.dumps({'agent.fn:seam': [digest]}))
+        return digest, pins
+
+    def test_function_pins_from_another_python_delegate_to_the_runtime_minor(self):
+        """macOS /usr/bin/python3 (3.9) dumps a different AST: compute under AST_PYTHON instead."""
+        from unittest import mock
+        self.assertEqual(sys.version_info[:2], check_compat.AST_PYTHON, 'run under the Hermes runtime Python')
+        digest, pins = self._write_function_pin()
+        old = mock.patch.object(check_compat.sys, 'version_info', (3, 9, 6))
+        with old, mock.patch.object(check_compat, '_ast_pythons', lambda core: iter([Path(sys.executable)])):
+            report = check_compat.check(self.core, self.plugin)
+        self.assertTrue(report['ok'], report)
+        self.assertEqual(report['skipped'], [])
+        (self.core / 'agent' / 'fn.py').write_text('def seam(x):\n    return x + 1\n')
+        with old, mock.patch.object(check_compat, '_ast_pythons', lambda core: iter([Path(sys.executable)])):
+            self.assertEqual([d['file'] for d in check_compat.check(self.core, self.plugin)['drift']], ['agent.fn:seam'])
+        with old, mock.patch.object(check_compat, '_ast_pythons', lambda core: iter([Path('/nonexistent/python')])):
+            report = check_compat.check(self.core, self.plugin)
+        self.assertEqual(report['drift'], [])  # a false drift from the wrong Python is worse than a visible skip
+        self.assertEqual([s['pin'] for s in report['skipped']], ['fast-rate-limit-fallback/compatibility.json'])
+
+    def test_fast_fallback_function_pin_drift_and_missing(self):
+        digest, pins = self._write_function_pin()
         pins.write_text(json.dumps({'agent.fn:seam': [digest], 'agent.gone:seam': digest}))
         drift = check_compat.check(self.core, self.plugin)['drift']
         self.assertEqual([(d['pin'], d['file'], d['actual']) for d in drift],
