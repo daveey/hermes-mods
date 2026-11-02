@@ -335,6 +335,25 @@ def _provider_of(exc_type: str, msg: str = "") -> str:
     return m.group(1).lower() if m else "unknown"
 
 
+# gateway/session_cron.py `execute` re-raises a failed cron run as `raise RuntimeError(result[3] or 'cron execution
+# failed')`. That run is already filed by the cron lane (collect_cron per job, and cron.scheduler's own traceback), so
+# the re-log only double-files every cron cause under one gateway fingerprint (gateway-88d6cacec0: a Codex quota wall
+# looked like the earlier offline case "came back"). Matched on the innermost frame AND that source line, so any
+# other exception raised inside execute still files.
+SESSION_CRON_REWRAP_SRC = "raise RuntimeError(result[3]"
+
+
+def _session_cron_rewrap(block: List[str], frames: list, exc_type: str) -> bool:
+    if exc_type != "RuntimeError" or not frames:
+        return False
+    path, fn = frames[-1]
+    if fn != "execute" or os.path.basename(path.replace("\\", "/")) != "session_cron.py":
+        return False
+    idx = max(i for i, l in enumerate(block) if FRAME_RE.match(l))
+    src = block[idx + 1].strip() if idx + 1 < len(block) else ""
+    return src.startswith(SESSION_CRON_REWRAP_SRC)
+
+
 def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Optional[list] = None,
                  host: str = "", prof: str = "default") -> List[dict]:
     """Records (header + continuation lines) -> traceback, hook-exception and credential-guard signals. Library
@@ -431,6 +450,8 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         last = exc_line or next((l for l in reversed(block) if l and not l[0].isspace()), "")  # socket.gaierror
         if CONNECT_FAIL_RE.match(r["msg"]) and (NETWORK_EXC_RE.match(last) or NETWORK_RE.match(last)):
             continue  # a retried platform connect with no network; a long outage files via NEEDS_ATTENTION
+        if _session_cron_rewrap(block, frames, exc_type):
+            continue  # the cron run's own failure, re-raised by the gateway: the cron lane files it
         comp, plug = component_of([f[0] for f in frames])
         if r["level"] == "WARNING" and not any(_own_frame(p) for p, _fn in frames):
             continue  # a library logging a handled exception (e.g. mcp's PermissionError); nothing of ours to fix

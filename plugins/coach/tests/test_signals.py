@@ -170,9 +170,83 @@ def test_session_cron_offline_traceback_is_not_a_defect():
     assert sg.parse_errors(SESSION_CRON_TB + [f"RuntimeError: RuntimeError: {CORE_OFFLINE_MSG}"]) == []
 
 
-def test_session_cron_other_runtime_error_still_files():
-    sigs = sg.parse_errors(SESSION_CRON_TB + ["RuntimeError: RuntimeError: cron job script exited 2"])
-    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("RuntimeError in execute (session_cron.py)")
+def test_session_cron_rewrap_of_a_failed_run_is_left_to_the_cron_lane():
+    # session_cron.execute re-raises run_job's failure (`raise RuntimeError(result[3] ...)`). The run itself is filed
+    # by the cron lane (collect_cron per job, plus cron.scheduler's own traceback), so the gateway re-log only
+    # double-files it under one fingerprint shared by every cron cause (gateway-88d6cacec0: a quota wall looked like
+    # the earlier offline case "came back").
+    assert sg.parse_errors(SESSION_CRON_TB + ["RuntimeError: RuntimeError: cron job script exited 2"]) == []
+
+
+def test_session_cron_rewrap_line_matches_core():
+    # Detection guard: the skip keys on core's exact re-raise line; a core rewording must break this test.
+    import os
+    root = Path(os.environ.get("HERMES_TEST_CORE") or Path.home() / ".hermes/hermes-agent")
+    src = root / "gateway/session_cron.py"
+    if not src.exists():
+        if os.environ.get("HERMES_TEST_CORE"):
+            raise AssertionError(f"HERMES_TEST_CORE set but {src} is missing")
+        pytest.skip("Hermes core checkout not found")
+    lines = [l.strip() for l in src.read_text().splitlines()]
+    assert sum(l.startswith(sg.SESSION_CRON_REWRAP_SRC) for l in lines) == 1
+
+
+def test_other_session_cron_errors_still_file():
+    # A bug in execute itself (not the re-wrapped run result) is the gateway's to fix and still files.
+    tb = SESSION_CRON_TB[:-1] + ["    job = dict(data['cron_job'], execution_id=execution_id)",
+                                 "KeyError: 'cron_job'"]
+    sigs = sg.parse_errors(tb)
+    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("KeyError in execute (session_cron.py)")
+    tb = SESSION_CRON_TB[:-1] + ["    raise RuntimeError('cron session lost its binding')",
+                                 "RuntimeError: cron session lost its binding"]
+    assert len(sg.parse_errors(tb)) == 1
+
+
+# The real hermes-hub pair (errors.log 2026-11-02 02:07:09 UTC): the cron run's own traceback, then the gateway's
+# re-log of the same failure. One incident -> one cron signal, no gateway signal.
+HUB_QUOTA_PAIR = [
+    "2026-11-02 02:07:09,639 ERROR cron.scheduler: Job 'bsky-reply-discovery' failed: RuntimeError: Subscription "
+    "quota unavailable for openai-codex/gpt-6-astra; resets at 1793774148.0",
+    "Traceback (most recent call last):",
+    '  File "/home/you/.hermes/hermes-agent/cron/scheduler.py", line 1832, in _resolve_job_runtime',
+    "    return resolve_runtime_provider(**runtime_kwargs), model",
+    '  File "/home/you/.hermes/hermes-agent/hermes_cli/runtime_provider.py", line 1074, in resolve_runtime_provider',
+    "    return resolve_managed_runtime(target_model, requested, config=managed,",
+    '  File "/home/you/.hermes/hermes-agent/agent/model_routing_managed.py", line 74, in resolve_managed_runtime',
+    '    runtime = resolve_class_runtime("class:" + level, "auto", config=restricted,',
+    '  File "/home/you/.hermes/hermes-agent/agent/model_routing_runtime.py", line 94, in resolve_class_runtime',
+    "    raise min(unavailable, key=lambda error: error.resets_at) from None",
+    "agent.model_routing_unavailable.SubscriptionQuotaUnavailable: Subscription quota unavailable for "
+    "openai-codex/gpt-6-astra; resets at 1793774148.0",
+    "",
+    "The above exception was the direct cause of the following exception:",
+    "",
+    "Traceback (most recent call last):",
+    '  File "/home/you/.hermes/hermes-agent/cron/scheduler.py", line 2811, in run_job',
+    "    setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)",
+    '  File "/home/you/.hermes/hermes-agent/cron/scheduler.py", line 2677, in _resolve_cron_agent_setup',
+    "    setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)",
+    '  File "/home/you/.hermes/hermes-agent/cron/scheduler.py", line 1839, in _resolve_job_runtime',
+    "    raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc",
+    "RuntimeError: Subscription quota unavailable for openai-codex/gpt-6-astra; resets at 1793774148.0",
+    "2026-11-02 02:07:09,649 ERROR gateway.session_authority: Admitted turn 02016c151a7c41c9beddedb12d957e16 failed",
+    "Traceback (most recent call last):",
+    '  File "/home/you/.hermes/hermes-agent/gateway/session_authority.py", line 1252, in _execute_claimed',
+    "    return await execute_finite_admission(self, ref, row), 'completed'",
+    '  File "/home/you/.hermes/hermes-agent/gateway/session_finite.py", line 81, in execute_finite_admission',
+    "    return await execute_admission(authority, ref, row)",
+    '  File "/home/you/.hermes/hermes-agent/gateway/session_ingress.py", line 242, in execute_admission',
+    "    return await execute(authority, ref, row, policy)",
+    '  File "/home/you/.hermes/hermes-agent/gateway/session_cron.py", line 319, in execute',
+    "    raise RuntimeError(result[3] or 'cron execution failed')",
+    "RuntimeError: RuntimeError: Subscription quota unavailable for openai-codex/gpt-6-astra; resets at 1793774148.0",
+]
+
+
+def test_hub_quota_pair_files_one_cron_signal_and_no_gateway_signal():
+    sigs = sg.parse_errors(HUB_QUOTA_PAIR)
+    assert [s["component"] for s in sigs] == ["cron"]
+    assert sigs[0]["symptom"].startswith("RuntimeError in _resolve_job_runtime (scheduler.py)")
 
 
 @pytest.mark.parametrize("traceback", [False, True])
