@@ -14,7 +14,8 @@ This plugin:
   (including `list`) in a repo with more than one worktree;
 - blocks `git stash pop` and `git stash apply` before execution when the stash's branch
   (`WIP on <branch>:` / `On <branch>:`) differs from the current branch, or its subject
-  does not name a branch;
+  does not name a branch. `git stash branch` (which applies and then drops the stash) gets
+  the same check on resolved argv; the textual fallback covers only pop and apply;
 - blocks a restore that follows a push (`git stash`, `push`, `save`, `store`) into the same
   repository earlier in the same command, whatever refs/stash holds when it is checked: the
   restore takes whichever stash is newest when it runs, which can be another worker's;

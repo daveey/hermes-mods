@@ -35,6 +35,9 @@ STASH_SUBS = {
     "branch", "create", "store", "export", "import",
 }
 REFUSE_OPS = {"pop", "apply"}
+# Judged on resolved argv only: `git stash branch` applies and drops a stash like pop, but the
+# word "branch" is too common for the textual evidence that REFUSE_OPS also drives.
+ARGV_RESTORE_OPS = REFUSE_OPS | {"branch"}
 # Subcommands that add an entry to refs/stash (`git stash create` only prints a commit).
 PUSH_OPS = {"push", "save", "store"}
 WRAPPERS = {"sudo", "env", "command", "exec", "time", "nice", "nohup", "stdbuf", "builtin"}
@@ -1912,7 +1915,7 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
         if op in PUSH_OPS:
             pushed.append(repo)
             continue
-        if op not in REFUSE_OPS:
+        if op not in ARGV_RESTORE_OPS:
             continue
         key = (repo, op, stash_ref(args), bool(pushed))
         if key in seen:

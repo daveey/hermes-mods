@@ -353,6 +353,34 @@ def test_push_then_restore_really_takes_a_stash_pushed_in_between(multi):
     assert (wt / "f.txt").read_text() == "main edit\n"
 
 
+# --- `git stash branch` restores (and drops) a stash too ---
+
+STASH_BRANCH_CASES = [
+    # (command template, workdir key, expected blocked)
+    ("git stash branch newb", "wt", True),
+    ("git -C {wt} stash branch newb stash@{{0}}", "main", True),
+    ("git stash push -q -m x; git stash branch newb", "main", True),
+    # The stash is main's own: restoring it in main is fine.
+    ("git stash branch newb", "main", False),
+]
+
+
+@pytest.mark.parametrize("template,where,expected", STASH_BRANCH_CASES)
+def test_stash_branch_is_checked_like_pop(multi, template, where, expected):
+    main, wt = multi
+    cmd = template.format(main=main, wt=wt)
+    assert _blocked(cmd, {"main": main, "wt": wt}[where]) is expected, cmd
+
+
+def test_stash_branch_really_takes_another_worktrees_stash(multi):
+    main, wt = multi
+    cmd = f"git -C {wt} stash branch newb"
+    assert _blocked(cmd, main)
+    subprocess.run([_proof_bash(), "-c", cmd], check=True, capture_output=True, env=GIT_ENV)
+    assert (wt / "f.txt").read_text() == "stashed\n"
+    assert _stash_count(main) == 0  # dropped: main's worker has lost it
+
+
 # --- Bounded shell state: groups, pipelines, background, mutations, substitutions ---
 
 def _blocked(cmd, cwd):
