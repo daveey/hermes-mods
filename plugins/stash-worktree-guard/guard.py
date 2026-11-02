@@ -955,14 +955,16 @@ def _strings(node) -> list:
 
 
 def _unknown(states) -> _State:
-    """Nothing is known about cwd or variables; known functions remain callable."""
+    """Lose values, not exported-name presence; known functions remain callable."""
     funcs = {}
-    markers = set()
+    exported = set()
     for st in states:
         funcs.update(st.funcs)
-        markers |= st.exported & _MARKERS  # shell options survive a loss of state
-        markers |= {e for e in st.exported if e.startswith(_FUNC_MARK)}  # so do function exports
-    return _State(None, {"IFS": None} if _NAMEREF in markers else {}, markers, funcs)
+        exported |= st.exported
+    values = {name: None for name in exported}
+    if _NAMEREF in exported:
+        values["IFS"] = None
+    return _State(None, values, exported, funcs)
 
 
 def _union(*groups) -> list:
@@ -1125,11 +1127,12 @@ class _Analyzer:
         self.home0 = os.environ.get("HOME")
         self.pipe_text: Optional[str] = None  # text of earlier commands of the current pipeline
         self.config_alias = False  # an earlier `git config alias.*` in this command
+        self.config_repo = False  # a preceding write may rewire core.worktree
         self.child_alias = False  # inherited only while analyzing a Git runner child
 
     def record(self, repo, sub, args, note: Optional[str] = None):
         """``note``: the unresolved shell word that alone made this a possible restore."""
-        self.calls.append((None if self.shadow else repo, sub, list(args), note))
+        self.calls.append((None if self.shadow or self.config_repo else repo, sub, list(args), note))
 
     def shadow_text(self, text: str, st: _State, depth: int):
         """Analyze ANSI-C text after decoding ``$'...'`` to single quotes, repo unknown."""
@@ -1415,6 +1418,9 @@ class _Analyzer:
     def redirs(self, redirs, states, depth):
         for _op, target, body, quoted in redirs:
             for st in states:
+                path = _expand_word(target, st.vars)
+                if ">" in _op and path and os.path.basename(path) in {"config", "config.worktree"}:
+                    self.config_repo = True
                 for inner in _substitutions(target):
                     self.isolated(inner, st, depth)
                 if body and not quoted:
@@ -1516,6 +1522,11 @@ class _Analyzer:
             self.shadow_argv(raw, st, depth, as_git=True)
             return [st], [st]
         cmd = os.path.basename(name)
+        if cmd == "alias":
+            for word in raw[1:]:
+                value = _expand_word(word, st.vars)
+                if value and "=" in value:
+                    self.shadow_string(value.split("=", 1)[1], st, depth)
         if cmd in SHELLS:
             child = self.child(st, prefix)
             mode, idx = _shell_script(lit)
@@ -1599,7 +1610,13 @@ class _Analyzer:
         if cmd == "trap":
             args = [w for w in lit[1:] if w not in ("--", "-p", "-l")]
             if args and args[0] != "-":
-                self.run_text(args[0], [_unknown([st])], depth + 1)  # runs later, cwd unknown
+                # The handler runs with the environment/config at signal time, not
+                # declaration time. Even an absolute -C cannot establish its repo.
+                self.shadow += 1
+                try:
+                    self.run_text(args[0], [_unknown([st])], depth + 1)
+                finally:
+                    self.shadow -= 1
             return [st], [st]
         if cmd in RUNNERS:
             self.shadow_argv(raw, st, depth, tail=cmd in _APPENDING_RUNNERS)
@@ -1999,6 +2016,9 @@ class _Analyzer:
         if "config" in ex:
             values = ex[ex.index("config") + 1:]
             keys = [w.lower() for w in values if w]
+            if None in values or any(k in {"core.worktree", "core.bare", "extensions.worktreeconfig"}
+                                     for k in keys):
+                self.config_repo = True
             if any(k.startswith(_CONFIG_ALIAS_KEYS) for k in keys):
                 text = " ".join(w or "$?" for w in values)
                 if None in values or "!" in text or "include" in text or _restore_evidence(

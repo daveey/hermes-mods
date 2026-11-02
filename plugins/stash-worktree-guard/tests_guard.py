@@ -1965,6 +1965,45 @@ def test_all_known_builtins_ignore_alias_uncertainty(multi, name):
     assert guard.refuse_reason(BUILTIN_WRAPPER + "; git " + name, str(main)) is None
 
 
+@pytest.mark.parametrize("template", [
+    "git -C {main} config core.worktree {wt}; git -C {main} stash pop",
+    "git config -f {main}/.git/config core.worktree {wt}; git -C {main} stash pop",
+    "printf '[core]\\n\\tworktree = {wt}\\n' >> {main}/.git/config; git -C {main} stash pop",
+    "shopt -s expand_aliases; alias p='git -C {wt} stash pop'\np",
+])
+def test_round5_config_write_and_alias_real_restore(multi, template):
+    main, wt = multi
+    cmd = template.format(main=main, wt=wt)
+    assert _blocked(cmd, main), cmd
+    subprocess.run(["bash", "-c", cmd], cwd=main, env=GIT_ENV,
+                   check=True, capture_output=True, timeout=30)
+    assert (main / "f.txt").read_text() == "base\n"
+    assert (wt / "f.txt").read_text() == "stashed\n"
+    assert not subprocess.check_output(["git", "stash", "list"], cwd=main, env=GIT_ENV).strip()
+
+
+@pytest.mark.parametrize("variant", ["trap_after", "trap_before", "fallback", "prompt"])
+def test_unknown_export_selectors_and_deferred_restores(multi, variant):
+    main, wt = multi
+    gd = subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"],
+                                 cwd=wt, env=GIT_ENV, text=True).strip()
+    export = f"export GIT_DIR={gd} GIT_WORK_TREE={wt}"
+    pop = f"git -C {main} stash pop"
+    branches = "; ".join(f"[ -e /nonexistent-swg-{i} ] && export Y{i}=1" for i in range(5))
+    cmd = {
+        "trap_after": f"{export}; trap '{pop}' EXIT",
+        "trap_before": f"trap '{pop}' EXIT; {export}",
+        "fallback": f"{export}; {branches}; {pop}",
+        "prompt": f"PROMPT_COMMAND='{pop}'; {export}; eval \"$PROMPT_COMMAND\"",
+    }[variant]
+    assert _blocked(cmd, main), cmd
+    subprocess.run(["bash", "-c", cmd], cwd=main, env=GIT_ENV,
+                   check=True, capture_output=True, timeout=30)
+    assert (main / "f.txt").read_text() == "base\n"
+    assert (wt / "f.txt").read_text() == "stashed\n"
+    assert not subprocess.check_output(["git", "stash", "list"], cwd=main, env=GIT_ENV).strip()
+
+
 def test_state_cap_exported_repository_selectors(multi):
     main, wt = multi
     gd = subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"],

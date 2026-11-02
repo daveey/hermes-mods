@@ -95,6 +95,16 @@ This plugin:
   expands to exactly one known word (literals, quotes, known scalars); a glob, brace
   expansion, substitution, splittable expansion, missing `in` list or `select` leaves it
   unknown. A value with a space still splits where the variable is used unquoted;
+- caps finite alternatives by export/function-identity partitions, retaining agreeing cwd
+  and variable values (including HOME); disagreeing logical cwd clears both cwd fields so
+  state copies cannot invent certainty. Namerefs and excessive partitions fall back to
+  unknown values, but retain exported names so Git selectors cannot disappear;
+- analyzes trap handlers with unknown run-time repository selection, even with absolute
+  `-C`; delayed prompt strings and shell-alias bodies likewise cannot prove a repository.
+  Earlier `git config core.worktree` writes (including `-f`) or redirects to `config` /
+  `config.worktree` make later restores uncertain. Regressions exercise these with real
+  wrong-worktree restores (`test_unknown_export_selectors_and_deferred_restores`,
+  `test_state_cap_exported_repository_selectors`, `test_round5_config_write_and_alias_real_restore`);
 - resolves a shell function by the expanded command name before wrapper stripping, as
   bash does: a function named `env`, `timeout`, `nice`, `sudo`, even `command` or `exec`,
   runs its body. A wrapped name (`command git`, `env git`, `builtin cd`) still bypasses
