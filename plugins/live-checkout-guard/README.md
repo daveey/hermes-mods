@@ -197,3 +197,18 @@ terminal/execute-code guard checks. Existing
   `test_real_core_registered_hook_uses_persisted_terminal_cwd` runs `_core_probe.py` under a Hermes runtime python
   (`$HERMES_CORE_PYTHON`, else `~/.hermes/installs/*/environments/*/venv/bin/python`) against `~/.hermes/hermes-agent`
   (`$HERMES_AGENT_DIR`); it skips when none can import the core.
+
+## Decision-module updates in running workers
+
+Once this reload boundary has been activated, running workers pick up changes to
+`guard.py` on their next tool call, without exiting. The hook stats its nanosecond
+mtime and size before computing a verdict; unchanged code is not re-read. A changed
+file is executed into a fresh module, then swapped only after successful loading.
+A syntax/load error retains the last good decisions and logs one warning per changed
+fingerprint. Successful reloads log `live-checkout-guard: reloaded guard.py`.
+`__init__.py`, hook registration and tool schemas are **not** hot-reloaded by this
+boundary; their existing activation paths still apply.
+
+Regression coverage: `tests/test_guard_decision_reload.py` at the repository root
+loads temporary plugin copies and exercises the registered pre-tool hook across
+allowed-to-refused edits, syntax errors, recovery and same-second/same-size edits.

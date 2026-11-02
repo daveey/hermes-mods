@@ -179,10 +179,12 @@ nested `tool_call`. It runs before the terminal handler can promote a timeout ov
 
 After a pull, hermes-sync's `mods-reload` re-activates a changed plugin in the gateway and
 in every serve/desktop-serve backend. Open sessions there use the new hooks from their next
-tool call (seen live 2026-11-01 21:13 PST in a gateway that started before both fixes). A
-Kanban worker loads plugins once, at start, and keeps that module until it exits. Updated
-files don't prove a given process refreshed: look for its
-`mods-reload: ... ok (stash-worktree-guard)` line.
+tool call (seen live 2026-11-01 21:13 PST in a gateway that started before both fixes).
+Once the decision reload boundary is activated, running Kanban workers also pick up
+`guard.py` changes on their next pre-tool call. Updates to `__init__.py` itself still
+require activation or a fresh worker. Updated files don't prove a given process refreshed:
+look for its `mods-reload: ... ok (stash-worktree-guard)` activation receipt or its
+`stash-worktree-guard: reloaded guard.py` decision reload line.
 
 ## Explicit out-of-scope compositions
 
@@ -395,3 +397,18 @@ an alias, an include or a `git-*` program through base64 (`env A=1 sh -c 'echo â
 .git/config'; git -C <wt> p`) really restored another branch's stash and was allowed. Before, the
 collapsed `HOME` made `p` a possible alias. The wrapper branch now sets that alias flag directly;
 the three shapes are in `test_external_wrapper_state_refusal_controls`.
+
+## Decision-module updates in running workers
+
+Once this reload boundary has been activated, running workers pick up changes to
+`guard.py` on their next tool call, without exiting. The hook stats its nanosecond
+mtime and size before computing a verdict; unchanged code is not re-read. A changed
+file is executed into a fresh module, then swapped only after successful loading.
+A syntax/load error retains the last good decisions and logs one warning per changed
+fingerprint. Successful reloads log `stash-worktree-guard: reloaded guard.py`.
+`__init__.py`, hook registration and tool schemas are **not** hot-reloaded by this
+boundary; their existing activation paths still apply.
+
+Regression coverage: `tests/test_guard_decision_reload.py` at the repository root
+loads temporary plugin copies and exercises the registered pre-tool hook across
+allowed-to-refused edits, syntax errors, recovery and same-second/same-size edits.
