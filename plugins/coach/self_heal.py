@@ -1338,6 +1338,8 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
 3. A real defect already owned by another card is a duplicate, NOT not_defect. Record
    `{SELF_EVENT} duplicate {fp} --owner <owner-card> --note "<evidence>"`,
    then complete this card as a duplicate. Post nothing to the Inbox; the owner retains the real defect.
+   A countermeasure you recommend (the owner could/should..., a follow-up) is a `kanban_create` card whose id is in
+   --note; the event refuses a note that recommends one without naming its card (it would be dropped).
    Not a real defect (expected behaviour, user's own setting, outside world with nothing to guard)? Only after you
    checked the user's complaint itself, not just the detector's trigger. Run
    `{SELF_EVENT} not_defect {fp} --note "<why>"` and complete this card with a
@@ -2000,6 +2002,7 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
 
 
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{6,}\b")
+_COUNTERMEASURE_WORDS = re.compile(r"\b(?:could|should|follow[- ]?ups?)\b", re.IGNORECASE)
 
 
 def digest_owner_cards(d: dict, since: float, data: Optional[Path] = None) -> list:
@@ -3006,6 +3009,11 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     card = resolve_event_card(card, st)
     if kind == "duplicate" and (not _CARD_ID.fullmatch(owner) or owner == card):
         raise ValueError("duplicate requires a distinct --owner t_<hex> card")
+    if kind == "duplicate" and _COUNTERMEASURE_WORDS.search(note) and not set(_CARD_ID.findall(note)) - {owner, card}:
+        # A fix recommended only in a duplicate note has no owner and is dropped: the quota-wall registry fix
+        # was proposed as "the owner should ..." on t_01a1946b62dfd5b3 and filed twice more (agent-ffb3d1ba3e).
+        raise ValueError("duplicate note recommends a countermeasure (could/should/follow-up) but names no card for "
+                         "it: kanban_create the fix card and put its t_<hex> id in --note, or drop the recommendation")
     kw: dict = {"status": EVENT_STATUS[kind]}
     cron_check = None
     if result and kind != "fixed":

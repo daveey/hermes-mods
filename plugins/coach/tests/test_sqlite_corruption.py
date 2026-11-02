@@ -228,3 +228,21 @@ def test_incident_holder_card_reads_the_local_home_only(tmp_path, monkeypatch):
     assert sh.incident_holder_card(d)["id"] == "t_77777777"
     assert sh.incident_holder_card({"incident": {**d["incident"], "host": "remote-host"}}) is None
     assert sh.incident_holder_card({}) is None
+
+
+def test_duplicate_refuses_countermeasure_note_without_card(store, monkeypatch):
+    """A duplicate note that recommends a fix must name the card that carries it (agent-ffb3d1ba3e: a quota-wall
+    fix proposed only as "the owner should ..." in a duplicate note was accepted and dropped)."""
+    monkeypatch.setattr(sh, "_store", lambda s=None: store)
+    sh.LaneState(store.root).update("kanban-test", status="filed", card="t_12345678")
+    for note in ("registry should catch SubscriptionQuotaUnavailable", "a follow-up could add a test",
+                 "Follow up: owner t_abcdef01 should fix it"):  # the owner/this card's own id is not the fix card
+        with pytest.raises(ValueError, match="kanban_create"):
+            sh.record_event("duplicate", "kanban-test", card="t_12345678", owner="t_abcdef01", note=note, store=store)
+    assert sh.LaneState(store.root).get("kanban-test")["status"] == "filed"
+    sh.record_event("duplicate", "kanban-test", card="t_12345678", owner="t_abcdef01",
+                    note="registry should catch it: filed t_0badc0de", store=store)
+    sh.LaneState(store.root).update("kanban-test", status="filed")
+    sh.record_event("duplicate", "kanban-test", card="t_12345678", owner="t_abcdef01",
+                    note="same traceback, 527 hub warnings", store=store)
+    assert sh.LaneState(store.root).get("kanban-test")["fix_card"] == "t_abcdef01"
