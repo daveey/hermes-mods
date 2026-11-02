@@ -66,7 +66,9 @@ This plugin:
   `timeout`): it runs in a child process, so the caller's cwd and variables stay known. The
   child may still write Git config, an include or a `git-*` program the guard cannot read, so
   a later non-builtin Git subcommand counts as a possible alias. After
-  a builtin or keyword (`command`, `builtin`, `exec`, `time`, `coproc`) they become unknown. `timeout` is
+  a builtin or keyword (`command`, `builtin`, `exec`, `time`, `coproc`) they become unknown. A
+  lookup (`command -v`/`-V`, also with `-p`) is the exception: it only prints how each name
+  resolves and runs none of them, so the state stays known. `timeout` is
   parsed exactly (`--foreground`, `--preserve-status`, `-v`, `-k`/`--kill-after`,
   `-s`/`--signal` in both spellings, then a numeric duration); any other shape is
   unsupported. `builtin` and `command` run the builtin that follows (`builtin cd X` changes

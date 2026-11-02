@@ -1003,10 +1003,26 @@ def _union(*groups) -> list:
     return joined
 
 
+def _command_lookup_only(args: list[str]) -> bool:
+    """True for `command [-p] -v|-V [--] NAME...`: it prints how each NAME resolves and runs none of
+    them, so it leaves the shell state alone. Options are read only up to the first operand or
+    `--`; any option other than -p/-v/-V is not a lookup."""
+    lookup = False
+    for word in args:
+        if word == "--" or not word.startswith("-") or word == "-":
+            break
+        if not re.fullmatch(r"-[pvV]+", word):
+            return False
+        lookup = lookup or "v" in word or "V" in word
+    return lookup
+
+
 def _skip_wrappers(words: list[str]) -> list[str]:
     while words:
         if os.path.basename(words[0]) in WRAPPERS | {"coproc"}:
             wrapper, words = os.path.basename(words[0]), words[1:]
+            if wrapper == "command" and _command_lookup_only(words):
+                return []  # a lookup: nothing runs
             # Do not guess option arity, environment changes, or coprocess scope.
             # The caller marks these unsupported wrappers uncertain for the whole text.
             if wrapper == "coproc" or (words and (

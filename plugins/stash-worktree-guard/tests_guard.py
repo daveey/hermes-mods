@@ -1891,6 +1891,74 @@ def test_for_loop_restores_still_refuse(multi, template):
     assert _blocked(cmd, main), cmd
 
 
+# --- `command -v`/`-V` only describes names: it runs nothing and keeps the shell state ---
+
+# Refused as `git stash pop` (no stash in it): `command -v gh` read as an unsupported wrapper
+# option, so the whole shell state collapsed and a later unquoted `-C $r` became a word that
+# could split into `stash pop`. Reported shape, host and paths anonymized.
+COMMAND_LOOKUP_REPORTED = r'''timeout 90 ssh -o BatchMode=yes host 'ls -l ~/x 2>&1 | cut -c1-160; command -v gh python3; for r in ~/a ~/b; do [ -d $r/.git ] || [ -f $r/.git ] || { echo "$r: not a git repo"; continue; }; echo "$r: HEAD $(git -C $r rev-parse --short=10 HEAD) branch $(git -C $r rev-parse --abbrev-ref HEAD)"; git -C $r cat-file -e 0123abcd 2>/dev/null && echo has || echo lacks; done' 2>&1 | grep -v x'''
+COMMAND_LOOKUP_ALLOWED = [
+    COMMAND_LOOKUP_REPORTED,
+    "command -v gh python3; for r in /tmp/a /tmp/b; do git -C $r rev-parse HEAD; done",
+    "command -v gh; git -C $HOME rev-parse HEAD",
+    "command -V git; C=/tmp/x; git -C $C log -1",
+    "command -pv git >/dev/null; git -C $HOME/a status",
+    "command -v -- git; X=/tmp/x; git -C $X status",
+    "builtin command -v git; X=/tmp/x; git -C $X status",
+    # A lookup names words; it never runs them.
+    "command -v git stash pop",
+]
+
+
+@pytest.mark.parametrize("cmd", COMMAND_LOOKUP_ALLOWED)
+def test_command_lookup_keeps_shell_state(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, "/Users/you") is None, cmd
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not _blocked(cmd, main), cmd
+
+
+@pytest.mark.parametrize("template", [
+    "command -v gh; git -C {wt} stash pop",
+    "command -v gh python3; for r in {wt}; do git -C $r stash pop; done",
+    "command -V git; cd {wt}; git stash pop",
+    "command -pv git; C={wt}; git -C $C stash apply",
+    "command -v gh; git -C $C stash pop",
+    # Running forms and unknown options stay uncertain, as before.
+    "command -p git -C {wt} stash pop",
+    "command git -C {wt} stash pop",
+    "command -x git -C {wt} stash pop",
+    "command -v$X git -C {wt} stash pop",
+])
+def test_command_lookup_controls_still_refuse(multi, template):
+    main, wt = multi
+    cmd = template.format(wt=wt)
+    assert _blocked(cmd, main), cmd
+
+
+def test_command_lookup_restore_control_really_restores(multi):
+    main, wt = multi
+    cmd = f"command -v gh >/dev/null; git -C {wt} stash pop -q"
+    assert _blocked(cmd, main), cmd
+    assert (wt / "f.txt").read_text() == "base\n"
+    subprocess.run([_proof_bash(), "-c", cmd], cwd=main, env=GIT_ENV, check=True,
+                   capture_output=True)
+    assert (wt / "f.txt").read_text() == "stashed\n"
+
+
+def test_command_lookup_allow_control_is_read_only(multi):
+    main, wt = multi
+    cmd = f"command -v gh python3 git; for r in {main} {wt}; do git -C $r rev-parse HEAD; done"
+    assert not _blocked(cmd, main), cmd
+    before = subprocess.run(["git", "stash", "list"], cwd=main, env=GIT_ENV, text=True,
+                            capture_output=True, check=True).stdout
+    subprocess.run([_proof_bash(), "-c", cmd], cwd=main, env=GIT_ENV, capture_output=True)
+    after = subprocess.run(["git", "stash", "list"], cwd=main, env=GIT_ENV, text=True,
+                           capture_output=True, check=True).stdout
+    assert before == after and before.strip()
+    assert (wt / "f.txt").read_text() == "base\n" and (main / "f.txt").read_text() == "base\n"
+
+
 # Shared allow corpus: add each real false positive here, not only a one-off test.
 AWK_DIFF = r"awk '/^diff --git a\/tools\/process_registry.py/{f=1} /^diff --git/ && !/tools\/process_registry.py/{f=0} f' v1101hr_598.diff"
 # Reported command is analyzed only, never executed. Personal path anonymized.
@@ -1911,6 +1979,7 @@ READ_ONLY_ALLOW_CORPUS = [
     r'''cd /Users/you/.hermes/cache/scratch.noindex && timeout 60 gh pr diff 598 -R example/repo > v1101hr_598.diff 2>&1; timeout 60 gh pr diff 608 -R example/repo > v1101hr_608.diff 2>&1; echo "598 diff lines $(wc -l < v1101hr_598.diff) | 608 diff lines $(wc -l < v1101hr_608.diff)"; echo "== #598 tools/process_registry.py hunks:"; ''' + AWK_DIFF + r''' | grep -E '^[@+-]' | grep -v -E '^(\+\+\+|---)' | cut -c1-170 | head -60''',
     SQLITE_LOOP_REPORTED, SQLITE_LOOP_FULL,
     *FOR_LOOP_ALLOWED[:4], FOR_LOOP_ALLOWED[-1],
+    *COMMAND_LOOKUP_ALLOWED,
     "[ -f x ] && echo y", "sed -n '1,5p' f",
     "awk 'BEGIN { print \"git stash pop\" }'",
 ]
