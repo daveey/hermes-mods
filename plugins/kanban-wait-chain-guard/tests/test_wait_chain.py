@@ -294,5 +294,56 @@ class CyclingAuthor(Base):
         self.assertIn('t_B has made no progress', out['message'])
 
 
+class ScheduledParentWake(Base):
+    """agent-0e5f1ab1f9: t_01a194ca90736cea parked kind=dependency behind t_01a18a95223f7036, scheduled and idle 81 h
+    until a quota reset (wake_at 2026-11-03T13:10Z). The hint said "not a started fix" but never named the wake or
+    the park the reply check accepts (kind=time until it), so the worker argued instead of parking on the clock."""
+
+    WAKE = NOW + 21 * H
+
+    def board(self, wake_at=WAKE, reason=None, child_runs=13):
+        payload = {'timed_park': True, 'requested_kind': 'time'}
+        if wake_at is not None:
+            payload['wake_at'] = int(wake_at)
+        if reason is not None:
+            payload['reason'] = reason
+        make_board(self.db, [('t_P', 'scheduled', NOW - 200 * H, None), ('t_C', 'running', NOW - 220 * H, None)],
+                   links=[('t_P', 't_C')],
+                   runs=[('t_C', NOW - 81 * H + i * H) for i in range(child_runs)],
+                   events=[('t_P', 'scheduled', NOW - 81 * H, payload)])
+
+    def iso(self, ts):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(int(ts), timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def test_dependency_hint_names_wake_and_time_park(self):
+        self.board()
+        out = self.call('kanban_block', {'task_id': 't_C', 'kind': 'dependency', 'reason': 'wait on P'})
+        text = json.loads(out)['warning']
+        self.assertIn('t_P has made no progress', text)
+        self.assertIn(f't_P wakes at {self.iso(self.WAKE)}', text)
+        self.assertIn(f"kanban_block(kind='time', reason='SCHEDULED_UNTIL={self.iso(self.WAKE)}", text)
+        self.assertIn("kind='needs_input'", text)
+
+    def test_wake_from_scheduled_until_in_reason(self):
+        self.board(wake_at=None, reason=f'SCHEDULED_UNTIL={self.iso(self.WAKE)} — quota reset')
+        text = json.loads(self.call('kanban_link', {'parent_id': 't_P', 'child_id': 't_C'}))['warning']
+        self.assertIn(f't_P wakes at {self.iso(self.WAKE)}', text)
+
+    def test_refusal_names_the_wake_too(self):
+        self.board(child_runs=20)
+        out = guard.pre_tool_call(tool_name='kanban_block', args={'task_id': 't_C', 'kind': 'dependency',
+                                                                  'reason': 'wait'})
+        self.assertEqual(out['action'], 'block')
+        self.assertIn(f"SCHEDULED_UNTIL={self.iso(self.WAKE)}", out['message'])
+
+    def test_past_wake_is_not_offered(self):
+        self.board(wake_at=NOW - 2 * H)
+        text = json.loads(self.call('kanban_link', {'parent_id': 't_P', 'child_id': 't_C'}))['warning']
+        self.assertIn('t_P has made no progress', text)
+        self.assertNotIn('wakes at', text)
+        self.assertNotIn("kind='time'", text)
+
+
 if __name__ == '__main__':
     unittest.main()

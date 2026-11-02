@@ -154,6 +154,45 @@ def _hours(conn, task, now):
     return max(0.0, (now - _last_progress(conn, task)) / 3600.0)
 
 
+def _iso(ts):
+    return datetime.fromtimestamp(int(ts), timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _wake_at(conn, task, now):
+    """Future wake time of a scheduled ``task`` (its latest 'scheduled' event: payload wake_at, else the reason's
+    SCHEDULED_UNTIL=), or None."""
+    if task is None or task['status'] != 'scheduled':
+        return None
+    try:
+        row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
+                           "ORDER BY created_at DESC, id DESC LIMIT 1", (task['id'],)).fetchone()
+        data = json.loads(row[0]) if row and row[0] else {}
+        wake = data.get('wake_at') if isinstance(data, dict) else None
+        if not wake:
+            m = WAKE.search(str((data or {}).get('reason') or ''))
+            if m:
+                dt = datetime.fromisoformat(m[1].replace('Z', '+00:00'))
+                wake = (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt).timestamp()
+        wake = float(wake) if wake else None
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+    return wake if wake and wake > now else None
+
+
+def _time_park(conn, cards, now):
+    """agent-0e5f1ab1f9: a scheduled card in the chain wakes on a clock. Name that wake and the park the reply check
+    accepts (kind=time until it, or David's decision), not another dependency park behind it."""
+    for c in cards:
+        wake = _wake_at(conn, c, now)
+        if wake:
+            iso = _iso(wake)
+            return (f" {c['id']} wakes at {iso} (scheduled on a clock). If nothing here can run before then, park "
+                    f"this card on that clock instead: kanban_block(kind='time', reason='SCHEDULED_UNTIL={iso} — …') "
+                    f"or kanban_schedule; if lifting the gate is David's call, kanban_block(kind='needs_input', "
+                    f"human_request=…). A dependency park behind it is not an ending")
+    return ''
+
+
 def _stalled(conn, parent, now):
     """Hint text when ``parent`` is a parked card going nowhere, else None."""
     if parent is None or parent['status'] not in PARKED or _human_ask(parent):
@@ -172,6 +211,7 @@ def _stalled(conn, parent, now):
         cur = nxt
     if not chain and idle < IDLE_HOURS:
         return None
+    clock = _time_park(conn, [parent] + chain, now)
     if chain:
         gp = chain[0]
         text = (f"{parent['id']} is itself waiting on {gp['id']} ({gp['status']}, idle {_hours(conn, gp, now):.0f}h); "
@@ -180,7 +220,7 @@ def _stalled(conn, parent, now):
             text += '; chain: ' + ' -> '.join([parent['id']] + [c['id'] + f" ({c['status']})" for c in chain])
     else:
         text = f"{parent['id']} has made no progress in {idle:.0f}h (status {parent['status']}, idle {idle:.0f}h)"
-    return text
+    return text + ('.' + clock if clock else '')
 
 
 def _targets(tool, args):
