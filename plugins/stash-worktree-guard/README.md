@@ -71,7 +71,13 @@ This plugin:
   parsed with their real arity. After `stash`, an unknown first positional (skipping
   `-m`/`--message` values) is a possible `pop`; an unknown ref makes the target unknown.
   The textual fallback mirrors this: a `stash` followed by an unresolved word, or `git`
-  followed by an unresolved subcommand, counts as restore evidence;
+  followed by an unresolved subcommand, counts as restore evidence. When only an unquoted
+  unknown word (no `stash` text) makes the subcommand unknown, the refusal names that word
+  and says to quote it or assign it first;
+- gives a `for NAME in WORDS` variable one known value per loop word when every word
+  expands to exactly one known word (literals, quotes, known scalars); a glob, brace
+  expansion, substitution, splittable expansion, missing `in` list or `select` leaves it
+  unknown. A value with a space still splits where the variable is used unquoted;
 - resolves a shell function by the expanded command name before wrapper stripping, as
   bash does: a function named `env`, `timeout`, `nice`, `sudo`, even `command` or `exec`,
   runs its body. A wrapped name (`command git`, `env git`, `builtin cd`) still bypasses

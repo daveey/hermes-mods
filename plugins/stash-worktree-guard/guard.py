@@ -712,7 +712,7 @@ class _Parser:
                 self.expect_word("done")
                 return ("loop", cond, body, None, self.parse_redirs())
             if word in ("for", "select"):
-                return self.parse_for()
+                return self.parse_for(word)
             if word == "case":
                 return self.parse_case()
             if word == "function":
@@ -776,15 +776,17 @@ class _Parser:
         self.expect_word("fi")
         return ("if", branches, other, self.parse_redirs())
 
-    def parse_for(self):
+    def parse_for(self, keyword: str = "for"):
         self.i += 1
         head = self.next()
-        var, words = None, []
+        # words is None without `in`: the loop runs over "$@", unknown here.
+        var, words = None, None
         if head.kind == "w":
             var = head.text
             self.skip_nl()
             if self.is_word("in"):
                 self.i += 1
+                words = []
                 while self.peek() is not None and self.peek().kind == "w":
                     words.append(self.next().text)
         elif head.kind != "arith":
@@ -795,8 +797,8 @@ class _Parser:
         self.expect_word("do")
         body = self.parse_list(stop_words=("done",))
         self.expect_word("done")
-        return ("loop", None, body, (var, words, head.text if head.kind == "arith" else None),
-                self.parse_redirs())
+        return ("loop", None, body, (var, words, head.text if head.kind == "arith" else None,
+                                     keyword), self.parse_redirs())
 
     def parse_case(self):
         self.i += 1
@@ -1045,8 +1047,9 @@ class _Analyzer:
         self.pipe_text: Optional[str] = None  # text of earlier commands of the current pipeline
         self.config_alias = False  # an earlier `git config alias.*` in this command
 
-    def record(self, repo, sub, args):
-        self.calls.append((None if self.shadow else repo, sub, list(args)))
+    def record(self, repo, sub, args, note: Optional[str] = None):
+        """``note``: the unresolved shell word that alone made this a possible restore."""
+        self.calls.append((None if self.shadow else repo, sub, list(args), note))
 
     def shadow_text(self, text: str, st: _State, depth: int):
         """Analyze ANSI-C text after decoding ``$'...'`` to single quotes, repo unknown."""
@@ -1277,9 +1280,9 @@ class _Analyzer:
         self.redirs(redirs, states, depth)
         pre = states
         if forspec:
-            var, words, arith = forspec
+            var, words, arith, keyword = forspec
             for st in states:
-                for word in words:
+                for word in words or ():
                     for inner in _substitutions(word):
                         self.isolated(inner, st, depth)
                 if arith:
@@ -1287,9 +1290,11 @@ class _Analyzer:
             if var:
                 pre = []
                 for st in states:
-                    new = st.copy()
-                    new.vars[var] = None
-                    pre.append(new)
+                    for value in self.loop_values(keyword, var, words, st):
+                        new = st.copy()
+                        new.vars[var] = value
+                        pre.append(new)
+                pre = _union(pre)
 
         def once(sts):
             cs, cf = self.exec(cond, sts, depth) if cond is not None else (sts, sts)
@@ -1303,6 +1308,19 @@ class _Analyzer:
         if any(st.key() not in known for st in out):
             out = _union(out, [_unknown(out)])  # did not converge in two iterations
         return out, out
+
+    @staticmethod
+    def loop_values(keyword, var, words, st) -> list:
+        """Values ``var`` may hold in the body of ``for var in words``.
+
+        Each word that expands (scalars, quotes, tilde) to exactly one known word gives one
+        value. Anything else (no ``in`` list, a glob, brace expansion, a substitution, an
+        unquoted expansion that may split, `select`'s user input) leaves it unknown.
+        """
+        if keyword != "for" or not _NAME.match(var or "") or not words:
+            return [None]
+        values = [_expand_word(word, st.vars) for word in words]
+        return [None] if None in values else list(dict.fromkeys(values))
 
     def redirs(self, redirs, states, depth):
         for _op, target, body, quoted in redirs:
@@ -1711,7 +1729,12 @@ class _Analyzer:
             text = " ".join(w for w in rest if w is not None)
             if any(w is None for w in rest) or aliased or _restore_evidence(text) or (
                     REFUSE_OPS & set(rest)):
-                self.record(None, "stash", ["pop"])
+                note = None
+                if not (aliased or REFUSE_OPS & set(rest) or re.search(r"\bstash\b", " ".join(raw))
+                        or _restore_evidence(" ".join(raw[i:]))):
+                    # Only an unknown word (no stash text): name it for the refusal message.
+                    note = next((raw[j] for j in range(i, len(ex)) if ex[j] is None), None)
+                self.record(None, "stash", ["pop"], note)
             return
         sub, args = ex[i], ex[i + 1:]
         if sub != "stash" or None not in args:
@@ -1735,7 +1758,15 @@ class _Analyzer:
 
 
 def _git_calls(cmd: str, cwd: Optional[str], depth: int = 0):
-    """Yield (repo, subcommand, args) for every git call the command may make.
+    """Yield (repo, subcommand, args) for every git call the command may make."""
+    for repo, sub, args, _note in _git_calls_noted(cmd, cwd, depth):
+        yield repo, sub, args
+
+
+def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
+    """Yield (repo, subcommand, args, note) for every git call the command may make.
+
+    ``note`` is the unresolved shell word behind a synthesized possible restore, else None.
 
     Bounded static analysis, not a shell interpreter: nothing is executed. Only HOME and
     TMPDIR are borrowed from the process environment; other variables of a persistent
@@ -1777,13 +1808,14 @@ def stash_ref(args: list[str]) -> str:
 
 
 def _stash_invocations(cmd: str, cwd: Optional[str]):
+    """Yield (repo, op, args, note) for every stash call (see ``_git_calls_noted``)."""
     base = _resolve(os.path.expanduser(cwd or os.getcwd()), os.getcwd())
-    for repo, sub, args in _git_calls(cmd, base):
+    for repo, sub, args, note in _git_calls_noted(cmd, base):
         if sub != "stash":
             continue
         op = stash_op(args)
         if op:
-            yield repo, op, args
+            yield repo, op, args, note
 
 
 def _safe_recipe() -> str:
@@ -1807,7 +1839,7 @@ def warning_for(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
     if _bypassed(cmd):
         return None
     seen = set()
-    for repo, _op, _args in _stash_invocations(cmd, cwd):
+    for repo, _op, _args, _note in _stash_invocations(cmd, cwd):
         if repo is None or repo in seen:
             continue
         seen.add(repo)
@@ -1822,7 +1854,18 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
     if _bypassed(cmd):
         return None
     seen = set()
-    for repo, op, args in _stash_invocations(cmd, cwd):
+    calls = list(_stash_invocations(cmd, cwd))
+    # Every unresolved-repo restore comes only from an unknown word, with no stash text.
+    notes = [note for repo, op, _a, note in calls if repo is None and op in REFUSE_OPS]
+    if notes and all(notes):
+        word = notes[0]
+        return (
+            f"STASH WORKTREE GUARD: blocked: the unquoted word `{word}` has an unknown value, so it "
+            "may split into several words and shift git's subcommand (it could become "
+            f"`stash pop`). Quote it (`\"{word}\"`) or assign it a literal earlier in the same "
+            "command."
+        )
+    for repo, op, args, _note in calls:
         if op not in REFUSE_OPS:
             continue
         key = (repo, op, stash_ref(args))

@@ -1056,3 +1056,80 @@ def test_bracket_controls_still_refuse(multi, template):
     main, wt = multi
     cmd = template.format(wt=wt)
     assert _blocked(cmd, main), cmd
+
+
+# --- `for NAME in WORDS`: literal loop words give the variable known values ---
+
+# Refused as `git stash pop` (no stash in it): an unquoted for-loop variable was an unknown,
+# splittable word, so git's subcommand position after `-C $T/$w` became unknown.
+FOR_LOOP_ALLOWED = [
+    "T=/tmp; for w in a b; do git -C $T/$w status; done",                 # card case 1
+    'T=/tmp; for w in a b; do git -C "$T/$w" status; done',               # case 2
+    "for w in /tmp/a /tmp/b; do git -C $w status; done",                  # case 3
+    'for w in /tmp/a /tmp/b; do git -C "$w" status; done',                # case 4
+    "C=/tmp/x; git -C $C worktree prune -v",                              # case 7
+    "T=/tmp; C=/tmp/x; for w in core-fix core-hub; do d=$(git -C $T/$w status --porcelain"
+    ' | wc -l); [ "$d" = 0 ] && git -C $C worktree remove $T/$w; done',   # reported, C set
+    "for w in 'a' \"b\" c\\\\d; do git -C /tmp/$w status; done",            # quoted literal words
+]
+
+
+@pytest.mark.parametrize("cmd", FOR_LOOP_ALLOWED)
+def test_for_loop_literal_words_are_known(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, "/Users/you") is None, cmd
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not _blocked(cmd, main), cmd
+
+
+def test_unknown_word_refusal_names_the_word(multi):
+    """Card case 6: no stash text, so the refusal names the word and says to quote it."""
+    main, _wt = multi
+    for cmd, word in (("git -C $C worktree prune -v", "$C"),
+                      ("for w in core-fix core-hub; do git -C $C worktree remove $T/$w; done",
+                       "$C"),
+                      # A loop word with a space splits again when the variable is unquoted.
+                      ("for w in 'a b'; do git -C /tmp/$w status; done", "/tmp/$w")):
+        why = guard.refuse_reason(cmd, "/Users/you")
+        assert why is not None, cmd
+        assert f"`{word}`" in why and f'"{word}"' in why and "Quote it" in why, why
+        assert "git stash pop`:" not in why, why
+        assert _blocked(cmd, main), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    'for w in a b; do git -C "$w" stash pop; done',      # card controls
+    "git -C $C stash apply",
+    "T=/x; for w in a; do git -C $T/$w stash pop; done",
+])
+def test_for_loop_card_controls_still_refuse(cmd):
+    why = guard.refuse_reason(cmd, "/Users/you")
+    assert why is not None and "`git stash" in why, (cmd, why)
+
+
+@pytest.mark.parametrize("template", [
+    "for w in {wt}; do git -C $w stash pop; done",
+    "for w in {main} {wt}; do git -C $w stash pop; done",
+    "for w in {main} {wt}; do cd $w; done; git stash pop",
+    "for w in {main}; do w={wt}; git -C $w stash pop; done",
+    "for w in {main}; do git -C $w/../wt stash pop; done",
+    # Non-literal loop words keep the variable unknown.
+    "for w in $(echo {main}); do git -C $w stash pop; done",
+    "for w in {main} $X; do git -C $w stash pop; done",
+    "for w in {main}*; do git -C $w stash pop; done",
+    "for w in {{{main},{wt}}}; do git -C $w stash pop; done",
+    "for w in `echo {main}`; do git -C $w stash pop; done",
+    "for w; do git -C $w stash pop; done",
+    "select w in {main}; do git -C $w stash pop; done",
+    "for w in {main}; do :; done; git -C $w/../wt stash pop",
+])
+def test_for_loop_restores_still_refuse(multi, template):
+    main, wt = multi
+    cmd = template.format(main=main, wt=wt)
+    assert _blocked(cmd, main), cmd
+
+
+def test_for_loop_over_same_branch_checkout_allows_pop(multi):
+    main, _wt = multi
+    cmd = f"for w in {main}; do git -C $w stash pop; done"
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
