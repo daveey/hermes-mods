@@ -19,11 +19,15 @@ For an all-session fleet audit, use the inventory-and-session-join procedure in
 ## Scope: this session by default
 
 "What's blocked?" means **this chat's cards** (the ones it created or is subscribed to, i.e. its task strip),
-not every board. **"What do you need me to do?" is wider.** He is reading the Desktop "For you" panel, which
-lists every human-blocked or gave-up card on the gateway, not only the thread you were just discussing. Before
-you say "nothing needed", sweep the board for `blocked` (`needs_input`/`capability`) and `gave_up` cards
-(`hermes kanban list` plus `kanban_show` on each) and clear them. He calls an answer of "nothing" given while
-that panel still shows asks a lie.
+not every board. **"What do you need me to do?" is wider**, and so is any "nothing (new) needs you" line you add unasked, such
+as the close of a Kanban notice reply. He reads both against the Desktop "For you" panel, which lists every
+human-blocked or gave-up card on the gateway, not only the thread you were just discussing. The ask-gate's
+"Cards linked to this chat" list is not that set: it omits asks on cards this chat never created. Before any
+such line, sweep each board for `blocked` (`needs_input`/`capability`) and `gave_up` cards (`sqlite3 -readonly
+<board> "select id,title from tasks where status='blocked' and coalesce(human_request,'')<>''"`, plus
+`hermes kanban list` for `gave_up`) and clear them. If a genuine ask remains, leave the line out rather than
+restate the ask; the panel already shows it. He calls an answer of "nothing" given while that panel still
+shows asks a lie.
 
 The card set for the session-scoped question: Find them from this session's own `kanban_create` results /
 task strip, then `kanban_show` each and report the blocked ones. Also report two states that wait silently:
@@ -129,9 +133,6 @@ a morning digest (`0 8 * * *`, `--run-checks --max-chars 3400`) and a frequent a
 uv run --with pytest python -m pytest -q -p no:cacheprovider skills/devops/kanban-hands-digest/tests
 ```
 
-Covers board discovery/filtering, structured + free-text parsing, shared-step dedupe, deadline/urgency
-ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (incl. `--board`),
-`--max-chars` shrinking, and the CLI's `--json` / silent `--checks-only`.
 
 ## Pitfalls
 
