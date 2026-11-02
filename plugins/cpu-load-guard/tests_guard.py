@@ -37,6 +37,54 @@ BAD = [
     "for ((i=0;i<16;i++)); do cat /dev/zero >/dev/null & done",
     "yes>/dev/null & " * 8,
 ]
+# These are analyzed as data only; no test executes a load generator.
+OPTION_POLLS = [
+    'r=""; for i in $(seq 1 45); do r=$(timeout 60 ssh -o BatchMode=yes '
+    '-o ConnectTimeout=20 user@example.com '
+    "'cat results.txt 2>/dev/null' 2>/dev/null | grep -v '^SSH route:'); "
+    'case "$r" in *DONE*) break;; esac; sleep 60; done',
+    "for i in $(seq 1 20); do ssh -o BatchMode=yes h 'true 2>/dev/null'; sleep 60; done",
+    "for i in $(seq 1 20); do apt-get -o APT::Get::Assume-Yes=yes check >/dev/null; done",
+]
+
+
+@pytest.mark.parametrize("cmd", OPTION_POLLS, ids=["ssh-poll", "ssh-simple", "apt-option"])
+def test_option_values_are_not_burners(cmd):
+    assert run("terminal", {"command": cmd}) is None
+    assert run("terminal", {"command": cmd, "background": True}) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "for i in $(seq 1 16); do yes > /dev/null & done",
+    "for i in $(seq 1 16); do timeout 5 yes > /dev/null & done",
+    "for i in $(seq 1 16); do nice -n 5 yes >/dev/null & done",
+    "seq 16 | xargs -P16 -I{} sh -c 'yes >/dev/null'",
+    "yes > /dev/null & " * 8,
+    "for i in $(seq 1 16); do (yes >/dev/null &); done",
+    "for i in $(seq 1 16); do env FOO=1 yes >/dev/null & done",
+])
+def test_command_position_burners_still_block(cmd):
+    assert run("terminal", {"command": cmd})["action"] == "block"
+
+
+@pytest.mark.parametrize("prefix", [
+    "", "nohup ", "exec ", "time ", "setsid ", "nice -n 5 ",
+    "timeout --signal=TERM 5 ", "env -i FOO=1 ", "env -u FOO ",
+    "sudo -u root ", "stdbuf -oL ", "caffeinate -i ",
+])
+def test_burner_wrappers_in_both_regexes(prefix):
+    cmd = prefix + "yes >/dev/null &"
+    assert plugin.guard.SHELL_BURNER_RE.search(cmd)
+    assert len(plugin.guard.BG_BURNER_RE.findall((cmd + " ") * 8)) == 8
+
+
+@pytest.mark.parametrize("prefix", ["=", ":", ",", "word", "echo ", "ssh -o BatchMode="])
+def test_argument_prefixes_in_both_regexes(prefix):
+    cmd = prefix + "yes >/dev/null &"
+    assert plugin.guard.SHELL_BURNER_RE.search(cmd) is None
+    assert plugin.guard.BG_BURNER_RE.search(cmd) is None
+
+
 GOOD = [
     "pytest -n 2",
     "pytest -n $(nproc) tests/",
