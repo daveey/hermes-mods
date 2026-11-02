@@ -171,17 +171,53 @@ def _replica_completed_at(cards: list[dict]) -> dict[int, float]:
     return out
 
 
+_BOARD_SLUG = re.compile(r'[a-z0-9][a-z0-9_-]*')
+
+
+def _read_shadow(board: str, ids: set[str]) -> tuple[bool, set[str]]:
+    """``(fresh, ids present)`` from ``sync-shadow/<board>.db``; raises when it cannot be read.
+
+    Fresh = exactly one sync-state row naming this board, pulled within 120 s and not future-dated."""
+    path = _kanban_root() / 'kanban' / 'sync-shadow' / f'{board}.db'
+    conn = core.ro_connect(path)
+    try:
+        conn.execute('BEGIN')
+        state = conn.execute('SELECT board_id, pulled_at FROM kanban_sync_state').fetchall()
+        fresh = len(state) == 1 and state[0][0] == board and state[0][1] is not None \
+            and 0 <= time.time() - float(state[0][1]) <= 120
+        found: set[str] = set()
+        wanted = sorted(ids)
+        for i in range(0, len(wanted), 500):
+            chunk = wanted[i:i + 500]
+            # Query ids, not status or links: absence is stronger than "not linked".
+            found.update(str(r[0]) for r in conn.execute(
+                f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk))
+        return fresh, found
+    finally:
+        conn.close()
+
+
 def _board_absence_veto(keys: set[str]) -> set[str]:
-    """Qualified keys need full-board coverage, not absence from a linked-card projection.
+    """Unresolved keys need full-board coverage, not absence from a linked-card projection.
 
     A Board shadow is the whole board across gateways/profiles. Any matching id
     vetoes absence (even a different owner); it never proves settlement. Missing,
     stale or unreadable coverage also vetoes absence. One read per board per pass.
+
+    A four-part key names its board. A bare id names none, so it is checked against every
+    board this host knows of beyond the local boards ``core.read_cards`` already read: each
+    ``sync-shadow/*.db`` and each link-only ``sync-links/*.db`` board. The id on any of them
+    vetoes; so does any of them lacking a fresh, readable shadow. A host with neither keeps
+    the earlier rule (local boards + projection are its whole coverage).
     """
     groups: dict[str, set[str]] = {}
     veto: set[str] = set()
+    bare: set[str] = set()
     for key in keys:
         parts = key.split('/')
+        if len(parts) == 1:
+            bare.add(key)
+            continue
         if len(parts) == 3:
             # Historical forms used BOTH gateway/profile/id and gateway/board/id.
             # Without a projected canonical owner, no one board proves absence.
@@ -190,29 +226,39 @@ def _board_absence_veto(keys: set[str]) -> set[str]:
         if len(parts) != 4:
             continue
         board = parts[2]
-        if not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', board):
+        if not _BOARD_SLUG.fullmatch(board):
             veto.add(key)
             continue
         groups.setdefault(board, set()).add(key)
-    for board, wanted in groups.items():
+    bare_boards: set[str] = set()
+    if bare:
         try:
-            path = _kanban_root() / 'kanban' / 'sync-shadow' / f'{board}.db'
-            conn = core.ro_connect(path)
-            try:
-                conn.execute('BEGIN')
-                state = conn.execute('SELECT board_id, pulled_at FROM kanban_sync_state').fetchall()
-                if len(state) != 1 or state[0][0] != board or state[0][1] is None \
-                        or not 0 <= time.time() - float(state[0][1]) <= 120:
-                    veto.update(wanted)
-                    continue
-                # Query ids, not status or links: absence is stronger than "not linked".
-                found = {str(r[0]) for r in conn.execute('SELECT id FROM tasks')}
-                veto.update(key for key in wanted if key.rsplit('/', 1)[-1] in found)
-            finally:
-                conn.close()
+            kanban = _kanban_root() / 'kanban'
+            for sub in ('sync-shadow', 'sync-links'):
+                if (kanban / sub).is_dir():
+                    bare_boards.update(p.stem for p in (kanban / sub).glob('*.db')
+                                       if _BOARD_SLUG.fullmatch(p.stem))
+        except Exception:
+            logger.debug('chat-closeout: board list unavailable', exc_info=True)
+            veto.update(bare)
+            bare = set()
+    gap = False
+    for board in sorted(set(groups) | bare_boards):
+        wanted = groups.get(board, set())
+        ids = {key.rsplit('/', 1)[-1] for key in wanted} | (bare if board in bare_boards else set())
+        try:
+            fresh, found = _read_shadow(board, ids)
         except Exception:
             logger.debug('chat-closeout: board absence coverage unavailable: %s', board, exc_info=True)
+            fresh, found = False, set()
+        if not fresh:
             veto.update(wanted)
+            gap = gap or board in bare_boards
+        veto.update(key for key in wanted if key.rsplit('/', 1)[-1] in found)
+        if board in bare_boards:
+            veto.update(bare & found)
+    if gap:
+        veto.update(bare)  # a board this host knows of has no fresh full read: no bare id is observed absent
     return veto
 
 

@@ -82,7 +82,13 @@ A missing, unreadable, wrong-board, future-dated or stale shadow is uncertain, n
 vetoes discard previously accumulated missing time on the first pass. Hosts without full-board coverage retain
 unresolved qualified entries rather than guessing. An unresolved legacy three-part key is also uncertain:
 its middle part historically meant either profile or board, so no single board can prove absence until an
-inventory row supplies a canonical owner. Bare-id resolution remains unchanged.
+inventory row supplies a canonical owner. An unresolved bare id names no board, so it is checked against every
+board this host knows of beyond its local boards: each `sync-shadow/*.db` and each link-only `sync-links/*.db`.
+The id in any of them (fresh or stale), or any of them missing, unreadable, wrong-board, future-dated or stale,
+makes the pass uncertain and discards earlier missing time; only a card absent from all of them (all fresh) is
+observed absent. A host with neither directory keeps the local-boards-plus-projection rule
+(`tests/test_bare_coverage.py`). This escaped `test_board_coverage.py`, which seeded only 3- and 4-part keys, and
+the live check, which filtered timers by `/runners/` instead of by card id.
 The Board shadow is shared across gateways/profiles (not a gateway partition); its `gateway_id` identifies the
 reader, not the owner of every task. This is why coverage is checked by board and presence by id.
 `tests/test_board_coverage.py` exercises full/light readers, first-pass reset, projection failure, >24-hour
