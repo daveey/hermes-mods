@@ -25,6 +25,9 @@ CLOSED = {'done', 'archived'}
 # progress: 'unblocked' is mostly automated wakes (resolved checks, coordinators), and t_e3e216d4 had one every day.
 PROGRESS = ('created', 'completed', 'review_requested', 'changes_requested', 'edited',
             'specified', 'goal_verified', 'pr_acceptance', 'assigned')
+OK_RUN_OUTCOMES = ('completed', 'review_requested', 'changes_requested')
+# A parent in one of these states has a doer on it now: waiting behind it is a handoff, not a watcher chain.
+ACTIVE = {'running', 'ready', 'review'}
 IDLE_HOURS = 24.0
 REFUSE_RUNS = 20
 CHAIN_DEPTH = 4
@@ -85,11 +88,50 @@ def _task(conn, tid):
     return conn.execute('SELECT * FROM tasks WHERE id = ?', (tid,)).fetchone()
 
 
-def _last_progress(conn, task):
+def _max(conn, sql, params):
+    try:
+        row = conn.execute(sql, params).fetchone()
+    except sqlite3.Error:
+        return 0.0  # older/narrower schema: that signal just does not count
+    return float((row[0] if row else 0) or 0)
+
+
+def _own_progress(conn, task):
+    """Latest moment ``task`` itself moved forward."""
+    tid = task['id']
     marks = ','.join('?' * len(PROGRESS))
-    row = conn.execute(f'SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind IN ({marks})',
-                       (task['id'], *PROGRESS)).fetchone()
-    return float(row[0] or task['created_at'] or 0)
+    best = _max(conn, f'SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind IN ({marks})',
+                (tid, *PROGRESS))
+    # A run that ended in a handoff (complete / review) is progress even if the event row is missing.
+    oks = ','.join('?' * len(OK_RUN_OUTCOMES))
+    best = max(best, _max(conn, f'SELECT MAX(COALESCE(ended_at, started_at)) FROM task_runs '
+                                f'WHERE task_id = ? AND outcome IN ({oks})', (tid, *OK_RUN_OUTCOMES)))
+    # Linking a NEW parent hands the next step to a fresh doer (t_01a188c7c974c529 linked a new reviewer per PR
+    # split). The link table's primary key means re-parking behind the same card never writes another 'linked'.
+    best = max(best, _max(conn, "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'linked' "
+                                "AND (payload IS NULL OR json_extract(payload, '$.child') = ?)", (tid, tid)))
+    return best
+
+
+def _active_parents(conn, tid):
+    return [p for p in _open_parents(conn, tid) if p['status'] in ACTIVE]
+
+
+def _last_progress(conn, task):
+    """Own progress, or the progress of the freshest active (running/ready/review) parent it waits on.
+
+    A dependency_wait behind an active parent is a handoff to a doer, so it counts too; behind a parked parent it
+    is the watcher loop this guard exists for (t_e3e216d4) and does not.
+    """
+    best = max(_own_progress(conn, task), float(task['created_at'] or 0))
+    active = _active_parents(conn, task['id'])
+    if active:
+        best = max(best, _max(conn, "SELECT MAX(created_at) FROM task_events WHERE task_id = ? "
+                                    "AND kind = 'dependency_wait'", (task['id'],)))
+        for p in active:
+            best = max(best, _own_progress(conn, p), float(p['created_at'] or 0),
+                       _max(conn, 'SELECT MAX(started_at) FROM task_runs WHERE task_id = ?', (p['id'],)))
+    return best
 
 
 def _open_parents(conn, tid):

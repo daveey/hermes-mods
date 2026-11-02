@@ -36,7 +36,8 @@ H = 3600.0
 
 
 def make_board(path, tasks, links=(), runs=(), events=()):
-    """tasks: (id, status, created_at, human_request). runs: (task_id, started_at). events: (task_id, kind, at)."""
+    """tasks: (id, status, created_at, human_request). runs: (task_id, started_at[, outcome]).
+    events: (task_id, kind, at[, payload])."""
     c = sqlite3.connect(path)
     c.executescript("""
         CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, created_at INTEGER,
@@ -52,11 +53,12 @@ def make_board(path, tasks, links=(), runs=(), events=()):
                   (tid, tid + ' title', status, int(created), hr))
         c.execute('INSERT INTO task_events (task_id, kind, created_at) VALUES (?,?,?)', (tid, 'created', int(created)))
     c.executemany('INSERT INTO task_links VALUES (?,?)', links)
-    for tid, at in runs:
+    for tid, at, *outcome in runs:
         c.execute('INSERT INTO task_runs (task_id, started_at, ended_at, outcome) VALUES (?,?,?,?)',
-                  (tid, int(at), int(at) + 60, 'scheduled'))
-    for tid, kind, at in events:
-        c.execute('INSERT INTO task_events (task_id, kind, created_at) VALUES (?,?,?)', (tid, kind, int(at)))
+                  (tid, int(at), int(at) + 60, outcome[0] if outcome else 'scheduled'))
+    for tid, kind, at, *payload in events:
+        c.execute('INSERT INTO task_events (task_id, kind, created_at, payload) VALUES (?,?,?,?)',
+                  (tid, kind, int(at), json.dumps(payload[0]) if payload else None))
     c.commit()
     c.close()
 
@@ -221,6 +223,75 @@ class Controls(Base):
                 hooks[name] = fn
         guard.register(Ctx())
         self.assertEqual(set(hooks), {'pre_tool_call', 'transform_tool_result'})
+
+
+class CyclingAuthor(Base):
+    """Regression for t_01a19a453972699d (runners board, 2026-11-02 03:20Z).
+
+    Shepherd t_82f80db4 (scheduled, many runs) parked awaiting author t_01a188c7c974c529, which was `todo` only
+    because 7s earlier it had linked a fresh reviewer (running) and gone dependency_wait. The guard measured the
+    author's idleness from its 81h-old 'created' event and refused: "has made no progress in 81h".
+    """
+    S, P, R = 't_82f80db4', 't_01a188c7c974c529', 't_01a19a43ef7fe8b9'
+
+    def board(self, reviewer_status='running', fresh=True):
+        at = NOW - (0.05 * H if fresh else 100 * H)
+        make_board(self.db,
+                   [(self.S, 'scheduled', NOW - 220 * H, None), (self.P, 'todo', NOW - 81 * H, None),
+                    (self.R, reviewer_status, at, None)],
+                   links=[(self.R, self.P)],
+                   runs=[(self.S, NOW - 80 * H + i * H) for i in range(30)]
+                   + [(self.P, NOW - 30 * H + i * H, 'blocked') for i in range(10)]
+                   + ([(self.R, at + 5)] if reviewer_status == 'running' else []),
+                   events=[(self.P, 'linked', at, {'parent': self.R, 'child': self.P}),
+                           (self.P, 'dependency_wait', at + 7, {'reason': 'await reviewer'})])
+
+    def schedule(self):
+        args = {'task_id': self.S, 'reason': 'SCHEDULED_UNTIL=x', 'awaiting': {'kind': 'card', 'ref': self.P}}
+        return guard.pre_tool_call(tool_name='kanban_schedule', args=args), \
+            guard.transform_tool_result(tool_name='kanban_schedule', args=args, result='{"ok": true}')
+
+    def test_todo_author_behind_fresh_running_reviewer_not_refused(self):
+        self.board()
+        pre, post = self.schedule()
+        self.assertIsNone(pre)
+        self.assertIsNone(post)
+
+    def test_long_running_parent_still_counts_via_dependency_wait(self):
+        # The reviewer was created long ago but is running now; the author's own dependency_wait on it is fresh.
+        self.board(fresh=False)
+        sqlite3.connect(self.db).execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?,?,?)",
+                                         (self.P, 'dependency_wait', int(NOW - 0.1 * H))).connection.commit()
+        self.assertEqual(self.schedule(), (None, None))
+
+    def test_fresh_link_counts_without_active_parent(self):
+        # Reviewer already done (link closed): the fresh 'linked' handoff itself is the author's progress.
+        self.board(reviewer_status='done')
+        self.assertEqual(self.schedule(), (None, None))
+
+    def test_handoff_run_outcome_counts(self):
+        make_board(self.db, [('t_P', 'todo', NOW - 200 * H, None), ('t_C', 'running', NOW - 220 * H, None)],
+                   runs=[('t_P', NOW - 2 * H, 'review_requested')] + [('t_C', NOW - 100 * H + i) for i in range(30)])
+        self.assertIsNone(guard.pre_tool_call(tool_name='kanban_link', args={'parent_id': 't_P', 'child_id': 't_C'}))
+
+    def test_dependency_wait_behind_parked_parent_still_refused(self):
+        # The watcher loop (t_e3e216d4): fresh dependency_waits, but the parent is parked and the link is old.
+        make_board(self.db, [('t_A', 'scheduled', NOW - 120 * H, None), ('t_B', 'todo', NOW - 200 * H, None),
+                             ('t_C', 'running', NOW - 220 * H, None)],
+                   links=[('t_A', 't_B')], runs=[('t_C', NOW - 100 * H + i * H) for i in range(25)],
+                   events=[('t_B', 'linked', NOW - 190 * H, {'parent': 't_A', 'child': 't_B'})]
+                   + [('t_B', 'dependency_wait', NOW - i * H) for i in range(1, 10)])
+        out = guard.pre_tool_call(tool_name='kanban_link', args={'parent_id': 't_B', 'child_id': 't_C'})
+        self.assertEqual(out['action'], 'block')
+        self.assertIn('t_B is itself waiting on t_A', out['message'])
+
+    def test_dependency_wait_without_parents_still_idle(self):
+        make_board(self.db, [('t_B', 'todo', NOW - 200 * H, None), ('t_C', 'running', NOW - 220 * H, None)],
+                   runs=[('t_C', NOW - 100 * H + i * H) for i in range(25)],
+                   events=[('t_B', 'dependency_wait', NOW - i * H) for i in range(1, 10)])
+        out = guard.pre_tool_call(tool_name='kanban_link', args={'parent_id': 't_B', 'child_id': 't_C'})
+        self.assertEqual(out['action'], 'block')
+        self.assertIn('t_B has made no progress', out['message'])
 
 
 if __name__ == '__main__':

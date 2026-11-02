@@ -12,8 +12,12 @@ read-only. The card waited on is **stalled** when it is `todo`/`scheduled`/`bloc
 - has made no progress for 24 h.
 
 Progress means a `created`, `completed`, `review_requested`, `changes_requested`, `edited`, `specified`,
-`goal_verified`, `pr_acceptance` or `assigned` event. Wakes, unblocks, claims, runs, parks, comments and links
-don't count.
+`goal_verified`, `pr_acceptance` or `assigned` event; a run that ended `completed`/`review_requested`/
+`changes_requested`; or a `linked` event where the card linked itself behind a new parent (the link key means
+re-parking behind the same card never writes another one). When the card has an open parent that is active
+(`running`, `ready`, `review`), its `dependency_wait` events and that parent's own progress and latest run start
+count too: waiting on a doer is a handoff. Wakes, unblocks, claims, other runs, heartbeats and comments don't
+count, and a `dependency_wait` behind a parked parent is the watcher loop, so it doesn't either.
 
 - Stalled parent: the result gets a `warning`, e.g. `t_B is itself waiting on t_A (scheduled, idle 120h); ...
   parking here is not a started fix: do the step yourself, re-place the card, complete it with what is proven
