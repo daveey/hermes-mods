@@ -3,6 +3,7 @@ watchdog. No Hermes imports at module level; everything that touches Hermes is p
 tests run on throwaway SQLite files."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -277,6 +278,17 @@ def is_unknown(card: Optional[dict[str, Any]]) -> bool:
     return card is None or (bool(card.get("remote")) and card.get("stale") is not False)
 
 
+def is_working(card: Optional[dict[str, Any]]) -> bool:
+    """Found and still doing work by its STATUS: readable, not settled, and not done/archived. A remote done row that
+    cannot settle (origin without binding, owner not attesting the close) is not working: it is unresolved."""
+    return not is_unknown(card) and not is_settled(card) and (card or {}).get("status") not in DONE_STATUSES
+
+
+def is_unresolved(card: Optional[dict[str, Any]]) -> bool:
+    """Nothing can move this entry on: unknown (missing, stale), or finished by status yet never settled."""
+    return is_unknown(card) or (not is_settled(card) and (card or {}).get("status") in DONE_STATUSES)
+
+
 def needs_human(card: Optional[dict[str, Any]]) -> bool:
     return bool(card) and is_settled(card) and card.get("status") not in DONE_STATUSES
 
@@ -380,10 +392,14 @@ def uncovered(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> list[str
 
 
 def closeout_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optional[str]:
-    """Wake/close-out key: the id set of the settled cards not yet covered by a close-out. Statuses are not part of
-    it, so settled->settled churn (blocked->archived, done->archived) never makes a new key; only a card that was
-    not reported yet does."""
-    new = uncovered(row, cards)
+    """Wake/close-out key: the id set of the settled cards not yet covered by a close-out, plus the entries unlinked
+    since the last one (``unlinked_removed``: even when nothing else is left, they get one close-out). Statuses are
+    not part of it, so settled->settled churn (blocked->archived, done->archived) never makes a new key; only a
+    card that was not reported yet does."""
+    batch = row.get("batch") or []
+    if batch and not settled_sig(batch, cards):
+        return None  # an unlinked entry waits for the batch's close-out like any settled card
+    new = uncovered(row, cards) + [f"unlinked:{k}" for k in unlinked_removed(row)]
     return hashlib.sha1(";".join(new).encode()).hexdigest()[:16] if new else None
 
 
@@ -463,6 +479,8 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
     for k in batch - missing:
         if cards.get(k) is not None and k in state and "removed" not in state[k]:
             state.pop(k)  # found again: a later absence starts its own clock
+        elif cards.get(k) is None and k in state and "removed" not in state[k]:
+            state[k]["mono"] = None  # unresolved this pass (uncertain): not observation, the next one starts anew
     is_healthy: Optional[bool] = None
     removed: set[str] = set()
     for k in sorted(missing):
@@ -501,12 +519,48 @@ def unlinked_removed(row: dict[str, Any]) -> list[str]:
     return sorted(k for k, v in (row.get("unlinked") or {}).items() if isinstance(v, dict) and "removed" in v)
 
 
+UNLINK_MAX_TRIES = 3      # close-out turns that failed to deliver an unlinked mention before it is dropped
+UNLINK_RETRY_S = 600.0    # backoff before a failed close-out turn's unlinked mention is woken again
+
+
 def without_removed(unlinked: Optional[dict]) -> dict:
     return {k: v for k, v in (unlinked or {}).items() if not (isinstance(v, dict) and "removed" in v)}
 
 
+def briefed(unlinked: Optional[dict], now: float) -> dict:
+    """``unlinked`` with each removed entry marked as named by the close-out brief starting now. Only the end of a
+    successful close-out turn forgets it (``record_turn_end``); a failed turn names it again."""
+    return {k: ({**v, "briefed": now} if isinstance(v, dict) and "removed" in v else v)
+            for k, v in (unlinked or {}).items()}
+
+
+def settle_unlinked(row: dict[str, Any], succeeded: bool, now: float) -> tuple[dict, bool]:
+    """At a close-out turn's end: ``(unlinked, retry)``. A successful turn forgets the removed entries its brief
+    named; a failed one keeps them (one try spent; dropped with a WARNING after ``UNLINK_MAX_TRIES``) and asks for
+    another close-out (``retry``)."""
+    out, retry, dropped = {}, False, []
+    for k, v in (row.get("unlinked") or {}).items():
+        if not (isinstance(v, dict) and "removed" in v and "briefed" in v):
+            out[k] = v
+            continue
+        if succeeded:
+            continue
+        tries = int(v.get("tries") or 0) + 1
+        if tries >= UNLINK_MAX_TRIES:
+            dropped.append(k)
+            continue
+        out[k] = {**{f: x for f, x in v.items() if f != "briefed"}, "tries": tries}
+        retry = True
+    if dropped:
+        logger.warning("chat-closeout: %s: %d close-out turn(s) failed to name unlinked %s; dropped",
+                       row.get("session_id"), UNLINK_MAX_TRIES, ", ".join(sorted(dropped)))
+    return out, retry
+
+
 # ---- one-time upgrade: shepherd rows that finished before they could settle ------------------------------------
-UPGRADE_SHEPHERD_KEY = "upgrade:shepherd-settle-v1"
+UPGRADE_SHEPHERD_KEY = "upgrade:shepherd-settle-v1"            # set once every snapshot entry was observed
+UPGRADE_CUTOFF_KEY = "upgrade:shepherd-settle-v1:cutoff"       # wall time of the first upgrade pass
+UPGRADE_PENDING_KEY = "upgrade:shepherd-settle-v1:pending"     # {sid: [entries not observed yet]}
 
 
 def shepherd_finished(card: Optional[dict[str, Any]]) -> bool:
@@ -514,31 +568,67 @@ def shepherd_finished(card: Optional[dict[str, Any]]) -> bool:
                 and card.get("status") in DONE_STATUSES)
 
 
-def upgrade_shepherd_rows(ledger: "Ledger", read: Callable[[list[str]], dict]) -> bool:
+def _snapshot_entry(key: str, batch: set[str]) -> Optional[str]:
+    """The batch entry a snapshot entry is now: itself, or the canonical key a legacy bare / 3-part spelling was
+    rewritten to since (the one 4-part batch key with its card id). None when it left the batch."""
+    if key in batch:
+        return key
+    parts = key.split("/")
+    if len(parts) in (1, 3):
+        twins = [b for b in batch if b.count("/") == 3 and b.rsplit("/", 1)[-1] == parts[-1]]
+        if len(twins) == 1:
+            return twins[0]
+    return None
+
+
+def upgrade_shepherd_rows(ledger: "Ledger", read: Callable[[list[str]], dict], now: Optional[float] = None) -> bool:
     """Cover, silently, the shepherd cards that finished while no release could settle them: they would otherwise
-    all close out at once on upgrade. Finished entries leave the batch (as a close-out leaves them), one INFO line
-    per changed row; nothing wakes. True when complete: the inventory was readable and no batch entry is a stale
-    shepherd row (that one could still turn out finished). Incomplete passes retry; the durable marker is set only
-    on completion, so later finishes close out normally."""
-    complete = True
-    for row in ledger.pending():
-        cards = read(row["batch"])
-        if not getattr(cards, "readable", True):
-            complete = False
-        if any(c and c.get("remote") and c.get("via") == "shepherd" and c.get("stale") is not False
-               for c in cards.values()):
-            complete = False
-        fin = {k for k in row["batch"] if shepherd_finished(cards.get(k))}
+    all close out at once on upgrade.
+
+    The first pass records a durable cutoff (its wall time) and a snapshot of every batch entry then in the ledger.
+    Only a snapshot entry can be covered here, and only when it is first observed (fresh) as a finished shepherd row
+    whose completion time is unknown or not after the cutoff. Its first fresh observation resolves it either way:
+    a card seen working, a finish after the cutoff, a local card, or an entry missing from a readable inventory is
+    left to the normal path for good. Entries added after the cutoff are never touched. Finished entries leave the
+    batch (as a close-out leaves them), one INFO line per changed row; nothing wakes. True (and the done marker
+    set) once every snapshot entry was observed or left its batch; until then it retries."""
+    now = time.time() if now is None else now
+    first = ledger.meta_get(UPGRADE_CUTOFF_KEY) is None
+    snapshot = {r["session_id"]: list(r["batch"]) for r in ledger.pending()} if first else {}
+    cutoff, pending = ledger.upgrade_begin(now, snapshot)
+    resolved: dict[str, set[str]] = {}
+    for sid, keys in pending.items():
+        row = ledger.get(sid) or {}
+        batch = set(row.get("batch") or [])
+        now_key = {k: _snapshot_entry(k, batch) for k in keys}
+        done = resolved.setdefault(sid, {k for k, b in now_key.items() if b is None})  # left the batch
+        live = {k: b for k, b in now_key.items() if b is not None}
+        if not live:
+            continue
+        cards = read(sorted(set(live.values())))
+        readable = getattr(cards, "readable", True)
+        uncertain = getattr(cards, "uncertain", frozenset())
+        fin: set[str] = set()
+        for k, b in live.items():
+            c = cards.get(b)
+            if c is None:
+                if readable and b not in uncertain:
+                    done.add(k)  # missing from a readable inventory: not a shepherd finish (unlinking handles it)
+                continue
+            if c.get("remote") and c.get("stale") is not False:
+                continue  # not observed yet: it could still turn out finished before the cutoff
+            done.add(k)
+            at = c.get("completed_at")
+            if shepherd_finished(c) and (at is None or float(at) <= cutoff):
+                fin.add(b)
         if not fin:
             continue
-        batch = set(row["batch"]) - fin
-        ledger.write(row["session_id"], batch=batch, covered=set(row.get("covered") or []) - fin,
-                     relayed={p for p in row.get("relayed") or [] if _premise_card(p) in batch})
+        rest = batch - fin
+        ledger.write(sid, batch=rest, covered=set(row.get("covered") or []) - fin,
+                     relayed={p for p in row.get("relayed") or [] if _premise_card(p) in rest})
         logger.info("chat-closeout: upgrade covered %d shepherd-finished card(s) of %s without a wake: %s",
-                    len(fin), row["session_id"], ", ".join(sorted(fin)))
-    if complete:
-        ledger.meta_set(UPGRADE_SHEPHERD_KEY, str(time.time()))
-    return complete
+                    len(fin), sid, ", ".join(sorted(fin)))
+    return ledger.upgrade_resolve(resolved, now)
 
 
 def pending_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optional[str]:
@@ -767,11 +857,12 @@ class Ledger:
         return _row(r)
 
     def pending(self) -> list[dict[str, Any]]:
-        """Rows still holding a batch (not closed out)."""
+        """Rows still holding a batch, or an unlinked entry no close-out has named yet (not closed out)."""
         with self._lock:
             c = self._conn()
             try:
-                rows = c.execute("SELECT * FROM waiting WHERE batch != '[]'").fetchall()
+                rows = c.execute("SELECT * FROM waiting WHERE batch != '[]' "
+                                 "OR unlinked LIKE '%\"removed\"%'").fetchall()
             finally:
                 c.close()
         return [_row(r) for r in rows]
@@ -908,6 +999,65 @@ class Ledger:
                 c.close()
         return {sid: have[sid] for sid in current}
 
+    def upgrade_begin(self, now: float, snapshot: dict[str, list[str]]) -> tuple[float, dict[str, list[str]]]:
+        """``(cutoff, entries not observed yet)`` of the one-time shepherd upgrade. The first call (any process)
+        records ``now`` as the cutoff and ``snapshot`` as the entries to observe, atomically; later calls return
+        what is stored."""
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                r = c.execute("SELECT v FROM meta WHERE k=?", (UPGRADE_CUTOFF_KEY,)).fetchone()
+                if r is None:
+                    c.execute("INSERT INTO meta (k, v) VALUES (?, ?)", (UPGRADE_CUTOFF_KEY, repr(float(now))))
+                    c.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)",
+                              (UPGRADE_PENDING_KEY, json.dumps({k: sorted(v) for k, v in snapshot.items() if v},
+                                                               sort_keys=True)))
+                    cutoff = float(now)
+                else:
+                    cutoff = float(r[0])
+                p = c.execute("SELECT v FROM meta WHERE k=?", (UPGRADE_PENDING_KEY,)).fetchone()
+                c.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(sqlite3.Error):
+                    c.execute("ROLLBACK")
+                raise
+            finally:
+                c.close()
+        try:
+            pending = {str(k): list(v) for k, v in json.loads(p[0] if p else "{}").items()}
+        except (ValueError, TypeError, AttributeError):
+            pending = {}
+        return cutoff, pending
+
+    def upgrade_resolve(self, resolved: dict[str, set[str]], now: float) -> bool:
+        """Drop observed entries from the upgrade's pending snapshot (read-modify-write in one transaction, so
+        concurrent passes never resurrect an entry). Sets the done marker and returns True once none is left."""
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                p = c.execute("SELECT v FROM meta WHERE k=?", (UPGRADE_PENDING_KEY,)).fetchone()
+                try:
+                    pending = dict(json.loads(p[0] if p else "{}"))
+                except (ValueError, TypeError):
+                    pending = {}
+                left = {sid: sorted(set(keys) - set(resolved.get(sid) or ())) for sid, keys in pending.items()}
+                left = {sid: keys for sid, keys in left.items() if keys}
+                c.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)",
+                          (UPGRADE_PENDING_KEY, json.dumps(left, sort_keys=True)))
+                if not left:
+                    c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES (?, ?)",
+                              (UPGRADE_SHEPHERD_KEY, repr(float(now))))
+                c.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(sqlite3.Error):
+                    c.execute("ROLLBACK")
+                raise
+            finally:
+                c.close()
+        return not left
+
     def meta_get(self, key: str) -> Optional[str]:
         with self._lock:
             c = self._conn()
@@ -938,8 +1088,8 @@ def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict],
         sid = row["session_id"]
         fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
         row = {**row, **fix}
-        if row["batch"] and pending_key(row, cards):
-            out[sid] = sorted(row["batch"])
+        if (row["batch"] or unlinked_removed(row)) and pending_key(row, cards):
+            out[sid] = sorted(row["batch"]) or unlinked_removed(row)
     return out
 
 
@@ -965,14 +1115,17 @@ def _row(r) -> Optional[dict[str, Any]]:
 
 # ---- turn end --------------------------------------------------------------------------------------------------
 def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Callable[[list[str]], dict],
-                    now: Optional[float] = None, observed_sig: Optional[str] = None) -> dict[str, Any]:
+                    now: Optional[float] = None, observed_sig: Optional[str] = None,
+                    succeeded: bool = True) -> dict[str, Any]:
     """Stamp ``waiting_on`` for the chat at a turn end. Every card it handed work to joins the batch.
 
     A turn is a close-out when it was briefed on the settled batch (``observed_sig`` from ``pre_llm_call``) or was
     started by the waker (``closing`` in the ledger). Only then are the batch's settled cards marked covered,
     including cards the close-out turn itself created that are already settled (a needs_input card): those must
     not make the batch "newly settled" and wake the chat again. An ordinary turn during which a card finished
-    covers nothing, so it can't silently acknowledge a handoff nobody saw."""
+    covers nothing, so it can't silently acknowledge a handoff nobody saw. ``succeeded`` (the turn ended in a
+    successful final reply): only then are the unlinked entries its brief named forgotten; a failed close-out turn
+    keeps them for another close-out (``settle_unlinked``)."""
     now = time.time() if now is None else now
     row = ledger.get(sid) or {}
     open_now = set(open_ids)
@@ -1005,6 +1158,11 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
         covered -= gone
         fields["relayed"] = {p for p in fields["relayed"] if _premise_card(p) in batch}
         fields["closing"] = None
+        unlinked, retry = settle_unlinked({**row, "session_id": sid}, succeeded, now)
+        if unlinked != (row.get("unlinked") or {}):
+            fields["unlinked"] = unlinked
+        if retry:  # the mention was not delivered: another close-out, after a shared backoff
+            fields.update(done_sig=None, claim_sig=None, retry_after=now + UNLINK_RETRY_S)
     fields["batch"], fields["covered"] = batch, covered
     if not batch and not row:
         return {"open": [], "batch": []}
@@ -1148,7 +1306,9 @@ def ask_notice_text(cards: dict[str, dict[str, Any]], ids: Iterable[str]) -> str
 
 
 def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: Optional[float] = None) -> str:
-    lines = [f"{TAG} Every kanban card this chat handed work to has settled. This turn is the close-out:"]
+    lines = [f"{TAG} Every kanban card this chat handed work to has settled. This turn is the close-out:"
+             if row.get("batch") else
+             f"{TAG} This chat no longer waits on the card(s) below. This turn is the close-out:"]
     for tid in sorted(row.get("batch") or []):
         c = cards.get(tid)
         if c is None:
@@ -1173,6 +1333,9 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
 
 def notice_text(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> str:
     n = len(row.get("batch") or [])
+    if not n:
+        gone = len(unlinked_removed(row))
+        return f"Close-out: {gone} card{'s' if gone != 1 else ''} no longer linked to this chat"
     waiting = [i for i in row.get("batch") or [] if needs_human(cards.get(i))
                and (cards.get(i) or {}).get("status") in ("blocked", "triage")
                and (cards.get(i) or {}).get("block_kind") not in NONHUMAN_BLOCK_KINDS]

@@ -182,7 +182,15 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
     row with no completion time takes it from another inventory row of the same owner key, else the hub replica,
     so its transcript acknowledgement can be proven."""
     uncertain: set[str] = set()
-    cards = core.read_cards(board_paths(), ids, light=light, uncertain_out=uncertain)
+    want = set(ids)
+    # Every key's card id is also looked up as a bare id on every local board: a missing 2/3/4-part key whose id
+    # some local card carries is not "matches nothing" (never unlinked), and a 3-part legacy key with a local card
+    # of that id never migrates to a remote owner.
+    probe = want | {str(i).rsplit('/', 1)[-1] for i in want if '/' in str(i)}
+    cards = core.read_cards(board_paths(), probe, light=light, uncertain_out=uncertain)
+    local_ids = {str(k).rsplit('/', 1)[-1] for k in cards} | {str(k).rsplit('/', 1)[-1] for k in uncertain}
+    cards = {k: v for k, v in cards.items() if k in want}
+    uncertain &= want
     out = core.Cards()
     try:
         remote = (remote_inventory or remote_cards)()
@@ -194,8 +202,6 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
         out.uncertain = frozenset(uncertain | {i for i in ids if i not in out})
         out.readable = False
         return out
-    want = set(ids)
-    local_bare = {i for i in want if '/' not in i and (i in cards or i in uncertain)}
     # Every key shape ends in the card id except a legacy remote row's stored ``key`` (then card_key IS that key):
     # only cards that could hit ``want`` pay for card_key (the inventory holds thousands of rows; a pass wants a
     # few hundred ids).
@@ -222,14 +228,14 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
         cards[key] = merged[key]
     for key in want - set(cards):
         parts = key.split('/')
-        if len(parts) not in (1, 3) or key in local_bare:
-            continue
         owners = by_id.get(parts[-1]) or set()
-        if len(owners) == 1:
+        if parts[-1] in local_ids:
+            uncertain.add(key)  # a local card has this id: neither migrated nor ever unlinked
+        elif len(parts) in (1, 3) and len(owners) == 1:
             canonical = next(iter(owners))
             cards[key] = {**merged[canonical], 'canonical_key': canonical}
         elif owners:
-            uncertain.add(key)
+            uncertain.add(key)  # several owners, or another owner key than this one: not "matches nothing"
     fill = [c for c in cards.values() if c.get('remote') and c.get('via') == 'shepherd'
             and c.get('status') in core.DONE_STATUSES and c.get('completed_at') is None]
     if fill:
@@ -436,7 +442,25 @@ def _eligible(session_id: str, platform: str = "") -> bool:
 
 
 # ---- hooks -----------------------------------------------------------------------------------------------------
-def post_llm_call(session_id: str = "", platform: str = "", **_: Any) -> None:
+def _turn_succeeded(conversation_history: Any) -> bool:
+    """The turn ended in a successful final reply: its last assistant message has text, no tool calls, a final
+    display kind and ``finish_reason`` stop/end_turn (the transcript ack rule, ``core.AckIndex``). No history (an
+    older core that passes none) keeps the previous behaviour: post_llm_call only fires for an uninterrupted
+    turn with a response."""
+    if not isinstance(conversation_history, list):
+        return True
+    for msg in reversed(conversation_history):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        text = content if isinstance(content, str) else " ".join(
+            str(p.get("text") or "") for p in content if isinstance(p, dict)) if isinstance(content, list) else ""
+        return (bool(text.strip()) and not msg.get("tool_calls") and msg.get("finish_reason") in ("stop", "end_turn")
+                and msg.get("display_kind") in (None, "", "final"))
+    return False
+
+
+def post_llm_call(session_id: str = "", platform: str = "", conversation_history: Any = None, **_: Any) -> None:
     """Waiting ledger: every turn end stamps ``waiting_on`` (the chat's open cards)."""
     if not _eligible(session_id, platform):
         return
@@ -445,7 +469,7 @@ def post_llm_call(session_id: str = "", platform: str = "", **_: Any) -> None:
         observed = _state.setdefault("observed", {}).pop(session_id, None)
         asked = _state.setdefault("observed_ask", {}).pop(session_id, None)
         out = core.record_turn_end(ledger(), session_id, open_card_ids(session_id), read_cards,
-                                   observed_sig=observed)
+                                   observed_sig=observed, succeeded=_turn_succeeded(conversation_history))
         if asked:
             row = ledger().get(session_id) or {}
             batch = set(row.get("batch") or [])
@@ -470,14 +494,14 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         _state.setdefault("observed_ask", {}).pop(session_id, None)
         _upgraded()
         row = ledger().get(session_id)
-        if not row or not row.get("batch"):
+        if not row or not (row.get("batch") or core.unlinked_removed(row)):
             return None
         cards = read_cards(row["batch"])
         fix = core.reconcile_done(row, cards, lambda t, c: session_proof(session_id, t, c))
         if fix:
             ledger().write(session_id, **fix)
             row = {**row, **fix}
-            if not row["batch"]:
+            if not row["batch"] and not core.unlinked_removed(row):
                 return None
         key = core.pending_key(row, cards)
         if not key and row.get("closing") is None:
@@ -490,7 +514,7 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         _state["observed"][session_id] = key
         prompt = core.closeout_prompt(row, cards, now=time.time())
         # the brief names each unlinked entry; this turn is its one mention
-        ledger().write(session_id, closing=sorted(row["batch"]), unlinked=core.without_removed(row.get("unlinked")))
+        ledger().write(session_id, closing=sorted(row["batch"]), unlinked=core.briefed(row.get("unlinked"), time.time()))
         return {"context": prompt}
     except Exception:
         logger.debug("chat-closeout pre_llm_call failed", exc_info=True)
@@ -658,7 +682,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         if fix:
             led.write(sid, **fix)
             row = {**row, **fix}
-            if not row["batch"]:
+            if not row["batch"] and not core.unlinked_removed(row):
                 continue
         key = core.pending_key(row, cards)
         if key and key != row.get("settled_sig"):
@@ -685,7 +709,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         prompt = core.closeout_prompt(row, cards, now=now)  # names each unlinked entry: this turn is its mention
         led.write(sid, covered=set(row.get("covered") or []) | set(new_ids), closing=sorted(row["batch"]),
                   wakes=wakes, wake_count=int(row.get("wake_count") or 0) + 1,
-                  unlinked=core.without_removed(row.get("unlinked")))
+                  unlinked=core.briefed(row.get("unlinked"), now))
         try:
             result = wake(sid, prompt, display_kind="kanban_notice",
                           display_metadata={"display_text": core.notice_text(row, cards), "closeout": True,
@@ -1160,8 +1184,8 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
     stuck: dict[str, list[str]] = {}
     for row in led.pending():
         cards = read(row["batch"])
-        unknown = [t for t in row["batch"] if core.is_unknown(cards.get(t))]
-        working = [t for t in row["batch"] if not core.is_unknown(cards.get(t)) and not core.is_settled(cards.get(t))]
+        unknown = [t for t in row["batch"] if core.is_unresolved(cards.get(t))]
+        working = [t for t in row["batch"] if core.is_working(cards.get(t))]
         if unknown and not working:
             stuck[row["session_id"]] = unknown
     for sid, since in led.stuck_since(stuck, now).items():
@@ -1172,9 +1196,11 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
             continue
         candidates.append((key, f"Chat {sid} waits on cards nothing can find",
                            f"Chat {sid} has waited {int((now - since) / 3600)} h on card(s) that no board or remote "
-                           f"inventory resolves ({', '.join(stuck[sid][:6])}) and nothing it waits on is still "
-                           "working, so no close-out can run. Check whether these cards moved, were deleted, or "
-                           "are on a gateway this one no longer syncs; reconcile the ledger row or restore the "
+                           f"inventory resolves or settles ({', '.join(stuck[sid][:6])}: missing, stale, or done "
+                           "without owner evidence such as an origin binding) and nothing it waits on is still "
+                           "working, so no close-out can run. Check whether these cards moved, were deleted, "
+                           "are on a gateway this one no longer syncs, or lack their owner's release; reconcile the "
+                           "ledger row or restore the "
                            "link. Entries missing through 24 h of fresh inventory reads are unlinked automatically."))
     for handoff in routing.stalled(led, now, 0):
         key = f"chat-closeout:handoff:{handoff['id']}"
@@ -1268,7 +1294,7 @@ def start_thread() -> Optional[threading.Event]:
 
 
 def register(ctx) -> None:
-    logger.info("chat-closeout: loaded shepherd-settle-v6 module=%s core=%s", __file__, core.__file__)
+    logger.info("chat-closeout: loaded shepherd-settle-v7 module=%s core=%s", __file__, core.__file__)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("pre_final_gate", pre_final_gate)
