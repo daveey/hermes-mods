@@ -1014,3 +1014,45 @@ def test_round6_restores_are_refused(multi, template):
         assert _blocked(cmd, main), cmd  # static only: vim may be absent or interactive
         return
     _assert_real_restore(cmd, main, wt)
+
+
+# --- `[` test builtin: a lone `[` / `]` is literal, not a bracket glob ---
+
+# Refused on hermes-hub as `git stash pop` (no git, no stash in it): the unquoted `[` of
+# `[ -f $db ]` was read as a glob, the command name became unknown and was re-read as git.
+SQLITE_LOOP_REPORTED = (
+    "cd ~/.hermes/kanban/boards; for b in */; do db=$b/kanban.db; [ -f $db ] || continue; "
+    "sqlite3 -readonly $db \"select '$b',r.task_id,... where e.kind='claimed' and e.payload "
+    "like '%\\\"holder\\\":\\\"worker-1\\\"%' ...\" 2>/dev/null; done; "
+    "sqlite3 -readonly ~/.hermes/kanban.db \"select ... title like '%portable%'\""
+)
+SQLITE_LOOP_FULL = (
+    "cd ~/.hermes/kanban/boards; for b in */; do db=$b/kanban.db; [ -f $db ] || continue; "
+    "sqlite3 -readonly $db \"select '$b',r.task_id,r.status from task_runs r join task_events e "
+    "on e.task_id=r.task_id where e.kind='claimed' and e.payload like "
+    "'%\\\"holder\\\":\\\"worker-1\\\"%' order by r.id desc limit 5\" 2>/dev/null; done; "
+    "sqlite3 -readonly ~/.hermes/kanban.db \"select id,title,status from tasks "
+    "where title like '%portable%'\""
+)
+
+
+@pytest.mark.parametrize("cmd", [SQLITE_LOOP_REPORTED, SQLITE_LOOP_FULL,
+                                 "for b in */; do [ -f $b/x ] || continue; done",
+                                 "x=$(ls); [ -n $x ] && echo ok"])
+def test_test_bracket_with_unknown_operand_is_not_a_restore(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not _blocked(cmd, main), cmd
+
+
+@pytest.mark.parametrize("template", [
+    "for b in */; do [ -f $b/x ] || continue; git -C {wt} stash pop; done",
+    "[ -f nothing ] || git -C {wt} stash pop",
+    "g[i]t -C {wt} stash pop",
+    "x=$(ls); [ -n $x ] && git -C $x stash pop",
+    "for b in */; do [ -d $b ] && $b -C {wt} stash pop; done",
+])
+def test_bracket_controls_still_refuse(multi, template):
+    main, wt = multi
+    cmd = template.format(wt=wt)
+    assert _blocked(cmd, main), cmd

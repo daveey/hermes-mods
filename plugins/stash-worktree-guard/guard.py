@@ -185,7 +185,9 @@ def _expand_word(raw: str, variables: dict) -> Optional[str]:
             out.append(value)
             i += len(match[0])
             continue
-        elif (char == "`" and quote != "'") or (quote is None and char in "*?[]()"):
+        elif (char == "`" and quote != "'") or (quote is None and char in "*?()"):
+            return None
+        elif char == "[" and quote is None and _glob_bracket(raw, i):
             return None
         elif char == "{" and quote is None and _brace_expansion(raw, i):
             return None  # {a,b} / {1..3} brace expansion is not modeled
@@ -247,6 +249,15 @@ def _brace_expansion(raw: str, i: int) -> bool:
     """Conservative: an unquoted ``{`` with a later ``}`` and a ``,`` or ``..`` between."""
     j = raw.find("}", i + 1)
     return j > 0 and ("," in raw[i + 1:j] or ".." in raw[i + 1:j])
+
+
+def _glob_bracket(raw: str, i: int) -> bool:
+    """Conservative: an unquoted ``[`` opens a bracket glob only with a later ``]``.
+
+    Bash leaves a ``[`` with no closing ``]`` (the ``[`` test builtin) and a lone ``]``
+    literal, so neither makes the word unknown.
+    """
+    return "]" in raw[i + 1:]
 
 
 def _splittable(raw: str) -> bool:
