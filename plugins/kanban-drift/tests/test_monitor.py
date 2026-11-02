@@ -151,3 +151,78 @@ def test_malformed_command_preserves_exit_diagnostic():
 def test_invalid_output_and_unreachable_are_unavailable():
     assert monitor.collect([sys.executable, "-c", "print('not json')"])["unavailable"]
     assert monitor.collect(["/nonexistent/drift-fixture"])["unavailable"]
+
+
+def _run_main(tmp_path, monkeypatch, targets, now, tools=None, **extra):
+    from types import SimpleNamespace
+    from hermes_cli import kanban_sync_client as client
+    config = tmp_path / "config.json"
+    state = tmp_path / "state.json"
+    config.write_text(json.dumps({"owner_gateway": "owner", "state_path": str(state), "targets": targets, **extra}))
+    monkeypatch.setattr(sys, "argv", ["monitor", "--config", str(config)])
+    monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="owner"))
+    monkeypatch.setattr(monitor, "native_tool", tools or Tools())
+    import time as real_time
+    from types import SimpleNamespace as NS
+    monkeypatch.setattr(monitor, "time", NS(**{**vars(real_time), "time": lambda: now}))
+    code = monitor.main()
+    return code, json.loads(state.read_text())
+
+
+def _emit(payload, code=0):
+    return [sys.executable, "-c", f"import sys; print({json.dumps(payload)!r}); sys.exit({code})"]
+
+
+ASLEEP = ["/nonexistent/drift-fixture-asleep"]
+
+
+def test_main_unavailable_target_within_threshold_exits_zero(tmp_path, monkeypatch, capsys):
+    code, state = _run_main(tmp_path, monkeypatch, {"hub/default": _emit(CLEAN), "laptop/default": ASLEEP}, 1000.0)
+    assert code == 0
+    assert state["targets"]["laptop/default"]["unavailable_since"] == 1000.0
+    assert "unavailable_since" not in state["targets"]["hub/default"] or state["targets"]["hub/default"]["unavailable_since"] is None
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["stale_targets"] == []
+    # A second dark sample keeps the first-seen time; still under the default 6 h threshold.
+    code, state = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 1000.0 + 21600)
+    assert code == 0
+    assert state["targets"]["laptop/default"]["unavailable_since"] == 1000.0
+
+
+def test_main_unavailable_past_threshold_exits_one_and_lists_stale(tmp_path, monkeypatch, capsys):
+    _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 1000.0)
+    capsys.readouterr()
+    code, _ = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 1000.0 + 21601)
+    assert code == 1
+    assert json.loads(capsys.readouterr().out)["stale_targets"] == ["laptop/default"]
+
+
+def test_main_per_target_threshold_map(tmp_path, monkeypatch, capsys):
+    targets = {"laptop/default": ASLEEP, "server/default": ASLEEP}
+    limits = {"unavailable_alert_after": {"laptop/default": 43200}}
+    _run_main(tmp_path, monkeypatch, targets, 0.0, **limits)
+    capsys.readouterr()
+    code, _ = _run_main(tmp_path, monkeypatch, targets, 30000.0, **limits)
+    assert code == 1
+    assert json.loads(capsys.readouterr().out)["stale_targets"] == ["server/default"]
+    code, _ = _run_main(tmp_path, monkeypatch, targets, 43201.0, **limits)
+    assert json.loads(capsys.readouterr().out)["stale_targets"] == ["laptop/default", "server/default"]
+
+
+@pytest.mark.parametrize("payload, code", [(CLEAN, 0), (DIRTY, 1)])
+def test_main_real_sample_clears_unavailable_since(tmp_path, monkeypatch, payload, code):
+    _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 1000.0)
+    rc, state = _run_main(tmp_path, monkeypatch, {"laptop/default": _emit(payload, code)}, 2000.0)
+    assert rc == 0
+    assert state["targets"]["laptop/default"]["unavailable_since"] is None
+    _, state = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 99999.0)
+    assert state["targets"]["laptop/default"]["unavailable_since"] == 99999.0
+
+
+def test_main_consumer_error_still_exits_one(tmp_path, monkeypatch):
+    def broken(name, args):
+        raise RuntimeError("fixture tool failure")
+    tools = Tools()
+    _run_main(tmp_path, monkeypatch, {"host/default": _emit(DIRTY, 1)}, 1.0, tools=tools)
+    code, _ = _run_main(tmp_path, monkeypatch, {"host/default": _emit(DIRTY, 1)}, 2.0, tools=broken)
+    assert code == 1

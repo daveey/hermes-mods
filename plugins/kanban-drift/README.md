@@ -16,6 +16,13 @@ samples. A state-file flock prevents concurrent consumers; file writes are atomi
 Command errors, malformed output and non-boolean clean values are unavailable, never clean.
 The consumer verifies its configured gateway before running any command or writing state.
 
+Each target row records `unavailable_since` (first unavailable sample of the current dark period;
+cleared by any real clean or dirty sample). Exit codes: `0` when every target was sampled or has been
+unavailable for at most `unavailable_alert_after` seconds (default 21600 = 6 h; an int, or a map of
+target key → seconds with optional `"*"` default), so a sleeping laptop does not fail the job; `1` when a
+sample hit a `consumer_error` or a target has been dark longer than its threshold. The receipt lists those
+targets in `stale_targets`, so the scheduler's failure detector catches a lasting blind spot.
+
 Deployment is opt-in: install ONE cron/timer on an always-on gateway, recording owner, schedule ID,
 config path, state path, command and receipt location. Disable that schedule to roll back; preserve
 state for restart-safe dedup. Do not enable another consumer for the same targets.
@@ -23,7 +30,8 @@ state for restart-safe dedup. Do not enable another consumer for the same target
 ## Tests
 
 `scripts/test-all -k kanban-drift` exercises dirty-dirty, dirty-clean-dirty, restart, unavailable,
-closed-card renewal, crash-after-create recovery, command failures and duplicate suppression.
+closed-card renewal, crash-after-create recovery, command failures, duplicate suppression, and
+main() exit codes for short vs stale unavailability (global and per-target thresholds).
 All card writes use isolated sinks (including a native-tool integration test with an explicitly
 isolated canonical Kanban path); tests cannot post live repair alerts. Malformed command output
 retains the exit code and bounded stderr diagnostic, while still failing unavailable.

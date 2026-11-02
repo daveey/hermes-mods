@@ -41,8 +41,11 @@ class Monitor:
                 row.update(streak=0, incident=None, card=None)
         if report.get("unavailable") or type(report.get("clean")) is not bool:
             row["streak"] = 0  # unknown breaks consecutive dirty, never clears the incident
+            if row.get("unavailable_since") is None:
+                row["unavailable_since"] = row["sampled_at"]
             self.save()
             return row
+        row["unavailable_since"] = None  # any real sample (clean or dirty) ends the dark period
         if report["clean"]:
             row["streak"] = 0
             self.save()
@@ -104,6 +107,22 @@ def native_tool(name, args):
     return result
 
 
+DEFAULT_UNAVAILABLE_ALERT_AFTER = 21600  # seconds; a sleeping laptop is normal, days of silence are not
+
+
+def alert_after(config, key):
+    """Seconds a target may stay unavailable before the run fails: an int, or a map with optional "*"."""
+    value = config.get("unavailable_alert_after", DEFAULT_UNAVAILABLE_ALERT_AFTER)
+    if isinstance(value, dict):
+        value = value.get(key, value.get("*", DEFAULT_UNAVAILABLE_ALERT_AFTER))
+    return float(value)
+
+
+def stale_targets(config, receipts, now):
+    return sorted(key for key, row in receipts.items()
+                  if row.get("unavailable_since") is not None and now - row["unavailable_since"] > alert_after(config, key))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -124,8 +143,12 @@ def main():
                 receipts[key] = dict(monitor.sample(key, report))
             except Exception as exc:
                 receipts[key] = {"last_sample": report, "consumer_error": str(exc)}
-        print(json.dumps({"sampled_at": time.time(), "targets": receipts}, sort_keys=True))
-        return int(any(r.get("consumer_error") or r.get("last_sample", {}).get("unavailable") for r in receipts.values()))
+        now = time.time()
+        stale = stale_targets(config, receipts, now)
+        print(json.dumps({"sampled_at": now, "stale_targets": stale, "targets": receipts}, sort_keys=True))
+        # Exit 1 = a consumer error, or a target dark longer than its threshold. A briefly
+        # unavailable target (asleep, rebooting) only resets its streak and keeps exit 0.
+        return int(bool(stale) or any(r.get("consumer_error") for r in receipts.values()))
 
 
 if __name__ == "__main__":
