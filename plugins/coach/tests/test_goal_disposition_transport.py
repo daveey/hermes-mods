@@ -46,6 +46,8 @@ def isolated_env(home):
     import hermes_constants
     # Allowlist instead of inheriting hub credentials, card routes or proxy URLs.
     env = {k: os.environ[k] for k in ('PATH', 'PYTHONPATH', 'LANG', 'TZ') if k in os.environ}
+    # The child must not wait on a real `hermes update` running on the host (serve's startup gate).
+    env['HERMES_SERVE_UPDATE_WAIT_S'] = '0'
     # Lazy core imports can add the managed dependency environment to sys.path
     # without changing sys.executable. Children must see those same packages.
     dependency_paths = [p for p in sys.path if p and 'site-packages' in Path(p).parts]
