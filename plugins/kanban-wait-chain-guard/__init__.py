@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import datetime, timezone
 import sqlite3
 import time
 from pathlib import Path
@@ -200,8 +202,74 @@ def _targets(tool, args):
     return args.get('board'), child, parents or None
 
 
+REMINDER = re.compile(r'\b(nudge|remind(er)?|re-?ping|ping|chase|follow[- ]?up)\b', re.I)
+DURATION = re.compile(r'(\d+(\.\d+)?)\s*(h|hrs?|hours?|d|days?)\b', re.I)
+MENTION = re.compile(r'nudge|remind|ping|chase|follow', re.I)
+WAKE = re.compile(r'SCHEDULED_UNTIL=([^\s]+)')
+
+
+def _reminder_verdict(args, now):
+    """Read the current wait's first park; never mutate the card or its clock."""
+    if MENTION.search(str(args.get('reason') or '')):
+        return None
+    tid = args.get('task_id') or os.environ.get('HERMES_KANBAN_TASK')
+    if not tid:
+        return None
+    conn = _connect(args.get('board'))
+    if conn is None:
+        return None
+    try:
+        task = _task(conn, tid)
+        if task is None:
+            return None
+        candidates = [(float(m[1]) * (24 if m[3].lower().startswith('d') else 1), line)
+                      for line in (task['body'] or '').splitlines() if REMINDER.search(line)
+                      for m in DURATION.finditer(line)]
+        if not candidates:
+            return None
+        hours, line = min(candidates, key=lambda item: item[0])
+        # Event id breaks ties when a reset and its first park share one second.
+        events = conn.execute('SELECT kind, created_at FROM task_events WHERE task_id = ? '
+                              'ORDER BY created_at, id', (tid,)).fetchall()
+        anchor = None
+        for event in events:
+            if event['kind'] in ('created', 'edited', 'specified', 'unblocked'):
+                anchor = None
+            elif event['kind'] == 'scheduled' and anchor is None:
+                anchor = float(event['created_at'])
+        due = (now if anchor is None else anchor) + hours * 3600
+        match = WAKE.search(str(args.get('reason') or ''))
+        if match:
+            dt = datetime.fromisoformat(match[1].replace('Z', '+00:00'))
+            wake = dt.replace(tzinfo=timezone.utc).timestamp() if dt.tzinfo is None else dt.timestamp()
+        else:
+            wake = now + 24 * 3600
+        if not (wake > due + 30 * 60 and now <= due + 24 * 3600):
+            return None
+        due_iso = datetime.fromtimestamp(due, timezone.utc).isoformat().replace('+00:00', 'Z')
+        wake_iso = datetime.fromtimestamp(wake, timezone.utc).isoformat().replace('+00:00', 'Z')
+        return 'refuse', (
+            f'{TAG}: refused. This card owes a reminder after {hours:g} h ("{line[:160]}"), '
+            f'due {due_iso}, but this park wakes at {wake_iso}, after it. '
+            'The wake_check only fires when they reply, so nothing would wake to send it. '
+            f"Park with reason 'SCHEDULED_UNTIL={due_iso} — …' (keep the wake_check), "
+            'send the reminder on that wake, then re-park to the deadline. '
+            'If it is already past due, send it now first. If no reminder is owed any more '
+            '(they replied, or you sent it), say so in the reason (mention the nudge) and retry.')
+    finally:
+        conn.close()
+
+
 def _verdict(tool, args, now=None):
     """('refuse'|'hint', message) or None."""
+    now = time.time() if now is None else now
+    if tool == 'kanban_schedule':
+        try:
+            reminder = _reminder_verdict(args, now)
+        except Exception:
+            reminder = None  # fail open without disabling the existing chain check
+        if reminder:
+            return reminder
     t = _targets(tool, args)
     if t is None:
         return None

@@ -32,6 +32,27 @@ Cross-gateway `awaiting` refs (`gateway` set) are skipped. A missing board or an
 Install with the repository installer, or link this directory into `$HERMES_HOME/plugins/kanban-wait-chain-guard`
 and run `hermes plugins enable kanban-wait-chain-guard`. Undo: `hermes plugins disable kanban-wait-chain-guard`.
 
+## Owed reminders
+
+For `kanban_schedule` only (also inside deferred `tool_call` batches), a body line
+with a reminder verb (`nudge`, `remind`, `reminder`, `re-ping`, `reping`, `ping`,
+`chase`, `follow up`, `follow-up`, or `followup`) and an hour/day duration owes a
+reminder. Matching is case-insensitive; the smallest duration across those lines
+wins, including decimals and compact forms such as `48h` or `3d`.
+
+The clock starts at the first `scheduled` event after the latest `created`,
+`edited`, `specified`, or `unblocked` event, or now on the first park. A proposed
+`SCHEDULED_UNTIL=<ISO8601>` wake (default: now + 24 h) more than 30 minutes after
+that reminder is refused while now is no more than 24 hours past due. Older
+standing waits are skipped. Park to the reminder first, keep the reply probe,
+send it on that wake (or now if overdue), then park to the final deadline.
+
+Bypass: if the reminder was sent or is no longer owed, mention the nudge in the
+reason. The bypass matches `nudge|remind|ping|chase|follow`; it is an explicit
+reason-based escape hatch, not proof of delivery. Missing boards, DB errors, and
+parse errors fail open. Other lifecycle tools are not checked by this rule.
+The `hermes kanban schedule` CLI is not a tool call, so it isn't checked either.
+
 Tests: `python3 -B -m unittest discover -s plugins/kanban-wait-chain-guard/tests` from the repo root.
 
 Origin: self-heal defect agent-ff9c2f154c. A shepherd card ran 141 times behind a todo incident card, which waited
