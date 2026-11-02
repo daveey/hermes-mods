@@ -118,11 +118,11 @@ def configure_core(root):
 
 
 def _readonly(config):
-    # management_operations gates the separate-identity broker (operations.py), which
-    # this process never imports or calls; the collector stays observe-only with it on.
+    # Management and dispatch run in their separate broker/gateway domains.
+    # Enabling either does not add an execution path to this read-only collector.
     flags = config['features']
-    if flags['observe'] is not True or type(flags['management_operations']) is not bool or any(
-            flags[k] is not False for k in ('dispatch', 'workspace_jobs')):
+    if flags['observe'] is not True or any(
+            type(flags[k]) is not bool for k in ('management_operations', 'dispatch')) or flags['workspace_jobs'] is not False:
         raise RuntimeError('observe_only_required')
 
 

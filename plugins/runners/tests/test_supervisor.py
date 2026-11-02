@@ -89,7 +89,24 @@ def test_collector_has_no_management_path():
         assert 'manage.sock' not in path.read_text(), path
 
 
-@pytest.mark.parametrize('flag', ['dispatch', 'workspace_jobs'])
+def test_dispatch_enabled_collector_publishes_readonly_snapshot(tmp_path):
+    cfg, config, private = files(tmp_path)
+    cfg['features']['dispatch'] = True
+    config.write_text(json.dumps(cfg))
+    runtime.run(config, private, (GATEWAY, 'example', 1), tmp_path / 'state', once=True, startup_delay=0)
+    snapshot = Service(tmp_path / 'state/state.sqlite', cfg).inventory()
+    assert snapshot['meta']['observed_at'] is not None
+    assert snapshot['meta']['owner']['config_revision'] == cfg['config_revision']
+    import ast
+    root = Path(runtime.__file__).resolve().parents[1]
+    for path in (root / 'collector.py', root / 'scripts/run_collector.py', root / 'scripts/runtime_collector.py'):
+        tree = ast.parse(path.read_text())
+        modules = {n.module or '' for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        names = {a.name for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+        assert not any(part in ('jobs', 'claims') for name in modules | names for part in name.split('.'))
+
+
+@pytest.mark.parametrize('flag', ['workspace_jobs'])
 def test_readonly_startup(tmp_path, flag):
     cfg, config, private = files(tmp_path)
     cfg['features'][flag] = True
