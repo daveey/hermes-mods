@@ -12,6 +12,22 @@ import tempfile
 RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "test-all"
 
 
+def _old_python():
+    """A python3 older than 3.11 (no tomllib), e.g. macOS's /usr/bin/python3, or None."""
+    for cand in ("/usr/bin/python3",):
+        try:
+            if Path(cand).is_file() and subprocess.run(
+                    [cand, "-c", "import sys; sys.exit(0 if sys.version_info < (3, 11) else 1)"],
+                    capture_output=True, timeout=30).returncode == 0:
+                return cand
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+OLD_PYTHON = _old_python()
+
+
 def make_tree(root: Path, plugins: dict[str, str]) -> None:
     for name, body in plugins.items():
         d = root / "plugins" / name
@@ -32,6 +48,27 @@ class TestAll(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
+
+    @unittest.skipUnless(OLD_PYTHON, "needs a python3 older than 3.11 on this host (macOS /usr/bin/python3)")
+    def test_driver_started_by_an_old_python3_reruns_itself_under_a_newer_one(self):
+        # `scripts/test-all` runs under `#!/usr/bin/env python3`; on macOS that is often 3.9, which has
+        # no tomllib, so the driver died on import before running any suite.
+        make_tree(self.root, {"alpha": "def test_ok():\n    pass\n"})
+        env = {k: v for k, v in os.environ.items() if k not in ("HERMES_CORE_CHECKOUT", "HERMES_TEST_ALL_REEXEC")}
+        env["HERMES_MODS_PYTHON"] = sys.executable
+        r = subprocess.run([str(OLD_PYTHON), str(RUNNER), "--root", str(self.root), "--hermes-core", "/nonexistent", "--list"],
+                           capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("plugins/alpha", r.stdout.split())
+
+    @unittest.skipUnless(OLD_PYTHON, "needs a python3 older than 3.11 on this host (macOS /usr/bin/python3)")
+    def test_driver_with_no_newer_python_says_so_instead_of_a_traceback(self):
+        env = {k: v for k, v in os.environ.items() if k != "HERMES_CORE_CHECKOUT"}
+        env["HERMES_TEST_ALL_REEXEC"] = "1"  # as if the re-run already happened and found nothing newer
+        r = subprocess.run([str(OLD_PYTHON), str(RUNNER), "--list"], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("Python >= 3.11", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
     def test_session_outcome_reports_real_core_results_even_on_success(self):
         make_tree(self.root, {"session-outcome": """
