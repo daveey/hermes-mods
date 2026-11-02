@@ -98,6 +98,10 @@ def main():
     for i, f in enumerate(fixtures):
         items.append({"id": f"scope{i}", "user": f["user"], "reply": f["reply"], "log": f.get("log", []),
                       "split": "fixture", "trigger": "fixture", "pos": False, "quote": ""})
+    # owner-list fixtures (agent-5f2ca3a822): true "the owner card is running" replies backed by a kanban_list read
+    for f in json.loads((COACH / "tests" / "fixtures" / "report_only_owner_list.json").read_text()):
+        items.append({"id": f["id"], "user": f["user"], "reply": f["reply"], "log": f.get("log", []),
+                      "split": "fixture", "trigger": "fixture", "pos": bool(f["expect_report_only"]), "quote": ""})
     # unverified-owner fixtures (the 2026-10-27 hub turn and its controls): expect = the deterministic check fires
     owners = json.loads((COACH / "tests" / "fixtures" / "report_only_unverified_owner.json").read_text())
     by_id = {f["id"]: f for f in owners}

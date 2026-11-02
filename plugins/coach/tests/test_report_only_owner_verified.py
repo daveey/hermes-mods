@@ -219,9 +219,17 @@ OWNER_READ_FIXTURES = {
 
 
 def test_every_owner_read_tool_has_a_real_format_fixture_showing_last_event():
-    assert set(rules.OWNER_READ_TOOLS) <= set(OWNER_READ_FIXTURES), (
-        f"add a real-format fixture for {set(rules.OWNER_READ_TOOLS) - set(OWNER_READ_FIXTURES)}")
-    for name in rules.OWNER_READ_TOOLS:
+    # list reads (agent-5f2ca3a822) have their own `<- OK list:` form and real-format fixture in
+    # test_report_only_owner_list.py; checked here so a new list tool can't slip in without one either
+    LIST_FIXTURE = json.loads((HERE / "tests" / "fixtures" / "owner_read_kanban_list.json").read_text())
+    for name in rules.LIST_READ_TOOLS:
+        for tool, args in ((name, {}), ("tool_call", {"calls": [{"name": name, "arguments": {}}]})):
+            line = rules.owner_result_line(tool, args, json.dumps(LIST_FIXTURE["result"]))
+            assert line and line.lstrip().startswith("<- OK list:") and "=running(" in line, (tool, name, line)
+    single = set(rules.OWNER_READ_TOOLS) - set(rules.LIST_READ_TOOLS)
+    assert single <= set(OWNER_READ_FIXTURES), (
+        f"add a real-format fixture for {single - set(OWNER_READ_FIXTURES)}")
+    for name in single:
         result = json.dumps(OWNER_READ_FIXTURES[name]())
         for tool, args in ((name, {}), ("tool_call", {"calls": [{"name": name, "arguments": {}}]})):
             line = rules.owner_result_line(tool, args, result)
@@ -242,7 +250,8 @@ OWNER_READ_SHELL_FIXTURES = {
                                           f"worker_pid from tasks where id='{CARD}'\")"},
                   lambda now: "2259396       01:06 Ssl", ("pid=2259396 alive",)),
     "kanban_cli": ("terminal", {"command": f"hermes kanban --board runners list | grep {CARD}"},
-                   lambda now: f"{CARD}  running  default  fix the collapsed arm", ("status=running",)),
+                   # a list read gets the `<- OK list: <id>=<status>` form (agent-5f2ca3a822)
+                   lambda now: f"{CARD}  running  default  fix the collapsed arm", (f"{CARD}=running",)),
 }
 OWNER_READ_EXEC_FIXTURE = (
     "execute_code", {"code": f"import sqlite3\nc = sqlite3.connect('/h/.hermes/kanban.db')\n"

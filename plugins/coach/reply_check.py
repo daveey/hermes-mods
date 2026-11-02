@@ -252,6 +252,8 @@ def card_closed(tool_log: Optional[list] = None) -> bool:
 # Telemetry only (report_only_scored.owner_fresh_ready): the judges read the same `<- OK` line through their rubrics.
 _OK_SEGMENT_RE = re.compile(r"task=(t_[0-9a-zA-Z_]+)\s+status=(\w+)(?:\s+run=(\S+))?(?:\s+summary=(?:(?!\slast=)[^|])*)?"
                             r"(?:\s+last=\S+\s+@\s+\S+\s+\((\d+)([smhd]) ago\))?")
+# list reads (agent-5f2ca3a822): `<- OK list: <id>=<status>(<age> ago) ...`, no run state
+_OK_LIST_SEGMENT_RE = re.compile(r"(t_[0-9a-zA-Z_]+)=(\w+)\((\d+)([smhd]) ago\)")
 _FAILED_RUN_RE = re.compile(r"crash|fail|timed_out|timeout|error|gave_up", re.I)
 FRESH_OWNER_S = 24 * 3600
 
@@ -265,8 +267,9 @@ def fresh_ready_owner(reply: str, tool_log: Optional[list] = None) -> list[str]:
     for line in tool_log or []:
         if not (line or "").lstrip().startswith("<- OK"):
             continue
-        for m in _OK_SEGMENT_RE.finditer(line):
-            cid, status, run, n, u = m.groups()
+        segs = [m.groups() for m in _OK_SEGMENT_RE.finditer(line)] + [
+            (c, st, None, n, u) for c, st, n, u in _OK_LIST_SEGMENT_RE.findall(line)]
+        for cid, status, run, n, u in segs:
             if cid in out or cid not in text or status not in ("ready", "todo"):
                 continue
             if run and run != "None" and _FAILED_RUN_RE.search(run):

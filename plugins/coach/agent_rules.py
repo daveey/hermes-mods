@@ -1235,9 +1235,35 @@ def rich_tool_line(tool: str, args: dict, arg: str = "") -> str:
 # and nothing from the one that found the card running, and held a true "the fix card is running" reply. After a
 # successful owner read (kanban_show, cross_task, `hermes kanban show`; direct or via tool_call) one `<- OK` line says
 # what it found. `<- ERROR` readers in reply_check look only for that prefix, so they ignore it.
-OWNER_READ_TOOLS = ("kanban_show", "cross_task")
+OWNER_READ_TOOLS = ("kanban_show", "cross_task", "kanban_list")
+# agent-5f2ca3a822: a board list read (kanban_list, `hermes kanban [--board b] list`) is how agents check a whole
+# delivery chain; it got no OK line, so the judges held a true "M4 is running" reply. List reads get their own short
+# form (`<- OK list: <id>=<status>(<age> ago) ... +N done`), see list_result_line.
+LIST_READ_TOOLS = ("kanban_list",)
 _OWNER_READ_CLI = re.compile(r"\bhermes\s+kanban\b[^\n]*\bshow\b")
+_LIST_READ_CLI = re.compile(r"\bhermes\s+kanban\b(?![^\n]*\bboards\s+(?:list|ls)\b)[^\n]*\b(?:list|ls)\b")
 OK_LINE_MAX = 200
+OK_LIST_LINE_MAX = 300
+_CLOSED = ("done", "archived")
+
+
+def _call_names(tool: str, args: Any) -> list:
+    name = (tool or "").rsplit("__", 1)[-1]
+    if name != "tool_call":
+        return [name]
+    a = args if isinstance(args, dict) else {}
+    return [str((c or {}).get("name") or "").rsplit("__", 1)[-1] for c in (a.get("calls") or []) if isinstance(c, dict)]
+
+
+def list_read_call(tool: str, args: Any) -> bool:
+    """True for a Kanban board list read (kanban_list direct or via tool_call, or `hermes kanban ... list`) that is
+    not also a single-card read (those keep the task= form)."""
+    names = _call_names(tool, args)
+    if names == ["terminal"]:
+        cmd = str((args if isinstance(args, dict) else {}).get("command") or "")
+        return bool(_LIST_READ_CLI.search(cmd)) and not _OWNER_READ_CLI.search(cmd)
+    return any(n in LIST_READ_TOOLS for n in names) and not any(
+        n in OWNER_READ_TOOLS and n not in LIST_READ_TOOLS for n in names)
 
 # agent-25f447092d: the third false hold in this class came from an owner read in neither tool form: a
 # `sqlite3 -readonly …/kanban.db` query of the card plus `ps -p <worker_pid>`. A shell or execute_code read is an
@@ -1284,9 +1310,9 @@ def owner_read_call(tool: str, args: Any) -> bool:
     if name in OWNER_READ_TOOLS:
         return True
     if name == "tool_call":
-        return any(str((c or {}).get("name") or "").rsplit("__", 1)[-1] in OWNER_READ_TOOLS
-                   for c in (a.get("calls") or []) if isinstance(c, dict))
-    if name == "terminal" and _OWNER_READ_CLI.search(str(a.get("command") or "")):
+        return any(n in OWNER_READ_TOOLS for n in _call_names(tool, args))
+    if name == "terminal" and (_OWNER_READ_CLI.search(str(a.get("command") or ""))
+                               or _LIST_READ_CLI.search(str(a.get("command") or ""))):
         return True
     return bool(owner_read_forms(name, a))
 
@@ -1315,6 +1341,73 @@ def _raw_owner_body(text: str, cards: list, now: float) -> str:
     rows = [l for l in short if "|" in l or _BOARD_STATUS_RE.search(l) or _PS_ROW_RE.match(l)]
     parts.append("rows: " + " ; ".join(rows or [" ".join(text.split())])[:160])
     return " ".join(parts)
+
+
+def _task_list(obj: Any, depth: int = 0) -> Optional[tuple]:
+    """(tasks, truncated) for the first list of Kanban task dicts in a list-read result (kanban_list's `tasks`, the
+    CLI's `--json` array, or either inside a terminal/tool_call wrapper; JSON strings inside fields are parsed).
+    tool_call's results wrapper puts the list 6 levels down (str>dict>list>dict>str>dict>list)."""
+    if depth > 8:
+        return None
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s[:1] in "{[":
+            try:
+                return _task_list(json.loads(s), depth + 1)
+            except Exception:
+                return None
+        return None
+    if isinstance(obj, list):
+        tasks = [x for x in obj if isinstance(x, dict) and str(x.get("id") or "").startswith("t_") and x.get("status")]
+        if tasks:
+            return tasks, False
+        return next((r for x in obj[:10] for r in [_task_list(x, depth + 1)] if r), None)
+    if not isinstance(obj, dict):
+        return None
+    if isinstance(obj.get("tasks"), list):
+        found = _task_list(obj["tasks"], depth + 1)
+        if found or not obj["tasks"]:
+            return (found[0] if found else []), bool(obj.get("truncated"))
+    return next((r for v in obj.values() if isinstance(v, (dict, list, str)) for r in [_task_list(v, depth + 1)] if r),
+                None)
+
+
+# `hermes kanban list` table row: `<glyph> t_<id>  <status>  <assignee>  <title>`
+_LIST_ROW_RE = re.compile(r"^\s*\S?\s*(t_[0-9a-zA-Z]+)\s+([a-z_]+)\b", re.M)
+
+
+def list_result_line(result: Any, now: Optional[float] = None) -> Optional[str]:
+    """`   <- OK list: <id>=<status>(<age> ago) ... +N done` for a successful list read: every open card (not done or
+    archived), oldest first, age from its newest started/completed/created time; None when nothing parses."""
+    now = time.time() if now is None else now
+    found = _task_list(result if isinstance(result, (dict, list)) else str(result or ""))
+    if found is not None:
+        tasks, truncated = found
+        rows = []
+        for t in sorted(tasks, key=lambda t: _ts(t.get("created_at")) or 0):
+            at = max((x for x in (_ts(t.get(k)) for k in ("started_at", "completed_at", "created_at")) if x),
+                     default=None)
+            rows.append((str(t.get("id")), str(t.get("status")), f"({_ago(now - at)} ago)" if at else ""))
+    else:
+        d = _as_dict(result)
+        text = str((d or {}).get("output") or (d or {}).get("result") or result or "")
+        rows = [(m.group(1), m.group(2), "") for m in _LIST_ROW_RE.finditer(text)]
+        truncated = False
+        if not rows:
+            return None
+    closed = sum(1 for _, st, _ in rows if st in _CLOSED)
+    tail = (f" +{closed} done" if closed else "") + (" (list truncated)" if truncated else "")
+    out = "   <- OK list:"
+    open_rows = [r for r in rows if r[1] not in _CLOSED]
+    for i, (cid, st, age) in enumerate(open_rows):
+        part, more = f" {cid}={st}{age}", f" +{len(open_rows) - i} more open"
+        if len(out) + len(part) + len(more) + len(tail) > OK_LIST_LINE_MAX:
+            out += more
+            break
+        out += part
+    if not open_rows:
+        out += " no open cards"
+    return (out + tail)[:OK_LIST_LINE_MAX]
 
 
 def _tasks_in(obj: Any, depth: int = 0) -> list:
@@ -1413,6 +1506,13 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
     if not owner_read_call(tool, args):
         return None
     now = time.time() if now is None else now
+    if list_read_call(tool, args):
+        try:
+            line = list_result_line(result, now)
+        except Exception:
+            line = None
+        if line:
+            return line  # else the generic forms below (unparsed list output still gets its head)
     try:
         found = _tasks_in(result if isinstance(result, (dict, list)) else str(result or ""))
         if found:

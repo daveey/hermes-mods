@@ -312,6 +312,17 @@ writes and unrelated reads get no line); detection guard
 `test_every_owner_read_shell_form_has_a_real_format_fixture` (every form in `OWNER_READ_SHELL_FORMS` needs a fixture).
 Replay of the incident through the real second-opinion judge: 0.9/0.1 → 0.1 (3/3).
 
+**Board list reads show the open cards (agent-5f2ca3a822).** After an "M3 done" notice the agent ran
+`kanban_list(board=…)`, saw M4 running with its review and deploy cards queued, and said so; the outcome judge held the
+rewrite at 0.88 ("kanban_list has no result"): list reads wrote no `<- OK` line. A successful list read
+(`kanban_list` direct or through `tool_call`, `hermes kanban [--board b] list|ls`, text table or `--json`; not
+`boards list`) now writes one line of at most 300 chars:
+`   <- OK list: <id>=<status>(<age> ago) … +N more open +M done` (every card not done/archived, oldest first; age from
+its newest started/completed/created time; the text table has no times). `reply_check.fresh_ready_owner` reads the
+list form too. Tests: `tests/test_report_only_owner_list.py` (the real result, direct, tool_call both wrappers, CLI
+table and JSON, failed/unrelated calls); gold-set draft `owner_list_5f2ca3a822` in
+`tests/fixtures/report_only_owner_list.json` (labeled not report_only, loaded by `eval/report_only_eval.py`).
+
 Queued owners (self-heal agent-9de19e15a9, 2026-11-01). A hub worker closed its crash card and named two fix cards it
 had filed 20 minutes earlier, both `ready` behind a busy queue; it commented the stall on both. Both judges held it
 (0.9, then 0.99: "Fix cards checked but ready, not running") because the rubrics put ready/todo with blocked/done as
