@@ -444,6 +444,27 @@ class TestAll(unittest.TestCase):
         self.assertEqual(result['status'], 'PASS', result)
         self.assertEqual(result['tail'], str(self.root))
 
+    def test_suites_see_the_selected_core_as_HERMES_CORE_SOURCE(self):
+        # chat-closeout's core-backed tests skip unless HERMES_CORE_SOURCE names the core checkout. test-all
+        # exported only HERMES_CORE_CHECKOUT, so its chat-closeout run skipped 12 of them (the watchdog-card
+        # origin-link regression tests among them) and still reported the suite green.
+        runner = runpy.run_path(str(RUNNER))
+        probe = 'import os; print(os.environ.get("HERMES_CORE_SOURCE"))'
+        suite = dict(name='core-env', cmd=[sys.executable, '-c', probe])
+        core = self.root / 'core'
+        for inherited in (None, '/stale/core'):  # a stale inherited value must not point tests at another core
+            with patch.dict(os.environ):
+                os.environ.pop('HERMES_CORE_SOURCE', None)
+                if inherited:
+                    os.environ['HERMES_CORE_SOURCE'] = inherited
+                result = runner['run_suite'](suite, sys.executable, core, 10, self.root, self.root / 'test-site')
+            self.assertEqual(result['status'], 'PASS', result)
+            self.assertEqual(result['tail'], str(core), inherited)
+        with patch.dict(os.environ):
+            os.environ.pop('HERMES_CORE_SOURCE', None)
+            result = runner['run_suite'](suite, sys.executable, None, 10, self.root, self.root / 'test-site')
+        self.assertEqual(result['tail'], 'None')  # no core found: those suites keep skipping with their reason
+
     def test_default_core_checkout_is_discovered(self):
         runner = runpy.run_path(str(RUNNER))
         core = self.root / '.hermes' / 'hermes-agent'
