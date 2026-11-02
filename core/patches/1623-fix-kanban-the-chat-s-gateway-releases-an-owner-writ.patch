@@ -1,0 +1,138 @@
+From 3cc6ce09c849428cc8bd160a523ad149ffb22769 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:53:12 -0800
+Subject: [PATCH] fix(kanban): the chat's gateway releases an owner-written
+ created link once the card closes [daveey]
+
+The owner board writes a 'created' task_chat_link for a remote origin chat
+(kanban_creator_chats initialize_ownership / inherit_chats). No reconcile
+released it: the owner's reconcile manages only its own chats' links, and the
+origin's only wrote the uids its ledger projects. When the origin ledger had no
+row for that chat+card, the done card stayed an 'unknown' obligation in
+replica_cards forever (hub t_01a1842a037068ba, t_01a184321b9b0fbf,
+t_01a1843be7a9418c, t_01a1844bf1292375 on macbook chat 20261027_134353_5ab65c).
+
+reconcile now reads the board's replica and, for each unreleased 'created'
+link to one of this gateway's chats on a card another gateway created whose
+replica status is done/archived, writes the same uid with released=1 (the same
+Board row, as it already does for a ledger 'origin' row). Links the ledger
+carries keep the ledger's answer; open cards and missing card rows are
+untouched. Dry run on macbook: 256 such links on 'default', including all 4.
+---
+ hermes_cli/kanban_chat_links.py            | 42 ++++++++++++++++++++++
+ tests/hermes_cli/test_kanban_chat_links.py | 39 ++++++++++++++++++++
+ 2 files changed, 81 insertions(+)
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index ee59cafe324..72d0f94ead6 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -95,6 +95,47 @@ def _ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
+     return out
+ 
+ 
++def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
++    """Released copies of the ``created`` links another gateway (the card's owner) wrote for this gateway's chats,
++    once the replica shows the card closed (``done``/``archived``). [daveey]
++
++    The owner writes them in ``kanban_creator_chats`` (``initialize_ownership`` / ``inherit_chats``) for a remote
++    origin chat. The owner's reconcile manages only its own chats' links, so nothing released them: a done card
++    whose origin ledger had no row for that chat (no ledger link with the same uid, no released shepherd sibling)
++    stayed an ``unknown`` obligation in ``replica_cards`` forever (4 hub cards on macbook chat
++    20261027_134353_5ab65c, 2026-11-01). The chat's gateway releases them by writing the same uid (the same row on
++    the Board) with ``released = 1``, as it already does for a ledger ``origin`` row. Open cards and missing card
++    rows are left alone; links ``want`` already carries keep the ledger's answer. A card reopened after the release
++    stays released for that chat: the uid is one row, so the owner's original intent is not recoverable here."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_placement import is_placeholder_session
++    path = ksc.shadow_path(board)
++    if not path.exists():
++        return {}
++    try:
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
++        try:
++            conn.row_factory = sqlite3.Row
++            marks = ",".join("?" * len(TERMINAL_STATUSES))
++            rows = [dict(r) for r in conn.execute(
++                "SELECT l.uid, l.task_id, l.chat_gateway, l.chat_profile, l.chat_session, l.kind, l.created_at "
++                "FROM task_chat_links l JOIN tasks t ON t.id = l.task_id "
++                "WHERE l.chat_gateway = ? AND l.kind = 'created' AND l.released = 0 AND l.uid IS NOT NULL "
++                f"AND t.created_on IS NOT NULL AND t.created_on != ? AND t.status IN ({marks})",
++                (gateway, gateway, *TERMINAL_STATUSES))]
++        finally:
++            conn.close()
++    except sqlite3.Error as exc:  # an unreadable replica releases nothing this round; the next one retries
++        _log.info("kanban chat links: replica %s unreadable for owner-link releases (%s)", path, exc)
++        return {}
++    out: dict[str, dict[str, Any]] = {}
++    for r in rows:
++        if r["uid"] in want or is_placeholder_session(r["chat_session"]) or _worker_shepherd(r["chat_session"], "created"):
++            continue
++        out[r["uid"]] = {**r, "released": 1, "created_at": int(r["created_at"] or time.time())}
++    return out
++
++
+ def ledger_boards(gateway: str) -> set[str]:
+     """Boards on which this gateway's chats have cards, per the origin-ledger projection."""
+     from hermes_cli.kanban_session_activity import _remote_links
+@@ -110,6 +151,7 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     want = _local_links(conn, gateway)
+     if ledger:
+         want.update(_ledger_links(board, gateway))
++    want.update(_owner_written_releases(board, gateway, want))
+     from hermes_cli.kanban_placement import is_placeholder_session
+     rows = conn.execute("SELECT uid, released, chat_session, kind FROM task_chat_links WHERE chat_gateway = ?",
+                         (gateway,)).fetchall()
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index 790e7e1cc21..fad1852e8b0 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -112,6 +112,45 @@ def _replica(path, tasks, chat_links):
+     conn.close()
+ 
+ 
++def test_reconcile_releases_the_owners_created_link_once_the_card_is_closed(live, kanban_home, monkeypatch):
++    """Hub cards t_01a1842a037068ba et al. (2026-11-01): the hub wrote a ``created`` link for a macbook chat
++    (kanban_creator_chats), the macbook ledger had no row for that chat+card, and no reconcile ever released it, so
++    each done card stayed an ``unknown`` obligation in replica_cards. The chat's gateway now releases it under the
++    same uid once the replica shows the card closed; open cards, ledger-held links and local cards are untouched."""
++    rep = ksc.shadow_path("default")
++    _replica(rep, [("t_done", "done", "done", OTHER), ("t_archived", "archived", "archived", OTHER),
++                   ("t_open", "open", "running", OTHER), ("t_held", "held", "done", OTHER),
++                   ("t_local", "local", "done", ME)],
++             [("t_done", ME, "s1", "created", 0), ("t_archived", ME, "s1", "created", 0),
++              ("t_open", ME, "s1", "created", 0), ("t_held", ME, "s1", "created", 0),
++              ("t_local", ME, "s1", "created", 0), ("t_done", "mini", "s9", "created", 0),
++              ("t_gone", ME, "s1", "created", 0)])  # t_gone: no card row in the replica, stays unknown
++    held = {**_ledger_row("t_held", "s1", via="origin", status="unknown"), "unfinished": True}
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [held])
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++    assert links.reconcile(live, "default", ME)["added"] == 3
++    assert _links(live) == {("t_done", "s1", "created", 1), ("t_archived", "s1", "created", 1),
++                            ("t_held", "s1", "created", 0)}
++    uid = links.link_uid("t_done", ME, "default", "s1", "created")
++    assert live.execute("SELECT released FROM task_chat_links WHERE uid = ?", (uid,)).fetchone()[0] == 1  # same row
++    pushed = {r[0] for r in live.execute("SELECT row_uid FROM kanban_sync_outbox WHERE table_name = 'task_chat_links'")}
++    assert uid in pushed  # captured, so the Board's (owner-written) row turns released
++    assert links.reconcile(live, "default", ME) == {"added": 0, "changed": 0, "released": 0, "retired": 0}
++    # Before the push comes back: the replica still lists the done cards. After it (the same uids now released),
++    # only the open card, the ledger-held one and the missing row remain this chat's.
++    before = {c["id"] for c in links.replica_cards(["s1"], ME, replicas=[("default", rep)])}
++    assert {"t_done", "t_archived"} <= before
++    conn = sqlite3.connect(rep)
++    conn.execute("UPDATE task_chat_links SET released = 1 WHERE uid IN (?, ?)",
++                 (uid, links.link_uid("t_archived", ME, "default", "s1", "created")))
++    conn.commit()
++    conn.close()
++    after = {c["id"] for c in links.replica_cards(["s1"], ME, replicas=[("default", rep)])}
++    assert after == {"t_open", "t_held", "t_gone"}
++    assert links.reconcile(live, "default", ME) == {"added": 0, "changed": 0, "released": 0, "retired": 0}
++
++
+ def test_replica_answers_a_chats_open_cards_on_other_gateways(tmp_path):
+     rep = tmp_path / "default.db"
+     _replica(rep, [("t_open", "open card", "running", OTHER), ("t_done", "done card", "done", OTHER),
+-- 
+2.55.0
+

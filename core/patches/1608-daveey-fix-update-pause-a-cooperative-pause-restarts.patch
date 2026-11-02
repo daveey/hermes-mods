@@ -1,0 +1,254 @@
+From a7d908c864bcf6cbd63ce7c1b0f5a77d9bee7371 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 01:36:47 +0000
+Subject: [PATCH] [daveey] fix(update-pause): a cooperative pause restarts the
+ auto-continue freshness clock at paused_at
+
+A live turn older than ~5 min could never be paused for a core update: not_resumable_reason applied the crash-recovery
+freshness window to started_at, and freshness_since counted a plain pause from turn start. Now freshness_since counts a
+core_update_pause marker from max(started_at, parked_at, paused_at), not_resumable_reason no longer rejects a live turn
+on its age, and PAUSE_RESTARTS_FRESHNESS = True advertises it to hermes-sync. Crash recovery keeps started_at.
+---
+ tests/tui_gateway/test_update_pause.py        |   9 +-
+ .../test_update_pause_freshness.py            | 116 ++++++++++++++++++
+ tui_gateway/turn_marker.py                    |  26 ++--
+ tui_gateway/update_pause.py                   |  12 +-
+ 4 files changed, 147 insertions(+), 16 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_freshness.py
+
+diff --git a/tests/tui_gateway/test_update_pause.py b/tests/tui_gateway/test_update_pause.py
+index b5e4ee001ab..18a17994692 100644
+--- a/tests/tui_gateway/test_update_pause.py
++++ b/tests/tui_gateway/test_update_pause.py
+@@ -87,7 +87,7 @@ def test_resumable_turn_pauses_and_its_marker_survives_the_turn_end(home):
+ 
+ 
+ @pytest.mark.parametrize("case", ["resume_on_startup_off", "auto_continue_disabled", "bot_room", "opted_out",
+-                                  "attempts_used_up", "stale", "no_marker"])
++                                  "attempts_used_up", "short_window", "no_marker"])
+ def test_turn_that_cannot_be_auto_continued_is_untouched(home, monkeypatch, case):
+     cfg = {"desktop": {"auto_continue": dict(CFG["desktop"]["auto_continue"])}}
+     extra = {}
+@@ -101,9 +101,10 @@ def test_turn_that_cannot_be_auto_continued_is_untouched(home, monkeypatch, case
+     if case != "no_marker":
+         record_turn_start(home, "session-key", "the prompt", auto_continue=case != "opted_out",
+                           attempts=2 if case == "attempts_used_up" else 0)
+-    if case == "stale":
+-        later = time.time() + 4 * 3600  # past the 240-min freshness window
+-        monkeypatch.setattr(up, "_now", lambda: later)
++    if case == "short_window":
++        # A window no longer than the update margin cannot outlast the update. A turn's age is no longer a
++        # reason: the pause restarts the clock (test_update_pause_freshness.py).
++        cfg["desktop"]["auto_continue"]["freshness_minutes"] = up.UPDATE_MARGIN_S / 60
+     _request_pause(home)
+ 
+     assert up.boundary_pause_hook(_session(profile_home=str(home), **extra), "session-key")() is None
+diff --git a/tests/tui_gateway/test_update_pause_freshness.py b/tests/tui_gateway/test_update_pause_freshness.py
+new file mode 100644
+index 00000000000..f3d65f6ee2b
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_freshness.py
+@@ -0,0 +1,116 @@
++"""[daveey] A cooperative core-update pause restarts the auto-continue freshness clock at ``paused_at``.
++
++Crash recovery keeps the ``started_at`` clock ("don't resurrect stale turns"); a live turn that runs 80 minutes
++and then accepts a pause is not 80 minutes stale. hermes-sync reads ``PAUSE_RESTARTS_FRESHNESS`` from this
++module's text to decide whether its drain may ask such a turn to pause.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from tui_gateway import server, startup_resume as sr, update_pause as up
++from tui_gateway.turn_marker import freshness_since, mark_turn_paused, read_turn_marker, record_turn_start
++from tests.tui_gateway.test_update_pause import CFG, _session, _request_pause, home, schedule_env
++
++AGE_S = 80 * 60.0
++CFG15 = {"desktop": {"auto_continue": {**CFG["desktop"]["auto_continue"], "freshness_minutes": 15}}}
++
++
++@pytest.fixture(autouse=True)
++def _fifteen_minute_window(monkeypatch, home):  # the shipped default: an 80-minute-old turn is far outside it
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG15)
++
++
++def _age(home, key="session-key", seconds=AGE_S):
++    path = home / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    entries[key]["started_at"] = time.time() - seconds
++    path.write_text(json.dumps(entries))
++
++
++def _kill_writer(home, key="session-key"):
++    path = home / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    entries[key]["writer_pid"] = 2 ** 22 - 3
++    entries[key].pop("writer_start_time", None)
++    path.write_text(json.dumps(entries))
++
++
++def test_turn_start_marker_advertises_that_its_pause_restarts_the_clock(home):
++    record_turn_start(home, "session-key", "p")
++    entries = json.loads((home / "desktop" / "interrupted_turns.json").read_text())
++    assert entries["session-key"]["pause_restarts_freshness"] is True  # hermes-sync reads it per marker
++
++
++def test_capability_constant_is_advertised():
++    assert up.PAUSE_RESTARTS_FRESHNESS is True
++
++
++def test_eighty_minute_old_live_turn_accepts_a_pause(home):
++    record_turn_start(home, "session-key", "long work")
++    _age(home)
++    assert up.not_resumable_reason(_session(profile_home=str(home)), "session-key") is None
++    _request_pause(home)
++    assert up.boundary_pause_hook(_session(profile_home=str(home)), "session-key")() == up.PAUSE_REASON
++
++
++def test_freshness_since_is_paused_at_after_the_pause(home):
++    record_turn_start(home, "session-key", "long work")
++    _age(home)
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    marker = read_turn_marker(home, "session-key")
++    assert marker["paused_at"] > marker["started_at"] + 4000
++    assert freshness_since(marker) == marker["paused_at"]
++    marker["parked_at"] = marker["paused_at"] + 30
++    assert freshness_since(marker) == marker["parked_at"]
++
++
++def test_crash_interrupted_marker_keeps_the_started_at_clock(home):
++    record_turn_start(home, "session-key", "long work")
++    _age(home)
++    marker = read_turn_marker(home, "session-key")
++    assert freshness_since(marker) == marker["started_at"]
++
++
++def test_startup_sweep_continues_an_old_paused_turn_but_not_an_old_crashed_one(home):
++    record_turn_start(home, "session-key", "paused work")
++    record_turn_start(home, "crashed-key", "crashed work")
++    _age(home, "session-key")
++    _age(home, "crashed-key")
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    _kill_writer(home, "session-key")
++    _kill_writer(home, "crashed-key")
++    assert [r["session_key"] for r in sr.pending_resumes(home, CFG15)] == ["session-key"]
++
++
++def test_in_place_continue_resumes_an_old_paused_turn(home):
++    record_turn_start(home, "session-key", "long work")
++    _age(home)
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    session = _session(profile_home=str(home))
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: None) == "resume"
++
++
++def test_scheduler_continues_an_old_paused_turn_and_clears_an_old_crashed_one(schedule_env, home):
++    record_turn_start(home, "session-key", "long work")
++    _age(home)
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    assert server._maybe_schedule_auto_continue("sid", _session(), "session-key") is not None
++    record_turn_start(home, "crashed-key", "crashed work")
++    _age(home, "crashed-key")
++    assert server._maybe_schedule_auto_continue("sid", _session(), "crashed-key") is None
++
++
++def test_max_pauses_still_caps(home):
++    record_turn_start(home, "session-key", "long work")
++    _age(home)
++    for _ in range(up.MAX_PAUSES):
++        mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    assert read_turn_marker(home, "session-key")["pauses"] == up.MAX_PAUSES
++    # The cap is enforced by the drain/window logic (test_update_pause_cap.py); a capped pause is still
++    # recorded and its clock counted from the last pause.
++    marker = read_turn_marker(home, "session-key")
++    assert freshness_since(marker) == marker["paused_at"]
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 847e9c13eed..834e7156df1 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -54,17 +54,22 @@ def _started_at(entry: dict) -> float:
+ 
+ 
+ def freshness_since(marker: dict) -> float:
+-    """[daveey] When a marker's auto-continue freshness clock starts: ``started_at``, except a core-update
+-    pause its live writer kept parked between drain windows (``mark_turn_parked``) counts from the last
+-    time it was confirmed parked. Waiting on the drainer is not the turn going stale, and every reader of
+-    freshness (in-place continue, startup sweep, notice hold) must agree or a parked turn is dropped."""
++    """[daveey] When a marker's auto-continue freshness clock starts: ``started_at`` for a crash-interrupted
++    turn ("don't resurrect stale turns"). A core-update pause counts from ``max(started_at, parked_at,
++    paused_at)``: the cooperative pause of a live turn restarts the clock at ``paused_at`` (a turn that ran
++    80 minutes is not 80 minutes stale when it pauses), and a pause its live writer kept parked between drain
++    windows (``mark_turn_parked``) counts from the last time it was confirmed parked. Every reader of
++    freshness (in-place continue, startup sweep, notice hold) must agree or a paused turn is dropped."""
+     started = _started_at(marker)
+     if marker.get("reason") != "core_update_pause":
+         return started
+-    try:
+-        return max(started, float(marker.get("parked_at") or 0))
+-    except (TypeError, ValueError):
+-        return started
++    stamps = [started]
++    for key in ("parked_at", "paused_at"):
++        try:
++            stamps.append(float(marker.get(key) or 0))
++        except (TypeError, ValueError):
++            pass
++    return max(stamps)
+ 
+ 
+ def _writer_identity() -> dict:
+@@ -158,7 +163,10 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
+         return
+     now = time.time()
+     entry = {"attempts": max(0, int(attempts)), "prompt": prompt[:_MAX_PROMPT_CHARS], "started_at": now,
+-             "auto_continue": bool(auto_continue), **_writer_identity()}
++             "auto_continue": bool(auto_continue), **_writer_identity(),
++             # [daveey] This backend's pause restarts the freshness clock (freshness_since), so hermes-sync may
++             # ask this turn to pause whatever its age. An older backend's marker lacks the field.
++             "pause_restarts_freshness": True}
+     if killed_jobs:
+         entry["killed_jobs"] = list(killed_jobs)
+     if pauses:
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index dee7fb8b26e..c14965568ae 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -45,6 +45,10 @@ PAUSE_STATUS_TEXT = "Paused for a Hermes update; continues automatically"
+ # The update itself takes a few minutes: a turn that would age out of the freshness window meanwhile is
+ # not paused (mirrors hermes-sync's AUTO_CONTINUE_UPDATE_MARGIN_S).
+ UPDATE_MARGIN_S = 600.0
++# [daveey] Capability flag hermes-sync reads from this file's text (never imports it): a cooperative pause
++# of a live turn restarts the auto-continue freshness clock at ``paused_at`` (turn_marker.freshness_since),
++# so ``not_resumable_reason`` no longer rejects a live turn for the age of its ``started_at``.
++PAUSE_RESTARTS_FRESHNESS = True
+ WATCH_POLL_S = 5.0
+ WATCH_MAX_S = 6 * 3600.0
+ # A skewed backend normally retires once idle and its successor continues the turn. One that is still
+@@ -126,8 +130,10 @@ def not_resumable_reason(session: dict, marker_key: str) -> str | None:
+         return "turn opted out of auto-continue"
+     if marker["attempts"] >= max_attempts:
+         return "crash-resume attempts used up"
+-    if _now() - marker["started_at"] + UPDATE_MARGIN_S > fresh_s:
+-        return "turn older than the auto-continue freshness window"
++    # The pause restarts the freshness clock at ``paused_at`` (PAUSE_RESTARTS_FRESHNESS), so the turn's age
++    # no longer matters; only that the window outlasts the update itself.
++    if fresh_s <= UPDATE_MARGIN_S:
++        return "auto-continue freshness window is shorter than the update margin"
+     return None
+ 
+ 
+@@ -452,7 +458,7 @@ def _keep_parked(session: dict, marker_key: str, *, last: bool = False) -> None:
+         prev = session.get("_update_pause_parked_stamp")
+         if last:
+             if prev is None:
+-                return  # never parked: a plain pause keeps its started_at clock
++                return  # never parked: a plain pause's clock is paused_at (turn_marker.freshness_since)
+             session.pop("_update_pause_parked_stamp", None)
+         elif prev is not None and 0 <= _now() - prev < PARK_STAMP_S:
+             return
+-- 
+2.55.0
+

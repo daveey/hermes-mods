@@ -1,0 +1,424 @@
+From 4f3cff8c0021c5fca096d1685d532abf5a3c91b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 01:27:37 +0000
+Subject: [PATCH] fix(kanban): a worker's card filed across board files reaches
+ its creator's human chat [daveey]
+
+#544 walks creator_task_id -> parents on the card's own board file, so two cross-board shapes left hub
+cards creator_chats_unresolved (t_01a19864fc42f5b2, t_01a1991923cadf9b):
+
+- Worker node: a MacBook card leased to the hub runs there and its worker files a card on the hub's live
+  board; the creator chain lives only in the board replica (sync-shadow/<board>.db). inherit_chats (and
+  so the reconcile backfill) now falls back to resolve_chats on the replica, writes the created link and a
+  notify sub whose cursor is the card's latest event (no replay).
+- Placement: kanban_create routing a worker's card to another gateway (now, or deferred until its parents
+  finish) sends the nearest real chat on this gateway that resolve_chats finds as the origin, never the
+  worker transcript; unresolved -> no origin.
+
+The CLI create never places remotely; its worker-node path is covered by the replica test.
+---
+ hermes_cli/kanban_creator_chats.py            |  56 +++++-
+ .../test_kanban_cross_board_creator_chats.py  | 167 ++++++++++++++++++
+ .../tools/test_kanban_worker_created_chats.py |   5 +
+ tools/kanban_tools.py                         |  16 +-
+ tools/kanban_tools_placement.py               |  31 +++-
+ 5 files changed, 262 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tools/test_kanban_cross_board_creator_chats.py
+
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index 90c5216f9bd..b999413e521 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -111,20 +111,70 @@ def _copy_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None:
+         (task_id, task_id, owner["task_id"], hub_chat, owner["chat_session"]))
+ 
+ 
++def _replica_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
++    """``resolve_chats`` on this board's replica (``sync-shadow/<board>.db``, the whole board).
++
++    A worker node runs another gateway's card from a copy in its live file: the copy carries no chat links, and its
++    creator chain lives only in the replica, so a card that worker files would resolve nothing here. Read-only;
++    [] when the board has no replica or it cannot be read.
++    """
++    from pathlib import Path
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_sync_client import shadow_path
++    key = sync._db_key(conn)
++    if not key or Path(key).parent.name in (sync.SHADOW_DIR, sync.LINKS_DIR):
++        return []
++    path = shadow_path(sync.board_slug_for_path(key))
++    try:
++        if not path.exists() or path.resolve() == Path(key).resolve():
++            return []
++        replica = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
++    except (OSError, sqlite3.Error):
++        return []
++    try:
++        replica.row_factory = sqlite3.Row
++        if not replica.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++            return []
++        return resolve_chats(replica, creator_task_id)
++    except sqlite3.Error:
++        return []
++    finally:
++        replica.close()
++
++
++def _owner_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None:
++    """Deliver to an owner whose card is not in this file: its chat on this gateway (``tui``) or through the hub."""
++    from hermes_cli.kanban_origin import gateway_names
++    if owner["chat_gateway"] == gateway_names()[0]:
++        platform, chat_id = "tui", owner["chat_session"]
++    else:
++        platform = "hub"
++        chat_id = f"{owner['chat_gateway']}/{owner['chat_profile'] or 'default'}/{owner['chat_session']}"
++    conn.execute(
++        "INSERT OR IGNORE INTO kanban_notify_subs "
++        "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
++        "VALUES (?,?,?,'','notify',?, unixepoch(), (SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?))",
++        (task_id, platform, chat_id, json.dumps({"reason": "create"}), task_id))
++
++
+ def inherit_chats(conn: sqlite3.Connection, task_id: str, creator_task_id: str) -> None:
+     """Copy a creator's real chat links inside the card creation transaction."""
+     from hermes_cli.kanban_chat_links import link_uid
+     from hermes_cli.kanban_db import _append_event
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+         return
+-    owners = resolve_chats(conn, creator_task_id)
++    owners, source = resolve_chats(conn, creator_task_id), None
++    if not owners:
++        owners = _replica_chats(conn, creator_task_id)
++        source = "replica" if owners else None
+     if not owners:
+         if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='creator_chats_unresolved'",
+                             (task_id,)).fetchone():
+             _append_event(conn, task_id, "creator_chats_unresolved",
+                           {"task_id": task_id, "creator_task_id": creator_task_id, "max_depth": MAX_DEPTH})
+         return
+-    _append_event(conn, task_id, "creator_chats_resolved", {"creator_task_id": creator_task_id})
++    _append_event(conn, task_id, "creator_chats_resolved",
++                  {"creator_task_id": creator_task_id, **({"source": source} if source else {})})
+     for owner in owners:
+         conn.execute(
+             "INSERT OR IGNORE INTO task_chat_links "
+@@ -132,7 +182,7 @@ def inherit_chats(conn: sqlite3.Connection, task_id: str, creator_task_id: str)
+             "VALUES (?, ?, ?, ?, ?, 'created', 0, ?)",
+             (link_uid(task_id, owner["chat_gateway"], owner["chat_profile"], owner["chat_session"], "created"),
+              task_id, owner["chat_gateway"], owner["chat_profile"], owner["chat_session"], owner["created_at"]))
+-        _copy_delivery(conn, task_id, owner)
++        (_owner_delivery if source else _copy_delivery)(conn, task_id, owner)
+ 
+ 
+ def backfill(conn: sqlite3.Connection) -> dict:
+diff --git a/tests/tools/test_kanban_cross_board_creator_chats.py b/tests/tools/test_kanban_cross_board_creator_chats.py
+new file mode 100644
+index 00000000000..a790ba4f9e1
+--- /dev/null
++++ b/tests/tools/test_kanban_cross_board_creator_chats.py
+@@ -0,0 +1,167 @@
++"""A worker's card reaches its creator's human chat even when the creator card lives on another board file. [daveey]
++
++Two cross-board shapes left hub cards with ``creator_chats_unresolved`` after #544:
++
++* Worker node: a MacBook card leased to the hub runs there, and its worker files a card on the hub's live board.
++  The copied creator carries no chat links and is evicted when it ends, so only the replica
++  (``sync-shadow/<board>.db``, the whole board) can walk to its chat.
++* Placement: a worker routes its card to another gateway (``kanban.placement``). The receiving gateway never sees
++  the creator card, so the creating side must send the resolved chat as the card's origin, never the worker
++  transcript.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_chat_links as links
++from tests.tools.test_kanban_worker_created_chats import CHAT, WORKER, create, make_home
++from tools import kanban_tools as tools
++
++FOREIGN_CHAT = "20261029_180356_84db5f"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    return make_home(tmp_path, monkeypatch)
++
++
++def _link(conn, task_id, gateway, profile, session, kind="created"):
++    conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                 "released, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 1)",
++                 (links.link_uid(task_id, gateway, profile, session, kind), task_id, gateway, profile, session, kind))
++    conn.commit()
++
++
++def _replica(home_dir, name="default.db"):
++    """The board replica with a MacBook creator chain whose ancestor holds the human chat."""
++    path = home_dir / "kanban" / "sync-shadow" / name
++    path.parent.mkdir(parents=True, exist_ok=True)
++    kbc.init_db(path)
++    with kbc.connect_closing(path) as conn:
++        ancestor = kb.create_task(conn, title="macbook ancestor", assignee="default")
++        creator = kb.create_task(conn, title="macbook creator leased here", assignee="default", parents=[ancestor])
++        _link(conn, ancestor, "macbook", None, FOREIGN_CHAT)
++        _link(conn, creator, "macbook", None, "local-" + "cd" * 32)  # its worker transcript: never an owner
++    return creator
++
++
++@pytest.mark.parametrize("entry", ["tool", "cli"])
++def test_worker_node_child_resolves_creator_chat_from_replica(home, monkeypatch, capsys, entry):
++    creator = _replica(home)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
++    monkeypatch.setenv("HERMES_SESSION_KEY", WORKER)
++    child = create(entry, monkeypatch, capsys)
++    with kbc.connect_closing() as conn:
++        links.reconcile(conn, "default", "here", ledger=False)
++        owned = conn.execute("SELECT chat_gateway, chat_session, kind FROM task_chat_links "
++                             "WHERE task_id=? AND released=0", (child,)).fetchall()
++        assert [tuple(r) for r in owned] == [("macbook", FOREIGN_CHAT, "created")]
++        subs = notify.list_notify_subs(conn, child)
++        assert [(s["platform"], s["chat_id"]) for s in subs] == [("hub", f"macbook/default/{FOREIGN_CHAT}")]
++        latest = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (child,)).fetchone()[0]
++        assert subs[0]["last_event_id"] == latest  # no replay of the card's history
++        kinds = [e.kind for e in kb.list_events(conn, child)]
++        assert "creator_chats_resolved" in kinds and "creator_chats_unresolved" not in kinds
++
++
++def test_backfill_repairs_an_unresolved_worker_node_card_from_replica(home, monkeypatch):
++    creator = _replica(home, "pending.db")  # not yet the board's replica: the child is filed unresolved
++    with kbc.connect_closing() as conn:
++        child = kb.create_task(conn, title="hub child filed before the fix", assignee="default",
++                               creator_task_id=creator, session_id=WORKER)
++        assert [e.kind for e in kb.list_events(conn, child)].count("creator_chats_unresolved") == 1
++    shadow = home / "kanban" / "sync-shadow"
++    for suffix in ("", "-wal", "-shm"):
++        if (shadow / f"pending.db{suffix}").exists():
++            (shadow / f"pending.db{suffix}").rename(shadow / f"default.db{suffix}")
++    with kbc.connect_closing() as conn:
++        links.reconcile(conn, "default", "here", ledger=False)
++        owned = conn.execute("SELECT chat_gateway, chat_session FROM task_chat_links WHERE task_id=? AND released=0 "
++                             "AND chat_gateway='macbook'", (child,)).fetchall()
++        assert [tuple(r) for r in owned] == [("macbook", FOREIGN_CHAT)]
++        sub = [s for s in notify.list_notify_subs(conn, child) if s["platform"] == "hub"]
++        latest = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (child,)).fetchone()[0]
++        assert [(s["chat_id"], s["last_event_id"]) for s in sub] == [(f"macbook/default/{FOREIGN_CHAT}", latest)]
++
++
++@pytest.fixture
++def placed(home, monkeypatch):
++    from hermes_cli import kanban_placement as kp
++    sent = []
++
++    def fake_create_remote(args, *, target, origin_session, origin_profile, self_gw, cfg=None, hub_cli=None):
++        sent.append({"target": target, "origin_session": origin_session, "origin_profile": origin_profile})
++        return {"ok": True, "request_id": "placement:hub:test", "queued_only": True}
++
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "hub", "why": "test route"})
++    monkeypatch.setattr(kp, "create_remote", fake_create_remote)
++    monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
++    monkeypatch.setenv("HERMES_SESSION_KEY", WORKER)
++    return sent
++
++
++def _place(creator, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    out = json.loads(tools._handle_create({"title": "routed child", "assignee": "default", "requires": []}))
++    assert out.get("ok") is True, out
++    return out
++
++
++@pytest.mark.parametrize("profile", [None, "research"])
++def test_placed_worker_child_carries_the_creator_chat_as_origin(placed, monkeypatch, profile):
++    with kbc.connect_closing() as conn:
++        ancestor = kb.create_task(conn, title="ancestor", assignee="default")
++        creator = kb.create_task(conn, title="creator", assignee="default", parents=[ancestor],
++                                 session_id=WORKER)
++        _link(conn, ancestor, "here", profile, CHAT)
++    _place(creator, monkeypatch)
++    assert placed == [{"target": "hub", "origin_session": CHAT, "origin_profile": profile or "default"}]
++
++
++def test_placed_worker_child_of_an_unresolved_creator_has_no_origin(placed, monkeypatch):
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="unowned creator", assignee="default", session_id=WORKER)
++    _place(creator, monkeypatch)
++    assert placed == [{"target": "hub", "origin_session": None, "origin_profile": "default"}]
++
++
++def test_placed_worker_child_skips_a_chat_on_another_gateway(placed, monkeypatch):
++    """hermes-hub create-task binds an origin on THIS gateway only, so a foreign chat cannot be the origin."""
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="creator", assignee="default", session_id=WORKER)
++        _link(conn, creator, "away", None, CHAT)
++    _place(creator, monkeypatch)
++    assert placed == [{"target": "hub", "origin_session": None, "origin_profile": "default"}]
++
++
++def test_deferred_worker_child_records_the_creator_chat_for_its_forward(placed, monkeypatch):
++    """A card kept here until its parents finish is forwarded later with the origin recorded now."""
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_placement_forward as kpf
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "local", "defer": "hub", "why": "test defer"})
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="creator", assignee="default", session_id=WORKER)
++        _link(conn, creator, "here", None, CHAT)
++    out = _place(creator, monkeypatch)
++    with kbc.connect_closing() as conn:
++        st = kpf.state(conn, out["task_id"])
++    assert (st["target"], st["origin_session"], st["origin_profile"]) == ("hub", CHAT, "default")
++    assert placed == []
++
++
++def test_deferred_worker_child_of_an_unresolved_creator_records_no_origin(placed, monkeypatch):
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_placement_forward as kpf
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "local", "defer": "hub", "why": "test defer"})
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="unowned creator", assignee="default", session_id=WORKER)
++    out = _place(creator, monkeypatch)
++    with kbc.connect_closing() as conn:
++        st = kpf.state(conn, out["task_id"])
++    assert (st["target"], st["origin_session"]) == ("hub", None)
+diff --git a/tests/tools/test_kanban_worker_created_chats.py b/tests/tools/test_kanban_worker_created_chats.py
+index 9d31862360b..1227de24122 100644
+--- a/tests/tools/test_kanban_worker_created_chats.py
++++ b/tests/tools/test_kanban_worker_created_chats.py
+@@ -18,6 +18,11 @@ CHAT = "20261101_100000_human"
+ 
+ @pytest.fixture
+ def home(tmp_path, monkeypatch):
++    return make_home(tmp_path, monkeypatch)
++
++
++def make_home(tmp_path, monkeypatch):
++    """A synced scratch Hermes home with one worker transcript and one human chat (shared with sibling tests)."""
+     home = tmp_path / ".hermes"
+     home.mkdir()
+     monkeypatch.setenv("HERMES_HOME", str(home))
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index a1266b65596..fc76c17542d 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -22,7 +22,7 @@ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+-                                          _placement_refused, _runs_where)
++                                          _placement_origin, _placement_refused, _runs_where)
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_park_args import _blocker_id_arg, _clear_blocker_arg, _blocker_scope_args, _park_guard
+ from hermes_cli.kanban_ask_resolved import ask_checks, create_ask_check, filing_context
+@@ -1526,7 +1526,7 @@ def _handle_attachments(args: dict, **kw) -> str:
+ 
+ 
+ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, session_id, conn=None,
+-                  note_local_pin: bool = True) -> tuple[Optional[str], Optional[dict]]:
++                  note_local_pin: bool = True, origin_profile=None) -> tuple[Optional[str], Optional[dict]]:
+     """[daveey] Create the card on the gateway ``kanban.placement`` routes this one to.
+ 
+     Returns ``(tool_result, None)`` when the card was queued there or the pin was refused,
+@@ -1555,7 +1555,7 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         self_gw = reg.self_gateway() or "local"
+         cfg = kp.config()
+         placed = kp.create_remote(view, target=target, origin_session=session_id,
+-                                  origin_profile=current_profile_name("default") or "default",
++                                  origin_profile=origin_profile or current_profile_name("default") or "default",
+                                   self_gw=self_gw, cfg=cfg, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")))
+         if not placed.get("ok"):
+             logger.warning("kanban placement: %s refused the card (%s)",
+@@ -1680,7 +1680,7 @@ def _handle_create(args: dict, **kw) -> str:
+         if project_id is None and workspace_kind is None and workspace_path is None:
+             if self_task is not None and self_task.project_id:
+                 project_id, project_source_task_id = self_task.project_id, self_task.id
+-        marker_placement = None
++        marker_placement, place_origin = None, {"session_id": session_id}
+         # Placement on a synced board: ``runs_on`` labels, and a pin to an enrolled machine that advertises
+         # pickup becomes ``runs_on=[machine:<name>]`` (created here, run there through the Board lease). Any
+         # other pin, a routed gateway included, falls through to the gateway route below. [daveey]
+@@ -1705,10 +1705,10 @@ def _handle_create(args: dict, **kw) -> str:
+             check_tool_create(args.get("requires"), workspace_kind=workspace_kind, project_id=project_id,
+                               skills=skills, assignee=str(assignee))  # before placement routes it away [daveey]
+             # Default placement: no local-only need -> the card runs on the routed gateway. [daveey]
++            place_origin = _placement_origin(conn, self_tid, session_id)  # a worker's: its creator's chat
+             remote, marker_placement = _place_remote(
+-                args, assignee=str(assignee), skills=skills, parents=parents,
+-                project_id=project_id, session_id=session_id, conn=conn,
+-                note_local_pin=pinned_machine is None)  # a machine pin was rewritten to "local"
++                args, assignee=str(assignee), skills=skills, parents=parents, project_id=project_id, conn=conn,
++                note_local_pin=pinned_machine is None, **place_origin)  # a machine pin was rewritten to "local"
+             if remote is not None:
+                 return remote
+             if marker_placement and marker_placement.get("runs_on") and runs_on is None:
+@@ -1761,7 +1761,7 @@ def _handle_create(args: dict, **kw) -> str:
+             }}
+         if origin is not None:
+             extra["origin_binding"] = kanban_origin.bind(conn, new_tid, origin, board=args.get("board"))
+-        extra.update(_marker_placement_fields(conn, new_tid, marker_placement, session_id))
++        extra.update(_marker_placement_fields(conn, new_tid, marker_placement, **place_origin))
+         after_create(conn, new_tid)
+         if origin_intent is None and args.get("requires"):
+             # Placement preflight: declared gateway needs this gateway lacks are owned first. [daveey]
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 587cffd435f..dad82f93962 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -35,6 +35,32 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+         state.close()
+ 
+ 
++def _placement_origin(conn, creator_task_id: Optional[str], session_id: Optional[str]) -> dict:
++    """``{session_id, origin_profile}`` a card routed to another gateway carries as its origin chat. [daveey]
++
++    The receiving gateway never sees a worker's creator card (it lives on this board), so it cannot walk to the
++    creator's chat itself. A dispatcher worker sends the nearest real chat ``resolve_chats`` finds here: on THIS
++    gateway only, because ``hermes-hub create-task`` binds an origin on the sending gateway. A worker transcript is
++    never an origin (no chat reads it back); anything else keeps the caller's session. ``origin_profile`` None
++    means this process's profile.
++    """
++    from hermes_cli.kanban_db_notify import is_headless_session
++    if creator_task_id:
++        try:  # never raises: placement itself decides what an identity failure means
++            from hermes_cli import kanban_capability_registry as reg
++            from hermes_cli.kanban_creator_chats import resolve_chats
++            self_gw = reg.self_gateway()
++            has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone()
++            for owner in (resolve_chats(conn, creator_task_id) if has_links else []):
++                if self_gw and owner["chat_gateway"] == self_gw and _persisted_session_id(owner["chat_session"]):
++                    return {"session_id": owner["chat_session"], "origin_profile": owner.get("chat_profile") or None}
++        except Exception:
++            logger.warning("Could not resolve the creator chat for a placed card", exc_info=True)
++    if session_id and is_headless_session(session_id):
++        return {"session_id": None, "origin_profile": None}
++    return {"session_id": session_id, "origin_profile": None}
++
++
+ def _placement_refused(pin: str, why: str) -> str:
+     """[daveey] A caller-pinned gateway cannot be honoured: say so instead of creating the card here."""
+     return tool_error(
+@@ -71,7 +97,8 @@ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_p
+     return placement
+ 
+ 
+-def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict], session_id: Optional[str]) -> dict:
++def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict], session_id: Optional[str],
++                             origin_profile: Optional[str] = None) -> dict:
+     """Result fields for a card a placement marker kept here; a deferred card records its forward. [daveey]"""
+     if not marker_placement:
+         return {}
+@@ -80,7 +107,7 @@ def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict
+         from hermes_cli import kanban_placement_forward as _kpf
+         from hermes_cli.profiles import current_profile_name as _cpn
+         _kpf.record_deferral(conn, new_tid, target=marker_placement["defer"], origin_session=session_id,
+-                             origin_profile=_cpn("default") or "default")
++                             origin_profile=origin_profile or _cpn("default") or "default")
+         return {"placement": {"where": "local", "defer": marker_placement["defer"], "why": marker_placement["why"]},
+                 "note": (f"Created here as {new_tid} so it can wait on its parents; it runs on "
+                          f"{marker_placement['defer']}, not here: when the parents finish the dispatcher "
+-- 
+2.55.0
+

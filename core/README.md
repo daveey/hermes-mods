@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1591 patches, one entry per non-merge source commit through `744ac50846c697afffec146710365547fba99cf7`.
+1625 patches, one entry per non-merge source commit through `93402fd50df7dc43fe11d839564bdeb462eb0ba7`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -24,10 +24,31 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d`; current merge-base: `c7da41dd522dc19cc08bbfcfa69d4b078224b45d` (the fork merged that upstream tip in `6e2fbc15549`).
 Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523 and 1549. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-Current replay: [mirror-replay-1591.json](mirror-replay-1591.json) (six hash-pinned bridges; the sixth carries the fork's upstream-sync merge `6e2fbc15549`) and [mirror-policy-1591.json](mirror-policy-1591.json). Executed checks: [mirror-1591-verification.md](mirror-1591-verification.md); preceding snapshots: [mirror-1588-verification.md](mirror-1588-verification.md), [mirror-1583-verification.md](mirror-1583-verification.md), [mirror-1539-verification.md](mirror-1539-verification.md), [mirror-1484-verification.md](mirror-1484-verification.md), [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
+Current replay: [mirror-replay-1625.json](mirror-replay-1625.json) (six hash-pinned bridges; the sixth carries the fork's upstream-sync merge `6e2fbc15549`) and [mirror-policy-1625.json](mirror-policy-1625.json). Executed checks: [mirror-1625-verification.md](mirror-1625-verification.md); preceding snapshots: [mirror-1591-verification.md](mirror-1591-verification.md), [mirror-1588-verification.md](mirror-1588-verification.md), [mirror-1583-verification.md](mirror-1583-verification.md), [mirror-1539-verification.md](mirror-1539-verification.md), [mirror-1484-verification.md](mirror-1484-verification.md), [mirror-1478-verification.md](mirror-1478-verification.md), [mirror-1476-verification.md](mirror-1476-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1592–1625
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Kanban quota episodes and clock-held stuck warning](kanban-quota-episodes.md) | 1592 1594 1595 1606 | A stuck warning names clock-held deadlines and stays quiet when every ready card waits on one; quota-wall requeues honour per-card reset deadlines with backoff, reroute default-routed cards off a known wall, check walls they did not record and fall back to the strong tier. |
+| [Kanban worker fence: finished-card shell hint, board-scoped tool fence](kanban-worker-fence-refusal.md) | 1593 1598 | A finished card's live worker shell gets a `kanban_comment` hint instead of the Desktop Cmd-Q leak advice; board-local `kanban_*` tool writes are fenced only on boards under the fenced root, like the DB fence. |
+| [Kanban notice: a live holder's never-acked claim no longer blocks the owner](kanban-notice-refusal-rewind.md) | 1597 | A live non-owner's never-acked notice claim no longer blocks the chat's owner: refused or stopping holders release the marker, and silent-only or stale live claims are reclaimed. |
+| [Test stability 1592–1625](test-stability-1592-1625.md) | 1596 1599 1604 1621 | Active-session contender tests skip `.N.tmp` staging files and fail fast; every unittest discovery form is refused; pause-boundary handshakes are written atomically; the locked wheelhouse fixture retries dropped PyPI connections with hashes still verified. |
+| [Desktop plugin loader refresh](desktop-plugin-loader-refresh.md) | 1600 | Desktop re-reads every known disk plugin's `plugin.js` on power resume and once a minute, and reloads files whose bytes changed when a filesystem watch event was missed. |
+| [Kanban edit: lowering priority needs --reason](kanban-edit-priority-reason.md) | 1601 1602 | `hermes kanban edit --priority` refuses to lower a card's priority without `--reason` (recorded on the event); `kanban_db_edit` imports `kanban_db` last to avoid a circular ImportError. |
+| [Kanban ordering-park handoff across gates and sync](kanban-pr-park-handoff.md) | 1603 1610 | Ordering-park handoffs survive completed operator-added gates and already-done synced parents, and match the checkpoint by stable `run_uid` across sync's run-id remapping. |
+| [Kanban creator chats across board files and chat-link release](kanban-creator-chat-routing.md) | 1605 1613 1614 1615 1623 1624 | A worker's card filed on another board file reaches its creator's human chat; explicit/ambient origins keep parent notify subs and headless ones record unresolved; a closed card's released or owner-written link stops counting as open; replica reads go through the lock guard. |
+| [Kanban origin creation: default intent fields](kanban-origin-work-ledger.md) | 1607 | Origin creation ignores default `chat_origin`/`placement_policy` in the stored intent envelope, so pre-upgrade retries reuse the original card. |
+| [Update pause: cooperative pause freshness clock](update-pause-followups.md) | 1608 1609 | A cooperative update pause restarts the auto-continue freshness clock at `paused_at` while crash recovery keeps `started_at`; test fixtures reused by assignment (F811). |
+| [Kanban recovery park identity](kanban-recovery-park-identity.md) | 1611 1612 | Synced boards stamp each recovery park with its own identity, so reconcile restores no longer change which recovery card may resume; the goal triage hold keeps local order on legacy or forked history. |
+| [Background commands under the foreground's bash](background-shell-bash.md) | 1616 1617 | POSIX background commands run under the foreground's bash after login-shell init; dependent tests follow the exec change. |
+| [Local session policy quarantine](local-session-policy-quarantine.md) | 1618 1619 1620 | Deterministically invalid local session policies are quarantined (history kept, retryable storage failures not quarantined) and shown in recovery diagnostics. |
+| [Kanban sync: kept-alive Board-service connection](kanban-central-sync-client.md) | 1622 | The Board client reuses one kept-alive HTTP/1.1 connection per thread instead of a TLS handshake per request; stale GETs retry once, POSTs are never resent. |
+| [Cron quota hold on subscription-pool refusal](provider-fallback-and-token-routing.md) | 1625 | Cron quota hold parks jobs on the routing pool's typed `SubscriptionQuotaUnavailable` refusal until its reset, and warns when a quota failure has no usable deadline. |
+| [1625-entry mirror verification](mirror-1625-verification.md) | verification report | Exact inventory, complete six-bridge replay and normalized tree; two existing fingerprints re-pinned (`tui_gateway/kanban_unloaded.py`, `tui_gateway/update_pause.py`), no new fingerprint or bridge. |
 
 ## Mirror follow-ups 1589–1591
 
@@ -897,7 +918,7 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1591-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the six bridges at the boundaries in `mirror-replay-1591.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
+For the current **1625-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply the six bridges at the boundaries in `mirror-replay-1625.json`. Do not start at the new merge-base or apply the entire glob without the bridges. Example (Bash, with this repository's absolute path in `MODS`):
 
 ```bash
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1

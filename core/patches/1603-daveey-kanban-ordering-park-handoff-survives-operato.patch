@@ -1,0 +1,159 @@
+From ae925dd7cf8a90b3b0ce00aa22f80043213169f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 01:59:47 +0000
+Subject: [PATCH] [daveey] kanban: ordering-park handoff survives
+ operator-added gates and synced done parents
+
+The respawn guard's dependency handoff required the current parent set to equal
+the checkpoint exactly, and a local task_runs row for every parent. A gate an
+operator linked after the owner's park (done since) and a synced parent owned by
+another gateway (done before the park, so not awaited) both held a legitimate
+review continuation in ready as active_pr until the 6 h hold cap
+(t_01a194b99da1ea92, PR me/myapp#2535).
+
+Now checkpointed parents must be a subset of the current ones (removal still
+refuses; added gates must be done and their own review verdict still refuses),
+and a non-local parent is skipped only when the checkpoint recorded it as
+already done at park time. An awaited remote parent stays fail-closed.
+---
+ hermes_cli/kanban_db_dispatch_pr_state.py     | 17 +++-
+ .../test_kanban_dependency_pr_handoff.py      | 82 +++++++++++++++++++
+ 2 files changed, 97 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index cf0c564c3ea..e4dcd250310 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -345,14 +345,20 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+                and (at, e["id"]) > (parked_at, park["id"]) for at, e in timed):
+         return False
+     # A promotion alone is not proof: the dependency edges must still exist and
+-    # be satisfied, rather than having been removed by an operator.
++    # be satisfied, rather than having been removed by an operator. A gate an
++    # operator ADDED after the park only delays the continuation (it must be done
++    # too, and its own review verdict still refuses below); it is not a bypass.
+     parents = kb.parent_ids(conn, task_id)
+-    if (not parents or sorted(parents) != evidence.get("parents")
++    checkpointed = evidence.get("parents")
++    if (not parents or not isinstance(checkpointed, list) or not checkpointed
++            or not all(isinstance(p, str) for p in checkpointed)
++            or not set(checkpointed).issubset(parents)
+             or kb.unsatisfied_parents(conn, task_id)):
+         return False
+     from hermes_cli.kanban_dependency_review import _awaited_parents, _SUMMARY_VERDICT
+     if not _awaited_parents(conn, parents, evidence, parked_at):
+         return False
++    awaited = evidence.get("awaited")
+     # Review results, including incomplete/invalid verdicts, belong exclusively to
+     # resumes_review. An ordering handoff must not bypass its exact-head checks.
+     for parent in parents:
+@@ -360,6 +366,13 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+             "SELECT metadata, summary FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (parent,),
+         ).fetchone()
+         if result is None:
++            # A synced parent another gateway owns has no local run to read. When the
++            # owner's checkpoint names it as already done at park time (in parents,
++            # not awaited), its result predates the park and cannot authorize or
++            # refuse this continuation. Anything else stays fail-closed. [daveey]
++            if (isinstance(awaited, list) and parent in checkpointed and parent not in awaited
++                    and kb.get_task(conn, parent) is None):
++                continue
+             return False
+         metadata = kb._json_dict(result["metadata"])
+         if (any(key in metadata for key in ("verdict", "approved", "reviewed_sha"))
+diff --git a/tests/hermes_cli/test_kanban_dependency_pr_handoff.py b/tests/hermes_cli/test_kanban_dependency_pr_handoff.py
+index bb9108a35ff..e393ba4b70a 100644
+--- a/tests/hermes_cli/test_kanban_dependency_pr_handoff.py
++++ b/tests/hermes_cli/test_kanban_dependency_pr_handoff.py
+@@ -159,6 +159,88 @@ def test_removing_awaited_edge_is_not_parent_completion(board, monkeypatch):
+     assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
+ 
+ 
++def _add_gate(board, task, clock, *, finish=True, metadata=None):
++    clock[0] += 5
++    gate = kb.create_task(board, title="operator-added gate", assignee="dev")
++    kb.link_tasks(board, gate, task)
++    kb.recompute_ready(board)
++    if finish:
++        clock[0] += 5
++        kb.claim_task(board, gate)
++        assert kb.complete_task(board, gate, summary="gate finished", metadata=metadata or {"head": "a" * 40})
++        kb.recompute_ready(board)
++    return gate
++
++
++def test_operator_added_gate_after_owner_park_still_allows_one_continuation(board, monkeypatch,
++                                                                            all_assignees_spawnable):
++    task, _, clock = park(board, monkeypatch)
++    _add_gate(board, task, clock)
++    assert kb.get_task(board, task).status == "ready"
++    assert prs.active_pr_reason(board, task, int(time.time())) is None
++    launched = []
++    dispatch.dispatch_once(board, spawn_fn=lambda task, workspace, **kwargs: launched.append(task.id) or 123456789)
++    assert task in launched
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++def test_operator_added_gate_still_open_stays_guarded(board, monkeypatch):
++    task, _, clock = park(board, monkeypatch)
++    _add_gate(board, task, clock, finish=False)
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++def test_operator_added_review_gate_cannot_bypass_review_evidence(board, monkeypatch):
++    task, _, clock = park(board, monkeypatch)
++    _add_gate(board, task, clock, metadata={"verdict": "approved", "head": "a" * 40})
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++def _remote_parent(board, task, run, status):
++    from hermes_cli import kanban_db_sync as sync
++
++    board.executescript(sync.SYNC_SCHEMA_SQL)
++    with kb.write_txn(board):
++        board.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", ("t_remote_done", task))
++        board.execute("INSERT INTO kanban_sync_remote_parents (parent_id, status, refreshed_at) "
++                      "VALUES ('t_remote_done', ?, 1)", (status,))
++
++
++def _park_with_remote(board, monkeypatch, status):
++    now = int(time.time())
++    clock = [now]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    task = kb.create_task(board, title="finish existing PR", assignee="dev")
++    kb.claim_task(board, task)
++    run = kb.get_task(board, task).current_run_id
++    worker_comment(board, task, "dev", PR)
++    _remote_parent(board, task, run, status)
++    parent = kb.create_task(board, title="ordering prerequisite", assignee="dev")
++    kb.link_tasks(board, parent, task, expected_child_run_id=run)
++    clock[0] += 10
++    assert kb.block_task(board, task, kind="dependency", reason="ordering", expected_run_id=run)
++    clock[0] += 10
++    kb.claim_task(board, parent)
++    assert kb.complete_task(board, parent, summary="ordering work finished")
++    return task, clock
++
++
++def test_synced_parent_done_before_park_does_not_hold_ordering_continuation(board, monkeypatch):
++    task, _ = _park_with_remote(board, monkeypatch, "done")
++    kb.recompute_ready(board)
++    assert kb.get_task(board, task).status == "ready"
++    assert prs.active_pr_reason(board, task, int(time.time())) is None
++
++
++def test_synced_parent_awaited_at_park_stays_guarded(board, monkeypatch):
++    task, _ = _park_with_remote(board, monkeypatch, "running")
++    with kb.write_txn(board):
++        board.execute("UPDATE kanban_sync_remote_parents SET status = 'done' WHERE parent_id = 't_remote_done'")
++    kb.recompute_ready(board)
++    assert kb.get_task(board, task).status == "ready"
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
+ def test_prose_review_without_head_still_requires_review_evidence(board, monkeypatch):
+     task, _, clock = park(board, monkeypatch, finish=False)
+     clock[0] += 10
+-- 
+2.55.0
+

@@ -1,0 +1,342 @@
+From 41aee8339338d47d91dc5a249adc98ffcafe7f40 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:43:02 +0000
+Subject: [PATCH] [daveey] Quarantine deterministically invalid local session
+ policies
+
+---
+ gateway/session_kanban.py                     |  5 +-
+ gateway/session_local_recovery.py             | 30 +++++-
+ hermes_state_local_quarantine.py              | 30 ++++++
+ .../gateway/test_kanban_policy_quarantine.py  | 38 ++++++++
+ tests/gateway/test_local_policy_quarantine.py | 94 +++++++++++++++++++
+ .../test_local_policy_quarantine_write.py     | 48 ++++++++++
+ 6 files changed, 238 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_state_local_quarantine.py
+ create mode 100644 tests/gateway/test_kanban_policy_quarantine.py
+ create mode 100644 tests/gateway/test_local_policy_quarantine.py
+ create mode 100644 tests/gateway/test_local_policy_quarantine_write.py
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index d55ab8278bc..3b300b81bd6 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -88,9 +88,8 @@ async def run_task(connection, params):
+     from gateway.run import _load_gateway_config
+     from gateway.session_local import create_local_session
+     from gateway.session_contract import Submission
+-    from gateway.session_local_recovery import local_identity
++    from gateway.session_local_recovery import local_identity, _restore_receipt_policy
+     from hermes_state_local import local_receipt
+-    from gateway.session_policy import restore_policy
+     authority = connection.authority
+     # Resolved off-loop up front: no await separates the saved-claim check from session
+     # creation. The Kanban claim check and its marker share one off-loop transaction; a
+@@ -102,7 +101,7 @@ async def run_task(connection, params):
+     sid = local_identity(authority.profile_id, connection.actor.subject, request_id)
+     saved = local_receipt(authority.db, sid) if authority.db.get_session(sid) is not None else None
+     if saved:
+-        policy = restore_policy(saved['policy'])
++        policy = _restore_receipt_policy(authority, sid, saved)
+         context = json.loads(policy.kanban_json or '{}')
+         if (not connection.native_owner or set(params) not in ({'board', 'task_id', 'run_id', 'claim_lock'}, {'board', 'task_id', 'run_id', 'claim_lock', 'db'})
+                 or any(params[k] != context.get(k) for k in params)):
+diff --git a/gateway/session_local_recovery.py b/gateway/session_local_recovery.py
+index 94651e61f37..97d6d6c2f10 100644
+--- a/gateway/session_local_recovery.py
++++ b/gateway/session_local_recovery.py
+@@ -150,23 +150,43 @@ def _stray_route_target(authority, receipt, session_id):
+     return True
+ 
+ 
++def _restore_receipt_policy(authority, sid, receipt):
++    from gateway.session_policy import restore_policy
++    from hermes_state_local_quarantine import quarantine_local_policy
++    if receipt.get('quarantine') is not None:
++        raise _ReceiptRefused('invalid_params', field='policy', detail='stored policy quarantined')
++    try:
++        return restore_policy(receipt['policy'])
++    except (KeyError, TypeError, ValueError) as exc:
++        # RuntimeStoreError is itself a ValueError. Only a validation cause from
++        # this policy decode is terminal, never a generic store/epoch refusal.
++        cause = exc.__cause__ if isinstance(exc, RuntimeStoreError) else exc
++        if not isinstance(cause, (KeyError, TypeError, ValueError)) or isinstance(cause, RuntimeStoreError):
++            raise
++        if quarantine_local_policy(authority.db, epoch=authority.epoch, session_id=sid,
++                                   expected=receipt, error_type=type(cause).__name__):
++            logging.getLogger(__name__).warning(
++                'Local session %s receipt quarantined: %s', sid, _refused_check(exc))
++        raise _ReceiptRefused('invalid_params', field='policy', detail='stored policy quarantined') from exc
++
++
+ def restore_local_session(authority, sid):
+     from gateway.session_authority import LiveSession
+     from gateway.session_local import LocalSessionAdapter
+-    from gateway.session_policy import restore_policy
+     try:
+         # The catch-up writes, so the receipt as stored must already be this owner's (#140060).
+         receipt, source, route, entry = owned_receipt(authority, sid)
++        policy = _restore_receipt_policy(authority, sid, receipt)
+         chat_id, store = source.chat_id, authority.runner.session_store
+         adopted = _with_untracked_compression(authority, sid, receipt)
+-        policy = restore_policy(adopted['policy'])
+         if adopted is not receipt:  # re-read after a catch-up: check the copy that will be served
++            policy = _restore_receipt_policy(authority, sid, adopted)
+             receipt, entry = adopted, _checked_entry(authority, adopted, source, route)
+         target = entry.session_id
+         from hermes_state_local_lineage import validate_local_lineage
+         with authority.db._read_ctx() as conn:
+             validate_local_lineage(conn, receipt)
+-    except _CatchUpPending:
++    except (_CatchUpPending, _ReceiptRefused):
+         raise
+     except (KeyError, TypeError, ValueError, AttributeError) as exc:
+         # The client only sees the bounded code: gateway.log names the check that refused (#140099).
+@@ -397,7 +417,9 @@ def reset_local_session(store, old_entry, session_id, now, display_name):
+ _BOOT_RECEIPTS_SQL = (
+     "SELECT m.key FROM state_meta m LEFT JOIN sessions s "
+     "ON s.id = CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.entry.session_id') END "
+-    "WHERE m.key LIKE ? AND (s.ended_at IS NULL OR s.end_reason = 'compression' "
++    "WHERE m.key LIKE ? AND CASE WHEN json_valid(m.value) "
++    "THEN json_extract(m.value, '$.quarantine') END IS NULL "
++    "AND (s.ended_at IS NULL OR s.end_reason = 'compression' "
+     "OR EXISTS (SELECT 1 FROM session_admissions a WHERE a.target_session_id = substr(m.key, ?) "
+     "AND a.status IN ('queued','started','unknown')) "
+     "OR EXISTS (SELECT 1 FROM state_meta c WHERE c.key = ? || substr(m.key, ?)))")
+diff --git a/hermes_state_local_quarantine.py b/hermes_state_local_quarantine.py
+new file mode 100644
+index 00000000000..a9c0638e92c
+--- /dev/null
++++ b/hermes_state_local_quarantine.py
+@@ -0,0 +1,30 @@
++"""Terminal, fail-closed quarantine of an invalid stored local policy."""
++import json
++import time
++
++from hermes_state_local import POLICY_PREFIX
++from hermes_state_runtime import RuntimeStoreError, _epoch, _json
++
++
++def quarantine_local_policy(db, *, epoch, session_id, expected, error_type):
++    """Keep policy/history intact; fence only the exact receipt the owner validated.
++
++    Returns whether this transaction recorded the first refusal. A stale owner or a
++    concurrently changed receipt must retry inspection rather than quarantine new data.
++    """
++    def write(conn):
++        _epoch(conn, epoch)
++        key = POLICY_PREFIX + session_id
++        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
++        if row is None:
++            raise RuntimeStoreError('storage_unavailable')
++        saved = json.loads(row[0])
++        if saved.get('quarantine') is not None:
++            return False
++        if saved != expected:
++            raise RuntimeStoreError('admission_conflict')
++        saved['quarantine'] = {'reason': 'invalid_stored_policy', 'error_type': error_type,
++                               'at': time.time()}
++        conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(saved), key))
++        return True
++    return db._execute_write(write)
+diff --git a/tests/gateway/test_kanban_policy_quarantine.py b/tests/gateway/test_kanban_policy_quarantine.py
+new file mode 100644
+index 00000000000..cc7467e831b
+--- /dev/null
++++ b/tests/gateway/test_kanban_policy_quarantine.py
+@@ -0,0 +1,38 @@
++"""A pre-admission Kanban retry reuses and respects its quarantined receipt."""
++import json
++
++import pytest
++
++from hermes_state_local import POLICY_PREFIX
++from hermes_state_runtime import RuntimeStoreError
++from tests.gateway.test_kanban_finite_admission import kanban_owner
++
++
++@pytest.mark.asyncio
++async def test_kanban_invalid_policy_retries_keep_one_receipt(kanban_owner, monkeypatch):
++    from gateway import session_kanban
++    from gateway.session_local_recovery import local_receipt_ids
++    from dataclasses import replace
++
++    owner = kanban_owner({'model': {'default': 'm', 'provider': 'custom'}})
++    build = session_kanban.build_kanban_policy
++
++    def broken(*args):
++        policy, secrets = build(*args)
++        return replace(policy, model=''), secrets
++
++    monkeypatch.setattr(session_kanban, 'build_kanban_policy', broken)
++    try:
++        for _ in range(3):
++            with pytest.raises(RuntimeStoreError, match='invalid_params'):
++                await session_kanban.run_task(owner.connection, owner.params)
++        with owner.authority.db._read_ctx() as conn:
++            rows = conn.execute('SELECT value FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',)).fetchall()
++            assert len(rows) == 1
++            receipt = json.loads(rows[0][0])
++            assert receipt['policy']['model'] == ''
++            assert receipt['quarantine']['reason'] == 'invalid_stored_policy'
++            assert conn.execute('SELECT count(*) FROM session_admissions').fetchone()[0] == 0
++        assert receipt['session_id'] not in local_receipt_ids(owner.authority)
++    finally:
++        await owner.close()
+diff --git a/tests/gateway/test_local_policy_quarantine.py b/tests/gateway/test_local_policy_quarantine.py
+new file mode 100644
+index 00000000000..a389836f414
+--- /dev/null
++++ b/tests/gateway/test_local_policy_quarantine.py
+@@ -0,0 +1,94 @@
++"""Stored policy validation is terminal; unavailable storage is retryable."""
++import json
++
++import pytest
++
++from gateway import session_local_recovery as recovery
++from gateway.session_local import create_local_session
++from hermes_state_local import POLICY_PREFIX
++from hermes_state_runtime import RuntimeStoreError
++from tests.gateway.test_local_receipt_untracked_compression import _owner, _unrecovered_owner
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('damage', ['empty_model', 'missing_model', 'bad_toolsets', 'bad_json', 'missing_policy'])
++async def test_invalid_policy_is_quarantined_once(tmp_path, monkeypatch, caplog, damage):
++    first, connection = await _owner(tmp_path, monkeypatch, 'first')
++    ref = create_local_session(first, connection.actor, {
++        'request_id': 'r', 'source': 'tui', 'cwd': str(tmp_path), 'model': 'm', 'toolsets': []})
++    sid = ref.session_id
++    first.db.append_message(sid, 'user', 'preserve this history; never replay')
++    with first.db._read_ctx() as conn:
++        receipt = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?',
++                                         (POLICY_PREFIX + sid,)).fetchone()[0])
++    if damage == 'empty_model':
++        receipt['policy']['model'] = ''
++    elif damage == 'missing_model':
++        del receipt['policy']['model']
++    elif damage == 'bad_toolsets':
++        receipt['policy']['toolsets'] = 42
++    elif damage == 'bad_json':
++        receipt['policy']['config_json'] = '{'
++    else:
++        del receipt['policy']
++    first.db._execute_write(lambda conn: conn.execute(
++        'UPDATE state_meta SET value=? WHERE key=?', (json.dumps(receipt), POLICY_PREFIX + sid)))
++    await connection.close()
++    first.db.close()
++    second, connection = _unrecovered_owner(tmp_path, 'second')
++    try:
++        recovery.recover_local_sessions(second)
++        assert sid not in recovery.local_receipt_ids(second)
++        assert sid not in second.sessions
++        with second.db._read_ctx() as conn:
++            saved = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?',
++                                           (POLICY_PREFIX + sid,)).fetchone()[0])
++        assert saved.get('policy') == receipt.get('policy')
++        assert saved['quarantine']['reason'] == 'invalid_stored_policy'
++        assert second.db.get_messages_as_conversation(sid)[0]['content'] == 'preserve this history; never replay'
++        recovery.recover_local_sessions(second)
++        with pytest.raises(RuntimeStoreError, match='invalid_params'):
++            recovery.restore_local_session(second, sid)
++        warnings = [r for r in caplog.records if sid in r.getMessage() and r.levelname == 'WARNING']
++        assert len(warnings) == 1
++    finally:
++        await connection.close()
++        second.db.close()
++    third, connection = _unrecovered_owner(tmp_path, 'third')
++    try:
++        assert sid not in recovery.local_receipt_ids(third)
++        recovery.recover_local_sessions(third)
++        assert sid not in third.sessions
++    finally:
++        await connection.close()
++        third.db.close()
++
++
++@pytest.mark.asyncio
++async def test_transient_policy_restore_failure_retries(tmp_path, monkeypatch):
++    from gateway import session_policy
++    first, connection = await _owner(tmp_path, monkeypatch, 'first')
++    ref = create_local_session(first, connection.actor, {
++        'request_id': 'r', 'source': 'tui', 'cwd': str(tmp_path), 'model': 'm', 'toolsets': []})
++    await connection.close()
++    first.db.close()
++    second, connection = _unrecovered_owner(tmp_path, 'second')
++    original = session_policy.restore_policy
++    calls = []
++
++    def unavailable(data):
++        calls.append(data)
++        raise RuntimeStoreError('storage_unavailable')
++
++    try:
++        monkeypatch.setattr(session_policy, 'restore_policy', unavailable)
++        recovery.recover_local_sessions(second)
++        recovery.recover_local_sessions(second)
++        assert len(calls) == 2
++        assert ref.session_id in recovery.local_receipt_ids(second)
++        monkeypatch.setattr(session_policy, 'restore_policy', original)
++        recovery.recover_local_sessions(second)
++        assert ref.session_id in second.sessions
++    finally:
++        await connection.close()
++        second.db.close()
+diff --git a/tests/gateway/test_local_policy_quarantine_write.py b/tests/gateway/test_local_policy_quarantine_write.py
+new file mode 100644
+index 00000000000..cc9a56a371d
+--- /dev/null
++++ b/tests/gateway/test_local_policy_quarantine_write.py
+@@ -0,0 +1,48 @@
++"""Quarantine cannot commit against stale ownership or a changed receipt."""
++import json
++
++import pytest
++
++from gateway.session_local import create_local_session
++from gateway.session_local_recovery import local_receipt_ids, recover_local_sessions
++from hermes_state_local import POLICY_PREFIX, local_receipt
++from hermes_state_runtime import RuntimeStoreError
++from tests.gateway.test_local_receipt_untracked_compression import _owner, _unrecovered_owner
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('failure', ['unavailable', 'changed_receipt'])
++async def test_quarantine_write_failure_keeps_receipt_retryable(tmp_path, monkeypatch, failure):
++    first, connection = await _owner(tmp_path, monkeypatch, 'first')
++    ref = create_local_session(first, connection.actor, {
++        'request_id': 'r', 'source': 'tui', 'cwd': str(tmp_path), 'model': 'm', 'toolsets': []})
++    sid = ref.session_id
++    receipt = local_receipt(first.db, sid)
++    receipt['policy']['model'] = ''
++    first.db._execute_write(lambda conn: conn.execute(
++        'UPDATE state_meta SET value=? WHERE key=?', (json.dumps(receipt), POLICY_PREFIX + sid)))
++    await connection.close()
++    first.db.close()
++    second, connection = _unrecovered_owner(tmp_path, 'second')
++    write = second.db._execute_write
++
++    def interrupted_write(operation):
++        if failure == 'unavailable':
++            raise RuntimeStoreError('storage_unavailable')
++        changed = dict(receipt, concurrent_metadata=True)
++        write(lambda conn: conn.execute('UPDATE state_meta SET value=? WHERE key=?',
++                                       (json.dumps(changed), POLICY_PREFIX + sid)))
++        return write(operation)
++
++    try:
++        monkeypatch.setattr(second.db, '_execute_write', interrupted_write)
++        recover_local_sessions(second)
++        assert sid in local_receipt_ids(second)
++        assert 'quarantine' not in local_receipt(second.db, sid)
++        monkeypatch.setattr(second.db, '_execute_write', write)
++        recover_local_sessions(second)
++        assert sid not in local_receipt_ids(second)
++        assert local_receipt(second.db, sid)['quarantine']['reason'] == 'invalid_stored_policy'
++    finally:
++        await connection.close()
++        second.db.close()
+-- 
+2.55.0
+

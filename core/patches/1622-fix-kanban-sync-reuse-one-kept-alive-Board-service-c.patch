@@ -1,0 +1,498 @@
+From 794ec3a2fce4c5625136bc3e28a0cbee8d327162 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 02:45:58 +0000
+Subject: [PATCH] fix(kanban-sync): reuse one kept-alive Board-service
+ connection per thread instead of a TLS handshake per request [daveey]
+
+Hub._call opened a fresh urlopen connection for every Board-service request, so each paid a TCP connect, a TLS
+handshake and a platform trust evaluation (truststore -> SecTrustEvaluateWithError on macOS). On David-MBP the
+gateway's sync executor thread did ~3.6 handshakes/s while cards ran (36 SecTrustEvaluate in a 10 s sample).
+Live replay against the real Board service through the gateway runtime: 10.1 ms thread-CPU per request with urlopen,
+0.69 ms on a reused connection.
+
+Hub now keeps one HTTP/1.1 connection per thread (fork-safe), drops it when the server closed it, after 30 s idle or on
+Connection: close, and retries a GET once on a stale reused socket. A POST whose answer was lost is never resent.
+Errors keep urlopen's contract (HubError/Resync for non-2xx, URLError for transport and protocol failures, which
+http.client's BadStatusLine was not before). An environment proxy keeps the urlopen path.
+---
+ hermes_cli/kanban_sync_client.py              | 140 ++++++++-
+ .../test_kanban_sync_hub_keepalive.py         | 293 ++++++++++++++++++
+ 2 files changed, 427 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 044b38c57e8..161324329f4 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -29,8 +29,11 @@ import os
+ import re
+ import sqlite3
+ import threading
++import threading as _hub_threading  # Hub's own handle: tests replace the module-level ``threading``/``time``
+ import time
++from time import monotonic as _hub_monotonic
+ import urllib.error
++import urllib.parse
+ import urllib.request
+ from contextlib import contextmanager
+ from dataclasses import dataclass, field
+@@ -95,19 +98,55 @@ def load_identity(cfg: Optional[dict] = None) -> Identity:
+     return Identity(url=url, key=key, gateway=gateway)
+ 
+ 
++def _peer_closed(conn) -> bool:
++    """True when an idle kept-alive socket is readable (the server sent FIN) or already gone."""
++    import select
++    sock = getattr(conn, "sock", None)
++    if sock is None:
++        return True
++    try:  # poll, not select: select raises for fds >= 1024, which a busy gateway has
++        if not hasattr(select, "poll"):  # Windows: select has no fd ceiling there
++            return bool(select.select([sock], [], [], 0)[0])
++        poller = select.poll()
++        poller.register(sock, select.POLLIN | select.POLLPRI)
++        return bool(poller.poll(0))
++    except (OSError, ValueError):
++        return True
++
++
+ class Hub:
+-    """The Board service's HTTP API for one gateway."""
++    """The Board service's HTTP API for one gateway.
++
++    Requests reuse one kept-alive HTTP/1.1 connection per thread. A fresh connection per request (``urlopen``) paid a
++    TCP connect, a TLS handshake and a platform trust evaluation (truststore → ``SecTrustEvaluateWithError`` on macOS)
++    every time: ~8.8 ms of thread CPU per request against ~0.5 ms on a reused connection, at several requests a second
++    while cards run. Errors keep ``urlopen``'s contract: non-2xx → :class:`HubError` / :class:`Resync`, transport
++    failures → ``urllib.error.URLError`` (an ``OSError``). A proxy from the environment keeps the ``urlopen`` path.
++    """
++
++    # Drop a connection idle this long instead of racing the server's own idle close. Not a data cache: it only bounds
++    # how long a socket is reused.
++    IDLE_REUSE_S = 30.0
+ 
+     def __init__(self, ident: Identity, timeout: float = HTTP_TIMEOUT_S) -> None:
+         self.ident, self.timeout = ident, timeout
++        self._local = _hub_threading.local()
++        self._ssl_context = None
++        self._ssl_lock = _hub_threading.Lock()
++
++    def _headers(self) -> dict:
++        return {"authorization": f"Bearer {self.ident.key}", "content-type": "application/json",
++                "user-agent": "hermes-kanban-sync/1"}
+ 
+     def _call(self, method: str, path: str, body: Optional[dict] = None) -> dict:
+         data = None if body is None else json.dumps(body).encode()
+-        req = urllib.request.Request(
+-            self.ident.url + path, data=data, method=method,
+-            headers={"authorization": f"Bearer {self.ident.key}", "content-type": "application/json",
+-                     "user-agent": "hermes-kanban-sync/1"},
+-        )
++        parts = urllib.parse.urlsplit(self.ident.url)
++        if parts.scheme not in ("http", "https") or not parts.hostname or self._proxied(parts):
++            return self._call_urlopen(method, path, data)
++        return self._call_kept_alive(parts, method, path, data)
++
++    def _call_urlopen(self, method: str, path: str, data: Optional[bytes]) -> dict:
++        req = urllib.request.Request(self.ident.url + path, data=data, method=method, headers=self._headers())
+         try:
+             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                 return json.loads(resp.read() or b"{}")
+@@ -117,6 +156,95 @@ class Hub:
+                 raise Resync(text) from exc
+             raise HubError(exc.code, text) from exc
+ 
++    @staticmethod
++    def _proxied(parts: urllib.parse.SplitResult) -> bool:
++        proxies = urllib.request.getproxies()
++        return bool(proxies.get(parts.scheme) or proxies.get("all")) and not urllib.request.proxy_bypass(parts.hostname)
++
++    def close(self) -> None:
++        """Close this thread's kept-alive connection (other threads' close when they reuse or exit)."""
++        self._drop()
++
++    def _drop(self) -> None:
++        conn = getattr(self._local, "conn", None)
++        self._local.conn = None
++        if conn is not None and getattr(self._local, "pid", None) == os.getpid():
++            try:
++                conn.close()
++            except OSError:
++                pass
++
++    def _connection(self, parts: urllib.parse.SplitResult):
++        """``(connection, reused)`` for this thread. A connection inherited across ``fork`` is never touched."""
++        loc = self._local
++        conn = getattr(loc, "conn", None)
++        if conn is not None and loc.pid != os.getpid():
++            loc.conn = conn = None  # the parent process's socket: leave it to the parent
++        if conn is not None and (_hub_monotonic() - loc.used > self.IDLE_REUSE_S or _peer_closed(conn)):
++            self._drop()
++            conn = None
++        if conn is not None:
++            return conn, True
++        import http.client
++        if parts.scheme == "https":
++            with self._ssl_lock:
++                if self._ssl_context is None:
++                    import ssl
++                    self._ssl_context = ssl.create_default_context()  # truststore-injected when installed
++            conn = http.client.HTTPSConnection(parts.hostname, parts.port, timeout=self.timeout,
++                                               context=self._ssl_context)
++        else:
++            conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=self.timeout)
++        loc.conn, loc.pid, loc.used = conn, os.getpid(), _hub_monotonic()
++        return conn, False
++
++    def _call_kept_alive(self, parts: urllib.parse.SplitResult, method: str, path: str, data: Optional[bytes]) -> dict:
++        import http.client
++        target = (parts.path or "") + path
++        headers = self._headers()
++        for attempt in (0, 1):
++            conn, reused = self._connection(parts)
++            try:
++                conn.request(method, target, body=data, headers=headers)
++            except (OSError, http.client.HTTPException) as exc:
++                self._drop()
++                if reused and attempt == 0:  # a stale kept-alive socket: the request never reached the server
++                    continue
++                raise urllib.error.URLError(exc) from exc
++            try:
++                resp = conn.getresponse()
++            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError) as exc:
++                self._drop()
++                # The server closed a reused socket without answering. Only an idempotent GET is resent: a POST
++                # (ops, leases) may have been applied, so it fails like any transport error and the round retries.
++                if reused and attempt == 0 and method == "GET":
++                    continue
++                raise urllib.error.URLError(exc) from exc
++            except (OSError, http.client.HTTPException) as exc:
++                self._drop()
++                raise urllib.error.URLError(exc) from exc
++            try:
++                raw = resp.read()
++            except (OSError, http.client.HTTPException) as exc:
++                self._drop()
++                raise urllib.error.URLError(exc) from exc
++            if resp.will_close:
++                self._drop()
++            else:
++                self._local.used = _hub_monotonic()
++            status = resp.status
++            if 300 <= status < 400 and method == "GET":  # the Board service sends none; urlopen follows them
++                return self._call_urlopen(method, path, data)
++            if 300 <= status < 400:  # never resend a POST the server may have applied
++                raise HubError(status, raw.decode("utf-8", "replace")[:500])
++            if not 200 <= status < 300:
++                text = raw.decode("utf-8", "replace")[:500]
++                if status == 410:
++                    raise Resync(text)
++                raise HubError(status, text)
++            return json.loads(raw or b"{}")
++        raise AssertionError("unreachable")  # pragma: no cover
++
+     def ops(self, board: str, ops: list[dict]) -> dict:
+         return self._call("POST", f"/v2/boards/{board}/ops", {"ops": ops})
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_hub_keepalive.py b/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+new file mode 100644
+index 00000000000..267806e3a8e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+@@ -0,0 +1,293 @@
++"""Hub requests reuse one kept-alive connection per thread (no TLS handshake + trust evaluation per request).
++
++Exercised against a real local HTTP/1.1 server that counts accepted connections and requests, so the wire behaviour
++(reuse, stale-socket recovery, no duplicate POST, the urlopen error contract) is what the tests see.
++"""
++from __future__ import annotations
++
++import http.server
++import json
++import os
++import socket
++import threading
++import urllib.error
++
++import pytest
++
++from hermes_cli import kanban_sync_client as ksc
++
++
++class _Server(http.server.ThreadingHTTPServer):
++    daemon_threads = True
++
++    def __init__(self):
++        super().__init__(("127.0.0.1", 0), _Handler)
++        self.connections = 0
++        self.requests: list[tuple[str, str]] = []
++        self.mode = "ok"  # ok | close | drop_post | status:<n> | bad_status
++        self.lock = threading.Lock()
++        self.open_sockets: list[socket.socket] = []
++
++    def get_request(self):
++        sock, addr = super().get_request()
++        with self.lock:
++            self.connections += 1
++            self.open_sockets.append(sock)
++        return sock, addr
++
++    def close_idle(self):
++        """Server-side idle close of every kept-alive socket (what an edge does after its idle timeout)."""
++        with self.lock:
++            socks, self.open_sockets = self.open_sockets, []
++        for s in socks:
++            try:
++                s.shutdown(socket.SHUT_RDWR)
++            except OSError:
++                pass
++
++
++class _Handler(http.server.BaseHTTPRequestHandler):
++    protocol_version = "HTTP/1.1"
++
++    def log_message(self, *a):
++        pass
++
++    def _serve(self):
++        n = int(self.headers.get("content-length") or 0)
++        body = self.rfile.read(n) if n else b""
++        srv = self.server
++        with srv.lock:
++            srv.requests.append((self.command, self.path))
++        mode = srv.mode
++        if mode == "drop_post" and self.command == "POST":
++            self.close_connection = True
++            self.connection.shutdown(socket.SHUT_RDWR)
++            return
++        if mode == "bad_status":
++            self.wfile.write(b"garbage\r\n\r\n")
++            self.close_connection = True
++            return
++        status = int(mode.split(":")[1]) if mode.startswith("status:") else 200
++        payload = json.dumps({"path": self.path, "body": body.decode() or None}).encode()
++        self.send_response(status)
++        self.send_header("content-type", "application/json")
++        self.send_header("content-length", str(len(payload)))
++        if mode == "close":
++            self.send_header("connection", "close")
++            self.close_connection = True
++        self.end_headers()
++        self.wfile.write(payload)
++
++    do_GET = do_POST = _serve
++
++
++@pytest.fixture
++def server(monkeypatch):
++    for var in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
++        monkeypatch.delenv(var, raising=False)
++    srv = _Server()
++    t = threading.Thread(target=srv.serve_forever, daemon=True)
++    t.start()
++    yield srv
++    srv.shutdown()
++    srv.server_close()
++
++
++def _hub(srv, prefix=""):
++    host, port = srv.server_address
++    return ksc.Hub(ksc.Identity(url=f"http://{host}:{port}{prefix}", key="k" * 16, gateway="gw"), timeout=5)
++
++
++def test_sequential_requests_share_one_connection(server):
++    hub = _hub(server)
++    for i in range(5):
++        assert hub.changes("default", since=i)["path"] == f"/v2/boards/default/changes?since={i}&limit=500"
++    hub.ops("default", [{"op": 1}])
++    assert len(server.requests) == 6
++    assert server.connections == 1  # urlopen opened 6: one TCP connect + TLS handshake + trust evaluation each
++
++
++def test_url_path_prefix_is_kept(server):
++    hub = _hub(server, prefix="/base")
++    assert hub.machines()["path"] == "/base/v2/machines"
++
++
++def test_server_idle_close_reconnects_transparently(server):
++    hub = _hub(server)
++    hub.machines()
++    server.close_idle()
++    assert hub.machines()["path"] == "/v2/machines"
++    assert server.connections == 2
++    assert len(server.requests) == 2  # the closed socket was detected before reuse; nothing was sent twice
++
++
++def test_stale_socket_get_is_retried_once(server, monkeypatch):
++    hub = _hub(server)
++    hub.machines()
++    monkeypatch.setattr(ksc, "_peer_closed", lambda conn: False)  # the close lands after the pre-reuse check
++    server.close_idle()
++    assert hub.machines()["path"] == "/v2/machines"
++    assert server.connections == 2
++
++
++def test_post_whose_answer_is_lost_is_not_resent(server):
++    hub = _hub(server)
++    hub.machines()
++    server.mode = "drop_post"
++    with pytest.raises(OSError):
++        hub.ops("default", [{"op": 1}])
++    assert [m for m, _ in server.requests].count("POST") == 1
++    server.mode = "ok"
++    assert hub.ops("default", [{"op": 2}])["body"] == json.dumps({"ops": [{"op": 2}]})
++
++
++def test_error_statuses_keep_the_urlopen_contract_and_the_connection(server):
++    hub = _hub(server)
++    server.mode = "status:410"
++    with pytest.raises(ksc.Resync):
++        hub.changes("default", since=1)
++    server.mode = "status:503"
++    with pytest.raises(ksc.HubError) as exc:
++        hub.machines()
++    assert exc.value.status == 503 and '"path": "/v2/machines"' in exc.value.detail
++    server.mode = "ok"
++    hub.machines()
++    assert server.connections == 1
++
++
++def test_protocol_garbage_is_an_oserror(server):
++    hub = _hub(server)
++    server.mode = "bad_status"
++    with pytest.raises(urllib.error.URLError):
++        hub.machines()
++    server.mode = "ok"
++    assert hub.machines()["path"] == "/v2/machines"
++
++
++def test_connection_close_response_is_not_reused(server):
++    hub = _hub(server)
++    server.mode = "close"
++    hub.machines()
++    hub.machines()
++    assert server.connections == 2
++
++
++def test_idle_connection_past_reuse_window_is_replaced(server, monkeypatch):
++    hub = _hub(server)
++    hub.machines()
++    monkeypatch.setattr(ksc.Hub, "IDLE_REUSE_S", -1.0)
++    hub.machines()
++    assert server.connections == 2
++
++
++def test_threads_never_share_a_connection(server):
++    hub = _hub(server)
++    errors = []
++
++    def work():
++        try:
++            for _ in range(5):
++                hub.machines()
++        except Exception as exc:
++            errors.append(exc)
++
++    threads = [threading.Thread(target=work) for _ in range(4)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert not errors
++    assert len(server.requests) == 20
++    assert server.connections == 4
++
++
++def test_environment_proxy_keeps_urlopen(server, monkeypatch):
++    calls = []
++    monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")
++    monkeypatch.setattr(ksc.Hub, "_call_urlopen", lambda self, m, p, d: calls.append((m, p)) or {"via": "urlopen"})
++    assert _hub(server).machines() == {"via": "urlopen"}
++    assert calls == [("GET", "/v2/machines")] and server.requests == []
++
++
++def test_failed_send_on_reused_socket_is_retried_on_a_fresh_one(server, monkeypatch):
++    hub = _hub(server)
++    hub.machines()
++    monkeypatch.setattr(ksc, "_peer_closed", lambda conn: False)
++    hub._local.conn.sock.close()  # the reused socket is dead before the request is written
++    assert hub.ops("default", [{"op": 1}])["body"] == json.dumps({"ops": [{"op": 1}]})
++    assert [m for m, _ in server.requests].count("POST") == 1
++    assert server.connections == 2
++
++
++def test_connection_inherited_across_fork_is_left_alone(server):
++    hub = _hub(server)
++    hub.machines()
++    inherited = hub._local.conn
++    hub._local.pid = -1  # what a forked child sees: the parent's pid on the connection
++    hub.machines()
++    assert hub._local.conn is not inherited and inherited.sock is not None  # not closed under the parent
++    assert server.connections == 2
++
++
++def test_peer_closed_works_above_select_fd_ceiling():
++    import resource
++    from types import SimpleNamespace
++    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
++    if soft <= 1100:
++        pytest.skip("RLIMIT_NOFILE too low to hold an fd above 1024")
++    ours, peer = socket.socketpair()
++    high = socket.socket(fileno=os.dup2(ours.fileno(), 1100))
++    ours.close()
++    try:
++        conn = SimpleNamespace(sock=high)
++        assert ksc._peer_closed(conn) is False  # select() raises ValueError for fd 1100: every reuse reconnected
++        peer.close()
++        assert ksc._peer_closed(conn) is True
++    finally:
++        high.close()
++        peer.close()
++
++
++class _Redirect(http.server.BaseHTTPRequestHandler):
++    protocol_version = "HTTP/1.1"
++
++    def log_message(self, *a):
++        pass
++
++    def _serve(self):
++        n = int(self.headers.get("content-length") or 0)
++        if n:
++            self.rfile.read(n)
++        self.server.requests.append((self.command, self.path))
++        if self.path.startswith("/moved"):
++            payload = b'{"moved": true}'
++            self.send_response(200)
++        else:
++            payload = b""
++            self.send_response(302)
++            self.send_header("location", "/moved")
++        self.send_header("content-length", str(len(payload)))
++        self.end_headers()
++        self.wfile.write(payload)
++
++    do_GET = do_POST = _serve
++
++
++def test_redirects_follow_for_get_and_never_resend_a_post(monkeypatch):
++    for var in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
++        monkeypatch.delenv(var, raising=False)
++    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Redirect)
++    srv.daemon_threads = True
++    srv.requests = []
++    threading.Thread(target=srv.serve_forever, daemon=True).start()
++    try:
++        hub = _hub(srv)
++        assert hub.machines() == {"moved": True}
++        srv.requests.clear()
++        with pytest.raises(ksc.HubError) as exc:
++            hub.ops("default", [{"op": 1}])
++        assert exc.value.status == 302
++        assert srv.requests == [("POST", "/v2/boards/default/ops")]
++    finally:
++        srv.shutdown()
++        srv.server_close()
+-- 
+2.55.0
+

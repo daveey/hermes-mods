@@ -1,0 +1,485 @@
+From 64c02b14eee6ca155ffde375f348715ab8f34224 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 02:02:16 +0000
+Subject: [PATCH] fix(kanban): quota-episode routing checks walls it didn't
+ record, falls back to the strong tier, and feeds its deadline to the stuck
+ warning [daveey]
+
+Follow-ups from the Opus review of PR #578 (t_01a19987de068d42):
+- decision() used to admit a target provider just because this episode had not hit it. A target that
+  provider_walls.json or the live OAuth pool shows as walled now counts as walled. This also holds
+  explicit pins and review-lane cards whose provider is walled elsewhere; they wait and the pin is not
+  rewritten. Once the episode is over, resolve_dispatch_tier applies the provider-wall reroute again
+  (it gated on episode() before, now on active()). So a card that moved off codex and was then walled
+  on anthropic is not routed back to walled codex during the episode or after it.
+- When no class alternate exists, an unpinned default episode card now takes main's strong-tier
+  retier_for_walls fallback. That covers routing off, a default model in no class or in more than one,
+  and a class whose routes are all walled. The fallback is judged against the episode's own walls too
+  (new extra_walls). Explicit pins still wait for the reset.
+- guard_hold_until() reads the episode's outstanding deadline (doubling backoff, every provider's wall)
+  for subscription_quota_reset and rate_limit_cooldown. The stuck warning's "(until ...)" now matches
+  the guard instead of ended_at + one cooldown.
+
+Tests: tests/hermes_cli/test_kanban_quota_episode_walls.py. 11 fail on main and 13/13 pass here (the
+other 2 are controls). In test_new_unpinned_card_created_after_a_known_wall_never_routes_to_it, the
+first card is now archived to isolate the tick: its own episode now reroutes it, which is the fixed
+behaviour, and a raw status='blocked' did not keep it out of the tick.
+---
+ hermes_cli/kanban_db_dispatch_clock.py        |   8 +
+ hermes_cli/kanban_model_tier.py               |   5 +-
+ hermes_cli/kanban_provider_walls.py           |   9 +-
+ hermes_cli/kanban_quota_episode.py            |  54 +++-
+ tests/hermes_cli/test_kanban_quota_episode.py |   5 +-
+ .../test_kanban_quota_episode_walls.py        | 267 ++++++++++++++++++
+ 6 files changed, 333 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_quota_episode_walls.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_clock.py b/hermes_cli/kanban_db_dispatch_clock.py
+index 95f63128d92..eba8b707fe5 100644
+--- a/hermes_cli/kanban_db_dispatch_clock.py
++++ b/hermes_cli/kanban_db_dispatch_clock.py
+@@ -22,6 +22,8 @@ CLOCK_REASONS = frozenset({
+     "infrastructure_cooldown",   # latest refused spawn + the same cooldown
+     "owner_restart_cooldown",    # run lost to its owner's restart + owner-restart cooldown
+ })
++# The reasons ``kanban_quota_episode.decision`` holds an episode card on.
++_EPISODE_REASONS = frozenset({"subscription_quota_reset", "rate_limit_cooldown"})
+ 
+ 
+ def guard_hold_until(conn: sqlite3.Connection, task_id: str, reason: str, now: int) -> Optional[int]:
+@@ -29,6 +31,12 @@ def guard_hold_until(conn: sqlite3.Connection, task_id: str, reason: str, now: i
+     if reason not in CLOCK_REASONS:
+         return None
+     from hermes_cli import kanban_db as kb
++    if reason in _EPISODE_REASONS:
++        # A quota episode's deadline (doubling backoff, every provider's wall) is what the guard holds on.
++        from hermes_cli.kanban_quota_episode import hold_until
++        until = hold_until(conn, task_id, now)
++        if until is not None:
++            return int(until) if until > now else None
+     if reason == "subscription_quota_reset":
+         reset = _receipt_reset_at(conn, task_id)
+         return int(reset) if reset is not None and reset > now else None
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index db89cdd63d7..7c948f2a82c 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -289,13 +289,14 @@ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Opt
+ 
+ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+     """One read-only route decision for preview and actual admission."""
+-    from hermes_cli.kanban_quota_episode import decision, episode
++    from hermes_cli.kanban_quota_episode import active, decision
+     base = resolve_model_tier(conn, task, lane=lane, cfg=cfg)
+     _, route = decision(conn, task, lane=lane, cfg=cfg, base=base)
+     if route:
+         return *route, f'{base[2]}+quota_reroute'
+-    if episode(conn, task.id):
++    if active(conn, task.id):
+         return base
++    # An expired episode no longer judges the route: another card's (or the live pool's) wall still does.
+     # Legacy provider-wide walls may only change ordinary default routing.
+     if base[2] == 'default' and not task.provider_override:
+         from hermes_cli.kanban_provider_walls import retier_for_walls
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index 765ed039970..423067774ab 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -127,11 +127,14 @@ def record_wall_for_run(conn: sqlite3.Connection, task_id: str, run_id: Optional
+ 
+ 
+ def retier_for_walls(task: Any, cfg: dict[str, Any], *, now: Optional[float] = None,
+-                     path: Optional[Path] = None) -> Optional[tuple[str, str, str]]:
+-    """``(model, provider, walled_provider)`` to run on instead, or None to leave the task alone."""
++                     path: Optional[Path] = None,
++                     extra_walls: Optional[dict[str, float]] = None) -> Optional[tuple[str, str, str]]:
++    """``(model, provider, walled_provider)`` to run on instead, or None to leave the task alone.
++
++    ``extra_walls`` adds walls only the caller knows (a card's own quota episode)."""
+     if REQUIRE_MODEL_MARKER in f"{getattr(task, 'title', '') or ''}\n{getattr(task, 'body', '') or ''}":
+         return None
+-    walls = active_walls(now=now, path=path)
++    walls = {**active_walls(now=now, path=path), **(extra_walls or {})}
+     task_model = str(getattr(task, "model_override", "") or "").strip()
+     provider = _norm(getattr(task, "provider_override", None)) or (profile_provider() if not task_model else "")
+     if not provider or provider == "auto":
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index e8ae70668bf..94a2be97e50 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -80,8 +80,8 @@ def _outstanding(conn, task_id, state, now):
+     return out
+ 
+ 
+-def _base_provider(task, base):
+-    """The concrete provider admission would run *task* on with *base*, or None when unknown."""
++def _base_route(task, base):
++    """The concrete ``(model, provider)`` admission would run *task* on with *base*, or None when unknown."""
+     from agent.model_routing import is_class_selector
+     from hermes_cli.kanban_model_tier import profile_route
+     model, provider = base[:2]
+@@ -91,7 +91,40 @@ def _base_provider(task, base):
+         model, provider = profile_route(getattr(task, 'assignee', None))
+     if not model or is_class_selector(model) or not provider or str(provider).lower() == 'auto':
+         return None
+-    return str(provider).strip().lower()
++    return str(model), str(provider).strip().lower()
++
++
++def _walled_elsewhere(model, provider, now):
++    """Deadline of a wall on *provider* that this episode never saw (another card's, or the live pool's)."""
++    from hermes_cli import kanban_provider_walls as pw
++    known = pw.active_walls(now=now).get(provider)
++    return known if known is not None else pw.live_quota_wall(provider, model)
++
++
++def _strong_fallback(task, base, walls, cfg, now):
++    """Main's strong-tier fallback for an unpinned default card, judged against this episode's walls too.
++
++    Used when no class alternate exists (routing off, or the default model is in no class): without it the
++    card waited out the whole wall although the strong tier had room."""
++    from copy import copy
++    from hermes_cli.kanban_model_tier import load_tier_config
++    from hermes_cli.kanban_provider_walls import retier_for_walls
++    if task.model_override or task.provider_override or base[2] != 'default' or not base[0]:
++        return None
++    probe = copy(task)
++    probe.model_override, probe.provider_override = base[:2]
++    moved = retier_for_walls(probe, load_tier_config() if cfg is None else cfg, now=now, extra_walls=walls)
++    return moved[:2] if moved else None
++
++
++def hold_until(conn, task_id, now=None):
++    """Latest deadline this task's quota episode still holds (every provider it hit), or None."""
++    state = episode(conn, task_id)
++    if not state:
++        return None
++    now = time.time() if now is None else now
++    outstanding = _outstanding(conn, task_id, state, now)
++    return max(s['until'] for s in outstanding) if outstanding else None
+ 
+ 
+ def alternate_route(conn, task, walls, base, now):
+@@ -151,20 +184,25 @@ def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
+             walls[name] = max(walls.get(name, 0), wall['until'])
+     try:
+         base = base or resolve_model_tier(conn, task, lane=lane, cfg=cfg)
+-        target = _base_provider(task, base)
++        target = _base_route(task, base)
++        if target is not None and not unknown and target[1] not in walls:
++            # A provider this episode never hit may still be walled (another card's wall, the live pool):
++            # admitting it would send a card moved off codex, then walled on anthropic, back to codex.
++            elsewhere = _walled_elsewhere(*target, now)
++            if elsewhere is None:
++                # The route admission will use is a known, free, different provider (e.g. a re-pinned card).
++                return None, None
++            walls[target[1]] = elsewhere
+     except sqlite3.Error:
+         raise
+     except Exception:
+         logger.warning('kanban quota: route resolve failed for %s; holding', task.id, exc_info=True)
+         return held, None
+-    if target is not None and not unknown and target not in walls:
+-        # The route admission will use is a known, different provider (e.g. a re-pinned card).
+-        return None, None
+     if lane == 'review' or unknown:
+         # An unrecorded wall may be any provider: no route can be proven to avoid it.
+         return held, None
+     try:
+-        route = alternate_route(conn, task, walls, base, now)
++        route = alternate_route(conn, task, walls, base, now) or _strong_fallback(task, base, walls, cfg, now)
+     except sqlite3.Error:
+         raise
+     except Exception:
+diff --git a/tests/hermes_cli/test_kanban_quota_episode.py b/tests/hermes_cli/test_kanban_quota_episode.py
+index 599ac2bd6bc..97a193c1689 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode.py
++++ b/tests/hermes_cli/test_kanban_quota_episode.py
+@@ -272,8 +272,9 @@ def test_new_unpinned_card_created_after_a_known_wall_never_routes_to_it(board,
+              fields={'failure_reason': 'rate_limit', 'failure_retryable': True, 'failure_resets_at': float(reset),
+                      'route_provider': 'openai-codex', 'route_model': 'gpt-6-astra'})
+         assert walls.active_walls(now=clock[0]).get('openai-codex') == pytest.approx(reset, abs=1)
+-        # Hold the first card out of this tick so only the new one can be dispatched.
+-        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (first,))
++        # Take the first card out of this tick so only the new one can be dispatched (its own episode
++        # now reroutes it too; test_kanban_quota_episode_walls covers that).
++        kb.archive_task(conn, first)
+         clock[0] += 60
+         new = kb.create_task(conn, title='brand-new default card', assignee='a')
+         conn.commit()
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_walls.py b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+new file mode 100644
+index 00000000000..38b0ab069a4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+@@ -0,0 +1,267 @@
++"""Quota-episode routing must consult every known wall, and its deadline must feed the stuck warning.
++
++Follow-ups from the Opus review of PR #578 (t_01a19987de068d42):
++(a) an episode card with no class alternate skipped the strong-tier fallback and waited out the wall;
++(b) ``decision`` admitted a "different" provider without asking whether that provider was walled too;
++(c) the stuck warning's ``(until ...)`` read a fixed cooldown, not the episode's doubling deadline.
++"""
++from typing import Any
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli.kanban_db_dispatch_clock import guard_hold_until
++from hermes_cli.kanban_quota_episode import episode
++from tests.hermes_cli.test_kanban_quota_episode import board as board, reap, routing  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
++
++HUB_CFG = {'default_model': 'gpt-6-astra', 'default_provider': 'openai-codex',
++           'strong_model': 'claude-opus-5-5', 'strong_provider': 'anthropic'}
++
++
++def _codex_wall(reset) -> dict[str, Any]:
++    return dict(text=f'SubscriptionQuotaUnavailable: Subscription quota unavailable for '
++                f'openai-codex/gpt-6-astra; resets at {reset}.0',
++                fields={'failure_reason': 'rate_limit', 'failure_retryable': True,
++                        'failure_resets_at': float(reset),
++                        'route_provider': 'openai-codex', 'route_model': 'gpt-6-astra'})
++
++
++def _clock(monkeypatch, start=1_800_000_000):
++    clock = [start]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    monkeypatch.setattr(walls.time, 'time', lambda: clock[0])
++    return clock
++
++
++def _hub_tier(monkeypatch):
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: HUB_CFG)
++
++
++@pytest.mark.parametrize('why', ['routing_disabled', 'no_class_alternate'])
++def test_episode_default_card_without_class_alternate_falls_back_to_strong_tier(
++        board, monkeypatch, all_assignees_spawnable, why):
++    """(a) Routing off (or no class peer): the episode's own wall still moves an unpinned default card
++    to the strong tier, even with no provider_walls.json entry and no live pool evidence."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    if why == 'routing_disabled':
++        config['model_routing']['enabled'] = False
++    else:  # gpt-6-astra belongs to no class: alternate_route cannot place it
++        config['model_routing']['routes'] = {'standard': [config['model_routing']['routes']['standard'][0]]}
++    _hub_tier(monkeypatch)
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    reset = clock[0] + 55 * 3600
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='episode default card', assignee='a')
++        reap(conn, tid, admit=HUB_CFG, **_codex_wall(reset))
++        # Only the episode knows the wall: no provider file, no live pool evidence.
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++        clock[0] += 301
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++        assert seen == [('claude-opus-5-5', 'anthropic')]
++        route = kb._json_dict(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
++                                           "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
++        assert route['provider'] == 'anthropic' and 'quota_reroute' in route['tier_reason']
++
++
++def test_episode_fallback_never_reroutes_an_explicit_pin(board, monkeypatch, all_assignees_spawnable):
++    """(a) The strong-tier fallback is for unpinned default cards only; an Astra pin waits for the reset."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    config['model_routing']['enabled'] = False
++    _hub_tier(monkeypatch)
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='astra pin', assignee='a')
++        conn.execute("UPDATE tasks SET model_override='gpt-6-astra', provider_override='openai-codex' WHERE id=?", (tid,))
++        conn.commit()
++        reap(conn, tid, admit=HUB_CFG, **_codex_wall(clock[0] + 55 * 3600))
++        clock[0] += 301
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        persisted = kb.get_task(conn, tid)
++        assert (persisted.model_override, persisted.provider_override) == ('gpt-6-astra', 'openai-codex')
++
++
++@pytest.mark.parametrize('evidence', ['provider_file', 'live_pool'])
++def test_episode_never_admits_a_target_that_is_walled_elsewhere(board, monkeypatch, all_assignees_spawnable, evidence):
++    """(b) The episode walled anthropic; the default route is codex, which another card's wall (or the live
++    pool) shows is walled too. "Different from the episode's provider" is not "free": hold."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    config['model_routing']['enabled'] = False
++    _hub_tier(monkeypatch)
++    codex_reset = clock[0] + 55 * 3600
++    if evidence == 'provider_file':
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(codex_reset)})
++        monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    else:
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++        monkeypatch.setattr(walls, 'live_quota_wall',
++                            lambda provider, model: float(codex_reset) if provider == 'openai-codex' else None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='moved to anthropic then walled there', assignee='a')
++        reap(conn, tid, text='Anthropic usage limit resets in ~11h', provider='anthropic',
++             fields={'route_provider': 'anthropic', 'route_model': 'claude-opus-5-5'})
++        assert episode(conn, tid)['providers'] == ['anthropic']
++        clock[0] += 301
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append(task.provider_override))
++        assert seen == []
++
++
++def test_episode_still_admits_a_target_with_no_wall_anywhere(board, monkeypatch, all_assignees_spawnable):
++    """(b) Control: with no wall on the default provider, the different provider is admitted as before."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    config['model_routing']['enabled'] = False
++    _hub_tier(monkeypatch)
++    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='walled on anthropic only', assignee='a')
++        reap(conn, tid, text='Anthropic usage limit resets in ~11h', provider='anthropic',
++             fields={'route_provider': 'anthropic', 'route_model': 'claude-opus-5-5'})
++        clock[0] += 301
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append(task.provider_override))
++        assert seen == ['openai-codex']
++
++
++def test_stuck_deadline_reads_the_episode_backoff_not_one_cooldown(board, monkeypatch):
++    """(c) Fourth rate-limited run with no hint: the episode holds 2400 s (300, 600, 1200, 2400 doubling);
++    the stuck warning's deadline must say the same, not ended_at + one 300 s cooldown."""
++    clock = _clock(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='backoff deadline', assignee='a')
++        for _ in range(3):
++            reap(conn, tid)
++            state = episode(conn, tid)
++            clock[0] = state['until']
++        reap(conn, tid)
++        state = episode(conn, tid)
++        assert state['count'] == 4 and state['until'] - clock[0] == 2400
++        clock[0] += 400  # past one cooldown, inside the episode's backoff
++        assert dispatch.check_respawn_guard(conn, tid) == 'rate_limit_cooldown'
++        assert guard_hold_until(conn, tid, 'rate_limit_cooldown', clock[0]) == int(state['until'])
++
++
++def test_stuck_deadline_keeps_an_earlier_providers_longer_wall(board, monkeypatch):
++    """(c) The episode holds the latest wall of every provider it hit; the deadline is the longest one."""
++    clock = _clock(monkeypatch)
++    routing(monkeypatch, blocked=True)  # no alternate: the card is held on both walls
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='two walls', assignee='a')
++        reap(conn, tid, text='usage limit resets in ~11h', provider='anthropic')
++        long_until = episode(conn, tid)['until']
++        reap(conn, tid, text='429 rate limited; retry after 5s', provider='openai-codex')
++        assert episode(conn, tid)['until'] < long_until
++        now = clock[0] + 600
++        clock[0] = now
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        assert guard_hold_until(conn, tid, 'subscription_quota_reset', now) == int(long_until)
++
++
++def test_stuck_warning_names_the_episode_deadline_end_to_end(board, monkeypatch, all_assignees_spawnable):
++    """(c) Through a real tick: the held episode card's warning suffix is the episode deadline."""
++    from hermes_cli.kanban_db_dispatch_clock import _iso
++    clock = _clock(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='backoff warning', assignee='a')
++        for _ in range(3):
++            reap(conn, tid)
++            clock[0] = episode(conn, tid)['until']
++        reap(conn, tid)
++        until = int(episode(conn, tid)['until'])
++        clock[0] += 400
++        res = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: None)
++    assert res.clock_held == {tid: ('rate_limit_cooldown', until)}
++    assert f'rate_limit_cooldown=1 (until {_iso(until)})' in dispatch.stuck_warning(6, [res])
++
++
++def test_expired_episode_still_honours_another_cards_wall(board, monkeypatch, all_assignees_spawnable):
++    """(b) The card's own anthropic wall (11 h) ends before codex's (55 h, known from another card). Once the
++    episode is over, routing must still skip walled codex: the provider-wall reroute applies again."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    config['model_routing']['enabled'] = False
++    _hub_tier(monkeypatch)
++    codex_reset = float(clock[0] + 55 * 3600)
++    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': codex_reset})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='anthropic wall ends first', assignee='a')
++        reap(conn, tid, text='Anthropic usage limit resets in ~11h', provider='anthropic',
++             fields={'route_provider': 'anthropic', 'route_model': 'claude-opus-5-5'})
++        clock[0] += 301
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        clock[0] = int(episode(conn, tid)['until']) + 1
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++        assert seen == [('claude-opus-5-5', 'anthropic')]
++
++
++def test_repin_onto_a_provider_walled_elsewhere_waits_and_keeps_the_pin(board, monkeypatch):
++    """(b) An explicit pin moved onto codex while codex is walled (another card's wall) is held, not
++    admitted into the wall, and the pin is never rewritten."""
++    clock = _clock(monkeypatch)
++    routing(monkeypatch)
++    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + 55 * 3600)})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='pinned', assignee='a')
++        conn.execute("UPDATE tasks SET model_override='claude-sonnet-5-5', provider_override='anthropic' WHERE id=?", (tid,))
++        conn.commit()
++        reap(conn, tid, text='resets in ~11h')
++        conn.execute("UPDATE tasks SET model_override='gpt-test', provider_override='openai-codex' WHERE id=?", (tid,))
++        conn.commit()
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        persisted = kb.get_task(conn, tid)
++        assert (persisted.model_override, persisted.provider_override) == ('gpt-test', 'openai-codex')
++
++
++def test_review_card_waits_when_its_strong_provider_is_walled_elsewhere(board, monkeypatch):
++    """(b) Review lane: the episode walled codex, the review route (strong tier, anthropic) is walled by
++    another card's wall. Holding beats sending the review into that wall."""
++    clock = _clock(monkeypatch)
++    routing(monkeypatch)
++    _hub_tier(monkeypatch)
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='review behind two walls', assignee='a')
++        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++        conn.commit()
++        reap(conn, tid, lane='review', provider='openai-codex', **_codex_wall(clock[0] + 55 * 3600))
++        clock[0] += 301
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++        free = dispatch.check_respawn_guard(conn, tid, lane='review')
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'anthropic': float(clock[0] + 3600)})
++        walled = dispatch.check_respawn_guard(conn, tid, lane='review')
++    assert free is None  # control: anthropic free, the review is admitted on it
++    assert walled == 'subscription_quota_reset'
++
++
++def test_class_with_every_route_walled_falls_back_to_strong_tier(board, monkeypatch, all_assignees_spawnable):
++    """(a) The default model's class exists but its only route is the walled one: the strong tier takes it."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    codex_route = dict(config['model_routing']['routes']['standard'][1], model='gpt-6-astra')
++    config['model_routing']['routes'] = {'deep': [codex_route]}
++    _hub_tier(monkeypatch)
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='only codex in class', assignee='a')
++        reap(conn, tid, admit=HUB_CFG, **_codex_wall(clock[0] + 55 * 3600))
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++        clock[0] += 301
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++        assert seen == [('claude-opus-5-5', 'anthropic')]
+-- 
+2.55.0
+

@@ -1,0 +1,322 @@
+From 6cd4413afd2ff230abe3f6000c888aa24599b154 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 02:11:01 +0000
+Subject: [PATCH] [daveey] desktop plugins: re-check linked plugin.js on power
+ resume and every minute
+
+fs.watch events are a hint, not the truth: macOS FSEvents can drop events
+(libuv discards the kFSEventStreamEventFlag*Dropped notice, so fs.watch never
+reports it), and a git pull into ~/code/hermes-mods right after a wake left the
+MacBook Desktop running a stale session-mentions plugin.js for 35 min, until the
+file was touched (t_01a199f0b0f218b0).
+
+refreshChangedDiskPlugins() re-reads every known plugin.js and reloads (and
+re-arms the watch for) the ones whose bytes differ from what was loaded. It runs
+on onPowerResume and every DISK_REFRESH_MS (60 s); unchanged files cost one read.
+---
+ .../contrib/runtime-loader-refresh.test.ts    | 158 ++++++++++++++++++
+ apps/desktop/src/contrib/runtime-loader.ts    |  89 +++++++++-
+ 2 files changed, 246 insertions(+), 1 deletion(-)
+ create mode 100644 apps/desktop/src/contrib/runtime-loader-refresh.test.ts
+
+diff --git a/apps/desktop/src/contrib/runtime-loader-refresh.test.ts b/apps/desktop/src/contrib/runtime-loader-refresh.test.ts
+new file mode 100644
+index 00000000000..796f35c5548
+--- /dev/null
++++ b/apps/desktop/src/contrib/runtime-loader-refresh.test.ts
+@@ -0,0 +1,158 @@
++// [daveey] Level-triggered refresh of disk plugins: a plugin.js whose bytes changed
++// with NO fs watch event (FSEvents dropped around sleep/wake, a dead watch, a git
++// pull right after a wake) is reloaded on the next power resume and on the
++// once-a-minute interval. Own file: watchRuntimePlugins() is once-per-module.
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { HermesReadDirResult } from '@/global'
++
++import { DISK_REFRESH_MS, refreshChangedDiskPlugins, unloadRuntimePlugin, watchRuntimePlugins } from './runtime-loader'
++
++const root = '/local/.hermes/desktop-plugins'
++const file = `${root}/linked/plugin.js`
++
++const desktopPluginsRoot = vi.fn<() => Promise<string>>()
++const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()
++const readFileText = vi.fn<(path: string) => Promise<{ text: string; truncated?: boolean }>>()
++const watchDirectory = vi.fn<(path: string) => Promise<{ id: string }>>()
++const watchPreviewFile = vi.fn<(path: string) => Promise<{ id: string }>>()
++const stopPreviewFileWatch = vi.fn<(id: string) => Promise<boolean>>()
++const onPreviewFileChanged = vi.fn()
++const logLine = vi.fn<(line: string) => void>()
++let resumeCallbacks: (() => void)[] = []
++
++const onPowerResume = vi.fn((cb: () => void) => {
++  resumeCallbacks.push(cb)
++
++  return () => undefined
++})
++
++const counters = globalThis as unknown as Record<string, number | undefined>
++const version = (v: string) => `export default { id: "linked", register() { globalThis.__linked_${v} = (globalThis.__linked_${v} ?? 0) + 1 } }`
++let source = version('v1')
++let watchN = 0
++let restoreBlob: () => void = () => undefined
++
++beforeEach(() => {
++  source = version('v1')
++  watchN = 0
++  resumeCallbacks = []
++
++  for (const key of Object.keys(counters).filter(k => k.startsWith('__linked_'))) {
++    delete counters[key]
++  }
++
++  desktopPluginsRoot.mockResolvedValue(root)
++  readDir.mockImplementation(async dir => {
++    if (dir === root) {
++      return { entries: [{ isDirectory: true, name: 'linked', path: `${root}/linked` }] }
++    }
++
++    if (dir === `${root}/linked`) {
++      return { entries: [{ isDirectory: false, name: 'plugin.js', path: file }] }
++    }
++
++    return { entries: [] }
++  })
++  readFileText.mockImplementation(async () => ({ text: source }))
++  watchDirectory.mockResolvedValue({ id: 'dir-watch' })
++  watchPreviewFile.mockImplementation(async () => ({ id: `w-linked-${++watchN}` }))
++  stopPreviewFileWatch.mockResolvedValue(true)
++  stopPreviewFileWatch.mockClear()
++  logLine.mockClear()
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
++    desktopPluginsRoot,
++    logLine,
++    onPowerResume,
++    onPreviewFileChanged,
++    readDir,
++    readFileText,
++    stopPreviewFileWatch,
++    watchDirectory,
++    watchPreviewFile
++  }
++
++  const createObjectURL = vi
++    .spyOn(URL, 'createObjectURL')
++    .mockImplementation(
++      blob =>
++        `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
++    )
++
++  const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
++  const RealBlob = globalThis.Blob
++  vi.stubGlobal(
++    'Blob',
++    class {
++      parts: string[]
++      constructor(parts: string[]) {
++        this.parts = parts
++      }
++    }
++  )
++
++  restoreBlob = () => {
++    createObjectURL.mockRestore()
++    revokeObjectURL.mockRestore()
++    vi.stubGlobal('Blob', RealBlob)
++  }
++})
++
++afterEach(() => {
++  restoreBlob()
++  vi.useRealTimers()
++})
++
++describe('disk plugins: level-triggered refresh (missed fs events)', () => {
++  it('entry paths: power resume and the interval each reload a plugin.js rewritten with no watch event', async () => {
++    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
++
++    watchRuntimePlugins()
++    await vi.waitFor(() => expect(counters.__linked_v1).toBe(1))
++    // The first scan has also bound the file watch (scan finished).
++    await vi.waitFor(() => expect(watchPreviewFile).toHaveBeenCalledTimes(1))
++    await Promise.resolve()
++    expect(onPowerResume).toHaveBeenCalledTimes(1)
++
++    // A git fast-forward rewrites the file; the fs watch never fires.
++    source = version('v2')
++    resumeCallbacks.forEach(cb => cb())
++    await vi.waitFor(() => expect(counters.__linked_v2).toBe(1))
++    // The orphaned watch is released and the current file is watched again.
++    expect(stopPreviewFileWatch).toHaveBeenCalledWith('w-linked-1')
++    expect(watchPreviewFile).toHaveBeenLastCalledWith(file)
++    expect(logLine).toHaveBeenCalledWith(expect.stringContaining('linked: plugin.js changed with no watch event; reloaded (resume)'))
++
++    // Later change, still no event, no wake: the minute interval picks it up.
++    source = version('v3')
++    vi.advanceTimersByTime(DISK_REFRESH_MS)
++    await vi.waitFor(() => expect(counters.__linked_v3).toBe(1))
++    expect(logLine).toHaveBeenCalledWith(expect.stringContaining('reloaded (interval)'))
++    expect(counters.__linked_v1).toBe(1)
++    expect(counters.__linked_v2).toBe(1)
++
++    unloadRuntimePlugin('linked')
++  })
++
++  it('unchanged bytes never reload, and a vanished file hands off to the scan instead of reloading', async () => {
++    // The module's disk map still holds `linked` from the first case (v3 there);
++    // re-sync it to this case's source through a refresh first.
++    source = version('v4')
++    await refreshChangedDiskPlugins('test')
++    expect(counters.__linked_v4).toBe(1)
++
++    const reads = readFileText.mock.calls.length
++    expect(await refreshChangedDiskPlugins('test')).toEqual([])
++    expect(await refreshChangedDiskPlugins('test')).toEqual([])
++    expect(counters.__linked_v4).toBe(1)
++    expect(readFileText.mock.calls.length).toBe(reads + 2)
++
++    // File gone (folder removed between scans): no reload, the scan retires it.
++    readFileText.mockImplementation(async () => {
++      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
++    })
++    readDir.mockImplementation(async dir => (dir === root ? { entries: [] } : { entries: [] }))
++    expect(await refreshChangedDiskPlugins('test')).toEqual([])
++    await vi.waitFor(() => expect(stopPreviewFileWatch).toHaveBeenCalled())
++  })
++})
+diff --git a/apps/desktop/src/contrib/runtime-loader.ts b/apps/desktop/src/contrib/runtime-loader.ts
+index 9cf318ddfdf..541ca88cd62 100644
+--- a/apps/desktop/src/contrib/runtime-loader.ts
++++ b/apps/desktop/src/contrib/runtime-loader.ts
+@@ -563,13 +563,21 @@ export async function loadRuntimePlugin(
+ //    main): saving the file hot-reloads the plugin in place;
+ //  - each root is fs-watched too (watchDirectory IPC), so new folders load +
+ //    removed ones unload on the change tick; older Electron shells without
+-//    watchDirectory fall back to the slow visible-tab poll.
++//    watchDirectory fall back to the slow visible-tab poll;
++//  - [daveey] fs events are a hint, not the truth: on every power resume and
++//    once a minute each known plugin.js is re-read and reloaded when its bytes
++//    differ from what was loaded (refreshChangedDiskPlugins). macOS FSEvents can
++//    drop events (libuv discards the "events were dropped" notice, so fs.watch
++//    never says so), and a `git pull` into a linked checkout right after a wake
++//    left a Desktop running a stale plugin until the file was touched again.
+ // Panes land via placement adoption and STAY where the user drags them —
+ // the tree treats not-yet-loaded pane ids as hidden, so boot and reload are
+ // collapse -> appear, never a placeholder flash.
+ // ---------------------------------------------------------------------------
+ 
+ const DISK_POLL_MS = 5_000
++/** [daveey] Level-triggered re-check of every known plugin.js (see header). */
++export const DISK_REFRESH_MS = 60_000
+ 
+ interface DiskRoot {
+   dir: string
+@@ -647,6 +655,9 @@ interface DiskPlugin {
+   packageOrigin?: PackageMarker['origin']
+   /** Loaded plugin id (null while broken — kept so a fixing save reloads). */
+   id: null | string
++  /** [daveey] The plugin.js text last read for this entry (loaded or not): the
++   *  refresh pass reloads only when the file on disk differs from it. */
++  loadedSource?: string
+   /** Origin label (folder name) — the toast/inventory name for load errors. */
+   origin: string
+   /** Linked dev package only: the SOURCE `desktop/plugin.js` this copy came from. */
+@@ -713,6 +724,7 @@ async function loadDiskPlugin(entry: DiskPlugin): Promise<boolean> {
+ 
+   try {
+     const text = await readPluginSourceText(entry.file)
++    entry.loadedSource = text
+ 
+     const id = await loadRuntimePlugin(text, entry.origin, {
+       defaultEnabled: entry.defaultEnabled,
+@@ -1039,6 +1051,73 @@ export async function uninstallDiskPlugin(
+   return { ok: true }
+ }
+ 
++let refreshing = false
++
++/** [daveey] Re-read every known plugin.js and reload the ones whose bytes no
++ *  longer match what was loaded, re-arming their watch (a rename-over or a
++ *  folder swap orphans the old one). Runs on power resume and every
++ *  DISK_REFRESH_MS, so a change whose fs event never arrived (dropped FSEvents
++ *  around sleep/wake, a dead watch) is picked up within a minute instead of at
++ *  the next save or restart. Returns the reloaded entry files. */
++export async function refreshChangedDiskPlugins(reason = 'refresh'): Promise<string[]> {
++  const desktop = window.hermesDesktop
++
++  if (!desktop || scanning || refreshing || disk.size === 0) {
++    return []
++  }
++
++  refreshing = true
++  const reloaded: string[] = []
++  let rescan = false
++
++  try {
++    // Linked dev packages: let Electron re-copy changed sources first (it
++    // reloads what it touched), so the copy compared below is current.
++    if ([...disk.values()].some(record => record.sourceFile)) {
++      await resyncLinkedDiskPlugins()
++    }
++
++    for (const [file, record] of [...disk.entries()]) {
++      if (disk.get(file) !== record) {
++        continue // Retired or replaced while this pass awaited.
++      }
++
++      let text: string
++
++      try {
++        text = await readPluginSourceText(file)
++      } catch (error) {
++        // Oversize: already reported on its row at load; re-reporting it every
++        // pass would toast once a minute. Anything else: gone or unreadable,
++        // so the scan reconciles/unloads it.
++        rescan ||= !(error instanceof PluginSourceOversizeError)
++
++        continue
++      }
++
++      if (text === record.loadedSource) {
++        continue
++      }
++
++      if (await loadDiskPlugin(record)) {
++        await watchDiskPluginFile(desktop, record)
++        reloaded.push(file)
++        desktop.logLine?.(`[plugins] ${record.origin}: plugin.js changed with no watch event; reloaded (${reason})`)
++      } else {
++        rescan = true
++      }
++    }
++  } finally {
++    refreshing = false
++  }
++
++  if (rescan) {
++    void scanDiskPlugins()
++  }
++
++  return reloaded
++}
++
+ /** Manual rescan (the ⌘K "Reload desktop plugins" fallback) — re-reads
+  *  known entries too, unlike the fs-watch/poll reconcile. */
+ export const discoverRuntimePlugins = (): Promise<void> => scanDiskPlugins(true)
+@@ -1123,6 +1202,14 @@ export function watchRuntimePlugins(): void {
+   }
+ 
+   void scanDiskPlugins().then(() => $diskPluginsScanPending.set(false))
++
++  // [daveey] Level-triggered backstop for missed fs events (see header): a
++  // wake is exactly when FSEvents drops, and a sync/pull often lands right
++  // after it; the interval covers everything else. Both live as long as the
++  // window, like the watches.
++  desktop.onPowerResume?.(() => void refreshChangedDiskPlugins('resume'))
++  window.setInterval(() => void refreshChangedDiskPlugins('interval'), DISK_REFRESH_MS)
++
+   void startDirWatches().then(watched => {
+     if (watched) {
+       return
+-- 
+2.55.0
+

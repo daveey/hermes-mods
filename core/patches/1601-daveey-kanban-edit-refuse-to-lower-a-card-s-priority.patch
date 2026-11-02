@@ -1,0 +1,436 @@
+From 0033f8dd69d6007c2c7832f428fd282c639f1a2a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:35:53 +0000
+Subject: [PATCH] [daveey] kanban edit: refuse to lower a card's priority
+ without --reason
+
+A chat ran `kanban edit <id> --priority 10` on a stale read and silently undid
+another actor's raise to 150. The CLI now refuses a lowering with no --reason
+(exit 1, naming the current value); with --reason the change applies and the
+reason lands in the reprioritized event payload. The check runs inside
+edit_task's write transaction (opt-in require_lower_reason), plus a pre-check
+before operator fields commit so a refused edit applies nothing. Raising or
+re-setting the same value is unchanged. Dashboard and REST callers of
+edit_task are unchanged (they don't opt in).
+
+edit_task moves to hermes_cli/kanban_db_edit.py (re-exported from kanban_db)
+to keep kanban_db.py under its line cap.
+---
+ hermes_cli/kanban.py                          |  23 +++-
+ hermes_cli/kanban_db.py                       |  78 +-----------
+ hermes_cli/kanban_db_edit.py                  | 115 ++++++++++++++++++
+ hermes_cli/kanban_parser.py                   |   5 +-
+ .../test_kanban_edit_priority_lower.py        | 112 +++++++++++++++++
+ 5 files changed, 248 insertions(+), 85 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_edit.py
+ create mode 100644 tests/hermes_cli/test_kanban_edit_priority_lower.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 2b7f4143656..0eab1698308 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1266,8 +1266,9 @@ _OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runti
+ def _cmd_edit(args: argparse.Namespace) -> int:
+     if getattr(args, "completion_contract", None) is not None:
+         return _contract_cli.cmd_edit_contract(args)
+-    if getattr(args, "reason", None) is not None:
+-        return _err("kanban edit: --reason only applies to --completion-contract", 2)
++    reason = getattr(args, "reason", None)
++    if reason is not None and getattr(args, "priority", None) is None:
++        return _err("kanban edit: --reason only applies to --completion-contract or --priority", 2)
+     result = getattr(args, "result", None)
+     raw_metadata = getattr(args, "metadata", None)
+     summary = getattr(args, "summary", None)
+@@ -1292,6 +1293,12 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+         return rc
+     with kbc.connect_closing() as conn:
+         changed: dict = {}
++        if priority is not None and has_operator and not (reason or "").strip():
++            # Refuse before the operator columns commit, so a refused lowering applies nothing;
++            # edit_task re-checks inside its own write transaction. [daveey]
++            row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (args.task_id,)).fetchone()
++            if row is not None and priority < int(row[0] or 0):
++                return _err(f"kanban edit: {kb.PriorityLowerRefused(args.task_id, int(row[0] or 0), priority)}")
+         if has_operator:
+             # Operator columns first: a refusal (e.g. a session_id overwrite) must leave the
+             # whole edit unapplied rather than half of it. [daveey]
+@@ -1304,10 +1311,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+             if changed is None:
+                 return _err(f"cannot edit {args.task_id} (unknown id)")
+         if any(value is not None for value in (title, body, priority, result)):
+-            ok = kb.edit_task(
+-                conn, args.task_id, title=title, body=body, priority=priority,
+-                result=result, summary=summary, metadata=metadata,
+-            )
++            try:
++                ok = kb.edit_task(
++                    conn, args.task_id, title=title, body=body, priority=priority,
++                    result=result, summary=summary, metadata=metadata,
++                    priority_reason=reason, require_lower_reason=True,
++                )
++            except kb.PriorityLowerRefused as exc:
++                return _err(f"kanban edit: {exc}")
+             if not ok:
+                 return _err(f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)")
+     detail = "; ".join(f"{f}: {c['old']!r} -> {c['new']!r}" for f, c in (changed or {}).items())
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8a74c5810bd..1413852ca86 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3038,83 +3038,6 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) ->
+     return candidate
+ 
+ 
+-def edit_task(
+-    conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+-    body: Optional[str] = None, priority: Optional[int] = None,
+-    result: Optional[str] = None, summary: Optional[str] = None,
+-    metadata: Optional[dict] = None, board: Optional[str] = None,
+-) -> bool:
+-    """Edit task fields, optionally backfilling a completed task's result."""
+-    changed_fields = [
+-        field for field, value in (("title", title), ("body", body), ("priority", priority))
+-        if value is not None
+-    ]
+-    with write_txn(conn):
+-        status = _task_status(conn, task_id)
+-        if status is None or (result is not None and status != "done"):
+-            return False
+-        assignments = []
+-        params = []
+-        for field, value in (("title", title), ("body", body), ("priority", priority)):
+-            if value is not None:
+-                assignments.append(f"{field} = ?")
+-                params.append(value)
+-        if result is not None:
+-            assignments.append("result = ?")
+-            params.append(result)
+-            changed_fields.append("result")
+-        if not assignments:
+-            return False
+-        conn.execute(
+-            f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?",
+-            (*params, task_id),
+-        )
+-        if priority is not None:
+-            _append_event(conn, task_id, "reprioritized", {"priority": priority})
+-        if result is None:
+-            non_priority_fields = [field for field in changed_fields if field != "priority"]
+-            if non_priority_fields:
+-                _append_event(conn, task_id, "edited", {"fields": non_priority_fields})
+-        else:
+-            handoff_summary = summary if summary is not None else result
+-            changed_fields.append("summary")
+-            if metadata is not None:
+-                changed_fields.append("metadata")
+-            run = conn.execute(
+-            """
+-            SELECT id FROM task_runs
+-             WHERE task_id = ?
+-               AND outcome = 'completed'
+-             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+-             LIMIT 1
+-            """,
+-            (task_id,),
+-        ).fetchone()
+-            if run is None:
+-                run_id = _synthesize_ended_run(
+-                    conn, task_id, outcome="completed", summary=handoff_summary, metadata=metadata,
+-                )
+-            else:
+-                run_id = int(run["id"])
+-                conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (handoff_summary, run_id))
+-                if metadata is not None:
+-                    conn.execute(
+-                        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+-                        (json.dumps(metadata, ensure_ascii=False), run_id),
+-                    )
+-            _append_event(
+-                conn, task_id, "edited",
+-                {
+-                    "fields": ["result", "summary"] + (["metadata"] if metadata is not None else []),
+-                    "result_len": len(result) if result else 0,
+-                    "summary": _first_line(handoff_summary, 400) or None,
+-                },
+-                run_id=run_id,
+-            )
+-    notify_task_updated(conn, task_id, changed_fields, board=board)
+-    return True
+-
+-
+ def _has_probe(wake_check: Optional[str], clock_only: bool) -> bool:
+     return bool(wake_check and str(wake_check).strip()) or bool(clock_only)
+ 
+@@ -4330,6 +4253,7 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
+ # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+ from hermes_cli.kanban_db_comment_ids import comment_id_before_run_start, delivered_comment_ids, own_comment_ids
+ from hermes_cli.kanban_db_schedule import schedule_task
++from hermes_cli.kanban_db_edit import PriorityLowerRefused, edit_task
+ from hermes_cli.kanban_reason_comment import _awaiting_human_answer
+ from hermes_cli.kanban_db_notify import _inherit_notify_subs, _owning_sub_clause
+ from hermes_cli.kanban_db_boards import (
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+new file mode 100644
+index 00000000000..e90a3a43f83
+--- /dev/null
++++ b/hermes_cli/kanban_db_edit.py
+@@ -0,0 +1,115 @@
++"""``edit_task``: title/body/priority edits and result backfill on a done card, plus the
++``hermes kanban edit`` guard that refuses to lower a priority without a reason. Split from
++``kanban_db`` (re-exported there). [daveey]"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Optional
++
++from hermes_cli import kanban_db as _kb
++
++
++class PriorityLowerRefused(ValueError):
++    """An edit would lower a card's priority without a reason (``require_lower_reason``). [daveey]"""
++
++    def __init__(self, task_id: str, current: int, requested: int):
++        self.task_id, self.current, self.requested = task_id, current, requested
++        super().__init__(
++            f"{task_id} priority is currently {current}; lowering it to {requested} needs --reason "
++            f"(another actor may have raised it since you last read it)"
++        )
++
++
++def edit_task(
++    conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
++    body: Optional[str] = None, priority: Optional[int] = None,
++    result: Optional[str] = None, summary: Optional[str] = None,
++    metadata: Optional[dict] = None, board: Optional[str] = None,
++    priority_reason: Optional[str] = None, require_lower_reason: bool = False,
++) -> bool:
++    """Edit task fields, optionally backfilling a completed task's result.
++
++    ``require_lower_reason`` (the ``hermes kanban edit`` CLI path) raises
++    :class:`PriorityLowerRefused` when ``priority`` is below the stored value and no
++    ``priority_reason`` is given; the check runs inside the write transaction, so a
++    stale read can't slip past it. ``priority_reason`` lands in the ``reprioritized``
++    event payload. [daveey]
++    """
++    changed_fields = [
++        field for field, value in (("title", title), ("body", body), ("priority", priority))
++        if value is not None
++    ]
++    with _kb.write_txn(conn):
++        status = _kb._task_status(conn, task_id)
++        if status is None or (result is not None and status != "done"):
++            return False
++        if priority is not None and require_lower_reason and not (priority_reason or "").strip():
++            row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
++            current = int(row[0] or 0) if row else 0
++            if priority < current:
++                raise PriorityLowerRefused(task_id, current, priority)
++        assignments = []
++        params = []
++        for field, value in (("title", title), ("body", body), ("priority", priority)):
++            if value is not None:
++                assignments.append(f"{field} = ?")
++                params.append(value)
++        if result is not None:
++            assignments.append("result = ?")
++            params.append(result)
++            changed_fields.append("result")
++        if not assignments:
++            return False
++        conn.execute(
++            f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?",
++            (*params, task_id),
++        )
++        if priority is not None:
++            payload: dict = {"priority": priority}
++            if priority_reason and priority_reason.strip():
++                payload["reason"] = priority_reason.strip()
++            _kb._append_event(conn, task_id, "reprioritized", payload)
++        if result is None:
++            non_priority_fields = [field for field in changed_fields if field != "priority"]
++            if non_priority_fields:
++                _kb._append_event(conn, task_id, "edited", {"fields": non_priority_fields})
++        else:
++            handoff_summary = summary if summary is not None else result
++            changed_fields.append("summary")
++            if metadata is not None:
++                changed_fields.append("metadata")
++            run = conn.execute(
++            """
++            SELECT id FROM task_runs
++             WHERE task_id = ?
++               AND outcome = 'completed'
++             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
++             LIMIT 1
++            """,
++            (task_id,),
++        ).fetchone()
++            if run is None:
++                run_id = _kb._synthesize_ended_run(
++                    conn, task_id, outcome="completed", summary=handoff_summary, metadata=metadata,
++                )
++            else:
++                run_id = int(run["id"])
++                conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (handoff_summary, run_id))
++                if metadata is not None:
++                    conn.execute(
++                        "UPDATE task_runs SET metadata = ? WHERE id = ?",
++                        (json.dumps(metadata, ensure_ascii=False), run_id),
++                    )
++            _kb._append_event(
++                conn, task_id, "edited",
++                {
++                    "fields": ["result", "summary"] + (["metadata"] if metadata is not None else []),
++                    "result_len": len(result) if result else 0,
++                    "summary": _kb._first_line(handoff_summary, 400) or None,
++                },
++                run_id=run_id,
++            )
++    _kb.notify_task_updated(conn, task_id, changed_fields, board=board)
++    return True
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 87aef07cdfb..9b2570ff6d7 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -438,7 +438,7 @@ _SPECS = [
+         _TASK_ID,
+         _arg("--title", help="Replace the task title"),
+         _arg("--body", help="Replace the task body"),
+-        _arg("--priority", type=int, help="Replace the task priority"),
++        _arg("--priority", type=int, help="Replace the task priority (lowering it requires --reason)"),
+         _arg("--result", help="Backfilled task result text for a done task"),
+         *_STEP_HANDOFF,
+         _arg("--max-retries", type=int, metavar="N", dest="max_retries",
+@@ -456,7 +456,8 @@ _SPECS = [
+              help="Orchestrator only: re-point the completion gate (local-only, OWNER/REPO or an exact "
+                   "PR URL) when the bound one can never pass, e.g. the repo moved or was suspended. "
+                   "Requires --reason; can't be combined with other edit flags"),
+-        _arg("--reason", help="With --completion-contract: why (recorded as an event and a comment)"),
++        _arg("--reason", help="With --completion-contract: why (recorded as an event and a comment). "
++                              "With --priority: why (required to lower it; recorded on the reprioritized event)"),
+     ], help="Edit task fields, operator fields (retries, goal mode, runtime cap, session, completion "
+             "contract), or recovery fields on an already-completed task"),
+     _cmd("reopen", [
+diff --git a/tests/hermes_cli/test_kanban_edit_priority_lower.py b/tests/hermes_cli/test_kanban_edit_priority_lower.py
+new file mode 100644
+index 00000000000..58ab4b1c8da
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_edit_priority_lower.py
+@@ -0,0 +1,112 @@
++"""``hermes kanban edit --priority``: lowering a card's priority needs ``--reason``.
++
++A chat once ran ``kanban edit <id> --priority 10`` on a stale read and silently undid
++another actor's raise to 150. The CLI now refuses a lowering without a reason (exit 1,
++naming the current value); raising or re-setting the same value is unchanged. [daveey]
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_parser import build_parser
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    kb.init_db()
++    return home
++
++
++def _main(argv: list[str]) -> int:
++    """The real argparse + dispatch path (rc and refusals included)."""
++    root = argparse.ArgumentParser(prog="hermes")
++    build_parser(root.add_subparsers(dest="command"))
++    return kc.kanban_command(root.parse_args(["kanban", *argv]))
++
++
++def _card(priority: int) -> str:
++    with kbc.connect_closing() as conn:
++        return kb.create_task(conn, title="card", priority=priority)
++
++
++def _priority(task_id: str) -> int:
++    with kbc.connect_closing() as conn:
++        return int(conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()[0])
++
++
++def _reprioritized(task_id: str) -> list[dict]:
++    with kbc.connect_closing() as conn:
++        return [e.payload or {} for e in kb.list_events(conn, task_id) if e.kind == "reprioritized"]
++
++
++def test_lowering_without_reason_is_refused_naming_current_value(kanban_home, capsys):
++    tid = _card(150)
++    rc = _main(["edit", tid, "--priority", "10"])
++    err = capsys.readouterr().err
++    print(f"rc={rc} priority={_priority(tid)} stderr={err.strip()!r}")
++    assert rc == 1
++    assert "currently 150" in err and "--reason" in err
++    assert _priority(tid) == 150
++    assert _reprioritized(tid) == []
++
++
++def test_lowering_with_reason_applies_and_records_reason(kanban_home, capsys):
++    tid = _card(150)
++    rc = _main(["edit", tid, "--priority", "10", "--reason", "superseded by t_x"])
++    assert rc == 0, capsys.readouterr().err
++    assert _priority(tid) == 10
++    assert _reprioritized(tid) == [{"priority": 10, "reason": "superseded by t_x"}]
++
++
++def test_blank_reason_does_not_count(kanban_home, capsys):
++    tid = _card(150)
++    assert _main(["edit", tid, "--priority", "10", "--reason", "  "]) == 1
++    assert _priority(tid) == 150
++
++
++def test_raising_needs_no_reason(kanban_home, capsys):
++    tid = _card(10)
++    assert _main(["edit", tid, "--priority", "150"]) == 0
++    assert _priority(tid) == 150
++    assert _reprioritized(tid) == [{"priority": 150}]
++
++
++def test_same_value_needs_no_reason(kanban_home, capsys):
++    tid = _card(150)
++    assert _main(["edit", tid, "--priority", "150"]) == 0
++    assert _priority(tid) == 150
++    assert _reprioritized(tid) == [{"priority": 150}]
++
++
++def test_refused_lowering_leaves_operator_fields_unapplied(kanban_home, capsys):
++    tid = _card(150)
++    assert _main(["edit", tid, "--priority", "10", "--max-retries", "5"]) == 1
++    with kbc.connect_closing() as conn:
++        row = conn.execute("SELECT priority, max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (int(row[0]), row[1]) == (150, None)
++
++
++def test_reason_without_priority_or_contract_still_refused(kanban_home, capsys):
++    tid = _card(0)
++    assert _main(["edit", tid, "--title", "x", "--reason", "why"]) == 2
++    assert "--priority" in capsys.readouterr().err
++
++
++def test_library_default_unchanged_for_dashboard_and_rest(kanban_home):
++    """edit_task without require_lower_reason (dashboard/REST callers) still lowers silently."""
++    tid = _card(150)
++    with kbc.connect_closing() as conn:
++        assert kb.edit_task(conn, tid, priority=10)
++    assert _priority(tid) == 10
+-- 
+2.55.0
+

@@ -1,0 +1,166 @@
+From 2a1aa6f72d5dcfd195a29bf10f07560a74228289 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 02:55:39 +0000
+Subject: [PATCH] fix(kanban): goal triage hold keeps local order on
+ legacy/forked synced history
+
+current_park is a hold, not authority. On the PR head it read 'the unique causal
+head is a blocked goal park', so a later non-block lifecycle event, a legacy
+(unevidenced) synced history or forked heads all released the hold and let the
+generic specifier/triage sweep take a judged goal. It now walks back from the
+unique head to the nearest block and falls back to main's local-order answer
+whenever the causal answer is undecided. [daveey]
+---
+ hermes_cli/kanban_goal_recovery.py            |  6 +-
+ hermes_cli/kanban_recovery_history.py         | 46 ++++++++++++---
+ .../test_kanban_recovery_reconcile.py         | 56 +++++++++++++++++++
+ 3 files changed, 97 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_goal_recovery.py b/hermes_cli/kanban_goal_recovery.py
+index 31478c502d0..e2c5f490896 100644
+--- a/hermes_cli/kanban_goal_recovery.py
++++ b/hermes_cli/kanban_goal_recovery.py
+@@ -99,9 +99,11 @@ def current_park(conn, task_id):
+     """Keep judged goals out of generic triage re-entry, even after recovery ends."""
+     from hermes_cli.kanban_resume_exec import _payload
+     from hermes_cli import kanban_recovery_history as history
+-    if history.synced(conn):
+-        row = history.latest(conn, task_id, ('blocked',))
++    decided, row = history.nearest(conn, task_id, ('blocked',)) if history.synced(conn) else (False, None)
++    if decided:
+         return bool(row and _payload(row['payload']).get('rekind_reason') == EVENT)
++    # Unsynced, legacy or forked history: this is a hold, not authority, so it keeps
++    # local order rather than failing open into generic triage.
+     row = conn.execute(
+         "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
+         (task_id,)).fetchone()
+diff --git a/hermes_cli/kanban_recovery_history.py b/hermes_cli/kanban_recovery_history.py
+index 917e14833f8..2cfd46f0176 100644
+--- a/hermes_cli/kanban_recovery_history.py
++++ b/hermes_cli/kanban_recovery_history.py
+@@ -41,18 +41,46 @@ def heads(rows):
+     return [row for row in rows if identity(row) not in seen]
+ 
+ 
+-def latest(conn, target, kinds):
+-    rows = events(conn, target, kinds)
+-    if not synced(conn):
+-        return max(rows, key=lambda r: r['id'], default=None)
++def head(conn, target):
++    """The unique evidenced lifecycle head of ``target``, or None (legacy or forked history)."""
+     # Include intermediate lifecycle events when finding a blocked head: filtering
+     # first would discard the links that supersede an older park.
+     from hermes_cli.kanban_resume_exec import _LIFECYCLE_KINDS
+-    lifecycle = events(conn, target, _LIFECYCLE_KINDS)
+-    tips = heads(lifecycle)
+-    if len(tips) != 1 or not metadata(tips[0]):
+-        return None
+-    return tips[0] if tips[0]['kind'] in kinds else None
++    tips = heads(events(conn, target, _LIFECYCLE_KINDS))
++    return tips[0] if len(tips) == 1 and metadata(tips[0]) else None
++
++
++def latest(conn, target, kinds):
++    if not synced(conn):
++        return max(events(conn, target, kinds), key=lambda r: r['id'], default=None)
++    tip = head(conn, target)
++    return tip if tip is not None and tip['kind'] in kinds else None
++
++
++def nearest(conn, target, kinds):
++    """``(decided, row)``: the causally newest ``kinds`` event at or behind the unique head.
++
++    Undecided (False, None) for legacy or forked history, or when the walk meets an
++    unevidenced ancestor or two candidates at once; callers then keep local order.
++    """
++    from hermes_cli.kanban_resume_exec import _LIFECYCLE_KINDS
++    tip = head(conn, target)
++    if tip is None:
++        return False, None
++    by_id = {identity(r): r for r in events(conn, target, _LIFECYCLE_KINDS)}
++    frontier, seen = [tip], set()
++    while frontier:
++        found = [r for r in frontier if r['kind'] in kinds]
++        if found:
++            return (True, found[0]) if len(found) == 1 else (False, None)
++        if any(not metadata(r) for r in frontier):
++            return False, None
++        seen.update(identity(r) for r in frontier)
++        keys = {k for r in frontier for k in metadata(r).get('predecessors', []) if k not in seen}
++        if any(k not in by_id for k in keys):
++            return False, None
++        frontier = [by_id[k] for k in keys]
++    return True, None
+ 
+ 
+ def evidenced(conn, target):
+diff --git a/tests/hermes_cli/test_kanban_recovery_reconcile.py b/tests/hermes_cli/test_kanban_recovery_reconcile.py
+index 5fcd403ec1f..1e3991da979 100644
+--- a/tests/hermes_cli/test_kanban_recovery_reconcile.py
++++ b/tests/hermes_cli/test_kanban_recovery_reconcile.py
+@@ -136,6 +136,62 @@ def test_legacy_synced_history_keeps_triage_hold_but_not_authority(gws):
+     assert rx.refusal(home.conn, rec, target) is not None
+ 
+ 
++def _goal_park(home):
++    from hermes_cli import kanban_goal_recovery as goal
++    home.enter()
++    target = kb.create_task(home.conn, title='judged goal', assignee='default', goal_mode=True)
++    assert kb.claim_task(home.conn, target)
++    home.round()
++    task = kb.get_task(home.conn, target)
++    assert task is not None
++    assert goal.park(home.conn, task, 'missing prerequisite', expected_run_id=task.current_run_id)
++    parked = kb.get_task(home.conn, target)
++    assert parked is not None and parked.status == 'triage'
++    return target
++
++
++def test_later_lifecycle_event_keeps_goal_specifier_hold(gws):
++    # Main's contract is "the newest block is the goal park", not "the newest lifecycle
++    # event is that block": a later non-block event in triage must not release the hold.
++    from hermes_cli import kanban_goal_recovery as goal
++    home, _ = gws
++    target = _goal_park(home)
++    with kb.write_txn(home.conn):
++        kb._append_event(home.conn, target, 'ask_rechecked', {'note': 'later'})
++    assert goal.current_park(home.conn, target)
++
++
++def test_legacy_synced_goal_park_keeps_specifier_hold(gws):
++    # A judged goal parked before the upgrade carries no causal evidence. The hold that
++    # keeps it out of generic triage must keep main's local-order answer, not fail open.
++    from hermes_cli import kanban_goal_recovery as goal
++    from hermes_cli.kanban_recovery_history import META
++    home, _ = gws
++    target = _goal_park(home)
++    with kb.write_txn(home.conn):
++        home.conn.execute('UPDATE task_events SET payload=json_remove(payload, ?) WHERE task_id=?',
++                          ('$.' + META, target))
++    assert goal.current_park(home.conn, target)
++
++
++def test_forked_lifecycle_heads_keep_goal_specifier_hold(gws):
++    # Two concurrent lifecycle heads (no unique causal tip) must not release the hold either.
++    from hermes_cli import kanban_goal_recovery as goal
++    home, _ = gws
++    target = _goal_park(home)
++    with kb.write_txn(home.conn):
++        kb._append_event(home.conn, target, 'ask_rechecked', {'note': 'peer A'})
++        a = home.conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (target,)).fetchone()[0]
++        kb._append_event(home.conn, target, 'ask_rechecked', {'note': 'peer B'})
++        b = home.conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (target,)).fetchone()[0]
++        # B was authored without seeing A: give it A's predecessors, forking the history.
++        pa = home.conn.execute("SELECT json_extract(payload, '$._recovery_history_v1.predecessors') "
++                               'FROM task_events WHERE id=?', (a,)).fetchone()[0]
++        home.conn.execute("UPDATE task_events SET payload=json_set(payload, "
++                          "'$._recovery_history_v1.predecessors', json(?)) WHERE id=?", (pa, b))
++    assert goal.current_park(home.conn, target)
++
++
+ def test_goal_park_and_receipt_restore_without_changing_judge_evidence(gws, svc):
+     from hermes_cli import kanban_goal_recovery as goal
+     home, _ = gws
+-- 
+2.55.0
+

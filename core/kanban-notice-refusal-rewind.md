@@ -1,9 +1,12 @@
 # A refused Kanban notice is handed back, not dropped
 
-Patch:
+Patches: 0132 0792 0793 1597
 
 - `patches/0132-fix-tui-hand-a-refused-kanban-notice-back-to-the-cha.patch`: backend
   (`tui_gateway/session_notifications.py`).
+- `patches/0792-fix-kanban-deliver-tui-kanban-notices-at-least-once-.patch`
+- `patches/0793-test-kanban-notice-arriving-while-the-chat-compacts-.patch`
+- `patches/1597-fix-kanban-a-live-process-s-never-acked-notice-claim.patch`
 
 What you see: a chat open in two Hermes backends (Desktop plus a phone client, or two Desktop windows) still gets
 every Kanban "✔ done" / "⏸ blocked" notice for the cards it made. Before, one of them could vanish: the agent never
@@ -98,6 +101,94 @@ Append 0792 then 0793 in series order. The existing database migration adds null
 ### Gotchas
 
 At-least-once recovery plus transcript deduplication is not a guarantee that the agent completed the requested follow-up. Remote-only notices and sessions without a usable transcript store fall back to the prior submit path; the new local durability tests do not cover that fallback.
+
+Patch 1597 below qualifies "a live holder blocks another durable claimant": a live holder's claim stops blocking once it is provably stuck.
+
+## A live holder's never-acked claim no longer blocks the owner (1597)
+
+Incident: a card's completion never reached the chat that made it. A long-lived non-owner process (a `hermes
+dashboard`) still held that chat's sub row, `inflight_from` far behind `last_event_id`, and had never acked it.
+0792 lets only a dead holder be recovered, so the chat's owning backend could not claim while this live process
+held the row. Every 5 min the dashboard re-claimed the new events and was refused `SESSION_NOT_OWNED`. It rewound
+only its latest range (`rewind_notify_cursor`), so the earlier marker stayed. Nine more rows on the same pid were
+stuck the same way.
+
+### Behavior
+
+- **Refused non-owner releases its whole marker.** When the turn is refused because another process owns the chat
+  (the pre-turn owner check, or a refused submit for which `_notif_owner_refused` holds), each local subscription
+  this backend no longer buffers anything for is released whole by `release_notify_claim`. That covers any
+  earlier claim it never acked. The cursor goes back to the earliest unacked event, and the owner's next poll
+  claims and delivers it.
+- **Stopping poller releases too.** `_kb_release_claims` also releases the whole marker it holds for every local sub
+  in `_kanban_claims` (e.g. a durable claim it never acked), not only the undelivered ranges.
+- **Stuck live claims stop blocking.** In `claim_unseen_events_for_sub`, a live foreign holder's marker is rewound
+  like an orphan (WARNING logged with the reason) when either:
+  - its held range `(inflight_from, last_event_id]` has no deliverable event. The new `deliverable_kinds` parameter
+    (the tui poller and the unloaded sweep pass the kinds that render a notice) defaults to `kinds`. A
+    silent-only range (`unblocked`/`archived`) will never be acked.
+  - it is older than `NOTIFY_CLAIM_STALE_S` (15 min). The age is read from the new `inflight_at` column. A marker
+    written before that column (NULL) is dated by the newest event it covers.
+  A fresh live holder of a deliverable range still blocks. Stealing a stale claim is safe because the notice row
+  is deduped by event key.
+- **Leaks closed:**
+  - The unloaded sweep now acks a silent-only claim. Before, it returned without an ack and left the range in
+    flight under its live process.
+  - The live poller keeps a silent claim whose ack was skipped behind an earlier pending claim, marked durable, so
+    the next ack run covers it. Before, it dropped the claim.
+  - `_kb_mark_delivered` and `_kb_rewind_refused` keep durable claims that are not yet acked instead of dropping
+    them.
+- `ack_notify_claim` now returns whether it cleared or moved the marker.
+
+### How it works
+
+`kanban_notify_subs` gains `inflight_at` (schema, migration column list and rebuild spec). A claim sets it when it
+opens a marker and keeps the earliest value while re-claiming, so a holder that keeps re-claiming without acking
+still ages out. Ack, rewind and orphan rewind clear it. `_stuck_live_claim` returns the reason or `None`.
+`_rewind_orphan` gains `why` for the log line. `release_notify_claim` rewinds the row only when this process is the
+holder (no-op otherwise). `_kb_rewind_refused(..., not_owned=True)` computes the subs it no longer holds claims for
+and releases each one.
+
+### Code
+
+`hermes_cli/kanban_db.py`, `hermes_cli/kanban_db_connect.py`, `hermes_cli/kanban_db_notify.py`,
+`tui_gateway/kanban_unloaded.py`, `tui_gateway/session_notifications.py`.
+
+### Tests
+
+`tests/tui_gateway/test_kanban_notice_live_holder.py` (new; real kanban DB and SessionDB, stubbed
+`_run_prompt_submit`, a second backend simulated by patching `_my_holder` to the parent pid):
+
+- `test_refused_live_holder_releases_its_whole_marker_and_the_owner_claims_next_tick`
+- `test_live_holder_of_a_range_with_nothing_deliverable_does_not_block`
+- `test_stale_live_holder_marker_is_recovered` (parametrized `inflight_at`, `legacy-null-inflight_at`)
+- `test_fresh_live_holder_of_a_deliverable_claim_still_blocks`
+- `test_unloaded_sweep_acks_a_silent_only_claim`
+- `test_silent_claim_behind_a_pending_claim_is_acked_with_it`
+
+`tests/tui_gateway/test_kanban_notice_at_least_once.py`: `test_live_holder_blocks_other_claimers_and_is_not_recovered`
+is adjusted. It now appends a deliverable `blocked` event behind the held completion instead of resetting the
+cursor, so the held range stays deliverable and fresh and the claim keeps blocking.
+
+These were not rerun by the mirror pass.
+
+Untested: the refused-submit path (`_notif_owner_refused` after an accepted-then-refused turn; only the pre-turn
+owner check is exercised); `_kb_release_claims` releasing the whole marker on poller stop; the `_kb_mark_delivered`
+and `_kb_rewind_refused` changes that keep unacked durable claims (not isolated); remote-notice claims; two real
+backend processes (the second holder is simulated).
+
+### Applying
+
+Apply after 0792/0793. The `inflight_at` column is added by the existing notify-sub column migration (nullable; old
+markers fall back to event age). Restart backends to load the code.
+
+### Gotchas
+
+- `NOTIFY_CLAIM_STALE_S` is a constant, not config. A healthy claim is acked within one turn wait, but a holder that
+  legitimately waits longer than 15 min on a deliverable claim can have it taken over. Duplicate rows are prevented
+  by the event-key dedup, not by the claim.
+- `release_notify_claim` only acts on markers this process holds. A different live non-owner's marker is cleared
+  only by the stuck-claim rules when someone else claims.
 
 ## Plugin?
 

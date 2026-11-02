@@ -1,0 +1,648 @@
+From f1c99623b2fe0fa1c73c9e129e1cdf648c7764bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:08:22 +0000
+Subject: [PATCH] fix(kanban): stuck warning names clock-held deadlines and
+ stays quiet when every ready card waits on one [daveey]
+
+hermes-hub 2026-11-01 23:48Z: 43 ready cards waited on a Codex quota wall with a typed reset
+(1793774148) and the dispatcher logged 'stuck ... subscription_quota_reset=43' every 5 min
+with no deadline. A card held until a known deadline is waiting, not stuck.
+
+- DispatchResult.clock_held / lane_candidates: guarded cards whose hold ends on a known clock
+  (subscription_quota_reset receipt, rate_limit/infrastructure/owner_restart cooldowns).
+- describe_suppression appends '(until <iso>[..<iso>])' to those reasons.
+- all_clock_held(): the gateway dispatcher and the CLI daemon don't count a tick as stuck when
+  every lane candidate of every ticked board waits on a known clock.
+
+Tests: tests/hermes_cli/test_kanban_stuck_clock_holds.py (warning content, no-fire and
+fire cases on both the gateway watcher and the CLI daemon entry paths).
+---
+ gateway/kanban_watchers.py                    |   5 +-
+ hermes_cli/kanban_db_dispatch.py              |  84 ++----
+ hermes_cli/kanban_db_dispatch_clock.py        | 107 ++++++++
+ hermes_cli/kanban_db_dispatch_stuck.py        |  80 ++++++
+ hermes_cli/kanban_ops.py                      |   3 +-
+ .../test_kanban_stuck_clock_holds.py          | 255 ++++++++++++++++++
+ 6 files changed, 464 insertions(+), 70 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_clock.py
+ create mode 100644 hermes_cli/kanban_db_dispatch_stuck.py
+ create mode 100644 tests/hermes_cli/test_kanban_stuck_clock_holds.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 8bac100d3ae..061e33af8c4 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -376,7 +376,10 @@ class GatewayKanbanWatchersMixin:
+                         any_spawned = _log_spawn_results(results)
+                         ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
+                         capped = _kbd.all_at_capacity(res for _slug, res in (results or []))
+-                        bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned and not capped else 0
++                        # Every ready card waiting on a known clock (quota reset, cooldown) is waiting, not stuck. [daveey]
++                        clocked = _kbd.all_clock_held(res for _slug, res in (results or []))
++                        bad_ticks = (bad_ticks + 1 if ready_pending and not any_spawned and not capped and not clocked
++                                     else 0)
+                     now = int(time.time())
+                     # Only an ungated tick can be "stuck": an estop or drain hold spawns 0 on purpose.
+                     if gate is None and bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index d3211aeb24c..17de1621244 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -41,6 +41,7 @@ from hermes_cli import kanban_owner_death as _owner_death  # [daveey]
+ from hermes_cli.kanban_db_dispatch_crash_accounting import _account_crashes  # [daveey]
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+ from hermes_cli.kanban_db_dispatch_queries import lane_rows, skip_reap
++from hermes_cli.kanban_db_dispatch_clock import record_clock_hold as _record_clock_hold
+ 
+ if TYPE_CHECKING:
+     from hermes_cli.kanban_db import Task
+@@ -220,6 +221,13 @@ class DispatchResult:
+     (quota/auth error — also auto-blocked), ``"shared_blocker"`` (parked behind
+     a declared shared blocker another card is probing), ``"recent_success"`` (completed run
+     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
++    clock_held: dict[str, tuple[str, int]] = field(default_factory=dict)
++    """``task_id -> (guard reason, epoch the hold ends)`` for guarded cards waiting on a known clock (quota reset,
++    cooldowns; ``kanban_db_dispatch_clock``). The stuck warning names the deadline and stays quiet when every
++    lane candidate is here. [daveey]"""
++    lane_candidates: int = field(default=0, compare=False)
++    """Unclaimed ready (+ review, when it dispatches) rows this tick enumerated, before eligibility. A census, not an
++    outcome, so it is left out of ``==``: callers compare results to assert what a tick did. [daveey]"""
+     shared_blocker_released: list[str] = field(default_factory=list)
+     """Blocked task ids unblocked because a probe cleared the shared blocker
+     they were parked behind (``kanban_shared_blockers``). [daveey]"""
+@@ -246,71 +254,8 @@ class DispatchResult:
+     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+ 
+ 
+-def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
+-    """One line naming why the tick(s) held ready work back, or ``""``.
+-
+-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
+-    memory_pressure=critical`` — the respawn-guard reasons counted per task
+-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
+-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
+-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
+-    guard reason is written (#111910).
+-    """
+-    counts: dict[str, int] = {}
+-    pressure: Optional[str] = None
+-    capacity: Optional[str] = None
+-    for res in results:
+-        if res is None:
+-            continue
+-        for _task_id, reason in res.respawn_guarded:
+-            counts[reason] = counts.get(reason, 0) + 1
+-        if res.rate_limited:
+-            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+-        if res.skipped_locked:
+-            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+-        if res.skipped_owned:
+-            counts["skipped_owned"] = counts.get("skipped_owned", 0) + 1
+-        for _task_id, reason in res.claim_deferred:
+-            key = f"claim_deferred({reason})"
+-            counts[key] = counts.get(key, 0) + 1
+-        for _task_id, reason in res.skipped_ineligible:
+-            key = f"skipped_ineligible({reason})"
+-            counts[key] = counts.get(key, 0) + 1
+-        if res.memory_pressure:
+-            pressure = res.memory_pressure
+-        if res.at_capacity:
+-            capacity = res.at_capacity
+-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+-    if capacity:
+-        parts.append(f"at_capacity({capacity})")
+-    if pressure:
+-        parts.append(f"memory_pressure={pressure}")
+-    return ", ".join(parts)
+-
+-
+-def stuck_warning(bad_ticks: int, results: Iterable[Optional[DispatchResult]]) -> str:
+-    """The "dispatcher stuck" line for the CLI daemon and the embedded gateway dispatcher.
+-
+-    When the Board deferred claims or the queue held cards this machine cannot lease, the line says so and points
+-    at the Board leases and ``runs_on``; it only blames profile health when nothing else explains the zero."""
+-    results = list(results)
+-    held = describe_suppression(results)
+-    msg = (f"kanban dispatcher stuck: ready queue non-empty for {bad_ticks} consecutive ticks but 0 workers "
+-           f"spawned.{f' Last tick held back: {held}.' if held else ''}")
+-    lease_bound = any(res is not None and (res.claim_deferred or res.skipped_ineligible) for res in results)
+-    if lease_bound:
+-        return (msg + " The Board lease refused or deferred claims: check the cards' runs_on / placement "
+-                "(`hermes kanban show <id>`) and which machine holds or may take their Board lease.")
+-    return msg + " Check profile health (venv, PATH, credentials) and `hermes kanban list --status ready`."
+-
+-
+-def all_at_capacity(results: Iterable[Optional[DispatchResult]]) -> bool:
+-    """True when every board's tick that ran was held only by a full concurrency cap (nothing could spawn).
+-
+-    The "dispatcher stuck" detectors skip such ticks: ready work waiting behind ``kanban.max_in_progress``
+-    running workers is the cap doing its job (stale/timeout reclaim frees hung workers). [daveey]"""
+-    ran = [res for res in results if res is not None and not res.skipped_locked]
+-    return bool(ran) and all(res.at_capacity for res in ran)
++from hermes_cli.kanban_db_dispatch_stuck import (  # re-exports for the stuck detectors [daveey]
++    all_at_capacity, all_clock_held, describe_suppression, stuck_warning)
+ 
+ 
+ # Bounded registry of recently-reaped worker exits, filled by the reap loop in
+@@ -2194,6 +2139,7 @@ def _dispatch_lane_task(
+     guard_reason = dispatch_guard(conn, task_id, lane=lane, dry_run=dry_run)
+     if guard_reason is not None:
+         result.respawn_guarded.append((task_id, guard_reason))
++        _record_clock_hold(conn, result, task_id, guard_reason)
+         # Maintenance is home-owned; foreign executors still record the guard.
+         if not dry_run:
+             if _block_if_guard_hold_capped(conn, task_id, guard_reason):
+@@ -2545,11 +2491,13 @@ def _dispatch_once_locked(
+     # Cards this machine cannot lease (runs_on for another machine, ...) are never candidates: before 10-28 a
+     # review card pinned to the hub sat first in the MacBook's review lane, took the review reservation every
+     # tick, and the Board refused its lease every tick, so the eligible ready queue never started.
+-    ready_rows = _eligible_rows(conn, lane_rows(conn, "ready"), "ready", result)
++    all_ready = lane_rows(conn, "ready")
++    ready_rows = _eligible_rows(conn, all_ready, "ready", result)
+     # Review rows are enumerated up front so the budget split can see whether
+     # review work exists at all.
+-    review_rows = (_eligible_rows(conn, lane_rows(conn, "review"), "review", result)
+-                   if review_dispatch_enabled() else [])
++    all_review = lane_rows(conn, "review") if review_dispatch_enabled() else []
++    review_rows = _eligible_rows(conn, all_review, "review", result) if all_review else []
++    result.lane_candidates = len(all_ready) + len(all_review)
+     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
+     # skipped_unassigned — "busy, retry later" differs from "needs routing".
+     # Resolved BEFORE the review reservation so the reservation can see which
+diff --git a/hermes_cli/kanban_db_dispatch_clock.py b/hermes_cli/kanban_db_dispatch_clock.py
+new file mode 100644
+index 00000000000..95f63128d92
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_clock.py
+@@ -0,0 +1,107 @@
++"""Respawn-guard holds that end on a known clock, for the "dispatcher stuck" warnings. [daveey]
++
++hermes-hub 2026-11-01: 43 ready cards waited on a Codex quota wall with a typed reset deadline, and the
++dispatcher logged "stuck" every 5 minutes with a bare ``subscription_quota_reset=43``. A card held until a
++known deadline is waiting, not stuck: the warning names the deadline, and a tick whose every ready card waits
++on a clock is not a stuck tick (:func:`all_clock_held`).
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from datetime import UTC, datetime
++from typing import Any, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++# Guard reasons whose hold ends at a deadline the dispatcher can compute from the card's own runs.
++CLOCK_REASONS = frozenset({
++    "subscription_quota_reset",  # typed reset in the latest attempt's receipt
++    "rate_limit_cooldown",       # latest rate_limited run + rate-limit cooldown
++    "infrastructure_cooldown",   # latest refused spawn + the same cooldown
++    "owner_restart_cooldown",    # run lost to its owner's restart + owner-restart cooldown
++})
++
++
++def guard_hold_until(conn: sqlite3.Connection, task_id: str, reason: str, now: int) -> Optional[int]:
++    """Epoch at which ``reason``'s hold on ``task_id`` ends, or None (no known clock, or already over)."""
++    if reason not in CLOCK_REASONS:
++        return None
++    from hermes_cli import kanban_db as kb
++    if reason == "subscription_quota_reset":
++        reset = _receipt_reset_at(conn, task_id)
++        return int(reset) if reset is not None and reset > now else None
++    row = conn.execute(
++        "SELECT ended_at FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
++        "ORDER BY ended_at DESC LIMIT 1", (task_id,)).fetchone()
++    ended_at = kb._to_epoch(row[0]) if row is not None else None
++    if ended_at is None:
++        return None
++    if reason == "owner_restart_cooldown":
++        from hermes_cli.kanban_db_dispatch import OWNER_RESTART_COOLDOWN_SECONDS
++        cooldown = kb._env_int("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", OWNER_RESTART_COOLDOWN_SECONDS)
++    else:
++        cooldown = kb._resolve_rate_limit_cooldown_seconds()
++    until = int(ended_at) + int(cooldown)
++    return until if until > now else None
++
++
++def record_clock_hold(conn: sqlite3.Connection, result: Any, task_id: str, reason: str) -> None:
++    """Record in ``result.clock_held`` when ``reason``'s hold on ``task_id`` ends, if it ends on a known clock.
++
++    Best effort: a failed lookup only drops the deadline from the warning, it never stops the tick."""
++    try:
++        until = guard_hold_until(conn, task_id, reason, int(time.time()))
++    except (sqlite3.Error, ValueError, TypeError, KeyError):
++        logger.debug("kanban: guard deadline lookup failed for %s", task_id, exc_info=True)
++        return
++    if until is not None:
++        result.clock_held[task_id] = (reason, until)
++
++
++def _receipt_reset_at(conn: sqlite3.Connection, task_id: str) -> Optional[float]:
++    """The typed reset in the latest ended run's ``rate_limited`` receipt (the record
++    ``kanban_quota_receipt.waiting_for_quota_reset`` admits on), or None."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_quota_receipt import quota_fields
++    row = conn.execute(
++        "SELECT e.payload FROM task_runs r JOIN task_events e ON e.run_id=r.id "
++        "AND e.task_id=r.task_id AND e.kind='worker_result' "
++        "WHERE r.id=(SELECT id FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
++        "ORDER BY ended_at DESC,id DESC LIMIT 1) AND r.outcome='rate_limited' "
++        "ORDER BY e.id DESC LIMIT 1", (task_id,)).fetchone()
++    if row is None:
++        return None
++    receipt = kb._json_dict(row[0])
++    if receipt.get("exit_code") != kb.KANBAN_RATE_LIMIT_EXIT_CODE:
++        return None
++    return quota_fields(receipt).get("failure_resets_at")
++
++
++def _iso(epoch: int) -> str:
++    return datetime.fromtimestamp(int(epoch), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++def deadline_suffixes(results: Iterable[Any]) -> dict[str, str]:
++    """``reason -> " (until <earliest>[..<latest>])"`` over the clock-held cards of ``results``."""
++    spans: dict[str, tuple[int, int]] = {}
++    for res in results:
++        if res is None:
++            continue
++        for _task_id, (reason, until) in res.clock_held.items():
++            lo, hi = spans.get(reason, (until, until))
++            spans[reason] = (min(lo, until), max(hi, until))
++    return {reason: f" (until {_iso(lo)}{'' if lo == hi else '..' + _iso(hi)})"
++            for reason, (lo, hi) in spans.items()}
++
++
++def all_clock_held(results: Iterable[Any]) -> bool:
++    """True when every board that ticked spawned nothing and every lane candidate it saw waits on a known clock.
++
++    Boards skipped for a lock or another dispatch owner say nothing either way. At least one board must hold
++    a card on a clock: a tick that saw no candidates at all is not evidence the queue is waiting."""
++    ran = [res for res in results if res is not None and not res.skipped_locked and not res.skipped_owned]
++    if not ran or not any(res.clock_held for res in ran):
++        return False
++    return all(not res.spawned and len(res.clock_held) == res.lane_candidates for res in ran)
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+new file mode 100644
+index 00000000000..bbabf955774
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -0,0 +1,80 @@
++"""The "dispatcher stuck" warning and the tick checks deciding whether a zero-spawn tick counts. [daveey]
++
++Moved out of ``kanban_db_dispatch`` (which re-exports these names). ``results`` are ``DispatchResult`` rows.
++"""
++from __future__ import annotations
++
++from typing import Any, Iterable, Optional
++
++from hermes_cli.kanban_db_dispatch_clock import all_clock_held, deadline_suffixes
++
++__all__ = ["all_at_capacity", "all_clock_held", "describe_suppression", "stuck_warning"]
++
++
++def describe_suppression(results: Iterable[Optional[Any]]) -> str:
++    """One line naming why the tick(s) held ready work back, or ``""``.
++
++    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
++    memory_pressure=critical`` — the respawn-guard reasons counted per task
++    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
++    CLI daemon and the embedded gateway dispatcher, which otherwise report a
++    bare zero-spawn count while ``hermes kanban tail`` is the only place the
++    guard reason is written (#111910).
++    """
++    results = list(results)
++    counts: dict[str, int] = {}
++    pressure: Optional[str] = None
++    capacity: Optional[str] = None
++    for res in results:
++        if res is None:
++            continue
++        for _task_id, reason in res.respawn_guarded:
++            counts[reason] = counts.get(reason, 0) + 1
++        if res.rate_limited:
++            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
++        if res.skipped_locked:
++            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
++        if res.skipped_owned:
++            counts["skipped_owned"] = counts.get("skipped_owned", 0) + 1
++        for _task_id, reason in res.claim_deferred:
++            key = f"claim_deferred({reason})"
++            counts[key] = counts.get(key, 0) + 1
++        for _task_id, reason in res.skipped_ineligible:
++            key = f"skipped_ineligible({reason})"
++            counts[key] = counts.get(key, 0) + 1
++        if res.memory_pressure:
++            pressure = res.memory_pressure
++        if res.at_capacity:
++            capacity = res.at_capacity
++    until = deadline_suffixes(results)
++    parts = [f"{k}={v}{until.get(k, '')}" for k, v in sorted(counts.items())]
++    if capacity:
++        parts.append(f"at_capacity({capacity})")
++    if pressure:
++        parts.append(f"memory_pressure={pressure}")
++    return ", ".join(parts)
++
++
++def stuck_warning(bad_ticks: int, results: Iterable[Optional[Any]]) -> str:
++    """The "dispatcher stuck" line for the CLI daemon and the embedded gateway dispatcher.
++
++    When the Board deferred claims or the queue held cards this machine cannot lease, the line says so and points
++    at the Board leases and ``runs_on``; it only blames profile health when nothing else explains the zero."""
++    results = list(results)
++    held = describe_suppression(results)
++    msg = (f"kanban dispatcher stuck: ready queue non-empty for {bad_ticks} consecutive ticks but 0 workers "
++           f"spawned.{f' Last tick held back: {held}.' if held else ''}")
++    lease_bound = any(res is not None and (res.claim_deferred or res.skipped_ineligible) for res in results)
++    if lease_bound:
++        return (msg + " The Board lease refused or deferred claims: check the cards' runs_on / placement "
++                "(`hermes kanban show <id>`) and which machine holds or may take their Board lease.")
++    return msg + " Check profile health (venv, PATH, credentials) and `hermes kanban list --status ready`."
++
++
++def all_at_capacity(results: Iterable[Optional[Any]]) -> bool:
++    """True when every board's tick that ran was held only by a full concurrency cap (nothing could spawn).
++
++    The "dispatcher stuck" detectors skip such ticks: ready work waiting behind ``kanban.max_in_progress``
++    running workers is the cap doing its job (stale/timeout reclaim frees hung workers). [daveey]"""
++    ran = [res for res in results if res is not None and not res.skipped_locked]
++    return bool(ran) and all(res.at_capacity for res in ran)
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 602a9681ded..d988a05220b 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -238,7 +238,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
+ 
+     def _on_tick(res):
+         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+-        if ready_pending and not res.spawned and not res.at_capacity:  # a full cap is idle, not stuck [daveey]
++        # A full cap, or every ready card waiting on a known clock (quota reset, cooldown), is idle, not stuck [daveey]
++        if ready_pending and not res.spawned and not res.at_capacity and not kbd.all_clock_held([res]):
+             health_state["bad_ticks"] += 1
+         else:
+             health_state["bad_ticks"] = 0
+diff --git a/tests/hermes_cli/test_kanban_stuck_clock_holds.py b/tests/hermes_cli/test_kanban_stuck_clock_holds.py
+new file mode 100644
+index 00000000000..750ad0c460d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_stuck_clock_holds.py
+@@ -0,0 +1,255 @@
++"""The "dispatcher stuck" warning knows about ready cards held on a known clock. [daveey]
++
++hermes-hub 2026-11-01 23:48Z: 43 ready cards waited on a Codex quota wall that resets 1793774148, and the
++dispatcher logged ``kanban dispatcher stuck ... subscription_quota_reset=43`` every 5 minutes with no reset time.
++A card held until a known deadline is waiting, not stuck:
++
++* the held-back breakdown names the deadline: ``subscription_quota_reset=43 (until 2026-11-03T22:35:48Z)``;
++* when EVERY ready card of every ticked board waits on a known clock, the stuck warning does not fire
++  (CLI ``daemon --force`` loop and the embedded gateway dispatcher both).
++"""
++
++from __future__ import annotations
++
++import argparse
++import asyncio
++import logging
++import time
++from datetime import UTC, datetime
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++STUCK = "kanban dispatcher stuck"
++
++
++def _iso(epoch: float) -> str:
++    return datetime.fromtimestamp(int(epoch), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda **kw: [SimpleNamespace(name="default")])
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "default")
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: False)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda *a, **kw: "unknown")
++    kb.init_db()
++    return home
++
++
++def _quota_held(conn, title: str, resets_at: float) -> str:
++    """A ready card whose latest run hit a subscription quota wall that resets at ``resets_at``."""
++    now = int(time.time())
++    tid = kb.create_task(conn, title=title, assignee="default")
++    with kb.write_txn(conn):
++        cur = conn.execute(
++            "INSERT INTO task_runs (task_id, profile, started_at, ended_at, outcome, status) "
++            "VALUES (?, 'default', ?, ?, 'rate_limited', 'rate_limited')", (tid, now - 120, now - 60))
++        kb._append_event(conn, tid, "worker_result", {
++            "exit_code": kb.KANBAN_RATE_LIMIT_EXIT_CODE, "failure_reason": "rate_limit",
++            "failure_retryable": True, "failure_resets_at": resets_at}, run_id=cur.lastrowid)
++    return tid
++
++
++def _cooldown_held(conn, title: str) -> tuple[str, int]:
++    """A ready card whose latest run was rate-limited with no typed reset: held by the requeue cooldown."""
++    now = int(time.time())
++    tid = kb.create_task(conn, title=title, assignee="default")
++    with kb.write_txn(conn):
++        conn.execute(
++            "INSERT INTO task_runs (task_id, profile, started_at, ended_at, outcome, status) "
++            "VALUES (?, 'default', ?, ?, 'rate_limited', 'rate_limited')", (tid, now - 60, now - 30))
++    return tid, now - 30 + kb._resolve_rate_limit_cooldown_seconds()
++
++
++def _auth_held(conn, title: str) -> str:
++    """A ready card held by ``blocker_auth``: no clock ends it, a human has to."""
++    tid = kb.create_task(conn, title=title, assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET last_failure_error = 'HTTP 403 forbidden: bad credentials' WHERE id = ?",
++                     (tid,))
++    return tid
++
++
++def _tick(conn, spawned: list) -> kbd.DispatchResult:
++    return kbd.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: spawned.append(task.id) or 42)
++
++
++# --- warning content -------------------------------------------------------------------------------------------
++
++
++def test_breakdown_names_the_quota_reset_deadline(home):
++    soon, later = time.time() + 7200, time.time() + 2 * 86400
++    spawned: list = []
++    with kbc.connect() as conn:
++        _quota_held(conn, "later", later)
++        _quota_held(conn, "soon", soon)
++        res = _tick(conn, spawned)
++    assert spawned == []
++    held = kbd.describe_suppression([res])
++    # Earliest deadline first: it is when the next card can move.
++    assert f"subscription_quota_reset=2 (until {_iso(soon)}..{_iso(later)})" in held
++    assert f"subscription_quota_reset=2 (until {_iso(soon)}..{_iso(later)})" in kbd.stuck_warning(6, [res])
++
++
++def test_single_deadline_and_cooldown_are_named(home):
++    reset = time.time() + 3600
++    with kbc.connect() as conn:
++        _quota_held(conn, "walled", reset)
++        _tid, cooldown_until = _cooldown_held(conn, "cooling")
++        res = _tick(conn, [])
++    held = kbd.describe_suppression([res])
++    assert f"subscription_quota_reset=1 (until {_iso(reset)})" in held
++    assert f"rate_limit_cooldown=1 (until {_iso(cooldown_until)})" in held
++
++
++def test_non_clock_guard_has_no_deadline(home):
++    with kbc.connect() as conn:
++        _auth_held(conn, "auth")
++        res = _tick(conn, [])
++    assert "blocker_auth=1" in kbd.describe_suppression([res])
++    assert "until" not in kbd.describe_suppression([res])
++
++
++# --- when it fires ---------------------------------------------------------------------------------------------
++
++
++def test_all_clock_held_only_when_every_ready_card_waits_on_a_clock(home):
++    with kbc.connect() as conn:
++        _quota_held(conn, "a", time.time() + 3600)
++        _cooldown_held(conn, "b")
++        all_held = _tick(conn, [])
++        assert kbd.all_clock_held([all_held])
++        _auth_held(conn, "c")
++        mixed = _tick(conn, [])
++    assert not kbd.all_clock_held([mixed])
++
++
++def test_all_clock_held_edge_cases():
++    held = kbd.DispatchResult(lane_candidates=1)
++    held.clock_held["t_a"] = ("subscription_quota_reset", 1793774148)
++    locked = kbd.DispatchResult(skipped_locked=True)
++    owned = kbd.DispatchResult(skipped_owned=True)
++    empty = kbd.DispatchResult()
++    assert kbd.all_clock_held([held, None, locked, owned, empty]), "other boards have nothing waiting"
++    assert not kbd.all_clock_held([]), "no board ticked"
++    assert not kbd.all_clock_held([locked, owned]), "no board actually ticked"
++    assert not kbd.all_clock_held([empty]), "nothing is held on a clock: the ready queue is elsewhere"
++    spawned = kbd.DispatchResult(lane_candidates=2)
++    spawned.clock_held["t_a"] = ("subscription_quota_reset", 1793774148)
++    spawned.spawned.append(("t_b", "default", ""))
++    assert not kbd.all_clock_held([spawned])
++    partial = kbd.DispatchResult(lane_candidates=2)
++    partial.clock_held["t_a"] = ("subscription_quota_reset", 1793774148)
++    assert not kbd.all_clock_held([partial])
++
++
++# --- CLI daemon entry path -------------------------------------------------------------------------------------
++
++
++def _daemon_stderr(monkeypatch, capsys, res, ticks=8):
++    from hermes_cli import kanban_ops
++
++    monkeypatch.setattr(kbd, "has_spawnable_ready", lambda conn: True)
++
++    def fake_run_daemon(*, on_tick, **_kw):
++        for _ in range(ticks):
++            on_tick(res)
++
++    monkeypatch.setattr(kbd, "run_daemon", fake_run_daemon)
++    assert kanban_ops._cmd_daemon(argparse.Namespace(force=True, interval=1, max=None, pidfile=None)) == 0
++    return capsys.readouterr().err
++
++
++def test_cli_daemon_silent_when_every_ready_card_waits_on_quota_reset(home, monkeypatch, capsys):
++    with kbc.connect() as conn:
++        _quota_held(conn, "a", time.time() + 3600)
++        _quota_held(conn, "b", time.time() + 7200)
++        res = _tick(conn, [])
++    assert STUCK not in _daemon_stderr(monkeypatch, capsys, res)
++
++
++def test_cli_daemon_warns_with_deadline_when_other_cards_are_held(home, monkeypatch, capsys):
++    reset = time.time() + 3600
++    with kbc.connect() as conn:
++        _quota_held(conn, "a", reset)
++        _auth_held(conn, "b")
++        res = _tick(conn, [])
++    err = _daemon_stderr(monkeypatch, capsys, res)
++    assert STUCK in err
++    assert f"subscription_quota_reset=1 (until {_iso(reset)})" in err
++
++
++# --- embedded gateway dispatcher entry path --------------------------------------------------------------------
++
++
++def _run_gateway_ticks(monkeypatch, n):
++    from gateway import kanban_watchers as watchers
++    from hermes_cli import kanban_wake_check as kwc
++
++    spawned: list = []
++    monkeypatch.setattr(kbd, "_default_spawn", lambda task, ws, *, board=None: spawned.append(task.id) or None)
++    runner = watchers.GatewayKanbanWatchersMixin()
++    runner._running = True
++    runner._external_drain_active = False
++    runner._restart_requested = False
++    cfg = {"auto_decompose": False, "dispatch_interval_seconds": 1}
++    monkeypatch.setattr(runner, "_kanban_dispatcher_boot", lambda: (lambda: {"kanban": cfg}, kb, cfg))
++    tick = {"n": 0}
++
++    async def no_sleep(delay):
++        return None
++
++    async def next_tick(interval):
++        tick["n"] += 1
++        if tick["n"] >= n:
++            runner._running = False
++
++    monkeypatch.setattr(watchers.asyncio, "sleep", no_sleep)
++    monkeypatch.setattr(runner, "_sleep_until_tick_or_sync_wake", next_tick)
++    try:
++        asyncio.run(runner._kanban_dispatcher_watcher())
++    finally:
++        kwc._shutdown_for_tests()
++    return spawned
++
++
++def _stuck_lines(caplog):
++    return [r.getMessage() for r in caplog.records if STUCK in r.getMessage()]
++
++
++def test_gateway_silent_when_every_ready_card_waits_on_quota_reset(home, monkeypatch, caplog):
++    from gateway import kanban_watchers as watchers
++
++    with kbc.connect_closing(board="default") as conn:
++        _quota_held(conn, "a", time.time() + 3600)
++        _quota_held(conn, "b", time.time() + 7200)
++    caplog.set_level(logging.INFO, logger="gateway")
++    assert _run_gateway_ticks(monkeypatch, watchers._HEALTH_WINDOW + 4) == []
++    assert _stuck_lines(caplog) == []
++
++
++def test_gateway_warns_with_deadline_when_other_cards_are_held(home, monkeypatch, caplog):
++    from gateway import kanban_watchers as watchers
++
++    reset = time.time() + 3600
++    with kbc.connect_closing(board="default") as conn:
++        _quota_held(conn, "a", reset)
++        _auth_held(conn, "b")
++    caplog.set_level(logging.INFO, logger="gateway")
++    assert _run_gateway_ticks(monkeypatch, watchers._HEALTH_WINDOW + 4) == []
++    lines = _stuck_lines(caplog)
++    assert lines, "a card held by blocker_auth is not on a clock"
++    assert f"subscription_quota_reset=1 (until {_iso(reset)})" in lines[0]
+-- 
+2.55.0
+

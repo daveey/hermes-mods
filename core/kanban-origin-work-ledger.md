@@ -1,5 +1,10 @@
 # Owner-qualified origin work, durable receipts and completion evidence
 
+Patches: 0221 0223 0242 0243 0244 0245 0246 0247 0268 0270 0273 0274 0275 0276 0277 0278 0279 0281 0282 0293 0295 0296 0297 0299 0311 0313 0314 0316 0324 0325 0326 0328 0342 0363 0409 0461 0777 1607
+
+Follow-up patch file:
+- `patches/1607-kanban-origin-creation-ignore-default-chat_origin-pl.patch`
+
 ## Behavior
 
 An originating chat stays unfinished while its work runs on another gateway. Task lists, sidebar counts and archive guards must not treat a failed replica read, missing owner, review state or unverified terminal status as an empty workload. Identity includes gateway, profile, board and task ID, not just a task ID.
@@ -127,7 +132,7 @@ Patch **0461** (`d52e183104`), requires 0409, 0404 (scope heartbeat) and 0405, 0
 - **Code.** `hermes_cli/kanban_session_activity.py` (`_read_remote_links`).
 - **Tests.** `tests/hermes_cli/test_kanban_remote_terminal_release.py` (20 tests) and the updated
   `tests/hermes_cli/test_kanban_origin_alias_release.py::test_unproven_intermediate_alias_needs_verified_owner_release`.
-- **Residual.** Five ledger-bound goal cards owned by hub task `t_b11f0591` still need owner verification; the
+- **Residual.** Historical ledger-bound goal cards still need owner verification; the
   ledger `project()` is untouched.
 
 ## Follow-up patch (0777)
@@ -143,3 +148,41 @@ Code: `hermes_cli/kanban_origin_ledger.py` (`observe_owner_task`, `_receipt_epoc
 Tests: `tests/hermes_cli/test_kanban_origin_legacy_release.py` (the `test_goal_card_completed_before_the_first_receipt_is_owner_verified`, `test_goal_card_without_receipt_after_the_epoch_stays_unverified`, `test_board_without_any_receipt_gets_no_legacy_pass`, `test_receipt_verified_card_keeps_the_lifecycle_basis`, `test_receipt_binds_the_full_handoff_not_the_events_first_line`, `test_legacy_card_whose_completed_event_was_lost_is_verified_by_its_closing_run`, `test_lost_completed_event_needs_every_other_proof`, `test_legacy_goal_card_releases_its_origin_obligation`, `test_archived_without_verified_completion_is_closed_not_waiting_nor_completed`, `test_archived_card_from_an_offline_owner_still_waits`, `test_archived_replica_card_is_closed_in_the_link_reader` cases) and `tests/hermes_cli/test_kanban_origin_evidence.py::test_archive_without_current_completion_proof_is_closed_not_completed`.
 
 A live origin session releasing a real historical card is untested in this patch.
+
+## Follow-up: retry compatibility for default creation options (1607)
+
+### Behavior
+
+- **1607:** Retrying origin creation through `kanban_db.create_task` matches a stored pre-upgrade intent that lacks the later `chat_origin` and `placement_policy` options when those options remain at their `None` defaults. The retry returns the original task rather than creating another.
+- **1607:** A non-default `chat_origin` on that retry still raises `origin_creation_conflict`; default compatibility does not relax immutable request identity. Non-default `placement_policy` conflict behavior is implemented but untested by this patch.
+
+### How it works
+
+`create_with_origin` removes `chat_origin` and `placement_policy` from the options envelope only when their values are `None`, before serializing/comparing the stored intent. Real values remain in the envelope. This extends the existing exclusion of `require_declaration`; it neither migrates stored rows nor changes adoption of existing tasks.
+
+### Code
+
+- **1607:** `hermes_cli/kanban_origin_creation.py` — default-only option normalization in `create_with_origin`.
+- **1607:** `tests/hermes_cli/test_kanban_origin_creation.py` — historical-envelope retry regressions.
+
+### Tests
+
+**1607**, in `tests/hermes_cli/test_kanban_origin_creation.py`:
+
+- `test_retry_ignores_default_options_added_after_intent_was_stored` removes the late keys from a persisted envelope, retries creation, and checks the same task ID and one task row.
+- `test_retry_with_non_default_late_option_still_conflicts` retries that historical envelope with non-default `chat_origin` and checks `origin_creation_conflict`.
+
+These were not rerun by the mirror pass.
+
+Untested:
+- Non-default `placement_policy` conflicts and retries of envelopes containing non-default late options.
+- CLI, registered create tool, courier and Desktop paths for this compatibility case; the new tests call database creation directly.
+- Live pre-upgrade data; the regression fixture simulates an old envelope by removing the late option keys.
+
+### Applying
+
+Apply in ordered series after the atomic creation-intent work and the introduction of the late options. No new configuration or data migration is required.
+
+### Gotchas
+
+Only `None` defaults are omitted; this is not a general rule to ignore new creation options or changed intent values. Creation receipts still do not prove task completion or delivery.

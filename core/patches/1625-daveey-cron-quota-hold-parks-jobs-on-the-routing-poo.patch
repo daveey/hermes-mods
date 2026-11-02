@@ -1,0 +1,400 @@
+From 93402fd50df7dc43fe11d839564bdeb462eb0ba7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 03:27:35 +0000
+Subject: [PATCH] [daveey] cron: quota hold parks jobs on the routing pool's
+ SubscriptionQuotaUnavailable refusal
+
+Since 11-01 x-reply-discovery and bsky-reply-discovery re-fired hourly into a Codex window the
+pool had already said was closed until 11-04 (resets_at), because cron/quota_hold only knew the
+Codex 429 AuthError 'retry after Ns'. Root: each consumer kept its own list of quota exception
+types, so the new pool refusal type silently bypassed the cron hold.
+
+- agent.model_routing_unavailable.quota_wait_seconds: one typed mapping from every quota
+  refusal (SubscriptionQuotaUnavailable / any 429 ModelRoutingError via resets_at, rate-limited
+  AuthError via retry_after, ProviderFallbackError whose every route is one) to a wait.
+- cron.quota_hold.hold_seconds_from_failure delegates to it; classify_failure_hold logs one
+  'quota failure not held' WARNING when a quota-class failure maps to no hold (detection).
+- tests: RuntimeError-from-refusal hold, passed/bogus reset, fallback chain, a real scheduler
+  tick that parks next_run_at past the reset, and a contract test that enumerates every 429
+  ModelRoutingError subclass in the tree and requires each to map to a hold.
+
+Self-heal cron-0f5ca72d35.
+---
+ agent/model_routing_unavailable.py         |  87 +++++++++++
+ cron/quota_hold.py                         |  62 ++++----
+ cron/scheduler.py                          |   4 +-
+ tests/cron/test_quota_hold_subscription.py | 164 +++++++++++++++++++++
+ 4 files changed, 280 insertions(+), 37 deletions(-)
+ create mode 100644 tests/cron/test_quota_hold_subscription.py
+
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index e9992f2acb3..4ff2aa9a87b 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -39,3 +39,90 @@ def quota_unavailable(pool, model):
+     if waits:
+         return SubscriptionQuotaUnavailable(pool.provider, model, min(waits))
+     return None
++
++
++def _finite_positive(value):
++    """A real int/float, finite and > 0 (huge ints and NaN/inf are not a deadline)."""
++    import math
++
++    if type(value) not in (float, int):
++        return None
++    try:
++        value = float(value)
++    except OverflowError:
++        return None
++    return value if math.isfinite(value) and value > 0 else None
++
++
++def _is_quota_type(error):
++    """True for an exception whose own type says "quota window closed" (not its text)."""
++    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
++
++    if isinstance(error, ModelRoutingError):
++        return getattr(error, "status_code", None) == 429
++    return isinstance(error, AuthError) and is_rate_limited_auth_error(error)
++
++
++def _own_wait(error, now):
++    """Seconds this one refusal says it stays closed: an absolute ``resets_at`` (pool refusal) or a
++    ``retry_after`` / ``retry after <N>s`` hint (Codex 429 AuthError)."""
++    import re
++
++    reset = _finite_positive(getattr(error, "resets_at", None))
++    if reset is not None:
++        return _finite_positive(reset - now)
++    hint = _finite_positive(getattr(error, "retry_after", None))
++    if hint is None and not isinstance(error, ModelRoutingError):
++        m = re.search(r"retry after (\d+)s", str(error), re.IGNORECASE)
++        hint = _finite_positive(float(m.group(1))) if m else None
++    return hint
++
++
++def _route_wait(error, now):
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
++    if isinstance(error, ProviderFallbackError):
++        waits = [_route_wait(failure, now) for _, _, failure in error.failures]
++        return min(waits) if waits and all(w is not None for w in waits) else None
++    return _own_wait(error, now) if _is_quota_type(error) else None
++
++
++def _terminal_refusal(exc):
++    """First quota refusal or fallback chain in *exc*'s cause chain, else None. A fallback's
++    implicit context may be the primary's refusal: the chain decides, not that context."""
++    from hermes_cli.auth import AuthError
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
++    seen = set()
++    cur = exc
++    while cur is not None and id(cur) not in seen:
++        seen.add(id(cur))
++        if isinstance(cur, (ProviderFallbackError, AuthError)) or _is_quota_type(cur):
++            return cur
++        cur = cur.__cause__ or cur.__context__
++    return None
++
++
++def quota_wait_seconds(exc, now=None):
++    """Seconds until the quota window that refused *exc* reopens, or None.
++
++    The one mapping from every quota refusal type the runtime raises (the routing pool's
++    ``SubscriptionQuotaUnavailable`` or any other 429 ``ModelRoutingError``, the Codex rate-limited
++    ``AuthError``, a ``ProviderFallbackError`` whose every route is one of those) to a wait.
++    Consumers (cron's quota hold) call this instead of keeping their own isinstance lists, so a new
++    quota type cannot silently bypass them. Typed only: failure text never yields a wait."""
++    import time
++
++    error = _terminal_refusal(exc)
++    return None if error is None else _route_wait(error, time.time() if now is None else now)
++
++
++def is_quota_failure(exc):
++    """True when *exc*'s cause chain ends in a quota refusal (every fallback route one, too),
++    whether or not it carries a usable deadline."""
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
++    error = _terminal_refusal(exc)
++    if isinstance(error, ProviderFallbackError):
++        return bool(error.failures) and all(is_quota_failure(f) for _, _, f in error.failures)
++    return error is not None and _is_quota_type(error)
+diff --git a/cron/quota_hold.py b/cron/quota_hold.py
+index 875ffa2b363..c5c534feed1 100644
+--- a/cron/quota_hold.py
++++ b/cron/quota_hold.py
+@@ -1,7 +1,9 @@
+ """Hold a job's fires while a provider's usage window is known to be closed (#89376).
+ 
+ A quota-exhausted provider answers with an explicit ``retry after <N>s`` (Codex 429: the
+-``AuthError`` from ``hermes_cli.auth_codex._codex_quota_exhausted_error``). When the whole
++``AuthError`` from ``hermes_cli.auth_codex._codex_quota_exhausted_error``), and the routing
++pool refuses before any request with ``SubscriptionQuotaUnavailable`` carrying ``resets_at``
++(``agent.model_routing_unavailable.quota_wait_seconds`` maps every such type). When the whole
+ fallback chain is unavailable, re-firing on cadence is guaranteed to fail identically until
+ the window reopens — every fire is a usage probe plus a delivered failure alert. The failing
+ run's alert says the job is held; ``mark_job_run`` then parks ``next_run_at`` at the recovery
+@@ -16,7 +18,6 @@ closed provider window. Any run that reaches the model clears the marker.
+ from __future__ import annotations
+ 
+ import logging
+-import re
+ from datetime import datetime
+ from typing import Any, Dict, Optional
+ 
+@@ -33,40 +34,31 @@ SCHEDULE_EXPR_KEY = "quota_hold_cron_expr"
+ # recorded a little wall clock has passed, so land clearly past the boundary.
+ HOLD_SLACK_SECONDS = 60
+ 
+-_RETRY_AFTER_RE = re.compile(r"retry after (\d+)s", re.IGNORECASE)
+-
+-
+ def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
+-    """Seconds the provider said it will stay closed, or None when *exc* (or anything in its
+-    cause chain) is not a rate-limited ``AuthError`` carrying a wait hint. Anchored on the
+-    AuthError itself, never on arbitrary text, so an unrelated "retry after" in an agent's
+-    output cannot park a job."""
+-    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+-
+-    from hermes_cli.fallback_errors import ProviderFallbackError
+-
+-    def route_hold(error: BaseException) -> Optional[float]:
+-        if isinstance(error, ProviderFallbackError):
+-            waits = [route_hold(failure) for _, _, failure in error.failures]
+-            return min(waits) if waits and all(wait is not None for wait in waits) else None
+-        if isinstance(error, AuthError) and is_rate_limited_auth_error(error):
+-            hint = getattr(error, "retry_after", None)
+-            if hint is None:
+-                m = _RETRY_AFTER_RE.search(str(error))
+-                hint = float(m.group(1)) if m else None
+-            return float(hint) if hint is not None and float(hint) > 0 else None
+-        # A fallback's implicit context may be the primary quota exception.
+-        # Never mistake that for a quota refusal by this route.
+-        return None
+-
+-    seen: set[int] = set()
+-    cur: Optional[BaseException] = exc
+-    while cur is not None and id(cur) not in seen:
+-        seen.add(id(cur))
+-        if isinstance(cur, (ProviderFallbackError, AuthError)):
+-            return route_hold(cur)
+-        cur = cur.__cause__ or cur.__context__
+-    return None
++    """Seconds the provider said it will stay closed, or None when *exc*'s cause chain does not
++    end in a typed quota refusal with a deadline: the routing pool's ``SubscriptionQuotaUnavailable``
++    (``resets_at``), a rate-limited ``AuthError`` (``retry after <N>s``), or a
++    ``ProviderFallbackError`` whose every route is one of those. Anchored on the exception types,
++    never on arbitrary text, so an unrelated "retry after" in an agent's output cannot park a job.
++    The type list lives in ``agent.model_routing_unavailable.quota_wait_seconds`` (one mapping for
++    every consumer)."""
++    from agent.model_routing_unavailable import quota_wait_seconds
++
++    return quota_wait_seconds(exc)
++
++
++def classify_failure_hold(job: dict[str, Any], exc: BaseException) -> Optional[float]:
++    """The hold for a failed run, or None. A quota-class failure that maps to no hold (no usable
++    deadline, or a new refusal type the mapping misses) logs ONE "quota failure not held" warning
++    per failed run: the self-heal lane keys on that line instead of every hourly traceback."""
++    from agent.model_routing_unavailable import is_quota_failure
++
++    hold = hold_seconds_from_failure(exc)
++    if hold is None and is_quota_failure(exc):
++        logger.warning(
++            "Job '%s': quota failure not held (no usable reset deadline in %s: %s); it will re-fire "
++            "on cadence", job.get("name", job.get("id", "?")), type(exc).__name__, exc)
++    return hold
+ 
+ 
+ def hold_active(job: dict[str, Any], now: Optional[datetime] = None) -> bool:
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 44659dfbefa..aeb37f3f71f 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2855,8 +2855,8 @@ def run_job(
+                 job["_model_unreachable"] = True
+             # Provider usage window closed for a known duration (cron/quota_hold.py): flag it so the
+             # bookkeeping tail parks the job past the window instead of re-firing into it (#89376).
+-            from cron.quota_hold import hold_seconds_from_failure
+-            _hold_s = hold_seconds_from_failure(e)
++            from cron.quota_hold import classify_failure_hold
++            _hold_s = classify_failure_hold(job, e)
+             if _hold_s:
+                 job["_quota_hold_seconds"] = _hold_s
+         except Exception:  # classification must never mask the real failure
+diff --git a/tests/cron/test_quota_hold_subscription.py b/tests/cron/test_quota_hold_subscription.py
+new file mode 100644
+index 00000000000..ff64b722fc5
+--- /dev/null
++++ b/tests/cron/test_quota_hold_subscription.py
+@@ -0,0 +1,164 @@
++"""The routing pool's ``SubscriptionQuotaUnavailable`` refusal parks a cron job past its reset
++(cron/quota_hold.py, self-heal cron-0f5ca72d35).
++
++The pool refusal carries an absolute ``resets_at`` epoch, not a ``retry after <N>s`` hint, and
++``_resolve_job_runtime`` re-raises it as a ``RuntimeError`` ``from`` the refusal. Before this
++fix the hold only recognized the Codex ``AuthError``, so x-reply-discovery and
++bsky-reply-discovery re-fired hourly into a window the pool had already said was closed.
++
++The contract test enumerates every 429-class ``ModelRoutingError`` subclass in the source tree,
++so a new quota refusal type cannot bypass the hold the way this one did.
++"""
++
++import ast
++import importlib
++import logging
++import time
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++import agent.model_routing_unavailable as mru
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++from cron import quota_hold as qh
++from cron.jobs import create_job, get_due_jobs, get_job
++from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, AuthError
++from hermes_cli.fallback_errors import ProviderFallbackError
++
++from tests.cron.test_quota_hold import _tick
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++@pytest.fixture
++def tmp_cron_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return home
++
++
++def _wrapped(exc: BaseException) -> RuntimeError:
++    """The exact shape ``_resolve_job_runtime`` raises: RuntimeError(text) from the refusal."""
++    try:
++        raise RuntimeError(str(exc)) from exc
++    except RuntimeError as wrapped:
++        return wrapped
++
++
++def test_runtime_error_from_subscription_quota_holds_until_reset():
++    reset = time.time() + 2 * 86400
++    hold = qh.hold_seconds_from_failure(
++        _wrapped(SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", reset)))
++    assert hold is not None
++    assert abs(hold - (reset - time.time())) < 5
++
++
++def test_passed_or_bogus_reset_gives_no_hold():
++    past = SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", time.time() - 10)
++    assert qh.hold_seconds_from_failure(_wrapped(past)) is None
++    for bogus in (None, "soon", float("nan"), float("inf")):
++        exc = SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", bogus)
++        assert qh.hold_seconds_from_failure(_wrapped(exc)) is None, bogus
++    # Text alone never parks a job.
++    assert qh.hold_seconds_from_failure(RuntimeError(
++        "Subscription quota unavailable for openai-codex/gpt-6-astra; resets at 1793774148.0")) is None
++
++
++def test_fallback_chain_of_pool_refusals_holds_for_the_earliest_reset():
++    now = time.time()
++    failures = [
++        ("openai-codex", "gpt-6-astra", SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", now + 7200)),
++        ("openai-codex", "gpt-6", AuthError("Codex quota exhausted (429); retry after 3600s",
++                                           provider="openai-codex", code=CODEX_RATE_LIMITED_CODE)),
++    ]
++    hold = qh.hold_seconds_from_failure(ProviderFallbackError(failures))
++    assert hold is not None and abs(hold - 3600) < 5
++    # One route that is not quota-closed means the chain is not known closed: no hold.
++    failures.append(("anthropic", "claude", RuntimeError("connection reset")))
++    assert qh.hold_seconds_from_failure(ProviderFallbackError(failures)) is None
++
++
++def _quota_routing_error_classes() -> set[type]:
++    """Every ModelRoutingError subclass in the source tree with HTTP 429 semantics."""
++    for path in REPO.rglob("*.py"):
++        rel = path.relative_to(REPO)
++        if rel.parts[0] in {"tests", ".venv", "node_modules", "website", "apps"} or ".worktrees" in rel.parts:
++            continue
++        try:
++            src = path.read_text(encoding="utf-8")
++        except (OSError, UnicodeDecodeError):
++            continue
++        if "ModelRoutingError" not in src and "SubscriptionQuotaUnavailable" not in src:
++            continue
++        tree = ast.parse(src)
++        if any(isinstance(n, ast.ClassDef) and n.bases for n in tree.body):
++            importlib.import_module(".".join(rel.with_suffix("").parts))
++    found, todo = set(), [ModelRoutingError]
++    while todo:
++        cls = todo.pop()
++        for sub in cls.__subclasses__():
++            todo.append(sub)
++            if getattr(sub, "status_code", None) == 429:
++                found.add(sub)
++    return found
++
++
++# A factory per quota refusal type: a new 429 ModelRoutingError fails this test until it is
++# both listed here and mapped to a wait by agent.model_routing_unavailable.quota_wait_seconds.
++_QUOTA_FACTORIES = {
++    SubscriptionQuotaUnavailable: lambda reset: SubscriptionQuotaUnavailable("p", "m", reset),
++}
++
++
++def test_every_quota_routing_error_maps_to_a_cron_hold():
++    classes = _quota_routing_error_classes()
++    assert SubscriptionQuotaUnavailable in classes
++    assert classes <= set(_QUOTA_FACTORIES), f"unmapped quota refusal types: {classes - set(_QUOTA_FACTORIES)}"
++    for cls in classes:
++        exc = _QUOTA_FACTORIES[cls](time.time() + 3600)
++        assert mru.quota_wait_seconds(exc) is not None, cls
++        assert qh.hold_seconds_from_failure(_wrapped(exc)) is not None, cls
++    # The Codex AuthError path is a quota type too.
++    codex = AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE, retry_after=900)
++    assert qh.hold_seconds_from_failure(_wrapped(codex)) == 900.0
++
++
++def test_scheduler_tick_parks_job_on_pool_refusal(tmp_cron_home, cron_owner):
++    """The real path: resolve_runtime_provider raises the pool refusal; the tick fails once and
++    stamps quota_hold_until past the reset instead of re-firing hourly."""
++    (tmp_cron_home / "config.yaml").write_text(
++        "platforms:\n  slack:\n    enabled: true\n    token: xoxb-test\n", encoding="utf-8")
++    job = create_job("bsky reply discovery", "7 * * * *", deliver="slack:alerts")
++    now = datetime.now(UTC)
++    reset = now.timestamp() + 2 * 86400
++
++    def refuse(**_kw):
++        raise SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", reset)
++
++    deliveries: list = []
++    _tick(get_job(job["id"]), tmp_cron_home, deliveries, refuse)
++    j = get_job(job["id"])
++    assert j is not None
++    assert j["last_status"] == "error"
++    assert j.get(qh.STATE_KEY), "the pool refusal must park the job"
++    parked = datetime.fromisoformat(j["next_run_at"])
++    assert parked.timestamp() >= reset, "next_run_at must land past the reset"
++    assert j[qh.STATE_KEY] == j["next_run_at"]
++    assert all(d["id"] != job["id"] for d in get_due_jobs())
++    assert len(deliveries) == 1 and "held" in deliveries[0], deliveries
++
++
++def test_quota_failure_without_a_hold_logs_one_warning(caplog):
++    """Detection: a quota-class failure the hold cannot map (here: reset already passed) logs
++    'quota failure not held' so the self-heal lane sees the gap, not an hourly traceback."""
++    exc = _wrapped(SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", None))
++    with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
++        assert qh.classify_failure_hold({"name": "x"}, exc) is None
++    assert [r.getMessage() for r in caplog.records if "quota failure not held" in r.getMessage()], caplog.text
++    caplog.clear()
++    with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
++        assert qh.classify_failure_hold({"name": "x"}, RuntimeError("model said no")) is None
++    assert "quota failure not held" not in caplog.text
+-- 
+2.55.0
+

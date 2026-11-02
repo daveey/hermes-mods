@@ -1,0 +1,497 @@
+From 2360171699c3910ea9e3dc80ede10dc31efbcb6f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:40:25 +0000
+Subject: [PATCH] fix(kanban): keep recovery park identity causal across
+ reconcile restores [daveey]
+
+Reconcile re-inserts a lost task_events row under a newer local id while keeping
+its uid. Recovery authority read MAX(id)/created-id order, so a restored park
+made its own valid recovery requester look stale, a restored stale requester's
+created event looked fresh, and a restored older park displaced the current one.
+
+On boards with a uid column, lifecycle, receipt and created events now carry
+append-time evidence (_recovery_history_v1): a stable identity, the lifecycle
+heads they superseded, the receipts a park cites, and the creator-chain parks a
+new card observed. Readers take the unique evidenced head instead of insertion
+order; freshness is 'created while this park was current'. Legacy synced
+histories with no evidence fail closed for authority but keep their triage
+hold. Unsynced boards keep local-id order unchanged.
+---
+ hermes_cli/kanban_db.py                       |   7 +-
+ hermes_cli/kanban_goal_recovery.py            |  15 +-
+ hermes_cli/kanban_recovery_history.py         | 108 ++++++++++++
+ hermes_cli/kanban_resume_exec.py              |  25 ++-
+ hermes_cli/kanban_resume_requester.py         |  23 ++-
+ .../test_kanban_recovery_reconcile.py         | 155 ++++++++++++++++++
+ 6 files changed, 313 insertions(+), 20 deletions(-)
+ create mode 100644 hermes_cli/kanban_recovery_history.py
+ create mode 100644 tests/hermes_cli/test_kanban_recovery_reconcile.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 1413852ca86..aaabeaac2f9 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1912,10 +1912,9 @@ def _append_event(
+     run_id: Optional[int] = None,
+ ) -> None:
+     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
+-    conn.execute(
+-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+-        "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
+-    )
++    from hermes_cli.kanban_recovery_history import stamp  # causal recovery evidence (synced boards)
++    conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)", (
++        task_id, run_id, kind, _json_or_null(stamp(conn, task_id, kind, payload, run_id)), int(time.time())))
+ 
+ 
+ def _end_run(
+diff --git a/hermes_cli/kanban_goal_recovery.py b/hermes_cli/kanban_goal_recovery.py
+index 09c3fbc86da..31478c502d0 100644
+--- a/hermes_cli/kanban_goal_recovery.py
++++ b/hermes_cli/kanban_goal_recovery.py
+@@ -52,16 +52,21 @@ def valid_receipt(conn, task_id, run_id, reason, *, before=None):
+     """Match the kernel receipt to this run, goal, and exact judge reason."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_resume_exec import _payload
++    from hermes_cli import kanban_recovery_history as history
+ 
+     task = kb.get_task(conn, task_id)
+     if not task or not task.goal_mode or run_id is None:
+         return False
+     row = conn.execute(
+-        'SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
++        'SELECT * FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
+         'ORDER BY id DESC LIMIT 1', (task_id, run_id, EVENT)).fetchone()
+-    if not row or (before is not None and row[0] >= before):
++    if not row:
+         return False
+-    data = _payload(row[1])
++    if before is not None:
++        block = conn.execute('SELECT * FROM task_events WHERE id=?', (before,)).fetchone()
++        if block is None or not history.receipt_precedes(conn, row, block):
++            return False
++    data = _payload(row['payload'])
+     expected = {**subject(task, reason), 'run_id': run_id, 'status': 'running'}
+     return data.get('subject') == expected and data.get('snapshot') == digest(expected)
+ 
+@@ -93,6 +98,10 @@ def recovery_assignee(task):
+ def current_park(conn, task_id):
+     """Keep judged goals out of generic triage re-entry, even after recovery ends."""
+     from hermes_cli.kanban_resume_exec import _payload
++    from hermes_cli import kanban_recovery_history as history
++    if history.synced(conn):
++        row = history.latest(conn, task_id, ('blocked',))
++        return bool(row and _payload(row['payload']).get('rekind_reason') == EVENT)
+     row = conn.execute(
+         "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
+         (task_id,)).fetchone()
+diff --git a/hermes_cli/kanban_recovery_history.py b/hermes_cli/kanban_recovery_history.py
+new file mode 100644
+index 00000000000..917e14833f8
+--- /dev/null
++++ b/hermes_cli/kanban_recovery_history.py
+@@ -0,0 +1,108 @@
++"""Recovery-only causal evidence, authored once and transported unchanged by sync.
++
++SQLite IDs locate rows, UUIDs identify them; neither is causal order. A lifecycle
++write records the heads it observed. Creation records the ancestor parks it saw.
++Restoring either row therefore cannot renew authority. Legacy synced histories
++without a unique evidenced head fail closed; unsynced boards retain local order.
++"""
++from __future__ import annotations
++
++import uuid
++
++META = '_recovery_history_v1'
++
++
++def synced(conn):
++    # A detached board can still contain replayed history. Schema presence, not
++    # today's sync toggle, determines whether insertion order is trustworthy.
++    return any(r[1] == 'uid' for r in conn.execute('PRAGMA table_info(task_events)'))
++
++
++def metadata(row):
++    from hermes_cli.kanban_resume_exec import _payload
++    value = _payload(row['payload']).get(META)
++    return value if isinstance(value, dict) else {}
++
++
++def identity(row):
++    if row is None:
++        return None
++    return metadata(row).get('identity') or row['uid']
++
++
++def events(conn, target, kinds):
++    marks = ','.join('?' for _ in kinds)
++    return conn.execute(f'SELECT * FROM task_events WHERE task_id=? AND kind IN ({marks})',
++                        (target, *kinds)).fetchall()
++
++
++def heads(rows):
++    seen = {key for row in rows for key in metadata(row).get('predecessors', [])}
++    return [row for row in rows if identity(row) not in seen]
++
++
++def latest(conn, target, kinds):
++    rows = events(conn, target, kinds)
++    if not synced(conn):
++        return max(rows, key=lambda r: r['id'], default=None)
++    # Include intermediate lifecycle events when finding a blocked head: filtering
++    # first would discard the links that supersede an older park.
++    from hermes_cli.kanban_resume_exec import _LIFECYCLE_KINDS
++    lifecycle = events(conn, target, _LIFECYCLE_KINDS)
++    tips = heads(lifecycle)
++    if len(tips) != 1 or not metadata(tips[0]):
++        return None
++    return tips[0] if tips[0]['kind'] in kinds else None
++
++
++def evidenced(conn, target):
++    """True once any lifecycle event of ``target`` carries causal evidence."""
++    from hermes_cli.kanban_resume_exec import _LIFECYCLE_KINDS
++    return any(metadata(r) for r in events(conn, target, _LIFECYCLE_KINDS))
++
++
++def park_identity(conn, target):
++    row = latest(conn, target, ('blocked',))
++    if not synced(conn):
++        return row['id'] if row else 0
++    return identity(row)
++
++
++def _observed_parks(conn, creator):
++    from hermes_cli.kanban_resume_exec import MAX_CREATOR_HOPS, _creator
++    result = {}
++    for _ in range(MAX_CREATOR_HOPS):
++        if not creator:
++            break
++        park = park_identity(conn, creator)
++        if park:
++            result[creator] = park
++        creator = _creator(conn, creator)
++    return result
++
++
++def stamp(conn, task_id, kind, payload, run_id):
++    from hermes_cli.kanban_resume_exec import _LIFECYCLE_KINDS
++    receipts = ('continuation_exhausted', 'goal_unachievable')
++    if kind not in (*_LIFECYCLE_KINDS, *receipts, 'created') or not synced(conn):
++        return payload
++    data: dict = {'identity': str(uuid.uuid4())}
++    if kind in _LIFECYCLE_KINDS:
++        data['predecessors'] = [identity(r) for r in heads(events(conn, task_id, _LIFECYCLE_KINDS))]
++    if kind == 'created':
++        data['parks'] = _observed_parks(conn, (payload or {}).get('creator_task_id'))
++    if kind == 'blocked' and run_id is not None:
++        data['receipts'] = [identity(r) for r in events(conn, task_id, receipts) if r['run_id'] == run_id]
++    return {**(payload or {}), META: data}
++
++
++def fresh(conn, requester, target):
++    rows = events(conn, requester, ('created',))
++    park = park_identity(conn, target)
++    return bool(park and len(rows) == 1 and metadata(rows[0]).get('parks', {}).get(target) == park)
++
++
++def receipt_precedes(conn, receipt, park):
++    if not synced(conn):
++        return receipt['id'] < park['id']
++    return identity(receipt) in metadata(park).get('receipts', [])
+diff --git a/hermes_cli/kanban_resume_exec.py b/hermes_cli/kanban_resume_exec.py
+index 9e878fdc8b8..f7e5ff6381f 100644
+--- a/hermes_cli/kanban_resume_exec.py
++++ b/hermes_cli/kanban_resume_exec.py
+@@ -129,10 +129,9 @@ def exhaustion_refusal(conn: sqlite3.Connection, target: str) -> Optional[str]:
+         return f"{target} is {status}, not parked in triage/blocked"
+     if run is not None:
+         return f"{target} still has a live run {run}"
+-    marks = ",".join("?" for _ in _LIFECYCLE_KINDS)
+-    last = conn.execute(
+-        f"SELECT id, kind, run_id, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+-        "ORDER BY id DESC LIMIT 1", (target, *_LIFECYCLE_KINDS)).fetchone()
++    from hermes_cli import kanban_recovery_history as history
++    event = history.latest(conn, target, _LIFECYCLE_KINDS)
++    last = tuple(event[k] for k in ('id', 'kind', 'run_id', 'payload')) if event else None
+     payload = _payload(last[3]) if last else {}
+     if last and last[1] == 'blocked' and payload.get('rekind_reason') == 'goal_unachievable':
+         from hermes_cli.kanban_goal_recovery import valid_receipt
+@@ -142,9 +141,9 @@ def exhaustion_refusal(conn: sqlite3.Connection, target: str) -> Optional[str]:
+     if not last or last[1] != "blocked" or payload.get("rekind_reason") != "continuation_exhausted":
+         return (f"{target}'s current park is not a continuation_exhausted block "
+                 f"(newest lifecycle event: {last[1] if last else 'none'})")
+-    if last[2] is None or not conn.execute(
+-            "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'continuation_exhausted' "
+-            "AND id < ?", (target, last[2], last[0])).fetchone():
++    receipts = history.events(conn, target, ('continuation_exhausted',))
++    if last[2] is None or not any(r['run_id'] == last[2] and history.receipt_precedes(conn, r, event)
++                                  for r in receipts):
+         return f"{target}'s block was not written by the run the kernel refused a continuation"
+     return None
+ 
+@@ -156,6 +155,13 @@ def _created_event_id(conn: sqlite3.Connection, task_id: str) -> int:
+ 
+ 
+ def _park_event_id(conn: sqlite3.Connection, target: str) -> int:
++    from hermes_cli import kanban_recovery_history as history
++    if history.synced(conn):
++        row = history.latest(conn, target, ('blocked',))
++        if row is not None or history.evidenced(conn, target):
++            return int(row['id']) if row else 0
++        # Legacy history with no causal evidence: authority fails closed elsewhere
++        # (exhaustion_refusal, fresh), but the triage hold keeps its old local anchor.
+     row = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+                        (target,)).fetchone()
+     return int(row[0]) if row and row[0] is not None else 0
+@@ -165,7 +171,10 @@ def _recovery_refusal(conn: sqlite3.Connection, requester: str, target: str) ->
+     """An ancestor may be resumed only by a card created for THIS park (after its exhaustion block)."""
+     if _creator(conn, target) == requester:
+         return None  # a card the requester created; the requester owns it
+-    if _created_event_id(conn, requester) <= _park_event_id(conn, target):
++    from hermes_cli import kanban_recovery_history as history
++    fresh = (history.fresh(conn, requester, target) if history.synced(conn) else
++             _created_event_id(conn, requester) > _park_event_id(conn, target))
++    if not fresh:
+         return (f"{requester} predates {target}'s current continuation_exhausted park; only a recovery "
+                 "card created for this park may resume it")
+     return None
+diff --git a/hermes_cli/kanban_resume_requester.py b/hermes_cli/kanban_resume_requester.py
+index cc335ae195f..31badbb8ba3 100644
+--- a/hermes_cli/kanban_resume_requester.py
++++ b/hermes_cli/kanban_resume_requester.py
+@@ -10,8 +10,9 @@ Each dispatcher tick, :func:`ensure_recovery_cards` finds home-owned cards whose
+ :func:`kanban_resume_exec.exhaustion_refusal` (a continuation_exhausted rekind written by the
+ refused run, no human gate, no live run, nothing moved it since) and creates ONE recovery card per
+ park: ``creator_task_id=<target>`` (1 hop), ``created_by=kanban-recovery``, idempotency key
+-``recovery:<target>:<park blocked event id>``. It is post-park and in scope by construction, so it
+-may file ``resume`` through the ordinary supervisor request path; every fence of that path
++``recovery:<target>:<durable park identity>`` (the local event id on unsynced boards). It is
++post-park and in scope by construction, so it may file ``resume`` through the ordinary supervisor
++request path; every fence of that path
+ (scope, freshness, human gate, exhaustion, ``MAX_RESUMES``) still runs unchanged at execution.
+ 
+ Not created: for a card whose resume budget is spent (the request would be refused), for a card
+@@ -26,13 +27,15 @@ import logging
+ import sqlite3
+ from typing import Optional
+ 
++from hermes_cli import kanban_recovery_history as history
++
+ logger = logging.getLogger(__name__)
+ 
+ CREATED_BY = "kanban-recovery"
+ EVENT = "resume_requester_created"
+ 
+ 
+-def _key(target: str, park_id: int) -> str:
++def _key(target: str, park_id) -> str:
+     return f"recovery:{target}:{park_id}"
+ 
+ 
+@@ -95,6 +98,8 @@ def _event_for_park(conn: sqlite3.Connection, target: str, park_id: int) -> Opti
+     from hermes_cli.kanban_wake_check import foreign_copy
+ 
+     park_uid = _park_uid(conn, target, park_id)
++    park = conn.execute("SELECT * FROM task_events WHERE task_id = ? AND id = ?", (target, park_id)).fetchone()
++    park_identity = history.identity(park) if park is not None and park_uid else None
+     foreign = foreign_copy(conn, target)
+     for (raw,) in conn.execute(
+             "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC", (target, EVENT)):
+@@ -104,7 +109,11 @@ def _event_for_park(conn: sqlite3.Connection, target: str, park_id: int) -> Opti
+             continue
+         if not isinstance(data, dict):
+             continue
+-        if data.get("park_event_uid"):
++        if data.get("park_identity"):
++            # Authored with the park's causal identity: survives row-loss restoration,
++            # which re-inserts the same event under a newer local id.
++            matches = park_identity is not None and data["park_identity"] == park_identity
++        elif data.get("park_event_uid"):
+             matches = data["park_event_uid"] == park_uid
+         else:
+             # Pre-UID links are only exact at home. A foreign reader cannot disprove
+@@ -163,7 +172,8 @@ def ensure_recovery_cards(conn: sqlite3.Connection) -> list[str]:
+                 model_override=task.model_override, provider_override=task.provider_override,
+                 requires=['terminal', 'file', 'kanban'] if goal else None,
+                 created_by=CREATED_BY, workspace_kind="scratch", tenant=row["tenant"],
+-                idempotency_key=_key(target, park_id), creator_task_id=target, runs_on=runs_on,
++                idempotency_key=_key(target, history.park_identity(conn, target) or park_id),
++                creator_task_id=target, runs_on=runs_on,
+             )
+         except (sqlite3.Error, ValueError):
+             logger.exception("kanban: recovery card for %s failed", target)
+@@ -172,6 +182,9 @@ def ensure_recovery_cards(conn: sqlite3.Connection) -> list[str]:
+         park_uid = _park_uid(conn, target, park_id)
+         if park_uid:
+             payload["park_event_uid"] = park_uid
++            identity = history.park_identity(conn, target)
++            if identity:
++                payload["park_identity"] = identity
+         with kb.write_txn(conn):
+             kb._append_event(conn, target, EVENT, payload)
+         made.append(rec)
+diff --git a/tests/hermes_cli/test_kanban_recovery_reconcile.py b/tests/hermes_cli/test_kanban_recovery_reconcile.py
+new file mode 100644
+index 00000000000..5fcd403ec1f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_recovery_reconcile.py
+@@ -0,0 +1,155 @@
++"""Recovery authority survives row-loss restoration, not insertion-order replay."""
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_resume_exec as rx
++from hermes_cli import kanban_resume_requester as rr
++from hermes_cli import kanban_supervisor_requests as sr
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import test_kanban_worker_node as worker_node
++from tests.hermes_cli.test_kanban_recovery_authority import _foreign_park
++from hermes_cli import kanban_continuation as kc
++from tests.hermes_cli.test_kanban_sync_reconcile import _without_capture
++
++gws = worker_node.gws
++svc = worker_node.svc
++
++
++def _exhaust(home, target):
++    assert kb.claim_task(home.conn, target) is not None
++    home.round()  # receive service-authored claimed before the park
++    run = kb.get_task(home.conn, target).current_run_id
++    out = kc.continue_task(home.conn, target, checkpoint='progress', expected_run_id=run, max_continuations=0)
++    assert out['reason_code'] == 'continuation_exhausted'
++    assert kb.block_task(home.conn, target, kind='transient', expected_run_id=run,
++                         reason='continuation_exhausted: split the work or reset the continuation budget')
++
++
++def _restore(home, svc, event_id):
++    home.round()
++    uid = home.conn.execute('SELECT uid FROM task_events WHERE id=?', (event_id,)).fetchone()[0]
++    _without_capture(home.conn, 'DELETE FROM task_events WHERE id=?', (event_id,))
++    ksc.reconcile(worker_node.BOARD, home.home / 'kanban.db', hub=svc.hub(home.name))
++    restored = home.conn.execute('SELECT id FROM task_events WHERE uid=?', (uid,)).fetchone()[0]
++    assert restored > event_id
++    return restored
++
++
++def test_restored_current_park_keeps_requester_and_executes_once(gws, svc):
++    home, worker = gws
++    target = _foreign_park(home, worker)
++    home.enter()
++    [rec] = rr.ensure_recovery_cards(home.conn)
++    assert rx.refusal(home.conn, rec, target) is None
++    _restore(home, svc, rx._park_event_id(home.conn, target))
++    assert rx.refusal(home.conn, rec, target) is None
++    assert rr.open_recovery_card(home.conn, target) == rec
++    assert rr.ensure_recovery_cards(home.conn) == []
++    home.tick()
++    run = kb.get_task(home.conn, rec).current_run_id
++    assert run is not None
++    out = sr.submit(home.conn, env_task=rec, env_run=str(run),
++                    ops=[{'op': 'resume', 'task_id': target}], reason='progress')
++    assert sr.drain(home.conn)['processed'] == [(out['request_id'], 'done')]
++    assert sr.drain(home.conn)['processed'] == []
++    assert len(rx._resume_events(home.conn, target)) == 1
++    home.round()
++    events = svc.board(worker_node.BOARD)['rows']['task_events'].values()
++    assert sum(e['task_id'] == target and e['kind'] == 'unblocked' for e in events) == 1
++
++
++def test_restored_stale_creation_does_not_gain_authority(gws, svc):
++    home, worker = gws
++    target = _foreign_park(home, worker)
++    home.enter()
++    [old] = rr.ensure_recovery_cards(home.conn)
++    assert kb.unblock_task(home.conn, target)
++    _exhaust(home, target)
++    assert 'predates' in rx.refusal(home.conn, old, target)
++    _restore(home, svc, rx._created_event_id(home.conn, old))
++    assert 'predates' in rx.refusal(home.conn, old, target)
++
++
++def test_restored_historical_park_does_not_replace_current(gws, svc):
++    home, worker = gws
++    target = _foreign_park(home, worker)
++    home.enter()
++    [old] = rr.ensure_recovery_cards(home.conn)
++    first_park = rx._park_event_id(home.conn, target)
++    assert kb.unblock_task(home.conn, target)
++    _exhaust(home, target)
++    [new] = rr.ensure_recovery_cards(home.conn)
++    current = rx._park_event_id(home.conn, target)
++    _restore(home, svc, first_park)
++    assert rx._park_event_id(home.conn, target) == current
++    assert rx.refusal(home.conn, new, target) is None
++    assert 'predates' in rx.refusal(home.conn, old, target)
++    assert rr.open_recovery_card(home.conn, target) == new
++    assert rr.ensure_recovery_cards(home.conn) == []
++
++
++def test_restored_receipt_and_equal_timestamps_keep_causal_order(gws, svc):
++    home, worker = gws
++    target = _foreign_park(home, worker)
++    home.enter()
++    [rec] = rr.ensure_recovery_cards(home.conn)
++    # Deliberately remove timestamp discrimination; these are event payloads, not
++    # a mocked clock or mocked recovery verdict.
++    with kb.write_txn(home.conn):
++        home.conn.execute('UPDATE task_events SET created_at=(SELECT MAX(created_at) FROM task_events)')
++    receipt = home.conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind='continuation_exhausted'",
++                                (target,)).fetchone()[0]
++    _restore(home, svc, receipt)
++    assert rx.refusal(home.conn, rec, target) is None
++    unrelated = kb.create_task(home.conn, title='unrelated', assignee='default')
++    assert 'creator chain' in rx.refusal(home.conn, unrelated, target)
++    with kb.write_txn(home.conn):
++        home.conn.execute("UPDATE tasks SET block_kind='needs_input', human_request=? WHERE id=?",
++                          ('{"action":"decide"}', target))
++    assert 'human_gate' in rx.refusal(home.conn, rec, target)
++    assert rr.ensure_recovery_cards(home.conn) == []
++
++
++def test_legacy_synced_park_without_provenance_fails_closed(gws):
++    from hermes_cli.kanban_recovery_history import META
++    home, worker = gws
++    target = _foreign_park(home, worker)
++    home.enter()
++    park = rx._park_event_id(home.conn, target)
++    with kb.write_txn(home.conn):
++        home.conn.execute('UPDATE task_events SET payload=json_remove(payload, ?) WHERE id=?',
++                          ('$.' + META, park))
++    assert rx.exhaustion_refusal(home.conn, target) is not None
++    assert rr.ensure_recovery_cards(home.conn) == []
++
++
++def test_legacy_synced_history_keeps_triage_hold_but_not_authority(gws):
++    from hermes_cli.kanban_recovery_history import META
++    home, worker = gws
++    target = _foreign_park(home, worker)
++    home.enter()
++    [rec] = rr.ensure_recovery_cards(home.conn)
++    # Pre-upgrade history: no lifecycle event carries causal evidence; the link has only the uid.
++    with kb.write_txn(home.conn):
++        home.conn.execute('UPDATE task_events SET payload=json_remove(payload, ?, ?) WHERE task_id IN (?, ?)',
++                          ('$.' + META, '$.park_identity', target, rec))
++    assert rr.open_recovery_card(home.conn, target) == rec  # stale-triage sweep still leaves it alone
++    assert rx.exhaustion_refusal(home.conn, target) is not None
++    assert rx.refusal(home.conn, rec, target) is not None
++
++
++def test_goal_park_and_receipt_restore_without_changing_judge_evidence(gws, svc):
++    from hermes_cli import kanban_goal_recovery as goal
++    home, _ = gws
++    home.enter()
++    target = kb.create_task(home.conn, title='judged goal', assignee='default', goal_mode=True)
++    assert kb.claim_task(home.conn, target)
++    home.round()
++    task = kb.get_task(home.conn, target)
++    assert goal.park(home.conn, task, 'missing prerequisite', expected_run_id=task.current_run_id)
++    rec = kb.create_task(home.conn, title='repair prerequisite', assignee='default', creator_task_id=target)
++    assert rx.refusal(home.conn, rec, target) is None
++    _restore(home, svc, rx._park_event_id(home.conn, target))
++    receipt = home.conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind='goal_unachievable'",
++                                (target,)).fetchone()[0]
++    _restore(home, svc, receipt)
++    assert goal.current_park(home.conn, target)
++    assert rx.refusal(home.conn, rec, target) is None
+-- 
+2.55.0
+

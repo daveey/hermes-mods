@@ -1,0 +1,134 @@
+From d6969c15e3483ceb972b7a9747e4e2c5c5ceb1bc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 03:17:07 +0000
+Subject: [PATCH] [daveey] test(pm): retry dropped PyPI connections in
+ locked_wheelhouse fixture
+
+The module-scoped locked_wheelhouse fixture fetched each locked wheel from
+PyPI with a single urlopen. A dropped TLS connection on a CI runner
+(SSL UNEXPECTED_EOF_WHILE_READING) errored setup for
+test_cold_manager_build_does_not_bootstrap_a_worker and only CI's retry
+kept the job green.
+
+Retry transient network failures (URLError, HTTP 5xx, connection/timeout/
+SSL errors) with backoff; 4xx still fails at once. Bytes are still
+sha256-checked, and verified downloads are reused across the two modules
+that use the fixture, halving PyPI round trips.
+---
+ tests/pm/test_runtime_wheelhouse.py | 77 +++++++++++++++++++++++++++--
+ 1 file changed, 74 insertions(+), 3 deletions(-)
+
+diff --git a/tests/pm/test_runtime_wheelhouse.py b/tests/pm/test_runtime_wheelhouse.py
+index b2390cf29bd..538b0056583 100644
+--- a/tests/pm/test_runtime_wheelhouse.py
++++ b/tests/pm/test_runtime_wheelhouse.py
+@@ -1,11 +1,15 @@
+ """Exercise offline PM staging with real wheels, not the application's environment."""
+ import hashlib
++import http.client
+ import json
+ from pathlib import Path
+ import shutil
++import ssl
+ import subprocess
+ import sys
++import time
+ import tomllib
++import urllib.error
+ import urllib.request
+ 
+ from packaging.tags import sys_tags
+@@ -17,6 +21,39 @@ from scripts.bundles.payload import seal_pm_runtime
+ from tests.pm._fixtures import stage_host_python
+ 
+ 
++# Verified wheel bytes by URL: test_worker imports this fixture too, so each module
++# would otherwise fetch the same wheels from PyPI again.
++_DOWNLOADED: dict[str, bytes] = {}
++_TRANSIENT = (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError, ssl.SSLError)
++
++
++def _download_wheel(url: str, expected: str, *, attempts: int = 5, backoff: float = 1.0) -> bytes:
++    """Fetch one locked wheel, retrying transient network failures.
++
++    CI runners see dropped TLS connections to PyPI (``UNEXPECTED_EOF_WHILE_READING``); one
++    such drop used to error the whole module's setup. The bytes are hash-checked, so a retry
++    or a reused download can never change what the tests stage.
++    """
++    if url in _DOWNLOADED:
++        return _DOWNLOADED[url]
++    for attempt in range(1, attempts + 1):
++        try:
++            with urllib.request.urlopen(url, timeout=60) as response:
++                data = response.read()
++        except urllib.error.HTTPError as error:
++            if error.code < 500 or attempt == attempts:
++                raise
++        except _TRANSIENT:
++            if attempt == attempts:
++                raise
++        else:
++            assert "sha256:" + hashlib.sha256(data).hexdigest() == expected
++            _DOWNLOADED[url] = data
++            return data
++        time.sleep(backoff * 2 ** (attempt - 1))  # health: allow HX013 -- backoff before re-requesting PyPI; no local event signals a remote recovery
++    raise AssertionError("unreachable")
++
++
+ @pytest.fixture(scope="module")
+ def locked_wheelhouse(tmp_path_factory):
+     """Download host wheels first; only the subsequent stage runs offline."""
+@@ -32,9 +69,7 @@ def locked_wheelhouse(tmp_path_factory):
+                    if parse_wheel_filename(wheel["url"].rsplit("/", 1)[1])[3] & tags]
+         assert choices, f"no host wheel for {package['name']}"
+         wheel = choices[0]
+-        with urllib.request.urlopen(wheel["url"], timeout=60) as response:
+-            data = response.read()
+-        assert "sha256:" + hashlib.sha256(data).hexdigest() == wheel["hash"]
++        data = _download_wheel(wheel["url"], wheel["hash"])
+         (wheelhouse / wheel["url"].rsplit("/", 1)[1]).write_bytes(data)
+         versions[package["name"]] = package["version"]
+     return wheelhouse, versions
+@@ -140,3 +175,39 @@ def test_offline_wheelhouse_rejects_missing_locked_wheel(
+                               wheelhouse=incomplete, offline=True)
+     assert "ruamel-yaml" in capfd.readouterr().err
+     assert not destination.exists()
++
++
++def test_wheel_download_retries_a_dropped_tls_connection(monkeypatch):
++    """CI saw PyPI drop TLS mid-request; one drop must not error every test using the wheelhouse."""
++    import io
++
++    payload = b"wheel bytes"
++    calls = []
++
++    def flaky_urlopen(url, timeout):
++        calls.append(url)
++        if len(calls) == 1:
++            raise urllib.error.URLError(ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred"))
++        return io.BytesIO(payload)
++
++    monkeypatch.setattr(urllib.request, "urlopen", flaky_urlopen)
++    monkeypatch.setattr(time, "sleep", lambda seconds: None)
++    url = "https://files.example.invalid/flaky-1.0-py3-none-any.whl"
++    monkeypatch.delitem(_DOWNLOADED, url, raising=False)
++    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
++    assert _download_wheel(url, digest) == payload
++    assert _download_wheel(url, digest) == payload
++    assert len(calls) == 2
++
++
++def test_wheel_download_does_not_retry_a_missing_wheel(monkeypatch):
++    calls = []
++
++    def missing(url, timeout):
++        calls.append(url)
++        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
++
++    monkeypatch.setattr(urllib.request, "urlopen", missing)
++    with pytest.raises(urllib.error.HTTPError):
++        _download_wheel("https://files.example.invalid/gone-1.0-py3-none-any.whl", "sha256:0")
++    assert len(calls) == 1
+-- 
+2.55.0
+

@@ -1,6 +1,11 @@
 # PR guard handoff after an orderly park
 
-Patch: **0350**, source `1a2ba03afccbee694b5dcb1adee73e85bb42be3d`. Follow-up: **1533** (ordering dependency parks, final section).
+Patches: 0350 1533 1603 1610
+
+Patch **0350**, source `1a2ba03afccbee694b5dcb1adee73e85bb42be3d`. Follow-up: **1533** (ordering dependency parks), **1603** (added gates and already-done synced parents), **1610** (stable run identity).
+
+- `patches/1603-daveey-kanban-ordering-park-handoff-survives-operato.patch`
+- `patches/1610-fix-kanban-match-ordering-park-checkpoint-by-stable-.patch`
 
 ## Behavior
 
@@ -124,3 +129,57 @@ needed.
   the PR hold applies again.
 - **Ordering parks only.** A dependency park whose parent produced any review verdict is handled only by
   `resumes_review`, never by this ordering handoff.
+
+## Follow-ups: added gates and stable checkpoint identity (1603, 1610)
+
+### Behavior
+
+- **1603:** A completed operator-added ordering gate no longer invalidates an owner's prior park; the dispatcher can launch one continuation. An unfinished added gate or one carrying review evidence still keeps the PR hold. This supersedes 1533's exact-parent-set requirement: checkpointed parents must remain a subset of current parents, and all current parents must be satisfied.
+- **1603:** A synced parent with no local task/run can be skipped for review-result inspection only if the checkpoint already included it but did not await it. A remote parent awaited at park time remains guarded even after its synced status becomes done.
+- **1610:** An ordering-park checkpoint matches the parked run by stable `run_uid`, so remapping integer run IDs during sync does not invalidate it. A present but invalid or foreign UID stays guarded; only a checkpoint with no UID field falls back to its original integer ID. A subsequent claim consumes the handoff locally and after sync.
+
+### How it works
+
+**1603** validates a nonempty list of string checkpoint parents and uses a subset check plus `unsatisfied_parents`. `_awaited_parents` still validates the awaited dependencies. The missing-result exception requires a checkpointed, non-awaited parent, an `awaited` list, and no local task; it is not permission to ignore missing local run evidence.
+
+**1610** replaces direct checkpoint `run_id` equality in `_dependency_handoff_after` with the shared `kanban_dependency_review._checkpoint_matches_run` predicate. Sync rewrites relational integer IDs but leaves checkpoint JSON unchanged, so the stable UID is authoritative when present.
+
+### Code
+
+- **1603, 1610:** `hermes_cli/kanban_db_dispatch_pr_state.py` — parent/result checks and checkpoint matching in `_dependency_handoff_after`.
+- **1603:** `tests/hermes_cli/test_kanban_dependency_pr_handoff.py` — added-gate and synced-parent regressions.
+- **1610:** `tests/hermes_cli/test_kanban_dependency_ordering_sync.py` — local and transported checkpoint identity regressions.
+
+### Tests
+
+**1603**, in `tests/hermes_cli/test_kanban_dependency_pr_handoff.py`:
+
+- `test_operator_added_gate_after_owner_park_still_allows_one_continuation`
+- `test_operator_added_gate_still_open_stays_guarded`
+- `test_operator_added_review_gate_cannot_bypass_review_evidence`
+- `test_synced_parent_done_before_park_does_not_hold_ordering_continuation`
+- `test_synced_parent_awaited_at_park_stays_guarded`
+
+**1610**, in `tests/hermes_cli/test_kanban_dependency_ordering_sync.py`:
+
+- `test_local_ordering_park_released`
+- `test_synced_ordering_park_released_despite_run_id_remap`
+- `test_bad_uid_stays_held_even_if_integer_matches`
+- `test_foreign_real_uid_stays_held`
+- `test_legacy_uidless_checkpoint_only_matches_original_id`
+- `test_second_claim_consumes_the_handoff`
+
+These were not rerun by the mirror pass.
+
+Untested:
+- Live cross-gateway transport and GitHub lookup; PR state is mocked to `OPEN`.
+- End-to-end synced PR comment provenance: the 1610 fixture replaces transported comments with an unattributed publication at the original time, isolating the checkpoint fix from `writer_run_id` remapping.
+- CLI, registered tool and Desktop initiation of these follow-up cases; tests exercise database/dispatcher helpers directly.
+
+### Applying
+
+Apply in series order after 1533 and the shared dependency-review checkpoint helper: 1603 before 1610. No new configuration is introduced.
+
+### Gotchas
+
+Added gates are not a bypass for unfinished parents or review evidence. A missing UID permits legacy integer matching, not recovery of an integer remapped by sync. Neither follow-up changes merge authority or grants unlimited continuations.

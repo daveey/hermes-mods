@@ -1,0 +1,1400 @@
+From b23827fae99eb18b3cac13c961e62e800339bccb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:21:15 +0000
+Subject: [PATCH] [daveey] kanban: honour quota-wall reset deadlines per
+ episode and reroute default-routed cards
+
+A rate_limited requeue respawned every ~5 min even when the worker reported a
+reset hours away (32 dead runs on one card), and on the 11-01 hub Codex wall
+32 default-routed cards were held until the reset although anthropic routed.
+
+- Durable per-card quota episode (kanban_quota_episode): exact-run receipt
+  deadline (typed failure_resets_at, then 'resets in Nh Mm', ISO or epoch
+  'resets at', retry-after), else exponential backoff capped at 2h.
+- One read-only decision shared by guard, preview and dispatch: unpinned
+  default/profile-default cards take the next eligible class route off the
+  walled provider (recorded in run_route as +quota_reroute); explicit pins,
+  strong and review tiers wait; a re-pin to a different known provider is
+  admitted. Replaces waiting_for_quota_reset, which ignored the next route.
+- Worker receipts record the concrete provider that ran (class routes).
+- One quota_episode_notice + comment after 3 consecutive walls, delivered by
+  the gateway and TUI notifiers; long cooldown holds file no fix cards.
+- Malformed/unrepresentable deadlines are rejected; reroute/notice failures
+  fall back to a hold so the reaper always finishes.
+---
+ agent/model_routing_agent.py                  |  17 +-
+ gateway/kanban_watchers_notifier.py           |  12 +-
+ gateway/session_kanban.py                     |  10 +-
+ hermes_cli/kanban_db_dispatch.py              |  33 +-
+ hermes_cli/kanban_db_dispatch_guard_notice.py |   6 +
+ hermes_cli/kanban_model_tier.py               |  39 +-
+ hermes_cli/kanban_provider_walls.py           |  26 +-
+ hermes_cli/kanban_quota_episode.py            | 236 +++++++
+ hermes_cli/kanban_quota_receipt.py            | 127 +++-
+ hermes_cli/kanban_shared_blockers.py          |   8 +-
+ .../hermes_cli/test_kanban_provider_walls.py  |   6 +-
+ tests/hermes_cli/test_kanban_quota_episode.py | 582 ++++++++++++++++++
+ tui_gateway/session_notifications.py          |   9 +-
+ 13 files changed, 1030 insertions(+), 81 deletions(-)
+ create mode 100644 hermes_cli/kanban_quota_episode.py
+ create mode 100644 tests/hermes_cli/test_kanban_quota_episode.py
+
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index 190857664d2..8a6a80824ca 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -2,6 +2,18 @@
+ from agent.model_routing import is_class_selector
+ 
+ 
++def class_requirements(config):
++    """Construction-time capability floor every AIAgent class allocation applies.
++
++    Shared with non-allocating probes (Kanban quota reroutes) so a probe never offers a
++    route the worker's own allocator would refuse."""
++    model_config = (config or {}).get("model", {})
++    requirements = {"tools": True, "streaming": True}
++    if isinstance(model_config, dict) and model_config.get("context_length"):
++        requirements["min_context_tokens"] = model_config["context_length"]
++    return requirements
++
++
+ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+                         api_mode, credential_pool, fallback_model):
+     """Resolve only class selectors; concrete user pins retain legacy semantics.
+@@ -21,10 +33,7 @@ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+     from hermes_cli.runtime_provider import resolve_runtime_provider
+ 
+     config = managed or load_user_config_effective()
+-    model_config = config.get("model", {})
+-    requirements = {"tools": True, "streaming": True}
+-    if isinstance(model_config, dict) and model_config.get("context_length"):
+-        requirements["min_context_tokens"] = model_config["context_length"]
++    requirements = class_requirements(config)
+     session_id = session_id or new_session_id()
+     runtime = resolve_runtime_provider(
+         requested=provider or "auto", target_model=model,
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 7c4281e93ea..94d2beca0c1 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -44,7 +44,9 @@ def _pin_first():
+ # "status" covers dashboard drag-drop and `_set_status_direct()`.
+ # ``review_requested`` wakes the origin like a block but is not one;
+ # the task is not archived so later review cycles keep notifying.
+-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
++# ``quota_episode_notice`` (third consecutive quota requeue) is a passive notice: it never wakes the origin,
++# whose own turn would land on the same exhausted provider.
++TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice")
+ # Kinds that hand a decision back to the origin, which must take a turn.
+ # status/archived/unblocked are bookkeeping.
+ _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+@@ -52,7 +54,7 @@ _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "revie
+ 
+ def diagnostic_event(ev) -> bool:
+     """Infrastructure attention is distinct from an explicit owner decision."""
+-    if ev.kind in {"crashed", "timed_out", "gave_up"}:
++    if ev.kind in {"crashed", "timed_out", "gave_up", "quota_episode_notice"}:
+         return True
+     if ev.kind in {"blocked", "block_loop_detected"}:
+         return (ev.payload or {}).get("kind") != "needs_input"
+@@ -465,6 +467,11 @@ def _fmt_failure(kind: str):
+     return fmt
+ 
+ 
++def _fmt_quota_episode(ev, n) -> tuple:
++    from hermes_cli.kanban_quota_episode import notice_text
++    return f"⏳ {n.head}{notice_text(ev.payload)}", None, None
++
++
+ def _fmt_timed_out(ev, n) -> tuple:
+     limit = int(_payload(ev, "limit_seconds") or 0)
+     minutes = max(1, round(limit / 60)) if limit else 0
+@@ -492,6 +499,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "review_requested": _fmt_review_requested,
+     "changes_requested": _fmt_changes_requested,
+     "block_loop_detected": _fmt_block_loop_detected,
++    "quota_episode_notice": _fmt_quota_episode,
+ }
+ 
+ 
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 11bd595d64a..d55ab8278bc 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -322,7 +322,7 @@ def _run_worker_turns(agent, frame, history):
+         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+         raise
+     finally:
+-        _record_worker_result(context, code, last_output, failure)
++        _record_worker_result(context, code, last_output, failure, agent=agent)
+ 
+ 
+ def record_start_failure(frame, exc):
+@@ -376,19 +376,21 @@ def start_failure_line(exc):
+     return failure_line(exc, 'Worker could not start')
+ 
+ 
+-def _record_worker_result(context, code, last_output, failure=None, extra=None):
++def _record_worker_result(context, code, last_output, failure=None, extra=None, *, agent=None):
+     _TURNS_DONE.set()
+     import os
+     from hermes_cli.kanban_db_connect import connect_closing
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_quota_receipt import quota_fields
++    from hermes_cli.kanban_quota_receipt import quota_fields, route_fields
+     with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+         if _bound_worker_matches(conn, context):
+             # Closing a run clears its claim/PID and replaces metadata; keep the
+             # result in the immutable attempt event stream instead.
+             kb._append_event(conn, context['task_id'], 'worker_result',
+                 {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+-                 'last_output': last_output, **quota_fields(failure), **(extra or {})}, run_id=context['run_id'])
++                 'last_output': last_output, **quota_fields(failure), **route_fields(failure, agent),
++                 **(extra or {})},
++                run_id=context['run_id'])
+ 
+ 
+ def record_worker_loss(policy, reason, *, pid=None, bound=False):
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 17de1621244..8bf0c55fd8a 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1393,6 +1393,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+                              (dead.error_text[:500], row["id"]))
+                 sweep.owner_restarted.append(row["id"])
+             elif dead.rate_limited:
++                try:
++                    from hermes_cli.kanban_quota_episode import record_episode
++                    record_episode(conn, row["id"], run_id)
++                except sqlite3.Error:
++                    raise
++                except Exception:  # health: allow BLE001 -- episode bookkeeping never strands the sweep; traceback logged [daveey]
++                    _kb._log.warning("kanban: recording quota episode failed for %s", row["id"], exc_info=True)
+                 sweep.rate_limited.append(row["id"])
+                 try:
+                     from hermes_cli import kanban_provider_walls as _walls
+@@ -1673,9 +1680,13 @@ def check_respawn_guard(
+         return None
+ 
+     now = int(time.time())
+-    from hermes_cli.kanban_quota_receipt import waiting_for_quota_reset
+-    if waiting_for_quota_reset(conn, task_id, now):
+-        return "subscription_quota_reset"
++    from hermes_cli.kanban_quota_episode import decision, episode
++    if episode(conn, task_id):
++        guard = decision(conn, _kb.get_task(conn, task_id), lane=lane, now=now)[0]
++        stamp = _kb._lossy_text(row['last_failure_error'])
++        if guard is None and _kbq.is_quota_error(stamp):
++            _kbq.clear_quota_error(conn, task_id, stamp)
++        return guard
+     # Only the latest run gates admission; quota and infrastructure failures are neutral.
+     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
+     latest_run = conn.execute(
+@@ -1696,22 +1707,6 @@ def check_respawn_guard(
+         if ended_at is not None and (now - ended_at) < cooldown:
+             return "owner_restart_cooldown"
+         return None
+-    if latest_run is not None and latest_run["outcome"] == "rate_limited":
+-        if rl_cooldown <= 0:
+-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
+-            # the stamped rate-limit text doesn't re-trap the task.
+-            return None
+-        ended_at = _kb._to_epoch(latest_run["ended_at"])
+-        if ended_at is not None and (now - ended_at) < rl_cooldown:
+-            return "rate_limit_cooldown"
+-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
+-        # stamped rate-limit text; this path intentionally retries forever
+-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+-        # The stamp is dropped so it cannot outlive this run (see 1b). [daveey]
+-        stamp = _kb._lossy_text(row["last_failure_error"])
+-        if _kbq.is_quota_error(stamp):
+-            _kbq.clear_quota_error(conn, task_id, stamp)
+-        return None
+ 
+     err = _kb._lossy_text(row["last_failure_error"])
+     latest_outcome = latest_run["outcome"] if latest_run is not None else None
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index 2075ccea2d5..0b118d1b6dd 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -115,6 +115,12 @@ def notify_guard_hold(conn: sqlite3.Connection, task_id: str, reason: str) -> bo
+         return False
+     if reason in _kbd._GUARD_HOLD_EXEMPT_REASONS:
+         return False
++    if reason == "rate_limit_cooldown":
++        # A quota episode's backoff (up to 2 h) is self-clearing and posts its own notice after
++        # three requeues; a generic fix card would ask an agent to fix a provider's quota.
++        from hermes_cli.kanban_quota_episode import active
++        if active(conn, task_id):
++            return False
+     started = guard_hold_started_at(conn, task_id)
+     if started is None:
+         return False
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 4663d94d262..db89cdd63d7 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -287,9 +287,30 @@ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Opt
+     return reason
+ 
+ 
++def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
++    """One read-only route decision for preview and actual admission."""
++    from hermes_cli.kanban_quota_episode import decision, episode
++    base = resolve_model_tier(conn, task, lane=lane, cfg=cfg)
++    _, route = decision(conn, task, lane=lane, cfg=cfg, base=base)
++    if route:
++        return *route, f'{base[2]}+quota_reroute'
++    if episode(conn, task.id):
++        return base
++    # Legacy provider-wide walls may only change ordinary default routing.
++    if base[2] == 'default' and not task.provider_override:
++        from hermes_cli.kanban_provider_walls import retier_for_walls
++        from copy import copy
++        probe = copy(task)
++        probe.model_override, probe.provider_override = base[:2]
++        moved = retier_for_walls(probe, load_tier_config() if cfg is None else cfg)
++        if moved:
++            return moved[0], moved[1], f'{base[2]}+wall:{moved[2]}'
++    return base
++
++
+ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
+     try:
+-        model, provider, reason = resolve_model_tier(conn, task, lane=lane, cfg=cfg)
++        model, provider, reason = resolve_dispatch_tier(conn, task, lane=lane, cfg=cfg)
+     except Exception as exc:
+         logger.warning("kanban model tier: resolve failed for %s (%s)", getattr(task, "id", "?"), exc,
+                        exc_info=True)
+@@ -305,22 +326,6 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+         elif unresolved:
+             logger.warning("kanban model tier: %s pin has no provider (%s)", getattr(task, "id", "?"), unresolved)
+             reason = "pinned+provider_unresolved"
+-    if reason not in ("off", "profile_out_of_scope") and not reason.startswith("pinned"):
+-        try:
+-            from hermes_cli import kanban_provider_walls as _walls
+-            cfg_ = load_tier_config() if cfg is None else cfg
+-            if model:
+-                probe = type("T", (), {"model_override": model, "provider_override": provider,
+-                                       "title": task.title, "body": task.body})()
+-            else:
+-                probe = task
+-            moved = _walls.retier_for_walls(probe, cfg_)
+-            if moved:
+-                model, provider, walled = moved
+-                reason = f"{reason}+wall:{walled}"
+-        except Exception as exc:  # never break dispatch over wall bookkeeping
+-            logger.debug("kanban model tier: wall re-tier failed for %s (%s)", getattr(task, "id", "?"), exc,
+-                         exc_info=True)
+     if model:
+         from agent.model_routing import is_class_selector
+         why = class_unroutable_reason(model) if is_class_selector(model) else None
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index 22f47aa8a16..765ed039970 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -3,17 +3,15 @@
+ 2026-10-26: the hub spawned workers on openai-codex that died ~60 s later with ``retry after 524389s``
+ (~6 days), 285 times in 24h. A ``rate_limited`` exit is requeued as neutral, so nothing noticed.
+ 
+-* :func:`record_wall` runs when a worker exits rate-limited. It reads the retry-after from the worker log
+-  and stores ``provider -> until`` in ``<kanban home>/provider_walls.json`` (a wall under
+-  ``MIN_WALL_SECONDS`` is left to the normal respawn cooldown).
+-* :func:`retier_for_walls` runs at claim time, after the tier decision. If the provider the worker would
+-  run on is walled, the card moves to the configured fallback (``kanban.default_model``/``default_provider``)
+-  unless the fallback is walled too; when it is (``default_provider`` is the walled one), the strong tier
+-  (``kanban.strong_model``/``strong_provider``) is tried next. A provider also counts as walled when its OAuth
+-  pool is quota-exhausted for the model right now (:func:`live_quota_wall`), so no worker has to crash first.
+-  This covers keep-pattern, review and retry tiers (which resolve to
+-  ``model: null`` = profile default) as well as explicit pins. A card whose body contains ``require_model``
+-  keeps its pin.
++* :func:`record_wall` stores ``provider -> until`` in ``provider_walls.json``.
++  Reaped attempts use their exact receipt/episode deadline; the log reader is
++  retained only for older callers without an episode.
++* :func:`retier_for_walls` moves ordinary default routing (``tier_reason: default``, no pin) off a walled
++  provider outside a quota episode: ``kanban.default_model`` first, then the strong tier when the default
++  provider is the walled one. A provider also counts as walled when its OAuth pool is quota-exhausted for
++  the model right now (:func:`live_quota_wall`). Explicit pins and strong tiers are never rewritten; a card
++  whose body contains ``require_model`` keeps its route. Attempt-specific admission, the class-route
++  alternate, backoff and notices live in ``kanban_quota_episode``.
+ * :func:`rate_limit_storm` counts ``rate_limited`` runs in the last hour for the alert card.
+ """
+ 
+@@ -100,6 +98,12 @@ def record_wall(provider: str, retry_after: Optional[int], *, now: Optional[floa
+ def record_wall_for_run(conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
+                         log_path: Optional[Path]) -> Optional[float]:
+     """Wall bookkeeping for a rate-limited exit: provider from the run's ``model_tier`` event."""
++    from hermes_cli.kanban_quota_episode import episode
++    state = episode(conn, task_id)
++    if state and state['run_id'] == run_id:
++        # Exact-run receipt/backoff owns the deadline; never extend it with an
++        # unscoped log tail or the legacy provider-wide default.
++        return record_wall(state.get('provider'), max(0, state['until'] - time.time()))
+     provider = ""
+     try:
+         for row in conn.execute(
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+new file mode 100644
+index 00000000000..e8ae70668bf
+--- /dev/null
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -0,0 +1,236 @@
++"""Durable quota episodes and a read-only decision shared by admission and routing.
++
++Runs, not polling ticks, advance backoff. A non-wall ended run is the episode
++boundary; no task failure counters or explicit model pins are changed here.
++
++Provider custody: the attempt's own receipt names the concrete provider that hit the
++wall (a class route is only allocated inside the worker), the admission receipt names
++the one it was sent to; both are held until the deadline. A provider nobody recorded
++is unknown, and an unknown wall can never be proven different from the next route.
++"""
++import logging
++import sqlite3
++import time
++from datetime import datetime
++from zoneinfo import ZoneInfo
++
++logger = logging.getLogger(__name__)
++
++MAX_BACKOFF_SECONDS = 7200
++
++
++def episode(conn, task_id):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_quota_receipt import receipt_deadline, receipt_route, valid_deadline
++    runs = []
++    for row in conn.execute(
++        "SELECT id, outcome, ended_at FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
++        "ORDER BY ended_at DESC, id DESC", (task_id,)):
++        if row['outcome'] != 'rate_limited':
++            break
++        runs.append(row)
++    if not runs:
++        return None
++    latest = runs[0]
++    stored = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='quota_episode' "
++        "ORDER BY id DESC LIMIT 1", (task_id, latest['id'])).fetchone()
++    if stored:
++        return kb._json_dict(stored[0])
++    reset = receipt_deadline(conn, task_id, latest['id'])
++    cooldown = max(0, kb._resolve_rate_limit_cooldown_seconds())
++    delay = min(MAX_BACKOFF_SECONDS, cooldown * 2 ** min(len(runs) - 1, 20))
++    ended = kb._to_epoch(latest['ended_at'])
++    # An unreadable end stamp anchors backoff at now; an unrepresentable sum holds one full cap.
++    backoff = valid_deadline((ended if ended is not None else time.time()) + delay)
++    # A hint extends the wait, never shortens it below the doubling backoff ('retry after 5s' x N).
++    found = [t for t in (reset, backoff) if t is not None]
++    until = max(found) if found else None
++    route = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='run_route' "
++        "ORDER BY id DESC LIMIT 1", (task_id, latest['id'])).fetchone()
++    route = kb._json_dict(route[0]) if route else {}
++    admitted = route.get('provider') if isinstance(route.get('provider'), str) and route.get('provider') else None
++    actual = receipt_route(conn, task_id, latest['id'])
++    actual, admitted = (p.strip().lower() if p else None for p in (actual, admitted))
++    providers = sorted({p for p in (actual, admitted) if p})
++    return {'episode_id': runs[-1]['id'], 'run_id': latest['id'], 'count': len(runs),
++            'until': until if until is not None else time.time() + MAX_BACKOFF_SECONDS,
++            'hinted': reset is not None, 'provider': actual or admitted, 'providers': providers,
++            'model': route.get('model')}
++
++
++def _providers(state):
++    found = state.get('providers')
++    if isinstance(found, list):
++        return [p for p in found if isinstance(p, str) and p]
++    return [state['provider']] if state.get('provider') else []
++
++
++def _outstanding(conn, task_id, state, now):
++    """Every wall of this episode still before its deadline (earlier providers included)."""
++    from hermes_cli import kanban_db as kb
++    out = [state] if state['until'] > now else []
++    for row in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='quota_episode' AND run_id>=?",
++        (task_id, state['episode_id'])):
++        prior = kb._json_dict(row[0])
++        if isinstance(prior.get('until'), (int, float)) and prior['until'] > now:
++            out.append(prior)
++    return out
++
++
++def _base_provider(task, base):
++    """The concrete provider admission would run *task* on with *base*, or None when unknown."""
++    from agent.model_routing import is_class_selector
++    from hermes_cli.kanban_model_tier import profile_route
++    model, provider = base[:2]
++    if not model:
++        model, provider = getattr(task, 'model_override', None), getattr(task, 'provider_override', None)
++    if not model:
++        model, provider = profile_route(getattr(task, 'assignee', None))
++    if not model or is_class_selector(model) or not provider or str(provider).lower() == 'auto':
++        return None
++    return str(provider).strip().lower()
++
++
++def alternate_route(conn, task, walls, base, now):
++    """Non-allocating probe using the worker's billing/capability eligibility."""
++    from agent.model_routing import eligible_routes, validate_policy, ModelRoutingError
++    from agent.model_routing_agent import class_requirements
++    from hermes_cli.config import is_provider_enabled
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from hermes_cli.kanban_provider_walls import active_walls
++    model, _provider, reason = base
++    if (task.model_override or task.provider_override or reason not in {'default', 'off', 'profile_out_of_scope'}
++            or not walls):
++        return None
++    config = _assignee_config(task.assignee) or {}
++    policy = config.get('model_routing') or {}
++    try:
++        validate_policy(policy)
++    except ModelRoutingError:
++        return None
++    if not policy.get('enabled'):
++        return None
++    if not model:
++        block = config.get('model') or {}
++        model = block.get('default') if isinstance(block, dict) else block
++    # A concrete default must belong to a known class; never guess its strength.
++    level = str(model or '').removeprefix('class:')
++    if not str(model or '').startswith('class:'):
++        levels = [key for key, routes in policy.get('routes', {}).items()
++                  if any(r['model'] == model for r in routes)]
++        if len(levels) != 1:
++            return None
++        level = levels[0]
++    walled = {**active_walls(now=now), **walls}
++    providers = config.get('providers') or {}
++    routes = eligible_routes(policy, level, class_requirements(config), eligible=lambda r: (
++        r['provider'] not in walled and is_provider_enabled(providers.get(r['provider'], {}))))
++    return (routes[0]['model'], routes[0]['provider']) if routes else None
++
++
++def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
++    """Return (guard reason, alternate route); never writes or allocates quota."""
++    from hermes_cli.kanban_model_tier import resolve_model_tier
++    state = episode(conn, task.id)
++    now = time.time() if now is None else now
++    if not state:
++        return None, None
++    outstanding = _outstanding(conn, task.id, state, now)
++    if not outstanding:
++        return None, None
++    state = max(outstanding, key=lambda s: s['until'])
++    held = 'subscription_quota_reset' if state['hinted'] else 'rate_limit_cooldown'
++    walls, unknown = {}, False
++    for wall in outstanding:
++        names = _providers(wall)
++        unknown = unknown or not names
++        for name in names:
++            walls[name] = max(walls.get(name, 0), wall['until'])
++    try:
++        base = base or resolve_model_tier(conn, task, lane=lane, cfg=cfg)
++        target = _base_provider(task, base)
++    except sqlite3.Error:
++        raise
++    except Exception:
++        logger.warning('kanban quota: route resolve failed for %s; holding', task.id, exc_info=True)
++        return held, None
++    if target is not None and not unknown and target not in walls:
++        # The route admission will use is a known, different provider (e.g. a re-pinned card).
++        return None, None
++    if lane == 'review' or unknown:
++        # An unrecorded wall may be any provider: no route can be proven to avoid it.
++        return held, None
++    try:
++        route = alternate_route(conn, task, walls, base, now)
++    except sqlite3.Error:
++        raise
++    except Exception:
++        # Config/policy read failures fail closed (hold), never into a guessed route.
++        logger.warning('kanban quota: alternate route probe failed for %s', task.id, exc_info=True)
++        route = None
++    if route:
++        return None, route
++    return held, None
++
++
++def active(conn, task_id, now=None):
++    """True while this task's quota episode still holds a deadline in the future."""
++    state = episode(conn, task_id)
++    if not state:
++        return False
++    now = time.time() if now is None else now
++    return bool(_outstanding(conn, task_id, state, now))
++
++
++def _notice_action(conn, task_id, state):
++    from hermes_cli import kanban_db as kb
++    task = kb.get_task(conn, task_id)
++    route = decision(conn, task, lane=task.status)[1] if task is not None else None
++    if route:
++        return f'reroute to {route[0]} ({route[1]})'
++    until = datetime.fromtimestamp(state['until'], ZoneInfo('America/Los_Angeles')).strftime('%Y-%m-%d %H:%M')
++    return f'wait until {until} PT'
++
++
++NOTICE_KIND = 'quota_episode_notice'
++
++
++def notice_text(payload):
++    """Chat line for a ``quota_episode_notice`` (gateway and TUI notifiers share it)."""
++    payload = payload if isinstance(payload, dict) else {}
++    count = payload.get('count') if type(payload.get('count')) is int else 3
++    action = str(payload.get('action') or 'wait for the quota reset')[:200]
++    return f' quota wall: {count} consecutive requeues; {action}. No failure budget consumed.'
++
++
++def record_episode(conn, task_id, run_id):
++    """Called inside the reaper transaction; event and notice are atomic/idempotent.
++
++    Database errors propagate (the reaper's transaction owns them); a failure while choosing
++    the notice's wording falls back to the bare wait, so it can never leave a card running."""
++    from hermes_cli import kanban_db as kb
++    state = episode(conn, task_id)
++    if not state or state['run_id'] != run_id:
++        return
++    exists = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='quota_episode'",
++                          (task_id, run_id)).fetchone()
++    if not exists:
++        kb._append_event(conn, task_id, 'quota_episode', state, run_id=run_id)
++    if state['count'] < 3:
++        return
++    notices = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (task_id, NOTICE_KIND))
++    if any(kb._json_dict(row[0]).get('episode_id') == state['episode_id'] for row in notices):
++        return
++    try:
++        action = _notice_action(conn, task_id, state)
++    except sqlite3.Error:
++        raise
++    except Exception:
++        logger.warning('kanban quota: notice wording failed for %s', task_id, exc_info=True)
++        action = 'wait for the quota reset'
++    kb._append_event(conn, task_id, NOTICE_KIND, {**state, 'action': action}, run_id=run_id)
++    kb.add_comment(conn, task_id, 'kanban-dispatcher',
++                   f'Quota wall: {state["count"]} consecutive requeues; {action}. No failure budget consumed.')
+diff --git a/hermes_cli/kanban_quota_receipt.py b/hermes_cli/kanban_quota_receipt.py
+index 024c80e376b..a5f3f59f314 100644
+--- a/hermes_cli/kanban_quota_receipt.py
++++ b/hermes_cli/kanban_quota_receipt.py
+@@ -15,29 +15,130 @@ def quota_fields(failure):
+             break
+         if isinstance(failure, AuthError) and is_rate_limited_auth_error(failure):
+             retry = failure.retry_after
+-            if type(retry) in (float, int) and math.isfinite(retry) and retry > 0:
++            if _finite(retry) and retry > 0:
+                 failure = {'failure_reason': 'rate_limit', 'failure_resets_at': time.time() + retry}
+                 break
+         failure = failure.__cause__ or failure.__context__
+     if not isinstance(failure, dict) or failure.get('failure_reason') not in {'rate_limit', 'upstream_rate_limit', 'billing'}:
+         return {}
+     reset = failure.get('failure_resets_at')
+-    if type(reset) not in (float, int) or not math.isfinite(reset):
++    if not _finite(reset):
+         return {}
+     return {'failure_reason': 'rate_limit', 'failure_retryable': True, 'failure_resets_at': reset}
+ 
+ 
+-def waiting_for_quota_reset(conn, task_id, now):
+-    """Only the latest ended attempt's receipt can defer its next admission."""
++_UNIT_SECONDS = {'d': 86400, 'day': 86400, 'days': 86400, 'h': 3600, 'hr': 3600, 'hrs': 3600, 'hour': 3600,
++                 'hours': 3600, 'm': 60, 'min': 60, 'mins': 60, 'minute': 60, 'minutes': 60, 's': 1, 'sec': 1,
++                 'secs': 1, 'second': 1, 'seconds': 1}
++_TERM = r'(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])'
++
++
++def _finite(value):
++    """A real int/float that is finite; a huge int (``isfinite`` overflows) is not."""
++    if type(value) not in (float, int):
++        return False
++    try:
++        return math.isfinite(value)
++    except OverflowError:
++        return False
++
++
++def valid_deadline(value):
++    """A finite epoch a datetime can represent, else None: malformed hints are rejected, never clamped."""
++    from datetime import UTC, datetime
++    if not _finite(value):
++        return None
++    try:
++        datetime.fromtimestamp(value, UTC)
++    except (OverflowError, OSError, ValueError):
++        return None
++    return float(value)
++
++
++def _relative_seconds(text):
++    """Longest ``resets in`` duration, summing compound terms (``2h 30m``), so no part is dropped early."""
++    import re
++    found = []
++    for match in re.finditer(r'resets?\s+in\s+~?\s*((?:' + _TERM + r'[\s,]*)+)', text, re.IGNORECASE):
++        found.append(sum(float(n) * _UNIT_SECONDS[u.lower()]
++                         for n, u in re.findall(_TERM, match[1], re.IGNORECASE)))
++    return max(found) if found else None
++
++
++def _owned_receipt(conn, task_id, run_id):
++    """The exact attempt's quota-exit receipt under its own claim, or None."""
+     from hermes_cli import kanban_db as kb
+     row = conn.execute(
+-        "SELECT e.payload FROM task_runs r JOIN task_events e ON e.run_id=r.id "
+-        "AND e.task_id=r.task_id AND e.kind='worker_result' "
+-        "WHERE r.id=(SELECT id FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+-        "ORDER BY ended_at DESC,id DESC LIMIT 1) AND r.outcome='rate_limited' "
+-        "ORDER BY e.id DESC LIMIT 1", (task_id,)).fetchone()
++        "SELECT e.payload, e.created_at, r.claim_lock FROM task_events e JOIN task_runs r "
++        "ON r.id=e.run_id AND r.task_id=e.task_id WHERE e.task_id=? AND e.run_id=? "
++        "AND e.kind='worker_result' ORDER BY e.id DESC LIMIT 1", (task_id, run_id)).fetchone()
+     if row is None:
+-        return False
+-    receipt = kb._json_dict(row[0])
+-    fields = quota_fields(receipt)
+-    return receipt.get('exit_code') == kb.KANBAN_RATE_LIMIT_EXIT_CODE and fields.get('failure_resets_at', 0) > now
++        return None
++    receipt = kb._json_dict(row['payload'])
++    if (receipt.get('exit_code') != kb.KANBAN_RATE_LIMIT_EXIT_CODE
++            or (row['claim_lock'] and receipt.get('claim_lock') != row['claim_lock'])):
++        return None
++    return receipt, kb._to_epoch(row['created_at'])
++
++
++def receipt_deadline(conn, task_id, run_id):
++    """Typed first, then legacy text, anchored to the exact receipt's timestamp."""
++    from datetime import datetime
++    import re
++    owned = _owned_receipt(conn, task_id, run_id)
++    if owned is None:
++        return None
++    receipt, created = owned
++    reset = valid_deadline(quota_fields(receipt).get('failure_resets_at'))
++    if reset is not None:
++        return reset
++    text = str(receipt.get('last_output') or '')
++    if created is None:
++        return None
++    relative = _relative_seconds(text)
++    if relative is not None:
++        return valid_deadline(created + relative)
++    absolute = re.search(r'resets?\s+(?:at|on)\s+(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:\d\d))', text, re.IGNORECASE)
++    if absolute:
++        try:
++            return valid_deadline(datetime.fromisoformat(absolute[1]).timestamp())
++        except (ValueError, OverflowError):
++            return None
++    # Pool refusals carry ``resets at <epoch>`` (SubscriptionQuotaUnavailable's text).
++    epoch = re.search(r'resets?\s+at\s+(\d{9,11}(?:\.\d+)?)(?![\d:])', text, re.IGNORECASE)
++    if epoch:
++        return valid_deadline(float(epoch[1]))
++    from hermes_cli.kanban_provider_walls import parse_retry_after
++    retry = parse_retry_after(text)
++    if retry is not None:
++        return valid_deadline(created + retry)
++    return None
++
++
++def _route_name(value):
++    return value if isinstance(value, str) and value and value.strip() == value and value != 'auto' else None
++
++
++def route_fields(failure, agent=None):
++    """The concrete provider/model that actually ran (or was refused), for the attempt receipt.
++
++    A class selector's admission receipt cannot know it (the worker allocates); the exhausted
++    pool's typed refusal or the live agent's runtime can. Unknown stays absent, never guessed."""
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    seen = set()
++    while isinstance(failure, BaseException) and id(failure) not in seen:
++        seen.add(id(failure))
++        if isinstance(failure, SubscriptionQuotaUnavailable):
++            provider, model = _route_name(failure.provider), _route_name(failure.model)
++            return {'route_provider': provider, 'route_model': model} if provider else {}
++        failure = failure.__cause__ or failure.__context__
++    provider = _route_name(getattr(agent, 'provider', None))
++    if not provider:
++        return {}
++    return {'route_provider': provider, 'route_model': _route_name(getattr(agent, 'model', None))}
++
++
++def receipt_route(conn, task_id, run_id):
++    """``route_provider`` recorded by the exact attempt's own quota receipt, or None."""
++    owned = _owned_receipt(conn, task_id, run_id)
++    return _route_name(owned[0].get('route_provider')) if owned else None
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index e6d2d3bea49..ee63854cf2b 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -223,19 +223,13 @@ def task_route(conn, task_id) -> tuple[Optional[str], Optional[str], str]:
+     try:
+         from hermes_cli.kanban_model_assignment import _assignee_config
+         from hermes_cli.kanban_pin_provider import resolve_legacy_pin
+-        from hermes_cli.kanban_provider_walls import retier_for_walls
+         cfg = tier.load_tier_config()
+-        model, provider, reason = tier.resolve_model_tier(conn, task, lane=lane, cfg=cfg)
++        model, provider, reason = tier.resolve_dispatch_tier(conn, task, lane=lane, cfg=cfg)
+         chosen = bool(model)
+         if reason == "pinned" and not task.provider_override:
+             task.provider_override = resolve_legacy_pin(task)[0]
+         if model:
+             task.model_override, task.provider_override = model, provider
+-        if reason not in {"off", "profile_out_of_scope"} and not reason.startswith("pinned"):
+-            moved = retier_for_walls(task, cfg)
+-            if moved:
+-                task.model_override, task.provider_override = moved[:2]
+-                chosen = True
+         model, provider = task.model_override, task.provider_override
+         if model and model.startswith("class:"):
+             if chosen and tier.class_unroutable_reason(model):
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index ab201d330a0..d36c9957450 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -37,7 +37,7 @@ def test_expired_wall_ignored(board):
+     assert walls.active_walls(path=p) == {}
+ 
+ 
+-def test_keep_pattern_card_retiered_off_walled_profile_provider(board, monkeypatch):
++def test_keep_pattern_card_preserves_strong_route_under_wall(board, monkeypatch):
+     _write_cfg(board, default_model=SONNET, default_provider="anthropic", default_model_keep_patterns=["security"])
+     monkeypatch.setattr(walls, "profile_provider", lambda: CODEX)
+     monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
+@@ -45,8 +45,8 @@ def test_keep_pattern_card_retiered_off_walled_profile_provider(board, monkeypat
+     conn = kbc.connect()
+     tid = kb.create_task(conn, title="security audit", assignee="default")
+     seen = _dispatch(conn)
+-    assert seen[tid][:2] == (SONNET, "anthropic")
+-    assert "wall:openai-codex" in _tier_events(conn, tid)[-1]["reason"]
++    assert seen[tid][:2] == (None, None)
++    assert _tier_events(conn, tid)[-1]['reason'] == 'pattern:security'
+ 
+ 
+ def test_pinned_card_on_walled_provider_keeps_exact_pin(board, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_quota_episode.py b/tests/hermes_cli/test_kanban_quota_episode.py
+new file mode 100644
+index 00000000000..8cd0f8358c9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_episode.py
+@@ -0,0 +1,582 @@
++"""Quota exit hints must survive reaping and gate admission beyond the fixed cooldown."""
++from pathlib import Path
++from datetime import UTC, datetime
++
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli.kanban_quota_episode import episode, record_episode
++from hermes_cli.kanban_shared_blockers import task_route
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_DELEGATED_CHILD_CONTEXT"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
++    kb.init_db()
++    return home
++
++
++def test_text_reset_hint_survives_reaper_and_blocks_after_cooldown(board, monkeypatch):
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="quota reset", assignee="a")
++        claimed = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        assert claimed is not None
++        pid = 71001
++        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
++        kb._append_event(conn, tid, "run_route", {
++            "model": "claude-opus-5-5", "provider": "anthropic",
++            "source": "pin", "tier_reason": "pinned", "lane": "ready",
++        }, run_id=claimed.current_run_id)
++        # Exact-run receipt is authoritative output; no synthetic outcome row.
++        kb._append_event(conn, tid, "worker_result", {
++            "pid": pid, "claim_lock": claimed.claim_lock, "exit_code": 75,
++            "last_output": "Anthropic rate-limited every one of 3 attempts — its usage limit resets in ~11h",
++        }, run_id=claimed.current_run_id)
++        conn.commit()
++        dispatch._record_worker_exit(pid, 75 << 8)
++        dispatch.detect_crashed_workers(conn)
++        run = conn.execute("SELECT outcome FROM task_runs WHERE id=?", (claimed.current_run_id,)).fetchone()
++        assert run["outcome"] == "rate_limited"
++        assert kb.get_task(conn, tid).consecutive_failures == 0
++        monkeypatch.setattr(kb.time, "time", lambda: now + 301)
++        assert dispatch.check_respawn_guard(conn, tid) is not None
++        monkeypatch.setattr(kb.time, "time", lambda: now + 11 * 3600 - 1)
++        assert dispatch.check_respawn_guard(conn, tid) is not None
++        monkeypatch.setattr(kb.time, "time", lambda: now + 11 * 3600 + 600)
++        assert dispatch.check_respawn_guard(conn, tid) is None
++
++
++def reap(conn, tid, *, text='', fields=None, provider='anthropic', lane='ready', before_reap=None, admit=None):
++    claim = kb.claim_review_task if lane == 'review' else kb.claim_task
++    task = claim(conn, tid, claimer=kb._claimer_id())
++    assert task is not None
++    pid = 71001
++    conn.execute('UPDATE tasks SET worker_pid=? WHERE id=?', (pid, tid))
++    if admit is not None:
++        # The dispatcher's real admission writes the run_route receipt (class routes: provider unknown).
++        tier.apply_model_tier(conn, task, lane=lane, cfg=admit)
++    else:
++        kb._append_event(conn, tid, 'run_route', {'model': 'claude-sonnet-5-5', 'provider': provider,
++                         'source': 'profile_default', 'tier_reason': 'default', 'lane': lane},
++                         run_id=task.current_run_id)
++    kb._append_event(conn, tid, 'worker_result', {'pid': pid, 'claim_lock': task.claim_lock,
++                     'exit_code': 75, 'last_output': text, **(fields or {})}, run_id=task.current_run_id)
++    conn.commit()
++    dispatch._record_worker_exit(pid, 75 << 8)
++    if before_reap:
++        before_reap()
++    dispatch.detect_crashed_workers(conn)
++    assert kb.get_task(conn, tid).status == lane
++    assert kb.get_task(conn, tid).consecutive_failures == 0
++    return task.current_run_id
++
++
++@pytest.mark.parametrize('hint', ['relative', 'timestamp', 'epoch', 'typed', 'retry_after'])
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_deadline_fixed_to_receipt_and_typed_precedence(board, monkeypatch, hint, lane):
++    clock = [1_800_000_000]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    now = clock[0]
++    reset = now + 7200
++    text = ('resets at ' + datetime.fromtimestamp(reset, UTC).isoformat()
++            if hint == 'timestamp' else 'usage limit resets in ~2h')
++    if hint == 'retry_after':
++        text = 'quota exhausted; retry after 7200s'
++    if hint == 'epoch':
++        # The live 11-01 hub receipt shape when the typed field is absent.
++        text = f'SubscriptionQuotaUnavailable: Subscription quota unavailable for openai-codex/gpt-6-astra; resets at {reset}.0'
++    fields = {'failure_reason': 'rate_limit', 'failure_resets_at': now + 3600} if hint == 'typed' else {}
++    expected = now + 3600 if hint == 'typed' else reset
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='deadline', assignee='a')
++        if lane == 'review':
++            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++            conn.commit()
++        run_id = reap(conn, tid, text=text, fields=fields, lane=lane,
++                      before_reap=lambda: clock.__setitem__(0, now + 100))
++        assert episode(conn, tid)['until'] == expected
++        for tick in [now + 301, expected - 1]:
++            clock[0] = tick
++            assert dispatch.check_respawn_guard(conn, tid, lane=lane) == 'subscription_quota_reset'
++        # A later unrelated receipt cannot change custody or re-anchor the persisted deadline.
++        kb._append_event(conn, tid, 'worker_result', {'exit_code': 75, 'last_output': 'resets in ~99h'}, run_id=run_id + 100)
++        clock[0] = expected
++        assert dispatch.check_respawn_guard(conn, tid, lane=lane) is None
++        assert episode(conn, tid)['until'] == expected
++
++
++@pytest.mark.parametrize('outcome', ['completed', 'crashed'])
++def test_backoff_cap_notice_once_and_nonwall_resets(board, monkeypatch, outcome):
++    clock = [1_800_000_000]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='backoff', assignee='a')
++        for count, delay in enumerate([300, 600, 1200, 2400, 4800, 7200, 7200], 1):
++            start = clock[0]
++            run_id = reap(conn, tid)
++            state = episode(conn, tid)
++            assert state['count'] == count and state['until'] == start + delay
++            clock[0] += delay - 1
++            assert dispatch.check_respawn_guard(conn, tid) == 'rate_limit_cooldown'
++            clock[0] += 1
++            assert dispatch.check_respawn_guard(conn, tid) is None
++            with kb.write_txn(conn):
++                record_episode(conn, tid, run_id)
++        notices = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='quota_episode_notice'", (tid,)).fetchall()
++        assert len(notices) == 1
++        assert 'PT' in kb._json_dict(notices[0][0])['action']
++        comments = conn.execute("SELECT body FROM task_comments WHERE task_id=? AND author='kanban-dispatcher'", (tid,)).fetchall()
++        assert sum('Quota wall:' in row[0] for row in comments) == 1
++        # An intervening normal attempt terminates the episode even if it wasn't successful.
++        kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        with kb.write_txn(conn):
++            kb._end_run(conn, tid, outcome=outcome, status=outcome)
++            conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL WHERE id=?", (tid,))
++        assert episode(conn, tid) is None
++        for count in range(3):
++            reap(conn, tid)
++            assert episode(conn, tid)['count'] == count + 1
++            clock[0] = episode(conn, tid)['until']
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='quota_episode_notice'", (tid,)).fetchone()[0] == 2
++
++
++def routing(monkeypatch, *, blocked=False, profile=False):
++    def route(provider, model, **kw):
++        # Real allocations require tools+streaming (agent.model_routing_agent.class_requirements).
++        return dict(provider=provider, model=model, billing='subscription', weight=1,
++                    capabilities={'tools': True, 'streaming': True}, eligible=True, funding_verified=True, **kw)
++    config = {'model': {'default': 'class:standard', 'provider': 'auto'},
++              'model_routing': {'enabled': True, 'routes': {'standard': [
++                  route('anthropic', 'claude-sonnet-5-5'),
++                  route('openai-codex', 'gpt-test')]}},
++              'providers': {'openai-codex': {'enabled': not blocked}}}
++    cfg = {} if profile else {'default_model': 'class:standard', 'strong_model': 'claude-opus-5-5',
++                              'strong_provider': 'anthropic', 'default_model_keep_patterns': ['security']}
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: cfg)
++    monkeypatch.setattr('hermes_cli.kanban_model_assignment._assignee_config', lambda _: config)
++    return config, cfg
++
++
++@pytest.mark.parametrize('entry', ['default', 'profile', 'pinned', 'provider_pin', 'review', 'pattern', 'retry', 'disabled', 'ineligible'])
++def test_shared_admission_preview_and_owner_route(board, monkeypatch, entry):
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    config, cfg = routing(monkeypatch, blocked=entry == 'disabled', profile=entry == 'profile')
++    if entry == 'ineligible':
++        config['model_routing']['routes']['standard'][1]['funding_verified'] = False
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='security work' if entry == 'pattern' else 'quota', assignee='a')
++        if entry == 'pinned':
++            conn.execute("UPDATE tasks SET model_override='claude-opus-5-5', provider_override='anthropic' WHERE id=?", (tid,))
++        elif entry == 'provider_pin':
++            conn.execute("UPDATE tasks SET provider_override='anthropic' WHERE id=?", (tid,))
++        elif entry == 'retry':
++            conn.execute("INSERT INTO task_runs(task_id,started_at,ended_at,status,outcome) VALUES (?,?,?,'crashed','crashed')", (tid, now - 20, now - 10))
++        lane = 'review' if entry == 'review' else 'ready'
++        if lane == 'review':
++            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++        conn.commit()
++        reap(conn, tid, text='resets in ~11h', lane=lane)
++        expected_reroute = entry in {'default', 'profile'}
++        assert (dispatch.check_respawn_guard(conn, tid, lane=lane) is None) == expected_reroute
++        before = conn.total_changes
++        preview = task_route(conn, tid)
++        assert conn.total_changes == before
++        task = kb.get_task(conn, tid)
++        original = (task.model_override, task.provider_override)
++        if expected_reroute:
++            claim = kb.claim_review_task if lane == 'review' else kb.claim_task
++            task = claim(conn, tid, claimer=kb._claimer_id())
++        tier.apply_model_tier(conn, task, lane=lane, cfg=cfg)
++        assert tier.effective_route(task)[:2] == preview[:2]
++        if expected_reroute:
++            assert preview[:2] == ('gpt-test', 'openai-codex')
++            assert tier.owner_model_pin(conn, task) == ('gpt-test', 'openai-codex')
++        elif entry in {'pinned', 'review', 'pattern', 'retry'}:
++            assert preview[:2] == ('claude-opus-5-5', 'anthropic')
++        persisted = kb.get_task(conn, tid)
++        assert (persisted.model_override, persisted.provider_override) == original
++
++
++@pytest.mark.parametrize('pinned', [False, True])
++def test_walled_concrete_default_model_reroutes_to_class_peer(board, monkeypatch, all_assignees_spawnable, pinned):
++    """Hub 11-01: kanban.default_model is the walled codex model itself; the next route comes from its class."""
++    clock = [1_800_000_000]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    config, _ = routing(monkeypatch)
++    config['model_routing']['routes'] = {'deep': [
++        dict(config['model_routing']['routes']['standard'][0], model='claude-opus-5-5'),
++        dict(config['model_routing']['routes']['standard'][1], model='gpt-6-astra')]}
++    cfg = {'default_model': 'gpt-6-astra', 'default_provider': 'openai-codex',
++           'strong_model': 'claude-opus-5-5', 'strong_provider': 'anthropic'}
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: cfg)
++    reset = clock[0] + 55 * 3600
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='hub default card', assignee='a')
++        if pinned:
++            conn.execute("UPDATE tasks SET model_override='gpt-6-astra', provider_override='openai-codex' WHERE id=?", (tid,))
++            conn.commit()
++        reap(conn, tid, admit=cfg, text=f'SubscriptionQuotaUnavailable: Subscription quota unavailable for '
++             f'openai-codex/gpt-6-astra; resets at {reset}.0',
++             fields={'failure_reason': 'rate_limit', 'failure_retryable': True, 'failure_resets_at': float(reset),
++                     'route_provider': 'openai-codex', 'route_model': 'gpt-6-astra'})
++        clock[0] += 301
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++        if pinned:
++            # Explicit pins keep their model and wait for the reset.
++            assert seen == []
++            assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        else:
++            assert seen == [('claude-opus-5-5', 'anthropic')]
++            route = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
++                                 "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
++            assert '"provider": "anthropic"' in route and 'quota_reroute' in route
++
++
++@pytest.mark.parametrize('reroute', [False, True])
++def test_real_dispatch_waits_or_uses_preview_route(board, monkeypatch, all_assignees_spawnable, reroute):
++    clock = [1_800_000_000]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    routing(monkeypatch, blocked=not reroute)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='dispatch quota', assignee='a')
++        reap(conn, tid, text='resets in ~11h')
++        clock[0] += 301
++        seen = []
++        def spawn(task, workspace):
++            seen.append((task.model_override, task.provider_override))
++        dispatch.dispatch_once(conn, spawn_fn=spawn)
++        if reroute:
++            assert seen == [('gpt-test', 'openai-codex')]
++        else:
++            assert seen == []
++            assert kb.get_task(conn, tid).status == 'ready'
++            clock[0] += 11 * 3600 + 600
++            dispatch.dispatch_once(conn, spawn_fn=spawn)
++            assert len(seen) == 1
++
++
++def test_reroute_notice_once_and_no_return_to_previous_walled_provider(board, monkeypatch):
++    clock = [1_800_000_000]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    routing(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='reroute notice', assignee='a')
++        for _ in range(3):
++            run_id = reap(conn, tid, text='resets in ~11h')
++        notices = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='quota_episode_notice'", (tid,)).fetchall()
++        assert len(notices) == 1
++        assert 'reroute to gpt-test (openai-codex)' == kb._json_dict(notices[0][0])['action']
++        with kb.write_txn(conn):
++            record_episode(conn, tid, run_id)
++        assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=? AND body LIKE 'Quota wall:%'", (tid,)).fetchone()[0] == 1
++        # The alternative hits a shorter wall. Its reset must not expose the original provider.
++        reap(conn, tid, provider='openai-codex')
++        clock[0] = episode(conn, tid)['until']
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        assert task_route(conn, tid)[:2] == ('gpt-test', 'openai-codex')
++
++
++@pytest.mark.parametrize('wrong', ['run', 'task', 'claim', 'exit'])
++def test_unowned_receipt_cannot_supply_reset(board, monkeypatch, wrong):
++    from hermes_cli.kanban_quota_receipt import receipt_deadline
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='custody', assignee='a')
++        task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        kb._append_event(conn, 'other' if wrong == 'task' else tid, 'worker_result', {
++            'exit_code': 1 if wrong == 'exit' else 75,
++            'claim_lock': 'other' if wrong == 'claim' else task.claim_lock,
++            'last_output': 'resets in ~11h'}, run_id=task.current_run_id + (1 if wrong == 'run' else 0))
++        assert receipt_deadline(conn, tid, task.current_run_id) is None
++
++
++
++# --- Provider custody for class routes: the runtime, not the admission receipt, names the wall ---
++
++def _route_receipt(provider, model='claude-sonnet-5-5'):
++    from types import SimpleNamespace
++    from hermes_cli.kanban_quota_receipt import route_fields
++    return route_fields(None, SimpleNamespace(provider=provider, model=model))
++
++
++@pytest.mark.parametrize('custody', ['runtime', 'typed_refusal', 'none'])
++def test_class_admission_reroutes_only_on_recorded_runtime_provider(board, monkeypatch, custody):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from hermes_cli.kanban_quota_receipt import route_fields
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    _, cfg = routing(monkeypatch, profile=True)
++    fields = {'runtime': _route_receipt('anthropic'),
++              'typed_refusal': route_fields(SubscriptionQuotaUnavailable('anthropic', 'claude-sonnet-5-5', now + 3600)),
++              'none': {}}[custody]
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='class wall', assignee='a')
++        run_id = reap(conn, tid, text='resets in ~11h', fields=fields, admit=cfg)
++        admitted = kb._json_dict(conn.execute(
++            "SELECT payload FROM task_events WHERE run_id=? AND kind='run_route'", (run_id,)).fetchone()[0])
++        assert admitted['provider'] is None  # real admission of a class route cannot know it
++        guard = dispatch.check_respawn_guard(conn, tid)
++        if custody == 'none':
++            # Unknown wall: never guess that some other provider is safe.
++            assert guard == 'subscription_quota_reset'
++            assert task_route(conn, tid)[:2] != ('gpt-test', 'openai-codex')
++        else:
++            assert episode(conn, tid)['providers'] == ['anthropic']
++            assert guard is None
++            assert task_route(conn, tid)[:2] == ('gpt-test', 'openai-codex')
++
++
++def test_route_fields_prefer_typed_refusal_and_never_record_auto():
++    from types import SimpleNamespace
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from hermes_cli.kanban_quota_receipt import route_fields
++    refusal = RuntimeError('agent init failed')
++    refusal.__cause__ = SubscriptionQuotaUnavailable('openai-codex', 'gpt-test', 1.0)
++    assert route_fields(refusal, SimpleNamespace(provider='anthropic', model='m')) == {
++        'route_provider': 'openai-codex', 'route_model': 'gpt-test'}
++    assert route_fields(None, SimpleNamespace(provider='auto', model='class:standard')) == {}
++    assert route_fields(None, None) == {}
++
++
++@pytest.mark.parametrize('caps', [{'tools': False, 'streaming': True}, {'tools': True, 'streaming': True, 'context_tokens': 1000}])
++def test_reroute_applies_worker_capability_requirements(board, monkeypatch, caps):
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    config, _cfg = routing(monkeypatch, profile=True)
++    config['model_routing']['routes']['standard'][1]['capabilities'] = caps
++    config['model']['context_length'] = 200_000
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='capability', assignee='a')
++        reap(conn, tid, text='resets in ~11h')
++        # The only other route cannot serve the worker's tools/context floor: hold, don't pin it.
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++
++
++@pytest.mark.parametrize('repin, held', [(('gpt-test', 'openai-codex'), False), (('claude-opus-5-5', 'anthropic'), True)])
++def test_changed_explicit_pin_is_judged_by_its_own_provider(board, monkeypatch, repin, held):
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    _, cfg = routing(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='pinned', assignee='a')
++        conn.execute("UPDATE tasks SET model_override='claude-sonnet-5-5', provider_override='anthropic' WHERE id=?", (tid,))
++        conn.commit()
++        reap(conn, tid, text='resets in ~11h')
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        conn.execute('UPDATE tasks SET model_override=?, provider_override=? WHERE id=?', (*repin, tid))
++        conn.commit()
++        assert (dispatch.check_respawn_guard(conn, tid) is not None) == held
++        task = kb.claim_task(conn, tid, claimer=kb._claimer_id()) if not held else kb.get_task(conn, tid)
++        tier.apply_model_tier(conn, task, lane='ready', cfg=cfg)
++        # The pin is never rewritten either way.
++        assert tier.effective_route(task)[:2] == repin
++
++
++# --- Runtime-emitted reset phrasings: compound and minute windows are not cut short ---
++
++@pytest.mark.parametrize('text, seconds', [
++    ('usage limit resets in 2h 30m', 9000), ('usage limit resets in 2h30m', 9000),
++    ('its usage limit resets in ~45 min. Send /retry', 2700),
++    ('resets in ~2h; elsewhere resets in ~11h', 11 * 3600)])
++def test_legacy_relative_text_uses_full_window(board, monkeypatch, text, seconds):
++    from hermes_cli.kanban_quota_receipt import receipt_deadline
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='text', assignee='a')
++        run_id = reap(conn, tid, text=text)
++        assert receipt_deadline(conn, tid, run_id) == now + seconds
++
++
++# --- Faults: malformed deadlines and optional notice/routing failures never strand the reaper ---
++
++@pytest.mark.parametrize('fields, text', [
++    ({'failure_reason': 'rate_limit', 'failure_resets_at': 1e300}, ''),
++    ({}, 'usage limit resets in 99999999999999999999h'),
++    ({}, 'quota exhausted; retry after 99999999999999999999s')])
++def test_unrepresentable_deadline_is_rejected_and_reaper_finishes(board, monkeypatch, fields, text):
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='huge', assignee='a')
++        for count in range(3):  # third reap renders the PT notice from the deadline
++            reap(conn, tid, text=text, fields=fields)
++        state = episode(conn, tid)
++        assert state['hinted'] is False and state['until'] == now + 1200
++        assert kb.get_task(conn, tid).status == 'ready'
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='quota_episode_notice'", (tid,)).fetchone()[0] == 1
++
++
++def test_overflowing_retry_after_never_strands_the_sweep(board, monkeypatch):
++    """A 400-digit 'retry after' overflows float(); the bystander dead worker must still be reaped."""
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    with kbc.connect() as conn:
++        bad = kb.create_task(conn, title='huge int', assignee='a')
++        reap(conn, bad, text='quota exhausted; retry after ' + '9' * 400 + 's')
++        state = episode(conn, bad)
++        assert state['hinted'] is False and state['until'] == now + 300
++        # Episode bookkeeping failing for one card leaves the others' reclaim intact.
++        import hermes_cli.kanban_quota_episode as qe
++        monkeypatch.setattr(qe, 'record_episode', lambda *a: (_ for _ in ()).throw(RuntimeError('boom')))
++        other = kb.create_task(conn, title='bystander', assignee='a')
++        reap(conn, other, text='resets in ~11h')
++        assert kb.get_task(conn, other).status == 'ready'
++
++
++def test_short_hints_never_undercut_doubling_backoff(board, monkeypatch):
++    clock = [1_800_000_000]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='short hint', assignee='a')
++        for delay in [300, 600, 1200, 2400]:
++            start = clock[0]
++            reap(conn, tid, text='429 rate limited; retry after 5s')
++            assert episode(conn, tid)['until'] == start + delay
++            clock[0] += 10
++            assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++            clock[0] = start + delay
++
++
++def test_notice_routing_failure_falls_back_and_reaper_finishes(board, monkeypatch):
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    routing(monkeypatch)
++    def broken(_assignee):
++        raise RuntimeError('profile config unreadable')
++    monkeypatch.setattr('hermes_cli.kanban_model_assignment._assignee_config', broken)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='broken config', assignee='a')
++        for _ in range(3):
++            reap(conn, tid, text='resets in ~11h')
++        notice = kb._json_dict(conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='quota_episode_notice'", (tid,)).fetchone()[0])
++        assert notice['action'].startswith('wait until') and notice['action'].endswith('PT')
++        # Admission fails closed on the same config error: held, no exception out of the guard.
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++
++
++def test_database_integrity_error_in_episode_record_propagates(board, monkeypatch):
++    import sqlite3
++    from hermes_cli.kanban_quota_episode import record_episode
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='integrity', assignee='a')
++        run_id = reap(conn, tid, text='resets in ~11h')
++        conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='quota_episode'", (tid,))
++        conn.commit()
++        real = kb._append_event
++        def failing(c, task_id, kind, *a, **k):
++            if kind == 'quota_episode':
++                raise sqlite3.IntegrityError('constraint failed')
++            return real(c, task_id, kind, *a, **k)
++        monkeypatch.setattr(kb, '_append_event', failing)
++        with pytest.raises(sqlite3.IntegrityError):
++            with kb.write_txn(conn):
++                record_episode(conn, tid, run_id)
++
++
++# --- Long backoff holds are quota episodes, not generic guard-hold fix cards ---
++
++def test_long_cooldown_hold_files_no_generic_fix_card(board, monkeypatch, all_assignees_spawnable):
++    clock = [1_800_000_000]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    monkeypatch.setattr(dispatch.time, 'time', lambda: clock[0])
++    from hermes_cli import kanban_db_dispatch_guard_notice as notice
++    monkeypatch.setattr(notice.time, 'time', lambda: clock[0])
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='long backoff', assignee='a')
++        for _ in range(5):  # 300,600,1200,2400 -> 4800 s backoff on the fifth
++            reap(conn, tid)
++            clock[0] = episode(conn, tid)['until']
++        reap(conn, tid)
++        assert episode(conn, tid)['until'] - clock[0] == 7200
++        spawn = lambda task, ws: None
++        for _ in range(3):
++            dispatch.dispatch_once(conn, spawn_fn=spawn)
++            clock[0] += 40 * 60
++        assert episode(conn, tid)['until'] > clock[0] - 40 * 60
++        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE title LIKE 'Fix respawn-guard hold%'").fetchone()[0] == 0
++        assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=? AND body LIKE '[respawn-guard]%'", (tid,)).fetchone()[0] == 0
++        assert kb.get_task(conn, tid).status == 'ready'
++
++
++# --- The third-requeue notice reaches subscribed chats through the existing notifiers ---
++
++def _third_requeue_notice(conn, tid):
++    for _ in range(3):
++        reap(conn, tid, text='resets in ~11h')
++
++
++def test_quota_notice_delivered_once_by_gateway_notifier(board, monkeypatch):
++    import asyncio
++    from gateway.config import Platform
++    from gateway.run import GatewayRunner
++    from hermes_cli import kanban_db_notify as kbn
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='notify quota', assignee='a')
++        kbn.add_notify_sub(conn, task_id=tid, platform='telegram', chat_id='chat-1')
++        _third_requeue_notice(conn, tid)
++
++    class Adapter:
++        sent = []
++        async def send(self, chat_id, text, metadata=None):
++            self.sent.append(text)
++
++    adapter = Adapter()
++    runner = GatewayRunner.__new__(GatewayRunner)
++    runner._running = True
++    runner.adapters = {Platform.TELEGRAM: adapter}
++    runner._kanban_sub_fail_counts = {}
++    runner._kanban_dispatcher_lock_handle = object()
++    real_sleep = asyncio.sleep
++    async def tick(runner):
++        async def fake_sleep(delay):
++            if delay == 5:
++                return
++            runner._running = False
++            await real_sleep(0)
++        monkeypatch.setattr(asyncio, 'sleep', fake_sleep)
++        await runner._kanban_notifier_watcher(interval=1)
++    asyncio.run(tick(runner))
++    quota = [t for t in adapter.sent if 'quota wall' in t]
++    assert len(quota) == 1 and tid in quota[0] and 'PT' in quota[0]
++    runner._running = True
++    asyncio.run(tick(runner))
++    assert len([t for t in adapter.sent if 'quota wall' in t]) == 1
++
++
++def test_quota_notice_delivered_once_to_desktop_chat(board, monkeypatch):
++    from hermes_cli import kanban_db_notify as kbn
++    from gateway.warning_notifications import DiagnosticText
++    from tui_gateway.server import _collect_kanban_notifications
++    now = 1_800_000_000
++    monkeypatch.setattr(kb.time, 'time', lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='notify desktop', assignee='a')
++        kbn.add_notify_sub(conn, task_id=tid, platform='tui', chat_id='desk-1')
++        _third_requeue_notice(conn, tid)
++    texts = [t for t in _collect_kanban_notifications({'session_key': 'desk-1'}) if 'quota wall' in t]
++    assert len(texts) == 1 and tid in texts[0] and isinstance(texts[0], DiagnosticText)
++    assert [t for t in _collect_kanban_notifications({'session_key': 'desk-1'}) if 'quota wall' in t] == []
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 350cd983d83..087be07c7ee 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -166,7 +166,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
+ 
+ # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
+ # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
+-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
++_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
++                        "quota_episode_notice")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+@@ -496,6 +497,11 @@ def _kb_timed_out(task, payload: dict, title: str) -> str:
+     return f" timed out (max_runtime={limit}s){tail}"
+ 
+ 
++def _kb_quota_episode(payload: dict) -> str:
++    from hermes_cli.kanban_quota_episode import notice_text
++    return notice_text(payload)
++
++
+ def _kb_failure(kind: str, payload: dict, title: str) -> str:
+     """Cause-accurate gave_up/crashed wording; pid/exit/raw output only under ``Details:``. [daveey]"""
+     from hermes_cli.kanban_failure_summary import describe_failure
+@@ -510,6 +516,7 @@ _KANBAN_EVENT_FORMATTERS = {
+     "crashed": ("✖", lambda t, p, title: _kb_failure("crashed", p, title)),
+     "timed_out": ("⏱", _kb_timed_out),
+     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
++    "quota_episode_notice": ("⏳", lambda t, p, title: _kb_quota_episode(p)),
+ }
+ 
+ 
+-- 
+2.55.0
+

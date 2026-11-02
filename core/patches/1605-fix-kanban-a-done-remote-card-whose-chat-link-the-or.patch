@@ -1,0 +1,115 @@
+From 9d13eeb47e7f2ee028a6ef4a767f8f831bbdef7e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:36:35 -0800
+Subject: [PATCH] fix(kanban): a done remote card whose chat link the origin
+ released stops counting as open [daveey]
+
+The owner gateway writes a 'created' task_chat_link for a remote origin chat
+(kanban_creator_chats) that no gateway ever releases: the owner's reconcile
+manages only its own chats' links, the origin's only its own board file. The
+origin's 'shepherd' link carries the verified release. replica_cards read only
+released=0 rows, so every done card kept an 'unknown' obligation: sidebar
+kanban_active counted cards that kanban_waiting_on/session_tasks never named
+(local 20261022_191623_29476a showed 4, 20261023_204423_b85a94 showed 1).
+
+A released sibling link (same card + chat, other kind) now settles a closed
+(done/archived) card for that chat. Open cards and missing rows are unchanged.
+Live: replica obligations 395 -> 142 vs ledger 139; sessions with active
+counts 155 -> 120.
+---
+ hermes_cli/kanban_chat_links.py            | 17 +++++++--
+ tests/hermes_cli/test_kanban_chat_links.py | 41 ++++++++++++++++++++++
+ 2 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 02e5d27b777..ee59cafe324 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -164,13 +164,22 @@ def _stale_after_s() -> float:
+ 
+ def _read_replica(path: Path, gateway: str, profile: str) -> tuple[list[dict[str, Any]], Optional[float]]:
+     """Every unreleased link of this gateway+profile's chats in one replica, with its card row (or none when the
+-    card row is missing), and the replica's last successful pull. Raises ``sqlite3.Error`` when unreadable."""
++    card row is missing), and the replica's last successful pull. Raises ``sqlite3.Error`` when unreadable.
++
++    ``chat_released`` is 1 when another link of the same card and chat (other kind) is released. [daveey] The owner
++    writes a ``created`` link for a remote origin chat (``kanban_creator_chats``) that no gateway ever releases: the
++    owner's reconcile only manages its own chats' links and the origin's only its own board file. The origin's
++    ``shepherd`` link carries the verified release instead, so a done card stayed an ``unknown`` obligation forever
++    (sidebar "4 open" naming none, 2026-11-01)."""
+     from hermes_cli.kanban_session_activity import cached_ro  # lazy: that module imports this one
+     with cached_ro(path) as conn:
+         conn.row_factory = sqlite3.Row
+         rows = [dict(r) for r in conn.execute(
+             "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
+-            "t.priority, t.block_kind, t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind "
++            "t.priority, t.block_kind, t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind, "
++            "EXISTS (SELECT 1 FROM task_chat_links r WHERE r.task_id = l.task_id AND r.chat_gateway = l.chat_gateway "
++            "AND r.chat_profile IS l.chat_profile AND r.chat_session = l.chat_session AND r.released = 1) "
++            "AS chat_released "
+             "FROM task_chat_links l LEFT JOIN tasks t ON t.id = l.task_id "
+             "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 0 "
+             "AND (t.id IS NULL OR (t.created_on IS NOT NULL AND t.created_on != ?))",
+@@ -296,6 +305,10 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             unknown = missing or status in TERMINAL_STATUSES or status is None
+             if not unknown and status not in statuses:
+                 continue
++            # A closed card this chat's other link released is settled for this chat (see ``_read_replica``). Only a
++            # terminal row: an open card keeps every unreleased link, and a missing row stays unknown.
++            if status in TERMINAL_STATUSES and r.get("chat_released"):
++                continue
+             tid = str(r["id"])
+             owner, owner_profile = _owner_of((owners or {}).get((board, tid), []), r["created_on"], r["chat_session"])
+             if missing and owner == gateway:  # the ledger places the missing row on this gateway: a local card
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index cb08f5af1e9..790e7e1cc21 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -318,3 +318,44 @@ def test_session_tasks_stale_ok_does_not_wait_behind_a_ledger_rebuild(live, kanb
+ 
+ 
+ _real_remote_links = ksa._remote_links
++
++
++def test_a_done_card_whose_shepherd_link_is_released_drops_the_owners_created_link(live, kanban_home, monkeypatch,
++                                                                                   tmp_path):
++    """[daveey] Phantom count (2026-11-01): the owner (hub) writes a ``created`` link for the origin chat
++    (``kanban_creator_chats``) that no gateway ever releases; the origin's ``shepherd`` link carries the verified
++    release. The done card stayed ``unknown`` and the sidebar said "4 open" while naming none. A released sibling
++    link of the same chat settles a closed card; it never drops an open card or another chat's link."""
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_done", "done", "done", OTHER), ("t_arch", "archived", "archived", OTHER),
++                   ("t_open", "open", "running", OTHER), ("t_unrel", "done, unverified", "done", OTHER)],
++             [("t_done", ME, "s1", "created", 0), ("t_done", ME, "s1", "shepherd", 1),
++              ("t_arch", ME, "s1", "created", 0), ("t_arch", ME, "s1", "shepherd", 1),
++              ("t_done", ME, "s2", "created", 0),  # another chat: its own release never arrived
++              ("t_open", ME, "s1", "created", 0), ("t_open", ME, "s1", "shepherd", 1),
++              ("t_unrel", ME, "s3", "created", 0), ("t_unrel", ME, "s3", "shepherd", 0)])
++    got = sorted((c["session"], c["id"], c["status"])
++                 for c in links.replica_cards(None, ME, ksa.LISTED_STATUSES, replicas=[("default", rep)]))
++    assert got == [("s1", "t_open", "running"), ("s2", "t_done", "unknown"), ("s3", "t_unrel", "unknown")]
++    _switch_to_replica(kanban_home, monkeypatch, rep)
++    assert ksa.active_task_counts() == {"s1": 1, "s2": 1, "s3": 1}
++    rows = ksa.annotate_kanban_activity([{"id": "s1"}, {"id": "s2"}, {"id": "s3"}])
++    assert [r.get("kanban_active") for r in rows] == [1, 1, 1]
++    assert [c["id"] for c in ksa.session_tasks(["s1"])] == ["t_open"]  # the count names what it counts
++
++
++def test_tui_legacy_subs_on_done_local_cards_count_nothing(live, kanban_home, monkeypatch):
++    """Legacy ``tui`` subs (no/invalid ``delivery_metadata``) keep an OPEN card counted, never a done one."""
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [])
++    done = kb.create_task(live, title="done", assignee="worker")
++    still = kb.create_task(live, title="open", assignee="worker")
++    with kbc.write_txn(live):
++        for tid in (done, still):
++            live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) "
++                         "VALUES (?, 'tui', 's_legacy', 1)", (tid,))
++            live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, delivery_metadata, created_at) "
++                         "VALUES (?, 'tui', 's_junk', '{not json', 1)", (tid,))
++        live.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (done,))
++    ksa._reset_cache_for_tests()
++    assert ksa.active_task_counts() == {"s_legacy": 1, "s_junk": 1}
++    assert ksa.waiting_on_task_ids() == {"s_legacy": frozenset({still}), "s_junk": frozenset({still})}
+-- 
+2.55.0
+
