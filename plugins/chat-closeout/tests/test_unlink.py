@@ -27,6 +27,16 @@ def world(tmp_path, monkeypatch):
     led = core.Ledger(tmp_path / 'ledger.db')
     inventory: list = []
     boards: list = []
+    # An empty linked-card projection is not full-board absence evidence. Supply
+    # a fresh full shadow for tests that intentionally model deleted remote cards.
+    root = tmp_path / 'coverage-home'
+    shadow = root / 'kanban' / 'sync-shadow' / 'build.db'
+    shadow.parent.mkdir(parents=True)
+    with sqlite3.connect(shadow) as db:
+        db.execute('CREATE TABLE tasks (id TEXT)')
+        db.execute('CREATE TABLE kanban_sync_state (board_id TEXT, pulled_at REAL)')
+        db.execute('INSERT INTO kanban_sync_state VALUES (?, ?)', ('build', plugin.time.time()))
+    monkeypatch.setattr(plugin, '_kanban_root', lambda: root)
     monkeypatch.setattr(plugin, 'ledger', lambda: led)
     monkeypatch.setattr(plugin, 'board_paths', lambda: list(boards))
     monkeypatch.setattr(plugin, 'remote_cards', lambda: [dict(r) for r in inventory])

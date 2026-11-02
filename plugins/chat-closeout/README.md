@@ -73,6 +73,19 @@ close-out turn whose last assistant message is a successful final reply (text, n
 stop/end_turn, the transcript ack rule); a failed wake, or a briefed turn that failed, keeps it, and a failed turn
 retries after a shared 600 s backoff subject to the existing hourly wake cap; failure never acknowledges delivery. A found entry
 forgets its missing time (`tests/test_unlink.py`, `tests/test_contract_edges.py`).
+
+A missing four-part `gateway/profile/board/id` additionally requires a fresh full Board shadow
+(`kanban/sync-shadow/<board>.db`, matching board identity and `pulled_at` within 120 seconds).
+The origin/shepherd projection only contains linked rows; freshness there does not establish full-board absence.
+Any task with that id in the shadow vetoes unlinking, regardless of status or owner, without granting settlement.
+A missing, unreadable, wrong-board, future-dated or stale shadow is uncertain, not an observed absence. These
+vetoes discard previously accumulated missing time on the first pass. Hosts without full-board coverage retain
+unresolved qualified entries rather than guessing; legacy one-/three-part resolution remains unchanged.
+The Board shadow is shared across gateways/profiles (not a gateway partition); its `gateway_id` identifies the
+reader, not the owner of every task. This is why coverage is checked by board and presence by id.
+`tests/test_board_coverage.py` exercises full/light readers, first-pass reset, projection failure, >24-hour
+retention and genuinely absent full-board deletion. The defect escaped the earlier list-only tests because those
+fixtures assumed the linked projection was exhaustive; deletion fixtures now supply full-board evidence.
 The regression was retained across upgrades because turn-end unions prior batches while readers use canonical
 keys; coverage upkeep lacked alias migration. Tests now seed mixed historical/canonical batches and exercise
 wake plus turn-end, including open canonical and missing-sibling controls.

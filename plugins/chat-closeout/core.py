@@ -90,6 +90,7 @@ class Cards(dict):
     could not be resolved (a local collision, a board that failed to read, several inventory owners for one legacy
     id); never evidence a card is gone. ``readable``: the remote inventory was read."""
     uncertain: frozenset = frozenset()
+    absence_veto: frozenset = frozenset()  # full-board presence/coverage veto; discard invalid old missing clocks
     readable: bool = True
 
 
@@ -102,6 +103,7 @@ def canonical_view(cards: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
         return cards
     out = Cards({**cards, **extra})
     out.uncertain = getattr(cards, 'uncertain', frozenset())
+    out.absence_veto = getattr(cards, 'absence_veto', frozenset())
     out.readable = getattr(cards, 'readable', True)
     return out
 
@@ -477,7 +479,9 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
     state = {k: dict(v) for k, v in before.items() if "removed" in v or k in batch}
     missing = {k for k in batch if cards.get(k) is None and k not in uncertain}
     for k in batch - missing:
-        if cards.get(k) is not None and k in state and "removed" not in state[k]:
+        if k in getattr(cards, "absence_veto", ()):
+            state.pop(k, None)  # prior linked-only reads never established this board's absence
+        elif cards.get(k) is not None and k in state and "removed" not in state[k]:
             state.pop(k)  # found again: a later absence starts its own clock
         elif cards.get(k) is None and k in state and "removed" not in state[k]:
             state[k]["mono"] = None  # unresolved this pass (uncertain): not observation, the next one starts anew

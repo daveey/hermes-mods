@@ -171,6 +171,46 @@ def _replica_completed_at(cards: list[dict]) -> dict[int, float]:
     return out
 
 
+def _board_absence_veto(keys: set[str]) -> set[str]:
+    """Qualified keys need full-board coverage, not absence from a linked-card projection.
+
+    A Board shadow is the whole board across gateways/profiles. Any matching id
+    vetoes absence (even a different owner); it never proves settlement. Missing,
+    stale or unreadable coverage also vetoes absence. One read per board per pass.
+    """
+    groups: dict[str, set[str]] = {}
+    veto: set[str] = set()
+    for key in keys:
+        parts = key.split('/')
+        if len(parts) != 4:
+            continue
+        board = parts[2]
+        if not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', board):
+            veto.add(key)
+            continue
+        groups.setdefault(board, set()).add(key)
+    for board, wanted in groups.items():
+        try:
+            path = _kanban_root() / 'kanban' / 'sync-shadow' / f'{board}.db'
+            conn = core.ro_connect(path)
+            try:
+                conn.execute('BEGIN')
+                state = conn.execute('SELECT board_id, pulled_at FROM kanban_sync_state').fetchall()
+                if len(state) != 1 or state[0][0] != board or state[0][1] is None \
+                        or not 0 <= time.time() - float(state[0][1]) <= 120:
+                    veto.update(wanted)
+                    continue
+                # Query ids, not status or links: absence is stronger than "not linked".
+                found = {str(r[0]) for r in conn.execute('SELECT id FROM tasks')}
+                veto.update(key for key in wanted if key.rsplit('/', 1)[-1] in found)
+            finally:
+                conn.close()
+        except Exception:
+            logger.debug('chat-closeout: board absence coverage unavailable: %s', board, exc_info=True)
+            veto.update(wanted)
+    return veto
+
+
 def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict]]] = None,
                light: bool = False) -> dict:
     """Local and remote cards by ledger key. ``light``: local cards carry only ``core.SETTLE_FIELDS``.
@@ -200,6 +240,7 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
         logger.debug('chat-closeout: origin projection unavailable', exc_info=True)
         out.update({key: card for key, card in cards.items() if '/' in key})
         out.uncertain = frozenset(uncertain | {i for i in ids if i not in out})
+        out.absence_veto = frozenset(_board_absence_veto(want - set(out)))
         out.readable = False
         return out
     # Every key shape ends in the card id except a legacy remote row's stored ``key`` (then card_key IS that key):
@@ -247,7 +288,8 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
                 if at is not None:
                     cards[key] = {**card, 'completed_at': at}  # a copy: inventory rows are core's cache
     out.update(cards)
-    out.uncertain = frozenset(uncertain & want)
+    out.absence_veto = frozenset(_board_absence_veto(want - set(cards)))
+    out.uncertain = frozenset((uncertain & want) | out.absence_veto)
     return out
 
 
@@ -290,6 +332,7 @@ def _pass_reader(light: bool = False) -> Callable[[list[str]], dict]:
         full = union["cards"]
         out = core.Cards({key: card for key, card in full.items() if key in want})
         out.uncertain = frozenset(set(getattr(full, "uncertain", ())) & want)
+        out.absence_veto = frozenset(set(getattr(full, "absence_veto", ())) & want)
         out.readable = getattr(full, "readable", True)
         return out
 
