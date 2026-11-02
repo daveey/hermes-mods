@@ -126,6 +126,12 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 - Workflows with `paths:` filters don't run for every commit. Without `--workflow`, the script waits on the
   workflows that have a run on a commit containing yours. With `--workflow X`, when X never runs it reports a
   stall after the 3-minute startup grace period plus two idle polls.
+- A workflow whose every job is gated off by `if:` ends its runs `skipped` (e.g. a `workflow_run` "runner-loss
+  recovery" job that acts only after a failed run, so it skips on every green
+  commit). It checked nothing and can never succeed. Without `--workflow` the script counts it as done once its
+  runs on your sha have finished, and lists it as `<name> skipped <url>` in the pass line. Older copies of the
+  script waited for its success forever: `not yet: waiting for <that workflow>; 0 run(s) queued/running` with
+  every other check green. With `--workflow X` a skipped X is still not a pass.
 - A cancelled run can stay `queued` indefinitely: an aggregator job with `if: always()` ("All required checks
   pass") still needs a runner, and on busy self-hosted runners it holds the PR's concurrency group, leaving the new
   head's run `pending`. Read back `status`/`conclusion` after `gh run cancel` before reporting it done; if stuck,

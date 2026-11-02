@@ -52,6 +52,40 @@ class EvaluateTests(unittest.TestCase):
         state = w.evaluate([r], ["b"], contains, ["macos-release.yml"])
         self.assertTrue(state["macos-release.yml"]["done"])
 
+    def test_workflow_whose_runs_all_skipped_is_not_a_check_of_the_commit(self):
+        # A workflow_run job gated by `if:` (a "runner-loss recovery" job that acts only after a failed run) ends
+        # every run `skipped`, so it never succeeds. Waiting for its success held every discovered wait at
+        # "not yet ... 0 run(s) queued/running" although every real check had passed.
+        runs = [run("c", wf="Recovery", conclusion="skipped"), run("b", wf="Recovery", conclusion="skipped"), run("b")]
+        state = w.evaluate(runs, ["b"], contains, None)
+        self.assertTrue(state["CI"]["done"])
+        self.assertFalse(state["CI"]["skipped"])
+        self.assertEqual(state["Recovery"]["done"]["url"], "u/Recovery/c0")
+        self.assertTrue(state["Recovery"]["skipped"])
+
+    def test_skipped_workflow_ignores_its_runs_still_active_on_later_commits(self):
+        # Every later commit starts new runs of it; one of those queued must not hold this commit's verdict.
+        runs = [run("d", wf="Recovery", status="in_progress", conclusion=""),
+                run("b", wf="Recovery", conclusion="skipped"), run("b")]
+        state = w.evaluate(runs, ["b"], contains, None)
+        self.assertTrue(state["Recovery"]["skipped"])
+
+    def test_skipped_workflow_waits_while_its_run_on_the_commit_itself_is_active(self):
+        runs = [run("b", wf="Recovery", status="queued", conclusion=""),
+                run("b", wf="Recovery", conclusion="skipped"), run("b")]
+        state = w.evaluate(runs, ["b"], contains, None)
+        self.assertIsNone(state["Recovery"]["done"])
+
+    def test_skipped_then_failed_reports_the_failure(self):
+        runs = [run("c", wf="Recovery", conclusion="failure"), run("b", wf="Recovery", conclusion="skipped"), run("b")]
+        state = w.evaluate(runs, ["b"], contains, None)
+        self.assertIsNone(state["Recovery"]["done"])
+        self.assertEqual(state["Recovery"]["failed"]["url"], "u/Recovery/c0")
+
+    def test_a_named_workflow_that_only_skipped_still_has_to_pass(self):
+        state = w.evaluate([run("b", wf="Recovery", conclusion="skipped")], ["b"], contains, ["Recovery"])
+        self.assertIsNone(state["Recovery"]["done"])
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -329,3 +363,34 @@ class BoundedCallTests(unittest.TestCase):
         rc, out = self._main_out([[red]], "--once")
         self.assertEqual(rc, 1)
         self.assertIn("(ran on dddddddddd, a later commit containing it)", out)
+
+    def _discovered_out(self, listings, *extra):
+        """main() without --workflow: the workflows are the ones with a run containing the commit."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        def fake_git(repo, *args):
+            return "c" * 40 if args[0] == "rev-parse" else ""
+        buf = io.StringIO()
+        with mock.patch.object(w, "resolve_repo", side_effect=lambda p, slug=None: p), \
+                mock.patch.object(w, "git", side_effect=fake_git), \
+                mock.patch.object(w, "make_contains", return_value=lambda commit, sha: True), \
+                mock.patch.object(w, "list_runs", side_effect=listings), \
+                mock.patch.object(w.time, "sleep"), contextlib.redirect_stdout(buf):
+            rc = w.main(["c" * 40, "--gh-repo", "o/r", "--interval", "0", *extra])
+        return rc, buf.getvalue()
+
+    def test_once_passes_when_the_only_other_workflow_skipped(self):
+        green, skipped = run("c" * 40), run("c" * 40, wf="Recovery", conclusion="skipped")
+        rc, out = self._discovered_out([[skipped, green]], "--once")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("passed ccccccccc: CI u/CI/", out)
+        self.assertIn("Recovery skipped u/Recovery/", out)
+
+    def test_wait_loop_passes_when_the_only_other_workflow_skipped(self):
+        # The loop used to time out here (2), or end "stalled" red (1) once nothing of that workflow was active.
+        green, skipped = run("c" * 40), run("c" * 40, wf="Recovery", conclusion="skipped")
+        rc, out = self._discovered_out([[skipped, green]], "--timeout-min", "0")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Recovery skipped u/Recovery/", out)

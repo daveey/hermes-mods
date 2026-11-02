@@ -14,7 +14,10 @@ Done when:
                     (e.g. `v*`, `desktop-pod-*`): the commit is released
   otherwise         for every workflow (the --workflow ones, or else every workflow
                     with a run on a commit that contains the sha), some run on a
-                    commit containing the sha concluded `success`
+                    commit containing the sha concluded `success`. A discovered
+                    workflow whose runs there all ended `skipped` (no job ran) counts
+                    as done, printed "skipped", once none of its runs on the sha
+                    itself is queued or running; a --workflow one must succeed
 
 Exit codes: 0 done; 1 stalled (nothing queued/running will finish it: the newest
 finished run containing the commit failed, or no run will ever pick it up), or
@@ -101,10 +104,17 @@ def workflow_key(run: dict) -> str:
 
 
 def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] | None) -> dict[str, dict]:
-    """Per workflow: {'done': run|None, 'active': n, 'failed': run|None}.
+    """Per workflow: {'done': run|None, 'skipped': bool, 'active': n, 'failed': run|None}.
 
     `runs` are newest first. A run counts for the commit when its headSha
     contains every sha. Cancelled runs are ignored (they were replaced).
+
+    A discovered workflow (no --workflow) whose runs containing the commit all ended `skipped` is done, with
+    'skipped' set: every job's `if:` was false, so it checked nothing and can never succeed. A `workflow_run`
+    "runner-loss recovery" job that acts only after a failed run ends that way on every green commit, and
+    waiting for its success held every discovered wait at "not yet" with nothing queued or
+    running. It still waits while a run of that workflow on the sha itself is queued or running. A workflow
+    named with --workflow must succeed: a skip there is not a pass.
     """
     relevant = [r for r in runs if all(contains(r["headSha"], s) for s in shas)]
     names = workflows if workflows else sorted({workflow_key(r) for r in relevant})
@@ -114,8 +124,14 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
         everyone = [r for r in runs if workflow_key(r) == name or r.get("_wf") == name]
         done = next((r for r in mine if r["status"] == "completed" and r["conclusion"] == "success"), None)
         finished = [r for r in mine if r["status"] == "completed" and r["conclusion"] not in ("cancelled", "skipped")]
+        skipped = None
+        if done is None and not finished and not workflows:
+            # Later commits keep starting runs of it; only a run on the sha itself can still decide.
+            if not any(r["status"] in ACTIVE and r["headSha"] in shas for r in mine):
+                skipped = next((r for r in mine if r["status"] == "completed" and r["conclusion"] == "skipped"), None)
         state[name] = {
-            "done": done,
+            "done": done or skipped,
+            "skipped": done is None and skipped is not None,
             # Any active run of the workflow may still end up building a newer commit containing ours.
             "active": sum(1 for r in everyone if r["status"] in ACTIVE),
             "failed": finished[0] if finished and finished[0]["conclusion"] != "success" else None,
@@ -277,7 +293,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             wf_state = evaluate(runs, shas, contains, a.workflow or None)
             if wf_state and all(s["done"] for s in wf_state.values()):
-                print(f"passed {label}: " + ", ".join(f"{n} {run_ref(s['done'], shas)}" for n, s in wf_state.items()))
+                print(f"passed {label}: " + ", ".join(
+                    f"{n} {'skipped ' if s['skipped'] else ''}{run_ref(s['done'], shas)}" for n, s in wf_state.items()))
                 return 0
             pend = {n: s for n, s in wf_state.items() if not s["done"]}
             active = sum(s["active"] for s in pend.values())
