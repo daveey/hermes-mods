@@ -670,6 +670,79 @@ def _canonical_session(sid: str) -> str:
 MAX_POST_ATTEMPTS = 3  # failed card filings per incident key before one ERROR and no more retries
 
 
+def _incident_session(key: str) -> Optional[str]:
+    """The chat a watchdog incident key is about: named in the key, or (handoff keys) in its handoff row."""
+    parts = key.split(":")
+    if len(parts) == 4 and parts[1] in ("unseen", "no-closeout", "ask-failed"):
+        return parts[2] or None
+    if len(parts) == 3 and parts[1] == "handoff":
+        try:
+            conn = routing._conn(ledger())
+            try:
+                row = conn.execute("SELECT session_id FROM handoffs WHERE id=?", (parts[2],)).fetchone()
+            finally:
+                conn.close()
+            return (row[0] or None) if row else None
+        except Exception:
+            logger.debug("chat-closeout: handoff session lookup failed for %s", key, exc_info=True)
+    return None
+
+
+def _origin_ref(key: str) -> Optional[str]:
+    """``@session:<profile>@<gateway>/<chat>`` for the chat ``key`` closes out, or None when this gateway's name or
+    the chat is unknown. Without it the card's only link to its chat was its title, so every card its worker filed
+    got ``creator_chats_unresolved`` and its result reached no chat (t_01a199c830931fc5). [daveey]"""
+    sid = _incident_session(key)
+    if not sid:
+        return None
+    try:
+        from hermes_cli.kanban_origin import gateway_names
+        from hermes_cli.profiles import get_active_profile_name
+        gateway, profile = gateway_names()[0], get_active_profile_name() or "default"
+    except Exception:
+        logger.debug("chat-closeout: gateway/profile name unavailable", exc_info=True)
+        return None
+    if not gateway:
+        logger.warning("chat-closeout: this gateway has no name, so card %s is not linked to chat %s", key, sid)
+        return None
+    return f"@session:{profile}@{gateway}/{_canonical_session(sid)}"
+
+
+def _link_existing(conn, tid: str, ref: str) -> bool:
+    """Bind an existing card to its chat with core's own creation-time path (``initialize_ownership``: created link,
+    ``origin`` notify sub whose cursor starts at the card's latest event), then let core's creator-chat backfill
+    re-resolve the children its worker already filed. True when a link was added."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_creator_chats import backfill, initialize_ownership
+    from hermes_cli.kanban_origin import parse_origin
+    origin = parse_origin(ref)
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+        return False  # an unsynced board has no chat links to resolve children through
+    if conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=? AND chat_gateway=? AND chat_session=? "
+                    "AND released=0", (tid, origin.gateway, origin.session)).fetchone():
+        return False
+    with kb.write_txn(conn):
+        initialize_ownership(conn, tid, None, (), int(time.time()), ref)
+    backfill(conn)
+    return True
+
+
+def relink_open_cards() -> list[str]:
+    """Backfill: link every open card this watchdog filed to the chat it closes out. Leaves other cards alone."""
+    from hermes_cli.kanban_db_connect import connect_closing
+    linked: list[str] = []
+    with connect_closing() as conn:
+        rows = conn.execute("SELECT id, idempotency_key FROM tasks WHERE created_by='chat-closeout' "
+                            "AND status NOT IN ('done','archived') AND idempotency_key IS NOT NULL").fetchall()
+        for tid, key in rows:
+            if not _WATCHDOG_KEY.match(key or ""):
+                continue
+            ref = _origin_ref(key)
+            if ref and _link_existing(conn, tid, ref):
+                linked.append(tid)
+    return linked
+
+
 def file_card(title: str, body: str, key: str) -> str:
     """One Kanban card per stuck-chat incident on this gateway's default board (agent-fixable state belongs on the
     board, never the Inbox). ``key`` is the idempotency key, so a repeat of the same incident reuses the card."""
@@ -694,6 +767,7 @@ def file_card(title: str, body: str, key: str) -> str:
             "<text>`, which the chat receives when your card completes. "
             "This is agent work: do not block on the user to resume a chat. Complete this card once the "
             "chat has reported its cards' results; the watchdog also closes it when its condition clears.")
+    ref = _origin_ref(key)
     with connect_closing() as conn:
         # Core create_task deduplicates even DONE rows. Preserve their incident key
         # in an archival namespace so a genuinely cleared/recurrent signature can file anew.
@@ -701,8 +775,13 @@ def file_card(title: str, body: str, key: str) -> str:
             conn.execute("UPDATE tasks SET idempotency_key=idempotency_key || ':resolved:' || id "
                          "WHERE idempotency_key=? AND created_by='chat-closeout' "
                          "AND status IN ('done','archived')", (key,))
-        return kb.create_task(conn, title=f"chat-closeout: {title}"[:200], body=text, assignee=assignee,
-                              created_by="chat-closeout", idempotency_key=key)
+        existed = conn.execute("SELECT id FROM tasks WHERE idempotency_key=? AND status != 'archived'",
+                               (key,)).fetchone()
+        tid = kb.create_task(conn, title=f"chat-closeout: {title}"[:200], body=text, assignee=assignee,
+                             created_by="chat-closeout", idempotency_key=key, chat_origin=ref)
+        if existed and ref:
+            _link_existing(conn, tid, ref)  # a reused pre-fix card gets the link it was filed without
+        return tid
 
 
 _WATCHDOG_KEY = re.compile(r"^chat-closeout:(?:unseen|no-closeout|ask-failed):[^:]+:[^:]+$"
@@ -787,6 +866,16 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
     The flag is recorded only after the Kanban card was filed, so a failed filing retries next run, up to
     MAX_POST_ATTEMPTS per key; then one ERROR and no more retries until the condition changes.
     Returns the flag keys raised. One remote-inventory read per tick, shared by every pending row."""
+    if post is None and not _state.get("relinked"):
+        # Once per process on the real route: cards filed before they carried their chat link get it now.
+        try:
+            linked = relink_open_cards()
+            _state["relinked"] = True
+            if linked:
+                logger.info("chat-closeout: linked %d open watchdog card(s) to their chats: %s", len(linked),
+                            ", ".join(linked))
+        except Exception:
+            logger.warning("chat-closeout: relinking open watchdog cards failed; retrying next tick", exc_info=True)
     post = post or file_card
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
