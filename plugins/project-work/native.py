@@ -18,6 +18,8 @@ import json
 import re
 import uuid
 
+from .errors import NativeCreateRefused
+
 
 class InboundChanged(RuntimeError):
     """Positive thread invalidation, not a transport outage."""
@@ -213,8 +215,23 @@ class NativeBridge:
         result = self.owner_tool('kanban_create', args, live)
         if isinstance(result, str):
             result = json.loads(result)
-        card_id = result.get('task_id') or result.get('id') or result.get('task', {}).get('id')
+        card_id = None
+        if isinstance(result, dict):
+            task = result.get('task')
+            card_id = (result.get('task_id') or result.get('id')
+                       or (task.get('id') if isinstance(task, dict) else None))
         if not card_id:
+            if (isinstance(result, dict) and isinstance(result.get('code'), str)
+                    and result['code'] and 'error' in result):
+                # A refusal is only typed once a fresh archived-inclusive lookup
+                # proves no card exists; a failed lookup stays ambiguous.
+                try:
+                    recovered = self._recover_card(params, scope)
+                except Exception as exc:
+                    raise RuntimeError('Native kanban_create refused; post-refusal lookup failed') from exc
+                if recovered is not None:
+                    return recovered
+                raise NativeCreateRefused(result['code'], str(result['error']), params['idempotency_key'])
             raise RuntimeError('Native kanban_create did not return a task ID')
         return self._validate_card(card_id, params, scope)
 

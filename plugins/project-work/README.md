@@ -240,6 +240,45 @@ and verify visibility BEFORE checking evidence or thread watermark. Failed unarc
 readback retains the obligation. Deleted/edited owner approvals cannot authorize archive.
 Never manually change ledger status to `archived` or fabricate delivery receipts.
 
+### Native card-create refusal (`create_refused`)
+
+`kanban_create` can refuse definitively, e.g.
+`{"error": "Assignee 'X' lacks required capabilities: host_repo", "code": "assignee_capability_mismatch"}`.
+`NativeBridge.create_card` raises `NativeCreateRefused` (`code`, `error`,
+`idempotency_key`) only when the result is a dict with no task ID, a non-empty
+string `code` and an `error` field, AND a fresh archived-inclusive `card_keys`
+lookup afterwards finds no card. If that lookup finds a card it is validated and
+adopted. Any other shape (no code, non-dict) or a failing lookup stays a plain,
+ambiguous `RuntimeError`.
+
+The stage loop then stores the entry as
+`{'state': 'create_refused', 'params': <unchanged>, 'refusal': {code, error, idempotency_key, at}}`,
+sets row `error` to `card_create_refused:<code>` and stops (later stages are not
+attempted). Each later normal attempt (reconcile tick) first runs the read-only,
+archived-inclusive `recover_card` and adopts a card it finds; otherwise it
+re-persists `create_intent` (keeping the refusal history) and calls `create_card`
+with the SAME params and idempotency key. Success sets `created` and the ID; a
+repeated refusal moves the previous `refusal` into the `refusals` list. Params
+and keys are never cleared or regenerated. An ambiguous outcome of that retry
+leaves `create_intent`, which needs the operator method below.
+
+### Operator recovery of a card `create_intent`
+
+A `create_intent` with no ID (create sent, outcome unknown) is still ambiguous on
+the normal path: `recover_card`, else `Ambiguous card creation; operator recovery
+required`. Once the native cause is fixed (for example the assignee capability was
+granted), a trusted operator calls `Service.recover_card_intent(workflow_id, stage)`
+with the runtime stopped, or from the same process: it takes the store lock itself.
+It requires an approved row, a stage entry in `create_intent` with no ID whose
+params belong to the current generation, and, for `review`/`release`, a created
+preceding stage matching `depends_on`; otherwise it raises `WorkflowError`
+without writing. It runs archived-inclusive `recover_card` and adopts a found
+card; on a miss it makes exactly ONE `create_card` with the same params. Results:
+`created` + ID + `recovered_from: 'create_intent'`, or `create_refused` + refusal
+evidence + `recovered_from: 'create_intent'`. Any other exception leaves the
+stored entry byte-identical and propagates. It returns the updated entry and never
+advances other stages or sends prompts; the next reconcile continues the graph.
+
 ### Operator procedure for an irrecoverable intent
 
 There is deliberately no "force retry" or direct ledger-edit operation. If an
@@ -313,6 +352,29 @@ native ingress parsing, ingress log lines and tool refusal messages, real slack_
 `AsyncApp` dispatch through the plugin middleware (skipped unless `--with slack_bolt
 --with aiohttp`), and a real local Unix-socket controller/client round trip.
 Native RPC/Slack tests use deterministic fakes and are NOT live end-to-end proof.
+
+`tests/test_create_refusal.py` maps the card-create refusal and intent recovery:
+
+| Behavior | Test |
+|---|---|
+| Structured refusal + empty archived-inclusive lookup raises `NativeCreateRefused` (dict and JSON string) | `test_structured_refusal_with_empty_lookup_is_typed` |
+| Refusal whose post-lookup finds a card returns the validated card | `test_refusal_whose_post_lookup_finds_card_returns_validated_card` |
+| No/empty/non-str code, no error field, non-dict result stay plain `RuntimeError` | `test_unstructured_result_stays_ambiguous` |
+| Post-refusal lookup raising, duplicate, or failing validation stays plain `RuntimeError` | `test_refusal_with_failing_post_lookup_stays_ambiguous` |
+| First-attempt refusal persists `create_refused`, unchanged params, error, raises with code | `test_first_attempt_refusal_persists_create_refused` |
+| Retry from `create_refused` creates with the same params/key, keeps history | `test_retry_from_create_refused_reuses_params_and_creates` |
+| Retry adopts a card found by `recover_card` without creating | `test_retry_from_create_refused_adopts_recovered_card_without_create` |
+| Repeated refusal appends to `refusals` | `test_repeated_refusal_appends_history_with_same_key` |
+| Ambiguous retry re-enters `create_intent` and the operator path | `test_ambiguous_retry_from_create_refused_reenters_operator_path` |
+| Legacy `create_intent` normal path stays ambiguous | `test_legacy_create_intent_normal_path_stays_ambiguous` |
+| `recover_card_intent` adopts an (archived) card with zero creates | `test_recover_card_intent_adopts_archived_card_without_create` |
+| `recover_card_intent` miss makes one create, `created`/`recovered_from` | `test_recover_card_intent_miss_creates_once`, `test_recover_card_intent_review_stage_after_created_implement` |
+| `recover_card_intent` refusal gives `create_refused`/`recovered_from` | `test_recover_card_intent_refusal_records_create_refused` |
+| `recover_card_intent` ambiguous exception leaves the row byte-identical | `test_recover_card_intent_ambiguous_leaves_entry_byte_identical` |
+| `recover_card_intent` refuses unapproved, wrong state, existing ID, stale generation, missing predecessor without writing | `test_recover_card_intent_refuses_without_writing` |
+
+The service tests use the fake ports; the bridge tests use fake native callables.
+A real core refusal round trip is untested here.
 
 Before rollout independently review the source, then verify normal plugin discovery,
 actual owner-session/tool attribution, project visibility, task-local sandboxing for

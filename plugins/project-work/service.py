@@ -14,7 +14,7 @@ from typing import Protocol
 
 from .store import Store, followup_text
 from .native import InboundChanged
-from .errors import RejectedRequest, RejectedScope
+from .errors import NativeCreateRefused, RejectedRequest, RejectedScope
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,17 @@ class NativePorts(Protocol):
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class CardCreateRefused(WorkflowError):
+    """A stage's native create was refused with proof that no card exists."""
+
+    def __init__(self, code):
+        super().__init__('card_create_refused:' + code)
+        self.code = code
+
+
+STAGES = ('implement', 'review', 'release')
 
 
 class Service:
@@ -197,7 +208,10 @@ class Service:
             current = self.store.get(row['workflow_id'])
             if current['generation'] != row['generation']:
                 row = current  # Never overwrite a newer inbound generation.
-            row['error'] = type(exc).__name__ + (': ' + str(exc) if isinstance(exc, WorkflowError) else '')
+            if isinstance(exc, CardCreateRefused):
+                row['error'] = str(exc)  # Already 'card_create_refused:<code>'.
+            else:
+                row['error'] = type(exc).__name__ + (': ' + str(exc) if isinstance(exc, WorkflowError) else '')
             self.store.save(row)
 
     def _session(self, row):
@@ -307,23 +321,94 @@ class Service:
                               depends_on=[previous] if previous else [], session_id=row['session_id'],
                               stored_session_id=row['stored_session_id'],
                               generation=row['generation'], text=row['text'], plan=row['plan'])
-                if entry:
+                if entry and entry.get('state') == 'create_refused':
+                    # Proven absent at refusal time; recover first, then retry the
+                    # SAME params/key. Re-persist the intent before the effect so an
+                    # ambiguous retry lands on the operator path, never a blind loop.
+                    card_id = self.ports.recover_card(row['workflow_id'], stage, entry['params'])
+                    if not card_id:
+                        entry['state'] = 'create_intent'
+                        self.store.save(row)
+                        card_id = self._create_or_refuse(row, stage)
+                elif entry:
                     card_id = self.ports.recover_card(row['workflow_id'], stage, entry['params'])
                     if not card_id:
                         raise WorkflowError('Ambiguous card creation; operator recovery required')
                 else:
                     row['cards'][stage] = {'state': 'create_intent', 'params': params}
                     self.store.save(row)
-                    card_id = self.ports.create_card(row['workflow_id'], stage, params)
-                if not isinstance(card_id, str) or not card_id:
-                    raise WorkflowError('Missing native card identifier')
-                if self.ports.get_card(card_id).get('id') != card_id:
-                    raise WorkflowError('Native card creation readback failed')
+                    card_id = self._create_or_refuse(row, stage)
+                self._check_card(card_id)
                 row['cards'][stage].update(id=card_id, state='created')
                 self.store.save(row)
             previous = row['cards'][stage]['id']
         row.update(state='running', error=None)
         self.store.save(row)
+
+    def _check_card(self, card_id):
+        if not isinstance(card_id, str) or not card_id:
+            raise WorkflowError('Missing native card identifier')
+        if self.ports.get_card(card_id).get('id') != card_id:
+            raise WorkflowError('Native card creation readback failed')
+
+    def _record_refusal(self, row, stage, exc, extra=None):
+        """Persist a proven native refusal; params and key are never touched."""
+        entry = row['cards'][stage]
+        if entry.get('refusal'):
+            entry.setdefault('refusals', []).append(entry['refusal'])
+        entry.update(state='create_refused', refusal={
+            'code': exc.code, 'error': exc.error,
+            'idempotency_key': exc.idempotency_key, 'at': time.time()}, **(extra or {}))
+        row['error'] = 'card_create_refused:' + exc.code
+        self.store.save(row)
+
+    def _create_or_refuse(self, row, stage):
+        """Create with the entry's persisted params; a typed refusal is recorded."""
+        try:
+            return self.ports.create_card(row['workflow_id'], stage, row['cards'][stage]['params'])
+        except NativeCreateRefused as exc:
+            self._record_refusal(row, stage, exc)
+            raise CardCreateRefused(exc.code) from exc
+
+    def recover_card_intent(self, workflow_id, stage):
+        """Trusted operator only: resolve one persisted card `create_intent`.
+
+        Run after the native cause is fixed, with the runtime stopped or (as here)
+        under the store lock. Archived-inclusive recover first; on a miss, exactly
+        one create with the SAME params/key. Never advances other stages or
+        prompts. Any non-refusal exception leaves the entry untouched.
+        """
+        with self.store.lock():
+            row = self._row(workflow_id)
+            if stage not in STAGES:
+                raise WorkflowError('Unknown stage')
+            if not row['approved']:
+                raise WorkflowError('Card intent recovery requires an approved workflow')
+            entry = row['cards'].get(stage)
+            if not entry or entry.get('state') != 'create_intent' or entry.get('id'):
+                raise WorkflowError('Stage is not an unresolved create_intent')
+            params = entry['params']
+            if (params.get('generation') != row['generation'] or
+                    params.get('idempotency_key') != f"{workflow_id}:{row['generation']}:{stage}"):
+                raise WorkflowError('Card intent is not in the current generation')
+            index = STAGES.index(stage)
+            if index:
+                prior = row['cards'].get(STAGES[index - 1]) or {}
+                if (prior.get('state') != 'created' or not prior.get('id')
+                        or params.get('depends_on') != [prior['id']]):
+                    raise WorkflowError('Preceding stage card must be created first')
+            card_id = self.ports.recover_card(workflow_id, stage, params)
+            if not card_id:
+                try:
+                    card_id = self.ports.create_card(workflow_id, stage, params)
+                except NativeCreateRefused as exc:
+                    self._record_refusal(row, stage, exc, {'recovered_from': 'create_intent'})
+                    return row['cards'][stage]
+            self._check_card(card_id)
+            entry.update(id=card_id, state='created', recovered_from='create_intent')
+            row['error'] = None
+            self.store.save(row)
+            return entry
 
     def _evidence(self, row):
         if not row['approved']:
