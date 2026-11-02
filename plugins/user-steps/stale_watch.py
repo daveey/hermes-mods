@@ -18,6 +18,11 @@ admitted turn ended in a failed-turn boundary before any tool ran and that nothi
 auto-continue row, no later user message) within FAILED_DECISION_MIN_AGE (self-heal desktop-3a6213ce74:
 a backend restart killed the turn, the tile had already closed, and the decision silently never ran).
 
+It also opens one card (key `user-steps-undelivered:<operationId>`) for a recorded decision never delivered: at
+least UNDELIVERED_MIN_ATTEMPTS counted failures, or UNDELIVERED_MAX_WAIT old in any state. The card carries the
+operation's redacted lastError. `--retire-operation OID --reason ... --evidence ...` settles one without delivering
+it (ActionStore.retire_operation, by=hygiene; refused for owners not on this gateway).
+
 Old-ask review (cron runs only, not run()'s default): at most one card a day (key
 `user-steps-old-asks:<PT date>`) lists undecided requests asked more than 72 h ago and not marked reviewed in the
 last 7 days, with the owner chat's title and last turn (PT) and its linked/named card states. It is created on this
@@ -43,6 +48,11 @@ HERE = Path(__file__).resolve().parent
 MIN_AGE = 3600
 FAILED_DECISION_MIN_AGE = 600
 FAILED_DECISION_MAX_AGE = 7 * 86400
+# A recorded decision still undelivered after this many counted failures, or this long in any state (closed-chat
+# waits and busy refusals don't count as attempts), opens one card (t_01a199c0a2e3ea8b).
+UNDELIVERED_MIN_ATTEMPTS = 20
+UNDELIVERED_MAX_WAIT = 24 * 3600
+UNDELIVERED_MIN_AGE = 600
 
 
 def _load(name):
@@ -161,6 +171,83 @@ def failed_decision_card(f):
             f"Source: plugins/user-steps/stale_watch.py (self-heal desktop-3a6213ce74).")
     return {'title': f'user-steps: decision {oid[:8]} was admitted but its turn failed and never ran',
             'body': body, 'idempotency_key': 'user-steps-failed-decision:' + oid, 'assignee': 'default'}
+
+
+def _iso_ts(value):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def undelivered_decisions(core, store, now=None):
+    """Recorded decisions never delivered or retired: >= UNDELIVERED_MIN_ATTEMPTS counted failures (and at least
+    UNDELIVERED_MIN_AGE old), or older than UNDELIVERED_MAX_WAIT whatever the reason."""
+    now = time.time() if now is None else now
+    with store._read() as c:
+        rows = [r[0] for r in c.execute('SELECT body FROM operations').fetchall()]
+    out = []
+    for raw in rows:
+        try:
+            op = json.loads(raw)
+        except ValueError:
+            continue
+        if op.get('dispatchState') in ('delivered', 'cancelled'):
+            continue
+        recorded = _iso_ts(op.get('recordedAt'))
+        if recorded is None:
+            continue
+        waited = now - recorded
+        if not ((op.get('attempts', 0) >= UNDELIVERED_MIN_ATTEMPTS and waited >= UNDELIVERED_MIN_AGE)
+                or waited >= UNDELIVERED_MAX_WAIT):
+            continue
+        request = (op.get('intent') or {}).get('request') or {}
+        out.append({'operationId': op['operationId'], 'requestId': op.get('requestId'),
+                    'owner': op.get('owner') or {}, 'title': request.get('title') or '',
+                    'effect': (op.get('intent') or {}).get('effect'), 'choiceId': (op.get('decision') or {}).get('choiceId'),
+                    'recordedAt': op.get('recordedAt'), 'attempts': op.get('attempts', 0),
+                    'ownerWaits': op.get('ownerWaits', 0), 'busyRefusals': op.get('busyRefusals', 0),
+                    'dispatchState': op.get('dispatchState'), 'error': op.get('error'),
+                    'lastError': op.get('lastError')})
+    return out
+
+
+def undelivered_card(u):
+    oid = u['operationId']
+    last = u.get('lastError') or {}
+    last_line = (f"{last.get('class')}: {last.get('message')} (at {last.get('at')})" if last
+                 else 'not recorded (attempts predate error capture)')
+    body = (f"David decided a For-you request but the decision was never delivered to its chat, so the chat still "
+            f"treats it as pending.\n\n"
+            f"- Operation id: {oid}\n- Request id: {u['requestId']}\n- Request: {u['title']}\n"
+            f"- Choice: {u['choiceId']} (effect {u['effect']}), recorded {u['recordedAt']}\n"
+            f"- Owner: {json.dumps(u['owner'], sort_keys=True)}\n"
+            f"- State: {u['dispatchState']}; counted attempts {u['attempts']}, closed-chat waits {u['ownerWaits']}, "
+            f"busy refusals {u['busyRefusals']}\n- Last error: {last_line}\n\n"
+            f"Fix the cause the last error names (plugins/user-steps: cards.py receivers, prompt_delivery.py, "
+            f"core.py ActionStore.dispatch), then retry it from the For-you tile or POST "
+            f"/api/plugins/user-steps/operations/{oid}/retry?session=<owner session>. Before redelivering, read the "
+            f"chat: if it moved on, replaying a days-old approval would act on stale intent. Then retire it instead:\n"
+            f"`python3 ~/.hermes/plugins/user-steps/stale_watch.py --retire-operation {oid} --reason '...' "
+            f"--evidence '...'`\nDone when the operation reads dispatchState delivered or cancelled (retired).\n"
+            f"Source: plugins/user-steps/stale_watch.py (t_01a199c0a2e3ea8b).")
+    return {'title': f"user-steps: decision {oid[:8]} undelivered ({u['attempts']} attempts): {u['title'][:60]}",
+            'body': body, 'idempotency_key': 'user-steps-undelivered:' + oid, 'assignee': 'default'}
+
+
+def retire_operation(core, store, oid, *, reason, evidence, local_gateway):
+    """Sanctioned retirement of one undelivered decision (by=hygiene), with reason and evidence. Refused for an
+    owner not on this gateway and for a delivered/already-retired operation."""
+    reason, evidence = _need(core, reason, 'Reason'), _need(core, evidence, 'Evidence')
+    with store._read() as c:
+        row = c.execute('SELECT body FROM operations WHERE id=?', (oid,)).fetchone()
+    if row is None:
+        raise core.ActionError('Unknown operation', 404)
+    owner = json.loads(row[0])['owner']
+    if not local_gateway or owner.get('gatewayId') != local_gateway:
+        raise core.ActionError('Operation owner is not on this gateway; not retired', 409)
+    return store.retire_operation(owner, oid, by='hygiene', reason=reason[:300], evidence=evidence[:500])
 
 
 def create_card(c):
@@ -538,6 +625,9 @@ def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_car
     for f in failed_decisions(core, store, db, now=now):
         create(failed_decision_card(f))  # one card per operation; idempotent on its key
         opened.append('failed-decision:' + f['operationId'])
+    for u in undelivered_decisions(core, store, now=now):
+        create(undelivered_card(u))  # one card per operation; idempotent on its key
+        opened.append('undelivered:' + u['operationId'])
     if review_create is not None:
         listed = review_old_asks(core, store, now=now, create=review_create, local_gateway=_local_gateway(core))
         if listed:
@@ -598,25 +688,34 @@ def main(argv=None):
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--withdraw', metavar='ID', help='withdraw one request (by=hygiene); needs --reason and --evidence')
     ap.add_argument('--reviewed', metavar='ID', help='keep one open request; hides it from the old-ask review 7 days')
+    ap.add_argument('--retire-operation', metavar='OID',
+                    help='settle one undelivered decision without delivering it; needs --reason and --evidence')
     ap.add_argument('--reason')
     ap.add_argument('--evidence')
     a = ap.parse_args(argv)
-    if a.dry_run and (a.withdraw or a.reviewed):
-        print(json.dumps({'error': '--dry-run cannot be combined with --withdraw or --reviewed'}))
+    if a.dry_run and (a.withdraw or a.reviewed or a.retire_operation):
+        print(json.dumps({'error': '--dry-run cannot be combined with --withdraw, --reviewed or --retire-operation'}))
         return 2
     core = _load('core')
-    if a.withdraw and a.reviewed:
-        print(json.dumps({'error': 'use --withdraw or --reviewed, not both'}))
+    if sum(map(bool, (a.withdraw, a.reviewed, a.retire_operation))) > 1:
+        print(json.dumps({'error': 'use one of --withdraw, --reviewed, --retire-operation'}))
         return 2
     try:
         local_gateway = _require_identity(core, sys.argv[1:] if argv is None else argv)
     except core.ActionError as exc:
         print(json.dumps({'error': str(exc), 'status': exc.status}))
         return 2
-    if a.withdraw or a.reviewed:
+    if a.withdraw or a.reviewed or a.retire_operation:
         try:
             store = _store(core)
-            if a.withdraw:
+            if a.retire_operation:
+                v = retire_operation(core, store, a.retire_operation, reason=a.reason, evidence=a.evidence,
+                                     local_gateway=local_gateway)
+                print(json.dumps({'retired': {'operationId': a.retire_operation,
+                                              'dispatchState': v['operation']['dispatchState'],
+                                              'requestState': v['request']['state'],
+                                              'retired': v['operation']['retired']}}))
+            elif a.withdraw:
                 owner = _find(core, store, a.withdraw)[0]
                 v = withdraw_old(core, store, a.withdraw, reason=a.reason, evidence=a.evidence,
                                  local_gateway=local_gateway, ledger=_ledger(core, owner))

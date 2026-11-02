@@ -2072,6 +2072,19 @@ def validate_admission_text(value):
 # A decision recorded while its session is mid-turn: the runtime refuses admission until the turn ends. The
 # dashboard's background retrier and the Desktop row both re-dispatch the SAME operation until it lands.
 BUSY_ERROR = 'Session is busy with another turn; this decision is delivered automatically when it ends.'
+OWNER_WAIT_ERROR = 'Its chat is not open in Desktop; this decision is delivered automatically when it is.'
+# prompt.admit refusals that mean "the owning chat is not loaded/attached right now", not a delivery failure.
+# Startup reconciliation runs before any chat loads, so it can only get these (t_01a199c0a2e3ea8b).
+_OWNER_WAIT_MARKERS = ('no unique live owner', 'is lazy or rotated', 'is detached')
+
+
+def _redact_error(exc) -> str:
+    """Delivery error text safe to store and log: no URLs, no long token-like runs, 240 chars."""
+    import re
+    text = ' '.join(str(getattr(exc, 'reason', None) or exc).split())
+    text = re.sub(r'[a-zA-Z][a-zA-Z0-9+.-]*://\S+', '<url>', text)
+    text = re.sub(r'[A-Za-z0-9_\-+/=.]{32,}', '<redacted>', text)
+    return text[:240]
 
 
 class ActionStore:
@@ -2326,34 +2339,42 @@ class ActionStore:
             c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
         receipt = None
         confirmed = False
-        busy = False
+        busy = owner_wait = False
         failure_class = 'unconfirmed_readback'
+        error_text = None
         try:
             if receiver is None: raise RuntimeError('No durable delivery receiver configured')
             receipt = (receiver.deliver_early(op, early_tool_call_id) if early_tool_call_id
                        else receiver.deliver(op))
             confirmed = bool(receiver.readback(op, receipt))
         except Exception as exc:
-            # Never expose credentials, receiver URLs or raw transport bodies: only classify.
-            busy = 'session is busy' in str(exc).lower()
-            failure_class = 'session_busy' if busy else getattr(exc, 'reason', type(exc).__name__)
+            # Never expose credentials, receiver URLs or raw transport bodies: classify, plus redacted text.
+            lowered = str(exc).lower()
+            busy = 'session is busy' in lowered
+            owner_wait = not busy and any(m in lowered for m in _OWNER_WAIT_MARKERS)
+            failure_class = ('session_busy' if busy else 'owner_not_live' if owner_wait
+                             else getattr(exc, 'reason', type(exc).__name__))
+            error_text = {'class': type(exc).__name__, 'message': _redact_error(exc)}
         if not confirmed:
             import logging
+            error_text = error_text or {'class': 'unconfirmed_readback', 'message': 'receiver readback did not confirm'}
             logging.getLogger('user-steps').warning(
-                'Decision delivery unconfirmed operation=%s classification=%s', oid, failure_class)
+                'Decision delivery unconfirmed operation=%s classification=%s error=%r',
+                oid, failure_class, error_text['message'])
         with self._tx() as c:
             result = self._operation(c, owner, oid); op = result['operation']
             # A slow failed retry cannot downgrade a concurrently confirmed delivery.
             if op['dispatchState'] in ('delivered', 'cancelled'): return result
-            if busy or early_tool_call_id:
-                # Not a delivery failure: a busy owner refuses admission until its turn ends, and an early answer
-                # never admits a turn. Neither may exhaust the retry budget.
+            if busy or owner_wait or early_tool_call_id:
+                # Not a delivery failure: a busy owner refuses admission until its turn ends, a closed chat until
+                # it is opened, and an early answer never admits a turn. None may exhaust the retry budget.
                 op['attempts'] = max(0, op['attempts'] - 1)
             if busy: op['busyRefusals'] = op.get('busyRefusals', 0) + 1
+            if owner_wait: op['ownerWaits'] = op.get('ownerWaits', 0) + 1
             if confirmed:
                 cancelled = receipt.get('terminalCancelled') is True
                 op.update(dispatchState='cancelled' if cancelled else 'delivered', receipt=receipt)
-                op.pop('error', None)
+                op.pop('error', None); op.pop('lastError', None)
                 effect = op['intent']['effect']
                 state = 'cancelled' if cancelled else {'revise': 'superseded', 'decline': 'cancelled'}.get(effect, 'resolved')
                 resolution = {'choiceId': op['decision']['choiceId'], 'operationId': oid,
@@ -2361,8 +2382,26 @@ class ActionStore:
                 c.execute('UPDATE requests SET state=?,resolution=? WHERE namespace=? AND id=? AND revision=?',
                           (state, _json(resolution), self._ns(owner), op['requestId'], op['revision']))
             else:
-                op.update(dispatchState='failed', error=BUSY_ERROR if busy else 'Delivery unconfirmed; retry the same idempotency key.')
+                op.update(dispatchState='failed', error=BUSY_ERROR if busy else OWNER_WAIT_ERROR if owner_wait
+                          else 'Delivery unconfirmed; retry the same idempotency key.',
+                          lastError=dict(error_text, at=datetime.now(timezone.utc).isoformat()))
             c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
+            return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
+
+    def retire_operation(self, owner, oid, *, by, reason, evidence):
+        """Settle a recorded-but-undelivered decision without delivering it (its chat is gone, or the chat moved on
+        and replaying the frozen decision now would act on stale intent). Not a decision: the recorded choice
+        stays on the operation; the request closes as cancelled and nothing retries it."""
+        from datetime import datetime, timezone
+        with self._tx() as c:
+            op = self._operation(c, owner, oid)['operation']
+            if op['dispatchState'] in ('delivered', 'cancelled'): raise ActionError('Operation already settled', 409)
+            op.update(dispatchState='cancelled', retired={'by': by, 'reason': reason, 'evidence': evidence,
+                                                          'at': datetime.now(timezone.utc).isoformat()})
+            op.pop('error', None)
+            c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
+            c.execute('UPDATE requests SET state=? WHERE namespace=? AND id=? AND revision=?',
+                      ('cancelled', self._ns(owner), op['requestId'], op['revision']))
             return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
 
     def pending_owners(self):

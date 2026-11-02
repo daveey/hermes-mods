@@ -399,3 +399,45 @@ def test_limit_permission_required_is_a_boolean_flag():
     r['limits'] = [dict(key='iam', value='')]
     with pytest.raises(core.ActionError, match='nonempty string'):
         core.validate_action(r)
+
+
+class RaisingReceiver:
+    def __init__(self, message): self.message = message
+    def deliver(self, operation): raise RuntimeError(self.message)
+    def readback(self, operation, receipt): return False
+
+
+def test_failed_delivery_records_the_sanitized_error_text(tmp_path, caplog):
+    """The log said only classification=RuntimeError for 380 failures (t_01a199c0a2e3ea8b); nobody could tell a
+    permanent CAS conflict from a closed chat. The op and the log now carry the message, with secrets cut."""
+    s = store(tmp_path); r = s.create(OWNER, request())
+    op = s.decide(OWNER, decision(r))['operation']
+    secret = 'sk-' + 'a' * 40
+    msg = f'Card binding CAS conflict at https://example.com/x?token={secret} key {secret}'
+    with caplog.at_level('WARNING', logger='user-steps'):
+        got = s.dispatch(OWNER, op['operationId'], RaisingReceiver(msg))['operation']
+    assert got['dispatchState'] == 'failed' and got['attempts'] == 1
+    assert got['lastError']['message'].startswith('Card binding CAS conflict')
+    assert got['lastError']['class'] == 'RuntimeError'
+    assert secret not in json.dumps(got) and 'example.com' not in json.dumps(got)
+    assert 'Card binding CAS conflict' in caplog.text and secret not in caplog.text
+
+
+@pytest.mark.parametrize('message', [
+    'exact session has no unique live owner on this runtime',
+    'exact session is lazy or rotated',
+    'exact session is detached; reattach its owner first',
+])
+def test_closed_owner_chat_is_a_wait_not_a_counted_failure(tmp_path, message):
+    """Startup reconciliation runs before Desktop loads any chat, so prompt.admit can only answer 'no unique live
+    owner'. Counting that burned the 240-attempt budget in an hour; after that, nothing retried the decision even
+    while its chat was open (t_01a199c0a2e3ea8b)."""
+    s = store(tmp_path); r = s.create(OWNER, request())
+    op = s.decide(OWNER, decision(r))['operation']
+    for _ in range(3):
+        got = s.dispatch(OWNER, op['operationId'], RaisingReceiver(message))['operation']
+    assert got['dispatchState'] == 'failed' and got['attempts'] == 0
+    assert got['ownerWaits'] == 3 and got['error'] == core.OWNER_WAIT_ERROR
+    ok = DurableReceiver(tmp_path / 'receiver.json'); ok.fail = False
+    # attempts stayed 0, so the capped background retrier still picks it up once the chat is open
+    assert s.reconcile(OWNER, ok, max_attempts=1)[0]['operation']['dispatchState'] == 'delivered'

@@ -532,7 +532,14 @@ patch 0723) hands the session's recorded-but-undelivered decisions to the clarif
 while it waits. "The session" is the owner's stored id or a compression ancestor/descendant of it. The operations are
 then delivered with a receipt `run: {destination: clarify_early_answer, toolCallId}` (cards and inbox as usual, no
 turn admitted), so the retrier never repeats them. A busy refusal is counted in `busyRefusals`, not `attempts`, so
-waiting out a long turn cannot exhaust the retry cap. Delivery after a turn ends is still the 15 s retrier (no
+waiting out a long turn cannot exhaust the retry cap. Likewise a closed chat: `prompt.admit` answers "no unique live owner",
+"lazy or rotated" or "detached" when the owning chat isn't loaded (startup reconciliation always runs before any
+chat loads); that is counted in `ownerWaits` with the error "Its chat is not open in Desktop...", not in `attempts`,
+so the decision still delivers once the chat is opened (tests/test_decisions.py
+`test_closed_owner_chat_is_a_wait_not_a_counted_failure`). A decision card's binding CAS hashes only the columns
+the card asks (`cards.QualifiedCardDelivery._DECISION_COLUMNS`), never the Board-sync bookkeeping
+(`sync_version`, `lease_version`, `created_on`...), and still verifies older full-row fingerprints
+(tests/test_card_delivery.py `test_replication_bookkeeping_*`, `test_legacy_*`). Delivery after a turn ends is still the 15 s retrier (no
 turn-end hook). Tests: `tests/test_clarify_early.py`.
 
 ## Tests
@@ -625,6 +632,16 @@ decision silently. Core now continues such a turn after a restart (the marker st
 first tool starts); this card is the net for when that recovery misses. Tests: `tests/test_failed_decision_watch.py`
 (failed without tools -> one card, rerun same key; flat receipt shape; continued / tools ran / recent / succeeded
 -> none; decline / undelivered -> none).
+
+It also opens one card per recorded decision that was never delivered (key `user-steps-undelivered:<operationId>`):
+20+ counted delivery failures (and 10 min old), or 24 h old in any state. The card carries the operation's
+`lastError` (class + redacted message; the same text is in the `Decision delivery unconfirmed ... error=` log line).
+After fixing the cause, redeliver it, or retire it when the chat is gone or has moved on:
+`stale_watch.py --retire-operation <operationId> --reason <text> --evidence <text>` (`ActionStore.retire_operation`:
+the operation becomes `cancelled` with `retired: {by: hygiene, reason, evidence, at}`, the request `cancelled`;
+refused for an owner on another gateway or an already settled operation). Tests: `tests/test_undelivered_watch.py`
+(19 failures -> none, 20 -> one card with the error, rerun same key; closed-chat waits -> card only after 24 h;
+fresh/delivered -> none; retire settles it and stops retries; reason/evidence/gateway required).
 
 A reply that only lists decisions waiting in other chats, queues or cards is a status report. A step whose
 evidence sits in that paragraph is not minted, unless the span itself is a direct request and does not contain

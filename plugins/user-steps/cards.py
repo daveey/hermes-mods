@@ -406,10 +406,34 @@ class QualifiedCardDelivery:
         if row is None: raise RuntimeError('Unknown decision card')
         return dict(zip((column[0] for column in cur.description), row))
 
+    # What a decision card asks: an edit to any of these after binding is a real CAS conflict. Everything else
+    # on the row (sync/lease/HLC stamps the Board-service sync writes without a task event, columns a schema
+    # migration adds, retry counters) is bookkeeping. Hashing the whole row made the Board sync's sync_version /
+    # lease_version / created_on stamps fail every later delivery forever (t_01a199c0a2e3ea8b).
+    _DECISION_COLUMNS = ('id', 'title', 'body', 'assignee', 'status', 'session_id', 'idempotency_key',
+                         'human_request', 'block_kind', 'tenant')
+    _REPLICATION_COLUMNS = ('sync_version', 'field_hlc', 'lease_holder', 'lease_expires', 'lease_version',
+                            'created_on', 'ready_since', 'runs_on')
+    _FP_V2 = 'v2:'
+
     @staticmethod
-    def _fingerprint(task):
+    def _sha(value):
         import hashlib
-        return hashlib.sha256(DecisionInbox._encode(task).encode()).hexdigest()
+        return hashlib.sha256(DecisionInbox._encode(value).encode()).hexdigest()
+
+    @classmethod
+    def _fingerprint(cls, task):
+        return cls._FP_V2 + cls._sha({k: task[k] for k in cls._DECISION_COLUMNS if k in task})
+
+    @classmethod
+    def _fingerprint_matches(cls, stored, task):
+        if not isinstance(stored, str): return False
+        if stored.startswith(cls._FP_V2): return stored == cls._fingerprint(task)
+        # Legacy full-row hash: the row as bound, before the sync stamped bookkeeping (NULL) or before a
+        # migration added those columns at all. A real edit to any other column still fails.
+        cleared = {k: (None if k in cls._REPLICATION_COLUMNS else v) for k, v in task.items()}
+        dropped = {k: v for k, v in task.items() if k not in cls._REPLICATION_COLUMNS}
+        return stored in (cls._sha(task), cls._sha(cleared), cls._sha(dropped))
 
     @staticmethod
     def _idle(task):
@@ -443,7 +467,8 @@ class QualifiedCardDelivery:
                 row = c.execute('SELECT owner,request_id,revision,request,fingerprint FROM '
                                 'user_steps_card_bindings WHERE task=?', (ref['id'],)).fetchone()
                 target = (owner, request['requestId'], request['revision'], body, fp)
-                if row and tuple(row) == target: return {'ref': ref, 'revision': request['revision']}
+                if row and tuple(row[:4]) == target[:4] and self._fingerprint_matches(row[4], task):
+                    return {'ref': ref, 'revision': request['revision']}  # crash-recovery repeat, any fp version
                 if row:
                     if (tuple(row[:2]) != target[:2] or row[2] != expected_revision or
                             request['revision'] != expected_revision + 1):
@@ -493,7 +518,7 @@ class QualifiedCardDelivery:
                         raise RuntimeError('Card receipt conflict')
                 else:
                     task = self._task(c, ref['id']); self._idle(task)
-                    if binding[3] != 'bound' or binding[5] != self._fingerprint(task):
+                    if binding[3] != 'bound' or not self._fingerprint_matches(binding[5], task):
                         raise RuntimeError('Card binding CAS conflict')
             finally: c.close()
 
@@ -527,7 +552,7 @@ class QualifiedCardDelivery:
                         cid = row[1]
                     else:
                         task = self._task(c, ref['id']); self._idle(task)
-                        if binding[3] != 'bound' or binding[5] != self._fingerprint(task):
+                        if binding[3] != 'bound' or not self._fingerprint_matches(binding[5], task):
                             raise RuntimeError('Card binding CAS conflict')
                         cid = api.add_comment(c, ref['id'], 'user-steps', self._comment(op))
                         changed = c.execute('UPDATE user_steps_card_bindings SET state=?,operation=?,decision=? '

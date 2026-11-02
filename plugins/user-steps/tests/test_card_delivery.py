@@ -152,3 +152,60 @@ def test_live_execution_cannot_receive_decision(tmp_path, field, value):
     with pytest.raises(RuntimeError): adapter.deliver(op)
     with sqlite3.connect(path) as c:
         assert c.execute('SELECT count(*) FROM task_comments').fetchone()[0] == 0
+
+
+REPLICATION = {'sync_version': 2, 'lease_version': 2, 'created_on': 'macbook', 'field_hlc': 'hlc', 'ready_since': 5}
+
+
+def _add_replication_columns(path):
+    with sqlite3.connect(path) as c:
+        for col in REPLICATION:
+            c.execute(f'ALTER TABLE tasks ADD COLUMN {col}')
+
+
+def test_replication_bookkeeping_does_not_break_the_binding_cas(tmp_path):
+    """Board-service sync stamps sync/lease columns on a bound card with no task event (t_01a199c0a2e3ea8b:
+    an approved decision then failed 'Card binding CAS conflict' 298 times). Bookkeeping is not a card edit."""
+    adapter, _, path, op = setup(tmp_path, 'approve')
+    _add_replication_columns(path)  # a schema migration after binding
+    with sqlite3.connect(path) as c:
+        for col, value in REPLICATION.items():
+            c.execute(f"UPDATE tasks SET {col}=? WHERE id='card'", (value,))
+    adapter.validate(op)
+    receipt = adapter.deliver(op)
+    assert adapter.readback(op, receipt)
+
+
+def test_legacy_full_row_fingerprint_survives_later_sync_stamps(tmp_path):
+    """A binding written by the old full-row fingerprint (sync columns NULL at bind time) still verifies after
+    the sync stamps them, so the stuck bindings already in the field deliver too."""
+    adapter, _, path, op = setup(tmp_path, 'approve', bind=False)
+    _add_replication_columns(path)
+    r = op['intent']['request']
+    adapter.bind(r, r['aliases'][0])
+    with sqlite3.connect(path) as c:
+        cur = c.execute("SELECT * FROM tasks WHERE id='card'")
+        task = dict(zip([d[0] for d in cur.description], cur.fetchone()))
+        import hashlib
+        legacy = hashlib.sha256(cards.DecisionInbox._encode(task).encode()).hexdigest()
+        c.execute("UPDATE user_steps_card_bindings SET fingerprint=? WHERE task='card'", (legacy,))
+        for col, value in REPLICATION.items():
+            c.execute(f"UPDATE tasks SET {col}=? WHERE id='card'", (value,))
+    adapter.validate(op)
+    assert adapter.readback(op, adapter.deliver(op))
+
+
+def test_legacy_fingerprint_still_rejects_a_real_card_edit(tmp_path):
+    adapter, _, path, op = setup(tmp_path, 'approve', bind=False)
+    _add_replication_columns(path)
+    r = op['intent']['request']
+    adapter.bind(r, r['aliases'][0])
+    with sqlite3.connect(path) as c:
+        cur = c.execute("SELECT * FROM tasks WHERE id='card'")
+        task = dict(zip([d[0] for d in cur.description], cur.fetchone()))
+        import hashlib
+        legacy = hashlib.sha256(cards.DecisionInbox._encode(task).encode()).hexdigest()
+        c.execute("UPDATE user_steps_card_bindings SET fingerprint=? WHERE task='card'", (legacy,))
+        c.execute("UPDATE tasks SET body='edited', sync_version=3 WHERE id='card'")
+    with pytest.raises(RuntimeError, match='CAS'): adapter.validate(op)
+    with pytest.raises(RuntimeError, match='CAS'): adapter.deliver(op)
