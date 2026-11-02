@@ -91,6 +91,13 @@ say what's running, never what needs the user.
   relevant instead of claiming implementation success. Archiving is not a substitute for this conclusion.
 - Keep genuine unfinished work open. Only irreducible human actions become blocked cards with
   `human_request`; delegated judgment does not supply credentials, physical evidence or extra spend.
+- When writing an `action_request` for a blocked ask, re-read every fact you put in `limits` (quotas, accounts,
+  regions, counts) live from the target. A worker treats an approved number as exact, so a stale figure copied
+  from an older card body blocks it again on the mismatch. If ask-gate refuses it as `agent_can_do`, republish
+  only when the scope opens by naming what is new (new exposure, risk or spend), not the steps.
+- When a worker blocks on a conflict between the approval's literal limits and live facts, settle it yourself:
+  pick the reading that satisfies both the intent and the letter, and leave anything outside the approved scope
+  untouched as a named follow-up. Then `kanban_comment` the ruling and unblock, rather than asking the user again.
 - Verify completion with `hermes sessions outcome <id> --refresh --json`, then read it back; without
   `--refresh` the command only reads stored state. Live card links can restore `waiting` after a done declaration. Trace remote links to the
   owner's `kanban notify-list <task> --json` and the card's named canonical origin. Remove only a demonstrably
