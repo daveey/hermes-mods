@@ -24,6 +24,7 @@ USER_QUIET_S = 300.0          # skip a wake while the user typed in the chat thi
 MAX_WAKES_PER_HOUR = 2        # hard cap per chat, whatever the cards do
 STALE_S = 1800.0              # watchdog: unseen results / missing close-out older than this
 WATCHDOG_EVERY_S = 900.0
+STUCK_S = 24 * 3600.0         # watchdog: a pending row with nothing found working, this long
 NOTICE_RE = re.compile(r"^\s*(?:[✔⏸✖⏱🔄]\s*\[|\[chat-closeout\])")
 TAG = "[chat-closeout]"
 
@@ -83,7 +84,29 @@ def card_key(card: dict[str, Any]) -> str:
 SETTLE_FIELDS = ("id", "status", "block_kind", "completed_at", "board")
 
 
-def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = False) -> dict[str, dict[str, Any]]:
+class Cards(dict):
+    """A card read: ``{key: card}`` plus what the read could not decide. ``uncertain``: keys that may exist but
+    could not be resolved (a local collision, a board that failed to read, several inventory owners for one legacy
+    id); never evidence a card is gone. ``readable``: the remote inventory was read."""
+    uncertain: frozenset = frozenset()
+    readable: bool = True
+
+
+def canonical_view(cards: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """``cards`` plus each legacy-matched card under its canonical key (``canonical_key``, set by the plugin's
+    read for a bare / 3-part ledger key that uniquely matches one inventory owner)."""
+    extra = {c['canonical_key']: c for c in cards.values()
+             if c and c.get('canonical_key') and c['canonical_key'] not in cards}
+    if not extra:
+        return cards
+    out = Cards({**cards, **extra})
+    out.uncertain = getattr(cards, 'uncertain', frozenset())
+    out.readable = getattr(cards, 'readable', True)
+    return out
+
+
+def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = False,
+               uncertain_out: Optional[set] = None) -> dict[str, dict[str, Any]]:
     """``{id: {id, status, block_kind, title, summary, completed_at, human_request, blocked_at, board}}`` for the ids
     found on any board. ``blocked_at`` is the newest ``blocked`` event (None when the board keeps no events).
 
@@ -114,7 +137,11 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = Fa
                     found[key] = card
         if exc is not None:
             ambiguous.update(i for i in want if '/' not in i)
+            if uncertain_out is not None:
+                uncertain_out.update(i for i in want if i.count('/') == 1 and i.split('/')[0] == board)
             logger.debug("chat-closeout: card read failed on %s: %s", path, exc)
+    if uncertain_out is not None:
+        uncertain_out.update(ambiguous)
     return {key: card for key, card in found.items() if key not in ambiguous}
 
 
@@ -229,7 +256,11 @@ def is_settled(card: Optional[dict[str, Any]]) -> bool:
         if card.get('stale') is not False:
             return False
         if status in DONE_STATUSES:
-            return card.get('unfinished') is False and card.get('via') == 'origin' and bool(card.get('binding_id'))
+            if card.get('unfinished') is not False:
+                return False
+            # An origin row needs its binding; a shepherd row (core _read_remote_links) is finished only when its
+            # owner attested the close (``unfinished`` False on a fresh replica).
+            return (card.get('via') == 'origin' and bool(card.get('binding_id'))) or card.get('via') == 'shepherd'
         # Remote review is unfinished agent/verification work, not a human ask.
         return status in ('blocked', 'triage') and card.get('block_kind') in ('needs_input', 'capability')
     if status in DONE_STATUSES or status in HUMAN_STATUSES:
@@ -356,12 +387,26 @@ def closeout_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optio
     return hashlib.sha1(";".join(new).encode()).hexdigest()[:16] if new else None
 
 
+def _rename_premise(premise: str, ren: dict[str, str]) -> str:
+    card, sep, digest = premise.rpartition("@")
+    return f"{ren[card]}{sep}{digest}" if sep and card in ren else premise
+
+
 def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Coverage upkeep: a covered card that went back to work (unblocked -> running) is uncovered, so its real
     result gets a close-out; a covered card that is done/archived leaves the batch. A relayed ask whose card went
     back to work or left the batch is forgotten, so a later block (even for the same reason) is a new ask.
+    A legacy bare / 3-part key the read matched to exactly one inventory owner (``canonical_key``) is rewritten
+    to that key in the batch, the coverage and the relayed premises.
     Returns changed fields."""
-    batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
+    batch0, covered0 = set(row.get("batch") or []), set(row.get("covered") or [])
+    relayed0 = set(row.get("relayed") or [])
+    ren = {i: cards[i]["canonical_key"] for i in batch0 | covered0
+           if cards.get(i) and cards[i].get("canonical_key") and cards[i]["canonical_key"] != i}
+    batch, covered = {ren.get(i, i) for i in batch0}, {ren.get(i, i) for i in covered0}
+    relayed = {_rename_premise(p, ren) for p in relayed0}
+    if ren:
+        cards = canonical_view(cards)
     # Old ledgers retain bare and gateway/profile/id spellings alongside newer keys.
     # Only a found sibling IN THIS BATCH proves an absent spelling redundant; a missing
     # sibling (or a found same-tail card elsewhere) is not evidence of completion.
@@ -370,7 +415,6 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     remote_aliases = {"/".join((p[0], p[1], p[3])) for p in found_parts if len(p) == 4}
     aliases = {i for i in batch | covered if cards.get(i) is None
                and (i in bare_aliases or i in remote_aliases)}
-    relayed = set(row.get("relayed") or [])
     keep = {p for p in relayed if _premise_card(p) in batch - aliases
             and (is_unknown(cards.get(_premise_card(p))) or is_settled(cards[_premise_card(p)])
                  or ask_premise(_premise_card(p), cards[_premise_card(p)]) == p)}
@@ -380,16 +424,121 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     reopened = {i for i in covered if cards.get(i) is not None and not is_settled(cards[i])}
     gone = {i for i in covered & batch if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
     out: dict[str, Any] = {}
-    if reopened or gone or aliases & covered:
-        out["covered"] = covered - reopened - gone - aliases
+    new_covered = covered - reopened - gone - aliases
+    new_batch = batch - gone - aliases
+    if new_covered != covered0:
+        out["covered"] = new_covered
     if reopened:  # the same id set may settle again: its old key must not suppress the new close-out
         out.update(done_sig=None, claim_sig=None)
-    if gone or aliases & batch:
-        out["batch"] = batch - gone - aliases
+    if new_batch != batch0:
+        out["batch"] = new_batch
         keep = {p for p in keep if _premise_card(p) not in gone}
-    if keep != relayed:
+    if keep != relayed0:
         out["relayed"] = keep
     return out
+
+
+# ---- unlinking: an entry nothing can find any more ---------------------------------------------------------------
+UNLINK_AFTER_S = 24 * 3600.0   # healthy observation before a missing entry leaves the batch
+UNLINK_MAX_GAP_S = 300.0       # a longer gap between two observations is not observation (an outage, a sleep)
+
+
+def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, healthy: Callable[[], bool],
+                   now: float, mono: float, pid: Optional[int] = None) -> dict[str, Any]:
+    """Age batch entries that match nothing: no local card, no inventory row, and not ``cards.uncertain``.
+
+    Only time observed while the inventory is fresh and readable (``healthy()``) counts. Each observation adds the
+    time since the previous one, as far as this process's monotonic clock confirms it (a lid sleep moves the wall
+    clock only), and nothing across a gap over ``UNLINK_MAX_GAP_S``, an unhealthy observation, or a process change.
+    Excluded time never resets what was already observed. ``unlinked`` (ledger column) keeps, per entry,
+    ``since`` (first seen missing, wall), ``observed`` (seconds), and the last observation (``at``/``mono``/
+    ``pid``); after ``UNLINK_AFTER_S`` observed the entry leaves the batch and coverage and becomes
+    ``{"removed": at}`` until a close-out names it. A found entry forgets its missing time. Returns changed fields."""
+    pid = os.getpid() if pid is None else pid
+    uncertain = getattr(cards, "uncertain", frozenset())
+    batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
+    before = {k: dict(v) for k, v in (row.get("unlinked") or {}).items() if isinstance(v, dict)}
+    state = {k: dict(v) for k, v in before.items() if "removed" in v or k in batch}
+    missing = {k for k in batch if cards.get(k) is None and k not in uncertain}
+    for k in batch - missing:
+        if cards.get(k) is not None and k in state and "removed" not in state[k]:
+            state.pop(k)  # found again: a later absence starts its own clock
+    is_healthy: Optional[bool] = None
+    removed: set[str] = set()
+    for k in sorted(missing):
+        e = state.get(k)
+        if is_healthy is None:
+            is_healthy = bool(healthy())
+        if not is_healthy:
+            if e is not None and "removed" not in e:
+                e["mono"] = None  # the outage is excluded: the next healthy observation starts a new interval
+            continue
+        if e is None or "removed" in e:
+            state[k] = {"since": now, "observed": 0.0, "at": now, "mono": mono, "pid": pid}
+            continue
+        if e.get("pid") == pid and e.get("mono") is not None and e.get("at") is not None:
+            step = min(now - float(e["at"]), mono - float(e["mono"]))
+            if 0 < step <= UNLINK_MAX_GAP_S:
+                e["observed"] = float(e.get("observed") or 0) + step
+        e.update(at=now, mono=mono, pid=pid)
+        if float(e.get("observed") or 0) >= UNLINK_AFTER_S:
+            state[k] = {"removed": now, "since": e.get("since")}
+            removed.add(k)
+    out: dict[str, Any] = {}
+    if state != before:
+        out["unlinked"] = state
+    if removed:
+        out["batch"] = batch - removed
+        out["covered"] = covered - removed
+        out["relayed"] = {p for p in row.get("relayed") or [] if _premise_card(p) not in removed}
+        logger.info("chat-closeout: %s no longer waits on %s (missing for %d h of fresh inventory reads)",
+                    row.get("session_id"), ", ".join(sorted(removed)), int(UNLINK_AFTER_S / 3600))
+    return out
+
+
+def unlinked_removed(row: dict[str, Any]) -> list[str]:
+    """Entries unlinked since the last close-out, which the next close-out names once."""
+    return sorted(k for k, v in (row.get("unlinked") or {}).items() if isinstance(v, dict) and "removed" in v)
+
+
+def without_removed(unlinked: Optional[dict]) -> dict:
+    return {k: v for k, v in (unlinked or {}).items() if not (isinstance(v, dict) and "removed" in v)}
+
+
+# ---- one-time upgrade: shepherd rows that finished before they could settle ------------------------------------
+UPGRADE_SHEPHERD_KEY = "upgrade:shepherd-settle-v1"
+
+
+def shepherd_finished(card: Optional[dict[str, Any]]) -> bool:
+    return bool(card and card.get("remote") and card.get("via") == "shepherd" and is_settled(card)
+                and card.get("status") in DONE_STATUSES)
+
+
+def upgrade_shepherd_rows(ledger: "Ledger", read: Callable[[list[str]], dict]) -> bool:
+    """Cover, silently, the shepherd cards that finished while no release could settle them: they would otherwise
+    all close out at once on upgrade. Finished entries leave the batch (as a close-out leaves them), one INFO line
+    per changed row; nothing wakes. True when complete: the inventory was readable and no batch entry is a stale
+    shepherd row (that one could still turn out finished). Incomplete passes retry; the durable marker is set only
+    on completion, so later finishes close out normally."""
+    complete = True
+    for row in ledger.pending():
+        cards = read(row["batch"])
+        if not getattr(cards, "readable", True):
+            complete = False
+        if any(c and c.get("remote") and c.get("via") == "shepherd" and c.get("stale") is not False
+               for c in cards.values()):
+            complete = False
+        fin = {k for k in row["batch"] if shepherd_finished(cards.get(k))}
+        if not fin:
+            continue
+        batch = set(row["batch"]) - fin
+        ledger.write(row["session_id"], batch=batch, covered=set(row.get("covered") or []) - fin,
+                     relayed={p for p in row.get("relayed") or [] if _premise_card(p) in batch})
+        logger.info("chat-closeout: upgrade covered %d shepherd-finished card(s) of %s without a wake: %s",
+                    len(fin), row["session_id"], ", ".join(sorted(fin)))
+    if complete:
+        ledger.meta_set(UPGRADE_SHEPHERD_KEY, str(time.time()))
+    return complete
 
 
 def pending_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optional[str]:
@@ -572,6 +721,7 @@ CREATE TABLE IF NOT EXISTS waiting (
   relayed TEXT NOT NULL DEFAULT '[]'     -- ask premises (card@hash) the chat was told about (ask relay)
 );
 CREATE TABLE IF NOT EXISTS unseen_seen (session_id TEXT PRIMARY KEY, since REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS stuck_seen (session_id TEXT PRIMARY KEY, since REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS flag_resolutions (key TEXT PRIMARY KEY, at REAL NOT NULL, evidence TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -581,7 +731,9 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 _MIGRATE = (("covered", "TEXT NOT NULL DEFAULT '[]'"), ("closing", "TEXT"),
             ("wakes", "TEXT NOT NULL DEFAULT '[]'"), ("wake_count", "INTEGER NOT NULL DEFAULT 0"),
             ("relayed", "TEXT NOT NULL DEFAULT '[]'"),
-            ("retry_after", "REAL"), ("failure_since", "REAL"))
+            ("retry_after", "REAL"), ("failure_since", "REAL"),
+            # {key: missing-entry clock, or {"removed": at} until a close-out names it} (track_unlinked)
+            ("unlinked", "TEXT NOT NULL DEFAULT '{}'"))
 _JSON_SETS = ("batch", "open", "covered", "relayed")
 
 
@@ -626,7 +778,8 @@ class Ledger:
 
     def write(self, sid: str, **fields: Any) -> None:
         enc = {k: (json.dumps(sorted(v)) if k in _JSON_SETS else
-                   json.dumps(list(v)) if k in ("closing", "wakes") and v is not None else v)
+                   json.dumps(list(v)) if k in ("closing", "wakes") and v is not None else
+                   json.dumps(dict(v or {}), sort_keys=True) if k == "unlinked" else v)
                for k, v in fields.items()}
         cols = ", ".join(enc)
         sets = ", ".join(f"{k}=excluded.{k}" for k in enc)
@@ -735,18 +888,43 @@ class Ledger:
 
     def unseen_since(self, current: dict[str, int], now: float) -> dict[str, float]:
         """Track since when each chat has had unseen kanban results; returns ``{sid: since}`` for current ones."""
+        return self._since("unseen_seen", set(current), now)
+
+    def stuck_since(self, current: Iterable[str], now: float) -> dict[str, float]:
+        """Since when each pending row has had no found, working entry (watchdog ``stuck``)."""
+        return self._since("stuck_seen", set(current), now)
+
+    def _since(self, table: str, current: set[str], now: float) -> dict[str, float]:
         with self._lock:
             c = self._conn()
             try:
-                have = {r["session_id"]: r["since"] for r in c.execute("SELECT * FROM unseen_seen")}
-                for sid in set(have) - set(current):
-                    c.execute("DELETE FROM unseen_seen WHERE session_id=?", (sid,))
-                for sid in set(current) - set(have):
-                    c.execute("INSERT OR IGNORE INTO unseen_seen VALUES (?, ?)", (sid, now))
+                have = {r["session_id"]: r["since"] for r in c.execute(f"SELECT * FROM {table}")}
+                for sid in set(have) - current:
+                    c.execute(f"DELETE FROM {table} WHERE session_id=?", (sid,))
+                for sid in current - set(have):
+                    c.execute(f"INSERT OR IGNORE INTO {table} VALUES (?, ?)", (sid, now))
                     have[sid] = now
             finally:
                 c.close()
         return {sid: have[sid] for sid in current}
+
+    def meta_get(self, key: str) -> Optional[str]:
+        with self._lock:
+            c = self._conn()
+            try:
+                r = c.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+                return r[0] if r else None
+            finally:
+                c.close()
+
+    def meta_set(self, key: str, value: str) -> None:
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                          (key, value))
+            finally:
+                c.close()
 
 
 def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict],
@@ -778,6 +956,10 @@ def _row(r) -> Optional[dict[str, Any]]:
         d["closing"] = json.loads(d["closing"]) if d.get("closing") else None
     except ValueError:
         d["closing"] = None
+    try:
+        d["unlinked"] = dict(json.loads(d.get("unlinked") or "{}"))
+    except (ValueError, TypeError):
+        d["unlinked"] = {}
     return d
 
 
@@ -796,11 +978,11 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
     open_now = set(open_ids)
     # Old-lineage cards (compression rotated the id) are still in the batch: keep them open until settled.
     batch = set(row.get("batch") or []) | open_now
-    cards = read(sorted(batch)) if batch else {}
-    open_now |= {i for i in batch if not is_settled(cards.get(i))}
+    cards = canonical_view(read(sorted(batch))) if batch else {}
     view = {**row, "batch": sorted(batch)}
     fix = reconcile(view, cards)
     view.update(fix)
+    open_now |= {i for i in view["batch"] if not is_settled(cards.get(i))}
     batch, covered = set(view["batch"]), set(view.get("covered") or [])
     key = closeout_key(view, cards)
     fields: dict[str, Any] = {"open": open_now, "stamped_at": now}
@@ -977,6 +1159,9 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
             state = f"blocked ({c.get('block_kind') or 'needs a human'})"
         handoff = " ".join(str(c.get("summary") or "").split())[:700] or "(no handoff)"
         lines.append(f"- {tid} [{state}] {c.get('title') or ''}{_ask_line(c, now)}\n  handoff: {handoff}")
+    for tid in unlinked_removed(row):
+        lines.append(f"- {tid}: no longer linked to this chat (no board or remote inventory has had it for "
+                     f"{int(UNLINK_AFTER_S / 3600)} h of healthy reads; this chat stopped waiting on it)")
     lines.append(
         "Write the closing answer for the user now: what each card delivered (from its handoff; check any claim you "
         "can cheaply verify), and for a card blocked on the user the exact one-line ask. For each problem the "

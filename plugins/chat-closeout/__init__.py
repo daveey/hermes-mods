@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -49,6 +50,7 @@ TICK_S = float(os.environ.get("CHAT_CLOSEOUT_TICK_S", "30"))
 _state: dict[str, Any] = {}
 _thread_lock = threading.Lock()
 _waiting_lock = threading.Lock()
+_upgrade_lock = threading.Lock()
 
 
 # ---- environment -----------------------------------------------------------------------------------------------
@@ -111,40 +113,145 @@ def remote_cards() -> list[dict]:
     return [card for card in ksa._remote_links() if card.get('via') != 'origin'] + rows
 
 
+def hub_db_path() -> Optional[Path]:
+    """This gateway's hermes-hub replica (core ``_hub_db_path``), or None."""
+    try:
+        from hermes_cli import kanban_session_activity as ksa
+        return ksa._hub_db_path()
+    except Exception:
+        return None
+
+
+def _hub_fresh() -> bool:
+    """The hub replica synced recently and is not offline (core's ``HUB_STALE_AFTER_S`` rule). No replica, or an
+    unreadable one, is not fresh: nothing then counts as a healthy observation of a missing entry."""
+    try:
+        from hermes_cli import kanban_session_activity as ksa
+        path = ksa._hub_db_path()
+        if path is None:
+            return False
+        conn = core.ro_connect(Path(path))
+        try:
+            meta = dict(conn.execute("SELECT k, v FROM meta").fetchall())
+        finally:
+            conn.close()
+        last_ok = float(meta.get("last_ok") or 0)
+        return not meta.get("offline_since") and 0 <= time.time() - last_ok <= float(ksa.HUB_STALE_AFTER_S)
+    except Exception:
+        logger.debug("chat-closeout: hub freshness unavailable", exc_info=True)
+        return False
+
+
+def _replica_completed_at(cards: list[dict]) -> dict[int, float]:
+    """``{id(card): completed_at}`` from the hub replica's task records (``[profile/]board/id`` under the owner
+    gateway) for finished shepherd rows that carry no completion time. Read-only; an unreadable replica gives {}."""
+    path = hub_db_path()
+    if path is None or not cards:
+        return {}
+    out: dict[int, float] = {}
+    try:
+        conn = core.ro_connect(Path(path))
+    except Exception:
+        return {}
+    try:
+        for card in cards:
+            rk = "/".join(str(card[k]) for k in ("profile", "board", "id") if card.get(k))
+            r = conn.execute("SELECT data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+                             (card.get("gateway"), rk)).fetchone()
+            if r is None:
+                continue
+            data = json.loads(r[0])
+            if str(data.get("id")) == str(card["id"]) and data.get("status") in core.DONE_STATUSES \
+                    and data.get("completed_at") is not None:
+                out[id(card)] = float(data["completed_at"])
+    except Exception:
+        logger.debug("chat-closeout: replica completion times unavailable", exc_info=True)
+    finally:
+        conn.close()
+    return out
+
+
 def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict]]] = None,
                light: bool = False) -> dict:
-    """Local and remote cards by ledger key. ``light``: local cards carry only ``core.SETTLE_FIELDS``."""
-    cards = core.read_cards(board_paths(), ids, light=light)
+    """Local and remote cards by ledger key. ``light``: local cards carry only ``core.SETTLE_FIELDS``.
+
+    Returns a ``core.Cards``: ``uncertain`` names keys that may exist but could not be resolved (never evidence
+    they are gone), ``readable`` whether the remote inventory was read. A legacy bare / 3-part key with no local
+    match that matches exactly one inventory owner key by card id comes back as that card with ``canonical_key``
+    (``core.reconcile`` rewrites the ledger); several owners leave it unresolved and uncertain. A finished shepherd
+    row with no completion time takes it from another inventory row of the same owner key, else the hub replica,
+    so its transcript acknowledgement can be proven."""
+    uncertain: set[str] = set()
+    cards = core.read_cards(board_paths(), ids, light=light, uncertain_out=uncertain)
+    out = core.Cards()
     try:
         remote = (remote_inventory or remote_cards)()
     except Exception:
         # Qualified local cards remain usable. Old bare IDs have lost ownership:
         # without the remote inventory they cannot safely resolve to local done.
         logger.debug('chat-closeout: origin projection unavailable', exc_info=True)
-        return {key: card for key, card in cards.items() if '/' in key}
+        out.update({key: card for key, card in cards.items() if '/' in key})
+        out.uncertain = frozenset(uncertain | {i for i in ids if i not in out})
+        out.readable = False
+        return out
     want = set(ids)
+    local_bare = {i for i in want if '/' not in i and (i in cards or i in uncertain)}
     # Every key shape ends in the card id except a legacy remote row's stored ``key`` (then card_key IS that key):
     # only cards that could hit ``want`` pay for card_key (the inventory holds thousands of rows; a pass wants a
     # few hundred ids).
     tails = {str(i).rsplit('/', 1)[-1] for i in want}
+    merged: dict[str, dict] = {}
+    times: dict[str, float] = {}
+    by_id: dict[str, set[str]] = {}
     for card in remote:
         cid = str(card['id'])
-        cards.pop(cid, None)  # ambiguous historical bare-ID ledger
+        if cid in cards:
+            cards.pop(cid)  # ambiguous historical bare-ID ledger
+            uncertain.add(cid)
         if cid not in tails and card.get('key') not in want:
             continue
         key = core.card_key(card)
-        if key in want:
-            previous = cards.get(key)
-            # Several origin bindings can name one owner; no unsafe first match.
-            if previous is None or not core.is_settled(card):
-                cards[key] = card
-    return cards
+        by_id.setdefault(cid, set()).add(key)
+        if card.get('completed_at') is not None:
+            times.setdefault(key, float(card['completed_at']))
+        previous = merged.get(key)
+        # Several origin bindings can name one owner; no unsafe first match.
+        if previous is None or not core.is_settled(card):
+            merged[key] = card
+    for key in want & set(merged):
+        cards[key] = merged[key]
+    for key in want - set(cards):
+        parts = key.split('/')
+        if len(parts) not in (1, 3) or key in local_bare:
+            continue
+        owners = by_id.get(parts[-1]) or set()
+        if len(owners) == 1:
+            canonical = next(iter(owners))
+            cards[key] = {**merged[canonical], 'canonical_key': canonical}
+        elif owners:
+            uncertain.add(key)
+    fill = [c for c in cards.values() if c.get('remote') and c.get('via') == 'shepherd'
+            and c.get('status') in core.DONE_STATUSES and c.get('completed_at') is None]
+    if fill:
+        replica = _replica_completed_at([c for c in fill if core.card_key(c) not in times])
+        fill_ids = {id(c) for c in fill}
+        for key, card in list(cards.items()):
+            if id(card) in fill_ids:
+                at = times.get(core.card_key(card), replica.get(id(card)))
+                if at is not None:
+                    cards[key] = {**card, 'completed_at': at}  # a copy: inventory rows are core's cache
+    out.update(cards)
+    out.uncertain = frozenset(uncertain & want)
+    return out
 
 
 def _pass_reader(light: bool = False) -> Callable[[list[str]], dict]:
     """``read_cards`` for one pass over the ledger: the remote inventory (a full hub-replica projection) and the
     local boards are read once and reused for every row, not once per pending row. A failed read fails every row
-    the same way. ``light`` for a pass that only decides settlement (the sidebar's waiting source)."""
+    the same way. ``light`` for a pass that only decides settlement (the sidebar's waiting source).
+
+    ``read.healthy()``: the inventory was read, no replica row is stale, and the hub replica is fresh: only such a
+    pass counts as observing that an entry is missing (``core.track_unlinked``)."""
     memo: list[tuple[Optional[list[dict]], Optional[BaseException]]] = []
 
     def inventory() -> list[dict]:
@@ -174,9 +281,49 @@ def _pass_reader(light: bool = False) -> Callable[[list[str]], dict]:
             return read_cards(ids, remote_inventory=inventory, light=light)
         if "cards" not in union:
             union["cards"] = read_cards(sorted(union["ids"]), remote_inventory=inventory, light=light)
-        return {key: card for key, card in union["cards"].items() if key in want}
+        full = union["cards"]
+        out = core.Cards({key: card for key, card in full.items() if key in want})
+        out.uncertain = frozenset(set(getattr(full, "uncertain", ())) & want)
+        out.readable = getattr(full, "readable", True)
+        return out
 
+    def healthy() -> bool:
+        if "healthy" not in union:
+            try:
+                rows = inventory()
+            except Exception:
+                union["healthy"] = False
+            else:
+                union["healthy"] = (not any(r.get("stale") is not False and r.get("via") != "origin"
+                                            for r in rows) and _hub_fresh())
+        return union["healthy"]
+
+    read.healthy = healthy  # type: ignore[attr-defined]
     return read
+
+
+def ensure_upgraded(read: Optional[Callable[[list[str]], dict]] = None) -> bool:
+    """Run the one-time shepherd upgrade (``core.upgrade_shepherd_rows``) before anything can wake or brief a chat.
+    Every waking path calls this first. Durable marker in the ledger; cheap once done."""
+    led = ledger()
+    if _state.get("upgraded") == str(led.path):
+        return True
+    with _upgrade_lock:
+        if _state.get("upgraded") == str(led.path):
+            return True
+        done = led.meta_get(core.UPGRADE_SHEPHERD_KEY) is not None
+        if not done:
+            done = core.upgrade_shepherd_rows(led, read or _pass_reader())
+        if done:
+            _state["upgraded"] = str(led.path)
+        return done
+
+
+def _upgraded(read: Optional[Callable[[list[str]], dict]] = None) -> None:
+    try:
+        ensure_upgraded(read)
+    except Exception:
+        logger.warning("chat-closeout: shepherd upgrade pass failed; retrying next pass", exc_info=True)
 
 
 # One waiting pass (``_proof_pass``): its connections, SessionDB and lineage lookups, reused by every proof in it.
@@ -294,6 +441,7 @@ def post_llm_call(session_id: str = "", platform: str = "", **_: Any) -> None:
     if not _eligible(session_id, platform):
         return
     try:
+        _upgraded()
         observed = _state.setdefault("observed", {}).pop(session_id, None)
         asked = _state.setdefault("observed_ask", {}).pop(session_id, None)
         out = core.record_turn_end(ledger(), session_id, open_card_ids(session_id), read_cards,
@@ -320,6 +468,7 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
     try:
         _state.setdefault("observed", {}).pop(session_id, None)
         _state.setdefault("observed_ask", {}).pop(session_id, None)
+        _upgraded()
         row = ledger().get(session_id)
         if not row or not row.get("batch"):
             return None
@@ -339,8 +488,10 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         if not key or row.get("closing") is not None:
             return None  # nothing new to report, or the waker already briefed this turn
         _state["observed"][session_id] = key
-        ledger().write(session_id, closing=sorted(row["batch"]))
-        return {"context": core.closeout_prompt(row, cards, now=time.time())}
+        prompt = core.closeout_prompt(row, cards, now=time.time())
+        # the brief names each unlinked entry; this turn is its one mention
+        ledger().write(session_id, closing=sorted(row["batch"]), unlinked=core.without_removed(row.get("unlinked")))
+        return {"context": prompt}
     except Exception:
         logger.debug("chat-closeout pre_llm_call failed", exc_info=True)
         return None
@@ -410,7 +561,9 @@ def waiting_source() -> dict[str, list[str]]:
         try:
             with _proof_pass():
                 # Settlement only: the light read skips the per-card handoff/ask subqueries nobody reads here.
-                out = core.pending_closeouts(ledger(), _pass_reader(light=True), proof=session_proof)
+                reader = _pass_reader(light=True)
+                _upgraded(reader)
+                out = core.pending_closeouts(ledger(), reader, proof=session_proof)
         except Exception:
             logger.debug("chat-closeout waiting source failed", exc_info=True)
             out = {}
@@ -460,17 +613,22 @@ def _unseen_counts() -> Optional[dict[str, int]]:
 def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]] = None,
               unseen: Optional[dict[str, int]] = None, last_user: Optional[Callable[[list[str]], float]] = None,
               read: Optional[Callable[[list[str]], dict]] = None,
-              proof: Optional[Callable[[str, str, dict], bool]] = None) -> list[dict]:
+              proof: Optional[Callable[[str, str, dict], bool]] = None, mono: Optional[float] = None,
+              healthy: Optional[Callable[[], bool]] = None) -> list[dict]:
     """One close-out pass over the ledger. Returns what it did (for logs/tests). One remote-inventory read per
     tick, shared by every pending row, and one ``_proof_pass`` (state.db connections, compression tips and
-    transcript proofs shared by every row, as the sidebar's waiting pass does)."""
+    transcript proofs shared by every row, as the sidebar's waiting pass does). ``healthy`` (default: the pass
+    reader's ``healthy``) says whether this pass observes missing entries (``core.track_unlinked``)."""
     with _proof_pass():
-        return _wake_tick(now=now, wake=wake, unseen=unseen, last_user=last_user, read=read, proof=proof)
+        return _wake_tick(now=now, wake=wake, unseen=unseen, last_user=last_user, read=read, proof=proof,
+                          mono=mono, healthy=healthy)
 
 
-def _wake_tick(*, now, wake, unseen, last_user, read, proof) -> list[dict]:
+def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=None) -> list[dict]:
     now = time.time() if now is None else now
+    mono = time.monotonic() if mono is None else mono
     read = read or _pass_reader()
+    healthy = healthy or getattr(read, "healthy", None) or (lambda: False)
     if wake is None:
         srv = _server()
         if srv is None:
@@ -479,6 +637,8 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof) -> list[dict]:
     unseen = _unseen_counts() if unseen is None else unseen
     if unseen is None:
         return []
+    if not ensure_upgraded(read):
+        logger.debug("chat-closeout: shepherd upgrade incomplete (inventory unreadable or stale); retrying")
     last_user = last_user or (lambda ids: core.last_user_at(state_dbs(), ids, pool=_pass_pool()))
     led = ledger()
     done: list[dict] = []
@@ -490,8 +650,9 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof) -> list[dict]:
             led.write(sid, batch=[], open=[], failure_since=None, retry_after=0)
             logger.info("chat-closeout: dropped ledger row of non-chat session %s", sid)
             continue
-        cards = read(row["batch"])
+        cards = core.canonical_view(read(row["batch"]))
         fix = core.reconcile(row, cards)
+        fix.update(core.track_unlinked({**row, **fix}, cards, healthy=healthy, now=now, mono=mono))
         fix.update(core.reconcile_done({**row, **fix}, cards,
                                        lambda t, c, sid=sid: (proof or session_proof)(sid, t, c)))
         if fix:
@@ -521,10 +682,12 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof) -> list[dict]:
         # Mark the batch covered and the turn as a close-out BEFORE it starts: the turn's own end (or a card it
         # creates) must never read as a fresh settled batch.
         wakes = [t for t in row.get("wakes") or [] if 0 <= now - float(t) < 3600] + [now]
+        prompt = core.closeout_prompt(row, cards, now=now)  # names each unlinked entry: this turn is its mention
         led.write(sid, covered=set(row.get("covered") or []) | set(new_ids), closing=sorted(row["batch"]),
-                  wakes=wakes, wake_count=int(row.get("wake_count") or 0) + 1)
+                  wakes=wakes, wake_count=int(row.get("wake_count") or 0) + 1,
+                  unlinked=core.without_removed(row.get("unlinked")))
         try:
-            result = wake(sid, core.closeout_prompt(row, cards, now=now), display_kind="kanban_notice",
+            result = wake(sid, prompt, display_kind="kanban_notice",
                           display_metadata={"display_text": core.notice_text(row, cards), "closeout": True,
                                             "task_ids": sorted(row["batch"])},
                           label="chat-closeout")
@@ -538,7 +701,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof) -> list[dict]:
         else:
             # busy/refused/error: undo the coverage + count; a later tick (or the owning backend) retries
             led.write(sid, covered=set(row.get("covered") or []), closing=None, wakes=row.get("wakes") or [],
-                      wake_count=int(row.get("wake_count") or 0))
+                      wake_count=int(row.get("wake_count") or 0), unlinked=row.get("unlinked") or {})
             led.release(sid, due, result, now=now,
                         backoff=0 if result == "busy" else owner_wake.CLAIM_TTL_S)
             logger.info("chat-closeout: close-out wake of %s deferred (%s)", sid, result)
@@ -716,7 +879,7 @@ MAX_POST_ATTEMPTS = 3  # failed card filings per incident key before one ERROR a
 def _incident_session(key: str) -> Optional[str]:
     """The chat a watchdog incident key is about: named in the key, or (handoff keys) in its handoff row."""
     parts = key.split(":")
-    if len(parts) == 4 and parts[1] in ("unseen", "no-closeout", "ask-failed"):
+    if len(parts) == 4 and parts[1] in ("unseen", "no-closeout", "ask-failed", "stuck"):
         return parts[2] or None
     if len(parts) == 3 and parts[1] == "handoff":
         try:
@@ -835,7 +998,7 @@ def file_card(title: str, body: str, key: str) -> str:
         return tid
 
 
-_WATCHDOG_KEY = re.compile(r"^chat-closeout:(?:unseen|no-closeout|ask-failed):[^:]+:[^:]+$"
+_WATCHDOG_KEY = re.compile(r"^chat-closeout:(?:unseen|no-closeout|ask-failed|stuck):[^:]+:[^:]+$"
                            r"|^chat-closeout:handoff:[^:]+$")
 
 
@@ -849,6 +1012,12 @@ def _cleared_evidence(key: str, unseen: dict[str, int], led) -> str:
         if row.get("done_sig") == parts[3]:
             return f"done_sig matched {parts[3]}; done_at={row.get('done_at')}"
         return f"batch moved on; settled_sig={row.get('settled_sig')!r}, batch={row.get('batch')!r}"
+    if parts[1] == "stuck":
+        row = led.get(parts[2]) or {}
+        if not row.get("batch"):
+            return f"batch of {parts[2]} cleared (closed out or every entry resolved)"
+        return (f"a found entry is working again or every entry resolved for {parts[2]}; "
+                f"batch={sorted(row.get('batch') or [])!r}")
     if parts[1] == "handoff":
         conn = routing._conn(led)
         try:
@@ -931,6 +1100,7 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
     read = read or _pass_reader()
+    _upgraded(read)
     led = ledger()
     unseen = _unseen_counts() if unseen is None else unseen
     if unseen is None:
@@ -983,6 +1153,29 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
             candidates.append((key, f"Ask relay stuck for chat {row['session_id']}",
                                f"Chat {row['session_id']}: ask relay has not been delivered for "
                                f"{int((now-since)/60)} min (last result: {row.get('wake_result')})."))
+    # A row pending for a day with nothing found still working and something nobody can resolve (missing, or an
+    # unknown/stale remote row): no close-out can ever run for it. One card per row episode (key = the persisted
+    # first-seen time). Wall age >= STUCK_S plus STALE_S of this process's monotonic observation, so a lid sleep
+    # alone never files it; a full day of uptime is not required (a backend restart would never let it fire).
+    stuck: dict[str, list[str]] = {}
+    for row in led.pending():
+        cards = read(row["batch"])
+        unknown = [t for t in row["batch"] if core.is_unknown(cards.get(t))]
+        working = [t for t in row["batch"] if not core.is_unknown(cards.get(t)) and not core.is_settled(cards.get(t))]
+        if unknown and not working:
+            stuck[row["session_id"]] = unknown
+    for sid, since in led.stuck_since(stuck, now).items():
+        key = f"chat-closeout:stuck:{sid}:{int(since)}"
+        observed.add(key)
+        first = seen_mono.setdefault(key, mono)
+        if now - since < core.STUCK_S or mono - first < core.STALE_S:
+            continue
+        candidates.append((key, f"Chat {sid} waits on cards nothing can find",
+                           f"Chat {sid} has waited {int((now - since) / 3600)} h on card(s) that no board or remote "
+                           f"inventory resolves ({', '.join(stuck[sid][:6])}) and nothing it waits on is still "
+                           "working, so no close-out can run. Check whether these cards moved, were deleted, or "
+                           "are on a gateway this one no longer syncs; reconcile the ledger row or restore the "
+                           "link. Entries missing through 24 h of fresh inventory reads are unlinked automatically."))
     for handoff in routing.stalled(led, now, 0):
         key = f"chat-closeout:handoff:{handoff['id']}"
         observed.add(key)
@@ -1075,7 +1268,7 @@ def start_thread() -> Optional[threading.Event]:
 
 
 def register(ctx) -> None:
-    logger.info("chat-closeout: loaded relay-stamp-keep-v5 module=%s core=%s", __file__, core.__file__)
+    logger.info("chat-closeout: loaded shepherd-settle-v6 module=%s core=%s", __file__, core.__file__)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("pre_final_gate", pre_final_gate)
