@@ -160,7 +160,7 @@ class DigestSynthetic(unittest.TestCase):
         self.assertTrue(second["prev"].endswith("Want me to also restart the pod?"))
         self.assertIn("…[clipped]…", second["prev"])
         self.assertLessEqual(len(second["prev"]), sd.PREV_HEAD + sd.PREV_TAIL + 20)
-        self.assertEqual(dg["digest_v"], 6)
+        self.assertEqual(dg["digest_v"], sd.DIGEST_V)
 
     def test_user_turn_after_an_interrupted_model_wait_carries_its_reason(self):
         """Core stamps display_metadata.interrupt on the interrupted row; the next user turn names why the turn
@@ -190,6 +190,32 @@ class ExcludeProfileGlob(unittest.TestCase):
         self.assertTrue(sd.excluded_profile("alpha", ["alpha"]))  # exact names still work
         self.assertFalse(sd.excluded_profile("alpha-follow", ["alpha"]))
 
+
+
+
+class DigestUserTurnClipping(unittest.TestCase):
+    def test_long_user_correction_preserves_head_tail_and_budget(self):
+        text = "I vetoed this: " + "quoted background " * 40 + " by accident, it is approved"
+        clipped = sd.clip_user_turn(text)
+        self.assertTrue(clipped.startswith("I vetoed this:"))
+        self.assertTrue(clipped.endswith("by accident, it is approved"))
+        self.assertEqual(len(clipped), sd.TURN_CHARS)
+        self.assertEqual(sd.clip_user_turn("short"), "short")
+
+    def test_distinct_long_turns_keep_correction_and_metadata(self):
+        prefix = "quoted material " * 50
+        a, b = prefix + "actually approved", prefix + "actually vetoed"
+        t = time.time() - 100
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, [("user", a, t, 1, 0, None, None, "u1"),
+                         ("user", b, t + 1, 1, 0, None, None, "u2")])
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        self.assertEqual(len(dg["user_turns"]), 2)
+        self.assertTrue(dg["user_turns"][0]["text"].endswith("actually approved"))
+        self.assertTrue(dg["user_turns"][1]["text"].endswith("actually vetoed"))
+        self.assertTrue(dg["user_turns"][0]["text_truncated"])
+        self.assertEqual(dg["user_turns"][0]["text_original_chars"], len(a))
 
 if __name__ == "__main__":
     unittest.main()

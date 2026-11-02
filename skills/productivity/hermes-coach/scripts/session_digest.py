@@ -15,7 +15,8 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, fnmatch, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 6            # v6: each user turn carries `prev`, the agent reply before it (head+tail clip), for the
+DIGEST_V = 7            # v7: bounded user-turn head/tail + explicit clipping metadata
+                        # v6: each user turn carries `prev`, the agent reply before it (head+tail clip), for the
                         #     self-heal backstop judge (without it \"why didnt this work\" reads as a new issue)
                         # v5: Kanban notices, cron prompts, compaction/continuation notes are synthetic, not user turns
                         # v4: `features` (content-free feature-use counts for curriculum adoption checks)
@@ -186,6 +187,16 @@ def trunc(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 15] + " …[truncated]"
 
 
+def clip_user_turn(text: str, budget: int = TURN_CHARS) -> str:
+    """Retain a correction after quoted material, within the existing redacted-text budget."""
+    if len(text) <= budget:
+        return text
+    marker = " …[clipped]… "
+    head = (budget - len(marker)) // 2
+    tail = budget - len(marker) - head
+    return text[:head] + marker + text[-tail:]
+
+
 def clip_ends(s: str, head: int = PREV_HEAD, tail: int = PREV_TAIL) -> str:
     s = (s or "").strip()
     return s if len(s) <= head + tail + 20 else s[:head] + " …[clipped]… " + s[-tail:]
@@ -305,9 +316,12 @@ def digest_db(profile, db, host, since):
                     if rx.search(text):
                         sig[k] += 1
                 n_real += 1
-                if users and users[-1]["text"] == trunc(text, TURN_CHARS):
+                if users and users[-1]["text"] == clip_user_turn(text):
                     continue  # the same turn persisted twice (retry / steer echo)
-                turn = {"t": round(m["timestamp"]), "text": trunc(text, TURN_CHARS)}
+                turn = {"t": round(m["timestamp"]), "text": clip_user_turn(text)}
+                if len(text) > TURN_CHARS:
+                    turn["text_truncated"] = True
+                    turn["text_original_chars"] = len(text)
                 if last_reply.strip():
                     turn["prev"] = clip_ends(redact(_home_rel(last_reply) or ""))
                 if last_interrupt:
