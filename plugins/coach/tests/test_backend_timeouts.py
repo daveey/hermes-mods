@@ -349,3 +349,60 @@ def test_awake_split_without_any_wake_is_no_wake_seen(tmp_path):
     write_log(tmp_path, 3)
     out = bt.scan(tmp_path, NOW, 30, [])
     assert out['awake_since_wake'] == {'no_wake_seen': 3}
+
+
+def test_timeouts_issued_before_a_wake_count_as_sleep_even_when_they_fire_after_it(tmp_path):
+    # 2026-11-01 18:36:09 on David-MBP: 40 GET /api/cron/jobs 60 s timeouts fired 30 s after a lid wake. Each request
+    # was issued while the lid was shut (latest possible start 18:35:10 < wake 18:35:39), so none is an awake incident.
+    sleep_lo = NOW - timedelta(minutes=10)
+    wake = NOW - timedelta(minutes=5)
+    hub = '[hermes] [hermes:api GET /api/cron/jobs?profile=all] conn=hermes-hub profile=default'
+    lines = [f'{stamp(wake + timedelta(seconds=30))} {hub} Error: Timed out connecting to Hermes backend after 60000ms'
+             for _ in range(40)]
+    lines += [
+        # 5 s fleet timeout one second after wake: started before it.
+        f'{stamp(wake + timedelta(seconds=1))} [hermes] [hermes:api GET /api/plugins/runners/v1/fleet] conn=hermes-hub '
+        'Error: Timed out connecting to Hermes backend after 5000ms',
+        # 10 s probe issued after the wake (latest start wake + 2 s): a real awake failure.
+        f'{stamp(wake + timedelta(seconds=11))} [hermes] Pooled remote backend "conn:hermes-hub::default" failed its '
+        'dispatch probe (Timed out connecting to Hermes backend after 10000ms); reconnecting on demand.',
+        # Fail-fast echo of that probe: lookback = 10 s + 25 s ago, still after the wake, so awake.
+        f'{stamp(wake + timedelta(seconds=36))} [hermes] [hermes:api GET /api/config] conn=hermes-hub Remote backend '
+        '"conn:hermes-hub::default" is down (dispatch probe failed: Timed out connecting to Hermes backend after '
+        '10000ms, 25s ago); reconnect in progress.',
+        # No duration in the line: nothing proves it started before the wake, so awake.
+        f'{stamp(wake + timedelta(seconds=2))} [hermes] [transcript-cache] Timed out connecting to Hermes backend',
+        # Same-second ambiguity: latest start == wake second, stays awake (positive evidence only).
+        f'{stamp(wake + timedelta(seconds=4))} [hermes] /api/status Error: Timed out connecting to Hermes backend after 5000ms',
+    ]
+    write_log(tmp_path, 0, extra=lines)
+    out = bt.scan(tmp_path, NOW, 30, [(sleep_lo, wake)])
+    assert out['count'] == 45
+    assert (out['sleep_count'], out['sleep_spanning_count'], out['awake_count']) == (41, 41, 4)
+    assert sum(out['awake_by_path'].values()) == 4
+    assert '/api/cron/jobs' not in out['awake_by_path']
+    assert '/api/plugins/runners/v1/fleet' not in out['awake_by_path']
+
+
+def test_a_timeout_whose_lifetime_ends_before_the_sleep_is_awake(tmp_path):
+    # The sleep must begin before the timeout fires: a request that timed out before sleeping is awake.
+    sleep_lo = NOW - timedelta(minutes=5)
+    write_log(tmp_path, 0, extra=[
+        f'{stamp(sleep_lo - timedelta(seconds=5))} [hermes] /api/status Error: Timed out connecting to Hermes backend after 60000ms'])
+    out = bt.scan(tmp_path, NOW, 30, [(sleep_lo, NOW - timedelta(minutes=1))])
+    assert (out['sleep_count'], out['sleep_spanning_count'], out['awake_count']) == (0, 0, 1)
+
+
+def test_spanning_burst_opens_no_card_and_body_reports_the_split(tmp_path, capsys, monkeypatch):
+    wake = NOW - timedelta(minutes=5)
+    lines = [f'{stamp(wake + timedelta(seconds=30))} [hermes] [hermes:api GET /api/cron/jobs] conn=hermes-hub '
+             'Error: Timed out connecting to Hermes backend after 60000ms' for _ in range(40)]
+    write_log(tmp_path, 0, extra=lines)
+    monkeypatch.setattr(bt, 'probe_power', lambda now: {'status': 'ok', 'intervals': [(wake - timedelta(minutes=9), wake)]})
+    r = Runner()
+    run(tmp_path, r)
+    out = json.loads(capsys.readouterr().out)
+    assert out['count'] == 40 and out['awake_count'] == 0 and out['sleep_spanning_count'] == 40
+    assert not out['over_threshold'] and not r.calls
+    body = bt.card_body('David-MBP', {**out, 'awake_count': 31}, {}, 30, 30)
+    assert 'of which 40 landed\nafter a wake but were issued before it' in body

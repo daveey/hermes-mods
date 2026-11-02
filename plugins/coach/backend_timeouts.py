@@ -7,6 +7,10 @@ and nothing read them until an archive preflight failed in front of David (self-
 them over the last --window minutes (live desktop.log plus rotated desktop.log.1..3), grouped by request path.
 Raw count stays unchanged; only awake_count triggers incidents. On macOS, positively observed pmset sleep/darkwake
 intervals classify sleep_count (including timers delivered in the full-wake second), with no post-wake grace.
+A timeout that lands after a wake still counts as sleep when its own `after Nms` (plus any `, Ns ago` of a quoted
+probe failure) proves the request started before that wake: wall time >= the monotonic timer, so the request's
+latest possible start is stamp + 1 s - N, and a sleep interval ending after it means the request lived through sleep
+(e.g. 2026-11-01 18:36:09: 40 60s-timeouts 30 s after a lid wake, all issued while the lid was shut).
 Failed/unsupported power probes suppress nothing.
 
     backend_timeouts.py [--dry-run] [--json] [--hours] [--threshold N] [--window MIN] [--home PATH] [--host NAME]
@@ -38,6 +42,7 @@ STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} ")
 API_RE = re.compile(r"\[hermes:api (?:[A-Z]+ )?(\S+?)\]")
 PATH_RE = re.compile(r"(/api/[^\s\]\)'\"?,:]+)")
 CONN_RE = re.compile(r"\bconn=([\w.-]+)")
+AFTER_RE = re.compile(r"Timed out connecting to Hermes backend after (\d+)ms(?:, (\d+)s ago)?")
 TAG_RE = re.compile(r"\[([a-z][\w:.-]*)\]")
 ID_SEG_RE = re.compile(r"^(?=.*\d)[\w.-]{8,}$|^\d+$|^t_[0-9a-f]+$")
 ROTATED = 3
@@ -78,7 +83,7 @@ def route_of(line: str) -> str:
 
 
 def iter_timeouts(files: list):
-    """Yield (datetime, route) per log entry naming the timeout. Stack/continuation lines without a stamp count only
+    """Yield (datetime, route, conn, lookback_s) per log entry naming the timeout. Stack/continuation lines without a stamp count only
     if their entry's stamped line did not already (one entry = one timeout)."""
     for path in files:
         last_ts, counted = None, False
@@ -99,7 +104,9 @@ def iter_timeouts(files: list):
                     continue
                 counted = True
                 m = CONN_RE.search(line)
-                yield last_ts, route_of(line), (m.group(1) if m else "?")
+                a = AFTER_RE.search(line)
+                lookback = (int(a.group(1)) / 1000.0 + int(a.group(2) or 0)) if a else 0.0
+                yield last_ts, route_of(line), (m.group(1) if m else "?"), lookback
 
 
 POWER_RE = re.compile(
@@ -158,6 +165,16 @@ def wake_bucket(ts: datetime, wake_ends: list) -> str:
     return "<1m" if gap < 60 else "<10m" if gap < 600 else ">=10m"
 
 
+def spanned_sleep(ts: datetime, lookback_s: float, intervals) -> bool:
+    """True when the timed-out request provably started before a sleep interval ended and that sleep began before
+    the timeout. `ts` is floored to the second, so the latest possible start is ts + 1 s - lookback; a wake in the
+    same second as that start is ambiguous and stays awake (positive evidence only)."""
+    if lookback_s <= 0:
+        return False
+    latest_start = ts + timedelta(seconds=1) - timedelta(seconds=lookback_s)
+    return any(lo <= ts and hi > latest_start for lo, hi in intervals)
+
+
 def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     start = now - timedelta(minutes=window_min)
     by_path: Counter = Counter()
@@ -166,13 +183,17 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     awake_since_wake: Counter = Counter()
     wake_ends = sorted(hi for _, hi in intervals)
     sleep_count = 0
+    spanning_count = 0
     first = last = None
     files = log_files(home)
-    for ts, route, conn in iter_timeouts(files):
+    for ts, route, conn, lookback in iter_timeouts(files):
         if start <= ts <= now:
             by_path[route] += 1
             if any(lo <= ts <= hi for lo, hi in intervals):
                 sleep_count += 1
+            elif spanned_sleep(ts, lookback, intervals):
+                sleep_count += 1
+                spanning_count += 1
             else:
                 awake_by_path[route] += 1
                 awake_by_conn[conn] += 1
@@ -182,7 +203,7 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     return {"window_start": start.isoformat(sep=" "), "window_end": now.isoformat(sep=" "),
             "files": [str(p) for p in files], "count": sum(by_path.values()),
             "by_path": dict(by_path.most_common()),
-            "sleep_count": sleep_count, "awake_count": sum(awake_by_path.values()),
+            "sleep_count": sleep_count, "sleep_spanning_count": spanning_count, "awake_count": sum(awake_by_path.values()),
             "awake_by_path": dict(awake_by_path.most_common()),
             "awake_by_conn": dict(awake_by_conn.most_common()),
             "awake_since_wake": dict(awake_since_wake.most_common()),
@@ -190,7 +211,7 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
 
 
 def hours(home: Path) -> dict:
-    c: Counter = Counter(ts.strftime("%Y-%m-%d %H") for ts, _, _c in iter_timeouts(log_files(home)))
+    c: Counter = Counter(ts.strftime("%Y-%m-%d %H") for ts, *_ in iter_timeouts(log_files(home)))
     return dict(sorted(c.items()))
 
 
@@ -255,7 +276,8 @@ The Desktop app on {host} logged {rep['count']} "{NEEDLE}" lines in the last {wi
 ({rep['first']} .. {rep['last']}, local time; threshold {threshold}). Users see this as chats that won't load,
 archive asking "task status unavailable", stale boards.
 Of these, {rep.get("awake_count", rep["count"])} occurred while awake and
-{rep.get("sleep_count", 0)} during positively observed sleep/darkwake intervals.
+{rep.get("sleep_count", 0)} during positively observed sleep/darkwake intervals (of which {rep.get("sleep_spanning_count", 0)} landed
+after a wake but were issued before it).
 The threshold applies only to awake timeouts; raw count remains unchanged.
 Awake timeouts by backend connection: {rep.get("awake_by_conn") or "(none)"}; by time since last observed wake:
 {rep.get("awake_since_wake") or "(none)"}.
