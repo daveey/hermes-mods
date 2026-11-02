@@ -21,6 +21,15 @@ board selection, ambiguity and the actual installed decoder (AST-isolated to
 avoid client side effects), or its explicit equivalent contract when the optional
 client is absent. The original sender commit had no intervening sender fix.
 
+## `authority_read` (courier action, no agent tool)
+
+The coach's compute-authority check (`plugins/coach/origin_authority.py`) queues `authority_read` for a hub
+Kanban worker whose card's origin chat is on another gateway. The courier pages that session's whole display
+transcript (`/api/sessions/<id>/messages?order=oldest&include_compacted=true`, 500 rows a page, 20 pages at most;
+longer is an error, never a partial read) and returns only each user row plus the last assistant text row before
+it, slimmed (`authorityRows`, `slimAuthorityRow`). A Desktop that predates the action answers `unknown action`,
+which the coach treats as no approval. Tests: `tests/authority-read.test.mjs`.
+
 ## `@` typeahead (Desktop half)
 
 `desktop-plugins/session-mentions/plugin.js` offers sessions and kanban tasks from every connected gateway in

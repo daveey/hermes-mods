@@ -539,6 +539,72 @@ async function readTranscript({ connectionId, profile, sessionId }, limit = 40) 
   return { title: meta?.title || '', profile: page?.profile || profile || 'default', session_id: page?.session_id || sessionId, messages }
 }
 
+/** The text a transcript row carries ('' for a non-text row). */
+function rowText(m) {
+  const c = m?.content
+  if (typeof c === 'string') return c
+  return Array.isArray(c) ? c.filter(p => p && p.type === 'text' && typeof p.text === 'string').map(p => p.text).join(' ') : ''
+}
+
+/** Keep only what an approval check reads from one row: role, typing fields, provenance flags and the text
+ *  (user rows: head; assistant rows: head + tail, where a closing ask sits). Truthy `_`-fields ride along as
+ *  `true` so the reader's provenance test fails closed on them. */
+export function slimAuthorityRow(m) {
+  const text = rowText(m)
+  const cut = m.role === 'user'
+    ? text.slice(0, AUTHORITY_USER_CHARS)
+    : (text.length > AUTHORITY_HEAD_CHARS + AUTHORITY_TAIL_CHARS
+        ? `${text.slice(0, AUTHORITY_HEAD_CHARS)}\n…\n${text.slice(-AUTHORITY_TAIL_CHARS)}` : text)
+  const out = { id: m.id, role: m.role, content: cut }
+  for (const k of ['display_kind', 'observed', 'timestamp', 'display_metadata']) if (m[k] != null && m[k] !== '') out[k] = m[k]
+  for (const k of Object.keys(m)) if (k.startsWith('_') && m[k]) out[k] = true
+  return out
+}
+
+/** The pairs a spend-approval check needs from a whole display transcript, in order: every user row, plus the
+ *  LAST assistant text row (or observed/summary row) before each user row. That is all `answered_asks` (coach
+ *  compute_envelope) reads: the nearest assistant text before a typed yes. */
+export function authorityRows(messages) {
+  const out = []
+  let pending = null
+  for (const m of messages || []) {
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue
+    if (m.role === 'assistant') {
+      if (rowText(m).trim() || m.observed) pending = m
+      continue
+    }
+    if (pending) out.push(slimAuthorityRow(pending))
+    pending = null
+    out.push(slimAuthorityRow(m))
+  }
+  return out
+}
+
+export const AUTHORITY_PAGE = 500
+export const AUTHORITY_MAX_PAGES = 20
+const AUTHORITY_USER_CHARS = 2000
+const AUTHORITY_HEAD_CHARS = 300
+const AUTHORITY_TAIL_CHARS = 6000
+
+/** A session's whole display transcript (compaction history included, rewound rows not), slimmed to
+ *  `authorityRows`. Hub Kanban workers read their card's origin chat with it (coach compute_authority). A
+ *  transcript longer than AUTHORITY_MAX_PAGES pages is an error, never a partial read. */
+export async function readAuthorityTranscript({ connectionId, profile, sessionId }, request = api) {
+  const rows = []
+  for (let page = 0; page < AUTHORITY_MAX_PAGES; page++) {
+    const q = `limit=${AUTHORITY_PAGE}&offset=${page * AUTHORITY_PAGE}&order=oldest&include_compacted=true` +
+      `&inline_images=false${profile ? `&profile=${enc(profile)}` : ''}`
+    const res = await request(connectionId, `/api/sessions/${enc(sessionId)}/messages?${q}`)
+    const got = Array.isArray(res?.messages) ? res.messages : []
+    rows.push(...got)
+    if (got.length < AUTHORITY_PAGE) {
+      return { ok: true, profile: res?.profile || profile || 'default', session_id: res?.session_id || sessionId,
+               total: rows.length, messages: authorityRows(rows) }
+    }
+  }
+  return { ok: false, error: `transcript longer than ${AUTHORITY_PAGE * AUTHORITY_MAX_PAGES} rows` }
+}
+
 async function sessionTitle(target) {
   const meta = await api(target.connectionId, `/api/sessions/${enc(target.sessionId)}${target.profile ? `?profile=${enc(target.profile)}` : ''}`).catch(() => null)
   return meta?.title || ''
@@ -1117,6 +1183,11 @@ export async function performRequest(req, origin, conns) {
   if (target.error) return { ok: false, error: target.error }
   if (!target.profile) target.profile = 'default'
   const gw = conns.find(c => c.id === target.connectionId)
+
+  if (action === 'authority_read') {
+    const tr = await readAuthorityTranscript(target)
+    return { gateway: gw?.key || target.connectionId, ref: sessionRef(target, origin, conns), ...tr }
+  }
 
   if (action === 'read') {
     const tr = await readTranscript(target, Number(args.limit) || 40)
