@@ -1,6 +1,6 @@
 """Idle drain cost. Every Desktop courier drains each connected gateway every ~3s, and each drain used to
-list the (normally empty) outbox, read every courier record, rewrite this courier's record through a
-temp file + rename, and sweep all four protocol dirs. On an idle gateway that is pure overhead.
+list the (normally empty) outbox, read every courier record, and sweep all four protocol dirs.
+Courier registration intentionally retains its atomic rewrite on every drain.
 
 Invariants the cheaper drain must keep (each is exercised below):
   - an empty-directory listing is reused only while the directory's identity (dev, ino, mtime_ns,
@@ -66,7 +66,7 @@ def clock(monkeypatch):
                                  time_ns=lambda: time.time_ns() + int(state["offset"] * 1e9),
                                  sleep=time.sleep, monotonic=time.monotonic)
     monkeypatch.setattr(rf, "time", fake)
-    for cache in ("_EMPTY_DIRS", "_SWEEP_STATE", "_COURIER_WRITES"):
+    for cache in ("_EMPTY_DIRS", "_SWEEP_STATE"):
         if hasattr(rf, cache):
             monkeypatch.setattr(rf, cache, {})
 
@@ -124,7 +124,7 @@ def test_idle_sweep_skips_settled_dirs_before_their_deadline(tmp_path, clock):
         assert not t.listed(base / sub), sub
 
 
-def test_unchanged_registration_refreshes_liveness_without_rewriting(tmp_path, clock):
+def test_unchanged_registration_refreshes_liveness(tmp_path, clock):
     base = _base(tmp_path)
     path = base / "couriers" / "desk-a.json"
     _drain(base)
@@ -132,7 +132,7 @@ def test_unchanged_registration_refreshes_liveness_without_rewriting(tmp_path, c
     time.sleep(0.05)
     _drain(base)
     after = path.stat()
-    assert after.st_ino == before.st_ino  # same file: no temp-file + rename per drain
+
     assert after.st_mtime_ns > before.st_mtime_ns  # liveness still advanced
     assert any(c["device"] == "desk-a" for c in rf.live_couriers(base))
 

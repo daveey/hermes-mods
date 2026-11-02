@@ -53,11 +53,11 @@ COURIER_FRESH_SECONDS = 20.0  # couriers drain every ~3s
 DIR_SETTLE_SECONDS = 2.0
 OUTBOX_RECHECK_SECONDS = 30.0  # longest an unchanged, cached-empty outbox goes unlisted
 SWEEP_RECHECK_SECONDS = 60.0   # longest a sweep skip lasts (in-place backdating does not touch the dir)
-COURIER_REWRITE_SECONDS = 60.0  # an unchanged courier record's `at` is rewritten at least this often
+
 _CACHE_LOCK = threading.Lock()
 _EMPTY_DIRS: dict = {}      # dir -> (key, listed_at): the dir held no *.json when listed
 _SWEEP_STATE: dict = {}     # dir -> (key, earliest expiry deadline of its files, swept_at)
-_COURIER_WRITES: dict = {}  # record path -> (record without `at`, at, file identity after our write)
+
 
 
 def _dir_key(path: Path) -> tuple | None:
@@ -208,48 +208,13 @@ def register_courier(base: Path, courier: Any, aliases: Any = (), reach: Any = (
     device = norm_name(courier)
     if not device or not safe_id(device):
         return ""
+    (base / "couriers").mkdir(exist_ok=True)
     record = {"device": device, "aliases": sorted(set(names(aliases)) | {device}), "reach": names(reach),
               "home": bool(home), "at": time.time()}
     if plugin:
         record["plugin"] = plugin
-    path = base / "couriers" / f"{device}.json"
-    stable = {k: v for k, v in record.items() if k != "at"}
-    name = str(path)
-    with _CACHE_LOCK:
-        prev = _COURIER_WRITES.get(name)
-    if prev is not None and prev[0] == stable and 0 <= record["at"] - prev[1] < COURIER_REWRITE_SECONDS:
-        # Same record as our last write and the file is still that write: liveness is the file's mtime
-        # (live_couriers, courier_versions), so touch it instead of a temp file + rename every ~3s.
-        try:
-            if _file_id(path) == prev[2]:
-                os.utime(path)
-                after = _file_id(path)
-                with _CACHE_LOCK:
-                    if after[:3] == prev[2][:3]:  # still our write (no replace raced the touch)
-                        _COURIER_WRITES[name] = (prev[0], prev[1], after)
-                    else:
-                        _COURIER_WRITES.pop(name, None)  # next drain rewrites our record
-                return device
-        except OSError:
-            pass
-    (base / "couriers").mkdir(exist_ok=True)
-    atomic_write(path, record)
-    try:
-        ident = _file_id(path)
-    except OSError:
-        ident = None
-    with _CACHE_LOCK:
-        if ident is None:
-            _COURIER_WRITES.pop(name, None)
-        else:
-            _COURIER_WRITES[name] = (stable, record["at"], ident)
+    atomic_write(base / "couriers" / f"{device}.json", record)
     return device
-
-
-def _file_id(path: Path) -> tuple:
-    """Identity of one write of a file: a replace by any other writer changes ino/size/mtime/ctime."""
-    st = os.stat(path)
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def live_couriers(base: Path | None = None) -> list[dict]:
