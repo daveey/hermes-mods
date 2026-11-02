@@ -100,11 +100,47 @@ _OWN_DIR = Path(__file__).resolve().parent
 _V4A_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update) File:\s*(.+)$", re.M)
 
 
+def _maintenance_git(root: Path, *args: str) -> str:
+    import subprocess
+
+    # A caller's repository overrides must not manufacture maintenance identity.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return subprocess.check_output(
+        ["git", "-C", str(root), *args], env=env, text=True,
+        stderr=subprocess.DEVNULL, timeout=2,
+    ).strip()
+
+
 def _own_file(path: str) -> bool:
-    # Editing this plugin (its tests quote the burners) must stay possible on a protected host.
+    # This exemption is for file maintenance only, never command execution.
     try:
-        return _OWN_DIR in Path(os.path.expanduser(path)).resolve().parents
+        target = Path(os.path.expanduser(path)).resolve()
+        if _OWN_DIR in target.parents:
+            return True
+        for parent in target.parents:
+            if parent.name != "cpu-load-guard" or parent.parent.name != "plugins":
+                continue
+            root = parent.parent.parent
+            own_root = _OWN_DIR.parent.parent
+            if _OWN_DIR.relative_to(own_root).as_posix() != "plugins/cpu-load-guard":
+                return False
+            common = _maintenance_git(own_root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+            if Path(_maintenance_git(root, "rev-parse", "--show-toplevel")).resolve() != root:
+                return False
+            other = _maintenance_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+            if Path(common).resolve() != Path(other).resolve():
+                return False
+            # Matching a forged .git pointer alone is insufficient: require registration.
+            records = _maintenance_git(own_root, "worktree", "list", "--porcelain", "-z").split("\0")
+            if "worktree " + str(root) not in records:
+                return False
+            relative = target.relative_to(root).as_posix()
+            # No blanket exemption for arbitrary new scripts placed beside our tests.
+            tracked = _maintenance_git(root, "ls-files", "--error-unmatch", "--", relative)
+            return tracked == relative
+        return False
     except Exception:
+        # Missing Git, timeouts and ambiguous identity retain ordinary write checks.
         return False
 
 

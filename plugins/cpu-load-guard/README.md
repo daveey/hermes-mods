@@ -1,5 +1,20 @@
 # cpu-load-guard
 
+## Safe maintenance in linked worktrees
+
+File writes and patches to tracked `plugins/cpu-load-guard/` files in registered
+worktrees of the installed plugin's repository are exempt from fixture scanning.
+Identity requires the same canonical Git common directory, a matching repository
+root and a registered worktree path; a matching directory name or cloned remote
+alone is insufficient. Inherited `GIT_*` overrides cannot establish identity.
+Untracked scripts and symlink escapes retain normal write checks. Git errors retain
+normal checks too. This does not exempt terminal or execute_code execution.
+
+`tests_worktree.py` uses isolated real Git repositories to cover direct writes,
+replacement and V4A patches, deferred patches, relative paths, symlink aliases and
+escapes, lookalikes, independent clones, forged gitfiles, Git failure and retained
+terminal/execute_code execution checks. Burner fixtures are never executed.
+
 ## Decision-module updates in running workers
 
 Once this reload boundary has been activated, running workers pick up changes to
