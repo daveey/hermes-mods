@@ -431,3 +431,70 @@ def test_retired_generation_plain_create_intent_stays_ambiguous(env):
     row = start(service, followup, 'more work')
     assert 'retired' not in row['history'][0] or row['history'][0]['retired'] is not True
     assert any('Earlier ambiguous card needs operator recovery' in str(e) for e in raised)
+
+
+# ------------------------------------------- run27 C-M2: invariants observed from the port
+
+def store_lock_state(service):
+    """(process-local lock held?, cross-process flock held?) for the service's ledger."""
+    import fcntl
+    store_mod = importlib.import_module(PACKAGE + '.store')
+    local = store_mod._LOCKS.get(str(service.store.path))
+    with open(str(service.store.path) + '.lock', 'a') as probe:  # new open file description
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            flocked = True
+        else:
+            fcntl.flock(probe, fcntl.LOCK_UN)
+            flocked = False
+    return bool(local is not None and local.locked()), flocked
+
+
+def test_retry_from_create_refused_persists_create_intent_before_create(env):
+    # The integration owner_tool re-reads the ledger and refuses unless the STORED
+    # state is create_intent, so the save must precede the effect (not only _attempt's).
+    service, ctx, ports = env
+    refuse(ports, 'implement', [CODE])
+    row = start(service, ctx, 'work')
+    workflow_id = row['workflow_id']
+    params = copy.deepcopy(row['cards']['implement']['params'])
+    first = copy.deepcopy(row['cards']['implement']['refusal'])
+    seen = []
+    original = ports.create_card
+
+    def create_card(wid, stage, p):
+        if stage == 'implement':
+            seen.append(copy.deepcopy(service.store.get(wid)['cards']['implement']))
+        return original(wid, stage, p)
+    ports.create_card = create_card
+    row = service.reconcile()[0]
+    assert row['cards']['implement']['state'] == 'created'
+    assert len(seen) == 1
+    assert seen[0]['state'] == 'create_intent' and 'id' not in seen[0]
+    assert seen[0]['params'] == params and seen[0]['refusal'] == first
+    assert service.store.get(workflow_id)['cards']['implement']['state'] == 'created'
+
+
+@pytest.mark.parametrize('outcome', ['created', 'refused'])
+def test_recover_card_intent_holds_store_lock_across_recover_and_create(env, outcome):
+    service, ports, row = legacy_intent(env)
+    params = row['cards']['implement']['params']
+    ports.cards.pop(params['idempotency_key'])
+    assert store_lock_state(service) == (False, False)  # nothing else holds it now
+    refuse(ports, 'implement', [CODE] if outcome == 'refused' else [])
+    observed = []
+    original_create, original_recover = ports.create_card, ports.recover_card
+
+    def recover_card(w, s, p):
+        observed.append(('recover_card', store_lock_state(service)))
+        return original_recover(w, s, p)
+
+    def create_card(w, s, p):
+        observed.append(('create_card', store_lock_state(service)))
+        return original_create(w, s, p)
+    ports.recover_card, ports.create_card = recover_card, create_card
+    entry = service.recover_card_intent(row['workflow_id'], 'implement')
+    assert entry['state'] == ('created' if outcome == 'created' else 'create_refused')
+    assert observed == [('recover_card', (True, True)), ('create_card', (True, True))]
+    assert store_lock_state(service) == (False, False)  # released afterwards

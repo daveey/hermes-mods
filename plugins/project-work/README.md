@@ -266,7 +266,15 @@ leaves `create_intent`, which needs the operator method below.
 When a newer generation retires an older one, a no-ID `create_refused` entry whose
 archived-inclusive lookup (after quiesce) is still empty becomes `refused_retired`:
 its last create was a proven refusal, so it is absent, not ambiguous. A no-ID
-`create_intent` there still needs operator recovery.
+`create_intent` there still needs operator recovery. The deployed retirer (the
+private integration's `GenerationRetirer`, wired as `quiesce`) treats such a stage
+as retired-absent only when its fresh archived-inclusive lookup by the exact key
+is empty; it still lists that key in the quiesce proof, so the bridge's key-set
+check holds. A refused stage whose lookup finds a card is adopted and parked as
+before, and a no-ID `create_intent` there still refuses as `ambiguous_card`
+(integration `test_retirement`: `test_refused_stage_without_card_is_retired_absent_in_composition`,
+`test_refused_stage_whose_lookup_finds_card_is_adopted_not_absent`,
+`test_create_intent_without_card_stays_ambiguous_in_composition`).
 
 ### Operator recovery of a card `create_intent`
 
@@ -380,9 +388,13 @@ Native RPC/Slack tests use deterministic fakes and are NOT live end-to-end proof
 | `recover_card_intent` refuses unapproved, wrong state, existing ID, stale generation, missing predecessor without writing | `test_recover_card_intent_refuses_without_writing` |
 | `refusals` history keeps the last 20 | `test_refusal_history_is_bounded` |
 | Retiring a generation turns a no-ID `create_refused` into `refused_retired`; a no-ID `create_intent` stays ambiguous | `test_retired_generation_create_refused_is_absent_not_ambiguous`, `test_retired_generation_plain_create_intent_stays_ambiguous` |
+| The retry from `create_refused` has saved `create_intent` (stored row) before its `create_card` | `test_retry_from_create_refused_persists_create_intent_before_create` |
+| `recover_card_intent` holds the store lock (process lock and flock) across its `recover_card` and `create_card` | `test_recover_card_intent_holds_store_lock_across_recover_and_create` |
 
 The service tests use the fake ports; the bridge tests use fake native callables.
-A real core refusal round trip is untested here.
+A real core refusal round trip is untested here. The `refused_retired` row above uses a fake
+`quiesce_generation`; the deployed retirer is covered by the integration tests named
+in the `create_refused` section.
 
 Before rollout independently review the source, then verify normal plugin discovery,
 actual owner-session/tool attribution, project visibility, task-local sandboxing for
