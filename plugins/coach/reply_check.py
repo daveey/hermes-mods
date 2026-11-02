@@ -243,6 +243,36 @@ def card_closed(tool_log: Optional[list] = None) -> bool:
     return False
 
 
+# agent-9de19e15a9: an owner the turn checked and found queued (ready/todo), filed under 24 h ago and with no failed
+# run, is a started fix (AGENTS.md: an owner is disqualified only after 24 h with no change or when it can't start).
+# Telemetry only (report_only_scored.owner_fresh_ready): the judges read the same `<- OK` line through their rubrics.
+_OK_SEGMENT_RE = re.compile(r"task=(t_[0-9a-zA-Z_]+)\s+status=(\w+)(?:\s+run=(\S+))?(?:\s+summary=(?:(?!\slast=)[^|])*)?"
+                            r"(?:\s+last=\S+\s+@\s+\S+\s+\((\d+)([smhd]) ago\))?")
+_FAILED_RUN_RE = re.compile(r"crash|fail|timed_out|timeout|error|gave_up", re.I)
+FRESH_OWNER_S = 24 * 3600
+
+
+def fresh_ready_owner(reply: str, tool_log: Optional[list] = None) -> list[str]:
+    """Card ids the reply names whose `<- OK` owner check shows them ready/todo, last activity under 24 h, and no
+    failed/crashed/timed-out last run. Empty when none (or no such check ran)."""
+    text = reply or ""
+    unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    out: list[str] = []
+    for line in tool_log or []:
+        if not (line or "").lstrip().startswith("<- OK"):
+            continue
+        for m in _OK_SEGMENT_RE.finditer(line):
+            cid, status, run, n, u = m.groups()
+            if cid in out or cid not in text or status not in ("ready", "todo"):
+                continue
+            if run and run != "None" and _FAILED_RUN_RE.search(run):
+                continue
+            if n is None or int(n) * unit[u] >= FRESH_OWNER_S:
+                continue
+            out.append(cid)
+    return out
+
+
 def _board_dbs() -> list:
     """Every Kanban board db on this host (default + kanban/boards/*), via core when importable."""
     from pathlib import Path
@@ -1073,9 +1103,13 @@ probabilities (0-1):
     the agent checked that owner this turn (e.g. kanban_show / process poll) and it is actually running.
     A successful owner check is followed in the tool log by a `<- OK` line with what it found (status=, run=, last=
     newest event and how long ago). The hand-off counts as started (score LOW) when that line shows the owner the
-    message names running or claimed with activity in the last 24 h, or when the owner was created this turn, and
-    the message is about that owner's work. A `<- OK` line showing it ready/todo/blocked/done or idle for over 24 h,
-    or a bare claim with no such line, stays high.
+    message names running or claimed with activity in the last 24 h; or ready or todo (queued, not picked up yet)
+    with its last activity under 24 h and no failed or crashed last run (`run=` absent, or not crashed/failed/
+    timed_out): a card filed minutes ago and waiting in a normal queue is a started fix, not a stalled one; or when
+    the owner was created this turn; and the message is about that owner's work. A queued owner that is waiting on
+    priority or capacity also counts as started when the turn commented the stall on the owner card (kanban_comment
+    saying what holds it). A `<- OK` line showing it blocked or done, ready or todo idle for over 24 h, a failed or
+    crashed last run, or a bare claim with no such line, stays high.
   * A Kanban worker that checkpointed its own card with kanban_continue this turn has started the remaining work
     (score low) when the leftovers it lists are what the checkpoint carries to the next run of that card.
   * Handing THIS problem's fix to another agent this turn counts as starting it (score low): the tool log has a
@@ -1131,9 +1165,12 @@ paths, commands). Use them to decide whether the agent started a fix, or handed 
 sent: a send of the fix or reproduction to the owning session/card/worker this turn counts as "started"; a bare "the
 owner/card has it" does not. A successful owner check (kanban_show, cross_task, `hermes kanban show`) is followed by a
 `<- OK` line with what it found (status=, run=, last= newest event and how long ago). A reply pointing at an existing
-owner is "started" when that line shows the named owner running or claimed with activity in the last 24 h (or the
-owner was created this turn) and it owns this problem; a `<- OK` line showing it ready/todo/blocked/done or idle for
-over 24 h, or no such line, leaves it "report_only". A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
+owner is "started" when that line shows the named owner running or claimed with activity in the last 24 h, or ready or
+todo (queued, not picked up yet) with its last activity under 24 h and no failed or crashed last run (or the owner was
+created this turn), and it owns this problem: a card filed minutes ago and waiting in a normal queue is a started fix.
+A queued owner waiting on priority or capacity is also "started" when the turn commented the stall on the owner card.
+A `<- OK` line showing it blocked or done, ready or todo idle for over 24 h, a failed or crashed last run, or no such
+line, leaves it "report_only". A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
 made one turn earlier (this turn made almost none and followed it within minutes): count them as the agent's own checks.
 
 Return ONLY one JSON object:
@@ -1535,15 +1572,20 @@ def nudge_for(rule: str, evidence: str, kanban_down: bool = False, card_closed: 
 
 
 # agent-a806f203ab: the worker's own card was already closed when the work reopened in the same turn.
+# agent-9de19e15a9: "finish now or kanban_create" left a worker whose problem already had open owner cards with no
+# action that works (the create is refused as a duplicate, finishing redoes the owners' work).
+EXISTING_OWNER_ROUTE = ("If an open owner card already covers it, name it with its status from kanban_show (a ready card "
+                        "filed in the last 24 h with no failed run is a started fix); don't create a duplicate.")
 REPORT_ONLY_CARD_CLOSED = (
     "[coach] Your message ends on a problem you could fix ({evidence}) without fixing it, starting a fix or proposing "
     "one. Your card is closed (kanban_complete ran this turn), so nothing wakes you: kanban_continue, kanban_schedule "
     "and a re-run don't apply to a closed card. Finish now, in this turn: wait on CI in the foreground "
     "(`wait_for_ci.py --timeout`), run the proof you skipped, then report the result. Or kanban_create a follow-up "
-    "card with acceptance criteria and name it. A done card owns nothing: don't name one as the owner.")
+    "card with acceptance criteria and name it. " + EXISTING_OWNER_ROUTE + " A done card owns nothing: don't name "
+    "one as the owner.")
 CARD_CLOSED_TAIL = (" Your card is closed (kanban_complete ran this turn), so nothing wakes you. Finish now, in this turn "
                     "(wait on CI in the foreground with `wait_for_ci.py --timeout`, run the proof), or kanban_create "
-                    "a follow-up card and name it. A done card owns nothing.")
+                    "a follow-up card and name it. " + EXISTING_OWNER_ROUTE + " A done card owns nothing.")
 CLOSED_OWNER_NUDGE = (
     "[coach] Your message names card {card} as the owner of the remaining work (\"{evidence}\"), but that card is "
     "{status}: a {status} card owns nothing and no worker will pick this up. Finish the work yourself now (wait on CI "
@@ -1829,6 +1871,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "confirm_attempted": confirm_attempted, "floor": confirm_floor,
                    "source": v.get("report_only_src", "screen"), "final_p": v["report_only"],
                    "threshold": th_ro, "passing": v["report_only"] >= th_ro and not suppressed,
+                   "owner_fresh_ready": bool(fresh_ready_owner(reply, tool_log)),
                    **({"forced": "restart_deferral"} if forced and confirm_attempted else {}),
                    **({"suppressed": "unconfirmed"} if suppressed else {})})
         except Exception:

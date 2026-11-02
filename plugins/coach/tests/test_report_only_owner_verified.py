@@ -235,3 +235,88 @@ def test_unparseable_success_falls_back_to_result_head():
     line = _ok_lines(coach.turn_context("s")[1])[0]
     assert "status:    running" in line or "status=running" in line, line
     assert len(line) <= 220
+
+
+# ───── self-heal agent-9de19e15a9: a hand-off to a just-filed, healthy owner card that is still queued ─────
+# A Kanban worker closed its crash card and named two fix cards it had filed minutes earlier: "queued but not started
+# yet". Both rubrics listed ready/todo with blocked/done as "stays high", with no age test, so the judge held a
+# hand-off AGENTS.md counts as a started fix (a linked card; an owner is disqualified only after 24 h with no change or
+# when it can't start). The fix: ready/todo with activity under 24 h and no failed last run counts as started.
+OWNERS = ("t_01a198e5508740cb", "t_01a198e56e285557")
+QUEUED_REPLY = (  # the revised reply the outcome judge held at p 0.99 (state.db message 607164), trimmed
+    "The two fix cards are still open and queued, but they are far back in the queue and I couldn't move them up.\n\n"
+    f"- **Status:** `{OWNERS[0]}` (find what wrote the small config and guard that write) and `{OWNERS[1]}` (stop "
+    "counting host-side refusals as card crashes) are both `ready`. They were created about 20 minutes ago, and "
+    "neither has started or failed.\n"
+    "- **What I did instead:** left a comment on each card explaining why it is stuck and the exact command an "
+    "operator chat can run to raise its priority.\n\n"
+    "No new card: the work already has open owners, and a duplicate card would be refused.")
+
+
+def _queued_show(card, age_s=18 * 60, run_status=None, status="ready"):
+    now = time.time()  # not module-level NOW: a full suite run takes minutes, which would age the fixture
+    ev = [{"kind": "created", "payload": {"status": status}, "created_at": int(now - age_s), "run_id": None}]
+    runs = [{"id": 1, "status": run_status, "started_at": int(now - age_s + 60)}] if run_status else []
+    return {"task": {"id": card, "title": "fix", "status": status}, "events": ev, "runs": runs}
+
+
+def _queued_log(**kw):
+    coach = rules.AgentCoach(None)
+    for card in OWNERS:
+        coach.observe("q", "kanban_show", {"task_id": card}, json.dumps(_queued_show(card, **kw)))
+    return coach.turn_context("q")[1]
+
+
+def test_fresh_ready_owner_found_for_the_incident_draft():
+    log = _queued_log()
+    assert any("status=ready" in l and "18m ago" in l for l in log), log
+    assert sorted(rc.fresh_ready_owner(QUEUED_REPLY, log)) == sorted(OWNERS)
+
+
+def test_stale_crashed_blocked_or_unnamed_owner_is_not_fresh():
+    assert rc.fresh_ready_owner(QUEUED_REPLY, _queued_log(age_s=3 * 86400)) == []
+    assert rc.fresh_ready_owner(QUEUED_REPLY, _queued_log(run_status="crashed")) == []
+    assert rc.fresh_ready_owner(QUEUED_REPLY, _queued_log(status="blocked")) == []
+    assert rc.fresh_ready_owner("The fix is owned by t_0000000000000fff.", _queued_log()) == []
+    assert rc.fresh_ready_owner(QUEUED_REPLY, []) == []
+
+
+def test_fresh_owner_parsed_with_summary_and_cross_task_shape():
+    """agent_rules writes summary= between status and last= when no run state exists (cross_task results)."""
+    line = (f"   <- OK task={OWNERS[0]} status=ready summary=filed by crash card t_01a198dc526bff6e "
+            f"last=created @ 2026-11-01T20:55Z (18m ago) | task={OWNERS[1]} status=todo run=timed_out "
+            f"last=timed_out @ 2026-11-01T20:56Z (5m ago)")
+    assert rc.fresh_ready_owner(QUEUED_REPLY, [line]) == [OWNERS[0]]
+
+
+def test_rubrics_count_a_fresh_queued_owner_as_started():
+    for text in (rc.JUDGE_SYS, rc.CONFIRM_SYS):
+        flat = " ".join(text.split())
+        # ready/todo is no longer lumped with blocked/done as "stays high" regardless of age
+        assert "ready/todo/blocked/done" not in flat, "ready/todo still unconditionally high"
+        assert "ready or todo" in flat and "under 24 h" in flat, flat[:200]
+        assert "failed or crashed" in flat
+        assert "commented the stall on the owner card" in flat
+
+
+def test_closed_card_nudge_names_the_existing_owner_route():
+    for text in (rc.REPORT_ONLY_CARD_CLOSED, rc.CARD_CLOSED_TAIL):
+        assert "open owner card already covers it" in text and "kanban_show" in text, text
+        assert "don't create a duplicate" in text, text
+
+
+def _scored(reply, log, confirm_p):
+    rows = []
+    verdict = json.dumps({"handoff": 0, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0.9,
+                          "evidence": "queued but not started yet"})
+    rc.check(reply, "work kanban task t_01a198dc526bff6e", log, lambda s, p: verdict,
+             thresholds={"report_only": 0.7}, confirm=lambda: (confirm_p, "x"), confirm_floor=0.5,
+             audit=rows.append, card_status=lambda c: "ready", only=["report_only"])
+    return [r for r in rows if r.get("event") == "report_only_scored"]
+
+
+def test_report_only_scored_audit_carries_owner_fresh_ready():
+    fresh = _scored(QUEUED_REPLY, _queued_log(), 0.2)
+    assert fresh and fresh[0].get("owner_fresh_ready") is True, fresh
+    stale = _scored(QUEUED_REPLY, _queued_log(age_s=3 * 86400), 0.9)
+    assert stale and stale[0].get("owner_fresh_ready") is False, stale

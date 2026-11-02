@@ -276,10 +276,23 @@ results. After a successful owner read (`kanban_show`, `cross_task`, `hermes kan
 `   <- OK task=<id> status=<task status> run=<latest run status> last=<newest event> @ <UTC> (<age> ago)` (unparseable
 output: the first 160 chars). The `<- ERROR` readers ignore it. Both rubrics count a hand-off as started when that line
 shows the named owner running or claimed with activity in the last 24 h (or it was created this turn); a line showing
-it ready/todo/blocked/done or idle longer, or no line, stays report_only. Tests: `tests/test_report_only_owner_verified.py`;
+it blocked/done or idle longer, or no line, stays report_only (ready/todo: see queued owners below). Tests: `tests/test_report_only_owner_verified.py`;
 fixture `owner-checked-running-20261031` in `tests/fixtures/report_only_unverified_owner.json`. Live replay of the
 incident through the real aux judges: second opinion 0.9 → 0.1, outcome 0.95 → 0.02; the same turn with the card
 `ready`, its run crashed and 4 days idle stays held (0.9 / 0.99).
+
+Queued owners (self-heal agent-9de19e15a9, 2026-11-01). A hub worker closed its crash card and named two fix cards it
+had filed 20 minutes earlier, both `ready` behind a busy queue; it commented the stall on both. Both judges held it
+(0.9, then 0.99: "Fix cards checked but ready, not running") because the rubrics put ready/todo with blocked/done as
+"stays high" with no age test, while AGENTS.md disqualifies an owner only after 24 h without change or when it can't
+start. Both rubrics now count a ready or todo owner as started when its `<- OK` line shows last activity under 24 h and
+no failed or crashed last run (or the turn commented the stall on that card); ready/todo idle over 24 h, blocked, done or
+a failed run still holds. The closed-card nudges (`REPORT_ONLY_CARD_CLOSED`, `CARD_CLOSED_TAIL`) add the existing-owner
+route (`EXISTING_OWNER_ROUTE`: name the open owner with its kanban_show status; no duplicate card). `report_only_scored`
+gains `owner_fresh_ready` (`reply_check.fresh_ready_owner`), so held replies with a fresh queued owner can be recounted:
+`jq -c 'select(.event=="report_only_scored" and .owner_fresh_ready and .passing)' ~/.hermes/coach/log.jsonl`. Live
+replay through the real aux judges: second opinion 0.9 → 0.1, outcome 0.85 → 0.6 (threshold 0.7); the same turn with
+the owners 3 days idle or with a crashed run stays held (0.9 / 0.9).
 
 **Closed cards (agent-a806f203ab).** A Kanban worker called `kanban_complete`, then an operator note reopened the work
 in the same turn; it pushed a fix and ended with CI unwatched, a proof never run and a done card named as "owner".
