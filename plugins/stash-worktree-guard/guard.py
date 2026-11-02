@@ -119,7 +119,8 @@ BUILTINS_NOT_HASHED = {"echo", ":", "true", "false", "test", "[", "type", "help"
 _KEYWORD = "*keyword*"      # `set -k`: assignment words anywhere in argv go to the environment
 _NAMEREF = "*nameref*"      # a nameref exists: an assignment may write any variable
 _CMDS = "*bash_cmds*"       # BASH_CMDS was assigned: the hash table maps unknown names
-_MARKERS = {_ALLEXPORT, _KEYWORD, _NAMEREF, _CMDS}
+_ANYREF = "*anyref*"        # a declared ref may be written by subsequent shell commands
+_MARKERS = {_ALLEXPORT, _KEYWORD, _NAMEREF, _CMDS, _ANYREF}
 # `export -f NAME` / `declare -fx NAME` (or a definition under `set -a`) puts NAME's function in
 # the environment, where a child Bash imports it: recorded in _State.exported as this + NAME.
 _FUNC_MARK = "()"
@@ -1348,6 +1349,8 @@ class _Analyzer:
                 for st in states:
                     for value in self.loop_values(keyword, var, words, st):
                         new = st.copy()
+                        if _ANYREF in new.exported:
+                            _taint_nameref(new)
                         new.vars[var] = value
                         pre.append(new)
                 pre = _union(pre)
@@ -1362,6 +1365,10 @@ class _Analyzer:
         out = _union(first, exit2, after2)
         known = {st.key() for st in first}
         if any(st.key() not in known for st in out):
+            # Later iterations may install functions nested in earlier definitions.
+            # Losing vars/cwd alone cannot represent those not-yet-seen bodies.
+            if any(st.funcs != initial.funcs for st in out for initial in states):
+                self.fail_closed("")
             out = _union(out, [_unknown(out)])  # did not converge in two iterations
         return out, out
 
@@ -1395,13 +1402,21 @@ class _Analyzer:
         variables["PWD"] = st.cwd
         names = (e[len(_FUNC_MARK):] for e in st.exported if e.startswith(_FUNC_MARK))
         funcs = {n: st.funcs[n] for n in names if n in st.funcs and st.funcs[n][0] != "hashed"}
-        return _State(st.cwd, variables, (set(st.exported) - _MARKERS) | set(prefix), funcs, st.lcwd)
+        # References themselves are not inherited, but their uncertain writes are.
+        markers = st.exported & {_NAMEREF}
+        return _State(st.cwd, variables, (set(st.exported) - _MARKERS) | set(prefix) | markers, funcs, st.lcwd)
 
     def simple(self, node, st: _State, depth: int, nested: bool = False):
         self.steps += 1
         if self.steps > MAX_STEPS:
             raise _Budget()
         _kind, assigns, words, redirs = node
+        if _ANYREF in st.exported and (assigns or not words or words[0] != "git"):
+            # An external git invocation cannot write the parent shell's references.
+            # Other commands (including functions, read, printf -v and declarations)
+            # may do so. Keep the no-write declaration + literal git control precise.
+            st = st.copy()
+            _taint_nameref(st)
         if not nested:  # a shadow re-analysis of the same words: already inspected
             for raw in assigns + words:
                 for inner in _substitutions(raw):
@@ -1702,6 +1717,11 @@ class _Analyzer:
     def declare(self, cmd, raw, lit, st):
         new, flags, unexport = st.copy(), set(), False
         for r, l in zip(raw[1:], lit[1:]):
+            if _ANYREF in new.exported:
+                _taint_nameref(new)
+            if not _ASSIGN.match(r) and _expand_word(r, st.vars) != l:
+                # Expanded flags/names can establish references or export Git selectors.
+                _taint_nameref(new)
             if l[:1] in "-+" and not _ASSIGN.match(l):
                 flags |= set(l[1:])
                 unexport |= cmd == "export" and l.startswith("-") and "n" in l
@@ -1718,11 +1738,12 @@ class _Analyzer:
                 elif cmd == "export" or "x" in flags:
                     new.exported.add(_FUNC_MARK + name)
                 continue
-            if "n" in flags and cmd != "export" and (
-                    not match or not re.fullmatch(r"[A-Za-z_]\w*", _literal(r[match.end():]))
-                    or _literal(r[match.end():]) in _NAMEREF_TAINT + ("PATH", "BASH_CMDS")
-                    or _literal(r[match.end():]).startswith(("GIT_", "BASH"))):
-                _taint_nameref(new)  # an assignment through the ref may set that variable
+            if "n" in flags and cmd != "export":
+                new.exported.add(_ANYREF)
+                if (not match or not re.fullmatch(r"[A-Za-z_]\w*", _literal(r[match.end():]))
+                        or _literal(r[match.end():]) in _NAMEREF_TAINT + ("PATH", "BASH_CMDS")
+                        or _literal(r[match.end():]).startswith(("GIT_", "BASH"))):
+                    _taint_nameref(new)
             if match:
                 unmodeled = match[2] or match[3] or (flags & _UNMODELED_FLAGS and cmd != "export")
                 new.vars[name] = None if unmodeled else _expand_word(r[match.end():], st.vars)

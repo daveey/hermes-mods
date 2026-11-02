@@ -1310,6 +1310,36 @@ def _case_cd(single, dirs):
     return f'cd {single}; case "$1" in {arms} esac; git stash pop'
 
 
+@pytest.mark.parametrize("declaration", ["declare -n", "declare -xn", "typeset -nx", "local -n", "local -xn"])
+@pytest.mark.parametrize("count", [0, 20])
+def test_state_cap_join_nameref_flags(multi, declaration, count):
+    main, wt = multi
+    loop = ("for s in " + " ".join(map(str, range(count))) + "; do echo $s; done; ") if count else ""
+    command = (f"X={main}; f() {{ {declaration} R=X; R={wt}; "
+               + loop + 'git -C "$X" stash pop; }; f')
+    _assert_real_restore(command, main, wt)
+
+
+@pytest.mark.parametrize("template", [
+    'X={main}; declare -n R=X; R={wt}; cd "$X"; bash -c "git stash pop"',
+    'export X={main}; declare -n R=X; R={wt}; bash -c \'git -C "$X" stash pop\'',
+    'X={main}; N=-n; declare $N R=X; R={wt}; git -C "$X" stash pop',
+    'X={main}; N=-n; declare "$N" R=X; R={wt}; git -C "$X" stash pop',
+    'F=-x; declare $F GIT_DIR={gitdir} GIT_WORK_TREE={wt}; git -C {main} stash pop',
+    'X={main}; Y={wt}; declare -n R=X; for R in Y; do git -C "$R" stash pop; done',
+])
+def test_state_cap_join_nameref_boundaries(multi, template):
+    main, wt = multi
+    _assert_real_restore(template.format(main=main, wt=wt, gitdir=_gitdir(wt)), main, wt)
+
+
+def test_state_cap_join_delayed_function(multi):
+    main, wt = multi
+    command = ("for i in 1 2 3; do g; h; h(){ g(){ f(){ "
+               + f"git -C {wt} stash pop; " + "}; }; }; done; f")
+    _assert_real_restore(command, main, wt)
+
+
 def test_state_cap_collapses_to_unknown(multi, single, monkeypatch):
     _main, wt = multi
     dirs = _subdirs(single, guard.MAX_STATES + 4)
