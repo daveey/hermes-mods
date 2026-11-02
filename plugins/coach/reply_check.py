@@ -904,14 +904,53 @@ def continued_run(tool_log: Optional[list] = None) -> bool:
     return False
 
 
+# report_only vs a run-ending park (self-heal agent-9f966b0682): a Kanban worker blocked its card for the user's
+# decision (kanban_block needs_input + human_request; block_handoff had already judged that ask at block time) and
+# closed with "H5 is blocked, not complete, on the remaining scope decision". report_only nudged it; the block had
+# ended the run, so the revision turn's kanban_schedule was refused and no revised reply could pass. A turn that
+# parked its run the protocol's way (a block that asks a human per human_block, a goal-mode kind=time block, or a
+# kanban_schedule) is not a diagnosis left unowned. Dependency/transient/assignment blocks and capability+needs blocks
+# ask nobody and stay judged. Reads the `<- OK park={...}` facts line agent_rules.observe writes after a successful
+# park call (the call line itself is cut at 140 chars); a failed call gets `<- ERROR` and no park line.
+_PARK_LINE = "<- OK park="
+
+
+def lifecycle_park(tool_log: Optional[list] = None) -> bool:
+    """True when this turn's tool log shows a successful human block, kind=time block or kanban_schedule."""
+    for line in tool_log or []:
+        s = (line or "").lstrip()
+        if not s.startswith(_PARK_LINE):
+            continue
+        try:
+            f = json.loads(s[len(_PARK_LINE):])
+        except ValueError:
+            continue
+        if not isinstance(f, dict):
+            continue
+        if f.get("tool") == "kanban_schedule":
+            return True
+        if f.get("tool") == "kanban_block":
+            if f.get("kind") == "time":
+                return True
+            args = {"kind": f.get("kind") or "", "reason": "park",
+                    **({"human_request": {"ask": True}} if f.get("human_request") else {}),
+                    **({"needs": ["x"]} if f.get("needs") else {})}
+            if human_block("kanban_block", args):
+                return True
+    return False
+
+
 def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None) -> Optional[str]:
-    """Why report_only can't apply to this turn ("scope_limited" / "scheduled_wait" / "continued_run"), else None."""
+    """Why report_only can't apply to this turn ("scope_limited" / "scheduled_wait" / "continued_run" /
+    "lifecycle_park"), else None."""
     if scope_limited(user_ask):
         return "scope_limited"
     if scheduled_wait_status(user_ask, reply):
         return "scheduled_wait"
     if continued_run(tool_log):
         return "continued_run"
+    if lifecycle_park(tool_log):
+        return "lifecycle_park"
     return None
 
 

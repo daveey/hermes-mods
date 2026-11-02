@@ -1363,6 +1363,35 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
     return f"   <- OK {body}"[:OK_LINE_MAX]
 
 
+# agent-9f966b0682: report_only nudged a Kanban worker right after it blocked its card for the user's decision; the
+# block had ended the run, so no revised reply could pass. reply_check.lifecycle_park exempts a turn that parked its
+# run (a human block or a schedule). The `-> kanban_block(...)` line is cut at 140 chars, which drops `kind` and
+# `human_request` for any real reason text, so after a successful park call one `<- OK park={...}` line keeps the facts
+# reply_check.human_block needs to classify it (no reason text, no card id).
+PARK_TOOLS = ("kanban_block", "kanban_schedule")
+
+
+def park_result_line(tool: str, args: Any) -> Optional[str]:
+    """The `   <- OK park={...}` line for a park call (direct or via tool_call), else None. Callers skip failed calls."""
+    name = (tool or "").rsplit("__", 1)[-1]
+    a = args if isinstance(args, dict) else {}
+    if name == "tool_call":
+        for c in a.get("calls") or []:
+            if isinstance(c, dict):
+                got = park_result_line(str(c.get("name") or ""), c.get("arguments"))
+                if got:
+                    return got
+        return None
+    if name not in PARK_TOOLS:
+        return None
+    facts: dict = {"tool": name}
+    if name == "kanban_block":
+        facts.update(kind=str(a.get("kind") or ""), human_request=bool(isinstance(a.get("human_request"), dict)
+                                                                       and a.get("human_request")),
+                     needs=bool(a.get("needs")))
+    return "   <- OK park=" + json.dumps(facts, sort_keys=True)
+
+
 class AgentCoach:
     def __init__(self, checkout: Optional[Path] = None, signals=None, clock: Callable[[], float] = time.monotonic):
         self.checkout = checkout
@@ -1535,6 +1564,10 @@ class AgentCoach:
             if ok:  # what a successful owner check found, for the report_only judges (agent-9516de5af8)
                 s["turn_log"].append(ok)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(ok)
+            park = park_result_line(tool, args)
+            if park:  # this turn parked its run: reply_check.lifecycle_park (agent-9f966b0682)
+                s["turn_log"].append(park)
+                s.setdefault("turn_rich", deque(maxlen=60)).append(park)
         if is_kanban_call(tool, args):  # sticky across turns until the next Kanban call answers
             s["kanban_db_down"] = bool(failed(tool, result, status) and KANBAN_DB_DOWN.search(str(result)))
 
