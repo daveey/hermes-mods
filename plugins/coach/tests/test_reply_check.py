@@ -741,6 +741,121 @@ def test_denied_ask_skips_a_reply_that_already_tells_the_ask():
     assert hit and hit["rule"] == "denied_ask"
 
 
+# ---- agent-747c4fc95b: a correct correction quoted the old phrase and retold the ask in plain words (as the nudge
+# asks: "the work, not its card id"), yet the outcome still scored denied_ask. Shape of the 2026-11-01 revision (macbook
+# state.db msg 777717) and its card's human_request, household names replaced.
+_DOT_CARD = {
+    "id": "t_01a195f002051277", "status": "blocked", "block_kind": "needs_input",
+    "title": "Living Room Echo Dot mic has been off since 10-30 11:00 (\"Hey Home stop listening\"): keep it off or "
+             "turn it back on?",
+    "human_request": json.dumps({
+        "action": "Pick 'Turn it back on' or 'Keep it off' for the Living Room Echo Dot. It has been muted since 10-30 "
+                  "11:00 PDT, after someone said \"Hey Home stop listening\" to it (likely Sam; her watch got the same "
+                  "2 min later). You can pick 'Turn it back on', or just press its mic button; Hermes will detect that "
+                  "it is on and start the measurement without another click. Unblock = an agent turns its mic back on "
+                  "(or confirms it is on) and measures room Voice ID for 7 days; archive = it stays off, with no "
+                  "living-room voice commands or room Voice ID.",
+        "why_human": "A spoken 'stop listening' is a persistent household privacy choice.", "interaction": "reply",
+        "scope": "Living Room Echo Dot listening policy only.", "evidence": "listening.status mode stopped",
+        "choices": [{"label": "Turn it back on", "value": "on"}, {"label": "Keep it off", "value": "off"}]})}
+_DOT_REVISION = (
+    "Correction: one thing does need you, so \"Nothing needs you\" was wrong.\n\n"
+    "**The Living Room Echo Dot's mic is off.** Someone, probably Sam, told it \"Hey Home stop listening\" on Friday "
+    "10-30 at 11:00 AM PDT, and it has stayed off since. It was still off at the last check, 19:16 PST. While it's "
+    "off, the living room gets no voice commands, and the 7-day test of how well the room recognises voices can't "
+    "start. Agents aren't allowed to turn a mic back on after someone tells it to stop listening, so this is your call "
+    "(or Sam's).\n\n"
+    "- **What to do:** in Hermes, under For you, pick \"Turn it back on\" or \"Keep it off\" for the Living Room Echo "
+    "Dot. Or just press the mic button on the Dot.\n"
+    "- **If you turn it on (or press the button):** an agent turns it on or confirms it's already on, and the 7-day "
+    "test starts by itself. A button press is picked up within 15 minutes.\n"
+    "- **If you pick \"Keep it off\" or do nothing:** it stays off.")
+
+
+def _dot_asks():
+    return rc.linked_human_asks([dict(_DOT_CARD)])
+
+
+def test_denied_ask_passes_the_logged_correction_that_retells_the_ask():
+    """(a) the exact revision, with the real card's title/action/choices: no denied_ask."""
+    hit = rc.check(_DOT_REVISION, "anything need me?", [], _zero_judge, human_asks=_dot_asks, only=["denied_ask"])
+    assert hit is None
+
+
+def test_denied_ask_outcome_resolves_the_logged_correction():
+    """(e) the nudge outcome of that revision is resolved."""
+    res = rc.nudge_outcome("denied_ask", _DOT_REVISION, "anything need me?", [], _zero_judge, human_asks=_dot_asks)
+    assert res["resolved"] is True and res["asks"] == []
+
+
+def test_denies_ask_skips_a_quoted_phrase():
+    assert rc.denies_ask('So "Nothing needs you" was wrong.') is None
+    assert rc.denies_ask("I said “nothing needs you” earlier; that was wrong.") is None
+    assert rc.denies_ask('The old reply ("nothing needs you") was wrong. Nothing needs you now.') == "Nothing needs you"
+    assert rc.denies_ask("Nothing needs you.") == "Nothing needs you"
+
+
+def test_denied_ask_quoted_correction_without_the_ask_still_fails_its_outcome():
+    """(b) a revision that quotes the old phrase but never tells the ask is still unresolved: the quote alone doesn't
+    clear the outcome, only telling the ask does."""
+    rev = 'Correction: "Nothing needs you" was wrong; one thing does. I will look into it.'
+    res = rc.nudge_outcome("denied_ask", rev, "anything need me?", [], _zero_judge, human_asks=_dot_asks)
+    assert res["resolved"] is False and res["asks"] == ["t_01a195f002051277"]
+
+
+def test_denied_ask_still_fires_on_an_unquoted_denial_with_an_unrelated_ask():
+    """(c) an unquoted denial while an ask on another topic waits: still fires."""
+    hit = rc.check("The PR merged and CI is green. Nothing needs you.", "status?", [], _zero_judge,
+                   human_asks=_dot_asks)
+    assert hit and hit["rule"] == "denied_ask" and hit["asks"] == ["t_01a195f002051277"]
+
+
+def test_denied_ask_low_title_overlap_without_a_choice_label_still_fires():
+    """(d) a reply naming a few title words (under 60%) and no choice label is not telling the ask."""
+    reply = "The living room speaker is fine and the echo test passed. Nothing needs you."
+    assert not rc.ask_told(reply, _dot_asks()[0])
+    hit = rc.check(reply, "status?", [], _zero_judge, human_asks=_dot_asks)
+    assert hit and hit["rule"] == "denied_ask"
+
+
+def test_ask_told_by_choice_label_or_title_words():
+    ask = _dot_asks()[0]
+    assert ask["choices"] == ["Turn it back on", "Keep it off"]
+    assert rc.ask_told("Pick “Keep it off” if you want it quiet. Nothing else needs you.", ask)
+    assert rc.ask_told("The living room echo dot mic stop listening since friday: keep it or turn it back?", ask)
+    one_word = {"id": "t_x", "title": "Deploy", "action": "Approve the deploy", "choices": ["Yes", "No"]}
+    assert not rc.ask_told("No, nothing needs you.", one_word)  # one-word labels never count on their own
+
+
+def test_replay_denied_ask_rescores_logged_outcomes(tmp_path):
+    """Detection: the replay reads the logged outcome, the revision (state.db) and the card (board), and reports
+    the verdict the current code gives; a revision that still denies stays unresolved."""
+    import sqlite3
+    (tmp_path / "coach").mkdir()
+    rows = [{"ts": 1000.0 + i, "event": "reply_nudge_outcome", "rule": "denied_ask", "session_id": f"s{i}",
+             "resolved": False, "asks": ["default/t_01a195f002051277"]} for i in range(2)]
+    (tmp_path / "coach" / "log.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    s = sqlite3.connect(tmp_path / "state.db")
+    s.execute("create table messages (id integer primary key, session_id text, role text, content text, "
+              "timestamp real)")
+    s.execute("insert into messages (session_id, role, content, timestamp) values ('s0','assistant',?,999)",
+              (_DOT_REVISION,))
+    s.execute("insert into messages (session_id, role, content, timestamp) values ('s1','assistant',?,1000)",
+              ("All green. Nothing needs you.",))
+    s.commit()
+    s.close()
+    k = sqlite3.connect(tmp_path / "kanban.db")
+    k.execute("create table tasks (id text, title text, status text, block_kind text, human_request text)")
+    k.execute("insert into tasks values (?, ?, 'done', NULL, ?)",
+              (_DOT_CARD["id"], _DOT_CARD["title"], _DOT_CARD["human_request"]))
+    k.commit()
+    k.close()
+    import time as _t
+    got = {r["session_id"]: r for r in rc.replay_denied_ask(days=(_t.time() - 900) / 86400, home=tmp_path)}
+    assert got["s0"]["was"] is False and got["s0"]["now"] is True
+    assert got["s1"]["now"] is False
+
+
 # ---- agent-a806f203ab: a worker that closed its own card earlier in the turn, then named a done card as owner ----
 CLOSED_REPLY = (  # shape of the 2026-10-30 revised reply (msg 444875), product details removed
     "I fixed both gaps by pushing commit 849d3ff2 to PR #248. Exact-head CI on 849d3ff2 hasn't finished. The earlier "

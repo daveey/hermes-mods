@@ -432,10 +432,15 @@ DENY_ASK_RE = re.compile(
 _CODE_QUOTE = re.compile(r"```.*?```|`[^`]*`|^>.*$", re.DOTALL | re.MULTILINE)
 
 
-def denies_ask(reply: str) -> Optional[str]:
-    """The phrase in the reply saying no ask/approval is pending for the user (code and quotes ignored), else None."""
-    m = DENY_ASK_RE.search(_CODE_QUOTE.sub(" ", reply or ""))
-    return m.group(0) if m else None
+def denies_ask(reply: str, include_quoted: bool = False) -> Optional[str]:
+    """The phrase in the reply saying no ask/approval is pending for the user, else None. Code and `>` quotes are
+    ignored, and so is a phrase inside quote marks (a correction quoting the old denial, agent-747c4fc95b) unless
+    `include_quoted` (the nudge outcome: a revision quoting the old denial must still tell the ask)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    for m in DENY_ASK_RE.finditer(text):
+        if include_quoted or not _quoted(text, m.start(), m.end()):
+            return m.group(0)
+    return None
 
 
 def _ask_valid(value: Any, kind: Any) -> Optional[dict]:
@@ -469,9 +474,25 @@ def linked_human_asks(cards: list) -> list[dict]:
             continue
         ask = _ask_valid(c.get("human_request"), c.get("block_kind"))
         if ask:
-            out.append({"id": str(c.get("key") or c.get("id")), "title": str(c.get("title") or ""),
-                        "action": " ".join(ask["action"].split())})
+            row: dict = {"id": str(c.get("key") or c.get("id")), "title": str(c.get("title") or ""),
+                         "action": " ".join(ask["action"].split())}
+            labels = _choice_labels(c.get("human_request"))
+            if labels:
+                row["choices"] = labels
+            out.append(row)
     return out
+
+
+def _choice_labels(value: Any) -> list[str]:
+    """The `choices[].label` strings of a raw human_request (dict or JSON), else []."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    choices = value.get("choices") if isinstance(value, dict) else None
+    return [" ".join(c["label"].split()) for c in choices or []
+            if isinstance(c, dict) and isinstance(c.get("label"), str) and c["label"].strip()]
 
 
 def session_human_asks(session_id: str) -> list[dict]:
@@ -543,8 +564,19 @@ def ask_told(reply: str, ask: dict) -> bool:
     title = " ".join(str(ask.get("title") or "").lower().split())
     if len(title) >= 8 and title in " ".join(text.split()):
         return True
+    said = set(_WORD.findall(text))
     words = set(_WORD.findall(str(ask.get("action") or "").lower()))
-    return len(words) >= 3 and len(words & set(_WORD.findall(text))) / len(words) >= 0.6
+    if len(words) >= 3 and len(words & said) / len(words) >= 0.6:
+        return True
+    # agent-747c4fc95b: the nudge asks for the work in plain words, not the card id, so a retelling counts: one of the
+    # card's answer choices (multi-word labels only; "Yes"/"No" prove nothing), or most of the title's words.
+    flat = " ".join(re.sub(r"[\"'“”‘’`*]", " ", text).split())
+    for label in ask.get("choices") or []:
+        lab = " ".join(str(label).lower().split())
+        if len(lab.split()) >= 2 and re.search(r"(?<!\w)" + re.escape(lab) + r"(?!\w)", flat):
+            return True
+    tw = {w for w in _WORD.findall(title) if re.search(r"[a-z]", w)}
+    return len(tw) >= 4 and len(tw & said) / len(tw) >= 0.6
 
 
 DENIED_ASK_NUDGE = (
@@ -1741,7 +1773,8 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
         hit = check(reply, user_ask, tool_log, judge, threshold=threshold, only=[rule], thresholds=thresholds,
                     wake=wake, kanban_down=kanban_down, human_asks=human_asks, prev_turn=prev_turn,
                     confirm=second if confirm is not None else None, confirm_floor=confirm_floor,
-                    human_confirm_floor=human_confirm_floor, report_only_fallback=report_only_fallback, audit=audit)
+                    human_confirm_floor=human_confirm_floor, report_only_fallback=report_only_fallback, audit=audit,
+                    deny_quoted=True)
     except Exception:
         return {"p": None, "resolved": None, "evidence": "outcome check failed", "judged": seen["called"]}
     sc = seen["scored"] or {}
@@ -1803,8 +1836,10 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           card_status: Optional[Callable[[str], Optional[str]]] = None,
           capped_nudge: bool = True,
           report_only_fallback: str = REPORT_ONLY_FALLBACK,
-          prev_turn: Optional[dict] = None) -> Optional[dict]:
+          prev_turn: Optional[dict] = None, deny_quoted: bool = False) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `deny_quoted` (nudge_outcome only): a denied_ask phrase inside quote marks still counts, so a correction that
+    quotes its old denial resolves only by telling the ask (agent-747c4fc95b).
     `prev_turn` (AgentCoach.prev_turn): the previous turn's tool log and reply head, shown to the judge when this turn
     made almost no tool calls and followed it within minutes (prev_turn_section; agent-1f34642d7f).
     `capped_nudge=False` (Kanban worker turns): when the report_only second opinion was due but unavailable (daily
@@ -1814,8 +1849,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     fallback, held to thresholds["report_only_capped"].
     `card_status(card_id) -> status | None` looks up cards the reply names as owner (default: this host's boards,
     read-only); a done/archived one is the deterministic `closed_owner` report_only hit.
-    `human_asks()` lists asks waiting on the user from cards linked to the chat ([{id, title, action}]); it is called
-    only when the reply says nothing needs the user, and a hit is the deterministic `denied_ask` rule.
+    `human_asks()` lists asks waiting on the user from cards linked to the chat ([{id, title, action, choices?}]);
+    it is called only when the reply says nothing needs the user, and a hit is the deterministic `denied_ask` rule.
     `thresholds` ({rule: th}) overrides `threshold` per rule; with it, the top rule among those over their own
     threshold wins.
     `confirm() -> (p, evidence) | None` is the report_only second opinion (aux task `coach_report_only`, real tool
@@ -1831,7 +1866,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     # walls the scheduled wait is one of) can't apply, so neither the deterministic checks nor the judge see it.
     scoped = bool(report_only_guard(user_ask, reply, tool_log))
     if human_asks is not None and (not only or "denied_ask" in only):
-        phrase = denies_ask(reply)
+        phrase = denies_ask(reply, include_quoted=deny_quoted)
         asks = []
         if phrase:
             try:
@@ -2093,6 +2128,69 @@ def backtest(rule: str, days: float, db=None, drafts=None) -> list:
     return hits
 
 
+# agent-747c4fc95b: `reply_check.py replay-denied-ask --days 30` reruns the denied_ask nudge outcome over the logged
+# outcomes in <coach>/log.jsonl: the revision is the session's last assistant message at the outcome time (state.db),
+# the asks are the logged card ids read back from the boards (any status, with their choices). It prints every
+# outcome whose verdict the current code changes, so a matcher change is measured against real revisions.
+def replay_denied_ask(days: float, home=None) -> list:
+    """[{ts, session_id, asks, was, now, evidence, reply}] for logged denied_ask outcomes newer than `days`."""
+    from pathlib import Path
+    home = Path(home) if home else _hermes_home()
+    since = time.time() - days * 86400
+    log = home / "coach" / "log.jsonl"
+    rows = []
+    for line in (log.read_text(errors="replace").splitlines() if log.exists() else []):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(r, dict) and r.get("event") == "reply_nudge_outcome" and r.get("rule") == "denied_ask"
+                and float(r.get("ts") or 0) >= since):
+            rows.append(r)
+    boards = [home / "kanban.db"] + sorted((home / "kanban" / "boards").glob("*/kanban.db"))
+
+    def card(cid: str) -> Optional[dict]:
+        slug, _, tid = cid.rpartition("/")
+        named = [p for p in boards if (p.parent.name if p.parent.parent.name == "boards" else "default") == slug]
+        for path in named + [p for p in boards if p not in named]:  # a gateway prefix (hub/t_x) names no board
+            if not path.exists():
+                continue
+            conn = _ro_connect(path, timeout=2)
+            try:
+                got = conn.execute("select id, title, block_kind, human_request from tasks where id=?",
+                                   (tid,)).fetchone()
+            finally:
+                conn.close()
+            if got:  # replay the ask as it was: treat the card as still waiting on the user
+                return {"id": cid, "title": got[1], "status": "blocked", "block_kind": got[2] or "needs_input",
+                        "human_request": got[3]}
+        return None
+
+    out = []
+    db = home / "state.db"
+    conn = _ro_connect(db) if db.exists() else None
+    try:
+        for r in rows:
+            ids = [str(a) for a in (r.get("asks") or [])]
+            if not ids or conn is None:
+                continue  # rows before ask-id logging can't be replayed against their cards
+            got = conn.execute("select content from messages where session_id=? and role='assistant' and "
+                               "timestamp <= ? and content is not null and content != '' order by timestamp desc "
+                               "limit 1", (r.get("session_id"), float(r["ts"]) + 1)).fetchone()
+            if not got:
+                continue
+            cards = [c for c in (card(i) for i in ids) if c]
+            res = nudge_outcome("denied_ask", got[0], "", [], lambda s, p: "{}",
+                                human_asks=lambda: linked_human_asks(cards))
+            out.append({"ts": r.get("ts"), "session_id": r.get("session_id"), "asks": ids,
+                        "was": r.get("resolved"), "now": res.get("resolved"), "evidence": res.get("evidence"),
+                        "reply": got[0]})
+    finally:
+        if conn is not None:
+            conn.close()
+    return out
+
+
 def main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="reply_check.py")
@@ -2102,7 +2200,20 @@ def main(argv=None) -> int:
     bt.add_argument("--days", type=float, default=14)
     bt.add_argument("--db", help="state.db (default <HERMES_HOME>/state.db)")
     bt.add_argument("--drafts", help="drafts.jsonl (default <HERMES_HOME>/coach/drafts.jsonl)")
+    rp = sub.add_parser("replay-denied-ask", help="rerun logged denied_ask nudge outcomes on their revisions and cards")
+    rp.add_argument("--days", type=float, default=30)
+    rp.add_argument("--home", help="Hermes home (default $HERMES_HOME)")
+    rp.add_argument("--all", action="store_true", help="print every replayed outcome, not only changed ones")
     a = ap.parse_args(argv)
+    if a.cmd == "replay-denied-ask":
+        rows = replay_denied_ask(a.days, a.home)
+        for r in rows:
+            if a.all or r["was"] != r["now"]:
+                print(f"{r['ts']}\t{r['session_id']}\twas={r['was']} now={r['now']}\t{','.join(r['asks'])}\t"
+                      f"{' '.join(str(r['reply']).split())[:160]}")
+        changed = sum(1 for r in rows if r["was"] != r["now"])
+        print(f"denied_ask outcomes replayed: {len(rows)}, verdict changed: {changed}")
+        return 0
     hits = backtest(a.rule, a.days, a.db, a.drafts)
     for src, sid, ev in hits:
         print(f"{src}\t{sid}\t{' '.join(str(ev).split())[:160]}")
