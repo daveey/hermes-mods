@@ -381,6 +381,58 @@ class BoundedCallTests(unittest.TestCase):
             rc = w.main(["c" * 40, "--gh-repo", "o/r", "--interval", "0", *extra])
         return rc, buf.getvalue()
 
+    def _event_runs(self):
+        sha = "c" * 40
+        pushes = [dict(run(sha, wf=name), event="push")
+                  for name in ("CI", "Docker", "Nix", "Workflow lint", "State tests")]
+        meta = [dict(run(sha, wf="Review", status="in_progress", conclusion=""), event="workflow_run"),
+                dict(run(sha, wf="Recovery", conclusion="failure"), event="workflow_run"),
+                dict(run(sha, wf="Comment", conclusion="success"), event="workflow_run")]
+        return pushes, meta
+
+    def test_discovery_ignores_workflow_run_even_on_same_head(self):
+        pushes, meta = self._event_runs()
+        state = w.evaluate(meta + pushes, ["c" * 40], lambda c, s: c == s, None)
+        self.assertEqual(set(state), {r["workflowName"] for r in pushes})
+        self.assertTrue(all(s["done"] for s in state.values()))
+
+    def test_once_ignores_active_and_failed_meta_runs_and_prints_only_pushes(self):
+        pushes, meta = self._event_runs()
+        rc, out = self._discovered_out([meta + pushes], "--once")
+        self.assertEqual(rc, 0, out)
+        for r in pushes:
+            self.assertIn(r["url"], out)
+        for r in meta:
+            self.assertNotIn(r["workflowName"], out)
+
+    def test_once_ignores_failed_meta_run_without_active_runs(self):
+        pushes, meta = self._event_runs()
+        rc, out = self._discovered_out([[meta[1]] + pushes], "--once")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("Recovery", out)
+
+    def test_same_name_meta_run_cannot_supply_success_failure_or_activity(self):
+        push = dict(run("c", conclusion="failure"), event="push")
+        for status, conclusion in (("completed", "success"), ("completed", "failure"), ("in_progress", "")):
+            with self.subTest(status=status, conclusion=conclusion):
+                meta = dict(run("c", status=status, conclusion=conclusion, n=1), event="workflow_run")
+                state = w.evaluate([meta, push], ["c"], contains, None)["CI"]
+                self.assertIsNone(state["done"])
+                self.assertEqual(state["failed"], push)
+                self.assertEqual(state["active"], 0)
+
+    def test_explicit_workflow_run_waits_and_then_accepts_success(self):
+        for selector in ("ci.yml", "CI"):
+            with self.subTest(selector=selector):
+                active = dict(run("c" * 40, status="in_progress", conclusion=""),
+                              event="workflow_run", _wf=selector)
+                green = dict(active, status="completed", conclusion="success")
+                rc, out = self._discovered_out([[active]], "--workflow", selector, "--once")
+                self.assertEqual(rc, 2, out)
+                rc, out = self._discovered_out([[green]], "--workflow", selector, "--once")
+                self.assertEqual(rc, 0, out)
+                self.assertIn(green["url"], out)
+
     def test_once_passes_when_the_only_other_workflow_skipped(self):
         green, skipped = run("c" * 40), run("c" * 40, wf="Recovery", conclusion="skipped")
         rc, out = self._discovered_out([[skipped, green]], "--once")

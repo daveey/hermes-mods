@@ -17,7 +17,9 @@ Done when:
                     commit containing the sha concluded `success`. A discovered
                     workflow whose runs there all ended `skipped` (no job ran) counts
                     as done, printed "skipped", once none of its runs on the sha
-                    itself is queued or running; a --workflow one must succeed
+                    itself is queued or running; a --workflow one must succeed.
+                    workflow_run events are ignored unless --workflow is given:
+                    their headSha belongs to the default branch, not the triggering run
 
 Exit codes: 0 done; 1 stalled (nothing queued/running will finish it: the newest
 finished run containing the commit failed, or no run will ever pick it up), or
@@ -108,14 +110,17 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
 
     `runs` are newest first. A run counts for the commit when its headSha
     contains every sha. Cancelled runs are ignored (they were replaced).
+    workflow_run events carry the default branch's head, not the triggering run's
+    commit. Exclude them from discovery AND evidence/activity unless --workflow
+    explicitly opts in (for example, a post-CI deploy).
 
-    A discovered workflow (no --workflow) whose runs containing the commit all ended `skipped` is done, with
-    'skipped' set: every job's `if:` was false, so it checked nothing and can never succeed. A `workflow_run`
-    "runner-loss recovery" job that acts only after a failed run ends that way on every green commit, and
-    waiting for its success held every discovered wait at "not yet" with nothing queued or
-    running. It still waits while a run of that workflow on the sha itself is queued or running. A workflow
+    A discovered workflow whose runs containing the commit all ended `skipped` is done, with
+    'skipped' set: every job's `if:` was false, so it checked nothing and can never succeed.
+    It still waits while a run of that workflow on the sha itself is queued or running. A workflow
     named with --workflow must succeed: a skip there is not a pass.
     """
+    if not workflows:
+        runs = [r for r in runs if r.get("event") != "workflow_run"]
     relevant = [r for r in runs if all(contains(r["headSha"], s) for s in shas)]
     names = workflows if workflows else sorted({workflow_key(r) for r in relevant})
     state = {}
