@@ -1398,8 +1398,11 @@ class _Analyzer:
             self.shadow_argv(words, st, depth)
             if os.path.basename(wrapper_words[0] or "") in EXTERNAL_WRAPPERS:
                 # A wrapper program runs its argv in a child process: only that argv is
-                # uncertain (analyzed above; config it writes sets config_alias there), never
-                # the caller's cwd, variables or functions.
+                # uncertain (analyzed above), never the caller's cwd, variables or functions.
+                # That child may still write Git config, an include or a `git-*` program
+                # the guard cannot see (`sh -c 'base64 -d >> .git/config'`): a later
+                # non-builtin subcommand may be an alias, as it was when the state collapsed.
+                self.config_alias = True
                 return [st], [st]
             unknown = _unknown([st])
             return [unknown], [unknown]

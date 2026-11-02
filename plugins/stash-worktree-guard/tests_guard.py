@@ -524,6 +524,15 @@ def test_external_wrapper_keeps_caller_state(multi, template):
     "G=git; nice -n 5 true; $G -C {wt} stash pop",
     # Config the wrapped child writes is shared state: a later alias call stays refused.
     "env A=1 git config alias.p 'stash pop'; git -C {wt} p",
+    # The child may also write Git config, an include or a `git-*` program with no Git text
+    # the guard can see (base64 of `[alias] p = stash pop`, `[include] path = ../../inc`,
+    # `exec git stash pop`): a later non-builtin subcommand may run it (2026-11-02).
+    "env A=1 sh -c 'echo W2FsaWFzXQoJcCA9IHN0YXNoIHBvcAo= | base64 -d >> .git/config'; "
+    "git -C {wt} p",
+    "echo W2FsaWFzXQoJcCA9IHN0YXNoIHBvcAo= | base64 -d > ../inc; env -u X sh -c "
+    "'echo W2luY2x1ZGVdCglwYXRoID0gLi4vLi4vaW5jCg== | base64 -d >> .git/config'; git -C {wt} p",
+    "mkdir -p ../bin; nice -n 5 sh -c 'echo IyEvYmluL3NoCmV4ZWMgZ2l0IHN0YXNoIHBvcAo= | base64 -d "
+    "> ../bin/git-p && chmod +x ../bin/git-p'; PATH=$PWD/../bin:$PATH git -C {wt} p",
     # Builtins and keywords run in the caller: its state stays unknown after them.
     "command -p cd {wt}; git stash pop",
     "time -p cd {wt}; git stash pop",

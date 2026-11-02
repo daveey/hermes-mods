@@ -51,7 +51,9 @@ This plugin:
   `command -p`, `exec -a`) and `coproc` as uncertain, including absolute wrapper paths
   and scalar wrapper names. Simple option-free wrappers remain supported. Only the wrapped
   argv is uncertain after a wrapper *program* (`env`, `nice`, `nohup`, `stdbuf`, `sudo`,
-  `timeout`): it runs in a child process, so the caller's cwd and variables stay known. After
+  `timeout`): it runs in a child process, so the caller's cwd and variables stay known. The
+  child may still write Git config, an include or a `git-*` program the guard cannot read, so
+  a later non-builtin Git subcommand counts as a possible alias. After
   a builtin or keyword (`command`, `builtin`, `exec`, `time`, `coproc`) they become unknown. `timeout` is
   parsed exactly (`--foreground`, `--preserve-status`, `-v`, `-k`/`--kill-after`,
   `-s`/`--signal` in both spellings, then a numeric duration); any other shape is
@@ -292,3 +294,9 @@ commands after them. `test_external_wrapper_keeps_caller_state` keeps those shap
 `test_external_wrapper_state_refusal_controls` runs these in bash and checks they are still
 refused: the wrapped restore, state tracked after the wrapper, config written by the child,
 and builtins (`command -p cd`, `time -p cd`).
+
+A review of that change found it also dropped an incidental refusal: a wrapped child that writes
+an alias, an include or a `git-*` program through base64 (`env A=1 sh -c 'echo … | base64 -d >>
+.git/config'; git -C <wt> p`) really restored another branch's stash and was allowed. Before, the
+collapsed `HOME` made `p` a possible alias. The wrapper branch now sets that alias flag directly;
+the three shapes are in `test_external_wrapper_state_refusal_controls`.
