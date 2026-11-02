@@ -42,6 +42,8 @@ _ASK = re.compile(
     r"|\byou can (revoke|cancel|add|enable|grant|do it yourself|sign in)\b"
     r"|\b(reply|answer|say|tell me) (with )?[\"'“]?(yes|no|go)\b"
     r"|\b(let me know|tell me) (if|whether|which|when)\b"
+    r"|(?<!not )(?<!n't )(?<!n’t )\btell me here directly\b"
+    r"|^(?:when (?:it|the (?:review|evaluation)) completes, )?(?:david|the user) (?:reads? (?:the )?recommendation and )?decides (?:the path forward|what to do next|whether)\b"
     r"|\bplease (confirm|approve|decide|pick|choose|reply|sign|add|click|revoke|cancel)\b"
     r"|\bneeds? (?:a )?manual nudge on (?:the )?(?:kanban )?board\b"
     r"|\b(unblock|unblocks) (it|the card|t_[0-9a-f]{8})\b",
@@ -88,7 +90,8 @@ _CARD_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")  # legacy 8-hex and 
 _LEFTOVER = re.compile(
     r"\bdavid'?s (call|decision|choice)\b|\bup to david\b|\bdavid (should|must|needs to|will need to|can)\b"
     r"|\bneeds? david\b|\bfor david to\b|\bleft (for|to) david\b|\bask david\b|\bneeds? (your|the user'?s) "
-    r"(call|decision|approval)\b|\bthe user (should|must|needs to)\b", re.I)
+    r"(call|decision|approval)\b|\bthe user (should|must|needs to)\b"
+    r"|^(?:when (?:it|the (?:review|evaluation)) completes, )?(?:david|the user) (?:reads? (?:the )?recommendation and )?decides (?:the path forward|what to do next|whether)\b", re.I)
 _DAVID_ACTION = re.compile(
     r"\bneeds? (you|david)\b|\bdavid'?s call\b|\bdavid (must|should|needs? to)\b|\bwaiting on (you|david)\b"
     r"|\bneeds? your\b", re.I)

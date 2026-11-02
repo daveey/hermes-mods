@@ -61,6 +61,10 @@ leftover the judge does not pass as a checked `ok` is rewritten `FYI (unverified
 starts with it. "Nothing … from your side/end" is status, not a leftover. Why: on 10-30 a hub worker's handoff told
 David "Please run this from your side:" above an `ssh … hermes kanban unblock` loop, and no shape matched.
 Tests: `tests/test_ask_gate.py` (`week_1026`, `shell_command_handback`, `final_send_leftover_keeps_its_header`).
+`tests/test_weekly_deferrals.py` also covers the decision handback “When it completes, the user reads the
+recommendation and decides the path forward” in both ask and leftover detection, and “tell me here directly”
+in ask detection. These are candidates for the existing judge, not automatic refusals. Descriptive UI flows,
+past decisions, and negated direct-reply requests remain negative controls.
 
 **action_request approvals (L3).** user-steps `action_request` publishes an approval/choice card directly, so `pre_tool_call` judges each `kind: approval|choice` publish (never a `withdraw`) on its title + scope against the user's typed messages from the WHOLE session (runtime notices dropped; the most relevant ones plus the newest 8, cut to the judge's 30-message window). `already_answered` or `agent_can_do` blocks with the user's quoted words and tells the agent to do the work; any other verdict, or no reachable judge, lets it publish. Held at most twice per (session, title). Log events: `action_request_held|judged|released|judge_unavailable`. Tests: `tests/test_action_request_gate.py`.
 
