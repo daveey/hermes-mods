@@ -240,8 +240,78 @@ the stash unchanged when an injected alias tries to shadow hash-object.
 `test_all_known_builtins_ignore_alias_uncertainty` exercises each listed non-stash name.
 The inventory is the intersection of measured Git 2.50.1, 2.54.0 and 2.55.0 builtin lists,
 minus `pack-redundant` and `whatchanged` (deprecated commands may be shadowed).
-This establishes command-name precedence only, not safety of a builtin's nested commands;
-Git runner arguments such as `for-each-repo ... x` are not modeled here.
+This establishes command-name precedence only, not safety of a builtin's nested commands.
+
+### Bounded nested Git runners
+
+Six explicit sites additionally analyze their child programs: `for-each-repo`, `bisect run`,
+`submodule--helper foreach`, public `submodule foreach`, `difftool --extcmd/-x`, and
+`rebase --exec/-x`. The builtin inventory is unchanged. Other builtin arguments are not
+interpreted as programs.
+
+- `for-each-repo` uses implicit Git argv, with `--config VALUE`/`--config=VALUE`,
+  keep-going flags and `--`. `bisect run` uses process argv: a single quoted
+  `"git stash pop"` operand is **not** split into three words or prefixed with Git.
+- Foreach uses shell text for one operand. Multiple operands follow Git's `use_shell`
+  (run-command.c `prepare_shell_cmd`): a first operand containing a shell metacharacter
+  (``|&;<>()$`\"'``, space, tab, newline, `*?[#~=%`) runs as `sh -c '<first> "$@"'`, so later operands are
+  appended to that code as quoted data words (unknown operands stay unknown words), never
+  re-parsed as code; otherwise the operands are literal process argv. The helper's
+  parse-options also permutes: recognized foreach options after the command word are
+  removed, the first later `--` is dropped, and an unknown option-like word takes the
+  conservative refusal path (Git rejects it without running anything). The public frontend
+  passes `-- "$@"`, so its later operands are all data. Helper quiet/recursive flags,
+  negations, `--super-prefix` and `--` are recognized conservatively. Public frontend parity is
+  for the executable command slot, not identical option acceptance: on tested Git 2.55.0
+  the public shell frontend rejects `--` and negated foreach flags before the command, while
+  the helper accepts them. These invalid public forms still receive conservative analysis.
+- Difftool and rebase recognize separated, equals and attached-short exec values,
+  repeated exec options, value-taking options and `--` termination. Unknown option
+  arities, abbreviations and clusters take a conservative refusal path; this is not a
+  complete Git option parser. Difftool's helper runs `eval $GIT_DIFFTOOL_EXTCMD '"$LOCAL"'
+  '"$REMOTE"'`, so the value is field-split on space/tab/newline and rejoined with single
+  spaces before analysis (a newline in `--extcmd` is only a word separator), followed by two
+  unknown operands. Bare `git stash pop` can fail from those operands while difftool
+  returns zero; the real restore proofs use `sh -c` or `...;:` and check file bytes and stash
+  removal. Because LOCAL/REMOTE are unknown words, an alias-tainted difftool child Git call
+  (`git -c alias.x=... difftool -x 'git stash list'`) is refused like any alias-tainted
+  unknown word.
+- Child repositories/HEAD are unknown, even when the outer checkout matches the stash.
+  Repository lists, empty diffs and no scheduled work do not exempt dangerous code.
+  Outer alias/include/config-environment/HOME uncertainty is inherited only by that
+  invocation's children; actual earlier config writes retain their existing sticky taint.
+  Child shell state is isolated. Depth and step exhaustion in a recognized slot refuse
+  unresolved execution rather than returning a safe builtin verdict.
+
+`test_nested_runner_real_execution` checks `refuse_reason` and the terminal hook before
+running direct and outer-alias restores in disposable linked worktrees and initialized
+local submodules. It verifies stash removal and restored bytes, including rebase's
+nonzero exit *after* restoring. `test_nested_runner_real_option_syntax` executes accepted
+option spellings; `test_nested_runner_real_nonrestoring_controls` checks missing config,
+empty diff, bare difftool, bisect argv, invalid helper and builtin-shadow controls.
+Parser, inherited/isolated taint and budget tests cover the bounded static policy.
+Public-submodule alias uncertainty and unknown stash-ref uncertainty were already
+refused by the baseline and are explicitly named existing controls, not new RED proofs.
+The existing wrapper-state refusal controls and full read-only allow corpus remain.
+`test_nested_runner_real_positional_operands` executes foreach shell-special first operands
+with appended operands (`'git stash' pop`, `'exec git' stash pop`, `'git stash' apply`, an
+assignment prefix, an outer-alias `'exec git' x`, helper `-- pop` and `--quiet pop`
+permutation) and difftool's newline-joined `-x` value, verifying restored bytes and stash
+removal; `test_nested_runner_real_positional_readonly` executes appended read-only operands,
+`echo` data, helper `--` and alias-tainted `git status` controls with unchanged stash, file
+and status. Positional parser tests cover unknown operands and the over-refusals below.
+
+Execution evidence for this change is Linux Git 2.55.0 and a locally compiled Git 2.47.3
+(full suite and the disposable repro both pass with identical outcomes); macOS execution
+remains unverified. Stored difftool config, interactive rebase todo/editor
+commands, arbitrary builtin runners/hooks, bisect view/visualize, custom helper update
+commands and repository-list inference are outside this change. Positional parameters
+referenced *inside* foreach code (`'git stash "$1"' list`) and `$0` are not bound to the
+operands: they stay unknown and such a stash call is refused. Difftool globbing of the
+unquoted value before eval is not modeled beyond the analyzer's unknown-glob handling. A
+public `git submodule foreach 'git stash' -- pop` (really `git stash -- pop`, which Git
+rejects here) is refused by the existing stash-op parser. This is not a shell
+or Git security boundary.
 `test_awk_command_primitive_refusal_controls` retains
 system/pipe/indirect-call controls and Perl parity; `test_awk_primitives_really_restore_cross_branch`
 executes four refused forms only in disposable repositories to prove they really restore.

@@ -1085,6 +1085,9 @@ class _Analyzer:
         # `$(case a in a) ...)` ends at the pattern's `)`), so the rest of the original command
         # may never have been analyzed: the caller then fails closed on the whole text.
         self.uncertain = False
+        # Counts uncertainty other than unknown words in a git argv, which git() itself
+        # models precisely. A Git runner child refuses on any increase of this counter.
+        self.unanalyzed = 0
         # >0 while re-analyzing a fragment whose boundaries are uncertain (ANSI-C text,
         # unsupported wrapper argv): every git call found there gets an unknown repo, so the
         # re-analysis can only add refusals, never remove one.
@@ -1094,6 +1097,7 @@ class _Analyzer:
         self.home0 = os.environ.get("HOME")
         self.pipe_text: Optional[str] = None  # text of earlier commands of the current pipeline
         self.config_alias = False  # an earlier `git config alias.*` in this command
+        self.child_alias = False  # inherited only while analyzing a Git runner child
 
     def record(self, repo, sub, args, note: Optional[str] = None):
         """``note``: the unresolved shell word that alone made this a possible restore."""
@@ -1137,9 +1141,11 @@ class _Analyzer:
             self.shadow -= 1
             self.splitting = False
 
-    def fail_closed(self, text: str):
+    def fail_closed(self, text: str, git_words: bool = False):
         """Analysis gave up on ``text``: any restore it may contain runs in an unknown repo."""
         self.uncertain = True
+        if not git_words:
+            self.unanalyzed += 1
         for op in _restore_evidence(text or ""):
             self.record(None, "stash", [op])
 
@@ -1587,7 +1593,7 @@ class _Analyzer:
         if cmd == "git" or (cmd.startswith("git-") and len(cmd) > 4):
             expanded = [_expand_word(w, st.vars) for w in raw]
             if any(w is None for w in expanded):
-                self.fail_closed(" ".join(raw))
+                self.fail_closed(" ".join(raw), git_words=True)
             if cmd != "git":  # dashed form: `git-stash pop` is `git stash pop`
                 raw, expanded = ["git", cmd[4:], *raw[1:]], ["git", cmd[4:], *expanded[1:]]
             self.git(raw, expanded, st, prefix, depth)
@@ -1730,6 +1736,192 @@ class _Analyzer:
                 new.exported.add(name)
         return [new], [new]
 
+    def nested_git_command(self, mode, argv, st, prefix, depth, aliased):
+        """One explicit Git child boundary. Preserve argv; never export child shell state.
+
+        Invocation-local alias uncertainty is distinct from sticky config writes. Unknown
+        repositories and executable slots cannot acquire safety from the outer checkout.
+        """
+        if not argv:
+            return
+        if depth >= MAX_DEPTH or self.steps >= MAX_STEPS:
+            self.record(None, "stash", ["pop"], "nested Git execution budget")
+            return
+        child = self.child(st, prefix)
+        child.cwd = child.lcwd = None
+        previous = self.child_alias
+        self.child_alias |= aliased
+        self.shadow += 1
+        try:
+            if mode == "shell":
+                if argv[0] is None:
+                    self.record(None, "stash", ["pop"], "unknown Git child program")
+                else:
+                    # argv[1:] are positional operands Git passes as `sh -c '<code> "$@"'`
+                    # (run-command.c prepare_shell_cmd) or difftool appends after its eval.
+                    # They are appended as quoted data words, never re-parsed as code;
+                    # unknown operands stay unknown-word markers.
+                    text = argv[0]
+                    if len(argv) > 1:
+                        text += " " + " ".join(
+                            _UNKNOWN_WORD if w is None else shlex.quote(w) for w in argv[1:])
+                    before = self.unanalyzed
+                    self.run_text(text, [child], depth + 1)
+                    if self.unanalyzed != before:
+                        self.record(None, "stash", ["pop"], "unresolved Git child program")
+            else:
+                # Quote *expanded* scalar words so shell expansion is not performed twice.
+                # Unknowns remain markers rather than becoming quoted literal '$?' data.
+                words = (['git'] if mode == "git" else []) + [
+                    _UNKNOWN_WORD if w is None else shlex.quote(w) for w in argv]
+                if argv[0] is None:
+                    self.record(None, "stash", ["pop"], "unknown Git child executable")
+                self.simple(("simple", [], words, []), child, depth + 1, nested=True)
+        except (_ParseError, _Budget, RecursionError):
+            self.record(None, "stash", ["pop"], "unresolved Git child program")
+        finally:
+            self.shadow -= 1
+            self.child_alias = previous
+
+    def git_runner(self, sub, args, st, prefix, depth, aliased):
+        """Only the six documented execution sites, not generic builtin argument scans."""
+        def child(mode, argv):
+            self.nested_git_command(mode, argv, st, prefix, depth, aliased)
+
+        def ambiguous():
+            self.record(None, "stash", ["pop"], "ambiguous Git runner options")
+
+        if sub == "bisect":
+            if args and args[0] == "run":
+                child("process", args[1:])
+            return
+        if sub in ("submodule", "submodule--helper"):
+            # Public frontend also accepts quiet before the foreach subcommand.
+            while sub == "submodule" and args and args[0] in ("-q", "--quiet"):
+                args = args[1:]
+            if not args or args[0] != "foreach":
+                return
+            args = args[1:]
+            k = 0
+            ended = sub == "submodule"  # the public script passes `-- "$@"` to the helper
+            while k < len(args):
+                opt = args[k]
+                if opt == "--":
+                    k += 1
+                    ended = True
+                    break
+                if opt in ("-q", "--quiet", "--recursive", "--no-quiet", "--no-recursive"):
+                    k += 1
+                elif opt == "--super-prefix":
+                    k += 2
+                elif opt and opt.startswith("--super-prefix="):
+                    k += 1
+                elif opt is None or opt.startswith("-"):
+                    ambiguous()
+                    return
+                else:
+                    break
+            argv = args[k:]
+            if argv and not ended:
+                # The helper's parse_options (flags 0) permutes: options after the command
+                # word are still options until the first `--`, which is itself removed.
+                rest, j = [], 1
+                while j < len(argv):
+                    opt = argv[j]
+                    if opt == "--":
+                        rest += argv[j + 1:]
+                        break
+                    if opt in ("-q", "--quiet", "--recursive", "--no-quiet", "--no-recursive") \
+                            or (opt and opt.startswith("--super-prefix=")):
+                        j += 1
+                        continue
+                    if opt == "--super-prefix":
+                        j += 2
+                        continue
+                    if opt is not None and opt.startswith("-") and opt != "-":
+                        ambiguous()  # Git rejects unknown options; never guess their arity
+                        return
+                    rest.append(opt)
+                    j += 1
+                argv = argv[:1] + rest
+            if argv:
+                # Git's use_shell (run-command.c prepare_shell_cmd): metacharacters in
+                # argv[0] select `sh -c '<argv0> "$@"' <argv0> <argv1...>`, so remaining
+                # operands are appended positional data, not code. Otherwise argv is exec'd.
+                special = argv[0] is not None and re.search(r"[|&;<>()$`\\\"' \t\n*?\[#~=%]", argv[0])
+                child("shell" if len(argv) == 1 or special else "process", argv)
+            return
+        if sub == "for-each-repo":
+            k = 0
+            while k < len(args):
+                opt = args[k]
+                if opt == "--":
+                    k += 1
+                    break
+                if opt in ("--keep-going", "--no-keep-going"):
+                    k += 1
+                elif opt == "--config":
+                    k += 2
+                elif opt and opt.startswith("--config="):
+                    k += 1
+                elif opt is not None and opt.startswith("-"):
+                    ambiguous()
+                    return
+                else:
+                    break
+            child("git", args[k:])
+            return
+        if sub not in ("difftool", "rebase"):
+            return
+        long = "--extcmd" if sub == "difftool" else "--exec"
+        values = ({"--tool", "-t", "--output", "--rotate-to", "--skip-to", "--diff-filter",
+                   "--src-prefix", "--dst-prefix", "--line-prefix"} if sub == "difftool" else
+                  {"--onto", "--upstream", "--strategy", "-s", "--strategy-option", "-X",
+                   "--whitespace"})
+        flags = ({"-y", "--no-prompt", "--prompt", "-d", "--dir-diff", "--no-dir-diff",
+                  "--trust-exit-code", "--no-trust-exit-code", "--gui", "-g", "--no-gui",
+                  "--symlinks", "--no-symlinks", "--cached", "--staged", "--no-index",
+                  "--stat", "--name-only", "--name-status", "--exit-code", "--quiet"}
+                 if sub == "difftool" else
+                 {"-i", "--interactive", "--continue", "--abort", "--quit", "--skip", "--edit-todo",
+                  "--root", "--keep-base", "--fork-point", "--no-fork-point", "--autosquash",
+                  "--no-autosquash", "--autostash", "--no-autostash", "--update-refs",
+                  "--no-update-refs", "--rebase-merges", "--no-rebase-merges", "-r", "-m",
+                  "--merge", "--apply", "--force-rebase", "-f", "--no-ff", "--ff", "-q",
+                  "--quiet", "-v", "--verbose", "--stat", "--no-stat", "--signoff", "--no-signoff",
+                  "--committer-date-is-author-date", "--gpg-sign", "-S"})
+        def exec_value(value):
+            if sub == "rebase" or value is None:
+                child("shell", [value])
+                return
+            # git-difftool--helper.sh runs `eval $GIT_DIFFTOOL_EXTCMD '"$LOCAL"' '"$REMOTE"'`:
+            # the unquoted value is field-split on default IFS and rejoined with single
+            # spaces before eval (a newline becomes a space), then two unknown operands follow.
+            fields = [f for f in re.split(r"[ \t\n]+", value) if f]
+            child("shell", [" ".join(fields), None, None])
+
+        k = 0
+        while k < len(args):
+            opt = args[k]
+            if opt == "--":
+                return
+            if opt in (long, "-x"):
+                exec_value(args[k + 1] if k + 1 < len(args) else None)
+                k += 2
+            elif opt and (opt.startswith(long + "=") or opt.startswith("-x")):
+                exec_value(opt.split("=", 1)[1] if opt.startswith(long + "=") else opt[2:])
+                k += 1
+            elif opt in values:
+                k += 2
+            elif opt in flags or (opt and opt.split("=", 1)[0] in values and "=" in opt):
+                k += 1
+            elif opt is None or opt.startswith("-"):
+                # Abbreviations and clusters with unmodeled arity never hide a slot.
+                ambiguous()
+                return
+            else:
+                k += 1  # parse-options permits options after revision operands
+
     def git(self, raw, ex, st, prefix, depth=MAX_DEPTH):
         """Record the git call; ``ex`` is the expanded argv, None where a word is unknown.
 
@@ -1752,7 +1944,7 @@ class _Analyzer:
         # define aliases, like `-c alias.x=...`; so may an earlier `git config alias.*`.
         aliased = (bool(_GIT_CONFIG_ENV & env) or any(n.startswith("GIT_CONFIG_KEY_") for n in env)
                    or "HOME" in prefix or st.vars.get("HOME") != self.home0
-                   or self.config_alias or _NAMEREF in env)
+                   or self.config_alias or self.child_alias or _NAMEREF in env)
         if "config" in ex:
             values = ex[ex.index("config") + 1:]
             keys = [w.lower() for w in values if w]
@@ -1820,6 +2012,7 @@ class _Analyzer:
                 self.record(None, "stash", ["pop"], note)
             return
         sub, args = ex[i], ex[i + 1:]
+        self.git_runner(sub, args, st, prefix, depth, aliased)
         if sub != "stash" or None not in args:
             self.record(repo, sub, args)
             return

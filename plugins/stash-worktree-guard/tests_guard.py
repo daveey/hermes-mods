@@ -4,6 +4,19 @@ import functools
 import importlib.util
 import os
 import shutil
+import shlex
+
+# Explicit Git execution slots; every unsafe execution below uses disposable repositories.
+NESTED_RUNNERS = {
+    "foreach": "git -c r.repo={target} for-each-repo --config=r.repo {implicit}",
+    "bisect": "git bisect run {process}",
+    "helper": "git submodule--helper foreach {shell}",
+    "public": "git submodule foreach {shell}",
+    "difftool": "git difftool -y --extcmd={diffshell}",
+    "rebase": "git rebase --exec {shell} HEAD~1",
+}
+
+
 import subprocess
 from pathlib import Path
 
@@ -124,6 +137,329 @@ def single(tmp_path, monkeypatch):
 
 def block(tool, **args):
     return plugin._pre_tool_call(tool_name=tool, args=args)
+
+
+@pytest.fixture
+def nested_repo(tmp_path, monkeypatch):
+    for key in list(os.environ):
+        if key.startswith(("GIT_", "STASH_WORKTREE_GUARD")):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    env = {**os.environ, **{k: v for k, v in GIT_ENV.items()
+                           if k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}}
+
+    def run(cwd, *args, check=True):
+        p = subprocess.run(["git", *args], cwd=cwd, env=env, text=True,
+                           capture_output=True, timeout=30)
+        assert not check or p.returncode == 0, (args, p.stdout, p.stderr)
+        return p
+
+    def init(path):
+        path.mkdir()
+        run(path, "init", "-q", "-b", "main")
+        (path / "f.txt").write_text("base\n")
+        for n in range(3):
+            (path / "g.txt").write_text(f"{n}\n")
+            run(path, "add", ".")
+            run(path, "commit", "-qm", f"commit-{n}")
+
+    def make(site):
+        main, target = tmp_path / "main", tmp_path / "other"
+        init(main)
+        run(main, "worktree", "add", "-qb", "other", str(target))
+        origin = main
+        cwd = main if site == "foreach" else target
+        if site in ("helper", "public"):
+            source = tmp_path / "source"
+            init(source)
+            run(main, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(source), "sub")
+            run(main, "commit", "-qam", "submodule")
+            cwd, target, origin = main, main / "sub", tmp_path / "origin"
+            run(target, "worktree", "add", "-qb", "stash-origin", str(origin))
+        (origin / "f.txt").write_text("stashed\n")
+        run(origin, "stash", "push", "-qm", "origin")
+        if site == "bisect":
+            run(target, "bisect", "start", "--no-checkout", "HEAD", "HEAD~2")
+        if site == "difftool":
+            (target / "g.txt").write_text("trigger\n")
+        assert run(target, "symbolic-ref", "--short", "HEAD").stdout != run(origin, "symbolic-ref", "--short", "HEAD").stdout
+        assert run(target, "worktree", "list", "--porcelain").stdout.count("worktree ") == 2
+        return cwd, target
+
+    return make, run, env
+
+
+@pytest.mark.parametrize("site,payload", [
+    (site, payload) for site in NESTED_RUNNERS for payload in ("direct", "alias", "readonly")
+    if (site, payload) != ("public", "alias")  # already refused by base name uncertainty
+])
+def test_nested_runner_real_execution(nested_repo, site, payload):
+    make, run, env = nested_repo
+    cwd, target = make(site)
+    tail = "x" if payload == "alias" else "stash list" if payload == "readonly" else "stash pop"
+    process = "git " + tail
+    cmd = NESTED_RUNNERS[site].format(target=shlex.quote(str(target)), implicit=tail,
+        process=process, shell=shlex.quote(process), diffshell=shlex.quote("sh -c " + shlex.quote(process)))
+    if payload == "alias":
+        cmd = cmd.replace("git ", "git -c alias.x='stash pop' ", 1)
+    before = (run(target, "stash", "list").stdout, (target / "f.txt").read_text(),
+              run(target, "status", "--porcelain").stdout)
+    assert before[0].count("stash@{") == 1 and before[1] == "base\n"
+    reason = guard.refuse_reason(cmd, str(cwd))
+    hook = block("terminal", command=cmd, workdir=str(cwd))
+    assert bool(reason) == (payload != "readonly"), (cmd, reason)
+    assert bool(hook) == (payload != "readonly"), (cmd, hook)
+    result = subprocess.run([BASH, "--noprofile", "--norc", "-c", cmd], cwd=cwd,
+                            env=env, text=True, capture_output=True, timeout=30)
+    after = (run(target, "stash", "list").stdout, (target / "f.txt").read_text(),
+             run(target, "status", "--porcelain").stdout)
+    if payload == "readonly":
+        assert result.returncode == 0, result.stderr
+        assert after == before
+    else:
+        assert after[0] == "" and after[1] == "stashed\n", (result, after)
+        assert result.returncode == (1 if site == "rebase" else 0), result.stderr
+
+
+NESTED_REFUSALS = [
+    "git for-each-repo --config r.repo -- stash pop",
+    "git for-each-repo --keep-going --no-keep-going --config=r.repo stash apply",
+    'git for-each-repo --config="$KEY" x',
+    "git for-each-repo --config=r.repo $COMMAND",
+    "git for-each-repo --mystery value stash pop",
+    "git bisect run sh -c 'git stash pop'",
+    'git bisect run "$COMMAND"',
+    "git rebase --exec '$COMMAND' HEAD~1",
+    "git rebase --committer-date-is-author-date -x 'git stash pop' HEAD~1",
+    "git submodule--helper foreach --quiet --recursive --super-prefix prefix -- 'git stash pop'",
+    "git submodule foreach -q --recursive -- git stash pop",
+    "git submodule foreach 'git stash pop; :' argument",
+    "git submodule foreach --no-quiet --no-recursive 'git stash pop'",
+    "git difftool --extcmd 'git stash pop'",
+    "git difftool --extcmd='git stash pop'",
+    "git difftool -x 'git stash pop'",
+    "git difftool -x'git stash pop'",
+    "git difftool --mystery -x 'git stash pop'",
+    "git rebase --exec 'git stash pop' HEAD~1",
+    "git rebase --exec='git stash pop' HEAD~1",
+    "git rebase -x 'git stash pop' HEAD~1",
+    "git rebase -x'git stash pop' HEAD~1",
+    "git rebase -x 'git stash list' -x 'git stash pop' HEAD~1",
+    "git rebase --exec \"$PROGRAM\" HEAD~1",
+    "git -c alias.x='stash pop' for-each-repo --config=r.repo bisect run git x",
+    "git -c alias.x='stash pop' rebase --exec 'git x' HEAD~1",
+]
+
+
+@pytest.mark.parametrize("cmd", NESTED_REFUSALS)
+def test_nested_runner_parser_refusal(multi, cmd):
+    main, _ = multi
+    assert guard.refuse_reason(cmd, str(main)), cmd
+    assert block("terminal", command=cmd, workdir=str(main)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git bisect log", "git bisect run 'git stash pop'", "git bisect run stash pop",
+    "git submodule--helper stash pop", "git log --grep='git stash pop'",
+    "git difftool -- --extcmd='git stash pop'",
+    "git rebase -- --exec='git stash pop'",
+    "git difftool --tool '--extcmd=git stash pop'",
+    "git rebase --onto '--exec=git stash pop' HEAD~1",
+    "git -c alias.x='stash pop' for-each-repo --config=r.repo status --porcelain; git x",
+    "git -c alias.hash-object='stash pop' hash-object f.txt",
+])
+def test_nested_runner_parser_allow(multi, cmd):
+    main, _ = multi
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not block("terminal", command=cmd, workdir=str(main)), cmd
+
+
+def test_nested_runner_budget_refusal(multi):
+    main, _ = multi
+    cmd = "git -c alias.x='stash pop' " + "for-each-repo --config=r.repo " * (guard.MAX_DEPTH + 2) + "x"
+    assert guard.refuse_reason(cmd, str(main))
+    assert block("terminal", command=cmd, workdir=str(main))
+
+
+def test_nested_runner_existing_unknown_ref_control(multi):
+    # Existing whole-command uncertainty refusal, not a new RED claim.
+    cmd = 'git for-each-repo --config=r.repo stash pop "$REF"'
+    assert guard.refuse_reason(cmd, str(multi[0]))
+    assert block("terminal", command=cmd, workdir=str(multi[0]))
+
+
+def test_nested_runner_step_budget_refusal(multi, monkeypatch):
+    monkeypatch.setattr(guard, "MAX_STEPS", 1)
+    cmd = "git -c alias.x='stash pop' for-each-repo --config=r.repo x"
+    assert guard.refuse_reason(cmd, str(multi[0]))
+    assert block("terminal", command=cmd, workdir=str(multi[0]))
+
+
+@pytest.mark.parametrize("command", [
+    "HOME=/missing git bisect run git x",
+    "GIT_CONFIG_GLOBAL=/missing git bisect run git x",
+    "git -c include.path=/missing bisect run git x",
+    "git --config-env=alias.x=VALUE bisect run git x",
+])
+def test_nested_runner_inherited_taint_refusal(multi, command):
+    assert guard.refuse_reason(command, str(multi[0]))
+    assert block("terminal", command=command, workdir=str(multi[0]))
+
+
+@pytest.mark.parametrize("command", [
+    "git -c alias.x='stash pop' bisect run git status; git x",
+    "git -c alias.x='stash pop' submodule--helper foreach 'git stash list'; git x",
+    "git -c alias.x='stash pop' difftool -x 'true'; git x",
+    "git -c alias.x='stash pop' rebase -x 'git stash list'; git x",
+    "git for-each-repo --config=r.repo -- -c alias.x='stash pop' status; git x",
+    "git bisect run sh -c 'cd /missing'; git stash pop",
+])
+def test_nested_runner_isolated_taint_allow(multi, command):
+    assert guard.refuse_reason(command, str(multi[0])) is None
+    assert not block("terminal", command=command, workdir=str(multi[0]))
+
+
+def test_nested_runner_existing_public_alias_control(nested_repo):
+    # Base already refuses the public script under alias uncertainty; not a new RED.
+    test_nested_runner_real_execution(nested_repo, "public", "alias")
+
+
+@pytest.mark.parametrize("site,command,refused,rc", [
+    ("foreach", "git for-each-repo --config=missing.repo stash pop", True, 0),
+    ("bisect", "git bisect run stash pop", False, 1),
+    ("bisect", "git bisect run 'git stash pop'", False, 1),
+    ("helper", "git submodule--helper stash pop", False, 129),
+    ("difftool", "git difftool -y --extcmd='git stash pop'", True, 0),
+    ("difftool", "git difftool -y --extcmd='git stash list'", False, 0),
+    ("difftool-empty", "git difftool -y --extcmd='git stash pop'", True, 0),
+    ("foreach", "git -c alias.x='stash pop' -c r.repo={target} for-each-repo --config=r.repo status --porcelain", False, 0),
+    ("foreach", "git -c alias.hash-object='stash pop' hash-object f.txt", False, 0),
+])
+def test_nested_runner_real_nonrestoring_controls(nested_repo, site, command, refused, rc):
+    make, run, env = nested_repo
+    cwd, target = make(site)
+    command = command.format(target=shlex.quote(str(target)))
+    before = (run(target, "stash", "list").stdout, (target / "f.txt").read_text(),
+              run(target, "status", "--porcelain").stdout)
+    assert bool(guard.refuse_reason(command, str(cwd))) == refused
+    assert bool(block("terminal", command=command, workdir=str(cwd))) == refused
+    result = subprocess.run([BASH, "-c", command], cwd=cwd, env=env, capture_output=True, timeout=30)
+    assert result.returncode == rc, result.stderr
+    assert (run(target, "stash", "list").stdout, (target / "f.txt").read_text(),
+            run(target, "status", "--porcelain").stdout) == before
+
+
+@pytest.mark.parametrize("site,template", [
+    ("foreach", "git -c r.repo={target} for-each-repo --config r.repo -- stash pop"),
+    ("foreach", "git -c r.repo={target} for-each-repo --keep-going --no-keep-going --config=r.repo stash pop"),
+    ("helper", "git submodule--helper foreach --quiet --recursive -- 'git stash pop'"),
+    ("public", "git submodule foreach -q --recursive git stash pop"),
+    ("public", "git submodule foreach 'git stash pop; :' unused"),
+    ("helper", "git submodule--helper foreach --no-quiet --no-recursive 'git stash pop'"),
+    ("difftool", "git difftool -y --extcmd \"sh -c 'git stash pop'\""),
+    ("difftool", "git difftool -y -x \"sh -c 'git stash pop'\""),
+    ("difftool", "git difftool -y -x\"sh -c 'git stash pop'\""),
+    ("rebase", "git rebase --exec='git stash pop' HEAD~1"),
+    ("rebase", "git rebase -x 'git stash pop' HEAD~1"),
+    ("rebase", "git rebase -x'git stash pop' HEAD~1"),
+    ("rebase", "git rebase -x 'git stash list' -x 'git stash pop' HEAD~1"),
+])
+def test_nested_runner_real_option_syntax(nested_repo, site, template):
+    make, run, env = nested_repo
+    cwd, target = make(site)
+    command = template.format(target=shlex.quote(str(target)))
+    assert guard.refuse_reason(command, str(cwd))
+    assert block("terminal", command=command, workdir=str(cwd))
+    assert run(target, "stash", "list").stdout.count("stash@{") == 1
+    assert (target / "f.txt").read_text() == "base\n"
+    result = subprocess.run([BASH, "-c", command], cwd=cwd, env=env, capture_output=True, timeout=30)
+    assert (target / "f.txt").read_text() == "stashed\n", result.stderr
+    assert run(target, "stash", "list").stdout == ""
+    assert result.returncode == (1 if site == "rebase" else 0), result.stderr
+
+
+# Git's use_shell runs `sh -c '<argv0> "$@"' <argv0> <operands...>` when argv0 has shell
+# metacharacters, so later foreach operands reach the program as quoted data. Difftool's
+# helper evals the field-split value, so a newline in --extcmd becomes a word separator.
+@pytest.mark.parametrize("site,command,op", [
+    ("helper", "git submodule--helper foreach 'git stash' pop", "pop"),
+    ("public", "git submodule foreach 'exec git' stash pop", "pop"),
+    ("public", "git submodule foreach 'git stash' apply", "apply"),
+    ("helper", "git submodule--helper foreach 'GIT_TRACE=0 git stash' pop", "pop"),
+    ("helper", "git -c alias.x='stash pop' submodule--helper foreach 'exec git' x", "pop"),
+    ("helper", "git submodule--helper foreach 'git stash' -- pop", "pop"),
+    ("helper", "git submodule--helper foreach 'git stash' --quiet pop", "pop"),
+    ("difftool", "git difftool -y -x 'git stash\npop;:'", "pop"),
+])
+def test_nested_runner_real_positional_operands(nested_repo, site, command, op):
+    make, run, env = nested_repo
+    cwd, target = make(site)
+    assert run(target, "stash", "list").stdout.count("stash@{") == 1
+    assert (target / "f.txt").read_text() == "base\n"
+    assert guard.refuse_reason(command, str(cwd)), command
+    assert block("terminal", command=command, workdir=str(cwd)), command
+    result = subprocess.run([BASH, "--noprofile", "--norc", "-c", command], cwd=cwd, env=env,
+                            text=True, capture_output=True, timeout=30)
+    assert (target / "f.txt").read_text() == "stashed\n", (result.stdout, result.stderr)
+    assert run(target, "stash", "list").stdout.count("stash@{") == (1 if op == "apply" else 0)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("site,command", [
+    ("helper", "git submodule--helper foreach 'git stash' list"),
+    ("public", "git submodule foreach 'git stash list' --oneline"),
+    ("public", "git submodule foreach 'echo' stash pop"),
+    ("helper", "git submodule--helper foreach 'git stash' -- list"),
+    ("helper", "git -c alias.x='stash pop' submodule--helper foreach 'git status' -- --porcelain"),
+    ("difftool", "git difftool -y -x 'git stash\nlist;:'"),
+])
+def test_nested_runner_real_positional_readonly(nested_repo, site, command):
+    make, run, env = nested_repo
+    cwd, target = make(site)
+    before = (run(target, "stash", "list").stdout, (target / "f.txt").read_text(),
+              run(target, "status", "--porcelain").stdout)
+    assert guard.refuse_reason(command, str(cwd)) is None, command
+    assert not block("terminal", command=command, workdir=str(cwd)), command
+    result = subprocess.run([BASH, "--noprofile", "--norc", "-c", command], cwd=cwd, env=env,
+                            text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert (run(target, "stash", "list").stdout, (target / "f.txt").read_text(),
+            run(target, "status", "--porcelain").stdout) == before
+
+
+@pytest.mark.parametrize("cmd", [
+    "git submodule--helper foreach 'git stash' \"$OP\"",
+    "git submodule foreach 'exec git' \"$CMD\"",
+    "git submodule--helper foreach 'git stash $(' pop",
+    "git submodule--helper foreach 'git stash \"$1\"' pop",
+    "git difftool -y -x 'git stash'",
+    "git -c alias.x='stash pop' difftool -y -x 'git stash list'",
+    "git submodule--helper foreach 'git log' --oneline",
+    "git submodule--helper foreach 'git stash' \"$X\" -- pop",
+    "git submodule--helper foreach 'git stash \"$1\"' list",
+    "git submodule foreach 'git stash' -- pop",
+])
+def test_nested_runner_positional_parser_refusal(multi, cmd):
+    # Unknown operands stay unknown; difftool's LOCAL/REMOTE are unknown operands, so an
+    # alias-tainted child Git call with them is refused like any alias-tainted unknown word.
+    # Helper options after the command word are permuted options; unknown ones never guess.
+    main, _ = multi
+    assert guard.refuse_reason(cmd, str(main)), cmd
+    assert block("terminal", command=cmd, workdir=str(main)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git submodule--helper foreach 'git stash list \"$1\"' \"$X\"",
+    "git submodule foreach 'echo' \"$X\" pop",
+    "git submodule foreach 'git stash' 'list'",
+    "git stash list \"$X\"; git difftool -y -x 'git status'",
+    "git difftool -y --extcmd=\"sh -c 'git status'\"",
+])
+def test_nested_runner_positional_parser_allow(multi, cmd):
+    main, _ = multi
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not block("terminal", command=cmd, workdir=str(main)), cmd
 
 
 def test_warns_on_stash_list_in_a_multi_worktree_repo(multi):
