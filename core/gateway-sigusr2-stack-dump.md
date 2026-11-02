@@ -33,3 +33,21 @@ Apply 1329 then 1367. No config.
 ## Gotchas
 
 The dump runs only when the main thread next executes bytecode; a main thread stuck in a long GIL-holding C call delays it. Fatal-error and shutdown-watchdog dumps are separate and unchanged. No plugin involved.
+
+## Follow-up patch (1651): the native live-test fixture dumps stacks the same way
+
+**1651** (`7c03df5831`, `test(gateway): native live fixture dumps stacks via refcounted frames, not faulthandler
+watchdog`). Test harness only.
+
+- **Behavior.** `test_native_gateway_runtime_live` exited -11 on a CI runner. Its fixture `tests/gateway/fixtures/stack_dump_daemon.py`
+  armed `faulthandler.dump_traceback_later(repeat=True)`, whose native watchdog walks interpreter frames without the GIL,
+  the same hazard 1329 removed from SIGUSR2; a thread retiring a code object mid-walk segfaults the gateway (the old
+  fixture crashed in 6 of 6 churn runs). The fixture now runs an `Event`-driven Python thread that every
+  `UGW_STACK_DUMP_AFTER` seconds snapshots `sys._current_frames()` (refcounted frames, like `gateway/sigusr2_stack_dump.py`)
+  and appends `=== threads @ <ts> ===` / `--- Thread 0x.. ---` stacks to `logs/stacks.txt`; it is stopped and joined
+  when `gateway.run` returns. The live harness sets `PYTHONFAULTHANDLER=1` so a future native crash prints a backtrace.
+- **Tests** (new `tests/gateway/test_stack_dump_daemon.py`, runs the real fixture in a subprocess with a 0.1 ms interval
+  against four threads churning dynamically compiled code; not rerun by this mirror pass):
+  `test_stack_dump_survives_retiring_code_objects`, `test_stack_dump_records_thread_stacks` (also asserts the dumper
+  thread does not outlive the fixture).
+- **Gotchas.** A dump now needs the GIL, so a gateway stuck in a GIL-holding C call produces no dump until it releases it.

@@ -1,0 +1,119 @@
+From accdf2e53139dd281cd6e0687e0b23657b6fd2fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 08:54:34 +0000
+Subject: [PATCH] [daveey] Exclude board detach during complete sync rounds
+
+---
+ hermes_cli/kanban_db_sync.py                  | 13 +++++++++
+ hermes_cli/kanban_sync_client.py              |  7 +++++
+ hermes_cli/kanban_sync_guard.py               | 18 ++++++++++++
+ .../test_kanban_sync_detach_race.py           | 29 +++++++++++++++++++
+ 4 files changed, 67 insertions(+)
+ create mode 100644 hermes_cli/kanban_sync_guard.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 89aee228fb0..9187ebea9f0 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -610,6 +610,19 @@ def set_mode(conn: sqlite3.Connection, mode: str) -> None:
+     """Switch the board's sync mode; ``off`` drops the capture triggers."""
+     if mode not in MODES:
+         raise ValueError(f"unknown kanban sync mode {mode!r}")
++    if mode == "off":
++        from pathlib import Path
++        from hermes_cli.kanban_sync_guard import board_sync_lock
++        path = _db_key(conn)
++        if path is None:
++            raise ValueError("detach requires an on-disk board")
++        with board_sync_lock(Path(path)):
++            _set_mode(conn, mode)
++    else:
++        _set_mode(conn, mode)
++
++
++def _set_mode(conn: sqlite3.Connection, mode: str) -> None:
+     from hermes_cli.kanban_db_connect import write_txn
+     key = _db_key(conn)
+     with write_txn(conn):
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 2f0472ad8a7..51d8f969e6c 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -789,6 +789,13 @@ def _pull_replica(slug: str, hub: Hub, gateway: str) -> int:
+ 
+ 
+ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
++    """Exclude explicit detach until this round's repairs and sends have ended."""
++    from hermes_cli.kanban_sync_guard import board_sync_lock
++    with board_sync_lock(path):
++        return _sync_board_locked(slug, path, hub, gateway)
++
++
++def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+     """One round for one board. Both modes keep the replica copy (the whole board) current and push the live
+     outbox; ``primary`` also applies this gateway's own cards from the feed into the live board."""
+     # Dropped first, so a round that fails or finds nothing to repair never leaves a stale deferral that would
+diff --git a/hermes_cli/kanban_sync_guard.py b/hermes_cli/kanban_sync_guard.py
+new file mode 100644
+index 00000000000..f6313c2a23d
+--- /dev/null
++++ b/hermes_cli/kanban_sync_guard.py
+@@ -0,0 +1,18 @@
++"""Cross-process exclusion between a sync round and explicit board detachment."""
++from contextlib import contextmanager
++from pathlib import Path
++
++
++@contextmanager
++def board_sync_lock(path: Path):
++    """Never wait for network I/O while detaching: a busy round must finish first.
++
++    Reuse the native portable nonblocking flock implementation with a separate
++    key, so ordinary dispatcher ticks are not serialized with network polling.
++    """
++    from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    canonical = Path(path).resolve()
++    with _dispatch_tick_lock(canonical.with_name(canonical.name + ".sync")) as held:
++        if not held:
++            raise RuntimeError("board sync round is busy; retry detach after it finishes")
++        yield
+diff --git a/tests/hermes_cli/test_kanban_sync_detach_race.py b/tests/hermes_cli/test_kanban_sync_detach_race.py
+index 0eddd957e75..a3fde2b7fb0 100644
+--- a/tests/hermes_cli/test_kanban_sync_detach_race.py
++++ b/tests/hermes_cli/test_kanban_sync_detach_race.py
+@@ -47,3 +47,32 @@ def test_detach_between_feed_precheck_and_write_preserves_custody(synced_conn, m
+         assert kb.get_task(conn, tid).status == "running"
+         assert [tuple(r) for r in conn.execute("SELECT * FROM task_runs")] == before
+         assert sync.sync_state(conn)["cursor"] != 999
++
++
++def test_detach_refuses_until_whole_sync_round_including_push_finishes(synced_conn, monkeypatch):
++    from hermes_cli import kanban_sync_client as client
++    from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++    conn = synced_conn
++    path = Path(sync._db_key(conn))
++    client.ensure_identity(conn, "default", "fixture-host")
++    sync.set_mode(conn, "primary")
++    kb.create_task(conn, title="pending publication", assignee="worker")
++    hub = FakeService().hub("fixture-host")
++    real_push = client.push
++    reached = []
++    with kbc.connect_closing(path) as detacher:
++        def push_with_detach(*args, **kwargs):
++            with pytest.raises(RuntimeError, match="sync round is busy"):
++                sync.set_mode(detacher, "off")
++            assert sync.board_mode(conn) == "primary"
++            reached.append(True)
++            return real_push(*args, **kwargs)
++
++        monkeypatch.setattr(client, "push", push_with_detach)
++        result = client.sync_board("default", path, hub, "fixture-host")
++        assert reached and result.push.sent
++        sync.set_mode(detacher, "off")
++        # A round enumerated before detach but starting after it does no I/O.
++        result = client.sync_board("default", path, None, "fixture-host")
++        assert result.mode == "off"
+-- 
+2.55.0
+

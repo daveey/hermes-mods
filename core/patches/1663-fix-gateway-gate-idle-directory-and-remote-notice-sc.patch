@@ -1,0 +1,529 @@
+From b71f0fef09f83ff0d7f92ea341ccbc8e7b062230 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:25:31 +0000
+Subject: [PATCH] fix(gateway): gate idle directory and remote notice scans on
+ change keys [daveey]
+
+---
+ tests/tools/test_skill_signature_idle.py     |  49 +++++++
+ tests/tui_gateway/test_idle_watcher_gates.py | 137 +++++++++++++++++++
+ tools/skills_tool.py                         |  15 +-
+ tui_gateway/change_watcher.py                |  47 ++++---
+ tui_gateway/kanban_remote_notices.py         |  42 ++++--
+ utils_directory_snapshot.py                  |  51 +++++++
+ 6 files changed, 297 insertions(+), 44 deletions(-)
+ create mode 100644 tests/tools/test_skill_signature_idle.py
+ create mode 100644 tests/tui_gateway/test_idle_watcher_gates.py
+ create mode 100644 utils_directory_snapshot.py
+
+diff --git a/tests/tools/test_skill_signature_idle.py b/tests/tools/test_skill_signature_idle.py
+new file mode 100644
+index 00000000000..fdf44dec6c3
+--- /dev/null
++++ b/tests/tools/test_skill_signature_idle.py
+@@ -0,0 +1,49 @@
++"""Signature walks stat unchanged directories instead of listing them on every watcher tick."""
++import os
++import time
++
++from tools.skills_tool import _skills_scan_signature
++
++
++def _age(path):
++    old = time.time_ns() - 10_000_000_000
++    os.utime(path, ns=(old, old))
++
++
++def test_unchanged_tree_no_listing_nested_install_is_seen(tmp_path, monkeypatch):
++    tmp_path = tmp_path / "skills"
++    tmp_path.mkdir()
++    category = tmp_path / "category"
++    category.mkdir()
++    _age(category)
++    _age(tmp_path)
++    before = _skills_scan_signature([tmp_path], [])
++    calls, real = [], os.scandir
++    monkeypatch.setattr(os, "scandir", lambda path: calls.append(path) or real(path))
++    assert _skills_scan_signature([tmp_path], []) == before
++    assert calls == []
++    (category / "new-skill").mkdir()
++    assert _skills_scan_signature([tmp_path], []) != before
++    assert str(category) in calls
++
++
++def test_symlink_target_type_change_is_seen(tmp_path):
++    root = tmp_path / "skills"
++    root.mkdir()
++    target = tmp_path / "target"
++    target.write_text("file")
++    (root / "linked").symlink_to(target)
++    _age(root)
++    before = _skills_scan_signature([root], [])
++    target.unlink()
++    target.mkdir()
++    assert _skills_scan_signature([root], []) != before
++
++
++def test_racy_timestamp_cannot_hide_membership_change(tmp_path, monkeypatch):
++    # Model a coarse clock: both directory stats stay equal inside the racy window.
++    real, frozen = os.stat, os.stat(tmp_path)
++    monkeypatch.setattr(os, "stat", lambda path, *a, **kw: frozen if str(path) == str(tmp_path) else real(path, *a, **kw))
++    before = _skills_scan_signature([tmp_path], [])
++    (tmp_path / "new").mkdir()
++    assert _skills_scan_signature([tmp_path], []) != before
+diff --git a/tests/tui_gateway/test_idle_watcher_gates.py b/tests/tui_gateway/test_idle_watcher_gates.py
+new file mode 100644
+index 00000000000..6512b6fe484
+--- /dev/null
++++ b/tests/tui_gateway/test_idle_watcher_gates.py
+@@ -0,0 +1,137 @@
++"""Idle entry points avoid directory listings and replica decoding without gating time or edits."""
++import contextlib
++import os
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from tests.tui_gateway.test_change_watcher import watcher_home
++from tests.tui_gateway.test_kanban_remote_idle_read import NOW, _insert, _replica
++from tests.tui_gateway.test_kanban_remote_arrival import CHAT, _card
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import server
++
++
++@pytest.mark.parametrize("kind", ["pairing", "outbox"])
++def test_idle_directory_not_relisted_but_member_edit_seen(watcher_home, monkeypatch, kind):
++    home, _ = watcher_home
++    root = home / ("pairing" if kind == "pairing" else "bot_relay/outbox")
++    root.mkdir(parents=True)
++    member = root / ("slack-pending.json" if kind == "pairing" else "notice.json")
++    member.write_text("{}")
++    old = time.time_ns() - 10_000_000_000
++    os.utime(root, ns=(old, old))
++    probe = server._pairing_sig if kind == "pairing" else server._bot_relay_outbox_sig
++    before = probe()
++    listed, original = [], os.scandir
++
++    def listing(path):
++        listed.append(Path(path))
++        return original(path)
++
++    monkeypatch.setattr(os, "scandir", listing)
++    assert probe() == before
++    assert listed == []
++    stat = member.stat()
++    os.utime(member, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
++    assert probe() != before
++    assert listed == []
++    added = root / ("other-approved.json" if kind == "pairing" else "next.json")
++    added.write_text("[]")
++    probe()
++    assert root in listed
++
++
++@pytest.mark.parametrize("mode", ["delete", "wal"])
++def test_sweep_idle_does_not_read_replica_and_unloaded_chat_is_retried(tmp_path, monkeypatch, mode):
++    replica = _replica(tmp_path, [_card("t_idle", CHAT, status="done", at=NOW)], mode)
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    opened = []
++
++    @contextlib.contextmanager
++    def session_db(profile, sid):
++        opened.append(sid)
++        yield None, None
++
++    def poll(live):
++        return krn.sweep_remote_notices(replica_path=replica, gateway="macbook", ledger=ledger,
++                                        now=NOW + 60, live_ids=live, session_db=session_db)
++
++    poll({CHAT})
++    poll({CHAT})
++    original = krn._task_rows
++    reads = []
++    monkeypatch.setattr(krn, "_task_rows", lambda *a: reads.append(1) or original(*a))
++    poll({CHAT})
++    assert reads == []
++    poll(set())
++    assert opened == [CHAT] and reads == []
++    _insert(replica, _card("t_new", CHAT, status="done", at=NOW), 2)
++    poll(set())
++    assert reads and len(opened) == 3
++
++
++def test_sweep_commit_during_read_is_not_cached(tmp_path, monkeypatch):
++    replica = _replica(tmp_path, [])
++    krn._reset_for_tests()
++    original = krn._task_rows
++
++    def rows_then_commit(*args):
++        rows = original(*args)
++        _insert(replica, _card("t_race", CHAT, status="done", at=NOW), 1)
++        return rows
++
++    monkeypatch.setattr(krn, "_task_rows", rows_then_commit)
++    assert krn._sweep_snapshot(replica, "macbook")[0] == []
++    monkeypatch.setattr(krn, "_task_rows", original)
++    assert krn._sweep_snapshot(replica, "macbook")[0][0][2]["id"] == "t_race"
++
++
++def test_session_commit_after_wal_frames_is_seen(watcher_home):
++    import sqlite3
++    from tests.tui_gateway.test_change_watcher import _seed_store
++    from tests.tui_gateway.test_kanban_remote_idle_read import _rewrite
++
++    home, _ = watcher_home
++    path = home / "state.db"
++    _seed_store(path)
++    with contextlib.closing(sqlite3.connect(path)) as writer:
++        writer.execute("PRAGMA journal_mode=WAL")
++        writer.execute("UPDATE sessions SET title='before'")
++        writer.commit()
++        before = server._session_db_content_sig(path)
++        shm = Path(f"{path}-shm")
++        unpublished = shm.read_bytes()
++        writer.execute("UPDATE sessions SET title='after'")
++        writer.commit()
++        published = shm.read_bytes()
++        # Settled frame timestamps model a publication delayed beyond the racy window.
++        old = time.time_ns() - 10_000_000_000
++        for file in (path, Path(f"{path}-wal")):
++            os.utime(file, ns=(old, old))
++        _rewrite(shm, unpublished)
++        try:
++            assert server._session_db_content_sig(path) == before
++        finally:
++            _rewrite(shm, published)
++        assert server._session_db_content_sig(path) != before
++
++
++def test_sweep_grace_expires_without_replica_change(tmp_path, monkeypatch):
++    replica = _replica(tmp_path, [_card("t_grace", CHAT, status="done", at=NOW)])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    opened = []
++
++    @contextlib.contextmanager
++    def session_db(profile, sid):
++        opened.append(sid)
++        yield None, None
++
++    for now in (NOW, NOW + 31):
++        krn.sweep_remote_notices(replica_path=replica, gateway="macbook", ledger=ledger, now=now,
++                                session_db=session_db, waker=SimpleNamespace(grace_s=30))
++    assert opened == [CHAT]
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index ada04fa6cc2..9be2edf96b9 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -52,20 +52,13 @@ def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
+     names, not only mtimes: an install and an uninstall inside one coarse mtime tick (1-2 s on some
+     filesystems) leave every mtime equal, and the change must still show. ~1 ms for 170 dirs."""
+     from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
++    from utils_directory_snapshot import directory_snapshot
+     try:
+-        mtime = os.stat(root).st_mtime_ns
+-        with os.scandir(root) as it:
+-            entries = list(it)
++        mtime, entries = directory_snapshot(root)
+     except OSError:
+         return
+-    names, is_skill = [], False
+-    for entry in entries:
+-        with suppress(OSError):
+-            if entry.is_dir():
+-                names.append(entry.name)
+-            elif entry.name == "SKILL.md":
+-                is_skill = True
+-    names.sort()
++    names = sorted(name for name, is_dir in entries if is_dir)
++    is_skill = any(name == "SKILL.md" and not is_dir for name, is_dir in entries)
+     sig.append((str(root), mtime, tuple(names)))
+     if depth <= 0:
+         return
+diff --git a/tui_gateway/change_watcher.py b/tui_gateway/change_watcher.py
+index 7a0f777e51c..e73b647f1df 100644
+--- a/tui_gateway/change_watcher.py
++++ b/tui_gateway/change_watcher.py
+@@ -191,9 +191,8 @@ def _pet_changed_payload() -> dict:
+ # them mid-turn and on idle ticks, so hashing them re-fired sessions.changed every heartbeat window
+ # (#98005). Liveness comes from session.active_list, and a real turn still moves message_count.
+ from hermes_state_projection import SESSION_SIGNATURE_FIELDS as _SESSION_SIGNATURE_FIELDS
+-# path -> (database/WAL mtime, session-table digest). The mtime guard keeps the
+-# normal 0.5 s watch pass stat-only; SQLite is read only after another process
+-# actually commits (and for ``utils.RACY_MTIME_WINDOW_NS`` after it, see _settled_mtime).
++# path -> (published SQLite commit key, session-table digest). A retained observer
++# avoids reopening unchanged stores and sees WAL commits after their frames publish.
+ _sessions_db_sig_cache: dict[str, tuple[object, tuple | None]] = {}
+ # A busy fleet commits to state.db continuously, so the mtime guard alone re-digests every
+ # session row (thousands) on nearly every 0.5 s pass. Re-digest a moved db at most this often;
+@@ -207,10 +206,13 @@ def _session_db_content_sig(db_path: Path):
+     """Read the transactional projection revision, or digest a legacy store.
+ 
+     Upgraded stores use bounded schema/meta probes after writes, independent of
+-    the legacy digest throttle. Settled unchanged files need no query. The file
++    the legacy digest throttle. Unchanged stores need only data_version. The file
+     identity distinguishes replacements whose counters happen to be equal.
+     Stores without the complete trigger capability retain the content fallback.
+     """
++    from tui_gateway.kanban_replica_observer import fingerprint
++
++    stamp = fingerprint(db_path)
+     mtime = _newest_mtime_ns((db_path, db_path.with_name(f"{db_path.name}-wal")))
+     cache_key = str(db_path)
+     cached = _sessions_db_sig_cache.get(cache_key)
+@@ -227,7 +229,7 @@ def _session_db_content_sig(db_path: Path):
+     _sessions_db_identity[cache_key] = identity
+     revision_cached = cached is not None and cached[1] is not None and cached[1][0] == "revision"
+ 
+-    if cached is not None and cached[0] == mtime:
++    if stamp is not None and cached is not None and cached[0] == stamp:
+         return cached[1]
+     now = time.monotonic()
+     if (not revision_cached and cached is not None and cached[1] is not None
+@@ -251,7 +253,8 @@ def _session_db_content_sig(db_path: Path):
+         revision = session_projection_revision(conn)
+         if revision is not None:
+             signature = ("revision", identity, revision)
+-            _sessions_db_sig_cache[cache_key] = (_settled_mtime(mtime), signature)
++            stable = stamp if stamp is not None and fingerprint(db_path) == stamp else None
++            _sessions_db_sig_cache[cache_key] = (stable, signature)
+             return signature
+         available = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+         fields = tuple(field for field in _SESSION_SIGNATURE_FIELDS if field in available)
+@@ -278,27 +281,13 @@ def _session_db_content_sig(db_path: Path):
+         if conn is not None:
+             conn.close()
+ 
+-    _sessions_db_sig_cache[cache_key] = (_settled_mtime(mtime), signature)
++    stable = stamp if stamp is not None and fingerprint(db_path) == stamp else None
++    _sessions_db_sig_cache[cache_key] = (stable, signature)
+     _sessions_digest_at[cache_key] = now
+ 
+     return signature
+ 
+ 
+-# Filesystem timestamps come from a coarse clock (~4 ms ticks; whole seconds on some filesystems) and
+-# SQLite commits in place, so a commit landing in the tick of a read leaves the DB/WAL mtime unchanged.
+-# A digest read while the mtime is that fresh must not become a cache hit ("racily clean", as in git's
+-# index): it is cached under a key no mtime equals, so the next tick re-reads the rows.
+-_RACY_MTIME = object()
+-
+-
+-def _settled_mtime(mtime):
+-    """``mtime`` when it is old enough to trust as a cache key, else a never-matching sentinel."""
+-    from utils import mtime_is_racy  # function-local: bodies are rebound onto server.py's globals
+-    if mtime is None or mtime_is_racy(mtime):
+-        return _RACY_MTIME
+-    return mtime
+-
+-
+ def _sessions_sig():
+     """Session-table content across the active and served profile stores.
+ 
+@@ -324,6 +313,16 @@ def _projects_sig():
+         for name in ("projects.db", "projects.db-wal"))
+ 
+ 
++def _watcher_entries(root: Path) -> tuple:
++    """Cache membership only; the signature still stats files for in-place edits."""
++    from utils_directory_snapshot import directory_snapshot
++    try:
++        _mtime, entries = directory_snapshot(root)
++        return tuple(root / name for name, _is_dir in entries)
++    except OSError:
++        return ()
++
++
+ def _pairing_sig():
+     """Per-file stat signature of every profile's pairing ledgers (legacy ``pairing/`` and
+     ``platforms/pairing/``): the gateway process writes pending codes, so the files are the only
+@@ -333,7 +332,7 @@ def _pairing_sig():
+         with contextlib.suppress(OSError):
+             # Only the ledgers: _rate_limits.json moves on every unauthorized DM.
+             entries += [
+-                e for e in root.iterdir() if e.name.endswith(("-pending.json", "-approved.json"))]
++                e for e in _watcher_entries(root) if e.name.endswith(("-pending.json", "-approved.json"))]
+     return _files_sig(entries)
+ 
+ 
+@@ -379,7 +378,7 @@ def _bot_relay_outbox_sig():
+     home = _watcher_home()
+     root = home.parent.parent if home.parent.name == "profiles" else home
+     with contextlib.suppress(OSError):
+-        for entry in (root / "bot_relay" / "outbox").iterdir():
++        for entry in _watcher_entries(root / "bot_relay" / "outbox"):
+             if entry.name.endswith(".json"):
+                 _bot_relay_outbox_seen = max(_bot_relay_outbox_seen, _watcher_mtime_ns(entry) or 0)
+     return _bot_relay_outbox_seen or None
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 6a8fe4915fe..42198de5513 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -48,6 +48,7 @@ _TERMINAL = ("done", "blocked")
+ 
+ _lock = threading.Lock()
+ _index_memo: Optional[tuple] = None  # (stamp, file identity, signature, me, index)
++_sweep_memo: Optional[tuple] = None  # (stamp, gateway, cards, current states)
+ 
+ 
+ def hub_db_path() -> Path:
+@@ -688,7 +689,8 @@ def _reset_for_tests() -> None:
+     from tui_gateway.kanban_remote_observations import _decoded, _decoded_files, _memo
+     from tui_gateway.kanban_replica_observer import reset as reset_observers
+ 
+-    global _index_memo
++    global _index_memo, _sweep_memo
++    _sweep_memo = None
+     reset_observers()
+     _memo.clear()
+     _decoded.clear()
+@@ -761,7 +763,7 @@ def _stale_notice_id(row, task: dict) -> tuple[str, str]:
+     return profile, key or f"remote:{row['ref']}:{row['state']}:{profile}:{sid}"
+ 
+ 
+-def _settle_stale_claims(rows: list[tuple], path, ledger) -> int:
++def _settle_stale_claims(states: dict, path, ledger) -> int:
+     """Settle in-flight claims nobody can finish: the holder is dead AND the card left the notice's state. [daveey]
+ 
+     ``collect`` and the sweep only walk cards that are terminal NOW, so a claim whose holder died after the card
+@@ -774,7 +776,6 @@ def _settle_stale_claims(rows: list[tuple], path, ledger) -> int:
+     it) and a card missing from the replica (partial sync) are left alone. Never raises.
+     """
+     try:
+-        states = _current_states(rows)
+         conn = _ledger(ledger)
+         try:
+             claims = conn.execute(
+@@ -968,12 +969,12 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+     if not profile or not sid or sid in live:
+         return
+     try:
+-        event_key, metadata, text = _sweep_payload(owner, key, task, me, profile, sid)
+-        memo_key = (str(path), profile, sid, metadata["notice_id"])
++        memo_key = (str(path), profile, sid, _notice_id(owner, key, task, profile, sid))
+         if memo_key in _delivered:
+             return
+         if waker is not None and observed_at is not None and now is not None and now - observed_at < waker.grace_s:
+             return  # a live poller (any backend) claims within seconds; it owns the chat's turn
++        event_key, metadata, text = _sweep_payload(owner, key, task, me, profile, sid)
+         claim = {"session": sid, "ref": ref, "state": state, "notice_key": event_key}
+         with session_db(profile, sid) as (db, tip):
+             if db is None or not text:
+@@ -1030,6 +1031,30 @@ def _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger,
+                           delivered=delivered, swept=swept, waker=waker, observed_at=observed_at, now=now)
+ 
+ 
++def _sweep_snapshot(path, me: str) -> tuple:
++    """Cache only replica-derived data, never claim recovery or time/liveness decisions.
++
++    Bracket the snapshot with SQLite's published-commit key, not WAL timestamps.
++    One memo bounds retained data; a failed/racing read cannot bless a stale snapshot.
++    """
++    global _sweep_memo
++    from tui_gateway.kanban_replica_observer import fingerprint
++
++    stamp = fingerprint(path)
++    memo = _sweep_memo
++    if stamp is not None and memo is not None and memo[:2] == (stamp, me):
++        return memo[2], memo[3]
++    _sweep_memo = None
++    with contextlib.closing(_ro(Path(path))) as conn:
++        rows = _canonical(_task_rows(conn, me))
++    cards = list(_sweep_cards(rows, me))
++    states = {ref: (state, {"sessions": task.get("sessions")})
++              for ref, (state, task) in _current_states(rows).items()}
++    if stamp is not None and fingerprint(path) == stamp:
++        _sweep_memo = (stamp, me, cards, states)
++    return cards, states
++
++
+ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session_db, live_ids=None,
+                          ledger=None, now: Optional[float] = None, waker=None) -> list[dict]:
+     """Persist addressed notices, then ack the ledger. Write-first: a failed append leaves no delivered row
+@@ -1058,20 +1083,19 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+     now = time.time() if now is None else now
+     live = set(live_ids or ())
+     try:
+-        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+-            rows = _canonical(_task_rows(conn, me))
++        cards, states = _sweep_snapshot(path, me)
+     except sqlite3.Error:
+         logger.debug("remote Kanban replica unavailable", exc_info=True)
+         return []
+     from tui_gateway.kanban_remote_observations import observe
+-    cards = list(_sweep_cards(rows, me))
++
+     try:
+         fresh_times = observe(Path(path), ledger, now)
+     except (OSError, sqlite3.Error):
+         logger.debug("remote kanban observation failed; defer notices", exc_info=True)
+         return []
+     _load_swept(ledger)
+-    _settle_stale_claims(rows, path, ledger)
++    _settle_stale_claims(states, path, ledger)
+     delivered: list[dict] = []
+     swept: list = []
+     counts: dict = {}
+diff --git a/utils_directory_snapshot.py b/utils_directory_snapshot.py
+new file mode 100644
+index 00000000000..dc57389f549
+--- /dev/null
++++ b/utils_directory_snapshot.py
+@@ -0,0 +1,51 @@
++"""Bounded directory-membership cache for polling signatures.
++
++Children's contents are not cached. Callers must still stat files/subdirectories.
++"""
++from __future__ import annotations
++
++import os
++import threading
++from collections import OrderedDict
++
++_MAX_DIRECTORIES = 4096
++_cache: OrderedDict[str, tuple] = OrderedDict()
++_lock = threading.Lock()
++
++
++def directory_snapshot(root) -> tuple[int, tuple]:
++    """Return (mtime_ns, ((name, is_dir), ...)), listing only changed directories.
++
++    A recent timestamp cannot certify membership on a coarse filesystem. Stat
++    before listing, and leave such reads uncached until the clock has settled.
++    Symlink target types are checked even when the link's parent has not moved.
++    """
++    from utils import mtime_is_racy
++
++    path = os.path.abspath(root)
++    with _lock:
++        st = os.stat(path)
++        key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
++        memo = _cache.get(path)
++        if memo is not None and memo[0] == key:
++            links = tuple((name, os.path.isdir(os.path.join(path, name))) for name, _ in memo[2])
++            if links == memo[2]:
++                _cache.move_to_end(path)
++                return st.st_mtime_ns, memo[1]
++        _cache.pop(path, None)
++        entries, links = [], []
++        with os.scandir(path) as scan:
++            for entry in scan:
++                try:
++                    row = (entry.name, entry.is_dir())
++                    entries.append(row)
++                    if entry.is_symlink():
++                        links.append(row)
++                except OSError:
++                    continue
++        result = tuple(entries)
++        if not mtime_is_racy(st.st_mtime_ns):
++            _cache[path] = (key, result, tuple(links))
++            while len(_cache) > _MAX_DIRECTORIES:
++                _cache.popitem(last=False)
++        return st.st_mtime_ns, result
+-- 
+2.55.0
+

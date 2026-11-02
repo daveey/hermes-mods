@@ -1,0 +1,178 @@
+From 7c03df5831b3adbc95f75c3551ee42024558c11a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 05:42:26 +0000
+Subject: [PATCH] [daveey] test(gateway): native live fixture dumps stacks via
+ refcounted frames, not faulthandler watchdog
+
+test_native_gateway_runtime_live exited -11 on a hub runner. The fixture armed
+faulthandler.dump_traceback_later(repeat=True), whose native watchdog walks
+interpreter frames without the GIL; a thread retiring a code object mid-walk
+segfaults the gateway (reproduced: old fixture -11 in 6/6 churn runs).
+
+Replace it with an Event-driven Python thread that snapshots
+sys._current_frames() (refcounted, like gateway/sigusr2_stack_dump.py), stopped
+and joined when the gateway exits. Add a subprocess regression that runs the real
+fixture under dynamic-code churn, and PYTHONFAULTHANDLER=1 in the live harness
+so any future native crash prints a backtrace.
+---
+ tests/gateway/fixtures/stack_dump_daemon.py   | 34 ++++++++--
+ tests/gateway/test_stack_dump_daemon.py       | 67 +++++++++++++++++++
+ .../test_unified_gateway_native_live.py       |  2 +-
+ 3 files changed, 97 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/test_stack_dump_daemon.py
+
+diff --git a/tests/gateway/fixtures/stack_dump_daemon.py b/tests/gateway/fixtures/stack_dump_daemon.py
+index 5f465e39cd6..a918d87028d 100644
+--- a/tests/gateway/fixtures/stack_dump_daemon.py
++++ b/tests/gateway/fixtures/stack_dump_daemon.py
+@@ -1,27 +1,45 @@
+ """Ordinary daemon plus delayed diagnostics (native-runner readiness stalls only).
+ 
+ No behaviour change: after ``UGW_STACK_DUMP_AFTER`` seconds every OS thread's stack
+-(faulthandler), every asyncio task's coroutine stack, the live runtime descriptor and a
++(refcounted Python frames), every asyncio task's coroutine stack, the live runtime descriptor and a
+ locally answered ``identify`` are appended to ``$HERMES_HOME/logs/stacks.txt`` so a stall
+ on a runner without SIGUSR2/strace still names the awaiting frame.
+ """
+ import asyncio
+-import faulthandler
+ import gc
+ import json
+ import os
+ from pathlib import Path
+ import runpy
++import sys
++import threading
+ import time
++import traceback
+ 
+ path = Path(os.environ['HERMES_HOME']) / 'logs' / 'stacks.txt'
+ path.parent.mkdir(parents=True, exist_ok=True)
+ delay = float(os.environ.get('UGW_STACK_DUMP_AFTER', '60'))
+-_sink = open(path, "w", encoding="utf-8")
+-faulthandler.dump_traceback_later(delay, repeat=True, file=_sink)
++_stop_dumps = threading.Event()
+ _real_run = asyncio.run
+ 
+ 
++def _dump_threads():
++    # faulthandler's native watchdog walks raw interpreter frames without the
++    # GIL; a returning thread can retire a frame/code object mid-walk (SIGSEGV).
++    # Like the gateway's SIGUSR2 dumper, retain real Python frame references.
++    # A Python thread still observes an event loop blocked in GIL-releasing I/O.
++    while not _stop_dumps.wait(delay):
++        frames = sys._current_frames()
++        try:
++            with path.open('a', encoding='utf-8') as sink:
++                sink.write(f'\n=== threads @ {time.time():.0f} ===\n')
++                for ident, frame in frames.items():
++                    sink.write(f'\n--- Thread 0x{ident:x} ---\n')
++                    traceback.print_stack(frame, file=sink)
++        finally:
++            del frames
++
++
+ def _describe(sink):
+     from gateway.control_socket import GatewayControlServer, windows_pipe_name
+     sink.write('\n=== runtime descriptors ===\n')
+@@ -67,4 +85,10 @@ def _run(main, **kwargs):
+ 
+ 
+ asyncio.run = _run
+-runpy.run_module('gateway.run', run_name='__main__')
++_dumper = threading.Thread(target=_dump_threads, name='stack-dump-diagnostics', daemon=True)
++_dumper.start()
++try:
++    runpy.run_module('gateway.run', run_name='__main__')
++finally:
++    _stop_dumps.set()
++    _dumper.join()
+diff --git a/tests/gateway/test_stack_dump_daemon.py b/tests/gateway/test_stack_dump_daemon.py
+new file mode 100644
+index 00000000000..3cd2877de28
+--- /dev/null
++++ b/tests/gateway/test_stack_dump_daemon.py
+@@ -0,0 +1,67 @@
++"""The native live-test diagnostics must not crash the process they observe.
++
++faulthandler's native watchdog walks unowned interpreter frames without the GIL,
++so a thread retiring a short-lived code object mid-walk takes the gateway down
++with SIGSEGV (CI: ``test_native_gateway_runtime_live`` exited -11). Run the real
++fixture with an aggressive dump interval while worker threads churn dynamically
++compiled code; the refcounted Python-frame observer must survive it.
++"""
++from pathlib import Path
++import os
++import subprocess
++import sys
++
++
++FIXTURE = Path(__file__).parent / 'fixtures' / 'stack_dump_daemon.py'
++
++SCRIPT = r'''
++import os, runpy, threading
++
++before = set(threading.enumerate())
++stop = threading.Event()
++
++def worker():
++    while not stop.is_set():
++        namespace = {}
++        exec(compile('def churn(n):\n if n: return churn(n-1)\nchurn(30)', '<churn>', 'exec'), namespace)
++        namespace.clear()
++
++def gateway(*args, **kwargs):
++    threads = [threading.Thread(target=worker) for _ in range(4)]
++    try:
++        for thread in threads:
++            thread.start()
++        stop.wait(float(os.environ['CHURN_SECONDS']))
++    finally:
++        stop.set()
++        for thread in threads:
++            thread.join(timeout=60)
++            assert not thread.is_alive()
++
++runpy.run_module = gateway
++runpy.run_path(os.environ['DUMP_FIXTURE'], run_name='__main__')
++assert set(threading.enumerate()) == before, 'diagnostics thread outlived the fixture'
++'''
++
++
++def _run_fixture(home, seconds):
++    env = {**os.environ, 'HERMES_HOME': str(home), 'DUMP_FIXTURE': str(FIXTURE),
++           'UGW_STACK_DUMP_AFTER': '0.0001', 'CHURN_SECONDS': str(seconds),
++           'PYTHONFAULTHANDLER': '1'}
++    result = subprocess.run([sys.executable, '-c', SCRIPT], env=env,
++                            capture_output=True, text=True, timeout=120, check=False)
++    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
++
++
++def test_stack_dump_survives_retiring_code_objects(tmp_path):
++    # A /dev/null sink keeps each dump cheap, so thousands of walks overlap the
++    # churn: the old native-watchdog fixture crashed 6 of 6 runs like this.
++    (tmp_path / 'logs').mkdir()
++    (tmp_path / 'logs' / 'stacks.txt').symlink_to(os.devnull)
++    _run_fixture(tmp_path, 3)
++
++
++def test_stack_dump_records_thread_stacks(tmp_path):
++    _run_fixture(tmp_path, 1)
++    text = (tmp_path / 'logs' / 'stacks.txt').read_text(encoding='utf-8')
++    assert '<churn>' in text and '--- Thread 0x' in text
+diff --git a/tests/gateway/test_unified_gateway_native_live.py b/tests/gateway/test_unified_gateway_native_live.py
+index ec75446f5ee..4a123bbe0d2 100644
+--- a/tests/gateway/test_unified_gateway_native_live.py
++++ b/tests/gateway/test_unified_gateway_native_live.py
+@@ -286,7 +286,7 @@ def harness(tmp_path, peer):
+         "    return _dumps(obj, *a, **kw)\n"
+         "_json.dumps = _dumps_witness\n", encoding='utf-8')
+     env = {k: os.environ[k] for k in _CHILD_ENV_KEYS if k in os.environ}
+-    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONUNBUFFERED='1',
++    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONUNBUFFERED='1', PYTHONFAULTHANDLER='1',
+                PYTHONPATH=os.pathsep.join([str(site), str(ROOT)]),
+                OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
+     return {'home': home, 'work': work, 'env': env, 'url': url, 'audit': audit, 'peer': peer}
+-- 
+2.55.0
+

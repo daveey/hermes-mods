@@ -1,0 +1,89 @@
+From 192ad2623c2d527b0f0a1cc79656531da69acbf8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 08:43:55 +0000
+Subject: [PATCH] [daveey] Fence queued sync feeds inside the detach
+ transaction
+
+---
+ hermes_cli/kanban_db_sync.py                  |  6 ++-
+ .../test_kanban_sync_detach_race.py           | 49 +++++++++++++++++++
+ 2 files changed, 53 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_detach_race.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 619e0be5052..89aee228fb0 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1096,10 +1096,12 @@ def apply_remote_changes(
+     pull and the snapshot rebuild) keeps every task field that has an unanswered local edit in the outbox, read
+     in the same transaction as the apply. [daveey]"""
+     from hermes_cli.kanban_db_connect import write_txn
+-    if board_mode(conn) == "off":
+-        raise RuntimeError("apply_remote_changes: kanban sync is not enabled on this board")
+     result = ApplyResult(cursor=new_cursor, local_pending_wins=local_pending_wins)
+     with write_txn(conn):
++        # Serialize with set_mode(off): a feed fetched before detach must not
++        # overwrite locally held custody after the detach transaction commits.
++        if board_mode(conn) == "off":
++            raise RuntimeError("apply_remote_changes: kanban sync is not enabled on this board")
+         if changes:
+             conn.execute("UPDATE kanban_sync_state SET applying = 1")
+             own = _state(conn)["gateway_id"]
+diff --git a/tests/hermes_cli/test_kanban_sync_detach_race.py b/tests/hermes_cli/test_kanban_sync_detach_race.py
+new file mode 100644
+index 00000000000..0eddd957e75
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_detach_race.py
+@@ -0,0 +1,49 @@
++"""An already-fetched service end cannot land after a native detach commits."""
++from contextlib import contextmanager
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def synced_conn(kanban_home):
++    yield from support.synced_conn(kanban_home)
++
++
++def test_detach_between_feed_precheck_and_write_preserves_custody(synced_conn, monkeypatch):
++    conn = synced_conn
++    tid = kb.create_task(conn, title="custody", assignee="worker")
++    assert kb.claim_task(conn, tid)
++    sync.set_mode(conn, "primary")
++    path = sync._db_key(conn)
++    assert path is not None
++    with kbc.connect_closing(Path(path)) as detacher:
++        real_txn = kbc.write_txn
++
++        @contextmanager
++        def detach_before_writer(target):
++            # Real second connection commits detach in the old check/lock gap.
++            with monkeypatch.context() as m:
++                m.setattr(kbc, "write_txn", real_txn)
++                sync.set_mode(detacher, "off")
++            with real_txn(target):
++                yield
++
++        monkeypatch.setattr(kbc, "write_txn", detach_before_writer)
++        before = [tuple(r) for r in conn.execute("SELECT * FROM task_runs")]
++        change = sync.RemoteChange(999, "tasks", tid, "upsert",
++                                   {"status": "ready", "current_run_uid": None}, 999,
++                                   "9999999999999-0000-server", "server")
++        with pytest.raises(RuntimeError, match="not enabled"):
++            sync.apply_remote_changes(conn, [change], new_cursor=999)
++        assert kb.get_task(conn, tid).status == "running"
++        assert [tuple(r) for r in conn.execute("SELECT * FROM task_runs")] == before
++        assert sync.sync_state(conn)["cursor"] != 999
+-- 
+2.55.0
+

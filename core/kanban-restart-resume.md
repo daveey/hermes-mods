@@ -22,9 +22,9 @@ booked `owner_restart_lost`, which is the trigger here).
 - **Fallbacks** (start fresh with today's transcript tail, as before): `prior_session_missing`,
   `prior_session_empty`, `prior_session_unreadable`, `prior_session_rotated` (1591: the prior session ended by
   rotation compaction), `foreign_home`, `foreign_profile` (prior session in another home/state.db or profile),
-  `over_compaction_threshold`, `threshold_unknown`, `plan_failed`, `seed_failed` (1591).
+  `over_compaction_threshold` (until 1634; see below), `threshold_unknown`, `plan_failed`, `seed_failed` (1591).
 - **Size gate.** The compaction threshold comes from the same compression config parser and `ContextCompressor`
-  the worker uses. 1591 resumes only below 85% of it (`RESUME_HEADROOM = 0.85`), leaving room for the first turn
+  the worker uses. 1591 resumed only below 85% of it (1634 resumes above it too, then compacts first) (`RESUME_HEADROOM = 0.85`), leaving room for the first turn
   and for owner/worker context-length lookup differences.
 - **Audit.** Every such run logs a `restart_resume` event carrying `prior_run_id`, `prior_session_id` and either
   `resumed_session_id` (also stamped on `owner_admitted`), `copied_messages`, `interrupted_calls`, or the
@@ -84,3 +84,38 @@ Apply 1589, 1590, 1591 in order (1590 and 1591 edit the file 1589 adds). No conf
 
 No. The hook point is inside the gateway's Kanban run admission (session creation and the worker's first-turn
 context), which no plugin hook exposes.
+
+## Follow-up patches (1634, 1635): an over-headroom transcript resumes, then compacts before the first model call
+
+**1634** (`340f8d6983`, `Kanban restart resume: an over-headroom prior session resumes, then compacts before the first
+model call`) and **1635** (`d75ec89392`, a regression test pinning a real-sized case).
+
+- **Behavior.** A prior session at or above `RESUME_HEADROOM` (85%) of the compaction threshold no longer falls back to
+  the 16k-char transcript tail (`over_compaction_threshold` is no longer produced). Admission copies the transcript as
+  usual and stamps `compaction: 'pending'` on the `restart_resume` event. The worker then runs the agent's own
+  `_compress_context` (trigger `turn_start_threshold`) **before** its first model call, so the first call sees the
+  compacted history plus the resume prompt. The worker appends a second `restart_resume` event for the same run: either
+  `compacted: true` with `compacted_messages` / `compacted_tokens`, or `fallback: 'compaction_failed'` (raised, or
+  returned no smaller history; `error` recorded when it raised) / `'compaction_unavailable'` (compression disabled or no
+  `_compress_context`). On a fallback the copied rows are soft-archived and the run starts from today's
+  transcript-tail context. The latest `restart_resume` event of a run is its outcome. The resume prompt now says the
+  conversation may be "summarized by context compaction when it was too long". Under-headroom resumes are unchanged
+  (no compaction, one event).
+- **How it works.** `gateway/session_kanban.py` calls `compact_resumed_history(agent, context, history)` before the turn.
+  It reads the run's latest `restart_resume` event read-only; anything other than `compaction == 'pending'` with a
+  `resumed_session_id` returns the history unchanged (an unreadable event resumes uncompacted). `drop_copied_rows`
+  calls `archive_and_compact(session_id, [], ...)`, the one in-place rewrite both `SessionDB` and the managed worker's
+  `RuntimeSessionStore` expose, so rows stay searchable. Recording the outcome is best-effort telemetry.
+- **Code.** `gateway/session_kanban_resume.py`, `gateway/session_kanban.py`.
+- **Tests** (not rerun by this mirror pass): `tests/gateway/test_session_kanban_restart_resume.py`:
+  `test_an_over_threshold_prior_session_resumes_and_is_compacted_before_the_first_model_call`,
+  `test_a_failed_compaction_falls_back_to_the_tail_only_fresh_session` (raise / abort / disabled),
+  `test_an_under_headroom_resume_is_not_compacted`; the fallback table drops the `over_threshold` case. 1635 adds
+  `test_hub_ev_380043_below_threshold_but_past_headroom_resumes_then_compacts` (a transcript of 222,858 tokens against
+  a 231,200 threshold: below it, past 85%). `tests/hermes_state/test_runtime_worker_compaction.py::test_a_kanban_restart_resume_fallback_drops_the_copied_rows_through_the_worker_store`.
+  The compaction itself is a stand-in `_compress_context`; a real summary-model call is untested, as is a transcript
+  still over the threshold after compaction.
+- **Applying.** Apply after 1589–1591, 1634 before 1635. No config.
+- **Gotchas.** Compaction runs in the worker before its first call, so a resumed over-headroom run spends one
+  summary-model call up front. A run whose compaction fails loses the copied context (as before 1634), but the rows are
+  archived, not deleted.

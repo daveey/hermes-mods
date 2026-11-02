@@ -2,6 +2,39 @@
 
 Patches: 1228 1211 1213 1231.
 
+## External-supervisor handback precedence (1673, 1675, 1676)
+
+### Behavior
+
+**1673** (`63b5e9ae4831916f5735cad68bed73f5d153a13f`) moves external-supervisor handback ahead of a stale installed-service definition. **1675** (`289edf5b0f99bc54b986bf1687b085d439616cd3`) deliberately broadens that rule: a running gateway declaring external supervision takes graceful handback even when the canonical installed service owns it. Refusal guards and orphan reap remain earlier. **1676** (`b55e36a61dc91a44d828b3b2cd36f5df8fde94e6`) isolates the test fixture from real service discovery and synchronizes teardown; its production change is comment-only.
+
+### How it works
+
+`_cmd_restart()` reads the live PID, calls `gateway_declares_external_supervisor()`, and hands it to `restart_externally_supervised_gateway()` before the installed-service dispatch. The existing SIGUSR1 drain exits the owner with 75 and waits for its supervisor to relaunch it. Patch 1675 removes 1673's `installed_service_owns_gateway()` ancestry exception and the redundant late handback branch. The manual fallback still checks a freshly read PID with `refuse_restart_of_service_managed_gateway()`.
+
+### Code
+
+`hermes_cli/gateway.py`, `hermes_cli/gateway_supervised_restart.py`. Companion Desktop diagnostics are in [restart failure logging](desktop-gateway-restart-failure-log.md), patch 1674.
+
+### Tests
+
+`tests/hermes_cli/test_gateway_restart_installed_service_external_supervisor.py`:
+`test_detach_restart_hands_back_to_external_supervisor_despite_failing_installed_service`,
+`test_installed_service_owner_also_gets_graceful_handback` (1675 replaces the earlier service-dispatch assertion),
+`test_refusal_guards_still_run_before_the_handback`,
+`test_supervisor_that_never_relaunches_still_fails_loudly`,
+`test_fake_supervisor_close_never_relaunches_after_teardown`.
+
+The fixture uses real child processes/signals and a stub supervisor, not real launchd/systemd lifecycle operations. Patch 1676 stubs `_installed_service_kind_for` rather than pretending the test host is macOS, asserts forbidden handback directly, and joins the watcher instead of sleeping. Patch 1675's source message reports 13 passed in the paired restart files and 1606 passed/48 skipped in the affected set; those are source-reported results, **not rerun in this documentation mirror**. A historical Desktop failure is not proven to have had this cause.
+
+### Applying
+
+Replay 1673, 1675 and 1676 in ordinal order as part of the [full mirror replay](README.md). The final contract is 1675's unconditional pre-service handback, not 1673's temporary service-owner exception. No plugin or new config is required.
+
+### Gotchas
+
+Canonical externally supervised services now also bypass plist/unit refresh, forced-kill escalation and kickstart fallback. A supervisor that does not relaunch yields exit 1 rather than a forced service restart. The fake supervisor must disable relaunch before killing children and reap both generations. Earlier exit-code descriptions in this document describe their historical patch: by this batch `KANBAN_OWNER_RESTART_EXIT_CODE` is 76, owner-unavailable is 69, and the new owner-down class is 68 (see [owner-down holds](kanban-owner-down-holds.md)).
+
 ## Behavior
 
 - Managed Kanban workers that are waiting on a gateway which is draining for a restart/update keep waiting, up to the owner's own `agent.restart_after_turn_timeout`, instead of giving up after `OWNER_WAIT_S` (180 s). If the owner restarted and the turn is lost, the worker exits with `KANBAN_OWNER_RESTART_EXIT_CODE` (69). (1228)

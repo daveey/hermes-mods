@@ -1,0 +1,422 @@
+From f50d06c6120ad761a6edba0d8b07e3f4e4e09700 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 04:04:09 +0000
+Subject: [PATCH] [daveey] fix(kanban): offer kind='assignment' only where a
+ different profile can take the card
+
+On single-profile hosts (no kanban.orchestrator_profile, creator == assignee) kind='assignment'
+always fails with no_capable_supervisor, yet the agent_owned_block refusal, the kanban_block
+schema, the worker prompt and the awaiting remedy all prescribed it: 38 cards in 72 h hit the
+wall, and some turned into asks to David for agent work or producer-less self-parks.
+
+- kanban_assignment_routing.supervisor_available(task): _supervisor(task)[0] is not None.
+- block_policy_error offers assignment only with task=(conn, id) and an available supervisor;
+  otherwise it lists the one-profile routes (owner card + card park, needs=[...],
+  kanban_supervisor_request). Tool and CLI pass task= per card.
+- route()'s no_capable_supervisor refusal names those routes instead of a config change.
+- Schema, KANBAN_GUIDANCE and the agent_action_wait remedy qualify assignment.
+Routing behavior and config defaults are unchanged.
+---
+ agent/prompt_builder.py                       |   3 +-
+ hermes_cli/kanban.py                          |  10 +-
+ hermes_cli/kanban_assignment_routing.py       |  27 ++-
+ hermes_cli/kanban_awaiting.py                 |   6 +-
+ hermes_cli/kanban_block_policy.py             |  34 +++-
+ .../test_kanban_agent_owned_block_guidance.py |   6 +-
+ .../test_kanban_block_assignment_guidance.py  | 160 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |  18 +-
+ 8 files changed, 242 insertions(+), 22 deletions(-)
+ create mode 100644 tests/tools/test_kanban_block_assignment_guidance.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 4cc034761f3..7187d60e80c 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -290,7 +290,8 @@ KANBAN_GUIDANCE = (
+     "holds, UX choice, paywalled source), call `kanban_block(kind=\"needs_input\", reason=\"...\", "
+     "human_request={action, why_human, interaction, scope, evidence})` and stop. Don't guess. A block with no "
+     "human_request, wake_check or clock_only is refused (`agent_owned_block`): access another agent or gateway "
+-    "holds is `kind=\"assignment\"` or `needs=[...]`, and peer output you need first is a parent link. The "
++    "holds is `needs=[...]` or an owner card you create and park on (`kind=\"assignment\"` only when a different "
++    "profile is configured), and peer output you need first is a parent link. The "
+     "user will unblock with context and the dispatcher will respawn you. "
+     "Waiting on time is not a block: when the next step must wait for a clock or an external event (a run cap, a soak, "
+     "a release window), call `kanban_schedule(reason=\"SCHEDULED_UNTIL=<ISO8601> — what you're waiting for\")` "
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 0eab1698308..7aa8bdc3200 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1392,11 +1392,11 @@ def _cmd_block(args: argparse.Namespace) -> int:
+         except ValueError as exc:
+             return _err(f"kanban block: {exc}", 2)
+         from hermes_cli.kanban_block_policy import block_policy_error
+-        from hermes_cli.kanban_continuation_recovery import is_exhausted_budget_block
+-        policy = block_policy_error(kind, human_request=request, wake_check=wake[0],
+-                                    clock_only=wake[2], reason=reason,
+-                                    exhausted_budget=all(is_exhausted_budget_block(conn, t, kind, reason)
+-                                                         for t in ids))
++        # Per card (task=): it checks that card's exhausted budget and offers kind='assignment' only where a
++        # different profile can take it. The first refusal stops the whole bulk block, as before. [daveey]
++        policy = next(filter(None, (block_policy_error(kind, human_request=request, wake_check=wake[0],
++                                                       clock_only=wake[2], reason=reason, task=(conn, t))
++                                    for t in ids)), None)
+         if policy:
+             return _err(f"kanban block: {policy}", 2)
+         refused: dict = {}
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index 652c0048ac0..cd1485eea8a 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -159,6 +159,28 @@ def _supervisor(task):
+     return None, []
+ 
+ 
++def supervisor_available(task) -> bool:
++    """True when kind='assignment' can route *task*: a different, existing, capable profile is configured.
++
++    Same check as :func:`route` (``_supervisor``), no new IO. Guidance texts offer assignment only when this
++    holds: on single-profile hosts (no orchestrator_profile, creator == assignee) it is always
++    ``no_capable_supervisor``. [daveey]
++    """
++    return _supervisor(task)[0] is not None
++
++
++# The routes that work without a second profile. Shown wherever assignment cannot route (the
++# agent_owned_block refusal, route()'s no_capable_supervisor refusal). [daveey]
++NO_SECOND_PROFILE_ROUTES = (
++    "(a) work that needs another gateway's access -> kanban_create the owner card on the gateway that "
++    "holds it (placement='<gateway>'), then park on it with kind='time', awaiting={kind:'card', "
++    "ref:'<owner id>', gateway:'<gateway>'}; (b) another gateway holds the access -> kanban_block("
++    "needs=['host:<gateway>'] or the exact capability, e.g. 'ssh:mini') so an owner card opens there; "
++    "(c) archive, unlink, resume or retry_limit on a card in your creator tree -> "
++    "kanban_supervisor_request(ops=[{'op': 'archive'|'unlink'|'resume'|'retry_limit', ...}])."
++)
++
++
+ def validate_repair_completion(conn, task_id):
+     """A completed repair must not release an invalid assignment after policy drift."""
+     from hermes_cli import kanban_db as kb
+@@ -210,8 +232,9 @@ def route(conn, task, payload):
+     if name is None:
+         raise AssignmentRoutingError(
+             f'no_capable_supervisor: task {task.id} requires a different profile '
+-            'with its original capabilities and kanban tools; configure '
+-            'kanban.orchestrator_profile or a capable creator profile.'
++            'with its original capabilities and kanban tools. No different profile is '
++            'configured on this host, so assignment cannot help; use one of: '
++            + NO_SECOND_PROFILE_ROUTES
+         )
+     # The enclosing block transaction owns the run CAS and validated this profile.
+     # assign_task's post-commit observer cannot run inside this transaction.
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index d36f6a47033..1f1334c567c 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -115,8 +115,10 @@ class RepeatedPark(Exception):
+ _REMEDY = (
+     "A wait needs a producer; agent-action conditions are work, not waits. Either (1) create the owner "
+     "card on the gateway that holds the capability (kanban_create there, or `hermes kanban create` over "
+-    "ssh) and park with awaiting={kind:'card', ref:'<owner id>', gateway:'<gw>'}; or (2) kanban_block "
+-    "kind='assignment' so a capable supervisor is routed.")
++    "ssh) and park with awaiting={kind:'card', ref:'<owner id>', gateway:'<gw>'}; (2) kanban_block "
++    "needs=[...] when another gateway holds the access; or (3) kanban_supervisor_request for archive, "
++    "unlink, resume or retry_limit on your creator tree. kanban_block kind='assignment' routes only when "
++    "a different profile is configured (kanban.orchestrator_profile or a creator other than the assignee).")
+ 
+ 
+ # --- parsing ---------------------------------------------------------------------------------
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index b2679a8bc9e..2a86ea28b50 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -49,6 +49,7 @@ def block_policy_error(kind, *, human_request=None, wake_check=None, clock_only=
+         return None
+     if reason and "SCHEDULED_UNTIL=" in reason:
+         return None
++    from hermes_cli.kanban_assignment_routing import NO_SECOND_PROFILE_ROUTES
+     if kind == "needs_input":
+         return (
+             f"{ERROR_CODE}: kind='needs_input' with no human_request is invisible to David (the "
+@@ -58,22 +59,45 @@ def block_policy_error(kind, *, human_request=None, wake_check=None, clock_only=
+             "(needs=['host:<gateway>'] or the exact capability, e.g. 'ssh:mini') so an owner card "
+             "is opened on that gateway, or kanban_create the owner card there and park on it "
+             "(kind='time', awaiting={kind:'card', ref, gateway}); (3) a timed wait -> kind='time' "
+-            "with awaiting plus wake_check (or clock_only=true)."
++            "with awaiting plus wake_check (or clock_only=true); (4) archive, unlink, resume or "
++            "retry_limit on a card in your creator tree -> kanban_supervisor_request."
+         ) + _SKELETON_NOTE
++    if _assignment_routes(task):
++        agent_work = (
++            "create the owner card on the gateway that holds the capability and park on it (kind='time', "
++            "awaiting={kind:'card', ref, gateway}), or kind='assignment' so a capable supervisor is routed "
++            "(a different profile is configured for this card)")
++    else:
++        agent_work = "use one of: " + NO_SECOND_PROFILE_ROUTES.rstrip(".")
+     return (
+         f"{ERROR_CODE}: kind={kind!r} with no human_request, wake_check or clock_only leaves the "
+         "card with no owner and nothing to wake it. Pick one: (1) a decision/action only David can "
+         "take -> pass human_request (kind needs_input or capability); (2) a condition an agent action "
+-        "changes (a grant, a permission, an install, a fix) is work, not a wait -> create the owner "
+-        "card on the gateway that holds the capability and park on it (kind='time', "
+-        "awaiting={kind:'card', ref, gateway}), or kind='assignment' so a capable supervisor is "
+-        "routed; (3) a wait needs a producer -> kind='time' with awaiting naming it (a live card, a "
++        f"changes (a grant, a permission, an install, a fix) is work, not a wait -> {agent_work}; "
++        "(3) a wait needs a producer -> kind='time' with awaiting naming it (a live card, a "
+         "CI run, a vendor ticket, a real clock window) plus wake_check (or clock_only=true). "
+         "If the work is actually done, call kanban_complete; if it needs another card, "
+         "kanban_create it and link it as a parent."
+     ) + _SKELETON_NOTE
+ 
+ 
++def _assignment_routes(task) -> bool:
++    """kind='assignment' can route the card in ``task=(conn, task_id)``; False without one or on any error.
++
++    Single-profile hosts (no kanban.orchestrator_profile, creator == assignee) always refuse it with
++    no_capable_supervisor, and offering it there sent 38 cards in 72 h into that wall. [daveey]
++    """
++    if task is None:
++        return False
++    try:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.kanban_assignment_routing import supervisor_available
++        row = kb.get_task(task[0], task[1])
++        return row is not None and supervisor_available(row)
++    except Exception:  # guidance only: an unreadable config or card never offers a route that may fail
++        return False
++
++
+ ASK_LINT_CODE = "user_ask_incomplete"
+ _UNBLOCK = re.compile(r"\bun-?block", re.IGNORECASE)
+ _ARCHIVE = re.compile(r"\barchiv", re.IGNORECASE)
+diff --git a/tests/tools/test_kanban_agent_owned_block_guidance.py b/tests/tools/test_kanban_agent_owned_block_guidance.py
+index 6d1fc0905b7..dfbb4e44eea 100644
+--- a/tests/tools/test_kanban_agent_owned_block_guidance.py
++++ b/tests/tools/test_kanban_agent_owned_block_guidance.py
+@@ -71,7 +71,11 @@ def test_tool_block_refusal_has_human_request_skeleton(worker_env, kind):
+         args["kind"] = kind
+     d = json.loads(kt._handle_block(args))
+     _assert_teaches_fix(d["error"])
+-    assert "kind='assignment'" in d["error"] or "needs=" in d["error"]
++    # No different profile is configured here, so assignment cannot route: the refusal names the routes that
++    # work on one profile instead (test_kanban_block_assignment_guidance.py covers the configured case).
++    assert "kind='assignment'" not in d["error"]
++    for route in ("kanban_create", "needs=", "kanban_supervisor_request"):
++        assert route in d["error"], route
+     assert _status(worker_env) == ("running", None)  # guard unchanged: still refused, task untouched
+ 
+ 
+diff --git a/tests/tools/test_kanban_block_assignment_guidance.py b/tests/tools/test_kanban_block_assignment_guidance.py
+new file mode 100644
+index 00000000000..de32780b0ac
+--- /dev/null
++++ b/tests/tools/test_kanban_block_assignment_guidance.py
+@@ -0,0 +1,160 @@
++"""Block refusals offer kind='assignment' only where it can route.
++
++Hub and MacBook leave ``kanban.orchestrator_profile`` unset, and their cards are created and run by the same
++``default`` profile, so ``kanban_block(kind='assignment')`` always fails with ``no_capable_supervisor``
++(``_supervisor`` excludes the assignee). In 72 h, 38 cards hit it (25 hub, 13 MacBook) after the refusal text and
++the schema told them to use it. The workers then improvised: asks to David for agent work, self-parks with no
++producer. The route stays profile-only (a same-profile worker cannot grant lifecycle authority), so the text now
++offers assignment per card, only when a different capable profile exists, and otherwise lists the routes that
++work on one profile: an owner card plus a card park, ``needs=[...]``, and ``kanban_supervisor_request``. [daveey]
++"""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kanban_cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++PROFILE_CFG = "platform_toolsets:\n  cli: [terminal, file, kanban]\nterminal:\n  backend: local\n"
++ALTERNATIVES = ("kanban_create", "needs=", "kanban_supervisor_request")
++
++
++@pytest.fixture
++def home(monkeypatch, tmp_path):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    (h / "config.yaml").write_text("kanban:\n  orchestrator_profile: ''\n")
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return h
++
++
++def _with_supervisor(home):
++    """orchestrator_profile names an existing, different profile with the card's tools plus kanban."""
++    (home / "config.yaml").write_text("kanban:\n  orchestrator_profile: supervisor\n")
++    prof = home / "profiles" / "supervisor"
++    prof.mkdir(parents=True)
++    (prof / "config.yaml").write_text(PROFILE_CFG)
++
++
++def _card(*, claim):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="needs a grant", assignee="default", created_by="default")
++        if claim:
++            kb.claim_task(conn, tid)
++            return tid, kb._current_run_id(conn, tid)
++    return tid, None
++
++
++def _tool_refusal(monkeypatch):
++    from tools import kanban_tools as kt
++    tid, run_id = _card(claim=True)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    d = json.loads(kt._handle_block({"kind": "capability", "reason": "need a grant"}))
++    assert d.get("rejection") == "agent_owned_block", d
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running"  # still refused, card untouched
++    return d["error"]
++
++
++def _cli_refusal():
++    tid, _ = _card(claim=False)
++    out = kanban_cli.run_slash(f"block {tid} need a grant")
++    assert "agent_owned_block" in out, out
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "ready"
++    return out
++
++
++def _assert_single_profile_routes(text):
++    assert "kind='assignment'" not in text, text
++    for word in ALTERNATIVES:
++        assert word in text, (word, text)
++    assert "awaiting={kind:'card'" in text
++    for op in ("archive", "unlink", "resume", "retry_limit"):
++        assert op in text, op
++    assert "human_request" in text  # David-only steps keep their route
++
++
++# --- agent_owned_block refusal: tool + CLI ------------------------------------------------------
++
++def test_tool_refusal_on_single_profile_host_omits_assignment(home, monkeypatch):
++    _assert_single_profile_routes(_tool_refusal(monkeypatch))
++
++
++def test_cli_refusal_on_single_profile_host_omits_assignment(home):
++    _assert_single_profile_routes(_cli_refusal())
++
++
++def test_tool_refusal_offers_assignment_when_a_different_profile_is_configured(home, monkeypatch):
++    _with_supervisor(home)
++    assert "kind='assignment'" in _tool_refusal(monkeypatch)
++
++
++def test_cli_refusal_offers_assignment_when_a_different_profile_is_configured(home):
++    _with_supervisor(home)
++    assert "kind='assignment'" in _cli_refusal()
++
++
++def test_refusal_without_a_task_never_offers_assignment():
++    from hermes_cli.kanban_block_policy import block_policy_error
++    _assert_single_profile_routes(block_policy_error("capability", reason="need a grant"))
++
++
++def test_supervisor_available_matches_route_eligibility(home):
++    from hermes_cli import kanban_assignment_routing as ar
++    tid, _ = _card(claim=False)
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++    assert ar.supervisor_available(task) is False
++    _with_supervisor(home)
++    assert ar.supervisor_available(task) is True
++
++
++# --- route(): no_capable_supervisor --------------------------------------------------------------
++
++def test_no_capable_supervisor_refusal_names_the_working_routes(home):
++    from hermes_cli import kanban_assignment_routing as ar
++    tid, _ = _card(claim=False)
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ar.AssignmentRoutingError) as exc:
++            kb.block_task(conn, tid, kind="assignment", reason="need a grant")
++        assert kb.get_task(conn, tid).status == "ready"
++    text = str(exc.value)
++    assert text.startswith("no_capable_supervisor")
++    assert "configure kanban.orchestrator_profile" not in text
++    assert "assignment cannot help" in text
++    for word in ALTERNATIVES:
++        assert word in text, word
++
++
++# --- schema text -----------------------------------------------------------------------------------
++
++def test_block_schema_no_longer_prescribes_assignment_for_agent_work():
++    from tools.kanban_tools_schemas import KANBAN_BLOCK_SCHEMA
++    desc = KANBAN_BLOCK_SCHEMA["description"]
++    kind_desc = KANBAN_BLOCK_SCHEMA["parameters"]["properties"]["kind"]["description"]
++    for text in (desc, kind_desc):
++        assert "agent work is 'assignment'" not in text
++        assert "no_capable_supervisor" in text or "different profile" in text
++    assert "route to a capable supervisor, not a human" not in desc
++    assert "kanban_supervisor_request" in kind_desc
++    assert "single-profile" in desc
++
++
++def test_worker_prompt_and_awaiting_remedy_qualify_assignment():
++    from agent import prompt_builder
++    from hermes_cli import kanban_awaiting
++    assert 'holds is `kind="assignment"` or `needs=[...]`' not in prompt_builder.KANBAN_GUIDANCE
++    assert "only when a different profile is configured" in prompt_builder.KANBAN_GUIDANCE
++    remedy = kanban_awaiting._REMEDY
++    assert "kind='assignment' so a capable supervisor is routed" not in remedy
++    assert "needs=" in remedy and "kanban_supervisor_request" in remedy
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 9b7cde729d3..9b738b17417 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -325,8 +325,10 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         "needed), 'needs_input' (a decision/answer only David can give; needs "
+         "``human_request``), 'capability' (a hard wall no agent can clear: needs "
+         "``human_request`` for David's step, or ``needs`` when another gateway "
+-        "holds the access), 'assignment' (this worker has the wrong tools/backend; "
+-        "route to a capable supervisor, not a human), 'transient' (a flaky failure that may clear), or "
++        "holds the access), 'assignment' (this card needs another configured profile's tools: "
++        "reassigns it to kanban.orchestrator_profile or the creator's profile when that differs from the "
++        "assignee; refused with no_capable_supervisor on single-profile hosts), 'transient' (a flaky "
++        "failure that may clear), or "
+         "'time' (waiting on a clock, a cron, a soak or a release, not a person: "
+         "parks the card 'scheduled' with a wake time, never as a human block). "
+         "``reason`` is shown to the human on the board and, in Desktop, in a "
+@@ -343,8 +345,9 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         "to look, and a park more than 2 h out without one is refused unless "
+         "``clock_only`` is true. Agent-action conditions (a grant, a permission, "
+         "an install, a fix) are work, not waits: create the owner card on the "
+-        "gateway that holds the capability and point ``awaiting`` at it, or use "
+-        "kind='assignment'. A wait on David is kind='needs_input' with "
++        "gateway that holds the capability and point ``awaiting`` at it, declare "
++        "``needs``, or use kanban_supervisor_request for archive/unlink/resume/retry_limit "
++        "on your creator tree ('assignment' only when a different profile is configured). A wait on David is kind='needs_input' with "
+         "``human_request``, never a park. A wait on another card on this board is "
+         "a parent link (kanban_link), not a park."
+     ),
+@@ -370,11 +373,14 @@ KANBAN_BLOCK_SCHEMA = _schema(
+                 "resumes automatically when an incomplete parent finishes; "
+                 "if no parent is open it is a timed wait (scheduled). 'time' "
+                 "parks scheduled until SCHEDULED_UNTIL=<ISO8601> in the reason "
+-                "(default 24h). 'assignment' routes to a capable supervisor. "
++                "(default 24h). 'assignment' reassigns to a different configured profile "
++                "(kanban.orchestrator_profile or the creator's), else no_capable_supervisor. "
+                 "'needs_input', 'capability', 'transient' or an omitted kind with no "
+                 "human_request, wake_check, clock_only or blocker_id is refused "
+                 "(agent_owned_block): a step for David needs human_request; agent "
+-                "work is 'assignment', ``needs`` or an owner card; a wait is 'time'."
++                "work is an owner card you create and park on, ``needs``, or "
++                "kanban_supervisor_request; 'assignment' only when a different profile "
++                "is configured; a wait is 'time'."
+             ),
+         },
+         "blocker_id": _prop("string", _BLOCKER_ID_DESC + (
+-- 
+2.55.0
+

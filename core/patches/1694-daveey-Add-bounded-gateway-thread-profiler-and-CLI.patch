@@ -1,0 +1,924 @@
+From c246c458563d202818fedc9d596ac858fbc83938 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 11:43:36 +0000
+Subject: [PATCH] [daveey] Add bounded gateway thread profiler and CLI
+
+---
+ gateway/control_profile.py                    | 213 ++++++++++++++++++
+ gateway/control_socket.py                     |  10 +-
+ hermes_cli/gateway.py                         |   4 +-
+ hermes_cli/gateway_profile.py                 |  35 +++
+ hermes_cli/subcommands/gateway.py             |   6 +
+ scripts/benchmark_gateway_profile.py          |  63 ++++++
+ tests/gateway/test_control_profile.py         | 103 +++++++++
+ tests/gateway/test_control_profile_bounds.py  |  29 +++
+ .../gateway/test_control_profile_lifetimes.py | 165 ++++++++++++++
+ tests/hermes_cli/test_gateway_profile.py      |  65 ++++++
+ .../docs/developer-guide/gateway-profiling.md |  91 ++++++++
+ 11 files changed, 781 insertions(+), 3 deletions(-)
+ create mode 100644 gateway/control_profile.py
+ create mode 100644 hermes_cli/gateway_profile.py
+ create mode 100644 scripts/benchmark_gateway_profile.py
+ create mode 100644 tests/gateway/test_control_profile.py
+ create mode 100644 tests/gateway/test_control_profile_bounds.py
+ create mode 100644 tests/gateway/test_control_profile_lifetimes.py
+ create mode 100644 tests/hermes_cli/test_gateway_profile.py
+ create mode 100644 website/docs/developer-guide/gateway-profiling.md
+
+diff --git a/gateway/control_profile.py b/gateway/control_profile.py
+new file mode 100644
+index 00000000000..68f449e0a15
+--- /dev/null
++++ b/gateway/control_profile.py
+@@ -0,0 +1,213 @@
++"""On-demand wall-stack samples and per-thread CPU deltas (no source or locals)."""
++from __future__ import annotations
++
++from collections import Counter
++from functools import lru_cache
++import ctypes
++import os
++import json
++import sys
++import threading
++import time
++
++
++# Darwin <sys/proc_info.h>. PROC_PIDTHREADINFO (5) matches its arg against the
++# thread's TSD handle (machine.cthread_self, as listed by PROC_PIDLISTTHREADS);
++# PROC_PIDTHREADID64INFO (15) matches the 64-bit kernel thread_id, which is what
++# pthread_threadid_np() and so threading.native_id return. Same struct for both.
++_PROC_PIDTHREADID64INFO = 15
++
++
++class _ProcThreadInfo(ctypes.Structure):
++    # struct proc_threadinfo (112 bytes). Times are nanoseconds.
++    _fields_ = [('user_time', ctypes.c_uint64), ('system_time', ctypes.c_uint64),
++                ('cpu_usage', ctypes.c_int32), ('policy', ctypes.c_int32),
++                ('run_state', ctypes.c_int32), ('flags', ctypes.c_int32),
++                ('sleep_time', ctypes.c_int32), ('curpri', ctypes.c_int32),
++                ('priority', ctypes.c_int32), ('maxpriority', ctypes.c_int32),
++                ('name', ctypes.c_char * 64)]
++
++
++@lru_cache(maxsize=1)
++def _darwin_proc_pidinfo():
++    # PyDLL keeps the GIL across the call. proc_pidinfo(PROC_PIDTHREADID64INFO) is a
++    # bounded, non-blocking kernel read of one thread's counters, so releasing and
++    # re-acquiring the GIL around it (CDLL) only adds a GIL handoff per thread per
++    # tick without letting other Python code run meaningfully in between.
++    library = ctypes.PyDLL('/usr/lib/libproc.dylib')
++    function = library.proc_pidinfo
++    function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
++    function.restype = ctypes.c_int
++    return function
++
++
++_PROC_THREADINFO_SIZE = ctypes.sizeof(_ProcThreadInfo)
++
++
++def _cpu_seconds(native_id):
++    if sys.platform == 'darwin':
++        info = _ProcThreadInfo()
++        # Unique, never-reused thread_id: an exited thread fails (ESRCH) instead of
++        # aliasing a later thread that reuses the same pthread/TSD address.
++        if _darwin_proc_pidinfo()(os.getpid(), _PROC_PIDTHREADID64INFO, native_id,
++                                  ctypes.addressof(info), _PROC_THREADINFO_SIZE) != _PROC_THREADINFO_SIZE:
++            return None
++        return (info.user_time + info.system_time) / 1e9
++    if not sys.platform.startswith('linux'):
++        return None
++    # Linux MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED): kernel-resolved numeric TID,
++    # not pthread_getcpuclockid's dereferenced pthread_t (unsafe after thread exit).
++    # An exited TID yields EINVAL/ESRCH, never a userspace use-after-free.
++    try:
++        return time.clock_gettime((~native_id << 3) | 6)
++    except OSError:
++        return None
++
++
++def _collect(seconds, hz, top):
++    records = {}
++    samples = 0
++    deadline = time.monotonic() + seconds
++    next_tick = time.monotonic()
++    code_keys = {}
++    previous_frames = {}
++    frames = {}
++    previous_stacks = {}
++    while time.monotonic() < deadline:
++        threads = {t.ident: t for t in threading.enumerate()}
++        frames = sys._current_frames()
++        current_stacks = {}
++        for ident, frame in frames.items():
++            thread = threads.get(ident)
++            if thread is None or thread.native_id is None:
++                continue
++            key = (thread, thread.native_id)
++            cpu = _cpu_seconds(thread.native_id)
++            if key not in records:
++                records[key] = dict(name=thread.name, native_id=thread.native_id,
++                                    samples=0, first_seen_sample=samples,
++                                    stack_counts={},
++                                    cpu_start=cpu, cpu_last=cpu)
++            row = records[key]
++            row['samples'] += 1
++            row['last_seen_sample'] = samples
++            unchanged = cpu is not None and cpu == row['cpu_last'] and previous_frames.get(ident) is frame
++            if cpu is not None:
++                row['cpu_last'] = cpu
++            if unchanged and ident in previous_stacks:
++                stack_key = previous_stacks[ident]
++            else:
++                stack = []
++                while frame is not None:
++                    code = frame.f_code
++                    code_id = id(code)
++                    if code_id not in code_keys:
++                        # Avoid expensive structural code-object hashing on every tick.
++                        code_keys[code_id] = (code, f'{code.co_filename}:{code.co_firstlineno}:{code.co_name}')
++                    stack.append(code_id)
++                    frame = frame.f_back
++                stack_key = tuple(stack)
++            current_stacks[ident] = stack_key
++            counts = row['stack_counts']
++            counts[stack_key] = counts.get(stack_key, 0) + 1
++        # Retain only the preceding snapshot to compare real frame identity (not
++        # reusable ids). Reuse its stack only if the native CPU clock has not moved:
++        # a resumed generator can keep its leaf frame but acquire a different caller.
++        # No locals/source are read; all frame references are cleared at window end.
++        previous_frames = frames
++        previous_stacks = current_stacks
++        samples += 1
++        next_tick += 1 / hz
++        time.sleep(max(0, min(next_tick, deadline) - time.monotonic()))
++    previous_frames.clear()
++    frames.clear()
++    frame = None
++    output = []
++    for (thread, native_id), row in records.items():
++        end = _cpu_seconds(native_id) if thread.is_alive() else None
++        start = row.pop('cpu_start')
++        last = row.pop('cpu_last') if end is None else end
++        row.pop('cpu_last', None)
++        row['cpu_s'] = max(0, last - start) if start is not None and last is not None else None
++        row['cpu_partial'] = end is None or start is None
++        self_counts, inclusive_counts = Counter(), Counter()
++        for stack, count in row.pop('stack_counts').items():
++            self_counts[code_keys[stack[0]][1]] += count
++            for frame_key in {code_keys[c][1] for c in stack}:
++                inclusive_counts[frame_key] += count
++        row['top_self'] = self_counts.most_common(top)
++        row['top_inclusive'] = inclusive_counts.most_common(top)
++        output.append(row)
++    output.sort(key=lambda r: r['cpu_s'] or 0, reverse=True)
++    return dict(seconds=seconds, hz=hz, samples=samples, threads=output)
++
++
++def trim_response(response, limit):
++    """Keep whole identities/frame keys or omit them; never silently rewrite them.
++
++    Reserve the complete envelope (including an arbitrary JSON request id) and
++    count JSON's ASCII escaping, separators and final newline in the wire budget.
++    """
++    result = response['result']
++    rows = result['threads']
++    result['threads'] = []
++    result['truncated'] = True
++    result['omitted_threads'] = len(rows)
++    result['omitted_frames'] = sum(len(r['top_self']) + len(r['top_inclusive']) for r in rows)
++    budget = limit - len(json.dumps(response, default=str).encode()) - 2
++    for row in rows:
++        kept = {**row, 'top_self': [], 'top_inclusive': []}
++        cost = len(json.dumps(kept, default=str).encode()) + 2
++        if cost > budget:
++            continue
++        budget -= cost
++        result['threads'].append(kept)
++        result['omitted_threads'] -= 1
++        for field in ('top_self', 'top_inclusive'):
++            for pair in row[field]:
++                cost = len(json.dumps(pair).encode()) + 2
++                if cost <= budget:
++                    kept[field].append(pair)
++                    budget -= cost
++                    result['omitted_frames'] -= 1
++    return response
++
++
++def validate_params(params):
++    seconds, hz, top = (params.get('seconds', 20), params.get('hz', 100), params.get('top', 40))
++    for name, value, low, high in [('seconds', seconds, 1, 60), ('hz', hz, 10, 200)]:
++        if type(value) not in (int, float) or not low <= value <= high:
++            raise ValueError(f'{name} must be a finite number in {low}..{high}')
++    if type(top) is not int or top <= 0:
++        raise ValueError('top must be a positive integer')
++    return seconds, hz, top
++
++
++_PROFILE_LOCK = threading.Lock()
++
++
++def profile(params):
++    seconds, hz, top = validate_params(params)
++    if not _PROFILE_LOCK.acquire(blocking=False):
++        raise RuntimeError('a profile is already running')
++    result = []
++    errors = []
++
++    def sample():
++        try:
++            result.append(_collect(seconds, hz, top))
++        except BaseException as exc:  # health: allow BLE001 -- transported to and re-raised by the waiting control handler
++            errors.append(exc)
++        finally:
++            _PROFILE_LOCK.release()
++
++    worker = threading.Thread(target=sample, name='gateway-profiler', daemon=True)  # health: allow HX012 -- process-wide diagnostic reads no profile state
++    try:
++        worker.start()
++    except BaseException:
++        _PROFILE_LOCK.release()
++        raise
++    worker.join()
++    if errors:
++        raise errors[0]
++    return result[0]
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index 7141eb22999..70af0c45646 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -317,8 +317,10 @@ class GatewayControlServer:
+         # removed on stop only while it is still that inode and empty, never one it found existing.
+         self._created_dir: Optional[tuple[Path, tuple[int, int]]] = None
+         self._file_identities = {}
++        from gateway.control_profile import profile
+         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
+-            "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
++            "identify": build_identify_payload, "status": build_status_payload,
++            "profile": profile, **(verb_handlers or {})}
+ 
+     async def start(self) -> bool:
+         """Bind and start serving. Returns True on success, False otherwise."""
+@@ -454,6 +456,7 @@ class GatewayControlServer:
+     def handle_request_line(self, raw: bytes, peer_subject: Optional[str] = None) -> bytes:
+         """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe)."""
+         request_id: Any = None
++        verb = None
+         try:
+             request = json.loads(raw.decode("utf-8"))
+             if not isinstance(request, dict):
+@@ -476,6 +479,8 @@ class GatewayControlServer:
+             else:
+                 # Verbs that carry arguments (e.g. migrate-profile-identity) declare a ``params``
+                 # parameter; argument-less verbs (identify/status/rescan) keep their bare signature.
++                if verb == "profile" and "params" in request and not isinstance(request["params"], dict):
++                    raise ValueError("profile params must be an object")
+                 params = request.get("params") if isinstance(request.get("params"), dict) else {}
+                 wants_params = "params" in inspect.signature(handler).parameters
+                 response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
+@@ -486,6 +491,9 @@ class GatewayControlServer:
+             response["id"] = request_id
+         try:
+             encoded = json.dumps(response, default=str).encode("utf-8")
++            if verb == "profile" and response.get("ok") and len(encoded) + 1 >= _MAX_RESPONSE_BYTES:
++                from gateway.control_profile import trim_response
++                encoded = json.dumps(trim_response(response, _MAX_RESPONSE_BYTES), default=str).encode("utf-8")
+         except Exception:
+             encoded = b'{"ok": false, "error": "response serialization failed"}'
+         if len(encoded) > _MAX_RESPONSE_BYTES:
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 004929e0e0a..23b0548baad 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -20,7 +20,7 @@ import textwrap
+ import time
+ from dataclasses import dataclass
+ from pathlib import Path
+-from hermes_cli import gateway_service_owner, setup_platforms
++from hermes_cli import gateway_service_owner, setup_platforms, gateway_profile
+ 
+ # UV's bundled Python ships a minimal PATH; ensure launchctl/systemctl are discoverable.
+ if os.name == "posix":
+@@ -5657,7 +5657,7 @@ def _cmd_migrate(args):
+ 
+ 
+ _GATEWAY_SUBCOMMANDS = {
+-    None: _cmd_run, "run": _cmd_run, "setup": _cmd_setup, "install": _cmd_install,
++    "profile": gateway_profile.profile_command, None: _cmd_run, "run": _cmd_run, "setup": _cmd_setup, "install": _cmd_install,
+     "uninstall": _cmd_uninstall, "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart,
+     "status": _cmd_status, "list": _cmd_list, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
+ }
+diff --git a/hermes_cli/gateway_profile.py b/hermes_cli/gateway_profile.py
+new file mode 100644
+index 00000000000..a942adf09c7
+--- /dev/null
++++ b/hermes_cli/gateway_profile.py
+@@ -0,0 +1,35 @@
++"""CLI renderer for the live gateway's on-demand profiler."""
++import json
++import sys
++
++
++def profile_command(args):
++    from gateway.control_profile import validate_params
++    from gateway.control_socket import query_gateway_control
++    from hermes_constants import get_hermes_home
++
++    params = dict(seconds=args.seconds, hz=args.hz, top=args.top)
++    try:
++        seconds, _, _ = validate_params(params)
++    except ValueError as exc:
++        print(f'gateway profile: {exc}', file=sys.stderr)
++        raise SystemExit(2) from exc
++    result = query_gateway_control(get_hermes_home(), 'profile', params=params, timeout=seconds + 10)
++    if result is None:
++        print('gateway profile: no result (gateway unavailable, unsupported, or another profile is running)', file=sys.stderr)
++        raise SystemExit(1)
++    if args.json:
++        print(json.dumps(result))
++        return
++    print(f"{result['samples']} wall samples over {result['seconds']}s at {result['hz']} Hz")
++    print('CPU seconds   Samples  Native ID  Thread')
++    for row in result['threads']:
++        cpu = 'unknown' if row['cpu_s'] is None else f"{row['cpu_s']:.6f}"
++        partial = ' (partial/lower bound)' if row.get('cpu_partial') else ''
++        print(f"{cpu:>11} {row['samples']:>9} {row['native_id']:>10}  {row['name']}{partial}")
++        for field, title in [('top_self', 'SELF'), ('top_inclusive', 'INCLUSIVE')]:
++            print(f'  {title} (wall samples, not CPU attribution)')
++            for frame, count in row[field]:
++                print(f'    {count:>6}  {frame}')
++    if result.get('truncated'):
++        print(f"Truncated: {result['omitted_threads']} threads and {result['omitted_frames']} frame entries omitted")
+diff --git a/hermes_cli/subcommands/gateway.py b/hermes_cli/subcommands/gateway.py
+index 2ecf5016fa4..12ef5ba3890 100644
+--- a/hermes_cli/subcommands/gateway.py
++++ b/hermes_cli/subcommands/gateway.py
+@@ -67,6 +67,12 @@ def build_gateway_parser(
+     gateway_subparsers = gateway_parser.add_subparsers(
+         dest="gateway_command", parser_class=_GatewayCommandParser)
+ 
++    gateway_profile = gateway_subparsers.add_parser('profile', help='Sample live gateway thread stacks and CPU')
++    gateway_profile.add_argument('--seconds', type=float, default=20, help='Duration in seconds (1..60; default 20)')
++    gateway_profile.add_argument('--hz', type=float, default=100, help='Sampling frequency (10..200; default 100)')
++    gateway_profile.add_argument('--top', type=int, default=40, help='Top frames per thread (default 40)')
++    gateway_profile.add_argument('--json', action='store_true', help='Print machine-readable profile')
++
+     gateway_run = gateway_subparsers.add_parser(
+         "run", help="Run gateway in foreground (recommended for WSL and Docker)"
+     )
+diff --git a/scripts/benchmark_gateway_profile.py b/scripts/benchmark_gateway_profile.py
+new file mode 100644
+index 00000000000..9da050c2436
+--- /dev/null
++++ b/scripts/benchmark_gateway_profile.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""Reproduce profiler overhead: process CPU, same idle threads, baseline subtraction.
++
++Run from checkout root: python3 scripts/benchmark_gateway_profile.py --seconds 10 --rounds 3
++No running gateway is contacted, restarted or signalled.
++"""
++import argparse
++import json
++from pathlib import Path
++import platform
++import statistics
++import sys
++import threading
++import time
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from gateway.control_profile import profile
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--seconds', type=float, default=10)
++    parser.add_argument('--rounds', type=int, default=3)
++    parser.add_argument('--threads', type=int, default=150)
++    parser.add_argument('--hz', type=float, default=100)
++    args = parser.parse_args()
++    stop = threading.Event()
++    barrier = threading.Barrier(args.threads + 1)
++    def idle():
++        barrier.wait()
++        stop.wait()
++    workers = [threading.Thread(target=idle, name=f'idle-{i}') for i in range(args.threads)]
++    for worker in workers:
++        worker.start()
++    barrier.wait()
++    results = []
++    try:
++        for index in range(args.rounds):
++            measurements = {}
++            # Alternate order to expose warmup/drift instead of hiding it.
++            order = ('baseline', 'profile') if index % 2 == 0 else ('profile', 'baseline')
++            for mode in order:
++                wall, cpu = time.monotonic(), time.process_time()
++                payload = profile({'seconds': args.seconds, 'hz': args.hz}) if mode == 'profile' else None
++                if mode == 'baseline':
++                    stop.wait(args.seconds)
++                cpu, wall = time.process_time() - cpu, time.monotonic() - wall
++                measurements[mode] = dict(cpu_s=cpu, wall_s=wall, core_percent=100 * cpu / wall)
++                if payload:
++                    measurements[mode]['samples'] = payload['samples']
++                    measurements[mode]['idle_threads_seen'] = sum(t['name'].startswith('idle-') for t in payload['threads'])
++            measurements['incremental_core_percent'] = measurements['profile']['core_percent'] - measurements['baseline']['core_percent']
++            results.append(measurements)
++    finally:
++        stop.set()
++        for worker in workers:
++            worker.join()
++    print(json.dumps(dict(platform=platform.platform(), python=sys.version, params=vars(args), rounds=results,
++                          median_incremental_core_percent=statistics.median(r['incremental_core_percent'] for r in results)), indent=2))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/gateway/test_control_profile.py b/tests/gateway/test_control_profile.py
+new file mode 100644
+index 00000000000..0eeb47287f0
+--- /dev/null
++++ b/tests/gateway/test_control_profile.py
+@@ -0,0 +1,103 @@
++"""Control socket ``profile`` verb: in-process sampling profiler of the live gateway daemon."""
++import json
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from gateway.control_socket import GatewayControlServer
++
++
++@pytest.mark.parametrize('params', [
++    {'seconds': 0}, {'seconds': 61}, {'seconds': float('nan')},
++    {'seconds': float('inf')}, {'seconds': True}, {'seconds': '1'},
++    {'hz': 9}, {'hz': 201}, {'hz': float('nan')}, {'hz': True},
++    {'top': 0}, {'top': -1}, {'top': 1.5}, {'top': True},
++])
++def test_invalid_profile_parameters(params):
++    from gateway.control_profile import validate_params
++    with pytest.raises(ValueError):
++        validate_params(params)
++
++
++@pytest.mark.parametrize('params', [None, [], 'bad'])
++def test_profile_rejects_nonobject_params(tmp_path, params, monkeypatch):
++    monkeypatch.setattr('gateway.control_profile._collect', lambda *args: {})
++    raw = json.dumps({'verb': 'profile', 'params': params}).encode()
++    response = json.loads(GatewayControlServer(tmp_path).handle_request_line(raw))
++    assert not response['ok'] and 'params' in response['error']
++
++
++def test_parameter_defaults_and_boundaries():
++    from gateway.control_profile import validate_params
++    assert validate_params({}) == (20, 100, 40)
++    assert validate_params({'seconds': 60, 'hz': 200, 'top': 1}) == (60, 200, 1)
++    assert validate_params({'seconds': 1, 'hz': 10}) == (1, 10, 40)
++
++
++def test_process_wide_concurrent_refusal_and_lock_release(tmp_path, monkeypatch):
++    import gateway.control_profile as profiler
++    started = threading.Event()
++    release = threading.Event()
++    collect = profiler._collect
++
++    def blocked(*args):
++        started.set()
++        assert release.wait(5)
++        return collect(*args)
++
++    monkeypatch.setattr(profiler, '_collect', blocked)
++    raw = json.dumps({'verb': 'profile', 'params': {'seconds': 1}}).encode()
++    with ThreadPoolExecutor(1) as pool:
++        first = pool.submit(GatewayControlServer(tmp_path).handle_request_line, raw)
++        assert started.wait(5)
++        try:
++            before = time.monotonic()
++            other = json.loads(GatewayControlServer(tmp_path).handle_request_line(raw))
++            assert not other['ok'] and 'already' in other['error']
++            assert time.monotonic() - before < 0.5
++        finally:
++            release.set()
++        assert json.loads(first.result(5))['ok']
++    assert json.loads(GatewayControlServer(tmp_path).handle_request_line(raw))['ok']
++
++
++def _profile_burner_spin(stop):
++    # Pure-Python loop with no Python-level calls, so every sample's leaf frame is this function.
++    n = 0
++    while not stop:
++        n += 1
++    return n
++
++
++@pytest.mark.platforms("linux")
++def test_profile_verb_reports_busy_thread_self_time_and_cpu(tmp_path):
++    stop: list = []
++    burner = threading.Thread(target=_profile_burner_spin, args=(stop,), name="profile-burner", daemon=True)
++    burner.start()
++    try:
++        server = GatewayControlServer(tmp_path)
++        raw = json.dumps({"verb": "profile", "id": 7, "protocol": 1,
++                          "params": {"seconds": 1, "hz": 100}}).encode()
++        response = json.loads(server.handle_request_line(raw))
++    finally:
++        stop.append(True)
++        burner.join(5)
++
++    assert response["ok"] is True, response
++    assert response["id"] == 7
++    result = response["result"]
++    assert result["seconds"] == 1 and result["hz"] == 100
++    assert result["samples"] > 0
++
++    threads = {t["name"]: t for t in result["threads"]}
++    busy = threads["profile-burner"]
++    code = _profile_burner_spin.__code__
++    key = f"{code.co_filename}:{code.co_firstlineno}:{code.co_name}"
++    assert busy["top_self"][0][0] == key
++    assert busy["top_self"][0][1] >= 25
++    assert dict(busy["top_inclusive"])[key] == busy["top_self"][0][1]
++    assert busy["cpu_s"] > 0
++    assert busy["native_id"] == burner.native_id
++    assert 0 <= busy["first_seen_sample"] <= busy["last_seen_sample"] < result["samples"]
+diff --git a/tests/gateway/test_control_profile_bounds.py b/tests/gateway/test_control_profile_bounds.py
+new file mode 100644
+index 00000000000..570d0a3c22f
+--- /dev/null
++++ b/tests/gateway/test_control_profile_bounds.py
+@@ -0,0 +1,29 @@
++"""Wire-budget contract, including names, frames and the request envelope."""
++import json
++
++from gateway.control_socket import GatewayControlServer, _MAX_RESPONSE_BYTES
++
++
++def test_profile_trims_whole_envelope_without_corrupting_shape(tmp_path):
++    frame = 'huge-path/' * 100000 + ':1:function'
++    row = dict(name='名' * 100000, native_id=12, cpu_s=0.1, samples=1,
++               first_seen_sample=0, last_seen_sample=0,
++               top_self=[[frame, 1]], top_inclusive=[[frame, 1]])
++    normal = {**row, 'name': 'normal'}
++    payload = dict(seconds=1, hz=100, samples=1, threads=[row, normal])
++    server = GatewayControlServer(tmp_path, verb_handlers={'profile': lambda: payload})
++    request_id = 'long-id' * 8000
++    raw = server.handle_request_line(json.dumps({'verb': 'profile', 'id': request_id}).encode())
++    assert len(raw) < _MAX_RESPONSE_BYTES
++    response = json.loads(raw)
++    assert response['ok'], response
++    assert response['id'] == request_id
++    result = response['result']
++    assert result['truncated'] is True
++    assert isinstance(result['threads'], list)
++    assert [t['name'] for t in result['threads']] == ['normal']
++    assert result['omitted_threads'] == 1 and result['omitted_frames'] == 4
++    for thread in result['threads']:
++        assert set(row) <= set(thread)
++        for field in ('top_self', 'top_inclusive'):
++            assert all(isinstance(pair, list) and len(pair) == 2 for pair in thread[field])
+diff --git a/tests/gateway/test_control_profile_lifetimes.py b/tests/gateway/test_control_profile_lifetimes.py
+new file mode 100644
+index 00000000000..c116c584a04
+--- /dev/null
++++ b/tests/gateway/test_control_profile_lifetimes.py
+@@ -0,0 +1,165 @@
++"""Thread lifetime, recursive stack and native CPU contracts."""
++import threading
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from gateway.control_profile import profile
++
++
++def _recursive_wait(depth, ready, release):
++    if depth:
++        return _recursive_wait(depth - 1, ready, release)
++    ready.set()
++    release.wait(5)
++
++
++@pytest.mark.platforms('linux', 'macos')
++def test_short_lived_and_sleeping_threads_retained(monkeypatch):
++    import gateway.control_profile as profiler
++    ready, release = threading.Event(), threading.Event()
++    sampled = threading.Event()
++    started = threading.Event()
++    reads = {}
++    read_cpu = profiler._cpu_seconds
++
++    def observed(tid):
++        reads[tid] = reads.get(tid, 0) + 1
++        started.set()
++        if 'short' in locals_for_observer and tid == locals_for_observer['short'].native_id and reads[tid] >= 5:
++            sampled.set()
++        return read_cpu(tid)
++
++    locals_for_observer = {}
++    monkeypatch.setattr(profiler, '_cpu_seconds', observed)
++    sleeper = threading.Thread(target=release.wait, name='sleeper')
++    sleeper.start()
++    with ThreadPoolExecutor(1) as pool:
++        future = pool.submit(profile, {'seconds': 2, 'hz': 100})
++        assert started.wait(3)
++        short = threading.Thread(target=_recursive_wait, args=(6, ready, release), name='short-lived')
++        locals_for_observer['short'] = short
++        short.start()
++        assert ready.wait(3)
++        assert sampled.wait(3)
++        release.set()
++        short.join(3)
++        sleeper.join(3)
++        result = future.result(5)
++    rows = {t['name']: t for t in result['threads']}
++    short_row = rows['short-lived']
++    assert short_row['first_seen_sample'] > 0
++    assert short_row['last_seen_sample'] < result['samples'] - 1
++    assert short_row['cpu_partial'] is True
++    code = _recursive_wait.__code__
++    key = f'{code.co_filename}:{code.co_firstlineno}:{code.co_name}'
++    assert dict(short_row['top_inclusive'])[key] <= short_row['samples']
++    assert 0 <= rows['sleeper']['cpu_s'] < 0.05
++
++
++@pytest.mark.platforms('linux', 'macos')
++def test_same_name_successive_thread_lifetimes_remain_separate(monkeypatch):
++    import gateway.control_profile as profiler
++    from tests.gateway.test_control_profile import _profile_burner_spin
++    read_cpu = profiler._cpu_seconds
++    counts = {}
++    stops = {}
++    started = threading.Event()
++
++    def observed(tid):
++        value = read_cpu(tid)
++        counts[tid] = counts.get(tid, 0) + 1
++        started.set()
++        if counts[tid] >= 8 and tid in stops:
++            stops[tid].append(True)
++        return value
++
++    monkeypatch.setattr(profiler, '_cpu_seconds', observed)
++    workers = []
++    with ThreadPoolExecutor(1) as pool:
++        future = pool.submit(profile, {'seconds': 2, 'hz': 100})
++        assert started.wait(3)
++        for _ in range(2):
++            stop = []
++            thread = threading.Thread(target=_profile_burner_spin, args=(stop,), name='reused-name', daemon=True)
++            thread.start()
++            workers.append(thread)
++            stops[thread.native_id] = stop
++            try:
++                thread.join(3)
++                assert not thread.is_alive()
++            finally:
++                stop.append(True)
++        result = future.result(5)
++    rows = [r for r in result['threads'] if r['name'] == 'reused-name']
++    assert len(rows) == 2
++    assert {r['native_id'] for r in rows} == {t.native_id for t in workers}
++    assert all(r['cpu_s'] > 0 and r['cpu_partial'] for r in rows)
++    rows.sort(key=lambda r: r['first_seen_sample'])
++    assert rows[0]['last_seen_sample'] < rows[1]['first_seen_sample']
++
++
++@pytest.mark.platforms('macos')
++def test_macos_cpu_reader_tracks_current_thread():
++    from gateway.control_profile import _cpu_seconds
++    import time
++    tid = threading.get_native_id()
++    before = _cpu_seconds(tid)
++    end = time.thread_time() + 0.02
++    while time.thread_time() < end:
++        pass
++    after = _cpu_seconds(tid)
++    assert before is not None and after is not None
++    assert after > before
++
++
++def test_darwin_reader_queries_thread_id64_flavor(monkeypatch):
++    """Runs everywhere: pins the XNU ABI the macOS-only test above cannot check on Linux CI.
++
++    threading.native_id on macOS is pthread_threadid_np()'s 64-bit kernel thread_id,
++    which only PROC_PIDTHREADID64INFO (15) matches; PROC_PIDTHREADINFO (5) expects the
++    PROC_PIDLISTTHREADS TSD handle and returns 0 bytes (ESRCH) for a thread_id.
++    """
++    import ctypes
++    import types
++    import gateway.control_profile as profiler
++    calls = []
++
++    def fake_proc_pidinfo(pid, flavor, arg, buffer, size):
++        calls.append((pid, flavor, arg, size))
++        if flavor != 15 or arg != 4242:
++            return 0
++        info = profiler._ProcThreadInfo.from_address(buffer)
++        info.user_time, info.system_time = 1_500_000_000, 250_000_000
++        return size
++
++    monkeypatch.setattr(profiler, 'sys', types.SimpleNamespace(platform='darwin'))
++    monkeypatch.setattr(profiler, '_darwin_proc_pidinfo', lambda: fake_proc_pidinfo)
++    assert ctypes.sizeof(profiler._ProcThreadInfo) == 112
++    assert profiler._cpu_seconds(4242) == pytest.approx(1.75)
++    assert profiler._cpu_seconds(4243) is None
++    assert [c[1:] for c in calls] == [(15, 4242, 112), (15, 4243, 112)]
++
++
++def test_darwin_reader_holds_gil_with_pydll(monkeypatch):
++    """proc_pidinfo is a bounded non-blocking read: load it via PyDLL (GIL held),
++    not CDLL, which releases/re-acquires the GIL on every per-thread call."""
++    import ctypes
++    import types
++    import gateway.control_profile as profiler
++    loaded = []
++
++    def make(kind):
++        def factory(path, *args, **kwargs):
++            loaded.append((kind, path))
++            return types.SimpleNamespace(proc_pidinfo=types.SimpleNamespace())
++        return factory
++
++    monkeypatch.setattr(ctypes, 'PyDLL', make('PyDLL'))
++    monkeypatch.setattr(ctypes, 'CDLL', make('CDLL'))
++    profiler._darwin_proc_pidinfo.cache_clear()
++    try:
++        profiler._darwin_proc_pidinfo()
++    finally:
++        profiler._darwin_proc_pidinfo.cache_clear()
++    assert loaded == [('PyDLL', '/usr/lib/libproc.dylib')]
+diff --git a/tests/hermes_cli/test_gateway_profile.py b/tests/hermes_cli/test_gateway_profile.py
+new file mode 100644
+index 00000000000..355b62c46ab
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_profile.py
+@@ -0,0 +1,65 @@
++"""Exercise CLI parser/dispatch against a real temporary control socket."""
++import argparse
++import asyncio
++import json
++import threading
++import time
++
++import pytest
++
++from gateway.control_socket import GatewayControlServer, query_gateway_control
++from hermes_cli.subcommands.gateway import build_gateway_parser
++from tests.waiting import async_wait_until
++
++
++def _parser():
++    from hermes_cli.gateway import gateway_command
++    parser = argparse.ArgumentParser()
++    build_gateway_parser(parser.add_subparsers(dest='command'), cmd_gateway=gateway_command,
++                         cmd_proxy=lambda args: None, cmd_gateway_enroll=lambda args: None)
++    return parser
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.asyncio
++async def test_cli_profile_and_socket_remain_responsive(tmp_path, monkeypatch, capsys):
++    from hermes_cli.gateway import gateway_command
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    args = _parser().parse_args(['gateway', 'profile', '--seconds', '1', '--hz', '100', '--json'])
++    server = GatewayControlServer(tmp_path, verb_handlers={'identify': lambda: {'alive': True},
++                                                         'status': lambda: {'ready': True}})
++    assert await server.start()
++    try:
++        task = asyncio.create_task(asyncio.to_thread(gateway_command, args))
++        await async_wait_until(lambda: any(t.name == 'gateway-profiler' for t in threading.enumerate()), timeout=3)
++        for verb, expected in [('identify', {'alive': True}), ('status', {'ready': True})]:
++            start = time.monotonic()
++            answer = await asyncio.to_thread(query_gateway_control, tmp_path, verb)
++            assert answer == expected
++            assert time.monotonic() - start < 0.5
++        await asyncio.wait_for(task, 5)
++        result = json.loads(capsys.readouterr().out)
++        assert result['seconds'] == 1 and result['hz'] == 100 and result['samples'] > 0
++        assert result['threads']
++        args = _parser().parse_args(['gateway', 'profile', '--seconds', '1', '--hz', '10'])
++        await asyncio.to_thread(gateway_command, args)
++        output = capsys.readouterr().out
++        assert 'CPU' in output and 'SELF' in output and 'INCLUSIVE' in output
++    finally:
++        await server.stop()
++
++
++def test_cli_profile_timeout_exceeds_duration(monkeypatch, tmp_path, capsys):
++    from hermes_cli.gateway import gateway_command
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    calls = []
++    def query(home, verb, *, params, timeout):
++        calls.append((home, verb, params, timeout))
++        return dict(seconds=60, hz=200, samples=0, threads=[])
++    monkeypatch.setattr('gateway.control_socket.query_gateway_control', query)
++    gateway_command(_parser().parse_args(['gateway', 'profile', '--seconds', '60', '--hz', '200', '--json']))
++    home, verb, params, timeout = calls[0]
++    assert home == tmp_path and verb == 'profile'
++    assert params == {'seconds': 60, 'hz': 200, 'top': 40}
++    assert timeout > 60
++    assert json.loads(capsys.readouterr().out)['seconds'] == 60
+diff --git a/website/docs/developer-guide/gateway-profiling.md b/website/docs/developer-guide/gateway-profiling.md
+new file mode 100644
+index 00000000000..4d50714bd95
+--- /dev/null
++++ b/website/docs/developer-guide/gateway-profiling.md
+@@ -0,0 +1,91 @@
++# On-demand gateway profiling
++
++`hermes gateway profile --seconds 20 --hz 100` samples the **running gateway process**, not the CLI process. Add `--json` for the wire result, or `--top 40` to set the number of self/inclusive frames per thread. It uses the existing local control socket and its filesystem/pipe authorization boundary. It does not restart the gateway, use signals, require root, or install dependencies.
++
++The control verb is `profile`, with `params`:
++
++- `seconds`: finite number, 1–60 inclusive, default 20.
++- `hz`: finite number, 10–200 inclusive, default 100.
++- `top`: positive integer, default 40.
++
++Booleans, numeric strings, out-of-range numbers and non-finite numbers are rejected. Only one profile may run process-wide; another request fails immediately. A daemon sampler does the work while one of the four dedicated control workers waits. The CLI timeout is the requested duration plus 10 seconds. It reports a failed/unavailable request rather than silently starting another gateway.
++
++## Result and interpretation
++
++```json
++{
++  "seconds": 20,
++  "hz": 100,
++  "samples": 2000,
++  "threads": [{
++    "name": "example",
++    "native_id": 123,
++    "cpu_s": 0.01,
++    "cpu_partial": false,
++    "samples": 2000,
++    "first_seen_sample": 0,
++    "last_seen_sample": 1999,
++    "top_self": [["/path/module.py:42:worker", 2000]],
++    "top_inclusive": [["/path/module.py:42:worker", 2000]]
++  }]
++}
++```
++
++This is an illustrative schema, not a captured profile. Frame keys use `co_filename:co_firstlineno:co_name`; the line is the function/code definition line, **not** its currently executing line. First/last sample indexes are zero-based. Recursive appearances of the same frame key count only once per inclusive sample. No locals, source lines or argument values are read or returned. File names and thread names can themselves contain sensitive information; treat the output as local diagnostic data.
++
++Stack counts are **wall samples**, not CPU attribution. Sleeping threads can accumulate many samples with almost zero CPU. CPU seconds are independently measured native thread CPU-clock deltas. Sampling is GIL-dependent and can be delayed by busy threads or native extensions; inspect the actual sample count. Threads without an identifiable Python `threading.Thread`/native ID are not reported. Purely native threads without Python frames are outside the stack census.
++
++CPU starts at each thread's first observation, not at its lifetime origin. Exited threads remain in the result; their last readable CPU clock supplies a **partial/lower bound**, explicitly marked `cpu_partial: true`. Unavailable CPU is `null`, never a guessed zero. Work before the first observation and after the last readable observation cannot be recovered. A thread that starts and exits entirely between samples cannot be detected. Thread objects and native IDs distinguish lifetimes even when Python thread identifiers or names are reused.
++
++Linux reads `clock_gettime((~native_id << 3) | 6)`, the kernel `MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)` encoding. This avoids `pthread_getcpuclockid(pthread_t)`, whose userspace pthread pointer may already have been freed when a thread exits; the numeric kernel lookup fails safely for exited IDs. No arbitrary process is queried. macOS uses own-process `proc_pidinfo(PROC_PIDTHREADID64INFO = 15)` through ctypes and sums the user/system nanosecond counters of `struct proc_threadinfo` (112 bytes). On macOS `threading.native_id` is `pthread_threadid_np()`'s 64-bit kernel `thread_id`; XNU (`bsd/kern/proc_info.c`, `osfmk/kern/bsd_kern.c:fill_taskthreadinfo`) matches flavor 15 against `thread->thread_id` but `PROC_PIDTHREADINFO = 5` against `machine.cthread_self` (the TSD handle listed by `PROC_PIDLISTTHREADS`; on arm64 `pthread_self() + 224`). Flavor 5 therefore fails with `ESRCH` for every native ID. Kernel thread IDs are not reused, so an exited thread reads as unavailable and cannot alias a later thread. Other hosts return unavailable CPU.
++
++To reduce idle sampling overhead, identical leaf frame objects reuse their previous stack only when their native CPU clock is unchanged. Code keys use identity rather than structural code-object hashing. Repeated stacks are aggregated before deriving self/inclusive counts. Only the preceding frame snapshot is retained; frame references are cleared at completion. No frame or code objects appear in the result.
++
++Responses include the complete envelope and newline in the size budget and stay below the 512 KiB response cap. Oversized results omit whole frame entries or whole threads (including giant names), never rewrite frame keys or names. They add `truncated`, `omitted_threads`, and `omitted_frames`. The request ID is included in the budget. A response whose envelope alone is too large uses the existing `response_too_large` error; socket requests are separately limited to 64 KiB.
++
++## Reproducible overhead measurement
++
++From the checkout root:
++
++```sh
++python3 scripts/benchmark_gateway_profile.py --seconds 5 --rounds 3 --threads 150 --hz 100
++```
++
++This creates an isolated process with 150 idle event-waiting threads. Each round measures **whole-process** `time.process_time()` and monotonic wall time, once without profiling and once with it; order alternates. Incremental percent of one core is `(profile CPU / profile wall - baseline CPU / baseline wall) * 100`. Thread creation is outside the measured intervals. The script prints raw measurements, Python/OS metadata, samples and idle-thread census; it never contacts a live gateway.
++
++Measured on Linux 7.0.0-1014-aws, x86_64, glibc 2.39, Python 3.14.9:
++
++| Round | Baseline CPU s | Baseline wall s | Profile CPU s | Profile wall s | Incremental % core | Samples / idle threads |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: |
++| 1 | 0.002312311 | 5.000162899 | 0.108611255 | 5.001772645 | 2.12521 | 500 / 150 |
++| 2 | 0.000146035 | 5.000233187 | 0.113924301 | 5.001637069 | 2.27482 | 500 / 150 |
++| 3 | 0.000075944 | 5.000186206 | 0.109895571 | 5.001116799 | 2.19590 | 500 / 150 |
++
++Median incremental overhead: **2.19590% of one core**, below the 3% target on this workload/host. The initial straightforward stack implementation measured 10.38331% median under the same parameters; the final result is not a baseline-free estimate. These numbers do not guarantee overhead for deep/changing stacks or more threads.
++
++Measured on macOS 27.2 (Darwin 27.2.0, xnu-13432.41.4), Apple M1 (8 cores), Homebrew Python 3.12.2, with the same 150 idle threads, 100 Hz, 3 × 5 s rounds. This was an isolated stdlib probe equivalent to the benchmark script; the host was shared, with load average about 12:
++
++| Round | Baseline CPU s | Baseline wall s | Profile CPU s | Profile wall s | Incremental % core | Samples / idle threads |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: |
++| 1 | 0.001373 | 5.000838 | 0.800702 | 5.007097 | 15.96388 | 500 / 150 |
++| 2 | 0.000114 | 5.000553 | 0.825325 | 5.007088 | 16.48085 | 500 / 150 |
++| 3 | 0.000571 | 5.007671 | 0.832967 | 5.016647 | 16.59266 | 500 / 150 |
++
++Median incremental overhead on macOS: **16.48085% of one core, which misses the 3% target**. An attribution run (`_collect` only, same workload) gave three medians. The real reader measured 16.245%, a constant-CPU stub 6.315%, and a `None` stub (always a full stack walk) 10.95%. About 10 points therefore come from the 150 `proc_pidinfo` syscalls per tick. The Python sampling loop itself costs about 6% on this host. On Linux the same attribution measured 2.311 / 1.542 / 3.252%.
++
++**PyDLL reader (current code).** `proc_pidinfo` is now loaded through `ctypes.PyDLL`, so the GIL stays held for this bounded, non-blocking per-thread read. Under `CDLL` the GIL was released and re-acquired on every call (150 per tick). The size constant is precomputed and the buffer is passed with `addressof`. A fresh struct is still allocated per call, so concurrent readers never share a buffer. Sample semantics are unchanged. The A/B ran on the Mac mini as interleaved `python3.12 -I probe.py <module> 5 3` subprocesses: 5 s, 3 rounds, 150 idle threads, 100 Hz. The host load average was about 45, so absolute figures are inflated. Every probe check passed for both readers. Medians:
++
++| Run | CDLL median % (rounds) | PyDLL median % (rounds) |
++|---|---|---|
++| 1 | 16.68482 (16.19497, 16.68482, 16.75607) | 15.42431 (15.15525, 15.43350, 15.42431) |
++| 2 | 16.30566 (16.30566, 16.85843, 16.13515) | 15.14392 (15.03389, 15.14392, 15.26198) |
++
++PyDLL saves about 1.2 points of core, roughly 7%. **macOS still misses the 3% target** at about 15%. Linux after this change measured a **2.18334%** median (`scripts/benchmark_gateway_profile.py --seconds 5 --rounds 3 --threads 150 --hz 100`). Not yet evaluated: one Mach `task_threads` call plus `thread_info` per port (still one syscall per thread, plus port-to-thread-id mapping) and lowering per-thread CPU-read frequency (which changes sample semantics).
++
++## Verification status
++
++Tests are run only through `scripts/run_tests.sh`. The contract test was first corrected from an erroneous global self table/`cpu_seconds` shape to the approved per-thread shape, then failed on the base with `unknown verb: 'profile'`. Incremental RED→GREEN runs covered the sampler, argument validation, concurrent refusal, response trimming, CLI parser/dispatch and invalid parameter objects. Additional acceptance tests cover recursive inclusive deduplication, real sleeping/burning threads, short-lived threads and successive same-name thread lifetimes. The CLI integration test runs against a real temporary Unix socket, checks JSON and text, and requires identify/status each to answer in under 0.5 seconds while the profile is in progress.
++
++Final Linux verification: **89 passed, 0 failed, 1 macOS-only skipped** across the four new profiler test files plus six related control-socket/diagnostics files. `python3 scripts/check --base HEAD` passed all **15 checks**. The full repository test suite was not run. After the macOS flavor fix, the four profiler test files gave **26 passed, 0 failed, 1 macOS-only skipped** via `scripts/run_tests.sh`. That count includes the new portable `test_darwin_reader_queries_thread_id64_flavor`, which fails on the flavor-5 code with `assert None == 1.75`.
++
++**macOS native verification** ran as a disposable plain `python3.12 -I` subprocess on a Mac mini (macOS 27.2, arm64). It imported only the copied stdlib module, with no Hermes bootstrap and no gateway contacted, restarted or signalled. With the original flavor 5, every CPU read returned `None`: `proc_pidinfo` returned 0 bytes with errno 3 (ESRCH). Busy, native-GIL-released, sleeping and short-lived rows all had `cpu_s: null`. In the 150-thread run, all 150 rows were `null`. The repo tests `test_macos_cpu_reader_tracks_current_thread` and `test_darwin_reader_queries_thread_id64_flavor` both failed. With flavor 15, both tests passed. The counter delta divided by `time.thread_time()` was 1.0003, confirming nanosecond units. A 2 s, 100 Hz `_collect` measured a busy Python thread at 1.837 s, a `hashlib.sha256` (GIL-released) thread at 0.665 s, and a sleeping thread at 0.003 s. A short-lived thread measured 0.143 s with `cpu_partial: true`; after it exited, its native ID read `None`. All 150 idle threads had readable CPU. Those repo tests ran under a stdlib pytest shim (`approx`, `monkeypatch.setattr`), not real pytest, and the macOS overhead figure above is from a loaded shared host.
+-- 
+2.55.0
+

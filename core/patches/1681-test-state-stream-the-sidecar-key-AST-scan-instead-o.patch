@@ -1,0 +1,109 @@
+From 198a1a79d20502a76ab8e383fa6cc1351cabc3e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 03:13:57 -0800
+Subject: [PATCH] test(state): stream the sidecar-key AST scan instead of
+ holding every tree [daveey]
+
+test_every_model_config_writer_key_is_a_worker_sidecar_key parsed all ~11k .py
+files into one dict before scanning, peaking at 1.58 GB RSS (26 s). On the
+self-hosted macOS hermes_state runner (16 GB mini shared with BabyBear and
+Hermes) every run tipped kern.memorystatus_vm_pressure_level to warn, which
+holds the bb-dev gate; warn share of governor ticks rose from 1-5% to 17-25%
+after this test landed on 10-30.
+
+Parse one file at a time and keep only module constants plus reduced write
+records. Identical (found, unresolved) to the old scan; peak 73 MB, 14 s.
+---
+ .../test_sidecar_keys_registry.py             | 65 ++++++++++++-------
+ 1 file changed, 41 insertions(+), 24 deletions(-)
+
+diff --git a/tests/hermes_state/test_sidecar_keys_registry.py b/tests/hermes_state/test_sidecar_keys_registry.py
+index ec90698ba76..26e475b9590 100644
+--- a/tests/hermes_state/test_sidecar_keys_registry.py
++++ b/tests/hermes_state/test_sidecar_keys_registry.py
+@@ -71,41 +71,58 @@ def _writes(tree):
+             yield node.lineno, argtuple.elts[1] if isinstance(argtuple, ast.Tuple) and len(argtuple.elts) > 1 else None, None
+ 
+ 
++def _key_ref(key):
++    """Reduce a key AST node to ("str", value), ("ident", name) or None (unresolvable), so no tree is retained."""
++    if isinstance(key, ast.Constant) and isinstance(key.value, str):
++        return ("str", key.value)
++    ident = key.id if isinstance(key, ast.Name) else key.attr if isinstance(key, ast.Attribute) else None
++    return ("ident", ident) if ident is not None else None
++
++
+ def _collect():
+-    trees = {rel: ast.parse(path.read_text(encoding="utf-8"), str(rel)) for rel, path in _py_files()}
+-    constants = {rel: _module_constants(tree) for rel, tree in trees.items()}
++    # Parse one file at a time and keep only its constants and reduced write records. Holding every tree at once
++    # peaked at ~1.6 GB RSS on the self-hosted macOS runner, and each run tipped the shared 16 GB mini into
++    # memory-pressure "warn" (hermes kanban t_01a19beb37e87be6).
++    constants: dict[Path, dict[str, str]] = {}
++    writes: list[tuple[Path, str, list | None]] = []
++    for rel, path in _py_files():
++        tree = ast.parse(path.read_text(encoding="utf-8"), str(rel))
++        constants[rel] = _module_constants(tree)
++        if rel.as_posix() in OWNER_ONLY_WRITERS:
++            continue
++        for lineno, dict_node, key_node in _writes(tree):
++            keys = [key_node] if key_node is not None else (
++                dict_node.keys if isinstance(dict_node, ast.Dict) else None)
++            # ``None`` = non-literal dict or ``**spread``.
++            refs = None if keys is None or any(k is None for k in keys) else [_key_ref(k) for k in keys]
++            writes.append((rel, f"{rel.as_posix()}:{lineno}", refs))
++        del tree
+     global_constants: dict[str, set[str]] = {}
+     for consts in constants.values():
+         for k, v in consts.items():
+             global_constants.setdefault(k, set()).add(v)
+ 
+-    def resolve(rel, key):
+-        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+-            return {key.value}
+-        ident = key.id if isinstance(key, ast.Name) else key.attr if isinstance(key, ast.Attribute) else None
+-        if ident is None:
++    def resolve(rel, ref):
++        if ref is None:
+             return None
+-        if ident in constants[rel]:
+-            return {constants[rel][ident]}
+-        return global_constants.get(ident)
++        kind, value = ref
++        if kind == "str":
++            return {value}
++        if value in constants[rel]:
++            return {constants[rel][value]}
++        return global_constants.get(value)
+ 
+     found, unresolved = {}, []
+-    for rel, tree in trees.items():
+-        if rel.as_posix() in OWNER_ONLY_WRITERS:
++    for rel, where, refs in writes:
++        if refs is None:
++            unresolved.append(where)
+             continue
+-        for lineno, dict_node, key_node in _writes(tree):
+-            where = f"{rel.as_posix()}:{lineno}"
+-            keys = [key_node] if key_node is not None else (
+-                dict_node.keys if isinstance(dict_node, ast.Dict) else None)
+-            if keys is None or any(k is None for k in keys):  # non-literal dict or ``**spread``
++        for ref in refs:
++            values = resolve(rel, ref)
++            if not values:
+                 unresolved.append(where)
+-                continue
+-            for key in keys:
+-                values = resolve(rel, key)
+-                if not values:
+-                    unresolved.append(where)
+-                for value in values or ():
+-                    found.setdefault(value, []).append(where)
++            for value in values or ():
++                found.setdefault(value, []).append(where)
+     return found, unresolved
+ 
+ 
+-- 
+2.55.0
+

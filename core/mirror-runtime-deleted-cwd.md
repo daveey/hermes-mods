@@ -32,3 +32,21 @@ The AST guard covers only `tools/`. An empty-string cwd must be handled by calle
 ## Could this be a plugin instead?
 
 No: it fixes core tool path resolution.
+
+## Follow-up patch (1627): skill locks stay fail-closed without a cwd
+
+**1627** (`6a9bdec695`, `Keep upstream skill locks fail-closed when process cwd is gone`).
+
+- **Behavior.** When at least one skill directory is locked and a command arrives with no explicit `cwd`,
+  `tools/skill_lock.command_refusal` resolves the base through `agent.runtime_cwd.process_cwd()` instead of a bare
+  `os.getcwd()`. If that returns `""` (the process cwd was deleted), the command is refused with "Cannot check skill
+  locks: working directory is unavailable. Supply an explicit workdir." because relative targets cannot be checked
+  against the locks. Before, `os.getcwd()` raised `FileNotFoundError`. An explicit `cwd` still gets the normal checks
+  (a write into a locked skill is refused as "locked by the user", a read such as `cat SKILL.md` passes), and with no
+  locked skills the function still returns `None` before touching the cwd.
+- **Code.** `tools/skill_lock.py`.
+- **Tests** (not rerun by this mirror pass): `tests/tools/test_deleted_process_cwd.py::test_skill_lock_refuses_unknown_cwd_without_losing_explicit_scope`
+  (deleted-cwd fixture; refusal text, explicit-scope refusal, read allowed, no-locks pass). The callers of
+  `command_refusal` (terminal / execute_code hooks) are not exercised by this test.
+- **Gotchas.** On a host with a deleted cwd and any locked skill, every relative-path command without a workdir is
+  refused, including harmless ones; pass `workdir`.

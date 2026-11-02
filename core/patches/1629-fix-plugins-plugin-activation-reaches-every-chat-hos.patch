@@ -1,0 +1,362 @@
+From 9744578a42210eb50d15befe94b01573af77faf5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 04:01:27 +0000
+Subject: [PATCH] fix(plugins): plugin activation reaches every chat-hosting
+ backend, not just the host owner [daveey]
+
+notify_serve_backend() dialed only the first live serve record (host owner, else Desktop child).
+On a host running both (David-MBP: hermes serve :9119 plus the Desktop child), the Desktop child,
+which hosts the Desktop chats, never got re-activated, so those chats ran plugin hooks loaded at
+its start (example-card).
+
+- serve_backend_records(): every live, token-consistent serve / desktop-serve record.
+- notify_serve_backend_record(): one backend; notify_serve_backends(): per-backend answers.
+- notify_serve_backend(): fans out, folds answers (host owner first) with a 'backends' list and
+  a backend_error naming each failed <role>:<port>, so a failed Desktop child is never reported
+  as loaded. A dead, torn-token or unreachable record never blocks the others.
+- _serve_backend_record() kept (first record) for older hermes-sync callers.
+---
+ hermes_cli/plugins_activation.py              |  87 ++++++++--
+ .../test_dashboard_session_token_routes.py    |   2 +-
+ .../test_plugin_activation_backend_failure.py |   7 +-
+ .../test_plugin_activation_serve_fanout.py    | 162 ++++++++++++++++++
+ tests/hermes_cli/test_web_server.py           |   2 +-
+ 5 files changed, 237 insertions(+), 23 deletions(-)
+ create mode 100644 tests/hermes_cli/test_plugin_activation_serve_fanout.py
+
+diff --git a/hermes_cli/plugins_activation.py b/hermes_cli/plugins_activation.py
+index 240d016695b..e81118e997a 100644
+--- a/hermes_cli/plugins_activation.py
++++ b/hermes_cli/plugins_activation.py
+@@ -240,14 +240,32 @@ def _go_live(name: str) -> Optional[dict[str, Any]]:
+     return activation
+ 
+ 
+-def _serve_backend_record():
+-    """The host-owner record, else the Desktop child's (a Desktop-only box has no host owner)."""
++def serve_backend_records() -> list:
++    """Every live, token-consistent chat-hosting backend record on this host: the host owner
++    (``serve``) first, then the Desktop child (``desktop-serve``). Both can run at once (a supervised
++    dashboard plus Desktop), and Desktop chats live in the child, so an activation must reach each
++    (t_01a19a63867979de). A stale (dead pid) record is skipped by ``read_record``; one whose token no
++    longer matches is skipped here. Never raises for one bad record."""
+     from gateway import host_rendezvous as hr
++    records, seen = [], set()
+     for role in (hr.ROLE_SERVE, hr.ROLE_DESKTOP_SERVE):
+-        record = hr.read_record(role)
+-        if record is not None and record.port and hr.record_token_is_consistent(record):
+-            return record
+-    return None
++        try:
++            record = hr.read_record(role)
++            usable = record is not None and record.port and hr.record_token_is_consistent(record)
++        except Exception:
++            logger.debug("serve backend record %s unreadable", role, exc_info=True)
++            continue
++        if usable and (record.pid, record.port) not in seen:
++            seen.add((record.pid, record.port))
++            records.append(record)
++    return records
++
++
++def _serve_backend_record():
++    """The first of :func:`serve_backend_records` (host owner, else the Desktop child), or None.
++    Kept for callers that need one backend; activation uses every record."""
++    records = serve_backend_records()
++    return records[0] if records else None
+ 
+ 
+ def _backend_failure_reason(exc: BaseException) -> str:
+@@ -260,18 +278,15 @@ def _backend_failure_reason(exc: BaseException) -> str:
+     return type(exc).__name__
+ 
+ 
+-def notify_serve_backend(name: str, home: Path) -> Optional[dict[str, Any]]:
+-    """Ask the running dashboard / Desktop backend (``hermes serve``, found through its host record) to
+-    run :func:`load_and_go_live` for ``name`` in ``home``. Returns the backend's answer; None when no
+-    backend record exists; ``{"backend_error": "<status> <reason>"}`` (logged at warning) when a
+-    record exists but the backend did not answer. Never raises."""
+-    try:
+-        record = _serve_backend_record()
+-    except Exception:
+-        logger.debug("serve backend record lookup failed", exc_info=True)
+-        return None
+-    if record is None:
+-        return None
++def backend_label(record) -> str:
++    """``<role>:<port>`` for log lines and hints."""
++    return f"{getattr(record, 'role', 'serve')}:{getattr(record, 'port', '?')}"
++
++
++def notify_serve_backend_record(record, name: str, home: Path) -> dict[str, Any]:
++    """POST ``/api/dashboard/agent-plugins/activate`` for ``name`` in ``home`` to ONE backend record.
++    The backend's answer, or ``{"backend_error": "<status> <reason>"}`` (logged at warning) when it
++    did not answer. Never raises."""
+     try:
+         import json
+         import urllib.request
+@@ -299,6 +314,42 @@ def notify_serve_backend(name: str, home: Path) -> Optional[dict[str, Any]]:
+         return {"backend_error": type(exc).__name__}
+ 
+ 
++def notify_serve_backends(name: str, home: Path, records: Optional[list] = None) -> list[dict[str, Any]]:
++    """Ask EVERY running dashboard / Desktop backend (:func:`serve_backend_records`, or ``records``)
++    to run :func:`load_and_go_live` for ``name`` in ``home``. One entry per backend:
++    ``{"role", "port", "pid", "create_time", "answer"}``; a backend that fails does not stop the
++    others. Never raises."""
++    if records is None:
++        try:
++            records = serve_backend_records()
++        except Exception:
++            logger.debug("serve backend record lookup failed", exc_info=True)
++            records = []
++    return [{"role": getattr(record, "role", "serve"), "port": getattr(record, "port", None),
++             "pid": getattr(record, "pid", None), "create_time": getattr(record, "create_time", None),
++             "answer": notify_serve_backend_record(record, name, home)} for record in records]
++
++
++def notify_serve_backend(name: str, home: Path) -> Optional[dict[str, Any]]:
++    """Activate ``name`` in every running backend (:func:`notify_serve_backends`) and fold the answers
++    into one: the first backend that answered (host owner first), with ``backends`` listing each
++    backend's answer. None when no backend record exists. When any backend did not answer,
++    ``backend_error`` says which (``<role>:<port> <reason>`` once there is more than one backend), so
++    a caller never reports a skipped Desktop backend as loaded. Never raises."""
++    backends = notify_serve_backends(name, home)
++    if not backends:
++        return None
++    answers = [entry["answer"] for entry in backends]
++    primary = next((a for a in answers if not a.get("backend_error")), answers[0])
++    failed = [e for e in backends if e["answer"].get("backend_error")]
++    result = {**primary, "backends": backends}
++    if failed:
++        result["backend_error"] = "; ".join(
++            (f"{e['role']}:{e['port']} " if len(backends) > 1 else "") + str(e["answer"]["backend_error"])
++            for e in failed)
++    return result
++
++
+ def _gateway_present() -> bool:
+     """A gateway runs for this profile (its own, or the multiplexer serving it from the root), or a
+     gateway service is installed for it."""
+diff --git a/tests/hermes_cli/test_dashboard_session_token_routes.py b/tests/hermes_cli/test_dashboard_session_token_routes.py
+index e63d46181ef..779741315e2 100644
+--- a/tests/hermes_cli/test_dashboard_session_token_routes.py
++++ b/tests/hermes_cli/test_dashboard_session_token_routes.py
+@@ -147,7 +147,7 @@ def test_every_session_header_caller_targets_a_session_token_route():
+     senders = _session_header_senders()
+     names = {(f, fn) for f, fn, _ in senders}
+     # Not vacuous: the two known service callers are found.
+-    assert ("hermes_cli/plugins_activation.py", "notify_serve_backend") in names
++    assert ("hermes_cli/plugins_activation.py", "notify_serve_backend_record") in names
+     assert ("hermes_cli/dashboard_procs.py", "_retirement_request") in names
+     for file, fn, paths in senders:
+         if (file, fn) in _EXEMPT:
+diff --git a/tests/hermes_cli/test_plugin_activation_backend_failure.py b/tests/hermes_cli/test_plugin_activation_backend_failure.py
+index 20df54cd5b9..4e13d345cf7 100644
+--- a/tests/hermes_cli/test_plugin_activation_backend_failure.py
++++ b/tests/hermes_cli/test_plugin_activation_backend_failure.py
+@@ -47,8 +47,9 @@ def backend(monkeypatch):
+         handler = type("H", (_Handler,), {"status": status, "seen_tokens": []})
+         server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+         threading.Thread(target=server.serve_forever, daemon=True).start()
+-        record = SimpleNamespace(role="desktop-serve", host="127.0.0.1", port=server.server_address[1])
+-        monkeypatch.setattr(plugins_activation, "_serve_backend_record", lambda: record)
++        record = SimpleNamespace(role="desktop-serve", host="127.0.0.1", port=server.server_address[1],
++                                 pid=1, create_time=None)
++        monkeypatch.setattr(plugins_activation, "serve_backend_records", lambda: [record])
+         monkeypatch.setattr("gateway.host_rendezvous.read_token", lambda role: "s3cret-token-value")
+         started.append(server)
+         return handler
+@@ -91,7 +92,7 @@ def test_backend_activation_is_shown(backend):
+ 
+ 
+ def test_no_backend_record_says_nothing_new(monkeypatch, caplog):
+-    monkeypatch.setattr(plugins_activation, "_serve_backend_record", lambda: None)
++    monkeypatch.setattr(plugins_activation, "serve_backend_records", list)
+     with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins_activation"):
+         result = plugins_activation.activate_plugin_now("probe", in_process=False)
+     hint = plugins_activation.activation_hint(result)
+diff --git a/tests/hermes_cli/test_plugin_activation_serve_fanout.py b/tests/hermes_cli/test_plugin_activation_serve_fanout.py
+new file mode 100644
+index 00000000000..46c8bcf6ab6
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_activation_serve_fanout.py
+@@ -0,0 +1,162 @@
++"""A plugin activation reaches EVERY chat-hosting backend on the host (t_01a19a63867979de).
++
++David-MBP ran a host-owner ``hermes serve`` (record ``serve``, :9119) and the Desktop child
++(record ``desktop-serve``) at once. ``notify_serve_backend`` dialed only the first record it found,
++so the Desktop child, which hosts the Desktop chats, kept running plugin hooks loaded at its start
++while hermes-sync logged ``backend serve:9119 ok``. These tests publish real host records into a
++temporary rendezvous dir and dial real HTTP listeners, so the record lookup, token check and
++per-backend POST all run.
++"""
++from __future__ import annotations
++
++import http.server
++import json
++import subprocess
++import sys
++import threading
++
++import pytest
++
++from gateway import host_rendezvous as hr
++from hermes_cli import plugins_activation
++
++
++def _listener(status: int = 200):
++    seen: list = []
++
++    class Handler(http.server.BaseHTTPRequestHandler):
++        def do_POST(self):
++            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
++            seen.append({"token": self.headers.get("X-Hermes-Session-Token"), **body})
++            reply = (json.dumps({"ok": True, "activation": {
++                "name": body["name"], "key": body["name"], "activated_now": {"hooks": ["pre_tool_call"]},
++                "deferred": {}}}) if status == 200 else json.dumps({"error": "nope"})).encode()
++            self.send_response(status)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(reply)))
++            self.end_headers()
++            self.wfile.write(reply)
++
++        def log_message(self, *args):
++            pass
++
++    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    return server, seen
++
++
++@pytest.fixture
++def host(monkeypatch, tmp_path):
++    """Publish real ``serve`` / ``desktop-serve`` records (this process, distinct ports + tokens)."""
++    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
++    servers = []
++
++    def publish(role: str, status: int = 200, *, port=None):
++        server, seen = _listener(status)
++        servers.append(server)
++        record = hr.publish_record(role, host="127.0.0.1", port=port or server.server_address[1],
++                                   token=f"{role}-token")
++        assert record is not None
++        return seen
++
++    yield publish
++    for server in servers:
++        server.shutdown()
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def test_both_live_records_get_the_activation(host, tmp_path):
++    serve = host(hr.ROLE_SERVE)
++    desktop = host(hr.ROLE_DESKTOP_SERVE)
++
++    answer = plugins_activation.notify_serve_backend("probe", tmp_path)
++
++    assert serve == [{"token": "serve-token", "name": "probe", "home": str(tmp_path)}]
++    assert desktop == [{"token": "desktop-serve-token", "name": "probe", "home": str(tmp_path)}]
++    assert answer["ok"] is True and "backend_error" not in answer
++    assert [(b["role"], b["answer"]["ok"]) for b in answer["backends"]] == [
++        ("serve", True), ("desktop-serve", True)]
++
++
++def test_host_owner_only(host, tmp_path):
++    serve = host(hr.ROLE_SERVE)
++    answer = plugins_activation.notify_serve_backend("probe", tmp_path)
++    assert len(serve) == 1
++    assert [b["role"] for b in answer["backends"]] == ["serve"]
++    assert answer["ok"] is True
++
++
++def test_desktop_only(host, tmp_path):
++    desktop = host(hr.ROLE_DESKTOP_SERVE)
++    answer = plugins_activation.notify_serve_backend("probe", tmp_path)
++    assert len(desktop) == 1
++    assert [b["role"] for b in answer["backends"]] == ["desktop-serve"]
++
++
++def test_no_record_answers_none(host, tmp_path):
++    assert plugins_activation.notify_serve_backend("probe", tmp_path) is None
++    assert plugins_activation.notify_serve_backends("probe", tmp_path) == []
++
++
++def test_dead_host_owner_record_does_not_block_the_desktop_child(host, tmp_path):
++    host(hr.ROLE_SERVE)
++    desktop = host(hr.ROLE_DESKTOP_SERVE)
++    path = hr.record_path(hr.ROLE_SERVE)
++    payload = json.loads(path.read_text())
++    payload["pid"] = _dead_pid()
++    path.write_text(json.dumps(payload))
++
++    answer = plugins_activation.notify_serve_backend("probe", tmp_path)
++
++    assert len(desktop) == 1
++    assert [b["role"] for b in answer["backends"]] == ["desktop-serve"]
++
++
++def test_inconsistent_token_record_is_skipped_and_the_other_still_reached(host, tmp_path):
++    serve = host(hr.ROLE_SERVE)
++    host(hr.ROLE_DESKTOP_SERVE)
++    hr.token_path(hr.ROLE_DESKTOP_SERVE).write_text("torn-restart-token")
++
++    answer = plugins_activation.notify_serve_backend("probe", tmp_path)
++
++    assert len(serve) == 1
++    assert [b["role"] for b in answer["backends"]] == ["serve"]
++
++
++def test_unreachable_backend_is_named_and_the_other_still_activates(host, tmp_path):
++    # A live record whose port answers nothing (backend wedged mid-restart): the host owner fails,
++    # the Desktop child must still activate, and the folded answer must say which one failed.
++    import socket
++    sock = socket.socket()
++    sock.bind(("127.0.0.1", 0))
++    closed_port = sock.getsockname()[1]
++    sock.close()
++    host(hr.ROLE_SERVE, port=closed_port)
++    desktop = host(hr.ROLE_DESKTOP_SERVE)
++
++    answer = plugins_activation.notify_serve_backend("probe", tmp_path)
++
++    assert len(desktop) == 1
++    assert answer["ok"] is True  # the Desktop child's answer leads
++    assert answer["backend_error"].startswith(f"serve:{closed_port} unreachable")
++    by_role = {b["role"]: b["answer"] for b in answer["backends"]}
++    assert by_role["desktop-serve"]["ok"] is True and "backend_error" in by_role["serve"]
++
++
++def test_cli_hint_reports_a_failed_desktop_backend_even_when_the_host_owner_loaded_it(
++        host, monkeypatch):
++    monkeypatch.setattr("gateway.control_socket.reload_gateway_plugins",
++                        lambda target, *, profile_home=None, timeout=30.0: None)
++    host(hr.ROLE_SERVE)
++    host(hr.ROLE_DESKTOP_SERVE, status=401)
++
++    result = plugins_activation.activate_plugin_now("probe", in_process=False)
++
++    assert result["backend"]["error"].startswith("desktop-serve:")
++    assert "401 Unauthorized" in result["backend"]["error"]
++    assert result["activation"]["name"] == "probe"  # what the host owner loaded is still reported
+diff --git a/tests/hermes_cli/test_web_server.py b/tests/hermes_cli/test_web_server.py
+index 2cefa97983b..5207b4f2674 100644
+--- a/tests/hermes_cli/test_web_server.py
++++ b/tests/hermes_cli/test_web_server.py
+@@ -3358,7 +3358,7 @@ class TestDesktopHostRendezvousIsolation:
+             assert hr.read_record(hr.ROLE_SERVE) is None
+             assert _host_backend_attachment() is None
+             # ...but a terminal `hermes plugins install` still lights up its open chats.
+-            assert notify_serve_backend("demo", tmp_path) == {"ok": True}
++            assert [(b["role"], b["port"], b["answer"]) for b in notify_serve_backend("demo", tmp_path)["backends"]] == [("desktop-serve", 9231, {"ok": True})]
+             assert dialed == [("http://127.0.0.1:9231/api/dashboard/agent-plugins/activate",
+                                "desktop-spawn-token")]
+         finally:
+-- 
+2.55.0
+

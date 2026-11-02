@@ -1,0 +1,238 @@
+From bf6356aadaaed60faa6bbf11fb049dcc6767a8b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 05:28:09 +0000
+Subject: [PATCH] [daveey] tools/registry: a subscription quota wall in a
+ check_fn is an INFO verdict with its reset, not a crashed probe
+
+SubscriptionQuotaUnavailable (routing satisfied, every route walled until a known reset) raised from a
+tool availability check was logged as WARNING 'check_fn ... raised' with a traceback, which the
+self-heal lane files as a defect every quota window (agent-ffb3d1ba3e; 527 hub warnings on
+example-card). Both the cached and uncached paths now return False with 'quota wall until
+<ISO reset> (<provider>/<model>)' at INFO, once per (check, wall) per process, no traceback, no
+last-good grace, and never cache the False verdict past resets_at. Every other ModelRoutingError
+(ManagedPinRejectedError, missing routes) stays a WARNING with a traceback.
+---
+ tests/tools/test_registry.py | 102 +++++++++++++++++++++++++++++++++++
+ tools/registry.py            |  65 ++++++++++++++++++++--
+ 2 files changed, 163 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tools/test_registry.py b/tests/tools/test_registry.py
+index d2a21c16ea2..07dedd6917a 100644
+--- a/tests/tools/test_registry.py
++++ b/tests/tools/test_registry.py
+@@ -336,6 +336,108 @@ class TestCheckFnExceptionHandling:
+         assert any(u["name"] == "crashes" for u in unavailable)
+ 
+ 
++class TestCheckFnQuotaWall:
++    """A subscription quota wall is an expected state with a known reset, not a crashed probe.
++
++    Live case (self-heal agent-ffb3d1ba3e): the vision/video check raised
++    ``SubscriptionQuotaUnavailable`` for a walled Codex route, and the registry logged it as a WARNING
++    with a traceback ("check_fn ... raised"), which the self-heal lane files as a defect each window.
++    """
++
++    @pytest.fixture(autouse=True)
++    def _fresh_caches(self):
++        from tools import registry as registry_mod
++
++        registry_mod.invalidate_check_fn_cache()
++        getattr(registry_mod, "_check_fn_quota_logged", set()).clear()
++        yield
++        registry_mod.invalidate_check_fn_cache()
++
++    @staticmethod
++    def _walled(resets_at, calls=None):
++        from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++
++        def check_video_requirements():
++            if calls is not None:
++                calls.append(1)
++            raise SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", resets_at)
++
++        return check_video_requirements
++
++    @staticmethod
++    def _loud(caplog):
++        return [r for r in caplog.records if r.levelno >= logging.WARNING or r.exc_info]
++
++    @pytest.mark.parametrize("path", ["cached", "uncached"])
++    def test_quota_wall_is_false_with_info_and_no_traceback(self, caplog, path):
++        import time as _time
++
++        from tools import registry as registry_mod
++
++        fn = self._walled(_time.time() + 3600)
++        run = registry_mod._check_fn_cached if path == "cached" else registry_mod._run_check_fn_uncached
++        with caplog.at_level(logging.DEBUG, logger="tools.registry"):
++            assert run(fn) is False
++        assert self._loud(caplog) == []
++        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
++        assert any("quota wall until" in m and "openai-codex/gpt-6-astra" in m for m in infos), infos
++
++    def test_other_routing_errors_stay_loud(self, caplog):
++        from agent.model_routing import ModelRoutingError
++        from agent.model_routing_managed import ManagedPinRejectedError
++        from tools import registry as registry_mod
++
++        for exc in (ModelRoutingError("no route for class vision"), ManagedPinRejectedError("gpt-x", "openai-codex", [])):
++            def bad(exc=exc):
++                raise exc
++
++            for run in (registry_mod._check_fn_cached, registry_mod._run_check_fn_uncached):
++                registry_mod.invalidate_check_fn_cache()
++                caplog.clear()
++                with caplog.at_level(logging.DEBUG, logger="tools.registry"):
++                    assert run(bad) is False
++                warned = [r for r in caplog.records if r.levelno == logging.WARNING]
++                assert warned and warned[0].exc_info, (run.__name__, type(exc).__name__)
++
++    def test_info_line_once_per_reset(self, caplog):
++        import time as _time
++
++        from tools import registry as registry_mod
++
++        reset = _time.time() + 3600
++        with caplog.at_level(logging.DEBUG, logger="tools.registry"):
++            fn = self._walled(reset)
++            for _ in range(3):
++                assert registry_mod._run_check_fn_uncached(fn) is False
++                registry_mod.invalidate_check_fn_cache()
++                assert registry_mod._check_fn_cached(fn) is False
++            later = self._walled(reset + 600)
++            assert registry_mod._run_check_fn_uncached(fn) is False
++        walls = [r.getMessage() for r in caplog.records if "quota wall until" in r.getMessage()]
++        assert len(walls) == 1, walls
++        with caplog.at_level(logging.DEBUG, logger="tools.registry"):
++            assert registry_mod._run_check_fn_uncached(later) is False
++        walls = [r.getMessage() for r in caplog.records if "quota wall until" in r.getMessage()]
++        assert len(walls) == 2, walls
++
++    def test_verdict_not_cached_past_reset(self):
++        import time as _time
++
++        from tools import registry as registry_mod
++
++        calls = []
++        fn = self._walled(_time.time() + 1, calls)  # reopens well inside the 30 s TTL
++        assert registry_mod._check_fn_cached(fn) is False
++        assert registry_mod._check_fn_cached(fn) is False
++        assert len(calls) == 2  # re-probed, not served a cached False that outlives the wall
++
++        far = []
++        walled = self._walled(_time.time() + 3600, far)
++        assert registry_mod._check_fn_cached(walled) is False
++        assert registry_mod._check_fn_cached(walled) is False
++        assert len(far) == 1  # a long wall still uses the normal TTL cache
++
++
+ class TestBuiltinDiscovery:
+ 
+ 
+diff --git a/tools/registry.py b/tools/registry.py
+index e0c6ebe263a..a62fda87d62 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -21,6 +21,7 @@ from pathlib import Path
+ from typing import Callable, Dict, List, Optional, Set
+ 
+ from hermes_constants import hermes_home_key, normalize_scope
++from datetime import UTC, datetime
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -264,6 +265,7 @@ _check_fn_cache: dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
+ _check_fn_last_good: dict[tuple[Callable, Optional[str]], float] = {}
+ _check_fn_ever_good: set[tuple[Callable, Optional[str]]] = set()  # probes that admitted tools this process
+ _check_fn_core_drop_warned: set[tuple[Callable, Optional[str]]] = set()  # once-per-process WARNING gate
++_check_fn_quota_logged: set[tuple] = set()  # once per (check, quota wall) INFO gate; survives invalidation
+ _check_fn_cache_lock = threading.Lock()
+ CHECK_FN_CACHE_BYPASS = ""
+ _NO_CACHE_CHECK_FNS: set[Callable] = set()
+@@ -308,6 +310,49 @@ def check_fn_cache_scope() -> Optional[str]:
+         return CHECK_FN_CACHE_BYPASS
+ 
+ 
++def _quota_wall_outcome(fn: Callable, exc: BaseException) -> Optional[str]:
++    """Verdict text for a typed subscription quota wall, else None. [daveey]
++
++    ``SubscriptionQuotaUnavailable`` means routing policy is satisfied but every route with capacity
++    is walled until a known reset: an expected state, not a crashed probe. It is logged at INFO with
++    its reset time, once per (check, wall) per process, with no traceback, so the self-heal lane does
++    not file each quota window as a defect (agent-ffb3d1ba3e). Only this exact type is softened:
++    every other ModelRoutingError (ManagedPinRejectedError, a missing route) stays a WARNING.
++    """
++    try:
++        from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    except ImportError:  # routing not importable: nothing could have raised it
++        return None
++    if not isinstance(exc, SubscriptionQuotaUnavailable):
++        return None
++    reset = getattr(exc, "resets_at", None)
++    try:
++        until = datetime.fromtimestamp(float(reset), tz=UTC).isoformat(timespec="seconds")
++    except (TypeError, ValueError, OverflowError, OSError):
++        until = str(reset)
++    route = f"{getattr(exc, 'provider', '?')}/{getattr(exc, 'model', '?')}"
++    outcome = f"quota wall until {until} ({route})"
++    key = (str(_fn_label(fn)), route, reset)
++    with _check_fn_cache_lock:
++        first = key not in _check_fn_quota_logged
++        if first:
++            while len(_check_fn_quota_logged) >= _CHECK_FN_CACHE_MAX:
++                _check_fn_quota_logged.pop()
++            _check_fn_quota_logged.add(key)
++    if first:
++        logger.info("check_fn %s hit a %s; dependent tools stay unavailable until it reopens",
++                    _fn_label(fn), outcome)
++    return outcome
++
++
++def _quota_wall_open_seconds(exc: BaseException) -> Optional[float]:
++    """Wall-clock seconds until a quota wall's ``resets_at``, or None when unknown."""
++    try:
++        return float(exc.resets_at) - time.time()
++    except (AttributeError, TypeError, ValueError, OverflowError):
++        return None
++
++
+ def _run_check_fn_uncached(fn: Callable) -> bool:
+     """Run an availability check without cache/grace handling."""
+     from agent.secret_scope import UnscopedSecretError, current_secret_scope
+@@ -332,10 +377,11 @@ def _run_check_fn_uncached(fn: Callable) -> bool:
+                 "check_fn %s raised UnscopedSecretError while the profile cache "
+                 "scope was resolved; dependent tools will be unavailable this turn",
+                 _fn_label(fn), exc_info=True)
+-    except Exception:
+-        logger.warning(
+-            "check_fn %s raised; dependent tools will be unavailable this turn",
+-            _fn_label(fn), exc_info=True)
++    except Exception as exc:
++        if _quota_wall_outcome(fn, exc) is None:
++            logger.warning(
++                "check_fn %s raised; dependent tools will be unavailable this turn",
++                _fn_label(fn), exc_info=True)
+     return False
+ 
+ 
+@@ -357,6 +403,17 @@ def _check_fn_cached(fn: Callable) -> bool:
+     try:
+         value, outcome = bool(fn()), "returned False"
+     except Exception as exc:
++        quota_outcome = _quota_wall_outcome(fn, exc)
++        if quota_outcome is not None:
++            # A known wall is not a flake: no last-good grace, no core-drop WARNING, and the False
++            # verdict is never cached past the wall's reset (the probe re-runs once it reopens).
++            with _check_fn_cache_lock:
++                _prune_check_fn_caches(now)
++                _check_fn_last_good.pop(cache_key, None)
++                left = _quota_wall_open_seconds(exc)
++                if left is None or left >= _CHECK_FN_TTL_SECONDS:
++                    _check_fn_cache[cache_key] = (now, False)
++            return False
+         # Keep the exception for the verdict log below (emitted outside this block, where
+         # ``exc_info=True`` would resolve to nothing): a check_fn that raises is a bug in the probe
+         # or its resolver, and a bare "raised" verdict reads as "nothing configured" (#87950).
+-- 
+2.55.0
+

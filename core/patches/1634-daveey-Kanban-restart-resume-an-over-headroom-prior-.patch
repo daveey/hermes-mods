@@ -1,0 +1,310 @@
+From 340f8d69833e7dad7df672759a08a651cda111ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 04:15:09 +0000
+Subject: [PATCH] [daveey] Kanban restart resume: an over-headroom prior
+ session resumes, then compacts before the first model call
+
+The planner used to refuse a resume at >= 85% of the compaction threshold (over_compaction_threshold),
+so the run restarted from a 16k-char tail (hub ev 380043: 222,858 tok vs 231,200, 23.7 run-min lost).
+Now admission copies the transcript as usual and marks restart_resume compaction: 'pending'; the worker
+runs the agent's own _compress_context (trigger turn_start_threshold) before its first model call and
+appends a second restart_resume event: compacted: true (+ compacted_messages/tokens), or fallback
+compaction_failed / compaction_unavailable, after which the copied rows are soft-archived
+(archive_and_compact with nothing to insert, on both SessionDB and the worker store) and the run starts
+from today's transcript-tail context.
+---
+ gateway/session_kanban.py                     |   4 +-
+ gateway/session_kanban_resume.py              |  97 +++++++++++++++--
+ .../test_session_kanban_restart_resume.py     | 100 +++++++++++++++++-
+ .../test_runtime_worker_compaction.py         |  11 ++
+ 4 files changed, 203 insertions(+), 9 deletions(-)
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 3b300b81bd6..ff83290e301 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -480,7 +480,9 @@ def _run_task_turns(agent, frame, history, context):
+     if warning:
+         import logging
+         logging.getLogger(__name__).warning('%s', warning)
+-    from gateway.session_kanban_resume import worker_prompt_context
++    from gateway.session_kanban_resume import compact_resumed_history, worker_prompt_context
++    # [daveey] An over-headroom resumed transcript is compacted before the first model call (or dropped).
++    history = compact_resumed_history(agent, context, history)
+     card = worker_prompt_context(context, history)  # [daveey] resumed after an owner restart, or the tail
+     prompt = '\n\n'.join(p for p in (skills, warning, card, frame['text']) if p)
+     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
+diff --git a/gateway/session_kanban_resume.py b/gateway/session_kanban_resume.py
+index ff05b68369d..aa0d864106a 100644
+--- a/gateway/session_kanban_resume.py
++++ b/gateway/session_kanban_resume.py
+@@ -13,10 +13,16 @@ read, never written, resumed or leased.
+ 
+ Fallback (today's fresh session with the transcript tail) whenever the copy cannot be proven safe:
+ the previous session is missing, empty or unreadable; it lives in another home/state.db or belongs to
+-another profile; or its transcript already exceeds the model's compaction threshold (a fresh session
+-with the tail is cheaper than a resume whose first act is a lossy compaction). A previous turn that
+-stopped mid-tool-call with no recorded result is still resumed, but each unanswered call gets a synthetic
+-"interrupted by gateway restart" result instead of being replayed.
++another profile. A previous turn that stopped mid-tool-call with no recorded result is still resumed, but
++each unanswered call gets a synthetic "interrupted by gateway restart" result instead of being replayed.
++
++A transcript past ``RESUME_HEADROOM`` of the model's compaction threshold is still resumed, then compacted
++by the worker before its first model call (``compact_resumed_history``: the agent's own ``_compress_context``,
++as a resumed chat's turn-start compaction runs it). The admission's ``restart_resume`` event carries
++``compaction: 'pending'``; the worker appends the outcome as a second ``restart_resume`` event for the same
++run (``compacted: true``, or ``fallback: 'compaction_failed'`` / ``'compaction_unavailable'``, after which the
++copied rows are dropped and the run starts from today's transcript-tail context). The latest
++``restart_resume`` event of a run is its outcome.
+ """
+ from __future__ import annotations
+ 
+@@ -40,7 +46,8 @@ INTERRUPTED_TOOL_RESULT = (
+ RESUME_NOTE = (
+     '\n## Resumed after gateway restart\n'
+     'The previous run of this card (run {prior_run}) was cut off by a gateway restart and requeued without '
+-    'counting a failure. Its full conversation above is restored into this run\'s session; continue that work '
++    'counting a failure. Its conversation above (summarized by context compaction when it was too long) is '
++    'restored into this run\'s session; continue that work '
+     'instead of starting over. Tool calls interrupted by the restart may or may not have taken effect: verify '
+     'files, running processes and remote side effects before repeating them. Use only THIS run\'s claim '
+     '(run {run_id}); the old run\'s ownership is gone. The card state below is current.\n'
+@@ -165,8 +172,8 @@ def plan_resume(candidate: Optional[dict], *, task, run_id: int, session_db, own
+     if not threshold:
+         return fallback('threshold_unknown', **{k: plan[k] for k in ('messages', 'tokens')})
+     plan['threshold'] = int(threshold)
+-    if tokens >= threshold * RESUME_HEADROOM:
+-        return fallback('over_compaction_threshold')
++    if tokens >= threshold * RESUME_HEADROOM:  # no room for the first turn: the worker compacts it first
++        plan['compaction'] = 'pending'
+     return {**plan, 'resumed_session_id': sid, 'interrupted_calls': _unanswered_tool_calls(history)}
+ 
+ 
+@@ -263,11 +270,87 @@ def record_resume_event(conn, task_id: str, run_id: int, plan: dict, copied: Opt
+         if copied:
+             payload.update(resumed_session_id=plan['resumed_session_id'], copied_messages=copied,
+                            interrupted_calls=len(plan.get('interrupted_calls') or ()))
++            if plan.get('compaction'):
++                payload['compaction'] = plan['compaction']
+         else:
+             payload['fallback'] = 'seed_failed'
+     kb._append_event(conn, task_id, EVENT_KIND, payload, run_id=run_id)
+ 
+ 
++def _latest_resume_event(context: dict) -> dict:
++    with closing(sqlite3.connect(Path(context['db']).resolve().as_uri() + '?mode=ro', uri=True, timeout=5)) as conn:
++        row = conn.execute('SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
++                           'ORDER BY id DESC LIMIT 1', (context['task_id'], context['run_id'], EVENT_KIND)).fetchone()
++    return _json_dict(row[0] if row else None)
++
++
++def _record_compaction(context: dict, payload: dict) -> None:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
++        kb._append_event(conn, context['task_id'], EVENT_KIND, payload, run_id=context['run_id'])
++
++
++def compact_resumed_history(agent, context: dict, history: list) -> list:
++    """Worker side, before the first model call: when the admission resumed an over-headroom transcript
++    (``compaction: 'pending'``), compact it through the agent's own ``_compress_context`` (in place, into this
++    run's session) and return the compacted history. When compaction is unavailable or fails (raises, or makes
++    no progress), the copied rows are dropped and ``[]`` is returned, so the run falls back to the fresh
++    session with the transcript-tail context. Any other history is returned unchanged."""
++    if not history or not context.get('resume_context'):
++        return history
++    try:
++        admitted = _latest_resume_event(context)
++    except (OSError, sqlite3.Error, KeyError, TypeError):
++        logger.warning('Kanban restart resume: admission event unreadable; resuming uncompacted', exc_info=True)
++        return history
++    if admitted.get('compaction') != 'pending' or not admitted.get('resumed_session_id'):
++        return history
++    from agent.model_metadata import estimate_messages_tokens_rough
++    outcome = {k: admitted[k] for k in ('prior_run_id', 'prior_session_id', 'resumed_session_id', 'messages',
++                                        'tokens', 'threshold') if admitted.get(k) is not None}
++    before = estimate_messages_tokens_rough(history)
++    compressed, error = history, None
++    compress: Any = getattr(agent, '_compress_context', None)
++    if getattr(agent, 'compression_enabled', True) is not True or not callable(compress):
++        reason = 'compaction_unavailable'
++    else:
++        reason = 'compaction_failed'
++        try:
++            compressed = compress(history, None, approx_tokens=admitted.get('tokens') or before,
++                                  task_id=agent.session_id or 'default', trigger='turn_start_threshold')[0]
++        except Exception as exc:  # a failed compaction is a fallback, never a dead run
++            logger.warning('Kanban restart resume: compacting %s failed', agent.session_id, exc_info=True)
++            compressed, error = history, f'{type(exc).__name__}: {exc}'[:200]
++    after = estimate_messages_tokens_rough(compressed) if compressed else 0
++    if compressed is not history and compressed and (len(compressed) < len(history) or after < before):
++        outcome.update(compacted=True, compacted_messages=len(compressed), compacted_tokens=int(after))
++        _record_compaction_safely(context, outcome)
++        return compressed
++    try:
++        drop_copied_rows(agent._session_db, agent.session_id)  # the tail-only fresh session, as on any fallback
++    except Exception:
++        logger.warning('Kanban restart resume: dropping the copied rows of %s failed', agent.session_id, exc_info=True)
++    outcome.pop('resumed_session_id', None)
++    outcome.update(fallback=reason, **({'error': error} if error else {}))
++    _record_compaction_safely(context, outcome)
++    return []
++
++
++def drop_copied_rows(session_db, session_id: str) -> int:
++    """Soft-archive every active row of ``session_id`` (the copied transcript), leaving the session empty for
++    the tail-only fallback. ``archive_and_compact`` with nothing to insert: the one in-place rewrite both the
++    owner's ``SessionDB`` and the managed worker's ``RuntimeSessionStore`` expose; the rows stay searchable."""
++    return int(session_db.archive_and_compact(session_id, [], watermark=None, lock_holder=None, tail_count=0))
++
++
++def _record_compaction_safely(context: dict, payload: dict) -> None:
++    try:
++        _record_compaction(context, payload)
++    except Exception:  # telemetry only: the run proceeds either way
++        logger.warning('Kanban restart resume: recording the compaction outcome failed', exc_info=True)
++
++
+ def resume_context(base_context: str, plan: dict) -> str:
+     """Built at policy time for every run that follows a restart loss; the worker uses it only when the
+     copied history arrived (``worker_prompt_context``)."""
+diff --git a/tests/gateway/test_session_kanban_restart_resume.py b/tests/gateway/test_session_kanban_restart_resume.py
+index 9bfbbb384b2..b01ce15b499 100644
+--- a/tests/gateway/test_session_kanban_restart_resume.py
++++ b/tests/gateway/test_session_kanban_restart_resume.py
+@@ -229,7 +229,6 @@ _FALLBACKS = {
+     'foreign_home': ({}, 'other-home/state.db', None, 'foreign_home', False),
+     'foreign_profile': ({'profile': 'other'}, None, None, 'foreign_profile', False),
+     'unreadable': ({}, None, _broken_reader, 'prior_session_unreadable', True),
+-    'over_threshold': ({}, None, _tiny_threshold, 'over_compaction_threshold', True),
+     'plan_raises': ({}, None, _broken_estimate, 'plan_failed', True),
+     'rotated': ({}, None, _rotated, 'prior_session_rotated', True),
+     'seed_raises': ({}, None, _broken_seed, 'seed_failed', True),
+@@ -258,6 +257,105 @@ def test_each_fallback_keeps_the_tail_only_fresh_session(env, case):
+     assert ('Interrupted worker continuation' in prompt) == tail and 'Resumed after gateway restart' not in prompt
+ 
+ 
++def _resume_events(task_id, run_id):
++    with _connect() as conn:
++        return [json.loads(p) for (p,) in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='restart_resume' ORDER BY id",
++            (task_id, run_id))]
++
++
++class _WorkerAgent:
++    """The managed worker's agent at the seam ``_run_task_turns`` drives: its real session store, an in-place
++    ``_compress_context`` stand-in (``mode``: rewrite the session to a summary, raise, or return the input
++    unchanged as an aborted compaction does) and a ``run_conversation`` that records the first model call."""
++
++    def __init__(self, db, mode='compact', enabled=True):
++        self.session_id, self._session_db, self.compression_enabled = NEW, db, enabled
++        self.mode, self.calls = mode, []
++
++    def _compress_context(self, messages, system_message, **kw):
++        self.calls.append(('compress', len(messages), kw.get('trigger')))
++        if self.mode == 'raise':
++            raise RuntimeError('summary model unavailable')
++        if self.mode == 'abort':
++            return messages, 'SP'
++        summary = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary: PROGRESS-MARKER-42, a.py patched'},
++                   messages[-1]]
++        self._session_db.archive_and_compact(self.session_id, summary)  # in-place compaction's commit
++        return summary, 'SP'
++
++    def run_conversation(self, text, **kw):
++        self.calls.append(('model', text, kw['conversation_history']))
++        return {'final_response': 'ok'}
++
++
++def _over_threshold_admission(env):
++    _prior_session(env.db)
++    _tiny_threshold(env)  # 4 messages are far past 85% of a 10-token threshold
++    tid = _task(env)
++    prior_run, _ = _lose_run(tid, code=KANBAN_OWNER_RESTART_EXIT_CODE, state_db=env.db.db_path,
++                             monkeypatch=env.monkeypatch)
++    env.monkeypatch.setattr('agent.kanban_turn_recovery.recover_failed_kanban_turns', lambda *a, **kw: None)
++    return tid, prior_run, _admit_next(env, tid)
++
++
++def test_an_over_threshold_prior_session_resumes_and_is_compacted_before_the_first_model_call(env):
++    from gateway import session_kanban
++    tid, prior_run, run = _over_threshold_admission(env)
++    # Admission resumes instead of falling back to the tail: the whole transcript is copied, compaction pending.
++    admitted = run.events['restart_resume']
++    assert admitted['resumed_session_id'] == PRIOR and admitted['compaction'] == 'pending'
++    assert admitted['copied_messages'] == 4 and 'fallback' not in admitted and admitted['threshold'] == 10
++    assert run.events['owner_admitted']['resumed_session_id'] == PRIOR and len(run.history) == 4
++    agent = _WorkerAgent(env.db)
++    session_kanban._run_task_turns(agent, {'text': f'work kanban task {tid}'}, run.history, run.context)
++    # Compaction ran first, then the one model call got the compacted history and the resume prompt.
++    assert [c[0] for c in agent.calls] == ['compress', 'model']
++    assert agent.calls[0] == ('compress', 4, 'turn_start_threshold')
++    _, prompt, sent = agent.calls[1]
++    assert sent[0]['content'].startswith('[CONTEXT COMPACTION]') and len(sent) == 2
++    assert 'Resumed after gateway restart' in prompt and 'Interrupted worker continuation' not in prompt
++    assert [m['content'] for m in env.db.get_messages_as_conversation(NEW)] == [m['content'] for m in sent]
++    # The run's outcome event: resumed AND compacted.
++    outcome = _resume_events(tid, run.run_id)[-1]
++    assert outcome['compacted'] is True and outcome['resumed_session_id'] == PRIOR
++    assert outcome['prior_run_id'] == prior_run and outcome['compacted_messages'] == 2 and 'fallback' not in outcome
++    assert len(env.db.get_messages_as_conversation(PRIOR)) == 4  # the prior session is still never written
++
++
++@pytest.mark.parametrize('mode,enabled,reason', [('raise', True, 'compaction_failed'),
++                                                 ('abort', True, 'compaction_failed'),
++                                                 ('compact', False, 'compaction_unavailable')])
++def test_a_failed_compaction_falls_back_to_the_tail_only_fresh_session(env, mode, enabled, reason):
++    from gateway import session_kanban
++    tid, _prior, run = _over_threshold_admission(env)
++    agent = _WorkerAgent(env.db, mode=mode, enabled=enabled)
++    session_kanban._run_task_turns(agent, {'text': f'work kanban task {tid}'}, run.history, run.context)
++    assert [c[0] for c in agent.calls] == (['model'] if not enabled else ['compress', 'model'])
++    _, prompt, sent = agent.calls[-1]
++    # Today's fallback: no copied rows left, the transcript-tail context instead of the resume note.
++    assert sent == [] and env.db.get_messages_as_conversation(NEW) == []
++    assert prompt.startswith(run.context['context']) and 'Interrupted worker continuation' in prompt
++    assert 'Resumed after gateway restart' not in prompt
++    outcome = _resume_events(tid, run.run_id)[-1]
++    assert outcome['fallback'] == reason and 'resumed_session_id' not in outcome and 'compacted' not in outcome
++    assert ('error' in outcome) == (mode == 'raise')
++
++
++def test_an_under_headroom_resume_is_not_compacted(env):
++    from gateway import session_kanban
++    _prior_session(env.db)
++    tid = _task(env)
++    _lose_run(tid, code=KANBAN_OWNER_RESTART_EXIT_CODE, state_db=env.db.db_path, monkeypatch=env.monkeypatch)
++    env.monkeypatch.setattr('agent.kanban_turn_recovery.recover_failed_kanban_turns', lambda *a, **kw: None)
++    run = _admit_next(env, tid)
++    assert 'compaction' not in run.events['restart_resume']
++    agent = _WorkerAgent(env.db)
++    session_kanban._run_task_turns(agent, {'text': f'work kanban task {tid}'}, run.history, run.context)
++    assert [c[0] for c in agent.calls] == ['model'] and len(agent.calls[0][2]) == 4
++    assert len(_resume_events(tid, run.run_id)) == 1
++
++
+ @pytest.mark.parametrize('kind', ['crash', 'timeout'])
+ def test_a_non_restart_requeue_is_unchanged(env, kind):
+     _prior_session(env.db)
+diff --git a/tests/hermes_state/test_runtime_worker_compaction.py b/tests/hermes_state/test_runtime_worker_compaction.py
+index ea476e895cf..552ec3a08e4 100644
+--- a/tests/hermes_state/test_runtime_worker_compaction.py
++++ b/tests/hermes_state/test_runtime_worker_compaction.py
+@@ -98,3 +98,14 @@ def test_micro_compaction_live_dicts_persist_through_the_worker_like_direct(work
+         durable[sid] = [r['content'] for r in db.get_messages_as_conversation(sid)]
+     assert store.failure is None and store.journal['pending'] == []
+     assert durable['owned'] == durable['direct'] == ['u1', 'micro summary', 'u2', 'after']
++
++
++def test_a_kanban_restart_resume_fallback_drops_the_copied_rows_through_the_worker_store(worker):
++    """[daveey] A failed compaction of a resumed Kanban transcript empties the run's session from inside the
++    managed worker (``gateway.session_kanban_resume.drop_copied_rows``): the rows are soft-archived, not lost."""
++    from gateway.session_kanban_resume import drop_copied_rows
++    db, store = worker
++    store.append_messages_batch('owned', [{'role': 'user', 'content': 'copied'}, {'role': 'assistant', 'content': 'old'}])
++    assert drop_copied_rows(store, 'owned') == 0
++    assert store.get_messages_as_conversation('owned') == []
++    assert db._read_one("SELECT COUNT(*) FROM messages WHERE session_id='owned' AND active=0")[0] == 2
+-- 
+2.55.0
+

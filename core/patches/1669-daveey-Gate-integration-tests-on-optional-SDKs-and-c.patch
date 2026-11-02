@@ -1,0 +1,176 @@
+From bf071a2bd5def5e02dfd8ef8fbf1ce921852535c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 09:24:07 +0000
+Subject: [PATCH] [daveey] Gate integration tests on optional SDKs and cgroup
+ migration access
+
+---
+ ...t_kanban_notifier_served_apiserver_wake.py |  3 +-
+ tests/gateway/test_kanban_wake_acceptance.py  |  1 +
+ .../test_managed_kanban_scope_placement.py    | 75 ++++++++++++++++++-
+ tests/tui_gateway/test_class_routing.py       |  3 +-
+ 4 files changed, 77 insertions(+), 5 deletions(-)
+
+diff --git a/tests/gateway/test_kanban_notifier_served_apiserver_wake.py b/tests/gateway/test_kanban_notifier_served_apiserver_wake.py
+index 82e74ae3054..1f066e9c338 100644
+--- a/tests/gateway/test_kanban_notifier_served_apiserver_wake.py
++++ b/tests/gateway/test_kanban_notifier_served_apiserver_wake.py
+@@ -172,7 +172,7 @@ def _api_sub(chat_id=SESSION, profile="builder"):
+ def test_served_profile_wake_runs_in_process_only_for_the_session_it_owns(served, monkeypatch):
+     """Owned session → in-process wake in the owner's scope; everything else fails closed; the
+     default profile keeps its HTTP self-post."""
+-    import aiohttp
++    aiohttp = pytest.importorskip("aiohttp", reason="API server wake transport requires aiohttp")
+ 
+     _own_session(served.builder, SESSION, "builder")
+     _FakeHttpSession.calls = []
+@@ -229,6 +229,7 @@ def test_served_profile_wake_runs_in_process_only_for_the_session_it_owns(served
+ def test_internal_session_turn_targets_the_live_session_under_the_owner_profile(served, monkeypatch):
+     """Adapter-level: the in-process turn binds the proven profile, adopts the compression tip,
+     and never runs against a session the owner's store does not hold."""
++    pytest.importorskip("aiohttp", reason="API server error responses require aiohttp")
+     from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
+ 
+     parent, tip = "20260918_010000_parent", "20260918_020000_tip"
+diff --git a/tests/gateway/test_kanban_wake_acceptance.py b/tests/gateway/test_kanban_wake_acceptance.py
+index ecb28472536..f03e91f6da5 100644
+--- a/tests/gateway/test_kanban_wake_acceptance.py
++++ b/tests/gateway/test_kanban_wake_acceptance.py
+@@ -17,6 +17,7 @@ from hermes_cli import kanban_db_notify as kbn
+ 
+ def setup_route(raft=False):
+     if raft:
++        pytest.importorskip("aiohttp", reason="Raft HTTP bridge requires aiohttp")
+         from plugins.platforms.raft.adapter import RaftAdapter
+         adapter = RaftAdapter(PlatformConfig(enabled=True, typing_indicator=False,
+             extra={"bridge_token": "owned-test-token", "port": 0}))
+diff --git a/tests/gateway/test_managed_kanban_scope_placement.py b/tests/gateway/test_managed_kanban_scope_placement.py
+index c92b893f09e..d9dec5ecda0 100644
+--- a/tests/gateway/test_managed_kanban_scope_placement.py
++++ b/tests/gateway/test_managed_kanban_scope_placement.py
+@@ -1,5 +1,6 @@
+ """A managed Kanban worker and its descendants land in the run's real, finite systemd scope."""
+ import asyncio
++import errno
+ import json
+ import os
+ import shutil
+@@ -78,7 +79,73 @@ def _reap(process):
+         process.stdout.close()
+ 
+ 
+-def test_child_and_descendant_inherit_run_scope_and_limit(run_scope):
++def _probe_migration(target):
++    """Scope creation does not grant migration across a nondelegated common ancestor.
++
++    Probe the kernel directly, not migrate(): a production placement regression must
++    still fail on capable hosts. Only move our disposable child, never the test runner.
++    """
++    process = _spawn()
++    try:
++        path = target / 'cgroup.procs'
++        try:
++            with path.open('wb', buffering=0) as stream:
++                stream.write(f'{process.pid}\n'.encode())
++        except OSError as exc:
++            if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
++                raise
++            pytest.skip(f'needs cgroup migration permission from {_cgroup(process.pid)} to {path}: {exc}')
++    finally:
++        _reap(process)
++
++
++@pytest.mark.parametrize('error', [None, errno.EACCES, errno.EPERM, errno.EROFS, errno.EIO])
++def test_migration_probe_classifies_kernel_errors_and_reaps(tmp_path, monkeypatch, error):
++    from contextlib import contextmanager, nullcontext
++
++    made = []
++    real_spawn = _spawn
++
++    def spawn():
++        process = real_spawn()
++        made.append(process)
++        return process
++
++    real_open = Path.open
++
++    @contextmanager
++    def open_control(path, *args, **kwargs):
++        if path != tmp_path / 'cgroup.procs':
++            with real_open(path, *args, **kwargs) as stream:
++                yield stream
++            return
++
++        def write(value):
++            assert value == f'{made[0].pid}\n'.encode()
++            if error is not None:
++                raise OSError(error, os.strerror(error))
++        yield SimpleNamespace(write=write)
++
++    monkeypatch.setattr(sys.modules[__name__], '_spawn', spawn)
++    monkeypatch.setattr(Path, 'open', open_control)
++    expected = nullcontext()
++    if error == errno.EIO:
++        expected = pytest.raises(OSError, match='Input/output error')
++    elif error is not None:
++        expected = pytest.raises(pytest.skip.Exception, match='needs cgroup migration permission')
++    with expected:
++        _probe_migration(tmp_path)
++    assert len(made) == 1 and made[0].poll() is not None
++    assert made[0].stdin.closed and made[0].stdout.closed
++
++
++@pytest.fixture
++def migration_access(run_scope):
++    target = scope_mod.CGROUP_ROOT / _cgroup(run_scope.submitter.pid).lstrip('/')
++    _probe_migration(target)
++
++
++def test_child_and_descendant_inherit_run_scope_and_limit(run_scope, migration_access):
+     process = scope_mod.placing_spawn(_spawn, run_scope.policy)()
+     try:
+         process.stdin.write(b'go\n')
+@@ -211,7 +278,9 @@ def test_migration_failure_kills_and_reaps_child(run_scope, monkeypatch):
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize('cancel_early', [True, False])
+-async def test_cancel_interleaving_leaves_no_child(run_scope, monkeypatch, cancel_early):
++async def test_cancel_interleaving_leaves_no_child(run_scope, monkeypatch, cancel_early, request):
++    if not cancel_early:
++        request.getfixturevalue('migration_access')
+     from gateway.session_worker_spawn import acquire_process
+     made = []
+ 
+@@ -247,7 +316,7 @@ async def test_cancel_interleaving_leaves_no_child(run_scope, monkeypatch, cance
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_spawn_registered_worker_places_real_child(run_scope, monkeypatch):
++async def test_spawn_registered_worker_places_real_child(run_scope, monkeypatch, migration_access):
+     """The production spawn path (not just the helper) lands the Popen child in the run scope."""
+     from gateway import session_managed_worker as managed
+     authority = SimpleNamespace(profile_id='p', pending_results={}, _managed_spawning={})
+diff --git a/tests/tui_gateway/test_class_routing.py b/tests/tui_gateway/test_class_routing.py
+index 47b65c53c52..77a69c0ca31 100644
+--- a/tests/tui_gateway/test_class_routing.py
++++ b/tests/tui_gateway/test_class_routing.py
+@@ -14,7 +14,7 @@ streaming_route = test_model_routing_agent.streaming_route
+ @pytest.fixture
+ def native_transport(monkeypatch):
+     import json
+-    import anthropic
++    anthropic = pytest.importorskip("anthropic", reason="Native Anthropic wire tests require the anthropic SDK")
+     import httpx
+     sent = []
+ 
+@@ -111,6 +111,7 @@ def test_desktop_readiness_uses_native_fence_without_allocation(routing_home, st
+ 
+ 
+ def test_desktop_exhaustion_cannot_enter_paid_fallback(routing_home, streaming_route, monkeypatch):
++    pytest.importorskip("anthropic", reason="Native Anthropic fallback guard requires the anthropic SDK")
+     from agent.model_routing import ModelRoutingError
+     monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("class:deep", "auto"))
+     monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
+-- 
+2.55.0
+

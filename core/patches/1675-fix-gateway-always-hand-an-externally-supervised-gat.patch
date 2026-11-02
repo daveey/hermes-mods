@@ -1,0 +1,243 @@
+From 289edf5b0f99bc54b986bf1687b085d439616cd3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 09:17:32 +0000
+Subject: [PATCH] fix(gateway): always hand an externally-supervised gateway
+ back before service restart [daveey]
+
+Spec: a gateway process that declares an external supervisor restarts through the
+graceful SIGUSR1 handback (restart_externally_supervised_gateway) before ANY
+installed-service dispatch, the canonical service owner included.
+
+d295a76236e narrowed that to services that do not own the gateway
+(installed_service_owns_gateway: launchd/systemd job pid == gateway or its launcher
+ancestor). That helper is removed; the pre-dispatch handback is unconditional, and the
+canonical-owner test now asserts the handback (exit 75 drain, relaunch, no service call)
+instead of the service path. RED/GREEN for that test: owner-red.log / owner-green.log.
+
+The late external-supervisor check before the manual fallback is removed: every path that
+reaches it already passed the identical pre-dispatch check, so it was dead code. The
+manual fallback keeps refuse_restart_of_service_managed_gateway on a fresh pid read.
+
+Test fixture: _FakeSupervisor.close() killed the first lookalike gateway, which woke the
+relaunch watcher and could spawn a second child after teardown (a leaked
+`gateway run --external-supervisor` lookalike). close() now sets a closed flag under the
+relaunch lock first, joins the watcher, and reaps both children.
+test_fake_supervisor_close_never_relaunches_after_teardown was RED on the old fixture
+(second child spawned after close) and is GREEN now.
+
+Tests: tests/hermes_cli/test_gateway_restart_installed_service_external_supervisor.py +
+test_gateway_restart_external_supervisor.py 13 passed; the 131-file gateway/update
+affected set 1606 passed, 0 failed, 48 skipped (hermes-core-wt test).
+
+Behavior change to note: the canonical launchd plist runs `gateway run
+--external-supervisor` and a systemd unit gateway answers identify with supervisor
+"systemd", so canonical service restarts now also take the handback instead of
+launchd_restart / systemd_restart (no plist/unit refresh, no wedged-loop SIGKILL
+escalation, no kickstart fallback when the supervisor does not relaunch: exit 1).
+---
+ hermes_cli/gateway.py                         | 27 ++++-----
+ hermes_cli/gateway_supervised_restart.py      | 34 -----------
+ ...t_installed_service_external_supervisor.py | 60 ++++++++++++++-----
+ 3 files changed, 56 insertions(+), 65 deletions(-)
+
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 802249b07d5..e3002da03cd 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -5480,16 +5480,16 @@ def _cmd_restart(args):
+     service_configured = kind is not None and (kind != "windows" or _gw_windows().is_installed())
+     from gateway.status import get_running_pid
+     from hermes_cli.gateway_supervised_restart import (
+-        gateway_declares_external_supervisor, installed_service_owns_gateway, refuse_restart_of_service_managed_gateway,
++        gateway_declares_external_supervisor, refuse_restart_of_service_managed_gateway,
+         restart_externally_supervised_gateway, start_restart_replacement,
+     )
+-    # [daveey] A canonical plist/unit on disk is not proof it runs THIS gateway: a custom agent's
+-    # `gateway run --external-supervisor` next to a stale or unloaded definition restarts by exiting
+-    # back to its own supervisor. Dispatching to the file-only service first failed and exited 1
+-    # ("Gateway service restart failed") before the handback below was ever reached.
+-    supervised_pid = get_running_pid() if kind is not None else None
+-    if (supervised_pid and gateway_declares_external_supervisor(supervised_pid)
+-            and not installed_service_owns_gateway(kind, supervised_pid, system)):
++    # External supervision is the running process's lifecycle contract, so it is honored before
++    # any service dispatch, even when the installed canonical service owns the gateway: a
++    # service-manager failure (a stale or unloaded canonical definition beside a custom agent)
++    # exited 1 before the graceful SIGUSR1 handback was ever reached. This is also the only
++    # handback point: the manual fallback below never sees a supervised gateway (#110637).
++    supervised_pid = get_running_pid()
++    if supervised_pid and gateway_declares_external_supervisor(supervised_pid):
+         restart_externally_supervised_gateway(supervised_pid)
+         return
+     if kind is not None:
+@@ -5523,14 +5523,9 @@ def _cmd_restart(args):
+         )
+         sys.exit(1)
+ 
+-    # A gateway that declares an external supervisor (custom launchd agent / unit running
+-    # `gateway run --external-supervisor`) restarts by exiting back to it: the stop + foreground
+-    # run below would stamp this CLI's PID as the gateway and wedge every respawn (#110637).
+-    supervised_pid = get_running_pid()
+-    if supervised_pid and gateway_declares_external_supervisor(supervised_pid):
+-        restart_externally_supervised_gateway(supervised_pid)
+-        return
+-    refuse_restart_of_service_managed_gateway(supervised_pid)
++    # An externally-supervised gateway already returned through the handback above, so the stop +
++    # foreground run below never stamps this CLI's PID over a supervised gateway (#110637).
++    refuse_restart_of_service_managed_gateway(get_running_pid())
+ 
+     if stop_profile_gateway():
+         print("✓ Stopped gateway for this profile")
+diff --git a/hermes_cli/gateway_supervised_restart.py b/hermes_cli/gateway_supervised_restart.py
+index ba1bc3d9f87..1425b09037f 100644
+--- a/hermes_cli/gateway_supervised_restart.py
++++ b/hermes_cli/gateway_supervised_restart.py
+@@ -49,40 +49,6 @@ def gateway_declares_external_supervisor(pid: int, home: Path | None = None) ->
+     return argv_declares_external_supervisor(argv)
+ 
+ 
+-def installed_service_owns_gateway(kind: str | None, pid: int, system: bool = False) -> bool:
+-    """[daveey] True when the installed ``kind`` service's live job IS ``pid`` or one of its ancestors.
+-
+-    ``_installed_service_kind_for`` only proves the canonical plist/unit FILE exists. A gateway run
+-    by a custom launchd agent / unit (``gateway run --external-supervisor``) next to a leftover or
+-    never-loaded canonical definition is owned by its own supervisor, and dispatching the restart to
+-    the canonical service fails (or bootstraps a second, competing supervisor). The canonical plist
+-    starts the gateway through a stderr launcher, so its job pid may be the gateway's parent: walk
+-    the ancestry. Only a positive match counts; an unreadable job (launchctl/systemctl error or
+-    timeout) is not proof of ownership. Kinds other than launchd/systemd keep the service path.
+-    """
+-    if kind not in ("launchd", "systemd"):
+-        return True
+-    from hermes_cli import gateway as gw
+-
+-    try:
+-        if kind == "launchd":
+-            service_pid = gw._launchd_print_service_pid(gw._launchd_domain(), gw.get_launchd_label())[1]
+-        else:
+-            service_pid = gw._systemd_main_pid(system=system)
+-    except Exception:
+-        return False
+-    if not service_pid or service_pid <= 1:
+-        return False
+-    current: int | None = pid
+-    for _ in range(8):  # gateway → launcher → job; bounded against pid-reuse cycles
+-        if current is None or current <= 1:
+-            return False
+-        if current == service_pid:
+-            return True
+-        current = gw._get_parent_pid(current)
+-    return False
+-
+-
+ def _wait_for_supervised_gateway_replacement(
+     old_pid: int, timeout: float | None = None, *, poll_interval: float = 0.5
+ ) -> int | None:
+diff --git a/tests/hermes_cli/test_gateway_restart_installed_service_external_supervisor.py b/tests/hermes_cli/test_gateway_restart_installed_service_external_supervisor.py
+index 7bb063e6a03..061072e332d 100644
+--- a/tests/hermes_cli/test_gateway_restart_installed_service_external_supervisor.py
++++ b/tests/hermes_cli/test_gateway_restart_installed_service_external_supervisor.py
+@@ -67,19 +67,28 @@ def _spawn_fake_gateway(script) -> subprocess.Popen:
+ 
+ 
+ class _FakeSupervisor:
+-    """A KeepAlive manager this test owns: relaunches the gateway once its first instance exits."""
++    """A KeepAlive manager this test owns: relaunches the gateway once its first instance exits.
++
++    ``close`` stops relaunching before it kills anything: killing ``first`` wakes the watcher, and
++    without the closed flag (checked under the same lock the relaunch holds) it spawned ``second``
++    after teardown had already passed it, leaking a lookalike gateway past the test.
++    """
+ 
+     def __init__(self, script, relaunch: bool = True):
+         self._script = script
++        self._lock = threading.Lock()
++        self._closed = False
+         self.first = _spawn_fake_gateway(script)
+         self.second: subprocess.Popen | None = None
+         self._relaunch = relaunch
+-        threading.Thread(target=self._watch, daemon=True).start()
++        self._watcher = threading.Thread(target=self._watch, daemon=True)
++        self._watcher.start()
+ 
+     def _watch(self):
+         self.first.wait()
+-        if self._relaunch:
+-            self.second = _spawn_fake_gateway(self._script)
++        with self._lock:
++            if self._relaunch and not self._closed:
++                self.second = _spawn_fake_gateway(self._script)
+ 
+     def running_pid(self, *a, **k):
+         if self.first.poll() is None:
+@@ -87,9 +96,15 @@ class _FakeSupervisor:
+         return self.second.pid if self.second is not None else None
+ 
+     def close(self):
++        with self._lock:  # waits out an in-flight relaunch, then forbids any later one
++            self._closed = True
+         for proc in (self.first, self.second):
+             if proc is not None and proc.poll() is None:
+                 proc.kill()
++        self._watcher.join(timeout=10)
++        for proc in (self.first, self.second):
++            if proc is not None:
++                proc.wait(timeout=10)
+ 
+ 
+ @pytest.fixture
+@@ -153,22 +168,19 @@ def test_detach_restart_hands_back_to_external_supervisor_despite_failing_instal
+     assert supervisor.second is not None
+     assert f"relaunched by its supervisor (PID {supervisor.second.pid})" in out
+     assert "Gateway service restart failed" not in out
+-    assert calls["service"] == [], "a service definition that does not own the gateway must not be dispatched"
++    assert calls["service"] == [], "an externally-supervised gateway is handed back, never service-dispatched"
+     assert not (calls["stopped"] or calls["started"] or calls["replacement_started"])
+ 
+ 
+-def test_installed_service_that_owns_the_gateway_is_still_dispatched(scenario, monkeypatch, capsys):
++def test_installed_service_owner_also_gets_graceful_handback(scenario, monkeypatch, capsys):
+     supervisor, calls = scenario
+-    # The canonical plist itself runs `gateway run --external-supervisor` (through a stderr launcher
+-    # whose pid launchd reports). When launchd's job pid is the gateway or its ancestor the service
+-    # path (plist refresh + kickstart) stays authoritative, and its failure is still exit 1.
++    # Even the canonical supervisor must drain gracefully, not kickstart its live worker.
+     monkeypatch.setattr(gw, "_launchd_print_service_pid", lambda domain, label: (True, os.getpid()))
+-    with pytest.raises(SystemExit) as exc:
+-        gw.gateway_command(_parse("restart", "--detach"))
+-    assert exc.value.code == 1
+-    assert calls["service"] == [("launchd", "restart")]
+-    assert supervisor.first.poll() is None, "no SIGUSR1 handback once the owning service was asked"
+-    assert "Gateway service restart failed" in capsys.readouterr().out
++    gw.gateway_command(_parse("restart", "--detach"))
++    assert calls["service"] == []
++    assert supervisor.first.returncode == 75
++    assert supervisor.second is not None
++    assert "relaunched by its supervisor" in capsys.readouterr().out
+ 
+ 
+ def test_refusal_guards_still_run_before_the_handback(scenario, monkeypatch):
+@@ -195,3 +207,21 @@ def test_supervisor_that_never_relaunches_still_fails_loudly(scenario, monkeypat
+     assert supervisor.first.returncode == 75
+     assert "Supervisor did not relaunch the gateway" in capsys.readouterr().out
+     assert not (calls["stopped"] or calls["started"] or calls["replacement_started"])
++
++
++def test_fake_supervisor_close_never_relaunches_after_teardown(tmp_path):
++    # Teardown kills `first` while it still runs, which wakes the relaunch watcher. A relaunch
++    # after close() returned would leak a `gateway run --external-supervisor` lookalike.
++    script = tmp_path / "bin" / "hermes"
++    script.parent.mkdir()
++    script.write_text(_FAKE_GATEWAY_CODE, encoding="utf-8")
++    supervisor = _FakeSupervisor(script)
++    first_pid = supervisor.first.pid
++    supervisor.close()
++    time.sleep(0.5)  # longer than a relaunch takes to start a second child
++    assert supervisor.second is None, "close() must stop the supervisor before it kills the gateway"
++    assert supervisor.first.returncode is not None
++    assert not supervisor._watcher.is_alive()
++    assert supervisor.running_pid() is None
++    with pytest.raises(ProcessLookupError):
++        os.kill(first_pid, 0)
+-- 
+2.55.0
+

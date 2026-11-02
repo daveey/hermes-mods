@@ -1,0 +1,377 @@
+From 8d3f19f72d07f94005fd5f9e2032cdee66dfe340 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 04:56:00 +0000
+Subject: [PATCH] [daveey] Wake ancestry probes pinned to a rebased commit
+ identity
+
+---
+ hermes_cli/kanban_dead_ancestry.py            | 154 +++++++++++++++++
+ hermes_cli/kanban_wake_check.py               |  13 +-
+ tests/hermes_cli/test_kanban_dead_ancestry.py | 155 ++++++++++++++++++
+ 3 files changed, 320 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_dead_ancestry.py
+ create mode 100644 tests/hermes_cli/test_kanban_dead_ancestry.py
+
+diff --git a/hermes_cli/kanban_dead_ancestry.py b/hermes_cli/kanban_dead_ancestry.py
+new file mode 100644
+index 00000000000..09dd9d289ad
+--- /dev/null
++++ b/hermes_cli/kanban_dead_ancestry.py
+@@ -0,0 +1,154 @@
++"""Read-only diagnosis of ancestry probes pinned to rebased commits. [daveey]
++
++Patch equivalence is evidence to replan, not evidence that a deployment is live.
++Unknown shell syntax, missing objects and exhausted budgets remain ordinary waits.
++"""
++from __future__ import annotations
++
++import os
++import re
++import shlex
++import subprocess
++import time
++from pathlib import Path
++
++EVENT = "wake_check_dead_ancestry"
++BUDGET_SECONDS = 10
++_HEX = re.compile(r"[0-9a-fA-F]{7,40}\Z")
++
++
++def ancestry_probes(cmd: str, cwd: str) -> list[tuple[str, str]]:
++    """Recognize literal git commands only, never quoted script/echo contents."""
++    try:
++        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
++        lexer.whitespace_split = True
++        tokens = list(lexer)
++    except ValueError:
++        return []
++    # Do not guess shell-mutated cwd or environment. Those probes still run normally.
++    if any(t in ("cd", "pushd", "eval", "export") or "$" in t or "`" in t for t in tokens):
++        return []
++    found = []
++    for i, token in enumerate(tokens):
++        if token != "git" or (i and tokens[i - 1] not in (";", "&&", "||", "|")):
++            continue
++        j, directory = i + 1, Path(cwd)
++        while j + 1 < len(tokens) and tokens[j] == "-C":
++            path = Path(os.path.expanduser(tokens[j + 1]))
++            directory = path if path.is_absolute() else directory / path
++            j += 2
++        args = tokens[j:j + 4]
++        if (len(args) == 4 and args[:2] == ["merge-base", "--is-ancestor"]
++                and _HEX.fullmatch(args[2]) and args[3] not in (";", "&&", "||", "|")):
++            found.append((str(directory.resolve()), args[2]))
++    return found
++
++
++def _git(repo: str, args: list[str], deadline: float, *, data: str | None = None) -> str:
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        raise subprocess.TimeoutExpired("git", BUDGET_SECONDS)
++    result = subprocess.run(["git", "--no-pager", "-C", repo, *args],
++                            input=data, capture_output=True, text=True,
++                            timeout=remaining, check=True,
++                            env={**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"})
++    return result.stdout.strip()
++
++
++def _patch_id(repo: str, sha: str, deadline: float) -> str:
++    diff = _git(repo, ["show", "--format=", "--no-ext-diff", "--no-textconv", sha, "--"], deadline)
++    output = _git(repo, ["patch-id", "--stable"], deadline, data=diff)
++    return output.split()[0] if output else ""
++
++
++def _landed(repo: str, sha: str, deadline: float) -> dict | None:
++    full = _git(repo, ["rev-parse", "--verify", f"{sha}^{{commit}}"], deadline)
++    try:
++        upstream = _git(repo, ["symbolic-ref", "refs/remotes/origin/HEAD"], deadline)
++    except subprocess.CalledProcessError:
++        upstream = "refs/remotes/origin/main"
++    tip = _git(repo, ["rev-parse", "--verify", f"{upstream}^{{commit}}"], deadline)
++    try:
++        _git(repo, ["merge-base", "--is-ancestor", full, tip], deadline)
++        return None
++    except subprocess.CalledProcessError as exc:
++        if exc.returncode != 1:
++            raise
++    cherry = _git(repo, ["cherry", tip, full, f"{full}~1"], deadline)
++    if f"- {full}" not in cherry.splitlines():
++        return None
++    patch_id = _patch_id(repo, full, deadline)
++    if not patch_id:
++        return None
++    landed = _find_patch(repo, tip, full, patch_id, deadline)
++    if landed:
++        return {"repo": repo, "sha": full, "landed": landed, "upstream": upstream}
++    return None
++
++
++def _find_patch(repo: str, tip: str, full: str, patch_id: str, deadline: float) -> str | None:
++    # Stream diffs: no per-commit process loop and no full-history diff in Python memory.
++    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"}
++    log = subprocess.Popen(
++        ["git", "--no-pager", "-C", repo, "log", "--no-merges", "--no-ext-diff",
++         "--no-textconv", "--no-renames", "-p", tip, "--not", f"{full}~1", "--"],
++        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
++    try:
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            return None
++        ids = subprocess.run(["git", "-C", repo, "patch-id", "--stable"], stdin=log.stdout,
++                             capture_output=True, text=True, timeout=remaining, check=True, env=env)
++        if log.wait(timeout=max(0.001, deadline - time.monotonic())) != 0:
++            return None
++        for line in ids.stdout.splitlines():
++            parts = line.split()
++            if len(parts) == 2 and parts[0] == patch_id:
++                return parts[1]
++        return None
++    finally:
++        if log.poll() is None:
++            log.kill()
++        log.wait()
++        if log.stdout:
++            log.stdout.close()
++
++
++def detect(cmd: str, cwd: str) -> list[dict]:
++    """Return proven equivalents within a single bounded local-only budget; never fetch."""
++    deadline = time.monotonic() + BUDGET_SECONDS
++    hits = []
++    for repo, sha in ancestry_probes(cmd, cwd):
++        try:
++            hit = _landed(repo, sha, deadline)
++        except (OSError, subprocess.SubprocessError, UnicodeError):
++            continue
++        if hit and hit not in hits:
++            hits.append(hit)
++    return hits
++
++
++def wake_once(conn, task_id: str, cmd: str, hits: list[dict]) -> str | None:
++    """Apply within the caller's generation-checked transaction, once per repo/SHA."""
++    import json
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_wake_check import _wake
++
++    seen = set()
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                              (task_id, EVENT)):
++        payload = json.loads(raw or "{}")
++        seen.update((h["repo"], h["sha"]) for h in payload.get("premises", []))
++    fresh = [h for h in hits if (h["repo"], h["sha"]) not in seen]
++    if not fresh:
++        return None
++    note = "\n".join(
++        f"wake_check waits for {h['sha']}, which landed on {h['upstream']} as {h['landed']}; "
++        "the original identity is not upstream. "
++        f"Re-park on {h['landed']} or run the check now."
++        for h in fresh)
++    woke = _wake(conn, task_id, EVENT, {"wake_check": cmd, "premises": fresh, "note": note})
++    if woke:
++        kb.add_comment(conn, task_id, "kanban-dispatcher", note)
++    return woke
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 0b6e2f03a8d..c7503039b14 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -754,8 +754,12 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+                 # [daveey] Same failure, another producer: the card this park awaits is done but the probe can't
+                 # see it (a `hermes kanban show` of another gateway's card). No write txn is open here (ssh).
+                 producer = finished_producer(conn, task_id, cmd)
++            dead_ancestry = None
++            if rc == 1 and not output_error(out) and not answered and not producer:
++                from hermes_cli.kanban_dead_ancestry import detect
++                dead_ancestry = detect(cmd, cwd)
+             apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag,
+-                         answered=answered, producer=producer)
++                         answered=answered, producer=producer, dead_ancestry=dead_ancestry)
+         finally:
+             conn.close()
+         return rc
+@@ -767,7 +771,7 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str,
+                  *, generation: str, now: Optional[int] = None,
+                  diagnostics: Optional[dict] = None, answered: Optional[dict] = None,
+-                 producer: Optional[dict] = None) -> Optional[str]:
++                 producer: Optional[dict] = None, dead_ancestry: Optional[list[dict]] = None) -> Optional[str]:
+     """Record one probe result; wake the card on success or a broken probe. Returns the event
+     kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
+     that is no longer the card's (re-parked, unblocked) is dropped."""
+@@ -806,6 +810,11 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 kb.add_comment(conn, task_id, "kanban-dispatcher", note)
+             return woke
+         if rc == 1 and not output_error(out):
++            if dead_ancestry:
++                from hermes_cli.kanban_dead_ancestry import wake_once
++                woke = wake_once(conn, task_id, cmd, dead_ancestry)
++                if woke:
++                    return woke
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+                 "next_at = ? WHERE task_id = ?", (now, tail, now + int(state["every"]), task_id))
+diff --git a/tests/hermes_cli/test_kanban_dead_ancestry.py b/tests/hermes_cli/test_kanban_dead_ancestry.py
+new file mode 100644
+index 00000000000..4ee5d61ef9d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dead_ancestry.py
+@@ -0,0 +1,155 @@
++"""Real-git regression: a rebased PR head must not leave a park asleep."""
++import shlex
++import subprocess
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++
++
++def git(repo, *args):
++    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
++
++
++@pytest.fixture
++def history(tmp_path):
++    repo = tmp_path / "repo with spaces"
++    repo.mkdir()
++    git(repo, "init", "-b", "main")
++    git(repo, "config", "user.email", "test@example.com")
++    git(repo, "config", "user.name", "Test")
++    (repo / "base").write_text("base\n")
++    git(repo, "add", ".")
++    git(repo, "commit", "-m", "base")
++    base = git(repo, "rev-parse", "HEAD")
++    git(repo, "checkout", "-b", "feature")
++    (repo / "feature").write_text("patch\n")
++    git(repo, "add", ".")
++    git(repo, "commit", "-m", "feature")
++    old = git(repo, "rev-parse", "HEAD")
++    git(repo, "checkout", "main")
++    (repo / "independent").write_text("main advanced\n")
++    git(repo, "add", ".")
++    git(repo, "commit", "-m", "advance")
++    git(repo, "cherry-pick", old)
++    landed = git(repo, "rev-parse", "HEAD")
++    assert old != landed
++    git(repo, "update-ref", "refs/remotes/origin/main", landed)
++    git(repo, "checkout", "-b", "unmerged", base)
++    (repo / "other").write_text("unmerged\n")
++    git(repo, "add", ".")
++    git(repo, "commit", "-m", "other")
++    unmerged = git(repo, "rev-parse", "HEAD")
++    return repo, old, landed, unmerged
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        yield conn
++    kwc._shutdown_for_tests()
++
++
++def park(conn, cmd):
++    tid = kb.create_task(conn, title="ancestry fixture", assignee="worker")
++    assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                            wake_check=cmd, check_every=120)
++    return tid
++
++
++@pytest.mark.parametrize("target", ["old", "landed", "unmerged", "absent", "non-ancestry"])
++def test_scheduler_rebased_head_and_controls(board, history, target):
++    repo, old, landed, unmerged = history
++    sha = {"old": old, "landed": landed, "unmerged": unmerged,
++           "absent": "a" * 40, "non-ancestry": old}[target]
++    # Keep HEAD behind both feature identities, including the unmerged control.
++    git(repo, "checkout", "--detach", "HEAD~1")
++    cmd = f"git -C {shlex.quote(str(repo))} merge-base --is-ancestor {sha} HEAD"
++    if target == "absent":
++        cmd += " 2>/dev/null || exit 1"
++    elif target == "non-ancestry":
++        cmd = "test -f /no-such-ancestry-fixture"
++    tid = park(board, cmd)
++    now = int(time.time())
++    kwc.run_due_wake_checks(board, now=now, wait=True)
++    if target == "old":
++        assert kb.get_task(board, tid).status == "ready"
++        comments = kb.list_comments(board, tid)
++        assert any(old in c.body and landed in c.body for c in comments)
++    else:
++        assert kb.get_task(board, tid).status == "scheduled"
++        assert kwc.get_state(board, tid)["fails"] == 0
++    before = kb.list_comments(board, tid)
++    kwc.run_due_wake_checks(board, now=now + 121, wait=True)
++    assert kb.list_comments(board, tid) == before
++    if target == "old":
++        assert kb.schedule_task(board, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                                wake_check=cmd, check_every=120)
++        kwc.run_due_wake_checks(board, now=now + 242, wait=True)
++        assert kb.get_task(board, tid).status == "scheduled"
++        assert kb.list_comments(board, tid) == before
++
++
++def test_detector_default_branch_and_unknowns(history, tmp_path, monkeypatch):
++    from hermes_cli import kanban_dead_ancestry as dead
++
++    repo, old, landed, _ = history
++    cmd = f"git merge-base --is-ancestor {old[:12]} HEAD"
++    assert dead.detect(cmd, str(repo))[0]["landed"] == landed
++    git(repo, "update-ref", "refs/remotes/origin/trunk", landed)
++    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
++    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
++    assert dead.detect(cmd, str(repo))[0]["upstream"] == "refs/remotes/origin/trunk"
++    monkeypatch.setattr(dead, "BUDGET_SECONDS", 0)
++    assert dead.detect(cmd, str(repo)) == []
++    monkeypatch.setattr(dead, "BUDGET_SECONDS", 10)
++    git(repo, "update-ref", "-d", "refs/remotes/origin/trunk")
++    assert dead.detect(cmd, str(repo)) == []
++    assert dead.detect(cmd, str(tmp_path)) == []
++
++
++@pytest.mark.parametrize("template", [
++    "echo 'git merge-base --is-ancestor {sha} HEAD'",
++    "cd elsewhere && git merge-base --is-ancestor {sha} HEAD",
++    "git -C $REPO merge-base --is-ancestor {sha} HEAD",
++    "bash -c 'git merge-base --is-ancestor {sha} HEAD'",
++    "git -C 'unterminated merge-base --is-ancestor {sha} HEAD",
++])
++def test_parser_does_not_guess_shell_state(history, template):
++    from hermes_cli.kanban_dead_ancestry import detect
++
++    repo, old, _, _ = history
++    assert detect(template.format(sha=old), str(repo)) == []
++
++
++def test_parser_multiple_and_relative_paths(history):
++    from hermes_cli.kanban_dead_ancestry import detect
++
++    repo, old, landed, _ = history
++    cmd = (f"git -C {shlex.quote(repo.name)} merge-base --is-ancestor {old} HEAD; "
++           f"git -C {shlex.quote(str(repo))} merge-base --is-ancestor {old[:12]} HEAD")
++    hits = detect(cmd, str(repo.parent))
++    assert len(hits) == 1
++    assert hits[0]["landed"] == landed
++
++
++def test_stale_generation_does_not_wake(board, history):
++    from hermes_cli.kanban_dead_ancestry import detect
++
++    repo, old, _, _ = history
++    cmd = f"git -C {shlex.quote(str(repo))} merge-base --is-ancestor {old} HEAD"
++    tid = park(board, cmd)
++    hits = detect(cmd, str(repo))
++    assert hits
++    assert kwc.apply_result(board, tid, cmd, 1, "", generation="stale", dead_ancestry=hits) is None
++    assert kb.get_task(board, tid).status == "scheduled"
++    assert kb.list_comments(board, tid) == []
+-- 
+2.55.0
+

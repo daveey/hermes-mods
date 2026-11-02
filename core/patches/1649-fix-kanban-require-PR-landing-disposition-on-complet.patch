@@ -1,0 +1,549 @@
+From 34fe22e1f16f1244714d570e3357a9591df3e3aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 06:04:26 +0000
+Subject: [PATCH] fix(kanban): require PR landing disposition on completion
+ [daveey]
+
+Both tool and CLI completed OPEN PRs with green CI: the shared acceptance receipt only represented CI, not disposition. Local-only contracts skipped acceptance even when publishing. Existing CI fixtures asserted success for OPEN PRs and worker guidance did not name a landing handoff, so this lifecycle gap was encoded rather than detected.
+
+Carry PR state and require closure, merge, a live exact-PR same-board landing owner rechecked in the completion write transaction, or an explicit retained left-open reason. Preserve exact-head CI and no-required-check waiver semantics; accept CLOSED as disposition, not delivery. Update schema, built-in worker guidance, docs and done notices.
+
+RED: both actual registry tool and CLI replay completed the OPEN PR before the fix. GREEN: 307 passed, 1 skipped across 10 targeted files (48 landing cases); scripts/check --base origin/main: 15 checks passed. HTTP fixture replay names example-card / PR 621 and known abbreviated a4733f8e; its full SHA is synthetic, not invented historical evidence.
+---
+ agent/prompt_builder.py                       |   9 +-
+ gateway/kanban_watchers_notifier.py           |   3 +
+ hermes_cli/kanban_db_completion_payload.py    |   5 +
+ hermes_cli/kanban_pr_acceptance.py            |  12 +-
+ hermes_cli/kanban_pr_acceptance_store.py      |  23 ++-
+ hermes_cli/kanban_pr_landing.py               |  52 +++++
+ .../hermes_cli/test_kanban_park_invariants.py |   6 +-
+ tests/hermes_cli/test_kanban_pr_acceptance.py |   6 +-
+ tests/hermes_cli/test_kanban_pr_landing.py    | 183 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_pr_wake.py       |   5 +-
+ tools/kanban_tools_schemas.py                 |  13 +-
+ website/docs/user-guide/features/kanban.md    |  25 ++-
+ 12 files changed, 312 insertions(+), 30 deletions(-)
+ create mode 100644 hermes_cli/kanban_pr_landing.py
+ create mode 100644 tests/hermes_cli/test_kanban_pr_landing.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 7187d60e80c..6a3b2ee98ab 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -314,7 +314,14 @@ KANBAN_GUIDANCE = (
+     "`kanban_request_review(summary=..., metadata=..., reviewer=<optional-profile>)`. The reviewer approves with "
+     "`kanban_complete`, returns actionable rework with `kanban_request_changes`, or uses `kanban_block` only for a "
+     "genuine external escalation. Review is not a block, so repeated review cycles do not trip unblock-loop "
+-    "detection.\n"
++    "detection. PR contracts and `metadata.published_pr` (even on local-only cards) require a disposition. "
++    "For an OPEN PR, merge now with exact-head required CI green and every review comment (bots too) "
++    "answered (standing approval), or create an open same-board landing card bound to the exact PR and "
++    "pass `metadata.landing_owner=<card id>`. A review/release child alone is not a landing owner. "
++    "To deliberately leave a PR open, pass `metadata.pr_left_open={\"reason\": \"<nonblank reason>\"}`; "
++    "the reason is retained in the done notice. The hub batch only installs merged main; it never merges PRs. "
++    "MERGED still needs exact-head required CI; CLOSED is an accepted disposition, not delivery. "
++    "`metadata.contract_waiver` only waives absent required checks, never the landing gate.\n"
+     "6. **If follow-up work appears, create it; don't do it.** Use `kanban_create(title=..., assignee=<right-profile>, "
+     "parents=[your-task-id])` to spawn a child task for the appropriate specialist profile instead of scope-creeping "
+     "into the next thing.\n"
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 94d2beca0c1..a4046978621 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -405,6 +405,9 @@ def _fmt_completed(ev, n) -> tuple:
+     elif n.task and n.task.result:
+         from hermes_cli.kanban_final_send import public_summary
+         wake_handoff = _first_line(public_summary(n.task.result), 160)
++    from hermes_cli.kanban_pr_landing import left_open_notice
++    if disposition := left_open_notice(ev.payload):
++        wake_handoff = f"{wake_handoff}\n{disposition}" if wake_handoff else disposition
+     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
+     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+ 
+diff --git a/hermes_cli/kanban_db_completion_payload.py b/hermes_cli/kanban_db_completion_payload.py
+index a925fde1069..67df72bd4a3 100644
+--- a/hermes_cli/kanban_db_completion_payload.py
++++ b/hermes_cli/kanban_db_completion_payload.py
+@@ -21,6 +21,11 @@ def completed_event_payload(
+     if final_sends := parse_final_sends(event_summary):
+         payload["final_sends"] = final_sends
+     if isinstance(metadata, dict):
++        from hermes_cli.kanban_pr_landing import left_open_reason
++        if reason := left_open_reason(metadata):
++            payload["pr_left_open"] = {"reason": reason}
++        if metadata.get("landing_owner"):
++            payload["landing_owner"] = metadata["landing_owner"]
+         cleaned = _cleaned_artifact_paths(metadata)
+         if cleaned:
+             payload["artifacts"] = cleaned
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 16e03ca7c42..731655e4c78 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -205,13 +205,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         pr = repository["pullRequest"]
+         sha, branch = pr["headRefOid"], pr["baseRefName"]
+         receipt["head_sha"] = sha
++        receipt["pr_state"] = pr["state"]
+         if pr["state"] == "CLOSED":
+-            # Closed without merging (e.g. the code landed by a direct push): this PR can never
+-            # be accepted. Name it, and the way out: a new PR rebinds the contract. [daveey]
+-            receipt.update(classification="closed_unmerged",
+-                           detail=f"Bound PR {url} was closed without merging; it can never pass acceptance. "
+-                                  "Open (or find) the PR that carries the change and complete with "
+-                                  "metadata.published_pr=<that PR URL>; a closed-unmerged binding is replaced.")
++            # Closure is a disposition, not a claim that the change shipped.
++            receipt.update(ok=True, classification="closed", detail="PR closed without merging; not delivery.")
+             return receipt
+         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
+             raise ValueError("PR head is unavailable")
+@@ -267,6 +264,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
+             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
+             return receipt
++        if current["state"] not in {"open", "closed"}:
++            raise ValueError("PR state is unavailable")
++        receipt["pr_state"] = "MERGED" if current.get("merged") else current["state"].upper()
+         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
+         receipt["ok"] = receipt["classification"] == "success"
+         return receipt
+diff --git a/hermes_cli/kanban_pr_acceptance_store.py b/hermes_cli/kanban_pr_acceptance_store.py
+index e7433c34cf9..2564625eb67 100644
+--- a/hermes_cli/kanban_pr_acceptance_store.py
++++ b/hermes_cli/kanban_pr_acceptance_store.py
+@@ -16,14 +16,14 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+     if snapshot is None:
+         return False
+     run_id, status, contract = snapshot
+-    if not contract or contract == "local-only":
++    published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
++    if (not contract or contract == "local-only") and published_pr is None:
+         return None
+     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
+         return False
+-    published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
+     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
+-    # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
+-    if match and contract == match[1]:
++    # Publication binds once, including publications from initially local-only work.
++    if match and contract in (None, "local-only", match[1]):
+         with write_txn(conn):
+             if _snapshot(conn, task_id) != snapshot:
+                 return False
+@@ -31,10 +31,9 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+         snapshot = (run_id, status, published_pr)
+         contract = published_pr
+     elif match and published_pr != contract and (bound := _PR.fullmatch(contract)) and bound[1] == match[1]:
+-        # Publication binds once -- unless the bound PR was closed without merging (the
+-        # change shipped some other way). That PR can never be accepted, so a binding that
+-        # cannot be replaced parks the card forever. Rebind only on GitHub's positive
+-        # "closed, not merged" answer, and leave an audit event. [daveey]
++        # A closed-unmerged PR may be replaced when the change ships another way.
++        # Preserve that recovery path even though closure itself is now a valid
++        # disposition. Rebind only on GitHub's positive answer, with an audit event.
+         assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
+         if _kpa.pr_closed_unmerged(contract, assignee):
+             from hermes_cli.kanban_db import _append_event
+@@ -55,15 +54,19 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+         # The only waivable classification, judged on THIS fresh read: a repo that gained
+         # required checks (or a failing/missing/pending check) is never waived. [daveey]
+         receipt["waived"] = {"reason": reason}
+-    return snapshot, receipt
++    from hermes_cli.kanban_pr_landing import check_landing
++    check_landing(conn, task_id, receipt, metadata)
++    return snapshot, receipt, metadata
+ 
+ 
+ def record_acceptance(conn, task_id, acceptance):
+     """Called under complete_task's write_txn, before its terminal UPDATE."""
+     from hermes_cli.kanban_db import _append_event
+-    snapshot, receipt = acceptance
++    from hermes_cli.kanban_pr_landing import check_landing
++    snapshot, receipt, metadata = acceptance
+     if _snapshot(conn, task_id) != snapshot:
+         return False
++    check_landing(conn, task_id, receipt, metadata)
+     _append_event(conn, task_id, "pr_acceptance", receipt, run_id=snapshot[0])
+     if receipt.get("waived") and receipt.get("classification") == "no_required_checks":
+         acceptance_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+diff --git a/hermes_cli/kanban_pr_landing.py b/hermes_cli/kanban_pr_landing.py
+new file mode 100644
+index 00000000000..29b6ed62e9d
+--- /dev/null
++++ b/hermes_cli/kanban_pr_landing.py
+@@ -0,0 +1,52 @@
++"""PR disposition gate; owner checks are board-local SQLite reads, never network I/O."""
++from __future__ import annotations
++
++from hermes_cli.kanban_workflow import DEFAULT_WORKFLOW
++
++HUB_BATCH_CAVEAT = "The hub batch only installs merged main; it never merges PRs."
++LANDING_RECOVERY = (
++    "Merge now with exact-head required CI green and every review comment (bots too) answered "
++    "(standing approval), or create a landing card bound to this exact PR and pass "
++    "metadata.landing_owner=<card id>. To deliberately leave it open, pass "
++    'metadata.pr_left_open={"reason": "<nonblank reason>"}. ' + HUB_BATCH_CAVEAT
++)
++OPEN_STATUSES = frozenset(DEFAULT_WORKFLOW.keys()) - {"done"}
++
++
++def left_open_reason(metadata):
++    raw = metadata.get("pr_left_open") if isinstance(metadata, dict) else None
++    reason = raw.get("reason") if isinstance(raw, dict) else None
++    return reason.strip() if isinstance(reason, str) and reason.strip() else None
++
++
++def landing_disposition(conn, task_id, pr_url, metadata):
++    """Resolve explicit exception or a live exact-PR owner on this connection's board."""
++    if reason := left_open_reason(metadata):
++        return {"pr_left_open": {"reason": reason}}
++    owner = metadata.get("landing_owner") if isinstance(metadata, dict) else None
++    if not isinstance(owner, str) or owner == task_id:
++        return None
++    row = conn.execute("SELECT status, completion_contract FROM tasks WHERE id=?", (owner,)).fetchone()
++    if row and row["status"] in OPEN_STATUSES and row["completion_contract"] == pr_url:
++        return {"landing_owner": owner}
++    return None
++
++
++def check_landing(conn, task_id, receipt, metadata):
++    """Also called under the completion write transaction to close owner races."""
++    if receipt.get("pr_state") != "OPEN":
++        return
++    disposition = landing_disposition(conn, task_id, receipt["pr_url"], metadata)
++    if disposition:
++        receipt["landing"] = disposition
++    elif receipt["ok"] or receipt.get("waived"):
++        receipt.pop("waived", None)
++        receipt.pop("landing", None)
++        receipt.update(ok=False, classification="open_unlanded",
++                       detail=f"PR {receipt['pr_url']} is OPEN and has no valid landing disposition.",
++                       recovery=LANDING_RECOVERY)
++
++
++def left_open_notice(payload):
++    reason = left_open_reason(payload)
++    return f"PR deliberately left open: {reason}. {HUB_BATCH_CAVEAT}" if reason else ""
+diff --git a/tests/hermes_cli/test_kanban_park_invariants.py b/tests/hermes_cli/test_kanban_park_invariants.py
+index 7e2276d9e90..3162a2230d7 100644
+--- a/tests/hermes_cli/test_kanban_park_invariants.py
++++ b/tests/hermes_cli/test_kanban_park_invariants.py
+@@ -144,9 +144,9 @@ def test_closed_unmerged_pr_gets_its_own_classification(monkeypatch):
+     from hermes_cli import kanban_pr_acceptance as kpa
+     monkeypatch.setattr(kpa, "_api", _fake_api({610: "CLOSED"}))
+     receipt = kpa.collect_acceptance("https://github.com/acme/repo/pull/610", None)
+-    assert receipt["classification"] == "closed_unmerged"
+-    assert "authentication" not in receipt["detail"]
+-    assert "published_pr" in receipt["detail"]
++    assert receipt["ok"] and receipt["classification"] == "closed"
++    assert receipt["pr_state"] == "CLOSED"
++    assert "not delivery" in receipt["detail"]
+ 
+ 
+ def test_catch_all_failure_names_the_phase_not_gh_auth(monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_pr_acceptance.py b/tests/hermes_cli/test_kanban_pr_acceptance.py
+index f96e0375235..a956bd88c66 100644
+--- a/tests/hermes_cli/test_kanban_pr_acceptance.py
++++ b/tests/hermes_cli/test_kanban_pr_acceptance.py
+@@ -23,7 +23,7 @@ def github(tmp_path, monkeypatch):
+                 rule = None if state.get("no_required") else {"requiredStatusChecks": [
+                     {"context": "required", "app": {"databaseId": 1}}]}
+                 value = {"data": {"repository": {"pullRequest": {
+-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
++                    "headRefOid": sha, "baseRefName": "main", "state": state.get("pr_state", "MERGED"),
+                     "baseRef": {"branchProtectionRule": rule}},
+                     "defaultBranchRef": {"name": "main", "branchProtectionRule": rule}}}}
+             elif "/rules/branches/" in self.path:
+@@ -45,7 +45,9 @@ def github(tmp_path, monkeypatch):
+             elif "/statuses" in self.path:
+                 value = [[]]
+             elif "/pulls/" in self.path:
+-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
++                value = {"head": {"sha": sha}, "base": {"ref": "main"},
++                         "state": "open" if state.get("pr_state", "MERGED") == "OPEN" else "closed",
++                         "merged": state.get("pr_state", "MERGED") == "MERGED"}
+             else:
+                 self.send_error(404)
+                 return
+diff --git a/tests/hermes_cli/test_kanban_pr_landing.py b/tests/hermes_cli/test_kanban_pr_landing.py
+new file mode 100644
+index 00000000000..5e393c84d51
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_landing.py
+@@ -0,0 +1,183 @@
++"""Landing disposition enforced through both public completion entry paths."""
++import json
++import shlex
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++pytest_plugins = ["tests.hermes_cli.test_kanban_pr_acceptance"]
++
++PR = "https://github.com/daveey/hermes/pull/621"
++SUMMARY = "It is open and unmerged; landing and deploy ride the hourly hub batch per the card."
++
++
++def complete(surface, tid, metadata, monkeypatch):
++    if surface == "cli":
++        from hermes_cli import kanban
++        return kanban.run_slash(f"complete {tid} --summary {shlex.quote(SUMMARY)} --metadata {shlex.quote(json.dumps(metadata))}")
++    from tools.registry import registry
++    import tools.kanban_tools  # register the actual tool handler
++    with connect() as conn:
++        run_id = kb.claim_task(conn, tid).current_run_id
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return registry.dispatch("kanban_complete", {"summary": SUMMARY, "metadata": metadata})
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++def test_open_pr_cannot_complete_on_hourly_batch_promise(github, monkeypatch, surface):
++    github["pr_state"] = "OPEN"
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Replay t_01a19a73526daaa9 (known head a4733f8e)", completion_contract=PR)
++    output = complete(surface, tid, {}, monkeypatch)
++    with connect() as conn:
++        assert kb.get_task(conn, tid).status != "done", output
++    assert "landing_owner" in output
++    assert "hub batch" in output
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
++def test_terminal_pr_disposition(github, monkeypatch, surface, state):
++    github["pr_state"] = state
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Terminal PR", completion_contract=PR)
++    output = complete(surface, tid, {}, monkeypatch)
++    with connect() as conn:
++        assert kb.get_task(conn, tid).status == "done", output
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++def test_left_open_is_recorded_and_visible_in_done_notice(github, monkeypatch, surface):
++    from types import SimpleNamespace
++    from gateway.kanban_watchers_notifier import _fmt_completed
++    github["pr_state"] = "OPEN"
++    reason = "User requested a draft for later evaluation"
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Draft", completion_contract=PR)
++    output = complete(surface, tid, {"pr_left_open": {"reason": reason}}, monkeypatch)
++    with connect() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.status == "done", output
++        payload = json.loads(conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()[0])
++    assert payload["pr_left_open"] == {"reason": reason}
++    notice, wake, _ = _fmt_completed(SimpleNamespace(payload=payload), SimpleNamespace(task=task, head="Done", title="Draft"))
++    for text in (notice, wake):
++        assert reason in text
++        assert "hub batch only installs merged main" in text
++        assert "never merges PRs" in text
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++@pytest.mark.parametrize("owner_kind", ["ready", "done", "archived", "self", "wrong_pr", "missing"])
++def test_landing_owner_must_be_open_same_board_exact_pr(github, monkeypatch, surface, owner_kind):
++    github["pr_state"] = "OPEN"
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Implementation", completion_contract=PR)
++        owner = kb.create_task(conn, title="Landing", completion_contract=PR + "0" if owner_kind == "wrong_pr" else PR)
++        if owner_kind in {"done", "archived"}:
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (owner_kind, owner))
++        if owner_kind == "self":
++            owner = tid
++        if owner_kind == "missing":
++            owner = "t_not_on_this_board"
++    output = complete(surface, tid, {"landing_owner": owner}, monkeypatch)
++    with connect() as conn:
++        assert (kb.get_task(conn, tid).status == "done") is (owner_kind == "ready"), output
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++@pytest.mark.parametrize("change", ["done", "archived", "wrong_pr"])
++def test_owner_changes_after_prepare_are_rechecked_in_write_transaction(github, monkeypatch, surface, change):
++    from hermes_cli import kanban_pr_acceptance_store as store
++    github["pr_state"] = "OPEN"
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Implementation", completion_contract=PR)
++        owner = kb.create_task(conn, title="Landing", completion_contract=PR)
++    prepare = store.prepare_acceptance
++    def raced_prepare(conn, *args):
++        receipt = prepare(conn, *args)
++        assert receipt[1]["landing"] == {"landing_owner": owner}
++        with connect() as rival:
++            if change == "wrong_pr":
++                rival.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (PR + "0", owner))
++            else:
++                rival.execute("UPDATE tasks SET status=? WHERE id=?", (change, owner))
++        return receipt
++    monkeypatch.setattr(store, "prepare_acceptance", raced_prepare)
++    output = complete(surface, tid, {"landing_owner": owner}, monkeypatch)
++    with connect() as conn:
++        assert kb.get_task(conn, tid).status != "done", output
++    assert "landing_owner" in output
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++@pytest.mark.parametrize("mode", ["local_publication", "waiver", "blank_reason", "string_reason", "read_error"])
++def test_no_landing_bypasses(github, monkeypatch, surface, mode):
++    from hermes_cli import kanban_pr_acceptance as acceptance
++    github["pr_state"] = "OPEN"
++    metadata = {"published_pr": PR}
++    if mode == "waiver":
++        github["no_required"] = True
++        metadata["contract_waiver"] = {"reason": "Local tests green"}
++    if mode == "blank_reason":
++        metadata["pr_left_open"] = {"reason": " "}
++    if mode == "string_reason":
++        metadata["pr_left_open"] = "not the required object"
++    if mode == "read_error":
++        def unavailable(*args, **kwargs):
++            raise OSError("offline")
++        monkeypatch.setattr(acceptance, "_api", unavailable)
++        metadata["pr_left_open"] = {"reason": "Explicit exception does not waive read errors"}
++    with connect() as conn:
++        tid = kb.create_task(conn, title="No bypass", completion_contract="local-only" if mode == "local_publication" else PR)
++    output = complete(surface, tid, metadata, monkeypatch)
++    with connect() as conn:
++        assert kb.get_task(conn, tid).status != "done", output
++    assert ("infra" if mode == "read_error" else "landing_owner") in output
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++@pytest.mark.parametrize("fault", ["failure", "pending", "missing", "stale", "no_required"])
++def test_left_open_exception_preserves_ci_gate(github, monkeypatch, surface, fault):
++    github["pr_state"] = "OPEN"
++    if fault in {"failure", "pending"}:
++        github["conclusion"] = fault
++    else:
++        github[fault] = True
++    metadata = {"pr_left_open": {"reason": "Intentional draft"}}
++    if fault == "no_required":
++        metadata["contract_waiver"] = {"reason": "Local tests passed; no repo checks configured"}
++    with connect() as conn:
++        tid = kb.create_task(conn, title="CI still applies", completion_contract=PR)
++    output = complete(surface, tid, metadata, monkeypatch)
++    with connect() as conn:
++        assert (kb.get_task(conn, tid).status == "done") is (fault == "no_required"), output
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("surface", ["tool", "cli"])
++def test_owner_on_other_board_is_not_a_landing_owner(github, monkeypatch, tmp_path, surface):
++    github["pr_state"] = "OPEN"
++    other = tmp_path / "other-board.db"
++    kb.init_db(other)
++    with connect(other) as conn:
++        owner = kb.create_task(conn, title="Foreign landing", completion_contract=PR)
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Implementation", completion_contract=PR)
++    output = complete(surface, tid, {"landing_owner": owner}, monkeypatch)
++    with connect() as conn:
++        assert kb.get_task(conn, tid).status != "done", output
++    assert "landing_owner" in output
++
++
++
+diff --git a/tests/hermes_cli/test_kanban_pr_wake.py b/tests/hermes_cli/test_kanban_pr_wake.py
+index 9743d340574..b5d1ac716cb 100644
+--- a/tests/hermes_cli/test_kanban_pr_wake.py
++++ b/tests/hermes_cli/test_kanban_pr_wake.py
+@@ -122,7 +122,8 @@ def test_closed_pr_wakes_real_board_but_does_not_complete(probe, tmp_path, monke
+         assert kb.get_task(conn, tid).status == "ready", wakes.get_state(conn, tid)["last_out"]
+         context = kb.build_worker_context(conn, tid)
+         assert "reconcile" in context and "not acceptance" in context
+-        # Abandoned and superseded PRs are identical until independent evidence exists.
++        # Waking is still not completion; a fresh CLOSED read is accepted as disposition, not delivery.
+         monkeypatch.setattr(acceptance, "_api", lambda *a, **kw: {"data": {"repository": {"pullRequest": {"state": "CLOSED", "headRefOid": "a" * 40, "baseRefName": "main"}}}})
+         receipt = acceptance.collect_acceptance(URL, URL)
+-        assert not receipt["ok"] and receipt["classification"] == "closed_unmerged"
++        assert receipt["ok"] and receipt["classification"] == "closed"
++        assert "not delivery" in receipt["detail"]
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 52a64bf1d68..e2c5023aa41 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -114,7 +114,13 @@ KANBAN_COMPLETE_SCHEMA = _schema(
+         "in ``artifacts`` — the gateway notifier will upload them as "
+         "native attachments to the human who subscribed to the task, "
+         "so the deliverable lands in their chat alongside the summary "
+-        "instead of being a path they have to fetch by hand."
++        "instead of being a path they have to fetch by hand. PR contracts and metadata.published_pr "
++        "require a landing disposition: MERGED or CLOSED, or for OPEN an open same-board card "
++        "bound to the exact PR in metadata.landing_owner, or metadata.pr_left_open={\"reason\": "
++        "\"<nonblank reason>\"}. OPEN/MERGED still require exact-head required CI; contract_waiver "
++        "only waives absent required checks, never landing. Merge now with exact-head required CI green "
++        "and every review comment (bots too) answered (standing approval), or create the landing card. "
++        "The hub batch only installs merged main; it never merges PRs."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+@@ -856,7 +862,10 @@ KANBAN_CREATE_SCHEMA = _schema(
+         )),
+         "completion_contract": _prop("string", (
+             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
+-            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr. "
++            "OPEN/MERGED PRs require repository-required exact-head CI and a landing disposition. "
++            "On publication pass metadata.published_pr (also enforced on local-only cards). "
++            "OPEN needs metadata.landing_owner bound to the same PR on an open same-board card, "
++            "or metadata.pr_left_open={\"reason\": ...}; CLOSED is disposition, not delivery. "
+             "A repo with no required checks can only complete with metadata.contract_waiver={\"reason\": ...} "
+             "(prefer local-only there)."
+         )),
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 9b1e60f7ab9..34db16cf623 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -66,18 +66,35 @@ Declare PR work at creation with `--completion-contract OWNER/REPO` (or an exact
+ accepts the same `completion_contract`. Use `local-only` for intentionally local
+ work; existing and undeclared cards retain that default. Prose URLs are not policy.
+ 
+-After publishing, pass `metadata.published_pr` to completion. The first matching
+-URL binds the card permanently; retries cannot substitute a green sibling PR.
++After publishing, pass `metadata.published_pr` to completion, including for a card
++initially marked `local-only`. The first matching URL binds the card; retries cannot
++substitute a green sibling PR (a positively closed-unmerged binding can be replaced).
+ CLI `show --json` and `kanban_show` expose the persisted contract.
+ 
++An **OPEN** PR cannot complete merely because it was published or CI passed. Merge
++now with exact-head required CI green and every review comment (bots too) answered
++(standing approval), or create a landing card on the same board, bind its
++`completion_contract` to the exact PR URL, and pass `metadata.landing_owner=<card id>`.
++The owner must be another open card; self, done, archived, missing, and different-PR
++owners are refused. The owner is checked again under the completion write lock,
++without network I/O. A pre-created review/release child alone is not a landing owner.
++
++To deliberately leave the PR open instead, pass
++`metadata.pr_left_open={"reason": "<nonblank reason>"}`. The completed event and done
++notice retain that reason and the caveat: **the hub batch only installs merged main;
++it never merges PRs**. A **MERGED** PR still requires exact-head CI acceptance.
++A **CLOSED** PR is an accepted disposition, not a claim of delivery; its closure
++does not require green CI. GitHub read errors remain fail-closed.
++
+ The shared `complete_task` boundary covers worker tools, CLI, review approval and
+ dashboard completion. It reads classic branch protection and active ruleset
+ required contexts, paginates exact-head check runs and legacy statuses, then
+ re-reads the PR head/base. Optional failed/skipped telemetry does not veto accepted
+ required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
+ neutral **required** evidence cannot complete the card. Neither can zero-run
+-acceptance, unreadable policy or GitHub API failures. A repository without required
+-checks needs a local-only contract. `gh` must be authenticated with read access to
++acceptance, unreadable policy or GitHub API failures. For OPEN/MERGED PRs with no
++required checks, `metadata.contract_waiver={"reason": "<local verification>"}` waives
++only that CI condition, never the landing gate. `gh` must be authenticated with read access to
+ the repository's checks and rules; no remote writes are performed by this gate.
+ Acceptance reads run as the **assignee profile's** `gh` login — its `GH_TOKEN` /
+ `GH_CONFIG_DIR` from the profile's own `.env`, never the ambient login of the
+-- 
+2.55.0
+

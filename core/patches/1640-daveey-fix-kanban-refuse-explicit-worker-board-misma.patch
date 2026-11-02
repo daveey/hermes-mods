@@ -1,0 +1,199 @@
+From 0c91f347dd01ba3c3620ca782a62698038e9870c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 05:06:01 +0000
+Subject: [PATCH] [daveey] fix(kanban): refuse explicit worker board mismatches
+
+---
+ tests/tools/test_kanban_explicit_board_pin.py | 63 +++++++++++++++++++
+ tools/kanban_tools.py                         | 20 +-----
+ tools/kanban_tools_board.py                   | 54 ++++++++++++++++
+ tools/kanban_tools_schemas.py                 |  4 +-
+ 4 files changed, 121 insertions(+), 20 deletions(-)
+ create mode 100644 tests/tools/test_kanban_explicit_board_pin.py
+ create mode 100644 tools/kanban_tools_board.py
+
+diff --git a/tests/tools/test_kanban_explicit_board_pin.py b/tests/tools/test_kanban_explicit_board_pin.py
+new file mode 100644
+index 00000000000..b3ae28ef412
+--- /dev/null
++++ b/tests/tools/test_kanban_explicit_board_pin.py
+@@ -0,0 +1,63 @@
++"""Explicit tool board intent must not silently redirect a dispatcher worker."""
++import json
++from contextlib import closing
++
++import pytest
++
++
++@pytest.mark.parametrize("own_board", ["default", "team", pytest.param("linked", marks=pytest.mark.platforms("posix"))])
++def test_explicit_board_pin(monkeypatch, tmp_path, own_board):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools  # register real handlers
++    from tools.registry import registry
++
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_HOME", "HERMES_DELEGATED_CHILD_CONTEXT",
++                "HERMES_DELEGATED_CHILD_OWNER", "HERMES_ORIGIN_SESSION", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    paths = {slug: kb.board_own_db_path(slug) for slug in (own_board, "other")}
++    if own_board == "linked":
++        backing = tmp_path / "board-storage"
++        backing.mkdir()
++        paths[own_board].parent.parent.mkdir(parents=True)
++        paths[own_board].parent.symlink_to(backing, target_is_directory=True)
++    for slug in paths:
++        kb.create_board(slug)
++    with closing(kbc.connect(board=own_board)) as conn:
++        tid = kb.create_task(conn, title="worker", assignee="test-worker")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(paths[own_board]))
++    # A stale current-board hint must not override the database pin.
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "other")
++
++    def call(name, **args):
++        result = registry.dispatch(name, args)
++        assert isinstance(result, str)
++        return json.loads(result)
++
++    def rows(slug):
++        with closing(kbc.connect(db_path=paths[slug])) as conn:
++            return [tuple(row) for row in conn.execute("SELECT id, title FROM tasks ORDER BY id")]
++
++    before = {slug: rows(slug) for slug in paths}
++    create = dict(title="child", assignee="test-worker", requires=[], placement="local")
++    for result in (call("kanban_create", board="other", **create),
++                   call("kanban_show", board="other", task_id=tid)):
++        assert result.get("code") == "board_pinned", result
++        assert result["pinned_board"] == own_board
++        assert result["requested_board"] == "other"
++    assert {slug: rows(slug) for slug in paths} == before
++    assert call("kanban_show", board=own_board, task_id=tid)["task"]["id"] == tid
++    created = call("kanban_create", board=own_board, **create)
++    assert created.get("ok"), created
++    assert (created["task_id"], "child") in rows(own_board)
++    assert rows("other") == before["other"]
++
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    other = call("kanban_create", board="other", **{**create, "title": "other child"})
++    assert other.get("ok"), other
++    assert (other["task_id"], "other child") in rows("other")
++    assert (other["task_id"], "other child") not in rows(own_board)
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index fc76c17542d..39d24fb4d99 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -12,7 +12,7 @@ import json
+ import logging
+ import os
+ import time
+-from contextlib import contextmanager
++from tools.kanban_tools_board import tool_board as _board
+ from typing import Any, Callable, Optional
+ 
+ from agent.redact import redact_sensitive_text
+@@ -418,24 +418,6 @@ def _require_orchestrator_tool(tool_name: str) -> None:
+             "kanban_heartbeat, or kanban_comment for their assigned task.")
+ 
+ 
+-@contextmanager
+-def _board(board: Optional[str], *, quiet_close: bool = False):
+-    """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
+-    contexts. ``board=None`` keeps the env/symlink resolution chain; an explicit slug
+-    overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_db_connect as kbc
+-    conn = kbc.connect(board=board)
+-    try:
+-        yield kb, conn
+-    finally:
+-        try:
+-            conn.close()
+-        except Exception:
+-            if not quiet_close:
+-                raise
+-
+-
+ def _existing_task(kb, conn, tid: str):
+     task = kb.get_task(conn, tid)
+     _check(task is not None, f"task {tid} not found")
+diff --git a/tools/kanban_tools_board.py b/tools/kanban_tools_board.py
+new file mode 100644
+index 00000000000..876e5a9a623
+--- /dev/null
++++ b/tools/kanban_tools_board.py
+@@ -0,0 +1,54 @@
++"""Board contexts for Kanban tools, retaining dispatcher isolation. [daveey]"""
++from __future__ import annotations
++
++import os
++from contextlib import contextmanager
++from typing import Optional
++
++
++class BoardPinnedError(ValueError):
++    """The worker's explicit tool target disagrees with its pinned database."""
++
++    code = "board_pinned"
++
++    def __init__(self, requested: str, pinned: str):
++        self.tool_error_fields = {"requested_board": requested, "pinned_board": pinned}
++        super().__init__(
++            f"Board {requested!r} refused: this worker is pinned to board {pinned!r} "
++            "and cannot reach other boards. Omit board or use its pinned board. Nothing changed."
++        )
++
++
++def _check_explicit_worker_board(board: Optional[str]) -> None:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_sync import board_slug_for_path
++
++    pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
++    if board is None or not pin or not os.environ.get("HERMES_KANBAN_TASK"):
++        return
++    requested = kb._normalize_board_slug(board)
++    if requested is None:
++        return
++    # Infer from the actual DB pin, not a potentially stale current-board hint.
++    # Keep the lexical board name: resolving symlinks can erase boards/<slug>.
++    pinned = board_slug_for_path(pin)
++    if requested != pinned:
++        raise BoardPinnedError(requested, pinned)
++
++
++@contextmanager
++def tool_board(board: Optional[str], *, quiet_close: bool = False):
++    """Open the requested board, refusing silent worker-pin redirection."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    _check_explicit_worker_board(board)
++    conn = kbc.connect(board=board)
++    try:
++        yield kb, conn
++    finally:
++        try:
++            conn.close()
++        except Exception:
++            if not quiet_close:
++                raise
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 9b738b17417..52a64bf1d68 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -18,7 +18,9 @@ _DESC_BOARD = (
+     "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
+     "home → 'default'. Pass an explicit slug only when the caller (e.g. "
+     "a Telegram routing layer) needs to override the env-pinned active "
+-    "board for this one call."
++    "board for this one call. A dispatcher worker's explicit slug must match "
++    "its pinned database's board; a mismatch returns board_pinned rather than "
++    "silently using the pinned board (existing exact-target owner-wake grants excepted)."
+ )
+ 
+ 
+-- 
+2.55.0
+

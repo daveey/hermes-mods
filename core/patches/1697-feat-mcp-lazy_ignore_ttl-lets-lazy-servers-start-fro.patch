@@ -1,0 +1,189 @@
+From 252f9d51b604ca81213588d38baeeaa27e54eb12 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:25:45 -0800
+Subject: [PATCH] feat(mcp): lazy_ignore_ttl lets lazy servers start from a
+ ttlMs=0 schema cache [daveey]
+
+chrome-devtools-mcp answers tools/list with ttlMs: 0, so get_cached_entry
+always treated its cache entry as expired and lazy: true fell back to an
+eager spawn (~110 MB per agent process). Per-server lazy_ignore_ttl (default
+false) serves a fingerprint-matching entry whatever its TTL; the first real
+call still connects live and write-through refreshes the entry.
+---
+ tests/tools/test_mcp_lazy_start.py            | 61 +++++++++++++++++++
+ tests/tools/test_mcp_schema_cache_ttl.py      |  8 +++
+ tools/mcp_schema_cache.py                     |  8 ++-
+ tools/mcp_tool_discovery.py                   | 11 +++-
+ .../docs/reference/mcp-config-reference.md    |  1 +
+ website/docs/user-guide/features/mcp.md       |  1 +
+ 6 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tools/test_mcp_lazy_start.py b/tests/tools/test_mcp_lazy_start.py
+index f12cddf5dd4..ddfbe4d6941 100644
+--- a/tests/tools/test_mcp_lazy_start.py
++++ b/tests/tools/test_mcp_lazy_start.py
+@@ -369,3 +369,64 @@ class TestLazyMcpStatus:
+                 status["playwright"]["connected"]) == ("lazy", len(cached), False)
+         assert status["eager"]["status"] == "configured" and status["eager"]["tools"] == 0
+         assert status["live"]["status"] == "connected" and status["live"]["tools"] == 2
++
++
++class TestLazyIgnoreTtl:
++    """``lazy_ignore_ttl`` against a real on-disk entry carrying ``ttl_ms: 0`` (chrome-devtools-mcp)."""
++
++    @pytest.fixture(autouse=True)
++    def _isolated_cache(self, tmp_path, monkeypatch):
++        from tools import mcp_schema_cache as sc
++        monkeypatch.setattr(sc, "_cache_path", lambda: tmp_path / "cache.json")
++        self.sc = sc
++
++    def _config(self, **extra):
++        return {"chrome-devtools": {"command": "node", "args": ["cdt.js"], "lazy": True, **extra}}
++
++    def _seed(self, config, fingerprint=None):
++        cfg = config["chrome-devtools"]
++        fp = fingerprint or self.sc.config_fingerprint(cfg)
++        self.sc.write_cache_entry("chrome-devtools", fp, tools=_fake_cache_entry()["tools"], ttl_ms=0,
++                                  cache_scope="private")
++
++    def _register(self, config):
++        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
++             patch("tools.mcp_tool_registration._register_from_cache_sync",
++                   return_value=["mcp_chrome-devtools_browser_navigate"]) as mock_register, \
++             patch("tools.mcp_tool_discovery._discover_and_register_server",
++                   new_callable=AsyncMock) as mock_discover, \
++             patch("tools.mcp_tool_loop._ensure_mcp_loop"), \
++             patch("tools.mcp_tool_loop._run_on_mcp_loop") as mock_run:
++            _mcp_discovery.register_mcp_servers(config)
++        return mock_register, mock_discover, mock_run
++
++    def test_ttl_zero_entry_with_ignore_ttl_registers_lazily(self):
++        config = self._config(lazy_ignore_ttl=True)
++        self._seed(config)
++        mock_register, mock_discover, mock_run = self._register(config)
++        mock_register.assert_called_once()
++        mock_discover.assert_not_called()
++        mock_run.assert_not_called()
++
++    def test_ttl_zero_entry_without_ignore_ttl_stays_eager(self):
++        config = self._config()
++        self._seed(config)
++        mock_register, _mock_discover, mock_run = self._register(config)
++        mock_register.assert_not_called()
++        mock_run.assert_called_once()
++
++    @pytest.mark.parametrize("extra", [{}, {"lazy_ignore_ttl": True}])
++    def test_fingerprint_mismatch_stays_eager(self, extra):
++        config = self._config(**extra)
++        self._seed(config, fingerprint="stale-fingerprint")
++        mock_register, _mock_discover, mock_run = self._register(config)
++        mock_register.assert_not_called()
++        mock_run.assert_called_once()
++
++    def test_ignore_ttl_without_lazy_stays_eager(self):
++        config = self._config(lazy_ignore_ttl=True)
++        config["chrome-devtools"]["lazy"] = False
++        self._seed(config)
++        mock_register, _mock_discover, mock_run = self._register(config)
++        mock_register.assert_not_called()
++        mock_run.assert_called_once()
+diff --git a/tests/tools/test_mcp_schema_cache_ttl.py b/tests/tools/test_mcp_schema_cache_ttl.py
+index b1198336042..22a903cd34e 100644
+--- a/tests/tools/test_mcp_schema_cache_ttl.py
++++ b/tests/tools/test_mcp_schema_cache_ttl.py
+@@ -49,3 +49,11 @@ def test_cache_scope_round_trips():
+         "srv", "fp", tools=[{"name": "t"}], ttl_ms=60_000, cache_scope="private"
+     )
+     assert sc.get_cached_entry("srv", "fp")["cache_scope"] == "private"
++
++
++def test_ignore_ttl_serves_expired_entry(monkeypatch):
++    sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=0)
++    assert sc.get_cached_entry("srv", "fp") is None
++    assert sc.get_cached_entry("srv", "fp", ignore_ttl=True) is not None
++    # Fingerprint still gates the entry.
++    assert sc.get_cached_entry("srv", "other", ignore_ttl=True) is None
+diff --git a/tools/mcp_schema_cache.py b/tools/mcp_schema_cache.py
+index c78542c9b5a..ed3fcc8b7bc 100644
+--- a/tools/mcp_schema_cache.py
++++ b/tools/mcp_schema_cache.py
+@@ -56,18 +56,20 @@ def _save_all(data: dict[str, Any]) -> None:
+     atomic_json_write(_cache_path(), data, mode=0o600)
+ 
+ 
+-def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
++def get_cached_entry(server_name: str, fingerprint: str, *, ignore_ttl: bool = False) -> Optional[dict]:
+     """Return cached entry when fingerprint matches (and TTL holds), else None. ``tools/list``
+     results may carry ``ttlMs`` (SEP-2549); an entry older than a recorded TTL is a miss so the
+     next startup re-probes instead of serving a stale manifest forever. Entries without a TTL
+-    never expire. ``cacheScope`` is irrelevant: this cache is per-user local disk."""
++    never expire. ``cacheScope`` is irrelevant: this cache is per-user local disk.
++    ``ignore_ttl`` (per-server ``lazy_ignore_ttl``) serves a fingerprint match whatever its TTL:
++    some servers (chrome-devtools-mcp: ``ttlMs: 0``) would otherwise never start lazily. [daveey]"""
+     with _cache_lock:
+         entry = _load_all().get(server_name)
+     if not isinstance(entry, dict) or entry.get("fingerprint") != fingerprint:
+         return None
+     ttl_ms = entry.get("ttl_ms")
+     written_at = entry.get("written_at")
+-    expired = (isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float))
++    expired = (not ignore_ttl and isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float))
+                and (time.time() - written_at) * 1000.0 >= float(ttl_ms))
+     return None if expired else entry
+ 
+diff --git a/tools/mcp_tool_discovery.py b/tools/mcp_tool_discovery.py
+index 3eb3657d997..04d17ae1429 100644
+--- a/tools/mcp_tool_discovery.py
++++ b/tools/mcp_tool_discovery.py
+@@ -216,6 +216,14 @@ def _resolve_server_lazy(name: str, config: dict) -> bool:
+     return _parse_boolish(config.get("lazy", False), default=False)
+ 
+ 
++def _resolve_server_lazy_ignore_ttl(config: dict) -> bool:
++    """True when ``mcp_servers.<name>.lazy_ignore_ttl`` lets a lazy server start from a cache entry
++    past its server-declared ``ttlMs`` (default off). A server that answers ``tools/list`` with
++    ``ttlMs: 0`` (chrome-devtools-mcp) otherwise never registers lazily; the first real call still
++    connects live and write-through refreshes the entry. [daveey]"""
++    return _parse_boolish(config.get("lazy_ignore_ttl", False), default=False)
++
++
+ def _note_connect_failure(name: str, exc: BaseException) -> str:
+     """Record a failed connect (under ``_lock``): error text for status, cooldown stamp."""
+     message = _errors._format_connect_error(exc)
+@@ -415,7 +423,8 @@ def _register_lazy_from_cache(new_servers: dict[str, dict]) -> tuple[dict[str, d
+     for name, cfg in new_servers.items():
+         if not _resolve_server_lazy(name, cfg):
+             continue
+-        entry = get_cached_entry(name, config_fingerprint(cfg))
++        entry = get_cached_entry(name, config_fingerprint(cfg),
++                                 ignore_ttl=_resolve_server_lazy_ignore_ttl(cfg))
+         if not entry:
+             continue
+         with _core._lock:
+diff --git a/website/docs/reference/mcp-config-reference.md b/website/docs/reference/mcp-config-reference.md
+index 48e0c66eb13..ed1b7446935 100644
+--- a/website/docs/reference/mcp-config-reference.md
++++ b/website/docs/reference/mcp-config-reference.md
+@@ -62,6 +62,7 @@ mcp_servers:
+ | `transport` | string | HTTP | Set to `sse` to use the SSE transport instead of Streamable HTTP |
+ | `keepalive_interval` | number | both | Liveness ping cadence in seconds (floored at 5s). HTTP defaults to `180`; set it below the server's session TTL when the server GC's idle sessions quickly. Stdio disables keepalive when omitted; set a value to opt in explicitly |
+ | `lazy` | bool | both | Register the server's tools from the on-disk schema cache at startup and only spawn/connect it on the first tool call (default: `false`). Needs one prior live connect to fill the cache; a missing or stale entry falls back to the normal eager connect. Status surfaces show the server as `lazy` with its cached tool count until first use |
++| `lazy_ignore_ttl` | bool | both | With `lazy: true`, use a matching schema-cache entry even past the server's `tools/list` `ttlMs` (default: `false`). For servers that declare `ttlMs: 0` (e.g. chrome-devtools-mcp), which otherwise never start lazily. The first tool call still connects live and refreshes the cache |
+ | `idle_timeout_seconds` | number | stdio | Optional stdio server recycle after idle time (`0` disables). May also live under a `lifecycle:` mapping |
+ | `max_lifetime_seconds` | number | stdio | Optional stdio server recycle after age (`0` disables). May also live under a `lifecycle:` mapping |
+ | `tools` | mapping | both | Filtering and utility-tool policy |
+diff --git a/website/docs/user-guide/features/mcp.md b/website/docs/user-guide/features/mcp.md
+index 754de7fe2d4..d7e408b4797 100644
+--- a/website/docs/user-guide/features/mcp.md
++++ b/website/docs/user-guide/features/mcp.md
+@@ -499,6 +499,7 @@ Hermes reads MCP config from `~/.hermes/config.yaml` under `mcp_servers`.
+ | `timeout` | number | Tool call timeout |
+ | `connect_timeout` | number | Initial connection timeout (also bounds the MCP `initialize` handshake) |
+ | `lazy` | bool | If `true`, register the server's tools from the schema cache at startup and only start/connect it on the first tool call (default `false`). Needs one prior live connect to fill the cache. |
++| `lazy_ignore_ttl` | bool | With `lazy: true`, serve the cached schema even past the server's `tools/list` `ttlMs` (default `false`). Use it for servers that declare `ttlMs: 0`, which otherwise never start lazily. |
+ | `idle_timeout_seconds` | number | Recycle a stdio server after this many seconds without a tool call (`0` = never, default). The server restarts transparently on the next tool call. |
+ | `max_lifetime_seconds` | number | Recycle a stdio server after this total age (`0` = never, default). Restarts transparently on next use. |
+ | `enabled` | bool | If `false`, Hermes skips the server entirely |
+-- 
+2.55.0
+

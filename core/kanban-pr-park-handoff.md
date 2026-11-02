@@ -173,7 +173,7 @@ These were not rerun by the mirror pass.
 
 Untested:
 - Live cross-gateway transport and GitHub lookup; PR state is mocked to `OPEN`.
-- End-to-end synced PR comment provenance: the 1610 fixture replaces transported comments with an unattributed publication at the original time, isolating the checkpoint fix from `writer_run_id` remapping.
+- End-to-end synced PR comment provenance: the 1610 fixture replaced transported comments with an unattributed publication at the original time. Since 1636 the comment keeps its writer by `writer_run_uid` and the fixtures no longer re-add it; see [kanban-respawn-guard-hold.md](kanban-respawn-guard-hold.md).
 - CLI, registered tool and Desktop initiation of these follow-up cases; tests exercise database/dispatcher helpers directly.
 
 ### Applying

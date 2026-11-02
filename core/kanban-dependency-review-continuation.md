@@ -73,3 +73,16 @@ Standalone application is not certified.
 **Gotchas.** Checkpoints written before this patch have no `run_uid`. They resume only on the board that created them;
 after a sync they stay held until a fresh authenticated park. Don't hand-edit `run_uid` into a payload: a wrong value
 fails closed.
+
+## Follow-up patch (1645): review reassignment chronology across sync (test only)
+
+**1645** (`4508013661`, `test(kanban): pin review reassignment chronology`).
+
+- **Behavior covered.** After a completed `changes_required` review, reassigning the card to another assignee and
+  syncing it never lets the new owner resume the old owner's review checkpoint (`resumes_review` is false on the
+  replica). Whether the respawn guard still holds depends on chronology: an assignment strictly later than the PR
+  publication is an independent operator handoff and is released (`None`); an assignment in the same second keeps
+  `active_pr`. A `review_clock` fixture pins `time.time` so scheduling delays cannot pick which policy runs; the
+  existing `test_synced_invalid_review_or_owner_stays_held` now uses it too. No production code changes.
+- **Tests** (not rerun by this mirror pass): `tests/hermes_cli/test_kanban_dependency_review_sync.py::test_synced_reassignment_separates_review_from_operator_handoff`
+  (`assignment_delay` 0 and 1).

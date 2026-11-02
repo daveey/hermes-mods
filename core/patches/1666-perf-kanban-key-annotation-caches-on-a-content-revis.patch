@@ -1,0 +1,835 @@
+From ab8d9bb45db393ff59efe03523acb6efa76f03f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:15:05 +0000
+Subject: [PATCH] perf(kanban): key annotation caches on a content revision,
+ not board file stats [daveey]
+
+The session-list annotation's count fingerprint, per-board read memo and remote-links fingerprint were keyed
+on each board file's stat. On David-MBP bookkeeping writes the annotation never reads (kanban_sync_state
+stamps, kanban_dispatch_stamp, replica pull stamps) moved that key ~61x/min, so every sidebar poll re-read the
+boards and re-projected the links (example-card, part of example-card).
+
+- kanban_activity_revision: a one-row counter bumped by triggers (installed at connect init) on insert/delete
+  and on updates of read columns of the tables the readers read (boards: tasks, task_links, task_runs,
+  task_events, task_comments, kanban_notify_subs, task_chat_links; replicas: tasks, task_chat_links).
+  Claim/lease/heartbeat/sync/notifier-inflight columns are bookkeeping. Same-transaction triggers keep
+  read-your-writes. Readers fall back to the stat when any watched table lacks its triggers.
+- _activity_fingerprint and _board_memo use that key; replica link rows are memoized on it; _ledger_owners
+  is memoized on the projection's card identity.
+- An equal recompute keeps the published objects and _read_annotation_parts returns the previous frozen
+  parts, skipping freeze/copy work.
+
+Mac replay on DB copies (120 s, ~57 bookkeeping + 3 task writes/min, 1 poll/s): process CPU 3152 -> 1252
+ms/min, board reads 65 -> 6, poll p50 31 -> 10 ms.
+---
+ hermes_cli/kanban_activity_revision.py        | 162 ++++++++++++
+ hermes_cli/kanban_chat_links.py               |  55 +++-
+ hermes_cli/kanban_db_connect.py               |  12 +
+ hermes_cli/kanban_session_activity.py         | 123 ++++-----
+ hermes_cli/kanban_session_activity_hub.py     |  49 ++++
+ .../test_kanban_activity_revision.py          | 234 ++++++++++++++++++
+ 6 files changed, 552 insertions(+), 83 deletions(-)
+ create mode 100644 hermes_cli/kanban_activity_revision.py
+ create mode 100644 hermes_cli/kanban_session_activity_hub.py
+ create mode 100644 tests/hermes_cli/test_kanban_activity_revision.py
+
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+new file mode 100644
+index 00000000000..031fdd75fcc
+--- /dev/null
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -0,0 +1,162 @@
++"""Content revision of the rows the session-list kanban annotation reads, not of the file. [daveey]
++
++The annotation's caches (``kanban_session_activity``: count fingerprint, per-board read memo, remote-links
++fingerprint) were keyed on each board file's stat. A live board file is rewritten many times a minute by bookkeeping
++the annotation never reads (``kanban_sync_state`` stamps, ``kanban_dispatch_stamp``, wake-check probes, a replica's
++``pulled_at``), so on David-MBP the stat key moved ~61 times a minute with no task work and every sidebar poll
++re-read the boards and re-projected the remote links (t_01a19b0b602137c1).
++
++Each writer (``kanban_db_connect`` init) installs ``kanban_activity_revision``: a one-row counter bumped by triggers on
++every insert, delete, or update of a read column of the tables the annotation reads. Triggers run inside the writer's
++own transaction, so a committed task write is visible in the counter to the next reader (read-your-writes). Updates
++that only touch bookkeeping columns (``BOOKKEEPING_COLUMNS``: claim/lease/heartbeat/sync clocks, notifier in-flight
++marks) do not bump it; no activity reader selects those columns.
++
++Readers (``content_key``) only trust the counter when every table they read that exists in the file carries all three
++of its triggers; otherwise (older writer, dropped trigger, rebuilt file) they fall back to the file's stat, the
++previous behaviour. The key also carries the file identity and ``schema_version``, so a replaced file or a schema
++change always reads afresh.
++"""
++
++from __future__ import annotations
++
++import os
++import sqlite3
++from pathlib import Path
++from typing import Callable, Iterable
++
++REVISION_TABLE = "kanban_activity_revision"
++PREFIX = "kanban_activity_rev_"
++# What the local-board readers read: counts/parked/stalled/unseen (_read_board), linked-card rows and their
++# details (_read_session_tasks, _add_card_details), wait info. Not task_wake_checks (rewritten by every probe).
++LOCAL_TABLES = ("tasks", "task_links", "task_runs", "task_events", "task_comments", "kanban_notify_subs",
++                "task_chat_links")
++# A sync replica (``sync-shadow/<board>.db``) is read only for this gateway's chat links and their card rows
++# (``kanban_chat_links._read_replica``). Its events/runs mirror the whole board's traffic and are never read.
++SHADOW_TABLES = ("tasks", "task_chat_links")
++# Columns no activity reader selects, written by claims, leases, heartbeats, the sync apply path and the notifier's
++# delivery claim. An update that changes only these is bookkeeping.
++BOOKKEEPING_COLUMNS: dict[str, frozenset[str]] = {
++    "tasks": frozenset({"claim_lock", "claim_expires", "last_heartbeat_at", "worker_pid", "worker_started_at",
++                        "lease_holder", "lease_expires", "lease_version", "sync_version", "field_hlc"}),
++    "task_runs": frozenset({"claim_lock", "claim_expires", "last_heartbeat_at", "worker_pid", "worker_started_at",
++                            "sync_version"}),
++    "kanban_notify_subs": frozenset({"inflight_from", "inflight_pid", "inflight_start", "inflight_at",
++                                     "last_ping_event_id"}),
++}
++_BUMP = f"UPDATE {REVISION_TABLE} SET revision = revision + 1 WHERE id = 1;"
++
++
++def is_shadow(path: str | os.PathLike) -> bool:
++    from hermes_cli.kanban_db_sync import SHADOW_DIR
++    return Path(path).parent.name == SHADOW_DIR
++
++
++def tables_for(path: str | os.PathLike) -> tuple[str, ...]:
++    return SHADOW_TABLES if is_shadow(path) else LOCAL_TABLES
++
++
++def _quote(name: str) -> str:
++    return '"' + name.replace('"', '""') + '"'
++
++
++def wanted_triggers(conn: sqlite3.Connection, tables: Iterable[str]) -> dict[str, str]:
++    """Trigger name -> CREATE statement for the ``tables`` present in ``conn``, from their live columns."""
++    out: dict[str, str] = {}
++    for table in tables:
++        columns = [r[1] for r in conn.execute(f"PRAGMA table_info({_quote(table)})")]
++        if not columns:
++            continue  # table absent: nothing to read, nothing to watch
++        for op in ("INSERT", "DELETE"):
++            name = f"{PREFIX}{table}_{op.lower()}"
++            out[name] = f"CREATE TRIGGER {name} AFTER {op} ON {_quote(table)} BEGIN {_BUMP} END"
++        read = [c for c in columns if c not in BOOKKEEPING_COLUMNS.get(table, frozenset())]
++        changed = " OR ".join(f"OLD.{_quote(c)} IS NOT NEW.{_quote(c)}" for c in read)
++        name = f"{PREFIX}{table}_update"
++        out[name] = f"CREATE TRIGGER {name} AFTER UPDATE ON {_quote(table)} WHEN {changed} BEGIN {_BUMP} END"
++    return out
++
++
++def ensure_revision(conn: sqlite3.Connection, tables: Iterable[str]) -> None:
++    """Install or repair the counter and its triggers. No write on the normal (already installed) path; a
++    (re)install bumps the counter so readers that cached a key before the gap re-read."""
++    tables = tuple(tables)
++    wanted = wanted_triggers(conn, tables)
++    found = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                              (PREFIX + "*",)))
++    has_row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
++                           (REVISION_TABLE,)).fetchone() and conn.execute(
++        f"SELECT 1 FROM {REVISION_TABLE} WHERE id = 1").fetchone()
++    if has_row and found == wanted:
++        return
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute(f"CREATE TABLE IF NOT EXISTS {REVISION_TABLE} "
++                     "(id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL)")
++        conn.execute(f"INSERT OR IGNORE INTO {REVISION_TABLE} VALUES (1, 0)")
++        conn.execute(_BUMP)
++        for name in set(found) - set(wanted):
++            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++        for name, sql in wanted.items():
++            if found.get(name) != sql:
++                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++                conn.execute(sql)
++
++
++_READ_SQL = (f"SELECT r.revision, (SELECT schema_version FROM pragma_schema_version) FROM {REVISION_TABLE} r "
++             "WHERE r.id = 1")
++
++
++def read_key(conn: sqlite3.Connection, tables: Iterable[str]) -> tuple | None:
++    """``(revision, schema_version)`` when the counter covers every one of ``tables`` present in ``conn``, else None
++    (the caller falls back to the file's stat). Raises ``sqlite3.Error`` like any read."""
++    tables = tuple(tables)
++    conn.execute("BEGIN")  # one snapshot: the coverage check must describe the counter it vouches for
++    try:
++        watched = (*tables, REVISION_TABLE)
++        names = {r[0] for r in conn.execute(
++            "SELECT name FROM sqlite_master WHERE (type = 'trigger' AND name GLOB ?) "
++            f"OR (type = 'table' AND name IN ({','.join('?' * len(watched))}))", (PREFIX + "*", *watched))}
++        row = conn.execute(_READ_SQL).fetchone() if REVISION_TABLE in names else None
++    finally:
++        conn.execute("COMMIT")
++    if row is None:
++        return None
++    for table in tables:
++        if table in names and not all(f"{PREFIX}{table}_{op}" in names for op in ("insert", "update", "delete")):
++            return None
++    return (int(row[0]), int(row[1]))
++
++
++def file_stat(path: Path) -> tuple:
++    out = []
++    for p in (path, Path(str(path) + "-wal")):
++        try:
++            st = p.stat()
++            out.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
++        except FileNotFoundError:
++            out.append(None)
++    return tuple(out)
++
++
++def content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
++    """A key that changes whenever any row of ``tables`` that the readers read changes in ``path`` (and on file
++    replacement or schema change), but not on bookkeeping-only writes. ``open_ro(path)`` is a context manager
++    yielding a read-only connection (a kept one: the read is one indexed row plus the schema table). Falls back to
++    the file's stat when the counter can't vouch for ``tables``. Never gated on the stat: a commit inside one
++    mtime tick that leaves the WAL size unchanged would otherwise hide a task write from the next read."""
++    tables = tuple(tables)
++    stat = file_stat(path)
++    try:
++        with open_ro(path) as conn:
++            revision = read_key(conn, tables)
++    except sqlite3.Error:
++        revision = None
++    db = stat[0]
++    if revision is None or db is None:
++        return ("stat", stat)
++    return ("revision", db[0], db[1], *revision)
++
++
++def is_revision(key: tuple) -> bool:
++    return bool(key) and key[0] == "revision"
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 2baa030a841..90b7543815d 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -256,7 +256,10 @@ _last_good: dict[tuple[str, str, str], tuple[list[dict[str, Any]], Optional[floa
+ 
+ 
+ def _reset_for_tests() -> None:
++    global _owners_memo
+     _last_good.clear()
++    _replica_rows.clear()
++    _owners_memo = None
+ 
+ 
+ def _stale_after_s() -> float:
+@@ -279,19 +282,20 @@ def _read_replica(path: Path, gateway: str, profile: str) -> tuple[list[dict[str
+     owner's reconcile only manages its own chats' links and the origin's only its own board file. The origin's
+     ``shepherd`` link carries the verified release instead, so a done card stayed an ``unknown`` obligation forever
+     (sidebar "4 open" naming none, 2026-11-01)."""
+-    from hermes_cli.kanban_session_activity import cached_ro  # lazy: that module imports this one
++    from hermes_cli.kanban_activity_revision import SHADOW_TABLES, is_revision
++    from hermes_cli.kanban_session_activity import _board_content_key, cached_ro  # lazy: that module imports this one
++    # [daveey] The link rows only change with the replica's tasks/task_chat_links content; a pull that only moves
++    # ``pulled_at`` (every few seconds) re-reads the stamp, not the ~10k links. Rows are read-only to callers.
++    memo_key = (str(path), gateway, profile)
++    content = _board_content_key(path, SHADOW_TABLES)
++    hit = _replica_rows.get(memo_key)
+     with cached_ro(path) as conn:
+         conn.row_factory = sqlite3.Row
+-        rows = [dict(r) for r in conn.execute(
+-            "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
+-            "t.priority, t.block_kind, t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind, "
+-            "EXISTS (SELECT 1 FROM task_chat_links r WHERE r.task_id = l.task_id AND r.chat_gateway = l.chat_gateway "
+-            "AND r.chat_profile IS l.chat_profile AND r.chat_session = l.chat_session AND r.released = 1) "
+-            "AS chat_released "
+-            "FROM task_chat_links l LEFT JOIN tasks t ON t.id = l.task_id "
+-            "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 0 "
+-            "AND (t.id IS NULL OR (t.created_on IS NOT NULL AND t.created_on != ?))",
+-            (gateway, profile, gateway)).fetchall()]
++        # Only a trigger-backed revision vouches for the rows; a stat key (no counter) always reads.
++        rows = hit[1] if hit is not None and hit[0] == content and is_revision(content) else None
++        if rows is None:
++            rows = _read_replica_links(conn, gateway, profile)
++            _replica_rows[memo_key] = (content, rows)
+         try:
+             row = conn.execute("SELECT pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
+             pulled = float(row[0]) if row and row[0] is not None else None
+@@ -300,25 +304,54 @@ def _read_replica(path: Path, gateway: str, profile: str) -> tuple[list[dict[str
+     return rows, pulled
+ 
+ 
++# (replica path, gateway, profile) -> (content key, link rows) of the last ``_read_replica``.
++_replica_rows: dict[tuple[str, str, str], tuple[tuple, list[dict[str, Any]]]] = {}
++
++
++def _read_replica_links(conn: sqlite3.Connection, gateway: str, profile: str) -> list[dict[str, Any]]:
++    return [dict(r) for r in conn.execute(
++        "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
++        "t.priority, t.block_kind, t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind, "
++        "EXISTS (SELECT 1 FROM task_chat_links r WHERE r.task_id = l.task_id AND r.chat_gateway = l.chat_gateway "
++        "AND r.chat_profile IS l.chat_profile AND r.chat_session = l.chat_session AND r.released = 1) "
++        "AS chat_released "
++        "FROM task_chat_links l LEFT JOIN tasks t ON t.id = l.task_id "
++        "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 0 "
++        "AND (t.id IS NULL OR (t.created_on IS NOT NULL AND t.created_on != ?))",
++        (gateway, profile, gateway)).fetchall()]
++
++
+ def _ledger_owners(stale_ok: bool = False) -> dict[tuple[str, str], list[tuple[str, str, str, bool]]]:
+     """``(board, id) -> [(owner gateway, owner profile, session, released)]`` from the origin-ledger projection. A
+     synced board is one file per gateway with one row per id, shared by that gateway's profiles, so the replica
+     row carries no owner profile: the ledger only labels it (``_owner_of``). ``stale_ok`` is ``_remote_links``'s:
+     take the last projection instead of waiting on a rebuild."""
+     from hermes_cli.kanban_session_activity import _remote_links
++    global _owners_memo
+     try:
+         cards = _remote_links(stale_ok=True) if stale_ok else _remote_links()
+     except Exception as exc:  # health: allow BLE001 -- the profile is a label; a failed ledger read must not hide cards
+         _log.info("kanban chat links: owner profiles unavailable (%s: %s)", type(exc).__name__, exc)
+         return {}
++    # [daveey] ``_remote_links`` hands out a new list of the SAME read-only card dicts until it re-projects: the same
++    # cards (by identity; the memo holds them, so no id is reused) give the same owners. Rebuilding this index from
++    # ~5k cards was ~15 ms of every count recompute on David-MBP.
++    memo = _owners_memo
++    if memo is not None and len(memo[0]) == len(cards) and all(a is b for a, b in zip(memo[0], cards)):
++        return memo[1]
+     out: dict[tuple[str, str], list[tuple[str, str, str, bool]]] = {}
+     for c in cards:
+         if c.get("gateway") and c.get("board") and c.get("id") and c.get("profile"):
+             out.setdefault((str(c["board"]), str(c["id"])), []).append(
+                 (str(c["gateway"]), str(c["profile"]), str(c.get("session") or ""), bool(c.get("released"))))
++    _owners_memo = (cards, out)
+     return out
+ 
+ 
++# (cards, owners) of the last ``_ledger_owners`` build. Callers treat the owners map as read-only.
++_owners_memo: tuple[list[dict[str, Any]], dict[tuple[str, str], list[tuple[str, str, str, bool]]]] | None = None
++
++
+ def _owner_of(known: list[tuple[str, str, str, bool]], owner: Optional[str],
+               session: str) -> tuple[Optional[str], str]:
+     """The ONE (owner gateway, owner profile) for a replica card: the profile this chat's own unreleased ledger row
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 28d12c8499e..f1a534fe1f4 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -882,6 +882,17 @@ def _refuse_dead_board_resurrection(path: Path, board: Optional[str]) -> None:
+         raise ValueError(f"kanban board {slug!r} does not exist; create it with `hermes kanban boards create {slug}`")
+ 
+ 
++def _ensure_activity_revision(conn: sqlite3.Connection, resolved: str) -> None:
++    """Content revision for the session-list annotation's caches (``kanban_activity_revision``). Display-only: a
++    failure leaves the readers on their stat fallback and never fails the open. [daveey]"""
++    from hermes_cli import kanban_activity_revision as rev
++    try:
++        rev.ensure_revision(conn, rev.tables_for(resolved))
++    except sqlite3.Error as exc:
++        _kb._log.warning("kanban activity revision not installed on %s (%s); annotation caches stay stat-keyed",
++                         resolved, exc)
++
++
+ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> sqlite3.Connection:
+     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
+     every connection so a re-created file stays robust; the first connection
+@@ -949,6 +960,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+                 conn.executescript(_kb.SCHEMA_SQL)
+                 _migrate_add_optional_columns(conn)
+                 _kb._sync.install_or_remove(conn, resolved)
++                _ensure_activity_revision(conn, resolved)
+                 _INITIALIZED_PATHS.add(resolved)
+ 
+         conn, _ = _open_configured(path, _init_if_needed)
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 74c4a34bd59..667f9336e09 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -18,6 +18,9 @@ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli import kanban_activity_identity as _identity
+ from hermes_cli import kanban_annotation_disk as _annotation_copy
+ from hermes_cli import kanban_annotation_refresh as _bounded
++from hermes_cli import kanban_activity_revision as _revision
++from hermes_cli import kanban_session_activity_hub as _hub_signature
++from hermes_cli.kanban_session_activity_hub import _hub_content_signature
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+ from hermes_cli.kanban_session_activity_release import TERMINAL_STATUSES
+ from hermes_cli.kanban_session_activity_release import owner_attests_terminal as _owner_attests_terminal
+@@ -849,44 +852,6 @@ def _park_of(task: dict[str, Any]) -> dict[str, Any] | None:
+         return None
+ 
+ 
+-_HUB_SIGNATURE_SQL = ("SELECT coll, COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll IN ('tasks', 'gateway') "
+-                      "GROUP BY coll")
+-_hub_signature_memo: tuple | None = None  # ((path, stat key), signature)
+-
+-
+-def _hub_content_signature(hub: Path) -> tuple:
+-    """What the remote-links projection reads from the hub replica (``tasks`` and ``gateway`` rows, ``meta``
+-    gateway), not the file's stat: hub-sync rewrites ~10k ``sessions`` rows continuously, so a stat-keyed
+-    fingerprint changed on nearly every read and every caller re-projected 2.4k cards (~19% of a Desktop
+-    backend's GIL time, 2026-10-27). ``seq`` is the replica's global write sequence, so COUNT + MAX + TOTAL of it
+-    moves on any insert, update or delete of those rows. The query (~10 ms) re-runs only when the file's stat
+-    moves; an unreadable replica falls back to the stat itself. [daveey]"""
+-    global _hub_signature_memo
+-    stat_key = []
+-    for path in (hub, Path(str(hub) + "-wal")):
+-        try:
+-            st = path.stat()
+-            stat_key.append((st.st_ino, st.st_size, st.st_mtime_ns))
+-        except FileNotFoundError:
+-            stat_key.append(None)
+-    memo_key = (str(hub), tuple(stat_key))
+-    memo = _hub_signature_memo
+-    if memo is not None and memo[0] == memo_key:
+-        return memo[1]
+-    try:
+-        conn = _open_ro(hub)
+-        try:
+-            rows = tuple(tuple(r) for r in conn.execute(_HUB_SIGNATURE_SQL).fetchall())
+-            meta = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
+-        finally:
+-            conn.close()
+-        signature = (str(hub), stat_key[0][0] if stat_key[0] else None, rows, meta[0] if meta else None)
+-    except (sqlite3.Error, OSError):
+-        signature = memo_key
+-    _hub_signature_memo = (memo_key, signature)
+-    return signature
+-
+-
+ def _replica_paths() -> list[Path]:
+     """The board replicas the counts read when ``kanban.sync.links_reader`` is ``replica`` (else none), so a pull
+     that changes a chat's cards invalidates the cached counts like a local board write does. [daveey]"""
+@@ -902,21 +867,21 @@ def _replica_paths() -> list[Path]:
+ 
+ def _activity_fingerprint(*, include_shadows: bool = True) -> tuple:
+     """Count inputs include sync shadows; the origin-ledger projection never reads them."""
+-    paths = _board_db_paths()
+     hub = _hub_db_path()
+     signature = [_hub_content_signature(hub)] if hub is not None else []
++    # [daveey] Each board's content revision (``kanban_activity_revision``), not its stat: bookkeeping writes
++    # (sync stamps, dispatch stamps, a replica's pull stamp) rewrite the files ~61x/min with no task change.
++    signature.extend((str(db), _board_content_key(db)) for db in _board_db_paths())
+     if include_shadows:
+-        paths.extend(_replica_paths())
+-    for db in paths:
+-        for path in (db, Path(str(db) + "-wal")):
+-            try:
+-                st = path.stat()
+-                signature.append((str(path), st.st_ino, st.st_size, st.st_mtime_ns))
+-            except FileNotFoundError:
+-                signature.append((str(path), None))
++        signature.extend((str(db), _board_content_key(db, _revision.SHADOW_TABLES)) for db in _replica_paths())
+     return tuple(signature)
+ 
+ 
++def _board_content_key(path: Path, tables: tuple[str, ...] = _revision.LOCAL_TABLES) -> tuple:
++    """Changes on every write to a row the activity readers read in ``path`` (stat fallback without the counter)."""
++    return _revision.content_key(path, tables, cached_ro)
++
++
+ def _remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str, Any]] | None:
+     """Durable last-known origin obligations, separate from the replaceable hub replica.
+ 
+@@ -1334,16 +1299,26 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+             remote_keys.setdefault(sid, set()).add((str(card.get("key")), "stalled", False))
+         if card.get("stale"):
+             stale[sid] = stale.get(sid, 0) + 1
++    fresh = ((active, blocked, unseen, stale), {sid: frozenset(ids) for sid, ids in waiting.items()},
++             (parked, held), stalled, {sid: frozenset(keys) for sid, keys in remote_keys.items()},
++             {sid: frozenset(keys) for sid, keys in local_keys.items()})
+     with _cache_lock:
++        # [daveey] An unchanged answer keeps the published objects, so the annotation can tell by identity that
++        # nothing moved and reuse its frozen copy (``_read_annotation_parts``). Equal values, same answer.
++        if _cache is not None and _cache_scope == scope:
++            current = (tuple(_cache[1:5]), _waiting_cache[0], _parked_cache[0], _stalled_cache[0],
++                       _remote_keys_cache[0], _local_keys_cache[0])
++            fresh = tuple(old if old == new else new for old, new in zip(current, fresh))
++        counts, waiting_ids, parked_held, stalled, remote_ids, local_ids = fresh
+         _cache_scope = scope
+-        _cache = (now + _CACHE_TTL_S, active, blocked, unseen, stale)
++        _cache = (now + _CACHE_TTL_S, *counts)
+         _cache_fingerprint = fingerprint
+         _counts_generation += 1
+-        _waiting_cache[0] = {sid: frozenset(ids) for sid, ids in waiting.items()}
+-        _parked_cache[0] = (parked, held)
++        _waiting_cache[0] = waiting_ids
++        _parked_cache[0] = parked_held
+         _stalled_cache[0] = stalled
+-        _remote_keys_cache[0] = {sid: frozenset(keys) for sid, keys in remote_keys.items()}
+-        _local_keys_cache[0] = {sid: frozenset(keys) for sid, keys in local_keys.items()}
++        _remote_keys_cache[0] = remote_ids
++        _local_keys_cache[0] = local_ids
+         return _cached_count_result(include_waiting, include_snapshot)
+ 
+ 
+@@ -1360,24 +1335,13 @@ def _read_local_pairs_into(active: dict[str, int], blocked: dict[str, int],
+             _pairs_sink = None
+ 
+ 
+-# [daveey] Per-board read memo: {board path: (stat key, reads)}. A board whose kanban.db and -wal have not moved
+-# since its last read holds the same rows, so a write on one board re-reads that board only; the other boards cost
+-# a stat. Only the stall verdict depends on the clock, so the memo keeps its rows and re-judges them on each use.
+-# Touched only under ``_pairs_lock``.
++# [daveey] Per-board read memo: {board path: (content key, reads)}. A board whose read rows have not changed since
++# its last read (``_board_content_key``: bookkeeping writes do not count) holds the same answer, so a write on one
++# board re-reads that board only; the other boards cost a stat. Only the stall verdict depends on the clock, so the
++# memo keeps its rows and re-judges them on each use. Touched only under ``_pairs_lock``.
+ _board_memo: dict[str, tuple[tuple, dict[str, Any]]] = {}
+ 
+ 
+-def _board_stat(path: Path) -> tuple:
+-    out = []
+-    for p in (path, Path(str(path) + "-wal")):
+-        try:
+-            st = p.stat()
+-            out.append((st.st_ino, st.st_size, st.st_mtime_ns))
+-        except FileNotFoundError:
+-            out.append(None)
+-    return tuple(out)
+-
+-
+ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, Any], bool]:
+     """Every count read of one board, on its shared connection in one read transaction (one snapshot; five fresh
+     opens cost ~5 ms on a board with no rows): ``(reads, complete)``. ``complete`` is False when a display-only read
+@@ -1430,7 +1394,7 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+         _board_memo.pop(gone, None)
+     now = time.time()
+     for path in paths:
+-        key = _board_stat(path)
++        key = _board_content_key(path)
+         hit = _board_memo.get(str(path))
+         reads = hit[1] if hit is not None and hit[0] == key else None
+         if reads is not None and ((sink is not None and "parked" not in reads)
+@@ -1831,8 +1795,22 @@ def _read_annotation_parts() -> tuple:
+     except Exception:
+         _log.debug("kanban attention unavailable", exc_info=True)
+         attention = {}
+-    return _identity.freeze_annotation((
+-        active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys, extra, attention))
++    raw = (active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys, extra, attention)
++    # [daveey] Nothing moved since the last read of this scope: return that read's frozen copy instead of freezing an
++    # equal one. Safe: frozen parts are never mutated (every poll already shares one), and ``==`` per part (sets and
++    # frozensets compare by members) proves the copy is exactly what freezing ``raw`` would build. The same object
++    # also lets ``_annotation_copy.published`` skip its deep comparison.
++    scope = _origin_scope()
++    previous = _frozen_parts.get(scope)
++    if previous is not None and all(old is new or old == new for old, new in zip(previous, raw)):
++        return previous
++    frozen = _identity.freeze_annotation(raw)
++    _frozen_parts[scope] = frozen
++    return frozen
++
++
++# [daveey] Per origin scope, the last frozen annotation parts (``_read_annotation_parts``).
++_frozen_parts: dict[tuple[str, ...], tuple] = {}
+ 
+ 
+ def _refresh_annotation_locked(scope: tuple[str, ...]) -> tuple:
+@@ -2014,13 +1992,14 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+ 
+ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+     global _cache, _remote_last, _links_cache, _snapshot_saved, _remote_read_memo
+-    global _hub_signature_memo, _annotate_flight_scope, _annotate_flight_result, _annotate_waiters
++    global _annotate_flight_scope, _annotate_flight_result, _annotate_waiters
+     _remote_read_memo = None
+-    _hub_signature_memo = None
++    _hub_signature.reset()
+     _annotate_flight_scope = None
+     _annotate_flight_result = None
+     _annotate_waiters = 0
+     _last_annotation.clear()
++    _frozen_parts.clear()
+     _bounded.reset()
+     _annotation_copy.reset()
+     with _pairs_lock:
+diff --git a/hermes_cli/kanban_session_activity_hub.py b/hermes_cli/kanban_session_activity_hub.py
+new file mode 100644
+index 00000000000..92b08f1be03
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_hub.py
+@@ -0,0 +1,49 @@
++"""The hub replica's content signature behind the annotation's fingerprint (moved from kanban_session_activity)."""
++
++from __future__ import annotations
++
++import sqlite3
++from pathlib import Path
++
++_HUB_SIGNATURE_SQL = ("SELECT coll, COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll IN ('tasks', 'gateway') "
++                      "GROUP BY coll")
++_hub_signature_memo: tuple | None = None  # ((path, stat key), signature)
++
++
++def _hub_content_signature(hub: Path) -> tuple:
++    """What the remote-links projection reads from the hub replica (``tasks`` and ``gateway`` rows, ``meta``
++    gateway), not the file's stat: hub-sync rewrites ~10k ``sessions`` rows continuously, so a stat-keyed
++    fingerprint changed on nearly every read and every caller re-projected 2.4k cards (~19% of a Desktop
++    backend's GIL time, 2026-10-27). ``seq`` is the replica's global write sequence, so COUNT + MAX + TOTAL of it
++    moves on any insert, update or delete of those rows. The query (~10 ms) re-runs only when the file's stat
++    moves; an unreadable replica falls back to the stat itself. [daveey]"""
++    global _hub_signature_memo
++    from hermes_cli import kanban_session_activity as _ksa  # lazy: that module imports this one; tests spy _open_ro
++    stat_key = []
++    for path in (hub, Path(str(hub) + "-wal")):
++        try:
++            st = path.stat()
++            stat_key.append((st.st_ino, st.st_size, st.st_mtime_ns))
++        except FileNotFoundError:
++            stat_key.append(None)
++    memo_key = (str(hub), tuple(stat_key))
++    memo = _hub_signature_memo
++    if memo is not None and memo[0] == memo_key:
++        return memo[1]
++    try:
++        conn = _ksa._open_ro(hub)
++        try:
++            rows = tuple(tuple(r) for r in conn.execute(_HUB_SIGNATURE_SQL).fetchall())
++            meta = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
++        finally:
++            conn.close()
++        signature = (str(hub), stat_key[0][0] if stat_key[0] else None, rows, meta[0] if meta else None)
++    except (sqlite3.Error, OSError):
++        signature = memo_key
++    _hub_signature_memo = (memo_key, signature)
++    return signature
++
++
++def reset() -> None:
++    global _hub_signature_memo
++    _hub_signature_memo = None
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+new file mode 100644
+index 00000000000..c55fc3d9773
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -0,0 +1,234 @@
++"""The annotation's caches key on the content the readers read, not the board file (t_01a19b0b602137c1). [daveey]
++
++On David-MBP the live kanban.db, the sync replicas and hub.db are rewritten ~61 times a minute by bookkeeping (sync
++stamps, the dispatcher's pass stamp, a replica's pull stamp) with no task change; each write moved the stat-keyed
++fingerprint, so every sidebar poll re-read the boards and re-projected the remote links. A bookkeeping-only write
++must not force a recompute; a task write must, at once (read-your-writes).
++"""
++
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_suspend_ledger as ledger
++from tests.hermes_cli import kanban_sync_support as support
++
++ME, OTHER = "macbook", "hub"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    support.write_sync_config(home, True)  # the live layout: synced board with kanban_sync_state
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [])
++    ksa._reset_cache_for_tests()
++    links._reset_for_tests()
++    yield home
++    ksa._reset_cache_for_tests()
++    links._reset_for_tests()
++
++
++@pytest.fixture
++def board(home):
++    conn = kbc.connect(home / "kanban.db")
++    ledger.record_dispatch_pass(conn)  # the live board already has the dispatcher's stamp tables
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _count_board_reads(monkeypatch) -> list:
++    reads: list = []
++    real = ksa._read_board
++
++    def traced(path, **kw):
++        reads.append(path)
++        return real(path, **kw)
++
++    monkeypatch.setattr(ksa, "_read_board", traced)
++    return reads
++
++
++def _bookkeeping(conn) -> None:
++    """What the live board saw with no task work: sync and dispatcher stamps."""
++    sync.mark_pulled(conn)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET hlc_last = hlc_last || 'x'")
++    ledger.record_dispatch_pass(conn)
++
++
++def _expire_counts() -> None:
++    with ksa._cache_lock:
++        ksa._cache = None
++
++
++def test_bookkeeping_writes_do_not_move_the_fingerprint_or_reread_the_board(board, monkeypatch):
++    kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    reads = _count_board_reads(monkeypatch)
++    before = ksa._activity_fingerprint()
++    assert ksa.active_task_counts() == {"s_chat": 1} and len(reads) == 1
++    _bookkeeping(board)
++    assert ksa._activity_fingerprint() == before
++    _expire_counts()  # even a recompute (TTL expired) serves the board from its memo
++    assert ksa.active_task_counts() == {"s_chat": 1} and len(reads) == 1
++
++
++def test_a_task_write_moves_the_fingerprint_and_is_read_at_once(board, monkeypatch):
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    reads = _count_board_reads(monkeypatch)
++    assert ksa.active_task_counts() == {"s_chat": 1}
++    before = ksa._activity_fingerprint()
++    kb.complete_task(board, tid, result="ok")
++    assert ksa._activity_fingerprint() != before
++    # Read-your-writes: within the count cache's TTL, the very next read sees the write.
++    assert ksa.active_task_counts() == {} and len(reads) == 2
++
++
++@pytest.mark.parametrize("write", [
++    "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) VALUES (:t, 'tui', 's_other', 1)",
++    "INSERT INTO task_events (task_id, kind, created_at) VALUES (:t, 'completed', 1)",
++    "INSERT INTO task_links (parent_id, child_id) VALUES ('t_parent', :t)",
++    "UPDATE tasks SET status = 'blocked' WHERE id = :t",
++])
++def test_every_table_the_counts_read_moves_the_key(board, write):
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    before = ksa._board_content_key(ksa._board_db_paths()[0])
++    with kbc.write_txn(board):
++        board.execute(write, {"t": tid})
++    assert ksa._board_content_key(ksa._board_db_paths()[0]) != before
++
++
++def test_claim_and_heartbeat_columns_are_bookkeeping(board):
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    path = ksa._board_db_paths()[0]
++    before = ksa._board_content_key(path)
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET claim_expires = 99, last_heartbeat_at = 98, worker_pid = 7 WHERE id = ?",
++                      (tid,))
++    assert ksa._board_content_key(path) == before
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET title = 'renamed' WHERE id = ?", (tid,))
++    assert ksa._board_content_key(path) != before
++
++
++def test_a_missing_trigger_falls_back_to_the_file_stat(board):
++    kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    path = ksa._board_db_paths()[0]
++    assert rev.is_revision(ksa._board_content_key(path))
++    board.execute("DROP TRIGGER kanban_activity_rev_task_events_insert")
++    board.commit()
++    key = ksa._board_content_key(path)
++    assert key[0] == "stat"  # the counter no longer vouches for task_events: never trusted
++    _bookkeeping(board)
++    assert ksa._board_content_key(path) != key  # back to the old behaviour: any write moves it
++
++
++def test_reinstall_after_a_gap_moves_the_key(board, home):
++    path = ksa._board_db_paths()[0]
++    board.execute("DROP TRIGGER kanban_activity_rev_tasks_update")
++    board.commit()
++    gap = ksa._board_content_key(path)
++    rev.ensure_revision(board, rev.LOCAL_TABLES)
++    assert rev.is_revision(ksa._board_content_key(path)) and ksa._board_content_key(path) != gap
++
++
++def test_hub_bookkeeping_does_not_move_the_fingerprint(board, home):
++    hub_dir = home.parent / "hub-state"
++    hub_dir.mkdir()
++    hub = sqlite3.connect(hub_dir / "hub.db")
++    hub.executescript("CREATE TABLE replica (coll TEXT, gw TEXT, key TEXT, data TEXT, seq INTEGER, version INTEGER, "
++                      "updated_at INTEGER); CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);"
++                      "INSERT INTO meta VALUES ('gateway', 'macbook'), ('last_ok', '1');")
++    hub.commit()
++    before = ksa._activity_fingerprint()
++    hub.execute("UPDATE meta SET v = '2' WHERE k = 'last_ok'")
++    hub.commit()
++    assert ksa._activity_fingerprint() == before
++    hub.execute("INSERT INTO replica VALUES ('tasks', 'hub', 'default/t_x', '{}', 1, 1, 1)")
++    hub.commit()
++    assert ksa._activity_fingerprint() != before
++    hub.close()
++
++
++def _shadow(home):
++    path = home / "kanban" / sync.SHADOW_DIR / "default.db"
++    conn = kbc.connect(path)
++    return path, conn
++
++
++def test_shadow_key_ignores_pull_stamps_and_unread_tables(home):
++    path, conn = _shadow(home)
++    try:
++        assert rev.tables_for(path) == rev.SHADOW_TABLES
++        before = ksa._board_content_key(path, rev.SHADOW_TABLES)
++        assert rev.is_revision(before)
++        sync.mark_pulled(conn)
++        with kbc.write_txn(conn):  # a replicated event of a hub card: the replica's readers never read events
++            conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_hub', 'heartbeat', 1)")
++        assert ksa._board_content_key(path, rev.SHADOW_TABLES) == before
++        with kbc.write_txn(conn):
++            conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                         "released, created_at) VALUES ('u1', 't_hub', ?, 'default', 's1', 'shepherd', 0, 1)", (ME,))
++        assert ksa._board_content_key(path, rev.SHADOW_TABLES) != before
++    finally:
++        conn.close()
++
++
++def test_replica_rows_are_reread_only_when_their_content_moves(home, monkeypatch):
++    path, conn = _shadow(home)
++    try:
++        with kbc.write_txn(conn):
++            conn.execute("INSERT INTO tasks (id, title, status, created_at, created_on) "
++                         "VALUES ('t_hub', 'hub card', 'running', 1, ?)", (OTHER,))
++            conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                         "released, created_at) VALUES ('u1', 't_hub', ?, 'default', 's1', 'shepherd', 0, 1)", (ME,))
++        queries = []
++        real = links._read_replica_links
++        monkeypatch.setattr(links, "_read_replica_links", lambda *a: queries.append(1) or real(*a))
++        first = links.replica_cards(["s1"], ME, replicas=[("default", path)])
++        assert [c["id"] for c in first] == ["t_hub"] and len(queries) == 1
++        sync.mark_pulled(conn, at=12345.0)
++        again = links.replica_cards(["s1"], ME, replicas=[("default", path)])
++        assert len(queries) == 1 and again[0]["synced_at"] == 12345.0  # the stamp is still read every time
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't_hub'")
++        assert links.replica_cards(["s1"], ME, replicas=[("default", path)])[0]["status"] == links.UNKNOWN
++        assert len(queries) == 2
++    finally:
++        conn.close()
++
++
++def test_ledger_owners_rebuild_only_for_a_new_projection(monkeypatch):
++    links._reset_for_tests()
++    cards = [{"gateway": OTHER, "board": "default", "id": f"t_{i}", "profile": "default", "session": "s1"}
++             for i in range(3)]
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: list(cards))  # a fresh list, same cards
++    first = links._ledger_owners()
++    assert links._ledger_owners() is first
++    cards[1] = {**cards[1], "profile": "work"}  # a re-projection hands out new card dicts
++    assert links._ledger_owners()[("default", "t_1")] == [(OTHER, "work", "s1", False)]
++    links._reset_for_tests()
++
++
++def test_an_unchanged_annotation_reuses_its_frozen_parts(board, monkeypatch):
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    freezes = []
++    real = ksa._identity.freeze_annotation
++    monkeypatch.setattr(ksa._identity, "freeze_annotation", lambda parts: freezes.append(1) or real(parts))
++    first = ksa._read_annotation_parts()
++    _bookkeeping(board)
++    _expire_counts()  # a real recompute, with an equal answer
++    assert ksa._read_annotation_parts() is first and len(freezes) == 1
++    kb.complete_task(board, tid, result="ok")
++    changed = ksa._read_annotation_parts()
++    assert changed is not first and changed[0] == {} and len(freezes) == 2
+-- 
+2.55.0
+

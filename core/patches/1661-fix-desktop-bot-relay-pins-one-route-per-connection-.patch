@@ -1,0 +1,275 @@
+From 13eb835894cb8019c0c355ec391ae3831034e555 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:29:04 -0800
+Subject: [PATCH] fix(desktop): bot relay pins one route per connection, not
+ one per profile [daveey]
+
+The hermes-bots relay pinned (retainProfileSocket), roster-synced and
+drained every profile route of every connection. The gateway relay doors
+read one install root whichever profile serves them (_relay_root maps
+profiles/<p> to <root>), so the extra routes did no work, but each
+pin held a remote `hermes serve --isolated` backend's WebSocket open for
+the Desktop's lifetime. web_server_idle_exit never saw zero clients, and
+the mini carried 9 per-profile backends (~4.8 GB top MEM) whenever the
+MacBook Desktop was connected, holding the bb gate on memory pressure.
+
+relayRepresentativeRoutes() now keeps one route per connection (its
+default profile, else the first listed). Delivery still dials the exact
+target profile on demand, so its socket closes at refcount 0 and the
+backend idle-exits.
+
+Tests: relay.test.ts covers the many-profile connection (one pin, one
+roster.sync, one drain, on default), the no-default fallback, and
+drain-via-default with delivery on the exact target. Three existing
+assertions that encoded the per-profile premise were updated. A new
+gateway test pins that the doors share one root across profile backends.
+---
+ .../src/plugins/hermes-bots/relay.test.ts     | 87 +++++++++++++++----
+ apps/desktop/src/plugins/hermes-bots/relay.ts | 46 ++++++----
+ tests/tui_gateway/test_bot_relay_methods.py   | 36 ++++++++
+ 3 files changed, 139 insertions(+), 30 deletions(-)
+
+diff --git a/apps/desktop/src/plugins/hermes-bots/relay.test.ts b/apps/desktop/src/plugins/hermes-bots/relay.test.ts
+index 8be00078d66..11110f77144 100644
+--- a/apps/desktop/src/plugins/hermes-bots/relay.test.ts
++++ b/apps/desktop/src/plugins/hermes-bots/relay.test.ts
+@@ -380,17 +380,12 @@ describe('relay-route socket retention (#93594)', () => {
+     await vi.advanceTimersByTimeAsync(0)
+     await pushAndSettle()
+ 
+-    // Only the sole remaining connection's one-time roster clear goes out — once per profile
+-    // route, since each profile home holds its own roster; the local source is never polled.
++    // Only the sole remaining connection's one-time roster clear goes out, ONCE: relay state is
++    // install-wide on the gateway (every profile home shares one roster), so the connection's
++    // default route speaks for all its profiles; the local source is never polled.
+     // Two profiles of one connection are not peers: no profiles.list, nothing pinned.
+     expect(calls).toEqual([
+-      { connectionId: 'remote-primary', method: 'bot_relay.roster.sync', params: { agents: [] }, route: route('remote-primary', { primary: true }) },
+-      {
+-        connectionId: 'remote-primary',
+-        method: 'bot_relay.roster.sync',
+-        params: { agents: [] },
+-        route: route('remote-primary', { primary: true, profile: 'research' })
+-      }
++      { connectionId: 'remote-primary', method: 'bot_relay.roster.sync', params: { agents: [] }, route: route('remote-primary', { primary: true }) }
+     ])
+     expect(pins).toHaveLength(0)
+ 
+@@ -432,8 +427,11 @@ describe('relay-route socket retention (#93594)', () => {
+       // One profiles.list per connection, however many of its profiles are routed.
+       const lists = calls.filter(call => call.method === 'profiles.list').map(call => call.connectionId)
+       expect(lists.sort()).toEqual([...new Set(routes.map(item => item.connectionId))].sort())
+-      // Every eligible profile route (its own socket scope and outbox) is pinned exactly once.
+-      expect(pins.map(pin => pin.route)).toEqual(routes)
++      // Each eligible CONNECTION is pinned exactly once, on its default route (every fixture lists
++      // the default first): a pin per profile held one remote backend per profile warm forever.
++      expect(pins.map(pin => pin.route)).toEqual(
++        routes.filter((item, index) => routes.findIndex(other => other.connectionId === item.connectionId) === index)
++      )
+ 
+       stopBotRelay()
+     }
+@@ -458,6 +456,61 @@ describe('relay-route socket retention (#93594)', () => {
+     stopBotRelay()
+   })
+ 
++  it('pins, roster-syncs and drains a many-profile remote connection through ONE default route', async () => {
++    // The mini incident: a remote with nine profiles kept nine `serve --isolated` backends
++    // (~5 GB) warm because every profile route was pinned. Relay state is install-wide, so the
++    // connection's default route is the only socket the relay needs.
++    const named = ['bb-dev', 'bb-device', 'links', 'bb-voice'].map(profile => route('mini', { profile }))
++    hostMock.profileRoutes = vi.fn(async () => [...named.slice(0, 2), route('mini'), ...named.slice(2), route('peer')])
++    const pins = trackRetention()
++
++    const calls = respondWith(call =>
++      call.method === 'profiles.list' ? { profiles: [{ name: 'default' }] } : { envelopes: [] }
++    )
++
++    const { startBotRelay, stopBotRelay } = await loadRelay()
++
++    startBotRelay()
++    await vi.advanceTimersByTimeAsync(0)
++    await pushAndSettle(1, {})
++
++    expect(pins.map(pin => pin.route)).toEqual([route('mini'), route('peer')])
++
++    const miniRoutes = calls.filter(call => call.connectionId === 'mini').map(call => call.route)
++    expect(miniRoutes.length).toBeGreaterThan(0)
++    expect(miniRoutes.every(item => item.profile === 'default')).toBe(true)
++    expect(calls.filter(call => call.method === 'bot_relay.roster.sync').map(call => call.route)).toEqual([
++      route('mini'),
++      route('peer')
++    ])
++    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.route)).toEqual([
++      route('mini'),
++      route('peer')
++    ])
++
++    stopBotRelay()
++    expect(pins.every(pin => pin.released)).toBe(true)
++  })
++
++  it('falls back to the first listed route when a connection exposes no default profile', async () => {
++    hostMock.profileRoutes = vi.fn(async () => [
++      route('a', { profile: 'ops' }),
++      route('a', { profile: 'scout' }),
++      route('b', { profile: 'research' })
++    ])
++    const pins = trackRetention()
++
++    respondWith(() => ({ envelopes: [] }))
++    const { startBotRelay, stopBotRelay } = await loadRelay()
++
++    startBotRelay()
++    await pushAndSettle()
++
++    expect(pins.map(pin => pin.route)).toEqual([route('a', { profile: 'ops' }), route('b', { profile: 'research' })])
++
++    stopBotRelay()
++  })
++
+   it('releases exactly the pin of a connection that left the registry', async () => {
+     const pins = trackRetention()
+ 
+@@ -884,12 +937,14 @@ describe('the drain loop wires drain → deliver → reply', () => {
+     stopBotRelay()
+   })
+ 
+-  it('drains every sender profile and delivers on the exact target profile', async () => {
++  it('drains a connection once through its default route and delivers on the exact target profile', async () => {
++    // The gateway's outbox is install-wide (tui_gateway/methods_bot_relay._relay_root), so an
++    // envelope a non-default profile ('ops') queued is claimed through the default route.
+     const ops = { ...route('a'), profile: 'ops', targetProfile: 'ops' }
+-    hostMock.profileRoutes = vi.fn(async () => [route('a'), ops, route('b')])
++    hostMock.profileRoutes = vi.fn(async () => [ops, route('a'), route('b')])
+ 
+     const calls = respondWith(call => {
+-      if (call.method === 'bot_relay.outbox.drain') {return { envelopes: call.route.profile === 'ops' ? [envelope] : [] }}
++      if (call.method === 'bot_relay.outbox.drain') {return { envelopes: call.connectionId === 'a' ? [{ ...envelope, from_profile: 'ops' }] : [] }}
+ 
+       if (call.method === 'bot_relay.deliver') {return {status: 'settled', delivery_id: envelope.id, admission_id: 'admission', reply: 'isolated'}}
+ 
+@@ -899,8 +954,10 @@ describe('the drain loop wires drain → deliver → reply', () => {
+     const {startBotRelay, stopBotRelay} = await loadRelay()
+     startBotRelay()
+     await pushAndSettle()
++    expect(calls.filter(call => call.method === 'bot_relay.outbox.drain').map(call => call.route)).toEqual([route('a'), route('b')])
+     expect(calls.find(call => call.method === 'bot_relay.deliver')?.route).toEqual({...route('b'), profile: 'ops', targetProfile: 'ops'})
+-    expect(calls.find(call => call.method === 'bot_relay.reply')?.route).toEqual(ops)
++    expect(calls.find(call => call.method === 'bot_relay.reply')?.route).toEqual(route('a'))
++    expect(calls.some(call => call.route.profile === 'ops' && call.route.connectionId === 'a')).toBe(false)
+     stopBotRelay()
+   })
+ 
+diff --git a/apps/desktop/src/plugins/hermes-bots/relay.ts b/apps/desktop/src/plugins/hermes-bots/relay.ts
+index bc9beea890c..67cd93f9aae 100644
+--- a/apps/desktop/src/plugins/hermes-bots/relay.ts
++++ b/apps/desktop/src/plugins/hermes-bots/relay.ts
+@@ -254,9 +254,36 @@ function releaseRelayRetention() {
+   relayRouteRetentions.clear()
+ }
+ 
+-/** Every relay-eligible profile route, once each. The canonical gateway keeps a
+- *  roster and an outbox per profile home, so drain/roster/pins are per ROUTE;
+- *  the peer set (is there anything to relay between?) is per connection id. */
++/** One relay route per relay-eligible connection. The gateway's relay doors read
++ *  and write ONE install root whichever profile backend serves them
++ *  (`tui_gateway/methods_bot_relay._relay_root` maps `<root>/profiles/<p>` to
++ *  `<root>`: one roster, one outbox, one replies dir), so any profile's backend
++ *  answers roster.sync / outbox.drain / reply for the whole connection. Pinning a route per PROFILE held one remote
++ *  `hermes serve --isolated` backend per profile warm for the Desktop's whole
++ *  lifetime (~0.5 GB each, never idle-exited; mini memory pressure). The
++ *  representative is the connection's `default` profile route (the warm,
++ *  always-on backend) when listed, else its first route. Delivery still dials
++ *  the exact target profile on demand (deliverRelayEnvelope). */
++export function relayRepresentativeRoutes(routes: ProfileRoute[]): ProfileRoute[] {
++  const byConnection = new Map<string, ProfileRoute>()
++
++  for (const route of routes) {
++    const id = String(route?.connectionId || '')
++
++    if (!id) {
++      continue
++    }
++
++    const current = byConnection.get(id)
++
++    if (!current || (current.profile !== 'default' && route.profile === 'default')) {
++      byConnection.set(id, route)
++    }
++  }
++
++  return [...byConnection.values()]
++}
++
+ async function relayConnections(): Promise<RelayConnection[]> {
+   if (typeof host.profileRoutes !== 'function' || typeof host.requestProfile !== 'function') {
+     return []
+@@ -265,19 +292,8 @@ async function relayConnections(): Promise<RelayConnection[]> {
+   try {
+     const rawRoutes = await host.profileRoutes()
+     const routes = relayEligibleRoutes(Array.isArray(rawRoutes) ? rawRoutes : [])
+-    const byConnection = new Map<string, ProfileRoute>()
+-
+-    for (const route of routes) {
+-      const id = String(route?.connectionId || '')
+-
+-      const key = JSON.stringify(route)
+-
+-      if (id && !byConnection.has(key)) {
+-        byConnection.set(key, route)
+-      }
+-    }
+ 
+-    return [...byConnection.values()].map(route => ({
++    return relayRepresentativeRoutes(routes).map(route => ({
+       id: route.connectionId,
+       route
+     }))
+diff --git a/tests/tui_gateway/test_bot_relay_methods.py b/tests/tui_gateway/test_bot_relay_methods.py
+index 39aa93367b4..3916864e7b7 100644
+--- a/tests/tui_gateway/test_bot_relay_methods.py
++++ b/tests/tui_gateway/test_bot_relay_methods.py
+@@ -302,3 +302,39 @@ def test_gateway_drains_the_mailbox_the_tools_write_to(tmp_path, monkeypatch, su
+     assert methods_bot_relay._relay_root() == writer_root
+     drained = _result(srv._methods["bot_relay.outbox.drain"](1, {}))
+     assert [e["id"] for e in drained["envelopes"]] == [env["id"]]
++
++
++@pytest.mark.parametrize("writer,drainer", [("default", "profiles/ops"), ("profiles/ops", "default"),
++                                            ("profiles/ops", "profiles/scout")])
++def test_every_profile_of_one_install_shares_one_relay_mailbox(tmp_path, monkeypatch, writer, drainer):
++    """The Desktop relay pins, roster-syncs and drains ONE route per connection (its default profile;
++    apps/desktop/src/plugins/hermes-bots/relay.ts ``relayRepresentativeRoutes``). That is correct only
++    while the gateway's relay doors (roster.sync / outbox.drain / reply) answer from ONE install root
++    whichever profile's backend serves them: a roster pushed through one profile backend is read back
++    through another, and an envelope queued in the install-root outbox drains through any profile
++    backend. Scope: this pins the gateway doors only. Where a named profile's ``message_agent`` writes
++    (tools/bot_mode_dm.py, its own profile home) is a separate path not covered here."""
++    from tools.bot_mode_probe import _default_home, _hermes_root
++    from tools.bot_relay import read_remote_roster
++    from tui_gateway import methods_bot_relay
++
++    install = tmp_path / ".hermes"
++    monkeypatch.setenv("HOME", str(tmp_path))
++
++    def as_profile(sub: str) -> None:
++        home = install if sub == "default" else install / sub
++        home.mkdir(parents=True, exist_ok=True)
++        monkeypatch.setenv("HERMES_HOME", str(home))
++
++    as_profile(writer)
++    target = {"profile": "scout", "handle": "scout", "connection_id": "cloud-1",
++              "connection_label": "", "title": "", "description": ""}
++    env = bot_relay.enqueue_envelope(_hermes_root(Path(_default_home())), target=target, message="m",
++                                     sender_profile="ops", sender_handle="ops")
++    _result(srv._methods["bot_relay.roster.sync"](1, {"agents": [target]}))
++
++    as_profile(drainer)
++    assert methods_bot_relay._relay_root() == install
++    assert [row["profile"] for row in read_remote_roster(methods_bot_relay._relay_root())] == ["scout"]
++    drained = _result(srv._methods["bot_relay.outbox.drain"](2, {}))
++    assert [e["id"] for e in drained["envelopes"]] == [env["id"]]
+-- 
+2.55.0
+

@@ -1,0 +1,94 @@
+From 79929d70df37ea92206e25f6a5168747da1314e5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 03:39:59 +0000
+Subject: [PATCH] state.db repair: skip the pre-lock fingerprint read when the
+ ledger has no exhausted budget, so a queued repairer is not seen as a live
+ writer by its peer [daveey]
+
+A second repairer starved mid-read of the pre-lock fingerprint held state.db open while the lock
+winner's foreign-holder preflight ran; the winner skipped surgery as 'a live writer still holds
+state.db' (flake in test_two_processes_repairing_at_once_perform_surgery_once). The budget check
+now reads the ledger count first and only fingerprints when the count could exhaust the budget.
+---
+ hermes_state_repair.py                        | 10 +++++-
+ .../test_state_db_malformed_repair.py         | 36 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_state_repair.py b/hermes_state_repair.py
+index afd892fdf52..66c08d78b8e 100644
+--- a/hermes_state_repair.py
++++ b/hermes_state_repair.py
+@@ -381,6 +381,14 @@ def _persistent_repair_attempts_exhausted(db_path: Path) -> bool:
+     in-process claim and cross-process lock still bound one run). Fingerprint unavailable (live connection) ->
+     compare the SIZE the ledger recorded, otherwise a peer connection hides an exhausted budget on every pass."""
+     ledger = _read_repair_ledger(db_path)
++    # Count first, fingerprint only when it could matter: this runs BEFORE the cross-process repair lock, and
++    # the fingerprint's raw read holds state.db open, which a concurrent repairer's foreign-holder preflight
++    # (hermes_state_holders) correctly counts as a live writer and skips surgery (two repairers at startup).
++    try:
++        if int(ledger.get("failed_attempts", 0)) < _MAX_PERSISTENT_REPAIR_ATTEMPTS:
++            return False
++    except (TypeError, ValueError):
++        return False
+     recorded = ledger.get("fingerprint")
+     fp = _db_fingerprint(db_path)
+     try:  # size is the one key component that needs no raw read
+@@ -388,7 +396,7 @@ def _persistent_repair_attempts_exhausted(db_path: Path) -> bool:
+             isinstance(recorded, str) and recorded.startswith(f"{db_path.stat().st_size}:"))
+     except OSError:
+         return False
+-    return same and int(ledger.get("failed_attempts", 0)) >= _MAX_PERSISTENT_REPAIR_ATTEMPTS
++    return same
+ 
+ 
+ def _persistent_repair_exhausted_error(db_path: Path) -> str:
+diff --git a/tests/hermes_state/test_state_db_malformed_repair.py b/tests/hermes_state/test_state_db_malformed_repair.py
+index 4b01b4acda0..94e74464498 100644
+--- a/tests/hermes_state/test_state_db_malformed_repair.py
++++ b/tests/hermes_state/test_state_db_malformed_repair.py
+@@ -563,6 +563,42 @@ def test_two_processes_repairing_at_once_perform_surgery_once(tmp_path):
+         conn.close()
+ 
+ 
++def test_repair_does_not_read_state_db_before_taking_the_repair_lock(tmp_path, monkeypatch):
++    """A queued repairer must hold no state.db fd while a peer runs its foreign-holder preflight.
++
++    The pre-lock budget check fingerprinted the file (a raw open) even with no recorded failures. A
++    second repairer starved mid-read was then seen by the lock winner's holder scan as a live writer,
++    so the winner skipped surgery (the flake in
++    test_two_processes_repairing_at_once_perform_surgery_once).
++    """
++    db_path = tmp_path / "state.db"
++    _build_healthy_db(db_path)
++    _corrupt_duplicate_fts(db_path)
++
++    events: list[str] = []
++    real_fingerprint = hermes_state_repair._db_fingerprint
++    real_lock = hermes_state_repair._cross_process_repair_lock
++
++    def spy_fingerprint(path):
++        events.append("fingerprint")
++        return real_fingerprint(path)
++
++    @contextlib.contextmanager
++    def spy_lock(path):
++        with real_lock(path) as held:
++            events.append("lock")
++            yield held
++
++    monkeypatch.setattr(hermes_state_repair, "_db_fingerprint", spy_fingerprint)
++    monkeypatch.setattr(hermes_state_repair, "_cross_process_repair_lock", spy_lock)
++
++    report = repair_state_db_schema(db_path)
++
++    assert report["repaired"] is True, report
++    assert "lock" in events
++    assert "fingerprint" not in events[: events.index("lock")], events
++
++
+ def test_schema_surgery_bumps_the_schema_cookie(tmp_path):
+     """Live connections in other processes must be told to reload the schema.
+ 
+-- 
+2.55.0
+

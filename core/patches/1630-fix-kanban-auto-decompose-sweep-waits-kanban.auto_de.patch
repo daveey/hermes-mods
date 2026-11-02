@@ -1,0 +1,297 @@
+From e5654de882ad113af8a36527f61ae213b43f1be8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 03:06:45 +0000
+Subject: [PATCH] fix(kanban): auto-decompose sweep waits
+ kanban.auto_decompose_min_age_seconds (120 s) before taking a triage card
+ [daveey]
+
+Agents create triage cards as holds (test fixtures) and park them with kanban_schedule; the sweep
+specified them 6-16 s after creation and workers claimed them (defect kanban-76c77018a6, 5 cases in
+4 days). The dispatcher's sweep now skips triage cards younger than the window; manual decompose and
+decompose --all are unchanged. The kanban_create triage param says triage is not a hold.
+---
+ gateway/kanban_watchers_common.py             |  23 ++++
+ gateway/kanban_watchers_dispatcher.py         |  16 ++-
+ hermes_cli/config_defaults.py                 |   4 +-
+ hermes_cli/kanban_decompose.py                |  12 +-
+ .../test_kanban_auto_decompose_min_age.py     | 116 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |   6 +-
+ 6 files changed, 168 insertions(+), 9 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_auto_decompose_min_age.py
+
+diff --git a/gateway/kanban_watchers_common.py b/gateway/kanban_watchers_common.py
+index 2df2f52e47b..212c1f23717 100644
+--- a/gateway/kanban_watchers_common.py
++++ b/gateway/kanban_watchers_common.py
+@@ -87,6 +87,29 @@ def _resolve_auto_decompose_settings(load_config: Callable[[], Any]) -> tuple[bo
+     return bool(kcfg.get("auto_decompose", True)), max(per_tick, 1)
+ 
+ 
++AUTO_DECOMPOSE_MIN_AGE_DEFAULT = 120
++
++
++def _auto_decompose_min_age_seconds() -> int:
++    """``kanban.auto_decompose_min_age_seconds`` (default 120; 0 = sweep immediately), re-read per tick.
++
++    The auto-decompose sweep skips triage cards younger than this so a creator can park a triage
++    hold with ``kanban_schedule`` before it is specified and dispatched (fixture cards were specified
++    6-16 s after creation and ran, defect kanban-76c77018a6). Manual decompose/specify ignore it.
++    A config read error keeps the default window. [daveey]
++    """
++    try:
++        from hermes_cli.config import load_config
++
++        raw = ((load_config() or {}).get("kanban") or {}).get(
++            "auto_decompose_min_age_seconds", AUTO_DECOMPOSE_MIN_AGE_DEFAULT)
++        return max(int(AUTO_DECOMPOSE_MIN_AGE_DEFAULT if raw is None else raw), 0)
++    except Exception:
++        logger.warning("kanban.auto_decompose_min_age_seconds unreadable; using %ss",
++                       AUTO_DECOMPOSE_MIN_AGE_DEFAULT, exc_info=True)
++        return AUTO_DECOMPOSE_MIN_AGE_DEFAULT
++
++
+ def _gc_retention_days() -> int:
+     """``kanban.done_sub_retention_days`` (default 30; 0 disables), re-read per sweep; fails safe to 30."""
+     try:
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index 9d70227289d..c1940df14b7 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -15,7 +15,9 @@ from dataclasses import asdict, dataclass
+ from pathlib import Path
+ from typing import Any, Optional
+ 
+-from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
++from gateway.kanban_watchers_common import (
++    _auto_decompose_min_age_seconds, _board_slugs, _positive_int_setting, logger,
++)
+ 
+ 
+ def _kbc():
+@@ -324,12 +326,17 @@ class _KanbanDispatcher:
+                     logger.exception("kanban dispatcher: health probe failed on board %s", slug)
+         return False
+ 
+-    def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
++    def auto_decompose_tick(self, auto_decompose_per_tick: int, min_age_seconds: Optional[int] = None) -> int:
+         """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
+ 
+         Runs before dispatch fans out; the per-tick cap keeps a bulk triage
+-        load from burst-spending the aux LLM. Returns the number decomposed.
++        load from burst-spending the aux LLM. Triage cards younger than
++        ``min_age_seconds`` (default: ``kanban.auto_decompose_min_age_seconds``)
++        wait for a later tick. Returns the number decomposed.
+         """
++        if min_age_seconds is None:
++            min_age_seconds = _auto_decompose_min_age_seconds()
++        self._ad_min_age = max(int(min_age_seconds), 0)
+         try:
+             from hermes_cli import kanban_decompose as _decomp
+         except Exception as exc:  # pragma: no cover
+@@ -365,7 +372,8 @@ class _KanbanDispatcher:
+ 
+     def _decompose_board(self, decomp, slug, budget):
+         try:
+-            triage_ids = decomp.list_triage_ids(skip_awaiting_human=True)
++            triage_ids = decomp.list_triage_ids(
++                skip_awaiting_human=True, min_age_seconds=getattr(self, "_ad_min_age", 0))
+         except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:
+             logger.exception("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
+             return 0, 0
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 30c99f59c7f..db181ae5b90 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1964,9 +1964,9 @@ DEFAULT_CONFIG = {
+         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
+         # decompose <id>` or the dashboard's Decompose button.
+         "auto_decompose": True,
+-        # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
+-        # defers to the next tick.
++        # Max triage tasks decomposed per tick (bounds the aux-LLM burst); excess defers to next tick.
+         "auto_decompose_per_tick": 3,
++        "auto_decompose_min_age_seconds": 120,  # sweep skips younger triage cards; 0 = immediate
+         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
+         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
+         "dispatch_stale_timeout_seconds": 14400,
+diff --git a/hermes_cli/kanban_decompose.py b/hermes_cli/kanban_decompose.py
+index 2dca7e652c1..226a07b7fd9 100644
+--- a/hermes_cli/kanban_decompose.py
++++ b/hermes_cli/kanban_decompose.py
+@@ -19,6 +19,7 @@ from __future__ import annotations
+ 
+ import logging
+ import re
++import time
+ from dataclasses import dataclass
+ from typing import Optional
+ 
+@@ -366,17 +367,24 @@ def decompose_task(
+     return outcome
+ 
+ 
+-def list_triage_ids(*, tenant: Optional[str] = None, skip_awaiting_human: bool = False) -> list[str]:
++def list_triage_ids(*, tenant: Optional[str] = None, skip_awaiting_human: bool = False,
++                    min_age_seconds: int = 0, now: Optional[float] = None) -> list[str]:
+     """Return the triage task ids that are decomposition candidates.
+ 
+     Every sweep (the dispatcher's auto-decompose and ``decompose --all``) drops
+     cards that already ran or that ``block_loop_detected`` escalated, even after
+     a human comments on them (:func:`kanban_db.decomposition_refusal`); those wait
+     for ``promote``/``unblock``. ``skip_awaiting_human`` is kept for callers and
+-    is now implied. [daveey]
++    is now implied. ``min_age_seconds`` drops cards created less than that long
++    ago (the dispatcher's ``kanban.auto_decompose_min_age_seconds`` grace window,
++    so a creator can still ``kanban_schedule`` a triage hold); 0 keeps all. [daveey]
+     """
+     del skip_awaiting_human
++    cutoff = (time.time() if now is None else now) - max(int(min_age_seconds or 0), 0)
+     with kbc.connect_closing() as conn:
+         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
++        if min_age_seconds:
++            # An unparseable stamp (None) stays a candidate: excluding it would strand the card.
++            rows = [row for row in rows if row.created_at is None or row.created_at <= cutoff]
+         rows = [row for row in rows if kb.decomposition_refusal(conn, row.id) is None]
+     return [row.id for row in rows]
+diff --git a/tests/gateway/test_kanban_auto_decompose_min_age.py b/tests/gateway/test_kanban_auto_decompose_min_age.py
+new file mode 100644
+index 00000000000..272ece1d6bb
+--- /dev/null
++++ b/tests/gateway/test_kanban_auto_decompose_min_age.py
+@@ -0,0 +1,116 @@
++"""The dispatcher's auto-decompose sweep leaves fresh triage cards alone for a grace window.
++
++Agents create triage cards meant as holds (test fixtures, "park it for later" cards) and park them
++with ``kanban_schedule`` right after. Before ``kanban.auto_decompose_min_age_seconds`` the sweep
++specified such a card 6-16 s after creation and a worker claimed it seconds later (defect
++kanban-76c77018a6: fixture t_01a1949d723b06ac ran 3x). [daveey]
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from gateway.kanban_watchers_dispatcher import _KanbanDispatcher, _resolve_dispatcher_settings
++
++
++@pytest.fixture
++def env(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    kb.create_board("default")
++
++
++@pytest.fixture
++def board(env, monkeypatch):
++    dispatcher = _KanbanDispatcher(kb, _resolve_dispatcher_settings({}, kb))
++    monkeypatch.setattr(dispatcher, "_board_slugs", lambda: ["default"])
++    from hermes_cli import kanban_decompose as decomp
++
++    specified: list[str] = []
++
++    def fake_decompose(tid, *, author=None, **_kw):
++        specified.append(tid)
++        return decomp.DecomposeOutcome(tid, True, "ok")
++
++    monkeypatch.setattr(decomp, "decompose_task", fake_decompose)
++    return dispatcher, specified
++
++
++def _triage_card(title="fixture: park me", age_seconds=0):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title=title, triage=True)
++        if age_seconds:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET created_at = created_at - ? WHERE id = ?", (age_seconds, tid))
++    return tid
++
++
++def test_fresh_triage_card_waits_out_the_window_then_is_specified(board):
++    dispatcher, specified = board
++    fresh = _triage_card()
++    dispatcher.auto_decompose_tick(3)
++    assert fresh not in specified, "a triage card seconds old must not be auto-specified"
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_at = created_at - 121 WHERE id = ?", (fresh,))
++    dispatcher.auto_decompose_tick(3)
++    assert specified == [fresh]
++
++
++def test_triage_card_scheduled_inside_the_window_stays_scheduled(board):
++    dispatcher, specified = board
++    tid = _triage_card()
++    with kbc.connect_closing() as conn:
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z fixture hold",
++                                clock_only=True)
++    for _ in range(3):
++        dispatcher.auto_decompose_tick(3)
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        # Even once old, a scheduled card is not a triage candidate.
++        conn.execute("UPDATE tasks SET created_at = created_at - 600 WHERE id = ?", (tid,))
++    dispatcher.auto_decompose_tick(3)
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "scheduled"
++    assert specified == []
++
++
++def test_window_is_configurable_and_zero_restores_immediate_sweep(board, monkeypatch):
++    dispatcher, specified = board
++    from hermes_cli import config as hcfg
++
++    monkeypatch.setattr(hcfg, "load_config", lambda: {"kanban": {"auto_decompose_min_age_seconds": 0}})
++    fresh = _triage_card()
++    dispatcher.auto_decompose_tick(3)
++    assert specified == [fresh]
++
++
++def test_list_triage_ids_min_age_filter_and_manual_default(board):
++    from hermes_cli import kanban_decompose as decomp
++
++    fresh = _triage_card("fresh")
++    old = _triage_card("old", age_seconds=300)
++    # Manual sweeps (`decompose --all`) and the default keep every candidate.
++    assert set(decomp.list_triage_ids()) >= {fresh, old}
++    aged = decomp.list_triage_ids(min_age_seconds=120)
++    assert old in aged and fresh not in aged
++
++
++def test_manual_decompose_still_specifies_a_fresh_card(env, monkeypatch):
++    """`hermes kanban decompose <id>` / Specify is not gated by the sweep's window."""
++    from hermes_cli import kanban_decompose as decomp
++
++    calls = []
++    monkeypatch.setattr(decomp, "_call_aux", lambda *a, **k: calls.append(a) or (None, "no aux"))
++    tid = _triage_card("manual")
++    decomp.decompose_task(tid, author="david")
++    assert len(calls) == 1, "manual decompose of a seconds-old triage card must reach the specifier"
++
++
++def test_window_default_and_tool_text_warn_triage_is_not_a_hold():
++    from hermes_cli.config_defaults import DEFAULT_CONFIG
++    from gateway.kanban_watchers_common import AUTO_DECOMPOSE_MIN_AGE_DEFAULT
++    from tools import kanban_tools_schemas as schemas
++
++    assert DEFAULT_CONFIG["kanban"]["auto_decompose_min_age_seconds"] == AUTO_DECOMPOSE_MIN_AGE_DEFAULT == 120
++    assert "Triage is not a hold" in schemas.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["triage"]["description"]
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 0b4a527d194..9b7cde729d3 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -745,7 +745,11 @@ KANBAN_CREATE_SCHEMA = _schema(
+         "triage": _prop("boolean", (
+                 "If true, task lands in 'triage' instead of 'todo' "
+                 "— a specifier profile is expected to flesh out "
+-                "the body before work starts."
++                "the body before work starts. Triage is not a hold: the "
++                "auto-decomposer specifies and dispatches triage cards after "
++                "~2 min (kanban.auto_decompose_min_age_seconds); to keep a "
++                "card from running, park it with kanban_schedule right after "
++                "creating it."
+         )),
+         "distinct_from": {"type": "array", "items": {"type": "string"}, "description": (
+                 "Ids of open cards a create_overlap refusal named that this card is NOT a duplicate of. "
+-- 
+2.55.0
+

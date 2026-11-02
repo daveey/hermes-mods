@@ -1,0 +1,211 @@
+From 98f43570acc5b83387a295649a51bc26f3d93b2c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 10:24:20 +0000
+Subject: [PATCH] fix(tui): keep protocol frames out of gateway stdout logs
+ [daveey]
+
+---
+ tests/tui_gateway/test_protocol.py           |  5 +-
+ tests/tui_gateway/test_rpc_log_privacy.py    | 92 ++++++++++++++++++++
+ tests/tui_gateway/test_tui_gateway_server.py |  3 +
+ tui_gateway/server.py                        |  5 +-
+ tui_gateway/transport.py                     | 12 ++-
+ 5 files changed, 110 insertions(+), 7 deletions(-)
+ create mode 100644 tests/tui_gateway/test_rpc_log_privacy.py
+
+diff --git a/tests/tui_gateway/test_protocol.py b/tests/tui_gateway/test_protocol.py
+index 743dfb67535..3ed00b6f726 100644
+--- a/tests/tui_gateway/test_protocol.py
++++ b/tests/tui_gateway/test_protocol.py
+@@ -73,8 +73,9 @@ def server():
+ 
+ 
+ @pytest.fixture()
+-def capture(server):
+-    """Redirect server's real stdout to a StringIO and return (server, buf)."""
++def capture(server, monkeypatch):
++    """Redirect the explicitly selected stdio RPC channel to a StringIO."""
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", True)
+     buf = io.StringIO()
+     server._real_stdout = buf
+     return server, buf
+diff --git a/tests/tui_gateway/test_rpc_log_privacy.py b/tests/tui_gateway/test_rpc_log_privacy.py
+new file mode 100644
+index 00000000000..be33d44b3f8
+--- /dev/null
++++ b/tests/tui_gateway/test_rpc_log_privacy.py
+@@ -0,0 +1,92 @@
++"""Protocol stdout is opt-in; gateway stdout is a diagnostic log sink."""
++import io
++import json
++import logging
++
++import pytest
++
++from tui_gateway import server
++from tui_gateway.transport import StdioTransport, bind_transport, reset_transport
++
++
++@pytest.mark.parametrize("frame_kind", ["event", "request", "response"])
++@pytest.mark.parametrize("route", ["fallback", "session", "context"])
++def test_unrouted_rpc_never_reaches_gateway_log(tmp_path, monkeypatch, frame_kind, route):
++    path = tmp_path / "gateway.log"
++    payload = {"tool_id": "test-call", "name": "terminal", "result": "private-tool-result-marker"}
++    frames = {
++        "event": {"jsonrpc": "2.0", "method": "event", "params": {
++            "type": "tool.complete", "session_id": "unattached", "payload": payload}},
++        "request": {"jsonrpc": "2.0", "id": "srq-1", "method": "secret",
++                    "params": {"session_id": "unattached", "label": "private-tool-result-marker"}},
++        "response": {"jsonrpc": "2.0", "id": "1", "result": payload},
++    }
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", False)
++    if route == "session":
++        monkeypatch.setitem(server._sessions, "unattached", {"transport": server._stdio_transport})
++    token = bind_transport(server._stdio_transport if route == "context" else None)
++    handler = logging.FileHandler(path)
++    server.logger.addHandler(handler)
++    try:
++        with path.open("a") as out:
++            monkeypatch.setattr(server, "_real_stdout", out)
++            delivered = (server._emit("tool.complete", "unattached", payload) if frame_kind == "event"
++                         else server.write_json(frames[frame_kind]))
++            server.logger.error("real diagnostic remains visible")
++        handler.flush()
++        text = path.read_text()
++        assert "private-tool-result-marker" not in text
++        assert "jsonrpc" not in text
++        assert "real diagnostic remains visible" in text
++        assert delivered is False
++    finally:
++        reset_transport(token)
++        server.logger.removeHandler(handler)
++        handler.close()
++
++
++@pytest.mark.parametrize("stdio", [False, True])
++@pytest.mark.parametrize("name", ["terminal", "connectors__example__lookup"])
++def test_tool_completion_callback_respects_stdout_ownership(tmp_path, monkeypatch, stdio, name):
++    path = tmp_path / "gateway.log"
++    sid = "callback-privacy-test"
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", stdio)
++    monkeypatch.setattr(server, "_tool_progress_enabled", lambda sid: True)
++    monkeypatch.setattr(server, "_publish_session_control_snapshot", lambda *a, **kw: None)
++    monkeypatch.setitem(server._sessions, sid, {
++        "transport": server._stdio_transport,
++        "tool_result_metadata": {"call-1": {}},
++    })
++    token = bind_transport(None)
++    try:
++        with path.open("w") as out:
++            monkeypatch.setattr(server, "_real_stdout", out)
++            server._on_tool_complete(sid, "call-1", name, {}, "private-callback-result")
++        text = path.read_text()
++        if stdio:
++            assert json.loads(text)["params"]["payload"]["result"] == "private-callback-result"
++        else:
++            assert not text
++    finally:
++        reset_transport(token)
++
++
++@pytest.mark.parametrize("route", ["stdio", "context", "session"])
++def test_explicit_rpc_channels_still_deliver(monkeypatch, route):
++    import threading
++
++    out, log = io.StringIO(), io.StringIO()
++    transport = StdioTransport(lambda: out, threading.Lock())
++    monkeypatch.setattr(server, "_real_stdout", out if route == "stdio" else log)
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", route == "stdio")
++    if route == "session":
++        monkeypatch.setitem(server._sessions, "privacy-test", {"transport": transport})
++    token = bind_transport(transport if route == "context" else None)
++    try:
++        frame = {"jsonrpc": "2.0", "method": "event", "params": {
++            "type": "tool.complete", "session_id": "privacy-test", "payload": {"result": "delivered"}}}
++        assert server.write_json(frame) is True
++        assert json.loads(out.getvalue())["params"]["payload"]["result"] == "delivered"
++        assert not log.getvalue()
++    finally:
++        reset_transport(token)
+diff --git a/tests/tui_gateway/test_tui_gateway_server.py b/tests/tui_gateway/test_tui_gateway_server.py
+index d49fb69f9e1..1a30f66533e 100644
+--- a/tests/tui_gateway/test_tui_gateway_server.py
++++ b/tests/tui_gateway/test_tui_gateway_server.py
+@@ -1168,6 +1168,7 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
+         def flush(self) -> None:
+             return None
+ 
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", True)
+     monkeypatch.setattr(server, "_real_stdout", RecordingStdout())
+ 
+     barrier = threading.Barrier(8)
+@@ -1197,6 +1198,7 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
+ 
+ 
+ def test_write_json_returns_false_on_broken_pipe(monkeypatch):
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", True)
+     monkeypatch.setattr(server, "_real_stdout", _BrokenStdout())
+ 
+     assert server.write_json({"ok": True}) is False
+@@ -1210,6 +1212,7 @@ def test_write_json_unserializable_payload_becomes_error_frame(monkeypatch, capl
+     import logging
+ 
+     out = _ChunkyStdout()
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", True)
+     monkeypatch.setattr(server, "_real_stdout", out)
+     with caplog.at_level(logging.ERROR, logger="tui_gateway.transport"):
+         assert server.write_json({"jsonrpc": "2.0", "id": "profiles",
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index e501aed53d4..351c0f9b934 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -236,7 +236,7 @@ class _DropTransport:
+ 
+ # Module-level stdio transport — fallback sink when no transport is bound via contextvar or session.
+ # Stream resolved through a lambda so test monkey-patches of `_real_stdout` still land.
+-_stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
++_stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock, enabled=lambda: _stdio_is_rpc_channel)
+ 
+ # Detached websocket sessions use a drop sink instead of stdio: Desktop embeds the gateway in-process
+ # and captures stdout into logs, so stale frames must not fall through while a session awaits resume/reap.
+@@ -572,7 +572,8 @@ def _default_session_cwd() -> str:
+ def write_json(obj: dict) -> bool:
+     """Emit one JSON frame via the most-specific transport: (1) event frames with a session id → that
+     session's transport (async events reach the owner even from threads with no contextvar binding);
+-    (2) the context-bound transport (:func:`dispatch`); (3) module stdio (tests monkey-patch ``_real_stdout``).
++    (2) the context-bound transport (:func:`dispatch`); (3) module stdio only when the
++    stdio entrypoint explicitly owns stdout as its protocol channel (otherwise drop).
+     Every event frame gets a per-session monotonic ``seq`` + replay-ring entry so ``session.events.since`` can resume."""
+     from tui_gateway.event_replay import _stamp_event
+     from tui_gateway.hosted_room_member_activity import project_room_member_activity
+diff --git a/tui_gateway/transport.py b/tui_gateway/transport.py
+index cd0d20b9b48..4015034eba2 100644
+--- a/tui_gateway/transport.py
++++ b/tui_gateway/transport.py
+@@ -109,14 +109,20 @@ class StdioTransport:
+     """Writes JSON frames to a stream (usually ``sys.stdout``) resolved via a callable, so runtime
+     monkey-patches of the stream keep working."""
+ 
+-    __slots__ = ("_lock", "_stream_getter")
++    __slots__ = ("_enabled", "_lock", "_stream_getter")
+ 
+-    def __init__(self, stream_getter: Callable[[], Any], lock: threading.Lock) -> None:
++    def __init__(self, stream_getter: Callable[[], Any], lock: threading.Lock, *,
++                 enabled: Callable[[], bool] = lambda: True) -> None:
+         self._stream_getter = stream_getter
+         self._lock = lock
++        self._enabled = enabled
+ 
+     def write(self, obj: dict) -> bool:
+-        """Return ``True`` on success, ``False`` ONLY when the peer is gone (see :func:`_raise_unless_peer_gone`)."""
++        """Return false for a disabled channel or a gone peer; propagate other I/O failures."""
++        # Session records and lifecycle emitters may hold this sink directly, bypassing
++        # write_json. Enforce protocol ownership here, before serializing any payload.
++        if not self._enabled():
++            return False
+         # Serialization is OUTSIDE the lock so a large payload can't block other threads' frames.
+         line = serialize_frame(obj, "stdio", logger) + "\n"
+         with self._lock:
+-- 
+2.55.0
+

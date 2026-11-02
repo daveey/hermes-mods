@@ -1,0 +1,197 @@
+From e3b9bfd3d65682f2e08bf209c73c3474ccc63613 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:07:56 -0800
+Subject: [PATCH] [daveey] tests: bring test_tui_gateway_server.py peak RSS
+ from ~550 MB to ~390 MB
+
+Three causes, measured on example gateway (where the required CI runs):
+
+- tests/conftest.py: background threads a test leaves running read
+  HERMES_HUB_STATE after the per-test monkeypatch is undone, so they loaded
+  the host's live ~/.local/state/example gateway/hub.db (~40 MB of task rows per
+  read). Set a process-wide default that never exists. 578 -> ~520 MB.
+- plugins/dashboard_auth/basic: _DUMMY_HASH ran a 16 MiB scrypt at import;
+  fresh-home plugin discovery re-imports the plugin ~150x in this file and
+  the repeated 16 MiB blocks fragmented glibc. Use a fixed well-formed hash
+  with the live cost parameters (verify still runs one full scrypt; the
+  all-zero key never verifies, unlike the old dummy for its own password).
+  ~520 -> ~390 MB.
+- test_interrupt_error_after_tts_stop_still_resumes_wake spawned a real
+  compute-host process via an unstubbed _get_compute_host_supervisor.
+
+Tests: tests/test_conftest_hub_state_isolation.py and
+tests/plugins/dashboard_auth/test_basic_dummy_hash.py (both RED on the old
+code).
+---
+ plugins/dashboard_auth/basic/__init__.py      | 11 +++-
+ tests/conftest.py                             |  6 ++
+ .../dashboard_auth/test_basic_dummy_hash.py   | 62 +++++++++++++++++++
+ tests/test_conftest_hub_state_isolation.py    | 32 ++++++++++
+ tests/tui_gateway/test_tui_gateway_server.py  |  4 ++
+ 5 files changed, 113 insertions(+), 2 deletions(-)
+ create mode 100644 tests/plugins/dashboard_auth/test_basic_dummy_hash.py
+ create mode 100644 tests/test_conftest_hub_state_isolation.py
+
+diff --git a/plugins/dashboard_auth/basic/__init__.py b/plugins/dashboard_auth/basic/__init__.py
+index e1c31e09c50..a38de1c54b6 100644
+--- a/plugins/dashboard_auth/basic/__init__.py
++++ b/plugins/dashboard_auth/basic/__init__.py
+@@ -79,8 +79,15 @@ def _verify_password(password: str, encoded: str) -> bool:
+ 
+ 
+ # Verified against when the username is unknown so "no such user" and "wrong
+-# password" take comparable time.
+-_DUMMY_HASH = hash_password("dummy-password-for-constant-time-verify")
++# password" take comparable time. [daveey] A fixed, well-formed hash with the
++# live cost parameters: verifying against it runs the same scrypt as a real
++# hash, and building it costs nothing at import. Hashing a dummy password here
++# ran a 16 MiB scrypt on every plugin import (each fresh-home plugin discovery
++# re-imports it), which fragmented the allocator enough to put
++# tests/tui_gateway/test_tui_gateway_server.py ~125 MB over its RSS budget.
++# No password derives the all-zero key, so the dummy never verifies.
++_DUMMY_HASH = (f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}$"
++               f"{base64.b64encode(bytes(_SCRYPT_SALT_BYTES)).decode()}${base64.b64encode(bytes(_SCRYPT_DKLEN)).decode()}")
+ 
+ 
+ # ---- Token signing (stateless HMAC-signed blobs) ----
+diff --git a/tests/conftest.py b/tests/conftest.py
+index bf1b2d6c1b3..e987b4b8bd6 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -204,6 +204,12 @@ os.environ["HERMES_TEST_ISOLATION"] = os.environ.get("HERMES_HOME", "") or "1"
+ # ran a real `uv pip install boto3` into the shared venv while other files raced
+ # on whether botocore was importable yet.
+ os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
++# [daveey] The hermes-hub replica (hub.db) lives under the real HOME. The per-test fixture below points
++# HERMES_HUB_STATE at an empty per-test dir, but a background thread a test leaves running (session
++# outcome derivation, sidebar counts) reads it after that monkeypatch is undone and would load the host's
++# live replica: ~40 MB of task rows per read on hermes-hub, enough to push a long test file past the
++# per-file RSS budget. Process-wide default = a dir that never exists.
++os.environ["HERMES_HUB_STATE"] = os.path.join(tempfile.gettempdir(), f"hermes-test-no-hub-state-{os.getpid()}")
+ 
+ #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
+ #: module could import code that configures logging. Recorded so the guard in
+diff --git a/tests/plugins/dashboard_auth/test_basic_dummy_hash.py b/tests/plugins/dashboard_auth/test_basic_dummy_hash.py
+new file mode 100644
+index 00000000000..ee33aba04b1
+--- /dev/null
++++ b/tests/plugins/dashboard_auth/test_basic_dummy_hash.py
+@@ -0,0 +1,62 @@
++"""The unknown-username dummy hash: free at import, same scrypt cost at verify. [daveey]
++
++Building it with ``hash_password`` ran a 16 MiB scrypt on every import of the plugin; fresh-home plugin
++discovery re-imports it, and in tests/tui_gateway/test_tui_gateway_server.py the repeated 16 MiB blocks
++fragmented the allocator by ~125 MB of peak RSS.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import importlib.util
++from pathlib import Path
++
++import pytest
++
++import plugins.dashboard_auth.basic as basic_plugin
++from hermes_cli.dashboard_auth import InvalidCredentialsError
++
++
++def _counting_scrypt(monkeypatch):
++    calls = []
++    real = hashlib.scrypt
++
++    def _scrypt(password, **kwargs):
++        calls.append(kwargs)
++        return real(password, **kwargs)
++
++    monkeypatch.setattr(hashlib, "scrypt", _scrypt)
++    return calls
++
++
++def test_importing_the_plugin_runs_no_scrypt(monkeypatch):
++    calls = _counting_scrypt(monkeypatch)
++    path = Path(basic_plugin.__file__)
++    spec = importlib.util.spec_from_file_location("_basic_auth_import_probe", path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    assert calls == []
++    assert module._DUMMY_HASH == basic_plugin._DUMMY_HASH
++
++
++def test_dummy_hash_carries_the_live_cost_parameters():
++    scheme, n, r, p, salt_b64, dk_b64 = basic_plugin._DUMMY_HASH.split("$")
++    assert scheme == "scrypt"
++    assert (int(n), int(r), int(p)) == (basic_plugin._SCRYPT_N, basic_plugin._SCRYPT_R, basic_plugin._SCRYPT_P)
++    assert len(base64.b64decode(salt_b64)) == basic_plugin._SCRYPT_SALT_BYTES
++    assert len(base64.b64decode(dk_b64)) == basic_plugin._SCRYPT_DKLEN
++
++
++@pytest.mark.parametrize("password", ["dummy-password-for-constant-time-verify", "hunter2", ""])
++def test_unknown_username_still_pays_one_full_cost_scrypt_and_is_refused(monkeypatch, password):
++    provider = basic_plugin.BasicAuthProvider(
++        username="admin", password_hash=basic_plugin.hash_password("right"), secret=b"s" * 32)
++    calls = _counting_scrypt(monkeypatch)
++    with pytest.raises(InvalidCredentialsError):
++        provider.complete_password_login(username="someone-else", password=password)
++    assert len(calls) == 1
++    assert (calls[0]["n"], calls[0]["r"], calls[0]["p"]) == (
++        basic_plugin._SCRYPT_N, basic_plugin._SCRYPT_R, basic_plugin._SCRYPT_P)
++    assert basic_plugin._verify_password(password, basic_plugin._DUMMY_HASH) is False
+diff --git a/tests/test_conftest_hub_state_isolation.py b/tests/test_conftest_hub_state_isolation.py
+new file mode 100644
+index 00000000000..91dd9eb1c91
+--- /dev/null
++++ b/tests/test_conftest_hub_state_isolation.py
+@@ -0,0 +1,32 @@
++"""The hermes-hub replica stays out of reach after per-test env isolation is undone. [daveey]
++
++The autouse isolation fixture points ``HERMES_HUB_STATE`` at an empty per-test dir, but a background
++thread a test leaves running reads the environment after that monkeypatch is undone. Before the
++process-wide default, such a thread on hermes-hub loaded the host's live ``hub.db`` (~40 MB of task
++rows per read) and pushed tests/tui_gateway/test_tui_gateway_server.py past the 512 MB per-file budget.
++"""
++
++import os
++import threading
++from pathlib import Path
++
++from hermes_cli import kanban_session_activity
++
++
++def test_hub_state_outside_the_test_scope_is_never_the_real_replica(monkeypatch):
++    seen = {}
++
++    def _late_reader():  # what a leaked background thread sees once the test's monkeypatch is gone
++        seen["env"] = os.environ.get("HERMES_HUB_STATE")
++        seen["path"] = kanban_session_activity._hub_db_path()
++
++    monkeypatch.undo()  # back to the process-wide environment conftest set at import
++    reader = threading.Thread(target=_late_reader)
++    reader.start()
++    reader.join(timeout=10)
++
++    real_default = Path.home() / ".local" / "state" / "hermes-hub"
++    assert seen["env"], "conftest must set a process-wide HERMES_HUB_STATE"
++    assert Path(seen["env"]) != real_default
++    assert not Path(seen["env"]).exists()
++    assert seen["path"] is None
+diff --git a/tests/tui_gateway/test_tui_gateway_server.py b/tests/tui_gateway/test_tui_gateway_server.py
+index 5efa2160928..492b2ce15c2 100644
+--- a/tests/tui_gateway/test_tui_gateway_server.py
++++ b/tests/tui_gateway/test_tui_gateway_server.py
+@@ -14222,6 +14222,10 @@ def test_interrupt_error_after_tts_stop_still_resumes_wake(monkeypatch):
+     monkeypatch.setattr(wake_word, "resume_listening", resume_listening)
+     monkeypatch.setattr(server, "_voice_wake_owner", None)
+     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
++    # The failed host call reaches _recover_unreachable_compute_host_turn's pending-turn probe; without a stub
++    # it builds a REAL HostSupervisor, i.e. spawns a compute-host process that outlives the test. [daveey]
++    monkeypatch.setattr(server, "_get_compute_host_supervisor",
++                        lambda _cfg=None: types.SimpleNamespace(has_pending_turn=lambda _sid: False))
+ 
+     def _host_failed(*_args, **_kwargs):
+         raise RuntimeError("host failed")
+-- 
+2.55.0
+

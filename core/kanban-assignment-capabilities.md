@@ -59,3 +59,42 @@ The bundled Kanban dashboard plugin exposes shared validation, but the authority
 - **Code.** `hermes_cli/kanban_assignment_routing.py`.
 - **Tests** (new file `tests/hermes_cli/test_kanban_assignment_model_authority.py`; not run for this mirror): `test_model_edit_is_authority_need` (7 phrasings), `test_model_history_is_not_authority_need` (4), `test_own_model_edit_not_other_card`, `test_model_authority_refused_before_candidate_selection` (eligible / absent / ineligible supervisor; DB `kb.block_task` path), `test_legacy_model_edit_repair_cannot_release_original` (`kb.complete_task` on the repair), `test_tool_model_edit_refusal_is_typed` (registered `kanban_block` tool). The CLI `hermes kanban block` path has no test of its own for this.
 - **Gotchas.** The classifier is English-verb based and limited to one clause. A request phrased without those verbs (for example "switch t_X to Sonnet") is not caught and still follows the earlier assignment-repair rules.
+
+## Follow-up patches (1632, 1633): offer `kind='assignment'` only where a different profile can take the card
+
+**1632** (`f50d06c612`, `fix(kanban): offer kind='assignment' only where a different profile can take the card`) and
+**1633** (`6ea8987d2a`, narrows the guidance probe's `except`).
+
+- **Behavior.** On a single-profile host (no `kanban.orchestrator_profile`, creator == assignee),
+  `kanban_block(kind='assignment')` always fails with `no_capable_supervisor`, yet the `agent_owned_block` refusal, the
+  `kanban_block` schema, the worker prompt and the awaiting remedy all prescribed it, so workers hit that wall and then
+  improvised (asks to a human for agent work, self-parks with no producer). Now:
+  - The `agent_owned_block` refusal (tool and CLI) offers assignment only when a different, existing, capable profile is
+    configured for that card. Otherwise it lists the routes that work on one profile: (a) `kanban_create` an owner card
+    on the gateway that holds the access and park on it with `awaiting={kind:'card', ...}`; (b) `kanban_block(needs=[...])`;
+    (c) `kanban_supervisor_request` for archive / unlink / resume / retry_limit on a card in the creator tree. The
+    `needs_input` refusal gains route (4), the supervisor request.
+  - `route()`'s `no_capable_supervisor` error names those same routes instead of telling the agent to configure a profile.
+  - The `kanban_block` schema, `KANBAN_GUIDANCE` and the `agent_action_wait` remedy qualify assignment as "only when a
+    different profile is configured".
+  - Routing behavior and config defaults are unchanged.
+- **How it works.** `kanban_assignment_routing.supervisor_available(task)` is `_supervisor(task)[0] is not None` (the
+  same check `route()` uses, no new IO). `NO_SECOND_PROFILE_ROUTES` holds the shared route text.
+  `kanban_block_policy.block_policy_error(..., task=(conn, task_id))` calls `_assignment_routes(task)`; with no task or
+  on a read error it never offers assignment. The CLI `_cmd_block` now evaluates the policy per card in a bulk block
+  (the first refusal stops the whole block, as before) and passes `task=`; the tool does the same for its card. 1633
+  narrows the probe's `except Exception` to `(sqlite3.Error, ValueError, OSError)`.
+- **Code.** `hermes_cli/kanban_assignment_routing.py`, `hermes_cli/kanban_block_policy.py`, `hermes_cli/kanban.py`,
+  `hermes_cli/kanban_awaiting.py`, `agent/prompt_builder.py`, `tools/kanban_tools_schemas.py`.
+- **Tests** (new `tests/tools/test_kanban_block_assignment_guidance.py`; not rerun by this mirror pass):
+  `test_tool_refusal_on_single_profile_host_omits_assignment`, `test_cli_refusal_on_single_profile_host_omits_assignment`,
+  `test_tool_refusal_offers_assignment_when_a_different_profile_is_configured`,
+  `test_cli_refusal_offers_assignment_when_a_different_profile_is_configured`,
+  `test_refusal_without_a_task_never_offers_assignment`, `test_supervisor_available_matches_route_eligibility`,
+  `test_no_capable_supervisor_refusal_names_the_working_routes` (DB `kb.block_task` path),
+  `test_block_schema_no_longer_prescribes_assignment_for_agent_work`,
+  `test_worker_prompt_and_awaiting_remedy_qualify_assignment`. `tests/tools/test_kanban_agent_owned_block_guidance.py`
+  now asserts the single-profile routes. 1633 has no test of its own (an exception other than the three listed would
+  now propagate; untested).
+- **Gotchas.** Guidance only: assignment routing itself is unchanged, so a card on a single-profile host still cannot
+  use it. A bulk CLI block with mixed cards is refused at the first card whose policy refuses.

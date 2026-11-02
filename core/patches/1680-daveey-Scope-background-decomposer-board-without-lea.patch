@@ -1,0 +1,128 @@
+From 23a9b9251a2e0c16beb2acd36489d53c96edd9dd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 10:37:10 +0000
+Subject: [PATCH] [daveey] Scope background decomposer board without leaking
+ into discovery
+
+---
+ gateway/kanban_watchers_dispatcher.py         | 16 ++---
+ .../test_discovery_during_decomposition.py    | 72 +++++++++++++++++++
+ 2 files changed, 77 insertions(+), 11 deletions(-)
+ create mode 100644 tests/gateway/test_discovery_during_decomposition.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index c1940df14b7..c27e30b1431 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -349,25 +349,19 @@ class _KanbanDispatcher:
+             for slug in self._board_slugs():
+                 if attempted >= auto_decompose_per_tick:
+                     break
+-                # Pin the board via env for the call: the decomposer connects
+-                # with no board kwarg (same pattern as the dashboard specify endpoint).
+-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
++                # The decomposer connects without a board kwarg. Keep selection
++                # local to this tick: a process-env pin makes concurrent discovery
++                # incorrectly offer environments:[kanban] skills.
+                 try:
+-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+-                    with self._unowned_board_work(slug) as conn:
++                    with _kb.scoped_current_board(slug), self._unowned_board_work(slug) as conn:
+                         if conn is not None:
+                             used, done = self._decompose_board(_decomp, slug, auto_decompose_per_tick - attempted)
+                             attempted += used
+                             successes += done
+-                except Exception:  # health: allow BLE001 -- per-board isolation boundary logs traceback; finally restores env
++                except Exception:  # health: allow BLE001 -- per-board isolation boundary logs traceback; context manager restores board
+                     # Contain connection, callback and cleanup failures per board;
+                     # the caller must still reach tick_once for healthy peers.
+                     logger.exception("kanban auto-decompose: board %s failed", slug)
+-                finally:
+-                    if prev_env is None:
+-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
+-                    else:
+-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
+         return successes
+ 
+     def _decompose_board(self, decomp, slug, budget):
+diff --git a/tests/gateway/test_discovery_during_decomposition.py b/tests/gateway/test_discovery_during_decomposition.py
+new file mode 100644
+index 00000000000..de175977f86
+--- /dev/null
++++ b/tests/gateway/test_discovery_during_decomposition.py
+@@ -0,0 +1,72 @@
++"""Background board selection must not change the interactive discovery environment."""
++from concurrent.futures import ThreadPoolExecutor
++import os
++import threading
++
++from gateway.kanban_watchers_dispatcher import _KanbanDispatcher, _resolve_dispatcher_settings
++from hermes_cli import kanban_db as kb
++
++
++def test_discovery_stays_equal_while_decomposer_selects_board(tmp_path, monkeypatch):
++    from agent.skill_commands import reload_skills
++    from hermes_cli import kanban_decompose as decomp
++    from tui_gateway import server
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    for name in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_TASK'):
++        monkeypatch.delenv(name, raising=False)
++    (tmp_path / 'config.yaml').write_text('{}')
++    for name, extra in (('ordinary-probe', ''), ('review-probe', 'environments: [kanban]\n')):
++        skill = tmp_path / 'skills' / name
++        skill.mkdir(parents=True)
++        (skill / 'SKILL.md').write_text(f'---\nname: {name}\ndescription: Probe\n{extra}---\nBody\n')
++    from hermes_cli import kanban_db_connect as kbc
++
++    kb.create_board('selected')
++    with kbc.connect_closing(board='selected') as conn:
++        task_id = kb.create_task(conn, title='Discovery probe', triage=True)
++    dispatched = []
++
++    def decompose(task_id, **kwargs):
++        dispatched.append((task_id, kb.get_current_board()))
++        return decomp.DecomposeOutcome(task_id, True, 'probe')
++
++    monkeypatch.setattr(decomp, 'decompose_task', decompose)
++    dispatcher = _KanbanDispatcher(kb, _resolve_dispatcher_settings({}, kb))
++    monkeypatch.setattr(dispatcher, '_board_slugs', lambda: ['selected'])
++    entered, release = threading.Event(), threading.Event()
++    seen = []
++    original = decomp.list_triage_ids
++
++    def held_list(**kwargs):
++        seen.append(kb.get_current_board())
++        entered.set()
++        assert release.wait(20)
++        return original(**kwargs)
++
++    monkeypatch.setattr(decomp, 'list_triage_ids', held_list)
++
++    def snapshot():
++        reload_skills()
++        return [server._methods[method](i, params)['result'] for i, (method, params) in enumerate([
++            ('commands.catalog', {}), ('complete.slash', {'text': '/'}),
++        ])]
++
++    baseline = snapshot()
++    assert '/ordinary-probe' in dict(baseline[0]['pairs'])
++    assert '/review-probe' not in dict(baseline[0]['pairs'])
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        future = executor.submit(dispatcher.auto_decompose_tick, 1, min_age_seconds=0)
++        try:
++            assert entered.wait(20)
++            assert snapshot() == baseline
++            assert 'HERMES_KANBAN_BOARD' not in os.environ
++            assert kb.get_current_board() == 'default'
++        finally:
++            release.set()
++        assert future.result(timeout=20) == 1
++        assert executor.submit(kb.get_current_board).result(timeout=20) == 'default'
++    assert dispatched == [(task_id, 'selected')]
++    assert seen == ['selected']
++    assert snapshot() == baseline
+-- 
+2.55.0
+

@@ -1,0 +1,187 @@
+From 3e1b13e59ae8ea766efa0ba637a0324ae5b228ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 09:03:42 +0000
+Subject: [PATCH] fix(desktop): log both output streams when a stale-owner
+ gateway restart fails [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+restartLocalGatewayOwner logged only the last line of stdout+stderr combined. The
+core restart prints its reason above a trailing hint ("✗ Gateway service restart
+failed." then fix advice), so a failed restart's cause never reached the Desktop log.
+
+formatGatewayRestartLog (local-gateway.ts) keeps the last 20 stdout and last 20
+stderr lines as separate sections on failure, names an empty stream, and says
+Desktop does not retry, so hermes-sync owes the restart. Success stays one line.
+main.ts uses it; the one-attempt rule (createStaleGatewayRestarter) is unchanged and
+covered with a real bounded client against a failing fake CLI.
+---
+ .../local-gateway-restart-failure-log.test.ts | 85 +++++++++++++++++++
+ apps/desktop/electron/local-gateway.ts        | 34 ++++++++
+ apps/desktop/electron/main.ts                 |  5 +-
+ 3 files changed, 121 insertions(+), 3 deletions(-)
+ create mode 100644 apps/desktop/electron/local-gateway-restart-failure-log.test.ts
+
+diff --git a/apps/desktop/electron/local-gateway-restart-failure-log.test.ts b/apps/desktop/electron/local-gateway-restart-failure-log.test.ts
+new file mode 100644
+index 00000000000..bc542a48800
+--- /dev/null
++++ b/apps/desktop/electron/local-gateway-restart-failure-log.test.ts
+@@ -0,0 +1,85 @@
++import fs from 'node:fs/promises'
++import os from 'node:os'
++import path from 'node:path'
++
++import { expect, test } from 'vitest'
++
++import { createStaleGatewayRestarter, formatGatewayRestartLog, runGatewayEnsure, runGatewayOwnerRestart } from './local-gateway'
++
++const lines = (prefix: string, count: number) => Array.from({ length: count }, (_, i) => `${prefix} ${i + 1}`)
++
++// A failed stale-owner restart used to log only the last line of stdout+stderr combined, so the
++// reason (usually a stdout line above a trailing hint, or stderr above stdout's last line) was lost.
++test('a failed restart keeps the last 20 stdout and last 20 stderr lines separately', () => {
++  const stdout = [...lines('out', 30), ''].join('\n')
++  const stderr = lines('err', 25).join('\r\n')
++  const message = formatGatewayRestartLog('work', { code: 1, stdout, stderr })
++  const logged = message.split('\n')
++
++  expect(logged[0]).toContain('[gateway] hermes --profile work gateway restart exited 1')
++  expect(message).toContain('hermes-sync owes the restart')
++
++  const outAt = logged.indexOf('[gateway] restart stdout (last 20 lines):')
++  const errAt = logged.indexOf('[gateway] restart stderr (last 20 lines):')
++
++  expect(outAt).toBeGreaterThan(0)
++  expect(errAt).toBeGreaterThan(outAt)
++  expect(logged.slice(outAt + 1, errAt).map(line => line.trim())).toEqual(lines('out', 30).slice(-20))
++  expect(logged.slice(errAt + 1).map(line => line.trim())).toEqual(lines('err', 25).slice(-20))
++})
++
++test('an empty stream on failure is named, not dropped', () => {
++  const message = formatGatewayRestartLog('default', { code: 2, stdout: '', stderr: 'boom' })
++
++  expect(message).toContain('[gateway] restart stdout (last 20 lines): (empty)')
++  expect(message).toContain('[gateway] restart stderr (last 20 lines):\n  boom')
++})
++
++test('a successful restart stays one line', () => {
++  const message = formatGatewayRestartLog('default', { code: 0, stdout: '→ draining\n✓ Gateway relaunched by its supervisor (PID 5555)\n', stderr: '' })
++
++  expect(message).toBe('[gateway] hermes --profile default gateway restart exited 0: ✓ Gateway relaunched by its supervisor (PID 5555)')
++})
++
++// The real composition main.ts uses: bounded client → formatter → log, behind the one-attempt
++// restarter. A failing owner restart is logged in full ONCE; the next dial on the same stale code
++// attaches as-is instead of restarting again.
++test.skipIf(process.platform === 'win32')('a failing owner restart is attempted once and logged with both streams', async () => {
++  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gw-restart-fail-'))
++  const calls = path.join(dir, 'calls')
++  const bin = path.join(dir, 'hermes')
++  await fs.writeFile(bin, [
++    '#!/bin/sh',
++    `echo "$*" >> "${calls}"`,
++    'i=1; while [ $i -le 25 ]; do echo "out $i"; i=$((i+1)); done',
++    'echo "✗ Gateway service restart failed." ',
++    'i=1; while [ $i -le 22 ]; do echo "err $i" >&2; i=$((i+1)); done',
++    'exit 1',
++    ''
++  ].join('\n'), { mode: 0o755 })
++
++  const logs: string[] = []
++  const run = (args: string[]) => runGatewayEnsure({ command: bin, args, env: {}, shell: false }, dir, dir, {}, { timeoutMs: 5000, label: 'hermes gateway restart' })
++
++  const restartOwner = async (owner: string) => {
++    logs.push(formatGatewayRestartLog(owner, await runGatewayOwnerRestart(run, owner)))
++  }
++
++  const restart = createStaleGatewayRestarter(restartOwner, message => logs.push(message))
++  const owner = { profile_id: '/h', control_home: null, instance_id: 'i', authority_epoch: 1, runtime_protocol: 1, api_origin: 'http://127.0.0.1:1', capabilities: [], supervisor: 'launchd' }
++  const stale = { gateway: 'old', client: 'new' }
++
++  await (await restart(owner, stale))?.done
++  expect(await restart(owner, stale)).toBeNull()
++
++  expect((await fs.readFile(calls, 'utf8')).trim().split('\n')).toEqual(['--profile default gateway restart --detach'])
++  const failure = logs.find(message => message.includes('exited 1')) ?? ''
++  expect(failure).toContain('✗ Gateway service restart failed.')
++  expect(failure).toContain('out 25')
++  expect(failure).not.toContain('out 5\n')
++  expect(failure).toContain('err 22')
++  expect(failure).toContain('err 3')
++  expect(failure).not.toContain('err 2\n')
++  expect(failure).toContain('hermes-sync owes the restart')
++  expect(logs.at(-1)).toContain('attaching as-is')
++})
+diff --git a/apps/desktop/electron/local-gateway.ts b/apps/desktop/electron/local-gateway.ts
+index d6c1aaf88f8..9ccd17cf2fe 100644
+--- a/apps/desktop/electron/local-gateway.ts
++++ b/apps/desktop/electron/local-gateway.ts
+@@ -100,6 +100,40 @@ export async function runGatewayOwnerRestart(
+   return result.code === 2 && /unrecognized arguments:.*--detach/.test(result.stderr) ? run(args) : result
+ }
+ 
++const GATEWAY_RESTART_FAILURE_TAIL_LINES = 20
++
++function tailLines(text: string, count: number): string[] {
++  return String(text ?? '').split(/\r?\n/).filter(line => line.trim()).slice(-count)
++}
++
++/** The Desktop log line(s) for one `hermes gateway restart` of a stale owner. Success stays one line
++ *  (the CLI's last word). A failure keeps the last 20 stdout and last 20 stderr lines SEPARATELY: the
++ *  reason sits above a trailing hint on stdout (`✗ Gateway service restart failed.` + fix advice), and
++ *  the combined last line dropped it. Desktop restarts a stale owner once (createStaleGatewayRestarter),
++ *  so the line says who owes the next attempt. */
++export function formatGatewayRestartLog(ownerProfile: string, result: { code: number; stdout: string; stderr: string }): string {
++  const head = `[gateway] hermes --profile ${ownerProfile} gateway restart exited ${result.code}`
++
++  if (result.code === 0) {
++    const reason = tailLines(`${result.stdout}\n${result.stderr}`, 1)[0]?.trim()
++
++    return reason ? `${head}: ${reason}` : head
++  }
++
++  const section = (name: string, text: string) => {
++    const lines = tailLines(text, GATEWAY_RESTART_FAILURE_TAIL_LINES)
++    const title = `[gateway] restart ${name} (last ${GATEWAY_RESTART_FAILURE_TAIL_LINES} lines):`
++
++    return lines.length ? [title, ...lines.map(line => `  ${line}`)] : [`${title} (empty)`]
++  }
++
++  return [
++    `${head}; Desktop does not retry a stale-owner restart, so hermes-sync owes the restart`,
++    ...section('stdout', result.stdout),
++    ...section('stderr', result.stderr)
++  ].join('\n')
++}
++
+ /** One restart per (owner process, stale gateway, client) per Desktop process. An owner a restart cannot move
+  *  (a service unit pinned to another checkout) is then attached as-is instead of being restarted
+  *  on every dial. */
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 751d39e0316..6f3da2d5806 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -1,7 +1,7 @@
+ import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
+ 
+ import type { GatewayEndpoint } from './local-gateway'
+-import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayRestarter, ensureLocalGateway, gatewayOwnerProfile, localGatewayDial, nativeGatewayHttpHeaders, redialLocalGateway, runGatewayEnsure, runGatewayOwnerRestart } from './local-gateway'
++import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayRestarter, ensureLocalGateway, formatGatewayRestartLog, gatewayOwnerProfile, localGatewayDial, nativeGatewayHttpHeaders, redialLocalGateway, runGatewayEnsure, runGatewayOwnerRestart } from './local-gateway'
+ import { closeGatewayTicketBridges, createGatewayTicketResolver } from './local-gateway-python'
+ import { createPluginWsUrlHandler } from './plugin-ws-url'
+ const localGatewayDials = createLocalGatewayDials()
+@@ -11596,8 +11596,7 @@ async function restartLocalGatewayOwner(ownerProfile: string): Promise<void> {
+     )
+   }, ownerProfile)
+ 
+-  const reason = `${result.stdout}\n${result.stderr}`.trim().split(/\r?\n/).filter(Boolean).pop()
+-  rememberLog(`[gateway] hermes --profile ${ownerProfile} gateway restart exited ${result.code}${reason ? `: ${reason}` : ''}`)
++  rememberLog(formatGatewayRestartLog(ownerProfile, result))
+ }
+ 
+ // A ready gateway whose boot commit differs from this Hermes (it outlived `hermes update`) is
+-- 
+2.55.0
+

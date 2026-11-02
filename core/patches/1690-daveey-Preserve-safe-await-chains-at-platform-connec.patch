@@ -1,0 +1,147 @@
+From 21cc9d04f8efa06e21f964171bed14b6aa2b2a20 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 13:45:59 +0000
+Subject: [PATCH] [daveey] Preserve safe await chains at platform connection
+ deadlines
+
+---
+ gateway/connect_diagnostics.py                | 36 ++++++++++
+ gateway/run_adapters.py                       |  3 +
+ .../test_connect_timeout_diagnostics.py       | 68 +++++++++++++++++++
+ 3 files changed, 107 insertions(+)
+ create mode 100644 gateway/connect_diagnostics.py
+ create mode 100644 tests/gateway/test_connect_timeout_diagnostics.py
+
+diff --git a/gateway/connect_diagnostics.py b/gateway/connect_diagnostics.py
+new file mode 100644
+index 00000000000..040bbbb5ea8
+--- /dev/null
++++ b/gateway/connect_diagnostics.py
+@@ -0,0 +1,36 @@
++"""Bounded, credential-free await-chain snapshots for platform connect deadlines."""
++import asyncio
++import types
++from pathlib import PurePath
++
++
++def task_wait_chain(task: object) -> list[str]:
++    """Describe native coroutine/generator locations only, never repr, source or locals.
++
++    Task.get_stack() exposes only the outer suspended frame. Following cr_await/gi_yieldfrom
++    identifies DNS, TLS, HTTP, and ready waits nested inside the Discord client task.
++    """
++    if not isinstance(task, asyncio.Task):
++        return []
++    current = task.get_coro()
++    frames = []
++    for _ in range(24):
++        if isinstance(current, types.CoroutineType):
++            frame, current = current.cr_frame, current.cr_await
++        elif isinstance(current, types.GeneratorType):
++            frame, current = current.gi_frame, current.gi_yieldfrom
++        else:
++            break
++        if frame is not None:
++            code = frame.f_code
++            frames.append(f"{PurePath(code.co_filename).name}:{frame.f_lineno}:{code.co_qualname}")
++    return frames
++
++
++def connect_waits(adapter: object, task: asyncio.Task) -> dict[str, list[str]]:
++    """The Discord bot is a separate task: the connect waiter alone only shows Event.wait."""
++    waits = {"connect": task_wait_chain(task)}
++    bot = getattr(adapter, "_bot_task", None)
++    if isinstance(bot, asyncio.Task):
++        waits["bot"] = task_wait_chain(bot)
++    return waits
+diff --git a/gateway/run_adapters.py b/gateway/run_adapters.py
+index 87c49bbe772..3beb792f763 100644
+--- a/gateway/run_adapters.py
++++ b/gateway/run_adapters.py
+@@ -205,6 +205,9 @@ class GatewayAdapterLifecycleMixin:
+         task = asyncio.ensure_future(adapter.connect(is_reconnect=is_reconnect))
+         if await self._wait_or_detach(task, timeout):
+             return bool(await task)
++        # No await after cancel: suspended frames still exist until the loop resumes the task.
++        from gateway.connect_diagnostics import connect_waits
++        logger.warning("Platform connect deadline: platform=%s waits=%s", platform.value, connect_waits(adapter, task))
+         raise TimeoutError(f"{platform.value} connect timed out after {timeout:g}s")
+ 
+     async def _connect_initial_adapter_with_timeout(self, adapter, platform) -> bool:
+diff --git a/tests/gateway/test_connect_timeout_diagnostics.py b/tests/gateway/test_connect_timeout_diagnostics.py
+new file mode 100644
+index 00000000000..6a6381cc938
+--- /dev/null
++++ b/tests/gateway/test_connect_timeout_diagnostics.py
+@@ -0,0 +1,68 @@
++"""A connection deadline must preserve the blocked await, without credential locals."""
++import asyncio
++import logging
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.config import Platform
++from gateway.run_adapters import GatewayAdapterLifecycleMixin
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("initial", [True, False])
++async def test_deadline_records_connect_and_bot_wait_without_secrets(initial, caplog):
++    entered = asyncio.Event()
++    blocked = asyncio.Event()
++
++    async def stalled_handshake(token):
++        entered.set()
++        await blocked.wait()
++
++    class Adapter:
++        _bot_task = None
++
++        async def connect(self, *, is_reconnect):
++            self._bot_task = asyncio.create_task(stalled_handshake("DO-NOT-LOG-TOKEN"))
++            await entered.wait()
++            await blocked.wait()
++
++    class Runner(GatewayAdapterLifecycleMixin):
++        def _platform_connect_timeout_secs(self, platform=None, *, initial=False):
++            return 0.01
++
++        @staticmethod
++        async def _wait_or_detach(task, timeout):
++            await asyncio.wait_for(entered.wait(), 5)
++            return await GatewayAdapterLifecycleMixin._wait_or_detach(task, timeout)
++
++    adapter = Adapter()
++    with caplog.at_level(logging.WARNING, logger="gateway.run"):
++        try:
++            with pytest.raises(TimeoutError, match="discord connect timed out"):
++                await Runner()._connect_adapter_bounded(
++                    adapter, Platform.DISCORD, is_reconnect=not initial, initial=initial,
++                )
++            assert "Adapter.connect" in caplog.text
++            assert "stalled_handshake" in caplog.text
++            assert "Event.wait" in caplog.text
++            assert "DO-NOT-LOG-TOKEN" not in caplog.text
++        finally:
++            if adapter._bot_task:
++                adapter._bot_task.cancel()
++                await asyncio.gather(adapter._bot_task, return_exceptions=True)
++
++
++@pytest.mark.asyncio
++async def test_success_has_no_timeout_diagnostic(caplog):
++    async def connect(**kwargs):
++        return True
++
++    class Runner(GatewayAdapterLifecycleMixin):
++        def _platform_connect_timeout_secs(self, platform=None, *, initial=False):
++            return 2
++
++    assert await Runner()._connect_adapter_bounded(
++        SimpleNamespace(connect=connect), Platform.DISCORD, is_reconnect=False, initial=True,
++    )
++    assert "Platform connect deadline" not in caplog.text
+-- 
+2.55.0
+

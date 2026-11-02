@@ -1,0 +1,155 @@
+From 98274ef72a9ce7b2b8766e9e0017bf56c9fdcef7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:59:52 +0000
+Subject: [PATCH] [daveey] pre_final_gate: tell the model a held draft was NOT
+ shown
+
+A buffered hold hides the draft from the user but keeps it in the model's
+context, and nothing said so: hub example-session held a full
+explanation for a missing session_outcome call, the model took it as
+delivered and sent only "The explanation and recommendations are
+complete." Core now prefixes every hold nudge whose draft never streamed
+with HELD_NOTICE ("[runtime] Your draft above was NOT shown to the user.
+Your next reply replaces it: include its full content..."), whatever the
+hook wrote. A draft that already streamed (unbuffered gate) and an
+interrupt-only stop get no notice.
+
+Tests: test_buffered_hold_nudge_starts_with_not_shown_notice (2 hooks),
+test_streamed_hold_nudge_has_no_not_shown_notice; existing hold test now
+asserts the prefixed nudge.
+---
+ agent/pre_final_gate.py            | 16 +++++++++++-
+ agent/turn_stop_gates.py           |  8 +++++-
+ tests/agent/test_pre_final_gate.py | 39 ++++++++++++++++++++++++++++--
+ 3 files changed, 59 insertions(+), 4 deletions(-)
+
+diff --git a/agent/pre_final_gate.py b/agent/pre_final_gate.py
+index a52ef235bec..5408542de9b 100644
+--- a/agent/pre_final_gate.py
++++ b/agent/pre_final_gate.py
+@@ -8,7 +8,9 @@ a candidate; unbuffered legacy gates run after verification and the kanban guard
+ - ``{"hold": True, "nudge": str}`` → the candidate is NOT emitted, NOT streamed (see below) and NOT
+   persisted; it is kept only as the budget-exhaustion fallback (``pending_verification_response``).
+   The held row plus the nudge (a synthetic user row) stay in the in-memory turn so the model sees
+-  them, and are stripped from the returned/live history at turn end. The turn continues.
++  them, and are stripped from the returned/live history at turn end. The turn continues. When the
++  held draft did not stream to the screen, core prefixes the nudge with ``HELD_NOTICE`` ("your
++  draft above was NOT shown ... include its full content"), whatever the hook wrote.
+ - ``{"append": str}`` → deliver with ``"\\n\\n" + text`` appended.
+ - ``{"replace": str}`` → replace the entire candidate with nonempty safe text, independent of
+   hold budget. Clears native replay carriers and the rejected stream buffer; other completion
+@@ -71,6 +73,16 @@ HOOK = "pre_final_gate"
+ FLAG = "_pre_final_gate_synthetic"
+ DEFAULT_MAX_ATTEMPTS = 2
+ DEFAULT_TIMEOUT_S = 30.0
++# Prefixed by core to every hold nudge whose draft never reached the screen. The held row stays in the model's
++# context, so without this line a model took its held explanation as delivered and sent only "The explanation and
++# recommendations are complete." (hub 20261028_071229_45f849). Hooks cannot be trusted to say it themselves.
++HELD_NOTICE = ("[runtime] Your draft above was NOT shown to the user. Your next reply replaces it: include its "
++               "full content; don't refer to it as 'above'.")
++
++
++def held_nudge(nudge: str, shown: bool) -> str:
++    """The nudge row for a hold: ``HELD_NOTICE`` first unless the held draft already streamed to the screen."""
++    return nudge if shown else f"{HELD_NOTICE}\n\n{nudge}"
+ 
+ # Explicit plugin compatibility handshake. Publish only with the matching turn
+ # consumers: replacement, exhausted-budget kwargs and post-transform emission.
+@@ -372,11 +384,13 @@ def _unavailable(pending: Any) -> GateDecision:
+ __all__ = [
+     "DEFAULT_MAX_ATTEMPTS",
+     "FLAG",
++    "HELD_NOTICE",
+     "HOOK",
+     "GateDecision",
+     "UnresolvedFallback",
+     "eligible_callbacks",
+     "evaluate",
++    "held_nudge",
+     "is_background_agent",
+     "max_attempts",
+     "needs_buffer",
+diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
+index c90e8aa8a55..f9b92ab7ee1 100644
+--- a/agent/turn_stop_gates.py
++++ b/agent/turn_stop_gates.py
+@@ -222,11 +222,17 @@ def apply_stop_gates(
+         # hold=True is bounded: every hold increments _pre_final_gate_attempts, which
+         # max_attempts() caps, so a plugin cannot hold a turn indefinitely.
+         agent._pre_final_gate_attempts = getattr(agent, "_pre_final_gate_attempts", 0) + 1
++        # Read before the discard: a buffered draft never streamed, so the model is told it was not shown
++        # (an interrupt-only stop is not a hold and gets no notice).
++        from agent.pre_final_gate import held_nudge
++
++        shown = not _decision.hold or (
++            isinstance(final_response, str) and agent._interim_content_was_streamed(final_response))
+         agent._discard_final_gate_buffer()
+         final_msg["finish_reason"] = "pre_final_gate_hold"
+         final_msg[_PFG_FLAG] = True
+         append_message(messages, final_msg)
+-        verdict = _continue(_decision.nudge or "Turn interrupted.", _PFG_FLAG)
++        verdict = _continue(held_nudge(_decision.nudge or "Turn interrupted.", shown), _PFG_FLAG)
+         if _decision.unresolved_fallback is not None:
+             verdict.pending_verification_response = _decision.unresolved_fallback
+             verdict.pending_verification_response_previewed = False
+diff --git a/tests/agent/test_pre_final_gate.py b/tests/agent/test_pre_final_gate.py
+index efb70e05c1f..ced952a1daa 100644
+--- a/tests/agent/test_pre_final_gate.py
++++ b/tests/agent/test_pre_final_gate.py
+@@ -94,9 +94,10 @@ def test_hold_once_never_shows_or_persists_first_answer(agent):
+     assert "Needs you" not in run.shown, run.shown
+     assert "Done: I minted it myself." in run.shown
+     assert [a for a, *_ in seen] == [0, 1]
+-    # Second call: the model saw its held answer and the private nudge.
++    # Second call: the model saw its held answer and the private nudge, told the answer was not shown.
+     wire = [m.get("content") for m in run.requests[1]["messages"]]
+-    assert "Needs you: please add the token." in wire and "Check first; do it yourself." in wire
++    assert "Needs you: please add the token." in wire
++    assert f"{HELD_NOTICE}\n\nCheck first; do it yourself." in wire
+     # Both hold rows are ephemeral (never persisted) and stripped from returned history.
+     held_rows = [m for m in seen[1][2] if m.get(FLAG)]
+     assert [m["role"] for m in held_rows] == ["assistant", "user"]
+@@ -105,6 +106,40 @@ def test_hold_once_never_shows_or_persists_first_answer(agent):
+     assert result["messages"][-1]["content"] == "Done: I minted it myself."
+ 
+ 
++HELD_NOTICE = ("[runtime] Your draft above was NOT shown to the user. Your next reply replaces it: include its "
++               "full content; don't refer to it as 'above'.")
++
++
++@pytest.mark.parametrize("nudge", ["Check first; do it yourself.", "[session-outcome] Record the outcome first."])
++def test_buffered_hold_nudge_starts_with_not_shown_notice(agent, nudge):
++    """A held draft never reached the screen, but stays in the model's context. Without a runtime line saying so, the
++    model took its held explanation as delivered and sent only "The explanation ... is complete" (hub
++    20261028_071229_45f849). Every hook's nudge gets the line from core, whatever the hook wrote."""
++    run = Run(agent, ["Full explanation of what we tested.", "Full explanation of what we tested, again."])
++
++    @_buffered
++    def hook(attempt, **kw):
++        return {"hold": True, "nudge": nudge} if attempt == 0 else None
++
++    _run(agent, hook)
++    wire = [m.get("content") for m in run.requests[1]["messages"]]
++    assert f"{HELD_NOTICE}\n\n{nudge}" in wire, wire
++    assert "Full explanation of what we tested." not in run.shown
++
++
++def test_streamed_hold_nudge_has_no_not_shown_notice(agent):
++    """An unbuffered gate holds an answer that already streamed: it WAS shown, so core must not claim otherwise."""
++    run = Run(agent, ["Streamed answer.", "Second answer."])
++
++    def hook(attempt, **kw):
++        return {"hold": True, "nudge": "Add the evidence."} if attempt == 0 else None
++
++    _run(agent, hook)
++    assert "Streamed answer." in run.shown
++    wire = [m.get("content") for m in run.requests[1]["messages"]]
++    assert "Add the evidence." in wire and not any(HELD_NOTICE in str(w) for w in wire)
++
++
+ @pytest.mark.parametrize("limit", [0, 2])
+ def test_replacement_never_exposes_retired_ask(agent, limit):
+     run = Run(agent, ["Please reconnect the retired account."])
+-- 
+2.55.0
+

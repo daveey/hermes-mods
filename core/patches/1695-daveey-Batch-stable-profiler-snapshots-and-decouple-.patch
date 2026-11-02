@@ -1,0 +1,653 @@
+From 2dd87d9c5bcc33cb0280e6305f0c2b98722ae984 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 12:45:07 +0000
+Subject: [PATCH] [daveey] Batch stable profiler snapshots and decouple CPU
+ refresh
+
+---
+ gateway/control_profile.py                    | 241 ++++++++++-----
+ .../gateway/test_control_profile_fastpath.py  | 292 ++++++++++++++++++
+ .../docs/developer-guide/gateway-profiling.md |  33 +-
+ 3 files changed, 492 insertions(+), 74 deletions(-)
+ create mode 100644 tests/gateway/test_control_profile_fastpath.py
+
+diff --git a/gateway/control_profile.py b/gateway/control_profile.py
+index 68f449e0a15..e4431e7d203 100644
+--- a/gateway/control_profile.py
++++ b/gateway/control_profile.py
+@@ -4,11 +4,13 @@ from __future__ import annotations
+ from collections import Counter
+ from functools import lru_cache
+ import ctypes
++import inspect
+ import os
+ import json
+ import sys
+ import threading
+ import time
++import traceback
+ 
+ 
+ # Darwin <sys/proc_info.h>. PROC_PIDTHREADINFO (5) matches its arg against the
+@@ -64,82 +66,179 @@ def _cpu_seconds(native_id):
+         return None
+ 
+ 
+-def _collect(seconds, hz, top):
+-    records = {}
+-    samples = 0
+-    deadline = time.monotonic() + seconds
+-    next_tick = time.monotonic()
+-    code_keys = {}
+-    previous_frames = {}
+-    frames = {}
+-    previous_stacks = {}
+-    while time.monotonic() < deadline:
+-        threads = {t.ident: t for t in threading.enumerate()}
+-        frames = sys._current_frames()
+-        current_stacks = {}
++# Native CPU clocks are read at a thread's first observation, then on refresh
++# ticks at most this often (monotonic seconds), and once at window end.
++_CPU_REFRESH_S = 0.1
++# Frames of these codes can be suspended and resumed under a different caller,
++# so a chain containing one is never reused from a previous snapshot.
++_SUSPENDABLE = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
++
++
++def _read_cpu(thread, native_id):
++    cpu = _cpu_seconds(native_id)
++    # Checked AFTER the read: a thread that is still alive still owns its kernel
++    # TID, while a dead thread's value may come from a reused Linux TID.
++    return cpu if cpu is not None and thread.is_alive() else None
++
++
++def _new_row(thread, native_id, sample):
++    return dict(name=thread.name, native_id=native_id, samples=0, first_seen_sample=sample,
++                stack_counts={}, cpu_start=None, cpu_last=None, cpu_last_sample=None, cpu_missed=False)
++
++
++def _record_cpu(row, cpu, sample):
++    if cpu is None:
++        if row['cpu_start'] is None:
++            row['cpu_missed'] = True  # a later first success is still a lower bound
++        return
++    if row['cpu_start'] is None:
++        row['cpu_start'] = cpu
++    row['cpu_last'], row['cpu_last_sample'] = cpu, sample
++
++
++class _Window:
++    """Per-window sampler state. Retains only the last walked frame snapshot."""
++
++    def __init__(self):
++        self.records = {}
++        self.code_keys = {}  # id(code) -> (code, frame key, suspendable); keeps ids valid
++        self.previous_frames = {}
++        self.previous = {}  # ident -> (row, stack_key, reusable)
++        self.batchable = False
++        self.run = 0  # open run of ticks identical to ``previous_frames``
++        self.run_last = 0
++
++    def flush(self):
++        if self.run:
++            for row, stack_key, _ in self.previous.values():
++                row['samples'] += self.run
++                row['last_seen_sample'] = self.run_last
++                row['stack_counts'][stack_key] += self.run
++            self.run = 0
++
++    def walk(self, frame, reusable):
++        stack = []
++        code_keys = self.code_keys
++        while frame is not None:
++            code = frame.f_code
++            code_id = id(code)
++            entry = code_keys.get(code_id)
++            if entry is None:
++                # Avoid expensive structural code-object hashing on every tick.
++                entry = code_keys[code_id] = (
++                    code, f'{code.co_filename}:{code.co_firstlineno}:{code.co_name}',
++                    bool(code.co_flags & _SUSPENDABLE))
++            if entry[2]:
++                reusable = False
++            stack.append(code_id)
++            frame = frame.f_back
++        return tuple(stack), reusable
++
++    def slow_tick(self, sample, cpu_due, no_greenlet, before, frames, after):
++        self.flush()
++        current = {}
++        batchable = no_greenlet
+         for ident, frame in frames.items():
+-            thread = threads.get(ident)
+-            if thread is None or thread.native_id is None:
++            thread = after.get(ident)
++            # The same Thread object on both sides owned this ident at snapshot time.
++            if thread is None or before.get(ident) is not thread or thread.native_id is None:
++                if thread is not None or ident in before:
++                    batchable = False  # transient: re-check next tick
+                 continue
+-            key = (thread, thread.native_id)
+-            cpu = _cpu_seconds(thread.native_id)
+-            if key not in records:
+-                records[key] = dict(name=thread.name, native_id=thread.native_id,
+-                                    samples=0, first_seen_sample=samples,
+-                                    stack_counts={},
+-                                    cpu_start=cpu, cpu_last=cpu)
+-            row = records[key]
+-            row['samples'] += 1
+-            row['last_seen_sample'] = samples
+-            unchanged = cpu is not None and cpu == row['cpu_last'] and previous_frames.get(ident) is frame
+-            if cpu is not None:
+-                row['cpu_last'] = cpu
+-            if unchanged and ident in previous_stacks:
+-                stack_key = previous_stacks[ident]
++            native_id = thread.native_id
++            row = self.records.get((thread, native_id))
++            if row is None:
++                row = self.records[thread, native_id] = _new_row(thread, native_id, sample)
++                _record_cpu(row, _read_cpu(thread, native_id), sample)
++            elif cpu_due:
++                _record_cpu(row, _read_cpu(thread, native_id), sample)
++            prior = self.previous.get(ident)
++            if (prior is not None and prior[2] and prior[0] is row and no_greenlet
++                    and self.previous_frames.get(ident) is frame):
++                stack_key, reusable = prior[1], True
+             else:
+-                stack = []
+-                while frame is not None:
+-                    code = frame.f_code
+-                    code_id = id(code)
+-                    if code_id not in code_keys:
+-                        # Avoid expensive structural code-object hashing on every tick.
+-                        code_keys[code_id] = (code, f'{code.co_filename}:{code.co_firstlineno}:{code.co_name}')
+-                    stack.append(code_id)
+-                    frame = frame.f_back
+-                stack_key = tuple(stack)
+-            current_stacks[ident] = stack_key
++                stack_key, reusable = self.walk(frame, no_greenlet)
++            row['samples'] += 1
++            row['last_seen_sample'] = sample
+             counts = row['stack_counts']
+             counts[stack_key] = counts.get(stack_key, 0) + 1
+-        # Retain only the preceding snapshot to compare real frame identity (not
+-        # reusable ids). Reuse its stack only if the native CPU clock has not moved:
+-        # a resumed generator can keep its leaf frame but acquire a different caller.
+-        # No locals/source are read; all frame references are cleared at window end.
+-        previous_frames = frames
+-        previous_stacks = current_stacks
+-        samples += 1
+-        next_tick += 1 / hz
+-        time.sleep(max(0, min(next_tick, deadline) - time.monotonic()))
+-    previous_frames.clear()
+-    frames.clear()
+-    frame = None
+-    output = []
+-    for (thread, native_id), row in records.items():
+-        end = _cpu_seconds(native_id) if thread.is_alive() else None
+-        start = row.pop('cpu_start')
+-        last = row.pop('cpu_last') if end is None else end
+-        row.pop('cpu_last', None)
+-        row['cpu_s'] = max(0, last - start) if start is not None and last is not None else None
+-        row['cpu_partial'] = end is None or start is None
+-        self_counts, inclusive_counts = Counter(), Counter()
+-        for stack, count in row.pop('stack_counts').items():
+-            self_counts[code_keys[stack[0]][1]] += count
+-            for frame_key in {code_keys[c][1] for c in stack}:
+-                inclusive_counts[frame_key] += count
+-        row['top_self'] = self_counts.most_common(top)
+-        row['top_inclusive'] = inclusive_counts.most_common(top)
+-        output.append(row)
+-    output.sort(key=lambda r: r['cpu_s'] or 0, reverse=True)
+-    return dict(seconds=seconds, hz=hz, samples=samples, threads=output)
++            current[ident] = (row, stack_key, reusable)
++            batchable = batchable and reusable
++        self.previous_frames, self.previous, self.batchable = frames, current, batchable
++
++    def finish(self, samples, top):
++        output = []
++        code_keys = self.code_keys
++        for (thread, native_id), row in self.records.items():
++            end = _read_cpu(thread, native_id) if thread.is_alive() else None
++            if end is not None:
++                if row['cpu_start'] is None:
++                    row['cpu_missed'] = True
++                _record_cpu(row, end, samples)
++            start_cpu, last_cpu, missed = row.pop('cpu_start'), row.pop('cpu_last'), row.pop('cpu_missed')
++            row['cpu_s'] = max(0, last_cpu - start_cpu) if start_cpu is not None else None
++            # Lower bound when the first or the end read is missing (e.g. exited thread).
++            row['cpu_partial'] = end is None or missed or start_cpu is None
++            self_counts, inclusive_counts = Counter(), Counter()
++            for stack, count in row.pop('stack_counts').items():
++                self_counts[code_keys[stack[0]][1]] += count
++                for frame_key in {code_keys[c][1] for c in stack}:
++                    inclusive_counts[frame_key] += count
++            row['top_self'] = self_counts.most_common(top)
++            row['top_inclusive'] = inclusive_counts.most_common(top)
++            output.append(row)
++        output.sort(key=lambda r: r['cpu_s'] or 0, reverse=True)
++        return output
++
++
++def _collect(seconds, hz, top):
++    window = _Window()
++    samples = 0
++    start = time.monotonic()
++    deadline = start + seconds
++    next_tick = next_cpu = start
++    frames = None
++    try:
++        while True:
++            now = time.monotonic()
++            if now >= deadline:
++                break
++            cpu_due = now >= next_cpu
++            # A refresh always takes the registry-sandwiched snapshot below; do
++            # not first collect a redundant snapshot just to discard it.
++            frames = None if cpu_due else sys._current_frames()
++            no_greenlet = sys.modules.get('greenlet') is None
++            # Batch a whole snapshot whose every chain was safe to reuse; dict ==
++            # compares the frame objects by identity, in C.
++            if window.batchable and no_greenlet and not cpu_due and frames == window.previous_frames:
++                window.run += 1
++                window.run_last = samples
++            else:
++                if cpu_due:
++                    next_cpu += _CPU_REFRESH_S
++                    if next_cpu <= now:  # late tick: skip missed refreshes, no burst
++                        next_cpu = now + _CPU_REFRESH_S
++                # Snapshot here, not in slow_tick: the sampler's own leaf frame
++                # must be the same object as in fast-path snapshots.
++                before = {t.ident: t for t in threading.enumerate()}
++                frames = sys._current_frames()
++                after = {t.ident: t for t in threading.enumerate()}
++                window.slow_tick(samples, cpu_due, no_greenlet, before, frames, after)
++                before = after = None
++            frames = None
++            samples += 1
++            next_tick += 1 / hz
++            time.sleep(max(0, min(next_tick, deadline) - time.monotonic()))
++        window.flush()
++    except BaseException as exc:
++        # Finished callee frames in the traceback (slow_tick, walk) hold frame refs.
++        traceback.clear_frames(exc.__traceback__)
++        raise
++    finally:
++        # No frame reference outlives the window, even via an error traceback.
++        frames = window.previous_frames = None
++    return dict(seconds=seconds, hz=hz, cpu_refresh_s=_CPU_REFRESH_S, samples=samples,
++                threads=window.finish(samples, top))
+ 
+ 
+ def trim_response(response, limit):
+diff --git a/tests/gateway/test_control_profile_fastpath.py b/tests/gateway/test_control_profile_fastpath.py
+new file mode 100644
+index 00000000000..d62ae3afc0e
+--- /dev/null
++++ b/tests/gateway/test_control_profile_fastpath.py
+@@ -0,0 +1,292 @@
++"""Deterministic sampler contracts: snapshot fast path, CPU cadence, lifetimes.
++
++A fake clock, frame snapshot and thread registry drive ``_collect`` so exact
++counts and read schedules can be asserted without timing flakiness.
++"""
++import gc
++import inspect
++from itertools import pairwise
++import types
++import weakref
++
++import pytest
++
++import gateway.control_profile as profiler
++
++
++class FakeCode:
++    def __init__(self, name, flags=0):
++        self.co_filename, self.co_firstlineno, self.co_name, self.co_flags = 'fake.py', 1, name, flags
++
++    @property
++    def key(self):
++        return f'fake.py:1:{self.co_name}'
++
++
++class FakeFrame:
++    """Weak-referenceable stand-in; ``back`` may be a callable for a changing caller."""
++
++    def __init__(self, code, back=None):
++        self.f_code, self._back, self.walks = code, back, 0
++
++    @property
++    def f_back(self):
++        self.walks += 1
++        return self._back() if callable(self._back) else self._back
++
++
++class FakeThread:
++    def __init__(self, ident, native_id, name):
++        self.ident, self.native_id, self.name, self.alive = ident, native_id, name, True
++
++    def is_alive(self):
++        return self.alive
++
++
++class Harness:
++    """Fake ``time``/``sys``/``threading`` for ``_collect``.
++
++    ``state(now)`` returns ``{ident: (thread, frame)}`` for the snapshot at ``now``.
++    ``registry(now, call_in_tick)`` may override what ``threading.enumerate`` sees.
++    """
++
++    def __init__(self, monkeypatch, state, cpu=None, registry=None, modules=None, jumps=None):
++        self.now = 0.0
++        self.state = state
++        self.registry = registry
++        self.jumps = dict(jumps or {})
++        self.frames_calls = self.enumerate_calls = 0
++        self.reads = []
++        self._tick_enumerates = (None, 0)
++        self.cpu = cpu or (lambda tid, now: now)
++        clock = types.SimpleNamespace(monotonic=lambda: self.now, sleep=self._sleep)
++        fake_sys = types.SimpleNamespace(_current_frames=self._frames, modules=modules or {})
++        fake_threading = types.SimpleNamespace(enumerate=self._enumerate)
++        monkeypatch.setattr(profiler, 'time', clock)
++        monkeypatch.setattr(profiler, 'sys', fake_sys)
++        monkeypatch.setattr(profiler, 'threading', fake_threading)
++        monkeypatch.setattr(profiler, '_cpu_seconds', self._read)
++
++    def _sleep(self, seconds):
++        self.now += seconds
++        for at, extra in list(self.jumps.items()):
++            if self.now >= at:
++                self.now += extra
++                del self.jumps[at]
++
++    def _frames(self):
++        self.frames_calls += 1
++        return {ident: frame for ident, (_, frame) in self.state(self.now).items()}
++
++    def _enumerate(self):
++        self.enumerate_calls += 1
++        at, count = self._tick_enumerates
++        count = count + 1 if at == self.now else 1
++        self._tick_enumerates = (self.now, count)
++        if self.registry is not None:
++            return self.registry(self.now, count)
++        return [thread for thread, _ in self.state(self.now).values()]
++
++    def _read(self, tid):
++        self.reads.append((tid, self.now))
++        return self.cpu(tid, self.now)
++
++
++def _rows(result):
++    return {row['name']: row for row in result['threads']}
++
++
++def test_identical_safe_snapshots_batch_exact_counts_and_skip_per_thread_work(monkeypatch):
++    leaf, mid, root = FakeCode('leaf'), FakeCode('mid'), FakeCode('root')
++    recursive_root = FakeFrame(root)
++    # root -> mid -> mid -> leaf: recursive mid must count once per inclusive sample.
++    chains = {i: FakeFrame(leaf, FakeFrame(mid, FakeFrame(mid, recursive_root))) for i in (1, 2, 3)}
++    threads = {i: FakeThread(i, 100 + i, f'idle-{i}') for i in (1, 2, 3)}
++    h = Harness(monkeypatch, lambda now: {i: (threads[i], chains[i]) for i in threads})
++    result = profiler._collect(1, 100, 10)
++
++    assert result['samples'] == 100
++    assert result['cpu_refresh_s'] == pytest.approx(0.1)
++    for row in result['threads']:
++        assert row['samples'] == 100
++        assert row['first_seen_sample'] == 0 and row['last_seen_sample'] == 99
++        assert dict(row['top_self']) == {leaf.key: 100}
++        assert dict(row['top_inclusive']) == {leaf.key: 100, mid.key: 100, root.key: 100}
++        assert row['cpu_partial'] is False
++    # Each chain is walked once, then reused by frame identity.
++    assert all(frame.walks == 1 for frame in chains.values())
++    # Per-thread work (registry sandwich + CPU reads) only on CPU-refresh ticks.
++    read_times = sorted({now for _, now in h.reads})
++    cadence_ticks = len(read_times) - 1  # minus the end-of-window read
++    assert 9 <= cadence_ticks <= 11
++    assert h.enumerate_calls == 2 * cadence_ticks
++    assert len(h.reads) == 3 * len(read_times)
++
++
++def test_ancestor_generator_caller_change_is_rewalked(monkeypatch):
++    leaf = FakeCode('leaf')
++    gen = FakeCode('gen', inspect.CO_GENERATOR)
++    first, second = FakeFrame(FakeCode('caller_a')), FakeFrame(FakeCode('caller_b'))
++    h = None
++    # Same leaf object and constant CPU; only the suspended generator's caller changes.
++    gen_frame = FakeFrame(gen, lambda: first if h.now < 0.5 - 1e-9 else second)
++    leaf_frame = FakeFrame(leaf, gen_frame)
++    thread = FakeThread(1, 11, 'gen-thread')
++    h = Harness(monkeypatch, lambda now: {1: (thread, leaf_frame)}, cpu=lambda tid, now: 1.0)
++    row = _rows(profiler._collect(1, 100, 10))['gen-thread']
++    inclusive = dict(row['top_inclusive'])
++    assert inclusive['fake.py:1:caller_a'] + inclusive['fake.py:1:caller_b'] == row['samples'] == 100
++    assert inclusive['fake.py:1:caller_a'] == 50
++    assert inclusive[leaf.key] == inclusive[gen.key] == 100
++
++
++def test_greenlet_present_forces_rewalk_of_plain_chain(monkeypatch):
++    leaf = FakeCode('leaf')
++    first, second = FakeFrame(FakeCode('caller_a')), FakeFrame(FakeCode('caller_b'))
++    h = None
++    leaf_frame = FakeFrame(leaf, lambda: first if h.now < 0.5 - 1e-9 else second)
++    thread = FakeThread(1, 11, 'greenlet-thread')
++    h = Harness(monkeypatch, lambda now: {1: (thread, leaf_frame)}, cpu=lambda tid, now: 1.0,
++                modules={'greenlet': object()})
++    inclusive = dict(_rows(profiler._collect(1, 100, 10))['greenlet-thread']['top_inclusive'])
++    assert inclusive['fake.py:1:caller_a'] == 50 and inclusive['fake.py:1:caller_b'] == 50
++
++
++def test_cpu_cadence_without_catchup_and_exit_lower_bound(monkeypatch):
++    code = FakeCode('wait')
++    stays, leaves = FakeThread(1, 11, 'stays'), FakeThread(2, 12, 'leaves')
++    frame_a, frame_b = FakeFrame(code), FakeFrame(code)
++
++    def state(now):
++        alive = {1: (stays, frame_a)}
++        if now < 0.555:
++            alive[2] = (leaves, frame_b)
++        return alive
++
++    def cpu(tid, now):
++        if tid == 12 and now >= 0.53:
++            # Thread is exiting: a Linux TID could already alias another thread.
++            leaves.alive = False
++            return 1000.0
++        return now
++
++    # One 0.35 s scheduling stall must not cause back-to-back CPU-refresh ticks.
++    h = Harness(monkeypatch, state, cpu=cpu, jumps={0.2: 0.35})
++    result = profiler._collect(1, 100, 10)
++    rows = _rows(result)
++    stays_reads = [now for tid, now in h.reads if tid == 11]
++    gaps = [b - a for a, b in pairwise(stays_reads[:-1])]  # end-of-window read excluded
++    assert gaps and min(gaps) >= 0.1 - 1e-9
++    assert max(gaps) <= 0.35 + 0.1 + 0.02
++    assert rows['stays']['cpu_partial'] is False
++    assert rows['stays']['cpu_last_sample'] == result['samples']
++    assert rows['stays']['cpu_s'] == pytest.approx(stays_reads[-1] - stays_reads[0])
++
++    leaves_row = rows['leaves']
++    good = [now for tid, now in h.reads if tid == 12 and now < 0.53]
++    assert leaves_row['cpu_partial'] is True
++    assert leaves_row['cpu_s'] == pytest.approx(good[-1] - good[0])  # dead read discarded
++    assert leaves_row['cpu_last_sample'] <= leaves_row['last_seen_sample'] < result['samples'] - 1
++
++
++def test_failed_first_cpu_read_recovers_but_is_partial(monkeypatch):
++    thread = FakeThread(1, 11, 'late-cpu')
++    frame = FakeFrame(FakeCode('wait'))
++    seen = []
++
++    def cpu(tid, now):
++        seen.append(now)
++        return None if len(seen) == 1 else now
++
++    h = Harness(monkeypatch, lambda now: {1: (thread, frame)}, cpu=cpu)
++    row = _rows(profiler._collect(1, 100, 10))['late-cpu']
++    assert row['cpu_partial'] is True
++    assert row['cpu_s'] == pytest.approx(seen[-1] - seen[1])
++    assert h.reads
++
++
++def test_enumerate_sandwich_rejects_reused_ident(monkeypatch):
++    code = FakeCode('wait')
++    old, new = FakeThread(7, 70, 'old'), FakeThread(7, 71, 'new')
++    old_frame, new_frame = FakeFrame(code), FakeFrame(code)
++    boundary, after_boundary = 0.285, 0.295  # tick 29 lies between these
++
++    def state(now):
++        # The boundary tick's snapshot already shows the new lifetime's frame.
++        return {7: (old, old_frame) if now < boundary else (new, new_frame)}
++
++    def registry(now, call_in_tick):
++        # On the boundary tick the ident is reused between the two enumerations.
++        if now < boundary:
++            return [old]
++        if now < after_boundary:
++            return [old] if call_in_tick == 1 else [new]
++        return [new]
++
++    h = Harness(monkeypatch, state, registry=registry)
++    result = profiler._collect(1, 100, 10)
++    rows = _rows(result)
++    assert set(rows) == {'old', 'new'}
++    assert rows['old']['samples'] + rows['new']['samples'] == result['samples'] - 1
++    assert rows['old']['last_seen_sample'] + 2 == rows['new']['first_seen_sample']
++    assert h.frames_calls >= result['samples']
++
++
++def test_no_frame_references_survive_success_or_error(monkeypatch):
++    code = FakeCode('wait')
++    thread = FakeThread(1, 11, 't')
++    holder = {'frame': FakeFrame(code, FakeFrame(FakeCode('root')))}
++    ref = weakref.ref(holder['frame'])
++    Harness(monkeypatch, lambda now: {1: (thread, holder['frame'])} if 'frame' in holder else {})
++    profiler._collect(1, 100, 10)
++    del holder['frame']
++    gc.collect()
++    assert ref() is None
++
++    holder['frame'] = FakeFrame(code)
++    ref = weakref.ref(holder['frame'])
++    calls = []
++
++    def failing(tid, now):
++        calls.append(now)
++        if len(calls) == 3:
++            raise RuntimeError('reader failed')
++        return now
++
++    h = Harness(monkeypatch, lambda now: {1: (thread, holder['frame'])} if 'frame' in holder else {}, cpu=failing)
++    with pytest.raises(RuntimeError) as caught:
++        profiler._collect(1, 100, 10)
++    del holder['frame']
++    gc.collect()
++    assert caught.value.__traceback__ is not None
++    assert ref() is None
++    assert h.reads
++
++
++@pytest.mark.platforms('linux', 'macos')
++def test_real_idle_threads_take_batched_ticks(monkeypatch):
++    """Real frames: the sampler's own frame must be identical across snapshots."""
++    import threading
++    real_enumerate = threading.enumerate
++    calls = []
++
++    def counted():
++        calls.append(1)
++        return real_enumerate()
++
++    monkeypatch.setattr(profiler, 'threading', types.SimpleNamespace(enumerate=counted))
++    stop = threading.Event()
++    idle = [threading.Thread(target=stop.wait, name=f'idle-{i}', daemon=True) for i in range(20)]
++    for thread in idle:
++        thread.start()
++    try:
++        result = profiler._collect(1, 100, 5)
++    finally:
++        stop.set()
++        for thread in idle:
++            thread.join(3)
++    rows = [r for r in result['threads'] if r['name'].startswith('idle-')]
++    assert len(rows) == 20
++    assert all(r['samples'] == result['samples'] for r in rows)
++    # ~11 CPU-refresh ticks plus slack for unrelated thread churn; unbatched would be ~200.
++    assert len(calls) <= 2 * 30, len(calls)
+diff --git a/website/docs/developer-guide/gateway-profiling.md b/website/docs/developer-guide/gateway-profiling.md
+index 4d50714bd95..92e72479966 100644
+--- a/website/docs/developer-guide/gateway-profiling.md
++++ b/website/docs/developer-guide/gateway-profiling.md
+@@ -16,12 +16,14 @@ Booleans, numeric strings, out-of-range numbers and non-finite numbers are rejec
+ {
+   "seconds": 20,
+   "hz": 100,
++  "cpu_refresh_s": 0.1,
+   "samples": 2000,
+   "threads": [{
+     "name": "example",
+     "native_id": 123,
+     "cpu_s": 0.01,
+     "cpu_partial": false,
++    "cpu_last_sample": 2000,
+     "samples": 2000,
+     "first_seen_sample": 0,
+     "last_seen_sample": 1999,
+@@ -35,11 +37,11 @@ This is an illustrative schema, not a captured profile. Frame keys use `co_filen
+ 
+ Stack counts are **wall samples**, not CPU attribution. Sleeping threads can accumulate many samples with almost zero CPU. CPU seconds are independently measured native thread CPU-clock deltas. Sampling is GIL-dependent and can be delayed by busy threads or native extensions; inspect the actual sample count. Threads without an identifiable Python `threading.Thread`/native ID are not reported. Purely native threads without Python frames are outside the stack census.
+ 
+-CPU starts at each thread's first observation, not at its lifetime origin. Exited threads remain in the result; their last readable CPU clock supplies a **partial/lower bound**, explicitly marked `cpu_partial: true`. Unavailable CPU is `null`, never a guessed zero. Work before the first observation and after the last readable observation cannot be recovered. A thread that starts and exits entirely between samples cannot be detected. Thread objects and native IDs distinguish lifetimes even when Python thread identifiers or names are reused.
++CPU starts at each thread's first observation, not at its lifetime origin. Native CPU clocks are read at that first observation, then on refresh ticks at most every `cpu_refresh_s` (0.1) monotonic seconds, and once at window end. A late tick takes one refresh and schedules the next 0.1 s later; missed refreshes are skipped, never replayed in a burst. `cpu_last_sample` is the zero-based sample index of the last successful CPU read, `samples` for the end-of-window read, or `null` if no read succeeded. Every read is followed by `Thread.is_alive()`; a read whose thread is already dead is discarded, because on Linux its numeric TID may already belong to another thread. If the first read fails and a later one succeeds, CPU is measured from the later read and marked `cpu_partial: true`. Exited threads remain in the result; their last readable CPU clock supplies a **partial/lower bound**, explicitly marked `cpu_partial: true`. Unavailable CPU is `null`, never a guessed zero. Work before the first observation and after the last readable observation cannot be recovered. A thread that starts and exits entirely between samples cannot be detected. Thread objects and native IDs distinguish lifetimes even when Python thread identifiers or names are reused.
+ 
+ Linux reads `clock_gettime((~native_id << 3) | 6)`, the kernel `MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)` encoding. This avoids `pthread_getcpuclockid(pthread_t)`, whose userspace pthread pointer may already have been freed when a thread exits; the numeric kernel lookup fails safely for exited IDs. No arbitrary process is queried. macOS uses own-process `proc_pidinfo(PROC_PIDTHREADID64INFO = 15)` through ctypes and sums the user/system nanosecond counters of `struct proc_threadinfo` (112 bytes). On macOS `threading.native_id` is `pthread_threadid_np()`'s 64-bit kernel `thread_id`; XNU (`bsd/kern/proc_info.c`, `osfmk/kern/bsd_kern.c:fill_taskthreadinfo`) matches flavor 15 against `thread->thread_id` but `PROC_PIDTHREADINFO = 5` against `machine.cthread_self` (the TSD handle listed by `PROC_PIDLISTTHREADS`; on arm64 `pthread_self() + 224`). Flavor 5 therefore fails with `ESRCH` for every native ID. Kernel thread IDs are not reused, so an exited thread reads as unavailable and cannot alias a later thread. Other hosts return unavailable CPU.
+ 
+-To reduce idle sampling overhead, identical leaf frame objects reuse their previous stack only when their native CPU clock is unchanged. Code keys use identity rather than structural code-object hashing. Repeated stacks are aggregated before deriving self/inclusive counts. Only the preceding frame snapshot is retained; frame references are cleared at completion. No frame or code objects appear in the result.
++Every tick takes an exact `sys._current_frames()` snapshot, and every accepted frame is counted. A thread's stack is re-walked unless its leaf frame is the same object as in the previous snapshot **and** no frame in its chain is a generator, coroutine or async generator **and** `greenlet` is not imported. A suspended generator anywhere in the chain (not only at the leaf) can be resumed under a different caller, so such chains are always re-walked. When the whole snapshot is identical (same identifiers, same frame objects, all chains reusable) and no CPU refresh is due, the tick extends an open run that is added to every row when the snapshot changes or the window ends, with no per-thread loop. Other ticks enumerate threads before and after the snapshot and accept an identifier only when both enumerations show the same `Thread` object, so an identifier reused mid-snapshot is not attributed to either lifetime. Lifetimes are keyed by `Thread` object plus native ID. Code keys use identity rather than structural code-object hashing. Repeated stacks are aggregated before deriving self/inclusive counts. Only the preceding frame snapshot is retained; frame references are cleared at completion and on errors (including callee frames in the error traceback). No frame or code objects appear in the result.
+ 
+ Responses include the complete envelope and newline in the size budget and stay below the 512 KiB response cap. Oversized results omit whole frame entries or whole threads (including giant names), never rewrite frame keys or names. They add `truncated`, `omitted_threads`, and `omitted_frames`. The request ID is included in the budget. A response whose envelope alone is too large uses the existing `response_too_large` error; socket requests are separately limited to 64 KiB.
+ 
+@@ -80,10 +82,35 @@ Median incremental overhead on macOS: **16.48085% of one core, which misses the
+ | 1 | 16.68482 (16.19497, 16.68482, 16.75607) | 15.42431 (15.15525, 15.43350, 15.42431) |
+ | 2 | 16.30566 (16.30566, 16.85843, 16.13515) | 15.14392 (15.03389, 15.14392, 15.26198) |
+ 
+-PyDLL saves about 1.2 points of core, roughly 7%. **macOS still misses the 3% target** at about 15%. Linux after this change measured a **2.18334%** median (`scripts/benchmark_gateway_profile.py --seconds 5 --rounds 3 --threads 150 --hz 100`). Not yet evaluated: one Mach `task_threads` call plus `thread_info` per port (still one syscall per thread, plus port-to-thread-id mapping) and lowering per-thread CPU-read frequency (which changes sample semantics).
++PyDLL saves about 1.2 points of core, roughly 7%. **macOS still misses the 3% target** at about 15%. Linux after this change measured a **2.18334%** median (`scripts/benchmark_gateway_profile.py --seconds 5 --rounds 3 --threads 150 --hz 100`). Not yet evaluated: one Mach `task_threads` call plus `thread_info` per port (still one syscall per thread, plus port-to-thread-id mapping). Lowering the per-thread CPU-read frequency is now implemented (below).
++
++**Snapshot fast path and 10 Hz CPU refresh (current code).** Linux 7.0.0-1014-aws, Python 3.14.9, same parameters (150 idle threads, 100 Hz, 3 × 5 s rounds), interleaved A/B against the previous implementation from isolated copies of the module, host load average about 2–7:
++
++| Implementation | Run 1 rounds % | Run 1 median % | Run 2 rounds % | Run 2 median % |
++| --- | --- | ---: | --- | ---: |
++| Previous (CPU read every tick) | 2.124, 2.220, 2.201 | 2.201 | 2.006, 2.214, 2.213 | 2.213 |
++| Current | 0.733, 0.744, 0.745 | 0.744 | 0.703, 0.954, 0.758 | 0.758 |
++
++Every round had 500 samples and 150 idle threads seen.
++
++Native macOS follow-up (same Mac mini, isolated stdlib probes, 150 idle threads, 100 Hz, 3 × 5 s rounds):
++
++| Python | Implementation | Incremental % core rounds | Median % core |
++| --- | --- | --- | ---: |
++| 3.12.2 | Previous PyDLL | 15.26453, 15.26455, 15.64877 | 15.26455 |
++| 3.12.2 | Snapshot batching / 10 Hz CPU | 3.65624, 3.79617, 3.92824 | 3.79617 |
++| 3.14.9 | Previous PyDLL | 14.36053, 14.31971, 14.92169 | 14.36053 |
++| 3.14.9 | Snapshot batching / 10 Hz CPU | 3.11061, 3.11483, 3.28467 | 3.11483 |
++| 3.14.9 | Also omit redundant pre-refresh snapshot (current) | 3.29556, 3.61991, 3.35109 | 3.35109 |
++
++All rounds collected 500 samples, all 150 idle threads, and readable CPU for every idle thread. **The macOS target remains unmet**; the single-snapshot change has no demonstrated performance gain in these shared-host measurements (load averages ranged about 7–25). The final native functional probe passed: busy Python thread 1.743097 CPU s, GIL-released native worker 0.655284 CPU s, sleeping thread 0.001776 CPU s, short-lived thread 0.1425 CPU s marked partial, exited native ID unavailable. These are stdlib subprocess checks, not a native pytest run or a live gateway measurement.
++
++A separate Python 3.12 attribution probe measured whole-profile CPU at 3.743% with the real reader versus 2.739% with a constant reader; collecting frames alone at 100 Hz measured 1.721%. These are attribution controls, not baseline-subtracted acceptance figures. The initial design coupled native counters to every stack tick and repeated Python bookkeeping for unchanged stacks; native benchmarking caught that cost after Linux-only performance checks passed. Counter refresh decoupling and exact run aggregation address that design, with deterministic cadence/lifetime tests and native A/B measurements preventing a Linux-only performance claim. Remaining native-reader and snapshot cost needs further work rather than rounding 3.11% down to the target.
+ 
+ ## Verification status
+ 
++`tests/gateway/test_control_profile_fastpath.py` drives `_collect` with a fake clock, frame snapshot and thread registry, and covers: exact batched counts for identical safe snapshots (with recursive dedup and no per-thread work between CPU refreshes), re-walking when an ancestor generator's caller changes under the same leaf frame, re-walking when `greenlet` is imported, CPU cadence without catch-up after a stall, exited-thread lower bounds with a dead-thread read discarded, recovery from a failed first CPU read (marked partial), rejecting an identifier reused between the two enumerations, and no frame references surviving success or an error. A real-thread test checks the fast path engages for idle threads (it failed with 200 enumerations per 100 ticks before the sampler's own frame was kept stable). Each failed on the previous implementation and passes now; existing tests are unchanged. Five profiler test files via `scripts/run_tests.sh`: **35 passed, 1 macOS-only skipped**, three consecutive runs; `python3 scripts/check --base HEAD`: 15 checks ok.
++
+ Tests are run only through `scripts/run_tests.sh`. The contract test was first corrected from an erroneous global self table/`cpu_seconds` shape to the approved per-thread shape, then failed on the base with `unknown verb: 'profile'`. Incremental RED→GREEN runs covered the sampler, argument validation, concurrent refusal, response trimming, CLI parser/dispatch and invalid parameter objects. Additional acceptance tests cover recursive inclusive deduplication, real sleeping/burning threads, short-lived threads and successive same-name thread lifetimes. The CLI integration test runs against a real temporary Unix socket, checks JSON and text, and requires identify/status each to answer in under 0.5 seconds while the profile is in progress.
+ 
+ Final Linux verification: **89 passed, 0 failed, 1 macOS-only skipped** across the four new profiler test files plus six related control-socket/diagnostics files. `python3 scripts/check --base HEAD` passed all **15 checks**. The full repository test suite was not run. After the macOS flavor fix, the four profiler test files gave **26 passed, 0 failed, 1 macOS-only skipped** via `scripts/run_tests.sh`. That count includes the new portable `test_darwin_reader_queries_thread_id64_flavor`, which fails on the flavor-5 code with `assert None == 1.75`.
+-- 
+2.55.0
+

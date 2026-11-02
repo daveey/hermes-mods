@@ -5,6 +5,15 @@ configuration docs), **0578** (`5ac187baca`, carried options) and **0636** (`7f1
 no duplicate on retry), **0651** (`ae139f8d31`, identity failures refuse explicit pins) and **0655**
 (`4f6e223fe8`, title-only host markers, visible local decisions and creator-scoped archive). Companion: [kanban-capability-routing.md](kanban-capability-routing.md) (the route back).
 
+## Worker-first opt-in (1662)
+
+Patch **1662** adds a separate durable worker-pool policy for portable cards. See
+[worker-first placement](kanban-worker-first-placement.md) for Behavior, implementation, exact source tests,
+deployment prerequisites and rollback. Its tool **and CLI** enrollment paths supersede the historical CLI
+non-placement limitation below only for this new opt-in policy; legacy forwarding is unchanged.
+A configured origin pool, even an empty one, queues eligible work without local overflow. No origin pool
+entry retains the legacy behavior described here.
+
 ## Behavior
 
 A gateway whose own machine must stay quiet (a laptop the user works on) maps itself to a target gateway:
@@ -130,7 +139,7 @@ gateway has, so capability routing opens an owner card back there.
   `test_still_queued_after_the_wait_says_the_card_is_created_and_not_to_call_again`,
   `test_identical_retry_returns_the_same_request_and_sends_no_second_card`, `test_remote_task_id_reads_a_plain_create_output`.
   The hermes-hub side (`outcomes`) is tested in the hermes-hub repo (`client/tests/test_outcomes_cli.py`). Live: a plain
-  `hermes chat -q` that called `kanban_create` once got back hub task id `t_01a18119d1bf4d6e` in 12.5 s and left exactly
+  `hermes chat -q` that called `kanban_create` once got back a hub task id in 12.5 s and left exactly
   one hub card.
 - 0573: `test_hub_cli_resolves_without_the_login_shell_path` (PATH without the install dir, `~/.local/bin` fallback, configured value wins, routing uses it) and `test_remote_body_names_the_capability_to_route_back_with`.
 

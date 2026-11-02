@@ -20,18 +20,34 @@ class VerificationError(Exception):
     pass
 
 
-def git(repo, *args, data=None):
+def run_git(repo, *args, data=None):
     # Do not inherit another worktree's index, object directory or repository.
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
     env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
                GIT_TERMINAL_PROMPT='0')
-    result = subprocess.run(
+    return subprocess.run(
         ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false',
          '-c', 'user.name=Mirror verifier', '-c', 'user.email=mirror@example.com',
          '-C', str(repo), *args], input=data, capture_output=True, env=env)
+
+
+def git(repo, *args, data=None):
+    result = run_git(repo, *args, data=data)
     if result.returncode:
         raise VerificationError('Git operation failed: ' + args[0])
     return result.stdout
+
+
+def is_ancestor(repo, ancestor, descendant):
+    """True/False from merge-base's exit status 0/1; anything else fails closed."""
+    code = run_git(repo, 'merge-base', '--is-ancestor', ancestor, descendant).returncode
+    if code not in (0, 1):
+        raise VerificationError('Git operation failed: merge-base')
+    return code == 0
+
+
+def parents(repo, commit):
+    return git(repo, 'rev-list', '--parents', '-1', commit).decode().split()[1:]
 
 
 def resolve(repo, ref):
@@ -59,9 +75,12 @@ def inventory(repo, base, tip, patch_dir):
             raise VerificationError('Patch ordinals must be contiguous and unique')
     seen = {}
     for ordinal, path in enumerate(files, 1):
-        header = HEADER.fullmatch(path.read_bytes().split(b'\n', 1)[0])
+        data = path.read_bytes()
+        header = HEADER.fullmatch(data.split(b'\n', 1)[0])
         if not header:
             raise VerificationError(f'Source header mismatch at ordinal {ordinal}: no SHA header')
+        if sum(line.startswith(b'From ') for line in data.splitlines()) != 1:
+            raise VerificationError(f'Exactly one mail entry required at ordinal {ordinal}')
         sha = header[1].decode()
         if sha in seen:
             raise VerificationError(
@@ -186,13 +205,48 @@ def compare(repo, tip, applied, substitutions, fingerprints, renames=()):
         raise VerificationError('Unused historical fingerprints; policy must match exactly')
 
 
+def load_ancestry_only(repo, tip, entries, headers, bridges):
+    """Patches whose source commits survive only as merge ancestry, never as tree content.
+
+    Each entry names a published single-parent patch commit and the frozen-tip merge
+    that retains it: the merge's tree is exactly its first parent's tree, and the
+    patch reaches the merge only through a non-first parent. Such a patch cannot
+    replay in linear context, so it is verified in isolation instead (see verify).
+    """
+    if not isinstance(entries, list) or not entries:
+        raise ValueError()
+    ancestry = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {'patch', 'source_merge'}:
+            raise ValueError()
+        sha, merge = entry['patch'], entry['source_merge']
+        if not all(isinstance(x, str) and re.fullmatch(r'[0-9a-f]{40}', x) for x in (sha, merge)):
+            raise ValueError()
+        if sha not in headers or sha in ancestry or sha in bridges:
+            raise ValueError()
+        if resolve(repo, sha) != sha or resolve(repo, merge) != merge:
+            raise ValueError()
+        merge_parents = parents(repo, merge)
+        if len(parents(repo, sha)) != 1 or len(merge_parents) < 2:
+            raise ValueError()
+        if not is_ancestor(repo, merge, tip):
+            raise ValueError()
+        if git(repo, 'rev-parse', merge + '^{tree}') != git(repo, 'rev-parse', merge_parents[0] + '^{tree}'):
+            raise ValueError()
+        if not is_ancestor(repo, sha, merge) or is_ancestor(repo, sha, merge_parents[0]):
+            raise ValueError()
+        ancestry[sha] = merge
+    return ancestry
+
+
 def load_replay_plan(path, repo, tip, base, patches):
     """Explicit opt-in only: pinned start and hash-bound merge diffs, never skips."""
     if path is None:
-        return None, {}
+        return None, {}, {}
     try:
         plan = json.loads(Path(path).read_text())
-        if set(plan) != {'source_tip', 'base', 'start', 'bridges'}:
+        if not {'source_tip', 'base', 'start', 'bridges'} <= set(plan) <= {
+                'source_tip', 'base', 'start', 'bridges', 'ancestry_only'}:
             raise ValueError()
         if plan['source_tip'] != tip or plan['base'] != base:
             raise ValueError()
@@ -204,7 +258,8 @@ def load_replay_plan(path, repo, tip, base, patches):
         headers = {HEADER.fullmatch(p.read_bytes().split(b'\n', 1)[0])[1].decode()
                    for p in patches}
         bridges = {}
-        if not isinstance(plan['bridges'], list) or not plan['bridges']:
+        # An empty bridge list is allowed only when ancestry-only entries do the work.
+        if not isinstance(plan['bridges'], list) or not (plan['bridges'] or 'ancestry_only' in plan):
             raise ValueError()
         for bridge in plan['bridges']:
             if set(bridge) != {'before', 'diff', 'sha256', 'source_merge'}:
@@ -225,9 +280,20 @@ def load_replay_plan(path, repo, tip, base, patches):
             if hashlib.sha256(data).hexdigest() != bridge['sha256']:
                 raise ValueError()
             bridges[before] = data
-        return start, bridges
+        ancestry = {}
+        if 'ancestry_only' in plan:
+            ancestry = load_ancestry_only(repo, tip, plan['ancestry_only'], headers, bridges)
+        return start, bridges, ancestry
     except (ValueError, TypeError, KeyError, AttributeError):
         raise VerificationError('Invalid replay plan or snapshot mismatch') from None
+
+
+def remove_worktree(repo, path):
+    # Retry a transient removal failure, without pruning sibling worktrees.
+    try:
+        git(repo, 'worktree', 'remove', '--force', str(path))
+    except VerificationError:
+        git(repo, 'worktree', 'remove', '--force', str(path))
 
 
 def verify(source_repo, source_tip, base, patch_dir, policy=None, replay_plan=None):
@@ -236,43 +302,67 @@ def verify(source_repo, source_tip, base, patch_dir, policy=None, replay_plan=No
     patches = inventory(repo, base, tip, patch_dir)
     substitutions, fingerprints, renames = load_policy(policy, tip, base)
     merge_base = git(repo, 'merge-base', base, tip).decode().strip()
-    start, bridges = load_replay_plan(replay_plan, repo, tip, base, patches)
+    start, bridges, ancestry = load_replay_plan(replay_plan, repo, tip, base, patches)
     replay_start = start or merge_base
-    # Only remove the uniquely allocated worktree; never prune anyone else's.
+    # Only remove the uniquely allocated worktrees; never prune anyone else's.
     directory = Path(tempfile.mkdtemp(prefix='mirror-verify-'))
     worktree = directory / 'replay'
-    added = False
+    owned = {}  # path -> whether `worktree add` returned successfully
+
+    def add(path, commit):
+        owned[path] = False
+        git(repo, 'worktree', 'add', '--detach', str(path), commit)
+        owned[path] = True
+
     try:
-        git(repo, 'worktree', 'add', '--detach', str(worktree), replay_start)
-        added = True
+        add(worktree, replay_start)
         # Batch each uninterrupted segment; all source patches still replay once.
         pending = []
         for patch in patches:
             sha = HEADER.fullmatch(patch.read_bytes().split(b'\n', 1)[0])[1].decode()
-            if sha in bridges:
+            if sha in bridges or sha in ancestry:
                 if pending:
                     git(worktree, 'am', '-3', '--empty=keep', data=b''.join(pending))
                     pending = []
+            if sha in bridges:
                 git(worktree, 'apply', '--index', '--3way', data=bridges[sha])
                 git(worktree, 'commit', '--allow-empty', '-qm', 'Explicit upstream merge bridge')
+            if sha in ancestry:
+                # Prove the unchanged published bytes recreate the source commit's whole
+                # tree in its own first-parent context: privacy substitutions only, no
+                # fingerprints or renames. Then mark the merge that discards its tree.
+                side = directory / ('ancestry-' + sha)
+                add(side, parents(repo, sha)[0])
+                git(side, 'am', '-3', '--empty=keep', data=patch.read_bytes())
+                compare(repo, sha, resolve(side, 'HEAD'), substitutions, {}, ())
+                remove_worktree(repo, side)
+                del owned[side]
+                git(worktree, 'commit', '--allow-empty', '-qm',
+                    'Ancestry-only source merge ' + ancestry[sha] + ' retains ' + sha)
+                continue
             pending.append(patch.read_bytes())
         if pending:
             git(worktree, 'am', '-3', '--empty=keep', data=b''.join(pending))
         applied = resolve(worktree, 'HEAD')
         compare(repo, tip, applied, substitutions, fingerprints, renames)
     finally:
-        # Retry a transient removal failure, without pruning sibling worktrees.
-        # If both attempts fail, preserve the directory and registry together for
+        # If removal fails twice, preserve the directory and registry together for
         # recovery rather than leaving a dangling prunable registry entry.
-        if added or worktree.exists():
-            try:
-                git(repo, 'worktree', 'remove', '--force', str(worktree))
-            except VerificationError:
-                git(repo, 'worktree', 'remove', '--force', str(worktree))
+        failure = None
+        for path, added in reversed(list(owned.items())):
+            if added or path.exists():
+                try:
+                    remove_worktree(repo, path)
+                except VerificationError as error:
+                    failure = failure or error
+        if failure:
+            raise failure
         shutil.rmtree(directory)
     result = {'patches': len(patches), 'source_tip': tip, 'base': base, 'merge_base': merge_base}
     if replay_plan is not None:
         result.update(replay_start=replay_start, bridges=len(bridges))
+    if ancestry:
+        result.update(ancestry_only=len(ancestry))
     return result
 
 

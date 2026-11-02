@@ -1,0 +1,108 @@
+From 1fb00ff49467421646cd2960bf9d6a3c4746c4dc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:17:47 -0800
+Subject: [PATCH] fix(tests): session daemon reaper matches HERMES_HOME
+ lexically, never resolves a live gateway's real home [daveey]
+
+On example gateway, test_basetemp_isolation and test_session_daemon_reaper failed with
+"TEST BUG: file I/O against the REAL hermes home: /home/user/.hermes/profiles".
+
+Why 1: _processes_with_hermes_home_under() called Path(HERMES_HOME).resolve() for every
+  process in /proc; realpath lstat()s each component (conftest.py:1344 traceback).
+Why 2: the hub runs live gateways with HERMES_HOME=~/.hermes/profiles/<p>, so the scan
+  resolved paths inside the real home while the real-home I/O guard was installed
+  (both tests call the reaper from inside a test).
+Why 3: membership in this session's roots only needs path comparison, but the scan
+  used filesystem resolution on paths it does not own.
+Not caught: CI runners and Macs run no Hermes processes (and the scan is Linux-only),
+  and no test put a foreign process on the real home in /proc.
+
+Fix: resolve only the session's own roots (match their given and resolved spellings);
+compare each process's absolute HERMES_HOME lexically; skip relative values. The
+real-home guard is unchanged. New test spawns a stand-in gateway whose HERMES_HOME is
+inside the guarded real root and asserts the reaper neither trips the guard nor
+signals it: RED on the hub before the fix, GREEN after.
+---
+ tests/conftest.py                   | 13 ++++++++++--
+ tests/test_session_daemon_reaper.py | 32 +++++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/tests/conftest.py b/tests/conftest.py
+index e987b4b8bd6..8bf0ce9d0ce 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1330,10 +1330,16 @@ def _processes_with_hermes_home_under(roots) -> list[int]:
+ 
+     Linux only (``/proc/<pid>/environ``; unreadable entries are another user's and skipped).
+     Elsewhere the scan is empty: a test-spawned daemon there is the per-test guard's problem.
++
++    Membership is decided lexically: another process's ``HERMES_HOME`` is never resolved, because
++    the host's live gateways (the hub's ``~/.hermes/profiles/<p>``) name the real Hermes home and
++    ``realpath`` would ``lstat`` it, which the real-home I/O guard refuses. Only this session's own
++    roots are resolved, and both their given and resolved spellings are matched, so a child that
++    got either spelling of a root is still found.
+     """
+     if not sys.platform.startswith("linux") or not os.path.isdir("/proc"):
+         return []
+-    resolved = [Path(r).resolve() for r in roots if r]
++    resolved = {Path(os.path.abspath(r)) for r in roots if r} | {Path(r).resolve() for r in roots if r}
+     found = []
+     for entry in os.scandir("/proc"):
+         if not entry.name.isdigit() or int(entry.name) == os.getpid():
+@@ -1347,9 +1353,12 @@ def _processes_with_hermes_home_under(roots) -> list[int]:
+         if not home:
+             continue
+         try:
+-            path = Path(os.fsdecode(home)).resolve()
++            text = os.fsdecode(home)
+         except (OSError, ValueError):
+             continue
++        if not os.path.isabs(text):  # relative to that process's cwd, not ours
++            continue
++        path = Path(os.path.normpath(text))
+         if any(path == root or path.is_relative_to(root) for root in resolved):
+             found.append(int(entry.name))
+     return found
+diff --git a/tests/test_session_daemon_reaper.py b/tests/test_session_daemon_reaper.py
+index 8f5af2fc14a..13c42a97523 100644
+--- a/tests/test_session_daemon_reaper.py
++++ b/tests/test_session_daemon_reaper.py
+@@ -46,3 +46,35 @@ def test_session_teardown_terminates_daemons_under_the_session_basetemp_only(tmp
+             if proc.poll() is None:
+                 proc.kill()
+             proc.wait(timeout=5)
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.live_system_guard_bypass  # signals nothing: the only child is outside every session root
++def test_session_teardown_skips_a_live_gateway_on_the_real_hermes_home_without_touching_it(tmp_path):
++    # A host's own gateways (hermes-hub: HERMES_HOME=~/.hermes/profiles/<p>) are visible in /proc.
++    # The scan must neither signal them nor resolve their home: realpath lstat()s the real home,
++    # which the real-home I/O guard (active in this test) refuses.
++    assert suite_conftest._REAL_HERMES_ROOT_CANDIDATES, "the real-home guard has no root to refuse"
++    real_profile = suite_conftest._REAL_HERMES_ROOT_CANDIDATES[0] / "profiles" / "live-gateway"
++    basetemp = tmp_path / "basetemp"
++    live = _detached(real_profile, "live")
++    try:
++        wait_until(lambda: _environ_home(live.pid) == os.fsencode(real_profile), timeout=10,
++                   what="the live-gateway stand-in exec'd with its HERMES_HOME")
++        config = SimpleNamespace(_tmp_path_factory=SimpleNamespace(_basetemp=basetemp))
++        assert live.pid not in suite_conftest._reap_session_hermes_processes(config)
++        assert live.poll() is None, "a process on the real Hermes home was signalled"
++    finally:
++        if live.poll() is None:
++            live.kill()
++        live.wait(timeout=5)
++
++
++def _environ_home(pid):
++    # /proc is outside every guarded root; read it the way the reaper does.
++    try:
++        with open(f"/proc/{pid}/environ", "rb") as handle:
++            environ = handle.read().split(b"\0")
++    except OSError:
++        return None
++    return next((item[12:] for item in environ if item.startswith(b"HERMES_HOME=")), None)
+-- 
+2.55.0
+

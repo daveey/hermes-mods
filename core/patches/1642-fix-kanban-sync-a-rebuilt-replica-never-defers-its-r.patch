@@ -1,0 +1,116 @@
+From 03d35b40826ba4412a6922542fc3dc815c9f38f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 05:18:46 +0000
+Subject: [PATCH] fix(kanban-sync): a rebuilt replica never defers its repair
+ pass, even when the inode is reused [daveey]
+
+Review of 2e24cb107e8: the rebuild deletes and recreates the replica file and ext4 often hands the same
+inode back, so (dev, ino) alone could make a rebuild look like a cursor-only change. _pulled_replica now
+reports rebuilt and such a round always repairs. Tests: a real snapshot rebuild (svc.compact) with a
+reused inode (RED without the flag), and a mode change inside the window.
+---
+ hermes_cli/kanban_sync_client.py              | 13 +++++----
+ .../test_kanban_sync_repair_window.py         | 29 ++++++++++++++++---
+ 2 files changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 9aff3fbd480..68d44c974b7 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -725,8 +725,10 @@ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+ 
+ @contextmanager
+ def _pulled_replica(slug: str, hub: Hub, gateway: str):
+-    """Keep the pulled (or rebuilt) replica open for this round, closing it on every exit."""
++    """Keep the pulled (or rebuilt) replica open for this round, closing it on every exit. Yields
++    ``(replica, pulled, rebuilt)``; ``rebuilt`` is True when the replica was replaced from a snapshot."""
+     replica = open_shadow(slug, gateway)
++    rebuilt = False
+     try:
+         try:
+             pulled = pull(replica, hub, slug, observers=False)
+@@ -735,19 +737,20 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str):
+             replica.close()
+             shadow_path(slug).unlink(missing_ok=True)
+             replica = open_shadow(slug, gateway)
++            rebuilt = True
+             pulled = resync(replica, hub, slug, observers=False)
+         try:  # readers derive the replica's staleness from this (kanban_chat_links); a failed stamp only ages it
+             sync.mark_pulled(replica)
+         except sqlite3.Error as exc:
+             _log.warning("kanban sync: %s replica pull not stamped (%s)", slug, exc)
+-        yield replica, pulled
++        yield replica, pulled, rebuilt
+     finally:
+         replica.close()
+ 
+ 
+ def _pull_replica(slug: str, hub: Hub, gateway: str) -> int:
+     """Pull the whole replica for standalone callers that do not run repairs."""
+-    with _pulled_replica(slug, hub, gateway) as (_, pulled):
++    with _pulled_replica(slug, hub, gateway) as (_, pulled, _rebuilt):
+         return pulled
+ 
+ 
+@@ -764,7 +767,7 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+         if mode == "off":
+             return result
+         ensure_identity(live, slug, gateway)
+-        with _pulled_replica(slug, hub, gateway) as (replica, pulled):
++        with _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             result.pulled = pulled
+             if mode == "primary":
+                 try:
+@@ -777,7 +780,7 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+             inputs = _repair_inputs(path, replica, mode, gateway)
+             key = str(path)
+             if inputs is None or _REPAIRED.get(key) != inputs:
+-                deferred = _defer_repair(key, inputs)
++                deferred = not rebuilt and _defer_repair(key, inputs)
+                 from hermes_cli.kanban_sync_partition_repair import repair_partition_chat_links, repair_partition_links
+                 if not deferred:
+                     repair_partition_links(live, replica, gateway)
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_window.py b/tests/hermes_cli/test_kanban_sync_repair_window.py
+index 38edb534bac..6a5a1dbc1e6 100644
+--- a/tests/hermes_cli/test_kanban_sync_repair_window.py
++++ b/tests/hermes_cli/test_kanban_sync_repair_window.py
+@@ -167,11 +167,32 @@ def test_an_uncaptured_local_write_inside_the_window_is_healed(live, svc, kanban
+ def test_a_rebuilt_replica_repairs_at_once(live, svc, kanban_home, monkeypatch, clock):
+     _settle(live, svc, kanban_home, "shadow")
+     calls = _spy(monkeypatch, HEAVY)
++    _remote(svc)
++    svc.compact(BOARD)  # the replica's cursor is now below the retention floor: the round rebuilds it
++    # Never decided by inode alone: a delete-and-recreate can get the same inode back (ext4 does).
++    real_stat = ksc.os.stat
+     path = str(kanban_home / "kanban.db")
+-    last = ksc._REPAIRED[path]
+-    live_version, (dev, ino, cursor), *rest = last
+-    # The replica file was replaced (a snapshot rebuild): a different inode is never a cursor-only change.
+-    ksc._REPAIRED[path] = (live_version, (dev, ino + 1, cursor), *rest)
++    _dev, ino = ksc._REPAIRED[path][1][:2]
++
++    def _same_inode(st):
++        fields = list(st[:10])
++        fields[1], fields[2] = ino, _dev  # stat_result order: mode, ino, dev, ...
++        return ksc.os.stat_result(fields)
++
++    shadow_file = str(ksc.shadow_path(BOARD))
++    monkeypatch.setattr(ksc.os, "stat", lambda p, *a, **k: _same_inode(real_stat(p)) if str(p) == shadow_file
++                        else real_stat(p, *a, **k))
++    assert not _round(kanban_home, svc).repair_deferred
++    assert all(n == 1 for n in calls.values()), calls
++
++
++@pytest.mark.parametrize("before,after", [("shadow", "primary"), ("primary", "shadow")])
++def test_a_mode_change_inside_the_window_repairs_at_once(live, svc, kanban_home, monkeypatch, clock, before, after):
++    _settle(live, svc, kanban_home, before)
++    calls = _spy(monkeypatch, HEAVY)
++    _remote(svc)
++    assert _round(kanban_home, svc).repair_deferred
++    sync.set_mode(live, after)
+     _remote(svc)
+     assert not _round(kanban_home, svc).repair_deferred
+     assert all(n == 1 for n in calls.values()), calls
+-- 
+2.55.0
+

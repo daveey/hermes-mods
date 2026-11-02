@@ -112,6 +112,43 @@ the non-http(s)-scheme fallback to `urlopen`; the CPU-per-request figures.
   used from several threads holds one socket per thread; `close()` only closes the caller's, the others close on
   their next reuse check or when the thread exits.
 
+## Loop-owned connections and detach fencing (1665, 1670–1672, 1677)
+
+### Behavior
+
+**1665** (`cd8a288a90d0cbd913b7cd21288f17707aaebca9`) reuses idle live/shadow SQLite handles across rounds of one sync loop, but closes standalone-round handles. Repeated identical pull/dispatch stamps and unchanged empty-feed cursor updates avoid writes.
+
+**1670** (`192ad2623c2d527b0f0a1cc79656531da69acbf8`) rechecks sync mode inside the feed-apply write transaction: a feed fetched before detach cannot overwrite newly local custody. **1671** (`accdf2e53139dd281cd6e0687e0b23657b6fd2fa`) fences the complete round, including repairs and pushes, against detach. **1672** (`4d65994a95c650c24533c6133a6d2191f6d0a66f`) makes contention a board-local error so peers still sync. **1677** (`13ab390b2bfbea5bd19c2c13b1c0c6dcaba6e020`) prints busy-detach refusal and returns CLI status 2; unexpected errors still propagate.
+
+### How it works
+
+`connection_scope()` owns a thread-local pool (default limit 32 idle handles); nested scopes have independent lifetimes. Borrowing checks WAL-generation recovery and device/inode identity. Only successfully returned, idle, unchanged-file handles are retained. Exceptions close the borrowed handle and the pool; unfinished transactions are rolled back by close, never committed by the pool. Retention resync invalidates/closes the shadow before unlinking it. `run_forever` owns and closes its scope.
+
+`board_sync_lock()` uses the canonical DB path plus a separate `.sync` lock key and nonblocking native locking. Detach never waits for a network round: `SyncRoundBusy` asks for a retry. The normal dispatcher lock is not reused as the sync lock. `set_mode(off)` requires an on-disk board and takes this fence; the loop catches contention for only the affected board. The transaction-level mode check remains a second protection.
+
+### Code
+
+`hermes_cli/kanban_sync_connections.py` (new), `kanban_sync_guard.py` (new), `kanban_sync_client.py`, `kanban_db_sync.py`, `kanban_suspend_ledger.py`, `kanban_sync_cli.py`.
+
+### Tests
+
+Source tests, not rerun by this mirror:
+
+- `tests/hermes_cli/test_kanban_sync_connections.py`: `test_successive_rounds_reuse_live_and_shadow`, `test_standalone_rounds_close`, `test_failed_round_discards_handles`, `test_reuse_sees_external_writer`, `test_pool_replacement_transaction_and_bound`, `test_pool_retires_deleted_wal_generation`, `test_closed_borrow_is_not_cached`, `test_unstatable_file_is_not_retained`, `test_scope_is_thread_local_and_nested`, `test_shadow_initialization_failure_closes_descriptor`, `test_retention_resync_closes_shadow_before_unlink`, `test_run_forever_owns_and_closes_connections`.
+- `tests/hermes_cli/test_kanban_sync_bookkeeping.py`: `test_repeated_pull_timestamp_and_dispatch_stamp_do_not_write`, `test_empty_apply_only_updates_changed_cursor_and_clears_applying`.
+- `tests/hermes_cli/test_kanban_sync_detach_race.py`: `test_detach_between_feed_precheck_and_write_preserves_custody` (1670), `test_detach_refuses_until_whole_sync_round_including_push_finishes` (1671), `test_busy_round_is_scoped_to_one_board_and_next_pass_recovers` (1672).
+- `tests/hermes_cli/test_kanban_sync_cli_busy.py`: `test_busy_detach_cli_preserves_custody_and_retry_succeeds`, `test_unexpected_cli_error_is_not_hidden` (1677).
+
+These use local SQLite and controlled sync fixtures, not live Board deployment acceptance.
+
+### Applying
+
+Replay these patches in ordinal order with the full series and the current [README applying instructions](README.md); do not treat them as independent mail patches. No configuration is added.
+
+### Gotchas
+
+A pool belongs to one thread and one loop, not the process. A cached handle must not survive a replaced file or retention rebuild. Busy detach is a refusal, not successful custody transfer; retry only after the round ends. Do not catch all runtime exceptions as contention or serialize unrelated boards behind one busy network request.
+
 ## Plugin?
 
 No: the sync client hooks core's kanban DB layer and gateway startup.

@@ -1,0 +1,107 @@
+From c92bb2cf53e0b31a76f76494899357ba460305c8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:57:47 +0000
+Subject: [PATCH] kanban activity revision: drop_triggers before DROP COLUMN of
+ a watched column; legacy-schema tests drop them first
+
+---
+ hermes_cli/kanban_activity_revision.py        | 13 +++++++++++++
+ .../test_kanban_activity_revision.py          | 19 +++++++++++++++++++
+ .../hermes_cli/test_kanban_comment_origin.py  |  3 +++
+ tests/hermes_cli/test_kanban_notify.py        |  5 ++++-
+ 4 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 031fdd75fcc..2573737861b 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -16,6 +16,10 @@ Readers (``content_key``) only trust the counter when every table they read that
+ of its triggers; otherwise (older writer, dropped trigger, rebuilt file) they fall back to the file's stat, the
+ previous behaviour. The key also carries the file identity and ``schema_version``, so a replaced file or a schema
+ change always reads afresh.
++
++The update trigger names each read column, so SQLite refuses ``ALTER TABLE ... DROP COLUMN`` of a watched column
++while it is installed. Call ``drop_triggers(conn)`` first; the next writer init reinstalls them for the new columns
++(readers fall back to the stat key in between).
+ """
+ 
+ from __future__ import annotations
+@@ -103,6 +107,15 @@ def ensure_revision(conn: sqlite3.Connection, tables: Iterable[str]) -> None:
+                 conn.execute(sql)
+ 
+ 
++def drop_triggers(conn: sqlite3.Connection) -> None:
++    """Remove the activity triggers (not the counter), e.g. before a ``DROP COLUMN`` of a watched column. Readers
++    fall back to the file's stat until the next writer init reinstalls them."""
++    names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                                        (PREFIX + "*",))]
++    for name in names:
++        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++
++
+ _READ_SQL = (f"SELECT r.revision, (SELECT schema_version FROM pragma_schema_version) FROM {REVISION_TABLE} r "
+              "WHERE r.id = 1")
+ 
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+index c55fc3d9773..27f0d930132 100644
+--- a/tests/hermes_cli/test_kanban_activity_revision.py
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -142,6 +142,25 @@ def test_reinstall_after_a_gap_moves_the_key(board, home):
+     assert rev.is_revision(ksa._board_content_key(path)) and ksa._board_content_key(path) != gap
+ 
+ 
++def test_drop_column_after_drop_triggers_reinstalls_for_the_new_columns(board, home):
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    path = ksa._board_db_paths()[0]
++    with pytest.raises(sqlite3.OperationalError):  # the update trigger names every read column
++        board.execute("ALTER TABLE task_comments DROP COLUMN origin_gateway")
++    rev.drop_triggers(board)
++    board.execute("ALTER TABLE task_comments DROP COLUMN origin_gateway")
++    board.commit()
++    assert ksa._board_content_key(path)[0] == "stat"
++    rev.ensure_revision(board, rev.LOCAL_TABLES)
++    assert "origin_gateway" not in rev.wanted_triggers(board, ["task_comments"])["kanban_activity_rev_task_comments_update"]
++    before = ksa._board_content_key(path)
++    assert rev.is_revision(before)
++    with kbc.write_txn(board):
++        board.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'a', 'x', 1)",
++                      (tid,))
++    assert ksa._board_content_key(path) != before
++
++
+ def test_hub_bookkeeping_does_not_move_the_fingerprint(board, home):
+     hub_dir = home.parent / "hub-state"
+     hub_dir.mkdir()
+diff --git a/tests/hermes_cli/test_kanban_comment_origin.py b/tests/hermes_cli/test_kanban_comment_origin.py
+index 5c259e4def4..f0419ace3e8 100644
+--- a/tests/hermes_cli/test_kanban_comment_origin.py
++++ b/tests/hermes_cli/test_kanban_comment_origin.py
+@@ -194,6 +194,9 @@ def test_migration_backfills_origin_gateway(kanban_home) -> None:
+         tid = kb.create_task(conn, title="t", assignee="worker")
+     raw = sqlite3.connect(str(db))
+     if "origin_gateway" in {r[1] for r in raw.execute("PRAGMA table_info(task_comments)")}:
++        # A pre-column DB also predates the activity triggers, which name every read column and block the DROP.
++        from hermes_cli.kanban_activity_revision import drop_triggers
++        drop_triggers(raw)
+         raw.execute("ALTER TABLE task_comments DROP COLUMN origin_gateway")
+     for author in ("hub:gw:macbook", "macbook/t_01a18013d59457e9", "default", "hub:op:david"):
+         raw.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, 'x', 1)",
+diff --git a/tests/hermes_cli/test_kanban_notify.py b/tests/hermes_cli/test_kanban_notify.py
+index cfe3255f070..9beafce14e0 100644
+--- a/tests/hermes_cli/test_kanban_notify.py
++++ b/tests/hermes_cli/test_kanban_notify.py
+@@ -947,7 +947,10 @@ def test_migration_backfills_legacy_gateway_subs_to_notify_wake(kanban_home):
+     with kbc.connect() as conn:
+         task_id = kb.create_task(conn, title="legacy sub upgrade")
+         # Simulate a pre-delivery_mode database: drop the column entirely,
+-        # then insert legacy-shaped rows (one gateway, one tui).
++        # then insert legacy-shaped rows (one gateway, one tui). A pre-column DB also predates the activity
++        # triggers, which name every read column and so block the DROP.
++        from hermes_cli.kanban_activity_revision import drop_triggers
++        drop_triggers(conn)
+         conn.execute("ALTER TABLE kanban_notify_subs DROP COLUMN delivery_mode")
+         conn.execute(
+             "INSERT INTO kanban_notify_subs "
+-- 
+2.55.0
+

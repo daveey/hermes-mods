@@ -35,3 +35,18 @@ Apply with `git am -3` in series order from the merge-base with upstream; the pa
 ## Plugin?
 
 No. It changes core code that runs before or outside plugin loading.
+
+## Follow-up patch (1639): foreign-owned boards don't count toward capacity health
+
+**1639** (`db7a16a8ec`, `fix(kanban): exclude foreign-owned boards from capacity health aggregation`).
+
+- **Behavior.** `all_at_capacity` decides whether a tick that dispatched nothing was "idle at capacity" rather than
+  "stuck". A board skipped because another dispatcher owns it (`DispatchResult.skipped_owned`) was counted as a ticked
+  board that was not capped, so a gateway whose only local board was at `max_in_progress` while another board was owned
+  elsewhere logged the "dispatcher stuck" health warning. Owned boards are now ignored like lock-skipped ones. If no
+  board actually ticked, the result is still not "at capacity".
+- **Code.** `hermes_cli/kanban_db_dispatch_stuck.py`.
+- **Tests** (not rerun by this mirror pass): `tests/hermes_cli/test_kanban_host_cap.py::test_all_at_capacity_ignores_boards_owned_by_another_dispatcher`;
+  `tests/gateway/test_kanban_external_drain_hold.py::test_capacity_with_foreign_owned_board_keeps_bad_ticks_zero`
+  (10 gateway ticks with a capped board plus an owned board, health window 1: no stuck line, no ERROR).
+- **Gotchas.** The CLI daemon's stuck detector uses the same helper; it has no separate test for this case.

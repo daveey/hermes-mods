@@ -1,0 +1,686 @@
+From 03e986dad31411c905a0a7c577b326bcac307362 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 05:38:01 +0000
+Subject: [PATCH] fix(kanban): machine sessions never own a card, whatever
+ their id shape [daveey]
+
+resolve_chats took any unreleased link unless is_headless_session() (local-<sha256> only) rejected it,
+so older Kanban worker transcripts (timestamp ids), cron runs (cron_<job>_<ts>) and one-shots counted as
+the nearest human chat. #594's live proof (hub example-card) resolved to MacBook worker transcript
+example-session instead of creator_chats_unresolved.
+
+- kanban_db_notify.is_machine_session(gateway, session): headless id, cron_ id, or a session of THIS
+  gateway whose state.db source is kanban/cron/oneshot/subagent (batch: machine_sessions). Missing,
+  unknown or foreign sessions stay human.
+- resolve_chats (incl. _chat_links' hub-sub branch) and _inherit_notify_subs skip them and keep walking.
+- kanban_chat_links.reconcile no longer wants links to local machine sessions, so it releases them
+  through its captured writes (they sync), including owner-written links on other gateways' open cards;
+  each pass that releases any writes ~/.hermes/kanban/repairs/machine-links-<board>-<ts>-<n>.json.
+- hermes kanban sync machine-links [--release]: dry run / release now.
+---
+ hermes_cli/kanban_chat_links.py               | 129 ++++++++---
+ hermes_cli/kanban_creator_chats.py            |  12 +-
+ hermes_cli/kanban_db_notify.py                | 110 ++++++++-
+ hermes_cli/kanban_parser.py                   |   3 +
+ hermes_cli/kanban_sync_cli.py                 |  32 ++-
+ .../test_kanban_machine_session_links.py      | 214 ++++++++++++++++++
+ 6 files changed, 462 insertions(+), 38 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_machine_session_links.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 67461ba24c7..2baa030a841 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -41,37 +41,46 @@ def _worker_shepherd(session: Any, kind: str) -> bool:
+ 
+ 
+ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str, Any]]:
+-    """Links from this board file's own data: creating chats and ``tui`` shepherd subscriptions."""
++    """Links from this board file's own data: creating chats and ``tui`` shepherd subscriptions.
++
++    A machine session of this gateway (``is_machine_session``: a worker/cron/one-shot/subagent transcript) is no
++    chat, so it is never wanted: :func:`reconcile` releases a link to it and never writes one back. [daveey]"""
++    from hermes_cli.kanban_db_notify import machine_sessions
+     from hermes_cli.kanban_session_activity import _counted_sub_clause
+     now = int(time.time())
+     out: dict[str, dict[str, Any]] = {}
++    has_links = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone())
++    created = [dict(r) for r in conn.execute(
++        "SELECT l.* FROM task_chat_links l WHERE l.chat_gateway=? AND l.kind='created' "
++        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=l.task_id "
++        "AND e.kind='creator_chats_resolved')", (gateway,))] if has_links else []
++    sessions = [tuple(r) for r in conn.execute(
++        "SELECT id, session_id, created_at FROM tasks WHERE session_id IS NOT NULL AND session_id != ''")]
++    try:
++        shepherds = [tuple(r) for r in conn.execute(
++            f"SELECT s.task_id, s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++            f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)}")]
++    except sqlite3.Error:  # board predates notify subscriptions
++        shepherds = []
++    machine = machine_sessions(gateway, [r["chat_session"] for r in created] + [r[1] for r in sessions]
++                               + [r[1] for r in shepherds], local_gateway=gateway)
+ 
+     def add(task_id: str, session: str, kind: str, created_at: Any) -> None:
+         from hermes_cli.kanban_placement import is_placeholder_session
+-        if is_placeholder_session(session) or _worker_shepherd(session, kind):
++        if is_placeholder_session(session) or _worker_shepherd(session, kind) or session in machine:
+             return
+         uid = link_uid(task_id, gateway, None, session, kind)
+         out[uid] = {"uid": uid, "task_id": task_id, "chat_gateway": gateway, "chat_profile": None,
+                     "chat_session": session, "kind": kind, "released": 0, "created_at": int(created_at or now)}
+ 
+-    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+-        for row in conn.execute(
+-                "SELECT l.* FROM task_chat_links l WHERE l.chat_gateway=? AND l.kind='created' "
+-                "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=l.task_id "
+-                "AND e.kind='creator_chats_resolved')", (gateway,)):
+-            if not _worker_shepherd(row["chat_session"], row["kind"]):
+-                out[row["uid"]] = dict(row)
+-    for task_id, session, created_at in conn.execute(
+-            "SELECT id, session_id, created_at FROM tasks WHERE session_id IS NOT NULL AND session_id != ''"):
++    for row in created:
++        if not _worker_shepherd(row["chat_session"], row["kind"]) and row["chat_session"] not in machine:
++            out[row["uid"]] = row
++    for task_id, session, created_at in sessions:
+         add(task_id, session, "created", created_at)
+-    try:
+-        for task_id, session in conn.execute(
+-                f"SELECT s.task_id, s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+-                f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)}"):
+-            if link_uid(task_id, gateway, None, session, "created") not in out:
+-                add(task_id, session, "shepherd", None)
+-    except sqlite3.Error:  # board predates notify subscriptions
+-        pass
++    for task_id, session in shepherds:
++        if link_uid(task_id, gateway, None, session, "created") not in out:
++            add(task_id, session, "shepherd", None)
+     return out
+ 
+ 
+@@ -87,6 +96,9 @@ def _ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
+         kind = "created" if card.get("via") == "origin" else "shepherd"
+         if is_placeholder_session(card["session"]) or _worker_shepherd(card["session"], kind):
+             continue
++        from hermes_cli.kanban_db_notify import is_machine_session
++        if is_machine_session(gateway, card["session"], local_gateway=gateway):
++            continue
+         profile = card.get("origin_profile")
+         uid = link_uid(card["id"], gateway, profile, card["session"], kind)
+         out[uid] = {"uid": uid, "task_id": card["id"], "chat_gateway": gateway, "chat_profile": profile,
+@@ -106,8 +118,13 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+     20261027_134353_5ab65c, 2026-11-01). The chat's gateway releases them by writing the same uid (the same row on
+     the Board) with ``released = 1``, as it already does for a ledger ``origin`` row. Open cards and missing card
+     rows are left alone; links ``want`` already carries keep the ledger's answer. A card reopened after the release
+-    stays released for that chat: the uid is one row, so the owner's original intent is not recoverable here."""
++    stays released for that chat: the uid is one row, so the owner's original intent is not recoverable here.
++
++    A link to a machine session of this gateway (``is_machine_session``) is released whatever the card's status:
++    no human reads that session, so it owns nothing even on an open card (hub t_01a19864fc42f5b2 was owned by
++    MacBook worker transcript 20261029_180356_84db5f, 2026-11-01)."""
+     from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_db_notify import machine_sessions
+     from hermes_cli.kanban_lockguard import connect
+     from hermes_cli.kanban_placement import is_placeholder_session
+     path = ksc.shadow_path(board)
+@@ -117,22 +134,24 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+         conn = connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+         try:
+             conn.row_factory = sqlite3.Row
+-            marks = ",".join("?" * len(TERMINAL_STATUSES))
+             rows = [dict(r) for r in conn.execute(
+-                "SELECT l.uid, l.task_id, l.chat_gateway, l.chat_profile, l.chat_session, l.kind, l.created_at "
+-                "FROM task_chat_links l JOIN tasks t ON t.id = l.task_id "
++                "SELECT l.uid, l.task_id, l.chat_gateway, l.chat_profile, l.chat_session, l.kind, l.created_at, "
++                "t.status FROM task_chat_links l JOIN tasks t ON t.id = l.task_id "
+                 "WHERE l.chat_gateway = ? AND l.kind = 'created' AND l.released = 0 AND l.uid IS NOT NULL "
+-                f"AND t.created_on IS NOT NULL AND t.created_on != ? AND t.status IN ({marks})",
+-                (gateway, gateway, *TERMINAL_STATUSES))]
++                "AND t.created_on IS NOT NULL AND t.created_on != ?",
++                (gateway, gateway))]
+         finally:
+             conn.close()
+     except sqlite3.Error as exc:  # an unreadable replica releases nothing this round; the next one retries
+         _log.info("kanban chat links: replica %s unreadable for owner-link releases (%s)", path, exc)
+         return {}
++    machine = machine_sessions(gateway, [r["chat_session"] for r in rows], local_gateway=gateway)
+     out: dict[str, dict[str, Any]] = {}
+     for r in rows:
+         if r["uid"] in want or is_placeholder_session(r["chat_session"]) or _worker_shepherd(r["chat_session"], "created"):
+             continue
++        if r.pop("status") not in TERMINAL_STATUSES and r["chat_session"] not in machine:
++            continue
+         out[r["uid"]] = {**r, "released": 1, "created_at": int(r["created_at"] or time.time())}
+     return out
+ 
+@@ -143,19 +162,63 @@ def ledger_boards(gateway: str) -> set[str]:
+     return {c["board"] for c in _remote_links() if c.get("board") and c.get("origin_gateway") in (None, gateway)}
+ 
+ 
++def _plan(conn: sqlite3.Connection, board: str, gateway: str, ledger: bool) -> tuple[dict, list]:
++    """``(want, rows)``: the links this gateway wants in ``conn`` and the rows it has (read-only)."""
++    want = _local_links(conn, gateway)
++    if ledger:
++        want.update(_ledger_links(board, gateway))
++    want.update(_owner_written_releases(board, gateway, want))
++    rows = conn.execute("SELECT uid, released, chat_session, kind, task_id FROM task_chat_links "
++                        "WHERE chat_gateway = ?", (gateway,)).fetchall()
++    return want, rows
++
++
++def _machine_releases(want: dict, rows: list, gateway: str) -> list[dict[str, Any]]:
++    """The links a reconcile pass releases because their chat is a machine session of this gateway: an unreleased
++    row nothing wants any more, or an owner-written row it writes back released (``_owner_written_releases``)."""
++    from hermes_cli.kanban_db_notify import is_headless_session, machine_sessions
++    from hermes_cli.kanban_placement import is_placeholder_session
++    have = {r[0]: r for r in rows}
++    out = [{"uid": r[0], "task_id": r[4], "chat_session": r[2], "kind": r[3]} for r in rows
++           if not r[1] and r[0] not in want]
++    out += [{"uid": uid, "task_id": l["task_id"], "chat_session": l["chat_session"], "kind": l["kind"]}
++            for uid, l in want.items() if l["released"] and (uid not in have or not have[uid][1])]
++    out = [o for o in out if not is_placeholder_session(o["chat_session"]) and not is_headless_session(o["chat_session"])]
++    machine = machine_sessions(gateway, [o["chat_session"] for o in out], local_gateway=gateway)
++    return sorted((o for o in out if o["chat_session"] in machine), key=lambda o: o["uid"])
++
++
++def machine_links(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: bool = True) -> list[dict[str, Any]]:
++    """Dry run: the links to this gateway's machine sessions the next :func:`reconcile` of ``board`` releases."""
++    return _machine_releases(*_plan(conn, board, gateway, ledger), gateway)
++
++
++def _write_release_receipt(board: str, gateway: str, released: list[dict[str, Any]]) -> None:
++    """``~/.hermes/kanban/repairs/machine-links-<board>-<ts>.json``: the uids one pass released (audit trail)."""
++    from hermes_cli import kanban_db
++    try:
++        path = kanban_db.kanban_home() / "kanban" / "repairs" / (
++            f"machine-links-{board}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{len(released)}.json")
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(json.dumps({"board": board, "gateway": gateway, "released_at": int(time.time()),
++                                    "released": released}, indent=1) + "\n", encoding="utf-8")
++        _log.info("kanban chat links: %s released %d links to machine sessions (receipt %s)", board, len(released), path)
++    except OSError as exc:  # the release itself is committed; only the audit copy is lost
++        _log.warning("kanban chat links: machine-link receipt for %s not written (%s)", board, exc)
++
++
+ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: bool = True) -> dict[str, int]:
+     """Bring this gateway's links in ``conn`` (one board file) up to date. Writes go through the capture triggers,
+-    so every new or changed link is pushed to the service. Returns counts of added/changed/released links."""
++    so every new or changed link is pushed to the service. Returns counts of added/changed/released links.
++
++    A link to a machine session of this gateway (``kanban_db_notify.is_machine_session``) is released here, through
++    the same captured writes; each pass that releases any writes a receipt (``_write_release_receipt``). [daveey]"""
+     from hermes_cli.kanban_db_connect import write_txn
+     from hermes_cli.kanban_creator_chats import backfill
+     backfill(conn)
+-    want = _local_links(conn, gateway)
+-    if ledger:
+-        want.update(_ledger_links(board, gateway))
+-    want.update(_owner_written_releases(board, gateway, want))
++    want, rows = _plan(conn, board, gateway, ledger)
++    machine = _machine_releases(want, rows, gateway)
+     from hermes_cli.kanban_placement import is_placeholder_session
+-    rows = conn.execute("SELECT uid, released, chat_session, kind FROM task_chat_links WHERE chat_gateway = ?",
+-                        (gateway,)).fetchall()
+     have = {r[0]: r[1] for r in rows}
+     # A placement attribution id is not a chat: its link is deleted (captured, so the Board drops it too), never
+     # merely released; a released one still counted in every diff and replica read. A worker transcript's
+@@ -181,6 +244,8 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+             if uid not in want and not was_released:
+                 conn.execute("UPDATE task_chat_links SET released = 1 WHERE uid = ?", (uid,))
+                 released += 1
++    if machine:
++        _write_release_receipt(board, gateway, machine)
+     return {"added": added, "changed": changed, "released": released, "retired": retired}
+ 
+ 
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index 5d7840898d3..11876c72f7c 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -76,10 +76,15 @@ def _chat_links(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+ 
+ 
+ def resolve_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
+-    """Nearest unreleased human links; creator edges precede dependency parents, cycles stop."""
+-    from hermes_cli.kanban_db_notify import is_headless_session
++    """Nearest unreleased human links; creator edges precede dependency parents, cycles stop.
++
++    A machine session (``is_machine_session``: a worker/cron/one-shot/subagent transcript, whatever its id
++    shape) owns nothing: its link is skipped and the walk goes on to the next level. [daveey]"""
++    from hermes_cli.kanban_db_notify import is_machine_session
++    from hermes_cli.kanban_origin import gateway_names
+     from hermes_cli.kanban_placement import is_placeholder_session
+ 
++    me = gateway_names()[0]
+     frontier, seen = [creator_task_id], set()
+     for _depth in range(MAX_DEPTH):
+         owners, following = {}, []
+@@ -88,7 +93,8 @@ def resolve_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
+                 continue
+             seen.add(task_id)
+             for row in _chat_links(conn, task_id):
+-                if not is_headless_session(row["chat_session"]) and not is_placeholder_session(row["chat_session"]):
++                if (not is_machine_session(row["chat_gateway"], row["chat_session"], local_gateway=me)
++                        and not is_placeholder_session(row["chat_session"])):
+                     key = (row["chat_gateway"], row["chat_profile"], row["chat_session"])
+                     owners.setdefault(key, dict(row))
+             row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index 38db109b693..fc0ef7165cb 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -53,6 +53,81 @@ def is_headless_session(chat_id: Any) -> bool:
+     return bool(_HEADLESS_SESSION.fullmatch(str(chat_id or "").rsplit("/", 1)[-1]))
+ 
+ 
++# ``sessions.source`` values of sessions no human reads: Kanban worker runs, cron runs, one-shots, subagents.
++# Older ones carry ordinary timestamp ids (``20261029_180356_84db5f``), so the id rule above misses them. [daveey]
++MACHINE_SESSION_SOURCES = frozenset({"kanban", "cron", "oneshot", "subagent"})
++_MISSING_TTL_S = 300.0
++# ``(state.db, session) -> (source, cached_at)``. A session's source never changes, so found rows stay cached;
++# a missing row is re-read after ``_MISSING_TTL_S`` (its session may be created later).
++_source_cache: dict[tuple[str, str], tuple[Optional[str], float]] = {}
++
++
++def _local_session_sources(sessions: Iterable[str]) -> dict[str, Optional[str]]:
++    """``sessions.source`` for each id in this gateway's state.db (None when missing or unreadable). Read-only."""
++    from contextlib import closing
++    from hermes_constants import get_hermes_home
++    path = str(get_hermes_home() / "state.db")
++    now = time.monotonic()
++    out: dict[str, Optional[str]] = {}
++    todo = []
++    for sid in dict.fromkeys(sessions):
++        hit = _source_cache.get((path, sid))
++        if hit is not None and (hit[0] is not None or now - hit[1] < _MISSING_TTL_S):
++            out[sid] = hit[0]
++        else:
++            todo.append(sid)
++    if not todo:
++        return out
++    found: dict[str, Optional[str]] = {}
++    readable = False
++    if Path(path).exists():
++        try:
++            uri = Path(path).as_uri() + "?mode=ro"
++            with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:  # noqa: kanban-lockguard (state.db, not a board)
++                for i in range(0, len(todo), 500):
++                    chunk = todo[i:i + 500]
++                    found.update(db.execute(
++                        f"SELECT id, source FROM sessions WHERE id IN ({','.join('?' * len(chunk))})", chunk))
++            readable = True
++        except sqlite3.Error:
++            pass
++    for sid in todo:
++        source = found.get(sid)
++        out[sid] = str(source) if source is not None else None
++        if readable:
++            _source_cache[(path, sid)] = (out[sid], now)
++    return out
++
++
++def machine_sessions(gateway: Any, sessions: Iterable[Any], *, local_gateway: Optional[str] = None) -> set[str]:
++    """The ids among ``sessions`` (chats of ``gateway``; bare or ``<gw>/<profile>/<session>``) that are machine
++    sessions per :func:`is_machine_session`, with one state.db read for the batch."""
++    ids = {str(s or "") for s in sessions}
++    out = {s for s in ids if is_headless_session(s) or s.rsplit("/", 1)[-1].startswith("cron_")}
++    rest = {s: s.rsplit("/", 1)[-1] for s in ids - out if s}
++    if not rest or not gateway:
++        return out
++    if local_gateway is None:
++        from hermes_cli.kanban_origin import gateway_names
++        local_gateway = gateway_names()[0]
++    if not local_gateway or str(gateway) != local_gateway:
++        return out
++    sources = _local_session_sources(rest.values())
++    return out | {s for s, sid in rest.items() if sources.get(sid) in MACHINE_SESSION_SOURCES}
++
++
++def is_machine_session(gateway: Any, session: Any, *, local_gateway: Optional[str] = None) -> bool:
++    """True when ``session`` (a chat of ``gateway``) is a session no human reads, so never a chat owner:
++
++    - a headless receipt id (:func:`is_headless_session`);
++    - a cron run id (``cron_<job>_<ts>``);
++    - a session of THIS gateway whose state.db ``sessions.source`` is in :data:`MACHINE_SESSION_SOURCES`.
++
++    A missing or unknown session, or one on another gateway (its state.db is not readable here), stays human.
++    ``local_gateway`` defaults to ``kanban_origin.gateway_names()[0]``; batch callers pass it once. [daveey]"""
++    return bool(machine_sessions(gateway, (session,), local_gateway=local_gateway))
++
++
+ def _sub_key(task_id: str, platform: str, chat_id: str, thread_id: Optional[str]) -> tuple:
+     return (task_id, platform, chat_id, thread_id or "")
+ 
+@@ -871,6 +946,11 @@ def _inherit_notify_subs(
+     ).fetchone()
+     cursor = int(row["cursor"] if row is not None else 0)
+     placeholders = ",".join("?" * len(parent_ids))
++    machine = _machine_sub_chats(conn, parent_ids)
++    skip = ""
++    if machine:
++        skip = (" AND (s.platform || char(31) || s.chat_id) NOT IN ("
++                + ",".join("?" * len(machine)) + ")")
+     conn.execute(
+         f"""
+         INSERT OR IGNORE INTO kanban_notify_subs
+@@ -882,12 +962,38 @@ def _inherit_notify_subs(
+                COALESCE(s.delivery_mode, 'notify'), s.delivery_metadata, ?, ?
+           FROM kanban_notify_subs s
+           LEFT JOIN tasks p ON p.id = s.task_id
+-         WHERE s.task_id IN ({placeholders}) AND {_owning_sub_clause()}
++         WHERE s.task_id IN ({placeholders}) AND {_owning_sub_clause()}{skip}
+         """,
+-        (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
++        (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids, *machine),
+     )
+ 
+ 
++def _machine_sub_chats(conn: sqlite3.Connection, parent_ids: tuple) -> list[str]:
++    """``platform\\x1fchat_id`` of the parents' ``tui``/``hub`` subs whose chat is a machine session
++    (``is_machine_session``: a worker/cron/one-shot/subagent transcript), which a child must not inherit. [daveey]"""
++    from hermes_cli.kanban_origin import OriginError, gateway_names, parse_origin
++    rows = conn.execute(
++        f"SELECT DISTINCT platform, chat_id FROM kanban_notify_subs WHERE task_id IN ({','.join('?' * len(parent_ids))})"
++        " AND platform IN ('tui', 'hub')", parent_ids).fetchall()
++    if not rows:
++        return []
++    me = gateway_names()[0]
++    by_gateway: dict[str, dict[str, str]] = {}
++    for platform, chat_id in rows:
++        gateway = me
++        if platform == "hub":
++            try:
++                gateway = parse_origin(chat_id).gateway
++            except OriginError:
++                gateway = ""
++        by_gateway.setdefault(gateway, {})[chat_id] = f"{platform}\x1f{chat_id}"
++    out = []
++    for gateway, chats in by_gateway.items():
++        hits = machine_sessions(gateway, chats, local_gateway=me)
++        out.extend(chats[c] for c in hits)
++    return out
++
++
+ def _owning_sub_clause() -> str:
+     """SQL predicate (aliases ``s`` = sub, ``p`` = its task) for a subscription a child inherits.
+ 
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 9b2570ff6d7..2af6cce2b3a 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -623,6 +623,9 @@ _SPECS = [
+         _cmd("links", help="Reconcile this gateway's chat links (which chats each card belongs to) now"),
+         _cmd("links-diff", [_json_flag()],
+              help="Compare chat links from the origin ledger with the synced links in the replicas (exit 1 if not clean)"),
++        _cmd("machine-links", [_json_flag(), _arg("--release", action="store_true",
++                                                  help="Release them now (default: dry run)")],
++             help="Unreleased chat links to this gateway's worker/cron/one-shot/subagent sessions (dry run)"),
+         _cmd("reconcile", [_json_flag()],
+              help="After the board file lost rows (a recovery): upload rows the service lacks, restore this "
+                   "gateway's rows the file lost from the service snapshot, then diff (exit 1 if not clean)"),
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index b954ae060a9..631c390f36e 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -151,8 +151,38 @@ def _reconcile(args: argparse.Namespace) -> int:
+     return 0 if report.get("clean") or report.get("mode") == "off" else 1
+ 
+ 
++def _machine_links(args: argparse.Namespace) -> int:
++    """Links of this gateway's machine sessions (worker/cron/one-shot/subagent transcripts) still unreleased in each
++    synced board (dry run), or, with ``--release``, release them now through the reconcile (receipt under
++    ``~/.hermes/kanban/repairs/``). [daveey]"""
++    from hermes_cli import kanban_chat_links
++    gateway = ksc.load_identity().gateway
++    boards = [(s, p) for s, p in ksc.board_paths() if not getattr(args, "board", None) or s == args.board]
++    out = {}
++    for slug, path in boards:
++        conn = kbc.connect(path)
++        try:
++            if sync.board_mode(conn) == "off":
++                continue
++            pending = kanban_chat_links.machine_links(conn, slug, gateway)
++            if args.release and pending:
++                kanban_chat_links.reconcile(conn, slug, gateway)
++                left = kanban_chat_links.machine_links(conn, slug, gateway)
++                out[slug] = {"released": len(pending) - len(left), "left": len(left), "uids": [p["uid"] for p in pending]}
++            else:
++                out[slug] = {"pending": len(pending), "uids": [p["uid"] for p in pending]}
++        finally:
++            conn.close()
++    if args.json:
++        print(json.dumps(out, indent=2))
++    else:
++        for slug, r in out.items():
++            print(f"{slug}: " + " ".join(f"{k}={v}" for k, v in r.items() if k != "uids"))
++    return 0
++
++
+ _ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run,
+-            "links": _links, "links-diff": _links_diff, "reconcile": _reconcile}
++            "links": _links, "links-diff": _links_diff, "reconcile": _reconcile, "machine-links": _machine_links}
+ 
+ 
+ def cmd_sync(args: argparse.Namespace) -> int:
+diff --git a/tests/hermes_cli/test_kanban_machine_session_links.py b/tests/hermes_cli/test_kanban_machine_session_links.py
+new file mode 100644
+index 00000000000..19c2a60a55e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_machine_session_links.py
+@@ -0,0 +1,214 @@
++"""Machine sessions (worker/cron/one-shot/subagent transcripts) never own a card, whatever their id shape. [daveey]
++
++``is_headless_session`` only knows ``local-<sha256>`` ids. Older Kanban workers, cron runs and one-shots have
++ordinary timestamp ids (``20261029_180356_84db5f``) or ``cron_<job>_<ts>``, so ``resolve_chats`` took their
++transcripts as the nearest human chat: hub t_01a19864fc42f5b2 (#594's live proof) was linked to a MacBook worker
++transcript instead of emitting ``creator_chats_unresolved``.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_creator_chats as creator_chats
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from tests.tools.test_kanban_worker_created_chats import CHAT, make_home
++
++OLD_WORKER = "20261029_180356_84db5f"  # source=kanban, a pre-receipt worker transcript
++CRON_RUN = "20261030_010000_c0ffee"  # source=cron with a timestamp id
++ONESHOT = "20261030_020000_0e5407"  # source=oneshot
++SUBAGENT = "20261030_030000_5ba9e7"  # source=subagent
++CRON_ID = "cron_backend-timeouts-watch_20261101_0300"  # no state.db row at all
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = make_home(tmp_path, monkeypatch)
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    for sid, source in ((OLD_WORKER, "kanban"), (CRON_RUN, "cron"), (ONESHOT, "oneshot"), (SUBAGENT, "subagent")):
++        db.create_session(sid, source=source)
++    db.close()
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away", "hub"}))
++    getattr(notify, "_source_cache", {}).clear()
++    return home
++
++
++def _link(conn, task_id, session, gateway="here", profile: str | None = "default", kind="created", released=0):
++    conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                 "released, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
++                 (links.link_uid(task_id, gateway, profile, session, kind), task_id, gateway, profile, session, kind,
++                  released))
++    conn.commit()
++
++
++def _sessions(owners):
++    return [(o["chat_gateway"], o["chat_session"]) for o in owners]
++
++
++@pytest.mark.parametrize("machine", [OLD_WORKER, CRON_RUN, ONESHOT, SUBAGENT])
++def test_a_nearest_local_machine_link_resolves_to_the_human_chat_above(home, machine):
++    """(a) The creator's own link is a local timestamp-id machine session: the human chat one level up owns."""
++    with kbc.connect_closing() as conn:
++        ancestor = kb.create_task(conn, title="human ancestor", assignee="default")
++        creator = kb.create_task(conn, title="worker-owned creator", assignee="default", parents=[ancestor])
++        _link(conn, ancestor, CHAT)
++        _link(conn, creator, machine)
++        assert _sessions(creator_chats.resolve_chats(conn, creator)) == [("here", CHAT)]
++        child = kb.create_task(conn, title="child", assignee="default", creator_task_id=creator)
++        owned = conn.execute("SELECT chat_session FROM task_chat_links WHERE task_id=? AND released=0",
++                             (child,)).fetchall()
++        assert [r[0] for r in owned] == [CHAT]
++
++
++def test_a_hub_sub_branch_skips_a_local_machine_origin(home):
++    """(a) ``_chat_links``' hub-sub branch: a legacy ``origin`` sub naming a local worker transcript owns nothing."""
++    with kbc.connect_closing() as conn:
++        ancestor = kb.create_task(conn, title="human ancestor", assignee="default")
++        creator = kb.create_task(conn, title="worker-origin creator", assignee="default", parents=[ancestor])
++        _link(conn, ancestor, CHAT, gateway="away")
++        conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, delivery_mode, "
++                     "delivery_metadata, created_at, last_event_id) VALUES (?, 'hub', ?, '', 'notify', ?, 1, 0)",
++                     (creator, f"here/default/{OLD_WORKER}", json.dumps({"reason": "origin"})))
++        conn.commit()
++        assert _sessions(creator_chats.resolve_chats(conn, creator)) == [("away", CHAT)]
++
++
++def test_a_child_does_not_inherit_a_machine_sessions_owning_sub(home):
++    """(a) ``_inherit_notify_subs``: a parent's owning ``tui`` sub on a worker transcript is not copied."""
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="parent", assignee="default")
++        for chat in (OLD_WORKER, CHAT):
++            conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, delivery_mode, "
++                         "delivery_metadata, created_at, last_event_id) VALUES (?, 'tui', ?, '', 'notify', ?, 1, 0)",
++                         (parent, chat, json.dumps({"reason": "create"})))
++        conn.commit()
++        child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++        assert [s["chat_id"] for s in notify.list_notify_subs(conn, child)] == [CHAT]
++
++
++def test_b_a_chain_of_only_machine_links_is_unresolved(home):
++    """(b) t_01a19451dffa47a8-shaped: every link up the chain is a worker/cron/one-shot transcript -> []."""
++    with kbc.connect_closing() as conn:
++        root = kb.create_task(conn, title="watch root (created_by a cron)", assignee="default")
++        _link(conn, root, CRON_RUN)
++        mid = kb.create_task(conn, title="mid", assignee="default", creator_task_id=root)
++        _link(conn, mid, ONESHOT)
++        _link(conn, mid, CHAT, kind="shepherd", released=1)  # a released shepherd link owns nothing either
++        creator = kb.create_task(conn, title="creator", assignee="default", creator_task_id=mid, parents=[root])
++        _link(conn, creator, OLD_WORKER)
++        assert creator_chats.resolve_chats(conn, creator) == []
++        child = kb.create_task(conn, title="child", assignee="default", creator_task_id=creator)
++        kinds = [e.kind for e in kb.list_events(conn, child)]
++        assert "creator_chats_unresolved" in kinds and "creator_chats_resolved" not in kinds
++        assert not conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=? AND released=0", (child,)).fetchall()
++
++
++@pytest.mark.parametrize("gateway", ["here", "away"])
++def test_c_a_cron_id_is_machine_without_a_state_row(home, gateway):
++    """(c) ``cron_<job>_<ts>`` is a cron run on any gateway, with no state.db row; a missing ordinary id stays human."""
++    with kbc.connect_closing() as conn:
++        ancestor = kb.create_task(conn, title="human ancestor", assignee="default")
++        creator = kb.create_task(conn, title="cron-owned creator", assignee="default", parents=[ancestor])
++        _link(conn, ancestor, CHAT, gateway="away")
++        _link(conn, creator, CRON_ID, gateway=gateway)
++        assert _sessions(creator_chats.resolve_chats(conn, creator)) == [("away", CHAT)]
++    assert notify.is_machine_session(gateway, CRON_ID)
++    assert notify.is_machine_session("hub", f"{gateway}/default/{CRON_ID}")
++    assert not notify.is_machine_session(gateway, "20261101_000000_nosuch")
++    assert not notify.is_machine_session("away", OLD_WORKER)  # another gateway's state.db is not readable here
++
++
++def test_d_replica_link_released_by_the_chats_gateway_is_skipped(home, monkeypatch):
++    """(d) Another gateway (hub) owns an OPEN card linked to this gateway's worker transcript. This gateway's
++    reconcile writes that link back released (captured, so it syncs), and the hub's resolver, which cannot read
++    our state.db, then skips it and walks on to the human chat."""
++    shadow = home / "kanban" / "sync-shadow" / "default.db"
++    shadow.parent.mkdir(parents=True, exist_ok=True)
++    kbc.init_db(shadow)
++    with kbc.connect_closing(shadow) as rep:
++        ancestor = kb.create_task(rep, title="hub ancestor", assignee="default")
++        card = kb.create_task(rep, title="hub card", assignee="default", parents=[ancestor])
++        rep.execute("UPDATE tasks SET created_on='hub', status='running' WHERE id IN (?, ?)", (ancestor, card))
++        _link(rep, ancestor, CHAT, gateway="away")
++        _link(rep, card, OLD_WORKER)
++    uid = links.link_uid(card, "here", "default", OLD_WORKER, "created")
++    with kbc.connect_closing() as conn:
++        links.reconcile(conn, "default", "here", ledger=False)
++        row = conn.execute("SELECT released FROM task_chat_links WHERE uid=?", (uid,)).fetchone()
++        assert row is not None and row[0] == 1
++        assert conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_chat_links' AND row_uid=? "
++                            "AND fields LIKE '%released%'", (uid,)).fetchone()
++    # The hub's copy after the sync: same uid, released. On the hub "here" is a foreign gateway.
++    monkeypatch.setattr("hermes_cli.kanban_origin.gateway_names", lambda: ("hub", {"here", "away", "hub"}))
++    with kbc.connect_closing(shadow) as rep:
++        rep.execute("UPDATE task_chat_links SET released=1 WHERE uid=?", (uid,))
++        rep.commit()
++        assert _sessions(creator_chats.resolve_chats(rep, card)) == [("away", CHAT)]
++
++
++def _cli(release):
++    from hermes_cli import kanban_sync_cli
++    return kanban_sync_cli.cmd_sync(argparse.Namespace(sync_action="machine-links", board="default", json=True,
++                                                       release=release))
++
++
++def test_e_repair_dry_run_then_release_then_nothing(home, capsys, monkeypatch):
++    """(e) Dry run lists the links to local machine sessions; the release releases exactly those (a receipt names
++    them); a second run releases 0. Human links stay."""
++    from types import SimpleNamespace
++    from hermes_cli import kanban_sync_client as ksc
++    monkeypatch.setattr(ksc, "load_identity", lambda *a, **k: SimpleNamespace(gateway="here"))
++    with kbc.connect_closing() as conn:
++        by_worker = kb.create_task(conn, title="filed by an old worker", assignee="default", session_id=OLD_WORKER)
++        by_cron = kb.create_task(conn, title="filed by a cron run", assignee="default", session_id=CRON_ID)
++        by_human = kb.create_task(conn, title="filed by a human", assignee="default", session_id=CHAT)
++        shepherded = kb.create_task(conn, title="watched by a one-shot", assignee="default")
++        conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, delivery_mode, "
++                     "delivery_metadata, created_at, last_event_id) VALUES (?, 'tui', ?, '', 'notify', ?, 1, 0)",
++                     (shepherded, ONESHOT, json.dumps({"reason": "shepherd"})))
++        conn.commit()
++        _link(conn, by_human, SUBAGENT)  # an inherited link to a subagent transcript
++        for task_id, session, kind, profile in ((by_worker, OLD_WORKER, "created", None),
++                                                (by_cron, CRON_ID, "created", None),
++                                                (by_human, CHAT, "created", None),
++                                                (shepherded, ONESHOT, "shepherd", None)):
++            _link(conn, task_id, session, profile=profile, kind=kind)
++    expected = sorted([links.link_uid(by_worker, "here", None, OLD_WORKER, "created"),
++                       links.link_uid(by_cron, "here", None, CRON_ID, "created"),
++                       links.link_uid(shepherded, "here", None, ONESHOT, "shepherd"),
++                       links.link_uid(by_human, "here", "default", SUBAGENT, "created")])
++    repairs = home / "kanban" / "repairs"
++
++    assert _cli(release=False) == 0
++    dry = json.loads(capsys.readouterr().out).get("default", {})
++    assert sorted(dry.get("uids", [])) == expected
++    with kbc.connect_closing() as conn:  # the dry run wrote nothing
++        assert conn.execute("SELECT COUNT(*) FROM task_chat_links WHERE released=1").fetchone()[0] == 0
++    assert not repairs.exists() or not list(repairs.iterdir())
++
++    assert _cli(release=True) == 0
++    real = json.loads(capsys.readouterr().out)["default"]
++    assert (real["released"], real["left"]) == (4, 0)
++    with kbc.connect_closing() as conn:
++        released = sorted(r[0] for r in conn.execute("SELECT uid FROM task_chat_links WHERE released=1"))
++        assert released == expected
++        human = links.link_uid(by_human, "here", None, CHAT, "created")
++        assert conn.execute("SELECT released FROM task_chat_links WHERE uid=?", (human,)).fetchone()[0] == 0
++    receipts = list(repairs.iterdir())
++    assert len(receipts) == 1
++    assert sorted(r["uid"] for r in json.loads(receipts[0].read_text())["released"]) == expected
++
++    assert _cli(release=True) == 0
++    again = json.loads(capsys.readouterr().out).get("default", {})
++    assert again.get("pending", 0) == 0 and again.get("released", 0) == 0
++    with kbc.connect_closing() as conn:  # the minute reconcile loop keeps them released, writes no new receipt
++        links.reconcile(conn, "default", "here", ledger=False)
++        assert sorted(r[0] for r in conn.execute("SELECT uid FROM task_chat_links WHERE released=1")) == expected
++    assert len(list(repairs.iterdir())) == 1
+-- 
+2.55.0
+

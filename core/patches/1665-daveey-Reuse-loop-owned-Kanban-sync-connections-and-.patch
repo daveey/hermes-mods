@@ -1,0 +1,638 @@
+From cd8a288a90d0cbd913b7cd21288f17707aaebca9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:27:57 +0000
+Subject: [PATCH] [daveey] Reuse loop-owned Kanban sync connections and avoid
+ redundant bookkeeping writes
+
+---
+ hermes_cli/kanban_db_sync.py                  |  17 +-
+ hermes_cli/kanban_suspend_ledger.py           |   3 +-
+ hermes_cli/kanban_sync_client.py              |  37 +--
+ hermes_cli/kanban_sync_connections.py         | 108 +++++++
+ .../test_kanban_sync_bookkeeping.py           |  48 +++
+ .../test_kanban_sync_connections.py           | 297 ++++++++++++++++++
+ 6 files changed, 485 insertions(+), 25 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_connections.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_bookkeeping.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_connections.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index e5ce83f5e25..619e0be5052 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -643,8 +643,9 @@ def mark_pulled(conn: sqlite3.Connection, at: Optional[float] = None) -> None:
+     """Stamp a successful feed pull (``pulled_at``), so readers of a replica can tell a fresh copy from an old one
+     without asking the network. [daveey]"""
+     from hermes_cli.kanban_db_connect import write_txn
++    stamp = time.time() if at is None else at
+     with write_txn(conn):
+-        conn.execute("UPDATE kanban_sync_state SET pulled_at = ?", (time.time() if at is None else at,))
++        conn.execute("UPDATE kanban_sync_state SET pulled_at = ? WHERE pulled_at IS NOT ?", (stamp, stamp))
+ 
+ 
+ def new_task_id(conn: sqlite3.Connection) -> str:
+@@ -1099,11 +1100,15 @@ def apply_remote_changes(
+         raise RuntimeError("apply_remote_changes: kanban sync is not enabled on this board")
+     result = ApplyResult(cursor=new_cursor, local_pending_wins=local_pending_wins)
+     with write_txn(conn):
+-        conn.execute("UPDATE kanban_sync_state SET applying = 1")
+-        own = _state(conn)["gateway_id"]
+-        for change in changes:
+-            _apply_one(conn, change, own, result)
+-        conn.execute("UPDATE kanban_sync_state SET cursor = ?, applying = 0", (new_cursor,))
++        if changes:
++            conn.execute("UPDATE kanban_sync_state SET applying = 1")
++            own = _state(conn)["gateway_id"]
++            for change in changes:
++                _apply_one(conn, change, own, result)
++        # Cursor-only pages have no capture triggers to suppress. Avoid dirtying
++        # the state row at all when both persisted values already match.
++        conn.execute("UPDATE kanban_sync_state SET cursor = ?, applying = 0 "
++                     "WHERE cursor IS NOT ? OR applying IS NOT 0", (new_cursor, new_cursor))
+     if observers:
+         _after_commit(conn, result, board)
+     return result
+diff --git a/hermes_cli/kanban_suspend_ledger.py b/hermes_cli/kanban_suspend_ledger.py
+index 159b6a0a47e..7e75df1c4ef 100644
+--- a/hermes_cli/kanban_suspend_ledger.py
++++ b/hermes_cli/kanban_suspend_ledger.py
+@@ -86,7 +86,8 @@ def record_dispatch_pass(
+                 recorded = (previous, now)
+             conn.execute(
+                 "INSERT INTO kanban_dispatch_stamp (id, at) VALUES (1, ?) "
+-                "ON CONFLICT(id) DO UPDATE SET at = excluded.at", (now,))
++                "ON CONFLICT(id) DO UPDATE SET at = excluded.at "
++                "WHERE kanban_dispatch_stamp.at IS NOT excluded.at", (now,))
+             conn.execute("DELETE FROM kanban_suspend_ledger WHERE end < ?", (now - RETENTION_SECONDS,))
+     except (sqlite3.Error, RuntimeError):
+         _log.warning("kanban: recording the dispatcher pass stamp failed", exc_info=True)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 653421aec0e..2f0472ad8a7 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -35,12 +35,13 @@ from time import monotonic as _hub_monotonic
+ import urllib.error
+ import urllib.parse
+ import urllib.request
+-from contextlib import contextmanager
++from contextlib import ExitStack, contextmanager
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -749,25 +750,29 @@ class RoundResult:
+ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+     path = shadow_path(slug)
+     path.parent.mkdir(parents=True, exist_ok=True)
+-    conn = _connect(path)
+-    ensure_identity(conn, slug, gateway)
+-    return conn
++    with ExitStack() as cleanup:
++        conn = _connect(path)
++        cleanup.callback(conn.close)
++        ensure_identity(conn, slug, gateway)
++        cleanup.pop_all()
++        return conn
+ 
+ 
+ @contextmanager
+ def _pulled_replica(slug: str, hub: Hub, gateway: str):
+-    """Keep the pulled (or rebuilt) replica open for this round, closing it on every exit. Yields
+-    ``(replica, pulled, rebuilt)``; ``rebuilt`` is True when the replica was replaced from a snapshot."""
+-    replica = open_shadow(slug, gateway)
+-    rebuilt = False
+-    try:
++    """Borrow the pulled replica for this round; retention rebuilds discard the old handle."""
++    path = shadow_path(slug)
++    with ExitStack() as stack:
++        replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
++        rebuilt = False
+         try:
+             pulled = pull(replica, hub, slug, observers=False)
+         except Resync:
+             _log.warning("kanban sync: %s replica cursor below the retention floor; rebuilding from a snapshot", slug)
+-            replica.close()
+-            shadow_path(slug).unlink(missing_ok=True)
+-            replica = open_shadow(slug, gateway)
++            stack.close()
++            invalidate(path)  # must close the pooled descriptor BEFORE unlinking its database
++            path.unlink(missing_ok=True)
++            replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+             rebuilt = True
+             pulled = resync(replica, hub, slug, observers=False)
+         try:  # readers derive the replica's staleness from this (kanban_chat_links); a failed stamp only ages it
+@@ -775,8 +780,6 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str):
+         except sqlite3.Error as exc:
+             _log.warning("kanban sync: %s replica pull not stamped (%s)", slug, exc)
+         yield replica, pulled, rebuilt
+-    finally:
+-        replica.close()
+ 
+ 
+ def _pull_replica(slug: str, hub: Hub, gateway: str) -> int:
+@@ -791,8 +794,7 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+     # Dropped first, so a round that fails or finds nothing to repair never leaves a stale deferral that would
+     # make the sync loop reselect this board without waiting; a deferring round sets it again.
+     _REPAIR_DEFERRED.pop(str(path), None)
+-    live = _connect(path)
+-    try:
++    with connection(path, lambda: _connect(path)) as live:
+         mode = sync.board_mode(live)
+         result = RoundResult(board=slug, mode=mode)
+         if mode == "off":
+@@ -837,8 +839,6 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+             from hermes_cli.kanban_worker_placement import reevaluate
+             reevaluate(live, hub, slug, gateway)
+         return result
+-    finally:
+-        live.close()
+ 
+ 
+ _UNPUBLISHED = object()
+@@ -1173,6 +1173,7 @@ def wait_for_work(wake: threading.Event, paths: Iterable[Path], period: float,
+     return "stopped"
+ 
+ 
++@connection_scope()
+ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = None,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
+     """The gateway's sync loop (call from a worker thread). Installs the lease client for primary boards, holds one
+diff --git a/hermes_cli/kanban_sync_connections.py b/hermes_cli/kanban_sync_connections.py
+new file mode 100644
+index 00000000000..855f77aa328
+--- /dev/null
++++ b/hermes_cli/kanban_sync_connections.py
+@@ -0,0 +1,108 @@
++"""Bounded SQLite reuse owned by one sync loop, never by the process.
++
++Only idle connections are retained; callers still own their transactions. The existing
++Kanban opener supplies all configuration and lockguard tracking. Keeping the connection
++also keeps SQLite's prepared statement cache, without sharing it with another thread.
++"""
++
++from collections import OrderedDict
++from contextlib import contextmanager
++from pathlib import Path
++import sqlite3
++import threading
++from typing import Callable, Iterator
++
++
++_local = threading.local()
++DEFAULT_LIMIT = 32  # retained idle handles; sync_board additionally borrows at most live + shadow
++
++
++def _identity(path: Path) -> tuple[int, int] | None:
++    try:
++        st = path.stat()
++        return st.st_dev, st.st_ino
++    except OSError:
++        return None
++
++
++def _idle(conn: sqlite3.Connection) -> bool:
++    try:
++        return not conn.in_transaction
++    except sqlite3.ProgrammingError:
++        return False  # same-thread WAL generation recovery may already have closed it
++
++
++class _Pool:
++    def __init__(self, limit: int):
++        self.limit = limit
++        self.idle: OrderedDict[Path, tuple[sqlite3.Connection, tuple[int, int] | None]] = OrderedDict()
++
++    def close(self) -> None:
++        while self.idle:
++            self.idle.popitem()[1][0].close()
++
++    def take(self, path: Path, opener: Callable[[], sqlite3.Connection]) -> sqlite3.Connection:
++        # A retained handle must pass the same WAL-generation fence as a fresh
++        # opener. Recovery can close same-thread idle handles, including ours.
++        from hermes_cli.kanban_generation import recover
++        recover(path)
++        entry = self.idle.pop(path, None)
++        if entry is not None:
++            conn, identity = entry
++            if identity is not None and identity == _identity(path) and _idle(conn):
++                return conn
++            conn.close()
++        return opener()
++
++    def put(self, path: Path, conn: sqlite3.Connection, identity: tuple[int, int] | None) -> None:
++        old = self.idle.pop(path, None)
++        if old is not None:
++            old[0].close()
++        while len(self.idle) >= self.limit:
++            self.idle.popitem(last=False)[1][0].close()
++        self.idle[path] = conn, identity
++
++
++@contextmanager
++def connection_scope(limit: int = DEFAULT_LIMIT) -> Iterator[None]:
++    """Opt in for this thread and lifetime; nested loops get independent ownership."""
++    if limit < 1:
++        raise ValueError("connection limit must be positive")
++    previous = getattr(_local, "pool", None)
++    pool = _Pool(limit)
++    _local.pool = pool
++    try:
++        yield
++    finally:
++        _local.pool = previous
++        pool.close()
++
++
++@contextmanager
++def connection(path: Path, opener: Callable[[], sqlite3.Connection]) -> Iterator[sqlite3.Connection]:
++    """Borrow exclusively, or close per call outside a loop. Failed work is never cached."""
++    path = path.absolute()
++    pool = getattr(_local, "pool", None)
++    conn = pool.take(path, opener) if pool is not None else opener()
++    identity = _identity(path)
++    completed = False
++    try:
++        yield conn
++        completed = True
++    finally:
++        if (pool is not None and completed and _idle(conn)
++                and identity is not None and identity == _identity(path)):
++            pool.put(path, conn, identity)
++        else:
++            conn.close()  # SQLite rolls back any unfinished transaction; never commit it here.
++            if pool is not None and not completed:
++                pool.close()  # A later push can fail after the shadow was already returned.
++
++
++def invalidate(path: Path) -> None:
++    """Close an idle cached handle before replacing its file (e.g. retention resync)."""
++    pool = getattr(_local, "pool", None)
++    if pool is not None:
++        entry = pool.idle.pop(path.absolute(), None)
++        if entry is not None:
++            entry[0].close()
+diff --git a/tests/hermes_cli/test_kanban_sync_bookkeeping.py b/tests/hermes_cli/test_kanban_sync_bookkeeping.py
+new file mode 100644
+index 00000000000..2ad848faab1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_bookkeeping.py
+@@ -0,0 +1,48 @@
++"""Bookkeeping writes reflect value changes, not repeated polling calls."""
++
++from hermes_cli import kanban_db_connect as db
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_suspend_ledger as ledger
++from tests.hermes_cli import kanban_sync_support as support
++
++
++def test_repeated_pull_timestamp_and_dispatch_stamp_do_not_write(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = db.connect(home / "kanban.db")
++    try:
++        from hermes_cli.kanban_sync_client import ensure_identity
++        ensure_identity(conn, "default", "macbook")
++        sync.mark_pulled(conn, at=100)
++        ledger.record_dispatch_pass(conn, now=100)
++        before = conn.total_changes
++        sync.mark_pulled(conn, at=100)
++        ledger.record_dispatch_pass(conn, now=100)
++        assert conn.total_changes == before
++        sync.mark_pulled(conn, at=101)
++        ledger.record_dispatch_pass(conn, now=101)
++        assert sync.sync_state(conn)["pulled_at"] == 101
++        assert conn.execute("SELECT at FROM kanban_dispatch_stamp").fetchone()[0] == 101
++    finally:
++        conn.close()
++
++
++def test_empty_apply_only_updates_changed_cursor_and_clears_applying(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = db.connect(home / "kanban.db")
++    try:
++        from hermes_cli.kanban_sync_client import ensure_identity
++        ensure_identity(conn, "default", "macbook")
++        before = conn.total_changes
++        sync.apply_remote_changes(conn, [], new_cursor=0, observers=False)
++        assert conn.total_changes == before
++        sync.apply_remote_changes(conn, [], new_cursor=7, observers=False)
++        assert conn.total_changes == before + 1
++        assert sync.sync_state(conn)["cursor"] == 7
++        conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        conn.commit()
++        sync.apply_remote_changes(conn, [], new_cursor=7, observers=False)
++        assert sync.sync_state(conn)["applying"] == 0
++    finally:
++        conn.close()
+diff --git a/tests/hermes_cli/test_kanban_sync_connections.py b/tests/hermes_cli/test_kanban_sync_connections.py
+new file mode 100644
+index 00000000000..3bf3d9d5563
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_connections.py
+@@ -0,0 +1,297 @@
++"""Loop-owned SQLite reuse: real board rounds, lifecycle and isolation contracts."""
++
++import sqlite3
++from concurrent.futures import ThreadPoolExecutor
++from contextlib import nullcontext
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    path = home / "kanban.db"
++    conn = kbc.connect(path)
++    client.ensure_identity(conn, "default", "macbook")
++    conn.close()
++    return path, FakeService().hub("macbook")
++
++
++@pytest.fixture
++def opened(monkeypatch):
++    connections = []
++    original = client._connect
++
++    def track(path):
++        conn = original(path)
++        connections.append(conn)
++        return conn
++
++    monkeypatch.setattr(client, "_connect", track)
++    return connections
++
++
++def assert_closed(conn):
++    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
++        conn.execute("SELECT 1")
++
++
++def test_successive_rounds_reuse_live_and_shadow(board, opened):
++    # The fallback exposes the baseline's repeated opens as an assertion failure.
++    scope = getattr(client, "connection_scope", nullcontext)
++    path, hub = board
++    with scope():
++        client.sync_board("default", path, hub, "macbook")
++        first = len(opened)
++        assert first == 2
++        client.sync_board("default", path, hub, "macbook")
++        assert len(opened) == first
++        assert all(not conn.in_transaction for conn in opened)
++    for conn in opened:
++        assert_closed(conn)
++
++
++def test_shadow_initialization_failure_closes_descriptor(board, opened, monkeypatch):
++    def fail(*args):
++        raise sqlite3.OperationalError("identity failure")
++
++    monkeypatch.setattr(client, "ensure_identity", fail)
++    with client.connection_scope():
++        with pytest.raises(sqlite3.OperationalError, match="identity failure"):
++            client.open_shadow("default", "macbook")
++        assert len(opened) == 1
++        assert_closed(opened[0])
++
++
++def test_standalone_rounds_close(board, opened):
++    path, hub = board
++    for _ in range(2):
++        client.sync_board("default", path, hub, "macbook")
++        for conn in opened:
++            assert_closed(conn)
++    assert len(opened) == 4
++
++
++@pytest.mark.parametrize("phase", ["pull", "push"])
++def test_failed_round_discards_handles(board, opened, monkeypatch, phase):
++    path, hub = board
++
++    def fail(*args, **kwargs):
++        raise OSError("offline")
++
++    original = getattr(client, phase)
++    with client.connection_scope():
++        client.sync_board("default", path, hub, "macbook")
++        monkeypatch.setattr(client, phase, fail)
++        with pytest.raises(OSError, match="offline"):
++            client.sync_board("default", path, hub, "macbook")
++        for conn in opened:
++            assert_closed(conn)
++        monkeypatch.setattr(client, phase, original)
++        client.sync_board("default", path, hub, "macbook")
++        assert len(opened) == 4
++
++
++def test_reuse_sees_external_writer(board, opened):
++    from hermes_cli import kanban_db as kb
++
++    path, hub = board
++    with client.connection_scope():
++        client.sync_board("default", path, hub, "macbook")
++        writer = kbc.connect(path)
++        try:
++            task = kb.create_task(writer, title="external", assignee="worker")
++        finally:
++            writer.close()
++        result = client.sync_board("default", path, hub, "macbook")
++        assert result.push is not None and result.push.sent > 0
++        assert hub.svc.board("default")["rows"]["tasks"][task]["title"] == "external"
++        assert len(opened) == 2
++
++
++def test_pool_replacement_transaction_and_bound(tmp_path):
++    from hermes_cli.kanban_sync_connections import connection, connection_scope
++
++    path = tmp_path / "db"
++    other = tmp_path / "other"
++    with connection_scope(limit=1):
++        with connection(path, lambda: sqlite3.connect(path)) as first:
++            first.execute("CREATE TABLE data(value)")
++        with connection(other, lambda: sqlite3.connect(other)) as second:
++            second.execute("SELECT 1")
++        assert_closed(first)
++        with connection(other, lambda: sqlite3.connect(other)) as dirty:
++            assert dirty is second
++            dirty.execute("CREATE TABLE data(value)")
++            dirty.execute("INSERT INTO data VALUES (1)")
++        assert_closed(dirty)
++        with connection(other, lambda: sqlite3.connect(other)) as clean:
++            assert clean.execute("SELECT * FROM data").fetchall() == []
++        replacement = tmp_path / "replacement"
++        fresh = sqlite3.connect(replacement)
++        fresh.execute("CREATE TABLE replacement(value)")
++        fresh.close()
++        replacement.replace(other)
++        with connection(other, lambda: sqlite3.connect(other)) as replaced:
++            assert_closed(clean)
++            replaced.execute("SELECT * FROM replacement")
++    assert_closed(replaced)
++
++
++@pytest.mark.platforms("posix")
++def test_pool_retires_deleted_wal_generation(tmp_path):
++    from hermes_cli import kanban_generation, kanban_lockguard
++    from hermes_cli.kanban_sync_connections import connection, connection_scope
++
++    path = tmp_path / "generation.db"
++    def opener():
++        conn = kanban_lockguard.connect(path)
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("CREATE TABLE IF NOT EXISTS data(value)")
++        kanban_generation.remember(conn)
++        return conn
++
++    with connection_scope():
++        with connection(path, opener) as first:
++            first.execute("SELECT * FROM data").fetchall()
++            first.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++        Path(str(path) + "-wal").unlink()
++        Path(str(path) + "-shm").unlink()
++        with connection(path, opener) as second:
++            assert second is not first
++            assert_closed(first)
++            second.execute("SELECT * FROM data").fetchall()
++        # Same-thread recovery may also close an idle handle before the next borrow.
++        second.close()
++        with connection(path, opener) as third:
++            assert third is not second
++            third.execute("SELECT 1")
++
++
++def test_closed_borrow_is_not_cached(tmp_path):
++    from hermes_cli.kanban_sync_connections import connection, connection_scope
++
++    path = tmp_path / "closed.db"
++    with connection_scope():
++        with connection(path, lambda: sqlite3.connect(path)) as conn:
++            conn.close()
++        with connection(path, lambda: sqlite3.connect(path)) as again:
++            assert again is not conn
++            again.execute("SELECT 1")
++
++
++def test_unstatable_file_is_not_retained(tmp_path, monkeypatch):
++    from hermes_cli.kanban_sync_connections import connection, connection_scope
++
++    path = tmp_path / "db"
++    original = Path.stat
++
++    def denied(target, *args, **kwargs):
++        if target == path:
++            raise PermissionError("cannot stat")
++        return original(target, *args, **kwargs)
++
++    with connection_scope():
++        with connection(path, lambda: sqlite3.connect(path)) as conn:
++            monkeypatch.setattr(Path, "stat", denied)
++        assert_closed(conn)
++
++
++def test_scope_is_thread_local_and_nested(tmp_path):
++    from hermes_cli.kanban_sync_connections import connection, connection_scope
++
++    path = tmp_path / "db"
++
++    def other_thread():
++        with connection(path, lambda: sqlite3.connect(path)) as conn:
++            conn.execute("SELECT 1")
++        assert_closed(conn)
++        return conn
++
++    with connection_scope():
++        with connection(path, lambda: sqlite3.connect(path)) as outer:
++            pass
++        with ThreadPoolExecutor(max_workers=1) as executor:
++            assert executor.submit(other_thread).result() is not outer
++        with connection_scope():
++            with connection(path, lambda: sqlite3.connect(path)) as inner:
++                assert inner is not outer
++        assert_closed(inner)
++        with connection(path, lambda: sqlite3.connect(path)) as again:
++            assert again is outer
++    assert_closed(outer)
++
++
++def test_retention_resync_closes_shadow_before_unlink(board, opened, monkeypatch):
++    path, hub = board
++    original_pull = client.pull
++    original_unlink = Path.unlink
++    shadow = client.shadow_path("default")
++    with client.connection_scope():
++        client.sync_board("default", path, hub, "macbook")
++        old_shadow = opened[1]
++
++        def stale(conn, *args, **kwargs):
++            if conn is old_shadow:
++                raise client.Resync()
++            return original_pull(conn, *args, **kwargs)
++
++        def unlink(target, *args, **kwargs):
++            if target == shadow:
++                assert_closed(old_shadow)
++            return original_unlink(target, *args, **kwargs)
++
++        monkeypatch.setattr(client, "pull", stale)
++        monkeypatch.setattr(Path, "unlink", unlink)
++        client.sync_board("default", path, hub, "macbook")
++        assert len(opened) == 3
++        client.sync_board("default", path, hub, "macbook")
++        assert len(opened) == 3
++    for conn in opened:
++        assert_closed(conn)
++
++
++@pytest.mark.parametrize("failed", [False, True])
++def test_run_forever_owns_and_closes_connections(board, opened, monkeypatch, failed):
++    from hermes_cli import machine_metrics
++
++    path, hub = board
++    running = True
++    monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="macbook", url="fake"))
++    monkeypatch.setattr(client, "Hub", lambda ident: hub)
++    monkeypatch.setattr(client.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(client, "board_paths", list)
++    monkeypatch.setattr(client, "reconcile_links", lambda *args: None)
++    monkeypatch.setattr(machine_metrics, "Reporter", lambda *args: SimpleNamespace(report_due=lambda: None))
++    # FakeHub has no metrics transport; the loop only needs this for Reporter construction.
++    monkeypatch.setattr(hub, "report_metrics", lambda *args: None, raising=False)
++
++    def rounds(*args, **kwargs):
++        client.sync_board("default", path, hub, "macbook")
++        client.sync_board("default", path, hub, "macbook")
++        assert len(opened) == 2
++        if failed:
++            raise OSError("loop failure")
++        return []
++
++    def stop(*args):
++        nonlocal running
++        running = False
++
++    monkeypatch.setattr(client, "sync_all_once", rounds)
++    monkeypatch.setattr(client, "wait_for_work", stop)
++    with pytest.raises(OSError, match="loop failure") if failed else nullcontext():
++        client.run_forever(lambda: running, interval=1)
++    for conn in opened:
++        assert_closed(conn)
++    client.sync_board("default", path, hub, "macbook")
++    for conn in opened:
++        assert_closed(conn)
+-- 
+2.55.0
+

@@ -1,0 +1,158 @@
+From 9892672e83fa1d9dd63e76751143285c85dd95b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 13:02:16 +0000
+Subject: [PATCH] [daveey] Keep stable profiler histograms batched across CPU
+ refresh
+
+---
+ gateway/control_profile.py                    | 15 ++++++
+ .../gateway/test_control_profile_fastpath.py  | 46 +++++++++++++++++++
+ .../docs/developer-guide/gateway-profiling.md | 22 +++++++++
+ 3 files changed, 83 insertions(+)
+
+diff --git a/gateway/control_profile.py b/gateway/control_profile.py
+index e4431e7d203..c62d078000d 100644
+--- a/gateway/control_profile.py
++++ b/gateway/control_profile.py
+@@ -104,6 +104,8 @@ class _Window:
+         self.code_keys = {}  # id(code) -> (code, frame key, suspendable); keeps ids valid
+         self.previous_frames = {}
+         self.previous = {}  # ident -> (row, stack_key, reusable)
++        self.previous_threads = {}
++        self.cpu_rows = []  # active (Thread, native_id, row), rebuilt on snapshot change
+         self.batchable = False
+         self.run = 0  # open run of ticks identical to ``previous_frames``
+         self.run_last = 0
+@@ -135,8 +137,19 @@ class _Window:
+         return tuple(stack), reusable
+ 
+     def slow_tick(self, sample, cpu_due, no_greenlet, before, frames, after):
++        if (self.batchable and no_greenlet and frames == self.previous_frames
++                and before == after == self.previous_threads):
++            # CPU refresh does not invalidate a stable stack run. The registry
++            # sandwich still fences lifetime changes before reusing the rows.
++            if cpu_due:
++                for thread, native_id, row in self.cpu_rows:
++                    _record_cpu(row, _read_cpu(thread, native_id), sample)
++            self.run += 1
++            self.run_last = sample
++            return
+         self.flush()
+         current = {}
++        cpu_rows = []
+         batchable = no_greenlet
+         for ident, frame in frames.items():
+             thread = after.get(ident)
+@@ -163,8 +176,10 @@ class _Window:
+             counts = row['stack_counts']
+             counts[stack_key] = counts.get(stack_key, 0) + 1
+             current[ident] = (row, stack_key, reusable)
++            cpu_rows.append((thread, native_id, row))
+             batchable = batchable and reusable
+         self.previous_frames, self.previous, self.batchable = frames, current, batchable
++        self.previous_threads, self.cpu_rows = after, cpu_rows
+ 
+     def finish(self, samples, top):
+         output = []
+diff --git a/tests/gateway/test_control_profile_fastpath.py b/tests/gateway/test_control_profile_fastpath.py
+index d62ae3afc0e..811ba530103 100644
+--- a/tests/gateway/test_control_profile_fastpath.py
++++ b/tests/gateway/test_control_profile_fastpath.py
+@@ -123,6 +123,52 @@ def test_identical_safe_snapshots_batch_exact_counts_and_skip_per_thread_work(mo
+     assert len(h.reads) == 3 * len(read_times)
+ 
+ 
++def test_cpu_refresh_keeps_stable_snapshot_run_open(monkeypatch):
++    thread = FakeThread(1, 11, 'stable')
++    frame = FakeFrame(FakeCode('wait'))
++    Harness(monkeypatch, lambda now: {1: (thread, frame)})
++    flushes = []
++    original = profiler._Window.flush
++
++    def flush(window):
++        flushes.append(window.run)
++        return original(window)
++
++    monkeypatch.setattr(profiler._Window, 'flush', flush)
++    row = _rows(profiler._collect(1, 100, 5))['stable']
++    assert row['samples'] == 100
++    assert row['cpu_s'] == pytest.approx(1.0)
++    # Initial walk and final flush only; CPU refresh must not redo histogram work.
++    assert flushes == [0, 99]
++
++
++def test_refresh_registry_change_does_not_reuse_old_lifetime(monkeypatch):
++    old, new = FakeThread(1, 11, 'old'), FakeThread(1, 12, 'new')
++    frame = FakeFrame(FakeCode('wait'))
++    # Deliberately identical snapshot, but different owner at a CPU-refresh tick.
++    Harness(monkeypatch, lambda now: {1: (old if now < 0.1 else new, frame)})
++    rows = _rows(profiler._collect(1, 100, 5))
++    assert set(rows) == {'old', 'new'}
++    assert sum(row['samples'] for row in rows.values()) == 100
++    assert rows['old']['last_seen_sample'] < rows['new']['first_seen_sample']
++
++
++def test_refresh_registry_sandwich_checks_before_as_well_as_after(monkeypatch):
++    thread, other = FakeThread(1, 11, 'stable'), FakeThread(1, 12, 'other')
++    frame = FakeFrame(FakeCode('wait'))
++
++    def registry(now, call_in_tick):
++        if 0.105 < now < 0.115 and call_in_tick == 1:
++            return [other]
++        return [thread]
++
++    Harness(monkeypatch, lambda now: {1: (thread, frame)}, registry=registry)
++    row = _rows(profiler._collect(1, 100, 5))['stable']
++    assert row['samples'] == 99  # ambiguous sandwich tick is not attributed
++    assert dict(row['top_self']) == {'fake.py:1:wait': 99}
++    assert dict(row['top_inclusive']) == {'fake.py:1:wait': 99}
++
++
+ def test_ancestor_generator_caller_change_is_rewalked(monkeypatch):
+     leaf = FakeCode('leaf')
+     gen = FakeCode('gen', inspect.CO_GENERATOR)
+diff --git a/website/docs/developer-guide/gateway-profiling.md b/website/docs/developer-guide/gateway-profiling.md
+index 92e72479966..3e45fd97bbf 100644
+--- a/website/docs/developer-guide/gateway-profiling.md
++++ b/website/docs/developer-guide/gateway-profiling.md
+@@ -55,6 +55,10 @@ python3 scripts/benchmark_gateway_profile.py --seconds 5 --rounds 3 --threads 15
+ 
+ This creates an isolated process with 150 idle event-waiting threads. Each round measures **whole-process** `time.process_time()` and monotonic wall time, once without profiling and once with it; order alternates. Incremental percent of one core is `(profile CPU / profile wall - baseline CPU / baseline wall) * 100`. Thread creation is outside the measured intervals. The script prints raw measurements, Python/OS metadata, samples and idle-thread census; it never contacts a live gateway.
+ 
++### Measurement history
++
++The following figures record intermediate implementations, not the final performance claim. The final stable CPU-refresh implementation and its confirmation measurements are listed below.
++
+ Measured on Linux 7.0.0-1014-aws, x86_64, glibc 2.39, Python 3.14.9:
+ 
+ | Round | Baseline CPU s | Baseline wall s | Profile CPU s | Profile wall s | Incremental % core | Samples / idle threads |
+@@ -107,8 +111,26 @@ All rounds collected 500 samples, all 150 idle threads, and readable CPU for eve
+ 
+ A separate Python 3.12 attribution probe measured whole-profile CPU at 3.743% with the real reader versus 2.739% with a constant reader; collecting frames alone at 100 Hz measured 1.721%. These are attribution controls, not baseline-subtracted acceptance figures. The initial design coupled native counters to every stack tick and repeated Python bookkeeping for unchanged stacks; native benchmarking caught that cost after Linux-only performance checks passed. Counter refresh decoupling and exact run aggregation address that design, with deterministic cadence/lifetime tests and native A/B measurements preventing a Linux-only performance claim. Remaining native-reader and snapshot cost needs further work rather than rounding 3.11% down to the target.
+ 
++### Stable CPU-refresh batching (final implementation)
++
++CPU refresh no longer flushes/rebuilds unchanged stack histograms. When both sides of the registry sandwich equal the preceding registry and every safe frame is unchanged, only the active cached CPU rows are refreshed; the exact histogram run remains open. Changed owners, ambiguous registry sandwiches, generators/coroutines and greenlet still take the full path. CPU read cadence and lifetime checks are unchanged.
++
++Native paired measurement on the same Mac mini, Python 3.14.9, 150 idle threads at 100 Hz:
++
++| Implementation | Window | Incremental % core rounds | Median % core |
++| --- | --- | --- | ---: |
++| Previous single-snapshot refresh | 5 s | 3.51001, 3.52259, 3.43461 | 3.51001 |
++| Stable CPU-refresh batching | 5 s | 3.04950, 2.84946, 2.98960 | 2.98960 |
++| Stable CPU-refresh batching, longer confirmation | 10 s | 2.71996, 2.67913, 2.62472 | 2.67913 |
++
++Both optimized medians meet the under-3% target for this measured workload; one 5-second round was 3.04950%, so this is not a per-window guarantee. The 10-second rounds each had 1000 samples, 150 idle threads and zero unavailable idle CPU readings. Baseline/profile CPU seconds were respectively 0.001513/0.273869, 0.000475/0.268571 and 0.000404/0.263057; baseline/profile wall seconds were 10.006841/10.013199, 10.006285/10.006834 and 10.009193/10.006869. All native functional checks passed again (busy 1.474682 CPU s, native worker 0.641537, sleeper 0.003285, short-lived 0.144580 marked partial). No live gateway was contacted. Final Linux 5-second rounds were 0.73508%, 0.68514%, 0.64804%, median **0.68514%**.
++
++Why the remaining overhead existed: the previous CPU-refresh tick unconditionally flushed all histograms and rebuilt per-thread dictionaries even for identical stacks (`_Window.slow_tick`). The new deterministic test failed on that implementation with repeated flushes instead of one final 99-tick run. Registry-change and before/after mismatch controls guard lifetime attribution; the existing exact-histogram/cadence/generator/cleanup tests exercise the optimized path too. This closes the remaining unnecessary-bookkeeping design gap, not by lowering sampling or CPU refresh frequency. Independent review found no correctness blockers.
++
+ ## Verification status
+ 
++Final stable-refresh change: **38 passed, 1 macOS-only skipped** across the five profiler files via `scripts/run_tests.sh`; all **15 checks** passed via `python3 scripts/check --base HEAD`. The refresh-run test was RED on the preceding implementation and GREEN after; registry replacement and both sides of the lifetime sandwich have explicit controls. Earlier verification stages follow.
++
+ `tests/gateway/test_control_profile_fastpath.py` drives `_collect` with a fake clock, frame snapshot and thread registry, and covers: exact batched counts for identical safe snapshots (with recursive dedup and no per-thread work between CPU refreshes), re-walking when an ancestor generator's caller changes under the same leaf frame, re-walking when `greenlet` is imported, CPU cadence without catch-up after a stall, exited-thread lower bounds with a dead-thread read discarded, recovery from a failed first CPU read (marked partial), rejecting an identifier reused between the two enumerations, and no frame references surviving success or an error. A real-thread test checks the fast path engages for idle threads (it failed with 200 enumerations per 100 ticks before the sampler's own frame was kept stable). Each failed on the previous implementation and passes now; existing tests are unchanged. Five profiler test files via `scripts/run_tests.sh`: **35 passed, 1 macOS-only skipped**, three consecutive runs; `python3 scripts/check --base HEAD`: 15 checks ok.
+ 
+ Tests are run only through `scripts/run_tests.sh`. The contract test was first corrected from an erroneous global self table/`cpu_seconds` shape to the approved per-thread shape, then failed on the base with `unknown verb: 'profile'`. Incremental RED→GREEN runs covered the sampler, argument validation, concurrent refusal, response trimming, CLI parser/dispatch and invalid parameter objects. Additional acceptance tests cover recursive inclusive deduplication, real sleeping/burning threads, short-lived threads and successive same-name thread lifetimes. The CLI integration test runs against a real temporary Unix socket, checks JSON and text, and requires identify/status each to answer in under 0.5 seconds while the profile is in progress.
+-- 
+2.55.0
+

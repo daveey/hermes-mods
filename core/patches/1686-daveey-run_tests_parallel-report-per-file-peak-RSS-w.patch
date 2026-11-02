@@ -1,0 +1,411 @@
+From 462570a49ab3b1d34f1e2309dc632dcf32f6ac15 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 03:58:52 -0800
+Subject: [PATCH] [daveey] run_tests_parallel: report per-file peak RSS, warn
+ on files over 512 MB
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reap each per-file pytest child with os.wait4 and keep its ru_maxrss
+(bytes on macOS, KiB elsewhere, normalized to bytes). The per-file time
+distribution now prints the top 5 peak-RSS files beside the 10 slowest, and
+one '⚠ high-memory test file' line per file over HERMES_TEST_FILE_RSS_WARN_MB
+(default 512). Warning only: the exit code is unchanged. A file that needs the
+memory on purpose raises its own threshold with a
+'# run_tests_parallel: rss-warn-mb=<N>' line.
+
+Why: tests/hermes_state/test_sidecar_keys_registry.py peaked at 1.58 GB per
+run on the 16 GB Mac mini hermes_state lane for 3 days and nothing in CI
+noticed (fixed in #655; example-card, example-card).
+---
+ scripts/ci/classify_changes.py                |   1 +
+ scripts/run_tests_parallel.py                 |   7 +-
+ scripts/run_tests_parallel_rss.py             | 122 ++++++++++++++++
+ tests/ci/test_flaky_kanban.py                 |   1 +
+ tests/ci/test_macos_state_routing.py          |   1 +
+ tests/scripts/test_run_tests_parallel.py      |   1 +
+ tests/scripts/test_run_tests_parallel_rss.py  | 131 ++++++++++++++++++
+ .../test_run_tests_parallel_slow_cases.py     |   1 +
+ 8 files changed, 264 insertions(+), 1 deletion(-)
+ create mode 100644 scripts/run_tests_parallel_rss.py
+ create mode 100644 tests/scripts/test_run_tests_parallel_rss.py
+
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index af8e76f7ad6..19333649c7e 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -256,6 +256,7 @@ _PY_TEST_HARNESS = (
+     "scripts/run_tests.sh",
+     "scripts/run_tests_parallel.py",
+     "scripts/run_tests_host_slots.py",
++    "scripts/run_tests_parallel_rss.py",
+ )
+ # The macOS state lane (hermes-state-macos.yml runs tests/hermes_state/ on the mini):
+ # hermes_state.py and every hermes_state_* sibling, their tests, the shared pytest harness
+diff --git a/scripts/run_tests_parallel.py b/scripts/run_tests_parallel.py
+index 204881aca40..517f08da858 100644
+--- a/scripts/run_tests_parallel.py
++++ b/scripts/run_tests_parallel.py
+@@ -63,6 +63,7 @@ from typing import Callable, Dict, List, Optional, Tuple
+ # "skipped on this host" note and the lanes can never disagree.
+ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
++from scripts import run_tests_parallel_rss as _rss  # [daveey] per-file peak RSS
+ from scripts.run_tests_host_slots import HELD_ENV as HOST_SLOT_HELD_ENV, host_slot_count, host_slot_dir, host_test_slot
+ 
+ 
+@@ -167,6 +168,8 @@ _DURATIONS_FILE = "test_durations.json"
+ # slow new case from CI-wide slowness. 0 disables (env: HERMES_TEST_SLOW_CASE_S).
+ _SLOW_CASE_SECONDS = float(os.environ.get("HERMES_TEST_SLOW_CASE_S") or 10.0)
+ _DURATION_LINE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)s\s+(?:setup|call|teardown)\s+(\S.*?)\s*$")
++
++
+ _DURATIONS_HEADER_RE = re.compile(r"^=+ slowest(?: \d+)? durations =+$")
+ 
+ 
+@@ -847,6 +850,7 @@ def _run_one_file_attempt(
+         # _kill_tree handles the Windows path via taskkill /F /T.
+         start_new_session=True,
+     )
++    _rss.reap_with_rusage(proc)
+ 
+     # Capture the pgid NOW, before the leader can exit and be reaped. Once
+     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
+@@ -885,6 +889,7 @@ def _run_one_file_attempt(
+ 
+         output +=  "\n"
+     finally:
++        _rss.record_peak_rss(file, _rss.proc_peak_rss_bytes(proc))
+         _kill_detached_leftovers(temproot)
+         # Delete the temp root for this attempt. Nothing reads it after the
+         # subprocess exits. More than 3000 of them fill the disk of the
+@@ -1941,11 +1946,11 @@ def main() -> int:
+         print(f"  Total subprocess CPU-wall: {total_subproc:.1f}s  (runner wall: {elapsed:.1f}s, parallelism: {args.jobs}x)")
+         print(f"  P50: {p50:.2f}s  P90: {p90:.2f}s  P95: {p95:.2f}s  P99: {p99:.2f}s  Max: {max_t:.2f}s")
+         print(f"  <1s: {fast} files ({fast/len(times)*100:.0f}%)  <2s: {fast_2s} files ({fast_2s/len(times)*100:.0f}%)")
+-        # Top 10 slowest files — likely the ones dragging the run.
+         slowest = sorted(file_times, key=lambda x: x[1], reverse=True)[:10]
+         print("  Top 10 slowest:")
+         for f, t in slowest:
+             print(f"    {t:>6.2f}s  {_format_file(f, repo_root)}")
++        _rss.print_peak_rss_report(repo_root)
+ 
+     skips_fail_the_run = bool(args.fail_on_skip) and _report_skips(skipped_files, repo_root)
+ 
+diff --git a/scripts/run_tests_parallel_rss.py b/scripts/run_tests_parallel_rss.py
+new file mode 100644
+index 00000000000..1e9eadaff6c
+--- /dev/null
++++ b/scripts/run_tests_parallel_rss.py
+@@ -0,0 +1,122 @@
++"""Per-file peak RSS for scripts/run_tests_parallel.py. [daveey]
++
++Each per-file pytest child is reaped with ``os.wait4``, whose rusage ``ru_maxrss``
++is the peak resident set of that child and of every descendant it reaped. The
++summary prints the top 5 files and one ``⚠ high-memory test file`` line per file
++over the threshold (warning only; the run's exit code is unchanged).
++
++Why: tests/hermes_state/test_sidecar_keys_registry.py peaked at 1.58 GB per run
++on the 16 GB Mac mini lane for 3 days and nothing in CI noticed
++(t_01a19beb37e87be6). Env: ``HERMES_TEST_FILE_RSS_WARN_MB`` (default 512). A file
++that needs the memory on purpose raises its own threshold with one line anywhere
++in it: ``# run_tests_parallel: rss-warn-mb=<N>``.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++import subprocess
++import sys
++import threading
++from pathlib import Path
++from typing import Optional
++
++DEFAULT_RSS_WARN_MB = 512.0
++_MB = 1024 * 1024
++_RSS_WARN_MARKER_RE = re.compile(
++    r"^\s*#\s*run_tests_parallel:\s*rss-warn-mb\s*=\s*(\d+(?:\.\d+)?)\s*$", re.MULTILINE
++)
++# Peak RSS in bytes per test file (max over its attempts); absent = not measured.
++PEAK_RSS: dict[Path, int] = {}
++_peak_rss_lock = threading.Lock()
++
++
++def maxrss_bytes(ru_maxrss: int, platform: str = sys.platform) -> int:
++    """``ru_maxrss`` in bytes: macOS reports bytes, Linux (and other POSIX) KiB."""
++    return int(ru_maxrss) if platform == "darwin" else int(ru_maxrss) * 1024
++
++
++def rss_warn_mb(env: Optional[dict] = None) -> float:
++    raw = (os.environ if env is None else env).get("HERMES_TEST_FILE_RSS_WARN_MB") or ""
++    try:
++        value = float(raw)
++    except ValueError:
++        return DEFAULT_RSS_WARN_MB
++    return value if value > 0 else DEFAULT_RSS_WARN_MB
++
++
++def file_rss_warn_mb(file: Path, default_mb: float) -> float:
++    """The file's own ``rss-warn-mb`` marker if it has one, else ``default_mb``."""
++    try:
++        m = _RSS_WARN_MARKER_RE.search(Path(file).read_text(encoding="utf-8-sig", errors="replace"))
++    except OSError:
++        return default_mb
++    return float(m.group(1)) if m else default_mb
++
++
++def record_peak_rss(file: Path, rss_bytes: Optional[int]) -> None:
++    if rss_bytes is None:
++        return
++    with _peak_rss_lock:
++        PEAK_RSS[file] = max(rss_bytes, PEAK_RSS.get(file, 0))
++
++
++def _rel(file: Path, repo_root: Path) -> str:
++    try:
++        return str(Path(file).resolve().relative_to(repo_root.resolve()))
++    except ValueError:
++        return str(file)
++
++
++def peak_rss_report(peaks: dict[Path, int], repo_root: Path, warn_mb: float, top: int = 5) -> list[str]:
++    """Summary lines: the ``top`` peak-RSS files, then one warning per file over its threshold."""
++    if not peaks:
++        return []
++    ranked = sorted(peaks.items(), key=lambda kv: kv[1], reverse=True)
++    lines = [f"  Top {min(top, len(ranked))} peak RSS:"]
++    lines += [f"    {rss / _MB:>7.0f} MB  {_rel(f, repo_root)}" for f, rss in ranked[:top]]
++    for f, rss in ranked:
++        limit = file_rss_warn_mb(f, warn_mb)
++        if rss > limit * _MB:
++            lines.append(
++                f"  \u26a0 high-memory test file: {_rel(f, repo_root)} peaked at "
++                f"{rss / _MB:.0f} MB RSS (> {limit:.0f} MB, HERMES_TEST_FILE_RSS_WARN_MB)"
++            )
++    return lines
++
++
++def print_peak_rss_report(repo_root: Path) -> None:
++    """Print the report for every file this run measured (nothing when none were)."""
++    with _peak_rss_lock:
++        peaks = dict(PEAK_RSS)
++    for line in peak_rss_report(peaks, repo_root, rss_warn_mb()):
++        print(line)
++
++
++def reap_with_rusage(proc: subprocess.Popen) -> None:
++    """Make ``proc`` reap itself with os.wait4 and keep the rusage on ``proc._hermes_rusage``.
++
++    Patches the instance's CPython POSIX reaper (``_try_wait``, which every
++    ``wait()``/``communicate()`` goes through) instead of subclassing Popen, so
++    tests that swap ``subprocess.Popen`` for a fake keep working. No-op on
++    Windows (no ``os.wait4``) or on a Popen without that reaper.
++    """
++    if not hasattr(os, "wait4") or not hasattr(proc, "_try_wait"):
++        return
++
++    def _try_wait(wait_flags):
++        try:
++            pid, sts, ru = os.wait4(proc.pid, wait_flags)
++        except ChildProcessError:
++            return (proc.pid, 0)
++        if pid == proc.pid:
++            proc._hermes_rusage = ru  # type: ignore[attr-defined]
++        return (pid, sts)
++
++    proc._try_wait = _try_wait  # type: ignore[method-assign]
++
++
++def proc_peak_rss_bytes(proc: object) -> Optional[int]:
++    ru = getattr(proc, "_hermes_rusage", None)
++    return None if ru is None else maxrss_bytes(ru.ru_maxrss)
+diff --git a/tests/ci/test_flaky_kanban.py b/tests/ci/test_flaky_kanban.py
+index 2f13c9b21af..be68a0544cd 100644
+--- a/tests/ci/test_flaky_kanban.py
++++ b/tests/ci/test_flaky_kanban.py
+@@ -316,6 +316,7 @@ def test_flaky_test_passes_and_files_a_card_while_a_hard_failure_stays_red(tmp_p
+     (root / "scripts" / "ci").mkdir(parents=True)
+     shutil.copy2(_ROOT / "scripts" / "run_tests_parallel.py", root / "scripts")
+     shutil.copy2(_ROOT / "scripts" / "run_tests_host_slots.py", root / "scripts")
++    shutil.copy2(_ROOT / "scripts" / "run_tests_parallel_rss.py", root / "scripts")
+     shutil.copy2(_ROOT / "scripts" / "ci" / "list_os_marked_tests.py", root / "scripts" / "ci")
+     marker = tmp_path / "flaked-once"
+     suite = tmp_path / "suite"
+diff --git a/tests/ci/test_macos_state_routing.py b/tests/ci/test_macos_state_routing.py
+index 364a87d388f..2f3fa1cbd1b 100644
+--- a/tests/ci/test_macos_state_routing.py
++++ b/tests/ci/test_macos_state_routing.py
+@@ -66,6 +66,7 @@ def test_release_forces_unselected_lane_and_explicit_commit_is_not_masked():
+     (['tests/hermes_state/test_state.py'], True), (['tests/conftest.py'], True),
+     (['scripts/run_tests.sh'], True), (['scripts/run_tests_parallel.py'], True),
+     (['scripts/run_tests_host_slots.py'], True), (['tests/_fixtures/state.py'], True),
++    (['scripts/run_tests_parallel_rss.py'], True),
+     (['pyproject.toml'], True), (['uv.lock'], True), (['setup.py'], True),
+     (['.github/workflows/ci.yaml'], True), ([], True),
+     ([f'docs/{i}.md' for i in range(300)], True),
+diff --git a/tests/scripts/test_run_tests_parallel.py b/tests/scripts/test_run_tests_parallel.py
+index 1285203f6c7..046104d2b2a 100644
+--- a/tests/scripts/test_run_tests_parallel.py
++++ b/tests/scripts/test_run_tests_parallel.py
+@@ -46,6 +46,7 @@ def _probe_root(tmp_path):
+     real = Path(__file__).resolve().parents[2] / "scripts"
+     shutil.copy2(real / "run_tests_parallel.py", scripts)
+     shutil.copy2(real / "run_tests_host_slots.py", scripts)
++    shutil.copy2(real / "run_tests_parallel_rss.py", scripts)
+     # The runner shares the platforms() spec resolver with the CI lane selector.
+     shutil.copy2(real / "ci" / "list_os_marked_tests.py", scripts / "ci")
+     return root
+diff --git a/tests/scripts/test_run_tests_parallel_rss.py b/tests/scripts/test_run_tests_parallel_rss.py
+new file mode 100644
+index 00000000000..67de8a686ae
+--- /dev/null
++++ b/tests/scripts/test_run_tests_parallel_rss.py
+@@ -0,0 +1,131 @@
++"""Per-file peak RSS in scripts/run_tests_parallel.py (helpers: run_tests_parallel_rss.py).
++
++The runner reaps each per-file pytest child with ``os.wait4``, prints the top
++5 peak-RSS files beside "Top 10 slowest", and prints one
++``⚠ high-memory test file`` line per file over HERMES_TEST_FILE_RSS_WARN_MB
++(default 512). The warning never changes the exit code.
++
++The end-to-end test below allocates ~600 MB in a grandchild. ``wait4`` folds
++reaped descendants into the child's ``ru_maxrss`` on Linux and macOS, so this
++file itself peaks near 600 MB and raises its own threshold:
++"""
++# run_tests_parallel: rss-warn-mb=1024
++
++from __future__ import annotations
++
++import importlib.util
++import os
++import shutil
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
++MB = 1024 * 1024
++
++
++@pytest.fixture(scope="module")
++def rtp():
++    spec = importlib.util.spec_from_file_location("rtp_rss", _SCRIPTS / "run_tests_parallel_rss.py")
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules["rtp_rss"] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def test_maxrss_is_bytes_on_macos(rtp) -> None:
++    assert rtp.maxrss_bytes(600 * MB, platform="darwin") == 600 * MB
++
++
++@pytest.mark.parametrize("platform", ["linux", "freebsd14"])
++def test_maxrss_is_kib_elsewhere(rtp, platform: str) -> None:
++    assert rtp.maxrss_bytes(600 * 1024, platform=platform) == 600 * MB
++
++
++def test_warn_threshold_env(rtp) -> None:
++    assert rtp.rss_warn_mb({}) == 512
++    assert rtp.rss_warn_mb({"HERMES_TEST_FILE_RSS_WARN_MB": "300"}) == 300
++    # Garbage or non-positive values keep the default rather than silencing the check.
++    assert rtp.rss_warn_mb({"HERMES_TEST_FILE_RSS_WARN_MB": "lots"}) == 512
++    assert rtp.rss_warn_mb({"HERMES_TEST_FILE_RSS_WARN_MB": "0"}) == 512
++
++
++def test_report_lists_top_five_and_warns_only_over_threshold(rtp, tmp_path: Path) -> None:
++    files = {}
++    for i, mb in enumerate([100, 700, 300, 513, 512, 50, 900]):
++        f = tmp_path / f"test_f{i}.py"
++        f.write_text("def test_x():\n    pass\n")
++        files[f] = mb * MB
++    lines = rtp.peak_rss_report(files, tmp_path, 512.0)
++
++    assert lines[0] == "  Top 5 peak RSS:"
++    top = lines[1:6]
++    assert [ln.split()[0] for ln in top] == ["900", "700", "513", "512", "300"]
++    warnings = [ln for ln in lines if "\u26a0 high-memory test file" in ln]
++    # 512 MB is AT the threshold, not over it.
++    assert [w.split(": ", 1)[1].split()[0] for w in warnings] == ["test_f6.py", "test_f1.py", "test_f3.py"]
++    assert "peaked at 900 MB RSS (> 512 MB" in warnings[0]
++
++
++def test_file_marker_raises_that_files_threshold(rtp, tmp_path: Path) -> None:
++    heavy = tmp_path / "test_heavy.py"
++    heavy.write_text("# run_tests_parallel: rss-warn-mb=2048\ndef test_x():\n    pass\n")
++    plain = tmp_path / "test_plain.py"
++    plain.write_text("def test_x():\n    pass\n")
++    lines = rtp.peak_rss_report({heavy: 900 * MB, plain: 900 * MB}, tmp_path, 512.0)
++    warnings = [ln for ln in lines if "high-memory" in ln]
++    assert len(warnings) == 1 and "test_plain.py" in warnings[0]
++
++
++def test_no_measurements_print_nothing(rtp, tmp_path: Path) -> None:
++    assert rtp.peak_rss_report({}, tmp_path, 512.0) == []
++
++
++@pytest.mark.skipif(not hasattr(os, "wait4"), reason="os.wait4 is POSIX-only")
++def test_rusage_popen_records_the_childs_peak(rtp) -> None:
++    proc = subprocess.Popen([sys.executable, "-c", "b = b'x' * (64 * 1024 * 1024)"])
++    rtp.reap_with_rusage(proc)
++    proc.wait(timeout=60)
++    assert proc.returncode == 0
++    assert rtp.proc_peak_rss_bytes(proc) >= 64 * MB
++
++
++def _probe_root(tmp_path: Path) -> Path:
++    root = tmp_path / "runner-root"
++    (root / "scripts" / "ci").mkdir(parents=True)
++    shutil.copy2(_SCRIPTS / "run_tests_parallel.py", root / "scripts")
++    shutil.copy2(_SCRIPTS / "run_tests_parallel_rss.py", root / "scripts")
++    shutil.copy2(_SCRIPTS / "run_tests_host_slots.py", root / "scripts")
++    shutil.copy2(_SCRIPTS / "ci" / "list_os_marked_tests.py", root / "scripts" / "ci")
++    return root
++
++
++@pytest.mark.skipif(not hasattr(os, "wait4"), reason="os.wait4 is POSIX-only")
++def test_runner_warns_about_a_600mb_file_and_keeps_exit_code(tmp_path: Path, monkeypatch) -> None:
++    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
++    monkeypatch.delenv("HERMES_TEST_FILE_RSS_WARN_MB", raising=False)
++    probe = tmp_path / "probe"
++    probe.mkdir()
++    (probe / "test_hog.py").write_text(textwrap.dedent("""
++        def test_allocates_600_mb():
++            blob = b"x" * (600 * 1024 * 1024)  # filled, so every page is resident
++            assert len(blob) == 600 * 1024 * 1024
++    """))
++    (probe / "test_light.py").write_text("def test_small():\n    assert True\n")
++    runner = _probe_root(tmp_path) / "scripts" / "run_tests_parallel.py"
++
++    proc = subprocess.run(
++        [sys.executable, str(runner), "--paths", str(probe), "-j", "1", "--file-timeout", "120"],
++        cwd=probe, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++        encoding="utf-8", errors="replace", timeout=180, check=False,
++    )
++
++    out = proc.stdout
++    assert proc.returncode == 0, out
++    assert "Top 10 slowest:" in out and "Top 2 peak RSS:" in out, out
++    warnings = [ln for ln in out.splitlines() if "\u26a0 high-memory test file" in ln]
++    assert len(warnings) == 1, out
++    assert "test_hog.py" in warnings[0] and "(> 512 MB" in warnings[0], out
+diff --git a/tests/scripts/test_run_tests_parallel_slow_cases.py b/tests/scripts/test_run_tests_parallel_slow_cases.py
+index 8785d573ca3..3eee99b4c0c 100644
+--- a/tests/scripts/test_run_tests_parallel_slow_cases.py
++++ b/tests/scripts/test_run_tests_parallel_slow_cases.py
+@@ -58,6 +58,7 @@ def test_runner_prints_the_slow_case_line(tmp_path, monkeypatch):
+     (root / "scripts" / "ci").mkdir(parents=True)
+     shutil.copy2(_REAL / "run_tests_parallel.py", root / "scripts")
+     shutil.copy2(_REAL / "run_tests_host_slots.py", root / "scripts")
++    shutil.copy2(_REAL / "run_tests_parallel_rss.py", root / "scripts")
+     shutil.copy2(_REAL / "ci" / "list_os_marked_tests.py", root / "scripts" / "ci")
+     probe_dir = tmp_path / "probe"
+     probe_dir.mkdir()
+-- 
+2.55.0
+

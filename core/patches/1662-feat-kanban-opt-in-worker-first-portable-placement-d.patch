@@ -1,0 +1,1877 @@
+From 91cbdec68d886d5965cd23fa2646cc6002a5d205 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:49:33 +0000
+Subject: [PATCH] feat(kanban): opt-in worker-first portable placement [daveey]
+ (#461)
+
+* refactor(kanban): extract conservative portable-card boundary [daveey]
+
+* feat(kanban): enroll portable cards with durable worker-first fences [daveey]
+
+* docs(kanban): expose opt-in worker pools and frozen acceptance map [daveey]
+
+* fix(kanban): preserve legacy routing and bound worker placement retries [daveey]
+
+* fix(kanban): rotate bounded worker reservation batches durably [daveey]
+
+* fix(kanban): retain extracted pin validation after rebase [daveey]
+
+* fix(kanban): route remote guard-hold sweep through worker-node dispatch refusals [daveey]
+
+main 91585980f6 added sweep_remote_guard_holds calling kanban_db_dispatch._local_refusals,
+which worker-first replaces with kanban_worker_node.dispatch_refusals (now including
+placement-policy fences). Without this every non-dry-run dispatch tick raised AttributeError
+after merging main. Test covers a worker-queued policy card's guard hold swept by the home.
+---
+ cli-config.yaml.example                       |   5 +
+ docs/worker-first-v1.md                       |  57 +++++
+ hermes_cli/config_defaults.py                 |   4 +-
+ hermes_cli/kanban.py                          |   2 +
+ hermes_cli/kanban_db.py                       |  34 ++-
+ hermes_cli/kanban_db_connect.py               |   1 +
+ hermes_cli/kanban_db_dispatch.py              |  23 +-
+ hermes_cli/kanban_db_dispatch_guard_notice.py |   3 +-
+ hermes_cli/kanban_db_sync.py                  |  19 +-
+ hermes_cli/kanban_model_assignment.py         |   5 +-
+ hermes_cli/kanban_pin_provider.py             |  11 +
+ hermes_cli/kanban_placement.py                |  51 +++--
+ hermes_cli/kanban_sync_client.py              |  60 ++++--
+ hermes_cli/kanban_worker_node.py              |  19 +-
+ hermes_cli/kanban_worker_placement.py         | 197 ++++++++++++++++++
+ hermes_cli/machine_metrics.py                 |  41 +++-
+ .../hermes_cli/test_kanban_guard_hold_sync.py |  29 +++
+ tests/hermes_cli/test_kanban_placement.py     |  16 ++
+ .../test_kanban_sync_hub_keepalive.py         |  21 +-
+ .../test_kanban_worker_placement.py           |  81 +++++++
+ .../test_kanban_worker_placement_failures.py  | 116 +++++++++++
+ .../test_kanban_worker_policy_cli.py          |  27 +++
+ .../test_kanban_worker_policy_db.py           | 127 +++++++++++
+ .../test_kanban_worker_reserve_client.py      | 177 ++++++++++++++++
+ .../test_kanban_worker_reserve_fairness.py    |  64 ++++++
+ tests/hermes_cli/test_machine_metrics.py      |   3 +-
+ tests/hermes_cli/test_machine_occupancy.py    |  43 ++++
+ tools/kanban_tools.py                         |   8 +-
+ tools/kanban_tools_placement.py               |   6 +-
+ tools/kanban_tools_schemas.py                 |   8 +-
+ 30 files changed, 1169 insertions(+), 89 deletions(-)
+ create mode 100644 docs/worker-first-v1.md
+ create mode 100644 hermes_cli/kanban_worker_placement.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_placement.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_placement_failures.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_policy_cli.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_policy_db.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_reserve_client.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_reserve_fairness.py
+ create mode 100644 tests/hermes_cli/test_machine_occupancy.py
+
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index 590dce16010..b3afca73f84 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -411,6 +411,11 @@ model:
+ # Disable this only when every review is performed manually from the dashboard.
+ kanban:
+   review_dispatch: true
++  # Optional worker-only portable placement. Requires the matching Board service,
++  # operator allowlist/capability attestations and current clients on every worker.
++  # No entry = legacy routing. An origin mapped to [] queues without local overflow.
++  # placement:
++  #   worker_pools: {hub: [worker-1]}
+ 
+ # =============================================================================
+ # Terminal Tool Configuration
+diff --git a/docs/worker-first-v1.md b/docs/worker-first-v1.md
+new file mode 100644
+index 00000000000..06ea9dd66c4
+--- /dev/null
++++ b/docs/worker-first-v1.md
+@@ -0,0 +1,57 @@
++# Worker-first portable cards (opt-in, disabled by default)
++
++`kanban.placement.worker_pools` maps an origin Board machine name to worker names, for example `{hub: [worker-1]}`. This is a pool, **not** an AND-list of `machine:*` labels. The default `placement: {}` is unchanged. `heavy_route` remains the legacy behavior only when the origin has no pool entry. A configured empty/unavailable pool queues portable work; it never overflows onto the hub.
++
++## Creation and schema
++
++Tool and CLI creation enroll portable light and heavy cards. The shared conservative `portable_reason` preserves scratch/default-board, assignee, carried-option, host/local/skill marker, project and gateway-requirement exclusions. Caller placement and `runs_on` (including `[]`) bypass automatic enrollment. Courier/origin creation keeps its original path. Parent and chat links are not replaced.
++
++Local SQLite `tasks.placement_policy` is a nullable TEXT migration, included in Task and sync column declarations. `worker-first-v1` is persisted in the first create transaction. Unknown policies and contradictory policy/manual pins are refused. A policy card has no runnable local fallback: ready and review claim paths enforce the fence before requesting a Board lease, even when sync is off/shadow or registry retrieval fails.
++
++## Board protocol and admission
++
++The paired daveey/hermes-hub implementation owns selection, CAS and reservations:
++
++`POST /v2/boards/default/placement/reserve`
++
++Request: `{task_id: string, expected_revision: integer, policy: "worker-first-v1", candidates: string[]}` (1–64 candidates, operator allowlisted).
++
++Response: `{state: "assigned" | "queued", machine: string | null, reservation_id: string | null, expires_at: number | null, reason: string}`. Expiry is epoch milliseconds; queued identities are null and reason is `waiting_for_worker_capacity`.
++
++Ordinary primary sync reevaluates only acknowledged origin-owned READY cards without a retained lease or pending local task write. Dispatch retries before checking the origin's own spawn budget. Only the authoritative pull installs assignments; a lost reply cannot manufacture an assignment. Repeated original revisions replay idempotently; current revisions reevaluate/renew. Never move active runs or rebalance review phases.
++
++Score is `max(cpu_load1/cpus, mem_used_pct/100)` below 0.85, plus a separate free-slot requirement. CPU load is load average, not utilization. Server admission rejects unknown/nonfinite/negative/future/stale (>90s) signals and missing capacity/pickup/capability attestations. Workers retain `pickup=explicit`. Registry labels `profile:<assignee>`, `capability:<requirement>`, and `skill:<name>` are operator attestations, not self claims.
++
++`machine_metrics.active_card_runs` samples the shared Kanban root and named boards across profiles, deduplicating physical databases. Foreign lease replicas do not consume local capacity. Unreadable or unknown schema returns unknown, not zero. Before opening a local run, both ready/review claims take a fresh pressure/occupancy sample; refusal releases the unused grant. Existing hard host admission remains in force.
++
++## Rollback and deployment order
++
++1. Deploy the Board schema/routes and matching clients on **every claiming gateway** before enabling any origin pool. Do not run older clients against enrolled cards.
++2. Verify fresh whole-host metrics, capacity and operator capability labels. Enable the Board's operator-owned `worker_pools` setting and then the intended client origin pools.
++3. Roll back new enrollment by removing client origin entries and setting Board pools to `{}`. This does **not** drop any existing policy fence or interrupt/relocate running leases.
++4. Allow current leases to finish/renew. Drain remaining ready cards or explicitly repin each through the creating gateway's `Hub.repin("default", task_id=..., expected_revision=..., runs_on=["machine:hub"])`. The endpoint is `POST /v2/boards/default/placement/repin`; `[]` is an intentionally unrestricted manual pin. Current revision, creator and no-lease/ready checks remain mandatory. Pull and read back policy=null and the exact requested labels before execution. Review cards stay assigned to their last authenticated worker; do not erase their fence in SQLite.
++
++5. **Revert the Board server last, never while policy cards remain queued.** Removing the placement routes first removes `Hub.repin`, while clients retain their execution fences. Verify the authoritative queue is drained/repinned and existing review/running leases have finished before reverting the server.
++
++Clients always send `active_card_runs` in machine metrics, even with pools disabled. A pre-PR Board rejects that unknown field (HTTP 400); metrics reporting is best-effort/display-only, so metrics displays may go stale after server rollback. Roll back clients too for compatible telemetry; do not treat missing telemetry as spare capacity.
++
++No configuration is activated by these code changes. Deployment, actual hostname/holder/run receipts, saturation/recovery, authenticated credential probes and two-worker live distribution belong to the separate rollout phase. If no second existing worker is available, N-worker live acceptance remains incomplete; this does not authorize rentals.
++
++## Frozen acceptance map
++
++| Requirement | Executable evidence |
++|---|---|
++| Portable light/heavy; retained exclusions; pins/empty pins/courier; legacy routing | `tests/hermes_cli/test_kanban_worker_placement.py`, existing `test_kanban_placement.py` |
++| First-insert policy, parent/origin preservation, unknown/contradictory policies | `test_kanban_worker_policy_db.py` |
++| Tool and CLI create entry paths | `test_kanban_placement.py::test_tool_creates_worker_policy_atomically_and_reports_queue`, `test_kanban_worker_policy_cli.py` |
++| Direct ready/review and local dispatch fences with sync off/registry failure | `test_kanban_worker_policy_db.py`, `test_kanban_worker_reserve_client.py::test_queued_origin_cannot_spawn_even_with_local_capacity` |
++| Exact reserve/repin HTTP contract; post-ack reevaluation; stale-field protection; ready-only/no lease | `test_kanban_worker_reserve_client.py` |
++| Whole-host occupancy, malformed/unreadable fail-closed samples, reporter compatibility | `test_machine_occupancy.py`, `test_machine_metrics.py` |
++| Local pressure/capacity refusal releases unused lease, ready and review | `test_kanban_worker_policy_db.py::test_worker_local_admission_rechecks_load_and_releases_unused_lease`, `test_admission_sampling_failure_releases_grant` |
++| Real concurrent multi-origin reservations; unauthorized candidates/CAS; expiry/replay/recovery | server `worker/test/worker-placement.test.ts` |
++| Numeric validity/freshness, score normalization, deterministic N-worker selection/ties | server `worker/test/worker-selection.test.ts` |
++| Two-worker ready rebalance, immovable running lease, capabilities/pickup at claim | server `worker/test/worker-placement.test.ts` |
++| Same-card review continuity, forged review-pin refusal, reserved-capacity exclusion | server `worker/test/worker-placement.test.ts` |
++| Operator settings, schema, rollback retains fences/leases and explicit CAS repin | server `worker/test/machines.test.ts`, `worker-placement.test.ts` |
++
++Server implementation/evidence and its deployment API are documented in `daveey/hermes-hub:docs/worker-first-v1.md`. Server integration tests execute real HTTP requests against Cloudflare's SQLite Durable Object test runtime; Python fake-service tests separately prove client sequencing and do not substitute for server atomicity tests.
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index db181ae5b90..7b8bf6f0119 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1952,8 +1952,8 @@ DEFAULT_CONFIG = {
+         # local_skill_markers (regex lists), assignees (always placed; any profile the target
+         # advertises is placed too), carried_requires (profile tools the target is trusted to
+         # satisfy when it publishes no profile-tools; default terminal/file/git/kanban),
+-        # hub_live_seconds, wait_seconds, hub_cli.
+-        # Empty = upstream behaviour (every card is created here).
++        # hub_live_seconds, wait_seconds, hub_cli; worker_pools maps origins to Board-worker lists.
++        # Empty = upstream behaviour; an enrolled empty pool queues, never overflows locally.
+         "placement": {},
+         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
+         # this home's dispatcher may claim (list or comma-separated string). None = any existing
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 7aa8bdc3200..a8d405ee5e4 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -485,6 +485,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_ask_resolved import AskFilingRefused, check_create_filing, create_context
+         assignee = (args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+                     or _cli_default_assignee(args))
++        from hermes_cli.kanban_worker_placement import cli_policy
+         try:
+             # [daveey] A blocked ask's resolved_check runs once first, as the sweep will run it for this assignee
+             # and workspace: already met or broken refuses the create. A key hit returns the card: no probe.
+@@ -516,6 +517,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                  if in_worker else None),
+                 validate_workspace=True, validate_skills=True, runs_on=getattr(args, "runs_on", None),
++                placement_policy=cli_policy(args, body, ws_kind, ws_path, board),
+             )
+         except WorktreeWorkspaceConfigError as exc:
+             return _err(f"kanban: --workspace: {exc}", 2)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 091b99292c8..b2b752a4659 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -30,6 +30,7 @@ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync
++from hermes_cli.kanban_worker_placement import validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_admission import admission_hold_set, claim_transaction, claim_and_open_run
+@@ -659,6 +660,7 @@ class Task:
+     human_request: Optional[dict] = None
+     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+     completion_contract: Optional[str] = None
++    placement_policy: Optional[str] = None
+ 
+     @classmethod
+     def from_row(cls, row: sqlite3.Row) -> Task:
+@@ -692,7 +694,7 @@ _TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expire
+ _TASK_OPTIONAL_COLUMNS = (
+     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
+     "max_runtime_seconds", "current_run_id", "workflow_template_id",
+-    "current_step_key", "max_retries", "session_id", "completion_contract",
++    "current_step_key", "max_retries", "session_id", "completion_contract", "placement_policy",
+ )
+ # Text columns where "" is stored/read as "not set".
+ _TASK_EMPTY_IS_NULL_COLUMNS = (
+@@ -1055,22 +1057,11 @@ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> t
+     provider = (provider or "").strip() or None
+     if provider and not model:
+         raise ValueError("provider_override requires a model_override")
+-    _reject_spaced_pin(model, provider)
++    from hermes_cli.kanban_pin_provider import reject_spaced_pin
++    reject_spaced_pin(model, provider)
+     return model, provider
+ 
+ 
+-def _reject_spaced_pin(model: Optional[str], provider: Optional[str]) -> None:
+-    """The ``/model`` whitespace rule for Kanban pins [daveey]. A provider-less pin is checked again
+-    once ``resolve_pin_provider`` binds its provider (a ``custom`` profile keeps spaced ids)."""
+-    if not model or not provider:
+-        return
+-    from hermes_cli.models_validate import model_whitespace_error
+-
+-    message = model_whitespace_error(model, provider)
+-    if message:
+-        raise ValueError(f"{message} Pin one model per card (got {model!r} on provider {provider!r}).")
+-
+-
+ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
+     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
+     if assignee is None:
+@@ -1235,6 +1226,7 @@ def create_task(
+     origin_intent: Optional[dict] = None, chat_origin: Optional[str] = None,
+     requires: Optional[list[str]] = None,
+     lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None, require_declaration: bool = False,
++    placement_policy: Optional[str] = None,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
+@@ -1258,6 +1250,9 @@ def create_task(
+     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
+     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+     """
++    validate_creation(placement_policy, runs_on=runs_on, workspace_kind=workspace_kind,
++                      workspace_path=workspace_path, project=project_id,
++                      origin_intent=origin_intent, board=board)
+     if origin_intent is not None:
+         # Capture all caller options before defaults mutate them, including future options.
+         creation_options = dict(locals())
+@@ -1309,6 +1304,8 @@ def create_task(
+     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
+         conn, project_id, project_source_task_id, workspace_kind, workspace_path
+     )
++    validate_creation(placement_policy, runs_on=runs_on, workspace_kind=workspace_kind,
++                      workspace_path=workspace_path, project=project_id, origin_intent=None, board=board)
+     parents = tuple(p for p in parents if p)
+     skills_list = _normalize_task_skills(skills)
+ 
+@@ -1343,7 +1340,8 @@ def create_task(
+         conn, assignee, runs_on=runs_on, requires=requires, workspace_kind=workspace_kind,
+         workspace_path=workspace_path, skills=skills_list, validate_skills=validate_skills,
+         require_declaration=require_declaration, model=model_override, provider=provider_override)
+-    _reject_spaced_pin(model_override, provider_override)
++    from hermes_cli.kanban_pin_provider import reject_spaced_pin
++    reject_spaced_pin(model_override, provider_override)
+ 
+     # Retry once on the extremely unlikely id collision.
+     for attempt in range(2):
+@@ -1370,8 +1368,8 @@ def create_task(
+                         max_runtime_seconds,
+                         skills, max_retries, model_override, provider_override,
+                         reasoning_effort,
+-                        goal_mode, goal_max_turns, session_id, completion_contract, requires
+-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        goal_mode, goal_max_turns, session_id, completion_contract, requires, placement_policy
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+                         task_id, title.strip(), body, assignee, task_status, priority,
+@@ -1381,7 +1379,7 @@ def create_task(
+                         json.dumps(skills_list) if skills_list is not None else None,
+                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
+                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+-                        json.dumps(required),
++                        json.dumps(required), placement_policy,
+                     ),
+                 )
+                 _sync.set_runs_on(conn, task_id, runs_on)  # placement labels (RFC "Placement"), synced boards only
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index ca82ccad908..28d12c8499e 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1054,6 +1054,7 @@ _LATER_TASK_COLUMNS = (
+     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
+     ("goal_max_turns", "goal_max_turns INTEGER"),
+     ("completion_contract", "completion_contract TEXT"),
++    ("placement_policy", "placement_policy TEXT"),
+     ("session_id", "session_id TEXT"),
+     # Typed operational reason; neither NULL nor capability implies a human ask.
+     ("block_kind", "block_kind TEXT"),
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 8bf0c55fd8a..f4f8ef7f830 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1825,18 +1825,9 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
+     return _gated
+ 
+ 
+-def _local_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
+-    """Cards in ``status`` this machine cannot lease (``kanban_worker_node.local_refusals``); never raises."""
+-    try:
+-        from hermes_cli.kanban_worker_node import local_refusals
+-        return local_refusals(conn, status)
+-    except Exception:  # health: allow BLE001 -- eligibility is advisory; the Board lease still decides
+-        _kb._log.debug("kanban dispatch: local eligibility check failed", exc_info=True)
+-        return {}
+-
+-
+ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+-    refused = _local_refusals(conn, status)
++    from hermes_cli.kanban_worker_node import dispatch_refusals
++    refused = dispatch_refusals(conn, status)
+     rows = [row for row in conn.execute(
+         "SELECT id, assignee FROM tasks "
+         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
+@@ -2470,6 +2461,13 @@ def _dispatch_once_locked(
+     if dispatch_paused():
+         _kb._log.info('kanban dispatcher: scheduling paused — gateway draining or restart requested')
+         return result
++    if not dry_run:
++        from hermes_cli.kanban_worker_placement import dispatch_tick
++        try:
++            dispatch_tick(conn)
++        except Exception:
++            logger = _kb._log
++            logger.warning("kanban worker placement failed; continuing local dispatch", exc_info=True)
+     may_spawn, spawn_budget = _tick_spawn_budget(
+         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+     )
+@@ -2576,7 +2574,8 @@ def _dispatch_once_locked(
+ 
+ def _eligible_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row], status: str,
+                    result: DispatchResult) -> list[sqlite3.Row]:
+-    refused = _local_refusals(conn, status) if rows else {}
++    from hermes_cli.kanban_worker_node import dispatch_refusals
++    refused = dispatch_refusals(conn, status) if rows else {}
+     if not refused:
+         return rows
+     kept = []
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index d9c56d7cd7d..8e0ecb5bb33 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -194,10 +194,11 @@ def sweep_remote_guard_holds(conn: sqlite3.Connection, result) -> None:
+     """
+     from hermes_cli import kanban_db_dispatch as dispatch
+     from hermes_cli.kanban_wake_check import foreign_ids
++    from hermes_cli.kanban_worker_node import dispatch_refusals
+ 
+     foreign = foreign_ids(conn)
+     for lane in ("ready", "review"):
+-        for task_id in dispatch._local_refusals(conn, lane):
++        for task_id in dispatch_refusals(conn, lane):
+             if task_id in foreign:
+                 continue
+             try:
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 598727708d1..e5ce83f5e25 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -58,7 +58,7 @@ SYNCED_COLUMNS: dict[str, frozenset[str]] = {
+         "consecutive_failures", "last_failure_error", "max_runtime_seconds", "current_run_id",
+         "workflow_template_id", "current_step_key", "skills", "requires", "model_override",
+         "provider_override", "reasoning_effort", "max_retries", "goal_mode", "goal_max_turns",
+-        "block_kind", "human_request", "block_recurrences", "completion_contract", "runs_on",
++        "block_kind", "human_request", "block_recurrences", "completion_contract", "runs_on", "placement_policy",
+     }),
+     "task_links": frozenset({"parent_id", "child_id"}),
+     "task_comments": frozenset({"task_id", "author", "body", "created_at"}),
+@@ -233,6 +233,8 @@ _SYNC_COLUMN_DDL = (
+     ("kanban_sync_state", "seconds_repaired", "seconds_repaired INTEGER NOT NULL DEFAULT 0"),
+     # Wall time of the last successful feed pull into this file (replicas): readers derive staleness from it. [daveey]
+     ("kanban_sync_state", "pulled_at", "pulled_at REAL"),
++    # Local-only round-robin position; refused revisions must not monopolize bounded batches.
++    ("kanban_sync_state", "worker_reserve_cursor", "worker_reserve_cursor TEXT"),
+ )
+ 
+ # Resolved db paths whose triggers this process installed. Empty = no synced
+@@ -747,6 +749,11 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+     """Lease seam before a claim CAS. Only ``primary`` boards ask the service;
+     without a grant the card stays ``ready`` (no offline claims: every card is
+     at-most-once in v1). A grant bounds the local claim to the lease deadline."""
++    from hermes_cli.kanban_worker_placement import execution_refusal
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if row is not None and (reason := execution_refusal(conn, row)):
++        _CLAIM_DEFERRALS[task_id] = reason
++        return ClaimGate(expires, deferred=True)
+     if board_mode(conn) != "primary":
+         return ClaimGate(expires)
+     state = _state(conn)
+@@ -764,7 +771,15 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+         _CLAIM_DEFERRALS[task_id] = lease.reason or "denied"
+         return ClaimGate(expires, deferred=True)
+     deadline = lease.expires_ms // 1000 - LEASE_SAFETY_MARGIN_SECONDS
+-    return ClaimGate(min(expires, deadline), lease=lease, ids=ids)
++    gate = ClaimGate(min(expires, deadline), lease=lease, ids=ids)
++    if row is not None and row["placement_policy"]:
++        from hermes_cli.kanban_worker_placement import local_admission
++        if not local_admission(conn):
++            with gate:
++                pass  # release the unused grant; no local task/run was started
++            _CLAIM_DEFERRALS[task_id] = "waiting_for_worker_capacity"
++            return ClaimGate(expires, deferred=True)
++    return gate
+ 
+ 
+ def stage_claim(conn: sqlite3.Connection, task_id: str, gate: Optional[ClaimGate]) -> Optional[str]:
+diff --git a/hermes_cli/kanban_model_assignment.py b/hermes_cli/kanban_model_assignment.py
+index 2a6da9ee0e4..9de30ed3a32 100644
+--- a/hermes_cli/kanban_model_assignment.py
++++ b/hermes_cli/kanban_model_assignment.py
+@@ -109,8 +109,7 @@ def _family_mismatch(assignee, model, provider):
+ 
+ def validate_task_pin(conn, task_id, model, provider):
+     """Repinning follows create's execution-host policy, including explicit remote providers."""
+-    from hermes_cli.kanban_db import _reject_spaced_pin
+-    from hermes_cli.kanban_pin_provider import require_remote_pin_provider, resolve_pin_provider
++    from hermes_cli.kanban_pin_provider import reject_spaced_pin, require_remote_pin_provider, resolve_pin_provider
+     from hermes_cli.kanban_runs_on_capabilities import runs_elsewhere
+ 
+     row = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
+@@ -125,7 +124,7 @@ def validate_task_pin(conn, task_id, model, provider):
+     if not provider:
+         # Same pin-time binding as create_task: resolve against the card's assignee, or refuse.
+         model, provider = resolve_pin_provider(model, None, assignee=assignee)
+-        _reject_spaced_pin(model, provider)
++        reject_spaced_pin(model, provider)
+     return model, provider
+ 
+ 
+diff --git a/hermes_cli/kanban_pin_provider.py b/hermes_cli/kanban_pin_provider.py
+index d3e5b42b60b..8426aa4d978 100644
+--- a/hermes_cli/kanban_pin_provider.py
++++ b/hermes_cli/kanban_pin_provider.py
+@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
+ _NO_PREFERENCE = frozenset({"", "auto"})
+ 
+ 
++def reject_spaced_pin(model: Optional[str], provider: Optional[str]) -> None:
++    """The ``/model`` whitespace rule; provider-less pins are checked again once bound."""
++    if not model or not provider:
++        return
++    from hermes_cli.models_validate import model_whitespace_error
++
++    message = model_whitespace_error(model, provider)
++    if message:
++        raise ValueError(f"{message} Pin one model per card (got {model!r} on provider {provider!r}).")
++
++
+ class PinProviderUnresolvedError(ValueError):
+     code = "pin_provider_unresolved"
+ 
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 3496a1f0174..f610ced035d 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -323,43 +323,52 @@ HOME_GATEWAY_MARKERS = (
+ )
+ 
+ 
+-def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
+-                     machine_ok: Optional[Callable[[str], bool]], *, skip: bool = False) -> Optional[dict]:
+-    """Placement for heavy, portable work created on a gateway with no ``route`` entry (the hub): None keeps it
+-    here on the gateway's own host. Portable means: scratch workspace on the default board, an assignee this
+-    config places, no option a worker cannot carry, only carried ``requires`` and no gateway ``needs``, no
+-    local-only marker, no marker naming the home gateway's own state (:data:`HOME_GATEWAY_MARKERS`, extended
+-    by ``extra_home_markers``), a heavy marker, and a worker that is an active pickup machine."""
+-    worker = c.heavy_target(self_gw)
+-    if skip or not worker:  # an explicit pin or a courier card is never re-routed
+-        return None
++def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
++    """Why a card cannot leave its origin; None means structurally portable, not admitted.
++
++    Keep the conservative legacy routeless-heavy boundary, excluding only its heavy-marker
++    requirement. Worker profile/tool/skill attestations and capacity are Board admission checks.
++    """
++    c = _Cfg(config() if cfg is None else cfg)
++    if args.get("needs"):
++        return "gateway-scoped need"
+     if (args.get("workspace_kind") or "scratch") != "scratch":
+-        return None
++        return "host workspace"
+     board = args.get("board")
+     if board and board != "default":
+-        return None
++        return "non-default board"
+     if (args.get("assignee") or "default") not in c.assignees():
+-        return None
++        return "assignee not allowlisted"
+     if any(args.get(k) not in (None, "", [], False) for k in UNCARRIED_OPTIONS):
+-        return None
++        return "uncarried option"
+     reqs = args.get("requires") or []
+     reqs = [reqs] if isinstance(reqs, str) else list(reqs)
+     if any(reg.is_gateway_need(r) for r in reqs):
+-        return None
++        return "gateway-scoped requirement"
+     if any(str(r) not in c.carried_requires() for r in reqs):
+-        return None
++        return "uncarried requirement"
+     title, body = args.get("title") or "", args.get("body") or ""
+     if _local_marker(title, body, args.get("skills"), c):
+-        return None
++        return "local marker"
+     full = f"{title}\n{body}"
+     extra = c.raw.get("extra_home_markers")
+     pats = list(HOME_GATEWAY_MARKERS) + (list(extra) if isinstance(extra, list) else [])
+     for p in pats:
+         try:
+             if re.search(p, full, re.IGNORECASE):
+-                return None
++                return "home gateway marker"
+         except re.error:
+             continue
++    return None
++
++
++def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
++                     machine_ok: Optional[Callable[[str], bool]], *, skip: bool = False) -> Optional[dict]:
++    """Legacy heavy routing; worker pools reuse portability without changing this opt-out path."""
++    worker = c.heavy_target(self_gw)
++    if skip or not worker or portable_reason(args, c.raw):
++        return None
++    title, body = args.get("title") or "", args.get("body") or ""
+     heavy = _heavy_marker(title, body, c)
+     if not heavy or not (machine_ok or _machine_picks_up)(worker):
+         return None
+@@ -590,8 +599,10 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         c = _Cfg(config() if cfg is None else cfg)
+         self_gw = reg.self_gateway() if self_gw is None else self_gw
+         pin = canonical_pin(args.get("placement") or "auto", self_gw, c.raw)
+-        if pin in ("local", "here", (self_gw or "").lower()):
+-            return {"where": "local", "why": PINNED_LOCAL_WHY}
++        from hermes_cli.kanban_worker_placement import creation_decision
++        enrollment = creation_decision(args, c.raw, self_gw, pin, origin_intent)
++        if enrollment is not None:
++            return enrollment
+         explicit = pin not in ("", "auto")
+         target = c.target(self_gw)
+         if explicit and (not target or pin != target.lower()):
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 68d44c974b7..653421aec0e 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -128,8 +128,9 @@ class Hub:
+     # how long a socket is reused.
+     IDLE_REUSE_S = 30.0
+ 
+-    def __init__(self, ident: Identity, timeout: float = HTTP_TIMEOUT_S) -> None:
++    def __init__(self, ident: Identity, timeout: float = HTTP_TIMEOUT_S, *, deadline: Optional[float] = None) -> None:
+         self.ident, self.timeout = ident, timeout
++        self.deadline = deadline
+         self._local = _hub_threading.local()
+         self._ssl_context = None
+         self._ssl_lock = _hub_threading.Lock()
+@@ -139,16 +140,22 @@ class Hub:
+                 "user-agent": "hermes-kanban-sync/1"}
+ 
+     def _call(self, method: str, path: str, body: Optional[dict] = None) -> dict:
++        timeout = self.timeout
++        if self.deadline is not None:
++            timeout = min(timeout, self.deadline - time.monotonic())
++            if timeout <= 0:
++                raise TimeoutError("Board request budget exhausted")
+         data = None if body is None else json.dumps(body).encode()
+         parts = urllib.parse.urlsplit(self.ident.url)
+         if parts.scheme not in ("http", "https") or not parts.hostname or self._proxied(parts):
+-            return self._call_urlopen(method, path, data)
+-        return self._call_kept_alive(parts, method, path, data)
++            return self._call_urlopen(method, path, data, timeout)
++        return self._call_kept_alive(parts, method, path, data, timeout)
+ 
+-    def _call_urlopen(self, method: str, path: str, data: Optional[bytes]) -> dict:
++    def _call_urlopen(self, method: str, path: str, data: Optional[bytes], timeout: Optional[float] = None) -> dict:
++        timeout = self.timeout if timeout is None else timeout
+         req = urllib.request.Request(self.ident.url + path, data=data, method=method, headers=self._headers())
+         try:
+-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
++            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                 return json.loads(resp.read() or b"{}")
+         except urllib.error.HTTPError as exc:
+             text = exc.read().decode("utf-8", "replace")[:500]
+@@ -174,8 +181,11 @@ class Hub:
+             except OSError:
+                 pass
+ 
+-    def _connection(self, parts: urllib.parse.SplitResult):
+-        """``(connection, reused)`` for this thread. A connection inherited across ``fork`` is never touched."""
++    def _connection(self, parts: urllib.parse.SplitResult, timeout: Optional[float] = None):
++        """``(connection, reused)`` for this thread. A connection inherited across ``fork`` is never touched.
++
++        ``timeout`` is this request's (deadline-capped) budget; a reused socket takes it too."""
++        timeout = self.timeout if timeout is None else timeout
+         loc = self._local
+         conn = getattr(loc, "conn", None)
+         if conn is not None and loc.pid != os.getpid():
+@@ -183,6 +193,14 @@ class Hub:
+         if conn is not None and (_hub_monotonic() - loc.used > self.IDLE_REUSE_S or _peer_closed(conn)):
+             self._drop()
+             conn = None
++        if conn is not None:
++            conn.timeout = timeout
++            try:
++                if getattr(conn, "sock", None) is not None:
++                    conn.sock.settimeout(timeout)
++            except OSError:  # the socket is already dead: nothing was sent on it, so open a fresh one
++                self._drop()
++                conn = None
+         if conn is not None:
+             return conn, True
+         import http.client
+@@ -191,19 +209,20 @@ class Hub:
+                 if self._ssl_context is None:
+                     import ssl
+                     self._ssl_context = ssl.create_default_context()  # truststore-injected when installed
+-            conn = http.client.HTTPSConnection(parts.hostname, parts.port, timeout=self.timeout,
++            conn = http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
+                                                context=self._ssl_context)
+         else:
+-            conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=self.timeout)
++            conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+         loc.conn, loc.pid, loc.used = conn, os.getpid(), _hub_monotonic()
+         return conn, False
+ 
+-    def _call_kept_alive(self, parts: urllib.parse.SplitResult, method: str, path: str, data: Optional[bytes]) -> dict:
++    def _call_kept_alive(self, parts: urllib.parse.SplitResult, method: str, path: str, data: Optional[bytes],
++                         timeout: Optional[float] = None) -> dict:
+         import http.client
+         target = (parts.path or "") + path
+         headers = self._headers()
+         for attempt in (0, 1):
+-            conn, reused = self._connection(parts)
++            conn, reused = self._connection(parts, timeout)
+             try:
+                 conn.request(method, target, body=data, headers=headers)
+             except (OSError, http.client.HTTPException) as exc:
+@@ -234,7 +253,7 @@ class Hub:
+                 self._local.used = _hub_monotonic()
+             status = resp.status
+             if 300 <= status < 400 and method == "GET":  # the Board service sends none; urlopen follows them
+-                return self._call_urlopen(method, path, data)
++                return self._call_urlopen(method, path, data, timeout)
+             if 300 <= status < 400:  # never resend a POST the server may have applied
+                 raise HubError(status, raw.decode("utf-8", "replace")[:500])
+             if not 200 <= status < 300:
+@@ -263,6 +282,17 @@ class Hub:
+     def leases(self, board: str, body: dict) -> dict:
+         return self._call("POST", f"/v2/boards/{board}/leases", body)
+ 
++    def repin(self, board: str, *, task_id: str, expected_revision: int, runs_on: list[str]) -> dict:
++        """Explicit rollback/manual pin; caller must pull the authoritative row afterward."""
++        return self._call("POST", f"/v2/boards/{board}/placement/repin", {
++            "task_id": task_id, "expected_revision": expected_revision, "runs_on": runs_on})
++
++    def reserve(self, board: str, *, task_id: str, expected_revision: int, candidates: list[str]) -> dict:
++        """Atomic Board placement; errors leave the persisted local queue fence intact."""
++        return self._call("POST", f"/v2/boards/{board}/placement/reserve", {
++            "task_id": task_id, "expected_revision": expected_revision,
++            "policy": "worker-first-v1", "candidates": candidates})
++
+     def sessions(self, board: str, body: dict) -> dict:
+         """Session owners (session handover, :mod:`hermes_cli.session_owner`): ``get`` / ``move``. A 409 refusal
+         returns its body (``{reason, owner}``) instead of raising."""
+@@ -402,7 +432,8 @@ def _full_row_if_unseen(conn: sqlite3.Connection, row: dict) -> dict:
+         return row
+     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["row_uid"],)).fetchone()
+     if task is None or task["sync_version"] is not None:
+-        return row
++        from hermes_cli.kanban_worker_placement import acknowledged_outbox
++        return acknowledged_outbox(row, task)
+     return {**row, "fields": _row_fields(conn, "tasks", task)}
+ 
+ 
+@@ -802,6 +833,9 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+         result.push = push(live, hub, slug, gateway, primary=mode == "primary")
+         from hermes_cli.kanban_sync_rejections import resolve_rejections
+         result.rejection_resolutions = resolve_rejections(live, hub, slug)
++        if mode == "primary":
++            from hermes_cli.kanban_worker_placement import reevaluate
++            reevaluate(live, hub, slug, gateway)
+         return result
+     finally:
+         live.close()
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 811a4ff4715..6042971eb24 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -287,24 +287,35 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     return gone
+ 
+ 
++def dispatch_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
++    """Advisory prefilter; the direct claim gate remains authoritative on errors."""
++    try:
++        return local_refusals(conn, status)
++    except Exception:  # health: allow BLE001 -- eligibility is advisory; the Board lease still decides
++        from hermes_cli import kanban_db
++        kanban_db._log.debug("kanban dispatch: local eligibility check failed", exc_info=True)
++        return {}
++
++
+ def local_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
+     """``{task_id: reason}`` for unclaimed ``status`` cards this gateway cannot lease: the Board's refusal
+     (:func:`eligible`) computed before the claim, so local dispatch never spends a slot on them. Only cards with
+     ``runs_on`` or another creator can be refused (a held machine is left to the lease). Empty when the board is
+     not primary or the registry is unreachable: the lease stays the authority and fails closed."""
++    from hermes_cli.kanban_worker_placement import local_refusals as policy_refusals
++    out = policy_refusals(conn, status)
+     if sync.board_mode(conn) != "primary":
+-        return {}
++        return out
+     own = _own(conn)
+     rows = conn.execute(
+         "SELECT id, runs_on, created_on, workspace_kind FROM tasks WHERE status = ? AND claim_lock IS NULL "
+         "AND (runs_on IS NOT NULL OR (created_on IS NOT NULL AND created_on != ?))", (status, own)).fetchall()
+     if not rows:
+-        return {}
++        return out
+     reg = registry()
+     if not reg:
+-        return {}
++        return out
+     machines = reg["machines"]
+-    out: dict[str, str] = {}
+     for row in rows:
+         reason = eligible(dict(row), own, machines)
+         if reason is not None and reason != "held":
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+new file mode 100644
+index 00000000000..565d994083d
+--- /dev/null
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -0,0 +1,197 @@
++"""Worker-first policy enrollment and execution fences; Board owns assignments."""
++from __future__ import annotations
++
++import json
++import math
++import time
++
++POLICY = "worker-first-v1"
++WAITING = "waiting_for_worker_capacity"
++MAX_RESERVES_PER_TICK = 4
++DISPATCH_NETWORK_BUDGET_S = 2.0
++
++
++def creation_decision(args, cfg, gateway, pin, origin_intent):
++    """Resolve explicit local pins and pool enrollment before legacy routing."""
++    from hermes_cli.kanban_placement import PINNED_LOCAL_WHY, portable_reason
++
++    if pin in ("local", "here", (gateway or "").lower()):
++        return {"where": "local", "why": PINNED_LOCAL_WHY}
++    pools = cfg.get("worker_pools")
++    if pin not in ("", "auto") or not isinstance(pools, dict) or gateway not in pools:
++        return None
++    if args.get("runs_on") is not None:
++        return None  # Preserve legacy routing, including an explicit empty pin.
++    if origin_intent is not None:
++        return None
++    reason = portable_reason(args, cfg)
++    if reason:
++        return None  # Non-portable work still follows the origin's legacy route.
++    return {"where": "local", "placement_policy": POLICY, "why": WAITING}
++
++
++def cli_policy(args, body, workspace_kind, workspace_path, board):
++    """CLI creation uses the same enrollment boundary, without changing legacy routes."""
++    from hermes_cli import kanban_placement as placement
++
++    cfg = placement.config()
++    if not cfg.get("worker_pools"):
++        return None
++    gateway = placement.reg.self_gateway()
++    fields = {**vars(args), "body": body, "workspace_kind": workspace_kind,
++              "workspace_path": workspace_path, "board": board}
++    if fields.get("initial_status") == "running":
++        fields.pop("initial_status")  # argparse's ordinary create default, not a requested hold
++    result = creation_decision(fields, cfg, gateway, "auto", None)
++    return (result or {}).get("placement_policy")
++
++
++def validate_creation(policy, *, runs_on, workspace_kind, workspace_path, project, origin_intent, board):
++    """Reject contradictory enrollment rather than quietly erasing a caller pin."""
++    if policy is None:
++        return
++    if policy != POLICY:
++        raise ValueError("unknown placement policy")
++    if (runs_on is not None or workspace_kind not in (None, "scratch") or workspace_path
++            or project or origin_intent is not None or board not in (None, "default")):
++        raise ValueError("worker-first policy cannot override manual, courier or host placement")
++
++
++def execution_refusal(conn, row):
++    """Local check only; a matching assignment still requires the authoritative lease.
++
++    A persisted policy always fences, including after sync/config rollback. Missing
++    or malformed labels cannot turn a queued card into origin-local work.
++    """
++    from hermes_cli import kanban_db_sync as sync
++
++    row = dict(row)
++    policy = row.get("placement_policy")
++    if not policy:
++        return None
++    if policy != POLICY or sync.board_mode(conn) != "primary":
++        return WAITING
++    state = sync.sync_state(conn) or {}
++    try:
++        labels = json.loads(row.get("runs_on") or "null")
++    except (TypeError, ValueError):
++        return WAITING
++    own = state.get("gateway_id")
++    if not own or labels != [f"machine:{own}"]:
++        return WAITING
++    return None
++
++
++def local_refusals(conn, status):
++    """Read policy cards even when the registry and sync are unavailable."""
++    rows = conn.execute("SELECT * FROM tasks WHERE status=? AND claim_lock IS NULL "
++                        "AND placement_policy IS NOT NULL", (status,)).fetchall()
++    return {row["id"]: reason for row in rows if (reason := execution_refusal(conn, row))}
++
++
++def reevaluate(conn, hub, board, gateway, *, cfg=None):
++    """Reserve acknowledged origin-owned ready work, then read authoritative feed.
++
++    No lease (even apparently expired) is moved here. A lost reply is retried with
++    the same revision; a successful reply is never itself permission to execute.
++    """
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_placement as placement
++    from hermes_cli import kanban_sync_client as client
++
++    if board != "default" or sync.board_mode(conn) != "primary":
++        return 0
++    cfg = placement.config() if cfg is None else cfg
++    pools = cfg.get("worker_pools")
++    candidates = pools.get(gateway) if isinstance(pools, dict) else None
++    if (not isinstance(candidates, list) or not candidates or len(candidates) > 64
++            or not all(isinstance(name, str) and name for name in candidates)):
++        return 0
++    cursor = (sync.sync_state(conn) or {}).get("worker_reserve_cursor") or ""
++    rows = conn.execute(
++        "SELECT id, sync_version FROM tasks WHERE placement_policy=? AND status='ready' "
++        "AND created_on=? AND claim_lock IS NULL AND lease_holder IS NULL AND sync_version IS NOT NULL "
++        "AND NOT EXISTS (SELECT 1 FROM kanban_sync_outbox o WHERE o.table_name='tasks' "
++        "AND o.row_uid=tasks.id AND o.state='pending') ORDER BY (id <= ?), id LIMIT ?",
++        (POLICY, gateway, cursor, MAX_RESERVES_PER_TICK)).fetchall()
++    attempted = 0
++    last = None
++    try:
++        for row in rows:
++            last = row["id"]
++            try:
++                hub.reserve(board, task_id=row["id"], expected_revision=row["sync_version"], candidates=candidates)
++                attempted += 1
++            except OSError:
++                # An unavailable transport applies to the entire batch, not just this card.
++                return attempted
++            except client.HubError:
++                # Refused revisions still advance the local cursor, but never the feed.
++                continue
++    finally:
++        if last is not None:
++            from hermes_cli.kanban_db_connect import write_txn
++            with write_txn(conn):
++                conn.execute("UPDATE kanban_sync_state SET worker_reserve_cursor=? WHERE board_id=? AND gateway_id=?",
++                             (last, board, gateway))
++    if attempted:
++        client.pull(conn, hub, board, observers=True, partition=gateway)
++    return attempted
++
++
++def acknowledged_outbox(row, task):
++    """Policy enrollment is create-only; never replay an old automatic assignment."""
++    if task is None or task["sync_version"] is None:
++        return row
++    fields = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"])
++    fields = dict(fields)
++    if task["placement_policy"] or fields.get("placement_policy"):
++        fields.pop("runs_on", None)
++    fields.pop("placement_policy", None)
++    return {**row, "fields": fields}
++
++
++def local_admission(conn):
++    """Fresh local pressure and whole-host occupancy before converting a grant to a run."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as node
++    from hermes_cli import machine_metrics
++
++    own = (sync.sync_state(conn) or {}).get("gateway_id")
++    try:
++        entry = ((node.registry() or {}).get("machines") or {}).get(own) or {}
++        capacity = entry.get("max_card_runs")
++        sample = machine_metrics.collect()
++        load, cpus, memory, active = (sample.get(k) for k in ("cpu_load1", "cpus", "mem_used_pct", "active_card_runs"))
++    except (OSError, ValueError, TypeError, AttributeError):
++        return False
++    if not all(type(v) in (int, float) and math.isfinite(v) for v in (load, cpus, memory)):
++        return False
++    if type(capacity) is not int or capacity <= 0 or type(active) is not int or active < 0:
++        return False
++    return (cpus > 0 and load >= 0 and 0 <= memory <= 100 and active < capacity
++            and max(load / cpus, memory / 100) < 0.85)
++
++
++def dispatch_tick(conn):
++    """Retry placement before local capacity checks, without creating an extra daemon."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++
++    if sync.board_mode(conn) != "primary":
++        return
++    state = sync.sync_state(conn) or {}
++    if not conn.execute("SELECT 1 FROM tasks WHERE placement_policy=? AND status='ready' LIMIT 1", (POLICY,)).fetchone():
++        return
++    try:
++        ident = client.load_identity()
++        if ident.gateway != state.get("gateway_id"):
++            return
++        hub = client.Hub(ident, timeout=DISPATCH_NETWORK_BUDGET_S,
++                         deadline=time.monotonic() + DISPATCH_NETWORK_BUDGET_S)
++        client.pull(conn, hub, state["board_id"], observers=True, partition=ident.gateway)
++        reevaluate(conn, hub, state["board_id"], ident.gateway)
++    except (client.HubError, client.SyncUnavailable, client.Resync, OSError):
++        # Offline origin cannot remove the queue fence or manufacture an assignment.
++        return
++
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 18db03dc442..85653ccc372 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -9,6 +9,7 @@ import logging
+ import os
+ import re
+ import shutil
++import sqlite3
+ import subprocess
+ import sys
+ import time
+@@ -56,9 +57,47 @@ def _mem_used_pct() -> Optional[float]:
+     return None
+ 
+ 
++def active_card_runs() -> Optional[int]:
++    """All profiles share the kanban root. Count its execution boards, not replicas.
++
++    Unreadable/schema-unknown boards invalidate the whole sample. Conservative
++    stale local runs consume slots until the normal reaper accounts for them.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_boards import named_board_db_files
++
++    try:
++        paths = [kb.kanban_home() / "kanban.db", *(p for _, p in named_board_db_files())]
++        total = 0
++        seen = set()
++        for path in paths:
++            stat = path.stat()
++            identity = (stat.st_dev, stat.st_ino)
++            if identity in seen:
++                continue
++            seen.add(identity)
++            db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
++            try:
++                cols = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
++                if "lease_holder" in cols:
++                    own = db.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
++                    if own is None or not own[0]:
++                        return None
++                    total += db.execute("SELECT count(*) FROM tasks WHERE status='running' AND "
++                                        "(claim_lock IS NOT NULL OR lease_holder IS NULL OR lease_holder=?)",
++                                        (own[0],)).fetchone()[0]
++                else:
++                    total += db.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0]
++            finally:
++                db.close()
++        return total
++    except (OSError, sqlite3.Error):
++        return None
++
++
+ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+     """``{cpu_load1, cpus, mem_used_pct, disk_free_gb, disk_total_gb}``; a value that cannot be read is left out."""
+-    out: dict[str, Any] = {}
++    out: dict[str, Any] = {"active_card_runs": active_card_runs()}
+     try:
+         out["cpu_load1"] = round(os.getloadavg()[0], 2)
+     except (OSError, AttributeError):
+diff --git a/tests/hermes_cli/test_kanban_guard_hold_sync.py b/tests/hermes_cli/test_kanban_guard_hold_sync.py
+index 57033cbb36f..4934e2bba75 100644
+--- a/tests/hermes_cli/test_kanban_guard_hold_sync.py
++++ b/tests/hermes_cli/test_kanban_guard_hold_sync.py
+@@ -135,6 +135,35 @@ def test_pinned_executor_hold_gets_home_maintenance_in_full_tick(gws, svc, monke
+     assert kb.get_task(home.conn, target).status == "triage"
+ 
+ 
++def test_home_maintains_guard_hold_on_worker_queued_policy_card(gws, svc, monkeypatch):
++    """A worker-first card is fenced out of the home's execution lanes (placement-policy refusal),
++    so its guard hold is home maintenance: the full tick sweeps it instead of aborting."""
++    home, _worker = gws
++    home.enter()
++    target = kb.create_task(home.conn, title="queued for worker capacity", assignee="default",
++                            placement_policy="worker-first-v1")
++    assert wn.dispatch_refusals(home.conn, "ready")[target] == "waiting_for_worker_capacity"
++    now = int(time.time()) + 2
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setenv("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", "10000")
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", "3600")
++    # Executor-shaped evidence: a restart-reclaimed run and its hold event (synced home in production).
++    with kb.write_txn(home.conn):
++        home.conn.execute(
++            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, metadata) "
++            "VALUES (?, 'reclaimed', 'reclaimed', ?, ?, ?)",
++            (target, now - 2, now, '{"owner_restart": true}'),
++        )
++        kb._append_event(home.conn, target, "respawn_guarded", {"reason": "owner_restart_cooldown"})
++    monkeypatch.setattr(time, "time", lambda: now + 4000)
++    result = home.tick(max_spawn=0)
++    assert result.auto_blocked == [target]
++    assert result.spawned == []
++    task = kb.get_task(home.conn, target)
++    assert task is not None and task.status == "triage"
++    assert home.conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (target,)).fetchone()[0] == 1
++
++
+ @pytest.mark.parametrize("cooldown", [120, 10000])
+ def test_home_revalidates_synced_cooldown_without_executor_budget(gws, monkeypatch, cooldown):
+     home, worker = gws
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 7f0d26a9371..04b19025ec8 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1379,6 +1379,22 @@ def test_heavy_route_machine_check_reads_the_board_registry(monkeypatch, entry,
+     assert kp._machine_picks_up("worker-1") is ok
+ 
+ 
++@pytest.mark.parametrize("title", ["Analyze public data", "Run the full test suite"])
++def test_tool_creates_worker_policy_atomically_and_reports_queue(mac, monkeypatch, title):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db_connect as kbc
++    monkeypatch.setattr(kp, "config", lambda: {"worker_pools": {"macbook": []}})
++    out = json.loads(kt._handle_create({"title": title, "requires": []}))
++    assert out["ok"], out
++    with kbc.connect_closing() as conn:
++        row = conn.execute("SELECT placement_policy FROM tasks WHERE id=?", (out["task_id"],)).fetchone()
++        assert row[0] == "worker-first-v1"
++    assert out["placement"]["placement_policy"] == "worker-first-v1"
++    assert out["placement"]["why"] == "waiting_for_worker_capacity"
++    assert out["runs_where"] == "worker pool (waiting_for_worker_capacity; no local fallback)"
++    assert not mac["calls"]
++
++
+ # --- the hub (no route entry) sends portable heavy work to the worker ---------------------------------------
+ # Gap: heavy_route was only read after a route target existed, so the hub (routeless) kept every heavy card
+ # on itself and worker-1's explicit pickup never saw one.
+diff --git a/tests/hermes_cli/test_kanban_sync_hub_keepalive.py b/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+index 267806e3a8e..24e06b2cb48 100644
+--- a/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
++++ b/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+@@ -204,11 +204,30 @@ def test_threads_never_share_a_connection(server):
+ def test_environment_proxy_keeps_urlopen(server, monkeypatch):
+     calls = []
+     monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")
+-    monkeypatch.setattr(ksc.Hub, "_call_urlopen", lambda self, m, p, d: calls.append((m, p)) or {"via": "urlopen"})
++    monkeypatch.setattr(ksc.Hub, "_call_urlopen", lambda self, m, p, d, *a: calls.append((m, p)) or {"via": "urlopen"})
+     assert _hub(server).machines() == {"via": "urlopen"}
+     assert calls == [("GET", "/v2/machines")] and server.requests == []
+ 
+ 
++def test_board_deadline_caps_every_kept_alive_request(server, monkeypatch):
++    """The worker-placement request budget (``deadline``) caps a reused socket too, not only the first connect."""
++    from types import SimpleNamespace
++    clock = [100.0]
++    monkeypatch.setattr(ksc, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++    host, port = server.server_address
++    hub = ksc.Hub(ksc.Identity(url=f"http://{host}:{port}", key="k" * 16, gateway="gw"), timeout=5, deadline=104.0)
++    hub.machines()
++    assert hub._local.conn.sock.gettimeout() == 4.0
++    clock[0] = 102.5
++    hub.machines()
++    assert server.connections == 1  # reused, yet bound by the remaining budget
++    assert hub._local.conn.sock.gettimeout() == 1.5
++    clock[0] = 104.5
++    with pytest.raises(TimeoutError, match="budget exhausted"):
++        hub.machines()
++    assert len(server.requests) == 2
++
++
+ def test_failed_send_on_reused_socket_is_retried_on_a_fresh_one(server, monkeypatch):
+     hub = _hub(server)
+     hub.machines()
+diff --git a/tests/hermes_cli/test_kanban_worker_placement.py b/tests/hermes_cli/test_kanban_worker_placement.py
+new file mode 100644
+index 00000000000..a505fa4e9f1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_placement.py
+@@ -0,0 +1,81 @@
++"""Frozen worker-first policy: conservative portable-card boundary."""
++import pytest
++
++from hermes_cli import kanban_placement as placement
++
++
++@pytest.mark.parametrize("title", ["Summarize a public paper", "Run the full test suite"])
++def test_portable_reason_accepts_light_and_heavy_scratch_work(title):
++    assert placement.portable_reason({"title": title, "requires": ["terminal", "file"]}, {}) is None
++
++
++@pytest.mark.parametrize("fields", [
++    {"workspace_kind": "dir"}, {"workspace_kind": "worktree"}, {"workspace_path": "/checkout"},
++    {"board": "another"}, {"assignee": "unlisted"}, {"project": "project"},
++    {"requires": ["host_repo"]}, {"requires": ["ssh:host"]}, {"requires": ["unknown"]},
++    {"needs": ["ssh:host"]},
++    {"title": "Read ~/code/example"}, {"title": "Inspect kanban.db"},
++    {"title": "Restart the gateway"}, {"title": "Use token-broker"},
++    {"title": "Run launchd"}, {"title": "Inspect Chrome on my Mac"},
++    {"human_request": {"action": "approve"}}, {"max_retries": 2}, {"tenant": "x"},
++])
++def test_portable_reason_retains_conservative_exclusions(fields):
++    assert placement.portable_reason({"title": "Analyze public data", **fields}, {})
++    args = {"title": "Analyze public data", **fields}
++    cfg = {"route": {"macbook": "hub"}, "heavy_route": {"macbook": "legacy"}}
++    options = {"self_gw": "macbook", "live": lambda _: None, "carries": True,
++               "locate": lambda _: {"holders": [("hub", {})]}}
++    legacy = placement.decide(args, cfg=cfg, **options)
++    pooled = placement.decide(args, cfg={**cfg, "worker_pools": {"macbook": ["worker-1"]}}, **options)
++    assert pooled == legacy
++
++
++def test_extra_home_marker_remains_an_exclusion():
++    assert placement.portable_reason({"title": "Inspect special-device"}, {"extra_home_markers": ["special-device"]})
++
++
++def test_parent_and_origin_metadata_are_not_mutated():
++    args = {"title": "Analyze public data", "parents": ["parent"], "origin_session": "@session:default@gw/id"}
++    before = dict(args)
++    assert placement.portable_reason(args, {}) is None
++    assert args == before
++
++
++@pytest.mark.parametrize("pool", [[], ["worker-1"], ["worker-1", "worker-2"]])
++@pytest.mark.parametrize("title", ["Summarize public data", "Run full test suite"])
++def test_pool_precedes_gateway_and_heavy_routes_and_never_falls_back(pool, title):
++    cfg = {"worker_pools": {"hub": pool}, "route": {"hub": "other"}, "heavy_route": {"hub": "old-worker"}}
++    result = placement.decide({"title": title}, cfg=cfg, self_gw="hub")
++    assert result["where"] == "local"  # storage stays here; execution is fenced
++    assert result["placement_policy"] == "worker-first-v1"
++    assert result["why"] == "waiting_for_worker_capacity"
++    assert result.get("runs_on") is None
++
++
++@pytest.mark.parametrize("fields", [{"placement": "local"}, {"placement": "hub"}, {"runs_on": []}, {"runs_on": ["linux"]}])
++def test_explicit_pins_bypass_worker_policy(fields):
++    result = placement.decide({"title": "Analyze data", **fields}, cfg={"worker_pools": {"hub": ["worker-1"]}}, self_gw="hub")
++    assert "placement_policy" not in result
++    if "runs_on" in fields:
++        args = {"title": "Analyze data", **fields}
++        cfg = {"route": {"macbook": "hub"}}
++        options = {"self_gw": "macbook", "live": lambda _: None, "carries": True,
++               "locate": lambda _: {"holders": [("hub", {})]}}
++        assert placement.decide(args, cfg={**cfg, "worker_pools": {"macbook": ["worker-1"]}}, **options) == placement.decide(args, cfg=cfg, **options)
++
++
++@pytest.mark.parametrize("fields", [{"title": "Fix the hermes-hub ssh config"}, {"requires": ["ssh:hub"]}])
++def test_hub_bound_work_keeps_legacy_route(fields):
++    args = {"title": "Analyze data", **fields}
++    cfg = {"route": {"macbook": "hub"}}
++    options = {"self_gw": "macbook", "live": lambda _: None, "carries": True,
++               "locate": lambda _: {"holders": [("hub", {})]}}
++    legacy = placement.decide(args, cfg=cfg, **options)
++    assert legacy["where"] == "hub"
++    assert placement.decide(args, cfg={**cfg, "worker_pools": {"macbook": ["worker-1"]}}, **options) == legacy
++
++
++def test_courier_and_host_work_bypass_worker_policy():
++    cfg = {"worker_pools": {"hub": ["worker-1"]}}
++    assert "placement_policy" not in placement.decide({"title": "Analyze data"}, origin_intent=object(), cfg=cfg, self_gw="hub")
++    assert "placement_policy" not in placement.decide({"title": "Inspect ~/code/repo"}, cfg=cfg, self_gw="hub")
+diff --git a/tests/hermes_cli/test_kanban_worker_placement_failures.py b/tests/hermes_cli/test_kanban_worker_placement_failures.py
+new file mode 100644
+index 00000000000..a709d972f72
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_placement_failures.py
+@@ -0,0 +1,116 @@
++"""Placement failures must not monopolize a dispatcher tick or strand local work."""
++import sqlite3
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from threading import Event, Thread
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++gws = fixtures.gws
++svc = fixtures.svc
++CFG = {"worker_pools": {"hub": ["worker-1"]}}
++
++
++def test_transport_failure_stops_reservation_batch(conn, monkeypatch):
++    for _ in range(8):
++        fixtures.acknowledged(conn)
++    hub = fixtures.RecordingHub()
++    def fail(board, **body):
++        hub.calls.append(body)
++        raise OSError("transport unavailable")
++    hub.reserve = fail
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg=CFG) == 0
++    assert len(hub.calls) == 1
++
++
++def test_http_budget_is_shared_across_requests(monkeypatch):
++    from contextlib import contextmanager
++    clock, timeouts = [100.0], []
++    from types import SimpleNamespace
++    monkeypatch.setattr(client, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++    for var in ("no_proxy", "NO_PROXY"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")  # the urlopen path; kept-alive: keepalive tests
++    @contextmanager
++    def open_response(request, *, timeout):
++        from io import BytesIO
++        timeouts.append(timeout)
++        clock[0] += 1.0
++        yield BytesIO(b"{}")
++    monkeypatch.setattr(client.urllib.request, "urlopen", open_response)
++    hub = client.Hub(client.Identity("http://example.invalid", "synthetic", "hub"), deadline=102.0)
++    hub.changes("default", 0)
++    hub.reserve("default", task_id="one", expected_revision=1, candidates=["worker-1"])
++    with pytest.raises(TimeoutError, match="budget exhausted"):
++        hub.changes("default", 1)
++    assert timeouts == [2.0, 1.0]
++
++
++def test_reservation_batch_is_bounded(conn, monkeypatch):
++    for _ in range(12):
++        fixtures.acknowledged(conn)
++    hub = fixtures.RecordingHub()
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++    wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    assert 0 < len(hub.calls) <= 4
++
++
++@pytest.mark.parametrize("error", [ValueError("bad JSON"), sqlite3.OperationalError("bad replica")])
++def test_unexpected_placement_failure_still_spawns_local_work(gws, monkeypatch, error, caplog):
++    origin, _ = gws
++    origin.enter()
++    local = kb.create_task(origin.conn, title="Host work", assignee="default")
++    origin.round()
++    def fail(db):
++        raise error
++    monkeypatch.setattr(wp, "dispatch_tick", fail)
++    result = origin.tick(reconcile_orphans=False)
++    assert local in [row[0] for row in result.spawned]
++    assert "worker placement" in caplog.text
++
++
++def test_hanging_reserve_times_out_and_local_work_spawns_same_tick(gws, monkeypatch):
++    origin, _ = gws
++    origin.enter()
++    local = kb.create_task(origin.conn, title="Host work", assignee="default")
++    origin.round()
++    queued = [fixtures.acknowledged(origin.conn) for _ in range(8)]
++    entered, release = Event(), Event()
++    requests = []
++    class Handler(BaseHTTPRequestHandler):
++        def do_POST(self):
++            requests.append(self.path)
++            entered.set()
++            release.wait(10)
++            self.close_connection = True
++        def log_message(self, *args):
++            pass
++    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++    thread = Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    monkeypatch.setattr(client, "load_identity", lambda: client.Identity(
++        f"http://127.0.0.1:{server.server_port}", "synthetic", "hub"))
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++    monkeypatch.setattr(placement, "config", lambda: CFG)
++    try:
++        start = time.monotonic()
++        result = origin.tick(reconcile_orphans=False)
++        assert time.monotonic() - start < 6
++        assert entered.is_set()
++        assert len(requests) == 1
++        assert local in [row[0] for row in result.spawned]
++        assert all(kb.get_task(origin.conn, tid).status == "ready" for tid in queued)
++    finally:
++        release.set()
++        server.shutdown()
++        server.server_close()
++        thread.join()
+diff --git a/tests/hermes_cli/test_kanban_worker_policy_cli.py b/tests/hermes_cli/test_kanban_worker_policy_cli.py
+new file mode 100644
+index 00000000000..4f071e14bef
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_policy_cli.py
+@@ -0,0 +1,27 @@
++"""The CLI create entry path enrolls only portable unpinned cards."""
++import argparse
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli import test_kanban_worker_policy_db as fixtures
++
++conn = fixtures.conn
++
++
++@pytest.mark.parametrize("extra,expected", [([], "worker-first-v1"), (["--runs-on", "linux"], None)])
++def test_cli_pool_create_preserves_pins(conn, monkeypatch, extra, expected):
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": []}})
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    assert cli._cmd_create(parser.parse_args(["kanban", "create", "Public data analysis", *extra])) == 0
++    with kbc.connect_closing() as conn:
++        tasks = kb.list_tasks(conn)
++        assert len(tasks) == 1
++        assert tasks[0].placement_policy == expected
++        if extra:
++            assert conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tasks[0].id,)).fetchone()[0] == '["linux"]'
+diff --git a/tests/hermes_cli/test_kanban_worker_policy_db.py b/tests/hermes_cli/test_kanban_worker_policy_db.py
+new file mode 100644
+index 00000000000..b94242f6548
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_policy_db.py
+@@ -0,0 +1,127 @@
++"""Durable queue fences survive disabled sync and origin restart."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    with kbc.connect(home / "kanban.db") as db:
++        ksc.ensure_identity(db, "default", "hub")
++        sync.set_mode(db, "primary")
++        yield db
++
++
++def test_policy_is_captured_in_first_insert_with_parent_and_origin(conn):
++    parent = kb.create_task(conn, title="Parent", assignee="default")
++    tid = kb.create_task(conn, title="Public analysis", assignee="default", parents=[parent],
++                         session_id="origin-session", placement_policy="worker-first-v1")
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert row["placement_policy"] == "worker-first-v1"
++    assert row["session_id"] == "origin-session"
++    assert row["status"] == "todo"
++    assert conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (tid,)).fetchone()[0] == parent
++    inserts = conn.execute("SELECT fields FROM kanban_sync_outbox WHERE row_uid=? ORDER BY rowid", (tid,)).fetchall()
++    assert json.loads(inserts[0][0])["placement_policy"] == "worker-first-v1"
++    assert kb.get_task(conn, tid).placement_policy == "worker-first-v1"
++
++
++@pytest.mark.parametrize("mode", ["off", "shadow", "primary"])
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_queue_fence_precedes_direct_claim_and_lease_even_without_sync(conn, mode, lane):
++    tid = kb.create_task(conn, title="Public analysis", assignee="default", placement_policy="worker-first-v1")
++    conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
++    conn.commit()
++    sync.set_mode(conn, mode)
++    client = support.FakeLeaseClient()  # would grant if accidentally consulted
++    old = sync.set_lease_client(client)
++    try:
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert client.calls == []
++        assert sync.pop_claim_deferral(tid) == "waiting_for_worker_capacity"
++        assert conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
++    finally:
++        sync.set_lease_client(old)
++
++
++@pytest.mark.parametrize("mode", ["off", "shadow", "primary"])
++def test_local_dispatch_refusal_survives_registry_failure_and_disabled_policy(conn, mode, monkeypatch):
++    tid = kb.create_task(conn, title="Public analysis", assignee="default", placement_policy="worker-first-v1")
++    sync.set_mode(conn, mode)
++    monkeypatch.setattr(wn, "registry", lambda: None)
++    assert wn.local_refusals(conn, "ready")[tid] == "waiting_for_worker_capacity"
++
++
++
++@pytest.mark.parametrize("sample,capacity,allowed", [
++    ({"cpu_load1": 3, "cpus": 4, "mem_used_pct": 50, "active_card_runs": 1}, 2, True),
++    ({"cpu_load1": 3.4, "cpus": 4, "mem_used_pct": 50, "active_card_runs": 1}, 2, False),
++    ({"cpu_load1": 0, "cpus": 4, "mem_used_pct": 85, "active_card_runs": 1}, 2, False),
++    ({"cpu_load1": 0, "cpus": 4, "mem_used_pct": 50, "active_card_runs": 2}, 2, False),
++    ({"cpu_load1": 0, "cpus": 4, "mem_used_pct": 50, "active_card_runs": None}, 2, False),
++    ({"cpu_load1": float("nan"), "cpus": 4, "mem_used_pct": 50, "active_card_runs": 0}, 2, False),
++    ({"cpu_load1": 0, "cpus": 0, "mem_used_pct": 50, "active_card_runs": 0}, 2, False),
++    ({"cpu_load1": 0, "cpus": 4, "mem_used_pct": 50, "active_card_runs": 0}, None, False),
++    ({"cpu_load1": 0, "cpus": 4, "mem_used_pct": 50, "active_card_runs": 0}, True, False),
++])
++@pytest.mark.parametrize("status", ["ready", "review"])
++def test_worker_local_admission_rechecks_load_and_releases_unused_lease(conn, monkeypatch, sample, capacity, allowed, status):
++    from hermes_cli import machine_metrics
++    tid = kb.create_task(conn, title="Public analysis", assignee="default", placement_policy="worker-first-v1")
++    conn.execute("UPDATE tasks SET runs_on=?, status=? WHERE id=?", ('["machine:hub"]', status, tid))
++    conn.commit()
++    monkeypatch.setattr(machine_metrics, "collect", lambda: sample)
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"hub": {"max_card_runs": capacity}}})
++    client = support.FakeLeaseClient()
++    old = sync.set_lease_client(client)
++    try:
++        claimed = (kb.claim_task if status == "ready" else kb.claim_review_task)(conn, tid)
++        assert (claimed is not None) == allowed
++        assert client.count("acquire") == 1
++        assert client.count("release") == (0 if allowed else 1)
++        if not allowed:
++            assert sync.pop_claim_deferral(tid) == "waiting_for_worker_capacity"
++    finally:
++        sync.set_lease_client(old)
++
++
++@pytest.mark.parametrize("fields", [{"runs_on": []}, {"runs_on": ["linux"]}, {"workspace_kind": "dir", "workspace_path": "/work"}])
++def test_policy_cannot_be_combined_with_manual_or_host_placement(conn, fields):
++    with pytest.raises(ValueError, match="worker-first"):
++        kb.create_task(conn, title="Public analysis", placement_policy="worker-first-v1", **fields)
++    assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("broken", ["registry", "metrics"])
++def test_admission_sampling_failure_releases_grant(conn, monkeypatch, broken):
++    from hermes_cli import machine_metrics
++    tid = kb.create_task(conn, title="Public analysis", placement_policy="worker-first-v1")
++    conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", ('["machine:hub"]', tid))
++    conn.commit()
++    def unavailable():
++        raise OSError("sample unavailable")
++    monkeypatch.setattr(wn, "registry", unavailable if broken == "registry" else lambda: {"machines": {}})
++    monkeypatch.setattr(machine_metrics, "collect", unavailable)
++    client = support.FakeLeaseClient()
++    old = sync.set_lease_client(client)
++    try:
++        assert kb.claim_task(conn, tid) is None
++        assert client.count("release") == 1
++    finally:
++        sync.set_lease_client(old)
++
++
++def test_unknown_policy_is_rejected_before_insertion(conn):
++    with pytest.raises(ValueError, match="placement policy"):
++        kb.create_task(conn, title="Public analysis", placement_policy="worker-first-v999")
++    assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+diff --git a/tests/hermes_cli/test_kanban_worker_reserve_client.py b/tests/hermes_cli/test_kanban_worker_reserve_client.py
+new file mode 100644
+index 00000000000..ec6ebfd1f19
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_reserve_client.py
+@@ -0,0 +1,177 @@
++"""Frozen Board reservation contract and origin-only ready reevaluation."""
++import json
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from threading import Thread
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_policy_db as db_fixtures
++from tests.hermes_cli import test_kanban_worker_node as node_fixtures
++
++conn = db_fixtures.conn
++gws = node_fixtures.gws
++svc = node_fixtures.svc
++
++
++def test_sync_tick_reserves_only_after_task_push_ack(gws, monkeypatch):
++    origin, _ = gws
++    origin.enter()
++    tid = kb.create_task(origin.conn, title="Public analysis", assignee="default", placement_policy="worker-first-v1")
++    calls = []
++    def observe(db, hub, board, gateway):
++        row = db.execute("SELECT sync_version, placement_policy FROM tasks WHERE id=?", (tid,)).fetchone()
++        calls.append((board, gateway, row[0], row[1]))
++        return 0
++    monkeypatch.setattr(wp, "reevaluate", observe)
++    origin.round()
++    assert len(calls) == 1
++    assert calls[0][:2] == ("default", "hub")
++    assert isinstance(calls[0][2], int) and calls[0][2] > 0
++    assert calls[0][3] == "worker-first-v1"
++
++
++def test_dispatch_tick_reevaluates_before_local_spawn_budget(gws, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    origin, _ = gws
++    origin.enter()
++    tid = kb.create_task(origin.conn, title="Public analysis", assignee="default", placement_policy="worker-first-v1")
++    calls = []
++    monkeypatch.setattr(wp, "dispatch_tick", lambda db: calls.append(tid), raising=False)
++    monkeypatch.setattr(dispatch, "_tick_spawn_budget", lambda *a, **kw: (False, 0))
++    result = origin.tick(reconcile_orphans=False)
++    assert calls == [tid]
++    assert not result.spawned
++    assert kb.get_task(origin.conn, tid).status == "ready"
++
++
++def test_queued_origin_cannot_spawn_even_with_local_capacity(gws, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    origin, _ = gws
++    origin.enter()
++    tid = kb.create_task(origin.conn, title="Public analysis", assignee="default", placement_policy=wp.POLICY)
++    monkeypatch.setattr(wp, "dispatch_tick", lambda db: None)
++    monkeypatch.setattr(dispatch, "_tick_spawn_budget", lambda *a, **kw: (False, 8))
++    assert not dispatch.has_spawnable_ready(origin.conn)
++    result = origin.tick(reconcile_orphans=False)
++    assert not result.spawned
++    assert kb.get_task(origin.conn, tid).status == "ready"
++    assert origin.conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
++
++
++def test_acknowledged_policy_sync_does_not_replay_stale_assignment_fields(gws):
++    origin, _ = gws
++    origin.enter()
++    tid = kb.create_task(origin.conn, title="Public analysis", placement_policy=wp.POLICY)
++    origin.round()
++    origin.conn.execute("UPDATE tasks SET priority=5 WHERE id=?", (tid,))
++    origin.conn.commit()
++    # A queued pre-assignment snapshot must not erase the Board-owned labels or
++    # re-enroll a policy that an explicit rollback repin has since removed.
++    origin.conn.execute("UPDATE kanban_sync_outbox SET fields=? WHERE table_name='tasks' AND row_uid=? AND state='pending'",
++                        (json.dumps({"priority": 5, "placement_policy": wp.POLICY, "runs_on": None}), tid))
++    origin.conn.commit()
++    hub = origin.svc.hub(origin.name)
++    sent, original = [], hub.ops
++    def observe(board, ops):
++        sent.extend(ops)
++        return original(board, ops)
++    hub.ops = observe
++    result = ksc.push(origin.conn, hub, "default", origin.name, primary=True)
++    assert result.rejected == 0
++    fields = next(op["fields"] for op in sent if op.get("uid") == tid)
++    assert fields["priority"] == 5
++    assert "runs_on" not in fields and "placement_policy" not in fields
++
++
++@pytest.mark.parametrize("action", ["reserve", "repin"])
++def test_reserve_http_contract(action):
++    received = []
++    # Exact queued response contract from worker/src/worker_placement.ts reserveWorker.
++    response = {"state": "queued", "machine": None, "reservation_id": None,
++                "expires_at": None, "reason": "waiting_for_worker_capacity"}
++    fields = {"candidates": ["worker-1"]}
++    wire = {"policy": "worker-first-v1", **fields}
++    if action == "repin":
++        response = {"version": 8, "runs_on": ["machine:hub"], "placement_policy": None}
++        fields = wire = {"runs_on": ["machine:hub"]}
++
++    class Handler(BaseHTTPRequestHandler):
++        def do_POST(self):
++            received.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
++            self.send_response(200)
++            self.end_headers()
++            self.wfile.write(json.dumps(response).encode())
++
++        def log_message(self, *args):
++            pass
++
++    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++    thread = Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        hub = ksc.Hub(ksc.Identity(f"http://127.0.0.1:{server.server_port}", "synthetic", "hub"))
++        assert getattr(hub, action)("default", task_id="task", expected_revision=7, **fields) == response
++        assert received == [(f"/v2/boards/default/placement/{action}", {
++            "task_id": "task", "expected_revision": 7, **wire})]
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join()
++
++
++class RecordingHub:
++    def __init__(self):
++        self.calls = []
++
++    def reserve(self, board, **body):
++        self.calls.append((board, body))
++        return {"state": "queued", "machine": None, "reservation_id": None,
++                "expires_at": None, "reason": "waiting_for_worker_capacity"}
++
++
++def acknowledged(conn, **fields):
++    tid = kb.create_task(conn, title="Public analysis", assignee="default", placement_policy="worker-first-v1")
++    conn.execute("UPDATE kanban_sync_state SET applying=1")
++    conn.execute("UPDATE tasks SET sync_version=4, created_on='hub' WHERE id=?", (tid,))
++    for key, value in fields.items():
++        conn.execute(f"UPDATE tasks SET {key}=? WHERE id=?", (value, tid))
++    conn.execute("UPDATE kanban_sync_state SET applying=0")
++    conn.execute("DELETE FROM kanban_sync_outbox")
++    conn.commit()
++    return tid
++
++
++def test_reevaluation_sends_revision_but_never_assigns_from_response(conn, monkeypatch):
++    tid = acknowledged(conn)
++    hub = RecordingHub()
++    pulls = []
++    monkeypatch.setattr(ksc, "pull", lambda *args, **kwargs: pulls.append(kwargs))
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg={"worker_pools": {"hub": ["worker-1"]}}) == 1
++    assert hub.calls == [("default", {"task_id": tid, "expected_revision": 4, "candidates": ["worker-1"]})]
++    assert pulls == [{"observers": True, "partition": "hub"}]
++    assert conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
++
++
++@pytest.mark.parametrize("fields", [
++    {"status": "running"}, {"status": "review"}, {"status": "todo"}, {"status": "blocked"},
++    {"lease_holder": "worker-1", "lease_expires": 1}, {"claim_lock": "local:123"},
++    {"created_on": "other"}, {"sync_version": None}, {"placement_policy": None},
++])
++def test_reevaluation_never_moves_nonready_leased_foreign_or_manual_cards(conn, fields):
++    acknowledged(conn, **fields)
++    hub = RecordingHub()
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg={"worker_pools": {"hub": ["worker-1"]}}) == 0
++    assert hub.calls == []
++
++
++@pytest.mark.parametrize("cfg", [{}, {"worker_pools": {"hub": []}}, {"worker_pools": {"hub": "worker-1"}}])
++def test_disabled_or_invalid_pool_retains_existing_fence(conn, cfg):
++    tid = acknowledged(conn)
++    hub = RecordingHub()
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg=cfg) == 0
++    assert kb.get_task(conn, tid).placement_policy == "worker-first-v1"
++    assert hub.calls == []
+diff --git a/tests/hermes_cli/test_kanban_worker_reserve_fairness.py b/tests/hermes_cli/test_kanban_worker_reserve_fairness.py
+new file mode 100644
+index 00000000000..163d17a3c5e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_reserve_fairness.py
+@@ -0,0 +1,64 @@
++"""Bounded placement batches must rotate past unchanged Board refusals."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++CFG = {"worker_pools": {"hub": ["worker-1"]}}
++
++
++@pytest.mark.parametrize("refused_count", [4, 9])
++def test_persistent_refusals_cannot_starve_later_cards(conn, monkeypatch, refused_count):
++    refused = [fixtures.acknowledged(conn, sync_version=5) for _ in range(refused_count)]
++    fresh = fixtures.acknowledged(conn, sync_version=9)
++    seen = []
++
++    class Hub:
++        def reserve(self, board, **body):
++            seen.append(body["task_id"])
++            if body["task_id"] in refused:
++                raise client.HubError(409, "explicit_pin")
++            return {"state": "assigned"}
++
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++    path = conn.execute("PRAGMA database_list").fetchone()[2]
++    # Reopen each tick: fairness must survive connection/process churn, not a
++    # module-global counter that different profiles can reset or share.
++    ticks = (refused_count + 1 + wp.MAX_RESERVES_PER_TICK - 1) // wp.MAX_RESERVES_PER_TICK
++    for _ in range(ticks):
++        before = len(seen)
++        with sqlite3.connect(path) as tick:
++            tick.row_factory = sqlite3.Row
++            wp.reevaluate(tick, Hub(), "default", "hub", cfg=CFG)
++        tick.close()
++        assert 0 < len(seen) - before <= 4
++    assert fresh in seen
++    assert set(refused).issubset(seen)
++    # A full second circuit must retry all rows, including refused unchanged ones.
++    seen.clear()
++    for _ in range(ticks):
++        before = len(seen)
++        wp.reevaluate(conn, Hub(), "default", "hub", cfg=CFG)
++        assert 0 < len(seen) - before <= 4
++    assert set(seen) == {*refused, fresh}
++
++
++def test_transport_stop_advances_only_the_attempted_card(conn, monkeypatch):
++    tasks = [fixtures.acknowledged(conn) for _ in range(5)]
++    seen = []
++
++    class Hub:
++        def reserve(self, board, **body):
++            seen.append(body["task_id"])
++            raise OSError("offline")
++
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: pytest.fail("transport stop must not pull"))
++    for _ in tasks:
++        before = len(seen)
++        assert wp.reevaluate(conn, Hub(), "default", "hub", cfg=CFG) == 0
++        assert len(seen) == before + 1
++    assert set(seen) == set(tasks)
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 9f910c24b9c..40f2c963280 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -30,7 +30,8 @@ def test_collect_reads_this_machine(tmp_path: Path):
+     assert out["cpus"] >= 1 and out["cpu_load1"] >= 0
+     assert 0 < out["disk_free_gb"] <= out["disk_total_gb"]
+     assert 0 <= out["mem_used_pct"] <= 100  # this platform's reader (linux or macos)
+-    assert set(out) <= {"cpu_load1", "cpus", "mem_used_pct", "disk_free_gb", "disk_total_gb"}
++    assert set(out) <= {"cpu_load1", "cpus", "mem_used_pct", "disk_free_gb", "disk_total_gb", "active_card_runs"}
++    assert out["active_card_runs"] is None or out["active_card_runs"] >= 0
+ 
+ 
+ def test_reporter_sends_at_most_every_30s_and_backs_off_on_old_board():
+diff --git a/tests/hermes_cli/test_machine_occupancy.py b/tests/hermes_cli/test_machine_occupancy.py
+new file mode 100644
+index 00000000000..bce3092c9dd
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_occupancy.py
+@@ -0,0 +1,43 @@
++"""Whole shared-board root occupancy is independent of active profile and sync filters."""
++import sqlite3
++
++from hermes_cli import machine_metrics as metrics
++
++
++def board(path, rows, own="worker-1"):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(path) as db:
++        db.executescript("CREATE TABLE tasks(id TEXT, status TEXT, claim_lock TEXT, lease_holder TEXT);"
++                         "CREATE TABLE kanban_sync_state(gateway_id TEXT);")
++        db.execute("INSERT INTO kanban_sync_state VALUES(?)", (own,))
++        db.executemany("INSERT INTO tasks VALUES(?,?,?,?)", rows)
++
++
++def test_occupancy_counts_all_profiles_and_named_boards_but_not_foreign_leases(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setattr(kb, "kanban_home", lambda: tmp_path)
++    board(tmp_path / "kanban.db", [("a", "running", "pid-a", None), ("b", "running", None, "hub"),
++                                   ("c", "running", None, "worker-1"), ("d", "ready", None, None)])
++    board(tmp_path / "kanban/boards/research/kanban.db", [("e", "running", "pid-e", None)])
++    # A shadow snapshot is not execution; counting it would count every remote run twice.
++    board(tmp_path / "kanban/shadow/default.db", [("e", "running", "pid-e", None)])
++    assert metrics.active_card_runs() == 3
++
++
++def test_corrupt_board_makes_occupancy_unknown_not_zero(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setattr(kb, "kanban_home", lambda: tmp_path)
++    board(tmp_path / "kanban.db", [])
++    bad = tmp_path / "kanban/boards/bad/kanban.db"
++    bad.parent.mkdir(parents=True)
++    bad.write_text("not SQLite")
++    assert metrics.active_card_runs() is None
++
++
++def test_collect_reports_unknown_as_null_to_clear_old_sample(tmp_path, monkeypatch):
++    monkeypatch.setattr(metrics, "active_card_runs", lambda: None, raising=False)
++    assert metrics.collect(tmp_path)["active_card_runs"] is None
++    monkeypatch.setattr(metrics, "active_card_runs", lambda: 7)
++    sent = []
++    assert metrics.Reporter(sent.append).report_due()
++    assert sent[0]["active_card_runs"] == 7
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 39d24fb4d99..9f8f12c8547 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1511,11 +1511,8 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                   note_local_pin: bool = True, origin_profile=None) -> tuple[Optional[str], Optional[dict]]:
+     """[daveey] Create the card on the gateway ``kanban.placement`` routes this one to.
+ 
+-    Returns ``(tool_result, None)`` when the card was queued there or the pin was refused,
+-    ``(None, None)`` to create it locally for any other reason, or ``(None, placement)`` when a
+-    text marker kept it here. ``placement`` is ``{where, why, remedy}`` so the create result can
+-    say so, or ``{where, why, runs_on}`` for heavy work created here and run on a worker node through
+-    the Board lease (``kanban.placement.heavy_route``). Never raises.
++    Returns a remote result/refusal, or local placement metadata. Worker-policy metadata
++    must reach the initial task INSERT; local storage is not permission to execute.
+     """
+     try:
+         from hermes_cli import kanban_placement as kp
+@@ -1716,6 +1713,7 @@ def _handle_create(args: dict, **kw) -> str:
+             idempotency_key=args.get("idempotency_key"),
+             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+             requires=args.get("requires"), runs_on=runs_on, max_retries=max_retries,
++            placement_policy=(marker_placement or {}).get("placement_policy"),
+             require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
+             model_override=model_override, provider_override=provider_override,
+             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index dad82f93962..b342c072ee6 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -78,6 +78,8 @@ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_p
+     elsewhere without the pin also gets a ``note`` naming that target (the card is still created here).
+     """
+     why = decision.get("why") or ""
++    if decision.get("placement_policy"):
++        return {"where": "local", "placement_policy": decision["placement_policy"], "why": why}
+     if decision.get("defer"):
+         # Parents are local links: created here, forwarded to the target once they finish.
+         return {"where": "local", "defer": decision["defer"], "why": why}
+@@ -112,7 +114,7 @@ def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict
+                 "note": (f"Created here as {new_tid} so it can wait on its parents; it runs on "
+                          f"{marker_placement['defer']}, not here: when the parents finish the dispatcher "
+                          f"forwards it there and this card completes when that one does.")}
+-    if marker_placement.get("runs_on"):
++    if marker_placement.get("runs_on") or marker_placement.get("placement_policy"):
+         return {"placement": dict(marker_placement)}
+     out: dict = {"placement": {"where": marker_placement["where"], "why": marker_placement["why"]}}
+     if marker_placement.get("remedy"):
+@@ -133,6 +135,8 @@ def _machine_placement(machine: str, runs_on: list[str]) -> dict:
+ 
+ def _runs_where(runs_on, pinned_machine, marker_placement) -> str:
+     """Where a card created on this board runs, for the kanban_create result. Never raises."""
++    if marker_placement and marker_placement.get("placement_policy"):
++        return "worker pool (waiting_for_worker_capacity; no local fallback)"
+     if runs_on is not None:
+         if pinned_machine:
+             return f"{pinned_machine} via the board lease (runs_on={runs_on})"
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index a9d151d2be0..af9527f361d 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -791,11 +791,9 @@ KANBAN_CREATE_SCHEMA = _schema(
+                     "if it waits too long. 'machine:<name>' is refused (placement_unavailable) unless that "
+                     "machine picks up this board; then use placement='<name>'."},
+         "placement": _prop("string", (
+-                "Where the card runs. 'auto' (default): on a gateway with a "
+-                "kanban.placement route (e.g. the MacBook -> 'hub', the gateway "
+-                "on the hermes-hub host; 'hermes-hub' is accepted as an alias), a "
+-                "card with no local-only need is created on the target "
+-                "gateway, still linked to this chat. 'local' pins it here "
++                "Where the card runs. 'auto' uses configured worker pools for portable work, queueing without hub overflow. "
++                "Without a pool, kanban.placement routes (e.g. MacBook -> hub; hermes-hub aliases hub) create "
++                "portable cards on that gateway, linked to this chat. 'local' pins it here "
+                 "(use it when the work needs this machine: its Chrome, "
+                 "Keychain, Apple apps, launchd/Desktop state, local "
+                 "checkouts). A gateway name pins it there; if the card cannot be "
+-- 
+2.55.0
+

@@ -1,0 +1,435 @@
+From 7d7c542ce763a215594ecaee72905438736af889 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:23:51 +0000
+Subject: [PATCH] fix(kanban): do not hold active_pr on another card's pull
+ [daveey]
+
+A comment that only names another live card's completion_contract, or
+that only says the pull does not block this card, is not duplicate-PR
+evidence. This card's own pull still holds. The hold notice reads checks
+with the same gh argv as pr_state, so a broker-readable pull with zero
+failing checks is not reported as unavailable. The fix card no longer
+tells a dispatcher worker to unblock or schedule the held card.
+---
+ hermes_cli/kanban_db_dispatch_guard_notice.py |  42 +++-
+ hermes_cli/kanban_db_dispatch_pr_state.py     | 118 ++++++++++--
+ .../test_kanban_active_pr_foreign_contract.py | 181 ++++++++++++++++++
+ 3 files changed, 317 insertions(+), 24 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_active_pr_foreign_contract.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index d1b492d0674..973d5965e7b 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -55,13 +55,27 @@ def guard_hold_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+     return reason if isinstance(reason, str) else None
+ 
+ 
+-def _pr_failing_checks(pr_url: str) -> str:
+-    """Best-effort one-line summary of ``pr_url``'s failing checks ('' if unavailable)."""
++def _pr_failing_checks(pr_url: str) -> Optional[str]:
++    """Failing-check summary, ``''`` if the read succeeded with none, None if unreadable.
++
++    Uses the same gh argv as :func:`kanban_db_dispatch_pr_state.pr_state`. A bare ``gh``
++    in the dispatcher process cannot read a broker-visible pull, and an empty summary
++    used to be reported as ``failing checks unavailable`` even when the read succeeded
++    with zero failures. [daveey]
++    """
++    from hermes_cli import kanban_db_dispatch_pr_state as prs
++
++    gh = prs._gh_argv() or ["gh"]
+     try:
+-        out = subprocess.run(["gh", "pr", "checks", pr_url], stdin=subprocess.DEVNULL, capture_output=True,
+-                             text=True, encoding="utf-8", errors="replace", timeout=30, check=False).stdout
++        proc = subprocess.run([*gh, "pr", "checks", pr_url], stdin=subprocess.DEVNULL, capture_output=True,
++                             text=True, encoding="utf-8", errors="replace", timeout=30, check=False)
+     except (OSError, subprocess.SubprocessError):
+-        return ""
++        return None
++    out = proc.stdout or ""
++    # gh pr checks: 0 green, 8 pending, 1 failing — all print a table. Empty stdout
++    # with a non-zero exit is an unreadable lookup (bare gh, auth, missing command).
++    if not out.strip() and proc.returncode != 0:
++        return None
+     failing = [ln.split("\t")[0].strip() for ln in out.splitlines()
+                if len(ln.split("\t")) > 1 and ln.split("\t")[1].strip().lower() in ("fail", "failure", "cancel")]
+     return f"{len(failing)} failing check(s): " + ", ".join(failing[:12]) if failing else ""
+@@ -75,8 +89,13 @@ def _file_fix_card(conn: sqlite3.Connection, task_id: str, reason: str, body: st
+     try:
+         _kb.create_task(
+             conn, title=f"Fix respawn-guard hold ({reason}) on {task_id}"[:120],
+-            body=(f"{body}\n\nRead kanban card {task_id}'s latest [respawn-guard] comment, fix the cause "
+-                  f"(failing PR checks, binding) and unblock it. Only ask David for a decision he alone can make."),
++            body=(f"{body}\n\nRead kanban card {task_id}'s latest [respawn-guard] comment and fix the cause "
++                  f"(failing PR checks, or a false active_pr bind). Do not call unblock or schedule "
++                  f"on that card: a dispatcher worker cannot mutate another card, and the worker shell "
++                  f"is write-fenced. The dispatcher releases the hold on the next tick once the guard "
++                  f"no longer matches. A manual lift, if one is still required before that code is "
++                  f"running, is an orchestrator or CLI write, not this worker. Only ask David for a "
++                  f"decision he alone can make."),
+             assignee="default", created_by="kanban-dispatcher", idempotency_key=f"guard-hold:{task_id}")
+     except Exception:
+         logger.warning("kanban: guard-hold fix card for %s failed", task_id, exc_info=True)
+@@ -104,12 +123,17 @@ def notify_guard_hold(conn: sqlite3.Connection, task_id: str, reason: str) -> bo
+             "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC", (task_id,))
+             for m in [_kbd._RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(r["body"]) or "")] if m]
+         if urls:
+-            checks = _pr_failing_checks(urls[0]) or "failing checks unavailable"
++            checks = _pr_failing_checks(urls[0])
++            if checks is None:
++                checks = "failing checks unavailable"
++            elif not checks:
++                checks = "0 failing checks"
+             detail = f" PR: {urls[0]} ({checks})."
+     minutes = max(1, held // 60)
+     body = (f"{GUARD_HOLD_NOTE_MARKER} Held in ready by the respawn guard ({reason}) for {minutes} min "
+             f"without running.{detail} It will be auto-blocked at the hold cap; fix the cause "
+-            f"(merge/close the PR, rebind, or unblock) before then.")
++            f"(the guard binding, or the PR's failing checks) before then. "
++            f"The dispatcher releases the hold on the next tick once the guard no longer matches.")
+     _kb.add_comment(conn, task_id, "kanban-dispatcher", body)
+     _file_fix_card(conn, task_id, reason, body)
+     return True
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 8170c4796ec..1b8a4ca6eed 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -18,6 +18,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import re
+ import sqlite3
+ import subprocess
+ import time
+@@ -30,6 +31,14 @@ OPEN_TTL_SECONDS = 300
+ ERROR_TTL_SECONDS = 120
+ GH_TIMEOUT_SECONDS = 20
+ 
++# A comment whose purpose is to say the named pull does not block this card.
++# "doesn't block the merge" is not that purpose; the object has to be the card.
++_NONBLOCKING_RE = re.compile(
++    r"\b(?:does(?:n['\u2019]t| not)|do(?:n['\u2019]t| not)|won['\u2019]t|will not)\s+block\s+"
++    r"(?:you|this\s+(?:card|task)|the\s+card)\b",
++    re.IGNORECASE,
++)
++
+ # url -> (state or None, monotonic expiry or None for "forever")
+ _cache: dict[str, tuple[Optional[str], Optional[float]]] = {}
+ _rejections: dict[str, str] = {}
+@@ -148,6 +157,95 @@ def _immediate_checkpoint_after(
+     )
+ 
+ 
++def _norm_pr(url: str) -> str:
++    return url.rstrip("/").lower()
++
++
++def _comment_says_pull_does_not_block(body: str) -> bool:
++    return bool(_NONBLOCKING_RE.search(body))
++
++
++def _own_published_key(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """This card's completion_contract when it is a pull URL, else None."""
++    row = conn.execute("SELECT completion_contract FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return None
++    contract = row["completion_contract"]
++    if not isinstance(contract, str) or not contract.lower().startswith("http"):
++        return None
++    return _norm_pr(contract)
++
++
++def _foreign_live_contract_keys(conn: sqlite3.Connection, task_id: str, keys: set[str]) -> set[str]:
++    """Pull URLs that are another live card's completion_contract.
++
++    Done and archived cards are not live: a finished contract is not an owner
++    that excuses a duplicate-PR mention. [daveey]
++    """
++    if not keys:
++        return set()
++    placeholders = ",".join("?" * len(keys))
++    rows = conn.execute(
++        "SELECT lower(rtrim(completion_contract, '/')) AS k FROM tasks "
++        "WHERE id != ? AND status NOT IN ('done', 'archived') "
++        f"AND lower(rtrim(completion_contract, '/')) IN ({placeholders})",
++        (task_id, *sorted(keys)),
++    ).fetchall()
++    return {row["k"] for row in rows}
++
++
++def _urls_that_hold(conn: sqlite3.Connection, task_id: str, mentions: list[tuple[str, str]]) -> set[str]:
++    """Normalized pull URLs that are duplicate-PR evidence.
++
++    Drop a URL that is another live card's completion_contract, and a URL that
++    appears only in comments saying that pull does not block this card. This
++    card's own completion_contract still holds. [daveey]
++    """
++    by_url: dict[str, list[str]] = {}
++    for url, body in mentions:
++        by_url.setdefault(_norm_pr(url), []).append(body)
++    if not by_url:
++        return set()
++    own = _own_published_key(conn, task_id)
++    foreign = _foreign_live_contract_keys(conn, task_id, set(by_url) - ({own} if own else set()))
++    holding: set[str] = set()
++    for key, bodies in by_url.items():
++        disclaimed = all(_comment_says_pull_does_not_block(body) for body in bodies)
++        if key == own or (key not in foreign and not disclaimed):
++            holding.add(key)
++    return holding
++
++
++def _holding_pr_comments(
++    conn: sqlite3.Connection, task_id: str, now: int,
++) -> tuple[list[int], list[str], int]:
++    """``(times, urls, latest_comment_id)`` for pulls that still arm ``active_pr``."""
++    from hermes_cli import kanban_db as _kb
++    from hermes_cli import kanban_db_dispatch as _kbd
++
++    parsed: list[tuple[int, int, str, list[str]]] = []
++    for t, c in _kbd._rows_since(conn, "task_comments", task_id, now - _kbd._RESPAWN_GUARD_PR_WINDOW,
++                                 cols=", id, body, author", unreadable=now):  # duplicate-PR risk: fail closed
++        body = _kb._lossy_text(c["body"]) or ""
++        if c["author"] == "kanban-dispatcher" and body.startswith("[respawn-guard]"):
++            continue  # a diagnostic must not rearm its own handoff barrier
++        urls = _kbd._RESPAWN_GUARD_PR_URL_RE.findall(body)
++        if urls:
++            parsed.append((t, c["id"], body, urls))
++    holding = _urls_that_hold(conn, task_id, [(url, body) for _, _, body, urls in parsed for url in urls])
++    pr_times: list[int] = []
++    pr_urls: list[str] = []
++    latest_pr_comment_id = 0
++    for t, comment_id, _body, urls in parsed:
++        kept = [url for url in urls if _norm_pr(url) in holding]
++        if not kept:
++            continue
++        latest_pr_comment_id = max(latest_pr_comment_id, comment_id)
++        pr_times.append(t)
++        pr_urls.extend(kept)
++    return pr_times, pr_urls, latest_pr_comment_id
++
++
+ def _pr_comments_predate_first_run(conn: sqlite3.Connection, task_id: str, newest_pr_at: int) -> bool:
+     """True when the card never ran a worker, or every PR comment predates its first run.
+ 
+@@ -181,24 +279,14 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     notices are diagnostic, not new PR publication evidence, and cannot invalidate
+     an existing handoff.
+     Also lifted once EVERY PR named in those comments is MERGED or CLOSED (gh, cached; any
+-    gh failure keeps the hold), or has a completed queue rejection requiring repair. [daveey]
++    gh failure keeps the hold), or has a completed queue rejection requiring repair.
++    A pull that is another live card's completion_contract is not this card's work, and
++    neither is a pull that appears only in a comment saying it does not block this card.
++    This card's own completion_contract still holds. [daveey]
+     """
+-    from hermes_cli import kanban_db as _kb
+     from hermes_cli import kanban_db_dispatch as _kbd
+ 
+-    pr_times: list[int] = []
+-    pr_urls: list[str] = []
+-    latest_pr_comment_id = 0
+-    for t, c in _kbd._rows_since(conn, "task_comments", task_id, now - _kbd._RESPAWN_GUARD_PR_WINDOW,
+-                                 cols=", id, body, author", unreadable=now):  # duplicate-PR risk: fail closed
+-        body = _kb._lossy_text(c["body"]) or ""
+-        if c["author"] == "kanban-dispatcher" and body.startswith("[respawn-guard]"):
+-            continue  # a diagnostic must not rearm its own handoff barrier
+-        urls = _kbd._RESPAWN_GUARD_PR_URL_RE.findall(body)
+-        if urls:
+-            latest_pr_comment_id = max(latest_pr_comment_id, c["id"])
+-            pr_times.append(t)
+-            pr_urls.extend(urls)
++    pr_times, pr_urls, latest_pr_comment_id = _holding_pr_comments(conn, task_id, now)
+     if not pr_times:
+         return None
+     if _pr_comments_predate_first_run(conn, task_id, max(pr_times)):
+diff --git a/tests/hermes_cli/test_kanban_active_pr_foreign_contract.py b/tests/hermes_cli/test_kanban_active_pr_foreign_contract.py
+new file mode 100644
+index 00000000000..af7c970e41a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_active_pr_foreign_contract.py
+@@ -0,0 +1,181 @@
++"""active_pr must not bind a card to another card's pull, or to a non-blocking mention.
++
++A comment that only names another live card's completion_contract pull is not this
++card's published work. Neither is a comment whose only purpose is to say that pull
++does not block this card. This card's own pull still holds. The hold notice must
++read checks with the same gh argv as pr_state, so a broker-readable pull with zero
++failing checks is not reported as unavailable. [daveey]
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_dispatch_guard_notice as notice
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli.test_kanban_park_invariants import kanban_home
++
++__all__ = ["kanban_home"]
++pytestmark = pytest.mark.usefixtures("kanban_home")
++
++FOREIGN = "https://github.com/daveey/hermes/pull/210"
++OWN = "https://github.com/daveey/hermes/pull/19"
++BROKER = ["token-broker", "exec", "--scope", "user/github", "--", "/usr/bin/gh"]
++
++
++@pytest.fixture(autouse=True)
++def open_pr(monkeypatch):
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++
++
++def _claimed(conn, title, **kwargs):
++    tid = kb.create_task(conn, title=title, assignee="a", **kwargs)
++    kb.claim_task(conn, tid)
++    return tid
++
++
++def _guard(conn, tid):
++    return kbd.check_respawn_guard(conn, tid)
++
++
++class _Proc:
++    def __init__(self, returncode, stdout="", stderr=""):
++        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
++
++
++def test_comment_that_only_names_another_live_cards_contract_does_not_hold():
++    with kbc.connect() as conn:
++        kb.create_task(conn, title="land the other pull", assignee="b", completion_contract=FOREIGN)
++        tid = _claimed(conn, "not that pull")
++        kb.add_comment(conn, tid, "parent", f"See {FOREIGN}")
++        assert _guard(conn, tid) is None
++
++
++def test_nonblocking_comment_alone_does_not_hold():
++    with kbc.connect() as conn:
++        tid = _claimed(conn, "informational mention")
++        kb.add_comment(
++            conn, tid, "parent",
++            f"{FOREIGN} only changes wording. It doesn't block you.",
++        )
++        assert _guard(conn, tid) is None
++
++
++def test_foreign_contract_match_ignores_case_and_trailing_slash():
++    with kbc.connect() as conn:
++        owner = kb.create_task(conn, title="land", assignee="b", completion_contract=FOREIGN)
++        conn.execute(
++            "UPDATE tasks SET completion_contract = ? WHERE id = ?",
++            (FOREIGN.upper() + "/", owner),
++        )
++        conn.commit()
++        tid = _claimed(conn, "not that pull")
++        kb.add_comment(conn, tid, "parent", f"Named only {FOREIGN}")
++        assert _guard(conn, tid) is None
++
++
++def test_own_pull_url_still_holds():
++    with kbc.connect() as conn:
++        tid = _claimed(conn, "opened our pull")
++        kb.add_comment(conn, tid, "a", f"Opened {OWN}")
++        assert _guard(conn, tid) == "active_pr"
++
++
++def test_own_contract_holds_even_when_comment_says_it_does_not_block():
++    with kbc.connect() as conn:
++        tid = _claimed(conn, "our published pull", completion_contract=OWN)
++        kb.add_comment(conn, tid, "a", f"{OWN} does not block this card.")
++        assert _guard(conn, tid) == "active_pr"
++
++
++def test_done_cards_contract_does_not_exempt():
++    with kbc.connect() as conn:
++        owner = kb.create_task(conn, title="already landed", assignee="b", completion_contract=FOREIGN)
++        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (owner,))
++        conn.commit()
++        tid = _claimed(conn, "mentioned a finished pull")
++        kb.add_comment(conn, tid, "a", f"Opened {FOREIGN}")
++        assert _guard(conn, tid) == "active_pr"
++
++
++def test_foreign_url_does_not_drop_an_own_url_in_the_same_comment():
++    with kbc.connect() as conn:
++        kb.create_task(conn, title="land", assignee="b", completion_contract=FOREIGN)
++        tid = _claimed(conn, "opened our pull too")
++        kb.add_comment(conn, tid, "a", f"See {FOREIGN}. Opened {OWN}")
++        assert _guard(conn, tid) == "active_pr"
++
++
++def test_nonblocking_comment_does_not_exempt_a_real_open_comment():
++    with kbc.connect() as conn:
++        tid = _claimed(conn, "opened then disclaimed")
++        kb.add_comment(conn, tid, "a", f"{OWN} does not block this card.")
++        kb.add_comment(conn, tid, "a", f"Opened {OWN}")
++        assert _guard(conn, tid) == "active_pr"
++
++
++def _hold_ready_for_notice(conn, monkeypatch, pr):
++    tid = kb.create_task(conn, title="held", assignee="a")
++    kb.add_comment(conn, tid, "a", f"Opened {pr}")
++    kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_NOTIFY_SECONDS", "0")
++    return tid
++
++
++def test_notice_for_broker_readable_zero_failing_does_not_say_unavailable(monkeypatch):
++    calls = []
++
++    def _run(cmd, *args, **kwargs):
++        calls.append(list(cmd))
++        return _Proc(
++            8,
++            "lint\tpass\t1s\thttps://example/lint\nunit\tpending\t0\thttps://example/unit\n",
++        )
++
++    monkeypatch.setattr(prs, "_gh_argv", lambda: list(BROKER))
++    monkeypatch.setattr(notice.subprocess, "run", _run)
++    with kbc.connect() as conn:
++        tid = _hold_ready_for_notice(conn, monkeypatch, OWN)
++        assert notice.notify_guard_hold(conn, tid, "active_pr") is True
++        notes = [c for c in kb.list_comments(conn, tid) if c.body.startswith("[respawn-guard]")]
++        assert len(notes) == 1
++        assert "failing checks unavailable" not in notes[0].body
++        assert OWN in notes[0].body
++        assert "0 failing checks" in notes[0].body
++    assert calls, "notice did not read checks"
++    assert calls[0][:len(BROKER)] == BROKER
++    assert calls[0][len(BROKER):] == ["pr", "checks", OWN]
++
++
++def test_notice_unreadable_checks_still_say_unavailable(monkeypatch):
++    def _run(cmd, *args, **kwargs):
++        return _Proc(1, "", "gh: auth required")
++
++    monkeypatch.setattr(prs, "_gh_argv", lambda: list(BROKER))
++    monkeypatch.setattr(notice.subprocess, "run", _run)
++    with kbc.connect() as conn:
++        tid = _hold_ready_for_notice(conn, monkeypatch, OWN)
++        assert notice.notify_guard_hold(conn, tid, "active_pr") is True
++        notes = [c for c in kb.list_comments(conn, tid) if c.body.startswith("[respawn-guard]")]
++        assert notes and "failing checks unavailable" in notes[0].body
++
++
++def test_fix_card_does_not_tell_worker_to_unblock_or_schedule(monkeypatch):
++    monkeypatch.setattr(prs, "_gh_argv", lambda: list(BROKER))
++    monkeypatch.setattr(
++        notice.subprocess, "run",
++        lambda *a, **k: _Proc(0, "lint\tpass\t1s\thttps://example/lint\n"),
++    )
++    with kbc.connect() as conn:
++        tid = _hold_ready_for_notice(conn, monkeypatch, OWN)
++        assert notice.notify_guard_hold(conn, tid, "active_pr") is True
++        row = conn.execute(
++            "SELECT body FROM tasks WHERE idempotency_key = ?",
++            (f"guard-hold:{tid}",),
++        ).fetchone()
++        assert row is not None
++        body = row["body"].lower()
++        assert "and unblock it" not in body
++        assert "or unblock" not in body
++        assert "do not call unblock or schedule" in body
++        assert "dispatcher releases the hold" in body
+-- 
+2.55.0
+

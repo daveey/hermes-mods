@@ -51,3 +51,25 @@ These patches depend on the preceding series (class routing, managed workers, pr
 ## Plugin?
 
 No. The changes sit in class routing, the turn error handler and the dispatcher's respawn guard, which have no plugin seams.
+
+## Follow-up patch (1650): a quota wall in a tool `check_fn` is an INFO verdict
+
+**1650** (`bf6356aada`, `tools/registry: a subscription quota wall in a check_fn is an INFO verdict with its reset, not a
+crashed probe`).
+
+- **Behavior.** A tool availability check (`check_fn`) that raises `SubscriptionQuotaUnavailable` used to log WARNING
+  "check_fn ... raised" with a traceback, which a self-heal lane then filed as a defect every quota window. Now both the
+  cached and uncached paths return `False` (dependent tools unavailable) and log once at INFO per (check, wall) per
+  process: "check_fn X hit a quota wall until `<ISO reset>` (`<provider>/<model>`); dependent tools stay unavailable
+  until it reopens". There is no traceback and no last-good grace (the previous good verdict is dropped), and the
+  `False` verdict is cached only when the reset is unknown or at least the check-fn TTL away, so the probe re-runs once
+  the wall reopens. Every other `ModelRoutingError` (for example `ManagedPinRejectedError`, a missing route) still logs
+  WARNING with a traceback.
+- **How it works.** `tools/registry.py`: `_quota_wall_outcome(fn, exc)` (exact type check, ISO formatting of
+  `resets_at`, a bounded `_check_fn_quota_logged` set under `_check_fn_cache_lock`) and `_quota_wall_open_seconds(exc)`.
+- **Code.** `tools/registry.py`.
+- **Tests** (`tests/tools/test_registry.py`; not rerun by this mirror pass): `test_quota_wall_is_false_with_info_and_no_traceback`
+  (`cached` via `_check_fn_cached` and `uncached` via `_run_check_fn_uncached`), `test_other_routing_errors_stay_loud`,
+  `test_info_line_once_per_reset`, `test_verdict_not_cached_past_reset`.
+- **Gotchas.** The once-per-wall INFO set is per process and bounded; a long-running process with many walls may log a
+  wall again after eviction.

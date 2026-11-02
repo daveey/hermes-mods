@@ -1,0 +1,180 @@
+From ccdfb231acf95249fdfe31ca56894e60769f9983 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 13:43:13 +0000
+Subject: [PATCH] fix(bot): share named-profile relay mailbox with connection
+ backend [daveey]
+
+---
+ tests/tools/test_bot_mode_dm.py       | 13 +++--
+ tests/tools/test_bot_profile_relay.py | 74 ++++++++++++++++++++++-----
+ tools/bot_mode_dm.py                  |  6 +--
+ tools/bot_mode_probe.py               |  2 +-
+ 4 files changed, 71 insertions(+), 24 deletions(-)
+
+diff --git a/tests/tools/test_bot_mode_dm.py b/tests/tools/test_bot_mode_dm.py
+index 7525091d5a2..5cfaea08894 100644
+--- a/tests/tools/test_bot_mode_dm.py
++++ b/tests/tools/test_bot_mode_dm.py
+@@ -403,21 +403,20 @@ def test_relay_ack_is_queued_with_the_envelope_id(tmp_path, monkeypatch):
+     assert result["delivery_id"] == envelope["id"]
+ 
+ 
+-def test_named_bot_relays_a_qualified_target_through_its_own_folder(tmp_path, monkeypatch):
+-    """A named bot messaging its same-named remote counterpart is offered 'researcher@box' (the bare
+-    form is reserved locally); that DM must queue in the sender's own relay folder, never the default's."""
++def test_named_bot_relays_a_qualified_target_through_install_mailbox(tmp_path, monkeypatch):
++    """The connection backend drains one install-wide mailbox, even for same-named remote
++    counterparts. Sender identity rides in from_profile, not the mailbox directory."""
+     _capture_spawn(monkeypatch)
+     home = _managed_home(tmp_path, teammates=("researcher",))
+     sender_home = home / "profiles" / "researcher"
+     row = {"profile": "researcher", "handle": "researcher", "connection_id": "box", "connection_label": "box"}
+-    for folder in (home, sender_home):
+-        bot_relay.write_remote_roster(folder, [row])
++    bot_relay.write_remote_roster(home, [row])
+     result = json.loads(bot_mode_dm.message_agent_tool(
+         target="researcher@box", message="ping", agent=_FakeAgent(sender_home)))
+ 
+     assert result["status"] == "queued", result
+-    assert bot_relay.claim_pending_envelopes(home) == []
+-    (envelope,) = bot_relay.claim_pending_envelopes(sender_home)
++    assert bot_relay.claim_pending_envelopes(sender_home) == []
++    (envelope,) = bot_relay.claim_pending_envelopes(home)
+     assert envelope["from_profile"] == "researcher" and envelope["target_connection"] == "box"
+ 
+ 
+diff --git a/tests/tools/test_bot_profile_relay.py b/tests/tools/test_bot_profile_relay.py
+index e625e2bf013..79c0158dad7 100644
+--- a/tests/tools/test_bot_profile_relay.py
++++ b/tests/tools/test_bot_profile_relay.py
+@@ -1,29 +1,77 @@
+-"""Relay discovery and mailbox ownership are profile scoped."""
++"""Relay transport is install-wide; sender identity remains profile-scoped."""
+ import json
++import shlex
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from threading import Event
+ from types import SimpleNamespace
+ 
++import pytest
++
+ from tools import bot_mode_dm, bot_mode_probe, bot_relay
++import tui_gateway.server as srv
+ 
+ 
+-def test_named_sender_uses_own_remote_roster_and_outbox(tmp_path, monkeypatch):
++@pytest.mark.parametrize('target', ['remote', 'remote@cloud'])
++def test_named_sender_round_trip_through_default_backend(tmp_path, monkeypatch, capsys, target):
+     root = tmp_path / 'state'
+     sender = root / 'profiles' / 'sender'
+     sender.mkdir(parents=True)
+     (sender / 'profile.yaml').write_text('ui_meta:\n  hermes-bots:\n    shape: cloud\n')
+-    own = dict(profile='remote', handle='remote', connection_id='own', title='Owned remote')
+-    other = dict(profile='remote', handle='remote', connection_id='foreign', title='Foreign remote')
+-    bot_relay.write_remote_roster(sender, [own])
+-    bot_relay.write_remote_roster(root, [other])
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    # The representative backend is default, not the sending profile.
++    monkeypatch.setenv('HERMES_HOME', str(root))
++    remote = dict(profile='remote', handle='remote', connection_id='cloud', title='Connected remote')
++    synced = srv._methods['bot_relay.roster.sync'](1, {'agents': [remote]})
++    assert synced['result']['count'] == 1
+     agent = SimpleNamespace(_session_db=SimpleNamespace(db_path=str(sender / 'state.db')),
+                             _session_title_hint='Bot Chat')
+     commands = []
+     monkeypatch.setattr(bot_mode_dm, '_spawn_delivery', lambda command, *a, **kw:
+                         commands.append(command) or json.dumps({'status': 'sent'}))
+-    result = json.loads(bot_mode_dm.message_agent_tool('remote', 'hello', agent=agent))
+-    assert result['status'] == 'sent'
+-    envelopes = bot_relay.claim_pending_envelopes(sender)
+-    assert len(envelopes) == 1 and envelopes[0]['target_connection'] == 'own'
+-    assert envelopes[0]['message'] == 'Message from 🤖 sender (@sender): hello'
+-    assert bot_relay.claim_pending_envelopes(root) == []
++    result = json.loads(bot_mode_dm.message_agent_tool(target, 'hello', agent=agent))
++    assert result == {'status': 'sent'}
++    envelopes = srv._methods['bot_relay.outbox.drain'](2, {})['result']['envelopes']
++    assert len(envelopes) == 1
++    envelope = envelopes[0]
++    assert envelope['target_connection'] == 'cloud'
++    assert envelope['from_profile'] == 'sender'
++    assert envelope['message'] == 'Message from 🤖 sender (@sender): hello'
++    assert not (sender / 'bot_relay').exists()
++    argv = shlex.split(commands[0])[2:]
++    assert argv[0] == '--wait-reply'
++    assert Path(argv[1]) == root / 'bot_relay' / 'replies' / f"{envelope['id']}.json"
++    # Exercise the real waiter entry point against the gateway's real reply write.
++    argv[-1] = '10'
++    observed_missing = Event()
++    original_exists = bot_mode_dm.os.path.exists
++
++    def observe_reply(path):
++        exists = original_exists(path)
++        if path == argv[1] and not exists:
++            observed_missing.set()
++        return exists
++
++    monkeypatch.setattr(bot_mode_dm.os.path, 'exists', observe_reply)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        waiting = pool.submit(bot_mode_dm._delivery_main, argv)
++        assert observed_missing.wait(timeout=5), 'waiter must start before the reply arrives'
++        reply = srv._methods['bot_relay.reply'](3, {'id': envelope['id'], 'reply': 'Remote answered'})
++        assert reply['result'] == {'ok': True}
++        assert waiting.result(timeout=15) == 0
++    assert 'Remote answered' in capsys.readouterr().out
++    assert srv._methods['bot_relay.outbox.drain'](4, {})['result']['envelopes'] == []
++
++
++def test_named_sender_prompt_uses_connection_roster_not_stale_profile_roster(tmp_path):
++    root = tmp_path / 'state'
++    sender = root / 'profiles' / 'sender'
++    sender.mkdir(parents=True)
++    (sender / 'profile.yaml').write_text('ui_meta:\n  hermes-bots:\n    shape: cloud\n')
++    bot_relay.write_remote_roster(root, [dict(profile='remote', handle='remote', connection_id='cloud',
++                                           title='Connected remote')])
++    bot_relay.write_remote_roster(sender, [dict(profile='stale', handle='stale', connection_id='old',
++                                             title='Stale remote')])
+     section = bot_mode_probe.get_bot_mode_protocol_section(sender, force_refresh=True)
+-    assert 'Owned remote' in section and 'Foreign remote' not in section
++    assert 'Connected remote' in section
++    assert 'Stale remote' not in section
+diff --git a/tools/bot_mode_dm.py b/tools/bot_mode_dm.py
+index 3d5e0e643ad..436df2364a4 100644
+--- a/tools/bot_mode_dm.py
++++ b/tools/bot_mode_dm.py
+@@ -273,8 +273,8 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
+     # hands out for a colliding row, and stamps on replies. Resolved locally first, a local bot whose friendly
+     # name slugs to 'hermes-mini' captured it. An '@' name no connection answers to still resolves locally.
+     if "@" in raw_target.strip().lstrip("@"):
+-        # The sender's own relay folder, as below: the default's would relay a named bot's DM as the default.
+-        relayed = _try_relay_delivery(Path(home), raw_target, content, me, **delivery)
++        # One mailbox per connection; the envelope's from_profile retains the sender identity.
++        relayed = _try_relay_delivery(root, raw_target, content, me, **delivery)
+         if relayed is not None:
+             return relayed
+     # Local teammate — folder id, or a friendly name / Desktop @-slug ('Scribe', 'Dr. Foo').
+@@ -286,7 +286,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
+         # Unknown locally, or same-name target on ANOTHER connection (this gateway's 'default'
+         # messaging the cloud 'default'): every Desktop-connected gateway is reachable via the
+         # relay roster, so try that before reporting a resolution failure / self-message.
+-        relayed = _try_relay_delivery(Path(home), raw_target, content, me, **delivery)
++        relayed = _try_relay_delivery(root, raw_target, content, me, **delivery)
+         if relayed is not None:
+             return relayed
+         if resolved == me:
+diff --git a/tools/bot_mode_probe.py b/tools/bot_mode_probe.py
+index 115f6679235..7ee71727aae 100644
+--- a/tools/bot_mode_probe.py
++++ b/tools/bot_mode_probe.py
+@@ -317,7 +317,7 @@ def _build_section(home: Path) -> str:
+         f"You are `@{_handle(me, names)}`. Your teammates (live roster; roles from their "
+         "profiles):\n"
+         f"{roster_block}"
+-        + _remote_paragraph(home)
++        + _remote_paragraph(root)
+         + _peer_paragraph(root)
+     )
+ 
+-- 
+2.55.0
+
