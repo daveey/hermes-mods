@@ -41,6 +41,14 @@ class RepoGuardsWorkflow(unittest.TestCase):
         self.assertIn("-m unittest discover -v -s tests", self.text)
         self.assertRegex(self.text, r"python: \['3\.11', '3\.14'\]")
 
+    def test_reload_scenarios_are_discovered_by_ci_runner(self):
+        suite = unittest.TestLoader().discover(
+            str(ROOT / "tests"), pattern="test_guard_decision_reload.py",
+            top_level_dir=str(ROOT / "tests"),
+        )
+        self.assertEqual(suite.countTestCases(), 40,
+                         "all five reload scenarios for all eight guards must run under unittest")
+
     def test_plugin_only_diff_selects_guard(self):
         """Dry run of GitHub's push filter for a plugins/coach-only diff: no paths filter => the job runs,
         and its discover over tests/ collects the sqlite mode=ro guard."""
