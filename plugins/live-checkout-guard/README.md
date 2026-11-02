@@ -106,6 +106,9 @@ Python 3.9 and 3.14.
 The existing archive directory must be **outside** the checkout and Git directory.
 Its `manifest.json` is a JSON list with one row for **every** current stash:
 `{"stash":"FULL_OID","patch":"relative.patch","bytes":123,"sha256":"SHA256"}`.
+An absolute `patch` must name a file inside the archive; only the archive's parent
+may be spelled through a symlink (macOS `/var` or `/tmp`). A symlink at or inside
+the archive is refused in every spelling.
 Each patch must be the complete `git stash show -p --binary --include-untracked`
 export. Preparation rejects missing or noncanonical bytes rather than regenerating
 those patches. It adds an index-parent patch and a self-contained Git bundle per
@@ -165,9 +168,11 @@ Tests: `tests/test_stash_retirement.py` exercises archive rejection, independent
 bundle recovery after GC, native writer races, lost replies, process death,
 partial commits and unchanged checkout/index/HEAD; `TransactionPipeLifecycleTests`
 covers repeated EOF/wait, retry after a wait timeout (child left alive, never
-killed), stderr retention and no use of `Popen.communicate` (on Python 3.9 it
+killed), stderr retention, stderr in a file (a late write after the CLI gives up
+cannot SIGPIPE Git) and no use of `Popen.communicate` (on Python 3.9 it
 flushed the already-closed stdin after a committed deletion, then failed again on
-retry). `tests/test_retirement_cli.py` exercises all three CLI modes on the running
+retry); `SymlinkedArchiveParentTests` covers absolute rows in both spellings and
+symlinks inside the archive. `tests/test_retirement_cli.py` exercises all three CLI modes on the running
 interpreter and on Python 3.9 (`HERMES_MODS_PY39` or `python3.9`; skipped locally
 when absent, a failure under `CI`), the pre-mutation old-interpreter refusal, plus
 terminal/execute-code guard checks. Existing

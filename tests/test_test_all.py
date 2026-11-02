@@ -322,6 +322,28 @@ class TestAll(unittest.TestCase):
             self.assertEqual(install.call_count, 3)
             self.assertEqual(install.call_args.args[0][-1], 'anthropic==0.125.0')
 
+    def test_overrides_keep_the_markers_of_the_deps_they_replace(self):
+        # A uv override replaces the whole requirement, marker included: core's unconditional Pillow override
+        # made its 3.14-only Pillow dep unconditional, so no Python 3.9 site could resolve (Pillow 13 needs 3.11).
+        runner = runpy.run_path(str(RUNNER))
+        core = self.root / 'core'
+        core.mkdir()
+        (core / 'pyproject.toml').write_text(
+            '[project]\ndependencies = ["Pillow==13.0.0; python_version >= \'3.14\'", "cryptography==50.0.2", '
+            '"psutil==7.2.2; sys_platform != \'android\'", "psutil @ git+https://example.com/p.git ; '
+            'sys_platform == \'android\'", "ruamel.yaml==0.18.16; python_version >= \'3.14\'"]\n\n'
+            '[tool.uv]\noverride-dependencies = ["Pillow==13.0.0", "cryptography==50.0.2", "pynacl>=1.6,<1.7", '
+            '"psutil==7.2.2", "ruamel_yaml==0.18.16; os_name == \'posix\'"]\n')
+        deps, overrides = runner['core_runtime_deps']('/fake/production/python3.9', core)
+        self.assertEqual(len(deps), 5)
+        self.assertEqual(overrides, [
+            "Pillow==13.0.0; (python_version >= '3.14')",
+            'cryptography==50.0.2',  # unmarked dep: nothing to inherit
+            'pynacl>=1.6,<1.7',  # transitive only: unchanged
+            "psutil==7.2.2; (sys_platform != 'android') or (sys_platform == 'android')",
+            "ruamel_yaml==0.18.16; (os_name == 'posix') and ((python_version >= '3.14'))",
+        ])
+
     def test_test_site_finds_user_uv_or_reports_missing_installer(self):
         runner = runpy.run_path(str(RUNNER))
         ensure = runner['ensure_test_site']

@@ -470,10 +470,7 @@ def _archive_path(archive, name):
         raise RetirementError('invalid archive path')
     p = Path(name)
     if p.is_absolute():
-        try:
-            p = p.relative_to(archive)
-        except ValueError:
-            raise RetirementError('archive file is outside the archive: ' + name) from None
+        p = _relative_to_archive(archive, p, name)
     if not p.parts or any(part in ('', '.', '..') for part in p.parts):
         raise RetirementError('invalid archive path: ' + name)
     target = archive
@@ -482,6 +479,36 @@ def _archive_path(archive, name):
         if target.is_symlink():
             raise RetirementError('archive symlink refused: ' + name)
     return target, PurePosixPath(*p.parts).as_posix()
+
+
+def _relative_to_archive(archive, p, name):
+    """An absolute row may spell the archive's PARENT through a symlink (macOS /var ->
+    /private/var, /tmp -> /private/tmp): ``archive`` is already resolved, so the row's
+    archive prefix is matched by resolving only its parent. The archive directory
+    itself must not be a symlink in that spelling, and every component inside the
+    archive is still checked component by component (no symlinks) by the caller."""
+    if any(part in ('.', '..') for part in p.parts):
+        raise RetirementError('invalid archive path: ' + name)
+    try:
+        return p.relative_to(archive)
+    except ValueError:
+        pass
+    parts = p.parts
+    for i in range(1, len(parts)):  # parts[i] names the archive dir; parts[:i] its parent
+        if parts[i] != archive.name:
+            continue
+        prefix = Path(*parts[:i + 1])
+        try:
+            parent = prefix.parent.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if parent == archive.parent:
+            if prefix.is_symlink():
+                raise RetirementError('archive symlink refused: ' + name)
+            return Path(*parts[i + 1:]) if i + 1 < len(parts) else Path()
+    raise RetirementError(f'archive file is outside the archive {archive}: {name} (absolute rows must name '
+                          'a path inside the archive directory; only its parent may be spelled through a '
+                          'symlink)')
 
 
 def _read_regular(path):
@@ -796,16 +823,31 @@ class _Transaction:
     is sent, EOF makes Git roll back; after it is sent, Git must be left to finish.
     The child inherits the sync lock, so a hung or orphaned child keeps it."""
 
-    def __init__(self, root):
+    def __init__(self, root, argv=None):
         self.root = root
         self._buf = b''
-        self._err = b''
+        # stderr goes to an anonymous file, not a pipe: if this process exits while Git
+        # is still committing (see _still_running), a late warning on stderr can never
+        # SIGPIPE Git mid-commit. stdout stays a pipe for replies; Git writes the commit
+        # reply only after the ref transaction is done.
+        self._err_file = tempfile.TemporaryFile(prefix='stash-retire-update-ref-')
         try:
-            self.proc = subprocess.Popen(_argv(root, ['update-ref', '--stdin']), stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_env(),
+            self.proc = subprocess.Popen(argv or _argv(root, ['update-ref', '--stdin']), stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=self._err_file, env=_env(),
                                          bufsize=0, pass_fds=_pass_fds(), start_new_session=True)
         except OSError as exc:
+            self._err_file.close()
             raise RetirementError('git update-ref could not run: ' + str(exc)) from exc
+
+    def _stderr(self):
+        """Everything Git wrote to stderr so far. pread never moves the offset that the
+        child shares with this process through the inherited file description."""
+        fd, out = self._err_file.fileno(), b''
+        while True:
+            chunk = os.pread(fd, 65536, len(out))
+            if not chunk:
+                return out
+            out += chunk
 
     def send(self, line):
         stdin = self.proc.stdin
@@ -860,14 +902,13 @@ class _Transaction:
     def close_and_wait(self, timeout=None):
         """EOF, then wait (bounded, no kill). Returns Git's stderr or a 'still running' note.
 
-        Drains stdout/stderr with select + os.read and reaps with Popen.wait instead
-        of Popen.communicate, whose per-version internal state is not safe to retry
-        after a failure or a timeout. Safe to call repeatedly: stderr accumulates on
-        the instance and pipes closed at EOF are skipped on the next call."""
+        Drains stdout with select + os.read and reaps with Popen.wait instead of
+        Popen.communicate, whose per-version internal state is not safe to retry after
+        a failure or a timeout. Safe to call repeatedly: stderr is re-read from its
+        file and a stdout pipe closed at EOF is skipped on the next call."""
         self.close_stdin()
         deadline = time.monotonic() + (TXN_TIMEOUT if timeout is None else timeout)
-        streams = {s.fileno(): s for s in (self.proc.stdout, self.proc.stderr) if s is not None and not s.closed}
-        err_fd = self.proc.stderr.fileno() if self.proc.stderr is not None and not self.proc.stderr.closed else None
+        streams = {s.fileno(): s for s in (self.proc.stdout,) if s is not None and not s.closed}
         while streams:
             left = deadline - time.monotonic()
             if left <= 0:
@@ -884,15 +925,13 @@ class _Transaction:
                     chunk = b''
                 if not chunk:
                     streams.pop(fd).close()
-                elif fd == err_fd:
-                    self._err += chunk
                 else:
                     self._buf += chunk
         try:
             self.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             return self._still_running()
-        return self._err.decode(errors='replace').strip() or f'exit {self.proc.returncode}'
+        return self._stderr().decode(errors='replace').strip() or f'exit {self.proc.returncode}'
 
     def _still_running(self):
         return (f'update-ref pid {self.proc.pid} is still running and holds the sync lock; '

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,8 +54,8 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='stash-retire-test-')
         self.addCleanup(self.tmp.cleanup)
-        # macOS: /var -> /private/var. Absolute manifest rows spelled through a symlinked
-        # archive parent are refused today (fail-closed; tracked separately), so use the real path.
+        # macOS: /var -> /private/var. The fixture uses the real path; absolute rows spelled
+        # through a symlinked archive parent are covered by SymlinkedArchiveParentTests.
         self.base = Path(self.tmp.name).resolve()
         self.root = self.base / 'repo'
         self.root.mkdir()
@@ -1694,6 +1695,117 @@ class PartialCommitTests(Base):
         self.assert_retired([self.target])
 
 
+class SymlinkedArchiveParentTests(Base):
+    """Absolute manifest rows may spell the archive's parent through a symlink (macOS
+    /var -> /private/var); symlinks at or inside the archive stay refused."""
+
+    def setUp(self):
+        super().setUp()
+        self.link = self.base.parent / (self.base.name + '-link')
+        self.link.symlink_to(self.base, target_is_directory=True)
+        self.addCleanup(self.link.unlink)
+        self.linked_archive = self.link / 'archive'
+
+    def rows(self):
+        return json.loads((self.archive / 'manifest.json').read_text())
+
+    def write_rows(self, rows):
+        (self.archive / 'manifest.json').write_text(json.dumps(rows, indent=2))
+
+    def spell(self, spellings):
+        rows = self.rows()
+        for n, row in enumerate(rows):
+            name = row['stash'] + '.patch'
+            row['patch'] = {'link': str(self.linked_archive / name), 'real': str(self.archive / name),
+                            'relative': name}[spellings[n % len(spellings)]]
+        self.write_rows(rows)
+        return rows
+
+    def test_both_absolute_spellings_accepted_and_retire(self):
+        rows = self.spell(['link', 'real', 'relative'])
+        self.assertTrue(rows[0]['patch'].startswith(str(self.link) + os.sep))
+        self.assertTrue(rows[1]['patch'].startswith(str(self.archive) + os.sep))
+        self.prepare()
+        self.retire(self.oids[:2])
+        self.assert_retired(self.oids[:2])
+
+    def test_every_row_through_link_accepted(self):
+        self.spell(['link'])
+        self.prepare()
+        self.assert_unchanged()
+
+    def test_archive_path_maps_both_spellings_to_the_resolved_archive(self):
+        archive = self.archive.resolve()
+        for name in (str(self.linked_archive / 'a.patch'), str(self.archive / 'a.patch'), 'a.patch'):
+            with self.subTest(name):
+                self.assertEqual(self.mod._archive_path(archive, name), (archive / 'a.patch', 'a.patch'))
+
+    def test_symlink_inside_archive_still_refused_in_both_spellings(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        data = (self.archive / (self.oids[0] + '.patch')).read_bytes()
+        (outside / (self.oids[0] + '.patch')).write_bytes(data)
+        (self.archive / 'sub').symlink_to(outside, target_is_directory=True)
+        for prefix in (self.linked_archive, self.archive):
+            with self.subTest(str(prefix)):
+                with self.assertRaisesRegex(self.mod.RetirementError, 'archive symlink refused'):
+                    self.mod._archive_path(self.archive, str(prefix / 'sub' / (self.oids[0] + '.patch')))
+                rows = self.rows()
+                rows[0]['patch'] = str(prefix / 'sub' / (self.oids[0] + '.patch'))
+                self.write_rows(rows)
+                with self.assertRaisesRegex(self.mod.RetirementError, 'archive symlink refused'):
+                    self.prepare()
+                self.assertFalse((self.archive / 'retirement-manifest.json').exists())
+                self.assert_unchanged()
+
+    def test_symlinked_file_inside_archive_still_refused_through_link(self):
+        target = self.archive / (self.oids[0] + '.patch')
+        outside = self.base / 'outside.patch'
+        outside.write_bytes(target.read_bytes())
+        target.unlink()
+        target.symlink_to(outside)
+        rows = self.rows()
+        rows[0]['patch'] = str(self.linked_archive / target.name)
+        self.write_rows(rows)
+        with self.assertRaisesRegex(self.mod.RetirementError, 'archive symlink refused'):
+            self.prepare()
+        self.assert_unchanged()
+
+    def test_archive_dir_named_through_its_own_symlink_refused(self):
+        alias = self.base / 'archive-alias'
+        alias.symlink_to(self.archive, target_is_directory=True)
+        nested = self.base / 'nest'
+        nested.mkdir()
+        (nested / 'archive').symlink_to(self.archive, target_is_directory=True)
+        for name in (str(alias / 'a.patch'), str(nested / 'archive' / 'a.patch'),
+                     str(self.link / 'nest' / 'archive' / 'a.patch')):
+            with self.subTest(name):
+                with self.assertRaisesRegex(self.mod.RetirementError, 'outside the archive'):
+                    self.mod._archive_path(self.archive, name)
+
+    def test_dotdot_and_outside_absolute_rows_refused_with_guidance(self):
+        for name in (str(self.linked_archive / '..' / 'archive' / 'a.patch'),
+                     str(self.archive / '..' / 'archive' / 'a.patch')):
+            with self.subTest(name):
+                with self.assertRaisesRegex(self.mod.RetirementError, 'invalid archive path'):
+                    self.mod._archive_path(self.archive, name)
+        for name in (str(self.link / 'outside.patch'), str(self.base / 'repo' / 'a.patch'), '/a.patch',
+                     str(self.linked_archive)):
+            with self.subTest(name):
+                with self.assertRaises(self.mod.RetirementError) as cm:
+                    self.mod._archive_path(self.archive, name)
+                if name != str(self.linked_archive):
+                    self.assertIn('only its parent may be spelled through a symlink', str(cm.exception))
+
+    def test_tampered_bytes_still_refused_through_link(self):
+        self.spell(['link'])
+        target = self.archive / (self.oids[0] + '.patch')
+        target.write_bytes(target.read_bytes()[:-1])
+        with self.assertRaisesRegex(self.mod.RetirementError, 'SHA-256 mismatch'):
+            self.prepare()
+        self.assert_unchanged()
+
+
 class TransactionPipeLifecycleTests(Base):
     """update-ref pipe lifecycle on every supported Python (3.9's Popen.communicate
     flushed an already-closed stdin and could not be retried after that failure)."""
@@ -1762,17 +1874,31 @@ class TransactionPipeLifecycleTests(Base):
 
     def test_exited_child_with_pipes_held_elsewhere_returns_promptly(self):
         # Stand-in child (not Git): exits at once while a background holder keeps the pipes.
-        txn = object.__new__(self.mod._Transaction)
-        txn.root, txn._buf, txn._err = self.root, b'', b''
-        txn.proc = subprocess.Popen(['sh', '-c', 'sleep 30 & echo held-err >&2; exit 3'],
-                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    bufsize=0, start_new_session=True)
+        txn = self.mod._Transaction(self.root, argv=['sh', '-c', 'sleep 30 & echo held-err >&2; exit 3'])
         self.addCleanup(lambda: os.killpg(txn.proc.pid, signal.SIGKILL) if txn.proc.poll() is not None else None)
         started = time.monotonic()
         self.assertEqual(txn.close_and_wait(timeout=20), 'held-err')
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(txn.proc.returncode, 3)
         self.assertEqual(txn.close_and_wait(timeout=20), 'held-err')
+
+    def test_git_stderr_is_a_regular_file_not_a_pipe(self):
+        txn = self.txn()
+        self.assertIsNone(txn.proc.stderr)
+        self.assertTrue(stat.S_ISREG(os.fstat(txn._err_file.fileno()).st_mode))
+        txn.expect('start')
+        txn.close_stdin()
+        self.assertEqual(txn.close_and_wait(), 'exit 0')
+
+    def test_late_stderr_after_parent_gave_up_cannot_sigpipe_child(self):
+        # The CLI exiting with a still-running child closes every read end it held. A
+        # late stderr write must then still succeed (it used to be a pipe: SIGPIPE).
+        script = 'read x; echo late-warning >&2 || exit 9; echo done-ok >&2; exit 0'
+        txn = self.mod._Transaction(self.root, argv=['sh', '-c', script])
+        txn.proc.stdout.close()  # what process exit does to the reply pipe
+        txn.close_stdin()
+        self.assertEqual(txn.proc.wait(timeout=20), 0)
+        self.assertEqual(txn.close_and_wait(timeout=5), 'late-warning\ndone-ok')
 
     def test_import_refuses_python_older_than_contract(self):
         with patch.object(sys, 'version_info', (3, 8, 18, 'final', 0)):
