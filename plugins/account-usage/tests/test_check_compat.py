@@ -52,6 +52,37 @@ class CheckCompat(unittest.TestCase):
         drift = check_compat.check(self.core, self.plugin)['drift']
         self.assertEqual([d['pin'] for d in drift], ['fast-rate-limit-fallback/account-usage-compatibility.json'])
 
+    def test_fast_fallback_function_pins_are_checked(self):
+        import ast
+        source = '@staticmethod\ndef seam(x):\n    return x\n'
+        (self.core / 'agent' / 'fn.py').write_text('def seam(): pass\n' + source)
+        digest = hashlib.sha256(ast.dump(ast.parse(source).body[0], include_attributes=False).encode()).hexdigest()
+        pins = self.composition.with_name('compatibility.json')
+        pins.write_text(json.dumps({'agent.fn:seam': [digest], 'agent.gone:seam': digest}))
+        drift = check_compat.check(self.core, self.plugin)['drift']
+        self.assertEqual([(d['pin'], d['file'], d['actual']) for d in drift],
+                         [('fast-rate-limit-fallback/compatibility.json', 'agent.gone:seam', 'missing')])
+        (self.core / 'agent' / 'fn.py').write_text('def seam(x):\n    return x + 1\n')
+        pins.write_text(json.dumps({'agent.fn:seam': [digest]}))
+        drift = check_compat.check(self.core, self.plugin)['drift']
+        self.assertEqual([d['file'] for d in drift], ['agent.fn:seam'])
+
+    def test_fast_fallback_pins_match_its_runtime_fingerprint(self):
+        """The stdlib digest equals the inspect-based one fast-rate-limit-fallback's install() uses."""
+        import ast
+        import inspect
+        import textwrap
+        from core_path import core_path
+        import importlib
+        pins = json.loads((PLUGIN.parent / 'fast-rate-limit-fallback' / 'compatibility.json').read_text())
+        for key in pins:
+            module, name = key.split(':')
+            function = getattr(importlib.import_module(module), name)
+            function = inspect.unwrap(function)
+            tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+            live = hashlib.sha256(ast.dump(tree.body[0], include_attributes=False).encode()).hexdigest()
+            self.assertEqual(check_compat._function_digest(core_path(), key), live, key)
+
     def test_cli_exit_codes(self):
         script = self.plugin / 'check_compat.py'
         shutil.copy(PLUGIN / 'check_compat.py', script)

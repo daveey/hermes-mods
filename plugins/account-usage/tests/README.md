@@ -29,6 +29,32 @@ explicit path, PYTHONPATH, home fallback, and readable missing-core failure.
 
 ## Compatibility audit
 
+### Core through `311d8339309` / `21acd343ff6` (2026-11-01)
+
+- `agent/credential_pool.py` (`311d8339309`): a pushed no-refresh OAuth token keeps a
+  live Codex-shaped quota mark instead of clearing it, and the refresh path returns
+  `None` for such a row. `choose_snapshot` reads persisted rows and already rejects an
+  exhausted row via `_exhausted_until`, so a manual choice now (correctly) refuses an
+  account a pushed token would previously have un-benched. No wrapped seam changed.
+- `agent/turn_api_error.py` (`d76f44fcd9d`, `21acd343ff6`): `handle_api_error` handles
+  `SubscriptionQuotaUnavailable` (class fallback or terminal return) before
+  credential recovery. It is raised only by class model routing (`model_routing_runtime`),
+  which `managed_routing_refusal` already refuses for a manual choice; the branch never
+  calls `recover_with_credential_pool`, and a stale `_account_usage_failed_attempt` is
+  cleared at the next middleware boundary. fast-rate-limit-fallback's
+  `handle_api_error` AST pin was appended for the same diff: the new branch returns
+  before `route_classified_error`, so its long-reset bypass is unaffected.
+- `check_compat.py` now also checks fast-rate-limit-fallback's `compatibility.json`
+  function pins (stdlib AST digest, tested equal to that plugin's live fingerprint):
+  the watcher had reported only the account-usage pins while the combined tests
+  failed on the fast-fallback pin.
+- Hub run note: with `HOME` a temp dir, the `anthropic` PM extra is not found; append
+  the installed extra's `site-packages` to `PYTHONPATH`. Result on core `1c96fe663f1`
+  and an `origin/main` export: **278 passed, 70 subtests**; fast-rate-limit-fallback
+  `run_tests.py`: **104 passed**.
+
+### Core `a22965539888`
+
 The full diff from `20478baa674` to `a22965539888` changes two pinned files:
 
 - `agent/chat_completion_helpers.py`: classify `StreamLifetimeExceeded` with

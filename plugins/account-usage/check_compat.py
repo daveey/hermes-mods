@@ -11,6 +11,8 @@ Pins checked:
 - execution-compatibility.json: sha256 of each core file whose seams install() wraps
   or depends on: one digest or a list of every audited version (a core matching none
   makes install() refuse and selection fail closed);
+- fast-rate-limit-fallback/compatibility.json: AST digest of each core function that plugin
+  wraps or guards (its install() refuses on a mismatch);
 - fast-rate-limit-fallback/account-usage-compatibility.json: sha256 of this plugin's
   selection.py (a mismatch makes fast-rate-limit-fallback refuse to compose with it).
 """
@@ -37,10 +39,37 @@ _sha = _pins.sha
 _accepted = _pins.accepted
 
 
+def _function_digest(core, key):
+    """fast-rate-limit-fallback's pin for 'module:function', computed without importing core:
+    sha256 of the attribute-free AST dump of the module's last top-level def of that name
+    (the same node its _fingerprint parses from inspect.getsource)."""
+    import ast
+    import hashlib
+    module, _, name = key.partition(':')
+    path = Path(core) / (module.replace('.', '/') + '.py')
+    if not path.is_file():
+        return 'missing'
+    try:
+        tree = ast.parse(path.read_bytes())
+    except SyntaxError:
+        return 'unparsable'
+    nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name]
+    if not nodes:
+        return 'missing'
+    return hashlib.sha256(ast.dump(nodes[-1], include_attributes=False).encode()).hexdigest()
+
+
 def check(core, plugin=PLUGIN):
     core = Path(core).expanduser().resolve()
     pins = json.loads((plugin / 'execution-compatibility.json').read_text())
     drift = [{'pin': 'execution-compatibility.json', **item} for item in _pins.pin_drift(core, pins)]
+    fallback = plugin.parent / 'fast-rate-limit-fallback' / 'compatibility.json'
+    if fallback.is_file():
+        for key, value in json.loads(fallback.read_text()).items():
+            actual = _function_digest(core, key)
+            if actual not in _accepted(value):
+                drift.append({'pin': 'fast-rate-limit-fallback/compatibility.json',
+                              'file': key, 'expected': value, 'actual': actual})
     composition = plugin.parent / 'fast-rate-limit-fallback' / 'account-usage-compatibility.json'
     if composition.is_file():
         expected = json.loads(composition.read_text()).get('selection_sha256')
