@@ -33,6 +33,7 @@ DISRUPTIVE = {"restart", "stop", "kill", "try-restart", "reload-or-restart", "tr
 SHELLS = {"sh", "bash", "zsh", "dash"}
 PROC_PATTERN = re.compile(r"hermes[\w\s./-]*\b(?:serve|dashboard)\b|hermes[_-]?dashboard|hermes-always-on", re.I)
 WRAPPER = "~/.hermes/sync-runner/hermes-sync pause-turns"
+REMOTE_CONNECT_TIMEOUT = 10  # ssh ConnectTimeout for remote PID discovery; run limit is this + 5 s
 
 MESSAGE = (
     "Refused: restarting the shared Hermes dashboard/gateway/serve backend cuts every live Desktop turn, "
@@ -54,8 +55,95 @@ def enabled() -> bool:
     return os.environ.get("HERMES_BACKEND_RESTART_GUARD", "on").lower() not in {"off", "0", "false", "no"}
 
 
+SUBST = "__brg_subst__"  # stands in for an extracted $(...)/`...` body in the outer command
+
+
+def _subst_end(text: str, i: int) -> Optional[int]:
+    """Index of the ')' closing a $(...)/<(...) body starting at ``i``; quoting restarts inside it."""
+    depth, single, double = 1, False, False
+    while i < len(text):
+        c = text[i]
+        if single:
+            single = c != "'"
+        elif c == "\\":
+            i += 1
+        elif c == "'" and not double:
+            single = True
+        elif c == '"':
+            double = not double
+        elif c == "$" and text.startswith("$(", i):
+            end = _subst_end(text, i + 2)
+            if end is None:
+                return None
+            i = end
+        elif c == "`":
+            end = text.find("`", i + 1)
+            if end < 0:
+                return None
+            i = end
+        elif not double and c == "(":
+            depth += 1
+        elif not double and c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _substitutions(text: str) -> tuple[str, list[str]]:
+    """Pull command-substitution bodies out of ``text``.
+
+    shlex does not understand $(...), so double quotes nested inside one ("$(grep -E "a|kill" f)")
+    close early and words of a quoted pattern became commands. Bodies the current shell would run
+    ($(...), `...`, <(...), >(...) outside single quotes, also inside double quotes) are returned to be
+    split as command lists of their own; the outer text keeps a placeholder. Single-quoted text is
+    literal here and is examined when its consumer (bash -c, ssh) is parsed. Unbalanced input is
+    left unchanged (the old splitting applies).
+    """
+    out, bodies, i, single, double = [], [], 0, False, False
+    while i < len(text):
+        c = text[i]
+        if single:
+            single = c != "'"
+        elif c == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        elif c == "'" and not double:
+            single = True
+        elif c == '"':
+            double = not double
+        elif (c == "$" or (c in "<>" and not double)) and text.startswith("(", i + 1):
+            end = _subst_end(text, i + 2)
+            if end is not None:
+                bodies.append(text[i + 2:end])
+                out.append(SUBST)
+                i = end + 1
+                continue
+        elif c == "`":
+            end = i + 1
+            while end < len(text) and text[end] != "`":
+                end += 2 if text[end] == "\\" else 1
+            if end < len(text):
+                bodies.append(text[i + 1:end])
+                out.append(SUBST)
+                i = end + 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out), bodies
+
+
 def _segments(text: str) -> list[list[str]]:
-    """argv lists split on shell control operators; unbalanced quoting falls back to whitespace splitting."""
+    """argv lists split on shell control operators; unbalanced quoting falls back to whitespace splitting.
+    Command-substitution bodies are split as separate command lists (see ``_substitutions``)."""
+    text, bodies = _substitutions(text)
+    nested = [argv for body in bodies for argv in _segments(body)]
+    return _split(text) + nested
+
+
+def _split(text: str) -> list[list[str]]:
     try:
         lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()\n")
         lex.whitespace = " \t\r"  # unquoted newlines are command boundaries, not argument whitespace
@@ -168,11 +256,22 @@ def protected_processes(host=None) -> dict:
             source = Path(__file__).read_text()
             source += '\nprint(json.dumps(protected_processes()))\n'
             safe_opts = _inspection_ssh_options(opts)
-            res = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
-                                  "-o", "ClearAllForwardings=yes", *safe_opts, dest, "python3 -"], input=source,
-                                 capture_output=True, text=True, timeout=5)
+            # A ProxyCommand route probe counts against ConnectTimeout (the MacBook's hub proxy spends
+            # up to 4 s before connecting), so allow for proxied hosts. Still fail open when unreachable.
+            try:
+                res = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes",
+                                      "-o", f"ConnectTimeout={REMOTE_CONNECT_TIMEOUT}",
+                                      "-o", "ClearAllForwardings=yes", *safe_opts, dest, "python3 -"], input=source,
+                                     capture_output=True, text=True, timeout=REMOTE_CONNECT_TIMEOUT + 5)
+            except subprocess.TimeoutExpired:
+                logger.warning("backend-restart-guard PID discovery failed open: remote %s timed out after %ss",
+                               dest, REMOTE_CONNECT_TIMEOUT + 5)
+                return {}
             if res.returncode:
-                raise OSError(f"remote discovery rc={res.returncode}")
+                tail = " | ".join((res.stderr or "").strip().splitlines()[-3:])[-300:]
+                logger.warning("backend-restart-guard PID discovery failed open: remote %s rc=%s: %s",
+                               dest, res.returncode, tail or "(no stderr)")
+                return {}
             return {int(p): row for p, row in json.loads(res.stdout).items()}
         res = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,args="],
                              capture_output=True, text=True, timeout=2, check=True)
