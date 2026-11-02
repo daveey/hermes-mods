@@ -1,5 +1,6 @@
 """Tests for stash-worktree-guard. Run: python3 -m pytest -q -p no:cacheprovider tests_guard.py"""
 
+import functools
 import importlib.util
 import os
 import shutil
@@ -29,6 +30,54 @@ GIT_ENV = {
     "GIT_COMMITTER_NAME": "t",
     "GIT_COMMITTER_EMAIL": "t@example.com",
 }
+
+
+def _newest_bash():
+    """(major, path) of the newest bash here. Restore proofs run in it, not in PATH's first
+    bash: macOS's /bin/bash 3.2 (first on PATH in some sessions) lacks coproc, mapfile,
+    BASH_CMDS, ${x@P} and `case` inside $(...)."""
+    best = (0, "bash")
+    for cand in dict.fromkeys(filter(None, (shutil.which("bash"), "/opt/homebrew/bin/bash",
+                                            "/usr/local/bin/bash", "/bin/bash"))):
+        try:
+            out = subprocess.run([cand, "-c", 'echo "${BASH_VERSINFO[0]}"'], capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.isdigit() and int(out) > best[0]:
+            best = (int(out), cand)
+    return best
+
+
+BASH_MAJOR, BASH = _newest_bash()
+
+
+def _proof_bash():
+    """bash for proving a refused command really restores. Call it only after the refusal is
+    asserted: without bash >= 4 the proof is skipped, never the refusal."""
+    if BASH_MAJOR < 4:
+        pytest.skip(f"restore proof needs bash >= 4 (newest here: {BASH}, major {BASH_MAJOR}); "
+                    "refusal checked")
+    return BASH
+
+
+# String-running modes some builds lack: BSD sed has no `e` command or `s///e` flag, Xcode's
+# GNU make 3.81 has no --eval, and macOS ships no flock or setsid. A case needing a mode the
+# host lacks checks the refusal only, like a missing program.
+HOST_PROBES = {
+    "sed": "echo x | sed 'e true' && echo true | sed 's/^//e'",
+    "make": "make -f /dev/null --eval 'all:;@true' all",
+    "setsid": "setsid -w true",
+}
+
+
+@functools.cache
+def _host_runs(prog):
+    if not shutil.which(prog):
+        return False
+    probe = HOST_PROBES.get(prog)
+    return probe is None or subprocess.run([BASH, "-c", probe], capture_output=True,
+                                           timeout=30).returncode == 0
 
 
 def git(*args, cwd):
@@ -379,7 +428,7 @@ def test_quoted_case_substitution_fails_closed_terminal(multi):
     assert "Save a patch instead" in got["message"]
     # The shape is a real restore: bash pops main's stash into the `other` worktree.
     assert _stash_count(main) == 1
-    subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
+    subprocess.run([_proof_bash(), "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
     assert _stash_count(main) == 0
     assert (wt / "f.txt").read_text() == "stashed\n"
 
@@ -414,7 +463,7 @@ def test_expanded_restore_argv(multi, template):
     # The hook is non-mutating, and the refused command is a real restore in bash.
     assert _stash_count(main) == 1
     assert (wt / "f.txt").read_text() == "base\n"
-    subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
+    subprocess.run([_proof_bash(), "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
     assert _stash_count(main) == 0
     assert (wt / "f.txt").read_text() == "stashed\n"
 
@@ -444,7 +493,7 @@ def test_wrapper_options_are_not_silently_dropped(multi, template):
     # The hook is non-mutating, and the refused command is a real restore in bash.
     assert _stash_count(main) == 1
     assert (wt / "f.txt").read_text() == "base\n"
-    subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
+    subprocess.run([_proof_bash(), "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
     assert _stash_count(main) == 0
     assert (wt / "f.txt").read_text() == "stashed\n"
 
@@ -505,7 +554,7 @@ def _assert_real_restore(cmd, main, wt):
     assert _blocked(cmd, main), cmd
     assert _stash_count(main) == 1
     assert (wt / "f.txt").read_text() == "base\n"
-    proc = subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV)
+    proc = subprocess.run([_proof_bash(), "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV)
     assert proc.returncode == 0, proc.stderr
     assert _stash_count(main) == (1 if "apply" in cmd else 0)  # apply keeps the entry
     assert (wt / "f.txt").read_text() == "stashed\n"
@@ -554,7 +603,7 @@ def test_function_precedence_allow_controls(multi, single):
     # The function shadows the wrapper: the wrapped restore never runs in bash.
     cmd = f'env() {{ :; }}; env git -C {wt} stash pop'
     assert not _blocked(cmd, main)
-    subprocess.run(["bash", "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
+    subprocess.run([BASH, "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
     assert _stash_count(main) == 1
     # Same-branch and single-worktree restores through a shadowing function stay allowed.
     assert not _blocked(f'timeout() {{ git -C {main} stash pop; }}; timeout 5 true', wt)
@@ -638,7 +687,11 @@ UNKNOWN_ARGV_RESTORES = [
 @pytest.mark.parametrize("template", UNKNOWN_ARGV_RESTORES)
 def test_unknown_argv_and_wrapper_restores_are_refused(multi, template):
     main, wt = multi
-    _assert_real_restore(template.format(wt=wt, main=main), main, wt)
+    cmd = template.format(wt=wt, main=main)
+    if any(not _host_runs(p) for p in ("flock", "setsid") if p in cmd.split()):
+        assert _blocked(cmd, main), cmd
+        return
+    _assert_real_restore(cmd, main, wt)
 
 
 @pytest.mark.parametrize("template", [
@@ -1010,7 +1063,7 @@ def test_round6_restores_are_refused(multi, template):
     cmd = template.format(wt=wt, main=main, gd=_gitdir(wt))
     first = cmd.split()[0]
     needs = [p for p in ("vim", "perl", "make", "sed") if p in cmd.split()]
-    if any(not shutil.which(p) for p in needs) or first == "vim":
+    if any(not _host_runs(p) for p in needs) or first == "vim":
         assert _blocked(cmd, main), cmd  # static only: vim may be absent or interactive
         return
     _assert_real_restore(cmd, main, wt)

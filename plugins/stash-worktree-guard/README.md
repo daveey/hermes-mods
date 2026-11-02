@@ -162,6 +162,13 @@ new code; updating the files is not proof an existing session refreshed.
 
 From the repository root: `scripts/test-all -k stash-worktree-guard`.
 
+Restore proofs (a refused command run in bash really pops the stash into the other
+worktree) use the newest bash on the host, not PATH's first one: macOS's `/bin/bash` 3.2
+lacks `coproc`, `mapfile`, `BASH_CMDS`, `${x@P}` and `case` inside `$(...)`. With no
+bash >= 4 the proof is skipped after the refusal is checked. Cases that need GNU sed's `e`,
+GNU make >= 4's `--eval`, `flock` or `setsid -w` check the refusal only where the host lacks
+them (macOS); Linux runs every proof.
+
 `tests_guard.py` uses real temporary Git repositories and linked worktrees. It exercises
 cross-branch refusal through terminal, execute_code literals, and nested tool_call;
 same-branch and single-worktree controls; the assignment → cd → stash push → pop shape
