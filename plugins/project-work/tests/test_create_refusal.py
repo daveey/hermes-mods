@@ -413,6 +413,23 @@ def test_retired_generation_create_refused_is_absent_not_ambiguous(env):
     assert row['cards']['implement']['state'] == 'created'
 
 
+def test_retired_generation_refused_retired_reentry_is_absent(env):
+    """A crash after saving refused_retired but before retired=True re-enters as absent, not ambiguous."""
+    service, ctx, ports = env
+    refuse(ports, 'implement', [CODE])
+    row = start(service, ctx, 'work')
+    assert row['cards']['implement']['state'] == 'create_refused'
+    row['history'] = [dict(generation=row['generation'], cards=copy.deepcopy(row['cards']))]
+    row['history'][0]['cards']['implement']['state'] = 'refused_retired'
+    service.store.save(row)
+    ports.quiesce_generation = lambda r, old: True
+    service._retire(service.store.get(row['workflow_id']))
+    old = service.store.get(row['workflow_id'])['history'][0]
+    assert old['retired'] is True
+    assert old['cards']['implement']['state'] == 'refused_retired'
+    assert 'id' not in old['cards']['implement']
+
+
 def test_retired_generation_plain_create_intent_stays_ambiguous(env):
     service, ctx, ports = env
     original = ports.create_card

@@ -248,11 +248,13 @@ class Service:
             for stage, entry in old.get('cards', {}).items():
                 if not entry.get('id'):
                     card_id = self.ports.recover_card(row['workflow_id'], stage, entry['params'])
-                    if not card_id and entry.get('state') == 'create_refused':
+                    if not card_id and entry.get('state') in ('create_refused', 'refused_retired'):
                         # The last create was a proven refusal (a retry re-persists
                         # create_intent first), and quiesce revoked the key: absent.
-                        entry['state'] = 'refused_retired'
-                        self.store.save(row)
+                        # refused_retired: re-entry after a crash before retired=True.
+                        if entry['state'] != 'refused_retired':
+                            entry['state'] = 'refused_retired'
+                            self.store.save(row)
                         continue
                     if not card_id:
                         raise WorkflowError('Earlier ambiguous card needs operator recovery')
