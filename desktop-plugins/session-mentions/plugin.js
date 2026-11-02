@@ -1016,7 +1016,7 @@ async function performTaskRequest(req, origin, conns) {
     return { ok: true, commented: true, gateway: gw?.key || target.connectionId, ref }
   }
 
-  return { ok: false, error: `unknown action ${action}` }
+  return { ok: false, error: `unknown action ${action}${stampNote()}` }
 }
 
 // ── typeahead ────────────────────────────────────────────────────────────────
@@ -1217,7 +1217,7 @@ export async function performRequest(req, origin, conns) {
     return { ...res, gateway: gw?.key || target.connectionId, ref: sessionRef(target, origin, conns) }
   }
 
-  return { ok: false, error: `unknown action ${action}` }
+  return { ok: false, error: `unknown action ${action}${stampNote()}` }
 }
 
 // ── run_in_user_terminal relayed from a gateway with no screen ───────────────
@@ -1343,14 +1343,77 @@ export async function forwardSend(target, text, waitSeconds = 0) {
 
 let lastHomeBeat = 0
 
+// ── loaded-version stamp ─────────────────────────────────────────────────────
+// Which plugin.js this Desktop is RUNNING vs. what is on its disk now, as git blob shas (compare with
+// `git rev-parse origin/main:desktop-plugins/session-mentions/plugin.js`). Sent on every drain and
+// kept in the gateway's couriers/<device>.json, so `relay_files.py couriers` shows a stale renderer
+// (loaded != disk: the Desktop missed a reload) or a Mac whose checkout is behind (disk != main).
+// 2026-11-02: the MacBook answered `unknown action authority_read` for 35 min after a git pull had
+// landed the action, and nothing showed it was running old code.
+// `loaded` is read from disk right after this module registers: a write landing in that instant
+// stamps the new sha early, but the same write then reloads the module anyway.
+const STAMP_DISK_RECHECK_MS = 60_000
+let pluginStamp = { loaded: '', disk: '', loadedAt: 0, diskAt: 0 }
+let ownFile = ''
+
+/** git's blob id for `text` (sha1 of "blob <bytes>\0<bytes>"), or '' without WebCrypto. */
+export async function gitBlobSha(text) {
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) return ''
+  const body = new TextEncoder().encode(String(text))
+  const head = new TextEncoder().encode(`blob ${body.length}\0`)
+  const buf = new Uint8Array(head.length + body.length)
+  buf.set(head)
+  buf.set(body, head.length)
+  return [...new Uint8Array(await subtle.digest('SHA-1', buf))].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** Blob sha of this plugin's plugin.js as it is on disk now ('' when the shell can't say). */
+async function diskSourceSha() {
+  const desktop = globalThis.window?.hermesDesktop
+  if (!desktop) return ''
+  if (!ownFile) {
+    const root = typeof desktop.desktopPluginsRoot === 'function' ? await desktop.desktopPluginsRoot() : ''
+    if (!root) return ''
+    ownFile = `${String(root).replace(/[\\/]+$/, '')}/${PLUGIN_ID}/plugin.js`
+  }
+  const read = typeof desktop.readPluginSource === 'function' ? await desktop.readPluginSource(ownFile) : await desktop.readFileText?.(ownFile)
+  if (!read || typeof read.text !== 'string' || read.truncated) return ''
+  return gitBlobSha(read.text)
+}
+
+/** Stamp the loaded sha (at register) or refresh the disk sha (at most once a minute). */
+export async function refreshPluginStamp({ loaded = false } = {}) {
+  if (!loaded && Date.now() - pluginStamp.diskAt < STAMP_DISK_RECHECK_MS) return pluginStamp
+  const stamp = pluginStamp
+  const sha = await diskSourceSha().catch(() => '')
+  if (loaded) {
+    stamp.loaded = sha
+    stamp.loadedAt = Date.now()
+  }
+  stamp.disk = sha || stamp.disk
+  stamp.diskAt = Date.now()
+  return stamp
+}
+
+export const pluginStampOf = () => ({ ...pluginStamp })
+
+/** ` (plugin.js loaded <sha8>, on disk <sha8>)` for refusals, so a stale Desktop says so. */
+const stampNote = () =>
+  pluginStamp.loaded ? ` (session-mentions plugin.js loaded ${pluginStamp.loaded.slice(0, 8)}, on disk ${(pluginStamp.disk || '?').slice(0, 8)})` : ''
+
 /** Drain query: home flag, plus (once this Mac's device name is known) who is draining and every
- *  gateway name it can reach, so the gateway hands it only requests it can serve. */
+ *  gateway name it can reach, so the gateway hands it only requests it can serve, and which
+ *  plugin.js this Desktop runs (see the stamp above). */
 export function outboxPath(conn, conns) {
   const q = []
   if (isHome(conn)) q.push('home=1')
   const me = conns.find(isHome)
   if (me?.device) {
     q.push(`courier=${enc(me.device)}`, `aliases=${enc(me.aliases.join(','))}`, `reach=${enc(reachNames(conns).join(','))}`)
+    if (pluginStamp.loaded) {
+      q.push(`plugin=${enc(pluginStamp.loaded)}`, `plugin_disk=${enc(pluginStamp.disk)}`, `plugin_at=${Math.round(pluginStamp.loadedAt / 1000)}`)
+    }
   }
   return `/outbox${q.length ? `?${q.join('&')}` : ''}`
 }
@@ -1359,6 +1422,7 @@ export function outboxPath(conn, conns) {
 const isHome = conn => conn?.kind === 'local'
 
 export async function courierTick() {
+  void refreshPluginStamp()
   const conns = await connections()
   {
     const home = conns.find(isHome)
@@ -1443,6 +1507,8 @@ export default {
     lastHomeBeat = 0
     connCache = { at: 0, rows: [] }
     deviceCache = { at: 0, info: null }
+    // Once per module: a disable/enable re-registers the SAME code, so the disk read then is not it.
+    if (!pluginStamp.loadedAt) void refreshPluginStamp({ loaded: true })
     loadWarm()
     refreshStale()
     refreshStaleTasks()

@@ -59,8 +59,11 @@ async def outbox(request: Request) -> Dict[str, Any]:
     rf = _rf()
     if "courier" not in q:  # legacy courier
         return {"requests": rf.claim_pending(home=home)}
+    extra = {}
+    if hasattr(rf, "plugin_stamp"):  # relay_files reloads on mtime; these routes are mounted once
+        extra["plugin"] = rf.plugin_stamp(q.get("plugin"), q.get("plugin_disk"), q.get("plugin_at"))
     return {"requests": rf.claim_pending(home=home, courier=q.get("courier"), reach=q.get("reach") or "",
-                                         aliases=q.get("aliases") or "")}
+                                         aliases=q.get("aliases") or "", **extra)}
 
 
 @router.post("/result")

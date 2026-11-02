@@ -139,15 +139,33 @@ def home_courier_alive(base: Path | None = None) -> bool:
         return False
 
 
-def register_courier(base: Path, courier: Any, aliases: Any = (), reach: Any = (), home: bool = False) -> str:
-    """Record a draining Desktop courier (its device name + aliases). Returns the device name."""
+def plugin_stamp(loaded: Any = "", disk: Any = "", loaded_at: Any = None) -> dict | None:
+    """The courier's plugin.js stamp (git blob shas, see the Desktop plugin), or None when absent/bad."""
+    def sha(raw: Any) -> str:
+        s = str(raw or "").strip().lower()
+        return s if re.fullmatch(r"[0-9a-f]{40}", s) else ""
+    if not sha(loaded):
+        return None
+    try:
+        at = float(loaded_at) if loaded_at not in (None, "") else None
+    except (TypeError, ValueError):
+        at = None
+    return {"loaded": sha(loaded), "disk": sha(disk), "loaded_at": at}
+
+
+def register_courier(base: Path, courier: Any, aliases: Any = (), reach: Any = (), home: bool = False,
+                     plugin: dict | None = None) -> str:
+    """Record a draining Desktop courier (its device name + aliases, and which plugin.js it runs).
+    Returns the device name."""
     device = norm_name(courier)
     if not device or not safe_id(device):
         return ""
     (base / "couriers").mkdir(exist_ok=True)
-    atomic_write(base / "couriers" / f"{device}.json", {
-        "device": device, "aliases": sorted(set(names(aliases)) | {device}), "reach": names(reach),
-        "home": bool(home), "at": time.time()})
+    record = {"device": device, "aliases": sorted(set(names(aliases)) | {device}), "reach": names(reach),
+              "home": bool(home), "at": time.time()}
+    if plugin:
+        record["plugin"] = plugin
+    atomic_write(base / "couriers" / f"{device}.json", record)
     return device
 
 
@@ -179,11 +197,11 @@ def may_claim(req: dict, *, home: bool, courier: str = "", reach: list[str] | No
 
 
 def claim_pending(base: Path | None = None, home: bool = True, courier: Any = "", reach: Any = None,
-                  aliases: Any = ()) -> list[dict]:
+                  aliases: Any = (), plugin: dict | None = None) -> list[dict]:
     """Claim every pending request this courier may serve (see ``may_claim``). A non-home drainer
     (another Mac's Desktop) gets nothing while this gateway's own Desktop courier is alive."""
     base = base or root()
-    device = register_courier(base, courier, aliases, reach or (), home) if courier else ""
+    device = register_courier(base, courier, aliases, reach or (), home, plugin) if courier else ""
     home_alive = (not home) and home_courier_alive(base)
     if home_alive and not device:
         sweep(base)
@@ -225,6 +243,13 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
         if now - float(req.get("created_at") or now) > float(req.get("ttl") or 600):
             write_result(req.get("id"), {"ok": False, "error": "request expired before the Desktop picked it up"}, base)
             continue
+        if device:
+            # Which Desktop took it, running which plugin.js: the trail for "who answered that?".
+            stamp = {"claimed_by": device, "claimed_at": now, **({"claimed_plugin": plugin["loaded"]} if plugin else {})}
+            try:
+                atomic_write(target, {**req, **stamp})
+            except OSError:
+                pass
         out.append(req)
     sweep(base)
     return out
@@ -571,3 +596,76 @@ def sweep(base: Path) -> None:
                     path.unlink()
             except OSError:
                 pass
+
+
+# ── loaded plugin version per Desktop ────────────────────────────────────────
+
+def git_blob_sha(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def checkout_plugin_sha(path: Path | None = None) -> str:
+    """Blob sha of the session-mentions Desktop plugin in THIS gateway's hermes-mods checkout
+    (``<mods>/desktop-plugins/session-mentions/plugin.js`` beside this agent plugin), or ''."""
+    path = path or Path(__file__).resolve().parents[2] / "desktop-plugins" / "session-mentions" / "plugin.js"
+    try:
+        return git_blob_sha(path.read_bytes())
+    except OSError:
+        return ""
+
+
+def courier_versions(base: Path | None = None, expected: str | None = None, now: float | None = None) -> list[dict]:
+    """One row per courier this gateway has seen: which session-mentions plugin.js its Desktop runs.
+
+    status: ``stale`` = the Desktop runs code other than its own disk copy (a missed reload);
+    ``behind`` = its disk copy differs from this gateway's checkout (that Mac has not pulled yet, or
+    this gateway is behind it); ``ok``; ``unknown`` = the Desktop predates the stamp. ``live`` is
+    whether it drained in the last COURIER_FRESH_SECONDS."""
+    base = base or root()
+    expected = checkout_plugin_sha() if expected is None else expected
+    now = time.time() if now is None else now
+    rows = []
+    for path in sorted((base / "couriers").glob("*.json")) if (base / "couriers").is_dir() else ():
+        try:
+            rec = json.loads(path.read_text())
+            age = now - path.stat().st_mtime
+        except Exception:
+            continue
+        plugin = rec.get("plugin") if isinstance(rec.get("plugin"), dict) else {}
+        loaded, disk = plugin.get("loaded") or "", plugin.get("disk") or ""
+        if not loaded:
+            status = "unknown"
+        elif disk and loaded != disk:
+            status = "stale"
+        elif expected and (disk or loaded) != expected:
+            status = "behind"
+        else:
+            status = "ok"
+        rows.append({"device": rec.get("device") or path.stem, "live": age < COURIER_FRESH_SECONDS,
+                     "age_s": round(age), "loaded": loaded, "disk": disk, "checkout": expected,
+                     "loaded_at": plugin.get("loaded_at"), "status": status})
+    return rows
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python3 relay_files.py couriers [--json]``: the loaded plugin version per Desktop.
+    Exit 1 when a live courier is ``stale`` (its Desktop missed a reload)."""
+    import sys
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] != "couriers":
+        print("usage: relay_files.py couriers [--json]", file=sys.stderr)
+        return 2
+    rows = courier_versions()
+    if "--json" in args:
+        print(json.dumps(rows, indent=2))
+    else:
+        print(f"{'device':<14} {'live':<5} {'age':>7}  {'loaded':<8} {'disk':<8} {'checkout':<8} status")
+        for r in rows:
+            print(f"{r['device']:<14} {'yes' if r['live'] else 'no':<5} {r['age_s']:>6}s  {r['loaded'][:8] or '-':<8} "
+                  f"{r['disk'][:8] or '-':<8} {r['checkout'][:8] or '-':<8} {r['status']}")
+    return 1 if any(r["live"] and r["status"] == "stale" for r in rows) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
