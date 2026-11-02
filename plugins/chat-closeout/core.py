@@ -481,6 +481,7 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
             state.pop(k)  # found again: a later absence starts its own clock
         elif cards.get(k) is None and k in state and "removed" not in state[k]:
             state[k]["mono"] = None  # unresolved this pass (uncertain): not observation, the next one starts anew
+            state[k]["clocks"] = {}
     is_healthy: Optional[bool] = None
     removed: set[str] = set()
     for k in sorted(missing):
@@ -490,14 +491,23 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
         if not is_healthy:
             if e is not None and "removed" not in e:
                 e["mono"] = None  # the outage is excluded: the next healthy observation starts a new interval
+                e["clocks"] = {}
             continue
         if e is None or "removed" in e:
             state[k] = {"since": now, "observed": 0.0, "at": now, "mono": mono, "pid": pid}
             continue
-        if e.get("pid") == pid and e.get("mono") is not None and e.get("at") is not None:
-            step = min(now - float(e["at"]), mono - float(e["mono"]))
+        # Several backends share the ledger. Remember each observer's last clock,
+        # but count only since the last shared observation (never double-count).
+        clocks = dict(e.get("clocks") or {})
+        own = clocks.get(str(pid))
+        if own is None and e.get("pid") == pid and e.get("mono") is not None:
+            own = {"at": e["at"], "mono": e["mono"]}
+        if own is not None and e.get("at") is not None:
+            step = min(now - float(e["at"]), mono - float(own["mono"]), now - float(own["at"]))
             if 0 < step <= UNLINK_MAX_GAP_S:
                 e["observed"] = float(e.get("observed") or 0) + step
+        clocks[str(pid)] = {"at": now, "mono": mono}
+        e["clocks"] = dict(sorted(clocks.items(), key=lambda item: item[1]["at"])[-8:])
         e.update(at=now, mono=mono, pid=pid)
         if float(e.get("observed") or 0) >= UNLINK_AFTER_S:
             state[k] = {"removed": now, "since": e.get("since")}
@@ -519,7 +529,6 @@ def unlinked_removed(row: dict[str, Any]) -> list[str]:
     return sorted(k for k, v in (row.get("unlinked") or {}).items() if isinstance(v, dict) and "removed" in v)
 
 
-UNLINK_MAX_TRIES = 3      # close-out turns that failed to deliver an unlinked mention before it is dropped
 UNLINK_RETRY_S = 600.0    # backoff before a failed close-out turn's unlinked mention is woken again
 
 
@@ -536,9 +545,9 @@ def briefed(unlinked: Optional[dict], now: float) -> dict:
 
 def settle_unlinked(row: dict[str, Any], succeeded: bool, now: float) -> tuple[dict, bool]:
     """At a close-out turn's end: ``(unlinked, retry)``. A successful turn forgets the removed entries its brief
-    named; a failed one keeps them (one try spent; dropped with a WARNING after ``UNLINK_MAX_TRIES``) and asks for
+    named; a failed one keeps them with an attempt count and asks for
     another close-out (``retry``)."""
-    out, retry, dropped = {}, False, []
+    out, retry = {}, False
     for k, v in (row.get("unlinked") or {}).items():
         if not (isinstance(v, dict) and "removed" in v and "briefed" in v):
             out[k] = v
@@ -546,14 +555,8 @@ def settle_unlinked(row: dict[str, Any], succeeded: bool, now: float) -> tuple[d
         if succeeded:
             continue
         tries = int(v.get("tries") or 0) + 1
-        if tries >= UNLINK_MAX_TRIES:
-            dropped.append(k)
-            continue
         out[k] = {**{f: x for f, x in v.items() if f != "briefed"}, "tries": tries}
         retry = True
-    if dropped:
-        logger.warning("chat-closeout: %s: %d close-out turn(s) failed to name unlinked %s; dropped",
-                       row.get("session_id"), UNLINK_MAX_TRIES, ", ".join(sorted(dropped)))
     return out, retry
 
 
@@ -623,11 +626,20 @@ def upgrade_shepherd_rows(ledger: "Ledger", read: Callable[[list[str]], dict], n
                 fin.add(b)
         if not fin:
             continue
-        rest = batch - fin
-        ledger.write(sid, batch=rest, covered=set(row.get("covered") or []) - fin,
+        # Removing the old shepherd obstacle must not expose an already-settled
+        # local/origin tail as a new wake. Only this upgrade-affected snapshot is
+        # covered, never a later completion or an unresolved origin association.
+        all_cards = canonical_view(read(sorted(batch)))
+        old_settled = {b for b in live.values() if is_settled(all_cards.get(b))
+                       and ((all_cards[b].get('completed_at') is None)
+                            or float(all_cards[b]['completed_at']) <= cutoff)}
+        cover = old_settled if batch <= old_settled else fin
+        retired = {b for b in cover if all_cards.get(b, {}).get('status') in DONE_STATUSES}
+        rest = batch - retired
+        ledger.write(sid, batch=rest, covered=(set(row.get("covered") or []) | cover) - retired,
                      relayed={p for p in row.get("relayed") or [] if _premise_card(p) in rest})
-        logger.info("chat-closeout: upgrade covered %d shepherd-finished card(s) of %s without a wake: %s",
-                    len(fin), sid, ", ".join(sorted(fin)))
+        logger.info("chat-closeout: upgrade covered %d old settled card(s) of %s without a wake: %s",
+                    len(cover), sid, ", ".join(sorted(cover)))
     return ledger.upgrade_resolve(resolved, now)
 
 

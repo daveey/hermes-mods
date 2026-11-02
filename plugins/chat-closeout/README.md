@@ -39,13 +39,15 @@ ago. The first pass after the upgrade (run first by every path that can wake or 
 `post_llm_call`, the sidebar source and the watchdog) removes those finished entries silently, as a close-out would,
 logging one INFO line per changed row with its card ids and waking nothing. The first pass records a durable cutoff
 (`meta upgrade:shepherd-settle-v1:cutoff`) and a snapshot of every batch entry then in the ledger (`...:pending`).
-Only a snapshot entry is ever covered this way, and only when its first fresh observation shows a finished shepherd
+Only a snapshot entry is ever covered this way, initially when its first fresh observation shows a finished shepherd
 row whose completion time is unknown or not after the cutoff. That first observation resolves the entry either way:
 a card seen working at deploy, a finish after the cutoff, a local card, or an entry absent from a readable inventory
 takes the normal path for good, and entries added after the cutoff are never touched, so they close out normally
 even while an old stale row keeps the upgrade incomplete. The done marker (`meta upgrade:shepherd-settle-v1`) is set
 once every snapshot entry was observed or left its batch (`tests/test_upgrade_shepherd.py`,
-`tests/test_contract_edges.py`).
+`tests/test_contract_edges.py`). When retiring shepherd entries would expose an entirely old, already-settled
+local/origin tail, that snapshot tail is covered silently too; otherwise it would cause the same upgrade wake burst.
+Post-cutoff completions and unresolved origin rows are never covered this way (`tests/test_upgrade_mixed.py`).
 
 Legacy duplicate keys are reconciled only against a found sibling in the same batch: an absent bare `id`
 is dropped when a found key ends in `/id`, and absent `gateway/profile/id` is dropped when a found
@@ -60,14 +62,16 @@ keep it) leaves the batch after 24 h of observation while the
 inventory is fresh and readable: the projection was read, no replica row is stale, and the hub replica synced within
 core's `HUB_STALE_AFTER_S`. Unreadable or stale periods are excluded but do not reset what was already observed;
 each observation counts only as far as this process's monotonic clock confirms the wall clock, and nothing across a
-gap over 5 min or a process change. A pass that cannot resolve the entry (uncertain: unreadable inventory, failed
+gap over 5 min or an observer's first pass. Each backend retains its own clock anchor while sharing the last
+observation time, so alternating backends make progress without double-counting (`tests/test_upgrade_mixed.py`).
+A pass that cannot resolve the entry (uncertain: unreadable inventory, failed
 board read) is not observation either: it ends the interval, so even an outage shorter than 5 min never counts. The ledger's `unlinked` column keeps the first missing time and observed seconds
 per entry. The next close-out names each unlinked entry once ("no longer linked to this chat"). An unlinked entry is part
 of the close-out key, so a batch that unlinking empties (or leaves holding only covered human asks) still gets that
 one close-out; a batch with cards still working waits for its own. The mention is forgotten only at the end of a
 close-out turn whose last assistant message is a successful final reply (text, no tool calls, `finish_reason`
 stop/end_turn, the transcript ack rule); a failed wake, or a briefed turn that failed, keeps it, and a failed turn
-retries after a shared 600 s backoff, at most 3 times before the mention is dropped with a WARNING. A found entry
+retries after a shared 600 s backoff subject to the existing hourly wake cap; failure never acknowledges delivery. A found entry
 forgets its missing time (`tests/test_unlink.py`, `tests/test_contract_edges.py`).
 The regression was retained across upgrades because turn-end unions prior batches while readers use canonical
 keys; coverage upkeep lacked alias migration. Tests now seed mixed historical/canonical batches and exercise

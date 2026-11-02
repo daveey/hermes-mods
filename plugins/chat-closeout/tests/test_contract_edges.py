@@ -8,7 +8,7 @@
    snapshot entry was observed (or left its batch).
 3. Unlinked-only batch: an entry unlinked out of a batch that then holds nothing (or only covered cards) still gets
    ONE close-out naming it; it is forgotten only at the end of a successful close-out turn, not at the brief and not
-   after a failed turn, and a failed delivery is retried a bounded number of times.
+   after a failed turn, and failed delivery retries respect the wake rate limit.
 4. Replica completion times follow core's replica record keys (``profile/board/id``, legacy ``board/id``).
 5. An uncertain entry (unreadable inventory) pauses its unlink clock: a short outage never counts.
 6. Watchdog: a row whose only entries are remote done/archived rows that cannot settle (origin without binding,
@@ -273,7 +273,7 @@ def test_brief_in_a_failed_user_turn_is_not_acknowledgement(lone):
     assert len(calls) == 1 and 'default/t_gone: no longer linked' in calls[0]
 
 
-def test_failed_deliveries_are_bounded(lone):
+def test_failed_deliveries_keep_the_undelivered_mention(lone):
     led, t, clock = lone
     woken = 0
     for n in range(12):
@@ -281,8 +281,9 @@ def test_failed_deliveries_are_bounded(lone):
         woken += len(calls)
         if calls:
             turn_end(clock, t + n * H + 10, FAILED_TURN)
-    assert woken == core.UNLINK_MAX_TRIES
-    assert core.unlinked_removed(led.get('chat')) == [] and not led.pending()
+    assert woken == 12
+    assert core.unlinked_removed(led.get('chat')) == ['default/t_gone']
+    assert led.pending()
 
 
 # ---- 4. replica completion times: core's record keys ---------------------------------------------------------------
