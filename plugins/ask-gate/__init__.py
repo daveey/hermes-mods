@@ -239,8 +239,59 @@ def _user_msgs(session_id: str) -> list[str]:
         return []
 
 
+_STOP = frozenset("that this with from have what when will your they them then than there their about would "
+                  "should could which only into just also make made like does done want need".split())
+
+
+def _words(s: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]{4,}", (s or "").lower()) if w not in _STOP}
+
+
+def _session_user_msgs(session_id: str, query: str, keep: int = 30, recent: int = 8) -> list[str]:
+    """David's typed messages from the WHOLE session, cut to the judge's window by relevance to ``query``.
+
+    An approval ask often repeats an order given days and hundreds of turns earlier (agent-ebedadaefd: the
+    10-25 order sat far outside the last 30 rows). Runtime notices are dropped; the most relevant messages
+    plus the newest ``recent`` ones are returned in chronological order. Falls back to ``_user_msgs``."""
+    try:
+        c = core._ro_connect(core.home() / 'state.db', timeout=2)
+        try:
+            cols = {r[1] for r in c.execute("pragma table_info(messages)")}
+            where = "session_id=? and role='user'"
+            if {"active", "compacted"} <= cols:
+                where += " and (active=1 or compacted=1)"
+            kind = "display_kind" if "display_kind" in cols else "null"
+            uid = "message_uid" if "message_uid" in cols else "id"
+            rows = c.execute(f"select content, {kind}, {uid} from messages where {where} order by id",
+                             (session_id,)).fetchall()
+        finally:
+            c.close()
+    except Exception:
+        rows = []
+    seen, msgs = set(), []
+    for content, kind, mid in rows:
+        if not isinstance(content, str) or (kind or "") not in ("", "steer") or mid in seen:
+            continue
+        seen.add(mid)
+        text = _human_text(content)
+        if text:
+            msgs.append(text)
+    for m in LOG.users(session_id):  # this turn's message may not be persisted yet
+        if m and m not in msgs:
+            msgs.append(m)
+    if not msgs:
+        return _user_msgs(session_id)
+    if len(msgs) <= keep:
+        return msgs
+    q = _words(query)
+    tail = set(range(len(msgs) - recent, len(msgs)))
+    scored = sorted(((len(q & _words(m)), i) for i, m in enumerate(msgs) if i not in tail), reverse=True)
+    picked = {i for s, i in scored[:keep - recent] if s > 0} | tail
+    return [msgs[i] for i in sorted(picked)]
+
+
 def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = "", *, structured: bool = False,
-              llm=None) -> list[dict]:
+              llm=None, users: list[str] | None = None) -> list[dict]:
     ids = core.card_ids(" ".join(asks) + " " + reply)
     statuses = core.card_status(ids)
     led = ledger().relevant(session_id, limit=20)
@@ -259,7 +310,8 @@ def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = 
         # An explicit request is judged on the result its evidence cites, not on the 360-char excerpt of it.
         cited = core.render_evidence(" ".join(pending), tools)
         tools_text += ("\n\n" + cited) if cited else ""
-    verdicts = judge_mod.judge(pending, tools_text=tools_text, user_msgs=_user_msgs(session_id),
+    verdicts = judge_mod.judge(pending, tools_text=tools_text,
+                              user_msgs=users if users is not None else _user_msgs(session_id),
                               card_status=statuses, ledger_text=ledger_text, caps=caps,
                               reply=reply, llm=judge_mod.structured_llm(base, grounding) if structured else base,
                               ledger=[a for a in led if not a.get('retired')],
@@ -872,6 +924,8 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             return delivery
         if tool_name == "kanban_complete" and _is_worker():
             return _worker_complete(session_id, args)
+        if tool_name == "action_request":
+            return _action_request_gate(session_id, args)
         if tool_name not in ("kanban_create", "kanban_block"):
             return None
         if args.get("human_request") is not None:
@@ -910,6 +964,68 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
     except Exception as e:
         core.log_event("l3_error", error=repr(e))
         return None
+
+
+# action_request (user-steps) publishes an approval/choice card directly, so it is an explicit ask like a blocked
+# card. Held at most twice per (session, title): the third identical publish passes, so a wrong verdict on a real
+# new decision costs two nudges, never a silent wait.
+_AR_HELD: dict[tuple[str, str], int] = {}
+_AR_MAX_HOLDS = 2
+_AR_BLOCKING = ("already_answered", "agent_can_do")
+
+
+def _action_request_gate(session_id: str, args: dict) -> dict | None:
+    """Judge an action_request approval/choice against David's words from the whole chat (agent-ebedadaefd).
+    Withdrawals, other kinds and an unreachable judge pass; only already_answered/agent_can_do block."""
+    req = args.get("request")
+    if not session_id or not isinstance(req, dict) or "withdraw" in args:
+        return None
+    if str(req.get("kind") or "") not in ("approval", "choice"):
+        return None
+    title = str(req.get("title") or "").strip()
+    scope = req.get("scope")
+    scope = scope if isinstance(scope, dict) else {}
+    plan = str(scope.get("markdown") or "").strip()
+    if not title and not plan:
+        return None
+    ask = (title + (": " + plan[:600] if plan else "")).strip()
+    key = (session_id, core.text_hash(title or plan))
+    if _AR_HELD.get(key, 0) >= _AR_MAX_HOLDS:
+        core.log_event("action_request_released", session=session_id, title=title[:160], holds=_AR_HELD[key])
+        return None
+    users = _session_user_msgs(session_id, ask)
+    tools = _tools_now(session_id)
+    verdicts, errors = None, []
+    for name, llm in [("configured", None)] + list(FALLBACKS()):
+        try:
+            verdicts = run_judge(session_id, [ask], tools, ask, llm=llm, users=users)
+            break
+        except judge_mod.JudgeUnavailable as e:
+            errors.append((name, str(e)))
+    if verdicts is None:
+        core.log_event("action_request_judge_unavailable", session=session_id, title=title[:160], errors=errors)
+        return None
+    hits = [v for v in verdicts if v.get("verdict") in _AR_BLOCKING]
+    if not hits:
+        core.log_event("action_request_judged", session=session_id, title=title[:160],
+                       verdicts=[(v["verdict"], v.get("reason", "")) for v in verdicts])
+        return None
+    _AR_HELD[key] = _AR_HELD.get(key, 0) + 1
+    q = _words(ask)
+    quote = max(users, key=lambda m: len(q & _words(m)), default="") if users else ""
+    core.log_event("action_request_held", session=session_id, title=title[:160], hold=_AR_HELD[key],
+                   verdicts=[(v["verdict"], v.get("reason", "")) for v in hits])
+    lines = [f"ask-gate: action_request \"{title[:160]}\" not published (David has NOT seen it)."]
+    for v in hits:
+        lines.append(f"- {v['verdict']}: {judge_mod._ADVICE.get(v['verdict'], '')}. {v.get('reason', '')}"
+                     + (f" Do this: {v['how']}." if v.get("how") else ""))
+    if quote and q & _words(quote):
+        lines.append(f"David's own words in this chat: \"{quote[:300]}\"")
+    lines.append("If David already asked for this change in this chat, or you can do it yourself, do the work now "
+                 "within the limits he set; do not publish an approval for it. Publish again only if the request is "
+                 "a genuinely new decision (new spend, scope or risk he has not covered), and say in the scope what "
+                 "is new.")
+    return {"action": "block", "message": "\n".join(lines)}
 
 
 def _chat_delivery_gate(session_id: str, tool_name: str, args: dict) -> dict | None:

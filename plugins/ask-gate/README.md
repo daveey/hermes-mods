@@ -62,6 +62,8 @@ starts with it. "Nothing … from your side/end" is status, not a leftover. Why:
 David "Please run this from your side:" above an `ssh … hermes kanban unblock` loop, and no shape matched.
 Tests: `tests/test_ask_gate.py` (`week_1026`, `shell_command_handback`, `final_send_leftover_keeps_its_header`).
 
+**action_request approvals (L3).** user-steps `action_request` publishes an approval/choice card directly, so `pre_tool_call` judges each `kind: approval|choice` publish (never a `withdraw`) on its title + scope against the user's typed messages from the WHOLE session (runtime notices dropped; the most relevant ones plus the newest 8, cut to the judge's 30-message window). `already_answered` or `agent_can_do` blocks with the user's quoted words and tells the agent to do the work; any other verdict, or no reachable judge, lets it publish. Held at most twice per (session, title). Log events: `action_request_held|judged|released|judge_unavailable`. Tests: `tests/test_action_request_gate.py`.
+
 **Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
 worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a
 delivery verb (send, type, ask, tell, relay, resume…) aimed at an `@session:` ref, a `session <id>` or "the <name>
