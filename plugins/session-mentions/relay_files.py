@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,53 @@ HOME_FRESH_SECONDS = 20.0  # the home Desktop beats every ~5s (from a worker, so
 ACTIONS = ("list", "read", "send")
 LOCAL_ALIASES = ("this-device", "local")
 COURIER_FRESH_SECONDS = 20.0  # couriers drain every ~3s
+
+# Idle-drain caches (per process; a hot reload of this file starts them empty). Every courier drains
+# every ~3s, so on an idle gateway the drain must not re-list empty dirs, re-read courier records or
+# re-sweep unchanged dirs. A directory's identity is (dev, ino, mtime_ns, ctime_ns): adding, removing or
+# renaming an entry changes mtime and ctime. A key is trusted only when the dir was already older than
+# DIR_SETTLE_SECONDS when listed (a coarse timestamp, e.g. 1-2s on HFS+/FAT, could otherwise hide a
+# same-tick change) and only for a bounded time (filesystems that do not update dir times at all).
+DIR_SETTLE_SECONDS = 2.0
+OUTBOX_RECHECK_SECONDS = 30.0  # longest an unchanged, cached-empty outbox goes unlisted
+SWEEP_RECHECK_SECONDS = 60.0   # longest a sweep skip lasts (in-place backdating does not touch the dir)
+COURIER_REWRITE_SECONDS = 60.0  # an unchanged courier record's `at` is rewritten at least this often
+_CACHE_LOCK = threading.Lock()
+_EMPTY_DIRS: dict = {}      # dir -> (key, listed_at): the dir held no *.json when listed
+_SWEEP_STATE: dict = {}     # dir -> (key, earliest expiry deadline of its files, swept_at)
+_COURIER_WRITES: dict = {}  # record path -> (record without `at`, at, file identity after our write)
+
+
+def _dir_key(path: Path) -> tuple | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _settled(key: tuple | None, at: float) -> bool:
+    return key is not None and at - max(key[2], key[3]) / 1e9 >= DIR_SETTLE_SECONDS
+
+
+def _list_json(path: Path) -> list[Path]:
+    """``path.glob('*.json')``, skipping the listing while ``path`` is a settled dir already seen empty."""
+    at = time.time()
+    key = _dir_key(path)  # taken BEFORE listing: an entry added after it changes the next key
+    if key is None:
+        return []
+    name = str(path)
+    with _CACHE_LOCK:
+        seen = _EMPTY_DIRS.get(name)
+    if seen is not None and seen[0] == key and 0 <= at - seen[1] < OUTBOX_RECHECK_SECONDS:
+        return []
+    found = list(path.glob("*.json"))
+    with _CACHE_LOCK:
+        if not found and _settled(key, at):
+            _EMPTY_DIRS[name] = (key, at)
+        else:
+            _EMPTY_DIRS.pop(name, None)
+    return found
 
 
 def norm_name(raw: Any) -> str:
@@ -160,13 +208,48 @@ def register_courier(base: Path, courier: Any, aliases: Any = (), reach: Any = (
     device = norm_name(courier)
     if not device or not safe_id(device):
         return ""
-    (base / "couriers").mkdir(exist_ok=True)
     record = {"device": device, "aliases": sorted(set(names(aliases)) | {device}), "reach": names(reach),
               "home": bool(home), "at": time.time()}
     if plugin:
         record["plugin"] = plugin
-    atomic_write(base / "couriers" / f"{device}.json", record)
+    path = base / "couriers" / f"{device}.json"
+    stable = {k: v for k, v in record.items() if k != "at"}
+    name = str(path)
+    with _CACHE_LOCK:
+        prev = _COURIER_WRITES.get(name)
+    if prev is not None and prev[0] == stable and 0 <= record["at"] - prev[1] < COURIER_REWRITE_SECONDS:
+        # Same record as our last write and the file is still that write: liveness is the file's mtime
+        # (live_couriers, courier_versions), so touch it instead of a temp file + rename every ~3s.
+        try:
+            if _file_id(path) == prev[2]:
+                os.utime(path)
+                after = _file_id(path)
+                with _CACHE_LOCK:
+                    if after[:3] == prev[2][:3]:  # still our write (no replace raced the touch)
+                        _COURIER_WRITES[name] = (prev[0], prev[1], after)
+                    else:
+                        _COURIER_WRITES.pop(name, None)  # next drain rewrites our record
+                return device
+        except OSError:
+            pass
+    (base / "couriers").mkdir(exist_ok=True)
+    atomic_write(path, record)
+    try:
+        ident = _file_id(path)
+    except OSError:
+        ident = None
+    with _CACHE_LOCK:
+        if ident is None:
+            _COURIER_WRITES.pop(name, None)
+        else:
+            _COURIER_WRITES[name] = (stable, record["at"], ident)
     return device
+
+
+def _file_id(path: Path) -> tuple:
+    """Identity of one write of a file: a replace by any other writer changes ino/size/mtime/ctime."""
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def live_couriers(base: Path | None = None) -> list[dict]:
@@ -207,6 +290,10 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
         sweep(base)
         return []
     reach_list = None if reach is None else sorted(set(names(reach)) | set(names(aliases)) | ({device} - {""}))
+    pending = _list_json(base / "outbox")
+    if not pending:  # idle: nothing to route, so no courier records to read
+        sweep(base)
+        return []
     couriers = live_couriers(base)
     # While this gateway's own Desktop courier is alive, another Mac's Desktop may still claim a request
     # that ONLY it can serve: addressed to that Mac itself, or to a gateway the home courier cannot reach.
@@ -219,7 +306,7 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
         home_names.discard("")
     out = []
     now = time.time()
-    for path in sorted((base / "outbox").glob("*.json"), key=lambda p: p.stat().st_mtime):
+    for path in sorted(pending, key=lambda p: p.stat().st_mtime):
         try:
             peek = json.loads(path.read_text())
         except Exception:
@@ -588,14 +675,42 @@ def cancel(req_id: Any, base: Path | None = None) -> bool:
 
 
 def sweep(base: Path) -> None:
-    cutoff = time.time() - STALE_SECONDS
+    """Delete protocol files older than STALE_SECONDS.
+
+    A dir is skipped while its identity is unchanged (no entry added, removed or renamed in), it was
+    settled when last swept, ``now`` is before the earliest expiry deadline of the files that sweep kept,
+    and for at most SWEEP_RECHECK_SECONDS. Aging and in-place edits do not change the directory: the
+    deadline ends the skip exactly when the oldest kept file expires, and the bounded recheck catches a
+    file backdated in place. Moving an old file in changes the directory and forces a full pass."""
+    now = time.time()
+    cutoff = now - STALE_SECONDS
     for sub in ("claimed", "results", "outbox", "couriers"):
-        for path in (base / sub).glob("*.json") if (base / sub).is_dir() else ():
+        d = base / sub
+        key = _dir_key(d)  # BEFORE listing, as in _list_json
+        if key is None:
+            continue
+        name = str(d)
+        with _CACHE_LOCK:
+            state = _SWEEP_STATE.get(name)
+        if state is not None and state[0] == key and now < state[1] and 0 <= now - state[2] < SWEEP_RECHECK_SECONDS:
+            continue
+        deadline, complete = float("inf"), True
+        for path in d.glob("*.json"):
             try:
-                if path.stat().st_mtime < cutoff:
+                mtime = path.stat().st_mtime
+                if mtime < cutoff:
                     path.unlink()
+                else:
+                    deadline = min(deadline, mtime + STALE_SECONDS)
+            except FileNotFoundError:
+                pass  # claimed, popped or swept by someone else: no longer ours to age
             except OSError:
-                pass
+                complete = False  # unknown age: never skip on a partial view
+        with _CACHE_LOCK:
+            if complete and _settled(key, now):
+                _SWEEP_STATE[name] = (key, deadline, now)
+            else:
+                _SWEEP_STATE.pop(name, None)
 
 
 # ── loaded plugin version per Desktop ────────────────────────────────────────
