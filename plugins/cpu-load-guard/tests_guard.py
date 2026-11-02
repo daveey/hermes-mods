@@ -85,6 +85,56 @@ def test_argument_prefixes_in_both_regexes(prefix):
     assert plugin.guard.BG_BURNER_RE.search(cmd) is None
 
 
+# Cross-product safety contract: narrowing a matcher must preserve refusals,
+# not merely fix the motivating false positive. These strings are never executed.
+CORPUS_WRAPPERS = [
+    "", "nohup", "exec", "time", "setsid", "nice", "nice -n 5", "nice -10",
+    "nice --adjustment=5", "timeout 5", "timeout -s KILL 5",
+    "timeout --signal TERM 5", "timeout -k 2 5", "timeout --kill-after 2 5",
+    "timeout --foreground 5", "env FOO=1", "env -i", "env -u X",
+    "sudo -n", "sudo -u root", "stdbuf -o0", "caffeinate -i", "command",
+    "LC_ALL=C", "LC_ALL=C FOO=1", "command nice -10 timeout -s KILL 5",
+]
+CORPUS_PAYLOADS = [
+    "yes >/dev/null", "/usr/bin/yes >/dev/null", "/bin/yes >/dev/null",
+    "openssl speed", "dd if=/dev/zero of=/dev/null", "cat /dev/zero >/dev/null",
+    "sha256sum /dev/zero", "sysbench cpu run",
+]
+CORPUS_POSITIONS = [
+    "{cmd} &", "if true; then {cmd} & fi", "( {cmd} & )",
+    "{{ {cmd}; }}", "true && {cmd} &", "printf x | {cmd} &",
+    "true\n{cmd} &", "! {cmd} &", "if false; then :; elif {cmd}; then :; fi",
+]
+REGRESSION_FORMS = [
+    "{ yes >/dev/null & }", "! yes >/dev/null", "command yes >/dev/null",
+    "LC_ALL=C yes >/dev/null", "nice -10 yes >/dev/null",
+    "timeout -s KILL 5 yes >/dev/null", "/usr/bin/yes >/dev/null", "openssl speed",
+]
+
+
+def refusal_corpus():
+    cases = [("existing-" + str(i), cmd) for i, cmd in enumerate(BAD)]
+    cases += [("regression-" + str(i), "for i in $(seq 1 16); do " + form + " & done")
+              for i, form in enumerate(REGRESSION_FORMS)]
+    for payload in CORPUS_PAYLOADS:
+        for wrapper in CORPUS_WRAPPERS:
+            cmd = (wrapper + " " + payload).strip()
+            for i, position in enumerate(CORPUS_POSITIONS):
+                cases.append((f"{payload}/{wrapper}/position-{i}",
+                              "for i in $(seq 1 16); do " + position.format(cmd=cmd) + "\ndone"))
+    # No wide loop: independently protects literal counting in BG_BURNER_RE.
+    for payload in CORPUS_PAYLOADS[:6]:
+        for wrapper in CORPUS_WRAPPERS:
+            cases.append((f"background/{payload}/{wrapper}",
+                          ((wrapper + " " + payload).strip() + " & ") * 8))
+    return cases
+
+
+@pytest.mark.parametrize("label,cmd", refusal_corpus())
+def test_must_refuse_corpus(label, cmd):
+    assert plugin.guard.check_shell(cmd), label
+
+
 GOOD = [
     "pytest -n 2",
     "pytest -n $(nproc) tests/",
@@ -98,6 +148,22 @@ GOOD = [
     "seq 1 100 | xargs -P 2 echo",
     "for i in $(seq 1 $(nproc)); do echo $i; done",
 ]
+
+
+ALLOW_CORPUS = GOOD + OPTION_POLLS + [
+    "for i in $(seq 1 12); do " + cmd + "; done"
+    for cmd in [
+        "echo yes > /dev/null", "grep -c yes file >/dev/null", "printf 'a:yes,b'",
+        "apt-get --yes check", "yes | cmd", "command yes | cmd",
+        "LC_ALL=C yes | cmd", "timeout -s KILL 5 yes | cmd",
+        "ssh -o BatchMode=yes example.com 'true 2>/dev/null'",
+    ]
+]
+
+
+@pytest.mark.parametrize("cmd", ALLOW_CORPUS)
+def test_must_allow_corpus(cmd):
+    assert plugin.guard.check_shell(cmd) is None
 
 
 @pytest.mark.parametrize("cmd", BAD)

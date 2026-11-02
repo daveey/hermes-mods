@@ -1,5 +1,26 @@
 # cpu-load-guard
 
+## Shell burner regression contract
+
+`tests_guard.py` generates a must-refuse cross-product of burner payloads,
+wrappers and command positions, plus literal background counts and the historical
+refusal cases, with `CPU_LOAD_GUARD_NCPU=16`. It also preserves a must-allow corpus
+for SSH option polling, argument text, small worker counts and `yes | cmd`.
+The corpus is analyzed by `check_shell()` only; burners are never executed.
+
+The command-position prefix recognizes brace groups, negation, `elif`, `command`,
+bare assignments, the supported `nice` increment forms, separate timeout option
+values and absolute burner paths. Both shell and background matchers recognize
+`openssl speed` (the existing worker threshold still applies).
+
+Failure chain: narrowing the prefix to avoid matching `BatchMode=yes` omitted
+valid command positions and wrappers, so those burners no longer matched.
+The previous targeted examples all passed because no cross-product refusal
+contract preserved those forms. The new generated corpus makes that narrowing
+visible alongside the legitimate polling cases rather than trading one for the
+other. Run `python3 scripts/test-all -k cpu-load-guard` from the repository root;
+the direct suite is `tests_guard.py tests_runtime.py tests_worktree.py`.
+
 ## Safe maintenance in linked worktrees
 
 File writes and patches to tracked `plugins/cpu-load-guard/` files in registered

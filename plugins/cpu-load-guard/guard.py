@@ -24,16 +24,19 @@ DEVNULL_SRC = r"/dev/(?:zero|urandom)"
 # Quotes retain scanning of embedded shell bodies (sh -c / terminal strings).
 # Keep separators zero-width: the preceding background match consumes its '&'.
 _BURNER_COMMAND = (
-    r"(?:^|(?<=[;&|(\n`'\"]))\s*"
-    r"(?:(?:do|then|else)\s+)?"
-    r"(?:(?:nohup|exec|time|setsid|nice(?:\s+-n\s*-?\d+)?"
-    r"|timeout(?:\s+--?[\w=-]+)*\s+\d+(?:\.\d+)?[smhd]?"
+    r"(?:^|(?<=[;&|({!\n`'\"]))\s*"
+    r"(?:(?:do|then|else|elif)\s+)?"
+    r"(?:(?:nohup|exec|time|setsid|command|[A-Za-z_]\w*=[^\s;&|]*"
+    r"|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))?"
+    r"|timeout(?:\s+(?:-s|--signal|-k|--kill-after)\s+[^\s;&|]+|\s+--?[\w=-]+)*"
+    r"\s+\d+(?:\.\d+)?[smhd]?"
     r"|sudo(?:\s+-[ugCDhpRrt]\s+[^\s;&|]+|\s+-[-\w=]+)*"
     r"|env(?:\s+(?:-u|--unset|-C|--chdir)\s+[^\s;&|]+|\s+-[-\w=]+)*"
     r"(?:\s+[A-Za-z_]\w*=[^\s;&|]*)*"
     r"|stdbuf(?:\s+-[ioe](?:\s+)?[\w.]+)*"
     r"|caffeinate(?:\s+-\w+)*"
     r"|xargs(?:\s+-(?:P|n|I)\s*[^\s;&|]+|\s+--?[\w=-]+)*)\s+)*"
+    r"(?:/[^\s;&|()'\"`]+/|/)?"
 )
 # Shell burners: any of these, fanned out to ~one per core, saturates the machine.
 SHELL_BURNER_RE = re.compile(
@@ -42,6 +45,7 @@ SHELL_BURNER_RE = re.compile(
     r"|dd\s+if=" + DEVNULL_SRC + r"\s+of=/dev/null"
     r"|cat\s+" + DEVNULL_SRC + r"\s*>\s*/dev/null"
     r"|(?:sha\d*sum|md5sum|gzip|bzip2|xz)\s+(?:-\w+\s+)*" + DEVNULL_SRC +
+    r"|openssl\s+speed\b"
     r"|(?:sysbench|cpuburn|burnP6|burnK7|lookbusy)\b"
     r"|while\s*(?::|true|\[\s*1\s*\])\s*;?\s*do\s*(?::|true)?\s*;?\s*done"
     r")",
@@ -50,6 +54,7 @@ SHELL_BURNER_RE = re.compile(
 # Backgrounded burners, counted literally (no loop needed to reach the threshold).
 BG_BURNER_RE = re.compile(
     _BURNER_COMMAND + r"(?:yes\b[^;&|\n)]*?(?:>\s*/dev/null|&>\s*/dev/null)\s*&(?!&)"
+    r"|openssl\s+speed\b[^;&|\n]*?&(?!&)"
     r"|dd\s+if=" + DEVNULL_SRC + r"\s+of=/dev/null[^;&|\n]*?&(?!&)"
     r"|cat\s+" + DEVNULL_SRC + r"\s*>\s*/dev/null[^;&|\n]*?&(?!&)"
     r"|while\s*(?::|true|\[\s*1\s*\])\s*;?\s*do\s*(?::|true)?\s*;?\s*done\s*&(?!&))",
