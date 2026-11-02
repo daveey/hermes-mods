@@ -46,6 +46,13 @@ the outcome and feeds core the two things only plugins know: open user decisions
   INFO (`session-outcome judge gave up for <sid> after Ns (gate)`). The nudge carries
   `[session-outcome]`. When it is already in the turn (or this gate held earlier in the turn), the reply passes. It
   never asks twice in a turn. A core whose `derive_outcome` lacks those keywords, or any error, passes.
+- **A held answer is never lost to a stub**: the nudge asks for the same full reply again ("the user has not seen
+  it"; core also prefixes `[runtime] Your draft above was NOT shown…`). If the reply after this gate's own hold is
+  under 40% of a held draft of 800+ characters, the gate returns `{"replace": <held draft>}`, logs
+  `session-outcome: restored held draft for <sid> (N -> M chars)` and appends a row to
+  `<home>/logs/held-draft-restores.jsonl` (the coach weekly's "Held-draft restores" KPI). Why: hub
+  20261028_071229_45f849 held a full explanation; the model made the call and sent only "The explanation and
+  recommendations are complete." Another gate's hold (nudge without `[session-outcome]`) is not restored.
 - **Per-turn call record**: a call is recorded as (session, tool call id) and counts only for a gate whose turn
   holds that call id, so it never carries into the next turn.
 - **The gate's turn starts at the last user row that is not its own nudge**, kanban notices included. Core's

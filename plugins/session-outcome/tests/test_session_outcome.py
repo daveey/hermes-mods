@@ -605,6 +605,93 @@ def test_register_wires_tool_gate_provider_and_judge(plugin, fake):
     assert set(fake.providers) == {"user-steps"} and fake.judges == [plugin.judge]
 
 
+# ---- held draft: the reply after this gate's hold must still carry the answer ----------------------------------
+# hub 20261028_071229_45f849 (10-31 18:26 PT): the gate held a full explanation for the missing call; the model made
+# the call, took its held draft as delivered and sent "The explanation and recommendations are complete." The user
+# saw only that line ("where is it? i dont see it").
+
+RUNTIME_PREFIX = ("[runtime] Your draft above was NOT shown to the user. Your next reply replaces it: include its "
+                  "full content; don't refer to it as 'above'.")
+DRAFT = ("We tested three routing configurations against the replay set. " * 50).strip()  # ~3150 chars
+STUB = "The explanation and recommendations are complete. I recorded the outcome for this chat; nothing else needs you."
+
+
+def _held_turn(plugin, draft=DRAFT, called=True, core_prefix=True):
+    first = gate(plugin, reply=draft)
+    assert first and first["hold"], "the judge's NO on an undeclared reply holds it"
+    nudge = f"{RUNTIME_PREFIX}\n\n{first['nudge']}" if core_prefix else first["nudge"]
+    msgs = [{"role": "user", "content": "explain what we tested, what we learned, what we can conclude"},
+            {"role": "assistant", "content": draft, "finish_reason": "pre_final_gate_hold",
+             "_pre_final_gate_synthetic": True},
+            {"role": "user", "content": nudge, "_pre_final_gate_synthetic": True}]
+    if called:
+        msgs += [{"role": "assistant", "content": "",
+                  "tool_calls": [{"id": "call_O", "function": {"name": "session_outcome"}}]},
+                 {"role": "tool", "tool_call_id": "call_O", "tool_name": "session_outcome", "content": "{\"ok\": true}"}]
+    return msgs
+
+
+def _restores(home):
+    p = home / "logs" / "held-draft-restores.jsonl"
+    return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
+
+
+def test_nudge_says_the_held_reply_was_not_shown(plugin):
+    assert "has not seen it" in plugin.NUDGE and "same full reply" in plugin.NUDGE
+
+
+def test_stub_after_own_hold_and_call_restores_the_held_draft(plugin, home):
+    assert len(DRAFT) >= 3000 and len(STUB) < 0.4 * len(DRAFT)
+    out = gate(plugin, reply=STUB, msgs=_held_turn(plugin), attempt=1)
+    assert out == {"replace": DRAFT}
+    rows = _restores(home)
+    assert len(rows) == 1 and rows[0]["session_id"] == "S1"
+    assert rows[0]["held_chars"] == len(DRAFT) and rows[0]["reply_chars"] == len(STUB)
+
+
+def test_stub_after_own_hold_without_call_also_restores(plugin, home):
+    """The second miss passes the call check, but the stub still must not replace the answer."""
+    assert gate(plugin, reply=STUB, msgs=_held_turn(plugin, called=False), attempt=1) == {"replace": DRAFT}
+
+
+def test_held_draft_found_without_core_prefix(plugin, home):
+    """An older core that does not prefix the nudge: the plugin's own TAG still marks its hold."""
+    assert gate(plugin, reply=STUB, msgs=_held_turn(plugin, core_prefix=False), attempt=1) == {"replace": DRAFT}
+
+
+def test_full_reply_after_hold_passes_unchanged(plugin, home):
+    again = DRAFT[:-200] + " In short: route B wins."
+    assert gate(plugin, reply=again, msgs=_held_turn(plugin), attempt=1) is None
+    assert _restores(home) == []
+
+
+def test_short_held_draft_is_not_restored(plugin, home):
+    short = "I checked the three configs; B was fastest and cheapest, so I switched the default to B."
+    assert len(short) < 800
+    assert gate(plugin, reply="Done.", msgs=_held_turn(plugin, draft=short), attempt=1) is None
+
+
+def test_short_reply_with_no_hold_this_turn_passes(plugin, home):
+    """No hold of ours in this turn (only an earlier turn's): a short reply is the model's own choice."""
+    msgs = _notice_turn_after_declared_turn(plugin, [
+        {"role": "assistant", "content": DRAFT, "_pre_final_gate_synthetic": True},
+        {"role": "user", "content": plugin.NUDGE, "_pre_final_gate_synthetic": True},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_D", "function": {"name": "session_outcome"}}]},
+    ])
+    msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": "call_E",
+                                                                       "function": {"name": "session_outcome"}}]})
+    assert gate(plugin, reply="Noted.", msgs=msgs) is None
+
+
+def test_another_gates_hold_is_not_restored(plugin, home):
+    """Only this plugin's own hold: a draft another gate held (its nudge has no TAG) is that gate's business."""
+    msgs = [{"role": "user", "content": "explain"},
+            {"role": "assistant", "content": DRAFT, "_pre_final_gate_synthetic": True},
+            {"role": "user", "content": f"{RUNTIME_PREFIX}\n\n[ask-gate] file the card first", "_pre_final_gate_synthetic": True},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_O", "function": {"name": "session_outcome"}}]}]
+    assert gate(plugin, reply=STUB, msgs=msgs, attempt=1) is None
+
+
 # ---- no core: everything is a no-op -------------------------------------------------------------------------
 
 def test_no_core_is_a_noop(home, monkeypatch):

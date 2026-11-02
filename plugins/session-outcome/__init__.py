@@ -13,7 +13,9 @@ Contract: side-session-notes session-outcome-contract.md, "Mods". Core owns stor
   once with a request for the call (open user-steps steps don't count there: the reply may resolve them after the
   gate). So is a reply the judge could not rule on (timeout, error, unclear answer) that
   only core's heuristic called a summary: a later refresh whose judge works can still say NO, so the agent declares
-  the outcome instead. Never loops: the second miss passes.
+  the outcome instead. Never loops: the second miss passes. After its own hold, a reply that drops most of a held
+  draft of 800+ characters (under 40% of it) is replaced by that draft (``restored held draft``; counted in
+  ``<home>/logs/held-draft-restores.jsonl``): the model had taken the hidden draft as delivered and sent a stub.
 
 On a core without ``hermes_state_outcome`` everything is a no-op: the tool is not offered, nothing registers and
 the gate passes. Off switch: HERMES_SESSION_OUTCOME_OFF=1.
@@ -58,7 +60,16 @@ NUDGE = (f"{TAG} Before this reply goes out, record how this chat ends with ONE 
          '{"kind": "decide", "items": [{"question": "...", "choices": [{"label": "...", "value": "..."}, ...]}]} '
          'if the user must choose (at least 2 choices each); '
          '{"kind": "wait", "on": [{"kind": "card|process|cron|time|capacity|subagent", "id": "...", "label": "..."}]} '
-         "if it waits on named work. Then send your final reply. If none fits, just send the reply.")
+         "if it waits on named work. Then send the same full reply again (the user has not seen it). "
+         "If none fits, just send that full reply.")
+# Safety net for the hold above: a held draft is hidden from the user but stays in the model's context, and a model
+# that took it as delivered answered the nudge with only "The explanation and recommendations are complete." (hub
+# 20261028_071229_45f849, 10-31). After this plugin's own hold, a reply under RESTORE_RATIO of a held draft of at
+# least RESTORE_MIN_CHARS is replaced by the held draft. Each restore is logged and appended to RESTORE_LOG (coach
+# weekly counts it).
+RESTORE_MIN_CHARS = 800
+RESTORE_RATIO = 0.4
+RESTORE_LOG = "held-draft-restores.jsonl"
 
 
 # ---- optional dependencies -----------------------------------------------------------------------------
@@ -626,6 +637,45 @@ def _would_be_no_summary(api, session_id: str, reply: str) -> bool:
     return False
 
 
+def _held_draft(msgs: list) -> str:
+    """This plugin's own held draft in this turn: the assistant row right before this turn's nudge row (the user row
+    carrying TAG; core may prefix it with its own not-shown line). "" when this plugin held nothing this turn."""
+    own = _own_turn(msgs)
+    for idx in range(len(own) - 1, 0, -1):
+        m = own[idx]
+        if m.get("role") == "user" and TAG in str(m.get("content") or ""):
+            prev = own[idx - 1]
+            content = prev.get("content") if prev.get("role") == "assistant" else None
+            return content if isinstance(content, str) else ""
+    return ""
+
+
+def _hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _restore_held(session_id: str, msgs: list, reply: str) -> Optional[dict]:
+    """{"replace": <held draft>} when the reply after this plugin's own hold dropped most of the held answer."""
+    held = _held_draft(msgs).strip()
+    if len(held) < RESTORE_MIN_CHARS or len(reply.strip()) >= RESTORE_RATIO * len(held):
+        return None
+    log.info("session-outcome: restored held draft for %s (%d -> %d chars)", session_id, len(held), len(reply.strip()))
+    try:
+        path = _hermes_home() / "logs" / RESTORE_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), "event": "restored_held_draft", "session_id": session_id,
+                                 "held_chars": len(held), "reply_chars": len(reply.strip())}) + "\n")
+    except OSError:
+        log.debug("session-outcome: restore log write failed", exc_info=True)
+    return {"replace": held}
+
+
 def pre_final_gate(session_id: str = "", platform: str = "", final_response: str = "",
                    turn_messages: list | None = None, attempt: int = 0, hold_budget: int | None = None,
                    **_: Any) -> Optional[dict]:
@@ -636,6 +686,9 @@ def pre_final_gate(session_id: str = "", platform: str = "", final_response: str
         if api is None or not _interactive(platform, session_id):
             return None
         msgs = list(turn_messages or [])
+        restored = _restore_held(session_id, msgs, final_response)
+        if restored is not None:
+            return restored
         if _called_this_turn(session_id, msgs):
             return None
         if _asked_this_turn(session_id, msgs, attempt):
