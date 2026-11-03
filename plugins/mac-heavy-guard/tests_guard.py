@@ -539,3 +539,71 @@ def test_claude_hook_emits_note_as_additional_context(core):
 def test_claude_hook_block_names_core_wt_test_in_core_worktree(core):
     r = _run_hook({"tool_name": "Bash", "cwd": str(core), "tool_input": {"command": "scripts/run_tests.sh"}})
     assert r.returncode == 2 and "hermes-core-wt test runs it on hermes-hub" in r.stderr
+
+
+# --- heredocs fed to ssh: the body runs on the remote host -----------------------------------------------------
+
+# The command the terminal tool refused (host address replaced by a hostname): the `uv sync` runs on the hub.
+SSH_HEREDOC = (
+    "timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=20 ubuntu@hermes-hub 'bash -s' <<'EOF' 2>&1"
+    " | grep -v '^hub SSH route:'\n"
+    "export TZ=America/Los_Angeles\n"
+    "env -u VIRTUAL_ENV $HOME/.local/bin/uv sync --project $HOME/.hermes/hermes-agent --locked --inexact"
+    " --group dev --group test --check > /tmp/x 2>&1\n"
+    "EOF\n"
+)
+
+
+def test_ssh_heredoc_body_is_remote():
+    assert guard.check_shell(SSH_HEREDOC) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh hub bash -s <<EOF\nuv sync\nEOF",
+    "ssh hub bash -s <<-EOF\n\tuv sync\n\tEOF",
+    "ssh hub bash -s <<-'EOF'\n\tcargo build --release\n\t\tEOF\n",
+])
+def test_ssh_heredoc_unquoted_and_tab_stripped_delimiters(cmd):
+    assert guard.check_shell(cmd) is None, cmd
+
+
+def test_ssh_heredoc_after_a_redirect():
+    assert guard.check_shell("ssh hub bash -s 2>&1 <<'EOF'\nuv sync\nEOF") is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh hub \\\n  bash -s <<'EOF'\nuv sync\nEOF",  # continued line: ssh still owns the operator
+    "cat <<A; ssh hub bash -s <<'B'\nhello\nA\nuv sync\nB",  # two heredocs on one line, bodies in order
+    "ssh hub bash -s <<'EOF'\nuv sync\n",  # no delimiter line: the body runs to the end
+])
+def test_ssh_heredoc_continued_several_and_unterminated(cmd):
+    assert guard.check_shell(cmd) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "bash -s <<'EOF'\nuv sync\nEOF",  # a local shell's heredoc runs here
+    "ssh hub bash -s <<'EOF'\necho hi\nEOF\nuv sync",  # after the delimiter line: local again
+    'ssh hub "echo <<EOF"\nuv sync',  # an operator inside quotes is no operator
+    "ssh hub bash -s <<< x\nuv sync",  # a here-string has no body
+    "ssh hub bash -s <<'B'; cat <<A\nx\nB\nuv sync\nA",  # second body is local
+])
+def test_heredoc_bodies_that_run_here_are_still_scanned(cmd):
+    assert guard.check_shell(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh hub true # <<EOF\nuv sync\nEOF",  # an operator in a comment is no operator
+    "ssh hub 'x\n<<EOF'\nuv sync\nEOF",  # nor one inside a quote opened on an earlier line
+    "bash -s <<'EOF'\nssh hub bash -s <<X\nuv sync\nX\nEOF",  # a local body is left exactly as it was
+])
+def test_pre_pass_keeps_text_without_an_ssh_heredoc(cmd):
+    assert guard._drop_ssh_heredocs(cmd) == cmd
+
+
+def test_hermes_plugin_allows_ssh_heredoc():
+    assert plugin._pre_tool_call(tool_name="terminal", args={"command": SSH_HEREDOC}) is None
+
+
+def test_claude_hook_allows_ssh_heredoc():
+    r = _hook(SSH_HEREDOC)
+    assert r.returncode == 0 and r.stderr == "", r.stderr
