@@ -364,6 +364,35 @@ class BoundedCallTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("(ran on dddddddddd, a later commit containing it)", out)
 
+    def test_pass_on_a_later_commit_says_the_commits_own_run_failed(self):
+        # The commit's own run went red and a later commit's run went green, because that later commit fixed
+        # it. "passed <sha>: … (ran on <later>)" alone got quoted as proof that this commit fixed CI.
+        green = dict(run("d" * 40), _wf="ci.yml")
+        red = dict(run("c" * 40, conclusion="failure"), _wf="ci.yml")
+        rc, out = self._main_out([[green, red]], "--once")
+        self.assertEqual(rc, 0)
+        self.assertIn("(ran on dddddddddd, a later commit containing it); but its own run on cccccccccc ended "
+                      "failure: u/CI/" + "c" * 40 + "0", out)
+
+    def test_own_run_rerun_green_or_proof_on_the_commit_adds_no_note(self):
+        # A rerun on the commit itself passed (newest own run green), or the proving run built the commit:
+        # nothing to warn about.
+        own_green = dict(run("c" * 40, n=1), _wf="ci.yml")
+        own_red = dict(run("c" * 40, conclusion="failure"), _wf="ci.yml")
+        later_green = dict(run("d" * 40), _wf="ci.yml")
+        for listing in ([later_green, own_green, own_red], [own_green, own_red]):
+            rc, out = self._main_out([listing], "--once")
+            self.assertEqual(rc, 0, out)
+            self.assertNotIn("its own run", out)
+
+    def test_own_cancelled_run_adds_no_note(self):
+        # Busy branches cancel runs on intermediate commits; a cancelled own run is not a red one.
+        green = dict(run("d" * 40), _wf="ci.yml")
+        cancelled = dict(run("c" * 40, conclusion="cancelled"), _wf="ci.yml")
+        rc, out = self._main_out([[green, cancelled]], "--once")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("its own run", out)
+
     def _discovered_out(self, listings, *extra):
         """main() without --workflow: the workflows are the ones with a run containing the commit."""
         import contextlib

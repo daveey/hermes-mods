@@ -134,14 +134,29 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
             # Later commits keep starting runs of it; only a run on the sha itself can still decide.
             if not any(r["status"] in ACTIVE and r["headSha"] in shas for r in mine):
                 skipped = next((r for r in mine if r["status"] == "completed" and r["conclusion"] == "skipped"), None)
+        own = [r for r in finished if r["headSha"] in shas]
         state[name] = {
             "done": done or skipped,
             "skipped": done is None and skipped is not None,
             # Any active run of the workflow may still end up building a newer commit containing ours.
             "active": sum(1 for r in everyone if r["status"] in ACTIVE),
             "failed": finished[0] if finished and finished[0]["conclusion"] != "success" else None,
+            # The newest finished run that built the commit itself, when it went red.
+            "own_failed": own[0] if own and own[0]["conclusion"] != "success" else None,
         }
     return state
+
+
+def own_failure_note(state: dict, shas: list[str]) -> str:
+    """Say so when a later commit's green run proves the commit but the commit's own run went red.
+
+    That later commit may have fixed this one (or a flake was retried there), so the pass proves the
+    combination, not this commit: "passed <sha>" alone got quoted as proof that <sha> fixed CI.
+    """
+    own, done = state.get("own_failed"), state.get("done")
+    if not own or not done or (done.get("headSha") or "") in shas:
+        return ""
+    return f"; but its own run on {own['headSha'][:10]} ended {own['conclusion']}: {own['url']}"
 
 
 def run_ref(run: dict, shas: list[str]) -> str:
@@ -299,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
             wf_state = evaluate(runs, shas, contains, a.workflow or None)
             if wf_state and all(s["done"] for s in wf_state.values()):
                 print(f"passed {label}: " + ", ".join(
-                    f"{n} {'skipped ' if s['skipped'] else ''}{run_ref(s['done'], shas)}" for n, s in wf_state.items()))
+                    f"{n} {'skipped ' if s['skipped'] else ''}{run_ref(s['done'], shas)}{own_failure_note(s, shas)}"
+                    for n, s in wf_state.items()))
                 return 0
             pend = {n: s for n, s in wf_state.items() if not s["done"]}
             active = sum(s["active"] for s in pend.values())
