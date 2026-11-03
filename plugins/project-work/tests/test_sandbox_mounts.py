@@ -7,6 +7,7 @@ audited, not only env routes. Driven through real core's loaders against a scrat
 
 No secret values: every credential file holds a placeholder."""
 import importlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -37,10 +38,15 @@ def core(monkeypatch, tmp_path):
     user.mkdir()
     monkeypatch.setenv('HOME', str(user))
     monkeypatch.setenv('HERMES_HOME', str(home))
+    # No core at all (plugin-suites CI: core is private) -> skip. A run that names a core checkout
+    # (scripts/test-all sets HERMES_CORE_CHECKOUT whenever it puts core on PYTHONPATH) imports plainly
+    # below, so a broken or missing core module there still errors instead of skipping.
+    if not os.environ.get('HERMES_CORE_CHECKOUT') and importlib.util.find_spec('hermes_constants') is None:
+        pytest.skip('needs Hermes core (hermes_constants not importable, HERMES_CORE_CHECKOUT unset)')
     for name in ('hermes_constants', 'tools.env_passthrough', 'tools.credential_files', 'agent.skill_utils',
                  'agent.file_safety', 'tools.environments.docker'):
         monkeypatch.delitem(sys.modules, name, raising=False)
-        # A plain import: a run without core on PYTHONPATH must fail, never skip this suite.
+        # A plain import: with core named (HERMES_CORE_CHECKOUT), a missing module fails, never skips.
         monkeypatch.setitem(sys.modules, name, importlib.import_module(name))
     if REAL_CORE_CREDENTIAL_FILES is None:  # pre-fix bytes have neither reader
         monkeypatch.delattr(plugin, '_core_credential_files', raising=False)
