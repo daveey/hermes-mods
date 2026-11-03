@@ -434,8 +434,10 @@ def is_settled(card: Optional[dict[str, Any]]) -> bool:
             if card.get('unfinished') is not False:
                 return False
             # An origin row needs its binding; a shepherd row (core _read_remote_links) is finished only when its
-            # owner attested the close (``unfinished`` False on a fresh replica).
-            return (card.get('via') == 'origin' and bool(card.get('binding_id'))) or card.get('via') == 'shepherd'
+            # owner attested the close (``unfinished`` False on a fresh replica). A shadow row (the plugin's read of a
+            # card absent from the projection, found on a FRESH full-board shadow) is the board's own record.
+            return (card.get('via') == 'origin' and bool(card.get('binding_id'))) \
+                or card.get('via') in ('shepherd', 'shadow')
         # Remote review is unfinished agent/verification work, not a human ask.
         return status in ('blocked', 'triage') and card.get('block_kind') in ('needs_input', 'capability')
     if status in DONE_STATUSES or status in HUMAN_STATUSES:
@@ -1626,10 +1628,20 @@ def revision_token(path: Path, board: bool = False) -> Optional[int]:
 
 
 # ---- sync-shadow coverage --------------------------------------------------------------------------------------
-def shadow_rows(path: Path, ids: Iterable[str]) -> tuple[tuple[tuple[Any, Any], ...], frozenset[str]]:
+SHADOW_FIELDS = ("status", "title", "completed_at", "block_kind", "human_request", "created_on")
+
+
+class ShadowIds(frozenset):
+    """The ids present in a shadow's ``tasks`` (compares as a plain set) plus ``rows``: ``{id: {field: value}}`` of
+    the ``SHADOW_FIELDS`` that shadow has. Shared by reuse: callers copy a row before handing it on."""
+    rows: dict = {}
+
+
+def shadow_rows(path: Path, ids: Iterable[str]) -> tuple[tuple[tuple[Any, Any], ...], ShadowIds]:
     """``(kanban_sync_state rows, ids present in tasks)`` of one sync shadow, in one read snapshot. Clock-free:
     callers judge freshness from the rows with the current time. Reused while the shadow's committed revision is
-    unchanged (registered observer, like the boards); raises when it cannot be read, and then caches nothing."""
+    unchanged (registered observer, like the boards); raises when it cannot be read, and then caches nothing.
+    The found ids carry their ``SHADOW_FIELDS`` (``ShadowIds.rows``; a column the shadow lacks is left out)."""
     wanted = tuple(sorted(set(ids)))
 
     def query(conn):
@@ -1642,9 +1654,19 @@ def shadow_rows(path: Path, ids: Iterable[str]) -> tuple[tuple[tuple[Any, Any], 
                 # Query ids, not status or links: absence is stronger than "not linked".
                 found.update(str(r[0]) for r in conn.execute(
                     f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk))
+            rows: dict[str, dict[str, Any]] = {}
+            cols = [c for c in SHADOW_FIELDS if c in _cols(conn, "tasks")] if found else []
+            hit = sorted(found)
+            for i in range(0, len(hit), 500) if cols else ():
+                chunk = hit[i:i + 500]
+                for r in conn.execute(f"SELECT id, {', '.join(cols)} FROM tasks "
+                                      f"WHERE id IN ({','.join('?' * len(chunk))})", chunk):
+                    rows[str(r[0])] = dict(zip(cols, tuple(r)[1:]))
         finally:
             conn.execute("COMMIT")
-        return state, frozenset(found)
+        out = ShadowIds(found)
+        out.rows = rows
+        return state, out
 
     return _structural_reads.read(path, ("shadow", wanted), query, board=True)
 

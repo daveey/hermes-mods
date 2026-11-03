@@ -66,7 +66,11 @@ def test_bare_key_for_card_on_a_covered_board_never_unlinks(bare_world, board, s
     keys = [ID] + ([f'hub/{board}/{ID}', f'hub/default/{board}/{ID}'] if siblings else [])
     seed(led, keys)
     cards = plugin.read_cards(keys)
-    assert ID in cards.uncertain and ID in cards.absence_veto and ID not in cards
+    # A fresh shadow holding the id with a readable status resolves the bare key as that card (via 'shadow',
+    # tests/test_shadow_resolve.py): open there, so it works. The siblings name gateway 'hub', which this
+    # status-only shadow cannot attest (no created_on): still vetoed.
+    assert ID in cards and core.is_working(cards[ID]) and cards[ID]['via'] == 'shadow'
+    assert ID not in cards.uncertain and set(keys[1:]) <= cards.uncertain
     never_unlinks(led, keys)
 
 
@@ -76,7 +80,7 @@ def test_bare_veto_survives_pass_subset_and_canonical_view(bare_world, light):
     shadow(root, 'runners', [ID])
     seed(led, [ID])
     cards = core.canonical_view(plugin._pass_reader(light=light)([ID]))
-    assert ID in cards.uncertain and ID in cards.absence_veto
+    assert ID in cards and core.is_working(cards[ID])  # resolved from the fresh shadow: an open card
     fix = core.track_unlinked(led.get('chat'), cards, healthy=lambda: True, now=1000, mono=1000)
     assert fix['unlinked'] == {}
 

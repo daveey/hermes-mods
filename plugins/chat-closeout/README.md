@@ -91,6 +91,16 @@ observed absent. A host with neither directory keeps the local-boards-plus-proje
 the live check, which filtered timers by `/runners/` instead of by card id.
 The Board shadow is shared across gateways/profiles (not a gateway partition); its `gateway_id` identifies the
 reader, not the owner of every task. This is why coverage is checked by board and presence by id.
+A key that no local board or projection row resolves but a FRESH shadow holds with a readable status is read as
+that card (`via: shadow`, remote, `stale` False, the shadow's status/`completed_at`/title/block): typically a hub
+card a hub session created, never origin-bound to this chat. Done/archived settles it (a close-out unless the
+transcript already reported it), anything else is working (or an ask). Before this such keys stayed uncertain
+forever: never aged, never settled, and the watchdog filed "waits on cards nothing can find" for them. A four-part
+key resolves from the board it names; a bare / three-part key only when every known board is fresh and exactly one
+holds the id, and then a resolved four-part sibling of the same id and board becomes its `canonical_key` so
+`reconcile` collapses it. A key naming a gateway resolves only from a row that gateway created (`created_on`):
+another owner's card of that id still only vetoes. Stale, missing, unreadable or status-less coverage, keys the read
+already found ambiguous, and a pass whose projection failed never resolve (`tests/test_shadow_resolve.py`).
 `tests/test_board_coverage.py` exercises full/light readers, first-pass reset, projection failure, >24-hour
 retention and genuinely absent full-board deletion. The defect escaped the earlier list-only tests because those
 fixtures assumed the linked projection was exhaustive; deletion fixtures now supply full-board evidence.

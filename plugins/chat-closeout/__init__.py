@@ -654,8 +654,9 @@ def _replica_completed_at(cards: list[dict], failed_out: Optional[list] = None) 
 _BOARD_SLUG = re.compile(r'[a-z0-9][a-z0-9_-]*')
 
 
-def _read_shadow(board: str, ids: set[str]) -> tuple[bool, set[str]]:
-    """``(fresh, ids present)`` from ``sync-shadow/<board>.db``; raises when it cannot be read.
+def _read_shadow(board: str, ids: set[str]) -> tuple[bool, "core.ShadowIds"]:
+    """``(fresh, ids present)`` from ``sync-shadow/<board>.db``; raises when it cannot be read. The ids compare as a
+    set and carry each found task's ``core.SHADOW_FIELDS`` (``.rows``, shared: copy before use).
 
     Fresh = exactly one sync-state row naming this board, pulled within 120 s and not future-dated."""
     path = _kanban_root() / 'kanban' / 'sync-shadow' / f'{board}.db'
@@ -663,34 +664,70 @@ def _read_shadow(board: str, ids: set[str]) -> tuple[bool, set[str]]:
     state, found = core.shadow_rows(path, ids)
     fresh = len(state) == 1 and state[0][0] == board and state[0][1] is not None \
         and 0 <= time.time() - float(state[0][1]) <= 120
-    return fresh, set(found)
+    return fresh, found
+
+
+def _shadow_card(key: str, board: str, row: dict) -> dict:
+    """A remote card read from a fresh full-board shadow (``via`` 'shadow'): a ledger key that neither a local board
+    nor the origin/shepherd projection resolves, e.g. a hub card a hub session created that was never origin-bound
+    to this chat. ``core.is_settled`` settles it when done/archived; otherwise it is working (or an ask)."""
+    parts = key.split('/')
+    row = {k: v for k, v in row.items() if k != 'created_on'}
+    card = {**row, 'id': parts[-1], 'board': board, 'remote': True, 'stale': False, 'via': 'shadow',
+            'unfinished': row.get('status') not in core.DONE_STATUSES, 'key': key}
+    if len(parts) == 4:
+        card.update(gateway=parts[0], profile=parts[1])
+    elif len(parts) == 3:
+        card['gateway'] = parts[0]
+    if card.get('completed_at') is not None:
+        try:
+            card['completed_at'] = float(card['completed_at'])
+        except (TypeError, ValueError):
+            card['completed_at'] = None
+    return card
+
+
+def _shadow_owner_ok(key: str, row: dict) -> bool:
+    """A key that names a gateway (three/four parts) resolves only from a shadow row that gateway created
+    (``created_on``): the shadow is shared across gateways, and another owner's card of that id is evidence against
+    absence, never permission to settle this entry. A bare id names no owner."""
+    return '/' not in key or (row.get('created_on') is not None and str(row['created_on']) == key.split('/')[0])
 
 
 def _board_absence_veto(keys: set[str]) -> set[str]:
-    """Unresolved keys need full-board coverage, not absence from a linked-card projection.
+    """``_board_coverage``'s veto alone (nothing resolved): the inventory-failure path."""
+    return _board_coverage(keys, resolve=False)[1]
 
+
+def _board_coverage(keys: set[str], exclude: frozenset = frozenset(),
+                    resolve: bool = True) -> tuple[dict[str, dict], set[str]]:
+    """``(resolved, veto)`` for keys no local board or projection row resolved.
+
+    Unresolved keys need full-board coverage, not absence from a linked-card projection.
     A Board shadow is the whole board across gateways/profiles. Any matching id
-    vetoes absence (even a different owner); it never proves settlement. Missing,
-    stale or unreadable coverage also vetoes absence. One read per board per pass.
+    vetoes absence (even a different owner). Missing, stale or unreadable coverage
+    also vetoes absence. One read per board per pass.
 
-    A four-part key names its board. A bare id names none, so it is checked against every
-    board this host knows of beyond the local boards ``core.read_cards`` already read: each
-    ``sync-shadow/*.db`` and each link-only ``sync-links/*.db`` board. The id on any of them
-    vetoes; so does any of them lacking a fresh, readable shadow. A host with neither keeps
-    the earlier rule (local boards + projection are its whole coverage).
+    A four-part key names its board. A bare id names none, and a three-part key's middle part meant profile or
+    board, so both are checked against every board this host knows of beyond the local boards ``core.read_cards``
+    already read: each ``sync-shadow/*.db`` and each link-only ``sync-links/*.db`` board. The id on any of them
+    vetoes; so does any of them lacking a fresh, readable shadow. A host with neither keeps the earlier rule (local
+    boards + projection are its whole coverage).
+
+    ``resolve``: a key whose id is on a FRESH shadow with a readable status comes back as a ``_shadow_card``
+    instead of a veto: a four-part key on the board it names; a bare / three-part key only when every known board
+    is fresh and exactly one holds the id; a key naming a gateway only from a row that gateway created
+    (``_shadow_owner_ok``). Such a bare / three-part key that a resolved four-part key of the same id
+    and board also names gets that key as ``canonical_key`` (``core.reconcile`` collapses it). ``exclude`` (keys
+    the read already found ambiguous) never resolves. Stale, missing or status-less coverage never resolves.
     """
     groups: dict[str, set[str]] = {}
     veto: set[str] = set()
-    bare: set[str] = set()
+    bare: set[str] = set()   # bare ids and three-part keys: no single board named
     for key in keys:
         parts = key.split('/')
-        if len(parts) == 1:
+        if len(parts) in (1, 3):
             bare.add(key)
-            continue
-        if len(parts) == 3:
-            # Historical forms used BOTH gateway/profile/id and gateway/board/id.
-            # Without a projected canonical owner, no one board proves absence.
-            veto.add(key)
             continue
         if len(parts) != 4:
             continue
@@ -699,6 +736,10 @@ def _board_absence_veto(keys: set[str]) -> set[str]:
             veto.add(key)
             continue
         groups.setdefault(board, set()).add(key)
+    three = {k for k in bare if k.count('/') == 2}
+    # Historical forms used BOTH gateway/profile/id and gateway/board/id. Without a projected canonical owner or a
+    # single fresh shadow holding the id, no one board proves absence: always uncertain unless resolved below.
+    veto.update(three)
     bare_boards: set[str] = set()
     if bare:
         try:
@@ -711,24 +752,54 @@ def _board_absence_veto(keys: set[str]) -> set[str]:
             logger.debug('chat-closeout: board list unavailable', exc_info=True)
             veto.update(bare)
             bare = set()
+    tail = lambda key: key.rsplit('/', 1)[-1]
+    bare_ids = {tail(k) for k in bare}
     gap = False
+    resolved: dict[str, dict] = {}
+    holders: dict[str, list[tuple[str, dict]]] = {}  # bare id -> [(board, row)] on fresh boards
     for board in sorted(set(groups) | bare_boards):
         wanted = groups.get(board, set())
-        ids = {key.rsplit('/', 1)[-1] for key in wanted} | (bare if board in bare_boards else set())
+        ids = {tail(key) for key in wanted} | (bare_ids if board in bare_boards else set())
         try:
             fresh, found = _read_shadow(board, ids)
         except Exception:
             logger.debug('chat-closeout: board absence coverage unavailable: %s', board, exc_info=True)
-            fresh, found = False, set()
+            fresh, found = False, core.ShadowIds()
+        rows = getattr(found, 'rows', None) or {}
         if not fresh:
             veto.update(wanted)
             gap = gap or board in bare_boards
-        veto.update(key for key in wanted if key.rsplit('/', 1)[-1] in found)
+        for key in wanted:
+            if tail(key) not in found:
+                continue
+            row = rows.get(tail(key))
+            if resolve and fresh and key not in exclude and row and row.get('status') and _shadow_owner_ok(key, row):
+                resolved[key] = _shadow_card(key, board, dict(row))
+            else:
+                veto.add(key)
         if board in bare_boards:
-            veto.update(bare & found)
+            for key in bare:
+                if tail(key) in found:
+                    veto.add(key)
+            for cid in bare_ids & found:
+                holders.setdefault(cid, []).append((board, dict(rows.get(cid) or {}) if fresh else {}))
     if gap:
         veto.update(bare)  # a board this host knows of has no fresh full read: no bare id is observed absent
-    return veto
+    elif resolve:
+        for key in sorted(bare - exclude):
+            held = holders.get(tail(key)) or []
+            if len(held) != 1 or not held[0][1].get('status') or not _shadow_owner_ok(key, held[0][1]):
+                continue
+            board, row = held[0]
+            card = _shadow_card(key, board, row)
+            sibling = sorted(k for k in resolved if k.count('/') == 3 and tail(k) == tail(key)
+                             and k.split('/')[2] == board
+                             and (key.count('/') == 0 or k.split('/')[0] == key.split('/')[0]))
+            if len(sibling) == 1:
+                card = {**resolved[sibling[0]], 'canonical_key': sibling[0]}
+            resolved[key] = card
+            veto.discard(key)
+    return resolved, veto
 
 
 def _read_key(ids: list[str], light: bool) -> Optional[tuple]:
@@ -779,7 +850,9 @@ def _reused_read(ids: list[str], remote_inventory: Callable[[], list[dict]], lig
             return None
     want = set(ids)
     out = core.Cards({k: _fresh_card(c) for k, c in snap["cards"].items()})
-    out.absence_veto = frozenset(_board_absence_veto(want - set(out)))
+    shadow, veto = _board_coverage(want - set(out), exclude=snap["uncertain"])
+    out.update(shadow)
+    out.absence_veto = frozenset(veto)
     out.uncertain = frozenset(snap["uncertain"] | out.absence_veto)
     return out
 
@@ -876,7 +949,10 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
                 if at is not None:
                     cards[key] = {**card, 'completed_at': at}  # a copy: inventory rows are core's cache
     out.update(cards)
-    out.absence_veto = frozenset(_board_absence_veto(want - set(cards)))
+    # Time-judged (shadow freshness), so never part of the memo below: recomputed on every reuse too.
+    shadow, veto = _board_coverage(want - set(cards), exclude=frozenset(uncertain & want))
+    out.update(shadow)
+    out.absence_veto = frozenset(veto)
     out.uncertain = frozenset((uncertain & want) | out.absence_veto)
     if content is not None and not failed and _read_key(ids, light) == content:
         # Labelled with the board revisions read BEFORE the read; nothing committed since.

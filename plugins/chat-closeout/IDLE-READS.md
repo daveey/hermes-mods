@@ -16,7 +16,7 @@ The cross-pass cache is deliberately below that layer, and only on Kanban board 
   list (`ksa._board_db_paths()`) as the `unseen` map of core `_all_counts`, which is built only from local
   boards. Key: board identity, observer revision, kinds. Summed afresh on every call.
 - `core.shadow_rows` (used by `_read_shadow`): a shadow's `kanban_sync_state` rows and the requested IDs present
-  in its `tasks`, read in one snapshot. Key: shadow identity, observer revision, sorted IDs. The 120 s
+  in its `tasks` (with their `core.SHADOW_FIELDS`, copied by every caller before use), read in one snapshot. Key: shadow identity, observer revision, sorted IDs. The 120 s
   freshness rule is judged from those rows with `time.time()` on **every** call, never cached.
 
 `core.last_user_at` (state.db) is **not** cached and keeps no connection: it uses the pass's `ReadPool`
