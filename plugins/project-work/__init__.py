@@ -91,6 +91,7 @@ def _check_no_credentials(config):
     if mounts:
         raise PermissionError('Project work forbids credential file mounts: '
                               + ', '.join(sorted(str(m.get('container_path')) for m in mounts)))
+    _check_no_credential_dirs()
 
 
 def _check_no_env_passthrough():
@@ -114,6 +115,93 @@ def _core_credential_files():
         declared = [declared]
     mounts = importlib.import_module('tools.credential_files').get_credential_file_mounts()
     return list(declared or []), list(mounts)
+
+
+# Directory mounts core adds to every non-capsule docker sandbox (tools/environments/docker.py
+# _RO_MOUNT_SOURCES), each read here through core's side-effect-free root enumerator. A source core
+# adds later refuses until it is audited here.
+_MAX_WALK_FILES = 100_000
+
+
+def _check_no_credential_dirs():
+    """Refuse a skills/cache directory mount that holds, or is an ancestor of, a credential store.
+
+    skills.external_dirs accepts any host path ('~', absolute, relative to HERMES_HOME), and core
+    bind-mounts each one read-only, so `external_dirs: ['.']` would hand the sandbox the profile's
+    .env and auth.json without touching terminal.credential_files.
+    """
+    try:
+        homes = _hermes_homes()
+        for root in _core_dir_mount_roots():
+            _check_dir_mount(Path(root), homes)
+    except PermissionError:
+        raise
+    except Exception as exc:  # fail closed: the directory mounts cannot be audited
+        raise PermissionError('Project work cannot verify sandbox directory mounts') from exc
+
+
+def _core_dir_mount_roots():
+    docker = importlib.import_module('tools.environments.docker')
+    cf = importlib.import_module('tools.credential_files')
+    roots = []
+    for getter, *_ in docker._RO_MOUNT_SOURCES:
+        if getter == 'get_credential_file_mounts':
+            continue  # audited by _core_credential_files
+        if getter == 'get_skills_directory_mount':
+            roots += [d for d, _ in cf._skill_dir_roots('/root/.hermes')]
+        elif getter == 'get_cache_directory_mounts':
+            roots += [d for d, _ in cf._cache_dir_roots('/root/.hermes', create_missing=False)]
+        else:
+            raise PermissionError(f'Project work cannot verify core sandbox mount source {getter}')
+    return roots
+
+
+def _hermes_homes():
+    """Every Hermes home on this host, resolved: the active profile, the root and each profile dir."""
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+    root = Path(get_default_hermes_root()).resolve()
+    homes = {Path(get_hermes_home()).resolve(), root}
+    profiles = root / 'profiles'
+    if profiles.is_dir():
+        homes.update(p.resolve() for p in profiles.iterdir() if p.is_dir())
+    return homes
+
+
+def _check_dir_mount(root, homes):
+    real = root.resolve()
+    for home in homes:
+        if home == real or home.is_relative_to(real):
+            raise PermissionError(f'Project work forbids sandbox directory mount {root}: it contains the '
+                                  f'Hermes home {home}')
+    from agent.file_safety import _CREDENTIAL_FILE_NAMES, _READ_DENIED_DIRS, get_read_block_error
+    names = {Path(n).as_posix() for n in _CREDENTIAL_FILE_NAMES}
+    denied_dirs = {d for d, *_ in _READ_DENIED_DIRS}
+    hubs = [home / 'skills' / '.hub' for home in homes]
+    seen = 0
+    # Core bind-mounts a symlink-free dir as-is (every file, no pruning) and otherwise mounts a copy of
+    # its regular files, so every regular non-symlink file is what the sandbox can read.
+    for dirpath, _dirs, files in os.walk(real):
+        for name in files:
+            seen += 1
+            if seen > _MAX_WALK_FILES:
+                raise PermissionError(f'Project work cannot verify sandbox directory mount {root}: too many files')
+            path = Path(dirpath) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            if _is_credential_store(path, homes, names, denied_dirs, hubs, get_read_block_error):
+                raise PermissionError(f'Project work forbids sandbox directory mount {root}: it holds the '
+                                      f'credential store {path}')
+
+
+def _is_credential_store(path, homes, names, denied_dirs, hubs, read_block):
+    for home in homes:  # core's deny-list only knows the active home and the root; check every profile
+        if path.is_relative_to(home):
+            rel = path.relative_to(home).as_posix()
+            if rel in names or rel.split('/', 1)[0] in denied_dirs:
+                return True
+    if any(path.is_relative_to(hub) for hub in hubs):
+        return False  # skills-hub cache: refused for prompt injection, not a credential
+    return bool(read_block(str(path)))  # project .env files, ~/.config/token-broker, ...
 
 
 def _check_tool_mount(volume, tool_dir):
