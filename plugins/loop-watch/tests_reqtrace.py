@@ -92,6 +92,35 @@ def test_non_http_scope_passes_through():
     assert seen == ["websocket"] and trace.inflight == {}
 
 
+def test_noisy_path_cannot_spend_the_hourly_budget_of_other_paths():
+    """Hub 2026-11-03 hour 00: 120 slow /api/sessions-heavy reports hit the global cap at 00:32:59.950, so the
+    /api/plugins/runners/v1/fleet request that started 00:32:58 and made the Desktop time out at 00:33:03
+    left no record at all. The cap is per path now; a path's own flood is still bounded."""
+    reps = []
+    now = [100.0]
+    trace = rt.ReqTrace(sink=reps.append, slow_s=1.0, clock=lambda: now[0])
+
+    def finish(path):
+        req = rt._Req(1, "GET", path, now[0] - 3.0, None)
+        req.resp_at = now[0]
+        trace._finish(req)
+
+    for _ in range(rt.MAX_REPORTS_PER_HOUR + 5):
+        finish("/api/sessions")
+    finish("/api/plugins/runners/v1/fleet")
+    paths = [r["path"] for r in reps]
+    assert paths[-1] == "/api/plugins/runners/v1/fleet"
+    assert paths.count("/api/sessions") == rt.MAX_REPORTS_PER_PATH_PER_HOUR
+    # Query strings do not make a path a new budget.
+    for i in range(rt.MAX_REPORTS_PER_PATH_PER_HOUR + 3):
+        finish("/api/sessions?limit=%d" % i)
+    assert sum(p.startswith("/api/sessions") for p in (r["path"] for r in reps)) == rt.MAX_REPORTS_PER_PATH_PER_HOUR
+    # ...and the whole sink stays bounded across many distinct paths.
+    for i in range(rt.MAX_REPORTS_PER_HOUR * 2):
+        finish("/api/x/%d" % i)
+    assert len(reps) == rt.MAX_REPORTS_PER_HOUR
+
+
 def test_install_on_starlette_app_wraps_once_and_serves():
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse

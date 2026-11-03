@@ -30,6 +30,10 @@ MAX_SAMPLES = 40
 CHAIN_DEPTH = 18
 TOP_N = 6
 MAX_REPORTS_PER_HOUR = 120
+# Per path (query stripped) inside the hourly cap. With only the global cap, /api/sessions and
+# /api/profiles/projects/tree spent all 120 by 00:32:59 (hub, 2026-11-03), and the fleet request behind a
+# Desktop timeout at 00:33:03 left no record.
+MAX_REPORTS_PER_PATH_PER_HOUR = 20
 
 
 def _short(path: str) -> str:
@@ -92,6 +96,7 @@ class ReqTrace:
         self._ids = itertools.count(1)
         self._lock = threading.Lock()
         self._hour = (0, 0)  # (hour bucket, reports in it)
+        self._per_path: Counter = Counter()  # reports per path in the current hour bucket
 
     # ---- ASGI side (runs on the loop) ----
     def wrap(self, app):
@@ -127,11 +132,13 @@ class ReqTrace:
         if total < self.slow_s:
             return
         hour = int(time.time() // 3600)
-        bucket, n = self._hour
-        n = n + 1 if bucket == hour else 1
-        self._hour = (hour, n)
-        if n > MAX_REPORTS_PER_HOUR:
+        if self._hour[0] != hour:
+            self._hour, self._per_path = (hour, 0), Counter()
+        key = req.path.split("?", 1)[0]
+        if self._per_path[key] >= MAX_REPORTS_PER_PATH_PER_HOUR or self._hour[1] >= MAX_REPORTS_PER_HOUR:
             return
+        self._per_path[key] += 1
+        self._hour = (hour, self._hour[1] + 1)
         wall0 = time.time() - (self.clock() - req.t0)
         rep = {
             "kind": "slow_request",
