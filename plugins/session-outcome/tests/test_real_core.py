@@ -1,7 +1,8 @@
 """The gate against the REAL hermes_state_outcome (not the fake), on a temp HERMES_HOME state.db.
 
 Core checkout: HERMES_OUTCOME_CORE_DIR, HERMES_CORE_CHECKOUT, or ~/.hermes/hermes-agent.
-Missing core/dependencies fail rather than silently remove integration coverage.
+A named core with missing core/dependencies fails rather than silently removing integration
+coverage; with no core at all (public plugin-suites CI) these tests skip.
 Run with a dependency-equipped interpreter via scripts/test-all -k session-outcome.
 """
 import importlib
@@ -21,6 +22,12 @@ SUMMARY = "Rebased the branch, fixed the two failing tests and pushed; CI is gre
 
 @pytest.fixture
 def real(tmp_path, monkeypatch):
+    # No core at all (public plugin-suites CI: core is private) -> skip. A named core
+    # (HERMES_OUTCOME_CORE_DIR, or HERMES_CORE_CHECKOUT which scripts/test-all sets whenever it found
+    # one) that is missing or broken still fails below, never skips.
+    named = os.environ.get("HERMES_OUTCOME_CORE_DIR") or os.environ.get("HERMES_CORE_CHECKOUT")
+    if not named and not (CORE / "hermes_state_outcome.py").is_file():
+        pytest.skip(f"needs Hermes core (none at {CORE}; HERMES_CORE_CHECKOUT unset)")
     assert (CORE / "hermes_state_outcome.py").is_file(), f"missing real core at {CORE}"
     # This is a library test, not a launch: never provision/re-exec for the disposable home.
     monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
