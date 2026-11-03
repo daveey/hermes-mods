@@ -62,8 +62,8 @@ A new guard also belongs in private `home/plugins-every-host.txt`; export must n
    runner exits 2 before building a site or running any suite: set `HERMES_MODS_PYTHON`. The header
    prints the chosen version; test dependencies are cached per Python minor version. Never a bare `pytest`
    at the root. On the MacBook run
-   only the targeted suite (`-k`); the full run belongs on the hub. A new plugin's tests are picked up
-   automatically; one with a non-pytest runner gets an entry in `SUITE_OVERRIDES` in that script.
+   only the targeted suite (`-k`); the full run belongs on the hub. A new plugin's or skill's tests (`skills/<cat>/<name>/{scripts,tests}/test_*.py`, one suite per skill,
+   CI: `.github/workflows/skill-tests.yml`) are picked up automatically; one with a non-pytest runner gets an entry in `SUITE_OVERRIDES` in that script.
 4. `git add` + `git commit` (the pre-commit hook runs gitleaks and the private denylist; enable it
    with `git config core.hooksPath .githooks` if `hermes-sync` hasn't yet). Then `git push`, or let
    the next `hermes-sync` run push it.

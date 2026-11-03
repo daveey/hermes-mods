@@ -488,7 +488,11 @@ def disk(with_du: bool = True) -> dict:
     out: dict = {"home_volume": {"total_gb": round(total / 2**30, 1), "free_gb": round(free / 2**30, 1),
                                  "used_pct": round(100 * used / total, 1)}}
     if MAC:
-        snaps = subprocess.run(["tmutil", "listlocalsnapshots", "/"], capture_output=True, text=True).stdout
+        try:  # missing/broken tmutil must not sink the whole report (memory() degrades the same way)
+            snaps = subprocess.run(["tmutil", "listlocalsnapshots", "/"], capture_output=True, text=True,
+                                   timeout=30).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            snaps = ""
         out["apfs_local_snapshots"] = [l for l in snaps.splitlines() if "com.apple" in l]
     # With --no-du (CPU-only question) never walk the caches: at load > 40 each `du` of a big cache ran its
     # full 240 s timeout and the report printed nothing for minutes. Sizes are skipped (gb null), not guessed.

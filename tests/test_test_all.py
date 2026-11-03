@@ -158,6 +158,40 @@ class TestAll(unittest.TestCase):
         self.assertIn('repo-guards', r.stdout)
         self.assertEqual(run(self.root, '-k', 'no-such-suite', '--list').stdout.split(), [])
 
+    def test_skill_script_tests_are_one_suite_per_skill_and_a_red_one_fails_the_run(self):
+        """skills/**/scripts/test_*.py were never run: a red hermes-coach askgate test sat on main unnoticed."""
+        coach = self.root / 'skills' / 'productivity' / 'hermes-coach'
+        (coach / 'scripts').mkdir(parents=True)
+        (coach / 'SKILL.md').write_text('---\nname: hermes-coach\n---\n')
+        # stdlib unittest module importing its sibling, as the real skill scripts do
+        (coach / 'scripts' / 'mod.py').write_text('X = 1\n')
+        (coach / 'scripts' / 'test_mod.py').write_text(textwrap.dedent("""
+            import sys, unittest
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import mod
+            class T(unittest.TestCase):
+                def test_x(self):
+                    self.assertEqual(mod.X, 1)
+        """))
+        other = self.root / 'skills' / 'devops' / 'other'
+        (other / 'tests').mkdir(parents=True)
+        (other / 'SKILL.md').write_text('---\nname: other\n---\n')
+        (other / 'tests' / 'test_mod.py').write_text('def test_ok():\n    pass\n')  # same basename
+        (self.root / 'skills' / 'devops' / 'no-tests').mkdir()
+        (self.root / 'skills' / 'devops' / 'no-tests' / 'SKILL.md').write_text('x')
+        listed = run(self.root, '--list')
+        self.assertEqual(listed.stdout.split(), ['skills/devops/other', 'skills/productivity/hermes-coach'])
+        self.assertEqual(run(self.root, '-k', 'hermes-coach', '--list').stdout.split(),
+                         ['skills/productivity/hermes-coach'])
+        ok = run(self.root)
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertIn('2 PASS', ok.stdout)
+        (coach / 'scripts' / 'mod.py').write_text('X = 2\n')
+        red = run(self.root, '-k', 'hermes-coach')
+        self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+        self.assertIn('FAILED: skills/productivity/hermes-coach', red.stdout)
+
     def test_python_selection_order_with_fake_paths(self):
         runner = runpy.run_path(str(RUNNER))
         core = self.root / 'core'
