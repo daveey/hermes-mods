@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from test_closed_asks import board, ut, snapshot, add_block, at, REQUEST
+from test_closed_asks import board, ut, snapshot, add_block, at, REQUEST, production_python, watchdog_env
 
 
 def bind(path, job, *, via="request"):
@@ -78,11 +78,12 @@ def test_detached_worker_watchdog_unblocks_once(board):
     path, job, db = board
     bind(path, job)
     end(job)
-    env = ut.launch_env()
-    env["HERMES_USER_TERMINAL_CORE_ROOT"] = str(Path(db.__file__).resolve().parent.parent)
-    env.pop("PYTHONPATH", None)
+    core = Path(db.__file__).resolve().parent.parent
+    # The interpreter watchdog.sh execs (production_python), else this runner's; see watchdog_env.
+    python = production_python(core) or sys.executable
+    env = watchdog_env(core, python)
     for _ in range(2):
-        result = subprocess.run([sys.executable, str(Path(ut.__file__)), "--watchdog", str(job)],
+        result = subprocess.run([python, str(Path(ut.__file__)), "--watchdog", str(job)],
                                 env=env, text=True, capture_output=True, timeout=60)
         assert result.returncode == 0, result.stderr
     with sqlite3.connect(path) as con:

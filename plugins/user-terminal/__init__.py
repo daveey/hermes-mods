@@ -131,9 +131,10 @@ def _home() -> Path:
         return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
-def jobs_dir() -> Path:
+def jobs_dir(*, create: bool = True) -> Path:
     d = Path(os.environ.get("HERMES_USER_TERMINAL_DIR") or _home() / "cache" / "user-terminal")
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -1098,23 +1099,32 @@ def expiry_reason(minutes: float) -> str:
     return f"expired after {minutes:g} min; ask again if still needed"
 
 
-def _ro_connect(path: Any, timeout: float = 2):
+def _ro_connect(path: Any, timeout: float = 2, *, check_same_thread: bool = True, retained: bool = False):
     """Read-only open of a live board: URI with the path percent-quoted (a '?', '#' or '%' in it would otherwise
     end the path), mode=ro first; a WAL db whose -wal/-shm sidecars are gone fails that, so fall back to mode=rw
-    (never rwc: a missing db is never created) with PRAGMA query_only=ON, which never writes rows."""
+    (never rwc: a missing db is never created) with PRAGMA query_only=ON, which never writes rows.
+    ``retained=True`` (a connection kept across sweeps) opens through core's guarded, WAL-generation-registered
+    reader when core has one (``kanban_generation.open_ro``); older cores use the plain open below."""
     import sqlite3
     from urllib.parse import quote
 
+    if retained:
+        try:
+            from hermes_cli.kanban_generation import open_ro
+        except ImportError:
+            pass
+        else:
+            return open_ro(Path(path), check_same_thread=check_same_thread)
     uri = "file:" + quote(str(path))
     try:
-        c = sqlite3.connect(uri + "?mode=ro", uri=True, timeout=timeout)
+        c = sqlite3.connect(uri + "?mode=ro", uri=True, timeout=timeout, check_same_thread=check_same_thread)
         try:
             c.execute("select 1 from sqlite_master limit 1")
         except sqlite3.OperationalError:
             c.close()
             raise
     except sqlite3.OperationalError:
-        c = sqlite3.connect(uri + "?mode=rw", uri=True, timeout=timeout)
+        c = sqlite3.connect(uri + "?mode=rw", uri=True, timeout=timeout, check_same_thread=check_same_thread)
     c.execute("PRAGMA query_only=ON")
     return c
 
@@ -1856,18 +1866,247 @@ def _completed_card_needs_sweep(job: Path, st: dict) -> bool:
         con.close()
 
 
-def sweep_jobs(skip: Path | None = None) -> None:
-    """Reconcile jobs including old final outcomes whose blocked asks may still be stale; never raises."""
+# Process-local, bounded hints only: never persist a negative reconciliation verdict.
+# Sweeps may run on the tool and reconciler threads; observers have no open transaction.
+#
+# WAL generations: an observer that kept a deleted -wal/-shm mapped (an external process unlinked the
+# sidecars after a stray close dropped this process's locks) would read a frozen data_version and make
+# core kanban_generation.recover() refuse every board connect in the process. So each observer records
+# its -shm identity and is dropped when the live one differs, observers open through core's registered
+# reader (_ro_connect(retained=True)) and _sweep_evict is a registered core reader cache. _SWEEP_DB_LOCK
+# guards _SWEEP_DBS and every observer use/close; it is never held across an open (an open runs
+# recover(), which calls _sweep_evict), and _sweep_evict never waits on it.
+import threading as _sweep_threading
+_SWEEP_LOCK = _sweep_threading.Lock()
+_SWEEP_DB_LOCK = _sweep_threading.Lock()
+_SWEEP_FINAL: dict = {}
+_SWEEP_DBS: dict = {}  # path -> (file identity, connection, generation, -shm identity)
+_SWEEP_DB_GENERATION = 0
+_SWEEP_DB_MAX = 32
+_SWEEP_GENERATION_HOOK = False
+_SWEEP_FILES = ('status.json', 'meta.json', 'owner.json', 'final.lock/result.json',
+                'attachment.json', 'completion-receipt.json', 'completion-payload.json',
+                'completion-pending.json')
+
+
+def _sweep_stat(path: Path):
     try:
-        jobs = [p for p in jobs_dir().iterdir() if p.is_dir() and p != skip]
+        st = path.stat()
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    except FileNotFoundError:
+        return None
+
+
+def _sweep_shm(path: str):
+    try:
+        st = os.stat(path + '-shm')
     except OSError:
-        return
-    for job in jobs:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _sweep_close(con) -> None:
+    try:
+        con.close()
+    except Exception:  # noqa: BLE001 -- a retired observer; nothing to recover
+        log.debug("user_terminal: closing a sweep observer failed", exc_info=True)
+
+
+def _sweep_evict(path: str) -> None:
+    """Core reader-cache hook (``path`` is a realpath): close our observers of that board before core
+    reopens it on a new WAL generation. Never waits: a sweep mid-read raises, and core's caller retries."""
+    if not _SWEEP_DB_LOCK.acquire(blocking=False):
         try:
-            if _completed_card_needs_sweep(job, read_status(job)):
-                watch_once(job, {})
+            from hermes_cli.kanban_generation import DeletedWalGenerationError as _Busy
+        except ImportError:  # pragma: no cover - only core with the registry calls this hook
+            import sqlite3
+            _Busy = sqlite3.OperationalError
+        raise _Busy(f"user-terminal sweep observer of {path} is in use; retry")
+    try:
+        for key in [k for k in _SWEEP_DBS if os.path.realpath(k) == path]:
+            _sweep_close(_SWEEP_DBS.pop(key)[1])
+    finally:
+        _SWEEP_DB_LOCK.release()
+
+
+def _sweep_register_hook() -> None:
+    global _SWEEP_GENERATION_HOOK
+    if _SWEEP_GENERATION_HOOK:
+        return
+    try:
+        from hermes_cli.kanban_generation import register_reader_cache
+    except ImportError:  # older core: the -shm identity check alone retires stranded observers
+        return
+    register_reader_cache(_sweep_evict)
+    _SWEEP_GENERATION_HOOK = True
+
+
+def _sweep_db_stamp(path: str):
+    """Stat catches replacement/WAL changes; data_version catches WAL commit publication.
+
+    WAL bytes can precede SQLite's publication of a commit, so stat equality alone
+    cannot prove the earlier SELECT still describes today's board.
+    """
+    global _SWEEP_DB_GENERATION
+    stamp = tuple(_sweep_stat(Path(path + suffix)) for suffix in ('', '-wal'))
+    if stamp[0] is None:
+        raise FileNotFoundError(path)
+    shm = _sweep_shm(path)
+    with _SWEEP_DB_LOCK:
+        observer = _SWEEP_DBS.get(path)
+        if observer is not None and (observer[0] != stamp[0][:2] or observer[3] != shm):
+            _sweep_close(_SWEEP_DBS.pop(path)[1])  # replaced file or a new/gone WAL generation
+            observer = None
+        if observer is not None:
+            try:
+                return stamp, observer[2], observer[1].execute('PRAGMA data_version').fetchone()[0]
+            except Exception:
+                _sweep_close(_SWEEP_DBS.pop(path)[1])
+                raise
+    _sweep_register_hook()
+    con = _ro_connect(path, check_same_thread=False, retained=True)  # never under _SWEEP_DB_LOCK
+    try:
+        current = _sweep_stat(Path(path))
+        if current is None or current[:2] != stamp[0][:2]:
+            raise FileNotFoundError(f"{path} was replaced while opening its observer")
+        shm = getattr(con, '_hermes_generation_shm', None) or _sweep_shm(path)
+    except BaseException:
+        _sweep_close(con)
+        raise
+    with _SWEEP_DB_LOCK:
+        old = _SWEEP_DBS.pop(path, None)
+        if old is not None:
+            _sweep_close(old[1])
+        while len(_SWEEP_DBS) >= _SWEEP_DB_MAX:
+            _sweep_close(_SWEEP_DBS.pop(next(iter(_SWEEP_DBS)))[1])
+        _SWEEP_DB_GENERATION += 1
+        observer = (stamp[0][:2], con, _SWEEP_DB_GENERATION, shm)
+        _SWEEP_DBS[path] = observer
+        try:
+            return stamp, observer[2], con.execute('PRAGMA data_version').fetchone()[0]
         except Exception:
-            log.exception("user_terminal: reconciling %s failed", job)
+            _sweep_close(_SWEEP_DBS.pop(path)[1])
+            raise
+
+
+def _sweep_json_object(path: Path):
+    """The file's JSON object, or None when unreadable, malformed or not an object. The legacy readers
+    tolerate such files silently, so a fallback decision is re-inspected next pass (never memoized)
+    without logging on every tick."""
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _sweep_nondeliverable(owner: dict) -> bool:
+    """True when watch_once's reconcile pass is a no-op for this FINAL job's owner.
+
+    reconcile_closed_ask and reconcile_completed_card act only on a card owner with a
+    task id and a board path; reconcile_session only on a session owner. Any other
+    decoded owner (none at all, relayed, an unknown kind, or a card lacking either
+    field) has nothing to reconcile, whatever the board, clock or environment say.
+    Keep this in step with those three functions' early returns.
+    """
+    kind = owner.get('kind')
+    if kind == 'session':
+        return False
+    if kind == 'card':
+        return not ((owner.get('task_id') or owner.get('task')) and owner.get('db'))
+    return True
+
+
+def _sweep_remember(job: Path, stamp, db: str) -> None:
+    if len(_SWEEP_FINAL) >= 4096:
+        _SWEEP_FINAL.pop(next(iter(_SWEEP_FINAL)))
+    _SWEEP_FINAL[job] = (stamp, db)
+
+
+def sweep_jobs(skip: Path | None = None) -> None:
+    """Inspect active jobs every pass; memoize only successfully proven final no-work jobs."""
+    if not _SWEEP_LOCK.acquire(blocking=False):
+        return  # another sweep owns reconciliation; no second concurrent DB observer use
+    try:
+        try:
+            root = jobs_dir(create=False).absolute()
+            jobs = [p for p in root.iterdir() if p.is_dir()]
+        except OSError:
+            return
+        present = set(jobs)
+        # Jobs are absolute (root is): compare an absolute skip, or a relative one never matches.
+        skip_abs = Path(skip).absolute() if skip is not None else None
+        for old in list(_SWEEP_FINAL):
+            if old.parent == root and old not in present:
+                _SWEEP_FINAL.pop(old, None)
+        # All jobs on one board share a pre-inspection observation for this pass.
+        # Commits during the pass invalidate it on the next pass, never get relabelled.
+        db_stamps = {}
+        def db_stamp(db):
+            if not db:
+                return None
+            if db not in db_stamps:
+                db_stamps[db] = _sweep_db_stamp(db)
+            return db_stamps[db]
+
+        for job in jobs:
+            if job == skip_abs:
+                continue
+            try:
+                # Capture BEFORE inspection, never label an old decision with new inputs.
+                files = tuple(_sweep_stat(job / name) for name in _SWEEP_FILES)
+                cached = _SWEEP_FINAL.get(job)
+                if cached is not None:
+                    previous, db = cached
+                    if files == previous[0]:
+                        stamp = (files, db_stamp(db))
+                        if stamp == previous:
+                            continue
+                    _SWEEP_FINAL.pop(job, None)
+                st = read_status(job)
+                if st.get('status') not in FINAL:
+                    watch_once(job, {})  # time/process checks are never memoized
+                    continue
+                _, owner = _job_meta_owner(job)
+
+                def malformed() -> bool:
+                    # The legacy readers tolerate malformed/unreadable files; don't memoize
+                    # their fallback decisions. A healthy next pass must retry those reads.
+                    # Quietly: the sweep never logged these before the memo existed.
+                    return any(files[_SWEEP_FILES.index(name)] is not None and _sweep_json_object(job / name) is None
+                               for name in ('status.json', 'meta.json', 'owner.json', 'final.lock/result.json'))
+
+                if _sweep_nondeliverable(owner):
+                    # Structural no-action proof: for a final job, watch_once's reconcile
+                    # pass reads only these job files and returns without any effect, so
+                    # their pre-inspection signatures alone key the memo (no board read).
+                    if malformed():
+                        watch_once(job, {})  # unchanged legacy pass; never a proof
+                        continue
+                    _sweep_remember(job, (files, None), '')
+                    continue
+                db = str(owner.get('db') or '') if owner.get('kind') == 'card' else ''
+                stamp = (files, db_stamp(db))
+                # completion.deliver treats an existing receipt as terminal before any
+                # authority/route lookup. Pending/backoff/lock contention are NOT receipts.
+                settled_session = False
+                receipt_ok = True
+                if owner.get('kind') == 'session' and files[_SWEEP_FILES.index('completion-receipt.json')] is not None:
+                    receipt = _sweep_json_object(job / 'completion-receipt.json')
+                    receipt_ok = receipt is not None
+                    settled_session = receipt is not None and receipt.get('status') in ('admitted', 'missing')
+                if not settled_session and _completed_card_needs_sweep(job, st):
+                    watch_once(job, {})
+                    continue  # an attempted reconcile/delivery is NOT a settled decision
+                if not receipt_ok or malformed():
+                    log.debug("user_terminal: %s has a malformed state file; not memoized", job)
+                    continue
+                _sweep_remember(job, stamp, db)
+            except Exception:
+                _SWEEP_FINAL.pop(job, None)
+                log.exception("user_terminal: reconciling %s failed", job)
+    finally:
+        _SWEEP_LOCK.release()
 
 
 def _claim_watchdog(job: Path) -> bool:

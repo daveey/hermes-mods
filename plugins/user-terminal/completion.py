@@ -282,8 +282,14 @@ async def admit(runner, authority, payload):
 def admit_producer(payload, home):
     """Core owns legacy routing and durability; no gateway publication is needed to queue.
 
-    None means routed, not delivered. Read back the same producer after admission
-    (and before a retry) so a lost acknowledgment cannot create a second notice.
+    None means routed, not delivered. ``admit_producer_completion`` looks up this producer
+    inside its own write transaction and returns an existing row's receipt instead of
+    inserting, so a lost acknowledgment cannot create a second notice and no separate
+    read precedes it (each read is a full writable profile-store open, and a routed
+    completion with no live owner repeats this on every backoff retry). Its one
+    divergence, ValueError for an existing row with another payload (or invalid text),
+    falls back to that read, reproducing the read-first outcome exactly. A fresh
+    admission is still read back before it counts.
     """
     try:
         from hermes_state_producer_admission import (
@@ -291,9 +297,13 @@ def admit_producer(payload, home):
     except ImportError as exc:
         raise Unavailable('producer_ingress_unavailable') from exc
     args = {'producer': payload['identity'], 'profile_home': Path(home)}
-    result = read_producer_admission(**args)
-    if result['outcome'] == 'absent':
+    try:
         result = admit_producer_completion(**args, stored_session_id=payload['session_id'], text=payload['text'])
+    except ValueError:
+        result = read_producer_admission(**args)
+        if result['outcome'] == 'absent':
+            raise
+    else:
         if result['outcome'] == 'admitted':
             result = read_producer_admission(**args)
     outcome = result['outcome']

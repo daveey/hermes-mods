@@ -1,5 +1,6 @@
 """Closed-window ask lifetime: isolated real core board, never live writes."""
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -232,6 +233,22 @@ def production_python(core: Path) -> str | None:
     return str(exe) if exe.is_file() else None
 
 
+def watchdog_env(core: Path, python: str) -> dict:
+    """Environment for a standalone watchdog subprocess: no inherited PYTHONPATH, core found only
+    through HERMES_USER_TERMINAL_CORE_ROOT. Production's interpreter gets core's dependencies from
+    the committed environment under the Hermes home; an isolated test HOME (scripts/test-all, env -i)
+    has none, and the runner supplied them only through PYTHONPATH site-packages. So when the child
+    is this runner's own interpreter, forward those dependency entries alone (never core or a repo)."""
+    env = ut.launch_env()
+    env["HERMES_USER_TERMINAL_CORE_ROOT"] = str(core)
+    env.pop("PYTHONPATH", None)
+    if os.path.realpath(python) == os.path.realpath(sys.executable):
+        deps = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if Path(p).name == "site-packages"]
+        if deps:
+            env["PYTHONPATH"] = os.pathsep.join(deps)
+    return env
+
+
 def test_standalone_watchdog_bootstraps_real_core(board):
     path, job, db = board
     final(job)
@@ -240,11 +257,9 @@ def test_standalone_watchdog_bootstraps_real_core(board):
     if python is None:
         pytest.skip(f"no production watchdog interpreter: no runtime launcher under {core}/.hermes/bin "
                     "and HERMES_USER_TERMINAL_WATCHDOG_PYTHON unset")
-    env = ut.launch_env()
-    env["HERMES_USER_TERMINAL_CORE_ROOT"] = str(core)
-    env.pop("PYTHONPATH", None)
     # Run the exact standalone entry point on the interpreter watchdog.sh execs, with no inherited
     # sys.path/modules (the runner's own Python differed from production: 3.11 vs 3.14).
+    env = watchdog_env(core, python)
     result = subprocess.run([python, str(SOURCE), "--watchdog", str(job)], env=env,
                             text=True, capture_output=True, timeout=60)
     assert result.returncode == 0, result.stderr
@@ -410,7 +425,11 @@ def test_watchdog_waits_out_a_busy_board_the_sweep_does_not(board, monkeypatch):
     real = kanban_lockguard.connect
 
     def spy(*a, **k):
-        seen.append(k.get("timeout"))
+        # The sweep's retained read-only observer opens through core's kanban_generation.open_ro (its own
+        # fixed timeout, never a write-lock wait); only the plugin's own board opens count here.
+        if not any(f.function == "open_ro" and f.filename.endswith("kanban_generation.py")
+                   for f in inspect.stack()[1:4]):
+            seen.append(k.get("timeout"))
         return real(*a, **k)
     monkeypatch.setattr(kanban_lockguard, "connect", spy)
     ut.sweep_jobs()
