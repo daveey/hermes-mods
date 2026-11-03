@@ -288,3 +288,22 @@ def test_real_core_actor_and_skill_lookup(tmp_path, monkeypatch):
         reset_ledger_actor(tok)
     assert "size_budget_warning" in json.loads(real._transform_tool_result(
         tool_name="skill_manage", args=args, result=json.dumps({"success": True}), tool_call_id="r2"))
+
+
+def test_inventory_labels_upstream_current_orphan_and_owned(tmp_path):
+    import subprocess
+    inv = _load("skill_size_budget_inventory", "inventory.py")
+    core = tmp_path / "core"
+    for rel in ("skills/a/shipped/SKILL.md", "optional-skills/b/retired/SKILL.md"):
+        (core / rel).parent.mkdir(parents=True)
+        (core / rel).write_text(FM)
+    git = ["git", "-C", str(core), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(git[:3] + ["init", "-q"], check=True)
+    subprocess.run(git + ["add", "-A"], check=True)
+    subprocess.run(git + ["commit", "-qm", "add"], check=True)
+    subprocess.run(git + ["rm", "-rq", "optional-skills/b/retired"], check=True)
+    subprocess.run(git + ["commit", "-qm", "retire"], check=True)
+    cur, hist = inv.upstream_names(core), inv.upstream_history_names(core)
+    assert inv.owner("shipped", cur, hist) == "upstream"
+    assert inv.owner("retired", cur, hist) == "upstream-orphan"
+    assert inv.owner("ours", cur, hist) == "owned"

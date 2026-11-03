@@ -13,12 +13,29 @@ from pathlib import Path
 _HUMAN_SOURCES = ("desktop", "cli", "tui", "local", "telegram", "slack", "discord", "imessage", "signal", "whatsapp")
 
 
+def _ro_connect(path: Path, timeout: float = 10) -> sqlite3.Connection:
+    """Read-only open of a live WAL db. mode=ro fails (Apple SQLite) once writers deleted -wal/-shm, so fall back
+    to mode=rw + PRAGMA query_only: same data, never writes, and mode=rw never creates a missing db."""
+    uri = Path(path).resolve().as_posix()
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{uri}?mode=ro", uri=True, timeout=timeout)
+        con.execute("select 1 from sqlite_master limit 1")
+        return con
+    except sqlite3.OperationalError:
+        if con is not None:
+            con.close()
+        con = sqlite3.connect(f"file:{uri}?mode=rw", uri=True, timeout=timeout)
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+
 def mine_phrasings(db: Path, max_len: int = 400, per_skill: int = 6, min_len: int = 25) -> dict[str, list[str]]:
     """{skill: [user message that immediately preceded a skill_view(skill) in a human chat]}.
 
     Parses tool_calls as JSON (a regex over the raw string misses escaped arguments)."""
     out: dict[str, list[str]] = {}
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+    con = _ro_connect(db, timeout=10)
     try:
         q = (f"select m.session_id, m.role, m.content, m.tool_calls from messages m join sessions s on s.id=m.session_id "
              f"where s.source in ({','.join('?' * len(_HUMAN_SOURCES))}) and m.role in ('user','assistant') "

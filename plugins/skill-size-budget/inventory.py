@@ -3,8 +3,9 @@
 
   inventory.py [--lines 500] [--chars 30000] [--core ~/.hermes/hermes-agent] DIR [DIR ...]
 
-One line per skill: lines, chars, owner (``upstream`` when a skill of that name ships in core's skills/ or
-optional-skills/, else ``owned``), path. Duplicate real paths are listed once.
+One line per skill: lines, chars, owner, path. Owner is ``upstream`` when a skill of that name ships in core's
+skills/ or optional-skills/ now, ``upstream-orphan`` when it only appears there in core's git history (upstream
+retired, merged or moved it and our copy is upstream text), else ``owned``. Duplicate real paths are listed once.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,6 +31,22 @@ def upstream_names(core: Path) -> set[str]:
     return names
 
 
+def upstream_history_names(core: Path) -> set[str]:
+    """Names of every SKILL.md dir that ever existed under core's skills/ or optional-skills/ (all refs)."""
+    try:
+        out = subprocess.run(["git", "-C", str(core), "log", "--all", "--format=", "--name-only", "--",
+                              "skills", "optional-skills"], capture_output=True, text=True, timeout=120).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {Path(line).parent.name for line in out.splitlines() if line.endswith("/SKILL.md")}
+
+
+def owner(name: str, current: set[str], history: set[str]) -> str:
+    if name in current:
+        return "upstream"
+    return "upstream-orphan" if name in history else "owned"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
@@ -38,6 +56,7 @@ def main() -> int:
     a = ap.parse_args()
     core = Path(a.core)
     up = upstream_names(core)
+    hist = upstream_history_names(core)
     seen, rows = set(), []
     for d in a.dirs:
         for p in Path(os.path.expanduser(d)).glob("**/SKILL.md"):
@@ -47,9 +66,9 @@ def main() -> int:
             seen.add(rp)
             lines, chars = budget.measure(p.read_text(encoding="utf-8", errors="replace"))
             if lines > a.lines or chars > a.chars:
-                rows.append((lines, chars, "upstream" if p.parent.name in up else "owned", str(p)))
+                rows.append((lines, chars, owner(p.parent.name, up, hist), str(p)))
     for r in sorted(rows, key=lambda r: (r[2], -r[1])):
-        print(f"{r[0]:5d} {r[1]:7,d} {r[2]:8s} {r[3]}")
+        print(f"{r[0]:5d} {r[1]:7,d} {r[2]:15s} {r[3]}")
     return 0
 
 
