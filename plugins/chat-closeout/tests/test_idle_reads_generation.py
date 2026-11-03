@@ -195,8 +195,8 @@ def test_observers_are_shared_across_threads_and_globally_bounded(tmp_path, monk
         t.join(30)
     assert not errors
     assert len(cache.entries) <= 2
-    open_dbs = [n for n in os.listdir('/proc/self/fd') if sys.platform.startswith('linux')
-                and os.path.realpath(f'/proc/self/fd/{n}').startswith(str(tmp_path / 'state'))]
+    fds = os.listdir('/proc/self/fd') if sys.platform.startswith('linux') else []  # no /proc on macOS
+    open_dbs = [n for n in fds if os.path.realpath(f'/proc/self/fd/{n}').startswith(str(tmp_path / 'state'))]
     assert len(open_dbs) <= 2 * 3
 
 
