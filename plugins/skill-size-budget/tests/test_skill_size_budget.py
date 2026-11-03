@@ -272,6 +272,11 @@ def test_failed_write_gets_no_warning(monkeypatch):
 
 def test_real_core_actor_and_skill_lookup(tmp_path, monkeypatch):
     """Real skill-ledger actor binding, real _find_skill file read and real fuzzy patch matcher."""
+    if not os.environ.get("HERMES_CORE_CHECKOUT"):
+        pytest.importorskip(
+            "tools.skill_ledger",
+            reason="needs Hermes core on PYTHONPATH (scripts/test-all with core; plugin-suites CI has none)")
+    # With core named, a missing/renamed module must fail here, never skip.
     from tools.skill_ledger import reset_ledger_actor, set_ledger_actor
 
     home = tmp_path / "home"
