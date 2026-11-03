@@ -170,11 +170,13 @@ def test_cli_flush_and_rollup(home, capsys):
     rows = core.read_lines(core.home_logs(home) * 2)  # duplicates across sources are dropped
     assert len(rows) == 3
     tab = {d["skill"]: d for d in core.rollup(rows, t - 100, t + 100)}
-    assert tab["five-whys"] == {"skill": "five-whys", "uses": 2, "ticked": 2, "first_pass_rate": 0.5,
-                                "mean_fix_rounds": 1.0, "correction_rate": 0.5}
+    # correction rate is over uses a real reply closed: s1 got none, s2 got "that's wrong, redo it"
+    assert tab["five-whys"] == {"skill": "five-whys", "uses": 2, "ticked": 2, "replied": 1, "first_pass_rate": 0.5,
+                                "mean_fix_rounds": 1.0, "correction_rate": 1.0}
     assert tab["other"]["ticked"] == 0 and tab["other"]["first_pass_rate"] is None
+    assert tab["other"]["replied"] == 0 and tab["other"]["correction_rate"] is None
     md = "\n".join(core.rollup_lines(rows, t - 100, t + 100))
-    assert "| five-whys | 2 | 2 | 50% | 1.00 | 50% |" in md
+    assert "| five-whys | 2 | 2 | 50% | 1.00 | 1 | 100% |" in md
     assert "No skill uses" in "\n".join(core.rollup_lines([], 0, 1))
     # a mismatched tick-off is excluded and counted (here forced on the 5/5 row)
     assert not any(r.get("tickoff_mismatch") for r in rows)

@@ -46,6 +46,7 @@ SYNTHETIC_RE = re.compile(
     r"[✔✓✗✖⚠⏸]|\[?Canonical user decision|New note on your kanban task)", re.I)
 # sessions.source values whose user turns are written by Hermes or a parent agent, never by a person
 MACHINE_SOURCES = {"subagent", "cron", "kanban", "tool"}
+REPLIED_SOURCES = ("keyword", "coach", "next_message")  # finalized on a real user reply
 # Fallback copy of coach's lessons.PREFILTER_RE, used only when the coach plugin is not installed next to this one.
 _FALLBACK_CORRECTION_RE = re.compile(
     r"^\s*(no\b|nope|wait\b|actually\b|that'?s (?:not|wrong)|i said|i meant|don'?t\b|stop\b|why (?:did|are|would) you|"
@@ -438,9 +439,11 @@ def rollup(rows: list, lo: float, hi: float) -> list:
         # a tick-off whose total doesn't match the skill's list is not trusted for first-pass / fix rounds
         ticked = [r for r in rs if r.get("checks_first_pass") is not None and not r.get("tickoff_mismatch")]
         fixes = [r["fix_rounds"] for r in ticked if isinstance(r.get("fix_rounds"), int)]
+        # over uses a real user reply closed (Kanban/cron/subagent uses get no reply and would read as 0%);
         # rules < RULES lines could miss or misread the user's reply (see RULES): not counted
-        corr = [r for r in rs if r.get("user_correction") is not None and (r.get("rules") or 1) >= RULES]
-        out.append({"skill": skill, "uses": len(rs), "ticked": len(ticked),
+        corr = [r for r in rs if r.get("user_correction") is not None and (r.get("rules") or 1) >= RULES
+                and r.get("correction_source") in REPLIED_SOURCES]
+        out.append({"skill": skill, "uses": len(rs), "ticked": len(ticked), "replied": len(corr),
                     "first_pass_rate": round(sum(1 for r in ticked if r["checks_first_pass"]) / len(ticked), 3)
                     if ticked else None,
                     "mean_fix_rounds": round(statistics.mean(fixes), 2) if fixes else None,
@@ -459,8 +462,8 @@ def rollup_lines(rows: list, lo: float, hi: float, top: int = 25, title: str = "
     hosts = sorted({r.get("host") or "?" for r in rows if lo <= (r.get("ts") or 0) < hi})
     out = [f"## {title}", "",
            "Per skill use (skill-outcomes plugin): first-pass rate and mean fix rounds over uses that ended with a "
-           "`Done means (<skill>): p/t first pass, k fix rounds` tick-off; correction rate = the user's next "
-           "message was a correction (coach regex or judge).", ""]
+           "`Done means (<skill>): p/t first pass, k fix rounds` tick-off; correction rate = share of the uses a real "
+           "user reply closed (`replied`) whose reply was a correction (coach regex or judge).", ""]
     if not tab:
         return out + ["No skill uses logged in this window (`logs/skill-outcomes.jsonl` empty on every host read)."]
     n = sum(d["uses"] for d in tab)
@@ -472,14 +475,14 @@ def rollup_lines(rows: list, lo: float, hi: float, top: int = 25, title: str = "
     old = sum(1 for r in rows if lo <= (r.get("ts") or 0) < hi and (r.get("rules") or 1) < RULES)
     if old:
         out.append(f"{old} line(s) predate the correction-rule fix (rules<{RULES}); left out of correction rate.")
-    out += ["", "| Skill | uses | ticked | first-pass | mean fix rounds | correction rate |",
-            "|---|---:|---:|---:|---:|---:|"]
+    out += ["", "| Skill | uses | ticked | first-pass | mean fix rounds | replied | correction rate |",
+            "|---|---:|---:|---:|---:|---:|---:|"]
     for d in tab[:top]:
         mf = "n/a" if d["mean_fix_rounds"] is None else f"{d['mean_fix_rounds']:.2f}"
         out.append(f"| {d['skill']} | {d['uses']} | {d['ticked']} | {_pct(d['first_pass_rate'])} | {mf} | "
-                   f"{_pct(d['correction_rate'])} |")
+                   f"{d['replied']} | {_pct(d['correction_rate'])} |")
     if len(tab) > top:
-        out.append(f"| … {len(tab) - top} more | {sum(d['uses'] for d in tab[top:])} | | | | |")
+        out.append(f"| … {len(tab) - top} more | {sum(d['uses'] for d in tab[top:])} | | | | | |")
     return out
 
 
