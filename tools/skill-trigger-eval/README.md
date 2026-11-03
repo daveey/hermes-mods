@@ -43,9 +43,11 @@ $P --core <core-wt> run --variant fmt-c --overrides formats/c.json --flag HERMES
 $P cost --variant base= --variant c=formats/c.json@HERMES_SKILL_INDEX_TRIGGERS=1 --alt-core <core-wt>
 ```
 
-`--flag K=V` sets an env var for the index render only. `HERMES_SKILL_INDEX_DESC_LIMIT` (row length) and
-`HERMES_SKILL_INDEX_TRIGGERS` (render `triggers:` frontmatter as `Asks: "..". Not for: ..`) are prototype flags
-in a core worktree; a core without them ignores them.
+Core renders a skill's `triggers:` frontmatter on its index row as `Asks: "..". Not for: ..` by default
+(config `skills.index_triggers`, default true; daveey/hermes PR #771), so `run --variant after-core` against the
+installed core needs no flag. `--flag K=V` sets an env var for the index render only;
+`HERMES_SKILL_INDEX_DESC_LIMIT` and `HERMES_SKILL_INDEX_TRIGGERS` were the pre-landing prototype's flags and only
+matter for an old prototype worktree passed as `--core`.
 
 Cross-host usage for the retire list: `collect_usage.sh` prints every home's `skills/.usage.json`; `usage.py`
 merges dumps (`parse_dump`, `merge`, `idle`).

@@ -3,8 +3,8 @@
 Formats (keys of the returned dict):
   a2  short:   <= 60 chars, "Use when <trigger>. <behavior>." (fits today's core limit)
   b   pdf:     output, input, 3 real phrases, 1 "Not for" in one row (needs a wider index row)
-  c   triggers: the a2 short description + hidden ``triggers: {asks: [3], not_for}`` frontmatter, rendered by the
-               prompt-builder prototype only when HERMES_SKILL_INDEX_TRIGGERS is set
+  c   triggers: the a2 short description + hidden ``triggers: {asks: [3], not_for}`` frontmatter, rendered by core
+               by default (config ``skills.index_triggers``, default true)
 
 The drafter sees the SKILL.md, the index and which skills the baseline confused it with; it never sees the
 trigger card, so the eval measures the description, not a copy of the test.

@@ -20,7 +20,8 @@ import yaml
 
 DEFAULT_CORE = Path.home() / ".hermes" / "hermes-agent"
 DEFAULT_HOME = Path.home() / ".hermes"
-# Prototype flags read by the core worktree (see README "Formats"); ignored by a core without them.
+# Env flags read only by the pre-landing prototype core worktree (see README). Landed core renders `triggers:`
+# by default (config `skills.index_triggers`, default true) and ignores these.
 FLAG_ENV = ("HERMES_SKILL_INDEX_DESC_LIMIT", "HERMES_SKILL_INDEX_TRIGGERS")
 
 _CHILD_ROOTS = r"""
