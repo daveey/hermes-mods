@@ -11,7 +11,8 @@ import pytest
 from test_compute_authority import RELAYED_ASK, call
 from test_compute_envelope import HERE, _log
 
-SPEND_LINE = 'Spend so far is $0.56 of the $36, and Vast shows exactly one GPU running.'
+# The would-be hold: names the $36 cap (a bare "of the $36" readback is not a cap; test_compute_authority.py).
+SPEND_LINE = 'Spend so far is $0.56 of the $36 cap, and Vast shows exactly one GPU running.'
 
 
 def _hooks_and_scope(tmp_path, monkeypatch):

@@ -76,15 +76,76 @@ def enabled() -> bool:
     return os.environ.get("COACH_COMPUTE_ENVELOPE", "1").strip().lower() not in ("0", "off", "false", "no")
 
 
+def _money_text(text: str) -> str:
+    """`text` with "3,000 USD" / "USD 3,000" written as "$3,000", so MONEY_RE sees every figure."""
+    text = re.sub(r"\b(\d[\d,]*(?:\.\d+)?)\s+USD\b", r"$\1", text or "", flags=re.I)
+    return re.sub(r"\bUSD\s*", "$", text, flags=re.I)
+
+
+def _usd(m: re.Match) -> float:
+    v = float(m.group(1).replace(",", "") + ("." + m.group(2) if m.group(2) else ""))
+    return v * 1000 if m.group(3) else v
+
+
 def totals(text: str) -> list[float]:
     """Dollar totals named in the text; hourly rates ($0.45/h) are not totals."""
+    return [_usd(m) for m in MONEY_RE.finditer(_money_text(text)) if not m.group(4)]
+
+
+# A figure is a cap the agent set only when a cap word governs it: "$60 cap", "budget: $3,000", "up to $3000",
+# "spend $3000", "capped at $90", "$3000 GPU budget", "spend no more than $70", with only connecting words between.
+# Sharing a sentence with a cap word is not enough. Live false holds (coach logs on both hosts, 10-31 .. 11-02):
+# an account readback ("- **Spend:** credit is $103.49"), spend so far ("Spend so far is $0.56 of the $36"), a
+# quoted example ("OK to spend $500/month ...?"), code being described ("the $36 check runs before the lock").
+CAP_WORDS = frozenset({"cap", "caps", "capped", "budget", "budgets", "budgeted", "limit", "limits", "limited",
+                       "ceiling", "upto", "spend"})
+CAP_CONNECTORS = frozenset({
+    "a", "an", "the", "of", "at", "to", "is", "be", "set", "it", "its", "this", "for", "run", "card", "per", "each",
+    "total", "max", "maximum", "hard", "soft", "firm", "strict", "overall", "new", "gpu", "gpus", "rental", "compute",
+    "about", "around", "approximately", "roughly", "under", "below", "within", "no", "more", "than", "most", "not",
+    "exceed", "over"})
+# "Spend:" / "spend so far" / "spend is" label a measured amount, not a commitment to spend.
+SPEND_LABEL_RE = re.compile(r"\bspend(?=\s*:|\s+(?:so far|to date|is|was)\b)", re.I)
+# A figure followed by these is a balance or a running total ("$40 left", "$103.49 credit remaining").
+READBACK_AFTER_RE = re.compile(r"\s*(?:left|remaining|so far|to date|spent|used|available|unused|in credit|credit|"
+                               r"balance)\b", re.I)
+QUOTED_RE = re.compile(r"\"[^\"\n]{0,400}\"|\u201c[^\u201d\n]{0,400}\u201d")
+CLAUSE_BREAK_RE = re.compile(r"[,;()\[\]|]|\s[-\u2013\u2014]\s")
+
+
+def _cap_words(text: str) -> list[str]:
+    """Lower-case words of `text`, "up to" as one word, a hyphenated word as its last part ("sub-cap" -> "cap")."""
+    text = re.sub(r"\bup\s+to\b", "upto", text.lower())
+    return [w.rsplit("-", 1)[-1] for w in re.findall(r"[a-z]+(?:-[a-z]+)*", text)]
+
+
+def _governed(words) -> bool:
+    """A cap word reached through connecting words only, in the order given (nearest the figure first)."""
+    for w in list(words)[:6]:
+        if w in CAP_WORDS:
+            return True
+        if w not in CAP_CONNECTORS:
+            return False
+    return False
+
+
+def cap_amounts(sent: str) -> list[float]:
+    """Dollar totals in `sent` that a cap word governs. Quoted text, readbacks and hourly rates are not caps."""
+    s = QUOTED_RE.sub(" ", _money_text(sent)).replace("*", "").replace("`", "")
+    s = SPEND_LABEL_RE.sub("spent", s)
+    found = list(MONEY_RE.finditer(s))
     out = []
-    text = re.sub(r"\b(\d[\d,]*(?:\.\d+)?)\s+USD\b", r"$\1", text or "", flags=re.I)
-    for m in MONEY_RE.finditer(re.sub(r"\bUSD\s*", "$", text, flags=re.I)):
+    for i, m in enumerate(found):
         if m.group(4):
             continue
-        v = float(m.group(1).replace(",", "") + ("." + m.group(2) if m.group(2) else ""))
-        out.append(v * 1000 if m.group(3) else v)
+        left = s[found[i - 1].end() if i else 0:m.start()]
+        right = s[m.end():found[i + 1].start() if i + 1 < len(found) else len(s)]
+        if READBACK_AFTER_RE.match(right):
+            continue
+        left = CLAUSE_BREAK_RE.split(left)[-1]
+        right = CLAUSE_BREAK_RE.split(right)[0]
+        if _governed(reversed(_cap_words(left))) or _governed(_cap_words(right)):
+            out.append(_usd(m))
     return out
 
 
@@ -262,7 +323,7 @@ def _authority(text: str, user_texts=(), asked=()) -> Optional[dict]:
         if not commitment and (REQUEST_RE.search(sent) or PAST_RE.search(sent) or DENY_RE.search(sent)
                 or (re.search(r"\bneeds?\b", sent, re.I) and REQUEST_RE.search(text))):
             continue
-        amounts = totals(sent) if re.search(r"\b(?:cap|budget|limit|up to|spend)\b", sent, re.I) else []
+        amounts = cap_amounts(sent)
         count_text = MONEY_RE.sub("money", re.sub(r"\bUSD\s*", "$", sent, flags=re.I))
         count_text = re.sub(r"\bnot\s+multi[- ]gpu\b", "single GPU", count_text, flags=re.I)
         multi = bool(AUTH_MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", count_text)))

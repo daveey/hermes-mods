@@ -119,14 +119,23 @@ inherit nothing; "Approve $50 or $100?" + yes credits $50. Only typed user text 
 and relay rows (`[chat-closeout] ...`, `⏸ [hub:default] ...`) never grant dollars, even when they quote
 the ask. Questions, denials and injected task/skill wrappers are not approval; teardown caveats
 in a separate clause do not erase it. Genuine approval requests and historical spend reports pass.
+A dollar figure is a declared cap only when a cap word governs it (`cap_amounts`): "$60 cap", "budget: $3,000",
+"up to $3000", "spend $3000", "capped at $90", "$3000 GPU budget", "spend no more than $70", with only connecting
+words (of, at, is set to, under, no more than, GPU, rental, ...) in between, in the same clause. Sharing a
+sentence with a cap word is not enough, so an account or spend readback ("**Spend:** credit is $103.49",
+"Spend so far is $0.56 of the $36", "budget: $40 left"), a quoted example ("OK to spend $500/month?") and a
+figure in prose about the check itself ("the $36 check runs before the lock") pass; the cap is caught where it
+is declared, not where a readback later mentions it.
 The nudge quotes the standing single-GPU/$25 rule and directs calibration inside it, then a blocked card
 asking for a number. A repeat logs `agent_fault` and passes: this is deterministic coaching, not a hard
 purchase or budget authorization boundary. Ambiguous language can still require agent judgment.
 Tests: `tests/test_compute_authority.py` covers all three surfaces, deferred creation, the reply backstop,
 $215 approval, $20 caps, past spend, provenance, numeric/word GPU counts, one-shot behavior, and the
-answered-ask flow with its negatives; `tests/test_compute_authority_persisted.py` replays the 2026-11-01 live
+answered-ask flow with its negatives, the cap binding (`test_readbacks_quotes_and_unbound_figures_are_not_caps`:
+the six live false holds of 10-31 .. 11-02 verbatim plus two readback shapes; `test_bound_cap_phrasings_are_held`)
+; `tests/test_compute_authority_persisted.py` replays the 2026-11-01 live
 false hold (David's "approved" to the $36 ask, compacted out of the window, then "Spend so far is $0.56 of the
-$36") through a real SessionDB on all three surfaces, and covers a rewound yes, an unpriced ask, a summary in
+$36 cap") through a real SessionDB on all three surfaces, and covers a rewound yes, an unpriced ask, a summary in
 the live or persisted transcript, the read only on a would-be hold, a failed read, and the empty cases;
 `tests/test_compute_authority_origin.py` replays the hub worker of card t_01a193e011b0a776 (origin chat on
 gateway `macbook`, served by a fake Desktop courier from a real SessionDB): $36 passes on all three surfaces and

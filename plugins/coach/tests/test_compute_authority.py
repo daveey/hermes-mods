@@ -253,3 +253,43 @@ def test_unpriced_go_does_not_authorize_agent_cap(tmp_path, monkeypatch, surface
         note = out['message']
     assert '$25' in note and 'blocked card' in note
     assert any(r.get('rule') == 'compute_authority' for r in _log(tmp_path))
+
+
+# Live false holds (coach logs on both hosts, 10-31 .. 11-02), verbatim: an account readback, spend so far, a
+# remaining balance, a quoted example, or a figure that only shares a sentence with a cap word is not a cap the
+# agent set. No approval is in scope here, so each of these held before the cap had to be bound to its figure.
+TOPIC = '\nVast shows one L40S GPU running.'
+
+
+@pytest.mark.parametrize('surface', ['reply', 'kanban_create', 'kanban_block'])
+@pytest.mark.parametrize('text', [
+    '- **Spend:** credit is $103.49, down $0.30 since teardown, and that drop is the other machine.',
+    '- Spend so far is $0.56 of the $36, and Vast shows exactly one GPU running (checked at 1:58 PM).',
+    '- **Cap check outside the lock:** the $36 check runs before the native ledger lock, and the native '
+    'per-card caps have no entry for this card.',
+    'I fixed the spend guard: it was wrongly flagging the $36 rerun you approved.',
+    '- **Real spend/change asks it misses:** "OK to spend $500/month on on-demand hosts?", "Is it fine to rent a '
+    'GPU for $40?", "Go ahead with the on-demand switch?", "Reply yes to switch CI to on-demand."',
+    '- Created budget-decision card `t_01a193e011b0a776`: proposed **$36 maximum**, one L40S, approximately '
+    '**30\u201333 hours**.',
+    'GPU spend: $103.49 credit remaining on Vast.',
+    'GPU rental budget: $40 left.',
+])
+def test_readbacks_quotes_and_unbound_figures_are_not_caps(tmp_path, monkeypatch, surface, text):
+    assert call(_hooks(tmp_path, monkeypatch), surface, text + TOPIC) is None
+
+
+# Binding the figure to its cap word keeps every phrasing an agent can use to grant itself spend.
+@pytest.mark.parametrize('surface', ['reply', 'kanban_create', 'kanban_block'])
+@pytest.mark.parametrize('text', [
+    'I will keep total GPU spend under $100 for this run.',
+    'GPU budget is set to $80 on one L40S.',
+    'GPU rental capped at $90, one H100.',
+    'GPU rental budget: **$40** for this run.',
+    'Renting one L40S on Vast, budget for this run: $60.',
+    'I will spend no more than $70 on the GPU rental.',
+    'One L40S with a hard sub-cap of $30 per card.',
+    'Spend: $13.47 so far; the new GPU rental cap is $50.',
+])
+def test_bound_cap_phrasings_are_held(tmp_path, monkeypatch, surface, text):
+    assert call(_hooks(tmp_path, monkeypatch), surface, text)
