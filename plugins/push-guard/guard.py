@@ -21,6 +21,11 @@ suffix is accepted: builds before exact matching compared substrings, so ``owner
   held to the same rule for the PR's ``headRefOid``, with or without ``--admin``: admin credentials can bypass
   branch protection even in an ordinary merge when admin enforcement is disabled. ``allow`` is ignored for
   such guards: the check is the gate. Enable server-side admin enforcement too; this hook is defense in depth.
+  A green head is not enough for ``gh pr merge`` when the base branch moved under it: if commits on the base branch
+  since ``merge-base(head, base)`` change any file the PR changes, the merge is refused, naming those files and
+  commits (rebase, then wait for the check on the new head; ``wt/*`` branches: ``hermes-core-wt ship <slug>``).
+  Read through GitHub's compare API; an unreadable compare blocks too. Why: daveey/hermes PR #475 landed green but
+  250 commits stale on 2026-11-02, onto two commits that changed its files, and main went red.
 
 ``PUSH_GUARD=off`` anywhere in the command skips the check (emergencies; say why). Pushes made inside other tools
 (hermes-core-wt, hermes-sync, hermes update) are not agent tool calls and are never seen here.
@@ -306,6 +311,126 @@ def _merge_repo(cwd: str, sel: Optional[str], repo: Optional[str]) -> str:
     return _slug(_git(cwd, "remote", "get-url", "origin") or "")
 
 
+COMPARE_FILE_CAP = 300  # GitHub's compare lists at most this many files; a full list may be truncated
+STALE_COMMIT_CAP = 1000  # main commits since the PR's base the guard will page through before calling it too stale
+PATH_QUERY_CAP = 60  # per-path history reads on a truncated compare before calling it unverifiable
+
+
+def _compare(slug: str, base: str, head: str, page: int = 0):
+    q = f"?per_page=100&page={page}" if page else ""
+    data, err = _gh_json(["api", f"repos/{slug}/compare/{base}...{head}{q}"])
+    if err is not None or not isinstance(data, dict) or not (data.get("merge_base_commit") or {}).get("sha"):
+        return None, err or "bad compare response"
+    return data, None
+
+
+def _names(data) -> list[str]:
+    return [str(f.get("filename")) for f in (data or {}).get("files") or [] if isinstance(f, dict) and f.get("filename")]
+
+
+def _pr_files(slug: str, number, listed: list[str]):
+    """Every file the PR changes: the compare's list, or GitHub's paginated PR file list when that one is full."""
+    if len(listed) < COMPARE_FILE_CAP or not number:
+        return listed, None
+    out: list[str] = []
+    for page in range(1, 31):
+        data, err = _gh_json(["api", f"repos/{slug}/pulls/{number}/files?per_page=100&page={page}"])
+        if err is not None or not isinstance(data, list):
+            return None, err or "bad pulls/files response"
+        out += [str(f["filename"]) for f in data if isinstance(f, dict) and f.get("filename")]
+        if len(data) < 100:
+            return out, None
+    return None, "the PR changes more than 3000 files"
+
+
+def _path_commits(slug: str, tip: str, path: str, moved: set) -> Optional[list[str]]:
+    """Commits of `moved` (base-branch commits since the PR's merge-base) that change `path`, newest first."""
+    data, err = _gh_json(["api", f"repos/{slug}/commits?sha={tip}&path={urllib.parse.quote(path)}&per_page=100"])
+    if err is not None or not isinstance(data, list):
+        return None
+    return [str(c["sha"]) for c in data if isinstance(c, dict) and c.get("sha") in moved]
+
+
+def base_overlap(slug: str, base: str, head: str, number=None) -> dict:
+    """What the base branch changed under a PR since the base its head was built (and CI-tested) on.
+
+    Returns {"behind": n, "merge_base": sha, "tip": sha, "overlap": {path: [commit shas]}} or {"error": why}.
+    `overlap` holds the PR's files that base-branch commits since merge-base(head, base) also change: the green
+    check on the head never ran with those changes. Reads GitHub's compare API (no local clone needed). That API
+    lists at most 300 files, so a full list is completed path by path from the base branch's history.
+    """
+    first, err = _compare(slug, base, head)
+    if first is None:
+        return {"error": err}
+    mb, tip = str(first["merge_base_commit"]["sha"]), str((first.get("base_commit") or {}).get("sha") or base)
+    behind = int(first.get("behind_by") or 0)
+    out = {"behind": behind, "merge_base": mb, "tip": tip, "overlap": {}}
+    if behind == 0:
+        return out  # the head already contains the base tip: what CI tested is what lands
+    if behind > STALE_COMMIT_CAP:
+        return {**out, "error": f"the base branch is {behind} commits past the PR's base (cap {STALE_COMMIT_CAP})"}
+    pr_files, err = _pr_files(slug, number, _names(first))
+    if pr_files is None:
+        return {**out, "error": f"the PR's file list could not be read ({err})"}
+    moved_files: list[str] = []
+    moved: set = set()
+    for page in range(1, STALE_COMMIT_CAP // 100 + 2):
+        data, err = _compare(slug, mb, tip, page)
+        if data is None:
+            return {**out, "error": f"the base branch since {mb[:12]} could not be read ({err})"}
+        if page == 1:
+            moved_files = _names(data)
+        commits = [str(c.get("sha")) for c in data.get("commits") or [] if isinstance(c, dict) and c.get("sha")]
+        moved.update(commits)
+        if len(commits) < 100:
+            break
+    hits = [p for p in pr_files if p in set(moved_files)]
+    if len(moved_files) >= COMPARE_FILE_CAP and not hits:
+        # truncated list with no overlap in view: ask each PR path's history which of those commits touch it
+        if len(pr_files) > PATH_QUERY_CAP:
+            return {**out, "error": (f"the base branch changed {COMPARE_FILE_CAP}+ files since {mb[:12]} and the PR "
+                                     f"changes {len(pr_files)} (more than {PATH_QUERY_CAP} to check one by one)")}
+        for p in pr_files:
+            got = _path_commits(slug, tip, p, moved)
+            if got is None:
+                return {**out, "error": f"the base branch history of {p} could not be read"}
+            if got:
+                out["overlap"][p] = got
+        return out
+    for p in hits:
+        out["overlap"][p] = _path_commits(slug, tip, p, moved) or []
+    return out
+
+
+def _overlap_block(g: dict, data: dict, what: str, number) -> Optional[str]:
+    """Refuse the merge when the base branch changed the PR's files after the base its green check ran on."""
+    head, branch = str(data["headRefOid"]), str(data.get("headRefName") or "")
+    ov = base_overlap(g["remote"], g["branch"], head, number)
+    pr = f"PR #{number}" if number else "the PR"
+    if branch.startswith("wt/"):
+        how = (f"`hermes-core-wt ship {branch[3:]}` (it rebases onto {g['branch']}, re-runs the gates and waits "
+               f"for \"{g['require_check']}\" on the new sha)")
+    else:
+        how = (f"`git fetch origin && git rebase origin/{g['branch']}` on the PR branch, push it "
+               f"(`git push --force-with-lease`), wait for \"{g['require_check']}\" on the new head sha, then merge")
+    tail = f" Emergency only: prefix the command with `{OVERRIDE}` and say why in your report."
+    if ov.get("error"):
+        return (f"PUSH GUARD: blocked: {what}: {pr}'s head {head[:12]} could not be compared with {g['remote']} "
+                f"{g['branch']} ({ov['error']}), so whether {g['branch']} changed its files since the base its "
+                f"check ran on is unverified. Rebase onto {g['branch']} and wait for \"{g['require_check']}\" on the "
+                f"new head: {how}.{tail}")
+    if not ov["overlap"]:
+        return None
+    paths = sorted(ov["overlap"])
+    named = "; ".join(f"{p} ({', '.join(c[:11] for c in ov['overlap'][p][:3]) or 'commit not resolved'})"
+                      for p in paths[:8]) + (f"; +{len(paths) - 8} more" if len(paths) > 8 else "")
+    return (f"PUSH GUARD: blocked: {what}: {pr}'s head {head[:12]} is green, but on base "
+            f"{ov['merge_base'][:12]}. {g['remote']} {g['branch']} has moved {ov['behind']} commits since, and "
+            f"some of them change files this PR changes: {named}. The green \"{g['require_check']}\" never ran with "
+            f"those changes, so the landed tree would be untested. Rebase onto {g['branch']} and wait for the "
+            f"check on the new head: {how}.{tail}")
+
+
 def check_pr_merge(cmd: str, cwd: str, guards: list[dict]) -> Optional[str]:
     checked = [g for g in guards if g["require_check"]]
     if not checked:
@@ -318,14 +443,18 @@ def check_pr_merge(cmd: str, cwd: str, guards: list[dict]) -> Optional[str]:
         kind = "admin merge" if "--admin" in text else "PR merge"
         what = f"`{text[:100]}` ({kind}; exact-head CI is required even for admin credentials)"
         selector = sel or _git(d, "symbolic-ref", "-q", "--short", "HEAD")
-        data, err = _gh_json(["pr", "view", *([selector] if selector else []), "--json", "headRefOid,baseRefName",
-                              "-R", slug], cwd=d)
+        data, err = _gh_json(["pr", "view", *([selector] if selector else []), "--json",
+                              "headRefOid,baseRefName,headRefName,number", "-R", slug], cwd=d)
         if err is not None or not isinstance(data, dict) or not data.get("headRefOid"):
             return _unverified(mine[0], what, f"the PR's head could not be read ({err or 'no headRefOid'})")
         for g in mine:
             if data.get("baseRefName") and data["baseRefName"] != g["branch"]:
                 continue
             why = _check_block(g, str(data["headRefOid"]), what)
+            if why:
+                return why
+            number = data.get("number") or (sel if sel and sel.isdigit() else None)
+            why = _overlap_block(g, data, what, number)
             if why:
                 return why
     return None

@@ -140,13 +140,17 @@ class FakeGH:
     """Stands in for guard._gh_json: check-runs per sha, PRs per selector, and a log of every call."""
 
     def __init__(self):
-        self.runs, self.prs, self.calls, self.fail = {}, {}, [], False
+        self.runs, self.prs, self.calls, self.fail, self.compares = {}, {}, [], False, {}
 
     def __call__(self, args, cwd=None):
         self.calls.append(list(args))
         if self.fail:
             return None, "HTTP 401: Bad credentials"
         if args[0] == "api":
+            if "/compare/" in args[1]:  # landing-overlap read: by default the head already contains main
+                return self.compares.get(args[1].split("/compare/")[1], {
+                    "merge_base_commit": {"sha": "f" * 40}, "base_commit": {"sha": "f" * 40}, "behind_by": 0,
+                    "files": []}), None
             sha = args[1].split("/commits/")[1].split("/")[0]
             return {"total_count": len(self.runs.get(sha, [])), "check_runs": self.runs.get(sha, [])}, None
         if args[:2] == ["pr", "view"]:
