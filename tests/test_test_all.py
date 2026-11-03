@@ -219,6 +219,67 @@ class TestAll(unittest.TestCase):
                 self.assertEqual(lines[1], warning)
                 self.assertEqual(lines[-1], warning)
 
+    def make_core(self, deps):
+        import json
+        core = Path(tempfile.mkdtemp(dir=self.root)) / 'core'
+        core.mkdir()
+        (core / 'hermes_bootstrap.py').touch()
+        (core / 'pyproject.toml').write_text('[project]\ndependencies = ' + json.dumps(deps) + '\n')
+        return core
+
+    def test_core_python_floor_is_the_highest_python_version_bound_of_core_deps(self):
+        runner = runpy.run_path(str(RUNNER))
+        floor = runner['core_python_floor']
+        self.assertIsNone(floor(None))
+        core = self.make_core(["python-dotenv==1.2.4; python_version >= '3.14'",
+                               "psutil==7.2.2; sys_platform != 'android' and python_version >= \"3.14\"",
+                               "old==1; python_version >= '3.9'", "plain==1"])
+        self.assertEqual(floor(core), (3, 14))
+        (core / 'pyproject.toml').write_text('[project]\ndependencies = ["plain==1"]\n')
+        self.assertIsNone(floor(core))
+        (core / 'pyproject.toml').write_text('not toml [')
+        self.assertIsNone(floor(core))
+
+    def run_main_with(self, py_version, fallback, deps):
+        import contextlib
+        import io
+        runner = runpy.run_path(str(RUNNER))
+        core = self.make_core(deps)
+        if not (self.root / 'plugins').exists():
+            make_tree(self.root, {'ok': 'def test_ok(): pass'})
+        main = runner['main']
+        out, err, calls = io.StringIO(), io.StringIO(), []
+        with patch.dict(main.__globals__, {
+            'select_python': lambda core: ('/fake/python', fallback),
+            'python_version': lambda py: py_version,
+            'ensure_test_site': lambda py, core, uv: calls.append('site') or self.root,
+            'run_suite': lambda *args: calls.append('suite') or dict(name='plugins/ok', status='PASS', secs=0, reason=''),
+        }), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(['--root', str(self.root), '--hermes-core', str(core)])
+        return rc, err.getvalue(), calls
+
+    GATED = ["python-dotenv==1.2.4; python_version >= '3.14'"]
+
+    def test_fallback_below_core_python_floor_is_refused_before_installing_or_running(self):
+        # A scratch HOME on the hub falls back to /usr/bin/python3 3.12: core's deps are all gated on 3.14,
+        # so the test site got none and user-terminal reported 56 `No module named 'dotenv'` failures.
+        rc, err, calls = self.run_main_with('3.12.3', True, self.GATED)
+        self.assertEqual(rc, 2)
+        self.assertEqual(calls, [])
+        self.assertIn('refusing fallback python=/fake/python (3.12.3)', err)
+        self.assertIn('Python >= 3.14', err)
+        self.assertIn('HERMES_MODS_PYTHON', err)
+
+    def test_fallback_at_core_floor_and_explicit_old_python_still_run(self):
+        for version, fallback in (('3.14.9', True), ('3.12.3', False)):
+            rc, err, calls = self.run_main_with(version, fallback, self.GATED)
+            self.assertEqual((rc, calls), (0, ['site', 'suite']), (version, fallback, err))
+            self.assertNotIn('refusing', err)
+
+    def test_fallback_runs_when_core_sets_no_python_floor(self):
+        rc, err, calls = self.run_main_with('3.12.3', True, ['plain==1'])
+        self.assertEqual((rc, calls), (0, ['site', 'suite']), err)
+
     def assert_core_sdk_install(self, lock, extra, expected, warning=False):
         import contextlib
         import io
