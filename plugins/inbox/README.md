@@ -45,7 +45,9 @@ refused with `PosterMuted` and one Kanban card `inbox-muted:<family>` is filed. 
 with the same key still go through. After fixing the producer: `hermes inbox unmute '<family>' --fix-commit <sha>`
 (a commit SHA or GitHub commit URL is required and recorded). David's decision resets the streak: a resolved card,
 or an accepted card whose outcome is a type-specific action (`post` on an X draft, `draft`, `send_1`). A generic
-`do_it` or an accept with no action id does not. Every `PosterMuted` refusal, on both the normal and the
+`do_it` or an accept with no action id does not, except on an agent-owned family's (`kanban`/`coach`/`cron`)
+card that carries an ask: admission only lets those carry a human_request-derived ask, so accepting it is David's
+decision and resets the streak (`tests/test_kanban_family_mute.py`). Every `PosterMuted` refusal, on both the normal and the
 conditional (`if_absent`/`expected`) path, goes through `_check_mute`/`_check_junk_mute`, which file the owner
 card first; an AST test in `tests/test_mute_paths.py` fails on any other `raise PosterMuted`.
 

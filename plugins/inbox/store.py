@@ -854,20 +854,28 @@ class Inbox:
 
         A generic 'Do it' on a repair is not a human decision. A resolved decision, or an
         accepted type-specific action (e.g. `post` on a draft), is one and resets the streak.
+        So is a 'Do it' on an agent-owned family's (kanban/coach/cron) card that carries an ask:
+        admission only lets those families carry an ask derived from their card's human_request
+        (never self-attested), so accepting it is David answering an owner decision, not a repair.
         An unmute has an explicit fix receipt.
         """
-        family = policy_module().family(poster)
+        policy = policy_module()
+        family = policy.family(poster)
+        reg = policy.registry(self.home).get(family) or {}
+        owner_asks = reg.get("owner") in policy.AGENT_OWNERS
         row = side.execute("SELECT unmuted_at FROM unmutes WHERE poster=? AND fix_commit IS NOT NULL", (family,)).fetchone()
         since = max(now - MUTE_WINDOW_S, float(row["unmuted_at"]) if row else 0.0)
         streak = 0
-        for r in side.execute("SELECT session_id, state, poster, outcome FROM items WHERE created_at>=? "
+        for r in side.execute("SELECT session_id, state, poster, outcome, ask_json FROM items WHERE created_at>=? "
                               "ORDER BY created_at DESC, rowid DESC", (since,)):
-            if policy_module().family(r["poster"]) != family:
+            if policy.family(r["poster"]) != family:
                 continue
             if r["state"] == "resolved":
                 break
             if r["state"] == "accepted" and (r["outcome"] or "") not in GENERIC_ACCEPTS:
                 break  # David picked a type-specific action (post, draft, send_1): a real decision
+            if r["state"] == "accepted" and owner_asks and r["ask_json"]:
+                break  # David accepted an agent-owned family's human_request-derived ask: a real decision
             if r["state"] in ("accepted", "queuing"):
                 continue
             s = db.get_session(r["session_id"])
