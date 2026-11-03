@@ -107,7 +107,9 @@ def test_network_worker_cannot_block_durable_ingress(env, tmp_path):
 
 @pytest.mark.parametrize('config,allowed', [
     ({'env_type': 'local'}, False), ({'env_type': 'ssh'}, False), ({}, False),
-    ({'env_type': 'custom'}, False), ({'env_type': 'docker'}, True),
+    ({'env_type': 'custom'}, False), ({'env_type': 'docker', 'container_persistent': False}, True),
+    # Core defaults container_persistent to true: a bare docker config is persistent and refuses.
+    ({'env_type': 'docker'}, False),
     ({'env_type': 'modal'}, True), ({'env_type': 'daytona'}, True),
     ({'env_type': 'docker', 'docker_volumes': ['/host:/host']}, False),
     ({'env_type': 'docker', 'docker_extra_args': ['--privileged']}, False),
@@ -132,7 +134,11 @@ def tool_home(tmp_path, monkeypatch):
 
 
 def gate(monkeypatch, **config):
-    config = {'env_type': 'docker', **config}
+    config = {'env_type': 'docker', 'container_persistent': False, **config}
+    # Hermetic: these cases fake hermes_constants, so the real core passthrough loader cannot run.
+    passthrough = types.ModuleType('tools.env_passthrough')
+    setattr(passthrough, '_load_config_passthrough', frozenset)
+    monkeypatch.setitem(sys.modules, 'tools.env_passthrough', passthrough)
     monkeypatch.setitem(sys.modules, 'tools.terminal_tool', types.SimpleNamespace(_get_env_config=lambda: config))
     return plugin.require_sandbox
 

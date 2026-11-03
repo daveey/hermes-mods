@@ -31,6 +31,12 @@ def require_sandbox():
         raise PermissionError('Project work requires a sandboxed terminal/code backend')
     if backend != 'docker':
         return
+    # A read-only tool mount says nothing about what a credential can do. The Slack-reachable
+    # sandbox must hold no host credential at all, and must not keep state across sessions.
+    _check_no_credentials(config)
+    # Core defaults container_persistent to true, so an absent key is persistent too.
+    if config.get('container_persistent', True) is not False:
+        raise PermissionError('Project work requires container_persistent: false (no state shared across sessions)')
     if config.get('docker_mount_cwd_to_workspace'):
         raise PermissionError('Project work forbids mounting the host cwd into the sandbox')
     extra = list(config.get('docker_extra_args') or [])
@@ -49,6 +55,39 @@ def require_sandbox():
 
 # gVisor only tightens the default runc sandbox; every other argument refuses.
 _ALLOWED_DOCKER_ARGS = ([], ['--runtime=runsc'], ['--runtime', 'runsc'])
+
+# Static docker_env values are visible config, but a name like these means a secret is being planted.
+_SECRET_NAME_HINTS = ('TOKEN', 'SECRET', 'PASSWORD', 'PASSWD', 'CREDENTIAL', 'PRIVATE_KEY', 'API_KEY',
+                      'ACCESS_KEY', 'BEARER', 'COOKIE')
+
+
+def _check_no_credentials(config):
+    """Refuse every route by which a host credential reaches the Slack-reachable sandbox.
+
+    docker_forward_env is an operator opt-in that core forwards past its provider-credential
+    blocklist on every exec, so any entry at all is refused (its value cannot be audited here).
+    terminal.env_passthrough forwards host values the same way, minus provider keys.
+    """
+    forward = config.get('docker_forward_env') or []
+    if forward:
+        raise PermissionError('Project work forbids docker_forward_env (host credentials in the sandbox): '
+                              + ', '.join(sorted(map(str, forward))))
+    env = config.get('docker_env') or {}
+    if not isinstance(env, dict):
+        raise PermissionError('Project work cannot verify docker_env')
+    secret = sorted(k for k in env if any(h in str(k).upper() for h in _SECRET_NAME_HINTS))
+    if secret:
+        raise PermissionError('Project work forbids credential-like docker_env names: ' + ', '.join(secret))
+    try:
+        from tools.env_passthrough import _load_config_passthrough
+    except ImportError:  # core without config passthrough cannot forward it
+        return
+    try:
+        passthrough = sorted(_load_config_passthrough())
+    except Exception as exc:  # fail closed: unreadable passthrough config
+        raise PermissionError('Project work cannot verify terminal.env_passthrough') from exc
+    if passthrough:
+        raise PermissionError('Project work forbids terminal.env_passthrough: ' + ', '.join(passthrough))
 
 
 def _check_tool_mount(volume, tool_dir):
