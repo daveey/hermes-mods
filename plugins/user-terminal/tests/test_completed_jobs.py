@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.requires_core  # tests/conftest.py: skipped when no Hermes core is importable
+
 from test_closed_asks import board, ut, snapshot, add_block, at, REQUEST, production_python, watchdog_env
 
 

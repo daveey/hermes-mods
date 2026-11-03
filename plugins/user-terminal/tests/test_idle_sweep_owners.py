@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.requires_core  # tests/conftest.py: skipped when no Hermes core is importable
+
 from test_closed_asks import board, ut  # noqa: F401 -- fixture
 from test_completed_jobs import bind, end
 

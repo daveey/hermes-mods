@@ -5,6 +5,8 @@ import sqlite3
 
 import pytest
 
+pytestmark = pytest.mark.requires_core  # tests/conftest.py: skipped when no Hermes core is importable
+
 from test_closed_asks import board, ut
 from pathlib import Path
 from test_completed_jobs import bind, end

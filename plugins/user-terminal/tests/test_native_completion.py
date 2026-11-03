@@ -5,6 +5,8 @@ import json
 import logging
 
 import pytest
+
+pytestmark = pytest.mark.requires_core  # tests/conftest.py: skipped when no Hermes core is importable
 from test_closed_asks import ut
 
 USER = '4242'  # fixture platform user id, not a real account

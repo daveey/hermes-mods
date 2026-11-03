@@ -6,6 +6,7 @@ import pytest
 from test_closed_asks import ut
 
 
+@pytest.mark.requires_core  # tests/conftest.py: hermes_cli.plugins injectors
 def test_reconciler_waits_for_host_then_sweeps_and_stops(monkeypatch):
     from hermes_cli import plugins
     for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_MANAGED_WORKER'):

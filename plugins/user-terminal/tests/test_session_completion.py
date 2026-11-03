@@ -5,6 +5,8 @@ import json
 from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.requires_core  # tests/conftest.py: skipped when no Hermes core is importable
 from test_closed_asks import ut
 
 

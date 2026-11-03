@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+pytestmark = pytest.mark.requires_core  # tests/conftest.py: skipped when no Hermes core is importable
+
 SOURCE = Path(__file__).resolve().parents[1] / "__init__.py"
 spec = importlib.util.spec_from_file_location("user_terminal_closed", SOURCE)
 ut = importlib.util.module_from_spec(spec)
