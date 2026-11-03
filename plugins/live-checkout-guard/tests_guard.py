@@ -332,7 +332,10 @@ def test_real_core_registered_hook_uses_persisted_terminal_cwd(env, tmp_path):
         pytest.skip("no Hermes runtime python that can import tools.terminal_tool (set HERMES_CORE_PYTHON)")
     home = tmp_path / "hermes-home"
     home.mkdir()
-    e = {**ENV, "HERMES_HOME": str(home), "LIVE_CHECKOUT_ROOT": str(env.live), "TERMINAL_CWD": str(env.other)}
+    # The probe stands for a fresh agent process. When an agent runs this suite from its own terminal, the core
+    # would read that session's inherited HERMES_SESSION_KEY and key the cwd records by it, not by lcg-A/lcg-B.
+    e = {k: v for k, v in ENV.items() if not k.startswith("HERMES_SESSION_")}
+    e.update(HERMES_HOME=str(home), LIVE_CHECKOUT_ROOT=str(env.live), TERMINAL_CWD=str(env.other))
     p = subprocess.run([py, str(HERE / "_core_probe.py"), str(core), str(env.live), str(env.wt), str(env.other)],
                        capture_output=True, text=True, env=e, timeout=240)
     assert p.returncode == 0, p.stderr[-3000:]
