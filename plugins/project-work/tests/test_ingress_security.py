@@ -139,6 +139,7 @@ def gate(monkeypatch, **config):
     passthrough = types.ModuleType('tools.env_passthrough')
     setattr(passthrough, '_load_config_passthrough', frozenset)
     monkeypatch.setitem(sys.modules, 'tools.env_passthrough', passthrough)
+    monkeypatch.setattr(plugin, '_core_credential_files', lambda: ([], []), raising=False)
     monkeypatch.setitem(sys.modules, 'tools.terminal_tool', types.SimpleNamespace(_get_env_config=lambda: config))
     return plugin.require_sandbox
 

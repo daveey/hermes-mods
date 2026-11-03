@@ -67,6 +67,8 @@ def _check_no_credentials(config):
     docker_forward_env is an operator opt-in that core forwards past its provider-credential
     blocklist on every exec, so any entry at all is refused (its value cannot be audited here).
     terminal.env_passthrough forwards host values the same way, minus provider keys.
+    terminal.credential_files bind-mounts profile files (core's config route even mounts the
+    master .env, which its skill route refuses), so any declaration or core mount is refused.
     """
     forward = config.get('docker_forward_env') or []
     if forward:
@@ -78,16 +80,40 @@ def _check_no_credentials(config):
     secret = sorted(k for k in env if any(h in str(k).upper() for h in _SECRET_NAME_HINTS))
     if secret:
         raise PermissionError('Project work forbids credential-like docker_env names: ' + ', '.join(secret))
+    _check_no_env_passthrough()
+    try:
+        declared, mounts = _core_credential_files()
+    except Exception as exc:  # fail closed: the mount route cannot be audited
+        raise PermissionError('Project work cannot verify terminal.credential_files') from exc
+    if declared:
+        raise PermissionError('Project work forbids terminal.credential_files: '
+                              + ', '.join(sorted(map(str, declared))))
+    if mounts:
+        raise PermissionError('Project work forbids credential file mounts: '
+                              + ', '.join(sorted(str(m.get('container_path')) for m in mounts)))
+
+
+def _check_no_env_passthrough():
     try:
         from tools.env_passthrough import _load_config_passthrough
     except ImportError:  # core without config passthrough cannot forward it
         return
     try:
         passthrough = sorted(_load_config_passthrough())
-    except Exception as exc:  # fail closed: unreadable passthrough config
+    except Exception as exc:  # defensive: core's loader returns empty on its own errors
         raise PermissionError('Project work cannot verify terminal.env_passthrough') from exc
     if passthrough:
         raise PermissionError('Project work forbids terminal.env_passthrough: ' + ', '.join(passthrough))
+
+
+def _core_credential_files():
+    """(config declaration, mounts core would bind) for terminal.credential_files, read through core."""
+    from hermes_cli.config import cfg_get, read_raw_config
+    declared = cfg_get(read_raw_config(), 'terminal', 'credential_files')
+    if declared is not None and not isinstance(declared, list):
+        declared = [declared]
+    mounts = importlib.import_module('tools.credential_files').get_credential_file_mounts()
+    return list(declared or []), list(mounts)
 
 
 def _check_tool_mount(volume, tool_dir):

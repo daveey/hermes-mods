@@ -9,14 +9,24 @@ import pytest
 from conftest import PACKAGE
 
 plugin = importlib.import_module(PACKAGE + '.__init__')
+# The real reader, before the autouse fixture replaces it (absent on pre-fix b5f0878).
+REAL_CORE_CREDENTIAL_FILES = getattr(plugin, '_core_credential_files', None)
+
+
+def use_real_credential_reader(monkeypatch):
+    if REAL_CORE_CREDENTIAL_FILES is None:
+        monkeypatch.delattr(plugin, '_core_credential_files', raising=False)
+    else:
+        monkeypatch.setattr(plugin, '_core_credential_files', REAL_CORE_CREDENTIAL_FILES)
 
 
 @pytest.fixture(autouse=True)
 def no_core_passthrough(monkeypatch):
-    # Default: a core whose config declares no terminal.env_passthrough.
+    # Default: a core whose config declares no terminal.env_passthrough and no credential files.
     fake: Any = types.ModuleType('tools.env_passthrough')
     fake._load_config_passthrough = lambda: frozenset()
     monkeypatch.setitem(sys.modules, 'tools.env_passthrough', fake)
+    monkeypatch.setattr(plugin, '_core_credential_files', lambda: ([], []), raising=False)
     return fake
 
 
@@ -78,11 +88,37 @@ def test_refuses_config_env_passthrough(monkeypatch, no_core_passthrough):
         gate(monkeypatch)()
 
 
-def test_fails_closed_on_unreadable_passthrough(monkeypatch, no_core_passthrough):
+def test_fails_closed_if_passthrough_loader_raises(monkeypatch, no_core_passthrough):
+    """Defensive only: core 14a124's real loader swallows its own errors and returns an empty set
+    (see test_real_core_unparseable_config_adds_no_route for what an unreadable config really does)."""
     def boom():
-        raise OSError('config unreadable')
+        raise OSError('loader failed')
     no_core_passthrough._load_config_passthrough = boom
     with pytest.raises(PermissionError, match='env_passthrough'):
+        gate(monkeypatch)()
+
+
+def test_refuses_declared_credential_files(monkeypatch):
+    monkeypatch.setattr(plugin, '_core_credential_files', lambda: (['.env'], []))
+    with pytest.raises(PermissionError, match=r'forbids terminal\.credential_files: \.env$'):
+        gate(monkeypatch)()
+
+
+def test_refuses_core_credential_file_mounts(monkeypatch):
+    mount = {'host_path': '/x/token.json', 'container_path': '/root/.hermes/token.json'}
+    monkeypatch.setattr(plugin, '_core_credential_files', lambda: ([], [mount]))
+    with pytest.raises(PermissionError, match='/root/.hermes/token.json'):
+        gate(monkeypatch)()
+
+
+def test_fails_closed_if_credential_file_loader_raises(monkeypatch):
+    use_real_credential_reader(monkeypatch)
+    broken: Any = types.ModuleType('tools.credential_files')
+    def boom():
+        raise OSError('loader failed')
+    broken.get_credential_file_mounts = boom
+    monkeypatch.setitem(sys.modules, 'tools.credential_files', broken)
+    with pytest.raises(PermissionError, match='cannot verify terminal.credential_files'):
         gate(monkeypatch)()
 
 
@@ -141,3 +177,77 @@ def test_real_core_config_passthrough_is_read(monkeypatch, tmp_path, declared, r
             check()
     else:
         check()
+
+
+@pytest.fixture
+def real_core(monkeypatch, tmp_path):
+    """Real core 14a124 env_passthrough + credential_files loaders against a scratch profile home."""
+    use_real_credential_reader(monkeypatch)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    mods = {}
+    for name in ('tools.env_passthrough', 'tools.credential_files'):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+        mods[name] = pytest.importorskip(name)
+        monkeypatch.setitem(sys.modules, name, mods[name])
+    cf = mods['tools.credential_files']
+    getattr(mods['tools.env_passthrough'], '_config_passthrough').clear()
+    getattr(cf, '_config_files').clear()
+    token = cf._registered_files_var.set({})
+    yield tmp_path, cf
+    cf._registered_files_var.reset(token)
+    getattr(cf, '_config_files').clear()
+
+
+def test_real_core_config_credential_file_mounts_profile_env(monkeypatch, real_core):
+    """Review t_01a1a0e8ba62a5b5 finding 1: one config line mounts the profile's master .env.
+    Core's config route skips the deny-list its skill route applies, so the gate must refuse it."""
+    home, cf = real_core
+    (home / '.env').write_text('PLACEHOLDER=not-a-secret\n')
+    (home / 'config.yaml').write_text("terminal:\n  credential_files: ['.env']\n")
+    # Precondition: the real core loader would bind-mount it (the RED route), and its skill route refuses it.
+    assert [m['container_path'] for m in cf.get_credential_file_mounts()] == ['/root/.hermes/.env']
+    assert cf.register_credential_file('.env') is False
+    with pytest.raises(PermissionError, match=r'forbids terminal\.credential_files: \.env$'):
+        gate(monkeypatch)()
+
+
+def test_real_core_declared_but_missing_credential_file_refuses(monkeypatch, real_core):
+    """A declared entry refuses even while core skips it, so creating the file later cannot open the route."""
+    home, cf = real_core
+    (home / 'config.yaml').write_text("terminal:\n  credential_files: ['gh-hosts.yml']\n")
+    assert cf.get_credential_file_mounts() == []
+    with pytest.raises(PermissionError, match=r'forbids terminal\.credential_files: gh-hosts\.yml$'):
+        gate(monkeypatch)()
+
+
+def test_real_core_skill_registered_credential_file_refuses(monkeypatch, real_core):
+    home, cf = real_core
+    (home / 'service-token.json').write_text('{}')
+    assert cf.register_credential_file('service-token.json') is True
+    with pytest.raises(PermissionError, match=r'forbids credential file mounts: /root/\.hermes/service-token\.json$'):
+        gate(monkeypatch)()
+
+
+def test_real_core_clean_profile_allows(monkeypatch, real_core):
+    home, _ = real_core
+    (home / 'config.yaml').write_text("terminal:\n  backend: docker\n")
+    gate(monkeypatch)()
+
+
+def test_real_core_unparseable_config_adds_no_route(monkeypatch, real_core):
+    """Review finding 2: core reads an unparseable config.yaml as {}; neither loader then forwards env
+    nor mounts files, so allowing here is correct and no 'fails closed' claim depends on it."""
+    home, cf = real_core
+    (home / '.env').write_text('PLACEHOLDER=not-a-secret\n')
+    (home / 'config.yaml').write_text("terminal: [credential_files: '.env'\n  env_passthrough: {\n")
+    passthrough = sys.modules['tools.env_passthrough']._load_config_passthrough()
+    assert passthrough == frozenset() and cf.get_credential_file_mounts() == []
+    gate(monkeypatch)()
+
+
+def test_core_without_env_passthrough_still_checks_credential_files(monkeypatch):
+    """A core lacking tools.env_passthrough skips only that check, never the credential-file one."""
+    monkeypatch.setitem(sys.modules, 'tools.env_passthrough', None)  # import raises ImportError
+    monkeypatch.setattr(plugin, '_core_credential_files', lambda: (['.env'], []))
+    with pytest.raises(PermissionError, match='credential_files'):
+        gate(monkeypatch)()
