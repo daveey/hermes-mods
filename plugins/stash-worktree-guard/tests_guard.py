@@ -3,6 +3,7 @@
 import functools
 import importlib.util
 import os
+import re
 import shutil
 import shlex
 
@@ -399,13 +400,20 @@ def test_nested_runner_existing_public_alias_control(nested_repo):
     test_nested_runner_real_execution(nested_repo, "public", "alias")
 
 
+# difftool hands its tool two file names, so a `git stash pop|list` tool fails whatever the guard
+# decides. What difftool exits with then depends on git: up to 2.55 it ignores the tool's status
+# (0); 2.56 dies "external diff died, stopping at <file>" (128). Rows marked TOOL_FAILED expect the
+# status this git gives a tool that fails.
+TOOL_FAILED = object()
+
+
 @pytest.mark.parametrize("site,command,refused,rc", [
     ("foreach", "git for-each-repo --config=missing.repo stash pop", True, 0),
     ("bisect", "git bisect run stash pop", False, 1),
     ("bisect", "git bisect run 'git stash pop'", False, 1),
     ("helper", "git submodule--helper stash pop", False, 129),
-    ("difftool", "git difftool -y --extcmd='git stash pop'", True, 0),
-    ("difftool", "git difftool -y --extcmd='git stash list'", False, 0),
+    ("difftool", "git difftool -y --extcmd='git stash pop'", True, TOOL_FAILED),
+    ("difftool", "git difftool -y --extcmd='git stash list'", False, TOOL_FAILED),
     ("difftool-empty", "git difftool -y --extcmd='git stash pop'", True, 0),
     ("foreach", "git -c alias.x='stash pop' -c r.repo={target} for-each-repo --config=r.repo status --porcelain", False, 0),
     ("foreach", "git -c alias.hash-object='stash pop' hash-object f.txt", False, 0),
@@ -418,8 +426,15 @@ def test_nested_runner_real_nonrestoring_controls(nested_repo, site, command, re
               run(target, "status", "--porcelain").stdout)
     assert bool(guard.refuse_reason(command, str(cwd))) == refused
     assert bool(block("terminal", command=command, workdir=str(cwd))) == refused
+    tool_failed = rc is TOOL_FAILED
+    if tool_failed:
+        rc = subprocess.run([BASH, "-c", "git difftool -y --extcmd=false"], cwd=cwd, env=env,
+                            capture_output=True, timeout=30).returncode
     result = subprocess.run([BASH, "-c", command], cwd=cwd, env=env, capture_output=True, timeout=30)
     assert result.returncode == rc, result.stderr
+    if tool_failed:
+        # The tool did run, on the changed file, and failed on the two names difftool appended.
+        assert re.search(rb"Too many revisions specified|bad revision", result.stderr), result.stderr
     assert (run(target, "stash", "list").stdout, (target / "f.txt").read_text(),
             run(target, "status", "--porcelain").stdout) == before
 
