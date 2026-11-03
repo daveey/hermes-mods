@@ -393,6 +393,40 @@ class BoundedCallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("its own run", out)
 
+    def test_pass_says_when_a_newer_run_containing_it_went_red(self):
+        # The commit's own run passed, then a later push broke the workflow: every newer run containing the commit
+        # is red. "passed <sha>: hermes-sync tests <own green url>" was quoted as "state CI is green" while the
+        # branch had been red for an hour. The pass stands (exit 0), but the line must name the newest red run.
+        red = dict(run("d" * 40, conclusion="failure"), _wf="ci.yml")
+        green = dict(run("c" * 40), _wf="ci.yml")
+        rc, out = self._main_out([[red, green]], "--once")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("passed ccccccccc: ci.yml u/CI/" + "c" * 40 + "0; but the newest finished run containing it, on "
+                      "dddddddddd, ended failure: u/CI/" + "d" * 40 + "0", out)
+
+    def test_newer_red_note_and_own_red_note_both_show(self):
+        # Own run red, a later commit's run green (the pass), a still later run red: both caveats apply.
+        newest_red = dict(run("e" * 40, conclusion="failure"), _wf="ci.yml")
+        green = dict(run("d" * 40), _wf="ci.yml")
+        own_red = dict(run("c" * 40, conclusion="failure"), _wf="ci.yml")
+        rc, out = self._main_out([[newest_red, green, own_red]], "--once")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("(ran on dddddddddd, a later commit containing it); but its own run on cccccccccc ended failure: "
+                      "u/CI/" + "c" * 40 + "0; but the newest finished run containing it, on eeeeeeeeee, ended "
+                      "failure: u/CI/" + "e" * 40 + "0", out)
+
+    def test_newest_run_green_cancelled_or_running_adds_no_newer_note(self):
+        # Only a FINISHED red run after the pass is news: a newer green, a cancelled replacement or a run still in
+        # flight says nothing about the branch being red.
+        own_green = dict(run("c" * 40), _wf="ci.yml")
+        for newer in (dict(run("d" * 40), _wf="ci.yml"),
+                      dict(run("d" * 40, conclusion="cancelled"), _wf="ci.yml"),
+                      dict(run("d" * 40, status="in_progress", conclusion=""), _wf="ci.yml")):
+            with self.subTest(newer=newer["status"] + "/" + newer["conclusion"]):
+                rc, out = self._main_out([[newer, own_green]], "--once")
+                self.assertEqual(rc, 0, out)
+                self.assertNotIn("newest finished run", out)
+
     def _discovered_out(self, listings, *extra):
         """main() without --workflow: the workflows are the ones with a run containing the commit."""
         import contextlib

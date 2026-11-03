@@ -159,6 +159,21 @@ def own_failure_note(state: dict, shas: list[str]) -> str:
     return f"; but its own run on {own['headSha'][:10]} ended {own['conclusion']}: {own['url']}"
 
 
+def newer_failure_note(state: dict) -> str:
+    """Say so when the workflow's newest finished run containing the commit went red after the run that proved it.
+
+    The proof is the newest GREEN run containing the commit, so a later push can have broken the workflow since:
+    every newer run containing the commit is red. "passed <sha>" then proves the commit, not the branch; a pass line
+    without this note got quoted as "CI is green" while that workflow had been red on the branch for an hour.
+    `failed` is the newest finished run (cancelled/skipped excluded); when it is red, the proof is older than it.
+    """
+    failed, done = state.get("failed"), state.get("done")
+    if not failed or not done:
+        return ""
+    head = (failed.get("headSha") or "")[:10]
+    return f"; but the newest finished run containing it, on {head}, ended {failed['conclusion']}: {failed['url']}"
+
+
 def run_ref(run: dict, shas: list[str]) -> str:
     """The run's URL, plus the commit it built when that is a later commit containing the sha(s).
 
@@ -315,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
             if wf_state and all(s["done"] for s in wf_state.values()):
                 print(f"passed {label}: " + ", ".join(
                     f"{n} {'skipped ' if s['skipped'] else ''}{run_ref(s['done'], shas)}{own_failure_note(s, shas)}"
+                    f"{newer_failure_note(s)}"
                     for n, s in wf_state.items()))
                 return 0
             pend = {n: s for n, s in wf_state.items() if not s["done"]}
