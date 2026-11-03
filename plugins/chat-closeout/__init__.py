@@ -1819,6 +1819,8 @@ _WATCHDOG_KEY = re.compile(r"^chat-closeout:(?:unseen|no-closeout|ask-failed|stu
 
 def _cleared_evidence(key: str, unseen: dict[str, int], led) -> str:
     parts = key.split(":")
+    if parts[1] in ("unseen", "no-closeout") and _session_gone(parts[2]):
+        return f"chat {parts[2]} was deleted (absent from every state.db); nothing can hand it results"
     if parts[1] == "unseen":
         return (f"unseen count 0 for {parts[2]}" if unseen.get(parts[2], 0) == 0
                 else f"unseen episode {parts[3]} ended; a different episode is now observed")
@@ -1932,6 +1934,8 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
     pending = led.pending()  # one ledger read for every check below (none of them writes the waiting rows)
     for sid, since in led.unseen_since({s: n for s, n in unseen.items() if n > 0}, now).items():
         key = f"chat-closeout:unseen:{sid}:{int(since)}"
+        if now - since >= core.STALE_S and _session_gone(sid):
+            continue  # a deleted chat: no route can ever hand it these notices (checked only once stale: cheap idle)
         observed.add(key)
         first = seen_mono.setdefault(key, mono)
         if now - since < core.STALE_S or mono - first < core.STALE_S:
@@ -1953,6 +1957,8 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
             continue  # reported since, or the batch moved on (a woken turn still in flight stays watched)
         if row.get("wake_result") == "quota" and _quota_wall(row["session_id"], now):
             continue  # a clock wait on the user's quota-walled exact pin: the core replays at the reset
+        if now - float(at) >= core.STALE_S and _session_gone(row["session_id"]):
+            continue  # a deleted chat: wake_tick drops its row; nothing can run its close-out
         observed.add(key)
         first = seen_mono.setdefault(key, mono)
         if now - float(at) < core.STALE_S or mono - first < core.STALE_S:
