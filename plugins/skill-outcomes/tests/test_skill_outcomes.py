@@ -263,3 +263,18 @@ def test_pending_record_closed_by_a_notice_is_reopened_and_old_lines_skip_correc
     tab = core.rollup([old], t - 1, t + 1)
     assert tab[0]["correction_rate"] is None
     assert "predate the correction-rule fix" in "\n".join(core.rollup_lines([old], t - 1, t + 1))
+
+
+def test_steer_envelope_counts_and_display_kind_turns_do_not(home):
+    turn("s1", "done", ("five-whys", SKILL_DONE))
+    t = core.time.time()
+    # a Hermes-written turn with no known prefix, marked only by display_kind on the stored message
+    plug.pre_llm_call(session_id="s1", user_message="Background process finished.",
+                      conversation_history=[{"role": "user", "content": "x", "display_kind": "process_complete"}])
+    # the user's own mid-turn steer, wrapped in the out-of-band envelope coach's SYNTHETIC_RE would reject
+    plug.pre_llm_call(session_id="s1", user_message="[OUT-OF-BAND USER MESSAGE — from the user]\n"
+                      "that's wrong, the hub is the target\n[/OUT-OF-BAND USER MESSAGE]",
+                      conversation_history=[{"role": "user", "content": "x", "display_kind": "steer"}])
+    core.flush(home, now=t + core.GRACE_S + 1)
+    (r,) = lines(home)
+    assert r["user_correction"] is True and r["correction_source"] == "keyword"

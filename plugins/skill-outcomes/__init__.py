@@ -139,10 +139,19 @@ def post_llm_call(session_id: str = "", assistant_response: Any = None, turn_id:
     return None
 
 
-def pre_llm_call(session_id: str = "", user_message: Any = None, **_):
+def _display_kind(history: Any) -> Any:
+    """display_kind of this turn's user message (the last user-role entry): set when Hermes wrote the turn."""
+    for m in reversed(history if isinstance(history, list) else []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return m.get("display_kind")
+    return None
+
+
+def pre_llm_call(session_id: str = "", user_message: Any = None, conversation_history: Any = None, **_):
     try:
         if session_id and isinstance(user_message, str):
-            core.note_user_message(None, session_id, user_message)
+            core.note_user_message(None, session_id, user_message,
+                                   display_kind=_display_kind(conversation_history))
         _sweep()
     except Exception as exc:
         log.debug("skill-outcomes pre_llm_call: %s", exc)

@@ -139,8 +139,22 @@ def _coach_synthetic_res() -> list:
     return _coach_synth
 
 
-def is_real_user_message(text: Any) -> bool:
+OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
+REAL_DISPLAY_KINDS = {None, "", "steer"}  # any other display_kind on the stored turn means Hermes wrote it
+
+
+def unwrap_steer(text: Any) -> Any:
+    """The user's words inside a mid-turn `[OUT-OF-BAND USER MESSAGE …]` envelope (coach's self_heal.OOB_RE);
+    coach's SYNTHETIC_RE would otherwise reject the envelope as a machine turn."""
+    m = OOB_RE.match(text) if isinstance(text, str) else None
+    return m.group(1) if m else text
+
+
+def is_real_user_message(text: Any, display_kind: Any = None) -> bool:
     """A human's message, not a Kanban/delegation/compaction notice, relay or runtime note."""
+    text = unwrap_steer(text)
+    if display_kind not in REAL_DISPLAY_KINDS:
+        return False
     if not isinstance(text, str) or not text.strip() or SYNTHETIC_RE.match(text):
         return False
     return not any(rx.search(text) for rx in _coach_synthetic_res())
@@ -229,10 +243,12 @@ def record_turn(home: Any, session: str, loads: Iterable[dict], reply: str, now:
     return recs
 
 
-def note_user_message(home: Any, session: str, text: str, now: Optional[float] = None) -> int:
+def note_user_message(home: Any, session: str, text: str, now: Optional[float] = None,
+                      display_kind: Any = None) -> int:
     """The session's next real user message closes the correction window of its open records."""
-    if not session or not is_real_user_message(text):
+    if not session or not is_real_user_message(text, display_kind):
         return 0
+    text = unwrap_steer(text)
     now = time.time() if now is None else now
     n = 0
     p = _pending_path(home)
