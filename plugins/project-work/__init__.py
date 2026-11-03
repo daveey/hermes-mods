@@ -68,8 +68,9 @@ def _check_no_credentials(config):
     docker_forward_env is an operator opt-in that core forwards past its provider-credential
     blocklist on every exec, so any entry at all is refused (its value cannot be audited here).
     terminal.env_passthrough forwards host values the same way, minus provider keys.
-    terminal.credential_files bind-mounts profile files (core's config route even mounts the
-    master .env, which its skill route refuses), so any declaration or core mount is refused.
+    terminal.credential_files bind-mounts profile files (core's config route before 7b1217bdee6
+    even mounts the master .env, which its skill route refuses), so any declaration or core mount
+    is refused, whichever core is running.
     """
     forward = config.get('docker_forward_env') or []
     if forward:

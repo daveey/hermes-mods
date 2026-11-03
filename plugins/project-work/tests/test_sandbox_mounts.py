@@ -78,11 +78,24 @@ def core_mounts(cf):
     return {m['container_path']: m['host_path'] for m in cf.get_credential_file_mounts()}
 
 
+def assert_core_mounts(cf, expected):
+    """Precondition on core's own config route. Core before 7b1217bdee6 (the alpha-askeve runtime's)
+    bind-mounts a master store listed in terminal.credential_files; core from 7b1217bdee6 on skips it
+    via _is_read_denied. The gate must refuse on both, so the precondition follows the core in use."""
+    mounts = core_mounts(cf)
+    if hasattr(cf, '_is_read_denied'):
+        assert mounts == {}
+    elif isinstance(expected, dict):
+        assert mounts == expected
+    else:
+        assert list(mounts.values()) == expected
+
+
 # ---- terminal.credential_files: every form core reads, and the ones it ignores, refuse ----
 
 def test_list_form_mounting_auth_json_refuses(monkeypatch, core):
     write_config(core.home, "  credential_files: ['auth.json']\n")
-    assert core_mounts(core.cf) == {'/root/.hermes/auth.json': str((core.home / 'auth.json').resolve())}
+    assert_core_mounts(core.cf, {'/root/.hermes/auth.json': str((core.home / 'auth.json').resolve())})
     with pytest.raises(PermissionError, match='credential_files'):
         gate(monkeypatch)()
 
@@ -118,7 +131,7 @@ def test_symlink_to_env_refuses(monkeypatch, core):
     """Core resolves the symlink inside HERMES_HOME and mounts the master .env's bytes under another name."""
     (core.home / 'service-token').symlink_to(core.home / '.env')
     write_config(core.home, "  credential_files: ['service-token']\n")
-    assert core_mounts(core.cf) == {'/root/.hermes/service-token': str((core.home / '.env').resolve())}
+    assert_core_mounts(core.cf, {'/root/.hermes/service-token': str((core.home / '.env').resolve())})
     with pytest.raises(PermissionError, match='credential_files'):
         gate(monkeypatch)()
 
@@ -126,7 +139,7 @@ def test_symlink_to_env_refuses(monkeypatch, core):
 def test_relative_traversal_to_env_refuses(monkeypatch, core):
     (core.home / 'sub').mkdir()
     write_config(core.home, "  credential_files: ['sub/../.env']\n")
-    assert list(core_mounts(core.cf).values()) == [str((core.home / '.env').resolve())]
+    assert_core_mounts(core.cf, [str((core.home / '.env').resolve())])
     with pytest.raises(PermissionError, match='credential_files'):
         gate(monkeypatch)()
 
@@ -135,7 +148,7 @@ def test_root_profile_mounting_another_profiles_env_refuses(monkeypatch, core):
     monkeypatch.setenv('HERMES_HOME', str(core.root))
     getattr(core.cf, '_config_files').clear()
     write_config(core.root, "  credential_files: ['profiles/other/.env']\n")
-    assert list(core_mounts(core.cf).values()) == [str((core.other / '.env').resolve())]
+    assert_core_mounts(core.cf, [str((core.other / '.env').resolve())])
     with pytest.raises(PermissionError, match='credential_files'):
         gate(monkeypatch)()
 

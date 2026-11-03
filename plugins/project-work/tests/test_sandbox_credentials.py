@@ -206,8 +206,10 @@ def test_real_core_config_credential_file_mounts_profile_env(monkeypatch, real_c
     home, cf = real_core
     (home / '.env').write_text('PLACEHOLDER=not-a-secret\n')
     (home / 'config.yaml').write_text("terminal:\n  credential_files: ['.env']\n")
-    # Precondition: the real core loader would bind-mount it (the RED route), and its skill route refuses it.
-    assert [m['container_path'] for m in cf.get_credential_file_mounts()] == ['/root/.hermes/.env']
+    # Precondition: core before 7b1217bdee6 (the alpha-askeve runtime's) bind-mounts it (the RED route);
+    # later core skips it itself. The gate refuses on both, and the skill route refuses it on both.
+    expected = [] if hasattr(cf, '_is_read_denied') else ['/root/.hermes/.env']
+    assert [m['container_path'] for m in cf.get_credential_file_mounts()] == expected
     assert cf.register_credential_file('.env') is False
     with pytest.raises(PermissionError, match=r'forbids terminal\.credential_files: \.env$'):
         gate(monkeypatch)()
