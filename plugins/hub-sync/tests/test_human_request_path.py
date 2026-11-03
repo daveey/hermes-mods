@@ -46,6 +46,10 @@ PRODUCER = Path(os.environ.get("HERMES_HUB_CLIENT_REAL") or _default_producer())
 @pytest.mark.parametrize("human_request", [EVIDENCE, {"action": "Choose a window."}])
 def test_real_producer_serializes_human_request(tmp_path, human_request):
     path = PRODUCER
+    # No hermes-hub checkout beside this repo and none named (public plugin-suites CI): skip. A named
+    # HERMES_HUB_CLIENT_REAL that is missing is a misconfiguration and still fails.
+    if not os.environ.get("HERMES_HUB_CLIENT_REAL") and not path.is_file():
+        pytest.skip(f"needs a hermes-hub checkout ({path} missing; HERMES_HUB_CLIENT_REAL unset)")
     assert path.is_file(), "Set HERMES_HUB_CLIENT_REAL to an isolated hermes-hub/client/hermes_hub.py"
     client = _load(path, "real_hub_evidence_producer")
     board = tmp_path / "kanban.db"
