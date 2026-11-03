@@ -2,7 +2,7 @@
 
 Paste exactly one section into a reviewer's task as its rubric. Each section is self-contained. Derived from
 the reviewer personas and document standards of google/elephant-goldfish-model (Apache-2.0); see
-[upstream.md](upstream.md) for what changed.
+the `upstream` reference for what changed.
 
 Every rubric shares these rules:
 - You are read-only. Do not edit files.

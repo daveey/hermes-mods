@@ -16,4 +16,4 @@ a card on its next real turn (e.g. to prove a routing change live).
 
 Addressed messages with no matching turns, or no connect line, is an outage: fix it. No addressed messages and a
 live connection is no traffic: wait for real traffic on a wake probe that counts step 2 (exit 2 when it can't read
-the DB), parked per kanban-orchestrator `references/orphan-waits.md`.
+the DB), parked per kanban-orchestrator's `orphan-waits` reference.
