@@ -385,6 +385,38 @@ def test_newline_separates_commands():
     assert blocked("terminal", command="echo start\nnpm ci\necho done\n")
 
 
+@pytest.mark.parametrize("cmd", [
+    "echo hi # note\nuv sync",
+    "echo hi # note\r\nuv sync",
+    "echo hi; # note\nuv sync",
+    "(echo hi) # note\nuv sync",
+    "echo 'it''s' # a 'quote\nuv sync",  # a quote inside a comment opens nothing
+    "# note\nuv sync",
+    "echo a#b\nuv sync",
+])
+def test_comment_keeps_its_newline(cmd):
+    assert guard.check_shell(cmd) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo hi # uv sync",
+    "echo hi #uv sync",
+    "# uv sync\necho done",
+    "echo hi # note\necho uv sync",
+])
+def test_comment_text_is_not_a_command(cmd):
+    assert guard.check_shell(cmd) is None, cmd
+
+
+@pytest.mark.parametrize("text, want", [
+    ("echo a#b", ["echo", "a#b"]),
+    ("echo '#' \"#x\" \\#y", ["echo", "#", "#x", "#y"]),
+    ("echo hi # note\nls", ["echo", "hi", "\n", "ls"]),
+])
+def test_hash_inside_a_word_or_quotes_is_not_a_comment(text, want):
+    assert guard._tokens(text) == want
+
+
 def test_script_resolved_against_the_task_shell_cwd(tmp_path, monkeypatch):
     """A worker that `cd`s in one terminal call and runs ./ci.sh in the next sends no workdir."""
     _script(tmp_path, SCRIPT_BODIES[0])

@@ -45,11 +45,43 @@ def enabled() -> bool:
     return sys.platform == "darwin" and os.environ.get("MAC_HEAVY_GUARD", "1") != "0"
 
 
+def _strip_comments(text: str) -> str:
+    """Drop every `# comment` up to (not including) its newline. shlex's own comment handling eats the newline
+    too, which glued the next line's command onto this one (`echo hi # note\\nuv sync` -> `echo hi uv sync`).
+    As in bash, `#` starts a comment only at the start of a word and outside quotes (`a#b`, `'#'` are words)."""
+    if "#" not in text:
+        return text
+    out: list[str] = []
+    quote = ""
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = ""
+        elif c == "\\":  # escapes the next char, outside quotes and inside "..."
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        elif quote == '"':
+            if c == '"':
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and (i == 0 or text[i - 1] in " \t\r\n;&|()"):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokens(text: str) -> Optional[list[str]]:
-    lex = shlex.shlex(text.replace("\\\n", " "), posix=True, punctuation_chars=";&|()\n")
+    lex = shlex.shlex(_strip_comments(text.replace("\\\n", " ")), posix=True, punctuation_chars=";&|()\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
-    lex.commenters = "#"
+    lex.commenters = ""
     try:
         return list(lex)
     except ValueError:  # unbalanced quotes: don't guess
