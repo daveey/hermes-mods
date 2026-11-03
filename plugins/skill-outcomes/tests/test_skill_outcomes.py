@@ -361,6 +361,23 @@ def test_subagent_prompts_and_compaction_notes_are_not_replies(home):
     assert rs["s1"]["correction_source"] == "none" and rs["sub"]["correction_source"] == "none"
 
 
+def test_state_db_reply_in_a_delegated_child_session_is_not_a_user_reply(home):
+    # delegate_task children are stored with source=desktop but carry parent_session_id; their later user turns
+    # are written by the parent agent, so they never close the correction window (the hook path skips them too)
+    import sqlite3
+    turn("child", "done", ("five-whys", SKILL_DONE))
+    t = core.time.time()
+    _state_db(home, "child", [(t + 5, "no, that's the wrong PR", None)])
+    con = sqlite3.connect(home / "state.db")
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, parent_session_id TEXT)")
+    con.execute("INSERT INTO sessions VALUES ('child', 'desktop', 'top')")
+    con.commit()
+    con.close()
+    core.flush(home, now=t + core.IDLE_S + 1)
+    (r,) = lines(home)
+    assert r["correction_source"] == "none" and r.get("reply_source") is None
+
+
 # ---------------------------------------------------------------- forks and interrupted turns (rules 4)
 def _tool_rows(h, session, rows):
     import sqlite3

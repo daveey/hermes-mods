@@ -299,6 +299,12 @@ def db_next_user(home: Any, session: str, after: float) -> Optional[tuple]:
                 src = None
             if src and str(src[0]) in MACHINE_SOURCES:
                 return None
+            try:  # delegate_task children keep source=desktop; their user turns come from the parent agent
+                par = con.execute("SELECT parent_session_id FROM sessions WHERE id=?", (session,)).fetchone()
+            except Exception:
+                par = None
+            if par and par[0]:
+                return None
             rows = con.execute(
                 "SELECT timestamp, content, display_kind FROM messages WHERE session_id=? AND role='user' "
                 "AND timestamp>? ORDER BY timestamp LIMIT 200", (session, after)).fetchall()
