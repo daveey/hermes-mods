@@ -22,3 +22,8 @@ def isolated_stores(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    # A Kanban worker's shell carries the core write fence (value = the real Hermes root). pytest's
+    # tmp_path sits under TMPDIR=<root>/cache/scratch, i.e. inside that root, so a temp board would
+    # be opened read-only and a missing kanban.db fails with "unable to open database file".
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_OWNER", raising=False)
