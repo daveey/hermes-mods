@@ -7,7 +7,7 @@ import tempfile
 from types import ModuleType
 import unittest
 
-from core_path import core_path
+from core_path import require_core
 from module_override import module_override
 
 
@@ -42,8 +42,8 @@ class ModuleOverride(unittest.TestCase):
             env = dict(os.environ, HOME=home, HERMES_HOME=str(Path(home) / '.hermes'),
                        # Retain the parent's provisioned test dependency paths;
                        # core alone drops test-all's SDK site in this cold child.
-                       HERMES_TEST_CORE=str(core_path()),
-                       PYTHONPATH=os.pathsep.join([str(core_path()), *sys.path]),
+                       HERMES_TEST_CORE=str(require_core()),
+                       PYTHONPATH=os.pathsep.join([str(require_core()), *sys.path]),
                        HERMES_DISABLE_LAZY_INSTALLS='1')
             target = str(Path(__file__).with_name('test_execution.py')) + (
                 '::Execution::test_full_turn_unavailable_selection_never_sends_another_account')

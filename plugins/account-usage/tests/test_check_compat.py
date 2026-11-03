@@ -13,6 +13,12 @@ PLUGIN = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('account_usage_check_compat', PLUGIN / 'check_compat.py')
 check_compat = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check_compat)
+# Function pins are AST digests defined under the Hermes runtime minor; under any other Python
+# check_compat delegates to an AST_PYTHON interpreter and, with none (public CI), reports "not checked".
+on_ast_python = unittest.skipUnless(
+    sys.version_info[:2] == check_compat.AST_PYTHON,
+    'needs the Hermes runtime Python %d.%d (check_compat.AST_PYTHON) to compute function-pin digests'
+    % check_compat.AST_PYTHON)
 
 
 class CheckCompat(unittest.TestCase):
@@ -73,10 +79,10 @@ class CheckCompat(unittest.TestCase):
         pins.write_text(json.dumps({'agent.fn:seam': [digest]}))
         return digest, pins
 
+    @on_ast_python
     def test_function_pins_from_another_python_delegate_to_the_runtime_minor(self):
         """macOS /usr/bin/python3 (3.9) dumps a different AST: compute under AST_PYTHON instead."""
         from unittest import mock
-        self.assertEqual(sys.version_info[:2], check_compat.AST_PYTHON, 'run under the Hermes runtime Python')
         digest, pins = self._write_function_pin()
         old = mock.patch.object(check_compat.sys, 'version_info', (3, 9, 6))
         with old, mock.patch.object(check_compat, '_ast_pythons', lambda core: iter([Path(sys.executable)])):
@@ -91,6 +97,7 @@ class CheckCompat(unittest.TestCase):
         self.assertEqual(report['drift'], [])  # a false drift from the wrong Python is worse than a visible skip
         self.assertEqual([s['pin'] for s in report['skipped']], ['fast-rate-limit-fallback/compatibility.json'])
 
+    @on_ast_python
     def test_fast_fallback_function_pin_drift_and_missing(self):
         digest, pins = self._write_function_pin()
         pins.write_text(json.dumps({'agent.fn:seam': [digest], 'agent.gone:seam': digest}))
@@ -107,7 +114,8 @@ class CheckCompat(unittest.TestCase):
         import ast
         import inspect
         import textwrap
-        from core_path import core_path
+        from core_path import require_core
+        core = require_core()
         import importlib
         pins = json.loads((PLUGIN.parent / 'fast-rate-limit-fallback' / 'compatibility.json').read_text())
         for key in pins:
@@ -116,7 +124,7 @@ class CheckCompat(unittest.TestCase):
             function = inspect.unwrap(function)
             tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
             live = hashlib.sha256(ast.dump(tree.body[0], include_attributes=False).encode()).hexdigest()
-            self.assertEqual(check_compat._function_digest(core_path(), key), live, key)
+            self.assertEqual(check_compat._function_digest(core, key), live, key)
 
     def test_cli_exit_codes(self):
         script = self.plugin / 'check_compat.py'
@@ -133,8 +141,8 @@ class CheckCompat(unittest.TestCase):
 class InstalledCore(unittest.TestCase):
     """The pins in this checkout match the core this host runs. Red = re-audit before shipping."""
     def test_pins_match_installed_core(self):
-        from core_path import core_path
-        core = core_path()
+        from core_path import require_core
+        core = require_core()
         report = check_compat.check(core)
         self.assertTrue(report['ok'], json.dumps(report['drift'], indent=2))
 
@@ -142,8 +150,8 @@ class InstalledCore(unittest.TestCase):
 class CoreImportIsolation(unittest.TestCase):
     def probe(self, route, code):
         import os
-        from core_path import core_path
-        core = core_path()
+        from core_path import require_core
+        core = require_core() if route != 'missing' else None  # that route needs no core
         with tempfile.TemporaryDirectory() as scratch:
             home = Path(scratch) / 'home'
             home.mkdir()

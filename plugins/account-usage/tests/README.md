@@ -4,7 +4,12 @@ Use a Python environment containing pytest and the core dependencies. Tests do n
 install dependencies or launch a new runtime. Core source resolution uses
 `HERMES_TEST_CORE`, then core already importable on `PYTHONPATH`, then
 `~/.hermes/hermes-agent`. An invalid explicit path fails with an ImportError and
-setup guidance; it does not fall back or skip the compatibility check.
+setup guidance; it does not fall back or skip the compatibility check. With no core
+anywhere and none requested (neither `HERMES_TEST_CORE` nor test-all's
+`HERMES_CORE_CHECKOUT` set: the public plugin-suites CI), `core_path.require_core()`
+skips the core-backed modules and tests with that same not-found reason and the
+core-free ones still run. The function-pin digest tests also skip off the Hermes
+runtime minor (`check_compat.AST_PYTHON`, 3.14).
 
 From the repository root (set `CORE` and `PYTHON` to absolute paths):
 
