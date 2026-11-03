@@ -5,7 +5,8 @@ Shared by the Hermes pre_tool_call hook (__init__.py) and the Claude Code PreToo
 (`docker build`), whole test suites (`pytest` with no test path or with `-n`, bare `npm test`,
 `vitest run` with no filter, `make test`, Hermes `scripts/run_tests.sh` with no test path) and whole-repo dependency installs (`npm install`,
 `pnpm install`, `uv sync`, `pip install -r`). Targeted work stays allowed (`pytest tests/test_x.py`,
-`cargo build`, `npm install left-pad`), as does anything sent over `ssh`.
+`cargo build`, `npm install left-pad`), as does anything sent over `ssh`, including the body of a
+heredoc fed to it (`ssh hub bash -s <<'EOF'`).
 
 Hermes core worktrees: a multi-file Python test run there (pytest or scripts/run_tests.sh with 2+ test paths
 or a directory) is allowed but gets a note pointing at `hermes-core-wt test <same args>`, which runs it on
@@ -81,7 +82,8 @@ def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
             cur.append(t)
 
 
-def _unwrap(argv: list[str]) -> Iterator[tuple[list[str], set[str]]]:
+def _strip_prefix(argv: list[str]) -> tuple[list[str], set[str]]:
+    """Drop leading `NAME=value` assignments and `env`/`nice`/`timeout`/... wrappers: (the command, env names)."""
     env: set[str] = set()
     i = 0
     while i < len(argv):
@@ -101,7 +103,11 @@ def _unwrap(argv: list[str]) -> Iterator[tuple[list[str], set[str]]]:
             i += 1  # the duration
         else:
             break
-    rest = argv[i:]
+    return argv[i:], env
+
+
+def _unwrap(argv: list[str]) -> Iterator[tuple[list[str], set[str]]]:
+    rest, env = _strip_prefix(argv)
     if not rest:
         return
     name = os.path.basename(rest[0])
@@ -114,6 +120,69 @@ def _unwrap(argv: list[str]) -> Iterator[tuple[list[str], set[str]]]:
             yield sub, sub_env | env
         return
     yield rest, env
+
+
+# `<<WORD` / `<<-WORD`, never the here-string `<<<`. WORD may be bare, 'quoted', "quoted" or \escaped.
+HEREDOC = re.compile(r"""(?<!<)<<(?!<)(-?)[ \t]*((?:'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|()<>'"\\])+)""")
+CONTINUED = re.compile(r"(?<!\\)(?:\\\\)*\\\n\Z")  # a line ending in an unescaped backslash
+_PROBE = "mac-heavy-guard-probe\x01"
+
+
+def _owner(before: str) -> Optional[str]:
+    """First word of the simple command still open at the end of `before` (shell text), past assignments and
+    wrappers. None when `before` ends inside a quote or a comment (so what follows is no operator)."""
+    toks = _tokens(before + " " + _PROBE)
+    if not toks or toks[-1] != _PROBE:
+        return None
+    toks = toks[:-1]
+    start = 0
+    for k, t in enumerate(toks):
+        if t == "&" and k and toks[k - 1][-1:] in (">", "<"):
+            continue  # `2>&1`, `>&2`: a redirect, not a separator
+        if t in SEPARATORS or (t and set(t) <= set(";&|()\n")):
+            start = k + 1
+    rest, _ = _strip_prefix(toks[start:])
+    return os.path.basename(rest[0]) if rest else ""
+
+
+def _drop_ssh_heredocs(text: str) -> str:
+    """Drop the body and delimiter lines of every heredoc fed to `ssh`: that text runs on the remote host.
+    Every other heredoc body (a local `bash -s`, `python3 -`, ...) stays in the text and is scanned."""
+    if "<<" not in text:
+        return text
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    shell = ""  # shell text read so far (heredoc bodies excluded): quote state and the owner's prefix
+    i = 0
+    while i < len(lines):
+        logical = lines[i]
+        i += 1
+        # A command line ends at a newline that is neither escaped nor inside a quote.
+        while i < len(lines) and (CONTINUED.search(logical) or _tokens(shell + logical) is None):
+            logical += lines[i]
+            i += 1
+        out.append(logical)
+        bodies = []
+        for m in HEREDOC.finditer(logical):
+            owner = _owner(shell + logical[:m.start()])
+            if owner is None:
+                continue
+            try:
+                word = shlex.split(m.group(2))[0]
+            except (ValueError, IndexError):
+                continue
+            bodies.append((owner == "ssh", m.group(1) == "-", word))
+        shell += logical
+        for remote, strip_tabs, word in bodies:  # several on one line: their bodies follow in order
+            while i < len(lines):  # no delimiter line: the body runs to the end of the text
+                line = lines[i]
+                i += 1
+                if not remote:
+                    out.append(line)
+                bare = line.rstrip("\r\n")
+                if (bare.lstrip("\t") if strip_tabs else bare) == word:
+                    break
+    return "".join(out)
 
 
 def _strip_runner(argv: list[str]) -> list[str]:
@@ -357,7 +426,7 @@ Hit = tuple[str, Optional[list[str]], Optional[str]]  # (why, Python-test args i
 
 
 def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optional[Hit]:
-    for argv, env in commands(text):
+    for argv, env in commands(_drop_ssh_heredocs(text)):
         if argv[0] == "cd" and len(argv) > 1 and not argv[1].startswith("-"):
             cwd = _cd(cwd, argv[1])
             continue
@@ -478,7 +547,7 @@ def note(text: str, cwd: Optional[str] = None) -> Optional[str]:
     """Non-blocking note for a multi-file Python test run inside a Hermes core worktree, else None."""
     if _opted_out():
         return None
-    for argv, env in commands(text):
+    for argv, env in commands(_drop_ssh_heredocs(text)):
         if argv[0] == "cd" and len(argv) > 1 and not argv[1].startswith("-"):
             cwd = _cd(cwd, argv[1])
             continue
