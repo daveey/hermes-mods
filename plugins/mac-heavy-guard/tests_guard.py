@@ -72,7 +72,7 @@ def test_large_copy_refused(copy_home, cmd):
     "ditto ~/.hermes/small ~/.hermes/state.db",
 ])
 def test_large_copy_allow_controls(copy_home, cmd):
-    assert blocked("terminal", command=cmd)  # SCRATCH: deliberately flipped to prove plugin-suites goes red
+    assert not blocked("terminal", command=cmd)
 
 
 @pytest.mark.parametrize("cmd", [
