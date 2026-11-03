@@ -42,7 +42,10 @@ Stress-test the design (this lens runs on the strongest model).
 3. Unbacked claims about external systems, data, performance or limits.
 4. Failure modes: for each external call, write, or message: what happens on timeout, partial failure, retry,
    duplicate delivery and concurrent execution? Is idempotency decided? Are ordering and at-least/at-most-once
-   semantics stated?
+   semantics stated? For whole-map read/modify/write without compare-and-swap, trace both lost-update directions:
+   another writer erases this writer's change, and this writer erases the other's change. Identify which invariant
+   detects each; successful readback can confirm an overwrite without detecting the lost concurrent change.
+   Check that reconciliation edits only owned entries rather than deleting unrelated members to restore an invariant.
 5. Security, privacy, scale and operational risks introduced but not mitigated.
 6. Rollback: can the change be undone, and is data migration reversible?
 
