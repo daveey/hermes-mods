@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import os
+import re
 import sys
 import threading
 import time
@@ -34,6 +36,13 @@ MAX_REPORTS_PER_HOUR = 120
 # /api/profiles/projects/tree spent all 120 by 00:32:59 (hub, 2026-11-03), and the fleet request behind a
 # Desktop timeout at 00:33:03 left no record.
 MAX_REPORTS_PER_PATH_PER_HOUR = 20
+# Hourly ``request_stats`` record: every request counts (fast ones and slow ones past the report caps), so the
+# per-hour slow rate and latency percentiles stay measurable while the slow_request reports are capped.
+STATS_MAX_PATHS = 300  # distinct normalized paths tracked per hour; the rest fold into "(other)"
+STATS_MAX_DURATIONS = 5000  # per path per hour, for the percentiles
+STATS_MAX_QUERIES = 64  # distinct slow query strings counted per path per hour
+STATS_EMIT_PATHS = 40  # paths written per record, by total time
+_ID_SEGMENT = re.compile(r"^(?=.*\d)[A-Za-z0-9_.:-]{8,}$")
 
 
 def _short(path: str) -> str:
@@ -74,12 +83,27 @@ def _task_chain(task) -> tuple:
         return ()
 
 
+def stats_path(path: str) -> str:
+    """Path with id-like segments (session ids, card ids, hashes) folded to ``:id``, so per-path stats
+    count one route, not one row per session."""
+    path = path.split("?", 1)[0]
+    return "/".join(":id" if _ID_SEGMENT.match(seg) else seg for seg in path.split("/"))
+
+
+def _pct(sorted_vals: list, q: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    return sorted_vals[min(len(sorted_vals) - 1, int(round(q * (len(sorted_vals) - 1))))]
+
+
 class _Req:
     __slots__ = ("id", "method", "path", "t0", "task", "resp_at", "status", "samples", "others", "workers",
-                 "last_sample")
+                 "last_sample", "query", "inflight_same")
 
-    def __init__(self, rid: int, method: str, path: str, t0: float, task) -> None:
+    def __init__(self, rid: int, method: str, path: str, t0: float, task, query: str = "",
+                 inflight_same: int = 0) -> None:
         self.id, self.method, self.path, self.t0, self.task = rid, method, path, t0, task
+        self.query, self.inflight_same = query, inflight_same
         self.resp_at: Optional[float] = None
         self.status: Optional[int] = None
         self.samples: Counter = Counter()
@@ -97,6 +121,8 @@ class ReqTrace:
         self._lock = threading.Lock()
         self._hour = (0, 0)  # (hour bucket, reports in it)
         self._per_path: Counter = Counter()  # reports per path in the current hour bucket
+        self._stats_hour = 0
+        self._stats: Dict[str, dict] = {}
 
     # ---- ASGI side (runs on the loop) ----
     def wrap(self, app):
@@ -105,9 +131,15 @@ class ReqTrace:
         async def traced(scope, receive, send):
             if scope.get("type") != "http":
                 return await app(scope, receive, send)
-            req = _Req(next(trace._ids), scope.get("method", "?"), scope.get("path", "?"), trace.clock(),
-                       asyncio.current_task())
+            path = scope.get("path", "?")
+            try:
+                query = (scope.get("query_string") or b"").decode("latin-1")[:300]
+            except Exception:  # noqa: BLE001
+                query = ""
             with trace._lock:
+                same = sum(1 for r in trace.inflight.values() if r.path == path and r.resp_at is None)
+                req = _Req(next(trace._ids), scope.get("method", "?"), path, trace.clock(),
+                           asyncio.current_task(), query, same)
                 trace.inflight[req.id] = req
 
             async def send_wrapper(message):
@@ -126,12 +158,60 @@ class ReqTrace:
         traced.__loop_watch_traced__ = True
         return traced
 
+    def _record_stats(self, req: _Req, total: float, hour: int) -> None:
+        if self._stats_hour != hour:
+            self.flush_stats()
+            self._stats_hour = hour
+        key = stats_path(req.path)
+        if key not in self._stats and len(self._stats) >= STATS_MAX_PATHS:
+            key = "(other)"
+        st = self._stats.get(key)
+        if st is None:
+            st = self._stats[key] = {"n": 0, "slow": 0, "durs": [], "max_inflight": 0, "slow_queries": Counter(),
+                                         "queries": Counter()}
+        st["n"] += 1
+        if len(st["durs"]) < STATS_MAX_DURATIONS:
+            st["durs"].append(total)
+        st["max_inflight"] = max(st["max_inflight"], req.inflight_same + 1)
+        if req.query in st["queries"] or len(st["queries"]) < STATS_MAX_QUERIES:
+            st["queries"][req.query] += 1
+        if total >= self.slow_s:
+            st["slow"] += 1
+            q = req.query
+            if q in st["slow_queries"] or len(st["slow_queries"]) < STATS_MAX_QUERIES:
+                st["slow_queries"][q] += 1
+
+    def flush_stats(self) -> None:
+        """Sink the current hour's ``request_stats`` record (if any request finished in it) and reset."""
+        stats, self._stats = self._stats, {}
+        if not stats:
+            return
+        paths = {}
+        ranked = sorted(stats.items(), key=lambda kv: -sum(kv[1]["durs"]))[:STATS_EMIT_PATHS]
+        for key, st in ranked:
+            durs = sorted(st["durs"])
+            paths[key] = {"n": st["n"], "slow": st["slow"], "p50_s": round(_pct(durs, 0.5), 3),
+                          "p95_s": round(_pct(durs, 0.95), 3), "max_s": round(durs[-1] if durs else 0.0, 3),
+                          "max_inflight": st["max_inflight"],
+                          "queries": [[q, n] for q, n in st["queries"].most_common(8)],
+                          "slow_queries": [[q, n] for q, n in st["slow_queries"].most_common(8)]}
+        rep = {"kind": "request_stats", "hour": time.strftime("%Y-%m-%dT%H", time.localtime(self._stats_hour * 3600)),
+               "pid": os.getpid(), "slow_s": self.slow_s, "paths": paths}
+        try:
+            self.sink(rep)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("loop-watch request-stats sink failed: %s", exc)
+
     def _finish(self, req: _Req) -> None:
         end = req.resp_at if req.resp_at is not None else self.clock()
         total = end - req.t0
+        hour = int(time.time() // 3600)
+        try:
+            self._record_stats(req, total, hour)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("loop-watch request stats failed: %s", exc)
         if total < self.slow_s:
             return
-        hour = int(time.time() // 3600)
         if self._hour[0] != hour:
             self._hour, self._per_path = (hour, 0), Counter()
         key = req.path.split("?", 1)[0]
@@ -145,6 +225,8 @@ class ReqTrace:
             "started": time.strftime("%H:%M:%S", time.localtime(wall0)) + ".%03d" % (int(wall0 * 1000) % 1000),
             "method": req.method,
             "path": req.path[:300],
+            "query": req.query,
+            "inflight_same_path": req.inflight_same,
             "total_s": round(total, 3),
             "responded": req.resp_at is not None,
             "status": req.status,
@@ -257,6 +339,14 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
     import json
 
     def sink(rep: dict) -> None:
+        if rep.get("kind") != "slow_request":
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rep) + "\n")
+            except OSError:
+                pass
+            return
         chain = rep["awaiting"][0]["chain"] if rep["awaiting"] else []
         top = chain[-3:]
         # Behind a BaseHTTPMiddleware the request task only waits on call_next's stream (anyio Event.wait), which
@@ -268,7 +358,7 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
                 w = workers[0]
                 busy = " busy=%s(%d): %s" % (w["thread"], w["n"], " > ".join(w["stack"][-3:]))
         logger.warning("loop-watch: slow request %s %s %.2fs (started %s, responded=%s, samples=%d) awaiting=%s%s",
-                       rep["method"], rep["path"], rep["total_s"], rep["started"], rep["responded"], rep["samples"],
+                       rep["method"], rep["path"] + ("?" + rep["query"] if rep.get("query") else ""), rep["total_s"], rep["started"], rep["responded"], rep["samples"],
                        " > ".join(top) or "-", busy)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

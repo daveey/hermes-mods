@@ -173,3 +173,73 @@ def test_sink_names_the_busy_worker_when_the_request_waits_behind_middleware(tmp
     with caplog.at_level("WARNING", logger="loop-watch"):
         sink(rep)
     assert "busy=" not in caplog.text  # a request parked on its own await already names it
+
+
+def test_slow_report_carries_query_and_same_path_concurrency():
+    """Card t_01a19f5af20a19f6: bursts of ~15 concurrent /api/sessions could not be attributed because the
+    report kept only the path. It now carries the query string and how many same-path requests were in flight."""
+    reps = []
+    trace = rt.ReqTrace(sink=reps.append, slow_s=0.2, sample_after_s=5, sample_s=1)
+
+    async def slowish(scope, receive, send):
+        await asyncio.sleep(0.3)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    app = trace.wrap(slowish)
+
+    async def burst():
+        async def one(i):
+            await app({"type": "http", "method": "GET", "path": "/api/sessions",
+                       "query_string": b"limit=100&order=recent&profile=p%d" % i}, None, lambda m: asyncio.sleep(0))
+        await asyncio.gather(*(one(i) for i in range(3)))
+
+    asyncio.run(burst())
+    slow = [r for r in reps if r["kind"] == "slow_request"]
+    assert sorted(r["query"] for r in slow) == ["limit=100&order=recent&profile=p%d" % i for i in range(3)]
+    assert sorted(r["inflight_same_path"] for r in slow) == [0, 1, 2]
+
+
+def test_hourly_request_stats_count_every_request_past_the_report_cap():
+    """The per-path report cap (20/h) made loop-watch.jsonl useless as a slow-rate meter: the hourly
+    request_stats record counts every request, slow ones included, with percentiles and the slow queries."""
+    reps = []
+    now = [100.0]
+    hour = [1000]
+    trace = rt.ReqTrace(sink=reps.append, slow_s=2.0, clock=lambda: now[0])
+    orig_time = rt.time.time
+    rt.time.time = lambda: hour[0] * 3600 + 5.0
+    try:
+        def finish(path, dur, query=""):
+            req = rt._Req(1, "GET", path, now[0] - dur, None, query, 0)
+            req.resp_at = now[0]
+            trace._finish(req)
+
+        for i in range(50):
+            finish("/api/sessions", 3.0, "limit=100&order=recent")
+        for i in range(50):
+            finish("/api/sessions", 0.1, "limit=20")
+        finish("/api/sessions/20261103_abcdef12/messages", 0.5)
+        assert not [r for r in reps if r["kind"] == "request_stats"]
+        hour[0] += 1
+        finish("/api/status", 0.01)
+    finally:
+        rt.time.time = orig_time
+    slow_reports = [r for r in reps if r["kind"] == "slow_request"]
+    assert len(slow_reports) == rt.MAX_REPORTS_PER_PATH_PER_HOUR
+    stats = [r for r in reps if r["kind"] == "request_stats"]
+    assert len(stats) == 1
+    s = stats[0]["paths"]["/api/sessions"]
+    assert s["n"] == 100 and s["slow"] == 50
+    assert s["p95_s"] == 3.0 and s["p50_s"] in (0.1, 3.0) and s["max_s"] == 3.0
+    assert s["slow_queries"] == [["limit=100&order=recent", 50]]
+    assert ["limit=20", 50] in s["queries"]
+    assert "/api/sessions/:id/messages" in stats[0]["paths"]
+    json.dumps(stats[0])
+
+
+def test_sink_writes_stats_record_without_a_log_line(tmp_path, caplog):
+    out = tmp_path / "logs" / "loop-watch.jsonl"
+    sink = rt.default_sink(out)
+    sink({"kind": "request_stats", "hour": "2026-11-03T13", "paths": {}})
+    assert json.loads(out.read_text())["kind"] == "request_stats"
+    assert "slow request" not in caplog.text
