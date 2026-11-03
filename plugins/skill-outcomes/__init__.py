@@ -4,6 +4,8 @@ Hooks (all fail-open):
 - post_tool_call: a successful full `skill_view` (no file_path) = one skill use in this turn.
 - transform_tool_result: a loaded skill with a `## Done means` section gets one line asking for the tick-off.
 - post_llm_call: turn end -> pending records with the reply's `Done means (<skill>): p/t first pass, k fix rounds`.
+- pre_final_gate: holds the reply once (first stop only) when a Done-means skill loaded this turn lacks its
+  tick-off line, so the agent re-sends it with the line.
 - pre_llm_call: the session's next real user message closes the correction window.
 - on_session_end: nothing is forced; due records are flushed by the sweep (hooks, at most once a minute) and by
   `outcomes.py flush` (coach_feed runs it before collecting).
@@ -147,7 +149,34 @@ def pre_llm_call(session_id: str = "", user_message: Any = None, **_):
     return None
 
 
+def pre_final_gate(session_id: str = "", final_response: Any = None, attempt: int = 0, **_):
+    """Hold a final reply once when a Done-means skill loaded this turn has no tick-off line in it. The ask in the
+    skill_view result is often far behind (or compacted away) by the time the reply is written."""
+    try:
+        if attempt or not session_id or not isinstance(final_response, str) or not final_response.strip():
+            return None
+        with _lock:
+            loads = list((_loads.get(session_id) or {}).values())
+        ticks = core.parse_tickoffs(final_response)
+        missing = [ld["skill"] for ld in loads if ld.get("has_done_means") and ld["skill"].lower() not in ticks]
+        if not missing:
+            return None
+        want = "\n".join(f"`Done means ({s}): <passed on first check>/<total> first pass, <k> fix rounds`"
+                         for s in missing)
+        return {"hold": True, "nudge": (
+            f"{core.MARK} You loaded {', '.join(missing)} this turn; each has a `## Done means` list. Check each "
+            f"line against your work, then send the reply again ending with one line per skill:\n{want}\n"
+            "(add `; still failing: <what>` when any line fails).")}
+    except Exception as exc:
+        log.debug("skill-outcomes pre_final_gate: %s", exc)
+        return None
+
+
+pre_final_gate.needs_buffer = True  # type: ignore[attr-defined]  # a held draft must not have streamed
+
+
 def register(ctx):
+    ctx.register_hook("pre_final_gate", pre_final_gate)
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("transform_tool_result", transform_tool_result)
     ctx.register_hook("post_llm_call", post_llm_call)

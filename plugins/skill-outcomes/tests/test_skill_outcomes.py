@@ -181,3 +181,22 @@ def test_cli_flush_and_rollup(home, capsys):
         r["tickoff_mismatch"] = r["skill"] == "five-whys" and r["checks"] == "5/5"
     assert core.rollup(rows, t - 100, t + 100)[0]["ticked"] == 1
     assert "1 tick-off(s) gave a total" in "\n".join(core.rollup_lines(rows, t - 100, t + 100))
+
+
+# ---------------------------------------------------------------- pre_final_gate tick-off hold
+def test_final_gate_holds_once_until_tickoff_present(home):
+    plug.post_tool_call(tool_name="skill_view", args={"name": "five-whys"}, result=view("five-whys", SKILL_DONE),
+                        session_id="s1")
+    plug.post_tool_call(tool_name="skill_view", args={"name": "other"}, result=view("other", SKILL_PLAIN),
+                        session_id="s1")
+    held = plug.pre_final_gate(session_id="s1", final_response="Root cause found.", attempt=0)
+    assert held["hold"] is True and "Done means (five-whys)" in held["nudge"] and "other" not in held["nudge"]
+    # the re-send is never held again, with or without the line
+    assert plug.pre_final_gate(session_id="s1", final_response="Root cause found.", attempt=1) is None
+    ok = "Root cause found.\n\nDone means (five-whys): 1/1 first pass, 0 fix rounds"
+    assert plug.pre_final_gate(session_id="s1", final_response=ok, attempt=0) is None
+    # a turn with no Done-means skill, or another session, is not held
+    assert plug.pre_final_gate(session_id="s2", final_response="hi", attempt=0) is None
+    plug.post_llm_call(session_id="s1", assistant_response=ok, turn_id="t1")
+    assert plug.pre_final_gate(session_id="s1", final_response="next turn", attempt=0) is None
+    assert plug.pre_final_gate.needs_buffer is True
