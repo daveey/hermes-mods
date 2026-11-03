@@ -140,5 +140,36 @@ class FeedStatusTest(unittest.TestCase):
         self.assertEqual(st["signals"], "no-hub")
 
 
+class SkillOutcomesCopy(unittest.TestCase):
+    def test_flushes_then_copies_home_and_profiles_as_a_union(self):
+        d = Path(tempfile.mkdtemp())
+        home, repo = d / "home", d / "repo"
+        (home / "logs").mkdir(parents=True)
+        (home / "profiles" / "coach" / "logs").mkdir(parents=True)
+        (home / "logs" / "skill-outcomes.jsonl").write_text('{"skill":"a","ts":2}\n')
+        (home / "profiles" / "coach" / "logs" / "skill-outcomes.jsonl").write_text('{"skill":"b","ts":3}\n')
+        dest = repo / "hub" / "skill-outcomes.jsonl"
+        dest.parent.mkdir(parents=True)
+        dest.write_text('{"skill":"old","ts":1}\n{"skill":"a","ts":2}\n')  # already collected; local log pruned
+        plugin = d / "outcomes.py"
+        plugin.write_text("")
+        calls = []
+        n = coach_feed.collect_skill_outcomes(home, repo, "hub", runner=lambda cmd, **kw: calls.append(cmd),
+                                              plugin=plugin)
+        self.assertEqual(n, 3)
+        self.assertEqual(calls[0][1:], [str(plugin), "flush", "--home", str(home), "--all-profiles"])
+        self.assertEqual(dest.read_text().splitlines(), ['{"skill":"old","ts":1}', '{"skill":"a","ts":2}',
+                                                         '{"skill":"b","ts":3}'])
+
+    def test_nothing_to_collect(self):
+        d = Path(tempfile.mkdtemp())
+        self.assertIsNone(coach_feed.collect_skill_outcomes(d / "h", d / "r", "hub", runner=lambda *a, **k: None,
+                                                            plugin=d / "missing.py"))
+        self.assertFalse((d / "r").exists())
+
+    def test_real_plugin_path_exists(self):
+        self.assertTrue(coach_feed.skill_outcomes_plugin().exists())
+
+
 if __name__ == "__main__":
     unittest.main()

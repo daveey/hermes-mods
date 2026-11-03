@@ -21,6 +21,11 @@ listed with session + quote so a human can eyeball them, and a miss on the sampl
 last 50 user turns per session) is possible. Weeks run Monday 00:00 PT to Monday 00:00 PT. Hits seen on several hosts
 (forked or mirrored sessions) count once.
 Target after the ask-gate ships: 0.
+
+With --last-week the report also carries a "Skill outcomes" section (plugins/skill-outcomes): per skill uses, Done-means
+tick-offs, first-pass rate, mean fix rounds and correction rate for that week, read from every host's
+<data>/<host>/skill-outcomes.jsonl (coach_feed copies them) plus the local --home logs. --post also writes it to
+reports/askgate/<monday>-skill-outcomes.md and puts it in the review card body.
 """
 import argparse, glob, json, os, re, subprocess, sys, time
 from datetime import datetime, timedelta
@@ -363,6 +368,24 @@ def _coach_mod(name):
     return mod
 
 
+def skill_outcome_lines(data, homes, lo, hi):
+    """The weekly Skill outcomes section (plugins/skill-outcomes/outcomes.py rollup over [lo, hi)), or a one-line
+    note when it cannot be built. Sources: every <data>/*/skill-outcomes.jsonl plus each home's own logs."""
+    try:
+        import importlib.util
+        p = Path(__file__).resolve().parents[4] / "plugins" / "skill-outcomes" / "outcomes.py"
+        spec = importlib.util.spec_from_file_location("_askgate_skill_outcomes", p)
+        so = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(so)
+        homes = homes or [Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()]
+        paths = sorted(Path(data).glob("*/skill-outcomes.jsonl"))
+        for h in homes:
+            paths += so.home_logs(h)
+        return so.rollup_lines(so.read_lines(paths), lo, hi)
+    except Exception as e:  # the KPI post never fails on this section
+        return [f"Skill outcomes section unavailable: {type(e).__name__}: {e}"]
+
+
 def lane_sessions(home):
     """Session ids the self-heal lane already has a filing for (any status)."""
     try:
@@ -555,6 +578,11 @@ def main():
     else:
         title = f"Ask-gate and had-to-ask-for-a-fix baseline: {a.weeks} weeks to {datetime.now(PT):%Y-%m-%d}"
     md = render(hits, weeks, scanned, title)
+    so_lines = None
+    if a.last_week:
+        homes = [Path(h).expanduser() for h in a.home] or None
+        so_lines = skill_outcome_lines(data, homes, weeks[0].timestamp(), until)
+        md += "\n\n" + "\n".join(so_lines)
     if a.json:
         print(json.dumps({"weeks": {f"{w:%Y-%m-%d}": c for w, c in week_counts(hits, weeks).items()},
                           "hits": hits}, indent=1))
@@ -598,6 +626,11 @@ def main():
                 extra += [""] + detected_lines(detected)
         else:
             detected = []
+        if so_lines:
+            extra = (extra or []) + [""] + so_lines
+            sp = data / "reports" / "askgate" / f"{weeks[0]:%Y-%m-%d}-skill-outcomes.md"
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            sp.write_text("\n".join(so_lines) + "\n")
         deliver(hits, weeks[0], extra, rest, len(fix), len(bb), len(ask))
         p = marker_path(data, weeks[0])
         p.parent.mkdir(parents=True, exist_ok=True)

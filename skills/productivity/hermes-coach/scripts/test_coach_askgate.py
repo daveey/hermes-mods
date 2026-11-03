@@ -323,5 +323,33 @@ class Deliver(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class SkillOutcomes(unittest.TestCase):
+    """The weekly Skill outcomes section reads every host's copy in the data repo plus the local home log."""
+    def test_section_rolls_up_hosts_and_home_in_the_window(self):
+        import json, tempfile
+        d = Path(tempfile.mkdtemp())
+        data, home = d / "data", d / "home"
+        row = lambda host, sid, ts, fp, fr, uc: json.dumps({"ts": ts, "host": host, "session": sid, "skill": "five-whys",
+                                                            "checks_first_pass": fp, "fix_rounds": fr,
+                                                            "user_correction": uc})
+        (data / "macbook").mkdir(parents=True)
+        (data / "macbook" / "skill-outcomes.jsonl").write_text(
+            row("macbook", "a", 1000, True, 0, False) + "\n" + row("macbook", "b", 1001, False, 2, True) + "\n"
+            + row("macbook", "old", 10, True, 0, False) + "\n")
+        (home / "logs").mkdir(parents=True)
+        # the hub's own log, also already copied into the data repo: counted once
+        hub = row("hermes-hub", "c", 1002, None, None, False)
+        (home / "logs" / "skill-outcomes.jsonl").write_text(hub + "\n")
+        (data / "hermes-hub").mkdir()
+        (data / "hermes-hub" / "skill-outcomes.jsonl").write_text(hub + "\n")
+        md = "\n".join(g.skill_outcome_lines(data, [home], 500, 2000))
+        self.assertIn("## Skill outcomes", md)
+        self.assertIn("3 uses of 1 skills on hermes-hub, macbook; 2 with a tick-off (67%)", md)
+        self.assertIn("| five-whys | 3 | 2 | 50% | 1.00 | 33% |", md)
+
+    def test_section_never_raises(self):
+        self.assertIn("unavailable", " ".join(g.skill_outcome_lines(None, [Path("/nonexistent")], 0, 1)))
+
+
 if __name__ == "__main__":
     unittest.main()

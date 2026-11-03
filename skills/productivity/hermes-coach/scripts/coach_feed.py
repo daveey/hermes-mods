@@ -8,6 +8,8 @@ Pull uses rebase + autostash; each host writes only its own <host>/ subtree, so 
 Meant for launchd/cron every ~30 min. Prints one JSON status line.
 Also copies this host's private curriculum overlay (<home>/coach/curriculum.yaml, if any) to
 <repo-dir>/curriculum/<host>.yaml, so the miner on the coach Bot can check its adoption tests.
+Also flushes due skill-outcomes records (plugins/skill-outcomes/outcomes.py flush --all-profiles) and copies this
+host's <home>/logs/skill-outcomes.jsonl (+ profiles) to <repo-dir>/<host>/skill-outcomes.jsonl for the weekly rollup.
 """
 import argparse, json, os, re, subprocess, sys, time
 from pathlib import Path
@@ -86,6 +88,40 @@ def signals_state(out):
     return "unknown"
 
 
+def skill_outcomes_plugin():
+    """plugins/skill-outcomes/outcomes.py in this hermes-mods tree (scripts -> hermes-coach -> productivity -> skills)."""
+    return HERE.parents[3] / "plugins" / "skill-outcomes" / "outcomes.py"
+
+
+def collect_skill_outcomes(home, repo, host, runner=subprocess.run, plugin=None):
+    """Flush due records, then copy every home/profile skill-outcomes.jsonl into <repo>/<host>/skill-outcomes.jsonl
+    (deduped union with what is there, so a pruned local log never drops rows already collected). Returns the
+    row count written, or None when there is nothing to collect."""
+    home = Path(home)
+    plugin = Path(plugin or skill_outcomes_plugin())
+    if plugin.exists():
+        runner([sys.executable, str(plugin), "flush", "--home", str(home), "--all-profiles"],
+               capture_output=True, text=True)
+    srcs = [home / "logs" / "skill-outcomes.jsonl", *sorted(home.glob("profiles/*/logs/skill-outcomes.jsonl"))]
+    dest = Path(repo) / host / "skill-outcomes.jsonl"
+    seen, rows = set(), []
+    for p in [dest, *srcs]:
+        if not p.exists():
+            continue
+        for line in p.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line and line not in seen:
+                seen.add(line)
+                rows.append(line)
+    if not rows:
+        return None
+    body = "\n".join(rows) + "\n"
+    if not dest.exists() or dest.read_text(errors="replace") != body:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(body)
+    return len(rows)
+
+
 def write_feed_status(repo, host, out, now=None):
     """<repo>/<host>/feed-status.json = {signals: state, detail, since}: lets the hub see a Mac forwarder that never
     reached it (no config, ssh refused, crash) from the data repo, without a shell on that Mac. Rewritten only when
@@ -152,6 +188,10 @@ def main():
     if overlay.exists() and (not copy.exists() or copy.read_bytes() != overlay.read_bytes()):
         copy.parent.mkdir(exist_ok=True)
         copy.write_bytes(overlay.read_bytes())
+    try:
+        status["skill_outcomes"] = collect_skill_outcomes(home, repo, a.host)
+    except Exception as e:  # never fail the digest feed on this
+        status["skill_outcomes"] = f"error: {type(e).__name__}: {e}"
     if (repo / a.host).exists():
         write_feed_status(repo, a.host, status["signals"])
         git(repo, "add", "-A", a.host)
