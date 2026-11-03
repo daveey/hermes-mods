@@ -907,6 +907,14 @@ export function summarizeTask(data, limit = 10) {
     id: t.id,
     title: t.title,
     status: t.status,
+    // Where this answer came from: "replica" = the gateway's Board replica copy of a card another gateway
+    // (owner, its created_on) created and owns; "live" = the gateway's own file. Writes on a replica copy
+    // are refused with foreign_card naming the owner.
+    ...(data?.source ? { source: data.source } : {}),
+    ...(data?.owner ? { owner: data.owner } : {}),
+    // A ready card's place in the queue that starts it (lane local: ahead/running/limit; lane
+    // worker_pool: the Board's last reason), so a long wait reads as queued, not stuck.
+    ...(data?.queue ? { queue: data.queue } : {}),
     assignee: t.assignee || null,
     priority: t.priority,
     created_by: t.created_by || null,
@@ -928,6 +936,21 @@ export function summarizeTask(data, limit = 10) {
   }
 }
 
+/** The owner-naming message from a gateway's 409 ``foreign_card`` refusal (the bridge throws
+ *  `409: {"detail":"foreign_card: <message>"}`), or null for any other error. */
+export function foreignCardRefusal(e) {
+  const text = String(e?.message || e || '')
+  if (!text.includes('foreign_card:')) return null
+  let detail = text
+  try {
+    const body = JSON.parse(text.slice(text.indexOf('{')))
+    detail = String(body?.detail ?? body?.error ?? text)
+  } catch {
+    /* not a JSON body: use the text after the marker */
+  }
+  return detail.slice(detail.indexOf('foreign_card:') + 'foreign_card:'.length).trim() || null
+}
+
 /** Resolve a task ref to {target, found:{data, board}}; a bare id is searched on every gateway
  *  (origin first). */
 async function resolveTask(rawTarget, origin, conns) {
@@ -939,6 +962,10 @@ async function resolveTask(rawTarget, origin, conns) {
   // timeout) was never searched. Reporting that as "not found" made agents conclude a live card was
   // deleted, so name the failure and say it is retryable.
   const unreachable = []
+  // A synced gateway answers a card another gateway owns from its Board replica (source "replica"). Keep
+  // looking for the gateway that holds it live (its comments land there); use the replica copy only when no
+  // reachable gateway does, e.g. a card a Board worker node created, which no Desktop reaches.
+  let replica = null
   for (const connectionId of order) {
     let found = null
     try {
@@ -947,7 +974,15 @@ async function resolveTask(rawTarget, origin, conns) {
       unreachable.push(`${gwName(connectionId)}: ${clip(e?.message || e, 300)}`)
       continue
     }
-    if (found) return { target: { ...target, connectionId, board: found.board || target.board }, found }
+    if (!found) continue
+    const hit = { target: { ...target, connectionId, board: found.board || target.board }, found }
+    if (found.data?.source !== 'replica' || !target.anyGateway) return hit
+    replica ||= hit
+  }
+  if (replica) {
+    return unreachable.length
+      ? { ...replica, note: `read from ${gwName(replica.target.connectionId)}'s replica copy; lookup failed on ${unreachable.join('; ')}` }
+      : replica
   }
   if (unreachable.length) {
     return { error: `could not read task ${target.taskId}: lookup failed on ${unreachable.join('; ')}. ` +
@@ -993,13 +1028,13 @@ async function performTaskRequest(req, origin, conns) {
     }
   }
 
-  const { target, found, error, retryable } = await resolveTask(args.target, origin, conns)
+  const { target, found, error, retryable, note } = await resolveTask(args.target, origin, conns)
   if (error) return { ok: false, error, ...(retryable ? { retryable: true } : {}) }
   const gw = conns.find(c => c.id === target.connectionId)
   const ref = taskRef(target, origin, conns)
 
   if (action === 'task_read') {
-    return { ok: true, gateway: gw?.key || target.connectionId, board: target.board || 'default', ref, task: summarizeTask(found.data, Number(args.limit) || 10) }
+    return { ok: true, gateway: gw?.key || target.connectionId, board: target.board || 'default', ref, task: summarizeTask(found.data, Number(args.limit) || 10), ...(note ? { note } : {}) }
   }
 
   if (action === 'task_comment') {
@@ -1007,11 +1042,19 @@ async function performTaskRequest(req, origin, conns) {
     if (!body) return { ok: false, error: 'message is required for comment' }
     const sender = req.sender || {}
     const author = String(sender.title || sender.session_id || 'cross-gateway agent').slice(0, 80)
-    await api(target.connectionId, `/api/plugins/kanban/tasks/${enc(target.taskId)}/comments${target.board ? `?board=${enc(target.board)}` : ''}`, {
-      method: 'POST',
-      body: { body, author },
-      timeoutMs: 15_000
-    })
+    try {
+      await api(target.connectionId, `/api/plugins/kanban/tasks/${enc(target.taskId)}/comments${target.board ? `?board=${enc(target.board)}` : ''}`, {
+        method: 'POST',
+        body: { body, author },
+        timeoutMs: 15_000
+      })
+    } catch (e) {
+      // 409 foreign_card: the gateway has only a replica copy; its message names the owner. Pass it on
+      // verbatim so the agent never reads it as "not found".
+      const refusal = foreignCardRefusal(e)
+      if (refusal) return { ok: false, rejection: 'foreign_card', error: refusal, gateway: gw?.key || target.connectionId, ref }
+      throw e
+    }
     taskCache.delete(target.connectionId)
     return { ok: true, commented: true, gateway: gw?.key || target.connectionId, ref }
   }

@@ -163,3 +163,66 @@ test('courier task_read: a failed board listing after a default-board miss is un
   assert.equal(r.retryable, true)
   assert.match(r.error, /board list unavailable/)
 })
+
+// A synced gateway answers a card another gateway owns from its Board replica (core plugin_api GET adds
+// source/owner); writes there are refused 409 foreign_card naming the owner.
+function replicaApi(calls = [], { liveOn = null } = {}) {
+  const base = fakeApi(calls)
+  const card = { id: 't_eeee5555', title: 'Made on worker-1', status: 'ready', assignee: 'default', created_at: 400 }
+  return async req => {
+    const url = new URL(req.path, 'http://x')
+    const m = /^\/api\/plugins\/kanban\/tasks\/(t_eeee5555)(\/comments)?$/.exec(url.pathname)
+    if (!m) return base(req)
+    calls.push(req)
+    const live = req.connectionId === liveOn
+    if (m[2]) {
+      if (live) return { ok: true }
+      throw new Error(`409: ${JSON.stringify({ detail: 'foreign_card: t_eeee5555 was created on worker-1 and lives there; this gateway has only a replica copy. Its owner or the Board must write it.' })}`)
+    }
+    const queue = live ? { queue: { lane: 'local', ahead: 3, running: 7, limit: 7, approximate: true } } : {}
+    return { task: { ...card, body: 'b' }, comments: [], events: [], runs: [], links: { parents: [], children: [] },
+      source: live ? 'live' : 'replica', ...(live ? {} : { owner: 'worker-1' }), ...queue }
+  }
+}
+
+test('courier task_read: a replica-only card reads ok with source and owner, not "not found"', async () => {
+  const m = await load({ state, connections: async () => conns }, replicaApi())
+  const r = await m.performRequest({ action: 'task_read', args: { target: 't_eeee5555' } }, 'local', conns)
+  assert.equal(r.ok, true, r.error)
+  assert.equal(r.task.source, 'replica')
+  assert.equal(r.task.owner, 'worker-1')
+  assert.equal(r.task.title, 'Made on worker-1')
+  assert.equal(r.gateway, 'this-device')
+})
+
+test('courier task_read: a gateway holding the card live wins over an earlier replica answer', async () => {
+  const m = await load({ state, connections: async () => conns }, replicaApi([], { liveOn: 'mac-mini' }))
+  const r = await m.performRequest({ action: 'task_read', args: { target: 't_eeee5555' } }, 'local', conns)
+  assert.equal(r.ok, true)
+  assert.equal(r.gateway, 'mac-mini')
+  assert.equal(r.task.source, 'live')
+  assert.equal(r.task.owner, undefined)
+  assert.deepEqual(r.task.queue, { lane: 'local', ahead: 3, running: 7, limit: 7, approximate: true })
+})
+
+test('courier task_comment: posts to the live holder; a replica-only card returns the owner-naming refusal', async () => {
+  const calls = []
+  const m1 = await load({ state, connections: async () => conns }, replicaApi(calls, { liveOn: 'mac-mini' }))
+  const ok = await m1.performRequest({ action: 'task_comment', args: { target: 't_eeee5555', message: 'ping' } }, 'local', conns)
+  assert.equal(ok.ok, true)
+  assert.equal(calls.find(c => c.method === 'POST').connectionId, 'mac-mini')
+
+  const m2 = await load({ state, connections: async () => conns }, replicaApi())
+  const r = await m2.performRequest({ action: 'task_comment', args: { target: 't_eeee5555', message: 'ping' } }, 'local', conns)
+  assert.equal(r.ok, false)
+  assert.equal(r.rejection, 'foreign_card')
+  assert.equal(r.error, 't_eeee5555 was created on worker-1 and lives there; this gateway has only a replica copy. Its owner or the Board must write it.')
+  assert.doesNotMatch(r.error, /not found/)
+})
+
+test('foreignCardRefusal reads the bridge error shape and ignores other errors', async () => {
+  const m = await load({ state, connections: async () => conns }, fakeApi())
+  assert.equal(m.foreignCardRefusal(new Error('409: {"detail":"foreign_card: t_x was created on w1"}')), 't_x was created on w1')
+  assert.equal(m.foreignCardRefusal(new Error('foreign_card: plain text')), 'plain text')
+  assert.equal(m.foreignCardRefusal(new Error('404 Not Found: task t_x')), null)
+})

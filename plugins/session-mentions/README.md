@@ -45,6 +45,18 @@ the composer's `@` popover. Rows come from a per-gateway cache that refreshes in
   a failed fetch shows `Couldn't load sessions|tasks from <gateway>` with the error. Picking one inserts the
   bare `@session:` / `@task:` prefix.
 
+## `cross_task` on cards another gateway owns
+
+A synced gateway answers `GET /api/plugins/kanban/tasks/<id>` for a card another gateway created (a Board worker
+node such as worker-1, which no Desktop reaches) from its Board replica, with `source: "replica"` and `owner`
+(the card's `created_on`); its own cards carry `source: "live"`, and a ready one a `queue` position. `task_read`
+passes `source`, `owner` and `queue` through. A bare id keeps searching past a replica answer for a gateway that
+holds the card live and uses the replica copy only when none does, so comments still land on the live holder. A
+comment the gateway refuses with 409 `foreign_card` returns `rejection: "foreign_card"` and the gateway's
+owner-naming message verbatim, never "not found". Tests: `tests/task-refs.test.mjs` (replica read, live wins,
+foreign_card comment, `foreignCardRefusal`). The core side is daveey/hermes `plugins/kanban/dashboard/plugin_api.py`
+(card t_01a1a015ef0013bd); against an older core no task has `source`, and reads behave as before.
+
 ## Tests
 
 From the repo root with pytest installed:
