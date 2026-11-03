@@ -24,9 +24,12 @@ from typing import Any, Iterable, Optional
 
 HERE = Path(__file__).resolve().parent
 MARK = "[skill-outcomes]"
-GRACE_S = 15 * 60  # after the next user message: lets coach's background correction judges log first
+# After the next user message, wait for coach's judges to log. Measured on the hub (14 days, evidence matched to the
+# message): complaint p95 0.5 min, backstop p50 34 min, p90 2.0 h, p95 19 h. 3 h catches ~90% of backstop hits.
+GRACE_S = 3 * 3600
 IDLE_S = 2 * 3600  # no next user message within this long (Kanban, cron, abandoned chat): user_correction=false
 COACH_EVENTS = {"selfheal_detect": {"complaint", "backstop"}, "lesson": None}
+RULES = 2  # lines from rules < 2 closed the window on machine notices and matched coach by time window only
 
 # `Done means (five-whys): 4/5 first pass, 1 fix round; still failing: ...`
 TICK_RE = re.compile(
@@ -35,7 +38,8 @@ TICK_RE = re.compile(
 DONE_HEADING_RE = re.compile(r"^#{2,3}\s+Done means\b", re.I | re.M)
 SYNTHETIC_RE = re.compile(
     r"^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe|System note|runtime|session-outcome|"
-    r"Session babysitter|False-stop recovery|skill-outcomes)\b)", re.I)
+    r"Session babysitter|False-stop recovery|skill-outcomes|ASYNC DELEGATION|CONTEXT COMPACTION)\b|"
+    r"[✔✓✗✖⚠⏸]|\[?Canonical user decision)", re.I)
 # Fallback copy of coach's lessons.PREFILTER_RE, used only when the coach plugin is not installed next to this one.
 _FALLBACK_CORRECTION_RE = re.compile(
     r"^\s*(no\b|nope|wait\b|actually\b|that'?s (?:not|wrong)|i said|i meant|don'?t\b|stop\b|why (?:did|are|would) you|"
@@ -112,14 +116,40 @@ def keyword_correction(user_text: str) -> bool:
     return bool(user_text) and bool(_keyword_fn()(user_text))
 
 
+_coach_synth = None
+
+
+def _coach_synthetic_res() -> list:
+    """coach's own machine-turn filters (self_heal.SYNTHETIC_RE, reply_check.NOTICE_RE), loaded by path."""
+    global _coach_synth
+    if _coach_synth is None:
+        _coach_synth = []
+        for base in (HERE.parent / "coach", home_dir() / "plugins" / "coach"):
+            for mod_name, attr in (("self_heal", "SYNTHETIC_RE"), ("reply_check", "NOTICE_RE")):
+                try:
+                    spec = importlib.util.spec_from_file_location(f"_skill_outcomes_coach_{mod_name}",
+                                                                  base / f"{mod_name}.py")
+                    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                    _coach_synth.append(getattr(mod, attr))
+                except Exception:
+                    continue
+            if _coach_synth:
+                break
+    return _coach_synth
+
+
 def is_real_user_message(text: Any) -> bool:
-    return isinstance(text, str) and bool(text.strip()) and not SYNTHETIC_RE.match(text)
+    """A human's message, not a Kanban/delegation/compaction notice, relay or runtime note."""
+    if not isinstance(text, str) or not text.strip() or SYNTHETIC_RE.match(text):
+        return False
+    return not any(rx.search(text) for rx in _coach_synthetic_res())
 
 
-def coach_correction(home: Any, session: str, user_ts: float, user_text: str, window: float = GRACE_S) -> bool:
-    """coach logged a correction judge hit for this session's next user message: a `selfheal_detect`
-    (complaint/backstop) or `lesson` event whose evidence is in that message, or that landed within `window`
-    seconds after it."""
+def coach_correction(home: Any, session: str, user_ts: float, user_text: str) -> bool:
+    """coach logged a correction judge hit on this session's next user message: a `selfheal_detect`
+    (complaint/backstop) or `lesson` event, logged after that message, whose evidence is in its text. A bare time
+    window is not enough: a backstop on the message that started the turn lands in the same window."""
     p = home_dir(home) / "coach" / "log.jsonl"
     if not p.exists() or not session:
         return False
@@ -141,9 +171,9 @@ def coach_correction(home: Any, session: str, user_ts: float, user_text: str, wi
                     continue
                 evidence = str(r.get("evidence") or "").strip().lower()
                 ts = r.get("ts")
-                if evidence and len(evidence) >= 8 and evidence[:60] in text:
-                    return True
-                if isinstance(ts, (int, float)) and user_ts - 5 <= ts <= user_ts + window:
+                if isinstance(ts, (int, float)) and ts < user_ts - 5:
+                    continue
+                if len(evidence) >= 8 and evidence[:60] in text:
                     return True
     except OSError:
         return False
@@ -218,9 +248,13 @@ def note_user_message(home: Any, session: str, text: str, now: Optional[float] =
 
 
 def _finalize(home: Any, r: dict) -> dict:
-    out = {k: v for k, v in r.items() if k not in ("next_user", "next_user_ts", "turn_end")}
+    out = {k: v for k, v in r.items() if k not in ("next_user", "next_user_ts", "turn_end", "reopened")}
+    out["rules"] = RULES
     nu = r.get("next_user")
-    if nu is None:
+    if nu is None and r.get("reopened"):
+        # its window was closed by a machine notice under the old rules; the real reply may have passed unrecorded
+        out["user_correction"], out["correction_source"] = None, "reopened"
+    elif nu is None:
         out["user_correction"], out["correction_source"] = False, "none"
     elif keyword_correction(nu):
         out["user_correction"], out["correction_source"] = True, "keyword"
@@ -241,6 +275,8 @@ def flush(home: Any = None, now: Optional[float] = None, force: bool = False) ->
     with _locked(home) as box:
         keep = []
         for r in box["data"]:
+            if r.get("next_user") is not None and not is_real_user_message(r["next_user"]):
+                r["next_user"], r["next_user_ts"], r["reopened"] = None, None, True  # closed by a notice
             nu_ts = r.get("next_user_ts")
             due = force or (nu_ts is not None and now - nu_ts >= GRACE_S) or \
                 (nu_ts is None and now - float(r.get("turn_end") or 0) >= IDLE_S)
@@ -295,7 +331,8 @@ def rollup(rows: list, lo: float, hi: float) -> list:
         # a tick-off whose total doesn't match the skill's list is not trusted for first-pass / fix rounds
         ticked = [r for r in rs if r.get("checks_first_pass") is not None and not r.get("tickoff_mismatch")]
         fixes = [r["fix_rounds"] for r in ticked if isinstance(r.get("fix_rounds"), int)]
-        corr = [r for r in rs if r.get("user_correction") is not None]
+        # rules < 2 lines closed the window on machine notices and matched coach by time only: not counted
+        corr = [r for r in rs if r.get("user_correction") is not None and (r.get("rules") or 1) >= RULES]
         out.append({"skill": skill, "uses": len(rs), "ticked": len(ticked),
                     "first_pass_rate": round(sum(1 for r in ticked if r["checks_first_pass"]) / len(ticked), 3)
                     if ticked else None,
@@ -325,6 +362,9 @@ def rollup_lines(rows: list, lo: float, hi: float, top: int = 25, title: str = "
     bad = sum(1 for r in rows if lo <= (r.get("ts") or 0) < hi and r.get("tickoff_mismatch"))
     if bad:
         out.append(f"{bad} tick-off(s) gave a total that differs from the skill's Done-means list; excluded.")
+    old = sum(1 for r in rows if lo <= (r.get("ts") or 0) < hi and (r.get("rules") or 1) < RULES)
+    if old:
+        out.append(f"{old} line(s) predate the correction-rule fix (rules<{RULES}); left out of correction rate.")
     out += ["", "| Skill | uses | ticked | first-pass | mean fix rounds | correction rate |",
             "|---|---:|---:|---:|---:|---:|"]
     for d in tab[:top]:

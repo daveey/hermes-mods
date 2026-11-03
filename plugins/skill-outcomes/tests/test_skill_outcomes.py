@@ -164,7 +164,7 @@ def test_cli_flush_and_rollup(home, capsys):
     turn("s3", "nothing", ("other", SKILL_PLAIN))
     t = core.time.time()
     plug.pre_llm_call(session_id="s2", user_message="that's wrong, redo it")
-    assert core.main(["flush", "--home", str(home), "--now", str(t + core.IDLE_S + 1)]) == 0
+    assert core.main(["flush", "--home", str(home), "--now", str(t + max(core.IDLE_S, core.GRACE_S) + 1)]) == 0
     assert "flushed 3" in capsys.readouterr().out
     rows = core.read_lines(core.home_logs(home) * 2)  # duplicates across sources are dropped
     assert len(rows) == 3
@@ -200,3 +200,66 @@ def test_final_gate_holds_once_until_tickoff_present(home):
     plug.post_llm_call(session_id="s1", assistant_response=ok, turn_id="t1")
     assert plug.pre_final_gate(session_id="s1", final_response="next turn", attempt=0) is None
     assert plug.pre_final_gate.needs_buffer is True
+
+
+# ---------------------------------------------------------------- correction rules v2 (review round 1)
+def test_machine_notices_do_not_close_the_window(home):
+    turn("s1", "done", ("five-whys", SKILL_DONE))
+    t = core.time.time()
+    for notice in ("✔ [default] @default Kanban t_01a1a003734a7026 done — fixture: no-op",
+                   "⏸ [default] @default Kanban t_01 blocked — needs input",
+                   "[ASYNC DELEGATION BATCH COMPLETE — deleg_f78a18fe] 2 tasks finished",
+                   "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted",
+                   "Canonical user decision. Act only on the frozen revision below."):
+        assert not core.is_real_user_message(notice), notice
+        plug.pre_llm_call(session_id="s1", user_message=notice)
+    human = "no, workers should scale up automatically, not need the mbp"
+    plug.pre_llm_call(session_id="s1", user_message=human)
+    core.flush(home, now=t + core.GRACE_S + 1)
+    (r,) = lines(home)
+    assert r["user_correction"] is True and r["correction_source"] == "keyword" and r["rules"] == core.RULES
+
+
+def test_coach_event_on_the_turn_starting_message_is_not_a_correction(home):
+    start = "why would you wait on me for this? just do it"
+    t = core.time.time()
+    plug.pre_llm_call(session_id="s1", user_message=start)  # starts the turn; no open record yet
+    turn("s1", "done", ("five-whys", SKILL_DONE))
+    plug.pre_llm_call(session_id="s1", user_message="make the change")
+    (home / "coach").mkdir()
+    (home / "coach" / "log.jsonl").write_text(json.dumps(
+        {"ts": t + 120, "event": "selfheal_detect", "source": "backstop", "session_id": "s1",
+         "evidence": start}) + "\n")
+    core.flush(home, now=t + core.GRACE_S + 10)
+    (r,) = lines(home)
+    assert r["user_correction"] is False and r["correction_source"] == "next_message"
+
+
+def test_late_coach_backstop_inside_grace_counts(home):
+    turn("s1", "fixed", ("five-whys", SKILL_DONE))
+    t = core.time.time()
+    msg = "the sidebar session still shows red after your change"
+    plug.pre_llm_call(session_id="s1", user_message=msg)
+    (home / "coach").mkdir()
+    (home / "coach" / "log.jsonl").write_text(json.dumps(
+        {"ts": t + 50 * 60, "event": "selfheal_detect", "source": "backstop", "session_id": "s1",
+         "evidence": msg}) + "\n")
+    assert core.flush(home, now=t + 16 * 60) == []  # the old 15-min grace would have finalized it here
+    core.flush(home, now=t + core.GRACE_S + 1)
+    (r,) = lines(home)
+    assert r["user_correction"] is True and r["correction_source"] == "coach"
+
+
+def test_pending_record_closed_by_a_notice_is_reopened_and_old_lines_skip_correction_rate(home):
+    turn("s1", "done", ("five-whys", SKILL_DONE))
+    t = core.time.time()
+    with core._locked(home) as box:  # a record the old rules closed on a Kanban notice
+        box["data"][0].update(next_user="✔ [default] @default Kanban t_1 done — x", next_user_ts=t)
+    core.flush(home, now=t + core.IDLE_S + 1)
+    (r,) = lines(home)
+    assert r["user_correction"] is None and r["correction_source"] == "reopened"
+    old = {"ts": t, "host": "h", "session": "s0", "skill": "five-whys", "user_correction": True,
+           "checks_first_pass": None}
+    tab = core.rollup([old], t - 1, t + 1)
+    assert tab[0]["correction_rate"] is None
+    assert "predate the correction-rule fix" in "\n".join(core.rollup_lines([old], t - 1, t + 1))
