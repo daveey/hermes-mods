@@ -36,6 +36,7 @@ def env(tmp_path, monkeypatch):
     db.close()
 
 
+@pytest.mark.needs_core
 def test_post_creates_hidden_unread_session_with_proposal(env):
     inbox, db, _ = env
     r = inbox.post("Destroy idle box", "GPU 0% for 5h", "Destroy vast 123", poster="cron · audit", cwd="/tmp")
@@ -49,6 +50,7 @@ def test_post_creates_hidden_unread_session_with_proposal(env):
     assert item["unread"] and item["poster"] == "cron · audit" and item["accept_prompt"] == "Destroy vast 123"
 
 
+@pytest.mark.needs_core
 def test_validation(env):
     inbox, _, _ = env
     with pytest.raises(ValueError):
@@ -57,6 +59,7 @@ def test_validation(env):
         inbox.post("t", "b", "  ")
 
 
+@pytest.mark.needs_core
 def test_key_dedupes_and_marks_unread_again(env):
     inbox, db, clock = env
     a = inbox.post("Idle box", "5h", "destroy", key="vast:1")
@@ -73,6 +76,7 @@ def test_key_dedupes_and_marks_unread_again(env):
     assert len(inbox.list()) == 2
 
 
+@pytest.mark.needs_core
 def test_reading_clears_unread(env):
     inbox, db, _ = env
     sid = inbox.post("t", "b", "p", poster="t")["session_id"]
@@ -80,6 +84,7 @@ def test_reading_clears_unread(env):
     assert inbox.list()[0]["unread"] is False
 
 
+@pytest.mark.needs_core
 def test_accept_unhides_and_leaves_inbox(env):
     inbox, db, _ = env
     sid = inbox.post("t", "b", "do the thing", poster="t")["session_id"]
@@ -90,6 +95,7 @@ def test_accept_unhides_and_leaves_inbox(env):
     assert inbox.accept(sid) is None  # only once
 
 
+@pytest.mark.needs_core
 def test_user_turn_accepts_only_open_messages(env):
     inbox, db, _ = env
     sid = inbox.post("t", "b", "p", poster="t")["session_id"]
@@ -99,6 +105,7 @@ def test_user_turn_accepts_only_open_messages(env):
     assert inbox.on_user_turn(sid) is False
 
 
+@pytest.mark.needs_core
 def test_archive(env):
     inbox, db, _ = env
     sid = inbox.post("t", "b", "p", key="k")["session_id"]
@@ -113,6 +120,7 @@ def test_archive(env):
     assert inbox.archive("nope") is False
 
 
+@pytest.mark.needs_core
 def test_archived_elsewhere_drops_out(env):
     inbox, db, _ = env
     sid = inbox.post("t", "b", "p", poster="t")["session_id"]
@@ -120,6 +128,7 @@ def test_archived_elsewhere_drops_out(env):
     assert inbox.list() == []
 
 
+@pytest.mark.needs_core
 def test_duplicate_titles_get_suffix(env):
     inbox, db, _ = env
     a = inbox.post("Same", "b", "p", poster="t")["session_id"]
@@ -127,6 +136,7 @@ def test_duplicate_titles_get_suffix(env):
     assert db.get_session(a)["title"] == "Same" and db.get_session(b)["title"] == "Same (2)"
 
 
+@pytest.mark.needs_core
 def test_cap_archives_oldest_read(env, monkeypatch):
     inbox, db, clock = env
     monkeypatch.setattr(store, "MAX_OPEN", 3)
@@ -142,6 +152,7 @@ def test_cap_archives_oldest_read(env, monkeypatch):
     assert db.get_session(ids[1])["archived"]
 
 
+@pytest.mark.needs_core
 def test_tool_handler(env, monkeypatch):
     inbox, db, _ = env
     plugin = _load("_inbox_plugin_test", HERE / "__init__.py")
@@ -167,6 +178,7 @@ def test_profile_homes_lists_root_then_profiles_with_an_inbox(tmp_path):
         store.profile_home(tmp_path, "../etc")
 
 
+@pytest.mark.needs_core
 def test_for_home_binds_a_profiles_own_state_db(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     prof = tmp_path / "profiles" / "p1"
@@ -184,6 +196,7 @@ def test_for_home_binds_a_profiles_own_state_db(tmp_path, monkeypatch):
     assert store.Inbox.for_home(tmp_path).list() == []
 
 
+@pytest.mark.needs_core
 def test_same_key_after_a_reply_lands_in_that_conversation_not_a_new_card(env):
     """The user replied to a card (accepted -> a normal chat); a follow-up on the same key goes into
     that chat, unread, instead of opening a duplicate card. Archived = dismissed: a new card."""
@@ -203,6 +216,7 @@ def test_same_key_after_a_reply_lands_in_that_conversation_not_a_new_card(env):
     assert c["session_id"] != a["session_id"] and not c["updated"]
 
 
+@pytest.mark.needs_core
 def test_prompt_label_replaces_the_prompt_dump_on_the_card(env):
     inbox, db, clock = env
     long_prompt = "Review improvement 1 (coach-apply show 1). " * 10
@@ -218,12 +232,14 @@ def test_prompt_label_replaces_the_prompt_dump_on_the_card(env):
     assert "**Do it:** keep or undo" in db.get_messages(r["session_id"])[-1]["content"]
 
 
+@pytest.mark.needs_core
 def test_without_prompt_label_the_card_still_shows_the_prompt(env):
     inbox, db, _ = env
     r = inbox.post("t", "b", "Destroy vast 123", poster="t")
     assert "**Proposed:** Destroy vast 123" in db.get_messages(r["session_id"])[0]["content"]
 
 
+@pytest.mark.needs_core
 def test_tool_and_cli_pass_prompt_label(env, monkeypatch):
     inbox, db, _ = env
     plugin = _load("_inbox_plugin_test2", HERE / "__init__.py")
@@ -268,6 +284,7 @@ def _post_and_archive(inbox, clock, poster, n):
         inbox.archive(r["session_id"])
 
 
+@pytest.mark.needs_core
 def test_poster_family_muted_after_two_ignored_cards(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
     _post_and_archive(inbox, clock, "cron · ci-main-watch", store.MUTE_AFTER)
@@ -285,6 +302,7 @@ def test_poster_family_muted_after_two_ignored_cards(tmp_path, monkeypatch):
     db.close()
 
 
+@pytest.mark.needs_core
 def test_accepted_card_does_not_break_the_streak_but_a_resolved_decision_does(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
     _post_and_archive(inbox, clock, "coach", 1)
@@ -309,6 +327,7 @@ def test_accepted_card_does_not_break_the_streak_but_a_resolved_decision_does(tm
     db.close()
 
 
+@pytest.mark.needs_core
 def test_sidebar_archive_counts_and_unmute_needs_a_fix_commit(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
     for i in range(store.MUTE_AFTER):  # archived through the session door, not inbox.archive
@@ -327,6 +346,7 @@ def test_sidebar_archive_counts_and_unmute_needs_a_fix_commit(tmp_path, monkeypa
     db.close()
 
 
+@pytest.mark.needs_core
 def test_mute_expires_after_window(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
     _post_and_archive(inbox, clock, "coach", store.MUTE_AFTER)
@@ -335,6 +355,7 @@ def test_mute_expires_after_window(tmp_path, monkeypatch):
     db.close()
 
 
+@pytest.mark.needs_core
 def test_rekey_update_of_open_card_is_not_refused(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
     clock["t"] += 60
@@ -344,6 +365,7 @@ def test_rekey_update_of_open_card_is_not_refused(tmp_path, monkeypatch):
     db.close()
 
 
+@pytest.mark.needs_core
 def test_mute_card_failure_is_visible_not_silent(tmp_path, monkeypatch, capsys, caplog):
     """A fenced worker terminal cannot create the Kanban card: the refusal still fires and says so."""
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
@@ -365,6 +387,7 @@ def test_mute_card_failure_is_visible_not_silent(tmp_path, monkeypatch, capsys, 
 # Fix cards filed before an instruction-template change kept their old `hermes inbox post` step and reached
 # David's Inbox anyway. While auto-approve is on (the default), nothing from self-heal may be posted.
 
+@pytest.mark.needs_core
 def test_selfheal_result_post_is_always_refused(env, monkeypatch):
     inbox, _, _ = env
     monkeypatch.setenv("COACH_SELFHEAL_AUTO_APPROVE", "0")  # even in manual mode: results are never Inbox cards
@@ -373,6 +396,7 @@ def test_selfheal_result_post_is_always_refused(env, monkeypatch):
     assert inbox.list() == []
 
 
+@pytest.mark.needs_core
 def test_selfheal_posts_refused_while_auto_approve_is_on(env, monkeypatch):
     inbox, _, _ = env
     monkeypatch.delenv("COACH_SELFHEAL_AUTO_APPROVE", raising=False)  # default: auto-approve on
@@ -389,6 +413,7 @@ def test_selfheal_posts_refused_while_auto_approve_is_on(env, monkeypatch):
     assert inbox.list() == []
 
 
+@pytest.mark.needs_core
 def test_selfheal_post_allowed_in_manual_mode(env, monkeypatch):
     inbox, _, _ = env
     monkeypatch.setenv("COACH_SELFHEAL_AUTO_APPROVE", "0")
@@ -396,6 +421,7 @@ def test_selfheal_post_allowed_in_manual_mode(env, monkeypatch):
     assert r["session_id"] and [i["poster"] for i in inbox.list()] == ["self-heal"]
 
 
+@pytest.mark.needs_core
 def test_selfheal_manual_mode_from_config_file(env, monkeypatch):
     inbox, _, _ = env
     monkeypatch.delenv("COACH_SELFHEAL_AUTO_APPROVE", raising=False)

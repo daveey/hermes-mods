@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.needs_core  # every test here runs the real core store
+
 HERE = Path(__file__).resolve().parents[1]
 
 

@@ -43,6 +43,7 @@ def env(tmp_path, monkeypatch):
 
 
 # ── 1. Archive sticks ───────────────────────────────────────────────────────────
+@pytest.mark.needs_core
 def test_archived_key_is_refused_on_repost_and_files_one_kanban_card(env):
     inbox, _db, clock, tasks = env
     r = inbox.post("GitHub Actions: pick billing limit", "b", "fix", key="gh-actions-billing:2026-10", poster="cron · gh")
@@ -54,6 +55,7 @@ def test_archived_key_is_refused_on_repost_and_files_one_kanban_card(env):
     assert [t["idempotency_key"] for t in tasks] == ["inbox-archived-key:gh-actions-billing:2026-10"]
 
 
+@pytest.mark.needs_core
 def test_sidebar_archive_also_sticks(env):
     inbox, db, clock, _ = env
     r = inbox.post("decide thing", "b", "fix", key="k:side", poster="p")
@@ -63,6 +65,7 @@ def test_sidebar_archive_also_sticks(env):
         inbox.post("decide thing", "b", "fix", key="k:side", poster="p")
 
 
+@pytest.mark.needs_core
 def test_archived_key_allowed_again_after_window_or_unarchive_key(env):
     inbox, _db, clock, _ = env
     inbox.archive(inbox.post("a", "b", "p", key="k:1", poster="p")["session_id"])
@@ -75,6 +78,7 @@ def test_archived_key_allowed_again_after_window_or_unarchive_key(env):
     assert inbox.post("c", "b", "p", key="k:2", poster="q")["updated"] is False
 
 
+@pytest.mark.needs_core
 def test_resolved_or_accepted_key_is_not_refused(env):
     inbox, _db, clock, _ = env
     sid = inbox.post("a", "b", "p", key="k:acc", poster="p")["session_id"]
@@ -84,12 +88,14 @@ def test_resolved_or_accepted_key_is_not_refused(env):
 
 
 # ── 2. Every post has a sender ──────────────────────────────────────────────────
+@pytest.mark.needs_core
 def test_post_with_no_poster_and_no_key_is_refused(env):
     inbox, *_ = env
     with pytest.raises(store.AgentOwnedPost, match="poster_missing"):
         inbox.post("Approve spend", "b", "go")
 
 
+@pytest.mark.needs_core
 def test_keyed_post_without_poster_is_refused_not_attributed(env):
     """v2: a key no longer stands in for a registered poster; the registry is fail-closed. The refusal names the
     missing poster (poster_missing_keyed + the --poster hint) rather than a generic unregistered family."""
@@ -98,6 +104,7 @@ def test_keyed_post_without_poster_is_refused_not_attributed(env):
         inbox.post("GitHub Actions: pick billing limit", "b", "fix", key="gh-actions-billing:2026-10")
 
 
+@pytest.mark.needs_core
 def test_card_run_posters_are_counted_per_family_and_unmute_needs_a_fix_commit(env):
     inbox, _db, clock, tasks = env
     for name in ("A", "B"):
@@ -112,6 +119,7 @@ def test_card_run_posters_are_counted_per_family_and_unmute_needs_a_fix_commit(e
     assert inbox.post("useful", "b", "p", key="n:E", poster="kanban · E")["updated"] is False
 
 
+@pytest.mark.needs_core
 def test_cron_family_is_muted_after_two_archived_cards_v2(env):
     inbox, _db, clock, _ = env
     for name in ("A", "B"):
@@ -122,6 +130,7 @@ def test_cron_family_is_muted_after_two_archived_cards_v2(env):
 
 
 # ── 3. Test/probe posts never reach the real Inbox ──────────────────────────────
+@pytest.mark.needs_core
 @pytest.mark.parametrize("title,key", [
     ("TEST: x", None),
     ("TEST: approval binding, not for publication", "x-post:Q-TEST-APPROVAL-09593"),
@@ -140,6 +149,7 @@ def test_test_and_probe_posts_are_refused(env, title, key):
         inbox.post(title, "b", "p", key=key, poster="someone")
 
 
+@pytest.mark.needs_core
 def test_dismissed_dm_family_is_muted_after_two_v2(env):
     """v2 mutes by family after two dismissals (the old per-key-only rule let x-dm noise through)."""
     inbox, _db, clock, _ = env
@@ -150,6 +160,7 @@ def test_dismissed_dm_family_is_muted_after_two_v2(env):
         inbox.post("X DM from 5", "b", "p", key="x-dm:5", poster="cli")
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("title,key", [
     ("organs: make livingroom-tests a required check on main?", "organs-require-livingroom-tests-check"),
     ("#quakes: Allie proposes moving past MeshRIR (D01 wave-speed test, then OpenFWI)", "quakes:next-benchmark"),
@@ -161,6 +172,7 @@ def test_real_cards_are_not_mistaken_for_tests(env, title, key):
     assert inbox.post(title, "b", "p", key=key, poster="someone")["session_id"]
 
 
+@pytest.mark.needs_core
 def test_test_env_refused_only_against_a_real_home(env, monkeypatch, tmp_path):
     inbox, *_ = env
     monkeypatch.setenv("HERMES_INBOX_TEST", "1")
@@ -189,6 +201,7 @@ def _cli(mod, argv):
     return mod._run_cli(p.parse_args(argv))
 
 
+@pytest.mark.needs_core
 def test_cli_refuses_archived_key_and_unarchive_key_releases_it(monkeypatch, tmp_path, capsys):
     mod = _plugin(monkeypatch, tmp_path)
     assert _cli(mod, ["post", "decide thing", "--prompt", "p", "--key", "k:cli", "--poster", "cron · w", "--ask", json.dumps(ASK)]) == 0
@@ -206,6 +219,7 @@ def test_cli_refuses_post_with_no_poster_and_no_key(monkeypatch, tmp_path, capsy
     assert "poster" in capsys.readouterr().err
 
 
+@pytest.mark.needs_core
 def test_tool_falls_back_to_a_poster_when_the_session_is_unknown(monkeypatch, tmp_path):
     mod = _plugin(monkeypatch, tmp_path)
     monkeypatch.setattr(mod, "_poster_for", lambda sid: (None, None))

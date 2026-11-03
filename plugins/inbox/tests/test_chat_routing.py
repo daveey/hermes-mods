@@ -49,6 +49,7 @@ def chat(tmp_path, monkeypatch):
     return session, row, calls, run, str(target)
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("surface", ["desktop", "tui"])
 def test_registered_first_turn_hook_routes_and_persists(chat, surface):
     s, row, calls, run, target = chat
@@ -92,6 +93,7 @@ def test_worker_environment_is_excluded(chat, monkeypatch):
     assert not chat[2]
 
 
+@pytest.mark.needs_core
 def test_owner_profile_project_not_process_home(chat, tmp_path, monkeypatch):
     s, row, calls, run, target = chat
     owner = tmp_path / "foreign-owner"

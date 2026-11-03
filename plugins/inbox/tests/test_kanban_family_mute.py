@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.needs_core  # every test here runs the real core store
+
 HERE = Path(__file__).resolve().parents[1]
 HR = {"interaction": "approval", "why_human": "Only David approves stopping these instances",
       "action": "Approve stopping the seven retired VMs. Unblock = stop them; archive = keep them."}

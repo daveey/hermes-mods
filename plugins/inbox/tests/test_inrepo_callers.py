@@ -95,6 +95,7 @@ def test_scanner_finds_the_live_callers():
     assert "plugins/inbox/__init__.py" in sites  # the scanner must see real callers, or the guard is vacuous
 
 
+@pytest.mark.needs_core
 def test_every_inrepo_inbox_post_caller_is_accepted(store):
     bad = []
     for caller in find_callers(REPO):

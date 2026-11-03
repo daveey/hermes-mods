@@ -44,6 +44,7 @@ def test_non_ask_refusals_do_not_get_the_retry_hint(tmp_path):
     assert "ask={" not in str(e.value)
 
 
+@pytest.mark.needs_core
 def test_retry_with_the_named_ask_is_accepted(tmp_path):
     st = load("_la_accept")
     b, _ = box(tmp_path, st)
@@ -62,6 +63,7 @@ def test_agent_owned_retry_with_self_written_ask_is_refused(tmp_path):
 
 # -- 2. kanban human_request -> ask, automatically -----------------------------------------------
 
+@pytest.mark.needs_core
 def test_kanban_worker_post_inherits_ask_from_card_human_request(tmp_path, monkeypatch):
     st = load("_la_hr")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_card")
@@ -211,6 +213,7 @@ def test_test_markers_inside_handles_are_junk(tmp_path, title):
         b.post(title, "b", "go", poster="pr", key="x-reply:1", ask=ASK)
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("title", [
     "X reply R-1 to @latest_news",
     "X reply R-2 to @contest",

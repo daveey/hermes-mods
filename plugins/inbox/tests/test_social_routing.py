@@ -49,6 +49,7 @@ def cwd_of(db, r):
     return db.get_session(r["session_id"])["cwd"]
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("kw", [
     dict(key="x-post:Q-7", title="Review caption"),
     dict(key="x-reply-draft:123", title="X reply draft: @a on foo"),
@@ -67,6 +68,7 @@ def test_social_positive_goes_to_pr(env, kw):
     assert cwd_of(db, r) == pr
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("title", [
     "Merge PR #123 after CI is green",
     "Review pull request: fix inbox store",
@@ -88,12 +90,14 @@ def test_non_social_pr_text_not_routed(env, title):
     assert cwd_of(db, r2) == "/Users/me/code/hermes"
 
 
+@pytest.mark.needs_core
 def test_explicit_cwd_wins(env):
     inbox, db, pr = env
     r = inbox.post("X post pending", "b", "p", key="x-post:Z", cwd="/Users/me/code/writing")
     assert cwd_of(db, r) == "/Users/me/code/writing"
 
 
+@pytest.mark.needs_core
 def test_inherited_cwd_replaced_unless_already_in_pr(env):
     inbox, db, pr = env
     a = inbox.post("X post pending", "b", "p", key="x-post:A", inherited_cwd="/Users/me")
@@ -108,6 +112,7 @@ def test_host_path_resolved_from_local_db_not_copied(tmp_path):
     assert rt.route_cwd(tmp_path, explicit=None, inherited="/Users/me/code/pr", social=True) == "/home/ubuntu/code/pr"
 
 
+@pytest.mark.needs_core
 def test_no_pr_project_keeps_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from hermes_state import SessionDB
@@ -139,6 +144,7 @@ def test_tool_passes_inherited_cwd_separately(tmp_path, monkeypatch):
     assert seen["cwd"] is None and seen["inherited_cwd"] == "/Users/me"
 
 
+@pytest.mark.needs_core
 def test_backfill_moves_only_fallback_cwd_and_is_idempotent(env, monkeypatch):
     inbox, db, pr = env
     home = str(Path.home())
@@ -159,6 +165,7 @@ def test_backfill_moves_only_fallback_cwd_and_is_idempotent(env, monkeypatch):
     assert again["x-post:A"] == "already"
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("explicit", [True, False])
 def test_provenance_survives_repost_and_reopen(env, explicit):
     inbox, db, pr = env
@@ -174,6 +181,7 @@ def test_provenance_survives_repost_and_reopen(env, explicit):
     assert cwd_of(db, r) == (home if explicit else pr)
 
 
+@pytest.mark.needs_core
 def test_legacy_schema_migration_leaves_provenance_unknown(env):
     inbox, db, pr = env
     home = str(Path.home())
@@ -186,6 +194,7 @@ def test_legacy_schema_migration_leaves_provenance_unknown(env):
     assert cwd_of(db, r) == home
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("message_count", [1, 8])
 @pytest.mark.parametrize("age", [1, 100_000])
 def test_backfill_unended_sessions_fail_closed(env, monkeypatch, message_count, age):
@@ -200,6 +209,7 @@ def test_backfill_unended_sessions_fail_closed(env, monkeypatch, message_count, 
     assert cwd_of(db, r) == str(Path.home())
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("change", ["resume", "cwd", "archive"])
 def test_backfill_rechecks_session_at_write(env, monkeypatch, change):
     inbox, db, pr = env
@@ -219,6 +229,7 @@ def test_backfill_rechecks_session_at_write(env, monkeypatch, change):
     assert cwd_of(db, r) == ("/chosen" if change == "cwd" else str(Path.home()))
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("missing", ["session", "ended_at"])
 def test_backfill_missing_lifecycle_evidence_fails_closed(env, monkeypatch, missing):
     inbox, db, pr = env
@@ -234,6 +245,7 @@ def test_backfill_missing_lifecycle_evidence_fails_closed(env, monkeypatch, miss
     assert cwd_of(db, r) == str(Path.home())
 
 
+@pytest.mark.needs_core
 def test_backfill_archived_opt_in_still_requires_ended_session(env, monkeypatch):
     inbox, db, pr = env
     with monkeypatch.context() as m:
@@ -267,6 +279,7 @@ def _selfheal_manual_mode(monkeypatch):
     monkeypatch.setenv("COACH_SELFHEAL_AUTO_APPROVE", "0")
 
 
+@pytest.mark.needs_core
 def test_poster_named_project_routes_new_card(env):
     inbox, db, pr = env
     from ask_fixtures import register_test_posters
@@ -277,6 +290,7 @@ def test_poster_named_project_routes_new_card(env):
     assert cwd_of(db, r) == sh
 
 
+@pytest.mark.needs_core
 def test_poster_named_project_routes_conditional_post(env):
     inbox, db, pr = env
     from ask_fixtures import register_test_posters
@@ -288,6 +302,7 @@ def test_poster_named_project_routes_conditional_post(env):
     assert cwd_of(db, r) == sh
 
 
+@pytest.mark.needs_core
 def test_poster_project_explicit_cwd_and_unknown_poster(env):
     inbox, db, pr = env
     from ask_fixtures import register_test_posters

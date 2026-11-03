@@ -165,6 +165,7 @@ def test_type_names_cannot_escape(tmp_path, name):
             reg.get(name)
 
 
+@pytest.mark.needs_core
 def test_post_checks_required_and_max(env):
     inbox, _, _ = env
     with pytest.raises(ValueError, match="requires field 'text'"):
@@ -208,6 +209,7 @@ def test_yaml_12_booleans_ids_like_no_stay_strings():
     assert list(spec["fields"]) == ["on"] and spec["actions"][1]["row"] is True
 
 
+@pytest.mark.needs_core
 def test_concurrent_act_only_one_wins(env):
     """Another process already moved the card on: this act() must not overwrite its outcome."""
     inbox, db, _ = env
@@ -228,6 +230,7 @@ def test_render_is_one_plain_pass():
 
 
 # ── posting / snapshot ─────────────────────────────────────────────────────
+@pytest.mark.needs_core
 def test_typed_post_snapshots_type_and_shows_preview(env):
     inbox, db, _ = env
     sid = _post_x(inbox)["session_id"]
@@ -243,6 +246,7 @@ def test_typed_post_snapshots_type_and_shows_preview(env):
     assert "Press **Do it**" not in text
 
 
+@pytest.mark.needs_core
 def test_repost_refreshes_snapshot_and_fields(env, skills):
     inbox, db, clock = env
     a = inbox.post("legacy card", "old", "post Q1", key="x-post:Q1")  # posted before types existed
@@ -257,6 +261,7 @@ def test_repost_refreshes_snapshot_and_fields(env, skills):
     assert "> new text" in db.get_messages(a["session_id"])[-1]["content"]
 
 
+@pytest.mark.needs_core
 def test_snapshot_survives_type_edits(env, skills):
     inbox, _, _ = env
     _post_x(inbox)
@@ -266,6 +271,7 @@ def test_snapshot_survives_type_edits(env, skills):
 
 
 # ── actions ────────────────────────────────────────────────────────────────
+@pytest.mark.needs_core
 def test_resolve_records_outcome_and_closes(env):
     inbox, db, clock = env
     sid = _post_x(inbox)["session_id"]
@@ -278,6 +284,7 @@ def test_resolve_records_outcome_and_closes(env):
     assert inbox.act(sid, "skip") is None  # closed cards take no more actions
 
 
+@pytest.mark.needs_core
 def test_resolve_with_input_writes_back_the_field(env):
     inbox, _, _ = env
     sid = _post_x(inbox)["session_id"]
@@ -291,6 +298,7 @@ def test_resolve_with_input_writes_back_the_field(env):
     assert out["fields"]["text"] == "Cells are agents, and so are you."
 
 
+@pytest.mark.needs_core
 def test_prompt_action_renders_and_accepts(env):
     inbox, db, _ = env
     sid = _post_x(inbox)["session_id"]
@@ -305,6 +313,7 @@ def test_prompt_action_renders_and_accepts(env):
     assert again["session_id"] != sid and not again["updated"]
 
 
+@pytest.mark.needs_core
 def test_unknown_action_rejected(env):
     inbox, _, _ = env
     sid = _post_x(inbox)["session_id"]
@@ -312,6 +321,7 @@ def test_unknown_action_rejected(env):
         inbox.act(sid, "post")
 
 
+@pytest.mark.needs_core
 def test_archive_records_archived_outcome(env):
     inbox, db, _ = env
     sid = _post_x(inbox)["session_id"]
@@ -322,6 +332,7 @@ def test_archive_records_archived_outcome(env):
     assert inbox.outcome("x-post:none") is None
 
 
+@pytest.mark.needs_core
 def test_archive_via_act_and_sidebar_archive_both_read_as_archived(env):
     inbox, db, _ = env
     a = _post_x(inbox, "Q1")["session_id"]
@@ -332,6 +343,7 @@ def test_archive_via_act_and_sidebar_archive_both_read_as_archived(env):
     assert inbox.outcome("x-post:Q2")["state"] == "archived"
 
 
+@pytest.mark.needs_core
 def test_archiving_a_resolved_card_keeps_its_outcome(env):
     inbox, _, _ = env
     sid = _post_x(inbox)["session_id"]
@@ -341,6 +353,7 @@ def test_archiving_a_resolved_card_keeps_its_outcome(env):
     assert inbox.outcome("x-post:Q1")["state"] == "resolved"
 
 
+@pytest.mark.needs_core
 def test_legacy_row_without_type_is_the_default_type(env, tmp_path):
     inbox, db, _ = env
     sid = inbox.post("old", "b", "do the old thing", key="k")["session_id"]
@@ -378,6 +391,7 @@ def _plugin(inbox, monkeypatch, name):
     return plugin
 
 
+@pytest.mark.needs_core
 def test_tools_post_typed_and_read_outcome(env, monkeypatch):
     inbox, _, _ = env
     plugin = _plugin(inbox, monkeypatch, "_inbox_plugin_types1")
@@ -401,6 +415,7 @@ def test_tools_post_typed_and_read_outcome(env, monkeypatch):
     assert plugin.SCHEMA["parameters"]["required"] == ["title", "body"]
 
 
+@pytest.mark.needs_core
 def test_cli_post_act_outcome_types(env, monkeypatch, capsys):
     inbox, _, _ = env
     plugin = _plugin(inbox, monkeypatch, "_inbox_plugin_types2")
@@ -473,6 +488,7 @@ def _post_chore(inbox, id_="C1"):
     return inbox.post(f"Chore {id_}", "", type="chore", key=f"chore:{id_}", fields={"id": id_, "text": "x"})["session_id"]
 
 
+@pytest.mark.needs_core
 def test_task_act_creates_one_card_records_outcome_and_closes(tenv):
     inbox, db, kb = tenv
     sid = _post_chore(inbox)
@@ -491,6 +507,7 @@ def test_task_act_creates_one_card_records_outcome_and_closes(tenv):
     assert inbox.act(sid, "plain") is None and len(kb.created) == 1  # closed: no second card
 
 
+@pytest.mark.needs_core
 def test_task_defaults_and_title_template(tenv):
     inbox, _, kb = tenv
     sid = _post_chore(inbox, "C2")
@@ -499,6 +516,7 @@ def test_task_defaults_and_title_template(tenv):
     assert k["assignee"] == "default" and k["title"] == "Chore C2" and k["skills"] is None
 
 
+@pytest.mark.needs_core
 def test_task_failure_leaves_the_card_open(tenv, tmp_path):
     inbox, db, kb = tenv
     sid = _post_chore(inbox, "C3")
@@ -538,6 +556,7 @@ def test_task_validation_rejects(tmp_path):
     assert act["assignee"] == "Helper_1-x" and act["board"] == "main" and act["skills"] == ["s"]
 
 
+@pytest.mark.needs_core
 def test_task_rendered_body_is_capped(tenv):
     inbox, _, kb = tenv
     inbox.types.define("big", {"fields": {"id": {}, "text": {}},
@@ -548,6 +567,7 @@ def test_task_rendered_body_is_capped(tenv):
     assert kb.created == [] and [i["state"] for i in inbox.list()] == ["open"]
 
 
+@pytest.mark.needs_core
 def test_task_claim_is_invisible_until_the_card_exists_and_survives_a_failed_record(tenv):
     inbox, db, kb = tenv
     sid = _post_chore(inbox, "C8")
@@ -584,6 +604,7 @@ def test_task_claim_is_invisible_until_the_card_exists_and_survives_a_failed_rec
     assert kb.created[0]["idempotency_key"] == f"inbox:{sid2}:plain"
 
 
+@pytest.mark.needs_core
 def test_task_card_is_a_decision_card(tenv):
     inbox, _, kb = tenv
     sid = _post_chore(inbox, "C4")
@@ -628,6 +649,7 @@ def test_task_creates_a_real_kanban_card_on_a_temp_board(tmp_path, monkeypatch):
     db.close()
 
 
+@pytest.mark.needs_core
 def test_task_tool_cli_and_rest(tenv, monkeypatch, capsys):
     inbox, _, kb = tenv
     plugin = _plugin(inbox, monkeypatch, "_inbox_plugin_task")
@@ -645,6 +667,7 @@ def test_task_tool_cli_and_rest(tenv, monkeypatch, capsys):
     assert rc == 1 and "down" in capsys.readouterr().err
 
 
+@pytest.mark.needs_core
 def test_rest_task_act_outcome_and_failure(tmp_path, monkeypatch, skills):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     fastapi = pytest.importorskip("fastapi")
@@ -674,6 +697,7 @@ def test_rest_task_act_outcome_and_failure(tmp_path, monkeypatch, skills):
     assert out["found"] and out["task"] == "t_fake1" and len(kb.created) == 1
 
 
+@pytest.mark.needs_core
 def test_task_act_on_another_profile(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     fastapi = pytest.importorskip("fastapi")
@@ -720,6 +744,7 @@ def client(tmp_path, monkeypatch, skills):
     return TestClient(app), api, tmp_path, reg_cls
 
 
+@pytest.mark.needs_core
 def test_rest_items_act_outcome(client):
     c, api, root, _ = client
     assert c.get("/ping").json() == {"ok": True, "api": 3}
@@ -743,6 +768,7 @@ def test_rest_items_act_outcome(client):
     assert c.post("/items", json={"poster": "t", "ask": __import__("ask_fixtures").ASK, "title": "t", "type": "x-post", "fields": {"id": "Q"}}).status_code == 400
 
 
+@pytest.mark.needs_core
 def test_rest_prompt_action_and_accept_alias(client):
     c, api, root, _ = client
     sid = c.post("/items", json={"poster": "t", "ask": __import__("ask_fixtures").ASK, "title": "x", "type": "x-post", "key": "x-post:Q2",
@@ -755,6 +781,7 @@ def test_rest_prompt_action_and_accept_alias(client):
     assert c.post(f"/items/{legacy}/accept").json()["accept_prompt"] == "go"
 
 
+@pytest.mark.needs_core
 def test_rest_act_and_outcome_by_profile(client):
     c, api, root, reg_cls = client
     st = api._store()

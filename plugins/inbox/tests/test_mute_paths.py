@@ -45,6 +45,7 @@ _ASK_JSON = json.dumps({"interaction": "preference", "why_human": "Only the owne
 _FIX = "abcdef1234567"
 
 
+@pytest.mark.needs_core
 def test_cli_post_refused_then_unmute(monkeypatch, tmp_path, capsys):
     mod, store = _load_plugin(monkeypatch, tmp_path)
     _mute(store, "cron · noisy")
@@ -56,6 +57,7 @@ def test_cli_post_refused_then_unmute(monkeypatch, tmp_path, capsys):
     assert _cli(mod, post) == 0
 
 
+@pytest.mark.needs_core
 def test_tool_post_refused(monkeypatch, tmp_path):
     mod, store = _load_plugin(monkeypatch, tmp_path)
     _mute(store, "kanban · noisy worker")
@@ -65,6 +67,7 @@ def test_tool_post_refused(monkeypatch, tmp_path):
     assert out["posted"] is False and "PosterMuted" in out["error"]
 
 
+@pytest.mark.needs_core
 def test_rest_post_refused(monkeypatch, tmp_path):
     fastapi = pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
@@ -111,6 +114,7 @@ def test_agent_fixable_posts_refused_before_any_card_exists(monkeypatch, tmp_pat
     assert out["posted"] is False and "AgentFixablePost" in out["error"]
 
 
+@pytest.mark.needs_core
 def test_owner_decisions_still_post(monkeypatch, tmp_path):
     mod, store = _load_plugin(monkeypatch, tmp_path)
     inbox = store.Inbox()
@@ -155,6 +159,7 @@ def _seq(inbox, clock, outcomes, type_="draft-post", poster="p"):
     clock["t"] += 10
 
 
+@pytest.mark.needs_core
 def test_typed_accept_breaks_ignored_streak(tmp_path, monkeypatch):
     """archived, accepted(post), archived: David's 'post' is a decision, so the next draft lands."""
     st, inbox, db, clock, cards = _typed_env(tmp_path, monkeypatch)
@@ -165,6 +170,7 @@ def test_typed_accept_breaks_ignored_streak(tmp_path, monkeypatch):
     db.close()
 
 
+@pytest.mark.needs_core
 def test_generic_do_it_does_not_break_streak(tmp_path, monkeypatch):
     """archived, accepted(do_it), archived: a generic Do it is not a decision; still muted."""
     st, inbox, db, clock, cards = _typed_env(tmp_path, monkeypatch)
@@ -174,6 +180,7 @@ def test_generic_do_it_does_not_break_streak(tmp_path, monkeypatch):
     db.close()
 
 
+@pytest.mark.needs_core
 def test_conditional_mute_files_owner_card(tmp_path, monkeypatch):
     """A conditional post refused as muted files the inbox-muted:<family> owner card (was silent)."""
     st, inbox, db, clock, cards = _typed_env(tmp_path, monkeypatch)

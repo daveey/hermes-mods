@@ -49,6 +49,7 @@ def test_every_posting_door_refuses_and_routes(tmp_path, monkeypatch, door):
     assert len(cards) == 1
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("door", ["tool", "cli", "rest"])
 def test_every_posting_door_transmits_valid_ask(tmp_path, monkeypatch, door):
     plugin = load("_ask_valid_entry_plugin", "__init__.py")
@@ -77,6 +78,7 @@ def test_every_posting_door_transmits_valid_ask(tmp_path, monkeypatch, door):
     assert json.loads(item["ask_json"]) == ASK
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("conditional", [False, True])
 def test_ask_receipt_survives_refresh(tmp_path, conditional):
     st = load("_ask_receipt", "store.py")

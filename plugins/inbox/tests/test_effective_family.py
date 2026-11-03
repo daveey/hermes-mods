@@ -78,6 +78,7 @@ def test_declared_inbox_family_cannot_self_attest_an_ask_from_agent_run(env, doo
     assert "ask_self_attested" in cards[0]["body"]
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("door", ["tool", "cli"])
 @pytest.mark.parametrize("poster", ["cli", "desktop", "oneshot"])
 def test_without_agent_markers_inbox_families_still_post(env, door, poster):
@@ -86,6 +87,7 @@ def test_without_agent_markers_inbox_families_still_post(env, door, poster):
     assert len(st.Inbox().list()) == 1
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("door", ["tool", "cli"])
 def test_kanban_worker_with_human_request_posting_as_cli_gets_derived_ask(env, door):
     plugin, st, _, mp = env
@@ -95,6 +97,7 @@ def test_kanban_worker_with_human_request_posting_as_cli_gets_derived_ask(env, d
     assert len(st.Inbox().list()) == 1
 
 
+@pytest.mark.needs_core
 def test_rest_post_route_binds_kanban_env(tmp_path, monkeypatch):
     fastapi = pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

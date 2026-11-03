@@ -3,6 +3,8 @@ import json
 import pytest
 from test_store import env, store
 
+pytestmark = pytest.mark.needs_core  # every test here runs the real core store
+
 
 def test_two_archives_across_distinct_labels_mute_family(env):
     inbox, db, _ = env

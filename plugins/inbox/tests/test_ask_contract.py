@@ -118,6 +118,7 @@ def test_legacy_agent_fixable_rule_also_routes_to_kanban(tmp_path):
     assert len(cards) == 1
 
 
+@pytest.mark.needs_core
 def test_refusal_repeats_become_comments_on_the_same_kanban_card(tmp_path, monkeypatch):
     import sqlite3
     from agent import delegation_context
@@ -164,6 +165,7 @@ def test_keyed_post_without_poster_gets_poster_missing_keyed_and_a_hint(tmp_path
     assert cards and "poster_missing_keyed" in cards[0]["body"]
 
 
+@pytest.mark.needs_core
 def test_refusal_after_done_fallback_card_files_a_fresh_card(tmp_path, monkeypatch):
     """A refusal must not become a silent comment on a finished card: a done card gets a fresh successor."""
     import sqlite3

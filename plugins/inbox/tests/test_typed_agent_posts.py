@@ -98,6 +98,7 @@ REAL = [
 ]
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("door", ["tool", "cli"])
 @pytest.mark.parametrize("poster,type_name,fields,title,ask", REAL)
 def test_real_typed_agent_producers_are_still_accepted(env, door, poster, type_name, fields, title, ask):
@@ -106,6 +107,7 @@ def test_real_typed_agent_producers_are_still_accepted(env, door, poster, type_n
     assert len(st.Inbox().list()) == 1
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("door", ["tool", "cli"])
 def test_manual_mode_selfheal_proposal_is_still_accepted(env, door):
     """Self-heal titles describe a defect by design; selfheal_reason (auto_approve) is what gates them."""

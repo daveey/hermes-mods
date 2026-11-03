@@ -66,6 +66,7 @@ def test_key_prefix_never_exempts_a_self_attested_agent_ask(env, door, key, post
     assert "ask_self_attested" in cards[0]["body"]
 
 
+@pytest.mark.needs_core
 def test_typed_engine_budget_card_from_coach_is_still_accepted(env):
     """The live spend-raise producer posts a resolve-typed card; the type, not the key, carries the decision."""
     plugin, st, _, _ = env
@@ -78,6 +79,7 @@ def test_typed_engine_budget_card_from_coach_is_still_accepted(env):
     assert r
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("door", ["tool", "cli"])
 def test_ask_derived_from_card_human_request_is_accepted(env, door):
     plugin, st, _, mp = env
@@ -94,6 +96,7 @@ def test_ask_differing_from_human_request_is_still_refused(env, door):
     assert not post(door, plugin, "Needs David", "anything:1", "kanban · a", {**ASK, "action": "Something else"})
 
 
+@pytest.mark.needs_core
 def test_non_agent_owner_still_accepts_any_ask(env):
     plugin, st, _, _ = env
     assert post("tool", plugin, "Review publication", "draft:1", "cli", ASK)

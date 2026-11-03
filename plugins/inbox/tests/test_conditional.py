@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+pytestmark = pytest.mark.needs_core  # every test here runs the real core store
+
 from test_store import HERE, env, store
 
 
