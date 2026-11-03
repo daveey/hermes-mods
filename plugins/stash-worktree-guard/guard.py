@@ -932,11 +932,84 @@ def _substitutions(raw: str) -> list:
                 j = _match_paren(raw, i + 2)
             except _ParseError:
                 return out + [raw[i:]]
-            out.append(raw[i + 2:j - 1])  # $((x)) yields "(x)": analyzed as a subshell
+            body = raw[i + 2:j - 1]
+            out.extend(_paren_substitution(body) if raw[i] == "$" else [body])
             i = j
             continue
         i += 1
     return out
+
+
+def _arith_balanced(expr: str) -> bool:
+    """Bash's ``chk_arithsub``: parentheses in ``expr`` balance and never close more than they
+    opened, outside quotes and backslash escapes. Only then is the text certainly arithmetic:
+    Bash runs a ``$((x))`` that fails it as a command substitution of the subshell ``(x)``, and
+    a ``((x))`` command it fails was parsed as nested subshells. An unterminated quote fails it."""
+    depth, i = 0, 0
+    while i < len(expr):
+        c = expr[i]
+        if c == "\\":
+            i += 2
+            continue
+        try:
+            if c == "'":
+                i = _skip_single(expr, i + 1)
+                continue
+            if c == '"':
+                i = _skip_double(expr, i + 1)
+                continue
+        except _ParseError:
+            return False
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+        i += 1
+    return depth == 0
+
+
+def _arith_commands(expr: str) -> list:
+    """Shell texts that evaluating the arithmetic text ``expr`` runs: its command substitutions.
+
+    ``$((expr))``, ``((expr))`` and ``for ((expr))`` expand ``expr`` as if double-quoted (a
+    single quote is literal, so a ``$(...)`` between single quotes still runs) and evaluate the
+    result as arithmetic, so an operand such as ``$(date +%s) - s`` is not a command name. Text
+    that is not certainly arithmetic (``_arith_balanced``) is returned whole, as shell text.
+    """
+    if not _arith_balanced(expr):
+        return [expr]
+    out, i = [], 0
+    while i < len(expr):
+        c = expr[i]
+        if c == "\\":
+            i += 2
+            continue
+        try:
+            if c == "`":
+                j = _skip_backtick(expr, i + 1)
+                out.append(re.sub(r"\\([\\`$])", r"\1", expr[i + 1:j - 1]))
+                i = j
+                continue
+            if expr.startswith("$(", i):
+                j = _match_paren(expr, i + 2)
+                out.extend(_paren_substitution(expr[i + 2:j - 1]))
+                i = j
+                continue
+        except _ParseError:
+            return out + [expr[i:]]  # unterminated: analyzed (and failed closed) as text
+        i += 1
+    return out
+
+
+def _paren_substitution(body: str) -> list:
+    """Shell texts that ``$(body)`` runs. ``$((x))`` is arithmetic when Bash's own test says so
+    (``body`` is ``(x)`` with ``x`` balanced); otherwise Bash runs ``body`` as a command
+    substitution, here a subshell."""
+    if len(body) >= 2 and body[0] == "(" and body[-1] == ")" and _arith_balanced(body[1:-1]):
+        return _arith_commands(body[1:-1])
+    return [body]
 
 
 class _State:
@@ -1381,7 +1454,8 @@ class _Analyzer:
         if kind == "arith":
             self.redirs(node[2], states, depth)
             for st in states:
-                self.isolated(node[1], st, depth)
+                for inner in _arith_commands(node[1]):
+                    self.isolated(inner, st, depth)
             return states, states
         if kind == "if":
             outs, cur = [], states
@@ -1444,7 +1518,8 @@ class _Analyzer:
                     for inner in _substitutions(word):
                         self.isolated(inner, st, depth)
                 if arith:
-                    self.isolated(arith, st, depth)
+                    for inner in _arith_commands(arith):
+                        self.isolated(inner, st, depth)
             if var:
                 pre = []
                 for st in states:

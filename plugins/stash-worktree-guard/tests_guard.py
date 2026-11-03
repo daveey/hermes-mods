@@ -2236,3 +2236,56 @@ def test_non_converging_loop_restores_still_refuse(multi, template):
     main, wt = multi
     cmd = template.format(main=main, wt=wt)
     assert _blocked(cmd, main), cmd
+
+
+# Refused as `git stash pop` (no git in it at all): `env -u NAME` is an unsupported wrapper
+# option, so any later non-builtin git subcommand may be an alias. `$(( $(date +%s) - s ))` was
+# analyzed as the subshell `( $(date +%s) - s )`, whose unknown command name might be git, and
+# `git - s` then looked like an alias run. Arithmetic text is not a command: only its own
+# substitutions run. Reported shape, paths shortened.
+ARITH_REPORTED = r'''P11=/opt/py/bin/python; D=/tmp/lcgfix/plugins/live-checkout-guard; TN=test_x
+cd /tmp || exit 1
+{ echo "== clean env: $(env -u HERMES_SESSION_KEY MAC_HEAVY_OK=1 timeout 100 "$P11" -B -m pytest -q "$D/tests_guard.py::$TN" 2>&1 | tail -1)"
+  for f in tests_guard.py tests_update.py; do
+    s=$(date +%s); r11=$(MAC_HEAVY_OK=1 timeout 150 "$P11" -B -m pytest -q "$D/$f" 2>&1 | tail -1); t11=$(( $(date +%s) - s ))
+    echo "   $f [$t11 s]: $r11"
+  done
+} > "$TMPDIR/out.txt" 2>&1; cat "$TMPDIR/out.txt" | cut -c1-260'''
+ARITH_ALLOWED = [
+    ARITH_REPORTED,
+    'env -u X true; t=$(( $(date +%s) - 1 )); echo "$t"',
+    'env -u X true; echo $(( `date +%s` - 1 ))',
+    'env -u X true; echo "$(( 2 * ($(date +%s) - 1) ))"',
+    'env -u X true; (( n = $(date +%s) - 1 )); echo "$n"',
+    'env -u X true; for (( i = $(date +%s); i < 0; i++ )); do :; done',
+]
+
+
+@pytest.mark.parametrize("cmd", ARITH_ALLOWED)
+def test_arithmetic_operands_are_not_commands(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, "/Users/you") is None, cmd
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not _blocked(cmd, main), cmd
+
+
+@pytest.mark.parametrize("template", [
+    # Substitutions inside arithmetic still run, in every arithmetic form.
+    'echo $(( $(git -C {wt} stash pop) + 1 ))',
+    'echo "$(( `git -C {wt} stash pop` ))"',
+    '(( n = $(git -C {wt} stash pop) ))',
+    'for (( i = $(git -C {wt} stash pop); i < 1; i++ )); do :; done',
+    'echo $(( 1 + $(( $(git -C {wt} stash pop) )) ))',
+    'env -u X true; echo $(( $(git -C {wt} stash pop) ))',
+    # Arithmetic text expands as if double-quoted: single quotes there do not stop `$(...)`.
+    "echo $(( '$(git -C {wt} stash pop)' ))",
+    # Unbalanced `$((...))` text is a command substitution of a subshell in Bash.
+    'echo $((cd {wt}; git stash pop) )',
+    'echo $((true) && (git -C {wt} stash pop))',
+    # `((a) ; (b))` is two nested subshells in Bash, not an arithmetic command.
+    '((true) ; (git -C {wt} stash pop))',
+])
+def test_arithmetic_substitutions_still_refuse(multi, template):
+    main, wt = multi
+    cmd = template.format(wt=wt)
+    assert _blocked(cmd, main), cmd
