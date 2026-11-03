@@ -82,6 +82,7 @@ def _check_no_credentials(config):
     secret = sorted(k for k in env if any(h in str(k).upper() for h in _SECRET_NAME_HINTS))
     if secret:
         raise PermissionError('Project work forbids credential-like docker_env names: ' + ', '.join(secret))
+    _check_docker_env_refs()
     _check_no_env_passthrough()
     try:
         declared, mounts = _core_credential_files()
@@ -94,6 +95,25 @@ def _check_no_credentials(config):
         raise PermissionError('Project work forbids credential file mounts: '
                               + ', '.join(sorted(str(m.get('container_path')) for m in mounts)))
     _check_no_credential_dirs()
+
+
+def _check_docker_env_refs():
+    """Refuse a terminal.docker_env value that names a host variable. Core expands ``${VAR}`` /
+    ``${env:VAR}`` in config values before the backend sees them, so ``{DEPLOY: "${DEPLOY_PAT}"}``
+    forwards a host secret under a harmless name, as docker_forward_env would. The expanded value
+    the backend gets cannot show this, so the raw config.yaml is read."""
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+        raw = cfg_get(read_raw_config(), 'terminal', 'docker_env')
+    except Exception as exc:  # fail closed
+        raise PermissionError('Project work cannot verify docker_env') from exc
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise PermissionError('Project work cannot verify docker_env')
+    refs = sorted(str(k) for k, v in raw.items() if '${' in str(v))
+    if refs:
+        raise PermissionError('Project work forbids docker_env values that read host variables: ' + ', '.join(refs))
 
 
 def _check_no_env_passthrough():
@@ -126,9 +146,12 @@ _MAX_WALK_FILES = 100_000
 # Ordinary (non-Hermes) credential files that core's read deny-list does not cover.
 _CREDENTIAL_BASENAMES = frozenset(('.netrc', '_netrc', '.git-credentials', '.pgpass', '.npmrc', '.pypirc', '.boto',
                                    '.s3cfg', '.htpasswd', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519'))
-# A token in a git remote: any userinfo on http(s) (https://TOKEN@host), a password on any scheme.
-# ssh://git@host carries no secret.
-_URL_SECRET = re.compile(r'https?://[^/\s@]+@|[a-z][a-z0-9+.-]*://[^/\s@:]+:[^/\s@]+@', re.IGNORECASE)
+# Ordinary credential files known by their trailing path, wherever they sit (an XDG home in a repo).
+_CREDENTIAL_SUFFIXES = ('.config/git/credentials', '.cache/huggingface/token', '.huggingface/token')
+# A token in a git config: any userinfo on http(s) (https://TOKEN@host), a password on any scheme
+# (ssh://git@host carries no secret), or an http.extraheader (actions/checkout stores its token there).
+_URL_SECRET = re.compile(r'https?://[^/\s@]+@|[a-z][a-z0-9+.-]*://[^/\s@:]+:[^/\s@]+@'
+                         r'|^\s*extraheader\s*=', re.IGNORECASE | re.MULTILINE)
 
 
 def _check_no_credential_dirs():
@@ -142,20 +165,28 @@ def _check_no_credential_dirs():
     """
     try:
         homes = _hermes_homes()
-        stores = _store_inodes(homes)
+        stores, linked = _store_inodes(homes)
+        if linked:
+            # A second hard link holds the same bytes under any name, anywhere on the filesystem
+            # (an unwalked cache dir included), so a multiply-linked store refuses outright.
+            raise PermissionError('Project work forbids a hard-linked credential store: ' + ', '.join(linked))
+        stores |= _user_credential_inodes()
         skill_roots, cache_roots = _core_dir_mount_roots()
         for root in skill_roots:
             _check_dir_mount(Path(root), homes, stores, walk=True)
         from hermes_constants import get_default_hermes_root, get_hermes_home
-        own = [Path(get_hermes_home()).resolve(), Path(get_default_hermes_root()).resolve()]
+        own = [Path(os.path.abspath(get_hermes_home())), Path(os.path.abspath(get_default_hermes_root()))]
         for root in cache_roots:
             # Fixed HERMES_HOME subdirs holding what users hand the agent (uploads, pastes): their
-            # contents are the agent's input, so they are not walked. A cache dir that resolves
-            # outside the Hermes home (a symlink to ~/code, say) is no cache dir and refuses.
-            if not any(Path(root).resolve().is_relative_to(h) for h in own):
-                raise PermissionError(f'Project work forbids sandbox cache mount {root}: it resolves outside '
-                                      'the Hermes home')
+            # contents are the agent's input, so they are not walked. That holds only while the dir is
+            # what its path says: a symlink anywhere below the Hermes home (to ~/code, to another
+            # profile's home/ subtree) makes it some other directory, and it refuses.
+            lexical = Path(os.path.abspath(root))
             _check_dir_mount(Path(root), homes, stores, walk=False)
+            if not any(lexical.is_relative_to(b) and lexical.resolve() == b.resolve() / lexical.relative_to(b)
+                       for b in own):
+                raise PermissionError(f'Project work forbids sandbox cache mount {root}: it is reached through '
+                                      'a symlink or lies outside the Hermes home')
         create_dir = importlib.import_module('agent.skill_utils').get_skill_create_dir()
         # skill_view also searches skills.create_dir, which core does not mount.
         extra = [create_dir] if create_dir is not None and create_dir.is_dir() else []
@@ -203,9 +234,10 @@ def _hermes_homes():
 
 
 def _store_inodes(homes):
-    """(st_dev, st_ino) of every Hermes credential store, so a hard link under another name is caught."""
+    """((st_dev, st_ino) of every Hermes credential store, [stores with more than one hard link]).
+    The inode set catches a hard link under another name inside a walked mount."""
     from agent.file_safety import _CREDENTIAL_FILE_NAMES, _READ_DENIED_DIRS
-    found = set()
+    found, linked = set(), []
     for home in homes:
         paths = [home / n for n in _CREDENTIAL_FILE_NAMES]
         for d, *_ in _READ_DENIED_DIRS:
@@ -217,6 +249,32 @@ def _store_inodes(homes):
             except OSError:
                 continue
             found.add((st.st_dev, st.st_ino))
+            if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                linked.append(str(p))
+    return found, sorted(linked)
+
+
+def _user_credential_inodes():
+    """(st_dev, st_ino) of the OS user's own credential files (~/.ssh/id_*, ~/.aws/credentials,
+    ~/.netrc, ...): the files directly in each home credential dir plus the ordinary basenames.
+    A hard link to one under a harmless name inside a walked mount is then caught."""
+    import pwd
+    from agent.file_safety import HOME_CREDENTIAL_DIRS
+    found = set()
+    for home in {Path(pwd.getpwuid(os.getuid()).pw_dir), Path(os.path.expanduser('~'))}:
+        paths = [home / n for n in _CREDENTIAL_BASENAMES] + [home / s for s in _CREDENTIAL_SUFFIXES]
+        for d in HOME_CREDENTIAL_DIRS:
+            try:
+                paths += list((home / d).iterdir())
+            except OSError:
+                continue
+        for p in paths:
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                found.add((st.st_dev, st.st_ino))
     return found
 
 
@@ -273,7 +331,10 @@ def _credential_reason(path, rules, *, is_dir=False):
     name = path.name.lower()  # core's deny-list matches basenames case-insensitively
     if name in env_names or name in _CREDENTIAL_BASENAMES:
         return True
-    if path.name == 'config' and path.parent.name == '.git':  # token embedded in a remote URL
+    if any(parts[-len(s.split('/')):] == tuple(s.split('/')) for s in _CREDENTIAL_SUFFIXES):
+        return True
+    # Any git config: the repo's own, a submodule's (.git/modules/<m>/config), a worktree's.
+    if path.name == 'config' and '.git' in parts[:-1]:
         try:
             return bool(_URL_SECRET.search(path.read_text(errors='replace')))
         except OSError as exc:
@@ -339,7 +400,7 @@ def register(ctx):
     # gateway has bound this profile before authorizing each individual turn.
     client = Client(endpoint)
     queue = DurableIngressQueue(endpoint.parent / 'ingress.sqlite3', client)
-    ingress = Ingress(policy, client, queue)
+    ingress = Ingress(policy, client, queue, gate=require_sandbox)
     def wire(native, adapter):
         native.use(ingress.middleware)
     ctx.register_platform_handler('slack', wire)

@@ -397,7 +397,7 @@ def test_cache_dir_symlinked_outside_home_refuses(monkeypatch, core, tmp_path):
     outside.mkdir()
     (core.home / 'attachments').symlink_to(outside)
     write_config(core.home, '')
-    with pytest.raises(PermissionError, match='resolves outside the Hermes home'):
+    with pytest.raises(PermissionError, match='a symlink or lies outside the Hermes home'):
         gate(monkeypatch)()
 
 
@@ -450,3 +450,111 @@ def test_more_credential_basenames_refuse(monkeypatch, core, tmp_path, name):
     external_dirs(core.home, str(skills))
     with pytest.raises(PermissionError, match='credential store'):
         gate(monkeypatch)()
+
+
+# ---- final review of 10184504 (neutral trace, adversarial pass): surviving findings ----
+
+@pytest.mark.parametrize('ref', ['${DEPLOY_PAT}', '${env:DEPLOY_PAT}', 'prefix-${DEPLOY_PAT}'])
+def test_docker_env_value_reading_host_variable_refuses(monkeypatch, core, ref):
+    """Core expands ${VAR} in config values, so a harmless docker_env name can carry a host secret."""
+    write_config(core.home, f'  docker_env:\n    DEPLOY: "{ref}"\n')
+    with pytest.raises(PermissionError, match='docker_env values that read host variables: DEPLOY'):
+        gate(monkeypatch)()
+
+
+def test_docker_env_literal_value_allows(monkeypatch, core):
+    write_config(core.home, '  docker_env:\n    LANG: C.UTF-8\n')
+    gate(monkeypatch)()
+
+
+def test_cache_dir_symlinked_into_other_profile_refuses(monkeypatch, core):
+    """Inside the Hermes root but not the dir its path names: another profile's subprocess home."""
+    (core.other / 'home').mkdir()
+    (core.other / 'home' / '.git-credentials').write_text('PLACEHOLDER\n')
+    (core.home / 'cache').mkdir()
+    (core.home / 'cache' / 'documents').symlink_to(core.other / 'home')
+    write_config(core.home, '')
+    with pytest.raises(PermissionError, match='a symlink or lies outside the Hermes home'):
+        gate(monkeypatch)()
+
+
+def test_cache_dir_hard_link_to_other_profile_env_refuses(monkeypatch, core):
+    """Cache dirs are not walked; a multiply-linked store refuses wherever its other link is."""
+    (core.home / 'cache' / 'documents').mkdir(parents=True)
+    os.link(core.other / '.env', core.home / 'cache' / 'documents' / 'report.txt')
+    write_config(core.home, '')
+    with pytest.raises(PermissionError, match='hard-linked credential store'):
+        gate(monkeypatch)()
+
+
+def test_hard_link_to_user_ssh_key_in_skill_dir_refuses(monkeypatch, core, tmp_path):
+    (core.user / '.ssh').mkdir()
+    (core.user / '.ssh' / 'id_ed25519').write_text('PLACEHOLDER\n')
+    skills = tmp_path / 'shared-skills'
+    d = skill(skills, 'tool')
+    os.link(core.user / '.ssh' / 'id_ed25519', d / 'notes.txt')
+    external_dirs(core.home, str(skills))
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+@pytest.mark.parametrize('rel', ['.config/git/credentials', '.cache/huggingface/token', '.huggingface/token'])
+def test_credential_suffix_in_mounted_dir_refuses(monkeypatch, core, tmp_path, rel):
+    skills = tmp_path / 'shared-skills'
+    skill(skills, 'tool')
+    (skills / rel).parent.mkdir(parents=True, exist_ok=True)
+    (skills / rel).write_text('PLACEHOLDER\n')
+    external_dirs(core.home, str(skills))
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+@pytest.mark.parametrize('where,text', [
+    ('.git/config', '[http "https://github.com/"]\n\textraheader = AUTHORIZATION: basic PLACEHOLDER\n'),
+    ('.git/modules/sub/config', '[remote "origin"]\n\turl = https://x-access-token:PLACEHOLDER@example.com/r\n')])
+def test_git_config_secret_forms_refuse(monkeypatch, core, tmp_path, where, text):
+    repo = tmp_path / 'skills-repo'
+    skill(repo, 'tool')
+    (repo / where).parent.mkdir(parents=True, exist_ok=True)
+    (repo / where).write_text(text)
+    external_dirs(core.home, str(repo))
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+def test_skill_added_after_register_refuses_at_tool_call(monkeypatch, core):
+    """register() passes; a skill that appears later (git pull, hub install) refuses the next tool call
+    before any authentication or server call."""
+    ingress_mod = importlib.import_module(PACKAGE + '.ingress')
+    write_config(core.home, '')
+    check = gate(monkeypatch)
+    check()
+    calls = []
+    ingress = ingress_mod.Ingress(types.SimpleNamespace(), types.SimpleNamespace(call=lambda *a, **k: calls.append(a)),
+                                  gate=check)
+    monkeypatch.setattr(ingress, 'current', lambda: calls.append('current'))
+    skill(core.home / 'skills', 'late', 'required_environment_variables:\n  - name: PLACEHOLDER_TOKEN\n')
+    with pytest.raises(PermissionError, match='forbids skill'):
+        ingress.tool('project_work_request', {'request': 'x'})
+    assert calls == []
+
+
+def test_register_wires_the_gate_into_ingress(monkeypatch, tmp_path):
+    seen = {}
+
+    class FakeIngress:
+        def __init__(self, *a, gate=None):
+            seen['gate'] = gate
+
+        middleware = None
+
+    monkeypatch.setattr(plugin, 'require_sandbox', lambda: None)
+    monkeypatch.setattr(plugin, 'load_config', lambda home: (object(), tmp_path / 'sock', None))
+    monkeypatch.setattr(plugin, 'Client', lambda *a, **k: None)
+    monkeypatch.setattr(plugin, 'DurableIngressQueue', lambda *a, **k: types.SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(plugin, 'Ingress', FakeIngress)
+    monkeypatch.setattr(plugin, 'register_tools', lambda ctx, ingress: None)
+    (tmp_path / 'project-work.json').write_text('{}')
+    monkeypatch.setitem(sys.modules, 'hermes_constants', types.SimpleNamespace(get_hermes_home=lambda: tmp_path))
+    plugin.register(types.SimpleNamespace(register_platform_handler=lambda *a: None))
+    assert seen['gate'] is plugin.require_sandbox

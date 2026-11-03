@@ -111,15 +111,16 @@ def test_network_worker_cannot_block_durable_ingress(env, tmp_path):
     # Core defaults container_persistent to true: a bare docker config is persistent and refuses.
     ({'env_type': 'docker'}, False),
     ({'env_type': 'modal'}, True), ({'env_type': 'daytona'}, True),
-    ({'env_type': 'docker', 'docker_volumes': ['/host:/host']}, False),
-    ({'env_type': 'docker', 'docker_extra_args': ['--privileged']}, False),
-    ({'env_type': 'docker', 'docker_mount_cwd_to_workspace': True}, False),
+    ({'env_type': 'docker', 'container_persistent': False, 'docker_volumes': ['/host:/host']}, False),
+    ({'env_type': 'docker', 'container_persistent': False, 'docker_extra_args': ['--privileged']}, False),
+    ({'env_type': 'docker', 'container_persistent': False, 'docker_mount_cwd_to_workspace': True}, False),
 ])
 def test_registration_sandbox_gate(monkeypatch, config, allowed):
     # Hermetic: the credential readers are covered against real core in test_sandbox_*.py; here they
     # would read whatever HERMES_HOME the runner has (test-all: the real one).
     monkeypatch.setattr(plugin, '_core_credential_files', lambda: ([], []), raising=False)
     monkeypatch.setattr(plugin, '_check_no_credential_dirs', lambda: None, raising=False)
+    monkeypatch.setattr(plugin, '_check_docker_env_refs', lambda: None, raising=False)
     passthrough = types.ModuleType('tools.env_passthrough')
     setattr(passthrough, '_load_config_passthrough', frozenset)
     monkeypatch.setitem(sys.modules, 'tools.env_passthrough', passthrough)
@@ -148,6 +149,7 @@ def gate(monkeypatch, **config):
     monkeypatch.setitem(sys.modules, 'tools.env_passthrough', passthrough)
     monkeypatch.setattr(plugin, '_core_credential_files', lambda: ([], []), raising=False)
     monkeypatch.setattr(plugin, '_check_no_credential_dirs', lambda: None, raising=False)
+    monkeypatch.setattr(plugin, '_check_docker_env_refs', lambda: None, raising=False)
     monkeypatch.setitem(sys.modules, 'tools.terminal_tool', types.SimpleNamespace(_get_env_config=lambda: config))
     return plugin.require_sandbox
 

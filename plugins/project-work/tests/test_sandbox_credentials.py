@@ -29,6 +29,7 @@ def no_core_passthrough(monkeypatch):
     monkeypatch.setattr(plugin, '_core_credential_files', lambda: ([], []), raising=False)
     # Directory mounts are covered by test_sandbox_mounts.py against real core.
     monkeypatch.setattr(plugin, '_check_no_credential_dirs', lambda: None, raising=False)
+    monkeypatch.setattr(plugin, '_check_docker_env_refs', lambda: None, raising=False)
     return fake
 
 

@@ -26,9 +26,12 @@ NOTICES = {
 
 
 class Ingress:
-    def __init__(self, policy, client, queue=None):
+    def __init__(self, policy, client, queue=None, gate=None):
         self.policy, self.client = policy, client
         self.queue = queue
+        # Re-run at every tool call: a skill or mount that appears after register() (a git pull, a
+        # hub install) would otherwise go unaudited for the gateway's lifetime.
+        self.gate = gate
         self.events = OrderedDict()
         self.lock = threading.Lock()
 
@@ -78,6 +81,8 @@ class Ingress:
         return ctx
 
     def tool(self, name, args):
+        if self.gate is not None:
+            self.gate()
         ctx = self.current()
         required = {'request'} if name == 'project_work_request' else {'workflow_id'}
         if not isinstance(args, dict) or set(args) != required:
