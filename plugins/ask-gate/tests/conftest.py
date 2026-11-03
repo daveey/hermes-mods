@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -7,6 +9,46 @@ from pathlib import Path
 import pytest
 
 HERE = Path(__file__).resolve().parents[1]
+
+# Core is private, so the public plugin-suites CI has none. A test that needs core there (it imports
+# agent/hermes_cli/model_tools, or ask-gate's runtime contract refuses registration because
+# agent.pre_final_gate is not importable) skips instead of failing. Only when no core is on the path and
+# none was named: scripts/test-all sets HERMES_CORE_CHECKOUT whenever it puts core on PYTHONPATH, and then
+# a missing core module still fails loudly. Only core's own top-level modules count.
+_NO_CORE = importlib.util.find_spec("hermes_cli") is None and not os.environ.get("HERMES_CORE_CHECKOUT")
+_CORE_TOPS = frozenset({"agent", "acp_adapter", "cron", "gateway", "model_tools", "run_agent", "tools",
+                        "toolsets", "cli", "batch_runner"})
+_UNIMPORTABLE = re.compile(r"could not import ([\w.]+)")
+
+
+def _core_module(name):
+    top = (name or "").split(".")[0]
+    return top in _CORE_TOPS or top.startswith("hermes_")
+
+
+def _missing_core(exc):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ModuleNotFoundError) and _core_module(exc.name):
+            return exc.name
+        found = _UNIMPORTABLE.search(str(exc))
+        if found and _core_module(found.group(1)):
+            return found.group(1)
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if not (_NO_CORE and report.failed and call.excinfo is not None):
+        return
+    missing = _missing_core(call.excinfo.value)
+    if missing:
+        report.outcome = "skipped"
+        report.longrepr = (str(item.path), item.location[1] or 0, f"Skipped: needs Hermes core ({missing} not importable)")
 FIX = json.loads((Path(__file__).parent / "fixtures" / "session_20261021_103941.json").read_text())
 
 SHEET = ("Things the agent can do itself (generated from local config just now):\n"
