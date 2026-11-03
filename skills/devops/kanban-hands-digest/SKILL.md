@@ -1,6 +1,12 @@
 ---
 name: kanban-hands-digest
-description: "Use when asked about Kanban blockers or human steps. Clear blockers and explain stalled cards in a scoped digest."
+description: "Use when asked what's blocked on Kanban. Clears blockers."
+triggers:
+  asks:
+    - "What's blocked?"
+    - "What do you need me to do?"
+    - "Is it stuck?"
+  not_for: "general session management (use hermes-session-manager)"
 version: 1.0.0
 author: daveey
 license: MIT

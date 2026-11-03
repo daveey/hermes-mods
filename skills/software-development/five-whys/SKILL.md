@@ -1,6 +1,12 @@
 ---
 name: five-whys
-description: "Use when analyzing a failure. Trace evidence-backed whys to a fixable root for bugs, incidents, CI or bad agent output."
+description: "Use when asking why it failed. Chain causes to a fix."
+triggers:
+  asks:
+    - "why did this fail?"
+    - "what's the root cause?"
+    - "why did the fix not hold?"
+  not_for: "gathering evidence on an unreproduced bug (use systematic-debugging)"
 version: 1.0.0
 author: Hermes Agent
 license: MIT

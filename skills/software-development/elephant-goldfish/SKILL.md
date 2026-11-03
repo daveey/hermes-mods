@@ -1,6 +1,12 @@
 ---
 name: elephant-goldfish
-description: "Use when reviewing a plan or design pre-build. Fresh agents."
+description: "Use when a design/plan needs review before building."
+triggers:
+  asks:
+    - "review this plan before I build it"
+    - "is this design ready?"
+    - "stress-test this spec"
+  not_for: "reading a repo or assessing implementation evidence (use codebase-inspection); code diffs (use requesting-code-review)"
 version: 1.0.0
 author: Hermes Agent (adapted from google/elephant-goldfish-model)
 license: Apache-2.0

@@ -1,6 +1,12 @@
 ---
 name: slack-workspace-bot
-description: "Use when acting as a team Slack bot or its channel follower."
+description: "Use when @-mentioned or DMed in Slack. Reply, read channels."
+triggers:
+  asks:
+    - "what's going on in #proj-x"
+    - "join the infra channel"
+    - "pin this message"
+  not_for: "resuming interrupted turns (use session-resume); drafting or posting on X or Bluesky (use x-presence)"
 version: 1.0.0
 author: daveey
 license: MIT

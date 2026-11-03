@@ -75,7 +75,14 @@ metadata:
    load: if the router grew with no matching removal, move the depth to `references/`. Leaving a skill unchanged
    is a valid result; an edit the evidence doesn't support is a regression. Report one line per rule:
    `kept|revised|dropped -> <rule> -> <the session moment that decided it>`.
-9. **Descriptions**: first 57 chars self-contained, `Use when <trigger>. <behaviour>.`
+9. **Descriptions** (measured by `tools/skill-trigger-eval` in hermes-mods; rerun it before and after):
+   - <= 60 chars, `Use when <trigger>. <behaviour>.`, where the trigger is the user's situation in the words
+     they type ("my Mac disk is full"), not internal jargon, and tells the skill apart from its index neighbours.
+   - Any skill with recall < 0.9 or in a collision pair also gets hidden `triggers:` frontmatter:
+     `asks:` 3 short user phrasings and `not_for: <neighbour task> (use <other-skill>)`. The index renders it
+     when core supports `triggers:`; until then it is inert. On the 30 weakest skills, a description rewrite alone
+     raised recall 0.67 -> 0.73; adding triggers raised it to 0.83, at about 72 index tokens per skill.
+   - Fix a collision with mutual `not_for` lines naming each other, or merge the two skills.
 10. Finish: commit and sync per `hermes-mods-repo` (public skills in hermes-mods, everything else via
    `hermes-sync run`), then report a short table: what changed, what was recovered, what needs the user.
 

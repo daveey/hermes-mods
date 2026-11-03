@@ -1,6 +1,12 @@
 ---
 name: hermes-session-manager
-description: "Use when a Hermes chat manages sessions, cards, blockers."
+description: "Use when asked what's blocked on me or to keep chats moving."
+triggers:
+  asks:
+    - "what's blocked on me"
+    - "archive finished sessions"
+    - "keep an eye on my chats and cards"
+  not_for: "Claude Code desktop session dispatch (use concierge)"
 ---
 
 # Hermes session manager

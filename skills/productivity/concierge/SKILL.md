@@ -1,6 +1,12 @@
 ---
 name: concierge
-description: "Use when a Claude Code desktop chat dispatches sessions."
+description: "Use when a Claude Code chat routes work to other sessions."
+triggers:
+  asks:
+    - "manage my sessions"
+    - "reply quickly, never block"
+    - "archive finished sessions"
+  not_for: "Hermes chats, Kanban cards, `hermes sessions` (use hermes-session-manager)"
 ---
 
 # Concierge

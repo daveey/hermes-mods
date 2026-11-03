@@ -1,6 +1,12 @@
 ---
 name: hermes-coach
-description: "Use when mining Hermes sessions across hosts for usage patterns. Digests, feed, coach Bot."
+description: "Use when setting up the cross-host session digest feed."
+triggers:
+  asks:
+    - "add a host to the digest feed"
+    - "which sessions were repeat-fix loops?"
+    - "why is the coach feed failing?"
+  not_for: "tuning detectors or coaching Hermes use (use hermes-training)"
 version: 0.1.0
 author: daveey
 license: MIT
