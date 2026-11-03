@@ -26,6 +26,7 @@ def home(tmp_path, monkeypatch):
     h.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(h))
     plug._loads.clear()
+    plug._live_turn.clear()
     plug._last_sweep[0] = 0.0
     monkeypatch.setattr(plug, "SWEEP_EVERY_S", 10 ** 9)  # tests flush explicitly
     plug._last_sweep[0] = 10 ** 12
@@ -320,7 +321,7 @@ def test_reply_missed_by_the_hook_is_read_from_state_db(home):
     core.flush(home, now=t + 9 + core.GRACE_S + 1)
     (r,) = lines(home)
     assert r["user_correction"] is True and r["correction_source"] == "keyword"
-    assert r["reply_source"] == "state_db" and r["rules"] == 3
+    assert r["reply_source"] == "state_db" and r["rules"] == core.RULES
 
 
 def test_state_db_with_only_notices_finalizes_none_after_idle(home):
@@ -358,3 +359,63 @@ def test_subagent_prompts_and_compaction_notes_are_not_replies(home):
     core.flush(home, now=t + core.IDLE_S + 1)
     rs = {r["session"]: r for r in lines(home)}
     assert rs["s1"]["correction_source"] == "none" and rs["sub"]["correction_source"] == "none"
+
+
+# ---------------------------------------------------------------- forks and interrupted turns (rules 4)
+def _tool_rows(h, session, rows):
+    import sqlite3
+    con = sqlite3.connect(h / "state.db")
+    con.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+                "content TEXT, timestamp REAL, display_kind TEXT, tool_name TEXT)")
+    con.executemany("INSERT INTO messages (session_id, role, content, timestamp, tool_name) VALUES (?,?,?,?,?)",
+                    [(session, "tool", content, ts, name) for ts, name, content in rows])
+    con.commit()
+    con.close()
+
+
+def test_background_review_fork_skill_view_is_not_a_use(home):
+    # live turn t1 starts; after it ends, a fork (same session_id, own turn_id, no pre/post_llm_call) views a skill
+    plug.pre_llm_call(session_id="s1", user_message="fix the login", turn_id="t1")
+    plug.post_llm_call(session_id="s1", assistant_response="done", turn_id="t1")
+    fork = dict(tool_name="skill_view", args={"name": "five-whys"}, result=view("five-whys", SKILL_DONE),
+                session_id="s1", turn_id="fork-review-1")
+    assert plug.transform_tool_result(**fork) is None  # no tick-off ask inside the fork
+    plug.post_tool_call(**fork)
+    # the parent's next turn loads nothing; the fork's view must not be filed under it
+    plug.pre_llm_call(session_id="s1", user_message="why is this red", turn_id="t2")
+    plug.post_llm_call(session_id="s1", assistant_response="ok", turn_id="t2")
+    core.flush(home, force=True)
+    assert lines(home) == []
+
+
+def test_flush_drops_a_use_the_transcript_never_saw(home):
+    # a view recorded before the plugin knew the live turn (e.g. right after a gateway restart): state.db decides
+    turn("s1", "done", ("five-whys", SKILL_DONE), ("token-broker", SKILL_PLAIN))
+    t = core.time.time()
+    _tool_rows(home, "s1", [(t - 1, "skill_view", view("token-broker", SKILL_PLAIN)),
+                            (t - 1, "terminal", '{"output": ""}')])
+    core.flush(home, force=True)
+    assert [r["skill"] for r in lines(home)] == ["token-broker"]
+
+
+def test_interrupted_turn_uses_close_at_the_next_message(home):
+    # turn t1 loads a skill and is interrupted (no post_llm_call); the next message ("whats up?") is its reply,
+    # not the message after turn t2
+    plug.pre_llm_call(session_id="s1", user_message="add a login", turn_id="t1")
+    plug.post_tool_call(tool_name="skill_view", args={"name": "five-whys"}, result=view("five-whys", SKILL_DONE),
+                        session_id="s1", turn_id="t1")
+    plug.pre_llm_call(session_id="s1", user_message="whats up?", turn_id="t2")
+    plug.post_llm_call(session_id="s1", assistant_response="working on it", turn_id="t2")
+    plug.pre_llm_call(session_id="s1", user_message="no, that's the wrong host", turn_id="t3")
+    core.flush(home, now=core.time.time() + core.GRACE_S + 1)
+    (r,) = lines(home)
+    assert r["turn_id"] == "t1" and r["interrupted"] is True
+    assert r["user_correction"] is False and r["correction_source"] == "next_message"
+    assert r["rules"] == 4
+
+
+def test_lines_before_rules_4_are_left_out_of_correction_rate():
+    t = 1000.0
+    old = {"ts": t, "host": "h", "session": "s0", "skill": "x", "user_correction": True, "rules": 3,
+           "checks_first_pass": None}
+    assert core.rollup([old], t - 1, t + 1)[0]["correction_rate"] is None

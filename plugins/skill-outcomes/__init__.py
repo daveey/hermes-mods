@@ -38,7 +38,10 @@ def _load_core():
 
 core = _load_core()
 _lock = threading.Lock()
-_loads: dict[str, dict[str, dict]] = {}  # session -> skill -> {skill, ts, has_done_means}
+_loads: dict[str, dict[str, dict]] = {}  # session -> skill -> {skill, ts, has_done_means, turn_id}
+# session -> turn_id of its live turn (from pre_llm_call). A background-review or side-question fork shares the
+# parent's session_id but runs its own turn_id and fires no pre/post_llm_call: its skill_views are not uses.
+_live_turn: dict[str, str] = {}
 _last_sweep = [0.0]
 _warned: set = set()
 
@@ -93,9 +96,16 @@ def _sweep(now: float | None = None) -> None:
         _warn("sweep", exc)
 
 
-def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "", **_):
+def _fork_call(session_id: str, turn_id: Any) -> bool:
+    """A tool call from a turn other than the session's live one: a detached fork (background review)."""
+    live = _live_turn.get(session_id)
+    return bool(live and turn_id and str(turn_id) != live)
+
+
+def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "",
+                   turn_id: Any = "", **_):
     try:
-        if tool_name != "skill_view" or not session_id:
+        if tool_name != "skill_view" or not session_id or _fork_call(session_id, turn_id):
             return None
         a = _args(args)
         if a.get("file_path"):
@@ -109,15 +119,18 @@ def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, se
         with _lock:
             _loads.setdefault(session_id, {}).setdefault(
                 skill, {"skill": skill, "ts": time.time(), "has_done_means": core.has_done_means(d["content"]),
-                        "checks_expected": core.count_done_means(d["content"])})
+                        "checks_expected": core.count_done_means(d["content"]),
+                        "turn_id": str(turn_id or "") or None})
     except Exception as exc:
         _warn("post_tool_call", exc)
     return None
 
 
-def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "", **_):
+def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "",
+                          turn_id: Any = "", **_):
     try:
-        if tool_name != "skill_view" or not isinstance(result, str) or core.MARK in result:
+        if tool_name != "skill_view" or not isinstance(result, str) or core.MARK in result or \
+                _fork_call(session_id, turn_id):
             return None
         a = _args(args)
         if a.get("file_path"):
@@ -159,8 +172,17 @@ def _display_kind(history: Any) -> Any:
 
 
 def pre_llm_call(session_id: str = "", user_message: Any = None, conversation_history: Any = None,
-                 parent_session_id: Any = "", **_):
+                 parent_session_id: Any = "", turn_id: Any = "", **_):
     try:
+        if session_id:
+            with _lock:
+                # loads left from a turn whose post_llm_call never fired (interrupted, crashed) are that turn's
+                # uses: record them now so this message, not a later one, closes their window
+                stale = list((_loads.pop(session_id, None) or {}).values())
+                if turn_id:
+                    _live_turn[session_id] = str(turn_id)
+            if stale:
+                core.record_turn(None, session_id, stale, "", turn_id=stale[0].get("turn_id"), interrupted=True)
         # a subagent's user turns are its parent agent's prompts, never the user's reply
         if session_id and isinstance(user_message, str) and not parent_session_id:
             core.note_user_message(None, session_id, user_message,

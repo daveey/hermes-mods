@@ -31,7 +31,8 @@ IDLE_S = 2 * 3600  # no next user message within this long (Kanban, cron, abando
 COACH_EVENTS = {"selfheal_detect": {"complaint", "backstop"}, "lesson": None}
 # rules < 2 closed the window on machine notices and matched coach by time window only; rules 2 missed real replies
 # while a reloaded gateway paired new hooks with a cached old core. rules 3 also reads the reply from state.db.
-RULES = 3
+# rules 4 drops background-review fork skill_views and closes an interrupted turn's uses at the next message.
+RULES = 4
 
 # `Done means (five-whys): 4/5 first pass, 1 fix round; still failing: ...`
 TICK_RE = re.compile(
@@ -223,7 +224,7 @@ def _locked(home: Any = None):
 
 
 def record_turn(home: Any, session: str, loads: Iterable[dict], reply: str, now: Optional[float] = None,
-                turn_id: Any = None) -> list:
+                turn_id: Any = None, interrupted: bool = False) -> list:
     """Turn end: one pending record per skill loaded this turn, with the reply's Done-means tick-off."""
     now = time.time() if now is None else now
     ticks = parse_tickoffs(reply or "")
@@ -241,7 +242,7 @@ def record_turn(home: Any, session: str, loads: Iterable[dict], reply: str, now:
             # the reply's tick-off total must match the skill's list; a mismatch marks an unreliable tick-off
             "tickoff_mismatch": (t["total"] != ld["checks_expected"]) if t and ld.get("checks_expected") else None,
             "turn_id": str(turn_id) if turn_id is not None else None, "turn_end": round(now, 3),
-            "next_user_ts": None, "next_user": None})
+            "next_user_ts": None, "next_user": None, **({"interrupted": True} if interrupted else {})})
     if recs:
         with _locked(home) as box:
             box["data"].extend(recs)
@@ -311,6 +312,35 @@ def db_next_user(home: Any, session: str, after: float) -> Optional[tuple]:
     return None
 
 
+def db_view_missing(home: Any, session: str, skill: str, ts: float, window: float = 120.0) -> bool:
+    """True when <home>/state.db holds this session's tool rows but no `skill_view` of `skill` near `ts`: the view
+    ran in a persistence-detached fork (background review) that shares the session_id, so it is not a use."""
+    p = home_dir(home) / "state.db"
+    if not session or not skill or not p.exists():
+        return False
+    try:
+        con = _ro_connect(p, timeout=2)
+        try:
+            if not con.execute("SELECT 1 FROM messages WHERE session_id=? AND role='tool' AND tool_name IS NOT NULL "
+                               "LIMIT 1", (session,)).fetchone():
+                return False  # nothing persisted for this session to judge against
+            rows = con.execute("SELECT content FROM messages WHERE session_id=? AND role='tool' AND "
+                               "tool_name='skill_view' AND timestamp BETWEEN ? AND ?",
+                               (session, ts - window, ts + window)).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return False
+    for (content,) in rows:
+        try:
+            d, _ = json.JSONDecoder().raw_decode(content or "")
+        except Exception:
+            continue
+        if isinstance(d, dict) and str(d.get("name") or "") == skill:
+            return False
+    return True
+
+
 def _finalize(home: Any, r: dict) -> dict:
     out = {k: v for k, v in r.items() if k not in ("next_user", "next_user_ts", "turn_end", "reopened")}
     out["rules"] = RULES
@@ -349,6 +379,8 @@ def flush(home: Any = None, now: Optional[float] = None, force: bool = False) ->
             nu_ts = r.get("next_user_ts")
             due = force or (nu_ts is not None and now - nu_ts >= GRACE_S) or \
                 (nu_ts is None and now - float(r.get("turn_end") or 0) >= IDLE_S)
+            if due and db_view_missing(home, r.get("session") or "", r.get("skill") or "", float(r.get("ts") or 0)):
+                continue  # the transcript has no such view: a detached fork's, not a use; dropped
             (done if due else keep).append(r)
         if done:
             lp = log_path(home)
