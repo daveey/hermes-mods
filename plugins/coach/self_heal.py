@@ -1700,6 +1700,28 @@ def kanban_trigger_closed(d: dict, home: Optional[Path] = None, now: Optional[fl
     return "trigger card " + ", ".join(got) if got else None
 
 
+def _monitor_withdrawn(d: dict) -> Optional[str]:
+    """Why the monitor that queued this finding no longer stands by it, else None. A detector fix must retract the
+    findings it already queued (agent-ea7ff00170: ask-gate rows queued 32 min before the classifier learned that
+    injected Kanban prompts are not David, then refiled as 39 Opus cards). Only positive evidence drops a row: the
+    stored quote is truncated, so "no pattern matched" proves nothing; "the quote is a generated prompt" does.
+    Any import failure files the row as before."""
+    if d.get("monitor") != "ask-gate" or not d.get("quote"):
+        return None
+    try:
+        import importlib.util
+        p = (Path(__file__).resolve().parents[2] / "skills" / "productivity" / "hermes-coach" / "scripts"
+             / "coach_askgate.py")
+        spec = importlib.util.spec_from_file_location("_selfheal_askgate", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if mod.generated(d["quote"]):
+            return "monitor no longer flags (ask-gate): quote is a generated prompt, not David"
+    except Exception:
+        return None
+    return None
+
+
 def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
     """Recheck due investigations through normal admission, never automatically release a card.
 
@@ -1725,8 +1747,8 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                            "why": f"stale pending (detected {_iso(at)}, > {PENDING_MAX_AGE_S // 86400}d)"})
                 out.append({"action": "skip", "why": "stale pending"})
                 continue
-            closed = kanban_trigger_closed(d, now=now)
-            if closed:  # the owner closed the card while this waited: nothing is broken any more
+            closed = kanban_trigger_closed(d, now=now) or _monitor_withdrawn(d)
+            if closed:  # the owner closed the card, or the monitor withdrew its verdict, while this waited
                 with db:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
                 store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp, "why": closed})

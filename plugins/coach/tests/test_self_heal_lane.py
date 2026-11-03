@@ -1890,3 +1890,22 @@ def test_admission_hook_passes_the_repeated_error_as_evidence(store, monkeypatch
     assert "disk I/O error" in got[0]["quote"] and "terminal(" in got[0]["quote"]
     (det,) = ev(store, "selfheal_detect")
     assert "disk I/O error" in det["evidence"]
+
+
+def test_queued_ask_gate_row_the_classifier_now_calls_generated_is_dropped_not_filed(store):
+    """agent-ea7ff00170: a detector fix retracts findings it already queued. Generated prompts (a Kanban card body,
+    an attention-router JSON item) are dropped; a real complaint and non-ask-gate rows still file."""
+    card = defect(symptom="card prompt", monitor="ask-gate",
+                  quote="# Kanban task t_01a184cee94603eb: Standing: support Eve on Ask Eve Assignee: default\u2026")
+    router = defect(symptom="router item", monitor="ask-gate",
+                    quote='{"item": {"person": "david", "kind": "hub_signin", "title": "Sign in"\u2026')
+    real = defect(symptom="real complaint", monitor="ask-gate", quote="why do you keep asking me, do it yourself")
+    other = defect(symptom="no monitor", quote="# Kanban task t_0000000000000000: x")
+    _queue(store, card, router, real, other)
+    got = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d["symptom"]) or {"action": "filed"})
+    assert sorted(got) == ["no monitor", "real complaint"]
+    skips = {e["fingerprint"]: e["why"] for e in ev(store, "selfheal_skip")}
+    assert "monitor no longer flags (ask-gate)" in skips[card["fingerprint"]]
+    assert "monitor no longer flags (ask-gate)" in skips[router["fingerprint"]]
+    assert sh.retry_deferred(store, now=NOW + 7200, filer=lambda *a, **k: pytest.fail("resurrected")) == []
