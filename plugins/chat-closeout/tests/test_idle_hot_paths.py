@@ -222,6 +222,19 @@ def test_unseen_counts_unreadable_board_raises_and_retries(tmp_path, monkeypatch
     assert core.unseen_counts([path], KINDS) == {'chat': 1}  # the failure was not cached
 
 
+def _hermes_cli_package(monkeypatch):
+    """Core's ``hermes_cli`` package, or an empty stand-in when no core is importable (plugin-suites CI has none):
+    these two tests fake ``kanban_session_activity`` entirely, so they only need a package to hang it on."""
+    try:
+        import hermes_cli
+    except ModuleNotFoundError:
+        import types
+        hermes_cli = types.ModuleType('hermes_cli')
+        hermes_cli.__path__ = []
+        monkeypatch.setitem(sys.modules, 'hermes_cli', hermes_cli)
+    return hermes_cli
+
+
 def test_plugin_unseen_counts_never_compute_the_activity_projection(tmp_path, monkeypatch):
     path = tmp_path / 'kanban.db'
     _board(path)
@@ -231,7 +244,7 @@ def test_plugin_unseen_counts_never_compute_the_activity_projection(tmp_path, mo
         raise AssertionError('_all_counts must not run: its remote-links refresh dominated idle CPU')
     ksa = types.SimpleNamespace(UNSEEN_KINDS=KINDS, _board_db_paths=lambda: [path], _all_counts=boom)
     monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity', ksa)
-    import hermes_cli
+    hermes_cli = _hermes_cli_package(monkeypatch)
     monkeypatch.setattr(hermes_cli, 'kanban_session_activity', ksa, raising=False)
     assert plugin._unseen_counts() == {'chat': 1}
     ksa._board_db_paths = lambda: [path, tmp_path / 'gone.db']
@@ -242,7 +255,7 @@ def test_plugin_unseen_counts_fall_back_on_an_older_core(tmp_path, monkeypatch):
     import types
     ksa = types.SimpleNamespace(_all_counts=lambda: ({}, {}, {'chat': 3}, {}))
     monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity', ksa)
-    import hermes_cli
+    hermes_cli = _hermes_cli_package(monkeypatch)
     monkeypatch.setattr(hermes_cli, 'kanban_session_activity', ksa, raising=False)
     assert plugin._unseen_counts() == {'chat': 3}
 

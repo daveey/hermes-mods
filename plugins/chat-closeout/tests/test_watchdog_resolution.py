@@ -23,7 +23,8 @@ def incident(monkeypatch):
         monkeypatch.setenv('HERMES_HUB_STATE', str(home / 'hub'))
         for name in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_TASK'):
             monkeypatch.delenv(name, raising=False)
-        import hermes_cli
+        # Core-backed: skip, like the suite's other real-board tests, when no core checkout is importable.
+        hermes_cli = pytest.importorskip('hermes_cli', reason='needs a core checkout (HERMES_CORE_SOURCE)')
         # Core's top-level helpers (hermes_state, hermes_dir_acl) live beside the hermes_cli package.
         monkeypatch.syspath_prepend(os.environ.get('HERMES_CORE_SOURCE') or str(Path(hermes_cli.__file__).parents[1]))
         from hermes_cli import kanban_db as kb
