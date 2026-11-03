@@ -83,6 +83,10 @@ metadata:
      when core supports `triggers:`; until then it is inert. On the 30 weakest skills, a description rewrite alone
      raised recall 0.67 -> 0.73; adding triggers raised it to 0.83, at about 72 index tokens per skill.
    - Fix a collision with mutual `not_for` lines naming each other, or merge the two skills.
+   - Low recall on a skill that used to be an umbrella router: its session-mined asks were mined while it routed
+     everything, so they now belong to its sub-skills. Narrow it (drop the duplicate routing table and any
+     "load X first" hop), move each such ask to the owning skill's card, keep it as a near-miss on the old one,
+     and record the move in the card (`rescoped:`); that is a scope change, not editing a test to pass.
 10. Finish: commit and sync per `hermes-mods-repo` (public skills in hermes-mods, everything else via
    `hermes-sync run`), then report a short table: what changed, what was recovered, what needs the user.
 
