@@ -81,6 +81,18 @@ def row_matches(row: dict, tool_name: str, args: dict, result: str) -> bool:
     return True
 
 
+def _calls(tool_name: str, args: dict) -> list[tuple[str, dict]]:
+    """(name, args) pairs a call stands for. A deferred-tool bridge call (`tool_call`, `calls: [{name, arguments}]`)
+    also stands for each inner call, so a row keyed on `inbox_post` fires whether or not core re-runs the hook
+    for the inner call with its own name (once-per-session dedupe keeps it to one injection)."""
+    out = [(tool_name, args)]
+    if tool_name == "tool_call":
+        for c in args.get("calls") or []:
+            if isinstance(c, dict) and isinstance(c.get("name"), str):
+                out.append((c["name"], _args(c.get("arguments"))))
+    return out
+
+
 # ---------------------------------------------------------------- skills
 def _skill_dirs() -> list[Path]:
     dirs = [_home() / "skills"]
@@ -196,8 +208,9 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
             return None
         sid = session_id or "_"
         extra = []
+        calls = _calls(tool_name, a)
         for row in load_rows():
-            if not row_matches(row, tool_name, a, result):
+            if not any(row_matches(row, n, ca, result) for n, ca in calls):
                 continue
             with _lock:
                 if row["id"] in _fired.get(sid, ()):

@@ -29,13 +29,39 @@ Use the minter.
 
 noise
 """
-ORCH = "intro\n\n**Card bodies for this user** (he reviews the board): spec path.\nsecond line.\n\nunrelated\n"
+ORCH = ("intro\n\n**Card bodies for this user** (he reviews the board): spec path.\nsecond line.\n\n"
+        "**Card mechanics for this user**: notify-subscribe on an unlinked card.\n\nunrelated\n")
+ASK = """# Asking
+
+## Commands that need the user
+
+- run_in_user_terminal, never paste.
+
+## Chrome steps
+
+- browser_focus first.
+
+## Another Mac's GUI
+
+- remote_approve_dialog first.
+
+## Inbox posts
+
+- ask={interaction, why_human, action}.
+
+## Done means
+
+- tick
+"""
+MODS = "# mods\n\n## Git worktrees\n\n- add owns remove.\n\n## Other\n\nnoise\n"
+REPO = P.parents[1]
 
 
 @pytest.fixture(autouse=True)
 def env(tmp_path, monkeypatch):
     home = tmp_path / "h"
-    for n, body in (("token-broker", SKILL), ("kanban-orchestrator", ORCH)):
+    for n, body in (("token-broker", SKILL), ("kanban-orchestrator", ORCH), ("asking-the-user", ASK),
+                    ("hermes-mods-repo", MODS)):
         d = home / "skills" / "devops" / n
         d.mkdir(parents=True)
         (d / "SKILL.md").write_text(body)
@@ -63,6 +89,7 @@ def test_no_match():
 def test_tool_name_and_bold_paragraph():
     out = run("kanban_create", {"title": "x"})
     assert "spec path" in out and "second line" in out and "unrelated" not in out
+    assert "notify-subscribe on an unlinked card" in out
 
 
 def test_result_regex_cloudflare():
@@ -112,3 +139,67 @@ def test_shipped_table_matches_real_skills():
     rows = st.load_rows(user_path=P / "nonexistent.yaml")
     ids = {r["id"] for r in rows}
     assert {"token-broker-command", "kanban-card-asks", "cloudflare-auth-error"} <= ids
+
+
+@pytest.mark.parametrize("tool,want,not_want", [
+    ("run_in_user_terminal", "never paste", "browser_focus first"),
+    ("browser_focus", "browser_focus first", "never paste"),
+    ("remote_approve_dialog", "remote_approve_dialog first", "Inbox"),
+    ("remote_screenshot", "remote_approve_dialog first", "Inbox"),
+    ("remote_input", "remote_approve_dialog first", "Inbox"),
+    ("remote_screen_hosts", "remote_approve_dialog first", "Inbox"),
+    ("inbox_post", "why_human", "never paste"),
+])
+def test_asking_the_user_rows(tool, want, not_want):
+    out = run(tool, {})
+    assert out and st.MARK in out and "asking-the-user" in out and want in out and not_want not in out
+    assert "tick" not in out
+
+
+def test_deferred_bridge_call_matches_inner_tool():
+    out = run("tool_call", {"calls": [{"name": "inbox_post", "arguments": {"title": "t"}}]})
+    assert out and "why_human" in out
+    # the inner call re-running the hook under its own name must not inject twice
+    assert run("inbox_post", {"title": "t"}) is None
+
+
+def test_bridge_call_inner_terminal_command():
+    out = run("tool_call", {"calls": [{"name": "terminal", "arguments": json.dumps({"command": "token-broker scopes"})}]})
+    assert out and "Never run approve" in out
+
+
+def test_bridge_call_other_tool_no_match():
+    assert run("tool_call", {"calls": [{"name": "web_search", "arguments": {}}]}) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "git worktree add --detach ../wt origin/main",
+    "git -C ~/code/hermes-mods worktree add ~/code/mods-work origin/main",
+    "for b in a b; do git worktree add ../$b $b; done",
+])
+def test_worktree_add_row(cmd):
+    out = run("terminal", {"command": cmd})
+    assert out and "add owns remove" in out and "noise" not in out
+
+
+@pytest.mark.parametrize("cmd", ["git worktree list", "git worktree remove ../wt", "echo worktreeadd"])
+def test_worktree_row_ignores_other_commands(cmd):
+    assert run("terminal", {"command": cmd}) is None
+
+
+def test_worktree_add_in_execute_code():
+    out = run("execute_code", {"code": "terminal('git worktree add ../x origin/main')"})
+    assert out and "add owns remove" in out
+
+
+def test_shipped_rows_for_this_repos_skill_resolve():
+    """Rows naming the public asking-the-user skill extract every section from the real SKILL.md in this repo."""
+    rows = [r for r in st.load_rows(user_path=P / "nonexistent.yaml") if r["skill"] == "asking-the-user"]
+    assert {r["id"] for r in rows} == {"user-terminal-handoff", "chrome-focus-handoff", "remote-mac-gui",
+                                       "inbox-post-shape"}
+    text = (REPO / "skills" / "productivity" / "asking-the-user" / "SKILL.md").read_text()
+    for r in rows:
+        for sec in r["sections"]:
+            assert st.extract_section(text, sec), (r["id"], sec)
+    inj = st.build_injection(rows[0], dirs=[REPO / "skills"])
+    assert inj and st.MARK in inj
