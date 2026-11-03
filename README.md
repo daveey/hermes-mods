@@ -33,6 +33,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 ## What isn't a plugin
 
 - **[Process safety](tools/process-safety/)**: Linux owned-session scheduling fault injection and an opt-in systemd user GPG SSH-agent health timer, with regression tests.
+- **[Skill trigger eval](tools/skill-trigger-eval/)**: replays natural asks against the real skills index (rendered by core's own prompt builder) and scores whether the right skill loads: recall, false loads, collisions; compares description formats and their prompt cost.
 
 - **[core/](core/)**: my changes to Hermes's own source: keyboard shortcuts, multi-gateway projects,
   session takeover, fork-friendly `hermes update`, and more. There's one doc per feature (behavior,
