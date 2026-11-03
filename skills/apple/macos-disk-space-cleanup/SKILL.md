@@ -7,7 +7,7 @@ description: Use when a Mac is low on disk. Find, clean, ask first.
 
 ## Procedure
 
-1. **Measure the right volume.** Run `df -h / /System/Volumes/Data`. User data lives on the Data volume (`disk3s5`), so ignore the sealed `/` capacity figure. `diskutil apfs list` shows usage per volume, including Preboot and VM.
+1. **Look: measure the right volume.** Run `df -h / /System/Volumes/Data`. User data lives on the Data volume (`disk3s5`), so ignore the sealed `/` capacity figure. `diskutil apfs list` shows usage per volume, including Preboot and VM.
 2. **Find the big consumers** in a single call: `du -sh ~/* ~/.[!.]* | sort -rh | head -25`. Then drill into `~/Library/{Application Support,Containers,Caches,Group Containers}`, `~/.local/share`, `~/.cache`, `~/code`, `/Applications`, `/opt`, `/usr/local` and `/private/tmp`.
    - `du` usually accounts for 30–40 GB less than the volume reports. That gap is system data, purgeable space or snapshots that can't be read without sudo. Mention it, but don't chase it.
    - For VM disk images, check `du -sh`, not `ls -l`. Files like Docker.raw and podman `*.raw` are sparse: `ls` shows the maximum size (30–64 GB), while `du` shows what is actually on disk.
@@ -25,7 +25,15 @@ description: Use when a Mac is low on disk. Find, clean, ask first.
    - Leftovers from retired services: LaunchAgent plists (including `LaunchAgents/disabled/`), their `~/Library/Logs/<label>` dirs and helper scripts. Confirm with `launchctl list` that nothing is loaded.
 5a. **Check for an external drive** (`diskutil list external`, `df -h | grep Volumes`). If one has free space, offer to *move* stale repos and archives there rather than delete them. Find stale repos by last commit date with `git log -1 --format=%cs`.
 5. **Ask once before deleting app state, VMs or work dirs.** Use a single multi-select `clarify` question. Each option gives the size and what happens if it's deleted, e.g. 'redownloads when used', 'rebuilt on next CI job', 'old images and volumes lost'. Never touch the user's own project data, source trees or running VM disks without asking.
-6. **Re-run `df`** and report the before and after free space, what was deleted, what failed and the fix, what is still large, and what will fill back up.
+6. **Re-run `df`** and report.
+7. **Check Done means** (below), fix at most 2 rounds, then report what still fails.
+
+## Done means
+- [ ] The report gives before and after free space from `df -h /System/Volumes/Data` run in this turn?
+- [ ] The free-space trend (step 3, MB per 90 s) was sampled before any cleanup and is in the report?
+- [ ] Nothing beyond step 4's safe list (app state, VMs, work dirs, Trash) was deleted without a yes to the clarify?
+- [ ] Each failed command is listed with its fix (uv lock, npm EACCES, ...)?
+- [ ] The report names what is still large and what will fill back up?
 
 ## Targeted screenshot cleanup
 

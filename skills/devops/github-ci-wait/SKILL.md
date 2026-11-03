@@ -13,6 +13,8 @@ metadata:
 
 ## Rule
 
+**Look first:** the exact sha from `git`/`gh` output, the repo's AGENTS.md (it may name its own wait wrapper), and `--once`.
+
 Never write your own watcher that follows "the newest run" (`gh run list -L 1`) or one specific run id
 (`gh run watch <id>`). On a busy branch, concurrency groups replace pending runs and most end `cancelled`.
 The run that actually builds your commit is often one started by someone else's later push. Newest-run
@@ -99,6 +101,14 @@ How to run it from an agent:
 - If `gh run view --log` omits completed reusable-workflow jobs or `--job ID --log` returns empty with exit 0, fetch `gh api repos/OWNER/REPO/actions/jobs/ID/logs` directly before concluding logs are unavailable. A file-level all-pass summary plus the shard's `flaky_kanban: 0 flaky test id(s)` can prove first-attempt success when the runner does not print individual passing node IDs; verify the target exists in that run's source revision.
 - Don't cancel another session's queued run to get yours through: the queued run will contain your
   commit too.
+- Last: check Done means (below), fix at most 2 rounds, then report what still fails.
+
+## Done means
+- [ ] The sha was copied from `git`/`gh` output, and `--once` ran with the same arguments before any "waiting on CI"?
+- [ ] The wait is `wait_for_ci.py` (background+notify in chat; `--once` + `kanban_continue` in Kanban), never a newest-run or `gh run watch` loop?
+- [ ] No filter pipe hides the wait's exit status (`| tail`/`| grep` only under `set -o pipefail`)?
+- [ ] The report cites the run URL or tag the script printed, marked "ran on a later commit" when it did?
+- [ ] On exit 1, the failing run's logs were read (`--log-failed` or the jobs API) before a cause was named?
 
 ## Batch acceptance: several PRs, one suite
 

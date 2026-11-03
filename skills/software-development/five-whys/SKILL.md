@@ -31,6 +31,8 @@ two-line chain; an outage gets the full write-up.
 
 ## Procedure
 
+**Look first:** the failing log/error, the card, alert or CI run that reported it, and recent commits and cards on it.
+
 ### 0. Establish scope and the evidence gate
 
 **By default the analysis ends in a fix.** When the user has standing approval to fix and ship (David does), fixing what
@@ -244,6 +246,15 @@ Countermeasures:
 - deferred: <card/issue link, if any>
 ```
 
+### 8. Check Done means (below), fix at most 2 rounds, then report what still fails
+
+## Done means
+- [ ] Every why cites evidence (log line, test, `file:line`, commit, metric) or is labelled `(hypothesis)`?
+- [ ] The write-up has both `Root (happened)` and `Root (not caught)`, and neither is "human error", "flaky" or "transient"?
+- [ ] A `Recurrence:` line names the earlier occurrence it searched for (or says first time)?
+- [ ] Every countermeasure has a `proof:` (test fails before/passes after, command output) or a card/issue link?
+- [ ] The chain is posted where the fix lives (PR body, issue, card comment), not only in chat?
+
 ## Blameless
 
 The method looks for broken processes, not people to blame. When an answer names a person or agent ("Sam skipped
@@ -326,7 +337,6 @@ Countermeasures:
 - Stopping at the first fact that sounds technical. "The pump shaft was worn" is a fact, not the root.
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
-- Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
 - Checking for a parallel fix only during diagnosis. Right before you implement, fetch the repo, read its branch log
   since the incident and search open cards on every board for the same symptom: another session reading the same
   logs often lands the fix first. If one did, run your tests against its commit instead of pushing a second fix.
