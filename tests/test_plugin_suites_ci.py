@@ -161,6 +161,13 @@ class ChangedPaths(unittest.TestCase):
             moved = git("rev-parse", "HEAD")
             self.assertEqual(mod.changed_paths(Path(d), moved, "pr"), ["plugins/x/f.py"])
             self.assertEqual(mod.changed_paths(Path(d), base, "pr"), ["plugins/x/f.py"])
+            # A break then its revert nets to no diff, but the suite it touched must still run.
+            git("checkout", "-q", "pr")
+            Path(d, "plugins", "y").mkdir(parents=True)
+            Path(d, "plugins", "y", "t.py").write_text("break")
+            git("add", "."), git("commit", "-qm", "break y")
+            git("rm", "-q", "plugins/y/t.py"), git("commit", "-qm", "revert y")
+            self.assertEqual(mod.changed_paths(Path(d), moved, "pr"), ["plugins/x/f.py", "plugins/y/t.py"])
 
 
 class Summary(unittest.TestCase):
@@ -181,7 +188,7 @@ class Summary(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertRegex(text, r"plugins/a\s+3\.11\.9\s+PASS\s+5\s+0\s+0\s+2")
             self.assertRegex(text, r"TOTAL\s+3\.11\.9\s+3 suites\s+8\s+1\s+0\s+2")
-            self.assertIn("::error title=plugins/b failed on Python 3.11.9::", text)
+            self.assertIn("::error title=plugins/b failed on Python 3.11.9::plugins/b FAIL on Python 3.11.9: 1 failed", text)
             self.assertIn("suite skipped: tests/integration_f3: needs a core checkout", text)
             self.assertIn("| plugins/b | 3.11.9 | FAIL | 3 | 1 | 0 | 0 |", Path(d, "summary.md").read_text())
             res.write_text(json.dumps({"python": "3.14.0", "suites": [
