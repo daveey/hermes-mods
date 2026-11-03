@@ -68,6 +68,12 @@ say what's running, never what needs the user.
 
 - Stalled card: read its log (`hermes kanban log <id>`), then `kanban_comment` with the next step,
   `reclaim` a dead claim, or unblock it if the blocker is gone. Fix it yourself when it is small.
+  Before explaining a `ready` card as "waiting for a slot", read the live capacity. Compare the latest
+  `kanban dispatcher: max_in_progress=N` line in `~/.hermes/logs/gateway.log` against running counts
+  summed across every board DB. Also grep that log for `dispatch held for a core update drain`, or check
+  for `~/.hermes/core-update/drain-hold`. Remembered capacity goes stale, and a drain holds every spawn
+  however many slots are free. A `scheduled` card whose awaited review or parent just finished can be
+  `kanban_unblock`ed at once instead of waiting out its wake interval.
 - For a completion sweep ("get all sessions green"), inspect each remaining deliverable and why it stopped,
   then resolve authorized asks and resume concrete work. If a recipient only relays the instruction back,
   direct it to produce the missing artifact in its own session; a coordination reply is not execution.
