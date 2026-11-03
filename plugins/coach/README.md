@@ -91,7 +91,11 @@ It reads only text addressed to a human (`block_text(..., human_only=True)`): re
 human_request, and a `kanban_create` only when it is created blocked or carries a human_request (body + request). A
 card that runs at once is a worker's brief, never an ask to David: a running plan card listing "compute quote and
 approval stages A/B/C" was held as a spend ask (`tests/test_compute_envelope_audience.py`). compute_authority still
-reads every card body, but not a create's human_request (that is the ask itself).
+reads every card body, but not a create's human_request (that is the ask itself). On a `kanban_block` it reads the
+reason, and the human_request unless the answer decides over-envelope compute: when its consequence clauses
+(`Unblock = ...`, `archive: ...`, `Yes = ...`, or `choices`) name a figure above the cap or multi-GPU, that compute is
+the question put to David, not a declaration (`tests/test_compute_block_human_request.py`). A cap in the reason, or
+beside an answer that decides no compute ("Unblock = continue"), is still held.
 **Compute authority (`compute_envelope.py`; same hook, rule `compute_authority`).**
 The other side of the envelope holds agent-declared GPU/rental caps above $25 or multi-GPU plans once,
 including `kanban_create.body`, direct/deferred `kanban_block`, the reply's `pre_final_gate` and its

@@ -71,7 +71,7 @@ SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?!])[\"'”*)\]]*\s+|\n+")
 # holds 2026-11-03: a review quoting proposed AGENTS.md wording ("A spend/change ask (card, clarify or reply) ..."),
 # a card body describing this detector. A quote right after "reply"/"say"/"type" is the answer the agent asks for
 # ('Reply "approve $20"'), and a directive attribute (t="...") is the agent's own text, so those stay.
-MENTION_SPAN_RE = re.compile(r"```.*?(?:```|\Z)|^[ \t]*>[^\n]*|`[^`\n]*\s[^`\n]*`|"
+MENTION_SPAN_RE = re.compile(r"```.*?(?:```|\Z)|^[ \t]*>[^\n]*|`[^`\n]*`|"
                              r"\"[^\"\n]{0,600}\"|\u201c[^\u201d\n]{0,600}\u201d", re.S | re.M)
 ANSWER_CUE_RE = re.compile(r"\b(?:reply|say|type|answer|respond|send|write)(?:\s+(?:with|back|me|us))?[\s*_:]*$", re.I)
 
@@ -85,6 +85,12 @@ def unquoted(text: str) -> str:
         # `::user-step{t="..."}` carries the agent's own ask as an attribute value.
         if m.group(0)[0] in "\"\u201c" and (ANSWER_CUE_RE.search(before) or before.endswith("=")):
             return m.group(0)
+        # Inline code pairs left to right; a one-token span (`choices`, `$3000`) is an identifier and stays. Matching
+        # only spans with whitespace paired the closing tick of `choices` with the next opening one and blanked the
+        # prose between (live 2026-11-03, a card body: "(`Unblock = …`, `Archive = …`, `choices`) describe ...").
+        g = m.group(0)
+        if g[0] == "`" and not g.startswith("```") and not re.search(r"\s", g):
+            return g
         return " " if "\n" not in m.group(0) else "\n"
     return MENTION_SPAN_RE.sub(sub, text)
 
@@ -231,7 +237,8 @@ DECLARED_RE = re.compile(r"\b(?:i|we)\s+(?:have\s+|had\s+)?approved?\b|"
 ASK_TALK_RE = re.compile(r"\bask(?:s|ed|ing)?\b", re.I)
 RULE_TALK_RE = re.compile(
     r"\bcoach\b|\bdetectors?\b|\bAGENTS\.md\b|\brules?\b|\bwording\b|\bsentences?\b|"
-    r"\b(?:existing|new|regression|unit) tests?\b|\b(?:is|are|still|be|gets?) held\b", re.I)
+    r"\b(?:existing|new|regression|unit) tests?\b|\btests?/\S+\.py\b|\btest_\w+|\bfixtures?\b|"
+    r"\b(?:is|are|still|be|gets?) held\b", re.I)
 # The agent committing itself ("I will", "I'll", "I've set", "we are setting"): rule talk around it does not excuse it.
 COMMITMENT_RE = re.compile(r"\b(?:I|we)(?:\s+(?:will|have|am|are)|['\u2019](?:ll|ve|m|re))?\s+(?:set|setting)\b|"
                            r"\b(?:I|we)\s+will\b|\b(?:I|we)['\u2019]ll\b", re.I)
@@ -395,6 +402,31 @@ def _hr_text(a: dict) -> str:
         if isinstance(hr, dict) else ""
 
 
+# A human_request action's consequence clause: what David's answer does ("Unblock = run ...", "archive: stop",
+# "Yes = rent ..."). It runs to the next ";", sentence end or the next such clause.
+CONSEQUENCE_RE = re.compile(
+    r"\b(?:unblock(?:ing)?|archiv(?:e|ing)|yes|no|approv(?:e|al|ing)|declin(?:e|ing)|deny|silence)\s*"
+    r"(?:=|:|\u2192|->|means\b)\s*(.*?)(?=;|(?<=[.?!])\s|\n|\b(?:unblock|archive|yes|no)\s*(?:=|:|\u2192|->)|$)",
+    re.I | re.S)
+
+
+def _decides_over_envelope(hr: Any) -> bool:
+    """True when the human_request's answer decides over-envelope compute: its consequence clauses (or `choices`)
+    name a figure above the envelope or multi-GPU. Then that compute is the question put to David, not an agent
+    declaration. Live false hold 2026-11-03 (hub, kanban_block): "Unblock = run the full 44K SFT on 8xH100
+    (~$150-250)" was read as the agent setting itself a multi-GPU run."""
+    if not isinstance(hr, dict):
+        return False
+    said = [m.group(1) for m in CONSEQUENCE_RE.finditer(str(hr.get("action") or ""))]
+    for c in hr.get("choices") or ():
+        if isinstance(c, dict):
+            said += [str(c.get("label") or ""), str(c.get("value") or "")]
+    for s in said:
+        if any(v > envelope_usd() for v in totals(s)) or AUTH_MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", s)):
+            return True
+    return False
+
+
 def _addressed_to_human(a: dict) -> bool:
     """A kanban_create a human reads as an ask: created blocked, or carrying a human_request. Any other card runs at
     once and its body is a worker's brief, never a message to David."""
@@ -410,6 +442,8 @@ def block_text(tool_name: str, args: Any, human_only: bool = False) -> str:
     compute_authority reads every card body (human_only False): a worker brief can still declare a cap. A create's
     human_request is read only as an ask: it is the ask itself, and its action line says what unblock does
     ("Unblock = run the full SFT on 8xH100"), which compute_authority would read as the agent declaring multi-GPU.
+    A block's human_request is read for compute_authority unless its answer decides over-envelope compute
+    (`_decides_over_envelope`): then it is that ask, and only the reason is authority text.
     """
     a = args if isinstance(args, dict) else {}
     if tool_name == "kanban_create":
@@ -419,7 +453,10 @@ def block_text(tool_name: str, args: Any, human_only: bool = False) -> str:
             return ""
         return " \n".join(s for s in (str(a.get("body") or ""), _hr_text(a)) if s)
     if tool_name == "kanban_block":
-        return " \n".join(s for s in (str(a.get("reason") or ""), _hr_text(a)) if s)
+        # compute_authority skips a human_request whose answer decides over-envelope compute (it is the ask);
+        # the reason is always read, and so is a human_request whose answer decides no compute.
+        hr = "" if not human_only and _decides_over_envelope(a.get("human_request")) else _hr_text(a)
+        return " \n".join(s for s in (str(a.get("reason") or ""), hr) if s)
     if tool_name == "tool_call":
         parts = [block_text(str((c or {}).get("name") or ""), (c or {}).get("arguments"), human_only)
                  for c in (a.get("calls") or []) if isinstance(c, dict)]
