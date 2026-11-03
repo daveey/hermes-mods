@@ -8,7 +8,9 @@ audited, not only env routes. Driven through real core's loaders against a scrat
 No secret values: every credential file holds a placeholder."""
 import importlib
 import os
+import subprocess
 import sys
+import time
 import types
 
 import pytest
@@ -38,7 +40,8 @@ def core(monkeypatch, tmp_path):
     for name in ('hermes_constants', 'tools.env_passthrough', 'tools.credential_files', 'agent.skill_utils',
                  'agent.file_safety', 'tools.environments.docker'):
         monkeypatch.delitem(sys.modules, name, raising=False)
-        monkeypatch.setitem(sys.modules, name, pytest.importorskip(name))
+        # A plain import: a run without core on PYTHONPATH must fail, never skip this suite.
+        monkeypatch.setitem(sys.modules, name, importlib.import_module(name))
     if REAL_CORE_CREDENTIAL_FILES is None:  # pre-fix bytes have neither reader
         monkeypatch.delattr(plugin, '_core_credential_files', raising=False)
     else:
@@ -233,3 +236,142 @@ def test_dir_audit_error_fails_closed(monkeypatch, core):
     write_config(core.home, '')
     with pytest.raises(PermissionError, match='cannot verify sandbox directory mounts'):
         gate(monkeypatch)()
+
+
+# ---- review of dcef823e (neutral trace, adversarial pass): surviving findings A-F ----
+
+def skill(root, name, frontmatter=''):
+    d = root / name
+    d.mkdir(parents=True)
+    (d / 'SKILL.md').write_text(f'---\nname: {name}\ndescription: test\n{frontmatter}---\nbody\n')
+    return d
+
+
+@pytest.mark.parametrize('frontmatter', [
+    'required_environment_variables:\n  - name: PLACEHOLDER_SERVICE_TOKEN\n',
+    'required_credential_files:\n  - svc-token.json\n',
+    'prerequisites:\n  env_vars: [PLACEHOLDER_SERVICE_TOKEN]\n',
+    'setup:\n  collect_secrets:\n    - env_var: PLACEHOLDER_SERVICE_TOKEN\n'])
+def test_A_skill_that_would_register_env_or_files_refuses(monkeypatch, core, frontmatter):
+    """skill_view registers these after register() (a Slack /<skill> message reaches it)."""
+    skill(core.home / 'skills', 'svc', frontmatter)
+    write_config(core.home, '')
+    with pytest.raises(PermissionError, match='forbids skill'):
+        gate(monkeypatch)()
+
+
+def test_A_skill_in_create_dir_refuses(monkeypatch, core, tmp_path):
+    create = tmp_path / 'created'
+    skill(create, 'svc', 'required_credential_files:\n  - svc-token.json\n')
+    write_config(core.home, f"skills:\n  create_dir: '{create}'\n")
+    with pytest.raises(PermissionError, match='forbids skill'):
+        gate(monkeypatch)()
+
+
+def test_A_plain_skills_allow(monkeypatch, core, tmp_path):
+    skill(core.home / 'skills', 'plain', 'metadata:\n  tags: [x]\n')
+    write_config(core.home, '')
+    gate(monkeypatch)()
+
+
+@pytest.mark.parametrize('rel', ['.aws/credentials', '.config/gh/hosts.yml', '.ssh/id_ed25519', '.netrc',
+                                 '.git-credentials', '.docker/config.json'])
+def test_B_ordinary_credential_in_mounted_dir_refuses(monkeypatch, core, tmp_path, rel):
+    skills = tmp_path / 'other-home'
+    skill(skills, 'tool')
+    (skills / rel).parent.mkdir(parents=True, exist_ok=True)
+    (skills / rel).write_text('PLACEHOLDER\n')
+    external_dirs(core.home, str(skills))
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+def test_B_mount_root_inside_credential_dir_refuses(monkeypatch, core):
+    (core.user / '.aws').mkdir()
+    (core.user / '.aws' / 'config').write_text('[default]\n')
+    external_dirs(core.home, '~/.aws')
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+def test_B_git_config_with_token_url_refuses(monkeypatch, core, tmp_path):
+    repo = tmp_path / 'skills-repo'
+    skill(repo, 'tool')
+    (repo / '.git').mkdir()
+    (repo / '.git' / 'config').write_text('[remote "origin"]\n  url = https://x-access-token:PLACEHOLDER@example.com/r\n')
+    external_dirs(core.home, str(repo))
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+def test_B_git_config_without_credentials_allows(monkeypatch, core, tmp_path):
+    repo = tmp_path / 'skills-repo'
+    skill(repo, 'tool')
+    (repo / '.git').mkdir()
+    (repo / '.git' / 'config').write_text('[remote "origin"]\n  url = https://example.com/r.git\n')
+    external_dirs(core.home, str(repo))
+    gate(monkeypatch)()
+
+
+def test_C_twenty_thousand_files_register_quickly(monkeypatch, core, tmp_path):
+    big = tmp_path / 'big'
+    skill(big, 'tool')
+    for i in range(20):
+        d = big / 'tool' / f'd{i}'
+        d.mkdir()
+        for j in range(1000):
+            (d / f'f{j}').touch()
+    external_dirs(core.home, str(big))
+    start = time.monotonic()
+    gate(monkeypatch)()
+    assert time.monotonic() - start < 5
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root reads a 000 directory')
+def test_D_unreadable_subdir_fails_closed(monkeypatch, core, tmp_path):
+    skills = tmp_path / 'shared-skills'
+    skill(skills, 'tool')
+    (skills / 'tool' / 'locked').mkdir()
+    os.chmod(skills / 'tool' / 'locked', 0)
+    try:
+        external_dirs(core.home, str(skills))
+        with pytest.raises(PermissionError, match='cannot verify'):
+            gate(monkeypatch)()
+    finally:
+        os.chmod(skills / 'tool' / 'locked', 0o755)
+
+
+def test_E_hard_link_to_profile_env_refuses(monkeypatch, core, tmp_path):
+    skills = tmp_path / 'shared-skills'
+    skill(skills, 'tool')
+    os.link(core.home / '.env', skills / 'tool' / 'notes.txt')
+    external_dirs(core.home, str(skills))
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+def test_F_trusted_project_skills_audited_regardless_of_cwd(monkeypatch, core, tmp_path):
+    repo = tmp_path / 'proj'
+    skill(repo / '.hermes' / 'skills', 'x')
+    (repo / '.hermes' / 'skills' / 'x' / '.env').write_text(PLACEHOLDER)
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    monkeypatch.chdir(tmp_path)  # register-time cwd outside the project
+    write_config(core.home, f"skills:\n  trusted_project_dirs: ['{repo}']\n")
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+def test_hub_cache_env_refuses(monkeypatch, core):
+    (core.home / 'skills' / '.hub' / 'pkg').mkdir(parents=True)
+    (core.home / 'skills' / '.hub' / 'pkg' / '.env').write_text(PLACEHOLDER)
+    write_config(core.home, '')
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()
+
+
+def test_cache_dir_contents_are_not_walked(monkeypatch, core):
+    """Uploads are the agent's input: a user-sent file named .env must not stop registration."""
+    (core.home / 'attachments').mkdir()
+    (core.home / 'attachments' / '.env').write_text(PLACEHOLDER)
+    write_config(core.home, '')
+    gate(monkeypatch)()

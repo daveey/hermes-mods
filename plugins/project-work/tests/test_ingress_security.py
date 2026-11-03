@@ -116,6 +116,13 @@ def test_network_worker_cannot_block_durable_ingress(env, tmp_path):
     ({'env_type': 'docker', 'docker_mount_cwd_to_workspace': True}, False),
 ])
 def test_registration_sandbox_gate(monkeypatch, config, allowed):
+    # Hermetic: the credential readers are covered against real core in test_sandbox_*.py; here they
+    # would read whatever HERMES_HOME the runner has (test-all: the real one).
+    monkeypatch.setattr(plugin, '_core_credential_files', lambda: ([], []), raising=False)
+    monkeypatch.setattr(plugin, '_check_no_credential_dirs', lambda: None, raising=False)
+    passthrough = types.ModuleType('tools.env_passthrough')
+    setattr(passthrough, '_load_config_passthrough', frozenset)
+    monkeypatch.setitem(sys.modules, 'tools.env_passthrough', passthrough)
     monkeypatch.setitem(sys.modules, 'tools.terminal_tool', types.SimpleNamespace(_get_env_config=lambda: config))
     if allowed:
         plugin.require_sandbox()

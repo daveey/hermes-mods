@@ -223,6 +223,8 @@ def test_real_core_declared_but_missing_credential_file_refuses(monkeypatch, rea
 
 
 def test_real_core_skill_registered_credential_file_refuses(monkeypatch, real_core):
+    """A gate run after a skill was viewed in this context. At gateway register() the registry is
+    empty; the skill route itself is covered by test_sandbox_mounts.py's frontmatter audit."""
     home, cf = real_core
     (home / 'service-token.json').write_text('{}')
     assert cf.register_credential_file('service-token.json') is True

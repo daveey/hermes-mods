@@ -1,6 +1,7 @@
 """Profile-local project-work entry point; no private defaults or target discovery."""
 import importlib
 import os
+import re
 import stat
 
 from pathlib import Path
@@ -121,19 +122,35 @@ def _core_credential_files():
 # _RO_MOUNT_SOURCES), each read here through core's side-effect-free root enumerator. A source core
 # adds later refuses until it is audited here.
 _MAX_WALK_FILES = 100_000
+# Ordinary (non-Hermes) credential files that core's read deny-list does not cover.
+_CREDENTIAL_BASENAMES = frozenset(('.netrc', '_netrc', '.git-credentials', '.pgpass', 'id_rsa', 'id_dsa',
+                                   'id_ecdsa', 'id_ed25519'))
+_URL_USERINFO = re.compile(r'[a-z][a-z0-9+.-]*://[^/\s@]+@', re.IGNORECASE)
 
 
 def _check_no_credential_dirs():
-    """Refuse a skills/cache directory mount that holds, or is an ancestor of, a credential store.
+    """Refuse a skills/cache directory mount that holds, or is an ancestor of, a credential store, and
+    any skill that would register an env passthrough or credential file when it is viewed.
 
     skills.external_dirs accepts any host path ('~', absolute, relative to HERMES_HOME), and core
     bind-mounts each one read-only, so `external_dirs: ['.']` would hand the sandbox the profile's
-    .env and auth.json without touching terminal.credential_files.
+    .env and auth.json without touching terminal.credential_files. A skill's required_* frontmatter
+    is registered at skill_view (a Slack /<skill> message reaches it), after register() has passed.
     """
     try:
         homes = _hermes_homes()
-        for root in _core_dir_mount_roots():
-            _check_dir_mount(Path(root), homes)
+        stores = _store_inodes(homes)
+        skill_roots, cache_roots = _core_dir_mount_roots()
+        for root in skill_roots:
+            _check_dir_mount(Path(root), homes, stores, walk=True)
+        for root in cache_roots:
+            # Fixed HERMES_HOME subdirs holding what users hand the agent (uploads, pastes): their
+            # contents are the agent's input, so only where the root really points is audited.
+            _check_dir_mount(Path(root), homes, stores, walk=False)
+        create_dir = importlib.import_module('agent.skill_utils').get_skill_create_dir()
+        # skill_view also searches skills.create_dir, which core does not mount.
+        extra = [create_dir] if create_dir is not None and create_dir.is_dir() else []
+        _check_skill_frontmatter(skill_roots + extra)
     except PermissionError:
         raise
     except Exception as exc:  # fail closed: the directory mounts cannot be audited
@@ -141,19 +158,28 @@ def _check_no_credential_dirs():
 
 
 def _core_dir_mount_roots():
+    """(skill roots, cache roots) core would mount, plus every trusted project's skill dirs.
+
+    Core picks project skill dirs from the session cwd at container creation; register() cannot know
+    that cwd, so every root in skills.trusted_project_dirs is audited instead.
+    """
     docker = importlib.import_module('tools.environments.docker')
     cf = importlib.import_module('tools.credential_files')
-    roots = []
+    su = importlib.import_module('agent.skill_utils')
+    skills, caches = [], []
     for getter, *_ in docker._RO_MOUNT_SOURCES:
         if getter == 'get_credential_file_mounts':
             continue  # audited by _core_credential_files
         if getter == 'get_skills_directory_mount':
-            roots += [d for d, _ in cf._skill_dir_roots('/root/.hermes')]
+            skills += [d for d, _ in cf._skill_dir_roots('/root/.hermes')]
         elif getter == 'get_cache_directory_mounts':
-            roots += [d for d, _ in cf._cache_dir_roots('/root/.hermes', create_missing=False)]
+            caches += [d for d, _ in cf._cache_dir_roots('/root/.hermes', create_missing=False)]
         else:
             raise PermissionError(f'Project work cannot verify core sandbox mount source {getter}')
-    return roots
+    if su._skills_cfg_get('project_discovery') is not False:
+        for project in sorted(su._project_trusted_dirs_from_config()):
+            skills += su._candidate_project_skills_dirs(project)
+    return list(dict.fromkeys(Path(d) for d in skills)), [Path(d) for d in caches]
 
 
 def _hermes_homes():
@@ -167,41 +193,96 @@ def _hermes_homes():
     return homes
 
 
-def _check_dir_mount(root, homes):
+def _store_inodes(homes):
+    """(st_dev, st_ino) of every Hermes credential store, so a hard link under another name is caught."""
+    from agent.file_safety import _CREDENTIAL_FILE_NAMES, _READ_DENIED_DIRS
+    found = set()
+    for home in homes:
+        paths = [home / n for n in _CREDENTIAL_FILE_NAMES]
+        for d, *_ in _READ_DENIED_DIRS:
+            if (home / d).is_dir() and not (home / d).is_symlink():
+                paths += [Path(p) / f for p, _, fs in os.walk(home / d) for f in fs]
+        for p in paths:
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            found.add((st.st_dev, st.st_ino))
+    return found
+
+
+def _walk_error(err):
+    raise PermissionError(f'Project work cannot verify sandbox directory mount: {err}')
+
+
+def _check_dir_mount(root, homes, stores, *, walk):
     real = root.resolve()
     for home in homes:
         if home == real or home.is_relative_to(real):
             raise PermissionError(f'Project work forbids sandbox directory mount {root}: it contains the '
                                   f'Hermes home {home}')
-    from agent.file_safety import _CREDENTIAL_FILE_NAMES, _READ_DENIED_DIRS, get_read_block_error
-    names = {Path(n).as_posix() for n in _CREDENTIAL_FILE_NAMES}
-    denied_dirs = {d for d, *_ in _READ_DENIED_DIRS}
-    hubs = [home / 'skills' / '.hub' for home in homes]
+    from agent.file_safety import (_BLOCKED_PROJECT_ENV_BASENAMES, _CREDENTIAL_FILE_NAMES, _READ_DENIED_DIRS,
+                                   HOME_CREDENTIAL_DIRS)
+    rules = (homes, {Path(n).as_posix() for n in _CREDENTIAL_FILE_NAMES}, {d for d, *_ in _READ_DENIED_DIRS},
+             [tuple(d.split('/')) for d in HOME_CREDENTIAL_DIRS], set(_BLOCKED_PROJECT_ENV_BASENAMES))
+    if _credential_reason(real, rules, is_dir=True):
+        raise PermissionError(f'Project work forbids sandbox directory mount {root}: it is a credential store')
+    if not walk:
+        return
     seen = 0
     # Core bind-mounts a symlink-free dir as-is (every file, no pruning) and otherwise mounts a copy of
-    # its regular files, so every regular non-symlink file is what the sandbox can read.
-    for dirpath, _dirs, files in os.walk(real):
+    # its regular files, so every regular non-symlink file is what the sandbox can read. An unreadable
+    # subdirectory refuses: the container's root may still read it.
+    for dirpath, _dirs, files in os.walk(real, onerror=_walk_error):
         for name in files:
             seen += 1
             if seen > _MAX_WALK_FILES:
                 raise PermissionError(f'Project work cannot verify sandbox directory mount {root}: too many files')
             path = Path(dirpath) / name
-            if path.is_symlink() or not path.is_file():
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode):
                 continue
-            if _is_credential_store(path, homes, names, denied_dirs, hubs, get_read_block_error):
+            if (st.st_nlink > 1 and (st.st_dev, st.st_ino) in stores) or _credential_reason(path, rules):
                 raise PermissionError(f'Project work forbids sandbox directory mount {root}: it holds the '
                                       f'credential store {path}')
 
 
-def _is_credential_store(path, homes, names, denied_dirs, hubs, read_block):
+def _credential_reason(path, rules, *, is_dir=False):
+    homes, names, denied_dirs, home_cred_dirs, env_names = rules
     for home in homes:  # core's deny-list only knows the active home and the root; check every profile
         if path.is_relative_to(home):
             rel = path.relative_to(home).as_posix()
             if rel in names or rel.split('/', 1)[0] in denied_dirs:
                 return True
-    if any(path.is_relative_to(hub) for hub in hubs):
-        return False  # skills-hub cache: refused for prompt injection, not a credential
-    return bool(read_block(str(path)))  # project .env files, ~/.config/token-broker, ...
+    parts = path.parts
+    # ~/.ssh, ~/.aws, ~/.config/gh, ... wherever they sit (another profile's subprocess home, a repo).
+    for seq in home_cred_dirs:
+        if any(parts[i:i + len(seq)] == seq for i in range(len(parts) - len(seq) + 1)):
+            return True
+    if is_dir:
+        return False
+    if path.name in env_names or path.name in _CREDENTIAL_BASENAMES:
+        return True
+    if path.name == 'config' and path.parent.name == '.git':  # token embedded in a remote URL
+        try:
+            return bool(_URL_USERINFO.search(path.read_text(errors='replace')))
+        except OSError as exc:
+            raise PermissionError(f'Project work cannot verify {path}') from exc
+    return False
+
+
+def _check_skill_frontmatter(skill_roots):
+    """Refuse any skill whose frontmatter would register an env passthrough or a credential file."""
+    from agent.skill_utils import iter_skill_index_files, parse_frontmatter
+    from tools.skills_tool_setup import _get_required_environment_variables
+    for root in skill_roots:
+        for skill_md in iter_skill_index_files(Path(root), 'SKILL.md'):
+            frontmatter, _ = parse_frontmatter(skill_md.read_text(encoding='utf-8', errors='replace'))
+            env = [e['name'] for e in _get_required_environment_variables(frontmatter or {})]
+            files = (frontmatter or {}).get('required_credential_files')
+            if env or files:
+                raise PermissionError(f'Project work forbids skill {skill_md}: it would forward '
+                                      + ', '.join(env + ([f'credential files {files}'] if files else [])))
 
 
 def _check_tool_mount(volume, tool_dir):
