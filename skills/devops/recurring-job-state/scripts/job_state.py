@@ -321,6 +321,19 @@ def cmd_lessons(a) -> int:
     return 0
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def cmd_harvest(a) -> int:
     path = resolve(a.job)
     cursor_path = os.path.join(os.path.dirname(path), f".{job_name(path)}.harvest.json")
@@ -329,7 +342,7 @@ def cmd_harvest(a) -> int:
             cursor = int(json.load(f).get("last_run_id", 0))
     except (OSError, ValueError):
         cursor = 0
-    con = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True, timeout=10)
+    con = _ro_connect(a.db, timeout=10)
     where = " or ".join("t.idempotency_key like ? escape '\\'" for _ in a.key_prefix)
     params = [p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%" for p in a.key_prefix]
     rows = con.execute(
