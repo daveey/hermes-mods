@@ -80,6 +80,28 @@ def test_scan_ignores_other_homes(stranded, tmp_path):
     assert not [f for f in sw.scan(str(other)) if f["pid"] == stranded.pid]
 
 
+def test_scan_ignores_scratch_cache_test_homes(tmp_path):
+    """A pytest home under HERMES_HOME/cache/scratch (TMPDIR) is not a live db: no finding."""
+    home = tmp_path / "home"
+    path = home / "cache" / "scratch" / "f1home" / "pytest-of-x" / "user-terminal-test-a" / "kanban.db"
+    path.parent.mkdir(parents=True)
+    db = sqlite3.connect(path)
+    db.execute("pragma journal_mode=wal")
+    db.execute("create table t(x)")
+    db.execute("insert into t values(1)")
+    db.commit()
+    db.close()
+    child = subprocess.Popen([sys.executable, "-c", CHILD, str(path)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        for s in ("-wal", "-shm"):
+            os.unlink(f"{path}{s}")
+        assert not [f for f in sw.scan(str(home)) if f["pid"] == child.pid]
+    finally:
+        child.kill()
+        child.wait()
+
+
 def test_dry_run_prints_findings_and_creates_nothing(stranded, capsys):
     r = Runner()
     assert sw.main(["--dry-run", "--home", str(stranded.home)], runner=r) == 0

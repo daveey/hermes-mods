@@ -4,7 +4,8 @@
 A process that loses POSIX locks can retain a stale WAL generation, but deleted descriptors alone do not prove
 that cause or any read failure. This scans /proc/*/fd for deleted kanban.db/state.db WAL/SHM under HERMES_HOME
 and files ONE Kanban card per (host, pid, pid start time, db). Entire absent profile homes are excluded as
-retired-reader cleanup, not live-database restart incidents.
+retired-reader cleanup, not live-database restart incidents; anything under HERMES_HOME/cache/ (scratch/TMPDIR
+test homes) is ignored.
 
     stranded_sqlite_watch.py [--dry-run] [--json] [--home PATH]
 
@@ -75,6 +76,10 @@ def scan(home: Optional[str] = None, proc: str = "/proc") -> list:
                 continue
             db = path.rsplit("-", 1)[0]
             relative = Path(db).relative_to(root).parts
+            if relative and relative[0] == "cache":
+                # cache/ (scratch, TMPDIR) holds throwaway test homes (pytest tmp_path etc.), never a live
+                # Hermes db; tests deleting their own sidecars mid-run is not a stranded live reader.
+                continue
             if len(relative) >= 3 and relative[0] == "profiles":
                 # Entire absent profile (tombstoned or otherwise retired): retained readers
                 # need lifecycle cleanup, not a live-db corruption/restart incident.
