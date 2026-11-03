@@ -401,10 +401,12 @@ def test_nested_runner_existing_public_alias_control(nested_repo):
 
 
 # difftool hands its tool two file names, so a `git stash pop|list` tool fails whatever the guard
-# decides. What difftool exits with then depends on git: up to 2.55 it ignores the tool's status
-# (0); 2.56 dies "external diff died, stopping at <file>" (128). Rows marked TOOL_FAILED expect the
-# status this git gives a tool that fails.
-TOOL_FAILED = object()
+# decides. What difftool exits with then depends on git: git 2.43 `git stash` prints the error but
+# exits 0, so difftool exits 0; git 2.56 (ubuntu-latest CI) `git stash` exits 128 and difftool dies
+# "external diff died, stopping at <file>" (128). A `--extcmd=false` probe can't stand in for it:
+# difftool tolerates rc 1 (0 on 2.56 too). Rows marked TOOL_FAILED accept either status and check
+# that the tool really ran and failed; the no-restore check is the real assertion.
+TOOL_FAILED = (0, 128)
 
 
 @pytest.mark.parametrize("site,command,refused,rc", [
@@ -427,11 +429,8 @@ def test_nested_runner_real_nonrestoring_controls(nested_repo, site, command, re
     assert bool(guard.refuse_reason(command, str(cwd))) == refused
     assert bool(block("terminal", command=command, workdir=str(cwd))) == refused
     tool_failed = rc is TOOL_FAILED
-    if tool_failed:
-        rc = subprocess.run([BASH, "-c", "git difftool -y --extcmd=false"], cwd=cwd, env=env,
-                            capture_output=True, timeout=30).returncode
     result = subprocess.run([BASH, "-c", command], cwd=cwd, env=env, capture_output=True, timeout=30)
-    assert result.returncode == rc, result.stderr
+    assert result.returncode in (rc if tool_failed else (rc,)), result.stderr
     if tool_failed:
         # The tool did run, on the changed file, and failed on the two names difftool appended.
         assert re.search(rb"Too many revisions specified|bad revision", result.stderr), result.stderr
