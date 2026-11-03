@@ -319,7 +319,9 @@ def _ci_section():
 
 
 FLEET_CACHE_S = 5
-# profile -> dict(at, value, lock). Each profile has its own entry and its own single-flight lock, so
+# An expired value younger than this is served while a background rebuild runs; older, the poll waits.
+FLEET_STALE_MAX_S = 120
+# profile -> dict(at, value, lock, gen). Each profile has its own entry and its own single-flight lock, so
 # the Desktop's concurrent per-profile polls neither evict each other (a scalar cache keyed by the
 # last profile missed on every other profile) nor queue behind one global build lock.
 _fleet_cache = {}
@@ -328,21 +330,21 @@ _fleet_guard = threading.Lock()  # protects the dict only; never held while buil
 
 def _fleet_entry(profile):
     with _fleet_guard:
-        return _fleet_cache.setdefault(profile, dict(at=None, value=None, lock=threading.Lock()))
+        return _fleet_cache.setdefault(profile, dict(at=None, value=None, lock=threading.Lock(), gen=0))
 
 
 # The gateway section is machine-wide (board replicas, registry, kanban-home cap: no profile input),
 # so it has ONE entry and one single-flight lock shared by every profile route. Per-profile entries
 # rebuilt it ten times per Desktop poll burst (a 15 s poll never hits a 5 s cache), concurrently:
 # 65 ms alone became 1.3-2.4 s of GIL convoy for all ten polls at once.
-_gateway_cache = dict(at=None, value=None, lock=threading.Lock())
+_gateway_cache = dict(at=None, value=None, lock=threading.Lock(), gen=0)
 
 
 def _fleet_invalidate():
+    # ``gen`` drops the result of a rebuild already running: it may have read the state before the change.
     with _fleet_guard:
-        for entry in _fleet_cache.values():
-            entry.update(at=None, value=None)
-    _gateway_cache.update(at=None, value=None)
+        for entry in list(_fleet_cache.values()) + [_gateway_cache]:
+            entry.update(at=None, value=None, gen=entry.get('gen', 0) + 1)
 
 
 def _section(build):
@@ -352,32 +354,88 @@ def _section(build):
         return dict(state='unavailable', reason=type(exc).__name__, machines=[])
 
 
+_rebuild_local = threading.local()  # set inside a background rebuild: nested sections build fresh, inline
+_rebuilds = set()  # running background rebuild threads (tests join them)
+_rebuilds_guard = threading.Lock()
+
+
+def _store(entry, gen, value):
+    import time
+    with _fleet_guard:
+        if entry.get('gen', 0) == gen:  # not invalidated while building
+            entry.update(at=time.monotonic(), value=value)
+
+
+def _rebuild_in_background(entry, build, gen):
+    """Runs with ``entry['lock']`` already held by the poll that started it; releases it when done.
+
+    The build runs in a copy of the poll's context: the profile home is a context-local override
+    (hermes_constants), and a bare thread would build (and owner-check) the CI section as the process home.
+    """
+    import contextvars
+    ctx = contextvars.copy_context()
+
+    def run():
+        _rebuild_local.active = True
+        try:
+            _store(entry, gen, build())
+        except Exception:  # noqa: BLE001 -- keep serving the previous value; the next poll retries
+            import logging
+            logging.getLogger(__name__).warning('runners fleet: background rebuild failed', exc_info=True)
+        finally:
+            entry['lock'].release()
+            with _rebuilds_guard:
+                _rebuilds.discard(threading.current_thread())
+    thread = threading.Thread(target=ctx.run, args=(run,), name='runners-fleet-rebuild', daemon=True)
+    with _rebuilds_guard:
+        _rebuilds.add(thread)
+    try:
+        thread.start()
+    except BaseException:
+        with _rebuilds_guard:
+            _rebuilds.discard(thread)
+        entry['lock'].release()
+        raise
+
+
+def _join_rebuilds(timeout=None):
+    with _rebuilds_guard:
+        threads = list(_rebuilds)
+    for t in threads:
+        t.join(timeout)
+
+
 def _cached(entry, build):
     """``entry``'s value while younger than FLEET_CACHE_S; else one build at a time (single-flight).
 
-    Stale-while-rebuilding: when a value exists and another thread is already rebuilding it, return the
-    previous value at once instead of parking on the lock. Every Desktop reconnect burst (ten profile polls
-    after a gap longer than the window) used to hold ten AnyIO workers on these locks behind one build slowed
-    by the burst's GIL contention; the session reads in the same burst queued behind them (hub,
-    t_01a18b4b710b722e: fleet_view lock waits were the most-sampled worker stack in every 4-5 s burst).
-    A cold entry (first poll, or after ``_fleet_invalidate``) still waits, so a create is read back.
+    Stale-while-revalidate: an expired value younger than FLEET_STALE_MAX_S is returned at once and the
+    rebuild runs on a background thread (one per entry). The Desktop polls every ~15 s with a 5 s budget, so
+    almost every poll is the one that finds the entry expired; building inline put the whole build (a Board
+    ``GET /v2/machines`` registry refresh with a 30 s HTTP timeout, CPU stretched by /api/sessions bursts)
+    on that poll: hub 2026-11-03 00:01:42Z took 11.2 s with the worker in the registry fetch, and Desktop
+    timed out at 5 s (also 00:32:58Z, 02:56:23Z). Concurrent pollers likewise get the previous value instead of
+    parking AnyIO workers on the lock (t_01a18b4b710b722e). A cold entry (first poll, after
+    ``_fleet_invalidate``) or one past FLEET_STALE_MAX_S still waits, so a create is read back; a rebuild
+    that was running across an invalidation does not store its value (``gen``).
     """
     import time
     at, value = entry['at'], entry['value']
-    if value is not None and at is not None and time.monotonic() - at < FLEET_CACHE_S:
+    age = None if value is None or at is None else time.monotonic() - at
+    if age is not None and age < FLEET_CACHE_S:
         return value
     lock = entry['lock']
-    if value is not None and at is not None:
-        if not lock.acquire(blocking=False):
-            return value
-    else:
-        lock.acquire()
+    if age is not None and age < FLEET_STALE_MAX_S and not getattr(_rebuild_local, 'active', False):
+        if lock.acquire(blocking=False):
+            _rebuild_in_background(entry, build, entry.get('gen', 0))
+        return value
+    lock.acquire()
     try:
         at, value = entry['at'], entry['value']
         if value is not None and at is not None and time.monotonic() - at < FLEET_CACHE_S:
             return value
+        gen = entry.get('gen', 0)
         value = build()
-        entry.update(at=time.monotonic(), value=value)
+        _store(entry, gen, value)
         return value
     finally:
         lock.release()

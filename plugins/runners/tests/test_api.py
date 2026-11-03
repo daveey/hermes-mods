@@ -476,6 +476,7 @@ def test_fleet_route_reports_each_section_and_isolates_failures(disk_api, monkey
     module, client, _, _, _, _ = disk_api
     assert client.get(PREFIX + '/fleet').status_code == 401
     module.FLEET_CACHE_S = 0
+    module.FLEET_STALE_MAX_S = 0  # every request builds inline: this test is about the sections, not caching
     monkeypatch.setattr(module, '_gateway_section', lambda: dict(state='ready', machines=[dict(name='hub', slots=16, running=[])]))
     body = client.get(PREFIX + '/fleet', headers=TOKEN).json()
     assert body['contract_version'] == 1 and body['profile'] == 'example'
@@ -577,26 +578,28 @@ def test_fleet_profile_burst_builds_the_machine_wide_gateway_section_once(api, m
     profile's entry rebuilt it: a 15 s poll never hits a 5 s cache, so every Desktop burst ran ten
     identical builds at once (65 ms alone, 1.3-2.4 s wall together on the hub) and all ten answered
     together, past the 5 s client timeout under contention (hub, 2026-10-29 13:26 PDT)."""
-    import threading, time
+    import contextvars, threading, time
     module, _, _ = api
     module._fleet_invalidate()
-    current = threading.local()
-    monkeypatch.setattr(module, 'active_profile', lambda: current.name)
+    # The profile is a context-local home override in production (hermes_constants), not a thread-local:
+    # a background rebuild must run as the profile whose poll started it.
+    current = contextvars.ContextVar('profile')
+    monkeypatch.setattr(module, 'active_profile', lambda: current.get())
     gateway_builds, ci_builds, guard = [], [], threading.Lock()
     def gateway():
         with guard:
-            gateway_builds.append(current.name)
+            gateway_builds.append(current.get())
         time.sleep(0.2)
         return dict(state='ready', machines=[dict(name='hub', slots=16, running=[])])
     def ci():
         with guard:
-            ci_builds.append(current.name)
-        return dict(state='ready', machines=[], owner=current.name)
+            ci_builds.append(current.get())
+        return dict(state='ready', machines=[], owner=current.get())
     monkeypatch.setattr(module, '_gateway_section', gateway)
     monkeypatch.setattr(module, '_ci_section', ci)
     results = {}
     def poll(name):
-        current.name = name
+        current.set(name)
         results[name] = module.fleet_view()
     def burst():
         threads = [threading.Thread(target=poll, args=(n,)) for n in PROFILES]
@@ -609,11 +612,15 @@ def test_fleet_profile_burst_builds_the_machine_wide_gateway_section_once(api, m
     assert {n: r['profile'] for n, r in results.items()} == {n: n for n in PROFILES}
     assert {n: r['ci']['owner'] for n, r in results.items()} == {n: n for n in PROFILES}
     assert all(r['gateways']['machines'][0]['name'] == 'hub' for r in results.values())
-    # Same expiry as before: past FLEET_CACHE_S the next burst rebuilds it, once.
+    # Same expiry as before: past FLEET_CACHE_S the next burst rebuilds it, once (in the background).
     for entry in list(module._fleet_cache.values()) + [module._gateway_cache]:
         entry['at'] -= module.FLEET_CACHE_S + 1
     burst()
+    module._join_rebuilds(5)
     assert len(gateway_builds) == 2 and len(ci_builds) == 2 * len(PROFILES)
+    assert sorted(ci_builds[len(PROFILES):]) == sorted(PROFILES)  # each rebuild ran as its own profile
+    burst()
+    assert {n: r['ci']['owner'] for n, r in results.items()} == {n: n for n in PROFILES}
     # An investigation create invalidates it for every profile.
     module._fleet_invalidate()
     burst()
@@ -650,11 +657,101 @@ def test_fleet_poll_during_a_rebuild_gets_the_previous_value_without_waiting(api
     assert [s['build'] for s in stale] == [1] * 5
     release.set()
     rebuilder.join(5)
+    module._join_rebuilds(5)  # the rebuild the poll started runs off the request thread
     assert module._shared_gateway_section()['build'] == 2 and len(builds) == 2
     # An invalidation (investigation create) is read back: no stale value is served after it.
     module._fleet_invalidate()
     release.set()
     assert module.fleet_view()['gateways']['build'] == 3
+
+
+def test_fleet_poll_that_finds_the_entry_expired_does_not_wait_for_the_rebuild(api, monkeypatch):
+    """The Desktop polls fleet every ~15 s with a 5 s budget, so (cache 5 s) nearly every poll is the one that
+    finds the entry expired, alone. That poll built inline: at 2026-11-03 00:01:42Z an AnyIO worker sat ~10 s
+    in kanban_worker_node registry -> Board GET /v2/machines (loop-watch, 11.2 s) and the Desktop timed out at
+    5 s; 00:32:58Z and 02:56:23Z (7.3 s) timed out during /api/sessions bursts. An expired entry with a
+    value now answers with that value at once and rebuilds in the background (single-flight); the next poll
+    gets the fresh value. Cold entries and invalidations still wait (a create is read back)."""
+    import threading, time
+    module, _, _ = api
+    module._fleet_invalidate()
+    monkeypatch.setattr(module, 'active_profile', lambda: 'default')
+    monkeypatch.setattr(module, '_ci_section', lambda: dict(state='ready', machines=[]))
+    release, started, builds = threading.Event(), threading.Event(), []
+    def gateway():
+        builds.append(1)
+        if len(builds) == 2:  # the registry fetch that hangs
+            started.set()
+            release.wait(10)
+        return dict(state='ready', machines=[], build=len(builds))
+    monkeypatch.setattr(module, '_gateway_section', gateway)
+    try:
+        assert module.fleet_view()['gateways']['build'] == 1  # cold: waited for the first build
+        for entry in list(module._fleet_cache.values()) + [module._gateway_cache]:
+            entry['at'] -= module.FLEET_CACHE_S + 1
+        t0 = time.monotonic()
+        body = module.fleet_view()  # one poll, nobody else rebuilding
+        assert time.monotonic() - t0 < 0.5
+        assert body['gateways']['build'] == 1
+        assert started.wait(5)  # the rebuild runs, off the request
+        assert module.fleet_view()['gateways']['build'] == 1 and len(builds) == 2  # still single-flight
+    finally:
+        release.set()
+    module._join_rebuilds(5)
+    assert module.fleet_view()['gateways']['build'] == 2  # the background build landed in both entries
+    assert len(builds) == 2
+
+
+def test_fleet_background_rebuild_failure_keeps_the_previous_value_and_retries(api, monkeypatch):
+    import threading
+    module, _, _ = api
+    module._fleet_invalidate()
+    monkeypatch.setattr(module, 'active_profile', lambda: 'default')
+    calls = []
+    def build(profile):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError('boom')
+        return dict(contract_version=1, profile=profile, gateways={}, ci={}, build=len(calls))
+    monkeypatch.setattr(module, '_build_fleet', build)
+    assert module.fleet_view()['build'] == 1
+    module._fleet_cache['default']['at'] -= module.FLEET_CACHE_S + 1
+    assert module.fleet_view()['build'] == 1
+    module._join_rebuilds(5)
+    assert len(calls) == 2 and not module._fleet_cache['default']['lock'].locked()
+    assert module.fleet_view()['build'] == 1  # failure kept the old value; still expired, so retried
+    module._join_rebuilds(5)
+    assert module.fleet_view()['build'] == 3
+
+
+def test_fleet_value_past_the_stale_cap_or_invalidated_mid_rebuild_is_not_served(api, monkeypatch):
+    import threading
+    module, _, _ = api
+    module._fleet_invalidate()
+    monkeypatch.setattr(module, 'active_profile', lambda: 'default')
+    release, started, calls = threading.Event(), threading.Event(), []
+    def build(profile):
+        calls.append(1)
+        if len(calls) == 2:
+            started.set()
+            release.wait(10)
+        return dict(contract_version=1, profile=profile, gateways={}, ci={}, build=len(calls))
+    monkeypatch.setattr(module, '_build_fleet', build)
+    assert module.fleet_view()['build'] == 1
+    # Too old to serve: the poll waits for a build instead of showing a minutes-old fleet.
+    module._fleet_cache['default']['at'] -= module.FLEET_STALE_MAX_S + 1
+    release.set()
+    assert module.fleet_view()['build'] == 2
+    # An invalidation while a background rebuild runs: that rebuild's (pre-create) value is dropped.
+    release.clear(); started.clear(); calls[:] = [1]
+    module._fleet_cache['default']['at'] -= module.FLEET_CACHE_S + 1
+    assert module.fleet_view()['build'] == 2
+    assert started.wait(5)
+    module._fleet_invalidate()
+    release.set()
+    module._join_rebuilds(5)
+    assert module._fleet_cache['default']['value'] is None
+    assert module.fleet_view()['build'] == 3
 
 
 def test_fleet_gateway_section_failure_is_shared_for_the_window_not_retried_per_profile(api, monkeypatch):
