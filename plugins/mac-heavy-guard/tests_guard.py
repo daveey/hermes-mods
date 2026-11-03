@@ -618,9 +618,17 @@ def test_ssh_heredoc_continued_several_and_unterminated(cmd):
     'ssh hub "echo <<EOF"\nuv sync',  # an operator inside quotes is no operator
     "ssh hub bash -s <<< x\nuv sync",  # a here-string has no body
     "ssh hub bash -s <<'B'; cat <<A\nx\nB\nuv sync\nA",  # second body is local
+    "ssh hub bash -s <<-EOF\n\techo hi\n\tEOF\nuv sync",  # a tab-indented <<- delimiter ends the body
 ])
 def test_heredoc_bodies_that_run_here_are_still_scanned(cmd):
     assert guard.check_shell(cmd), cmd
+
+
+def test_no_note_for_a_multi_file_run_inside_an_ssh_heredoc(core):
+    # note() drops ssh heredoc bodies too: a multi-file run sent to another host puts no load on this Mac.
+    cmd = "ssh hub bash -s <<'EOF'\npytest tests/test_a.py tests/test_b.py\nEOF"
+    assert guard.note(cmd, cwd=str(core)) is None
+    assert _pre(cmd, core) is None and _post(cmd, core) is None
 
 
 @pytest.mark.parametrize("cmd", [
