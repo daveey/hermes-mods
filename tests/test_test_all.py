@@ -231,10 +231,14 @@ class TestAll(unittest.TestCase):
         runner = runpy.run_path(str(RUNNER))
         floor = runner['core_python_floor']
         self.assertIsNone(floor(None))
+        # Each quote style must carry the highest bound once, or a parser that reads only one style still passes.
         core = self.make_core(["python-dotenv==1.2.4; python_version >= '3.14'",
-                               "psutil==7.2.2; sys_platform != 'android' and python_version >= \"3.14\"",
+                               "psutil==7.2.2; sys_platform != 'android' and python_version >= \"3.12\"",
                                "old==1; python_version >= '3.9'", "plain==1"])
         self.assertEqual(floor(core), (3, 14))
+        core = self.make_core(["python-dotenv==1.2.4; python_version >= '3.12'",
+                               "psutil==7.2.2; sys_platform != 'android' and python_version >= \"3.13\""])
+        self.assertEqual(floor(core), (3, 13))
         (core / 'pyproject.toml').write_text('[project]\ndependencies = ["plain==1"]\n')
         self.assertIsNone(floor(core))
         (core / 'pyproject.toml').write_text('not toml [')
