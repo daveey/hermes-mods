@@ -180,6 +180,21 @@ test('directive falls back to plain text when the ledger is unreachable; empty t
   assert.equal(el().textContent, '')
 })
 
+test('strip: a legacy card row leads with its requested step and why, never its technical title', async () => {
+  const call = fakeRest([], {})
+  const hr = { ...request('Sign in to the portal in the agent browser.'), why_human: 'Only you hold that login.' }
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_tech0001', board: 'default', title: 'Creds: gate retained; choice settled', text: 'Creds: gate retained', human_request: hr, at: 1 }] } }
+  focused.set('S1')
+  await m.refresh(call)
+  await show(React.createElement(m.Strip, { key: 'legacy-copy' }))
+  const row = el().querySelector('[data-user-steps-card="t_tech0001"]')
+  assert.ok(row, el().innerHTML)
+  assert.equal(row.querySelector('[data-user-steps-card-action]').textContent, 'Do this: Sign in to the portal in the agent browser.')
+  assert.equal(row.querySelector('[data-user-steps-card-why]').textContent, 'Why you: Only you hold that login.')
+  assert.equal(row.querySelector('[data-user-steps-card-action]').textContent.includes('settled'), false)
+  assert.match(row.textContent, /Next: answer in chat or open the card\. This is not an approval button\./)
+})
+
 test('strip: lists open steps + other blocked cards for the focused chat, hides when empty', async () => {
   const steps = [step('us_eeeeee01', 'do', { text: 'Plug the watch in' })]
   let card = { id: 't_rolling9', board: 'default' }

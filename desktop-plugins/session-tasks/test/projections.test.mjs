@@ -709,3 +709,22 @@ test('subagentChips carry tool count and last tool for the session panel stuck c
   const [bare] = m.subagentChips([{ subagent_id: 'b', goal: 'Idle', status: 'running' }])
   assert.deepEqual([bare.toolCount, bare.lastTool], [0, null])
 })
+
+test('humanRequestOf: dict or replica JSON text → plain strings; anything without an action → null', () => {
+  const r = { action: ' Sign in to the portal. ', why_human: ' Only you can. ', interaction: 'external', scope: 's', evidence: 'e' }
+  assert.deepEqual(m.humanRequestOf(r), { action: 'Sign in to the portal.', why: 'Only you can.', interaction: 'external' })
+  assert.deepEqual(m.humanRequestOf(JSON.stringify(r)), { action: 'Sign in to the portal.', why: 'Only you can.', interaction: 'external' })
+  for (const bad of [null, undefined, '', 'not json', '[1]', [], {}, { action: '' }, { action: 7 }, { why_human: 'x' }]) assert.equal(m.humanRequestOf(bad), null)
+  assert.deepEqual(m.humanRequestOf({ action: 'Do it', why_human: 5 }), { action: 'Do it', why: '', interaction: '' })
+})
+
+test('chips carry the card human_request on local and hub-replica paths', () => {
+  const hr = { action: 'Plug in the hub.', why_human: 'Physical step.' }
+  const [local] = m.sessionTaskChips([{ id: 't_l', title: 'Hub: power gate settled', status: 'blocked', human_request: JSON.stringify(hr), wait: { wait_state: 'human' } }], { connectionId: 'C1', profile: 'default' })
+  assert.deepEqual(local.humanRequest, { action: 'Plug in the hub.', why: 'Physical step.', interaction: '' })
+  assert.equal(local.look, 'needs-you')
+  const [remote] = m.hubLinkChips([{ id: 't_r', gateway: 'hub', profile: 'default', status: 'blocked', human_request: hr, wait: { wait_state: 'human' } }])
+  assert.equal(remote.humanRequest.action, 'Plug in the hub.')
+  const [none] = m.sessionTaskChips([{ id: 't_n', status: 'blocked' }], { connectionId: 'C1', profile: 'default' })
+  assert.equal(none.humanRequest, null)
+})

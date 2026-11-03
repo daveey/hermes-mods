@@ -146,7 +146,7 @@ test('producer: real missing-profile rows qualify from the owner route; the same
     assert.match(tiles[0].getAttribute('data-action-request'), /0dd02bb1-bcb2-434b-acb2-ab36816ce2a5/)
     // Unknown legacy cards are references only: no approval/decision buttons, just "Open card".
     for (const card of repeats) {
-      assert.match(card.textContent, /Legacy reference — not an approval request\./)
+      assert.match(card.textContent, /This is not an approval button\./)
       assert.deepEqual([...card.querySelectorAll('button')].map(b => b.textContent), ['Open card'])
     }
   } finally { dispose() }
@@ -235,6 +235,18 @@ test('producer: detail evidence is read through the same owner profile route as 
     host.state.focusedSessionOwner.value = { connectionId: 'C1', profile: 'default' }
     host.state.profile.value = 'default'
   }
+})
+
+test('producer: Needs you shows the card human_request (from core TEXT rows), not its title', async () => {
+  const { dispose } = wire({ C1: [coreRow({ wait: human })] })
+  try {
+    await render('ask-copy')
+    const row = el().querySelector(`[data-ask-row][data-panel-row="kb:C1:default:default:${ID}"]`)
+    assert.ok(row, el().innerHTML)
+    assert.equal(row.querySelector('[data-ask-step]').textContent, 'Do this: Reply in this chat with a spend cap.')
+    assert.equal(row.querySelector('[data-ask-why]').textContent, 'Why you: Spend needs the owner.')
+    assert.equal(row.querySelector('[data-ask-step]').textContent.includes(TITLE), false)
+  } finally { dispose() }
 })
 
 test('done', () => { root.unmount() })

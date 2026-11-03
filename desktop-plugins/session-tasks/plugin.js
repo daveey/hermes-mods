@@ -148,6 +148,17 @@ export function subagentChips(subagents) {
 
 const KANBAN_RANK = { running: 0, stalled: 1, blocked: 1, 'needs-you': 1, review: 2, triage: 2, ready: 3, scheduled: 4, waiting: 4, todo: 5 }
 
+/** The card's structured ask (`human_request`) as trimmed plain strings, or null when it names no action. The hub
+ *  replica stores it as JSON text, so a string is decoded. Exported for tests. */
+export function humanRequestOf(raw) {
+  let r = raw
+  if (typeof r === 'string') { try { r = JSON.parse(r) } catch { return null } }
+  if (!r || typeof r !== 'object' || Array.isArray(r)) return null
+  const s = k => (typeof r[k] === 'string' ? r[k].trim() : '')
+  const out = { action: s('action'), why: s('why_human'), interaction: s('interaction') }
+  return out.action ? out : null
+}
+
 function taskChip(t, status) {
   const watching = t.via === 'subscribed'
   const connectionId = t.connectionId || (t.gateway ? connectionForHubGateway(t.gateway) : null)
@@ -163,6 +174,8 @@ function taskChip(t, status) {
     look,
     waitingOn,
     waitingSince,
+    // What the card asks the user to do, in its own words (Needs you shows this, never the card title).
+    humanRequest: humanRequestOf(t.human_request),
     key: `kb:${taskKey(t.gateway || connectionId, t.board, t.id, t.profile)}`,
     kind: 'kanban',
     id: str(t.id),

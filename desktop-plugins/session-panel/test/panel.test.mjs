@@ -227,3 +227,89 @@ test('register marks the panel active (so the old strips hide) and unregisters c
   dispose()
   assert.equal(window.__sessionPanel, undefined)
 })
+
+// ── Needs you copy: the exact step, why, next — never the agent's card title or block reason ──────────────
+// Regression: card t_b857cd9d showed its title "Phone credentials: Telnyx login for staged rotation; host-access
+// choice settled" plus "answer in chat or open the card", while its structured human_request said what to do.
+const TECH_TITLE = 'Phone credentials: Telnyx login for staged rotation; host-access choice settled'
+const REQ = {
+  action: 'Sign in to the Telnyx portal through the agent browser when opened. Unblock = continue staged credential rotation with read-only checks and no calls; archive = leave rotation undone and retain current credentials.',
+  why: 'Primary portal authentication is absent from the vault.', interaction: 'external'
+}
+
+test('askView: a structured request becomes do-this / why-you / next; the technical title never appears', () => {
+  const v = m.askView({ label: TECH_TITLE, humanRequest: REQ })
+  assert.equal(v.known, true)
+  assert.equal(v.step, 'Sign in to the Telnyx portal through the agent browser when opened.')
+  assert.equal(v.why, 'Primary portal authentication is absent from the vault.')
+  assert.equal(v.next, 'When done, open the card and press Unblock (continue staged credential rotation with read-only checks and no calls), or Archive if you don’t want it (leave rotation undone and retain current credentials). You can also reply in chat.')
+  assert.equal(JSON.stringify(v).includes('host-access choice settled'), false)
+  // No outcome clauses: a generic, still concrete next step.
+  assert.match(m.askView({ humanRequest: { action: 'Plug the hub into power.' } }).next, /^When done, open the card and press Unblock, or reply in chat\./)
+})
+
+test('askView: no structured request → says the step is not shown and offers an agent question, never an invented action', () => {
+  for (const hr of [undefined, null, {}, { action: '   ' }, { action: 42 }]) {
+    const v = m.askView({ label: TECH_TITLE, humanRequest: hr })
+    assert.equal(v.known, false)
+    assert.equal(v.step, 'The exact step isn’t shown here.')
+    assert.match(v.next, /Ask agent/)
+    assert.equal(JSON.stringify(v).includes('Telnyx'), false, 'nothing is guessed from the title')
+  }
+  assert.equal(m.askAgentText({ id: 't_x' }), 'Card t_x: what exactly do you need me to do, and where? Please answer in one or two plain sentences.\n')
+})
+
+test('askView: long copy is clipped inline with an ellipsis; the full step stays available', () => {
+  const long = `Open the billing page at https://example.com/billing and ${'confirm each line item carefully '.repeat(40)}`
+  const v = m.askView({ humanRequest: { action: long, why: 'x'.repeat(900) } })
+  assert.equal(v.step.length, m.ASK_MAX)
+  assert.ok(v.step.endsWith('…'))
+  assert.equal(v.full, long.trim())
+  assert.ok(v.why.length <= 300 && v.why.endsWith('…'))
+})
+
+test('classify: archived, done, cancelled or resolved cards never need you, whatever wait they last reported', () => {
+  const chips = ['archived', 'done', 'cancelled', 'resolved', 'blocked'].map(st => card(`t_${st}`, st, { look: 'needs-you', humanRequest: REQ }))
+  const out = m.classify(chips, { nowMs: NOW })
+  assert.deepEqual(out.unasked.map(i => i.id), ['t_blocked'])
+})
+
+test('panel: unasked rows show the step for local and remote cards; missing data asks the agent; text renders safely', async () => {
+  window.localStorage.clear()
+  drafts.length = 0
+  const s = Date.now() / 1000
+  const xss = '<img src=x onerror="globalThis.__pwned=1"> Reply "yes" in chat'
+  const b = bridges({ chips: [
+    card('t_local', 'blocked', { look: 'needs-you', label: TECH_TITLE, title: `t_local · blocked\n${TECH_TITLE}`, humanRequest: REQ, activityAt: s - 60 }),
+    // a hub-replica card on another gateway: the qualified key carries gateway + profile
+    card('t_remote', 'blocked', { key: 'kb:G2:default:default:t_remote', gateway: 'G2', gatewayId: 'G2', connectionId: 'C2', look: 'needs-you', label: 'Infra: settled gate, rotation staged', humanRequest: { action: xss, why: 'Only you can answer.' }, activityAt: s - 60 }),
+    card('t_bare', 'blocked', { look: 'needs-you', label: 'Gate retained; architecture settled', activityAt: s - 60 }),
+    card('t_canon', 'blocked', { look: 'needs-you', label: 'Covered by a canonical ask', humanRequest: REQ, activityAt: s - 60 })
+  ], asks: 1, asked: src => src.id === 't_canon' })
+  await show(React.createElement(m.Panel, { key: 'ask-rows' }))
+  try {
+  const rows = [...el().querySelectorAll('[data-ask-row]')]
+  assert.deepEqual(rows.map(r => r.getAttribute('data-panel-row')), ['kb:t_local', 'kb:G2:default:default:t_remote', 'kb:t_bare'], 'canonical-covered card is not repeated')
+  assert.equal(el().querySelector('[data-section="needs-you"]').textContent, 'Needs you · 4')
+  const [local, remote, bare] = rows
+  assert.equal(local.querySelector('[data-ask-step]').textContent, 'Do this: Sign in to the Telnyx portal through the agent browser when opened.')
+  assert.equal(local.querySelector('[data-ask-why]').textContent, 'Why you: Primary portal authentication is absent from the vault.')
+  assert.match(local.querySelector('[data-ask-next]').textContent, /^Next: When done, open the card and press Unblock \(continue staged/)
+  for (const r of rows) assert.equal(r.querySelector('[data-ask-step]').textContent.includes('settled'), false, 'title/status never shown as the ask')
+  assert.equal(el().textContent.includes('answer in chat or open the card'), false)
+  // safe rendering: markup in the request is text, not elements
+  assert.equal(remote.querySelector('img'), null)
+  assert.equal(remote.querySelector('[data-ask-step]').textContent, `Do this: ${xss}`)
+  assert.equal(globalThis.__pwned, undefined)
+  // Open card routes the exact (remote) chip
+  await React.act(async () => { remote.querySelector('[data-open-card]').click(); await flush() })
+  assert.deepEqual(b.opened, ['t_remote'])
+  // missing data: honest copy plus Ask agent (draft only), no Do this
+  assert.equal(bare.getAttribute('data-ask-row'), 'unknown')
+  assert.equal(bare.querySelector('[data-ask-step]').textContent, 'The exact step isn’t shown here.')
+  assert.equal(local.querySelector('[data-ask-agent]'), null)
+  await React.act(async () => { bare.querySelector('[data-ask-agent]').click(); await flush() })
+  assert.deepEqual(drafts.at(-1), ['S1', m.askAgentText({ id: 't_bare' })])
+  assert.equal(bare.querySelector('[data-ask-card]').getAttribute('title'), 'Gate retained; architecture settled', 'title only as hover context')
+  } finally { await show(null) } // unmount: stops the panel's done poll so the file exits
+})

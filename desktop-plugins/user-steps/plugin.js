@@ -532,10 +532,14 @@ const rowStyle = { display: 'flex', flexDirection: 'column', gap: 4, padding: '6
 
 function CardRow({ item }) {
   const bp = blockedPanel()
+  // Lead with what the card asks the user to do (its validated human_request), never its agent-written title.
+  const r = item.human_request || {}
+  const action = str(r.action).trim() || str(item.text).trim()
+  const why = str(r.why_human).trim()
   return jsxs('div', { 'data-user-steps-card': item.id, style: rowStyle, children: [
-    jsx('strong', { children: item.title }),
-    jsx('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: jsx(Linked, { text: item.text || item.human_request?.action }) }),
-    jsx('small', { children: 'Legacy reference — not an approval request.' }),
+    jsx('strong', { 'data-user-steps-card-action': '', style: { overflowWrap: 'anywhere' }, children: jsx(Linked, { text: `Do this: ${action}` }) }),
+    why && jsx('div', { 'data-user-steps-card-why': '', style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12.5, opacity: 0.85 }, children: `Why you: ${why}` }),
+    jsxs('small', { children: ['Next: answer in chat or open the card. This is not an approval button.', jsx('span', { title: str(item.title), style: { opacity: 0.6 }, children: ` (card ${item.id})` })] }),
     jsxs('div', { style: flowStyle, children: [typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: actionStyle, onClick: () => bp.openCard(item), children: 'Open card' })] })
   ] })
 }

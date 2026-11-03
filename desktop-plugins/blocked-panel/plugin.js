@@ -837,7 +837,7 @@ export function Item({ item }) {
           item.text && list.source !== 'parsed' && jsx('button', { type: 'button', style: { ...btn(), border: 'none', padding: '2px 4px', opacity: 0.75 }, onClick: () => setShowNote(!showNote), children: showNote ? 'Hide agent\u2019s note' : 'Agent\u2019s note' }),
           jsx('span', { style: { flex: 1 } }),
           jsx('button', { type: 'button', style: btn(), onClick: () => openCard(item), children: 'Open card' }),
-          jsx('span', { children: 'Legacy reference — not approval.' }),
+          jsx('span', { children: 'Answer in chat or on the card; this is not an approval button.' }),
           jsx('button', { type: 'button', style: btn(), onClick: () => { const session = host.state.focusedStoredSessionId.get(); void host.composer?.setDraft?.(session, `Please provide a complete versioned action request inline for: ${item.text || item.title}`); host.composer?.focus?.(session) }, children: 'Request complete action' })
         ]
       })

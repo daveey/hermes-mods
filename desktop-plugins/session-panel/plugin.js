@@ -4,7 +4,9 @@
  *
  *   header       agent working now / idle since …, and a progress bar over the chat's kanban cards:
  *                done · running · needs you · stuck · waiting · queued
- *   Needs you    user-steps' decision cards (window.__userSteps.ActionQueue, embedded) and its earlier asks
+ *   Needs you    user-steps' decision cards (window.__userSteps.ActionQueue, embedded) and its earlier asks; a card
+ *                no ask covers shows its own human_request as "Do this / Why you / Next" (askView), never its
+ *                agent-written title or block reason; without a request it says so and offers Ask agent
  *   Stuck        a running card with no event for 2 h, a parked card whose agent-owned wait stalled
  *                (backend `wait.wait_state === 'stalled'`), or a sub-agent whose tool count has not moved
  *                for 30 min; each with numbered steps and Nudge agent / Open card. A stale chip (session-tasks'
@@ -69,6 +71,7 @@ export function trackSubagents(chips, nowMs, memory) {
 }
 
 /** Sort the chat's work into the panel's sections. `isAsked(chip)` = a user-steps ask already covers this card. */
+const TERMINAL = new Set(['done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'])
 export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false } = {}) {
   const now = nowMs / 1000
   const out = { active: [], stuck: [], waiting: [], queued: [], unasked: [], lastActivity: 0 }
@@ -93,7 +96,11 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // A stale chip is session-tasks' last-known copy after a failed read: the card may have been answered,
     // re-blocked or archived since, so it is never stuck (no nudge) or needs-you, only "status unknown".
     if (c.stale) { out.waiting.push({ ...item(c), detail: `status unknown · last known: ${c.look === 'needs-you' ? 'needs you' : c.state || 'unknown'}${last ? ` (${ago(last, nowMs)})` : ''}; the card could not be re-read` }); continue }
-    if (c.look === 'needs-you') { if (!isAsked(c)) out.unasked.push({ ...item(c), detail: on || 'needs you' }); continue }
+    if (c.look === 'needs-you') {
+      // A finished, archived or cancelled card asks nothing, whatever wait it last reported.
+      if (!TERMINAL.has(str(c.state)) && !isAsked(c)) out.unasked.push({ ...item(c), detail: on || 'needs you' })
+      continue
+    }
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
     if (c.state === 'running') {
       if (last && now - last >= STUCK_CARD_S) out.stuck.push({ ...item(c), reason: 'no-progress', lastAt: last, detail: `running, no progress since ${clock(last, nowMs)} (${ago(last, nowMs)})${c.activity ? ` · last event: ${c.activity}` : ''}` })
@@ -110,6 +117,38 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
 function item(c) {
   return { key: c.key, kind: c.kind, label: str(c.label) || str(c.id) || 'task', id: c.id || null, chip: c }
 }
+
+export const ASK_MAX = 400 // characters of a step shown inline; the full text stays in the tooltip
+const clip = (s, n = ASK_MAX) => { const t = str(s).replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t }
+const clause = (text, word) => {
+  const m = new RegExp(`\\b${word}\\s*(?:\\([^)]*\\))?\\s*=\\s*([^;]+?)\\s*(?:;|$)`, 'i').exec(text)
+  return m ? m[1].replace(/[.\s]+$/, '') : ''
+}
+
+/** What a card that needs the user shows, in plain words: the step to take (with where, as the card states it),
+ *  why only the user can do it, and what happens next. Built only from the card's structured `human_request`;
+ *  the card title and block reason are agent bookkeeping and are never shown as the ask. Without a request the
+ *  row says the step isn't shown here and offers the agent a clarifying question, never an invented action. */
+export function askView(c) {
+  const r = c?.humanRequest
+  const action = typeof r?.action === 'string' ? r.action.trim() : ''
+  if (!action) {
+    return { known: false, step: 'The exact step isn’t shown here.', full: '', why: '',
+      next: 'Open the card to read what it needs, or press Ask agent to have it spell out the step.' }
+  }
+  // Producers append what each answer does ("Unblock = …; archive = …"): that is the next step, not the ask.
+  const cut = action.search(/\b(?:unblock|yes)\s*(?:\([^)]*\))?\s*=/i)
+  const step = (cut > 0 ? action.slice(0, cut) : action).trim()
+  const tail = cut > 0 ? action.slice(cut) : ''
+  const yes = clause(tail, '(?:unblock|yes)'), no = clause(tail, '(?:archive|no)')
+  const next = yes || no
+    ? `When done, open the card and press Unblock${yes ? ` (${clip(yes, 200)})` : ''}${no ? `, or Archive if you don’t want it (${clip(no, 200)})` : ''}. You can also reply in chat.`
+    : 'When done, open the card and press Unblock, or reply in chat. Archive the card if you don’t want it.'
+  return { known: true, step: clip(step), full: step, why: typeof r.why === 'string' ? clip(r.why, 300) : '', next }
+}
+
+/** Composer draft for Ask agent: a plain question about one card, sent only when the user presses send. */
+export const askAgentText = i => `Card ${i.id}: what exactly do you need me to do, and where? Please answer in one or two plain sentences.\n`
 
 /** Progress-bar counts. Cards only (sub-agents and processes are listed, not counted); needs you = open asks
  *  plus unasked cards that need the user. */
@@ -249,6 +288,24 @@ function Row({ i, color }) {
   ] })
 }
 
+function AskRow({ i, session }) {
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const canOpen = i.kind === 'kanban' && !!i.chip.connectionId && !!i.chip.profile && typeof st?.openTaskChip === 'function'
+  const v = askView(i.chip)
+  const ask = () => { void host.composer?.setDraft?.(session, askAgentText(i)); host.composer?.focus?.(session) }
+  const line = { fontSize: 12.5, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }
+  return jsxs('div', { 'data-panel-row': i.key, 'data-ask-row': v.known ? 'known' : 'unknown', style: { border: `1px solid color-mix(in srgb, ${C.needsYou} 45%, transparent)`, borderRadius: 6, padding: '8px 10px', marginBottom: 6, minWidth: 0 }, children: [
+    jsx('div', { 'data-ask-step': '', title: v.full || undefined, style: { fontWeight: 600, fontSize: 13, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }, children: v.known ? `Do this: ${v.step}` : v.step }),
+    v.why && jsx('div', { 'data-ask-why': '', style: { ...line, color: 'var(--muted-foreground)' }, children: `Why you: ${v.why}` }),
+    jsx('div', { 'data-ask-next': '', style: line, children: `Next: ${v.next}` }),
+    jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 6 }, children: [
+      canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: btn, onClick: () => st.openTaskChip(i.chip), children: 'Open card' }),
+      !v.known && jsx('button', { type: 'button', 'data-ask-agent': '', style: btn, title: 'Drafts a question to the agent in the composer; nothing is sent until you send it', onClick: ask, children: 'Ask agent' }),
+      jsx('span', { 'data-ask-card': '', title: str(i.chip?.title) || i.label, style: { ...muted, marginLeft: 'auto', fontSize: 11 }, children: i.id ? `card ${i.id}` : '' })
+    ] })
+  ] })
+}
+
 function StuckCard({ i, session, now }) {
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const canOpen = i.kind === 'kanban' && !!i.chip.connectionId && !!i.chip.profile && typeof st?.openTaskChip === 'function'
@@ -314,7 +371,7 @@ export function Panel() {
   const needsYou = [
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
     US?.ActionQueue && jsx(US.ActionQueue, { embedded: true }, 'queue'),
-    ...sorted.unasked.map(i => jsx(Row, { i: { ...i, detail: `${i.detail} · answer in chat or open the card` }, color: C.needsYou }, i.key)),
+    ...sorted.unasked.map(i => jsx(AskRow, { i, session: route.session }, i.key)),
     legacy
   ].filter(Boolean)
   const summary = Object.keys(LABEL).filter(k => n[k]).map(k => `${n[k]} ${LABEL[k]}`).join(' · ')
