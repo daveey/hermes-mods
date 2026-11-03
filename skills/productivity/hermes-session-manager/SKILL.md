@@ -89,8 +89,11 @@ say what's running, never what needs the user.
 - Finish in the originating session: a conclusion stating what was done, what was verified and
   why the work is finished, plus its done outcome. For obsolete work, state why it is no longer
   relevant instead of claiming implementation success. Archiving is not a substitute for this conclusion.
-- Keep genuine unfinished work open. Only irreducible human actions become blocked cards with
-  `human_request`; delegated judgment does not supply credentials, physical evidence or extra spend.
+- For an owner-terminal blocker, read the existing handoff and consumed receipts first. A worker's
+  identity refusal does not establish that the user must act: try the approved `run_in_user_terminal`
+  flow from the owner-facing chat. If it succeeds, record the exact receipt, unblock the existing card,
+  and verify resumed execution; never replay completed recovery steps or bypass the identity gate.
+  Keep unfinished delivery open; delegated judgment still cannot supply credentials, physical evidence or extra spend.
 - When writing an `action_request` for a blocked ask, re-read every fact you put in `limits` (quotas, accounts,
   regions, counts) live from the target. A worker treats an approved number as exact, so a stale figure copied
   from an older card body blocks it again on the mismatch. If ask-gate refuses it as `agent_can_do`, republish
@@ -138,5 +141,8 @@ when nothing did.
 
 ## Reply style
 
-Lead with what needs the user (the exact ask, one line each), then what finished, then what you
-unstuck. Short. Link card and session ids. No recap of these mechanics unless asked.
+Lead with any verified user action: who must do what, where, and what it unblocks, with the task link
+and supported interaction ready. Translate internal handoff names into the actual action; “initiate
+HANDOFF” or a truncated block reason makes the user reconstruct the procedure from logs. If no user
+action remains, say what is executing next and distinguish recovery from completed delivery. Then give
+verified results briefly; do not replay the process.
