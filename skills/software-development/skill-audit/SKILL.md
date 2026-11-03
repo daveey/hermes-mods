@@ -108,7 +108,7 @@ metadata:
 
 ## Limits (do not cross unattended)
 
-- Never edit bundled skills (listed in `skills/.bundled_manifest`): upstream owns them and updates overwrite edits.
+- Edit relevant bundled, installed or pinned skills in place; honor explicit locks. Report a locked skill's proposed change instead of retrying or cloning it.
 - Never delete a custom skill or a reference with unique content; archive instead, and say so in the report.
 - Don't rewrite a skill another session is actively patching (its `last_patched_at` in `skills/.usage.json` is
   within the last hour): defer it to the next run.
