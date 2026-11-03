@@ -278,3 +278,63 @@ def test_steer_envelope_counts_and_display_kind_turns_do_not(home):
     core.flush(home, now=t + core.GRACE_S + 1)
     (r,) = lines(home)
     assert r["user_correction"] is True and r["correction_source"] == "keyword"
+
+
+# ---------------------------------------------------------------- reload + state.db fallback (rules 3)
+def _state_db(h, session, rows):
+    import sqlite3
+    con = sqlite3.connect(h / "state.db")
+    con.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+                "content TEXT, timestamp REAL, display_kind TEXT)")
+    con.executemany("INSERT INTO messages (session_id, role, content, timestamp, display_kind) VALUES (?,?,?,?,?)",
+                    [(session, "user", text, ts, kind) for ts, text, kind in rows])
+    con.commit()
+    con.close()
+
+
+def test_plugin_reload_loads_the_current_core(tmp_path):
+    # a gateway reload re-executes __init__.py; it must not keep an older outcomes.py from sys.modules
+    import shutil
+    d = tmp_path / "skill-outcomes"
+    shutil.copytree(P, d, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+
+    def load():
+        sp = importlib.util.spec_from_file_location("so_reload_probe", d / "__init__.py")
+        m = importlib.util.module_from_spec(sp)
+        sp.loader.exec_module(m)
+        return m
+
+    assert not hasattr(load().core, "RELOAD_PROBE")
+    (d / "outcomes.py").write_text((d / "outcomes.py").read_text() + "\nRELOAD_PROBE = 1\n")
+    assert load().core.RELOAD_PROBE == 1
+
+
+def test_reply_missed_by_the_hook_is_read_from_state_db(home):
+    turn("s1", "done", ("five-whys", SKILL_DONE))
+    t = core.time.time()
+    # no pre_llm_call reached the plugin; the transcript holds two Hermes notices, then the user's correction
+    _state_db(home, "s1", [(t + 5, "[ASYNC DELEGATION BATCH COMPLETE — deleg_1] x", "async_delegation_complete"),
+                           (t + 6, "Background process finished.", "process_complete"),
+                           (t + 9, "no, that's the wrong host", None)])
+    assert core.flush(home, now=t + core.IDLE_S + 1) == []  # the reply starts the 3 h grace, not the idle clock
+    core.flush(home, now=t + 9 + core.GRACE_S + 1)
+    (r,) = lines(home)
+    assert r["user_correction"] is True and r["correction_source"] == "keyword"
+    assert r["reply_source"] == "state_db" and r["rules"] == 3
+
+
+def test_state_db_with_only_notices_finalizes_none_after_idle(home):
+    turn("s1", "done", ("five-whys", SKILL_DONE))
+    t = core.time.time()
+    _state_db(home, "s1", [(t + 5, "✔ [default] @default Kanban t_1 done — x", "kanban_notice"),
+                           (t - 50, "an earlier message from before the turn ended", None)])
+    core.flush(home, now=t + core.IDLE_S + 1)
+    (r,) = lines(home)
+    assert r["user_correction"] is False and r["correction_source"] == "none"
+
+
+def test_lines_before_rules_3_are_left_out_of_correction_rate():
+    t = 1000.0
+    old = {"ts": t, "host": "h", "session": "s0", "skill": "x", "user_correction": False, "rules": 2,
+           "checks_first_pass": None}
+    assert core.rollup([old], t - 1, t + 1)[0]["correction_rate"] is None

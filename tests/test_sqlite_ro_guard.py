@@ -95,7 +95,8 @@ class SqliteRoGuard(unittest.TestCase):
             else:
                 self.skipTest("this SQLite build opens a WAL db read-only without -wal/-shm")
             for rel in ("plugins/open-asks/core.py", "plugins/user-steps/cards.py", "plugins/follow-through/core.py",
-                        "plugins/coach/origin_authority.py", "plugins/kanban-wait-chain-guard/__init__.py"):
+                        "plugins/coach/origin_authority.py", "plugins/kanban-wait-chain-guard/__init__.py",
+                        "plugins/skill-outcomes/outcomes.py"):
                 helper = _load(rel, "_ro_guard_" + rel.replace("/", "_").replace("-", "_")[:-3]).__dict__.get("_ro_connect")
                 self.assertIsNotNone(helper, f"{rel} has no _ro_connect")
                 c = helper(db, timeout=1)

@@ -26,9 +26,9 @@ HERE = Path(__file__).resolve().parent
 
 
 def _load_core():
+    # Always re-execute outcomes.py: a gateway plugin reload re-runs this file, and reusing a cached core from
+    # sys.modules paired new hooks with old core functions (a TypeError the fail-open hooks swallowed).
     name = "skill_outcomes_core"
-    if name in sys.modules:
-        return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, HERE / "outcomes.py")
     mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
     sys.modules[name] = mod
@@ -40,6 +40,17 @@ core = _load_core()
 _lock = threading.Lock()
 _loads: dict[str, dict[str, dict]] = {}  # session -> skill -> {skill, ts, has_done_means}
 _last_sweep = [0.0]
+_warned: set = set()
+
+
+def _warn(hook: str, exc: Exception) -> None:
+    """Hooks stay fail-open, but each distinct failure is logged once at WARNING so a broken hook is visible."""
+    key = (hook, type(exc).__name__, str(exc)[:200])
+    if key in _warned:
+        log.debug("skill-outcomes %s: %s", hook, exc)
+        return
+    _warned.add(key)
+    log.warning("skill-outcomes %s hook failed: %r", hook, exc)
 SWEEP_EVERY_S = 60
 
 
@@ -79,7 +90,7 @@ def _sweep(now: float | None = None) -> None:
     try:
         core.flush(None, now)
     except Exception as exc:
-        log.debug("skill-outcomes sweep: %s", exc)
+        _warn("sweep", exc)
 
 
 def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "", **_):
@@ -100,7 +111,7 @@ def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, se
                 skill, {"skill": skill, "ts": time.time(), "has_done_means": core.has_done_means(d["content"]),
                         "checks_expected": core.count_done_means(d["content"])})
     except Exception as exc:
-        log.debug("skill-outcomes post_tool_call: %s", exc)
+        _warn("post_tool_call", exc)
     return None
 
 
@@ -120,7 +131,7 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
             f"failures at most 2 rounds, and end the reply with one line: `Done means ({name}): <passed on first "
             f"check>/<total> first pass, <k> fix rounds` (add `; still failing: <what>` if any still fail).")
     except Exception as exc:
-        log.debug("skill-outcomes transform_tool_result: %s", exc)
+        _warn("transform_tool_result", exc)
         return None
 
 
@@ -135,7 +146,7 @@ def post_llm_call(session_id: str = "", assistant_response: Any = None, turn_id:
                              else "", turn_id=turn_id)
         _sweep()
     except Exception as exc:
-        log.debug("skill-outcomes post_llm_call: %s", exc)
+        _warn("post_llm_call", exc)
     return None
 
 
@@ -154,7 +165,7 @@ def pre_llm_call(session_id: str = "", user_message: Any = None, conversation_hi
                                    display_kind=_display_kind(conversation_history))
         _sweep()
     except Exception as exc:
-        log.debug("skill-outcomes pre_llm_call: %s", exc)
+        _warn("pre_llm_call", exc)
     return None
 
 
@@ -177,7 +188,7 @@ def pre_final_gate(session_id: str = "", final_response: Any = None, attempt: in
             f"line against your work, then send the reply again ending with one line per skill:\n{want}\n"
             "(add `; still failing: <what>` when any line fails).")}
     except Exception as exc:
-        log.debug("skill-outcomes pre_final_gate: %s", exc)
+        _warn("pre_final_gate", exc)
         return None
 
 

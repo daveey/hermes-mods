@@ -29,7 +29,9 @@ MARK = "[skill-outcomes]"
 GRACE_S = 3 * 3600
 IDLE_S = 2 * 3600  # no next user message within this long (Kanban, cron, abandoned chat): user_correction=false
 COACH_EVENTS = {"selfheal_detect": {"complaint", "backstop"}, "lesson": None}
-RULES = 2  # lines from rules < 2 closed the window on machine notices and matched coach by time window only
+# rules < 2 closed the window on machine notices and matched coach by time window only; rules 2 missed real replies
+# while a reloaded gateway paired new hooks with a cached old core. rules 3 also reads the reply from state.db.
+RULES = 3
 
 # `Done means (five-whys): 4/5 first pass, 1 fix round; still failing: ...`
 TICK_RE = re.compile(
@@ -263,6 +265,43 @@ def note_user_message(home: Any, session: str, text: str, now: Optional[float] =
     return n
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
+def db_next_user(home: Any, session: str, after: float) -> Optional[tuple]:
+    """(ts, text) of the session's first real user message after `after`, read from <home>/state.db: the
+    authoritative transcript, so a reply the pre_llm_call hook missed (plugin reload, crash) still closes the
+    window. Turns Hermes wrote carry a display_kind other than steer; the text filters apply as well."""
+    p = home_dir(home) / "state.db"
+    if not session or not p.exists():
+        return None
+    try:
+        con = _ro_connect(p, timeout=2)
+        try:
+            rows = con.execute(
+                "SELECT timestamp, content, display_kind FROM messages WHERE session_id=? AND role='user' "
+                "AND timestamp>? ORDER BY timestamp LIMIT 200", (session, after)).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    for ts, text, kind in rows:
+        if is_real_user_message(text, kind):
+            return float(ts), unwrap_steer(text)[:2000]
+    return None
+
+
 def _finalize(home: Any, r: dict) -> dict:
     out = {k: v for k, v in r.items() if k not in ("next_user", "next_user_ts", "turn_end", "reopened")}
     out["rules"] = RULES
@@ -293,6 +332,11 @@ def flush(home: Any = None, now: Optional[float] = None, force: bool = False) ->
         for r in box["data"]:
             if r.get("next_user") is not None and not is_real_user_message(r["next_user"]):
                 r["next_user"], r["next_user_ts"], r["reopened"] = None, None, True  # closed by a notice
+            if r.get("next_user") is None:
+                hit = db_next_user(home, r.get("session") or "", float(r.get("turn_end") or 0))
+                if hit:
+                    r["next_user_ts"], r["next_user"] = round(hit[0], 3), hit[1]
+                    r["reply_source"] = "state_db"
             nu_ts = r.get("next_user_ts")
             due = force or (nu_ts is not None and now - nu_ts >= GRACE_S) or \
                 (nu_ts is None and now - float(r.get("turn_end") or 0) >= IDLE_S)
@@ -347,7 +391,7 @@ def rollup(rows: list, lo: float, hi: float) -> list:
         # a tick-off whose total doesn't match the skill's list is not trusted for first-pass / fix rounds
         ticked = [r for r in rs if r.get("checks_first_pass") is not None and not r.get("tickoff_mismatch")]
         fixes = [r["fix_rounds"] for r in ticked if isinstance(r.get("fix_rounds"), int)]
-        # rules < 2 lines closed the window on machine notices and matched coach by time only: not counted
+        # rules < RULES lines could miss or misread the user's reply (see RULES): not counted
         corr = [r for r in rs if r.get("user_correction") is not None and (r.get("rules") or 1) >= RULES]
         out.append({"skill": skill, "uses": len(rs), "ticked": len(ticked),
                     "first_pass_rate": round(sum(1 for r in ticked if r["checks_first_pass"]) / len(ticked), 3)
