@@ -1,6 +1,6 @@
 ---
 name: asking-the-user
-description: "Use when the user must click, sign in, approve or run a step."
+description: "Use when user must act: sudo, sign-in, Inbox, a Mac screen."
 triggers:
   asks:
     - "I need you to sign in to this site"
