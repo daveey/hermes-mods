@@ -104,6 +104,13 @@ def test_data_version_detects_commit_when_file_signature_is_unchanged(board, mon
     try:
         writer.execute('PRAGMA journal_mode=WAL')
         ut.sweep_jobs()
+        # The first pass stamps the board before its own reads create the empty -wal, so its memo misses on
+        # the -wal stat alone. Settle on a second pass and prove a memo hit; otherwise the frozen-stat pass
+        # below re-inspects even with data_version gone from the stamp.
+        ut.sweep_jobs()
+        with patch.object(ut, 'read_status', wraps=ut.read_status) as status:
+            ut.sweep_jobs()
+        assert status.call_count == 0
         # Model the WAL-publication gap: unchanged stat is not proof of no commit.
         original = ut._sweep_stat
         frozen = {str(path) + suffix: original(Path(str(path) + suffix)) for suffix in ('', '-wal')}
