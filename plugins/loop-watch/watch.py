@@ -261,6 +261,7 @@ def _append(path: Path, rep: dict) -> None:
 
 
 _STARTED_ATTR = "_hermes_loop_watch_started"
+WEB_MODULE = "hermes_cli.web_server"
 
 
 def _reqtrace_mod():
@@ -282,19 +283,40 @@ def _install_reqtrace(home: Path, slow_s: Optional[float]):
     """Wrap the serve process's FastAPI app with the slow-request tracer. None when not a web server."""
     if slow_s is None or slow_s <= 0:
         return None
-    ws = sys.modules.get("hermes_cli.web_server")
+    ws = sys.modules.get(WEB_MODULE)
     app = getattr(ws, "app", None) if ws is not None else None
     if app is None:
+        return None
+    # The gateway imports web_server in a worker thread; the module sits in sys.modules
+    # for the whole import. Building the middleware stack now makes the import's later
+    # add_middleware raise "Cannot add middleware after an application has started".
+    if getattr(getattr(ws, "__spec__", None), "_initializing", False):
         return None
     try:
         rt = _reqtrace_mod()
         trace = rt.ReqTrace(sink=rt.default_sink(home / "logs" / "loop-watch.jsonl"), slow_s=slow_s)
         if rt.install_on_app(app, trace):
+            setattr(trace, "_loop_watch_app", app)
             log.info("loop-watch: tracing requests slower than %.1fs", slow_s)
             return trace
     except Exception as exc:  # noqa: BLE001
         log.info("loop-watch: request tracer not installed: %s", exc)
     return None
+
+
+def _ensure_reqtrace(home: Path, slow_s: Optional[float], trace):
+    """One tick's install step: keep the trace while it wraps the live app, else (re)install."""
+    if slow_s is None or slow_s <= 0:
+        return trace
+    if trace is not None:
+        ws = sys.modules.get(WEB_MODULE)
+        live = getattr(ws, "app", None) if ws is not None else None
+        if live is None or live is getattr(trace, "_loop_watch_app", live):
+            return trace
+        # A failed or redone import bound a new app: the old trace wraps a dead object.
+        log.info("loop-watch: web app replaced; re-attaching request tracer")
+        trace = None
+    return _install_reqtrace(home, slow_s)
 
 
 def start(home: Path, *, stall_s: float = STALL_S, wait_for_loop_s: float = 600.0,
@@ -324,8 +346,7 @@ def start(home: Path, *, stall_s: float = STALL_S, wait_for_loop_s: float = 600.
             nonlocal trace
             # Gateway listeners import the web app lazily, after the loop is running.
             # Retry until it exists; installing once at watcher startup loses tracing.
-            if trace is None and slow_s is not None and slow_s > 0:
-                trace = _install_reqtrace(home, slow_s)
+            trace = _ensure_reqtrace(home, slow_s, trace)
             profile()
             if trace is not None:
                 trace.tick(loop)

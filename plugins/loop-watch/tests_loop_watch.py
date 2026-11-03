@@ -161,6 +161,93 @@ def test_start_retries_tracer_after_lazy_webapp_load(tmp_path, monkeypatch):
         monkeypatch.delattr(sys, watch._STARTED_ATTR, raising=False)
 
 
+def _half_loaded_web_module(monkeypatch, initializing=True):
+    """A web_server module the import system is still executing: in sys.modules, app half built."""
+    import importlib.machinery
+    import types
+    from starlette.applications import Starlette
+    from starlette.middleware.gzip import GZipMiddleware
+
+    app = Starlette()
+    app.add_middleware(GZipMiddleware)
+    mod = types.ModuleType("hermes_cli.web_server")
+    mod.__spec__ = importlib.machinery.ModuleSpec("hermes_cli.web_server", None)
+    mod.__spec__._initializing = initializing
+    mod.app = app
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", mod)
+    return mod
+
+
+def test_reqtrace_waits_while_web_module_is_still_importing(tmp_path, monkeypatch):
+    from starlette.middleware.gzip import GZipMiddleware
+
+    mod = _half_loaded_web_module(monkeypatch)
+    assert watch._install_reqtrace(tmp_path, 2.0) is None
+    assert mod.app.middleware_stack is None
+    mod.app.add_middleware(GZipMiddleware)  # the import's later add_middleware must still work
+    mod.__spec__._initializing = False
+    trace = watch._install_reqtrace(tmp_path, 2.0)
+    assert trace is not None
+    assert getattr(mod.app.middleware_stack, "__loop_watch_traced__", False)
+
+
+def test_reqtrace_reattaches_when_web_app_is_replaced(tmp_path, monkeypatch):
+    from starlette.applications import Starlette
+
+    mod = _half_loaded_web_module(monkeypatch, initializing=False)
+    trace = watch._ensure_reqtrace(tmp_path, 2.0, None)
+    assert trace is not None
+    assert watch._ensure_reqtrace(tmp_path, 2.0, trace) is trace  # same app: no reinstall
+    mod.app = Starlette()  # a failed and redone import binds a new app
+    again = watch._ensure_reqtrace(tmp_path, 2.0, trace)
+    assert again is not None
+    assert getattr(mod.app.middleware_stack, "__loop_watch_traced__", False)
+
+
+def test_tick_during_real_lazy_import_does_not_break_add_middleware(tmp_path, monkeypatch):
+    """End to end: a real import in a worker thread while the watcher's tick keeps retrying."""
+    import importlib
+
+    pkg = tmp_path / "pkg"
+    (pkg / "lw_fake_hermes_cli").mkdir(parents=True)
+    (pkg / "lw_fake_hermes_cli" / "__init__.py").write_text("")
+    (pkg / "lw_fake_hermes_cli" / "web_server.py").write_text(
+        "import time\n"
+        "from starlette.applications import Starlette\n"
+        "from starlette.middleware.gzip import GZipMiddleware\n"
+        "app = Starlette()\n"
+        "app.add_middleware(GZipMiddleware)\n"
+        "time.sleep(0.4)\n"
+        "app.add_middleware(GZipMiddleware)\n"
+    )
+    monkeypatch.syspath_prepend(str(pkg))
+    monkeypatch.setattr(watch, "WEB_MODULE", "lw_fake_hermes_cli.web_server")
+    errors = []
+
+    def importer():
+        try:
+            importlib.import_module("lw_fake_hermes_cli.web_server")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    th = threading.Thread(target=importer)
+    trace = None
+    try:
+        th.start()
+        while th.is_alive():
+            trace = watch._ensure_reqtrace(tmp_path, 2.0, trace)
+            time.sleep(0.01)
+        th.join()
+        trace = watch._ensure_reqtrace(tmp_path, 2.0, trace)
+        assert errors == []
+        mod = sys.modules["lw_fake_hermes_cli.web_server"]
+        assert trace is not None
+        assert getattr(mod.app.middleware_stack, "__loop_watch_traced__", False)
+    finally:
+        for name in ("lw_fake_hermes_cli.web_server", "lw_fake_hermes_cli"):
+            sys.modules.pop(name, None)
+
+
 def test_run_calls_on_tick():
     lp = _Loop()
     try:
