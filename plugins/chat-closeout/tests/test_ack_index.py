@@ -178,6 +178,10 @@ def test_the_waker_tick_shares_one_pass(chat, tmp_path, monkeypatch):
     assert in_pass == [True, True, True]
     assert opens.count(str(chat)) == 1
     assert plugin._pass_local.res is None
+    opens.clear()
+    assert plugin.wake_tick(now=10_001, wake=lambda *a, **k: 'busy', unseen={}) == []
+    assert opens.count(str(chat)) == 1  # state.db: one per pass, nothing retained between passes
+    assert opens.count(str(board)) == 0  # boards: the registered observer survives
     rows = {r['session_id']: r['batch'] for r in led.pending()}
     assert rows == {'chat': ['default/t_0', 'default/t_open'], 'chat1': ['default/t_1', 'default/t_open'],
                     'chat2': ['default/t_2', 'default/t_open']}  # nothing acked: no notice for these cards

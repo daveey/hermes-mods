@@ -108,7 +108,7 @@ def test_an_unchanged_board_is_not_read_again_and_any_commit_is_seen(tmp_path, m
     writer.execute("UPDATE tasks SET status='runnin3' WHERE id='t_run'")
     assert core.read_cards([board], IDS, light=light)['t_run']['status'] == 'runnin3'
     monkeypatch.setattr(core, 'ro_connect', real)
-    core._board_cache.clear()
+    core._structural_reads.clear()
     assert core.read_cards([board], IDS, light=light) == core.read_cards([board], IDS, light=light)
     assert core.read_cards([board], IDS + ['t_extra'], light=light) is not None  # another id set: its own read
     writer.close()

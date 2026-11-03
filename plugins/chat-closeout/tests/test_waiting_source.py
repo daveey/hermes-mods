@@ -95,9 +95,14 @@ def test_local_boards_read_once_per_pass_with_the_same_answer(tmp_path, monkeypa
     led = core.Ledger(tmp_path / 'ledger.db')
     for n in range(5):
         led.write(f'chat{n}', batch=[f't_{n}'], open=[])
-    opens = []
+    opens, statements = [], []
     real = core.ro_connect
-    monkeypatch.setattr(core, 'ro_connect', lambda p: opens.append(p) or real(p))
+    def connect(p, *args, **kwargs):
+        opens.append(p)
+        conn = real(p, *args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+    monkeypatch.setattr(core, 'ro_connect', connect)
     monkeypatch.setattr(plugin, 'ledger', lambda: led)
     monkeypatch.setattr(plugin, 'board_paths', lambda: [board])
     monkeypatch.setattr(plugin, 'remote_cards', lambda: [])
@@ -106,9 +111,12 @@ def test_local_boards_read_once_per_pass_with_the_same_answer(tmp_path, monkeypa
     monkeypatch.delitem(plugin._state, 'waiting_cache', raising=False)
     expected = {f'chat{n}': [f't_{n}'] for n in range(5)}
     assert core.pending_closeouts(led, plugin.read_cards) == expected  # the per-row reader, for comparison
-    assert len(opens) == 5
+    assert len(opens) == 1  # all five queries share a retained observer
+    assert sum(s.startswith('SELECT t.id') for s in statements) == 5
     opens.clear()
+    statements.clear()
     assert plugin.waiting_source() == expected
-    assert len(opens) == 1
+    assert len(opens) == 0
+    assert sum(s.startswith('SELECT t.id') for s in statements) == 1  # union still read once per pass
     read = plugin._pass_reader()
     assert read(['t_3']) == plugin.read_cards(['t_3']) and read(['t_absent']) == {}

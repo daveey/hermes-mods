@@ -13,10 +13,12 @@ Every hook fails open. [daveey]
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -83,6 +85,478 @@ def board_paths() -> list[Path]:
                 if p.is_file()]
 
 
+# ---- cross-pass remote inventory gate (REMOTE-GATE.md) ---------------------------------------------------------
+# Core keeps its links projection _LINKS_MAX_AGE_S (15 s), half this thread's 30 s tick, so every pass re-projected
+# the origin ledger and hub replica (native replay: ~93 ms of a ~150 ms pass) for an unchanged answer. The gate
+# reuses core's own last projection only while every input it read is unchanged and every clock verdict it took
+# still holds now; it never extends a verdict past a cut-off and has no age-based reuse.
+_REPLICA_FRESH_S = 180.0  # core project(): replica fresh / owner observation recent within 180 s
+_GATE_NEEDS = ("remote_links_and_origin_rows", "_links_fingerprint", "_origin_scope", "_links_lock", "_links_cache",
+               "one_annotation_snapshot", "_annotation_scope", "_hub_db_path", "_cache_lock", "_remote_last",
+               "_remote_scope", "HUB_STALE_AFTER_S", "parked_waits")
+_gate_lock = threading.Lock()
+_gate: dict[str, Any] = {}  # "memo": the reusable projection and the inputs it was read under
+
+
+def _gate_reset() -> None:
+    with _gate_lock:
+        _gate.clear()
+
+
+def _gate_ready(ksa) -> bool:
+    """Core has everything the gate keys on, and no outer ``one_annotation_snapshot`` pins a projection here."""
+    return (all(hasattr(ksa, n) for n in _GATE_NEEDS)
+            and getattr(ksa._annotation_scope, "reads", None) is None)
+
+
+def _stat_key(path: Path) -> tuple:
+    out = []
+    for p in (path, Path(str(path) + "-wal")):
+        try:
+            st = p.stat()
+            out.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+def _replica_clock(ksa, now: float) -> Optional[tuple[tuple, Optional[float], Optional[float]]]:
+    """``(verdict, last_ok, project_last_ok)`` from the hub replica's sync meta. ``verdict`` holds every clock
+    judgement the projection takes from it (core project() freshness, replica staleness), judged at ``now`` on each
+    call, never cached. ``last_ok`` as the replica read parses it, ``project_last_ok`` as project() does (the
+    ``synced_at`` of origin rows). None when the meta cannot be read: then nothing is reused."""
+    meta = _replica_meta(ksa)
+    return None if meta is None else _judge_replica(ksa, meta, now)
+
+
+def _replica_meta(ksa) -> Optional[Any]:
+    """The replica sync meta the clock verdicts are judged from: ``"no-replica"``, or ``{last_ok, offline_since}``
+    as stored. None when unreadable."""
+    path = ksa._hub_db_path()
+    if path is None or not Path(path).is_file():
+        return "no-replica"
+    try:
+        conn = core.ro_connect(Path(path))
+        try:
+            return dict(conn.execute("SELECT k, v FROM meta WHERE k IN ('last_ok', 'offline_since')").fetchall())
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _judge_replica(ksa, meta: Any, now: float) -> Optional[tuple[tuple, Optional[float], Optional[float]]]:
+    """``_replica_clock`` of stored ``meta`` at ``now``: every verdict judged at ``now``."""
+    if meta == "no-replica":
+        return ("no-replica",), None, None
+    try:
+        raw = meta.get("last_ok")
+        last_ok = float(raw) if raw not in (None, "") else None
+        lo = float(raw or 0)
+    except Exception:
+        return None
+    since = None if last_ok is None else now - last_ok
+    verdict = (meta.get("offline_since"), last_ok is None, 0 <= now - lo, now - lo <= _REPLICA_FRESH_S,
+               since is not None and since > float(ksa.HUB_STALE_AFTER_S))
+    return verdict, last_ok, lo
+
+
+def _clock_cutoffs(replica: Optional[Path], ledger: Path) -> Optional[tuple[float, ...]]:
+    """Every wall time at which an unchanged replica and ledger could project differently: each owner collector's
+    per-scope heartbeat and its end (``scope_window`` of that owner), each obligation's owner observation and its
+    180 s end. A superset of what core judges (project() owner liveness, ``owner_attests_terminal``,
+    ``_moved_evidence``). None when unreadable."""
+    try:
+        from hermes_cli.kanban_origin_ledger import _owner_evidence
+        from hermes_cli.kanban_scope_heartbeat import scope_window
+    except ImportError:
+        return None
+    out: set[float] = set()
+
+    def add(at: Any, window: float) -> None:
+        if isinstance(at, (int, float)) and math.isfinite(at):
+            out.update((float(at), float(at) + window))
+
+    try:
+        if replica is not None and Path(replica).is_file():
+            conn = core.ro_connect(Path(replica))
+            try:
+                infos = conn.execute("SELECT data FROM replica WHERE coll = 'gateway'").fetchall()
+            finally:
+                conn.close()
+            for (raw,) in infos:
+                try:
+                    info = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                scopes = info.get("task_scopes") if isinstance(info, dict) else None
+                if isinstance(scopes, list):
+                    window = scope_window(info)
+                    for scope in scopes:
+                        if isinstance(scope, dict):
+                            add(scope.get("observed_at"), window)
+        conn = core.ro_connect(ledger)
+        try:
+            tasks = conn.execute("SELECT task_json FROM origin_obligations").fetchall()
+        finally:
+            conn.close()
+        for (raw,) in tasks:
+            try:
+                task = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(task, dict):
+                add(_owner_evidence(task).get("observed_at"), _REPLICA_FRESH_S)
+    except Exception:
+        return None
+    return tuple(sorted(out))
+
+
+def _alias_sessions(legacy: Optional[list[dict]], rows: list[dict]) -> frozenset[str]:
+    """Sessions whose compression tip the projection may resolve (a superset): core's ``superseded`` resolves tips
+    only for a legacy card whose ``(key, origin gateway, origin profile)`` matches a receipt row that does not
+    already name the card's session, and then only that card's session and the row's two aliases."""
+    if not legacy:
+        return frozenset()
+    by_key: dict[tuple, list[dict]] = {}
+    for r in rows:
+        by_key.setdefault((r.get("key"), r.get("origin_gateway"), r.get("origin_profile")), []).append(r)
+    out: set[str] = set()
+    for c in legacy:
+        for r in by_key.get((c.get("key"), c.get("origin_gateway"), c.get("origin_profile")), ()):
+            if c.get("session") in (r.get("origin_session"), r.get("session")):
+                continue
+            out.update(str(s) for s in (c.get("session"), r.get("origin_session"), r.get("session")) if s)
+    return frozenset(out)
+
+
+def _alias_tips(sessions: frozenset[str]) -> Optional[tuple]:
+    """``((session, compression tip), ...)`` exactly as core's projection resolves them; None when state.db cannot
+    be opened. One short-lived connection, closed here (state.db is never observed, IDLE-READS.md)."""
+    if not sessions:
+        return ()
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.kanban_origin import _ro
+        from hermes_cli.kanban_origin_adapter import _resolve_session
+        state_db = get_hermes_home() / "state.db"
+        conn = _ro(state_db)
+    except Exception:
+        return None
+    try:
+        out = []
+        for sid in sorted(sessions):
+            try:
+                out.append((sid, _resolve_session(state_db, sid, conn)))
+            except (OSError, sqlite3.Error, ValueError):
+                out.append((sid, None))  # core's tip(): unresolvable is None
+        return tuple(out)
+    finally:
+        conn.close()
+
+
+def _gate_structure(ksa, ledger: Path) -> Optional[tuple]:
+    """Every store the projection reads except state.db: core's own links fingerprint (hub replica task/gateway
+    content, each board's content revision, ledger stat) plus the ledger's committed revision (retained observer)."""
+    token = core.revision_token(ledger)
+    if token is None:
+        return None
+    return ksa._origin_scope(), ksa._links_fingerprint(), token
+
+
+def _restamp(memo: dict, last_ok: Optional[float], lo: Optional[float]):
+    """``(cards, rows)`` of ``memo`` with ``synced_at`` as the current replica meta gives it, or None when that
+    cannot be derived from the stored rows. Only ``synced_at`` follows ``last_ok`` (every hub pull) without a verdict
+    changing: origin rows carry project()'s ``last_ok``; live replica cards ``min(owner seen, last_ok)``."""
+    cards, rows = memo["cards"], memo["rows"]
+    if last_ok == memo["last_ok"] and lo == memo["lo"]:
+        return list(cards), list(rows)
+    moved = {id(r): (r if r.get("synced_at") == lo else {**r, "synced_at": lo}) for r in rows}
+    out = []
+    for c in cards:
+        if id(c) in moved:
+            out.append(moved[id(c)])  # a card core took from the origin rows (the same object)
+            continue
+        if c.get("via") == "origin":
+            return None  # an origin card that is not one of the rows: provenance unknown
+        if c.get("stale") is not False:
+            if memo["verdict"][-1]:
+                return None  # stale replica: a live row is indistinguishable from a remembered one
+            out.append(c)  # a remembered (stale) row keeps its stamp
+            continue
+        s = c.get("synced_at")
+        if s is None or memo["last_ok"] is None or not s < memo["last_ok"] or not last_ok:
+            return None  # owner seen unknown (the stamp was last_ok itself)
+        new = min(s, last_ok)
+        out.append(c if new == s else {**c, "synced_at": new})
+    return out, list(moved.values())
+
+
+def _gate_hit(ksa, ledger: Path, now: float):
+    """``(cards, rows, core entry)`` when the stored projection is still exactly what core would project now."""
+    with _gate_lock:
+        memo = _gate.get("memo")
+    if memo is None or ksa._links_cache is None:  # core reset its caches: so does the gate
+        return None
+    if now < memo["t0"]:
+        return None
+    cut = memo["cutoffs"]
+    i = bisect.bisect_left(cut, memo["t0"])
+    if i < len(cut) and cut[i] <= now:
+        return None  # a heartbeat or observation window opened or closed since the projection
+    clock = _replica_clock(ksa, now)
+    if clock is None or clock[0] != memo["verdict"]:
+        return None
+    if _gate_structure(ksa, ledger) != memo["structure"] or _alias_tips(memo["sessions"]) != memo["tips"]:
+        return None
+    stamped = _restamp(memo, clock[1], clock[2])
+    if stamped is None:
+        return None
+    entry = memo["entry"]
+    # Core's own entry shape (expires, scope, fingerprint, cards, rows), restamped: what a pinned reader gets.
+    return stamped[0], stamped[1], (entry[0], entry[1], entry[2], stamped[0], stamped[1])
+
+
+def _gate_project(ksa, ledger: Path, now: float):
+    """Core's projection; stored for reuse only when it was projected after the inputs were read, they are unchanged
+    afterwards, and nothing in it came from a failed read."""
+    scope = ksa._origin_scope()
+    try:
+        from hermes_constants import get_hermes_home
+        state_db: Optional[Path] = get_hermes_home() / "state.db"
+    except Exception:
+        state_db = None
+    # Holding core's projection lock while reading the inputs: no projection is running, so any entry published
+    # after this block was projected from inputs at least this new.
+    with ksa._links_lock:
+        before = ksa._links_cache
+        with ksa._cache_lock:
+            legacy_before = ksa._remote_last
+        clock = _replica_clock(ksa, now)
+        structure = _gate_structure(ksa, ledger)
+        state = _stat_key(state_db) if state_db is not None else None
+    with ksa.one_annotation_snapshot():
+        cards, rows = ksa.remote_links_and_origin_rows()
+        entry = getattr(ksa._annotation_scope, "links", None)
+    with _gate_lock:
+        _gate.pop("memo", None)
+    with ksa._cache_lock:
+        legacy, legacy_scope = ksa._remote_last, ksa._remote_scope
+    if (entry is None or entry is before or clock is None or structure is None or state is None
+            or legacy is legacy_before or legacy_scope != scope):
+        return cards, rows  # a core cache hit, unreadable input, or the replica read failed (stale fallback)
+    if state_db is None or _stat_key(state_db) != state or _gate_structure(ksa, ledger) != structure:
+        return cards, rows  # an input moved while projecting
+    if _replica_clock(ksa, time.time()) != clock:
+        return cards, rows  # a pull landed or a verdict flipped while projecting: the rows may mix both
+    verdict, last_ok, lo = clock
+    if any(r.get("synced_at") != lo for r in rows):
+        return cards, rows  # project() read another sync stamp (or none): not this meta
+    if verdict[3] and verdict[0] in (None, "") and rows and all(r.get("stale") is not False for r in rows):
+        return cards, rows  # a fresh replica yet nothing current: project() may have swallowed a replica error
+    sessions = _alias_sessions(legacy, rows)
+    tips = _alias_tips(sessions)
+    cutoffs = _clock_cutoffs(ksa._hub_db_path(), ledger)
+    if tips is None or cutoffs is None:
+        return cards, rows
+    memo = {"t0": now, "cutoffs": cutoffs, "verdict": verdict, "last_ok": last_ok, "lo": lo,
+            "structure": structure, "sessions": sessions, "tips": tips,
+            "cards": list(cards), "rows": list(rows), "entry": entry}
+    with _gate_lock:
+        _gate["memo"] = memo
+    return cards, rows
+
+
+def _gated_inventory(ksa, ledger: Path) -> tuple[list[dict], list[dict]]:
+    """``ksa.remote_links_and_origin_rows()``, reused across passes while unchanged (``_gate_hit``). A memo already
+    validated by ``_gate_hit``/``_gate_project`` is reused without re-reading its inputs while their cheap content
+    keys (``_gate_inputs``) are unchanged; every clock verdict and cut-off is still judged now (``_gate_fast``)."""
+    if not _gate_ready(ksa):
+        return ksa.remote_links_and_origin_rows()
+    now = time.time()
+    fast = _gate_fast(ksa, ledger, now)
+    if fast is not None:
+        return fast
+    with _gate_lock:
+        prior = _gate.get("memo")
+    # Labelled with the inputs read BEFORE validating/projecting; kept only if nothing moved by the end.
+    pre, meta = _gate_inputs(ksa, ledger), _replica_meta(ksa)
+    hit = _gate_hit(ksa, ledger, now)
+    if hit is not None:
+        _gate_remember(ksa, ledger, prior, pre, meta, now)
+        return hit[0], hit[1]
+    out = _gate_project(ksa, ledger, now)
+    with _gate_lock:
+        stored = _gate.get("memo")
+    if stored is not None and stored is not prior and stored["t0"] == now:
+        _gate_remember(ksa, ledger, stored, pre, meta, now)
+    return out
+
+
+def _gate_inputs(ksa, ledger: Path) -> Optional[tuple[tuple, Optional[tuple]]]:
+    """Cheap content keys covering everything ``_gate_hit`` re-reads, each at least as change-sensitive as the key
+    the gate compares: ``(scope, hub replica stat, each core board's and the ledger's committed revision, ledger
+    stat), state.db stat``. The hub stat also covers the replica meta (its ``last_ok``) and is the key core's own
+    ``_hub_content_signature`` memo uses; boards and the ledger use the retained observers' ``data_version``
+    (``core.revision_token``); state.db (alias tips) is only stat'ed, never opened. None: no shortcut."""
+    try:
+        if getattr(getattr(getattr(ksa, "_revalidate", None), "inputs_pin", None), "fingerprints", None) is not None:
+            return None  # an outer pin decides core's fingerprints: no shortcut under it
+        from hermes_constants import get_hermes_home
+        hub = ksa._hub_db_path()
+        boards = tuple(str(p) for p in ksa._board_db_paths())
+        tokens = tuple(core.revision_token(Path(p), board=True) for p in boards)
+        led = core.revision_token(ledger)
+        if led is None or None in tokens:
+            return None
+        main = (ksa._origin_scope(), str(hub) if hub is not None else None,
+                _stat_key(Path(hub)) if hub is not None else None, boards, tokens, led, _stat_key(ledger))
+        return main, _stat_key(get_hermes_home() / "state.db")
+    except Exception:
+        logger.debug("chat-closeout: gate input keys unavailable", exc_info=True)
+        return None
+
+
+def _gate_remember(ksa, ledger: Path, memo: Optional[dict], pre, meta, at: float) -> None:
+    """Record ``memo`` (just validated at ``at``, or stored) for ``_gate_fast`` under the input keys ``pre`` read
+    before it, only when the keys are unchanged now and ``meta`` judges to the memo's verdict at ``at``."""
+    if memo is None or pre is None or meta is None:
+        return
+    clock = _judge_replica(ksa, meta, at)
+    if clock is None or clock[0] != memo["verdict"]:
+        return
+    if _gate_inputs(ksa, ledger) != pre:
+        return  # an input moved while validating or projecting
+    with _gate_lock:
+        if _gate.get("memo") is memo:
+            _gate["fast"] = {"memo": memo, "key": pre, "meta": meta}
+
+
+def _gate_fast(ksa, ledger: Path, now: float):
+    """``(cards, rows)`` of the validated memo while every input key is unchanged; the cut-offs and the replica
+    verdicts are judged at ``now`` from the recorded meta (unchanged with the hub stat). None: full gate."""
+    with _gate_lock:
+        memo, fast = _gate.get("memo"), _gate.get("fast")
+    if memo is None or fast is None or fast["memo"] is not memo or ksa._links_cache is None:
+        return None
+    if now < memo["t0"]:
+        return None
+    cut = memo["cutoffs"]
+    i = bisect.bisect_left(cut, memo["t0"])
+    if i < len(cut) and cut[i] <= now:
+        return None
+    clock = _judge_replica(ksa, fast["meta"], now)
+    if clock is None or clock[0] != memo["verdict"]:
+        return None
+    key = _gate_inputs(ksa, ledger)
+    if key is None or key[0] != fast["key"][0] or (memo["sessions"] and key[1] != fast["key"][1]):
+        return None
+    return _restamp(memo, clock[1], clock[2])
+
+
+_PARKED_NEEDS = ("_board_db_paths", "_parked_pairs", "_local_wait_rows", "_describe_waits", "_board_slug",
+                 "_remote_links", "_remote_wait")
+
+
+class _Uncacheable(Exception):
+    """A read core would swallow (and degrade) failed: answer it uncached, never store it."""
+
+
+class _StrictEvents:
+    """The board connection, except that a failed park-event query on a board that has ``task_events`` raises
+    ``_Uncacheable`` instead of the ``sqlite3.Error`` core's ``_local_wait_rows`` swallows into status-only info:
+    that degraded answer must not be kept until the next commit. A board without the table degrades as in core."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def execute(self, sql: str, *args: Any):
+        try:
+            return self._conn.execute(sql, *args)
+        except sqlite3.Error as exc:
+            if "task_events" in sql and self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_events'").fetchone():
+                raise _Uncacheable(str(exc)) from exc
+            raise
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
+def _board_parked_rows(ksa, conn: sqlite3.Connection, strict: bool = True) -> tuple[frozenset, tuple, dict[str, str]]:
+    """Clock-free rows of one board's parked cards: ``(pairs, (parked, events), titles)``, exactly what core
+    ``parked_waits`` reads per board before judging wait ages (``_describe_waits``). Pure in the board's content.
+    ``strict``: a transient park-event failure raises (``_StrictEvents``) rather than return a degraded answer."""
+    pairs = frozenset(ksa._parked_pairs(conn))
+    if not pairs:
+        return pairs, ({}, {}), {}
+    rows = ksa._local_wait_rows(_StrictEvents(conn) if strict else conn, {tid for _, tid in pairs})
+    titles: dict[str, str] = {}
+    ids = sorted(rows[0])  # wait info is only ever given for parked rows
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        titles.update((str(t), str(n or "")) for t, n in conn.execute(
+            f"SELECT id, title FROM tasks WHERE id IN ({','.join('?' for _ in chunk)})", chunk))
+    return pairs, rows, titles
+
+
+def _local_parked(ksa, now: Optional[float]) -> list[dict]:
+    """The local half of core ``parked_waits``. Core opened a fresh connection per board per pass (native/proxy:
+    the largest cost left in the owner wake); here each board's clock-free rows come from its registered retained
+    observer and are reused while its ``data_version`` is unchanged. Wait ages are judged now, on every call."""
+    out: list[dict] = []
+    for path in ksa._board_db_paths():
+        try:
+            try:
+                pairs, rows, titles = core._structural_reads.read(
+                    path, ("parked-wait-rows",), lambda conn: _board_parked_rows(ksa, conn), board=True)
+            except _Uncacheable:  # core's degraded answer for this pass, from a one-shot read, never stored
+                conn = core.ro_connect(Path(path), board=True)
+                try:
+                    pairs, rows, titles = _board_parked_rows(ksa, conn, strict=False)
+                finally:
+                    conn.close()
+            info = ksa._describe_waits(*rows, now=now) if pairs else {}
+        except Exception as exc:  # core: a board read failure skips that board
+            logger.debug("chat-closeout: parked waits read failed for %s: %s", path, exc)
+            continue
+        board = ksa._board_slug(path)
+        for sid, tid in sorted(pairs):
+            if tid in info:
+                out.append({"session": sid, "id": tid, "board": board, "key": f"{board}/{tid}",
+                            "title": titles.get(tid, ""), "remote": False, "gateway": None, "wait": info[tid]})
+    return out
+
+
+def _parked_waits(ksa, now: Optional[float]) -> list[dict]:
+    """Core ``parked_waits``, composed from core's own helpers: local rows from retained board observers
+    (``_local_parked``), remote cards from the gated projection (``_gated_inventory``). Wait info is computed at
+    call time from the rows, never stored. Older cores: core's own ``parked_waits``."""
+    if not all(hasattr(ksa, n) for n in _PARKED_NEEDS):
+        return ksa.parked_waits(now=now)
+    out = _local_parked(ksa, now)
+    try:
+        from hermes_constants import get_hermes_home
+        ledger = get_hermes_home() / "kanban" / "origin-ledger.db"
+        if ledger.exists() and _gate_ready(ksa):
+            remote = _gated_inventory(ksa, ledger)[0]
+        else:
+            remote = ksa._remote_links()
+    except Exception as exc:
+        logger.warning("chat-closeout: parked waits: remote links unreadable, local cards only this pass: %s", exc)
+        remote = []
+    for card in remote:
+        if card.get("stale"):
+            continue
+        wait = ksa._remote_wait(card)
+        if wait is None:
+            continue
+        out.append({"session": str(card.get("session")), "id": str(card.get("id")), "board": card.get("board"),
+                    "key": str(card.get("key")), "title": str(card.get("title") or ""), "remote": True,
+                    "gateway": card.get("gateway"), "wait": wait})
+    return out
+
+
 def remote_cards() -> list[dict]:
     """Use core's authoritative projection, including released rows (session_tasks omits those).
 
@@ -101,7 +575,8 @@ def remote_cards() -> list[dict]:
     shared = getattr(ksa, "remote_links_and_origin_rows", None)
     if shared is not None:
         # Newer cores keep the ledger rows of their cached projection: same rows, no second project() per pass.
-        cards, rows = shared()
+        # Across passes the projection is reused only while every input it reads is unchanged (REMOTE-GATE.md).
+        cards, rows = _gated_inventory(ksa, path)
         return [card for card in cards if card.get('via') != 'origin'] + rows
     replica = ksa._hub_db_path()
     rows = project(path, replica=replica,
@@ -142,9 +617,10 @@ def _hub_fresh() -> bool:
         return False
 
 
-def _replica_completed_at(cards: list[dict]) -> dict[int, float]:
+def _replica_completed_at(cards: list[dict], failed_out: Optional[list] = None) -> dict[int, float]:
     """``{id(card): completed_at}`` from the hub replica's task records (``[profile/]board/id`` under the owner
-    gateway) for finished shepherd rows that carry no completion time. Read-only; an unreadable replica gives {}."""
+    gateway) for finished shepherd rows that carry no completion time. Read-only; an unreadable replica gives {}
+    (and is noted in ``failed_out``: such a read must never be reused)."""
     path = hub_db_path()
     if path is None or not cards:
         return {}
@@ -152,6 +628,8 @@ def _replica_completed_at(cards: list[dict]) -> dict[int, float]:
     try:
         conn = core.ro_connect(Path(path))
     except Exception:
+        if failed_out is not None:
+            failed_out.append(path)
         return {}
     try:
         for card in cards:
@@ -165,6 +643,8 @@ def _replica_completed_at(cards: list[dict]) -> dict[int, float]:
                     and data.get("completed_at") is not None:
                 out[id(card)] = float(data["completed_at"])
     except Exception:
+        if failed_out is not None:
+            failed_out.append(path)
         logger.debug("chat-closeout: replica completion times unavailable", exc_info=True)
     finally:
         conn.close()
@@ -179,22 +659,11 @@ def _read_shadow(board: str, ids: set[str]) -> tuple[bool, set[str]]:
 
     Fresh = exactly one sync-state row naming this board, pulled within 120 s and not future-dated."""
     path = _kanban_root() / 'kanban' / 'sync-shadow' / f'{board}.db'
-    conn = core.ro_connect(path)
-    try:
-        conn.execute('BEGIN')
-        state = conn.execute('SELECT board_id, pulled_at FROM kanban_sync_state').fetchall()
-        fresh = len(state) == 1 and state[0][0] == board and state[0][1] is not None \
-            and 0 <= time.time() - float(state[0][1]) <= 120
-        found: set[str] = set()
-        wanted = sorted(ids)
-        for i in range(0, len(wanted), 500):
-            chunk = wanted[i:i + 500]
-            # Query ids, not status or links: absence is stronger than "not linked".
-            found.update(str(r[0]) for r in conn.execute(
-                f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk))
-        return fresh, found
-    finally:
-        conn.close()
+    # Rows are reused while the shadow's committed revision is unchanged; freshness is judged now, every call.
+    state, found = core.shadow_rows(path, ids)
+    fresh = len(state) == 1 and state[0][0] == board and state[0][1] is not None \
+        and 0 <= time.time() - float(state[0][1]) <= 120
+    return fresh, set(found)
 
 
 def _board_absence_veto(keys: set[str]) -> set[str]:
@@ -262,8 +731,61 @@ def _board_absence_veto(keys: set[str]) -> set[str]:
     return veto
 
 
+def _read_key(ids: list[str], light: bool) -> Optional[tuple]:
+    """Content key of ``read_cards``'s local half: the ids, the mode, the board list and each board's committed
+    revision (retained observer ``data_version``). None when a board cannot be observed: no reuse."""
+    boards = tuple(str(p) for p in board_paths())
+    tokens = tuple(core.revision_token(Path(p), board=True) for p in boards)
+    if None in tokens:
+        return None
+    return light, tuple(sorted(set(ids))), boards, tokens
+
+
+def _same_rows(a: list[dict], b: list[dict]) -> bool:
+    """The very same inventory row objects in the same order: the gate handed back its unchanged projection."""
+    return len(a) == len(b) and all(x is y for x, y in zip(a, b))
+
+
+def _fresh_card(card: dict) -> dict:
+    out = dict(card)
+    if isinstance(out.get("parents"), list):
+        out["parents"] = list(out["parents"])
+    return out
+
+
+_read_memo_lock = threading.Lock()
+_read_memo: dict[bool, dict] = {}  # light -> the last reusable read (``_reused_read``)
+
+
+def _reused_read(ids: list[str], remote_inventory: Callable[[], list[dict]], light: bool,
+                 key: Optional[tuple]) -> Optional[dict]:
+    """The stored read of exactly these ids when nothing it was derived from changed: the same board revisions
+    (``key``), the very same inventory rows (``_same_rows``) and, if the hub replica filled a completion time, the
+    same replica stat. Absence coverage is time-judged and recomputed here. None: read afresh."""
+    with _read_memo_lock:
+        snap = _read_memo.get(light)
+    if snap is None or key is None or snap["key"] != key:
+        return None
+    try:
+        remote = remote_inventory()
+    except Exception:
+        return None  # the full read reports it (and stores nothing)
+    if not _same_rows(remote, snap["rows"]):
+        return None
+    if snap["hub"] is not None:
+        hub = hub_db_path()
+        current = (str(hub), _stat_key(Path(hub))) if hub is not None else ("no-replica",)
+        if current != snap["hub"]:
+            return None
+    want = set(ids)
+    out = core.Cards({k: _fresh_card(c) for k, c in snap["cards"].items()})
+    out.absence_veto = frozenset(_board_absence_veto(want - set(out)))
+    out.uncertain = frozenset(snap["uncertain"] | out.absence_veto)
+    return out
+
+
 def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict]]] = None,
-               light: bool = False) -> dict:
+               light: bool = False, reuse: bool = False) -> dict:
     """Local and remote cards by ledger key. ``light``: local cards carry only ``core.SETTLE_FIELDS``.
 
     Returns a ``core.Cards``: ``uncertain`` names keys that may exist but could not be resolved (never evidence
@@ -271,20 +793,30 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
     match that matches exactly one inventory owner key by card id comes back as that card with ``canonical_key``
     (``core.reconcile`` rewrites the ledger); several owners leave it unresolved and uncertain. A finished shepherd
     row with no completion time takes it from another inventory row of the same owner key, else the hub replica,
-    so its transcript acknowledgement can be proven."""
+    so its transcript acknowledgement can be proven.
+
+    ``reuse`` (a pass's union read, IDLE-READS.md): a successful read is kept and returned again (fresh copies) while
+    its content keys are unchanged (``_reused_read``); a read with any failure is never kept."""
+    remote_inventory = remote_inventory or remote_cards
+    content = _read_key(ids, light) if reuse else None
+    if content is not None:
+        hit = _reused_read(ids, remote_inventory, light, content)
+        if hit is not None:
+            return hit
     uncertain: set[str] = set()
+    failed: list = []
     want = set(ids)
     # Every key's card id is also looked up as a bare id on every local board: a missing 2/3/4-part key whose id
     # some local card carries is not "matches nothing" (never unlinked), and a 3-part legacy key with a local card
     # of that id never migrates to a remote owner.
     probe = want | {str(i).rsplit('/', 1)[-1] for i in want if '/' in str(i)}
-    cards = core.read_cards(board_paths(), probe, light=light, uncertain_out=uncertain)
+    cards = core.read_cards(board_paths(), probe, light=light, uncertain_out=uncertain, failed_out=failed)
     local_ids = {str(k).rsplit('/', 1)[-1] for k in cards} | {str(k).rsplit('/', 1)[-1] for k in uncertain}
     cards = {k: v for k, v in cards.items() if k in want}
     uncertain &= want
     out = core.Cards()
     try:
-        remote = (remote_inventory or remote_cards)()
+        remote = remote_inventory()
     except Exception:
         # Qualified local cards remain usable. Old bare IDs have lost ownership:
         # without the remote inventory they cannot safely resolve to local done.
@@ -330,8 +862,13 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
             uncertain.add(key)  # several owners, or another owner key than this one: not "matches nothing"
     fill = [c for c in cards.values() if c.get('remote') and c.get('via') == 'shepherd'
             and c.get('status') in core.DONE_STATUSES and c.get('completed_at') is None]
+    hub_key = None
     if fill:
-        replica = _replica_completed_at([c for c in fill if core.card_key(c) not in times])
+        ask = [c for c in fill if core.card_key(c) not in times]
+        if ask:
+            hub = hub_db_path()
+            hub_key = (str(hub), _stat_key(Path(hub))) if hub is not None else ("no-replica",)
+        replica = _replica_completed_at(ask, failed_out=failed)
         fill_ids = {id(c) for c in fill}
         for key, card in list(cards.items()):
             if id(card) in fill_ids:
@@ -341,6 +878,12 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
     out.update(cards)
     out.absence_veto = frozenset(_board_absence_veto(want - set(cards)))
     out.uncertain = frozenset((uncertain & want) | out.absence_veto)
+    if content is not None and not failed and _read_key(ids, light) == content:
+        # Labelled with the board revisions read BEFORE the read; nothing committed since.
+        snap = {"key": content, "rows": list(remote), "hub": hub_key, "uncertain": frozenset(uncertain & want),
+                "cards": {k: _fresh_card(c) for k, c in cards.items()}}
+        with _read_memo_lock:
+            _read_memo[light] = snap
     return out
 
 
@@ -379,7 +922,7 @@ def _pass_reader(light: bool = False) -> Callable[[list[str]], dict]:
         if not want or not want <= union["ids"]:
             return read_cards(ids, remote_inventory=inventory, light=light)
         if "cards" not in union:
-            union["cards"] = read_cards(sorted(union["ids"]), remote_inventory=inventory, light=light)
+            union["cards"] = read_cards(sorted(union["ids"]), remote_inventory=inventory, light=light, reuse=True)
         full = union["cards"]
         out = core.Cards({key: card for key, card in full.items() if key in want})
         out.uncertain = frozenset(set(getattr(full, "uncertain", ())) & want)
@@ -719,10 +1262,18 @@ def _lineage(sid: str) -> list[str]:
 
 def _unseen_counts() -> Optional[dict[str, int]]:
     """Unseen kanban results per session, or None when unreadable: a failed read must never look like "all
-    notices delivered" (that would wake a chat before its results landed)."""
+    notices delivered" (that would wake a chat before its results landed).
+
+    Reads only what that count is made of, core's local-board notify subscriptions (``core.unseen_counts`` over
+    core's board list and event kinds), not ``_all_counts``: that whole projection's remote-links refresh was
+    most of this thread's idle CPU. Cores without those names keep the old projection read."""
     try:
         from hermes_cli import kanban_session_activity as ksa
-        return dict(ksa._all_counts()[2])
+        kinds = getattr(ksa, "UNSEEN_KINDS", None)
+        paths = getattr(ksa, "_board_db_paths", None)
+        if kinds is None or paths is None:
+            return dict(ksa._all_counts()[2])
+        return core.unseen_counts(list(paths()), kinds)
     except Exception:
         logger.debug("chat-closeout: unseen counts unavailable", exc_info=True)
         return None
@@ -959,7 +1510,7 @@ def owner_wake_tick(*, now: Optional[float] = None, cards: Optional[list[dict]] 
     if cards is None:
         if ksa is None or not hasattr(ksa, "parked_waits"):
             return []
-        cards = ksa.parked_waits(now=now)
+        cards = _parked_waits(ksa, now)
     if wake is None:
         srv = _server()
         wake = srv._wake_session_turn if srv is not None else None
@@ -1228,6 +1779,7 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
     observed: set[str] = set()  # detection predicates, before sleep-safe age gates
     uncertain: set[str] = set()
     flagged = set(led.flags())
+    pending = led.pending()  # one ledger read for every check below (none of them writes the waiting rows)
     for sid, since in led.unseen_since({s: n for s, n in unseen.items() if n > 0}, now).items():
         key = f"chat-closeout:unseen:{sid}:{int(since)}"
         observed.add(key)
@@ -1238,7 +1790,7 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                f"{int((now - since) / 60)} min.")
         candidates.append((key, f"Kanban results stuck for chat {sid}", msg + " Check the "
                            "unloaded-session sweeper in gui.log and deliver the notices via an agent route."))
-    for row in led.pending():
+    for row in pending:
         sig, at = row.get("settled_sig"), row.get("settled_at")
         if not sig or not at or sig == row.get("done_sig"):
             continue
@@ -1257,7 +1809,7 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                f"settled {int((now - float(at)) / 60)} min ago and no close-out turn ran "
                f"(last wake: {row.get('wake_result') or 'none'}).")
         candidates.append((key, f"No close-out for chat {row['session_id']}", msg))
-    for row in led.pending():
+    for row in pending:
         since = row.get("failure_since")
         if since is None:
             continue
@@ -1276,7 +1828,7 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
     # first-seen time). Wall age >= STUCK_S plus STALE_S of this process's monotonic observation, so a lid sleep
     # alone never files it; a full day of uptime is not required (a backend restart would never let it fire).
     stuck: dict[str, list[str]] = {}
-    for row in led.pending():
+    for row in pending:
         cards = read(row["batch"])
         unknown = [t for t in row["batch"] if core.is_unresolved(cards.get(t))]
         working = [t for t in row["batch"] if core.is_working(cards.get(t))]

@@ -4,6 +4,7 @@ tests run on throwaway SQLite files."""
 from __future__ import annotations
 
 import contextlib
+from collections import OrderedDict
 import hashlib
 import json
 import logging
@@ -31,16 +32,44 @@ TAG = "[chat-closeout]"
 
 
 # ---- sqlite helpers --------------------------------------------------------------------------------------------
-def ro_connect(path: Path, timeout: float = 2.0) -> sqlite3.Connection:
-    """Read-only open that survives a WAL db whose -wal/-shm were deleted (mode=rw + query_only fallback)."""
+def ro_connect(path: Path, timeout: float = 2.0, *, check_same_thread: bool = True,
+               board: bool = False) -> sqlite3.Connection:
+    """Read-only open that survives a WAL db whose -wal/-shm were deleted (mode=rw + query_only fallback).
+    ``board=True`` (a Kanban board) opens through core's guarded, generation-registered reader when core has
+    one (``kanban_generation.open_ro``); older cores fall back to the plain open below."""
+    if board:
+        open_ro = _core_board_open()
+        if open_ro is not None:
+            c = open_ro(Path(path), check_same_thread=check_same_thread)
+            c.row_factory = sqlite3.Row
+            return c
     try:
-        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout, check_same_thread=check_same_thread)
         c.execute("select 1 from sqlite_master limit 1")
     except sqlite3.OperationalError:
-        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout, check_same_thread=check_same_thread)
         c.execute("PRAGMA query_only=ON")
     c.row_factory = sqlite3.Row
     return c
+
+
+def _core_board_open() -> Optional[Callable[..., sqlite3.Connection]]:
+    try:
+        from hermes_cli import kanban_lockguard  # noqa: F401 -- open_ro needs it; a partial/stubbed core falls back
+        from hermes_cli.kanban_generation import open_ro
+    except ImportError:  # core without the WAL-generation registry
+        return None
+    return open_ro
+
+
+def _shm_identity(path: str) -> Optional[tuple]:
+    """``(dev, ino)`` of the live ``-shm`` (None when absent): a retained connection opened on one ``-shm``
+    inode maps a dead WAL index once the path names another, or none."""
+    try:
+        st = os.stat(path + "-shm")
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
 
 
 class ReadPool:
@@ -49,6 +78,7 @@ class ReadPool:
 
     def __init__(self) -> None:
         self._conns: dict[str, sqlite3.Connection] = {}
+        self._cols: dict[tuple[str, str], set[str]] = {}
 
     def get(self, path: Path) -> sqlite3.Connection:
         key = str(path)
@@ -56,7 +86,17 @@ class ReadPool:
             self._conns[key] = ro_connect(Path(path))
         return self._conns[key]
 
+    def cols(self, path: Path, table: str) -> set[str]:
+        """``table``'s columns on this pass's connection to ``path``, read once per pass (a schema changes only by
+        migration; the next pass reads it again). Forgotten with the connection."""
+        key = (str(path), table)
+        if key not in self._cols:
+            self._cols[key] = _cols(self.get(path), table)
+        return self._cols[key]
+
     def drop(self, path: Path) -> None:
+        for key in [k for k in self._cols if k[0] == str(path)]:
+            del self._cols[key]
         conn = self._conns.pop(str(path), None)
         if conn is not None:
             conn.close()
@@ -64,6 +104,182 @@ class ReadPool:
     def close(self) -> None:
         for key in list(self._conns):
             self.drop(Path(key))
+
+
+_GENERATION_HOOK: Optional[Callable[[str], None]] = None  # the evict callback registered with core, once
+
+
+def _register_generation_hook(cache: "_StructuralReads") -> None:
+    """Let core ``kanban_generation.recover()`` retire our observers before it reopens a board on a new WAL
+    generation; without this, one retained observer on a deleted ``-shm`` makes recover refuse every board
+    connect in the process. Older cores have no registry: observers then rely on the ``-shm`` check alone."""
+    global _GENERATION_HOOK
+    if _GENERATION_HOOK is not None:
+        return
+    try:
+        from hermes_cli.kanban_generation import register_reader_cache
+    except ImportError:
+        return
+    register_reader_cache(cache.evict)
+    _GENERATION_HOOK = cache.evict
+
+
+def _deleted_generation_error(message: str) -> sqlite3.OperationalError:
+    try:
+        from hermes_cli.kanban_generation import DeletedWalGenerationError
+    except ImportError:
+        return sqlite3.OperationalError(message)
+    return DeletedWalGenerationError(message)
+
+
+class _StructuralReads:
+    """One bounded, process-wide pool of read-only observers; data_version is meaningful only on a retained
+    connection.
+
+    Cache only successful structural reads, never health or clock-derived decisions. No read transaction
+    survives a call. A pre-read revision is rechecked after the read, so a concurrent commit cannot label
+    old data with a newer revision. Path identity fences replacement/deletion; failures close and retry.
+
+    WAL generations: each entry records its ``-shm`` identity and is dropped when the live one differs (an
+    external process unlinked the sidecars), so a frozen data_version never vouches for old rows. Board
+    observers are core's registered, guarded readers and ``evict`` is registered with core, so core
+    ``recover()`` closes them before any other connect. Entries are ``(identity, conn, cached, lock, shm)``;
+    a connection is used and closed only under its own ``lock``; ``evict`` never waits on a borrowed one.
+    The pool is shared by every thread (bounded descriptors), not per thread.
+    """
+    MAX_DATABASES = 48  # local boards + sync shadows (~16 + ~10 on the largest host); up to 3 descriptors each
+    MAX_QUERIES = 128
+    _ATTEMPTS = 3
+
+    def __init__(self):
+        self.entries = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _close(*entries):
+        for entry in entries:
+            if entry is not None:
+                with entry[3]:
+                    with contextlib.suppress(sqlite3.Error):
+                        entry[1].close()
+
+    def drop(self, path):
+        with self._lock:
+            entry = self.entries.pop(str(path), None)
+        self._close(entry)
+
+    def clear(self):
+        with self._lock:
+            entries = list(self.entries.values())
+            self.entries.clear()
+        self._close(*entries)
+
+    def evict(self, path):
+        """Core reader-cache hook (``path`` is a realpath). Raises instead of waiting on a borrowed observer;
+        core's caller retries once the borrower returns it.
+
+        Unpublish under ``_lock`` but close only after releasing it: closing a board connection takes that
+        board's lifecycle lock, and core calls this hook both from a connect() holding that lock and from the
+        sync pool without it (lock-order inversion otherwise). Each entry stays under its own lock until closed."""
+        taken = []
+        try:
+            with self._lock:
+                for key in [k for k in self.entries if os.path.realpath(k) == path]:
+                    entry = self.entries[key]
+                    if not entry[3].acquire(blocking=False):
+                        raise _deleted_generation_error(f"chat-closeout observer of {path} is borrowed; retry")
+                    taken.append(entry)
+                    del self.entries[key]
+        finally:
+            for entry in taken:
+                try:
+                    with contextlib.suppress(sqlite3.Error):
+                        entry[1].close()
+                finally:
+                    entry[3].release()
+
+    @staticmethod
+    def identity(path):
+        st = Path(path).stat()
+        return st.st_dev, st.st_ino
+
+    def _current(self, path, board):
+        """A published entry whose file and ``-shm`` generation are current, opening one if needed."""
+        identity = self.identity(path)
+        shm = _shm_identity(path)
+        with self._lock:
+            entry = self.entries.get(path)
+            stale = None
+            if entry is not None and (entry[0] != identity or entry[4] != shm):
+                stale, entry = self.entries.pop(path), None
+        self._close(stale)
+        if entry is not None:
+            return entry
+        if board:
+            _register_generation_hook(self)
+        conn = ro_connect(Path(path), board=board, check_same_thread=False)
+        try:
+            if self.identity(path) != identity:
+                raise sqlite3.OperationalError(f"{path} was replaced while opening its observer")
+            shm = getattr(conn, "_hermes_generation_shm", None) or _shm_identity(path)
+        except BaseException:
+            conn.close()
+            raise
+        fresh = (identity, conn, OrderedDict(), threading.Lock(), shm)
+        with self._lock:
+            entry = self.entries.get(path)
+            retired = []
+            if entry is None or entry[0] != identity or entry[4] != shm:
+                retired.append(self.entries.pop(path, None))
+                self.entries[path] = entry = fresh
+                fresh = None
+                while len(self.entries) > self.MAX_DATABASES:
+                    retired.append(self.entries.popitem(last=False)[1])
+        self._close(fresh, *retired)  # fresh: another thread published a current one first
+        return entry
+
+    def read(self, path, key, query, *, board=False):
+        path = str(Path(path).absolute())
+        try:
+            for _ in range(self._ATTEMPTS):
+                entry = self._current(path, board)
+                with entry[3]:
+                    with self._lock:
+                        if self.entries.get(path) is not entry:
+                            continue  # retired (evicted, bounded out, replaced) while we waited
+                        self.entries.move_to_end(path)
+                    return self._read(path, entry, key, query)
+        except Exception:
+            self.drop(path)
+            raise
+        # Thrashing past the bound (more hot databases than MAX_DATABASES): answer from a one-shot
+        # connection, uncached, rather than fail the read.
+        conn = ro_connect(Path(path), board=board)
+        try:
+            return query(conn)
+        finally:
+            conn.close()
+
+    def _read(self, path, entry, key, query):
+        """Caller holds ``entry[3]``."""
+        identity, conn, cached = entry[0], entry[1], entry[2]
+        revision = conn.execute('PRAGMA data_version').fetchone()[0]
+        hit = cached.get(key)
+        if hit is not None and hit[0] == revision:
+            cached.move_to_end(key)
+            return hit[1]
+        # Discard stale entries before querying; never retain a failed result.
+        cached.pop(key, None)
+        result = query(conn)
+        if (self.identity(path) == identity and _shm_identity(path) == entry[4]
+                and conn.execute('PRAGMA data_version').fetchone()[0] == revision):
+            cached[key] = (revision, result)
+            while len(cached) > self.MAX_QUERIES:
+                cached.popitem(last=False)
+        return result
+
+
+_structural_reads = _StructuralReads()
 
 
 def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -109,13 +325,14 @@ def canonical_view(cards: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
 
 
 def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = False,
-               uncertain_out: Optional[set] = None) -> dict[str, dict[str, Any]]:
+               uncertain_out: Optional[set] = None, failed_out: Optional[list] = None) -> dict[str, dict[str, Any]]:
     """``{id: {id, status, block_kind, title, summary, completed_at, human_request, blocked_at, board}}`` for the ids
     found on any board. ``blocked_at`` is the newest ``blocked`` event (None when the board keeps no events).
 
     ``light`` (the sidebar's waiting pass, which only decides settlement) returns just ``SETTLE_FIELDS`` and skips
     the per-card event/run subqueries and the links read. It finds and refuses exactly what the full read does: the
-    full statement is still compiled (so a board the full read can't query fails the same way), just not run."""
+    full statement is still compiled (so a board the full read can't query fails the same way), just not run.
+    ``failed_out`` collects each board whose read failed (such a read must never be reused)."""
     want = sorted({str(i) for i in ids if i})
     found: dict[str, dict[str, Any]] = {}
     if not want:
@@ -139,6 +356,8 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = Fa
                         ambiguous.add(key)
                     found[key] = card
         if exc is not None:
+            if failed_out is not None:
+                failed_out.append(path)
             ambiguous.update(i for i in want if '/' not in i)
             if uncertain_out is not None:
                 uncertain_out.update(i for i in want if i.count('/') == 1 and i.split('/')[0] == board)
@@ -148,58 +367,15 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = Fa
     return {key: card for key, card in found.items() if key not in ambiguous}
 
 
-# Board reads are reused while the board's files are byte-for-byte unchanged (see _board_sig): {(path, light):
-# (signature, ids, rows)}. The sidebar's waiting pass and the waker read the same boards every few seconds, and
-# most boards sit unchanged between them.
-_board_cache: dict[tuple[str, bool], tuple[tuple, tuple, list]] = {}
-_board_cache_lock = threading.Lock()
-
-
-def _board_sig(path: Path) -> Optional[tuple]:
-    """A signature that changes with every committed write to an SQLite db: the db file's and its -wal's identity,
-    size and mtime, plus the db header's file change counter (rollback journal mode bumps it on every commit) and the
-    WAL header (a WAL reset writes new salts, so a restarted -wal of the old size still differs). None when the db
-    can't be stat'ed (no reuse)."""
-    out = []
-    for name, head in ((str(path), (24, 4)), (str(path) + "-wal", (0, 32))):
-        try:
-            fd = os.open(name, os.O_RDONLY)
-        except FileNotFoundError:
-            if name == str(path):
-                return None
-            out.append(None)
-            continue
-        except OSError:
-            return None
-        try:
-            st = os.fstat(fd)
-            if name != str(path) and st.st_size == 0:
-                out.append(None)  # an empty -wal holds no frames: the same data as no -wal
-                continue
-            out.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
-                        os.pread(fd, head[1], head[0])))
-        except OSError:
-            return None
-        finally:
-            os.close(fd)
-    return tuple(out)
-
-
 def _board_rows(path: Path, left: list[str], light: bool) -> tuple[list[dict[str, Any]], Optional[Exception]]:
-    """``(rows, error)`` of one board for ``left`` (bare ids): rows read before any error, as the per-row loop
-    stored them. Reused from the last read of this board while its signature is unchanged; errors are not cached."""
-    sig = _board_sig(path)
-    ck = (str(path), light)
-    with _board_cache_lock:
-        hit = _board_cache.get(ck)
-    if sig is not None and hit is not None and hit[0] == sig and hit[1] == tuple(left):
-        return hit[2], None
+    """Rows before any error, or successful rows reused at the same committed revision.
+
+    The key includes mode and IDs; schema, task events, runs and links all belong to this same database.
+    Board naming and cross-board ambiguity remain evaluated by read_cards on every call.
+    """
     rows: list[dict[str, Any]] = []
-    try:
-        conn = ro_connect(path)
-    except sqlite3.Error as exc:
-        return rows, exc
-    try:
+
+    def query(conn):
         cols = _cols(conn, "tasks")
         bk = "t.block_kind" if "block_kind" in cols else "NULL"
         comp = "t.completed_at" if "completed_at" in cols else "NULL"
@@ -237,16 +413,12 @@ def _board_rows(path: Path, left: list[str], light: bool) -> tuple[list[dict[str
                     parents.setdefault(pr[1], []).append(pr[0])
             for r in conn.execute(full.format(ph=ph), left):
                 rows.append({**dict(r), 'parents': tuple(parents.get(r['id'], []))})
-    except sqlite3.Error as exc:
-        with _board_cache_lock:
-            _board_cache.pop(ck, None)
+        return rows
+
+    try:
+        return _structural_reads.read(path, ('board', light, tuple(left)), query, board=True), None
+    except (sqlite3.Error, OSError) as exc:
         return rows, exc
-    finally:
-        conn.close()
-    if sig is not None and sig == _board_sig(path):  # unchanged while we read: the rows belong to this signature
-        with _board_cache_lock:
-            _board_cache[ck] = (sig, tuple(left), rows)
-    return rows, None
 
 
 def is_settled(card: Optional[dict[str, Any]]) -> bool:
@@ -758,7 +930,8 @@ class AckIndex:
         conn = pool.get(self.path) if pool is not None else ro_connect(self.path)
         failed = False
         try:
-            if not _ACK_COLS.issubset(_cols(conn, 'messages')):
+            cols = pool.cols(self.path, 'messages') if pool is not None else _cols(conn, 'messages')
+            if not _ACK_COLS.issubset(cols):
                 self.usable = False
                 return
             ph = ",".join("?" for _ in self.ids)
@@ -1364,8 +1537,13 @@ def notice_text(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> str:
 # ---- state.db: when did the user last type ---------------------------------------------------------------------
 def last_user_at(state_dbs: Iterable[Path], ids: Iterable[str], pool: Optional[ReadPool] = None) -> float:
     """Newest real user message (not a kanban/close-out notice or synthetic row) over the given session ids.
-    ``pool`` (one pass's connections) is reused and left open."""
+    ``pool`` (one pass's connections) is reused and left open; without one, each database gets a connection
+    closed before returning. Never cached and never retained across passes: state.db is SessionDB's file, and a
+    handle kept open here (unregistered with SessionDB's WAL-generation fence) would pin a deleted
+    ``-wal``/``-shm`` generation and make the next SessionDB open in this process refuse to start."""
     ids = [i for i in dict.fromkeys(ids) if i]
+    if not ids:
+        return 0.0  # an empty IN () matches no row: same answer without opening anything
     best = 0.0
     for path in state_dbs:
         try:
@@ -1373,7 +1551,8 @@ def last_user_at(state_dbs: Iterable[Path], ids: Iterable[str], pool: Optional[R
         except sqlite3.Error:
             continue
         try:
-            dk = "AND (display_kind IS NULL OR display_kind = '')" if "display_kind" in _cols(conn, "messages") else ""
+            cols = pool.cols(Path(path), "messages") if pool is not None else _cols(conn, "messages")
+            dk = "AND (display_kind IS NULL OR display_kind = '')" if "display_kind" in cols else ""
             ph = ",".join("?" for _ in ids)
             for r in conn.execute(f"SELECT content, timestamp FROM messages WHERE role='user' AND session_id IN ({ph}) "
                                   f"{dk} ORDER BY timestamp DESC LIMIT 20", ids):
@@ -1388,6 +1567,86 @@ def last_user_at(state_dbs: Iterable[Path], ids: Iterable[str], pool: Optional[R
             if pool is None:
                 conn.close()
     return best
+
+
+# ---- unseen kanban results: local notify subscriptions only ----------------------------------------------------
+def _unseen_query(conn: sqlite3.Connection, kinds: tuple[str, ...]) -> dict[str, int]:
+    """Core ``kanban_session_activity._unseen_on``'s rule on one board: ``tui`` subscriptions per chat whose cursor
+    trails a terminal event. A board without the subscription/event tables (or their columns) counts nothing, as
+    in core. Any other error raises where core counted nothing: an unreadable board must read as unknown."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {"kanban_notify_subs", "task_events"} <= tables:
+        return {}
+    ph = ",".join("?" for _ in kinds)
+    try:
+        rows = conn.execute(
+            f"SELECT s.chat_id, COUNT(*) FROM kanban_notify_subs s WHERE s.platform = 'tui' AND s.chat_id != '' "
+            f"AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = s.task_id AND e.id > s.last_event_id "
+            f"AND e.kind IN ({ph})) GROUP BY s.chat_id", kinds).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such column" in str(exc) or "no such table" in str(exc):
+            return {}
+        raise
+    return {str(sid): int(n) for sid, n in rows}
+
+
+def unseen_counts(board_paths: Iterable[Path], kinds: Iterable[str]) -> dict[str, int]:
+    """Unseen results per chat summed over ``board_paths``: the ``unseen`` map of core ``_all_counts`` without
+    computing the rest of that projection (remote links, waits, stalls). Each board's answer is reused while its
+    committed revision is unchanged (``_structural_reads``: registered board observers). Raises when any board
+    cannot be read; a failed read is never cached."""
+    kinds = tuple(kinds)
+    out: dict[str, int] = {}
+    for path in board_paths:
+        counts = _structural_reads.read(path, ("unseen", kinds), lambda conn: _unseen_query(conn, kinds), board=True)
+        for sid, n in counts.items():
+            out[sid] = out.get(sid, 0) + n
+    return out
+
+
+_REVISION_TOKENS = iter(range(1, 1 << 62))
+_REVISION_TOKENS_LOCK = threading.Lock()
+
+
+def _next_revision_token(_conn: sqlite3.Connection) -> int:
+    with _REVISION_TOKENS_LOCK:
+        return next(_REVISION_TOKENS)
+
+
+def revision_token(path: Path, board: bool = False) -> Optional[int]:
+    """A token that stays equal exactly while ``path``'s committed contents are unchanged: the retained observer's
+    ``data_version`` (``_structural_reads``), so every commit by any connection, file replacement or ``-shm``
+    generation change yields a new token. None when the file cannot be observed (callers then take no shortcut).
+    Not for state.db (see IDLE-READS.md: never retained). ``board``: a Kanban board (core's registered reader)."""
+    try:
+        return _structural_reads.read(path, ("revision-token",), _next_revision_token, board=board)
+    except Exception:
+        logger.debug("chat-closeout: revision of %s unavailable", path, exc_info=True)
+        return None
+
+
+# ---- sync-shadow coverage --------------------------------------------------------------------------------------
+def shadow_rows(path: Path, ids: Iterable[str]) -> tuple[tuple[tuple[Any, Any], ...], frozenset[str]]:
+    """``(kanban_sync_state rows, ids present in tasks)`` of one sync shadow, in one read snapshot. Clock-free:
+    callers judge freshness from the rows with the current time. Reused while the shadow's committed revision is
+    unchanged (registered observer, like the boards); raises when it cannot be read, and then caches nothing."""
+    wanted = tuple(sorted(set(ids)))
+
+    def query(conn):
+        conn.execute("BEGIN")
+        try:
+            state = tuple((r[0], r[1]) for r in conn.execute("SELECT board_id, pulled_at FROM kanban_sync_state"))
+            found: set[str] = set()
+            for i in range(0, len(wanted), 500):
+                chunk = wanted[i:i + 500]
+                # Query ids, not status or links: absence is stronger than "not linked".
+                found.update(str(r[0]) for r in conn.execute(
+                    f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk))
+        finally:
+            conn.execute("COMMIT")
+        return state, frozenset(found)
+
+    return _structural_reads.read(path, ("shadow", wanted), query, board=True)
 
 
 # ---- turn-end promise lint -------------------------------------------------------------------------------------
