@@ -77,10 +77,16 @@ How to run it from an agent:
   older than 24 h. In those cases the job can still die without a word. So after any update or restart, check
   each wait you promised with `process_manage poll` (or `--once`). If a deploy or a promised report depends
   on the wait, put that step on a durable Kanban card with a `wake_check`, not a chat-owned chain.
-- When a script chains steps after the wait, send the wait's output to a log file (`>> log 2>&1`) and test the
-  wait's own exit code; never pipe it through `| tail -n`. tail prints nothing until the wait exits, so a killed
-  or hung wait leaves no record of what it was waiting on. And `wait | tail && deploy` tests tail's exit status,
-  so it deploys after a failed wait.
+- Never pipe the wait through a filter (`| tail -n`, a secret-scrubbing `| grep -v`): the pipeline's exit status is
+  the filter's, so a failed or killed wait reports exit code 0 in its background notice, and
+  `wait | filter && deploy` deploys after it. If you must filter, start the command with `set -o pipefail`; when
+  one command chains several waits, keep each status (`a=$?`) and end with `exit $((a|b))`, not an `echo`. When a
+  script chains steps after the wait, send the wait's output to a log file (`>> log 2>&1`) and test the wait's own
+  exit code: tail also prints nothing until the wait exits, so a killed or hung wait leaves no record of what it
+  was waiting on.
+- A wait that ends with a wrapper's message instead of the script's verdict (e.g. a GitHub quota guard's
+  `refused/failed`) was stopped by that wrapper, not by CI: run `--once` for CI's real state before reporting
+  anything, then diagnose the wrapper.
 - In a Kanban worker there is no async notify, and a poll loop burns `max_runtime_seconds` (most worker
   timeouts were exactly this). Run `--once`; if it exits 2, call `kanban_continue(checkpoint=<sha, what to
   check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
@@ -119,7 +125,9 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 ## Notes
 
 - Auditing a workflow's history (green-window soak, "every run since D", promoting a lane to required): `references/workflow-history-audit.md`. Not `gh run list -L N`: on a busy workflow it drops the oldest runs.
-- For JS fixture isolation on CI, keep TMPDIR roots short (for example `/tmp/wc.XXXXXX`): nesting a `RUNNER_TEMP/workspace-checks.*` root under Vitest plus gateway control sockets can exceed AF_UNIX path limits and surface as `listen EINVAL` followed by a timeout. Exercise a real nested Unix socket, executable helper, original failure status, and cleanup through the actual workflow shell. Container `sudo` does not prove mount permission; inspect mount failure and `/dev/shm` noexec/capacity. Reconcile runner label migration before changing retired container hosts; the next real job must prove tmpfs selection and memory reserve on the serving fleet.
+- Writing or fixing CI itself (where a new script goes, path filters for guard workflows, unittest discovery,
+  shard counts vs timeouts) and known failure classes (JS fixture socket paths, Hermes E2E daemon leaks, Docker
+  gha cache export, gitleaks on self-hosted runners): `references/ci-authoring-and-failure-fixes.md`.
 
 - In a fork checkout with an `upstream` remote, a bare `gh run`/`gh pr` reads the upstream repo's runs, so a
   hand-run one needs `-R OWNER/NAME` (the script passes it from `origin`; override with `--gh-repo`).
@@ -152,16 +160,7 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
   diagnose that label's pool per `references/self-hosted-runner-migration.md` (Pitfalls, saturation by label).
 - A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
   maps to) takes precedence; check the repo's AGENTS.md first.
-- Match full-suite shard counts to the reusable workflow's timeout envelope. Reducing an eight-shard matrix to two while retaining the same per-job timeout can cancel every Python job even when e2e is green. Keep the gate's required exact job names, workflow matrix, and test fake synchronized; never count cancelled shards as green or compensate by weakening assertions.
 - Tests: `python3 -B -m unittest discover -s tests` from this skill's dir.
-- For detached core-E2E gateway leaks, verify `HERMES_E2E_RUN_TMP` survives `coreAppEnv` into the real `gateway ensure` daemon before blaming runner liveness: runtime-variable scrubbing must preserve the lifecycle marker. Exercise both SIGKILL → next-runner recovery and normal exit through the real fixture environment; a marked `sleep` child bypasses this boundary. Pre-fix unmarked daemons require a one-off HOME/HERMES_HOME/argv/owner-verified cleanup; their removal is not post-fix live prevention proof.
-- For Hermes E2E failures on loaded runners, audit sandbox daemon ownership before raising timeouts. `hermes -z` and viewer `/exit` deliberately retain the shared gateway: each isolated test home must stop its own home/PID/start-time-verified gateway before closing fake provider/proxy servers. Assert viewer-only cleanup first, then full runtime cleanup; never hide arbitrary children as persistent infrastructure. A cold public model-metadata fetch can also reach OpenRouter during another provider's test: seed metadata for the fake model rather than broadening the foreign-provider egress allowlist. For recording/prebuilt TUI probes, pass the installed Node explicitly with supported `HERMES_NODE` through the hermetic child's overrides; obsolete `HERMES_SKIP_NODE_BOOTSTRAP` has no reader, and Node on PATH alone still falls through to `pm.ensure('node')`. Prove attach-only isolation by forbidding PM acquisition in a real child CLI while retaining exact handoff/lease assertions, rather than raising its timeout.
-- For Docker builds that load/push the image successfully and then fail at `exporting to GitHub Actions Cache` (`error writing layer blob: not_found`), keep cache exports advisory with `ignore-error=true` in each `cache-to: type=gha` option list, including release and sibling image workflows. Do not use step-level `continue-on-error`: image build/load/push failures must remain fatal. Test the parsed workflow exporter policy and verify a green main push run; a later artifact-quota warning alone does not establish why the cache backend failed.
-- Self-hosted runners keep files between jobs. `gitleaks/gitleaks-action@v2` downloads to the fixed path
-  `os.tmpdir()/gitleaks.tmp`, so one interrupted run makes every later install fail with "Destination file path
-  ... already exists" on that runner. Fix in the workflow, not on the hosts: set `TMPDIR: ${{ runner.temp }}` in the
-  step's `env` (emptied per job). Check every runner's failure first (`runner_name` per job) to tell a systemic
-  cause from one dirty host.
 
 ## CI refused for billing (account-wide outage)
 
@@ -227,8 +226,10 @@ Order: exact-head review verdict AND exact-head required aggregate ("All require
   every patch identical: main moved underneath it. Ask the SAME reviewer lineage for a delta review of the new
   sha (a done card can't be reopened unless it sits in review; create a continuation card, pinned to the same
   model, and link it as parent of the ship card).
-- Exact-head failure: re-run only the failing test files on a detached worktree at the PR's merge-base. Failing
-  there too means it is inherited; route it to the owner of the breaking commit (search cards and comments for
+- Exact-head failure: first list main's commits since the merge-base
+  (`gh api repos/O/R/compare/<head>...main --jq '.commits[].commit.message'`); one that fixes the failing test
+  means it is inherited and already fixed, so rebase. Otherwise re-run only the failing test files on a detached
+  worktree at the PR's merge-base. Failing there too means it is inherited; route it to the owner of the breaking commit (search cards and comments for
   the test name first), wait for that fix to merge, rebase onto it, re-verify range-diff, push with
   `--force-with-lease=<ref>:<old sha>`, then request the delta review. Never merge over a red aggregate.
 - Hosted Actions refused for billing on a repo WITHOUT branch protection or required checks: run the workflow's
@@ -276,14 +277,3 @@ or closed-unmerged (wake to reconcile; neither is acceptance), 2 = evidence/auth
   switch it to this one.
 - This is not a CI-ready probe: an OPEN PR with green checks still waits. Use an exact-head CI probe when the next
   step is review/landing.
-
-## Adding helper scripts to a repo
-
-For tests added to a stdlib `unittest discover` directory, verify actual discovery as well as imports: installing pytest fixes an import error but does not make unittest execute function-style parametrized tests. Preserve every scenario when porting fixtures to unittest and add a collection-count regression; run the exact CI command on each Python matrix version without undeclared packages.
-
-For cross-repository integration tests, wire every required environment path into the actual CI suite step, not only a local test command. An existing companion checkout does not export its paths automatically. Retain real-producer tests and add a workflow regression tying the export to that checkout before the test runner; verify the green branch run rather than replacing the producer with a mock or skip.
-
-Before choosing a directory for a new tool, read the CI workflows' `on.push.paths` and any plan step's path rules. A
-script under a shared or product directory (e.g. `shared/`, `lib/`) can trigger a full rebuild and release of every
-product on push. Put agent tooling where no release workflow watches (often `tools/`), and confirm by checking that
-no new run started after the push.
