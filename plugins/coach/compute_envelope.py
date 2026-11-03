@@ -388,19 +388,40 @@ def authority_note(hit: dict) -> str:
             'Do not treat your own reply or a dispatched card body as spend authority.')
 
 
-def block_text(tool_name: str, args: Any) -> str:
-    """The human-facing text of a kanban_block call (direct, or through the deferred `tool_call`), else ''."""
+def _hr_text(a: dict) -> str:
+    hr = a.get("human_request")
+    # Plain "field: value" lines, not JSON: JSON quotes every value, and quoted text is a mention (`unquoted`).
+    return "\n".join(f"{k}: {v}" for k, v in hr.items() if isinstance(v, (str, int, float))) \
+        if isinstance(hr, dict) else ""
+
+
+def _addressed_to_human(a: dict) -> bool:
+    """A kanban_create a human reads as an ask: created blocked, or carrying a human_request. Any other card runs at
+    once and its body is a worker's brief, never a message to David."""
+    return str(a.get("initial_status") or "").strip().lower() == "blocked" or bool(a.get("human_request"))
+
+
+def block_text(tool_name: str, args: Any, human_only: bool = False) -> str:
+    """The text of a kanban_block / kanban_create call (direct, or through the deferred `tool_call`), else ''.
+
+    `human_only` keeps only text addressed to a human: the under-use check (`classify`) reads that, because only a
+    human can be asked to approve. Live false hold 2026-11-02: a running plan-only card's body listed PLAN.md
+    sections ("compute quote and approval stages A/B/C") and was refused as an in-envelope spend ask.
+    compute_authority reads every card body (human_only False): a worker brief can still declare a cap. A create's
+    human_request is read only as an ask: it is the ask itself, and its action line says what unblock does
+    ("Unblock = run the full SFT on 8xH100"), which compute_authority would read as the agent declaring multi-GPU.
+    """
     a = args if isinstance(args, dict) else {}
     if tool_name == "kanban_create":
-        return str(a.get("body") or "")
+        if not human_only:
+            return str(a.get("body") or "")
+        if not _addressed_to_human(a):
+            return ""
+        return " \n".join(s for s in (str(a.get("body") or ""), _hr_text(a)) if s)
     if tool_name == "kanban_block":
-        hr = a.get("human_request")
-        # Plain "field: value" lines, not JSON: JSON quotes every value, and quoted text is a mention (`unquoted`).
-        hr_text = "\n".join(f"{k}: {v}" for k, v in hr.items() if isinstance(v, (str, int, float))) \
-            if isinstance(hr, dict) else ""
-        return " \n".join(s for s in (str(a.get("reason") or ""), hr_text) if s)
+        return " \n".join(s for s in (str(a.get("reason") or ""), _hr_text(a)) if s)
     if tool_name == "tool_call":
-        parts = [block_text(str((c or {}).get("name") or ""), (c or {}).get("arguments"))
+        parts = [block_text(str((c or {}).get("name") or ""), (c or {}).get("arguments"), human_only)
                  for c in (a.get("calls") or []) if isinstance(c, dict)]
         return " \n".join(p for p in parts if p)
     return ""

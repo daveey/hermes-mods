@@ -314,18 +314,19 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             log.debug("coach close open nudges: %s", exc)
 
-    def _envelope(session_id, where, text, may_hold=True, sink=None):
+    def _envelope(session_id, where, text, may_hold=True, sink=None, ask_text=None):
         """Compute-envelope check (compute_envelope.py). First hit per session/surface -> the note (the caller holds
         the block / the reply); a repeat after the note goes through and is logged as an agent fault. A reply hit is a
         reply_nudge with its own nudge_id (returned in `sink["rec"]` so the caller parks it for delivery); no judge
-        re-checks the revision, so its outcome record (`nudge_outcome_untracked`) is written with it."""
+        re-checks the revision, so its outcome record (`nudge_outcome_untracked`) is written with it.
+        `ask_text` (default `text`) is the part addressed to a human, the only part the under-use check reads."""
         try:
             ce = _load("compute_envelope")
             if not ce.enabled():
                 return None
-            hit = (ce.authority(text, authority_users.get(session_id, ()), authority_asked.get(session_id, ()),
-                                persisted=lambda: _persisted_asks(session_id))
-                   or ce.classify(text))
+            hit = ((ce.authority(text, authority_users.get(session_id, ()), authority_asked.get(session_id, ()),
+                                 persisted=lambda: _persisted_asks(session_id)) if text else None)
+                   or ce.classify(text if ask_text is None else ask_text))
             if not hit:
                 return None
             rule = hit.get("rule", "compute_envelope")
@@ -368,11 +369,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     def pre_tool_call(tool_name="", args=None, session_id="", **_):
         if tool_name in ("kanban_block", "kanban_create", "tool_call"):
             try:
-                text = _load("compute_envelope").block_text(tool_name, args)
+                ce = _load("compute_envelope")
+                text = ce.block_text(tool_name, args)
+                ask = ce.block_text(tool_name, args, human_only=True)
             except Exception as exc:
                 log.debug("coach compute_envelope: %s", exc)
-                text = ""
-            msg = _envelope(session_id, "block", text) if text else None
+                text = ask = ""
+            msg = _envelope(session_id, "block", text, ask_text=ask) if text or ask else None
             if msg:
                 return {"action": "block", "message": msg}
         if tool_name in ("kanban_block", "kanban_create", "tool_call"):

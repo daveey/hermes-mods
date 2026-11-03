@@ -87,6 +87,11 @@ per session and surface holds the block / the turn once with a note to rent with
 Origin: defect agent-962f3f10ff, where three blocks and an "approve $20 / use metta1 directly" menu left a ~$5-10
 experiment blocked for 5 days; `tests/test_compute_envelope.py` replays both verbatim. Env:
 `COACH_COMPUTE_ENVELOPE=0` turns it off, `COACH_COMPUTE_ENVELOPE_USD` changes the cap (default 25).
+It reads only text addressed to a human (`block_text(..., human_only=True)`): replies, a `kanban_block`'s reason and
+human_request, and a `kanban_create` only when it is created blocked or carries a human_request (body + request). A
+card that runs at once is a worker's brief, never an ask to David: a running plan card listing "compute quote and
+approval stages A/B/C" was held as a spend ask (`tests/test_compute_envelope_audience.py`). compute_authority still
+reads every card body, but not a create's human_request (that is the ask itself).
 **Compute authority (`compute_envelope.py`; same hook, rule `compute_authority`).**
 The other side of the envelope holds agent-declared GPU/rental caps above $25 or multi-GPU plans once,
 including `kanban_create.body`, direct/deferred `kanban_block`, the reply's `pre_final_gate` and its
