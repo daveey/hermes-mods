@@ -338,3 +338,23 @@ def test_lines_before_rules_3_are_left_out_of_correction_rate():
     old = {"ts": t, "host": "h", "session": "s0", "skill": "x", "user_correction": False, "rules": 2,
            "checks_first_pass": None}
     assert core.rollup([old], t - 1, t + 1)[0]["correction_rate"] is None
+
+
+def test_subagent_prompts_and_compaction_notes_are_not_replies(home):
+    import sqlite3
+    turn("s1", "done", ("five-whys", SKILL_DONE))
+    turn("sub", "done", ("five-whys", SKILL_DONE))
+    t = core.time.time()
+    plug.pre_llm_call(session_id="sub", user_message="no, review the other PR", parent_session_id="s1")
+    plug.pre_llm_call(session_id="s1", user_message="[Your active task list was preserved across context "
+                      "compression]\n- [>] 3. Verify access")
+    plug.pre_llm_call(session_id="s1", user_message="New note on your kanban task t_1: wrong host")
+    _state_db(home, "sub", [(t + 5, "no, that's the wrong PR", None)])
+    con = sqlite3.connect(home / "state.db")
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT)")
+    con.execute("INSERT INTO sessions VALUES ('sub', 'subagent')")
+    con.commit()
+    con.close()
+    core.flush(home, now=t + core.IDLE_S + 1)
+    rs = {r["session"]: r for r in lines(home)}
+    assert rs["s1"]["correction_source"] == "none" and rs["sub"]["correction_source"] == "none"

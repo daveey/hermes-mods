@@ -40,8 +40,11 @@ TICK_RE = re.compile(
 DONE_HEADING_RE = re.compile(r"^#{2,3}\s+Done means\b", re.I | re.M)
 SYNTHETIC_RE = re.compile(
     r"^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe|System note|runtime|session-outcome|"
-    r"Session babysitter|False-stop recovery|skill-outcomes|ASYNC DELEGATION|CONTEXT COMPACTION)\b|"
-    r"[✔✓✗✖⚠⏸]|\[?Canonical user decision)", re.I)
+    r"Session babysitter|False-stop recovery|skill-outcomes|ASYNC DELEGATION|CONTEXT COMPACTION|"
+    r"Your active task list was preserved|Skills pruned)\b|"
+    r"[✔✓✗✖⚠⏸]|\[?Canonical user decision|New note on your kanban task)", re.I)
+# sessions.source values whose user turns are written by Hermes or a parent agent, never by a person
+MACHINE_SOURCES = {"subagent", "cron", "kanban", "tool"}
 # Fallback copy of coach's lessons.PREFILTER_RE, used only when the coach plugin is not installed next to this one.
 _FALLBACK_CORRECTION_RE = re.compile(
     r"^\s*(no\b|nope|wait\b|actually\b|that'?s (?:not|wrong)|i said|i meant|don'?t\b|stop\b|why (?:did|are|would) you|"
@@ -289,6 +292,12 @@ def db_next_user(home: Any, session: str, after: float) -> Optional[tuple]:
     try:
         con = _ro_connect(p, timeout=2)
         try:
+            try:
+                src = con.execute("SELECT source FROM sessions WHERE id=?", (session,)).fetchone()
+            except Exception:  # no sessions table: judge the messages alone
+                src = None
+            if src and str(src[0]) in MACHINE_SOURCES:
+                return None
             rows = con.execute(
                 "SELECT timestamp, content, display_kind FROM messages WHERE session_id=? AND role='user' "
                 "AND timestamp>? ORDER BY timestamp LIMIT 200", (session, after)).fetchall()

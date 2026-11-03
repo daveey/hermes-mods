@@ -158,9 +158,11 @@ def _display_kind(history: Any) -> Any:
     return None
 
 
-def pre_llm_call(session_id: str = "", user_message: Any = None, conversation_history: Any = None, **_):
+def pre_llm_call(session_id: str = "", user_message: Any = None, conversation_history: Any = None,
+                 parent_session_id: Any = "", **_):
     try:
-        if session_id and isinstance(user_message, str):
+        # a subagent's user turns are its parent agent's prompts, never the user's reply
+        if session_id and isinstance(user_message, str) and not parent_session_id:
             core.note_user_message(None, session_id, user_message,
                                    display_kind=_display_kind(conversation_history))
         _sweep()
