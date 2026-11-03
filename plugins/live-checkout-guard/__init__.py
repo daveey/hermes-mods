@@ -133,6 +133,8 @@ def classify(tool_name: str, args: Any, task_id: str = "") -> Optional[str]:
         return guard.check_file_tool(tool, args, _cwd(args, task_id, shell=False))
     if tool in SHELL_TOOLS:
         cmd = " ; ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
+        if tool == "terminal" and (why := guard.check_terminal_env(str(args.get("command") or ""))):
+            return why  # only the terminal tool carries exports into later calls
         return guard.check_shell(cmd, _cwd(args, task_id))
     if tool in PY_TOOLS:
         return guard.check_python(str(args.get("code") or ""), _cwd(args, task_id))

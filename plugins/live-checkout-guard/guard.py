@@ -73,6 +73,8 @@ def in_root(path: str, cwd: Optional[str] = None) -> bool:
 
 
 def message(why: str) -> str:
+    if why.startswith(HOME_EXPORT_WHY):
+        return home_export_message(why)
     if why == "unfenced hermes update":
         return ("[live-checkout-guard] Refused: unfenced hermes update. Core updates go through each "
                 "host's fenced route: the hub's hermes-core-update.timer (every 10 min, drain-first, "
@@ -547,6 +549,157 @@ def check_shell(cmd: str, cwd: Optional[str] = None, *, _update_checked: bool = 
     return None
 
 
+# ---- a throwaway HERMES_HOME that would persist in the terminal session -------------------------
+# The Hermes terminal tool re-dumps `export -p` after every call and sources it before the next, so
+# `export HERMES_HOME=$(mktemp -d)` in one call is still set in every later call. On 2026-11-02 a coach
+# test recipe did that, and the same session's next `hermes-sync run` exported the throwaway home into the
+# private state repo and re-pointed the real launchd job at it. Only the terminal tool persists: subshells,
+# `bash -c '...'`, heredoc bodies and the one-command prefix form (`HERMES_HOME=... cmd`) do not.
+
+HOME_EXPORT_WHY = "a throwaway HERMES_HOME would persist in this terminal session"
+_ASSIGN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_PERSIST_BUILTIN = re.compile(r"^(?:export|declare|typeset|readonly)(?:\s+-[A-Za-z]+)*\s(?:.*\s)?$", re.S)
+_KEYWORDS = re.compile(r"^\s*(?:(?:then|do|else|elif|if|while|until|time|!)\s+)*")
+_TEMP_HINT = re.compile(r"mktemp|\$\{?TMPDIR\b|\$\{?TMP\b|pytest|tmp_path|basetemp")
+_TEMP_PREFIXES = ("/tmp", "/private/tmp", "/var/tmp", "/var/folders", "/private/var/folders")
+
+
+def _word_end(cmd: str, i: int) -> int:
+    """Index just past the shell word starting at i (quotes, $(...), ${...}, `...` and escapes kept whole)."""
+    n = len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            i = n if j < 0 else j + 1
+        elif c == '"':
+            i += 1
+            while i < n and cmd[i] != '"':
+                i += 2 if cmd[i] == "\\" else 1
+            i += 1
+        elif c == "`":
+            j = cmd.find("`", i + 1)
+            i = n if j < 0 else j + 1
+        elif c == "$" and i + 1 < n and cmd[i + 1] in "({":
+            close, depth, i = (")" if cmd[i + 1] == "(" else "}"), 0, i + 1
+            opener = cmd[i]
+            while i < n:
+                if cmd[i] == opener:
+                    depth += 1
+                elif cmd[i] == close:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            i += 1
+        elif c.isspace() or c in ";&|()<>":
+            return i
+        else:
+            i += 1
+    return n
+
+
+def _top_level_statements(cmd: str):
+    """Yield (start, end) of each top-level simple command: outside quotes, subshells, command substitution,
+    backticks, comments and heredoc bodies, i.e. the code whose variable assignments outlive the call."""
+    n, i, start, depth = len(cmd), 0, 0, 0
+    pending_heredocs: list[str] = []
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c in "'\"`" or (c == "$" and i + 1 < n and cmd[i + 1] in "({"):
+            i = _word_end(cmd, i) if depth == 0 else i + 1
+            continue
+        if c == "#" and (i == 0 or cmd[i - 1].isspace() or cmd[i - 1] in ";&|("):
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if depth == 0 and cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+            m = re.match(r"<<-?\s*(['\"]?)([A-Za-z0-9_.-]+)\1", cmd[i:])
+            if m:
+                pending_heredocs.append(m.group(2))
+                i += m.end()
+                continue
+        if c == "(":
+            if depth == 0 and i > start:
+                yield start, i
+            depth += 1
+        elif c == ")":
+            depth = max(0, depth - 1)
+            start = i + 1
+        elif depth == 0 and (c in ";&|{}" or c == "\n"):
+            if i > start:
+                yield start, i
+            start = i + 1
+            if c == "\n" and pending_heredocs:  # skip each body up to its delimiter line
+                for delim in pending_heredocs:
+                    m = re.compile(rf"^[ \t]*{re.escape(delim)}[ \t]*$", re.M).search(cmd, start)
+                    start = n if m is None else m.end()
+                pending_heredocs = []
+                i = start
+                continue
+        i += 1
+    if depth == 0 and start < n:
+        yield start, n
+
+
+def _temp_value(raw: str) -> bool:
+    if _TEMP_HINT.search(raw):
+        return True
+    value = raw.strip("'\"")
+    if value.startswith(_TEMP_PREFIXES):
+        return True
+    expanded = os.path.realpath(os.path.expandvars(os.path.expanduser(value))) if value else ""
+    roots = {os.path.realpath(r) for r in (os.environ.get("TMPDIR"), "/tmp") if r}
+    return any(expanded == r or expanded.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def check_terminal_env(cmd: str) -> Optional[str]:
+    """Refuse a top-level `export HERMES_HOME=<temp>` (or an assignment-only `HERMES_HOME=<temp>` statement,
+    which keeps an already-exported variable exported) in the terminal tool, whose session carries it into
+    every later call. The prefix form `HERMES_HOME=<temp> cmd` and subshells are allowed."""
+    if not cmd or "HERMES_HOME=" not in cmd:
+        return None
+    for s, e in _top_level_statements(cmd):
+        stmt = cmd[s:e]
+        for m in re.finditer(r"(?<![A-Za-z0-9_])HERMES_HOME=", stmt):
+            vstart = m.end()
+            vend = _word_end(stmt, vstart)
+            value = stmt[vstart:vend]
+            if not _temp_value(value):
+                continue
+            head = _KEYWORDS.sub("", stmt[:m.start()], count=1)
+            if _PERSIST_BUILTIN.match(head):
+                return f"{HOME_EXPORT_WHY} (`{stmt.strip()[:120]}`)"
+            words = head.split()
+            if all(_ASSIGN_WORD.match(w) for w in words):  # only assignments before it
+                rest = stmt[vend:]
+                while True:  # skip further assignments; a command word after them = one-command prefix form
+                    rest = rest.lstrip(" \t")
+                    a = _ASSIGN_WORD.match(rest)
+                    if not a:
+                        break
+                    rest = rest[_word_end(rest, a.end()):]
+                if not rest.strip():
+                    return f"{HOME_EXPORT_WHY} (`{stmt.strip()[:120]}`)"
+    return None
+
+
+def home_export_message(why: str) -> str:
+    return (f"[live-checkout-guard] Refused: {why}.\n"
+            "The terminal tool keeps exported variables between calls, so every later command in this session "
+            "would run against the throwaway home while hermes-sync, git and launchd still write the real "
+            "~/code/hermes, ~/code/hermes-mods and ~/Library/LaunchAgents (on 2026-11-02 a later `hermes-sync run` "
+            "exported a test home into the state repo and re-pointed the real launchd job). Scope it instead:\n"
+            "  HERMES_HOME=\"$(mktemp -d)\" python -m pytest ...        # one command\n"
+            "  ( export HERMES_HOME=\"$(mktemp -d)\"; cmd1; cmd2 )      # a subshell\n"
+            "If an earlier call already exported one, run `unset HERMES_HOME` first.")
+
+
 # ---- execute_code ------------------------------------------------------------------------------
 
 def _const(node: ast.AST):
@@ -578,7 +731,7 @@ def check_python(code: str, cwd: Optional[str] = None) -> Optional[str]:
         if name in {"terminal", "run_shell"}:
             c = kw.get("command") or (pos[0] if pos else None)
             if isinstance(c, str):
-                why = check_shell(c, wd)
+                why = (check_terminal_env(c) if name == "terminal" else None) or check_shell(c, wd)
         elif name in FILE_MUTATORS:
             a = {k: v for k, v in kw.items() if isinstance(v, str)}
             if pos and isinstance(pos[0], str):  # write_file(path, content) / patch(path, old, new, ...)

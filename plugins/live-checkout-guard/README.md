@@ -50,6 +50,23 @@ Kill switch: `LIVE_CHECKOUT_GUARD=0`. Paths are compared after `realpath`, so sy
   Install: `python3 plugins/live-checkout-guard/claude_hook.py --install [--settings PATH]` (idempotent; default
   `~/.claude/settings.json`). Exit 2 blocks; bad input fails open.
 
+## Throwaway HERMES_HOME in the terminal session
+
+The Hermes `terminal` tool re-sources its `export -p` snapshot before every call, so
+`export HERMES_HOME=$(mktemp -d)` in one call is still set in every later call of that session. On 2026-11-02 a
+coach test recipe did exactly that, and the same session's next `hermes-sync run --no-core` exported the
+throwaway home into the private state repo and re-pointed the real `com.daveey.hermes-sync` LaunchAgent at it.
+
+The guard refuses a `terminal` call (direct, `mcp__terminal`, batched, or a literal `terminal()` in
+`execute_code`) whose top-level code exports `HERMES_HOME` to a temp path: `mktemp`, `$TMPDIR`/`$TMP`, `pytest`
+basetemps, `/tmp`, `/var/tmp`, `/var/folders` and `/private/...`. That covers `export`/`declare -x`/`typeset -x`
+and an assignment-only `HERMES_HOME=<temp>` statement (which keeps an inherited export exported). Still allowed: the
+one-command prefix form `HERMES_HOME=<temp> cmd`, `env HERMES_HOME=...`, subshells `( export ...; cmd )`,
+`bash -c '...'`, `$(...)`, heredoc bodies, quoted text, comments, and any non-temp value such as a profile home.
+`process` stdin and execute_code's own `subprocess` shells are not checked: they end with their process.
+hermes-sync itself also refuses host-global passes from a non-canonical home (state repo, `hermes-sync`).
+Tests: `tests_home_export.py` (incl. a two-call run through the real core terminal tool).
+
 ## Fenced core updates
 
 Agent `terminal` and literal `execute_code` shell calls may not run a mutating
