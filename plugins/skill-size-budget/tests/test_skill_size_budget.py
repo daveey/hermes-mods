@@ -228,6 +228,14 @@ def test_reference_without_links_passes_and_self_link_ok():
     assert pre([op]) is None
 
 
+def test_path_ending_in_preferences_is_not_a_reference_link():
+    FILES[("demo", "SKILL.md")] = skill(10)
+    text = "# A\n\nWrite `{\"path\": \"preferences/x.md\"}` with memory.write; see docs/references-guide.md too.\n"
+    assert budget.cross_reference_links("", text, "references/a.md") == []
+    op = {"action": "write_file", "name": "demo", "file_path": "references/a.md", "file_content": text}
+    assert pre([op]) is None
+
+
 def test_existing_cross_links_are_not_counted():
     FILES[("demo", "SKILL.md")] = skill(10)
     FILES[("demo", "references/a.md")] = "# A\n\nsee references/b.md\n- rule one\n"
@@ -307,3 +315,26 @@ def test_inventory_labels_upstream_current_orphan_and_owned(tmp_path):
     assert inv.owner("shipped", cur, hist) == "upstream"
     assert inv.owner("retired", cur, hist) == "upstream-orphan"
     assert inv.owner("ours", cur, hist) == "owned"
+
+
+def test_inventory_labels_name_matched_fork_that_diverges_from_core(tmp_path):
+    inv = _load("skill_size_budget_inventory", "inventory.py")
+    core = tmp_path / "core"
+    rel = core / "skills/creative/design/SKILL.md"
+    rel.parent.mkdir(parents=True)
+    upstream_text = skill(400)
+    rel.write_text(upstream_text)
+    cur = inv.upstream_paths(core)
+    assert cur == {"design": rel}
+    # verbatim copy and a small local touch-up stay "upstream"
+    assert inv.owner("design", cur, set(), upstream_text) == "upstream"
+    touched = upstream_text.replace("(3)\n", "(3) Small local note.\n") + "- One local line we added.\n"
+    assert inv.owner("design", cur, set(), touched) == "upstream"
+    # a copy with a long section of our own is an owned fork, reported with its additions
+    ours = upstream_text + "\n## Our gate\n\n" + "\n".join(
+        f"- Local rule {i}: always run the baseline check before shipping the screen." for i in range(60)) + "\n"
+    assert inv.owner("design", cur, set(), ours) == "owned-fork"
+    lines, chars = inv.added_vs(ours, upstream_text)
+    assert lines == 61 and chars > 4000
+    # a name-only lookup (set) keeps the old behaviour
+    assert inv.owner("design", set(cur), set(), ours) == "upstream"

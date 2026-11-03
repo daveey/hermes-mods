@@ -41,7 +41,14 @@ block, actor, skills, findings).
 
 ## Inventory / one-time split
 
-`inventory.py` lists skills whose body is over a budget (`--lines 500 --chars 30000`), marking upstream-bundled ones.
+`inventory.py` lists skills whose body is over a budget (`--lines 500 --chars 30000`) with an owner label:
+`upstream` (the name ships in core and our body is core's text, at most 20 lines / 2,000 chars added),
+`owned-fork` (the name ships in core but our copy adds more; the row prints the added lines/chars, and those
+additions are ours to split into `references/`), `upstream-orphan` (the name is only in core's git history) or
+`owned`. Labels compare against the core checkout given by `--core` (default `~/.hermes/hermes-agent`).
+
+The one-hop check counts `references/X.md` path mentions (not `preferences/X.md`) and markdown links to a
+sibling `.md`.
 
 ## Tests
 

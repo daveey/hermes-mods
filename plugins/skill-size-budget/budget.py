@@ -28,7 +28,7 @@ _FRONTMATTER = re.compile(r"\A---\s*\n.*?\n---[ \t]*(?:\n|\Z)", re.S)
 _DONE_HEADING = re.compile(r"^#{2,3}\s+done means\b", re.I)
 _HEADING = re.compile(r"^#{1,3}\s+\S")
 _CHECKBOX = re.compile(r"^\s*[-*]\s+\[[ xX]\]\s+\S")
-_REF_PATH = re.compile(r"references/[\w./-]+\.md")
+_REF_PATH = re.compile(r"(?<![\w-])references/[\w./-]+\.md")  # not "preferences/x.md"
 # A markdown link to a sibling .md ("](other.md)", "](./other.md)", "](../references/x.md)").
 _MD_LINK = re.compile(r"\]\(\s*(?:\./|\.\./references/)?([\w.-]+\.md)(?:#[^)]*)?\s*\)")
 
