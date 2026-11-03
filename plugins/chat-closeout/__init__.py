@@ -1395,6 +1395,12 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
             led.write(sid, batch=[], open=[], failure_since=None, retry_after=0)
             logger.info("chat-closeout: dropped ledger row of non-chat session %s", sid)
             continue
+        if _session_gone(sid):
+            # A deleted chat (e.g. a worker's throwaway Desktop test chat) can never take a close-out turn, so its
+            # row would sit pending and the watchdog would file a no-closeout card for nobody.
+            led.write(sid, batch=[], open=[], failure_since=None, retry_after=0)
+            logger.info("chat-closeout: dropped ledger row of deleted chat %s", sid)
+            continue
         cards = core.canonical_view(read(row["batch"]))
         fix = core.reconcile(row, cards)
         fix.update(core.track_unlinked({**row, **fix}, cards, healthy=healthy, now=now, mono=mono))
@@ -1479,6 +1485,27 @@ def _session_scope(sid: str) -> tuple[Optional[Path], str]:
             if c.execute("SELECT 1 FROM sessions WHERE id=?", (sid,)).fetchone():
                 return path, path.parent.name if path.parent.parent.name == "profiles" else "default"
     return None, "default"
+
+
+_HERMES_SID = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6,}$")
+
+
+def _session_gone(sid: str) -> bool:
+    """True only on positive evidence the chat was deleted: a Hermes-format chat id that no state DB holds, every
+    store read cleanly (a failed read is unknown, never gone). Non-Hermes ids (remote/legacy keys) never count."""
+    if not _HERMES_SID.match(sid or ""):
+        return False
+    paths = state_dbs()
+    if not paths:
+        return False
+    for path in paths:
+        try:
+            with _ro(path) as c:
+                if c.execute("SELECT 1 FROM sessions WHERE id=?", (sid,)).fetchone():
+                    return False
+        except Exception:
+            return False
+    return True
 
 
 def _session_source(sid: str) -> str:
