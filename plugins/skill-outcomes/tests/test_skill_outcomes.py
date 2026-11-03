@@ -87,6 +87,15 @@ def test_tickoff_fills_checks_and_fix_rounds(home):
     a, b = lines(home)
     assert (a["checks_first_pass"], a["fix_rounds"], a["checks"], a["has_done_means"]) == (False, 1, "4/5", True)
     assert (b["checks_first_pass"], b["fix_rounds"], b["checks"]) == (True, 0, "3/3")
+    # SKILL_DONE lists 1 check, so totals of 5 and 3 are mismatches
+    assert a["tickoff_mismatch"] is True and b["tickoff_mismatch"] is True
+
+
+def test_tickoff_total_matching_skill_list_is_not_a_mismatch(home):
+    turn("s1", "Done means (five-whys): 1/1 first pass, 0 fix rounds", ("five-whys", SKILL_DONE))
+    core.flush(home, force=True)
+    (a,) = lines(home)
+    assert a["tickoff_mismatch"] is False and a["checks_first_pass"] is True
 
 
 def test_no_tickoff_or_no_done_means_leaves_checks_null(home):
@@ -149,8 +158,9 @@ def test_no_next_message_finalizes_false_after_idle(home):
 
 # ---------------------------------------------------------------- CLI + rollup
 def test_cli_flush_and_rollup(home, capsys):
-    turn("s1", "Done means (five-whys): 4/5 first pass, 2 fix rounds", ("five-whys", SKILL_DONE))
-    turn("s2", "Done means (five-whys): 5/5 first pass, 0 fix rounds", ("five-whys", SKILL_DONE))
+    skill5 = SKILL_DONE + "".join(f"- [ ] Check {i}?\n" for i in range(2, 6))  # a 5-item list
+    turn("s1", "Done means (five-whys): 4/5 first pass, 2 fix rounds", ("five-whys", skill5))
+    turn("s2", "Done means (five-whys): 5/5 first pass, 0 fix rounds", ("five-whys", skill5))
     turn("s3", "nothing", ("other", SKILL_PLAIN))
     t = core.time.time()
     plug.pre_llm_call(session_id="s2", user_message="that's wrong, redo it")
@@ -165,3 +175,9 @@ def test_cli_flush_and_rollup(home, capsys):
     md = "\n".join(core.rollup_lines(rows, t - 100, t + 100))
     assert "| five-whys | 2 | 2 | 50% | 1.00 | 50% |" in md
     assert "No skill uses" in "\n".join(core.rollup_lines([], 0, 1))
+    # a mismatched tick-off is excluded and counted (here forced on the 5/5 row)
+    assert not any(r.get("tickoff_mismatch") for r in rows)
+    for r in rows:
+        r["tickoff_mismatch"] = r["skill"] == "five-whys" and r["checks"] == "5/5"
+    assert core.rollup(rows, t - 100, t + 100)[0]["ticked"] == 1
+    assert "1 tick-off(s) gave a total" in "\n".join(core.rollup_lines(rows, t - 100, t + 100))

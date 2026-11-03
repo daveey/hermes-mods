@@ -66,6 +66,15 @@ def has_done_means(text: str) -> bool:
     return bool(DONE_HEADING_RE.search(text or ""))
 
 
+def count_done_means(text: str) -> Optional[int]:
+    """Number of `- [ ]` items in the skill's Done-means section (None without one)."""
+    m = DONE_HEADING_RE.search(text or "")
+    if not m:
+        return None
+    body = re.split(r"^#{1,3}\s", text[m.end():], maxsplit=1, flags=re.M)[0]
+    return len(re.findall(r"^\s*[-*]\s+\[[ xX]\]", body, re.M)) or None
+
+
 def parse_tickoffs(text: str) -> dict:
     """{skill: {"passed", "total", "fix_rounds"}} from the reply's `Done means (<skill>): p/t first pass, k fix
     rounds` lines (last one per skill wins)."""
@@ -180,6 +189,8 @@ def record_turn(home: Any, session: str, loads: Iterable[dict], reply: str, now:
             "skill": skill, "checks_first_pass": (t["passed"] == t["total"]) if t else None,
             "fix_rounds": t["fix_rounds"] if t else None, "user_correction": None,
             "checks": f"{t['passed']}/{t['total']}" if t else None, "has_done_means": bool(ld.get("has_done_means")),
+            # the reply's tick-off total must match the skill's list; a mismatch marks an unreliable tick-off
+            "tickoff_mismatch": (t["total"] != ld["checks_expected"]) if t and ld.get("checks_expected") else None,
             "turn_id": str(turn_id) if turn_id is not None else None, "turn_end": round(now, 3),
             "next_user_ts": None, "next_user": None})
     if recs:
@@ -281,7 +292,8 @@ def rollup(rows: list, lo: float, hi: float) -> list:
         by.setdefault(r["skill"], []).append(r)
     out = []
     for skill, rs in by.items():
-        ticked = [r for r in rs if r.get("checks_first_pass") is not None]
+        # a tick-off whose total doesn't match the skill's list is not trusted for first-pass / fix rounds
+        ticked = [r for r in rs if r.get("checks_first_pass") is not None and not r.get("tickoff_mismatch")]
         fixes = [r["fix_rounds"] for r in ticked if isinstance(r.get("fix_rounds"), int)]
         corr = [r for r in rs if r.get("user_correction") is not None]
         out.append({"skill": skill, "uses": len(rs), "ticked": len(ticked),
@@ -310,6 +322,9 @@ def rollup_lines(rows: list, lo: float, hi: float, top: int = 25, title: str = "
     n = sum(d["uses"] for d in tab)
     t = sum(d["ticked"] for d in tab)
     out.append(f"{n} uses of {len(tab)} skills on {', '.join(hosts)}; {t} with a tick-off ({_pct(t / n)}).")
+    bad = sum(1 for r in rows if lo <= (r.get("ts") or 0) < hi and r.get("tickoff_mismatch"))
+    if bad:
+        out.append(f"{bad} tick-off(s) gave a total that differs from the skill's Done-means list; excluded.")
     out += ["", "| Skill | uses | ticked | first-pass | mean fix rounds | correction rate |",
             "|---|---:|---:|---:|---:|---:|"]
     for d in tab[:top]:

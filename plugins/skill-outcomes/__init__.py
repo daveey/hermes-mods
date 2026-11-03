@@ -95,7 +95,8 @@ def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, se
             return None
         with _lock:
             _loads.setdefault(session_id, {}).setdefault(
-                skill, {"skill": skill, "ts": time.time(), "has_done_means": core.has_done_means(d["content"])})
+                skill, {"skill": skill, "ts": time.time(), "has_done_means": core.has_done_means(d["content"]),
+                        "checks_expected": core.count_done_means(d["content"])})
     except Exception as exc:
         log.debug("skill-outcomes post_tool_call: %s", exc)
     return None
