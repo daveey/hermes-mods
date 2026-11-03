@@ -22,7 +22,6 @@ Defect agent-962f3f10ff: with no default budget written down, agents turned a ~$
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Any, Optional
@@ -51,6 +50,9 @@ GPU_HOURS_RE = re.compile(r"\bgpu[- ]?h(?:ours?|rs?)?\b", re.I)
 META_RE = re.compile(
     r"\bcompute envelope\b|\bcoach\b|\bguard\b|\benvelope\b|"
     r"\b(?:approval|authority|spend|compute)[- ](?:check|gate|rule|detector)s?\b", re.I)
+# A sentence that says it is not asking ("My report doesn't ask anyone to approve compute or spend").
+NOT_ASKING_RE = re.compile(r"\b(?:doesn['\u2019]t|does not|don['\u2019]t|do not|didn['\u2019]t|did not|isn['\u2019]t|"
+                           r"is not|no need to|nothing to)\s+(?:\w+\s+){0,2}(?:ask|approv|decid)\w*", re.I)
 # A leading permission request is still an ask when its purpose names the guard.
 # Anchor after list markers/whitespace, not quotes or prose describing someone else's ask.
 PERMISSION_START_RE = re.compile(
@@ -63,6 +65,28 @@ MULTI_RE = re.compile(
 MONEY_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?\s*(k\b)?(\s*(?:/|per |an |a )\s*(?:h|hr|hour)\b)?",
                       re.I)
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?!])[\"'”*)\]]*\s+|\n+")
+
+# Mention, not use: text inside quotes, multi-word inline code, fenced code and blockquotes is somebody else's words
+# (a rule being proposed, a test fixture, the coach's own note), never the agent asking or declaring. Live false
+# holds 2026-11-03: a review quoting proposed AGENTS.md wording ("A spend/change ask (card, clarify or reply) ..."),
+# a card body describing this detector. A quote right after "reply"/"say"/"type" is the answer the agent asks for
+# ('Reply "approve $20"'), and a directive attribute (t="...") is the agent's own text, so those stay.
+MENTION_SPAN_RE = re.compile(r"```.*?(?:```|\Z)|^[ \t]*>[^\n]*|`[^`\n]*\s[^`\n]*`|"
+                             r"\"[^\"\n]{0,600}\"|\u201c[^\u201d\n]{0,600}\u201d", re.S | re.M)
+ANSWER_CUE_RE = re.compile(r"\b(?:reply|say|type|answer|respond|send|write)(?:\s+(?:with|back|me|us))?[\s*_:]*$", re.I)
+
+
+def unquoted(text: str) -> str:
+    """`text` with quoted / code / blockquoted spans blanked, except a quoted answer the text asks the reader for."""
+    text = str(text or "")
+
+    def sub(m: re.Match) -> str:
+        before = text[max(0, m.start() - 40):m.start()]
+        # `::user-step{t="..."}` carries the agent's own ask as an attribute value.
+        if m.group(0)[0] in "\"\u201c" and (ANSWER_CUE_RE.search(before) or before.endswith("=")):
+            return m.group(0)
+        return " " if "\n" not in m.group(0) else "\n"
+    return MENTION_SPAN_RE.sub(sub, text)
 
 
 def envelope_usd() -> float:
@@ -160,8 +184,9 @@ def classify(text: str, envelope: Optional[float] = None) -> Optional[dict]:
         return None
     if MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", text)):
         return None
-    for sent in SENTENCE_SPLIT_RE.split(text):
+    for sent in SENTENCE_SPLIT_RE.split(unquoted(text)):
         if (ASK_RE.search(sent) and COMPUTE_RE.search(sent) and not CREDENTIAL_RE.search(sent)
+                and not NOT_ASKING_RE.search(sent)
                 and (not META_RE.search(sent) or PERMISSION_START_RE.match(sent))):
             return {"sentence": sent.strip()[:300], "usd": max(money) if money else None, "cap": cap}
     return None
@@ -200,6 +225,20 @@ ASK_USER_RE = re.compile(
     r"\b(?:awaiting|pending) (?:your )?approval\b|\breply\b.*\bapprove\b", re.I)
 DECLARED_RE = re.compile(r"\b(?:i|we)\s+(?:have\s+|had\s+)?approved?\b|"
                          r"\b(?:you|he|she|they|david|the user)\s+(?:have\s+|has\s+|had\s+)?approved\b", re.I)
+# A sentence about asking ("a real over-$25 / multi-GPU ask is still held") talks about the flow the rule wants, and
+# one about the rule, its wording, its detector or its tests describes or proposes a rule. Neither is the agent
+# granting itself spend; an "I/we will|set" commitment in the same sentence still counts.
+ASK_TALK_RE = re.compile(r"\bask(?:s|ed|ing)?\b", re.I)
+RULE_TALK_RE = re.compile(
+    r"\bcoach\b|\bdetectors?\b|\bAGENTS\.md\b|\brules?\b|\bwording\b|\bsentences?\b|"
+    r"\b(?:existing|new|regression|unit) tests?\b|\b(?:is|are|still|be|gets?) held\b", re.I)
+# The agent committing itself ("I will", "I'll", "I've set", "we are setting"): rule talk around it does not excuse it.
+COMMITMENT_RE = re.compile(r"\b(?:I|we)(?:\s+(?:will|have|am|are)|['\u2019](?:ll|ve|m|re))?\s+(?:set|setting)\b|"
+                           r"\b(?:I|we)\s+will\b|\b(?:I|we)['\u2019]ll\b", re.I)
+# "the two GPU sentences", "2 GPU rules": a count of words about GPUs, not of GPUs.
+GPU_NOT_MACHINE_RE = re.compile(
+    r"\bgpus?(?=\s+(?:sentences?|rules?|lines?|words?|quotes?|mentions?|paragraphs?|bullets?|phrases?|clauses?|"
+    r"references?|examples?|tests?|cases?|checks?|detectors?|questions?|asks?|headings?|notes?|policies)\b)", re.I)
 
 
 def typed_text(text: Any) -> Optional[str]:
@@ -317,15 +356,18 @@ def _authority(text: str, user_texts=(), asked=()) -> Optional[dict]:
     multi_approved = any(AUTH_MULTI_RE.search(u) and re.search(
         r"\b(?:approve|allow|go ahead|you may|rent|use)\b", u, re.I) for u in users)
     # A cap label followed by its value on the next line is one declaration.
-    text = re.sub(r"\b(cap|budget|limit)\s*\n\s*(?=USD|\$)", r"\1 ", text, flags=re.I)
+    text = re.sub(r"\b(cap|budget|limit)\s*\n\s*(?=USD|\$)", r"\1 ", unquoted(text), flags=re.I)
     for sent in SENTENCE_SPLIT_RE.split(text):
-        commitment = re.search(r"\b(?:I|we) (?:will|set|am setting|are setting|have set)\b", sent, re.I)
+        commitment = COMMITMENT_RE.search(sent)
         if not commitment and (REQUEST_RE.search(sent) or PAST_RE.search(sent) or DENY_RE.search(sent)
+                or ASK_TALK_RE.search(sent) or RULE_TALK_RE.search(sent)
                 or (re.search(r"\bneeds?\b", sent, re.I) and REQUEST_RE.search(text))):
             continue
         amounts = cap_amounts(sent)
         count_text = MONEY_RE.sub("money", re.sub(r"\bUSD\s*", "$", sent, flags=re.I))
-        count_text = re.sub(r"\bnot\s+multi[- ]gpu\b", "single GPU", count_text, flags=re.I)
+        count_text = re.sub(r"\b(?:not|no|without)\s+(?:gpus?\s+or\s+)?multi[- ]?(?:gpu|node)s?\b", "single GPU",
+                            count_text, flags=re.I)
+        count_text = GPU_NOT_MACHINE_RE.sub("gpuword", count_text)
         multi = bool(AUTH_MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", count_text)))
         # The task's approved policy accepts either matching dollars or explicit
         # multi-GPU permission. Never let a smaller dollar figure grant a larger cap.
@@ -353,8 +395,10 @@ def block_text(tool_name: str, args: Any) -> str:
         return str(a.get("body") or "")
     if tool_name == "kanban_block":
         hr = a.get("human_request")
-        return " \n".join(s for s in (str(a.get("reason") or ""),
-                                      json.dumps(hr, ensure_ascii=False) if isinstance(hr, dict) else "") if s)
+        # Plain "field: value" lines, not JSON: JSON quotes every value, and quoted text is a mention (`unquoted`).
+        hr_text = "\n".join(f"{k}: {v}" for k, v in hr.items() if isinstance(v, (str, int, float))) \
+            if isinstance(hr, dict) else ""
+        return " \n".join(s for s in (str(a.get("reason") or ""), hr_text) if s)
     if tool_name == "tool_call":
         parts = [block_text(str((c or {}).get("name") or ""), (c or {}).get("arguments"))
                  for c in (a.get("calls") or []) if isinstance(c, dict)]
