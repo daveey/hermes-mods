@@ -26,6 +26,12 @@ suffix is accepted: builds before exact matching compared substrings, so ``owner
   commits (rebase, then wait for the check on the new head; ``wt/*`` branches: ``hermes-core-wt ship <slug>``).
   Read through GitHub's compare API; an unreadable compare blocks too. Why: daveey/hermes PR #475 landed green but
   250 commits stale on 2026-11-02, onto two commits that changed its files, and main went red.
+  The same two gates hold a REST merge, ``PUT repos/<owner>/<repo>/pulls/<n>/merge`` sent by ``gh api`` (``-X PUT``,
+  ``-XPUT``, ``--method PUT``, ``--method=PUT``; the ``sha`` field is the head checked, else the PR's head), curl, or
+  a Python HTTP client. A GraphQL ``mergePullRequest`` / ``enablePullRequestAutoMerge`` call on a guarded repo (or one
+  whose PR node id cannot be resolved) is refused outright, and so is ``gh pr merge --auto`` onto a require_check
+  branch: the gates run when the command is issued but GitHub merges later, after the branch may have moved.
+  Land those with ``gh pr merge <n> --match-head-commit <sha>``.
 
 ``PUSH_GUARD=off`` anywhere in the command skips the check (emergencies; say why). Pushes made inside other tools
 (hermes-core-wt, hermes-sync, hermes update) are not agent tool calls and are never seen here.
@@ -119,6 +125,8 @@ def _commands(cmd: str, cwd: str):
                 words, changed = words[1:], True
                 while words and re.match(r"^(-\S+|\d+[smh]?)$", words[0]):
                     words = words[1:]
+            if len(words) > 1 and re.match(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$", words[0]):
+                words, changed = words[1:], True  # `$B gh api ...`: B holds a wrapper (token-broker exec ... --)
             if words and os.path.basename(words[0]) == "token-broker" and "--" in words:
                 words, changed = words[words.index("--") + 1:], True
         if not words:
@@ -431,6 +439,45 @@ def _overlap_block(g: dict, data: dict, what: str, number) -> Optional[str]:
             f"check on the new head: {how}.{tail}")
 
 
+def _auto_block(g: dict, text: str) -> str:
+    """`gh pr merge --auto`: the gates run now, GitHub merges later. Counted before refusing it: 7 `gh pr merge
+    --auto` calls on daveey/hermes in the 14 days to 2026-11-03 (hub: PRs 120, 180, 274, 278; MacBook: PR 329 x3),
+    and PR 180's merged at once, before CI finished on its head."""
+    return (f"PUSH GUARD: blocked: `{text[:100]}` asks GitHub to merge later (--auto) on {g['remote']} "
+            f"{g['branch']}. This guard checks \"{g['require_check']}\" on the exact head and whether {g['branch']} "
+            f"changed the PR's files when the command runs, but an auto-merge lands afterwards, when {g['branch']} "
+            f"may have moved. Wait for the check on the head sha (github-ci-wait skill), then merge now: "
+            f"`gh pr merge <n> -R {g['remote']} --match-head-commit <head sha>`. Emergency only: prefix the command "
+            f"with `{OVERRIDE}` and say why in your report.")
+
+
+def _gate_pr(mine: list[dict], slug: str, selector: Optional[str], what: str, cwd: Optional[str],
+             sha: Optional[str] = None, auto=None) -> Optional[str]:
+    """The merge gate for one PR of a require_check repo: exact-head check, then landing overlap.
+
+    ``sha`` is the head the merge request pins (REST ``-f sha=``); without it the PR's current head is checked.
+    ``auto`` (the command text) refuses a deferred `--auto` merge onto the guarded branch outright."""
+    data, err = _gh_json(["pr", "view", *([selector] if selector else []), "--json",
+                          "headRefOid,baseRefName,headRefName,number", "-R", slug], cwd=cwd)
+    if err is not None or not isinstance(data, dict) or not data.get("headRefOid"):
+        return _unverified(mine[0], what, f"the PR's head could not be read ({err or 'no headRefOid'})")
+    if sha:
+        data = {**data, "headRefOid": sha}  # GitHub merges only if the head is this sha: gate what will land
+    for g in mine:
+        if data.get("baseRefName") and data["baseRefName"] != g["branch"]:
+            continue
+        if auto:
+            return _auto_block(g, auto)
+        why = _check_block(g, str(data["headRefOid"]), what)
+        if why:
+            return why
+        number = data.get("number") or (selector if selector and selector.isdigit() else None)
+        why = _overlap_block(g, data, what, number)
+        if why:
+            return why
+    return None
+
+
 def check_pr_merge(cmd: str, cwd: str, guards: list[dict]) -> Optional[str]:
     checked = [g for g in guards if g["require_check"]]
     if not checked:
@@ -443,21 +490,137 @@ def check_pr_merge(cmd: str, cwd: str, guards: list[dict]) -> Optional[str]:
         kind = "admin merge" if "--admin" in text else "PR merge"
         what = f"`{text[:100]}` ({kind}; exact-head CI is required even for admin credentials)"
         selector = sel or _git(d, "symbolic-ref", "-q", "--short", "HEAD")
-        data, err = _gh_json(["pr", "view", *([selector] if selector else []), "--json",
-                              "headRefOid,baseRefName,headRefName,number", "-R", slug], cwd=d)
-        if err is not None or not isinstance(data, dict) or not data.get("headRefOid"):
-            return _unverified(mine[0], what, f"the PR's head could not be read ({err or 'no headRefOid'})")
-        for g in mine:
-            if data.get("baseRefName") and data["baseRefName"] != g["branch"]:
-                continue
-            why = _check_block(g, str(data["headRefOid"]), what)
-            if why:
-                return why
-            number = data.get("number") or (sel if sel and sel.isdigit() else None)
-            why = _overlap_block(g, data, what, number)
-            if why:
-                return why
+        why = _gate_pr(mine, slug, selector, what, d, auto="--auto" in text.split() and text)
+        if why:
+            return why
+    for d, slug, number, sha, text in _api_merges(cmd, cwd):
+        why = gate_rest_merge(slug, number, sha, text, d, checked)
+        if why:
+            return why
     return None
+
+
+def gate_rest_merge(slug: str, number: str, sha: Optional[str], text: str, cwd: Optional[str],
+                    checked: list[dict]) -> Optional[str]:
+    """`PUT repos/<slug>/pulls/<number>/merge` (gh api, curl, urllib...): the same gate as `gh pr merge`."""
+    mine = [g for g in checked if g["remote"] == slug]
+    if not mine:
+        return None
+    what = (f"`{text[:100]}` (REST API merge of PR #{number}; exact-head CI is required even for admin "
+            f"credentials; prefer `gh pr merge {number} -R {slug} --match-head-commit <sha>`)")
+    return _gate_pr(mine, slug, number, what, cwd, sha)
+
+
+# --- raw GitHub API merges (gh api REST / GraphQL, curl) --------------------------------------------------------
+
+GH_API_VALUE_OPTS = {"-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--input", "-q",
+                     "--jq", "-t", "--template", "--hostname", "-p", "--preview", "--cache"}
+REST_MERGE = re.compile(r"^(?:https?://[^/]+/(?:api/v3/)?)?/?repos/([^/\s]+)/([^/\s?]+)/pulls/(\d+)/merge/?(?:\?.*)?$")
+GQL_MERGE = re.compile(r"\b(?:mergePullRequest|enablePullRequestAutoMerge)\b")
+# a GraphQL call, not text that merely names the mutation (grep, a log search): `gh api [opts] graphql` in shell or a
+# Python string, a Python argv list, or the GraphQL endpoint URL (curl, urllib, requests)
+GQL_CALL = re.compile(r"""\bgh\s+api\b[^|;&\n]*?\sgraphql\b|["']gh["']\s*,\s*["']api["']\s*,(?:\s*["'][^"']*["']\s*,)*"""
+                      r"""\s*["']graphql["']|https?://[^"'\s]+/graphql\b""")
+
+
+def _gh_api_parse(words: list[str]):
+    """(endpoint, method or None, {field: value}) for `gh api <words...>` (words after `api`)."""
+    endpoint, method, fields, i = None, None, {}, 0
+    while i < len(words):
+        a = words[i]
+        val = None
+        if a in GH_API_VALUE_OPTS:
+            val = words[i + 1] if i + 1 < len(words) else ""
+            i += 2
+        elif a.startswith("--") and "=" in a and a.split("=", 1)[0] in GH_API_VALUE_OPTS:
+            a, val = a.split("=", 1)
+            i += 1
+        elif re.match(r"^-[XfFHqtp].", a):  # attached short form: -XPUT, -fsha=...
+            a, val = a[:2], a[2:]
+            i += 1
+        else:
+            if not a.startswith("-") and endpoint is None:
+                endpoint = a
+            i += 1
+            continue
+        if a in ("-X", "--method"):
+            method = val.upper()
+        elif a in ("-f", "--raw-field", "-F", "--field") and "=" in val:
+            k, v = val.split("=", 1)
+            fields[k] = v
+    return endpoint, method, fields
+
+
+def _origin_slug(cwd: str) -> str:
+    return _slug(_git(cwd, "remote", "get-url", "origin") or "")
+
+
+def _api_merges(cmd: str, cwd: str):
+    """Yield (cwd, slug, number, sha or None, text) per REST merge: `gh api -X PUT repos/o/r/pulls/N/merge` and
+    `curl -X PUT .../repos/o/r/pulls/N/merge`. `{owner}/{repo}` placeholders resolve to the cwd's origin as gh does."""
+    for d, words in _commands(cmd, cwd):
+        tool = os.path.basename(words[0])
+        if tool == "gh" and words[1:2] == ["api"]:
+            endpoint, method, fields = _gh_api_parse(words[2:])
+            sha = fields.get("sha")
+        elif tool == "curl":
+            endpoint, method, sha = None, None, None
+            for j, w in enumerate(words[1:], 1):
+                if w in ("-X", "--request") and j + 1 < len(words):
+                    method = words[j + 1].upper()
+                elif re.match(r"^-X.", w) or w.startswith("--request="):
+                    method = w.split("=", 1)[1].upper() if w.startswith("--") else w[2:].upper()
+                elif REST_MERGE.match(w):
+                    endpoint = w
+            m = re.search(r'"sha"\s*:\s*"([0-9a-fA-F]{7,40})"', " ".join(words))
+            sha = m.group(1) if m else None
+        else:
+            continue
+        m = REST_MERGE.match(endpoint or "")
+        if not m or method != "PUT":
+            continue
+        owner, name, number = m.groups()
+        slug = _origin_slug(d) if (owner, name) == ("{owner}", "{repo}") else _slug(f"{owner}/{name}")
+        yield d, slug, number, sha, " ".join(words)
+
+
+def _gql_repo(text: str, guards: list[dict]) -> Optional[str]:
+    """The repo a GraphQL merge mutation targets: resolve the PR node id through the API, else a slug or an
+    owner/name pair named in the query or its fields. None when it cannot be told."""
+    for node in dict.fromkeys(re.findall(r"\bPR_[A-Za-z0-9_-]{6,}", text)):
+        q = 'query{node(id:"%s"){... on PullRequest{repository{nameWithOwner}}}}' % node
+        data, err = _gh_json(["api", "graphql", "-f", f"query={q}"])
+        try:
+            return _slug(data["data"]["node"]["repository"]["nameWithOwner"])
+        except (TypeError, KeyError):
+            pass
+    for g in guards:
+        if re.search(r"(?<![\w.-])" + re.escape(g["remote"]) + r"(?![\w-])", text, re.I):
+            return g["remote"]
+    owner = re.search(r"\bowner\b\W{0,4}([\w.-]+)", text)
+    name = re.search(r"\bname\b\W{0,4}([\w.-]+)", text)
+    if owner and name:
+        return _slug(f"{owner.group(1)}/{name.group(1)}")
+    return None
+
+
+def check_graphql_merge(text: str, guards: list[dict]) -> Optional[str]:
+    """Refuse a GraphQL mergePullRequest / enablePullRequestAutoMerge call (``text`` is the call itself) on a guarded
+    repo, or one that cannot be told: the mutation lands without the exact-head and landing-overlap gates
+    `gh pr merge` gets here."""
+    if not guards or not GQL_MERGE.search(text):
+        return None
+    slug = _gql_repo(text, guards)
+    mine = [g for g in guards if g["remote"] == slug] if slug else guards
+    if not mine:
+        return None
+    g, hit = mine[0], GQL_MERGE.search(text)
+    which = hit.group(0) if hit else "mergePullRequest"
+    target = f"{g['remote']} {g['branch']}" if slug else "a repo this guard cannot identify (no readable PR node id)"
+    return (f"PUSH GUARD: blocked: a GraphQL `{which}` merges a PR on {target} without the exact-head CI and "
+            f"landing-overlap checks every merge on a guarded repo gets. Merge with `gh pr merge <n> -R <owner/repo> "
+            f"--match-head-commit <head sha>` instead (after the required check is green on that sha). Emergency "
+            f"only: prefix the command with `{OVERRIDE}` and say why in your report.")
 
 
 # --- entry points --------------------------------------------------------------------------------------------
@@ -465,8 +628,14 @@ def check_pr_merge(cmd: str, cwd: str, guards: list[dict]) -> Optional[str]:
 def check_shell(cmd: str, cwd: Optional[str] = None, guards: Optional[list[dict]] = None) -> Optional[str]:
     guards = load_guards() if guards is None else guards
     cmd = cmd or ""
-    if not guards or OVERRIDE in cmd or ("push" not in cmd and "merge" not in cmd):
+    if not guards or OVERRIDE in cmd or ("push" not in cmd and "merge" not in cmd.lower()):
         return None
+    why = None
+    if GQL_MERGE.search(cmd) and GQL_CALL.search(cmd):
+        # the query may span lines, quotes and `|`: read the whole command once it calls GraphQL
+        why = check_graphql_merge(cmd, guards)
+        if why:
+            return why
     cwd = _resolve(cwd or os.getcwd())
     why = check_pr_merge(cmd, cwd, guards)
     if why or "push" not in cmd:
@@ -512,19 +681,49 @@ PY_LITERAL = re.compile(r"""(?:"([^"\n]*\b(?:git\b[^"\n]*\bpush|gh\b[^"\n]*\bmer
                         r"""'([^'\n]*\b(?:git\b[^'\n]*\bpush|gh\b[^'\n]*\bmerge)\b[^'\n]*)')""")
 
 
+PY_REST_URL = re.compile(r"""["'](https?://[^"'\s]+/repos/[^/"'\s]+/[^/"'\s]+/pulls/\d+/merge/?)["']""")
+
+
+def _python_rest_merges(code: str, cwd: Optional[str], guards: list[dict]) -> Optional[str]:
+    """urllib/requests/httpx PUTs to `https://api.github.com/repos/<o>/<r>/pulls/<n>/merge` inside Python."""
+    checked = [g for g in guards if g["require_check"]]
+    if not checked or not re.search(r"""["']PUT["']|\.put\(""", code, re.I):
+        return None
+    sha = re.search(r"""["']sha["']\s*:\s*["']([0-9a-fA-F]{7,40})["']""", code)
+    for url in PY_REST_URL.findall(code):
+        m = REST_MERGE.match(url)
+        if not m:
+            continue
+        owner, name, number = m.groups()
+        why = gate_rest_merge(_slug(f"{owner}/{name}"), number, sha.group(1) if sha else None,
+                              f"PUT {url}", _resolve(cwd or os.getcwd()), checked)
+        if why:
+            return why
+    return None
+
+
 def check_python(code: str, cwd: Optional[str] = None, guards: Optional[list[dict]] = None) -> Optional[str]:
     """Shell strings inside Python (subprocess.run("...", shell=True), terminal("...")) and argv lists."""
     guards = load_guards() if guards is None else guards
     code = code or ""
-    if not guards or ("push" not in code and "merge" not in code):
+    if not guards or ("push" not in code and "merge" not in code.lower()):
         return None
+    if OVERRIDE not in code:
+        if GQL_MERGE.search(code) and GQL_CALL.search(code):
+            # the mutation spans quotes and lines: read the whole code once it calls GraphQL
+            why = check_graphql_merge(code, guards)
+            if why:
+                return why
+        why = _python_rest_merges(code, cwd, guards)
+        if why:
+            return why
     for lit in PY_LITERAL.findall(code):
         why = check_shell(lit[0] or lit[1], cwd, guards)
         if why:
             return why
     for m in re.finditer(r"\[\s*[\"'](?:git|gh)[\"'](?:\s*,\s*[\"'][^\"']*[\"'])+\s*\]", code):
         words = re.findall(r"[\"']([^\"']*)[\"']", m.group(0))
-        if "push" in words or "merge" in words:
+        if "push" in words or any(w == "merge" or REST_MERGE.match(w) for w in words):
             why = check_shell(shlex.join(words), cwd, guards)
             if why:
                 return why
