@@ -7,10 +7,17 @@ import pytest
 from plugins.runners.providers import runtime
 
 
-def call(client):
+# The deadline covers launching a fresh interpreter, which alone takes 0.1-0.4 s
+# on a loaded CI runner. Tests that expect expiry keep the short deadline; a
+# test that expects success uses the production budget (GitHubActions timeout=10).
+EXPIRY_TIMEOUT = 0.2
+SUCCESS_TIMEOUT = 10
+
+
+def call(client, timeout=EXPIRY_TIMEOUT):
     return client('GET', 'https://api.github.com/x',
                   headers={'Authorization': 'Bearer fictional-deadline-token'},
-                  timeout=0.2, allow_redirects=False)
+                  timeout=timeout, allow_redirects=False)
 
 
 @pytest.mark.parametrize('stage', ['dns', 'headers', 'body', 'close'])
@@ -100,7 +107,7 @@ http.client.HTTPSConnection = Connection
         assert kwargs['close_fds'] and len(kwargs['pass_fds']) == 1
         return real_popen(argv, **kwargs)
     monkeypatch.setattr(runtime.subprocess, 'Popen', spawn)
-    result = call(runtime.GitHubHTTPTransport())
+    result = call(runtime.GitHubHTTPTransport(), timeout=SUCCESS_TIMEOUT)
     assert result.status == 200 and result.body == {'ok': True}
     assert result.headers == {'etag': 'offline'}
     assert capfd.readouterr() == ('', '')
