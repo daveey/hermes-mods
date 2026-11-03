@@ -57,7 +57,9 @@ A new guard also belongs in private `home/plugins-every-host.txt`; export must n
 3. Test the worktree copy before publication; verify linked registration after deployment. The whole-repo gate is `scripts/test-all`
    (exit 0 = every suite passed; `-k <plugin>` for one). Python selection is `$HERMES_MODS_PYTHON`,
    then `<core>/.venv/bin/python`, then production (macOS signed Python 3.14; Linux gateway launcher's
-   managed Python), then the invoking interpreter with a warning in both header and summary. The header
+   managed Python), then the invoking interpreter with a warning in both header and summary. If that
+   invoking interpreter is older than the Python core gates its runtime dependencies on (3.14 today), the
+   runner exits 2 before building a site or running any suite: set `HERMES_MODS_PYTHON`. The header
    prints the chosen version; test dependencies are cached per Python minor version. Never a bare `pytest`
    at the root. On the MacBook run
    only the targeted suite (`-k`); the full run belongs on the hub. A new plugin's tests are picked up
