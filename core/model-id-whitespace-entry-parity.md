@@ -27,7 +27,8 @@ One shared helper holds the rule and each entry point calls it, so they cannot d
 
 - `hermes_cli/models_validate.py`: `model_whitespace_error`, `_normalized_provider`
 - `hermes_cli/main.py`: `_reject_startup_spaced_model`
-- `hermes_cli/kanban_db.py`: `_reject_spaced_pin`
+- `hermes_cli/kanban_pin_provider.py`: `reject_spaced_pin`, called by `kanban_db._validate_model_override`,
+  `kanban_db.create_task` and `kanban_model_assignment.validate_task_pin`
 - `agent/error_classifier.py`: `_is_anthropic_model_not_found`
 
 ## Tests
