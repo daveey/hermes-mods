@@ -304,13 +304,19 @@ export function Panel() {
   const n = counts(sorted, { asks, done: finished ? finished.length : null })
   // A legacy card listed above as an unasked row is the same exact qualified card the strip's "Earlier asks"
   // would show again: hand those identities to the strip so each card renders once. Exact identity only.
-  const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }) : null
+  const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
   const anything = asks || sorted.unasked.length || chips.length || finished?.length || US?.snapshot?.ledger?.steps?.length || US?.snapshot?.issues?.length
   if (!anything) return null
   const attention = attentionKeys(asks, sorted)
   const collapsed = !!collapsedKeys && attention.every(k => collapsedKeys.includes(k))
   const toggle = () => { const next = collapsed ? null : attention; writeCollapsed(next); setCollapsedState(next) }
   const status = busy ? 'Agent working now' : sorted.lastActivity ? `Idle · last activity ${ago(sorted.lastActivity, now)}` : 'Idle'
+  const needsYou = [
+    (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
+    US?.ActionQueue && jsx(US.ActionQueue, { embedded: true }, 'queue'),
+    ...sorted.unasked.map(i => jsx(Row, { i: { ...i, detail: `${i.detail} · answer in chat or open the card` }, color: C.needsYou }, i.key)),
+    legacy
+  ].filter(Boolean)
   const summary = Object.keys(LABEL).filter(k => n[k]).map(k => `${n[k]} ${LABEL[k]}`).join(' · ')
   return jsxs('section', { 'data-session-panel': '', 'aria-label': 'Session status', style: { width: '100%', minWidth: 0, boxSizing: 'border-box', padding: '10px 12px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
     jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }, children: [
@@ -320,11 +326,10 @@ export function Panel() {
       jsx('button', { type: 'button', 'data-panel-toggle': '', 'aria-expanded': !collapsed, 'aria-label': collapsed ? 'Expand session status' : 'Collapse session status', title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: toggle, style: { ...btn, marginLeft: 'auto', flex: 'none', minHeight: 28, minWidth: 28, padding: '2px 6px' }, children: jsx('i', { 'aria-hidden': true, className: `codicon ${collapsed ? 'codicon-chevron-up' : 'codicon-chevron-down'}` }) })
     ] }),
     !collapsed && jsx(Bar, { n }),
+    // Collapse folds progress, never an ask: a muted "1 needs you" behind a chevron reads as nothing needing you.
+    collapsed && n.needsYou > 0 && jsx('div', { 'data-panel-needs-you': '', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0 }, children: needsYou }),
     !collapsed && jsxs('div', { 'data-panel-body': '', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0 }, children: [
-      (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }),
-      US?.ActionQueue && jsx(US.ActionQueue, { embedded: true }),
-      ...sorted.unasked.map(i => jsx(Row, { i: { ...i, detail: `${i.detail} · answer in chat or open the card` }, color: C.needsYou }, i.key)),
-      legacy,
+      ...needsYou,
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
       ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),
       sorted.active.length > 0 && jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),

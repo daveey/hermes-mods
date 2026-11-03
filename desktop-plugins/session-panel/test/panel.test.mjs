@@ -178,6 +178,21 @@ test('panel: an unmarked session-cards answer leaves done unknown instead of zer
   void b
 })
 
+test('panel: a collapsed panel still shows what needs you (collapse folds progress, never an ask)', async () => {
+  window.localStorage.clear()
+  const s = Date.now() / 1000
+  bridges({ chips: [card('t_ask', 'blocked', { look: 'needs-you' }), card('t_run', 'running', { activityAt: s - 30 })] })
+  await show(React.createElement(m.Panel, { key: 'collapse-ask' }))
+  await React.act(async () => { el().querySelector('[data-panel-toggle]').click(); await flush() })
+  assert.equal(el().querySelector('[data-panel-body]'), null, 'progress is folded')
+  assert.match(el().querySelector('[data-collapsed-summary]').textContent, /1 needs you/)
+  const kept = el().querySelector('[data-panel-needs-you]')
+  assert.ok(kept, 'needs-you section stays visible while collapsed')
+  assert.equal(kept.querySelector('[data-section="needs-you"]').textContent, 'Needs you · 1')
+  assert.ok(kept.querySelector('[data-panel-row]'), 'the card row itself is shown')
+  assert.equal(kept.textContent.includes('t_run'), false, 'running work stays folded')
+})
+
 test('panel: collapse holds until a new stuck item appears, then reopens', async () => {
   window.localStorage.clear()
   const s = Date.now() / 1000
