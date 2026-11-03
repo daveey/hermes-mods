@@ -1,6 +1,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -43,6 +44,10 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
+    if _NO_CORE:
+        for item in items:
+            if f'{item.path.name}::{item.originalname}' in _CORE_ONLY_TESTS:
+                item.add_marker(pytest.mark.skip(reason='needs Hermes core (none on the path; HERMES_CORE_CHECKOUT unset)'))
     # Core's own conftest applies platforms(...) gating, but scripts/test-all runs this suite with its own
     # rootdir, so only this conftest loads: Linux-only tests (core's http_readback) ran and failed on macOS.
     # Reuse core's gate rather than a copy that can drift from it.
@@ -54,6 +59,79 @@ def pytest_collection_modifyitems(config, items):
         reason = _platforms_gate_reason(item)
         if reason is not None:
             item.add_marker(pytest.mark.skip(reason=reason))
+
+
+# Core is private, so the public plugin-suites CI has none: a test module that imports core at module
+# level skips there instead of erroring at collection. Only when no core is on the path and none was
+# named (scripts/test-all sets HERMES_CORE_CHECKOUT whenever it puts core on PYTHONPATH); with a core
+# named, a missing core module still fails loudly. Only core's own top-level modules count.
+_NO_CORE = _core_spec is None and not os.environ.get('HERMES_CORE_CHECKOUT')
+_CORE_TOPS = frozenset({'agent', 'acp_adapter', 'cron', 'gateway', 'model_tools', 'run_agent', 'tools',
+                        'toolsets', 'hermes_platform', 'batch_runner', 'cli'})
+_MISSING_MODULE = re.compile(r"ModuleNotFoundError: No module named '([\w.]+)'")
+# Tests that need core but never see its ImportError: the plugin swallows it (the judge/context path
+# reports judge_or_context_error), core's websockets dependency is absent, or they read core's source or
+# platform-gating fixture. They pass with core; skipped only when there is none (see _NO_CORE).
+_CORE_ONLY_TESTS = frozenset({
+    'test_goal_bounded_evidence.py::test_oversized_memory_is_bounded_and_stop_remains_human',
+    'test_goal_bounded_evidence.py::test_restriction_after_large_tool_is_not_trimmed',
+    'test_goal_capability_gate.py::test_current_boundary_is_logged',
+    'test_goal_capability_gate.py::test_gate_does_not_certify_superseded_boundary',
+    'test_goal_disposition.py::test_no_owner_adapter_never_certifies_ownership',
+    'test_goal_process_serve.py::test_process_ownership_over_production_serve',
+    'test_goal_restriction_gate.py::test_explicit_restriction_never_nudges_work',
+    'test_goal_restriction_gate.py::test_new_repair_steering_supersedes_old_whole_turn_veto',
+    'test_goal_restriction_gate.py::test_partial_quoted_or_ambiguous_scope_is_not_whole_turn_veto',
+    'test_goal_serve_acceptance.py::test_production_serve_auth_and_next_turn',
+    'test_goal_transport_controls.py::test_ws_reconnect_guarded_completion',
+    'test_platform_marks.py::test_windows_only_mark_runs_only_on_windows',
+    'test_reply_check.py::test_notice_turn_recognizes_every_prompt_producer_text',
+})
+
+
+def _core_module(name):
+    parts = name.split('.')
+    if parts[0] == 'tests' and len(parts) > 1:  # core's own tests package (tests.agent, tests.waiting, ...)
+        parts = parts[1:]
+        if not (_ROOT / 'tests' / parts[0]).exists() and not (_ROOT / 'tests' / f'{parts[0]}.py').exists():
+            return True
+    top = parts[0]
+    return top in _CORE_TOPS or top.startswith('hermes_')
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    outcome = yield
+    report = outcome.get_result()
+    if not (_NO_CORE and report.failed and isinstance(collector, pytest.Module)):
+        return
+    missing = _MISSING_MODULE.findall(str(report.longrepr))
+    if missing and all(_core_module(m) for m in missing):
+        report.outcome = 'skipped'
+        report.longrepr = (str(collector.path), 0, f'Skipped: needs Hermes core ({missing[-1]} not importable)')
+
+
+def _missing_core(exc):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ModuleNotFoundError) and exc.name and _core_module(exc.name):
+            return exc.name
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    # Same rule for a test (or fixture) that imports core at run time.
+    outcome = yield
+    report = outcome.get_result()
+    if not (_NO_CORE and report.failed and call.excinfo is not None):
+        return
+    missing = _missing_core(call.excinfo.value)
+    if missing:
+        report.outcome = 'skipped'
+        report.longrepr = (str(item.path), item.location[1] or 0, f'Skipped: needs Hermes core ({missing} not importable)')
 
 
 @pytest.hookimpl(trylast=True)
