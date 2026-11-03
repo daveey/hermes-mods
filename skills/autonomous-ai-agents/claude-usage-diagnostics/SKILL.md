@@ -60,12 +60,16 @@ Probe **all models on all credentials** and report the matrix. Partial availabil
 ### 3a. Healthy live account skipped by Hermes
 
 - Inspect `model_cooldowns` as well as credential-wide status: `hermes auth list` can show `ok` while a model-specific cooldown blocks selection. Compare with a correctly shaped live completion before declaring quota exhausted.
-- For each account that succeeds live but remains blocked locally, use `hermes auth reset anthropic <exact-entry-id>`; this clears model cooldowns without rotating tokens. Leave genuinely failing accounts untouched. Read back pool state, then exercise `hermes chat --provider anthropic -m <tested-model> --oneshot --ignore-rules -t '' --max-turns 1 --run-budget 45 -Q -q 'Reply with exactly: pool-ok. Do not use any tools.'` and confirm the logged provider is Anthropic, not a fallback.
+- After an exact account×model completion succeeds despite a local cooldown, use `hermes auth reset <provider> <exact-entry-id>` (`anthropic` or `openai-codex`), not a token rotation or whole-pool reset. Read back the affected worker profile's effective auth store; confirm the target cleared and genuinely exhausted entries stayed unchanged. Run a one-turn smoke through that profile with the tested provider/model and verify no fallback. Output followed by a teardown timeout proves a response, not successful job completion; worker recovery additionally requires a normal-gate run with served-model, tool activity and result evidence.
 - An enabled `fast-rate-limit-fallback` plugin may still be inactive: run its `check.py` with the managed Hermes Python and inspect `wrappers_active`. After upgrades, AST compatibility guards can disable wrappers while the plugin list still reports enabled. Do not replace compatibility fingerprints without auditing changed core behavior and rerunning regression tests.
 
 ### Managed workers versus direct CLI
 
 When a direct CLI call rotates successfully but a Kanban/managed turn repeats one account's 429, inspect the agent-construction handoff before changing grants or relay state. Carry the resolver's `credential_pool` along with its bearer into the managed agent; preserve explicit launch-key authority, fallback-provider boundaries and deferred class routing. Test real managed construction followed by real pool recovery for both providers. A CLI probe can persist cooldowns and make later managed probes pass without fixing rotation: live acceptance must begin with an authorized reset of a known-walled first row and show 429 → account switch → completion within the same managed run. Do not treat an unscoped `all exhausted or empty` log line as evidence that the requested provider is out.
+
+### Successful Codex probe but exhaustion survives reload
+
+Test successful-probe recovery through select → persisted auth row → fresh pool reload in an isolated HERMES_HOME, not only the selected in-memory entry. Clearing last_status_at to None can let the persistence recency merge reinstate a still-future disk exhaustion. Preserve the observed failure generation when designing the fix, and test that a newer concurrent 429 and unrelated model cooldowns survive; do not broadly bypass recency with status_cleared_ids. An external HTTP200 proves capacity, not that the pool observed or persisted recovery. Keep the incident's historical cause separate from a reproduced persistence defect.
 
 ### 3b. Verify account-selection and rotation plugins together
 
