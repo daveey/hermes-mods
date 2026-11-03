@@ -11,6 +11,10 @@ spec.loader.exec_module(monitor)
 DIRTY = {"clean": False, "rejected_ops": 1}
 CLEAN = {"clean": True}
 UNKNOWN = {"clean": False, "unavailable": True}
+# Core-backed tests (hermes_cli kanban tools, owner identity) skip only when core is absent
+# (plugin-suites CI has no core checkout); with core they run, and a broken core still fails.
+requires_core = pytest.mark.skipif(importlib.util.find_spec("hermes_cli") is None,
+                                   reason="Hermes core (hermes_cli) not importable: core-backed test")
 
 
 class Tools:
@@ -100,6 +104,7 @@ def test_command_contract(code, payload, available):
     assert bool(report.get("unavailable")) is (not available)
 
 
+@requires_core
 def test_native_tools_create_readback_and_restart_dedup(tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
@@ -128,6 +133,7 @@ def test_native_tools_create_readback_and_restart_dedup(tmp_path, monkeypatch):
         conn.close()
 
 
+@requires_core
 def test_main_owner_guard_before_state_write(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import kanban_sync_client as client
@@ -176,6 +182,7 @@ def _emit(payload, code=0):
 ASLEEP = ["/nonexistent/drift-fixture-asleep"]
 
 
+@requires_core
 def test_main_unavailable_target_within_threshold_exits_zero(tmp_path, monkeypatch, capsys):
     code, state = _run_main(tmp_path, monkeypatch, {"hub/default": _emit(CLEAN), "laptop/default": ASLEEP}, 1000.0)
     assert code == 0
@@ -189,6 +196,7 @@ def test_main_unavailable_target_within_threshold_exits_zero(tmp_path, monkeypat
     assert state["targets"]["laptop/default"]["unavailable_since"] == 1000.0
 
 
+@requires_core
 def test_main_unavailable_past_threshold_exits_one_and_lists_stale(tmp_path, monkeypatch, capsys):
     _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 1000.0)
     capsys.readouterr()
@@ -197,6 +205,7 @@ def test_main_unavailable_past_threshold_exits_one_and_lists_stale(tmp_path, mon
     assert json.loads(capsys.readouterr().out)["stale_targets"] == ["laptop/default"]
 
 
+@requires_core
 def test_main_per_target_threshold_map(tmp_path, monkeypatch, capsys):
     targets = {"laptop/default": ASLEEP, "server/default": ASLEEP}
     limits = {"unavailable_alert_after": {"laptop/default": 43200}}
@@ -209,6 +218,7 @@ def test_main_per_target_threshold_map(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["stale_targets"] == ["laptop/default", "server/default"]
 
 
+@requires_core
 @pytest.mark.parametrize("payload, code", [(CLEAN, 0), (DIRTY, 1)])
 def test_main_real_sample_clears_unavailable_since(tmp_path, monkeypatch, payload, code):
     _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 1000.0)
@@ -219,6 +229,7 @@ def test_main_real_sample_clears_unavailable_since(tmp_path, monkeypatch, payloa
     assert state["targets"]["laptop/default"]["unavailable_since"] == 99999.0
 
 
+@requires_core
 def test_main_consumer_error_still_exits_one(tmp_path, monkeypatch):
     def broken(name, args):
         raise RuntimeError("fixture tool failure")
