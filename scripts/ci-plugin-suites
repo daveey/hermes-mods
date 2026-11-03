@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""CI helper for .github/workflows/plugin-suites.yml: pick the test-all suites a change touches, then
+summarize their results.
+
+  scripts/ci-plugin-suites select --all
+  scripts/ci-plugin-suites select --base <sha> [--head HEAD]
+      Prints the selected suite names, one per line (stdout), and why each was picked (stderr).
+  scripts/ci-plugin-suites summary results.json
+      Prints a suite / python / status / passed / failed / errors / skipped table (and appends it to
+      $GITHUB_STEP_SUMMARY), plus one ::error annotation per failed suite. Exit 1 if any suite failed.
+
+Suite names and dirs come from `scripts/test-all --list` (the source of truth). A changed path selects:
+  * every suite, if it is under scripts/, tests/, lib/ or is this workflow (shared runner/helpers),
+    or if the base commit is missing/unknown (new branch, force push, shallow history);
+  * the suite whose dir contains it (plugins/<n>, tools/<n>, skills/<cat>/<n>);
+  * desktop-plugins/<n>/...: plugins/<n> when that suite exists;
+  * any other plugin/tool/skill suite whose Python files name a selected component (`plugins/<n>`,
+    `plugins.<n_>`, `"plugins" / "<n>"`), repeated until nothing new is added: coach imports ask-gate, so
+    an ask-gate change runs coach too.
+tests/ and repo-guards are never added as dependents: repo-guards.yml runs tests/ on every push and PR.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKFLOW = ".github/workflows/plugin-suites.yml"
+ALL_PREFIXES = ("scripts/", "tests/", "lib/")
+REPO_WIDE = ("tests", "repo-guards", "tests/integration_f3")  # dir tests/: run by repo-guards.yml too
+
+
+def list_suites(root: Path) -> list[str]:
+    out = subprocess.run([sys.executable, str(root / "scripts" / "test-all"), "--root", str(root), "--list"],
+                         check=True, capture_output=True, text=True).stdout
+    return [ln.split("  [skip:", 1)[0].strip() for ln in out.splitlines() if ln.strip()]
+
+
+def changed_paths(root: Path, base: str | None, head: str) -> list[str] | None:
+    """Paths changed between merge-base(base, head) and head; None when the base can't be used."""
+    if not base or set(base) == {"0"}:
+        return None
+    git = ["git", "-C", str(root)]
+    if subprocess.run(git + ["cat-file", "-e", base + "^{commit}"], capture_output=True).returncode:
+        return None
+    mb = subprocess.run(git + ["merge-base", base, head], capture_output=True, text=True)
+    if mb.returncode:
+        return None
+    out = subprocess.run(git + ["diff", "--name-only", "--no-renames", mb.stdout.strip(), head],
+                         check=True, capture_output=True, text=True).stdout
+    return [p for p in out.splitlines() if p]
+
+
+def refs(component: str) -> re.Pattern:
+    """How a suite's code names another component: path string, import path, or Path / parts."""
+    top, _, name = component.partition("/")
+    if "/" in name:  # skills/<cat>/<n>: only its path is referenced
+        return re.compile(re.escape(component) + r"(?![\w-])")
+    return re.compile(
+        rf"{re.escape(top)}/{re.escape(name)}(?![\w-])"
+        rf"|\b{re.escape(top)}\.{re.escape(name.replace('-', '_'))}\b"
+        rf"|[\"']{re.escape(top)}[\"']\s*[/,]\s*[\"']{re.escape(name)}[\"']")
+
+
+def suite_text(root: Path, suite: str) -> str:
+    texts = []
+    for p in sorted((root / suite).rglob("*.py")):
+        if not {"node_modules", "__pycache__", ".git"} & set(p.parts):
+            try:
+                texts.append(p.read_text(errors="replace"))
+            except OSError:
+                pass
+    return "\n".join(texts)
+
+
+def select(root: Path, suites: list[str], paths: list[str] | None) -> tuple[list[str], list[str]]:
+    """(selected suites in --list order, reasons)."""
+    if paths is None:
+        return suites, ["base commit unavailable: every suite"]
+    reasons, picked = [], set()
+    for path in paths:
+        if path == WORKFLOW or path.startswith(ALL_PREFIXES):
+            return suites, [f"{path}: shared runner/helper changed: every suite"]
+    owned = sorted((s for s in suites if s not in REPO_WIDE), key=len, reverse=True)
+    for path in paths:
+        owner = next((s for s in owned if path.startswith(s + "/")), None)
+        if owner is None and path.startswith("desktop-plugins/"):
+            cand = "plugins/" + path.split("/")[1]
+            owner = cand if cand in suites else None
+        if owner and owner not in picked:
+            picked.add(owner)
+            reasons.append(f"{path} -> {owner}")
+        elif owner is None:
+            reasons.append(f"{path}: no suite")
+    texts = {}
+    frontier = set(picked)
+    while frontier:
+        new = set()
+        for target in frontier:
+            pat = refs(target)
+            for s in owned:
+                if s in picked or s in new:
+                    continue
+                if s not in texts:
+                    texts[s] = suite_text(root, s)
+                if pat.search(texts[s]):
+                    new.add(s)
+                    reasons.append(f"{s}: references {target}")
+        picked |= new
+        frontier = new
+    return [s for s in suites if s in picked], reasons
+
+
+def summary(path: Path) -> int:
+    data = json.loads(path.read_text())
+    py = data.get("python", "?")
+    rows = data.get("suites", [])
+    head = ["suite", "python", "status", "passed", "failed", "errors", "skipped"]
+    table = [[r["name"], py, r["status"], str(r.get("passed", 0)), str(r.get("failed", 0)),
+              str(r.get("errors", 0)), str(r.get("skipped", 0))] for r in rows]
+    total = ["TOTAL", py, f"{len(rows)} suites"] + [str(sum(r.get(k, 0) for r in rows))
+                                                   for k in ("passed", "failed", "errors", "skipped")]
+    widths = [max(len(x) for x in col) for col in zip(head, *table, total)]
+    fmt = "  ".join("{:<%d}" % w for w in widths)
+    print(fmt.format(*head))
+    for row in table + [total]:
+        print(fmt.format(*row))
+    bad = [r for r in rows if r["status"] not in ("PASS", "SKIP")]
+    for r in rows:
+        if r["status"] == "SKIP":
+            print(f"suite skipped: {r['name']}: {r.get('reason', '')}")
+    for r in bad:
+        print(f"::error title={r['name']} failed on Python {py}::{r['status']}: "
+              f"{r.get('failed', 0)} failed, {r.get('errors', 0)} errors ({r.get('reason') or 'see log'})")
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        md = [f"### Plugin suites on Python {py}", "", "| " + " | ".join(head) + " |",
+              "|" + "---|" * len(head)]
+        md += ["| " + " | ".join(row) + " |" for row in table + [total]]
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write("\n".join(md) + "\n\n")
+    return 1 if bad else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("select")
+    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--base")
+    sp.add_argument("--head", default="HEAD")
+    sp.add_argument("--root", default=str(ROOT), help=argparse.SUPPRESS)
+    sm = sub.add_parser("summary")
+    sm.add_argument("results")
+    a = ap.parse_args(argv)
+    if a.cmd == "summary":
+        return summary(Path(a.results))
+    root = Path(a.root).resolve()
+    suites = list_suites(root)
+    if a.all:
+        chosen, why = suites, ["--all: every suite"]
+    else:
+        chosen, why = select(root, suites, changed_paths(root, a.base, a.head))
+    for line in why:
+        print("select: " + line, file=sys.stderr)
+    print(f"select: {len(chosen)} of {len(suites)} suites", file=sys.stderr)
+    for s in chosen:
+        print(s)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

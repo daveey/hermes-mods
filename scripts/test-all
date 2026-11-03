@@ -16,6 +16,9 @@ and no output. So this runner:
 Usage:
   scripts/test-all                      all suites, 4 at a time
   scripts/test-all -k hub-sync          only suites whose name contains the substring (plus repo-guards)
+  scripts/test-all --exact -k plugins/coach -k tools/tailnet --json out.json
+                                        exactly those suites (CI: .github/workflows/plugin-suites.yml);
+                                        --json writes each suite's status and passed/failed/errors/skipped
   scripts/test-all -j 8 --timeout 900
   scripts/test-all --list
   scripts/test-all --hermes-core PATH   override the core checkout (default $HERMES_CORE_CHECKOUT,
@@ -84,7 +87,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Repo-wide guards (a pattern banned in every plugin): their own suite, added to every -k run, so a
 # plugin-scoped run (what a worker runs before pushing) still trips them.
 GUARD_SUITE = "repo-guards"
-GUARD_TESTS = ("test_sqlite_ro_guard.py", "test_card_id_regex_guard.py")
+GUARD_TESTS = ("test_sqlite_ro_guard.py", "test_card_id_regex_guard.py", "test_plugin_suites_ci.py")
 
 SUITE_OVERRIDES: dict[str, dict] = {
     # Required real-core coverage must be visible even when the suite succeeds.
@@ -96,6 +99,8 @@ SUITE_OVERRIDES: dict[str, dict] = {
                 '{py} -I run_tests.py --repo "{core}" --test-site-packages "{site}" '
                 '&& {py} -m unittest discover -s harness_tests'],
         "cwd": "plugins/fast-rate-limit-fallback",
+        # Every test runs inside a snapshot of core: without one, run_tests.py dies on `--repo ""`.
+        "needs_core": True,
     },
     # unittest suite (its README); pytest mistakes the plugin's package __init__ for a test module.
     "plugins/mcp-file-access": {
@@ -269,6 +274,39 @@ def ensure_test_site(py: str, core: Path | None = None, uv: str | None = '') -> 
 
 
 SUMMARY_RE = re.compile(r"\b\d+ (passed|failed|error|errors|skipped|deselected|xfailed)\b|no tests ran|^Ran \d+ tests?")
+# pytest's final line ("3 failed, 10 passed, 2 skipped in 1.20s", optionally framed by ===) and unittest's
+# "Ran N tests in 0.1s" ... "OK (skipped=2)" / "FAILED (failures=1, errors=2)" pair.
+PYTEST_FINAL_RE = re.compile(r"^=*\s*((?:\d+ [a-z]+(?:, )?)+|no tests ran) in [\d.]+s\b.*$")
+UNITTEST_RAN_RE = re.compile(r"^Ran (\d+) tests? in [\d.]+s$")
+UNITTEST_RESULT_RE = re.compile(r"^(OK|FAILED)(?: \((.*)\))?$")
+
+
+def counts(out: str) -> dict:
+    """passed/failed/errors/skipped from a suite's output (all 0 when no summary was printed).
+
+    The LAST pytest final line counts (a failing test's captured output may hold a nested run's summary
+    earlier on). A unittest block counts too when it comes after that line, so a suite that runs pytest and
+    then unittest (fast-rate-limit-fallback) reports both."""
+    c = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+    lines = [ln.strip() for ln in out.splitlines()]
+    py_at = next((i for i in range(len(lines) - 1, -1, -1) if PYTEST_FINAL_RE.match(lines[i])), None)
+    if py_at is not None:
+        for n, word in re.findall(r"(\d+) ([a-z]+)", PYTEST_FINAL_RE.match(lines[py_at]).group(1)):
+            key = {"passed": "passed", "failed": "failed", "error": "errors", "errors": "errors",
+                   "skipped": "skipped"}.get(word)
+            if key:
+                c[key] += int(n)
+    ran_at = next((i for i in range(len(lines) - 1, -1, -1) if UNITTEST_RAN_RE.match(lines[i])), None)
+    if ran_at is not None and (py_at is None or ran_at > py_at):
+        total = int(UNITTEST_RAN_RE.match(lines[ran_at]).group(1))
+        res = next((UNITTEST_RESULT_RE.match(ln) for ln in lines[ran_at + 1:] if UNITTEST_RESULT_RE.match(ln)), None)
+        detail = dict((k, int(v)) for k, v in re.findall(r"(\w+)=(\d+)", (res.group(2) or "") if res else ""))
+        failed, errors, skipped = detail.get("failures", 0), detail.get("errors", 0), detail.get("skipped", 0)
+        c["failed"] += failed
+        c["errors"] += errors
+        c["skipped"] += skipped
+        c["passed"] += max(0, total - failed - errors - skipped - detail.get("expected_failures", 0))
+    return c
 
 
 def find_core(arg: str | None) -> tuple[Path | None, bool]:
@@ -369,11 +407,14 @@ def discover(root: Path, core: Path | None, explicit_core: bool) -> list[dict]:
                            "targets": [str(f) for f in files]})
     for s in suites:
         s.update(SUITE_OVERRIDES.get(s["name"], {}))
+        if s.get("needs_core") and not core and not s.get("skip"):
+            s["skip"] = "needs a core checkout: pass --hermes-core PATH or set HERMES_CORE_CHECKOUT"
     return suites
 
 
 def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT, site: Path | None = None, uv: str | None = None) -> dict:
-    res = {"name": s["name"], "status": "", "rc": None, "secs": 0.0, "tail": "", "reason": s.get("skip", "")}
+    res = {"name": s["name"], "status": "", "rc": None, "secs": 0.0, "tail": "", "reason": s.get("skip", ""),
+           "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
     if s.get("skip"):
         res["status"] = "SKIP"
         return res
@@ -418,6 +459,7 @@ def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = RO
     res["rc"] = rc
     lines = [ln for ln in out.splitlines() if ln.strip()]
     res["tail"] = "\n".join(lines if s.get("show_output") else lines[-40:])
+    res.update(counts(out))
     if res["status"]:
         return res
     summarized = bool(SUMMARY_RE.search(out))
@@ -442,6 +484,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=int, default=1500, help="per-suite seconds (default 1500)")
     ap.add_argument("--hermes-core", dest="core")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--exact", action="store_true",
+                    help="-k names whole suites (as printed by --list), and repo-guards is not added")
+    ap.add_argument("--json", dest="json_out", help="also write per-suite results (status, counts, tail) here")
     ap.add_argument("--root", default=str(ROOT), help=argparse.SUPPRESS)  # tests point this at a fixture tree
     a = ap.parse_args(argv)
 
@@ -449,7 +494,13 @@ def main(argv: list[str] | None = None) -> int:
     core, explicit_core = find_core(a.core)
     py, fallback = select_python(core)
     suites = discover(root, core, explicit_core=explicit_core)
-    if a.match:
+    if a.match and a.exact:
+        unknown = sorted(set(a.match) - {s["name"] for s in suites})
+        if unknown:
+            print("test-all: no such suite(s): " + ", ".join(unknown), file=sys.stderr)
+            return 2
+        suites = [s for s in suites if s["name"] in a.match]
+    elif a.match:
         picked = [s for s in suites if any(m in s["name"] for m in a.match)]
         guards = next((s for s in suites if s["name"] == GUARD_SUITE), None)
         if picked and guards and guards not in picked:
@@ -505,6 +556,9 @@ def main(argv: list[str] | None = None) -> int:
           + (" -- FAILED: " + ", ".join(r["name"] for r in bad) if bad else " -- OK"))
     if warning:
         print(warning)
+    if a.json_out:
+        Path(a.json_out).write_text(json.dumps({"python": version, "core": str(core) if core else None,
+                                                "suites": results}, indent=2) + "\n")
     return 1 if bad else 0
 
 

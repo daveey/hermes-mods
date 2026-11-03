@@ -1,4 +1,5 @@
 """scripts/test-all: one broken plugin is reported by name, never swallowed, and the exit code says so."""
+import json
 import os
 import runpy
 import subprocess
@@ -157,6 +158,65 @@ class TestAll(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('repo-guards', r.stdout)
         self.assertEqual(run(self.root, '-k', 'no-such-suite', '--list').stdout.split(), [])
+
+    def test_exact_selects_whole_suite_names_without_adding_repo_guards(self):
+        """plugin-suites.yml runs `--exact -k <suite>` per selected suite: `-k plugins/coach` must not also run
+        plugins/coach-extra, and repo-guards (run by repo-guards.yml) is not added."""
+        make_tree(self.root, {"coach": "def test_coach():\n    pass\n", "coach-extra": "def test_x():\n    pass\n"})
+        tests = self.root / "tests"
+        tests.mkdir()
+        (tests / "test_sqlite_ro_guard.py").write_text("def test_guard():\n    pass\n")
+        listed = run(self.root, '--exact', '-k', 'plugins/coach', '--list')
+        self.assertEqual(listed.stdout.split(), ['plugins/coach'], listed.stderr)
+        both = run(self.root, '--exact', '-k', 'plugins/coach', '-k', 'repo-guards', '--list')
+        self.assertEqual(both.stdout.split(), ['repo-guards', 'plugins/coach'], both.stderr)
+        bad = run(self.root, '--exact', '-k', 'coach', '--list')
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn('no such suite(s): coach', bad.stderr)
+
+    def test_json_reports_per_suite_counts_for_pytest_and_unittest(self):
+        make_tree(self.root, {
+            "mixed": textwrap.dedent("""
+                import pytest
+                def test_a(): pass
+                def test_b(): pass
+                def test_c(): assert False
+                @pytest.mark.skip(reason="needs core")
+                def test_d(): pass
+                @pytest.fixture
+                def boom(): raise RuntimeError("x")
+                def test_e(boom): pass
+            """),
+            "green": "def test_ok():\n    pass\n"})
+        out = self.root / "r.json"
+        r = run(self.root, '--exact', '-k', 'plugins/mixed', '-k', 'plugins/green', '--json', str(out))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        data = json.loads(out.read_text())
+        rows = {s['name']: s for s in data['suites']}
+        self.assertEqual(set(rows), {'plugins/mixed', 'plugins/green'})
+        self.assertEqual({k: rows['plugins/mixed'][k] for k in ('status', 'passed', 'failed', 'errors', 'skipped')},
+                         {'status': 'FAIL', 'passed': 2, 'failed': 1, 'errors': 1, 'skipped': 1})
+        self.assertEqual((rows['plugins/green']['status'], rows['plugins/green']['passed']), ('PASS', 1))
+        self.assertRegex(data['python'], r'^3\.\d+')
+        runner = runpy.run_path(str(RUNNER))
+        self.assertEqual(runner['counts']("Ran 7 tests in 0.010s\n\nFAILED (failures=1, errors=2, skipped=3)\n"),
+                         {'passed': 1, 'failed': 1, 'errors': 2, 'skipped': 3})
+        # pytest then unittest in one suite (fast-rate-limit-fallback): both count; a nested summary inside a
+        # failure's captured output (before the final line) does not.
+        self.assertEqual(runner['counts']("99 passed in 1s\n=== 4 passed, 1 skipped in 2.10s ===\n"
+                                          "Ran 3 tests in 0.1s\nOK (skipped=1)\n"),
+                         {'passed': 6, 'failed': 0, 'errors': 0, 'skipped': 2})
+        self.assertEqual(runner['counts']("no summary"), {'passed': 0, 'failed': 0, 'errors': 0, 'skipped': 0})
+
+    def test_suite_needing_core_is_skipped_with_reason_without_one(self):
+        (self.root / "plugins" / "fast-rate-limit-fallback").mkdir(parents=True)
+        (self.root / "plugins" / "fast-rate-limit-fallback" / "test_x.py").write_text("def test_x():\n    pass\n")
+        runner = runpy.run_path(str(RUNNER))
+        frl = next(s for s in runner['discover'](self.root, None, False) if s['name'] == 'plugins/fast-rate-limit-fallback')
+        self.assertIn('needs a core checkout', frl['skip'])
+        with_core = next(s for s in runner['discover'](self.root, self.root, True)
+                         if s['name'] == 'plugins/fast-rate-limit-fallback')
+        self.assertNotIn('skip', with_core)
 
     def test_skill_script_tests_are_one_suite_per_skill_and_a_red_one_fails_the_run(self):
         """skills/**/scripts/test_*.py were never run: a red hermes-coach askgate test sat on main unnoticed."""
