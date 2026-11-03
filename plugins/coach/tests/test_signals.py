@@ -514,6 +514,113 @@ def test_cron_quota_failure_not_held_files_one_defect_per_exception_type(tmp_pat
     assert sg.parse_errors([quoted]) == []
 
 
+# cron-2e00ca561a: MacBook 2026-11-02 15:04 PT. The run failed on the Codex quota wall and core parked the job
+# (cron.quota_hold.plan_hold); both cron detectors still filed it. Lines and the jobs.json row as on the MacBook.
+HELD_JOB = "x-daily-post-and-engage"
+HELD_FAIL_AT = 1793660693.0     # 2026-11-02T15:04:53-08:00, jobs.json last_failure.at
+HELD_UNTIL = "2026-11-04T09:04:00-08:00"
+
+
+def _held_failure_lines(at, job=HELD_JOB, hold=True, gap=0):
+    t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at))
+    t2 = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at + gap))
+    lines = [l.replace("bsky-reply-discovery", job) for l in HUB_QUOTA_PAIR[:HUB_QUOTA_PAIR.index(
+        "RuntimeError: Subscription quota unavailable for openai-codex/gpt-6-astra; resets at 1793774148.0") + 1]]
+    lines[0] = lines[0].replace("2026-11-02 02:07:09", t)
+    if hold:
+        lines.append(f"{t2},308 WARNING cron.scheduler: Job '{job}': provider usage window closed for 113575s — "
+                     f"holding fires until {HELD_UNTIL} instead of failing on every cadence tick")
+    return lines
+
+
+def _held_job(hold=True, at=HELD_FAIL_AT):
+    job = {"id": "b23d5853a448", "name": HELD_JOB, "last_status": "error", "failure_streak": 1,
+           "last_error": "RuntimeError: Subscription quota unavailable for openai-codex/gpt-6-astra; resets at "
+                         "1793774268",
+           "last_failure": {"at": datetime_iso(at), "detail": "RuntimeError: Subscription quota unavailable for "
+                            "openai-codex/gpt-6-astra; resets at 1793774268"},
+           "next_run_at": HELD_UNTIL, "schedule": {"kind": "cron", "expr": "4 9 * * *"}}
+    if hold:
+        job["quota_hold_until"] = HELD_UNTIL
+    return job
+
+
+def datetime_iso(ts):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, timezone.utc).astimezone().isoformat()
+
+
+def _held_cursor(prof="default", key="b23d5853a448"):
+    # the two 11-01 "No eligible deep routes" failures from before the hold fix: a third counted failure files
+    return {"cron": {f"{prof}:{key}": HELD_FAIL_AT - 86000}, "cron_fails": {
+        f"{prof}:{key}": [HELD_FAIL_AT - 80000, HELD_FAIL_AT - 79000]}}
+
+
+def test_errors_log_cron_failure_core_held_is_not_a_defect():
+    """The scheduler's 'Job failed' traceback followed within 5 s by core's 'holding fires until' WARNING for the
+    same job is a handled quota park: nothing files."""
+    assert sg.parse_errors(_held_failure_lines(HELD_FAIL_AT)) == []
+
+
+def test_errors_log_cron_failure_not_held_still_files():
+    sigs = sg.parse_errors(_held_failure_lines(HELD_FAIL_AT, hold=False))
+    assert [s["component"] for s in sigs] == ["cron"]
+    # a hold logged for ANOTHER job, or more than 5 s later, does not excuse this one
+    other = _held_failure_lines(HELD_FAIL_AT)
+    other[-1] = other[-1].replace(f"Job '{HELD_JOB}'", "Job 'bsky-notify'")
+    assert [s["component"] for s in sg.parse_errors(other)] == ["cron"]
+    assert [s["component"] for s in sg.parse_errors(_held_failure_lines(HELD_FAIL_AT, gap=30))] == ["cron"]
+    # a quoted hold line from another logger does not count either
+    quoted = _held_failure_lines(HELD_FAIL_AT)
+    quoted[-1] = quoted[-1].replace("WARNING cron.scheduler:", "WARNING tools.terminal: output:")
+    assert [s["component"] for s in sg.parse_errors(quoted)] == ["cron"]
+
+
+def test_errors_log_unrelated_failure_next_to_a_held_one_still_files():
+    t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(HELD_FAIL_AT + 1))
+    lines = _held_failure_lines(HELD_FAIL_AT) + [
+        f"{t},400 ERROR cron.scheduler: Job 'nightly export' failed: ValueError: bad row",
+        "Traceback (most recent call last):",
+        '  File "/home/you/.hermes/hermes-agent/cron/scheduler.py", line 2811, in run_job',
+        "    rows = export()",
+        "ValueError: bad row"]
+    sigs = sg.parse_errors(lines)
+    assert len(sigs) == 1 and "nightly export" in sigs[0]["symptom"], sigs
+
+
+def test_jobs_json_failure_core_held_is_not_counted(home):
+    """jobs.json row with quota_hold_until later than last_failure.at: core parked it, the cursor advances and the
+    failure is neither filed nor counted toward '3 failures in 24h'."""
+    _write_jobs(home, _held_job())
+    cur = _held_cursor()
+    assert sg.collect_cron(home, cur, HELD_FAIL_AT + 300, "macbook") == []
+    assert cur["cron"]["default:b23d5853a448"] == pytest.approx(HELD_FAIL_AT)
+    assert len(cur["cron_fails"]["default:b23d5853a448"]) == 2
+
+
+def test_jobs_json_failure_without_hold_still_counts(home):
+    _write_jobs(home, _held_job(hold=False))
+    got = sg.collect_cron(home, _held_cursor(), HELD_FAIL_AT + 300, "macbook")
+    assert len(got) == 1 and "3 failures in 24h" in got[0]["details"]
+    # a stale hold (earlier than the failure: the recovery fire failed on something else) does not excuse it
+    job = _held_job()
+    job["quota_hold_until"] = "2026-11-02T09:04:00-08:00"
+    _write_jobs(home, job)
+    assert len(sg.collect_cron(home, _held_cursor(), HELD_FAIL_AT + 300, "macbook")) == 1
+
+
+def test_held_quota_failure_files_nothing_across_all_collectors(tmp_path):
+    """Detection guard (cron-2e00ca561a): one core-held quota failure, seen by every collector in one sweep (jobs.json
+    AND errors.log), files zero signals. Each detector alone was tested; the double filing was not."""
+    h = tmp_path / "home"
+    (h / "logs").mkdir(parents=True)
+    (h / "cron").mkdir()
+    (h / "logs" / "errors.log").write_text("\n".join(_held_failure_lines(HELD_FAIL_AT)) + "\n")
+    _write_jobs(h, _held_job())
+    sigs = sg.collect(h, _held_cursor(), "macbook", HELD_FAIL_AT + 300)
+    assert sigs == [], sigs
+
+
 def _reconnect_log(home, n, start):
     lines = []
     for i in range(n):

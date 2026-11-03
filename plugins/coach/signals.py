@@ -187,6 +187,12 @@ ADMISSION_BUSY_RE = re.compile(r"^((?:Review u|U)pdate admission) unavailable: u
 # Core's cron quota hold could not map a quota-class failure to a wait (cron.quota_hold.classify_failure_hold,
 # cron-0f5ca72d35): the job will re-fire into a closed provider window. One WARNING per failed run, no traceback.
 QUOTA_NOT_HELD_RE = re.compile(r"^Job '(.+?)': quota failure not held \(no usable reset deadline in ([\w.]+): ")
+# ... and the held case (cron.quota_hold.plan_hold): core parked the job behind a closed provider window right after
+# the scheduler logged its "Job '<name>' failed:" traceback. That pair is a handled, expected park, not a defect
+# (cron-2e00ca561a: one held failure filed twice, from errors.log and jobs.json).
+CRON_JOB_FAILED_RE = re.compile(r"^Job '(.+?)' failed: ")
+QUOTA_HELD_RE = re.compile(r"^Job '(.+?)': provider usage window closed for [\d.]+s — holding fires until \S+")
+QUOTA_HELD_PAIR_S = 5
 RECONNECT_STORM = 20               # more than this many library reconnects in RECONNECT_WINDOW_S files one defect
 RECONNECT_WINDOW_S = 3600
 
@@ -358,6 +364,25 @@ def _session_cron_rewrap(block: List[str], frames: list, exc_type: str) -> bool:
     return src.startswith(SESSION_CRON_REWRAP_SRC)
 
 
+def _cron_held_failures(recs: List[dict]) -> set:
+    """Indexes of cron.scheduler "Job '<name>' failed:" records that core's quota hold parked: a cron.scheduler
+    "Job '<name>': provider usage window closed … holding fires until" WARNING for the same job follows within
+    QUOTA_HELD_PAIR_S seconds. A failure of another job, or a hold logged later, still files."""
+    held = set()
+    for i, r in enumerate(recs):
+        m = CRON_JOB_FAILED_RE.match(r["msg"]) if r["logger"] == "cron.scheduler" else None
+        if not m:
+            continue
+        for nxt in recs[i + 1:]:
+            if nxt["at"] - r["at"] > QUOTA_HELD_PAIR_S:
+                break
+            hm = QUOTA_HELD_RE.match(nxt["msg"]) if nxt["logger"] == "cron.scheduler" else None
+            if hm and hm.group(1) == m.group(1):
+                held.add(i)
+                break
+    return held
+
+
 def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Optional[list] = None,
                  host: str = "", prof: str = "default") -> List[dict]:
     """Records (header + continuation lines) -> traceback, hook-exception and credential-guard signals. Library
@@ -373,9 +398,10 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             recs.append(cur)
         elif cur is not None:
             cur["cont"].append(ln)
+    held = _cron_held_failures(recs)
     out = []
-    for r in recs:
-        if SKIP_LOGGERS.match(r["logger"]):
+    for i, r in enumerate(recs):
+        if SKIP_LOGGERS.match(r["logger"]) or i in held:
             continue
         hm = HOOK_RE.match(r["msg"])
         if hm:
@@ -822,6 +848,8 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                 seen[k] = max(prev, at)
                 continue
             seen[k] = at
+            if _iso_ts(job.get("quota_hold_until")) > at:
+                continue  # core parked this failure behind a closed provider window (cron.quota_hold): not counted
             name = job.get("name") or job.get("id")
             detail = str(lf.get("detail") or job.get("last_error") or "run failed")
             streak = int(job.get("failure_streak") or 0)
