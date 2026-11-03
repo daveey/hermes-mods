@@ -29,7 +29,7 @@ Files live in `~/.hermes/state/<job>.md` (`JOB_STATE_DIR` overrides; a path endi
 | Read first | `python3 $S show <job>` (creates the file if missing) |
 | Update last | `python3 $S record <job> --last-run "<one line: result>" --tried "<what you tried + outcome>" [--lesson "[slug] rule"] [--watch "<thing to recheck next run>"] [--unwatch "<substr>"]` |
 | Promote | `record` prints `PROMOTE [slug] xN` once a lesson slug recurs 3 times: add it to the job's skill as a yes/no `## Done means` line, then `record <job> --promoted <slug>` |
-| Card family | generator puts `python3 $S show <family> --slice` in each card body; the worker passes `metadata.job_state = {"tried": "...", "lessons": ["[slug] ..."], "watch": [...], "unwatch": [...]}` to `kanban_complete`/`kanban_block`; the generator runs `python3 $S harvest <family> --db ~/.hermes/kanban.db --key-prefix <prefix>` each tick (idempotent cursor; workers on other machines never need the file) |
+| Card family | one no-agent cron per board host runs `harvest <family> --db <kanban.db> --key-prefix <prefix>` every few minutes and comments `show <family> --slice` once on each new todo/ready/running card of the family (never on parked cards: a comment can satisfy a wait-comment probe). The worker returns `metadata.job_state = {"tried": "...", "lessons": ["[slug] ..."], "watch": [...], "unwatch": [...]}` on `kanban_complete`/`kanban_request_review`/`kanban_block`; workers on other machines never need the file. Lessons at 3x get one promotion card (idempotency key per slug) |
 | Prune only | `python3 $S prune <job>` (exit 3 = still over cap: shorten Lessons/Watch list) |
 
 Lesson slugs are short kebab-case names for the rule (`[gh-rate-limit]`), reused verbatim when the same lesson
@@ -47,3 +47,4 @@ for one real run and diff the state file before/after.
 - [ ] The state file exists on the host that runs the job and has a Last run line from a real run after the change?
 - [ ] Every new lesson has a `[slug]`, and each PROMOTE line was moved into the job's skill and marked `--promoted`?
 - [ ] `python3 $S prune <job>` exits 0 (file within 150 lines)?
+- [ ] Card family: a fresh card of the family shows the `job-state:` comment, and a finished run appears in Tried?
