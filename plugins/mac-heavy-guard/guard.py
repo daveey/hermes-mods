@@ -61,7 +61,18 @@ def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
     if toks is None:
         return
     cur: list[str] = []
+    in_array = False
     for t in toks + [";"]:
+        # `name=(a b c)` / `local name=(...)` is a bash array literal: its words are data, not a command
+        # (hermes-core-wt's `here=(./scripts/run_tests.sh)` read as a whole-suite run and blocked the tool
+        # this guard itself recommends).
+        if in_array:
+            if ")" in t:
+                in_array = False
+            continue
+        if t == "(" and cur and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\+?=", cur[-1]):
+            in_array = True
+            continue
         if t in SEPARATORS or (t and set(t) <= set(";&|()\n")):
             if cur:
                 yield from _unwrap(cur)

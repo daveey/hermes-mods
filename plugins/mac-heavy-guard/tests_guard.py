@@ -187,6 +187,20 @@ def test_script_echo_naming_run_tests_is_not_the_runner(tmp_path):
     assert blocked("terminal", command=str(g))
 
 
+def test_script_array_literal_naming_run_tests_is_data(tmp_path):
+    # Regression (11-02): hermes-core-wt's `local here=(./scripts/run_tests.sh)` array literal read as a
+    # whole-suite run, so `hermes-core-wt new/test <paths>` (the command this guard recommends) was blocked.
+    f = _script(tmp_path, 'local here=(./scripts/run_tests.sh)\n'
+                          'here=(env X="${X:-4}" nice -n 10 ./scripts/run_tests.sh)\n'
+                          'files+=(./scripts/run_tests.sh)\n'
+                          '"${here[@]}" "$@"\n', name="wt.sh")
+    assert not blocked("terminal", command=str(f))
+    # A real run after the array, or a command substitution, is still caught.
+    g = _script(tmp_path, "here=(a b)\n./scripts/run_tests.sh -j 4\n", name="after.sh")
+    assert blocked("terminal", command=str(g))
+    assert blocked("terminal", command="x=$(./scripts/run_tests.sh -j 4)")
+
+
 @pytest.mark.parametrize("cmd", HEAVY)
 def test_blocks_heavy_terminal(cmd):
     assert blocked("terminal", command=cmd), cmd
