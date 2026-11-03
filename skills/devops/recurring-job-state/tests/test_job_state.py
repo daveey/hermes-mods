@@ -175,7 +175,8 @@ class Harvest(Base):
             (2, "t_2", "completed", "fixed b", json.dumps(meta), 1793600100),
             (3, "t_3", "completed", "other family", None, 1793600200),
             (4, "t_4", "completed", "underscore is literal", None, 1793600250),
-            (5, "t_1", None, "still running", None, None)])
+            (5, "t_1", None, "still running", None, None),
+            (6, "t_1", "continued", "checkpoint only", None, 1793600300)])
         con.commit()
         con.close()
         return db
@@ -184,7 +185,7 @@ class Harvest(Base):
         db = self.make_db()
         rc, out, _ = run("harvest", "demo", "--db", db, "--key-prefix", "deflake:")
         self.assertEqual(rc, 0)
-        self.assertIn("2 run(s), 1 with metadata.job_state", out)
+        self.assertIn("2 of 3 new run(s), 1 with metadata.job_state", out)
         st = js.load(self.path)
         self.assertEqual(len(st.sections["Tried"]), 2)
         self.assertIn("t_1 completed: fixed a", st.sections["Tried"][0])
@@ -194,6 +195,7 @@ class Harvest(Base):
         self.assertEqual(st.sections["Watch list"], ["- tests/b.py::y"])
         self.assertNotIn("other family", self.text())
         self.assertNotIn("underscore", self.text())
+        self.assertNotIn("checkpoint only", self.text())
         rc, out, _ = run("harvest", "demo", "--db", db, "--key-prefix", "deflake:")
         self.assertIn("nothing new", out)
         self.assertEqual(len(js.load(self.path).sections["Tried"]), 2)

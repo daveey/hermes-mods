@@ -34,6 +34,8 @@ from contextlib import contextmanager
 SECTIONS = ("Last run", "Tried", "Lessons", "Watch list")
 MAX_LINES = 150
 PROMOTE_AT = 3
+# Run outcomes that end a worker's attempt with something worth remembering (continued/reclaimed/crashed... are not).
+HARVEST_OUTCOMES = {"completed", "blocked", "review_requested", "changes_requested", "gave_up", "failed"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^\s*\[([a-z0-9][a-z0-9-]{0,48})\]\s*(.+)$", re.S)
 LESSON_RE = re.compile(r"^- \[([a-z0-9][a-z0-9-]*)\] \(x(\d+), last ([0-9-]+)(, promoted)?\) (.*)$", re.S)
@@ -340,7 +342,7 @@ def cmd_harvest(a) -> int:
         return 0
     with locked(path):
         st = load(path)
-        n_meta = 0
+        n_meta = n_used = 0
         for run_id, task_id, key, outcome, summary, meta, ended in rows:
             stamp = _dt.datetime.fromtimestamp(float(ended), _dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
             try:
@@ -348,6 +350,9 @@ def cmd_harvest(a) -> int:
             except ValueError:
                 md = {}
             js = md.get("job_state") if isinstance(md, dict) else None
+            if outcome not in HARVEST_OUTCOMES and not isinstance(js, dict):
+                continue
+            n_used += 1
             st.set_last_run(f"{task_id} ({key}) {outcome or '?'}", stamp)
             if isinstance(js, dict):
                 n_meta += 1
@@ -358,10 +363,11 @@ def cmd_harvest(a) -> int:
                 text = one_line(summary or "")[:220] or "(no summary)"
                 st.add_tried(f"{task_id} {outcome or '?'}: {text}", stamp)
         dropped = st.prune(a.max_lines)
-        save(path, st)
+        if n_used:
+            save(path, st)
         with open(cursor_path, "w") as f:
             json.dump({"last_run_id": rows[-1][0]}, f)
-    print(f"job_state: harvest {job_name(path)}: {len(rows)} run(s), {n_meta} with metadata.job_state"
+    print(f"job_state: harvest {job_name(path)}: {n_used} of {len(rows)} new run(s), {n_meta} with metadata.job_state"
           + (f", pruned {dropped}" if dropped else ""))
     print_promotions(st, path)
     return 0
