@@ -985,6 +985,43 @@ def _unknown(states) -> _State:
     return _State(None, values, exported, funcs)
 
 
+def _widen(states) -> Optional[_State]:
+    """One state that covers ``states``: values and directories they disagree on are unknown.
+
+    None when they disagree on exported names or functions (not joinable as values) or hold
+    a reference marker (an assignment may write any variable): the caller loses everything.
+    A name some states lack and others set becomes unknown (an absent IFS means the default).
+    """
+    first = states[0]
+    if any(st.exported != first.exported or st.key()[4] != first.key()[4] for st in states):
+        return None
+    if first.exported & {_NAMEREF, _ANYREF}:
+        return None
+    wide = first.copy()
+    wide.cwd = first.cwd if all(s.cwd == first.cwd for s in states) else None
+    wide.lcwd = first.lcwd if all(s.lcwd == first.lcwd for s in states) else None
+    if wide.lcwd is None:
+        wide.cwd = None
+    for name in set().union(*(s.vars for s in states)):
+        value = first.vars.get(name)
+        wide.vars[name] = value if all(
+            name in s.vars and s.vars[name] == value for s in states) else None
+    return wide
+
+
+def _within(st: _State, wide: _State) -> bool:
+    """Whether ``wide`` covers ``st``: every fact ``wide`` keeps holds in ``st`` too."""
+    if st.exported != wide.exported or st.key()[4] != wide.key()[4]:
+        return False
+    if (wide.cwd is not None and st.cwd != wide.cwd) or (
+            wide.lcwd is not None and st.lcwd != wide.lcwd):
+        return False
+    if set(st.vars) - set(wide.vars):
+        return False  # a name `wide` holds absent (e.g. default IFS) was set
+    return all(value is None or (name in st.vars and st.vars[name] == value)
+               for name, value in wide.vars.items())
+
+
 def _union(*groups) -> list:
     seen = {}
     for group in groups:
@@ -1433,7 +1470,17 @@ class _Analyzer:
             # Losing vars/cwd alone cannot represent those not-yet-seen bodies.
             if any(st.funcs != initial.funcs for st in out for initial in states):
                 self.fail_closed("")
-            out = _union(out, [_unknown(out)])  # did not converge in two iterations
+            # Did not converge in two iterations. Widen only what differs between the
+            # states (`A="$A x"` grows forever; HOME and cwd do not) and accept the widened
+            # state only if one more iteration from it stays within it (a post-fixpoint).
+            # Otherwise every value is lost, as before.
+            wide = _widen(out)
+            if wide is not None:
+                exit3, after3 = once([wide])
+                if all(_within(st, wide) for st in _union(exit3, after3)):
+                    out = _union(out, [wide])
+                    return out, out
+            out = _union(out, [_unknown(out)])
         return out, out
 
     @staticmethod

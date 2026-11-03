@@ -100,6 +100,10 @@ This plugin:
   expands to exactly one known word (literals, quotes, known scalars); a glob, brace
   expansion, substitution, splittable expansion, missing `in` list or `select` leaves it
   unknown. A value with a space still splits where the variable is used unquoted;
+- widens a loop that does not converge in two iterations (`A="$A x"` grows forever) by
+  making unknown only the cwd and values its states disagree on, then keeps HOME, cwd and
+  the other values only if a third iteration from that widened state stays inside it.
+  Otherwise (or when exports, functions or namerefs differ) every value is lost;
 - caps finite alternatives by export/function-identity partitions, retaining agreeing cwd
   and variable values (including HOME); disagreeing logical cwd clears both cwd fields so
   state copies cannot invent certainty. Namerefs and excessive partitions fall back to

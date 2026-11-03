@@ -2184,3 +2184,55 @@ def test_quoted_array_expansion_in_git_option_fails_closed(multi, cmd):
     assert before
     subprocess.run([bash, "-c", cmd], cwd=main, env=GIT_ENV, capture_output=True, timeout=30)
     assert stashes() != before and (wt / "f.txt").read_text() == "stashed\n"
+
+
+# --- A loop that does not converge in two iterations widens only what changed ---
+
+# Refused as `git stash pop` (no git in it at all): `ARNS="$ARNS ..."` grows on every
+# iteration, so the loop did not converge and the whole state collapsed to unknown. HOME was
+# lost with it, `~/.local/bin/token-broker` became an unknown command name that might be git,
+# and an unknown command run as git may be an alias for `stash pop`. Reported shape.
+LOOP_ACCUMULATOR_REPORTED = r'''cat > $TMPDIR/decom_stop.py <<'EOF'
+import boto3
+ec2 = boto3.client("ec2", region_name="us-east-1")
+resp = ec2.stop_instances(InstanceIds=["i-0abc", "i-0def"])
+for s in resp["StoppingInstances"]:
+    print(s["InstanceId"], s["CurrentState"]["Name"])
+EOF
+ARNS=""
+for i in i-0abc i-0def; do ARNS="$ARNS --resource arn:aws:ec2:us-east-1:111111111111:instance/$i"; done
+~/.local/bin/token-broker exec --help 2>&1 | grep -i -E "resource" | head -3'''
+LOOP_ACCUMULATOR_ALLOWED = [
+    LOOP_ACCUMULATOR_REPORTED,
+    'A=""; for i in a b c; do A="$A x$i"; done; ~/bin/tool run --help',
+    'A=""; for i in a b; do A="$A/$i"; done; git -C ~/x status',
+    'n=0; while [ $n -lt 3 ]; do n=$((n+1)); done; ~/bin/tool --help',
+    'A=; for i in a b; do A="$A$i"; done; cd {main} && git stash pop',
+]
+
+
+@pytest.mark.parametrize("cmd", LOOP_ACCUMULATOR_ALLOWED)
+def test_non_converging_loop_keeps_unchanged_state(multi, cmd):
+    main, _wt = multi
+    cmd = cmd.format(main=main)
+    assert guard.refuse_reason(cmd, "/Users/you") is None, cmd
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not _blocked(cmd, main), cmd
+
+
+@pytest.mark.parametrize("template", [
+    # Values that change across iterations stay unknown after the loop.
+    'D={main}; for i in a b; do D="$D/.."; done; git -C "$D" stash pop',
+    'D={main}; for i in a b; do D="$D/x"; cd {wt}; done; git stash pop',
+    'for i in a b c; do cd ..; done; git stash pop',
+    'A=; for i in a b; do A="$A s"; done; for d in {main}; do cd {wt}; done; git stash pop',
+    # A value that changes only from the third iteration on is still widened.
+    'A=; B=; C={main}; for i in a b c d; do C="$B"; B="$A"; A="$A x"; done; git -C "$C" stash pop',
+    'A=; H={main}; for i in a b c d; do cd "$H"; H="$G"; G="$A"; A="$A {wt}"; done; git stash pop',
+    # A changing value used as a command name inside the loop may be git.
+    'A=; for i in a b; do A="$A stash"; $A pop; done',
+])
+def test_non_converging_loop_restores_still_refuse(multi, template):
+    main, wt = multi
+    cmd = template.format(main=main, wt=wt)
+    assert _blocked(cmd, main), cmd
