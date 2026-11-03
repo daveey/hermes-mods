@@ -203,3 +203,12 @@ def test_shipped_rows_for_this_repos_skill_resolve():
             assert st.extract_section(text, sec), (r["id"], sec)
     inj = st.build_injection(rows[0], dirs=[REPO / "skills"])
     assert inj and st.MARK in inj
+
+
+def test_kanban_cli_create_row():
+    out = run("terminal", {"command": "hermes kanban create 'x' --max-retries 2"})
+    assert out and "notify-subscribe on an unlinked card" in out
+
+
+def test_kanban_cli_other_verbs_no_match():
+    assert run("terminal", {"command": "hermes kanban list"}) is None
