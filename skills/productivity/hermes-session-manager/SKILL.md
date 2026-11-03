@@ -98,6 +98,11 @@ say what's running, never what needs the user.
   regions, counts) live from the target. A worker treats an approved number as exact, so a stale figure copied
   from an older card body blocks it again on the mismatch. If ask-gate refuses it as `agent_can_do`, republish
   only when the scope opens by naming what is new (new exposure, risk or spend), not the steps.
+  Before filing, check whether an existing approval already covers the step (its `outcomes`/`exclusions`: a
+  reversible stop the approved plan implied is covered; only an explicit exclusion like termination or deletion
+  needs a new ask) and whether the credential scope is auto-tier. If so, do it and skip the ask.
+  `choices[].recommended` accepts only `true`: put it on the choice that is the safe default (decline/keep for
+  irreversible deletes), and omit the field on the others.
 - When a worker blocks on a conflict between the approval's literal limits and live facts, settle it yourself:
   pick the reading that satisfies both the intent and the letter, and leave anything outside the approved scope
   untouched as a named follow-up. Then `kanban_comment` the ruling and unblock, rather than asking the user again.
