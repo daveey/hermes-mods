@@ -375,3 +375,65 @@ def test_cache_dir_contents_are_not_walked(monkeypatch, core):
     (core.home / 'attachments' / '.env').write_text(PLACEHOLDER)
     write_config(core.home, '')
     gate(monkeypatch)()
+
+
+# ---- second review (cut off by a gateway restart; its candidate findings checked here) ----
+
+def test_cache_dir_symlinked_outside_home_refuses(monkeypatch, core, tmp_path):
+    outside = tmp_path / 'code'
+    outside.mkdir()
+    (core.home / 'attachments').symlink_to(outside)
+    write_config(core.home, '')
+    with pytest.raises(PermissionError, match='resolves outside the Hermes home'):
+        gate(monkeypatch)()
+
+
+@pytest.mark.parametrize('where', ['.archive/svc', '.hub/quarantine/svc', 'tool/node_modules/svc'])
+def test_skill_in_pruned_dir_still_audited(monkeypatch, core, where):
+    """skill_view reaches these by direct path though the index walk prunes them."""
+    skill(core.home / 'skills', where, 'required_environment_variables:\n  - name: PLACEHOLDER_TOKEN\n')
+    write_config(core.home, '')
+    with pytest.raises(PermissionError, match='forbids skill'):
+        gate(monkeypatch)()
+
+
+def test_flat_markdown_skill_audited(monkeypatch, core):
+    (core.home / 'skills' / 'misc').mkdir(parents=True)
+    (core.home / 'skills' / 'misc' / 'svc.md').write_text(
+        '---\nname: svc\nrequired_credential_files:\n  - svc-token.json\n---\nbody\n')
+    write_config(core.home, '')
+    with pytest.raises(PermissionError, match='forbids skill'):
+        gate(monkeypatch)()
+
+
+def test_skills_symlink_cycle_terminates(monkeypatch, core):
+    d = skill(core.home / 'skills', 'tool')
+    (d / 'loop').symlink_to(core.home / 'skills')
+    write_config(core.home, '')
+    gate(monkeypatch)()
+
+
+@pytest.mark.parametrize('url,refused', [('ssh://git@example.com/r.git', False), ('git@example.com:r.git', False),
+                                         ('https://PLACEHOLDER@example.com/r', True),
+                                         ('ssh://user:PLACEHOLDER@example.com/r', True)])
+def test_git_remote_userinfo(monkeypatch, core, tmp_path, url, refused):
+    repo = tmp_path / 'skills-repo'
+    skill(repo, 'tool')
+    (repo / '.git').mkdir()
+    (repo / '.git' / 'config').write_text(f'[remote "origin"]\n  url = {url}\n')
+    external_dirs(core.home, str(repo))
+    if refused:
+        with pytest.raises(PermissionError, match='credential store'):
+            gate(monkeypatch)()
+    else:
+        gate(monkeypatch)()
+
+
+@pytest.mark.parametrize('name', ['.ENV', '.Env.Local', '.npmrc', '.pypirc'])
+def test_more_credential_basenames_refuse(monkeypatch, core, tmp_path, name):
+    skills = tmp_path / 'shared-skills'
+    d = skill(skills, 'tool')
+    (d / name).write_text('PLACEHOLDER\n')
+    external_dirs(core.home, str(skills))
+    with pytest.raises(PermissionError, match='credential store'):
+        gate(monkeypatch)()

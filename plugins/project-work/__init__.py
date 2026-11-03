@@ -123,9 +123,11 @@ def _core_credential_files():
 # adds later refuses until it is audited here.
 _MAX_WALK_FILES = 100_000
 # Ordinary (non-Hermes) credential files that core's read deny-list does not cover.
-_CREDENTIAL_BASENAMES = frozenset(('.netrc', '_netrc', '.git-credentials', '.pgpass', 'id_rsa', 'id_dsa',
-                                   'id_ecdsa', 'id_ed25519'))
-_URL_USERINFO = re.compile(r'[a-z][a-z0-9+.-]*://[^/\s@]+@', re.IGNORECASE)
+_CREDENTIAL_BASENAMES = frozenset(('.netrc', '_netrc', '.git-credentials', '.pgpass', '.npmrc', '.pypirc', '.boto',
+                                   '.s3cfg', '.htpasswd', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519'))
+# A token in a git remote: any userinfo on http(s) (https://TOKEN@host), a password on any scheme.
+# ssh://git@host carries no secret.
+_URL_SECRET = re.compile(r'https?://[^/\s@]+@|[a-z][a-z0-9+.-]*://[^/\s@:]+:[^/\s@]+@', re.IGNORECASE)
 
 
 def _check_no_credential_dirs():
@@ -143,9 +145,15 @@ def _check_no_credential_dirs():
         skill_roots, cache_roots = _core_dir_mount_roots()
         for root in skill_roots:
             _check_dir_mount(Path(root), homes, stores, walk=True)
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        own = [Path(get_hermes_home()).resolve(), Path(get_default_hermes_root()).resolve()]
         for root in cache_roots:
             # Fixed HERMES_HOME subdirs holding what users hand the agent (uploads, pastes): their
-            # contents are the agent's input, so only where the root really points is audited.
+            # contents are the agent's input, so they are not walked. A cache dir that resolves
+            # outside the Hermes home (a symlink to ~/code, say) is no cache dir and refuses.
+            if not any(Path(root).resolve().is_relative_to(h) for h in own):
+                raise PermissionError(f'Project work forbids sandbox cache mount {root}: it resolves outside '
+                                      'the Hermes home')
             _check_dir_mount(Path(root), homes, stores, walk=False)
         create_dir = importlib.import_module('agent.skill_utils').get_skill_create_dir()
         # skill_view also searches skills.create_dir, which core does not mount.
@@ -261,23 +269,32 @@ def _credential_reason(path, rules, *, is_dir=False):
             return True
     if is_dir:
         return False
-    if path.name in env_names or path.name in _CREDENTIAL_BASENAMES:
+    name = path.name.lower()  # core's deny-list matches basenames case-insensitively
+    if name in env_names or name in _CREDENTIAL_BASENAMES:
         return True
     if path.name == 'config' and path.parent.name == '.git':  # token embedded in a remote URL
         try:
-            return bool(_URL_USERINFO.search(path.read_text(errors='replace')))
+            return bool(_URL_SECRET.search(path.read_text(errors='replace')))
         except OSError as exc:
             raise PermissionError(f'Project work cannot verify {path}') from exc
     return False
 
 
 def _check_skill_frontmatter(skill_roots):
-    """Refuse any skill whose frontmatter would register an env passthrough or a credential file."""
-    from agent.skill_utils import iter_skill_index_files, parse_frontmatter
+    """Refuse any skill whose frontmatter would register an env passthrough or a credential file.
+
+    skill_view loads more than the index walk lists: a direct path (`.archive/x`, a `.hub` copy,
+    node_modules) and any flat `<name>.md` under a root. So every .md file under every root is read,
+    nothing pruned, symlinked dirs followed once.
+    """
+    from agent.skill_utils import parse_frontmatter
     from tools.skills_tool_setup import _get_required_environment_variables
     for root in skill_roots:
-        for skill_md in iter_skill_index_files(Path(root), 'SKILL.md'):
-            frontmatter, _ = parse_frontmatter(skill_md.read_text(encoding='utf-8', errors='replace'))
+        for skill_md in _iter_markdown(Path(root)):
+            text = skill_md.read_text(encoding='utf-8', errors='replace')
+            if not text.lstrip('\ufeff').startswith('---'):
+                continue
+            frontmatter, _ = parse_frontmatter(text)
             env = [e['name'] for e in _get_required_environment_variables(frontmatter or {})]
             files = (frontmatter or {}).get('required_credential_files')
             if env or files:
@@ -327,3 +344,16 @@ def register(ctx):
     ctx.register_platform_handler('slack', wire)
     register_tools(ctx, ingress)
     queue.start()
+
+
+def _iter_markdown(root):
+    seen = set()
+    for dirpath, dirs, files in os.walk(root, followlinks=True, onerror=_walk_error):
+        real = os.path.realpath(dirpath)
+        if real in seen:  # a symlink cycle or a second link to the same tree
+            dirs[:] = []
+            continue
+        seen.add(real)
+        for name in files:
+            if name.lower().endswith('.md'):
+                yield Path(dirpath) / name
