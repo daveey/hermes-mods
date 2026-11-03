@@ -127,8 +127,10 @@ class Store:
         """Schema-v1 collectors minted a new investigation context each tick once
         more than 1000 incidents existed (a capped list() lookup). Keep the newest
         open context per entity, plus any a repair names or that carries
-        transitions; resolve the other empty duplicates at `stamp` so the existing
-        resolved-incident retention (30 days) removes them. Nothing is deleted here."""
+        transitions; mark the other empty duplicates resolved (resolved_at=`stamp`).
+        updated_at is kept: this is no put, so the existing resolved-incident
+        retention (30 days from the last put) removes them, and the open context
+        stays first in newest-first history. Nothing is deleted here."""
         referenced = set()
         if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='repair_domain_records'").fetchone():
             referenced = {r[0] for r in self.connection.execute(
@@ -143,11 +145,11 @@ class Store:
                     FROM runner_records WHERE kind='Incident' AND active=1
                     AND json_extract(payload,'$.dimension')='investigation') WHERE rank=1''')
             self.connection.execute('''UPDATE runner_records
-                SET payload=json_set(payload,'$.resolved_at',?), active=0, updated_at=?
+                SET payload=json_set(payload,'$.resolved_at',?), active=0
                 WHERE kind='Incident' AND active=1
                 AND json_extract(payload,'$.dimension')='investigation'
                 AND json_array_length(payload,'$.transitions')=0
-                AND record_key NOT IN (SELECT record_key FROM runner_keep)''', (resolved_at, stamp))
+                AND record_key NOT IN (SELECT record_key FROM runner_keep)''', (resolved_at,))
         finally:
             self.connection.execute('DROP TABLE temp.runner_keep')
 

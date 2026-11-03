@@ -142,19 +142,26 @@ def test_v1_migration_adds_index_and_resolves_only_duplicate_empty_investigation
             "SELECT record_key,payload,updated_at,active FROM runner_records WHERE kind='Incident'")}
         open_ids = {k for k, (_, _, active) in state.items() if active}
         assert open_ids == {kept_newest['id'], referenced['id'], with_evidence['id'], other_dimension['id'], single['id']}
+        original = dict(zip((d['id'] for d in dup), (100, 200, 300, 900, 400)))
         for doc in dup:
             payload, updated, active = state[doc['id']]
             if doc['id'] in open_ids:
                 assert payload == doc and active == 1
             else:
                 assert payload == dict(doc, resolved_at='1970-01-11T00:00:00Z')
-                assert (updated, active) == (migrated_at, 0)
+                # Not a put: the last-put timestamp (retention clock, history order) is kept.
+                assert (updated, active) == (original[doc['id']], 0)
         assert state[resolved_before['id']] == (resolved_before, 80, 0)
         assert store.get('Observation', observation['id']) == observation
+        # Newest-first detail history still leads with the open context.
+        from plugins.runners.service import INCIDENT_HISTORY_SQL
+        first = json.loads(store.connection.execute(INCIDENT_HISTORY_SQL, (a, 1)).fetchone()[0])
+        assert first == kept_newest
         # Resolved duplicates fall under the existing 30-day resolved-incident policy, no sooner.
-        store.prune(now=migrated_at + 30 * DAY)
-        assert len(state) == len([r for r in store.connection.execute("SELECT 1 FROM runner_records WHERE kind='Incident'")]) + 1
-        store.prune(now=migrated_at + 30 * DAY + 1)
+        store.prune(now=400 + 30 * DAY)
+        left = {r[0] for r in store.connection.execute("SELECT record_key FROM runner_records WHERE kind='Incident'")}
+        assert left == open_ids | {dup[4]['id']}
+        store.prune(now=400 + 30 * DAY + 1)
         left = {r[0] for r in store.connection.execute("SELECT record_key FROM runner_records WHERE kind='Incident'")}
         assert left == open_ids
     with sqlite3.connect(store.backup_path) as backup:

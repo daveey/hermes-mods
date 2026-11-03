@@ -327,7 +327,8 @@ are refused forever (no lease expiry or takeover). Rate limits per source and gl
   adds the `runner_entity` index (kind, `json_extract(payload,'$.entity_id')`,
   updated_at) behind runner detail and repair context reads, and resolves duplicate
   empty investigation incidents left by v1 collectors (newest per entity, any a repair
-  names, and any with transitions stay open). The one-time v1->v2 migration took
+  names, and any with transitions stay open; resolved ones keep their last-put
+  updated_at, so retention and newest-first order are unchanged). The one-time v1->v2 migration took
   ~6.5 min on a 2.8 GB store, backup included.
 - `put/get/list/active`, `retire_runner`, `prune` manage data. `list` caps at its
   limit; `active(kind)` is unbounded. The collector runs `prune` at most hourly. Defaults retain observations,
