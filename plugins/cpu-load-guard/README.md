@@ -58,3 +58,5 @@ boundary; their existing activation paths still apply.
 Regression coverage: `tests/test_guard_decision_reload.py` at the repository root
 loads temporary plugin copies and exercises the registered pre-tool hook across
 allowed-to-refused edits, syntax errors, recovery and same-second/same-size edits.
+
+<!-- scratch: plugin-suites selection proof -->
