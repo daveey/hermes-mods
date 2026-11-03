@@ -88,7 +88,11 @@ GO_ASK_RE = re.compile(r"^\W*(go|go\s+ahead|do\s+it|yes|yep|approved|ship\s+it|l
 NOT_USER_ASK_RE = re.compile(r"^\s*(\[(System note|IMPORTANT|SYSTEM)|work kanban task\b)", re.I)
 OOB_RE = re.compile(r"\[/?OUT-OF-BAND USER MESSAGE[^\]]*\]")
 BUILD_ASK_MIN_WORDS = 25
-GIT_EDIT_RE = re.compile(r"\bgit\b[^;&|\n]*?\s(commit|worktree\s+add|apply|am|cherry-pick)(?![-\w])")
+# The rest of ONE simple command after its name, up to the blank before a later word of it: no ; & | or newline
+# in between, except a backslash-newline, which continues the command. A bare newline ends the command: the line
+# `x=$(git -C ~/.hermes/hermes-agent rev-parse HEAD)` followed by the line `rm -f out.txt` is not `git rm`.
+SAME_COMMAND = r"(?:[^;&|\n]|\\\n)*?(?:[ \t]|\\\n)"
+GIT_EDIT_RE = re.compile(r"\bgit\b" + SAME_COMMAND + r"(commit|worktree[ \t]+add|apply|am|cherry-pick)(?![-\w])")
 INPLACE_RE = re.compile(r"\bsed\s+-i\b|\bperl\s+-pi\b")
 
 
@@ -402,7 +406,8 @@ LOOP_SLEEP_RE = re.compile(r"\b(while|until|for)\b[^\n]*?(;|\n|\bdo\b)[\s\S]*?\b
 WATCH_RE = re.compile(r"(^|[;&|]\s*)watch\s+-n")
 # The mutating word must start after whitespace: glued to a revision, path or option value it is an argument
 # (`cat-file -e "$sha^{commit}"`, `show HEAD:docs/checkout.md`, `--grep=merge`), not a subcommand.
-GIT_MUTATE_RE = re.compile(r"\bgit\b[^;&|]*?\s(commit|pull|reset|checkout|switch|merge|rebase|stash|am|apply|cherry-pick)\b(?!-)")
+GIT_MUTATE_RE = re.compile(r"\bgit\b" + SAME_COMMAND +
+                           r"(commit|pull|reset|checkout|switch|merge|rebase|stash|am|apply|cherry-pick)\b(?!-)")
 FILE_MUTATE_RE = re.compile(r"(\bsed\s+-i\b|\bperl\s+-pi\b|\bnpm\s+run\s+(pack|build)\b|\bhermes\s+desktop\b.*--build)")
 # Output redirects: `>`, `>>`, `>|`, `N>`, `&>`. The target group is either an fd dup (`&1`, `&2`, `&-`) or a path.
 REDIRECT_RE = re.compile(r"""(?<![-=<>])(?:&|\d*)>>?\|?\s*(&[\d-]*|"[^"]*"|'[^']*'|[^\s;&|()<>]+)""")
@@ -801,7 +806,7 @@ def mutation_in_tree(cmd: str, workdir: str, root: str, home_form: str) -> bool:
     return False
 
 
-GIT_HEAD_RE = re.compile(r"\bgit\b((?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?)[^;&|\n]*?\s"
+GIT_HEAD_RE = re.compile(r"\bgit\b((?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?)" + SAME_COMMAND +
                          r"(commit|pull|reset|checkout|switch|merge|rebase|am|cherry-pick|revert)(?![-\w])")
 PACK_RE = re.compile(r"(\bnpm\s+run\s+pack\b|\bhermes\s+desktop\b[^;&|\n]*--build)")
 UPDATE_RE = re.compile(r"(?:^|[;&|(]\s*|\s)hermes\s+update\b")
@@ -889,9 +894,10 @@ PY_LITERAL_RE = re.compile(r"""(['"])((?:(?!\1)[^\\\n]|\\.)*)\1""")
 INPLACE_EDIT_RE = re.compile(r"(\bsed\s+(?:-\w+\s+)*-i\b|\bperl\s+-\w*i\w*\b)")
 FILE_CMD_RE = re.compile(r"(?:^|(?<=[;&|(\n]))\s*(?:sudo\s+)?(cp|mv|install|rsync|ln|tee|rm|truncate|touch|patch)(?=\s)")
 PKG_INSTALL_RE = re.compile(r"(?:^|(?<=[;&|(\n]))\s*(?:sudo\s+)?(?:[A-Z_][A-Z0-9_]*=\S*\s+)*(npm|pnpm|yarn|bun)\b"
-                            r"[^;&|\n]*?\s(install|i|ci|add|update|up|upgrade|uninstall|remove|rm|un|link|ln|dedupe|"
+                            + SAME_COMMAND + r"(install|i|ci|add|update|up|upgrade|uninstall|remove|rm|un|link|ln|dedupe|"
                             r"prune|rebuild)(?![-\w])")
-GIT_FILE_WRITE_RE = re.compile(r"\bgit\b((?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?)[^;&|\n]*?\s(stash|apply|rm|mv)(?![-\w])")
+GIT_FILE_WRITE_RE = re.compile(r"\bgit\b((?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?)" + SAME_COMMAND +
+                               r"(stash|apply|rm|mv)(?![-\w])")
 
 
 def _rel(path: str, root: str) -> str:
