@@ -323,8 +323,14 @@ are refused forever (no lease expiry or takeover). Rate limits per source and gl
 - `Store()` defaults to `$HERMES_HOME/runners/state.sqlite` (otherwise ~/.hermes).
   Explicit paths support tests. Connections are thread-affine. WAL, FULL sync,
   nested transactions, backup-before-migration and future-writer refusal are used.
-  Schema v1 adds generic validated records, tombstones and reducer state.
-- `put/get/list`, `retire_runner`, `prune` manage data. Defaults retain observations,
+  Schema v1 adds generic validated records, tombstones and reducer state. Schema v2
+  adds the `runner_entity` index (kind, `json_extract(payload,'$.entity_id')`,
+  updated_at) behind runner detail and repair context reads, and resolves duplicate
+  empty investigation incidents left by v1 collectors (newest per entity, any a repair
+  names, and any with transitions stay open). The one-time v1->v2 migration took
+  ~6.5 min on a 2.8 GB store, backup included.
+- `put/get/list/active`, `retire_runner`, `prune` manage data. `list` caps at its
+  limit; `active(kind)` is unbounded. The collector runs `prune` at most hourly. Defaults retain observations,
   transitions and resolved incidents 30 days; terminal job/repair audit 90 days;
   tombstones 30 days. Active records never expire. Ephemeral/JIT retirement compacts
   observations; audit is independent. Retention uses last write time: collectors

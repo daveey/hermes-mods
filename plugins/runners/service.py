@@ -11,6 +11,14 @@ from .health import State, project, Policy
 from .models import validate
 
 
+# Served by store.py's runner_entity expression index (schema v2): the
+# json_extract expression must stay textually equivalent to the indexed one.
+OBSERVATION_HISTORY_SQL = ("SELECT payload FROM runner_records WHERE kind='Observation' AND "
+                           "json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT ?")
+INCIDENT_HISTORY_SQL = ("SELECT payload FROM runner_records WHERE kind='Incident' AND "
+                        "json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT ?")
+
+
 def connect(path, *, write=False):
     uri = Path(path).resolve().as_uri()
     if write:
@@ -140,8 +148,8 @@ class Service:
         db=connect(self.path)
         try:
             # JSON filtering occurs before LIMIT; do not silently lose older matching rows.
-            observations=[json.loads(r[0]) for r in db.execute("SELECT payload FROM runner_records WHERE kind='Observation' AND json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT ?",(runner_id,history_limit))]
-            incidents=[json.loads(r[0]) for r in db.execute("SELECT payload FROM runner_records WHERE kind='Incident' AND json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT 100",(runner_id,))]
+            observations=[json.loads(r[0]) for r in db.execute(OBSERVATION_HISTORY_SQL,(runner_id,history_limit))]
+            incidents=[json.loads(r[0]) for r in db.execute(INCIDENT_HISTORY_SQL,(runner_id,100))]
             repairs=[]
             if principal and self.config['features']['repair_sessions'] and db.execute("SELECT 1 FROM sqlite_master WHERE name='repair_domain_records'").fetchone():
                 scope='host:'+runner['host_id'] if runner.get('host_id') else 'runner:'+runner_id

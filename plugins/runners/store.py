@@ -4,21 +4,27 @@ Store(path): explicit local SQLite WAL database, context-managed close.
 put(kind, document, *, key=None, at=None): validate an exact contract definition;
 key defaults to document.id (Transition requires an explicit opaque key). Timestamp
 is a numeric UTC epoch; default uses time.time. Replaces one record atomically.
-get(kind,key)/list(kind,limit=1000): detached documents. transaction(): composable
+get(kind,key)/list(kind,limit=1000): detached documents. active(kind): every
+active record, unbounded (list() truncates). transaction(): composable
 atomic batch with nested savepoints. Connections are thread-affine; use one Store
 per thread/process. Active status is derived, never supplied by a caller.
 prune(now=...): observations/transitions/resolved incidents 30d, terminal job/repair
 audits 90d, tombstones 30d. Other records and active work never expire. Retention
-starts at the last actual put, not a read. No TTL-based dispatch retries.
+starts at the last actual put, not a read. No TTL-based dispatch retries. The
+collector runs prune at most hourly.
 retire_runner(id,at=...): replace registration with compact identity tombstone;
 ephemeral/JIT raw observations and their transitions are compacted immediately.
 Audits/active incidents are retained independently. tombstone(id) reads that marker.
 
-Schema v1 is additive from v0 (unversioned databases). Existing databases receive
-an SQLite online backup before migration; backup_path exposes it. Unknown future
+Schema v1 is additive from v0 (unversioned databases). Schema v2 adds the
+runner_entity index (kind, payload entity_id, updated_at) for per-entity history
+and resolves duplicate empty investigation contexts minted by v1 collectors
+(newest per entity stays open). Existing databases receive an SQLite online
+backup before each migration; backup_path exposes it. Unknown future
 schemas refuse writers, including already-open instances. No automatic downgrade.
 """
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 import json
 import math
@@ -30,8 +36,10 @@ import uuid
 
 from .models import validate
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DAY = 86400
+# Indexed by runner_entity; queries must repeat this expression to use it.
+ENTITY = "json_extract(payload,'$.entity_id')"
 
 
 class StoreError(RuntimeError):
@@ -74,7 +82,7 @@ class Store:
                 os.chmod(self.path, 0o600)
                 if version < SCHEMA_VERSION:
                     if existed:
-                        self.backup_path = self.path.with_name(self.path.name + '.pre-v1-' + uuid.uuid4().hex + '.bak')
+                        self.backup_path = self.path.with_name(self.path.name + f'.pre-v{SCHEMA_VERSION}-' + uuid.uuid4().hex + '.bak')
                         fd = os.open(self.backup_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                         os.close(fd)
                         with sqlite3.connect(self.backup_path) as backup:
@@ -92,23 +100,61 @@ class Store:
             os.close(lock)
 
     def _migrate(self, version):
-        if version != 0:
+        if version not in (0, 1):
             raise StoreError('unsupported_schema')
         self.connection.execute('BEGIN IMMEDIATE')
         try:
-            self.connection.execute('''CREATE TABLE runner_records (
-                kind TEXT NOT NULL, record_key TEXT NOT NULL, payload TEXT NOT NULL,
-                updated_at REAL NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)),
-                PRIMARY KEY(kind,record_key))''')
-            self.connection.execute('CREATE INDEX runner_retention ON runner_records(kind,active,updated_at)')
-            self.connection.execute('''CREATE TABLE runner_tombstones (
-                record_key TEXT PRIMARY KEY, payload TEXT NOT NULL, retired_at REAL NOT NULL)''')
-            self.connection.execute('CREATE TABLE health_states (runner_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+            if version == 0:
+                self.connection.execute('''CREATE TABLE runner_records (
+                    kind TEXT NOT NULL, record_key TEXT NOT NULL, payload TEXT NOT NULL,
+                    updated_at REAL NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)),
+                    PRIMARY KEY(kind,record_key))''')
+                self.connection.execute('CREATE INDEX runner_retention ON runner_records(kind,active,updated_at)')
+                self.connection.execute('''CREATE TABLE runner_tombstones (
+                    record_key TEXT PRIMARY KEY, payload TEXT NOT NULL, retired_at REAL NOT NULL)''')
+                self.connection.execute('CREATE TABLE health_states (runner_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+            # v2: entity history (runner detail, repair contexts) is index-backed.
+            self.connection.execute(f'CREATE INDEX IF NOT EXISTS runner_entity ON runner_records(kind,{ENTITY},updated_at)')
+            if version == 1:
+                self._resolve_duplicate_contexts(_timestamp(None))
             self.connection.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
             self.connection.execute('COMMIT')
         except BaseException:
             self.connection.execute('ROLLBACK')
             raise
+
+    def _resolve_duplicate_contexts(self, stamp):
+        """Schema-v1 collectors minted a new investigation context each tick once
+        more than 1000 incidents existed (a capped list() lookup). Keep the newest
+        open context per entity, plus any a repair names or that carries
+        transitions; resolve the other empty duplicates at `stamp` so the existing
+        resolved-incident retention (30 days) removes them. Nothing is deleted here."""
+        referenced = set()
+        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='repair_domain_records'").fetchone():
+            referenced = {r[0] for r in self.connection.execute(
+                "SELECT json_extract(payload,'$.incident_id') FROM repair_domain_records")}
+        resolved_at = datetime.fromtimestamp(stamp, timezone.utc).isoformat().replace('+00:00', 'Z')
+        self.connection.execute('CREATE TEMP TABLE runner_keep (record_key TEXT PRIMARY KEY)')
+        try:
+            self.connection.executemany('INSERT OR IGNORE INTO runner_keep VALUES (?)', ((k,) for k in referenced if k))
+            self.connection.execute(f'''INSERT OR IGNORE INTO runner_keep
+                SELECT record_key FROM (SELECT record_key, row_number() OVER (
+                    PARTITION BY {ENTITY} ORDER BY updated_at DESC, record_key DESC) AS rank
+                    FROM runner_records WHERE kind='Incident' AND active=1
+                    AND json_extract(payload,'$.dimension')='investigation') WHERE rank=1''')
+            self.connection.execute('''UPDATE runner_records
+                SET payload=json_set(payload,'$.resolved_at',?), active=0, updated_at=?
+                WHERE kind='Incident' AND active=1
+                AND json_extract(payload,'$.dimension')='investigation'
+                AND json_array_length(payload,'$.transitions')=0
+                AND record_key NOT IN (SELECT record_key FROM runner_keep)''', (resolved_at, stamp))
+        finally:
+            self.connection.execute('DROP TABLE temp.runner_keep')
+
+    def active(self, kind):
+        """Every active record of a kind, oldest put first; unbounded, unlike list()."""
+        return [json.loads(row[0]) for row in self.connection.execute(
+            'SELECT payload FROM runner_records WHERE kind=? AND active=1 ORDER BY updated_at, record_key', (kind,))]
 
     def save_health(self, runner_id, state):
         from dataclasses import asdict

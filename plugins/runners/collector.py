@@ -18,6 +18,9 @@ from .models import validate
 from .probes.lifecycle import valid_timestamp
 
 
+PRUNE_INTERVAL = 3600
+
+
 def ident(prefix='obj'):
     return prefix + '_' + uuid.uuid4().hex
 
@@ -178,6 +181,7 @@ class Collector:
         self.store, self.config, self.adapter, self.clock = store, config, adapter, clock
         self.repair_service = repair_service
         self._repair_checked_at = None
+        self._pruned_at = None
         if type(max_scopes) is not int or max_scopes < 1 or tick_budget <= 0:
             raise ValueError('invalid_collection_budget')
         self.max_scopes, self.tick_budget, self.monotonic = max_scopes, tick_budget, monotonic
@@ -281,6 +285,10 @@ class Collector:
                 self._save_budget(self.adapter.export_state())
         if self.repair_service is not None:
             self.repair_service.reconcile_verifications()
+        # Existing retention policy (Store.prune); hourly, after a committed tick.
+        if self._pruned_at is None or self.monotonic() - self._pruned_at >= PRUNE_INTERVAL:
+            self.store.prune(now=self.clock())
+            self._pruned_at = self.monotonic()
         return snapshot
 
     def _tick(self):
@@ -472,7 +480,7 @@ class Collector:
             # An investigation context is not a failure assertion. Persist its
             # identity once so repeated clicks/reloads share the same context,
             # including online or readiness-unverified registrations.
-            contexts = {i['entity_id']: i for i in self.store.list('Incident')
+            contexts = {i['entity_id']: i for i in self.store.active('Incident')
                         if i['dimension'] == 'investigation' and not i['resolved_at']}
             for entity_id in [r['id'] for r in rows] + [h['resource_id'] for h in self.config['hosts']]:
                 context = contexts.get(entity_id) or dict(id=ident('incident'),
