@@ -870,6 +870,14 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   the seven-day `not_defect` suppression. Its brief directs investigators to this event.
   `tests/test_sqlite_corruption.py` replays six sanitized actual traceback tails (one card, five comments), concurrent
   filing, path/hour/host isolation, real owner-query filtering, comment failures, shadow safety and duplicate CLI.
+- **Disk-pressure ownership (`host-disk-full`):** disk I/O/full/Errno 28/"No space left on device" symptoms join a disk-pressure
+  card whose title names the exact source host and contains `disk` plus `ENOSPC`, `critical`, `% used`, or `free`.
+  The owner must be open or created within ±2 hours of the event. The closest creation time wins. Live mode
+  comments the occurrence; shadow `file --mode shadow` returns `adopted: true` without writing a card or lane.
+  A truncated local signal can also join when `journalctl` finds ENOSPC within ±120 seconds; this query has a
+  five-second timeout and is never run for another host. Unavailable evidence or no matching card leaves normal
+  filing intact. This contextual family does not enter the generic family-lane cache (which is not host-scoped).
+  `kanban-db-view` classification is unchanged. Tests: `tests/test_self_heal_disk_pressure.py`.
 - **Root families:** some exceptions are faces of one root. `kanban-db-view` = `disk I/O error`,
   `KanbanDbCorruptError`, `KanbanDbUnreliableViewError` or `database disk image is malformed` from Kanban code or a
   Kanban DB (a stale per-process view of a board). Before filing (after session adoption), a defect in a family

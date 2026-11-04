@@ -2553,6 +2553,77 @@ def root_family(d: dict) -> Optional[str]:
     return None
 
 
+_DISK_FULL_FACE = re.compile(r"disk I/O error|database or disk is full|Errno 28\b|No space left on device", re.I)
+_DISK_PRESSURE_TITLE = re.compile(r"ENOSPC|critical|%\s*used|free", re.I)
+
+
+def disk_pressure_owner(d: dict) -> Optional[dict]:
+    """Same-host disk incident, open or created within two hours of the event.
+
+    Require a host token in the title, not an incidental host mention in a traceback.
+    No generic family-lane alias: that would merge unrelated hosts and incidents.
+    """
+    import sqlite3
+    host = str(d.get("host") or "")
+    if not host or os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1":
+        return None
+    try:
+        at = float(d["at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    text = "\n".join(str(d.get(k) or "") for k in ("symptom", "details"))
+    has_face = bool(_DISK_FULL_FACE.search(text))
+    if not has_face and (d.get("source") != "signal" or host != host_name()):
+        return None
+    host_re = re.compile(r"(?<![\w.-])" + re.escape(host) + r"(?![\w.-])", re.I)
+    candidates = []
+    for board, path in _board_dbs(_kanban_home()):
+        db = None
+        try:
+            db = _ro_state(path)
+            for cid, title, status, created in db.execute("SELECT id, title, status, created_at FROM tasks"):
+                title = title or ""
+                if not (host_re.search(title) and re.search(r"\bdisk\b", title, re.I)
+                        and _DISK_PRESSURE_TITLE.search(title)):
+                    continue
+                if status in ("done", "archived") and abs(float(created or 0) - at) > 7200:
+                    continue
+                candidates.append({"id": cid, "board": board, "created_at": created,
+                                   "status": status})
+        except (sqlite3.Error, ValueError, TypeError):
+            continue
+        finally:
+            if db is not None:
+                db.close()
+    if candidates and not has_face:
+        # Query only this host, only a bounded event window, and only after finding an owner.
+        import subprocess
+        try:
+            journal = subprocess.run(
+                ["journalctl", "--since", f"@{at - 120:.0f}", "--until", f"@{at + 120:.0f}",
+                 "--no-pager", "-o", "cat", "--grep", r"No space left on device|Errno 28\b|ENOSPC", "-n", "1"],
+                capture_output=True, text=True, timeout=5)
+            if journal.returncode != 0 or not re.search(r"No space left on device|Errno 28\b|ENOSPC", journal.stdout):
+                return None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return min(candidates, key=lambda c: (abs(float(c["created_at"] or 0) - at), c["id"]), default=None)
+
+
+def _adopt_disk_pressure(d: dict, store, m: str, runner=None) -> Optional[dict]:
+    owner = disk_pressure_owner(d)
+    if not owner:
+        return None
+    result = {"action": "skip", "adopted": True, "via": "host-disk-full",
+              "card": owner["id"], "why": "adopted disk-pressure owner", "fingerprint": d["fingerprint"]}
+    if m == "live":
+        commented = _open_card_comment(d, {"fix_card": owner["id"], "board": owner["board"]}, store, runner)
+        if commented["action"] == "error":
+            return commented
+        store.log({"event": "selfheal_adopted_owner", "family": "host-disk-full", **result})
+    return result
+
+
 def _lane_family(e: dict) -> Optional[str]:
     return e.get("family") or root_family({"symptom": e.get("symptom")})
 
@@ -2784,6 +2855,10 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         if closed:
             store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": closed})
             return {"action": "skip", "why": closed}
+    if hub:
+        disk_owner = _adopt_disk_pressure(d, store, m, runner)
+        if disk_owner:
+            return disk_owner
     lane = LaneState(store.root)
     st = lane.get(fp)
     if st.get("status") == "adopted" and m == "live" and hub:
