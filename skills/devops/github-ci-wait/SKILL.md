@@ -148,6 +148,7 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 - In a fork checkout with an `upstream` remote, a bare `gh run`/`gh pr` reads the upstream repo's runs, so a
   hand-run one needs `-R OWNER/NAME` (the script passes it from `origin`; override with `--gh-repo`).
 
+- With a narrow `remote.origin.fetch`, fetching a branch may update only FETCH_HEAD and leave its `origin/<branch>` tracking ref stale. If `--once` reports “not on origin/…” after a verified push, compare `git ls-remote` and `git rev-parse origin/<branch>`; explicitly fetch `refs/heads/<branch>:refs/remotes/origin/<branch>` before retrying. Do not re-push an already verified head.
 - `--repo` is a LOCAL checkout path (the script runs `git -C <repo> fetch`). An `owner/name` slug resolves to `~/code/<name>` only when that checkout's origin is the same repo; anything else exits with "not a local checkout". Run it from inside the checkout or pass the path.
 
 - Workflows with `paths:` filters don't run for every commit. Without `--workflow`, the script waits on the
