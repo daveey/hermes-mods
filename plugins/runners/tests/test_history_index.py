@@ -157,11 +157,12 @@ def test_v1_migration_adds_index_and_resolves_only_duplicate_empty_investigation
         from plugins.runners.service import INCIDENT_HISTORY_SQL
         first = json.loads(store.connection.execute(INCIDENT_HISTORY_SQL, (a, 1)).fetchone()[0])
         assert first == kept_newest
-        # Resolved duplicates fall under the existing 30-day resolved-incident policy, no sooner.
-        store.prune(now=400 + 30 * DAY)
+        # Resolved empty duplicates fall under the 1-day churn bound (Store.prune
+        # churn_days), counted from the kept last put, no sooner.
+        store.prune(now=400 + DAY)
         left = {r[0] for r in store.connection.execute("SELECT record_key FROM runner_records WHERE kind='Incident'")}
         assert left == open_ids | {dup[4]['id']}
-        store.prune(now=400 + 30 * DAY + 1)
+        store.prune(now=400 + DAY + 1)
         left = {r[0] for r in store.connection.execute("SELECT record_key FROM runner_records WHERE kind='Incident'")}
         assert left == open_ids
     with sqlite3.connect(store.backup_path) as backup:
@@ -210,3 +211,24 @@ def test_collector_prunes_on_schedule_with_existing_policy(tmp_path):
         clock[0] += 3600; ticks[0] += 3600
         c.tick()
         assert store.get('Observation', 'obj_' + _hex(3)) is None
+
+
+def test_collector_prune_uses_configured_retention(tmp_path):
+    """Config retention reaches Store.prune; raw Observations default to 2 days."""
+    from plugins.runners.collector import Collector
+    from plugins.runners.config import normalize
+    from plugins.runners.store import Store
+    now = 40 * DAY
+    entity = 'runner_' + _hex(9, 16)
+    with Store(tmp_path / 'default.sqlite') as store:
+        store.put('Observation', _observation(1, entity), at=now - 3 * DAY)
+        store.put('Observation', _observation(2, entity), at=now - 1.5 * DAY)
+        Collector(store, config(), Adapter(), clock=lambda: now).tick()
+        assert store.get('Observation', 'obj_' + _hex(1)) is None
+        assert store.get('Observation', 'obj_' + _hex(2)) is not None
+    short = normalize(dict(schema_version=1, owner_gateway_id=F['Owner']['gateway_id'], owner_profile='example',
+                           scopes=[F['Scope']], retention=dict(observations_days=1)))
+    with Store(tmp_path / 'short.sqlite') as store:
+        store.put('Observation', _observation(2, entity), at=now - 1.5 * DAY)
+        Collector(store, short, Adapter(), clock=lambda: now).tick()
+        assert store.get('Observation', 'obj_' + _hex(2)) is None

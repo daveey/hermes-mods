@@ -8,8 +8,12 @@ get(kind,key)/list(kind,limit=1000): detached documents. active(kind): every
 active record, unbounded (list() truncates). transaction(): composable
 atomic batch with nested savepoints. Connections are thread-affine; use one Store
 per thread/process. Active status is derived, never supplied by a caller.
-prune(now=...): observations/transitions/resolved incidents 30d, terminal job/repair
-audits 90d, tombstones 30d. Other records and active work never expire. Retention
+prune(now=...): raw Observations 2d (raw_observation_days, capped by observations_days;
+each expires minutes after collection, current state lives in health_states and runner
+detail reads only the newest 100), transitions/resolved incidents 30d (observations_days),
+resolved empty `investigation` contexts 1d (churn_days; no transitions and no repair
+names them, so no reader uses them), terminal job/repair audits 90d, tombstones 30d.
+Other records and active work never expire. Retention
 starts at the last actual put, not a read. No TTL-based dispatch retries. The
 collector runs prune at most hourly.
 retire_runner(id,at=...): replace registration with compact identity tombstone;
@@ -286,14 +290,27 @@ class Store:
                 self.connection.executemany("DELETE FROM runner_records WHERE kind='Transition' AND record_key=?", ((key,) for key in transitions))
             return marker
 
-    def prune(self, *, now=None, observations_days=30, audit_days=90, retired_days=30):
+    def prune(self, *, now=None, observations_days=30, audit_days=90, retired_days=30,
+              raw_observation_days=2, churn_days=1):
         stamp = _timestamp(now)
-        for value in (observations_days, audit_days, retired_days):
+        for value in (observations_days, audit_days, retired_days, raw_observation_days, churn_days):
             if type(value) is not int or value < 1:
                 raise StoreError('invalid_retention')
         with self.transaction():
             removed = 0
-            for kinds, days in [(('Observation', 'Transition', 'Incident'), observations_days), (('Job', 'Repair'), audit_days)]:
+            # A context any Repair (store record or repair-domain row) names is kept.
+            # NULLs are filtered: one NULL in a NOT IN list would keep every row.
+            referenced = "SELECT json_extract(payload,'$.incident_id') AS k FROM runner_records WHERE kind='Repair'"
+            if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='repair_domain_records'").fetchone():
+                referenced += " UNION SELECT json_extract(payload,'$.incident_id') FROM repair_domain_records"
+            referenced = f'SELECT k FROM ({referenced}) WHERE k IS NOT NULL'
+            removed += self.connection.execute(
+                f'''DELETE FROM runner_records WHERE kind='Incident' AND active=0 AND updated_at < ?
+                AND json_extract(payload,'$.dimension')='investigation'
+                AND json_array_length(payload,'$.transitions')=0
+                AND record_key NOT IN ({referenced})''', (stamp - churn_days * DAY,)).rowcount
+            for kinds, days in [(('Observation',), min(raw_observation_days, observations_days)),
+                                (('Transition', 'Incident'), observations_days), (('Job', 'Repair'), audit_days)]:
                 marks = ','.join('?' for _ in kinds)
                 removed += self.connection.execute(
                     f'DELETE FROM runner_records WHERE active=0 AND kind IN ({marks}) AND updated_at < ?',

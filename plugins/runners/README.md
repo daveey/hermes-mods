@@ -331,8 +331,10 @@ are refused forever (no lease expiry or takeover). Rate limits per source and gl
   updated_at, so retention and newest-first order are unchanged). The one-time v1->v2 migration took
   ~6.5 min on a 2.8 GB store, backup included.
 - `put/get/list/active`, `retire_runner`, `prune` manage data. `list` caps at its
-  limit; `active(kind)` is unbounded. The collector runs `prune` at most hourly. Defaults retain observations,
-  transitions and resolved incidents 30 days; terminal job/repair audit 90 days;
+  limit; `active(kind)` is unbounded. The collector runs `prune` at most hourly with the config's
+  `retention` block. Defaults retain raw observations 2 days (each expires minutes after collection;
+  capped by `observations_days`), transitions and resolved incidents 30 days (`observations_days`),
+  resolved empty `investigation` contexts no Repair names 1 day; terminal job/repair audit 90 days;
   tombstones 30 days. Active records never expire. Ephemeral/JIT retirement compacts
   observations; audit is independent. Retention uses last write time: collectors
   must not rewrite unchanged observations just to refresh timestamps.

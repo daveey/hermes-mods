@@ -327,7 +327,7 @@ class Collector:
             self.repair_service.reconcile_verifications()
         # Existing retention policy (Store.prune); hourly, after a committed tick.
         if self._pruned_at is None or self.monotonic() - self._pruned_at >= PRUNE_INTERVAL:
-            self.store.prune(now=self.clock())
+            self.store.prune(now=self.clock(), **self.config['retention'])
             self._pruned_at = self.monotonic()
         return snapshot
 

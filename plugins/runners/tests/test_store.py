@@ -139,10 +139,64 @@ def test_retention_boundary_and_reads_do_not_renew(tmp_path):
     from plugins.runners.store import Store
     with Store(tmp_path / 'state.sqlite') as store:
         store.put('Observation', FIXTURES['Observation'], at=0)
-        store.prune(now=30 * DAY)
+        store.put('Transition', FIXTURES['Transition'], key='transition_0000000000000001', at=0)
+        store.prune(now=2 * DAY)
         assert store.get('Observation', FIXTURES['Observation']['id']) == FIXTURES['Observation']
-        store.prune(now=30 * DAY + 1)
+        store.prune(now=2 * DAY + 1)
         assert store.list('Observation') == []
+        # Transitions keep the 30-day history bound.
+        store.prune(now=30 * DAY)
+        assert len(store.list('Transition')) == 1
+        store.prune(now=30 * DAY + 1)
+        assert store.list('Transition') == []
+
+
+def test_raw_observation_bound_is_configurable_and_capped_by_history(tmp_path):
+    from plugins.runners.store import Store, StoreError
+    with Store(tmp_path / 'state.sqlite') as store:
+        store.put('Observation', FIXTURES['Observation'], at=0)
+        store.prune(now=4 * DAY, raw_observation_days=5)
+        assert len(store.list('Observation')) == 1
+        store.prune(now=DAY + 1, observations_days=1, raw_observation_days=5)
+        assert store.list('Observation') == []
+        for bad in (0, 1.5, None):
+            with pytest.raises(StoreError, match='invalid_retention'):
+                store.prune(now=0, raw_observation_days=bad)
+            with pytest.raises(StoreError, match='invalid_retention'):
+                store.prune(now=0, churn_days=bad)
+
+
+def test_churned_investigation_contexts_purged_after_one_day(tmp_path):
+    from plugins.runners.store import Store
+    resolved = '2030-01-01T00:00:00Z'
+    base = dict(FIXTURES['Incident'], dimension='investigation', resolved_at=resolved)
+
+    def inc(n, **extra):
+        return dict(base, id='incident_%016x' % n, **extra)
+
+    churn = inc(1)
+    with_history = inc(2, transitions=[FIXTURES['Transition']])
+    other = inc(3, dimension='readiness')
+    still_open = inc(4, resolved_at=None)
+    named_by_repair = inc(5)
+    named_by_domain = inc(6)
+    with Store(tmp_path / 'state.sqlite') as store:
+        for row in (churn, with_history, other, still_open, named_by_repair, named_by_domain):
+            store.put('Incident', row, at=0)
+        store.put('Repair', dict(FIXTURES['Repair'], incident_id=named_by_repair['id'], state='closed'), at=0)
+        store.connection.execute('CREATE TABLE repair_domain_records (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        store.connection.execute('INSERT INTO repair_domain_records VALUES (?,?)',
+                                 ('a', json.dumps(dict(incident_id=named_by_domain['id']))))
+        store.connection.execute('INSERT INTO repair_domain_records VALUES (?,?)', ('b', json.dumps({})))
+        store.prune(now=DAY)
+        assert len(store.list('Incident')) == 6
+        assert store.prune(now=DAY + 1) == 1
+        assert store.get('Incident', churn['id']) is None
+        keep = {r['id'] for r in store.list('Incident')}
+        assert keep == {with_history['id'], other['id'], still_open['id'], named_by_repair['id'], named_by_domain['id']}
+        store.prune(now=30 * DAY + 1)
+        # The existing 30-day resolved-incident retention still takes the rest.
+        assert [r['id'] for r in store.list('Incident')] == [still_open['id']]
 
 
 def test_active_audit_cannot_be_expired_by_caller(tmp_path):
