@@ -1,0 +1,326 @@
+From 3d1c392baf809d41d15d37b76e5011d999bdbdfb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:01:25 +0000
+Subject: [PATCH] fix(kanban): repin survives Board churn; creator worker can
+ repin its queued card (#827)
+
+* fix(kanban): worker-first repin retries a revision_conflict after a pull; a creator worker can repin its own queued card [daveey]
+
+* refactor(kanban): keep the creator-repin tool path out of the kanban_tools facade (line cap) [daveey]
+---
+ hermes_cli/kanban_creator_repin.py           | 52 ++++++++++++
+ hermes_cli/kanban_worker_repin.py            | 43 +++++++---
+ tests/hermes_cli/test_kanban_worker_repin.py | 44 ++++++++++-
+ tests/tools/test_kanban_creator_repin.py     | 83 ++++++++++++++++++++
+ tools/kanban_tools.py                        |  6 +-
+ tools/kanban_tools_schemas.py                |  5 +-
+ 6 files changed, 216 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/kanban_creator_repin.py
+ create mode 100644 tests/tools/test_kanban_creator_repin.py
+
+diff --git a/hermes_cli/kanban_creator_repin.py b/hermes_cli/kanban_creator_repin.py
+new file mode 100644
+index 00000000000..b44d3c9e347
+--- /dev/null
++++ b/hermes_cli/kanban_creator_repin.py
+@@ -0,0 +1,52 @@
++"""A scoped worker repins a worker-first card its own task created. [daveey]
++
++The no-pool-worker notice (``kanban_repin_notice``) tells a card's creator to repin it to the origin. When the
++creator is a chat, it runs the printed ``hermes kanban move``. When the creator is another card's worker, that CLI
++is fenced (worker shells may not write the board) and ``kanban_move`` was scoped to the worker's own card, so the
++card waited forever. This is the narrow grant: ``kanban_move(task_id=<card my task created>)`` takes the same
++explicit Board repin (``kanban_worker_repin.repin_to_origin`` via ``kanban_move.move_queued``) and nothing else:
++not a running card, not a card another task created, not a card without a worker-first policy.
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++from typing import Any, Callable
++
++from hermes_cli.kanban_archive_scope import _creator_task_id
++
++
++def other_card(args: dict) -> bool:
++    """A scoped worker named a task other than its own."""
++    env, tid = os.environ.get("HERMES_KANBAN_TASK"), str(args.get("task_id") or "")
++    return bool(env and tid and tid != env)
++
++
++def tool_repin(args: dict, *, board: Callable, check: Callable, ok: Callable, reject_child: Callable) -> str:
++    """``kanban_move`` for another card (helpers injected from tools.kanban_tools to keep that facade small)."""
++    reject_child("kanban_move", args)
++    env, tid = os.environ["HERMES_KANBAN_TASK"], str(args["task_id"])
++    reason = str(args.get("reason") or "").strip()
++    check(reason, "reason is required")
++    with board(args.get("board")) as (_kb, conn):
++        res = creator_repin(conn, tid, env, runs_on=args.get("runs_on"), reason=reason)
++    check(res.get("ok"), f"could not repin {tid}: {res.get('error')}")
++    return ok(**{k: v for k, v in res.items() if k not in ("ok", "task_id", "next")},
++              task_id=tid, next="Repinned another card; this run continues.")
++
++
++def creator_repin(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs_on: Any, reason: str,
++                  hub: Any = None) -> dict[str, Any]:
++    """``move_queued``'s result, or ``{"ok": False, "reason_code", "error"}`` when this worker may not repin it."""
++    from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_worker_repin as repin
++
++    if _creator_task_id(conn, task_id) != env_task:
++        return {"ok": False, "reason_code": "not_creator_task",
++                "error": f"worker is scoped to task {env_task}; it may move another card only to repin a "
++                         f"worker-first card its own task created, and {task_id} was not created by it"}
++    if not repin.applies(conn, task_id):
++        return {"ok": False, "reason_code": "not_repinnable",
++                "error": f"{task_id} is not an unstarted worker-first card (running, done, archived or no "
++                         "placement policy); only the explicit origin repin is allowed here"}
++    return km.move_queued(conn, task_id, runs_on=runs_on, reason=reason, hub=hub)
+diff --git a/hermes_cli/kanban_worker_repin.py b/hermes_cli/kanban_worker_repin.py
+index 5971ccff909..cd9199f59be 100644
+--- a/hermes_cli/kanban_worker_repin.py
++++ b/hermes_cli/kanban_worker_repin.py
+@@ -31,6 +31,8 @@ from typing import Any, Optional
+ 
+ REPINNED_EVENT_FLAG = "repinned"
+ _BOARD_CODES = ("revision_conflict", "not_creator", "not_claimable", "invalid_pin", "not_found")
++# Repin CAS attempts on revision_conflict, each after a pull of the newest Board row (see repin_to_origin).
++CONFLICT_ATTEMPTS = 3
+ 
+ 
+ def _refuse(code: str, message: str) -> dict[str, Any]:
+@@ -131,19 +133,34 @@ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], r
+     except client.SyncUnavailable as exc:
+         return _refuse("board_unavailable", f"no Board identity on this gateway ({exc}); policy unchanged")
+ 
+-    try:
+-        reply = hub.repin(board, task_id=task_id, expected_revision=pre["revision"], runs_on=labels)
+-    except client.HubError as exc:
+-        if exc.status >= 500:
+-            return _unknown(f"HTTP {exc.status}")
+-        code = _board_code(exc.detail)
+-        if code == "revision_conflict":
+-            return _refuse("revision_conflict", f"the Board has a newer revision of {task_id} than this copy; "
+-                                                "verify placement after the next sync before retrying")
+-        return _refuse("repin_refused", f"the Board refused the repin (HTTP {exc.status}"
+-                                        + (f", {code}" if code else "") + "); local copy unchanged; verify after sync")
+-    except (OSError, client.Resync) as exc:
+-        return _unknown(type(exc).__name__)
++    reply: Any = None
++    for attempt in range(CONFLICT_ATTEMPTS):
++        try:
++            reply = hub.repin(board, task_id=task_id, expected_revision=pre["revision"], runs_on=labels)
++            break
++        except client.HubError as exc:
++            if exc.status >= 500:
++                return _unknown(f"HTTP {exc.status}")
++            code = _board_code(exc.detail)
++            if code != "revision_conflict":
++                return _refuse("repin_refused", f"the Board refused the repin (HTTP {exc.status}"
++                                                + (f", {code}" if code else "") + "); local copy unchanged; verify after sync")
++            conflict = _refuse("revision_conflict", f"the Board has a newer revision of {task_id} than this copy; "
++                                                    "verify placement after the next sync before retrying")
++            if attempt + 1 >= CONFLICT_ATTEMPTS:
++                return conflict
++            # A queued policy card's Board row is rewritten by every reservation reply, so the local revision is
++            # often a step behind. Read the newest row, re-check every precondition on it, and CAS again: never a
++            # blind write over an edit this copy has not seen.
++            try:
++                client.pull(conn, hub, board, observers=True, partition=me)
++            except (client.HubError, client.Resync, client.SyncUnavailable, OSError):
++                return conflict
++            pre = eligibility(conn, task_id, labels)
++            if not pre.get("ok"):
++                return pre
++        except (OSError, client.Resync) as exc:
++            return _unknown(type(exc).__name__)
+     version = reply.get("version") if isinstance(reply, dict) else None
+ 
+     # The Board has committed. Record the operator's reason as the card's move audit (no runs_on/policy write).
+diff --git a/tests/hermes_cli/test_kanban_worker_repin.py b/tests/hermes_cli/test_kanban_worker_repin.py
+index af794a6e501..0f9af3499e2 100644
+--- a/tests/hermes_cli/test_kanban_worker_repin.py
++++ b/tests/hermes_cli/test_kanban_worker_repin.py
+@@ -136,15 +136,55 @@ def test_board_offline_reports_unknown_outcome_with_local_copy_intact(gws, svc):
+ 
+ 
+ def test_board_revision_conflict_leaves_policy_intact(gws, svc):
++    # The Board row changes on every attempt (a queued card's row is rewritten by each reservation reply): every
++    # CAS loses, so after the bounded pull-and-retry the move is refused and the policy is untouched everywhere.
+     origin, _ = gws
+     tid, _ = _policy_card(origin)
+     b = svc.board(BOARD)
+-    svc._put(b, "tasks", tid, {"priority": 3}, "worker-1", None, f"{9_999_999_999_996:013d}-0000-x")  # unseen edit
+-    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=RepinHub(svc, HUB))
++    n = iter(range(9_999_999_999_990, 9_999_999_999_900, -1))
++    churn = lambda: svc._put(b, "tasks", tid, {"priority": 3}, "worker-1", None, f"{next(n):013d}-0000-x")
++    hub = RepinHub(svc, HUB, during=churn)
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=hub)
+     assert res["reason_code"] == "revision_conflict", res
++    assert len(hub.repins) == repin.CONFLICT_ATTEMPTS
+     assert _local(origin.conn, tid)[0] == wp.POLICY and b["rows"]["tasks"][tid]["placement_policy"] == wp.POLICY
+ 
+ 
++def test_repin_after_one_unseen_board_edit_pulls_and_retries(gws, svc):
++    # Live: fixture t_01a1a46cbd08b275's printed move was refused revision_conflict because the Board rewrote the
++    # row between the local read and the POST. One unseen edit: pull, re-check, CAS again at the new revision.
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    b = svc.board(BOARD)
++    svc._put(b, "tasks", tid, {"priority": 3}, "worker-1", None, f"{9_999_999_999_996:013d}-0000-x")  # unseen edit
++    hub = RepinHub(svc, HUB)
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=hub)
++    assert res.get("ok") is True and res["readback"] == "confirmed", res
++    assert len(hub.repins) == 2 and hub.repins[1]["expected_revision"] > hub.repins[0]["expected_revision"]
++    assert _local(origin.conn, tid) == (None, ["machine:hub"], "ready")
++
++
++def test_repin_retry_rechecks_preconditions_on_the_pulled_row(gws, svc, monkeypatch):
++    # The conflicting edit blocked the card: the pulled row is no longer ready, so no second CAS is sent.
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    b = svc.board(BOARD)
++    svc._put(b, "tasks", tid, {"priority": 3}, "worker-1", None, f"{9_999_999_999_996:013d}-0000-x")  # unseen edit
++    real_pull = ksc.pull
++
++    def pull_sees_block(conn_, *a, **kw):
++        out = real_pull(conn_, *a, **kw)
++        with conn_:
++            conn_.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
++        return out
++
++    monkeypatch.setattr(ksc, "pull", pull_sees_block)
++    hub = RepinHub(svc, HUB)
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=hub)
++    assert res.get("ok") is not True and res["reason_code"] == "repin_unavailable", res
++    assert len(hub.repins) == 1 and b["rows"]["tasks"][tid]["placement_policy"] == wp.POLICY
++
++
+ # --- CLI entry path ------------------------------------------------------------------------------------------------
+ 
+ def test_cli_move_repins_an_unstarted_origin_policy_card(gws, svc, monkeypatch):
+diff --git a/tests/tools/test_kanban_creator_repin.py b/tests/tools/test_kanban_creator_repin.py
+new file mode 100644
+index 00000000000..d08bc96bbc0
+--- /dev/null
++++ b/tests/tools/test_kanban_creator_repin.py
+@@ -0,0 +1,83 @@
++"""A worker repins a worker-first card its own task created via kanban_move(task_id=...). [daveey]
++
++The no-pool-worker notice tells the creator to repin the card. A creator that is another card's worker could
++not: its shell is fenced from ``hermes kanban move`` and ``kanban_move`` refused any task but its own, so the
++card stayed queued forever (live: fixture t_01a1a46cbd08b275, created by t_01a1a10ffdb8433c). The grant is
++narrow: only the explicit origin repin, only for a card the caller's task created, never a running card.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_worker_placement as wp
++from hermes_cli import kanban_worker_repin as repin
++from hermes_cli.kanban_db_connect import connect
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    db = tmp_path / "board.db"
++    conn = connect(db)
++    owner = kb.create_task(conn, title="owner")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    monkeypatch.setenv("HOME", str(tmp_path))
++    calls = []
++
++    def fake_repin(conn_, task_id, labels, reason, *, hub=None):
++        calls.append((task_id, labels, reason))
++        return {"ok": True, "runs_on": labels, "repinned": True, "readback": "confirmed"}
++
++    monkeypatch.setattr(repin, "repin_to_origin", fake_repin)
++    yield conn, owner, calls
++    conn.close()
++
++
++def _move(task_id):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_move({"task_id": task_id, "runs_on": ["machine:hub"],
++                                       "reason": "no pool worker can run it", "checkpoint": "n/a"}))
++
++
++def test_creator_worker_repins_its_queued_worker_first_card(board):
++    conn, owner, calls = board
++    card = kb.create_task(conn, title="fixture", creator_task_id=owner, placement_policy=wp.POLICY)
++    out = _move(card)
++    assert out.get("ok") is True, out
++    assert calls == [(card, ["machine:hub"], "no pool worker can run it")]
++    # The caller's own card is untouched: repinning another card never ends or re-queues this run.
++    assert not [e for e in kb.list_events(conn, owner) if e.kind in ("continued", "moved", "worker_moved")]
++
++
++def test_worker_may_not_repin_a_card_another_task_created(board):
++    conn, owner, calls = board
++    other = kb.create_task(conn, title="other owner")
++    card = kb.create_task(conn, title="foreign", creator_task_id=other, placement_policy=wp.POLICY)
++    out = _move(card)
++    assert out.get("ok") is not True and owner in out["error"], out
++    assert calls == []
++
++
++def test_creator_worker_may_not_relabel_a_card_without_worker_first_policy(board):
++    conn, owner, calls = board
++    card = kb.create_task(conn, title="plain", creator_task_id=owner)
++    out = _move(card)
++    assert out.get("ok") is not True and "worker-first" in out["error"], out
++    assert calls == []
++
++
++def test_creator_worker_may_not_repin_a_running_card(board):
++    conn, owner, calls = board
++    card = kb.create_task(conn, title="running", creator_task_id=owner, placement_policy=wp.POLICY)
++    # A worker-first card is claimed through the Board lease, so set the running state the lease leaves.
++    with conn:
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (card,))
++    out = _move(card)
++    assert out.get("ok") is not True, out
++    assert calls == []
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8a0e84b7740..9e37f2fea8d 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1240,7 +1240,11 @@ def _handle_continue(args: dict, **kw) -> str:
+ 
+ @_kanban_handler("kanban_move")
+ def _handle_move(args: dict, **kw) -> str:
+-    """[daveey] Checkpoint, end this run and re-queue the card with new runs_on labels (hermes_cli.kanban_move)."""
++    """[daveey] Checkpoint, end this run and re-queue the card with new runs_on labels (hermes_cli.kanban_move).
++    Another card: only the origin repin of a worker-first card the caller's task created (kanban_creator_repin)."""
++    from hermes_cli import kanban_creator_repin as kcr
++    if kcr.other_card(args):
++        return kcr.tool_repin(args, board=_board, check=_check, ok=_ok, reject_child=_reject_delegated_child_mutation)
+     tid = _worker_guard("kanban_move", args)
+     checkpoint = _redact(_require_text(
+         args, "checkpoint", "checkpoint is required — write what is done, what is not portable and the next "
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index af9527f361d..0d1139fd068 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -450,7 +450,10 @@ KANBAN_MOVE_SCHEMA = _schema(
+         "card's runs_on to the labels you give and re-queues it, so ONLY a machine carrying every label claims "
+         "the next run (the Board enforces it). Refused when no other active machine matches, after "
+         "kanban.move.max_moves moves, when moving back to a machine the card already left (pass force), and "
+-        "for dir/worktree cards. After it returns, end your turn with a one-line reply; do not call more tools."
++        "for dir/worktree cards. After it returns, end your turn with a one-line reply; do not call more tools. "
++        "Exception: task_id = a worker-first card YOUR task created that no pool worker can run (its "
++        "'No pool worker can run this card' notice) and runs_on = [\"machine:<origin>\"] repins that card to the "
++        "origin instead; your own run continues. Every other card is refused."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+-- 
+2.55.0
+

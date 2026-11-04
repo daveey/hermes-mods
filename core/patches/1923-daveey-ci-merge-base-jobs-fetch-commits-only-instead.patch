@@ -1,0 +1,552 @@
+From e0970e3d00796053f3c2f631e575a0d8943699a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 07:20:22 +0000
+Subject: [PATCH] [daveey] ci: merge-base jobs fetch commits only instead of
+ fetch-depth 0 (#832)
+
+* [daveey] ci: merge-base jobs fetch commits only instead of fetch-depth 0
+
+prompt-surface-diff, lockfile-diff, history-check, contributor-check, lint's
+ruff + ty diff and both supply-chain-audit jobs checked out with
+fetch-depth: 0, which on this ~1 GB fork fetched all ~500 heads, every tag
+and (mostly) every blob: 1m50s-3m on a good ci-fast runner and past the
+job timeout on slow ones (#802, #806 3/3 attempts, sync PRs), failing
+"All required checks pass (v2)".
+
+They now keep the default depth-1 checkout and run the new
+.github/actions/fetch-merge-base: one `git fetch --filter=tree:0
+--unshallow` of HEAD and the base (branch or sha), commits only, no other
+heads, no tags. History is complete, so merge-base, base..HEAD ranges and
+git log --author answer exactly as on a full clone; trees and blobs of the
+merge base load lazily on first use (blob:none promisor fetch, one batch per
+tree). On the hub: 6-7 s for #806 vs a 9.6 s depth-1 checkout.
+An empty merge base means unrelated histories; a fetch error fails the
+step, so history-check never reads an error as "unrelated".
+
+tests/ci/test_fetch_merge_base.py drives the script from a depth-1 clone
+against a local origin: merge base and contributor log range equal a full
+clone's (incl. a branch that merged main), lazy base reads, sha inputs the
+checkout lacks, unrelated histories, and a fetch failure.
+
+* [daveey] ci(fetch-merge-base): no expressions in the action description (the runner evaluates them)
+---
+ .github/actions/fetch-merge-base/action.yml   |  43 ++++++
+ .../fetch-merge-base/fetch-merge-base.sh      |  58 +++++++
+ .github/workflows/contributor-check.yml       |  14 +-
+ .github/workflows/history-check.yml           |  21 +--
+ .github/workflows/lint.yml                    |  12 +-
+ .github/workflows/lockfile-diff.yml           |  21 ++-
+ .github/workflows/prompt-surface-diff.yml     |  32 ++--
+ .github/workflows/supply-chain-audit.yml      |  18 ++-
+ tests/ci/test_fetch_merge_base.py             | 146 ++++++++++++++++++
+ 9 files changed, 332 insertions(+), 33 deletions(-)
+ create mode 100644 .github/actions/fetch-merge-base/action.yml
+ create mode 100755 .github/actions/fetch-merge-base/fetch-merge-base.sh
+ create mode 100644 tests/ci/test_fetch_merge_base.py
+
+diff --git a/.github/actions/fetch-merge-base/action.yml b/.github/actions/fetch-merge-base/action.yml
+new file mode 100644
+index 00000000000..8abe4084bf5
+--- /dev/null
++++ b/.github/actions/fetch-merge-base/action.yml
+@@ -0,0 +1,43 @@
++name: Fetch the merge base
++description: >-
++  After a default (depth 1) checkout, fetch the complete commit history of HEAD and one base
++  revision, commits only (--filter=tree:0, no other heads, no tags), and output their merge base.
++  It replaces `fetch-depth: 0`, which on this ~1 GB fork fetched all ~500 heads, every tag and
++  every blob: 2-3 min on a good ci-fast runner and past the job timeout on slow ones, failing the
++  required aggregate. The history is complete, so merge-base, `base..HEAD` ranges and
++  `git log --author` answer exactly as on a full clone. Trees and blobs of other commits are fetched
++  lazily on first use (git diff / archive / worktree), which needs credentials: keep the
++  checkout's default persist-credentials, or pass a token to those commands yourself. Use it
++  right after actions/checkout (default fetch-depth) with `base` set to the PR's base branch;
++  the merge base is in `steps.<id>.outputs.sha`.
++
++inputs:
++  base:
++    description: Branch name (fetched to refs/remotes/origin/<base>) or a 40-hex commit.
++    required: true
++  head:
++    description: Revision in the checkout, or a 40-hex commit to fetch. Default HEAD.
++    default: HEAD
++  token:
++    description: Token for the fetch when the checkout did not persist credentials.
++    default: ${{ github.token }}
++
++outputs:
++  sha:
++    description: The merge base of base and head; empty when the histories are unrelated.
++    value: ${{ steps.fetch.outputs.sha }}
++
++runs:
++  using: composite
++  steps:
++    - id: fetch
++      shell: bash
++      env:
++        _BASE: ${{ inputs.base }}
++        _HEAD: ${{ inputs.head }}
++        FETCH_TOKEN: ${{ inputs.token }}
++      run: |
++        set -euo pipefail
++        sha=$("$GITHUB_ACTION_PATH/fetch-merge-base.sh" "$_BASE" "$_HEAD")
++        echo "Merge base of ${_BASE} and ${_HEAD}: ${sha:-<none: unrelated histories>}"
++        echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+diff --git a/.github/actions/fetch-merge-base/fetch-merge-base.sh b/.github/actions/fetch-merge-base/fetch-merge-base.sh
+new file mode 100755
+index 00000000000..354d4e5232a
+--- /dev/null
++++ b/.github/actions/fetch-merge-base/fetch-merge-base.sh
+@@ -0,0 +1,58 @@
++#!/usr/bin/env bash
++# Fetch the full commit graph of HEAD and one base revision, commits only, and print their
++# merge base (empty when the histories are unrelated). See action.yml for why.
++#
++#   fetch-merge-base.sh <base> [<head>]
++#     base  a branch name (fetched to refs/remotes/origin/<base>) or a 40-hex commit
++#     head  a revision already in the repo, or a 40-hex commit to fetch; default HEAD
++#
++# FETCH_TOKEN (optional) authenticates https://github.com remotes when the checkout did not
++# persist credentials. Exit status is non-zero only when the fetch itself fails.
++set -euo pipefail
++
++base=${1:?usage: fetch-merge-base.sh <base> [<head>]}
++head=${2:-HEAD}
++
++is_sha() { [[ $1 =~ ^[0-9a-f]{40}$ ]]; }
++
++if is_sha "$head"; then
++  head_sha=$head
++else
++  head_sha=$(git rev-parse --verify "${head}^{commit}")
++fi
++if is_sha "$base"; then
++  base_spec=$base
++  base_rev=$base
++else
++  base_spec="+refs/heads/${base}:refs/remotes/origin/${base}"
++  base_rev="refs/remotes/origin/${base}"
++fi
++
++git_auth=()
++url=$(git remote get-url origin)
++if [[ -n ${FETCH_TOKEN:-} && $url == https://github.com/* ]] \
++   && ! git config --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
++  basic=$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')
++  git_auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic}")
++fi
++
++# tree:0 = commit objects only: the whole history of both sides is tens of MB, where the
++# full-history checkout it replaces pulled every head, tag, tree and blob of the repo. The repo
++# becomes a partial clone, so a later diff/archive/worktree of the merge base lazily fetches that
++# commit's trees and blobs (credentials must reach those commands too).
++depth_args=()
++if [[ $(git rev-parse --is-shallow-repository) == true ]]; then
++  depth_args=(--unshallow)
++fi
++start=$SECONDS
++git "${git_auth[@]}" fetch --quiet --no-tags --no-recurse-submodules --filter=tree:0 \
++  "${depth_args[@]}" origin "$head_sha" "$base_spec"
++echo "fetch-merge-base: fetched ${base_rev} and ${head_sha} history in $((SECONDS - start))s" >&2
++
++# Exit 1 with no output is "no common ancestor"; anything else (a missing object) is an error,
++# never a silent "unrelated".
++rc=0
++git merge-base "$base_rev" "$head_sha" || rc=$?
++if (( rc > 1 )); then
++  exit "$rc"
++fi
+diff --git a/.github/workflows/contributor-check.yml b/.github/workflows/contributor-check.yml
+index 2ea5751c680..9db803314ce 100644
+--- a/.github/workflows/contributor-check.yml
++++ b/.github/workflows/contributor-check.yml
+@@ -25,13 +25,21 @@ jobs:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
+           ref: ${{ inputs.commit }}
+-          fetch-depth: 0  # Full history needed for git log
++
++      # fork: git log needs the full commit history of main and HEAD, not fetch-depth 0's every
++      # head, tag and blob; this fetches commits only.
++      - name: Fetch the merge base
++        id: merge-base
++        uses: ./.github/actions/fetch-merge-base
++        with:
++          base: main
+ 
+       - name: Check for unmapped contributor emails
+         id: check-emails
++        env:
++          MERGE_BASE: ${{ steps.merge-base.outputs.sha }}
+         run: |
+-          # Get the merge base between this PR and main
+-          MERGE_BASE=$(git merge-base origin/main HEAD)
++          : "${MERGE_BASE:?no merge base with main}"
+ 
+           # Find any new author emails in this PR's commits
+           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+diff --git a/.github/workflows/history-check.yml b/.github/workflows/history-check.yml
+index a4e93fb2f0b..c4df2bb1293 100644
+--- a/.github/workflows/history-check.yml
++++ b/.github/workflows/history-check.yml
+@@ -38,19 +38,22 @@ jobs:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
+           ref: ${{ inputs.commit }}
+-          fetch-depth: 0 # full history both sides for merge-base
+-          # [daveey] merge-base needs only the commit graph; a full-blob clone of
+-          # the ~1 GB fork outran the 10-min fast-lane cap on fresh runners.
+-          filter: blob:none
++
++      # [daveey] merge-base needs only the commit graph: the full history of main and HEAD,
++      # commits only. A fetch-depth 0 clone of the ~1 GB fork outran the 10-min fast-lane cap.
++      # The action fails on a fetch error, so an empty sha means unrelated histories.
++      - id: fetch-merge-base
++        name: Fetch the merge base
++        uses: ./.github/actions/fetch-merge-base
++        with:
++          base: main
+ 
+       - id: merge-base-check
+         name: Reject PRs with no common ancestor on main
++        env:
++          BASE: ${{ steps.fetch-merge-base.outputs.sha }}
+         run: |
+-          # `git merge-base` exits non-zero AND prints nothing when the two
+-          # commits share no ancestor.  We check both conditions explicitly
+-          # so the failure message is clear regardless of which signal fires
+-          # first.
+-          if ! BASE=$(git merge-base origin/main HEAD 2>/dev/null) || [ -z "$BASE" ]; then
++          if [ -z "$BASE" ]; then
+             STATUS='[{"source":"unrelated histories","results":[{"kind":"action_required","title":"Unrelated histories","summary":"This PR has no common ancestor with main.","detail":"","how_to_fix":"Rebase your changes onto current main:\n```\ngit fetch origin main\ngit checkout -b fix-branch origin/main\n# re-apply your changes (cherry-pick, copy files, etc.)\ngit push -f origin fix-branch\n```\n"}]}]'
+             echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+             echo "review_status=${STATUS}" > review-status.json
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index e15d59ea2dd..2073d05733a 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -47,7 +47,14 @@ jobs:
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
+           ref: ${{ inputs.commit }}
+-          fetch-depth: 0 # need full history for merge-base + worktree
++
++      # fork: commits only, not fetch-depth 0 (every head, tag and blob, which hung this job at
++      # its timeout); the base worktree's trees and blobs are fetched lazily (credentials persist).
++      - name: Fetch the merge base
++        id: merge-base
++        uses: ./.github/actions/fetch-merge-base
++        with:
++          base: ${{ github.base_ref }}
+ 
+       # No automatic post-save: an optional cache upload must not consume the job timeout.
+       - uses: ./.github/actions/setup-pm
+@@ -76,7 +83,8 @@ jobs:
+           # For PRs, diff against the merge base with the target branch.
+           # For pushes to main, diff against the previous commit on main.
+           if [ "${{ inputs.event_name }}" = "pull_request" ]; then
+-            BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
++            BASE_SHA="${{ steps.merge-base.outputs.sha }}"
++            [ -n "$BASE_SHA" ] || { echo "::error::no merge base with ${{ github.base_ref }}"; exit 1; }
+             BASE_REF="origin/${{ github.base_ref }}"
+           else
+             BASE_SHA=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+diff --git a/.github/workflows/lockfile-diff.yml b/.github/workflows/lockfile-diff.yml
+index 88fbe5ff707..87558f001e3 100644
+--- a/.github/workflows/lockfile-diff.yml
++++ b/.github/workflows/lockfile-diff.yml
+@@ -41,9 +41,9 @@ jobs:
+   diff:
+     name: package-lock.json semantic diff
+     runs-on: [self-hosted, ci-fast]
+-    # fork: a full-history fetch of this ~1 GB private repo on a fresh ci-fast runner can exceed
+-    # 5 min; a cancel here fails the required aggregate (execution is required even though the
+-    # findings are advisory). 10 is the fast-lane cap (tests/ci/test_fast_runner_routing.py).
++    # fork: a cancel here fails the required aggregate (execution is required even though the
++    # findings are advisory), so keep the fast-lane cap (tests/ci/test_fast_runner_routing.py).
++    # The checkout below is depth 1 plus a commits-only history fetch, not fetch-depth 0.
+     timeout-minutes: 10
+     outputs:
+       changed: ${{ steps.diff.outputs.changed }}
+@@ -53,18 +53,25 @@ jobs:
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
+           ref: ${{ inputs.commit }}
+-          fetch-depth: 0 # need history for the merge base
+-          # fork: commits+trees only; the two lockfile blobs are fetched lazily (credentials persist).
+-          filter: blob:none
++
++      # fork: commits only, not fetch-depth 0; the two lockfile blobs are fetched lazily
++      # (credentials persist).
++      - name: Fetch the merge base
++        id: merge-base
++        uses: ./.github/actions/fetch-merge-base
++        with:
++          base: ${{ github.base_ref }}
+ 
+       - name: Generate semantic lockfile diff
+         id: diff
++        env:
++          BASE_SHA: ${{ steps.merge-base.outputs.sha }}
+         run: |
+           set -euo pipefail
+           # Three-dot semantics by hand: diff from the merge base with the
+           # target branch to the PR head, so changes that landed on main
+           # after the branch point don't show up as this PR's doing.
+-          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
++          : "${BASE_SHA:?no merge base with the target branch}"
+           echo "Merge base: ${BASE_SHA}"
+           python3 scripts/ci/lockfile_diff.py \
+             --base "$BASE_SHA" \
+diff --git a/.github/workflows/prompt-surface-diff.yml b/.github/workflows/prompt-surface-diff.yml
+index 0a421fd4b44..fe64a75d67e 100644
+--- a/.github/workflows/prompt-surface-diff.yml
++++ b/.github/workflows/prompt-surface-diff.yml
+@@ -41,9 +41,9 @@ jobs:
+   diff:
+     name: Prompt surface summary
+     runs-on: [self-hosted, ci-fast]
+-    # fork: a full-history fetch of this ~1 GB private repo on a fresh ci-fast runner can exceed
+-    # 5 min; a cancel here fails the required aggregate (execution is required even though the
+-    # findings are advisory). 10 is the fast-lane cap (tests/ci/test_fast_runner_routing.py).
++    # fork: a cancel here fails the required aggregate (execution is required even though the
++    # findings are advisory), so keep the fast-lane cap (tests/ci/test_fast_runner_routing.py).
++    # The checkout below is depth 1 plus a commits-only history fetch, not fetch-depth 0.
+     timeout-minutes: 10
+     outputs:
+       changed: ${{ steps.diff.outputs.changed }}
+@@ -53,23 +53,35 @@ jobs:
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
+           ref: ${{ inputs.commit }}
+-          fetch-depth: 0 # need history for the merge base
+           persist-credentials: false
+ 
++      # Merge base, not the base tip: surface changes that landed on main after the branch point
++      # are not this PR's doing. fork: a fetch-depth 0 checkout (every head, tag and blob) ran past
++      # the timeout on slow ci-fast runners; this fetches only the two histories' commits.
++      - name: Fetch the merge base
++        id: merge-base
++        uses: ./.github/actions/fetch-merge-base
++        with:
++          base: ${{ github.base_ref }}
++
+       - name: Summarise the snapshot diff
+         id: diff
+         env:
+-          BASE_REF: ${{ github.base_ref }}
++          BASE_SHA: ${{ steps.merge-base.outputs.sha }}
++          FETCH_TOKEN: ${{ github.token }}
+         run: |
+           set -euo pipefail
+-          # Merge base, not the base tip: surface changes that landed on main after the branch
+-          # point are not this PR's doing.
+-          BASE_SHA=$(git merge-base "origin/${BASE_REF}" HEAD)
++          : "${BASE_SHA:?no merge base with the target branch}"
+           SNAP=tests/fixtures/prompt_surface
++          # The base snapshot's trees and blobs are fetched lazily (partial clone) and the checkout
++          # persists no credentials: pass the token to these git commands only, never to the script.
++          auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')"
++          unset FETCH_TOKEN
+           mkdir -p "$RUNNER_TEMP/base"
+-          if git cat-file -e "${BASE_SHA}:${SNAP}" 2>/dev/null; then
+-            git archive "$BASE_SHA" "$SNAP" | tar -x -C "$RUNNER_TEMP/base"
++          if [ -n "$(git -c "$auth" ls-tree -d "$BASE_SHA" -- "$SNAP")" ]; then
++            git -c "$auth" archive "$BASE_SHA" "$SNAP" | tar -x -C "$RUNNER_TEMP/base"
+           fi
++          unset auth
+           python3 scripts/ci/prompt_surface.py diff "$RUNNER_TEMP/base/$SNAP" "$SNAP" \
+             --output "$RUNNER_TEMP/prompt-surface.md"
+           if [ -s "$RUNNER_TEMP/prompt-surface.md" ]; then
+diff --git a/.github/workflows/supply-chain-audit.yml b/.github/workflows/supply-chain-audit.yml
+index 1dde3eb787d..35fb857f67e 100644
+--- a/.github/workflows/supply-chain-audit.yml
++++ b/.github/workflows/supply-chain-audit.yml
+@@ -64,7 +64,14 @@ jobs:
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
+           ref: ${{ inputs.commit }}
+-          fetch-depth: 0
++
++      # fork: `git diff base...head` needs their merge base: fetch both histories' commits only,
++      # not fetch-depth 0's every head, tag and blob (trees and blobs load lazily).
++      - name: Fetch the merge base
++        uses: ./.github/actions/fetch-merge-base
++        with:
++          base: ${{ github.event.pull_request.base.sha }}
++          head: ${{ github.event.pull_request.head.sha }}
+ 
+       - name: Scan diff for critical patterns
+         id: scan
+@@ -168,7 +175,14 @@ jobs:
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+         with:
+           ref: ${{ inputs.commit }}
+-          fetch-depth: 0
++
++      # fork: `git diff base...head` needs their merge base: fetch both histories' commits only,
++      # not fetch-depth 0's every head, tag and blob (trees and blobs load lazily).
++      - name: Fetch the merge base
++        uses: ./.github/actions/fetch-merge-base
++        with:
++          base: ${{ github.event.pull_request.base.sha }}
++          head: ${{ github.event.pull_request.head.sha }}
+ 
+       - name: Check for unbounded PyPI deps
+         id: bounds
+diff --git a/tests/ci/test_fetch_merge_base.py b/tests/ci/test_fetch_merge_base.py
+new file mode 100644
+index 00000000000..f2b8346b1a8
+--- /dev/null
++++ b/tests/ci/test_fetch_merge_base.py
+@@ -0,0 +1,146 @@
++"""fetch-merge-base: a depth-1 checkout plus a commits-only fetch answers like a full clone.
++
++The CI jobs that need a merge base (prompt-surface-diff, lockfile-diff, history-check,
++contributor-check, lint's ruff + ty diff, supply-chain-audit) used `fetch-depth: 0`, which on the
++fork pulled every head, tag and blob and ran past the ci-fast timeouts. They now check out at depth
++1 and run .github/actions/fetch-merge-base. These tests drive its script against a local origin
++(file://, partial-clone filters allowed, as GitHub allows them) from a depth-1 clone.
++"""
++from __future__ import annotations
++
++import os
++import subprocess
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++SCRIPT = ROOT / ".github/actions/fetch-merge-base/fetch-merge-base.sh"
++
++pytestmark = pytest.mark.platforms("posix")
++
++GIT_ENV = {
++    "GIT_CONFIG_GLOBAL": os.devnull,
++    "GIT_CONFIG_NOSYSTEM": "1",
++    "GIT_AUTHOR_NAME": "a",
++    "GIT_COMMITTER_NAME": "c",
++    "GIT_COMMITTER_EMAIL": "c@example.com",
++}
++
++
++def git(cwd: Path, *args: str, email: str = "a@example.com") -> str:
++    env = {**os.environ, **GIT_ENV, "GIT_AUTHOR_EMAIL": email}
++    return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True,
++                          encoding="utf-8").stdout.strip()
++
++
++def commit(repo: Path, name: str, email: str = "a@example.com") -> str:
++    (repo / f"{name}.txt").write_text(name, encoding="utf-8")
++    git(repo, "add", f"{name}.txt")
++    git(repo, "commit", "-q", "-m", name, email=email)
++    return git(repo, "rev-parse", "HEAD")
++
++
++def run_script(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
++    env = {**os.environ, **GIT_ENV}
++    return subprocess.run(["bash", str(SCRIPT), *args], cwd=cwd, env=env, capture_output=True,
++                          encoding="utf-8", timeout=120, check=False)
++
++
++@pytest.fixture
++def origin(tmp_path: Path) -> Path:
++    """main: m1..m6. feature: f1 off m2, then merges m4 (a sync), then f2 and f3 by a new author."""
++    repo = tmp_path / "origin"
++    repo.mkdir()
++    git(repo, "init", "-q", "-b", "main")
++    git(repo, "config", "uploadpack.allowFilter", "true")
++    git(repo, "config", "uploadpack.allowAnySHA1InWant", "true")
++    for i in (1, 2):
++        commit(repo, f"m{i}")
++    git(repo, "checkout", "-q", "-b", "feature")
++    commit(repo, "f1")
++    git(repo, "checkout", "-q", "main")
++    for i in (3, 4):
++        commit(repo, f"m{i}")
++    git(repo, "checkout", "-q", "feature")
++    git(repo, "merge", "-q", "--no-edit", "main")
++    commit(repo, "f2", email="new@example.com")
++    commit(repo, "f3", email="new@example.com")
++    git(repo, "checkout", "-q", "main")
++    for i in (5, 6):
++        commit(repo, f"m{i}")
++    git(repo, "checkout", "-q", "--orphan", "unrelated")
++    git(repo, "rm", "-rq", "--cached", ".")
++    commit(repo, "u1")
++    git(repo, "checkout", "-q", "-f", "main")
++    return repo
++
++
++def checkout(origin: Path, tmp_path: Path, branch: str) -> Path:
++    """What actions/checkout does by default: depth 1, no tags, one ref."""
++    work = tmp_path / f"work-{branch}"
++    git(tmp_path, "clone", "-q", "--depth=1", "--no-tags", "--single-branch", "-b", branch,
++        origin.as_uri(), str(work))
++    assert git(work, "rev-parse", "--is-shallow-repository") == "true"
++    return work
++
++
++def test_merge_base_and_ranges_match_a_full_clone(origin, tmp_path):
++    work = checkout(origin, tmp_path, "feature")
++
++    result = run_script(work, "main")
++
++    assert result.returncode == 0, result.stderr
++    expected = git(origin, "merge-base", "main", "feature")
++    assert result.stdout.strip() == expected
++    assert git(work, "rev-parse", "refs/remotes/origin/main") == git(origin, "rev-parse", "main")
++    assert git(work, "rev-parse", "--is-shallow-repository") == "false"
++    # contributor-check's range walk sees exactly the PR's commits: the m3/m4 sync merged into the
++    # branch is reachable from the merge base, so it is not listed as the PR's work.
++    log = ["log", f"{expected}..HEAD", "--format=%s %ae", "--no-merges"]
++    assert git(work, *log) == git(origin, *log[:1], f"{expected}..feature", *log[2:])
++    assert git(work, *log).splitlines() == ["f3 new@example.com", "f2 new@example.com",
++                                            "f1 a@example.com"]
++
++
++def test_base_trees_and_blobs_load_on_first_use(origin, tmp_path):
++    """Commits only are fetched; archive/diff of the merge base still work (lazy fetch)."""
++    work = checkout(origin, tmp_path, "feature")
++    base = run_script(work, "main").stdout.strip()
++
++    assert git(work, "show", f"{base}:m4.txt") == "m4"
++    # m6 exists only on main past the merge base: its tree and blob were never fetched.
++    assert git(work, "show", "refs/remotes/origin/main:m6.txt") == "m6"
++    assert git(work, "diff", "--name-only", f"{base}...HEAD").splitlines() == [
++        "f1.txt", "f2.txt", "f3.txt"]
++
++
++def test_sha_inputs_fetch_a_head_the_checkout_lacks(origin, tmp_path):
++    """supply-chain-audit passes the PR's base and head shas; the checkout has neither."""
++    work = checkout(origin, tmp_path, "main")
++    base_sha = git(origin, "rev-parse", "main~1")
++    head_sha = git(origin, "rev-parse", "feature")
++
++    result = run_script(work, base_sha, head_sha)
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout.strip() == git(origin, "merge-base", base_sha, head_sha)
++
++
++def test_unrelated_histories_print_nothing_and_succeed(origin, tmp_path):
++    work = checkout(origin, tmp_path, "unrelated")
++
++    result = run_script(work, "main")
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == ""
++
++
++def test_a_fetch_failure_fails_rather_than_reading_as_unrelated(origin, tmp_path):
++    """history-check treats empty output as unrelated histories: an error must not look like it."""
++    work = checkout(origin, tmp_path, "feature")
++
++    result = run_script(work, "no-such-branch")
++
++    assert result.returncode != 0
++    assert result.stdout == ""
+-- 
+2.55.0
+

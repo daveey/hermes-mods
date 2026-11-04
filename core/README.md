@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1918 patches, one entry per non-merge source commit through `b9eaa8e842f5bc0c0e513e255f28a2df0850968c`.
+1923 patches, one entry per non-merge source commit through `ea651aab330ef51dc3ad565c763c993a0e654e11`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -22,12 +22,22 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `fd267bb3242a14c33d4899cffc60ee4be816f14d`; current merge-base: the same commit (the fork merged upstream `717447e`, `fbf6c6c`, `c314285` and `fd267bb` in `02df0dd38e8`, `95e40c5b81b`, `fe003ae5188` and `27576ed88c6`).
-Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523, 1549, 1627, 1822, 1823 and 1893, and four reviewed source-context bridges before 1824, 1828, 1866 and 1896 (a feature branch's pre-merge file version and two hand-resolved merge results; see [mirror-1918-verification.md](mirror-1918-verification.md)). Entries 1626, 1649 and 1656 are applied and tree-verified in their own source-parent contexts, then represented by explicit ancestry-only merge markers in the main replay. Their full patch bodies remain intact. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-Current replay: [mirror-replay-1918.json](mirror-replay-1918.json) (fourteen hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-1918.json](mirror-policy-1918.json). Executed checks: [mirror-1918-verification.md](mirror-1918-verification.md); previous snapshots: [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
+Upstream exclusion tip: `71736c9f32597bbca9d89cede5aa136e55946b2f`; current merge-base: `a66e74dc67097219b6bb1807d18459859125be62`.
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. The fourteen bridges from the 1918 pass remain unchanged; two upstream bridges are added before 1919 and 1922. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay.
+Current replay: [mirror-replay-1923.json](mirror-replay-1923.json) (sixteen hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-1923.json](mirror-policy-1923.json). Executed checks: [mirror-1923-verification.md](mirror-1923-verification.md); previous snapshots: [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1919–1923
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Desktop upstream compatibility](desktop-upstream-compat-1919-1922.md) | 1919, 1922 | Sibling SessionInfo/SDK exports; readiness and onboarding mocks. |
+| [Worker queue reasons and explicit origin repin](kanban-queue-reasons-repin.md) | 1920 | Revision-conflict retries and scoped creator-worker repins. |
+| [Credential read deny-list](credential-files-read-denylist.md) | 1921 | Sanitized skills mounts/sync and case-insensitive read denial. |
+| [Commit-only CI merge-base fetch](ci-fetch-merge-base.md) | 1923 | Full commit graph with lazy trees/blobs and explicit fetch failure. |
+| [1923-entry mirror verification](mirror-1923-verification.md) | verification report | Complete inventory, sixteen bridges, normalized tree and 216 targeted Python tests. |
 
 ## Mirror follow-ups 1822–1918
 
@@ -1059,16 +1069,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1918-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fourteen bridges and three ancestry-only markers from `mirror-replay-1918.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **1923-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply sixteen bridges and three ancestry-only markers from `mirror-replay-1923.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip b9eaa8e842f5bc0c0e513e255f28a2df0850968c \
-  --base fd267bb3242a14c33d4899cffc60ee4be816f14d \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-1918.json" \
-  --replay-plan "$MODS/core/mirror-replay-1918.json"
+  --source-tip ea651aab330ef51dc3ad565c763c993a0e654e11 \
+  --base 71736c9f32597bbca9d89cede5aa136e55946b2f \
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-1923.json" \
+  --replay-plan "$MODS/core/mirror-replay-1923.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1120,6 +1130,12 @@ git am -3 --empty=keep "${patches[@]:1892:3}"
 git apply --index --3way "$MODS/core/bridges/resolution-04bc5b36944.diff"
 git commit --allow-empty -m 'Merge-resolution bridge before 1896'
 git am -3 --empty=keep "${patches[@]:1895:23}"
+git apply --index --3way "$MODS/core/bridges/upstream-958df18a746.diff"
+git commit -m 'Explicit upstream merge bridge before 1919'
+git am -3 --empty=keep "${patches[@]:1918:3}"
+git apply --index --3way "$MODS/core/bridges/upstream-ced18437aa5.diff"
+git commit -m 'Explicit upstream merge bridge before 1922'
+git am -3 --empty=keep "${patches[@]:1921:2}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

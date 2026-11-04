@@ -46,6 +46,34 @@ Apply as part of the full series with the README **Applying** recipe; these patc
 No: these change core modules that plugins cannot hook.
 
 
+## Follow-up 1920: revision retries and creator-worker repins
+
+Patch **1920** (`3d1c392baf80`).
+
+### Behavior
+
+A revision conflict triggers a Board pull and eligibility recheck before retrying, with at most three CAS attempts. A creator worker can use the `kanban_move` tool to repin its own task's unstarted worker-first card to the origin, without ending the creator's run.
+
+### How it works
+
+`repin_to_origin` retries only `revision_conflict`, not other refusals. `kanban_creator_repin` checks creation ownership and worker-first eligibility before calling the existing queued-move path. Running cards, unrelated cards and cards without the policy are refused.
+
+### Code
+
+`hermes_cli/kanban_worker_repin.py`, `hermes_cli/kanban_creator_repin.py`, `tools/kanban_tools.py`, `tools/kanban_tools_schemas.py`.
+
+### Tests
+
+The 1923 mirror pass ran `tests/hermes_cli/test_kanban_worker_repin.py` (33 passed) and `tests/tools/test_kanban_creator_repin.py` (4 passed). The former covers retry-after-pull and changed eligibility; the latter calls the tool entry and covers creator success and the three scope refusals. A live Board network transaction was not rerun.
+
+### Applying
+
+Use the full README replay. Existing worker-first placement modules are prerequisites.
+
+### Gotchas
+
+This grants an explicit origin repin, not arbitrary movement of another card. Transport failures still report an unknown outcome rather than claiming no mutation.
+
 ## Follow-up 1886, 1887, 1894, 1897, 1913: worker-first repins from kanban_move and repin notices
 
 Patches: **1886** (`7a38123856`, `fix(kanban): origin applies a worker's kanban_move of a worker-first card as a Board repin; back off on not_claimable [daveey]`), **1887** (`aef5b17d58`, `fix(kanban): kanban_move --reclaim of a worker-first card is a repin request too; tolerate a local record failure after a Board repin; prune expired not_claimable backoffs [daveey]`), **1894** (`73ee883f89`, `[daveey] worker-placement: a not_claimable reserve lost to the reserved worker's claim is a pickup, not a refusal`), **1897** (`cccf2477fa`, `[daveey] worker-placement: a no_eligible_worker card tells its owner the repin command once per revision`), **1913** (`7fd3c049e8`, `[daveey] worker-placement: repin notice also fires for the overflow-off capability_mismatch/mixed rollup over the whole pool (#822)`). Mirrored in the 1822–1918 pass ([mirror-1918-verification.md](mirror-1918-verification.md)).

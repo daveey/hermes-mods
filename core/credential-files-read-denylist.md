@@ -32,7 +32,35 @@ Apply as part of the full series with the README **Applying** recipe; these patc
 
 ## Gotchas
 
-- None recorded beyond the source commit messages.
+- Read-deny matching intentionally over-blocks case variants even on case-sensitive filesystems. Write guards are unchanged.
+
+## Follow-up 1921: sanitized skills mounts and sync
+
+Patch **1921** (`62c90b6d51de`) also withholds read-denied files from skills mounts and per-file synchronization.
+
+### Behavior
+
+Skills trees containing symlinks, `.hub` caches or denied files use a sanitized copy. Per-file enumeration omits denied files too. Missing or raising guards fail closed. Each source directory keeps its own copy; refresh preserves the mount directory instead of deleting a live mount's contents.
+
+### How it works
+
+The walker checks the root and candidate names derived from all read-deny rules and resolved symlink-target basenames. Casefolded name comparisons cover alternate-case stores and resolved skills cache roots. Refresh uses atomic replacement and nanosecond timestamps, handling file/directory type changes and read-only files.
+
+### Code
+
+`agent/file_safety.py`, `tools/credential_files.py`, `tools/environments/docker.py`.
+
+### Tests
+
+The 1923 mirror pass ran `tests/agent/test_file_safety_credentials.py` (24 passed), `tests/tools/test_credential_files.py` (66 passed) and `tests/tools/test_docker_environment.py` (84 passed). These cover case variants, symlink targets, mount filtering, sync enumeration, separate roots, in-place refresh, unavailable guards and mount-failure isolation. Docker tests use fixtures; a live container integration was not rerun.
+
+### Applying
+
+Use the full README replay, including its upstream bridges. The patch is not independently certified.
+
+### Gotchas
+
+This is read-path hardening, not a change to write guards. Do not replace the sanitized mount directory while containers still use it.
 
 ## Plugin?
 
