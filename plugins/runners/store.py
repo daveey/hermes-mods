@@ -15,6 +15,15 @@ collector runs prune at most hourly.
 retire_runner(id,at=...): replace registration with compact identity tombstone;
 ephemeral/JIT raw observations and their transitions are compacted immediately.
 Audits/active incidents are retained independently. tombstone(id) reads that marker.
+A retired id is never re-put (retired_identity); provider runner ids are not reused.
+Absence retirement (the only automatic retire_runner caller, collector.py): a Runner
+is retired when its scope's enumeration this cycle is complete and does not list it,
+health is `missing` (absent from >=2 complete enumerations), its last put (= last
+provider listing) is older than collector.RETIRE_AFTER (1 h), it has no host_id or
+config binding, and no active Job/Repair names it. Its empty investigation context
+is resolved with it (normal resolved-incident retention). Health state stays until
+the tombstone expires. Nothing else deletes Runner rows.
+put_times(kind): {record_key: last put epoch} for every record of a kind.
 
 Schema v1 is additive from v0 (unversioned databases). Schema v2 adds the
 runner_entity index (kind, payload entity_id, updated_at) for per-entity history
@@ -239,6 +248,10 @@ class Store:
         return [json.loads(row[0]) for row in self.connection.execute(
             'SELECT payload FROM runner_records WHERE kind=? ORDER BY record_key LIMIT ?', (kind, limit))]
 
+    def put_times(self, kind):
+        return dict(self.connection.execute(
+            'SELECT record_key, updated_at FROM runner_records WHERE kind=?', (kind,)))
+
     def tombstone(self, runner_id):
         row = self.connection.execute('SELECT payload FROM runner_tombstones WHERE record_key=?', (runner_id,)).fetchone()
         return json.loads(row[0]) if row else None
@@ -260,13 +273,13 @@ class Store:
             self.connection.execute('INSERT INTO runner_tombstones VALUES (?,?,?)', (runner_id, json.dumps(marker), stamp))
             self.connection.execute("DELETE FROM runner_records WHERE kind='Runner' AND record_key=?", (runner_id,))
             if runner['lifecycle'] in ('ephemeral', 'jit'):
-                ids = []
-                for key, payload in self.connection.execute("SELECT record_key,payload FROM runner_records WHERE kind='Observation'"):
-                    if json.loads(payload)['entity_id'] == runner_id:
-                        ids.append(key)
+                # runner_entity index; absence retirement may call this per tick.
+                ids = [row[0] for row in self.connection.execute(
+                    f"SELECT record_key FROM runner_records WHERE kind='Observation' AND {ENTITY}=?", (runner_id,))]
                 transitions = []
                 observation_ids = set(ids)
-                for key, payload in self.connection.execute("SELECT record_key,payload FROM runner_records WHERE kind='Transition'"):
+                for key, payload in (self.connection.execute(
+                        "SELECT record_key,payload FROM runner_records WHERE kind='Transition'") if ids else ()):
                     if json.loads(payload)['observation_id'] in observation_ids:
                         transitions.append(key)
                 self.connection.executemany("DELETE FROM runner_records WHERE kind='Observation' AND record_key=?", ((key,) for key in ids))

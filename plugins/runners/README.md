@@ -336,6 +336,16 @@ are refused forever (no lease expiry or takeover). Rate limits per source and gl
   tombstones 30 days. Active records never expire. Ephemeral/JIT retirement compacts
   observations; audit is independent. Retention uses last write time: collectors
   must not rewrite unchanged observations just to refresh timestamps.
+- Absence retirement is the collector's only automatic `retire_runner` call. A runner
+  is retired when its scope's enumeration this cycle is complete and omits it, its
+  health is `missing` (absent from at least 2 complete enumerations), it was last
+  listed (its last put) more than `collector.RETIRE_AFTER` (1 h) ago, it has no
+  `host_id` or config binding, and no active Job or Repair names it. Its empty
+  investigation context is resolved with it. Ephemeral CI VMs register a new runner
+  per job, and without this policy the store kept every one of them. A retired id is
+  never re-put; GitHub never reuses runner ids, so a listing for one is skipped
+  instead of failing the tick. Nothing else deletes Runner rows. The collector reads
+  runners with the unbounded `active('Runner')`, never the capped `list()`.
 - `save_health/load_health` persist pure reducer State across collector restarts.
   Commit the reducer state and related observations in one outer transaction.
 

@@ -19,6 +19,9 @@ from .probes.lifecycle import valid_timestamp
 
 
 PRUNE_INTERVAL = 3600
+# Absence retirement (Store docstring): an unbound runner the provider stopped
+# listing is retired once its last listing is this old.
+RETIRE_AFTER = 3600
 
 
 def ident(prefix='obj'):
@@ -177,8 +180,12 @@ def initialize(store):
 class Collector:
     def __init__(self, store, config, adapter, *, clock=time.time, host_probe=None,
                  max_scopes=16, tick_budget=20, monotonic=time.monotonic,
-                 job_repositories=None, max_job_scopes=2, repair_service=None):
+                 job_repositories=None, max_job_scopes=2, repair_service=None,
+                 retire_after=RETIRE_AFTER):
         self.store, self.config, self.adapter, self.clock = store, config, adapter, clock
+        if type(retire_after) not in (int, float) or retire_after <= 0:
+            raise ValueError('invalid_retire_after')
+        self.retire_after = retire_after
         self.repair_service = repair_service
         self._repair_checked_at = None
         self._pruned_at = None
@@ -225,6 +232,39 @@ class Collector:
                 'INSERT INTO collector_cache VALUES (?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload',
                 ('provider_budget', json.dumps(state)))
 
+    def _runners(self):
+        # Unbounded and key-ordered: list() caps at 1000 rows and would hide
+        # (and drop host_id mappings of) every runner whose key sorts later.
+        return sorted(self.store.active('Runner'), key=lambda r: r['id'])
+
+    def _retirable(self, row, state, listed_at, now):
+        """Absence retirement: confirmed missing (>=2 complete enumerations without
+        it), last listed more than retire_after ago, and never a bound runner."""
+        if state.registration != 'missing' or listed_at is None or now - listed_at < self.retire_after:
+            return False
+        return not (row.get('host_id') or any(b['runner_id'] == row['id'] for b in self.config['bindings']))
+
+    def _retire(self, ids, now):
+        from .store import StoreError
+        retired = []
+        for rid in ids:
+            try:
+                self.store.retire_runner(rid, at=now)
+            except StoreError as error:
+                if error.args == ('active_work',):
+                    continue  # active Job/Repair keeps the registration
+                raise
+            retired.append(rid)
+        if retired:
+            gone = set(retired)
+            # Only the empty investigation context goes; incidents with
+            # transitions and other dimensions are retained independently.
+            for incident in self.store.active('Incident'):
+                if (incident['entity_id'] in gone and incident['dimension'] == 'investigation'
+                        and not incident['transitions']):
+                    self.store.put('Incident', dict(incident, resolved_at=iso(now), last_seen=iso(now)), at=now)
+        return retired
+
     def owner(self):
         return {k:self.config[k] for k in ('owner_gateway_id','owner_profile','owner_epoch','config_revision')}
 
@@ -232,7 +272,7 @@ class Collector:
         scopes, hosts = set(), set()
         if not targets:
             return {s['id'] for s in self.config['scopes']}, {h['id'] for h in self.config['hosts']}
-        runners = {r['id']:r for r in self.store.list('Runner')}
+        runners = {r['id']:r for r in self._runners()}
         for target in targets:
             if target in runners:
                 scopes.add(runners[target]['scope_id'])
@@ -322,7 +362,7 @@ class Collector:
             return saved.get('served_at', saved.get('attempted_at', -1e20)
                              if saved.get('error') not in ('budget_deferred', 'cycle_budget') else -1e20)
         due.sort(key=lambda s:(served_at(s), s['id']))
-        populated = {r['scope_id'] for r in self.store.list('Runner')}
+        populated = {r['scope_id'] for r in self._runners()}
         # Refresh is a fair service lane, not an unbounded priority override.
         lane_order = ('active', 'discovery', 'refresh')
         lanes = {
@@ -382,7 +422,7 @@ class Collector:
         for scope, inventory in candidates[:self.max_job_scopes]:
             if self.monotonic() >= deadline:
                 break
-            recent = [row['provider_runner_id'] for row in self.store.list('Runner')
+            recent = [row['provider_runner_id'] for row in self._runners()
                       if row['scope_id'] == scope['id'] and row['activity'] == 'busy']
             jobs = self.adapter.enrich_jobs(scope, inventory.rows,
                 allowed_repositories=self.job_repositories[scope['id']], recent_runner_ids=recent)
@@ -414,8 +454,10 @@ class Collector:
                     evidence_summary='Bounded fixed SSH management probe',
                     error_class=None if evidence['management']=='reachable' else 'network'), at=now)
                 evidence['observation_ids'] = [oid]
-            old = self.store.list('Runner')
+            old = self._runners()
             identities = {(r['scope_id'], r['provider_runner_id']): r for r in old}
+            listed_at = self.store.put_times('Runner')
+            retire = []
             coverage, provenance, errors = [], [], []
             for scope, result in results:
                 sid = scope['id']
@@ -436,6 +478,10 @@ class Collector:
                     row.pop('readiness_evidence', None)
                     row.pop('operational_evidence', None)
                     previous = identities.get((sid, row['provider_runner_id']))
+                    if previous is None and self.store.tombstone(row['id']) is not None:
+                        # Retired identities are never re-put (Store contract) and
+                        # GitHub never reuses a runner id: skip, don't fail the tick.
+                        continue
                     row['host_id'] = None
                     if previous:
                         row['id'] = previous['id']
@@ -461,6 +507,9 @@ class Collector:
                         continue
                     state = advance(self.store.load_health(row['id']), Sample(cycle, result.observed_at, None, complete=result.complete, error=result.error), now=now, policy=policy, healthy=False)
                     self.store.save_health(row['id'], state)
+                    if result.complete and self._retirable(row, state, listed_at.get(row['id']), now):
+                        retire.append(row['id'])
+            self._retire(retire, now)
             complete=True
             for scope in scopes:
                 sid=scope['id']; saved=self.scope_results.get(sid)
@@ -476,7 +525,7 @@ class Collector:
                 complete &= saved['complete'] and fresh
                 if saved['error']:
                     errors.append(dict(source_id=sid,code=saved['error'],retry_after_seconds=saved.get('retry_after_seconds'),observed_at=iso(saved['attempted_at'])))
-            rows = self.store.list('Runner')
+            rows = self._runners()
             # An investigation context is not a failure assertion. Persist its
             # identity once so repeated clicks/reloads share the same context,
             # including online or readiness-unverified registrations.
