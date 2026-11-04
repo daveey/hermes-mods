@@ -55,6 +55,36 @@ class Provenance(unittest.TestCase):
         self.assertEqual(g.classify_fix(text), 'root-cause')
         self.assertTrue(g.classify('why do you keep asking me?'))
 
+    def test_later_turn_of_a_probe_session_is_flagged_for_the_lane(self):
+        """agent-43f47d4029: the probe session lives on another host, so the hub lane cannot look up its first turn;
+        the ask-gate reads it from the digest and sends it along, and the lane skips the hit as a probe."""
+        import json
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            p = Path(directory) / 'macbook' / 'default'
+            p.mkdir(parents=True)
+            (p / 's.json').write_text(json.dumps({
+                'id': 'probe-s', 'source': 'desktop', 'host': 'macbook', 'user_turns': [
+                    {'t': 100, 'text': '[selfheal-probe] Live check of the approval gate'},
+                    {'t': 101, 'text': 'Do what is needed, dont ask me.'},
+                ]}))
+            (p / 'r.json').write_text(json.dumps({
+                'id': 'real-s', 'source': 'desktop', 'host': 'macbook', 'user_turns': [
+                    {'t': 100, 'text': 'check the coach db'},
+                    {'t': 102, 'text': 'Do what is needed, dont ask me.'},
+                ]}))
+            hits, _ = g.collect(directory, 0, 200)
+            by = {h['session']: h for h in hits}
+            self.assertTrue(by['probe-s'].get('probe'))
+            self.assertFalse(by['real-s'].get('probe'))
+            filed = []
+            owned, rest = g.route_hits(hits, Path(directory) / 'nohome',
+                                       filer=lambda d: filed.append(d) or {"action": "would_file"})
+            sh = g._coach_mod('self_heal')
+            got = {d['session_id']: sh.probe_defect(d) for d in filed}
+            self.assertEqual(got, {'probe-s': True, 'real-s': False})
+
 
 if __name__ == '__main__':
     unittest.main()

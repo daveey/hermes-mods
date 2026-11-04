@@ -158,8 +158,18 @@ def probe_session(session_id: str, ask: str = "", home: Optional[Path] = None) -
 
 
 def probe_defect(d: dict) -> bool:
-    """A defect payload from a probe: an explicit `probe` flag (set by another host), else the session lookup."""
-    return bool(d.get("probe")) or probe_session(str(d.get("session_id") or ""))
+    """A defect payload from a probe. The session lookup reads only THIS host's state.db, so a payload about a session
+    on another host (the hub's ask-gate reading MacBook digests) carries its own evidence (agent-43f47d4029): an
+    explicit `probe` flag, the session's `first_user` turn, or a `quote` that is itself the marked opener (also when
+    it survives only as the quoted text in `symptom`). Any of them -> probe; else the local session lookup."""
+    if d.get("probe"):
+        return True
+    sym = str(d.get("symptom") or "")
+    quoted = sym.split('"', 1)[1] if '"' in sym else ""
+    for text in (d.get("first_user"), d.get("quote"), quoted):
+        if isinstance(text, str) and text and PROBE_RE.match(clean_user(text) or ""):
+            return True
+    return probe_session(str(d.get("session_id") or ""))
 
 ADMIT_RE = re.compile(
     r"\b(my mistake|my (?:bad|fault|error)|that was (?:my|a) mistake|i (?:was wrong|missed|forgot|skipped|"

@@ -42,6 +42,10 @@ SKIP = re.compile(
 GENERATED = re.compile(
     r'^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe)\]|'
     r'\{\s*"item"\s*:)|\(Roleplay test of our reply checker', re.I)
+# Same marker as plugins/coach/self_heal.py PROBE_RE: a session opener that marks a deliberate detector probe.
+PROBE = re.compile(r"^\s*(?:\[selfheal-probe\]|Live test of a detector\b)", re.I)
+
+
 def generated(text):
     # Operator notes can carry a human's words even with an "another session"
     # stamp. Without writer provenance, retain them for individual review.
@@ -224,6 +228,11 @@ def collect(data, since_ts, until_ts):
         if st and (first_ts is None or st < first_ts):
             first_ts = st
         turns = d.get("user_turns") or []
+        # A deliberate detector probe opens with `[selfheal-probe]`; its later turns are scripted too. The lane that
+        # files the hit may run on another host than the session (no state.db row there), so the hit carries the
+        # opener and a probe flag (agent-43f47d4029). Digests keep the first user turns, so turns[0] is the opener.
+        first = clean((turns[0].get("text") if turns and isinstance(turns[0], dict) else "") or "")
+        probe = bool(PROBE.match(first))
         for i, u in enumerate(turns):
             t, text = u.get("t", 0), clean(u.get("text") or "")
             if not (since_ts <= t < until_ts) or not text or generated(text) or SKIP.match(text):
@@ -248,7 +257,8 @@ def collect(data, since_ts, until_ts):
                 continue
             seen.add(key)
             hits.append({"t": t, "session": d.get("id"), "host": d.get("host"), "source": d.get("source"),
-                         "class": cls, "pattern": kind, "quote": text})
+                         "class": cls, "pattern": kind, "quote": text,
+                         **({"probe": True, "first_user": first[:300]} if probe else {})})
     hits.sort(key=lambda h: h["t"])
     return hits, scanned
 
@@ -523,6 +533,8 @@ def route_hits(hits, home, filer=None, signals=None, detected=None):
         m = hit_defect(h)
         d = signals.monitor_defect(m, host=h.get("host"))
         d.update(session_id=m["session_id"], quote=m["quote"], hit_t=h.get("t"))  # hit_t: still_flags at drain
+        if h.get("probe"):  # the lane's own lookup cannot see another host's session: send the evidence along
+            d.update(probe=True, first_user=h.get("first_user") or "")
         try:
             res = (filer or _coach_mod("self_heal").file_defect)(d)
         except Exception as e:

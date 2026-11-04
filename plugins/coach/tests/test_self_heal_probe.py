@@ -233,3 +233,42 @@ def test_pre_llm_call_complaint_from_a_probe_session_is_skipped(store, monkeypat
     hooks["pre_llm_call"](session_id=PROBE_SID, user_message="it is still broken")
     assert events(store, "selfheal_would_file") == []
     assert events(store, "selfheal_skip")[-1]["why"] == "probe"
+
+
+# ── cross-host payloads (agent-43f47d4029): the session lives on another host, so this host's state.db has no row ──
+XHOST_QUOTE = "[selfheal-probe] Standing order from me, same as on 10-25: Do what is needed, dont ask me."
+
+
+def xhost(**kw):
+    return {**defect("local-14d2-macbook-only"), "host": "macbook", **kw}
+
+
+def test_cross_host_probe_quote_is_skipped(store):
+    r = Runner()
+    out = sh.file_defect(xhost(quote=XHOST_QUOTE), store=store, m="live", runner=r, now=NOW, cfg={}, budget_fn=OPEN)
+    assert out == {"action": "skip", "why": "probe"} and r.creates() == []
+    assert events(store, "selfheal_skip")[-1]["session_id"] == "local-14d2-macbook-only"
+
+
+def test_cross_host_probe_first_user_is_skipped(store):
+    r = Runner()
+    d = xhost(quote="dont ask me, do what is needed", first_user="[selfheal-probe] run the ask-gate twice")
+    assert sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg={}, budget_fn=OPEN)["why"] == "probe"
+    assert r.creates() == []
+
+
+def test_cross_host_probe_is_dropped_on_deferred_retry(store):
+    r = Runner()
+    d = xhost(quote="dont ask me", first_user="[selfheal-probe] run the ask-gate twice")
+    sh._defer_investigation(d, {"action": "deferred", "retry_at": sh._iso(NOW + 60),
+                                "why": "self-heal concurrency limit reached"}, store)
+    out = sh.retry_deferred(store, now=NOW + 3600, filer=file_live(r))
+    assert r.creates() == [] and pending_rows(store) == 0
+    assert out and out[0]["action"] == "skip" and out[0]["why"] == "probe"
+
+
+def test_cross_host_ordinary_payload_still_files(store):
+    r = Runner()
+    d = xhost(quote="dont ask me, do what is needed", first_user="check the coach db for me")
+    assert sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg={}, budget_fn=OPEN)["action"] == "filed"
+    assert len(r.creates()) == 1
