@@ -291,7 +291,10 @@ def _session_user_msgs(session_id: str, query: str, keep: int = 30, recent: int 
 
 
 def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = "", *, structured: bool = False,
-              llm=None, users: list[str] | None = None) -> list[dict]:
+              llm=None, users: list[str] | None = None, whole_request: bool = False,
+              label_basis: list[str] | None = None) -> list[dict]:
+    """``whole_request``: each ask is a complete structured request (action_request), not an ask sentence, so
+    sentence-level screens (soft-instruction routing, "I can't" short-circuit) do not apply to its plan text."""
     ids = core.card_ids(" ".join(asks) + " " + reply)
     statuses = core.card_status(ids)
     led = ledger().relevant(session_id, limit=20)
@@ -315,7 +318,9 @@ def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = 
                               card_status=statuses, ledger_text=ledger_text, caps=caps,
                               reply=reply, llm=judge_mod.structured_llm(base, grounding) if structured else base,
                               ledger=[a for a in led if not a.get('retired')],
-                              soft=[core.is_soft_ask(a) for a in pending])
+                              soft=[False if whole_request else core.is_soft_ask(a) for a in pending],
+                              screen_incapability=not whole_request,
+                              label_basis=[label_basis[i] for i in remaining] if label_basis is not None else None)
     for v in verdicts:
         i = remaining[v['i']]
         retired[i] = {**v, 'i': i}
@@ -970,6 +975,77 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
 _AR_HELD: dict[tuple[str, str], int] = {}
 _AR_MAX_HOLDS = 2
 _AR_BLOCKING = ("already_answered", "agent_can_do")
+# Large-input policy for the rendered ActionRequest identity the judge reads (~6k tokens, sent at most twice
+# within the hook's budget). Structured fields (ids, limits, exclusions, outcomes, choices, source refs) come
+# first, each item clipped at _AR_ITEM_CAP and all of them together at half the cap; the plan markdown fills the
+# rest, head and tail kept around an explicit marker when it overflows. ANY clip or cut makes the identity
+# incomplete, and an incomplete identity cannot ground "David already approved exactly this": a repeat verdict on
+# it never holds (agent_can_do still does).
+AR_IDENTITY_CAP = 24000
+_AR_ITEM_CAP = 1500
+
+
+def _clip(value: Any, cap: int = _AR_ITEM_CAP) -> tuple[str, bool]:
+    s = " ".join(str(value if value is not None else "").split())
+    return (s, False) if len(s) <= cap else (s[:cap] + " [...]", True)
+
+
+def _typed(d: dict, key: str, typ: type) -> Any:
+    value = d.get(key)
+    return value if isinstance(value, typ) else typ()
+
+
+def _action_identity(args: dict, req: dict) -> tuple[str, bool]:
+    """The complete action identity of an ActionRequest publish, as judge input: (text, truncated).
+
+    Correctness cannot depend on where in the plan the distinguishing object, limits or provenance sit, so the
+    whole request is rendered (t_01a1a58fa1eb1ff5: a 600-char cut dropped a new study's object and budget, and a
+    reused "Stage B" label matched another study's approval)."""
+    cut = False
+    title, c = _clip(req.get("title"))
+    cut |= c
+    scope = _typed(req, "scope", dict)
+    lines = [title]
+    rid = args.get("requestId")
+    rid_s, c = _clip(rid, 80) if rid else ("(new)", False)
+    cut |= c
+    rev_s, c = _clip(args.get("expectedRevision"), 20)
+    cut |= c if "expectedRevision" in args else False
+    lines.append(f"ActionRequest kind {_clip(req.get('kind'), 20)[0]}; requestId {rid_s}"
+                 + (f"; expectedRevision {rev_s}" if "expectedRevision" in args else ""))
+
+    def section(name: str, items: list[str]) -> None:
+        nonlocal cut
+        if items:
+            lines.append(name + ":")
+            for it in items:
+                s, c = _clip(it)
+                cut |= c
+                lines.append("- " + s)
+
+    section("LIMITS", [f"{x.get('key')}: {x.get('value')}" + (" (permission required)" if x.get("permissionRequired")
+                                                              else "") if isinstance(x, dict) else str(x)
+                       for x in _typed(req, "limits", list)])
+    section("EXCLUSIONS", [str(x) for x in _typed(req, "exclusions", list)])
+    section("OUTCOMES", [f"{k}: {v}" for k, v in _typed(req, "outcomes", dict).items()])
+    section("CHOICES", [f"{x.get('label')} [{x.get('effect')}]" + (f": {x['explain']}" if x.get("explain") else "")
+                        if isinstance(x, dict) else str(x) for x in _typed(req, "choices", list)])
+    section("SOURCE REFS", [" ".join(f"{k}={x[k]}" for k in ("type", "id", "board", "profile", "gatewayId") if x.get(k))
+                            if isinstance(x, dict) else str(x) for x in _typed(scope, "sourceRefs", list)])
+    head = "\n".join(lines)
+    if len(head) > AR_IDENTITY_CAP // 2:
+        head = head[:AR_IDENTITY_CAP // 2] + "\n[... structured fields cut by ask-gate's size cap ...]"
+        cut = True
+    plan = str(scope.get("markdown") or "").strip()
+    if plan:
+        room = max(AR_IDENTITY_CAP - len(head) - 120, 2000)
+        if len(plan) > room:
+            keep_head, keep_tail = room * 2 // 3, room // 3
+            plan = (plan[:keep_head] + f"\n[... {len(plan) - keep_head - keep_tail} chars of scope omitted by "
+                    "ask-gate's size cap ...]\n" + plan[-keep_tail:])
+            cut = True
+        head += f"\nSCOPE (complete={bool(scope.get('complete'))}):\n" + plan
+    return head, cut
 
 
 def _action_request_gate(session_id: str, args: dict) -> dict | None:
@@ -986,7 +1062,7 @@ def _action_request_gate(session_id: str, args: dict) -> dict | None:
     plan = str(scope.get("markdown") or "").strip()
     if not title and not plan:
         return None
-    ask = (title + (": " + plan[:600] if plan else "")).strip()
+    ask, truncated = _action_identity(args, req)
     key = (session_id, core.text_hash(title or plan))
     if _AR_HELD.get(key, 0) >= _AR_MAX_HOLDS:
         core.log_event("action_request_released", session=session_id, title=title[:160], holds=_AR_HELD[key])
@@ -996,7 +1072,9 @@ def _action_request_gate(session_id: str, args: dict) -> dict | None:
     verdicts, errors = None, []
     for name, llm in [("configured", None)] + list(FALLBACKS()):
         try:
-            verdicts = run_judge(session_id, [ask], tools, ask, llm=llm, users=users)
+            verdicts = run_judge(session_id, [ask], tools, "(the ask above is the complete ActionRequest)",
+                                 llm=llm, users=users, whole_request=True,
+                                 label_basis=[title + "\n" + plan])
             break
         except judge_mod.JudgeUnavailable as e:
             errors.append((name, str(e)))
@@ -1004,21 +1082,29 @@ def _action_request_gate(session_id: str, args: dict) -> dict | None:
         core.log_event("action_request_judge_unavailable", session=session_id, title=title[:160], errors=errors)
         return None
     hits = [v for v in verdicts if v.get("verdict") in _AR_BLOCKING]
+    if truncated and any(v.get("verdict") == "already_answered" for v in hits):
+        core.log_event("action_request_repeat_unproven", session=session_id, title=title[:160], chars=len(plan),
+                       reasons=[v.get("reason", "") for v in hits if v.get("verdict") == "already_answered"])
+        hits = [v for v in hits if v.get("verdict") != "already_answered"]
     if not hits:
-        core.log_event("action_request_judged", session=session_id, title=title[:160],
+        core.log_event("action_request_judged", session=session_id, title=title[:160], truncated=truncated,
                        verdicts=[(v["verdict"], v.get("reason", "")) for v in verdicts])
         return None
     _AR_HELD[key] = _AR_HELD.get(key, 0) + 1
-    q = _words(ask)
-    quote = max(users, key=lambda m: len(q & _words(m)), default="") if users else ""
     core.log_event("action_request_held", session=session_id, title=title[:160], hold=_AR_HELD[key],
-                   verdicts=[(v["verdict"], v.get("reason", "")) for v in hits])
+                   verdicts=[(v["verdict"], v.get("reason", ""), v.get("equivalence")) for v in hits])
     lines = [f"ask-gate: action_request \"{title[:160]}\" not published (David has NOT seen it)."]
     for v in hits:
         lines.append(f"- {v['verdict']}: {judge_mod._ADVICE.get(v['verdict'], '')}. {v.get('reason', '')}"
                      + (f" Do this: {v['how']}." if v.get("how") else ""))
-    if quote and q & _words(quote):
-        lines.append(f"David's own words in this chat: \"{quote[:300]}\"")
+        eq: dict = _typed(v, "equivalence", dict)
+        src, req_q = str(eq.get("source_quote") or ""), str(eq.get("request_quote") or "")
+        if src:
+            # The verdict's own validated evidence, never a message picked by word overlap.
+            lines.append(f"  Source evidence ({eq.get('source') or 'unknown'}): \"{src[:300]}\""
+                         + (f", matched to this request's \"{req_q[:200]}\"" if req_q else ""))
+        else:
+            lines.append("  Source evidence: unavailable (the judge cited no verbatim source for this verdict).")
     lines.append("If David already asked for this change in this chat, or you can do it yourself, do the work now "
                  "within the limits he set; do not publish an approval for it. Publish again only if the request is "
                  "a genuinely new decision (new spend, scope or risk he has not covered), and say in the scope what "
