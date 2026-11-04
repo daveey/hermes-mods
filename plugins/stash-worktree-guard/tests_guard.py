@@ -1092,6 +1092,68 @@ def test_external_wrapper_state_refusal_controls(multi, template):
     _assert_real_restore(template.format(wt=wt), main, wt)
 
 
+@pytest.mark.parametrize("cmd", [
+    'TP=$(echo x); env -i A=1 $TP -c x; $TP -m pip list',
+    '''cd ~/code/_wt/v111-verify; TP=$(timeout 60 scripts/run-in-hermes-env /usr/bin/env 2>/dev/null | sed -n 's/^__HERMES_TEST_PYTHON=//p'); echo "TP=$TP"; $TP -c 'import sys, pytest, httpx; print(sys.version.split()[0], "pytest", pytest.__version__)'; S=~/.hermes/cache/scratch/v111_vf/pt92; env -i PYTHONPATH=$S/site $TP -c 'import pytest, pluggy; print("overlay", pytest.__version__, pytest.__file__.split("/")[-3], "pluggy", pluggy.__version__)'; $TP -m pip list 2>/dev/null | grep -iE '^pytest|pluggy|anyio' | head -8 || ls $(dirname $TP)/../lib/python3*/site-packages | grep -iE '^pytest' | head''',
+    'TP=$(echo x); S=/tmp; env -i PYTHONPATH=$S/site "$TP" -c x; "$TP" -m pip list',
+], ids=["A1", "A2", "A3"])
+def test_opaque_child_unknown_interpreter_allow(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, str(main)) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "env A=1 sh -c 'echo W2FsaWFzXQoJcCA9IHN0YXNoIHBvcAo= | base64 -d >> .git/config'; G=$(echo x); $G p",
+    'TP=$(echo x); env -i A=1 $TP -c x; $TP stash pop',
+    'TP=$(echo x); env -i A=1 $TP -c x; git p',
+], ids=["R2", "R3", "R4"])
+def test_opaque_child_unknown_interpreter_refuse(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, str(main))
+
+
+@pytest.mark.parametrize("evidence", [
+    'stash', 'pop', 'apply', '.GiT/CoNfIg', 'GiT CoNfIg', 'ALIAS.p', '[ALIAS]', 'INCLUDE', 'git_config',
+])
+def test_opaque_child_unknown_name_keeps_whole_text_evidence(multi, evidence):
+    main, _wt = multi
+    cmd = f'TP=$(echo x); env -i A=1 $TP -c x; $TP p; echo {shlex.quote(evidence)}'
+    assert guard.refuse_reason(cmd, str(main))
+
+
+@pytest.mark.parametrize("later", [
+    '$TP "$ARGS"',  # independently unknown argv must still refuse
+    'HOME=/somewhere $TP p',  # explicit environment uncertainty, not just the child
+    '$TP git p',  # literal Git in a suffix is not the unknown-name-as-git reading
+])
+def test_opaque_child_does_not_relax_other_uncertainty(multi, later):
+    main, _wt = multi
+    assert guard.refuse_reason(f'TP=$(echo x); env -i A=1 $TP -c x; {later}', str(main))
+
+
+@pytest.mark.parametrize("evidence,refused", [('', False), ('include', True)])
+def test_child_alias_unknown_name_evidence_gate(tmp_path, evidence, refused):
+    analyzer = guard._Analyzer(evidence)
+    analyzer.child_alias = True
+    analyzer.child_alias_source = 'opaque runner child'
+    state = guard._State(str(tmp_path), {'HOME': analyzer.home0}, {'HOME'}, {})
+    analyzer.shadow_argv(['$TP', 'p'], state, 0, as_git=True, unknown_command='$TP p')
+    restores = [c for c in analyzer.calls if c[1] == 'stash']
+    assert bool(restores) is refused
+    if refused:
+        assert 'opaque runner child' in restores[0][3]
+        assert '$TP p' in restores[0][3]
+
+
+def test_opaque_child_alias_diagnostic(multi):
+    main, _wt = multi
+    reason = guard.refuse_reason('TP=$(echo x); env -i A=1 $TP -c x; git p', str(main))
+    assert 'env -i A=1 $TP -c x' in reason
+    assert 'git p' in reason
+    assert 'alias' in reason
+    assert 'Quote it' not in reason
+
+
 def test_ansi_c_quote_cannot_hide_substitution(multi):
     main, wt = multi
     cmd = "echo $'it\\'s'\"$(git -C " + str(wt) + " stash pop)\"$'it\\'s'"

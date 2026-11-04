@@ -1250,8 +1250,15 @@ def _restore_evidence(text: str) -> list[str]:
     return sorted(found)
 
 
+class _AliasUncertainty(str):
+    """A causal diagnostic, not an unresolved word that quoting could fix."""
+
+
 class _Analyzer:
-    def __init__(self):
+    def __init__(self, text: str = ""):
+        self.alias_evidence = bool(_restore_evidence(text) or re.search(
+            r"\b(?:stash|pop|apply)\b|\.git/config|git\s+config|alias\.|\[alias\]|include|GIT_CONFIG",
+            text, re.IGNORECASE))
         self.calls: list = []
         self.steps = 0
         # Set when any fragment could not be analyzed (parse error, depth limit, unknown eval).
@@ -1271,6 +1278,8 @@ class _Analyzer:
         self.home0 = os.environ.get("HOME")
         self.pipe_text: Optional[str] = None  # text of earlier commands of the current pipeline
         self.config_alias = False  # an earlier `git config alias.*` in this command
+        self.opaque_alias: Optional[str] = None  # external child with unobservable writes
+        self.child_alias_source: Optional[str] = None
         self.config_repo = False  # a preceding write may rewire core.worktree
         self.child_alias = False  # inherited only while analyzing a Git runner child
 
@@ -1294,7 +1303,8 @@ class _Analyzer:
             self.shadow -= 1
 
     def shadow_argv(self, words: list, st: _State, depth: int, as_git: bool = False,
-                    tail: bool = False):
+                    tail: bool = False, unknown_command: Optional[str] = None,
+                    git_assigns: Optional[list] = None):
         """Unsupported wrapper or unknown command name: any suffix may be the real command.
 
         Each suffix of the argv is analyzed as a command with unknown repo (and, for an
@@ -1311,7 +1321,8 @@ class _Analyzer:
             for k in range(1, len(words)):
                 self.simple(("simple", [], words[k:] + extra, []), st, depth, nested=True)
             if as_git:
-                self.simple(("simple", [], ["git", *words[1:]], []), st, depth, nested=True)
+                self.simple(("simple", git_assigns or [], ["git", *words[1:]], []), st, depth, nested=True,
+                            unknown_command=unknown_command)
         finally:
             self.shadow -= 1
             self.splitting = False
@@ -1595,7 +1606,8 @@ class _Analyzer:
         markers = st.exported & {_NAMEREF}
         return _State(st.cwd, variables, (set(st.exported) - _MARKERS) | set(prefix) | markers, funcs, st.lcwd)
 
-    def simple(self, node, st: _State, depth: int, nested: bool = False):
+    def simple(self, node, st: _State, depth: int, nested: bool = False,
+               unknown_command: Optional[str] = None):
         self.steps += 1
         if self.steps > MAX_STEPS:
             raise _Budget()
@@ -1666,7 +1678,7 @@ class _Analyzer:
                 # That child may still write Git config, an include or a `git-*` program
                 # the guard cannot see (`sh -c 'base64 -d >> .git/config'`): a later
                 # non-builtin subcommand may be an alias, as it was when the state collapsed.
-                self.config_alias = True
+                self.opaque_alias = " ".join(words)
                 return [st], [st]
             unknown = _unknown([st])
             return [unknown], [unknown]
@@ -1678,7 +1690,8 @@ class _Analyzer:
         if name is None:
             # Unknown command name: it may be git itself, or a wrapper of a later word.
             self.fail_closed(" ".join(words))
-            self.shadow_argv(raw, st, depth, as_git=True)
+            self.shadow_argv(raw, st, depth, as_git=True,
+                             unknown_command=" ".join(assigns + raw), git_assigns=assigns)
             return [st], [st]
         cmd = os.path.basename(name)
         if cmd == "alias":
@@ -1822,7 +1835,7 @@ class _Analyzer:
                 self.fail_closed(" ".join(raw), git_words=True)
             if cmd != "git":  # dashed form: `git-stash pop` is `git stash pop`
                 raw, expanded = ["git", cmd[4:], *raw[1:]], ["git", cmd[4:], *expanded[1:]]
-            self.git(raw, expanded, st, prefix, depth)
+            self.git(raw, expanded, st, prefix, depth, unknown_command=unknown_command)
             return [st], [st]
         is_awk = re.sub(r"[\d.]+$", "", cmd) in {"awk", "gawk", "mawk"}
         awk_text = "\n".join([
@@ -1985,7 +1998,10 @@ class _Analyzer:
         child = self.child(st, prefix)
         child.cwd = child.lcwd = None
         previous = self.child_alias
+        previous_source = self.child_alias_source
         self.child_alias |= aliased
+        if aliased:
+            self.child_alias_source = " ".join(w if w is not None else "$?" for w in argv)
         self.shadow += 1
         try:
             if mode == "shell":
@@ -2017,6 +2033,7 @@ class _Analyzer:
         finally:
             self.shadow -= 1
             self.child_alias = previous
+            self.child_alias_source = previous_source
 
     def git_runner(self, sub, args, st, prefix, depth, aliased):
         """Only the six documented execution sites, not generic builtin argument scans."""
@@ -2157,7 +2174,7 @@ class _Analyzer:
             else:
                 k += 1  # parse-options permits options after revision operands
 
-    def git(self, raw, ex, st, prefix, depth=MAX_DEPTH):
+    def git(self, raw, ex, st, prefix, depth=MAX_DEPTH, unknown_command=None):
         """Record the git call; ``ex`` is the expanded argv, None where a word is unknown.
 
         Unknown words, unknown global options (unknown arity) and config-injected aliases
@@ -2179,7 +2196,7 @@ class _Analyzer:
         # define aliases, like `-c alias.x=...`; so may an earlier `git config alias.*`.
         aliased = (bool(_GIT_CONFIG_ENV & env) or any(n.startswith("GIT_CONFIG_KEY_") for n in env)
                    or "HOME" in prefix or st.vars.get("HOME") != self.home0
-                   or self.config_alias or self.child_alias or _NAMEREF in env)
+                   or self.config_alias or _NAMEREF in env)
         if "config" in ex:
             values = ex[ex.index("config") + 1:]
             keys = [w.lower() for w in values if w]
@@ -2234,15 +2251,30 @@ class _Analyzer:
             repo = None
         if i >= len(ex):
             return
+        # Only the unknown-name-as-git reading may discount opaque-child uncertainty.
+        # Literal Git, other shadow readings and independently unknown argv stay closed.
+        opaque_only = not aliased and bool(self.opaque_alias or self.child_alias)
+        aliased |= bool(self.opaque_alias or self.child_alias)
         # An alias cannot shadow a builtin command, but any other name may be an alias.
         known = ex[i] is not None and not ex[i].startswith("-") and (
             not aliased or ex[i] in _GIT_BUILTINS)
         if not known:
             rest = ex[i:]
             text = " ".join(w for w in rest if w is not None)
+            independent_restore = (any(w is None for w in rest) or _restore_evidence(text)
+                                   or bool(REFUSE_OPS & set(rest)))
+            if (unknown_command is not None and opaque_only and not independent_restore
+                    and not self.alias_evidence):
+                return
             if any(w is None for w in rest) or aliased or _restore_evidence(text) or (
                     REFUSE_OPS & set(rest)):
                 note = None
+                if opaque_only:
+                    source = self.opaque_alias or self.child_alias_source
+                    later = unknown_command if unknown_command is not None else " ".join(raw)
+                    note = _AliasUncertainty(
+                        f"opaque child `{source}` may change Git aliases; later command `{later}` "
+                        "may invoke an alias that restores a stash")
                 if not (aliased or REFUSE_OPS & set(rest) or re.search(r"\bstash\b", " ".join(raw))
                         or _restore_evidence(" ".join(raw[i:]))):
                     # Only an unknown word (no stash text): name it for the refusal message.
@@ -2286,7 +2318,7 @@ def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
     TMPDIR are borrowed from the process environment; other variables of a persistent
     terminal may differ and stay unknown. ``repo`` is None when it cannot be resolved.
     """
-    analyzer = _Analyzer()
+    analyzer = _Analyzer(cmd or "")
     variables = {key: os.environ.get(key) for key in ("HOME", "TMPDIR")}
     variables["PWD"] = cwd
     state = _State(cwd, variables, {"HOME", "TMPDIR", "PWD", "OLDPWD"}, {})
@@ -2371,6 +2403,9 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
     calls = list(_stash_invocations(cmd, cwd))
     # Every unresolved-repo restore comes only from an unknown word, with no stash text.
     notes = [note for repo, op, _a, note in calls if repo is None and op in REFUSE_OPS]
+    alias_note = next((note for note in notes if isinstance(note, _AliasUncertainty)), None)
+    if alias_note:
+        return f"STASH WORKTREE GUARD: blocked: {alias_note}. " + _safe_recipe()
     if notes and all(notes):
         word = notes[0]
         return (
