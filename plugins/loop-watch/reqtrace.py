@@ -19,8 +19,8 @@ import re
 import sys
 import threading
 import time
-import traceback
 from collections import Counter
+from functools import lru_cache
 from typing import Any, Callable, Dict, Optional
 
 log = logging.getLogger("loop-watch")
@@ -45,6 +45,7 @@ STATS_EMIT_PATHS = 40  # paths written per record, by total time
 _ID_SEGMENT = re.compile(r"^(?=.*\d)[A-Za-z0-9_.:-]{8,}$")
 
 
+@lru_cache(maxsize=4096)
 def _short(path: str) -> str:
     for marker in ("/hermes-agent/", "/site-packages/", "/plugins/", "/lib/python"):
         i = path.rfind(marker)
@@ -310,8 +311,15 @@ def _worker_stacks(depth: int = 10) -> Counter:
         name = names.get(tid) or ""
         if tid == me or not name.startswith(_WORKER_PREFIXES):
             continue
-        st = tuple("%s:%d %s" % (_short(fs.filename), fs.lineno, fs.name)
-                   for fs in traceback.extract_stack(frame)[-depth:])
+        # Only metadata is reported. Traceback extraction checks source caches even
+        # with lookup_lines=False, doing filesystem I/O on the event loop.
+        stack = []
+        while frame is not None and (depth <= 0 or len(stack) < depth):
+            code = frame.f_code
+            stack.append("%s:%d %s" % (_short(code.co_filename), frame.f_lineno, code.co_name))
+            frame = frame.f_back
+        stack.reverse()  # reports retain outer-to-inner order
+        st = tuple(stack if depth > 0 else stack[-depth:])
         if not st:
             continue
         # Idle = parked in the pool's own queue wait: every frame is threading/queue/pool plumbing.
