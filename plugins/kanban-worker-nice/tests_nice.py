@@ -1,8 +1,11 @@
 import importlib.util
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 _spec = importlib.util.spec_from_file_location("kwn", Path(__file__).with_name("__init__.py"))
 kwn = importlib.util.module_from_spec(_spec)
@@ -36,15 +39,27 @@ def test_never_lowers():
     assert kwn.apply({"HERMES_KANBAN_TASK": "t"}, g, s) is None and st["n"] == 19
 
 
-def test_children_inherit_real_process():
-    """Real setpriority in a subprocess; a grandchild shell reports the inherited nice."""
+@pytest.mark.parametrize("initial_floor", [0, 15, 19])
+def test_children_inherit_real_process(initial_floor):
+    """Worker and grandchild preserve inherited niceness above the default target."""
     code = (
-        "import importlib.util,subprocess,sys;"
+        "import importlib.util,json,os,subprocess;"
+        # Change only the subprocess, never the pytest runner, and never require
+        # privilege to undo niceness inherited from a background suite launcher.
+        f"os.setpriority(os.PRIO_PROCESS,0,max(os.getpriority(os.PRIO_PROCESS,0),{initial_floor}));"
+        "before=os.getpriority(os.PRIO_PROCESS,0);"
         f"sp=importlib.util.spec_from_file_location('k',{str(Path(__file__).with_name('__init__.py'))!r});"
         "m=importlib.util.module_from_spec(sp);sp.loader.exec_module(m);m.apply();"
-        "print(subprocess.check_output(['sh','-c','ps -o nice= -p $$']).decode().strip())"
+        "after=os.getpriority(os.PRIO_PROCESS,0);"
+        "child=int(subprocess.check_output(['sh','-c','ps -o nice= -p $$']));"
+        "print(json.dumps([before,after,child]))"
     )
     env = dict(os.environ, HERMES_KANBAN_TASK="t_test")
     env.pop(kwn.ENV_VAR, None)
-    out = subprocess.check_output([sys.executable, "-c", code], env=env).decode().strip()
-    assert out == "10"
+    before, after, child = json.loads(
+        subprocess.check_output([sys.executable, "-c", code], env=env, timeout=15)
+    )
+    assert before >= initial_floor
+    expected = max(before, 10)
+    assert after == expected
+    assert child == expected
