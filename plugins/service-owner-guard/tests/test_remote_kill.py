@@ -149,7 +149,16 @@ class RemoteKill(Base):
     def test_linux_proc_owner_environment_and_cwd(self):
         def lookup(pid):
             spec = {"kind": "pids", "verb": "kill", "pid": pid}
-            r = subprocess.run([sys.executable, "-", json.dumps(spec)], input=self.g.remote_script(spec), text=True, capture_output=True, timeout=15)
+            # Keep real /proc reads and fixture-parent ancestry, but not the
+            # unrelated scheduler/test-runner ancestry in the ps snapshot.
+            import inspect
+            from test_guard import fixture_run, FIXTURE_ROOT_PID
+            prelude = ("import subprocess\nREAL_RUN = subprocess.run\n"
+                       f"FIXTURE_ROOT_PID = {FIXTURE_ROOT_PID}\n"
+                       + inspect.getsource(fixture_run)
+                       + "\nsubprocess.run = fixture_run\n")
+            script = prelude + "\nexec(" + repr(self.g.remote_script(spec)) + ")\n"
+            r = subprocess.run([sys.executable, "-", json.dumps(spec)], input=script, text=True, capture_output=True, timeout=15)
             self.assertEqual(r.returncode, 0, r.stderr)
             return json.loads(r.stdout)
         free = self.home / 'free'

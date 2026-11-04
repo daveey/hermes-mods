@@ -17,6 +17,24 @@ OWNER = CARD + "@macbook"
 LABEL = "com.example.owned-svc"
 
 
+REAL_RUN = subprocess.run
+FIXTURE_ROOT_PID = os.getpid()
+
+
+def fixture_run(argv, **kwargs):
+    """Read real fixture processes, excluding the test runner and its ancestors.
+
+    Owner lookup walks ancestors before checking cwd markers. The runner is not
+    part of a fixture service, even when its scheduler has an explicit owner.
+    """
+    result = REAL_RUN(argv, **kwargs)
+    if argv[:2] == ["ps", "-Ao"] and result.returncode == 0:
+        result.stdout = "\n".join(
+            line for line in result.stdout.splitlines()
+            if line.split() and line.split()[0] != str(FIXTURE_ROOT_PID))
+    return result
+
+
 def load():
     spec = importlib.util.spec_from_file_location("service_owner_guard", PLUGIN / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
@@ -40,7 +58,10 @@ class Base(unittest.TestCase):
         (agents / "com.example.free-svc.plist").write_bytes(plistlib.dumps(
             {"Label": "com.example.free-svc", "ProgramArguments": ["/bin/sleep", "1"]}))
         self.log = self.home / "guard.log"
-        env = {"HOME": str(self.home), "SERVICE_OWNER_GUARD_LOG": str(self.log)}
+        # The suite gate can itself be owner-marked. Fixture children must not
+        # inherit that owner in preference to their deliberately placed OWNER.md.
+        env = {"HOME": str(self.home), "SERVICE_OWNER_GUARD_LOG": str(self.log),
+               "HERMES_OWNER_CARD": ""}
         p = mock.patch.dict(os.environ, env)
         p.start()
         self.addCleanup(p.stop)
@@ -49,6 +70,9 @@ class Base(unittest.TestCase):
         self.g = load()
         # no real launchctl/systemctl: `print` and `show` fail unless a test stubs them
         real = self.g.run_cmd
+        process_patch = mock.patch.object(subprocess, "run", fixture_run)
+        process_patch.start()
+        self.addCleanup(process_patch.stop)
         self.g.run_cmd = lambda argv, timeout=5: (1, "") if argv[0] in ("launchctl", "systemctl") else real(argv, timeout)
 
     def verdict(self, cmd, tool="terminal"):
