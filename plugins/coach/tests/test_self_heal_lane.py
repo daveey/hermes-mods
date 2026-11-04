@@ -1945,6 +1945,31 @@ def test_queued_ask_gate_row_the_detector_already_saw_is_withdrawn_by_the_full_v
     assert fresh["fingerprint"] not in skips and other_day["fingerprint"] not in skips
 
 
+def test_queued_ask_gate_row_for_an_inbox_doit_press_is_withdrawn(store, tmp_path, monkeypatch):
+    """plugin-9ab6e8e868: a row queued for a turn that was an Inbox **Do it** press (the poster's proposal pasted
+    as the user's message) is withdrawn at the drain: still_flags reads the session digest (HERMES_COACH_DATA) and
+    finds the Inbox notice before that turn. A real turn after the same notice still files."""
+    proposal = "Find out why the mail poller is not enrolled, and resend it if it still matters."
+    prev = (f"**Mail expired**\n\n**Proposed:** {proposal}\n\n_Inbox message from hermes-mail. Press **Do it** to "
+            "run the proposal, reply to adjust it, or archive to dismiss._")
+    data = tmp_path / "coach-data"
+    (data / "hub" / "default").mkdir(parents=True)
+    (data / "hub" / "default" / "s_doit.json").write_text(json.dumps({"id": "s_doit", "user_turns": [
+        {"t": NOW - 600, "text": proposal, "prev": prev},
+        {"t": NOW - 300, "text": "no, figure out why the poller died", "prev": prev}]}))
+    monkeypatch.setenv("HERMES_COACH_DATA", str(data))
+    doit = defect(symptom="unfiled fix request needs review: doit", monitor="ask-gate", session_id="s_doit",
+                  quote=proposal, hit_t=NOW - 600)
+    real = defect(symptom="unfiled fix request needs review: real", monitor="ask-gate", session_id="s_doit",
+                  quote="no, figure out why the poller died", hit_t=NOW - 300)
+    _queue(store, doit, real)
+    got = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d["symptom"]) or {"action": "filed"})
+    assert got == ["unfiled fix request needs review: real"]
+    skips = {e["fingerprint"]: e["why"] for e in ev(store, "selfheal_skip")}
+    assert "Inbox Do-it" in skips[doit["fingerprint"]]
+
+
 def test_queued_ask_gate_row_whose_session_the_lane_already_filed_is_withdrawn(store):
     row = defect(symptom="unfiled fix request needs review: x", monitor="ask-gate", session_id="s_lane",
                  quote="can you fix it", hit_t=NOW - 60)

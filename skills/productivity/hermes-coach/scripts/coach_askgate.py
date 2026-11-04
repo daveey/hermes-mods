@@ -219,6 +219,53 @@ def clean(text):
     return drop_agent_notes(text.strip()).strip()
 
 
+# An Inbox notice (plugins/inbox/store.py _post_text/_update_text) ends in "**Proposed:** <accept_prompt>" and the
+# footer "Press **Do it** to run the proposal"; pressing Do it sends <accept_prompt> as the user's message. That turn
+# is the poster's text, not David's (plugin-9ab6e8e868: plain-text proposals got past the bold-markdown filter).
+DOIT_FOOTER = re.compile(r"Press \*\*Do it\*\* to run the proposal", re.I)
+DOIT_UPDATE = re.compile(r"^\s*\*\*Update \d{4}-\d{2}-\d{2} \d{2}:\d{2}\*\*")
+PROPOSED = re.compile(r"\*\*Proposed:\*\*\s*(.*?)\s*(?:\n\s*\n\s*_(?:Inbox message|From )|\Z)", re.S)
+CLIP = "…[clipped]…"  # session_digest clip_ends / clip_user_turn marker
+
+
+def _ws(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _ends(s):
+    """(head, tail) of a possibly clipped digest string: the text before the first clip marker and after the last."""
+    if CLIP not in s:
+        return s, s
+    return s.split(CLIP, 1)[0].strip(), s.rsplit(CLIP, 1)[1].strip()
+
+
+def doit_remainder(text, prev):
+    """When ``text`` is an Inbox Do-it press (``prev`` is the Inbox notice and the turn starts with its proposal),
+    the rest of the turn after the proposal ("" when the turn is exactly the proposal), else None. Only the
+    remainder is David's: an edited or own-words reply no longer starts with the proposal and counts as before."""
+    prev = prev or ""
+    if not (DOIT_FOOTER.search(prev) or DOIT_UPDATE.match(prev)):
+        return None
+    ms = list(PROPOSED.finditer(prev))
+    if not ms:
+        return None
+    p, t = _ws(ms[-1].group(1)), _ws(text)
+    if not p:
+        return None
+    if CLIP not in p and CLIP not in t:
+        return t[len(p):].strip() if t.startswith(p) else None
+    # Either side was clipped by the digest: match the kept ends, treat a match as the whole turn.
+    (ph, pt), (th, tt) = _ends(p), _ends(t)
+    heads = ph.startswith(th) or th.startswith(ph)
+    tails = pt.endswith(tt) or tt.endswith(pt)
+    return "" if ph and th and heads and tails else None
+
+
+def inbox_doit(text, prev):
+    """True when the whole turn is an Inbox proposal pasted by the Do it button (not David's words)."""
+    return doit_remainder(text, prev) == ""
+
+
 def classify(text):
     if generated(text) or SKIP.match(text) or NEGATIVE.search(text):
         return None
@@ -236,7 +283,9 @@ def week_start(ts):
     return mon
 
 
-def collect(data, since_ts, until_ts):
+def collect(data, since_ts, until_ts, doit=None):
+    """-> (hits, scanned). Turns that are an Inbox Do-it press (the poster's proposal pasted as the user's message)
+    are not David's words: they are neither hits nor scanned turns, and are appended to ``doit`` when given."""
     hits, seen, first_ts = [], set(), None
     scanned = {}  # week start ts -> user turns scanned (0 = no digest coverage, the count is unknown, not zero)
     for f in glob.glob(str(Path(data).expanduser() / "*" / "*" / "*.json")):
@@ -259,6 +308,15 @@ def collect(data, since_ts, until_ts):
             t, text = u.get("t", 0), clean(u.get("text") or "")
             if not (since_ts <= t < until_ts) or not text or generated(text) or SKIP.match(text):
                 continue
+            rest = doit_remainder(text, u.get("prev"))
+            if rest is not None:  # Inbox Do-it press: only words David added after the proposal are his
+                if not rest:
+                    dk = ("doit", d.get("id"), int(t))  # mirrored sessions on several hosts count once
+                    if doit is not None and dk not in seen:
+                        seen.add(dk)
+                        doit.append({"t": t, "session": d.get("id"), "host": d.get("host"), "quote": text})
+                    continue
+                text = rest
             ws = week_start(t)
             scanned[ws] = scanned.get(ws, 0) + 1
             # A session that opens with a screenshot and "stop asking me" is about an OS/app popup, not an agent ask
@@ -308,7 +366,20 @@ def week_counts(hits, weeks):
     return out
 
 
-def render(hits, weeks, scanned, title):
+def doit_counts(doit, weeks):
+    return {w: sum(1 for x in doit or () if week_start(x["t"]) == w) for w in weeks}
+
+
+def doit_lines(doit, weeks=None):
+    """Report lines for Inbox Do-it presses: kept visible, never counted as David's words."""
+    doit = [x for x in doit or () if weeks is None or week_start(x["t"]) in weeks]
+    lines = [f"Inbox Do-it presses (not counted): {len(doit)} turn{'s' if len(doit) != 1 else ''} that were an Inbox "
+             "proposal pasted by the Do it button, not David's words."]
+    lines += [f"- {fmt_ts(x['t'])} · session `{x['session']}`: \"{quote(x, 100)}\"" for x in doit]
+    return lines
+
+
+def render(hits, weeks, scanned, title, doit=None):
     counts = week_counts(hits, weeks)
     out = [f"# {title}", "",
            f"Generated {fmt_ts(time.time())}. Detector: skills/productivity/hermes-coach/scripts/coach_askgate.py "
@@ -328,6 +399,8 @@ def render(hits, weeks, scanned, title):
     out.append(f"| **Total** | **{len(by_class(hits, ASK_CLASS))}** | **{len(fx)}** ({len({h['session'] for h in fx})}) | "
                f"**{len(by_class(hits, BB_CLASS))}** | {sum(scanned.values())} |")
     out.append("")
+    if doit is not None:
+        out += doit_lines(doit, weeks) + [""]
     for cls in (FIX_CLASS, BB_CLASS, ASK_CLASS):
         out += [f"## {CLASS_LABEL[cls]}", ""]
         for w in weeks:
@@ -473,16 +546,52 @@ def row_hit_t(row):
     return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M").replace(tzinfo=PT).timestamp()
 
 
-def still_flags(row, homes=None):
+DOIT_NEAR = 120  # a digest turn this close to a queued row's hit time is that row's turn
+
+
+def coach_data_dirs(data=None):
+    """Where still_flags looks for session digests: ``data``, else $HERMES_COACH_DATA, else ~/code/hermes-coach-data."""
+    return [Path(data or os.environ.get("HERMES_COACH_DATA") or "~/code/hermes-coach-data").expanduser()]
+
+
+def row_is_doit(row, data=None):
+    """True when a queued row's turn was an Inbox Do-it press: the session's digest has a turn near the row's hit
+    time whose text starts with the row's (collapsed, clipped) quote and is exactly the proposal of the Inbox notice
+    before it. Rows queued before plugin-9ab6e8e868 carry no `prev`, so the digest is the only provenance."""
+    s, q = row.get("session_id"), _ws(str(row.get("quote") or "")).rstrip("…").strip()
+    if not s or not q:
+        return False
+    t = row_hit_t(row)
+    for base in coach_data_dirs(data):
+        for f in glob.glob(str(base / "*" / "*" / f"{glob.escape(s)}.json")):
+            try:
+                with open(f) as fh:
+                    d = json.load(fh)
+            except Exception:
+                continue
+            for u in (d.get("user_turns") or []) if isinstance(d, dict) else ():
+                if not isinstance(u, dict) or (t is not None and abs((u.get("t") or 0) - t) > DOIT_NEAR):
+                    continue
+                text = clean(u.get("text") or "")
+                if _ws(re.sub(r"\[Image attached[^\]]*\]", "", text)).startswith(q) and inbox_doit(text, u.get("prev")):
+                    return True
+    return False
+
+
+def still_flags(row, homes=None, data=None):
     """Why the ask-gate monitor no longer stands by a row it queued earlier, else None. The drain re-checks a queued
     row with today's full verdict, in route_hits' order, so any later rule fix retracts the rows it would not have
     queued (plugin-656a006c84: queued 11 minutes before detection_for existed, filed a day later anyway). Only
-    positive evidence withdraws: a generated quote, a detection of that session near the hit (selfheal.json), or a
-    lane filing for that session (selfheal_lane.json). Any error -> None, so the row files as before."""
+    positive evidence withdraws: a generated quote, an Inbox Do-it press (the session digest's notice before the
+    turn, plugin-9ab6e8e868), a detection of that session near the hit (selfheal.json), or a lane filing for that
+    session (selfheal_lane.json). Any error -> None, so the row files as before."""
     try:
         q = row.get("quote") or ""
         if q and generated(q):
             return "monitor no longer flags (ask-gate): quote is a generated prompt, not David"
+        if row_is_doit(row, data):
+            return ("monitor no longer flags (ask-gate): the turn was an Inbox Do-it press (the poster's proposal "
+                    "pasted as the user's message), not David")
         s = row.get("session_id")
         if not s:
             return None
@@ -648,21 +757,23 @@ def main():
     else:
         weeks = [cur - timedelta(days=7 * i) for i in range(a.weeks - 1, -1, -1)]
         until = time.time() + 1
-    hits, scanned = collect(data, weeks[0].timestamp(), until)
+    doit = []  # Inbox Do-it presses: visible in the report, never counted as David's words (plugin-9ab6e8e868)
+    hits, scanned = collect(data, weeks[0].timestamp(), until, doit=doit)
 
     if a.last_week:
         title = f"Ask-gate and had-to-ask-for-a-fix, week of {weeks[0]:%Y-%m-%d}"
     else:
         title = f"Ask-gate and had-to-ask-for-a-fix baseline: {a.weeks} weeks to {datetime.now(PT):%Y-%m-%d}"
-    md = render(hits, weeks, scanned, title)
+    md = render(hits, weeks, scanned, title, doit=doit)
     so_lines = None
     if a.last_week:
         homes = [Path(h).expanduser() for h in a.home] or None
         so_lines = skill_outcome_lines(data, homes, weeks[0].timestamp(), until)
         md += "\n\n" + "\n".join(so_lines)
     if a.json:
-        print(json.dumps({"weeks": {f"{w:%Y-%m-%d}": c for w, c in week_counts(hits, weeks).items()},
-                          "hits": hits}, indent=1))
+        dc = doit_counts(doit, weeks)
+        print(json.dumps({"weeks": {f"{w:%Y-%m-%d}": dict(c, inbox_doit=dc[w]) for w, c in week_counts(hits, weeks).items()},
+                          "hits": hits, "inbox_doit": doit}, indent=1))
     else:
         print(md)
     if a.baseline:
@@ -703,6 +814,8 @@ def main():
                 extra += [""] + detected_lines(detected)
         else:
             detected = []
+        if doit:
+            extra = (extra or []) + [""] + doit_lines(doit, weeks)
         if so_lines:
             extra = (extra or []) + [""] + so_lines
             sp = data / "reports" / "askgate" / f"{weeks[0]:%Y-%m-%d}-skill-outcomes.md"
@@ -713,7 +826,7 @@ def main():
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"posted_by": me, "posted_at": int(time.time()), ASK_CLASS: len(ask), FIX_CLASS: len(fix), BB_CLASS: len(bb),
                                  "fix_sessions": len({h["session"] for h in fix}),
-                                 "detected_not_refiled": len(detected)}) + "\n")
+                                 "detected_not_refiled": len(detected), "inbox_doit": len(doit)}) + "\n")
 
 
 if __name__ == "__main__":
