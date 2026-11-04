@@ -207,6 +207,12 @@ class TestAll(unittest.TestCase):
                                           "Ran 3 tests in 0.1s\nOK (skipped=1)\n"),
                          {'passed': 6, 'failed': 0, 'errors': 0, 'skipped': 2})
         self.assertEqual(runner['counts']("no summary"), {'passed': 0, 'failed': 0, 'errors': 0, 'skipped': 0})
+        # pytest's subtests plugin adds a two-word "N subtests passed" item; coach's summary has one, and it
+        # used to drop the whole line (plugin-suites CI reported coach as 0 passed / 0 skipped).
+        self.assertEqual(runner['counts']("1268 passed, 943 skipped, 1 warning, 9 subtests passed in 170.92s (0:02:50)\n"),
+                         {'passed': 1268, 'failed': 0, 'errors': 0, 'skipped': 943})
+        self.assertEqual(runner['counts']("=== 1 failed, 5 passed, 2 subtests failed, 3 subtests passed in 1.0s ===\n"),
+                         {'passed': 5, 'failed': 1, 'errors': 0, 'skipped': 0})
 
     def test_suite_needing_core_is_skipped_with_reason_without_one(self):
         (self.root / "plugins" / "fast-rate-limit-fallback").mkdir(parents=True)
