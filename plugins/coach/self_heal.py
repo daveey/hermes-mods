@@ -1056,6 +1056,7 @@ USD_DAY = 200.0
 MAX_RUNNING = 3
 SNOOZE_DAYS = 14
 NOT_DEFECT_DAYS = 7
+SAME_QUOTE_MIN_CHARS = 120  # a quote this long, shared by other sessions, is one complaint (agent-ea7ff00170)
 SKILLS = ("five-whys", "hermes-mods-repo")
 BB_SKILLS = ("five-whys", "bb-self-fix")
 FIX_SKILLS = ("five-whys", "hermes-mods-repo", "systematic-debugging")
@@ -2583,6 +2584,10 @@ def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]
     identity = _complaint_identity(d)
     if not sid or not any(identity.values()):
         return None
+    # A long quote shared by other sessions is one piece of evidence, not N complaints (agent-ea7ff00170: one
+    # injected Kanban card body, one wake per session, became 39 cards). Only while its owner card is open; a short
+    # quote ("so, can you fix it please") may be two real complaints and still files per session.
+    long_quote = len(re.sub(r"\s+", " ", clean_user(str(d.get("quote") or ""))).strip()) >= SAME_QUOTE_MIN_CHARS
     lane = LaneState(store.root)
     owners = []
     entries = lane.read()
@@ -2590,8 +2595,14 @@ def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]
         # An alias retains the old turn even if its canonical fingerprint later recurs.
         # Consult the canonical lifecycle rather than trusting a stale copied verdict.
         canonical = entries.get(e["complaint_owner"], {}) if e.get("complaint_owner") else e
-        if ((ofp == fp and not e.get("complaint_owner")) or e.get("session_id") != sid
-                or not canonical or canonical.get("status") == "declined"):
+        if (ofp == fp and not e.get("complaint_owner")) or not canonical or canonical.get("status") == "declined":
+            continue
+        if e.get("session_id") != sid:
+            card = e.get("fix_card") or e.get("card")
+            if (long_quote and card and identity["complaint_quote_hash"]
+                    and identity["complaint_quote_hash"] == e.get("complaint_quote_hash")
+                    and canonical.get("status") in ("filed", "proposed", "approved")):
+                owners.append((e.get("filed_at") or now, ofp, card, e, "complaint_quote"))
             continue
         if (canonical.get("status") == "not_defect" and
                 now - (canonical.get("closed_at") or 0) >= NOT_DEFECT_DAYS * 86400):
@@ -2605,10 +2616,10 @@ def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]
         except (TypeError, ValueError):
             same_time = False
         if card and (same_quote or same_time):
-            owners.append((e.get("filed_at") or now, ofp, card, e))
+            owners.append((e.get("filed_at") or now, ofp, card, e, "complaint_turn"))
     if not owners:
         return None
-    _, ofp, card, e = sorted(owners, key=lambda o: (o[0], o[1]))[0]
+    _, ofp, card, e, via = sorted(owners, key=lambda o: (o[0], o[1]))[0]
     st = lane.get(fp)
     # Keep only an alias, not a copied lifecycle: copying `proposed` would launch a
     # second fix from sync(), and copying `not_defect` would suppress this fingerprint
@@ -2621,10 +2632,15 @@ def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]
                 board=e.get("board"), complaint_owner=e.get("complaint_owner") or ofp,
                 complaint_at=e.get("complaint_at"), complaint_quote_hash=e.get("complaint_quote_hash"),
                 cards=sorted(known_cards(st) | {card}))
-    store.log({"event": "selfheal_adopted_owner", "via": "complaint_turn", "fingerprint": fp,
-               "owner_fingerprint": ofp, "card": card, "session_id": sid, "board": e.get("board")})
-    return {"action": "skip", "why": f"same complaint turn as {ofp}", "card": card,
-            "adopted": True, "via": "complaint_turn", "fingerprint": fp}
+    store.log({"event": "selfheal_adopted_owner", "via": via, "fingerprint": fp,
+               "owner_fingerprint": ofp, "card": card, "session_id": sid, "board": e.get("board"),
+               "owner_session_id": e.get("session_id")})
+    why = f"same quote as {card} ({ofp})" if via == "complaint_quote" else f"same complaint turn as {ofp}"
+    if via == "complaint_quote":
+        store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp, "why": why, "card": card,
+                   "session_id": sid})
+    return {"action": "skip", "why": why, "card": card,
+            "adopted": True, "via": via, "fingerprint": fp}
 
 
 def _adopt_family_lane(d: dict, fp: str, store, now: float) -> Optional[dict]:
