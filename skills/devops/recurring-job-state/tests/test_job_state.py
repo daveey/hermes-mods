@@ -181,6 +181,72 @@ class Harvest(Base):
         con.close()
         return db
 
+    def test_late_lower_run_id_is_not_skipped(self):
+        db = self.make_db()
+        run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        with sqlite3.connect(db) as con:
+            con.execute("update task_runs set outcome='completed', summary='late finish', ended_at=1793600400 where id=5")
+        run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        self.assertIn('late finish', self.text())
+
+    def test_crash_after_state_commit_does_not_count_lessons_twice(self):
+        from unittest.mock import patch
+        db = self.make_db()
+        original = js.save
+        def committed_then_crash(path, st):
+            original(path, st)
+            raise RuntimeError('interrupted after atomic state replace')
+        with patch.object(js, 'save', side_effect=committed_then_crash):
+            with self.assertRaises(RuntimeError):
+                run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        self.assertIn('[fake-clock] (x1', self.text())
+        self.assertNotIn('(x2', self.text())
+
+    def test_legacy_cursor_migration_preserves_state_and_tracks_open_runs(self):
+        db = self.make_db()
+        run('record', 'demo', '--tried', 'legacy entry')
+        with open(os.path.join(self.tmp.name, '.demo.harvest.json'), 'w') as f:
+            json.dump({'last_run_id': 6}, f)
+        run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        self.assertNotIn('fixed a', self.text())
+        with sqlite3.connect(db) as con:
+            con.execute("update task_runs set outcome='completed', summary='late legacy finish', ended_at=1793600400 where id=5")
+        run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        self.assertIn('late legacy finish', self.text())
+        self.assertIn('legacy entry', self.text())
+
+    def test_corrupt_legacy_cursor_fails_closed(self):
+        db = self.make_db()
+        with open(os.path.join(self.tmp.name, '.demo.harvest.json'), 'w') as f:
+            f.write('{')
+        with self.assertRaises(ValueError):
+            run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_concurrent_harvests_count_each_run_once(self):
+        import subprocess
+        db = self.make_db()
+        cmd = [sys.executable, js.__file__, 'harvest', 'demo', '--db', db, '--key-prefix', 'deflake:']
+        procs = [subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+        for proc in procs:
+            out, err = proc.communicate(timeout=20)
+            self.assertEqual(proc.returncode, 0, out + err)
+        self.assertEqual(len(js.load(self.path).sections['Tried']), 2)
+        self.assertIn('[fake-clock] (x1', self.text())
+
+    def test_source_rebinding_refused_and_record_preserves_cursor(self):
+        db = self.make_db()
+        run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        run('record', 'demo', '--watch', 'preserved')
+        run('prune', 'demo')
+        run('harvest', 'demo', '--db', db, '--key-prefix', 'deflake:')
+        self.assertIn('[fake-clock] (x1', self.text())
+        with self.assertRaises(ValueError):
+            run('harvest', 'demo', '--db', db, '--key-prefix', 'ci-red:')
+        _, sliced, _ = run('show', 'demo', '--slice')
+        self.assertNotIn('harvest-v2', sliced)
+
     def test_harvest_is_idempotent_and_scoped_to_prefix(self):
         db = self.make_db()
         rc, out, _ = run("harvest", "demo", "--db", db, "--key-prefix", "deflake:")

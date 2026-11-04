@@ -14,7 +14,7 @@ Commands (stdlib only, any python3 >= 3.8):
   harvest JOB --db KANBAN_DB --key-prefix P [...]
                                    fold finished card runs of a card family into the file: each run's
                                    metadata.job_state ({tried, lessons, watch, unwatch}) and a Tried line
-                                   from its summary. A cursor file next to the state file makes it idempotent.
+                                   from its summary. Consumed run IDs commit atomically inside the state file.
   path JOB                         print the resolved path
 
 JOB is a name (file = $JOB_STATE_DIR or ~/.hermes/state, + JOB.md) or a path ending in .md.
@@ -337,24 +337,47 @@ def _ro_connect(path, timeout=10):
 def cmd_harvest(a) -> int:
     path = resolve(a.job)
     cursor_path = os.path.join(os.path.dirname(path), f".{job_name(path)}.harvest.json")
-    try:
-        with open(cursor_path) as f:
-            cursor = int(json.load(f).get("last_run_id", 0))
-    except (OSError, ValueError):
-        cursor = 0
-    con = _ro_connect(a.db, timeout=10)
-    where = " or ".join("t.idempotency_key like ? escape '\\'" for _ in a.key_prefix)
-    params = [p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%" for p in a.key_prefix]
-    rows = con.execute(
-        "select r.id, t.id, t.idempotency_key, r.outcome, r.summary, r.metadata, r.ended_at from task_runs r "
-        f"join tasks t on t.id = r.task_id where r.ended_at is not null and r.id > ? and ({where}) order by r.id",
-        [cursor, *params]).fetchall()
-    con.close()
-    if not rows:
-        print(f"job_state: harvest {job_name(path)}: nothing new after run {cursor}")
-        return 0
+    marker = '<!-- harvest-v2 '
+    source = [os.path.realpath(a.db), sorted(a.key_prefix)]
+    # Cursor and visible state share ONE atomic replacement under the same lock.
+    # Run IDs are allocated at start, not completion: a high-water ID loses late runs.
     with locked(path):
         st = load(path)
+        entries = [p for p in st.preamble if p.startswith(marker)]
+        if len(entries) > 1:
+            raise ValueError('duplicate harvest cursor')
+        if entries:
+            if not entries[0].endswith(' -->'):
+                raise ValueError('invalid harvest cursor')
+            cursor = json.loads(entries[0][len(marker):-4])
+            if cursor['source'] != source:
+                raise ValueError('harvest source changed; use a separate state slice')
+            seen = set(cursor['seen'])
+        else:
+            seen = set()
+        con = _ro_connect(a.db, timeout=10)
+        try:
+            where = " or ".join("t.idempotency_key like ? escape '\\'" for _ in a.key_prefix)
+            params = [p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%" for p in a.key_prefix]
+            rows = con.execute(
+                "select r.id, t.id, t.idempotency_key, r.outcome, r.summary, r.metadata, r.ended_at from task_runs r "
+                f"join tasks t on t.id = r.task_id where r.ended_at is not null and ({where}) order by r.ended_at, r.id",
+                params).fetchall()
+        finally:
+            con.close()
+        if not entries and os.path.exists(cursor_path):
+            # Preserve legacy counts; already-missed historic completions cannot be
+            # distinguished from pruned Tried entries. Do not fabricate a repair.
+            # Open low-ID runs are NOT seeded, so later finishes remain eligible.
+            with open(cursor_path) as f:
+                legacy = json.load(f)['last_run_id']
+            if not isinstance(legacy, int) or legacy < 0:
+                raise ValueError('invalid legacy harvest cursor')
+            seen = {r[0] for r in rows if r[0] <= legacy}
+        rows = [r for r in rows if r[0] not in seen]
+        if not rows and entries:
+            print(f"job_state: harvest {job_name(path)}: nothing new")
+            return 0
         n_meta = n_used = 0
         for run_id, task_id, key, outcome, summary, meta, ended in rows:
             stamp = _dt.datetime.fromtimestamp(float(ended), _dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
@@ -375,11 +398,11 @@ def cmd_harvest(a) -> int:
             if not (isinstance(js, dict) and js.get("tried")):
                 text = one_line(summary or "")[:220] or "(no summary)"
                 st.add_tried(f"{task_id} {outcome or '?'}: {text}", stamp)
+        seen.update(r[0] for r in rows)
+        st.preamble = [p for p in st.preamble if not p.startswith(marker)]
+        st.preamble.append(marker + json.dumps({'source': source, 'seen': sorted(seen)}, separators=(',', ':')) + ' -->')
         dropped = st.prune(a.max_lines)
-        if n_used:
-            save(path, st)
-        with open(cursor_path, "w") as f:
-            json.dump({"last_run_id": rows[-1][0]}, f)
+        save(path, st)
     print(f"job_state: harvest {job_name(path)}: {n_used} of {len(rows)} new run(s), {n_meta} with metadata.job_state"
           + (f", pruned {dropped}" if dropped else ""))
     print_promotions(st, path)

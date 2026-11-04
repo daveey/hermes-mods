@@ -37,6 +37,18 @@ recurs: the count is what triggers promotion. One line per entry; no prose parag
 
 ## Wiring a cron job
 
+For family harvests, preserve the `harvest-v2` HTML-comment checkpoint in the file preamble.
+It commits consumed run IDs and visible state in one atomic replacement under a lock; run IDs are not completion
+order. Use `show --slice` for worker context so the checkpoint is omitted. A malformed legacy cursor fails closed.
+Migration preserves legacy counts and tracks still-open lower-ID runs, but does not reconstruct historic omissions
+hidden by the old high-water cursor. Never claim those recovered without separate source evidence.
+
+Inventory actual generators on every requested host/board, including low-frequency ones. Dedupe counters are not
+Tried/Lessons/Watch memory; finite project namespaces and human-action asks are not recurring repair families.
+Validate each changed slice with an actual worker read and subsequent update, not merely a prompt or historic harvest.
+For interruptible collectors, checkpoint each external delivery and reconcile its durable receipt before retrying;
+test late completions, interruption and concurrent writers rather than only uninterrupted sequential runs.
+
 Prepend to the prompt: `STATE: first run python3 $S show <job> and follow its Lessons and Watch list.` Append:
 `Last step, every run (including [SILENT] runs): python3 $S record <job> --last-run ... --tried ...` with the
 fields above. Edit with `hermes cron edit <id> --prompt "$(cat new.txt)"` on the job's host, then trigger or wait
