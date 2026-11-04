@@ -2678,7 +2678,9 @@ def corruption_incident(d: dict, now: float) -> Optional[dict]:
     Other pathless SQLite errors are left alone rather than merging unrelated databases.
     """
     text = "\n".join(str(d.get(k) or "") for k in ("symptom", "details", "quote"))
-    if not re.search(r"database disk image is malformed|KanbanDbCorruptError|file is not a database", text, re.I):
+    if not (re.search(r"database disk image is malformed|KanbanDbCorruptError|file is not a database", text, re.I)
+            # only the log-record collector's own signal; text another defect quotes never joins an incident
+            or (d.get("kind") == "corruption" and "(unconfirmed corruption)" in str(d.get("symptom") or ""))):
         return None
     paths = re.findall(r"(?:~?/|[A-Za-z]:[/\\])[^\s\"'<>():,;]*\.(?:db|sqlite3?|sqlite)", text)
     path = d.get("db_path") or (paths[0] if paths else None)

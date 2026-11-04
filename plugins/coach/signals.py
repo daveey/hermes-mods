@@ -6,6 +6,10 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               a provider 401/403 logged as "Streaming failed before delivery" (core's retry loop refreshes or
               rotates) only as a storm: 3+ in 10 min per host, fingerprinted by status + reason class
               (revoked/expired/invalid/other); the e0a5909348 credential-guard warnings (no traceback) always;
+- corruption  core's `hermes_state` WARNING records for a structural SQLITE_CORRUPT that a read-only quick_check did not
+              confirm (replayed once, storage not latched; errors.log, no traceback). Only real log records of that
+              logger for a live db under the home (never cache/ scratch homes, never text a card, test or tool echoed).
+              self_heal.corruption_incident folds them into one Kanban owner per host + db + UTC hour;
 - hook        plugin hook exceptions (`Hook '<name>' callback <cb> raised: ...` from hermes_cli/plugins_dispatch);
 - worker      managed kanban worker crashes in <home>/logs/managed-worker.log (`[pid N] ` lines; newer core also
               writes one `[pid N] @ <UTC> core=<sha>` header per worker) only
@@ -72,7 +76,7 @@ GATEWAY_TAGS = ("gateway.previous_unclean_exit", "asyncio.run.exception", "gatew
 # the home/host (already_running / pid_claim / host_refused). One of either is a bounce, not a defect; only a
 # storm is filed, plus a refusal by an owner pid that is not running (a stale record blocking every start).
 SIGNAL_STORM_N, SIGNAL_STORM_S = 3, 600
-KINDS = ("errors", "hook", "worker", "cron", "kanban", "gateway", "coach", "monitor")
+KINDS = ("errors", "hook", "worker", "cron", "kanban", "gateway", "coach", "monitor", "corruption")
 SELF_DIR = Path(__file__).resolve().parent
 HUB_CMD = "python3 ~/code/hermes-mods/plugins/coach/signals.py ingest"
 
@@ -608,6 +612,70 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
         auth += [dict(a, profile=prof) for a in prof_auth]
         out += reconnect_storms(cur, prof, recs, now, host)
     out += auth_storms(cur, auth, now, host)
+    return out
+
+
+# Core's unconfirmed-corruption WARNINGs (hermes_state.py, selfheal gateway-d7a592a91c): a structural SQLITE_CORRUPT that a
+# scoped fresh-process quick_check did not confirm is replayed once instead of latching, and logged with no traceback, so
+# the traceback path above never sees it. Anchored on the producer: a real log RECORD (timestamp + level) from the
+# `hermes_state` logger whose message is one of core's four sentences, for a db file under the scanned home. A line a tool
+# printed or a card/test quoted is no record of that logger (it has no record head or another logger) and never matches.
+CORRUPT_LOGGER = "hermes_state"
+CORRUPT_LEVELS = frozenset({"WARNING", "ERROR"})
+UNCONFIRMED_RE = re.compile(
+    r"^state\.db (?P<db>/\S+\.db): (?:"
+    r"(?:a read|\S+) raised structural corruption \(.+\)(?: at stage=\w+)?, NOT confirmed \(.*unconfirmed this process: "
+    r"(?P<n>\d+)\); .*replaying it once.*"
+    r"|(?:read corruption|structural corruption reported by \S+) \(.+\) did not recur on (?:replay|the same-connection "
+    r"replay); .*storage is NOT latched \(unconfirmed corruption\)\.)$")
+
+
+def _live_db(db: str, root: Path) -> bool:
+    """A db under the scanned home that is not scratch: cache/ (TMPDIR, throwaway test homes) never counts."""
+    try:
+        rel = Path(db).resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    return bool(rel.parts) and rel.parts[0] != "cache"
+
+
+def parse_unconfirmed_corruption(lines: List[str], root: Path) -> List[dict]:
+    """Log lines -> one {at, db, line, count} per unconfirmed-corruption record of a live db."""
+    out = []
+    for ln in lines:
+        m = REC_RE.match(ln)
+        if not m or m.group(2) not in CORRUPT_LEVELS or m.group(4) != CORRUPT_LOGGER:
+            continue
+        u = UNCONFIRMED_RE.match(m.group(5))
+        if not u or not _live_db(u.group("db"), root):
+            continue
+        out.append({"at": _ts(m.group(1)), "db": u.group("db"), "line": m.group(5), "count": int(u.group("n") or 0)})
+    return out
+
+
+def corruption_signals(lines: List[str], root: Path, prof: str, now: float, host: str) -> List[dict]:
+    """errors.log lines -> corruption signals (pure: no filesystem beyond path resolution)."""
+    out = []
+    for r in parse_unconfirmed_corruption(lines, root):
+        if r["at"] < now - BACKFILL_S:
+            continue
+        db = home_tilde(r["db"])
+        out.append({"kind": "corruption", "component": "agent", "at": r["at"], "profile": prof,
+                    "symptom": f"state.db structural corruption not confirmed by a read-only check on {host} ({db}); "
+                               f"replayed once, storage not latched (unconfirmed corruption)",
+                    "details": home_tilde(r["line"])[:1500] + "\nA later clean check does not prove the file was "
+                               "never damaged: the first cause is undetermined. No forced restart.",
+                    "fp": fp("agent", "unconfirmed-corruption", host, db)})
+    return out
+
+
+def collect_corruption(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
+    """One signal per record; `collect` keeps one per db per pass. self_heal.corruption_incident then folds them into
+    the host + db + UTC-hour incident: ONE Kanban owner per episode, later occurrences comment on it while it is open."""
+    out = []
+    for prof, h in homes(home):
+        out += corruption_signals(read_new(h / "logs" / "errors.log", cur, f"corruption:{prof}", now),
+                                  home, prof, now, host)
     return out
 
 
@@ -1793,6 +1861,7 @@ def collect(home: Path, cur: dict, host: str, now: Optional[float] = None) -> Li
     now = now or time.time()
     out = []
     for kind, fn in (("errors", lambda: collect_errors(home, cur, now, host)),
+                     ("corruption", lambda: collect_corruption(home, cur, now, host)),
                      ("worker", lambda: collect_worker(home, cur, now, host)),
                      ("cron", lambda: collect_cron(home, cur, now, host)),
                      ("kanban", lambda: collect_kanban(home, cur, now, host)),
