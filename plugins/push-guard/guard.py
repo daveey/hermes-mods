@@ -48,6 +48,7 @@ import shlex
 import shutil
 import subprocess
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -382,32 +383,51 @@ def base_overlap(slug: str, base: str, head: str, number=None) -> dict:
         return {**out, "error": f"the PR's file list could not be read ({err})"}
     moved_files: list[str] = []
     moved: set = set()
-    for page in range(1, STALE_COMMIT_CAP // 100 + 2):
-        data, err = _compare(slug, mb, tip, page)
-        if data is None:
-            return {**out, "error": f"the base branch since {mb[:12]} could not be read ({err})"}
-        if page == 1:
-            moved_files = _names(data)
-        commits = [str(c.get("sha")) for c in data.get("commits") or [] if isinstance(c, dict) and c.get("sha")]
-        moved.update(commits)
-        if len(commits) < 100:
+    # `behind` commits since the merge-base span ceil(behind/100) compare pages; read them concurrently (each read
+    # is ~2 s on the live API and the whole hook has a 30 s budget). A further page is read only if the last one is
+    # still full (the count moved while reading).
+    page, last = 1, STALE_COMMIT_CAP // 100 + 1
+    count = max(1, -(-behind // 100))
+    while page <= last:
+        pages = list(range(page, min(last, page + count - 1) + 1))
+        full = False
+        for n, (data, err) in zip(pages, _parallel(lambda k: _compare(slug, mb, tip, k), pages)):
+            if data is None:
+                return {**out, "error": f"the base branch since {mb[:12]} could not be read ({err})"}
+            if n == 1:
+                moved_files = _names(data)
+            commits = [str(c.get("sha")) for c in data.get("commits") or [] if isinstance(c, dict) and c.get("sha")]
+            moved.update(commits)
+            full = len(commits) >= 100
+        if not full:
             break
+        page, count = pages[-1] + 1, 1
     hits = [p for p in pr_files if p in set(moved_files)]
     if len(moved_files) >= COMPARE_FILE_CAP and not hits:
         # truncated list with no overlap in view: ask each PR path's history which of those commits touch it
         if len(pr_files) > PATH_QUERY_CAP:
             return {**out, "error": (f"the base branch changed {COMPARE_FILE_CAP}+ files since {mb[:12]} and the PR "
                                      f"changes {len(pr_files)} (more than {PATH_QUERY_CAP} to check one by one)")}
-        for p in pr_files:
-            got = _path_commits(slug, tip, p, moved)
+        for p, got in zip(pr_files, _parallel(lambda q: _path_commits(slug, tip, q, moved), pr_files)):
             if got is None:
                 return {**out, "error": f"the base branch history of {p} could not be read"}
             if got:
                 out["overlap"][p] = got
         return out
-    for p in hits:
-        out["overlap"][p] = _path_commits(slug, tip, p, moved) or []
+    for p, got in zip(hits, _parallel(lambda q: _path_commits(slug, tip, q, moved), hits)):
+        out["overlap"][p] = got or []
     return out
+
+
+PARALLEL_READS = 8  # concurrent GitHub reads per overlap check
+
+
+def _parallel(fn, items: list) -> list:
+    """fn over items, PARALLEL_READS at a time, results in item order."""
+    if len(items) <= 1:
+        return [fn(i) for i in items]
+    with ThreadPoolExecutor(max_workers=min(PARALLEL_READS, len(items))) as pool:
+        return list(pool.map(fn, items))
 
 
 def _overlap_block(g: dict, data: dict, what: str, number) -> Optional[str]:

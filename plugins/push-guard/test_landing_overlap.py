@@ -8,6 +8,7 @@ so the 300-file truncation of the 250-commit compare is the real one.
 Run: python3 -m pytest -q -p no:cacheprovider test_landing_overlap.py
 """
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -127,3 +128,34 @@ def test_head_on_top_of_main_needs_no_compare_beyond_the_first(core, monkeypatch
     monkeypatch.setattr(guard, "_gh_json", gh)
     assert _merge(work, gh, "terminal", 5) is None
     assert sum("/compare/" in c[1] for c in gh.calls if c[0] == "api") == 1
+
+
+class SlowGH(RecordedGH):
+    """RecordedGH where every answer takes DELAY seconds, like the live API (~2 s per call on the hub)."""
+    DELAY = 0.2
+
+    def __call__(self, args, cwd=None):
+        time.sleep(self.DELAY)
+        return super().__call__(args, cwd)
+
+
+def test_history_reads_run_in_parallel_within_the_hook_budget(core, monkeypatch):
+    """A PR whose base moved 300+ files needs a compare page per 100 base commits plus one history read per PR
+    path. Read one by one at live latency (~2 s each) that took 37 s for daveey/hermes#810, past the 30 s
+    pre_tool_call budget, so the host dropped the hook and refused an admissible merge. The reads after the
+    first compare must overlap: wall time well under the serial sum, same verdict."""
+    work, _ = core
+    rec = json.loads(json.dumps(PR475))
+    page1 = next(k for k in rec["calls"] if k.endswith("per_page=100&page=1") and "/compare/41b7bad" in k)
+    kept = [f for f in rec["calls"][page1]["files"] if f["filename"] not in OVERLAP_475]
+    rec["calls"][page1]["files"] = kept + [{"filename": "docs/pad-1.md"}, {"filename": "docs/pad-2.md"}]
+    gh = SlowGH(rec, 475, "fix/session-open-stalls")
+    monkeypatch.setattr(guard, "_gh_json", gh)
+    t0 = time.monotonic()
+    got = _merge(work, gh, "terminal", 475)
+    wall = time.monotonic() - t0
+    assert got and all(p in got["message"] for p in OVERLAP_475)
+    assert "kanban_reader_lifecycle.py" not in got["message"]
+    serial = len(gh.calls) * SlowGH.DELAY
+    assert len(gh.calls) >= 8, gh.calls
+    assert wall < serial / 2, (wall, serial, len(gh.calls))
