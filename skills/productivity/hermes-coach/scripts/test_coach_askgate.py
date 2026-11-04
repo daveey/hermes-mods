@@ -288,6 +288,47 @@ class RouteToLane(unittest.TestCase):
         self.assertEqual([d["session_id"] for d in filed], ["s_fix", "s_ask", "s_known"])
         self.assertEqual(len(rest), 3)
 
+    def seen_data(self, host, fps):
+        import json, tempfile
+        d = Path(tempfile.mkdtemp())
+        (d / host).mkdir()
+        (d / host / "selfheal-seen.json").write_text(json.dumps(fps))
+        return d
+
+    def test_detection_on_another_host_is_not_refiled(self):
+        # plugin-03d4509c8a: the MacBook detector saw s_fix's turn (agent-a193bf9868, shadow), but ask-gate runs on
+        # the hub whose own selfheal.json has nothing; the feed's <data>/macbook/selfheal-seen.json must count.
+        t = self.hits()[0]["t"]
+        data = self.seen_data("macbook", {"agent-a193bf9868": {"first": t + 30, "last": t + 30,
+                                                               "sessions": ["s_fix"]}})
+        filed, detected = [], []
+        owned, rest = g.route_hits(self.hits(), self.home({}), filer=lambda d: filed.append(d) or
+                                   {"action": "would_file"}, detected=detected, data=data)
+        self.assertEqual([d["session_id"] for d in filed], ["s_ask", "s_known"])
+        self.assertEqual([(h["session"], h["detected_fp"]) for h in detected], [("s_fix", "agent-a193bf9868")])
+        self.assertIn("agent-a193bf9868", "\n".join(g.detected_lines(detected)))
+
+    def test_other_host_detection_on_another_day_still_files(self):
+        t = self.hits()[0]["t"]
+        data = self.seen_data("macbook", {"agent-0000000000": {"first": t - 20 * 86400, "last": t - 19 * 86400,
+                                                               "sessions": ["s_fix"]}})
+        filed, detected = [], []
+        g.route_hits(self.hits(), self.home({}), filer=lambda d: filed.append(d) or {"action": "would_file"},
+                     detected=detected, data=data)
+        self.assertEqual(detected, [])
+        self.assertEqual([d["session_id"] for d in filed], ["s_fix", "s_ask", "s_known"])
+
+    def test_still_flags_sees_other_host_detection(self):
+        # the drain re-check of a queued row must use the same cross-host detections as the weekly pass
+        t = self.hits()[0]["t"]
+        data = self.seen_data("macbook", {"agent-a193bf9868": {"first": t + 30, "last": t + 30,
+                                                               "sessions": ["s_fix"]}})
+        row = {"session_id": "s_fix", "quote": "root cause and fix this please", "hit_t": t}
+        why = g.still_flags(row, homes=[self.home({})], data=data)
+        self.assertIsNotNone(why)
+        self.assertIn("agent-a193bf9868", why)
+        self.assertIsNone(g.still_flags(row, homes=[self.home({})], data=self.seen_data("mini", {})))
+
     def test_queued_payload_carries_hit_t_and_details_fallback_parses(self):
         # still_flags re-checks a queued row by its hit time: new payloads carry hit_t; old rows parse `details`
         hits = self.hits()

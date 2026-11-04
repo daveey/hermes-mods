@@ -10,6 +10,8 @@ Also copies this host's private curriculum overlay (<home>/coach/curriculum.yaml
 <repo-dir>/curriculum/<host>.yaml, so the miner on the coach Bot can check its adoption tests.
 Also flushes due skill-outcomes records (plugins/skill-outcomes/outcomes.py flush --all-profiles) and copies this
 host's <home>/logs/skill-outcomes.jsonl (+ profiles) to <repo-dir>/<host>/skill-outcomes.jsonl for the weekly rollup.
+Also copies this host's self-heal detections (<home>/coach/selfheal.json, + profiles; ids and times only) to
+<repo-dir>/<host>/selfheal-seen.json, so the hub's ask-gate does not re-file a turn another host's detector saw.
 """
 import argparse, json, os, re, subprocess, sys, time
 from pathlib import Path
@@ -122,6 +124,40 @@ def collect_skill_outcomes(home, repo, host, runner=subprocess.run, plugin=None)
     return len(rows)
 
 
+def collect_selfheal_seen(home, repo, host):
+    """Copy this host's self-heal detections (home + profiles <coach>/selfheal.json, shadow or live) to
+    <repo>/<host>/selfheal-seen.json = {fingerprint: {first, last, sessions}}, a union with what is there so a
+    pruned local file never drops one. The hub's ask-gate reads every host's copy: detection state is per host, so a
+    MacBook detection was invisible to it and the turn was re-filed (plugin-03d4509c8a). Only ids and times are
+    copied, never the symptom text. Rewritten only when it changes. Returns the fingerprint count, or None."""
+    home = Path(home)
+    dest = Path(repo) / host / "selfheal-seen.json"
+    srcs = [dest, home / "coach" / "selfheal.json", *sorted(home.glob("profiles/*/coach/selfheal.json"))]
+    seen = {}
+    for p in srcs:
+        try:
+            st = json.loads(p.read_text())
+        except Exception:
+            continue
+        for fp, v in (st.items() if isinstance(st, dict) else ()):
+            if not isinstance(v, dict) or not v.get("sessions"):
+                continue
+            first = v.get("first") or 0
+            last = v.get("last") or first
+            cur = seen.setdefault(fp, {"first": first, "last": last, "sessions": []})
+            cur["first"], cur["last"] = min(cur["first"], first), max(cur["last"], last)
+            cur["sessions"] += [s for s in v["sessions"] if isinstance(s, str) and s not in cur["sessions"]]
+    if not seen:
+        return None
+    for v in seen.values():
+        v["sessions"].sort()
+    body = json.dumps(dict(sorted(seen.items())), indent=1) + "\n"
+    if not dest.exists() or dest.read_text(errors="replace") != body:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(body)
+    return len(seen)
+
+
 def write_feed_status(repo, host, out, now=None):
     """<repo>/<host>/feed-status.json = {signals: state, detail, since}: lets the hub see a Mac forwarder that never
     reached it (no config, ssh refused, crash) from the data repo, without a shell on that Mac. Rewritten only when
@@ -192,6 +228,10 @@ def main():
         status["skill_outcomes"] = collect_skill_outcomes(home, repo, a.host)
     except Exception as e:  # never fail the digest feed on this
         status["skill_outcomes"] = f"error: {type(e).__name__}: {e}"
+    try:
+        status["selfheal_seen"] = collect_selfheal_seen(home, repo, a.host)
+    except Exception as e:  # never fail the digest feed on this
+        status["selfheal_seen"] = f"error: {type(e).__name__}: {e}"
     if (repo / a.host).exists():
         write_feed_status(repo, a.host, status["signals"])
         git(repo, "add", "-A", a.host)

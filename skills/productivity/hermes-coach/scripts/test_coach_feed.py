@@ -171,5 +171,60 @@ class SkillOutcomesCopy(unittest.TestCase):
         self.assertTrue(coach_feed.skill_outcomes_plugin().exists())
 
 
+class SelfhealSeenCopy(unittest.TestCase):
+    """<repo>/<host>/selfheal-seen.json: this host's detections (shadow or live) for the hub's ask-gate
+    (plugin-03d4509c8a: a MacBook detection was invisible to the hub, so ask-gate re-filed the turn)."""
+
+    def test_copies_home_and_profiles_as_a_union_without_symptom_text(self):
+        d = Path(tempfile.mkdtemp())
+        home, repo = d / "home", d / "repo"
+        (home / "coach").mkdir(parents=True)
+        (home / "profiles" / "bb" / "coach").mkdir(parents=True)
+        (home / "coach" / "selfheal.json").write_text(json.dumps({
+            "agent-a193bf9868": {"first": 10, "last": 20, "count": 2, "sessions": ["s1"], "symptom": "secret-ish"},
+            "bad": "not a dict"}))
+        (home / "profiles" / "bb" / "coach" / "selfheal.json").write_text(json.dumps({
+            "agent-a193bf9868": {"first": 5, "last": 15, "sessions": ["s2"]}}))
+        dest = repo / "macbook" / "selfheal-seen.json"
+        dest.parent.mkdir(parents=True)
+        dest.write_text(json.dumps({"agent-old": {"first": 1, "last": 2, "sessions": ["s0"]}}))  # local pruned
+        n = coach_feed.collect_selfheal_seen(home, repo, "macbook")
+        self.assertEqual(n, 2)
+        st = json.loads(dest.read_text())
+        self.assertEqual(st["agent-old"], {"first": 1, "last": 2, "sessions": ["s0"]})
+        self.assertEqual(st["agent-a193bf9868"], {"first": 5, "last": 20, "sessions": ["s1", "s2"]})
+        self.assertNotIn("secret-ish", dest.read_text())
+        mtime = dest.stat().st_mtime_ns
+        coach_feed.collect_selfheal_seen(home, repo, "macbook")
+        self.assertEqual(dest.stat().st_mtime_ns, mtime)  # unchanged -> not rewritten (no commit churn)
+
+    def test_nothing_to_collect(self):
+        d = Path(tempfile.mkdtemp())
+        self.assertIsNone(coach_feed.collect_selfheal_seen(d / "h", d / "r", "hub"))
+        self.assertFalse((d / "r").exists())
+
+    def test_main_commits_it_and_askgate_reads_it(self):
+        d = Path(tempfile.mkdtemp())
+        repo, home = d / "repo", d / "home"
+        repo.mkdir(); (home / "coach").mkdir(parents=True)
+        (home / "coach" / "selfheal.json").write_text(json.dumps({
+            "agent-a193bf9868": {"first": 1792600030, "last": 1792600030, "sessions": ["s_fix"]}}))
+        g(repo, "init", "-q", "-b", "main")
+        (repo / "README.md").write_text("x\n")
+        g(repo, "add", "-A"); g(repo, "commit", "-qm", "base")
+        r = subprocess.run([sys.executable, str(HERE / "coach_feed.py"), "--host", "macbook", "--repo-dir",
+                            str(repo), "--home", str(home), "--no-push"], capture_output=True, text=True,
+                           env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("agent-a193bf9868", g(repo, "show", "HEAD:macbook/selfheal-seen.json"))
+        import coach_askgate
+        hub = d / "hub"
+        hub.mkdir()
+        seen = coach_askgate.detected_sessions(hub, data=repo)
+        self.assertEqual(coach_askgate.detection_for({"session": "s_fix", "t": 1792600000}, seen),
+                         "agent-a193bf9868")
+
+
 if __name__ == "__main__":
     unittest.main()

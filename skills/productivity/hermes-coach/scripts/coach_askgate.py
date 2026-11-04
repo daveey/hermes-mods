@@ -26,6 +26,10 @@ With --last-week the report also carries a "Skill outcomes" section (plugins/ski
 tick-offs, first-pass rate, mean fix rounds and correction rate for that week, read from every host's
 <data>/<host>/skill-outcomes.jsonl (coach_feed copies them) plus the local --home logs. --post also writes it to
 reports/askgate/<monday>-skill-outcomes.md and puts it in the review card body.
+
+A hit whose turn the self-heal detector already saw (shadow or live) is listed as "Detected, not a miss" instead of
+filed. Detections come from the local <home>/coach/selfheal.json plus every host's <data>/<host>/selfheal-seen.json
+(coach_feed copies them), since ask-gate runs on the hub and detection state is per host (plugin-03d4509c8a).
 """
 import argparse, glob, json, os, re, subprocess, sys, time
 from datetime import datetime, timedelta
@@ -505,20 +509,26 @@ def lane_sessions(home):
 DETECT_BEFORE, DETECT_AFTER = 12 * 3600, 48 * 3600  # a detection of the hit's turn lands within this window of it
 
 
-def detected_sessions(home):
-    """Sessions the self-heal detector already saw, shadow or live: <coach>/selfheal.json fingerprint -> sessions.
-    -> {session: [(fingerprint, first, last), ...]}. Shadow mode only logs, so these have no lane filing."""
-    try:
-        st = json.loads((Path(home) / "coach" / "selfheal.json").read_text())
-    except Exception:
-        return {}
+def detected_sessions(home, data=None):
+    """Sessions the self-heal detector already saw, shadow or live: <coach>/selfheal.json fingerprint -> sessions,
+    merged with every other host's copy <data>/*/selfheal-seen.json (coach_feed writes it; detection state is per
+    host, and ask-gate runs on the hub: plugin-03d4509c8a). -> {session: [(fingerprint, first, last), ...]}. Shadow
+    mode only logs, so these have no lane filing."""
+    srcs = [Path(home) / "coach" / "selfheal.json"]
+    if data is not None:
+        srcs += sorted(Path(data).expanduser().glob("*/selfheal-seen.json"))
     out = {}
-    for fp, v in (st.items() if isinstance(st, dict) else ()):
-        if not isinstance(v, dict):
+    for src in srcs:
+        try:
+            st = json.loads(src.read_text())
+        except Exception:
             continue
-        first, last = v.get("first") or 0, v.get("last") or v.get("first") or 0
-        for s in v.get("sessions") or ():
-            out.setdefault(s, []).append((fp, first, last))
+        for fp, v in (st.items() if isinstance(st, dict) else ()):
+            if not isinstance(v, dict):
+                continue
+            first, last = v.get("first") or 0, v.get("last") or v.get("first") or 0
+            for s in v.get("sessions") or ():
+                out.setdefault(s, []).append((fp, first, last))
     return out
 
 
@@ -586,7 +596,8 @@ def still_flags(row, homes=None, data=None):
     row with today's full verdict, in route_hits' order, so any later rule fix retracts the rows it would not have
     queued (plugin-656a006c84: queued 11 minutes before detection_for existed, filed a day later anyway). Only
     positive evidence withdraws: a generated quote, an Inbox Do-it press (the session digest's notice before the
-    turn, plugin-9ab6e8e868), a detection of that session near the hit (selfheal.json), or a lane filing for that
+    turn, plugin-9ab6e8e868), a detection of that session near the hit (selfheal.json, or another host's
+    <data>/*/selfheal-seen.json: plugin-03d4509c8a), or a lane filing for that
     session (selfheal_lane.json). Any error -> None, so the row files as before."""
     try:
         q = row.get("quote") or ""
@@ -604,7 +615,7 @@ def still_flags(row, homes=None, data=None):
             if s in lane_sessions(home):
                 return f"monitor no longer flags (ask-gate): the self-heal lane already has a filing for session {s}"
             if t is not None:
-                fp = detection_for({"session": s, "t": t}, detected_sessions(home))
+                fp = detection_for({"session": s, "t": t}, detected_sessions(home, data=coach_data_dirs(data)[0]))
                 if fp:
                     return (f"monitor no longer flags (ask-gate): the self-heal detector already saw this turn "
                             f"({fp}, session {s})")
@@ -618,7 +629,7 @@ def detected_lines(hits):
     if not hits:
         return []
     lines = [f"Detected (shadow/live), not a miss: {len(hits)} hit{'s' if len(hits) != 1 else ''} the self-heal "
-             "detector already saw (coach/selfheal.json), not re-filed:"]
+             "detector already saw (coach/selfheal.json on this host or <host>/selfheal-seen.json), not re-filed:"]
     lines += [f"- {fmt_ts(h['t'])} · session `{h['session']}` · `{h['detected_fp']}`: \"{quote(h, 100)}\"" for h in hits]
     return lines
 
@@ -646,14 +657,15 @@ def hit_defect(h):
             "prompt": prompt, "component": comp, "session_id": h["session"], "quote": q}
 
 
-def route_hits(hits, home, filer=None, signals=None, detected=None):
+def route_hits(hits, home, filer=None, signals=None, detected=None, data=None):
     """File every hit the lane does not already own. -> (owned hits, not-owned hits). In shadow mode nothing is
     owned (file_defect only logs), so the card keeps its review prompt until the lane goes live. A hit whose turn the
     detector already saw (selfheal.json, shadow or live) is neither: it is appended to ``detected`` (with
-    ``detected_fp``) and never filed, since no filing there is not a detector miss (plugin-d55a1b9bb1)."""
+    ``detected_fp``) and never filed, since no filing there is not a detector miss (plugin-d55a1b9bb1). ``data``
+    (the coach data repo) adds every other host's detections, <data>/*/selfheal-seen.json (plugin-03d4509c8a)."""
     signals = signals or _coach_mod("signals")
     known = lane_sessions(home)
-    seen = detected_sessions(home)
+    seen = detected_sessions(home, data=data)
     owned, rest = [], []
     for h in hits:
         if h["session"] in known:
@@ -805,7 +817,7 @@ def main():
             home = Path(a.home[0] if a.home else os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
             detected = []
             try:
-                owned, rest_lane = route_hits(lane_hits, home, detected=detected)
+                owned, rest_lane = route_hits(lane_hits, home, detected=detected, data=data)
             except Exception as e:
                 owned, rest_lane, detected = [], lane_hits, []
                 sys.stderr.write(f"self-heal routing failed: {e}\n")
