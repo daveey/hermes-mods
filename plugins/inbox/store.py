@@ -53,6 +53,14 @@ _lock = threading.RLock()
 _UNSET = object()  # explicit expected=None is invalid, never an unconditional fallback
 
 
+class SettlementError(ValueError):
+    """Stable machine-readable producer settlement refusal."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
 class PosterMuted(ValueError):
     """The poster's recent cards were all dismissed; its posts are refused until it is fixed + unmuted."""
 
@@ -288,7 +296,7 @@ CREATE TABLE IF NOT EXISTS key_releases (
 """
 # Added with card types; ALTERed into older sidecars on open (idempotent).
 _COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"), ("outcome", "TEXT"),
-            ("outcome_value", "TEXT"), ("resolved_at", "REAL"), ("outcome_task", "TEXT"),
+            ("outcome_value", "TEXT"), ("resolved_at", "REAL"), ("resolved_by", "TEXT"), ("outcome_task", "TEXT"),
             ("cwd_explicit", "INTEGER"), ("ask_json", "TEXT"))  # NULL = legacy/unknown
 # Not "types.py": a sibling named like the stdlib module shadows it whenever this dir is on sys.path.
 _TYPES = Path(__file__).resolve().parent / "card_types.py"
@@ -737,6 +745,7 @@ class Inbox:
                 "task": None if item["state"] == "queuing" else item.get("outcome_task"), "revision": revision,
             "ask": item.get("ask_json"),
                 "item_state": item["state"], "updated_at": item["updated_at"],
+                "resolved_by": item.get("resolved_by"), "resolved_at": item.get("resolved_at"),
                 "message_count": len(messages),
                 "last_message_id": messages[-1]["id"] if messages else None}
 
@@ -1255,6 +1264,82 @@ class Inbox:
             item.update(outcome=act["id"], outcome_value=value, fields_json=json.dumps(fields),
                         action=act["id"], kind=act["kind"])
             return item
+
+    def settle(self, session_id: str, *, key: str, poster: str, outcome: str,
+               body: str) -> dict[str, Any]:
+        """Record a producer result, never a user action or a new decision.
+
+        The Update, lifecycle and attribution commit together using the same attached
+        transaction as conditional posting. An interrupted transaction rolls back; a
+        retry after commit returns the persisted result without appending again.
+        Only failed -> vetoed may correct a previous terminal producer result.
+        """
+        if not isinstance(key, str) or not key.strip():
+            raise SettlementError("invalid_key")
+        if not isinstance(poster, str) or not poster.strip():
+            raise SettlementError("invalid_poster")
+        if outcome not in ("posted", "vetoed", "expired", "failed"):
+            raise SettlementError("invalid_outcome")
+        if not isinstance(body, str) or not body.strip() or len(body) > MAX_BODY:
+            raise SettlementError("invalid_body")
+        with self._atomic() as (conn, db):
+            row = conn.execute("SELECT * FROM inbox.items WHERE session_id=?", (session_id,)).fetchone()
+            if row is None:
+                raise SettlementError("not_found")
+            item = dict(row)
+            if item["key"] != key:
+                raise SettlementError("key_mismatch")
+            if item["poster"] != poster:
+                raise SettlementError("poster_mismatch")
+            session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if session is None:
+                raise SettlementError("session_missing")
+            actor = "producer:" + poster
+
+            def result(status, state=None):
+                return {"status": status, "session_id": session_id, "key": key,
+                        "state": state or item["state"], "outcome": item.get("outcome"),
+                        "resolved_by": item.get("resolved_by")}
+
+            if item["state"] == "queuing":
+                raise SettlementError("pending_action")
+            producer_resolved = item["state"] == "resolved" and item.get("resolved_by") == actor
+            if producer_resolved:
+                if item["outcome"] == outcome:
+                    return result("already-settled")
+                if (item["outcome"], outcome) != ("failed", "vetoed"):
+                    raise SettlementError("outcome_conflict")
+                # A visible conversation archived after settlement is a user
+                # disposition, unlike the hidden session retired by settle itself.
+                if session["archived"] and not session["hidden"]:
+                    return result("skipped")
+            elif item["state"] not in ("open", "accepted") or session["archived"]:
+                return result("skipped", "archived" if session["archived"] and
+                              item["state"] in ("open", "accepted") else None)
+
+            # Core transcript encoding, counters and mutation guards must run on our
+            # transaction, not a separately committed SessionDB connection.
+            class Writer:
+                def __getattr__(self, name):
+                    return getattr(db, name)
+
+                def _execute_write(self, fn, **kwargs):
+                    return fn(conn)
+
+            db._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
+            now = self.clock()
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+            type(db).append_message(Writer(), session_id, "assistant",
+                                    f"**Update {stamp}**\n\n{body}")
+            # Preserve accepted/visible conversations. A hidden open decision can
+            # retire its session; producer corrections preserve its current visibility.
+            if not producer_resolved and item["state"] == "open" and session["hidden"]:
+                conn.execute("UPDATE sessions SET archived=1 WHERE id=?", (session_id,))
+            conn.execute("UPDATE inbox.items SET state='resolved',outcome=?,resolved_by=?,"
+                         "resolved_at=?,updated_at=?,outcome_value=NULL,outcome_task=NULL WHERE session_id=?",
+                         (outcome, actor, now, now, session_id))
+            item.update(state="resolved", outcome=outcome, resolved_by=actor)
+            return result("resolved")
 
     def outcome(self, key: str) -> Optional[dict[str, Any]]:
         """What happened to the newest card with *key*: {key, state, outcome, value, fields, at,

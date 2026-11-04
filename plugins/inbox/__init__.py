@@ -261,6 +261,14 @@ def _setup_cli(parser) -> None:
     t.add_argument("name", nargs="?")
     o = sub.add_parser("outcome", help="what happened to the newest card with a key")
     o.add_argument("key")
+    s = sub.add_parser("settle", help="record a terminal producer result without a user action")
+    def settle_usage_error(message):
+        print(json.dumps({"status": "error", "error": "invalid_arguments", "message": message}))
+        raise SystemExit(2)
+    s.error = settle_usage_error
+    s.add_argument("session_id")
+    for name in ("key", "poster", "outcome", "body"):
+        s.add_argument("--" + name, required=True)
     x = sub.add_parser("act", help="run one of a card's actions")
     x.add_argument("session_id")
     x.add_argument("action")
@@ -312,6 +320,17 @@ def _run_cli(args) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        return 0
+    if cmd == "settle":
+        try:
+            result = inbox.settle(args.session_id, key=args.key, poster=args.poster,
+                                  outcome=args.outcome, body=args.body)
+        except Exception as exc:
+            print(json.dumps({"status": "error", "error": getattr(exc, "code", "settlement_failed"),
+                              "session_id": args.session_id, "key": args.key,
+                              "message": str(exc), "exception_type": type(exc).__name__}))
+            return 1
+        print(json.dumps(result))
         return 0
     if cmd == "outcome":
         out = inbox.outcome(args.key)

@@ -16,6 +16,53 @@ The card ends with the full **Proposed:** prompt, or, when the poster passes `pr
 
 Re-posting with the same `key` updates the open message (new assistant note, title, prompt; marked unread again) instead of adding a duplicate. Once you replied to it (accepted, not archived), a re-post with that key lands in that chat as an unread update instead of opening a second card; after Archive the next post is a new card. At most 20 open messages are kept. Past that, the oldest read ones are archived.
 
+## Producer settlement
+
+A producer reports the terminal result of an **existing** decision without impersonating a
+user action, reposting a status as a new decision, or treating Archive as resolution:
+
+```sh
+hermes inbox settle SESSION_ID --key KEY --poster POSTER --outcome posted --body 'Result details'
+```
+
+Python: `Inbox.settle(session_id, key=key, poster=poster, outcome=outcome, body=body)`.
+Session ID, key and stored poster must match exactly (no normalization). Outcomes are
+`posted`, `vetoed`, `expired`, `failed`; body must be nonempty and at most 20,000 characters.
+The result has exactly these fields:
+
+```json
+{"status":"resolved","session_id":"SESSION_ID","key":"KEY","state":"resolved","outcome":"posted","resolved_by":"producer:POSTER"}
+```
+
+`status` is `resolved`, `already-settled` (same outcome retry), or `skipped` (a user
+archived/resolved the item). Skipped results return the **stored** outcome/attribution,
+including nulls, not the requested outcome. Success exits 0. Runtime errors exit 1 with
+JSON `{status:"error", error:CODE, session_id, key, message, exception_type}`. Missing
+arguments exit 2 with JSON `{status:"error", error:"invalid_arguments", message}`.
+`SettlementError.code` identifies `invalid_key`, `invalid_poster`, `invalid_outcome`,
+`invalid_body`, `not_found`, `key_mismatch`, `poster_mismatch`, `session_missing`,
+`outcome_conflict`, or `pending_action` (retry when the in-flight user action finishes).
+Other runtime failures use `settlement_failed` with the core exception type/message.
+Active-turn leases and closed/compressed-session guards remain enforced: retry active
+turn conflicts after the turn ends; do not silently redirect an exact-ID settlement to
+another session. No tool or REST settlement endpoint is added.
+
+Open or accepted items become resolved, leave the open Inbox, and gain one assistant
+**Update** containing the result. Accepted/visible conversations stay visible. Hidden open
+sessions are archived as part of settlement. Same-outcome retries do not alter the Update,
+body or timestamps. Only `failed` → `vetoed` is a permitted correction, adding one new
+Update without replacing unrelated conversation messages. A user-archived visible chat is
+not corrected. `outcome(key)` exposes `resolved_by` and `resolved_at`.
+
+Update, session finalization and sidecar attribution share the existing attached SQLite
+transaction. Exceptions/process interruption before commit roll back together; retries
+following commit are no-ops. As with conditional posting, SQLite WAL does not guarantee
+cross-file atomicity under host power loss; this is not a power-loss recovery protocol.
+Tests in `tests/test_settle.py` use real temporary Inbox/session databases, including
+CLI processes, concurrent retries, migration, injected append/finalization failures,
+process death before commit, user dispositions, active-turn protection and correction.
+No live Inbox probes are used.
+
 ## What belongs in the Inbox (and the noise breaker)
 
 The Inbox is for **decisions only David can make**: spend, an irreversible action, a judgment call. A failure an
