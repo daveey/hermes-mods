@@ -26,9 +26,12 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+_TL = threading.local()  # detect_complaint -> handle hand-off of an untraced complaint judgment (see handle)
 
 if __package__:
     from .reply_check import CROSS_SESSION_HEADER, CROSS_SESSION_RE, render_tool_log
@@ -691,43 +694,54 @@ def resample_stage1(s1: float, user_text) -> bool:
     return bool(FIX_RESAMPLE and s1 < GATE and FIX_RE.search(clean_user(user_text)))
 
 
-def _ask(llm: Callable[[str, str], str], system: str, prompt: str, tries: int = 2) -> Optional[dict]:
+def _ask(llm: Callable[[str, str], str], system: str, prompt: str, tries: int = 2,
+         trace: Optional[dict] = None, stage: str = "") -> Optional[dict]:
     """One judge stage, retried once when the call fails or the answer does not parse (an empty flash answer is
-    common). None = no opinion, which the cascade leaves out; it is never a 'no' vote."""
+    common). None = no opinion, which the cascade leaves out; it is never a 'no' vote. With `trace`, a stage that
+    exhausts its tries records why in trace["exhausted"] ({stage, error, raised}): without it an outage of the judge
+    looked exactly like "no complaints" for a week (plugin-89461de0ed)."""
+    last, raised = "", False
     for _ in range(tries):
         try:
-            v = parse(llm(system, prompt))
-        except Exception:
-            v = None
+            raw = llm(system, prompt)
+            v = parse(raw)
+            if not v:
+                last, raised = ("empty answer" if not str(raw or "").strip()
+                                else f"unparsed answer: {str(raw)[:120]}"), False
+        except Exception as exc:
+            v, last, raised = None, f"{type(exc).__name__}: {exc}"[:300], True
         if v:
             return v
+    if trace is not None:
+        trace.setdefault("exhausted", []).append({"stage": stage, "error": last, "raised": raised})
     return None
 
 
 def complaint_verdict(prev_reply: str, user_text, llm: Callable[[str, str], str], tool_log=None,
-                      confirm: Optional[Callable[[str, str], str]] = None, context: str = "") -> Optional[dict]:
+                      confirm: Optional[Callable[[str, str], str]] = None, context: str = "",
+                      trace: Optional[dict] = None) -> Optional[dict]:
     """The complaint cascade, before the threshold: judge (COMPLAINT_SYS); below GATE stop there. Otherwise a second
     flash opinion (COMPLAINT_STRICT_SYS) and, when configured, the confirm model on COMPLAINT_SYS; p_defect = the mean
     of the stage scores (a non-defect kind scores 0; a stage with no answer after a retry is left out, since counting
     it as 0 halved real catches). Component/symptom come from the strongest stage."""
     prompt = complaint_prompt(prev_reply, user_text, tool_log, context)
     system = _with_profile(COMPLAINT_SYS)
-    v1 = _ask(llm, system, prompt)
+    v1 = _ask(llm, system, prompt, trace=trace, stage="s1")
     if not v1:
         return None
     s1 = _score(v1)
     if s1 < GATE and resample_stage1(s1, user_text):
         # Flash at temp 0 is not deterministic: "why are all the dots red? [screenshot]" scored 0.7, 0.6 and 0.05 on
         # three identical calls. One more sample on a borderline score or an explicit fix request; the max counts.
-        v1b = _ask(llm, system, prompt)
+        v1b = _ask(llm, system, prompt, trace=trace, stage="s1b")
         if v1b and _score(v1b) > s1:
             v1, s1 = v1b, _score(v1b)
     if s1 < GATE:
         return {**v1, "p_defect": s1, "stages": [s1]}
-    v2 = _ask(llm, _with_profile(COMPLAINT_STRICT_SYS), prompt)
+    v2 = _ask(llm, _with_profile(COMPLAINT_STRICT_SYS), prompt, trace=trace, stage="s2")
     stages, best = [s1] + ([_score(v2)] if v2 else []), v1
     if confirm:
-        v3 = _ask(confirm, _with_profile(COMPLAINT_SYS), prompt)
+        v3 = _ask(confirm, _with_profile(COMPLAINT_SYS), prompt, trace=trace, stage="confirm")
         if v3:
             stages.append(_score(v3))
         best = v3 if v3 and _score(v3) > 0 else best
@@ -739,19 +753,65 @@ def complaint_verdict(prev_reply: str, user_text, llm: Callable[[str, str], str]
 def detect_complaint(prev_reply: str, user_text, llm: Optional[Callable[[str, str], str]] = None,
                      threshold: float = THRESHOLD, tool_log=None,
                      confirm: Optional[Callable[[str, str], str]] = None, context: str = "",
-                     gap_s: Optional[float] = None) -> Optional[dict]:
+                     gap_s: Optional[float] = None, trace: Optional[dict] = None) -> Optional[dict]:
     """pre_llm_call path: core's resume note (backend stopped mid-turn) is a machine signal; otherwise prefilter,
     then the cascade (complaint_verdict) on (previous reply + its turn's tool log, user message). Returns
-    {p_defect, kind, component, symptom, fingerprint, source, stages} or None. Fail-open."""
+    {p_defect, kind, component, symptom, fingerprint, source, stages} or None. Fail-open; with `trace` it records
+    the outcome (signal / prefiltered / no_opinion / error / below / hit), score, stages and errors."""
+    t = trace if trace is not None else {}
+    if trace is None:
+        # An older coach __init__ (a long-running backend keeps the one it booted with while this module hot-reloads)
+        # passes no trace: park it for handle(), which that __init__ calls next on this thread, to log.
+        _TL.pending = t
     try:
         if is_resume_note(user_text):
+            t["outcome"] = "signal"
             return resume_signal(user_text, gap_s)  # machine-written: never sent to the complaint judge
         if not prefilter(user_text):
+            t["outcome"] = "prefiltered"
             return None
-        return _verdict(complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm, context),
-                        "complaint", threshold)
-    except Exception:
+        v = complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm, context, trace=t)
+        if not v:
+            ex = t.get("exhausted") or [{}]
+            t["outcome"] = "error" if ex[0].get("raised") else "no_opinion"
+            t["error"] = ex[0].get("error") or ""
+            return None
+        hit = _verdict(v, "complaint", threshold)
+        t.update(outcome="hit" if hit else "below", score=_score(v) if not hit else v["p_defect"],
+                 stages=v.get("stages") or [], kind=v.get("kind"))
+        if hit:
+            t["fingerprint"] = hit["fingerprint"]
+        return hit
+    except Exception as exc:
+        t.update(outcome="error", error=f"{type(exc).__name__}: {exc}"[:300])
         return None
+
+
+def log_judged(store, trace: dict, session_id: str, platform: str = "", started: Optional[float] = None) -> None:
+    """One `selfheal_judged` row per complaint-judged turn, plus one `selfheal_judge_error` per stage that exhausted
+    its retries. Lives here, not in the hook, so a gateway that hot-reloads this module picks up format changes."""
+    rec = {"event": "selfheal_judged", "session_id": session_id, "platform": platform,
+           "outcome": trace.get("outcome") or "unknown"}
+    for k in ("score", "stages", "kind", "fingerprint", "error", "why"):
+        if trace.get(k) not in (None, "", []):
+            rec[k] = trace[k]
+    if started is not None:
+        rec["ms"] = int((time.time() - started) * 1000)
+    store.log(rec)
+    for ex in trace.get("exhausted") or []:
+        store.log({"event": "selfheal_judge_error", "session_id": session_id, "stage": ex.get("stage"),
+                   "error": ex.get("error"), "raised": bool(ex.get("raised"))})
+
+
+def skip_reason(platform: str = "", parent_session_id: str = "") -> Optional[str]:
+    """Why user_facing() is False for a turn on a user platform, when that is worth a row: a leaked
+    HERMES_KANBAN_TASK in a chat process would mute every chat silently. None = log nothing (automated platforms
+    and subagents are normal skips)."""
+    if (platform or "").lower() in ("cron", "kanban", "webhook", "batch") or parent_session_id:
+        return None
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return "kanban_env"
+    return None
 
 
 def audit_verdict(final_reply: str, llm: Callable[[str, str], str], tool_log=None, ask="",
@@ -901,6 +961,13 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     """Log a detection and hand a new fingerprint (first time today) to the lane: `file_defect` logs
     `selfheal_would_file` in shadow mode and files the investigation card on the hub in live mode. A deliberate
     detector probe (`probe_session`) is logged and skipped: no fingerprint record, no queue row, no filing."""
+    pending = getattr(_TL, "pending", None)
+    if pending is not None:  # a complaint judged by an older __init__ that logs no selfheal_judged row itself
+        _TL.pending = None
+        try:
+            log_judged(store, pending, session_id, platform)
+        except Exception:
+            pass
     if not hit:
         return None
     m = m or mode()
@@ -3485,7 +3552,8 @@ def drain(store=None, m: Optional[str] = None, filer: Optional[Callable] = None)
 
 
 def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: float = 25 * 60,
-         backstop_fn: Optional[Callable] = None) -> list:
+         backstop_fn: Optional[Callable] = None, liveness_every: float = 3600,
+         liveness_fn: Optional[Callable] = None) -> list:
     """The hub's pass (no agent, hermes cron every 5 min): Inbox outcomes (Do it -> fix card within 5 min), queue
     drain, and the digest backstop at most every `backstop_every` seconds. Prints only what it did.
 
@@ -3518,7 +3586,115 @@ def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: fl
                     lines.append(f"backstop: {r.get('action')} {r.get('fingerprint') or r.get('card') or ''}")
         except Exception as exc:
             lines.append(f"backstop failed: {exc}")
+    lstamp = Path(store.root) / "selfheal_liveness.last"
+    try:
+        llast = float(lstamp.read_text().strip() or 0)
+    except Exception:
+        llast = 0.0
+    if now - llast >= liveness_every:
+        lstamp.parent.mkdir(parents=True, exist_ok=True)
+        lstamp.write_text(str(now))
+        try:
+            r = (liveness_fn or judge_liveness)(store, now=now)
+            if r.get("action") not in ("ok", "unknown", "skip"):
+                lines.append(f"liveness: {r.get('action')} {r.get('fingerprint') or r.get('card') or ''}")
+        except Exception as exc:
+            lines.append(f"liveness failed: {exc}")
     return lines
+
+
+# ── liveness: a complaint judge that has gone quiet while users chat is a defect (plugin-89461de0ed) ──
+USER_SOURCES = ("desktop", "cli", "tui", "telegram", "discord", "slack", "signal", "whatsapp", "sms", "imessage",
+                "matrix", "email")
+LIVENESS_MIN_TURNS = 20
+LIVENESS_MIN_JUDGED = 3   # this many judge-reaching rows, all error/no_opinion, = the judge is failing
+JUDGE_REACHED = ("hit", "below", "no_opinion", "error")
+
+
+def user_turns_since(since: float, home: Optional[Path] = None) -> Optional[int]:
+    """User messages after `since` in this host's state.db, in top-level sessions on user platforms (no cron,
+    Kanban, subagent or scripted-dispatch sessions). None when the db cannot be read."""
+    import sqlite3
+    path = hermes_home(home) / "state.db"
+    if not path.is_file():
+        return None
+    marks = ",".join("?" * len(USER_SOURCES))
+    try:
+        db = _ro_state(path)
+        try:
+            row = db.execute(
+                f"SELECT sum((SELECT count(*) FROM messages m WHERE m.session_id=s.id AND m.role='user' "
+                f"AND m.timestamp > ?)) FROM sessions s WHERE COALESCE(s.last_activity_at, s.started_at) > ? "
+                f"AND s.parent_session_id IS NULL AND s.source IN ({marks})",
+                (since, since, *USER_SOURCES)).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return None
+    return int(row[0] or 0) if row else 0
+
+
+def _recent_events(root: Path, name: str, since: float, tail_bytes: int = 32 << 20) -> list:
+    """`name` rows after `since` from the last `tail_bytes` of <coach>/log.jsonl (bounded read of a growing log)."""
+    p = Path(root) / "log.jsonl"
+    if not p.exists():
+        return []
+    with p.open("rb") as fh:
+        size = fh.seek(0, 2)
+        fh.seek(max(0, size - tail_bytes))
+        data = fh.read().decode("utf-8", "replace")
+    out, needle = [], f'"event": "{name}"'
+    for line in data.splitlines():
+        if needle not in line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("event") == name and (r.get("ts") or 0) > since:
+            out.append(r)
+    return out
+
+
+def judge_liveness(store=None, now: Optional[float] = None, turns_fn: Optional[Callable] = None,
+                   filer: Optional[Callable] = None, window: float = 86400,
+                   min_turns: int = LIVENESS_MIN_TURNS) -> dict:
+    """Hub cron check: more than `min_turns` user turns in `window` on this host with zero `selfheal_judged`
+    rows (the hook or its thread is not running), or >= LIVENESS_MIN_JUDGED judge-reaching rows that are all
+    error/no_opinion (the judge is failing), files one defect through the lane. Its fingerprint names the host and
+    alarm, so an ongoing incident is one card (the lane dedupes) and a later one refiles. Logs `selfheal_liveness`."""
+    store = _store(store)
+    now = now or time.time()
+    since = now - window
+    turns = (turns_fn or user_turns_since)(since)
+    rows = _recent_events(store.root, "selfheal_judged", since)
+    reached = [r for r in rows if r.get("outcome") in JUDGE_REACHED]
+    failed = [r for r in reached if r.get("outcome") in ("error", "no_opinion")]
+    alarm = None
+    if turns is not None and turns > min_turns:
+        if not rows:
+            alarm = "no_judgments"
+        elif len(reached) >= LIVENESS_MIN_JUDGED and len(failed) == len(reached):
+            alarm = "judge_failing"
+    rec = {"event": "selfheal_liveness", "turns": turns, "judged": len(rows), "reached": len(reached),
+           "failed": len(failed), "alarm": alarm}
+    store.log(rec)
+    if turns is None:
+        return {"action": "unknown", **rec}
+    if not alarm:
+        return {"action": "ok", **rec}
+    host = host_name()
+    symptom = ("self-heal complaint judge logged no verdicts while users chatted" if alarm == "no_judgments"
+               else "self-heal complaint judge calls all failed") + f" on {host}"
+    errs = sorted({str(r.get("error") or "")[:120] for r in failed if r.get("error")})[:3]
+    quote = (f"{turns} user turns in the last {int(window // 3600)} h on {host}; {len(rows)} selfheal_judged rows, "
+             f"{len(reached)} reached the judge, {len(failed)} error/no_opinion."
+             + (f" Errors: {'; '.join(errs)}" if errs else ""))
+    d = {"component": "plugin", "symptom": symptom, "source": "signal", "kind": "signal", "p_defect": 0.9,
+         "session_id": "", "quote": quote, "host": host, "platform": "cron", "at": now,
+         "fingerprint": fingerprint("plugin", symptom)}
+    res = (filer or file_defect)(d, store=store)
+    return {**(res or {}), "fingerprint": d["fingerprint"], "alarm": alarm}
 
 
 if __name__ == "__main__":

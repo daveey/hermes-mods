@@ -553,6 +553,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 threading.Thread(target=fn, args=args, daemon=True).start()
         except Exception as exc:
             log.debug("coach self_heal: %s", exc)
+            try:  # a thread that could not start, or a self_heal module that failed to load, is a row
+                store.log({"event": "selfheal_judged", "session_id": args[0] if args else "", "outcome": "error",
+                           "stage": "run", "detector": getattr(fn, "__name__", ""),
+                           "error": f"{type(exc).__name__}: {exc}"[:300]})
+            except Exception:
+                pass
 
     def _confirm(sh):
         """Second-stage judge: explicit `selfheal_confirm`, else (production, no injected judge) the configured
@@ -563,9 +569,16 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     def _selfheal_complaint(session_id, user_message, prev, platform="", parent_session_id="", tool_log=None,
                             gap_s=None, turn_at=None):
+        # Every judged turn leaves a `selfheal_judged` row (outcome, score, stages, error), and a failure anywhere
+        # in here is a row too: a week-long judge outage once looked exactly like "no complaints" (plugin-89461de0ed).
+        sh, trace, started = None, {}, time.time()
         try:
             sh = _load("self_heal")
             if not sh.user_facing(platform, parent_session_id):
+                why = sh.skip_reason(platform, parent_session_id) if hasattr(sh, "skip_reason") else None
+                if why:
+                    store.log({"event": "selfheal_judged", "session_id": session_id, "platform": platform,
+                               "outcome": "skipped", "why": why})
                 return
             if turn_at is not None and sh.is_pause_note(user_message):
                 # The coach file was last written when the paused turn STARTED (turn start/end only): time the pause
@@ -578,7 +591,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                "why": "pause_gap_unknown"})
             hit = sh.detect_complaint(prev or "", user_message, llm=selfheal_llm, threshold=sh.threshold(),
                                       confirm=_confirm(sh),
-                                      tool_log=tool_log, gap_s=gap_s)
+                                      tool_log=tool_log, gap_s=gap_s, trace=trace)
+            if hasattr(sh, "log_judged"):
+                sh.log_judged(store, trace, session_id, platform, started)
+            trace["logged"] = True
             evidence = sh.clean_user(user_message)
             if hit and hit.get("gap_s") is not None:
                 lead = ("update pause continued" if hit.get("symptom", "").startswith("update pause")
@@ -587,6 +603,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             sh.handle(hit, session_id, store, evidence=evidence, platform=platform, ask=user_message)
         except Exception as exc:
             log.debug("coach self_heal complaint: %s", exc)
+            try:
+                store.log({"event": "selfheal_judged", "session_id": session_id, "platform": platform,
+                           "outcome": "error", "stage": "handle" if trace.get("logged") else "hook",
+                           "error": f"{type(exc).__name__}: {exc}"[:300]})
+            except Exception:
+                pass
 
     def _selfheal_admission(session_id, reply, platform="", parent_session_id="", tool_log=None, ask=""):
         try:

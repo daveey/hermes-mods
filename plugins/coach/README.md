@@ -804,6 +804,17 @@ and the symptom's stemmed content words, so "sidebar sessions reshuffle" and "se
 (evaluated on `gemini-3.8-flash`) and the confirm model with `auxiliary.coach_defect_confirm` (evaluated on
 `claude-sonnet-5`).
 
+Judge telemetry and liveness (plugin-89461de0ed: the hub's complaint judge caught nothing for a week, and nothing
+showed it, because failures became silent "no opinion"). Every user-facing turn the complaint hook sees logs one
+`selfheal_judged` row: `outcome` = `prefiltered` / `signal` / `below` / `hit` / `no_opinion` / `error` (with `error`,
+`score`, `stages`, `ms`), or `skipped why=kanban_env` when a chat process carries a leaked `HERMES_KANBAN_TASK`. A
+judge stage that exhausts its retries also logs `selfheal_judge_error` (`stage`, `error`, `raised`). Exceptions in the
+hook thread are `selfheal_judged outcome=error stage=hook|handle|run` rows, not only debug lines. The hub cron runs
+`judge_liveness` hourly. It counts top-level user-platform turns in `state.db` over 24 h, and with more than 20 turns
+plus zero `selfheal_judged` rows (`no_judgments`), or at least 3 judge-reaching rows that are all
+error/no_opinion (`judge_failing`), it files one plugin defect per host and alarm through the lane. It logs
+`selfheal_liveness` every run. Tests: `tests/test_self_heal_judged.py`.
+
 Replay evals:
 - `eval/selfheal_incident_replay.py` (`run`, then `score --relabel --report`): the production code over an
   incident-labeled turn set (episodes + five-whys verdicts + every normal turn), scored like the self-correct replay:
