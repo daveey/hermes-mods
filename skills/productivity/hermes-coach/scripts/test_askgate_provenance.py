@@ -167,6 +167,14 @@ class InboxDoit(unittest.TestCase):
         update = "**Update 2026-10-28 13:30**\n\n**Proposed:** " + self.PROPOSAL
         self.assertTrue(g.inbox_doit(self.PROPOSAL, update))
 
+    def test_digest_inbox_doit_flag_is_provenance(self):
+        """A labelled card's prompt is not in prev: the digest's `inbox_doit` flag (from the Inbox store) decides."""
+        text = 'On the hub, recover the corrupt board and find out why it keeps corrupting.'
+        hits, _, doit = self._collect([{'t': 100, 'text': text, 'prev': '**Do it:** Recover board', 'inbox_doit': True},
+                                       {'t': 200, 'text': text}])
+        self.assertEqual([h['t'] for h in hits], [200])
+        self.assertEqual([d['t'] for d in doit], [100])
+
     def test_plain_proposal_without_inbox_prev_still_classified(self):  # (c) no Inbox notice before it
         for prev in (None, '', 'Here is what I found. **Proposed:** ' + self.PROPOSAL):
             with self.subTest(prev=prev):

@@ -308,7 +308,9 @@ def collect(data, since_ts, until_ts, doit=None):
             t, text = u.get("t", 0), clean(u.get("text") or "")
             if not (since_ts <= t < until_ts) or not text or generated(text) or SKIP.match(text):
                 continue
-            rest = doit_remainder(text, u.get("prev"))
+            # Provenance: the digest's `inbox_doit` flag (the Inbox store says Do it sent this prompt; the only proof
+            # for a labelled card, whose prompt is not in prev), else the Inbox notice in prev.
+            rest = "" if u.get("inbox_doit") is True else doit_remainder(text, u.get("prev"))
             if rest is not None:  # Inbox Do-it press: only words David added after the proposal are his
                 if not rest:
                     dk = ("doit", d.get("id"), int(t))  # mirrored sessions on several hosts count once
@@ -573,7 +575,8 @@ def row_is_doit(row, data=None):
                 if not isinstance(u, dict) or (t is not None and abs((u.get("t") or 0) - t) > DOIT_NEAR):
                     continue
                 text = clean(u.get("text") or "")
-                if _ws(re.sub(r"\[Image attached[^\]]*\]", "", text)).startswith(q) and inbox_doit(text, u.get("prev")):
+                if _ws(re.sub(r"\[Image attached[^\]]*\]", "", text)).startswith(q) and (
+                        u.get("inbox_doit") is True or inbox_doit(text, u.get("prev"))):
                     return True
     return False
 

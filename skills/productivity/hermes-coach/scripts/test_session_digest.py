@@ -162,6 +162,29 @@ class DigestSynthetic(unittest.TestCase):
         self.assertLessEqual(len(second["prev"]), sd.PREV_HEAD + sd.PREV_TAIL + 20)
         self.assertEqual(dg["digest_v"], sd.DIGEST_V)
 
+    def test_turn_sent_by_an_inbox_do_it_press_is_flagged(self):
+        """plugin-9ab6e8e868: a labelled Inbox card shows only "**Do it:** <label>", so the pasted prompt is not in
+        `prev`; the Inbox store (<home>/inbox/inbox.db items.accept_prompt for that session) is the provenance."""
+        t = time.time() - 100
+        prompt = "On the hub, recover the corrupt board and find why it keeps corrupting."
+        rows = [("user", prompt, t, 1, 0, None, None, "u1"),
+                ("assistant", "On it.", t + 1, 1, 0, None, None, "a1"),
+                ("user", "no, find out why it broke first", t + 2, 1, 0, None, None, "u2")]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, rows)
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+            self.assertNotIn("inbox_doit", dg["user_turns"][0])  # no Inbox store: nothing is claimed
+            (Path(d) / "inbox").mkdir()
+            con = sqlite3.connect(Path(d) / "inbox" / "inbox.db")
+            con.execute("create table items (session_id text primary key, accept_prompt text not null, state text)")
+            con.execute("insert into items values ('s1', ?, 'accepted')", ("  " + prompt.replace(" ", "\n ", 2),))
+            con.commit(); con.close()
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        first, second = dg["user_turns"]
+        self.assertIs(first.get("inbox_doit"), True)
+        self.assertNotIn("inbox_doit", second)  # David's own words after the card still count
+
     def test_user_turn_after_an_interrupted_model_wait_carries_its_reason(self):
         """Core stamps display_metadata.interrupt on the interrupted row; the next user turn names why the turn
         stopped (self-heal agent-38bad5aced: Stop vs backend exit vs reaper were indistinguishable)."""

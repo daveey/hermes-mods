@@ -264,7 +264,31 @@ def _interrupt_meta(raw):
     return {"reason": str(i["reason"])[:40], "waited_s": i.get("waited_s"), "prompt_tokens": i.get("prompt_tokens")}
 
 
+def _ws(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def inbox_prompts(db):
+    """{session id: the cleaned accept_prompt} of every Inbox card in this profile's Inbox store
+    (<home>/inbox/inbox.db next to state.db). Pressing Do it sends that prompt as the user's turn in the card's own
+    session, so a turn equal to it is the poster's text, not the user's (plugin-9ab6e8e868). A labelled card shows only
+    "**Do it:** <label>", so the store is the only provenance. Missing or unreadable store -> {}."""
+    p = Path(db).parent / "inbox" / "inbox.db"
+    if not p.exists():
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=10)
+        try:
+            rows = con.execute("select session_id, accept_prompt from items").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+    return {sid: _ws(clean_user(pr)) for sid, pr in rows if sid and pr and pr.strip()}
+
+
 def digest_db(profile, db, host, since):
+    doit_prompts = inbox_prompts(db)
     con = sqlite3.connect(f"file:{db}", uri=True, timeout=30)
     con.execute("pragma query_only = 1")
     con.row_factory = sqlite3.Row
@@ -321,6 +345,8 @@ def digest_db(profile, db, host, since):
                 if users and users[-1]["text"] == clip_user_turn(text):
                     continue  # the same turn persisted twice (retry / steer echo)
                 turn = {"t": round(m["timestamp"]), "text": clip_user_turn(text)}
+                if doit_prompts.get(sid) and _ws(text) == doit_prompts[sid]:
+                    turn["inbox_doit"] = True  # sent by the Inbox Do it button: the card's prompt, not the user
                 if len(text) > TURN_CHARS:
                     turn["text_truncated"] = True
                     turn["text_original_chars"] = len(text)
