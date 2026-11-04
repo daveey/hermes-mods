@@ -1,0 +1,87 @@
+From b9eaa8e842f5bc0c0e513e255f28a2df0850968c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 03:41:15 +0000
+Subject: [PATCH] bot_desktop: start() waits for the published DISPLAY, not
+ just the env file
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+_spawn_and_wait returned once the env file existed; status() reports running only
+when that file names a DISPLAY. A launcher writing it in place (open/truncate, then
+write — every test fake's `printf > env`) exposes an existing, empty file for a
+moment, and a throttled runner caught start() in it: running=False, display=None
+beside a live launcher (flake in test_orphaned_x_server_of_a_dead_launcher_is_reaped_on_next_start).
+
+Readiness now checks the same signal status() reads. Guard test holds the
+open->write window open for 0.5 s; it fails on the old check.
+---
+ tests/tools/test_bot_desktop_runtime.py | 22 ++++++++++++++++++++++
+ tools/bot_desktop/runtime.py            | 11 ++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tools/test_bot_desktop_runtime.py b/tests/tools/test_bot_desktop_runtime.py
+index 84afc9a0a31..5c5c20df6fe 100644
+--- a/tests/tools/test_bot_desktop_runtime.py
++++ b/tests/tools/test_bot_desktop_runtime.py
+@@ -262,6 +262,28 @@ def test_orphaned_x_server_of_a_dead_launcher_is_reaped_on_next_start(in_process
+     assert runtime.stop() is True
+ 
+ 
++_IN_PLACE_ENV_LAUNCHER = """#!/usr/bin/env bash
++# Writes the env file in place with the open/truncate -> write window held open: the file exists, empty,
++# for 0.5 s. Under CPU throttling the fakes' plain `printf > env` showed start() the same empty file.
++sleep 30 &
++echo $! > "$HERMES_BD_XLOCK_DIR/.X${HERMES_BD_DISPLAY_NUM}-lock"
++: > "$HERMES_BD_SOCKET"
++{ sleep 0.5; printf 'DISPLAY=:%s\\n' "$HERMES_BD_DISPLAY_NUM"; } > "$HERMES_BD_ENV_FILE"
++wait
++"""
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.live_system_guard_bypass  # the launcher's group must really be signalled at teardown
++def test_start_waits_for_the_published_display_not_just_the_env_file(in_process_runtime):
++    """start() used to return as soon as the env file existed; status() reads DISPLAY from it, so an
++    existing-but-empty file came back as running=False, display=None beside a live launcher."""
++    (in_process_runtime / "launcher.sh").write_text(_IN_PLACE_ENV_LAUNCHER, encoding="utf-8")
++    up = runtime.start(wait_seconds=10)
++    assert up.running and up.display == f":{(runtime.state_dir() / 'display').read_text()}", up
++    assert runtime.stop() is True
++
++
+ @pytest.mark.platforms("linux")
+ @pytest.mark.live_system_guard_bypass  # the orphan is reparented to init: signalling it is the point
+ def test_orphaned_x_server_is_found_by_its_socket_when_the_lock_file_is_gone(tmp_path, monkeypatch):
+diff --git a/tools/bot_desktop/runtime.py b/tools/bot_desktop/runtime.py
+index e68c21269a4..8657192124e 100644
+--- a/tools/bot_desktop/runtime.py
++++ b/tools/bot_desktop/runtime.py
+@@ -774,6 +774,12 @@ def start(*, wait_seconds: float = 15.0) -> DesktopStatus:
+             raise
+ 
+ 
++def _env_has_display(env_file: Path) -> bool:
++    """The launcher's env file names a DISPLAY (the publish is complete as far as status() can tell)."""
++    return any(key.strip() == "DISPLAY" and value.strip()
++               for key, sep, value in (line.partition("=") for line in (_read(env_file) or "").splitlines()) if sep)
++
++
+ def _spawn_and_wait(sd: Path, wait_seconds: float) -> DesktopStatus:
+     """Caller holds ``start.lock``. Takes ``_ALLOC_LOCK`` itself, from picking the number to Xvnc's claim."""
+     with contextlib.ExitStack() as alloc:
+@@ -837,7 +843,10 @@ def _spawn_and_wait(sd: Path, wait_seconds: float) -> DesktopStatus:
+             if proc.poll() is not None:
+                 tail = (sd / "launcher.log").read_bytes()[-2000:].decode("utf-8", "replace")
+                 raise RuntimeError(f"Bot Desktop launcher exited with {proc.returncode}:\n{tail}")
+-            if env_file.exists() and (sd / "rfb.sock").exists():
++            # Ready means what status() reports as running: DISPLAY published, not merely an env file present.
++            # A launcher that writes it in place (open/truncate, then write) shows an existing, still-empty file
++            # for a moment; returning then handed the caller a "stopped" status with the launcher alive.
++            if (sd / "rfb.sock").exists() and _env_has_display(env_file):
+                 logger.info("Bot Desktop for profile %s up on :%s", _profile_name(), num)
+                 touch_activity()
+                 return status()
+-- 
+2.55.0
+

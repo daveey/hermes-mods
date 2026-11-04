@@ -1,0 +1,135 @@
+From 4af752c4edb0acce0f47e21b8c882ce7e251c3da Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:59:20 +0000
+Subject: [PATCH] [daveey] Extract adapter status methods to preserve merged
+ health budget
+
+---
+ gateway/run_adapter_status.py | 41 ++++++++++++++++++++++++++++++++++-
+ gateway/run_adapters.py       | 34 +++--------------------------
+ 2 files changed, 43 insertions(+), 32 deletions(-)
+
+diff --git a/gateway/run_adapter_status.py b/gateway/run_adapter_status.py
+index 2c921fbd957..c7473e7cc3d 100644
+--- a/gateway/run_adapter_status.py
++++ b/gateway/run_adapter_status.py
+@@ -1,6 +1,12 @@
+-"""Shared adapter status text for startup and reconnect recovery."""
++"""Shared adapter status for startup and reconnect recovery."""
++import logging
++from datetime import UTC, datetime, timedelta
++from typing import Optional
++
+ from gateway.config import Platform
+ 
++logger = logging.getLogger("gateway.run_adapters")
++
+ 
+ def adapter_unavailable_message(platform: Platform, *, retrying: bool = True) -> str:
+     """Keep the plugin/deps/credentials hint after the first reconnect retry."""
+@@ -8,3 +14,36 @@ def adapter_unavailable_message(platform: Platform, *, retrying: bool = True) ->
+         f"No adapter available for enabled {platform.value}; check the plugin, dependencies, and credentials."
+     )
+     return f"{message} Retrying in the background." if retrying else message
++
++
++class GatewayAdapterStatusMixin:
++    """Publish reconnect attention and fatal adapter status."""
++
++    def _flag_reconnect_needs_attention(
++        self, platform, info: dict, now: float, *, status_key: Optional[str] = None
++    ) -> None:
++        """Flag NEEDS_ATTENTION (once) past the threshold — a signal, NOT a circuit breaker. The threshold
++        is the bound profile's ``agent.reconnect_attention_after``: secondaries call this inside their
++        ``_profile_runtime_scope`` with their ``<profile>:<platform>`` status key."""
++        from gateway.run import _reconnect_needs_attention
++        if info.get("attention_flagged") or not _reconnect_needs_attention(info, now):
++            return
++        info["attention_flagged"] = True
++        queued_for = now - info.get("queued_at", now)
++        logger.warning(
++            "%s has been failing/reconnecting continuously for %.1f hours (%d attempts) — flagging "
++            "NEEDS_ATTENTION. Retries continue, but this usually means a permanent problem (revoked "
++            "credentials, missing intents, broken sidecar). Check `hermes status` / `/platform list`.",
++            status_key or platform.value, queued_for / 3600.0, info.get("attempts", 0),
++        )
++        self._update_platform_runtime_status(
++            status_key or platform.value, platform_state="retrying", needs_attention=True,
++            retrying_since=(datetime.now(UTC) - timedelta(seconds=queued_for)).isoformat(),
++        )
++
++    def _mark_platform_fatal(self, status_key: str, adapter) -> None:
++        """Record an adapter's fatal error code/message as ``fatal`` runtime status."""
++        self._update_platform_runtime_status(
++            status_key, platform_state="fatal", error_code=adapter.fatal_error_code,
++            error_message=adapter.fatal_error_message,
++        )
+diff --git a/gateway/run_adapters.py b/gateway/run_adapters.py
+index 31b864994b6..946ee426bc9 100644
+--- a/gateway/run_adapters.py
++++ b/gateway/run_adapters.py
+@@ -18,7 +18,7 @@ import time
+ import weakref as _weakref
+ from agent.async_utils import consume_detached_task_result
+ from contextvars import Context
+-from datetime import datetime, timedelta, timezone, UTC
++from datetime import datetime, timezone, UTC
+ from gateway.config import (
+     ON_ALL_ADAPTERS_DOWN_POLICIES,
+     SHARED_LISTENER_MIRROR_PLATFORMS,
+@@ -28,7 +28,7 @@ from gateway.config import (
+ from gateway.platforms.base import BasePlatformAdapter
+ from gateway.platforms.helpers import carry_inbound_dedup, hand_over_held_inbound
+ from gateway.restart import is_global_startup_conflict
+-from gateway.run_adapter_status import adapter_unavailable_message
++from gateway.run_adapter_status import GatewayAdapterStatusMixin, adapter_unavailable_message
+ from gateway.run_shutdown import _log_suppressed
+ from gateway.session import SessionSource
+ from hermes_cli.observability.shared_metrics_gateway import record_platform_connect, record_platform_disconnect
+@@ -59,7 +59,7 @@ class _UnresolvedProfileHome:
+ UNRESOLVED_PROFILE_HOME = _UnresolvedProfileHome()
+ 
+ 
+-class GatewayAdapterLifecycleMixin:
++class GatewayAdapterLifecycleMixin(GatewayAdapterStatusMixin):
+     """Adapter lifecycle: connect/teardown, fatal recovery, reconnect watcher, multiplex profiles."""
+ 
+     @staticmethod
+@@ -739,34 +739,6 @@ class GatewayAdapterLifecycleMixin:
+             if not await _idle(10):  # re-check every 10 seconds
+                 return
+ 
+-    def _flag_reconnect_needs_attention(
+-        self, platform, info: dict, now: float, *, status_key: Optional[str] = None
+-    ) -> None:
+-        """Flag NEEDS_ATTENTION (once) past the threshold — a signal, NOT a circuit breaker. The threshold
+-        is the bound profile's ``agent.reconnect_attention_after``: secondaries call this inside their
+-        ``_profile_runtime_scope`` with their ``<profile>:<platform>`` status key."""
+-        from gateway.run import _reconnect_needs_attention
+-        if info.get("attention_flagged") or not _reconnect_needs_attention(info, now):
+-            return
+-        info["attention_flagged"] = True
+-        queued_for = now - info.get("queued_at", now)
+-        logger.warning(
+-            "%s has been failing/reconnecting continuously for %.1f hours (%d attempts) — flagging "
+-            "NEEDS_ATTENTION. Retries continue, but this usually means a permanent problem (revoked "
+-            "credentials, missing intents, broken sidecar). Check `hermes status` / `/platform list`.",
+-            status_key or platform.value, queued_for / 3600.0, info.get("attempts", 0),
+-        )
+-        self._update_platform_runtime_status(
+-            status_key or platform.value, platform_state="retrying", needs_attention=True,
+-            retrying_since=(datetime.now(UTC) - timedelta(seconds=queued_for)).isoformat(),
+-        )
+-
+-    def _mark_platform_fatal(self, status_key: str, adapter) -> None:
+-        """Record an adapter's fatal error code/message as ``fatal`` runtime status."""
+-        self._update_platform_runtime_status(
+-            status_key, platform_state="fatal", error_code=adapter.fatal_error_code,
+-            error_message=adapter.fatal_error_message,
+-        )
+ 
+     def _bump_reconnect_backoff(
+         self, platform, info: dict, attempt: int, error_code, error_message: str
+-- 
+2.55.0
+

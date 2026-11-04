@@ -1,0 +1,321 @@
+From 51b6ad8064fbc442c039cd4ab2f6084c08cbd25b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:47:39 +0000
+Subject: [PATCH] test(kanban): hub CPU/cap gate across named boards, profiles,
+ primary/local boards and legacy/host-bound/policy cards; a never-created
+ default board no longer blinds the host cap [daveey]
+
+---
+ hermes_cli/machine_metrics.py                 |  12 +-
+ .../test_kanban_hub_admission_scopes.py       | 243 ++++++++++++++++++
+ tests/hermes_cli/test_machine_metrics.py      |  21 ++
+ 3 files changed, 274 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_hub_admission_scopes.py
+
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index b2a7fec9692..b54f0f927c7 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -76,11 +76,19 @@ def active_card_runs() -> Optional[int]:
+     from hermes_cli.kanban_db_boards import named_board_db_files
+ 
+     try:
+-        paths = [kb.kanban_home() / "kanban.db", *(p for _, p in named_board_db_files())]
++        default = kb.kanban_home() / "kanban.db"
++        paths = [default, *(p for _, p in named_board_db_files())]
+         total = 0
+         seen = set()
+         for path in paths:
+-            stat = path.stat()
++            try:
++                stat = path.stat()
++            except FileNotFoundError:
++                # [daveey] A never-created default board holds no runs. Named boards are listed only when present,
++                # so a vanished one still invalidates the sample (fails closed) like any other unreadable board.
++                if path == default:
++                    continue
++                raise
+             identity = (stat.st_dev, stat.st_ino)
+             if identity in seen:
+                 continue
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_scopes.py b/tests/hermes_cli/test_kanban_hub_admission_scopes.py
+new file mode 100644
+index 00000000000..faa7ab64de7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_admission_scopes.py
+@@ -0,0 +1,243 @@
++"""Spec gate 3 scopes for the hub CPU/cap admission gate: named boards, multiple profiles, primary and local boards,
++legacy / host-bound / worker-first policy cards, ready and review lanes, and the whole-host cap across all of them.
++
++Every case runs in an isolated installation under ``tmp_path`` (root ``.hermes`` with real ``profiles/<name>`` homes,
++the default board DB and a named board DB); nothing reads or writes the live configuration. The root config alone
++holds the CPU limit and the cap; each profile config tries to switch the gate off and lift the cap, which must not
++matter. HERMES_KANBAN_HOME is NOT set: board storage resolves through the installation root exactly like production.
++"""
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli import machine_cpu_metrics as cm
++from hermes_cli import machine_metrics as mm
++from tests.hermes_cli import kanban_sync_support as support
++
++pytestmark = pytest.mark.platforms("posix")
++
++PROFILES = ("alpha", "beta")
++NAMED = "proj"
++GATEWAY = "hub"
++PROFILE_OVERRIDE = ("kanban:\n  max_in_progress: 50\n  admission:\n    cpu_busy_below_pct: null\n"
++                    "  sync:\n    enabled: false\n")
++
++
++class Install:
++    def __init__(self, tmp_path, monkeypatch, *, cap=7, sync_boards=None):
++        self.mp = monkeypatch
++        self.root = tmp_path / ".hermes"
++        self.root.mkdir()
++        monkeypatch.setattr(Path, "home", lambda: tmp_path)
++        for var in ("HERMES_KANBAN_HOME", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
++            monkeypatch.delenv(var, raising=False)
++        lines = ["kanban:", f"  max_in_progress: {cap}", "  admission:", "    cpu_busy_below_pct: 50",
++                 "  sync:", "    enabled: true"]
++        if sync_boards is not None:
++            lines.append(f"    boards: {json.dumps(sync_boards)}")
++        (self.root / "config.yaml").write_text("\n".join(lines) + "\n")
++        for name in PROFILES:
++            home = self.root / "profiles" / name
++            home.mkdir(parents=True)
++            (home / "config.yaml").write_text(PROFILE_OVERRIDE)
++        self.use(PROFILES[0])
++        ksc.reset_board_watch()  # kept read connections belong to one test's files
++        sync.consume_dispatcher_wake()
++        from hermes_cli.kanban_db_boards import create_board
++        create_board(NAMED)
++        self.client = support.FakeLeaseClient()
++        self._old_client = sync.set_lease_client(self.client)
++        monkeypatch.setattr(wn, "registry", lambda: {"machines": {GATEWAY: {"max_card_runs": 7}}})
++        self.conns = []
++
++    def close(self):
++        for c in self.conns:
++            c.close()
++        sync.set_lease_client(self._old_client)
++
++    def use(self, profile):
++        self.mp.setenv("HERMES_HOME", str(self.root / "profiles" / profile))
++
++    def connect(self, board, mode):
++        conn = kbc.connect(board=None if board == "default" else board)
++        self.conns.append(conn)
++        if mode is not None:
++            ksc.ensure_identity(conn, board, GATEWAY)
++            sync.set_mode(conn, mode)
++        return conn
++
++    def advisory(self, pct=10.0):
++        mm.record_hub_cpu_sample({"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000,
++                                  "cpu_busy_sample_end_ms": int(time.time() * 1000)}, root=self.root)
++
++    def final_sample(self, pct):
++        calls = []
++
++        def sample(*a, **k):
++            calls.append(pct)
++            return {"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000,
++                    "cpu_busy_sample_end_ms": int(time.time() * 1000)}
++        self.mp.setattr(cm, "sample", sample)
++        return calls
++
++
++@pytest.fixture
++def install(tmp_path, monkeypatch):
++    inst = Install(tmp_path, monkeypatch)
++    try:
++        yield inst
++    finally:
++        inst.close()
++
++
++def card(conn, kind, lane, title="scope"):
++    if kind == "policy":
++        t = kb.create_task(conn, title=title, assignee="default", placement_policy="worker-first-v1")
++        # The origin's own portable card leased back to it (hub overflow / review continuation).
++        conn.execute("UPDATE tasks SET runs_on=?, created_on=? WHERE id=?", (f'["machine:{GATEWAY}"]', GATEWAY, t))
++        conn.commit()
++    elif kind == "host":
++        t = kb.create_task(conn, title=title, assignee="default", runs_on=[f"machine:{GATEWAY}"])
++    else:
++        t = kb.create_task(conn, title=title, assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, t))
++    return t
++
++
++def claim(conn, t, lane):
++    return (kb.claim_review_task if lane == "review" else kb.claim_task)(conn, t)
++
++
++def runs(conn, t):
++    return conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (t,)).fetchone()[0]
++
++
++SCOPES = [(board, mode, kind) for board in ("default", NAMED) for mode, kinds in
++          (("off", ("legacy", "host")), ("primary", ("legacy", "host", "policy"))) for kind in kinds]
++
++
++@pytest.mark.parametrize("profile", PROFILES)
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("board,mode,kind", SCOPES)
++def test_root_gate_refuses_every_scope_under_lock_and_releases_only_its_grant(install, profile, lane, board, mode,
++                                                                             kind):
++    """Fresh advisory below the limit lets the claim reach the final gate; the independent under-lock sample is at
++    80 % so it must refuse: no local run, deferral recorded, and on a primary board the one lease it took released."""
++    install.use(profile)
++    conn = install.connect(board, mode)
++    install.advisory(10.0)
++    sampled = install.final_sample(80.0)
++    t = card(conn, kind, lane)
++    assert claim(conn, t, lane) is None
++    assert sampled == [80.0], "the final gate must take its own sample for this scope"
++    assert kb.get_task(conn, t).status == lane and runs(conn, t) == 0
++    assert sync.pop_claim_deferral(t) == "hub_cpu_at_or_above_limit"
++    assert install.client.count("release") == install.client.count("acquire") == (1 if mode == "primary" else 0)
++
++
++@pytest.mark.parametrize("profile", PROFILES)
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("board,mode,kind", SCOPES)
++def test_root_gate_admits_every_scope_below_limit_with_consumed_sample(install, profile, lane, board, mode, kind):
++    install.use(profile)
++    conn = install.connect(board, mode)
++    install.advisory(10.0)
++    sampled = install.final_sample(49.9)
++    t = card(conn, kind, lane)
++    assert claim(conn, t, lane) is not None
++    assert sampled == [49.9]
++    assert runs(conn, t) == 1
++    payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='claimed'",
++                                      (t,)).fetchone()[0])
++    assert payload["hub_cpu"]["cpu_busy_pct"] == 49.9 and payload["hub_cpu"]["limit_pct"] == 50.0
++    assert install.client.count("release") == 0
++
++
++@pytest.mark.parametrize("profile", PROFILES)
++@pytest.mark.parametrize("board", ["default", NAMED])
++def test_profile_resolves_to_the_shared_root_not_its_own_home(install, profile, board):
++    """Precondition for every case above: a real profile home resolves the root config and shared board storage."""
++    from hermes_constants import get_default_hermes_root
++    install.use(profile)
++    assert Path(get_default_hermes_root()) == install.root
++    assert kb.kanban_home() == install.root
++    expected = install.root / "kanban.db" if board == "default" else install.root / "kanban" / "boards" / board / "kanban.db"
++    assert kb.kanban_db_path(board=None if board == "default" else board) == expected
++    assert cm.root_limit() == (cm.ON, 50.0)
++
++
++def _fill_host(install, cap_board_modes):
++    """Start one real run per (profile, board, mode, kind, lane), each through the gate."""
++    install.advisory(10.0)
++    install.final_sample(10.0)
++    started = []
++    for i, (profile, board, mode, kind, lane) in enumerate(cap_board_modes):
++        install.use(profile)
++        conn = install.connect(board, mode)
++        t = card(conn, kind, lane, title=f"fill{i}")
++        assert claim(conn, t, lane) is not None, (profile, board, mode, kind, lane)
++        started.append((conn, t))
++    return started
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("board,mode,kind", SCOPES)
++def test_whole_host_cap_counts_runs_from_every_profile_and_board(tmp_path, monkeypatch, lane, board, mode, kind):
++    """Root cap 3 (each profile config says 50): runs started by alpha on the default board, beta on the named board
++    and alpha on the named board fill the host; then any profile, board, lane or card kind is refused at 3/3, with no
++    run and only its own grant released. Completing one run frees exactly one slot."""
++    inst = Install(tmp_path, monkeypatch, cap=3)
++    try:
++        started = _fill_host(inst, [("alpha", "default", "primary", "legacy", "ready"),
++                                    ("beta", NAMED, "off", "host", "review"),
++                                    ("alpha", NAMED, "primary", "policy", "ready")])
++        assert mm.active_card_runs() == 3
++        acquired, released = inst.client.count("acquire"), inst.client.count("release")
++        for profile in PROFILES:
++            inst.use(profile)
++            conn = inst.connect(board, mode)
++            t = card(conn, kind, lane, title=f"over-{profile}")
++            assert claim(conn, t, lane) is None
++            assert runs(conn, t) == 0 and kb.get_task(conn, t).status == lane
++            assert sync.pop_claim_deferral(t) == "hub_capacity_full"
++        took = inst.client.count("acquire") - acquired
++        assert took == (2 if mode == "primary" else 0)
++        assert inst.client.count("release") - released == took
++        done_conn, done = started[0]
++        assert kb.complete_task(done_conn, done, result="ok")
++        assert mm.active_card_runs() == 2
++        inst.use("beta")
++        conn = inst.connect(board, mode)
++        t = card(conn, kind, lane, title="after")
++        assert claim(conn, t, lane) is not None
++        assert mm.active_card_runs() == 3
++    finally:
++        inst.close()
++
++
++def test_unsynced_local_board_does_not_blind_the_host_cap(tmp_path, monkeypatch):
++    """A named board excluded from sync (kanban.sync.boards) is a plain local board: its runs count toward the cap
++    and its presence must not make the whole-host count unknown (which would refuse every claim on the host)."""
++    inst = Install(tmp_path, monkeypatch, cap=2, sync_boards=["default"])
++    try:
++        inst.connect("default", "primary")  # default DB exists: isolates the unsynced-board question
++        _fill_host(inst, [("beta", NAMED, None, "legacy", "ready")])
++        assert mm.active_card_runs() == 1
++        inst.use("alpha")
++        conn = inst.connect("default", "primary")
++        t = card(conn, "legacy", "ready", title="second")
++        assert claim(conn, t, "ready") is not None
++        assert mm.active_card_runs() == 2
++        t = card(conn, "legacy", "review", title="third")
++        assert claim(conn, t, "review") is None
++        assert sync.pop_claim_deferral(t) == "hub_capacity_full"
++    finally:
++        inst.close()
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 6b143a9301c..251aba82192 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -149,3 +149,24 @@ def test_failed_cpu_report_is_never_replayed_next_round_takes_a_fresh_sample():
+ def test_worker_load_fields_unchanged_by_cpu_gate(tmp_path):
+     out = mm.collect(disk_path=tmp_path)
+     assert not CPU_KEYS & set(out)  # collect() never blocks on a CPU sample; only the hub reporter adds it
++
++
++def test_active_card_runs_absent_default_board_counts_named_but_vanished_named_board_fails_closed(tmp_path, monkeypatch):
++    """A never-created default board holds no runs (it must not blind the hub cap gate); a listed named board that
++    cannot be read still makes the whole-host count unknown."""
++    import sqlite3
++
++    from hermes_cli import kanban_db_boards as kbb
++
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    named = tmp_path / "kanban" / "boards" / "proj" / "kanban.db"
++    named.parent.mkdir(parents=True)
++    db = sqlite3.connect(named)
++    db.executescript("CREATE TABLE tasks (id TEXT, status TEXT); INSERT INTO tasks VALUES ('a','running'),('b','ready');")
++    db.commit()
++    db.close()
++    assert not (tmp_path / "kanban.db").exists()
++    assert mm.active_card_runs() == 1
++    gone = tmp_path / "kanban" / "boards" / "gone" / "kanban.db"
++    monkeypatch.setattr(kbb, "named_board_db_files", lambda: [("proj", named), ("gone", gone)])
++    assert mm.active_card_runs() is None
+-- 
+2.55.0
+

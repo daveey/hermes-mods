@@ -1,0 +1,561 @@
+From cccf2477fa2337e2e0188136c8929ded1c9f0787 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 22:10:57 +0000
+Subject: [PATCH] [daveey] worker-placement: a no_eligible_worker card tells
+ its owner the repin command once per revision
+
+Ruling 9 of the overflow plan keeps a card no pool worker can run queued and fenced with no automatic return
+to origin. It used to wait silently. Now the origin posts one comment (missing labels + the exact
+'hermes kanban move <id> --runs-on machine:<origin>' command) and a worker_repin_notice event its origin chat
+receives (gateway + TUI notifiers), once per card revision (required labels + run count, not sync_version, which
+every reserve bumps). It runs on every reserve reply, so cards already queued get it on the next pass. The
+stuck summary lists them as 'waiting for a manual repin' and no longer blames the lease. Nothing repins.
+---
+ docs/worker-first-v1.md                      |   3 +-
+ gateway/kanban_watchers_notifier.py          |  11 +-
+ hermes_cli/kanban_db_dispatch_preclaim.py    |   4 +
+ hermes_cli/kanban_db_dispatch_stuck.py       |  19 +-
+ hermes_cli/kanban_queue_reason.py            |  11 +-
+ hermes_cli/kanban_repin_notice.py            | 104 ++++++++++
+ tests/hermes_cli/test_kanban_queue_reason.py |  17 +-
+ tests/hermes_cli/test_kanban_repin_notice.py | 198 +++++++++++++++++++
+ tui_gateway/session_notifications.py         |   8 +-
+ 9 files changed, 366 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_repin_notice.py
+ create mode 100644 tests/hermes_cli/test_kanban_repin_notice.py
+
+diff --git a/docs/worker-first-v1.md b/docs/worker-first-v1.md
+index a4a9e441507..d1ad5c8c365 100644
+--- a/docs/worker-first-v1.md
++++ b/docs/worker-first-v1.md
+@@ -4,7 +4,7 @@
+ 
+ ## Worker-first hub overflow (off by default)
+ 
+-Workers always win. The Board reserves the origin hub for a portable card only when **every** compatible member of the origin's *configured* pool (never the request subset) is known, fresh and refused solely for pressure (score >= .85) or full slots, AND the hub's reported measured CPU busy is fresh (conservative end within 15 s) and strictly below the operator's threshold, AND hub capacity/memory/drain allow it, AND no other hub overflow reservation is outstanding, AND the sample's conservative start is after the last hub overflow grant. Unknown, stale, held, draining or offline workers veto overflow and the card queues. Zero compatible workers queues with `no_eligible_worker`: the automatic structural origin repin was removed (only the explicit owner repin clears the fence). Prior runs, host-bound cards and running leases are never moved.
++Workers always win. The Board reserves the origin hub for a portable card only when **every** compatible member of the origin's *configured* pool (never the request subset) is known, fresh and refused solely for pressure (score >= .85) or full slots, AND the hub's reported measured CPU busy is fresh (conservative end within 15 s) and strictly below the operator's threshold, AND hub capacity/memory/drain allow it, AND no other hub overflow reservation is outstanding, AND the sample's conservative start is after the last hub overflow grant. Unknown, stale, held, draining or offline workers veto overflow and the card queues. Zero compatible workers queues with `no_eligible_worker`: the automatic structural origin repin was removed (only the explicit owner repin clears the fence). The origin then posts one owner notice per card revision (`hermes_cli/kanban_repin_notice.py`): a comment naming the missing labels and the exact `hermes kanban move <id> --runs-on machine:<origin> --reason "no pool worker can run it"` command, plus a `worker_repin_notice` event its origin chat receives; the dispatcher stuck summary lists such cards as "waiting for a manual repin" instead of a stall. Nothing repins automatically. Prior runs, host-bound cards and running leases are never moved.
+ 
+ * Board: operator-owned `worker_overflow` setting, e.g. `{"hub": {"machine": "hub", "cpu_busy_below_pct": 50}}`; `{}`/absent disables it. The lease grant re-runs the decision with the current registry and records the consumed sample; a worker freeing up, a CPU rise, a used sample or a disabled setting refuses the grant.
+ * Core: `kanban.admission.cpu_busy_below_pct` in the **installation-root** config enables (a) a 10 s metrics report carrying `cpu_busy_pct`/`cpu_busy_window_ms`/`cpu_busy_sample_end_ms` (2 s hard total, never replayed), (b) a lock-free advisory pre-check before any Board lease, and (c) the final gate: with `admission.lock` held and before the claim commits, an independent full ~1 s `/proc/stat` sample must be strictly below the limit and the host running count below the root `kanban.max_in_progress`. Any unknown (unreadable config, bad value, failed sample, window outside 1-2 s, passed deadline) refuses. The gate applies to every new ready/review claim on that host (legacy, host-bound and policy cards); the worker load formula is not used for the origin's own cards.
+@@ -57,6 +57,7 @@ No configuration is activated by these code changes. Deployment, actual hostname
+ | Tool and CLI create entry paths | `test_kanban_placement.py::test_tool_creates_worker_policy_atomically_and_reports_queue`, `test_kanban_worker_policy_cli.py` |
+ | Direct ready/review and local dispatch fences with sync off/registry failure | `test_kanban_worker_policy_db.py`, `test_kanban_worker_reserve_client.py::test_queued_origin_cannot_spawn_even_with_local_capacity` |
+ | Exact reserve/repin HTTP contract; post-ack reevaluation; stale-field protection; ready-only/no lease | `test_kanban_worker_reserve_client.py` |
++| `no_eligible_worker` owner notice once per revision, origin-chat delivery, stuck summary, no repin | `test_kanban_repin_notice.py` |
+ | Whole-host occupancy, malformed/unreadable fail-closed samples, reporter compatibility | `test_machine_occupancy.py`, `test_machine_metrics.py` |
+ | Local pressure/capacity refusal releases unused lease, ready and review | `test_kanban_worker_policy_db.py::test_worker_local_admission_rechecks_load_and_releases_unused_lease`, `test_admission_sampling_failure_releases_grant` |
+ | Real concurrent multi-origin reservations; unauthorized candidates/CAS; expiry/replay/recovery | server `worker/test/worker-placement.test.ts` |
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 81d944302bc..002ec899d67 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -45,8 +45,9 @@ def _pin_first():
+ # ``review_requested`` wakes the origin like a block but is not one;
+ # the task is not archived so later review cycles keep notifying.
+ # ``quota_episode_notice`` (third consecutive quota requeue) is a passive notice: it never wakes the origin,
+-# whose own turn would land on the same exhausted provider.
+-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice")
++# whose own turn would land on the same exhausted provider. ``worker_repin_notice`` (no pool worker can run the
++# card; hermes_cli.kanban_repin_notice) is passive too: it tells the creator the repin command, never runs it.
++TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice", "worker_repin_notice")
+ # Kinds that hand a decision back to the origin, which must take a turn.
+ # status/archived/unblocked are bookkeeping.
+ _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+@@ -484,6 +485,11 @@ def _fmt_quota_episode(ev, n) -> tuple:
+     return f"⏳ {n.head}{notice_text(ev.payload)}", None, None
+ 
+ 
++def _fmt_repin_notice(ev, n) -> tuple:
++    from hermes_cli.kanban_repin_notice import notice_text
++    return f"⚠ {n.head}: {notice_text(ev.payload)}", None, None
++
++
+ def _fmt_timed_out(ev, n) -> tuple:
+     limit = int(_payload(ev, "limit_seconds") or 0)
+     minutes = max(1, round(limit / 60)) if limit else 0
+@@ -509,6 +515,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "changes_requested": _fmt_changes_requested,
+     "block_loop_detected": _fmt_block_loop_detected,
+     "quota_episode_notice": _fmt_quota_episode,
++    "worker_repin_notice": _fmt_repin_notice,
+ }
+ 
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_preclaim.py b/hermes_cli/kanban_db_dispatch_preclaim.py
+index 284b47584cc..406b0b6a60d 100644
+--- a/hermes_cli/kanban_db_dispatch_preclaim.py
++++ b/hermes_cli/kanban_db_dispatch_preclaim.py
+@@ -28,11 +28,15 @@ def eligible_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row], status: str
+     refused = dispatch_refusals(conn, status) if rows else {}
+     if not refused:
+         return rows
++    from hermes_cli import kanban_repin_notice as repin
++    from hermes_cli.kanban_worker_placement import WAITING
+     kept = []
+     for row in rows:
+         reason = refused.get(row["id"])
+         if reason is None:
+             kept.append(row)
+         else:
++            if reason == WAITING and repin.awaiting(conn, row["id"]):
++                reason = repin.MANUAL_REPIN  # no pool worker can run it: its creator must repin, not a lease
+             result.skipped_ineligible.append((row["id"], reason))
+     return kept
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index be06c5bd226..15cb612dc02 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -7,8 +7,16 @@ from __future__ import annotations
+ from typing import Any, Iterable, Optional
+ 
+ from hermes_cli.kanban_db_dispatch_clock import all_clock_held, deadline_suffixes
++from hermes_cli.kanban_repin_notice import MANUAL_REPIN
+ 
+-__all__ = ["all_at_capacity", "all_clock_held", "cap_source", "describe_suppression", "stuck_warning"]
++__all__ = ["all_at_capacity", "all_clock_held", "cap_source", "describe_suppression", "manual_repin_ids",
++           "stuck_warning"]
++
++
++def manual_repin_ids(results: Iterable[Optional[Any]]) -> list[str]:
++    """Ready cards no pool worker can run, which wait for their creator's repin (``kanban_repin_notice``)."""
++    return sorted({tid for res in results if res is not None
++                   for tid, reason in res.skipped_ineligible if reason == MANUAL_REPIN})
+ 
+ 
+ def describe_suppression(results: Iterable[Optional[Any]]) -> str:
+@@ -40,6 +48,8 @@ def describe_suppression(results: Iterable[Optional[Any]]) -> str:
+             key = f"claim_deferred({reason})"
+             counts[key] = counts.get(key, 0) + 1
+         for _task_id, reason in res.skipped_ineligible:
++            if reason == MANUAL_REPIN:
++                continue  # named on its own (manual_repin_ids): not a hold this machine's lease explains
+             key = f"skipped_ineligible({reason})"
+             counts[key] = counts.get(key, 0) + 1
+         if res.memory_pressure:
+@@ -87,9 +97,14 @@ def stuck_warning(bad_ticks: int, results: Iterable[Optional[Any]]) -> str:
+     at the Board leases and ``runs_on``; it only blames profile health when nothing else explains the zero."""
+     results = list(results)
+     held = describe_suppression(results)
++    repin = manual_repin_ids(results)
+     msg = (f"kanban dispatcher stuck: ready queue non-empty for {bad_ticks} consecutive ticks but 0 workers "
+            f"spawned.{f' Last tick held back: {held}.' if held else ''}")
+-    lease_bound = any(res is not None and (res.claim_deferred or res.skipped_ineligible) for res in results)
++    if repin:
++        # No pool worker can run these (Board ``no_eligible_worker``); each card carries the repin command.
++        msg += f" Not a stall, waiting for a manual repin: {', '.join(repin)}."
++    lease_bound = any(res is not None and (res.claim_deferred or any(
++        reason != MANUAL_REPIN for _tid, reason in res.skipped_ineligible)) for res in results)
+     if lease_bound:
+         # With sync enabled every claim goes through the Board lease: a stopped sync loop explains them all. [daveey]
+         from hermes_cli import kanban_sync_runstate as runstate
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index a563c3d2b66..052228c32f4 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -219,12 +219,19 @@ def _record(conn, task_id, gateway, value, *, fence=None):
+         recorded_ms = max(int(time.time() * 1000), int(previous_ms) + 1 if _number(previous_ms) else 0)
+         value = {**value, "recorded_at_ms": recorded_ms}
+         kb._append_event(conn, task_id, EVENT, value)
+-        kb.add_comment(conn, task_id, "worker-placement", describe(value), origin_gateway=gateway)
++        if value.get("code") != "no_eligible_worker":  # its thread comment is the owner's repin notice instead
++            kb.add_comment(conn, task_id, "worker-placement", describe(value), origin_gateway=gateway)
+         return True
+ 
+ 
+ def record_reply(conn, task_id, gateway, reply):
+-    return _record(conn, task_id, gateway, normalize(reply))
++    from hermes_cli import kanban_repin_notice as repin
++
++    value = normalize(reply)
++    recorded = _record(conn, task_id, gateway, value)
++    # Every reply, not only a changed one: a card queued before the notice existed gets it on the next pass.
++    repin.maybe_notify(conn, task_id, gateway, value)
++    return recorded
+ 
+ 
+ def try_record(writer, *args, **kwargs):
+diff --git a/hermes_cli/kanban_repin_notice.py b/hermes_cli/kanban_repin_notice.py
+new file mode 100644
+index 00000000000..0cb907dbe1b
+--- /dev/null
++++ b/hermes_cli/kanban_repin_notice.py
+@@ -0,0 +1,104 @@
++"""Owner notice for a worker-first card no pool worker can run (``no_eligible_worker``). [daveey]
++
++Under the approved overflow plan (ruling 9) the Board no longer returns such a card to its origin: it stays
++queued and fenced until its creator repins it. Without this module the only trace was a queue reason in
++``kanban show``. Here the origin posts ONE comment per card revision with the exact repin command, appends a
++``worker_repin_notice`` event (the gateway/TUI notifiers deliver it to the card's origin chat, when it has one),
++and the dispatcher's stuck summary lists such cards as waiting for a manual repin instead of a lease stall.
++
++Never repins: the notice only tells the creator what to run.
++
++A "revision" is the card's required labels plus its run count, not the Board ``sync_version``: every Board
++reserve of a queued card bumps that version, so keying on it would repeat the notice on every pass.
++"""
++from __future__ import annotations
++
++import json
++
++NOTICE_KIND = "worker_repin_notice"
++MANUAL_REPIN = "waiting_for_manual_repin"
++AUTHOR = "worker-placement"
++CODE = "no_eligible_worker"
++
++
++def _json_list(text):
++    try:
++        value = json.loads(text) if text else []
++    except (TypeError, ValueError):
++        return []
++    return [v for v in value if isinstance(v, str) and v] if isinstance(value, list) else []
++
++
++def required_labels(row):
++    """The labels a pool worker must attest to run this card (mirrors the Board's ``requiredLabels``)."""
++    row = dict(row)
++    return ([f"profile:{row.get('assignee') or 'default'}"]
++            + [f"capability:{r}" for r in _json_list(row.get("requires"))]
++            + [f"skill:{s}" for s in _json_list(row.get("skills"))])
++
++
++def observed_labels(value):
++    """Missing labels the Board observation names across its candidates, sorted; [] when it names none."""
++    labels = set()
++    for candidate in (value or {}).get("candidates") or []:
++        labels.update(candidate.get("missing_labels") or [])
++    return sorted(labels)
++
++
++def command(task_id, origin):
++    return f'hermes kanban move {task_id} --runs-on machine:{origin} --reason "no pool worker can run it"'
++
++
++def notice_text(payload):
++    """Comment and chat line (gateway and TUI notifiers share it)."""
++    payload = payload if isinstance(payload, dict) else {}
++    task_id = str(payload.get("task_id") or "<id>")[:64]
++    origin = str(payload.get("origin") or "<origin>")[:120]
++    labels = ", ".join(str(v) for v in (payload.get("labels") or [])[:64]) or "unknown labels"
++    return (f"No pool worker can run this card (needs: {labels}). It stays queued until its creator repins it: "
++            f"`{command(task_id, origin)}` on {origin}, or until a pool worker is given those labels.")
++
++
++def _revision(conn, task_id, row):
++    runs = conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]
++    return {"required": required_labels(row), "run_count": runs}
++
++
++def maybe_notify(conn, task_id, gateway, value):
++    """Post the notice for a normalized ``queued``/``no_eligible_worker`` observation, once per card revision.
++
++    Runs on every reserve reply, not only on a changed observation, so a card already queued when this code
++    deploys gets its notice on the next pass. Same ownership fence as the observation record: only the origin
++    gateway, only an unclaimed ready policy card. Returns True when it posted.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_worker_placement import POLICY
++
++    if not isinstance(value, dict) or value.get("state") != "queued" or value.get("code") != CODE:
++        return False
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if (row is None or row["created_on"] != gateway or row["placement_policy"] != POLICY
++                or row["status"] != "ready" or row["claim_lock"] or row["lease_holder"]
++                or sync.board_mode(conn) != "primary"
++                or (sync.sync_state(conn) or {}).get("gateway_id") != gateway):
++            return False
++        revision = _revision(conn, task_id, row)
++        for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                                       (task_id, NOTICE_KIND)):
++            if kb._json_dict(payload).get("revision") == revision:
++                return False
++        payload = {"task_id": task_id, "origin": gateway, "revision": revision,
++                   "labels": observed_labels(value) or revision["required"]}
++        kb._append_event(conn, task_id, NOTICE_KIND, payload)
++        kb.add_comment(conn, task_id, AUTHOR, notice_text(payload), origin_gateway=gateway)
++        return True
++
++
++def awaiting(conn, task_id):
++    """True while the card's current queue observation is the Board's ``no_eligible_worker`` queue."""
++    from hermes_cli import kanban_queue_reason as queue
++
++    value = queue.latest(conn, task_id) or {}
++    return bool(value.get("current") and value.get("state") == "queued" and value.get("code") == CODE)
+diff --git a/tests/hermes_cli/test_kanban_queue_reason.py b/tests/hermes_cli/test_kanban_queue_reason.py
+index 54d3885b6bd..7860c825a23 100644
+--- a/tests/hermes_cli/test_kanban_queue_reason.py
++++ b/tests/hermes_cli/test_kanban_queue_reason.py
+@@ -75,7 +75,7 @@ def test_unknown_payload_never_persists_raw_fields(conn):
+     assert "DO_NOT_STORE" not in json.dumps(qr.latest(conn, tid))
+ 
+ 
+-@pytest.mark.parametrize("code", sorted(qr.CODES - {"board_error"}))
++@pytest.mark.parametrize("code", sorted(qr.CODES - {"board_error", "no_eligible_worker"}))
+ def test_each_reason_has_durable_matching_thread_and_change_only_dedupe(conn, code):
+     tid = fixtures.acknowledged(conn)
+     r = reply(code, reasons=[code])
+@@ -92,6 +92,21 @@ def test_each_reason_has_durable_matching_thread_and_change_only_dedupe(conn, co
+     assert not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks' AND state='pending'").fetchone()
+ 
+ 
++def test_no_eligible_worker_thread_is_the_single_repin_notice(conn):
++    """``no_eligible_worker`` keeps the durable change-only observation, but its one thread comment is the owner's
++    repin notice (kanban_repin_notice), not a second diagnostic line beside it."""
++    tid = fixtures.acknowledged(conn)
++    r = reply("no_eligible_worker", reasons=["missing_labels"])
++    r["observation"]["candidates"][0]["missing_labels"] = ["skill:five-whys"]
++    assert qr.record_reply(conn, tid, "hub", r)
++    assert qr.latest(conn, tid)["code"] == "no_eligible_worker"
++    bodies = [c.body for c in kb.list_comments(conn, tid)]
++    assert len(bodies) == 1 and bodies[0].startswith("No pool worker can run this card (needs: skill:five-whys)")
++    r["observation"]["observed_at_ms"] = 2000
++    assert not qr.record_reply(conn, tid, "hub", r)
++    assert len(kb.list_comments(conn, tid)) == 1
++
++
+ @pytest.mark.parametrize("fields", [
+     {"created_on": "foreign"}, {"claim_lock": "claim"}, {"lease_holder": "worker-1"},
+     {"status": "blocked"}, {"placement_policy": None},
+diff --git a/tests/hermes_cli/test_kanban_repin_notice.py b/tests/hermes_cli/test_kanban_repin_notice.py
+new file mode 100644
+index 00000000000..c81c685fb18
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_repin_notice.py
+@@ -0,0 +1,198 @@
++"""A worker-first card no pool worker can run (``no_eligible_worker``) reaches its owner. [daveey]
++
++Ruling 9 of the approved overflow plan keeps the card queued and fenced (no automatic repin); these tests pin
++that the origin then posts one comment + one origin-chat notice per card revision with the exact repin command,
++that the stuck summary names the card instead of counting it as a stall, and that nothing repins it.
++"""
++import json
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_repin_notice as rn
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from hermes_cli.kanban_db_dispatch_preclaim import eligible_rows
++from hermes_cli.kanban_db_dispatch_stuck import describe_suppression, stuck_warning
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++CFG = {"worker_pools": {"hub": ["worker-1"]}}
++COMMAND = 'hermes kanban move {tid} --runs-on machine:hub --reason "no pool worker can run it"'
++
++
++def _queued(missing=("skill:five-whys",)):
++    candidate = {"machine": "worker-1", "reasons": ["missing_labels"]}
++    if missing:
++        candidate["missing_labels"] = list(missing)
++    return {"state": "queued", "machine": None, "reservation_id": None, "expires_at": None,
++            "reason": "waiting_for_worker_capacity",
++            "observation": {"version": 1, "code": "no_eligible_worker", "observed_at_ms": 1000,
++                            "candidates": [candidate]}}
++
++
++def _hub(reply=None):
++    hub = Mock()
++    hub.reserve.return_value = reply or _queued()
++    return hub
++
++
++def _card(conn):
++    return fixtures.acknowledged(conn, skills=json.dumps(["five-whys"]),
++                                 requires=json.dumps(["terminal", "file"]))
++
++
++def _notices(conn, tid):
++    return [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, rn.NOTICE_KIND))]
++
++
++def _notice_comments(conn, tid):
++    return [c for c in kb.list_comments(conn, tid) if c.body.startswith("No pool worker can run this card")]
++
++
++def _subscribe(conn, tid, chat="origin-chat"):
++    kn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat,
++                      delivery_metadata={"reason": "create"})
++
++
++def _delivered(conn, tid, chat="origin-chat"):
++    from gateway.kanban_watchers_notifier import TERMINAL_KINDS
++    _old, _new, events = kn.claim_unseen_events_for_sub(conn, task_id=tid, platform="tui", chat_id=chat,
++                                                        kinds=TERMINAL_KINDS)
++    return [ev for ev in events if ev.kind == rn.NOTICE_KIND]
++
++
++@pytest.fixture(autouse=True)
++def _no_pull(monkeypatch):
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++
++
++def test_one_comment_and_one_delivery_per_revision_across_passes(conn):
++    tid = _card(conn)
++    _subscribe(conn, tid)
++    hub = _hub()
++    for _ in range(4):
++        assert wp.reevaluate(conn, hub, "default", "hub", cfg=CFG) == 1
++    comments = _notice_comments(conn, tid)
++    assert len(comments) == 1
++    body = comments[0].body
++    assert "(needs: skill:five-whys)" in body
++    assert f"`{COMMAND.format(tid=tid)}` on hub" in body
++    assert body.endswith("or until a pool worker is given those labels.")
++    delivered = _delivered(conn, tid)
++    assert len(delivered) == 1
++    for _ in range(2):  # later passes never add another deliverable notice
++        wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    assert _delivered(conn, tid) == []
++    assert len(_notices(conn, tid)) == 1
++
++
++def test_notice_text_reaches_gateway_and_tui_chats(conn):
++    from gateway import kanban_watchers_notifier as notifier
++    from tui_gateway import session_notifications as tui
++
++    tid = _card(conn)
++    _subscribe(conn, tid)
++    wp.reevaluate(conn, _hub(), "default", "hub", cfg=CFG)
++    ev = _delivered(conn, tid)[0]
++    assert rn.NOTICE_KIND not in notifier._WAKE_KINDS  # passive: the creator acts, nothing is auto-run
++    assert not notifier.diagnostic_event(ev)  # an owner ask, not infrastructure noise
++    text = notifier._EVENT_FORMATTERS[rn.NOTICE_KIND](ev, SimpleNamespace(head=f"Kanban {tid}"))[0]
++    assert text.startswith(f"⚠ Kanban {tid}") and COMMAND.format(tid=tid) in text
++    assert rn.NOTICE_KIND in tui._KANBAN_NOTIFY_KINDS
++    _glyph, fmt = tui._KANBAN_EVENT_FORMATTERS[rn.NOTICE_KIND]
++    assert COMMAND.format(tid=tid) in fmt(None, ev.payload, "title")
++
++
++def test_card_without_origin_chat_still_gets_the_comment(conn):
++    tid = _card(conn)
++    wp.reevaluate(conn, _hub(), "default", "hub", cfg=CFG)
++    assert len(_notice_comments(conn, tid)) == 1
++    assert conn.execute("SELECT count(*) FROM kanban_notify_subs WHERE task_id=?", (tid,)).fetchone()[0] == 0
++
++
++def test_labels_fall_back_to_the_cards_required_labels(conn):
++    tid = _card(conn)
++    wp.reevaluate(conn, _hub(_queued(missing=())), "default", "hub", cfg=CFG)
++    body = _notice_comments(conn, tid)[0].body
++    assert "(needs: profile:default, capability:terminal, capability:file, skill:five-whys)" in body
++
++
++def test_new_card_revision_gets_a_new_notice(conn):
++    tid = _card(conn)
++    hub = _hub()
++    wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    conn.execute("UPDATE kanban_sync_state SET applying=1")
++    conn.execute("UPDATE tasks SET skills=? WHERE id=?", (json.dumps(["five-whys", "plan"]), tid))
++    conn.execute("UPDATE kanban_sync_state SET applying=0")
++    conn.execute("DELETE FROM kanban_sync_outbox")
++    conn.commit()
++    hub.reserve.return_value = _queued(missing=("skill:five-whys", "skill:plan"))
++    for _ in range(2):
++        wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    assert len(_notice_comments(conn, tid)) == 2
++
++
++def test_no_repin_call_is_made_and_the_fence_stays(conn):
++    tid = _card(conn)
++    hub = _hub()
++    for _ in range(3):
++        wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    assert len(_notice_comments(conn, tid)) == 1  # the owner was told...
++    hub.repin.assert_not_called()  # ...and nothing repinned it for them
++    row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert row["placement_policy"] == wp.POLICY and row["runs_on"] is None
++    assert wp.execution_refusal(conn, row) == wp.WAITING
++    assert not dispatch.has_spawnable_ready(conn)
++
++
++def test_already_queued_card_gets_its_notice_on_the_next_pass(conn, monkeypatch):
++    tid = _card(conn)
++    _subscribe(conn, tid)
++    hub = _hub()
++    with monkeypatch.context() as m:  # the pass that ran before this code was installed
++        m.setattr(rn, "maybe_notify", lambda *a, **kw: False)
++        wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    assert qr.latest(conn, tid)["code"] == "no_eligible_worker"
++    assert _notice_comments(conn, tid) == []
++    wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    assert len(_notice_comments(conn, tid)) == 1
++    assert len(_delivered(conn, tid)) == 1
++
++
++def test_other_queue_codes_post_no_notice(conn):
++    tid = _card(conn)
++    reply = _queued()
++    reply["observation"]["code"] = "workers_saturated"
++    wp.reevaluate(conn, _hub(reply), "default", "hub", cfg=CFG)
++    assert _notices(conn, tid) == []
++
++
++def test_stuck_summary_names_the_card_and_does_not_count_it_as_a_stall(conn):
++    tid = _card(conn)
++    wp.reevaluate(conn, _hub(), "default", "hub", cfg=CFG)
++    rows = conn.execute("SELECT * FROM tasks WHERE status='ready'").fetchall()
++    result = dispatch.DispatchResult()
++    assert eligible_rows(conn, rows, "ready", result) == []
++    assert result.skipped_ineligible == [(tid, rn.MANUAL_REPIN)]
++    assert "skipped_ineligible" not in describe_suppression([result])
++    line = stuck_warning(6, [result])
++    assert f"waiting for a manual repin: {tid}" in line
++    assert "Board lease refused or deferred" not in line  # not blamed on the lease
++    assert not dispatch.has_spawnable_ready(conn)
++
++
++def test_stuck_summary_keeps_other_refusals_as_lease_holds(conn):
++    tid = _card(conn)
++    result = dispatch.DispatchResult()
++    result.skipped_ineligible = [(tid, rn.MANUAL_REPIN), ("t_other", "labels_mismatch")]
++    line = stuck_warning(6, [result])
++    assert f"waiting for a manual repin: {tid}" in line
++    assert "skipped_ineligible(labels_mismatch)=1" in line
++    assert "Board lease refused or deferred" in line
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index bddd49019f2..7a754dcc0fd 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -167,7 +167,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
+ # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
+ # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
+ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
+-                        "quota_episode_notice")
++                        "quota_episode_notice", "worker_repin_notice")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+@@ -595,6 +595,11 @@ def _kb_quota_episode(payload: dict) -> str:
+     return notice_text(payload)
+ 
+ 
++def _kb_repin_notice(payload: dict) -> str:
++    from hermes_cli.kanban_repin_notice import notice_text
++    return ": " + notice_text(payload)
++
++
+ def _kb_failure(kind: str, payload: dict, title: str) -> str:
+     """Cause-accurate gave_up/crashed wording; pid/exit/raw output only under ``Details:``. [daveey]"""
+     from hermes_cli.kanban_failure_summary import describe_failure
+@@ -610,6 +615,7 @@ _KANBAN_EVENT_FORMATTERS = {
+     "timed_out": ("⏱", _kb_timed_out),
+     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
+     "quota_episode_notice": ("⏳", lambda t, p, title: _kb_quota_episode(p)),
++    "worker_repin_notice": ("⚠", lambda t, p, title: _kb_repin_notice(p)),
+ }
+ 
+ 
+-- 
+2.55.0
+

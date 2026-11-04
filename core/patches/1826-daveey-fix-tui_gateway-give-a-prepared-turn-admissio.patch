@@ -1,0 +1,116 @@
+From 4ef1b79ab6b4e4a8632852c6aed546e92ab8ea3b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:18:40 +0000
+Subject: [PATCH] [daveey] fix(tui_gateway): give a prepared turn admission
+ back when the start path raises
+
+A raise under _sessions_lock before the spawn (routing-row reopen) leaked
+the prepared admission; clean-up now runs after the lock is released
+(cancel before spawn, abort for a failed spawn, nothing once the worker
+started). Also drops the blind catch flagged by code health.
+---
+ .../test_prompt_start_lock_order.py           | 37 ++++++++++++++++++-
+ tui_gateway/prompt_turn.py                    | 34 +++++++++--------
+ 2 files changed, 55 insertions(+), 16 deletions(-)
+
+diff --git a/tests/tui_gateway/test_prompt_start_lock_order.py b/tests/tui_gateway/test_prompt_start_lock_order.py
+index 6c29f62279c..051bfb8f168 100644
+--- a/tests/tui_gateway/test_prompt_start_lock_order.py
++++ b/tests/tui_gateway/test_prompt_start_lock_order.py
+@@ -33,7 +33,7 @@ class _OrderCheckedLock:
+ 
+     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+         self.acquisitions += 1
+-        if getattr(server._sessions_lock, "_is_owned")():
++        if server._sessions_lock._is_owned():
+             self.under_sessions_lock.append(threading.current_thread().name)
+         if threading.current_thread().name == self.watched_thread and self._lock.locked():
+             self.contended.set()
+@@ -213,3 +213,38 @@ def test_cancelled_work_settles_a_turn_whose_sibling_worker_finished_meanwhile(t
+     assert session["running"] is False
+     assert session.get("_turn_admission") is None
+     assert fence.active_count() == 0
++
++
++@pytest.mark.parametrize("failure", ["before-spawn", "spawn"])
++def test_turn_start_failure_releases_the_prepared_admission_outside_sessions_lock(
++        turn_env, request, tmp_path, monkeypatch, failure):
++    """A failure under ``_sessions_lock`` (routing-row reopen, or the thread spawn itself) propagates and
++    gives the prepared admission back, taking ``history_lock`` only after ``_sessions_lock`` is released."""
++    import agent.memory_provider as memory_provider
++    from hermes_cli import backend_retirement
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++
++    def boom(*a, **k):
++        raise RuntimeError(failure)
++
++    if failure == "spawn":
++        monkeypatch.setattr(memory_provider, "spawn_context_thread", boom)
++    else:
++        monkeypatch.setattr(server, "_reopen_routed_session_row", boom)
++    sid = f"lockfail-{request.node.name}"[:60]
++    lock, completed = _OrderCheckedLock(), threading.Event()
++    session = _registered_session(sid, lock, completed)
++    session.update(profile_home=str(tmp_path))
++    try:
++        with pytest.raises(RuntimeError, match=failure):
++            server._run_prompt_submit("rid", sid, session, "go")
++    finally:
++        with server._sessions_lock:
++            server._sessions.pop(sid, None)
++    assert not completed.is_set()
++    assert lock.under_sessions_lock == []
++    assert session.get("_turn_admission") is None
++    assert fence.active_count() == 0
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index ac5395f2ca6..51127133a9c 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1468,22 +1468,26 @@ def _run_admitted_prompt(
+     # admission is retained before it too: that takes history_lock, and session.resume/activate hold
+     # history_lock while they take _sessions_lock (a resume racing this submit deadlocked the backend).
+     work = _prepare_session_work(run, name=f"prompt-turn-{sid}", session=session)
+-    spawn_error = None
+-    with _routing_provenance_db(session) as routing_db, _sessions_lock:
+-        registered = _sessions.get(sid)
+-        can_start = work is not None and not session.get("_closing") and (registered is None or registered is session)
+-        if can_start:
+-            # Only a registered session is proof the conversation is routed here; an unregistered one may
+-            # still run its turn, but its stamp stays (#106459).
+-            if registered is session:
+-                _reopen_routed_session_row(routing_db, sid, session)
+-            try:
++    spawning = started = False
++    try:
++        with _routing_provenance_db(session) as routing_db, _sessions_lock:
++            registered = _sessions.get(sid)
++            can_start = work is not None and not session.get("_closing") and (registered is None or registered is session)
++            if can_start:
++                # Only a registered session is proof the conversation is routed here; an unregistered one may
++                # still run its turn, but its stamp stays (#106459).
++                if registered is session:
++                    _reopen_routed_session_row(routing_db, sid, session)
++                spawning = True
+                 work.start(abort_on_error=False)  # spawns only; the close-race check above stays atomic
+-            except BaseException as exc:
+-                spawn_error = exc
+-    if spawn_error is not None:
+-        work.abort()  # the worker's cleanup takes history_lock: never under _sessions_lock
+-        raise spawn_error
++                started = True
++    except BaseException:
++        # Out here _sessions_lock is released: both clean-ups take history_lock. A started worker owns its own.
++        if spawning and not started:
++            work.abort()
++        elif work is not None and not started:
++            work.cancel()
++        raise
+     if work is not None and not can_start:
+         work.cancel()
+     if not can_start:
+-- 
+2.55.0
+

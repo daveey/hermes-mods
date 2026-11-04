@@ -1,0 +1,820 @@
+From 085866cb50045b07c36d6c2bd899ef66ec5e5c86 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 13:43:27 +0000
+Subject: [PATCH] [daveey] desktop: warm transcript cache for
+ @session-referenced sessions so first ref clicks paint from cache
+
+An @session mention usually names an old session outside the prefetcher's
+PER_GATEWAY window, so its first click waited on hub REST (paint:"rest",
+1.5 s on 11-02). Ref chips/links now ask main to prefetch the key the click
+would paint from (owner resolved like the click: resolveSessionRefOwner), on
+render and on pointer-enter, via a fire-and-forget
+hermes:transcript-cache:prefetch IPC. Main dedupes queued/in-flight keys,
+skips a current cache (hub meta from the last pass, else MIN_REFETCH_MS),
+shares the tick's per-gateway backoff, and runs at most 2 per gateway.
+---
+ apps/desktop/electron/preload.ts              |   4 +-
+ .../electron/transcript-cache-host.test.ts    |  40 +++-
+ .../desktop/electron/transcript-cache-host.ts |  10 +
+ .../electron/transcript-prefetch.test.ts      | 105 ++++++++++
+ apps/desktop/electron/transcript-prefetch.ts  | 179 +++++++++++++++++-
+ .../app/chat/session-ref-prefetch.test.tsx    | 125 ++++++++++++
+ .../src/app/chat/session-ref-prefetch.ts      | 103 ++++++++++
+ .../assistant-ui/directive-text.tsx           |  35 +++-
+ apps/desktop/src/global.d.ts                  |   2 +
+ 9 files changed, 594 insertions(+), 9 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/session-ref-prefetch.test.tsx
+ create mode 100644 apps/desktop/src/app/chat/session-ref-prefetch.ts
+
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index 8dd43a6b5ba..ec0bd536e52 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -72,7 +72,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+     migrateProfile: (connectionId, from, to) =>
+       ipcRenderer.send('hermes:transcript-cache:migrate-profile', { connectionId, from, to }),
+     clear: () => ipcRenderer.send('hermes:transcript-cache:clear'),
+-    stats: () => ipcRenderer.invoke('hermes:transcript-cache:stats')
++    stats: () => ipcRenderer.invoke('hermes:transcript-cache:stats'),
++    // [daveey] Fire-and-forget: warm an `@session`-referenced session before it is clicked.
++    prefetch: key => ipcRenderer.send('hermes:transcript-cache:prefetch', key)
+   },
+   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+   // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
+diff --git a/apps/desktop/electron/transcript-cache-host.test.ts b/apps/desktop/electron/transcript-cache-host.test.ts
+index c23fe2f9ae2..92e270ec74f 100644
+--- a/apps/desktop/electron/transcript-cache-host.test.ts
++++ b/apps/desktop/electron/transcript-cache-host.test.ts
+@@ -48,7 +48,7 @@ function install() {
+     userDataDir: dir
+   })
+ 
+-  return { backendFor, host, on }
++  return { backendFor, getJson, host, on }
+ }
+ 
+ describe('transcript cache host', () => {
+@@ -76,6 +76,42 @@ describe('transcript cache host', () => {
+     expect(event.returnValue?.messages).toEqual([{ content: 'row of local', id: 1, role: 'user' }])
+     host.stop()
+   })
++
++  it("[daveey] prefetch IPC stores an @session ref's latest rows under its key and skips the fetch when current", async () => {
++    const { getJson, host, on } = install()
++
++    const messageReads = () =>
++      getJson.mock.calls.filter(([, requestPath]) => String(requestPath).includes('/messages')).length
++
++    const key = { connectionId: 'mac-mini', profile: 'default', sessionId: 'old-ref' }
++
++    on.get('hermes:transcript-cache:prefetch')!({}, key)
++
++    await vi.waitFor(() =>
++      expect(host.store.read(key)?.messages).toEqual([{ content: 'row of mac-mini', id: 1, role: 'user' }])
++    )
++    expect(messageReads()).toBe(1)
++    expect(getJson).toHaveBeenCalledWith(
++      { connectionId: 'mac-mini' },
++      expect.stringMatching(/^\/api\/sessions\/old-ref\/messages\?.*order=latest/),
++      expect.anything()
++    )
++
++    // Cache current (fresh copy, session not listed as moved): a second ask fetches nothing.
++    on.get('hermes:transcript-cache:prefetch')!({}, key)
++    await expect(host.prefetcher.prefetchKey(key)).resolves.toBe('current')
++    expect(messageReads()).toBe(1)
++
++    // A session the tick already cached at the hub's meta is current too; '' means the primary.
++    await host.prefetcher.tick()
++    const before = messageReads()
++    on.get('hermes:transcript-cache:prefetch')!({}, { connectionId: '', profile: '', sessionId: 'l1' })
++    await expect(
++      host.prefetcher.prefetchKey({ connectionId: 'local', profile: 'default', sessionId: 'l1' })
++    ).resolves.toBe('current')
++    expect(messageReads()).toBe(before)
++    host.stop()
++  })
+ })
+ 
+ describe('[daveey] open Inbox cards in prefetch', () => {
+@@ -104,7 +140,7 @@ describe('[daveey] open Inbox cards in prefetch', () => {
+     expect(marked).toHaveLength(2)
+   })
+ 
+-  it('reads the replica Inbox on the primary and fetches a card\'s session first', async () => {
++  it("reads the replica Inbox on the primary and fetches a card's session first", async () => {
+     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcript-cache-host-inbox-'))
+     dirs.push(dir)
+     const fetched: string[] = []
+diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
+index fac89b9c83c..318ea9e7393 100644
+--- a/apps/desktop/electron/transcript-cache-host.ts
++++ b/apps/desktop/electron/transcript-cache-host.ts
+@@ -11,6 +11,7 @@
+  *   hermes:transcript-cache:migrate-profile  send      {connectionId, from, to}
+  *   hermes:transcript-cache:clear            send
+  *   hermes:transcript-cache:stats            invoke    -> {bytes, sessions}
++ *   hermes:transcript-cache:prefetch         send      {connectionId, profile, sessionId}  ([daveey] @session ref warm-up)
+  */
+ import path from 'node:path'
+ 
+@@ -269,6 +270,15 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+     store
+   })
+ 
++  // [daveey] An `@session` ref chip rendered/hovered: warm that session so its first click paints from cache.
++  deps.ipcMain.on('hermes:transcript-cache:prefetch', (_event, raw) => {
++    const key = normalizeKey(raw)
++
++    if (key) {
++      void prefetcher.prefetchKey(key).catch(error => deps.log(`transcript prefetch (ref) failed: ${error}`))
++    }
++  })
++
+   return {
+     prefetcher,
+     start: () => prefetcher.start(),
+diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
+index 3efa563b541..20df1d02a02 100644
+--- a/apps/desktop/electron/transcript-prefetch.test.ts
++++ b/apps/desktop/electron/transcript-prefetch.test.ts
+@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
+ 
+ import { type TranscriptCacheKey, TranscriptCacheStore } from './transcript-cache'
+ import {
++  DEMAND_CONCURRENCY,
+   GATEWAY_BACKOFF_MS,
+   type HubSessionRecord,
+   MIN_REFETCH_MS,
+@@ -234,3 +235,107 @@ describe('prefetch refresh on activity change', () => {
+     expect(fetchLatest).not.toHaveBeenCalled()
+   })
+ })
++
++describe('[daveey] on-demand prefetch of an @session-referenced session', () => {
++  function harness(records: HubSessionRecord[] = []) {
++    let clock = 1_000_000
++    const store = new TranscriptCacheStore(':memory:', { now: () => clock })
++    const fetchLatest = vi.fn(async (key: TranscriptCacheKey) => [{ content: `${key.sessionId}@${clock}`, id: clock }])
++
++    const prefetcher = new TranscriptPrefetcher({
++      connectionForGateway: gateway => CONNECTIONS[gateway],
++      fetchLatest,
++      listHubSessions: async () => records,
++      now: () => clock,
++      store
++    })
++
++    return { advance: (ms: number) => (clock += ms), fetchLatest, prefetcher, store }
++  }
++
++  const old = { connectionId: 'hermes-hub', profile: 'default', sessionId: '20261018_114650_7ed013' }
++
++  it('fetches a session outside the PER_GATEWAY window into the cache, once per MIN_REFETCH_MS', async () => {
++    const h = harness()
++
++    await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('fetched')
++    expect(h.store.read(old)?.messages).toHaveLength(1)
++    await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('current')
++    expect(h.fetchLatest).toHaveBeenCalledTimes(1)
++
++    h.advance(MIN_REFETCH_MS)
++    await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('fetched')
++  })
++
++  it('dedupes a key already queued or in flight', async () => {
++    const h = harness()
++    const first = h.prefetcher.prefetchKey(old)
++
++    await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('queued')
++    await expect(first).resolves.toBe('fetched')
++    expect(h.fetchLatest).toHaveBeenCalledTimes(1)
++  })
++
++  it('uses the hub meta from the last pass: unchanged is current, moved is refetched', async () => {
++    // Hidden: listed by the hub but never a tick target, so only the on-demand path fetches it.
++    const records = [record('hub', 'listed', 5, { hidden: true })]
++    const h = harness(records)
++    const key = { connectionId: 'hermes-hub', profile: 'default', sessionId: 'listed' }
++
++    await h.prefetcher.tick()
++    expect(h.fetchLatest).not.toHaveBeenCalled()
++    await expect(h.prefetcher.prefetchKey(key)).resolves.toBe('fetched')
++    expect(h.store.meta(key)).toMatchObject({ activity: 5, messageCount: 10 })
++
++    h.advance(MIN_REFETCH_MS)
++    await expect(h.prefetcher.prefetchKey(key)).resolves.toBe('current')
++
++    records[0] = record('hub', 'listed', 9, { hidden: true })
++    await h.prefetcher.tick()
++    await expect(h.prefetcher.prefetchKey(key)).resolves.toBe('fetched')
++    expect(h.fetchLatest).toHaveBeenCalledTimes(2)
++    expect(h.store.meta(key)).toMatchObject({ activity: 9 })
++  })
++
++  it('backs off a gateway that failed (shared with the tick) and runs at most DEMAND_CONCURRENCY per gateway', async () => {
++    const h = harness()
++    let inFlight = 0
++    let peak = 0
++
++    h.fetchLatest.mockImplementation(async key => {
++      inFlight += 1
++      peak = Math.max(peak, inFlight)
++      await new Promise(resolve => setTimeout(resolve, 5))
++      inFlight -= 1
++
++      if (key.connectionId === 'mac-mini') {
++        throw new Error('connect ECONNREFUSED')
++      }
++
++      return [{ content: 'ok', id: 1 }]
++    })
++
++    const keys = Array.from({ length: 6 }, (_, index) => ({ ...old, sessionId: `s${index}` }))
++    await expect(Promise.all(keys.map(key => h.prefetcher.prefetchKey(key)))).resolves.toEqual(Array(6).fill('fetched'))
++    expect(peak).toBeLessThanOrEqual(DEMAND_CONCURRENCY)
++
++    const dead = { connectionId: 'mac-mini', profile: 'default', sessionId: 'x' }
++    await expect(h.prefetcher.prefetchKey(dead)).resolves.toBe('failed')
++    h.fetchLatest.mockClear()
++    await expect(h.prefetcher.prefetchKey({ ...dead, sessionId: 'y' })).resolves.toBe('backoff')
++    expect(h.fetchLatest).not.toHaveBeenCalled()
++
++    h.advance(GATEWAY_BACKOFF_MS)
++    await expect(h.prefetcher.prefetchKey({ ...dead, sessionId: 'y' })).resolves.toBe('failed')
++  })
++
++  it('does not refetch a missing session within MIN_REFETCH_MS, and rejects a key without an owner', async () => {
++    const h = harness()
++    h.fetchLatest.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }))
++
++    await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('failed')
++    await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('current')
++    await expect(h.prefetcher.prefetchKey({ ...old, connectionId: '' })).resolves.toBe('invalid')
++    expect(h.fetchLatest).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index 903d1536972..78b54e4eec8 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -16,6 +16,10 @@ export const PER_GATEWAY = 200
+ export const MIN_REFETCH_MS = 30_000
+ /** A gateway that failed is skipped for this long before it is tried again. */
+ export const GATEWAY_BACKOFF_MS = 60_000
++/** [daveey] On-demand (`@session` ref) fetches in flight per gateway, and the most queued behind them. */
++export const DEMAND_CONCURRENCY = 2
++export const DEMAND_QUEUE_MAX = 50
++const DEMAND_MISSED_MAX = 500
+ 
+ export interface HubSessionRecord {
+   activity?: null | number
+@@ -56,6 +60,11 @@ export interface PrefetchDeps {
+ }
+ 
+ const profileOf = (value: unknown) => String(value ?? '').trim() || 'default'
++const keyString = (key: TranscriptCacheKey) => `${key.connectionId}\u0000${key.profile}\u0000${key.sessionId}`
++
++/** What one on-demand prefetch did: fetched/empty/failed ran a fetch; the rest skipped it. */
++export type PrefetchKeyOutcome =
++  'backoff' | 'current' | 'dropped' | 'empty' | 'failed' | 'fetched' | 'invalid' | 'queued'
+ 
+ /**
+  * Per gateway, the PER_GATEWAY most recently active session tips: open Inbox cards' sessions first, then people's
+@@ -151,7 +160,21 @@ export class TranscriptPrefetcher {
+    * The cache has no row for them, so without this needsRefresh() saw "never fetched" and every tick refetched
+    * them. They are retried once their activity/message_count moves (and MIN_REFETCH_MS passed).
+    */
+-  private readonly unstored = new Map<string, { activity: null | number; messageCount: null | number; savedAt: number }>()
++  private readonly unstored = new Map<
++    string,
++    { activity: null | number; messageCount: null | number; savedAt: number }
++  >()
++  /** [daveey] Hub meta of every session the last pass listed, so an on-demand fetch can tell a current cache. */
++  private readonly listed = new Map<string, { activity: null | number; messageCount: null | number }>()
++  /** [daveey] On-demand fetches: queued/in-flight keys (with their waiters), per-gateway queues, active counts. */
++  private readonly demandWaiters = new Map<string, ((outcome: PrefetchKeyOutcome) => void)[]>()
++  private readonly demandQueues = new Map<string, TranscriptCacheKey[]>()
++  private readonly demandActive = new Map<string, number>()
++  /** [daveey] On-demand keys whose fetch stored nothing (404, empty): not retried within MIN_REFETCH_MS. */
++  private readonly demandMissed = new Map<
++    string,
++    { activity: null | number; messageCount: null | number; savedAt: number }
++  >()
+   private running: null | Promise<PrefetchTickResult> = null
+   private timer: null | ReturnType<typeof setTimeout> = null
+   private stopped = true
+@@ -171,6 +194,142 @@ export class TranscriptPrefetcher {
+     return this.running
+   }
+ 
++  /**
++   * [daveey] Warm one session the renderer is about to open (an `@session` ref chip rendered or was hovered).
++   * Such refs mostly point at old sessions outside the PER_GATEWAY window, so without this the first click waited
++   * on REST. Fire-and-forget for the caller; the promise settles when this key is done (tests, logs). Deduped
++   * against queued/in-flight keys; skipped while the cache is current (the hub's activity/message_count when the
++   * last pass listed the session, else a copy younger than MIN_REFETCH_MS) or the gateway is backed off; at most
++   * DEMAND_CONCURRENCY fetches per gateway at a time and DEMAND_QUEUE_MAX queued behind them.
++   */
++  prefetchKey(raw: TranscriptCacheKey): Promise<PrefetchKeyOutcome> {
++    const key: TranscriptCacheKey = {
++      connectionId: String(raw?.connectionId ?? '').trim(),
++      profile: profileOf(raw?.profile),
++      sessionId: String(raw?.sessionId ?? '').trim()
++    }
++
++    const id = keyString(key)
++    const now = this.deps.now?.() ?? Date.now()
++
++    if (!key.connectionId || !key.sessionId) {
++      return Promise.resolve('invalid')
++    }
++
++    if (this.demandWaiters.has(id)) {
++      return Promise.resolve('queued')
++    }
++
++    if ((this.downUntil.get(key.connectionId) ?? 0) > now) {
++      return Promise.resolve('backoff')
++    }
++
++    if (!this.demandDue(key, now)) {
++      return Promise.resolve('current')
++    }
++
++    const queue = this.demandQueues.get(key.connectionId) ?? []
++
++    if (queue.length >= DEMAND_QUEUE_MAX) {
++      return Promise.resolve('dropped')
++    }
++
++    return new Promise<PrefetchKeyOutcome>(resolve => {
++      this.demandWaiters.set(id, [resolve])
++      queue.push(key)
++      this.demandQueues.set(key.connectionId, queue)
++      this.pumpDemand(key.connectionId)
++    })
++  }
++
++  private demandDue(key: TranscriptCacheKey, now: number): boolean {
++    const id = keyString(key)
++    const cached = this.deps.store.meta(key) ?? this.unstored.get(id) ?? this.demandMissed.get(id) ?? null
++    const listed = this.listed.get(id)
++
++    if (!cached) {
++      return true
++    }
++
++    if (listed) {
++      return needsRefresh(cached, { automated: false, key, meta: listed }, now)
++    }
++
++    // Not in the hub listing: nothing says it moved, so only a copy older than MIN_REFETCH_MS is refreshed.
++    return now - cached.savedAt >= MIN_REFETCH_MS
++  }
++
++  private pumpDemand(connectionId: string): void {
++    const queue = this.demandQueues.get(connectionId) ?? []
++
++    while (queue.length > 0 && (this.demandActive.get(connectionId) ?? 0) < DEMAND_CONCURRENCY) {
++      const key = queue.shift()!
++      this.demandActive.set(connectionId, (this.demandActive.get(connectionId) ?? 0) + 1)
++
++      void this.fetchDemand(key).then(outcome => {
++        this.demandActive.set(connectionId, Math.max(0, (this.demandActive.get(connectionId) ?? 1) - 1))
++        const waiters = this.demandWaiters.get(keyString(key)) ?? []
++        this.demandWaiters.delete(keyString(key))
++        waiters.forEach(resolve => resolve(outcome))
++        this.pumpDemand(connectionId)
++      })
++    }
++
++    if (queue.length === 0) {
++      this.demandQueues.delete(connectionId)
++    }
++  }
++
++  private async fetchDemand(key: TranscriptCacheKey): Promise<PrefetchKeyOutcome> {
++    const id = keyString(key)
++    const meta = this.listed.get(id) ?? { activity: null, messageCount: null }
++    const stamp = () => this.deps.now?.() ?? Date.now()
++
++    const markMissed = () => {
++      this.demandMissed.delete(id)
++      this.demandMissed.set(id, { ...meta, savedAt: stamp() })
++
++      // Bounded: drop the oldest misses past the cap (Map keeps insertion order).
++      for (const stale of this.demandMissed.keys()) {
++        if (this.demandMissed.size <= DEMAND_MISSED_MAX) {
++          break
++        }
++
++        this.demandMissed.delete(stale)
++      }
++    }
++
++    if ((this.downUntil.get(key.connectionId) ?? 0) > stamp()) {
++      return 'backoff'
++    }
++
++    try {
++      const rows = await this.deps.fetchLatest(key, LATEST_ROWS)
++
++      if (rows.length > 0 && this.deps.store.putLatest(key, rows, meta)) {
++        this.demandMissed.delete(id)
++        this.deps.log?.(`transcript prefetch (ref): cached ${key.connectionId}/${key.profile}/${key.sessionId}`)
++
++        return 'fetched'
++      }
++
++      markMissed()
++
++      return 'empty'
++    } catch (error) {
++      if (isGatewayFailure(error)) {
++        this.downUntil.set(key.connectionId, stamp() + GATEWAY_BACKOFF_MS)
++        this.deps.log?.(
++          `transcript prefetch (ref): ${key.connectionId} unreachable (${(error as Error)?.message || error}); backing off`
++        )
++      } else {
++        markMissed() // a 4xx for this one session
++      }
++
++      return 'failed'
++    }
++  }
++
+   start(intervalMs = 5_000): void {
+     if (!this.stopped) {
+       return
+@@ -225,8 +384,21 @@ export class TranscriptPrefetcher {
+     const targets = selectPrefetchTargets(records, gateway => names.get(gateway))
+     result.targets = targets.length
+ 
+-    const keyOf = (target: PrefetchTarget) =>
+-      `${target.key.connectionId}\u0000${target.key.profile}\u0000${target.key.sessionId}`
++    // [daveey] Every listed session's hub meta (not just the targets), for on-demand freshness checks.
++    this.listed.clear()
++
++    for (const record of records) {
++      const connectionId = record?.id && record.gateway ? names.get(record.gateway) : undefined
++
++      if (connectionId) {
++        this.listed.set(keyString({ connectionId, profile: profileOf(record.profile), sessionId: record.id }), {
++          activity: record.activity ?? null,
++          messageCount: record.message_count ?? null
++        })
++      }
++    }
++
++    const keyOf = (target: PrefetchTarget) => keyString(target.key)
+ 
+     // Forget memo entries for sessions no longer targeted, so the map stays bounded by the target set.
+     const live = new Set(targets.map(keyOf))
+@@ -240,6 +412,7 @@ export class TranscriptPrefetcher {
+     const due = targets.filter(target =>
+       needsRefresh(this.deps.store.meta(target.key) ?? this.unstored.get(keyOf(target)) ?? null, target, now)
+     )
++
+     result.skipped = targets.length - due.length
+ 
+     const markUnstored = (target: PrefetchTarget) =>
+diff --git a/apps/desktop/src/app/chat/session-ref-prefetch.test.tsx b/apps/desktop/src/app/chat/session-ref-prefetch.test.tsx
+new file mode 100644
+index 00000000000..f89a31f7a12
+--- /dev/null
++++ b/apps/desktop/src/app/chat/session-ref-prefetch.test.tsx
+@@ -0,0 +1,125 @@
++import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { SessionRefChip, SessionRefLink } from '@/components/assistant-ui/directive-text'
++import { __resetSessionLinkTitleCache } from '@/lib/session-link-title'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { $sessions, _resetSessionOwnerHintsForTests } from '@/store/session'
++import { $sessionTiles } from '@/store/session-states'
++import type { SessionInfo } from '@/types/hermes'
++
++import { prefetchSessionRef, REF_PREFETCH_MIN_MS, resetSessionRefPrefetch } from './session-ref-prefetch'
++
++const row = (over: Partial<SessionInfo>): SessionInfo => over as SessionInfo
++
++const registry = () =>
++  ({
++    connections: [
++      { id: 'local', kind: 'local', label: 'This device' },
++      { id: 'hermes-hub', kind: 'ssh', label: 'hermes-hub' },
++      { id: 'mac-mini', kind: 'ssh', label: 'Mac Mini' }
++    ],
++    primary: 'local',
++    secureTokenStorage: true,
++    version: 2
++  }) as never
++
++// Let the chip's lazy import and its effect run.
++const settle = () => act(() => new Promise(resolve => setTimeout(resolve, 20)))
++
++let prefetch: ReturnType<typeof vi.fn>
++let previousDesktop: unknown
++
++beforeEach(() => {
++  resetSessionRefPrefetch()
++  _resetSessionOwnerHintsForTests()
++  $connectionsRegistry.set(registry())
++  $sessions.set([])
++  $sessionTiles.set([])
++  prefetch = vi.fn()
++  previousDesktop = (window as any).hermesDesktop
++  ;(window as any).hermesDesktop = { ...(previousDesktop as object), transcriptCache: { prefetch } }
++})
++
++afterEach(() => {
++  cleanup()
++  ;(window as any).hermesDesktop = previousDesktop
++  $connectionsRegistry.set(null)
++  $sessions.set([])
++  $sessionTiles.set([])
++  __resetSessionLinkTitleCache()
++})
++
++describe('@session ref chips warm the transcript cache', () => {
++  it('render + pointer-enter issues exactly one prefetch for the resolved owner key', async () => {
++    $sessions.set([row({ connection_id: 'hermes-hub', id: '20261018_114650_7ed013', profile: 'default' })])
++
++    render(<SessionRefChip value="default/20261018_114650_7ed013" />)
++    await waitFor(() => expect(prefetch).toHaveBeenCalledTimes(1))
++
++    fireEvent.pointerEnter(screen.getByTitle('default/20261018_114650_7ed013'))
++    await settle()
++
++    expect(prefetch).toHaveBeenCalledTimes(1)
++    expect(prefetch).toHaveBeenCalledWith({
++      connectionId: 'hermes-hub',
++      profile: 'default',
++      sessionId: '20261018_114650_7ed013'
++    })
++  })
++
++  it('a second render within MIN_REFETCH_MS issues none; after the window it sends again', async () => {
++    $sessions.set([row({ connection_id: 'hermes-hub', id: 's1', profile: 'default' })])
++
++    render(<SessionRefChip value="default/s1" />)
++    await waitFor(() => expect(prefetch).toHaveBeenCalledTimes(1))
++    cleanup()
++
++    render(<SessionRefLink value="default/s1" />)
++    await settle()
++    fireEvent.pointerEnter(screen.getByTitle('default/s1'))
++    await settle()
++
++    expect(prefetch).toHaveBeenCalledTimes(1)
++
++    // The throttle is per window, not forever.
++    expect(prefetchSessionRef('default/s1', null, Date.now() + REF_PREFETCH_MIN_MS + 1)).toEqual({
++      connectionId: 'hermes-hub',
++      profile: 'default',
++      sessionId: 's1'
++    })
++    expect(prefetch).toHaveBeenCalledTimes(2)
++  })
++
++  it('an unresolved owner issues none, then a hover after the owner is known sends it', async () => {
++    render(<SessionRefChip value="default/unknown1" />)
++    await settle()
++    fireEvent.pointerEnter(screen.getByTitle('default/unknown1'))
++    await settle()
++
++    expect(prefetch).not.toHaveBeenCalled()
++
++    // Not remembered as sent: once the list knows the owner, a hover warms it.
++    $sessions.set([row({ connection_id: 'mac-mini', id: 'unknown1', profile: 'default' })])
++    fireEvent.pointerEnter(screen.getByTitle('default/unknown1'))
++    await waitFor(() => expect(prefetch).toHaveBeenCalledTimes(1))
++    expect(prefetch).toHaveBeenCalledWith({ connectionId: 'mac-mini', profile: 'default', sessionId: 'unknown1' })
++  })
++
++  it('a gateway-qualified ref targets that gateway (markdown link)', async () => {
++    // A row on another gateway with the same id must not win over the qualifier.
++    $sessions.set([row({ connection_id: 'hermes-hub', id: 's9', profile: 'work' })])
++
++    render(<SessionRefLink value="work@mac-mini/s9" />)
++    await waitFor(() => expect(prefetch).toHaveBeenCalledTimes(1))
++
++    expect(prefetch).toHaveBeenCalledWith({ connectionId: 'mac-mini', profile: 'work', sessionId: 's9' })
++  })
++
++  it('an unknown gateway qualifier issues none', async () => {
++    render(<SessionRefLink value="default@nowhere/s9" />)
++    await settle()
++
++    expect(prefetch).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/app/chat/session-ref-prefetch.ts b/apps/desktop/src/app/chat/session-ref-prefetch.ts
+new file mode 100644
+index 00000000000..96de0c0f5b7
+--- /dev/null
++++ b/apps/desktop/src/app/chat/session-ref-prefetch.ts
+@@ -0,0 +1,103 @@
++/**
++ * [daveey] Warm the transcript cache for a session an `@session:` ref points at.
++ *
++ * The background prefetcher (electron/transcript-prefetch.ts) keeps only each
++ * gateway's PER_GATEWAY most recently active sessions cached. A mention usually
++ * names an older session, so its first click waited on a hub REST round trip
++ * (1-3 s under load) before anything painted. When a ref chip renders (and again
++ * on pointer-enter) we resolve its owner exactly as the click does
++ * (`resolveSessionRefOwner`) and ask main to fetch that key into the cache;
++ * the click then paints from it (`paint:"cache"` in open-timing).
++ *
++ * The key is the one the open's cache paint reads (`transcriptRestScope`):
++ * the owner's connection and its target profile. An unresolved owner sends
++ * nothing (the open would not read an unscoped entry either), and is not
++ * remembered, so a later render/hover retries once the session list knows it.
++ * Main dedupes, honours MIN_REFETCH_MS and per-gateway backoff; this side only
++ * stops one key from re-sending inside the same window.
++ */
++import { resolveSessionRefOwner } from '@/app/chat/session-ref-owner'
++import { parseSessionRefValue } from '@/lib/session-refs'
++
++/** Mirrors electron/transcript-prefetch.ts MIN_REFETCH_MS. */
++export const REF_PREFETCH_MIN_MS = 30_000
++const SENT_MAX = 1_000
++
++const sent = new Map<string, number>()
++
++export interface SessionRefPrefetchKey {
++  connectionId: string
++  profile: string
++  sessionId: string
++}
++
++/** The cache key a click on this ref would paint from, or null when its owner is unknown. */
++export function sessionRefPrefetchKey(value: string, originStoredId?: null | string): null | SessionRefPrefetchKey {
++  const { sessionId } = parseSessionRefValue(value)
++
++  if (!sessionId) {
++    return null
++  }
++
++  const owner = resolveSessionRefOwner(value, originStoredId)
++
++  if (!owner) {
++    return null
++  }
++
++  return {
++    connectionId: String(owner.connectionId ?? '').trim(),
++    profile: owner.targetProfile || owner.profile || 'default',
++    sessionId
++  }
++}
++
++/** Ask main to warm this ref's session. Returns the key it sent, or null when it sent nothing. */
++export function prefetchSessionRef(
++  value: string,
++  originStoredId?: null | string,
++  now: number = Date.now()
++): null | SessionRefPrefetchKey {
++  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.transcriptCache : undefined
++
++  if (!bridge?.prefetch) {
++    return null
++  }
++
++  const key = sessionRefPrefetchKey(value, originStoredId)
++
++  if (!key) {
++    return null
++  }
++
++  const id = JSON.stringify([key.connectionId, key.profile, key.sessionId])
++  const last = sent.get(id)
++
++  if (last !== undefined && now - last < REF_PREFETCH_MIN_MS) {
++    return null
++  }
++
++  sent.delete(id)
++  sent.set(id, now)
++
++  for (const stale of sent.keys()) {
++    if (sent.size <= SENT_MAX) {
++      break
++    }
++
++    sent.delete(stale)
++  }
++
++  try {
++    bridge.prefetch(key)
++  } catch {
++    return null
++  }
++
++  return key
++}
++
++/** Test hook: forget what was sent. */
++export function resetSessionRefPrefetch(): void {
++  sent.clear()
++}
+diff --git a/apps/desktop/src/components/assistant-ui/directive-text.tsx b/apps/desktop/src/components/assistant-ui/directive-text.tsx
+index b12b9c93faf..029d49fe4a4 100644
+--- a/apps/desktop/src/components/assistant-ui/directive-text.tsx
++++ b/apps/desktop/src/components/assistant-ui/directive-text.tsx
+@@ -560,6 +560,25 @@ function useOriginStoredId(): null | string {
+   return useStore(useTileSessionView()?.$storedId ?? NO_STORED_ID)
+ }
+ 
++/** [daveey] Warm the referenced session's transcript cache so its first click
++ *  paints from cache, not a hub REST round trip. Lazy for the same reason as
++ *  `openSessionRef`; main dedupes, this only throttles one key per window. */
++export function warmSessionRef(value: string, originStoredId?: null | string): Promise<unknown> {
++  return import('@/app/chat/session-ref-prefetch')
++    .then(({ prefetchSessionRef }) => prefetchSessionRef(value, originStoredId))
++    .catch(() => null)
++}
++
++/** Warm on render (and on value/origin change); returns the pointer-enter retry,
++ *  which catches an owner the session list only learned after the render. */
++function useWarmSessionRef(value: string, originStoredId: null | string): () => void {
++  useEffect(() => {
++    void warmSessionRef(value, originStoredId)
++  }, [value, originStoredId])
++
++  return () => void warmSessionRef(value, originStoredId)
++}
++
+ /** A `@session:<profile>/<id>` reference in the user transcript (directive
+  *  segments), rendered as a chip like the other composer refs. Clicking it
+  *  opens the session as a tab. */
+@@ -569,9 +588,16 @@ export const SessionRefChip: FC<{
+ }> = ({ label, value }) => {
+   const resolved = useSessionLinkTitle(value, label)
+   const originStoredId = useOriginStoredId()
++  const warm = useWarmSessionRef(value, originStoredId)
+ 
+   return (
+-    <DirectiveChip id={value} label={resolved} onClick={() => openSessionRef(value, originStoredId)} type="session" />
++    <DirectiveChip
++      id={value}
++      label={resolved}
++      onClick={() => openSessionRef(value, originStoredId)}
++      onPointerEnter={warm}
++      type="session"
++    />
+   )
+ }
+ 
+@@ -584,6 +610,7 @@ export const SessionRefLink: FC<{
+ }> = ({ label, value }) => {
+   const resolved = useSessionLinkTitle(value, label)
+   const originStoredId = useOriginStoredId()
++  const warm = useWarmSessionRef(value, originStoredId)
+ 
+   return (
+     <a
+@@ -594,6 +621,7 @@ export const SessionRefLink: FC<{
+         event.stopPropagation()
+         openSessionRef(value, originStoredId)
+       }}
++      onPointerEnter={warm}
+       title={value}
+     >
+       <DirectiveIcon type="session" />
+@@ -621,7 +649,8 @@ const DirectiveChip: FC<{
+   label: string
+   id: string
+   onClick?: () => void
+-}> = ({ type, label, id, onClick }) => {
++  onPointerEnter?: () => void
++}> = ({ type, label, id, onClick, onPointerEnter }) => {
+   const { t } = useI18n()
+   // An `onClick` override is a bespoke activation, not the kind's link action —
+   // an override must not turn its carrier into a link.
+@@ -654,7 +683,7 @@ const DirectiveChip: FC<{
+   }
+ 
+   return activate ? (
+-    <button {...props} onClick={activate} type="button">
++    <button {...props} onClick={activate} onPointerEnter={onPointerEnter} type="button">
+       {body}
+     </button>
+   ) : (
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index 6c07fc5b3a3..fcb8002651a 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -114,6 +114,8 @@ declare global {
+         migrateProfile: (connectionId: string, from: string, to: string) => void
+         clear: () => void
+         stats: () => Promise<{ bytes: number; sessions: number }>
++        /** [daveey] Warm a session's latest page in main (fire-and-forget; main dedupes and backs off). */
++        prefetch?: (key: TranscriptCacheBridgeKey) => void
+       }
+       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
+       // Browser host only: before a pick routes `profile`, re-read the served
+-- 
+2.55.0
+

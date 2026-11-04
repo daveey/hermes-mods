@@ -86,3 +86,33 @@ fails closed.
   existing `test_synced_invalid_review_or_owner_stays_held` now uses it too. No production code changes.
 - **Tests** (not rerun by this mirror pass): `tests/hermes_cli/test_kanban_dependency_review_sync.py::test_synced_reassignment_separates_review_from_operator_handoff`
   (`assignment_delay` 0 and 1).
+
+
+## Follow-up 1873, 1880: same-second parks and PR-naming prerequisites keep the ordering handoff
+
+Patches: **1873** (`f02c12e269`, `[daveey] kanban: a dependency park in the same second as the owner's own PR report resumes it`), **1880** (`0f4792607e`, `[daveey] kanban: a prerequisite that names the child's PR keeps its ordering handoff`). Mirrored in the 1822–1918 pass ([mirror-1918-verification.md](mirror-1918-verification.md)).
+
+### Behavior
+
+- A dependency park written in the same second as the owner's own PR report still resumes the card when the parent finishes (1873).
+- A prerequisite whose result names the child's checkpointed PR keeps the ordering handoff instead of being read as a review (1880).
+
+### How it works
+
+`hermes_cli/kanban_db_dispatch_pr_state.py` and `hermes_cli/kanban_dependency_review.py` compare park and PR-comment times inclusively and classify prerequisites by role, not by PR mention.
+
+Source commit notes (first paragraph of each message, privacy-normalized):
+
+- 1873: An owner that posts its state comment (with the PR URL) and then parks on a dependency in the same turn lands both rows in one wall-clock second. The ordering-park handoff required parked_at > newest PR comment time, so the tie kept the card held by active_pr after its parent finished (t_01a19e1fc70f3521, comment 33793 and dependency_wait both at 1793663272), filing a respawn-guard fix card and needing a manual reset.
+- 1880: Problem: since #728 (f3dea5638be) a parent result that names the child's checkpointed PR counts as a review. The ordering handoff then refuses, the child stays held by active_pr and a "Fix respawn-guard hold" card is filed. Replaying the classifier over every dependency_wait checkpoint on hermes-hub flips 27 of 301 parent/child pairs from ordering to review. 21 of them report their own work (CI gates, merges, implementations, triage). 6 are reviews or size-judge rulings that record their outcome under keys other than verdict/approved/reviewed_sha. The pre-#728 rule (581a96495866) classified...
+
+### Code
+
+`hermes_cli/kanban_db_dispatch_pr_state.py`, `hermes_cli/kanban_dependency_review.py`.
+
+### Tests
+
+Landed with the source commits; not rerun by this mirror pass unless the verification report lists them. Names are tests each patch added; a file with no names was modified only.
+
+- `tests/hermes_cli/test_kanban_dependency_pr_handoff.py`: `test_same_second_park_after_own_pr_report_resumes_once`, `test_same_second_pr_comment_after_park_stays_guarded`, `test_same_second_park_without_valid_watermark_stays_guarded`
+- `tests/hermes_cli/test_kanban_dependency_review_no_verdict.py`: `test_lost_review_citing_its_report_file_stays_held`, `test_lost_review_completed_by_the_worker_tool_stays_held`, `test_lost_review_needs_a_checkpointed_pr_to_name`

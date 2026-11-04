@@ -1,0 +1,153 @@
+From 30f20532c78282dc1588f1f1cff89ced5f9f869a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:10:12 +0000
+Subject: [PATCH] fix(kanban-pr): an app-pinned required context accepts that
+ app's own legacy commit status [daveey]
+
+GitHub satisfies a required check pinned to integration N with a commit status
+posted by app N's bot user (fabric-research's "Human review approval" status
+from github-actions[bot] passes integration 15368; PR #199 merged CLEAN). The
+gate refused every such status, so merged fabric-research PR cards could never
+complete. Resolve the status creator <slug>[bot] via apps/<slug> and accept it
+when the id matches; anyone else stays missing. Merge-time partitioning keys
+statuses by context + creator so a later status by someone else cannot hide
+the app's own.
+---
+ hermes_cli/kanban_pr_acceptance.py            | 28 +++++++++++++-
+ hermes_cli/kanban_pr_merge_time.py            |  7 +++-
+ tests/hermes_cli/test_kanban_pr_merge_time.py | 38 +++++++++++++++++++
+ 3 files changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 2d1a216892b..4b8e5ada1a6 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -259,11 +259,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         phase = "selecting merge-time evidence"
+         runs, statuses = merge_evidence(receipt, pr, repo, runs, statuses)
+         outcomes = []
++        app_of_bot: dict[str, int | None] = {}
+         for context, app_id in sorted(required, key=str):
+             matching = [r for r in runs if r["name"] == context and
+                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
+-            # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
+-            legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
++            # A legacy status satisfies an unpinned context, and a pinned one only when that
++            # app posted it (GitHub does the same: Actions' status passes integration 15368).
++            phase = "resolving status creators"
++            legacy = [s for s in statuses if s["context"] == context and (
++                app_id in (None, -1) or _status_app_id(s, app_of_bot, profile_home) == app_id)]
+             selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
+             if not selected:
+                 outcomes.append("missing")
+@@ -307,6 +311,26 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         return receipt
+ 
+ 
++def _status_app_id(status: dict, cache: dict, profile_home: str | None) -> int | None:
++    """The GitHub App that posted a legacy commit status, else None.
++
++    The statuses API names only the creator user; an app posts as its bot user
++    ``<slug>[bot]`` (type Bot), and ``apps/<slug>`` gives that app's id. Any other
++    creator, or a slug GitHub doesn't know, is no app: the pinned context stays
++    missing (fail closed). [daveey]"""
++    creator = status.get("creator") or {}
++    login = creator.get("login") or ""
++    slug = login[:-len("[bot]")] if login.endswith("[bot]") else ""
++    if creator.get("type") != "Bot" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", slug):
++        return None
++    if slug not in cache:
++        try:
++            cache[slug] = _api(f"apps/{slug}", profile_home=profile_home)["id"]
++        except _GateAuthError:
++            cache[slug] = None  # 404: a bot with no public app behind it
++    return cache[slug]
++
++
+ def pr_closed_unmerged(url: str, assignee: str | None = None) -> bool:
+     """True only when GitHub positively reports PR ``url`` as closed and not merged.
+     Any error, or an open/merged PR, is False: a binding is replaced only on proof. [daveey]"""
+diff --git a/hermes_cli/kanban_pr_merge_time.py b/hermes_cli/kanban_pr_merge_time.py
+index 3955f32b684..1f3d9fe6090 100644
+--- a/hermes_cli/kanban_pr_merge_time.py
++++ b/hermes_cli/kanban_pr_merge_time.py
+@@ -27,7 +27,8 @@ def partition_at_merge(checks, merged_at, *, runs):
+     """Latest pre-merge execution per producer, plus every later execution.
+ 
+     App identities stay distinct: an unpinned context must not hide another app's
+-    failed run behind a success. Legacy statuses have only their context identity.
++    failed run behind a success. Legacy statuses key on context + creator, so a
++    later status by someone else never hides the pinned app's own status.
+     """
+     cutoff = timestamp(merged_at)
+ 
+@@ -35,7 +36,9 @@ def partition_at_merge(checks, merged_at, *, runs):
+         return timestamp(check.get("started_at") if runs else check.get("created_at"))
+ 
+     def key_of(check):
+-        return (check["name"], check["app"]["id"]) if runs else check["context"]
++        if runs:
++            return (check["name"], check["app"]["id"])
++        return (check["context"], (check.get("creator") or {}).get("id"))
+ 
+     def concluded_at_merge(check):
+         done = check.get("completed_at")
+diff --git a/tests/hermes_cli/test_kanban_pr_merge_time.py b/tests/hermes_cli/test_kanban_pr_merge_time.py
+index 854d226da67..34f08404b38 100644
+--- a/tests/hermes_cli/test_kanban_pr_merge_time.py
++++ b/tests/hermes_cli/test_kanban_pr_merge_time.py
+@@ -40,6 +40,11 @@ def evidence(monkeypatch):
+             return checks
+         if "/statuses?" in endpoint:
+             return [state["statuses"]]
++        if endpoint.startswith("apps/"):
++            apps = {"github-actions": 15368, "other-ci": 99}
++            if endpoint[5:] not in apps:
++                raise acceptance._GateAuthError(f"HTTP 404 on {endpoint}")
++            return {"id": apps[endpoint[5:]], "slug": endpoint[5:]}
+         if "/pulls/" in endpoint:
+             # rest_state overrides model a PR whose state moved between the GraphQL and REST reads.
+             rest = state.get("rest_state", state["state"])
+@@ -205,6 +210,39 @@ def test_pinned_app_cannot_borrow_legacy_success(evidence):
+     assert collect()["classification"] == "missing"
+ 
+ 
++ACTIONS_BOT = {"id": 41898282, "login": "github-actions[bot]", "type": "Bot"}
++
++
++def test_pinned_app_accepts_its_own_legacy_status(evidence):
++    # Metta-AI/fabric-research#199: "Human review approval" is pinned to integration 15368
++    # and satisfied by a commit status github-actions[bot] posted; GitHub merged it CLEAN.
++    evidence.update(runs=[], statuses=[{**status(PRE, "success"), "creator": ACTIONS_BOT}])
++    receipt = collect()
++    assert receipt["ok"] and receipt["classification"] == "success", receipt
++    assert [c["id"] for c in receipt["checks"]] == [PRE["id"]]
++    assert evidence["requests"].count("apps/github-actions") == 1
++
++
++@pytest.mark.parametrize("creator", [
++    {"id": 7, "login": "other-ci[bot]", "type": "Bot"},       # a different app
++    {"id": 8, "login": "ghost-bot[bot]", "type": "Bot"},      # no app behind the bot (404)
++    {"id": 9, "login": "github-actions[bot]", "type": "User"},  # not a bot user
++    {"id": 10, "login": "someone", "type": "User"}])
++def test_pinned_app_rejects_legacy_status_from_anyone_else(evidence, creator):
++    evidence.update(runs=[], statuses=[{**status(PRE, "success"), "creator": creator}])
++    assert collect()["classification"] == "missing"
++
++
++def test_pinned_app_status_not_hidden_by_later_status_from_another_creator(evidence):
++    # The latest pre-merge status per context belongs to someone else: the app's own
++    # failure is still the evidence, never borrowed success nor "missing".
++    late = {**PRE, "id": PRE["id"] + 1, "started_at": "2026-11-02T13:00:00Z"}
++    evidence.update(runs=[], statuses=[
++        {**status(PRE, "failure"), "creator": ACTIONS_BOT},
++        {**status(late, "success"), "creator": {"id": 10, "login": "someone", "type": "User"}}])
++    assert collect()["classification"] == "failure"
++
++
+ def test_unpinned_context_retains_each_app_failure(evidence):
+     evidence.update(app=None, runs=[PRE, {**PRE, "id": PRE["id"] + 1,
+                                          "app": {"id": 99}, "conclusion": "failure"}])
+-- 
+2.55.0
+

@@ -1,0 +1,775 @@
+From f1cbd59d69eb14641040705cf57248e55db08021 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 10:15:29 +0000
+Subject: [PATCH] test: write live-test child logs through O_APPEND and read
+ them by path (#781)
+
+* test: write live-test child logs through O_APPEND and read them by path
+
+Nineteen gateway/hermes_cli live tests gave a child a 'w+' log handle and
+read it with log.seek(0); log.read(). The child inherits that open file
+description, so it shares the parent's offset: each seek(0) moved the
+child's next write to offset 0, over what was already logged. Most sites
+did the seek(0) unconditionally before a readiness assert whose message
+reads the log, so on every passing run the offset stayed at 0 and all
+later child output overwrote the start of the log; a failure further on
+then showed a clobbered log. test_worker_persistence re-seeked on every
+worker command. Same race #755 fixed in test_command_discovery.py.
+
+Add tests/child_log.py: ChildLog is an O_APPEND (truncating, like 'w+')
+FileIO to pass as the child's stdout/stderr, and text() reads the file by
+path. Convert every site whose child can still be writing. Test: a child
+writes READY, the shared offset is moved to 0, the child writes NEXT; the
+log must read READY\nNEXT\n (without O_APPEND it reads NEXT\n\n).
+
+* test: add unittest-discovery guard to tests/test_child_log.py
+---
+ tests/child_log.py                            | 41 +++++++++++++++++++
+ .../gateway/fixtures/local_recovery_probe.py  |  7 ++--
+ tests/gateway/fixtures/owner_process.py       |  7 ++--
+ ...multiplex_cold_profile_sidebar_mutation.py |  6 +--
+ tests/gateway/test_mute_live_owner.py         |  6 +--
+ tests/gateway/test_native_http_auth.py        |  6 +--
+ .../test_native_http_per_profile_edits.py     |  6 +--
+ ...t_native_http_secondary_profile_binding.py |  6 +--
+ tests/gateway/test_native_ingress_media.py    |  6 +--
+ .../test_native_profile_registry_grant.py     |  6 +--
+ tests/gateway/test_normal_runtime_boot.py     |  7 ++--
+ .../gateway/test_owner_backfill_live_owner.py |  6 +--
+ tests/gateway/test_runtime_token_identity.py  |  6 +--
+ tests/gateway/test_session_authority.py       |  6 +--
+ .../test_session_ws_upgrade_failure_logged.py |  7 ++--
+ .../test_unified_gateway_native_live.py       | 11 +++--
+ .../test_worker_lifecycle_execution.py        |  9 ++--
+ tests/gateway/test_worker_persistence.py      |  6 +--
+ .../gateway/test_worker_rotation_adoption.py  |  6 +--
+ .../test_gateway_snapshot_restore_live.py     |  9 ++--
+ tests/test_child_log.py                       | 34 +++++++++++++++
+ 21 files changed, 136 insertions(+), 68 deletions(-)
+ create mode 100644 tests/child_log.py
+ create mode 100644 tests/test_child_log.py
+
+diff --git a/tests/child_log.py b/tests/child_log.py
+new file mode 100644
+index 00000000000..936d26c3db0
+--- /dev/null
++++ b/tests/child_log.py
+@@ -0,0 +1,41 @@
++"""A log file a child process writes while the test reads it.
++
++    with ChildLog(tmp_path / 'gateway.log') as log:
++        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
++        ...
++        assert ready, log.text()
++
++Don't hand a child a ``'w+'`` handle and poll it with ``log.seek(0); log.read()``. The child
++inherits that open file description, so it shares the parent's file offset. Each ``seek(0)`` moves
++the child's next write to offset 0, where it overwrites what is already there: a poll throttled
++between its seek and read misses a READY line, and a ``seek(0)`` left behind after a passing
++readiness check makes everything the child writes later overwrite the start of the log. A
++ChildLog is an ``O_APPEND`` handle (every write lands at the end, whatever the offset), and
++``text()`` reads the file by path, so the test never moves the child's offset.
++"""
++
++from __future__ import annotations
++
++import io
++import os
++from pathlib import Path
++
++
++def _truncating_opener(path: str, flags: int) -> int:
++    # FileIO's 'a' is O_WRONLY|O_CREAT|O_APPEND; truncate as well, like the 'w+' this replaces.
++    return os.open(path, flags | os.O_TRUNC, 0o644)
++
++
++class ChildLog(io.FileIO):
++    """An append-only file to pass as a child's stdout/stderr, read back by path with ``text()``."""
++
++    def __init__(self, path: Path | str) -> None:
++        self.path = Path(path)
++        super().__init__(self.path, 'a', opener=_truncating_opener)
++
++    def text(self) -> str:
++        """The whole log so far, read by path (never through the child's shared offset)."""
++        try:
++            return self.path.read_text(encoding='utf-8', errors='replace')
++        except FileNotFoundError:
++            return ''
+diff --git a/tests/gateway/fixtures/local_recovery_probe.py b/tests/gateway/fixtures/local_recovery_probe.py
+index 16e426300b7..23925fd2546 100644
+--- a/tests/gateway/fixtures/local_recovery_probe.py
++++ b/tests/gateway/fixtures/local_recovery_probe.py
+@@ -15,6 +15,7 @@ import time
+ from websockets.asyncio.client import connect
+ from tests.gateway.test_normal_runtime_boot import control
+ from tests.waiting import async_wait_until
++from tests.child_log import ChildLog
+ 
+ 
+ class Model(BaseHTTPRequestHandler):
+@@ -105,7 +106,7 @@ def seed_offline_models_dev(home):
+ def daemon(root, home, env, *, barrier, fixture='local_recovery_daemon.py'):
+     seed_offline_models_dev(env.get('HERMES_HOME', home))
+     command = [sys.executable, str(root / 'tests/gateway/fixtures' / fixture)] if barrier else [sys.executable, '-m', 'gateway.run']
+-    with (home / ('first.log' if barrier else 'restart.log')).open('w+') as log:
++    with ChildLog(home / ('first.log' if barrier else 'restart.log')) as log:
+         proc = subprocess.Popen(command, cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+             deadline = time.monotonic() + 120
+@@ -118,9 +119,7 @@ def daemon(root, home, env, *, barrier, fixture='local_recovery_daemon.py'):
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.05)
+-            log.flush()
+-            log.seek(0)
+-            assert desc.get('state') == 'ready', log.read()
++            assert desc.get('state') == 'ready', log.text()
+             yield proc, desc
+         finally:
+             stop_child(proc)
+diff --git a/tests/gateway/fixtures/owner_process.py b/tests/gateway/fixtures/owner_process.py
+index 60bcbcd191d..dbefc7224d1 100644
+--- a/tests/gateway/fixtures/owner_process.py
++++ b/tests/gateway/fixtures/owner_process.py
+@@ -7,6 +7,7 @@ import signal
+ import subprocess
+ import sys
+ import time
++from tests.child_log import ChildLog
+ 
+ ROOT = Path(__file__).resolve().parents[3]
+ 
+@@ -40,7 +41,7 @@ def running_owner(tmp_path: Path, model_peer, *, prepare=None, extra_env=None):
+     if prepare is not None:
+         prepare(home)
+     env = {**owner_env(home, user, model_url), **(extra_env or {})}
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=ROOT, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+@@ -53,9 +54,7 @@ def running_owner(tmp_path: Path, model_peer, *, prepare=None, extra_env=None):
+                 except (OSError, ValueError, AssertionError):
+                     pass
+                 time.sleep(.1)
+-            log.flush()
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+             yield home, descriptor, env
+         finally:
+             if process.poll() is None:
+diff --git a/tests/gateway/test_multiplex_cold_profile_sidebar_mutation.py b/tests/gateway/test_multiplex_cold_profile_sidebar_mutation.py
+index 532fa8a3def..3f69fab9446 100644
+--- a/tests/gateway/test_multiplex_cold_profile_sidebar_mutation.py
++++ b/tests/gateway/test_multiplex_cold_profile_sidebar_mutation.py
+@@ -30,6 +30,7 @@ import pytest
+ from websockets.asyncio.client import connect
+ 
+ from tests.gateway.test_normal_runtime_boot import control
++from tests.child_log import ChildLog
+ 
+ 
+ @contextmanager
+@@ -52,7 +53,7 @@ def multiplex_daemon(tmp_path, profiles=('warm', 'cold')):
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
+                PYTHONUNBUFFERED='1')
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+@@ -66,8 +67,7 @@ def multiplex_daemon(tmp_path, profiles=('warm', 'cold')):
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.1)
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+             yield home, descriptor, env
+         finally:
+             if process.poll() is None:
+diff --git a/tests/gateway/test_mute_live_owner.py b/tests/gateway/test_mute_live_owner.py
+index 515dc75ed6c..4ec903f9892 100644
+--- a/tests/gateway/test_mute_live_owner.py
++++ b/tests/gateway/test_mute_live_owner.py
+@@ -16,6 +16,7 @@ import httpx
+ import pytest
+ 
+ from tests.gateway.test_normal_runtime_boot import control
++from tests.child_log import ChildLog
+ 
+ 
+ def _seed(home: Path, sid: str) -> None:
+@@ -43,7 +44,7 @@ def test_mute_and_outcome_refresh_run_on_the_live_owner(tmp_path):
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
+                PYTHONUNBUFFERED='1')
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+@@ -56,8 +57,7 @@ def test_mute_and_outcome_refresh_run_on_the_live_owner(tmp_path):
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.1)
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+ 
+             def headers():
+                 # A native grant ticket is single-use: mint one per request, as Desktop does.
+diff --git a/tests/gateway/test_native_http_auth.py b/tests/gateway/test_native_http_auth.py
+index 8ba94e22e4b..62dccea3174 100644
+--- a/tests/gateway/test_native_http_auth.py
++++ b/tests/gateway/test_native_http_auth.py
+@@ -15,6 +15,7 @@ from websockets.asyncio.client import connect
+ from websockets.exceptions import InvalidStatus
+ 
+ from tests.gateway.test_normal_runtime_boot import control
++from tests.child_log import ChildLog
+ 
+ 
+ @contextmanager
+@@ -38,7 +39,7 @@ def daemon(tmp_path):
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home),
+                PYTHONPATH=str(root), PYTHONUNBUFFERED='1',
+                HERMES_DASHBOARD_SESSION_TOKEN='normal-http-owner')
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+@@ -52,8 +53,7 @@ def daemon(tmp_path):
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.1)
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+             yield home, descriptor
+         finally:
+             if process.poll() is None:
+diff --git a/tests/gateway/test_native_http_per_profile_edits.py b/tests/gateway/test_native_http_per_profile_edits.py
+index 91947d52221..19b97d3bda2 100644
+--- a/tests/gateway/test_native_http_per_profile_edits.py
++++ b/tests/gateway/test_native_http_per_profile_edits.py
+@@ -21,6 +21,7 @@ import pytest
+ from websockets.asyncio.client import connect
+ 
+ from tests.gateway.test_normal_runtime_boot import control
++from tests.child_log import ChildLog
+ 
+ 
+ def _seed(home, rows):
+@@ -54,7 +55,7 @@ def test_per_profile_grants_edit_old_local_rows_of_their_own_profile(tmp_path):
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
+                PYTHONUNBUFFERED='1')
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+@@ -67,8 +68,7 @@ def test_per_profile_grants_edit_old_local_rows_of_their_own_profile(tmp_path):
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.1)
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+             homes = {'default': str(home.resolve()), 'beta': str(beta.resolve())}
+ 
+             def ticket(profile, purpose='native-http'):
+diff --git a/tests/gateway/test_native_http_secondary_profile_binding.py b/tests/gateway/test_native_http_secondary_profile_binding.py
+index 0db16408f86..a7827b671dd 100644
+--- a/tests/gateway/test_native_http_secondary_profile_binding.py
++++ b/tests/gateway/test_native_http_secondary_profile_binding.py
+@@ -11,6 +11,7 @@ import httpx
+ import pytest
+ 
+ from tests.gateway.test_normal_runtime_boot import control
++from tests.child_log import ChildLog
+ 
+ 
+ @pytest.mark.platforms("linux")
+@@ -35,7 +36,7 @@ def test_secondary_native_ticket_implicit_selectors_touch_only_the_secondary_hom
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
+                PYTHONUNBUFFERED='1', HERMES_DASHBOARD_SESSION_TOKEN='normal-http-owner')
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+@@ -49,8 +50,7 @@ def test_secondary_native_ticket_implicit_selectors_touch_only_the_secondary_hom
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.1)
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+             served = {p['profile_id'] for p in descriptor['served_profiles']}
+             assert str(beta.resolve()) in served and str(home.resolve()) in served, descriptor
+ 
+diff --git a/tests/gateway/test_native_ingress_media.py b/tests/gateway/test_native_ingress_media.py
+index 484d6940499..272cf9a5e56 100644
+--- a/tests/gateway/test_native_ingress_media.py
++++ b/tests/gateway/test_native_ingress_media.py
+@@ -7,6 +7,7 @@ import sys
+ import time
+ 
+ import pytest
++from tests.child_log import ChildLog
+ 
+ 
+ def _peer(tmp_path, mode):
+@@ -23,15 +24,14 @@ def _peer(tmp_path, mode):
+ @pytest.mark.platforms("linux")
+ def test_accepted_media_survives_mutation_cleanup_and_owner_kill(tmp_path):
+     command, env, repo, state = _peer(tmp_path, 'capture')
+-    with (state / 'owner.log').open('w+') as log:
++    with ChildLog(state / 'owner.log') as log:
+         child = subprocess.Popen(command, cwd=repo, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=log, stderr=subprocess.STDOUT)
+         try:
+             deadline = time.monotonic() + 45
+             while not (state / 'accepted.json').exists():
+                 if child.poll() is not None or time.monotonic() > deadline:
+-                    log.seek(0)
+-                    pytest.fail(log.read())
++                    pytest.fail(log.text())
+                 time.sleep(0.05)
+             child.kill()
+             assert child.wait(timeout=10) < 0
+diff --git a/tests/gateway/test_native_profile_registry_grant.py b/tests/gateway/test_native_profile_registry_grant.py
+index c6d6e3a9e06..4a840d22462 100644
+--- a/tests/gateway/test_native_profile_registry_grant.py
++++ b/tests/gateway/test_native_profile_registry_grant.py
+@@ -19,6 +19,7 @@ import httpx
+ import pytest
+ 
+ from tests.gateway.test_normal_runtime_boot import control
++from tests.child_log import ChildLog
+ 
+ 
+ @pytest.mark.platforms('linux')
+@@ -36,7 +37,7 @@ def test_registry_grant_renames_and_deletes_only_its_own_served_profile(tmp_path
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
+                PYTHONUNBUFFERED='1')
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+@@ -49,8 +50,7 @@ def test_registry_grant_renames_and_deletes_only_its_own_served_profile(tmp_path
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.1)
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+ 
+             def home_of(profile):
+                 return str(home.resolve() if profile == 'default' else (home / 'profiles' / profile).resolve())
+diff --git a/tests/gateway/test_normal_runtime_boot.py b/tests/gateway/test_normal_runtime_boot.py
+index 2ed01020d8d..3d48d382b75 100644
+--- a/tests/gateway/test_normal_runtime_boot.py
++++ b/tests/gateway/test_normal_runtime_boot.py
+@@ -12,6 +12,7 @@ import time
+ import pytest
+ from websockets.asyncio.client import connect
+ from websockets.exceptions import InvalidStatus
++from tests.child_log import ChildLog
+ 
+ 
+ def control(home, verb, params=None):
+@@ -142,7 +143,7 @@ def test_normal_entrypoint_earns_authenticated_authority_readiness(tmp_path, mod
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home),
+                PYTHONPATH=str(root), PYTHONUNBUFFERED='1',
+                OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=model_url)
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         descriptor = {}
+@@ -156,9 +157,7 @@ def test_normal_entrypoint_earns_authenticated_authority_readiness(tmp_path, mod
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.1)
+-            log.flush()
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+             assert descriptor['authority_epoch'] > 0
+             import sqlite3
+             with sqlite3.connect(f"file:{home / 'state.db'}?mode=ro", uri=True) as db:
+diff --git a/tests/gateway/test_owner_backfill_live_owner.py b/tests/gateway/test_owner_backfill_live_owner.py
+index 2aad5873d26..15ec5dba0ab 100644
+--- a/tests/gateway/test_owner_backfill_live_owner.py
++++ b/tests/gateway/test_owner_backfill_live_owner.py
+@@ -16,6 +16,7 @@ import httpx
+ import pytest
+ 
+ from tests.gateway.test_normal_runtime_boot import control
++from tests.child_log import ChildLog
+ 
+ 
+ @pytest.mark.platforms('linux')
+@@ -33,7 +34,7 @@ def test_owner_backfill_runs_on_the_live_owner(tmp_path):
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
+                PYTHONUNBUFFERED='1')
+-    with (tmp_path / 'gateway.log').open('w+') as log:
++    with ChildLog(tmp_path / 'gateway.log') as log:
+         process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+@@ -46,8 +47,7 @@ def test_owner_backfill_runs_on_the_live_owner(tmp_path):
+                 except (OSError, ValueError):
+                     pass
+                 time.sleep(.1)
+-            log.seek(0)
+-            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++            assert descriptor.get('state') == 'ready', (descriptor, log.text())
+ 
+             def headers(profile_home):
+                 # The Desktop mints each profile's own native grant (the profile its body names).
+diff --git a/tests/gateway/test_runtime_token_identity.py b/tests/gateway/test_runtime_token_identity.py
+index b855fdfd9d6..6802c4caf7d 100644
+--- a/tests/gateway/test_runtime_token_identity.py
++++ b/tests/gateway/test_runtime_token_identity.py
+@@ -14,6 +14,7 @@ import time
+ import pytest
+ from websockets.asyncio.client import connect
+ from websockets.exceptions import InvalidStatus
++from tests.child_log import ChildLog
+ 
+ 
+ @pytest.mark.asyncio
+@@ -118,7 +119,7 @@ def test_ordinary_daemon_keeps_control_auth_and_loop_witness(tmp_path, layout):
+             temp = tmp_path / ('t' * 120)
+             temp.mkdir()
+             env['TMPDIR'] = str(temp)
+-        with (tmp_path / 'daemon.log').open('w+') as log:
++        with ChildLog(tmp_path / 'daemon.log') as log:
+             process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+             control_path = None
+@@ -130,8 +131,7 @@ def test_ordinary_daemon_keeps_control_auth_and_loop_witness(tmp_path, layout):
+                     if descriptor.get('state') == 'ready':
+                         break
+                     time.sleep(.05)
+-                log.seek(0)
+-                assert descriptor.get('state') == 'ready', (descriptor, log.read())
++                assert descriptor.get('state') == 'ready', (descriptor, log.text())
+                 assert descriptor['pid'] == process.pid
+                 control_path = resolve_client_socket_path(home)
+                 assert control_path is not None
+diff --git a/tests/gateway/test_session_authority.py b/tests/gateway/test_session_authority.py
+index d55e77bf48b..3c4b43dab31 100644
+--- a/tests/gateway/test_session_authority.py
++++ b/tests/gateway/test_session_authority.py
+@@ -8,6 +8,7 @@ import sys
+ import time
+ 
+ import pytest
++from tests.child_log import ChildLog
+ 
+ 
+ def test_messaging_then_authenticated_ws_reuses_live_agent(tmp_path):
+@@ -44,15 +45,14 @@ def test_native_queue_survives_owner_kill_without_replaying_unknown(tmp_path):
+     env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state),
+                PYTHONPATH=str(repo), PYTHONUNBUFFERED='1', AUTHORITY_PROBE_MODE='crash')
+     command = [sys.executable, str(Path(__file__).parent / 'fixtures' / 'shared_authority_peer.py')]
+-    with (state / 'owner.log').open('w+') as log:
++    with ChildLog(state / 'owner.log') as log:
+         child = subprocess.Popen(command, cwd=repo, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=log, stderr=subprocess.STDOUT)
+         try:
+             deadline = time.monotonic() + 90
+             while not (state / 'crash-ready.json').exists():
+                 if child.poll() is not None or time.monotonic() > deadline:
+-                    log.seek(0)
+-                    pytest.fail(log.read())
++                    pytest.fail(log.text())
+                 time.sleep(0.05)
+             child.kill()
+             assert child.wait(timeout=10) < 0
+diff --git a/tests/gateway/test_session_ws_upgrade_failure_logged.py b/tests/gateway/test_session_ws_upgrade_failure_logged.py
+index 4589deeacd5..b4f2c7d7a5b 100644
+--- a/tests/gateway/test_session_ws_upgrade_failure_logged.py
++++ b/tests/gateway/test_session_ws_upgrade_failure_logged.py
+@@ -18,6 +18,7 @@ import pytest
+ 
+ from tests.gateway.test_normal_runtime_boot import control
+ from tests.waiting import wait_until
++from tests.child_log import ChildLog
+ 
+ # The owner, with ``tui_gateway.ws.handle_ws`` failing the way the unimportable onboarding module did.
+ _BROKEN_OWNER = textwrap.dedent('''
+@@ -65,7 +66,7 @@ def test_a_failed_session_upgrade_is_logged_with_its_cause(tmp_path):
+     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home),
+                PYTHONPATH=str(root), PYTHONUNBUFFERED='1', OPENAI_API_KEY='loopback-only')
+-    with (tmp_path / 'owner.out').open('w+') as out:
++    with ChildLog(tmp_path / 'owner.out') as out:
+         owner = subprocess.Popen([sys.executable, '-c', _BROKEN_OWNER], cwd=root, env=env,
+                                  stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+         try:
+@@ -84,9 +85,7 @@ def test_a_failed_session_upgrade_is_logged_with_its_cause(tmp_path):
+                 outcome = wait_until(ready_or_exited, timeout=35, what='the owner to be ready')
+             except AssertionError as exc:
+                 outcome = str(exc)
+-            out.flush()
+-            out.seek(0)
+-            assert outcome == 'ready', (outcome, descriptor, out.read())
++            assert outcome == 'ready', (outcome, descriptor, out.text())
+             dialed = subprocess.run([sys.executable, '-c', _DIALS], cwd=root, env=env, capture_output=True,
+                                     text=True, timeout=60, check=False)
+             assert dialed.returncode == 0, dialed.stderr
+diff --git a/tests/gateway/test_unified_gateway_native_live.py b/tests/gateway/test_unified_gateway_native_live.py
+index 4a123bbe0d2..50445fe442c 100644
+--- a/tests/gateway/test_unified_gateway_native_live.py
++++ b/tests/gateway/test_unified_gateway_native_live.py
+@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
+ 
+ import pytest
+ from websockets.asyncio.client import connect
++from tests.child_log import ChildLog
+ 
+ ROOT = Path(__file__).resolve().parents[2]
+ # Windows children need the system environment (Winsock, temp, PATHEXT) that the
+@@ -164,7 +165,7 @@ def planned_stop(home, proc, desc):
+ @contextmanager
+ def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
+     command = [sys.executable, str(ROOT / 'tests/gateway/fixtures' / fixture)] if fixture else [sys.executable, '-m', 'gateway.run']
+-    with (home.parent / log_name).open('w+', encoding='utf-8', errors='replace') as log:
++    with ChildLog(home.parent / log_name) as log:
+         proc = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+         try:
+             desc = {}
+@@ -178,7 +179,6 @@ def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
+                     pass
+                 time.sleep(.1)
+             if expect_ready:
+-                log.flush(); log.seek(0)
+                 detail = {name: (home / 'logs' / name).read_text(encoding='utf-8', errors='replace')[-6000:]
+                           for name in ('gateway.log',) if (home / 'logs' / name).exists()}
+                 stacks = home / 'logs' / 'stacks.txt'
+@@ -188,7 +188,7 @@ def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
+                     artifacts.mkdir(parents=True, exist_ok=True)
+                     (artifacts / f'stacks-{proc.pid}.txt').write_text(stacks.read_text(encoding='utf-8', errors='replace'), encoding='utf-8')
+                     detail['stacks.txt'] = stacks.read_text(encoding='utf-8', errors='replace')
+-                assert desc.get('state') == 'ready', (json.dumps(desc, default=str), proc.poll(), log.read()[-3000:], detail)
++                assert desc.get('state') == 'ready', (json.dumps(desc, default=str), proc.poll(), log.text()[-3000:], detail)
+             yield proc, desc, log
+         finally:
+             if proc.poll() is None:
+@@ -382,7 +382,7 @@ def test_native_gateway_runtime_live(harness):
+         with pytest.raises(OwnershipConflict):
+             with exclusive_maintenance([home]):
+                 pass
+-        with (home.parent / 'second.log').open('w+', encoding='utf-8', errors='replace') as log:
++        with ChildLog(home.parent / 'second.log') as log:
+             second = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=ROOT, env=env,
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+             try:
+@@ -390,8 +390,7 @@ def test_native_gateway_runtime_live(harness):
+             except subprocess.TimeoutExpired:
+                 second.kill(); second.wait(timeout=20)
+                 raise AssertionError('second gateway did not refuse while the first owns gateway.lock')
+-            log.flush(); log.seek(0)
+-            text = log.read()
++            text = log.text()
+         # One gateway per host: a second `gateway run` for a profile the live owner already serves
+         # ATTACHES (exit 0, spawns nothing) rather than starting a second process; only a launch the
+         # owner cannot serve is refused non-zero. Either way the owner keeps the lock and its identity.
+diff --git a/tests/gateway/test_worker_lifecycle_execution.py b/tests/gateway/test_worker_lifecycle_execution.py
+index c879cb7587d..77314867cf3 100644
+--- a/tests/gateway/test_worker_lifecycle_execution.py
++++ b/tests/gateway/test_worker_lifecycle_execution.py
+@@ -16,6 +16,7 @@ import pytest
+ from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
+ from tests.gateway.test_worker_agent_execution import Model
+ from tests.waiting import async_wait_until
++from tests.child_log import ChildLog
+ 
+ 
+ @pytest.mark.platforms("linux")
+@@ -66,7 +67,7 @@ def test_worker_lifecycle_then_owner_successor_refuses_late_mutations(tmp_path):
+         with daemon(root, home, env, barrier=False) as (_, desc):
+             sid, foreign = asyncio.run(create(desc))
+             ready, receipt = tmp_path / 'ready.json', tmp_path / 'receipt.json'
+-            with (tmp_path / 'worker.log').open('w+') as log:
++            with ChildLog(tmp_path / 'worker.log') as log:
+                 proc = subprocess.Popen([sys.executable, str(root / 'tests/gateway/fixtures/lifecycle_persistence_worker.py')],
+                     cwd=root, env=env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True)
+                 try:
+@@ -76,8 +77,7 @@ def test_worker_lifecycle_then_owner_successor_refuses_late_mutations(tmp_path):
+                     deadline = time.monotonic() + 60
+                     while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                         time.sleep(.05)
+-                    log.seek(0)
+-                    assert ready.exists(), log.read()
++                    assert ready.exists(), log.text()
+                     before = rows(sid)
+                     assert before['end_reason'] == 'agent_close' and before['title'] == 'worker-title'
+                     asyncio.run(successor(desc, sid))
+@@ -86,8 +86,7 @@ def test_worker_lifecycle_then_owner_successor_refuses_late_mutations(tmp_path):
+                     proc.stdin.write('successor-settled\n')
+                     proc.stdin.flush()
+                     proc.wait(timeout=30)
+-                    log.seek(0)
+-                    assert proc.returncode == 0, log.read()
++                    assert proc.returncode == 0, log.text()
+                     proof = json.loads(receipt.read_text())
+                     assert proof['opens'] == [] and proof['fds'] == [], proof
+                     assert set(proof['foreign'].values()) == {'permission_denied'}, proof
+diff --git a/tests/gateway/test_worker_persistence.py b/tests/gateway/test_worker_persistence.py
+index 1bbcf8e16b8..23c225e84f9 100644
+--- a/tests/gateway/test_worker_persistence.py
++++ b/tests/gateway/test_worker_persistence.py
+@@ -10,6 +10,7 @@ import sys
+ import pytest
+ 
+ from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
++from tests.child_log import ChildLog
+ 
+ 
+ @pytest.mark.platforms("linux")
+@@ -28,7 +29,7 @@ def test_worker_survives_owner_restart_without_repeating_tool(tmp_path):
+             response = await rpc(ws, 'session.create', request_id='worker-session', source='cli')
+             assert 'result' in response, response
+             return response['result']['session_id']
+-    with (tmp_path / 'worker.log').open('w+') as log:
++    with ChildLog(tmp_path / 'worker.log') as log:
+         worker = subprocess.Popen([sys.executable, str(root / 'tests/gateway/fixtures/persistence_worker.py')],
+             cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
+         def command(op, **params):
+@@ -37,8 +38,7 @@ def test_worker_survives_owner_restart_without_repeating_tool(tmp_path):
+             import select
+             assert select.select([worker.stdout], [], [], 30)[0], 'worker response timeout'
+             raw = worker.stdout.readline()
+-            log.flush(); log.seek(0)
+-            assert raw, log.read()
++            assert raw, log.text()
+             result = json.loads(raw)
+             assert 'fatal' not in result, result
+             return result
+diff --git a/tests/gateway/test_worker_rotation_adoption.py b/tests/gateway/test_worker_rotation_adoption.py
+index fb3f5914314..f1cabcdbef1 100644
+--- a/tests/gateway/test_worker_rotation_adoption.py
++++ b/tests/gateway/test_worker_rotation_adoption.py
+@@ -14,6 +14,7 @@ import pytest
+ 
+ from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
+ from tests.gateway.test_worker_agent_execution import Model
++from tests.child_log import ChildLog
+ 
+ 
+ @pytest.mark.platforms("linux")
+@@ -49,7 +50,7 @@ def test_rotated_agent_survives_owner_kill_and_explicit_adoption(tmp_path):
+             assert time.monotonic() < deadline, 'worker receipt deadline'
+             time.sleep(0.05)
+     try:
+-        with (tmp_path / 'worker.log').open('w+') as log:
++        with ChildLog(tmp_path / 'worker.log') as log:
+             ready, outage, receipt = (tmp_path / name for name in ('ready.json', 'outage', 'receipt.json'))
+             with daemon(root, home, env, barrier=False) as (owner, desc):
+                 sid = asyncio.run(create(desc, 'compressed'))
+@@ -71,8 +72,7 @@ def test_rotated_agent_survives_owner_kill_and_explicit_adoption(tmp_path):
+             with daemon(root, home, env, barrier=False):
+                 send('adopt')
+                 worker.wait(timeout=60)
+-                log.seek(0)
+-                assert worker.returncode == 0, log.read()
++                assert worker.returncode == 0, log.text()
+                 proof = json.loads(receipt.read_text())
+                 assert proof['opens'] == proof['fds'] == [], proof['opens']
+                 assert proof['restart']['pid'] == worker.pid
+diff --git a/tests/hermes_cli/test_gateway_snapshot_restore_live.py b/tests/hermes_cli/test_gateway_snapshot_restore_live.py
+index 18f335424cf..0a5439aa349 100644
+--- a/tests/hermes_cli/test_gateway_snapshot_restore_live.py
++++ b/tests/hermes_cli/test_gateway_snapshot_restore_live.py
+@@ -21,6 +21,7 @@ from hermes_cli.gateway_session_store import GatewaySessionStore
+ from hermes_cli.profiles import parked_marker_path
+ from tests.gateway.fixtures.local_recovery_probe import Model, child_env
+ from tests.waiting import wait_until
++from tests.child_log import ChildLog
+ 
+ 
+ @pytest.fixture
+@@ -47,7 +48,7 @@ def local_gateway(tmp_path, monkeypatch):
+                    PYTHONPATH=str(root), OPENAI_API_KEY="loopback-only", OPENAI_BASE_URL=url,
+                    # This child owns a disposable default root; it is reaped below.
+                    HERMES_STATE_DB_GUARD_BYPASS="1")
+-        log = (home / f"fixture-gateway-{len(children)}.log").open("w+", encoding="utf-8")
++        log = ChildLog(home / f"fixture-gateway-{len(children)}.log")
+         logs.append(log)
+         process = subprocess.Popen([sys.executable, "-m", "gateway.run"], cwd=root, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+@@ -80,14 +81,12 @@ def local_gateway(tmp_path, monkeypatch):
+         for process in children:
+             if process.poll() is not None and process.returncode:
+                 log = logs[children.index(process)]
+-                log.seek(0)
+-                print(log.read())
++                print(log.text())
+             if process.poll() is None:
+                 process.kill()
+             process.wait(timeout=10)
+         for log in logs:
+-            log.seek(0)
+-            print(log.read()[-6000:])
++            print(log.text()[-6000:])
+             log.close()
+         peer.release.set()
+         peer.shutdown()
+diff --git a/tests/test_child_log.py b/tests/test_child_log.py
+new file mode 100644
+index 00000000000..62cba72fafe
+--- /dev/null
++++ b/tests/test_child_log.py
+@@ -0,0 +1,34 @@
++"""ChildLog keeps a child's log intact while the test reads it (tests/child_log.py)."""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++
++import os
++import subprocess
++import sys
++
++from tests.child_log import ChildLog
++from tests.waiting import wait_until
++
++_CHILD = "import sys\nprint('READY', flush=True)\nsys.stdin.readline()\nprint('NEXT', flush=True)\n"
++
++
++def test_child_writes_land_at_eof_even_after_the_shared_offset_moves(tmp_path):
++    path = tmp_path / 'child.log'
++    path.write_text('stale output from an earlier run\n')
++    with ChildLog(path) as log:
++        assert log.text() == ''  # truncated, like the 'w+' it replaces
++        child = subprocess.Popen([sys.executable, '-c', _CHILD], stdin=subprocess.PIPE,
++                                 stdout=log, stderr=subprocess.STDOUT, text=True)
++        try:
++            assert child.stdout is None
++            wait_until(lambda: 'READY' in log.text() or child.poll() is not None, timeout=30,
++                       what='the child READY line')
++            # The race: a poll's seek(0) on the description the child shares. Without O_APPEND the
++            # child's next line lands at offset 0 and overwrites READY.
++            os.lseek(log.fileno(), 0, os.SEEK_SET)
++            child.communicate('go\n', timeout=30)
++        finally:
++            if child.poll() is None:
++                child.kill()
++                child.wait(timeout=10)
++        assert child.returncode == 0
++        assert log.text() == 'READY\nNEXT\n'
+-- 
+2.55.0
+

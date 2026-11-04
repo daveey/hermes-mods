@@ -1,0 +1,757 @@
+From 78e4ceeb0358a8c42c3a79033834d3b5aad3ec21 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:54:21 +0000
+Subject: [PATCH] feat(kanban): hub CPU/cap final gate with an independent full
+ sample under admission.lock; origin claims skip worker load formula [daveey]
+
+- Advisory lock-free pre-check before the Board lease (ruling 5); final gate under admission.lock
+  takes a real 1 s /proc/stat sample, rechecks whole-host cap and lease deadline (ruling 1 override).
+- Origin claiming its own policy card no longer uses the worker load1/CPUs formula (ruling 2).
+- Eight overflow queue reason codes; claimed event records the consumed sample.
+- No automatic structural origin repin: legacy origin reply still applied, new no_eligible_worker keeps fence (ruling 9).
+- Real-sample test asserts the whole sample ran with the lock held, hold <= 2.5 s, and the measured
+  0.5 s BUSY_WAIT_S chat-turn outcome matches the hold interval.
+---
+ docs/worker-first-v1.md                       |  13 +-
+ hermes_cli/kanban_admission.py                | 125 ++++++-
+ hermes_cli/kanban_db.py                       |  10 +-
+ hermes_cli/kanban_db_sync.py                  |   5 +-
+ hermes_cli/kanban_queue_reason.py             |   5 +-
+ hermes_cli/machine_metrics.py                 |  35 ++
+ tests/hermes_cli/test_kanban_hub_admission.py | 323 ++++++++++++++++++
+ .../test_kanban_queue_integration.py          |  25 +-
+ .../test_kanban_worker_policy_db.py           |  24 +-
+ 9 files changed, 550 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_hub_admission.py
+
+diff --git a/docs/worker-first-v1.md b/docs/worker-first-v1.md
+index 06ea9dd66c4..0ee496dab47 100644
+--- a/docs/worker-first-v1.md
++++ b/docs/worker-first-v1.md
+@@ -1,6 +1,14 @@
+ # Worker-first portable cards (opt-in, disabled by default)
+ 
+-`kanban.placement.worker_pools` maps an origin Board machine name to worker names, for example `{hub: [worker-1]}`. This is a pool, **not** an AND-list of `machine:*` labels. The default `placement: {}` is unchanged. `heavy_route` remains the legacy behavior only when the origin has no pool entry. A configured empty/unavailable pool queues portable work; it never overflows onto the hub.
++`kanban.placement.worker_pools` maps an origin Board machine name to worker names, for example `{hub: [worker-1]}`. This is a pool, **not** an AND-list of `machine:*` labels. The default `placement: {}` is unchanged. `heavy_route` remains the legacy behavior only when the origin has no pool entry. A configured empty/unavailable pool queues portable work; it never overflows onto the hub unless the operator enables worker-first overflow (below).
++
++## Worker-first hub overflow (off by default)
++
++Workers always win. The Board reserves the origin hub for a portable card only when **every** compatible member of the origin's *configured* pool (never the request subset) is known, fresh and refused solely for pressure (score >= .85) or full slots, AND the hub's reported measured CPU busy is fresh (conservative end within 15 s) and strictly below the operator's threshold, AND hub capacity/memory/drain allow it, AND no other hub overflow reservation is outstanding, AND the sample's conservative start is after the last hub overflow grant. Unknown, stale, held, draining or offline workers veto overflow and the card queues. Zero compatible workers queues with `no_eligible_worker`: the automatic structural origin repin was removed (only the explicit owner repin clears the fence). Prior runs, host-bound cards and running leases are never moved.
++
++* Board: operator-owned `worker_overflow` setting, e.g. `{"hub": {"machine": "hub", "cpu_busy_below_pct": 50}}`; `{}`/absent disables it. The lease grant re-runs the decision with the current registry and records the consumed sample; a worker freeing up, a CPU rise, a used sample or a disabled setting refuses the grant.
++* Core: `kanban.admission.cpu_busy_below_pct` in the **installation-root** config enables (a) a 10 s metrics report carrying `cpu_busy_pct`/`cpu_busy_window_ms`/`cpu_busy_sample_end_ms` (2 s hard total, never replayed), (b) a lock-free advisory pre-check before any Board lease, and (c) the final gate: with `admission.lock` held and before the claim commits, an independent full ~1 s `/proc/stat` sample must be strictly below the limit and the host running count below the root `kanban.max_in_progress`. Any unknown (unreadable config, bad value, failed sample, window outside 1-2 s, passed deadline) refuses. The gate applies to every new ready/review claim on that host (legacy, host-bound and policy cards); the worker load formula is not used for the origin's own cards.
++* Rollout order: deploy Boards and clients first; set root `cpu_busy_below_pct`; verify reports; only then enable Board `worker_overflow`. Rollback: set Board `worker_overflow` to `{}` (outstanding hub reservations become unclaimable), then remove the root key.
+ 
+ ## Creation and schema
+ 
+@@ -53,5 +61,8 @@ No configuration is activated by these code changes. Deployment, actual hostname
+ | Two-worker ready rebalance, immovable running lease, capabilities/pickup at claim | server `worker/test/worker-placement.test.ts` |
+ | Same-card review continuity, forged review-pin refusal, reserved-capacity exclusion | server `worker/test/worker-placement.test.ts` |
+ | Operator settings, schema, rollback retains fences/leases and explicit CAS repin | server `worker/test/machines.test.ts`, `worker-placement.test.ts` |
++| Hub overflow selection, one-reservation/one-sample fences, grant re-check, rollback | server `worker/test/worker-overflow.test.ts` |
++| CPU sampler, root-only limit, reporter cadence/budget | `test_machine_cpu_metrics.py`, `test_machine_metrics.py`, `test_kanban_sync_metrics_budget.py` |
++| Final hub gate under admission.lock (ready/review, advisory, cap, deadline) | `test_kanban_hub_admission.py`, `test_kanban_worker_policy_db.py` |
+ 
+ Server implementation/evidence and its deployment API are documented in `daveey/hermes-hub:docs/worker-first-v1.md`. Server integration tests execute real HTTP requests against Cloudflare's SQLite Durable Object test runtime; Python fake-service tests separately prove client sequencing and do not substitute for server atomicity tests.
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index fe9502b3063..b7d25af3438 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -1,8 +1,109 @@
+-"""Kanban claim publication boundary for the POSIX updater fence."""
++"""Kanban claim publication boundary for the POSIX updater fence, and the hub CPU/cap admission gate.
++
++Hub CPU gate (worker-first overflow, docs/worker-first-v1.md): on a host whose installation-root config sets
++``kanban.admission.cpu_busy_below_pct`` every new ready/review claim (legacy, host-bound and policy cards alike) must
++pass, while ``admission.lock`` is held and before the claim commits: an independent full ~1 s CPU busy sample strictly
++below the limit, a whole-host running count below the root ``kanban.max_in_progress`` cap, and a lease deadline that
++is still ahead after sampling. Any unknown refuses. No network happens under the lock. A lock-free advisory read of the
++reporter's latest sample runs earlier, before any Board lease, so a busy hub causes no grant/release churn.
++"""
+ import contextlib
+ import logging
++import threading
++import time
+ from pathlib import Path
+ 
++ADVISORY_MAX_AGE_MS = 15_000
++_consumed = threading.local()
++
++
++def _now() -> float:
++    return time.time()
++
++
++def _defer(task_id, reason):
++    if task_id is None:
++        return
++    from hermes_cli import kanban_db_sync as sync
++    sync._CLAIM_DEFERRALS[task_id] = reason
++
++
++def hub_cpu_advisory(task_id=None):
++    """Lock-free pre-check before a Board lease (review ruling 5). Returns a refusal reason or None.
++
++    Off unless the root limit is set. Uses the metrics reporter's latest complete sample: missing, stale (>15 s),
++    future or malformed reads as unknown and defers; a fresh value at or above the limit defers. Advisory only."""
++    from hermes_cli import machine_cpu_metrics as cpu
++    from hermes_cli import machine_metrics
++
++    state, limit = cpu.root_limit()
++    if state == cpu.OFF:
++        return None
++    reason = "hub_cpu_unknown"
++    if state == cpu.ON:
++        last = machine_metrics.read_hub_cpu_sample() or {}
++        end = last.get("cpu_busy_sample_end_ms")
++        age = _now() * 1000 - end if type(end) in (int, float) else None
++        if age is not None and 0 <= age <= ADVISORY_MAX_AGE_MS:
++            pct = last.get("cpu_busy_pct")
++            if cpu.below(pct, limit):
++                return None
++            if type(pct) in (int, float) and 0 <= pct <= 100:
++                reason = "hub_cpu_at_or_above_limit"
++    _defer(task_id, reason)
++    return reason
++
++
++def _root_max_in_progress():
++    """Root ``kanban.max_in_progress`` resolved like the dispatcher (unset → memory-derived default).
++
++    ``(ok, cap)``: ok False when the root config is unreadable or the value is invalid (refuses)."""
++    from hermes_constants import get_default_hermes_root
++    from hermes_cli.config_backend import read_config_doc_readonly
++    from hermes_cli.kanban_db_dispatch import resolve_max_in_progress
++
++    try:
++        doc = read_config_doc_readonly(Path(get_default_hermes_root()) / "config.yaml")
++    except FileNotFoundError:
++        doc = None
++    except Exception:  # health: allow BLE001 -- unreadable root config refuses the claim
++        return False, None
++    raw = ((doc or {}).get("kanban") or {}).get("max_in_progress") if isinstance(doc, dict) else None
++    if raw is not None and (type(raw) is not int or raw < 1):
++        return False, None
++    return True, resolve_max_in_progress(raw)
++
++
++def _final_hub_gate(gate):
++    """Under admission.lock: ``(reason, evidence)``; reason None admits. Never touches the network."""
++    from hermes_cli import machine_cpu_metrics as cpu
++    from hermes_cli import machine_metrics
++
++    state, limit = cpu.root_limit()
++    if state == cpu.OFF:
++        return None, None
++    if state != cpu.ON:
++        return "hub_cpu_unknown", None
++    measured = cpu.sample()
++    if not measured or not all(k in measured for k in cpu.FIELDS):
++        return "hub_cpu_unknown", None
++    if not cpu.MIN_WINDOW_MS <= measured["cpu_busy_window_ms"] <= cpu.MAX_WINDOW_MS:
++        return "hub_cpu_unknown", None
++    if not cpu.below(measured["cpu_busy_pct"], limit):
++        return "hub_cpu_at_or_above_limit", None
++    if gate is not None and getattr(gate, "expires", None) is not None and gate.expires <= int(_now()):
++        return "hub_cpu_unknown", None  # the claim/lease deadline passed while sampling: never start
++    ok, cap = _root_max_in_progress()
++    active = machine_metrics.active_card_runs()
++    if not ok or type(active) is not int or active < 0 or (cap is not None and active >= cap):
++        return "hub_capacity_full", None
++    return None, {**{k: measured[k] for k in cpu.FIELDS}, "limit_pct": limit}
++
++
++def consumed_hub_cpu():
++    """The sample the final gate admitted this claim with (for the ``claimed`` event), or None."""
++    return getattr(_consumed, "evidence", None)
++
+ 
+ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, event_extra=None, gate=None):
+     """CAS to running and publish its run/event. Caller owns the fenced transaction."""
+@@ -52,9 +153,11 @@ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, even
+         )
+         run_id = run_cur.lastrowid
+     conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
++    hub_cpu = consumed_hub_cpu()
+     kb._append_event(
+         conn, task_id, "claimed",
+-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
++        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {}),
++         **({"hub_cpu": hub_cpu} if hub_cpu else {})}, run_id=run_id,
+     )
+     return run_id
+ 
+@@ -76,8 +179,8 @@ def admission_hold_set():
+ 
+ 
+ @contextlib.contextmanager
+-def claim_transaction(conn):
+-    """Fence check and real SQL commit share admission.lock (never a savepoint).
++def claim_transaction(conn, *, task_id=None, gate=None):
++    """Fence check, the hub CPU/cap gate and real SQL commit share admission.lock (never a savepoint).
+ 
+     Board storage may be overridden independently of the installation. Use the
+     process's installation root, not the board path. Hooks run after both locks.
+@@ -117,5 +220,17 @@ def claim_transaction(conn):
+             if held:
+                 logging.getLogger(__name__).info(HOLD_MESSAGE)
+                 yield False
+-            else:
++                return
++            # Frozen contract: an independent full CPU sample is taken HERE, with admission.lock held, and the
++            # claim commits before the lock is released, so a concurrent claimer sees this run in its recount.
++            reason, evidence = _final_hub_gate(gate)
++            if reason is not None:
++                logging.getLogger(__name__).info("Hub admission refused Kanban claim %s: %s", task_id, reason)
++                _defer(task_id, reason)
++                yield False
++                return
++            _consumed.evidence = evidence
++            try:
+                 yield True
++            finally:
++                _consumed.evidence = None
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 02ce264e045..7f3d9926ec8 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -33,7 +33,7 @@ from hermes_cli import kanban_db_sync as _sync
+ from hermes_cli.kanban_worker_placement import validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+-from hermes_cli.kanban_admission import admission_hold_set, claim_transaction, claim_and_open_run
++from hermes_cli.kanban_admission import admission_hold_set, claim_transaction, claim_and_open_run, hub_cpu_advisory
+ from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+ from toolsets import get_toolset_names
+ from utils import unlink_files_older_than
+@@ -2197,10 +2197,12 @@ def claim_task(
+     # [daveey] Refuse a held fence before the Board-service lease, not after it.
+     if admission_hold_set():
+         return None
++    if hub_cpu_advisory(task_id):  # lock-free, before the Board lease; the locked gate stays authoritative
++        return None
+     gate = _sync.claim_gate(conn, task_id, expires)
+     if gate.deferred:
+         return None
+-    with gate, claim_transaction(conn) as admitted:
++    with gate, claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
+         if not admitted:
+             return None
+         # Single enforcement point: never ready -> running with an undone
+@@ -2237,10 +2239,12 @@ def claim_review_task(
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+     if admission_hold_set():  # [daveey] before the Board-service lease (see claim_task)
+         return None
++    if hub_cpu_advisory(task_id):
++        return None
+     gate = _sync.claim_gate(conn, task_id, expires, lane="review")
+     if gate.deferred:
+         return None
+-    with gate, claim_transaction(conn) as admitted:
++    with gate, claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
+         if not admitted:
+             return None
+         if not _parents_satisfied(conn, task_id):
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index fb2476e4b26..0f2378c22ea 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -792,7 +792,10 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+         return ClaimGate(expires, deferred=True)
+     deadline = lease.expires_ms // 1000 - LEASE_SAFETY_MARGIN_SECONDS
+     gate = ClaimGate(min(expires, deadline), lease=lease, ids=ids)
+-    if row is not None and row["placement_policy"]:
++    # Review ruling 2: the worker load formula guards a WORKER's claim of someone else's card. The origin claiming
++    # its own card (hub overflow, review continuation) is gated by the measured-CPU/cap gate in claim_transaction
++    # instead; normalized load is never a substitute for that measurement.
++    if row is not None and row["placement_policy"] and row["created_on"] != ids[1]:
+         from hermes_cli.kanban_worker_placement import local_admission
+         if not local_admission(conn):
+             with gate:
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index 7a7e7d84663..080db140391 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -10,7 +10,10 @@ from datetime import UTC, datetime
+ 
+ EVENT = "worker_queue_reason"
+ CODES = {"reserved", "draining", "admission_limits", "no_live_candidate", "capability_mismatch",
+-         "observation_unavailable", "mixed", "board_error", "board_refused", "no_pool_worker"}
++         "observation_unavailable", "mixed", "board_error", "board_refused", "no_pool_worker",
++         # worker-first overflow (docs/worker-first-v1.md): Board reserve observations and the core final gate
++         "workers_unknown", "no_eligible_worker", "workers_saturated", "hub_cpu_at_or_above_limit",
++         "hub_cpu_unknown", "hub_capacity_full", "hub_sample_already_used", "hub_overflow_reserved"}
+ _REJECTIONS = {"invalid_policy", "not_creator", "not_claimable", "worker_pool_disabled",
+                "unauthorized_candidate", "explicit_pin", "revision_conflict", "not_found"}
+ _TOKEN = re.compile(r"^[A-Za-z0-9_.:/+-]{1,120}$")
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 11edf67ed1a..104a5485001 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -130,6 +130,37 @@ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+     return out
+ 
+ 
++HUB_CPU_SAMPLE_FILE = "hub-cpu-sample.json"
++
++
++def _hub_cpu_path(root: Optional[Path] = None) -> Path:
++    if root is None:
++        from hermes_constants import get_default_hermes_root
++        root = Path(get_default_hermes_root())
++    return Path(root) / "cache" / HUB_CPU_SAMPLE_FILE
++
++
++def record_hub_cpu_sample(sample: dict, root: Optional[Path] = None) -> None:
++    """Keep the reporter's latest complete CPU triple for the lock-free advisory pre-check
++    (``kanban_admission.hub_cpu_advisory``). Advisory only: the final gate always measures again under the lock."""
++    import json
++    path = _hub_cpu_path(root)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
++    tmp.write_text(json.dumps({k: sample[k] for k in ("cpu_busy_pct", "cpu_busy_window_ms",
++                                                       "cpu_busy_sample_end_ms")}), encoding="utf-8")
++    os.replace(tmp, path)
++
++
++def read_hub_cpu_sample(root: Optional[Path] = None) -> Optional[dict]:
++    import json
++    try:
++        doc = json.loads(_hub_cpu_path(root).read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
++    return doc if isinstance(doc, dict) else None
++
++
+ class Reporter:
+     """Sends ``collect()`` to the Board at most every REPORT_EVERY_S; never raises into the sync loop."""
+ 
+@@ -149,6 +180,10 @@ class Reporter:
+             measured = (self.cpu_sample_fn or cpu.sample)()
+             if measured and all(k in measured for k in cpu.FIELDS):
+                 sample.update({k: measured[k] for k in cpu.FIELDS})
++                try:
++                    record_hub_cpu_sample(measured)
++                except OSError as exc:
++                    _log.debug("hub CPU advisory sample not recorded: %s", exc)
+         return sample
+ 
+     def report_due(self) -> bool:
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+new file mode 100644
+index 00000000000..70999c0c91c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -0,0 +1,323 @@
++"""Final hub CPU/cap gate: an independent full CPU sample taken UNDER admission.lock, ready and review paths."""
++import json
++import os
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from hermes_cli import kanban_admission as ka
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_queue_reason as queue
++from hermes_cli import machine_cpu_metrics as cm
++from hermes_cli import machine_metrics as mm
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn, tmp_path
++    finally:
++        conn.close()
++
++
++def configure(home, limit=50, cap=None):
++    lines = ["kanban:"]
++    if cap is not None:
++        lines.append(f"  max_in_progress: {cap}")
++    if limit is not None:
++        lines += ["  admission:", f"    cpu_busy_below_pct: {limit}"]
++    (home / "config.yaml").write_text("\n".join(lines) + "\n")
++
++
++def advisory(home, pct=10.0, age_ms=0):
++    mm.record_hub_cpu_sample({"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000,
++                              "cpu_busy_sample_end_ms": int(time.time() * 1000) - age_ms}, root=home)
++
++
++def task(conn, review=False, title="gate"):
++    t = kb.create_task(conn, title=title, assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", ("review" if review else "ready", t))
++    return t
++
++
++def claim(conn, t, review):
++    return (kb.claim_review_task if review else kb.claim_task)(conn, t)
++
++
++def fake_sample(pct, calls=None, check=None):
++    def sample(*a, **k):
++        if check:
++            check()
++        if calls is not None:
++            calls.append(time.monotonic())
++        if pct is None:
++            return None
++        return {"cpu_busy_pct": pct, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": int(time.time() * 1000)}
++    return sample
++
++
++def runs(conn):
++    return conn.execute("SELECT count(*) FROM task_runs").fetchone()[0]
++
++
++def refused(conn, t, review, reason):
++    assert kb.get_task(conn, t).status == ("review" if review else "ready")
++    assert runs(conn) == 0
++    assert sync.pop_claim_deferral(t) == reason
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_gate_absent_admits_without_sampling(board, monkeypatch, review):
++    conn, _home = board
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("no root limit: must not sample"))
++    t = task(conn, review)
++    assert claim(conn, t, review) is not None
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_below_limit_admits_and_claimed_event_carries_consumed_sample(board, monkeypatch, review):
++    conn, home = board
++    configure(home)
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(49.999))
++    t = task(conn, review)
++    assert claim(conn, t, review) is not None
++    payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='claimed'",
++                                      (t,)).fetchone()[0])
++    assert payload["hub_cpu"] == {"cpu_busy_pct": 49.999, "cpu_busy_window_ms": 1000,
++                                  "cpu_busy_sample_end_ms": payload["hub_cpu"]["cpu_busy_sample_end_ms"],
++                                  "limit_pct": 50.0}
++
++
++@pytest.mark.parametrize("review", [False, True])
++@pytest.mark.parametrize("pct,reason", [(50.0, "hub_cpu_at_or_above_limit"), (50.001, "hub_cpu_at_or_above_limit"),
++                                        (None, "hub_cpu_unknown")])
++def test_at_or_above_limit_or_unknown_refuses_with_no_local_run(board, monkeypatch, review, pct, reason):
++    conn, home = board
++    configure(home)
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(pct))
++    t = task(conn, review)
++    assert claim(conn, t, review) is None
++    refused(conn, t, review, reason)
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_invalid_root_limit_refuses_without_sampling(board, monkeypatch, review):
++    conn, home = board
++    configure(home, limit='"fifty"')  # type: ignore[arg-type]
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("invalid limit: refuse before sampling"))
++    t = task(conn, review)
++    assert claim(conn, t, review) is None
++    refused(conn, t, review, "hub_cpu_unknown")
++
++
++def test_profile_override_cannot_disable_root_gate(board, monkeypatch, tmp_path):
++    conn, home = board
++    configure(home)
++    advisory(home)
++    profile = home / "profiles" / "p"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text("kanban:\n  admission:\n    cpu_busy_below_pct: null\n")
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: home)
++    monkeypatch.setattr(cm, "sample", fake_sample(80.0))
++    t = task(conn)
++    assert kb.claim_task(conn, t) is None
++    refused(conn, t, False, "hub_cpu_at_or_above_limit")
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_sample_is_taken_while_admission_lock_is_held(board, monkeypatch, review):
++    conn, home = board
++    configure(home)
++    advisory(home)
++    seen = []
++
++    def check():
++        try:
++            with af.admission_lock(home, timeout=0):
++                seen.append("free")
++        except af.AdmissionBusy:
++            seen.append("held")
++    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=check))
++    t = task(conn, review)
++    assert claim(conn, t, review) is not None
++    assert seen == ["held"]
++
++
++@pytest.mark.parametrize("review", [False, True])
++@pytest.mark.parametrize("advice,reason", [(80.0, "hub_cpu_at_or_above_limit"), ("stale", "hub_cpu_unknown"),
++                                           ("missing", "hub_cpu_unknown"), ("future", "hub_cpu_unknown")])
++def test_advisory_precheck_defers_before_any_lease_or_sample(board, monkeypatch, review, advice, reason):
++    conn, home = board
++    configure(home)
++    if advice == "stale":
++        advisory(home, age_ms=15_001)
++    elif advice == "future":
++        advisory(home, age_ms=-5_000)
++    elif advice != "missing":
++        advisory(home, pct=advice)
++    monkeypatch.setattr(sync, "claim_gate", lambda *a, **k: pytest.fail("advisory refusal must not ask for a lease"))
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("advisory refusal must not sample"))
++    t = task(conn, review)
++    assert claim(conn, t, review) is None
++    refused(conn, t, review, reason)
++
++
++def test_advisory_age_boundary_15000_ms_is_fresh(board, monkeypatch):
++    conn, home = board
++    configure(home)
++    advisory(home, age_ms=14_900)
++    monkeypatch.setattr(cm, "sample", fake_sample(10.0))
++    t = task(conn)
++    assert kb.claim_task(conn, t) is not None
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_whole_host_cap_is_rechecked_under_lock(board, monkeypatch, review):
++    conn, home = board
++    configure(home, cap=2)
++    advisory(home)
++    monkeypatch.setattr(cm, "sample", fake_sample(10.0))
++    monkeypatch.setattr(mm, "active_card_runs", lambda: 2)
++    t = task(conn, review)
++    assert claim(conn, t, review) is None
++    refused(conn, t, review, "hub_capacity_full")
++    monkeypatch.setattr(mm, "active_card_runs", lambda: None)  # an unreadable board fails closed
++    assert claim(conn, t, review) is None
++    refused(conn, t, review, "hub_capacity_full")
++    monkeypatch.setattr(mm, "active_card_runs", lambda: 1)
++    assert claim(conn, t, review) is not None
++
++
++def test_lease_expiring_during_sample_cannot_start(board, monkeypatch):
++    conn, home = board
++    configure(home)
++    advisory(home)
++    real_time = time.time
++    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: monkeypatch.setattr(
++        ka, "_now", lambda: real_time() + 10 ** 7)))
++    t = task(conn)
++    assert kb.claim_task(conn, t) is None
++    refused(conn, t, False, "hub_cpu_unknown")
++
++
++def test_simultaneous_claimers_at_6_of_7_start_at_most_one(board, monkeypatch):
++    conn, home = board
++    configure(home, cap=7)
++    advisory(home)
++    count = {"running": 6}
++    gate_lock = threading.Lock()
++
++    def active():
++        with gate_lock:
++            return count["running"]
++    monkeypatch.setattr(mm, "active_card_runs", active)
++    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: time.sleep(0.2)))
++    tasks = [task(conn, title=f"t{i}") for i in range(4)]
++
++    def go(t):
++        with kbc.connect(home / "kanban.db") as other:
++            got = kb.claim_task(other, t)
++        if got is not None:
++            with gate_lock:
++                count["running"] += 1
++        return got
++    for _ in range(3):  # contended rounds: losers defer (lock busy) or are refused at 7/7
++        with ThreadPoolExecutor(max_workers=4) as pool:
++            list(pool.map(go, tasks))
++    assert runs(conn) == 1
++
++
++def _lock_state(home):
++    try:
++        with af.admission_lock(home, timeout=0):
++            return "free"
++    except af.AdmissionBusy:
++        return "held"
++
++
++@pytest.mark.skipif(not cm.sys.platform.startswith("linux"), reason="real /proc/stat sample")
++def test_real_sample_is_entirely_under_lock_bounded_and_measures_chat_turn_cost(board):
++    """Frozen contract: an independent FULL real ~1 s /proc/stat sample is taken entirely while admission.lock is held
++    (held at its first and last read), the hold stays <= ~2 s, and a chat/notification turn reserving the lock with
++    BUSY_WAIT_S=0.5 s during the sample is measured (its outcome must match the measured hold interval)."""
++    from hermes_cli import backend_retirement
++
++    conn, home = board
++    configure(home, limit=100)  # the real measured value admits unless the host is 100% busy
++    advisory(home)
++    t = task(conn)
++    m = {}
++    started = threading.Event()
++
++    def chat_turn():
++        started.wait(5)
++        time.sleep(0.2)  # inside the claim's ~1 s sample
++        m["chat_try"] = time.monotonic()
++        try:
++            with af.admission_lock(home, timeout=backend_retirement.BUSY_WAIT_S):
++                m["chat"] = "acquired"
++        except af.AdmissionBusy:
++            m["chat"] = "busy"
++        m["chat_done"] = time.monotonic()
++    real_sample = cm.sample
++
++    def sample(*a, **k):
++        m["lock_at_sample_start"] = _lock_state(home)
++        m["sample_start"] = time.monotonic()
++        started.set()
++        out = real_sample(*a, **k)
++        m["sample_end"] = time.monotonic()
++        m["lock_at_sample_end"] = _lock_state(home)
++        m["sample"] = out
++        return out
++    cm_sample, cm.sample = cm.sample, sample
++    try:
++        th = threading.Thread(target=chat_turn)
++        th.start()
++        t0 = time.monotonic()
++        got = kb.claim_task(conn, t)
++        m["claim_end"] = time.monotonic()
++        th.join(5)
++    finally:
++        cm.sample = cm_sample
++    claim_s = m["claim_end"] - t0
++    sample_s = m["sample_end"] - m["sample_start"]
++    record = {"claim_s": round(claim_s, 4), "sample_s": round(sample_s, 4),
++              "lock_at_sample_start": m["lock_at_sample_start"], "lock_at_sample_end": m["lock_at_sample_end"],
++              "sample": m["sample"], "chat": m["chat"], "chat_wait_s": round(m["chat_done"] - m["chat_try"], 4),
++              "chat_try_offset_s": round(m["chat_try"] - m["sample_start"], 4),
++              "busy_wait_s": backend_retirement.BUSY_WAIT_S}
++    print("HUB_ADMISSION_LOCK_MEASURE " + json.dumps(record))
++    assert got is not None
++    # The whole independent sample ran with admission.lock held (first and last /proc/stat read inside the hold).
++    assert m["lock_at_sample_start"] == "held" and m["lock_at_sample_end"] == "held"
++    assert m["sample"] is not None and cm.MIN_WINDOW_MS <= m["sample"]["cpu_busy_window_ms"] <= cm.MAX_WINDOW_MS
++    assert sample_s >= 1.0
++    assert claim_s <= 2.5  # frozen bound: one ~1 s sample (window <= 2 s) plus the commit
++    # The chat turn's outcome follows from the measured hold: lock held over [sample_start, claim_end].
++    wait_end = m["chat_try"] + backend_retirement.BUSY_WAIT_S
++    if m["sample_start"] <= m["chat_try"] and wait_end <= m["sample_end"]:
++        assert m["chat"] == "busy" and m["chat_done"] - m["chat_try"] >= backend_retirement.BUSY_WAIT_S
++    elif m["chat"] == "acquired":
++        assert m["chat_done"] >= m["sample_end"]  # only once the claim's hold had ended
++    assert m["chat_done"] - m["chat_try"] <= 2.5
++
++
++def test_queue_reason_codes_cover_the_eight_overflow_reasons():
++    assert {"workers_unknown", "no_eligible_worker", "workers_saturated", "hub_cpu_at_or_above_limit",
++            "hub_cpu_unknown", "hub_capacity_full", "hub_sample_already_used", "hub_overflow_reserved"} <= queue.CODES
+diff --git a/tests/hermes_cli/test_kanban_queue_integration.py b/tests/hermes_cli/test_kanban_queue_integration.py
+index 0724645acaf..82ca664fc9b 100644
+--- a/tests/hermes_cli/test_kanban_queue_integration.py
++++ b/tests/hermes_cli/test_kanban_queue_integration.py
+@@ -115,8 +115,9 @@ def _apply_board_repin(conn, tid):
+     conn.commit()
+ 
+ 
+-def test_origin_return_records_reason_and_unfences_origin(conn, monkeypatch, capsys):
+-    """Board state=origin: the reason is durable, shown, and the origin may run the card in the same pass."""
++def test_legacy_board_origin_return_records_reason_and_unfences_origin(conn, monkeypatch, capsys):
++    """LEGACY Board (pre-overflow, hermes-hub#69) state=origin reply: still recorded and shown during a rolling deploy.
++    Overflow Boards no longer send it (review ruling 9): see test_no_eligible_worker_queues_and_keeps_fence."""
+     from hermes_cli import kanban
+ 
+     tid = fixtures.acknowledged(conn, requires=json.dumps(["terminal", "file", "git"]))
+@@ -172,3 +173,23 @@ def test_origin_reason_is_current_before_feed_and_survives_pull_error(conn):
+     _apply_board_repin(conn, tid)
+     applied = qr.latest(conn, tid)
+     assert applied["state"] == "origin" and applied["current"] is True and applied["reason"] == ORIGIN_REASON
++
++
++def test_no_eligible_worker_queues_and_keeps_fence(conn, monkeypatch):
++    """Overflow Board (ruling 9): no automatic origin return. A card no pool worker can run is queued with
++    `no_eligible_worker`; its fence stays and the origin may NOT run it until an explicit owner repin."""
++    tid = fixtures.acknowledged(conn, requires=json.dumps(["terminal", "file", "git"]))
++    hub = Mock()
++    hub.reserve.return_value = {"state": "queued", "machine": None, "reservation_id": None, "expires_at": None,
++                                "reason": "waiting_for_worker_capacity",
++                                "observation": {"version": 1, "code": "no_eligible_worker", "observed_at_ms": 1000,
++                                                "candidates": [{"machine": "worker-1", "reasons": ["missing_labels"],
++                                                                "missing_labels": ["capability:file"]}]}}
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg={"worker_pools": {"hub": ["worker-1"]}}) == 1
++    value = qr.latest(conn, tid)
++    assert value["code"] == "no_eligible_worker" and value["state"] == "queued"
++    row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert row["placement_policy"] == "worker-first-v1"
++    assert wp.execution_refusal(conn, row) == wp.WAITING
++    assert tid in wp.local_refusals(conn, "ready")
+diff --git a/tests/hermes_cli/test_kanban_worker_policy_db.py b/tests/hermes_cli/test_kanban_worker_policy_db.py
+index b94242f6548..b4588258ebc 100644
+--- a/tests/hermes_cli/test_kanban_worker_policy_db.py
++++ b/tests/hermes_cli/test_kanban_worker_policy_db.py
+@@ -78,7 +78,8 @@ def test_local_dispatch_refusal_survives_registry_failure_and_disabled_policy(co
+ def test_worker_local_admission_rechecks_load_and_releases_unused_lease(conn, monkeypatch, sample, capacity, allowed, status):
+     from hermes_cli import machine_metrics
+     tid = kb.create_task(conn, title="Public analysis", assignee="default", placement_policy="worker-first-v1")
+-    conn.execute("UPDATE tasks SET runs_on=?, status=? WHERE id=?", ('["machine:hub"]', status, tid))
++    # A worker ("hub" in this fixture) claiming another origin's card keeps the load formula (review ruling 2).
++    conn.execute("UPDATE tasks SET runs_on=?, status=?, created_on=? WHERE id=?", ('["machine:hub"]', status, "origin-x", tid))
+     conn.commit()
+     monkeypatch.setattr(machine_metrics, "collect", lambda: sample)
+     monkeypatch.setattr(wn, "registry", lambda: {"machines": {"hub": {"max_card_runs": capacity}}})
+@@ -106,7 +107,7 @@ def test_policy_cannot_be_combined_with_manual_or_host_placement(conn, fields):
+ def test_admission_sampling_failure_releases_grant(conn, monkeypatch, broken):
+     from hermes_cli import machine_metrics
+     tid = kb.create_task(conn, title="Public analysis", placement_policy="worker-first-v1")
+-    conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", ('["machine:hub"]', tid))
++    conn.execute("UPDATE tasks SET runs_on=?, created_on=? WHERE id=?", ('["machine:hub"]', "origin-x", tid))
+     conn.commit()
+     def unavailable():
+         raise OSError("sample unavailable")
+@@ -125,3 +126,22 @@ def test_unknown_policy_is_rejected_before_insertion(conn):
+     with pytest.raises(ValueError, match="placement policy"):
+         kb.create_task(conn, title="Public analysis", placement_policy="worker-first-v999")
+     assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("status", ["ready", "review"])
++def test_origin_claiming_its_own_card_skips_worker_load_formula(conn, monkeypatch, status):
++    """Review ruling 2: hub overflow is gated by measured CPU (claim_transaction), never by load1/CPUs."""
++    from hermes_cli import machine_metrics
++    tid = kb.create_task(conn, title="Public analysis", assignee="default", placement_policy="worker-first-v1")
++    conn.execute("UPDATE tasks SET runs_on=?, status=?, created_on=? WHERE id=?", ('["machine:hub"]', status, "hub", tid))
++    conn.commit()
++    monkeypatch.setattr(machine_metrics, "collect", lambda: {"cpu_load1": 400, "cpus": 4, "mem_used_pct": 50,
++                                                             "active_card_runs": 0})
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"hub": {"max_card_runs": 7}}})
++    client = support.FakeLeaseClient()
++    old = sync.set_lease_client(client)
++    try:
++        assert (kb.claim_task if status == "ready" else kb.claim_review_task)(conn, tid) is not None
++        assert client.count("release") == 0
++    finally:
++        sync.set_lease_client(old)
+-- 
+2.55.0
+

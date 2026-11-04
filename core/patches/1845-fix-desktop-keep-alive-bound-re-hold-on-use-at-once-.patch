@@ -1,0 +1,160 @@
+From 53ea9e1a68266ae918171373d710ceda009d1f7c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:40:22 -0800
+Subject: [PATCH] =?UTF-8?q?fix(desktop):=20keep-alive=20bound=20=E2=80=94?=
+ =?UTF-8?q?=20re-hold=20on=20use=20at=20once,=20test=20resume=20skip=20and?=
+ =?UTF-8?q?=20pending-reconnect=20release=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review follow-ups: noteUse re-holds immediately (no 15 s gap before a released
+backend's idle grace could end), the post-resume rebuild filter lives in
+SshKeepaliveHolds.rebuildIfHeld with its own log line and tests (dead unheld
+scope retired, not redialled; bare/local/non-SSH/default/prewarm/recent
+redialled), a release cancels a pending reconnect (mutation-checked), and the
+warm-set test cleans its temp dir.
+---
+ apps/desktop/electron/main.ts                 |  4 +-
+ .../electron/ssh-keepalive-hold.test.ts       | 65 ++++++++++++++++++-
+ apps/desktop/electron/ssh-keepalive-hold.ts   | 17 +++++
+ 3 files changed, 82 insertions(+), 4 deletions(-)
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 47530c5e921..51ecac2e103 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -14266,9 +14266,7 @@ function revalidateSuspectPoolAfterResume() {
+       entries: backendPool.entries(),
+       log: rememberLog,
+       probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
+-      // A dead scope outside the warm/in-use set is only retired: rebuilding it would re-pin it.
+-      rebuild: async poolKey =>
+-        remoteWarmSet.holds.shouldHold(poolKey) ? redialPoolBackendAfterResume(poolKey) : undefined,
++      rebuild: poolKey => remoteWarmSet.holds.rebuildIfHeld(poolKey, redialPoolBackendAfterResume),
+       retire: async poolKey => {
+         await stopPoolBackend(poolKey, 'resume')
+         // The pool key doubles as the SSH scope for registry SSH backends and
+diff --git a/apps/desktop/electron/ssh-keepalive-hold.test.ts b/apps/desktop/electron/ssh-keepalive-hold.test.ts
+index ac539bda221..8fe34b95ddc 100644
+--- a/apps/desktop/electron/ssh-keepalive-hold.test.ts
++++ b/apps/desktop/electron/ssh-keepalive-hold.test.ts
+@@ -8,7 +8,7 @@ import fs from 'node:fs'
+ import os from 'node:os'
+ import path from 'node:path'
+ 
+-import { describe, expect, it, vi } from 'vitest'
++import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { createRemoteWarmSet } from './remote-warm-set'
+ import { createSshIsolatedKeepaliveRegistry } from './ssh-isolated-keepalive'
+@@ -156,6 +156,60 @@ describe('SSH keep-alive retention bound', () => {
+     expect(holds.shouldHold('conn:mini::bb-shadow')).toBe(false)
+   })
+ 
++  it('a release cancels a pending reconnect; noteUse and a republish re-hold at once', async () => {
++    vi.useFakeTimers()
++
++    try {
++      const { holds, instances, keepalives, openSocket } = setup()
++      const scope = 'conn:mini::bb-device'
++      const [socket] = openSocket(scope)
++
++      socket.emit('error', new Error('tunnel blip')) // schedules a reconnect
++      holds.reconcile()
++      const dialled = instances.length
++      await vi.advanceTimersByTimeAsync(60_000)
++      expect(instances).toHaveLength(dialled)
++      expect(keepalives.openUrl(scope)).toBeNull()
++
++      holds.noteUse(scope) // no reconcile tick needed
++      expect(keepalives.isHeld(scope)).toBe(true)
++      expect(instances).toHaveLength(dialled + 1)
++      expect(keepalives.openUrl(scope)).toBe(instances.at(-1).url)
++
++      keepalives.setHeld('conn:mini::bb-voice', false)
++      keepalives.start('conn:mini::bb-voice', { baseUrl: 'http://127.0.0.1:50004', token: 't' })
++      expect(keepalives.isHeld('conn:mini::bb-voice')).toBe(true)
++      expect(openSocket('conn:mini::bb-voice')).toHaveLength(1)
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  it('post-resume: retires a dead unheld scope without redialling it; held scopes are redialled', async () => {
++    const { holds, log } = setup()
++    const redial = vi.fn(async () => {})
++
++    holds.noteUse('conn:mini::bb-dev')
++
++    for (const scope of [
++      '',
++      'work',
++      'conn:local::work',
++      'conn:https-remote::work',
++      'conn:mini::default',
++      'conn:mini::bb-aux',
++      'conn:mini::bb-dev',
++      'conn:hub::work'
++    ]) {
++      expect(await holds.rebuildIfHeld(scope, redial)).toBe(true)
++    }
++
++    expect(redial).toHaveBeenCalledTimes(8)
++    expect(await holds.rebuildIfHeld('conn:mini::bb-device', redial)).toBe(false)
++    expect(redial).toHaveBeenCalledTimes(8)
++    expect(log).toHaveBeenCalledWith(expect.stringContaining('retired conn:mini::bb-device without rebuild'))
++  })
++
+   it('start/stop drive a periodic reconcile', () => {
+     const timers: Array<() => void> = []
+     const clearTimer = vi.fn()
+@@ -182,8 +236,17 @@ describe('SSH keep-alive retention bound', () => {
+ })
+ 
+ describe('remote warm set wiring', () => {
++  const dirs: string[] = []
++
++  afterEach(() => {
++    for (const dir of dirs.splice(0)) {
++      fs.rmSync(dir, { force: true, recursive: true })
++    }
++  })
++
+   function warmSet(recent: Record<string, Record<string, number>>, env: Record<string, string> = {}) {
+     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'warm-set-'))
++    dirs.push(dir)
+     const statePath = path.join(dir, 'remote-prewarm-profiles.json')
+     fs.writeFileSync(statePath, JSON.stringify(recent))
+     const { FakeWs } = makeFakeWs()
+diff --git a/apps/desktop/electron/ssh-keepalive-hold.ts b/apps/desktop/electron/ssh-keepalive-hold.ts
+index c60f9fbca03..af3bb8eb438 100644
+--- a/apps/desktop/electron/ssh-keepalive-hold.ts
++++ b/apps/desktop/electron/ssh-keepalive-hold.ts
+@@ -56,6 +56,23 @@ export class SshKeepaliveHolds {
+   /** A non-passive dial for real use (same signal remote-prewarm's recent set records). */
+   noteUse(scope: string) {
+     this.#lastUse.set(scope, this.#now())
++    // Re-hold now, not at the next reconcile: a released backend near the end of its idle grace must not exit
++    // between this dial and the next tick.
++    this.#deps.keepalives.setHeld(scope, true)
++  }
++
++  /** Post-resume rebuild of a retired pool scope: a dead scope outside the warm/in-use set is only retired, since
++   * rebuilding it would re-pin it. */
++  async rebuildIfHeld(scope: string, redial: (scope: string) => Promise<unknown>): Promise<boolean> {
++    if (this.shouldHold(scope)) {
++      await redial(scope)
++
++      return true
++    }
++
++    this.#deps.log?.(`[ssh] resume: retired ${scope} without rebuild (outside warm/in-use set)`)
++
++    return false
+   }
+ 
+   shouldHold(scope: string, prewarm: ReadonlySet<string> = new Set(this.#deps.prewarmKeys())): boolean {
+-- 
+2.55.0
+

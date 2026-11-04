@@ -1,0 +1,382 @@
+From 73ee883f89ca7aec6e39012d27308a44d0096ee8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 18:26:53 +0000
+Subject: [PATCH] [daveey] worker-placement: a not_claimable reserve lost to
+ the reserved worker's claim is a pickup, not a refusal
+
+Probe t_01a19fd990770095 (hub, 11-03): the Board reserved the card for worker-1, worker-1 claimed it at
+05:21:51Z, and the hub's next reserve from a copy without that lease got 409 not_claimable at 05:21:52Z.
+worker-placement recorded board_refused and commented "Board placement request refused" although the card
+ran fine on worker-1 (the local `claimed` event arrived after the refusal was written).
+
+On not_claimable, when the latest queue observation is an assignment to machine X, pull the feed once and
+treat a lease (or a Board `claimed` event newer than that observation) held by X as the pickup: no
+board_refused reason, no refusal comment. No current reservation, a failed pull (any error; the
+batch goes on), or a lease held by another machine keep the refusal, fenced on the row the Board refused (pre-pull)
+so the queue guard does not silence it; every card in the tick is judged against the row and reservation its reserve
+was made from (snapshotted before the loop). The extra pull runs at most once per tick. Also rewords the `mixed` code ("Candidates excluded for multiple reasons"), which was
+untrue for one candidate carrying several reasons.
+
+Card: t_01a19fdd27fcdcca
+---
+ hermes_cli/kanban_queue_reason.py             |  26 ++-
+ hermes_cli/kanban_worker_placement.py         |  47 ++++-
+ tests/hermes_cli/test_kanban_queue_reason.py  |  14 ++
+ .../test_kanban_worker_placement_race.py      | 183 ++++++++++++++++++
+ 4 files changed, 264 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_worker_placement_race.py
+
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index 7a7e7d84663..a4acc7e9db4 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -152,7 +152,7 @@ def describe(value):
+              "capability_mismatch": "Candidate capabilities do not match",
+              "board_error": "Board observation failed",
+              "board_refused": "Board placement request refused",
+-             "mixed": "Candidates have different exclusions",
++             "mixed": "Candidates excluded for multiple reasons",
+              "observation_unavailable": "Queue detail observation unavailable"}.get(value.get("code"), "Queue observation")
+     details = []
+     for c in value.get("candidates", []):
+@@ -181,18 +181,34 @@ def print_field(value, field):
+         field("queue", describe(value))
+ 
+ 
+-def _record(conn, task_id, gateway, value):
++def snapshot(conn, task_id):
++    """The row and lifecycle a Board request was made against, to fence a later record on (see ``_record``)."""
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    return None if row is None else {"row": dict(row), "lifecycle": _lifecycle(conn, task_id, row)}
++
++
++def _record(conn, task_id, gateway, value, *, fence=None):
++    """Append one change-only observation and its thread comment.
++
++    ``fence`` (from ``snapshot``) checks the row the Board request was made from instead of the current one: a
++    refusal answered against that row stays recorded after a feed pull moved the row on, exactly as it was before
++    the placement tick learned to pull on ``not_claimable``.
++    """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_sync as sync
+ 
+     with kb.write_txn(conn):
+         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if row is not None and fence is not None:
++            if fence["row"]["id"] != task_id:
++                raise ValueError("fence snapshot is for another task")
++            row = fence["row"]
+         if (not row or sync.board_mode(conn) != "primary" or row["created_on"] != gateway
+                 or (sync.sync_state(conn) or {}).get("gateway_id") != gateway
+                 or row["placement_policy"] != "worker-first-v1" or row["status"] != "ready"
+                 or row["claim_lock"] or row["lease_holder"]):
+             return False
+-        value = {**value, "lifecycle": _lifecycle(conn, task_id, row)}
++        value = {**value, "lifecycle": fence["lifecycle"] if fence is not None else _lifecycle(conn, task_id, row)}
+         previous = _stored(conn, task_id)
+         if previous and _signature(previous) == _signature(value):
+             return False
+@@ -230,7 +246,7 @@ def record_pull_error(conn, gateway, *, status=None, error=None):
+         try_record(record_error, conn, row["id"], gateway, status=status, error=error)
+ 
+ 
+-def record_error(conn, task_id, gateway, *, status=None, error=None):
++def record_error(conn, task_id, gateway, *, status=None, error=None, fence=None):
+     value = {"version": 1, "code": "board_error", "candidates": []}
+     from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
+     if isinstance(error, Resync):
+@@ -255,4 +271,4 @@ def record_error(conn, task_id, gateway, *, status=None, error=None):
+             value.update(code="board_refused", rejection_code=code)
+     if type(status) is int and 100 <= status <= 599:
+         value["http_status"] = status
+-    return _record(conn, task_id, gateway, value)
++    return _record(conn, task_id, gateway, value, fence=fence)
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 9452509a174..8da1c413f99 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -126,6 +126,10 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+ 
+     attempted = 0
+     last = None
++    pulled = []  # at most one feed pull per tick for not_claimable pickups (shared network budget)
++    # Every reserve below is made from this pre-loop copy, so a refusal is judged against it even after an in-loop
++    # pull moved a later row on: the refused row (fence) and the reservation it was waiting on.
++    before = {r["id"]: (queue.snapshot(conn, r["id"]), _reserved_machine(queue, conn, r["id"])) for r in rows}
+     now = time.monotonic()
+     try:
+         for row in rows:
+@@ -159,10 +163,14 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                 queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc)
+                 return attempted
+             except client.HubError as exc:
++                fence = None
+                 if rejection_code(exc) == "not_claimable":
+                     # The Board already has it leased or not ready: our copy is behind. Back off at this revision.
+                     _refused[key] = (row["sync_version"], now + NOT_CLAIMABLE_BACKOFF_S)
+-                queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc)
++                    fence, machine = before[row["id"]]
++                    if picked_up(conn, hub, board, gateway, row["id"], machine, pulled):
++                        continue  # the worker we reserved already claimed it: a pickup, not a refusal
++                queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc, fence=fence)
+                 # Refused revisions still advance the local cursor, but never the feed.
+                 continue
+     finally:
+@@ -176,6 +184,43 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+     return attempted
+ 
+ 
++def _reserved_machine(queue, conn, task_id):
++    """The machine of the current assignment observation (the Board's reserve reply), or None."""
++    value = queue.latest(conn, task_id) or {}
++    return value.get("machine") if value.get("state") == "assigned" and value.get("current") else None
++
++
++def picked_up(conn, hub, board, gateway, task_id, machine, pulled):
++    """Whether a ``not_claimable`` reserve only lost the race to ``machine``, the worker this origin reserved.
++
++    The Board leases the card to its reserved worker and drops the reservation in one write, so a reserve made from
++    a copy that has not pulled that lease is refused. Pull the feed (once per tick: ``pulled`` remembers it) and
++    look for the lease, or a Board ``claimed`` event newer than the reservation, held by the reserved machine.
++    Anything else (no current reservation, a failed pull, another holder) stays a refusal.
++    """
++    from hermes_cli import kanban_queue_reason as queue
++    from hermes_cli import kanban_sync_client as client
++
++    if not machine:
++        return False
++    if not pulled:
++        pulled.append(True)
++        try:
++            client.pull(conn, hub, board, observers=True, partition=gateway)
++        except Exception as exc:  # health: allow BLE001 -- a failed pull keeps the refusal; never abort the batch
++            logger.warning("feed pull after not_claimable failed (%s)", type(exc).__name__)
++            return False
++    row = conn.execute("SELECT lease_holder FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if row is not None and row["lease_holder"] == machine:
++        return True
++    since = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id=? AND kind=?",
++                         (task_id, queue.EVENT)).fetchone()[0]
++    claim = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='claimed' AND id>? AND json_valid(payload) "
++        "AND json_extract(payload, '$.holder') IS NOT NULL ORDER BY id DESC LIMIT 1", (task_id, since)).fetchone()
++    return bool(claim and json.loads(claim[0]).get("holder") == machine)
++
++
+ def rejection_code(exc):
+     """The Board's rejection code from a HubError body (``{"error": "<code>"}``), or None."""
+     try:
+diff --git a/tests/hermes_cli/test_kanban_queue_reason.py b/tests/hermes_cli/test_kanban_queue_reason.py
+index 1be889520e7..54d3885b6bd 100644
+--- a/tests/hermes_cli/test_kanban_queue_reason.py
++++ b/tests/hermes_cli/test_kanban_queue_reason.py
+@@ -185,3 +185,17 @@ def test_comment_failure_rolls_back_observation(conn, monkeypatch):
+     with pytest.raises(RuntimeError, match="synthetic"):
+         qr.record_reply(conn, tid, "hub", reply())
+     assert qr.latest(conn, tid) is None
++
++
++@pytest.mark.parametrize("candidates", [
++    [{"machine": "worker-1", "reasons": ["last_seen_stale", "metrics_stale"]}],  # probe t_01a19fd990770095, 11-03
++    [{"machine": "worker-1", "reasons": ["load_threshold"]}, {"machine": "worker-2", "reasons": ["draining"]}],
++])
++def test_mixed_wording_is_true_for_one_or_many_candidates(conn, candidates):
++    tid = fixtures.acknowledged(conn)
++    r = reply("mixed")
++    r["observation"]["candidates"] = candidates
++    assert qr.record_reply(conn, tid, "hub", r)
++    body = kb.list_comments(conn, tid)[-1].body
++    assert body.startswith("Candidates excluded for multiple reasons — worker-1: ")
++    assert "different exclusions" not in body
+diff --git a/tests/hermes_cli/test_kanban_worker_placement_race.py b/tests/hermes_cli/test_kanban_worker_placement_race.py
+new file mode 100644
+index 00000000000..f7263e8ead2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_placement_race.py
+@@ -0,0 +1,183 @@
++"""A ``409 not_claimable`` that only means the reserved worker already claimed the card is not a refusal. [daveey]
++
++Seen 2026-11-03 on probe t_01a19fd990770095 (hub): the Board reserved the card for worker-1 (05:21:31Z), worker-1
++claimed it (05:21:51Z), and the hub's next placement call, made from a copy that had not pulled the lease yet, got
++``409 not_claimable`` at 05:21:52Z. worker-placement recorded ``board_refused`` and commented "Board placement request
++refused" although the card ran fine on worker-1. Entry path: the origin's placement tick
++``kanban_worker_placement.reevaluate`` against the fake Board shared by the origin and the worker gateway.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_node as node_fixtures
++from tests.hermes_cli import test_kanban_worker_policy_db as db_fixtures
++from tests.hermes_cli.test_kanban_worker_move_request import PlacementHub, RecordingHub, _acknowledged
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER
++from tests.hermes_cli.test_kanban_worker_repin import _policy_card
++
++conn = db_fixtures.conn
++gws = node_fixtures.gws
++svc = node_fixtures.svc
++POOLS = {"worker_pools": {HUB: [WORKER]}}
++
++
++class BoardHub(PlacementHub):
++    """``reserveWorker`` as the Board runs it: ``not_claimable`` once the row is not ready or carries a lease."""
++
++    def reserve(self, board, *, task_id, expected_revision, candidates):
++        b = self.svc.board(board)
++        task = b["rows"].get("tasks", {}).get(task_id) or {}
++        if task.get("status") != "ready" or task_id in b["leases"]:
++            self.reserves.append(task_id)
++            raise ksc.HubError(409, json.dumps({"error": "not_claimable"}))
++        return super().reserve(board, task_id=task_id, expected_revision=expected_revision, candidates=candidates)
++
++
++@pytest.fixture(autouse=True)
++def _fresh_backoff():
++    wp._refused.clear()
++    yield
++    wp._refused.clear()
++
++
++def _reasons(conn_, tid):
++    return [json.loads(p)["code"] for (p,) in conn_.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, qr.EVENT))]
++
++
++def _assigned_to(conn_, tid):
++    latest = qr.latest(conn_, tid) or {}
++    return latest.get("machine") if latest.get("state") == "assigned" else None
++
++
++def _placement_comments(conn_, tid):
++    return [c.body for c in kb.list_comments(conn_, tid) if c.author == "worker-placement"]
++
++
++def test_not_claimable_after_the_reserved_worker_claimed_is_recorded_as_picked_up(gws, svc, monkeypatch):
++    origin, worker = gws
++    monkeypatch.setattr(wp, "local_admission", lambda conn_: True)  # worker-1 has capacity (host metrics)
++    tid, _ = _policy_card(origin)
++    hub = BoardHub(svc, HUB)
++    origin.enter()
++    assert wp.reevaluate(origin.conn, hub, BOARD, HUB, cfg=POOLS) == 1
++    assert _assigned_to(origin.conn, tid) == WORKER
++
++    # worker-1 pulls its assignment and claims the card on the Board; the origin has not pulled the lease yet.
++    worker.round()
++    worker.tick()
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++    origin.enter()
++    row = origin.conn.execute("SELECT status, lease_holder FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert (row["status"], row["lease_holder"]) == ("ready", None)  # the stale copy the probe's hub had
++
++    wp._refused.clear()
++    wp.reevaluate(origin.conn, hub, BOARD, HUB, cfg=POOLS)
++    assert len(hub.reserves) == 2  # the race really happened: the second reserve was refused not_claimable
++    assert "board_refused" not in _reasons(origin.conn, tid)
++    assert not any("refused" in body for body in _placement_comments(origin.conn, tid))
++    row = origin.conn.execute("SELECT status, lease_holder FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert (row["status"], row["lease_holder"]) == ("running", WORKER)  # recorded as picked up by worker-1
++
++
++def test_not_claimable_without_a_claim_by_the_reserved_machine_is_still_refused(conn, monkeypatch):
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: None)  # the feed shows no lease: the row is still unclaimed
++    tid = _acknowledged(conn)
++    wp.reevaluate(conn, RecordingHub(), "default", "hub", cfg=POOLS)
++    assert _assigned_to(conn, tid) == WORKER
++    wp.reevaluate(conn, RecordingHub(refuse="not_claimable"), "default", "hub", cfg=POOLS)
++    assert _reasons(conn, tid)[-1] == "board_refused" and len(_reasons(conn, tid)) == 2
++    assert _placement_comments(conn, tid)[-1].startswith("Board placement request refused — HTTP 409")
++
++
++def _pull_applying(conn_, tid, *, claims, lease_holder=None, holder="worker-2"):
++    """A feed stub: after the reservation, it brings a Board claim (event, optionally the lease mirror)."""
++    def pull(c, *a, **kw):
++        if not claims:
++            return
++        c.execute("UPDATE kanban_sync_state SET applying=1")
++        if lease_holder:
++            c.execute("UPDATE tasks SET status='running', lease_holder=?, lease_expires=? WHERE id=?",
++                      (lease_holder, 9_999_999_999_999, tid))
++        c.execute("UPDATE kanban_sync_state SET applying=0")
++        kb._append_event(c, tid, "claimed", {"holder": holder, "run_uid": "u", "expires": 1})
++        c.commit()
++    return pull
++
++
++def test_not_claimable_while_another_machine_holds_the_lease_is_still_refused(conn, monkeypatch):
++    tid = _acknowledged(conn)
++    claims = []
++    monkeypatch.setattr(ksc, "pull", _pull_applying(conn, tid, claims=claims, lease_holder="worker-2"))
++    wp.reevaluate(conn, RecordingHub(), "default", "hub", cfg=POOLS)
++    assert _assigned_to(conn, tid) == WORKER
++    claims.append(True)
++    wp.reevaluate(conn, RecordingHub(refuse="not_claimable"), "default", "hub", cfg=POOLS)
++    assert conn.execute("SELECT lease_holder FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "worker-2"
++    assert _reasons(conn, tid)[-1] == "board_refused"  # recorded against the refused copy, as before the pull
++    assert _placement_comments(conn, tid)[-1].startswith("Board placement request refused — HTTP 409")
++
++
++def test_not_claimable_with_only_the_reserved_workers_claimed_event_is_a_pickup(conn, monkeypatch):
++    tid = _acknowledged(conn)
++    claims = []
++    monkeypatch.setattr(ksc, "pull", _pull_applying(conn, tid, claims=claims, holder=WORKER))
++    wp.reevaluate(conn, RecordingHub(), "default", "hub", cfg=POOLS)
++    claims.append(True)
++    wp.reevaluate(conn, RecordingHub(refuse="not_claimable"), "default", "hub", cfg=POOLS)
++    assert "board_refused" not in _reasons(conn, tid)
++    assert not any("refused" in body for body in _placement_comments(conn, tid))
++
++
++def test_a_later_card_in_the_tick_is_judged_against_the_copy_its_reserve_was_made_from(conn, monkeypatch):
++    """One pull per tick: cards after the first are refused or picked up by their pre-pull row and reservation."""
++    first, leased_elsewhere, picked = _acknowledged(conn), _acknowledged(conn), _acknowledged(conn)
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: None)
++    wp.reevaluate(conn, RecordingHub(), "default", "hub", cfg=POOLS)
++    assert all(_assigned_to(conn, t) == WORKER for t in (first, leased_elsewhere, picked))
++
++    def pull(c, *a, **kw):  # the tick's single pull brings both later cards' Board leases
++        c.execute("UPDATE kanban_sync_state SET applying=1")
++        for tid, holder in ((leased_elsewhere, "worker-2"), (picked, WORKER)):
++            c.execute("UPDATE tasks SET status='running', lease_holder=?, lease_expires=? WHERE id=?",
++                      (holder, 9_999_999_999_999, tid))
++        c.execute("UPDATE kanban_sync_state SET applying=0")
++        c.commit()
++    monkeypatch.setattr(ksc, "pull", pull)
++    hub = RecordingHub(refuse="not_claimable")
++    wp.reevaluate(conn, hub, "default", "hub", cfg=POOLS)
++    assert len(hub.reserves) == 3
++    assert _reasons(conn, first)[-1] == "board_refused"
++    assert _reasons(conn, leased_elsewhere)[-1] == "board_refused"
++    assert "board_refused" not in _reasons(conn, picked)
++
++
++def test_a_failing_pull_keeps_the_refusal_and_the_batch(conn, monkeypatch):
++    first, second = _acknowledged(conn), _acknowledged(conn)
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: None)
++    wp.reevaluate(conn, RecordingHub(), "default", "hub", cfg=POOLS)
++    pulls = []
++
++    def broken(*a, **kw):
++        pulls.append(1)
++        raise RuntimeError("schema ahead")
++    monkeypatch.setattr(ksc, "pull", broken)
++    hub = RecordingHub(refuse="not_claimable")
++    wp.reevaluate(conn, hub, "default", "hub", cfg=POOLS)
++    assert len(hub.reserves) == 2 and len(pulls) == 1  # one pull per tick, and the batch went on
++    assert _reasons(conn, first)[-1] == _reasons(conn, second)[-1] == "board_refused"
++
++
++def test_not_claimable_with_no_prior_reservation_is_refused_without_an_extra_pull(conn, monkeypatch):
++    pulls = []
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: pulls.append(kw))
++    tid = _acknowledged(conn)
++    wp.reevaluate(conn, RecordingHub(refuse="not_claimable"), "default", "hub", cfg=POOLS)
++    assert _reasons(conn, tid) == ["board_refused"] and pulls == []
+-- 
+2.55.0
+

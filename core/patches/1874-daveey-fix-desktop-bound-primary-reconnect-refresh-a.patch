@@ -1,0 +1,869 @@
+From bea3dcc5bb7aaaeeb2377c2739b6f507e0201b0e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 10:16:01 +0000
+Subject: [PATCH] [daveey] fix(desktop): bound primary reconnect refresh and
+ heal owner-pinned requests on a closed primary
+
+---
+ .../use-gateway-boot-primary-redial.test.tsx  | 263 ++++++++++++++++++
+ .../src/app/gateway/hooks/use-gateway-boot.ts |  49 +++-
+ apps/desktop/src/store/gateway.ts             |  24 +-
+ .../store/primary-gateway-recovery.test.ts    |  86 ++++++
+ .../src/store/primary-gateway-recovery.ts     | 114 ++++++++
+ .../desktop/src/test/gateway-boot-harness.tsx | 179 ++++++++++++
+ 6 files changed, 707 insertions(+), 8 deletions(-)
+ create mode 100644 apps/desktop/src/app/gateway/hooks/use-gateway-boot-primary-redial.test.tsx
+ create mode 100644 apps/desktop/src/store/primary-gateway-recovery.test.ts
+ create mode 100644 apps/desktop/src/store/primary-gateway-recovery.ts
+ create mode 100644 apps/desktop/src/test/gateway-boot-harness.tsx
+
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot-primary-redial.test.tsx b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-primary-redial.test.tsx
+new file mode 100644
+index 00000000000..7e35237effd
+--- /dev/null
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-primary-redial.test.tsx
+@@ -0,0 +1,263 @@
++import { act, render } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { activeGateway, ensureGatewayForAgent, isActivePrimary, requestGatewayForProfile } from '@/store/gateway'
++import { $gatewayState } from '@/store/session'
++import { requestForSessionProfile } from '@/store/session-request-router'
++
++import { deferred } from '../../../test/deferred'
++import { FakeWebSocket } from '../../../test/fake-gateway-socket'
++import type {
++  fakeBootDesktop} from '../../../test/gateway-boot-harness';
++import {
++  advanceBackoff,
++  BootHarness,
++  bootHooks,
++  flushAsync,
++  localPrimaryConn,
++  recordSends,
++  sentMethods,
++  setUpBootHarness,
++  tearDownBootHarness
++} from '../../../test/gateway-boot-harness'
++
++vi.mock(import('@/store/terminal-backend-warning'), () => ({
++  warnIfTerminalBackendUnavailable: vi.fn(async () => false)
++}))
++
++// The window primary's socket is owned by useGatewayBoot (fresh descriptor and
++// ticket per dial, full-jitter backoff). These cases cover the gaps where that
++// owner either stopped redialing (a latch) or was bypassed (owner-pinned
++// requests that call the raw primary client). Reproduced against the hook and
++// the real HermesGateway; the historical outage (ECONNRESET, then local request
++// failures until a reload) is consistent with these mechanisms but did not
++// record which one fired.
++
++const OWNER = { connectionId: 'local', profile: 'default' }
++
++const ambient = vi.fn(async () => {
++  throw new Error('owner-pinned requests must not use the ambient gateway')
++})
++
++let desktop: ReturnType<typeof fakeBootDesktop>
++let stopRecording: () => void
++
++beforeEach(() => {
++  desktop = setUpBootHarness()
++  stopRecording = recordSends()
++  ambient.mockClear()
++})
++
++afterEach(() => {
++  stopRecording()
++  tearDownBootHarness()
++})
++
++const primarySockets = () => FakeWebSocket.instances.filter(socket => socket.url === localPrimaryConn.wsUrl)
++const sendsOf = (method: string) => FakeWebSocket.instances.flatMap(sentMethods).filter(sent => sent === method)
++
++async function bootWithRemoteForeground() {
++  render(<BootHarness />)
++  await flushAsync()
++
++  let opening!: Promise<boolean>
++  act(() => {
++    opening = ensureGatewayForAgent('coder-remote', 'coder')
++  })
++  await flushAsync()
++  expect(await opening).toBe(true)
++  expect(isActivePrimary()).toBe(false)
++}
++
++describe('primary socket owner keeps redialing', () => {
++  it('redials a local primary after a close, and again after a failed dial (error)', async () => {
++    render(<BootHarness />)
++    await flushAsync()
++
++    FakeWebSocket.mode = 'fail'
++    act(() => primarySockets()[0].drop())
++    await advanceBackoff()
++    expect(primarySockets().length).toBeGreaterThan(1)
++    expect(activeGateway()?.connectionState).not.toBe('open')
++
++    FakeWebSocket.mode = 'open'
++    await advanceBackoff()
++    await advanceBackoff()
++    expect(activeGateway()?.connectionState).toBe('open')
++    expect($gatewayState.get()).toBe('open')
++  })
++
++  it('redials a drop that lands while the post-reconnect refresh hangs', async () => {
++    let hang = false
++    const refreshSessions = () => (hang ? new Promise<void>(() => undefined) : Promise.resolve())
++    render(<BootHarness refreshSessions={refreshSessions} />)
++    await flushAsync()
++
++    hang = true
++    act(() => primarySockets()[0].drop())
++    await advanceBackoff()
++    expect(primarySockets()).toHaveLength(2)
++    expect(activeGateway()?.connectionState).toBe('open')
++
++    // The refresh above never settles. The next drop must still be redialed.
++    act(() => primarySockets()[1].drop())
++    await advanceBackoff()
++    await advanceBackoff()
++    expect(primarySockets()).toHaveLength(3)
++    expect(activeGateway()?.connectionState).toBe('open')
++  })
++
++  it('arms the backoff when the socket dropped while boot was still refreshing', async () => {
++    const bootRefresh = deferred<void>()
++    render(<BootHarness refreshSessions={() => bootRefresh.promise} />)
++    await flushAsync()
++
++    act(() => primarySockets()[0].drop())
++    await act(async () => bootRefresh.resolve())
++    await advanceBackoff()
++
++    expect(primarySockets()).toHaveLength(2)
++    expect(activeGateway()?.connectionState).toBe('open')
++  })
++
++  it('arms the backoff when the socket dropped while a connection apply was finishing', async () => {
++    let switchRefresh: null | ReturnType<typeof deferred<void>> = null
++    const refreshSessions = () => switchRefresh?.promise ?? Promise.resolve()
++    render(<BootHarness refreshSessions={refreshSessions} />)
++    await flushAsync()
++
++    switchRefresh = deferred<void>()
++    act(() => bootHooks.connectionApplied?.())
++    await flushAsync()
++    expect(primarySockets()).toHaveLength(2)
++
++    act(() => primarySockets()[1].drop())
++    await act(async () => switchRefresh!.resolve())
++    await advanceBackoff()
++
++    expect(primarySockets()).toHaveLength(3)
++    expect(activeGateway()?.connectionState).toBe('open')
++  })
++})
++
++describe('owner-pinned requests on a closed primary', () => {
++  it('sends the next local request on the redialed primary while a remote is foregrounded', async () => {
++    await bootWithRemoteForeground()
++    const [primary, remote] = FakeWebSocket.instances
++
++    act(() => primary.drop())
++    const reply = requestForSessionProfile(OWNER, ambient, 'ping')
++    await flushAsync()
++
++    await expect(reply).resolves.toEqual({ pong: true })
++    const redialed = primarySockets().at(-1)!
++    expect(redialed).not.toBe(primary)
++    expect(sentMethods(redialed)).toContain('ping')
++    expect(sentMethods(remote)).not.toContain('ping')
++    expect(ambient).not.toHaveBeenCalled()
++    // Recovery never moves the foreground.
++    expect(isActivePrimary()).toBe(false)
++  })
++
++  it('coalesces concurrent requests onto one primary dial', async () => {
++    await bootWithRemoteForeground()
++    const lookups = desktop.getConnection.mock.calls.length
++
++    act(() => primarySockets()[0].drop())
++
++    const replies = [
++      requestForSessionProfile(OWNER, ambient, 'ping'),
++      requestGatewayForProfile('default', 'ping'),
++      requestForSessionProfile(OWNER, ambient, 'ping')
++    ]
++
++    await flushAsync()
++
++    await expect(Promise.all(replies)).resolves.toEqual([{ pong: true }, { pong: true }, { pong: true }])
++    expect(primarySockets()).toHaveLength(2)
++    expect(desktop.getConnection.mock.calls.length).toBe(lookups + 1)
++  })
++
++  it('never sends a request aborted while it waited for the redial', async () => {
++    await bootWithRemoteForeground()
++    const lookup = deferred<Record<string, unknown>>()
++    desktop.getConnection.mockReturnValueOnce(lookup.promise)
++
++    act(() => primarySockets()[0].drop())
++    const controller = new AbortController()
++    const reply = requestForSessionProfile(OWNER, ambient, 'session.steer', {}, 30_000, controller.signal)
++    const outcome = reply.catch((error: unknown) => error)
++    await flushAsync()
++
++    controller.abort()
++    await flushAsync()
++    expect(await outcome).toMatchObject({ name: 'AbortError' })
++
++    lookup.resolve(localPrimaryConn)
++    await flushAsync()
++    expect(activeGateway()).not.toBeNull()
++    expect(primarySockets().at(-1)?.readyState).toBe(FakeWebSocket.OPEN)
++    expect(sendsOf('session.steer')).toEqual([])
++  })
++
++  it('keeps the caller deadline and does not send after it expired', async () => {
++    await bootWithRemoteForeground()
++    const lookup = deferred<Record<string, unknown>>()
++    desktop.getConnection.mockReturnValueOnce(lookup.promise)
++
++    act(() => primarySockets()[0].drop())
++    const outcome = requestForSessionProfile(OWNER, ambient, 'session.steer', {}, 1_000).catch((error: unknown) => error)
++    await flushAsync(1_000)
++    expect(String(await outcome)).toMatch(/timed out/i)
++
++    lookup.resolve(localPrimaryConn)
++    await flushAsync()
++    expect(primarySockets().at(-1)?.readyState).toBe(FakeWebSocket.OPEN)
++    expect(sendsOf('session.steer')).toEqual([])
++  })
++
++  it('does not replay a request that was already sent when the socket dropped', async () => {
++    await bootWithRemoteForeground()
++    const reply = requestForSessionProfile(OWNER, ambient, 'session.steer').catch((error: unknown) => error)
++    await flushAsync()
++    expect(sendsOf('session.steer')).toHaveLength(1)
++
++    act(() => primarySockets()[0].drop())
++    expect(String(await reply)).toMatch(/closed|not connected/i)
++    await advanceBackoff()
++
++    expect(activeGateway()).not.toBeNull()
++    expect(primarySockets().at(-1)?.readyState).toBe(FakeWebSocket.OPEN)
++    expect(sendsOf('session.steer')).toHaveLength(1)
++  })
++
++  it('does not dial from a request once the boot hook is gone', async () => {
++    const view = render(<BootHarness />)
++    await flushAsync()
++    view.unmount()
++
++    act(() => primarySockets()[0].drop())
++    await expect(requestGatewayForProfile('default', 'ping')).rejects.toThrow()
++    await flushAsync()
++    expect(primarySockets()).toHaveLength(1)
++  })
++
++  it('does not race a connection apply with its own dial', async () => {
++    render(<BootHarness />)
++    await flushAsync()
++    const lookup = deferred<Record<string, unknown>>()
++    desktop.getConnection.mockReturnValueOnce(lookup.promise)
++
++    act(() => bootHooks.connectionApplied?.())
++    await flushAsync()
++    const lookups = desktop.getConnection.mock.calls.length
++
++    await expect(requestForSessionProfile(OWNER, ambient, 'ping')).rejects.toThrow()
++    expect(desktop.getConnection.mock.calls.length).toBe(lookups)
++
++    lookup.resolve(localPrimaryConn)
++    await flushAsync()
++    expect(primarySockets()).toHaveLength(2)
++    expect(activeGateway()?.connectionState).toBe('open')
++  })
++})
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+index c49b7c73b75..bd185aa299c 100644
+--- a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+@@ -68,6 +68,7 @@ import {
+ } from '@/store/gateway-switch'
+ import { watchLocalRuntimeJobs } from '@/store/local-runtime-jobs'
+ import { dismissNotification, notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
++import { registerPrimaryGatewayRecovery } from '@/store/primary-gateway-recovery'
+ import {
+   $activeGatewayProfile,
+   currentProfileSelectionRevision,
+@@ -376,6 +377,10 @@ export function useGatewayBoot({
+     // switch and the renderer's own bounded retry (#82679).
+     let bootFailed = false
+     let reconnecting = false
++    // One redial per outage may be brought forward by a request waiting on the
++    // closed primary (registerPrimaryGatewayRecovery below); later waiters ride
++    // the backoff. Cleared when the socket opens.
++    let redialExpedited = false
+     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+     let reconnectAttempt = 0
+     // Wall-clock of the current socket's 'open'; null while not open.
+@@ -593,8 +598,19 @@ export function useGatewayBoot({
+         // A manual retry may finish after the user has moved to another route.
+         if (!manual || (isActivePrimary() && gatewayActivationEpoch() === manual.activationEpoch)) {
+           reconcileBusyStatesOnReconnect()
+-          await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
+-          await callbacksRef.current.refreshSessions().catch(() => undefined)
++          // Bounded: `reconnecting` stays set until these settle, and while it
++          // is set a drop of the socket just reopened is not redialed. A hung
++          // refresh would latch the primary closed until a reload.
++          await withTimeout(
++            callbacksRef.current.refreshHermesConfig(),
++            RECONNECT_ATTEMPT_TIMEOUT_MS,
++            'Timed out refreshing config after reconnect'
++          ).catch(() => undefined)
++          await withTimeout(
++            callbacksRef.current.refreshSessions(),
++            RECONNECT_ATTEMPT_TIMEOUT_MS,
++            'Timed out refreshing sessions after reconnect'
++          ).catch(() => undefined)
+         }
+       } catch (err) {
+         // OAuth session expired mid-reconnect: surface the actionable "sign in
+@@ -845,6 +861,7 @@ export function useGatewayBoot({
+       }
+ 
+       let switchToken: null | ReturnType<typeof beginGatewaySwitch> = null
++      let switchCompleted = false
+ 
+       try {
+         // Barrier up + machine-context reset + session wipe, in one synchronous
+@@ -945,6 +962,7 @@ export function useGatewayBoot({
+ 
+         completeDesktopBoot()
+         bootCompleted = true
++        switchCompleted = true
+         // Rediscover local-runtime jobs (model downloads, runtime installs)
+         // that were running before a reload — the backend registry is the
+         // authority; this just resumes following it.
+@@ -973,7 +991,14 @@ export function useGatewayBoot({
+         // returning. Never use token-less teardown here: it would force down a
+         // newer switch started synchronously by error recovery/notification UI.
+         if (switchToken !== null) {
++          const owned = isCurrentGatewaySwitch(switchToken)
+           endGatewaySwitch(switchToken)
++
++          // A drop while the switch held the barrier was not redialed (the
++          // close handler defers to the switch). Arm the backoff now.
++          if (owned && switchCompleted) {
++            scheduleReconnect()
++          }
+         }
+       }
+     }
+@@ -1155,6 +1180,7 @@ export function useGatewayBoot({
+         reauthNotified = false
+         primaryReauthError = null
+         livenessProbeFailures = 0
++        redialExpedited = false
+         clearReconnectTimer()
+         clearLivenessReprobeTimer()
+ 
+@@ -1261,6 +1287,22 @@ export function useGatewayBoot({
+     const offPowerResume = desktop.onPowerResume?.(() => void forceReconnectNow())
+     const offConnectionApplied = desktop.onConnectionApplied?.(() => void softSwitch())
+ 
++    // Owner-pinned store requests on the closed primary wait for THIS redial
++    // (fresh descriptor and ticket) instead of failing or dialing on their own.
++    const offPrimaryRecovery = registerPrimaryGatewayRecovery(gateway, () => {
++      if (cancelled || !bootCompleted || primaryReauthError || $gatewaySwitching.get()) {
++        return false
++      }
++
++      if (!reconnecting && !gatewayOpen() && !redialExpedited) {
++        redialExpedited = true
++        clearReconnectTimer()
++        void attemptReconnect()
++      }
++
++      return true
++    })
++
+     const offGatewayReconnect = registerGatewayReconnect(async (options?: GatewayReconnectOptions) => {
+       if (cancelled || !bootCompleted || $gatewaySwitching.get()) {
+         return
+@@ -1670,6 +1712,8 @@ export function useGatewayBoot({
+         completeDesktopBoot()
+         bootCompleted = true
+         bootRetryAttempt = 0
++        // A drop before bootCompleted was not redialed by the close handler.
++        scheduleReconnect()
+         // A Docker/SSH terminal backend that fails its probe means shell
+         // commands silently cannot run — say so once, with a way out. Cold
+         // launch is the common path, so it must warn too, not only softSwitch.
+@@ -1755,6 +1799,7 @@ export function useGatewayBoot({
+ 
+     return () => {
+       cancelled = true
++      offPrimaryRecovery()
+       offSwitchLifecycle()
+       endGatewaySwitch()
+       clearReconnectTimer()
+diff --git a/apps/desktop/src/store/gateway.ts b/apps/desktop/src/store/gateway.ts
+index 40641d6d602..b0e1b2c5399 100644
+--- a/apps/desktop/src/store/gateway.ts
++++ b/apps/desktop/src/store/gateway.ts
+@@ -42,6 +42,7 @@ import {
+ } from '@/store/gateway-shared-route'
+ import { notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
+ import { markNativeNotifyBaseline } from '@/store/notify-baseline'
++import { waitForPrimaryGateway } from '@/store/primary-gateway-recovery'
+ import { setConnection, setGatewayState } from '@/store/session'
+ import { stampSecondaryProfileOwner } from '@/store/session-event-provenance'
+ export { useGatewayActivationEpoch } from '@/store/gateway-activation-epoch'
+@@ -536,13 +537,17 @@ async function requestOnPrimaryGateway<T>(
+ ): Promise<T> {
+   const gateway = g.primaryGateway
+ 
+-  if (!gateway || !isOpen(gateway)) {
++  const ready = gateway && (await waitForPrimaryGateway(gateway, timeoutMs, signal))
++
++  if (!gateway || !ready || !isOpen(gateway)) {
+     throw new Error('Hermes gateway unavailable')
+   }
+ 
+-  return timeoutMs === undefined && signal === undefined
++  const { remainingMs } = ready
++
++  return remainingMs === undefined && signal === undefined
+     ? gateway.request<T>(method, params)
+-    : gateway.request<T>(method, params, timeoutMs, signal)
++    : gateway.request<T>(method, params, remainingMs, signal)
+ }
+ 
+ export function isActivePrimary(): boolean {
+@@ -1234,13 +1239,20 @@ export async function requestGatewayForProfile<T>(
+     }
+ 
+     const routedParams = route.scopeProfile ? { ...params, profile: route.key } : params
++    const gateway = route.gateway
++
++    // A closed primary is redialed by its one owner (useGatewayBoot), never
++    // here: wait for that redial before the first send. With no owner able to
++    // redial, send as before and let the closed client reject it.
++    const ready = gateway === g.primaryGateway ? await waitForPrimaryGateway(gateway, timeoutMs, signal) : null
++    const remainingMs = ready ? ready.remainingMs : timeoutMs
+ 
+     // Same arity contract as the ambient path in session-request-router: only
+     // pass the deadline args through when the caller set them, so a plain
+     // profile-routed RPC keeps its two-argument call shape.
+-    const result = await (timeoutMs === undefined && signal === undefined
+-      ? route.gateway.request<T>(method, routedParams)
+-      : route.gateway.request<T>(method, routedParams, timeoutMs, signal))
++    const result = await (remainingMs === undefined && signal === undefined
++      ? gateway.request<T>(method, routedParams)
++      : gateway.request<T>(method, routedParams, remainingMs, signal))
+ 
+     // A served RPC proves the backend answers, not just accepts, so it clears the dial history.
+     // Lease requests dispose their entry right after, before a close could prove the socket stable.
+diff --git a/apps/desktop/src/store/primary-gateway-recovery.test.ts b/apps/desktop/src/store/primary-gateway-recovery.test.ts
+new file mode 100644
+index 00000000000..5aa042efa74
+--- /dev/null
++++ b/apps/desktop/src/store/primary-gateway-recovery.test.ts
+@@ -0,0 +1,86 @@
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import type { HermesGateway } from '@/hermes'
++
++import { registerPrimaryGatewayRecovery, waitForPrimaryGateway } from './primary-gateway-recovery'
++
++const disposers: (() => void)[] = []
++beforeEach(() => vi.useFakeTimers())
++afterEach(() => {
++  disposers.splice(0).forEach(dispose => dispose())
++  vi.useRealTimers()
++})
++
++function client(state = 'closed', synchronousOpen = false) {
++  const listeners = new Set<(state: string) => void>()
++
++  const gateway = {
++    connectionState: state,
++    onState: (callback: (state: string) => void) => {
++      listeners.add(callback)
++
++      if (synchronousOpen) {
++        gateway.connectionState = 'open'
++        callback('open')
++      }
++
++      return () => { listeners.delete(callback) }
++    }
++  }
++
++  return { gateway: gateway as unknown as HermesGateway, listeners }
++}
++
++it('cleans up a synchronously delivered open subscription', async () => {
++  const { gateway, listeners } = client('closed', true)
++  disposers.push(registerPrimaryGatewayRecovery(gateway, () => true))
++  await expect(waitForPrimaryGateway(gateway, 1000, undefined)).resolves.toEqual({ remainingMs: 1000 })
++  expect(listeners.size).toBe(0)
++  expect(vi.getTimerCount()).toBe(0)
++})
++
++it('does not invoke the new owner for an old gateway', async () => {
++  const old = client().gateway
++  const current = client().gateway
++  const recover = vi.fn(() => true)
++  disposers.push(registerPrimaryGatewayRecovery(current, recover))
++  await expect(waitForPrimaryGateway(old, 1000, undefined)).resolves.toBeNull()
++  expect(recover).not.toHaveBeenCalled()
++})
++
++it('rejects old waiters and removes subscriptions when ownership is replaced', async () => {
++  const { gateway, listeners } = client()
++  disposers.push(registerPrimaryGatewayRecovery(gateway, () => true))
++  const result = waitForPrimaryGateway(gateway, 1000, undefined).catch(error => error)
++  disposers.push(registerPrimaryGatewayRecovery(client().gateway, () => true))
++  expect(await result).toBeInstanceOf(Error)
++  expect(listeners.size).toBe(0)
++  expect(vi.getTimerCount()).toBe(0)
++})
++
++it.each(['abort', 'timeout', 'dispose'])('cleans subscriptions after %s', async mode => {
++  const { gateway, listeners } = client()
++  const dispose = registerPrimaryGatewayRecovery(gateway, () => true)
++  disposers.push(dispose)
++  const controller = new AbortController()
++  const result = waitForPrimaryGateway(gateway, 1000, controller.signal).catch(error => error)
++
++  if (mode === 'abort') {controller.abort()}
++
++  if (mode === 'timeout') {await vi.advanceTimersByTimeAsync(1000)}
++
++  if (mode === 'dispose') {dispose()}
++  expect(await result).toMatchObject({ name: mode === 'abort' ? 'AbortError' : 'Error' })
++  expect(listeners.size).toBe(0)
++  expect(vi.getTimerCount()).toBe(0)
++})
++
++it('charges recovery time to the caller deadline', async () => {
++  const { gateway, listeners } = client()
++  disposers.push(registerPrimaryGatewayRecovery(gateway, () => true))
++  const result = waitForPrimaryGateway(gateway, 1000, undefined)
++  await vi.advanceTimersByTimeAsync(700)
++  ;(gateway as { connectionState: string }).connectionState = 'open'
++  listeners.forEach(listener => listener('open'))
++  await expect(result).resolves.toEqual({ remainingMs: 300 })
++})
+diff --git a/apps/desktop/src/store/primary-gateway-recovery.ts b/apps/desktop/src/store/primary-gateway-recovery.ts
+new file mode 100644
+index 00000000000..64544f0a8b0
+--- /dev/null
++++ b/apps/desktop/src/store/primary-gateway-recovery.ts
+@@ -0,0 +1,114 @@
++import type { HermesGateway } from '@/hermes'
++import { RECONNECT_ATTEMPT_TIMEOUT_MS } from '@/lib/with-timeout'
++
++/** Only the boot hook redials; requests wait before their first send, never replay. */
++export type PrimaryGatewayRecoverer = () => boolean
++
++interface Owner {
++  gateway: HermesGateway
++  disposed: boolean
++  recover: PrimaryGatewayRecoverer
++  waiters: Set<(error: Error) => void>
++}
++
++let owner: Owner | null = null
++
++function disposeOwner(entry: Owner) {
++  entry.disposed = true
++
++  if (owner === entry) {owner = null}
++
++  for (const fail of [...entry.waiters]) {fail(new Error('Hermes gateway unavailable'))}
++}
++
++export function registerPrimaryGatewayRecovery(gateway: HermesGateway, recover: PrimaryGatewayRecoverer): () => void {
++  if (owner) {disposeOwner(owner)}
++  const entry: Owner = { gateway, disposed: false, recover, waiters: new Set() }
++  owner = entry
++
++  return () => disposeOwner(entry)
++}
++
++const abortError = () => new DOMException('Aborted', 'AbortError')
++
++export interface PrimaryGatewayReady {
++  /** Remaining caller deadline, undefined when none was supplied. */
++  remainingMs: number | undefined
++}
++
++/** Wait on the exact registered primary. Never dial or change the foreground route. */
++export function waitForPrimaryGateway(
++  gateway: HermesGateway,
++  timeoutMs: number | undefined,
++  signal: AbortSignal | undefined
++): Promise<null | PrimaryGatewayReady> {
++  if (signal?.aborted) {return Promise.reject(abortError())}
++
++  if (gateway.connectionState === 'open') {return Promise.resolve({ remainingMs: timeoutMs })}
++  const entry = owner
++
++  if (!entry || entry.disposed || entry.gateway !== gateway) {return Promise.resolve(null)}
++
++  const startedAt = Date.now()
++  const hasDeadline = timeoutMs !== undefined && timeoutMs > 0
++  const budget = hasDeadline ? timeoutMs : RECONNECT_ATTEMPT_TIMEOUT_MS
++
++  return new Promise((resolve, reject) => {
++    let settled = false
++    let offState: (() => void) | undefined
++
++    const finish = (outcome: () => void) => {
++      if (settled) {return}
++      settled = true
++      clearTimeout(timer)
++      offState?.()
++      signal?.removeEventListener('abort', onAbort)
++      entry.waiters.delete(fail)
++      outcome()
++    }
++
++    const fail = (error: Error) => finish(() => reject(error))
++    const onAbort = () => fail(abortError())
++    const timedOut = () => fail(new Error(`Timed out waiting for the Hermes gateway to reconnect (${Math.round(budget / 1000)}s)`))
++
++    const opened = () => {
++      const elapsed = Date.now() - startedAt
++
++      if (elapsed >= budget) {
++        timedOut()
++
++        return
++      }
++
++      finish(() => resolve({ remainingMs: hasDeadline ? timeoutMs - elapsed : timeoutMs }))
++    }
++
++    const timer = setTimeout(timedOut, budget)
++    entry.waiters.add(fail)
++    signal?.addEventListener('abort', onAbort, { once: true })
++    offState = gateway.onState(state => {
++      if (state === 'open') {opened()}
++    })
++
++    // onState immediately reports the current state. Its disposer is not yet
++    // assigned during that callback, so unsubscribe again after assignment.
++    if (settled) {
++      offState()
++
++      return
++    }
++
++    if (signal?.aborted) {
++      onAbort()
++
++      return
++    }
++
++    try {
++      if (!entry.recover()) {finish(() => resolve(null))}
++      else if (gateway.connectionState === 'open') {opened()}
++    } catch (error) {
++      finish(() => reject(error))
++    }
++  })
++}
+diff --git a/apps/desktop/src/test/gateway-boot-harness.tsx b/apps/desktop/src/test/gateway-boot-harness.tsx
+new file mode 100644
+index 00000000000..64036e82776
+--- /dev/null
++++ b/apps/desktop/src/test/gateway-boot-harness.tsx
+@@ -0,0 +1,179 @@
++// Shared harness for the sibling use-gateway-boot-*.test.tsx files: the REAL
++// useGatewayBoot hook + REAL HermesGateway over FakeWebSocket, a fake Electron
++// bridge, and the store resets every case needs. use-gateway-boot.test.tsx is
++// over the file-size ratchet, so new boot scenarios live in siblings that share
++// this instead of copying it.
++import { act, cleanup } from '@testing-library/react'
++import { vi } from 'vitest'
++
++import { takeGatewaySurvivor } from '@/app/gateway/hooks/gateway-hmr-survivor'
++import { useGatewayBoot } from '@/app/gateway/hooks/use-gateway-boot'
++import { $desktopBoot } from '@/store/boot'
++import { _resetConnectionsForTests } from '@/store/connections'
++import { closeSecondaryGateways } from '@/store/gateway'
++import { endGatewaySwitch } from '@/store/gateway-switch'
++import { clearNotifications } from '@/store/notifications'
++import { $activeGatewayProfile, $profiles } from '@/store/profile'
++import { $connection, $gatewayState } from '@/store/session'
++import { $sessionTiles } from '@/store/session-states'
++
++import { FakeWebSocket } from './fake-gateway-socket'
++
++/** App-managed local primary: registry identity `local`, like a real Desktop. */
++export const localPrimaryConn = {
++  authMode: 'token' as const,
++  baseUrl: 'http://127.0.0.1:9119',
++  connectionId: 'local',
++  mode: 'local' as const,
++  profile: 'default',
++  token: 't',
++  wsUrl: 'ws://127.0.0.1:9119/api/ws?token=t'
++}
++
++/** A second, remote registry source the user can foreground. */
++export const remoteConn = {
++  authMode: 'token' as const,
++  baseUrl: 'https://coder.example.com',
++  connectionId: 'coder-remote',
++  mode: 'remote' as const,
++  profile: 'coder',
++  token: 'c',
++  wsUrl: 'wss://coder.example.com/api/ws?token=c'
++}
++
++export const bootHooks = {
++  connectionApplied: null as null | (() => void)
++}
++
++export function fakeBootDesktop(primary: typeof localPrimaryConn = localPrimaryConn) {
++  const unsubscribe = () => () => undefined
++
++  return {
++    getConnection: vi.fn(async (_profile?: null | string): Promise<Record<string, unknown>> => primary),
++    getConnectionFor: vi.fn(async (_route: { connectionId: string; profile: string }) => remoteConn),
++    getGatewayWsUrl: vi.fn(async (conn?: { wsUrl?: string }) => conn?.wsUrl ?? primary.wsUrl),
++    getBootProgress: vi.fn(async () => ({
++      error: null,
++      fakeMode: false,
++      message: '',
++      phase: 'init',
++      progress: 0,
++      retryable: false,
++      running: true,
++      timestamp: Date.now()
++    })),
++    onBootProgress: vi.fn(unsubscribe),
++    onBackendExit: vi.fn(unsubscribe),
++    onConnectionApplied: vi.fn((callback: () => void) => {
++      bootHooks.connectionApplied = callback
++
++      return () => {
++        bootHooks.connectionApplied = null
++      }
++    }),
++    onPowerResume: vi.fn(unsubscribe),
++    revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
++    onWindowStateChanged: vi.fn(unsubscribe),
++    profile: { get: vi.fn(async () => ({ profile: 'default' })) }
++  }
++}
++
++export interface BootHarnessProps {
++  refreshHermesConfig?: () => Promise<void>
++  refreshSessions?: () => Promise<void>
++}
++
++export function BootHarness({ refreshHermesConfig, refreshSessions }: BootHarnessProps) {
++  useGatewayBoot({
++    beforeConnectionSwitch: () => undefined,
++    handleGatewayEvent: () => undefined,
++    handleServerRequest: () => false,
++    onConnectionReady: () => undefined,
++    onGatewayReady: () => undefined,
++    refreshHermesConfig: refreshHermesConfig ?? (async () => undefined),
++    refreshSessions: refreshSessions ?? (async () => undefined)
++  })
++
++  return null
++}
++
++const originalWebSocket = globalThis.WebSocket
++
++function dropSurvivor() {
++  // Vitest keeps import.meta.hot truthy, so an unmount parks an open primary.
++  takeGatewaySurvivor()?.gateway.close()
++}
++
++export function setUpBootHarness(desktop: ReturnType<typeof fakeBootDesktop> = fakeBootDesktop()) {
++  dropSurvivor()
++  closeSecondaryGateways()
++  $activeGatewayProfile.set('default')
++  $connection.set(null)
++  $profiles.set([])
++  $sessionTiles.set([])
++  vi.useFakeTimers()
++  FakeWebSocket.mode = 'open'
++  FakeWebSocket.instances = []
++  FakeWebSocket.pingMode = 'pong'
++  bootHooks.connectionApplied = null
++  clearNotifications()
++  ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
++  $gatewayState.set('idle')
++  $desktopBoot.set({
++    error: null,
++    fakeMode: false,
++    message: '',
++    phase: 'init',
++    progress: 0,
++    running: true,
++    timestamp: Date.now(),
++    visible: true
++  })
++
++  return desktop
++}
++
++export function tearDownBootHarness() {
++  cleanup()
++  dropSurvivor()
++  closeSecondaryGateways()
++  $activeGatewayProfile.set('default')
++  $connection.set(null)
++  _resetConnectionsForTests()
++  endGatewaySwitch()
++  vi.useRealTimers()
++  ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
++  delete (window as { hermesDesktop?: unknown }).hermesDesktop
++}
++
++/** Let pending awaits AND the queued 0 ms socket open/error fire. */
++export async function flushAsync(ms = 0) {
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(ms)
++  })
++}
++
++/** Run the next scheduled reconnect attempt (the backoff caps at 15 s). */
++export const advanceBackoff = () => flushAsync(15_000)
++
++/** Methods each FakeWebSocket was asked to send, keyed by socket URL order. */
++export function sentMethods(socket: FakeWebSocket): string[] {
++  return (socket as unknown as { sent?: string[] }).sent ?? []
++}
++
++/** Record every frame's method per socket (FakeWebSocket keeps no log itself). */
++export function recordSends() {
++  const original = FakeWebSocket.prototype.send
++
++  const spy = vi.spyOn(FakeWebSocket.prototype, 'send').mockImplementation(function (this: FakeWebSocket, data) {
++    const frame = JSON.parse(data) as { method?: string }
++
++    const self = this as unknown as { sent?: string[] }
++
++    ;(self.sent ??= []).push(String(frame.method))
++    original.call(this, data)
++  })
++
++  return () => spy.mockRestore()
++}
+-- 
+2.55.0
+

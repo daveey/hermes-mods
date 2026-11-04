@@ -1,0 +1,112 @@
+From 35832b3fd0aa0b04b524350ce64fa1dd748ae648 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:51:10 +0000
+Subject: [PATCH] [daveey] test: fix two red-main tests (Wednesday compaction
+ boundary; 6/7 claimers counter race) (#817)
+
+* [daveey] test(gateway): derive the compacted turns in the compress/restart FIFO journey
+
+The test named PRESSURE_1 as the turn compaction folds away, but which turn crosses
+the 12k threshold depends on the system prompt's size. On Wednesdays the date line
+('Wednesday, November 04') is two characters longer, compaction fires one turn
+earlier, PRESSURE_1 lands in the protected tail, and both params fail every time
+(main red at 56983357, run 41744090118). Compute the compacted middle from the
+last pre-compaction request minus the child transcript instead; verified green with
+the date line pinned to Mon/Tue/Wed/Fri/Sat.
+
+* [daveey] test(kanban): 6-of-7 simultaneous claimers count running cards from the board
+
+The fake active_card_runs read a counter the test bumped only after claim_task
+returned, i.e. after the winner had released admission.lock. On a loaded runner a
+second claimer took the lock and recounted 6/7 before the bump landed, so two
+claims started (main red at ac3196b7, run 41747221442; 24/24 failures locally under
+CPU load). Count running tasks from the board like the real active_card_runs does:
+0/24 under the same load.
+---
+ .../test_journey_compress_restart_fifo.py      | 12 +++++++++++-
+ tests/hermes_cli/test_kanban_hub_admission.py  | 18 ++++++++----------
+ 2 files changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/tests/gateway/test_journey_compress_restart_fifo.py b/tests/gateway/test_journey_compress_restart_fifo.py
+index 8a36865de19..e8aa2b81e56 100644
+--- a/tests/gateway/test_journey_compress_restart_fifo.py
++++ b/tests/gateway/test_journey_compress_restart_fifo.py
+@@ -140,6 +140,10 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
+             compacting = params
+             children = rows('SELECT id FROM sessions WHERE parent_session_id=?', (sid,))
+             assert len(children) == 1, children
++            summary_at = next(i for i, r in enumerate(peer.requests) if r['model'] == 'summary')
++            last_turn = next(r for r in reversed(peer.requests[:summary_at]) if r['model'] == 'original')
++            before['compaction_input'] = {
++                str(m.get('content', '')) for m in json.loads(last_turn['wire']) if m['role'] != 'system'}
+             receipts = {compacting['input_id']: accepted['admission_id']}
+             for name in FOLLOWERS:
+                 receipts[name] = (await call(ws, 'prompt.submit', session_id=sid, input_id=name, text=name))['admission_id']
+@@ -194,11 +198,17 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
+         order = [r['text'] for r in peer.requests if r['model'] == 'original' and r['text'] in FOLLOWERS]
+         assert order == list(FOLLOWERS), order
+         assert executed(compacting['text'][:12]) == before['compacting_requests'], 'compacted turn replayed'
++        # Which turns compaction folds depends on where the token threshold falls, and that moves with
++        # the system prompt's size (its date line is longer on a Wednesday). Derive the compacted middle
++        # from the parent's pre-compaction request instead of naming a turn.
++        compacted_away = before['compaction_input'] - {c for _, _, c in before['compacted']}
++        assert compacted_away, 'compaction folded no turn into the summary'
+         for name in FOLLOWERS:
+             wire = next(r['wire'] for r in peer.requests if r['text'] == name)
+             # protect_first_n keeps PRESSURE_0 verbatim; the compacted middle is only inside the summary.
+             turns = [str(m.get('content', '')) for m in json.loads(wire)]
+-            assert 'SUMMARY_RETAINED_FACTS' in wire and not any(t.startswith('PRESSURE_1 ') for t in turns), name
++            assert turns[1].startswith('PRESSURE_0 '), name
++            assert 'SUMMARY_RETAINED_FACTS' in wire and not compacted_away & set(turns), name
+         settled = admissions()
+         assert {r['target_session_id'] for r in settled} == {sid}
+         assert [r['request_id'] for r in settled][-3:] == list(FOLLOWERS)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index d87c700c756..355dfca7287 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -1,9 +1,11 @@
+ """Final hub CPU/cap gate: an independent full CPU sample taken UNDER admission.lock, ready and review paths."""
+ import json
+ import os
++import sqlite3
+ import threading
+ import time
+ from concurrent.futures import ThreadPoolExecutor
++from contextlib import closing
+ 
+ import pytest
+ 
+@@ -219,23 +221,19 @@ def test_simultaneous_claimers_at_6_of_7_start_at_most_one(board, monkeypatch):
+     conn, home = board
+     configure(home, cap=7)
+     advisory(home)
+-    count = {"running": 6}
+-    gate_lock = threading.Lock()
+-
++    # Six runs elsewhere plus whatever this board has claimed, read from the DB like the real count:
++    # a counter bumped after claim_task returns lags the lock release, so a busy runner let a second
++    # claimer recount 6/7 before the first winner's bump landed.
+     def active():
+-        with gate_lock:
+-            return count["running"]
++        with closing(sqlite3.connect(f"file:{home / 'kanban.db'}?mode=ro", uri=True, timeout=5)) as db:
++            return 6 + db.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0]
+     monkeypatch.setattr(mm, "active_card_runs", active)
+     monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: time.sleep(0.2)))  # health: allow HX013 -- stands in for the ~1 s sample held under the lock
+     tasks = [task(conn, title=f"t{i}") for i in range(4)]
+ 
+     def go(t):
+         with kbc.connect(home / "kanban.db") as other:
+-            got = kb.claim_task(other, t)
+-        if got is not None:
+-            with gate_lock:
+-                count["running"] += 1
+-        return got
++            return kb.claim_task(other, t)
+     for _ in range(3):  # contended rounds: losers defer (lock busy) or are refused at 7/7
+         with ThreadPoolExecutor(max_workers=4) as pool:
+             list(pool.map(go, tasks))
+-- 
+2.55.0
+

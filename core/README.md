@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1821 patches, one entry per non-merge source commit through `2050733bc6571383fe954bea422f8da0f8cdd67d`.
+1918 patches, one entry per non-merge source commit through `b9eaa8e842f5bc0c0e513e255f28a2df0850968c`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -22,12 +22,54 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `f0d94882e89ab8d4098b5bb2f166adfb9ee0a0ab`; current merge-base: `e8639fd4312e5102d6f10c76b56406cb01c19092` (the tested upstream sync reached the fork in `622f8967b06`).
-Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523, 1549 and 1627 (1703–1821 need no new bridge: no upstream merge reached the fork between the 1702 and 1821 tips). Entries 1626, 1649 and 1656 are applied and tree-verified in their own source-parent contexts, then represented by explicit ancestry-only merge markers in the main replay. Their full patch bodies remain intact. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-Current replay: [mirror-replay-1821.json](mirror-replay-1821.json) (seven hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-1821.json](mirror-policy-1821.json). Executed checks: [mirror-1821-verification.md](mirror-1821-verification.md); previous snapshots: [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
+Upstream exclusion tip: `fd267bb3242a14c33d4899cffc60ee4be816f14d`; current merge-base: the same commit (the fork merged upstream `717447e`, `fbf6c6c`, `c314285` and `fd267bb` in `02df0dd38e8`, `95e40c5b81b`, `fe003ae5188` and `27576ed88c6`).
+Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523, 1549, 1627, 1822, 1823 and 1893, and four reviewed source-context bridges before 1824, 1828, 1866 and 1896 (a feature branch's pre-merge file version and two hand-resolved merge results; see [mirror-1918-verification.md](mirror-1918-verification.md)). Entries 1626, 1649 and 1656 are applied and tree-verified in their own source-parent contexts, then represented by explicit ancestry-only merge markers in the main replay. Their full patch bodies remain intact. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
+Current replay: [mirror-replay-1918.json](mirror-replay-1918.json) (fourteen hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-1918.json](mirror-policy-1918.json). Executed checks: [mirror-1918-verification.md](mirror-1918-verification.md); previous snapshots: [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1822–1918
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Gateway adapter lifecycle kept under its health cap after the 717447e upstream merge](gateway-adapter-health-budget.md) | 1822, 1823 | Adapter lifecycle/status methods move into `run_adapter_status.py` so the merged gateway adapter module stays under its health cap (1822/1823). |
+| [TUI gateway: prompt turns start without history_lock under _sessions_lock](tui-prompt-turn-lock-order.md) | 1824–1828 | Prompt turns prepare admission before `_sessions_lock`, fixing a resume/submit deadlock; cancelled and raising prepared turns give their admission back (1824–1826); test seams (1827/1828). |
+| [Embedded Kanban dispatcher re-reads max_in_progress every tick](kanban-dispatcher-live-cap.md) | 1829, 1833 | The embedded dispatcher picks up `kanban.max_in_progress` changes live (1829); a bad read keeps the last good cap, not the boot cap (1833). |
+| [Kanban sync: pre-rename boards, request budgets and a visible stopped sync loop](kanban-sync-schema-and-down-visibility.md) | 1830, 1834, 1847, 1869 | Pre-rename boards sync (1830); per-request retry/redirect budgets (1834); a stopped sync loop is named in warnings, status and create, with sync-down regression tests (1847/1869). |
+| [Desktop sends to a busy chat: gateway turns wait for the lease; unqueued sends return to the composer](desktop-busy-turn-lease-wait.md) | 1831, 1832, 1839 | Gateway-hosted Desktop turns wait for a held turn lease instead of refusing (1831/1832); an unqueued busy send goes back to the composer (1839). |
+| [PR acceptance: app-pinned contexts accept legacy statuses](kanban-pr-merge-time-acceptance.md) | 1835 | A required context pinned to an app accepts that app's own bot commit status (1835). |
+| [Skill index rows show triggers: frontmatter](skill-index-triggers.md) | 1836–1838 | `triggers:` frontmatter renders on skill index rows (`skills.index_triggers`, default on) (1836); skill_manage and learn-prompt description guidance (1837/1838). |
+| [Outcome: an unviewed completion note is not an interrupted turn](outcome-unviewed-completion-note.md) | 1840 | A completion note written with no viewer no longer leaves the chat red as interrupted. |
+| [Worker-first placement: wider enrollment, host-bound guards](kanban-worker-first-placement.md) | 1841–1843 | Ordinary repo and MacBook-placed cards enroll worker-first (1841); host skills, local worktrees and hub runs stay on their host (1842/1843). |
+| [Desktop: SSH keep-alive bounded to the warm set](desktop-ssh-keepalive-warm-set.md) | 1844–1846 | SSH keep-alives are held only for the warm set, so one-off dials stop pinning remote backends (1844–1846). |
+| [Kanban: hub CPU/cap final gate for worker-first claims](kanban-hub-cpu-cap-gate.md) | 1848–1860, 1896, 1899 | Measured CPU sampler, hub reporter and a final CPU/cap gate under `admission.lock` for hub claims; waiting turns outlast the sample; unused Board grants released (1848–1860, 1896, 1899). |
+| [Kanban: trusted capsule admission for host_repo worktree cards on isolated backends](kanban-capsule-admission.md) | 1861–1866 | Isolated-backend builders can take host_repo worktree cards through a host-owned capsule registration with owner gates and a truthful /workspace contract (1861–1866). |
+| [Red-CI owner: FAILED lists keep the same-run rule](kanban-red-ci-failure-owner.md) | 1867 | Same-run red-CI duplicates are refused even when the owner carries a FAILED test list (1867). |
+| [Test stability 1822–1918](test-stability-1822-1918.md) | 1868, 1870–1872, 1882, 1883, 1892, 1905, 1906, 1911, 1914 | Collection in minimal venvs, required-extras lane guard, pytest 9.2 Starlette monkeypatch, and several deflakes (1868, 1870–1872, 1882/1883, 1892, 1905, 1906, 1911, 1914). |
+| [Dependency handoff: same-second parks and PR-naming parents](kanban-dependency-review-continuation.md) | 1873, 1880 | Same-second dependency parks resume (1873); a parent naming the child's PR stays an ordering handoff (1880). |
+| [Desktop: bounded primary reconnect refresh, healed owner-pinned requests](desktop-primary-reconnect-heal.md) | 1874, 1875 | Primary reconnect refresh is bounded and owner-pinned requests on a closed primary heal (1874/1875). |
+| [CI: state contract dispatch and advisory-job timeouts](ci-workflow-timeouts-1822-1918.md) | 1876, 1878, 1895, 1898 | State core-contract suites dispatched on relevant core pushes (1876/1878); advisory and sync-PR jobs no longer cancel at timeouts (1895/1898). |
+| [create_overlap: re-checked in the insert transaction](kanban-create-overlap.md) | 1877 | The overlap check runs again inside the insert transaction, closing the concurrent-create race (1877). |
+| [terminal.credential_files honors the master-store read deny-list](credential-files-read-denylist.md) | 1879 | Config-listed credential files are refused when on the read deny-list (fail-closed). |
+| [Kanban: a fenced connect of a missing board DB names the fence](kanban-fenced-connect-message.md) | 1881 | A fenced read-only open of a missing board DB names the fence. |
+| [GET /api/sessions: single-flight and data-stamp cache](sessions-list-single-flight.md) | 1884 | Session list requests are single-flighted and cached on a data stamp. |
+| [hermes update: restart obligations settle for unmapped stops and external-checkout runtimes](update-restart-obligation-settle.md) | 1885 | Stale "update did not restart gateways" warnings settle for unmapped stops and external checkouts. |
+| [Worker-first repins and repin notices](kanban-queue-reasons-repin.md) | 1886, 1887, 1894, 1897, 1913 | Worker kanban_move becomes a Board repin (1886/1887); lost reserves count as pickups (1894); one repin notice per revision for unrunnable cards (1897/1913). |
+| [⌘B park from SSH-isolated backends](sessions-mute-live-owner.md) | 1888 | ⌘B park from a remote SSH-isolated backend forwards to the live gateway owner (1888). |
+| [Desktop: @session refs and tiles paint from the transcript cache](desktop-session-ref-transcript-cache.md) | 1889–1891, 1893 | Ref clicks and tiles paint from a warmed transcript cache while REST loads (1889–1891); sidebar hook split (1893). |
+| [Kanban: worker-created cards readable from the board replica](kanban-foreign-card-replica.md) | 1900 | Worker-created cards are readable from the replica; their writes are refused as foreign_card (1900). |
+| [Respawn guard: supported reopen reaches dispatch](kanban-respawn-guard-hold.md) | 1901, 1902 | A deliberate reopen after success lifts recent_success/active_pr until the rerun completes or posts a PR comment (1901/1902). |
+| [Credential pool: probe-restored Codex quota persists across reloads](credential-pool-probe-restore-persist.md) | 1903 | A probe-restored Codex account stays restored across reloads and processes. |
+| [persist_on_release jobs survive gateway restarts and run-scope stops](process-persist-on-release-survival.md) | 1904 | persist_on_release jobs outlive gateway restarts and Kanban run-scope stops (1904). |
+| [Cron: a quota hold is released once its refusing pool serves again](cron-quota-hold-early-release.md) | 1907–1909 | Quota-held cron jobs resume once their pool serves again (1907–1909). |
+| [Runtime: skipped worker receipt sequences named on both sides](runtime-worker-receipt-sequence.md) | 1910 | Worker persistence sequence gaps are reported with both sequence numbers. |
+| [API server: a stream disconnect during worker teardown keeps the reply](api-server-stream-disconnect-reply.md) | 1912 | Late stream disconnects no longer discard a finished reply. |
+| [Kanban comments record writer_kind](kanban-comment-writer-kind.md) | 1915 | Comments carry writer_kind so agent notes are not presented as the operator's. |
+| [Model routing: a router-picked pin reroutes in-class on a far quota wall](model-routing-router-pin-reroute.md) | 1916 | Router-chosen pins reroute in-class on a far quota wall; user pins are unchanged. |
+| [Redaction masks Google AI Studio AQ. keys](redact-google-aq-keys.md) | 1917 | AQ.-style Gemini keys are redacted. |
+| [bot_desktop start() waits for the published DISPLAY](bot-desktop-display-wait.md) | 1918 | start() waits for the DISPLAY value, fixing a start/status race. |
+| [1918-entry mirror verification](mirror-1918-verification.md) | verification report | Exact inventory, fourteen-bridge replay (seven new: two upstream merges plus a combined third, two branch-context and two merge-resolution bridges), three source-checked ancestry-only entries, normalized full tree and five fingerprint re-pins. |
 
 ## Mirror follow-ups 1703–1821
 
@@ -1017,16 +1059,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1821-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply seven bridges and three ancestry-only markers from `mirror-replay-1821.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **1918-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fourteen bridges and three ancestry-only markers from `mirror-replay-1918.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 2050733bc6571383fe954bea422f8da0f8cdd67d \
-  --base f0d94882e89ab8d4098b5bb2f166adfb9ee0a0ab \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-1821.json" \
-  --replay-plan "$MODS/core/mirror-replay-1821.json"
+  --source-tip b9eaa8e842f5bc0c0e513e255f28a2df0850968c \
+  --base fd267bb3242a14c33d4899cffc60ee4be816f14d \
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-1918.json" \
+  --replay-plan "$MODS/core/mirror-replay-1918.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1057,6 +1099,27 @@ git commit --allow-empty -m 'Ancestry-only source merge ccbe7c69d0b retains patc
 git am -3 --empty=keep "${patches[@]:1649:6}"
 git commit --allow-empty -m 'Ancestry-only source merge ccbe7c69d0b retains patch 1656'
 git am -3 --empty=keep "${patches[@]:1656:165}"
+git apply --index --3way "$MODS/core/bridges/upstream-717447e-via-02df0dd38e8.diff"
+git commit --allow-empty -m 'Explicit upstream merge bridge before 1822'
+git am -3 --empty=keep "${patches[@]:1821:1}"
+git apply --index --3way "$MODS/core/bridges/upstream-fbf6c6c-via-95e40c5b81b.diff"
+git commit --allow-empty -m 'Explicit upstream merge bridge before 1823'
+git am -3 --empty=keep "${patches[@]:1822:1}"
+git apply --index --3way "$MODS/core/bridges/context-1824-prompt-turn-branch-side.diff"
+git commit --allow-empty -m 'Source-context bridge before 1824'
+git am -3 --empty=keep "${patches[@]:1823:4}"
+git apply --index --3way "$MODS/core/bridges/resolution-1bf6faea509.diff"
+git commit --allow-empty -m 'Merge-resolution bridge before 1828'
+git am -3 --empty=keep "${patches[@]:1827:38}"
+git apply --index --3way "$MODS/core/bridges/context-1866-kanban-db-before-cpu-gate.diff"
+git commit --allow-empty -m 'Source-context bridge before 1866'
+git am -3 --empty=keep "${patches[@]:1865:27}"
+git apply --index --3way "$MODS/core/bridges/upstream-through-27576ed88c6.diff"
+git commit --allow-empty -m 'Explicit upstream merge bridge before 1893'
+git am -3 --empty=keep "${patches[@]:1892:3}"
+git apply --index --3way "$MODS/core/bridges/resolution-04bc5b36944.diff"
+git commit --allow-empty -m 'Merge-resolution bridge before 1896'
+git am -3 --empty=keep "${patches[@]:1895:23}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

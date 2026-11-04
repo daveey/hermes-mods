@@ -1,0 +1,119 @@
+From dfacd322538f30b8d01b7c79b2d51a85db0dd5aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:08:56 +0000
+Subject: [PATCH] fix(kanban): a Board grant the core never used is released
+ with unused_grant: true so the Board keeps the card first-start (review F2
+ wire contract) [daveey]
+
+---
+ hermes_cli/kanban_db_sync.py                  |  8 +++--
+ hermes_cli/kanban_sync_client.py              |  7 +++--
+ .../test_kanban_hub_admission_scopes.py       | 29 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_sync_client.py   | 16 ++++++++++
+ 4 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 0f2378c22ea..2ca2a7bc896 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -702,7 +702,8 @@ class LeaseClient(Protocol):
+ 
+     def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> Lease: ...
+ 
+-    def release(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str) -> None: ...
++    def release(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str,
++                unused_grant: bool = False) -> None: ...
+ 
+ 
+ _LEASE_CLIENT: Optional[LeaseClient] = None
+@@ -749,8 +750,9 @@ class ClaimGate:
+         if self.lease is None or self.consumed:
+             return
+         board_id, gateway_id, task_id = self._ids
+-        try:
+-            _client().release(board_id=board_id, task_uid=task_id, run_uid=self.lease.run_uid, gateway_id=gateway_id)
++        try:  # never consumed = nothing started locally: the Board keeps the card first-start (review F2)
++            _client().release(board_id=board_id, task_uid=task_id, run_uid=self.lease.run_uid, gateway_id=gateway_id,
++                              unused_grant=True)
+         except _CLIENT_ERRORS as err:  # the lease then simply expires on the server
+             _log.info("kanban sync: release of unused lease for %s failed: %s", task_id, err)
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 78e6ef26fae..2a5f439a8b6 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1960,5 +1960,8 @@ class HubLeaseClient:
+     def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> sync.Lease:
+         return self._lease(board_id, {"action": "renew", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s}, run_uid)
+ 
+-    def release(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str) -> None:
+-        self._lease(board_id, {"action": "release", "task": task_uid, "run_uid": run_uid}, run_uid)
++    def release(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str,
++                unused_grant: bool = False) -> None:
++        # ``unused_grant``: released before anything started locally (the Board does not count it as a start).
++        self._lease(board_id, {"action": "release", "task": task_uid, "run_uid": run_uid,
++                               **({"unused_grant": True} if unused_grant else {})}, run_uid)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_scopes.py b/tests/hermes_cli/test_kanban_hub_admission_scopes.py
+index faa7ab64de7..68400aed6a2 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_scopes.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_scopes.py
+@@ -241,3 +241,32 @@ def test_unsynced_local_board_does_not_blind_the_host_cap(tmp_path, monkeypatch)
+         assert sync.pop_claim_deferral(t) == "hub_capacity_full"
+     finally:
+         inst.close()
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("reason,pct,cap", [("hub_cpu_at_or_above_limit", 80.0, 7), ("hub_capacity_full", 10.0, 0)])
++def test_grant_refused_by_the_final_gate_is_released_as_unused(install, lane, reason, pct, cap, monkeypatch):
++    """Review F2 (wire contract with the Board, ``unused_grant: true``): a grant the core gate refused never started
++    locally, so its release says so and the Board keeps the card first-start (overflow is evaluated again)."""
++    conn = install.connect("default", "primary")
++    install.advisory(10.0)
++    install.final_sample(pct)
++    if cap == 0:
++        monkeypatch.setattr(mm, "active_card_runs", lambda: 7)
++    t = card(conn, "policy", lane)
++    assert claim(conn, t, lane) is None
++    assert sync.pop_claim_deferral(t) == reason
++    (acquired,) = [kw for kind, kw in install.client.calls if kind == "acquire"]
++    (released,) = [kw for kind, kw in install.client.calls if kind == "release"]
++    assert released["run_uid"] == acquired["run_uid"] and released["unused_grant"] is True
++
++
++def test_reclaim_of_a_started_run_is_not_released_as_unused(install):
++    conn = install.connect("default", "primary")
++    install.advisory(10.0)
++    install.final_sample(10.0)
++    t = card(conn, "policy", "ready")
++    assert claim(conn, t, "ready") is not None
++    assert kb.reclaim_task(conn, t, reason="operator")
++    releases = [kw for kind, kw in install.client.calls if kind == "release"]
++    assert releases and all(not kw.get("unused_grant") for kw in releases)
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 9d9215fac26..70e4913c156 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -967,3 +967,19 @@ def test_board_discovery_reads_the_sync_config_once(kanban_home, monkeypatch):
+     assert len(reads) == 1
+     monkeypatch.setattr(sync, "sync_config", lambda: {**real(), "boards": ["beta"]})
+     assert [s for s, _ in ksc.board_paths()] == ["beta"]
++
++
++def test_hub_lease_client_release_marks_an_unused_grant_only_when_asked(svc, monkeypatch):
++    """Wire contract with the Board (review F2): ``unused_grant: true`` only for a grant released before any local
++    start; an ordinary release sends no new field (old Boards ignore unknown lease fields either way)."""
++    svc.board(BOARD)
++    client = ksc.HubLeaseClient(svc.hub(ME))
++    bodies = []
++    real = client.hub.leases
++    monkeypatch.setattr(client.hub, "leases", lambda board, body: bodies.append(body) or real(board, body))
++    for run, unused in (("run-me-0002", True), ("run-me-0003", False)):
++        assert client.acquire(board_id=BOARD, task_uid="t_u", run_uid=run, gateway_id=ME, ttl_s=60).granted
++        client.release(board_id=BOARD, task_uid="t_u", run_uid=run, gateway_id=ME, unused_grant=unused)
++        assert "t_u" not in svc.board(BOARD)["leases"]
++    releases = [b for b in bodies if b["action"] == "release"]
++    assert releases[0]["unused_grant"] is True and "unused_grant" not in releases[1]
+-- 
+2.55.0
+

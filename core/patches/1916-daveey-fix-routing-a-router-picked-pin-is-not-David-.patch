@@ -1,0 +1,835 @@
+From 16b0f02c53cca77717084165e8750cf1dfc3a026 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 03:32:03 +0000
+Subject: [PATCH] [daveey] fix(routing): a router-picked pin is not David's
+ pin; a far quota wall reroutes it in-class
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: MacBook Desktop chat 20261026_000514_23ef49 went dead for ~33 h from 11-02 13:59 PT. Every
+turn failed before it started with "Subscription quota unavailable for openai-codex/gpt-6-astra;
+resets at 1793774268" while claude-opus-5-5 in the same `deep` class was available.
+
+Why 1: the turn's pre-build lookup raised the wall (run_turn_runner → runtime_provider →
+       model_routing_runtime.resolve_class_runtime).
+Why 2: a concrete model resolves through pin_policy, which keeps one route, so Opus was never tried.
+Why 3: the router picked Astra; the gateway's concrete echo of that pick made RoutingState._allocate
+       upgrade the allocation to exact_pin, and exact pins refuse failover.
+Why 4: routes did not record where a pin came from: a router pick, the config default and a model
+       David named all stored exact_pin (MacBook: 9017 deep allocation+exact rows vs 2 switches;
+       hub: 4622 vs 13).
+Root (happened): pin provenance was not recorded, so router picks were treated as David's choices.
+Root (not caught): no test covered "an allocation echoed as a concrete model, then walled", and the
+       refusal named an epoch timestamp, so nothing told David the chat was parked or how to leave.
+
+Fix:
+- model_routing_state: every new route records `pin_source` (`explicit` = honoured switch or a model
+  David named; `default` = router pick, config default). An echo never upgrades an allocation to
+  exact. Legacy rows count as explicit only when they record `explicit-switch`.
+- model_routing_walls (new) + resolve_managed_runtime: a `default` pin whose subscription wall resets
+  6 h or more away is re-selected in its class (`same-class-failover`, `walled_from` recorded), and
+  the session then follows its reroute even though its stored model still names the walled one.
+  Explicit pins, Kanban card pins (t_01a19990897b9d9b owns those) and walls under 6 h still hold.
+- gateway: the pre-build lookup knows the turn's session (`routing_session`) and defers a reroutable
+  wall to the agent build instead of refusing; the chat gets one line ("<model> quota is out until
+  <PT>; continuing on <model>."). A held pin's reply names the PT reset and /model.
+- Detection: WARNING `routing: walled default pin rerouted <from>→<to> until <reset>`, once per
+  episode.
+
+Tests: tests/agent/test_walled_default_pin.py (red on 9825be18561: 6 failed, 4 controls passed);
+test_model_routing_state_contention's upgrade assertion now asserts the echo stays non-exact.
+
+Undo: revert this commit; older code ignores `pin_source`/`walled_from`, no migration.
+Self-heal defect agent-13b91b3e1b, card t_01a1a10a107f7f2c.
+---
+ agent/model_routing.py                        |   6 +-
+ agent/model_routing_managed.py                |  38 ++-
+ agent/model_routing_runtime.py                |  29 +-
+ agent/model_routing_state.py                  |  46 +++-
+ agent/model_routing_walls.py                  | 159 +++++++++++
+ gateway/run_turn_prepare.py                   |   2 +
+ gateway/run_turn_runner.py                    |  16 +-
+ gateway/session_worker_construct.py           |  16 +-
+ .../test_model_routing_state_contention.py    |  12 +-
+ tests/agent/test_walled_default_pin.py        | 258 ++++++++++++++++++
+ 10 files changed, 549 insertions(+), 33 deletions(-)
+ create mode 100644 agent/model_routing_walls.py
+ create mode 100644 tests/agent/test_walled_default_pin.py
+
+diff --git a/agent/model_routing.py b/agent/model_routing.py
+index 71bbcac8b53..f5fdbd8edb5 100644
+--- a/agent/model_routing.py
++++ b/agent/model_routing.py
+@@ -105,7 +105,8 @@ def eligible_routes(policy, level, requirements=None, excluded=(), eligible=None
+ 
+ def resolve_model_route(model, provider="auto", *, config=None, session_id=None,
+                         parent_session_id=None, requirements=None, excluded=(), state_path=None,
+-                        eligible=None, prepare=None, exact_pin=False, replace: bool | str = False):
++                        eligible=None, prepare=None, exact_pin=False, replace: bool | str = False,
++                        pin_source=None, walled_from=None):
+     """Return concrete model/provider and durable metadata, or unchanged exact pin.
+ 
+     ``excluded`` is a sequence of failed (provider, model) pairs for a new attempt,
+@@ -141,5 +142,6 @@ def resolve_model_route(model, provider="auto", *, config=None, session_id=None,
+         state_path = get_hermes_home() / "model-routing.sqlite3"
+     metadata = RoutingState(state_path).allocate(session_id, parent_session_id, level,
+                                                 routes, policy.get("policy_version", 1), excluded, prepare,
+-                                                exact_pin=exact_pin, replace=replace)
++                                                exact_pin=exact_pin, replace=replace,
++                                                pin_source=pin_source, walled_from=walled_from)
+     return {"model": metadata["selected_model"], "provider": metadata["selected_provider"], "metadata": metadata}
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+index 543f680ef2a..f7bafb46c2d 100644
+--- a/agent/model_routing_managed.py
++++ b/agent/model_routing_managed.py
+@@ -86,13 +86,41 @@ def pin_policy(model, provider, config):
+ 
+ def resolve_managed_runtime(model, provider, *, config, session_id=None, requirements=None,
+                             prepare_runtime=None, replace: bool | str = False):
+-    from agent.model_routing_runtime import resolve_class_runtime
++    from agent import model_routing_walls as walls
++    from agent.model_routing_runtime import is_temporary_resolution, resolve_class_runtime
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
+     from hermes_state_ids import new_session_id
+     level, restricted = pin_policy(model, provider, config)
+-    runtime = resolve_class_runtime("class:" + level, "auto", config=restricted,
+-                                    session_id=session_id or new_session_id(), requirements=requirements,
+-                                    exact_pin=True, replace=replace, prepare_runtime=prepare_runtime)
+-    return runtime
++    durable = bool(session_id) and not is_temporary_resolution()
++    session_id = session_id or new_session_id()
++    source = walls.request_pin_source(model, provider, config, replace)
++    if durable and not replace:
++        # [daveey] A rerouted default pin stays on its reroute: the session's stored model still
++        # names the walled one, and resolving that again must not move the chat back mid-episode.
++        followed = walls.follows_reroute(walls.peek_route(session_id, level), model)
++        if followed is not None:
++            try:
++                level, restricted = pin_policy(followed[1], followed[0], config)
++            except ModelRoutingError:
++                pass  # the reroute left the registry: resolve the session's own pin
++    try:
++        return resolve_class_runtime("class:" + level, "auto", config=restricted, session_id=session_id,
++                                     requirements=requirements, exact_pin=True, replace=replace,
++                                     prepare_runtime=prepare_runtime, pin_source=source)
++    except SubscriptionQuotaUnavailable as wall:
++        # The pre-build lookup (temporary) never reroutes: its caller defers to the agent build.
++        if not durable or replace or not walls.may_reroute(wall, walls.peek_route(session_id, level), source):
++            raise
++        walled_from = {"provider": wall.provider, "model": wall.model, "resets_at": wall.resets_at}
++        try:
++            runtime = resolve_class_runtime("class:" + level, "auto", config=walls.class_config(config, level),
++                                            session_id=session_id, requirements=requirements,
++                                            excluded=[(wall.provider, wall.model)], walled_from=walled_from,
++                                            prepare_runtime=prepare_runtime, pin_source="default")
++        except ModelRoutingError:
++            raise wall from None  # nothing else in the class can serve: the wall is the answer
++        walls.log_reroute(wall, runtime["model_routing"])
++        return runtime
+ 
+ 
+ def verify_selected_route(model, provider, metadata, config):
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index e5fcebe028b..6b9890b1d15 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -6,6 +6,29 @@ from contextlib import contextmanager
+ from contextvars import ContextVar
+ 
+ _temporary_resolution = ContextVar("temporary_model_resolution", default=False)
++_routing_session = ContextVar("model_routing_session", default=None)
++
++
++@contextmanager
++def routing_session(session_id):
++    """[daveey] Name the session a pre-build lookup (``temporary_resolution``) resolves for.
++
++    The pre-build lookup allocates nothing, but it must read that session's standing route: a
++    router-picked pin walled for hours is rerouted by the agent build, so the lookup defers to it
++    instead of refusing the turn (``gateway.session_worker_construct._route_runtime``)."""
++    token = _routing_session.set(session_id or None)
++    try:
++        yield
++    finally:
++        _routing_session.reset(token)
++
++
++def current_routing_session():
++    return _routing_session.get()
++
++
++def is_temporary_resolution():
++    return _temporary_resolution.get()
+ 
+ 
+ @contextmanager
+@@ -20,7 +43,8 @@ def temporary_resolution():
+ 
+ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+                           parent_session_id=None, requirements=None, excluded=(), state_path=None,
+-                          prepare_runtime=None, exact_pin=False, replace: bool | str = False):
++                          prepare_runtime=None, exact_pin=False, replace: bool | str = False,
++                          pin_source=None, walled_from=None):
+     from agent.credential_pool import load_pool
+     from hermes_cli import runtime_provider as runtime
+ 
+@@ -83,7 +107,8 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+             resolve_model_route(model, provider, config=config, session_id=session_id,
+                                 parent_session_id=parent_session_id, requirements=requirements,
+                                 excluded=failed, eligible=eligible, state_path=state_path, prepare=prepare,
+-                                exact_pin=exact_pin, replace=replace)
++                                exact_pin=exact_pin, replace=replace, pin_source=pin_source,
++                                walled_from=walled_from)
+             return resolved
+         except UnavailableCredential:
+             continue
+diff --git a/agent/model_routing_state.py b/agent/model_routing_state.py
+index 239f60d55f2..7728b123db6 100644
+--- a/agent/model_routing_state.py
++++ b/agent/model_routing_state.py
+@@ -64,7 +64,7 @@ class RoutingState:
+                    "PRIMARY KEY(root, class))")
+ 
+     def allocate(self, session_id, parent_session_id, level, candidates, version, excluded, prepare=None,
+-                 exact_pin=False, replace: bool | str = False):
++                 exact_pin=False, replace: bool | str = False, pin_source=None, walled_from=None):
+         """Allocate and persist atomically; aliases share one failover decision.
+ 
+         ``replace`` is ``True`` (unconditional, an in-session switch) or a committed switch-intent fence
+@@ -80,8 +80,8 @@ class RoutingState:
+         failover, pin, replacement) still runs ``prepare`` before COMMIT, so a failed credential/client
+         never becomes visible.
+         """
+-        if not replace:
+-            previous = self._sticky(session_id, level, candidates, excluded, exact_pin)
++        if not replace and walled_from is None:
++            previous = self._sticky(session_id, level, candidates, excluded)
+             if previous is not None:
+                 if prepare is not None:
+                     prepare(previous)
+@@ -92,7 +92,7 @@ class RoutingState:
+             started = time.monotonic()
+             try:
+                 result = self._allocate(db, session_id, parent_session_id, level, candidates, version, excluded,
+-                                        exact_pin, replace)
++                                        exact_pin, replace, pin_source=pin_source, walled_from=walled_from)
+                 # Credentials/client must be usable before another process can
+                 # observe the replacement. Failure rolls back counters as well.
+                 if prepare is not None:
+@@ -106,7 +106,7 @@ class RoutingState:
+                 logger.warning("model routing allocation held the routing writer lock %.1fs (class %s)", held, level)
+             return result
+ 
+-    def _sticky(self, session, level, candidates, excluded, exact_pin):
++    def _sticky(self, session, level, candidates, excluded):
+         """The existing allocation when reusing it needs no write, else None (take the write path)."""
+         if not self.path.exists():
+             return None
+@@ -124,8 +124,6 @@ class RoutingState:
+         previous = json.loads(row[0])
+         if not _reusable(previous, candidates, excluded):
+             return None
+-        if exact_pin and not previous.get("exact_pin"):
+-            return None  # upgrading to an exact pin is a write
+         return previous
+ 
+     def peek(self, session, level):
+@@ -164,7 +162,7 @@ class RoutingState:
+                 raise
+ 
+     def _allocate(self, db, session, parent, level, candidates, version, excluded, exact_pin=False,
+-                  replace: bool | str = False):
++                  replace: bool | str = False, pin_source=None, walled_from=None):
+         from agent.model_routing import ModelRoutingError
+ 
+         root = self._root(db, session, parent)
+@@ -180,16 +178,20 @@ class RoutingState:
+         row = db.execute("SELECT metadata FROM routes WHERE root=? AND class=?", (root, level)).fetchone()
+         if row and not replace:
+             previous = json.loads(row[0])
+-            if _reusable(previous, candidates, excluded):
+-                if exact_pin and not previous.get("exact_pin"):
+-                    previous["exact_pin"] = True
+-                    db.execute("UPDATE routes SET metadata=? WHERE root=? AND class=?",
+-                               (json.dumps(previous), root, level))
++            if walled_from is not None:
++                # [daveey] A quota-walled router/default pin moves within its class; David's own
++                # pin never does (``is_explicit_pin``).
++                if is_explicit_pin(previous):
++                    raise ModelRoutingError("Exact pinned route cannot fail over")
++            elif _reusable(previous, candidates, excluded):
++                # [daveey] An echo of this session's own selection (the gateway resolving the concrete
++                # model the router picked) is not David naming it: it never upgrades the allocation to
++                # an exact pin, so a quota wall can still move it within its class.
+                 return previous
+             # A sticky class selection is a preference, not an exact-model pin.
+             # Re-select only from the current class's filtered candidates; prepare
+             # still runs before commit, so failed credentials cannot publish it.
+-            if previous.get("exact_pin") or exact_pin:
++            elif previous.get("exact_pin") or exact_pin:
+                 raise ModelRoutingError("Exact pinned route cannot fail over")
+         if not candidates:
+             raise ModelRoutingError(f"No eligible {level} routes under billing/capability policy")
+@@ -199,8 +201,12 @@ class RoutingState:
+                     "billing_group": route["billing"], "reason": "same-class-failover" if row else "allocation"}
+         if exact_pin:
+             metadata["exact_pin"] = True
++        metadata["pin_source"] = "explicit" if replace or (exact_pin and pin_source == "explicit") else "default"
+         if replace:
+             metadata["reason"] = "explicit-switch"
++        if walled_from is not None:
++            metadata.pop("exact_pin", None)
++            metadata.update(reason="same-class-failover", walled_from=dict(walled_from))
+         db.execute("INSERT OR REPLACE INTO routes VALUES (?, ?, ?)", (root, level, json.dumps(metadata)))
+         if replace and fence is not None:
+             db.execute("INSERT OR REPLACE INTO switch_fences VALUES (?, ?, ?)", (root, level, fence))
+@@ -241,6 +247,18 @@ class RoutingState:
+         return sorted(groups[provider], key=lambda r: r["model"])[0]
+ 
+ 
++def is_explicit_pin(metadata):
++    """True for a route David chose (an honoured switch, a model he named); a router pick, the config
++    default or an echo of either is ``default``. Rows written before ``pin_source`` count as explicit
++    only when they record an honoured switch: their ``exact_pin`` was also set by echoes. [daveey]"""
++    if not metadata:
++        return False
++    source = metadata.get("pin_source")
++    if source in ("explicit", "default"):
++        return source == "explicit"
++    return metadata.get("reason") == "explicit-switch"
++
++
+ def _reusable(previous, candidates, excluded):
+     """One sticky-reuse rule for the snapshot read and the write transaction."""
+     identity = previous["selected_provider"], previous["selected_model"]
+diff --git a/agent/model_routing_walls.py b/agent/model_routing_walls.py
+new file mode 100644
+index 00000000000..4df0329dcda
+--- /dev/null
++++ b/agent/model_routing_walls.py
+@@ -0,0 +1,159 @@
++"""A router-chosen pin is not David's pin: a far quota wall moves it within its class. [daveey]
++
++MacBook Desktop chat 20261026_000514_23ef49 (11-02): the router allocated openai-codex/gpt-6-astra for
++the chat's ``deep`` class, the gateway's concrete echo of it was stored as an exact pin, and a 33 h
++Codex wall then refused every turn although claude-opus-5-5 in the same class was free.
++
++Policy (one place, read by the managed resolver and the gateway's pre-build lookup):
++- ``explicit`` pins (an honoured switch, a model David named, a Kanban card's pin) never move;
++- a ``default`` pin (router pick, config default, an echo of either) whose subscription wall resets
++  ``WALL_REROUTE_MIN_SECONDS`` or more away is re-selected in its class (``same-class-failover`` with
++  ``walled_from``); a shorter wall still holds, since waiting beats a provider switch;
++- once rerouted, the session follows the reroute even while its stored model still names the walled one.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import time
++
++logger = logging.getLogger(__name__)
++
++WALL_REROUTE_MIN_SECONDS = 6 * 3600
++
++
++def _state_path():
++    from hermes_constants import get_hermes_home
++    return get_hermes_home() / "model-routing.sqlite3"
++
++
++def peek_route(session_id, level):
++    """The session's standing route in the real store (read-only; never the pre-build ``:memory:``)."""
++    if not session_id:
++        return None
++    from agent.model_routing_state import RoutingState
++    try:
++        return RoutingState(_state_path()).peek(session_id, level)
++    except Exception:  # an unreadable store proves nothing: treat as no row (the pin then holds)
++        logger.debug("routing: could not peek %s/%s", session_id, level, exc_info=True)
++        return None
++
++
++def request_pin_source(model, provider, config, replace: bool | str = False):
++    """``explicit`` for a model David named (switch, -m, picker) or a Kanban card; ``default`` when the
++    request is the config default. An existing row decides for itself (an echo never upgrades it)."""
++    if replace or os.environ.get("HERMES_KANBAN_TASK"):
++        return "explicit"
++    model_cfg = (config or {}).get("model") or {}
++    default = model_cfg.get("default") if isinstance(model_cfg, dict) else model_cfg
++    default_provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
++    if model == default and provider in (None, "", "auto", default_provider):
++        return "default"
++    return "explicit"
++
++
++def follows_reroute(row, model):
++    """``(provider, model)`` the session was rerouted to when *model* is the one its wall moved it off."""
++    from agent.model_routing_state import is_explicit_pin
++    walled = (row or {}).get("walled_from") or {}
++    if is_explicit_pin(row) or walled.get("model") != model or row.get("selected_model") == model:
++        return None
++    return row["selected_provider"], row["selected_model"]
++
++
++def may_reroute(wall, row, source, now=None):
++    """True when the quota *wall* on a pin with standing *row* / request *source* should move it."""
++    from agent.model_routing_state import is_explicit_pin
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        return False  # card pins: t_01a19990897b9d9b (David's D1) owns their policy
++    reset = getattr(wall, "resets_at", None)
++    if not isinstance(reset, (int, float)) or reset - (time.time() if now is None else now) < WALL_REROUTE_MIN_SECONDS:
++        return False
++    if row is not None:
++        return not is_explicit_pin(row)
++    return source == "default"
++
++
++def class_config(config, level):
++    """*config* with every class route of *level* (the managed policy already forbids metered ones)."""
++    from copy import deepcopy
++    full = deepcopy(config)
++    full["model_routing"]["routes"] = {level: list(config["model_routing"].get("routes", {}).get(level, []))}
++    return full
++
++
++def reset_pt(resets_at):
++    """``Tue 11-03 22:37 PT``: David reads Pacific time."""
++    from datetime import datetime
++    from zoneinfo import ZoneInfo
++    return datetime.fromtimestamp(float(resets_at), ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M PT")
++
++
++def _label(model):
++    return model
++
++
++def reroute_notice(wall, to_model=None):
++    """The one chat line for a rerouted turn."""
++    target = _label(to_model) if to_model else "another model in its class"
++    return f"{_label(wall.model)} quota is out until {reset_pt(wall.resets_at)}; continuing on {target}."
++
++
++def held_reply(wall):
++    """The reply for a walled pin that holds (explicit, or a wall under the reroute threshold)."""
++    return (f"⚠️ {wall.provider}/{wall.model} subscription quota is out until {reset_pt(wall.resets_at)}. "
++            f"This chat is pinned to it; use /model to switch, or resend after the reset.")
++
++
++def log_reroute(wall, metadata):
++    logger.warning("routing: walled default pin rerouted %s/%s→%s/%s until %s", wall.provider, wall.model,
++                   metadata["selected_provider"], metadata["selected_model"], reset_pt(wall.resets_at))
++
++
++def predicted_target(config, level, wall):
++    """Other ``(provider, model)`` routes that can serve *level* now (the allocator picks among them)."""
++    from agent.credential_pool import load_pool
++    from agent.model_routing import eligible_routes
++    policy = config["model_routing"]
++    found = set()
++    for route in eligible_routes(policy, level):
++        if (route["provider"], route["model"]) == (wall.provider, wall.model) or route["billing"] != "subscription":
++            continue
++        try:
++            if load_pool(route["provider"], allowed_auth_types={"oauth"}).has_available(model=route["model"]):
++                found.add((route["provider"], route["model"]))
++        except Exception:  # an unreadable pool cannot serve; the wall then stands
++            logger.debug("routing: pool %s unreadable", route["provider"], exc_info=True)
++            continue
++    return sorted(found)
++
++
++def gateway_deferral(wall, model, provider, config):
++    """Pre-build lookup (gateway): a deferred runtime when the agent build will reroute this walled pin,
++    else None (the refusal stands). Needs the turn's ``routing_session``."""
++    from agent.model_routing import ModelRoutingError
++    from agent.model_routing_managed import managed_config, pin_policy
++    from agent.model_routing_runtime import current_routing_session
++    session_id = current_routing_session()
++    if not session_id:
++        return None
++    managed = managed_config(config)
++    if managed is None:
++        return None
++    try:
++        level, _ = pin_policy(model, provider, managed)
++    except ModelRoutingError:
++        return None
++    row = peek_route(session_id, level)
++    followed = follows_reroute(row, model)
++    if followed is None and not may_reroute(wall, row, request_pin_source(model, provider, managed)):
++        return None
++    if followed is None:
++        targets = predicted_target(managed, level, wall)
++        if not targets:
++            return None  # nothing else in the class can serve: the refusal stands
++        notice = reroute_notice(wall, targets[0][1] if len({p for p, _ in targets}) == 1 else None)
++    else:
++        notice = None  # the reroute was announced when it happened
++    return {"provider": "auto", "requested_provider": "auto", "model": model, "class_deferred": True,
++            "api_key": None, "base_url": None, "api_mode": None, "walled_notice": notice}
+diff --git a/gateway/run_turn_prepare.py b/gateway/run_turn_prepare.py
+index 19e7ae5df2f..30b5b351f6a 100644
+--- a/gateway/run_turn_prepare.py
++++ b/gateway/run_turn_prepare.py
+@@ -64,6 +64,8 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str
+             fallback_entry.get('model') or 'default')
+         return fallback_entry['model'], _runtime_agent_kwargs(runtime)
+     if runtime.get('class_deferred'):
++        if runtime.get('walled_notice'):
++            runner._pre_agent_fallback_notice = runtime['walled_notice']
+         return runtime['model'], _runtime_agent_kwargs(runtime)
+     return model, _runtime_agent_kwargs(runtime)
+ 
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 0ff2191c52e..c4bd04ae831 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -172,6 +172,12 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str,
+         # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
+         from gateway.run import _gateway_provider_error_reply
+         return _gateway_provider_error_reply(str(exc)), auth_permanent, False
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    if isinstance(exc, SubscriptionQuotaUnavailable):
++        # [daveey] A pinned route's subscription wall: name the reset in PT and the way out (/model),
++        # not an epoch timestamp. Router/default pins never get here for a long wall (rerouted).
++        from agent.model_routing_walls import held_reply
++        return held_reply(exc), "route_refused" if platform == Platform.LOCAL else auth_permanent, False
+     if platform == Platform.LOCAL:
+         # The local operator reads the terminal: the resolver's own sentence ("provider 'custom'
+         # resolved without credentials ...") is the diagnosis; /login is not.
+@@ -1290,9 +1296,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+             max_iterations = room.max_iterations
+             ctx.enabled_toolsets = list(room.enabled_toolsets)
+         try:
+-            model, runtime_kwargs = runner._resolve_session_agent_runtime(
+-                source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+-            )
++            # [daveey] The pre-build lookup reads this session's standing route (a walled router pick
++            # defers to the agent build's same-class reroute instead of refusing the turn).
++            from agent.model_routing_runtime import routing_session
++            with routing_session(getattr(ctx, "session_id", None)):
++                model, runtime_kwargs = runner._resolve_session_agent_runtime(
++                    source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
++                )
+             # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
+             # fallback was resolved before any agent exists (#74349); one-shot per turn.
+             pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
+diff --git a/gateway/session_worker_construct.py b/gateway/session_worker_construct.py
+index 4c54339ecb2..15c3e7af88c 100644
+--- a/gateway/session_worker_construct.py
++++ b/gateway/session_worker_construct.py
+@@ -175,8 +175,22 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
+     mints a random one), so it must not record a standing allocation. The agent's own
+     ``prepare_agent_route`` allocates under the real session id."""
+     from agent.model_routing_runtime import temporary_resolution
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
+     with temporary_resolution():
+-        return _route_runtime(policy, frozen, model, key, fallback=fallback)
++        try:
++            return _route_runtime(policy, frozen, model, key, fallback=fallback)
++        except SubscriptionQuotaUnavailable as wall:
++            # [daveey] A router-picked pin walled for hours is rerouted within its class by the agent
++            # build (``resolve_managed_runtime``); this lookup has no standing allocation to do it, so
++            # it defers to the build instead of refusing the turn. David's own pins still refuse here.
++            from agent.model_routing_walls import gateway_deferral
++            if key or json.loads(policy.request_json).get('base_url'):
++                raise
++            deferred = gateway_deferral(wall, model or (frozen.get('model') or {}).get('default'),
++                                        (frozen.get('model') or {}).get('provider'), None)
++            if deferred is None:
++                raise
++            return deferred, None
+ 
+ 
+ def _route_runtime(policy, frozen, model, key, *, fallback=True):
+diff --git a/tests/agent/test_model_routing_state_contention.py b/tests/agent/test_model_routing_state_contention.py
+index 2906c35a57e..92077caa9d6 100644
+--- a/tests/agent/test_model_routing_state_contention.py
++++ b/tests/agent/test_model_routing_state_contention.py
+@@ -220,12 +220,12 @@ def test_sticky_snapshot_never_advances_counters_and_writes_still_go_through_the
+     with pytest.raises(RuntimeError):
+         route(path, "s", prepare=lambda metadata: (_ for _ in ()).throw(RuntimeError("client failed")))
+     assert route(path, "s") == first and rows(path, "SELECT * FROM counters") == counters
+-    # Exact-pin upgrade is a write: recorded durably.
+-    pinned = route(path, "s", exact_pin=True)
+-    assert pinned["metadata"]["exact_pin"] is True
+-    assert RoutingState(path).peek("s", "deep")["exact_pin"] is True
+-    with pytest.raises(ModelRoutingError, match="cannot fail over"):
+-        route(path, "s", excluded=[(first["provider"], first["model"])])
++    # An exact-pin echo of the sticky class route is not David pinning it: no upgrade, no write
++    # (tests/agent/test_walled_default_pin.py), so a quota wall can still move it within its class.
++    echoed = route(path, "s", exact_pin=True)
++    assert echoed == first and "exact_pin" not in RoutingState(path).peek("s", "deep")
++    assert RoutingState(path).peek("s", "deep")["pin_source"] == "default"
++    assert rows(path, "SELECT * FROM counters") == counters
+     # Failover of an unpinned sticky route advances the counter once, under the writer lock.
+     other = route(path, "t")
+     failed = route(path, "t", excluded=[(other["provider"], other["model"])])
+diff --git a/tests/agent/test_walled_default_pin.py b/tests/agent/test_walled_default_pin.py
+new file mode 100644
+index 00000000000..405009efe18
+--- /dev/null
++++ b/tests/agent/test_walled_default_pin.py
+@@ -0,0 +1,258 @@
++"""A router-chosen route is not David's pin: a far quota wall moves it within its class. [daveey]
++
++MacBook Desktop chat 20261026_000514_23ef49 (11-02 13:59 PT): the router allocated openai-codex/gpt-6-astra
++for the chat's ``deep`` class; the gateway then resolved that concrete model under the session id, and
++``RoutingState._allocate`` upgraded the allocation to ``exact_pin``. When the Codex subscription hit a 33 h
++wall, every turn failed before it started ("Subscription quota unavailable for openai-codex/gpt-6-astra")
++although claude-opus-5-5 in the same class was available the whole time.
++
++The allocation store now records ``pin_source`` (``explicit``: an honoured switch or a model David named;
++``default``: a router pick, the config default, an echo). An echo never upgrades a router pick to exact,
++and a non-explicit pin walled for 6 h or more is rerouted within its class (``walled_from`` recorded).
++"""
++import base64
++import json
++import logging
++import time
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++OPUS, ASTRA = 'claude-opus-5-5', 'gpt-6-astra'
++SID = '20261026_000514_23ef49'
++HOUR = 3600
++
++
++def _jwt(account, plan):
++    def seg(obj):
++        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b'=').decode()
++    return '.'.join((seg({'alg': 'none'}), seg({'exp': int(time.time()) + 3600, 'sub': account,
++                     'https://api.openai.com/auth': {'chatgpt_account_id': account, 'chatgpt_plan_type': plan}}),
++                     'sig'))
++
++
++def _route(provider, model):
++    return {'provider': provider, 'model': model, 'billing': 'subscription', 'weight': 1, 'eligible': True,
++            'funding_verified': True,
++            'capabilities': {'tools': True, 'vision': True, 'streaming': True, 'context_tokens': 200000}}
++
++
++def _write_auth(home):
++    (home / 'auth.json').write_text(json.dumps({'version': 1, 'credential_pool': {
++        'anthropic': [{'id': 'sub', 'label': 'sub', 'priority': 0, 'auth_type': 'oauth', 'source': 'manual',
++                       'access_token': 'sk-ant-oat-fixture'}],
++        'openai-codex': [{'id': 'pro', 'label': 'pro', 'priority': 0, 'auth_type': 'oauth',
++                          'source': 'manual:device_code', 'access_token': _jwt('acct-pro', 'pro'),
++                          'refresh_token': 'r'}]}}), encoding='utf-8')
++
++
++def _config():
++    return {'model': {'default': OPUS, 'provider': 'anthropic', 'context_length': 200000},
++            'model_routing': {'enabled': True, 'policy_version': 1, 'allow_metered': False,
++                              'enforce_subscription_only': True,
++                              'routes': {'deep': [_route('anthropic', OPUS), _route('openai-codex', ASTRA)]}}}
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    from hermes_cli.config import atomic_config_write
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'codex'))
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    atomic_config_write(tmp_path / 'config.yaml', _config())
++    _write_auth(tmp_path)
++
++    def no_network(*args, **kwargs):
++        raise AssertionError(f'unexpected HTTP send: {args[1] if len(args) > 1 else args}')
++    monkeypatch.setattr('httpx.Client.send', no_network)
++    monkeypatch.setattr('httpx.AsyncClient.send', no_network)
++    monkeypatch.setattr('agent.anthropic_adapter.build_anthropic_client', lambda *a, **k: MagicMock())
++    monkeypatch.setattr('model_tools.get_tool_definitions', lambda *a, **k: [])
++    return tmp_path
++
++
++def _state(home):
++    from agent.model_routing_state import RoutingState
++    return RoutingState(home / 'model-routing.sqlite3')
++
++
++def _resolve(model, provider, session=SID):
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    return resolve_runtime_provider(requested=provider, target_model=model, routing_session_id=session)
++
++
++def _router_picks_astra(home):
++    """The router's own class allocation for SID lands on Astra (the cycle's second provider)."""
++    _resolve('class:deep', 'auto', session='warm-up')
++    first = _resolve('class:deep', 'auto')
++    assert (first['provider'], first['model']) == ('openai-codex', ASTRA)
++    return first
++
++
++def _legacy_row(home, metadata):
++    """A row exactly as the pre-fix allocator stored it (no ``pin_source``)."""
++    import sqlite3
++    state = _state(home)
++    with sqlite3.connect(state.path) as db:
++        state._ensure_schema(db)
++        db.execute('INSERT OR REPLACE INTO aliases VALUES (?, ?)', (SID, SID))
++        db.execute('INSERT OR REPLACE INTO routes VALUES (?, ?, ?)', (SID, 'deep', json.dumps(metadata)))
++
++
++LEGACY_ECHO = {'requested_class': 'deep', 'policy_version': 1, 'selected_provider': 'openai-codex',
++               'selected_model': ASTRA, 'billing_group': 'subscription', 'reason': 'allocation',
++               'exact_pin': True}
++
++
++def _wall(home, provider, model, hours):
++    from agent.credential_pool import load_pool
++    reset = time.time() + hours * HOUR
++    pool = load_pool(provider, allowed_auth_types={'oauth'})
++    entry_id = pool.entries()[0].id
++    pool.mark_exhausted_and_rotate(status_code=429, model=model, credential_id=entry_id,
++                                   error_context={'reset_at': reset}, failure_reason='rate_limit')
++    return reset
++
++
++def test_echo_of_the_router_pick_stays_a_class_allocation(home):
++    _router_picks_astra(home)
++    echoed = _resolve(ASTRA, 'openai-codex')
++    assert (echoed['provider'], echoed['model']) == ('openai-codex', ASTRA)
++    recorded = _state(home).peek(SID, 'deep')
++    assert not recorded.get('exact_pin'), recorded
++    assert recorded['reason'] == 'allocation'
++    assert recorded['pin_source'] == 'default'
++
++
++def test_walled_legacy_default_pin_moves_to_anthropic_deep(home, caplog):
++    _legacy_row(home, LEGACY_ECHO)
++    reset = _wall(home, 'openai-codex', ASTRA, 33)
++    with caplog.at_level(logging.WARNING):
++        moved = _resolve(ASTRA, 'openai-codex')
++        again = _resolve(ASTRA, 'openai-codex')
++    assert (moved['provider'], moved['model']) == ('anthropic', OPUS)
++    assert (again['provider'], again['model']) == ('anthropic', OPUS)
++    recorded = _state(home).peek(SID, 'deep')
++    assert recorded['reason'] == 'same-class-failover'
++    assert recorded['pin_source'] == 'default'
++    assert not recorded.get('exact_pin')
++    assert recorded['walled_from']['provider'] == 'openai-codex'
++    assert recorded['walled_from']['model'] == ASTRA
++    assert recorded['walled_from']['resets_at'] == pytest.approx(reset, abs=1)
++    warnings = [r.getMessage() for r in caplog.records
++                if r.getMessage().startswith('routing: walled default pin rerouted')]
++    assert len(warnings) == 1, warnings  # once per episode, not once per turn
++    assert f'openai-codex/{ASTRA}→anthropic/{OPUS} until ' in warnings[0]
++
++
++def test_rerouted_chat_stays_on_its_reroute_after_the_wall_clears(home):
++    _legacy_row(home, LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 33)
++    assert _resolve(ASTRA, 'openai-codex')['model'] == OPUS
++    _write_auth(home)  # the Codex wall is gone; the session's stale model is still Astra
++    after = _resolve(ASTRA, 'openai-codex')
++    assert (after['provider'], after['model']) == ('anthropic', OPUS)
++
++
++def test_walled_explicit_switch_pin_still_holds(home):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    _legacy_row(home, dict(LEGACY_ECHO, reason='explicit-switch'))
++    _wall(home, 'openai-codex', ASTRA, 33)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve(ASTRA, 'openai-codex')
++    assert _state(home).peek(SID, 'deep')['selected_model'] == ASTRA
++
++
++def test_walled_named_model_on_a_new_session_still_holds(home):
++    """A first allocation of a model that is not the config default was named by David (-m, picker)."""
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    _wall(home, 'openai-codex', ASTRA, 33)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve(ASTRA, 'openai-codex', session='named-astra')
++
++
++def test_walled_config_default_on_a_new_session_moves(home):
++    _wall(home, 'anthropic', OPUS, 33)
++    moved = _resolve(OPUS, 'anthropic', session='default-opus')
++    assert (moved['provider'], moved['model']) == ('openai-codex', ASTRA)
++    assert _state(home).peek('default-opus', 'deep')['walled_from']['model'] == OPUS
++
++
++def test_wall_under_six_hours_still_holds(home):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    _legacy_row(home, LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 2)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve(ASTRA, 'openai-codex')
++    assert _state(home).peek(SID, 'deep') == LEGACY_ECHO
++
++
++def test_kanban_card_pins_are_not_moved(home, monkeypatch):
++    """Card pins are owned by t_01a19990897b9d9b (David's D1): a worker's first pin stays explicit."""
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_card')
++    _wall(home, 'anthropic', OPUS, 33)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve(OPUS, 'anthropic', session='card-opus')
++
++
++def test_gateway_local_turn_with_legacy_astra_pin_builds_on_opus(home, monkeypatch):
++    """The pre-build lookup (``route_runtime``) and the agent build both take the reroute."""
++    from agent.model_routing_runtime import routing_session
++    from gateway.run_turn_prepare import _resolve_policy_agent_runtime
++    from hermes_cli.config import load_config
++    from run_agent import AIAgent
++    _legacy_row(home, LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 33)
++    frozen = dict(load_config())
++    frozen['model'] = dict(frozen['model'], default=ASTRA, provider='openai-codex')
++    policy = SimpleNamespace(request_json='{}', model=ASTRA,
++                             effective=lambda authority=None, secrets=True: (frozen, ASTRA))
++    runner = SimpleNamespace(_pre_agent_fallback_notice=None)
++    monkeypatch.setattr('gateway.session_authorities.active_authority', lambda runner: None)
++    monkeypatch.setattr('gateway.session_policy.route_launch_key', lambda *a: None)
++    with routing_session(SID):
++        model, kwargs = _resolve_policy_agent_runtime(runner, policy)
++    assert model == ASTRA and kwargs['provider'] == 'auto' and not kwargs['api_key'], kwargs
++    notice = runner._pre_agent_fallback_notice
++    assert notice and 'quota is out until' in notice and 'PT' in notice and OPUS in notice, notice
++    agent = AIAgent(model=model, session_id=SID, quiet_mode=True, skip_memory=True, skip_context_files=True,
++                    **{k: v for k, v in kwargs.items() if k in ('provider', 'api_key', 'base_url', 'api_mode')})
++    assert (agent.model, agent.provider) == (OPUS, 'anthropic')
++    assert agent.model_routing['walled_from']['model'] == ASTRA
++    # The next turn follows the reroute without announcing it again.
++    runner._pre_agent_fallback_notice = None
++    with routing_session(SID):
++        _resolve_policy_agent_runtime(runner, policy)
++    assert runner._pre_agent_fallback_notice is None
++
++
++def test_gateway_local_turn_with_explicit_switch_pin_still_refuses(home, monkeypatch):
++    """Control on the gateway path: David's own switch is never deferred to a reroute."""
++    from agent.model_routing_runtime import routing_session
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from gateway.run_turn_prepare import _resolve_policy_agent_runtime
++    from hermes_cli.config import load_config
++    _legacy_row(home, dict(LEGACY_ECHO, reason='explicit-switch'))
++    _wall(home, 'openai-codex', ASTRA, 33)
++    frozen = dict(load_config())
++    frozen['model'] = dict(frozen['model'], default=ASTRA, provider='openai-codex')
++    policy = SimpleNamespace(request_json='{}', model=ASTRA,
++                             effective=lambda authority=None, secrets=True: (frozen, ASTRA))
++    runner = SimpleNamespace(_pre_agent_fallback_notice=None)
++    monkeypatch.setattr('gateway.session_authorities.active_authority', lambda runner: None)
++    monkeypatch.setattr('gateway.session_policy.route_launch_key', lambda *a: None)
++    with routing_session(SID), pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve_policy_agent_runtime(runner, policy)
++    assert runner._pre_agent_fallback_notice is None
++
++
++def test_gateway_explicit_pin_reply_names_the_reset_and_model_command(home):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from gateway.config import Platform
++    from gateway.run_turn_runner import _resolution_failure_reply
++    reset = time.time() + 33 * HOUR
++    text, _, _ = _resolution_failure_reply(SubscriptionQuotaUnavailable('openai-codex', ASTRA, reset),
++                                           Platform.LOCAL)
++    assert 'PT' in text and '/model' in text and ASTRA in text, text
+-- 
+2.55.0
+

@@ -1,0 +1,178 @@
+From 9328cbc2d9b10cb71e78f92942e4dc610ba4b9a0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:10:48 +0000
+Subject: [PATCH] fix(kanban): let ordinary repo work and MacBook-placed cards
+ enroll worker-first [daveey]
+
+Problem: 2026-11-03 06:56 UTC the hub held 84 ready cards and ran 6-7 locally at its cap of 7, while
+worker-1 (max_card_runs 16) ran 2. Only 1 ready card carried placement_policy=worker-first-v1.
+
+Why 1: worker-first enrollment happens only when portable_reason() returns None at creation, and it returned a
+  reason for ~82% of hub cards (141 of 804 created in 48 h were portable).
+Why 2: portable_reason scans the whole title+body for host markers. Three fired on ordinary work: `~/code/`
+  and `/home/x/code/` (any repo path), a bare `~/.hermes` (incl. ~/.hermes/hermes-agent worktrees that
+  workers already make), and `hermes-hub` (the Board CLI name).
+Why 3: every card the MacBook places on the hub carries remote_body()'s note listing the MacBook's own
+  host-only things ("Chrome profile, Keychain, ... launchd ... ssh to the mini"). portable_reason scanned that
+  note as card text, so each such card read as Mac-bound on the hub (19 open cards carry it).
+Root (happened): the portability boundary treats system-written routing text and repo paths as host needs.
+Root (not caught): tests froze `Read ~/code/example` as an exclusion and never fed portable_reason a body
+  produced by remote_body().
+
+Fix: strip the placement note before scanning; drop the repo-path and Board-name markers; keep real host
+state as markers: ~/.hermes/<state> other than hermes-agent/skills/repos/bin, an existing ~/code/_wt
+worktree (unpushed work), kanban.db, cron, hermes-sync, ssh, launchd, gateway admin, explicit host_repo.
+On the 48 h sample: portable 141 -> 199 of 804. No change to caps, pins, courier cards or active runs.
+
+Tests: RED on base (7 failing), GREEN 361 across the placement suites.
+---
+ hermes_cli/kanban_placement.py                | 30 +++++++++--
+ tests/hermes_cli/test_kanban_placement.py     | 11 +++-
+ .../test_kanban_worker_placement.py           | 51 ++++++++++++++++++-
+ 3 files changed, 84 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index e95e238e4c1..35eb3d4db4c 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -344,15 +344,35 @@ def _heavy_marker(title: str, body: str, cfg: _Cfg) -> Optional[str]:
+ 
+ # Work that only makes sense on the gateway that owns it (the hub, for a routeless gateway): its checkout and
+ # state, credentials broker, cron control plane, Kanban DB, Board/gateway admin. Used only for ``_routeless_heavy``.
++#
++# Repository paths are not markers: a worker provisions its own checkout (``~/code/<repo>``, a worktree of
++# ``~/.hermes/hermes-agent``), so ordinary repo work is portable. Before 11-03 ``~/code/``, a bare ``~/.hermes``
++# and the Board CLI name ``hermes-hub`` kept ~3 of every 4 ready hub cards off the worker pool, so the hub's
++# local execution cap throttled the whole queue. What stays local: an existing worktree on this host
++# (``~/code/_wt/<slug>`` holds unpushed work), Hermes state under ``~/.hermes`` other than the code checkout and
++# skills, and a card that declares ``requires: [host_repo]`` or a ``dir``/``worktree`` workspace.
++HERMES_STATE_PATH = r"(?:~|/home/[^/\s]+)/\.hermes/(?!(?:hermes-agent|skills|repos|bin)(?:/|\b))[\w.-]"
++HOST_WORKTREE_PATH = r"(?:~|/home/[^/\s]+)/code/_wt"
+ HOME_GATEWAY_MARKERS = (
+-    r"~/\.hermes\b", r"/home/ubuntu/\.hermes\b", r"\bkanban\.db\b", r"\bcron ?(job|jobs|tab)?\b",
+-    r"\btoken-broker\b", r"\bhermes-sync\b", r"\bhermes-hub\b", r"\bon the hub\b", r"\bthe hub's\b",
+-    r"\bgateway (restart|config|service)\b", r"\bsystemctl\b", r"\blaunchd\b",
+-    r"~/code/", r"/home/[^/\s]+/code/", r"\bssh\b",
++    HERMES_STATE_PATH, HOST_WORKTREE_PATH, r"\bkanban\.db\b", r"\bcron ?(job|jobs|tab)?\b",
++    r"\btoken-broker\b", r"\bhermes-sync\b", r"\bon the hub\b", r"\bthe hub's\b",
++    r"\bgateway (restart|config|service)\b", r"\bsystemctl\b", r"\blaunchd\b", r"\bssh\b",
+     r"\brestart(ing)? (the )?gateway\b", r"\bhermes config (set|edit|unset)\b",
+ )
+ 
+ 
++# The note :func:`remote_body` appends when another gateway places a card here. It lists the origin's own
++# host-only things (Chrome, Keychain, launchd, ssh) as what to block on, so scanning it as card text made
++# every card a MacBook placed on the hub look Mac-bound, and none of them reached the worker pool.
++_PLACEMENT_NOTE = re.compile(
++    r"Placed on \S+ by \S+'s default placement rule \(kanban\.placement\):.*?don't park or ask David\.", re.DOTALL)
++
++
++def without_placement_note(body: str) -> str:
++    """``body`` minus the system-written placement note: it is routing advice, not the card's work."""
++    return _PLACEMENT_NOTE.sub("", body or "")
++
++
+ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+     """Why a card cannot leave its origin; None means structurally portable, not admitted.
+ 
+@@ -377,7 +397,7 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+         return "gateway-scoped requirement"
+     if any(str(r) not in c.carried_requires() for r in reqs):
+         return "uncarried requirement"
+-    title, body = args.get("title") or "", args.get("body") or ""
++    title, body = args.get("title") or "", without_placement_note(args.get("body") or "")
+     if _local_marker(title, body, args.get("skills"), c):
+         return "local marker"
+     full = f"{title}\n{body}"
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index b2059bc0e78..fb0a2408709 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1491,8 +1491,17 @@ def test_hub_origin_explicit_pins_and_courier_cards_win_over_heavy_routing():
+ 
+ @pytest.mark.parametrize("body", [
+     "Run pytest in ~/code/hermes-mods",
+-    "cd /home/ubuntu/code/_wt/foo then pytest",
+     "cd /home/alice/code/project then pytest",
++])
++def test_hub_origin_heavy_repo_work_goes_to_the_worker(body):
++    """A repo path is not a host need (the worker provisions its own checkout); an existing ~/code/_wt
++    worktree is, below."""
++    assert _hub({"title": "Maintenance", "body": body})["runs_on"] == ["machine:worker-1"]
++
++
++@pytest.mark.parametrize("body", [
++    "cd /home/ubuntu/code/_wt/foo then pytest",
++    "Run pytest in ~/.hermes/kanban/workspaces/t_x",
+     "ssh ubuntu@mini then pytest",
+     "Run pytest then restart the gateway",
+     "Run pytest before restarting gateway",
+diff --git a/tests/hermes_cli/test_kanban_worker_placement.py b/tests/hermes_cli/test_kanban_worker_placement.py
+index a505fa4e9f1..e1430ad578e 100644
+--- a/tests/hermes_cli/test_kanban_worker_placement.py
++++ b/tests/hermes_cli/test_kanban_worker_placement.py
+@@ -14,7 +14,8 @@ def test_portable_reason_accepts_light_and_heavy_scratch_work(title):
+     {"board": "another"}, {"assignee": "unlisted"}, {"project": "project"},
+     {"requires": ["host_repo"]}, {"requires": ["ssh:host"]}, {"requires": ["unknown"]},
+     {"needs": ["ssh:host"]},
+-    {"title": "Read ~/code/example"}, {"title": "Inspect kanban.db"},
++    {"title": "Edit ~/.hermes/config.yaml"}, {"title": "Inspect kanban.db"},
++    {"title": "Tail /home/ubuntu/.hermes/logs/agent.log"},
+     {"title": "Restart the gateway"}, {"title": "Use token-broker"},
+     {"title": "Run launchd"}, {"title": "Inspect Chrome on my Mac"},
+     {"human_request": {"action": "approve"}}, {"max_retries": 2}, {"tenant": "x"},
+@@ -78,4 +79,50 @@ def test_hub_bound_work_keeps_legacy_route(fields):
+ def test_courier_and_host_work_bypass_worker_policy():
+     cfg = {"worker_pools": {"hub": ["worker-1"]}}
+     assert "placement_policy" not in placement.decide({"title": "Analyze data"}, origin_intent=object(), cfg=cfg, self_gw="hub")
+-    assert "placement_policy" not in placement.decide({"title": "Inspect ~/code/repo"}, cfg=cfg, self_gw="hub")
++    assert "placement_policy" not in placement.decide({"title": "Inspect ~/code/repo", "requires": ["host_repo"]},
++                                                      cfg=cfg, self_gw="hub")
++
++
++@pytest.mark.parametrize("title", [
++    "Fix flaky test in ~/code/hermes/tests/test_x.py",
++    "Patch /home/ubuntu/code/fabric-play and open a PR",
++    "Branch off ~/.hermes/hermes-agent: git -C ~/.hermes/hermes-agent log origin/main",
++    "Update the skill at ~/.hermes/skills/devops/foo/SKILL.md in hermes-mods",
++    "hermes-hub client: retry a 409 from the Board",
++    "Read the hermes-agent tree under ~/.hermes for context",
++])
++def test_ordinary_repo_work_enrolls_worker_first(title):
++    """Repo paths, the Board CLI name and a bare ~/.hermes are not host needs: workers provision checkouts."""
++    assert placement.portable_reason({"title": title, "requires": ["terminal", "file", "git"]}, {}) is None
++    result = placement.decide({"title": title, "requires": ["terminal", "file", "git"]},
++                              cfg={"worker_pools": {"hub": ["worker-1"]}}, self_gw="hub")
++    assert result["placement_policy"] == "worker-first-v1"
++
++
++@pytest.mark.parametrize("title", [
++    "Edit ~/.hermes/config.yaml on this gateway", "Rotate /home/ubuntu/.hermes/.env",
++    "Prune ~/.hermes/kanban/workspaces", "Fix the hermes-hub ssh config", "Restart the gateway",
++    "Continue in worktree ~/code/_wt/fix-x and push", "cd /home/ubuntu/code/_wt/foo then pytest",
++])
++def test_hub_state_work_stays_local(title):
++    result = placement.decide({"title": title}, cfg={"worker_pools": {"hub": ["worker-1"]}}, self_gw="hub")
++    assert "placement_policy" not in result
++
++
++
++def test_placement_note_from_the_origin_is_not_a_host_need():
++    """A card the MacBook placed on the hub carries remote_body's note naming Chrome, launchd and ssh as
++    the MacBook's own things; the note must not make the card look host-bound on the hub."""
++    args = {"title": "Fix flaky kanban test", "requires": ["terminal", "file", "git"]}
++    args["body"] = placement.remote_body({"body": "Deflake tests/x.py and open a PR."}, self_gw="macbook", target="hub")
++    assert "Chrome" in args["body"] and "launchd" in args["body"]
++    assert placement.portable_reason(args, {}) is None
++    result = placement.decide(args, cfg={"worker_pools": {"hub": ["worker-1"]}}, self_gw="hub")
++    assert result["placement_policy"] == "worker-first-v1"
++
++
++def test_placement_note_does_not_hide_a_real_host_need_in_the_card_text():
++    args = {"title": "Fix flaky kanban test"}
++    args["body"] = placement.remote_body({"body": "Reproduce with launchctl list on the Mac."},
++                                         self_gw="macbook", target="hub")
++    assert placement.portable_reason(args, {}) == "local marker"
+-- 
+2.55.0
+

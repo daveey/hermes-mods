@@ -1,0 +1,493 @@
+From 20b09e5165f0a41f083d5803c1694c8b938f9d5e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 13:10:26 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20fix(sessions):=20=E2=8C=98B=20park?=
+ =?UTF-8?q?=20from=20an=20SSH-isolated=20backend=20forwards=20to=20the=20l?=
+ =?UTF-8?q?ive=20gateway=20owner?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+774d5e7198d moved POST /api/sessions/{id}/mute, GET /outcome?refresh=1 and owner-backfill onto the
+live owner's store, but only when the gateway runner is composed into the same app. Desktop on a
+remote host (hermes-hub) talks to an SSH-isolated `serve` with no runner, which still took the
+offline maintenance lock and 409'd ('Exclusive maintenance refused'; hub gui.log at 05:35 and 09:40
+after that fix deployed). Such a backend now replays the write on the owner's own HTTP API with a
+single-use native-http ticket minted on its control socket. Live-gateway test with an uncomposed
+app (RED = the exact 409).
+---
+ hermes_cli/web_routers/sessions.py            | 137 ++++++++--
+ tests/gateway/test_mute_live_owner.py         | 258 ++++++++++++++++--
+ .../test_session_maintenance_http.py          |   5 +-
+ 3 files changed, 358 insertions(+), 42 deletions(-)
+
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 9e846f16c95..4da8d9ecabf 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -1006,23 +1006,37 @@ async def backfill_session_owner_profiles(body: SessionOwnerBackfill, request: R
+     """
+     stamp = _serving_profile(body.profile)
+ 
++    def answer(stamped):
++        if stamped:
++            _log.info(
++                "owner-backfill: stamped %d legacy NULL-profile session row(s) with profile %r",
++                stamped, stamp)
++        return {"ok": True, "stamped": stamped, "profile": stamp}
++
++    def offline_stamp():
++        with http_failure(
++            "POST /api/sessions/owner-backfill failed", 500, detail="Internal server error"):
++            return _with_db(body.profile, lambda db: db.backfill_null_session_profiles(stamp),
++                            read_only=False)
++
++    if getattr(request.app.state, "gateway_runner", None) is None:
++        # A backend not composed with the gateway (Desktop's SSH-isolated serve): the live owner
++        # stamps its own store; with no owner the offline maintenance-lock write runs.
++        async def offline():
++            return answer(await asyncio.to_thread(offline_stamp))
++        return await _on_live_owner(request, body.profile, offline)
++
+     with http_failure(
+         "POST /api/sessions/owner-backfill failed", 500, detail="Internal server error"):
+         owner_db = _owner_db_for(request, body.profile)
+-        if owner_db is not None:
+-            # A live gateway owns this store: it is the only writer (the offline maintenance lock
+-            # would 409 every Desktop boot), so the idempotent stamp runs on its own connection.
+-            stamped = await asyncio.to_thread(owner_db.backfill_null_session_profiles, stamp)
+-        else:
+-            stamped = await asyncio.to_thread(
+-                _with_db, body.profile, lambda db: db.backfill_null_session_profiles(stamp),
+-                read_only=False)
+-
+-    if stamped:
+-        _log.info(
+-            "owner-backfill: stamped %d legacy NULL-profile session row(s) with profile %r",
+-            stamped, stamp)
+-    return {"ok": True, "stamped": stamped, "profile": stamp}
++    if owner_db is None:
++        return answer(await asyncio.to_thread(offline_stamp))
++    # A live gateway owns this store: it is the only writer (the offline maintenance lock
++    # would 409 every Desktop boot), so the idempotent stamp runs on its own connection.
++    with http_failure(
++        "POST /api/sessions/owner-backfill failed", 500, detail="Internal server error"):
++        stamped = await asyncio.to_thread(owner_db.backfill_null_session_profiles, stamp)
++    return answer(stamped)
+ 
+ 
+ @manage_router.patch("/api/sessions/{session_id}")
+@@ -1036,14 +1050,103 @@ async def rename_session_endpoint(session_id: str, body: SessionRename, request:
+         expected_generation=body.expected_generation, operation='sidebar', payload=payload)
+ 
+ 
++def _own_profile_name_for_multiplexer(home: Path, control_home: Optional[str]) -> Optional[str]:
++    """[daveey] The profile name a forward must carry when a multiplexer (another home) serves *home*,
++    else None. The owner routes on the request's ``profile`` and takes its own default store without
++    one, so a named-profile backend names itself; a home no profile name resolves to refuses (503)."""
++    if Path(control_home or home).resolve() == home.resolve():
++        return None
++    name = _cron_default_profile()
++    try:
++        named = Path(_cron_profile_home(name)[1]).resolve() == home.resolve()
++    except (HTTPException, ValueError, OSError):
++        named = False
++    if not named:
++        _log.warning("owner forward: no profile name resolves to %s (served by %s)", home, control_home)
++        raise HTTPException(status_code=503, detail="owner_unreachable")
++    return name
++
++
++async def _on_live_owner(request: Request, profile: Optional[str], offline: Callable):
++    """[daveey] Run a session write on the live gateway owner from a backend not composed with it.
++
++    Desktop's SSH-isolated ``serve`` (and a standalone dashboard) has no owner store to write on, and
++    the offline maintenance lock always loses to a running gateway, so every write there 409'd
++    ("Exclusive maintenance refused"). The owner serves the same route on its own store: this replays
++    the request on its HTTP API with a single-use ``native-http`` ticket minted on the control socket
++    that just identified it (pinned to the profile's home, as ``_mutate_via_gateway_owner`` does).
++    With no endpoint, ``offline()`` (the maintenance-lock path) decides; when that loses to an owner
++    discovery saw but could not reach (starting, draining, a control timeout), it answers a retryable
++    503 with discovery's reason rather than the bare 409. A composed gateway never forwards (no loop).
++    An owner 401/403 is a refusal of this forward, never of the caller's credentials: Desktop
++    rotates its token on a 401/403, so it answers 503 too."""
++    from dataclasses import replace
++    from fastapi.responses import JSONResponse, Response
++    from gateway.runtime_ownership import OwnershipConflict
++    from hermes_cli.gateway_client import _session_ticket
++    from hermes_cli.gateway_runtime import discover_gateway_endpoint, gateway_profile_home
++    from hermes_constants import get_hermes_home
++    from hermes_state import _default_db_path
++    import httpx
++
++    home = Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
++    discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=1.5)
++    endpoint = discovery.endpoint
++    if endpoint is None:
++        try:
++            return await offline()
++        except HTTPException as exc:
++            if discovery.state == "absent" or not isinstance(exc.__cause__, OwnershipConflict):
++                raise
++            reason = discovery.reason_code or discovery.state
++            raise HTTPException(status_code=503, detail=f"owner_unavailable: {reason}: {exc.detail}") from exc
++    if not getattr(endpoint, "control_home", True):
++        # A standalone profile gateway answered on its own socket: mint there, never on the launch home's.
++        endpoint = replace(endpoint, control_home=str(home.expanduser().resolve()))
++    params, content = dict(request.query_params), await request.body()
++    name = None if profile is not None else await asyncio.to_thread(
++        _own_profile_name_for_multiplexer, home, endpoint.control_home)
++    if name is not None:
++        if request.method == "GET":
++            params["profile"] = name
++        else:
++            content = json.dumps({**json.loads(content or b"{}"), "profile": name}).encode()
++    try:
++        ticket = await asyncio.to_thread(
++            _session_ticket, gateway_profile_home(get_hermes_home()), endpoint, purpose="native-http")
++        async with httpx.AsyncClient(trust_env=False, timeout=30) as client:
++            answer = await client.request(
++                request.method, endpoint.api_origin + request.url.path, params=params, content=content,
++                headers={"X-Hermes-Gateway-Ticket": ticket, "Content-Type": "application/json"})
++    except Exception as exc:  # transport or mint failure on an owner discovery just identified
++        _log.warning("owner forward %s %s failed: %s", request.method, request.url.path, exc)
++        raise HTTPException(status_code=503, detail="owner_unreachable") from exc
++    if answer.status_code in (401, 403):
++        _log.warning("owner forward %s %s refused by the owner: %s %s", request.method, request.url.path,
++                     answer.status_code, answer.text[:200])
++        raise HTTPException(status_code=503, detail="owner_unreachable")
++    try:
++        return JSONResponse(status_code=answer.status_code, content=answer.json())
++    except ValueError:
++        return Response(status_code=answer.status_code, content=answer.content,
++                        media_type=answer.headers.get("content-type"))
++
++
+ async def _write_on_owner(request: Request, profile: Optional[str], fn: Callable):
+     """[daveey] A single-row write: on the live owner's own store when a composed gateway serves the
+-    profile, else under the offline maintenance lock. A running gateway always holds that lock, so
+-    taking it there 409s every write ("Exclusive maintenance refused") — same split as owner-backfill."""
++    profile, forwarded to the live owner from a backend that isn't composed with it, else under the
++    offline maintenance lock. A running gateway always holds that lock, so taking it there 409s
++    every write ("Exclusive maintenance refused") — same split as owner-backfill."""
+     owner_db = _owner_db_for(request, profile)
+     if owner_db is not None:
+         return await asyncio.to_thread(fn, owner_db)
+-    return await asyncio.to_thread(_with_db, profile, fn, read_only=False)
++
++    async def offline():
++        return await asyncio.to_thread(_with_db, profile, fn, read_only=False)
++
++    if getattr(request.app.state, "gateway_runner", None) is not None:
++        return await offline()
++    return await _on_live_owner(request, profile, offline)
+ 
+ 
+ @manage_router.post("/api/sessions/{session_id}/mute")
+diff --git a/tests/gateway/test_mute_live_owner.py b/tests/gateway/test_mute_live_owner.py
+index 4ec903f9892..5357ab802f4 100644
+--- a/tests/gateway/test_mute_live_owner.py
++++ b/tests/gateway/test_mute_live_owner.py
+@@ -2,8 +2,10 @@
+ 
+ Both took the offline maintenance lock, which a running gateway always holds, so every ⌘B on a
+ gateway-served profile failed with "Exclusive maintenance refused" and the park never stuck. They now
+-write on the live owner's own store, like owner-backfill.
++write on the live owner's own store, like owner-backfill. A backend that is NOT composed with the
++gateway (Desktop's SSH-isolated ``serve`` on a remote host) forwards the write to that owner.
+ """
++from contextlib import contextmanager
+ import json
+ import os
+ from pathlib import Path
+@@ -31,8 +33,9 @@ def _seed(home: Path, sid: str) -> None:
+         db.close()
+ 
+ 
+-@pytest.mark.platforms('linux')
+-def test_mute_and_outcome_refresh_run_on_the_live_owner(tmp_path):
++@contextmanager
++def _live_gateway(tmp_path):
++    """A real gateway owning a fresh home seeded with session ``chat``; yields (home, descriptor)."""
+     home, user = tmp_path / 'state', tmp_path / 'user'
+     home.mkdir(mode=0o700)
+     user.mkdir()
+@@ -58,27 +61,7 @@ def test_mute_and_outcome_refresh_run_on_the_live_owner(tmp_path):
+                     pass
+                 time.sleep(.1)
+             assert descriptor.get('state') == 'ready', (descriptor, log.text())
+-
+-            def headers():
+-                # A native grant ticket is single-use: mint one per request, as Desktop does.
+-                return {'X-Hermes-Gateway-Ticket': control(home, 'session-ticket', {
+-                    'profile_id': str(home.resolve()), 'instance_id': descriptor['instance_id'],
+-                    'purpose': 'native-http'})['ticket']}
+-            with httpx.Client(base_url=descriptor['api_origin'], trust_env=False, timeout=30) as client:
+-                muted = client.post('/api/sessions/chat/mute', json={'muted': True}, headers=headers())
+-                assert muted.status_code == 200, muted.text
+-                assert muted.json()['muted'] is True and muted.json()['outcome']['kind'] == 'muted'
+-                stored = client.get('/api/sessions/chat/outcome', headers=headers())
+-                assert stored.status_code == 200, stored.text
+-                assert stored.json()['outcome']['kind'] == 'muted'
+-
+-                unmuted = client.post('/api/sessions/chat/mute', json={'muted': False}, headers=headers())
+-                assert unmuted.status_code == 200, unmuted.text
+-                assert unmuted.json()['outcome']['kind'] != 'muted'
+-
+-                refreshed = client.get('/api/sessions/chat/outcome', params={'refresh': 1}, headers=headers())
+-                assert refreshed.status_code == 200, refreshed.text
+-                assert client.post('/api/sessions/nope/mute', json={'muted': True}, headers=headers()).status_code == 404
++            yield home, descriptor
+         finally:
+             if process.poll() is None:
+                 process.send_signal(signal.SIGINT)
+@@ -87,3 +70,230 @@ def test_mute_and_outcome_refresh_run_on_the_live_owner(tmp_path):
+                 except subprocess.TimeoutExpired:
+                     process.kill()
+                     process.wait(timeout=5)
++
++
++@pytest.mark.platforms('linux')
++def test_mute_and_outcome_refresh_run_on_the_live_owner(tmp_path):
++    with _live_gateway(tmp_path) as (home, descriptor):
++        def headers():
++            # A native grant ticket is single-use: mint one per request, as Desktop does.
++            return {'X-Hermes-Gateway-Ticket': control(home, 'session-ticket', {
++                'profile_id': str(home.resolve()), 'instance_id': descriptor['instance_id'],
++                'purpose': 'native-http'})['ticket']}
++        with httpx.Client(base_url=descriptor['api_origin'], trust_env=False, timeout=30) as client:
++            muted = client.post('/api/sessions/chat/mute', json={'muted': True}, headers=headers())
++            assert muted.status_code == 200, muted.text
++            assert muted.json()['muted'] is True and muted.json()['outcome']['kind'] == 'muted'
++            stored = client.get('/api/sessions/chat/outcome', headers=headers())
++            assert stored.status_code == 200, stored.text
++            assert stored.json()['outcome']['kind'] == 'muted'
++
++            unmuted = client.post('/api/sessions/chat/mute', json={'muted': False}, headers=headers())
++            assert unmuted.status_code == 200, unmuted.text
++            assert unmuted.json()['outcome']['kind'] != 'muted'
++
++            refreshed = client.get('/api/sessions/chat/outcome', params={'refresh': 1}, headers=headers())
++            assert refreshed.status_code == 200, refreshed.text
++            assert client.post('/api/sessions/nope/mute', json={'muted': True}, headers=headers()).status_code == 404
++
++
++@pytest.mark.platforms('linux')
++def test_uncomposed_backend_forwards_mute_to_the_live_owner(tmp_path, monkeypatch):
++    """Desktop on a remote host talks to an SSH-isolated ``serve`` that has no gateway runner; its
++    writes must reach the running gateway instead of losing the maintenance lock to it (409)."""
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from hermes_cli.web_routers.sessions import manage_router
++
++    with _live_gateway(tmp_path) as (home, _descriptor):
++        import hermes_state
++
++        # The serving backend's home is the gateway's; the hermetic conftest re-points the default DB.
++        monkeypatch.setenv('HERMES_HOME', str(home))
++        monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', home / 'state.db')
++        app = FastAPI()
++        app.include_router(manage_router)
++        assert getattr(app.state, 'gateway_runner', None) is None
++        with TestClient(app) as client:
++            muted = client.post('/api/sessions/chat/mute', json={'muted': True})
++            assert muted.status_code == 200, muted.text
++            assert muted.json()['muted'] is True and muted.json()['outcome']['kind'] == 'muted'
++            assert client.get('/api/sessions/chat/outcome').json()['outcome']['kind'] == 'muted'
++
++            unmuted = client.post('/api/sessions/chat/mute', json={'muted': False})
++            assert unmuted.status_code == 200, unmuted.text
++            assert unmuted.json()['outcome']['kind'] != 'muted'
++
++            refreshed = client.get('/api/sessions/chat/outcome', params={'refresh': 1})
++            assert refreshed.status_code == 200, refreshed.text
++            import sqlite3
++            with sqlite3.connect(home / 'state.db') as raw:  # a legacy unowned row for the owner to stamp
++                raw.execute("UPDATE sessions SET profile_name = NULL WHERE id = 'chat'")
++            backfill = client.post('/api/sessions/owner-backfill', json={})
++            assert backfill.status_code == 200, backfill.text
++            assert backfill.json()['stamped'] == 1, backfill.text
++            assert client.post('/api/sessions/nope/mute', json={'muted': True}).status_code == 404
++
++
++def _uncomposed_client(monkeypatch, home):
++    import hermes_state
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from hermes_cli.web_routers.sessions import manage_router
++
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', home / 'state.db')
++    app = FastAPI()
++    app.include_router(manage_router)
++    return TestClient(app)
++
++
++@pytest.mark.platforms('linux')
++def test_owner_refusing_the_forward_answers_503_not_a_credential_rejection(tmp_path, monkeypatch):
++    """A 401/403 from the owner refuses the forward, not Desktop's credentials (which it would rotate)."""
++    from hermes_cli import gateway_client
++
++    with _live_gateway(tmp_path) as (home, _descriptor):
++        monkeypatch.setattr(gateway_client, '_session_ticket', lambda *a, **k: 'not-a-ticket')
++        with _uncomposed_client(monkeypatch, home) as client:
++            refused = client.post('/api/sessions/chat/mute', json={'muted': True})
++            assert refused.status_code == 503, refused.text
++            assert refused.json()['detail'] == 'owner_unreachable'
++
++
++def test_no_gateway_keeps_the_offline_write(tmp_path, monkeypatch):
++    home = tmp_path / 'state'
++    home.mkdir(mode=0o700)
++    _seed(home, 'chat')
++    with _uncomposed_client(monkeypatch, home) as client:
++        muted = client.post('/api/sessions/chat/mute', json={'muted': True})
++        assert muted.status_code == 200, muted.text
++        assert muted.json()['outcome']['kind'] == 'muted'
++
++
++def test_standalone_profile_ticket_is_minted_on_the_profiles_own_socket(tmp_path, monkeypatch):
++    """A profile gateway that answered on its own socket (no control_home) mints there, never on the
++    serving backend's launch home, whose socket belongs to another owner or none."""
++    from hermes_cli import gateway_client
++    from hermes_cli import gateway_runtime
++    from hermes_cli.gateway_runtime import GatewayDiscovery, GatewayEndpoint
++
++    home = tmp_path / 'state'
++    home.mkdir(mode=0o700)
++    _seed(home, 'chat')
++    endpoint = GatewayEndpoint(profile_id=str(home.resolve()), instance_id='i', authority_epoch=1,
++                               runtime_protocol=1, api_origin='http://127.0.0.1:9', supervisor='none',
++                               capabilities=frozenset(), control_home=None)
++    monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
++                        lambda *_a, **_k: GatewayDiscovery('ready', endpoint=endpoint))
++    minted = []
++
++    def ticket(_home, endpoint, **_kw):
++        minted.append(endpoint.control_home)
++        raise OSError('stop after the mint')
++    monkeypatch.setattr(gateway_client, '_session_ticket', ticket)
++    with _uncomposed_client(monkeypatch, home) as client:
++        assert client.post('/api/sessions/chat/mute', json={'muted': True}).status_code == 503
++    assert minted == [str(home.resolve())]
++
++
++def test_unreachable_owner_answers_503_with_discoverys_reason_not_a_bare_409(tmp_path, monkeypatch):
++    """An owner discovery saw but couldn't reach (starting, draining) still holds the lock: the
++    offline write loses, and mute and owner-backfill answer a retryable 503 naming why."""
++    from contextlib import contextmanager
++
++    import gateway.runtime_ownership as ownership
++    from hermes_cli import gateway_runtime
++    from hermes_cli.gateway_runtime import GatewayDiscovery
++
++    home = tmp_path / 'state'
++    home.mkdir(mode=0o700)
++    _seed(home, 'chat')
++    monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
++                        lambda *_a, **_k: GatewayDiscovery('starting', reason_code='runtime_starting'))
++
++    @contextmanager
++    def held(_homes, **_kw):
++        raise ownership.OwnershipConflict('Exclusive maintenance refused')
++        yield
++    monkeypatch.setattr(ownership, 'exclusive_maintenance', held)
++    with _uncomposed_client(monkeypatch, home) as client:
++        for path, payload in (('/api/sessions/chat/mute', {'muted': True}), ('/api/sessions/owner-backfill', {})):
++            refused = client.post(path, json=payload)
++            assert refused.status_code == 503, (path, refused.text)
++            assert refused.json()['detail'].startswith('owner_unavailable: runtime_starting'), refused.text
++
++
++def test_multiplexer_served_profile_keeps_its_control_home_and_forwards_the_profile(tmp_path, monkeypatch):
++    """A named profile served by the default multiplexer: the ticket is minted on the multiplexer's
++    socket (the endpoint's control_home, untouched) and the forwarded body still names the profile."""
++    import httpx as httpx_module
++
++    from hermes_cli import gateway_client
++    from hermes_cli import gateway_runtime
++    from hermes_cli.gateway_runtime import GatewayDiscovery, GatewayEndpoint
++    import hermes_cli.web_routers.sessions as routes
++
++    home, root = tmp_path / 'profiles' / 'work', tmp_path / 'root'
++    home.mkdir(parents=True, mode=0o700)
++    root.mkdir(mode=0o700)
++    monkeypatch.setattr(routes, '_cron_profile_home', lambda profile: (profile, str(home)))
++    endpoint = GatewayEndpoint(profile_id=str(home.resolve()), instance_id='i', authority_epoch=1,
++                               runtime_protocol=1, api_origin='http://127.0.0.1:9', supervisor='none',
++                               capabilities=frozenset(), control_home=str(root))
++    monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
++                        lambda *_a, **_k: GatewayDiscovery('ready', endpoint=endpoint))
++    minted, sent = [], []
++    monkeypatch.setattr(gateway_client, '_session_ticket',
++                        lambda _home, endpoint, **_kw: minted.append(endpoint.control_home) or 'ticket')
++
++    def owner(request):
++        sent.append((str(request.url), request.headers['X-Hermes-Gateway-Ticket'], json.loads(request.content)))
++        return httpx_module.Response(200, json={'ok': True, 'muted': True})
++    real_client = httpx_module.AsyncClient
++    monkeypatch.setattr(httpx_module, 'AsyncClient',
++                        lambda **kw: real_client(transport=httpx_module.MockTransport(owner), **kw))
++    with _uncomposed_client(monkeypatch, home) as client:
++        forwarded = client.post('/api/sessions/chat/mute', json={'muted': True, 'profile': 'work'})
++        assert forwarded.status_code == 200, forwarded.text
++    assert minted == [str(root)]
++    assert sent == [('http://127.0.0.1:9/api/sessions/chat/mute', 'ticket', {'muted': True, 'profile': 'work'})]
++
++
++def test_named_profile_backend_names_its_profile_to_the_multiplexer(tmp_path, monkeypatch):
++    """A backend serving named profile ``work`` beside the default multiplexer: Desktop omits
++    ``profile``, so the forward names it, or the owner would write its own default store."""
++    import httpx as httpx_module
++
++    from hermes_cli import gateway_client
++    from hermes_cli import gateway_runtime
++    from hermes_cli.gateway_runtime import GatewayDiscovery, GatewayEndpoint
++    import hermes_cli.web_routers.sessions as routes
++
++    home, root = tmp_path / 'profiles' / 'work', tmp_path / 'root'
++    home.mkdir(parents=True, mode=0o700)
++    root.mkdir(mode=0o700)
++    monkeypatch.setattr(routes, '_cron_profile_home', lambda profile: (profile, str(home if profile == 'work' else root)))
++    monkeypatch.setattr(routes, '_cron_default_profile', lambda: 'work')
++    endpoint = GatewayEndpoint(profile_id=str(home.resolve()), instance_id='i', authority_epoch=1,
++                               runtime_protocol=1, api_origin='http://127.0.0.1:9', supervisor='none',
++                               capabilities=frozenset(), control_home=str(root))
++    monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
++                        lambda *_a, **_k: GatewayDiscovery('ready', endpoint=endpoint))
++    monkeypatch.setattr(gateway_client, '_session_ticket', lambda *_a, **_k: 'ticket')
++    sent = []
++
++    def owner(request):
++        sent.append((request.method, request.url.path, dict(request.url.params),
++                     json.loads(request.content) if request.content else None))
++        return httpx_module.Response(200, json={'ok': True})
++    real_client = httpx_module.AsyncClient
++    monkeypatch.setattr(httpx_module, 'AsyncClient',
++                        lambda **kw: real_client(transport=httpx_module.MockTransport(owner), **kw))
++    with _uncomposed_client(monkeypatch, home) as client:
++        assert client.post('/api/sessions/chat/mute', json={'muted': True}).status_code == 200
++        assert client.post('/api/sessions/owner-backfill', json={}).status_code == 200
++        assert client.get('/api/sessions/chat/outcome', params={'refresh': 1}).status_code == 200
++    assert sent == [('POST', '/api/sessions/chat/mute', {}, {'muted': True, 'profile': 'work'}),
++                    ('POST', '/api/sessions/owner-backfill', {}, {'profile': 'work'}),
++                    ('GET', '/api/sessions/chat/outcome', {'refresh': '1', 'profile': 'work'}, None)]
+diff --git a/tests/hermes_cli/test_session_maintenance_http.py b/tests/hermes_cli/test_session_maintenance_http.py
+index 6605e087aa3..db6ef000b80 100644
+--- a/tests/hermes_cli/test_session_maintenance_http.py
++++ b/tests/hermes_cli/test_session_maintenance_http.py
+@@ -26,7 +26,10 @@ async def test_maintenance_routes_refuse_live_owner_without_changing_rows(tmp_pa
+                         ('DELETE', 'empty', None), ('POST', 'owner-backfill', {}),
+                         ('POST', 'prune', {'older_than_days': 1})]:
+                     response = await client.request(method, '/api/sessions/' + path, json=body)
+-                    assert response.status_code == 409, (path, response.text)
++                    # owner-backfill is an owner write: an owner it can't reach answers a retryable 503
++                    # naming discovery's state (as session.mutate does), never the bare offline 409.
++                    expected = 503 if path == 'owner-backfill' else 409
++                    assert response.status_code == expected, (path, response.text)
+                     assert 'maintenance' in response.json()['detail'].lower()
+                     assert db.get_session('ended-empty') == before
+         finally:
+-- 
+2.55.0
+

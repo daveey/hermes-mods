@@ -1,0 +1,382 @@
+From 658b2be7cdb157c3c08d7368bc1e4aa62d0af417 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:07:50 +0000
+Subject: [PATCH] feat(kanban): hub reporter attaches measured CPU busy, 10 s
+ cadence, 2 s hard-total no-replay POST [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              | 45 ++++++++-
+ hermes_cli/machine_cpu_metrics.py             |  1 +
+ hermes_cli/machine_drain_metrics.py           | 14 ++-
+ hermes_cli/machine_metrics.py                 | 27 +++++-
+ .../test_kanban_sync_metrics_budget.py        | 94 +++++++++++++++++++
+ tests/hermes_cli/test_machine_metrics.py      | 77 ++++++++++++++-
+ 6 files changed, 245 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_metrics_budget.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 798e5d52e79..a250ff825f1 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -160,6 +160,39 @@ class _DeadlineRequests(urllib.request.BaseHandler):
+     https_request = http_request
+ 
+ 
++CPU_REPORT_BUDGET_S = 2.0
++_CPU_FIELDS = ("cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms")
++
++
++def _bounded_call(ident: Identity, method: str, path: str, body: Optional[dict], budget_s: float) -> dict:
++    """One request with a hard total wall-clock budget, on a private connection that is closed afterwards.
++
++    The request runs on a daemon thread whose own Hub carries the absolute deadline (every attempt's socket timeout
++    is recomputed by ``Hub._remaining``). Waiting for that thread is bounded by the same deadline, so a response
++    that trickles in byte by byte, each recv inside its timeout, still cannot hold the caller past ``budget_s``.
++    An abandoned thread ends at its next socket timeout (<= budget_s) and closes its connection."""
++    deadline = time.monotonic() + budget_s
++    hub = Hub(ident, timeout=budget_s, deadline=deadline)
++    box: dict = {}
++
++    def run() -> None:
++        try:
++            box["result"] = hub._call(method, path, body)
++        except BaseException as exc:  # health: allow BLE001 -- re-raised in the caller's thread below
++            box["error"] = exc
++        finally:
++            hub.close()
++
++    worker = _hub_threading.Thread(target=run, daemon=True, name="kanban-bounded-call")
++    worker.start()
++    worker.join(max(0.0, deadline - time.monotonic()))
++    if worker.is_alive():
++        raise TimeoutError(f"Board request exceeded its {budget_s:g} s total budget")
++    if "error" in box:
++        raise box["error"]
++    return box["result"]
++
++
+ class Hub:
+     """The Board service's HTTP API for one gateway.
+ 
+@@ -370,8 +403,16 @@ class Hub:
+ 
+     def report_metrics(self, metrics: dict) -> dict:
+         """This machine's own load for the registry: Runners display and worker-first pool admission
+-        (see hermes_cli.machine_metrics). Sending stays best-effort."""
+-        return self._call("POST", "/v2/machines/me/metrics", metrics)
++        (see hermes_cli.machine_metrics). Sending stays best-effort.
++
++        A report carrying a CPU busy sample (hub overflow gate) gets a hard :data:`CPU_REPORT_BUDGET_S` total: its
++        own Hub whose per-attempt budget comes from ``_remaining`` (connect, resend, redirect), plus a wall-clock
++        bound on the whole exchange so a trickling response cannot stretch it. On expiry it raises
++        ``TimeoutError``; the sample is dropped, never resent (the Board also rejects a stale sample by its end
++        stamp, since a client timeout does not prove the server never processes the request)."""
++        if not any(k in metrics for k in _CPU_FIELDS):
++            return self._call("POST", "/v2/machines/me/metrics", metrics)
++        return _bounded_call(self.ident, "POST", "/v2/machines/me/metrics", metrics, CPU_REPORT_BUDGET_S)
+ 
+     def report_pickup(self, pickup: Optional[str]) -> dict:
+         """Publish this machine's ``kanban.sync.pickup`` (None → null) on its own registry row."""
+diff --git a/hermes_cli/machine_cpu_metrics.py b/hermes_cli/machine_cpu_metrics.py
+index 26ff4962d3f..a744e21f50c 100644
+--- a/hermes_cli/machine_cpu_metrics.py
++++ b/hermes_cli/machine_cpu_metrics.py
+@@ -26,6 +26,7 @@ WINDOW_S = 1.0
+ MIN_WINDOW_MS = 1000
+ MAX_WINDOW_MS = 2000
+ CONFIG_KEY = ("kanban", "admission", "cpu_busy_below_pct")
++FIELDS = ("cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms")
+ 
+ 
+ def parse_proc_stat(text: str) -> Optional[tuple[int, int]]:
+diff --git a/hermes_cli/machine_drain_metrics.py b/hermes_cli/machine_drain_metrics.py
+index e5678e2e351..63236005017 100644
+--- a/hermes_cli/machine_drain_metrics.py
++++ b/hermes_cli/machine_drain_metrics.py
+@@ -31,13 +31,21 @@ def collect():
+     return result
+ 
+ 
++# Fields newer Boards accept and older Boards reject (400, atomically). CPU busy fields are never resent: the
++# compatibility retry strips them, so an old CPU sample is never re-stamped as fresh.
++ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms")
++
++
+ def send_compatible(send, sample):
+-    """Old Boards reject unknown metrics atomically; retry only additive drain fields."""
++    """Old Boards reject unknown metrics atomically; retry once with every additive field removed.
++
++    Only a 400 on a sample that carried an additive field is retried; any other error (timeouts included) is raised
++    and the sample is dropped. An unrelated validation error simply fails again on the retry and is raised."""
+     from hermes_cli.kanban_sync_client import HubError
+ 
+     try:
+         return send(sample)
+     except HubError as exc:
+-        if exc.status != 400 or not any(k in sample for k in ("drain_active", "drain_until_ms")):
++        if exc.status != 400 or not any(k in sample for k in ADDITIVE_FIELDS):
+             raise
+-        return send({k: v for k, v in sample.items() if k not in ("drain_active", "drain_until_ms")})
++        return send({k: v for k, v in sample.items() if k not in ADDITIVE_FIELDS})
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 408e60ad965..11edf67ed1a 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -5,6 +5,12 @@ calls; the kanban sync loop sends it with ``report_due()`` at most every :data:`
+ since worker-first-v1 (docs/worker-first-v1.md): the Board's worker-pool admission scores the reported sample, and
+ ``kanban_worker_placement.local_admission`` takes a fresh ``collect()`` before turning a policy card's grant into a
+ local run. Cards without ``placement_policy`` are still placed without it.
++
++Hub overflow: on a host whose installation-root config sets ``kanban.admission.cpu_busy_below_pct`` the reporter
++also takes a measured ~1 s CPU busy sample (``machine_cpu_metrics.sample``) immediately before each send and attaches
++the complete triple ``cpu_busy_pct``/``cpu_busy_window_ms``/``cpu_busy_sample_end_ms``. ``collect()`` itself never
++samples CPU busy. A CPU-bearing report has a hard 2 s total transport budget and is never replayed: a failed round
++drops its sample and the next round measures again.
+ """
+ from __future__ import annotations
+ 
+@@ -21,8 +27,8 @@ from typing import Any, Callable, Optional
+ 
+ _log = logging.getLogger(__name__)
+ 
+-REPORT_EVERY_S = 30.0
+-# A Board without the route (older deploy) answers 404/405: ask again rarely, not every 30 s.
++REPORT_EVERY_S = 10.0
++# A Board without the route (older deploy) answers 404/405: ask again rarely, not every 10 s.
+ UNSUPPORTED_RETRY_S = 600.0
+ _GB = 1024 ** 3
+ 
+@@ -128,10 +134,23 @@ class Reporter:
+     """Sends ``collect()`` to the Board at most every REPORT_EVERY_S; never raises into the sync loop."""
+ 
+     def __init__(self, send: Callable[[dict], Any], *, collect_fn: Optional[Callable[[], dict]] = None,
+-                 clock: Callable[[], float] = time.monotonic) -> None:
++                 clock: Callable[[], float] = time.monotonic,
++                 cpu_limit_fn: Optional[Callable[[], tuple]] = None,
++                 cpu_sample_fn: Optional[Callable[[], Optional[dict]]] = None) -> None:
+         self.send, self.collect_fn, self.clock = send, collect_fn, clock
++        self.cpu_limit_fn, self.cpu_sample_fn = cpu_limit_fn, cpu_sample_fn
+         self.next_at = 0.0
+ 
++    def _sample(self) -> dict:
++        from hermes_cli import machine_cpu_metrics as cpu
++        sample = dict((self.collect_fn or collect)())
++        state, _limit = (self.cpu_limit_fn or cpu.root_limit)()
++        if state == cpu.ON:  # only the gated hub pays the ~1 s measurement, taken last: right before sending
++            measured = (self.cpu_sample_fn or cpu.sample)()
++            if measured and all(k in measured for k in cpu.FIELDS):
++                sample.update({k: measured[k] for k in cpu.FIELDS})
++        return sample
++
+     def report_due(self) -> bool:
+         now = self.clock()
+         if now < self.next_at:
+@@ -139,7 +158,7 @@ class Reporter:
+         self.next_at = now + REPORT_EVERY_S
+         try:
+             from hermes_cli.machine_drain_metrics import send_compatible
+-            send_compatible(self.send, (self.collect_fn or collect)())
++            send_compatible(self.send, self._sample())
+             return True
+         except Exception as exc:  # health: allow BLE001 -- load reporting must never stop kanban sync
+             status = getattr(exc, "status", None)
+diff --git a/tests/hermes_cli/test_kanban_sync_metrics_budget.py b/tests/hermes_cli/test_kanban_sync_metrics_budget.py
+new file mode 100644
+index 00000000000..75088315cc9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_metrics_budget.py
+@@ -0,0 +1,94 @@
++"""A CPU-bearing metrics POST has a hard 2 s total budget (real local HTTP server, real sockets)."""
++import http.server
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_sync_client as ksc
++
++CPU = {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1_700_000_000_000}
++
++
++class Server:
++    def __init__(self, mode):
++        self.requests = []
++        outer = self
++
++        class H(http.server.BaseHTTPRequestHandler):
++            protocol_version = "HTTP/1.1"
++
++            def log_message(self, *a):
++                pass
++
++            def do_POST(self):
++                n = int(self.headers.get("content-length") or 0)
++                outer.requests.append((self.path, self.rfile.read(n)))
++                if mode == "stall":
++                    time.sleep(4)
++                    body = b"{}"
++                    self.send_response(200)
++                    self.send_header("content-length", str(len(body)))
++                    self.end_headers()
++                    self.wfile.write(body)
++                elif mode == "trickle":  # headers fast, then one byte every 0.4 s: each recv is within its timeout
++                    body = b'{"ok": true}' + b" " * 12
++                    self.send_response(200)
++                    self.send_header("content-length", str(len(body)))
++                    self.end_headers()
++                    for i in range(len(body)):
++                        try:
++                            self.wfile.write(body[i:i + 1])
++                            self.wfile.flush()
++                        except OSError:
++                            return
++                        time.sleep(0.4)
++                else:
++                    body = b'{"ok": true}'
++                    self.send_response(200)
++                    self.send_header("content-length", str(len(body)))
++                    self.end_headers()
++                    self.wfile.write(body)
++
++        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
++        self.httpd.daemon_threads = True
++        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
++        self.url = f"http://127.0.0.1:{self.httpd.server_port}"
++
++    def close(self):
++        self.httpd.shutdown()
++        self.httpd.server_close()
++
++
++@pytest.fixture
++def server(request):
++    s = Server(request.param)
++    yield s
++    s.close()
++
++
++def hub(url):
++    return ksc.Hub(ksc.Identity(url=url, key="k" * 16, gateway="gw"))
++
++
++@pytest.mark.parametrize("server", ["stall", "trickle"], indirect=True)
++def test_cpu_report_has_hard_total_budget(server, monkeypatch):
++    monkeypatch.setattr(ksc.urllib.request, "getproxies", dict)
++    t0 = time.monotonic()
++    with pytest.raises(TimeoutError):
++        hub(server.url).report_metrics({"cpus": 4, **CPU})
++    assert time.monotonic() - t0 <= ksc.CPU_REPORT_BUDGET_S + 0.25
++    assert len(server.requests) == 1  # sent once, never resent
++
++
++@pytest.mark.parametrize("server", ["ok"], indirect=True)
++def test_cpu_report_succeeds_inside_budget_and_plain_report_keeps_normal_path(server, monkeypatch):
++    monkeypatch.setattr(ksc.urllib.request, "getproxies", dict)
++    h = hub(server.url)
++    assert h.report_metrics({"cpus": 4, **CPU}) == {"ok": True}
++    assert h.report_metrics({"cpus": 4}) == {"ok": True}
++    assert len(server.requests) == 2
++
++
++def test_cpu_report_budget_is_two_seconds():
++    assert ksc.CPU_REPORT_BUDGET_S == 2.0
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index e2098b71178..6b143a9301c 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -37,14 +37,15 @@ def test_collect_reads_this_machine(tmp_path: Path):
+     assert "drain_until_ms" not in out or out.get("drain_active") == 1
+ 
+ 
+-def test_reporter_sends_at_most_every_30s_and_backs_off_on_old_board():
++def test_reporter_sends_at_most_every_10s_and_backs_off_on_old_board():
+     sent, now = [], [1000.0]
+     r = mm.Reporter(sent.append, collect_fn=lambda: {"cpus": 4}, clock=lambda: now[0])
+     assert r.report_due() and sent == [{"cpus": 4}]
+-    now[0] += 29
++    now[0] += 9.999
+     assert not r.report_due() and len(sent) == 1
+-    now[0] += 1
++    now[0] += 0.001
+     assert r.report_due() and len(sent) == 2
++    assert mm.REPORT_EVERY_S == 10.0
+ 
+     def old_board(_m):
+         raise ksc.HubError(404, "not found")
+@@ -79,4 +80,72 @@ def test_sync_loop_reports_metrics_once_per_window(monkeypatch):
+     monkeypatch.setattr(mm, "collect", lambda disk_path=None: {"cpus": 2})
+     rounds = iter([True, True, True, False])
+     ksc.run_forever(lambda: next(rounds), interval=1)
+-    assert reported == [{"cpus": 2}]  # three rounds inside one 30 s window
++    assert reported == [{"cpus": 2}]  # three rounds inside one 10 s window
++
++
++CPU = {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1_700_000_000_000}
++CPU_KEYS = set(CPU)
++
++
++def cpu_reporter(send, *, limit=("on", 50.0), cpu=lambda: dict(CPU), calls=None, now=None):
++    calls = [] if calls is None else calls
++    now = [1000.0] if now is None else now
++
++    def collect():
++        calls.append("collect")
++        return {"cpus": 4, "drain_active": 0}
++
++    def sample():
++        calls.append("cpu")
++        return cpu()
++    return mm.Reporter(send, collect_fn=collect, clock=lambda: now[0], cpu_limit_fn=lambda: limit,
++                       cpu_sample_fn=sample)
++
++
++def test_cpu_triple_only_when_root_gate_configured_and_sampled_last():
++    sent, calls = [], []
++    assert cpu_reporter(sent.append, calls=calls).report_due()
++    assert sent == [{"cpus": 4, "drain_active": 0, **CPU}] and calls == ["collect", "cpu"]
++    for limit in (("off", None), ("unknown", None)):
++        sent, calls = [], []
++        assert cpu_reporter(sent.append, limit=limit, calls=calls).report_due()
++        assert sent == [{"cpus": 4, "drain_active": 0}] and calls == ["collect"]  # never samples off-hub
++
++
++def test_incomplete_cpu_measurement_is_omitted_never_coerced_to_idle():
++    sent = []
++    assert cpu_reporter(sent.append, cpu=lambda: None).report_due()
++    assert not CPU_KEYS & set(sent[0])
++
++
++def test_old_board_fallback_strips_cpu_and_drain_fields_once():
++    sent = []
++
++    def send(value):
++        sent.append(value)
++        if CPU_KEYS & set(value) or "drain_active" in value:
++            raise ksc.HubError(400, "unknown metric")
++    assert cpu_reporter(send).report_due()
++    assert sent[1] == {"cpus": 4} and len(sent) == 2  # the retry never carries the (now older) CPU sample
++
++
++def test_failed_cpu_report_is_never_replayed_next_round_takes_a_fresh_sample():
++    sent, now, n = [], [1000.0], [0]
++
++    def cpu():
++        n[0] += 1
++        return {**CPU, "cpu_busy_sample_end_ms": CPU["cpu_busy_sample_end_ms"] + n[0]}
++
++    def send(value):
++        sent.append(value)
++        raise TimeoutError("CPU metrics report exceeded its 2 s budget")
++    r = cpu_reporter(send, cpu=cpu, now=now)
++    assert r.report_due() is False and len(sent) == 1  # a timeout is not retried in-round
++    now[0] += mm.REPORT_EVERY_S
++    assert r.report_due() is False and len(sent) == 2
++    assert sent[0]["cpu_busy_sample_end_ms"] != sent[1]["cpu_busy_sample_end_ms"]
++
++
++def test_worker_load_fields_unchanged_by_cpu_gate(tmp_path):
++    out = mm.collect(disk_path=tmp_path)
++    assert not CPU_KEYS & set(out)  # collect() never blocks on a CPU sample; only the hub reporter adds it
+-- 
+2.55.0
+

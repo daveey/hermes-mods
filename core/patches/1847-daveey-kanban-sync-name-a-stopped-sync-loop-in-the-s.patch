@@ -1,0 +1,487 @@
+From 4dfb4cc1f02a3600eed9bf0541f584e36fb8a254 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:19:00 -0800
+Subject: [PATCH] [daveey] kanban sync: name a stopped sync loop in the stuck
+ warning, sync status and create
+
+Incident (MacBook, 2026-11-02 20:47 PT): the gateway logged "kanban sync: not starting: board default: this
+core does not declare columns a newer core added (tasks: last_spawn_error, spawn_failures)" once, and its sync
+watcher never respun. With sync enabled every claim goes through the Board lease, so the board stalled (52 outbox
+ops unpushed, 15 ready, 0 running). Nothing said why: the dispatcher-stuck warning named only claim_deferred /
+skipped_ineligible counts, `hermes kanban sync status` printed last_error: None (it reads outbox rows only), and
+kanban_create(placement="hub") kept returning local runs_on=[machine:hub] rows that only the stopped loop could
+push. The root cause is fixed in #764; this is the detection half, for any future start refusal (a schema-ahead
+refusal is legitimate after a core rollback).
+
+- hermes_cli/kanban_sync_runstate.py (new): run_forever records {running: false, since, reason, pid} atomically in
+  <kanban home>/kanban/.sync-state.json when it refuses to start (no identity, schema-ahead board), gives the sync
+  role up mid-run, stops, or crashes. A completed round clears the file. Readers trust it only while
+  kanban.sync.enabled is on.
+- stuck_warning: when claims are deferred and the record says sync is down, the line says
+  "... and kanban sync not running since <time>: <reason>" instead of pointing at runs_on/placement.
+  The dispatcher health JSON (.dispatcher-health.json) has no reason field, so it is unchanged.
+- sync status: new "running" row ("no: kanban sync not running since ...: <reason>" / "yes (no stop recorded)").
+- kanban_create: while sync is down a machine pin is not rewritten to runs_on; it takes the gateway placement
+  route (relay) like any other pin, and an explicit or marker-derived runs_on is refused (sync_not_running)
+  naming the sync state. Courier creates are unchanged. Claim behaviour is unchanged.
+
+Tests (tests/hermes_cli/test_kanban_sync_schema_guard.py, pre_rename_live + upstream_new_field fixture): a
+refused start names the state in the stuck warning and in sync status; a healthy round clears it and the warning
+has no sync clause; a loop exit is recorded; the state is ignored with sync off; a machine-pin create while sync is
+down returns no runs_on row (placement pin and explicit runs_on) and a pin takes the gateway relay. 7 of them fail
+with the production changes reverted.
+---
+ hermes_cli/kanban_db_dispatch_stuck.py        |   6 +
+ hermes_cli/kanban_sync_client.py              |  42 ++++-
+ hermes_cli/kanban_sync_runstate.py            | 124 ++++++++++++++
+ .../test_kanban_sync_schema_guard.py          | 155 ++++++++++++++++++
+ tools/kanban_tools.py                         |  15 +-
+ 5 files changed, 328 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_runstate.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index a6572cd7d36..be06c5bd226 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -91,6 +91,12 @@ def stuck_warning(bad_ticks: int, results: Iterable[Optional[Any]]) -> str:
+            f"spawned.{f' Last tick held back: {held}.' if held else ''}")
+     lease_bound = any(res is not None and (res.claim_deferred or res.skipped_ineligible) for res in results)
+     if lease_bound:
++        # With sync enabled every claim goes through the Board lease: a stopped sync loop explains them all. [daveey]
++        from hermes_cli import kanban_sync_runstate as runstate
++        stopped = runstate.describe()
++        if stopped:
++            return (msg + f" The Board lease refused or deferred claims and {stopped}. Restart the gateway once "
++                    "the cause is fixed (`hermes kanban sync status` shows the same state).")
+         return (msg + " The Board lease refused or deferred claims: check the cards' runs_on / placement "
+                 "(`hermes kanban show <id>`) and which machine holds or may take their Board lease.")
+     return msg + " Check profile health (venv, PATH, credentials) and `hermes kanban list --status ready`."
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index aeee85dcb5e..798e5d52e79 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1339,12 +1339,26 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+     feed socket per synced board. Connected boards pull on feed/local invalidation; disconnected boards and
+     failed pulls retain the poll period. An independent full recovery audits all boards at least every 60s
+     (or the configured period if longer), subject to in-flight IO and the next poll tick."""
++    from hermes_cli import kanban_sync_runstate as runstate
++    # Record why the loop is not running, so the stuck-dispatcher warning, ``sync status`` and create name it
++    # instead of a board that silently stalls behind the Board lease (MacBook, 2026-11-02). [daveey]
++    try:
++        _run_forever(keep_running, interval, runstate)
++    except BaseException as exc:
++        runstate.record_down(f"kanban sync loop crashed: {type(exc).__name__}: {exc}")
++        raise
++
++
++def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], runstate: Any) -> None:
+     try:
+         ident = load_identity()
+     except SyncUnavailable as exc:
+         _log.warning("%s; kanban sync not started", exc)
++        runstate.record_down(f"not starting: {exc}")
+         return
+-    if _schema_ahead_boards(board_paths()):
++    ahead = _schema_ahead_boards(board_paths())
++    if ahead:
++        runstate.record_down("not starting: " + "; ".join(f"board {slug}: {why}" for slug, why in ahead))
+         return  # give the host sync role up: a current core's gateway can take it [daveey]
+     hub = Hub(ident)
+     sync.set_lease_client(HubLeaseClient(hub))
+@@ -1368,9 +1382,12 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+         selected = work.select(boards, time.monotonic(), outbox_pending)
+         selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
+         results = sync_all_once(hub, boards=selected)
+-        if any((r.error or "").startswith("SchemaAhead") for r in results):
++        ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
++        if ahead:
+             _log.error("kanban sync: a newer core migrated this host's board; giving up the sync role")
++            runstate.record_down("gave up the sync role: " + "; ".join(f"board {r.board}: {r.error}" for r in ahead))
+             return
++        runstate.clear()  # a completed round: the loop runs
+         for r in results:
+             work.finished(r.board, not r.error)
+             if r.push and (r.push.sent or r.push.rejected):
+@@ -1385,10 +1402,12 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+         if deferred_due is not None:
+             remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+         wait_for_work(wake, [p for _s, p in boards], remaining, keep_running)
++    runstate.record_down("stopped (gateway stopping, or the host sync lease went to another gateway)")
+ 
+ 
+-def _schema_ahead_boards(boards: list[tuple[str, Path]]) -> list[str]:
+-    """Boards a newer core migrated (logged at ERROR). An unreadable board is left to the round's own errors."""
++def _schema_ahead_boards(boards: list[tuple[str, Path]]) -> list[tuple[str, str]]:
++    """``(slug, refusal)`` per board a newer core migrated (logged at ERROR). An unreadable board is left to the
++    round's own errors."""
+     ahead = []
+     for slug, path in boards:
+         try:
+@@ -1398,7 +1417,7 @@ def _schema_ahead_boards(boards: list[tuple[str, Path]]) -> list[str]:
+             cols = {}
+         if cols:
+             _log.error("kanban sync: not starting: board %s: %s", slug, SchemaAhead(cols))
+-            ahead.append(slug)
++            ahead.append((slug, str(SchemaAhead(cols))))
+     return ahead
+ 
+ 
+@@ -1567,9 +1586,16 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
+         r = conn.execute("SELECT last_error FROM kanban_sync_outbox WHERE last_error IS NOT NULL "
+                          "ORDER BY created_at DESC LIMIT 1").fetchone()
+         last_error = r[0] if r else None
+-    return {"mode": sync.board_mode(conn), "board_id": st.get("board_id"), "gateway": st.get("gateway_id"),
+-            "cursor": st.get("cursor"), "pending": counts.get("pending", 0), "rejected": counts.get("rejected", 0),
+-            "last_error": last_error}
++    mode = sync.board_mode(conn)
++    out = {"mode": mode, "board_id": st.get("board_id"), "gateway": st.get("gateway_id"),
++           "cursor": st.get("cursor"), "pending": counts.get("pending", 0), "rejected": counts.get("rejected", 0),
++           "last_error": last_error}
++    if mode != "off":
++        # A refused start writes no outbox row, so ``last_error`` alone read a stalled board as healthy. [daveey]
++        from hermes_cli import kanban_sync_runstate as runstate
++        stopped = runstate.describe()
++        out["running"] = f"no: {stopped}" if stopped else "yes (no stop recorded)"
++    return out
+ 
+ 
+ _DIFF_SKIP = {"current_run_id"}  # compared as run uids instead
+diff --git a/hermes_cli/kanban_sync_runstate.py b/hermes_cli/kanban_sync_runstate.py
+new file mode 100644
+index 00000000000..4a00112b73f
+--- /dev/null
++++ b/hermes_cli/kanban_sync_runstate.py
+@@ -0,0 +1,124 @@
++"""Whether this host's kanban sync loop is running, where the dispatcher, ``sync status`` and create can read it. [daveey]
++
++Incident (2026-11-02, MacBook): the gateway logged ``kanban sync: not starting: board default: ...`` once and its
++sync watcher never respun. With sync enabled every claim goes through the Board lease, so the board stalled (52
++outbox ops unpushed, 15 ready, 0 running) while the "dispatcher stuck" warning named only ``claim_deferred`` counts,
++``hermes kanban sync status`` printed ``last_error: None``, and ``kanban_create(placement=<machine>)`` kept returning
++local ``runs_on`` rows that could only reach the Board through the stopped loop.
++
++``run_forever`` records ``{running: false, since, reason}`` here when it refuses to start or exits; its first
++completed round clears the file. Readers only trust it while ``kanban.sync.enabled`` is on.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++__all__ = ["clear", "describe", "down", "explicit_runs_on", "path", "placement_runs_on", "record_down", "stranded_create"]
++
++_FILE = ".sync-state.json"
++
++
++def path() -> Path:
++    """Beside the host's ``.sync.lock`` (one sync loop per host)."""
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "kanban" / _FILE
++
++
++def record_down(reason: str) -> None:
++    """The loop is not running. Keeps the first ``since`` while the reason is unchanged (a respun refusal)."""
++    target = path()
++    previous = _read(target)
++    since = time.time()
++    if previous and previous.get("running") is False and previous.get("reason") == reason:
++        since = float(previous.get("since") or since)
++    record = {"running": False, "since": since, "reason": str(reason), "pid": os.getpid()}
++    try:
++        target.parent.mkdir(parents=True, exist_ok=True)
++        temp = target.with_name(f"{_FILE}.{os.getpid()}.tmp")
++        temp.write_text(json.dumps(record), encoding="utf-8")
++        temp.replace(target)
++    except OSError:
++        from hermes_cli.kanban_sync_client import _log
++        _log.warning("kanban sync: cannot record the sync loop state at %s", target, exc_info=True)
++
++
++def clear() -> None:
++    """A round completed: the loop runs. One stat per round when nothing was recorded."""
++    target = path()
++    try:
++        if target.exists():
++            target.unlink()
++    except OSError:
++        pass
++
++
++def _read(target: Path) -> Optional[dict[str, Any]]:
++    try:
++        record = json.loads(target.read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    return record if isinstance(record, dict) else None
++
++
++def down() -> Optional[dict[str, Any]]:
++    """The recorded stop while sync is enabled, else None (no record, or sync is off so nothing waits on it)."""
++    try:
++        from hermes_cli import kanban_db_sync as sync
++        if not sync.sync_enabled():
++            return None
++    except Exception:  # health: allow BLE001 -- a diagnostic read must never break the dispatcher or create
++        return None
++    record = _read(path())
++    if not record or record.get("running") is not False:
++        return None
++    return record
++
++
++def _when(since: Any) -> str:
++    try:
++        return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(float(since)))
++    except (TypeError, ValueError, OverflowError):
++        return "an unknown time"
++
++
++def describe(record: Optional[dict[str, Any]] = None) -> str:
++    """``kanban sync not running since <time>: <reason>``, or ``""`` when sync runs (or is off)."""
++    record = down() if record is None else record
++    if not record:
++        return ""
++    return f"kanban sync not running since {_when(record.get('since'))}: {record.get('reason') or 'unknown reason'}"
++
++
++def placement_runs_on(conn: Any, placement: Any) -> Optional[list[str]]:
++    """``kanban_worker_node.placement_runs_on``, except None while sync is down: a machine pin then takes the
++    gateway route (the placement relay) instead of a local ``runs_on`` row nothing can push. [daveey]"""
++    if down():
++        return None
++    from hermes_cli import kanban_worker_node as wn
++    return wn.placement_runs_on(conn, placement)
++
++
++def explicit_runs_on(conn: Any, value: Any, *, courier: bool = False) -> Optional[list[str]]:
++    """``kanban_worker_node.explicit_runs_on`` (machine pins need pickup), and ValueError for a row the stopped
++    sync would strand."""
++    from hermes_cli import kanban_worker_node as wn
++    labels = wn.explicit_runs_on(conn, value)
++    stranded = stranded_create(labels, courier=courier)
++    if stranded:
++        raise ValueError(stranded)
++    return labels
++
++
++def stranded_create(runs_on: Optional[list[str]], *, courier: bool = False) -> str:
++    """Why a create must not make this ``runs_on`` row (it reaches its machine only through this host's stopped
++    sync), else ``""``. A courier create keeps its own retry. 2026-11-02: placement="hub" cards stranded. [daveey]"""
++    stopped = describe() if runs_on and not courier else ""
++    if not stopped:
++        return ""
++    return (f"Not created: this card needs runs_on={runs_on}, which reaches its machine only through this host's "
++            f"Board sync, and {stopped}. Use placement='<gateway>' to relay it to a gateway, or retry once "
++            "`hermes kanban sync status` shows running: yes. Nothing changed.")
+diff --git a/tests/hermes_cli/test_kanban_sync_schema_guard.py b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+index 35e5248b9c1..3a5e2d913c2 100644
+--- a/tests/hermes_cli/test_kanban_sync_schema_guard.py
++++ b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+@@ -230,3 +230,158 @@ def test_every_rename_source_column_is_declared_retired():
+     sources = {src for _new, _ddl, src, _copy in kbc._RENAMED_TASK_COLUMNS if src}
+     assert sources and sources == sync.RETIRED_COLUMNS["tasks"]
+     assert not sync.RETIRED_COLUMNS["tasks"] & (sync.SYNCED_COLUMNS["tasks"] | sync.LOCAL_COLUMNS["tasks"])
++
++
++# Incident (2026-11-02, MacBook), the detection half: after that refusal the loop never respun, every claim went
++# through the Board lease, and the board stalled (52 outbox ops unpushed, 15 ready, 0 running). The stuck warning
++# named only ``claim_deferred`` counts, ``sync status`` printed ``last_error: None`` and ``kanban_create`` kept
++# returning local ``runs_on`` rows. ``run_forever`` now records why it is not running (kanban_sync_runstate).
++
++def _runstate():
++    from hermes_cli import kanban_sync_runstate
++    return kanban_sync_runstate
++
++
++def _run_sync_loop(kanban_home, svc, monkeypatch, rounds=1):
++    """``run_forever`` against the fake Board for ``rounds`` completed rounds (or its start refusal). Returns the
++    recorded sync state seen while the loop was still running, one per round."""
++    from hermes_cli import machine_metrics
++
++    hub = svc.hub(ME)
++    monkeypatch.setattr(ksc, "load_identity", lambda: hub.ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident: hub)
++    monkeypatch.setattr(ksc.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(ksc, "board_paths", lambda: [(BOARD, kanban_home / "kanban.db")])
++    monkeypatch.setattr(ksc, "reconcile_links", lambda *args, **kwargs: None)
++    monkeypatch.setattr(machine_metrics, "Reporter", lambda *args: type("R", (), {"report_due": lambda self: None})())
++    monkeypatch.setattr(hub, "report_metrics", lambda *args: None, raising=False)
++
++    class Feed:
++        def __init__(self, *args, **kwargs):
++            pass
++
++        def run(self):
++            return None
++
++    monkeypatch.setattr(ksc, "FeedWatcher", Feed)
++    left = [rounds]
++    seen = []
++
++    def wait(*args):
++        seen.append(_runstate().describe())
++        left[0] -= 1
++
++    monkeypatch.setattr(ksc, "wait_for_work", wait)
++    ksc.run_forever(lambda: left[0] > 0, interval=1)
++    return seen
++
++
++def _deferred_tick():
++    """The stuck line of a tick shaped like the MacBook's (claims deferred, cards not leasable here)."""
++    from hermes_cli import kanban_db_dispatch as kbd
++    res = kbd.DispatchResult()
++    res.claim_deferred.append(("t_a", "not_found"))
++    res.claim_deferred.append(("t_b", "not_claimable"))
++    res.skipped_ineligible.append(("t_c", "labels_mismatch"))
++    return kbd.stuck_warning(6, [res])
++
++
++def _refuse_start(kanban_home, pre_rename_live, svc, monkeypatch):
++    with kbc.write_txn(pre_rename_live):
++        pre_rename_live.execute("ALTER TABLE tasks ADD COLUMN upstream_new_field TEXT")
++    assert _run_sync_loop(kanban_home, svc, monkeypatch) == []  # refused: no round ran
++
++
++def test_refused_sync_start_is_named_by_the_stuck_dispatcher_warning(kanban_home, pre_rename_live, svc, monkeypatch):
++    _refuse_start(kanban_home, pre_rename_live, svc, monkeypatch)
++    msg = _deferred_tick()
++    assert "claim_deferred(not_found)=1" in msg
++    assert "kanban sync not running since " in msg
++    assert "upstream_new_field" in msg and "board default" in msg, msg
++
++
++def test_refused_sync_start_is_named_by_sync_status(kanban_home, pre_rename_live, svc, monkeypatch, capsys):
++    import argparse
++    from hermes_cli import kanban_sync_cli
++    _refuse_start(kanban_home, pre_rename_live, svc, monkeypatch)
++    assert ksc.status(pre_rename_live)["running"].startswith("no: kanban sync not running since ")
++    assert kanban_sync_cli._status(argparse.Namespace(board=BOARD, json=False)) == 0
++    out = capsys.readouterr().out
++    assert "running: no: kanban sync not running since" in out and "upstream_new_field" in out, out
++
++
++def test_healthy_round_clears_the_sync_state(kanban_home, pre_rename_live, svc, monkeypatch):
++    _refuse_start(kanban_home, pre_rename_live, svc, monkeypatch)
++    assert "kanban sync not running" in _deferred_tick()
++    with kbc.write_txn(pre_rename_live):
++        pre_rename_live.execute("ALTER TABLE tasks DROP COLUMN upstream_new_field")  # the newer core's column gone
++    assert _run_sync_loop(kanban_home, svc, monkeypatch) == [""]  # cleared by the round, while the loop runs
++    _runstate().clear()  # drop the loop's own exit record (covered below): this asserts the running state
++    msg = _deferred_tick()
++    assert "kanban sync not running" not in msg and "runs_on / placement" in msg
++    assert ksc.status(pre_rename_live)["running"].startswith("yes")
++
++
++def test_sync_loop_exit_while_enabled_is_recorded(kanban_home, pre_rename_live, svc, monkeypatch):
++    _run_sync_loop(kanban_home, svc, monkeypatch)
++    assert "stopped" in _runstate().describe()
++
++
++def test_sync_state_is_ignored_when_sync_is_off(kanban_home, pre_rename_live, svc, monkeypatch):
++    _refuse_start(kanban_home, pre_rename_live, svc, monkeypatch)
++    support.write_sync_config(kanban_home, False)
++    assert _runstate().describe() == ""
++    assert "kanban sync not running" not in _deferred_tick()
++
++
++@pytest.fixture
++def machine_pin_create(kanban_home, pre_rename_live, monkeypatch):
++    """A primary board whose registry lists worker-1 as a machine that picks up other gateways' cards."""
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_worker_node as wn
++    monkeypatch.setattr(reg, "self_gateway", lambda: ME)
++    wn.set_registry_fetch(lambda: {"me": ME, "machines": [
++        {"name": "worker-1", "state": "active", "labels": ["linux"], "pickup": "all"}]})
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", BOARD)
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    from tools import kanban_tools as kt
++    try:
++        yield kt
++    finally:
++        wn.set_registry_fetch(None)
++
++
++def _runs_on_rows(conn):
++    return conn.execute("SELECT id, runs_on FROM tasks WHERE runs_on IS NOT NULL").fetchall()
++
++
++def test_machine_pin_create_with_sync_running_makes_a_runs_on_row(machine_pin_create, pre_rename_live):
++    out = json.loads(machine_pin_create._handle_create({"title": "Summarize public data", "assignee": "default",
++                                                        "placement": "worker-1", "requires": []}))
++    assert out.get("runs_on") == ["machine:worker-1"], out
++
++
++@pytest.mark.parametrize("pin", [{"placement": "worker-1"}, {"runs_on": ["machine:worker-1"]}])
++def test_machine_pin_create_while_sync_is_down_never_returns_a_stranded_row(machine_pin_create, pre_rename_live,
++                                                                            pin):
++    _runstate().record_down("not starting: board default: SchemaAhead(test)")
++    out = json.loads(machine_pin_create._handle_create({"title": "Summarize public data", "assignee": "default",
++                                                        "requires": [], **pin}))
++    assert _runs_on_rows(pre_rename_live) == [], out
++    assert "error" in out, out
++
++
++def test_machine_pin_create_while_sync_is_down_takes_the_gateway_relay(machine_pin_create, pre_rename_live,
++                                                                      monkeypatch):
++    """A name that is both a gateway and an enrolled machine (``hub``) goes through the placement relay."""
++    from hermes_cli import kanban_placement as kp
++    sent = []
++    monkeypatch.setattr(kp, "target_live", lambda target, **kw: None)  # the gateway answers the relay
++    monkeypatch.setattr(kp, "create_remote", lambda view, **kw: sent.append(kw["target"]) or
++                        {"ok": True, "request_id": "r_1", "queued_only": True})
++    _runstate().record_down("not starting: board default: SchemaAhead(test)")
++    out = json.loads(machine_pin_create._handle_create({"title": "Summarize public data", "assignee": "default",
++                                                        "requires": [], "placement": "worker-1"}))
++    assert sent == ["worker-1"] and out.get("status") == "queued", out
++    assert _runs_on_rows(pre_rename_live) == []
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index da2db061817..4ed3b60c9fe 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1494,14 +1494,17 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                 "project_id": project_id}
+         from hermes_cli import kanban_worker_node as _wn
+         # runs_on only works on a board that syncs as primary; the machine check is kp._machine_picks_up.
+-        machine_ok = ((lambda m: _wn.sync.board_mode(conn) == "primary" and kp._machine_picks_up(m))
+-                      if conn is not None else None)
++        from hermes_cli import kanban_sync_runstate as _runstate  # down: a machine pin takes the gateway route
++        machine_ok = ((lambda m: _wn.sync.board_mode(conn) == "primary" and kp._machine_picks_up(m)
++                       and not _runstate.down()) if conn is not None else None)
+         decision = kp.decide(view, machine_ok=machine_ok)
+         target = decision["where"]
+         if target == "refuse":
+             return _placement_refused(decision["pin"], decision.get("why", "")), None
+         if target == "local":
+-            return None, _local_placement(kp, view, decision, machine_ok=machine_ok, note_local_pin=note_local_pin)
++            local = _local_placement(kp, view, decision, machine_ok=machine_ok, note_local_pin=note_local_pin)
++            stranded = _runstate.stranded_create((local or {}).get("runs_on"))
++            return (tool_error(stranded, rejection="sync_not_running"), None) if stranded else (None, local)
+         self_gw = reg.self_gateway() or "local"
+         cfg = kp.config()
+         placed = kp.create_remote(view, target=target, origin_session=session_id,
+@@ -1634,14 +1637,14 @@ def _handle_create(args: dict, **kw) -> str:
+         # Placement on a synced board: ``runs_on`` labels, and a pin to an enrolled machine that advertises
+         # pickup becomes ``runs_on=[machine:<name>]`` (created here, run there through the Board lease). Any
+         # other pin, a routed gateway included, falls through to the gateway route below. [daveey]
+-        from hermes_cli import kanban_worker_node as _wn
++        from hermes_cli import kanban_sync_runstate as _runstate  # runs_on rows need this host's sync [daveey]
+         try:
+-            runs_on = _wn.explicit_runs_on(conn, args.get("runs_on"))  # machine pins need pickup
++            runs_on = _runstate.explicit_runs_on(conn, args.get("runs_on"), courier=origin_intent is not None)
+         except ValueError as exc:
+             return tool_error(str(exc))
+         pinned_machine = None
+         if runs_on is None and origin_intent is None:
+-            runs_on = _wn.placement_runs_on(conn, args.get("placement"))
++            runs_on = _runstate.placement_runs_on(conn, args.get("placement"))
+             if runs_on is not None:
+                 pinned_machine = str(args.get("placement")).strip()
+                 args = {**args, "placement": "local"}
+-- 
+2.55.0
+

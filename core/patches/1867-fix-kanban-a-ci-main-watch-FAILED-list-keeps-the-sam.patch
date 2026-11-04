@@ -1,0 +1,304 @@
+From b9e55cc72036b687d67b5635d92e9c7cb3e850ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:26:11 +0000
+Subject: [PATCH] fix(kanban): a ci-main-watch FAILED list keeps the
+ same-CI-run rule [daveey]
+
+ci_main_watch now writes each red run's `failed tests:` block (FAILED <node id> lines) into every red-main
+card. failure_identity turns those lines into `tests`, and same_failure refused a shared run only when
+neither card had tests, so once the owner carried the list the five same-run duplicates #732's replay
+refused got through again ("no match at all"): t_01a18505110a5892 and t_01a18507649f5425 against
+t_01a18504581b2063 (run 40785006949), t_88f89e55, t_ebcc8f52 and t_4129a258 against t_bdb6c497.
+
+A FAILED list is the whole run's failures, not a test the card is about:
+- FailureIdentity.listed is True when the tests came only from FAILED lines.
+- same_failure refuses on a shared run unless one card names its own test (title, or a failing
+  sentence of its opening). The test rule is unchanged: a listed test still matches a card naming it.
+- _reasons adds "titles share N words" only when the title ratio alone is >= 0.5; a failure match set
+  score to 1.0 and made refusals claim a title overlap the rule never found. Side effect: a same-run
+  or same-test match with no real title overlap is failure-only, so #732's cites rule now admits a card
+  that cites that owner by id (14-day replay: t_01a18bc2d209fb98, a close-out follow-up citing its
+  deflake owner t_01a18b57b9bfef18, was refused only by the false title reason).
+
+Tests: the five real pairs, owner as filed and with its FAILED block (40785006949 from its real job
+log; 39886244584's logs are HTTP 410, so the node ids other cards quote for it), local and replica.
+Card: t_01a1a05806da4ef0.
+---
+ hermes_cli/kanban_overlap.py                  | 37 +++++---
+ tests/tools/kanban_overlap_failure_cases.json | 49 +++++++++-
+ .../test_kanban_create_overlap_failure.py     | 90 ++++++++++++++++++-
+ 3 files changed, 161 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index 31ca6d360e0..759b152dd1d 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -134,9 +134,11 @@ def singleton_job(title: str) -> Optional[str]:
+ # failing test (``test_busy_board_open_does_not_block_session_poll``) or the same Actions run (41516070553), but their
+ # titles shared too few words for the overlap above. A card NAMES a failing test when its title carries a pytest
+ # function name (``test_\w+``), its body's opening paragraph carries a node id (``tests/…py::test_…``) in a sentence
+-# that says it fails, or its body has a pytest ``FAILED <node id>`` line (ci_main_watch lists them). A node id
+-# elsewhere in a body is context or a verification step ("the regression test tests/…::test_x checks …"), not the
+-# failure. A card names a run by ``actions/runs/<id>`` anywhere in its title or body.
++# that says it fails. A body whose only tests are pytest ``FAILED <node id>`` lines (ci_main_watch lists them) has
++# them as ``listed`` tests: they match a card naming one of them, but they are the run's failures, not a test the card
++# names, so that card still owns its run (t_01a1a05806da4ef0). A node id elsewhere in a body is context or a
++# verification step ("the regression test tests/…::test_x checks …"), not the failure. A card names a run by
++# ``actions/runs/<id>`` anywhere in its title or body.
+ _NODE = re.compile(r"(?<![\w-])(?:[\w.-]+/)*(test_\w+)\.py::(?:[A-Za-z_]\w*::)*(test_\w+)")
+ _BARE_TEST = re.compile(r"(?<![\w/.:-])(test_\w*[a-z0-9])(?![\w.:/-])")
+ _RUN = re.compile(r"\bactions/runs/(\d{6,})\b")
+@@ -155,6 +157,9 @@ class FailureIdentity(NamedTuple):
+     modules: frozenset  # test modules of the node ids named
+     bare: frozenset  # test names in the title without a module (may be a module: "test_kanban_db spawn tests fail")
+     runs: frozenset  # GitHub Actions run ids
++    # True when ``tests`` came only from ``FAILED <node id>`` lines (ci_main_watch's ``failed tests:`` block): the whole
++    # run's failures, not a test the card is about, so the card still owns the run (t_01a1a05806da4ef0).
++    listed: bool = False
+ 
+ 
+ def _node_names(text: str) -> tuple[set[str], set[str]]:
+@@ -179,30 +184,38 @@ def failure_identity(title: str, body: str) -> FailureIdentity:
+             if "::" in sentence and _FAILING.search(_NODE.sub(" ", sentence)):
+                 f, m = _node_names(sentence)
+                 funcs, mods = funcs | f, mods | m
+-    if "FAILED" in body and not funcs:
++    from_list = "FAILED" in body and not funcs
++    if from_list:
+         # Only a card whose subject is the log list (ci_main_watch: "main is red", then FAILED lines). A card that
+         # already named its test pastes a job tail whose FAILED lines include OTHER tests of that job.
+         for line in _FAILED_LINE.findall(body):
+             f, m = _node_names(line)
+             funcs, mods = funcs | f, mods | m
+     runs = set(_RUN.findall(title)) | (set(_RUN.findall(body)) if "actions/runs/" in body else set())
+-    return FailureIdentity(frozenset(f for f in funcs if len(f) >= _MIN_TEST_NAME), frozenset(mods),
+-                           frozenset(bare), frozenset(runs))
++    tests = frozenset(f for f in funcs if len(f) >= _MIN_TEST_NAME)
++    return FailureIdentity(tests, frozenset(mods), frozenset(bare), frozenset(runs), listed=from_list and bool(tests))
+ 
+ 
+ def same_failure(new: FailureIdentity, card: FailureIdentity) -> Optional[str]:
+     """Why two cards own one failure, else None: the same failing test function (a title's bare name may be the
+-    other card's test module), or the same Actions run when neither card names a failing test. One run fails many
+-    tests, so two cards naming different tests of one run are different failures."""
++    other card's test module), or the same Actions run when neither card names its own failing test. One run fails
++    many tests, so two cards naming different tests of one run are different failures. A run's FAILED list
++    (``listed``) is not a test the card names: it matches a card naming one of those tests, and the card still owns
++    the run."""
+     tests = (new.tests & card.tests) | (new.bare & card.modules) | (card.bare & new.modules)
+     if tests:
+         return "same failing test " + ", ".join(sorted(tests)[:3])
+     runs = new.runs & card.runs
+-    if runs and not new.tests and not card.tests:
++    if runs and not _names_own_test(new) and not _names_own_test(card):
+         return "same CI run " + ", ".join(f"actions/runs/{r}" for r in sorted(runs)[:3])
+     return None
+ 
+ 
++def _names_own_test(fi: FailureIdentity) -> bool:
++    """The card names a failing test of its own (title, or a failing sentence of its opening), not only a FAILED list."""
++    return bool(fi.tests) and not fi.listed
++
++
+ def _failure_reason(why: str) -> bool:
+     return why.startswith(("same failing test ", "same CI run "))
+ 
+@@ -237,8 +250,10 @@ def _reasons(card: dict, new_words: set[str], title: str, body: str, target_boar
+             and _names_board(card["board"], title, body, gateways)):
+         reasons.append(f"the new card names board {card['board']!r}")
+     if new_words and theirs:
+-        score = max(score, len(shared) / max(len(new_words), len(theirs)))
+-        if len(shared) >= MIN_SHARED and score >= 0.5:
++        ratio = len(shared) / max(len(new_words), len(theirs))
++        score = max(score, ratio)
++        # The title ratio alone: a failure match sets score to 1.0 without any title overlap.
++        if len(shared) >= MIN_SHARED and ratio >= 0.5:
+             reasons.append(f"titles share {len(shared)} words ({', '.join(sorted(shared))})")
+     return reasons, score
+ 
+diff --git a/tests/tools/kanban_overlap_failure_cases.json b/tests/tools/kanban_overlap_failure_cases.json
+index 1bc58a9c34f..c0f63214f94 100644
+--- a/tests/tools/kanban_overlap_failure_cases.json
++++ b/tests/tools/kanban_overlap_failure_cases.json
+@@ -55,14 +55,16 @@
+   "body": "main of daveey/hermes is red at 9cdafef2 (2026-10-23 03:00 UTC):\n\n- CI: cancelled on 9cdafef2 https://github.com/daveey/hermes/actions/runs/39886244584\n  failed jobs: JS & TS checks / JS & TS checks, Python tests / Run tests (1/2), All required checks pass (v2)\n- Termux verification: failure on 15bd9424 https://github.com/daveey/hermes/actions/runs/39883176310\n  failed jobs: Prebuilt TUI checks, Termux packaging contracts on Linux, Detect R2 credentials\n- .github/workflows/lockfile-diff.yml: failure on 15bd9424 https://github.com/daveey/hermes/actions/runs/39883175189\n- Docker Build, Test, and Publish: failure on 813413ee https://github.com/daveey/hermes/actions/runs/39833033372\n  failed jobs: Resolve release phase\n- Nix flake check: failure on 813413ee https://github.com/daveey/hermes/actions/runs/39833033437\n  failed jobs: Detect affected areas\n- auto-fix lint issues & formatting: failure on d5f8a69c https://github.com/daveey/hermes/actions/runs/39724765530\n  failed jobs: Generate eslint --fix patch\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until a green push run exists for main.",
+   "key": "ci-red:daveey/hermes:f5ec2367c980e0b1d6bad394705671236bbc39de",
+   "created_by": "ci-main-watch",
+-  "created": 1792724421
++  "created": 1792724421,
++  "body_listed": "main of daveey/hermes is red at 9cdafef2 (2026-10-23 03:00 UTC):\n\n- CI: cancelled on 9cdafef2 https://github.com/daveey/hermes/actions/runs/39886244584\n  failed jobs: JS & TS checks / JS & TS checks, Python tests / Run tests (1/2), All required checks pass (v2)\n  failed tests:\n  - FAILED tests/ci/test_docs_drift.py::test_no_new_undocumented_config_keys_or_slash_commands\n  - FAILED tests/gateway/test_session_api.py::test_interim_commentary_reaches_session_sse_and_responses_stream\n  - FAILED tests/test_hermes_constants.py::TestIsContainer::test_detects_dockerenv\n  - FAILED tests/test_hermes_constants.py::TestIsContainer::test_detects_kubernetes_env\n- Termux verification: failure on 15bd9424 https://github.com/daveey/hermes/actions/runs/39883176310\n  failed jobs: Prebuilt TUI checks, Termux packaging contracts on Linux, Detect R2 credentials\n- .github/workflows/lockfile-diff.yml: failure on 15bd9424 https://github.com/daveey/hermes/actions/runs/39883175189\n- Docker Build, Test, and Publish: failure on 813413ee https://github.com/daveey/hermes/actions/runs/39833033372\n  failed jobs: Resolve release phase\n- Nix flake check: failure on 813413ee https://github.com/daveey/hermes/actions/runs/39833033437\n  failed jobs: Detect affected areas\n- auto-fix lint issues & formatting: failure on d5f8a69c https://github.com/daveey/hermes/actions/runs/39724765530\n  failed jobs: Generate eslint --fix patch\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until a green push run exists for main."
+  },
+  "t_fa55aeb4": {
+   "title": "Fix red main CI: daveey/hermes (since 16c20ad1)",
+   "body": "main of daveey/hermes is red at 16c20ad1 (2026-10-26 22:23 UTC):\n\n- CI: failure on 16c20ad1 https://github.com/daveey/hermes/actions/runs/40399486841\n  failed jobs: Python tests / Run tests (1/2), All required checks pass (v2)\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until a green push run exists for main.",
+   "key": "ci-red:daveey/hermes:16c20ad1652a7f0464ca077fca00947223d3c2d5",
+   "created_by": "ci-main-watch",
+-  "created": 1793053412
++  "created": 1793053412,
++  "body_listed": "main of daveey/hermes is red at 16c20ad1 (2026-10-26 22:23 UTC):\n\n- CI: failure on 16c20ad1 https://github.com/daveey/hermes/actions/runs/40399486841\n  failed jobs: Python tests / Run tests (1/2), All required checks pass (v2)\n  failed tests:\n  - FAILED tests/tui_gateway/test_auto_continue.py::test_marker_roundtrip\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until a green push run exists for main."
+  },
+  "t_47d51eb4": {
+   "title": "Deflake tests/tui_gateway/test_auto_continue.py::test_marker_roundtrip",
+@@ -119,5 +121,48 @@
+   "key": "deflake:tests/gateway/test_multiplex_hot_serve.py::test_profile_control_verbs_round_trip_and_refusals",
+   "created_by": "ci-flaky-cards",
+   "created": 1793228667
++ },
++ "t_01a18504581b2063": {
++  "title": "Fix red main CI: daveey/hermes (since a0ebd73b)",
++  "body": "main of daveey/hermes is red at a0ebd73b (2026-10-29 00:16 UTC):\n\n- CI: failure on a0ebd73b https://github.com/daveey/hermes/actions/runs/40785006949\n  failed jobs: Python tests / Run tests (2/2), All required checks pass (v2)\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until a green push run exists for main.",
++  "key": "ci-red:daveey/hermes:a0ebd73b9c91b6a69f133898179c059ba592b4ee",
++  "created_by": "ci-main-watch",
++  "created": 1793233016,
++  "body_listed": "main of daveey/hermes is red at a0ebd73b (2026-10-29 00:16 UTC):\n\n- CI: failure on a0ebd73b https://github.com/daveey/hermes/actions/runs/40785006949\n  failed jobs: Python tests / Run tests (2/2), All required checks pass (v2)\n  failed tests:\n  - FAILED tests/ci/test_prompt_surface.py::test_committed_prompt_surface_is_current\n  - FAILED tests/tools/test_clarify_early_answer.py::test_decision_recorded_while_blocked_ends_the_clarify\n  - FAILED tests/tui_gateway/test_tui_gateway_server.py::test_session_resume_deferred_history_close_cancels_build\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until a green push run exists for main."
++ },
++ "t_01a18505110a5892": {
++  "title": "Fix load-fragile 2s wait in session-resume cancel test",
++  "body": "GOAL\nFix the single-test failure that made daveey/hermes CI run 40785006949 conclude failure, so a busy CI host cannot turn this test's deadlock guard into a red required check.\n\nEVIDENCE\n- Run https://github.com/daveey/hermes/actions/runs/40785006949 event=push head=a0ebd73b9c91b6a69f133898179c059ba592b4ee conclusion=failure (completed 2026-10-29T00:16Z).\n- Failed job: Python tests / Run tests (2/2), job 123156990828, runner ec2-gwgen-1, started 2026-10-28T23:31:07Z, test step failed.\n- Check-run annotation (the only failure): tests/tui_gateway/test_tui_gateway_server.py::test_session_resume_deferred_history_close_cancels_build KeyError '68b90e2c' at line 3823. Same annotation: 1 failed, 670 passed in 264.34s. Inner cause printed in captured stdout: `assert release_history.wait(timeout=2.0)` failed, then the resume error path emitted \"Could not reopen that session (its transcript could not be read)\" and removed the session before the test reached `server._sessions[sid]`.\n- Gate job 123181572825 failed only because \"1 job(s) failed: tests\".\n- Test source is unchanged from that head through origin/main 7adaa5306ee98531eafe21d4f15bddbf86969b1a (function at line 3783). No open card already owns this test.\n- At 00:12Z on ec2-gwgen-1, the host was running this shard plus dispatch run 40785530488 and e2e path tests: four node web.mjs builds at ~84% CPU and many pytest workers. The test's 2.0s waiter (line 3800) is the deadlock guard; the test only sets release_history after it closes the session (line 3830), which it never reached.\n\nFIVE WHYS\nProblem: shard 2 of push 40785006949 failed one test and the required gate, so the containing run could not be acceptance.\nWhy 1: the test looked up _sessions[sid] after that session was already gone — evidence: KeyError at line 3823, sid 68b90e2c.\nWhy 2: the deferred history loader's 2.0s wait expired and the error path tore the session down — evidence: annotation quotes `wait(timeout=2.0)` matching line 3800.\nWhy 3: the test thread did not close the session within 2s of the waiter starting — evidence: close is after resume() returns (lines 3826-3830); KeyError at 3823 means the session was gone before that close.\nWhy 4: the runner was CPU-saturated by concurrent jobs — evidence: ps on ec2-gwgen-1 at 00:12Z (four node builds ~84% plus other pytest workers).\nRoot (happened): the test uses a 2s wall-clock assert as its synchronization point. CI host contention exceeds that budget and the guard becomes a false failure.\nRoot (not caught): one timing failure fails the whole required Python shard; nothing retries or widens the guard under load.\nRecurrence: first observed here. Do not bump the timeout blindly without a regression that fails when the waiter is not released, and passes when it is released after a delay longer than 2s.\n\nACCEPTANCE\n- The deadlock guard no longer fails the test when the test thread is delayed past 2s but still closes the session.\n- A regression test or the existing test, run for real, fails if release_history is never set, and passes when it is set after a delay.\n- Do not cancel in-flight daveey/hermes main push runs to free a runner. This card is NOT a parent of t_01a184543d488b8d; a later fully green containing push still closes that card.\n",
++  "key": "flake:test_session_resume_deferred_history_close_cancels_build",
++  "created_by": "default",
++  "created": 1793233064
++ },
++ "t_01a18507649f5425": {
++  "title": "Finish the containing daveey/hermes CI green-run watch",
++  "body": "GOAL\nFinish the acceptance for parent card t_01a184543d488b8d. That card hit its 12-continuation limit while CI was still running. Do not complete t_01a184543d488b8d and do not complete t_01a181f3d791f631. When you have the evidence, comment it on t_01a184543d488b8d and complete THIS card. The parent resumes because you are its dependency, and it will record the acceptance.\n\nREPO / AUTH\n- Repo checkout (read-only unless you must fix a trivial failure): /home/ubuntu/.hermes/hermes-agent. Do not git checkout/switch that shared checkout. Use a worktree you remove before you finish.\n- Workflow: ci.yaml. Fix commit that must be contained: 250ee8a8a8e1d3688b0e4f4cd255f0e0f74ca9bf.\n- GitHub auth: token-broker exec --scope user/github --reason '<reason>' -- <cmd>\n- Probe: token-broker exec --scope user/github --reason 'check containing CI acceptance' -- python3 -B /home/ubuntu/.hermes/repos/hermes-mods/skills/devops/github-ci-wait/scripts/wait_for_ci.py 250ee8a8a8e1d3688b0e4f4cd255f0e0f74ca9bf --repo /home/ubuntu/.hermes/hermes-agent --workflow ci.yaml --once\n- Inspect helper: /home/ubuntu/.hermes/kanban/workspaces/t_01a184543d488b8d/inspect_runs.py\n\nSTATE AT HANDOFF (2026-10-29T00:18Z)\n- No green containing run yet.\n- Failed, not acceptance: https://github.com/daveey/hermes/actions/runs/40785006949 event=push head=a0ebd73b9c91b6a69f133898179c059ba592b4ee conclusion=failure attempt=1. Job 123156990828 Python tests / Run tests (2/2) on ec2-gwgen-1 failed only tests/tui_gateway/test_tui_gateway_server.py::test_session_resume_deferred_history_close_cancels_build (KeyError 68b90e2c at line 3823). Annotation: FakeDB release_history.wait(timeout=2.0) at line 3800 expired under host load. Gate 123181572825 failed only because tests failed. Owner of that flake: t_01a18505110a5892. Do not duplicate that card. A repeat of the same failure is a comment on t_01a18505110a5892, not a new card.\n- Primary run to follow: https://github.com/daveey/hermes/actions/runs/40792510284 event=push head=7adaa5306ee98531eafe21d4f15bddbf86969b1a. Jobs started 00:16:48Z. At 00:18Z: 9 success, 14 skipped, 10 queued, 0 failed. If a newer containing push superseded it, follow that newer in-flight push. Do not cancel other people's runs. Do not dispatch another suite.\n- Prior dispatch by t_01a184543d488b8d, not acceptance: https://github.com/daveey/hermes/actions/runs/40785530488 (desktop core timeout + update-concurrency failure). Owner t_01a184ee6d2aac0f.\n- ci-superseded-sweeper.timer is active. A worker stopped it at 00:15:40Z on a stale read and restarted it before the 00:16:38 tick (action none). Leave it active except the window below.\n- Shared checkout status/diff was clean. /home/ubuntu/.hermes/cache/scratch/wt-ci-dispatch was absent. Fix commit is an ancestor of origin/main. PR 158 replaced run_id dispatch isolation with per-ref grouping; do not claim the old isolation is intact.\n- Hung threshold: 2x recent shard median ~2092-2142s = 4184s from the job's startedAt (not queuedAt). Within that, wait. Beyond that, read the runner (ec2-gwgen-* maps in /home/ubuntu/asg-ci-controller/GATEWAY-MIGRATION.md; ssh ubuntu@<ip>, no sudo) before cancelling.\n\nSTEPS\n1. Run the probe. If any containing push, or the documented dispatch, has conclusion success and every job success or skipped, go to verify.\n2. If the in-flight containing push is still running real jobs with no failures, do not add suite load. Park with kanban_continue (you have a fresh budget) resume_after_seconds 900, check_every 120, awaiting kind=ci ref=<run url>, and a wake_check that exits 0 when that run is completed, has a failed/cancelled job, or its only open jobs are All required checks / CI timing report. End the turn after continue.\n3. Sweeper window: if that run is gate-only, zero failed/cancelled jobs, and head != freshly fetched origin/main, the 5-min ci-superseded-sweeper will force-cancel it and the conclusion will not be success. Then: sudo systemctl stop ci-superseded-sweeper.timer, let the timing report finish, confirm conclusion, sudo systemctl start ci-superseded-sweeper.timer. Record the pause. A sweeper cancel is not a concurrency-fix failure; do not file that card. If you lose the race and it is cancelled after all real jobs succeeded, follow the next in-flight containing push.\n4. If a different test fails, record the job and annotation. Fix only if trivial and attributable; otherwise file a card and name it in your completion. Same 2s KeyError: comment on t_01a18505110a5892 only.\n5. Verify before success: git merge-base --is-ancestor 250ee8a8a8e1d3688b0e4f4cd255f0e0f74ca9bf <head>; that head is an ancestor of freshly fetched origin/main; shared checkout status and diff clean; wt-ci-dispatch absent; remove any worktree you created.\n6. Comment the green run URL, event, head SHA, conclusion, ancestry, and actions on t_01a1815d5433bfac and on t_01a184543d488b8d. Then complete THIS card with that evidence in summary and metadata. If no green run is achievable, complete THIS card with the concrete blocker and the follow-up card id. Never report success without a fully green containing run.\n\nACTIONS ALREADY TAKEN (keep in the final list)\n- Dispatch 40785530488 at 2026-10-28T23:11Z by t_01a184543d488b8d.\n- Sweeper timer stop/start at 2026-10-29T00:15Z, reversed, tick action none.\n- Created t_01a184ee6d2aac0f and t_01a18505110a5892. The parent completion must list both.",
++  "key": "ci-green-watch:t_01a184543d488b8d:40792510284",
++  "created_by": "default",
++  "created": 1793233216
++ },
++ "t_88f89e55": {
++  "title": "daveey/hermes CI: JS & TS checks job cancelled at ~30 min on main 9cdafef2bb (timeout)",
++  "body": "Run https://github.com/daveey/hermes/actions/runs/39886244584, job 120195192886 \"JS & TS checks\" started 01:54:10Z, cancelled 02:24:37Z (30 min, looks like timeout-minutes or runner contention). Find which step was running (`gh run view --job 120195192886 -R daveey/hermes --log`), raise the timeout or fix the slow step (check whether #14's desktop JS tests are the slow part), PR, merge once green (standing approval). Then re-run CI on the new main head via github-ci-wait. Use a git worktree.",
++  "key": null,
++  "created_by": "default",
++  "created": 1792724724
++ },
++ "t_ebcc8f52": {
++  "title": "daveey/hermes CI: Nix flake check red (813413eeb), never re-run on current main",
++  "body": "Workflow \"Nix flake check\" last failed on 813413eeb (run https://github.com/daveey/hermes/actions/runs/39833033437) and has not run on main since (path filters or runner capacity). Trigger it on current origin/main (gh workflow run or a trigger-path touch), read `--log-failed`, fix if small, PR, merge once green (standing approval). If it already passes, say so with the run URL and close.",
++  "key": null,
++  "created_by": "default",
++  "created": 1792724757
++ },
++ "t_4129a258": {
++  "title": "daveey/hermes CI: Docker Build, Test, and Publish red (813413eeb), never re-run on current main",
++  "body": "Workflow \"Docker Build, Test, and Publish\" last failed on 813413eeb (run https://github.com/daveey/hermes/actions/runs/39833033372) and has not run on main since. Trigger it on current origin/main, read `--log-failed`, fix if small, PR, merge once green (standing approval). If it already passes, say so with the run URL and close.",
++  "key": null,
++  "created_by": "default",
++  "created": 1792724757
+  }
+ }
+diff --git a/tests/tools/test_kanban_create_overlap_failure.py b/tests/tools/test_kanban_create_overlap_failure.py
+index cca4df49a9f..939e0f7f0f0 100644
+--- a/tests/tools/test_kanban_create_overlap_failure.py
++++ b/tests/tools/test_kanban_create_overlap_failure.py
+@@ -38,11 +38,11 @@ def owner(cid: str, *, status: str = "ready", body_field: str = "body") -> str:
+     return tid
+ 
+ 
+-def remote(tmp_path, cids, status="ready"):
++def remote(tmp_path, cids, status="ready", body_field="body"):
+     """The real cards as other-gateway rows of the hermes-hub replica, under their real ids."""
+     (tmp_path / "hub-state" / "hub.db").unlink(missing_ok=True)
+     helpers._fake_replica(tmp_path / "hub-state" / "hub.db", [
+-        ("macbook", {"id": cid, "board": "default", "title": CASES[cid]["title"], "body": CASES[cid]["body"],
++        ("macbook", {"id": cid, "board": "default", "title": CASES[cid]["title"], "body": CASES[cid][body_field],
+                      "status": status, "gateway": "macbook", "sessions": [{"session": f"chat-{cid}", "rel": "created"}]})
+         for cid in cids])
+ 
+@@ -139,6 +139,92 @@ def test_real_non_duplicate_pairs_have_no_failure_match(home, tmp_path, new, old
+     assert failure_whys(check(new)) == []
+ 
+ 
++# --- A ci-main-watch FAILED list keeps the same-CI-run rule (t_01a1a05806da4ef0) ----------------------------------
++# ci_main_watch writes the run's ``failed tests:`` block into every red-main card. That list is the whole run's
++# failures, not a test the card is about, so the owner still owns the run: the five same-run duplicates #732's replay
++# refused must stay refused once the owner carries it. ``body_listed`` blocks: run 40785006949 from its real job log
++# (ci_main_watch.failed_tests); run 39886244584's logs are gone (HTTP 410), so its node ids are the ones
++# t_7cf84718, t_e37a86df and t_62ce7dc1 quote for that run.
++SAME_RUN_DUPLICATES = [
++    ("t_01a18505110a5892", "t_01a18504581b2063", "40785006949"),  # flaky test of the streak card's run
++    ("t_01a18507649f5425", "t_01a18504581b2063", "40785006949"),  # "finish the CI green-run watch" = its goal
++    ("t_88f89e55", "t_bdb6c497", "39886244584"),  # JS & TS job of the red-main run
++    ("t_ebcc8f52", "t_bdb6c497", "39833033437"),  # Nix job of the red run
++    ("t_4129a258", "t_bdb6c497", "39833033372"),  # Docker job of the red run
++]
++
++
++@pytest.mark.parametrize("body_field", ["body", "body_listed"])
++@pytest.mark.parametrize("where", ["local", "replica"])
++@pytest.mark.parametrize("new,old,run", SAME_RUN_DUPLICATES)
++def test_same_run_duplicate_is_refused_whether_or_not_the_owner_lists_failed_tests(home, tmp_path, new, old, run,
++                                                                                    where, body_field):
++    if where == "local":
++        tid = owner(old, body_field=body_field)
++    else:
++        remote(tmp_path, [old], body_field=body_field)
++        tid = old
++    result = check(new)
++    assert result and result["code"] == "create_overlap", (new, body_field)
++    assert [m["id"] for m in result["matches"]] == [tid]
++    assert result["matches"][0]["why"] == f"same CI run actions/runs/{run}"  # no claimed title overlap
++
++
++def test_listed_tests_are_marked_and_still_match_a_card_naming_one():
++    listed = ko.failure_identity(CASES["t_01a18504581b2063"]["title"], CASES["t_01a18504581b2063"]["body_listed"])
++    assert listed.listed and "test_session_resume_deferred_history_close_cancels_build" in listed.tests
++    assert not ko.failure_identity(CASES["t_47d51eb4"]["title"], CASES["t_47d51eb4"]["body"]).listed
++    named = ko.failure_identity("Fix tests/tui_gateway/test_tui_gateway_server.py::"
++                                "test_session_resume_deferred_history_close_cancels_build", "")
++    assert ko.same_failure(named, listed) == "same failing test test_session_resume_deferred_history_close_cancels_build"
++
++
++@pytest.mark.parametrize("where", ["local", "replica"])
++def test_listed_owner_admits_a_card_naming_another_test_of_its_run(home, tmp_path, where):
++    """A card that names its own test, not in the owner's FAILED list, is a different failure of the same run."""
++    if where == "local":
++        owner("t_01a18504581b2063", body_field="body_listed")
++    else:
++        remote(tmp_path, ["t_01a18504581b2063"], body_field="body_listed")
++    run = "https://github.com/daveey/hermes/actions/runs/40785006949"
++    assert check(title="Fix tests/tools/test_other_mod.py::test_unlisted_other_case on main",
++                 body=f"tests/tools/test_other_mod.py::test_unlisted_other_case fails in {run}.") is None
++
++
++@pytest.mark.parametrize("where", ["local", "replica"])
++def test_a_same_run_card_citing_the_listed_owner_is_admitted(home, tmp_path, where):
++    """With no claimed title overlap, a same-run match is failure-only, so a card that cites the owner by id (a
++    follow-up written knowing it) is admitted, as #732's cites rule says."""
++    if where == "local":
++        tid = owner("t_01a18504581b2063", body_field="body_listed")
++    else:
++        remote(tmp_path, ["t_01a18504581b2063"], body_field="body_listed")
++        tid = "t_01a18504581b2063"
++    assert check("t_01a18507649f5425")  # refused without the citation
++    body = CASES["t_01a18507649f5425"]["body"] + f"\n\nFollow-up of {tid}."
++    assert check("t_01a18507649f5425", body=body) is None
++
++
++@pytest.mark.parametrize("body_field", ["body", "body_listed"])
++def test_red_main_card_vs_deflake_card_naming_its_own_test_has_no_run_match(body_field):
++    """t_fa55aeb4 (ci-main-watch, run 40399486841) vs t_47d51eb4 (deflake of a flake seen in that run): the deflake
++    card names its own test, so the shared run is not one failure in either ci-main-watch body format. (Run
++    40399486841's logs are gone; the only node id quoted for it is t_47d51eb4's flake, so the listed body names that
++    flake and the unchanged test rule matches it, as on main.)"""
++    new = ko.failure_identity(CASES["t_fa55aeb4"]["title"], CASES["t_fa55aeb4"][body_field])
++    old = ko.failure_identity(CASES["t_47d51eb4"]["title"], CASES["t_47d51eb4"]["body"])
++    assert not (ko.same_failure(new, old) or "").startswith("same CI run")
++
++
++@pytest.mark.parametrize("where", ["local", "replica"])
++def test_red_main_card_as_filed_is_admitted_against_the_deflake_card(home, tmp_path, where):
++    if where == "local":
++        owner("t_47d51eb4")
++    else:
++        remote(tmp_path, ["t_47d51eb4"])
++    assert check("t_fa55aeb4") is None
++
++
+ def test_a_test_named_only_as_a_verification_step_is_not_a_failure(home):
+     """t_01a18e0f85fa5317 (real) names ``test_under_the_hood_screen_reader_labels_are_translated`` as the regression
+     test that checks its work. An open card about that test failing must not refuse it."""
+-- 
+2.55.0
+

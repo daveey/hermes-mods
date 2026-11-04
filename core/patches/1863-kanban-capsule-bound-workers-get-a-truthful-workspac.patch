@@ -1,0 +1,531 @@
+From 3d99cc66ce06dbcc20e13499370346d4390619b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 03:53:27 +0000
+Subject: [PATCH] kanban: capsule-bound workers get a truthful /workspace
+ contract and cwd [daveey]
+
+A capsule-bound Kanban worker (tools.capsule_workspace bound by observation_bind) only has the task's
+private git checkout mounted at /workspace in a runsc sandbox, and the host publishes its committed head.
+Run6 (Ask Eve) showed every model-facing surface said otherwise: KANBAN_GUIDANCE told it to cd
+$HERMES_KANBAN_WORKSPACE (unset in the sandbox) and to kanban_complete when a review child exists, the
+first turn's Workspace header named the HOST worktree, and terminal commands ran in the profile's
+terminal.cwd (/root). The worker probed host paths and blocked asking for a host backend and push
+credentials.
+
+- terminal/file default cwd: _get_env_config returns /workspace for a bound docker worker; the per-command
+  resolver keeps only recorded cwds inside /workspace (an explicit workdir is still honoured).
+- prompt: bound workers get kanban_capsule_guidance(): the generic protocol with its host-workspace,
+  credential-example and step-5 completion lines replaced (exact anchors; drift fails that worker closed)
+  plus a static Capsule contract (/workspace, safe.directory, no fetch/push/credential asks,
+  kanban_request_review hand-off, host seals/tests/publishes/completes).
+- worker context and kanban_show: the own card's Workspace header names /workspace; kanban_show adds
+  execution_workspace. Task body text and the row's workspace_path are reported unchanged.
+
+Ordinary (unbound) workers: byte-identical prompt and unchanged cwd (control tests).
+---
+ agent/agent_init.py                         |   7 +-
+ agent/agent_init_capsule.py                 |  18 ++
+ agent/prompt_builder.py                     |  79 ++++++++
+ gateway/session_kanban.py                   |   3 +-
+ gateway/session_kanban_capsule.py           |  16 ++
+ tests/tools/test_capsule_worker_contract.py | 205 ++++++++++++++++++++
+ tools/capsule_workspace.py                  |  19 ++
+ tools/kanban_show.py                        |   5 +-
+ tools/kanban_tools_capsule.py               |  16 ++
+ tools/terminal_tool.py                      |  12 ++
+ 10 files changed, 373 insertions(+), 7 deletions(-)
+ create mode 100644 agent/agent_init_capsule.py
+ create mode 100644 tests/tools/test_capsule_worker_contract.py
+ create mode 100644 tools/kanban_tools_capsule.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 6c34ff95619..1013b702d55 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1024,11 +1024,8 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
+     # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
+     # expose kanban_show interactively, and children/cron runs inherit the env var, without
+     # owning a task.
+-    from agent.delegation_context import owned_kanban_task
+-    from agent.prompt_builder import KANBAN_GUIDANCE
+-    agent._kanban_worker_guidance = (
+-        KANBAN_GUIDANCE if owned_kanban_task() and "kanban_show" in agent.valid_tool_names else ""
+-    )
++    from agent.agent_init_capsule import select_kanban_guidance  # [daveey] capsule-bound: capsule protocol
++    agent._kanban_worker_guidance = select_kanban_guidance(agent.valid_tool_names)
+     if agent.quiet_mode:
+         return
+     if agent.tools:
+diff --git a/agent/agent_init_capsule.py b/agent/agent_init_capsule.py
+new file mode 100644
+index 00000000000..f37b5a7f171
+--- /dev/null
++++ b/agent/agent_init_capsule.py
+@@ -0,0 +1,18 @@
++"""Capsule-aware pieces of agent construction (:mod:`agent.agent_init`). [daveey]"""
++
++
++def select_kanban_guidance(valid_tool_names) -> str:
++    """The Kanban protocol for this agent's system prompt ("" when it owns no task).
++
++    [daveey] A capsule-bound worker (bound before construction by agent.observation_bind) gets the capsule
++    protocol: its only workspace is /workspace and the host publishes, so the generic host-workspace and
++    completion lines would be false there."""
++    from agent.delegation_context import owned_kanban_task
++    from agent.prompt_builder import KANBAN_GUIDANCE
++    if not (owned_kanban_task() and "kanban_show" in valid_tool_names):
++        return ""
++    from tools import capsule_workspace
++    if capsule_workspace.bound():
++        from agent.prompt_builder import kanban_capsule_guidance
++        return kanban_capsule_guidance()
++    return KANBAN_GUIDANCE
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 3fec75ee816..386d98accee 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -378,6 +378,85 @@ KANBAN_GUIDANCE = (
+     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
+ )
+ 
++# [daveey] Capsule-bound Kanban worker (tools.capsule_workspace.bound()): the host mounted ONLY the task's
++# private git capsule at /workspace inside a runsc sandbox and publishes the result itself. The generic
++# protocol's host workspace / env var / `git worktree add` / kanban_complete-hands-off-to-review-child lines
++# are false there (run6, t_01a19f6eb64ca98b), so they are replaced, never appended to. Static text: nothing
++# task- or caller-supplied reaches it.
++KANBAN_CAPSULE_CONTRACT = (
++    "## Capsule contract (authoritative runtime context for this run)\n\n"
++    "You run in an isolated sandbox. The task's repository is a private git checkout at `/workspace`: the "
++    "terminal and file tools start there, and relative paths resolve there. `execute_code` starts in a temp "
++    "directory, so use absolute `/workspace/...` paths or `os.chdir('/workspace')` in it. The checkout is the "
++    "base commit the host already fetched and approved for this task; it has no remote and no credentials, by "
++    "design.\n"
++    "- Host paths (`/home/...`, the `.worktrees/...` path in `kanban_show`'s `workspace_path`), the host home, "
++    "`$HERMES_KANBAN_WORKSPACE` and the Docker socket are intentionally not visible here. Their absence is "
++    "expected and is never a reason to block. This contract supersedes any earlier comment, attempt or handoff "
++    "on the card that mentions a host checkout, a host backend, mounts or credentials.\n"
++    "- Never fetch, pull, push, open a PR, or ask for a host backend, a token, an SSH key or a mount. Do not "
++    "request push or GitHub access in `kanban_block`: the host holds publication.\n"
++    "- Git: the sandbox user differs from the checkout's owner, so run `git config --global --add "
++    "safe.directory /workspace` once (sandbox-local) before other git commands. There is no git identity: commit "
++    "with `git -c user.name=<name> -c user.email=<email> commit ...`.\n"
++    "- Do the work in `/workspace`: inspect, edit, run the relevant checks, then commit there. A detached HEAD "
++    "is fine. Do not rewrite or remove the base commit.\n"
++    "- Hand off with `kanban_request_review(summary=..., metadata={\"commit\": \"<full HEAD sha>\", ...})` and "
++    "end your turn. Do NOT call `kanban_complete` for this card: the host seals this run's observation, re-runs "
++    "the required checks on exactly the committed HEAD in its own sandbox, publishes that head, runs review and "
++    "CI, and completes the card. A task that genuinely needs no change still ends with "
++    "`kanban_request_review`, its summary saying why and naming the unchanged HEAD; never fabricate a commit.\n"
++    "- `kanban_block(kind=\"needs_input\")` is only for a real product or task ambiguity a human must decide. "
++    "Missing host paths, credentials or publication access are not that.\n"
++)
++
++
++def _capsule_protocol(generic: str) -> str:
++    """The generic protocol with its host-workspace and completion lines replaced (exact substrings)."""
++    swaps = (
++        ("; your workspace is `$HERMES_KANBAN_WORKSPACE`.",
++         "; your workspace is the task capsule at `/workspace` (see the Capsule contract below)."),
++        ("If you need a human decision you cannot infer (a credential only the user holds, UX choice, paywalled "
++         "source)",
++         "If you need a human decision you cannot infer (a product or task decision only a human can make, UX "
++         "choice, paywalled source; never credentials, mounts or publication access: see the Capsule contract)"),
++        ("2. **Work inside the workspace.** `cd $HERMES_KANBAN_WORKSPACE` before any file operations. The workspace "
++         "is yours for this run.",
++         "2. **Work inside the workspace.** Work in `/workspace` (see the Capsule contract). The workspace is "
++         "yours for this run."),
++        ("- **Workspace.** `cd $HERMES_KANBAN_WORKSPACE` first. For a `worktree` kind with no `.git`, `git worktree "
++         "add <path> ${HERMES_KANBAN_BRANCH:-wt/$HERMES_KANBAN_WORKER_TASK}` from the main repo, then cd there. For "
++         "a project-linked task the workspace is a fresh `<repo>/.worktrees/<task-id>` and `$HERMES_KANBAN_BRANCH` "
++         "a deterministic `<project-slug>/<task-id>` — the main repo is two levels up, so run `git worktree add` "
++         "from there.\n",
++         "- **Workspace.** `/workspace` is already the task's git checkout; do not create worktrees or look for "
++         "a main repo.\n"),
++    )
++    # Step 5 (generic: "call kanban_complete when a review child depends on your task") is replaced whole.
++    start, end = "5. **Finish with the review model encoded by the task graph.**", "6. **If follow-up work appears"
++    if generic.count(start) != 1 or generic.count(end) != 1 or generic.index(start) > generic.index(end):
++        raise RuntimeError("KANBAN_GUIDANCE drifted; capsule step-5 anchors missing")
++    step5 = generic[generic.index(start):generic.index(end)]
++    swaps += ((step5,
++               "5. **Finish with the Capsule contract's hand-off.** Commit in `/workspace`, then call "
++               "`kanban_request_review(summary=..., metadata=...)` with the structured handoff; never put secrets, "
++               "tokens, or raw PII in these durable fields. Do not call `kanban_complete` on this card, even when a "
++               "review or release child depends on it: the host verifies and publishes your committed head and "
++               "completes the card, which is what releases those children.\n"),)
++    text = generic
++    for old, new in swaps:
++        if text.count(old) != 1:  # generic protocol drifted: a capsule worker fails closed (tests catch it first)
++            raise RuntimeError(f"KANBAN_GUIDANCE drifted; capsule swap anchor missing: {old[:60]!r}")
++        text = text.replace(old, new)
++    head, sep, rest = text.partition("\n## Lifecycle\n")
++    return head + "\n" + KANBAN_CAPSULE_CONTRACT + sep + rest
++
++
++def kanban_capsule_guidance() -> str:
++    """Kanban protocol for a capsule-bound worker. Built on use, so a drifted anchor fails only that worker."""
++    return _capsule_protocol(KANBAN_GUIDANCE)
++
++
+ TOOL_USE_ENFORCEMENT_GUIDANCE = (
+     "# Tool-use enforcement\n"
+     "You MUST use your tools to take action — do not describe what you would do or plan to do without actually doing "
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index bc34ce8da54..8f4704f2747 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -489,10 +489,11 @@ def _run_task_turns(agent, frame, history, context):
+         import logging
+         logging.getLogger(__name__).warning('%s', warning)
+     from gateway.session_kanban_resume import compact_resumed_history, worker_prompt_context
++    from gateway.session_kanban_capsule import capsule_worker_context
+     # [daveey] An over-headroom resumed transcript is compacted before the first model call (or dropped).
+     history = compact_resumed_history(agent, context, history)
+     card = worker_prompt_context(context, history)  # [daveey] resumed after an owner restart, or the tail
+-    prompt = '\n\n'.join(p for p in (skills, warning, card, frame['text']) if p)
++    prompt = '\n\n'.join(p for p in (skills, warning, capsule_worker_context(context, card), frame['text']) if p)
+     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
+ 
+     def recover(nudge):
+diff --git a/gateway/session_kanban_capsule.py b/gateway/session_kanban_capsule.py
+index 4c8301d42d5..08d27bf66be 100644
+--- a/gateway/session_kanban_capsule.py
++++ b/gateway/session_kanban_capsule.py
+@@ -120,3 +120,19 @@ def attach_capsule_transport(policy):
+         return attach(context)
+     except RendezvousError as exc:
+         raise RuntimeStoreError(MISSING) from exc
++
++
++def capsule_worker_context(context, text=None):
++    """The owner-built worker context (``text``, default ``context['context']``), with its host
++    ``Workspace:`` header line replaced by the capsule's when this worker process is capsule-bound (the only
++    workspace its tools can reach). Ordinary cards: as is. [daveey]"""
++    text = context['context'] if text is None else text
++    from tools import capsule_workspace
++    if not capsule_workspace.bound() or not isinstance(text, str):
++        return text
++    import re
++    head, sep, rest = text.partition('\n## Body\n')
++    line = re.compile(r'^Workspace: \S+ @ ' + re.escape(str(context.get('workspace'))) + r'$', re.MULTILINE)
++    head = line.sub(lambda _m: f'Workspace: {capsule_workspace.CAPSULE_CWD} (task capsule: a private git checkout; '
++                    'the host-side path is not visible in this sandbox)', head, count=1)
++    return head + sep + rest
+diff --git a/tests/tools/test_capsule_worker_contract.py b/tests/tools/test_capsule_worker_contract.py
+new file mode 100644
+index 00000000000..e6f911b382f
+--- /dev/null
++++ b/tests/tools/test_capsule_worker_contract.py
+@@ -0,0 +1,205 @@
++"""Capsule worker contract: what a capsule-bound Kanban worker's model is told, and where its tools start.
++
++Run6 (Ask Eve, t_01a19f6eb64ca98b): the capsule really was mounted at /workspace, but the worker's
++system prompt said ``cd $HERMES_KANBAN_WORKSPACE`` (unset in the sandbox), its first turn named the HOST
++worktree path, generic step 5 said ``kanban_complete`` hands off to a review child, and every terminal
++command ran in the profile's ``terminal.cwd`` (/root). The model probed host paths, found nothing and
++blocked asking for a host backend and push credentials.
++
++These tests drive the REAL ``_get_env_config`` (the v3 capsule tests monkeypatched it, which is why the
++/root default was never caught), the real ``terminal_tool`` entry and the real prompt selection. Each
++bound assertion has an unbound control that must stay byte-identical to the generic behaviour.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++
++import pytest
++
++from tools import capsule_workspace
++
++from tests.tools.test_capsule_workspace import (  # pytest fixtures
++    IMAGE, RUN, TASK, VALID_CC, capsule, fake_docker,
++)
++
++
++@pytest.fixture
++def docker_env_vars(monkeypatch, tmp_path):
++    """The live askeve-builder terminal shape as the bridged TERMINAL_* env (profile terminal.cwd=/root)."""
++    import tools.terminal_tool as tt
++    for key, value in {
++        "TERMINAL_ENV": "docker", "TERMINAL_CWD": "/root", "TERMINAL_DOCKER_IMAGE": IMAGE,
++        "TERMINAL_DOCKER_EXTRA_ARGS": json.dumps(["--runtime=runsc"]), "TERMINAL_DOCKER_VOLUMES": "[]",
++        "TERMINAL_DOCKER_FORWARD_ENV": "[]", "TERMINAL_DOCKER_ENV": "{}",
++        "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE": "false", "TERMINAL_CONTAINER_PERSISTENT": "false",
++    }.items():
++        monkeypatch.setenv(key, value)
++    monkeypatch.setattr(tt, "_ensure_terminal_env_bridged", lambda: None)
++    monkeypatch.setattr(tt, "_active_environments", {})
++    monkeypatch.setattr(tt, "_last_activity", {})
++    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
++    return tt
++
++
++# --- cwd -----------------------------------------------------------------------------------------
++
++def test_unbound_docker_default_cwd_stays_the_profile_cwd(capsule, docker_env_vars):
++    assert docker_env_vars._get_env_config()["cwd"] == "/root"
++
++
++def test_bound_docker_default_cwd_is_the_capsule(capsule, docker_env_vars):
++    capsule.bind()
++    config = docker_env_vars._get_env_config()
++    assert (config["cwd"], config["host_cwd"]) == ("/workspace", None)
++
++
++def test_bound_non_docker_config_is_not_rewritten(capsule, docker_env_vars, monkeypatch):
++    # A bound process refuses every non-docker backend at env creation; the default is left alone.
++    capsule.bind()
++    monkeypatch.setenv("TERMINAL_ENV", "local")
++    monkeypatch.setenv("TERMINAL_CWD", "/srv/x")
++    assert docker_env_vars._get_env_config()["cwd"] == "/srv/x"
++
++
++def _exec_script(fake):
++    """The bash script the docker backend exec'd for the last command (its leading ``cd``)."""
++    return " ".join(fake.execs[-1])
++
++
++HOST_NATIVE = "/home/ubuntu/code/askeve/.worktrees/t_01a19a6b4fcce737"  # run6's recorded/advertised cwd
++
++
++@pytest.mark.parametrize("recorded", [HOST_NATIVE, "<tmp-native>", None])
++@pytest.mark.parametrize("bound,expected", [(True, "/workspace"), (False, "/root")])
++def test_real_terminal_tool_command_cwd(capsule, fake_docker, docker_env_vars, monkeypatch, bound, expected,
++                                        recorded):
++    """The real ``terminal_tool`` entry: with the worker's HOST native worktree as the session cwd record
++    (run6's path, and a /tmp path the generic host-path heuristic does not classify), or none at all."""
++    from tools import terminal_tool as tt
++    if recorded == "<tmp-native>":
++        recorded = os.path.dirname(capsule.ws)  # parent of the mounted capsule, under pytest's /tmp
++    if bound:
++        capsule.bind()
++    monkeypatch.setattr(tt, "get_session_cwd", lambda key: recorded)
++    out = json.loads(tt.terminal_tool(command="pwd", task_id="sess-cwd"))
++    assert out.get("exit_code") == 0, out
++    script = _exec_script(fake_docker)
++    if bound:
++        assert "builtin cd -- /workspace " in script, script
++        assert "/root" not in script.split("eval")[0]
++        assert not recorded or recorded not in script
++    elif recorded is None or recorded == HOST_NATIVE:
++        assert "builtin cd -- /root " in script, script  # control: today's generic behaviour, unchanged
++
++
++def test_bound_terminal_keeps_a_cd_within_the_capsule(capsule, fake_docker, docker_env_vars, monkeypatch):
++    from tools import terminal_tool as tt
++    capsule.bind()
++    monkeypatch.setattr(tt, "get_session_cwd", lambda key: "/workspace/site")
++    json.loads(tt.terminal_tool(command="pwd", task_id="sess-cd"))
++    assert "builtin cd -- /workspace/site " in _exec_script(fake_docker)
++
++
++def test_bound_terminal_explicit_workdir_is_honoured(capsule, fake_docker, docker_env_vars):
++    from tools import terminal_tool as tt
++    capsule.bind()
++    json.loads(tt.terminal_tool(command="pwd", task_id="sess-wd", workdir="/tmp"))
++    assert "builtin cd -- /tmp " in _exec_script(fake_docker)
++
++
++def test_file_ops_env_starts_in_capsule(capsule, fake_docker, docker_env_vars):
++    from tools.file_tools import _create_terminal_env_for_file_ops
++    capsule.bind()
++    env = _create_terminal_env_for_file_ops("sess-file", "sess-file")[1]
++    assert env.cwd == "/workspace"
++
++
++# --- prompt --------------------------------------------------------------------------------------
++
++def test_capsule_guidance_replaces_every_host_workspace_and_completion_line():
++    from agent.prompt_builder import KANBAN_GUIDANCE, kanban_capsule_guidance
++    g = kanban_capsule_guidance()
++    assert "## Capsule contract (authoritative runtime context for this run)" in g
++    assert "private git checkout at `/workspace`" in g
++    for host_line in ("`cd $HERMES_KANBAN_WORKSPACE`", "your workspace is `$HERMES_KANBAN_WORKSPACE`",
++                      "the main repo is two levels up", "a credential only the user holds",
++                      "When any pre-created review, QA, or release child depends on your task, call `kanban_complete`"):
++        assert host_line in KANBAN_GUIDANCE  # the generic text still says it ...
++        assert host_line not in g            # ... the capsule text never does
++    assert "kanban_request_review(summary=..., metadata=" in g
++    assert "Do not call `kanban_complete` on this card" in g
++    assert "safe.directory /workspace" in g
++    # Tells the worker NOT to ask for access; never asks for it.
++    assert "Never fetch, pull, push, open a PR, or ask for a host backend, a token, an SSH key or a mount" in g
++    assert g.index("## Capsule contract") < g.index("## Lifecycle")
++
++
++def test_capsule_guidance_fails_closed_on_generic_drift(monkeypatch):
++    import agent.prompt_builder as pb
++    monkeypatch.setattr(pb, "KANBAN_GUIDANCE", pb.KANBAN_GUIDANCE.replace("`cd $HERMES_KANBAN_WORKSPACE` before", "x"))
++    with pytest.raises(RuntimeError, match="drifted"):
++        pb.kanban_capsule_guidance()
++
++
++def test_agent_init_selects_capsule_guidance_only_when_bound(capsule, monkeypatch):
++    """The selection agent_init._load_tools calls, for a bound and an unbound owned Kanban worker."""
++    import inspect
++    import agent.agent_init as ai
++    import agent.agent_init_capsule as aic
++    import agent.delegation_context as dc
++    from agent.prompt_builder import KANBAN_GUIDANCE, kanban_capsule_guidance
++    monkeypatch.setattr(dc, "owned_kanban_task", lambda: True)
++    picked = []
++    assert "select_kanban_guidance(agent.valid_tool_names)" in inspect.getsource(ai._load_tools)
++    real = aic.select_kanban_guidance
++    picked.append(real({"kanban_show"}))
++    capsule.bind()
++    picked.append(real({"kanban_show"}))
++    picked.append(real({"terminal"}))  # no kanban_show: never a Kanban protocol, bound or not
++    assert picked == [KANBAN_GUIDANCE, kanban_capsule_guidance(), ""]
++
++
++# --- worker context (first turn) and kanban_show -------------------------------------------------
++
++HEADER = ("# Kanban task t_x: title\n\nAssignee: askeve-builder\nStatus:   running\n"
++          "Workspace: worktree @ {ws}\n\n## Body\nWorkspace: worktree @ {ws}\nbody text\n")
++
++
++def test_worker_context_header_names_the_capsule_only_when_bound(capsule):
++    from gateway.session_kanban_capsule import capsule_worker_context
++    native = os.path.dirname(capsule.ws)
++    context = {"context": HEADER.format(ws=native), "workspace": native}
++    assert capsule_worker_context(context) == context["context"]  # unbound: byte-identical
++    capsule.bind()
++    out = capsule_worker_context(context)
++    head, _, body = out.partition("\n## Body\n")
++    assert "Workspace: /workspace (task capsule" in head and native not in head
++    assert body == f"Workspace: worktree @ {native}\nbody text\n"  # task-supplied body text is never rewritten
++
++
++def test_kanban_show_own_card_names_execution_workspace_when_bound(capsule, tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools
++    kb.init_db()
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        mine = kb.create_task(conn, title="mine", body="b")
++        other = kb.create_task(conn, title="other", body="b")
++        native = os.path.dirname(capsule.ws)
++        conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=? WHERE id IN (?, ?)",
++                     (native, mine, other))
++        conn.commit()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", mine)
++    show = lambda tid: json.loads(kanban_tools._handle_show({"task_id": tid}))
++    before = show(mine)
++    assert "execution_workspace" not in before and f"@ {native}" in before["worker_context"]
++    monkeypatch.setenv("HERMES_KANBAN_TASK", TASK)
++    capsule.bind()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", mine)
++    mine_bound, other_bound = show(mine), show(other)
++    assert mine_bound["execution_workspace"] == "/workspace"
++    assert mine_bound["task"]["workspace_path"] == native  # the row is reported as it is
++    assert "Workspace: /workspace (task capsule" in mine_bound["worker_context"]
++    assert "execution_workspace" not in other_bound and f"@ {native}" in other_bound["worker_context"]
+diff --git a/tools/capsule_workspace.py b/tools/capsule_workspace.py
+index 3871cb31475..9d65242f344 100644
+--- a/tools/capsule_workspace.py
++++ b/tools/capsule_workspace.py
+@@ -170,6 +170,25 @@ def current_binding() -> Optional[WorkspaceBinding]:
+     return binding
+ 
+ 
++def bound() -> bool:
++    """True once this process installed a capsule binding (live, revoked or closed: it never reverts).
++
++    Model-facing defaults (the container cwd, the worker's workspace contract) read this, never env or
++    config: a bound worker's only workspace is :data:`CAPSULE_CWD`, and a revoked one runs nothing at all,
++    so it never needs a host fallback. Does not validate or latch; execution still goes through
++    :func:`current_binding` / :func:`require_binding`."""
++    with _STATE.lock:
++        return _STATE.binding is not None
++
++
++def inside(path: Any) -> bool:
++    """``path`` is :data:`CAPSULE_CWD` or below it (a container path, compared lexically)."""
++    if not isinstance(path, str) or "\0" in path:
++        return False
++    norm = os.path.normpath(path)
++    return norm == CAPSULE_CWD or norm.startswith(CAPSULE_CWD + "/")
++
++
+ def require_binding(handle: Optional[WorkspaceBinding]) -> None:
+     """Gate for an environment about to run anything: ``handle`` must be the live binding, and an
+     environment without a handle may only run when this process was never bound."""
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index 46259192aad..847e90a2ebc 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -17,8 +17,11 @@ def show(args: dict) -> str:
+         })
+     with kt._granted_board(args.get("board"), tid) as (kb, conn, _):
+         task = kt._existing_task(kb, conn, tid)
++        from tools.kanban_tools_capsule import own_card_view
++        worker_context, capsule = own_card_view(task, tid, kb.build_worker_context(conn, tid))
+         return json.dumps({
+             "task": kt._fields(task, kt._TASK_FIELDS),
++            **capsule,
+             "queue_reason": kqr.latest(conn, tid),
+             "parents": kb.parent_ids(conn, tid),
+             "unsatisfied_parents": [
+@@ -29,4 +32,4 @@ def show(args: dict) -> str:
+             "events": [kt._fields(e, kt._EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
+             "runs": [kt._fields(r, kt._RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+             "supervisor_requests": kt._graph.supervisor_requests(conn, tid),
+-            "worker_context": kb.build_worker_context(conn, tid)})
++            "worker_context": worker_context})
+diff --git a/tools/kanban_tools_capsule.py b/tools/kanban_tools_capsule.py
+new file mode 100644
+index 00000000000..b0ef88271f1
+--- /dev/null
++++ b/tools/kanban_tools_capsule.py
+@@ -0,0 +1,16 @@
++"""Capsule-bound worker view of its own card for ``kanban_show`` (:mod:`tools.kanban_show`). [daveey]"""
++import os
++
++
++def own_card_view(task, tid: str, worker_context: str) -> tuple[str, dict]:
++    """``(worker_context, extra fields)``. Unbound workers and other cards: the context as built, no extras.
++
++    A capsule worker's own card row names the HOST ``workspace_path``, which the sandbox cannot see; the
++    Workspace header is rewritten to the capsule's (same rewrite as its first turn) and
++    ``execution_workspace`` says where the task's checkout actually is."""
++    from tools import capsule_workspace
++    if not (capsule_workspace.bound() and tid == os.environ.get("HERMES_KANBAN_TASK")):
++        return worker_context, {}
++    from gateway.session_kanban_capsule import capsule_worker_context
++    rewritten = capsule_worker_context({"context": worker_context, "workspace": task.workspace_path})
++    return rewritten, {"execution_workspace": capsule_workspace.CAPSULE_CWD}
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 8e450002650..d13de137c1e 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -837,6 +837,12 @@ def _get_env_config() -> dict[str, Any]:
+         docker_forward_env, docker_volumes, docker_env, docker_extra_args, docker_shm_size = [], [], {}, [], "1g"
+ 
+     cwd, host_cwd = _resolve_config_cwd(env_type, mount_docker_cwd)
++    # [daveey] A capsule-bound worker's only workspace is the mounted capsule: the profile's
++    # ``terminal.cwd`` (e.g. /root) is a home the capsule never mounts, and every per-command, file-op
++    # and env-creation fallback below reads this value. Docker only: a bound process refuses others.
++    from tools import capsule_workspace
++    if env_type == "docker" and capsule_workspace.bound():
++        cwd, host_cwd = capsule_workspace.CAPSULE_CWD, None
+ 
+     return {
+         "env_type": env_type,
+@@ -1040,6 +1046,12 @@ def _resolve_command_cwd(
+     if workdir:
+         return coerce_ssh_remote_cwd(_container_visible_cwd(workdir, env_type, env), env_type)
+     recorded = get_session_cwd(session_key)
++    if env_type == "docker":
++        # [daveey] A capsule-bound worker only ever has /workspace: a recorded cwd outside it can only be a
++        # host path (the native worktree the worker process chdir'd to), never a ``cd`` of this session.
++        from tools import capsule_workspace
++        if capsule_workspace.bound():
++            return recorded if recorded and capsule_workspace.inside(recorded) else capsule_workspace.CAPSULE_CWD
+     if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(
+         recorded, mounted_host=mounted_host
+     ) and not _in_sandbox_home(recorded, env):
+-- 
+2.55.0
+

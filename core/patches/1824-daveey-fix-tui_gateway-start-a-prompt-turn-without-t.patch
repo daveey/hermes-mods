@@ -1,0 +1,458 @@
+From cb4dab32c260a74c75aad74c7753d7bc049cb309 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:04:38 +0000
+Subject: [PATCH] [daveey] fix(tui_gateway): start a prompt turn without taking
+ history_lock under _sessions_lock
+
+C14 (multiclient session model e2e) wedged the backend: a session.resume
+racing its session's own prompt.submit deadlocked, and every later
+create/resume queued behind the stuck _sessions_lock (seed 11 resume hung
+60 s, seeds 23/37 could not create a session).
+
+py-spy dumps of two locally reproduced wedges show the same cycle:
+- prompt worker: _run_admitted_prompt holds _sessions_lock (close-race
+  check + spawn) -> _start_session_work -> start_work waits on the
+  session's history_lock to retain the turn admission (added with the
+  cross-process admission fence);
+- session.resume: _live_session_payload holds history_lock ->
+  _rebind_live_transport -> _cancel_ws_orphan_reap waits on _sessions_lock.
+
+Lock order is history_lock -> _sessions_lock (resume, activate and the lazy
+reattach all rebind that way). start_work is split into prepare_work
+(retains admission under history_lock) and PreparedWork.start (spawn only);
+_run_admitted_prompt prepares before _sessions_lock, keeps the _closing
+check + spawn atomic under it, and cancels/aborts the prepared work after
+releasing it. Other start_work callers are unchanged.
+
+Tests: test_prompt_start_lock_order.py (lock-order invariant and a forced
+resume/submit race, both red on the old code; refused-turn admission
+give-back).
+---
+ .../test_bot_live_owner_delivery.py           |   8 +-
+ .../test_prompt_start_lock_order.py           | 186 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  18 +-
+ tui_gateway/session_lifecycle.py              |   7 +
+ tui_gateway/turn_admission.py                 |  93 ++++++---
+ 5 files changed, 283 insertions(+), 29 deletions(-)
+ create mode 100644 tests/tui_gateway/test_prompt_start_lock_order.py
+
+diff --git a/tests/tui_gateway/test_bot_live_owner_delivery.py b/tests/tui_gateway/test_bot_live_owner_delivery.py
+index 9afa57b59cf..b0004e18c9d 100644
+--- a/tests/tui_gateway/test_bot_live_owner_delivery.py
++++ b/tests/tui_gateway/test_bot_live_owner_delivery.py
+@@ -14,7 +14,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
+     import logging
+     import time
+     from tui_gateway import prompt_turn
+-    from tui_gateway.session_lifecycle import _start_session_work
++    from tui_gateway.session_lifecycle import _prepare_session_work
+     from tools import bot_live_delivery as mailbox
+ 
+     owner = dict(profile_home=str(tmp_path.resolve()), session_id="chat",
+@@ -30,17 +30,17 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
+     worker_errors = []
+     # server installs a process-wide excepthook during the worker's lazy import;
+     # capture at the worker boundary rather than relying on that mutable hook.
+-    def start_work(target, **kwargs):
++    def prepare_work(target, **kwargs):
+         def run():
+             try:
+                 target()
+             except BaseException as exc:
+                 worker_errors.append(exc)
+-        return _start_session_work(run, **kwargs)
++        return _prepare_session_work(run, **kwargs)
+ 
+     submit = rebind(prompt_turn._run_admitted_prompt, {
+         "threading": threading, "time": time, "logger": logging.getLogger(__name__),
+-        "_start_session_work": start_work,
++        "_prepare_session_work": prepare_work,
+         "_sessions_lock": threading.RLock(), "_sessions": {},
+         "_admit_prompt_turn": lambda *args, **kwargs: ([], agent),
+         "_session_profile_runtime_scope": lambda session: contextlib.nullcontext(),
+diff --git a/tests/tui_gateway/test_prompt_start_lock_order.py b/tests/tui_gateway/test_prompt_start_lock_order.py
+new file mode 100644
+index 00000000000..4ea732c1f6f
+--- /dev/null
++++ b/tests/tui_gateway/test_prompt_start_lock_order.py
+@@ -0,0 +1,186 @@
++"""Starting a prompt turn never takes a session's ``history_lock`` while holding ``_sessions_lock`` [daveey].
++
++session.resume / session.activate rebind a live transport under ``history_lock`` and then take
++``_sessions_lock`` (``_rebind_live_transport`` -> ``_cancel_ws_orphan_reap``). ``_run_admitted_prompt``
++used to start the turn worker inside its ``_sessions_lock`` block, and ``start_work`` takes that same
++session's ``history_lock`` to retain the turn's admission. A resume of the session racing its own
++prompt.submit then deadlocked the two threads, and every later create/close/resume on the backend
++queued behind the leaked ``_sessions_lock`` (C14 seed 11: resume hung 60 s, seeds 23/37 could not
++even create a session). The py-spy dump of the wedged backend showed exactly that pair.
++"""
++
++from __future__ import annotations
++
++import threading
++import types
++
++import pytest
++
++from tui_gateway import server
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++class _OrderCheckedLock:
++    """A session ``history_lock`` that records every acquisition made while ``_sessions_lock`` is held."""
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self.under_sessions_lock: list[str] = []
++        self.acquisitions = 0
++        self.watched_thread: str | None = None
++        self.contended = threading.Event()  # set when ``watched_thread`` waits on this lock
++
++    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
++        self.acquisitions += 1
++        if getattr(server._sessions_lock, "_is_owned")():
++            self.under_sessions_lock.append(threading.current_thread().name)
++        if threading.current_thread().name == self.watched_thread and self._lock.locked():
++            self.contended.set()
++        return self._lock.acquire(blocking, timeout)
++
++    def release(self) -> None:
++        self._lock.release()
++
++    def __enter__(self):
++        self.acquire()
++        return self
++
++    def __exit__(self, *exc) -> None:
++        self.release()
++
++
++class _Db:
++    def append_message(self, **kw):
++        return 1
++
++
++@pytest.fixture()
++def turn_env(monkeypatch, tmp_path):
++    frames: list[tuple] = []
++    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None, *a, **k: frames.append((event, payload)))
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(server, "_submit_row_target_key", lambda session: session["session_key"])
++    return frames
++
++
++def _registered_session(sid: str, lock: _OrderCheckedLock, completed: threading.Event) -> dict:
++    def run_conversation(*a, **k):
++        completed.set()
++        return {"final_response": "ok", "messages": [], "interrupted": False, "completed": True}
++
++    agent = types.SimpleNamespace(session_id=f"agent-{sid}", run_conversation=run_conversation,
++                                  clear_interrupt=lambda: None, interrupt=lambda *a, **k: True, _session_db=_Db())
++    session = {
++        "agent": agent, "agent_ready": threading.Event(), "agent_error": None, "history": [],
++        "history_lock": lock, "running": True, "session_key": sid, "history_version": 0,
++        "attached_images": [], "image_counter": 0, "cols": 80, "slash_worker": None, "show_reasoning": False,
++        "tool_progress_mode": "all", "inflight_turn": None,
++    }
++    session["agent_ready"].set()
++    with server._sessions_lock:
++        server._sessions[sid] = session
++    return session
++
++
++def test_registered_turn_start_takes_history_lock_outside_sessions_lock(turn_env, request):
++    sid = f"lockorder-{request.node.name}"[:60]
++    lock, completed = _OrderCheckedLock(), threading.Event()
++    session = _registered_session(sid, lock, completed)
++    try:
++        assert server._run_prompt_submit("rid", sid, session, "go")
++        thread = session.get("_run_thread")
++        assert thread is not None
++        thread.join(10)
++        assert not thread.is_alive()
++    finally:
++        with server._sessions_lock:
++            server._sessions.pop(sid, None)
++    assert completed.is_set(), "the turn must still run"
++    assert lock.acquisitions, "the start path must still retain admission under history_lock"
++    assert lock.under_sessions_lock == [], (
++        "history_lock taken while holding _sessions_lock (resume/activate take them in the opposite order): "
++        f"{lock.under_sessions_lock}")
++
++
++def test_resume_rebind_racing_turn_start_does_not_deadlock(turn_env, request):
++    """The C14 interleaving, forced: a resume holds the session's history_lock and is about to cancel the
++    orphan reap (``_sessions_lock``) while prompt.submit's worker starts the turn."""
++    sid = f"lockrace-{request.node.name}"[:60]
++    lock, completed = _OrderCheckedLock(), threading.Event()
++    session = _registered_session(sid, lock, completed)
++    lock.watched_thread = "prompt-submit-under-test"
++    contended = lock.contended
++    result: dict = {}
++    submit = threading.Thread(
++        target=lambda: result.setdefault("ok", server._run_prompt_submit("rid", sid, session, "go")),
++        name="prompt-submit-under-test", daemon=True)
++    stalls = []
++    try:
++        with lock:
++            submit.start()
++        # At EVERY point where prompt.submit waits for history_lock, a resume holding it must still be able
++        # to take _sessions_lock; then let prompt.submit through that one acquisition and repeat.
++        while submit.is_alive():
++            with lock:  # session.resume: _live_session_payload holds history_lock ...
++                if not contended.wait(0.5):
++                    continue
++                contended.clear()  # cleared while prompt.submit is blocked on us, so no wait is missed
++                # ... then _rebind_live_transport -> _cancel_ws_orphan_reap takes _sessions_lock.
++                got = server._sessions_lock.acquire(timeout=3)
++                if got:
++                    server._sessions_lock.release()
++                else:
++                    stalls.append("turn start held _sessions_lock while waiting for history_lock")
++        submit.join(10)
++        assert stalls == [], f"deadlock: {stalls}"
++        thread = session.get("_run_thread")
++        if thread is not None:
++            thread.join(10)
++    finally:
++        with server._sessions_lock:
++            server._sessions.pop(sid, None)
++    assert result.get("ok") is True
++    assert completed.is_set()
++
++
++@pytest.mark.parametrize("claimed", [True, False], ids=["submit-claimed-admission", "no-prior-admission"])
++def test_turn_refused_for_a_closing_session_gives_back_the_prepared_admission(
++        turn_env, request, tmp_path, monkeypatch, claimed):
++    """Retaining the admission before the ``_closing`` check must not leak it when the check refuses the
++    turn: no worker runs and no update-admission reservation outlives the refused turn (as before the
++    admission was retained ahead of the check)."""
++    from hermes_cli import backend_retirement
++    from tui_gateway import turn_admission as ta
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    sid = f"lockclose-{request.node.name}"[:60]
++    completed = threading.Event()
++    session = _registered_session(sid, _OrderCheckedLock(), completed)
++    session.update(profile_home=str(tmp_path), running=False)
++    try:
++        if claimed:  # prompt.submit's claim: the session owns one admission until terminal settlement
++            with ta.admission(session) as accepted:
++                assert accepted
++                session["running"] = True
++        session["_closing"] = True
++        assert server._run_prompt_submit("rid", sid, session, "go") is False
++        assert not completed.is_set()
++        assert "_run_thread" not in session
++        assert fence.active_count() == 0
++        assert session.get("_turn_admission") is None
++        assert session["running"] is False
++    finally:
++        with session["history_lock"]:
++            ta.settle(session)
++        with server._sessions_lock:
++            server._sessions.pop(sid, None)
++    assert fence.active_count() == 0
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 42fd85f8ef5..ac5395f2ca6 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1464,16 +1464,28 @@ def _run_admitted_prompt(
+         if followup is not None:
+             _run_post_turn_followups(rid, sid, session, *followup)
+     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
+-    # state registry, and _sessions_lock gates every create/close/prompt on this backend.
++    # state registry, and _sessions_lock gates every create/close/prompt on this backend. The worker's
++    # admission is retained before it too: that takes history_lock, and session.resume/activate hold
++    # history_lock while they take _sessions_lock (a resume racing this submit deadlocked the backend).
++    work = _prepare_session_work(run, name=f"prompt-turn-{sid}", session=session)
++    spawn_error = None
+     with _routing_provenance_db(session) as routing_db, _sessions_lock:
+         registered = _sessions.get(sid)
+-        can_start = not session.get("_closing") and (registered is None or registered is session)
++        can_start = work is not None and not session.get("_closing") and (registered is None or registered is session)
+         if can_start:
+             # Only a registered session is proof the conversation is routed here; an unregistered one may
+             # still run its turn, but its stamp stays (#106459).
+             if registered is session:
+                 _reopen_routed_session_row(routing_db, sid, session)
+-            can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
++            try:
++                work.start(abort_on_error=False)  # spawns only; the close-race check above stays atomic
++            except BaseException as exc:
++                spawn_error = exc
++    if spawn_error is not None:
++        work.abort()  # the worker's cleanup takes history_lock: never under _sessions_lock
++        raise spawn_error
++    if work is not None and not can_start:
++        work.cancel()
+     if not can_start:
+         from tui_gateway.turn_admission import owns
+         with session["history_lock"]:
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 9231c9a5d6e..b0bcd64e1a6 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -26,6 +26,13 @@ def _start_session_work(target, *, name: str, session: dict | None = None, home=
+     return start_work(target, name=name, session=session, home=home, busy_wait_s=busy_wait_s)
+ 
+ 
++def _prepare_session_work(target, *, name: str, session: dict, busy_wait_s=None):
++    """``_start_session_work`` for a caller that spawns under ``_sessions_lock``: retain the admission here
++    (takes ``history_lock``, so BEFORE ``_sessions_lock``), then ``start()``/``cancel()`` the returned work."""
++    from tui_gateway.turn_admission import prepare_work
++    return prepare_work(target, name=name, session=session, busy_wait_s=busy_wait_s)
++
++
+ def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> list[str]:
+     """Fire session lifecycle hooks with CLI parity; returns plugin ``on_session_finalize`` user messages."""
+     with contextlib.suppress(Exception):
+diff --git a/tui_gateway/turn_admission.py b/tui_gateway/turn_admission.py
+index f5d85a02553..7e44cd34ea2 100644
+--- a/tui_gateway/turn_admission.py
++++ b/tui_gateway/turn_admission.py
+@@ -191,7 +191,18 @@ def start_build_work(session, target, *, delay=None):
+ 
+ 
+ def start_work(target, *, name, session=None, home=None, busy_wait_s=None):
+-    from agent.memory_provider import spawn_context_thread
++    prepared = prepare_work(target, name=name, session=session, home=home, busy_wait_s=busy_wait_s)
++    return None if prepared is None else prepared.start()
++
++
++def prepare_work(target, *, name, session=None, home=None, busy_wait_s=None):
++    """``start_work`` split in two: retain the admission now (takes ``history_lock``), spawn the worker with
++    ``start()`` later without touching ``history_lock``, or give the admission back with ``cancel()``.
++
++    Lock order is ``history_lock`` -> ``_sessions_lock`` (session.resume/activate rebind a transport under
++    ``history_lock``, then cancel the orphan reap under ``_sessions_lock``). A caller that must start the
++    worker atomically with a ``_sessions_lock`` check prepares BEFORE taking that lock; taking
++    ``history_lock`` inside it deadlocked a resume racing its session's own prompt.submit."""
+     if session is not None:
+         with session["history_lock"]:
+             if not owns(session):
+@@ -202,6 +213,7 @@ def start_work(target, *, name, session=None, home=None, busy_wait_s=None):
+                 token.retain()
+     else:
+         token = None
++    installed = False
+     if token is None:
+         token = acquire(home or (session or {}).get("profile_home"), busy_wait_s=busy_wait_s)
+         if token is not None and session is not None:
+@@ -213,19 +225,29 @@ def start_work(target, *, name, session=None, home=None, busy_wait_s=None):
+                 else:
+                     session[_KEY] = token.retain()
+                     session["_turn_admission_generation"] = token
++                    installed = True
+     if token is None:
+         return None
+     with token.lock:
+         token.workers += 1
+-    finished = False
+-    finish_lock = threading.Lock()
++    return PreparedWork(target, name, session, token, installed)
++
+ 
+-    def finish():
+-        nonlocal finished
+-        with finish_lock:
+-            if finished:
++class PreparedWork:
++    """A worker whose admission is retained but whose thread has not started (see ``prepare_work``)."""
++
++    def __init__(self, target, name, session, token, installed):
++        self._target, self._name, self._session, self._token = target, name, session, token
++        self._installed = installed  # this prepare put ``token`` on the session (no turn owned it yet)
++        self._finished = False
++        self._finish_lock = threading.Lock()
++
++    def _finish(self):
++        with self._finish_lock:
++            if self._finished:
+                 return
+-            finished = True
++            self._finished = True
++        session, token = self._session, self._token
+         # The final worker also covers failures before normal terminal cleanup.
+         if session is not None:
+             with session["history_lock"], token.lock:
+@@ -238,26 +260,53 @@ def start_work(target, *, name, session=None, home=None, busy_wait_s=None):
+                 token.workers -= 1
+         token.release()
+ 
+-    def run():
+-        context = _current.set((session, token))
++    def cancel(self):
++        """Never started: undo the prepare only (no settlement), as if ``start_work`` had not been called."""
++        with self._finish_lock:
++            if self._finished:
++                return
++            self._finished = True
++        session, token = self._session, self._token
++        if session is not None and self._installed:
++            with session["history_lock"]:
++                if session.get(_KEY) is token:
++                    session.pop(_KEY)
++                    if session.get("_turn_admission_generation") is token:
++                        session.pop("_turn_admission_generation", None)
++                    token.release()
++        with token.lock:
++            token.workers -= 1
++        token.release()
++
++    def _run(self):
++        context = _current.set((self._session, self._token))
+         try:
+-            target()
++            self._target()
+         finally:
+             try:
+-                finish()
++                self._finish()
+             finally:
+                 _current.reset(context)
+ 
+-    try:
+-        thread = spawn_context_thread(run, name=name)
+-        if session is not None:
+-            session["_run_thread"] = thread
+-        thread.start()
+-        return thread
+-    except BaseException:
+-        context = _current.set((session, token))
++    def abort(self):
++        """A ``start`` that raised: the worker's own cleanup (it may settle the turn), from this thread."""
++        context = _current.set((self._session, self._token))
+         try:
+-            finish()
++            self._finish()
+         finally:
+             _current.reset(context)
+-        raise
++
++    def start(self, *, abort_on_error=True):
++        """Spawn the worker; takes no session lock. Under ``_sessions_lock`` pass ``abort_on_error=False`` and
++        call ``abort()`` after releasing it, since the cleanup takes ``history_lock``."""
++        from agent.memory_provider import spawn_context_thread
++        try:
++            thread = spawn_context_thread(self._run, name=self._name)
++            if self._session is not None:
++                self._session["_run_thread"] = thread
++            thread.start()
++            return thread
++        except BaseException:
++            if abort_on_error:
++                self.abort()
++            raise
+-- 
+2.55.0
+

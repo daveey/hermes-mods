@@ -1,0 +1,191 @@
+From 7c0cbd292320dbad3a584f0944275147f549c613 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 06:09:07 +0000
+Subject: [PATCH] fix(kanban): recompute retry and redirect request budgets
+ [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              | 32 ++++++--
+ .../test_kanban_sync_hub_keepalive.py         | 75 +++++++++++++++++++
+ .../test_kanban_worker_placement_failures.py  |  2 +-
+ 3 files changed, 103 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 497e660fbd4..aeee85dcb5e 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -147,6 +147,19 @@ def _peer_closed(conn) -> bool:
+         return True
+ 
+ 
++class _DeadlineRequests(urllib.request.BaseHandler):
++    """urllib invokes request processors again for each redirect, before sending."""
++
++    def __init__(self, remaining: Callable[[float], float]) -> None:
++        self.remaining = remaining
++
++    def http_request(self, request):
++        request.timeout = self.remaining(request.timeout)
++        return request
++
++    https_request = http_request
++
++
+ class Hub:
+     """The Board service's HTTP API for one gateway.
+ 
+@@ -172,12 +185,17 @@ class Hub:
+         return {"authorization": f"Bearer {self.ident.key}", "content-type": "application/json",
+                 "user-agent": "hermes-kanban-sync/1"}
+ 
+-    def _call(self, method: str, path: str, body: Optional[dict] = None) -> dict:
+-        timeout = self.timeout
++    def _remaining(self, timeout: Optional[float] = None) -> float:
++        """Recompute the shared absolute budget immediately before each HTTP attempt."""
++        timeout = self.timeout if timeout is None else timeout
+         if self.deadline is not None:
+             timeout = min(timeout, self.deadline - time.monotonic())
+             if timeout <= 0:
+                 raise TimeoutError("Board request budget exhausted")
++        return timeout
++
++    def _call(self, method: str, path: str, body: Optional[dict] = None) -> dict:
++        timeout = self._remaining()
+         data = None if body is None else json.dumps(body).encode()
+         parts = urllib.parse.urlsplit(self.ident.url)
+         if parts.scheme not in ("http", "https") or not parts.hostname or self._proxied(parts):
+@@ -185,10 +203,14 @@ class Hub:
+         return self._call_kept_alive(parts, method, path, data, timeout)
+ 
+     def _call_urlopen(self, method: str, path: str, data: Optional[bytes], timeout: Optional[float] = None) -> dict:
+-        timeout = self.timeout if timeout is None else timeout
++        timeout = self._remaining(timeout)
+         req = urllib.request.Request(self.ident.url + path, data=data, method=method, headers=self._headers())
++        # A per-call opener leaves global urllib users alone. Its processor also caps
++        # urllib's internal redirect follows, not merely the initial fallback send.
++        open_request = (urllib.request.build_opener(_DeadlineRequests(self._remaining)).open
++                        if self.deadline is not None else urllib.request.urlopen)
+         try:
+-            with urllib.request.urlopen(req, timeout=timeout) as resp:
++            with open_request(req, timeout=timeout) as resp:
+                 return json.loads(resp.read() or b"{}")
+         except urllib.error.HTTPError as exc:
+             text = exc.read().decode("utf-8", "replace")[:500]
+@@ -255,7 +277,7 @@ class Hub:
+         target = (parts.path or "") + path
+         headers = self._headers()
+         for attempt in (0, 1):
+-            conn, reused = self._connection(parts, timeout)
++            conn, reused = self._connection(parts, self._remaining(timeout))
+             try:
+                 conn.request(method, target, body=data, headers=headers)
+             except (OSError, http.client.HTTPException) as exc:
+diff --git a/tests/hermes_cli/test_kanban_sync_hub_keepalive.py b/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+index 24e06b2cb48..13404b3a0b2 100644
+--- a/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
++++ b/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+@@ -130,6 +130,37 @@ def test_stale_socket_get_is_retried_once(server, monkeypatch):
+     assert server.connections == 2
+ 
+ 
++@pytest.mark.parametrize("elapsed", [1.5, 2.1])
++def test_get_resend_recomputes_remaining_budget(server, monkeypatch, elapsed):
++    """A real reused connection closes after spending part (or all) of the budget."""
++    from types import SimpleNamespace
++    clock = [100.0]
++    monkeypatch.setattr(ksc, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++    hub = _hub(server)
++    hub.machines()
++    hub.deadline = 102.0
++    original = _Handler._serve
++
++    def close_once(handler):
++        clock[0] += elapsed
++        monkeypatch.setattr(_Handler, "do_GET", original)
++        handler.close_connection = True
++        handler.connection.shutdown(socket.SHUT_RDWR)
++
++    monkeypatch.setattr(_Handler, "do_GET", close_once)
++    try:
++        if elapsed > 2:
++            with pytest.raises(TimeoutError, match="budget exhausted"):
++                hub.machines()
++            assert server.connections == 1
++        else:
++            assert hub.machines()["path"] == "/v2/machines"
++            assert hub._local.conn.sock.gettimeout() <= 0.5
++            assert server.connections == 2
++    finally:
++        hub.close()
++
++
+ def test_post_whose_answer_is_lost_is_not_resent(server):
+     hub = _hub(server)
+     hub.machines()
+@@ -292,6 +323,50 @@ class _Redirect(http.server.BaseHTTPRequestHandler):
+     do_GET = do_POST = _serve
+ 
+ 
++@pytest.mark.parametrize("proxied", [False, True])
++@pytest.mark.parametrize("step", [0.4, 2.1])
++def test_redirect_chain_recomputes_budget(server, monkeypatch, proxied, step):
++    """Every actual HTTP send, including urllib's own follows, gets remaining time."""
++    import http.client
++    from types import SimpleNamespace
++    clock = [100.0]
++    monkeypatch.setattr(ksc, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++    monkeypatch.setattr(ksc.Hub, "_proxied", staticmethod(lambda parts: proxied))
++    sent = []
++    request = http.client.HTTPConnection.request
++
++    def observed_request(conn, *args, **kwargs):
++        sent.append((clock[0], conn.timeout))
++        return request(conn, *args, **kwargs)
++
++    def redirect(handler):
++        clock[0] += step
++        server.requests.append((handler.command, handler.path))
++        handler.send_response(302 if handler.path != "/end" else 200)
++        handler.send_header("location", "/end" if handler.path == "/hop" else "/hop")
++        handler.send_header("content-length", "2" if handler.path == "/end" else "0")
++        handler.end_headers()
++        if handler.path == "/end":
++            handler.wfile.write(b"{}")
++
++    monkeypatch.setattr(http.client.HTTPConnection, "request", observed_request)
++    monkeypatch.setattr(_Handler, "do_GET", redirect)
++    hub = _hub(server)
++    hub.deadline = 102.0
++    try:
++        if step > 2:
++            with pytest.raises(TimeoutError, match="budget exhausted"):
++                hub.machines()
++            assert len(sent) == 1
++        else:
++            assert hub.machines() == {}
++            assert len(sent) >= 3
++            for now, timeout in sent:
++                assert 0 < timeout <= 102.0 - now
++    finally:
++        hub.close()
++
++
+ def test_redirects_follow_for_get_and_never_resend_a_post(monkeypatch):
+     for var in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+         monkeypatch.delenv(var, raising=False)
+diff --git a/tests/hermes_cli/test_kanban_worker_placement_failures.py b/tests/hermes_cli/test_kanban_worker_placement_failures.py
+index a709d972f72..0b27c5c0cb0 100644
+--- a/tests/hermes_cli/test_kanban_worker_placement_failures.py
++++ b/tests/hermes_cli/test_kanban_worker_placement_failures.py
+@@ -46,7 +46,7 @@ def test_http_budget_is_shared_across_requests(monkeypatch):
+         timeouts.append(timeout)
+         clock[0] += 1.0
+         yield BytesIO(b"{}")
+-    monkeypatch.setattr(client.urllib.request, "urlopen", open_response)
++    monkeypatch.setattr(client.urllib.request, "build_opener", lambda *handlers: SimpleNamespace(open=open_response))
+     hub = client.Hub(client.Identity("http://example.invalid", "synthetic", "hub"), deadline=102.0)
+     hub.changes("default", 0)
+     hub.reserve("default", task_id="one", expected_revision=1, candidates=["worker-1"])
+-- 
+2.55.0
+

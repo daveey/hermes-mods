@@ -46,3 +46,34 @@ Rollback removes new enrollment, not existing fences. Keep the Board routes avai
 ## Gotchas
 
 Pool membership is a candidate list, not an AND-list of `machine:*` requirements. Load average is not CPU utilization. Removing config or changing sync mode must not make existing policy cards locally runnable. Older Board servers can reject `active_card_runs`, leaving telemetry stale even when pools are disabled. Never erase placement fences in SQLite to work around a rollback. This is core routing/lease logic, not a plugin.
+
+
+## Follow-up 1841–1843: ordinary repo work enrolls worker-first; host-bound work stays home
+
+Patches: **1841** (`9328cbc2d9`, `fix(kanban): let ordinary repo work and MacBook-placed cards enroll worker-first [daveey]`), **1842** (`dfafe9cb8c`, `fix(kanban): keep host skills, local worktrees and hermes-hub runs on their host [daveey]`), **1843** (`46329eeaba`, `fix(kanban): keep every home-rooted .worktrees tree on its host [daveey]`). Mirrored in the 1822–1918 pass ([mirror-1918-verification.md](mirror-1918-verification.md)).
+
+### Behavior
+
+- Ordinary repo work and MacBook-placed cards can enroll worker-first instead of all queueing on the hub (1841).
+- Cards that need host skills, a host-local worktree or a hermes-hub run stay on their host (1842), and every home-rooted `.worktrees` tree counts as host-local, not only the hermes-agent checkout's (1843).
+
+### How it works
+
+`hermes_cli/kanban_placement.py` loosens the portability boundary and adds explicit host-bound markers (host skills, `LOCAL_WORKTREE_PATH` for any `~/**/.worktrees`).
+
+Source commit notes (first paragraph of each message, privacy-normalized):
+
+- 1841: Problem: 2026-11-03 06:56 UTC the hub held 84 ready cards and ran 6-7 locally at its cap of 7, while worker-1 (max_card_runs 16) ran 2. Only 1 ready card carried placement_policy=worker-first-v1.
+- 1842: Review of d2f8d4fd (PR773) named wrong-host risks in the loosened portability boundary. Traced on hermes-hub:
+- 1843: Re-review of 15ef9d20 (PR773, B1): LOCAL_WORKTREE_PATH covered only ~/.hermes/hermes-agent/.worktrees, so cards naming the per-repo kanban trees on the hub enrolled worker-first though their work exists only there (~/code/myapp/.worktrees/t_50dec368: 1 unpushed commit; ~/code/askeve/.worktrees/t_01a18c8*: 12 trees, 1-6 dirty files each). Repro at 15ef9d20: decide() returned worker-first-v1 for both titles.
+
+### Code
+
+`hermes_cli/kanban_placement.py`.
+
+### Tests
+
+Landed with the source commits; not rerun by this mirror pass unless the verification report lists them. Names are tests each patch added; a file with no names was modified only.
+
+- `tests/hermes_cli/test_kanban_placement.py`: `test_hub_origin_heavy_repo_work_goes_to_the_worker`
+- `tests/hermes_cli/test_kanban_worker_placement.py`: `test_ordinary_repo_work_enrolls_worker_first`, `test_hub_state_work_stays_local`, `test_placement_note_from_the_origin_is_not_a_host_need`, `test_placement_note_does_not_hide_a_real_host_need_in_the_card_text`, `test_host_specific_state_and_identity_stay_local`

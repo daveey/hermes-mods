@@ -50,3 +50,30 @@ Apply as part of the full series with the README **Applying** recipe; these patc
 ## Plugin?
 
 No: these change core modules that plugins cannot hook.
+
+
+## Follow-up 1835: app-pinned required contexts accept the app's legacy commit status
+
+Patches: **1835** (`30f20532c7`, `fix(kanban-pr): an app-pinned required context accepts that app's own legacy commit status [daveey]`). Mirrored in the 1822–1918 pass ([mirror-1918-verification.md](mirror-1918-verification.md)).
+
+### Behavior
+
+- A required check pinned to a GitHub App integration is satisfied by a legacy commit status posted by that app's own bot user (`<slug>[bot]`, resolved via `apps/<slug>`), matching GitHub's own merge rule (1835).
+
+### How it works
+
+`hermes_cli/kanban_pr_acceptance.py` and `kanban_pr_merge_time.py` resolve the status creator to its app id before comparing with the pinned integration.
+
+Source commit notes (first paragraph of each message, privacy-normalized):
+
+- 1835: GitHub satisfies a required check pinned to integration N with a commit status posted by app N's bot user (fabric-research's "Human review approval" status from github-actions[bot] passes integration 15368; PR #199 merged CLEAN). The gate refused every such status, so merged fabric-research PR cards could never complete. Resolve the status creator <slug>[bot] via apps/<slug> and accept it when the id matches; anyone else stays missing. Merge-time partitioning keys statuses by context + creator so a later status by someone else cannot hide the app's own.
+
+### Code
+
+`hermes_cli/kanban_pr_acceptance.py`, `hermes_cli/kanban_pr_merge_time.py`.
+
+### Tests
+
+Landed with the source commits; not rerun by this mirror pass unless the verification report lists them. Names are tests each patch added; a file with no names was modified only.
+
+- `tests/hermes_cli/test_kanban_pr_merge_time.py`: `test_pinned_app_accepts_its_own_legacy_status`, `test_pinned_app_rejects_legacy_status_from_anyone_else`, `test_pinned_app_status_not_hidden_by_later_status_from_another_creator`

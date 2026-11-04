@@ -1,0 +1,322 @@
+diff --git a/tests/tools/test_process_registry_awaiting_custody.py b/tests/tools/test_process_registry_awaiting_custody.py
+new file mode 100644
+index 00000000000..ed1d55a2e4b
+--- /dev/null
++++ b/tests/tools/test_process_registry_awaiting_custody.py
+@@ -0,0 +1,55 @@
++"""In-flight custody and held-copy marks compose for events taken off a session's held list [daveey].
++
++``process_registry_awaiting.hold`` puts events a poller took off its ``_notif_held`` list in in-flight custody
++(the backend-exit journal reads it) and ``release`` ends it. ``release`` also ends a held-copy mark
++(``async_delegation.mark_copy_held``) because ``take_ready`` takes one. The held list keeps its own mark, ended
++by ``_notif_unhold``. So ``hold`` must take a mark too: otherwise ``release`` + ``_notif_unhold`` end two marks
++for one, and a delegation result still being routed reads as lost to the orphan sweep.
++"""
++
++from __future__ import annotations
++
++import collections
++
++import pytest
++
++from tools import async_delegation as ad
++from tools import process_registry_awaiting as awaiting
++
++
++@pytest.fixture
++def marks(monkeypatch):
++    monkeypatch.setattr(ad, "_held_copies", collections.Counter())
++    monkeypatch.setattr(awaiting, "_in_flight", collections.Counter())
++    monkeypatch.setattr(awaiting, "_in_flight_events", [])
++    return ad._held_copies
++
++
++def _result(delegation_id: str) -> dict:
++    return {"type": "async_delegation", "delegation_id": delegation_id, "owner_task_id": "owner"}
++
++
++def test_hold_then_release_leaves_the_held_lists_mark(marks):
++    evt = _result("d1")
++    ad.mark_copy_held("d1")  # the session's held list owns this one (_notif_hold_for)
++    awaiting.hold([evt])
++    assert marks["d1"] == 2
++    assert evt in awaiting._in_flight_events and awaiting._in_flight["owner"] == 1
++    awaiting.release([evt])
++    assert marks["d1"] == 1, "release ended the held list's mark: the result reads as lost while still owed"
++    assert evt not in awaiting._in_flight_events and not awaiting._in_flight
++    ad.unmark_copy_held("d1")  # _notif_unhold
++    assert not marks
++
++
++def test_take_ready_then_release_balances_marks_and_custody(marks):
++    import queue
++
++    q: queue.Queue = queue.Queue()
++    evt = _result("d2")
++    q.put(evt)
++    taken = awaiting.take_ready(q, 0)
++    assert taken == [evt] and marks["d2"] == 1
++    assert awaiting.pending_events(q) == [evt]
++    awaiting.release(taken)
++    assert not marks and awaiting.pending_events(q) == []
+diff --git a/tests/tui_gateway/test_notice_commit_lock_order.py b/tests/tui_gateway/test_notice_commit_lock_order.py
+new file mode 100644
+index 00000000000..5c5b05901ef
+--- /dev/null
++++ b/tests/tui_gateway/test_notice_commit_lock_order.py
+@@ -0,0 +1,80 @@
++"""A notice turn's exit-fence commit keeps the ``history_lock`` -> ``_sessions_lock`` order [daveey].
++
++Two fork changes met in one merge. The C14 deadlock fix starts a prompt turn without taking a session's
++``history_lock`` while holding ``_sessions_lock`` (session.resume holds history_lock, then takes _sessions_lock).
++The backend-exit journal made a notice turn's start the commit point for its completions: the exit fence is
++checked and the start done under ``_sessions_lock``, and ``start_synthesized_turn`` marked the completions
++delivered under ``history_lock`` inside it. Composed naively that is the same ABBA pair again, on every
++automatic turn. The commit now marks before ``_sessions_lock`` and checks the fence under it, and the fence
++itself is raised under each session's ``history_lock`` first.
++"""
++
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from tests.tui_gateway.test_prompt_start_lock_order import (  # turn_env is a fixture
++    _OrderCheckedLock, _registered_session, turn_env)
++from tui_gateway import server
++from tui_gateway.exit_job_receipts import EXIT_FENCE, fence_exit_notices
++from tui_gateway.session_notifications import (
++    COMPLETION_UNSECURED, NOTIF_OFFERED_COMPLETIONS, start_synthesized_turn)
++
++pytestmark = pytest.mark.platforms("posix")
++
++EVENT = {"type": "completion", "session_id": "proc_done", "output": "CI passed"}
++
++
++def test_notice_turn_start_marks_delivery_without_history_lock_under_sessions_lock(turn_env, request):
++    sid = f"noticelock-{request.node.name}"[:60]
++    lock, completed = _OrderCheckedLock(), threading.Event()
++    session = _registered_session(sid, lock, completed)
++    session.update({"_synthesized_turn": True, NOTIF_OFFERED_COMPLETIONS: {"proc_done": dict(EVENT)}})
++    try:
++        assert server._run_prompt_submit("rid", sid, session, "notice")
++        thread = session.get("_run_thread")
++        assert thread is not None
++        thread.join(10)
++        assert not thread.is_alive()
++    finally:
++        with server._sessions_lock:
++            server._sessions.pop(sid, None)
++    assert completed.is_set(), "the notice turn must still run"
++    assert "proc_done" in session.get("_completion_delivered", set())
++    assert lock.under_sessions_lock == [], (
++        f"history_lock taken while holding _sessions_lock: {lock.under_sessions_lock}")
++
++
++def test_fence_between_mark_and_commit_refuses_the_start_and_keeps_the_notice_owed():
++    """The mark precedes the fence check now: an exit fencing in between must still see the notice (unsecured,
++    which the journal reports), the start must be refused, and the mark must be rolled back."""
++    session = {"history_lock": threading.Lock(), "_synthesized_turn": True,
++               NOTIF_OFFERED_COMPLETIONS: {"proc_done": dict(EVENT)}}
++    starts: list = []
++    with start_synthesized_turn(session) as commit:
++        assert set(session[COMPLETION_UNSECURED]) == {"proc_done"}  # the journal reports it from here on
++        fence_exit_notices([("sid", session)])
++        with server._sessions_lock:
++            assert commit(lambda: starts.append(1) or object()) is None
++    assert starts == [], "a notice turn started after the exit fence"
++    assert session[EXIT_FENCE] is True
++    assert not session.get("_completion_delivered")
++    assert not session.get(COMPLETION_UNSECURED)
++
++
++def test_exit_fence_takes_history_lock_outside_sessions_lock():
++    lock = _OrderCheckedLock()
++    session = {"history_lock": lock, "_turn_cancel_requested": False}
++    with server._sessions_lock:
++        server._sessions["fence-order"] = session
++    try:
++        fence_exit_notices()
++    finally:
++        with server._sessions_lock:
++            server._sessions.pop("fence-order", None)
++    assert session[EXIT_FENCE] is True
++    assert lock.acquisitions
++    assert lock.under_sessions_lock == [], (
++        f"history_lock taken while holding _sessions_lock: {lock.under_sessions_lock}")
+diff --git a/tests/tui_gateway/test_shutdown_job_receipts.py b/tests/tui_gateway/test_shutdown_job_receipts.py
+index c92de628f04..46a402a8c47 100644
+--- a/tests/tui_gateway/test_shutdown_job_receipts.py
++++ b/tests/tui_gateway/test_shutdown_job_receipts.py
+@@ -557,16 +557,22 @@ def _slow_notice_turn(monkeypatch, *, block_in, start=None):
+         starts.append(name)
+         return (start or (lambda: object()))()
+ 
++    def prepare_work(target, *, name, session=None, **kw):
++        # The prompt turn retains admission before _sessions_lock and spawns under it (``PreparedWork``).
++        return types.SimpleNamespace(start=lambda **_k: start_work(target, name=name, session=session),
++                                     cancel=lambda: None, abort=lambda: None)
++
+     monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: True)
+     monkeypatch.setattr(server, "_session_moved_refusal", lambda session: None)
+     monkeypatch.setattr(server, "_ensure_active_session_slot", slot)
+     monkeypatch.setattr(server, "_admit_prompt_turn", admit)
+-    real_start = server._start_session_work
++    real_start, real_prepare = server._start_session_work, server._prepare_session_work
+     monkeypatch.setattr(server, "_start_session_work", start_work)
++    monkeypatch.setattr(server, "_prepare_session_work", prepare_work)
+     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+     monkeypatch.setattr(server, "_notif_refusal_backoff", lambda s: None)
+     return types.SimpleNamespace(entered=entered, go=go, outcomes=outcomes, texts=texts, starts=starts,
+-                                 real_start=real_start)
++                                 real_start=real_start, real_prepare=real_prepare)
+ 
+ 
+ def _closing_backend(monkeypatch, backend):
+@@ -580,6 +586,7 @@ def _closing_backend(monkeypatch, backend):
+ 
+ def _next_backend_text(monkeypatch, home, turn) -> str:
+     monkeypatch.setattr(server, "_start_session_work", turn.real_start)  # the next backend's own start
++    monkeypatch.setattr(server, "_prepare_session_work", turn.real_prepare)
+     monkeypatch.setattr("tools.process_registry.process_registry", ProcessRegistry())
+     return _resume_text(monkeypatch, home)
+ 
+@@ -641,8 +648,8 @@ def test_notice_turn_claimed_before_exit_fence_but_not_started_is_journaled(home
+ 
+ @pytest.mark.parametrize("start", ["refused", "raises"])
+ def test_notice_turn_start_refused_or_raising_is_not_delivered(home, registry, backend, monkeypatch, start):
+-    """No exit in progress: a start that is refused or raises rolls back the delivered mark it made under
+-    _sessions_lock, the event goes back to the queue, and a later orderly exit journals it."""
++    """No exit in progress: a start that is refused or raises rolls back the delivered mark it made before the
++    start, the event goes back to the queue, and a later orderly exit journals it."""
+     from tools.process_registry_notifications import format_process_notification
+     from tui_gateway.session_notifications import COMPLETION_UNSECURED
+     _, event = _finished_event(registry, exit_code=4)
+diff --git a/tui_gateway/exit_job_receipts.py b/tui_gateway/exit_job_receipts.py
+index 8e749e7853a..6b3870fe1a4 100644
+--- a/tui_gateway/exit_job_receipts.py
++++ b/tui_gateway/exit_job_receipts.py
+@@ -76,14 +76,16 @@ def fence_exit_notices(sessions=None) -> None:
+     notice journaled for the next backend is not also delivered by this one. One-way; only the exit calls it."""
+     from tui_gateway import server
+     # Raised only under ``_sessions_lock`` (reentrant): a notice turn's start commits under it
+-    # (``start_synthesized_turn``), so each start lands wholly before the fence or is refused after it.
++    # (``start_synthesized_turn``), so each start lands wholly before the fence or is refused after it. Lock order
++    # is ``history_lock`` -> ``_sessions_lock`` (session.resume holds history_lock while it takes _sessions_lock),
++    # so each session is fenced under its own history_lock first.
+     with server._sessions_lock:
+         if sessions is None:
+             sessions = list(server._sessions.items())
+-        for _sid, session in sessions:
+-            with session.get("history_lock") or contextlib.nullcontext():
+-                session.setdefault(USER_STOP_AT_EXIT, bool(session.get("_turn_cancel_requested")))
+-                session[EXIT_FENCE] = True
++    for _sid, session in sessions:
++        with session.get("history_lock") or contextlib.nullcontext(), server._sessions_lock:
++            session.setdefault(USER_STOP_AT_EXIT, bool(session.get("_turn_cancel_requested")))
++            session[EXIT_FENCE] = True
+ 
+ 
+ def _user_stopped(session: dict) -> bool:
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 51127133a9c..4081aee4e5f 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -182,6 +182,12 @@ def _admit_prompt_turn(
+                 # the session already held stays for close's own handoff (_settle_isolated_turn_before_close).
+                 _release_active_session_slot(session)
+             return None
++        if not admit_synthesized_turn(session):
++            # [daveey] A backend exit fenced automatic turns after this one's claim: its notice is journaled
++            # for the next backend (exit_job_receipts), so it must not also run here. Delivery itself is
++            # committed only at the start below (start_synthesized_turn).
++            session["running"] = False
++            return None
+         images = list(session.get("attached_images", []) if image_paths is None else image_paths)
+         if image_paths is None:
+             session["attached_images"] = []
+@@ -276,7 +282,10 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+             session["_active_turn_marker_key"] = marker_key
+             # [daveey] _on_tool_start switches an at-most-once turn's marker off before its first tool runs.
+             session["_until_tool_marker_key"] = marker_key if until_tool and auto_continue else ""
+-        record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
++            from tui_gateway.session_notifications import COMPLETION_UNSECURED
++            carried = list(session.get(COMPLETION_UNSECURED) or ())
++        recorded = record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
++                          carried_job_ids=carried,
+                           auto_continue=auto_continue,
+                           **({"until_tool": True} if until_tool and auto_continue else {}),
+                           **({"killed_jobs": killed_jobs} if killed_jobs else {}),
+@@ -284,9 +293,20 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+                           **({"notification_category": "diagnostic"}
+                              if notification_category == "diagnostic" else {}))
+         with session["history_lock"]:
+-            marker_cancelled = bool(session.get("_turn_cancel_requested"))
++            # [daveey] The backend exit's own interrupt is not a Stop: like _retire_turn_marker, keep the marker
++            # it raced (only a user Stop before the exit drops it). That marker's prompt now carries any notice
++            # this turn was started with, so the exit journal stops reporting those separately.
++            exit_keeps = session.get("_exit_keeps_turn_marker") and not session.get("_user_stop_at_exit")
++            marker_cancelled = bool(session.get("_turn_cancel_requested")) and not exit_keeps
++            if recorded:  # only verified persistence secures the carried notices; a failed write keeps custody
++                unsecured = session.get(COMPLETION_UNSECURED) or {}
++                for pid in carried:
++                    unsecured.pop(pid, None)
++                if not unsecured:
++                    session.pop(COMPLETION_UNSECURED, None)
+         if marker_cancelled:
+-            clear_turn_marker(marker_home, marker_key)
++            from tui_gateway.turn_marker import retire_cancelled_turn_marker
++            retire_cancelled_turn_marker(marker_home, marker_key)
+     return marker_key
+ 
+ 
+@@ -1419,6 +1439,11 @@ def _run_admitted_prompt(
+                 with session["history_lock"]:
+                     if session.get(SESSION_KEY) is segments:
+                         session.pop(SESSION_KEY)
++                    if not session.get("_exit_keeps_turn_marker"):
++                        # [daveey] The turn ran; a notice it carried without a marker of its own (one carried
++                        # a core-update pause) is delivered. A backend exit's interrupt keeps it reportable.
++                        from tui_gateway.session_notifications import COMPLETION_UNSECURED
++                        session.pop(COMPLETION_UNSECURED, None)
+                 # Closing bookend of "tui prompt accepted" — exactly one per accepted prompt.
+                 # agent.session_id is re-read because compression may have rotated it (an
+                 # accepted/finished pair whose id changed IS a rotation trace).
+@@ -1467,20 +1492,25 @@ def _run_admitted_prompt(
+     # state registry, and _sessions_lock gates every create/close/prompt on this backend. The worker's
+     # admission is retained before it too: that takes history_lock, and session.resume/activate hold
+     # history_lock while they take _sessions_lock (a resume racing this submit deadlocked the backend).
++    # [daveey] The notice commit (start_synthesized_turn) marks before _sessions_lock for the same reason.
+     work = _prepare_session_work(run, name=f"prompt-turn-{sid}", session=session)
+     spawning = started = False
+     try:
+-        with _routing_provenance_db(session) as routing_db, _sessions_lock:
+-            registered = _sessions.get(sid)
+-            can_start = work is not None and not session.get("_closing") and (registered is None or registered is session)
+-            if can_start:
+-                # Only a registered session is proof the conversation is routed here; an unregistered one may
+-                # still run its turn, but its stamp stays (#106459).
+-                if registered is session:
+-                    _reopen_routed_session_row(routing_db, sid, session)
+-                spawning = True
+-                work.start(abort_on_error=False)  # spawns only; the close-race check above stays atomic
+-                started = True
++        with start_synthesized_turn(session) as commit:
++            with _routing_provenance_db(session) as routing_db, _sessions_lock:
++                registered = _sessions.get(sid)
++                can_start = (work is not None and not session.get("_closing")
++                             and (registered is None or registered is session))
++                if can_start:
++                    # Only a registered session is proof the conversation is routed here; an unregistered one may
++                    # still run its turn, but its stamp stays (#106459).
++                    if registered is session:
++                        _reopen_routed_session_row(routing_db, sid, session)
++                    # Under _sessions_lock: the exit fence check and the start are one commit (exit_job_receipts);
++                    # spawns only, so the close-race check above stays atomic.
++                    spawning = True
++                    started = commit(lambda: work.start(abort_on_error=False)) is not None
++                    can_start = started
+     except BaseException:
+         # Out here _sessions_lock is released: both clean-ups take history_lock. A started worker owns its own.
+         if spawning and not started:

@@ -1,0 +1,1056 @@
+From 88d92f918c4157b16b50b1805fe4702845a7c1bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:59:16 +0000
+Subject: [PATCH] fix(desktop): give a busy-chat send that could not be queued
+ back to the composer (#770)
+
+* fix(desktop): give a busy-chat send that could not be queued back to the composer
+
+A send the owner admitted whose turn was then refused because another writer
+held the chat's turn lease (serve turn refused at once, gateway lease-wait
+timeout, taken-over chat; failure_reason session_busy) lost the user's words:
+Enter had already cleared the composer.
+
+- tui_gateway: message.complete forwards failure_reason=session_busy.
+- Desktop: the live frame and the failed_turn hydration row mark the refusal
+  (ChatMessage.refusedSend); the composer offers the refused words back once,
+  after anything typed meanwhile, as a new message (fresh submission id).
+- Nothing runs twice: one offer per scope+text (survives reload, released by a
+  newer user turn); Retry/Take over withdraws an untouched offer.
+- SESSION_OWNER_BUSY (refused before admission) already keeps the draft; now
+  covered by tests.
+
+Follow-up of #765.
+
+* refactor(tui_gateway): move message.complete outcome flags into _structured_outcome_fields
+
+Keeps _complete_turn_payload under the code-health CC target after the
+session_busy failure_reason was added.
+---
+ .../chat/composer/hooks/use-composer-draft.ts |  90 ++++
+ .../use-composer-submit.busy-refusal.test.tsx | 451 ++++++++++++++++++
+ .../gateway-event/message-stream.ts           |  19 +
+ .../session/hooks/use-prompt-actions/index.ts |   4 +
+ .../message-equivalence.ts                    |   3 +
+ .../src/lib/chat-messages/hydration.ts        |  18 +-
+ apps/desktop/src/lib/chat-messages/types.ts   |   4 +
+ apps/desktop/src/lib/session-busy-refusal.ts  |  23 +
+ apps/desktop/src/store/refused-sends.ts       | 197 ++++++++
+ .../test_durable_takeover_recovery.py         |   2 +
+ tui_gateway/prompt_turn.py                    |  27 +-
+ 11 files changed, 827 insertions(+), 11 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/composer/hooks/use-composer-submit.busy-refusal.test.tsx
+ create mode 100644 apps/desktop/src/lib/session-busy-refusal.ts
+ create mode 100644 apps/desktop/src/store/refused-sends.ts
+
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts
+index a53f6f5d604..1cd9cbfc3df 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts
+@@ -2,6 +2,7 @@ import { useAui, useAuiState, useComposerRuntime } from '@assistant-ui/react'
+ import { SLASH_COMMAND_RE } from '@hermes/shared'
+ import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+ 
++import type { ClientSessionState } from '@/app/types'
+ import { isElementInHiddenPane } from '@/components/pane-shell/pane-visibility'
+ import { translateNow } from '@/i18n'
+ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+@@ -12,6 +13,7 @@ import {
+   adoptNewSessionDraft,
+   type ComposerAttachment,
+   type ComposerDraftSyncMode,
++  draftKey,
+   freshDraftScope,
+   isFreshDraftScope,
+   onComposerDraftSyncRequest,
+@@ -34,6 +36,14 @@ import { adoptInterruptedSend, type InterruptedSendHandlers, restoreInterruptedS
+ import { $composerPopout } from '@/store/composer-popout'
+ import { migrateQueuedPrompts } from '@/store/composer-queue'
+ import { notify } from '@/store/notifications'
++import {
++  claimRefusedSendOffer,
++  mergeRefusedText,
++  onRefusedSendWithdraw,
++  releaseRefusedSendOffers,
++  tailUserTurn
++} from '@/store/refused-sends'
++import { $sessionStates } from '@/store/session-states'
+ 
+ import { type ComposerStoreWriter, createComposerStoreWriter } from '../composer-store-writer'
+ import {
+@@ -868,6 +878,86 @@ export function useComposerDraft({
+     [target]
+   )
+ 
++  // A send the owner admitted but never ran because another writer held the chat
++  // (failure_reason session_busy, store/refused-sends.ts): Enter already cleared the words, so
++  // they come back here, once, after anything the user typed since. As a NEW message: the
++  // refused submission id is settled, so reusing it would be deduplicated and run nothing.
++  const offerRefusedSend = () => {
++    const scope = draftScopeRef.current
++    const runtimeId = sessionIdRef.current
++    const states: Record<string, ClientSessionState> = $sessionStates.get()
++
++    const state =
++      (runtimeId ? states[runtimeId] : undefined) ??
++      (scope ? Object.values(states).find(candidate => candidate.storedSessionId === scope) : undefined)
++
++    const tail = state?.messages ? tailUserTurn(state.messages) : null
++
++    if (tail && !tail.refused) {
++      releaseRefusedSendOffers(scope)
++    }
++
++    const refused = tail?.refused && tail.text ? { text: tail.text } : null
++
++    if (
++      !refused ||
++      inputDisabled ||
++      queueEditStateRef.current?.sessionKey === scope ||
++      isBrowsingHistory(runtimeId) ||
++      !claimRefusedSendOffer(scope, refused)
++    ) {
++      return
++    }
++
++    const current = syncDraftFromEditor()
++    const next = mergeRefusedText(current, refused.text)
++
++    if (next === current) {
++      return
++    }
++
++    if (draftRetryRef.current) {
++      draftRetryRef.current = undefined
++      writeDraftRetry(scope, undefined)
++    }
++
++    const attachments = attachmentScope.$attachments.get()
++    stashAt(scope, next, attachments)
++    loadIntoComposer(next, attachments, true)
++  }
++
++  // A re-run of the refused turn from its card (Take over here, Retry) takes back an offer the
++  // user has not touched, so one Enter more cannot run the same message twice.
++  const withdrawRefusedSend = (detail: { handled: boolean; scope: string; text: string }) => {
++    if (draftKey(draftScopeRef.current) !== detail.scope) {
++      return
++    }
++
++    detail.handled = true
++
++    if (syncDraftFromEditor().trim() !== detail.text.trim()) {
++      return
++    }
++
++    const attachments = attachmentScope.$attachments.get()
++    stashAt(draftScopeRef.current, '', attachments)
++    loadIntoComposer('', attachments)
++  }
++
++  const refusedSendRef = useRef({ offer: offerRefusedSend, withdraw: withdrawRefusedSend })
++  refusedSendRef.current = { offer: offerRefusedSend, withdraw: withdrawRefusedSend }
++
++  useEffect(() => {
++    refusedSendRef.current.offer()
++    const stopOffers = $sessionStates.listen(() => refusedSendRef.current.offer())
++    const stopWithdraws = onRefusedSendWithdraw(detail => refusedSendRef.current.withdraw(detail))
++
++    return () => {
++      stopOffers()
++      stopWithdraws()
++    }
++  }, [activeQueueSessionKey, sessionId])
++
+   // pagehide is load-bearing: React skips effect cleanups on reload, so Cmd+R
+   // inside the debounce/rAF window would drop trailing keystrokes without this.
+   // beforeunload covers closing the window: Electron tears the renderer down
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.busy-refusal.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.busy-refusal.test.tsx
+new file mode 100644
+index 00000000000..08ac54a360f
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.busy-refusal.test.tsx
+@@ -0,0 +1,451 @@
++import { JsonRpcGatewayError } from '@hermes/shared'
++import { act, cleanup, render } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { renderMessageStream } from '@/app/session/hooks/use-message-stream/test-harness'
++import type { ClientSessionState } from '@/app/types'
++import { type ChatMessage, textPart, toChatMessages } from '@/lib/chat-messages'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { clearSessionDraft, mainComposerScope, takeSessionDraft } from '@/store/composer'
++import { resetRefusedSendsForTests, withdrawRefusedSend } from '@/store/refused-sends'
++import { $sessionStates } from '@/store/session-states'
++import type { SessionMessage } from '@/types/hermes'
++
++import { DRAFT_PERSIST_DEBOUNCE_MS, type QueueEditState } from '../composer-utils'
++import { composerPlainText, RICH_INPUT_SLOT } from '../rich-editor'
++
++import { useComposerDraft } from './use-composer-draft'
++import { useComposerSubmit } from './use-composer-submit'
++
++// A send to a busy chat that still can't be queued keeps the user's words: either the submit is
++// refused before admission (SESSION_OWNER_BUSY, the composer restores the draft), or the owner
++// admitted it and the turn was then refused because another writer held the lease
++// (failure_reason session_busy: an immediate serve refusal, the gateway's lease-wait timeout, a
++// taken-over chat). The draft and submit hooks, the stash and the message stream are the real ones;
++// only the assistant-ui adapter is substituted.
++const runtime = vi.hoisted(() => {
++  let text = ''
++  const listeners = new Set<() => void>()
++
++  const setText = vi.fn((next: string) => {
++    text = next
++    listeners.forEach(listener => listener())
++  })
++
++  return {
++    composer: { setText },
++    getState: () => ({ text }),
++    reset: () => {
++      text = ''
++      listeners.clear()
++    },
++    subscribe: (listener: () => void) => {
++      listeners.add(listener)
++
++      return () => listeners.delete(listener)
++    }
++  }
++})
++
++vi.mock('@assistant-ui/react', () => ({
++  useAui: () => ({ composer: () => runtime.composer }),
++  useAuiState: (selector: (state: { composer: { text: string } }) => unknown) =>
++    selector({ composer: runtime.getState() }),
++  useComposerRuntime: () => runtime
++}))
++
++const SCOPE = 'busy-refusal-session'
++const RUNTIME = 'busy-refusal-runtime'
++const TEXT = 'please summarize the open PRs'
++const queueEditRef = { current: null as QueueEditState | null }
++
++type Submit = (text: string, target?: { submission_id?: string }) => Promise<boolean>
++
++let submitDraft: () => void
++let onSubmit: Submit
++
++function Harness() {
++  const draft = useComposerDraft({
++    activeQueueSessionKey: SCOPE,
++    focusKey: null,
++    inputDisabled: false,
++    queueEditRef,
++    sessionId: RUNTIME
++  })
++
++  const submit = useComposerSubmit({
++    ...draft,
++    activeQueueSessionKey: SCOPE,
++    attachments: [],
++    busy: false,
++    disabled: false,
++    drainNextQueued: async () => false,
++    exitQueuedEdit: () => false,
++    inputDisabled: false,
++    onCancel: () => {},
++    onSteer: async () => true,
++    onSteerHidden: async () => true,
++    onSubmit: (text, target) => onSubmit(text, target),
++    queueCurrentDraft: () => false,
++    queueEdit: null,
++    queuedPrompts: [],
++    sessionId: RUNTIME
++  })
++
++  submitDraft = submit.submitDraft
++
++  return (
++    <div
++      contentEditable
++      data-slot={RICH_INPUT_SLOT}
++      data-testid="editor"
++      ref={draft.editorRef}
++      suppressContentEditableWarning
++    />
++  )
++}
++
++function typeAndSave(editor: HTMLElement, text: string) {
++  editor.textContent = text
++  editor.dispatchEvent(new Event('input', { bubbles: true }))
++  act(() => {
++    runtime.composer.setText(text)
++  })
++  act(() => void vi.advanceTimersByTime(DRAFT_PERSIST_DEBOUNCE_MS + 50))
++}
++
++const composerText = (editor: HTMLElement) => composerPlainText(editor).trim()
++
++const userBubble = (rowId?: number): ChatMessage => ({
++  id: 'user-optimistic',
++  role: 'user',
++  parts: [textPart(TEXT)],
++  ...(rowId !== undefined ? { rowId } : {})
++})
++
++const publish = (state: ClientSessionState) => act(() => $sessionStates.set({ [RUNTIME]: state }))
++
++/** Send TEXT from the composer; the owner admits it (the composer empties). Returns its id. */
++async function sendAdmitted(editor: HTMLElement): Promise<string | undefined> {
++  let submissionId: string | undefined
++
++  onSubmit = async (_text, target) => {
++    submissionId = target?.submission_id
++
++    return true
++  }
++
++  typeAndSave(editor, TEXT)
++  act(() => submitDraft())
++  await act(async () => undefined)
++  expect(composerText(editor)).toBe('')
++
++  return submissionId
++}
++
++/** The live stream's view of the admitted turn ending in `payload` (a message.complete error). */
++function streamTurnFailure(payload: Record<string, unknown>, rowId?: number): ClientSessionState {
++  const states = new Map([[RUNTIME, createClientSessionState(SCOPE, [userBubble(rowId)])]])
++  const stream = renderMessageStream(RUNTIME, { states })
++
++  act(() => stream.handleEvent({ payload: {}, session_id: RUNTIME, type: 'message.start' }))
++  act(() =>
++    stream.handleEvent({ payload: { status: 'error', ...payload }, session_id: RUNTIME, type: 'message.complete' })
++  )
++
++  return stream.state(RUNTIME)
++}
++
++// agent/turn_facade_lease.py `_lease_not_acquired_result`, as tui_gateway/prompt_turn.py frames it.
++const SERVE_REFUSAL = {
++  text: 'This chat has another active writer. Use session.take_over (Take over here), then retry your message. Your message was not processed.',
++  error: `session_turn_lease_timeout:${SCOPE}`,
++  failure_reason: 'session_busy',
++  error_surface: { layer: 'gateway', code: 'SESSION_NOT_OWNED', retryable: false },
++  recoverable: true
++}
++
++const LEASE_WAIT_TIMEOUT = {
++  text: '⏳ Another Hermes process kept this session busy too long. Your message was not processed - wait for the other process to finish, then send it again.',
++  error: `session_turn_lease_timeout:${SCOPE}`,
++  recoverable: true
++}
++
++beforeEach(() => {
++  vi.useFakeTimers()
++  runtime.reset()
++  resetRefusedSendsForTests()
++})
++
++afterEach(() => {
++  cleanup()
++  vi.useRealTimers()
++  mainComposerScope.clear()
++  clearSessionDraft(SCOPE)
++  $sessionStates.set({})
++  resetRefusedSendsForTests()
++})
++
++describe('a busy-chat send that cannot be queued keeps the user text', () => {
++  it('SESSION_OWNER_BUSY: the refused submit leaves the words in the composer', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    onSubmit = async () => {
++      throw new JsonRpcGatewayError('The gateway is running a turn in this chat and could not queue it.', {
++        code: 4090,
++        data: { reason: 'SESSION_OWNER_BUSY' }
++      })
++    }
++
++    typeAndSave(editor, TEXT)
++    act(() => submitDraft())
++    await act(async () => undefined)
++
++    expect(composerText(editor)).toBe(TEXT)
++    expect(takeSessionDraft(SCOPE).text).toBe(TEXT)
++  })
++
++  it('SESSION_OWNER_BUSY answered as a rejected send (accepted === false) keeps the words too', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    onSubmit = async () => false
++    typeAndSave(editor, TEXT)
++    act(() => submitDraft())
++    await act(async () => undefined)
++
++    expect(composerText(editor)).toBe(TEXT)
++  })
++
++  it('a serve turn refused at once by a held lease gives the words back to the composer', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    publish(streamTurnFailure(SERVE_REFUSAL, 41))
++
++    expect(composerText(editor)).toBe(TEXT)
++    expect(takeSessionDraft(SCOPE).text).toBe(TEXT)
++  })
++
++  it('a gateway turn that waited out the lease gives the words back (older frame: error prefix only)', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    publish(streamTurnFailure(LEASE_WAIT_TIMEOUT))
++
++    expect(composerText(editor)).toBe(TEXT)
++  })
++
++  it('a turn refused because another window took the chat over gives the words back', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    publish(
++      streamTurnFailure({
++        text: 'This chat was taken over by another Hermes window. Resume it explicitly to continue here. Your message was not processed.',
++        failure_reason: 'session_busy',
++        error_surface: { layer: 'gateway', code: 'SESSION_NOT_OWNED', retryable: false }
++      })
++    )
++
++    expect(composerText(editor)).toBe(TEXT)
++  })
++
++  it('a failed_turn row with failure_reason session_busy brings the text back on a reopened chat', () => {
++    const rows: SessionMessage[] = [
++      { id: 7, role: 'user', content: TEXT, timestamp: 1 } as SessionMessage,
++      {
++        role: 'assistant',
++        content: 'This turn did not complete.',
++        timestamp: 2,
++        display_kind: 'failed_turn',
++        display_metadata: { error: `session_turn_lease_timeout:${SCOPE}`, failure_reason: 'session_busy' }
++      } as SessionMessage
++    ]
++
++    const { getByTestId } = render(<Harness />)
++    publish(createClientSessionState(SCOPE, toChatMessages(rows)))
++
++    expect(composerText(getByTestId('editor'))).toBe(TEXT)
++  })
++
++  it('a failed_turn row whose error surface names session_busy brings the text back', () => {
++    const rows: SessionMessage[] = [
++      { id: 8, role: 'user', content: TEXT, timestamp: 1 } as SessionMessage,
++      {
++        role: 'assistant',
++        content: 'This turn did not complete.',
++        timestamp: 2,
++        display_kind: 'failed_turn',
++        display_metadata: { error_surface: { layer: 'gateway', code: 'session_busy', retryable: true } }
++      } as SessionMessage
++    ]
++
++    const { getByTestId } = render(<Harness />)
++    publish(createClientSessionState(SCOPE, toChatMessages(rows)))
++
++    expect(composerText(getByTestId('editor'))).toBe(TEXT)
++  })
++
++  it('another failed turn (a provider error) leaves the composer alone', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    publish(
++      streamTurnFailure({
++        text: 'rate limited',
++        error: 'rate limited',
++        error_surface: { layer: 'provider', code: 'rate_limit', retryable: true }
++      })
++    )
++
++    expect(composerText(editor)).toBe('')
++  })
++
++  it('keeps what the user typed meanwhile and adds the refused words after it', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    typeAndSave(editor, 'and the next thing')
++    publish(streamTurnFailure(SERVE_REFUSAL, 41))
++
++    expect(composerPlainText(editor)).toBe(`and the next thing\n\n${TEXT}`)
++  })
++})
++
++describe('nothing runs twice', () => {
++  it('offers the words once: a re-read transcript does not refill a composer the user emptied', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    const refused = streamTurnFailure(SERVE_REFUSAL, 41)
++    publish(refused)
++    expect(composerText(editor)).toBe(TEXT)
++
++    typeAndSave(editor, '')
++    publish({ ...refused, messages: [...refused.messages] })
++
++    expect(composerText(editor)).toBe('')
++  })
++
++  it('the given-back words are a new message, not a retry of the settled submission id', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    const first = await sendAdmitted(editor)
++    publish(streamTurnFailure(SERVE_REFUSAL, 41))
++    expect(composerText(editor)).toBe(TEXT)
++
++    let resent: string | undefined
++
++    onSubmit = async (_text, target) => {
++      resent = target?.submission_id
++
++      return true
++    }
++
++    act(() => submitDraft())
++    await act(async () => undefined)
++
++    expect(first).toBeTruthy()
++    expect(resent).toBeTruthy()
++    expect(resent).not.toBe(first)
++  })
++
++  it('re-running the refused turn from its card takes the untouched offer back', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    publish(streamTurnFailure(SERVE_REFUSAL, 41))
++    expect(composerText(editor)).toBe(TEXT)
++
++    act(() => withdrawRefusedSend(SCOPE, TEXT))
++
++    expect(composerText(editor)).toBe('')
++    expect(takeSessionDraft(SCOPE).text).toBe('')
++  })
++
++  it('an edited offer is the user’s new message: a re-run of the card leaves it', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    publish(streamTurnFailure(SERVE_REFUSAL, 41))
++    typeAndSave(editor, `${TEXT} and the issues`)
++
++    act(() => withdrawRefusedSend(SCOPE, TEXT))
++
++    expect(composerText(editor)).toBe(`${TEXT} and the issues`)
++  })
++
++  it('the live refusal, then the same turn hydrated with its row id, is still one offer', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    publish(streamTurnFailure(SERVE_REFUSAL))
++    expect(composerText(editor)).toBe(TEXT)
++    typeAndSave(editor, '')
++
++    const rows: SessionMessage[] = [
++      { id: 41, role: 'user', content: TEXT, timestamp: 1 } as SessionMessage,
++      {
++        role: 'assistant',
++        content: SERVE_REFUSAL.text,
++        timestamp: 2,
++        display_kind: 'failed_turn',
++        display_metadata: { failure_reason: 'session_busy' }
++      } as SessionMessage
++    ]
++
++    publish(createClientSessionState(SCOPE, toChatMessages(rows)))
++
++    expect(composerText(editor)).toBe('')
++  })
++
++  it('the same words sent again and refused again come back again', async () => {
++    const { getByTestId } = render(<Harness />)
++    const editor = getByTestId('editor')
++
++    await sendAdmitted(editor)
++    const first = streamTurnFailure(SERVE_REFUSAL, 41)
++    publish(first)
++    expect(composerText(editor)).toBe(TEXT)
++
++    // Enter on the given-back words: a new pending user turn sits at the tail.
++    act(() => submitDraft())
++    await act(async () => undefined)
++    expect(composerText(editor)).toBe('')
++    publish({ ...first, messages: [...first.messages, { ...userBubble(), id: 'user-again', pending: true }] })
++
++    // ...and it is refused too.
++    publish({
++      ...first,
++      messages: [
++        ...first.messages,
++        { ...userBubble(), id: 'user-again' },
++        { id: 'refusal-again', role: 'assistant', parts: [], error: 'busy', refusedSend: true }
++      ]
++    })
++
++    expect(composerText(editor)).toBe(TEXT)
++  })
++
++  it('a later user turn means the refusal is history: nothing is offered', () => {
++    const later: ChatMessage = { id: 'user-later', role: 'user', parts: [textPart('something else')] }
++    const refused = streamTurnFailure(SERVE_REFUSAL, 41)
++
++    const { getByTestId } = render(<Harness />)
++    publish({ ...refused, messages: [...refused.messages, later] })
++
++    expect(composerText(getByTestId('editor'))).toBe('')
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
+index ff66ab1b366..48208ebafa5 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
+@@ -8,6 +8,7 @@ import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
+ import { playCompletionSound } from '@/lib/completion-sound'
+ import { parseErrorSurface } from '@/lib/error-surface'
+ import { triggerHaptic } from '@/lib/haptics'
++import { isSessionBusyRefusal } from '@/lib/session-busy-refusal'
+ import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
+ import { clearSettledClarifyRequest } from '@/store/clarify'
+ import { setSessionCompacting } from '@/store/compaction'
+@@ -16,6 +17,7 @@ import { notify } from '@/store/notifications'
+ import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
+ import { clearAllPrompts } from '@/store/prompts'
+ import { providerWaitText, setSessionProviderWait } from '@/store/provider-wait'
++import { markRefusedSendTail } from '@/store/refused-sends'
+ import { setCurrentUsage, setTurnStartedAt } from '@/store/session'
+ import { refreshSupportedSessionControlAfterTurn } from '@/store/session-control'
+ import { $focusedStoredSessionId } from '@/store/session-focus'
+@@ -433,6 +435,23 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
+       noteFreeTierTurnComplete()
+     }
+ 
++    // Another writer held the chat, so the turn never ran (failure_reason session_busy): mark its
++    // error bubble so the composer gives the refused words back (store/refused-sends.ts).
++    if (
++      payload?.status === 'error' &&
++      isSessionBusyRefusal({
++        error: payload.error,
++        failureReason: payload.failure_reason,
++        surfaceCode: parseErrorSurface(payload.error_surface)?.code
++      })
++    ) {
++      deps.updateSessionState(sessionId, state => {
++        const messages = markRefusedSendTail(state.messages)
++
++        return messages === state.messages ? state : { ...state, messages }
++      })
++    }
++
+     // Structured billing wall forwarded by the gateway (out of credits /
+     // payment required) — cache it for the banner (toast only off screen). A window
+     // plan's limit is said once, by the turn's error card (its buttons are the
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
+index a1c6edfb994..6a8c41c411f 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
+@@ -30,6 +30,7 @@ import { confirm } from '@/store/confirm'
+ import { clearNotifications, notify, notifyError } from '@/store/notifications'
+ import { clearPreviewArtifacts } from '@/store/preview-status'
+ import { clearAllPrompts } from '@/store/prompts'
++import { withdrawRefusedSend } from '@/store/refused-sends'
+ import {
+   $busy,
+   $currentCwd,
+@@ -1121,6 +1122,9 @@ export function usePromptActions({
+       clearPreviewArtifacts(sessionId)
+ 
+       clearNotifications()
++      // Re-running a refused send (Take over here, Retry): the composer must not keep the copy it
++      // was offered back, or one more Enter would run the same message twice.
++      withdrawRefusedSend($sessionStates.get()[sessionId]?.storedSessionId ?? sessionId, plan.text)
+       updateSessionState(sessionId, state => applyReloadOptimistic(state, plan))
+ 
+       try {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/message-equivalence.ts b/apps/desktop/src/app/session/hooks/use-session-actions/message-equivalence.ts
+index 5ef10d22014..549173c3013 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/message-equivalence.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/message-equivalence.ts
+@@ -37,6 +37,9 @@ const COMPARED_FIELDS = [
+   // Structured failure layer — drives the error card's title and action row,
+   // so a change (e.g. resume replay attaching the descriptor) must repaint.
+   'errorSurface',
++  // A busy-chat refusal hands the user's words back to the composer, which reads this marker
++  // from the published transcript: a resume that only attaches it must still publish.
++  'refusedSend',
+   'hidden',
+   'branchGroupId',
+   'interim',
+diff --git a/apps/desktop/src/lib/chat-messages/hydration.ts b/apps/desktop/src/lib/chat-messages/hydration.ts
+index 5f2ba5b321e..ff9245891f4 100644
+--- a/apps/desktop/src/lib/chat-messages/hydration.ts
++++ b/apps/desktop/src/lib/chat-messages/hydration.ts
+@@ -5,6 +5,7 @@ import { splitLeadingAttachmentRefs } from '@/components/assistant-ui/reference-
+ import { extractImageRefs } from '@/lib/embedded-images'
+ import { parseErrorSurface } from '@/lib/error-surface'
+ import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
++import { isSessionBusyRefusal } from '@/lib/session-busy-refusal'
+ import { isTodoToolName } from '@/lib/todos'
+ import type { MessageReaction, SessionMessage } from '@/types/hermes'
+ 
+@@ -219,9 +220,20 @@ function isPainted(message: SessionMessage): boolean {
+ // kept on its boundary row so a reopened session shows it after the live frame is gone.
+ function failedTurnError(
+   metadata: SessionMessage['display_metadata']
+-): null | Pick<ChatMessage, 'error' | 'errorSurface'> {
++): null | Pick<ChatMessage, 'error' | 'errorSurface' | 'refusedSend'> {
+   const parsed = parseDisplayMetadata(metadata)
+-  const errorSurface = parseErrorSurface(parsed?.error_surface)
++  const parsedSurface = parseErrorSurface(parsed?.error_surface)
++
++  // A busy-chat refusal never processed the user's message: the composer offers it back
++  // (store/refused-sends.ts). A row naming only its `failure_reason` still gets its card.
++  const refused = isSessionBusyRefusal({
++    error: parsed?.error,
++    failureReason: parsed?.failure_reason,
++    surfaceCode: parsedSurface?.code
++  })
++
++  const errorSurface =
++    parsedSurface ?? (refused ? { layer: 'gateway' as const, code: 'session_busy', retryable: true } : null)
+ 
+   if (!errorSurface) {
+     return null
+@@ -229,7 +241,7 @@ function failedTurnError(
+ 
+   const error = typeof parsed?.error === 'string' && parsed.error.trim() ? parsed.error : errorSurface.code
+ 
+-  return { error, errorSurface }
++  return { error, errorSurface, ...(refused ? { refusedSend: true } : {}) }
+ }
+ 
+ function timelineTaskCount(metadata: SessionMessage['display_metadata']): number | undefined {
+diff --git a/apps/desktop/src/lib/chat-messages/types.ts b/apps/desktop/src/lib/chat-messages/types.ts
+index 986581b2b48..f50ab775555 100644
+--- a/apps/desktop/src/lib/chat-messages/types.ts
++++ b/apps/desktop/src/lib/chat-messages/types.ts
+@@ -53,6 +53,10 @@ export type ChatMessage = {
+    *  Drives the error card's layer label + actions; absent on older
+    *  backends, where the card falls back to generic copy. */
+   errorSurface?: ErrorSurface
++  /** The failed turn was refused because another writer held the chat (`failure_reason:
++   *  session_busy`): the user's message was never processed, so the composer offers it back
++   *  (store/refused-sends.ts). */
++  refusedSend?: boolean
+   branchGroupId?: string
+   hidden?: boolean
+   /** Sealed mid-turn commentary (`message.interim`) — rendered without the
+diff --git a/apps/desktop/src/lib/session-busy-refusal.ts b/apps/desktop/src/lib/session-busy-refusal.ts
+new file mode 100644
+index 00000000000..4000519b215
+--- /dev/null
++++ b/apps/desktop/src/lib/session-busy-refusal.ts
+@@ -0,0 +1,23 @@
++// A turn the owner admitted but could not start because another writer held the chat's turn lease
++// (agent/turn_facade_lease.py stamps `failure_reason: session_busy`; its lease-timeout result names
++// `error: session_turn_lease_timeout:<id>`). The user's message never reached the model.
++
++/** The backend's marker for a turn refused because another writer holds the session. */
++export const SESSION_BUSY_FAILURE = 'session_busy'
++
++const LEASE_TIMEOUT_ERROR_PREFIX = 'session_turn_lease_timeout:'
++
++export interface RefusalSignals {
++  error?: unknown
++  failureReason?: unknown
++  surfaceCode?: unknown
++}
++
++/** Whether a failed turn is a busy-chat refusal that never processed the user's message. */
++export function isSessionBusyRefusal({ error, failureReason, surfaceCode }: RefusalSignals): boolean {
++  return (
++    failureReason === SESSION_BUSY_FAILURE ||
++    surfaceCode === SESSION_BUSY_FAILURE ||
++    (typeof error === 'string' && error.trim().startsWith(LEASE_TIMEOUT_ERROR_PREFIX))
++  )
++}
+diff --git a/apps/desktop/src/store/refused-sends.ts b/apps/desktop/src/store/refused-sends.ts
+new file mode 100644
+index 00000000000..3366b547259
+--- /dev/null
++++ b/apps/desktop/src/store/refused-sends.ts
+@@ -0,0 +1,197 @@
++import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
++
++import { draftKey, stashSessionDraft, takeSessionDraft } from './composer'
++
++// A send the owner admitted whose turn then could not start because another writer held the
++// chat's turn lease: a serve backend refuses a held lease at once ("This chat has another active
++// writer ... Your message was not processed"), a gateway-hosted turn gives up after its lease wait
++// ("kept this session busy too long ... send it again"), and a chat taken over by another window
++// refuses the queued turn. The backend stamps each `failure_reason: session_busy`
++// (agent/turn_facade_lease.py); the text never reached the model. Enter had already cleared the
++// composer, so the words would only live in the transcript bubble: the composer gets them back.
++//
++// Offered, never re-sent: the user decides. The draft carries no retry identity (the refused
++// submission id is admitted and settled, so reusing it would be deduplicated and run nothing), and
++// a re-run of that turn from its card (Take over here / Retry) withdraws a still-untouched offer,
++// so the send never runs twice.
++
++/** Mark the turn's error bubble (the newest message carrying an error) as a refused send. */
++export function markRefusedSendTail(messages: ChatMessage[]): ChatMessage[] {
++  for (let index = messages.length - 1; index >= 0; index -= 1) {
++    const message = messages[index]
++
++    if (message.role === 'user') {
++      return messages
++    }
++
++    if (message.error) {
++      return message.refusedSend
++        ? messages
++        : messages.map((item, i) => (i === index ? { ...item, refusedSend: true } : item))
++    }
++  }
++
++  return messages
++}
++
++export interface RefusedSend {
++  text: string
++}
++
++export interface TailUserTurn {
++  /** The newest turn's outcome is a busy-chat refusal. */
++  refused: boolean
++  text: string
++}
++
++/** The transcript's newest user turn and whether a busy-chat refusal answered it. */
++export function tailUserTurn(messages: readonly ChatMessage[]): null | TailUserTurn {
++  let refused = false
++
++  for (let index = messages.length - 1; index >= 0; index -= 1) {
++    const message = messages[index]
++
++    if (message.role !== 'user') {
++      refused ||= message.refusedSend === true
++
++      continue
++    }
++
++    return { refused, text: chatMessageText(message).trim() }
++  }
++
++  return null
++}
++
++/** The refused send at the transcript's tail: its error is the latest turn's outcome, nothing was
++ *  sent after it. Null once a later user turn exists (the user moved on, or already re-sent it). */
++export function refusedSendAtTail(messages: readonly ChatMessage[]): null | RefusedSend {
++  const tail = tailUserTurn(messages)
++
++  return tail?.refused && tail.text ? { text: tail.text } : null
++}
++
++/** The composer's text with a refused send given back: kept as is when it already holds those words. */
++export function mergeRefusedText(current: string, text: string): string {
++  const words = text.trim()
++
++  if (!current.trim()) {
++    return words
++  }
++
++  return current.includes(words) ? current : `${current.trimEnd()}\n\n${words}`
++}
++
++// Offers survive a reload: a transcript re-read (live bubble, then hydrated row) must not paint
++// the same refusal into a composer the user deliberately emptied. One claim per scope, keyed by
++// the refused words; a newer user turn at the tail releases it, so the same words refused again
++// later are offered again.
++const OFFERED_STORAGE_KEY = 'hermes:refused-send-offered:v1'
++const MAX_OFFERED = 200
++
++function readOffered(): string[] {
++  try {
++    const parsed: unknown = JSON.parse(window.localStorage.getItem(OFFERED_STORAGE_KEY) || '[]')
++
++    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
++  } catch {
++    return []
++  }
++}
++
++function writeOffered(offered: string[]): void {
++  try {
++    window.localStorage.setItem(OFFERED_STORAGE_KEY, JSON.stringify(offered.slice(-MAX_OFFERED)))
++  } catch {
++    // Best-effort like the draft itself: quota/private mode never blocks the offer.
++  }
++}
++
++const scopePrefix = (scope: string | null | undefined) => `${JSON.stringify(draftKey(scope))}\u0000`
++const offeredId = (scope: string | null | undefined, text: string) => `${scopePrefix(scope)}${text.trim()}`
++
++/** Claim the one offer of `send` in `scope`: false when it was already given back. */
++export function claimRefusedSendOffer(scope: string | null | undefined, send: RefusedSend): boolean {
++  const id = offeredId(scope, send.text)
++  const offered = readOffered()
++
++  if (offered.includes(id)) {
++    return false
++  }
++
++  writeOffered([...offered.filter(item => !item.startsWith(scopePrefix(scope))), id])
++  lastOffers.set(draftKey(scope), send.text)
++
++  return true
++}
++
++/** A newer user turn than the refusal sits at the tail of `scope`: its claim is history. */
++export function releaseRefusedSendOffers(scope: string | null | undefined): void {
++  const prefix = scopePrefix(scope)
++  const offered = readOffered()
++
++  if (offered.some(item => item.startsWith(prefix))) {
++    writeOffered(offered.filter(item => !item.startsWith(prefix)))
++  }
++}
++
++// The words last given back per draft scope, so a re-run of that turn can take them back.
++const lastOffers = new Map<string, string>()
++
++const WITHDRAW_EVENT = 'hermes:refused-send-withdraw'
++
++interface WithdrawDetail {
++  /** Set by a composer showing `scope`: it judged the live editor itself. */
++  handled: boolean
++  scope: string
++  text: string
++}
++
++/**
++ * The refused turn is being re-run from its card (reload, Take over here): a composer of `scope`
++ * still holding exactly the offered words drops them, or Enter would run the message a second time.
++ * Edited words are the user's new message and stay. With no composer showing `scope`, the saved
++ * draft is checked the same way.
++ */
++export function withdrawRefusedSend(scope: string | null | undefined, text: string): void {
++  const key = draftKey(scope)
++  const offered = lastOffers.get(key)
++
++  if (offered === undefined || offered.trim() !== text.trim() || typeof window === 'undefined') {
++    return
++  }
++
++  lastOffers.delete(key)
++  const detail: WithdrawDetail = { handled: false, scope: key, text: offered }
++  window.dispatchEvent(new CustomEvent<WithdrawDetail>(WITHDRAW_EVENT, { detail }))
++
++  if (!detail.handled) {
++    const saved = takeSessionDraft(key)
++
++    if (saved.text.trim() === offered.trim()) {
++      stashSessionDraft(key, '', saved.attachments)
++    }
++  }
++}
++
++export function onRefusedSendWithdraw(handler: (detail: WithdrawDetail) => void): () => void {
++  if (typeof window === 'undefined') {
++    return () => undefined
++  }
++
++  const listener = (event: Event) => handler((event as CustomEvent<WithdrawDetail>).detail)
++  window.addEventListener(WITHDRAW_EVENT, listener)
++
++  return () => window.removeEventListener(WITHDRAW_EVENT, listener)
++}
++
++/** Test seam. */
++export function resetRefusedSendsForTests(): void {
++  lastOffers.clear()
++
++  try {
++    window.localStorage.removeItem(OFFERED_STORAGE_KEY)
++  } catch {
++    // ignore
++  }
++}
+diff --git a/tests/tui_gateway/test_durable_takeover_recovery.py b/tests/tui_gateway/test_durable_takeover_recovery.py
+index 7bc1412c6d7..55c162b9608 100644
+--- a/tests/tui_gateway/test_durable_takeover_recovery.py
++++ b/tests/tui_gateway/test_durable_takeover_recovery.py
+@@ -58,6 +58,8 @@ def test_takeover_retry_preserves_the_accepted_followup_once(monkeypatch, tmp_pa
+             server._absorb_turn_result("ui", session, st, "follow up", None, None)
+             payload, _, status = server._complete_turn_payload(session, st, None, 80)
+             assert status == "error"
++            # Desktop gives the refused words back to the composer on this marker.
++            assert payload["failure_reason"] == "session_busy"
+             assert agent._pending_cli_user_message is None
+         else:
+             monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: ActiveSessionRefusal(
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index ca14602087f..b56ed16e953 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1105,6 +1105,24 @@ def _persisted_turn_receipt(st: _TurnRun, raw: Any, status: str) -> dict | None:
+             committed_row_id(before) is not None and committed_row_id(before) == committed_row_id(after)))
+ 
+ 
++def _structured_outcome_fields(result: dict) -> dict:
++    """Machine-readable outcome fields message.complete carries next to the text."""
++    fields: dict = {}
++    # transform_llm_output may rewrite the final after streaming: the renderer must treat
++    # this payload as the authoritative replacement even without a prefix relationship.
++    if result.get("response_transformed"):
++        fields["response_transformed"] = True
++    # Structured billing-wall descriptor: the client renders recovery without re-parsing text.
++    if _billing_block := result.get("billing_block"):
++        fields["billing"] = _billing_block
++        fields["failure_reason"] = result.get("failure_reason")
++    if result.get("failure_reason") == "session_busy":
++        # Another writer held the chat and the message never ran: Desktop gives the words back
++        # to the composer (apps/desktop/src/store/refused-sends.ts).
++        fields["failure_reason"] = "session_busy"
++    return fields
++
++
+ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None, cols: int):
+     """``(payload, raw, status)`` for message.complete; retains/clears the inflight turn and
+     settles the hosted-room terminal receipt."""
+@@ -1144,14 +1162,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
+     # Only the agent's reuse site sets this; never inferred from equal text (a model may say the same words twice).
+     if raw and result.get("response_reused"):
+         payload["response_reused"] = True
+-    # transform_llm_output may rewrite the final after streaming: the renderer must treat
+-    # this payload as the authoritative replacement even without a prefix relationship.
+-    if result.get("response_transformed"):
+-        payload["response_transformed"] = True
+-    # Structured billing-wall descriptor: the client renders recovery without re-parsing text.
+-    if _billing_block := result.get("billing_block"):
+-        payload["billing"] = _billing_block
+-        payload["failure_reason"] = result.get("failure_reason")
++    payload.update(_structured_outcome_fields(result))
+     if rendered := render_message(raw, cols):
+         payload["rendered"] = rendered
+     error_value = result.get("error")
+-- 
+2.55.0
+

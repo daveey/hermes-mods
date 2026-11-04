@@ -1,0 +1,149 @@
+From aef5b17d58ac24109c9144f82c3e24a658859179 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 14:39:10 +0000
+Subject: [PATCH] fix(kanban): kanban_move --reclaim of a worker-first card is
+ a repin request too; tolerate a local record failure after a Board repin;
+ prune expired not_claimable backoffs [daveey]
+
+Review LOW-2/3/6 on #797. RED on the previous head: test_a_reclaimed_move_of_a_policy_card_is_a_request_too,
+test_a_local_record_failure_after_a_board_repin_does_not_abort_the_batch.
+---
+ hermes_cli/kanban_move.py                     | 16 ++++++---
+ hermes_cli/kanban_worker_placement.py         | 13 ++++++-
+ .../test_kanban_worker_move_request.py        | 36 +++++++++++++++++++
+ 3 files changed, 59 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index aaf33dc0764..783bc790ee0 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -231,21 +231,27 @@ def move_reclaim(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason
+         plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg)
+     except MoveRefused as exc:
+         return {"ok": False, "reason_code": exc.code, "error": str(exc)}
+-    row = conn.execute("SELECT t.status, t.claim_lock, r.uid AS run_uid FROM tasks t LEFT JOIN task_runs r "
++    row = conn.execute("SELECT t.status, t.claim_lock, t.placement_policy, r.uid AS run_uid FROM tasks t "
++                       "LEFT JOIN task_runs r "
+                        "ON r.id = t.current_run_id WHERE t.id = ?", (task_id,)).fetchone()
+     if row["status"] != "running" or row["claim_lock"] is None:
+         return {"ok": False, "reason_code": "not_running_here",
+                 "error": f"task {task_id} is not running under a claim on this gateway"}
++    requested = bool(row["placement_policy"])  # Board-owned runs_on: the origin repins it (see move_task)
+     with kb.write_txn(conn):
+-        wn.set_runs_on(conn, task_id, plan["runs_on"])
++        if not requested:
++            wn.set_runs_on(conn, task_id, plan["runs_on"])
+         kb._append_event(conn, task_id, MOVED_EVENT, {
+             "from_machine": plan["me"], "runs_on": plan["runs_on"], "previous_runs_on": plan["previous"],
+             "reason": reason[:500], "move_no": plan["move_no"], "forced": plan["forced"],
+-            "matches": plan["matches"], "reclaimed": True})
++            "matches": plan["matches"], "reclaimed": True, **({"repin_requested": True} if requested else {})})
+     if not kb.reclaim_task(conn, task_id, reason=f"moved to {plan['runs_on']}: {reason}"[:400]):
+         return {"ok": False, "reason_code": "reclaim_failed",
+                 "error": f"labels set to {plan['runs_on']} but the run could not be reclaimed; it ends on its own"}
+     sync.release_lease(conn, task_id, row["run_uid"])
+     status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+-    return {"ok": True, "runs_on": plan["runs_on"], "matches": plan["matches"], "move_no": plan["move_no"],
+-            "status": status}
++    out = {"ok": True, "runs_on": plan["runs_on"], "matches": plan["matches"], "move_no": plan["move_no"],
++           "status": status}
++    if requested:
++        out["repin"] = "requested"
++    return out
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 2cb5a14f229..9452509a174 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -2,9 +2,13 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import math
++import sqlite3
+ import time
+ 
++logger = logging.getLogger(__name__)
++
+ POLICY = "worker-first-v1"
+ WAITING = "waiting_for_worker_capacity"
+ MAX_RESERVES_PER_TICK = 4
+@@ -131,13 +135,20 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+             if held and held[0] == row["sync_version"] and now < held[1]:
+                 continue  # refused not_claimable at this revision: wait for the feed, don't re-ask every tick
+             _refused.pop(key, None)
++            if len(_refused) > 1024:  # cards that left the query never come back to clear their entry
++                for stale in [k for k, (_, until) in _refused.items() if until <= now]:
++                    del _refused[stale]
+             labels = requested_move(conn, row["id"])
+             try:
+                 if labels is not None:
+                     # A run moved this card (kanban_move). Its runs_on is Board-owned, so only the origin's
+                     # creator repin can apply that move; reserving would hand it straight back to the pool.
+                     reply = hub.repin(board, task_id=row["id"], expected_revision=row["sync_version"], runs_on=labels)
+-                    _record_repin(conn, row["id"], gateway, labels, reply)
++                    try:
++                        _record_repin(conn, row["id"], gateway, labels, reply)
++                    except sqlite3.Error:
++                        logger.warning("repinned %s on the Board but could not record it locally", row["id"],
++                                       exc_info=True)
+                 else:
+                     reply = hub.reserve(board, task_id=row["id"], expected_revision=row["sync_version"],
+                                         candidates=candidates)
+diff --git a/tests/hermes_cli/test_kanban_worker_move_request.py b/tests/hermes_cli/test_kanban_worker_move_request.py
+index 1f40a55240c..a60c904ac8f 100644
+--- a/tests/hermes_cli/test_kanban_worker_move_request.py
++++ b/tests/hermes_cli/test_kanban_worker_move_request.py
+@@ -105,6 +105,28 @@ def test_a_worker_move_back_to_the_origin_is_repinned_there_and_the_origin_runs_
+     assert svc.board(BOARD)["leases"][tid]["holder"] == HUB
+ 
+ 
++def test_a_reclaimed_move_of_a_policy_card_is_a_request_too(gws, svc, monkeypatch):
++    origin, worker = gws
++    monkeypatch.setattr(wp, "local_admission", lambda conn_: True)
++    monkeypatch.setitem(node_fixtures.MACHINES[HUB], "pickup", "explicit")
++    tid, _ = _worker_runs_policy_card(origin, worker, svc)
++    # The fixture's spawner records this test process as the worker pid; reclaim must not SIGTERM it.
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda pid, lock, **kw: {
++        "prev_pid": pid, "host_local": True, "termination_attempted": True, "terminated": True, "sigkill": False})
++    worker.enter()
++    before = worker.conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++    res = km.move_reclaim(worker.conn, tid, runs_on=[f"machine:{HUB}"], reason="needs the hub", force=True)
++    assert res["ok"] and res.get("repin") == "requested", res
++    assert worker.conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] == before
++    assert _moved(worker.conn, tid)[-1].get("repin_requested") is True
++    worker.round()
++    origin.round()
++    hub = PlacementHub(svc, HUB)
++    origin.enter()
++    wp.reevaluate(origin.conn, hub, BOARD, HUB, cfg=POOLS)
++    assert hub.reserves == [] and [r["runs_on"] for r in hub.repins] == [[f"machine:{HUB}"]]
++
++
+ class RecordingHub:
+     def __init__(self, *, refuse=None):
+         self.reserves, self.repins, self.refuse = [], [], refuse
+@@ -161,6 +183,20 @@ def test_an_applied_repin_is_not_replayed(conn, no_pull):
+     assert hub.repins == [] and len(hub.reserves) == 1
+ 
+ 
++def test_a_local_record_failure_after_a_board_repin_does_not_abort_the_batch(conn, no_pull, monkeypatch):
++    first, second = _acknowledged(conn), _acknowledged(conn)
++    for tid in (first, second):
++        kb._append_event(conn, tid, km.MOVED_EVENT, {"from_machine": WORKER, "runs_on": ["machine:hub"]})
++    conn.commit()
++
++    def broken(*a, **kw):
++        raise __import__("sqlite3").OperationalError("database is locked")
++    monkeypatch.setattr(wp, "_record_repin", broken)
++    hub = RecordingHub()
++    wp.reevaluate(conn, hub, "default", "hub", cfg=POOLS)
++    assert sorted(r["task_id"] for r in hub.repins) == sorted([first, second])
++
++
+ def test_not_claimable_backs_off_until_the_revision_changes(conn, no_pull):
+     tid = _acknowledged(conn)
+     hub = RecordingHub(refuse="not_claimable")
+-- 
+2.55.0
+

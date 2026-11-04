@@ -1,0 +1,697 @@
+From 895d0d15497b8b07d3b7c8b08f21acb26e0e1c6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 13:56:52 +0000
+Subject: [PATCH] [daveey] desktop: tiles paint from the transcript cache while
+ REST is in flight
+
+An @session ref click opens a tile, and resumeTile always waited on the
+latest-page REST read, so the warmed cache never reached the screen. When
+REST has not landed by the time session.resume binds, the tile now publishes
+the cached rows (same owner scope as the REST read) and reconciles to the
+REST page when it lands, refreshing the cache. Tile opens write an
+[open-timing] line tagged surface:tile, so paint:cache is observable.
+
+Review fixes on the prefetch: unlisted sessions refetch on demand at most
+every 10 min (they don't move), demand concurrency 1 on top of the tick's 2,
+a throwing store read resolves 'failed' instead of escaping the IPC
+listener, stale hub meta is dropped when the listing is unreadable, and the
+'' -> primary host test now asserts the normalized key.
+---
+ .../electron/transcript-cache-host.test.ts    |   6 +-
+ .../electron/transcript-prefetch.test.ts      |  19 ++-
+ apps/desktop/electron/transcript-prefetch.ts  |  25 ++-
+ .../app/chat/session-ref-prefetch.test.tsx    |  24 ++-
+ .../src/app/contrib/hooks/tile-cache-paint.ts | 135 ++++++++++++++++
+ ...-session-tile-delegate.cache-paint.test.ts | 147 ++++++++++++++++++
+ .../hooks/use-session-tile-delegate.ts        |  66 +++++++-
+ apps/desktop/src/lib/open-timing.ts           |  45 ++++++
+ 8 files changed, 454 insertions(+), 13 deletions(-)
+ create mode 100644 apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
+ create mode 100644 apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
+
+diff --git a/apps/desktop/electron/transcript-cache-host.test.ts b/apps/desktop/electron/transcript-cache-host.test.ts
+index 92e270ec74f..8beb3e18a91 100644
+--- a/apps/desktop/electron/transcript-cache-host.test.ts
++++ b/apps/desktop/electron/transcript-cache-host.test.ts
+@@ -105,10 +105,10 @@ describe('transcript cache host', () => {
+     // A session the tick already cached at the hub's meta is current too; '' means the primary.
+     await host.prefetcher.tick()
+     const before = messageReads()
++    const prefetchKey = vi.spyOn(host.prefetcher, 'prefetchKey')
+     on.get('hermes:transcript-cache:prefetch')!({}, { connectionId: '', profile: '', sessionId: 'l1' })
+-    await expect(
+-      host.prefetcher.prefetchKey({ connectionId: 'local', profile: 'default', sessionId: 'l1' })
+-    ).resolves.toBe('current')
++    expect(prefetchKey).toHaveBeenCalledWith({ connectionId: 'local', profile: 'default', sessionId: 'l1' })
++    await expect(prefetchKey.mock.results[0].value).resolves.toBe('current')
+     expect(messageReads()).toBe(before)
+     host.stop()
+   })
+diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
+index 20df1d02a02..7d991ada7ca 100644
+--- a/apps/desktop/electron/transcript-prefetch.test.ts
++++ b/apps/desktop/electron/transcript-prefetch.test.ts
+@@ -7,7 +7,8 @@ import {
+   type HubSessionRecord,
+   MIN_REFETCH_MS,
+   selectPrefetchTargets,
+-  TranscriptPrefetcher
++  TranscriptPrefetcher,
++  UNLISTED_REFETCH_MS
+ } from './transcript-prefetch'
+ 
+ const CONNECTIONS: Record<string, string> = { hub: 'hermes-hub', macbook: 'local', mini: 'mac-mini' }
+@@ -255,18 +256,30 @@ describe('[daveey] on-demand prefetch of an @session-referenced session', () =>
+ 
+   const old = { connectionId: 'hermes-hub', profile: 'default', sessionId: '20261018_114650_7ed013' }
+ 
+-  it('fetches a session outside the PER_GATEWAY window into the cache, once per MIN_REFETCH_MS', async () => {
++  it('fetches a session outside the hub listing into the cache, then only once the copy is UNLISTED_REFETCH_MS old', async () => {
+     const h = harness()
+ 
+     await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('fetched')
+     expect(h.store.read(old)?.messages).toHaveLength(1)
+     await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('current')
+-    expect(h.fetchLatest).toHaveBeenCalledTimes(1)
+ 
++    // Old sessions don't move: a hover after MIN_REFETCH_MS is still served by the cache.
+     h.advance(MIN_REFETCH_MS)
++    await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('current')
++    expect(h.fetchLatest).toHaveBeenCalledTimes(1)
++
++    h.advance(UNLISTED_REFETCH_MS)
+     await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('fetched')
+   })
+ 
++  it('a store that throws (closed at quit) resolves failed instead of throwing out of the IPC listener', async () => {
++    const h = harness()
++    h.store.close()
++
++    await expect(h.prefetcher.prefetchKey(old)).resolves.toBe('failed')
++    expect(h.fetchLatest).not.toHaveBeenCalled()
++  })
++
+   it('dedupes a key already queued or in flight', async () => {
+     const h = harness()
+     const first = h.prefetcher.prefetchKey(old)
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index 78b54e4eec8..a33cce1b1d3 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -16,9 +16,12 @@ export const PER_GATEWAY = 200
+ export const MIN_REFETCH_MS = 30_000
+ /** A gateway that failed is skipped for this long before it is tried again. */
+ export const GATEWAY_BACKOFF_MS = 60_000
+-/** [daveey] On-demand (`@session` ref) fetches in flight per gateway, and the most queued behind them. */
+-export const DEMAND_CONCURRENCY = 2
++/** [daveey] On-demand (`@session` ref) fetches in flight per gateway (on top of the tick's two), and the most
++ *  queued behind them. */
++export const DEMAND_CONCURRENCY = 1
+ export const DEMAND_QUEUE_MAX = 50
++/** [daveey] A cached session the hub listing does not cover is refetched on demand at most this often. */
++export const UNLISTED_REFETCH_MS = 10 * 60_000
+ const DEMAND_MISSED_MAX = 500
+ 
+ export interface HubSessionRecord {
+@@ -203,6 +206,17 @@ export class TranscriptPrefetcher {
+    * DEMAND_CONCURRENCY fetches per gateway at a time and DEMAND_QUEUE_MAX queued behind them.
+    */
+   prefetchKey(raw: TranscriptCacheKey): Promise<PrefetchKeyOutcome> {
++    try {
++      return this.enqueueDemand(raw)
++    } catch (error) {
++      // A store read can throw (closed at quit, SQLITE_BUSY): never out of an IPC listener.
++      this.deps.log?.(`transcript prefetch (ref) skipped: ${(error as Error)?.message || error}`)
++
++      return Promise.resolve('failed')
++    }
++  }
++
++  private enqueueDemand(raw: TranscriptCacheKey): Promise<PrefetchKeyOutcome> {
+     const key: TranscriptCacheKey = {
+       connectionId: String(raw?.connectionId ?? '').trim(),
+       profile: profileOf(raw?.profile),
+@@ -255,8 +269,9 @@ export class TranscriptPrefetcher {
+       return needsRefresh(cached, { automated: false, key, meta: listed }, now)
+     }
+ 
+-    // Not in the hub listing: nothing says it moved, so only a copy older than MIN_REFETCH_MS is refreshed.
+-    return now - cached.savedAt >= MIN_REFETCH_MS
++    // Not in the hub listing (past its limit, or hub-sync unreadable): nothing says it moved. Refs mostly name
++    // such old sessions, and the open's own REST read refreshes the cache, so only a long-stale copy is refetched.
++    return now - cached.savedAt >= UNLISTED_REFETCH_MS
+   }
+ 
+   private pumpDemand(connectionId: string): void {
+@@ -368,6 +383,8 @@ export class TranscriptPrefetcher {
+     const records = await this.deps.listHubSessions()
+ 
+     if (!records) {
++      this.listed.clear() // stale hub meta must not keep a moved session reading as current
++
+       return result
+     }
+ 
+diff --git a/apps/desktop/src/app/chat/session-ref-prefetch.test.tsx b/apps/desktop/src/app/chat/session-ref-prefetch.test.tsx
+index f89a31f7a12..15f5a2d0cb2 100644
+--- a/apps/desktop/src/app/chat/session-ref-prefetch.test.tsx
++++ b/apps/desktop/src/app/chat/session-ref-prefetch.test.tsx
+@@ -8,7 +8,15 @@ import { $sessions, _resetSessionOwnerHintsForTests } from '@/store/session'
+ import { $sessionTiles } from '@/store/session-states'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+-import { prefetchSessionRef, REF_PREFETCH_MIN_MS, resetSessionRefPrefetch } from './session-ref-prefetch'
++import { transcriptRestScope } from '../session/hooks/use-session-actions/provisional-transcript'
++
++import { resolveSessionRefOwner } from './session-ref-owner'
++import {
++  prefetchSessionRef,
++  REF_PREFETCH_MIN_MS,
++  resetSessionRefPrefetch,
++  sessionRefPrefetchKey
++} from './session-ref-prefetch'
+ 
+ const row = (over: Partial<SessionInfo>): SessionInfo => over as SessionInfo
+ 
+@@ -122,4 +130,18 @@ describe('@session ref chips warm the transcript cache', () => {
+ 
+     expect(prefetch).not.toHaveBeenCalled()
+   })
++
++  it('the warmed key is exactly the scope the open reads its cache paint from', () => {
++    $sessions.set([row({ connection_id: 'hermes-hub', id: 's1', profile: 'work' })])
++
++    for (const value of ['work/s1', 'work@mac-mini/s1']) {
++      const owner = resolveSessionRefOwner(value)
++      const key = sessionRefPrefetchKey(value)
++
++      expect(owner).toBeDefined()
++      expect({ connectionId: key!.connectionId, profile: key!.profile }).toEqual(
++        transcriptRestScope(owner, undefined, '')
++      )
++    }
++  })
+ })
+diff --git a/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts b/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
+new file mode 100644
+index 00000000000..188c97697fa
+--- /dev/null
++++ b/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
+@@ -0,0 +1,135 @@
++/**
++ * [daveey] Paint a tile from the local transcript cache instead of waiting on REST.
++ *
++ * A tile (every `@session` ref click, ⌘-click, "open beside") used to show a
++ * spinner until both `session.resume` AND the latest-page REST read returned;
++ * hub REST is 1-3 s under load while the resume RPC rides an open socket. When
++ * the cache holds the session (prefetched because a ref chip rendered, or
++ * because it is recent), the tile now publishes the cached rows as soon as
++ * the resume binds a runtime, and the REST page reconciles them when it lands
++ * (same merge the warm-refresh path uses). With no cache entry, or a REST page
++ * that already arrived, nothing changes.
++ */
++import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
++import { startTileOpenTiming } from '@/lib/open-timing'
++import { loadTranscriptTail, saveTranscriptTail, type TranscriptTailScope } from '@/store/transcript-tail-cache'
++import type { SessionMessage } from '@/types/hermes'
++
++export interface TrackedPromise<T> {
++  readonly promise: Promise<T>
++  readonly settled: boolean
++}
++
++/** Wrap a promise so callers can ask synchronously whether it has settled. */
++export function trackSettled<T>(promise: Promise<T>): TrackedPromise<T> {
++  let settled = false
++
++  const done = () => {
++    settled = true
++  }
++
++  promise.then(done, done)
++
++  return {
++    promise,
++    get settled() {
++      return settled
++    }
++  }
++}
++
++/** Cached transcript a tile may paint while its REST page is still in flight, or null. */
++export function tileCachedPaint(
++  storedSessionId: string,
++  scope: TranscriptTailScope | undefined,
++  rest: TrackedPromise<unknown>
++): ChatMessage[] | null {
++  if (rest.settled || !scope) {
++    return null
++  }
++
++  return loadTranscriptTail(storedSessionId, scope)
++}
++
++export type TileOpenTiming = ReturnType<typeof startTileOpenTiming>
++export type TilePaint = 'cache' | 'kept' | 'rest'
++
++/** Open timing for a tile resume; an authoritative (live-snapshot) resume is not an open and is not timed. */
++export function startTileTiming(storedSessionId: string, authoritative: boolean): TileOpenTiming | null {
++  return authoritative ? null : startTileOpenTiming(storedSessionId)
++}
++
++/** Stamp the resolved owner onto the timing line. */
++export function noteTileOwner(timing: TileOpenTiming | null, owner: unknown): void {
++  timing?.stage('owner')
++
++  if (timing && owner && typeof owner === 'object' && 'connectionId' in owner) {
++    timing.record.connection = String((owner as { connectionId?: unknown }).connectionId ?? '') || undefined
++  }
++}
++
++/** What the tile's first publish showed: kept rows already on screen, the cache, or the REST page. */
++export function tilePaintSource(
++  authoritative: boolean,
++  previous: readonly unknown[],
++  cachedPaint: ChatMessage[] | null
++): TilePaint {
++  if (authoritative || previous.length > 0) {
++    return 'kept'
++  }
++
++  return cachedPaint ? 'cache' : 'rest'
++}
++
++/** Rows for a tile with nothing on screen yet: the cache paint, else the REST page, else the resume's own rows. */
++export function tileFirstMessages(
++  cachedPaint: ChatMessage[] | null,
++  prefetch: { messages?: SessionMessage[] } | null,
++  resumed: { messages?: SessionMessage[] } | undefined
++): ChatMessage[] {
++  return cachedPaint ?? toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
++}
++
++interface SettleTileOpen {
++  cachedPaint: ChatMessage[] | null
++  painted: TilePaint
++  prefetch: { messages?: SessionMessage[] } | null
++  prefetchPromise: Promise<{ messages?: SessionMessage[] } | null>
++  scope: TranscriptTailScope | undefined
++  storedSessionId: string
++  timing: TileOpenTiming | null
++  /** Publish the REST page over the cached paint; false when the tile was rebound meanwhile. */
++  publish: (fresh: ChatMessage[], cachedPaint: ChatMessage[]) => { changed: boolean; ours: boolean }
++}
++
++/**
++ * Finish a tile open. A cache paint is reconciled when the REST page lands
++ * (and the page refreshes the cache); otherwise the open is already final.
++ */
++export function settleTileOpen(args: SettleTileOpen): void {
++  const { cachedPaint, painted, prefetch, timing } = args
++
++  if (painted !== 'cache' || !cachedPaint) {
++    if (painted === 'rest') {
++      timing?.paint('rest', prefetch?.messages?.length ?? 0)
++    }
++
++    timing?.reconciled(painted === 'kept' ? 'warm' : prefetch ? 'rest' : 'failed')
++
++    return
++  }
++
++  timing?.paint('cache', cachedPaint.length)
++
++  void args.prefetchPromise.then(page => {
++    if (!page?.messages?.length) {
++      timing?.reconciled('failed')
++
++      return
++    }
++
++    saveTranscriptTail(args.storedSessionId, page.messages, args.scope)
++    const { changed, ours } = args.publish(toChatMessages(page.messages), cachedPaint)
++    timing?.reconciled(ours ? 'rest' : 'abandoned', ours ? changed : undefined)
++  })
++}
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
+new file mode 100644
+index 00000000000..d7c9aee6eae
+--- /dev/null
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
+@@ -0,0 +1,147 @@
++import { renderHook } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { ClientSessionState } from '@/app/types'
++import type * as HermesModule from '@/hermes'
++import { chatMessageText } from '@/lib/chat-messages'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { resetOpenTimings } from '@/lib/open-timing'
++import { setSessionOwnerHint, setSessions } from '@/store/session'
++import { $sessionTiles, sessionTileDelegate } from '@/store/session-states'
++import { clearTranscriptTails, readCachedTranscript, saveTranscriptTail } from '@/store/transcript-tail-cache'
++import type { SessionMessage } from '@/types/hermes'
++
++import { clearSingleFlightSessionResumeState } from '../../session/hooks/use-prompt-actions/single-flight-resume'
++
++import { useSessionTileDelegate } from './use-session-tile-delegate'
++
++vi.mock('@/hermes', async importActual => ({
++  ...(await importActual<typeof HermesModule>()),
++  getLatestSessionMessages: vi.fn(async () => ({ messages: [], session_id: '' })),
++  getSession: vi.fn()
++}))
++vi.mock('@/store/gateway', async importActual => ({
++  ...(await importActual<Record<string, unknown>>()),
++  requestGatewayForAgent: vi.fn(),
++  requestGatewayForProfile: vi.fn()
++}))
++
++const { getLatestSessionMessages } = await import('@/hermes')
++const { requestGatewayForAgent } = await import('@/store/gateway')
++
++const ROUTE = { connectionId: 'hermes-hub', mode: 'remote' as const, profile: 'default', targetProfile: 'default' }
++const SCOPE = { connectionId: 'hermes-hub', profile: 'default' }
++
++const rows = (...texts: string[]): SessionMessage[] =>
++  texts.map((text, index) => ({ content: text, id: index + 1, role: index % 2 ? 'assistant' : 'user' }) as never)
++
++function deferred<T>() {
++  let resolve!: (value: T) => void
++  const promise = new Promise<T>(done => (resolve = done))
++
++  return { promise, resolve }
++}
++
++function renderTile() {
++  const states = new Map<string, ClientSessionState>()
++
++  const updateSessionState = vi.fn(
++    (runtimeId: string, updater: (state: ClientSessionState) => ClientSessionState, storedSessionId?: string) => {
++      states.set(runtimeId, updater(states.get(runtimeId) ?? createClientSessionState(storedSessionId ?? null)))
++    }
++  )
++
++  renderHook(() =>
++    useSessionTileDelegate({
++      archiveSession: vi.fn(async () => undefined),
++      branchLoadedSession: vi.fn(async () => false) as never,
++      branchStoredSession: vi.fn(async () => undefined),
++      executeSlashCommand: vi.fn(async () => undefined) as never,
++      removeSession: vi.fn(async () => undefined),
++      requestGateway: vi.fn(async () => ({})) as never,
++      runtimeIdByStoredSessionIdRef: { current: new Map() } as never,
++      sessionStateByRuntimeIdRef: { current: new Map() } as never,
++      updateSessionState: updateSessionState as never
++    })
++  )
++
++  return { states }
++}
++
++const texts = (state?: ClientSessionState) => state?.messages.map(message => chatMessageText(message)) ?? []
++
++const tileLines = () =>
++  ((globalThis as { __hermesOpenTimings?: Record<string, unknown>[] }).__hermesOpenTimings ?? []).filter(
++    record => record.surface === 'tile'
++  )
++
++describe('[daveey] a tile (the @session ref click) paints from the transcript cache', () => {
++  beforeEach(() => {
++    clearSingleFlightSessionResumeState()
++    clearTranscriptTails()
++    resetOpenTimings()
++    setSessions([])
++    $sessionTiles.set([])
++    vi.mocked(getLatestSessionMessages).mockReset()
++    vi.mocked(requestGatewayForAgent).mockReset()
++  })
++
++  afterEach(() => {
++    clearSingleFlightSessionResumeState()
++    clearTranscriptTails()
++    setSessions([])
++    $sessionTiles.set([])
++  })
++
++  it('binds with the cached rows while REST is in flight, then reconciles to the REST page', async () => {
++    setSessionOwnerHint('old-ref', ROUTE)
++    saveTranscriptTail('old-ref', rows('cached question', 'cached answer'), SCOPE)
++    const rest = deferred<{ messages: SessionMessage[]; session_id: string }>()
++    vi.mocked(getLatestSessionMessages).mockReturnValue(rest.promise as never)
++    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'runtime-old' } as never)
++    const { states } = renderTile()
++
++    // Resolves without the REST page: the tile is not held on hub REST.
++    await expect(sessionTileDelegate()!.resumeTile('old-ref')).resolves.toBe('runtime-old')
++    expect(getLatestSessionMessages).toHaveBeenCalledWith('old-ref', SCOPE)
++    expect(texts(states.get('runtime-old'))).toEqual(['cached question', 'cached answer'])
++
++    rest.resolve({ messages: rows('cached question', 'cached answer', 'newer question'), session_id: 'old-ref' })
++    await vi.waitFor(() =>
++      expect(texts(states.get('runtime-old'))).toEqual(['cached question', 'cached answer', 'newer question'])
++    )
++
++    // The page refreshed the cache, and the open wrote one tile line painted from cache.
++    expect(readCachedTranscript('old-ref', SCOPE)?.messages).toHaveLength(3)
++    expect(tileLines()).toEqual([
++      expect.objectContaining({ changed: true, id: 'old-ref', outcome: 'rest', paint: 'cache', paintRows: 2 })
++    ])
++  })
++
++  it('without a cached copy it waits on REST exactly as before and logs paint "rest"', async () => {
++    setSessionOwnerHint('cold-ref', ROUTE)
++    vi.mocked(getLatestSessionMessages).mockResolvedValue({
++      messages: rows('from rest'),
++      session_id: 'cold-ref'
++    } as never)
++    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'runtime-cold' } as never)
++    const { states } = renderTile()
++
++    await expect(sessionTileDelegate()!.resumeTile('cold-ref')).resolves.toBe('runtime-cold')
++
++    expect(texts(states.get('runtime-cold'))).toEqual(['from rest'])
++    expect(tileLines()).toEqual([expect.objectContaining({ id: 'cold-ref', outcome: 'rest', paint: 'rest' })])
++  })
++
++  it('a cached copy under another owner key is not painted', async () => {
++    setSessionOwnerHint('other-ref', ROUTE)
++    saveTranscriptTail('other-ref', rows('wrong gateway'), { connectionId: 'mac-mini', profile: 'default' })
++    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: rows('right'), session_id: 'other-ref' } as never)
++    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'runtime-other' } as never)
++    const { states } = renderTile()
++
++    await sessionTileDelegate()!.resumeTile('other-ref')
++
++    expect(texts(states.get('runtime-other'))).toEqual(['right'])
++  })
++})
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+index 4c6d46916ea..615ac246274 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+@@ -64,6 +64,17 @@ import type { useSessionStateCache } from '../../session/hooks/use-session-state
+ import type { ClientSessionState } from '../../types'
+ import type { GatewayRequester } from '../types'
+ 
++import {
++  noteTileOwner,
++  settleTileOpen,
++  startTileTiming,
++  tileCachedPaint,
++  tileFirstMessages,
++  type TilePaint,
++  tilePaintSource,
++  trackSettled
++} from './tile-cache-paint'
++
+ type SessionStateCache = ReturnType<typeof useSessionStateCache>
+ 
+ /** Runtime a stored session is bound to: the primary reverse lookup, else a retained tile. */
+@@ -437,14 +448,18 @@ export function useSessionTileDelegate({
+         // reading messages) without a profile lets the gateway fall back to the
+         // launch-profile DB and fork the conversation into the wrong profile —
+         // the same cross-profile bleed the recovery resumes had (#67603).
++        const timing = startTileTiming(storedSessionId, authoritativeSnapshot)
+         let owner = await ownerForStoredSession(storedSessionId)
+ 
++        noteTileOwner(timing, owner)
+         const restScope = tileRestScope(owner)
+ 
+         let prefetchPromise = authoritativeSnapshot
+           ? Promise.resolve(null)
+           : getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
+ 
++        let rest = trackSettled(prefetchPromise)
++
+         if (!authoritativeSnapshot && existing && isWarmTileState(cached, storedSessionId)) {
+           const prefetch = await prefetchPromise
+ 
+@@ -524,6 +539,7 @@ export function useSessionTileDelegate({
+                     prefetchPromise = getLatestSessionMessages(storedSessionId, tileRestScope(foreignOwner)).catch(
+                       () => null
+                     )
++                    rest = trackSettled(prefetchPromise)
+                   }
+ 
+                   return resumed
+@@ -546,9 +562,14 @@ export function useSessionTileDelegate({
+           }
+         )
+ 
+-        const prefetch = await prefetchPromise
++        // [daveey] REST still in flight: paint the cached transcript now and reconcile when the page lands.
++        const cachedPaint =
++          outcome.mode === 'read-only' ? null : tileCachedPaint(storedSessionId, tileRestScope(owner), rest)
++
++        const prefetch = cachedPaint ? null : await prefetchPromise
+ 
+         if (outcome.mode === 'read-only') {
++          timing?.reconciled('asleep')
+           const readOnlyId = readOnlyRuntimeIdFor(storedSessionId)
+ 
+           updateSessionState(
+@@ -588,12 +609,15 @@ export function useSessionTileDelegate({
+         }
+ 
+         const info = resumed?.info
++        let painted: TilePaint = 'kept'
+ 
+         updateSessionState(
+           runtimeId,
+           state => {
+             const previousMessages = state.messages.length > 0 ? state.messages : resumeRequestBaselineMessages
+ 
++            painted = tilePaintSource(authoritativeSnapshot, previousMessages, cachedPaint)
++
+             const messages = authoritativeSnapshot
+               ? resumed.messages.length > 0
+                 ? overlayConcurrentMessageChanges(
+@@ -608,7 +632,7 @@ export function useSessionTileDelegate({
+                 : previousMessages
+               : previousMessages.length > 0
+                 ? previousMessages
+-                : toChatMessages(prefetch?.messages ?? resumed.messages ?? [])
++                : tileFirstMessages(cachedPaint, prefetch, resumed)
+ 
+             const busyChangedWhileResuming = cached
+               ? Boolean(
+@@ -638,6 +662,44 @@ export function useSessionTileDelegate({
+           storedSessionId
+         )
+ 
++        settleTileOpen({
++          cachedPaint,
++          painted,
++          prefetch,
++          prefetchPromise,
++          scope: tileRestScope(owner),
++          storedSessionId,
++          timing,
++          // Replace the cached paint while it is all that is on screen, else merge as the warm
++          // refresh does (deltas may have streamed in). The tile records its runtime only after
++          // this resolves, so unbound is still ours; a tile rebound meanwhile is left alone.
++          publish: (fresh, paint) => {
++            const bound = boundTileRuntimeId(runtimeIdByStoredSessionIdRef, storedSessionId)
++
++            if (bound && bound !== runtimeId) {
++              return { changed: false, ours: false }
++            }
++
++            let changed = false
++
++            updateSessionState(
++              runtimeId,
++              state => {
++                const next = chatMessageArraysEquivalent(state.messages, paint)
++                  ? fresh
++                  : mergeTileTranscript(state.messages, fresh, state.streamId)
++
++                changed = !chatMessageArraysEquivalent(state.messages, next)
++
++                return changed ? { ...state, messages: next } : state
++              },
++              storedSessionId
++            )
++
++            return { changed, ours: true }
++          }
++        })
++
+         return runtimeId
+       },
+       submitToSession: async (runtimeId, text) => {
+diff --git a/apps/desktop/src/lib/open-timing.ts b/apps/desktop/src/lib/open-timing.ts
+index 2300f1374c1..c8a7ab3d1dd 100644
+--- a/apps/desktop/src/lib/open-timing.ts
++++ b/apps/desktop/src/lib/open-timing.ts
+@@ -32,6 +32,8 @@ export interface OpenTimingRecord {
+   /** ms from click to each step of the open path (owner resolved, gateway ready, REST page back). */
+   stages?: Record<string, number>
+   startedBy: 'click' | 'resume'
++  /** [daveey] `tile`: a session tile/tab open (`@session` ref clicks), timed apart from main-pane opens. */
++  surface?: 'tile'
+ }
+ 
+ const CLICK_WINDOW_MS = 2_000
+@@ -118,7 +120,10 @@ export function markOpenReconciled(id: string, outcome: OpenOutcome, changed?: b
+   }
+ 
+   open.delete(id)
++  writeRecord(record)
++}
+ 
++function writeRecord(record: OpenTimingRecord): void {
+   const list = history()
+   list.push(record)
+   list.splice(0, Math.max(0, list.length - KEEP))
+@@ -133,6 +138,46 @@ export function markOpenReconciled(id: string, outcome: OpenOutcome, changed?: b
+   }
+ }
+ 
++/**
++ * [daveey] Timing for one tile open (`@session` ref click, tab restore). Kept out
++ * of the main-pane `open` map: a tile resuming beside the main chat must not
++ * mark the main open abandoned. Writes the same `[open-timing]` line, tagged
++ * `"surface":"tile"`, once reconciled; an open never reconciled writes nothing.
++ */
++export function startTileOpenTiming(id: string, connection?: string) {
++  const record: OpenTimingRecord = { clickAt: now(), connection, id, startedBy: 'resume', surface: 'tile' }
++
++  return {
++    record,
++    stage(name: string) {
++      if (!record.outcome && record.stages?.[name] === undefined) {
++        record.stages = { ...record.stages, [name]: Math.round(now() - record.clickAt) }
++      }
++    },
++    paint(source: OpenPaintSource, rows: number) {
++      if (!record.paint && !record.outcome) {
++        record.paint = source
++        record.paintMs = Math.round(now() - record.clickAt)
++        record.paintRows = rows
++      }
++    },
++    reconciled(outcome: OpenOutcome, changed?: boolean) {
++      if (record.outcome) {
++        return
++      }
++
++      record.outcome = outcome
++      record.reconciledMs = Math.round(now() - record.clickAt)
++
++      if (changed !== undefined) {
++        record.changed = changed
++      }
++
++      writeRecord(record)
++    }
++  }
++}
++
+ /** Test seam. */
+ export function resetOpenTimings(): void {
+   open.clear()
+-- 
+2.55.0
+

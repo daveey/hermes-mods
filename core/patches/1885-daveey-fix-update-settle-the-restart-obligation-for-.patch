@@ -1,0 +1,491 @@
+From dd3dcfe081b93439f2c11be06dfad38887f230bc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 14:34:57 +0000
+Subject: [PATCH] [daveey] fix(update): settle the restart obligation for an
+ unmapped stop on a live home and for external-checkout runtimes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: since 2026-11-03 13:00 UTC every `hermes` CLI call on hermes-hub printed
+"A previous `hermes update` pulled new code but did not restart running gateways", although the
+only checkout-backed gateway (default, pid 2542475) was current on ceff8ab7358f. The host
+obligation (gateway-locks/host-update-restart-*.json, expected_sha ceff8ab7358f) owed:
+default, askeve-builder, askeve-reviewer (both code 14a1244773e6, askeve-runtime's own pinned
+core) and an unmapped row {profile: None, pid: 2549548, stopped_unmapped: true}.
+
+Why 1: `_marker_only_restart_obsolete()` returned False, so `_update_owes_fleet_restart()` kept
+  warning. Replaying that inventory against the 13:00 fleet (default current, both askeve rows
+  `external`): the askeve rows ARE covered (`_fleet_covered_gateways` counts external rows and the
+  current-check skips them); the unmapped row is what fails: `("gateway","")` needs a live local
+  gateway that no owed profile explains, and default is explained by its own row.
+Why 2: pid 2549548 was recorded as unmapped because `_restart_manual_gateways` SIGTERMed a
+  `gateway run` process on a home in this update's scope that held no profile's gateway.pid and
+  was no unit MainPID ("Stopped 1 manual gateway process(es)", update.log; receipt killed_pids
+  [2549548]). It started after 12:58:43 UTC and never logged `gateway.start` in any home's
+  gateway-exit-diag.log, so it was a pre-lock / lock-losing `gateway run`, not a serving gateway.
+Why 3: the row carries no identity: the stop recorded only the pid, not the home it ran on, so no
+  successor can ever be matched to it; on a host whose every home already has its one
+  lock-holding gateway (gateway.lock is per home) the debt is undischargeable.
+Why 4 (askeve rows): `_record_owed_gateway_inventory` records every planned gateway, including
+  profiles whose runtime serves ANOTHER checkout; they settle only while their external row is
+  live, so an Ask Eve gateway restarting or down for its own reasons holds this checkout's
+  warning hostage.
+Root (happened): the owed inventory records identities it can never prove (an unmapped stop with
+  no home) and debts this checkout cannot pay (external-checkout runtimes).
+Root (not caught): the unmapped-row tests (test_update_fleet_check_fail_closed.py) only model a
+  stop whose successor is a NEW profile gateway; none models the common case of a stray
+  `gateway run` on a home whose gateway is already current, and no test put an external-checkout
+  runtime in the owed inventory.
+Recurrence: first time for this chain; related unmapped-debt rules came from codemap §6 V7/V12.
+
+Fix:
+- the restart sweep and the stale-survivor sweep read each unmapped gateway's home BEFORE the
+  signal (`gateway_pid_home`: live environ, else the spawn ledger) into
+  `_GatewayRestartOutcome.stopped_unmapped_homes`; the owed row keeps it as `home`;
+- `_marker_owed_gateways` owes such a row to the profile whose home it ran on, so that home's
+  live current gateway settles it; an unreadable home keeps the old fail-closed rule;
+- `_record_owed_gateway_inventory` no longer records profiles the post-restart fleet snapshot
+  shows `external`.
+A stale or down checkout-backed gateway, and an unmapped stop on a home with no live gateway,
+still owe the restart (control cases in the new test file, green before and after).
+
+Tests: tests/hermes_cli/test_update_obligation_row_classes.py — 4 cases RED on main
+(external row recorded/undischargeable, unmapped-on-live-home undischargeable, both sweeps lose
+the home), 3 controls green on both.
+---
+ hermes_cli/update_cmd_fleet.py                |  39 +++-
+ hermes_cli/update_cmd_fleet_verify.py         |  21 +-
+ hermes_cli/update_cmd_stale_survivors.py      |  23 ++
+ .../test_update_obligation_row_classes.py     | 217 ++++++++++++++++++
+ 4 files changed, 295 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_obligation_row_classes.py
+
+diff --git a/hermes_cli/update_cmd_fleet.py b/hermes_cli/update_cmd_fleet.py
+index 3c7ced0de8d..a85ce837b3c 100644
+--- a/hermes_cli/update_cmd_fleet.py
++++ b/hermes_cli/update_cmd_fleet.py
+@@ -299,6 +299,21 @@ def _live_fleet_covers_receipt(expected_sha: str | None, receipt: dict, owed: se
+ _UNMAPPED_GATEWAY = ("gateway", "")
+ 
+ 
++def _profile_for_home(home: object) -> str | None:
++    """The profile whose home is *home* (resolved), or None when it names no profile of this install."""
++    if not isinstance(home, str) or not home.strip():
++        return None
++    try:
++        from hermes_cli.update_receipt import _profile_homes
++        target = Path(home).expanduser().resolve()
++        for profile, profile_home in _profile_homes():
++            if Path(profile_home).expanduser().resolve() == target:
++                return profile
++    except Exception as exc:
++        logger.debug("Could not map stopped gateway home %s to a profile: %s", home, exc, exc_info=True)
++    return None
++
++
+ def _marker_owed_gateways(inventory: object) -> set[tuple[str, str]] | None:
+     """The ``("gateway", profile)`` set a marker's inventory owes; None when it recorded none.
+ 
+@@ -320,7 +335,12 @@ def _marker_owed_gateways(inventory: object) -> set[tuple[str, str]] | None:
+         if runtime_outside_gateway_evidence(runtime):
+             continue
+         if runtime.get("kind") == "gateway" and runtime.get("stopped_unmapped"):
+-            owed.add(_UNMAPPED_GATEWAY)
++            # A stopped gateway whose home was read at the stop is owed to THAT home's profile: one
++            # gateway per home holds ``gateway.lock``, so a live current gateway there is its
++            # successor, however it was launched (a lock loser or a pre-lock `gateway run` never
++            # served anything the home's gateway does not). No readable home keeps the old rule.
++            profile = _profile_for_home(runtime.get("home"))
++            owed.add(("gateway", profile) if profile else _UNMAPPED_GATEWAY)
+             continue
+         profile = runtime.get("profile")
+         if runtime.get("kind") != "gateway" or not isinstance(profile, str) or not profile.strip() or profile == "unknown":
+@@ -1460,6 +1480,10 @@ class _GatewayRestartOutcome:
+     #: the summary tells the user to restart them by hand, so the fleet probe must not expect
+     #: a row for them.
+     stopped_unmapped_pids: set = field(default_factory=set)
++    #: ``{pid: home}`` for the unmapped stops whose home was readable BEFORE the signal (live
++    #: environment or spawn ledger); the owed inventory keeps it so that home's live gateway can
++    #: settle the debt. Read before the stop: a dead process has no environment left to read.
++    stopped_unmapped_homes: dict = field(default_factory=dict)
+     #: ``scope/name`` of every settled systemd unit; the fleet probe stops waiting for a state stamp
+     #: once none of them is active or activating any more (the successor died, nothing will publish).
+     restarted_scoped_units: set = field(default_factory=set)
+@@ -1493,6 +1517,16 @@ class _GatewayRestartOutcome:
+             )
+ 
+ 
++def _stopped_gateway_home(pid: int) -> str | None:
++    """Home gateway *pid* runs on, read before it is stopped; None when unreadable. Never raises."""
++    try:
++        from hermes_cli.update_fleet_scope import gateway_pid_home
++        return gateway_pid_home(pid)
++    except Exception as exc:
++        logger.debug("Could not read the home of gateway PID %s: %s", pid, exc, exc_info=True)
++        return None
++
++
+ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None:
+     """Drain/stop every manual (non-service) gateway and print the restart summary.
+ 
+@@ -1554,10 +1588,13 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
+     for pid in manual_pids:
+         if pid in profile_processes and pid not in unrestartable_pids:
+             continue
++        home = _stopped_gateway_home(pid)
+         with suppress(ProcessLookupError, PermissionError):
+             os.kill(pid, _signal.SIGTERM)
+             out.killed_pids.add(pid)
+             out.stopped_unmapped_pids.add(pid)
++            if home:
++                out.stopped_unmapped_homes[pid] = home
+ 
+     if out.restarted_services or out.killed_pids:
+         print()
+diff --git a/hermes_cli/update_cmd_fleet_verify.py b/hermes_cli/update_cmd_fleet_verify.py
+index 964349963c0..425cec27db1 100644
+--- a/hermes_cli/update_cmd_fleet_verify.py
++++ b/hermes_cli/update_cmd_fleet_verify.py
+@@ -184,7 +184,7 @@ def _settle_units_proven_current(restart, fleet_rows: list) -> bool:
+     return True
+ 
+ 
+-def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=()) -> None:
++def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=(), stopped_homes=None, fleet_snapshot=()) -> None:
+     """Name the pre-update gateways on the obligation once their restart is owed.
+ 
+     The pull arms the obligation before the restart phase knows what it owes. An inventory-less
+@@ -192,11 +192,18 @@ def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=()) -> None:
+     (nothing live, nothing named), which would silence the owed-restart warning that replaces a
+     failed update under contract C3. A named inventory keeps it until those gateways run HEAD.
+     A gateway stopped with no known profile is recorded as an unmapped row for the same reason: it
+-    has no ``gateway_state.json`` the gateway-less probe could see, so absence would settle it.
++    has no ``gateway_state.json`` the gateway-less probe could see, so absence would settle it. Its
++    ``home`` (read before the stop, *stopped_homes*) rides along when known, so that home's live
++    gateway can settle it (``_marker_owed_gateways``).
++    A profile the post-restart *fleet_snapshot* shows serving ANOTHER checkout (``external``, e.g.
++    an Ask Eve runtime pinned to its own core) owes this checkout nothing and is not recorded:
++    named, it was owed a row that only its own checkout's update can produce, and while that
++    runtime was down or restarting the obligation could not settle.
+     A readable inventory (a same-SHA catch-up keeps the standing record) only GROWS: rows this run
+     newly owes are appended, so a mapped successor cannot discharge a newly stopped unmapped one.
+     """
+     from hermes_cli import update_cmd_fleet as fleet
++    from hermes_cli.update_receipt import row_is_external
+     armed = fleet._fleet_restart_obligation_armed()
+     fields = fleet._obligation_fields() if armed else {}
+     if fields is None:
+@@ -209,13 +216,17 @@ def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=()) -> None:
+         except ValueError:
+             return
+         recorded = inventory["runtimes"]
++    external = {row.get("profile") for row in fleet_snapshot or () if row_is_external(row)}
++    stopped_homes = stopped_homes or {}
+     from dataclasses import asdict
+     rows = [
+         asdict(runtime) for runtime in getattr(plan, "runtimes", ()) or ()
+         if getattr(runtime, "kind", None) == "gateway"
+         and isinstance(getattr(runtime, "profile", None), str)
+         and runtime.profile.strip() and runtime.profile != "unknown"
+-    ] + [{"kind": "gateway", "profile": None, "pid": pid, "stopped_unmapped": True}
++        and runtime.profile not in external
++    ] + [{"kind": "gateway", "profile": None, "pid": pid, "stopped_unmapped": True,
++          **({"home": stopped_homes[pid]} if stopped_homes.get(pid) else {})}
+          for pid in sorted(stopped_unmapped_pids)]
+     rows = [row for row in rows if row not in recorded]
+     if rows:
+@@ -498,7 +509,9 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
+             restart, stopped, gateway_owed=_gateway_owed, stale_serves=_stale_serves_owed,
+             down_serves=set(_dashboards_down or ())))
+         with _best_effort('Fleet restart inventory not recorded: %s'):
+-            _record_owed_gateway_inventory(_pre_update_plan, stopped)
++            _record_owed_gateway_inventory(_pre_update_plan, stopped,
++                                           stopped_homes=getattr(restart, "stopped_unmapped_homes", None),
++                                           fleet_snapshot=_fleet_snapshot)
+     if _units_settled:
+         # Credited units changed the restart result; save it with the final verdict so it agrees with
+         # the follow-up above.
+diff --git a/hermes_cli/update_cmd_stale_survivors.py b/hermes_cli/update_cmd_stale_survivors.py
+index 3232abf19ab..b011d254eeb 100644
+--- a/hermes_cli/update_cmd_stale_survivors.py
++++ b/hermes_cli/update_cmd_stale_survivors.py
+@@ -25,6 +25,18 @@ def stale_fleet_survivor_pids(fleet: list, already_signalled: set) -> list[int]:
+     return pids
+ 
+ 
++def _profile_home(profile: str | None) -> str | None:
++    """Home of *profile* on this install, or None when it names none. Never raises."""
++    if not profile:
++        return None
++    try:
++        from hermes_cli.update_receipt import _profile_homes
++        return next((str(home) for name, home in _profile_homes() if name == profile), None)
++    except Exception:
++        logger.debug("Could not resolve the home of profile %s", profile, exc_info=True)
++        return None
++
++
+ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> list[int]:
+     """Drain-first restart every proven-stale gateway; returns the PIDs signalled.
+ 
+@@ -44,15 +56,23 @@ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> l
+     from hermes_cli import gateway_supervised_restart
+ 
+     labels = {row.get("pid"): str(row.get("profile") or "gateway") for row in fleet if isinstance(row, dict)}
++    row_profiles = {row.get("pid"): row.get("profile") for row in fleet if isinstance(row, dict)}
+     print()
+     print(f"  ⚠ {len(pids)} gateway process(es) still run the pre-update code — requesting a restart")
+     signalled: list[int] = []
+     manual: list[int] = []
++    homes: dict[int, str] = {}
+     for pid in pids:
+         label = f"{labels.get(pid, 'gateway')} (PID {pid})"
+         try:
+             # Read before the signal: the declaration comes from the live process.
+             external = pid not in service_pids and gateway_supervised_restart.gateway_declares_external_supervisor(pid)
++            if pid not in service_pids and not external:
++                # The fleet row came from walking that profile's own home: its home is exact,
++                # where the process-environment read can only agree with it or guess.
++                from hermes_cli.update_cmd_fleet import _stopped_gateway_home
++                if home := _profile_home(row_profiles.get(pid)) or _stopped_gateway_home(pid):
++                    homes[pid] = home
+             if _drain_or_signal_gateway_for_update(pid, drain_budget, label):
+                 signalled.append(pid)
+                 restart.killed_pids.add(pid)
+@@ -72,6 +92,9 @@ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> l
+         stopped = getattr(restart, "stopped_unmapped_pids", None)
+         if isinstance(stopped, set):
+             stopped.update(manual)
++        stopped_homes = getattr(restart, "stopped_unmapped_homes", None)
++        if isinstance(stopped_homes, dict):
++            stopped_homes.update({pid: homes[pid] for pid in manual if pid in homes})
+         print(f"  → Stopped {len(manual)} manual gateway process(es) that had no supervisor to respawn them")
+         print("    Restart manually: hermes gateway run")
+         if len(manual) > 1:
+diff --git a/tests/hermes_cli/test_update_obligation_row_classes.py b/tests/hermes_cli/test_update_obligation_row_classes.py
+new file mode 100644
+index 00000000000..833a0f4a070
+--- /dev/null
++++ b/tests/hermes_cli/test_update_obligation_row_classes.py
+@@ -0,0 +1,217 @@
++"""The host restart obligation settles once every checkout-backed gateway runs the checkout.
++
++hermes-hub, 2026-11-03: an update restarted `default` onto the pulled code and handed the Ask Eve
++profiles (whose gateways run the askeve-runtime's own pinned core) back to their units, but it also
++SIGTERMed a stray ``gateway run`` process that held no profile's ``gateway.pid``. That stop was
++recorded as ``{"profile": None, "stopped_unmapped": True}`` with no home, and the inventory named the
++Ask Eve profiles too. Every later CLI start then printed "did not restart running gateways"
++although nothing checkout-backed was stale: an unmapped row with no identity can only be settled by
++a further local gateway that no owed profile explains, and that never comes.
++
++Each owed row class gets its own case: the external-checkout runtime, the unmapped stop with a
++readable home, and the controls that must keep warning (a stale or down checkout gateway, an
++unmapped stop whose home has no live gateway, an unmapped stop whose home was unreadable).
++"""
++
++from __future__ import annotations
++
++import json
++import types
++
++import pytest
++
++HEAD = "ceff8ab7358f07324e7fcd09526ccb197aa518d4"
++ASKEVE = "14a1244773e6304204e451b30c829cb77aa9edbd"
++
++
++def _plan(runtimes):
++    return types.SimpleNamespace(runtimes=runtimes)
++
++
++@pytest.fixture
++def host(monkeypatch, tmp_path):
++    """Isolated obligation store and checkout HEAD; ``rows`` is the live fleet the probe sees."""
++    from hermes_cli import update_cmd, update_cmd_fleet as fleet, update_cmd_fleet_verify as fleet_verify
++    from hermes_cli import update_host_obligation as host_obligation, update_receipt
++
++    monkeypatch.setattr(host_obligation, "host_obligation_path", lambda: tmp_path / "host-update-restart.json")
++    monkeypatch.setattr(fleet, "_current_checkout_sha", lambda: HEAD)
++    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: HEAD)
++    monkeypatch.setattr(fleet_verify, "_print_legacy_units_warning", lambda: None)
++    monkeypatch.setattr("hermes_cli.update_cmd_maint._refresh_dashboard_after_update", lambda **kw: None)
++    monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda plan: [])
++    monkeypatch.setattr(fleet_verify, "_FLEET_PROBE_SETTLE_TIMEOUT_SECONDS", 0)
++    monkeypatch.setattr("hermes_cli.update_cmd_stale_survivors.signal_stale_fleet_survivors", lambda *a: None)
++    rows: list = []
++    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **kw: [dict(r) for r in rows])
++    home = update_cmd.get_hermes_home()
++    (home / "profiles" / "askeve-builder").mkdir(parents=True, exist_ok=True)
++    (home / "profiles" / "work").mkdir(parents=True, exist_ok=True)
++    return types.SimpleNamespace(rows=rows, home=home, fleet=fleet, verify=fleet_verify, receipt=update_receipt)
++
++
++def _current(profile, pid):
++    return {"profile": profile, "pid": pid, "state": "current", "code_sha": HEAD,
++            "code_root": "/srv/hermes-agent"}
++
++
++def _external(profile, pid):
++    return {"profile": profile, "pid": pid, "state": "external", "code_sha": ASKEVE,
++            "code_root": "/srv/askeve-runtime/core-14a1244773e6"}
++
++
++def _run_update(h, *, stopped_unmapped=(), homes=None, phase_errors=()):
++    """The real post-restart verification, ending in an owed restart (the obligation is armed)."""
++    from hermes_cli.update_inventory import RuntimeRecord
++
++    h.fleet._write_fleet_restart_pending_marker(expected_sha=HEAD)  # armed by the pull
++    out = h.fleet._GatewayRestartOutcome(
++        incomplete=bool(phase_errors), phase_errors=list(phase_errors), pre_restart_gateway_pids=[1532017],
++        restarted_services=["hermes-gateway", "hermes-gateway-askeve-builder"], failed_or_stale_units=[],
++        relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(stopped_unmapped),
++        stopped_unmapped_pids=set(stopped_unmapped),
++    )
++    # Set as an attribute, not a constructor field, so the case runs (and fails on the gap it
++    # tests) against an outcome type that predates the field.
++    out.stopped_unmapped_homes = dict(homes or {})
++    plan = _plan([
++        RuntimeRecord(kind="gateway", profile="default", pid=1532017, code_sha="9ba5754ca9e9"),
++        RuntimeRecord(kind="gateway", profile="askeve-builder", pid=1533512, code_sha=ASKEVE),
++    ])
++    h.receipt.begin_update_receipt()
++    h.verify._verify_fleet_after_update(out, _pre_update_plan=plan, _windows_gateway_resume=None,
++                                        update_complete=True)
++    assert h.fleet._fleet_restart_obligation_armed(), "the run must leave an owed restart for this case"
++    return json.loads(h.fleet._obligation_fields()["inventory"])["runtimes"]
++
++
++# --- external-checkout runtime (askeve-runtime's own pinned core) -------------------------------
++
++def test_an_external_checkout_gateway_is_not_owed_a_restart_onto_this_checkout(host):
++    host.rows[:] = [_current("default", 2542475), _external("askeve-builder", 2544484)]
++    inventory = _run_update(host, phase_errors=["boom"])
++
++    assert [r["profile"] for r in inventory] == ["default"], "a runtime of another checkout was recorded as owed"
++    # The Ask Eve gateway restarting (no row for a moment) or down for its own reasons is that
++    # runtime's business: the checkout-backed fleet is current, so nothing of this update is owed.
++    host.rows[:] = [_current("default", 2542475)]
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is False
++    assert not host.fleet._fleet_restart_obligation_armed()
++
++
++def test_a_stale_checkout_gateway_still_owes_the_restart_next_to_an_external_one(host):
++    host.rows[:] = [_current("default", 2542475), _external("askeve-builder", 2544484)]
++    _run_update(host, phase_errors=["boom"])
++
++    host.rows[:] = [dict(_current("default", 1532017), state="stale", code_sha="9ba5754ca9e9"),
++                    _external("askeve-builder", 2544484)]
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is True
++    host.rows[:] = [_external("askeve-builder", 2544484)]  # `default` down
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is True
++    assert host.fleet._fleet_restart_obligation_armed()
++
++
++# --- unmapped stop (no profile, no code) ---------------------------------------------------------
++
++def test_an_unmapped_stop_on_a_home_whose_gateway_runs_the_checkout_is_settled(host):
++    host.rows[:] = [_current("default", 2542475), _external("askeve-builder", 2544484)]
++    inventory = _run_update(host, stopped_unmapped=[2549548], homes={2549548: str(host.home)})
++
++    assert {"kind": "gateway", "profile": None, "pid": 2549548, "stopped_unmapped": True,
++            "home": str(host.home)} in inventory
++    # The home's one lock-holding gateway is current on HEAD: the stray process owes nothing more.
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is False
++    assert not host.fleet._fleet_restart_obligation_armed()
++
++
++def test_an_unmapped_stop_on_a_home_with_no_live_gateway_keeps_warning(host):
++    work = host.home / "profiles" / "work"
++    host.rows[:] = [_current("default", 2542475), _external("askeve-builder", 2544484)]
++    _run_update(host, stopped_unmapped=[2549548], homes={2549548: str(work)})
++
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is True
++    host.rows.append(_current("work", 2600000))  # `hermes -p work gateway run`
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is False
++
++
++def test_an_unmapped_stop_with_an_unreadable_home_keeps_the_old_rule(host):
++    host.rows[:] = [_current("default", 2542475), _external("askeve-builder", 2544484)]
++    inventory = _run_update(host, stopped_unmapped=[2549548])
++
++    assert {"kind": "gateway", "profile": None, "pid": 2549548, "stopped_unmapped": True} in inventory
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is True
++
++
++def test_the_manual_sweep_reads_each_unmapped_home_before_the_stop(monkeypatch):
++    from hermes_cli import gateway, update_cmd_fleet as fleet, update_cmd_posix_pause, update_fleet_scope
++
++    alive = {2549548}
++    monkeypatch.setattr(gateway, "_get_service_pids", lambda all_profiles=False: set())
++    monkeypatch.setattr(update_cmd_posix_pause, "already_restarted", lambda: {"pids": set()})
++    monkeypatch.setattr(gateway, "find_gateway_pids", lambda exclude_pids=None, all_profiles=False: [2549548])
++    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda exclude_pids=None, strict=False: [])
++    monkeypatch.setattr(fleet, "_scoped_manual_gateway_pids", lambda pids, keep=(), quiet=False: list(pids))
++    monkeypatch.setattr(update_fleet_scope, "gateway_pid_home",
++                        lambda pid: "/srv/home" if pid in alive else None)
++    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: alive.discard(pid))
++    out = fleet._GatewayRestartOutcome(
++        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[], restarted_services=[],
++        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
++    )
++    fleet._restart_manual_gateways(out, 0)
++
++    assert out.stopped_unmapped_pids == {2549548}
++    assert out.stopped_unmapped_homes == {2549548: "/srv/home"}
++
++
++def test_the_stale_survivor_sweep_reads_each_manual_home_before_the_signal(monkeypatch):
++    from hermes_cli import gateway, gateway_supervised_restart, update_cmd_fleet as fleet, update_fleet_scope
++    from hermes_cli.update_cmd_stale_survivors import signal_stale_fleet_survivors
++
++    alive = {4242}
++    monkeypatch.setattr(gateway, "_get_service_pids", lambda all_profiles=False: set())
++    monkeypatch.setattr(gateway_supervised_restart, "gateway_declares_external_supervisor", lambda pid, home=None: False)
++    monkeypatch.setattr(update_fleet_scope, "gateway_pid_home", lambda pid: "/srv/work" if pid in alive else None)
++    monkeypatch.setattr(fleet, "_drain_or_signal_gateway_for_update",
++                        lambda pid, budget, label, **kw: alive.discard(pid) or True)
++    out = fleet._GatewayRestartOutcome(
++        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[], restarted_services=[],
++        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
++    )
++    signal_stale_fleet_survivors([{"profile": None, "pid": 4242, "state": "stale"}], out, 0)
++
++    assert out.stopped_unmapped_pids == {4242}
++    assert out.stopped_unmapped_homes == {4242: "/srv/work"}
++
++
++def test_an_unmapped_stop_is_owed_to_its_own_homes_profile_not_to_any_live_gateway(host):
++    # A named home maps to ITS profile: `default` and an unrelated `ops` coming back current are no
++    # successor of a stop on `work` (the home-less rule accepts `ops`, which no owed row explains).
++    work = host.home / "profiles" / "work"
++    (host.home / "profiles" / "ops").mkdir(parents=True, exist_ok=True)
++    host.rows[:] = [_current("default", 2542475), _external("askeve-builder", 2544484), _current("ops", 2544999)]
++    _run_update(host, stopped_unmapped=[2549548], homes={2549548: str(work)})
++
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is True
++    host.rows.append(_current("work", 2600000))
++    assert host.fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is False
++
++
++def test_the_stale_survivor_sweep_records_the_home_of_the_rows_own_profile(monkeypatch):
++    from hermes_cli import gateway, gateway_supervised_restart, update_cmd, update_cmd_fleet as fleet
++    from hermes_cli import update_fleet_scope
++    from hermes_cli.update_cmd_stale_survivors import signal_stale_fleet_survivors
++
++    work = update_cmd.get_hermes_home() / "profiles" / "work"
++    work.mkdir(parents=True, exist_ok=True)
++    monkeypatch.setattr(gateway, "_get_service_pids", lambda all_profiles=False: set())
++    monkeypatch.setattr(gateway_supervised_restart, "gateway_declares_external_supervisor", lambda pid, home=None: False)
++    monkeypatch.setattr(update_fleet_scope, "gateway_pid_home", lambda pid: "/guessed/from/environ")
++    monkeypatch.setattr(fleet, "_drain_or_signal_gateway_for_update", lambda pid, budget, label, **kw: True)
++    out = fleet._GatewayRestartOutcome(
++        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[], restarted_services=[],
++        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
++    )
++    signal_stale_fleet_survivors([{"profile": "work", "pid": 4343, "state": "stale"}], out, 0)
++
++    assert out.stopped_unmapped_homes == {4343: str(work)}
+-- 
+2.55.0
+

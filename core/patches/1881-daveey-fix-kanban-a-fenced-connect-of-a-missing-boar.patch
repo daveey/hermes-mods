@@ -1,0 +1,125 @@
+From ba48afaefc938615c1d5d59f1048ec6a445aacd6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 13:14:42 +0000
+Subject: [PATCH] [daveey] fix(kanban): a fenced connect() of a missing board
+ DB names the fence
+
+A spawned descendant whose HERMES_DELEGATED_CHILD_CONTEXT root covers the board
+path opens it ?mode=ro. When the file did not exist SQLite only said "unable to
+open database file" (raised from kanban_lockguard), which a worker misread as a
+lockguard bug (t_01a19efdde6364d6; real cause was the inherited fence covering a
+pytest tmp_path under <root>/cache/scratch, t_01a19f60a4e241d2).
+
+connect() now raises PermissionError naming the path and the marker value
+before the read-only open. Regression test sets the marker to a root and points
+HERMES_KANBAN_HOME at a missing dir under it (red before: OperationalError);
+test_delegate_lineage_fail_closed now expects the named refusal.
+---
+ hermes_cli/kanban_db_connect.py               | 10 ++++
+ .../test_delegate_lineage_fail_closed.py      |  6 +--
+ .../test_kanban_fenced_missing_board.py       | 49 +++++++++++++++++++
+ 3 files changed, 62 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_fenced_missing_board.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 052555137a5..3893435aca7 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -904,6 +904,16 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+     if kanban_path_is_fenced(path):
+         # Reads must not enter schema/backfill write transactions. Never create a
+         # missing board or migrate on a descendant's behalf; the owner initializes it.
++        if not path.exists():
++            # Name the fence: a bare ``?mode=ro`` open of a missing file only says SQLite's
++            # "unable to open database file", which reads like a lockguard/filesystem bug.
++            from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
++            marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "") or "<in-process delegate>"
++            raise PermissionError(
++                f"kanban board {path} is fenced for this delegated/worker process "
++                f"({DELEGATED_CHILD_ENV_MARKER}={marker}) and has no database; "
++                "descendants cannot create boards"
++            )
+         conn = _kanban_lockguard.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+         conn.row_factory = sqlite3.Row
+         conn.text_factory = _kb._lossy_text
+diff --git a/tests/agent/test_delegate_lineage_fail_closed.py b/tests/agent/test_delegate_lineage_fail_closed.py
+index 3fb2525cb3a..e0ad8a311c6 100644
+--- a/tests/agent/test_delegate_lineage_fail_closed.py
++++ b/tests/agent/test_delegate_lineage_fail_closed.py
+@@ -1,6 +1,5 @@
+ """Unknown process ancestry must not grant board mutation rights."""
+ import os
+-import sqlite3
+ import subprocess
+ import sys
+ from pathlib import Path
+@@ -75,8 +74,9 @@ def test_unknown_lineage_keeps_fence_and_allows_isolated_db(tmp_path, monkeypatc
+         assert dc.kanban_path_is_fenced(pinned)
+         with pytest.raises(PermissionError):
+             kb._assert_not_delegated_child_mutation(pinned)
+-        # Fenced connection initialization is read-only and cannot create a DB.
+-        with pytest.raises(sqlite3.OperationalError, match="unable to open database"):
++        # Fenced connection initialization is read-only and cannot create a DB; the refusal
++        # names the fence instead of SQLite's bare "unable to open database file".
++        with pytest.raises(PermissionError, match="is fenced .* has no database"):
+             kb.init_db(pinned)
+         assert not pinned.exists()
+         assert not dc.kanban_path_is_fenced(scratch)
+diff --git a/tests/hermes_cli/test_kanban_fenced_missing_board.py b/tests/hermes_cli/test_kanban_fenced_missing_board.py
+new file mode 100644
+index 00000000000..d6f23fb738e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fenced_missing_board.py
+@@ -0,0 +1,49 @@
++"""A fenced connect() of a board with no database names the fence. [daveey]
++
++A spawned descendant whose HERMES_DELEGATED_CHILD_CONTEXT root covers the board
++path opens it ``?mode=ro``. When the file does not exist SQLite only said
++``unable to open database file`` (raised from kanban_lockguard), which a worker
++misread as a lockguard bug (t_01a19efdde6364d6; real cause: the inherited fence
++covered a pytest tmp_path under <root>/cache/scratch, t_01a19f60a4e241d2).
++"""
++from __future__ import annotations
++
++import pytest
++
++from agent.delegation_context import (
++    DELEGATED_CHILD_ENV_MARKER,
++    DELEGATED_CHILD_OWNER_ENV,
++    kanban_path_is_fenced,
++)
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def fenced_missing_board(tmp_path, monkeypatch):
++    root = tmp_path / "root"
++    root.mkdir()
++    home = root / "cache" / "scratch" / "kanban-home"  # missing: never created
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
++                "HERMES_KANBAN_WORKSPACES_ROOT", DELEGATED_CHILD_OWNER_ENV):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, str(root))
++    kb._INITIALIZED_PATHS.clear()
++    path = kb.kanban_db_path()
++    assert not path.exists()
++    assert kanban_path_is_fenced(path)
++    return root, home, path
++
++
++def test_fenced_connect_of_missing_board_names_the_fence(fenced_missing_board):
++    root, home, path = fenced_missing_board
++    with pytest.raises(PermissionError) as exc:
++        kbc.connect()
++    msg = str(exc.value)
++    assert str(path) in msg
++    assert "fenced" in msg
++    assert f"{DELEGATED_CHILD_ENV_MARKER}={root}" in msg
++    assert "has no database" in msg
++    # Nothing was created on the descendant's behalf.
++    assert not home.exists()
+-- 
+2.55.0
+

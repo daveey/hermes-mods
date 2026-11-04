@@ -1,0 +1,2420 @@
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index b1520661847..c7b93d20b48 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -237,18 +237,19 @@ export interface SidebarSessionsRequest {
+ // The batched /sidebar endpoint shipped later than the per-slice route, so a
+ // newer desktop can meet an older backend that 404s it ("No such API
+ // endpoint"). Endpoint-missing is a capability signal, not a transient
+-// failure: remember it (per renderer lifetime — a runtime home change reloads
+-// the window and re-probes) and serve every subsequent refresh straight from
+-// the three proven per-slice calls instead of re-probing a known-dead route
+-// once per turn/broadcast.
+-let sidebarBatchEndpointMissing = false
+-
+-// Capability flags are per-backend facts. A hard re-home reloads the window
+-// (module state resets naturally), but a soft gateway switch re-dials in
+-// place — the next backend may well have the batched route, so the switch
+-// paths call this to re-probe rather than leak the old backend's capability.
++// failure: remember it and serve every subsequent refresh straight from the
++// three proven per-slice calls instead of re-probing a known-dead route once
++// per turn/broadcast. It is a fact about ONE backend, so it is keyed by the
++// connection the request rode: a gateway pick re-scopes requests in place
++// (no reload, no list wipe), and the next gateway may well have the route.
++// Keyed at request time, a late 404 from the gateway just left still lands on
++// that gateway, not on the one now in front.
++const sidebarBatchEndpointMissing = new Set<string>()
++
++// A Settings apply can re-point a connection id at a different backend, so it
++// forgets every remembered capability and re-probes.
+ export function resetSidebarBatchCapability() {
+-  sidebarBatchEndpointMissing = false
++  sidebarBatchEndpointMissing.clear()
+ }
+ 
+ // Compatibility fallback: reassemble the three sidebar slices from the
+@@ -314,7 +315,9 @@ export function scanSessionPullRequests(
+ }
+ 
+ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {
+-  if (sidebarBatchEndpointMissing) {
++  const capabilityKey = getApiRequestConnection() ?? ''
++
++  if (sidebarBatchEndpointMissing.has(capabilityKey)) {
+     return listSidebarSessionsLegacy(req)
+   }
+ 
+@@ -350,7 +353,7 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
+     }
+ 
+     // Older backend without the batched route (desktop/runtime version skew).
+-    sidebarBatchEndpointMissing = true
++    sidebarBatchEndpointMissing.add(capabilityKey)
+ 
+     return listSidebarSessionsLegacy(req)
+   }
+diff --git a/apps/desktop/src/app/chat/sidebar/local-device-switch.tsx b/apps/desktop/src/app/chat/sidebar/local-device-switch.tsx
+index c830b80514a..ed6661675b5 100644
+--- a/apps/desktop/src/app/chat/sidebar/local-device-switch.tsx
++++ b/apps/desktop/src/app/chat/sidebar/local-device-switch.tsx
+@@ -4,22 +4,9 @@ import { useRef, useState } from 'react'
+ import { FirstRunRemoteSetup } from '@/components/remote-setup/first-run'
+ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+ import { useI18n } from '@/i18n'
++import { localBootstrapNeeded } from '@/lib/local-backend-probe'
+ import { notifyError } from '@/store/notifications'
+ 
+-/**
+- * Resolve whether This device would install, without starting the installer.
+- * Missing bridge fails closed: a click must not reach runBootstrap unseen.
+- */
+-async function probeLocalBackend(): Promise<boolean> {
+-  const probe = window.hermesDesktop?.probeLocalBackend
+-
+-  if (!probe) {
+-    return true
+-  }
+-
+-  return (await probe()).bootstrapNeeded === true
+-}
+-
+ export interface LocalDeviceTarget {
+   connectionId: string
+   label: string
+@@ -56,7 +43,7 @@ export function useLocalDeviceSwitch() {
+     let bootstrapNeeded: boolean
+ 
+     try {
+-      bootstrapNeeded = await probeLocalBackend()
++      bootstrapNeeded = await localBootstrapNeeded()
+     } catch (error) {
+       notifyError(error, t.profiles.switchConnectionFailed(target.label))
+ 
+diff --git a/apps/desktop/src/app/chat/sidebar/session-index.ts b/apps/desktop/src/app/chat/sidebar/session-index.ts
+index b80c806f1f9..8b101e42cf6 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-index.ts
++++ b/apps/desktop/src/app/chat/sidebar/session-index.ts
+@@ -45,8 +45,10 @@ export function buildSessionByAnyId(
+  * only local ids — renders empty, so the conversation vanishes from the
+  * sidebar entirely (#85969). Falling back to the row flag keeps the invariant:
+  * a session the backend says is pinned is always reachable from the Pinned
+- * section, whatever the local cache holds. session-pin-sync then adopts the
+- * pin into the local set on its next reconcile, restoring ordering control.
++ * section, whatever the local cache holds. For a row the pin set's own gateway
++ * owns, session-pin-sync then adopts the pin into the local set on its next
++ * reconcile, restoring ordering control; another gateway's row (kept or still
++ * painted after a pick) is never adopted and stays a server-only pin.
+  *
+  * `unconfirmedPinWrites` is that same module's fence, and the fallback has to
+  * respect it. Unpinning drops the id from the local set immediately, but the
+diff --git a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
+index fc73295f459..75c6687c93a 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
++++ b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
+@@ -6,6 +6,7 @@ import { setApiRequestConnection, setApiRequestProfile } from '@/hermes'
+ import { createClientSessionState } from '@/lib/chat-runtime'
+ import { adoptNewSessionDraft, beginFreshChatSend, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+ import { $confirmRequest, runConfirm, settleConfirm } from '@/store/confirm'
++import { keepRoute, keptRouteOpened } from '@/store/gateway-kept-routes'
+ import { $hubInstalledOverride } from '@/store/hub-actions'
+ import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
+ import { requestPluginCatalogInstallFromDeepLink } from '@/store/plugin-catalog-install'
+@@ -1135,4 +1136,52 @@ describe('useDesktopIntegrations', () => {
+       dropSessionState('runtime-999')
+     })
+   })
++
++  describe('kept gateway opens', () => {
++    afterEach(() => {
++      vi.useRealTimers()
++    })
++
++    it('folds the launch burst of kept-route opens into one sessions refresh, and drops a pending one on unmount', () => {
++      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
++      const refreshSessions = vi.fn()
++      const gateways = ['homelab', 'vps', 'nas', 'office', 'lab']
++      const releases = gateways.map(gateway => keepRoute(gateway, 'default'))
++
++      const { unmount } = renderHook(() =>
++        useDesktopIntegrations({
++          activeProfile: 'default',
++          chatOpen: false,
++          hasPreview: false,
++          locationPathname: '/',
++          navigate,
++          profileReady: false,
++          refreshSessions,
++          resumeExhaustedSessionId: null,
++          resumeLastSession: false,
++          routedSessionId: null,
++          runtimeIdByStoredSessionId: { current: new Map() },
++          sessions: []
++        })
++      )
++
++      try {
++        for (const gateway of gateways) {
++          keptRouteOpened(gateway, 'default')
++          vi.advanceTimersByTime(100)
++        }
++
++        expect(refreshSessions).not.toHaveBeenCalled()
++        vi.advanceTimersByTime(1_000)
++        expect(refreshSessions).toHaveBeenCalledTimes(1)
++
++        keptRouteOpened('homelab', 'default')
++        unmount()
++        vi.advanceTimersByTime(1_000)
++        expect(refreshSessions).toHaveBeenCalledTimes(1)
++      } finally {
++        releases.forEach(release => release())
++      }
++    })
++  })
+ })
+diff --git a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+index 2e742001597..26b335fde58 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+@@ -60,6 +60,9 @@ import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionR
+ 
+ import { resolveRememberedSessionId } from './remembered-session'
+ 
++// Trailing window that folds a burst of kept-route opens into one list refresh.
++const KEPT_ROUTE_REFRESH_COALESCE_MS = 400
++
+ type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'parent_session_id' | 'profile' | 'source'>
+ 
+ interface DesktopIntegrationsParams {
+@@ -610,5 +613,19 @@ export function useDesktopIntegrations({
+   }, [refreshSessions])
+ 
+   // A gateway that connects after the list was drawn adds its rows to it.
+-  useEffect(() => onKeptRouteOpened(() => void refreshSessions()), [refreshSessions])
++  // Kept-route opens (launch dials and reconnects alike) share one trailing
++  // timer, so opens less than KEPT_ROUTE_REFRESH_COALESCE_MS apart pull once.
++  useEffect(() => {
++    let timer: ReturnType<typeof setTimeout> | undefined
++
++    const off = onKeptRouteOpened(() => {
++      clearTimeout(timer)
++      timer = setTimeout(() => void refreshSessions(), KEPT_ROUTE_REFRESH_COALESCE_MS)
++    })
++
++    return () => {
++      off()
++      clearTimeout(timer)
++    }
++  }, [refreshSessions])
+ }
+diff --git a/apps/desktop/src/hermes.test.ts b/apps/desktop/src/hermes.test.ts
+index a582070cbde..a319887f78a 100644
+--- a/apps/desktop/src/hermes.test.ts
++++ b/apps/desktop/src/hermes.test.ts
+@@ -410,6 +410,46 @@ describe('Hermes REST helpers', () => {
+     expect(result.recents.sessions).toEqual([])
+   })
+ 
++  it('keeps the endpoint-missing verdict on the gateway that 404d, not the one picked next', async () => {
++    api.mockImplementation(({ connectionId, path }: { connectionId?: string; path: string }) =>
++      path.startsWith('/api/profiles/sessions/sidebar') && connectionId === 'old-gateway'
++        ? Promise.reject(new Error('404: {"detail":"No such API endpoint: /api/profiles/sessions/sidebar"}'))
++        : Promise.resolve(
++            path.startsWith('/api/profiles/sessions/sidebar')
++              ? { recents: { sessions: [] }, cron: { sessions: [] }, messaging: { sessions: [] } }
++              : emptySessionsResponse
++          )
++    )
++
++    const req = {
++      recentsProfile: 'all' as const,
++      recentsLimit: 20,
++      recentsExclude: [],
++      cronLimit: 50,
++      messagingLimit: 100,
++      messagingExclude: []
++    }
++
++    const batchedProbesOn = (connectionId: string) =>
++      api.mock.calls.filter(call => {
++        const arg = call[0] as { connectionId?: string; path: string }
++
++        return arg.connectionId === connectionId && arg.path.startsWith('/api/profiles/sessions/sidebar')
++      })
++
++    setApiRequestConnection('old-gateway')
++    await listSidebarSessions(req)
++    // A sidebar gateway pick re-scopes requests in place; nothing resets.
++    setApiRequestConnection('new-gateway')
++    await listSidebarSessions(req)
++    await listSidebarSessions(req)
++    setApiRequestConnection('old-gateway')
++    await listSidebarSessions(req)
++
++    expect(batchedProbesOn('new-gateway')).toHaveLength(2)
++    expect(batchedProbesOn('old-gateway')).toHaveLength(1)
++  })
++
+   it('does NOT fall back on transient failures — only endpoint-missing shapes trigger legacy mode', async () => {
+     api.mockRejectedValue(new Error('Request timed out after 60000ms'))
+ 
+diff --git a/apps/desktop/src/lib/local-backend-probe.ts b/apps/desktop/src/lib/local-backend-probe.ts
+new file mode 100644
+index 00000000000..8b5d1457e9b
+--- /dev/null
++++ b/apps/desktop/src/lib/local-backend-probe.ts
+@@ -0,0 +1,14 @@
++/**
++ * Whether This device would need the installer, resolved without starting it.
++ * A missing bridge fails closed: neither a click nor the gateway keeper may
++ * reach runBootstrap unseen.
++ */
++export async function localBootstrapNeeded(): Promise<boolean> {
++  const probe = window.hermesDesktop?.probeLocalBackend
++
++  if (!probe) {
++    return true
++  }
++
++  return (await probe()).bootstrapNeeded === true
++}
+diff --git a/apps/desktop/src/lib/with-timeout.ts b/apps/desktop/src/lib/with-timeout.ts
+index a1605b4e521..bfba698372e 100644
+--- a/apps/desktop/src/lib/with-timeout.ts
++++ b/apps/desktop/src/lib/with-timeout.ts
+@@ -19,9 +19,12 @@ export const BACKEND_BOOT_WAIT_TIMEOUT_MS = 180_000
+ // caller forever. Every caller of these bounds them with this shared budget.
+ export const RECONNECT_ATTEMPT_TIMEOUT_MS = 20_000
+ 
+-/** Budget for the phase-1 dial of a source switch (store/connections
+- * selectConnection). Unlike the two above this await is not one IPC: it is the
+- * main process's whole remote bring-up chain — one ssh connect
++/** Budget for each bounded step of a source switch (store/connections
++ * selectConnection): the phase-1 open of the target, the OAuth REST probe and
++ * the activation (ensureGatewayAgent) each get this whole budget, as does a
++ * registry secondary's getConnectionFor in store/gateway. It is sized for the
++ * worst of them, the cold dial. Unlike the two above, the cold dial is not one IPC:
++ * it is the main process's whole remote bring-up chain — one ssh connect
+  * (DEFAULT_CONNECT_TIMEOUT_MS 15 s in electron/ssh-connection.ts), the
+  * sequential ssh execs that probe platform, locate the runtime and read its
+  * version (DEFAULT_EXEC_TIMEOUT_MS 20 s each), the spawned backend's ready
+diff --git a/apps/desktop/src/store/connections.test.ts b/apps/desktop/src/store/connections.test.ts
+index f659b85d1af..b2c163d5da8 100644
+--- a/apps/desktop/src/store/connections.test.ts
++++ b/apps/desktop/src/store/connections.test.ts
+@@ -9,6 +9,16 @@ import { deferred } from '../test/deferred'
+ 
+ const $activeGatewayProfile = atom('default')
+ const $newChatProfile = atom<null | string>(null)
++const $newChatRoute = atom<null | { connectionId: string; profile: string }>(null)
++const $newChatConnectionId = atom<null | string>(null)
++// Every new-chat owner intent bumps this, like the real profile store.
++let newChatIntent = 0
++
++const captureNewChatSource = vi.fn((connectionId: null | string = null) => {
++  newChatIntent += 1
++  $newChatConnectionId.set(connectionId)
++})
++
+ const $freshSessionRequest = atom(0)
+ const $showAllProfiles = atom(false)
+ 
+@@ -36,6 +46,8 @@ const openGatewayAgent = vi.fn(async (_connectionId: string, _profile: string):
+ const refreshActiveProfile = vi.fn(async () => undefined)
+ const requestFreshSession = vi.fn()
+ const exitProjectScope = vi.fn()
++const isLegacyNewChatProfile = vi.fn((_profile: string) => false)
++const pinLegacyNewChatProfile = vi.fn()
+ 
+ vi.mock('@/store/session', () => ({
+   $connection,
+@@ -49,14 +61,17 @@ vi.mock('@/store/gateway-switch', () => ({ supersedeGatewaySwitch: vi.fn() }))
+ vi.mock('@/store/profile', () => ({
+   $activeGatewayProfile,
+   $freshSessionRequest,
++  $newChatConnectionId,
+   $newChatProfile,
+-  $newChatRoute: atom(null),
++  $newChatRoute,
+   $showAllProfiles,
+-  captureNewChatSource: vi.fn(),
+-  currentNewChatIntent: () => 0,
++  captureNewChatSource,
++  currentNewChatIntent: () => newChatIntent,
+   ensureGatewayAgent,
++  isLegacyNewChatProfile,
+   normalizeProfileKey: (name: null | string | undefined) => (name ?? '').trim() || 'default',
+   openGatewayAgent,
++  pinLegacyNewChatProfile,
+   refreshActiveProfile,
+   requestFreshSession
+ }))
+@@ -95,7 +110,13 @@ beforeEach(() => {
+   $connection.set(null)
+   $activeGatewayProfile.set('default')
+   $newChatProfile.set(null)
++  $newChatRoute.set(null)
++  $newChatConnectionId.set(null)
++  newChatIntent = 0
+   $showAllProfiles.set(false)
++  isLegacyNewChatProfile.mockReset()
++  isLegacyNewChatProfile.mockReturnValue(false)
++  pinLegacyNewChatProfile.mockClear()
+   ensureGatewayAgent.mockReset()
+   // Mirrors the real door: beforeActivate runs right before the activation
+   // publishes, and a declined hook publishes nothing.
+@@ -481,12 +502,217 @@ describe('selectConnection', () => {
+     await expect(selectConnection('homelab')).rejects.toThrow('offline')
+ 
+     expect($connection.get()?.connectionId).toBe('local')
+-    expect($newChatProfile.get()).toBe('default')
++    // The draft is back to what it was before the click, not on homelab.
++    expect($newChatProfile.get()).toBeNull()
++    expect($newChatConnectionId.get()).toBeNull()
+     expect(requestFreshSession).toHaveBeenCalledTimes(2)
+     expect(setLastUsed).not.toHaveBeenCalled()
+     expect($pendingConnectionId.get()).toBeNull()
+   })
+ 
++  it('a failed activation keeps the agent route the user pinned before the click', async () => {
++    setConnectionsRegistry(registry)
++    $connection.set({ connectionId: 'local', mode: 'local' })
++    $newChatProfile.set('work')
++    $newChatRoute.set({ connectionId: 'local', profile: 'work' })
++    $newChatConnectionId.set('local')
++    ensureGatewayAgent.mockImplementationOnce(async (_connectionId, _profile, options) => {
++      options?.beforeActivate?.()
++
++      throw new Error('offline')
++    })
++
++    await expect(selectConnection('homelab')).rejects.toThrow('offline')
++
++    expect($newChatProfile.get()).toBe('work')
++    expect($newChatRoute.get()).toEqual({ connectionId: 'local', profile: 'work' })
++    expect($newChatConnectionId.get()).toBe('local')
++  })
++
++  it('a failed activation leaves alone a draft the user started after the pick reached its turn', async () => {
++    setConnectionsRegistry(registry)
++    $connection.set({ connectionId: 'local', mode: 'local' })
++    ensureGatewayAgent.mockImplementationOnce(async (_connectionId, _profile, options) => {
++      options?.beforeActivate?.()
++      // A gateway group's "+" while the activation is still settling.
++      $newChatProfile.set('scout')
++      $newChatRoute.set({ connectionId: 'work-vps', profile: 'scout' })
++      captureNewChatSource('work-vps')
++
++      throw new Error('offline')
++    })
++
++    await expect(selectConnection('homelab')).rejects.toThrow('offline')
++
++    expect($newChatProfile.get()).toBe('scout')
++    expect($newChatRoute.get()).toEqual({ connectionId: 'work-vps', profile: 'scout' })
++    expect($newChatConnectionId.get()).toBe('work-vps')
++    expect(requestFreshSession).toHaveBeenCalledTimes(1)
++  })
++
++  it('a failed pick restores a legacy profile pin the draft had before the click', async () => {
++    setConnectionsRegistry(registry)
++    $connection.set({ connectionId: 'local', mode: 'local' })
++    // A saved null default pinned the legacy profile door for 'ops'.
++    $newChatProfile.set('ops')
++    isLegacyNewChatProfile.mockImplementation(profile => profile === 'ops')
++    ensureGatewayAgent.mockImplementationOnce(async (_connectionId, _profile, options) => {
++      options?.beforeActivate?.()
++
++      throw new Error('offline')
++    })
++
++    await expect(selectConnection('homelab')).rejects.toThrow('offline')
++
++    expect(pinLegacyNewChatProfile).toHaveBeenCalledWith('ops')
++  })
++
++  describe('two overlapping picks (activations serialized like the profile store mutex)', () => {
++    // Each activation waits for the one ahead of it, then runs beforeActivate.
++    // A gateway listed in `failing` never comes up, so nothing is published.
++    function serializeActivations(failing: Set<string>, holds: Partial<Record<string, Promise<unknown>>>) {
++      let queue: Promise<unknown> = Promise.resolve()
++
++      ensureGatewayAgent.mockImplementation((connectionId, profile, options) => {
++        const turn = queue.then(async () => {
++          if (holds[`${connectionId}:turn`]) {
++            await holds[`${connectionId}:turn`]
++          }
++
++          if (options?.beforeActivate && !options.beforeActivate()) {
++            return
++          }
++
++          await holds[`${connectionId}:dial`]
++
++          if (connectionId === null || failing.has(connectionId)) {
++            return
++          }
++
++          $connection.set({ connectionId, mode: 'remote', profile, registryScoped: true })
++        })
++
++        queue = turn
++
++        return turn
++      })
++    }
++
++    it('both fail: the draft is the one from before the first click', async () => {
++      const homelabDial = deferred()
++
++      setConnectionsRegistry(registry)
++      $connection.set({ connectionId: 'local', mode: 'local' })
++      serializeActivations(new Set(['homelab', 'work-vps']), { 'homelab:dial': homelabDial.promise })
++
++      const first = selectConnection('homelab').then(
++        () => 'resolved',
++        (error: Error) => error.message
++      )
++
++      // homelab reached its turn and re-homed the draft; work-vps queues behind it.
++      await vi.waitFor(() => expect($newChatConnectionId.get()).toBe('homelab'))
++
++      const second = selectConnection('work-vps').then(
++        () => 'resolved',
++        (error: Error) => error.message
++      )
++
++      await vi.waitFor(() => expect(ensureGatewayAgent).toHaveBeenCalledTimes(2))
++      homelabDial.resolve()
++
++      // The superseded pick fails quietly; the newer one reports its failure.
++      expect(await first).toBe('resolved')
++      expect(await second).toMatch(/did not become active/)
++      expect($connection.get()?.connectionId).toBe('local')
++      expect($newChatConnectionId.get()).toBeNull()
++      expect($newChatProfile.get()).toBeNull()
++      expect($newChatRoute.get()).toBeNull()
++    })
++
++    it('the first fails and settles before the second takes its turn: the second still re-homes the draft', async () => {
++      const homelabDial = deferred()
++      const workVpsTurn = deferred()
++
++      setConnectionsRegistry(registry)
++      $connection.set({ connectionId: 'local', mode: 'local' })
++      serializeActivations(new Set(['homelab']), {
++        'homelab:dial': homelabDial.promise,
++        'work-vps:turn': workVpsTurn.promise
++      })
++
++      const first = selectConnection('homelab')
++      await vi.waitFor(() => expect($newChatConnectionId.get()).toBe('homelab'))
++      const second = selectConnection('work-vps')
++      await vi.waitFor(() => expect(ensureGatewayAgent).toHaveBeenCalledTimes(2))
++
++      // homelab's caller sees its failure before work-vps reaches beforeActivate.
++      homelabDial.resolve()
++      await first
++      workVpsTurn.resolve()
++      await second
++
++      expect($connection.get()?.connectionId).toBe('work-vps')
++      expect($newChatConnectionId.get()).toBe('work-vps')
++      expect($newChatProfile.get()).toBe('default')
++    })
++
++    it('the first lands and the second fails: the draft stays on the first', async () => {
++      const homelabDial = deferred()
++
++      setConnectionsRegistry(registry)
++      $connection.set({ connectionId: 'local', mode: 'local' })
++      serializeActivations(new Set(['work-vps']), { 'homelab:dial': homelabDial.promise })
++
++      const first = selectConnection('homelab')
++      await vi.waitFor(() => expect($newChatConnectionId.get()).toBe('homelab'))
++
++      const second = selectConnection('work-vps').then(
++        () => 'resolved',
++        (error: Error) => error.message
++      )
++
++      await vi.waitFor(() => expect(ensureGatewayAgent).toHaveBeenCalledTimes(2))
++
++      // homelab publishes, then work-vps takes its turn while homelab's pick
++      // is still finishing, and work-vps never comes up.
++      homelabDial.resolve()
++      await first
++
++      expect(await second).toMatch(/did not become active/)
++      expect($connection.get()?.connectionId).toBe('homelab')
++      expect($newChatConnectionId.get()).toBe('homelab')
++      expect($newChatProfile.get()).toBe('default')
++    })
++
++    it('the newer pick fails while opening, then the first fails: the pre-click draft is back', async () => {
++      const homelabDial = deferred()
++
++      setConnectionsRegistry(registry)
++      $connection.set({ connectionId: 'local', mode: 'local' })
++      $newChatProfile.set('work')
++      $newChatRoute.set({ connectionId: 'local', profile: 'work' })
++      $newChatConnectionId.set('local')
++      serializeActivations(new Set(['homelab']), { 'homelab:dial': homelabDial.promise })
++
++      const first = selectConnection('homelab')
++      await vi.waitFor(() => expect($newChatConnectionId.get()).toBe('homelab'))
++
++      // work-vps is down: it fails at the open, before it ever queues.
++      openGatewayAgent.mockRejectedValueOnce(new Error('offline'))
++      await expect(selectConnection('work-vps')).rejects.toThrow('offline')
++
++      // homelab is superseded, but its failure still gives the draft back.
++      homelabDial.resolve()
++      await first
++
++      expect($connection.get()?.connectionId).toBe('local')
++      expect($newChatProfile.get()).toBe('work')
++      expect($newChatRoute.get()).toEqual({ connectionId: 'local', profile: 'work' })
++      expect($newChatConnectionId.get()).toBe('local')
++    })
++  })
++
+   it('a pick superseded while queued neither drafts nor activates', async () => {
+     // Both activations sit behind an in-flight profile/agent activation (the
+     // profile store's mutex); their beforeActivate hooks only run once it settles.
+diff --git a/apps/desktop/src/store/connections.ts b/apps/desktop/src/store/connections.ts
+index 8ff1e30ae91..a073af142aa 100644
+--- a/apps/desktop/src/store/connections.ts
++++ b/apps/desktop/src/store/connections.ts
+@@ -18,14 +18,17 @@ import { supersedeGatewaySwitch } from '@/store/gateway-switch'
+ import {
+   $activeGatewayProfile,
+   $freshSessionRequest,
++  $newChatConnectionId,
+   $newChatProfile,
+   $newChatRoute,
+   $showAllProfiles,
+   captureNewChatSource,
+   currentNewChatIntent,
+   ensureGatewayAgent,
++  isLegacyNewChatProfile,
+   normalizeProfileKey,
+   openGatewayAgent,
++  pinLegacyNewChatProfile,
+   refreshActiveProfile,
+   requestFreshSession
+ } from '@/store/profile'
+@@ -92,11 +95,10 @@ const $activeConnectionProfile = computed(
+ )
+ 
+ // The CONNECTION twin of profile.ts's $activeGatewayProfile subscription.
+-// The switch commit point (beginGatewaySwitch → invalidateProfileScopedQueries)
+-// runs inside beforeActivate — BEFORE applyActive publishes the new request
+-// scope (setApiRequestConnection) — so that invalidation's refetches ride the
+-// OUTGOING backend. Re-invalidate on the actual connection-id change, which
+-// applyActive publishes only after the tag moved, so the refetch lands on the
++// A gateway pick runs no switch reset (only a connection apply does), so this is
++// what moves gateway-scoped caches to the picked backend. It fires on the
++// actual connection-id change, which applyActive publishes only after the
++// request scope (setApiRequestConnection) moved, so the refetches land on the
+ // backend the tags now name. `listen` (not `subscribe`) skips the mount-time
+ // fire, and the computed dedupes equal ids, so this only runs on a real switch.
+ $activeConnectionId.listen(() => {
+@@ -134,6 +136,7 @@ export function _resetConnectionsForTests(): void {
+   pendingTarget = null
+   restoreAttempted = false
+   switchRevision = 0
++  tentativeRehome = null
+   $pendingConnectionId.set(null)
+ }
+ 
+@@ -153,6 +156,87 @@ function rehomeNewChatDraft(profile: string, keepExplicitRoute = false, connecti
+   requestFreshSession()
+ }
+ 
++// Returns what puts the current draft back (an explicit agent route and a
++// legacy profile pin included), for a pick whose activation then fails.
++function snapshotNewChatDraft(): () => void {
++  const profile = $newChatProfile.get()
++  const route = $newChatRoute.get()
++  const source = $newChatConnectionId.get()
++  const legacy = profile !== null && isLegacyNewChatProfile(profile) ? profile : null
++
++  return () => {
++    if (legacy !== null) {
++      pinLegacyNewChatProfile(legacy)
++
++      return
++    }
++
++    $newChatProfile.set(profile)
++    $newChatRoute.set(route)
++    captureNewChatSource(source)
++  }
++}
++
++// A pick's tentative draft re-home: the new-chat intent it produced, whether
++// the pick's target is active, how to give back the draft from before the
++// click, and the intent that give-back produced once it ran.
++interface DraftRehome {
++  intent: number
++  landed: () => boolean
++  restore: () => void
++  revision: number
++  undoneAs: null | number
++}
++
++// The re-home of the latest pick that reached its turn and whose pick has not
++// finished (landed or not).
++// Activations are serialized, so a pick queued behind it takes its turn right
++// after that activation settles, possibly before that pick's caller resumes.
++let tentativeRehome: DraftRehome | null = null
++
++// The tentative re-home the draft shows when a pick starts, if any: the pick
++// ahead of it whose pick has not finished (landed or not).
++function rehomeAhead(draftIntent: number): DraftRehome | null {
++  return tentativeRehome?.intent === draftIntent ? tentativeRehome : null
++}
++
++// True while no new-chat intent newer than the pick's own start has taken the
++// draft over. The pick ahead failing and giving its draft back is not one.
++function noNewerDraftIntent(draftIntent: number, ahead: DraftRehome | null): boolean {
++  const intent = currentNewChatIntent()
++
++  return intent === draftIntent || (ahead !== null && intent === ahead.undoneAs)
++}
++
++function releaseTentativeRehome(revision: number): void {
++  if (tentativeRehome?.revision === revision) {
++    tentativeRehome = null
++  }
++}
++
++// What a failed pick gives back. While the draft is still the tentative
++// re-home of a pick ahead that did not land, that pick's give-back has not run
++// yet, so it is the draft from before that click, not the tentative one.
++function draftBeforePick(ahead: DraftRehome | null): () => void {
++  if (ahead !== null && ahead.intent === currentNewChatIntent() && !ahead.landed()) {
++    return ahead.restore
++  }
++
++  return snapshotNewChatDraft()
++}
++
++// Gives the draft back, but only while no newer new-chat intent has taken it
++// over since the re-home.
++function undoDraftRehome(rehome: DraftRehome): void {
++  if (currentNewChatIntent() !== rehome.intent) {
++    return
++  }
++
++  rehome.restore()
++  requestFreshSession()
++  rehome.undoneAs = currentNewChatIntent()
++}
++
+ export function setConnectionsRegistry(registry: DesktopConnectionsRegistry): void {
+   $connectionsRegistry.set(registry)
+ }
+@@ -488,10 +572,12 @@ export async function selectConnection(connectionId: string, options: SelectConn
+   // A draft the user starts while this pick is in flight (a gateway group's
+   // "+", a profile pick) is newer than it; the late re-home must not take it over.
+   const draftIntent = currentNewChatIntent()
++  const ahead = rehomeAhead(draftIntent)
+   const activation = new AbortController()
+   let rehomed = false
+   pendingTarget = targetKey
+   $pendingConnectionId.set(connectionId)
++  let undoRehome = (): void => undefined
+ 
+   // Runs inside the activation's serialized section, synchronously right
+   // before the target is published, so the center is already a fresh draft on
+@@ -514,12 +600,24 @@ export async function selectConnection(connectionId: string, options: SelectConn
+       exitProjectScope()
+     }
+ 
+-    if (currentNewChatIntent() === draftIntent) {
++    if (noNewerDraftIntent(draftIntent, ahead)) {
+       // The open runtime belongs to the gateway being left; unbind it now, not
+       // when the fresh draft renders, so nothing pairs it with the target.
+       setActiveSessionId(null)
+       setSelectedStoredSessionId(null)
++      const restore = draftBeforePick(ahead)
+       rehomeNewChatDraft(targetProfile, restoreOnBoot, connectionId)
++
++      const rehome: DraftRehome = {
++        intent: currentNewChatIntent(),
++        landed: targetIsActive,
++        restore,
++        revision,
++        undoneAs: null
++      }
++
++      tentativeRehome = rehome
++      undoRehome = () => undoDraftRehome(rehome)
+       rehomed = true
+     }
+ 
+@@ -569,33 +667,37 @@ export async function selectConnection(connectionId: string, options: SelectConn
+       }
+     }
+ 
+-    if (revision !== switchRevision) {
+-      return
+-    }
+-
+     if (!targetIsActive()) {
+       throw new Error(`Connection "${targetConnection.label}" did not become active.`)
+     }
+ 
++    if (revision !== switchRevision) {
++      return
++    }
++
+     await rememberConnection(connectionId)
+ 
+     if (revision === switchRevision) {
+       await refreshActiveProfile()
+     }
+   } catch (error) {
++    // The target never became active: give back the draft as it was before
++    // the click, even when a newer pick superseded this one (its re-home is
++    // still the draft until that pick takes its turn). A draft the user
++    // started since the re-home is newer than this pick and is left alone.
++    if (rehomed) {
++      undoRehome()
++    }
++
+     // A newer pick owns the outcome; this one's failure is moot.
+     if (revision !== switchRevision) {
+       return
+     }
+ 
+-    // The target never became active: point the draft back at the gateway
+-    // still in front so the next message cannot go to the one that failed.
+-    if (rehomed) {
+-      rehomeNewChatDraft(currentProfile)
+-    }
+-
+     throw error
+   } finally {
++    releaseTentativeRehome(revision)
++
+     if (revision === switchRevision) {
+       pendingTarget = null
+       $pendingConnectionId.set(null)
+diff --git a/apps/desktop/src/store/gateway-kept-routes.test.ts b/apps/desktop/src/store/gateway-kept-routes.test.ts
+index e34d7cd8ff2..8999e8c0f60 100644
+--- a/apps/desktop/src/store/gateway-kept-routes.test.ts
++++ b/apps/desktop/src/store/gateway-kept-routes.test.ts
+@@ -33,7 +33,7 @@ const {
+   setPrimaryGateway
+ } = await import('./gateway')
+ 
+-const { keepRoute, onKeptRouteOpened } = await import('./gateway-kept-routes')
++const { isKeptRoute, keepRoute, onKeptRouteOpened } = await import('./gateway-kept-routes')
+ 
+ let endpoint = 'wss://homelab.invalid/api/ws?token=old'
+ 
+@@ -108,3 +108,15 @@ it('an unkept route is still pruned when idle and announces nothing', async () =
+   expect(opened).not.toHaveBeenCalled()
+   off()
+ })
++
++it('a route two holders keep stays kept until both release it, however often one releases', () => {
++  const first = keepRoute('workshop', 'default')
++  const second = keepRoute('workshop', 'default')
++
++  first()
++  first()
++  expect(isKeptRoute('workshop', 'default')).toBe(true)
++
++  second()
++  expect(isKeptRoute('workshop', 'default')).toBe(false)
++})
+diff --git a/apps/desktop/src/store/gateway-kept-routes.ts b/apps/desktop/src/store/gateway-kept-routes.ts
+index 4172ca2411e..c2f2eefe672 100644
+--- a/apps/desktop/src/store/gateway-kept-routes.ts
++++ b/apps/desktop/src/store/gateway-kept-routes.ts
+@@ -1,16 +1,31 @@
+ // Routes Desktop keeps connected for the window's lifetime (store/gateway-persistence).
+ // A leaf module, so store/gateway can consult it without importing its consumer.
+-const kept = new Set<string>()
++// Counted per route: a route stays kept until every holder has released it.
++const kept = new Map<string, number>()
+ const openedListeners = new Set<() => void>()
+ 
+ const routeKey = (connectionId: null | string, profile: string) => `${connectionId ?? ''}\u0000${profile}`
+ 
+-/** Keep one route's socket open against every idle-dispose path. Returns the release. */
++/** Keep one route's socket open against every idle-dispose path. Returns the release (idempotent). */
+ export function keepRoute(connectionId: string, profile: string): () => void {
+   const key = routeKey(connectionId, profile)
+-  kept.add(key)
++  kept.set(key, (kept.get(key) ?? 0) + 1)
++  let released = false
+ 
+-  return () => kept.delete(key)
++  return () => {
++    if (released) {
++      return
++    }
++
++    released = true
++    const holders = (kept.get(key) ?? 1) - 1
++
++    if (holders > 0) {
++      kept.set(key, holders)
++    } else {
++      kept.delete(key)
++    }
++  }
+ }
+ 
+ export function isKeptRoute(connectionId: null | string, profile: string): boolean {
+diff --git a/apps/desktop/src/store/gateway-persistence.test.ts b/apps/desktop/src/store/gateway-persistence.test.ts
+index 0a0027e529b..e718b4947ca 100644
+--- a/apps/desktop/src/store/gateway-persistence.test.ts
++++ b/apps/desktop/src/store/gateway-persistence.test.ts
+@@ -6,9 +6,17 @@ const released: string[] = []
+ const keepRoute = vi.fn((connectionId: string, _profile: string) => () => released.push(connectionId))
+ const openGatewayForAgent = vi.fn(async (_connectionId: string, _profile: string) => undefined)
+ const live = new Set<string>()
++// `live`: the gateway's kept default-profile route is open. This set: only a
++// named profile's socket on that gateway is open.
++const liveNamedProfile = new Set<string>()
+ 
+ vi.mock('@/store/gateway', () => ({
+-  liveSecondaryConnectionIds: () => new Set(live),
++  gatewayRouteState: (connectionId: string, profile: string) => ({
++    key: `${connectionId}:${profile}`,
++    open: profile === 'default' && live.has(connectionId)
++  }),
++  // Not read by the keeper; the pre-fix keeper did, so the redial test fails there on its assertion.
++  liveSecondaryConnectionIds: () => new Set([...live, ...liveNamedProfile]),
+   openGatewayForAgent
+ }))
+ vi.mock('@/store/gateway-kept-routes', () => ({ keepRoute }))
+@@ -32,16 +40,19 @@ const registry = (ids: string[]): DesktopConnectionsRegistry => ({
+ 
+ let stop: () => void = () => undefined
+ 
+-function installProbe(bootstrapNeeded: boolean): void {
+-  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
+-    probeLocalBackend: vi.fn(async () => ({ bootstrapNeeded }))
+-  }
++function installProbe(bootstrapNeeded: boolean) {
++  const probeLocalBackend = vi.fn(async () => ({ bootstrapNeeded }))
++
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { probeLocalBackend }
++
++  return probeLocalBackend
+ }
+ 
+ beforeEach(() => {
+   vi.useFakeTimers()
+   released.length = 0
+   live.clear()
++  liveNamedProfile.clear()
+   keepRoute.mockClear()
+   openGatewayForAgent.mockClear()
+   $primaryGatewayRoute.set({ connectionId: 'local', mode: 'local' })
+@@ -96,3 +107,175 @@ it('with a remote primary, keeps This device only where Hermes is installed (nev
+     ['local', 'default']
+   ])
+ })
++
++it('redials a dropped kept route even while a named profile on the same gateway stays open', () => {
++  live.add('homelab')
++  live.add('vps')
++  stop = startPersistentGateways()
++  expect(openGatewayForAgent).not.toHaveBeenCalled()
++
++  live.delete('homelab')
++  liveNamedProfile.add('homelab')
++  vi.advanceTimersByTime(30_000)
++
++  expect(dialedRoutes()).toEqual([['homelab', 'default']])
++})
++
++/** (connection, profile) per dial, whatever options the keeper passes. */
++function dialedRoutes(): unknown[][] {
++  return openGatewayForAgent.mock.calls.map(call => call.slice(0, 2))
++}
++
++it("dials nothing while no primary route is published, so the primary's own gateway never gets a second socket", () => {
++  $primaryGatewayRoute.set({ connectionId: null, mode: null })
++  stop = startPersistentGateways()
++  vi.advanceTimersByTime(30_000)
++  expect(openGatewayForAgent).not.toHaveBeenCalled()
++
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++  expect(dialedRoutes()).toEqual([['vps', 'default']])
++
++  // A primary teardown clears the route until the next primary publishes.
++  openGatewayForAgent.mockClear()
++  $primaryGatewayRoute.set({ connectionId: null, mode: null })
++  vi.advanceTimersByTime(30_000)
++  expect(openGatewayForAgent).not.toHaveBeenCalled()
++})
++
++it('probes This device once while it stays not installed, and again after the registry changes', async () => {
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++  const probe = installProbe(true)
++  stop = startPersistentGateways()
++
++  await vi.advanceTimersByTimeAsync(5 * 60_000)
++  expect(probe).toHaveBeenCalledTimes(1)
++
++  $connectionsRegistry.set(registry(['local', 'homelab', 'vps', 'nas']))
++  await vi.advanceTimersByTimeAsync(0)
++  expect(probe).toHaveBeenCalledTimes(2)
++  expect(dialedRoutes()).not.toContainEqual(['local', 'default'])
++})
++
++it('re-probes This device on a new primary route, not on each reconnect that republishes the same one', async () => {
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++  const probe = installProbe(true)
++  stop = startPersistentGateways()
++  await vi.advanceTimersByTimeAsync(0)
++
++  for (let reconnect = 0; reconnect < 3; reconnect += 1) {
++    $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++    await vi.advanceTimersByTimeAsync(0)
++  }
++
++  expect(probe).toHaveBeenCalledTimes(1)
++
++  $primaryGatewayRoute.set({ connectionId: 'vps', mode: 'remote' })
++  await vi.advanceTimersByTimeAsync(0)
++  expect(probe).toHaveBeenCalledTimes(2)
++})
++
++it('a dropped probe that fails late leaves the newer cached probe in place', async () => {
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++  let failFirst: (error: Error) => void = () => undefined
++
++  const probeLocalBackend = vi
++    .fn<() => Promise<{ bootstrapNeeded: boolean }>>()
++    .mockImplementationOnce(() => new Promise((_resolve, reject) => (failFirst = reject)))
++    .mockImplementation(async () => ({ bootstrapNeeded: true }))
++
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { probeLocalBackend }
++  stop = startPersistentGateways()
++
++  // The registry change drops the in-flight probe and starts a second one.
++  $connectionsRegistry.set(registry(['local', 'homelab', 'vps', 'nas']))
++  await vi.advanceTimersByTimeAsync(0)
++  expect(probeLocalBackend).toHaveBeenCalledTimes(2)
++
++  failFirst(new Error('probe failed'))
++  await vi.advanceTimersByTimeAsync(5 * 60_000)
++  expect(probeLocalBackend).toHaveBeenCalledTimes(2)
++})
++
++it("a dropped probe's late installed answer neither clears its replacement's not-installed verdict nor dials", async () => {
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++  let answerFirst: (result: { bootstrapNeeded: boolean }) => void = () => undefined
++
++  const probeLocalBackend = vi
++    .fn<() => Promise<{ bootstrapNeeded: boolean }>>()
++    .mockImplementationOnce(() => new Promise(resolve => (answerFirst = resolve)))
++    .mockImplementation(async () => ({ bootstrapNeeded: true }))
++
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { probeLocalBackend }
++  stop = startPersistentGateways()
++
++  // The registry change drops the in-flight probe; its replacement finds no install.
++  $connectionsRegistry.set(registry(['local', 'homelab', 'vps', 'nas']))
++  await vi.advanceTimersByTimeAsync(0)
++  expect(probeLocalBackend).toHaveBeenCalledTimes(2)
++
++  answerFirst({ bootstrapNeeded: false })
++  await vi.advanceTimersByTimeAsync(5 * 60_000)
++  expect(probeLocalBackend).toHaveBeenCalledTimes(2)
++  // Nor does it let its own waiting dial reach an install the newer probe found missing.
++  expect(dialedRoutes()).not.toContainEqual(['local', 'default'])
++})
++
++it('re-probes a missing This device install every ten minutes, so one installed meanwhile is kept', async () => {
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++
++  const probeLocalBackend = vi
++    .fn<() => Promise<{ bootstrapNeeded: boolean }>>()
++    .mockImplementationOnce(async () => ({ bootstrapNeeded: true }))
++    .mockImplementation(async () => ({ bootstrapNeeded: false }))
++
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { probeLocalBackend }
++  stop = startPersistentGateways()
++  await vi.advanceTimersByTimeAsync(9 * 60_000)
++  expect(probeLocalBackend).toHaveBeenCalledTimes(1)
++  expect(dialedRoutes()).not.toContainEqual(['local', 'default'])
++
++  await vi.advanceTimersByTimeAsync(75_000)
++  expect(probeLocalBackend).toHaveBeenCalledTimes(2)
++  expect(dialedRoutes()).toContainEqual(['local', 'default'])
++})
++
++it('re-checks an installed This device before each redial, so an install removed since is never dialed', async () => {
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++
++  const probeLocalBackend = vi
++    .fn<() => Promise<{ bootstrapNeeded: boolean }>>()
++    .mockImplementationOnce(async () => ({ bootstrapNeeded: false }))
++    .mockImplementation(async () => ({ bootstrapNeeded: true }))
++
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { probeLocalBackend }
++  stop = startPersistentGateways()
++  await vi.advanceTimersByTimeAsync(0)
++  expect(dialedRoutes()).toContainEqual(['local', 'default'])
++
++  // The local route never opened and the install is gone by the next tick.
++  openGatewayForAgent.mockClear()
++  await vi.advanceTimersByTimeAsync(30_000)
++
++  expect(probeLocalBackend).toHaveBeenCalledTimes(2)
++  expect(dialedRoutes()).not.toContainEqual(['local', 'default'])
++})
++
++it('drops a This device dial still waiting on its probe once the primary route is unpublished or the keeper stops', async () => {
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++  let answer: (result: { bootstrapNeeded: boolean }) => void = () => undefined
++
++  const probeLocalBackend = vi.fn(() => new Promise<{ bootstrapNeeded: boolean }>(resolve => (answer = resolve)))
++
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { probeLocalBackend }
++  stop = startPersistentGateways()
++  $primaryGatewayRoute.set({ connectionId: null, mode: null })
++  answer({ bootstrapNeeded: false })
++  await vi.advanceTimersByTimeAsync(0)
++  expect(dialedRoutes()).not.toContainEqual(['local', 'default'])
++
++  $primaryGatewayRoute.set({ connectionId: 'homelab', mode: 'remote' })
++  stop()
++  answer({ bootstrapNeeded: false })
++  await vi.advanceTimersByTimeAsync(0)
++  expect(dialedRoutes()).not.toContainEqual(['local', 'default'])
++})
+diff --git a/apps/desktop/src/store/gateway-persistence.ts b/apps/desktop/src/store/gateway-persistence.ts
+index 679d8fa459d..7cee5d088bb 100644
+--- a/apps/desktop/src/store/gateway-persistence.ts
++++ b/apps/desktop/src/store/gateway-persistence.ts
+@@ -1,8 +1,9 @@
+ import { LOCAL_CONNECTION_ID } from '@hermes/shared'
+ 
+ import type { DesktopConnectionsRegistry, DesktopRegistryConnection } from '@/global'
++import { localBootstrapNeeded } from '@/lib/local-backend-probe'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+-import { liveSecondaryConnectionIds, openGatewayForAgent } from '@/store/gateway'
++import { gatewayRouteState, openGatewayForAgent } from '@/store/gateway'
+ import { keepRoute } from '@/store/gateway-kept-routes'
+ import { $primaryGatewayRoute, type PrimaryGatewayRoute } from '@/store/gateway-primary-route'
+ 
+@@ -13,6 +14,9 @@ import { $primaryGatewayRoute, type PrimaryGatewayRoute } from '@/store/gateway-
+ // rows) shows every gateway at once instead of only the one in front.
+ const HOME_PROFILE = 'default'
+ const REDIAL_INTERVAL_MS = 30_000
++// A missing This device install is re-probed this often, so one installed
++// while the window stays open still joins the kept gateways.
++const LOCAL_NOT_INSTALLED_RECHECK_MS = 10 * 60_000
+ 
+ /** The window's primary socket already holds this gateway open; a second socket
+  *  to the same backend would duplicate its event stream. */
+@@ -25,23 +29,25 @@ function servedByPrimary(connection: DesktopRegistryConnection, primary: Primary
+ }
+ 
+ /** The registry connections that need their own kept socket. */
+-export function persistentGatewayIds(
+-  registry: DesktopConnectionsRegistry | null,
+-  primary: PrimaryGatewayRoute
+-): string[] {
++function persistentGatewayIds(registry: DesktopConnectionsRegistry | null, primary: PrimaryGatewayRoute): string[] {
+   return (registry?.connections ?? []).filter(connection => !servedByPrimary(connection, primary)).map(c => c.id)
+ }
+ 
+-/** Dialing This device where Hermes is not installed would start the installer
+- *  unseen; only a confirmed click may do that. A missing probe fails closed. */
+-async function localInstalled(): Promise<boolean> {
+-  const probe = window.hermesDesktop?.probeLocalBackend
+-
+-  return probe ? (await probe()).bootstrapNeeded !== true : false
++/** A published route names the gateway the primary socket serves. Until one is
++ *  published (boot, or a primary teardown), the primary's own gateway looks
++ *  unserved and would get a duplicate socket. */
++function primaryPublished(primary: PrimaryGatewayRoute): boolean {
++  return Boolean(primary.connectionId || primary.mode)
+ }
+ 
+-async function dial(connectionId: string): Promise<void> {
+-  if (connectionId === LOCAL_CONNECTION_ID && !(await localInstalled())) {
++/** Dialing This device where Hermes is not installed would start the installer
++ *  unseen; only a confirmed click may do that. */
++async function dial(
++  connectionId: string,
++  localInstalled: () => Promise<boolean>,
++  stillWanted: () => boolean
++): Promise<void> {
++  if (connectionId === LOCAL_CONNECTION_ID && !((await localInstalled()) && stillWanted())) {
+     return
+   }
+ 
+@@ -54,8 +60,67 @@ async function dial(connectionId: string): Promise<void> {
+ export function startPersistentGateways(): () => void {
+   const pins = new Map<string, () => void>()
+ 
++  // This device's install verdict. "Installed" is re-checked before every
++  // dial (an install can go away while the window lives, and dialing it then
++  // would start the installer), while "not installed" is kept until the
++  // registry or the primary route changes or LOCAL_NOT_INSTALLED_RECHECK_MS
++  // passes, so a missing install is not re-probed every tick. Concurrent dials
++  // share one probe in flight.
++  let localProbe: Promise<boolean> | null = null
++  let localProbeExpiresAt = Infinity
++  // Bumped whenever a registry or primary-route change drops the probe: a dial
++  // that awaited a dropped probe must not act on its answer.
++  let localGeneration = 0
++
++  const localInstalled = () => {
++    if (localProbe && Date.now() >= localProbeExpiresAt) {
++      localProbe = null
++    }
++
++    if (!localProbe) {
++      const probe: Promise<boolean> = localBootstrapNeeded().then(
++        needed => {
++          // A dropped probe's answer is for its own callers only.
++          if (localProbe === probe) {
++            if (needed) {
++              localProbeExpiresAt = Date.now() + LOCAL_NOT_INSTALLED_RECHECK_MS
++            } else {
++              localProbe = null
++            }
++          }
++
++          return !needed
++        },
++        (error: unknown) => {
++          if (localProbe === probe) {
++            localProbe = null
++          }
++
++          throw error
++        }
++      )
++
++      localProbe = probe
++      localProbeExpiresAt = Infinity
++    }
++
++    return localProbe
++  }
++
++  // The probe takes time: by its answer the keeper may have stopped, released
++  // this route, lost its published primary, or dropped the probe for a newer one.
++  const stillWanted = (connectionId: string, generation: number) =>
++    generation === localGeneration && pins.has(connectionId) && primaryPublished($primaryGatewayRoute.get())
++
+   const reconcile = () => {
+-    const wanted = new Set(persistentGatewayIds($connectionsRegistry.get(), $primaryGatewayRoute.get()))
++    const primary = $primaryGatewayRoute.get()
++
++    if (!primaryPublished(primary)) {
++      return
++    }
++
++    const wanted = new Set(persistentGatewayIds($connectionsRegistry.get(), primary))
++    const generation = localGeneration
+ 
+     for (const [connectionId, release] of pins) {
+       if (!wanted.has(connectionId)) {
+@@ -64,21 +129,42 @@ export function startPersistentGateways(): () => void {
+       }
+     }
+ 
+-    const live = liveSecondaryConnectionIds()
+-
+     for (const connectionId of wanted) {
+       if (!pins.has(connectionId)) {
+         pins.set(connectionId, keepRoute(connectionId, HOME_PROFILE))
+       }
+ 
+-      if (!live.has(connectionId)) {
+-        void dial(connectionId).catch(() => undefined)
++      // The kept route itself: another profile's open socket on the same
++      // gateway does not carry this one.
++      if (!gatewayRouteState(connectionId, HOME_PROFILE).open) {
++        void dial(connectionId, localInstalled, () => stillWanted(connectionId, generation)).catch(() => undefined)
+       }
+     }
+   }
+ 
+-  const offRegistry = $connectionsRegistry.subscribe(reconcile)
+-  const offPrimary = $primaryGatewayRoute.listen(reconcile)
++  const recheckLocalAndReconcile = () => {
++    localProbe = null
++    localGeneration += 1
++    reconcile()
++  }
++
++  // Every primary reconnect republishes the same route, which says nothing new
++  // about This device; only a different route re-probes it.
++  let primaryRoute = $primaryGatewayRoute.get()
++
++  const onPrimaryRoute = (route: PrimaryGatewayRoute) => {
++    const changed = route.connectionId !== primaryRoute.connectionId || route.mode !== primaryRoute.mode
++    primaryRoute = route
++
++    if (changed) {
++      recheckLocalAndReconcile()
++    } else {
++      reconcile()
++    }
++  }
++
++  const offRegistry = $connectionsRegistry.subscribe(recheckLocalAndReconcile)
++  const offPrimary = $primaryGatewayRoute.listen(onPrimaryRoute)
+   const timer = setInterval(reconcile, REDIAL_INTERVAL_MS)
+ 
+   return () => {
+diff --git a/apps/desktop/src/store/gateway-switch.ts b/apps/desktop/src/store/gateway-switch.ts
+index 92f36ac3ff4..7cf9b3520da 100644
+--- a/apps/desktop/src/store/gateway-switch.ts
++++ b/apps/desktop/src/store/gateway-switch.ts
+@@ -52,8 +52,10 @@ export const $gatewaySwitching = atom(false)
+  * is activated or published: fresh-draft the open transcript, drop the overlay
+  * return route, reset the project tree, close terminals — everything bound to
+  * the OUTGOING backend that lives outside the session store. Registered by
+- * useGatewayBoot (whose host owns those React callbacks) so store-driven
+- * switches run the exact same reset as a Settings → Gateway apply.
++ * useGatewayBoot, whose host owns those React callbacks. Only a connection
++ * apply (Settings → Gateway, or a backend recycle) runs it. A gateway pick does
++ * not: selectConnection's beforeActivate does its own narrower draft/project
++ * reset.
+  */
+ export interface GatewaySwitchLifecycle {
+   beforeConnectionSwitch: () => void
+diff --git a/apps/desktop/src/store/gateway.ts b/apps/desktop/src/store/gateway.ts
+index 40641d6d602..38243e566dc 100644
+--- a/apps/desktop/src/store/gateway.ts
++++ b/apps/desktop/src/store/gateway.ts
+@@ -1190,7 +1190,7 @@ async function gatewayForProfile(
+       if (
+         entry.activeRequests === 0 &&
+         !entry.retained &&
+-        !relayRetained(entry) &&
++        !pinnedOpen(entry) &&
+         !foregroundPinned(entry) &&
+         g.activeKey !== entry.scope
+       ) {
+@@ -1336,7 +1336,7 @@ export async function requestGatewayForAgent<T>(
+       !drainPendingConnectionRedial(entry) &&
+       entry.activeRequests === 0 &&
+       !entry.retained &&
+-      !relayRetained(entry) &&
++      !pinnedOpen(entry) &&
+       !foregroundPinned(entry) &&
+       g.activeKey !== entry.scope
+     ) {
+@@ -1350,14 +1350,12 @@ export async function requestGatewayForAgent<T>(
+ }
+ 
+ // ── Bot-relay socket retention (#93594) ─────────────────────────────────────
+-// The desktop bot relay RPCs EVERY registered connection on its drain loop.
+-// Each of those calls runs through requestGatewayForAgent's per-request lease,
+-// so a connection with no other consumer dialed a fresh WebSocket and tore it
+-// down again on every tick — a connect/disconnect pair per connection per tick
+-// flooding the gateway logs. While the relay is active, its routes hold a
+-// counted retention that keeps the pooled socket (and its existing
+-// scheduleReconnect/backoff machinery) alive across ticks; stopBotRelay (and
+-// plugin dispose) releases it, restoring the dispose-at-refcount-0 behavior.
++// The desktop bot relay RPCs EVERY registered connection on its drain loop. Each of those calls runs
++// through requestGatewayForAgent's per-request lease, so a connection with no other consumer dialed a
++// fresh WebSocket and tore it down again on every tick — a connect/disconnect pair per connection per
++// tick flooding the gateway logs. While the relay is active, its routes hold a counted retention that
++// keeps the pooled socket (and its existing scheduleReconnect/backoff machinery) alive across ticks;
++// stopBotRelay (and plugin dispose) releases it, restoring the dispose-at-refcount-0 behavior.
+ 
+ /**
+  * True when a foreground surface (mounted tile / primary thread) is bound to
+@@ -1375,9 +1373,12 @@ function foregroundPinned(entry: Secondary): boolean {
+   return scopes.has(entry.scope) || (!entry.connectionId && scopes.has(entry.profile))
+ }
+ 
+-/** Pinned open: the bot relay holds it, or it is kept connected (gateway-kept-routes). */
+-function relayRetained(entry: Secondary): boolean {
+-  return entry.relayRetainCount > 0 || isKeptRoute(entry.connectionId, entry.profile)
++/** The bot relay holds a lease on this socket (retainGatewayForRelay); a kept route is not a lease. */
++const relayLeased = (entry: Secondary): boolean => entry.relayRetainCount > 0
++
++/** Pinned open against idle dispose: a relay lease or a kept route (gateway-kept-routes). Edits use relayLeased. */
++function pinnedOpen(entry: Secondary): boolean {
++  return relayLeased(entry) || isKeptRoute(entry.connectionId, entry.profile)
+ }
+ 
+ /**
+@@ -1388,7 +1389,7 @@ function drainPendingConnectionRedial(entry: Secondary): boolean {
+   if (
+     entry.pendingConnectionRedial !== true ||
+     entry.activeRequests > 0 ||
+-    entry.relayRetainCount > 0 ||
++    relayLeased(entry) ||
+     foregroundPinned(entry) ||
+     g.secondaries.get(entry.scope) !== entry
+   ) {
+@@ -1470,7 +1471,7 @@ export function retainGatewayForRelay(connectionId: null | string, profile: stri
+ 
+     if (
+       !drainPendingConnectionRedial(entry) &&
+-      !relayRetained(entry) &&
++      !pinnedOpen(entry) &&
+       entry.activeRequests === 0 &&
+       !entry.retained &&
+       !foregroundPinned(entry) &&
+@@ -1555,7 +1556,7 @@ export async function retainGatewayForAgent(
+     if (
+       entry.activeRequests === 0 &&
+       !entry.retained &&
+-      !relayRetained(entry) &&
++      !pinnedOpen(entry) &&
+       !foregroundPinned(entry) &&
+       g.activeKey !== entry.scope
+     ) {
+@@ -2145,7 +2146,7 @@ export function reconnectSecondaryGateways({ forceOpenSockets = false }: { force
+       // request would hang until its per-call timeout. Probe liveness instead —
+       // a healthy-but-busy backend answers and keeps its socket; a dead
+       // transport is closed and healed by the ordinary reconnect backoff.
+-      if (entry.activeRequests > 0 || relayRetained(entry) || foregroundPinned(entry)) {
++      if (entry.activeRequests > 0 || pinnedOpen(entry) || foregroundPinned(entry)) {
+         probeSecondaryLiveness(entry)
+ 
+         continue
+@@ -2247,10 +2248,10 @@ export function pruneSecondaryGateways(keep: Set<string>): void {
+       key === g.activeKey ||
+       keep.has(key) ||
+       (!entry.connectionId && keep.has(entry.profile)) ||
+-      // Bot-relay retention (#93594): the relay pins its remote routes for
+-      // its whole active lifetime; the live-work pruner must not undo that
+-      // pin between drain ticks or the socket churn returns.
+-      relayRetained(entry) ||
++      // pinnedOpen: the bot relay pins its remote routes for its active lifetime (#93594) and a
++      // kept route stays connected for the window's lifetime (gateway-kept-routes); the pruner
++      // must undo neither.
++      pinnedOpen(entry) ||
+       // A mounted tile / the primary thread is bound to a runtime on this
+       // socket (#93892) — pinned for as long as that surface is mounted.
+       foregroundPinned(entry) ||
+@@ -2407,13 +2408,12 @@ export function retireLocalProfileGateways(profile: string): void {
+   }
+ }
+ 
+-// Registry lifecycle: a connection was removed or materially edited. Removal
+-// disposes every scoped secondary immediately (a removed remote/cloud source
+-// has no local process to die, so otherwise its WebSocket streams ghost
+-// events). A material edit redials each profile through the normal open path so
+-// fresh sockets target the NEW endpoint, but request/relay leases and mounted
+-// foreground runtimes keep their old socket until they drain; the active scope
+-// re-activates when its replacement is safe to publish.
++// Registry lifecycle: a connection was removed or materially edited. Removal disposes every scoped
++// secondary immediately (a removed remote/cloud source has no local process to die, so otherwise its
++// WebSocket streams ghost events). A material edit redials each profile through the normal open path so
++// fresh sockets target the NEW endpoint, but request/relay leases and mounted foreground runtimes keep
++// their old socket until they drain (a keep pin does not: relayLeased, not pinnedOpen); the active
++// scope re-activates when its replacement is safe to publish.
+ export function disposeSecondariesForConnection(connectionId: string, opts: { redial?: boolean } = {}): void {
+   const id = String(connectionId || '').trim()
+   let activeInvalidated = false
+@@ -2443,7 +2443,7 @@ export function disposeSecondariesForConnection(connectionId: string, opts: { re
+     const wasActive = key === g.activeKey
+     activeInvalidated ||= wasActive
+ 
+-    if (opts.redial && (entry.activeRequests > 0 || entry.relayRetainCount > 0 || foregroundPinned(entry))) {
++    if (opts.redial && (entry.activeRequests > 0 || relayLeased(entry) || foregroundPinned(entry))) {
+       entry.pendingConnectionRedial = true
+ 
+       continue
+diff --git a/apps/desktop/src/store/session-pin-connection-scope.test.ts b/apps/desktop/src/store/session-pin-connection-scope.test.ts
+index 85fd41e6c39..6dc08d5ac58 100644
+--- a/apps/desktop/src/store/session-pin-connection-scope.test.ts
++++ b/apps/desktop/src/store/session-pin-connection-scope.test.ts
+@@ -14,6 +14,7 @@ vi.mock('@/hermes', () => ({
+   setSessionPinnedRemote: (id: string, pinned: boolean, profile?: null | string) => patch(id, pinned, profile)
+ }))
+ 
++import { $primaryGatewayRoute } from '@/store/gateway-primary-route'
+ import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
+ import { $sessions, setConnection } from '@/store/session'
+ 
+@@ -43,6 +44,7 @@ beforeAll(() => {
+ 
+ beforeEach(() => {
+   window.localStorage.clear()
++  $primaryGatewayRoute.set({ connectionId: null, mode: null })
+   setConnection(remote('default'))
+   $sessions.set([])
+   $pinnedSessionIds.set([])
+@@ -86,6 +88,60 @@ describe('desktop pin list is connection-scoped, not profile-scoped', () => {
+     expect($pinnedSessionIds.get()).toEqual(['b-1'])
+   })
+ 
++  it("never adopts the previous gateway's pinned rows still on screen after a pick", async () => {
++    const gateway = (connectionId: string) =>
++      ({ ...remote('default', `https://gw-${connectionId}.example`), connectionId }) as HermesConnection
++
++    setConnection(gateway('a'))
++    $sessions.set([row('only-on-a', { connection_id: 'a', pinned: true, profile: 'default' })])
++    await flush()
++    expect($pinnedSessionIds.get()).toEqual(['only-on-a'])
++
++    // A pick publishes B while A's rows are still loaded.
++    setConnection(gateway('b'))
++    await flush()
++    expect($pinnedSessionIds.get()).toEqual([])
++
++    $sessions.set([...$sessions.get(), row('b-own', { connection_id: 'b', pinned: true, profile: 'default' })])
++    await flush()
++
++    expect($pinnedSessionIds.get()).toEqual(['b-own'])
++  })
++
++  it("repaints only the active gateway's row when another gateway lists the same id", async () => {
++    setConnection({ ...remote('default', 'https://gw-b.example'), connectionId: 'b' } as HermesConnection)
++    $sessions.set([
++      row('shared', { connection_id: 'a', pinned: false, profile: 'default' }),
++      row('shared', { connection_id: 'b', pinned: false, profile: 'default' })
++    ])
++    await flush()
++
++    pinSession('shared')
++    await flush()
++
++    const pinnedById = Object.fromEntries($sessions.get().map(r => [r.connection_id, r.pinned]))
++
++    expect(pinnedById).toEqual({ a: false, b: true })
++  })
++
++  it("never adopts This device's untagged pinned rows into a remote gateway's set", async () => {
++    // This device is the primary: its rows are listed untagged.
++    $primaryGatewayRoute.set({ connectionId: 'local', mode: 'local' })
++    setConnection({ connectionId: 'local', mode: 'local', profile: 'default' } as unknown as HermesConnection)
++    $sessions.set([row('only-local', { pinned: true, profile: 'default' })])
++    await flush()
++    expect($pinnedSessionIds.get()).toEqual(['only-local'])
++
++    // Picking registry gateway B leaves the primary (and its rows) in place.
++    setConnection({ ...remote('default', 'https://gw-b.example'), connectionId: 'b' } as HermesConnection)
++    await flush()
++    expect($pinnedSessionIds.get()).toEqual([])
++
++    $sessions.set([...$sessions.get(), row('b-own', { connection_id: 'b', pinned: true, profile: 'default' })])
++    await flush()
++    expect($pinnedSessionIds.get()).toEqual(['b-own'])
++  })
++
+   it('lets an unpin survive a profile rescope instead of flushing pin=true', async () => {
+     $sessions.set([row('s1', { pinned: false, profile: 'k9' })])
+ 
+diff --git a/apps/desktop/src/store/session-pin-sync.ts b/apps/desktop/src/store/session-pin-sync.ts
+index 8495251bdab..615f3c06a89 100644
+--- a/apps/desktop/src/store/session-pin-sync.ts
++++ b/apps/desktop/src/store/session-pin-sync.ts
+@@ -23,11 +23,14 @@
+ 
+ import { atom } from 'nanostores'
+ 
++import { ambientOwnerConnectionId } from '@/api/client'
+ import { setSessionPinnedRemote } from '@/hermes'
+ import { onConnectionScopeChange } from '@/lib/connection-scoped'
++import { $primaryGatewayRoute } from '@/store/gateway-primary-route'
+ import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
+ import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+ import {
++  $connection,
+   $cronSessions,
+   $messagingSessions,
+   $sessions,
+@@ -99,8 +102,35 @@ function profileFor(pinId: string): null | string | undefined {
+   return loadedRowFor(pinId)?.profile
+ }
+ 
++/**
++ * Whether `row` lives on the gateway the pin set is scoped to.
++ *
++ * `$pinnedSessionIds` follows `$connection` (setConnection rescopes it), but
++ * the loaded slices can hold other gateways' rows: a gateway pick publishes
++ * the new connection while the previous one's rows are still painted, and
++ * kept gateways pool their rows into the same lists. Another gateway's
++ * `pinned` flag says nothing about this gateway's state.db, and a PATCH for it
++ * would ride the ambient connection to a backend that never had the row. A
++ * row with no `connection_id` belongs to the primary pool (the row stamp never
++ * tags `local` or the primary's own rows): `local` for a local primary, else
++ * the primary's registry id; a primary with no registry id keeps counting as
++ * the active backend's, as before. A descriptor that names no connection falls
++ * back to the ambient owner id (the request scope's tag, or `local` for the
++ * local pool).
++ */
++function ownedByPinScope(row: SessionInfo): boolean {
++  const primary = $primaryGatewayRoute.get()
++  const owner = row.connection_id?.trim() || (primary.mode === 'local' ? 'local' : primary.connectionId?.trim())
++
++  if (!owner) {
++    return true
++  }
++
++  return owner === ($connection.get()?.connectionId?.trim() || ambientOwnerConnectionId())
++}
++
+ function loadedSessionRows(): SessionInfo[] {
+-  return [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()]
++  return [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].filter(ownedByPinScope)
+ }
+ 
+ /**
+@@ -173,6 +203,7 @@ function applyRowPinned(pinId: string, pinned: boolean, profile?: null | string)
+         typeof row.pinned !== 'boolean' ||
+         row.pinned === pinned ||
+         !sessionMatchesStoredId(row, pinId) ||
++        !ownedByPinScope(row) ||
+         (owner != null && normalizeProfileKey(row.profile) !== owner)
+       ) {
+         return row
+diff --git a/hermes_cli/_early_recovery.py b/hermes_cli/_early_recovery.py
+index 8630b0fc699..c61c5b515ba 100644
+--- a/hermes_cli/_early_recovery.py
++++ b/hermes_cli/_early_recovery.py
+@@ -871,14 +871,13 @@ def _index_lock_holder(git_dir: Path, root: Path | None) -> str:
+     return f"a running git ({held})" if isinstance(held, _Holder) else "a running git"
+ 
+ 
+-def _release_dead_index_lock(git_dir: Path, root: Path | None = None, *, any_git: bool = False) -> bool:
+-    """Drop a killed git's ``index.lock`` (it refuses every git command) once its owner is PROVEN gone.
++def _release_dead_lock(lock: Path, root: Path | None = None, *, any_git: bool = False) -> bool:
++    """Drop a killed git's ``lock`` (``index.lock`` refuses every git command) once its owner is PROVEN gone.
+ 
+     False while a live git may hold it, or when this platform cannot prove it dead: the caller then
+     keeps the interrupted-pull marker, so the next launch tries again instead of a rollback being lost.
+     ``any_git``: every git working in ``root`` keeps it, readers included (:func:`_held_open`).
+     """
+-    lock = git_dir / "index.lock"
+     deadline = time.monotonic() + 5
+     while lock.exists():
+         held = None if sys.platform == "win32" else _held_open(lock, root, any_git=any_git)
+@@ -1135,7 +1134,7 @@ def _judge_index_lock(fields: dict[str, str], marker: Path, root: Path, *,
+     # a live `git commit` in the editor holds it with its fd closed, which only Linux can still see.
+     known_foreign = bool(fields.get("foreign_lock", "").strip()) and \
+         fields["foreign_lock"].strip() == _lock_identity(lock)
+-    index_free = foreign_lock or (not known_foreign and _release_dead_index_lock(git_dir, root))
++    index_free = foreign_lock or (not known_foreign and _release_dead_lock(lock, root))
+     return foreign_lock, known_foreign, index_free
+ 
+ 
+@@ -1280,7 +1279,7 @@ def _redo_rollback_head(git, git_dir: Path, root: Path, pre: str, mode: str, *,
+     git that exited in this very process (``after_failure``) a lock is never ours to judge.
+     """
+     lock = git_dir / "index.lock"
+-    if lock.exists() and (after_failure or not _release_dead_index_lock(git_dir, root)):
++    if lock.exists() and (after_failure or not _release_dead_lock(lock, root)):
+         return f"{_index_lock_holder(git_dir, root)} may still hold .git/index.lock"
+     if mode == "detach":
+         moved = git("update-ref", "--no-deref", "HEAD", pre)
+diff --git a/hermes_cli/gitlock.py b/hermes_cli/gitlock.py
+index ceb3ed0cd6f..a258a2be892 100644
+--- a/hermes_cli/gitlock.py
++++ b/hermes_cli/gitlock.py
+@@ -150,7 +150,14 @@ def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = N
+     Removes only when older than the age floor AND no git process is running. Never raises: a lock we cannot
+     stat/unlink is skipped (it may have been re-created between the age check and the unlink; skipping is safe).
+     """
+-    return _sweep_locks(Path(repo_root) / ".git", (*LOCK_NAMES, *OBJECT_STORE_LOCK_NAMES), min_age_seconds)
++    git_dir = Path(repo_root) / ".git"
++    return _sweep_stale(
++        git_dir, lambda: [*(git_dir / name for name in (*LOCK_NAMES, *OBJECT_STORE_LOCK_NAMES)),
++                          *ref_lock_files(git_dir)],
++        min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
++        skip_msg="git process running; skipping stale-lock sweep",
++        log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
++    )
+ 
+ 
+ def clear_stale_object_store_locks(git_dir: Path) -> list[str]:
+@@ -177,18 +184,48 @@ def release_dead_index_lock(repo_root: Path) -> bool:
+     with psutil (:func:`_windows_git_in_checkout`). Whatever cannot be read keeps the lock. An
+     interrupted tree move owns its own lock judgement, so its marker defers to that repair.
+     """
+-    from hermes_cli._early_recovery import _git_dir, _release_dead_index_lock, interrupted_pull_marker
++    return bool(_release_killed_update_locks(Path(repo_root), lambda git_dir: [git_dir / "index.lock"]))
++
++
++def ref_lock_files(git_dir: Path) -> list[Path]:
++    """The lock files of git's ref transactions: ``packed-refs.lock`` and every ``refs/**/*.lock``."""
++    refs = git_dir / "refs"
++    return [git_dir / "packed-refs.lock", *(sorted(refs.rglob("*.lock")) if refs.is_dir() else ())]
++
++
++def release_dead_fetch_locks(repo_root: Path) -> list[str]:
++    """Drop the locks a killed update's fetch left, whatever their age: ``shallow.lock`` and the ref
++    locks (:func:`ref_lock_files`).
++
++    The update's ``git fetch`` dies with its tree (``taskkill /T /F``, the Linux parent-death signal),
++    so a kill inside its ref transaction strands ``refs/remotes/origin/<branch>.lock``. Git (2.51+)
++    then rejects that ref on every later fetch as "fetching ref refs/remotes/origin/main failed:
++    reference already exists" (its batched fetch files a lock it cannot create under that reason),
++    so no update could fetch again until a user found and deleted the file (the Windows crash cell
++    ``mid_fetch``). A shallow fetch (installer checkouts are ``--depth 1``) killed in its pack
++    transfer strands ``shallow.lock`` the same way ("File exists"); a live :class:`_ShallowLock`
++    holder keeps it open, so the proofs see it. The same two proofs as
++    :func:`release_dead_index_lock`; returns the removed paths.
++    """
++    return _release_killed_update_locks(Path(repo_root), lambda git_dir: [git_dir / "shallow.lock",
++                                                                        *ref_lock_files(git_dir)])
++
++
++def _release_killed_update_locks(root: Path, candidates: Callable[[Path], Iterable[Path]]) -> list[str]:
++    from hermes_cli._early_recovery import _git_dir, _release_dead_lock, interrupted_pull_marker
+ 
+-    root = Path(repo_root)
+     git_dir = _git_dir(root)
+-    lock = git_dir / "index.lock"
+-    if not lock.exists() or interrupted_pull_marker(root).exists():
+-        return False
+-    if not _killed_update_owns(lock):
+-        return False
+-    if os.name == "nt" and _windows_git_in_checkout(root) is not False:
+-        return False
+-    return _release_dead_index_lock(git_dir, root, any_git=True)
++    if interrupted_pull_marker(root).exists():
++        return []
++    locks = [lock for lock in candidates(git_dir) if lock.exists() and _killed_update_owns(lock)]
++    if not locks or (os.name == "nt" and _windows_git_in_checkout(root) is not False):
++        return []
++    released: list[str] = []
++    for lock in locks:
++        if not _release_dead_lock(lock, root, any_git=True):
++            break  # a git works in the checkout: every lock stays
++        released.append(str(lock))
++    return released
+ 
+ 
+ def _receipt_time(value: object) -> Optional[float]:
+@@ -513,7 +550,9 @@ def _shallow_file_path(repo_root: Path) -> Optional[Path]:
+ class _ShallowLock:
+     """Git's own ``shallow.lock`` protocol, so a concurrent ``git fetch`` that
+     writes ``.git/shallow`` between our read and our write is never clobbered:
+-    the fetch fails fast on the lock and we re-read before writing."""
++    the fetch fails fast on the lock and we re-read before writing. The lock stays
++    open while held: this holder runs no git between its git calls, so the open fd
++    (an unlink refusal on Windows) is how :func:`release_dead_fetch_locks` sees it."""
+ 
+     def __init__(self, shallow_path: Path):
+         self._path = shallow_path
+@@ -528,11 +567,16 @@ class _ShallowLock:
+             raise RuntimeError(f"cannot create shallow lock: {exc}") from exc
+         try:
+             os.write(fd, b"hermes shallow maintenance\n")
+-        finally:
++        except OSError as exc:
++            # A leaked fd would read as a live holder (and pin the file on Windows).
+             os.close(fd)
++            self._lock_path.unlink(missing_ok=True)
++            raise RuntimeError(f"cannot write shallow lock: {exc}") from exc
++        self._fd = fd
+         return self
+ 
+     def __exit__(self, *exc_info) -> None:
++        os.close(self._fd)
+         try:
+             self._lock_path.unlink()
+         except FileNotFoundError:
+diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
+index f55a6589bce..02346e4a154 100644
+--- a/hermes_cli/update_cmd.py
++++ b/hermes_cli/update_cmd.py
+@@ -1831,10 +1831,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
+     # fail with "File exists" until an operator removed the lock by hand (#132089). Idempotent,
+     # and _sweep_stale skips everything while a git process holds it. A killed update's
+     # index.lock is younger than the sweep's age floor, so it goes here once its git is proven
+-    # dead (we hold the update lock: no other update's git can own it).
+-    from hermes_cli.gitlock import release_dead_index_lock
++    # dead (we hold the update lock: no other update's git can own it). Its killed fetch's ref
++    # and shallow locks likewise, or every later fetch fails ("reference already exists").
++    from hermes_cli.gitlock import release_dead_fetch_locks, release_dead_index_lock
+     if release_dead_index_lock(_m().PROJECT_ROOT):
+         print("  (removed .git/index.lock left by a git that was killed)")
++    for lock in release_dead_fetch_locks(_m().PROJECT_ROOT):
++        print(f"  (removed {lock} left by a git that was killed)")
+     _check.clear_git_debris(_m().PROJECT_ROOT)
+ 
+     opts = _resolve_update_options(args, gateway_mode)
+diff --git a/hermes_cli/update_custody.py b/hermes_cli/update_custody.py
+index b272425d93f..d7bcc65888d 100644
+--- a/hermes_cli/update_custody.py
++++ b/hermes_cli/update_custody.py
+@@ -14,7 +14,8 @@ can still write the checkout, and must NOT leak into processes that outlive the
+   needs as a child holding the fd (and start the daemon under it), so before a move the objects
+   are fetched without the fd and with the user's helpers (:func:`_prefetch_for_move`); a lazy
+   fetch the prefetch missed still runs, just without a helper. A killed fetch that leaves
+-  ``*.lock`` ref files is recovered by the stale-lock rules (``gitlock.clear_stale_git_locks``).
++  ``*.lock`` ref files or ``shallow.lock`` is recovered by the stale-lock rules (``gitlock.release_dead_fetch_locks``
++  once its update is proven dead, ``gitlock.clear_stale_git_locks`` by age otherwise).
+ * Windows has no fd inheritance: while this process holds (or joined) the checkout lock, every
+   child started here is created SUSPENDED, assigned to the update's kill-on-close job and only
+   then resumed, so it and everything it spawns die with the lock owner. The Node build goes
+diff --git a/skills/autonomous-ai-agents/hermes-agent/SKILL.md b/skills/autonomous-ai-agents/hermes-agent/SKILL.md
+index a1d3b854e4d..9b9bb8dd96a 100644
+--- a/skills/autonomous-ai-agents/hermes-agent/SKILL.md
++++ b/skills/autonomous-ai-agents/hermes-agent/SKILL.md
+@@ -1,7 +1,7 @@
+ ---
+ name: hermes-agent
+ description: "Use, configure, theme, extend, and orchestrate Hermes Agent."
+-version: 3.2.0
++version: 3.3.0
+ author: Hermes Agent + Teknium
+ license: MIT
+ platforms: [linux, macos, windows]
+@@ -97,6 +97,7 @@ Profiles use `~/.hermes/profiles/<name>/` with the same layout. When a profile i
+ | AGENTS.md / .hermes.md / CLAUDE.md project rules | `references/project-context-files.md` |
+ | Secret redaction, PII, approval modes, "reset permissions" | `references/security-privacy.md` |
+ | Delegation, cron, curator, kanban | `references/background-systems.md` |
++| `hermes project` workspaces, multi-folder projects, desktop sidebar groups | `references/projects-and-folders.md` |
+ | MCP servers (add, catalog, `hermes mcp`) | `references/native-mcp.md` |
+ | Webhook routes and event-driven runs | `references/webhooks.md` |
+ | A custom theme/skin ("synthwave theme", "change the gold ●") | `references/themes.md` + `templates/skin.yaml` |
+diff --git a/skills/autonomous-ai-agents/hermes-agent/references/background-systems.md b/skills/autonomous-ai-agents/hermes-agent/references/background-systems.md
+index efb1ae2497f..8fd32fbcacc 100644
+--- a/skills/autonomous-ai-agents/hermes-agent/references/background-systems.md
++++ b/skills/autonomous-ai-agents/hermes-agent/references/background-systems.md
+@@ -98,4 +98,6 @@ sessions still have zero `kanban_*` schema footprint unless configured.
+   `HERMES_KANBAN_BOARD` pinned in env); tenant is a soft namespace
+   within a board for workspace-path + memory-key isolation.
+ 
++Project-linked tasks (worktree + branch by default under a Project's primary folder, when it has one):
++`references/projects-and-folders.md`.
+ User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
+diff --git a/skills/autonomous-ai-agents/hermes-agent/references/cli-reference.md b/skills/autonomous-ai-agents/hermes-agent/references/cli-reference.md
+index ec8b1b8a17d..f336c9c69d5 100644
+--- a/skills/autonomous-ai-agents/hermes-agent/references/cli-reference.md
++++ b/skills/autonomous-ai-agents/hermes-agent/references/cli-reference.md
+@@ -121,7 +121,7 @@ hermes dashboard            Web admin panel + embedded chat (--stop / --status)
+ hermes proxy                OpenAI-compatible local proxy backed by an OAuth provider
+ hermes portal               Quick setup / sign in via Nous Portal
+ hermes kanban <verb>        Multi-agent work-queue board
+-hermes project              Named multi-folder workspaces
++hermes project              Named multi-folder workspaces (see references/projects-and-folders.md)
+ hermes skin list|use|set    Switch/tweak skins (see references/themes.md)
+ hermes pets <verb>          Pet mascots (see references/petdex.md)
+ hermes memory setup|status|off|reset   Memory provider
+diff --git a/skills/autonomous-ai-agents/hermes-agent/references/projects-and-folders.md b/skills/autonomous-ai-agents/hermes-agent/references/projects-and-folders.md
+new file mode 100644
+index 00000000000..5125fc71142
+--- /dev/null
++++ b/skills/autonomous-ai-agents/hermes-agent/references/projects-and-folders.md
+@@ -0,0 +1,146 @@
++# Projects and folders (`hermes project`)
++
++A **Project** is a named workspace that can span several folders — a repo, a monorepo, a
++scratch directory, a sibling repo you always open together. Projects are the named
++workspaces the desktop sidebar groups chats by, and a kanban task linked to a project with a
++primary folder defaults to a worktree and branch under that repo.
++
++Projects are **not** git concepts and not config keys: they live in their own SQLite store,
++one per profile (`$HERMES_HOME/projects.db`; `~/.hermes` by default, `%LOCALAPPDATA%\hermes`
++on Windows), created on first use. `hermes -p <profile> project list` shows another
++profile's projects.
++
++## Command surface
++
++`hermes project <sub> --help` is authoritative for flags.
++
++| Subcommand | What it does |
++|---|---|
++| `create <name> [folders...]` | New project. First folder becomes the primary; `--slug`, `--primary PATH`, `--description`, `--icon`, `--color`, `--board SLUG`, `--use` (make it active). |
++| `list` (alias `ls`) | Projects, oldest first; `*` marks the active one; `--all` includes archived. |
++| `show <project>` | Slug, id, name, about/board/primary, folder list (`*` = primary). |
++| `add-folder <project> <path>` | Add a folder; `--label`, `--primary` (make it primary). |
++| `remove-folder <project> <path>` | Drop a folder (repoints primary if it was primary). |
++| `rename <project> <name>` | Change the display name. The slug does **not** change. |
++| `set-primary <project> <path>` | Primary folder; the path must already be in the project. |
++| `use [<project>]` | Set the active project; with no argument, clear it. |
++| `archive <project>` / `restore <project>` | Hide / unhide a project (reversible; nothing on disk moves). |
++| `bind-board <project> [<board>]` | Record a kanban board on the project; omit the board to unbind (see Kanban below). |
++
++`<project>` is an id (`p_1a2b3c4d`, exact) or a slug (any case). The CLI does **not**
++accept the display name; get the slug from `hermes project list`.
++
++## Semantics worth knowing
++
++- **Slug** — derived from the name (lowercased, runs of non-alphanumerics collapse to `-`,
++  capped at 64 chars) unless `--slug` is given. An invalid `--slug` exits **2**. A slug that
++  is already taken gets a suffix (`team-docs-2`, …), an explicit `--slug` included, so read
++  the slug back from the `Created project <slug>` line.
++- **Folders** — stored as absolute paths; `~`, relative paths and trailing slashes are
++  normalized on every command. Paths are not checked or created. The primary is the first
++  folder given, or `--primary`; it anchors kanban worktrees and the folder a desktop chat
++  moves to.
++- **One project per primary folder** — `create` refuses a primary path that is already the
++  primary of another (non-archived) project (`folder already belongs to project '<slug>'
++  …`). Two projects owning one path produce duplicate sidebar subtrees.
++- **Active project** — one per-profile pointer that `use` sets and clears: the `*` in
++  `hermes project list` and the highlighted project in the desktop sidebar. It is a marker,
++  not a scope: kanban tasks and chat workspaces do not follow it.
++- **Archived projects** are hidden from `list` (use `--all`) and stop claiming their folders
++  for path → project resolution; they still resolve by id or slug.
++- **Path → project resolution** — a folder owns itself and everything under it, and the
++  longest matching folder wins, so a nested project resolves to the innermost one.
++- **Deleting** — the CLI has no delete; `archive` is the reversible way to retire a project.
++  The desktop app's project menu deletes the project record permanently (folders on disk and
++  chats are kept).
++- **Exit codes** — `0` ok; `1` no such project, or the path is not a folder of that project
++  (`remove-folder`, `set-primary`); `2` invalid input (bad slug or board slug, empty name,
++  duplicate primary folder, bad arguments).
++
++## What projects actually drive
++
++- **Desktop sidebar grouping.** A chat's workspace (its cwd) resolves to the owning project
++  by the path rule above, and the TUI status line and desktop status bar name it. The
++  sidebar also shows automatic groups for repos and folders that are not projects (absent
++  from `hermes project list`); setting a color or icon on one turns it into a real project.
++- **The `desktop_project` tool** (toolset `project`, folded in by the desktop/TUI gateway;
++  not in the default CLI or messaging toolsets). `action: create|switch|list` with `name` /
++  `path`; unlike the CLI it also matches display names, and archived projects. In a live
++  desktop/TUI chat, `create` and `switch` move *that chat's* workspace to the project's
++  primary folder and the sidebar follows — the intended way to move a chat between projects,
++  not `cd`. The tool itself leaves the active-project pointer (the shared sidebar selection)
++  alone, though the desktop sidebar following the chat you are viewing can select the new
++  project; a project with no folders cannot move the chat, so it sets the pointer instead. A
++  primary folder that does not exist on disk is skipped silently: the call succeeds but the
++  chat stays put. `create` with a `path` that is already another project's primary reuses
++  that project instead of failing.
++- **Kanban.** A task is linked to a project when it is created with
++  `hermes kanban create … --project <id-or-slug>`, or when its board is bound to the project
++  in the kanban dashboard (the board's Project selector); tasks on such a board inherit the
++  project unless created with `--workspace scratch`. A linked task whose project has a
++  primary folder defaults to a worktree at `<primary>/.worktrees/<task-id>` on branch
++  `<project-slug>/<task-id>[-<title-slug>]` instead of the generic `wt/<task-id>`; the
++  primary must be a git repo when the worker starts. An unknown `--project` value does not
++  fail: the task is created unlinked.
++  `hermes project bind-board` does not set that board binding. It records the board on the
++  project and, when the board exists and the project has a primary folder, sets the board's
++  default workdir to it (from the CLI only a bare `--workspace worktree` task uses it; the
++  dashboard's new-task form pre-selects a worktree or dir task there);
++  a binding made in the dashboard is left as it was. Unbinding (`bind-board <project>` with
++  no board) clears only the project's record; the board keeps its default workdir and any
++  dashboard binding.
++
++## Common tasks
++
++```bash
++# Make a project for a repo and start using it
++hermes project create "Hermes Agent" ~/Work/hermes-agent --use
++
++# A workspace spanning two repos (first given = primary)
++hermes project create "Payments" ~/Work/payments-api ~/Work/payments-web
++
++# Add a folder later / move the primary
++hermes project add-folder payments ~/Work/payments-infra --label infra
++hermes project set-primary payments ~/Work/payments-web
++
++# What is active (archived included), and what a project contains
++hermes project list --all
++hermes project show payments
++
++# Retire one without losing it
++hermes project archive payments        # hidden from list / path resolution
++hermes project restore payments
++
++# A project-linked kanban task (worktree + deterministic branch)
++hermes kanban create "Wire the webhook" --project payments
++```
++
++## Troubleshooting
++
++- **`no such project: <Name>`** — the CLI takes an id or slug, not the display name.
++- **Kanban task has no `project_id` / branch** — `--project` did not match an id or slug in
++  this profile (no error is raised), or the board was only bound with
++  `hermes project bind-board`. Pass a valid `--project <slug>`, or bind the board to the
++  project in the kanban dashboard. A `project_id` with no branch on a non-`dir` task means the
++  project has no primary folder
++  (`hermes project add-folder <project> <path> --primary`).
++- **"switched project but this chat didn't move"** — `hermes project use` only moves the
++  pointer. Switch from inside the chat (the `desktop_project` tool), or start the chat in the
++  project's folder; check that the primary folder exists.
++- **`create` refused: folder already belongs to project X** — the folder is already X's
++  primary (possibly an automatic sidebar group that was given a color or icon). Use X
++  (`hermes project show X`, `rename` it if the name is wrong) rather than adding the folder
++  to a second project.
++- **A project's folders look "unprojected"** — the project is archived;
++  `hermes project restore <project>`.
++- **Two profiles show different projects** — expected: `projects.db` is per profile.
++
++## See also
++
++- `references/cli-reference.md` — `hermes project` in the CLI command map.
++- `references/background-systems.md` — kanban overview.
++- `references/project-context-files.md` — a different feature: `AGENTS.md` / `.hermes.md` /
++  `CLAUDE.md` instruction files that load into a session.
++- https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban#managing-boards-from-the-dashboard
++  (board ↔ project binding) and
++  https://hermes-agent.nousresearch.com/docs/reference/cli-commands#hermes-project
+diff --git a/tests-js/scripts/desktop-chat-smoke.ts b/tests-js/scripts/desktop-chat-smoke.ts
+index 528d0103791..4363a0a3690 100644
+--- a/tests-js/scripts/desktop-chat-smoke.ts
++++ b/tests-js/scripts/desktop-chat-smoke.ts
+@@ -122,8 +122,15 @@ export async function waitForChatReady(page: Page, timeoutMs = 120_000): Promise
+   try {
+     await composer.waitFor({ state: 'visible', timeout: timeoutMs })
+     await expect(composer).toBeEditable({ timeout: timeoutMs })
+-    // Trial input checks hit testing, not merely a non-zero box behind the boot overlay.
+-    await composer.click({ trial: true, timeout: timeoutMs })
++    // Hit-test without scrolling: the composer's centre must reach the composer,
++    // not the boot/onboarding overlay. Never use a Playwright pointer action on
++    // the composer: its actionability step calls scrollIntoView (and its retries
++    // cycle end/center/start alignment), which scrolls the app's overflow-hidden
++    // ancestors. The v0.19.1 desktop's chat surface scrolled that way stays
++    // displaced, so its composer was never hittable again (every retry hit
++    // <html>, the chat surface or the composer dock, with this poll already true).
++    await expect.poll(async (): Promise<boolean> => composer.evaluate(composerIsTopmost), { timeout: timeoutMs })
++      .toBe(true)
+   } catch (error) {
+     throw new Error(`${(error as Error).message} -- composer not interactable `
+       + `(composer-root=${await root.count()}, contenteditable=${await root.locator('[contenteditable]').count()}): `
+@@ -133,6 +140,35 @@ export async function waitForChatReady(page: Page, timeoutMs = 120_000): Promise
+   return composer
+ }
+ 
++/** Runs in the page: the composer's centre hits the composer, not an overlay. */
++function composerIsTopmost(el: Element): boolean {
++  const box = el.getBoundingClientRect()
++  const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)
++
++  return hit !== null && el.contains(hit)
++}
++
++/** Runs in the page: keyboard input will reach the composer. */
++function composerHasFocus(el: Element): boolean {
++  return document.activeElement !== null && el.contains(document.activeElement)
++}
++
++/**
++ * Focus the hit-tested composer without scrolling. A pointer click (page.mouse
++ * or locator.click) did not reliably focus the v0.19.1 editor, and locator
++ * actions scroll the app (see waitForChatReady); focus({ preventScroll }) does
++ * neither, and the topmost check still proves a user could reach it.
++ */
++async function focusComposer(composer: Locator): Promise<void> {
++  await expect.poll(async (): Promise<boolean> => composer.evaluate(composerIsTopmost), {
++    timeout: 15_000, message: 'The composer must be the topmost element at its centre before typing',
++  }).toBe(true)
++  await composer.evaluate((el: Element): void => { (el as HTMLElement).focus({ preventScroll: true }) })
++  await expect.poll(async (): Promise<boolean> => composer.evaluate(composerHasFocus), {
++    timeout: 15_000, message: 'The composer must hold focus before typing',
++  }).toBe(true)
++}
++
+ /** What the composer actually contains, for a failure that explains itself. */
+ async function composerDiagnostics(root: Locator): Promise<string> {
+   try {
+@@ -285,25 +321,27 @@ export async function runDesktopChatSmoke(page: Page, options: DesktopChatSmokeO
+     if (expectCommit) { assertChatCommit(identity, expectCommit, options.provenanceCommit, options.reusedBuildCommit) }
+     const beforeIds = (await readTranscript(page)).map((message: TranscriptMessage): string => message.id)
+     const before = (await observe()).length
+-    await composer.click()
++    await focusComposer(composer)
+     // The app persists its composer draft across launches, so a checkpoint that
+     // types on top of a restored draft can submit the PREVIOUS checkpoint's text
+     // (proved: the update window's turn carried the root checkpoint's prompt) and
+     // the witness never matches. Clear it deliberately and refuse to type until
+     // the composer is provably empty.
+-    await composer.press('ControlOrMeta+A')
+-    await composer.press('Delete')
++    // page.keyboard types into the focused composer; locator.press/pressSequentially
++    // would call element.focus() first, which can scroll the old layout too.
++    await page.keyboard.press('ControlOrMeta+A')
++    await page.keyboard.press('Delete')
+     await expect.poll(async (): Promise<string> => composerText(composer), {
+       timeout: 15_000, message: 'The composer must be empty before the checkpoint types (a restored draft must not survive)',
+     }).toBe('')
+-    await composer.pressSequentially(prompt)
++    await page.keyboard.type(prompt)
+     // The composer clears on submit whether or not a turn was ever started, so
+     // the clear-poll below passes vacuously when the editor refused the input.
+     // Prove the typing landed before trusting anything downstream of Enter.
+     await expect.poll(async (): Promise<string> => composerText(composer), {
+       timeout: 15_000, message: 'The composer must hold the typed prompt before Enter (did the editor accept input?)',
+     }).toContain(prompt)
+-    await composer.press('Enter')
++    await page.keyboard.press('Enter')
+     await expect.poll(async (): Promise<string> => composerText(composer),
+     { timeout: 90_000, message: 'The submitted draft must clear before the idle control proves completion' }).toBe('')
+     let witnessIndex = -1
+diff --git a/tests/e2e/core/upgrade/git/test_killed_fetch_ref_lock.py b/tests/e2e/core/upgrade/git/test_killed_fetch_ref_lock.py
+new file mode 100644
+index 00000000000..1b154e78bbb
+--- /dev/null
++++ b/tests/e2e/core/upgrade/git/test_killed_fetch_ref_lock.py
+@@ -0,0 +1,79 @@
++"""A real ``hermes update`` killed inside its fetch's ref transaction, then the user's next update.
++
++Failure class: the Windows crash cell ``mid_fetch`` (``tests/e2e/core/windows_update``) kills the
++update's tree while its ``git fetch`` runs. When the kill lands while git holds
++``refs/remotes/origin/main.lock``, that file outlives git, and git 2.51+ rejects the ref on every
++later fetch: "fetching ref refs/remotes/origin/main failed: reference already exists". No update
++could fetch again until a user found and deleted the file.
++
++Here the kill point is deterministic: git's own ``reference-transaction`` hook (in the checkout's
++``.git/hooks``, nothing in the product) holds the fetch in the ``prepared`` state, when every ref
++lock of the transaction is taken. The whole sandboxed update tree is then SIGKILLed (a closed
++console, ``taskkill /T /F``), and the next plain ``hermes update`` of the same home must complete
++to the target.
++"""
++
++from __future__ import annotations
++
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from tests.e2e.core.upgrade import _helpers as H
++from tests.e2e.core.upgrade import _install_helpers as I
++from tests.e2e.core.upgrade.git.test_hostile_lock import Rig, _finish
++
++pytestmark = [
++    pytest.mark.platforms("linux"),
++    pytest.mark.live_system_guard_bypass,
++    pytest.mark.skipif(H.sandbox_required_reason() is not None, reason=str(H.sandbox_required_reason())),
++]
++
++HOOK = """#!/bin/sh
++input=$(cat)
++case "$1:$input" in
++  prepared:*refs/remotes/origin/main*)
++    if [ -e "{hold}" ]; then
++      : > "{held}"
++      while [ -e "{hold}" ]; do sleep 0.05; done
++    fi ;;
++esac
++"""
++
++
++def test_an_update_killed_holding_its_fetchs_ref_lock_does_not_block_the_next(tmp_path):
++    rig = Rig(tmp_path)
++    origin = Path(I.git("remote", "get-url", "origin", cwd=rig.checkout))
++    tree = I.git("rev-parse", "main^{tree}", cwd=origin)
++    target = I.git("-c", "user.name=e2e", "-c", "user.email=e2e@example.invalid", "commit-tree", tree, "-p", "main", "-m", "next release", cwd=origin)
++    I.git("update-ref", "refs/heads/main", target, cwd=origin)
++    hold, held = tmp_path / "hold-ref-transaction", tmp_path / "held-ref-transaction"
++    hook = rig.checkout / ".git" / "hooks" / "reference-transaction"
++    hook.write_text(HOOK.format(hold=hold, held=held), encoding="utf-8")
++    hook.chmod(0o755)
++    lock = rig.checkout / ".git" / "refs" / "remotes" / "origin" / "main.lock"
++
++    hold.touch()
++    # Rig.update's process is not a group leader, so H.kill_tree could not reach it.
++    first = subprocess.Popen(
++        H.sandbox_argv([sys.executable, "-m", "hermes_cli.main", "update", "--yes", "--branch", "main",
++                        "--no-gateway-restart"], writable=[tmp_path]),
++        env=rig.env("home-a"), cwd=rig.checkout, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT, text=True, start_new_session=True)
++    try:
++        H.wait_for(lambda: held.exists() or first.poll() is not None, timeout=240,
++                   what="the update's fetch to reach its ref transaction")
++        assert first.poll() is None, f"the update exited before its fetch locked the ref:\n{first.communicate()[0][-4000:]}"
++        assert lock.exists(), "premise: the held fetch holds refs/remotes/origin/main.lock"
++    finally:
++        H.kill_tree(first)
++        first.communicate()
++        hold.unlink()
++    assert lock.exists(), "premise: the killed fetch left its ref lock behind"
++
++    code, out = _finish(rig.update("home-a"), timeout=600)
++    head = I.git("rev-parse", "HEAD", cwd=rig.checkout)
++    assert code == 0 and head == target, f"the update after the killed one did not complete (rc={code}, HEAD {head}):\n{out[-6000:]}"
++    assert not lock.exists()
+diff --git a/tests/hermes_cli/test_gitlock.py b/tests/hermes_cli/test_gitlock.py
+index 58e1a055de6..469f7b62fab 100644
+--- a/tests/hermes_cli/test_gitlock.py
++++ b/tests/hermes_cli/test_gitlock.py
+@@ -634,3 +634,146 @@ def test_a_failed_retry_never_erases_the_killed_updates_claim(repo: Path) -> Non
+ 
+     assert release_dead_index_lock(repo) is True
+     assert not lock.exists()
++
++
++# ---- a killed fetch's ref lock (Windows crash cell mid_fetch: "reference already exists") ----
++
++# Git's own hook: it runs while the fetch holds its ref locks ("prepared") and waits for a release
++# file, so the kill lands inside the ref transaction instead of wherever a timer happens to be.
++_HOLD_IN_REF_TRANSACTION = """#!/bin/sh
++input=$(cat)
++case "$1:$input" in
++  prepared:*refs/remotes/origin/main*)
++    dir=$(git rev-parse --git-dir)  # once: a git spawned in the loop would be a live git here
++    : > "$dir/held"
++    while [ ! -e "$dir/release" ]; do sleep 0.05; done ;;
++esac
++"""
++
++
++_FETCH = ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "fetch", "origin",
++          "+refs/heads/main:refs/remotes/origin/main"]
++
++
++def _fetch(clone: Path) -> subprocess.CompletedProcess:
++    return subprocess.run(_FETCH, cwd=clone, capture_output=True, text=True, encoding="utf-8", check=False)
++
++
++@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="ownership proof via /proc (Linux)")
++def test_a_killed_fetchs_ref_lock_goes_and_the_next_fetch_lands(repo: Path, tmp_path: Path) -> None:
++    """A fetch killed inside its ref transaction strands ``refs/remotes/origin/main.lock`` and git
++    then refuses every later fetch ("reference already exists"): the next update must drop that
++    lock once its killed run's git is gone, and never while the fetch still runs."""
++    from hermes_cli.gitlock import release_dead_fetch_locks
++
++    clone = tmp_path / "clone"
++    subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
++    subprocess.run(["git", "clone", "-q", f"file://{repo}", str(clone)], check=True)
++    subprocess.run(["git", "-c", "maintenance.auto=false", "commit", "-q", "--allow-empty", "-m", "next"],
++                   cwd=repo, check=True)
++    git_dir = clone / ".git"
++    hook = git_dir / "hooks" / "reference-transaction"
++    hook.write_text(_HOLD_IN_REF_TRANSACTION, encoding="utf-8")
++    hook.chmod(0o755)
++    lock = git_dir / "refs" / "remotes" / "origin" / "main.lock"
++    _killed_update_receipt()
++    err = tmp_path / "fetch.err"  # a file, not a pipe: the hook inherits it and outlives the killed git
++    with err.open("w", encoding="utf-8") as sink:
++        proc = subprocess.Popen(_FETCH, cwd=clone, stdout=subprocess.DEVNULL, stderr=sink)
++    try:
++        deadline = time.monotonic() + 30
++        while not (git_dir / "held").exists():
++            assert proc.poll() is None and time.monotonic() < deadline, \
++                f"the fetch never reached its ref transaction: {err.read_text(encoding='utf-8')}"
++            time.sleep(0.05)
++        assert lock.exists(), "premise: the held fetch holds its ref lock"
++        assert release_dead_fetch_locks(clone) == [] and lock.exists(), "the reclaim took a live fetch's lock"
++    finally:
++        proc.kill()
++        proc.wait()
++        (git_dir / "release").touch()  # the hook (not a git) exits; the dead fetch's lock stays
++
++    hook.unlink()
++
++    stuck = _fetch(clone)  # git 2.51+: "reference already exists"; older git: "...main.lock': File exists"
++    assert stuck.returncode != 0 and "origin/main" in stuck.stderr, f"premise: {stuck.stderr}"
++    assert release_dead_fetch_locks(clone) == [str(lock)]
++    landed = _fetch(clone)
++    assert landed.returncode == 0, landed.stderr
++    tips = [subprocess.run(["git", "rev-parse", ref], cwd=cwd, capture_output=True, text=True, check=True).stdout
++            for cwd, ref in ((clone, "refs/remotes/origin/main"), (repo, "HEAD"))]
++    assert tips[0] == tips[1]
++
++
++# ---- a killed shallow fetch's shallow.lock (installer checkouts are `--depth 1`) ----
++
++# Upload-pack's pack-objects hook (honored from global config only) runs after the server sent
++# its shallow-info, so the client already holds shallow.lock: the kill lands in the pack transfer.
++_HOLD_IN_PACK_TRANSFER = """#!/bin/sh
++: > "{held}"
++while [ ! -e "{release}" ]; do sleep 0.05; done
++exec "$@"
++"""
++
++
++@pytest.mark.platforms("linux")
++def test_a_killed_shallow_fetchs_shallow_lock_goes_and_the_next_fetch_lands(repo: Path, tmp_path: Path) -> None:
++    """A ``--depth 1`` fetch killed mid-transfer strands ``.git/shallow.lock`` and git refuses every
++    later fetch ("shallow.lock': File exists") until the age sweep: the next update drops it once
++    its killed run's git is gone, never while the fetch still runs."""
++    from tests.waiting import wait_until
++
++    from hermes_cli.gitlock import release_dead_fetch_locks
++
++    clone = tmp_path / "clone"
++    subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
++    subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(clone)], check=True)
++    subprocess.run(["git", "-c", "maintenance.auto=false", "commit", "-q", "--allow-empty", "-m", "next"],
++                   cwd=repo, check=True)
++    held, release = tmp_path / "held", tmp_path / "release"
++    hook = tmp_path / "pack-objects-hook"
++    hook.write_text(_HOLD_IN_PACK_TRANSFER.format(held=held, release=release), encoding="utf-8")
++    hook.chmod(0o755)
++    config = tmp_path / "gitconfig"
++    config.write_text(f"[uploadpack]\n\tpackObjectsHook = {hook}\n", encoding="utf-8")
++    fetch = ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "fetch", "--depth", "1", "origin",
++             "+refs/heads/main:refs/remotes/origin/main"]
++    lock = clone / ".git" / "shallow.lock"
++    _killed_update_receipt()
++    err = tmp_path / "fetch.err"
++    with err.open("w", encoding="utf-8") as sink:
++        proc = subprocess.Popen(fetch, cwd=clone, env={**os.environ, "GIT_CONFIG_GLOBAL": str(config)},
++                                stdout=subprocess.DEVNULL, stderr=sink)
++    try:
++        def reached_pack_transfer() -> bool:
++            assert proc.poll() is None, f"the fetch exited early: {err.read_text(encoding='utf-8')}"
++            return held.exists()
++
++        wait_until(reached_pack_transfer, timeout=30, what="the fetch reaching its pack transfer")
++        assert lock.exists(), "premise: the shallow fetch holds shallow.lock"
++        assert release_dead_fetch_locks(clone) == [] and lock.exists(), "the reclaim took a live fetch's lock"
++    finally:
++        proc.kill()
++        proc.wait()
++        release.touch()  # the server side (working in repo, not the clone) finishes and exits
++
++    stuck = subprocess.run(fetch, cwd=clone, capture_output=True, text=True, encoding="utf-8", check=False)
++    assert stuck.returncode != 0 and "shallow.lock" in stuck.stderr, f"premise: {stuck.stderr}"
++    assert release_dead_fetch_locks(clone) == [str(lock)]
++    landed = subprocess.run(fetch, cwd=clone, capture_output=True, text=True, encoding="utf-8", check=False)
++    assert landed.returncode == 0, landed.stderr
++    tips = [subprocess.run(["git", "rev-parse", ref], cwd=cwd, capture_output=True, text=True, check=True).stdout
++            for cwd, ref in ((clone, "refs/remotes/origin/main"), (repo, "HEAD"))]
++    assert tips[0] == tips[1]
++
++
++@pytest.mark.platforms("linux")
++def test_a_live_hermes_shallow_lock_holder_keeps_its_lock(repo: Path) -> None:
++    """Hermes's own ``_ShallowLock`` holder runs no git between its git calls: the reclaim must
++    still see it (it keeps the lock open), even after a killed update."""
++    from hermes_cli.gitlock import _ShallowLock, release_dead_fetch_locks
++
++    _killed_update_receipt()
++    with _ShallowLock(repo / ".git" / "shallow"):
++        assert release_dead_fetch_locks(repo) == []
++        assert (repo / ".git" / "shallow.lock").exists()
+diff --git a/tests/install/e2e-assets/source_driver.py b/tests/install/e2e-assets/source_driver.py
+index 3ae2c13dfd8..cf8e9319783 100644
+--- a/tests/install/e2e-assets/source_driver.py
++++ b/tests/install/e2e-assets/source_driver.py
+@@ -14,12 +14,21 @@ import subprocess
+ import sys
+ 
+ 
++def _live_app_dirs(app: Path, patterns: tuple[str, ...]) -> list[Path]:
++    # electron-builder's appOutDir names (win-unpacked, linux-arm64-unpacked,
++    # mac-arm64) never hold a dot; rollback copies beside them do: a raw
++    # Windows pack's before-pack keeps `<appOutDir>.bak`, which a later
++    # stage-and-swap update leaves alone, and the swap's `.previous` aside.
++    # The product never launches those, so neither may the verifier judge them.
++    return [path for pattern in patterns for path in app.glob(pattern)
++            if "." not in path.relative_to(app / "release").parts[0]]
++
++
+ def desktop_outputs(root: Path) -> list[Path]:
+-    desktop = root / "apps/desktop"
+-    return [path for pattern in (
++    return _live_app_dirs(root / "apps/desktop", (
+         "release/*/resources/app.asar.unpacked/dist",
+         "release/mac*/Hermes.app/Contents/Resources/app.asar.unpacked/dist",
+-    ) for path in desktop.glob(pattern)]
++    ))
+ 
+ 
+ def verify_products(root: Path, desktop: str, node: Path | None = None) -> None:
+@@ -31,10 +40,10 @@ def verify_products(root: Path, desktop: str, node: Path | None = None) -> None:
+     if desktop == "present":
+         if not outputs or not any((out / "index.html").is_file() for out in outputs):
+             raise RuntimeError("desktop packaged renderer is missing or incomplete")
+-        executables = [path for pattern in (
++        executables = [path for path in _live_app_dirs(app, (
+             "release/*/Hermes.exe", "release/*/Hermes", "release/*/hermes",
+             "release/mac*/Hermes.app/Contents/MacOS/Hermes",
+-        ) for path in app.glob(pattern) if path.is_file() and path.stat().st_size]
++        )) if path.is_file() and path.stat().st_size]
+         if not executables:
+             raise RuntimeError("desktop executable is missing or empty")
+     if node is None:
+diff --git a/tests/scripts/test_source_driver.py b/tests/scripts/test_source_driver.py
+index 21d8b3ff8c5..cf6e28ea7f2 100644
+--- a/tests/scripts/test_source_driver.py
++++ b/tests/scripts/test_source_driver.py
+@@ -137,6 +137,28 @@ def test_observer_preserves_no_desktop_and_refuses_incomplete_app(tmp_path):
+     assert (release / "hermes").read_bytes() == b"incomplete fixture"
+ 
+ 
++def test_observer_judges_only_the_live_app_not_rollback_copies_beside_it(tmp_path):
++    # An update from a release whose raw Windows pack kept release/win-unpacked.bak
++    # (the stage-and-swap promotion never touches it) must be judged on the live
++    # win-unpacked the product launches; a rollback copy alone is no desktop at all.
++    driver = runpy.run_path(str(ASSETS / "source_driver.py"))
++    release = tmp_path / "source/apps/desktop/release"
++    for name in ("win-unpacked", "win-unpacked.bak", "win-unpacked.previous", "mac-arm64.previous"):
++        dist = release / name / "resources/app.asar.unpacked/dist"
++        dist.mkdir(parents=True)
++        (dist / "index.html").write_text("<html></html>", encoding="utf-8")
++        (release / name / "Hermes.exe").write_bytes(b"MZ fixture")
++    assert driver["desktop_outputs"](tmp_path / "source") == [
++        release / "win-unpacked/resources/app.asar.unpacked/dist"]
++    driver["verify_products"](tmp_path / "source", "present")
++    (release / "win-unpacked/Hermes.exe").unlink()
++    with pytest.raises(RuntimeError, match="desktop executable is missing or empty"):
++        driver["verify_products"](tmp_path / "source", "present")
++    shutil.rmtree(release / "win-unpacked")
++    with pytest.raises(RuntimeError, match="desktop"):
++        driver["verify_products"](tmp_path / "source", "present")
++
++
+ @pytest.mark.platforms("posix")
+ @pytest.mark.parametrize("fault,error", [
+     ("uv-lock", "dependency generation is not current"),
+diff --git a/website/docs/reference/cli-commands.md b/website/docs/reference/cli-commands.md
+index 62a0d994841..229c23a3475 100644
+--- a/website/docs/reference/cli-commands.md
++++ b/website/docs/reference/cli-commands.md
+@@ -70,7 +70,7 @@ The install also ships `hermes-agent`, a minimal runner that sends one query and
+ | `hermes cron` | Inspect and tick the cron scheduler. |
+ | `hermes pause` / `hermes resume` | Global emergency stop: no new cron fires (built-in ticker, managed-cron webhook, misfire catch-up), kanban dispatch or gateway turns start until resumed. Interactive CLI, TUI and Desktop turns are gateway turns, so they are held too, and each surface shows "Hermes is paused" with the reason and "run `hermes resume`". Turns already running finish; in-flight work is never killed. |
+ | `hermes kanban` | Multi-profile collaboration board (tasks, links, dispatcher). |
+-| `hermes project` | Manage named, multi-folder workspaces (projects). Anchors desktop session grouping and, when bound to a kanban board, gives tasks a deterministic worktree + branch convention. State is per-profile. |
++| `hermes project` | Manage named, multi-folder workspaces (projects). Anchors desktop session grouping; kanban tasks linked to a project with a primary folder default to a deterministic worktree + branch. State is per-profile. |
+ | `hermes webhook` | Manage dynamic webhook subscriptions for event-driven activation. |
+ | `hermes hooks` | Inspect, approve, or remove shell-script hooks declared in `config.yaml`. |
+ | `hermes doctor` | Diagnose config and dependency issues. |
+@@ -815,7 +815,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
+ | `boards show` / `boards current` | Print the currently-active board's name, DB path, and task counts. |
+ | `boards rename <slug> "<name>"` | Change a board's display name. Slug is immutable. |
+ | `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default`. |
+-| `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
++| `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--project <id-or-slug>` (link to a project; defaults to a worktree + branch under its primary folder, when it has one), `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
+ | `list` / `ls` | List tasks on the active board. Filter with `--mine`, `--assignee`, `--status`, `--tenant`, `--archived`, `--json`. |
+ | `show <id>` | Show a task with comments and events. `--json` for machine output. |
+ | `assign <id> <profile>` | Assign or reassign. Use `none` to unassign. Refused while task is running. |
+@@ -927,7 +927,7 @@ Common failure modes + recovery are covered in [Egress proxy → Troubleshooting
+ hermes project <create|list|show|add-folder|remove-folder|rename|set-primary|use|archive|restore|bind-board>
+ ```
+ 
+-Projects are human-named workspaces that can span multiple folders / repos. They anchor desktop session grouping and, when bound to a kanban board, give tasks a deterministic worktree + branch convention. State is per-profile.
++Projects are human-named workspaces that can span multiple folders / repos. They anchor desktop session grouping, and a kanban task linked to a project (`hermes kanban create --project <slug>`, or a board bound to the project in the kanban dashboard) gets a deterministic worktree + branch under the project's primary folder by default (when the project has one). State is per-profile.
+ 
+ | Subcommand | Description |
+ |------------|-------------|
+@@ -941,7 +941,7 @@ Projects are human-named workspaces that can span multiple folders / repos. They
+ | `use` | Set the active project. |
+ | `archive` | Archive a project (recoverable). |
+ | `restore` | Restore an archived project. |
+-| `bind-board` | Bind a kanban board to this project. |
++| `bind-board` | Record a kanban board on the project and, when the board exists and the project has a primary folder, point the board's default workdir at it. Does not link the board's tasks to the project. |
+ 
+ ## `hermes webhook`
+ 
+diff --git a/website/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md b/website/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md
+index 0cc9f2b5e64..140220925f4 100644
+--- a/website/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md
++++ b/website/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md
+@@ -16,7 +16,7 @@ Use, configure, theme, extend, and orchestrate Hermes Agent.
+ |---|---|
+ | Source | Bundled (installed by default) |
+ | Path | `skills/autonomous-ai-agents/hermes-agent` |
+-| Version | `3.2.0` |
++| Version | `3.3.0` |
+ | Author | Hermes Agent + Teknium |
+ | License | MIT |
+ | Platforms | linux, macos, windows |
+@@ -114,6 +114,7 @@ Profiles use `~/.hermes/profiles/<name>/` with the same layout. When a profile i
+ | AGENTS.md / .hermes.md / CLAUDE.md project rules | `references/project-context-files.md` |
+ | Secret redaction, PII, approval modes, "reset permissions" | `references/security-privacy.md` |
+ | Delegation, cron, curator, kanban | `references/background-systems.md` |
++| `hermes project` workspaces, multi-folder projects, desktop sidebar groups | `references/projects-and-folders.md` |
+ | MCP servers (add, catalog, `hermes mcp`) | `references/native-mcp.md` |
+ | Webhook routes and event-driven runs | `references/webhooks.md` |
+ | A custom theme/skin ("synthwave theme", "change the gold ●") | `references/themes.md` + `templates/skin.yaml` |

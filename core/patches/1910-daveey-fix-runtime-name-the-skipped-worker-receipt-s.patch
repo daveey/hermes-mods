@@ -1,0 +1,184 @@
+From 9825be18561ba7fc27357493aaa278df62fef365 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:14:07 +0000
+Subject: [PATCH] [daveey] fix(runtime): name the skipped worker receipt
+ sequence on both sides
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Run 36008 (card t_01a1a264e0987946) and its sibling worker died at the same second (01:11Z) with a
+sticky WorkerPersistenceError: invalid_params. Evidence: the worker journal
+(~/.hermes/worker-outboxes/admission-worker-4af4aa9b…/pending.json) held sequence 194, state.db
+worker_executions.last_sequence was 192; the sibling's journal 171 vs owner 168. Not disk, not locks:
+no busy/storage errors in agent/gateway/errors logs in that window.
+
+Five whys:
+1. The run died -> worker.persist was refused invalid_params and the worker latches persistence failure.
+2. Refused -> apply_worker_receipt requires sequence == last_sequence + 1; journal 194 vs owner 192.
+3. Sequence 193 was considered done by the worker but never recorded by the owner -> cause NOT
+   established (evidence stops: owner connection closed after 195 frames; no owner-side refusal log).
+4. Why no evidence -> the owner raised RuntimeStoreError('invalid_params') with no field/detail, which
+   gateway.session_controls._log_refusal logs at DEBUG; the worker raised the bare code with no log.
+Root (not caught / not diagnosable): an unnamed sequence refusal is invisible in production logs.
+
+Fix (diagnostic, distinct scope from the cron fix): the owner names field='sequence',
+detail='expected N, got M' (wire reason unchanged: invalid_params), so _log_refusal logs it at WARNING;
+the worker logs the named refusal (method, operation, sequence, field, detail) before raising the
+unchanged bare reason. Bare refusals (session_busy, etc.) log nothing new.
+
+Not fixed: the cause of the lost receipt. Next occurrence now leaves "expected N, got M" in
+gateway and worker logs to finish the chain.
+
+Tests: tests/agent/test_worker_receipt_sequence_diag.py (RED on base 2/4; the two controls pass on
+both), plus test_runtime_worker, test_worker_rpc_proxy, test_runtime_session_store_proxy,
+test_worker_receipt_bound_contract: 15/15.
+---
+ agent/runtime_session_store.py                | 10 +-
+ hermes_state_runtime.py                       |  6 +-
+ .../test_worker_receipt_sequence_diag.py      | 95 +++++++++++++++++++
+ 3 files changed, 109 insertions(+), 2 deletions(-)
+ create mode 100644 tests/agent/test_worker_receipt_sequence_diag.py
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index b5be22fe8f8..3fccbcb9697 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -231,7 +231,15 @@ class WorkerRPC:
+                 self._drop()
+                 raise
+             if 'error' in response:
+-                raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
++                error = response['error']
++                data = error.get('data') if isinstance(error.get('data'), dict) else {}
++                if data.get('field') or data.get('detail'):
++                    # The raised reason stays the bare wire code (callers compare it); the check that
++                    # fired goes to the log, where a sticky failure otherwise names nothing.
++                    logger.warning('worker owner refused %s operation=%s sequence=%s: %s field=%s detail=%s',
++                                   method, params.get('operation'), params.get('sequence'),
++                                   error.get('message'), data.get('field'), data.get('detail'))
++                raise WorkerPersistenceError(error.get('message', 'persistence_failed'))
+             if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
+                 global _worker_process
+                 _worker_process = True
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index ad65f4e7296..debfcfa9705 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -1035,7 +1035,11 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
+         if row['status'] not in ('registered', 'running'):
+             raise RuntimeStoreError('stale_generation')
+         if sequence != row['last_sequence'] + 1:
+-            raise RuntimeStoreError('invalid_params')
++            # Named, so the gateway logs it at warning and the worker can say which write it lost:
++            # a bare code is a debug line, and a skipped sequence once killed two workers with no
++            # owner-side trace (t_01a1a264e0987946 run 36008: journal at 194, owner at 192).
++            raise RuntimeStoreError('invalid_params', field='sequence',
++                                    detail=f"expected {row['last_sequence'] + 1}, got {sequence}")
+         # Each SQLite retry gets fresh rows; rolled-back annotations must not escape.
+         changes = conn.total_changes
+         result = handlers[operation](db, conn, session_id, json.loads(encoded))
+diff --git a/tests/agent/test_worker_receipt_sequence_diag.py b/tests/agent/test_worker_receipt_sequence_diag.py
+new file mode 100644
+index 00000000000..afe194b7248
+--- /dev/null
++++ b/tests/agent/test_worker_receipt_sequence_diag.py
+@@ -0,0 +1,95 @@
++"""A skipped worker receipt sequence names itself on both sides of the worker boundary.
++
++Run 36008 (t_01a1a264e0987946) and its sibling worker died at the same second with a sticky
++``WorkerPersistenceError: invalid_params``: the worker journal held sequence 194 while the owner's
++``worker_executions.last_sequence`` was 192. The owner raised a bare code, which the gateway logs at
++debug only, and the worker raised the bare code, so no log line said which check fired or which
++write was missing. The refusal now carries ``field='sequence'`` and ``expected N, got M``; the wire
++reason stays ``invalid_params`` (callers compare it), and the worker logs the named check.
++"""
++import json
++import logging
++import queue
++from types import SimpleNamespace
++
++import pytest
++from websockets.exceptions import ConnectionClosed
++
++import hermes_state_runtime as rt
++from tests.hermes_state.test_runtime_worker import append, setup_worker
++
++
++def test_owner_names_the_expected_sequence(tmp_path):
++    db, epoch, assignment = setup_worker(tmp_path)
++    try:
++        append(db, epoch=epoch, **assignment, sequence=1, content='first')
++        with pytest.raises(rt.RuntimeStoreError) as caught:
++            append(db, epoch=epoch, **assignment, sequence=3, content='skipped two')
++        assert caught.value.reason == 'invalid_params'
++        assert caught.value.field == 'sequence'
++        assert caught.value.detail == 'expected 2, got 3'
++        assert db._conn.execute(
++            "SELECT last_sequence FROM worker_executions WHERE execution_id='worker'").fetchone()[0] == 1
++    finally:
++        db.close()
++
++
++def test_gateway_logs_named_sequence_refusal_at_warning(caplog):
++    from gateway.session_controls import _log_refusal, _refusal_data
++    exc = rt.RuntimeStoreError('invalid_params', field='sequence', detail='expected 193, got 194')
++    with caplog.at_level(logging.DEBUG, logger='gateway.session_controls'):
++        _log_refusal('/home/x/.hermes', 'worker.persist', exc)
++    record = next(r for r in caplog.records if 'worker.persist refused' in r.getMessage())
++    assert record.levelno == logging.WARNING
++    assert 'field=sequence detail=expected 193, got 194' in record.getMessage()
++    assert _refusal_data(exc) == {'reason': 'invalid_params', 'field': 'sequence',
++                                  'detail': 'expected 193, got 194'}
++
++
++def _owner(monkeypatch, reply):
++    endpoint = SimpleNamespace(api_origin='http://127.0.0.1:1234')
++    monkeypatch.setattr('hermes_cli.gateway_runtime.discover_gateway_endpoint',
++                        lambda *a, **k: SimpleNamespace(state='ready', endpoint=endpoint))
++    monkeypatch.setattr('hermes_cli.gateway_runtime.control_home_for', lambda home, endpoint: home)
++    monkeypatch.setattr('hermes_cli.gateway_runtime_discovery.query_identify', lambda *a, **k: {'pid': -1})
++    monkeypatch.setattr('hermes_cli.gateway_client._session_ticket', lambda *a, **k: 'ticket')
++
++    def connect(url, **kwargs):
++        frames = queue.SimpleQueue()
++
++        def recv():
++            frame = frames.get()
++            if frame is None:
++                raise ConnectionClosed(None, None)
++            return frame
++
++        def send(value):
++            frames.put(json.dumps({'id': json.loads(value)['id'], 'error': reply}))
++        return SimpleNamespace(send=send, recv=recv, close=lambda: frames.put(None))
++    monkeypatch.setattr('websockets.sync.client.connect', connect)
++
++
++def test_worker_logs_named_refusal_and_keeps_bare_reason(tmp_path, monkeypatch, caplog):
++    from agent.runtime_session_store import WorkerPersistenceError, WorkerRPC
++    _owner(monkeypatch, {'code': 4001, 'message': 'invalid_params', 'data': {
++        'reason': 'invalid_params', 'field': 'sequence', 'detail': 'expected 193, got 194'}})
++    rpc = WorkerRPC(tmp_path)
++    with caplog.at_level(logging.WARNING, logger='agent.runtime_session_store'):
++        with pytest.raises(WorkerPersistenceError) as caught:
++            rpc('worker.persist', operation='session.sidecars', sequence=194)
++    assert str(caught.value) == 'invalid_params'
++    lines = [r.getMessage() for r in caplog.records if 'worker owner refused' in r.getMessage()]
++    assert lines == ['worker owner refused worker.persist operation=session.sidecars sequence=194: '
++                     'invalid_params field=sequence detail=expected 193, got 194']
++    rpc.close()
++
++
++def test_worker_bare_refusal_logs_nothing_new(tmp_path, monkeypatch, caplog):
++    from agent.runtime_session_store import WorkerPersistenceError, WorkerRPC
++    _owner(monkeypatch, {'code': 4001, 'message': 'session_busy', 'data': {'reason': 'session_busy'}})
++    rpc = WorkerRPC(tmp_path)
++    with caplog.at_level(logging.WARNING, logger='agent.runtime_session_store'):
++        with pytest.raises(WorkerPersistenceError, match='session_busy'):
++            rpc('worker.persist', operation='turn.acquire', sequence=5)
++    assert not [r for r in caplog.records if 'worker owner refused' in r.getMessage()]
++    rpc.close()
+-- 
+2.55.0
+

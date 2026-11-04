@@ -1,0 +1,95 @@
+From 592ad3fe5d44b101e813a7964a606a5623b65ecf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:00:17 +0000
+Subject: [PATCH] [daveey] test(cron): cover fallback-chain stamp, tz-pinned
+ release, queued run-now and a real credential pool for the quota-hold early
+ release
+
+Review of 7e5337c70db (exact-head, Opus): logic correct; asked for these four cases. Interval holds and holds
+with a queued run-now intentionally stay one-way (an errored interval job would be fired at once by the
+stale-error re-arm; a run-now waits for the boundary via extra_fire.reschedule): both keep pre-fix behaviour.
+---
+ tests/cron/test_quota_hold_early_release.py | 70 +++++++++++++++++++++
+ 1 file changed, 70 insertions(+)
+
+diff --git a/tests/cron/test_quota_hold_early_release.py b/tests/cron/test_quota_hold_early_release.py
+index 6acec2f17c5..1421a1686ab 100644
+--- a/tests/cron/test_quota_hold_early_release.py
++++ b/tests/cron/test_quota_hold_early_release.py
+@@ -234,3 +234,73 @@ def test_scheduler_tick_on_pool_refusal_stamps_route(tmp_cron_home, cron_owner,
+     assert j[qh.STATE_KEY], j.get("last_error")
+     assert j[qh.ROUTE_KEY] == ROUTE
+     assert "_quota_hold_route" not in j
++
++
++def test_fallback_chain_stamps_terminal_route():
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
++    reset = NOW.timestamp() + 3600
++    chain = ProviderFallbackError([
++        ("anthropic", "claude-opus-5-5", SubscriptionQuotaUnavailable("anthropic", "claude-opus-5-5", reset)),
++        ("openai-codex", "gpt-6-astra", SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", reset)),
++    ])
++    assert qh.route_from_failure(chain) == ROUTE
++    assert qh.route_from_failure(ProviderFallbackError([])) is None
++
++
++def test_timezone_pinned_job_releases_to_its_own_zones_next_slot(tmp_cron_home, pool):
++    """01:25Z is 17:25 in Los Angeles (PST): the next 7,37 17-18 slot there is 17:37 PST = 01:37Z.
++    Read in UTC instead it would be 17:07Z, after the parked 15:07Z, and nothing would move."""
++    job_id = _held_job(expr="7,37 17-18 * * *")
++    update_job(job_id, {"timezone": "America/Los_Angeles"})
++    update_job(job_id, {"next_run_at": PARKED.isoformat(), qh.STATE_KEY: PARKED.isoformat()})
++    assert job_id not in {d["id"] for d in get_due_jobs()}
++    j = _get(job_id)
++    assert datetime.fromisoformat(j["next_run_at"]) == NATURAL_NEXT
++    assert qh.STATE_KEY not in j
++
++
++def test_queued_run_now_keeps_hold_and_skips_pool_read(tmp_cron_home, pool):
++    """A run-now queued during the hold waits for the boundary (extra_fire.reschedule owns it);
++    the early release never rewrites next_run_at under it."""
++    from cron import extra_fire
++    from cron.jobs import trigger_job
++
++    job_id = _held_job()
++    assert trigger_job(job_id) is not None
++    assert extra_fire.queued(_get(job_id))
++    get_due_jobs()
++    assert pool["reads"] == []
++    assert _get(job_id).get(qh.STATE_KEY) == PARKED.isoformat()
++
++
++def test_real_credential_pool_drives_pool_serving(tmp_path, monkeypatch):
++    """No mocks on the pool: a temp HERMES_HOME auth store with every OAuth entry cooling down is
++    not serving; one healthy entry is."""
++    import time
++    from pathlib import Path
++
++    from agent.credential_pool import PooledCredential
++    from hermes_cli.auth import write_credential_pool
++
++    # The suite's hermetic HERMES_HOME holds the store; external CLI stores stay in tmp_path.
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
++
++    def rows(exhausted):
++        now = time.time()
++        out = []
++        for i in range(2):
++            row = dict(id=f"{'cool' if exhausted else 'mixed'}{i}", label=f"account{i}",
++                       source="manual:device_code", auth_type="oauth",
++                       access_token=f"fixture-access-{i}", refresh_token=f"fixture-refresh-{i}", priority=i)
++            if exhausted or i == 0:
++                row.update(last_status="exhausted", last_status_at=now, last_error_code=429,
++                           last_error_reset_at=now + 3600)
++            out.append(PooledCredential.from_dict("openai-codex", row).to_dict())
++        return out
++
++    write_credential_pool("openai-codex", rows(exhausted=True))
++    assert qh.pool_serving(ROUTE) is False
++    write_credential_pool("openai-codex", rows(exhausted=False))
++    assert qh.pool_serving(ROUTE) is True
+-- 
+2.55.0
+

@@ -1,0 +1,324 @@
+From 5fd59833c70b930131b0de977c4ca08ccd44f718 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 04:41:27 +0000
+Subject: [PATCH] skill index: show triggers: frontmatter on index rows
+ (skills.index_triggers, default on) [daveey]
+
+A skill's triggers: mapping ({asks: [up to 3 user phrasings], not_for: str}) is appended to its
+<available_skills> row as ' Asks: "a"; "b"; "c". Not for: x.'. extract_skill_description() stays
+the one place rows are built (with_triggers=None reads config). The setting is part of the
+in-process cache key and recorded in the disk snapshot (v6), so toggling it or editing triggers:
+refreshes the index; v5 snapshots are rebuilt. Documented in creating-skills.md.
+
+Measured with hermes-mods tools/skill-trigger-eval: weakest-30 recall 0.670 -> 0.829 (a description
+rewrite alone 0.731); full index mean 0.921 -> 0.947, ~72 tokens per skill with triggers.
+---
+ agent/prompt_builder.py                       |  23 ++--
+ agent/skill_utils.py                          |  37 +++++-
+ hermes_cli/config_defaults.py                 |   4 +-
+ tests/agent/test_skill_index_triggers.py      | 106 ++++++++++++++++++
+ tools/skill_manager_tool.py                   |   2 +-
+ .../docs/developer-guide/creating-skills.md   |  16 +++
+ 6 files changed, 173 insertions(+), 15 deletions(-)
+ create mode 100644 tests/agent/test_skill_index_triggers.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index ad57cfc9667..3fec75ee816 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -23,10 +23,10 @@ from agent.model_metadata import CHARS_PER_TOKEN
+ from agent.runtime_cwd import resolve_agent_cwd
+ from agent.skill_utils import (
+     EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS,
+-    TIER_LOCAL, clip_skill_description, extract_skill_conditions, extract_skill_description,
++    TIER_LOCAL, extract_skill_conditions, extract_skill_description,
+     get_disabled_skill_names, get_skill_search_roots,
+-    iter_skill_index_files, parse_frontmatter, skill_matches_apps, skill_matches_environment,
+-    skill_matches_platform, skill_matches_platform_list,
++    iter_skill_index_files, parse_frontmatter, skill_index_triggers_enabled, skill_matches_apps,
++    skill_matches_environment, skill_matches_platform, skill_matches_platform_list,
+ )
+ from tools.threat_patterns import scan_for_threats as _scan_for_threats
+ from utils import atomic_json_write, file_cache_version
+@@ -1120,8 +1120,9 @@ _SKILLS_PROMPT_CACHE_MAX = 32
+ _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
+ _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
+ # v2 added org provenance fields (org_id/org_author); v4 adds ``rel`` (SKILL.md path relative to its root) for
+-# duplicate-name resolution; v5 stores descriptions clipped at a word boundary. Older snapshots are rebuilt.
+-_SKILLS_SNAPSHOT_VERSION = 5
++# duplicate-name resolution; v5 stores descriptions clipped at a word boundary; v6 rows carry ``triggers:`` and the
++# snapshot records ``index_triggers`` (the skills.index_triggers value they were built with). Older ones are rebuilt.
++_SKILLS_SNAPSHOT_VERSION = 6
+ 
+ 
+ def _skills_prompt_snapshot_path() -> Path:
+@@ -1159,12 +1160,14 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
+ 
+ 
+ def _load_skills_snapshot(skills_dir: Path, manifest: Optional[dict] = None) -> Optional[dict]:
+-    """The disk snapshot if it exists, is current-version, and its manifest still matches."""
++    """The disk snapshot if it exists, is current-version, was built with the current skills.index_triggers, and
++    its manifest still matches."""
+     try:
+         snapshot = json.loads(_skills_prompt_snapshot_path().read_text(encoding="utf-8-sig"))
+     except Exception:  # missing, unreadable or corrupt -> rebuild
+         return None
+     if (isinstance(snapshot, dict) and snapshot.get("version") == _SKILLS_SNAPSHOT_VERSION
++            and snapshot.get("index_triggers") == skill_index_triggers_enabled()
+             and snapshot.get("manifest") == (manifest if manifest is not None else _build_skills_manifest(skills_dir))):
+         return snapshot
+     return None
+@@ -1253,7 +1256,8 @@ def _plugin_skill_prompt_rows(
+             if not _skill_should_show(extract_skill_conditions(frontmatter), available_tools,
+                                       available_toolsets, session_platform):
+                 continue
+-            desc = clip_skill_description(str(meta.get("description") or "").strip()) or extract_skill_description(frontmatter)
++            desc = extract_skill_description(
++                {**frontmatter, "description": meta.get("description") or frontmatter.get("description") or ""})
+             rows.append((name, desc))
+     except Exception:
+         logger.debug("Plugin skill prompt rows unavailable", exc_info=True)
+@@ -1427,7 +1431,7 @@ def _build_skills_system_prompt_inner(
+         tuple(sorted(str(t) for t in (available_tools or set()))),
+         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
+         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
+-        _oneshot_prompt_variant(), tuple(plugin_rows),
++        _oneshot_prompt_variant(), tuple(plugin_rows), skill_index_triggers_enabled(),
+     )
+     snapshot = _load_skills_snapshot(skills_dir, manifest)
+     app_gated = snapshot is not None and any(
+@@ -1485,7 +1489,8 @@ def _build_skills_system_prompt_inner(
+     if snapshot is None:  # persist for fast cold-start reuse (best-effort)
+         try:
+             atomic_json_write(_skills_prompt_snapshot_path(), {
+-                "version": _SKILLS_SNAPSHOT_VERSION, "manifest": _build_skills_manifest(skills_dir),
++                "version": _SKILLS_SNAPSHOT_VERSION, "index_triggers": skill_index_triggers_enabled(),
++                "manifest": _build_skills_manifest(skills_dir),
+                 "skills": [entry for entry, _ in candidates],
+             })
+         except Exception as e:
+diff --git a/agent/skill_utils.py b/agent/skill_utils.py
+index 1ccf84a4089..d74e09f93ac 100644
+--- a/agent/skill_utils.py
++++ b/agent/skill_utils.py
+@@ -876,9 +876,40 @@ def clip_skill_description(desc: str) -> str:
+     return _CLIP_TRAIL_RE.sub("", head[:boundary.start()]) + "..."
+ 
+ 
+-def extract_skill_description(frontmatter: dict[str, Any]) -> str:
+-    """Extract a system-prompt-length description from parsed frontmatter."""
+-    return clip_skill_description(_normalize_skill_description(frontmatter))
++def skill_index_triggers_enabled() -> bool:
++    """``skills.index_triggers`` (default true): index rows carry each skill's ``triggers:`` frontmatter."""
++    from utils import is_truthy_value
++    return is_truthy_value(_skills_cfg_get("index_triggers"), default=True)
++
++
++def _one_line(value: Any) -> str:
++    return " ".join(str(value).split())
++
++
++def render_skill_triggers(frontmatter: dict[str, Any]) -> str:
++    """`` Asks: "a"; "b"; "c". Not for: x.`` from a ``triggers:`` mapping (``asks``: up to three of the user's own
++    phrasings, ``not_for``: str naming the neighbour skill to use instead); "" when absent or malformed.
++
++    Measured by hermes-mods tools/skill-trigger-eval: on the 30 weakest skills recall 0.67 -> 0.83 (a description
++    rewrite alone reached 0.73), at ~72 index tokens per skill that declares triggers."""
++    trig = frontmatter.get("triggers")
++    if not isinstance(trig, dict):
++        return ""
++    raw_asks = trig.get("asks")
++    raw_asks = [raw_asks] if isinstance(raw_asks, str) else raw_asks if isinstance(raw_asks, list) else []
++    asks = [a for a in (_one_line(a).replace('"', "'") for a in raw_asks) if a][:3]
++    not_for = _one_line(trig.get("not_for") or "").rstrip(".")
++    out = (" Asks: " + "; ".join(f'"{a}"' for a in asks) + ".") if asks else ""
++    return out + (f" Not for: {not_for}." if not_for else "")
++
++
++def extract_skill_description(frontmatter: dict[str, Any], *, with_triggers: bool | None = None) -> str:
++    """The skill's system-prompt index row text: the description clipped to SKILL_PROMPT_DESC_LIMIT, then its
++    ``triggers:`` (``with_triggers`` None = the ``skills.index_triggers`` config). Every index row is built here."""
++    desc = clip_skill_description(_normalize_skill_description(frontmatter))
++    if with_triggers is None:
++        with_triggers = skill_index_triggers_enabled()
++    return desc + render_skill_triggers(frontmatter) if with_triggers else desc
+ 
+ 
+ def is_skill_description_truncated_for_prompt(frontmatter: dict[str, Any]) -> bool:
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 7b8bf6f0119..e32bf209c73 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1470,6 +1470,7 @@ DEFAULT_CONFIG = {
+         "auto_load": [],
+         # Substitute ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in SKILL.md content.
+         "template_vars": True,
++        "index_triggers": True,  # index rows show `triggers:` frontmatter (Asks: ... Not for: ...)
+         # Pre-execute !`cmd` snippets in SKILL.md, inlining stdout (dates, git state...). Off:
+         # host-unapproved skill-author code; community hub installs never auto-execute (#63307).
+         "inline_shell": False,
+@@ -1489,8 +1490,7 @@ DEFAULT_CONFIG = {
+         "write_approval": False,
+         # Audit ledger: every skill mutation appends to ~/.hermes/skills/.curator_ledger.jsonl with
+         # before/after hashes (blobs under ~/.hermes/.curator_backups/blobs/); powers `hermes
+-        # curator ledger` / `rollback <entry-id>`. Never a gate — failures can't block.
+-        # See #79686.
++        # curator ledger` / `rollback <entry-id>`. Never a gate — failures can't block. See #79686.
+         "ledger": True,
+         # Size cap for that ledger: once the file grows past this, the next append rewrites it
+         # through the unchanged-file dedup and, if still over, drops the oldest entries (0 = keep
+diff --git a/tests/agent/test_skill_index_triggers.py b/tests/agent/test_skill_index_triggers.py
+new file mode 100644
+index 00000000000..189e467f741
+--- /dev/null
++++ b/tests/agent/test_skill_index_triggers.py
+@@ -0,0 +1,106 @@
++"""``triggers:`` frontmatter on skill index rows (config ``skills.index_triggers``, default on)."""
++
++import json
++import re
++
++import pytest
++
++from agent import prompt_builder
++from agent.prompt_builder import build_skills_system_prompt, clear_skills_system_prompt_cache
++from agent.skill_utils import extract_skill_description, render_skill_triggers
++
++FM = {"description": "Use when the Mac disk is full. Audit, clean safely.",
++      "triggers": {"asks": ["my disk is full", "free up space", "what is eating storage", "fourth"],
++                   "not_for": "CI runner disk (use ci-runner-disk-recovery)."}}
++ROW = ('Use when the Mac disk is full. Audit, clean safely. Asks: "my disk is full"; "free up space"; '
++       '"what is eating storage". Not for: CI runner disk (use ci-runner-disk-recovery).')
++
++
++@pytest.fixture(autouse=True)
++def home(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    clear_skills_system_prompt_cache(clear_snapshot=True)
++    yield tmp_path
++    clear_skills_system_prompt_cache(clear_snapshot=True)
++
++
++def _config(home, value):
++    (home / "config.yaml").write_text(f"skills:\n  index_triggers: {value}\n", encoding="utf-8")
++
++
++def _skill(home, asks, not_for="the CI runner disk"):
++    d = home / "skills" / "apple" / "mac-disk-cleanup"
++    d.mkdir(parents=True, exist_ok=True)
++    asks_yaml = "".join(f"\n    - \"{a}\"" for a in asks)
++    (d / "SKILL.md").write_text(
++        f"---\nname: mac-disk-cleanup\ndescription: Use when my Mac disk is full.\n"
++        f"triggers:\n  asks:{asks_yaml}\n  not_for: \"{not_for}\"\n---\n\nBody.\n", encoding="utf-8")
++
++
++def _row(prompt):
++    return next(line for line in prompt.splitlines() if "mac-disk-cleanup" in line)
++
++
++def test_triggers_render_after_the_clipped_description_by_default():
++    assert extract_skill_description(FM) == ROW
++
++
++@pytest.mark.parametrize("value", ["false", "'false'", "no"])
++def test_config_off_hides_triggers(home, value):
++    _config(home, value)
++    assert extract_skill_description(FM) == "Use when the Mac disk is full. Audit, clean safely."
++
++
++def test_explicit_with_triggers_overrides_config(home):
++    _config(home, "false")
++    assert extract_skill_description(FM, with_triggers=True) == ROW
++    _config(home, "true")
++    assert extract_skill_description(FM, with_triggers=False) == FM["description"]
++
++
++def test_malformed_triggers_are_ignored_and_rows_stay_one_line():
++    assert extract_skill_description({"description": "d.", "triggers": ["x"]}) == "d."
++    assert extract_skill_description({"description": "d.", "triggers": {"not_for": "y"}}) == "d. Not for: y."
++    assert render_skill_triggers({"triggers": {"asks": "one ask", "not_for": None}}) == ' Asks: "one ask".'
++    assert render_skill_triggers({"triggers": {"asks": [' say "hi"\n  now ', "", 3]}}) == (
++        " Asks: \"say 'hi' now\"; \"3\".")
++    assert render_skill_triggers({"triggers": {"asks": {"a": 1}, "not_for": "x\ny."}}) == " Not for: x y."
++
++
++def test_index_row_carries_triggers_and_a_frontmatter_edit_refreshes_it(home):
++    _skill(home, ["my disk is full"])
++    first = build_skills_system_prompt()
++    assert _row(first).endswith(': Use when my Mac disk is full. Asks: "my disk is full". Not for: the CI runner disk.')
++    assert json.loads((home / ".skills_prompt_snapshot.json").read_text())["index_triggers"] is True
++
++    _skill(home, ["free up space"])  # same description: only triggers: changed
++    assert '"free up space"' in _row(build_skills_system_prompt())  # in-process LRU missed
++
++    clear_skills_system_prompt_cache()  # cold start: only the disk snapshot is left
++    assert '"free up space"' in _row(build_skills_system_prompt())
++
++
++def test_toggling_the_config_rebuilds_cache_and_snapshot(home):
++    _skill(home, ["my disk is full"])
++    assert "Asks:" in _row(build_skills_system_prompt())
++    _config(home, "false")
++    assert _row(build_skills_system_prompt()).endswith(": Use when my Mac disk is full.")  # LRU key
++    snapshot = json.loads((home / ".skills_prompt_snapshot.json").read_text())
++    assert snapshot["index_triggers"] is False and snapshot["version"] == prompt_builder._SKILLS_SNAPSHOT_VERSION
++    _config(home, "true")
++    clear_skills_system_prompt_cache()  # the disk snapshot built with triggers off must not be reused
++    assert "Asks:" in _row(build_skills_system_prompt())
++
++
++def test_pre_triggers_snapshot_is_rebuilt(home):
++    _skill(home, ["my disk is full"])
++    build_skills_system_prompt()
++    path = home / ".skills_prompt_snapshot.json"
++    old = json.loads(path.read_text())
++    old.pop("index_triggers")
++    old["version"] = 5
++    for entry in old["skills"]:
++        entry["description"] = re.sub(r" Asks:.*", "", entry["description"])
++    path.write_text(json.dumps(old))
++    clear_skills_system_prompt_cache()
++    assert "Asks:" in _row(build_skills_system_prompt())
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index 529463cc405..441a6df5a08 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -484,7 +484,7 @@ def _add_description_prompt_preview(result: dict[str, Any], content: str) -> dic
+     fm, _ = _parse_frontmatter(content)
+     if is_skill_description_truncated_for_prompt(fm):
+         result["system_prompt_preview"] = (
+-            f"System prompt will show: \"{extract_skill_description(fm)}\" — shorten the "
++            f"System prompt will show: \"{extract_skill_description(fm, with_triggers=False)}\" — shorten the "
+             f"description to {SKILL_PROMPT_DESC_LIMIT} chars so the index shows all of it.")
+     return result
+ 
+diff --git a/website/docs/developer-guide/creating-skills.md b/website/docs/developer-guide/creating-skills.md
+index 8e2f5506302..b71ff84bfe6 100644
+--- a/website/docs/developer-guide/creating-skills.md
++++ b/website/docs/developer-guide/creating-skills.md
+@@ -134,6 +134,22 @@ metadata:
+ 
+ **Use case for `requires_*`:** Create a skill that only makes sense when certain tools are present. For example, a web scraping workflow skill with `requires_toolsets: [web]` won't clutter the prompt when web tools are disabled.
+ 
++### Trigger Phrases
++
++The system-prompt skill index shows each skill as one row: its name and its description, clipped to 60 characters. A skill whose description is accurate but doesn't sound like what users actually say gets skipped. Add a top-level `triggers:` mapping with up to three phrasings in the user's own words, plus the neighbouring skill to use instead:
++
++```yaml
++description: "Use when my Mac disk is full. Audit, clean, trim OrbStack."
++triggers:
++  asks:
++    - "my disk is full"
++    - "free up space"
++    - "what is eating storage"
++  not_for: "CI runner disk (use ci-runner-disk-recovery)"
++```
++
++The index row then reads `- mac-disk-cleanup: Use when my Mac disk is full. Audit, clean, trim OrbStack. Asks: "my disk is full"; "free up space"; "what is eating storage". Not for: CI runner disk (use ci-runner-disk-recovery).` Only the first three `asks` are shown. Each one costs index tokens on every turn, so add triggers to skills that get missed or confused with a neighbour, not to every skill. Set `skills.index_triggers: false` in `config.yaml` to show descriptions only.
++
+ ### Environment Variable Requirements
+ 
+ Skills can declare environment variables they need. When a skill is loaded via `skill_view`, its required vars are automatically registered for passthrough into sandboxed execution environments (terminal, execute_code).
+-- 
+2.55.0
+

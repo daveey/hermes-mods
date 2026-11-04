@@ -1,0 +1,178 @@
+From f02c12e2698790066e91149f2ccb9d7836ce41ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 04:30:17 +0000
+Subject: [PATCH] [daveey] kanban: a dependency park in the same second as the
+ owner's own PR report resumes it
+
+An owner that posts its state comment (with the PR URL) and then parks on a
+dependency in the same turn lands both rows in one wall-clock second. The
+ordering-park handoff required parked_at > newest PR comment time, so the tie
+kept the card held by active_pr after its parent finished (t_01a19e1fc70f3521,
+comment 33793 and dependency_wait both at 1793663272), filing a respawn-guard
+fix card and needing a manual reset.
+
+The review checkpoint now stamps comment_id_at_checkpoint (MAX comment id, in
+the block transaction), the same server-derived ordering proof the continuation
+checkpoint already uses. A same-second tie releases only when that watermark
+maps to a local row covering the newest PR comment; a PR comment after the park,
+a missing, non-int, zero or unmappable watermark stays guarded.
+
+test_other_refusals_survive[missing] only held through the same-second tie: one
+second later the metadata-free parent already resumed via the ordering handoff.
+It now asserts the review path refusal directly and pins both chronologies.
+---
+ hermes_cli/kanban_db_dispatch_pr_state.py     | 29 +++++++++--
+ hermes_cli/kanban_dependency_review.py        |  6 +++
+ .../test_kanban_dependency_pr_handoff.py      | 51 ++++++++++++++++++-
+ 3 files changed, 81 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 3d84647209b..cb55a49136b 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -303,11 +303,29 @@ def _foreign_pr_comment_ids(conn: sqlite3.Connection, task_id: str) -> set[int]:
+     return foreign
+ 
+ 
+-def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int) -> bool:
++def _park_watermark_covers(conn: sqlite3.Connection, task_id: str, evidence: object,
++                           latest_pr_comment_id: int) -> bool:
++    """True when the park's authenticated comment watermark includes the newest PR comment.
++
++    The watermark is a row id on the host that parked; map it to the local row first
++    (replica cards). A watermark naming no single local row proves nothing.
++    """
++    watermark = evidence.get("comment_id_at_checkpoint") if isinstance(evidence, dict) else None
++    if type(watermark) is not int or watermark <= 0 or latest_pr_comment_id <= 0:
++        return False
++    local = _local_comment_id(conn, task_id, watermark)
++    return local is not None and local >= latest_pr_comment_id
++
++
++def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int,
++                              latest_pr_comment_id: int = 0) -> bool:
+     """A claimed owner's orderly dependency park permits exactly one continuation.
+ 
+     Operator links/synthetic runs are not owner intent. Compare occurrence times,
+     not insertion order: synced history can append older events after promotion.
++    A park in the same second as the newest PR comment counts only when the park's
++    server-stamped comment watermark covers that comment (the owner reported, then
++    parked); without it the tie stays guarded.
+     """
+     from hermes_cli import kanban_db as kb
+ 
+@@ -346,9 +364,11 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+     from hermes_cli.kanban_dependency_review import _checkpoint_matches_run
+     if not _checkpoint_matches_run(evidence, run):
+         return False
+-    if (parked_at <= since or ended is None or ended < since
++    if (parked_at < since or ended is None or ended < since
+             or payload.get("kind") != "dependency" or payload.get("source_status") not in {"ready", "review"}):
+         return False
++    if parked_at == since and not _park_watermark_covers(conn, task_id, evidence, latest_pr_comment_id):
++        return False  # same-second tie with no ordering proof stays guarded (fail closed)
+     if not any(e["kind"] == "claimed" and e["run_id"] == run["id"] and at <= parked_at
+                for at, e in timed):
+         return False
+@@ -407,7 +427,8 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     one continuation after parent completion/promotion: it must belong to the latest
+     claimed run of this card and assignee, ended orderly as blocked, with no subsequent
+     crash/reclaim/timeout. Operator-only links or synthetic unclaimed runs do not count;
+-    the next claim consumes the handoff. Same-second dependency parks stay guarded.
++    the next claim consumes the handoff. A same-second dependency park counts only when
++    its server-stamped comment watermark covers the newest PR comment; otherwise it stays guarded.
+     This does not change the separate review-checkpoint exception below. So does
+     a completed exact-head review of the checkpointed PRs (repair metadata, including
+     absent/unrecognised verdicts, or an approval
+@@ -477,7 +498,7 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+             "'continued', 'scheduled')",
+             cols=", kind, payload", strict=True)):
+         return None
+-    if _dependency_handoff_after(conn, task_id, max(pr_times)):
++    if _dependency_handoff_after(conn, task_id, max(pr_times), latest_pr_comment_id):
+         return None
+     from hermes_cli.kanban_dependency_review import resumes_review
+     if resumes_review(conn, task_id, pr_urls):
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index a972f745be5..63c8c58bd41 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -47,6 +47,12 @@ def checkpoint(conn, task_id, expected_run_id):
+     # leaves its JSON payload unchanged. Carry the run's stable identity as well.
+     if "uid" in row.keys() and row["uid"]:
+         evidence["run_uid"] = row["uid"]
++    # Server-derived ordering proof for PR comments sharing the park's second (an owner
++    # posts its state comment and parks in one turn). Same contract as the continuation
++    # checkpoint's comment_id_at_checkpoint: a host-local row id, mapped back on read.
++    evidence["comment_id_at_checkpoint"] = conn.execute(
++        "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
++    ).fetchone()[0]
+     return evidence
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_dependency_pr_handoff.py b/tests/hermes_cli/test_kanban_dependency_pr_handoff.py
+index e393ba4b70a..0fac6e3dae1 100644
+--- a/tests/hermes_cli/test_kanban_dependency_pr_handoff.py
++++ b/tests/hermes_cli/test_kanban_dependency_pr_handoff.py
+@@ -75,8 +75,57 @@ def test_park_before_new_publication_then_crash_stays_guarded(board, monkeypatch
+     assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
+ 
+ 
+-def test_same_second_park_stays_guarded(board, monkeypatch):
++def test_same_second_park_after_own_pr_report_resumes_once(board, monkeypatch, all_assignees_spawnable):
++    # The owner posts its state comment (with the PR URL) and parks in the same second.
++    # The park's server-stamped comment watermark orders the two, so this is the
++    # orderly handoff, not a duplicate-publication risk.
+     task, _, _ = park(board, monkeypatch, delta=0)
++    evidence = kb._json_dict(board.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'dependency_wait' "
++        "ORDER BY id DESC LIMIT 1", (task,)).fetchone()[0])["review_checkpoint"]
++    latest = board.execute("SELECT MAX(id) FROM task_comments WHERE task_id = ?", (task,)).fetchone()[0]
++    assert evidence["comment_id_at_checkpoint"] == latest
++    assert prs.active_pr_reason(board, task, int(time.time())) is None
++    result = dispatch.dispatch_once(board, spawn_fn=lambda task, workspace, **kwargs: 123456789)
++    assert len(result.spawned) == 1
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++def test_same_second_pr_comment_after_park_stays_guarded(board, monkeypatch):
++    # A PR comment in the park's second but after it is beyond the watermark.
++    now = int(time.time())
++    clock = [now]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    task = kb.create_task(board, title="finish existing PR", assignee="dev")
++    kb.claim_task(board, task)
++    run = kb.get_task(board, task).current_run_id
++    parent = kb.create_task(board, title="ordering prerequisite", assignee="dev")
++    kb.link_tasks(board, parent, task, expected_child_run_id=run)
++    clock[0] += 10
++    worker_comment(board, task, "dev", PR)
++    assert kb.block_task(board, task, kind="dependency", reason="ordering prerequisite", expected_run_id=run)
++    worker_comment(board, task, "dev", "https://github.com/example/repo/pull/11")
++    clock[0] += 10
++    kb.claim_task(board, parent)
++    assert kb.complete_task(board, parent, summary="ordering work finished")
++    kb.recompute_ready(board)
++    assert kb.get_task(board, task).status == "ready"
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++@pytest.mark.parametrize("watermark", [None, 0, "7", 10**9])
++def test_same_second_park_without_valid_watermark_stays_guarded(board, monkeypatch, watermark):
++    task, _, _ = park(board, monkeypatch, delta=0)
++    row = board.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'dependency_wait' "
++                        "ORDER BY id DESC LIMIT 1", (task,)).fetchone()
++    payload = kb._json_dict(row["payload"])
++    if watermark is None:
++        payload["review_checkpoint"].pop("comment_id_at_checkpoint")
++    else:
++        payload["review_checkpoint"]["comment_id_at_checkpoint"] = watermark
++    import json
++    with kb.write_txn(board):
++        board.execute("UPDATE task_events SET payload = ? WHERE id = ?", (json.dumps(payload), row["id"]))
+     assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
+ 
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,986 @@
+From b1f608189c0526391f2457e4ac01d7c0a2ce2b58 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 21:51:48 +0000
+Subject: [PATCH] [daveey] kanban: read worker-created cards from the board
+ replica; refuse their writes as foreign_card naming the owner; show
+ ready-card queue position
+
+A card created on a Board worker node (worker-1) is in no Desktop-reachable gateway's live kanban.db: a synced
+board's live file holds only that gateway's own cards, the replica (kanban/sync-shadow/<board>.db) holds the whole
+board. GET /api/plugins/kanban/tasks/{id} read only the live file, so cross_task read answered "not found on any
+connected gateway" and a chat concluded the card was a phantom (t_01a19fd40c53bb19). Writes answered stale_run /
+"cannot archive" / "unknown id or terminal state".
+
+- hermes_cli/kanban_foreign_card.py: replica path for a synced board (kanban.sync.enabled + boards), read-only open
+  (mode=ro, query_only fallback), owner_of/refusal/check, rejection "foreign_card".
+- GET /tasks/{id}: live hit adds "source": "live" (+ "queue" when ready); a live miss on a synced board reads the
+  replica and adds "source": "replica", "owner": <created_on>; a miss in both stays 404.
+- 409 "foreign_card: <id> was created on <owner> and lives there; ..." on POST /tasks/{id}/comments and PATCH
+  /tasks/{id}; kanban_complete (new rejection class foreign_card), kanban_archive and kanban_comment tool paths; CLI
+  `hermes kanban complete` / `archive`. A pickup copy in the live file is unchanged (completes into the outbox).
+- hermes_cli/kanban_queue_position.py: ready live cards get queue {lane: local, ahead, running, limit,
+  approximate} (ahead = same-assignee unclaimed, non-worker-first ready cards with higher priority or same priority
+  and older), or
+  {lane: worker_pool, reason: <kanban_queue_reason code>} for worker-first-v1 cards. Other statuses: no key.
+
+Proof: tests/plugins/test_kanban_foreign_card_api.py (16) + tests/hermes_cli/test_kanban_foreign_card_writes.py
+(9, incl. two-gateway fake-Board e2e). Parent: 12 fail (404 / KeyError source,queue / stale_run / generic
+messages); the 8 controls (missing-everywhere 404, unsynced board 404, live comment, done card no queue, unknown id
+stale_run, pickup copy completes) pass on both. Fix: 25/25 (3 later guard tests: no-replica 404 creates no file, replica_path of the replica itself, created_on without the sync column). Mutants killed: dropping claim_lock IS NULL from ahead, dropping the live-file check in owner_of (pickup e2e fails). Regression: tests/plugins + complete/archive tool
+suites + test_kanban_cli + test_kanban_worker_node, 2090 passed. Live probe on hermes-hub's real board:
+t_01a1a36257482229 (created_on=worker-1) -> 200 source=replica owner=worker-1; a ready hub card ->
+queue {lane: local, ahead: 2, running: 9, limit: 7}.
+
+Card: t_01a1a015ef0013bd
+
+Desktop half (prefers a live holder over a replica answer, passes foreign_card verbatim): hermes-mods e18a3768.
+Review (Opus): its blocking finding (a replica answer shadowing a reachable live holder in cross_task) is fixed
+there; probe-failure connection leak fixed + tested; worker-first cards excluded from the local `ahead`.
+Out of scope, unchanged (still the old generic errors on replica-only cards): attachments, delete, reclaim,
+specify, reassign, block/unblock, move, link, CLI comment/block/edit/assign, kanban_show.
+---
+ hermes_cli/kanban.py                          |   8 +
+ hermes_cli/kanban_foreign_card.py             | 142 +++++++++
+ hermes_cli/kanban_owner_archive_relay.py      |   5 +-
+ hermes_cli/kanban_queue_position.py           |  60 ++++
+ plugins/kanban/dashboard/plugin_api.py        |  88 ++++--
+ .../test_kanban_foreign_card_writes.py        | 189 +++++++++++
+ tests/plugins/test_kanban_foreign_card_api.py | 295 ++++++++++++++++++
+ tools/kanban_tools.py                         |  15 +-
+ 8 files changed, 773 insertions(+), 29 deletions(-)
+ create mode 100644 hermes_cli/kanban_foreign_card.py
+ create mode 100644 hermes_cli/kanban_queue_position.py
+ create mode 100644 tests/hermes_cli/test_kanban_foreign_card_writes.py
+ create mode 100644 tests/plugins/test_kanban_foreign_card_api.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 45b7c19676d..b37f40b1e2e 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -27,6 +27,7 @@ from hermes_cli import kanban_db_operator as kbo
+ from hermes_cli import kanban_swarm as ks
+ from hermes_cli import kanban_workflow
+ from hermes_cli import kanban_contract_cli as _contract_cli
++from hermes_cli import kanban_foreign_card as _foreign_card
+ from hermes_cli.kanban_output import (
+     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
+     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
+@@ -1261,6 +1262,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+                 fail_msg[tid] = gate_err
+                 return False
+             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
++            foreign = _foreign_card.refusal(conn, tid)  # [daveey] only a replica copy here: name the owner
++            if foreign:
++                fail_msg[tid] = f"cannot complete {tid}: {_foreign_card.REJECTION}: {foreign}"
++                return False
+             try:
+                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
+                                         goal_verification=verified[0] if verified else None,
+@@ -1586,6 +1591,9 @@ def _cmd_archive(args: argparse.Namespace) -> int:
+                                lambda tid: f"cannot delete {tid} (must already be archived)")
+         vias: dict[str, Optional[str]] = {}
+         for tid in ids:
++            foreign = _foreign_card.refusal(conn, tid)  # [daveey] only a replica copy here: name the owner
++            if foreign:
++                return _err(f"cannot archive {tid}: {_foreign_card.REJECTION}: {foreign}")
+             refusal, vias[tid] = worker_archive_scope(conn, tid)
+             if refusal:
+                 return _err(refusal)
+diff --git a/hermes_cli/kanban_foreign_card.py b/hermes_cli/kanban_foreign_card.py
+new file mode 100644
+index 00000000000..3a337e13547
+--- /dev/null
++++ b/hermes_cli/kanban_foreign_card.py
+@@ -0,0 +1,142 @@
++"""Cards this gateway holds only as a Board replica copy: read them there, refuse writes naming the owner. [daveey]
++
++On a synced board the live ``kanban.db`` holds only this gateway's own cards (plus copies the worker-node pickup
++made); the replica (``kanban/sync-shadow/<board>.db``) holds the whole board (``hermes_cli.kanban_worker_node``).
++A card another gateway created (a Board worker node such as worker-1, which no Desktop can reach) therefore read as
++404 on every gateway, and a write on it was refused as ``unknown id`` / ``stale_run``, so a chat checking a worker's
++named follow-up concluded the card was a phantom (t_01a19fd40c53bb19, 2026-11-02).
++
++:func:`open_replica` opens the replica read-only when the board syncs. :func:`owner_of` answers whether a card
++exists only there and who created it; :func:`refusal` is the one message every write path returns for it, tagged
++with the stable rejection :data:`REJECTION`.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++from contextlib import contextmanager
++from pathlib import Path
++from typing import Iterator, Optional
++
++_log = logging.getLogger(__name__)
++
++REJECTION = "foreign_card"
++_UNSET = object()
++
++
++class ForeignCardError(Exception):
++    """A write on a card this gateway has only as a replica copy."""
++
++    def __init__(self, task_id: str, owner: Optional[str]):
++        self.task_id = task_id
++        self.owner = owner
++        super().__init__(message(task_id, owner))
++
++
++def message(task_id: str, owner: Optional[str]) -> str:
++    return (f"{task_id} was created on {owner or 'another gateway'} and lives there; this gateway has only a "
++            "replica copy. Its owner or the Board must write it.")
++
++
++def replica_path(db_path: Optional[str]) -> Optional[Path]:
++    """The replica of the board whose live file is ``db_path``, when ``kanban.sync`` syncs that board and the
++    replica exists; None otherwise (sync off, board not selected, no replica yet, or ``db_path`` is the replica)."""
++    if not db_path:
++        return None
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as ksc
++    config = sync.sync_config()
++    if not config.get("enabled") or not sync.board_selected(str(db_path), config):
++        return None
++    path = ksc.shadow_path(sync.board_slug_for_path(str(db_path)))
++    try:
++        if not path.is_file() or path.resolve() == Path(db_path).resolve():
++            return None
++    except OSError:
++        return None
++    return path
++
++
++def _ro(path: Path) -> sqlite3.Connection:
++    """Read-only open; ``mode=ro`` refuses a WAL db whose -shm is absent, so fall back to ``query_only``."""
++    from hermes_cli import kanban_lockguard
++    conn = None
++    try:
++        conn = kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
++        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
++    except sqlite3.OperationalError:
++        if conn is not None:  # opened but the probe failed: close it before the fallback replaces it
++            conn.close()
++        conn = kanban_lockguard.connect(f"file:{path}?mode=rw", uri=True, timeout=5)
++        conn.execute("PRAGMA query_only = ON")
++    conn.row_factory = sqlite3.Row
++    return conn
++
++
++@contextmanager
++def open_replica(db_path: Optional[str]) -> Iterator[Optional[sqlite3.Connection]]:
++    """A read-only connection to the board's replica (see :func:`replica_path`), or None. Closed on exit."""
++    path = replica_path(db_path)
++    conn = None
++    if path is not None:
++        try:
++            conn = _ro(path)
++        except sqlite3.Error as exc:  # an unreadable replica is a miss, as before this fallback existed
++            _log.info("kanban: replica %s unreadable (%s)", path, exc)
++            conn = None
++    try:
++        yield conn
++    finally:
++        if conn is not None:
++            conn.close()
++
++
++def created_on(conn: sqlite3.Connection, task_id: str):
++    """The card's ``created_on`` in ``conn`` (None when the column is NULL), or ``_UNSET`` when it has no row."""
++    try:
++        row = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    except sqlite3.OperationalError:  # an unsynced schema has no created_on column
++        row = conn.execute("SELECT NULL FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return _UNSET if row is None else row[0]
++
++
++def _live_db_file(conn: sqlite3.Connection) -> Optional[str]:
++    from hermes_cli.kanban_db_connect import _main_db_file
++    return _main_db_file(conn)
++
++
++def owner_of(conn: sqlite3.Connection, task_id: str) -> tuple[bool, Optional[str]]:
++    """``(replica_only, owner)`` for ``task_id`` against the live connection ``conn``.
++
++    ``replica_only`` is True when the live file lacks the card and the board's replica has it; ``owner`` is then
++    the replica row's ``created_on``. A card in the live file, or in neither, is ``(False, None)``.
++    """
++    try:
++        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
++            return False, None
++    except sqlite3.Error:
++        return False, None
++    with open_replica(_live_db_file(conn)) as replica:
++        if replica is None:
++            return False, None
++        try:
++            owner = created_on(replica, task_id)
++        except sqlite3.Error as exc:
++            _log.info("kanban: replica lookup of %s failed (%s)", task_id, exc)
++            return False, None
++    if owner is _UNSET:
++        return False, None
++    return True, (None if owner is None else str(owner))
++
++
++def refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """The :func:`message` when ``task_id`` exists only in the replica, else None."""
++    only, owner = owner_of(conn, task_id)
++    return message(task_id, owner) if only else None
++
++
++def check(conn: sqlite3.Connection, task_id: str) -> None:
++    """Raise :class:`ForeignCardError` when ``task_id`` exists only in the replica."""
++    only, owner = owner_of(conn, task_id)
++    if only:
++        raise ForeignCardError(task_id, owner)
+diff --git a/hermes_cli/kanban_owner_archive_relay.py b/hermes_cli/kanban_owner_archive_relay.py
+index 1919407ead1..ae7e5dd155d 100644
+--- a/hermes_cli/kanban_owner_archive_relay.py
++++ b/hermes_cli/kanban_owner_archive_relay.py
+@@ -212,7 +212,8 @@ def worker_archive(conn: sqlite3.Connection, tid: str, *,
+ 
+     A ``relay=home`` owner card this board lacks is forwarded home (:func:`forward`). Any other card gets the local
+     scope rule, then :func:`hermes_cli.kanban_remote_stop.archive`: a card another machine runs under its live
+-    Board lease gets a stop request, since the Board would reject the status write (live_claim).
++    Board lease gets a stop request, since the Board would reject the status write (live_claim). A card this
++    gateway has only as a replica copy raises :class:`hermes_cli.kanban_foreign_card.ForeignCardError`.
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban import worker_archive_scope
+@@ -227,6 +228,8 @@ def worker_archive(conn: sqlite3.Connection, tid: str, *,
+                 return str(out.get("error") or f"cannot archive {tid}"), None
+             out.pop("task_id", None)
+             return None, out
++    from hermes_cli import kanban_foreign_card as kfc
++    kfc.check(conn, tid)  # [daveey] a card only in the Board replica: raise ForeignCardError naming its owner
+     refusal, via = worker_archive_scope(conn, tid)
+     if refusal:
+         return refusal, None
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+new file mode 100644
+index 00000000000..fc52aa063e2
+--- /dev/null
++++ b/hermes_cli/kanban_queue_position.py
+@@ -0,0 +1,60 @@
++"""Where a ``ready`` card stands in the queue that will start it, for task reads. [daveey]
++
++A ready card with no claim for hours looked the same as a stuck one, so chats re-investigated queued cards
++(three times in a day, 2026-11-02/03). The hub's own dispatcher claims ready cards by priority, then age
++(``kanban_db_dispatch_queries.lane_rows``), under a host concurrency cap; a ``worker-first-v1`` card waits for the
++worker pool instead, and the Board's last answer about it is stored by ``kanban_queue_reason``.
++
++:func:`position` returns ``{"lane": "local", "ahead", "running", "limit", "approximate": True}`` or
++``{"lane": "worker_pool", "reason": <code>}``; None for a card that is not ready.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++from typing import Any, Optional
++
++_log = logging.getLogger(__name__)
++
++
++def _ahead(conn: sqlite3.Connection, task) -> int:
++    """Unclaimed ready cards of the same assignee the dispatcher reaches first (higher priority, or the same
++    priority and created earlier). Worker-first cards wait for the pool, not a local slot, so they are not ahead."""
++    from hermes_cli.kanban_worker_placement import POLICY
++    return int(conn.execute(
++        "SELECT COUNT(*) FROM tasks WHERE status = 'ready' AND claim_lock IS NULL AND id != ? AND assignee IS ? "
++        "AND placement_policy IS NOT ? AND (priority > ? OR (priority = ? AND created_at < ?))",
++        (task.id, task.assignee, POLICY, int(task.priority or 0), int(task.priority or 0), int(task.created_at or 0)),
++    ).fetchone()[0])
++
++
++def _running_and_limit(conn: sqlite3.Connection, board: Optional[str]) -> tuple[Optional[int], Optional[int]]:
++    """The host's running workers (every board) and its ``max_in_progress`` cap, as the dispatcher counts them."""
++    from hermes_cli import kanban_db_dispatch as kbd
++    try:
++        running = kbd.count_running_tasks(conn) + kbd.count_running_tasks_other_boards(board)
++    except Exception:  # health: allow BLE001 -- an unreadable count is unknown, not zero
++        _log.debug("kanban queue position: running count unavailable", exc_info=True)
++        running = None
++    try:
++        limit = kbd.resolve_max_in_progress(kbd.configured_max_in_progress())
++    except Exception:  # health: allow BLE001 -- an unreadable cap is unknown
++        _log.debug("kanban queue position: cap unavailable", exc_info=True)
++        limit = None
++    return running, limit
++
++
++def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
++    """The queue a ``ready`` ``task`` in this gateway's live file waits in; None for any other status."""
++    if task is None or task.status != "ready":
++        return None
++    from hermes_cli.kanban_worker_placement import POLICY
++    if getattr(task, "placement_policy", None) == POLICY:
++        from hermes_cli import kanban_queue_reason as kqr
++        try:
++            value = kqr.latest(conn, task.id)
++        except (sqlite3.Error, IndexError):  # an unsynced schema has no lease columns: no stored reason
++            value = None
++        return {"lane": "worker_pool", "reason": (value or {}).get("code")}
++    running, limit = _running_and_limit(conn, board)
++    return {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True}
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 219cdc04b2d..adf98fd7474 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -390,34 +390,66 @@ def get_task(
+     board: Optional[str] = Query(None),
+     run_state_type: Optional[str] = Query(None, description="With run_state_name: filter runs by column 'status' or 'outcome'"),
+     run_state_name: Optional[str] = Query(None, description="With run_state_type: exact value for that run column")):
++    if (run_state_type is None) ^ (run_state_name is None):
++        raise HTTPException(status_code=400, detail="run_state_type and run_state_name must be passed together or omitted")
++    if run_state_type not in (None, "status", "outcome"):
++        raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
++    from hermes_cli import kanban_foreign_card as kfc
+     with _board_conn(board) as (board, conn):
+-        if (run_state_type is None) ^ (run_state_name is None):
+-            raise HTTPException(status_code=400, detail="run_state_type and run_state_name must be passed together or omitted")
+-        if run_state_type not in (None, "status", "outcome"):
+-            raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
+-        task = _require_task(conn, task_id)
+-        # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
+-        task_d = _task_dict(
+-            task, latest_summary=kanban_db.latest_summary(conn, task_id),
+-            current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id))
+-        links = _links_for(conn, task_id)
+-        child_summaries = kanban_db.latest_summaries(conn, links["children"])
+-        children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
+-        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
+-        from hermes_cli import kanban_wake_check as kwc
+-        task_d["wake_check"] = kwc.get_state(conn, task_id)  # condition wake probe [daveey]
+-        return {
+-            "task": task_d,
+-            "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
+-            "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
+-            "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
+-            "links": links,
+-            "link_tasks": _link_tasks(conn, links),
+-            "child_results": [
+-                {"id": c.id, "title": c.title, "status": c.status, "latest_summary": child_summaries.get(c.id), "result": c.result}
+-                for c in children],
+-            "runs": _runs_with_worker_sessions(
+-                conn, task_id, kanban_db.list_runs(conn, task_id, state_type=run_state_type, state_name=run_state_name))}
++        task = kanban_db.get_task(conn, task_id)
++        if task is not None:
++            out = _task_detail(conn, task, run_state_type, run_state_name)
++            from hermes_cli import kanban_queue_position as kqp
++            queue = kqp.position(conn, task, board)  # [daveey] a long wait reads as queued, not stuck
++            if queue is not None:
++                out["queue"] = queue
++            return {**out, "source": "live"}
++        live_file = kbc._main_db_file(conn)
++    # [daveey] A synced board's live file holds only this gateway's own cards; a card another gateway created
++    # (a Board worker node no Desktop reaches) is read from the board replica, named with its owner.
++    with kfc.open_replica(live_file) as replica:
++        task = kanban_db.get_task(replica, task_id) if replica is not None else None
++        if replica is not None and task is not None:
++            owner = kfc.created_on(replica, task_id)
++            out = _task_detail(replica, task, run_state_type, run_state_name)
++            return {**out, "source": "replica", "owner": None if owner is kfc._UNSET else owner}
++    raise HTTPException(status_code=404, detail=f"task {task_id} not found")
++
++
++def _task_detail(conn: sqlite3.Connection, task: kanban_db.Task, run_state_type: Optional[str],
++                 run_state_name: Optional[str]) -> dict[str, Any]:
++    """The GET /tasks/:id payload for ``task`` read from ``conn`` (the live file or the board replica)."""
++    task_id = task.id
++    # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
++    task_d = _task_dict(
++        task, latest_summary=kanban_db.latest_summary(conn, task_id),
++        current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id))
++    links = _links_for(conn, task_id)
++    child_summaries = kanban_db.latest_summaries(conn, links["children"])
++    children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
++    _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
++    from hermes_cli import kanban_wake_check as kwc
++    task_d["wake_check"] = kwc.get_state(conn, task_id)  # condition wake probe [daveey]
++    return {
++        "task": task_d,
++        "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
++        "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
++        "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
++        "links": links,
++        "link_tasks": _link_tasks(conn, links),
++        "child_results": [
++            {"id": c.id, "title": c.title, "status": c.status, "latest_summary": child_summaries.get(c.id), "result": c.result}
++            for c in children],
++        "runs": _runs_with_worker_sessions(
++            conn, task_id, kanban_db.list_runs(conn, task_id, state_type=run_state_type, state_name=run_state_name))}
++
++
++def _foreign_card_409(conn: sqlite3.Connection, task_id: str) -> None:
++    """409 ``foreign_card: <message naming the owner>`` when ``task_id`` exists only in the board replica. [daveey]"""
++    from hermes_cli import kanban_foreign_card as kfc
++    msg = kfc.refusal(conn, task_id)
++    if msg:
++        raise HTTPException(status_code=409, detail=f"{kfc.REJECTION}: {msg}")
+ 
+ 
+ # --- POST /tasks ------------------------------------------------------------
+@@ -778,6 +810,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
+ 
+     actor = classification_actor(request) if payload.metadata_only else ""
+     with _board_conn(board) as (board, conn):
++        _foreign_card_409(conn, task_id)
+         _require_task(conn, task_id)
+         if (refusal := ask_filing_refusal(conn, task_id, payload)):
+             raise _conflict(refusal)
+@@ -897,6 +930,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
+     if not payload.body.strip():
+         raise HTTPException(status_code=400, detail="body is required")
+     with _board_conn(board) as (board, conn):
++        _foreign_card_409(conn, task_id)
+         _require_task(conn, task_id)
+         kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body)
+         return {"ok": True}
+diff --git a/tests/hermes_cli/test_kanban_foreign_card_writes.py b/tests/hermes_cli/test_kanban_foreign_card_writes.py
+new file mode 100644
+index 00000000000..6cc4863245d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_foreign_card_writes.py
+@@ -0,0 +1,189 @@
++"""Writes on a card this gateway holds only as a Board replica copy name the owner (``foreign_card``). [daveey]
++
++``kanban_complete`` used to answer ``stale_run`` ("unknown id, stale run, or already terminal"), ``kanban_archive``
++"cannot archive <id>", and ``hermes kanban complete`` "unknown id or terminal state" for a card a Board worker
++node created (t_01a19fd40c53bb19). Each now says the card lives on its creator. A copy the worker-node pickup made
++into the live file is still the local path and completes normally.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++
++OWNER_TEXT = "was created on worker-1 and lives there; this gateway has only a replica copy"
++
++
++@pytest.fixture
++def home(monkeypatch, tmp_path):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return kb.kanban_home()
++
++
++def replica_card(home: Path, owner: str = "worker-1") -> str:
++    path = home / "kanban" / sync.SHADOW_DIR / "default.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = kbc.connect(path)
++    try:
++        tid = kb.create_task(conn, title="made on worker-1", assignee="test-worker")
++        if "created_on" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++            conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++        conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", (owner, tid))
++        conn.commit()
++    finally:
++        conn.close()
++    return tid
++
++
++@pytest.fixture
++def synced(home, monkeypatch):
++    tid = replica_card(home)
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": True, "boards": ["default"]})
++    return tid
++
++
++def cli(*argv: str) -> int:
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kc.build_parser(parser.add_subparsers(dest="command"))
++    return kc.kanban_command(parser.parse_args(["kanban", *argv]))
++
++
++def test_tool_complete_names_owner_not_stale_run(synced):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_complete({"task_id": synced, "summary": "done"}))
++    assert out["rejection"] == "foreign_card", out
++    assert OWNER_TEXT in out["error"]
++    assert "foreign_card" in kt.COMPLETE_REJECTION_CLASSES
++
++
++def test_tool_complete_unknown_id_is_still_stale_run(synced):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_complete({"task_id": "t_0000000000000000", "summary": "done"}))
++    assert out["rejection"] == "stale_run", out
++
++
++def test_tool_archive_names_owner(synced):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_archive({"task_id": synced}))
++    assert out.get("rejection") == "foreign_card", out
++    assert OWNER_TEXT in out["error"]
++
++
++def test_tool_comment_names_owner(synced):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_comment({"task_id": synced, "body": "hello"}))
++    assert out.get("rejection") == "foreign_card", out
++    assert OWNER_TEXT in out["error"]
++
++
++def test_cli_complete_names_owner(synced, capsys):
++    assert cli("complete", synced, "--summary", "done") == 1
++    err = capsys.readouterr().err
++    assert f"cannot complete {synced}: foreign_card: {synced} {OWNER_TEXT}" in err
++    assert "unknown id or terminal state" not in err
++
++
++def test_cli_archive_names_owner(synced, capsys):
++    assert cli("archive", synced) != 0
++    err = capsys.readouterr().err
++    assert f"cannot archive {synced}: foreign_card: {synced} {OWNER_TEXT}" in err
++
++
++def test_picked_up_copy_completes_and_lands_in_live_file(synced, capsys):
++    """The worker-node pickup copies the replica row into the live file: that copy is local and completes."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="picked-up copy", assignee="test-worker")
++    assert cli("complete", tid, "--summary", "done") == 0
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == "done"
++    assert "foreign_card" not in capsys.readouterr().err
++
++
++# --- end to end: two gateways on the fake Board (the worker-node fixture) --------------------------------------
++
++def _api_client():
++    import importlib.util
++    import sys
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    plugin = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
++    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_kanban_foreign_e2e", plugin)
++    assert spec is not None and spec.loader is not None
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    app = FastAPI()
++    app.include_router(mod.router, prefix="/api/plugins/kanban")
++    return TestClient(app)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch):
++    from tests.hermes_cli import test_kanban_worker_node as twn
++    from tests.hermes_cli.kanban_sync_fake_board import FakeService
++    svc = FakeService(lease_runs=True)
++    gen = twn.gws.__wrapped__(tmp_path, monkeypatch, svc)
++    hub, worker = next(gen)
++    yield hub, worker, svc
++    next(gen, None)
++
++
++def test_e2e_worker_created_card_reads_from_hub_replica_and_refuses_hub_writes(gws, capsys):
++    hub, worker, _svc = gws
++    worker.enter()
++    tid = kb.create_task(worker.conn, title="made on worker-1", assignee="default", runs_on=["machine:hub"])
++    worker.round()
++    hub.round()
++    hub.enter()
++    assert kb.get_task(hub.conn, tid) is None  # the hub's live file holds only its own cards
++    api = _api_client()
++    body = api.get(f"/api/plugins/kanban/tasks/{tid}").json()
++    assert (body["source"], body["owner"], body["task"]["title"]) == ("replica", "worker-1", "made on worker-1")
++    r = api.post(f"/api/plugins/kanban/tasks/{tid}/comments", json={"body": "hi"})
++    assert r.status_code == 409 and r.json()["detail"].startswith(f"foreign_card: {tid} {OWNER_TEXT}")
++    assert cli("complete", tid, "--summary", "done") == 1
++    assert f"foreign_card: {tid} {OWNER_TEXT}" in capsys.readouterr().err
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "done"}))
++    assert out["rejection"] == "foreign_card"
++
++
++def test_e2e_picked_up_copy_completes_into_the_outbox(gws, monkeypatch, capsys):
++    hub, worker, _svc = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="hub card", assignee="default", runs_on=["linux"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    worker.enter()
++    task = kb.get_task(worker.conn, tid)
++    assert task is not None and task.status == "running"  # the pickup copy, claimed under the Board lease
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
++    assert cli("complete", tid, "--summary", "done on the worker") == 0, capsys.readouterr().err
++    pending = worker.conn.execute(
++        "SELECT COUNT(*) FROM kanban_sync_outbox WHERE state != 'rejected' AND (row_uid = ? OR "
++        "json_extract(fields, '$.task_id') = ?)", (tid, tid)).fetchone()[0]
++    assert pending > 0
++    worker.round()
++    hub.round()
++    hub.enter()
++    done = kb.get_task(hub.conn, tid)
++    assert done is not None and done.status == "done"
+diff --git a/tests/plugins/test_kanban_foreign_card_api.py b/tests/plugins/test_kanban_foreign_card_api.py
+new file mode 100644
+index 00000000000..5796f61256b
+--- /dev/null
++++ b/tests/plugins/test_kanban_foreign_card_api.py
+@@ -0,0 +1,295 @@
++"""GET/PATCH/comment on a card another gateway created, which this gateway has only in the Board replica. [daveey]
++
++A synced board's live file holds only this gateway's own cards; the replica (``kanban/sync-shadow/<board>.db``)
++holds the whole board. A card created on a Board worker node (worker-1) read as 404 on every gateway, so a chat
++concluded it was a phantom (t_01a19fd40c53bb19). Reads now fall back to the replica (``source: replica`` +
++``owner``); writes are refused 409 ``foreign_card`` naming the owner. Ready live cards carry a ``queue`` position.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import sqlite3
++import sys
++from pathlib import Path
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++
++
++def _load_plugin_router():
++    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
++    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_kanban_foreign_card_test", plugin_file)
++    assert spec is not None and spec.loader is not None
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    return mod.router
++
++
++def make_replica_card(home: Path, *, title: str = "Made on worker-1", owner: str = "worker-1",
++                      board: str = "default") -> str:
++    """A full-schema replica at ``<home>/kanban/sync-shadow/<board>.db`` holding one card ``owner`` created."""
++    path = home / "kanban" / sync.SHADOW_DIR / f"{board}.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = kbc.connect(path)
++    try:
++        tid = kb.create_task(conn, title=title, assignee="default")
++        kb.add_comment(conn, tid, author="worker", body="from the worker")
++        cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++        if "created_on" not in cols:
++            conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++        conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", (owner, tid))
++        conn.commit()
++    finally:
++        conn.close()
++    return tid
++
++
++def enable_sync(monkeypatch, boards=("default",)) -> None:
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": True, "boards": list(boards)})
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return kb.kanban_home()
++
++
++@pytest.fixture
++def api(kanban_home):
++    app = FastAPI()
++    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
++    return TestClient(app)
++
++
++def _live_card(title="Live card", **kw) -> str:
++    conn = kbc.connect()
++    try:
++        return kb.create_task(conn, title=title, **kw)
++    finally:
++        conn.close()
++
++
++def test_replica_only_card_reads_with_source_and_owner(kanban_home, api, monkeypatch):
++    tid = make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    r = api.get(f"/api/plugins/kanban/tasks/{tid}")
++    assert r.status_code == 200, r.text
++    body = r.json()
++    assert body["source"] == "replica"
++    assert body["owner"] == "worker-1"
++    assert body["task"]["id"] == tid and body["task"]["title"] == "Made on worker-1"
++    assert [c["body"] for c in body["comments"]] == ["from the worker"]
++    assert "queue" not in body  # queue position is for the live dispatcher's own cards
++
++
++def test_replica_ignored_when_board_does_not_sync(kanban_home, api, monkeypatch):
++    tid = make_replica_card(kanban_home)
++    enable_sync(monkeypatch, boards=("other",))
++    assert api.get(f"/api/plugins/kanban/tasks/{tid}").status_code == 404
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": False})
++    assert api.get(f"/api/plugins/kanban/tasks/{tid}").status_code == 404
++
++
++def test_live_card_unchanged_plus_source_live(kanban_home, api, monkeypatch):
++    make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    tid = _live_card()
++    body = api.get(f"/api/plugins/kanban/tasks/{tid}").json()
++    assert body["source"] == "live"
++    assert "owner" not in body
++    assert set(body) >= {"task", "comments", "events", "attachments", "links", "link_tasks", "child_results", "runs"}
++
++
++def test_missing_everywhere_is_404(kanban_home, api, monkeypatch):
++    make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    r = api.get("/api/plugins/kanban/tasks/t_0000000000000000")
++    assert r.status_code == 404
++    assert "not found" in r.json()["detail"]
++
++
++def test_comment_on_replica_only_card_is_409_foreign_card(kanban_home, api, monkeypatch):
++    tid = make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    r = api.post(f"/api/plugins/kanban/tasks/{tid}/comments", json={"body": "hi", "author": "chat"})
++    assert r.status_code == 409, r.text
++    detail = r.json()["detail"]
++    assert detail.startswith("foreign_card: ")
++    assert f"{tid} was created on worker-1 and lives there" in detail
++    assert "Its owner or the Board must write it." in detail
++
++
++def test_patch_on_replica_only_card_is_409_foreign_card(kanban_home, api, monkeypatch):
++    tid = make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    r = api.patch(f"/api/plugins/kanban/tasks/{tid}", json={"priority": 5})
++    assert r.status_code == 409, r.text
++    assert r.json()["detail"].startswith(f"foreign_card: {tid} was created on worker-1")
++
++
++def test_comment_on_missing_card_stays_404(kanban_home, api, monkeypatch):
++    make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    r = api.post("/api/plugins/kanban/tasks/t_0000000000000000/comments", json={"body": "hi"})
++    assert r.status_code == 404
++
++
++def test_comment_on_live_card_still_lands(kanban_home, api, monkeypatch):
++    make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    tid = _live_card()
++    assert api.post(f"/api/plugins/kanban/tasks/{tid}/comments", json={"body": "ok"}).status_code == 200
++
++
++# --- queue position (ready cards in the live file) -------------------------------------------
++
++def _set(tid, **cols):
++    conn = kbc.connect()
++    try:
++        for k, v in cols.items():
++            conn.execute(f"UPDATE tasks SET {k} = ? WHERE id = ?", (v, tid))
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def test_ready_card_reports_local_queue_position(kanban_home, api, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as kbd
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 6)
++    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 2)
++    high = _live_card("p5 new", assignee="default", priority=5)
++    old = _live_card("p0 old", assignee="default", priority=0)
++    new = _live_card("p0 new", assignee="default", priority=0)
++    other = _live_card("p9 other assignee", assignee="someone-else", priority=9)
++    running = _live_card("running", assignee="default", priority=0)
++    claimed = _live_card("claimed ready", assignee="default", priority=9)
++    pool = _live_card("worker-first", assignee="default", priority=9)
++    _set(old, created_at=100)
++    _set(new, created_at=200)
++    _set(high, created_at=300)
++    _set(other, created_at=50)
++    _set(running, status="running", created_at=10)
++    _set(claimed, claim_lock="host:1", created_at=10)  # being claimed this tick: not ahead in the lane
++    from hermes_cli import kanban_worker_placement as kwp
++    _set(pool, placement_policy=kwp.POLICY, created_at=10)  # waits for the worker pool, not a local slot
++    q = api.get(f"/api/plugins/kanban/tasks/{new}").json()["queue"]
++    assert q == {"lane": "local", "ahead": 2, "running": 3, "limit": 6, "approximate": True}
++    assert api.get(f"/api/plugins/kanban/tasks/{old}").json()["queue"]["ahead"] == 1
++    assert api.get(f"/api/plugins/kanban/tasks/{high}").json()["queue"]["ahead"] == 0
++
++
++def test_done_card_has_no_queue(kanban_home, api):
++    tid = _live_card()
++    _set(tid, status="done")
++    assert "queue" not in api.get(f"/api/plugins/kanban/tasks/{tid}").json()
++
++
++def test_worker_first_card_reports_worker_pool_reason(kanban_home, api):
++    from hermes_cli import kanban_worker_placement as kwp
++    tid = _live_card()
++    _set(tid, placement_policy=kwp.POLICY)
++    conn = kbc.connect()
++    try:
++        cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++        for col in ("lease_holder", "runs_on"):  # synced schema (worker-first cards live on synced boards)
++            if col not in cols:
++                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
++        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, 1)",
++                     (tid, "worker_queue_reason", json.dumps(
++                         {"version": 1, "code": "no_live_candidate", "candidates": [],
++                          "lifecycle": {"runs_on": None, "run_count": 0}})))
++        conn.commit()
++    finally:
++        conn.close()
++    q = api.get(f"/api/plugins/kanban/tasks/{tid}").json()["queue"]
++    assert q == {"lane": "worker_pool", "reason": "no_live_candidate"}
++
++
++def test_replica_open_falls_back_to_query_only(kanban_home, monkeypatch):
++    """``mode=ro`` refuses a WAL replica whose -shm is absent; the fallback still reads it."""
++    from hermes_cli import kanban_foreign_card as kfc
++    tid = make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    from hermes_cli import kanban_lockguard
++    orig = kanban_lockguard.connect
++    seen = []
++
++    def flaky(database, *a, **kw):
++        seen.append(str(database))
++        if "mode=ro" in str(database):
++            raise sqlite3.OperationalError("unable to open database file")
++        return orig(database, *a, **kw)
++
++    monkeypatch.setattr(kanban_lockguard, "connect", flaky)
++    with kfc.open_replica(str(kb.kanban_db_path())) as replica:
++        assert replica is not None
++        assert replica.execute("PRAGMA query_only").fetchone()[0] == 1
++        assert kfc.created_on(replica, tid) == "worker-1"
++    assert any("mode=ro" in s for s in seen) and any("mode=rw" in s for s in seen)
++
++
++def test_sync_on_without_a_replica_is_404_and_creates_nothing(kanban_home, api, monkeypatch):
++    enable_sync(monkeypatch)
++    assert api.get("/api/plugins/kanban/tasks/t_0000000000000000").status_code == 404
++    assert not (kanban_home / "kanban" / sync.SHADOW_DIR / "default.db").exists()
++
++
++def test_replica_path_is_none_for_the_replica_itself(kanban_home, monkeypatch):
++    from hermes_cli import kanban_foreign_card as kfc
++    make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    shadow = kanban_home / "kanban" / sync.SHADOW_DIR / "default.db"
++    assert kfc.replica_path(str(kb.kanban_db_path())) == shadow
++    assert kfc.replica_path(str(shadow)) is None
++    assert kfc.replica_path(None) is None
++
++
++def test_created_on_without_the_sync_column(tmp_path):
++    from hermes_cli import kanban_foreign_card as kfc
++    conn = sqlite3.connect(tmp_path / "plain.db")
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
++    conn.execute("INSERT INTO tasks VALUES ('t_1')")
++    assert kfc.created_on(conn, "t_1") is None
++    assert kfc.created_on(conn, "t_2") is kfc._UNSET
++
++
++def test_replica_open_closes_a_connection_whose_probe_failed(kanban_home, monkeypatch):
++    from hermes_cli import kanban_foreign_card as kfc
++    from hermes_cli import kanban_lockguard
++    make_replica_card(kanban_home)
++    enable_sync(monkeypatch)
++    orig = kanban_lockguard.connect
++    closed = []
++
++    class ProbeFails:
++        def __init__(self, inner):
++            self.inner = inner
++
++        def execute(self, sql, *a):
++            raise sqlite3.OperationalError("probe failed")
++
++        def close(self):
++            closed.append(True)
++            self.inner.close()
++
++    def connect(database, *a, **kw):
++        conn = orig(database, *a, **kw)
++        return ProbeFails(conn) if "mode=ro" in str(database) else conn
++
++    monkeypatch.setattr(kanban_lockguard, "connect", connect)
++    with kfc.open_replica(str(kb.kanban_db_path())) as replica:
++        assert replica is not None and replica.execute("PRAGMA query_only").fetchone()[0] == 1
++    assert closed == [True]
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index b4bea973898..ec41bc9a0e8 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -155,6 +155,7 @@ COMPLETE_REJECTION_CLASSES = frozenset({
+     "empty",          # no summary/result, or an evidence-free completion
+     "live_claim",     # another live dispatcher worker owns the card
+     "stale_run",      # run superseded, card already terminal, or unknown id
++    "foreign_card",   # card exists here only as a Board replica copy; its owner gateway must write it [daveey]
+     "pr_acceptance",  # completion contract's PR CI acceptance refused (pr_acceptance event ok=false)
+     "parents",        # unsatisfied parent dependencies
+     "not_owner",      # delegate child / other task / unbound run id
+@@ -895,6 +896,10 @@ def _handle_complete(args: dict, **kw) -> str:
+     _require_dict_metadata(metadata)
+     metadata = _stamp_worker_session_metadata(tid, metadata)
+     with _board(args.get("board")) as (kb, conn):
++        from hermes_cli import kanban_foreign_card as _kfc
++        foreign = _kfc.refusal(conn, tid)  # [daveey] only a replica copy here: name the owner, not "stale run"
++        if foreign:
++            raise _Reject(foreign, _kfc.REJECTION)
+         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
+         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
+         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
+@@ -1366,6 +1371,10 @@ def _handle_comment(args: dict, **kw) -> str:
+     # with what reads as a system directive. See #19713.
+     author = _persisted_identity()
+     with _board(args.get("board")) as (kb, conn):
++        from hermes_cli import kanban_foreign_card as _kfc
++        foreign = _kfc.refusal(conn, str(tid))  # [daveey] only a replica copy here: name the owner
++        if foreign:
++            raise _Reject(foreign, _kfc.REJECTION)
+         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+         subscribed = _maybe_subscribe_on_touch(conn, str(tid))
+         live = kb.live_run_id(conn, str(tid))
+@@ -1896,8 +1905,12 @@ def _handle_archive(args: dict, **kw) -> str:
+     tid = str(tid)
+     with _board(args.get("board")) as (_kb, conn):
+         # [daveey] Scope rule, stop request for a card leased elsewhere, relayed owner card forwarded home.
++        from hermes_cli import kanban_foreign_card as _kfc
+         from hermes_cli.kanban_owner_archive_relay import worker_archive
+-        refusal, out = worker_archive(conn, tid, run_id_fn=_worker_run_id)
++        try:
++            refusal, out = worker_archive(conn, tid, run_id_fn=_worker_run_id)
++        except _kfc.ForeignCardError as exc:
++            raise _Reject(str(exc), _kfc.REJECTION) from None
+         if refusal:
+             raise _Reject(refusal)
+         _check(out, f"cannot archive {tid}")
+-- 
+2.55.0
+

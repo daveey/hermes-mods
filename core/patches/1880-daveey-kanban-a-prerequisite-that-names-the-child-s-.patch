@@ -1,0 +1,228 @@
+From 0f4792607ebeaa5c1a015f349b75357d194d7e67 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 04:04:34 -0800
+Subject: [PATCH] [daveey] kanban: a prerequisite that names the child's PR
+ keeps its ordering handoff
+
+Problem: since #728 (f3dea5638be) a parent result that names the child's
+checkpointed PR counts as a review. The ordering handoff then refuses, the
+child stays held by active_pr and a "Fix respawn-guard hold" card is filed.
+Replaying the classifier over every dependency_wait checkpoint on hermes-hub
+flips 27 of 301 parent/child pairs from ordering to review. 21 of them report
+their own work (CI gates, merges, implementations, triage). 6 are reviews or
+size-judge rulings that record their outcome under keys other than
+verdict/approved/reviewed_sha. The pre-#728 rule (581a96495866) classified
+all 27 as ordering.
+
+Why 1: is_review_result returns True for any result whose pr key, "PR #N" or
+URL names a checkpointed PR, and #728 made reviewed_pr a verdict key.
+Why 2: parent results name the child's PR next to keys that record their own
+work or outcome: the 21 prerequisites mention it as context, and the 6
+reviews and rulings are about it but keep their outcome under other keys.
+#728's flaky case, a review whose verdict was lost, carries only the PR
+reference plus keys added without the worker describing anything.
+Why 3: the rule was fitted to the flaky test, whose ordering controls name no
+PR, so nothing exercised a parent that mentions the PR.
+Root (happened): "names the PR" does not separate a lost review from a
+result that records its own work.
+Root (not caught): no fixture or replay used real parent results that
+mention the child's PR. No test reached the empty-capture branch either:
+mutant `if not prs: return True` passed all 31 related files, because
+checkpoint() never stores an empty capture (kanban_dependency_review.py:
+40-41) and no test called is_review_result directly.
+Recurrence: the second false active_pr hold class in 24 h (#752 fixed a
+same-second tie), and the second landed fix in 24 h with surviving mutants
+(#699's, closed by #725).
+
+Fix: infer a review from the PR name only when the metadata holds nothing
+but pr/reviewed_pr, the worker_session_id kanban_complete stamps on a
+dispatcher worker's own result, and artifacts (files the worker lists, by
+artifacts= or by hand, plus scratch-workspace files complete_task finds
+named in the summary or result). reviewed_pr alone is no longer a verdict
+key, as before #728. The docstring says the fallback is a heuristic both
+ways: a prerequisite reported only in prose that names the PR is held, and
+a review that keeps its outcome under other keys gets the continuation.
+Countermeasures: tests for the 5 hub prerequisite shapes, an approved review
+recorded with review_outcome, a lost review citing its report file (end to
+end through complete_task), a lost review completed by the worker's
+kanban_complete tool (worker_session_id + artifacts=), and the empty-capture
+contract. The hermes-mods-repo-core-dev skill now asks for a population
+replay before a rule that matches more lands, and a killing test for each
+condition a fix adds.
+
+Proof: on origin/main, the 5 prerequisite rows and the review_outcome row
+fail (active_pr). Dropping artifacts from _LOST_REVIEW_KEYS fails the
+report-file and worker-tool tests; dropping worker_session_id fails the
+worker-tool test too. `if not prs: return True` fails both empty-capture
+params. The dependency-review files and every test file that references the
+guard pass. A replay over the hub's checkpoints classifies no pair
+differently from pre-#728.
+---
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  4 +-
+ hermes_cli/kanban_dependency_review.py        | 24 ++++--
+ ...est_kanban_dependency_review_no_verdict.py | 81 +++++++++++++++++++
+ 3 files changed, 100 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index cb55a49136b..661ab27d25e 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -393,8 +393,8 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+     if not _awaited_parents(conn, parents, evidence, parked_at):
+         return False
+     awaited = evidence.get("awaited")
+-    # Review results, including incomplete/invalid verdicts, belong exclusively to
+-    # resumes_review. An ordering handoff must not bypass its exact-head checks.
++    # Results is_review_result calls reviews (incomplete or invalid verdicts included)
++    # belong to resumes_review: this handoff must not bypass its exact-head checks. [daveey]
+     for parent in parents:
+         result = conn.execute(
+             "SELECT metadata, summary FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (parent,),
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 63c8c58bd41..7b4cc2e5024 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -194,24 +194,34 @@ def _approval_prs(conn, parent_id, parked_at, owner_run_id, captured: set[str])
+     return named if named is not None else set(captured)
+ 
+ 
+-_REVIEW_KEYS = ("verdict", "approved", "reviewed_sha", "reviewed_pr")
++_REVIEW_KEYS = ("verdict", "approved", "reviewed_sha")
++# Keys a result can carry without its worker describing any work: a PR reference, the
++# session id kanban_complete stamps on a dispatcher worker's own result, and artifacts
++# (files the worker lists, by artifacts= or by hand, plus scratch-workspace files
++# complete_task finds named in the summary or result). Any other key routes by
++# _REVIEW_KEYS alone, so hub reviews that record review_outcome or reviewer_checks, and
++# size-judge rulings, take the ordering continuation as they did before #728. [daveey]
++_LOST_REVIEW_KEYS = frozenset({"pr", "reviewed_pr", "worker_session_id", "artifacts"})
+ 
+ 
+ def is_review_result(metadata, summary, captured) -> bool:
+     """True when a parent's result belongs to the review rules, not the ordering handoff.
+ 
+     Verdict keys or a ``VERDICT:`` line mark a review (a bare ``head`` does not:
+-    operator gates record one). So does a result that
+-    names a checkpointed PR (``pr``/summary ``PR #N`` or URL) with none of them: a
+-    review whose metadata was lost must fail closed on the exact-head check rather
+-    than pass as an ordering prerequisite once the park is a second past the PR.
++    operator gates record one). So does a result with only ``_LOST_REVIEW_KEYS`` that
++    names a checkpointed PR (``pr``/``reviewed_pr`` key, summary ``PR #N`` or URL): it may
++    be a review whose verdict was lost, so it fails closed on the exact-head check rather
++    than passing as an ordering prerequisite once the park is a second past the PR.
++    This fallback is a heuristic both ways: a prerequisite that reports its work only in
++    prose and names the PR is held too, and a review that keeps its outcome under other
++    keys is treated as a prerequisite. [daveey]
+     """
+     if any(key in metadata for key in _REVIEW_KEYS) or _SUMMARY_VERDICT.search(summary or ""):
+         return True
+     prs = {u.rstrip("/").lower() for u in captured or () if isinstance(u, str)}
+-    if not prs:
++    if not prs or not set(metadata) <= _LOST_REVIEW_KEYS:
+         return False
+-    if "pr" in metadata and _named_prs(metadata, prs):
++    if _named_prs(metadata, prs):
+         return True
+     text = (summary or "").lower()
+     nums = set(_SUMMARY_PR_NUM.findall(text))
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py b/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
+index fd1ed94f827..5f7c4f78b22 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
++++ b/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
+@@ -123,13 +123,94 @@ def test_finished_unreadable_review_notices_immediately(board, monkeypatch, fini
+     ({}, "Reviewed PR #682. No blocking defects; one medium finding.", "active_pr"),
+     ({}, "Looked at " + PR + " and found nothing blocking", "active_pr"),
+     ({"pr": PR}, "Review complete", "active_pr"),
++    # A dispatcher worker's completion adds worker_session_id; with only that and a PR reference left, still a review.
++    ({"worker_session_id": "review-session"}, "Reviewed PR #682. No blocking defects.", "active_pr"),
++    ({"reviewed_pr": PR, "worker_session_id": "review-session"}, "Review complete", "active_pr"),
+     # A finished ordering prerequisite that names no checkpointed PR keeps its one continuation.
+     ({}, "ordering work finished", None),
+     ({"head": SHA}, "gate finished", None),
+     ({}, "Unrelated PR #999 merged", None),
++    # So does one that reports its own work and names the child's PR only as context
++    # (shapes from hub results: CI premise, CI gate, implementation, landed sibling fix, CI triage).
++    ({"pr": PR, "head": SHA[:7], "merge_sha": "b" * 40, "ci_run": 40761355194},
++     "PR682 squash-merged; CI run 40761355194 attempt 2 was green.", None),
++    ({"pr": PR, "head": SHA[:7], "ci_run": 1, "decision": "wait"},
++     "PR #682 head is still 80a1696 and not mergeable yet.", None),
++    ({"core_pr": PR, "core_sha": "c" * 40, "core_tests": "37 passed"},
++     "Implemented and published core PR #682 with exact-head tests passing.", None),
++    ({"pr": PR, "merge_commit": "d" * 40, "green_main_run": 1}, "PR #682 merged; main CI is green.", None),
++    ({"reviewed_pr": PR, "resolution": "already repaired", "failure_run": 1},
++     "Identified the shard failure in " + PR + "; already repaired on main.", None),
++    # A review that keeps its outcome under other keys (4 hub reviews use review_outcome and
++    # reviewer_checks) is not recognised and takes the continuation, as it did before #728.
++    ({"reviewed_pr": PR, "review_outcome": "approved", "reviewer_checks": ["exact-head tests"],
++      "landed_sha": "e" * 40, "worker_session_id": "review-session"},
++     "Reviewed and approved PR #682; landed as eeeeeee.", None),
+ ])
+ def test_ordering_handoff_does_not_absorb_unreadable_review(board, monkeypatch, metadata, summary, expected):
+     """Park a second after the PR comment (production order): the ordering handoff
+     releases only parents that are not reviews of the checkpointed PR."""
+     task, _ = incident(board, monkeypatch, metadata=metadata, summary=summary, park_delay=1)
+     assert dispatch.check_respawn_guard(board, task) == expected
++
++
++def test_lost_review_citing_its_report_file_stays_held(board, monkeypatch):
++    """Completion adds an artifacts list when the summary names a scratch-workspace file, so a
++    review whose verdict was lost but which cites its report file must still be held."""
++    from hermes_cli import kanban_db_workspace as kbw
++    task, parents = incident(board, monkeypatch, finish=False)
++    stored_keys = []
++    for parent in parents:
++        kb.claim_task(board, parent)
++        row = kb.get_task(board, parent)
++        assert row is not None
++        workspace = kbw.resolve_workspace(row)
++        kbw.set_workspace_path(board, parent, workspace)
++        report = workspace / "review.md"
++        report.write_text("No blocking defects.\n")
++        assert kb.complete_task(board, parent, summary=f"Reviewed PR #682. No blocking defects; report: {report}",
++                                expected_run_id=row.current_run_id, metadata={})
++        stored = kb._json_dict(board.execute(
++            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (parent,)).fetchone()[0])
++        assert "artifacts" in stored, stored  # added by completion: the worker passed no metadata
++        stored_keys.append(sorted(stored))
++    kb.recompute_ready(board)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr", stored_keys
++
++
++def test_lost_review_completed_by_the_worker_tool_stays_held(board, monkeypatch):
++    """A worker's kanban_complete stamps worker_session_id on its own card and folds artifacts= into
++    metadata; a review whose verdict was lost and that names the PR in its summary is still held."""
++    from hermes_cli import kanban_db_workspace as kbw
++    from tools import kanban_tools as kt
++    task, parents = incident(board, monkeypatch, finish=False)
++    for parent in parents:
++        kb.claim_task(board, parent)
++        row = kb.get_task(board, parent)
++        assert row is not None
++        workspace = kbw.resolve_workspace(row)
++        kbw.set_workspace_path(board, parent, workspace)
++        report = workspace / "review.md"
++        report.write_text("No blocking defects.\n")
++        monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
++        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(row.current_run_id))
++        monkeypatch.setenv("HERMES_SESSION_ID", "review-session")
++        out = json.loads(kt._handle_complete({"summary": "Reviewed PR #682. No blocking defects.",
++                                              "artifacts": [str(report)]}))
++        assert out["ok"] is True, out
++        stored = kb._json_dict(board.execute(
++            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (parent,)).fetchone()[0])
++        assert sorted(stored) == ["artifacts", "worker_session_id"], stored
++    kb.recompute_ready(board)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("captured", [None, []])
++def test_lost_review_needs_a_checkpointed_pr_to_name(captured):
++    """checkpoint() never stores an empty capture, so one here comes from a checkpoint written without "prs"
++    (older code or another gateway). With nothing to name, the pre-#728 rule applies: only verdict keys or a
++    VERDICT: line mark a review."""
++    assert review.is_review_result({}, "Reviewed PR #682. No blocking defects.", captured) is False
++    assert review.is_review_result({"pr": PR, "worker_session_id": "s"}, "Review complete", captured) is False
++    assert review.is_review_result({"reviewed_sha": SHA}, "", captured) is True
++    assert review.is_review_result({}, "VERDICT: REQUEST_CHANGES", captured) is True
+-- 
+2.55.0
+

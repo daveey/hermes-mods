@@ -1,0 +1,629 @@
+From 441a5464ba0abc0093564ae1454de3e09a008728 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 18:48:10 +0000
+Subject: [PATCH] fix(process): persist_on_release jobs survive gateway
+ restarts and Kanban run-scope stops [daveey]
+
+Hub 2026-11-03: paid GPU-rental watchdogs started by Kanban workers with
+persist_on_release died with gateway restarts and worker OOMs, leaving rentals
+billing unsupervised.
+
+- The next gateway adopted the orphaned worker job from processes.json, and its
+  next shutdown swept it with kill_all(source="gateway_shutdown"), which reaches
+  persisted jobs. A restart now sweeps with the lifecycle source
+  "gateway_restart", which spares persisted jobs (the next gateway re-adopts
+  them). A real stop still kills the persisted jobs it spawned (#41225/#46778),
+  but never one it only adopted.
+- A worker's run scope (OOMPolicy=stop, KillMode=control-group) is stopped on
+  an OOM or after the run, which took its persisted jobs with it. A
+  persist_on_release job spawned in a Kanban run scope now gets its own
+  transient scope in hermes-kanban.slice, with the run scope's memory cap.
+- format_uptime_short moved to tools/process_registry_uptime.py (line cap).
+---
+ gateway/run_shutdown.py                       |  16 +-
+ ...st_persist_job_survives_gateway_restart.py | 176 ++++++++++++++++++
+ .../test_shutdown_kill_restart_source.py      |  64 +++++++
+ tests/tools/test_persist_job_own_scope.py     | 109 +++++++++++
+ tools/process_registry.py                     |  30 ++-
+ tools/process_registry_persist_scope.py       |  50 +++++
+ tools/process_registry_uptime.py              |  12 ++
+ 7 files changed, 433 insertions(+), 24 deletions(-)
+ create mode 100644 tests/gateway/test_persist_job_survives_gateway_restart.py
+ create mode 100644 tests/gateway/test_shutdown_kill_restart_source.py
+ create mode 100644 tests/tools/test_persist_job_own_scope.py
+ create mode 100644 tools/process_registry_persist_scope.py
+ create mode 100644 tools/process_registry_uptime.py
+
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index 6175e4ca476..be460bfd085 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -1701,7 +1701,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+             return None
+ 
+     @staticmethod
+-    def _stop_kill_tool_subprocesses(phase: str) -> list:
++    def _stop_kill_tool_subprocesses(phase: str, *, restarting: bool = False) -> list:
+         """Kill tool subprocesses + terminal envs + browsers; returns cron job IDs marked interrupted.
+ 
+         Called twice: after a drain timeout (reclaim children before systemd SIGKILLs) and as a final
+@@ -1718,11 +1718,11 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+ 
+         def _kill_processes() -> None:
+             from tools.process_registry import process_registry
+-            # Host shutdown: kill even persist_on_release jobs or they become
+-            # PPID=1 orphans (#41225/#46778); an explicit source reaches them.
++            # Stop: kill persist_on_release jobs this gateway spawned or they become PPID=1 orphans
++            # (#41225/#46778). A restart, or one adopted (a Kanban worker's), survives. [daveey]
+             _count_step(
+                 "Shutdown (%s): killed %d tool subprocess(es)",
+-                lambda: process_registry.kill_all(source="gateway_shutdown"))
++                lambda: process_registry.kill_all(source="gateway_restart" if restarting else "gateway_shutdown"))
+ 
+         def _mark_cron_interrupted() -> list:
+             # kill_all() is global: a cron job mid-dispatch lost its tool subprocess and its agent thread may
+@@ -1764,7 +1764,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+         return _marked_cron_jobs
+ 
+     @staticmethod
+-    async def _stop_kill_tool_subprocesses_off_loop(phase: str) -> list:
++    async def _stop_kill_tool_subprocesses_off_loop(phase: str, *, restarting: bool = False) -> list:
+         """Run _stop_kill_tool_subprocesses in a worker thread; returns cron job IDs marked interrupted.
+ 
+         ``kill_all`` fans out into per-target ``kill_process`` calls that do blocking work
+@@ -1778,7 +1778,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+         watchdog remains the hard backstop.
+         """
+         return await asyncio.to_thread(
+-            GatewayShutdownMixin._stop_kill_tool_subprocesses, phase
++            GatewayShutdownMixin._stop_kill_tool_subprocesses, phase, restarting=restarting
+         )
+ 
+     async def _stop_begin_teardown(self, ctx: GatewayShutdownMixin._StopContext) -> None:
+@@ -1894,7 +1894,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+             logger.debug("Re-signaled interrupt for work still live at settle-window exit")
+         # Kill tool subprocesses NOW: deferring past adapter/DB teardown risks the systemd cgroup SIGKILL.
+         # Off-loop: the sweep does blocking kills that must not monopolize the event loop (#116327).
+-        _interrupted_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
++        _interrupted_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt", restarting=self._restart_requested)
+         logger.info("Shutdown phase: post-interrupt tool kill done at +%.2fs", ctx.elapsed())
+         # Last window with the transport up (the cron worker's own notice arrives after teardown).
+         with _log_suppressed(logging.DEBUG, "Cron interrupt notification failed: %s"):
+@@ -1975,7 +1975,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+         self._shutdown_event.set()
+         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
+         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
+-        await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
++        await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup", restarting=self._restart_requested)
+         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
+         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
+         def _reap_aux_clients() -> None:
+diff --git a/tests/gateway/test_persist_job_survives_gateway_restart.py b/tests/gateway/test_persist_job_survives_gateway_restart.py
+new file mode 100644
+index 00000000000..5922dd15cba
+--- /dev/null
++++ b/tests/gateway/test_persist_job_survives_gateway_restart.py
+@@ -0,0 +1,176 @@
++"""A persist_on_release job a Kanban worker started outlives the worker and gateway restarts. [daveey]
++
++Hub incident (2026-11-03): paid GPU-rental watchdogs that Kanban workers started with
++``terminal(background=true, persist_on_release=true)`` died with the next gateway restart.
++The worker exited (or was requeued by a restart), the next gateway adopted the orphaned job
++from ``processes.json`` at startup, and that gateway's NEXT shutdown swept it with
++``kill_all(source="gateway_shutdown")``, which deliberately reaches persisted jobs.
++
++These tests drive the real path with real processes: a separate "worker" interpreter spawns
++the job through ``ProcessRegistry.spawn_local`` and exits; a fresh registry adopts it the way
++gateway startup does; then the gateway's own shutdown sweep runs.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import signal
++import subprocess
++import sys
++import textwrap
++import time
++from pathlib import Path
++
++import pytest
++
++from gateway.run_shutdown import GatewayShutdownMixin
++from tools.process_registry import ProcessRegistry, ProcessSession
++
++REPO = Path(__file__).resolve().parents[2]
++
++# Real signals to the jobs these tests spawn: the worker child exits, so its job is reparented to
++# init and the conftest guard would refuse (and the swallowing shutdown sweep hide) every kill.
++pytestmark = [pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups"),
++              pytest.mark.live_system_guard_bypass]
++
++
++@pytest.fixture(autouse=True)
++def _no_systemd_scopes(monkeypatch):
++    """Plain process groups here; the scope placement has its own test (no real units in CI)."""
++    monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: False)
++
++
++def _alive(pid: int) -> bool:
++    try:
++        os.kill(pid, 0)
++    except OSError:
++        return False
++    try:  # a zombie is dead for our purposes
++        stat = Path(f"/proc/{pid}/stat").read_text()
++        return stat[stat.rindex(")") + 2] != "Z"
++    except (OSError, ValueError):
++        return True
++
++
++def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if not _alive(pid):
++            return True
++        time.sleep(0.05)
++    return not _alive(pid)
++
++
++@pytest.fixture()
++def checkpoint(tmp_path, monkeypatch):
++    path = tmp_path / "processes.json"
++    monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", path)
++    return path
++
++
++@pytest.fixture()
++def reap():
++    pids: list[int] = []
++    yield pids.append
++    for pid in pids:
++        for sig in (signal.SIGTERM, signal.SIGKILL):
++            try:
++                os.killpg(pid, sig)
++            except OSError:
++                pass
++
++
++def _worker_spawns_persisted_job(checkpoint: Path, tmp_path: Path) -> dict:
++    """A separate interpreter (the Kanban worker) starts ``sleep`` persist_on_release, then exits."""
++    script = textwrap.dedent(f"""
++        import json, sys
++        sys.path.insert(0, {str(REPO)!r})
++        from unittest.mock import patch
++        from pathlib import Path
++        with patch("tools.process_registry.CHECKPOINT_PATH", Path({str(checkpoint)!r})), \
++                patch("tools.process_registry._systemd_run_user_scope_available", lambda: False):
++            from tools.process_registry import ProcessRegistry
++            reg = ProcessRegistry()
++            s = reg.spawn_local("sleep 120", cwd={str(tmp_path)!r}, task_id="t_card",
++                                owner_task_id="t_card", persist_on_release=True)
++            reg._write_checkpoint()
++            print(json.dumps({{"pid": s.pid, "id": s.id}}))
++        # exits without any cleanup sweep, like a worker the restart requeued
++    """)
++    env = {**os.environ, "HERMES_KANBAN_TASK": "t_card", "HERMES_HOME": str(tmp_path / "home")}
++    env.pop("_HERMES_GATEWAY", None)
++    out = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True,
++                         timeout=60, check=True, stdin=subprocess.DEVNULL)
++    return json.loads(out.stdout.strip().splitlines()[-1])
++
++
++def _gateway_adopts(checkpoint: Path, job_id: str) -> ProcessRegistry:
++    gateway_registry = ProcessRegistry()
++    assert gateway_registry.recover_from_checkpoint(owner="gateway") == 1
++    assert gateway_registry._running[job_id].detached
++    assert gateway_registry._running[job_id].persist_on_release
++    return gateway_registry
++
++
++@pytest.mark.parametrize("restarting", [True, False], ids=["restart", "stop"])
++def test_worker_started_persisted_job_survives_gateway_shutdown_sweep(
++        checkpoint, tmp_path, reap, monkeypatch, restarting):
++    job = _worker_spawns_persisted_job(checkpoint, tmp_path)
++    reap(job["pid"])
++    assert _alive(job["pid"]), "the worker's persisted job outlived the worker"
++
++    gateway_registry = _gateway_adopts(checkpoint, job["id"])
++    monkeypatch.setattr("tools.process_registry.process_registry", gateway_registry)
++    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", lambda *a, **k: [])
++
++    # The gateway's real shutdown sweep, both phases it runs (a plain stop uses the default).
++    kwargs = {"restarting": True} if restarting else {}
++    GatewayShutdownMixin._stop_kill_tool_subprocesses("post-interrupt", **kwargs)
++    GatewayShutdownMixin._stop_kill_tool_subprocesses("final-cleanup", **kwargs)
++
++    assert not _wait_dead(job["pid"], timeout=1.0), "gateway shutdown killed a worker's persisted job"
++    # Still in the checkpoint, so the next gateway adopts it again.
++    assert job["id"] in {e["session_id"] for e in json.loads(checkpoint.read_text())}
++
++
++def _own_job(registry: ProcessRegistry, tmp_path: Path, *, persist: bool) -> ProcessSession:
++    s = registry.spawn_local("sleep 120", cwd=str(tmp_path), task_id="gw", owner_task_id="gw",
++                             persist_on_release=persist)
++    assert s.pid
++    return s
++
++
++def test_restart_spares_gateway_own_persisted_job_but_kills_volatile(checkpoint, tmp_path, reap, monkeypatch):
++    registry = ProcessRegistry()
++    persisted, volatile = _own_job(registry, tmp_path, persist=True), _own_job(registry, tmp_path, persist=False)
++    reap(persisted.pid)
++    reap(volatile.pid)
++    monkeypatch.setattr("tools.process_registry.process_registry", registry)
++    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", lambda *a, **k: [])
++
++    GatewayShutdownMixin._stop_kill_tool_subprocesses("post-interrupt", restarting=True)
++
++    assert _wait_dead(volatile.pid), "a restart still reaps ordinary background jobs"
++    assert not _wait_dead(persisted.pid, timeout=1.0), "a restart is not host exit: persisted job survives"
++
++
++def test_final_stop_still_kills_gateway_own_persisted_job(checkpoint, tmp_path, reap, monkeypatch):
++    """Upstream #41225/#46778 contract kept: a real stop reaps the jobs this gateway itself started."""
++    registry = ProcessRegistry()
++    persisted = _own_job(registry, tmp_path, persist=True)
++    reap(persisted.pid)
++    monkeypatch.setattr("tools.process_registry.process_registry", registry)
++    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", lambda *a, **k: [])
++
++    GatewayShutdownMixin._stop_kill_tool_subprocesses("post-interrupt")
++
++    assert _wait_dead(persisted.pid)
++
++
++def test_explicit_kill_still_reaches_adopted_persisted_job(checkpoint, tmp_path, reap):
++    job = _worker_spawns_persisted_job(checkpoint, tmp_path)
++    reap(job["pid"])
++    gateway_registry = _gateway_adopts(checkpoint, job["id"])
++    gateway_registry.kill_process(job["id"], source="process_manage")
++    assert _wait_dead(job["pid"])
+diff --git a/tests/gateway/test_shutdown_kill_restart_source.py b/tests/gateway/test_shutdown_kill_restart_source.py
+new file mode 100644
+index 00000000000..3f3f0d18972
+--- /dev/null
++++ b/tests/gateway/test_shutdown_kill_restart_source.py
+@@ -0,0 +1,64 @@
++"""Restart vs stop picks the gateway's kill source in both shutdown sweeps. [daveey]
++
++A restart passes ``gateway_restart`` (a lifecycle source that spares persist_on_release jobs, which
++the next gateway re-adopts); a stop keeps ``gateway_shutdown``. Drives the real
++``_stop_interrupt_remaining_work`` (post-interrupt) and ``_stop_kill_tool_subprocesses_off_loop``
++(final-cleanup) entry points.
++"""
++
++import time
++
++import pytest
++
++from gateway.run_shutdown import GatewayShutdownMixin
++from tests.gateway.restart_test_helpers import make_restart_runner
++
++
++def _runner(monkeypatch, sources, *, restarting):
++    runner, _adapter = make_restart_runner()
++    runner._restart_drain_timeout = 0.01
++    runner._restart_requested = restarting
++
++    def _fake_kill_all(task_id=None, **kwargs):
++        sources.append(kwargs.get("source"))
++        return 0
++
++    import tools.process_registry as _pr
++
++    monkeypatch.setattr(_pr.process_registry, "kill_all", _fake_kill_all)
++    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", lambda *a, **k: [])
++    monkeypatch.setattr("tools.async_delegation.interrupt_all", lambda *a, **k: 0)
++    monkeypatch.setattr("tools.terminal_tool_lifecycle.cleanup_all_environments", lambda: None)
++    monkeypatch.setattr("tools.browser_session_lifecycle.cleanup_all_browsers", lambda *, process_shutdown=False: None)
++    return runner
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("restarting", "source"), [(True, "gateway_restart"), (False, "gateway_shutdown")])
++async def test_post_interrupt_sweep_source_follows_restart(monkeypatch, restarting, source):
++    sources: list = []
++    runner = _runner(monkeypatch, sources, restarting=restarting)
++    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0)
++    ctx.started_at = time.monotonic()
++
++    await runner._stop_interrupt_remaining_work(ctx)
++
++    assert sources == [source]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("restarting", "source"), [(True, "gateway_restart"), (False, "gateway_shutdown")])
++async def test_off_loop_sweep_forwards_restarting(monkeypatch, restarting, source):
++    sources: list = []
++    _runner(monkeypatch, sources, restarting=restarting)
++
++    await GatewayShutdownMixin._stop_kill_tool_subprocesses_off_loop("final-cleanup", restarting=restarting)
++
++    assert sources == [source]
++
++
++def test_restart_source_is_a_lifecycle_sweep():
++    from tools.process_registry import ProcessRegistry
++
++    assert "gateway_restart" in ProcessRegistry._LIFECYCLE_KILL_SOURCES
++    assert "gateway_shutdown" not in ProcessRegistry._LIFECYCLE_KILL_SOURCES
+diff --git a/tests/tools/test_persist_job_own_scope.py b/tests/tools/test_persist_job_own_scope.py
+new file mode 100644
+index 00000000000..9d563a646f6
+--- /dev/null
++++ b/tests/tools/test_persist_job_own_scope.py
+@@ -0,0 +1,109 @@
++"""A Kanban worker's persist_on_release job gets its own scope, outside the run scope. [daveey]
++
++The run scope is OOMPolicy=stop / KillMode=control-group and is stopped when the run OOMs or after
++it ends, which killed a persisted paid-rental watchdog (hub, 2026-11-03 03:42Z).
++"""
++
++import os
++import subprocess
++import time
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++import tools.process_registry as pr
++from tools.process_registry import ProcessRegistry
++from tools.process_registry_persist_scope import KANBAN_SLICE, kanban_run_scope_cgroup
++
++RUN_SCOPE = "user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/" \
++            "hermes-worker-kanban-t_abc-run-7.scope"
++
++
++def test_run_scope_cgroup_parses_only_kanban_run_scopes(tmp_path):
++    cg = tmp_path / "cgroup"
++    cg.write_text(f"0::/{RUN_SCOPE}\n")
++    assert kanban_run_scope_cgroup(str(cg)) == Path("/sys/fs/cgroup") / RUN_SCOPE
++    cg.write_text("0::/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-gateway.service\n")
++    assert kanban_run_scope_cgroup(str(cg)) is None
++    assert kanban_run_scope_cgroup(str(tmp_path / "missing")) is None
++
++
++def _spawn(monkeypatch, tmp_path, *, persist, in_run_scope=True):
++    scope_dir = tmp_path / "run-scope"
++    scope_dir.mkdir(exist_ok=True)
++    (scope_dir / "memory.max").write_text("8589934592\n")
++    monkeypatch.setattr(pr, "_IS_LINUX", True)
++    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
++    monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
++    monkeypatch.setattr("tools.process_registry_persist_scope.kanban_run_scope_cgroup",
++                        lambda: scope_dir if in_run_scope else None)
++    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
++    captured = {}
++
++    def fake_popen(argv, **kwargs):
++        captured["argv"] = list(argv)
++        captured["env"] = kwargs.get("env")
++        proc = MagicMock(pid=4321, stdout=iter([]))
++        proc.poll.return_value = None
++        return proc
++
++    registry = ProcessRegistry()
++    with (patch("subprocess.Popen", side_effect=fake_popen), patch("threading.Thread", return_value=MagicMock()),
++          patch.object(registry, "_write_checkpoint")):
++        session = registry.spawn_local("sleep 60", cwd=str(tmp_path), persist_on_release=persist)
++    return session, captured["argv"]
++
++
++@pytest.mark.platforms("linux")
++def test_persisted_job_in_kanban_run_scope_gets_own_scope(monkeypatch, tmp_path):
++    session, argv = _spawn(monkeypatch, tmp_path, persist=True)
++    assert argv[0] == "/usr/bin/systemd-run" and "--scope" in argv and "--user" in argv
++    assert argv[argv.index("--unit") + 1] == f"hermes-worker-{session.id}"
++    assert f"--slice={KANBAN_SLICE}" in argv[:argv.index("--")]
++    assert "MemoryMax=8589934592" in argv[:argv.index("--")], "the run scope's own cap, not the 4 GiB gateway one"
++    assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
++
++
++@pytest.mark.platforms("linux")
++def test_volatile_job_stays_in_run_scope(monkeypatch, tmp_path):
++    session, argv = _spawn(monkeypatch, tmp_path, persist=False)
++    assert argv[0] != "/usr/bin/systemd-run"
++    assert session.systemd_unit == ""
++
++
++@pytest.mark.platforms("linux")
++def test_persisted_job_outside_kanban_run_scope_is_unchanged(monkeypatch, tmp_path):
++    session, argv = _spawn(monkeypatch, tmp_path, persist=True, in_run_scope=False)
++    assert argv[0] != "/usr/bin/systemd-run"
++    assert session.systemd_unit == ""
++
++
++def _in_real_run_scope() -> bool:
++    return kanban_run_scope_cgroup() is not None and pr._systemd_run_user_scope_available()
++
++
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.skipif(not _in_real_run_scope(), reason="needs a real Kanban run scope and a user systemd bus")
++def test_real_persisted_job_lands_outside_run_scope(tmp_path, monkeypatch):
++    """On a Kanban worker host: the job's cgroup is its own scope, so stopping the run scope can't reach it."""
++    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)  # earlier tests may have cached a fake verdict
++    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_PROBED_AT", 0.0)
++    if not pr._systemd_run_user_scope_available():
++        pytest.skip("user systemd bus probe failed at run time")
++    registry = ProcessRegistry()
++    session = registry.spawn_local("sleep 30", cwd=str(tmp_path), persist_on_release=True)
++    try:
++        deadline = time.monotonic() + 10
++        cgroup = ""
++        while time.monotonic() < deadline:
++            cgroup = Path(f"/proc/{session.pid}/cgroup").read_text()
++            if session.systemd_unit in cgroup:
++                break
++            time.sleep(0.1)
++        assert session.systemd_unit and cgroup.rstrip().endswith("/" + session.systemd_unit), cgroup
++        assert f"/{KANBAN_SLICE}/" in cgroup
++        assert "hermes-worker-kanban-" not in cgroup
++    finally:
++        subprocess.run(["systemctl", "--user", "stop", session.systemd_unit], check=False, timeout=15,
++                       env=pr.systemd_user_bus_env() or os.environ)
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 094a3ac086e..fa2d37de3cc 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -179,7 +179,7 @@ def _worker_memory_max_bytes() -> int:
+     return min(override_bound, safe_bound) if override_bound else safe_bound
+ 
+ 
+-def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> list[str]:
++def _systemd_scope_argv(binary: str, unit_name: str, *argv: str, memory_max: int = 0, slice_name: str = "") -> list[str]:
+     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
+     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
+     No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
+@@ -187,8 +187,9 @@ def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> list[str]:
+     no_expand = ["--expand-environment=no"] if _SYSTEMD_RUN_NO_EXPAND else []
+     return [
+         binary, "--user", "--scope", "--quiet", *no_expand, "--unit", unit_name, "--collect",
++        *([f"--slice={slice_name}"] if slice_name else []),
+         "--property", "MemoryAccounting=yes",
+-        "--property", f"MemoryMax={_worker_memory_max_bytes()}",
++        "--property", f"MemoryMax={memory_max or _worker_memory_max_bytes()}",
+         "--", *argv,
+     ]
+ 
+@@ -508,15 +509,7 @@ def _stop_systemd_unit(unit_name: str) -> bool:
+         return False
+ 
+ 
+-def format_uptime_short(seconds: int) -> str:
+-    s = max(0, int(seconds))
+-    if s < 60:
+-        return f"{s}s"
+-    mins, secs = divmod(s, 60)
+-    if mins < 60:
+-        return f"{mins}m {secs}s"
+-    hours, mins = divmod(mins, 60)
+-    return f"{hours}h {mins}m"
++from tools.process_registry_uptime import format_uptime_short  # re-export
+ 
+ 
+ def _not_found(session_id: str) -> dict:
+@@ -1128,6 +1121,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+         if in_supervised_gateway and _systemd_run_user_scope_available():
+             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
+             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
++        from tools.process_registry_persist_scope import persisted_job_scope_argv  # leave a Kanban run scope [daveey]
++        if (scoped := persisted_job_scope_argv(session, argv, unit_suffix)) is not argv:
++            return scoped
+         if in_supervised_gateway:
+             # Under a supervisor but no private cgroup: a worker OOM can still take
+             # the whole gateway down.
+@@ -2426,8 +2422,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+     # Kill sources that are agent-lifecycle cleanup (session end / compression / error
+     # recovery / turn abandon), not a deliberate stop: those must skip persist_on_release
+     # sessions. An explicit stop (process_manage kill, CLI /stop) passes its own source and still reaches them.
++    # ``gateway_restart``: not host exit; the next gateway re-adopts the job from the checkpoint. [daveey]
+     _LIFECYCLE_KILL_SOURCES = frozenset({"kill_all", "gateway_turn_timeout", "agent_close", "core_update_pause",
+-                                         "backend_shutdown"})
++                                         "backend_shutdown", "gateway_restart"})
+ 
+     def kill_started_since(self, task_id: str, baseline_ids, *, source: str) -> int:
+         """Kill ``task_id`` processes created after ``baseline_ids``. Output is
+@@ -2444,17 +2441,18 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+ 
+         Sessions with ``persist_on_release=True`` are skipped when ``source`` is an
+         agent-lifecycle sweep (the default ``kill_all`` release path, a gateway turn
+-        timeout, or ``agent_close``): an explicitly persisted background job must survive
+-        session end / compression / error recovery (#41225). An explicit operator stop
++        timeout, ``agent_close``, a gateway restart): an explicitly persisted background job must survive
++        session end / compression / error recovery / restart (#41225). ``gateway_shutdown`` reaches only the
++        persisted jobs it spawned, never one it adopted (a Kanban worker's) [daveey]. An explicit operator stop
+         (``process.kill`` via process_manage, CLI /stop) passes its own source and still
+         reaches them, so the user can always stop a persisted process on purpose."""
+-        lifecycle = source in self._LIFECYCLE_KILL_SOURCES
++        lifecycle, host_exit = source in self._LIFECYCLE_KILL_SOURCES, source == "gateway_shutdown"
+         with self._lock:
+             targets = [
+                 s for s in (*self._running.values(), *self._finished.values())
+                 if (task_id is None or s.owner_task_id == task_id)
+                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+-                and not (lifecycle and s.persist_on_release)
++                and not (s.persist_on_release and (lifecycle or (host_exit and s.detached)))
+             ]
+         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
+         return sum(
+diff --git a/tools/process_registry_persist_scope.py b/tools/process_registry_persist_scope.py
+new file mode 100644
+index 00000000000..0c5108e8aae
+--- /dev/null
++++ b/tools/process_registry_persist_scope.py
+@@ -0,0 +1,50 @@
++"""A Kanban worker's persist_on_release job leaves the worker's run scope. [daveey]
++
++A Kanban worker runs in ``hermes-worker-kanban-<task>-run-<n>.scope`` (OOMPolicy=stop,
++KillMode=control-group), which systemd stops when the run OOMs and the dispatcher stops after the
++run ends. A ``persist_on_release`` job spawned inside it died with the worker (a paid-rental
++watchdog on the hub, 2026-11-03), so it gets its own transient scope in the same
++aggregate-bounded ``hermes-kanban.slice``, with the run scope's own memory cap.
++"""
++from __future__ import annotations
++
++import shutil
++from pathlib import Path
++from typing import Optional
++
++KANBAN_RUN_SCOPE_PREFIX = "hermes-worker-kanban-"
++KANBAN_SLICE = "hermes-kanban.slice"
++
++
++def kanban_run_scope_cgroup(proc_cgroup: str = "/proc/self/cgroup") -> Optional[Path]:
++    """This process's Kanban run-scope cgroup directory, or None outside one."""
++    try:
++        for line in Path(proc_cgroup).read_text(encoding="utf-8-sig").splitlines():
++            if line.startswith("0::"):
++                relative = line[3:].strip()
++                name = relative.rsplit("/", 1)[-1]
++                if name.startswith(KANBAN_RUN_SCOPE_PREFIX) and name.endswith(".scope"):
++                    return Path("/sys/fs/cgroup") / relative.lstrip("/")
++                return None
++    except OSError:
++        pass
++    return None
++
++
++def persisted_job_scope_argv(session, shell_argv: list[str], unit_suffix: str) -> list[str]:
++    """``systemd-run --user --scope`` argv moving a persisted job out of this process's Kanban run scope
++    (and naming ``session.systemd_unit``); ``shell_argv`` itself (the same object) when that does not apply."""
++    from tools import process_registry as pr
++
++    run_scope = kanban_run_scope_cgroup() if pr._IS_LINUX and session.persist_on_release else None
++    binary = shutil.which("systemd-run") if run_scope is not None else None
++    if binary is None or not pr._systemd_run_user_scope_available():
++        return shell_argv
++    try:
++        raw = (run_scope / "memory.max").read_text(encoding="utf-8-sig").strip()
++    except OSError:
++        raw = ""
++    memory_max = int(raw) if raw.isdigit() and int(raw) >= pr._MIN_WORKER_MEMORY_MAX_BYTES else 0
++    session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
++    return pr._systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv,
++                                  memory_max=memory_max, slice_name=KANBAN_SLICE)
+diff --git a/tools/process_registry_uptime.py b/tools/process_registry_uptime.py
+new file mode 100644
+index 00000000000..bccf9245417
+--- /dev/null
++++ b/tools/process_registry_uptime.py
+@@ -0,0 +1,12 @@
++"""Short uptime label for process listings (moved out of ``tools/process_registry.py``)."""
++
++
++def format_uptime_short(seconds: int) -> str:
++    s = max(0, int(seconds))
++    if s < 60:
++        return f"{s}s"
++    mins, secs = divmod(s, 60)
++    if mins < 60:
++        return f"{mins}m {secs}s"
++    hours, mins = divmod(mins, 60)
++    return f"{hours}h {mins}m"
+-- 
+2.55.0
+

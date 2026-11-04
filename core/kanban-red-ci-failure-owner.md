@@ -38,3 +38,31 @@ Apply as part of the full series with the README **Applying** recipe; these patc
 ## Plugin?
 
 No: these change core modules that plugins cannot hook.
+
+
+## Follow-up 1867: a ci-main-watch FAILED list keeps the same-CI-run rule
+
+Patches: **1867** (`b9e55cc720`, `fix(kanban): a ci-main-watch FAILED list keeps the same-CI-run rule [daveey]`). Mirrored in the 1822–1918 pass ([mirror-1918-verification.md](mirror-1918-verification.md)).
+
+### Behavior
+
+- A red-main card carrying ci-main-watch's `failed tests:` block still refuses a duplicate that names the same Actions run when the other card lists no tests, so same-run duplicates no longer get through (1867).
+
+### How it works
+
+`hermes_cli/kanban_overlap.py` `same_failure` falls back to the shared-run rule when only one side carries tests.
+
+Source commit notes (first paragraph of each message, privacy-normalized):
+
+- 1867: ci_main_watch now writes each red run's `failed tests:` block (FAILED <node id> lines) into every red-main card. failure_identity turns those lines into `tests`, and same_failure refused a shared run only when neither card had tests, so once the owner carried the list the five same-run duplicates #732's replay refused got through again ("no match at all"): t_01a18505110a5892 and t_01a18507649f5425 against t_01a18504581b2063 (run 40785006949), t_88f89e55, t_ebcc8f52 and t_4129a258 against t_bdb6c497.
+
+### Code
+
+`hermes_cli/kanban_overlap.py`.
+
+### Tests
+
+Landed with the source commits; not rerun by this mirror pass unless the verification report lists them. Names are tests each patch added; a file with no names was modified only.
+
+- `tests/tools/kanban_overlap_failure_cases.json`
+- `tests/tools/test_kanban_create_overlap_failure.py`: `test_same_run_duplicate_is_refused_whether_or_not_the_owner_lists_failed_tests`, `test_listed_tests_are_marked_and_still_match_a_card_naming_one`, `test_listed_owner_admits_a_card_naming_another_test_of_its_run`, `test_a_same_run_card_citing_the_listed_owner_is_admitted`, `test_red_main_card_vs_deflake_card_naming_its_own_test_has_no_run_match`, `test_red_main_card_as_filed_is_admitted_against_the_deflake_card`

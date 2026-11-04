@@ -1,0 +1,412 @@
+From 71787a8a8ed97b372c9aa314495dea793e693cfb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 07:10:17 +0000
+Subject: [PATCH] kanban: capsule card submitter refuses an owner without this
+ core's capsule gates
+
+A capsule-required card's gates (admission probe, single-use rendezvous,
+--observation-fd) live in the profile owner. kanban_worker_client reached
+whatever owner discovery returned; a named profile is served by the root
+multiplexer, so a pinned-core submitter reached a global-core owner with no
+capsule gates, which admitted the card and ran an ordinary managed worker
+(hub 2026-11-02, run4 of t_01a19a6b4fcce737).
+
+The owner now advertises kanban-capsule-transport-v1. For a card whose board
+row requires a capsule (derived exactly as the owner derives it; unreadable
+fails closed), the submitter requires that capability AND an owner code_sha
+equal to its own code identity, checked via connect_gateway(owner_check=...)
+before any ticket, dial or kanban.run. The refusal is final
+(kanban_capsule_owner_unsupported, exit 1), not an owner wait. Ordinary
+cards are unchanged.
+---
+ gateway/run_runtime.py                        |   5 +-
+ hermes_cli/gateway_client.py                  |  12 +-
+ hermes_cli/kanban_capsule_owner.py            |  79 +++++++++
+ hermes_cli/kanban_worker_client.py            |   6 +-
+ .../hermes_cli/test_gateway_client_backlog.py |   2 +-
+ .../test_kanban_capsule_owner_binding.py      | 157 ++++++++++++++++++
+ .../test_kanban_worker_owner_wait.py          |   2 +-
+ .../test_kanban_worker_socket_recovery.py     |   2 +-
+ 8 files changed, 258 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_capsule_owner.py
+ create mode 100644 tests/hermes_cli/test_kanban_capsule_owner_binding.py
+
+diff --git a/gateway/run_runtime.py b/gateway/run_runtime.py
+index 9157d68a43a..09fc1cda494 100644
+--- a/gateway/run_runtime.py
++++ b/gateway/run_runtime.py
+@@ -692,8 +692,11 @@ def publish_gateway_runtime_ready(runner):
+     descriptor = runner.session_runtime_descriptor
+     if runner.session_api.task.done() or not runner._running or runner._draining:
+         raise RuntimeError('gateway stopped before session API readiness')
++    # [daveey] kanban-capsule-transport-v1: this core holds the capsule owner gates
++    # (gateway.session_kanban_capsule); a capsule card's submitter refuses any owner without it.
++    from hermes_cli.kanban_capsule_owner import CAPABILITY as _CAPSULE_CAPABILITY
+     descriptor.update(state='ready', capabilities=[
+-        'session-authority-v1', 'durable-admission-v1', 'event-replay-v1'])
++        'session-authority-v1', 'durable-admission-v1', 'event-replay-v1', _CAPSULE_CAPABILITY])
+     from gateway.session_hosted_service import start_ready_hosted_services
+     start_ready_hosted_services(runner)
+ 
+diff --git a/hermes_cli/gateway_client.py b/hermes_cli/gateway_client.py
+index 7cc3075ab92..ec4eeab6c54 100644
+--- a/hermes_cli/gateway_client.py
++++ b/hermes_cli/gateway_client.py
+@@ -319,7 +319,7 @@ def outside_restart_wait():
+ 
+ 
+ @asynccontextmanager
+-async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 1024):
++async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 1024, owner_check=None):
+     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
+     (maintenance that must never start a gateway); default ensures one, starting it if needed.
+     ``subject``: mint the ticket for this principal (the caller's authenticated dashboard user)
+@@ -327,7 +327,9 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
+     ``max_size``: the largest frame accepted; a ``session.resume`` answer carries the whole history.
+     Inside ``outside_restart_wait()`` an owner in a restart's after-turn wait is refused as
+     ``draining`` (``restart_wait``) instead of attached, and the ticket carries that policy so the
+-    owner also refuses the socket when the wait opens between discovery and the dial."""
++    owner also refuses the socket when the wait opens between discovery and the dial.
++    ``owner_check``: called with the discovered (or given) endpoint before any ticket is minted or
++    socket dialed; it raises to refuse that owner (a capsule card's owner binding). [daveey]"""
+     from websockets.asyncio.client import connect
+     from hermes_constants import get_hermes_home
+     from hermes_cli.gateway_runtime import attachable, ensure_gateway_runtime, gateway_profile_home
+@@ -337,10 +339,14 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
+     remote = "" if endpoint is not None else os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
+     protocols = None
+     if endpoint is not None:
++        if owner_check is not None:
++            owner_check(endpoint)
+         ticket = await asyncio.to_thread(_session_ticket, gateway_profile_home(get_hermes_home()), endpoint,
+                                          subject=subject)
+         url, protocols = gateway_ws_target(endpoint, ticket)
+     elif remote:
++        if owner_check is not None:
++            raise GatewayClientError("An explicit gateway URL cannot prove the owner binding; no local fallback")
+         parsed = urlsplit(remote)
+         if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+             raise GatewayClientError("Invalid explicit gateway WebSocket URL; no local fallback")
+@@ -360,6 +366,8 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
+             raise GatewayUnavailableError(f"Gateway {result.state}: {result.reason_code or 'not_ready'}{detail}",
+                                           result.state, result.reason_code)
+         endpoint = result.endpoint
++        if owner_check is not None:
++            owner_check(endpoint)
+         try:
+             policy: dict = {"refuse_restart_wait": True} if _REFUSE_RESTART_WAIT.get() else {}
+             ticket = await asyncio.to_thread(_session_ticket, home, endpoint, **policy)
+diff --git a/hermes_cli/kanban_capsule_owner.py b/hermes_cli/kanban_capsule_owner.py
+new file mode 100644
+index 00000000000..e40c0c4746d
+--- /dev/null
++++ b/hermes_cli/kanban_capsule_owner.py
+@@ -0,0 +1,79 @@
++"""Submitter-side owner binding for capsule-required Kanban cards. [daveey]
++
++The capsule gates (``gateway.session_kanban_capsule``: admission probe, launch-time rendezvous consume,
++``--observation-fd`` on the managed worker) live in the PROFILE OWNER, not in the dispatcher or the
++submitter. ``kanban_worker_client`` reaches whatever owner ordinary discovery returns for its home, and a
++named profile is served by the root multiplexer unless it is ``gateway.standalone``. When that owner runs
++a core without these gates (an older or unrelated install), it admits the card and runs an ordinary
++managed worker: real model and tool calls, no capsule, no observation (2026-11-02, hub, run4 of
++t_01a19a6b4fcce737: pinned-core submitter, global-core multiplexer owner).
++
++So the submitter itself refuses BEFORE ``kanban.run`` (no session, no admission, no model or tool work)
++unless the discovered owner proves both:
++
++* it advertises ``CAPABILITY`` in its control identity (only a core carrying the capsule gates publishes
++  it), and
++* its ``code_sha`` equals this submitter's own code identity: the dispatcher pinned the submitter's core,
++  and the owner must run that same core.
++
++Ordinary cards (no ``host_repo`` need, or an assignee whose own policy grants ``host_repo``) are not
++affected. The requirement is derived from the board row exactly as the owner derives it; an unreadable
++board or task fails closed (required).
++"""
++from __future__ import annotations
++
++import sqlite3
++from contextlib import closing
++from pathlib import Path
++
++from hermes_cli.gateway_client import GatewayUnavailableError
++
++CAPABILITY = 'kanban-capsule-transport-v1'
++REFUSED = 'kanban_capsule_owner_unsupported'
++
++
++class CapsuleOwnerRefused(GatewayUnavailableError):
++    """A final refusal (never a restart wait): the discovered owner cannot host this capsule card."""
++
++    def __init__(self, detail: str):
++        super().__init__(f'{REFUSED}: {detail}', 'incompatible', REFUSED)
++
++
++def card_requires_capsule(board_db, task_id) -> bool:
++    """The owner's own derivation (``capsule_requirement``) on a read-only board row; unreadable -> True."""
++    from hermes_cli import kanban_db as kb
++    from gateway.session_kanban_capsule import capsule_requirement
++    try:
++        uri = Path(board_db).resolve(strict=True).as_uri() + '?mode=ro'
++        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn:
++            conn.row_factory = sqlite3.Row
++            task = kb.get_task(conn, task_id)
++    except (OSError, ValueError, TypeError, sqlite3.Error):
++        return True
++    if task is None:
++        return True
++    return bool(capsule_requirement(task).get('required', True))
++
++
++def own_code_sha() -> str | None:
++    from hermes_cli.version_info import get_code_identity
++    sha = get_code_identity().get('sha')
++    return sha if isinstance(sha, str) and sha else None
++
++
++def owner_check(required: bool):
++    """``connect_gateway(owner_check=...)`` callback: None for ordinary cards, else the binding check."""
++    if not required:
++        return None
++    expected = own_code_sha()
++
++    def check(endpoint):
++        capabilities = getattr(endpoint, 'capabilities', None) or frozenset()
++        if CAPABILITY not in capabilities:
++            raise CapsuleOwnerRefused('owner lacks ' + CAPABILITY)
++        if expected is None:
++            raise CapsuleOwnerRefused('submitter code identity unknown')
++        actual = getattr(endpoint, 'code_sha', None)
++        if actual != expected:
++            raise CapsuleOwnerRefused(f'owner code {str(actual)[:12] or "unknown"} != submitter {expected[:12]}')
++    return check
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index d1e1a6ec910..7a7c594b608 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -136,6 +136,10 @@ async def run(params, board_db):
+     from websockets.exceptions import WebSocketException
+     if os.environ.get('HERMES_TUI_GATEWAY_URL'):
+         raise GatewayClientError('Kanban requires the assigned local profile owner')
++    # [daveey] A capsule card may only reach an owner running this submitter's own capsule-gated core;
++    # any other owner is refused here, before ``kanban.run`` (no session, admission, model or tool work).
++    from hermes_cli.kanban_capsule_owner import card_requires_capsule, owner_check
++    check = owner_check(await asyncio.to_thread(card_requires_capsule, board_db, params['task_id']))
+     # A lost socket is not a lost attempt, and exiting here would let ``_watch_submitter`` end the
+     # owner's in-flight turn, so the next connection resumes whatever the last one reached. The
+     # wait is bounded from the owner's last answer: an owner that keeps answering keeps the
+@@ -150,7 +154,7 @@ async def run(params, board_db):
+             # waits for the NEXT owner, and a worker polling its receipt inside the wait keeps the
+             # turn it waits on alive, holding `hermes update` until restart_after_turn_timeout.
+             with outside_restart_wait():
+-                async with connect_gateway() as client:
++                async with connect_gateway(owner_check=check) as client:
+                     # kanban.run subscribes this socket to the card's session, but only receipts
+                     # matter here: discard the turn's events, or they fill the client's bounded
+                     # queue and its reader stops, with the next receipt behind it.
+diff --git a/tests/hermes_cli/test_gateway_client_backlog.py b/tests/hermes_cli/test_gateway_client_backlog.py
+index 993f0080184..8d166bf2e1a 100644
+--- a/tests/hermes_cli/test_gateway_client_backlog.py
++++ b/tests/hermes_cli/test_gateway_client_backlog.py
+@@ -106,7 +106,7 @@ async def test_kanban_worker_settles_a_card_whose_turn_outstreams_the_client_que
+     from hermes_cli import kanban_worker_client
+ 
+     @asynccontextmanager
+-    async def connect():
++    async def connect(**_):
+         async with GatewayClient(CardOwner(6000)) as client:
+             yield client
+ 
+diff --git a/tests/hermes_cli/test_kanban_capsule_owner_binding.py b/tests/hermes_cli/test_kanban_capsule_owner_binding.py
+new file mode 100644
+index 00000000000..533c0f4b2e0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capsule_owner_binding.py
+@@ -0,0 +1,157 @@
++"""A capsule card's submitter refuses an owner that cannot hold the capsule gates. [daveey]
++
++2026-11-02 hub, run4 of t_01a19a6b4fcce737: the dispatcher launched a pinned-core
++``kanban_worker_client`` whose ordinary discovery reached the root multiplexer (another core, no
++``gateway.session_kanban_capsule``). That owner admitted the capsule-required card and ran an ordinary
++managed worker: real model/tool calls with no capsule and no observation. These tests drive the REAL
++``kanban_worker_client.run`` and ``connect_gateway`` with only the discovery verdict and the ticket mint
++faked, and prove the refusal happens before any ticket, socket or ``kanban.run``.
++"""
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import gateway_client, kanban_worker_client
++from hermes_cli.gateway_runtime import GatewayDiscovery, GatewayEndpoint
++from hermes_cli.kanban_capsule_owner import CAPABILITY, REFUSED, CapsuleOwnerRefused, card_requires_capsule
++
++BASE_CAPS = frozenset({'session-authority-v1', 'durable-admission-v1', 'event-replay-v1'})
++OTHER_SHA = '16488722687057fcbf6861283e042feca062c5a0'
++OWN_SHA = 'a' * 40
++
++
++def _board(tmp_path, monkeypatch, *, local=False):
++    from tests.gateway.test_session_kanban_capsule_guard import _board as guard_board
++    _connection, params, _config = guard_board(tmp_path, monkeypatch, local=local)
++    from hermes_cli.kanban_db import kanban_db_path
++    return params, str(kanban_db_path(board='owned'))
++
++
++def _endpoint(caps, sha):
++    return GatewayEndpoint(profile_id='/p', instance_id='i', authority_epoch=1, runtime_protocol=1,
++                           api_origin='http://127.0.0.1:1', supervisor='systemd', capabilities=frozenset(caps),
++                           control_home='/root-home', code_sha=sha)
++
++
++class _Stop(Exception):
++    pass
++
++
++def _discovery(monkeypatch, endpoint, calls):
++    from hermes_cli import gateway_runtime, version_info
++
++    def ensure(home, **kw):
++        calls.append('ensure')
++        return GatewayDiscovery('ready', endpoint)
++
++    def ticket(*a, **kw):
++        calls.append('ticket')
++        raise _Stop('ticket minted: the owner check passed')
++
++    monkeypatch.setattr(gateway_runtime, 'ensure_gateway_runtime', ensure)
++    monkeypatch.setattr(gateway_client, '_session_ticket', ticket)
++    monkeypatch.setattr(version_info, 'get_code_identity', lambda refresh=False: {'sha': OWN_SHA})
++    monkeypatch.delenv('HERMES_TUI_GATEWAY_URL', raising=False)
++
++
++def _run(params, db):
++    return asyncio.run(kanban_worker_client.run(params, db))
++
++
++@pytest.mark.parametrize('caps,sha', [
++    (BASE_CAPS, OTHER_SHA),                 # the run4 owner: older core, no capsule gates
++    (BASE_CAPS | {CAPABILITY}, OTHER_SHA),  # capsule-capable but not this submitter's core
++    (BASE_CAPS | {CAPABILITY}, None),       # cannot name its code
++    (BASE_CAPS, OWN_SHA),                   # same sha claimed, capability absent
++])
++def test_required_card_refuses_unbound_owner_before_ticket(tmp_path, monkeypatch, caps, sha):
++    params, db = _board(tmp_path, monkeypatch)
++    assert card_requires_capsule(db, params['task_id']) is True
++    calls = []
++    _discovery(monkeypatch, _endpoint(caps, sha), calls)
++    with pytest.raises(CapsuleOwnerRefused) as exc:
++        _run(params, db)
++    assert REFUSED in str(exc.value)
++    assert calls == ['ensure']  # final verdict: no retry, no ticket, no dial, no kanban.run
++
++
++def test_required_card_reaches_bound_owner(tmp_path, monkeypatch):
++    params, db = _board(tmp_path, monkeypatch)
++    calls = []
++    _discovery(monkeypatch, _endpoint(BASE_CAPS | {CAPABILITY}, OWN_SHA), calls)
++    with pytest.raises(_Stop):
++        _run(params, db)
++    assert calls == ['ensure', 'ticket']
++
++
++def test_ordinary_card_unchanged_with_any_owner(tmp_path, monkeypatch):
++    params, db = _board(tmp_path, monkeypatch, local=True)
++    assert card_requires_capsule(db, params['task_id']) is False
++    calls = []
++    _discovery(monkeypatch, _endpoint(BASE_CAPS, OTHER_SHA), calls)
++    with pytest.raises(_Stop):
++        _run(params, db)
++    assert calls == ['ensure', 'ticket']
++
++
++def test_unreadable_board_or_task_fails_closed(tmp_path, monkeypatch):
++    params, db = _board(tmp_path, monkeypatch)
++    assert card_requires_capsule(str(tmp_path / 'missing.db'), params['task_id']) is True
++    assert card_requires_capsule(db, 't_missing') is True
++
++
++def test_submitter_without_code_identity_refuses(tmp_path, monkeypatch):
++    params, db = _board(tmp_path, monkeypatch)
++    calls = []
++    _discovery(monkeypatch, _endpoint(BASE_CAPS | {CAPABILITY}, OWN_SHA), calls)
++    from hermes_cli import version_info
++    monkeypatch.setattr(version_info, 'get_code_identity', lambda refresh=False: {'sha': None})
++    with pytest.raises(CapsuleOwnerRefused, match='submitter code identity unknown'):
++        _run(params, db)
++    assert calls == ['ensure']
++
++
++def test_explicit_endpoint_and_remote_url_paths_check(monkeypatch):
++    seen = []
++
++    def check(endpoint):
++        seen.append(endpoint)
++        raise CapsuleOwnerRefused('x')
++
++    async def dial(**kw):
++        async with gateway_client.connect_gateway(**kw):
++            pass
++
++    endpoint = _endpoint(BASE_CAPS, OTHER_SHA)
++    with pytest.raises(CapsuleOwnerRefused):
++        asyncio.run(dial(endpoint=endpoint, owner_check=check))
++    assert seen == [endpoint]
++    monkeypatch.setenv('HERMES_TUI_GATEWAY_URL', 'ws://127.0.0.1:9/x')
++    with pytest.raises(gateway_client.GatewayClientError, match='cannot prove the owner binding'):
++        asyncio.run(dial(owner_check=lambda e: None))
++
++
++def test_submit_exit_is_a_counted_refusal_not_an_owner_wait(tmp_path, monkeypatch, capsys):
++    params, db = _board(tmp_path, monkeypatch)
++    calls = []
++    _discovery(monkeypatch, _endpoint(BASE_CAPS, OTHER_SHA), calls)
++    monkeypatch.setenv('HERMES_KANBAN_BOARD', params['board'])
++    monkeypatch.setenv('HERMES_KANBAN_TASK', params['task_id'])
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(params['run_id']))
++    monkeypatch.setenv('HERMES_KANBAN_CLAIM_LOCK', params['claim_lock'])
++    monkeypatch.setenv('HERMES_KANBAN_DB', db)
++    assert kanban_worker_client._submit() == 1
++    assert REFUSED in capsys.readouterr().err
++    assert calls == ['ensure']
++
++
++def test_capsule_core_owner_advertises_capability(monkeypatch):
++    from gateway import run_runtime, session_hosted_service
++    monkeypatch.setattr(session_hosted_service, 'start_ready_hosted_services', lambda runner: None)
++    runner = SimpleNamespace(session_runtime_descriptor={}, _running=True, _draining=False,
++                             session_api=SimpleNamespace(task=SimpleNamespace(done=lambda: False)))
++    run_runtime.publish_gateway_runtime_ready(runner)
++    assert CAPABILITY in runner.session_runtime_descriptor['capabilities']
++    assert {'session-authority-v1', 'durable-admission-v1', 'event-replay-v1'} <= set(
++        runner.session_runtime_descriptor['capabilities'])
+diff --git a/tests/hermes_cli/test_kanban_worker_owner_wait.py b/tests/hermes_cli/test_kanban_worker_owner_wait.py
+index 2b31658760a..a8dcc6c229e 100644
+--- a/tests/hermes_cli/test_kanban_worker_owner_wait.py
++++ b/tests/hermes_cli/test_kanban_worker_owner_wait.py
+@@ -16,7 +16,7 @@ from hermes_cli import gateway_client, kanban_worker_client
+ 
+ def _owner(states, submitted):
+     @asynccontextmanager
+-    async def connect():
++    async def connect(**_):
+         state = states.pop(0) if states else None
+         if state:
+             # The exact refusal connect_gateway raises for a draining/starting owner.
+diff --git a/tests/hermes_cli/test_kanban_worker_socket_recovery.py b/tests/hermes_cli/test_kanban_worker_socket_recovery.py
+index 86346dd79b2..c37f62c584c 100644
+--- a/tests/hermes_cli/test_kanban_worker_socket_recovery.py
++++ b/tests/hermes_cli/test_kanban_worker_socket_recovery.py
+@@ -54,7 +54,7 @@ class _Owner:
+         owner = self
+ 
+         @asynccontextmanager
+-        async def _connect():
++        async def _connect(**_):
+             owner.dials += 1
+             owner._step(owner.connects, owner.after)
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,109 @@
+From db46a8d3df4c5b349d9b1abd01cb9e1fc8037e1c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:13:48 +0000
+Subject: [PATCH] [daveey] fix(tui_gateway): a cancelled prepared turn worker
+ settles when its sibling deferred to it
+
+A sibling worker of the same turn that finishes while prepared work is
+counted but unstarted skips settlement; cancel() now leaves as the last
+worker would, so the turn settles as it did before the work was prepared.
+Test is red without it.
+---
+ .../test_prompt_start_lock_order.py           | 29 +++++++++++++++++++
+ tui_gateway/turn_admission.py                 | 17 +++++++++--
+ 2 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/tests/tui_gateway/test_prompt_start_lock_order.py b/tests/tui_gateway/test_prompt_start_lock_order.py
+index 4ea732c1f6f..6c29f62279c 100644
+--- a/tests/tui_gateway/test_prompt_start_lock_order.py
++++ b/tests/tui_gateway/test_prompt_start_lock_order.py
+@@ -184,3 +184,32 @@ def test_turn_refused_for_a_closing_session_gives_back_the_prepared_admission(
+         with server._sessions_lock:
+             server._sessions.pop(sid, None)
+     assert fence.active_count() == 0
++
++
++def test_cancelled_work_settles_a_turn_whose_sibling_worker_finished_meanwhile(tmp_path, monkeypatch, request):
++    """A sibling worker that ends while this work is prepared but unstarted skips settlement (this work is
++    still counted); cancelling it must then settle the turn, as the sibling would have had it never been
++    prepared. Without a sibling, cancel leaves the claimed turn alone."""
++    from hermes_cli import backend_retirement
++    from tui_gateway import turn_admission as ta
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    session = {"history_lock": threading.Lock(), "running": False, "profile_home": str(tmp_path)}
++    with ta.admission(session) as accepted:
++        assert accepted
++        session["running"] = True
++    release = threading.Event()
++    sibling = ta.start_work(release.wait, name=f"sibling-{request.node.name}", session=session)
++    assert sibling is not None
++    work = ta.prepare_work(lambda: None, name="prepared", session=session)
++    assert work is not None
++    release.set()
++    sibling.join(10)
++    assert not sibling.is_alive()
++    assert session["running"] is True, "the sibling must defer settlement to the still-counted work"
++    work.cancel()
++    assert session["running"] is False
++    assert session.get("_turn_admission") is None
++    assert fence.active_count() == 0
+diff --git a/tui_gateway/turn_admission.py b/tui_gateway/turn_admission.py
+index 7e44cd34ea2..1b207c29c4d 100644
+--- a/tui_gateway/turn_admission.py
++++ b/tui_gateway/turn_admission.py
+@@ -229,16 +229,18 @@ def prepare_work(target, *, name, session=None, home=None, busy_wait_s=None):
+     if token is None:
+         return None
+     with token.lock:
++        shared = token.workers > 0  # another worker of this turn is running and would have settled it
+         token.workers += 1
+-    return PreparedWork(target, name, session, token, installed)
++    return PreparedWork(target, name, session, token, installed, shared)
+ 
+ 
+ class PreparedWork:
+     """A worker whose admission is retained but whose thread has not started (see ``prepare_work``)."""
+ 
+-    def __init__(self, target, name, session, token, installed):
++    def __init__(self, target, name, session, token, installed, shared):
+         self._target, self._name, self._session, self._token = target, name, session, token
+         self._installed = installed  # this prepare put ``token`` on the session (no turn owned it yet)
++        self._shared = shared  # another worker was running when this one joined the turn
+         self._finished = False
+         self._finish_lock = threading.Lock()
+ 
+@@ -247,6 +249,9 @@ class PreparedWork:
+             if self._finished:
+                 return
+             self._finished = True
++        self._leave()
++
++    def _leave(self):
+         session, token = self._session, self._token
+         # The final worker also covers failures before normal terminal cleanup.
+         if session is not None:
+@@ -261,11 +266,17 @@ class PreparedWork:
+         token.release()
+ 
+     def cancel(self):
+-        """Never started: undo the prepare only (no settlement), as if ``start_work`` had not been called."""
++        """Never started: leave the turn as if ``start_work`` had not been called (a sibling worker that
++        finished meanwhile deferred settlement to this one, so it settles then; otherwise only undo)."""
+         with self._finish_lock:
+             if self._finished:
+                 return
+             self._finished = True
++        if self._shared:
++            # A sibling that finished meanwhile skipped settlement because this worker was counted; leaving
++            # as the last worker settles the turn exactly as that sibling would have.
++            self._leave()
++            return
+         session, token = self._session, self._token
+         if session is not None and self._installed:
+             with session["history_lock"]:
+-- 
+2.55.0
+

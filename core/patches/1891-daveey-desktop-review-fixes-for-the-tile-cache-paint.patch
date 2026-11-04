@@ -1,0 +1,198 @@
+From c76f0f3c9f6db828391c836bde581255627546d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 16:29:02 +0000
+Subject: [PATCH] [daveey] desktop: review fixes for the tile cache paint
+
+An explicit refresh (refreshTranscript) never paints the cache, so callers
+that await fresh rows still get the REST page. Tests: rows landing after the
+cache paint are merged (mutation-checked: an always-replace publish fails),
+REST failure after a cache paint keeps the rows and logs outcome failed,
+refreshTranscript waits on REST, queue-full keys resolve dropped. Fix the
+prefetchKey doc (unlisted copies use UNLISTED_REFETCH_MS).
+---
+ .../electron/transcript-prefetch.test.ts      | 27 ++++++++
+ apps/desktop/electron/transcript-prefetch.ts  |  2 +-
+ .../src/app/contrib/hooks/tile-cache-paint.ts |  8 ++-
+ ...-session-tile-delegate.cache-paint.test.ts | 68 +++++++++++++++++++
+ .../hooks/use-session-tile-delegate.ts        |  9 ++-
+ 5 files changed, 108 insertions(+), 6 deletions(-)
+
+diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
+index 7d991ada7ca..d2b5129f5e9 100644
+--- a/apps/desktop/electron/transcript-prefetch.test.ts
++++ b/apps/desktop/electron/transcript-prefetch.test.ts
+@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
+ import { type TranscriptCacheKey, TranscriptCacheStore } from './transcript-cache'
+ import {
+   DEMAND_CONCURRENCY,
++  DEMAND_QUEUE_MAX,
+   GATEWAY_BACKOFF_MS,
+   type HubSessionRecord,
+   MIN_REFETCH_MS,
+@@ -351,4 +352,30 @@ describe('[daveey] on-demand prefetch of an @session-referenced session', () =>
+     await expect(h.prefetcher.prefetchKey({ ...old, connectionId: '' })).resolves.toBe('invalid')
+     expect(h.fetchLatest).toHaveBeenCalledTimes(1)
+   })
++
++  it('drops keys past DEMAND_QUEUE_MAX queued on one gateway', async () => {
++    const h = harness()
++    const gate = deferredRows()
++    h.fetchLatest.mockImplementation(() => gate.promise)
++
++    const keys = Array.from({ length: DEMAND_CONCURRENCY + DEMAND_QUEUE_MAX + 1 }, (_, index) => ({
++      ...old,
++      sessionId: `q${index}`
++    }))
++
++    const outcomes = keys.map(key => h.prefetcher.prefetchKey(key))
++
++    await expect(outcomes[outcomes.length - 1]).resolves.toBe('dropped')
++    gate.resolve([{ content: 'ok', id: 1 }])
++    const settled = await Promise.all(outcomes)
++    expect(settled.filter(outcome => outcome === 'dropped')).toHaveLength(1)
++    expect(h.fetchLatest).toHaveBeenCalledTimes(DEMAND_CONCURRENCY + DEMAND_QUEUE_MAX)
++  })
+ })
++
++function deferredRows() {
++  let resolve!: (rows: { content: string; id: number }[]) => void
++  const promise = new Promise<{ content: string; id: number }[]>(done => (resolve = done))
++
++  return { promise, resolve }
++}
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index a33cce1b1d3..c4af2c86211 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -202,7 +202,7 @@ export class TranscriptPrefetcher {
+    * Such refs mostly point at old sessions outside the PER_GATEWAY window, so without this the first click waited
+    * on REST. Fire-and-forget for the caller; the promise settles when this key is done (tests, logs). Deduped
+    * against queued/in-flight keys; skipped while the cache is current (the hub's activity/message_count when the
+-   * last pass listed the session, else a copy younger than MIN_REFETCH_MS) or the gateway is backed off; at most
++   * last pass listed the session, else a copy younger than UNLISTED_REFETCH_MS) or the gateway is backed off; at most
+    * DEMAND_CONCURRENCY fetches per gateway at a time and DEMAND_QUEUE_MAX queued behind them.
+    */
+   prefetchKey(raw: TranscriptCacheKey): Promise<PrefetchKeyOutcome> {
+diff --git a/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts b/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
+index 188c97697fa..b8a00cc23b8 100644
+--- a/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
++++ b/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
+@@ -38,13 +38,15 @@ export function trackSettled<T>(promise: Promise<T>): TrackedPromise<T> {
+   }
+ }
+ 
+-/** Cached transcript a tile may paint while its REST page is still in flight, or null. */
++/** Cached transcript a tile may paint while its REST page is still in flight, or null (no scope, REST already
++ *  landed, or an explicit refresh whose caller awaits fresh rows). */
+ export function tileCachedPaint(
+   storedSessionId: string,
+   scope: TranscriptTailScope | undefined,
+-  rest: TrackedPromise<unknown>
++  rest: TrackedPromise<unknown>,
++  refresh = false
+ ): ChatMessage[] | null {
+-  if (rest.settled || !scope) {
++  if (refresh || rest.settled || !scope) {
+     return null
+   }
+ 
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
+index d7c9aee6eae..4a6f2e1d966 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
+@@ -144,4 +144,72 @@ describe('[daveey] a tile (the @session ref click) paints from the transcript ca
+ 
+     expect(texts(states.get('runtime-other'))).toEqual(['right'])
+   })
++
++  it('rows that landed after the cache paint are merged with the REST page, not overwritten', async () => {
++    setSessionOwnerHint('busy-ref', ROUTE)
++    saveTranscriptTail('busy-ref', rows('cached question', 'cached answer'), SCOPE)
++    const rest = deferred<{ messages: SessionMessage[]; session_id: string }>()
++    vi.mocked(getLatestSessionMessages).mockReturnValue(rest.promise as never)
++    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'runtime-busy' } as never)
++    const { states } = renderTile()
++
++    await sessionTileDelegate()!.resumeTile('busy-ref')
++    const painted = states.get('runtime-busy')!
++    const local = { id: 'user-local-send', parts: [{ text: 'just sent', type: 'text' }], role: 'user' }
++    states.set('runtime-busy', { ...painted, messages: [...painted.messages, local as never] })
++
++    // The page has nothing newer than the paint: replacing (not merging) would drop the local send.
++    rest.resolve({ messages: rows('cached question', 'cached answer edited'), session_id: 'busy-ref' })
++
++    await vi.waitFor(() => expect(texts(states.get('runtime-busy'))).toContain('cached answer edited'))
++    expect(texts(states.get('runtime-busy'))).toContain('just sent')
++  })
++
++  it('a REST failure after the cache paint keeps the cached rows and logs outcome "failed"', async () => {
++    setSessionOwnerHint('fail-ref', ROUTE)
++    saveTranscriptTail('fail-ref', rows('cached only'), SCOPE)
++    const rest = deferred<null>()
++    vi.mocked(getLatestSessionMessages).mockReturnValue(rest.promise as never)
++    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'runtime-fail' } as never)
++    const { states } = renderTile()
++
++    await sessionTileDelegate()!.resumeTile('fail-ref')
++    rest.resolve(null)
++
++    await vi.waitFor(() =>
++      expect(tileLines()).toEqual([expect.objectContaining({ outcome: 'failed', paint: 'cache' })])
++    )
++    expect(texts(states.get('runtime-fail'))).toEqual(['cached only'])
++  })
++
++  it('an explicit refresh (refreshTranscript) still waits on REST and never paints the cache', async () => {
++    setSessionOwnerHint('refresh-ref', ROUTE)
++    saveTranscriptTail('refresh-ref', rows('stale cached'), SCOPE)
++    const rest = deferred<{ messages: SessionMessage[]; session_id: string }>()
++    vi.mocked(getLatestSessionMessages).mockReturnValue(rest.promise as never)
++    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'runtime-refresh' } as never)
++    const { states } = renderTile()
++
++    let resolved = false
++
++    const open = sessionTileDelegate()!
++      .resumeTile('refresh-ref', { refreshTranscript: true })
++      .then(id => {
++        resolved = true
++
++        return id
++      })
++
++    // REST pending: the resume has bound, but an explicit refresh neither resolves nor paints the cache.
++    await vi.waitFor(() => expect(requestGatewayForAgent).toHaveBeenCalled())
++    await new Promise(resolve => setTimeout(resolve, 20))
++    expect(resolved).toBe(false)
++    expect(texts(states.get('runtime-refresh'))).toEqual([])
++
++    rest.resolve({ messages: rows('fresh'), session_id: 'refresh-ref' })
++    await expect(open).resolves.toBe('runtime-refresh')
++
++    expect(texts(states.get('runtime-refresh'))).toEqual(['fresh'])
++    expect(tileLines()).toEqual([expect.objectContaining({ paint: 'rest' })])
++  })
+ })
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+index 615ac246274..bfbf4c52a73 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+@@ -563,8 +563,13 @@ export function useSessionTileDelegate({
+         )
+ 
+         // [daveey] REST still in flight: paint the cached transcript now and reconcile when the page lands.
+-        const cachedPaint =
+-          outcome.mode === 'read-only' ? null : tileCachedPaint(storedSessionId, tileRestScope(owner), rest)
++        // An explicit refresh (callers await fresh rows) and a read-only fallback wait on REST as before.
++        const cachedPaint = tileCachedPaint(
++          storedSessionId,
++          outcome.mode === 'read-only' ? undefined : tileRestScope(owner),
++          rest,
++          refreshTranscript
++        )
+ 
+         const prefetch = cachedPaint ? null : await prefetchPromise
+ 
+-- 
+2.55.0
+

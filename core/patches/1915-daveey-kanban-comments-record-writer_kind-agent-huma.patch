@@ -1,0 +1,430 @@
+From c2f066a6d0982f2476cdd5bef8b53ba10fa7eef9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:18:12 +0000
+Subject: [PATCH] [daveey] kanban: comments record writer_kind (agent/human);
+ live notes say when an agent wrote them
+
+The kanban_comment tool is always an agent, but nothing recorded it. David and his agents share one
+profile, so a chat agent's note reached the worker stamped 'default (another session)' under
+'from the operator', and the ask-gate scored 'Please re-check (c) yourself' as David (agent-261aa31f49).
+
+- add_comment(writer_kind='agent'|'human', writer_session=...) stores them on the commented event
+  (additive; unset for system writers and legacy callers; other values raise).
+- kanban_comment tool: agent + request-scoped session id. CLI / slash command and dashboard (Desktop): human.
+- inject_new_comments_from_env stamps agent lines '(agent chat, another session)'; when every line is an
+  agent's, the header is 'from another agent session'.
+
+Proof: tests/tools/test_kanban_comment_writer_kind.py 7 red -> green; 59 comment-touching test files
+1146 passed.
+---
+ hermes_cli/kanban.py                          |   3 +-
+ hermes_cli/kanban_db.py                       |  31 +---
+ hermes_cli/kanban_db_comment_ids.py           |  61 ++++++++
+ plugins/kanban/dashboard/plugin_api.py        |   3 +-
+ .../tools/test_kanban_comment_writer_kind.py  | 146 ++++++++++++++++++
+ tools/kanban_tools.py                         |  24 +--
+ tools/kanban_tools_notes.py                   |  29 ++++
+ 7 files changed, 248 insertions(+), 49 deletions(-)
+ create mode 100644 tests/tools/test_kanban_comment_writer_kind.py
+ create mode 100644 tools/kanban_tools_notes.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index b37f40b1e2e..ba563dc3ef9 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1079,8 +1079,9 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+     author = args.author or _profile_author()
+     with kbc.connect_closing() as conn:
+         try:
++            # [daveey] The CLI and /kanban slash command are typed by a person; agents use the tool.
+             kb.add_comment(conn, args.task_id, author, body,
+-                           origin_gateway=getattr(args, "origin_gateway", None))
++                           origin_gateway=getattr(args, "origin_gateway", None), writer_kind="human")
+         except ValueError as exc:
+             return _err(f"kanban comment: {exc}", 2)
+         live = kb.live_run_id(conn, args.task_id)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 07722da695b..6b65293a92b 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1688,35 +1688,6 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
+ 
+ # --- Comments & events ---
+ 
+-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
+-                origin_gateway: Optional[str] = None) -> int:
+-    """Append a comment. ``origin_gateway``: the gateway it came from (the hermes-hub relay passes the
+-    sender); default: the gateway the author spelling names, else this gateway (kanban_comment_origin). [daveey]"""
+-    if not body or not body.strip():
+-        raise ValueError("comment body is required")
+-    if not author or not author.strip():
+-        raise ValueError("comment author is required")
+-    from hermes_cli.kanban_comment_origin import resolve_origin
+-    origin = resolve_origin(author, origin_gateway)
+-    now = int(time.time())
+-    # [daveey] A comment written from inside a worker run records that run on its
+-    # ``commented`` event, so the live comment bridge can skip exactly the run's own notes
+-    # by id. Authorship cannot: workers and the chats steering them share a profile.
+-    # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
+-    # compose comment writes under one outer commit.
+-    with write_txn(conn, allow_nested=True):
+-        _require_task(conn, task_id)
+-        cur = conn.execute(
+-            "INSERT INTO task_comments (task_id, author, body, created_at, origin_gateway) "
+-            "VALUES (?, ?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now, origin),
+-        )
+-        cid = int(cur.lastrowid or 0)
+-        payload: dict = {"author": author, "len": len(body), "comment_id": cid}
+-        payload.update(writer_provenance(conn, task_id))  # writer_run_id + portable writer_run_uid
+-        _append_event(conn, task_id, "commented", payload)
+-        return cid
+-
+-
+ def record_comment_delivery(conn: sqlite3.Connection, task_id: str, run_id: int,
+                             comment_ids: list[int]) -> None:
+     """Receipt that the live bridge steered ``comment_ids`` into the running worker of ``run_id``."""
+@@ -4214,7 +4185,7 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
+ 
+ # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+ from hermes_cli.kanban_db_comment_ids import (
+-    comment_id_before_run_start, delivered_comment_ids, own_comment_ids, writer_provenance)
++    add_comment, agent_comment_ids, comment_id_before_run_start, delivered_comment_ids, own_comment_ids, writer_provenance)
+ from hermes_cli.kanban_db_schedule import schedule_task
+ from hermes_cli.kanban_db_edit import PriorityLowerRefused, edit_task
+ from hermes_cli.kanban_reason_comment import _awaiting_human_answer
+diff --git a/hermes_cli/kanban_db_comment_ids.py b/hermes_cli/kanban_db_comment_ids.py
+index 3ccadc7391d..faef583ee62 100644
+--- a/hermes_cli/kanban_db_comment_ids.py
++++ b/hermes_cli/kanban_db_comment_ids.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ import json
+ import os
+ import sqlite3
++import time
+ from typing import Optional
+ 
+ 
+@@ -76,3 +77,63 @@ def comment_id_before_run_start(conn: sqlite3.Connection, task_id: str, run_id:
+     got = conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id = ? AND created_at < ?",
+                        (task_id, int(row[0]))).fetchone()
+     return int(got[0]) if got and got[0] is not None else 0
++
++
++def agent_comment_ids(conn: sqlite3.Connection, task_id: str, comment_ids: list[int]) -> set[int]:
++    """Those of ``comment_ids`` whose ``commented`` event says an agent wrote them
++    (``writer_kind='agent'``). Legacy and system comments carry no kind and are not included. [daveey]"""
++    ids = [int(i) for i in comment_ids]
++    if not ids:
++        return set()
++    marks = ",".join("?" * len(ids))
++    rows = conn.execute(
++        "SELECT json_extract(payload, '$.comment_id') FROM task_events "
++        "WHERE task_id = ? AND kind = 'commented' "
++        "AND json_extract(payload, '$.writer_kind') = 'agent' "
++        f"AND json_extract(payload, '$.comment_id') IN ({marks})", (task_id, *ids)).fetchall()
++    return {int(r[0]) for r in rows if r[0] is not None}
++
++
++def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
++                origin_gateway: Optional[str] = None, writer_kind: Optional[str] = None,
++                writer_session: Optional[str] = None) -> int:
++    """Append a comment (moved from ``kanban_db``; re-exported there). ``origin_gateway``: the gateway it came from (the hermes-hub relay passes the
++    sender); default: the gateway the author spelling names, else this gateway (kanban_comment_origin). [daveey]
++
++    ``writer_kind`` ("agent" | "human") records who typed it on the ``commented`` event, with the
++    agent's ``writer_session``: David and his agents share one profile, so the author can't say.
++    Unset (system writers, legacy callers) leaves the payload as before. [daveey]"""
++    if not body or not body.strip():
++        raise ValueError("comment body is required")
++    if not author or not author.strip():
++        raise ValueError("comment author is required")
++    if writer_kind not in (None, "agent", "human"):
++        raise ValueError(f"writer_kind must be 'agent' or 'human', not {writer_kind!r}")
++    from hermes_cli.kanban_comment_origin import resolve_origin
++    origin = resolve_origin(author, origin_gateway)
++    now = int(time.time())
++    # [daveey] A comment written from inside a worker run records that run on its
++    # ``commented`` event, so the live comment bridge can skip exactly the run's own notes
++    # by id. Authorship cannot: workers and the chats steering them share a profile.
++    # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
++    # compose comment writes under one outer commit.
++    with _kb.write_txn(conn, allow_nested=True):
++        _kb._require_task(conn, task_id)
++        cur = conn.execute(
++            "INSERT INTO task_comments (task_id, author, body, created_at, origin_gateway) "
++            "VALUES (?, ?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now, origin),
++        )
++        cid = int(cur.lastrowid or 0)
++        payload: dict = {"author": author, "len": len(body), "comment_id": cid}
++        payload.update(writer_provenance(conn, task_id))  # writer_run_id + portable writer_run_uid
++        if writer_kind:
++            payload["writer_kind"] = writer_kind
++            if writer_session:
++                payload["writer_session"] = str(writer_session)
++        _kb._append_event(conn, task_id, "commented", payload)
++        return cid
++
++
++# Late-bound at the bottom (import-cycle breaking, like ``kanban_db_schedule``): ``kanban_db``
++# re-exports from this module, so it must be fully populated before ``kanban_db`` imports it.
++from hermes_cli import kanban_db as _kb
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index adf98fd7474..74b19ddf896 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -932,7 +932,8 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
+     with _board_conn(board) as (board, conn):
+         _foreign_card_409(conn, task_id)
+         _require_task(conn, task_id)
+-        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body)
++        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body,
++                              writer_kind="human")  # [daveey] typed in the dashboard/Desktop
+         return {"ok": True}
+ 
+ 
+diff --git a/tests/tools/test_kanban_comment_writer_kind.py b/tests/tools/test_kanban_comment_writer_kind.py
+new file mode 100644
+index 00000000000..647d80d7de5
+--- /dev/null
++++ b/tests/tools/test_kanban_comment_writer_kind.py
+@@ -0,0 +1,146 @@
++"""Comment writer provenance: who wrote a card note, an agent or a human. [daveey]
++
++Regression for self-heal agent-261aa31f49: a chat agent's ``kanban_comment`` ("Please re-check (c)
++yourself, then complete.") reached the worker as ``New note on your kanban task from the operator`` /
++``default (another session)``, the same stamp a human's note gets, so the ask-gate scored it as David
++saying "do it yourself". Every actor shares the ``default`` profile, so the author name can't tell them
++apart; the ``commented`` event now records ``writer_kind`` and the live note says when an agent wrote it.
++"""
++from __future__ import annotations
++
++import json
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++import tools.kanban_tools as kt
++from tests.tools import test_kanban_comment_injection as inj
++
++worker_home = inj.worker_home
++FakeAgent = inj.FakeAgent
++AGENT_HEADER = "on your kanban task from another agent session (delivered mid-run)"
++OPERATOR_HEADER = "on your kanban task from the operator (delivered mid-run)"
++
++
++def _payload(tid: str, cid: int) -> dict:
++    conn = kbc.connect()
++    try:
++        for e in kb.list_events(conn, tid):
++            if e.kind == "commented" and (e.payload or {}).get("comment_id") == cid:
++                return e.payload
++    finally:
++        conn.close()
++    raise AssertionError(f"no commented event for comment {cid}")
++
++
++def _ready_task(title="t") -> str:
++    conn = kbc.connect()
++    try:
++        return kb.create_task(conn, title=title)
++    finally:
++        conn.close()
++
++
++def test_tool_comment_event_records_agent_writer(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    tid = _ready_task()
++    out = json.loads(kt._handle_comment({"task_id": tid, "body": "Please re-check (c) yourself"}))
++    assert _payload(tid, out["comment_id"])["writer_kind"] == "agent"
++
++
++def test_tool_comment_records_the_writing_session(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    from gateway.session_context import clear_session_vars, set_session_vars
++    tid = _ready_task()
++    tokens = set_session_vars(session_id="sess-chat-1")
++    try:
++        out = json.loads(kt._handle_comment({"task_id": tid, "body": "note"}))
++    finally:
++        clear_session_vars(tokens)
++    assert _payload(tid, out["comment_id"])["writer_session"] == "sess-chat-1"
++
++
++def test_cli_comment_event_records_human_writer(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    from hermes_cli import kanban
++    tid = _ready_task()
++    assert "Comment added" in kanban.run_slash(f"comment {tid} why are you asking me?")
++    conn = kbc.connect()
++    try:
++        cid = kb.list_comments(conn, tid)[-1].id
++    finally:
++        conn.close()
++    assert _payload(tid, cid)["writer_kind"] == "human"
++
++
++def test_dashboard_comment_event_records_human_writer(worker_home, monkeypatch):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    import importlib.util
++    from pathlib import Path
++    spec = importlib.util.spec_from_file_location(
++        "kanban_dash_api_wk", Path(kt.__file__).resolve().parents[1] / "plugins/kanban/dashboard/plugin_api.py")
++    mod = importlib.util.module_from_spec(spec)
++    import sys
++    monkeypatch.setitem(sys.modules, spec.name, mod)
++    spec.loader.exec_module(mod)
++    app = FastAPI()
++    app.include_router(mod.router)
++    tid = _ready_task()
++    r = TestClient(app).post(f"/tasks/{tid}/comments", json={"body": "do it yourself"})
++    assert r.status_code == 200, r.text
++    conn = kbc.connect()
++    try:
++        cid = kb.list_comments(conn, tid)[-1].id
++    finally:
++        conn.close()
++    assert _payload(tid, cid)["writer_kind"] == "human"
++
++
++def test_unknown_writer_kind_is_rejected(worker_home):
++    tid = _ready_task()
++    conn = kbc.connect()
++    try:
++        with pytest.raises(ValueError):
++            kb.add_comment(conn, tid, "default", "x", writer_kind="robot")
++        cid = kb.add_comment(conn, tid, "kanban-dispatcher", "system note")
++    finally:
++        conn.close()
++    assert "writer_kind" not in _payload(tid, cid)  # system writers: unchanged payload
++
++
++def _chat_tool_comment(tid: str, body: str) -> None:
++    """A Desktop chat on the same profile posting via the kanban_comment tool (no worker env)."""
++    inj._as_other_session(lambda: kt._handle_comment({"task_id": tid, "body": body}))
++
++
++def test_agent_note_reaches_worker_with_agent_header_and_stamp(worker_home, monkeypatch):
++    tid, _run = inj._running_worker(monkeypatch)
++    agent = FakeAgent()
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False  # seed
++    _chat_tool_comment(tid, "Please re-check (c) yourself, then complete.")
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    note = agent.steers[0]
++    assert note.startswith("New note " + AGENT_HEADER), note
++    assert "- default (agent chat, another session) at " in note
++    assert "from the operator" not in note
++
++
++def test_mixed_notes_keep_operator_header_and_stamp_each_line(worker_home, monkeypatch):
++    tid, _run = inj._running_worker(monkeypatch)
++    agent = FakeAgent()
++    inj._unthrottle()
++    kt.inject_new_comments_from_env(agent)  # seed
++    _chat_tool_comment(tid, "agent says: re-check it yourself")
++    from hermes_cli import kanban
++    inj._as_other_session(lambda: kanban.run_slash(f"comment {tid} why are you asking me?"))
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    note = agent.steers[0]
++    assert note.startswith("New notes " + OPERATOR_HEADER), note
++    assert "- default (agent chat, another session) at " in note
++    assert "- default (another session) at " in note  # the human line keeps the old stamp
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index ec41bc9a0e8..8a0e84b7740 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -703,18 +703,6 @@ _comment_poll_last_attempt: float = 0.0
+ _comment_watermark: dict[str, int] = {}
+ 
+ 
+-def _comment_stamp(c: Any, own_identity: str) -> str:
+-    """``default (another session) at 04:50 PDT``: who wrote the note and when, so a worker
+-    can tell an operator note from its own even when both run as the same profile."""
+-    author = (c.author or "").strip() or "operator"
+-    who = f"{author} (another session)" if author == own_identity else author
+-    try:
+-        when = time.strftime("%H:%M %Z", time.localtime(int(c.created_at)))
+-    except (TypeError, ValueError, OverflowError):
+-        return who
+-    return f"{who} at {when}"
+-
+-
+ def inject_new_comments_from_env(agent: Any) -> bool:
+     """Steer new operator comments on the worker's task into ``agent``; True iff a
+     steer was injected; never raises. Skipped as own: the comments THIS run wrote, by id
+@@ -744,6 +732,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
+             if seen is not None and rows and run_id is not None:
+                 own_ids = (kb.own_comment_ids(conn, tid, run_id)
+                            | kb.delivered_comment_ids(conn, tid, run_id))
++            agent_ids = kb.agent_comment_ids(conn, tid, [c.id for c in rows]) if seen is not None else set()
+     except Exception:
+         logger.debug("comment-inject: bridge failed", exc_info=True)
+         return False
+@@ -763,10 +752,8 @@ def inject_new_comments_from_env(agent: Any) -> bool:
+         fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+     if not fresh:
+         return False
+-    lines = [f"- {_comment_stamp(c, own)}: {c.body.strip()}" for c in fresh]
+-    note = ("New note" + ("s" if len(fresh) > 1 else "")
+-            + " on your kanban task from the operator (delivered mid-run). "
+-            + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
++    from tools.kanban_tools_notes import live_note
++    note = live_note(fresh, own, agent_ids)
+     try:
+         delivered = bool(agent.steer(note))
+     except Exception:
+@@ -1375,7 +1362,10 @@ def _handle_comment(args: dict, **kw) -> str:
+         foreign = _kfc.refusal(conn, str(tid))  # [daveey] only a replica copy here: name the owner
+         if foreign:
+             raise _Reject(foreign, _kfc.REJECTION)
+-        cid = kb.add_comment(conn, tid, author=author, body=str(body))
++        # [daveey] This tool is always an agent: record it, so no reader guesses (agent-261aa31f49).
++        from gateway.session_context import get_session_env
++        cid = kb.add_comment(conn, tid, author=author, body=str(body), writer_kind="agent",
++                             writer_session=get_session_env("HERMES_SESSION_ID", "") or None)
+         subscribed = _maybe_subscribe_on_touch(conn, str(tid))
+         live = kb.live_run_id(conn, str(tid))
+         extra: dict = {"live_run": live is not None}
+diff --git a/tools/kanban_tools_notes.py b/tools/kanban_tools_notes.py
+new file mode 100644
+index 00000000000..1753f927259
+--- /dev/null
++++ b/tools/kanban_tools_notes.py
+@@ -0,0 +1,29 @@
++"""Text of the live card note steered into a running worker (split from ``kanban_tools``). [daveey]"""
++from __future__ import annotations
++
++import time
++from typing import Any
++
++
++def _comment_stamp(c: Any, own_identity: str, agent: bool = False) -> str:
++    """``default (another session) at 04:50 PDT``: who wrote the note and when, so a worker
++    can tell an operator note from its own even when both run as the same profile. A note an
++    agent wrote (``writer_kind='agent'``) says so: ``default (agent chat, another session)``. [daveey]"""
++    author = (c.author or "").strip() or "operator"
++    tags = (["agent chat"] if agent else []) + (["another session"] if author == own_identity else [])
++    who = f"{author} ({', '.join(tags)})" if tags else author
++    try:
++        when = time.strftime("%H:%M %Z", time.localtime(int(c.created_at)))
++    except (TypeError, ValueError, OverflowError):
++        return who
++    return f"{who} at {when}"
++
++
++def live_note(fresh: list, own_identity: str, agent_ids: set) -> str:
++    """The OUT-OF-BAND note for ``fresh`` comments. [daveey] Say when only agents wrote it: readers
++    (ask-gate) must not take a chat agent's "check it yourself" for David's words (agent-261aa31f49)."""
++    lines = [f"- {_comment_stamp(c, own_identity, c.id in agent_ids)}: {c.body.strip()}" for c in fresh]
++    source = "another agent session" if all(c.id in agent_ids for c in fresh) else "the operator"
++    return ("New note" + ("s" if len(fresh) > 1 else "")
++            + f" on your kanban task from {source} (delivered mid-run). "
++            + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
+-- 
+2.55.0
+

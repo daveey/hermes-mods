@@ -1,0 +1,273 @@
+From 8e9d24471c4da8cbe51a19b93d3b9425b5fdbdb6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:35:22 -0800
+Subject: [PATCH] fix(outcome): an unviewed completion's note is not an
+ interrupted turn [daveey]
+
+A completion that arrives with no viewer attached is written into the chat as a
+note and runs no turn by design (#134889 LC-7). The stored outcome read that
+user row as unresolved{interrupted}, so chat 20261025_073850_55b17f (its
+delegation cut by a gateway restart) stayed red with no possible resolution, and
+nothing refreshed the outcome after a note since no turn ended.
+
+- hermes_state_outcome: trailing notes for finished work are transparent (the
+  chat's own last turn is its last word, a declaration still holds, a lost
+  request still shows); a note for an unfinished delegation reads as
+  unresolved{subagent_killed}.
+- process_registry_notifications: async_delegation_display_unfinished reads the
+  producer's own title, kept next to it.
+- session_completion_notes: refresh the stored outcome after writing a note,
+  off the admission loop.
+---
+ gateway/session_completion_notes.py           | 18 +++++
+ hermes_state_outcome.py                       | 40 +++++++++-
+ .../gateway/test_unviewed_completion_notes.py | 42 +++++++++++
+ tests/hermes_state/test_session_outcome.py    | 74 +++++++++++++++++++
+ tools/process_registry_notifications.py       | 11 +++
+ 5 files changed, 184 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/session_completion_notes.py b/gateway/session_completion_notes.py
+index 6982d2c3e69..4eb23e8f186 100644
+--- a/gateway/session_completion_notes.py
++++ b/gateway/session_completion_notes.py
+@@ -73,5 +73,23 @@ async def note_if_unviewed(authority, ref, row):
+     refresh = getattr(authority.runner, '_refresh_agent_cache_message_count', None)
+     if refresh is not None:  # the owner's own row: a cached agent stays, as after a turn's writes
+         await refresh(live.route, target)
++    _refresh_outcome_after_note(authority.db, target)
+     authority.pending_results[row['admission_id']] = {'result': {'final_response': '', 'messages': []}, 'usage': {}}
+     return ''
++
++
++def _refresh_outcome_after_note(db, target):
++    """[daveey] A note runs no turn, so no turn-end refresh restores the chat's stored outcome: refresh it here, off
++    the admission loop (the judge may call a model), as ``gateway/turn_outcome.py`` does for a turn. Best-effort."""
++    from agent.memory_provider import spawn_context_thread
++    from hermes_state_outcome import refresh_outcomes_quietly
++    try:
++        thread = spawn_context_thread(refresh_outcomes_quietly, name='completion-note-outcome',
++                                      args=([target], 'notice'), kwargs={'db': db})
++        thread.start()
++        return thread
++    except Exception:  # health: allow BLE001 -- a thread that can't start skips one refresh; the next refresh heals
++        import logging
++        logging.getLogger(__name__).warning('completion-note outcome refresh did not start for %s', target,
++                                            exc_info=True)
++        return None
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index bf7b2653356..717b0bb42dc 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -441,8 +441,46 @@ def _lost_request(tail: list[dict]) -> Optional[str]:
+     return None
+ 
+ 
++def _completion_note(row: dict) -> Optional[dict]:
++    """The display metadata of a completion written into the chat as a note because no viewer was attached
++    (``gateway/session_completion_notes.py``, #134889 LC-7), else None. A note never runs a turn by design, so it
++    is not a request awaiting an answer: a chat that ends on one was not interrupted."""
++    if row.get("role") != "user":
++        return None
++    meta = row.get("display_metadata")
++    if isinstance(meta, str):
++        with contextlib.suppress(ValueError, TypeError):
++            meta = json.loads(meta)
++    return meta if isinstance(meta, dict) and meta.get("completion_note") else None
++
++
++def _unfinished_note(row: dict) -> bool:
++    """An async delegation's note whose subagent did not finish (failed, interrupted by a restart, timed out)."""
++    meta = _completion_note(row)
++    if meta is None or row.get("display_kind") != "async_delegation_complete":
++        return False
++    from tools.process_registry_notifications import async_delegation_display_unfinished
++
++    return async_delegation_display_unfinished(str(meta.get("display_text") or ""))
++
++
++def _without_finished_notes(tail: list[dict]) -> list[dict]:
++    """[daveey] ``tail`` with its trailing completion notes for finished work dropped: the chat's own last turn is
++    then its last word. The newest note for unfinished work stops the drop and heads the tail, so ``_tail_reason``
++    names it."""
++    i = 0
++    while i < len(tail) and _completion_note(tail[i]) is not None:
++        if _unfinished_note(tail[i]):
++            return tail[i:]
++        i += 1
++    return tail[i:] if 0 < i < len(tail) else tail
++
++
+ def _tail_reason(tail: list[dict]) -> Optional[str]:
+     last = tail[0]
++    if _unfinished_note(last):
++        # A subagent the chat was waiting on stopped before it finished; with no viewer the note ran no turn.
++        return "subagent_killed"
+     if last.get("display_kind") == _NOTICE_KIND:
+         # The orphan reap's notice to a parent whose subagent a restart killed (tui_gateway/reap_notices.py).
+         return "subagent_killed" if '"subagent_killed"' in str(last.get("display_metadata") or "") else "notice_tail"
+@@ -520,7 +558,7 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     if not ignore_live_turn and _live_turn(db, sid):
+         return _outcome("running", now)
+     decisions, waits = _live_work(db, sid, _lineage_ids(db, sid))
+-    tail = _tail(db, sid)
++    tail = _without_finished_notes(_tail(db, sid))
+     if pending_reply is not None:  # the unsaved final reply is the last assistant message
+         tail.insert(0, {"role": "assistant", "content": pending_reply, "timestamp": now})
+     declared = _declared(stored)
+diff --git a/tests/gateway/test_unviewed_completion_notes.py b/tests/gateway/test_unviewed_completion_notes.py
+index 5561c249745..23a3ad243a3 100644
+--- a/tests/gateway/test_unviewed_completion_notes.py
++++ b/tests/gateway/test_unviewed_completion_notes.py
+@@ -401,3 +401,45 @@ async def test_closed_tip_lookup_defers_only_a_failed_read():
+         assert await lookup(db(error), entry, 'lc7-root', {'end_reason': 'compression'}) == ''
+     with pytest.raises(AttributeError):
+         await lookup(db(AttributeError('bug')), entry, 'lc7-root', {'end_reason': 'compression'})
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('display_text, expected', [
++    ('Subagent Task Interrupted: implement the fix', ('unresolved', 'subagent_killed')),
++    ('Subagent Task Completed: implement the fix', ('done', None)),
++])
++async def test_a_note_refreshes_the_stored_outcome_without_reading_as_an_interrupted_turn(
++        tmp_path, monkeypatch, display_text, expected):
++    """[daveey] A note runs no turn, so no turn-end refresh fires: the note path refreshes the chat's stored
++    outcome itself, and the outcome reads the note for what it is (a finished result, or a subagent stopped
++    before it finished), never ``unresolved{interrupted}``."""
++    import json
++    import threading
++    from gateway import session_completion_notes as notes_mod
++    from gateway.platforms.event import MessageEvent
++    from hermes_state_outcome import get_outcome
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    started = []
++    real = notes_mod._refresh_outcome_after_note
++    monkeypatch.setattr(notes_mod, '_refresh_outcome_after_note',
++                        lambda db, target: started.append(real(db, target)) or started[-1])
++    try:
++        target = _target(runner, authority, ref)
++        authority.db.append_message(target, role='user', content='ship the fix')
++        authority.db.append_message(target, role='assistant', content=(
++            'Shipped the fix; a background worker is double-checking the live UI and will report back.'))
++        live = authority.sessions[ref.session_id]
++        event = MessageEvent(text='[ASYNC DELEGATION BATCH COMPLETE — deleg_note] RESULT_deleg_note',
++                             source=live.source, internal=True, metadata={
++                                 'gateway_session_key': live.route, 'gateway_session_id': target,
++                                 'display_kind': 'async_delegation_complete', 'display_text': display_text})
++        await authority.admit_automation(runner._adapter_for_source(live.source), event,
++                                         json.dumps(['async_delegation', 'deleg_note', ''], separators=(',', ':')))
++        await authority._drain(ref)
++        assert len(_notes(authority, target)) == 1
++        assert started and isinstance(started[0], threading.Thread)
++        started[0].join(10)
++        stored = get_outcome(target, db=authority.db) or {}
++        assert (stored.get('kind'), stored.get('reason')) == expected
++    finally:
++        authority.db.close()
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 20225d4d7aa..43b54f8cf31 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -547,3 +547,77 @@ def test_a_declared_wait_on_a_cron_is_still_honoured(db):
+     so.declare_outcome("chat", {"kind": "waiting", "on": [{"kind": "cron", "id": "j1"}]}, db=db)
+     say(db, "tool", "ok", tool_name="session_outcome", tool_call_id="c1")
+     assert so.derive_outcome("chat", db=db)["kind"] == "waiting"
++
++
++# ── unviewed completion notes (#134889 LC-7) ───────────────────────────────
++
++
++def note(db, display_text, kind="async_delegation_complete"):
++    """What ``append_completion_note`` writes when a completion arrives with no viewer: a user row, no turn."""
++    say(db, "user", "[ASYNC DELEGATION BATCH COMPLETE — d1] ...", display_kind=kind,
++        display_metadata={"completion_note": ['["async_delegation","d1",""]'], "display_text": display_text,
++                          "completion_admission": "a1"})
++
++
++def test_a_finished_completion_note_leaves_the_chats_own_last_turn_as_its_word(db):
++    turn(db)
++    note(db, "Subagent Task Completed: implement the fix")
++    note(db, "Finished: make", kind="process_complete")
++    out = so.refresh_outcome("chat", "notice", db=db)
++    assert (out["kind"], out["summary"]) == ("done", SUMMARY)
++
++
++def test_an_unfinished_delegation_note_is_a_stopped_subagent_not_an_interrupted_turn(db):
++    turn(db)
++    note(db, "Subagent Task Interrupted: implement the fix")
++    out = so.refresh_outcome("chat", "notice", db=db)
++    assert (out["kind"], out["reason"]) == ("unresolved", "subagent_killed")
++
++
++def test_an_unfinished_note_under_a_finished_one_still_names_the_stopped_subagent(db):
++    turn(db)
++    note(db, "Subagent Tasks Finished with Issues: fan-out (2 tasks)")
++    note(db, "Subagent Task Completed: other")
++    out = so.refresh_outcome("chat", "notice", db=db)
++    assert (out["kind"], out["reason"]) == ("unresolved", "subagent_killed")
++
++
++def test_a_finished_note_does_not_break_a_declaration_or_hide_a_lost_request(db):
++    say(db, "user", "do it")
++    so.declare_outcome("chat", {"kind": "done", "summary": "Shipped."}, db=db)
++    say(db, "assistant", "ok")
++    note(db, "Subagent Task Completed: x")
++    out = so.refresh_outcome("chat", "notice", db=db)
++    assert (out["kind"], out["source"]) == ("done", "declared")
++    say(db, "user", "and the docs?")
++    note(db, "Subagent Task Completed: y")
++    assert so.refresh_outcome("chat", "notice", db=db)["reason"] == "interrupted"
++
++
++def test_a_typed_row_that_merely_mentions_completion_note_is_still_a_request(db):
++    turn(db)
++    say(db, "user", "what is a completion_note?")
++    assert so.refresh_outcome("chat", "turn_end", db=db)["reason"] == "interrupted"
++
++
++@pytest.mark.parametrize("text, unfinished", [
++    ("Subagent Task Completed: a", False), ("Subagent Tasks Completed: a (2 tasks)", False),
++    ("Subagent Task Interrupted: a", True), ("Subagent Task Failed: a", True), ("Subagent Task Incomplete: a", True),
++    ("Subagent Tasks Finished with Issues: a (2 tasks)", True), ("Subagent Task Timed Out: a", True),
++    ("Finished: make", False), ("", False),
++])
++def test_unfinished_reads_the_producers_own_titles(text, unfinished):
++    from tools.process_registry_notifications import async_delegation_display_unfinished
++    assert async_delegation_display_unfinished(text) is unfinished
++
++
++@pytest.mark.parametrize("result, unfinished", [
++    ({"status": "completed", "summary": "ok"}, False), ({"status": "interrupted"}, True),
++    ({"status": "error", "error": "boom"}, True), ({"status": "timeout"}, True),
++    ({"status": "completed", "summary": "ok", "exit_reason": "max_iterations"}, True),
++])
++def test_unfinished_agrees_with_the_title_producer(result, unfinished):
++    from tools.process_registry_notifications import (async_delegation_display_text,
++                                                      async_delegation_display_unfinished)
++    for evt in ({"goal": "g", **result}, {"is_batch": True, "goals": ["g"], "results": [{"task_index": 0, **result}]}):
++        assert async_delegation_display_unfinished(async_delegation_display_text(evt)) is unfinished
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index 87f5cfe9756..cd09e850221 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -349,6 +349,17 @@ def async_delegation_display_text(evt: dict) -> str:
+     return f"Subagent Tasks {outcome}: {_short_title(title)} ({len(results)} tasks)"
+ 
+ 
++_FINISHED_DISPLAY_PREFIXES = ("Subagent Task Completed:", "Subagent Tasks Completed:")
++
++
++def async_delegation_display_unfinished(display_text: str) -> bool:
++    """True when ``async_delegation_display_text`` titled a result whose work did not finish (failed,
++    interrupted, timed out, truncated...). [daveey] Read by the stored chat outcome off an unviewed completion's
++    note (``hermes_state_outcome``), which keeps only this title; kept next to its producer so the two can't drift."""
++    text = str(display_text or "")
++    return text.startswith("Subagent Task") and not text.startswith(_FINISHED_DISPLAY_PREFIXES)
++
++
+ def _short_title(title: str) -> str:
+     # A goal is free text: the card's title stays one line (and within an admission's display limit).
+     return title[:197] + "..." if len(title) > 200 else title
+-- 
+2.55.0
+

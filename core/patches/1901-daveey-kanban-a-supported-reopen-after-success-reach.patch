@@ -1,0 +1,421 @@
+From 3c624f4f9f6b4566497ca49e8cbd90accfeabaf6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 22:01:16 +0000
+Subject: [PATCH] [daveey] kanban: a supported reopen after success reaches
+ normal dispatch (recent_success/active_pr)
+
+`hermes kanban reopen` (reopen_done_task) emits `reopened`, which the respawn guard's
+recent_success step did not count as a deliberate re-run (only status/promoted/unblocked/
+reclaimed), so a card reopened right after completing sat held for the 1 h window.
+
+- reopened_after(): a `reopened` event with the supported payload (previous_status=done)
+  STRICTLY after the latest completed run lifts recent_success; same-second/older/malformed
+  reopens and unrelated events stay guarded. One reopen authorizes one rerun: the rerun's
+  own completion is newer and guards again.
+- active_pr: the same strict reopen after the newest PR comment lets the PR owner resume
+  THAT PR once; its next PR comment guards again.
+- reopen_done_task writes its REOPENED note through add_comment (nested) so it carries
+  `commented` provenance (chat/FYI). Before, a reason naming the PR was an unmatched,
+  owned publication candidate in the same second as the reopen, holding it active_pr.
+
+- reopened_after and the moved is_handoff_event live in kanban_db_dispatch_rerun.py
+  (kanban_db_dispatch.py file cap).
+
+RED: the new dispatch tests fail on main with respawn_guarded == [(tid, 'recent_success')].
+Mutants (strict tie, payload check, active_pr lift, add_comment provenance, recent_success
+lift): 5/5 killed.
+
+Why-chain: live t_01a19fc2faa99ef8 run 29063 completed 1793685957; reopened 1793686975;
+respawn_guarded recent_success 1793686978. Existing reopen tests asserted status only,
+never dispatch. Recurrence of t_e67c8a57 (t_7ba3127e), closed without a core change.
+Replay over hub kanban.db + boards + sync-shadow: 3 real reopened events, 1 changes
+(t_01a19fc2faa99ef8 recent_success -> released); 1 legacy {"by":"supervisor"} event stays guarded.
+---
+ hermes_cli/kanban_db_dispatch.py              |  22 +-
+ hermes_cli/kanban_db_dispatch_pr_state.py     |   7 +-
+ hermes_cli/kanban_db_dispatch_rerun.py        |  39 ++++
+ hermes_cli/kanban_db_operator.py              |   5 +-
+ .../hermes_cli/test_kanban_reopen_dispatch.py | 215 ++++++++++++++++++
+ 5 files changed, 267 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_rerun.py
+ create mode 100644 tests/hermes_cli/test_kanban_reopen_dispatch.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 2387b2f3497..91f67bce519 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -42,6 +42,7 @@ from hermes_cli.kanban_db_dispatch_crash_accounting import _account_crashes  # [
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+ from hermes_cli.kanban_db_dispatch_queries import lane_rows, skip_reap
+ from hermes_cli.kanban_db_dispatch_clock import record_clock_hold as _record_clock_hold
++from hermes_cli.kanban_db_dispatch_rerun import reopened_after
+ 
+ if TYPE_CHECKING:
+     from hermes_cli.kanban_db import Task
+@@ -1752,11 +1753,12 @@ def check_respawn_guard(
+     # 3. Completed run within guard window. Exception: an explicit re-queue
+     #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
+     #    a deliberate "run it again" — otherwise a manual done→ready would sit
+-    #    silently held until the window elapses.
++    #    silently held until the window elapses. An operator reopen counts only strictly after it. [daveey]
+     success = max((t for t, _ in _rows_since(
+         conn, "task_runs", task_id, now - _RESPAWN_GUARD_SUCCESS_WINDOW, "AND outcome = 'completed'")), default=None)
+     if success is not None and not any(_rows_since(
+-            conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
++            conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")) \
++            and not reopened_after(conn, task_id, success):
+         return "recent_success"
+ 
+     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR
+@@ -1783,22 +1785,6 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int,
+             yield t, row
+ 
+ 
+-def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
+-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
+-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
+-    --reclaim``), an unassign, or the dispatcher's own
+-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
+-    the very implementer that opened the PR. Events without ``from`` (written
+-    before it was recorded) are not trusted as handoffs — fail closed."""
+-    if kind != "assigned":
+-        return True
+-    data = _kb._json_or(payload, {})
+-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
+-        return False
+-    to = data.get("assignee")
+-    return bool(to) and "from" in data and data["from"] != to
+-
+-
+ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
+     """``hermes_cli.profiles.profile_exists``, or ``None`` when it cannot be
+     imported (local import avoids a cycle; callers fall back to trusting the
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 661ab27d25e..ede4522ecdf 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -423,6 +423,8 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     merge is resumed by that unblock to ship/verify THAT PR. So does an orderly park AFTER the
+     PR comment (``continued`` checkpoint or ``scheduled`` timed wait): the owner parked knowing
+     its PR, and the wake resumes it from that checkpoint, not a context-free respawn.
++    So does a supported operator reopen of the done card (``reopened``, strictly after): the
++    rerun resumes THAT PR; its ``REOPENED:`` note carries chat provenance, so it is FYI here.
+     An ordering ``dependency_wait`` strictly after the newest PR comment also permits
+     one continuation after parent completion/promotion: it must belong to the latest
+     claimed run of this card and assignee, ended orderly as blocked, with no subsequent
+@@ -449,6 +451,7 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     from hermes_cli import kanban_db as _kb
+     from hermes_cli import kanban_db_dispatch as _kbd
+     from hermes_cli.kanban_db_dispatch_pr_policy import holding_urls, norm_pr
++    from hermes_cli.kanban_db_dispatch_rerun import is_handoff_event, reopened_after
+ 
+     foreign_ids = _foreign_pr_comment_ids(conn, task_id)
+     fyi_urls: list[str] = []
+@@ -492,12 +495,14 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     if _immediate_checkpoint_after(conn, task_id, max(pr_times), latest_pr_comment_id):
+         return None
+     # Strictly after: a same-second handoff tie stays guarded (fail closed).
+-    if any(_kbd._is_handoff_event(e["kind"], e["payload"]) for _, e in _kbd._rows_since(
++    if any(is_handoff_event(e["kind"], e["payload"]) for _, e in _kbd._rows_since(
+             conn, "task_events", task_id, max(pr_times),
+             "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked', "
+             "'continued', 'scheduled')",
+             cols=", kind, payload", strict=True)):
+         return None
++    if reopened_after(conn, task_id, max(pr_times)):
++        return None  # operator reopen of the PR owner: it resumes THAT PR (its comments are in context)
+     if _dependency_handoff_after(conn, task_id, max(pr_times), latest_pr_comment_id):
+         return None
+     from hermes_cli.kanban_dependency_review import resumes_review
+diff --git a/hermes_cli/kanban_db_dispatch_rerun.py b/hermes_cli/kanban_db_dispatch_rerun.py
+new file mode 100644
+index 00000000000..dc888e9891b
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_rerun.py
+@@ -0,0 +1,39 @@
++"""Respawn-guard classifiers for events that make a re-spawn deliberate rather than a duplicate. [daveey]
++
++Moved out of ``kanban_db_dispatch`` (file cap): :func:`reopened_after` (operator reopen of a done
++card, used by ``recent_success`` and ``active_pr``) and :func:`is_handoff_event` (``active_pr``).
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Optional
++
++
++def reopened_after(conn: sqlite3.Connection, task_id: str, since: int) -> bool:
++    """A supported operator reopen (:func:`kanban_db_operator.reopen_done_task`: ``done`` -> ready/todo,
++    payload ``previous_status: done``) strictly after ``since``: a deliberate "run it again". A same-second
++    tie, an older reopen, or a ``reopened`` event without that payload fails closed. One reopen authorizes
++    one rerun: that rerun's own completion or PR comment is newer and guards again. [daveey]"""
++    from hermes_cli import kanban_db as _kb
++    from hermes_cli.kanban_db_dispatch import _rows_since
++
++    return any(_kb._json_dict(e["payload"]).get("previous_status") == "done" for _, e in _rows_since(
++        conn, "task_events", task_id, since, "AND kind = 'reopened'", cols=", payload", strict=True))
++
++
++def is_handoff_event(kind: str, payload: Optional[str]) -> bool:
++    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
++    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
++    --reclaim``), an unassign, or the dispatcher's own
++    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
++    the very implementer that opened the PR. Events without ``from`` (written
++    before it was recorded) are not trusted as handoffs — fail closed."""
++    if kind != "assigned":
++        return True
++    from hermes_cli import kanban_db as _kb
++
++    data = _kb._json_or(payload, {})
++    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
++        return False
++    to = data.get("assignee")
++    return bool(to) and "from" in data and data["from"] != to
+diff --git a/hermes_cli/kanban_db_operator.py b/hermes_cli/kanban_db_operator.py
+index 6e6fae6bc32..4f465b1f986 100644
+--- a/hermes_cli/kanban_db_operator.py
++++ b/hermes_cli/kanban_db_operator.py
+@@ -132,7 +132,6 @@ def reopen_done_task(
+     actor = (actor or "").strip() or "operator"
+     if not reason:
+         raise KanbanEditRefused("reopen requires a reason")
+-    now = int(time.time())
+     with _kb.write_txn(conn):
+         if _kb._task_status(conn, task_id) != "done":
+             return None
+@@ -148,7 +147,9 @@ def reopen_done_task(
+         _kb._append_event(conn, task_id, "reopened", {
+             "reason": reason[:2000], "actor": actor, "previous_status": "done", "status": new_status,
+         })
+-        _kb._insert_comment(conn, task_id, actor, f"REOPENED: {reason}", now)
++        # add_comment (nested) stamps the ``commented`` provenance: an operator note naming the PR is FYI to
++        # active_pr, not a fresh publication that would hold the reopen it records. [daveey]
++        _kb.add_comment(conn, task_id, actor, f"REOPENED: {reason}")
+         result = _kb.invalidate_descendants_for_parent_reopen(conn, task_id, author=actor)
+     for pid, claim_lock, started_at in result["terminations"]:
+         _kb._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+diff --git a/tests/hermes_cli/test_kanban_reopen_dispatch.py b/tests/hermes_cli/test_kanban_reopen_dispatch.py
+new file mode 100644
+index 00000000000..31f5abc7d96
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_reopen_dispatch.py
+@@ -0,0 +1,215 @@
++"""A supported operator reopen of a done card reaches a normal dispatch. [daveey]
++
++``hermes kanban reopen`` (``kanban_db_operator.reopen_done_task``) moves a card that
++completed moments ago back to ready with a ``reopened`` event. The respawn guard's
++``recent_success`` step only treated ``status``/``promoted``/``unblocked``/``reclaimed`` as a
++deliberate re-run, so the reopen sat held until the 1 h window elapsed (live: the Stage A
++owner was reopened at 22:22:55 PST and guarded ``recent_success`` three seconds later).
++
++A reopen strictly after the latest completed run now authorizes ONE rerun through the
++normal dispatch path; a same-second or older reopen, a malformed ``reopened`` event and
++unrelated events stay guarded; a live claim is not duplicated; open parents still gate;
++a PR owner resumes its PR once and its next PR comment guards again; a fenced worker
++shell still cannot reopen.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_db_operator as kbo
++from tests.hermes_cli import test_kanban_edit_operator_fields as ops
++from tests.hermes_cli import test_kanban_shared_blockers as shared
++from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++kanban_home = shared.kanban_home
++spawns = shared.spawns
++
++T0 = 1_793_686_000
++PR = "https://github.com/daveey/hermes/pull/9001"
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [T0]
++    monkeypatch.setattr(time, "time", lambda: now[0])
++    return now
++
++
++@pytest.fixture
++def open_pr(monkeypatch):
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++
++
++def _ran_and_completed(conn, title="stage a", pr_comment=False):
++    tid = kb.create_task(conn, title=title, assignee="default")
++    assert kb.claim_task(conn, tid) is not None
++    if pr_comment:
++        worker_comment(conn, tid, "default", f"Opened {PR}")
++    assert kb.complete_task(conn, tid, result="ok", summary="done")
++    return tid
++
++
++def _reopen(tid, reason="independent replay found defects"):
++    assert ops._main(["reopen", tid, "--reason", reason]) == 0
++
++
++def _guard(tid):
++    with kbc.connect_closing() as conn:
++        return kbd.check_respawn_guard(conn, tid)
++
++
++def test_cli_reopen_after_success_dispatches_once(kanban_home, clock, spawns):
++    spawned, spawn = spawns
++    with kbc.connect_closing() as conn:
++        tid = _ran_and_completed(conn)
++    clock[0] += 30
++    _reopen(tid)
++    with kbc.connect_closing() as conn:
++        first = kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert (tid, "recent_success") not in first.respawn_guarded
++        assert spawned == [tid]
++        assert kb.get_task(conn, tid).status == "running"
++        # The live claim is never duplicated by a second tick.
++        clock[0] += 5
++        kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert spawned == [tid]
++        assert conn.execute("SELECT count(*) FROM task_runs WHERE task_id=? AND ended_at IS NULL",
++                            (tid,)).fetchone()[0] == 1
++
++
++def test_dashboard_done_to_ready_still_dispatches(kanban_home, clock, spawns):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++
++    from tests.plugins.test_kanban_dashboard_plugin import _load_plugin_router
++
++    spawned, spawn = spawns
++    with kbc.connect_closing() as conn:
++        tid = _ran_and_completed(conn)
++    clock[0] += 30
++    app = FastAPI()
++    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
++    r = TestClient(app).patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"})
++    assert r.status_code == 200, r.text
++    with kbc.connect_closing() as conn:
++        result = kbd.dispatch_once(conn, spawn_fn=spawn)
++    assert not result.respawn_guarded and spawned == [tid]
++
++
++def test_reopen_authorizes_one_rerun_only(kanban_home, clock, spawns):
++    spawned, spawn = spawns
++    with kbc.connect_closing() as conn:
++        tid = _ran_and_completed(conn)
++    clock[0] += 30
++    _reopen(tid)
++    with kbc.connect_closing() as conn:
++        kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert spawned == [tid]
++        clock[0] += 60
++        assert kb.complete_task(conn, tid, result="corrected", summary="rerun done")
++    # The rerun's completion is newer than the reopen: the older reopen no longer lifts.
++    assert _guard(tid) == "recent_success"
++
++
++def test_same_second_reopen_stays_guarded(kanban_home, clock):
++    with kbc.connect_closing() as conn:
++        tid = _ran_and_completed(conn)
++    _reopen(tid)
++    assert _guard(tid) == "recent_success"
++    clock[0] += 1
++    assert _guard(tid) == "recent_success"  # the tie is a fact of the event, not of the read time
++
++
++@pytest.mark.parametrize("kind,payload", [
++    ("edited", {"fields": ["body"]}),
++    ("reprioritized", {"priority": 15}),
++    ("model_override_set", {"model": "m", "provider": "p"}),
++    ("review_reopened", {}),
++    ("reopened", {}),
++    ("reopened", {"previous_status": "blocked"}),
++])
++def test_unrelated_or_malformed_events_stay_guarded(kanban_home, clock, kind, payload):
++    with kbc.connect_closing() as conn:
++        tid = _ran_and_completed(conn)
++        clock[0] += 30
++        kb.add_comment(conn, tid, "default", "notes")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, kind, payload)
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        conn.commit()
++    assert _guard(tid) == "recent_success"
++
++
++def test_open_parent_still_gates_reopened_child(kanban_home, clock, spawns):
++    spawned, spawn = spawns
++    with kbc.connect_closing() as conn:
++        child = _ran_and_completed(conn, title="child")
++        parent = kb.create_task(conn, title="parent", assignee="other")
++        kb.link_tasks(conn, parent_id=parent, child_id=child)
++    clock[0] += 30
++    _reopen(child)
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, child).status == "todo"
++        kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert child not in spawned
++        assert kb.get_task(conn, child).status == "todo"
++        clock[0] += 30
++        assert kb.claim_task(conn, parent) is not None
++        assert kb.complete_task(conn, parent, result="ok", summary="parent done")
++        kb.recompute_ready(conn)
++        assert kb.get_task(conn, child).status == "ready"
++        kbd.dispatch_once(conn, spawn_fn=spawn)
++    assert spawned.count(child) == 1
++
++
++@pytest.mark.parametrize("reason", [f"review of {PR} found two defects", "review found two defects"])
++def test_pr_owner_reopen_resumes_its_pr_once(kanban_home, clock, spawns, open_pr, reason):
++    spawned, spawn = spawns
++    with kbc.connect_closing() as conn:
++        tid = _ran_and_completed(conn, pr_comment=True)
++    clock[0] += 30
++    _reopen(tid, reason)
++    with kbc.connect_closing() as conn:
++        result = kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert not result.respawn_guarded
++        assert spawned == [tid]
++        assert [t.id for t in kb.list_tasks(conn)] == [tid]  # same owner; no second implementation card
++        clock[0] += 30
++        worker_comment(conn, tid, "default", f"Pushed the corrections to {PR}")
++    # The rerun's own PR report is newer than the reopen: a respawn is guarded again.
++    assert _guard(tid) == "active_pr"
++
++
++def test_reopen_without_newer_reopen_keeps_pr_guard(kanban_home, clock, open_pr):
++    """No reopen: a done card's open PR still guards a ready row (the ordinary hold)."""
++    with kbc.connect_closing() as conn:
++        tid = _ran_and_completed(conn, pr_comment=True)
++        clock[0] += 3700  # past the success window, inside the PR window
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        conn.commit()
++    assert _guard(tid) == "active_pr"
++
++
++def test_fenced_worker_shell_cannot_reopen(kanban_home, clock, monkeypatch, capsys):
++    with kbc.connect_closing() as conn:
++        tid = _ran_and_completed(conn)
++        other = kb.create_task(conn, title="worker card", assignee="default")
++    clock[0] += 30
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(kanban_home))
++    monkeypatch.setenv("HERMES_KANBAN_TASK", other)
++    assert ops._main(["reopen", tid, "--reason", "worker wants a rerun"]) != 0
++    assert "cannot mutate" in capsys.readouterr().err
++    # The durable boundary is the DB write itself, not only the CLI fast-fail.
++    with kbc.connect_closing() as conn, pytest.raises(Exception, match="(?i)delegat|fenc"):
++        kbo.reopen_done_task(conn, tid, reason="direct import", actor="worker")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "done"
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == "reopened"]
+-- 
+2.55.0
+

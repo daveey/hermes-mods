@@ -1,0 +1,597 @@
+From 642f5ca456fadbd1501b512079be99461d717d93 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:42:42 +0000
+Subject: [PATCH] [daveey] fix(cron): release a quota hold once its refusing
+ pool serves again
+
+x-reply-discovery (hub ac8b62d38a0b) was parked until 2026-11-04T15:07Z by the 11-02 22:07Z
+SubscriptionQuotaUnavailable openai-codex/gpt-6-astra refusal, while the same pool served sibling
+cron sessions (bsky-reply-discovery) all of 11-03; ~26 in-window slots were skipped.
+
+Five whys:
+1. Job not firing -> next_run_at parked at quota_hold_until 11-04 15:07Z.
+2. Park computed from the pool refusal's resets_at (min over exhausted OAuth entries at refusal).
+3. Pool reopened long before that (another entry/cooldown cleared): resets_at is an upper bound.
+4. cron/quota_hold.py held one-way: only a run of the SAME job reaching the model cleared it,
+   and the hold prevented that run.
+Root (happened): no early-release check against current local pool state.
+Root (not caught): no test for "pool recovers before resets_at".
+
+Fix:
+- plan_hold stamps the refusing route (quota_hold_route {provider, model}) from the typed
+  refusal (SubscriptionQuotaUnavailable .provider/.model; fallback chain: terminal route),
+  carried run -> bookkeeping via the _quota_hold_route RUN_JOB_FLAG.
+- The due scan, for a cron job with an active hold, a known route and no queued run-now,
+  consults that route's local OAuth pool (load_pool + quota_unavailable + has_available; no
+  network). When serving it clears the hold and moves next_run_at to the schedule's NEXT natural
+  occurrence (never an immediate catch-up fire) and logs "quota hold released early: pool
+  serving". A pool read fault keeps the hold.
+- Holds planned before the stamp existed release only when their persisted last_error is the
+  exact SubscriptionQuotaUnavailable message (which names the route) AND the pool check agrees;
+  text never parks a job. Holds naming no route, interval holds, and holds whose next natural
+  slot is not earlier than the parked instant are unchanged. Caps/allocation untouched.
+
+Tests: tests/cron/test_quota_hold_early_release.py (RED on base: 9/10 fail; the legacy-unchanged
+control passes on both), plus existing test_quota_hold*.py.
+---
+ agent/model_routing_unavailable.py          |  22 ++
+ cron/jobs.py                                |  26 ++-
+ cron/quota_hold.py                          | 110 ++++++++-
+ cron/scheduler.py                           |   6 +-
+ cron/scheduler_bookkeeping.py               |   3 +
+ gateway/session_cron.py                     |   2 +-
+ tests/cron/test_quota_hold_early_release.py | 236 ++++++++++++++++++++
+ 7 files changed, 400 insertions(+), 5 deletions(-)
+ create mode 100644 tests/cron/test_quota_hold_early_release.py
+
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index 4ff2aa9a87b..59db34ddede 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -117,6 +117,28 @@ def quota_wait_seconds(exc, now=None):
+     return None if error is None else _route_wait(error, time.time() if now is None else now)
+ 
+ 
++def quota_refusal_route(exc):
++    """``(provider, model)`` of the route whose quota refusal ended *exc*'s cause chain, else None.
++
++    The pool refusal names its own route; for a fallback chain it is the terminal (last-tried)
++    route. A refusal that does not name both (the Codex ``AuthError`` carries no model) gives None.
++    Typed only, like ``quota_wait_seconds``."""
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
++    error = _terminal_refusal(exc)
++    if isinstance(error, ProviderFallbackError):
++        if not error.failures:
++            return None
++        provider, model, _ = error.failures[-1]
++    elif error is not None and _is_quota_type(error):
++        provider, model = getattr(error, "provider", None), getattr(error, "model", None)
++    else:
++        return None
++    if not (isinstance(provider, str) and provider.strip() and isinstance(model, str) and model.strip()):
++        return None
++    return provider.strip().lower(), model.strip()
++
++
+ def is_quota_failure(exc):
+     """True when *exc*'s cause chain ends in a quota refusal (every fallback route one, too),
+     whether or not it carries a usable deadline."""
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 0fe6b7e0f14..e540a57d9b4 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2555,6 +2555,7 @@ def mark_job_run(
+     ladder_rung: bool = False,
+     quota_hold_seconds: Optional[float] = None,
+     recover_consumed_fire: bool = False,
++    quota_hold_route: Optional[dict[str, str]] = None,
+     agent_skipped: bool = False,
+     fire_error: bool = False,
+     gate_error: bool = False,
+@@ -2579,7 +2580,8 @@ def mark_job_run(
+     ``retry after <N>s``). Recurring jobs are parked through the window instead of re-firing into
+     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
+     consumed fire when the provider reopens; manual runs retain the natural schedule
+-    (cron/quota_hold.py, #89376).
++    (cron/quota_hold.py, #89376). ``quota_hold_route`` ({provider, model} of the refusing route)
++    is stamped on the hold so the due scan can release it once that pool serves again.
+ 
+     ``agent_skipped``: a gate (``wakeAgent=false`` script, unchanged monitor) suppressed the agent,
+     so this successful tick is not evidence of agent health. ``last_status``, ``last_error``,
+@@ -2626,7 +2628,8 @@ def mark_job_run(
+             # Any run that reached the model (either outcome) resets the re-run ladder.
+             clear_state(job)
+         if not success and quota_hold_seconds and not is_terminal_job(job):
+-            quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)
++            quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire,
++                                 route=quota_hold_route)
+         else:
+             quota_hold.clear_state(job)
+         save_jobs(jobs)
+@@ -3148,6 +3151,23 @@ def _rearm_stale_error_recurring(d: _DueJob) -> datetime:
+     return recovered_next_dt
+ 
+ 
++def _release_recovered_quota_hold(d: _DueJob) -> bool:
++    """A cron job parked by a quota hold whose refusing pool is serving again moves to its next
++    natural occurrence (never "now"); True when released, so this tick does not fire it."""
++    if not d.job.get("quota_hold_until"):
++        return False
++    from cron.quota_hold import clear_state, release_if_serving
++
++    natural_next = d.recompute_next()
++    if not release_if_serving(d.job, d.scan.now, natural_next):
++        return False
++    rj = d.scan.find(d.job["id"])
++    if rj is not None:
++        clear_state(rj)
++    d.scan.persist(d.job["id"], next_run_at=natural_next)
++    return True
++
++
+ def _reanchor_stale_cron(d: _DueJob) -> bool:
+     """Stale-schedule guard for a due cron instant; True when re-anchored without firing.
+ 
+@@ -3294,6 +3314,8 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
+     # misfire on it — skip it entirely.
+     if kind == "cron" and not manual_run and zone is None and _repair_timezone_shifted_cron(d):
+         return False
++    if kind == "cron" and not manual_run and _release_recovered_quota_hold(d):
++        return False
+     d.next_run_dt = _rearm_stale_error_recurring(d)
+     if _instant_after(d.next_run_dt, now):
+         return False
+diff --git a/cron/quota_hold.py b/cron/quota_hold.py
+index c5c534feed1..1a0bbb1c614 100644
+--- a/cron/quota_hold.py
++++ b/cron/quota_hold.py
+@@ -13,11 +13,20 @@ stamps ``quota_hold_until`` so the stale-error re-arm
+ 
+ Complement to ``cron/unreachable_retry.py``: this one moves ``next_run_at`` out of a known
+ closed provider window. Any run that reaches the model clears the marker.
++
++The refusal's reset is an upper bound, not a fact: a pool reopens early when another OAuth
++entry clears its cooldown. The hold therefore also stamps the refusing route
++(``quota_hold_route``), and the due scan releases a held cron job to its next natural
++occurrence as soon as that route's local credential pool is serving again
++(``release_if_serving``; no network request, never an immediate catch-up fire). Without it a
++hold prevented the very run that would have cleared it, so x-reply-discovery skipped a whole
++day of slots while the same Codex pool served its sibling jobs.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
++import re
+ from datetime import datetime
+ from typing import Any, Dict, Optional
+ 
+@@ -29,6 +38,18 @@ logger = logging.getLogger("cron.scheduler")
+ # Persisted while a hold is active: ISO instant the job was parked at.
+ STATE_KEY = "quota_hold_until"
+ SCHEDULE_EXPR_KEY = "quota_hold_cron_expr"
++# The route whose pool refused: {"provider": ..., "model": ...}; lets the due scan release early.
++ROUTE_KEY = "quota_hold_route"
++# Run-side flag (rides gateway.session_cron.RUN_JOB_FLAGS) carrying the route to mark_job_run.
++ROUTE_FLAG = "_quota_hold_route"
++
++# Holds planned before ROUTE_KEY existed: the failure the hold was planned from is persisted in
++# the exact ``SubscriptionQuotaUnavailable`` message shape (optionally behind the RuntimeError
++# wrapper's type prefix). Read only to RELEASE a hold, and only after the pool check agrees;
++# text never parks a job.
++_LEGACY_REFUSAL = re.compile(
++    r"^(?:[A-Za-z_][\w.]*: )?Subscription quota unavailable for ([a-z0-9][a-z0-9_.-]*)/(\S+); "
++    r"resets at [0-9.]+$")
+ 
+ # The provider's remaining seconds were measured when the probe ran; by the time the run is
+ # recorded a little wall clock has passed, so land clearly past the boundary.
+@@ -72,6 +93,86 @@ def hold_active(job: dict[str, Any], now: Optional[datetime] = None) -> bool:
+ def clear_state(job: dict[str, Any]) -> None:
+     job.pop(STATE_KEY, None)
+     job.pop(SCHEDULE_EXPR_KEY, None)
++    job.pop(ROUTE_KEY, None)
++
++
++def route_from_failure(exc: BaseException) -> Optional[dict[str, str]]:
++    """The refusing route to stamp on the hold, or None when the refusal does not name one."""
++    from agent.model_routing_unavailable import quota_refusal_route
++
++    route = quota_refusal_route(exc)
++    return None if route is None else {"provider": route[0], "model": route[1]}
++
++
++def _valid_route(route: Any) -> Optional[dict[str, str]]:
++    if not isinstance(route, dict):
++        return None
++    provider, model = route.get("provider"), route.get("model")
++    if isinstance(provider, str) and provider and isinstance(model, str) and model:
++        return {"provider": provider, "model": model}
++    return None
++
++
++def hold_route(job: dict[str, Any]) -> Optional[dict[str, str]]:
++    """The route an active hold waits on: the stamped ``quota_hold_route``, else (a hold planned
++    before the stamp existed) the route named by the persisted pool refusal it was planned from.
++    None keeps the hold one-way until its timestamp, as before."""
++    stamped = _valid_route(job.get(ROUTE_KEY))
++    if stamped is not None:
++        return stamped
++    m = _LEGACY_REFUSAL.match(str(job.get("last_error") or "").strip())
++    return {"provider": m.group(1), "model": m.group(2)} if m else None
++
++
++def pool_serving(route: dict[str, str]) -> bool:
++    """True when the route's local OAuth credential pool can serve its model right now.
++
++    The same local evidence the router refuses on (``quota_unavailable``: a known cooldown on
++    every live OAuth entry), plus positive availability so an empty pool never counts as serving.
++    Reads the credential store only; no provider request. Any read fault keeps the hold."""
++    try:
++        from agent.credential_pool import load_pool
++        from agent.model_routing_unavailable import quota_unavailable
++
++        pool = load_pool(route["provider"], allowed_auth_types={"oauth"})
++        return quota_unavailable(pool, route["model"]) is None and bool(
++            pool.has_available(model=route["model"]))
++    except Exception as exc:  # health: allow BLE001 -- a pool read fault must keep the hold, never break the due scan
++        logger.debug("quota hold: pool check failed for %s/%s (%s)",
++                     route.get("provider"), route.get("model"), exc, exc_info=True)
++        return False
++
++
++def release_if_serving(
++    job: dict[str, Any], now: datetime, natural_next: Optional[str],
++) -> bool:
++    """Release a held cron job whose refusing route is serving again (due scan, jobs lock held).
++
++    *natural_next* is the schedule's next occurrence after *now*. On release the marker is
++    cleared and ``next_run_at`` moves to that occurrence: never "now", so a recovered pool gets
++    no catch-up fire. Only cron holds, earlier than the parked instant, with a known route and
++    no queued run-now (that run-now waits for the boundary, ``extra_fire.reschedule``).
++    Interval holds stay one-way: a cleared marker on an errored interval job lets the stale-error
++    re-arm fire it immediately. Returns True when released (the caller persists the record)."""
++    from cron.jobs import _instant_before, _parse_aware
++
++    if (job.get("schedule") or {}).get("kind") != "cron" or not hold_active(job, now):
++        return False
++    if extra_fire.queued(job) or not natural_next:
++        return False
++    parked, natural = _parse_aware(job.get("next_run_at")), _parse_aware(natural_next)
++    if parked is None or natural is None or not _instant_before(natural, parked):
++        return False
++    route = hold_route(job)
++    if route is None or not pool_serving(route):
++        return False
++    clear_state(job)
++    job["next_run_at"] = natural_next
++    logger.info(
++        "Job '%s': quota hold released early: pool serving (%s/%s); next run %s instead of %s",
++        job.get("name", job.get("id", "?")), route["provider"], route["model"],
++        natural_next, parked.isoformat())
++    return True
+ 
+ 
+ def is_recovery_fire(job: dict[str, Any], next_run: str) -> bool:
+@@ -116,11 +217,13 @@ def _recovery_worthwhile(
+ 
+ def plan_hold(
+     job: dict[str, Any], hold_seconds: float, *, recover_consumed_fire: bool = False,
++    route: Optional[dict[str, str]] = None,
+ ) -> bool:
+     """Called under the jobs lock AFTER ``_advance_after_run`` computed the schedule's natural
+     ``next_run_at`` for a failed run. A scheduled sparse cron may retry its consumed fire at the
+     recovery boundary; manual runs keep the natural schedule. Otherwise coalesce fires through
+-    the closed window. Returns True when parked."""
++    the closed window. *route* (``route_from_failure``) is stamped so the due scan can release
++    the hold early when that pool serves again. Returns True when parked."""
+     from cron.jobs import _instant_before, _parse_aware, compute_next_run
+ 
+     schedule = job.get("schedule") or {}
+@@ -151,6 +254,11 @@ def plan_hold(
+         job.pop(SCHEDULE_EXPR_KEY, None)
+     extra_fire.reschedule(job, parked)
+     job[STATE_KEY] = parked
++    stamped = _valid_route(route)
++    if stamped is not None:
++        job[ROUTE_KEY] = stamped
++    else:
++        job.pop(ROUTE_KEY, None)
+     logger.warning(
+         "Job '%s': provider usage window closed for %.0fs — holding fires until %s instead of "
+         "failing on every cadence tick",
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index aeb37f3f71f..051a052e69a 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2855,10 +2855,14 @@ def run_job(
+                 job["_model_unreachable"] = True
+             # Provider usage window closed for a known duration (cron/quota_hold.py): flag it so the
+             # bookkeeping tail parks the job past the window instead of re-firing into it (#89376).
+-            from cron.quota_hold import classify_failure_hold
++            from cron.quota_hold import ROUTE_FLAG, classify_failure_hold, route_from_failure
+             _hold_s = classify_failure_hold(job, e)
+             if _hold_s:
+                 job["_quota_hold_seconds"] = _hold_s
++                # The refusing route lets the due scan release the hold once that pool serves.
++                _hold_route = route_from_failure(e)
++                if _hold_route:
++                    job[ROUTE_FLAG] = _hold_route
+         except Exception:  # classification must never mask the real failure
+             logger.debug("Job '%s': unreachable-failure classification failed", job_id)
+         # No audit row when we failed before the agent existed; the audit write must never raise.
+diff --git a/cron/scheduler_bookkeeping.py b/cron/scheduler_bookkeeping.py
+index 09121bf6e3c..3369ad2f3da 100644
+--- a/cron/scheduler_bookkeeping.py
++++ b/cron/scheduler_bookkeeping.py
+@@ -74,9 +74,12 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
+         # A re-run of an occurrence that already counted: must not spend another repeat slot.
+         mark_kwargs["ladder_rung"] = True
+     _hold_s = job.pop("_quota_hold_seconds", None)
++    _hold_route = job.pop("_quota_hold_route", None)
+     if not d.success and _hold_s:
+         # Provider window closed for a known duration: park past it (cron/quota_hold.py, #89376).
+         mark_kwargs["quota_hold_seconds"] = _hold_s
++        if _hold_route:
++            mark_kwargs["quota_hold_route"] = _hold_route
+         mark_kwargs["recover_consumed_fire"] = bool(job.get("_scheduled_instant"))
+     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
+         mark_kwargs["status"] = "delivery_queued"
+diff --git a/gateway/session_cron.py b/gateway/session_cron.py
+index 43e7ecc9a56..00a954ee324 100644
+--- a/gateway/session_cron.py
++++ b/gateway/session_cron.py
+@@ -159,7 +159,7 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
+ # keeps the job's last real verdict (failure streak, alert-once marker) instead of resetting it.
+ # [daveey] ``_gate_error``: a pre-agent gate (monitor source, unparseable config) failed; booked as
+ # ``last_error_kind = "gate"`` so the next good gate tick may clear the streak.
+-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_agent_skipped', '_gate_error')
++RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_quota_hold_route', '_agent_skipped', '_gate_error')
+ 
+ 
+ async def operation(authority, name, params, actor=None):
+diff --git a/tests/cron/test_quota_hold_early_release.py b/tests/cron/test_quota_hold_early_release.py
+new file mode 100644
+index 00000000000..6acec2f17c5
+--- /dev/null
++++ b/tests/cron/test_quota_hold_early_release.py
+@@ -0,0 +1,236 @@
++"""A quota hold releases early once its refusing pool serves again (cron/quota_hold.py).
++
++Defect: x-reply-discovery was parked until 2026-11-04T15:07Z by a 11-02 22:07Z
++``SubscriptionQuotaUnavailable openai-codex/gpt-6-astra`` refusal. The same pool served sibling
++cron sessions all of 11-03, yet the hold was one-way: only a run of the SAME job reaching the model
++cleared it, and the hold prevented that run, so ~26 in-window slots were skipped.
++
++Contract: the hold stamps the refusing route; the due scan consults that route's local OAuth pool
++(no network) and, when it is serving, clears the hold and moves ``next_run_at`` to the schedule's
++NEXT natural occurrence (never an immediate catch-up fire). A pool still exhausted keeps the hold;
++a hold that names no route (stamp absent and no persisted pool refusal) keeps today's behaviour.
++"""
++
++import logging
++from datetime import UTC, datetime, timedelta
++
++import pytest
++
++from agent import credential_pool
++import agent.model_routing_unavailable as mru
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++from cron import quota_hold as qh
++from cron.jobs import create_job, get_due_jobs, get_job, mark_job_run, update_job
++
++from tests.cron.test_quota_hold import _tick
++
++ROUTE = {"provider": "openai-codex", "model": "gpt-6-astra"}
++# 01:25Z on the incident night; the schedule is x-reply-discovery's own.
++NOW = datetime(2026, 11, 4, 1, 25, tzinfo=UTC)
++EXPR = "7,37 15-23,0-4 * * *"
++NATURAL_NEXT = datetime(2026, 11, 4, 1, 37, tzinfo=UTC)
++PARKED = datetime(2026, 11, 4, 15, 7, tzinfo=UTC)
++LEGACY_ERROR = ("RuntimeError: Subscription quota unavailable for openai-codex/gpt-6-astra; "
++                "resets at 1793774269.0")
++
++
++def _get(job_id):
++    j = get_job(job_id)
++    assert j is not None
++    return j
++
++
++@pytest.fixture
++def tmp_cron_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr("cron.jobs._hermes_now", lambda: NOW)
++    monkeypatch.setattr(qh, "_hermes_now", lambda: NOW)
++    return home
++
++
++class _Pool:
++    """The two reads ``pool_serving`` makes of a CredentialPool."""
++
++    def __init__(self, provider, *, exhausted_until=None, available=True):
++        self.provider = provider
++        self.exhausted_until = exhausted_until
++        self.available = available
++
++    def has_available(self, *, model=None):
++        return self.available
++
++
++@pytest.fixture
++def pool(monkeypatch):
++    """The local pool state the hold consults, plus a record of every (provider, model) read."""
++    state = {"exhausted_until": None, "available": True, "reads": []}
++
++    def load_pool(provider, *, allowed_auth_types=None):
++        assert allowed_auth_types == {"oauth"}
++        return _Pool(provider, exhausted_until=state["exhausted_until"], available=state["available"])
++
++    def quota_unavailable(p, model):
++        state["reads"].append((p.provider, model))
++        if p.exhausted_until is None:
++            return None
++        return SubscriptionQuotaUnavailable(p.provider, model, p.exhausted_until)
++
++    monkeypatch.setattr(credential_pool, "load_pool", load_pool)
++    monkeypatch.setattr(mru, "quota_unavailable", quota_unavailable)
++    return state
++
++
++def _held_job(*, route=ROUTE, last_error=LEGACY_ERROR, expr=EXPR):
++    """A cron job parked by a pool refusal exactly as mark_job_run leaves it."""
++    job = create_job("x-reply-discovery", expr)
++    fields = {
++        "next_run_at": PARKED.isoformat(),
++        qh.STATE_KEY: PARKED.isoformat(),
++        qh.SCHEDULE_EXPR_KEY: None,
++        "last_status": "error",
++        "last_error": last_error,
++        "last_run_at": (NOW - timedelta(hours=27)).isoformat(),
++    }
++    if route is not None:
++        fields[qh.ROUTE_KEY] = dict(route)
++    update_job(job["id"], fields)
++    held = _get(job["id"])
++    assert held[qh.STATE_KEY] == PARKED.isoformat()
++    return held["id"]
++
++
++def test_pool_serving_releases_hold_to_next_natural_slot_without_firing(
++        tmp_cron_home, pool, caplog, monkeypatch):
++    """(a) Route stamped + pool serving: released to the next 7,37 slot, not fired this tick."""
++    job_id = _held_job()
++    with caplog.at_level(logging.INFO, logger="cron.scheduler"):
++        due = get_due_jobs()
++    assert job_id not in {d["id"] for d in due}, "a released hold must never catch-up fire"
++    j = _get(job_id)
++    assert datetime.fromisoformat(j["next_run_at"]) == NATURAL_NEXT
++    for key in (qh.STATE_KEY, qh.SCHEDULE_EXPR_KEY, qh.ROUTE_KEY):
++        assert key not in j
++    assert pool["reads"] == [("openai-codex", "gpt-6-astra")]
++    assert any("quota hold released early: pool serving" in r.getMessage() for r in caplog.records)
++
++    # The released job then fires at that natural slot, like any healthy cron job.
++    later = NATURAL_NEXT + timedelta(seconds=5)
++    monkeypatch.setattr("cron.jobs._hermes_now", lambda: later)
++    monkeypatch.setattr(qh, "_hermes_now", lambda: later)
++    assert job_id in {d["id"] for d in get_due_jobs()}
++
++
++def test_pool_still_exhausted_keeps_hold(tmp_cron_home, pool):
++    """(b) Route stamped + pool still exhausted (or nothing available): stays parked."""
++    job_id = _held_job()
++    pool["exhausted_until"] = PARKED.timestamp()
++    assert job_id not in {d["id"] for d in get_due_jobs()}
++    j = _get(job_id)
++    assert j["next_run_at"] == PARKED.isoformat()
++    assert j[qh.STATE_KEY] == PARKED.isoformat()
++    assert j[qh.ROUTE_KEY] == ROUTE
++
++    # No cooldown recorded but no usable entry either: an empty pool is not "serving".
++    pool["exhausted_until"] = None
++    pool["available"] = False
++    assert job_id not in {d["id"] for d in get_due_jobs()}
++    assert _get(job_id)[qh.STATE_KEY] == PARKED.isoformat()
++
++
++def test_pool_read_fault_keeps_hold(tmp_cron_home, monkeypatch):
++    job_id = _held_job()
++
++    def broken(provider, *, allowed_auth_types=None):
++        raise OSError("auth.json unreadable")
++
++    monkeypatch.setattr(credential_pool, "load_pool", broken)
++    assert job_id not in {d["id"] for d in get_due_jobs()}
++    assert _get(job_id)[qh.STATE_KEY] == PARKED.isoformat()
++
++
++def test_legacy_hold_without_route_is_unchanged(tmp_cron_home, pool):
++    """(c) No stamped route and no persisted pool refusal to name one: one-way as before, and the
++    pool is never consulted."""
++    job_id = _held_job(route=None, last_error="RuntimeError: Codex provider quota exhausted (429); "
++                                              "retry after 123518s.")
++    assert job_id not in {d["id"] for d in get_due_jobs()}
++    j = _get(job_id)
++    assert j["next_run_at"] == PARKED.isoformat()
++    assert j[qh.STATE_KEY] == PARKED.isoformat()
++    assert pool["reads"] == []
++
++
++def test_pre_stamp_hold_from_pool_refusal_releases(tmp_cron_home, pool):
++    """The live x-reply-discovery record: parked before the stamp existed, but its persisted
++    last_error is the exact SubscriptionQuotaUnavailable refusal, which names the route. Read only
++    to release after the pool check agrees; the fix (not a jobs.json edit) unsticks it."""
++    job_id = _held_job(route=None)
++    assert job_id not in {d["id"] for d in get_due_jobs()}
++    j = _get(job_id)
++    assert datetime.fromisoformat(j["next_run_at"]) == NATURAL_NEXT
++    assert qh.STATE_KEY not in j
++    assert pool["reads"] == [("openai-codex", "gpt-6-astra")]
++
++
++def test_no_earlier_natural_slot_keeps_hold(tmp_cron_home, pool):
++    """When the next natural occurrence is the parked instant itself (or later), nothing moves."""
++    job_id = _held_job(expr="7 15 * * *")
++    assert job_id not in {d["id"] for d in get_due_jobs()}
++    assert _get(job_id)[qh.STATE_KEY] == PARKED.isoformat()
++    assert pool["reads"] == []
++
++
++def test_interval_hold_stays_one_way(tmp_cron_home, pool):
++    """Interval holds are out of scope: a cleared marker on an errored interval job would let the
++    stale-error re-arm fire it immediately."""
++    job = create_job("interval job", "every 30m")
++    update_job(job["id"], {"next_run_at": PARKED.isoformat(), qh.STATE_KEY: PARKED.isoformat(),
++                           qh.ROUTE_KEY: dict(ROUTE), "last_status": "error",
++                           "last_error": LEGACY_ERROR})
++    assert job["id"] not in {d["id"] for d in get_due_jobs()}
++    assert _get(job["id"])[qh.STATE_KEY] == PARKED.isoformat()
++    assert pool["reads"] == []
++
++
++def test_mark_job_run_stamps_route_and_model_reach_clears_it(tmp_cron_home):
++    job = create_job("x-reply-discovery", EXPR)
++    assert mark_job_run(job["id"], False, LEGACY_ERROR, quota_hold_seconds=13 * 3600,
++                        quota_hold_route=dict(ROUTE))
++    j = _get(job["id"])
++    assert j[qh.STATE_KEY] and j[qh.ROUTE_KEY] == ROUTE
++    assert mark_job_run(job["id"], False, "RuntimeError: model said no")
++    j = _get(job["id"])
++    assert qh.STATE_KEY not in j and qh.ROUTE_KEY not in j
++
++
++def test_route_from_pool_refusal_and_fallback_chain():
++    def wrapped(exc):
++        try:
++            raise RuntimeError(str(exc)) from exc
++        except RuntimeError as w:
++            return w
++
++    refusal = SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", NOW.timestamp() + 3600)
++    assert qh.route_from_failure(wrapped(refusal)) == ROUTE
++    assert qh.route_from_failure(RuntimeError(LEGACY_ERROR)) is None  # text alone never stamps
++
++
++def test_scheduler_tick_on_pool_refusal_stamps_route(tmp_cron_home, cron_owner, monkeypatch):
++    """The real run path: a resolve that raises the pool refusal parks the job AND stamps the
++    refusing route, so the next due scan can release it."""
++    real_now = datetime.now(UTC)
++    monkeypatch.setattr("cron.jobs._hermes_now", lambda: real_now)
++    monkeypatch.setattr(qh, "_hermes_now", lambda: real_now)
++    job = create_job("x-reply-discovery", "every 30m")
++    refusal = SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", real_now.timestamp() + 13 * 3600)
++
++    def resolve(**_kw):
++        raise refusal
++
++    _tick(_get(job["id"]), tmp_cron_home, [], resolve)
++    j = _get(job["id"])
++    assert j[qh.STATE_KEY], j.get("last_error")
++    assert j[qh.ROUTE_KEY] == ROUTE
++    assert "_quota_hold_route" not in j
+-- 
+2.55.0
+

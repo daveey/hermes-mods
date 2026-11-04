@@ -1,0 +1,104 @@
+From 8642b2e4b97aed5ded2294eaeaef9a99cff0c09c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:06:25 +0000
+Subject: [PATCH] fix(kanban): hub gate refuses a full cap or passed deadline
+ before its 1 s sample, recounting after it (review F6) [daveey]
+
+---
+ hermes_cli/kanban_admission.py                | 29 +++++++++++++++----
+ tests/hermes_cli/test_kanban_hub_admission.py | 26 +++++++++++++++++
+ 2 files changed, 49 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 6c6da550394..6806eebeef6 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -74,16 +74,35 @@ def _root_max_in_progress():
+     return True, resolve_max_in_progress(raw)
+ 
+ 
++def _expired(gate):
++    return gate is not None and getattr(gate, "expires", None) is not None and gate.expires <= int(_now())
++
++
++def _cap_full():
++    from hermes_cli import machine_metrics
++
++    ok, cap = _root_max_in_progress()
++    active = machine_metrics.active_card_runs()
++    return not ok or type(active) is not int or active < 0 or (cap is not None and active >= cap)
++
++
+ def _final_hub_gate(gate):
+-    """Under admission.lock: ``(reason, evidence)``; reason None admits. Never touches the network."""
++    """Under admission.lock: ``(reason, evidence)``; reason None admits. Never touches the network.
++
++    Cheap checks (whole-host cap, lease deadline) run BEFORE the ~1 s sample so a claim that must be refused anyway
++    never holds the lock for a sample (review F6); the deadline and the whole-host count are checked again after
++    sampling, immediately before the commit."""
+     from hermes_cli import machine_cpu_metrics as cpu
+-    from hermes_cli import machine_metrics
+ 
+     state, limit = cpu.root_limit()
+     if state == cpu.OFF:
+         return None, None
+     if state != cpu.ON:
+         return "hub_cpu_unknown", None
++    if _cap_full():
++        return "hub_capacity_full", None
++    if _expired(gate):
++        return "hub_cpu_unknown", None
+     measured = cpu.sample()
+     if not measured or not all(k in measured for k in cpu.FIELDS):
+         return "hub_cpu_unknown", None
+@@ -91,11 +110,9 @@ def _final_hub_gate(gate):
+         return "hub_cpu_unknown", None
+     if not cpu.below(measured["cpu_busy_pct"], limit):
+         return "hub_cpu_at_or_above_limit", None
+-    if gate is not None and getattr(gate, "expires", None) is not None and gate.expires <= int(_now()):
++    if _expired(gate):
+         return "hub_cpu_unknown", None  # the claim/lease deadline passed while sampling: never start
+-    ok, cap = _root_max_in_progress()
+-    active = machine_metrics.active_card_runs()
+-    if not ok or type(active) is not int or active < 0 or (cap is not None and active >= cap):
++    if _cap_full():  # the spec's recount immediately before commit
+         return "hub_capacity_full", None
+     return None, {**{k: measured[k] for k in cpu.FIELDS}, "limit_pct": limit}
+ 
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index f294f04ce92..198ab173aff 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -321,3 +321,29 @@ def test_real_sample_is_entirely_under_lock_bounded_and_measures_chat_turn_cost(
+ def test_queue_reason_codes_cover_the_eight_overflow_reasons():
+     assert {"workers_unknown", "no_eligible_worker", "workers_saturated", "hub_cpu_at_or_above_limit",
+             "hub_cpu_unknown", "hub_capacity_full", "hub_sample_already_used", "hub_overflow_reserved"} <= queue.CODES
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_full_cap_refuses_before_the_sample_so_the_lock_is_not_held_for_it(board, monkeypatch, review):
++    """Review F6: the cheap whole-host cap check runs first; a claim at the cap never holds admission.lock ~1 s."""
++    conn, home = board
++    configure(home, cap=2)
++    advisory(home)
++    monkeypatch.setattr(mm, "active_card_runs", lambda: 2)
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("at the cap: refuse before sampling"))
++    t = task(conn, review)
++    assert claim(conn, t, review) is None
++    refused(conn, t, review, "hub_capacity_full")
++
++
++def test_deadline_already_passed_refuses_before_the_sample(board, monkeypatch):
++    conn, home = board
++    configure(home)
++    advisory(home, age_ms=-10 ** 10)  # fresh against the shifted clock below, so the advisory admits
++    real_time = time.time
++    monkeypatch.setattr(sync, "claim_gate", lambda conn, task_id, expires, lane="ready": sync.ClaimGate(expires))
++    monkeypatch.setattr(ka, "_now", lambda: real_time() + 10 ** 7)
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("deadline passed: refuse before sampling"))
++    t = task(conn)
++    assert kb.claim_task(conn, t) is None
++    refused(conn, t, False, "hub_cpu_unknown")
+-- 
+2.55.0
+

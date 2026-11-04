@@ -1,0 +1,118 @@
+From eeeef6aae0b218b6fcbb6e40ee9dddd7b4f179b3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:10:43 +0000
+Subject: [PATCH] docs/config(kanban): root cpu_busy_below_pct is a known
+ off-by-default key; rollback keeps the root CPU guard and cap;
+ advisory/sync-loop dependency and reporter budget pinned by tests (review F4,
+ F7, F8) [daveey]
+
+---
+ docs/worker-first-v1.md                      |  8 +++-
+ hermes_cli/config_defaults.py                | 14 +++----
+ tests/hermes_cli/test_hub_cpu_gate_budget.py | 43 ++++++++++++++++++++
+ 3 files changed, 57 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_hub_cpu_gate_budget.py
+
+diff --git a/docs/worker-first-v1.md b/docs/worker-first-v1.md
+index 0ee496dab47..a4a9e441507 100644
+--- a/docs/worker-first-v1.md
++++ b/docs/worker-first-v1.md
+@@ -8,7 +8,10 @@ Workers always win. The Board reserves the origin hub for a portable card only w
+ 
+ * Board: operator-owned `worker_overflow` setting, e.g. `{"hub": {"machine": "hub", "cpu_busy_below_pct": 50}}`; `{}`/absent disables it. The lease grant re-runs the decision with the current registry and records the consumed sample; a worker freeing up, a CPU rise, a used sample or a disabled setting refuses the grant.
+ * Core: `kanban.admission.cpu_busy_below_pct` in the **installation-root** config enables (a) a 10 s metrics report carrying `cpu_busy_pct`/`cpu_busy_window_ms`/`cpu_busy_sample_end_ms` (2 s hard total, never replayed), (b) a lock-free advisory pre-check before any Board lease, and (c) the final gate: with `admission.lock` held and before the claim commits, an independent full ~1 s `/proc/stat` sample must be strictly below the limit and the host running count below the root `kanban.max_in_progress`. Any unknown (unreadable config, bad value, failed sample, window outside 1-2 s, passed deadline) refuses. The gate applies to every new ready/review claim on that host (legacy, host-bound and policy cards); the worker load formula is not used for the origin's own cards.
+-* Rollout order: deploy Boards and clients first; set root `cpu_busy_below_pct`; verify reports; only then enable Board `worker_overflow`. Rollback: set Board `worker_overflow` to `{}` (outstanding hub reservations become unclaimable), then remove the root key.
++* Rollout order: deploy Boards and clients first; set root `cpu_busy_below_pct`; verify reports; only then enable Board `worker_overflow`. Rollback: set Board `worker_overflow` to `{}` and read it back (outstanding hub reservations become unclaimable). Rollback keeps the root CPU guard and `kanban.max_in_progress` (7): removing the root key or raising the cap is a separate, explicit operator decision, never part of rollback.
++* The advisory is fed only by the sync loop's metrics reporter (`cache/hub-cpu-sample.json`, written before the Board POST, so a Board outage does not starve it). When the sync loop is not running (sync role given up, no identity) or a round stretches past the 15 s freshness, every hub claim on that host defers as `hub_cpu_unknown`: fail-closed by design. The slowest healthy round (10 s cadence + <= 2 s sample + 2 s POST budget) stays inside 15 s.
++* Turns are not refused by a claim's sample: chat, notification and review turns wait out a busy `admission.lock` for longer than its longest designed hold (`admission_fence.CLAIM_MAX_HOLD_S`), a waiting turn makes the next claims defer to their next tick, and `prompt.admit` waits outside the session resume lock and then retries its admission once (nothing durable precedes admission, so no duplicate turn).
++* A Board grant the core gate refuses (or any claim that never started locally) is released with `unused_grant: true`; the Board then keeps the card first-start, so overflow is evaluated again.
+ 
+ ## Creation and schema
+ 
+@@ -64,5 +67,8 @@ No configuration is activated by these code changes. Deployment, actual hostname
+ | Hub overflow selection, one-reservation/one-sample fences, grant re-check, rollback | server `worker/test/worker-overflow.test.ts` |
+ | CPU sampler, root-only limit, reporter cadence/budget | `test_machine_cpu_metrics.py`, `test_machine_metrics.py`, `test_kanban_sync_metrics_budget.py` |
+ | Final hub gate under admission.lock (ready/review, advisory, cap, deadline) | `test_kanban_hub_admission.py`, `test_kanban_worker_policy_db.py` |
++| Gate scopes (named boards, profiles, primary/local, legacy/host-bound/policy), `unused_grant` release | `test_kanban_hub_admission_scopes.py`, `test_kanban_sync_client.py` |
++| Turns and `prompt.admit` outlast a claim's sample (no 5035), waiting turns make claims defer | `test_kanban_hub_admission_turns.py`, `tests/tui_gateway/test_prompt_admission_busy_lock.py`, `test_admission_fence.py` |
++| Reporter/advisory budget, root key known and off by default | `test_hub_cpu_gate_budget.py` |
+ 
+ Server implementation/evidence and its deployment API are documented in `daveey/hermes-hub:docs/worker-first-v1.md`. Server integration tests execute real HTTP requests against Cloudflare's SQLite Durable Object test runtime; Python fake-service tests separately prove client sequencing and do not substitute for server atomicity tests.
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index e32bf209c73..8930ac0e2a4 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1933,14 +1933,14 @@ DEFAULT_CONFIG = {
+         # Assignee when the orchestrator can't match one to an installed profile; "" = default
+         # profile. A task never ends up with assignee=None.
+         "default_assignee": "",
+-        # Global concurrency cap (#33488): when set to a positive int, the HOST never has more than N tasks
+-        # in 'running' at once — counted across every active board and across both the ready and review
+-        # dispatch lanes (workers are OS processes sharing one machine's memory, so the cap bounds the
+-        # machine, not each board; OOF-30). Unset (None) means "derive from system memory" (OOF-30/OOF-77):
+-        # the dispatcher caps concurrency at roughly MemTotal / 512 MiB, clamped to [2, 8] — e.g. 2 workers
+-        # on a 1 GiB VM. On hosts where total memory can't be read (macOS/Windows), unset falls back to no
+-        # cap. Set an explicit value to override the derived default in either direction.
++        # Global concurrency cap (#33488): a positive int caps the HOST's 'running' tasks across every active board
++        # and both ready/review lanes (workers share one machine's memory; OOF-30). Unset (None) derives it from
++        # memory (OOF-30/OOF-77): about MemTotal / 512 MiB clamped to [2, 8]; no cap where memory can't be read
++        # (macOS/Windows). An explicit value overrides the derived default in either direction.
+         "max_in_progress": None,
++        # [daveey] Hub CPU gate (docs/worker-first-v1.md; installation-root config only): 0 < value <= 100 = every new
++        # claim here needs measured CPU busy strictly below it (~1 s sample under admission.lock). None/absent = off.
++        "admission": {"cpu_busy_below_pct": None},
+         # Per-profile cap: positive int = no single profile runs more than N workers even if the
+         # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
+         # when fan-out would saturate one profile's model/API quota/browser pool. See #21582.
+diff --git a/tests/hermes_cli/test_hub_cpu_gate_budget.py b/tests/hermes_cli/test_hub_cpu_gate_budget.py
+new file mode 100644
+index 00000000000..4b5efb740f6
+--- /dev/null
++++ b/tests/hermes_cli/test_hub_cpu_gate_budget.py
+@@ -0,0 +1,43 @@
++"""Hub CPU gate operating budget and configuration surface (review F4, F8).
++
++The lock-free advisory refuses every hub claim when the reporter's latest sample is older than 15 s (fail-closed,
++intended): so a healthy sync loop must refresh it well inside that age even in its slowest round, a Board outage
++must not starve it, and the root key must be a known, documented, off-by-default configuration key.
++"""
++import time
++
++from hermes_cli import kanban_admission as ka
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import machine_cpu_metrics as cm
++from hermes_cli import machine_metrics as mm
++
++
++def test_slowest_reporter_round_refreshes_the_advisory_inside_its_freshness_window():
++    # Cadence + the longest valid sample + the hard POST budget: the next record lands before the 15 s limit.
++    slowest_s = mm.REPORT_EVERY_S + cm.MAX_WINDOW_MS / 1000 + ksc.CPU_REPORT_BUDGET_S
++    assert slowest_s < ka.ADVISORY_MAX_AGE_MS / 1000, slowest_s
++
++
++def test_advisory_is_recorded_before_the_send_so_a_board_outage_does_not_starve_local_claims(tmp_path, monkeypatch):
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: tmp_path)
++    end = int(time.time() * 1000)
++
++    def send(_sample):
++        raise TimeoutError("Board unreachable")
++    reporter = mm.Reporter(send, collect_fn=lambda: {"cpus": 4}, cpu_limit_fn=lambda: (cm.ON, 50.0),
++                           cpu_sample_fn=lambda: {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000,
++                                                  "cpu_busy_sample_end_ms": end})
++    assert reporter.report_due() is False  # the send failed and nothing raised into the sync loop
++    assert mm.read_hub_cpu_sample(tmp_path) == {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000,
++                                               "cpu_busy_sample_end_ms": end}
++
++
++def test_root_cpu_gate_key_is_known_documented_and_off_by_default():
++    from hermes_cli.config import _validate_config_key
++    from hermes_cli.config_defaults import DEFAULT_CONFIG
++
++    assert _validate_config_key("kanban.admission.cpu_busy_below_pct") == (True, None)
++    assert DEFAULT_CONFIG["kanban"]["admission"] == {"cpu_busy_below_pct": None}
++    # The seeded null reads as "off": the gate never turns on from defaults.
++    assert cm.root_limit(read_doc=lambda _p: {"kanban": DEFAULT_CONFIG["kanban"]}) == (cm.OFF, None)
+-- 
+2.55.0
+

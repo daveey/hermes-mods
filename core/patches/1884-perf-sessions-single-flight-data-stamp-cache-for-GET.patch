@@ -1,0 +1,458 @@
+From 92e3135eddb4ea723dcf64f45e82175040545054 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 13:12:09 +0000
+Subject: [PATCH] perf(sessions): single-flight + data-stamp cache for GET
+ /api/sessions [daveey]
+
+hermes-hub: Desktop reconnect bursts of ~15 identical /api/sessions calls each
+ran the recent-order list SQL (~0.1-0.3 s on a 7 GB state.db) plus the activity
+annotations in its own threadpool slot; the burst queued behind itself (2-7 s
+per call, ~3,000 slow calls in 30 h, 131 requests parked in run_in_threadpool).
+
+Identical calls (same params + state.db path) now share one computation while
+one is in flight, and a finished result is reused for 2 s. The cache key's data
+stamp is SQLite's WAL-index header (iChange/mxFrame/salts, both copies must
+agree) plus stat of the db and WAL, so any committed write to state.db misses at
+once; the TTL only bounds staleness of annotations read from other stores. No
+WAL/shm means no caching or coalescing (old behaviour). Each caller gets its own
+copy of the payload rows.
+
+Measured on the hub's live 7.2 GB state.db, 15 concurrent identical calls:
+uncached p95 2.14 s (15 SQL runs) -> 0.15 s (1 SQL run).
+---
+ hermes_cli/session_list_flight.py            | 138 +++++++++++
+ hermes_cli/web_routers/sessions.py           |  18 +-
+ tests/hermes_cli/test_session_list_flight.py | 233 +++++++++++++++++++
+ 3 files changed, 388 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/session_list_flight.py
+ create mode 100644 tests/hermes_cli/test_session_list_flight.py
+
+diff --git a/hermes_cli/session_list_flight.py b/hermes_cli/session_list_flight.py
+new file mode 100644
+index 00000000000..450e005b8ba
+--- /dev/null
++++ b/hermes_cli/session_list_flight.py
+@@ -0,0 +1,138 @@
++"""Single-flight + short-TTL cache for ``GET /api/sessions`` (hermes-hub, card t_01a19f5af20a19f6). [daveey]
++
++Desktop reconnects fan out ~15 identical list calls within 100 ms. Each one ran the recent-order ranking
++query (~0.1-0.3 s on a 7 GB state.db) plus the activity annotations in its own threadpool slot, so the
++burst queued behind itself: 2-7 s per call, 131 requests parked in ``run_in_threadpool``.
++
++Identical calls now share one computation:
++
++* **single-flight** -- a call whose key (params + state.db path) matches one already running, against the
++  same data stamp, waits for that result instead of running the SQL again;
++* **short TTL** -- a finished result is reused for ``TTL_S`` while the data stamp is unchanged.
++
++The data stamp is SQLite's own WAL change counter: the ``iChange``/``mxFrame``/salt header at the start of
++``<db>-shm``, which every write transaction bumps (both header copies must agree, or the read was torn and
++nothing is cached), plus ``stat`` of the db and WAL files. So any write to state.db -- a new message, a
++rename, an archive -- misses the cache at once. Annotations read from other stores (kanban.db activity, live turns, cron) can be as old as the
++start of the computation they came from: up to ``TTL_S`` for a cache hit, plus that computation's run time
++for a caller that joined it in flight. No readable stamp (no WAL, unreadable shm) means no
++caching and no coalescing: every call computes, as before.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++import time
++from collections import OrderedDict
++from pathlib import Path
++from typing import Any, Callable, Hashable, Optional
++
++TTL_S = 2.0
++MAX_ENTRIES = 64
++# A follower never waits longer than this on a leader; then it computes itself.
++FOLLOW_TIMEOUT_S = 30.0
++_SHM_HEADER = 48  # one WalIndexHdr copy; the second copy follows at offset 48
++
++
++def data_stamp(db_path: os.PathLike | str) -> Optional[tuple]:
++    """Fingerprint that changes with every committed write to *db_path* (WAL mode), else ``None``."""
++    db = Path(db_path)
++    try:
++        with open(f"{db}-shm", "rb") as f:
++            head = f.read(2 * _SHM_HEADER)
++        st_db = os.stat(db)
++        st_wal = os.stat(f"{db}-wal")
++    except OSError:
++        return None
++    if len(head) < 2 * _SHM_HEADER or head[:_SHM_HEADER] != head[_SHM_HEADER:]:
++        return None  # torn read: a writer was mid-update (it writes copy 2, then copy 1)
++    return (head[:_SHM_HEADER], st_db.st_mtime_ns, st_db.st_size, st_wal.st_mtime_ns, st_wal.st_size)
++
++
++class _Flight:
++    __slots__ = ("done", "error", "followers", "value")
++
++    def __init__(self) -> None:
++        self.followers = 0
++        self.done = threading.Event()
++        self.value: Any = None
++        self.error: Optional[BaseException] = None
++
++
++class SingleFlightCache:
++    """``get(key, stamp, compute)``: one ``compute()`` per (key, stamp) at a time, reused for ``ttl_s``."""
++
++    def __init__(self, *, ttl_s: float = TTL_S, max_entries: int = MAX_ENTRIES,
++                 clock: Callable[[], float] = time.monotonic, copy: Callable[[Any], Any] = lambda v: v) -> None:
++        self.ttl_s, self.max_entries, self.clock, self.copy = ttl_s, max_entries, clock, copy
++        self._lock = threading.Lock()
++        self._done: OrderedDict[Hashable, tuple] = OrderedDict()  # key -> (stamp, t, value)
++        self._flights: dict = {}  # (key, stamp) -> _Flight
++        self.computes = 0  # for tests and diagnostics
++
++    def _count(self) -> None:
++        with self._lock:
++            self.computes += 1
++
++    def get(self, key: Hashable, stamp: Optional[tuple], compute: Callable[[], Any]) -> Any:
++        if stamp is None or self.ttl_s <= 0:
++            self._count()
++            return compute()
++        fkey = (key, stamp)
++        with self._lock:
++            hit = self._done.get(key)
++            if hit is not None and hit[0] == stamp and self.clock() - hit[1] < self.ttl_s:
++                return self.copy(hit[2])
++            flight = self._flights.get(fkey)
++            leader = flight is None
++            if leader:
++                flight = self._flights[fkey] = _Flight()
++            else:
++                flight.followers += 1
++        if not leader:
++            if flight.done.wait(FOLLOW_TIMEOUT_S):
++                if flight.error is not None:
++                    raise flight.error
++                return self.copy(flight.value)
++            self._count()  # the leader hung past FOLLOW_TIMEOUT_S: answer on our own
++            return compute()
++        t0 = self.clock()
++        self._count()
++        try:
++            flight.value = compute()
++        except BaseException as exc:
++            flight.error = exc
++            raise
++        finally:
++            with self._lock:
++                self._flights.pop(fkey, None)
++                if flight.error is None:
++                    # Expired entries go now, not only when the size cap evicts them.
++                    for old in [k for k, (_s, t, _v) in self._done.items() if self.clock() - t >= self.ttl_s]:
++                        del self._done[old]
++                    self._done[key] = (stamp, t0, flight.value)
++                    self._done.move_to_end(key)
++                    while len(self._done) > self.max_entries:
++                        self._done.popitem(last=False)
++            flight.done.set()
++        return self.copy(flight.value)
++
++    def clear(self) -> None:
++        with self._lock:
++            self._done.clear()
++
++
++def copy_session_list(value: Any) -> Any:
++    """Per-caller copy of a ``/api/sessions`` payload: own top-level dict, list and row dicts, so one
++    response's row edits can never leak into another's."""
++    if not isinstance(value, dict):
++        return value
++    out = dict(value)
++    rows = out.get("sessions")
++    if isinstance(rows, list):
++        out["sessions"] = [dict(r) if isinstance(r, dict) else r for r in rows]
++    return out
++
++
++SESSION_LIST_CACHE = SingleFlightCache(copy=copy_session_list)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 7e21617dcd2..9e846f16c95 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -19,6 +19,7 @@ from fastapi.encoders import jsonable_encoder
+ from fastapi.responses import StreamingResponse
+ 
+ from hermes_cli.session_listing import stamp_automated, subagent_listing_scope
++from hermes_cli.session_list_flight import SESSION_LIST_CACHE, data_stamp
+ from hermes_cli.web_deps import late
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+@@ -214,6 +215,21 @@ def get_sessions(
+             status_code=400, detail="archived must be one of: exclude, only, include")
+     if order not in ("created", "recent"):
+         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
++    args = (limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full, profile)
++    try:
++        db_path = _session_db_path_for_profile(profile)
++    except HTTPException:  # an unknown profile: the uncached path raises the same 400/404
++        return _list_sessions_payload(*args)
++    # Identical concurrent calls (a Desktop reconnect fans out ~15) share one computation, and a result is
++    # reused for a moment while state.db is unchanged (session_list_flight; t_01a19f5af20a19f6). [daveey]
++    return SESSION_LIST_CACHE.get(
++        (str(db_path),) + args, data_stamp(db_path), lambda: _list_sessions_payload(*args))
++
++
++def _list_sessions_payload(
++    limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full, profile,
++) -> dict:
++    """The ``GET /api/sessions`` body for already-validated params (uncached)."""
+     profile_name = _cron_profile_home(profile)[0] if profile else None
+     try:
+         db = _open_session_db_for_profile(profile, read_only=True)
+@@ -293,7 +309,7 @@ def get_sessions(
+         # RuntimeError family, not sqlite3: same 503 payload as the analytics reads (#110054).
+         with corrupt_store_as_status(_session_db_path_for_profile(profile)):
+             raise
+-    except Exception:
++    except Exception:  # health: allow BLE001 -- the route's 500 boundary (moved from get_sessions); logs the traceback
+         _log.exception("GET /api/sessions failed")
+         raise HTTPException(status_code=500, detail="Internal server error")
+ 
+diff --git a/tests/hermes_cli/test_session_list_flight.py b/tests/hermes_cli/test_session_list_flight.py
+new file mode 100644
+index 00000000000..4526ccb15ed
+--- /dev/null
++++ b/tests/hermes_cli/test_session_list_flight.py
+@@ -0,0 +1,233 @@
++"""GET /api/sessions single-flight + data-stamp cache (hermes_cli/session_list_flight.py, t_01a19f5af20a19f6).
++
++hermes-hub 2026-11-03: Desktop reconnect bursts of ~15 identical /api/sessions calls each ran the list SQL in
++their own threadpool slot and took 2-7 s. Identical concurrent calls must run the SQL once, and any write to
++state.db must invalidate the cached result.
++"""
++
++import sqlite3
++import threading
++
++import pytest
++
++from tests.waiting import wait_until
++
++from hermes_cli import session_list_flight as slf
++
++
++def _wal_db(tmp_path):
++    path = tmp_path / "state.db"
++    conn = sqlite3.connect(path, check_same_thread=False)
++    conn.execute("PRAGMA journal_mode=WAL")
++    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)")
++    conn.execute("INSERT INTO sessions VALUES ('a', 'first')")
++    conn.commit()
++    return path, conn
++
++
++def test_data_stamp_is_stable_across_reads_and_changes_on_every_write(tmp_path):
++    path, conn = _wal_db(tmp_path)
++    reader = sqlite3.connect(path)
++    before = slf.data_stamp(path)
++    assert before is not None
++    reader.execute("SELECT * FROM sessions").fetchall()
++    assert slf.data_stamp(path) == before
++    conn.execute("UPDATE sessions SET title = 'renamed' WHERE id = 'a'")
++    conn.commit()
++    after_write = slf.data_stamp(path)
++    assert after_write != before
++    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    conn.execute("INSERT INTO sessions VALUES ('b', 'second')")
++    conn.commit()
++    assert slf.data_stamp(path) not in (before, after_write)
++
++
++def test_no_wal_means_no_stamp_and_no_caching(tmp_path):
++    path = tmp_path / "plain.db"
++    sqlite3.connect(path).execute("CREATE TABLE t (x)").connection.commit()
++    assert slf.data_stamp(path) is None
++    cache = slf.SingleFlightCache()
++    calls = []
++    for _ in range(3):
++        cache.get("k", None, lambda: calls.append(1) or len(calls))
++    assert len(calls) == 3
++
++
++def _session_rows(path):
++    conn = sqlite3.connect(path)
++    try:
++        return {"sessions": [{"id": i, "title": t} for i, t in conn.execute("SELECT id, title FROM sessions ORDER BY id")]}
++    finally:
++        conn.close()
++
++
++def test_concurrent_identical_calls_run_the_sql_once_and_a_write_invalidates(tmp_path):
++    path, writer = _wal_db(tmp_path)
++    cache = slf.SingleFlightCache(ttl_s=60.0, copy=slf.copy_session_list)
++    n = 15
++    started = threading.Event()
++    release = threading.Event()
++    sql_runs = []
++
++    def compute():
++        sql_runs.append(1)
++        started.set()
++        release.wait(5)  # hold the leader so every follower arrives while it is in flight
++        return _session_rows(path)
++
++    results = [None] * n
++
++    def call(i):
++        results[i] = cache.get(("state.db", 100, "recent"), slf.data_stamp(path), compute)
++
++    threads = [threading.Thread(target=call, args=(i,)) for i in range(n)]
++    threads[0].start()
++    assert started.wait(5)
++    for t in threads[1:]:
++        t.start()
++    # every follower is parked on the leader's flight before it is released
++    flight = next(iter(cache._flights.values()))
++    wait_until(lambda: flight.followers == n - 1, timeout=5)
++    release.set()
++    for t in threads:
++        t.join(5)
++    assert len(sql_runs) == 1
++    assert all(r == {"sessions": [{"id": "a", "title": "first"}]} for r in results)
++    # each caller owns its copy: one response's edits never leak into another's
++    results[0]["sessions"][0]["title"] = "mutated"
++    assert results[1]["sessions"][0]["title"] == "first"
++
++    # still fresh and unchanged: a later identical call is a cache hit
++    assert cache.get(("state.db", 100, "recent"), slf.data_stamp(path), compute)["sessions"][0]["title"] == "first"
++    assert len(sql_runs) == 1
++
++    # a write to state.db invalidates it at once (no TTL wait)
++    writer.execute("UPDATE sessions SET title = 'renamed' WHERE id = 'a'")
++    writer.commit()
++    fresh = cache.get(("state.db", 100, "recent"), slf.data_stamp(path), compute)
++    assert len(sql_runs) == 2 and fresh["sessions"][0]["title"] == "renamed"
++
++
++def test_ttl_expiry_and_different_params_recompute():
++    now = [0.0]
++    cache = slf.SingleFlightCache(ttl_s=2.0, clock=lambda: now[0])
++    runs = []
++    get = lambda key: cache.get(key, ("stamp",), lambda: runs.append(key) or key)
++    get("a")
++    get("a")
++    get("b")
++    assert runs == ["a", "b"]
++    now[0] = 2.5
++    get("a")
++    assert runs == ["a", "b", "a"]
++
++
++def test_leader_error_reaches_followers_and_is_not_cached():
++    cache = slf.SingleFlightCache(ttl_s=60.0)
++    gate = threading.Event()
++    in_flight = threading.Event()
++    errors = []
++
++    def boom():
++        in_flight.set()
++        gate.wait(5)
++        raise RuntimeError("store busy")
++
++    def call():
++        try:
++            cache.get("k", ("s",), boom)
++        except RuntimeError as exc:
++            errors.append(str(exc))
++
++    leader = threading.Thread(target=call)
++    leader.start()
++    assert in_flight.wait(5)
++    follower = threading.Thread(target=call)
++    follower.start()
++    flight = next(iter(cache._flights.values()))
++    wait_until(lambda: flight.followers == 1, timeout=5)
++    gate.set()
++    leader.join(5)
++    follower.join(5)
++    assert errors == ["store busy", "store busy"]
++    assert cache.computes == 1  # the follower got the leader's error; it did not run boom() itself
++    assert cache.get("k", ("s",), lambda: "ok") == "ok"
++
++
++def test_follower_computes_on_its_own_when_the_leader_hangs(monkeypatch):
++    monkeypatch.setattr(slf, "FOLLOW_TIMEOUT_S", 0.2)
++    cache = slf.SingleFlightCache(ttl_s=60.0)
++    release = threading.Event()
++    in_flight = threading.Event()
++
++    def hung():
++        in_flight.set()
++        release.wait(10)
++        return "late"
++
++    leader = threading.Thread(target=lambda: cache.get("k", ("s",), hung))
++    leader.start()
++    assert in_flight.wait(5)
++    try:
++        assert cache.get("k", ("s",), lambda: "own") == "own"
++        assert cache.computes == 2
++    finally:
++        release.set()
++        leader.join(5)
++
++
++def test_expired_entries_are_dropped_on_the_next_insert():
++    now = [0.0]
++    cache = slf.SingleFlightCache(ttl_s=2.0, clock=lambda: now[0])
++    cache.get("a", ("s",), lambda: "A")
++    now[0] = 3.0
++    cache.get("b", ("s",), lambda: "B")
++    assert list(cache._done) == ["b"]
++
++
++def test_get_sessions_route_coalesces_and_sees_writes(tmp_path, monkeypatch):
++    """The real handler: two identical GETs on an unchanged store run list_sessions_rich once; a write
++    to state.db (a new session) shows up on the very next GET."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    from hermes_state import SessionDB
++    from hermes_cli.web_routers import sessions as routes
++
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session(session_id="s1", source="desktop")
++    db.append_message("s1", role="user", content="hello there")
++    monkeypatch.setattr(routes, "_session_db_path_for_profile", lambda profile: tmp_path / "state.db")
++
++    real_open = routes._open_session_db_for_profile
++    monkeypatch.setattr(routes, "_open_session_db_for_profile",
++                        lambda profile, read_only: SessionDB(db_path=tmp_path / "state.db", read_only=True)
++                        if read_only else real_open(profile, read_only=read_only))
++    listings = []
++    real_list = SessionDB.list_sessions_rich
++
++    def counting(self, *a, **kw):
++        listings.append(1)
++        return real_list(self, *a, **kw)
++
++    monkeypatch.setattr(SessionDB, "list_sessions_rich", counting)
++    slf.SESSION_LIST_CACHE.clear()
++    call = lambda: routes.get_sessions(limit=20, offset=0, min_messages=0, archived="exclude", order="recent",
++                                       source=None, sources=None, exclude_sources="cron", cwd_prefix=None,
++                                       full=False, profile=None)
++    first = call()
++    second = call()
++    assert [s["id"] for s in first["sessions"]] == ["s1"] == [s["id"] for s in second["sessions"]]
++    assert len(listings) == 1
++
++    db.create_session(session_id="s2", source="desktop")
++    db.append_message("s2", role="user", content="second chat")
++    third = call()
++    assert len(listings) == 2
++    assert {s["id"] for s in third["sessions"]} == {"s1", "s2"}
++    db.close()
++
++
++@pytest.fixture(autouse=True)
++def _clear_cache():
++    slf.SESSION_LIST_CACHE.clear()
++    yield
++    slf.SESSION_LIST_CACHE.clear()
+-- 
+2.55.0
+

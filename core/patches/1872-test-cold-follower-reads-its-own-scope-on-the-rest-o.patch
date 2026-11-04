@@ -1,0 +1,143 @@
+From af424f2dc9de6ba1ab7931039f3c9c916ad90e42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 01:35:18 +0000
+Subject: [PATCH] test: cold follower reads its own scope on the rest of its
+ budget [daveey]
+
+PR #699 bounded cold annotation polls to one _REFRESH_WAIT_S, but two
+mutations of the follower branch survived the related 28-file set: an
+inline (unbounded) follower read (M3) and a fresh full budget for it (M5).
+The cold test kept the leader's read blocked for the whole window, so no
+follower ever reached its own read.
+
+The new test gates each read on an Event, drives the module's monotonic
+clock by hand and spies the budget handed to refresh_bounded. A follower
+waits behind another scope's read (and, as a variant, behind a failed
+same-scope read); that read ends 0.25 s in; the follower must start its own
+read on a bounded helper with 0.75 s and answer kanban_unknown while that
+read is still blocked. Fails under M3 and M5; no production change.
+---
+ .../test_kanban_annotation_cold_bounded.py    | 110 ++++++++++++++++++
+ 1 file changed, 110 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_annotation_cold_bounded.py b/tests/hermes_cli/test_kanban_annotation_cold_bounded.py
+index 2b948c39d7c..07627303db2 100644
+--- a/tests/hermes_cli/test_kanban_annotation_cold_bounded.py
++++ b/tests/hermes_cli/test_kanban_annotation_cold_bounded.py
+@@ -54,3 +54,113 @@ def test_cold_polls_finish_while_refresh_is_descheduled(monkeypatch, foreign):
+         assert activity._annotate_refresh_lock.acquire(timeout=5)
+         activity._annotate_refresh_lock.release()
+         activity._reset_cache_for_tests()
++
++
++class _Clock:
++    """``time`` for the module under test with a monotonic clock the test moves by hand."""
++
++    def __init__(self, real):
++        self._real, self.now = real, 0.0
++
++    def monotonic(self):
++        return self.now
++
++    def __getattr__(self, name):
++        return getattr(self._real, name)
++
++
++class _ObservedLock:
++    """The refresh lock, with each blocking acquire announced. The follower's wait behind the other read is not
++    under test here (test_cold_polls_finish_while_refresh_is_descheduled covers it), so the timeout it asks for is
++    recorded and a generous safety bound replaces it: the follower always gets the lock once that read ends."""
++
++    def __init__(self):
++        self._lock, self.waiting, self.timeouts = threading.Lock(), threading.Event(), []
++
++    def acquire(self, blocking=True, timeout=-1):
++        if not blocking:
++            return self._lock.acquire(False)
++        self.timeouts.append(timeout)
++        self.waiting.set()
++        return self._lock.acquire(timeout=10)
++
++    def release(self):
++        self._lock.release()
++
++
++@pytest.mark.parametrize("ahead", ["other_scope_read", "failed_same_scope_read"])
++def test_cold_follower_reads_its_scope_on_what_is_left_of_its_budget(monkeypatch, ahead):
++    """A cold poll that waited behind another read, then found nothing usable for its scope, reads that scope
++    itself on a bounded helper with only the rest of its single ``_REFRESH_WAIT_S``. A read that outlasts it leaves
++    the rows unknown (no invented counts); the follower never blocks on the read or restarts its budget."""
++    activity._reset_cache_for_tests()
++    scope = ContextVar("test_annotation_scope", default="leader")
++    follower_scope = "follower" if ahead == "other_scope_read" else "leader"
++    clock, lock = _Clock(activity.time), _ObservedLock()
++    monkeypatch.setattr(activity, "time", clock)
++    monkeypatch.setattr(activity, "_annotate_refresh_lock", lock)
++    monkeypatch.setattr(activity, "_REFRESH_WAIT_S", 1.0)
++    monkeypatch.setattr(activity, "_origin_scope", lambda: (scope.get(),))
++    monkeypatch.setattr(activity._annotation_copy, "seed", lambda *args: None)
++    monkeypatch.setattr(activity._annotation_copy, "published", lambda *args: None)
++    gates = [(threading.Event(), threading.Event()), (threading.Event(), threading.Event())]
++    reads = []
++
++    def read():
++        n = len(reads)
++        reads.append(scope.get())
++        entered, release = gates[n]
++        entered.set()
++        assert release.wait(10), "test did not release annotation read"
++        if n == 0 and ahead == "failed_same_scope_read":
++            raise RuntimeError("leader read failed")
++        return activity._identity.freeze_annotation(({"target": 3}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}))
++
++    monkeypatch.setattr(activity, "_read_annotation_parts", read)
++    budgets = []
++    real_refresh_bounded = activity._bounded.refresh_bounded
++
++    def refresh_bounded(refresh, lock_, previous, wait_s):
++        budgets.append((scope.get(), wait_s))
++        # The budget handed over is what is asserted; its expiry is simulated by waiting zero, so no assertion
++        # rides on how fast this host runs the gated reads.
++        return real_refresh_bounded(refresh, lock_, previous, 0.0)
++
++    monkeypatch.setattr(activity._bounded, "refresh_bounded", refresh_bounded)
++
++    def poll(name):
++        scope.set(name)
++        return activity.annotate_kanban_activity([{"id": "target"}])[0]
++
++    pool = ThreadPoolExecutor(max_workers=1)
++    try:
++        # The leader's cold read starts at t=0 and its poll answers unknown when its (simulated) budget ends.
++        leader_row = poll("leader")
++        assert leader_row["kanban_unknown"] is True and "kanban_active" not in leader_row
++        assert gates[0][0].wait(10), "leader read never started"
++        follower = pool.submit(poll, follower_scope)
++        assert lock.waiting.wait(10), "follower never waited for the refresh lock"
++        assert lock.timeouts == [1.0]
++        # The leader's read takes 0.25 s of the follower's budget, then ends (or fails) inside it.
++        clock.now = 0.25
++        gates[0][1].set()
++        assert gates[1][0].wait(10), "follower never started its own read"
++        # The follower's own read runs on a bounded helper with the 0.75 s left, not inline, not a fresh 1.0 s.
++        assert budgets == [("leader", 1.0), (follower_scope, 0.75)]
++        row = follower.result(timeout=10)
++        assert row["id"] == "target"
++        assert row["kanban_unknown"] is True
++        assert "kanban_active" not in row
++        assert reads == ["leader", follower_scope]
++        gates[1][1].set()
++        assert lock._lock.acquire(timeout=10)
++        lock._lock.release()
++        # The abandoned read still publishes its scope's real counts for the next poll.
++        assert activity._last_annotation[(follower_scope,)][0] == {"target": 3}
++    finally:
++        for _, release in gates:
++            release.set()
++        pool.shutdown(wait=True)
++        assert lock._lock.acquire(timeout=10)
++        lock._lock.release()
++        activity._reset_cache_for_tests()
+-- 
+2.55.0
+

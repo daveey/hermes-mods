@@ -1,0 +1,270 @@
+From 381e2ff5c34c881ccaecf6e41ecbb6cc288db32d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 14:02:29 +0000
+Subject: [PATCH] [daveey] test(conftest): monkeypatch restores Starlette State
+ attributes on pytest 9.2
+
+pytest 9.2's MonkeyPatch.setattr reads the value to restore from the
+target's instance __dict__. Starlette's State (app.state, request.state)
+keeps attributes in State._state behind __getattr__/__setattr__, so every
+setattr on it records "no old value": a double setattr of one attribute
+deletes it twice at undo (KeyError at teardown), and an attribute the app
+already had is deleted instead of restored. Under a pytest 9.2.0 overlay
+10 test files errored at teardown (test_webapp_gated_sign_out also failed
+one test, test_webapp_socket_tickets took 125 s instead of 2.4 s); the lock
+pins 9.0.3, so CI was green until the pin moves.
+
+Fix the class once instead of hand-editing each file: tests/conftest.py
+now registers a `monkeypatch` override (tests/_fixtures/state_monkeypatch.py)
+whose setattr on a State routes to setitem(state._state, ...), which records
+each old value from the dict that holds it. Every other target goes to
+pytest unchanged and the fixture is still a real pytest.MonkeyPatch.
+
+tests/test_conftest_state_monkeypatch.py covers double setattr (new and
+pre-existing attribute), a FastAPI app.state attribute, raising, and
+non-State targets, plus delattr-then-setattr and setattr-then-delattr of an
+existing attribute (delattr routes to delitem so undo replays both in order).
+Without the shim it fails on pytest 9.2.0 (4 failed,
+2 errors); with it all 10 files and the new test pass on 9.0.3 and 9.2.0.
+---
+ tests/_fixtures/state_monkeypatch.py     |  98 ++++++++++++++++++++
+ tests/conftest.py                        |   1 +
+ tests/test_conftest_state_monkeypatch.py | 109 +++++++++++++++++++++++
+ 3 files changed, 208 insertions(+)
+ create mode 100644 tests/_fixtures/state_monkeypatch.py
+ create mode 100644 tests/test_conftest_state_monkeypatch.py
+
+diff --git a/tests/_fixtures/state_monkeypatch.py b/tests/_fixtures/state_monkeypatch.py
+new file mode 100644
+index 00000000000..6b650f80d19
+--- /dev/null
++++ b/tests/_fixtures/state_monkeypatch.py
+@@ -0,0 +1,98 @@
++"""``monkeypatch`` that records Starlette ``State`` attributes correctly on every pytest version.
++
++Imported into ``tests/conftest.py`` so pytest registers the override there (see live_system_guard.py
++for why ``pytest_plugins`` is not used).
++
++pytest 9.2's ``MonkeyPatch.setattr`` reads the value it will restore from the target's instance
++``__dict__``. Starlette's ``State`` (``app.state``, ``request.state``) keeps its attributes in
++``self._state`` behind ``__getattr__``/``__setattr__``, so every setattr on it records "no old value":
++
++* setting the same State attribute twice (a re-set, or a helper called twice) deletes it twice at
++  undo, and the second delete raises ``KeyError`` at teardown;
++* an attribute the app already had (set by ``create_app``) is deleted at undo instead of restored,
++  so later tests on a module-level app see it missing.
++
++pytest 9.0 read the old value with ``getattr`` and did neither. Routing ``setattr(<State>, name, v)``
++to ``setitem(state._state, name, v)`` (and ``delattr`` to ``delitem``) records each old value from
++the dict that really holds it, which is correct on both versions; every other target goes to
++pytest unchanged.
++"""
++from __future__ import annotations
++
++import sys
++from typing import Any
++
++import pytest
++
++_UNSET: Any = object()
++_STARLETTE_DATASTRUCTURES = "starlette.datastructures"
++
++
++def _is_starlette_state(target: object) -> bool:
++    # Never import starlette here: if it is not loaded yet, ``target`` cannot be one of its States.
++    mod = sys.modules.get(_STARLETTE_DATASTRUCTURES)
++    state_cls = getattr(mod, "State", None) if mod is not None else None
++    return state_cls is not None and isinstance(target, state_cls)
++
++
++def _state_store(target: object, name: object) -> dict[str, Any] | None:
++    """The ``_state`` dict holding ``name`` when ``target`` is a State and ``name`` lives there."""
++    if not (isinstance(name, str) and _is_starlette_state(target)):
++        return None
++    if name in vars(target) or hasattr(type(target), name):  # ``_state`` itself, methods, dunders
++        return None
++    return vars(target)["_state"]
++
++
++def state_aware(mpatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
++    """Make ``mpatch.setattr``/``delattr`` on a Starlette ``State`` patch its ``_state`` dict.
++
++    Both go through the ``setitem``/``delitem`` stack: ``undo()`` replays the setattr stack before
++    the setitem stack, so routing only ``setattr`` would replay a ``delattr``-then-``setattr`` of one
++    attribute in the wrong order. Dotted-string targets and ``MonkeyPatch.context()`` instances keep
++    pytest's behaviour (no in-tree use touches a State that way).
++
++    Wraps the instance methods rather than subclassing: ``pytest.MonkeyPatch`` is ``@final``, and
++    the fixture must stay a real ``pytest.MonkeyPatch`` for code that checks or annotates it.
++    Returns ``mpatch``.
++    """
++    native_setattr = mpatch.setattr
++    native_delattr = mpatch.delattr
++
++    def setattr(target: Any, name: Any = _UNSET, value: Any = _UNSET, raising: bool = True) -> None:
++        __tracebackhide__ = True
++        store = _state_store(target, name) if value is not _UNSET else None
++        if store is None:
++            native_setattr(target, *[a for a in (name, value) if a is not _UNSET], raising=raising)
++            return
++        if raising and name not in store:
++            raise AttributeError(f"{target!r} has no attribute {name!r}")
++        mpatch.setitem(store, name, value)
++
++    def delattr(target: Any, name: Any = _UNSET, raising: bool = True) -> None:
++        __tracebackhide__ = True
++        store = _state_store(target, name)
++        if store is None:
++            native_delattr(target, *[a for a in (name,) if a is not _UNSET], raising=raising)
++            return
++        if name not in store:
++            if raising:
++                raise AttributeError(name)
++            return
++        mpatch.delitem(store, name)
++
++    mpatch.setattr = setattr  # type: ignore[method-assign]
++    mpatch.delattr = delattr  # type: ignore[method-assign]
++    return mpatch
++
++
++@pytest.fixture(name="monkeypatch")
++def _state_aware_monkeypatch():
++    """Same contract as pytest's built-in ``monkeypatch``, with State-aware ``setattr``/``delattr``.
++
++    Registered under a private function name: a conftest global named ``monkeypatch`` would be
++    shadowed by every fixture that takes ``monkeypatch`` as a parameter (ruff F811).
++    """
++    mpatch = state_aware(pytest.MonkeyPatch())
++    yield mpatch
++    mpatch.undo()
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 7af4d2a943f..ef3995de958 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -283,6 +283,7 @@ from tests._fixtures.offline_catalogs import (
+ from tests._fixtures.offline_cli_catalogs import _offline_cli_catalog_transport
+ from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
+ from tests._fixtures.session_context_reset import _reset_session_context_vars
++from tests._fixtures.state_monkeypatch import _state_aware_monkeypatch
+ from tests._fixtures import required_extras as _required_extras
+ 
+ # HERMES_TEST_REQUIRE_EXTRAS (set by the CI lanes that install the extras): a listed optional
+diff --git a/tests/test_conftest_state_monkeypatch.py b/tests/test_conftest_state_monkeypatch.py
+new file mode 100644
+index 00000000000..6bebca2c3f9
+--- /dev/null
++++ b/tests/test_conftest_state_monkeypatch.py
+@@ -0,0 +1,109 @@
++"""The ``monkeypatch`` fixture restores Starlette ``State`` attributes on every pytest version.
++
++pytest 9.2 records State attributes as "no old value" (they live in ``State._state``, not the
++instance ``__dict__``), so a double setattr raised ``KeyError`` at teardown and a pre-existing
++attribute was deleted instead of restored. tests/_fixtures/state_monkeypatch.py routes State
++targets through ``setitem``; these tests call ``undo()`` explicitly and pass on pytest 9.0 and 9.2.
++"""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++
++import types
++
++import pytest
++
++from tests._fixtures.state_monkeypatch import state_aware
++
++State = pytest.importorskip("starlette.datastructures").State
++
++
++def test_fixture_is_still_a_pytest_monkeypatch(monkeypatch):
++    assert isinstance(monkeypatch, pytest.MonkeyPatch)
++
++
++def test_double_setattr_of_new_state_attribute_undoes_cleanly(monkeypatch):
++    state = State()
++    monkeypatch.setattr(state, "session_authority", "first", raising=False)
++    monkeypatch.setattr(state, "session_authority", "second", raising=False)
++    assert state.session_authority == "second"
++
++    monkeypatch.undo()
++
++    assert "session_authority" not in state._state
++
++
++def test_double_setattr_of_existing_state_attribute_restores_original(monkeypatch):
++    state = State({"ssh_isolated_clients": "original"})
++    monkeypatch.setattr(state, "ssh_isolated_clients", "a")
++    monkeypatch.setattr(state, "ssh_isolated_clients", "b")
++    assert state.ssh_isolated_clients == "b"
++
++    monkeypatch.undo()
++
++    assert state.ssh_isolated_clients == "original"
++
++
++def test_app_state_attribute_survives_patching(monkeypatch):
++    fastapi = pytest.importorskip("fastapi")
++    app = fastapi.FastAPI()
++    app.state.auth_required = True
++    monkeypatch.setattr(app.state, "auth_required", False)
++
++    monkeypatch.undo()
++
++    assert app.state.auth_required is True
++
++
++def test_delattr_then_setattr_of_existing_state_attribute_restores_original(monkeypatch):
++    # The "drop it if present, then set it" pattern (test_ui_preferences.py and others): undo
++    # must replay both steps in reverse order across pytest's setattr and setitem stacks.
++    state = State({"ui_surface": "original"})
++    monkeypatch.delattr(state, "ui_surface")
++    monkeypatch.setattr(state, "ui_surface", "patched", raising=False)
++
++    monkeypatch.undo()
++
++    assert state.ui_surface == "original"
++
++
++def test_setattr_then_delattr_of_existing_state_attribute_restores_original(monkeypatch):
++    state = State({"ui_surface": "original"})
++    monkeypatch.setattr(state, "ui_surface", "patched")
++    monkeypatch.delattr(state, "ui_surface")
++    assert "ui_surface" not in state._state
++
++    monkeypatch.undo()
++
++    assert state.ui_surface == "original"
++
++
++def test_delattr_of_missing_state_attribute_raises_unless_raising_false(monkeypatch):
++    state = State()
++    with pytest.raises(AttributeError):
++        monkeypatch.delattr(state, "absent")
++    monkeypatch.delattr(state, "absent", raising=False)
++    monkeypatch.undo()
++    assert "absent" not in state._state
++
++
++def test_missing_state_attribute_raises_unless_raising_false():
++    mpatch = state_aware(pytest.MonkeyPatch())
++    state = State()
++    with pytest.raises(AttributeError):
++        mpatch.setattr(state, "absent", 1)
++    mpatch.setattr(state, "absent", 1, raising=False)
++    assert state.absent == 1
++    mpatch.undo()
++    assert "absent" not in state._state
++
++
++def test_non_state_targets_keep_native_behaviour(monkeypatch):
++    target = types.SimpleNamespace(value="original")
++    monkeypatch.setattr(target, "value", "a")
++    monkeypatch.setattr(target, "value", "b")
++    monkeypatch.setattr("os.sep", "!")
++    import os
++
++    assert (target.value, os.sep) == ("b", "!")
++    monkeypatch.undo()
++    assert target.value == "original"
++    assert os.sep != "!"
+-- 
+2.55.0
+

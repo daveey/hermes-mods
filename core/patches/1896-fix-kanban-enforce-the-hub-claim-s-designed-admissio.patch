@@ -1,0 +1,172 @@
+From bd18747d7e094d8d4b0d1708cbc65790fcdea592 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 20:52:54 +0000
+Subject: [PATCH] fix(kanban): enforce the hub claim's designed admission.lock
+ hold; document cpu_busy_below_pct (docs drift)
+
+The final hub gate now refuses (hub_cpu_unknown) when its cheap pre-sample checks leave no room for a nominal 1 s
+sample, or when sample + recount overran CLAIM_MAX_HOLD_S minus a 0.25 s commit reserve, so an admitted claim can no
+longer outlast a waiting turn's BUSY_WAIT_S (final integration review N1; the sample itself stays a full independent
+sample under the lock per the frozen contract). website configuration.md documents the root-only
+kanban.admission.cpu_busy_below_pct key, which the docs-drift ratchet required (red CI at 6798d57d834). [daveey]
+---
+ hermes_cli/kanban_admission.py                | 26 ++++++++--
+ tests/hermes_cli/test_kanban_hub_admission.py | 48 +++++++++++++++++++
+ website/docs/user-guide/configuration.md      | 16 +++++++
+ 3 files changed, 87 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 6806eebeef6..78abd6f2221 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -86,12 +86,27 @@ def _cap_full():
+     return not ok or type(active) is not int or active < 0 or (cap is not None and active >= cap)
+ 
+ 
+-def _final_hub_gate(gate):
++COMMIT_RESERVE_S = 0.25  # lock time left for the SQL commit after the gate admits
++
++
++def _hold_budget_s():
++    from hermes_cli.admission_fence import CLAIM_MAX_HOLD_S
++    return CLAIM_MAX_HOLD_S - COMMIT_RESERVE_S
++
++
++def _over_budget(started, needed_s=0.0):
++    return started is not None and time.monotonic() - started + needed_s > _hold_budget_s()
++
++
++def _final_hub_gate(gate, started=None):
+     """Under admission.lock: ``(reason, evidence)``; reason None admits. Never touches the network.
+ 
+     Cheap checks (whole-host cap, lease deadline) run BEFORE the ~1 s sample so a claim that must be refused anyway
+     never holds the lock for a sample (review F6); the deadline and the whole-host count are checked again after
+-    sampling, immediately before the commit."""
++    sampling, immediately before the commit. ``started`` (monotonic, taken when admission.lock was acquired) enforces
++    the designed hold: a gate that cannot fit its sample inside ``CLAIM_MAX_HOLD_S`` minus the commit
++    reserve refuses before sampling when not even a nominal 1 s sample fits, and one that overran it (slow board scan, stall) refuses instead of committing, so
++    a waiting turn's BUSY_WAIT_S budget is never outlasted by an admitted claim (final review N1)."""
+     from hermes_cli import machine_cpu_metrics as cpu
+ 
+     state, limit = cpu.root_limit()
+@@ -103,6 +118,8 @@ def _final_hub_gate(gate):
+         return "hub_capacity_full", None
+     if _expired(gate):
+         return "hub_cpu_unknown", None
++    if _over_budget(started, cpu.WINDOW_S):
++        return "hub_cpu_unknown", None  # no room left for even a nominal sample inside the designed hold
+     measured = cpu.sample()
+     if not measured or not all(k in measured for k in cpu.FIELDS):
+         return "hub_cpu_unknown", None
+@@ -114,6 +131,8 @@ def _final_hub_gate(gate):
+         return "hub_cpu_unknown", None  # the claim/lease deadline passed while sampling: never start
+     if _cap_full():  # the spec's recount immediately before commit
+         return "hub_capacity_full", None
++    if _over_budget(started):
++        return "hub_cpu_unknown", None  # the hold overran its budget: refuse rather than outlast waiting turns
+     return None, {**{k: measured[k] for k in cpu.FIELDS}, "limit_pct": limit}
+ 
+ 
+@@ -222,6 +241,7 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+         with write_txn(conn):
+             try:
+                 root = stack.enter_context(admission_lock(get_default_hermes_root(), timeout=0))
++                started = time.monotonic()
+                 held = is_held(root)
+                 waiting = not held and turns_waiting(root)
+             except AdmissionBusy:
+@@ -247,7 +267,7 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+                 return
+             # Frozen contract: an independent full CPU sample is taken HERE, with admission.lock held, and the
+             # claim commits before the lock is released, so a concurrent claimer sees this run in its recount.
+-            reason, evidence = _final_hub_gate(gate)
++            reason, evidence = _final_hub_gate(gate, started)
+             if reason is not None:
+                 logging.getLogger(__name__).info("Hub admission refused Kanban claim %s: %s", task_id, reason)
+                 _defer(task_id, reason)
+diff --git a/tests/hermes_cli/test_kanban_hub_admission.py b/tests/hermes_cli/test_kanban_hub_admission.py
+index 198ab173aff..7adebe9d537 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission.py
++++ b/tests/hermes_cli/test_kanban_hub_admission.py
+@@ -347,3 +347,51 @@ def test_deadline_already_passed_refuses_before_the_sample(board, monkeypatch):
+     t = task(conn)
+     assert kb.claim_task(conn, t) is None
+     refused(conn, t, False, "hub_cpu_unknown")
++
++
++def _shrink_hold_budget(monkeypatch, budget_s):
++    """The designed hold is CLAIM_MAX_HOLD_S - COMMIT_RESERVE_S; shrink it so an overrun is cheap to provoke."""
++    monkeypatch.setattr(ka, "COMMIT_RESERVE_S", af.CLAIM_MAX_HOLD_S - budget_s)
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_hold_that_overruns_its_budget_refuses_instead_of_committing(board, monkeypatch, review):
++    """Final review N1: a sample + recount that outlast the designed hold must not commit (turn budget would lose)."""
++    conn, home = board
++    configure(home)
++    advisory(home)
++    _shrink_hold_budget(monkeypatch, 0.2)
++    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: time.sleep(0.3)))  # health: allow HX013 -- a sample that overruns the shrunken hold
++    t = task(conn, review)
++    assert claim(conn, t, review) is None
++    refused(conn, t, review, "hub_cpu_unknown")
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_slow_pre_sample_checks_leave_no_room_so_it_refuses_before_sampling(board, monkeypatch, review):
++    """Final review N1: when the cheap checks already ate the room a nominal 1 s sample needs, never start sampling."""
++    conn, home = board
++    configure(home)
++    advisory(home)
++    _shrink_hold_budget(monkeypatch, cm.WINDOW_S + 0.2)
++
++    def slow_count():
++        time.sleep(0.3)  # health: allow HX013 -- a slow board scan before the sample
++        return 0
++    monkeypatch.setattr(mm, "active_card_runs", slow_count)
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("no room for the sample: refuse before sampling"))
++    t = task(conn, review)
++    assert claim(conn, t, review) is None
++    refused(conn, t, review, "hub_cpu_unknown")
++
++
++def test_claim_inside_the_hold_budget_still_admits(board, monkeypatch):
++    """Control for the N1 bound: the default budget admits a normal sample (the bound is not a blanket refusal)."""
++    conn, home = board
++    configure(home)
++    advisory(home)
++    assert ka._hold_budget_s() == pytest.approx(af.CLAIM_MAX_HOLD_S - ka.COMMIT_RESERVE_S)
++    assert ka._hold_budget_s() >= cm.WINDOW_S + 1.0
++    monkeypatch.setattr(cm, "sample", fake_sample(10.0, check=lambda: time.sleep(0.1)))  # health: allow HX013 -- a short stand-in sample
++    t = task(conn)
++    assert kb.claim_task(conn, t) is not None
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index f7d55ef5eb5..41f30f524e0 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3371,6 +3371,22 @@ kanban:
+ 
+ `kanban.sync.enabled` is off by default. When enabled, boards opened afterwards gain the sync tables and outbox triggers used by the central-sync client seams. Existing boards are unaffected until reopened.
+ 
++## Kanban hub CPU admission gate
++
++```yaml
++# installation-root config.yaml only (a profile's config.yaml is ignored for this key)
++kanban:
++  admission:
++    cpu_busy_below_pct: 50   # absent/null = gate off (default)
++```
++
++`kanban.admission.cpu_busy_below_pct` (default unset: off) turns on the measured-CPU admission gate on a host that takes overflow work from the Board's worker-first placement. It is read only from the installation-root `config.yaml`, never from a profile override. When set:
++
++- the metrics reporter attaches a measured CPU busy percentage (two `/proc/stat` snapshots about 1 s apart) to its 10 s Board report, with a 2 s total budget and no replay;
++- every new ready/review claim on the host takes an independent full ~1 s sample while `admission.lock` is held, and claims only when busy is strictly below the limit and the host's running count is below the root `kanban.max_in_progress`.
++
++Any unknown (an unreadable config, a non-numeric or out-of-range value, a failed sample, a window outside 1-2 s) refuses the claim rather than admitting it. The Board-side `worker_overflow` setting decides whether the hub is offered overflow at all; with it absent or `{}` nothing is sent to the hub.
++
+ ## Kanban duplicate-work check
+ 
+ `kanban.create_overlap_check` (default `true`) makes `kanban_create` check open cards across local boards and other gateways' replicated boards before creating another owner for overlapping work. A match refuses creation with `code=create_overlap` and identifies the existing cards. For genuinely separate work, pass `distinct_from` with those card IDs and a `distinct_reason`; set this configuration key to `false` to disable the check entirely. Missing or unreadable remote replicas are skipped and logged rather than blocking creation.
+-- 
+2.55.0
+

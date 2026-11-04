@@ -102,3 +102,30 @@ Applies on its own on top of the fork; it moves `_runs_where` and the marker-pla
 ## Plugin?
 
 No: the gate sits inside the core tool's create path, before placement.
+
+
+## Follow-up 1877: create_overlap re-checked inside the insert transaction
+
+Patches: **1877** (`0dc7d70825`, `fix(kanban): re-check create_overlap inside the insert's write transaction [daveey]`). Mirrored in the 1822–1918 pass ([mirror-1918-verification.md](mirror-1918-verification.md)).
+
+### Behavior
+
+- `create_overlap` is re-checked inside the insert's write transaction, so two creators racing within milliseconds (for example a worker and ci-main-watch) can no longer both pass the check (1877).
+
+### How it works
+
+`kanban_overlap.check()` returns an `AfterCreate` whose `.guard` the tool, CLI and REST entries pass to `create_task(insert_guard=...)`; it re-runs the same match against open cards of the target board created since the first check, and a hit rolls the create back with the same `create_overlap` payload. Races across boards/gateways remain a documented limit.
+
+Source commit notes (first paragraph of each message, privacy-normalized):
+
+- 1877: On 11-03 a worker's kanban_create (t_01a19f0a4cc8b092) and ci-main-watch's `hermes kanban create` (t_01a19f0a4d82213d) were inserted 186 ms apart and both own test_termux_assembly_permissions. The overlap check reads the board outside create_task's transaction (and the CLI runs placement/ask checks in between), so each process passed it before the other's row existed (#732 "Known limit").
+
+### Code
+
+`hermes_cli/kanban.py`, `hermes_cli/kanban_db.py`, `hermes_cli/kanban_db_creation.py`, `hermes_cli/kanban_origin_creation.py`, `hermes_cli/kanban_overlap.py`, `plugins/kanban/dashboard/plugin_api.py`, `tools/kanban_tools.py`, `tools/kanban_tools_placement.py`, `website/docs/user-guide/features/kanban.md`.
+
+### Tests
+
+Landed with the source commits; not rerun by this mirror pass unless the verification report lists them. Names are tests each patch added; a file with no names was modified only.
+
+- `tests/tools/test_kanban_create_overlap_race.py`: `test_concurrent_pair_lands_one_card_and_one_refusal`, `test_rest_insert_rechecks_inside_its_transaction`, `test_recheck_reads_only_cards_created_since_the_first_check`

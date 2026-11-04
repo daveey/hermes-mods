@@ -1,0 +1,216 @@
+From 632e807b48a2842aa0000b9d96b14ef453018f50 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 06:48:18 +0000
+Subject: [PATCH] fix(kanban): a bad cap read keeps the cap in force, not the
+ boot cap [daveey]
+
+8f3ca18b32e (PR763) made the embedded dispatcher re-read kanban.max_in_progress
+every tick, falling back to the BOOT value when the read was unset/invalid/
+unreadable. Hub sequence boot 16 -> config 7 -> one bad read reopened 16, the
+opposite of that commit's "a transient read error never raises the cap".
+
+Why chain:
+1. A tick after a bad read passed max_in_progress=16 to dispatch_once
+   (RED: boot16 -> 7 -> key removed / "not-a-number" / 0 / file deleted /
+   load_config_readonly raising all yielded 16; real _tick_spawn_budget
+   admitted 13 more with 3 running under a 2 cap).
+2. live_max_in_progress used `configured or self.settings.max_in_progress`;
+   configured_max_in_progress collapses unset/invalid/raising to None.
+3. The fallback was chosen as "boot value" without distinguishing "never
+   lowered" from "lowered live then unreadable".
+4. Not caught: the unset/invalid test booted at 7 and stayed at 7, so boot ==
+   last cap and the fallback choice was invisible; the PR merged without an
+   independent review of the fail-closed claim.
+
+Fix: fall back to the cap the previous tick used (boot value only on the first
+tick). Raising takes an explicit value; returning to the memory-derived default
+takes a restart. Broken YAML already held 7 via config last-known-good.
+
+Tests: tests/gateway/test_kanban_dispatcher_live_max_in_progress_fail_closed.py
+(7 RED on 8f3ca18b32e, 8 GREEN; PR763's 3 tests unchanged and GREEN).
+---
+ gateway/kanban_watchers_dispatcher.py         |  15 +-
+ ...atcher_live_max_in_progress_fail_closed.py | 136 ++++++++++++++++++
+ 2 files changed, 147 insertions(+), 4 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_dispatcher_live_max_in_progress_fail_closed.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index 7d042c9ed65..d934f9a334c 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -39,7 +39,7 @@ class _DispatcherSettings:
+     """``kanban.*`` dispatch settings, read once at boot (restart to apply).
+ 
+     Exception: ``max_in_progress`` is re-read every tick (``_KanbanDispatcher.live_max_in_progress``);
+-    this field is only its boot value / fallback."""
++    this field is only its fallback until a tick has run."""
+ 
+     interval: float
+     max_spawn: Any
+@@ -153,11 +153,18 @@ class _KanbanDispatcher:
+         The host cap is the one dispatch setting an operator lowers to contain load, and the
+         dashboard and ``hermes kanban daemon`` already read it live. Freezing it at boot let a
+         hub gateway booted at 16 keep claiming to 16/16 for an hour after config said 7, while
+-        the dashboard showed 15/7. An explicit positive value wins; an unset or unreadable key
+-        keeps the boot value (the memory-derived default when it was unset at boot).
++        the dashboard showed 15/7. An explicit positive value wins; an unset, invalid or
++        unreadable key keeps the cap the previous tick used (the boot value on the first tick),
++        never the boot value: boot 16 -> config 7 -> one bad read must not reopen 16. Raising the
++        cap takes an explicit value; restoring the memory-derived default takes a restart.
+         """
+         configured = _kbd().configured_max_in_progress()
+-        effective = configured if configured is not None else self.settings.max_in_progress
++        if configured is not None:
++            effective = configured
++        elif self._logged_max_in_progress is not _UNSET:
++            effective = self._logged_max_in_progress
++        else:
++            effective = self.settings.max_in_progress
+         if effective != self._logged_max_in_progress:
+             if self._logged_max_in_progress is not _UNSET:
+                 logger.info("kanban dispatcher: max_in_progress=%s (was %s; config re-read live)",
+diff --git a/tests/gateway/test_kanban_dispatcher_live_max_in_progress_fail_closed.py b/tests/gateway/test_kanban_dispatcher_live_max_in_progress_fail_closed.py
+new file mode 100644
+index 00000000000..99a72043f9c
+--- /dev/null
++++ b/tests/gateway/test_kanban_dispatcher_live_max_in_progress_fail_closed.py
+@@ -0,0 +1,136 @@
++"""A bad or missing cap read never raises the embedded dispatcher's host cap above the one in force. [daveey]
++
++8f3ca18b32e made the gateway re-read ``kanban.max_in_progress`` every tick but fell back to the
++BOOT value whenever the read came back unset/invalid/unreadable. A gateway booted at 16 and
++contained to 7 by a config edit therefore jumped back to 16 on the next bad read: the opposite
++of the "a transient read error never raises the cap" claim. Only an explicit positive value
++moves the cap; anything else keeps the cap the previous tick used.
++"""
++import os
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_dispatch import DispatchResult
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    root = tmp_path / "home"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    return root
++
++
++def _write_config(home, body: str) -> None:
++    path = home / "config.yaml"
++    old = path.stat().st_mtime_ns if path.exists() else 0
++    path.write_text(body)
++    os.utime(path, ns=(time.time_ns(), max(time.time_ns(), old + 2_000_000_000)))
++
++
++def _dispatcher(boot_cap):
++    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
++    return _KanbanDispatcher(kb, _DispatcherSettings(60, None, boot_cap, 2, 0, True, None, None))
++
++
++def _capture(monkeypatch):
++    seen = []
++
++    def fake_dispatch_once(conn, **kwargs):
++        seen.append(kwargs.get("max_in_progress"))
++        return DispatchResult()
++
++    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
++    return seen
++
++
++def _boot16_then_7(home, monkeypatch):
++    _write_config(home, "kanban:\n  max_in_progress: 16\n")
++    kb.create_board("sample")
++    dispatcher = _dispatcher(16)
++    seen = _capture(monkeypatch)
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  max_in_progress: 7\n")
++    dispatcher.tick_once_for_board("sample")
++    return dispatcher, seen
++
++
++@pytest.mark.parametrize("body", [
++    "kanban:\n  dispatch_interval_seconds: 15\n",   # key removed
++    "kanban:\n  max_in_progress: not-a-number\n",  # invalid
++    "kanban:\n  max_in_progress: 0\n",             # non-positive
++    "kanban:\n  max_in_progress: [\n",             # broken YAML
++])
++def test_bad_or_missing_value_after_lowering_keeps_lowered_cap(home, monkeypatch, body):
++    dispatcher, seen = _boot16_then_7(home, monkeypatch)
++    _write_config(home, body)
++    dispatcher.tick_once_for_board("sample")
++    dispatcher.tick_once_for_board("sample", suppress_spawn=True)
++
++    assert seen == [16, 7, 7, 7]
++
++
++def test_config_file_deleted_after_lowering_keeps_lowered_cap(home, monkeypatch):
++    dispatcher, seen = _boot16_then_7(home, monkeypatch)
++    (home / "config.yaml").unlink()
++    dispatcher.tick_once_for_board("sample")
++
++    assert seen == [16, 7, 7]
++
++
++def test_config_read_raising_after_lowering_keeps_lowered_cap(home, monkeypatch):
++    dispatcher, seen = _boot16_then_7(home, monkeypatch)
++    import hermes_cli.config as config_mod
++
++    def boom():
++        raise OSError("EIO reading config.yaml")
++
++    monkeypatch.setattr(config_mod, "load_config_readonly", boom)
++    dispatcher.tick_once_for_board("sample")
++
++    assert seen == [16, 7, 7]
++
++
++def test_explicit_value_still_raises_and_lowers_after_a_bad_read(home, monkeypatch):
++    dispatcher, seen = _boot16_then_7(home, monkeypatch)
++    _write_config(home, "kanban:\n  max_in_progress: nope\n")
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  max_in_progress: 12\n")
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  max_in_progress: 3\n")
++    dispatcher.tick_once_for_board("sample")
++
++    assert seen == [16, 7, 7, 12, 3]
++
++
++def test_bad_read_after_lowering_refuses_claims_through_real_budget_gate(home, monkeypatch):
++    """3 running, boot 16 -> config 2 -> invalid value: the real gate still says 3/2."""
++    _write_config(home, "kanban:\n  max_in_progress: 16\n")
++    kb.create_board("sample")
++    dispatcher = _dispatcher(16)
++    monkeypatch.setattr(kbd, "count_running_tasks", lambda conn: 3)
++    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 0)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda sample=None: "ok")
++    budgets = []
++    real_budget = kbd._tick_spawn_budget
++
++    def spy(conn, result, **kwargs):
++        out = real_budget(conn, result, **kwargs)
++        budgets.append((kwargs["max_in_progress"], out, result.at_capacity))
++        return out
++
++    monkeypatch.setattr(kbd, "_tick_spawn_budget", spy)
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  max_in_progress: 2\n")
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  max_in_progress: bogus\n")
++    dispatcher.tick_once_for_board("sample")
++
++    assert budgets[0][:2] == (16, (True, 13))
++    assert budgets[-1] == (2, (False, None), "max_in_progress=3/2")
+-- 
+2.55.0
+

@@ -1,0 +1,205 @@
+From 8f3ca18b32ed81726b2195f030139b1ef296261a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 06:14:11 +0000
+Subject: [PATCH] fix(kanban): embedded dispatcher re-reads
+ kanban.max_in_progress every tick [daveey]
+
+hermes-hub booted its gateway at 04:18Z with max_in_progress=16; config.yaml
+was lowered to 7 at 05:15Z, yet the gateway kept claiming (dashboard 12 -> 15/7)
+until an unrelated restart at 05:59Z logged max_in_progress=7.
+
+Why chain:
+1. Claims passed the budget gate: dispatch_once got max_in_progress=16.
+2. _KanbanDispatcher passed asdict(self.settings), resolved once at boot.
+3. _DispatcherSettings is documented "read once at boot (restart to apply)",
+   while `hermes kanban daemon` and the dashboard re-read the cap per tick, so
+   the operator's containment edit showed /7 but was not enforced.
+4. Not caught: no test asserted the embedded loop follows a config edit; the
+   daemon path's live read had no gateway counterpart.
+
+Fix: tick_once_for_board passes live_max_in_progress(): an explicit positive
+config value wins each tick (load is mtime-cached); unset/invalid/unreadable
+keeps the boot value so a transient read error never raises the cap. Logs
+the change once.
+
+Tests: tests/gateway/test_kanban_dispatcher_live_max_in_progress.py (RED on
+the unfixed source for both hot-reload cases, GREEN with the fix, including a
+claim refused through the real _tick_spawn_budget).
+---
+ gateway/kanban_watchers_dispatcher.py         |  27 ++++-
+ ..._kanban_dispatcher_live_max_in_progress.py | 102 ++++++++++++++++++
+ 2 files changed, 128 insertions(+), 1 deletion(-)
+ create mode 100644 tests/gateway/test_kanban_dispatcher_live_max_in_progress.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index c27e30b1431..7d042c9ed65 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -29,12 +29,17 @@ def _kbd():
+     from hermes_cli import kanban_db_dispatch
+     return kanban_db_dispatch
+ 
++_UNSET = object()
++
+ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
+ 
+ 
+ @dataclass
+ class _DispatcherSettings:
+-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
++    """``kanban.*`` dispatch settings, read once at boot (restart to apply).
++
++    Exception: ``max_in_progress`` is re-read every tick (``_KanbanDispatcher.live_max_in_progress``);
++    this field is only its boot value / fallback."""
+ 
+     interval: float
+     max_spawn: Any
+@@ -137,10 +142,29 @@ class _KanbanDispatcher:
+         self.successful_scopes: list = []
+         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+         self._rr_offset = 0  # round-robin start board for spawning ticks (_fair_board_order)
++        self._logged_max_in_progress: Any = _UNSET  # last host cap a tick used (live_max_in_progress)
+ 
+     def _board_slugs(self) -> list:
+         return _board_slugs(self.kb)
+ 
++    def live_max_in_progress(self) -> Optional[int]:
++        """``kanban.max_in_progress`` re-read for this tick (config load is mtime-cached). [daveey]
++
++        The host cap is the one dispatch setting an operator lowers to contain load, and the
++        dashboard and ``hermes kanban daemon`` already read it live. Freezing it at boot let a
++        hub gateway booted at 16 keep claiming to 16/16 for an hour after config said 7, while
++        the dashboard showed 15/7. An explicit positive value wins; an unset or unreadable key
++        keeps the boot value (the memory-derived default when it was unset at boot).
++        """
++        configured = _kbd().configured_max_in_progress()
++        effective = configured if configured is not None else self.settings.max_in_progress
++        if effective != self._logged_max_in_progress:
++            if self._logged_max_in_progress is not _UNSET:
++                logger.info("kanban dispatcher: max_in_progress=%s (was %s; config re-read live)",
++                            effective, self._logged_max_in_progress)
++            self._logged_max_in_progress = effective
++        return effective
++
+     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
+         from hermes_cli import kanban_db as _kb
+         with _kb.pin_first_board_resolution():
+@@ -189,6 +213,7 @@ class _KanbanDispatcher:
+         if not self._quarantine_lifted(slug, fingerprint):
+             return None
+         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
++        kwargs["max_in_progress"] = self.live_max_in_progress()
+         if suppress_spawn:
+             kwargs["max_spawn"] = 0  # budget gate refuses every claim; bookkeeping phases still run
+         try:
+diff --git a/tests/gateway/test_kanban_dispatcher_live_max_in_progress.py b/tests/gateway/test_kanban_dispatcher_live_max_in_progress.py
+new file mode 100644
+index 00000000000..638aa49e7ce
+--- /dev/null
++++ b/tests/gateway/test_kanban_dispatcher_live_max_in_progress.py
+@@ -0,0 +1,102 @@
++"""The embedded dispatcher's host cap follows config.yaml without a gateway restart. [daveey]
++
++Regression: hermes-hub booted at max_in_progress=16 (04:18Z), config was lowered to 7 at 05:15Z,
++and the gateway kept claiming to 16/16 because ``_DispatcherSettings`` froze the cap at boot.
++"""
++import os
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_dispatch import DispatchResult
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    root = tmp_path / "home"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    return root
++
++
++def _write_config(home, body: str) -> None:
++    path = home / "config.yaml"
++    old = path.stat().st_mtime_ns if path.exists() else 0
++    path.write_text(body)
++    # load_config_readonly is mtime-cached: make sure the edit is visible to it.
++    os.utime(path, ns=(time.time_ns(), max(time.time_ns(), old + 2_000_000_000)))
++
++
++def _dispatcher(boot_cap):
++    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
++    return _KanbanDispatcher(kb, _DispatcherSettings(60, None, boot_cap, 2, 0, True, None, None))
++
++
++def _capture(monkeypatch):
++    seen = []
++
++    def fake_dispatch_once(conn, **kwargs):
++        seen.append(kwargs.get("max_in_progress"))
++        return DispatchResult()
++
++    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
++    return seen
++
++
++def test_lowered_cap_applies_on_next_tick_without_restart(home, monkeypatch):
++    _write_config(home, "kanban:\n  max_in_progress: 16\n")
++    kb.create_board("sample")
++    dispatcher = _dispatcher(16)
++    seen = _capture(monkeypatch)
++
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  max_in_progress: 7\n")
++    dispatcher.tick_once_for_board("sample")
++    dispatcher.tick_once_for_board("sample", suppress_spawn=True)
++
++    assert seen == [16, 7, 7]
++
++
++def test_unset_cap_keeps_boot_value(home, monkeypatch):
++    _write_config(home, "kanban:\n  max_in_progress: 7\n")
++    kb.create_board("sample")
++    dispatcher = _dispatcher(7)
++    seen = _capture(monkeypatch)
++
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  dispatch_interval_seconds: 15\n")
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  max_in_progress: not-a-number\n")
++    dispatcher.tick_once_for_board("sample")
++
++    assert seen == [7, 7, 7]
++
++
++def test_lowered_cap_refuses_claims_through_real_budget_gate(home, monkeypatch):
++    """End to end through dispatch_once's real ``_tick_spawn_budget``: 3 running, config 16 -> 2."""
++    _write_config(home, "kanban:\n  max_in_progress: 16\n")
++    kb.create_board("sample")
++    dispatcher = _dispatcher(16)
++    monkeypatch.setattr(kbd, "count_running_tasks", lambda conn: 3)
++    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 0)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda sample=None: "ok")
++    budgets = []
++    real_budget = kbd._tick_spawn_budget
++
++    def spy(conn, result, **kwargs):
++        out = real_budget(conn, result, **kwargs)
++        budgets.append((kwargs["max_in_progress"], out, result.at_capacity))
++        return out
++
++    monkeypatch.setattr(kbd, "_tick_spawn_budget", spy)
++    dispatcher.tick_once_for_board("sample")
++    _write_config(home, "kanban:\n  max_in_progress: 2\n")
++    dispatcher.tick_once_for_board("sample")
++
++    assert budgets[0][:2] == (16, (True, 13))
++    assert budgets[-1] == (2, (False, None), "max_in_progress=3/2")
+-- 
+2.55.0
+

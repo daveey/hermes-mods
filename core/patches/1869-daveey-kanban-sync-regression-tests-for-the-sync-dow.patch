@@ -1,0 +1,191 @@
+From 6b0afbba9a7c3aac70463d5810c72655157f5611 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 01:06:20 -0800
+Subject: [PATCH] [daveey] kanban sync: regression tests for the sync-down
+ paths; explicit runs_on refusal carries rejection=sync_not_running
+
+#779 follow-up. Mutants of 4dfb4cc1f02a that survived the schema-guard tests now each fail a test: the
+load_identity start refusal, the mid-loop SchemaAhead give-up, the crash record, heavy work while sync is down
+(machine check + stranded check together), the courier exemption, and record_down keeping since.
+
+Bug found by the courier test: an explicit runs_on create refused while sync is down returned a bare error
+without rejection=sync_not_running (the placement path sets it). kanban_sync_runstate.SyncNotRunning
+(a ValueError) now marks that refusal and kanban_create adds the rejection.
+---
+ hermes_cli/kanban_sync_runstate.py            |  12 +-
+ .../test_kanban_sync_schema_guard.py          | 113 ++++++++++++++++++
+ tools/kanban_tools.py                         |   3 +-
+ 3 files changed, 125 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_runstate.py b/hermes_cli/kanban_sync_runstate.py
+index 4a00112b73f..75d14e65843 100644
+--- a/hermes_cli/kanban_sync_runstate.py
++++ b/hermes_cli/kanban_sync_runstate.py
+@@ -17,11 +17,19 @@ import time
+ from pathlib import Path
+ from typing import Any, Optional
+ 
+-__all__ = ["clear", "describe", "down", "explicit_runs_on", "path", "placement_runs_on", "record_down", "stranded_create"]
++__all__ = [
++    "SyncNotRunning", "clear", "describe", "down", "explicit_runs_on", "path", "placement_runs_on", "record_down",
++    "stranded_create",
++]
+ 
+ _FILE = ".sync-state.json"
+ 
+ 
++class SyncNotRunning(ValueError):
++    """A create refused because its ``runs_on`` row would strand behind the stopped sync (``rejection:
++    sync_not_running``, the same as the placement path)."""
++
++
+ def path() -> Path:
+     """Beside the host's ``.sync.lock`` (one sync loop per host)."""
+     from hermes_cli import kanban_db as kb
+@@ -109,7 +117,7 @@ def explicit_runs_on(conn: Any, value: Any, *, courier: bool = False) -> Optiona
+     labels = wn.explicit_runs_on(conn, value)
+     stranded = stranded_create(labels, courier=courier)
+     if stranded:
+-        raise ValueError(stranded)
++        raise SyncNotRunning(stranded)
+     return labels
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_schema_guard.py b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+index 3a5e2d913c2..e5cb600041b 100644
+--- a/tests/hermes_cli/test_kanban_sync_schema_guard.py
++++ b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+@@ -385,3 +385,116 @@ def test_machine_pin_create_while_sync_is_down_takes_the_gateway_relay(machine_p
+                                                         "requires": [], "placement": "worker-1"}))
+     assert sent == ["worker-1"] and out.get("status") == "queued", out
+     assert _runs_on_rows(pre_rename_live) == []
++
++
++# #779 follow-up: each test below kills a mutant of the sync-down paths that the tests above let survive. [daveey]
++
++def test_sync_start_refused_for_no_identity_is_recorded(kanban_home, pre_rename_live, monkeypatch):
++    """``load_identity`` → ``SyncUnavailable``: the start refusal names the reason (mutant: no record)."""
++    def no_identity():
++        raise ksc.SyncUnavailable("kanban sync has no Board key on this host")
++
++    monkeypatch.setattr(ksc, "load_identity", no_identity)
++    monkeypatch.setattr(ksc, "FeedWatcher", lambda *a, **k: pytest.fail("feed started without an identity"))
++    ksc.run_forever(lambda: True, interval=1)
++    described = _runstate().describe()
++    assert "not starting: kanban sync has no Board key on this host" in described, described
++    assert "not starting: kanban sync has no Board key on this host" in _deferred_tick()
++
++
++def test_mid_loop_schema_ahead_give_up_is_recorded_and_not_overwritten(kanban_home, pre_rename_live, svc,
++                                                                       monkeypatch):
++    """A round that returns ``SchemaAhead`` mid-loop gives the role up; the record says so, not ``stopped``."""
++    from types import SimpleNamespace
++    rounds = []
++    monkeypatch.setattr(ksc, "sync_all_once", lambda hub, boards: rounds.append(boards) or [
++        SimpleNamespace(board=BOARD, error="SchemaAhead: tasks: upstream_new_field", push=None, mode="primary",
++                        pulled=0)])
++    assert _run_sync_loop(kanban_home, svc, monkeypatch, rounds=3) == []  # gave up after the first round
++    assert len(rounds) == 1
++    described = _runstate().describe()
++    assert "gave up the sync role: board default: SchemaAhead: tasks: upstream_new_field" in described, described
++    assert "stopped" not in described
++
++
++def test_sync_loop_crash_is_recorded_and_reraised(kanban_home, pre_rename_live, svc, monkeypatch):
++    boom = RuntimeError("board exploded")
++
++    def crash(hub, boards):
++        raise boom
++
++    monkeypatch.setattr(ksc, "sync_all_once", crash)
++    with pytest.raises(RuntimeError) as err:
++        _run_sync_loop(kanban_home, svc, monkeypatch)
++    assert err.value is boom
++    described = _runstate().describe()
++    assert "crashed: RuntimeError: board exploded" in described, described
++
++
++def _heavy_create(kt, monkeypatch):
++    """A heavy-marker card with no placement on a routeless gateway whose ``heavy_route`` names worker-1."""
++    from hermes_cli import kanban_placement as kp
++    monkeypatch.setattr(kp, "config", lambda: {"heavy_route": {ME: "worker-1"}})
++    return json.loads(kt._handle_create({"title": "Run the pytest regression suite", "assignee": "default",
++                                         "requires": []}))
++
++
++def test_heavy_create_with_sync_running_makes_a_runs_on_row(machine_pin_create, pre_rename_live, monkeypatch):
++    out = _heavy_create(machine_pin_create, monkeypatch)
++    assert out.get("runs_on") == ["machine:worker-1"], out
++    assert len(_runs_on_rows(pre_rename_live)) == 1
++
++
++def test_heavy_create_while_sync_is_down_never_returns_a_runs_on_row(machine_pin_create, pre_rename_live,
++                                                                     monkeypatch):
++    """``decide`` → ``_routeless_heavy`` → ``runs_on=[machine:worker-1]``: both the machine check and the stranded
++    check after ``_local_placement`` must keep that row off a board whose sync is down."""
++    _runstate().record_down("not starting: board default: SchemaAhead(test)")
++    out = _heavy_create(machine_pin_create, monkeypatch)
++    assert _runs_on_rows(pre_rename_live) == [], out
++    assert not out.get("runs_on"), out
++
++
++def _courier_intent():
++    return {"request_id": "request-sync-down-001",
++            "owner": {"gateway": ME, "profile": "default", "board": BOARD},
++            "origin": {"gateway": "origin", "profile": "work", "session": "s_origin"}}
++
++
++def test_courier_runs_on_create_while_sync_is_down_is_created(machine_pin_create, pre_rename_live):
++    """A courier create keeps its own retry, so a stopped sync does not refuse it."""
++    _runstate().record_down("not starting: board default: SchemaAhead(test)")
++    args = {"title": "Summarize public data", "assignee": "default", "requires": [],
++            "runs_on": ["machine:worker-1"]}
++    out = json.loads(machine_pin_create._handle_create(args, origin_intent=_courier_intent()))
++    assert out.get("task_id"), out
++    assert [json.loads(r[1]) for r in _runs_on_rows(pre_rename_live)] == [["machine:worker-1"]], out
++
++
++def test_non_courier_runs_on_create_while_sync_is_down_is_refused(machine_pin_create, pre_rename_live):
++    _runstate().record_down("not starting: board default: SchemaAhead(test)")
++    out = json.loads(machine_pin_create._handle_create({"title": "Summarize public data", "assignee": "default",
++                                                        "requires": [], "runs_on": ["machine:worker-1"]}))
++    assert out.get("rejection") == "sync_not_running", out
++    assert "kanban sync not running since" in out.get("error", ""), out
++    assert _runs_on_rows(pre_rename_live) == []
++
++
++def test_record_down_keeps_since_for_the_same_reason_and_resets_it_for_a_new_one(kanban_home, pre_rename_live,
++                                                                                 monkeypatch):
++    import time as _time
++    rs = _runstate()
++    now = [1000.0]
++    monkeypatch.setattr(_time, "time", lambda: now[0])
++
++    def since():
++        return json.loads(rs.path().read_text())["since"]
++
++    rs.record_down("not starting: board default: SchemaAhead(a)")
++    assert since() == 1000.0
++    now[0] = 2000.0
++    rs.record_down("not starting: board default: SchemaAhead(a)")  # a respun refusal: same reason
++    assert since() == 1000.0
++    now[0] = 3000.0
++    rs.record_down("not starting: board default: SchemaAhead(b)")  # a different reason
++    assert since() == 3000.0
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 4ed3b60c9fe..a15ffe0a091 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1641,7 +1641,8 @@ def _handle_create(args: dict, **kw) -> str:
+         try:
+             runs_on = _runstate.explicit_runs_on(conn, args.get("runs_on"), courier=origin_intent is not None)
+         except ValueError as exc:
+-            return tool_error(str(exc))
++            sync_down = isinstance(exc, _runstate.SyncNotRunning)
++            return tool_error(str(exc), **({"rejection": "sync_not_running"} if sync_down else {}))
+         pinned_machine = None
+         if runs_on is None and origin_intent is None:
+             runs_on = _runstate.placement_runs_on(conn, args.get("placement"))
+-- 
+2.55.0
+

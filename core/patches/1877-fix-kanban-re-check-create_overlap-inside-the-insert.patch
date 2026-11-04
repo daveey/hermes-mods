@@ -1,0 +1,896 @@
+From 0dc7d708252ecff3cb7e314e436b1742c7fb02d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:34:36 +0000
+Subject: [PATCH] fix(kanban): re-check create_overlap inside the insert's
+ write transaction [daveey]
+
+On 11-03 a worker's kanban_create (t_01a19f0a4cc8b092) and ci-main-watch's
+`hermes kanban create` (t_01a19f0a4d82213d) were inserted 186 ms apart and both
+own test_termux_assembly_permissions. The overlap check reads the board outside
+create_task's transaction (and the CLI runs placement/ask checks in between), so
+each process passed it before the other's row existed (#732 "Known limit").
+
+kanban_overlap.check() now returns an AfterCreate whose .guard is passed to
+kb.create_task(insert_guard=...) by the tool, CLI and REST entries. The guard runs
+inside the INSERT's BEGIN IMMEDIATE transaction and re-runs the same match
+(_find, same exemptions and gateway set) against open cards of the target board
+created since the first check began; a hit raises OverlapRefused, which rolls
+the create back, and the entry returns the same create_overlap payload (event
+recorded as before). The first full check (all boards, replica) is unchanged;
+races across boards/gateways stay a documented limit.
+
+Tests: tests/tools/test_kanban_create_overlap_race.py replays the real 11-03 pair
+in two processes (tool + CLI, both orders) held at a barrier after the first
+check: main lands 2 cards, this lands 1 and refuses the other. Cost: median of
+50 non-matching tool creates 16.6-19.0 ms before vs 17.5-19.6 ms after.
+
+To keep code-health caps: _create_session_id split out of _handle_create, and
+_project_branch_name moved to kanban_db_creation.project_branch_name.
+---
+ hermes_cli/kanban.py                          |  26 +-
+ hermes_cli/kanban_db.py                       |  16 +-
+ hermes_cli/kanban_db_creation.py              |  18 ++
+ hermes_cli/kanban_origin_creation.py          |   1 +
+ hermes_cli/kanban_overlap.py                  | 267 +++++++++++++-----
+ plugins/kanban/dashboard/plugin_api.py        |   6 +-
+ .../tools/test_kanban_create_overlap_race.py  | 193 +++++++++++++
+ tools/kanban_tools.py                         |  78 +++--
+ tools/kanban_tools_placement.py               |  21 ++
+ website/docs/user-guide/features/kanban.md    |   9 +
+ 10 files changed, 492 insertions(+), 143 deletions(-)
+ create mode 100644 tests/tools/test_kanban_create_overlap_race.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index f9c210a73db..45b7c19676d 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -413,6 +413,19 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _print_overlap_refusal(args: argparse.Namespace, refused: str) -> int:
++    """Print a ``create_overlap`` refusal (JSON with ``--json``, else a summary on stderr); exit code 2."""
++    if getattr(args, "json", False):
++        print(refused)
++    else:
++        ref = json.loads(refused)
++        print(f"kanban: {ref['code']}: {ref['note']}", file=sys.stderr)
++        for m in ref["matches"]:
++            print(f"  {m['id']}  {m['gateway']}/{m['board']}  ({m['status']})  {m['title']}  — {m['why']}",
++                  file=sys.stderr)
++    return 2
++
++
+ def _cmd_create(args: argparse.Namespace) -> int:
+     from agent.delegation_context import is_dispatcher_owned_worker_context
+ 
+@@ -480,15 +493,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             self_tid=os.environ.get("HERMES_KANBAN_TASK") if in_worker else None,
+             parents=list(args.parent or ()), entry="cli")
+         if refused:
+-            if getattr(args, "json", False):
+-                print(refused)
+-            else:
+-                ref = json.loads(refused)
+-                print(f"kanban: {ref['code']}: {ref['note']}", file=sys.stderr)
+-                for m in ref["matches"]:
+-                    print(f"  {m['id']}  {m['gateway']}/{m['board']}  ({m['status']})  {m['title']}  — {m['why']}",
+-                          file=sys.stderr)
+-            return 2
++            return _print_overlap_refusal(args, refused)
+         from hermes_cli.kanban_db_workspace import WorktreeWorkspaceConfigError
+         from hermes_cli.kanban_capabilities import CapabilityMismatchError
+         from hermes_cli.kanban_pin_provider import PinProviderUnresolvedError
+@@ -532,7 +537,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                                  if in_worker else None),
+                 validate_workspace=True, validate_skills=True, runs_on=getattr(args, "runs_on", None),
+                 placement_policy=cli_policy(args, body, ws_kind, ws_path, board),
++                insert_guard=after_create.guard,  # re-checks overlap under the write lock [daveey]
+             )
++        except kanban_overlap.OverlapRefused as exc:  # landed under the write lock after the first check
++            return _print_overlap_refusal(args, exc.settle())
+         except WorktreeWorkspaceConfigError as exc:
+             return _err(f"kanban: --workspace: {exc}", 2)
+         except (CapabilityMismatchError, UnknownSkillError, RequiresDeclarationMissing, MachinePinRefused,
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e1591b3fbb1..4e697cf45a4 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1227,6 +1227,7 @@ def create_task(
+     requires: Optional[list[str]] = None,
+     lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None, require_declaration: bool = False,
+     placement_policy: Optional[str] = None,
++    insert_guard: Optional[Callable[[sqlite3.Connection], None]] = None,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
+@@ -1236,6 +1237,7 @@ def create_task(
+     ``validate_workspace=True`` (agent/CLI create surfaces) rejects a non-project ``worktree`` workspace
+     that could never resolve at spawn (``WorktreeWorkspaceConfigError``); ``validate_skills=True`` rejects
+     a pinned skill the assignee cannot load (``UnknownSkillError``). [daveey] ``runs_on``: placement labels.
++    ``insert_guard``: see ``kanban_db_creation.run_insert_guard`` (the overlap re-check under the write lock).
+ 
+     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
+     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+@@ -1335,7 +1337,7 @@ def create_task(
+         if board_default:
+             workspace_path = str(board_default)
+ 
+-    from hermes_cli.kanban_db_creation import validate_create_assignment  # [daveey] runs_on-aware
++    from hermes_cli.kanban_db_creation import project_branch_name, run_insert_guard, validate_create_assignment
+     required, model_override, provider_override = validate_create_assignment(
+         conn, assignee, runs_on=runs_on, requires=requires, workspace_kind=workspace_kind, project_id=project_id,
+         workspace_path=workspace_path, skills=skills_list, validate_skills=validate_skills, project_repo=project_repo,
+@@ -1350,6 +1352,7 @@ def create_task(
+             # allow_nested: graph builders compose create_task under one outer
+             # commit so the dispatcher never sees a half-built graph.
+             with write_txn(conn, allow_nested=True):
++                run_insert_guard(conn, insert_guard)
+                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                 # Project worktree: fresh dir under the repo + deterministic
+                 # branch, instead of the random ``wt/<id>`` worker fallback.
+@@ -1357,7 +1360,7 @@ def create_task(
+                     if project_repo and not workspace_path:
+                         workspace_path = os.path.join(project_repo, ".worktrees", task_id)
+                     if not branch_name:
+-                        branch_name = _project_branch_name(project_obj, task_id, title)
++                        branch_name = project_branch_name(project_obj, task_id, title)
+ 
+                 conn.execute(
+                     """
+@@ -1407,15 +1410,6 @@ def _board_meta_for(board: Optional[str]) -> dict:
+     return read_board_metadata(board if board else get_current_board())
+ 
+ 
+-def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -> Optional[str]:
+-    from hermes_cli import projects_db as _pdb
+-
+-    try:
+-        return _pdb.branch_name_for(project_obj, task_id, title=title or "")
+-    except Exception:
+-        return None
+-
+-
+ def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+     conn.execute(
+         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index e06af52dbac..be5b7cf16f0 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -91,3 +91,21 @@ def validate_create_assignment(conn, assignee, *, runs_on, requires, workspace_k
+     # Bind a provider-less concrete pin now (or refuse), never late-bind it to config at spawn.
+     model, provider = resolve_pin_provider(model, provider, assignee=assignee)
+     return required, model, provider
++
++
++def run_insert_guard(conn, guard) -> None:
++    """Run ``create_task(insert_guard=...)`` inside the INSERT's write transaction, before the row exists. The
++    guard raises to roll the create back: ``kanban_overlap.AfterCreate.guard`` re-runs the overlap match under the
++    board's write lock, so a concurrent create that passed the same first check is refused. [daveey]"""
++    if guard is not None:
++        guard(conn)
++
++
++def project_branch_name(project_obj, task_id: str, title) -> "str | None":
++    """A project worktree card's deterministic branch (moved from ``kanban_db``)."""
++    from hermes_cli import projects_db as _pdb
++
++    try:
++        return _pdb.branch_name_for(project_obj, task_id, title=title or "")
++    except Exception:  # health: allow BLE001 -- moved unchanged from kanban_db; no branch = worker wt/<id> fallback
++        return None
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 7cf90342dd4..02f1709f232 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -57,6 +57,7 @@ def create_with_origin(conn, intent: dict, options: dict) -> str:
+         raise OriginError("origin_creation_invalid", "invalid owner/origin creation intent") from None
+ 
+     options = dict(options)
++    options.pop("insert_guard", None)  # a courier create was overlap-checked on the gateway that asked for it
+     # The sender gated its own declaration; kept out of the stored envelope so an intent recorded
+     # before the option existed still matches on retry. [daveey]
+     options.pop("require_declaration", None)
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index 759b152dd1d..6c8d9fb8110 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -36,6 +36,10 @@ revision, or another work role, :func:`work_role`: implement vs measure vs deliv
+ ticket number alone is not a different target). Admitted look-alikes
+ are logged. Each card counts once per gateway. A missing or unreadable replica is skipped and logged, never a block.
+ ``kanban.create_overlap_check: false`` turns the check off.
++
++Concurrent creates (11-03, two owners of one failure inserted 186 ms apart): this full check reads outside the
++INSERT's transaction, so :class:`AfterCreate` re-runs the match inside it (``create_task(insert_guard=...)``) against
++open cards of the target board created since the check began. Other boards and gateways stay a documented race.
+ """
+ 
+ from __future__ import annotations
+@@ -512,34 +516,47 @@ def _board_files() -> Iterable[tuple[str, Path]]:
+         yield owner.get(key) or (pinned if key != real(kb.board_own_db_path(slug)) else slug), path
+ 
+ 
++def _board_cards(c: sqlite3.Connection, slug: str, self_gw: Optional[str], *,
++                 since: Optional[tuple[int, int]] = None) -> list[dict]:
++    """Open cards of the board ``c`` reads, as :func:`find` compares them. ``since`` (``(rowid, epoch seconds)``)
++    keeps only cards inserted after that rowid or created at or after that time: the in-transaction re-check
++    reads just what landed since the first check. The rowid is exact: ``created_at`` is stamped before
++    ``create_task`` waits for the write lock, so a slow concurrent create can commit a row older than the check."""
++    marks = ",".join("?" * len(OPEN))
++    newer = " AND (t.rowid > ? OR t.created_at >= ?)" if since is not None else ""
++    rows = c.execute(
++        "SELECT t.id, t.title, t.body, t.status, t.session_id, (SELECT json_extract(e.payload, "
++        "'$.creator_task_id') FROM task_events e WHERE e.task_id = t.id AND e.kind = 'created' "
++        f"LIMIT 1), t.idempotency_key FROM tasks t WHERE t.status IN ({marks}){newer}",
++        (*OPEN, *(since or ()))).fetchall()
++    if not rows:
++        return []
++    try:
++        links = c.execute("SELECT task_id, chat_session FROM task_chat_links WHERE released = 0").fetchall()
++    except sqlite3.OperationalError:
++        links = []
++    chats: dict[str, set[str]] = {}
++    for tid, sess in links:
++        chats.setdefault(tid, set()).add(sess)
++    return [{"id": tid, "board": slug, "gateway": self_gw or "local", "status": status, "title": title,
++             "body": body or "",
++             "session_id": sess, "creator_task_id": creator, "local": True, "key_family": key_family(key),
++             "chats": sorted(chats.get(tid, set()) | ({sess} if sess else set()))}
++            for tid, title, body, status, sess, creator, key in rows]
++
++
+ def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
+     from hermes_cli.kanban_session_activity import cached_ro
+-    marks = ",".join("?" * len(OPEN))
+     for slug, path in _board_files():
+         if not path.exists():
+             continue
+         try:
+             with cached_ro(path) as c:
+-                rows = c.execute(
+-                    "SELECT t.id, t.title, t.body, t.status, t.session_id, (SELECT json_extract(e.payload, "
+-                    "'$.creator_task_id') FROM task_events e WHERE e.task_id = t.id AND e.kind = 'created' "
+-                    f"LIMIT 1), t.idempotency_key FROM tasks t WHERE t.status IN ({marks})", OPEN).fetchall()
+-                try:
+-                    links = c.execute("SELECT task_id, chat_session FROM task_chat_links WHERE released = 0"
+-                                      ).fetchall()
+-                except sqlite3.OperationalError:
+-                    links = []
++                cards = _board_cards(c, slug, self_gw)
+         except sqlite3.Error as exc:
+             _log.warning("kanban create overlap: board %s unreadable, skipped (%s)", slug, exc)
+             continue
+-        chats: dict[str, set[str]] = {}
+-        for tid, sess in links:
+-            chats.setdefault(tid, set()).add(sess)
+-        for tid, title, body, status, sess, creator, key in rows:
+-            yield {"id": tid, "board": slug, "gateway": self_gw or "local", "status": status, "title": title,
+-                   "body": body or "",
+-                   "session_id": sess, "creator_task_id": creator, "local": True, "key_family": key_family(key),
+-                   "chats": sorted(chats.get(tid, set()) | ({sess} if sess else set()))}
++        yield from cards
+ 
+ 
+ def _replica_cards(self_gw: Optional[str]) -> Iterable[dict]:
+@@ -622,55 +639,66 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+     card's idempotency-key family) skips cards from the same keyed creator, except singleton jobs."""
+     try:
+         from hermes_cli import kanban_capability_registry as reg
+-        self_gw = reg.self_gateway()
+-        skip = set(parents) | ({self_tid} if self_tid else set())
+-        waiting = capability_owner_waiting_id(title, body)
+-        new_words = words(title)
+-        job = singleton_job(title)
+-        failure = failure_identity(title, body)
+-        out, seen, mine = [], set(), None
++        return _find(title=title, body=body, target_board=target_board, session_id=session_id, self_tid=self_tid,
++                     parents=parents, family=family, self_gw=reg.self_gateway())[0]
++    except Exception:  # health: allow BLE001 -- a broken check must never block creating a card
++        _log.warning("kanban create overlap check failed; creating without it", exc_info=True)
++        return []
++
++
++def _find(*, title: str, body: str, target_board: str, session_id: Optional[str], self_tid: Optional[str],
++          parents: Iterable[str], family: Optional[str] = None, self_gw: Optional[str] = None,
++          cards: Optional[list[dict]] = None, gateways: Optional[set[str]] = None) -> tuple[list[dict], set[str]]:
++    """:func:`find` over ``cards`` (default: every local board and the replica) -> ``(matches, gateways)``.
++    ``gateways`` (default: those the cards name) feeds the board-reference and host rules; the in-transaction
++    re-check passes the first check's set so both reads judge a card the same way. Raises on a broken read."""
++    skip = set(parents) | ({self_tid} if self_tid else set())
++    waiting = capability_owner_waiting_id(title, body)
++    new_words = words(title)
++    job = singleton_job(title)
++    failure = failure_identity(title, body)
++    out, seen, mine = [], set(), None
++    if cards is None:
+         cards = [*_local_cards(self_gw), *_replica_cards(self_gw)]
++    if gateways is None:
+         gateways = {g for g in (self_gw, *(c["gateway"] for c in cards)) if g}
+         if gateways & {"hub", "hermes-hub"}:
+             gateways |= {"hub", "hermes-hub"}
+-        for card in cards:
+-            singleton = bool(job and job == singleton_job(card.get("title") or ""))
+-            if (card["gateway"], card["id"]) in seen:
+-                continue
+-            # The capability owner executes this exact waiting card, even for a singleton.
+-            # Keep other mirror owners visible; do not exempt a whole family or envelope.
+-            if card["id"] == waiting:
+-                continue
+-            if not singleton and (card["id"] in skip
+-                    or (waiting and _sibling_owner(card.get("title") or "", waiting))
+-                    or (session_id and card["session_id"] == session_id)
+-                    or (self_tid and card["creator_task_id"] == self_tid)
+-                    or (family and card.get("key_family") == family)):
+-                continue
+-            seen.add((card["gateway"], card["id"]))
+-            reasons, score = _reasons(card, new_words, title, body, target_board, gateways, failure)
+-            if not reasons:
+-                continue
+-            if mine is None:
+-                mine = _identity(title, body, gateways)
+-            admit = (f"waits on {card['id']}" if waits_on(card["id"], title, body)
+-                     else f"recovers {card['id']}" if recovers(card["id"], title, card.get("title") or "")
+-                     # A failure-only match the new card cites by id was written knowing that owner.
+-                     else f"cites {card['id']}" if (all(_failure_reason(r) for r in reasons)
+-                                                    and cites(card["id"], title, body))
+-                     else _distinct(mine, _identity(card.get("title") or "", card.get("body") or "", gateways)))
+-            if admit and not singleton:
+-                # Logged so an audit can tell an admitted look-alike from a missed one.
+-                _log.info("kanban create overlap: admitted %r despite %s/%s/%s (%s): %s", title, card["gateway"],
+-                          card["board"], card["id"], "; ".join(reasons), admit)
+-            else:
+-                out.append({**{k: card[k] for k in ("id", "board", "gateway", "status", "title", "chats")},
+-                            "why": "; ".join(reasons), "_score": score, "_local": card["local"]})
+-        out.sort(key=lambda m: (-m["_score"], m["status"] not in ("running", "ready", "scheduled"), m["id"]))
+-        return out
+-    except Exception:  # health: allow BLE001 -- a broken check must never block creating a card
+-        _log.warning("kanban create overlap check failed; creating without it", exc_info=True)
+-        return []
++    for card in cards:
++        singleton = bool(job and job == singleton_job(card.get("title") or ""))
++        if (card["gateway"], card["id"]) in seen:
++            continue
++        # The capability owner executes this exact waiting card, even for a singleton.
++        # Keep other mirror owners visible; do not exempt a whole family or envelope.
++        if card["id"] == waiting:
++            continue
++        if not singleton and (card["id"] in skip
++                or (waiting and _sibling_owner(card.get("title") or "", waiting))
++                or (session_id and card["session_id"] == session_id)
++                or (self_tid and card["creator_task_id"] == self_tid)
++                or (family and card.get("key_family") == family)):
++            continue
++        seen.add((card["gateway"], card["id"]))
++        reasons, score = _reasons(card, new_words, title, body, target_board, gateways, failure)
++        if not reasons:
++            continue
++        if mine is None:
++            mine = _identity(title, body, gateways)
++        admit = (f"waits on {card['id']}" if waits_on(card["id"], title, body)
++                 else f"recovers {card['id']}" if recovers(card["id"], title, card.get("title") or "")
++                 # A failure-only match the new card cites by id was written knowing that owner.
++                 else f"cites {card['id']}" if (all(_failure_reason(r) for r in reasons)
++                                                and cites(card["id"], title, body))
++                 else _distinct(mine, _identity(card.get("title") or "", card.get("body") or "", gateways)))
++        if admit and not singleton:
++            # Logged so an audit can tell an admitted look-alike from a missed one.
++            _log.info("kanban create overlap: admitted %r despite %s/%s/%s (%s): %s", title, card["gateway"],
++                      card["board"], card["id"], "; ".join(reasons), admit)
++        else:
++            out.append({**{k: card[k] for k in ("id", "board", "gateway", "status", "title", "chats")},
++                        "why": "; ".join(reasons), "_score": score, "_local": card["local"]})
++    out.sort(key=lambda m: (-m["_score"], m["status"] not in ("running", "ready", "scheduled"), m["id"]))
++    return out, gateways
+ 
+ 
+ def public(matches: list[dict]) -> list[dict]:
+@@ -748,34 +776,121 @@ def record(conn: Optional[sqlite3.Connection], task_id: Optional[str], *, outcom
+         _log.warning("kanban create overlap: could not record the %s event", outcome, exc_info=True)
+ 
+ 
+-def _no_override(conn: sqlite3.Connection, task_id: str) -> None:
+-    return None
++class OverlapRefused(Exception):
++    """The in-transaction re-check found an open card that landed after the first check: the create rolls back.
++
++    The entry catches it outside the rolled-back transaction and calls :meth:`settle`, which records the
++    ``create_overlap`` event and returns the same refusal JSON the first check returns."""
++
++    def __init__(self, settle: Callable[[], str]):
++        super().__init__(EVENT)
++        self.settle = settle
++
++
++class AfterCreate:
++    """``after_create(conn, new_task_id)`` records an accepted ``distinct_from`` override on the new card (a no-op
++    when nothing overlapped). :attr:`guard` (None when the check did not run) goes to ``kb.create_task(...,
++    insert_guard=...)``: it re-runs the match inside the INSERT's ``BEGIN IMMEDIATE`` transaction, against open
++    cards of that board created since the first check began, and raises :class:`OverlapRefused` on a hit.
++
++    Two creates of one failure that both passed the first check before either inserted (11-03: a worker's
++    ``kanban_create`` and ci-main-watch's ``hermes kanban create``, 186 ms apart) serialize on the board's write
++    lock, so the second one sees the first one's row here. Only this board is re-read under the lock: a card that
++    lands on another board or gateway in the same window is still a documented race."""
++
++    def __init__(self, conn: Optional[sqlite3.Connection] = None, *, since: Optional[tuple[int, int]] = None,
++                 board: str = "", title: str = "", body: str = "", target_board: str = "",
++                 session_id: Optional[str] = None,
++                 self_tid: Optional[str] = None, parents: Iterable[str] = (), family: Optional[str] = None,
++                 self_gw: Optional[str] = None, gateways: Optional[set[str]] = None, matches: Iterable[dict] = (),
++                 distinct: Iterable[str] = (), reason: str = "", own: bool = False, entry: str = "tool"):
++        self._conn, self._since, self._board, self._title, self._body = conn, since, board, title, body
++        self._find_kw = {"title": title, "body": body, "target_board": target_board, "session_id": session_id,
++                         "self_tid": self_tid, "parents": list(parents), "family": family, "self_gw": self_gw}
++        self._gateways, self._matches = gateways, list(matches)
++        self._distinct, self._reason, self._own, self._entry = list(distinct), reason, own, entry
++        self._session_id, self._self_tid = session_id, self_tid
++
++    def __call__(self, conn: sqlite3.Connection, task_id: str) -> None:
++        if self._matches:
++            record(conn, task_id, outcome="override", title=self._title, matches=self._matches,
++                   reason=self._reason, session_id=self._session_id)
++
++    @property
++    def guard(self) -> Optional[Callable[[sqlite3.Connection], None]]:
++        return self._recheck if self._since is not None else None
++
++    def _recheck(self, conn: sqlite3.Connection) -> None:
++        try:
++            cards = _board_cards(conn, self._board, self._find_kw["self_gw"], since=self._since)
++            matches = _find(**self._find_kw, cards=cards, gateways=self._gateways)[0] if cards else []
++        except Exception:  # health: allow BLE001 -- a broken re-check must never block creating a card
++            _log.warning("kanban create overlap: in-transaction re-check failed; creating without it", exc_info=True)
++            return
++        known = {m["id"] for m in self._matches}
++        fresh = [m for m in matches if m["id"] not in known]
++        if not fresh:
++            return
++        if covered(fresh, self._distinct, self._reason):
++            self._matches += fresh
++            return
++        _log.info("kanban create overlap: %r refused under the write lock: %s landed after the first check",
++                  self._title, ", ".join(m["id"] for m in fresh))
++
++        def settle() -> str:
++            record(self._conn if self._own else None, self._self_tid, outcome="refused", title=self._title,
++                   matches=fresh, session_id=self._session_id)
++            return json.dumps(refusal(fresh, self._distinct, self._reason, self._entry))
++
++        raise OverlapRefused(settle)
++
++
++_no_override = AfterCreate()
+ 
+ 
+ def check(conn: sqlite3.Connection, args: dict, *, courier: bool, title: str, session_id: Optional[str],
+           self_tid: Optional[str], parents: list[str], entry: str = "tool",
+-          ) -> tuple[Optional[str], Callable[[sqlite3.Connection, str], None]]:
+-    """``(refusal_json, _)`` stops the create; otherwise ``(None, after_create)``, where ``after_create(conn,
+-    new_task_id)`` records an accepted ``distinct_from`` override on the new card (a no-op when nothing
+-    overlapped). A courier-applied card (``courier``) was already checked on the gateway that asked for it.
+-    ``entry`` (tool | cli | rest) only words the refusal's retry hint for the caller's entry path."""
++          ) -> tuple[Optional[str], AfterCreate]:
++    """``(refusal_json, _)`` stops the create; otherwise ``(None, after_create)`` (:class:`AfterCreate`): pass
++    ``after_create.guard`` as ``kb.create_task(insert_guard=...)`` and call ``after_create(conn, new_task_id)``
++    once the card exists. A courier-applied card (``courier``) was already checked on the gateway that asked for
++    it. ``entry`` (tool | cli | rest) only words the refusal's retry hint for the caller's entry path."""
++    import time
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_capability_registry as reg
+     if courier or not enabled():
+         return None, _no_override
+     key = args.get("idempotency_key")
+     if key and conn.execute("SELECT 1 FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
+                             (key,)).fetchone():
+         return None, _no_override  # a retry returns the existing card; nothing new is created
++    # A card another process inserts from here on is invisible to this read; the guard re-reads them under the
++    # write lock (rowid watermark; the time, one second earlier as ``created_at`` is whole seconds, also catches a
++    # row whose rowid was reused after a delete).
++    since = (conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM tasks").fetchone()[0], int(time.time()) - 1)
+     distinct = [str(x) for x in (args.get("distinct_from") or [])]
+     reason = str(args.get("distinct_reason") or "")
+-    matches = find(title=title, body=str(args.get("body") or ""), target_board=args.get("board") or kb.DEFAULT_BOARD,
+-                   session_id=session_id, self_tid=self_tid, parents=parents, family=key_family(key))
+-    if not matches:
++    body = str(args.get("body") or "")
++    target_board = args.get("board") or kb.DEFAULT_BOARD
++    own = bool(self_tid) and not args.get("board")  # the creator's card is on the board this call opened
++    find_kw = {"title": title, "body": body, "target_board": target_board, "session_id": session_id,
++               "self_tid": self_tid, "parents": parents, "family": key_family(key)}
++    try:
++        self_gw = reg.self_gateway()
++        matches, gateways = _find(**find_kw, self_gw=self_gw)
++    except Exception:  # health: allow BLE001 -- a broken check must never block creating a card
++        _log.warning("kanban create overlap check failed; creating without it", exc_info=True)
+         return None, _no_override
++    # The board ``conn`` is (the tool opens the current board when none is named), labelled as the first read
++    # labels it, so both reads judge a card and record its event the same way.
++    board = args.get("board") or kb.get_current_board()
++    pending = AfterCreate(conn, since=since, board=board, **find_kw, self_gw=self_gw, gateways=gateways, distinct=distinct,
++                          reason=reason, own=own, entry=entry)
++    if not matches:
++        return None, pending
+     if covered(matches, distinct, reason):
+-        return None, lambda c, tid: record(c, tid, outcome="override", title=title, matches=matches,
+-                                           reason=reason, session_id=session_id)
+-    own = bool(self_tid) and not args.get("board")  # the creator's card is on the board this call opened
++        pending._matches = list(matches)
++        return None, pending
+     record(conn if own else None, self_tid, outcome="refused", title=title, matches=matches,
+            session_id=session_id)
+     return json.dumps(refusal(matches, distinct, reason, entry)), _no_override
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 482fdcebab0..219cdc04b2d 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -465,7 +465,11 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+             raise HTTPException(status_code=409, detail=json.loads(refused))
+         from plugins.kanban.dashboard.plugin_api_human_request import check_create_ask
+         check_create_ask(conn, payload)
+-        task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **fields)
++        try:  # the guard re-checks overlap under the write lock [daveey]
++            task_id = kanban_db.create_task(conn, created_by="dashboard", board=board,
++                                            insert_guard=after_create.guard, **fields)
++        except kanban_overlap.OverlapRefused as exc:
++            raise HTTPException(status_code=409, detail=json.loads(exc.settle()))
+         after_create(conn, task_id)
+         task = kanban_db.get_task(conn, task_id)
+         body: dict[str, Any] = {"task": _task_dict(
+diff --git a/tests/tools/test_kanban_create_overlap_race.py b/tests/tools/test_kanban_create_overlap_race.py
+new file mode 100644
+index 00000000000..c9683412a4f
+--- /dev/null
++++ b/tests/tools/test_kanban_create_overlap_race.py
+@@ -0,0 +1,193 @@
++"""Two concurrent creates of one failure: the insert re-checks overlap inside its write transaction. [daveey]
++
++Incident (2026-11-03): t_01a19f0a4cc8b092 (a worker's ``kanban_create`` tool call) and t_01a19f0a4d82213d
++(ci-main-watch's ``hermes kanban create`` subprocess) were inserted 186 ms apart and both own
++``test_termux_assembly_permissions``. Each process ran the overlap check before the other's row existed, so both
++passed it. The replay below runs the real pair (``kanban_overlap_failure_cases.json``) through the real tool and CLI
++entries in two processes, holds both at a barrier after the first check, then lets one insert while the other waits
++on the board's write lock. Exactly one card may land; the other must get the ``create_overlap`` refusal.
++"""
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_overlap as ko
++from tests.tools import test_kanban_create_overlap as helpers
++
++home = helpers.home
++
++REPO = Path(__file__).resolve().parents[2]
++CASES = json.loads((Path(__file__).with_name("kanban_overlap_failure_cases.json")).read_text(encoding="utf-8"))
++CMW_1103, WORKER_1103 = "t_01a19f0a4d82213d", "t_01a19f0a4cc8b092"
++
++# One create process. It runs its entry path unchanged except for two hooks. ``kb.create_task`` (called after the
++# entry's overlap check) waits until both processes reached it. The first process then signals from inside its write
++# transaction (``initial_task_state`` runs under BEGIN IMMEDIATE, before the INSERT), and the second process only
++# calls the real ``create_task`` after that signal, so it blocks on the write lock until the first commits.
++RUNNER = textwrap.dedent("""
++    import json, os, sys, threading
++    from pathlib import Path
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_graph as graph
++
++    sync, role, entry, case_file, cid = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
++    case = json.loads(Path(case_file).read_text(encoding="utf-8"))[cid]
++    tick = threading.Event()
++
++    def wait_for(*names):
++        for _ in range(3000):  # 60 s
++            if all((sync / n).exists() for n in names):
++                return
++            tick.wait(0.02)
++        raise SystemExit(f"barrier timeout waiting for {names}")
++
++    real_create, real_state = kb.create_task, graph.initial_task_state
++
++    def create_task(conn, **kw):
++        (sync / f"{role}.checked").touch()
++        wait_for("first.checked", "second.checked")  # both passed the first check, neither inserted
++        if role == "second":
++            wait_for("first.locked")  # the first holds the write lock; this create queues behind it
++        return real_create(conn, **kw)
++
++    def initial_task_state(conn, *a, **kw):
++        if role == "first":
++            (sync / "first.locked").touch()
++        return real_state(conn, *a, **kw)
++
++    kb.create_task, graph.initial_task_state = create_task, initial_task_state
++    if entry == "tool":
++        from tools import kanban_tools as kt
++        print(kt._handle_create({"title": case["title"], "body": case["body"], "assignee": "default",
++                                 "requires": [], "idempotency_key": case["key"]}))
++    else:
++        from hermes_cli import kanban as kc
++        from hermes_cli.main import main
++        kc._check_dispatcher_presence = lambda **kw: (True, "")
++        sys.argv = ["hermes", "kanban", "create", case["title"], "--body", case["body"], "--assignee", "default",
++                    "--idempotency-key", case["key"], "--json"]
++        try:
++            main()
++        except SystemExit as exc:
++            sys.exit(exc.code)
++""")
++
++
++def _spawn(tmp_path, sync, role, entry, cid):
++    env = {**os.environ, "HERMES_HOME": os.environ["HERMES_HOME"], "HERMES_HUB_STATE": str(tmp_path / "hub-state"),
++           "PYTHONPATH": os.pathsep.join([str(REPO), os.environ.get("PYTHONPATH", "")]),
++           "HERMES_SESSION_ID": f"chat-{entry}-{cid}"}
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
++        env.pop(var, None)
++    runner = tmp_path / "race_runner.py"
++    runner.write_text(RUNNER, encoding="utf-8")
++    cases = Path(__file__).with_name("kanban_overlap_failure_cases.json")
++    return subprocess.Popen([sys.executable, str(runner), str(sync), role, entry, str(cases), cid], cwd=str(REPO),
++                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++
++
++def _open_ids() -> list[str]:
++    with kbc.connect_closing() as conn:
++        return [r["id"] for r in conn.execute(
++            f"SELECT id FROM tasks WHERE status IN ({','.join('?' * len(ko.OPEN))})", ko.OPEN)]
++
++
++def _refusal(out: str) -> dict | None:
++    for line in [*out.splitlines()[::-1], out]:
++        try:
++            got = json.loads(line)
++        except ValueError:
++            continue
++        if isinstance(got, dict) and got.get("code") == ko.EVENT:
++            return got
++    return None
++
++
++# The real incident: the worker's card through the tool, ci-main-watch's through the CLI. Either may win the lock.
++@pytest.mark.parametrize("first,second", [(("tool", WORKER_1103), ("cli", CMW_1103)),
++                                          (("cli", CMW_1103), ("tool", WORKER_1103))],
++                         ids=["tool-inserts-cli-refused", "cli-inserts-tool-refused"])
++def test_concurrent_pair_lands_one_card_and_one_refusal(home, tmp_path, first, second):
++    sync = tmp_path / "sync"
++    sync.mkdir()
++    procs = {"first": _spawn(tmp_path, sync, "first", *first), "second": _spawn(tmp_path, sync, "second", *second)}
++    outs = {}
++    for role, proc in procs.items():
++        out, err = proc.communicate(timeout=180)
++        outs[role] = (proc.returncode, out, err)
++    assert all((sync / f"{r}.checked").exists() for r in procs), outs  # both passed the first check
++    landed = _open_ids()
++    assert len(landed) == 1, (landed, outs)
++    rc, out, err = outs["second"]
++    refusal = _refusal(out)
++    assert refusal is not None, outs["second"]
++    assert [m["id"] for m in refusal["matches"]] == landed, refusal
++    assert refusal["matches"][0]["why"].startswith("same failing test "), refusal
++    if second[0] == "cli":
++        assert rc == 2, outs["second"]
++    assert outs["first"][0] == 0 and landed[0] in outs["first"][1], outs["first"]
++
++
++# REST shares the guard: a competing create that commits between the REST check and its insert is refused. A
++# competing row stamped ``created_at`` before the check began (its create waited on the write lock for seconds) is
++# still re-read: the guard keys on the rowid, not only the time.
++@pytest.mark.parametrize("stamped_early_s", [0, 30])
++def test_rest_insert_rechecks_inside_its_transaction(home, monkeypatch, stamped_early_s):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from plugins.kanban.dashboard.plugin_api import router
++    first, second = CASES[WORKER_1103], CASES[CMW_1103]
++    real, raced = kb.create_task, []
++
++    def create_task(conn, **kw):
++        with kbc.connect_closing() as other:  # another process's create lands after this request's first check
++            raced.append(real(other, title=first["title"], body=first["body"], assignee="default",
++                              session_id="other-chat", idempotency_key=first["key"]))
++            other.execute("UPDATE tasks SET created_at = created_at - ? WHERE id = ?", (stamped_early_s, raced[-1]))
++            other.commit()
++        return real(conn, **kw)
++
++    monkeypatch.setattr(kb, "create_task", create_task)
++    app = FastAPI()
++    app.include_router(router)
++    with TestClient(app) as client:
++        r = client.post("/tasks", json={"title": second["title"], "body": second["body"], "assignee": "default",
++                                        "idempotency_key": second["key"]})
++    assert r.status_code == 409, r.text
++    detail = r.json().get("detail")
++    assert detail["code"] == ko.EVENT and [m["id"] for m in detail["matches"]] == raced
++    assert _open_ids() == raced
++
++
++def test_recheck_reads_only_cards_created_since_the_first_check(home, monkeypatch):
++    """An old open look-alike that the first check admitted (distinct_from) is not re-read under the lock."""
++    old = CASES[WORKER_1103]
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title=old["title"], body=old["body"], assignee="default", session_id="old-chat")
++        conn.execute("UPDATE tasks SET created_at = created_at - 3600 WHERE id = ?", (tid,))
++        conn.commit()
++    new = CASES[CMW_1103]
++    with kbc.connect_closing() as conn:
++        refused, after = ko.check(conn, {"body": new["body"], "distinct_from": [tid], "distinct_reason": "separate"},
++                                  courier=False, title=new["title"], session_id="new-chat", self_tid=None, parents=[])
++        assert refused is None
++        seen, real = [], ko._board_cards
++
++        def spy(c, slug, self_gw, *, since=None):
++            cards = real(c, slug, self_gw, since=since)
++            seen.append((since, [x["id"] for x in cards]))
++            return cards
++
++        monkeypatch.setattr(ko, "_board_cards", spy)
++        new_tid = kb.create_task(conn, title=new["title"], body=new["body"], assignee="default",
++                                 session_id="new-chat", insert_guard=after.guard)
++    assert new_tid and len(seen) == 1 and seen[0][0] is not None and seen[0][1] == [], seen
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index a15ffe0a091..b4bea973898 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -22,7 +22,7 @@ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+-                                          _placement_origin, _placement_refused, _runs_where)
++                                          _create_session_id, _placement_origin, _placement_refused, _runs_where)
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_park_args import _blocker_id_arg, _clear_blocker_arg, _blocker_scope_args, _park_guard
+ from hermes_cli.kanban_ask_resolved import ask_checks, create_ask_check, filing_context
+@@ -1608,28 +1608,10 @@ def _handle_create(args: dict, **kw) -> str:
+                    "If a human really can act now despite the unfinished parents, set "
+                    "human_action_now=true and explain that present action in body. Nothing changed.",
+                    rejection="invalid_args")
+-        from gateway.session_context import get_session_env
+-        from tools.async_delegation import _current_origin_session_id
+         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
+                     if origin_intent is None and _is_dispatcher_owned_worker() else None)
+         self_task = kb.get_task(conn, self_tid) if self_tid else None
+-        # The worker/API runtime may be transient; the owning task's origin is durable.
+-        # The ambient id is the request-scoped ContextVar binding, not the process-global
+-        # os.environ: in a multi-session gateway the env holds the LAST agent built, and an
+-        # id that never reached its ``sessions`` row is provenance pointing at nothing.
+-        if origin_intent is not None:
+-            # Courier retries use only their durable envelope, never the receiving
+-            # process's current session/tenant/project. Creator provenance remains
+-            # unchanged even if its session is compressed or subsequently removed.
+-            session_id = args.get("session_id")
+-        else:
+-            session_id = (_persisted_session_id(args.get("session_id"))
+-                          # The parent card's session too: a card placed from another gateway carries
+-                          # a placeholder (or a chat that lives elsewhere), and handing that on as a
+-                          # child's origin made the owner's bind fail (kanban-69709bcf16). [daveey]
+-                          or _persisted_session_id(self_task.session_id if self_task else None)
+-                          or _persisted_session_id(_current_origin_session_id())
+-                          or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
++        session_id = _create_session_id(args, origin_intent, self_task)
+         if project_id is None and workspace_kind is None and workspace_path is None:
+             if self_task is not None and self_task.project_id:
+                 project_id, project_source_task_id = self_task.project_id, self_task.id
+@@ -1674,32 +1656,36 @@ def _handle_create(args: dict, **kw) -> str:
+             _pin = _kp.explicit_foreign_pin(args, _reg.self_gateway())
+             if _pin:
+                 return _placement_refused(_pin, "an origin-bound card is created on this gateway")
+-        new_tid = kb.create_task(
+-            conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+-            parents=tuple(parents), tenant=(args.get("tenant") if origin_intent is not None
+-                                           else args.get("tenant") or os.environ.get("HERMES_TENANT")),
+-            priority=_opt_int(args.get("priority"), 0),
+-            workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
+-            # Board-project inheritance must read the board this call opened, not the
+-            # session's current board.
+-            board=args.get("board"),
+-            project_source_task_id=project_source_task_id, triage=triage,
+-            creator_task_id=self_tid,
+-            idempotency_key=args.get("idempotency_key"),
+-            max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+-            requires=args.get("requires"), runs_on=runs_on, max_retries=max_retries,
+-            placement_policy=(marker_placement or {}).get("placement_policy"),
+-            require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
+-            model_override=model_override, provider_override=provider_override,
+-            goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+-            completion_contract=args.get("completion_contract"),
+-            initial_status=str(args.get("initial_status") or "running"),
+-            human_request=kb.redact_review_value(args.get("human_request")),
+-            created_by=_persisted_identity(), session_id=session_id,
+-            origin_intent=origin_intent, chat_origin=origin.ref if origin else args.get("origin_session"),
+-            # Reject a worktree path the dispatcher could never resolve now, to the
+-            # creator, instead of burning spawn retries on it later. [daveey]
+-            validate_workspace=True, validate_skills=True)
++        try:
++            new_tid = kb.create_task(
++                conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
++                parents=tuple(parents), tenant=(args.get("tenant") if origin_intent is not None
++                                               else args.get("tenant") or os.environ.get("HERMES_TENANT")),
++                priority=_opt_int(args.get("priority"), 0),
++                workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
++                # Board-project inheritance must read the board this call opened, not the
++                # session's current board.
++                board=args.get("board"),
++                project_source_task_id=project_source_task_id, triage=triage,
++                creator_task_id=self_tid,
++                idempotency_key=args.get("idempotency_key"),
++                max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
++                requires=args.get("requires"), runs_on=runs_on, max_retries=max_retries,
++                placement_policy=(marker_placement or {}).get("placement_policy"),
++                require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
++                model_override=model_override, provider_override=provider_override,
++                goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
++                completion_contract=args.get("completion_contract"),
++                initial_status=str(args.get("initial_status") or "running"),
++                human_request=kb.redact_review_value(args.get("human_request")),
++                created_by=_persisted_identity(), session_id=session_id,
++                origin_intent=origin_intent, chat_origin=origin.ref if origin else args.get("origin_session"),
++                # Reject a worktree path the dispatcher could never resolve now, to the
++                # creator, instead of burning spawn retries on it later. [daveey]
++                validate_workspace=True, validate_skills=True,
++                insert_guard=after_create.guard)  # re-checks overlap under the write lock [daveey]
++        except kanban_overlap.OverlapRefused as exc:  # landed under the write lock after the first check
++            return exc.settle()
+         landed = _fields(kb.get_task(conn, new_tid), _ca.CREATED_FIELDS)
+         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index b342c072ee6..f200e5ca91f 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -149,3 +149,24 @@ def _runs_where(runs_on, pinned_machine, marker_placement) -> str:
+     except Exception:
+         gw = None
+     return f"here ({gw})" if gw else "here"
++
++
++def _create_session_id(args: dict, origin_intent: Optional[dict], self_task) -> Optional[str]:
++    """The new card's session. The worker/API runtime may be transient; the owning task's origin is durable.
++    The ambient id is the request-scoped ContextVar binding, not the process-global os.environ: in a
++    multi-session gateway the env holds the LAST agent built, and an id that never reached its ``sessions``
++    row is provenance pointing at nothing."""
++    if origin_intent is not None:
++        # Courier retries use only their durable envelope, never the receiving
++        # process's current session/tenant/project. Creator provenance remains
++        # unchanged even if its session is compressed or subsequently removed.
++        return args.get("session_id")
++    from gateway.session_context import get_session_env
++    from tools.async_delegation import _current_origin_session_id
++    return (_persisted_session_id(args.get("session_id"))
++            # The parent card's session too: a card placed from another gateway carries
++            # a placeholder (or a chat that lives elsewhere), and handing that on as a
++            # child's origin made the owner's bind fail (kanban-69709bcf16). [daveey]
++            or _persisted_session_id(self_task.session_id if self_task else None)
++            or _persisted_session_id(_current_origin_session_id())
++            or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 6606ce02193..fcb538a6e24 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -55,6 +55,15 @@ when the proposed work is genuinely separate. Set `kanban.create_overlap_check`
+ `false` to disable this check. Missing or unreadable replicas are skipped and logged;
+ the check cannot guarantee uniqueness against unavailable boards.
+ 
++Two creates that run at the same moment both pass the first check before either card
++exists. So every entry (the `kanban_create` tool, `hermes kanban create`, and the
++dashboard REST API) runs the match again inside the write transaction that inserts the
++card. That second pass reads only open cards on the target board that were created
++since the first check began. Of two concurrent owners of one piece of work on one
++board, exactly one lands and the other gets the same `create_overlap` refusal. A
++concurrent create on another board or another gateway is not re-checked under that
++lock, so that race remains.
++
+ Every refusal is recorded with each match's `why`: as a `create_overlap` event on the
+ creator's card or the best local match, or, when every match is on another gateway, as a
+ line in `<kanban home>/logs/create_overlap.jsonl` (rotated to `.1` at 1 MiB).
+-- 
+2.55.0
+

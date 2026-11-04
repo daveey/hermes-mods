@@ -1,0 +1,603 @@
+From ea49c9cf7b9c76d8ff9d6baeb146f3d8078cfef6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:02:01 +0000
+Subject: [PATCH] fix(admission): chat/notification/review turns and
+ prompt.admit outlast a hub claim's under-lock CPU sample instead of 5035
+ (waiting turns make claims defer; prompt.admit waits outside the resume lock)
+ [daveey]
+
+---
+ hermes_cli/admission_fence.py                 |  60 ++++++++
+ hermes_cli/backend_retirement.py              |  82 +++++++---
+ hermes_cli/kanban_admission.py                |   9 +-
+ tests/hermes_cli/test_admission_fence.py      |   7 +-
+ .../test_kanban_hub_admission_turns.py        | 140 ++++++++++++++++++
+ .../test_prompt_admission_busy_lock.py        |  78 ++++++++++
+ tui_gateway/methods_prompt_admission.py       |  60 +++++---
+ 7 files changed, 394 insertions(+), 42 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_hub_admission_turns.py
+ create mode 100644 tests/tui_gateway/test_prompt_admission_busy_lock.py
+
+diff --git a/hermes_cli/admission_fence.py b/hermes_cli/admission_fence.py
+index 7843826c5aa..5544bc5601a 100644
+--- a/hermes_cli/admission_fence.py
++++ b/hermes_cli/admission_fence.py
+@@ -19,6 +19,15 @@ CAPABILITY = {"version": 1, "supported": SUPPORTED, "scope": "installation-root"
+ HOLD_MESSAGE = "Hermes update admission is paused or busy; retry shortly (or after the update completes)."
+ 
+ 
++# [daveey] The longest designed admission.lock hold: a hub Kanban claim's independent ~1 s CPU sample (window <= 2 s,
++# else refused) plus its commit, taken entirely under this lock (worker-first overflow, docs/worker-first-v1.md).
++# Turn sources wait longer than this (backend_retirement.BUSY_WAIT_S), so a hold never refuses a chat turn.
++CLAIM_MAX_HOLD_S = 2.5
++# A turn source waiting out a busy lock registers here; a Kanban claim that sees a waiter defers to its next tick
++# (claims retry; a typed message, notification or review turn has nowhere else to go), so waits stay one hold long.
++TURN_WAITERS = "turn-waiters"
++
++
+ class AdmissionBusy(TimeoutError):
+     """admission.lock is held by another process past the caller's timeout; no hold is implied.
+ 
+@@ -78,6 +87,57 @@ class Reservation:
+                     self.fd = None
+ 
+ 
++@contextmanager
++def turn_waiting(home):
++    """Mark a turn source as waiting for admission.lock while the block runs (never takes the lock).
++
++    The marker is flocked before it becomes visible (dotfile, then rename), so a reader never mistakes a
++    half-created marker for a crashed one; a crashed owner's marker is unlocked and is reaped by the reader."""
++    import fcntl
++
++    directory = Path(home) / "core-update" / TURN_WAITERS
++    directory.mkdir(parents=True, exist_ok=True)
++    name = uuid.uuid4().hex
++    tmp, path = directory / f".{name}", directory / name
++    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        os.rename(tmp, path)
++        yield
++    finally:
++        try:
++            path.unlink(missing_ok=True)
++            tmp.unlink(missing_ok=True)
++        finally:
++            os.close(fd)
++
++
++def turns_waiting(root):
++    """True while a live turn source waits for admission.lock (``root`` = the ``core-update`` directory)."""
++    import fcntl
++
++    try:
++        paths = [p for p in (Path(root) / TURN_WAITERS).iterdir() if not p.name.startswith(".")]
++    except FileNotFoundError:
++        return False
++    for path in paths:
++        try:
++            fd = os.open(path, os.O_RDWR)
++        except FileNotFoundError:
++            continue
++        try:
++            try:
++                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except OSError as exc:
++                if exc.errno not in (errno.EAGAIN, errno.EACCES):
++                    raise
++                return True
++            path.unlink(missing_ok=True)  # crashed owner
++        finally:
++            os.close(fd)
++    return False
++
++
+ def reserve(home):
+     import fcntl
+ 
+diff --git a/hermes_cli/backend_retirement.py b/hermes_cli/backend_retirement.py
+index f66f4c2c36e..723ae33c79a 100644
+--- a/hermes_cli/backend_retirement.py
++++ b/hermes_cli/backend_retirement.py
+@@ -4,6 +4,7 @@ The gate belongs to the process, not a profile or transport. Diagnostic ledgers
+ close the check/use race: every source of new work must reserve admission before dispatch.
+ """
+ 
++import contextlib
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ import logging
+@@ -16,7 +17,13 @@ import time
+ # dropped a typed message, notification or goal turn. Turn sources retry a busy lock (50 ms tries) for up
+ # to BUSY_WAIT_S; a real hold or a retiring backend still refuses at once. The one caller that reserves
+ # under the session resume lock (prompt.admit) passes busy_wait_s=0 and keeps a single try.
+-BUSY_WAIT_S = 0.5
++# A hub Kanban claim holds the lock for its ~1 s CPU sample (worker-first overflow, frozen contract): the budget
++# outlasts that longest designed hold, and a waiting turn makes further claims defer (admission_fence.turn_waiting),
++# so a chat turn waits at most about one hold and is never refused by one (review F1). prompt.admit waits outside
++# the resume lock instead (methods_prompt_admission).
++from hermes_cli.admission_fence import CLAIM_MAX_HOLD_S
++
++BUSY_WAIT_S = CLAIM_MAX_HOLD_S + 0.5
+ _refusal: ContextVar = ContextVar("update_admission_refusal", default=None)
+ _busy_wait_override: ContextVar = ContextVar("update_admission_busy_wait", default=None)
+ _log = logging.getLogger(__name__)
+@@ -40,6 +47,38 @@ def last_refusal():
+     return _refusal.get()
+ 
+ 
++@contextmanager
++def admission_waiter(home=None, busy_wait_s=None):
++    """Wait, registered as a waiting turn, until admission.lock is free (at most ``busy_wait_s``, default BUSY_WAIT_S).
++
++    For a caller whose reservation must take one short try because it holds the session resume lock (prompt.admit):
++    it waits here with that lock RELEASED, then retries its admission inside this block, so claims keep deferring to
++    it until it has reserved. Yields True once the lock came free, False when the budget ran out. [daveey]"""
++    from hermes_constants import get_default_hermes_root, get_hermes_home
++    from hermes_cli import admission_fence
++
++    root = get_default_hermes_root(home=home or get_hermes_home())
++    budget = BUSY_WAIT_S if busy_wait_s is None else busy_wait_s
++    with contextlib.ExitStack() as waiting:
++        try:
++            waiting.enter_context(admission_fence.turn_waiting(root))
++        except OSError:
++            _log.debug("could not register as a waiting turn", exc_info=True)
++        deadline = time.monotonic() + budget
++        free = False
++        while not free:
++            try:
++                with admission_fence.admission_lock(root, timeout=0.05):
++                    free = True
++            except admission_fence.AdmissionBusy:
++                if time.monotonic() >= deadline:
++                    break
++            except (OSError, TimeoutError):
++                _log.warning("update admission unavailable while waiting for a busy lock", exc_info=True)
++                break
++        yield free
++
++
+ def refusal_text():
+     """The 5035 text for the latest refusal in this context."""
+     if _refusal.get() == "busy":
+@@ -56,23 +95,30 @@ def _reserve(root, busy_wait_s, what):
+ 
+     started = time.monotonic()
+     tries = 0
+-    while True:
+-        tries += 1
+-        try:
+-            pending = admission_fence.reserve(root)
+-        except admission_fence.AdmissionBusy:
+-            waited = time.monotonic() - started
+-            if waited >= busy_wait_s:
+-                _log.warning("%s unavailable: update admission lock busy for %.1fs (no update hold)", what, waited)
+-                return None, "busy"
+-            continue
+-        except (OSError, TimeoutError):
+-            _log.warning("%s unavailable", what, exc_info=True)
+-            return None, "unavailable"
+-        if tries > 1:
+-            _log.debug("update admission lock was busy for %.2fs; %s after %d tries",
+-                       time.monotonic() - started, "admitted" if pending is not None else "held", tries)
+-        return pending, (None if pending is not None else "held")
++    with contextlib.ExitStack() as waiting:
++        while True:
++            tries += 1
++            try:
++                pending = admission_fence.reserve(root)
++            except admission_fence.AdmissionBusy:
++                waited = time.monotonic() - started
++                if waited >= busy_wait_s:
++                    _log.warning("%s unavailable: update admission lock busy for %.1fs (no update hold)", what, waited)
++                    return None, "busy"
++                if tries == 1:
++                    try:  # claims defer to a waiting turn; failing to register only loses that priority
++                        waiting.enter_context(admission_fence.turn_waiting(root))
++                    except OSError:
++                        _log.debug("could not register as a waiting turn", exc_info=True)
++                continue
++            except (OSError, TimeoutError):
++                _log.warning("%s unavailable", what, exc_info=True)
++                return None, "unavailable"
++            break
++    if tries > 1:
++        _log.debug("update admission lock was busy for %.2fs; %s after %d tries",
++                   time.monotonic() - started, "admitted" if pending is not None else "held", tries)
++    return pending, (None if pending is not None else "held")
+ 
+ # [daveey] Background reviews (the post-turn memory/skill review fork) run on a daemon thread with
+ # no session turn lease and no admission reservation, so the idle proof read a backend mid-review
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index b7d25af3438..6c6da550394 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -186,7 +186,7 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+     process's installation root, not the board path. Hooks run after both locks.
+     """
+     from hermes_constants import get_default_hermes_root
+-    from hermes_cli.admission_fence import AdmissionBusy, admission_lock, is_held, HOLD_MESSAGE, SUPPORTED
++    from hermes_cli.admission_fence import AdmissionBusy, admission_lock, is_held, turns_waiting, HOLD_MESSAGE, SUPPORTED
+     from hermes_cli.kanban_db import write_txn
+ 
+     if conn.in_transaction:
+@@ -206,6 +206,7 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+             try:
+                 root = stack.enter_context(admission_lock(get_default_hermes_root(), timeout=0))
+                 held = is_held(root)
++                waiting = not held and turns_waiting(root)
+             except AdmissionBusy:
+                 # [daveey] Designed contention: another claimer (or hermes-sync) holds admission.lock
+                 # through its commit. A normal defer, not a failure: no WARNING/traceback, which the
+@@ -221,6 +222,12 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+                 logging.getLogger(__name__).info(HOLD_MESSAGE)
+                 yield False
+                 return
++            if waiting:
++                # [daveey] A chat/notification/review turn is waiting out this lock: claims retry next tick, turns
++                # cannot, so the claim yields before its ~1 s sample (review F1).
++                logging.getLogger(__name__).info("A turn is waiting for update admission; deferring Kanban claim")
++                yield False
++                return
+             # Frozen contract: an independent full CPU sample is taken HERE, with admission.lock held, and the
+             # claim commits before the lock is released, so a concurrent claimer sees this run in its recount.
+             reason, evidence = _final_hub_gate(gate)
+diff --git a/tests/hermes_cli/test_admission_fence.py b/tests/hermes_cli/test_admission_fence.py
+index 6be3802ec4c..91d5bd3dee6 100644
+--- a/tests/hermes_cli/test_admission_fence.py
++++ b/tests/hermes_cli/test_admission_fence.py
+@@ -76,15 +76,16 @@ def test_reservation_survives_lock_briefly_busy_without_hold(tmp_path, caplog):
+ def test_reservation_refuses_long_busy_lock_with_one_warning(tmp_path, caplog):
+     import logging
+     import time
++    from hermes_cli.backend_retirement import BUSY_WAIT_S
+     caplog.set_level(logging.DEBUG, logger="hermes_cli.backend_retirement")
+-    child = _spawn_lock_holder(tmp_path, 2.0)
++    child = _spawn_lock_holder(tmp_path, BUSY_WAIT_S + 1.5)  # held past the whole busy-wait budget
+     try:
+         fence = RetirementFence()
+         started = time.monotonic()
+         with fence.reservation(tmp_path) as admitted:
+             elapsed = time.monotonic() - started
+             assert not admitted
+-        assert 0.45 <= elapsed < 1.5
++        assert BUSY_WAIT_S - 0.05 <= elapsed < BUSY_WAIT_S + 1.0
+         records = _busy_records(caplog)
+         assert len(records) == 1, [r.getMessage() for r in records]
+         message = records[0].getMessage()
+@@ -150,7 +151,7 @@ def test_busy_refusal_text_says_briefly_busy(tmp_path, monkeypatch):
+     monkeypatch.setattr(backend_retirement, "retirement", fence)
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     session = {"history_lock": threading.RLock(), "profile_home": str(tmp_path), "session_key": "k"}
+-    child = _spawn_lock_holder(tmp_path, 2.0)
++    child = _spawn_lock_holder(tmp_path, backend_retirement.BUSY_WAIT_S + 1.5)  # past the busy-wait budget
+     try:
+         error, _ = server._lock_in_submit_turn("r", "s", session, "hi", {}, False, None, None, None)
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_turns.py b/tests/hermes_cli/test_kanban_hub_admission_turns.py
+new file mode 100644
+index 00000000000..560f0a77cc1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_admission_turns.py
+@@ -0,0 +1,140 @@
++"""Turn sources vs the hub claim's ~1 s sample under admission.lock (review F1).
++
++The frozen contract keeps the independent full CPU sample entirely under admission.lock. A chat, notification or
++review turn that reserves admission during that hold must be admitted once the hold ends, never refused with 5035:
++turn sources wait longer than the longest designed hold, and a waiting turn makes the next claims defer (claims
++retry on the next tick; a typed message has nowhere else to go).
++"""
++import threading
++import time
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from hermes_cli import backend_retirement
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import machine_cpu_metrics as cm
++from hermes_cli import machine_metrics as mm
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.platforms("posix")
++
++HOLD_S = 1.2  # the measured hub-claim hold (lock-measure.jsonl: 1.20-1.26 s)
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    (tmp_path / "config.yaml").write_text("kanban:\n  admission:\n    cpu_busy_below_pct: 50\n")
++    mm.record_hub_cpu_sample({"cpu_busy_pct": 10.0, "cpu_busy_window_ms": 1000,
++                              "cpu_busy_sample_end_ms": int(time.time() * 1000)}, root=tmp_path)
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn, tmp_path
++    finally:
++        conn.close()
++
++
++def ready(conn, title="gate"):
++    t = kb.create_task(conn, title=title, assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (t,))
++    return t
++
++
++def slow_sample(started, hold_s=HOLD_S, ended=None):
++    def sample(*a, **k):
++        started.set()
++        time.sleep(hold_s)  # health: allow HX013 -- stands in for the real ~1 s sample (+ commit) held under the lock
++        if ended is not None:
++            ended.append(time.monotonic())
++        return {"cpu_busy_pct": 10.0, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": int(time.time() * 1000)}
++    return sample
++
++
++def test_turn_wait_budget_outlasts_the_longest_designed_hold():
++    # Frozen bound on one hub claim's hold (test_kanban_hub_admission: claim_s <= 2.5) is the shared constant.
++    assert af.CLAIM_MAX_HOLD_S == 2.5
++    assert backend_retirement.BUSY_WAIT_S > af.CLAIM_MAX_HOLD_S
++
++
++def test_turn_reserving_during_a_hub_claim_sample_is_admitted_after_the_hold(board, monkeypatch):
++    """The real turn-source path (retirement.reservation, as typed submit / notifications use it) started inside the
++    claim's held sample is admitted once the claim commits: no 5035, and the claim still sampled under the lock."""
++    conn, home = board
++    started, ended = threading.Event(), []
++    monkeypatch.setattr(cm, "sample", slow_sample(started, ended=ended))
++    t = ready(conn)
++    m = {}
++
++    def turn():
++        started.wait(5)
++        m["try"] = time.monotonic()
++        with backend_retirement.retirement.reservation(home) as admitted:
++            m["admitted"] = admitted
++            m["refusal"] = backend_retirement.last_refusal()
++            m["at"] = time.monotonic()
++    th = threading.Thread(target=turn)
++    th.start()
++    got = kb.claim_task(conn, t)
++    th.join(10)
++    assert got is not None
++    assert m["admitted"] is True and m["refusal"] is None, m
++    assert m["at"] >= ended[0]  # admitted only after the claim's sample (held under the lock) finished
++    assert m["at"] - m["try"] <= backend_retirement.BUSY_WAIT_S + 0.1
++
++
++def test_a_waiting_turn_makes_the_next_claim_defer_without_sampling(board, monkeypatch):
++    conn, home = board
++    monkeypatch.setattr(cm, "sample", lambda *a, **k: pytest.fail("a waiting turn: defer before sampling"))
++    t = ready(conn)
++    with af.turn_waiting(home):
++        assert af.turns_waiting(home / "core-update")
++        assert kb.claim_task(conn, t) is None
++        assert kb.get_task(conn, t).status == "ready"
++        assert conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
++        assert sync.pop_claim_deferral(t) is None  # an ordinary busy-lock defer, not a gate refusal
++    assert not af.turns_waiting(home / "core-update")
++    monkeypatch.setattr(cm, "sample", slow_sample(threading.Event(), hold_s=0))
++    assert kb.claim_task(conn, t) is not None
++
++
++def test_busy_reservation_registers_as_a_waiting_turn_until_admitted(board):
++    _conn, home = board
++    m = {}
++    with af.admission_lock(home, timeout=1):
++        th = threading.Thread(target=lambda: m.setdefault("r", backend_retirement._reserve(
++            home, backend_retirement.BUSY_WAIT_S, "test turn")))
++        th.start()
++        wait_until(lambda: af.turns_waiting(home / "core-update"), timeout=5, what="turn registered as waiting")
++    th.join(10)
++    pending, reason = m["r"]
++    try:
++        assert pending is not None and reason is None
++    finally:
++        pending.close()
++    assert not af.turns_waiting(home / "core-update")
++
++
++def test_crashed_waiter_marker_is_not_a_waiting_turn(board):
++    _conn, home = board
++    directory = home / "core-update" / af.TURN_WAITERS
++    directory.mkdir(parents=True)
++    (directory / "dead-owner").write_text("")
++    assert not af.turns_waiting(home / "core-update")
++    assert not (directory / "dead-owner").exists()
++
++
++def test_update_hold_still_refuses_a_waiting_turn_at_once(board):
++    _conn, home = board
++    af.set_hold(home)
++    try:
++        t0 = time.monotonic()
++        pending, reason = backend_retirement._reserve(home, backend_retirement.BUSY_WAIT_S, "test turn")
++        assert pending is None and reason == "held"
++        assert time.monotonic() - t0 < 0.5
++    finally:
++        af.clear_hold(home)
+diff --git a/tests/tui_gateway/test_prompt_admission_busy_lock.py b/tests/tui_gateway/test_prompt_admission_busy_lock.py
+new file mode 100644
+index 00000000000..e9e1488d3dd
+--- /dev/null
++++ b/tests/tui_gateway/test_prompt_admission_busy_lock.py
+@@ -0,0 +1,78 @@
++"""prompt.admit while a hub Kanban claim holds admission.lock for its ~1 s sample (review F1).
++
++prompt.admit reserves under the session resume lock, so it never waits there (one short try). A briefly busy lock
++must still not refuse the accepted decision: it waits OUTSIDE the resume lock, as a registered waiting turn, then
++retries the whole admission once. Nothing durable happens before admission, so the retry cannot duplicate a turn.
++"""
++import threading
++import time
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tests.tui_gateway.test_prompt_admission import call, owner
++from tests.waiting import wait_until
++from tui_gateway import server
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++def _root():
++    from hermes_constants import get_default_hermes_root, get_hermes_home
++    return get_default_hermes_root(home=get_hermes_home())
++
++
++def _hold_lock(release, m):
++    with af.admission_lock(_root(), timeout=1):
++        m["held"].set()
++        release.wait(5)
++        m["released"] = time.monotonic()
++
++
++def test_busy_update_lock_admits_once_after_the_hold_without_holding_the_resume_lock(owner):
++    db, _session, params, started = owner
++    release, m = threading.Event(), {"held": threading.Event()}
++    holder = threading.Thread(target=_hold_lock, args=(release, m))
++    holder.start()
++    m["held"].wait(5)
++    result = {}
++    caller = threading.Thread(target=lambda: result.setdefault("r", call("prompt.admit", params)))
++    caller.start()
++    try:
++        # While admit waits, it is a registered waiting turn and the resume lock stays free for other sessions.
++        wait_until(lambda: af.turns_waiting(_root() / "core-update"), timeout=5, what="prompt.admit waiting")
++        assert server._session_resume_lock.acquire(timeout=1)
++        server._session_resume_lock.release()
++        time.sleep(0.6)  # health: allow HX013 -- past the old one-try refusal point while the hold continues
++        assert caller.is_alive()
++    finally:
++        release.set()
++        holder.join(5)
++        caller.join(10)
++    response = result["r"]
++    assert "result" in response, response
++    assert response["result"]["status"] == "accepted"
++    assert len(started) == 1  # dispatched exactly once
++    assert len(db.get_messages(params["stored_session_id"])) == 1
++    assert not af.turns_waiting(_root() / "core-update")
++    # A lost reply's retry reads the same receipt back and never dispatches again.
++    assert call("prompt.admit", params)["result"] == response["result"]
++    assert len(started) == 1
++
++
++def test_lock_busy_past_the_budget_still_refuses_with_5035_and_nothing_admitted(owner, monkeypatch):
++    from hermes_cli import backend_retirement
++    db, _session, params, started = owner
++    monkeypatch.setattr(backend_retirement, "BUSY_WAIT_S", 0.3)
++    release, m = threading.Event(), {"held": threading.Event()}
++    holder = threading.Thread(target=_hold_lock, args=(release, m))
++    holder.start()
++    m["held"].wait(5)
++    try:
++        response = call("prompt.admit", params)
++    finally:
++        release.set()
++        holder.join(5)
++    assert response["error"]["code"] == 5035, response
++    assert not started
++    assert db.get_messages(params["stored_session_id"]) == []
+diff --git a/tui_gateway/methods_prompt_admission.py b/tui_gateway/methods_prompt_admission.py
+index d4ac68a0a03..24334efc127 100644
+--- a/tui_gateway/methods_prompt_admission.py
++++ b/tui_gateway/methods_prompt_admission.py
+@@ -5,7 +5,7 @@ and readback work without a live owner. An accepted operation is never dispatche
+ again, even if the process died between the SQLite commit and thread start.
+ """
+ from pathlib import Path
+-from contextlib import contextmanager
++from contextlib import ExitStack, contextmanager
+ import threading
+ import time
+ import logging
+@@ -15,6 +15,7 @@ from hermes_state_prompt_admission import admit_prompt, mark_dispatch_failed, pr
+ 
+ _operations_lock = threading.Lock()
+ _operations = {}
++_BUSY = object()
+ 
+ 
+ @contextmanager
+@@ -135,6 +136,31 @@ def _dispatch(server, rid, sid, session, text, profile):
+         raise RuntimeError("backend retired after durable acceptance")
+ 
+ 
++def _claim_turn(server, rid, params, home, text):
++    """Under the resume lock: ``(refusal | _BUSY | None, sid, session)``; None = the turn is claimed (running)."""
++    with server._session_resume_lock:
++        sid, session = _live_owner(server, params, home)
++        # busy_wait_s=0: never wait out a busy update lock while holding the resume lock (_BUSY: wait outside it).
++        with server._session_turn_admission(session, busy_wait_s=0) as admitted:
++            if not admitted:
++                from hermes_cli.backend_retirement import last_refusal
++                return (_BUSY if last_refusal() == "busy" else server._err(rid, 5035, "backend is retiring")), sid, session
++            _live_owner(server, params, home)
++            refusal = server._reattach_refusal(rid, sid, session)
++            if refusal is not None:
++                return refusal, sid, session
++            if server._ws_session_is_detached(session):
++                raise ValueError("exact session is detached; reattach its owner first")
++            refusal = server._legacy_group_fence_error(rid, session, params)
++            if refusal is not None:
++                return refusal, sid, session
++            session["running"] = True
++            session["_turn_cancel_requested"] = False
++            session["last_active"] = time.time()
++            server._start_inflight_turn(session, text)
++    return None, sid, session
++
++
+ def submit_admission(rid, params):
+     from tui_gateway import server
+     from hermes_cli.input_sanitize import sanitize_user_prompt_text
+@@ -155,25 +181,19 @@ def submit_admission(rid, params):
+             prior = _read(server, params, home)
+             if prior is not None:
+                 return _reply(server, rid, params, prior)
+-            with server._session_resume_lock:
+-                sid, session = _live_owner(server, params, home)
+-                # busy_wait_s=0: never wait out a busy update lock while holding the resume lock.
+-                with server._session_turn_admission(session, busy_wait_s=0) as admitted:
+-                    if not admitted:
+-                        return server._err(rid, 5035, "backend is retiring")
+-                    _live_owner(server, params, home)
+-                    refusal = server._reattach_refusal(rid, sid, session)
+-                    if refusal is not None:
+-                        return refusal
+-                    if server._ws_session_is_detached(session):
+-                        raise ValueError("exact session is detached; reattach its owner first")
+-                    refusal = server._legacy_group_fence_error(rid, session, params)
+-                    if refusal is not None:
+-                        return refusal
+-                    session["running"] = True
+-                    session["_turn_cancel_requested"] = False
+-                    session["last_active"] = time.time()
+-                    server._start_inflight_turn(session, text)
++            with ExitStack() as waiting:
++                outcome, sid, session = _claim_turn(server, rid, params, home, text)
++                if outcome is _BUSY:
++                    # [daveey] A briefly busy update lock (a hub Kanban claim's ~1 s sample, review F1) is waited out
++                    # with the resume lock released, then admission is retried once. Nothing durable happened yet
++                    # and the operation lock is still held, so the retry cannot duplicate this turn.
++                    from hermes_cli.backend_retirement import admission_waiter, refusal_text
++                    if waiting.enter_context(admission_waiter(session.get("profile_home"))):
++                        outcome, sid, session = _claim_turn(server, rid, params, home, text)
++                    if outcome is _BUSY:
++                        return server._err(rid, 5035, refusal_text())
++                if outcome is not None:
++                    return outcome
+             return _accept_claimed(server, rid, sid, session, params, text)
+     except ValueError as exc:
+         return server._err(rid, 4092, str(exc))
+-- 
+2.55.0
+

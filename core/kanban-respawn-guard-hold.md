@@ -214,3 +214,32 @@ module 1653 adds.
 - A pull that was another card's contract stops being exempt as soon as that card is done or archived.
 - 1636 makes the 1610 note in [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) (fixtures re-adding an unattributed
   PR comment) obsolete; the synced comment keeps its writer by uid.
+
+
+## Follow-up 1901, 1902: a supported reopen after success reaches normal dispatch
+
+Patches: **1901** (`3c624f4f9f`, `[daveey] kanban: a supported reopen after success reaches normal dispatch (recent_success/active_pr)`), **1902** (`5698335772`, `[daveey] kanban reopen guard: pin same-second active_pr tie; docstring names the rerun bound`). Mirrored in the 1822–1918 pass ([mirror-1918-verification.md](mirror-1918-verification.md)).
+
+### Behavior
+
+- A supported supervisor/operator `reopened` event with `previous_status=done`, strictly later than a completed run or the latest owned PR comment, lifts the `recent_success`/`active_pr` holds; same-second, older, malformed and unrelated events stay guarded (1901/1902).
+- The reopen authorizes reruns until one completes or posts a fresh PR comment, not a single spawn; reclaimed attempts follow ordinary retry rules (1902).
+
+### How it works
+
+`hermes_cli/kanban_db_dispatch_rerun.py` decides whether a reopen authorizes a rerun; `kanban_db_dispatch.py`, `kanban_db_dispatch_pr_state.py` and `kanban_db_operator.py` consult it. Reopen reasons that mention the PR are recorded as `commented` FYI provenance and do not count as a fresh publication.
+
+Source commit notes (first paragraph of each message, privacy-normalized):
+
+- 1901: `hermes kanban reopen` (reopen_done_task) emits `reopened`, which the respawn guard's recent_success step did not count as a deliberate re-run (only status/promoted/unblocked/ reclaimed), so a card reopened right after completing sat held for the 1 h window.
+- 1902: Review of #808: the strict reopen tie was only killed through recent_success; add an active_pr-only test (success window over, PR comment and reopen in one second stay guarded). Docstring: a reopen authorizes reruns until one completes or posts a PR comment; a rerun ending without either retries like any reclaimed run.
+
+### Code
+
+`hermes_cli/kanban_db_dispatch.py`, `hermes_cli/kanban_db_dispatch_pr_state.py`, `hermes_cli/kanban_db_dispatch_rerun.py`, `hermes_cli/kanban_db_operator.py`.
+
+### Tests
+
+Landed with the source commits; not rerun by this mirror pass unless the verification report lists them. Names are tests each patch added; a file with no names was modified only.
+
+- `tests/hermes_cli/test_kanban_reopen_dispatch.py`: `test_cli_reopen_after_success_dispatches_once`, `test_dashboard_done_to_ready_still_dispatches`, `test_reopen_authorizes_one_rerun_only`, `test_same_second_reopen_stays_guarded`, `test_unrelated_or_malformed_events_stay_guarded`, `test_open_parent_still_gates_reopened_child`, `test_pr_owner_reopen_resumes_its_pr_once`, `test_reopen_without_newer_reopen_keeps_pr_guard`, `test_fenced_worker_shell_cannot_reopen`, `test_same_second_reopen_keeps_pr_guard`

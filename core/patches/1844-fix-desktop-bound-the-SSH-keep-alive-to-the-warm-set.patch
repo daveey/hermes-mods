@@ -1,0 +1,634 @@
+From e27818e4663a4f16ce1467df269ab0cac4fa8ccb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:33:42 -0800
+Subject: [PATCH] fix(desktop): bound the SSH keep-alive to the warm set so
+ one-off dials stop pinning remote backends [daveey]
+
+Desktop main held an idle-exit-blocking /api/ws keep-alive (#106935) on every
+published SSH-isolated scope until teardown, so a single sweep over a host's
+profiles kept every one of those backends alive for the whole Desktop session
+(9 serve --isolated on the mini, 4 outside the prewarm set, no renderer client,
+holding the BB memory gate at WARN).
+
+The keep-alive now stays only on the primary, bare/local/non-SSH scopes, the
+default profile, the prewarm targets (default + recent cap 4) and scopes dialled
+for use in the last 30 min (ssh-keepalive-hold.ts, reconciled every 15 s).
+Other scopes just lose that socket: tunnel and pool entry stay, a renderer
+socket or running turn still keeps the backend up, and the dispatch probe
+redials one that idle-exited. Post-resume sweeps no longer rebuild a dead scope
+outside that set. Warm-set wiring moved to remote-warm-set.ts (main.ts shrinks).
+---
+ apps/desktop/electron/main.ts                 |  35 ++-
+ apps/desktop/electron/remote-warm-set.ts      |  43 ++++
+ .../electron/ssh-isolated-keepalive.ts        |  42 ++-
+ .../electron/ssh-keepalive-hold.test.ts       | 240 ++++++++++++++++++
+ apps/desktop/electron/ssh-keepalive-hold.ts   | 121 +++++++++
+ 5 files changed, 460 insertions(+), 21 deletions(-)
+ create mode 100644 apps/desktop/electron/remote-warm-set.ts
+ create mode 100644 apps/desktop/electron/ssh-keepalive-hold.test.ts
+ create mode 100644 apps/desktop/electron/ssh-keepalive-hold.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index f3c99c39cd9..47530c5e921 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -538,9 +538,10 @@ import {
+ } from './remote-liveness'
+ import { resolveRemoteOauthTicket, rosterSourceEnumerationTimeoutMs } from './remote-oauth-ticket'
+ import { createRemoteOwnerCache } from './remote-owner-cache'
+-import { prewarmTargets, RecentRemoteProfiles, RemotePrewarmer } from './remote-prewarm'
++import { RemotePrewarmer } from './remote-prewarm'
+ import { remoteSessionCookies } from './remote-session-cookies'
+ import { RemoteUpdatePause, remoteUpdatePauseKey } from './remote-update-pause'
++import { createRemoteWarmSet } from './remote-warm-set'
+ import {
+   applyRemoteRequestHeaders,
+   attachRemoteRequestHeaderListener,
+@@ -10602,24 +10603,17 @@ async function ensureBackend(
+ // lifecycle as per-profile local descriptors.
+ // Part B (instant session loads): dial every SSH gateway at startup and keep it warm (remote-prewarm.ts): its
+ // default profile plus each named profile dispatched to in the last 24 h (one remote backend per profile).
+-const recentRemoteProfiles = new RecentRemoteProfiles({
+-  load: () => JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'remote-prewarm-profiles.json'), 'utf8')),
+-  save: data =>
+-    fs.writeFileSync(path.join(app.getPath('userData'), 'remote-prewarm-profiles.json'), JSON.stringify(data), {
+-      mode: 0o600
+-    })
++// Warm set + the keep-alive bound to it (remote-warm-set.ts).
++const remoteWarmSet = createRemoteWarmSet({
++  statePath: () => path.join(app.getPath('userData'), 'remote-prewarm-profiles.json'),
++  readRegistry: readDesktopConnectionsRegistry,
++  keepalives: sshIsolatedKeepalives,
++  isPrimaryScope: scope => sshConnections.get(scope)?.primaryRegistryScope === true,
++  log: line => sshRememberLog(line)
+ })
+ 
+ const remotePrewarmer = new RemotePrewarmer({
+-  listTargets: () =>
+-    process.env.HERMES_DESKTOP_REMOTE_PREWARM === '0'
+-      ? []
+-      : prewarmTargets(
+-          readDesktopConnectionsRegistry()
+-            .connections.filter(connection => connection.kind === 'ssh')
+-            .map(connection => connection.id),
+-          recentRemoteProfiles
+-        ),
++  listTargets: remoteWarmSet.listTargets,
+   ensure: ({ connectionId, profile }, { forceProbe }) =>
+     ensureRegistryBackend(connectionId, profile, '', { forceProbe }),
+   log: line => rememberLog(line)
+@@ -10656,7 +10650,8 @@ async function ensureRegistryBackend(
+   }
+ 
+   if (source.kind === 'ssh' && !passive && !opts.forceProbe) {
+-    recentRemoteProfiles.touch(id, profileKey)
++    remoteWarmSet.recent.touch(id, profileKey)
++    remoteWarmSet.holds.noteUse(backendScopeKey(id, profileKey))
+   }
+ 
+   let resolvedRegistrySshConfig
+@@ -14271,7 +14266,9 @@ function revalidateSuspectPoolAfterResume() {
+       entries: backendPool.entries(),
+       log: rememberLog,
+       probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
+-      rebuild: poolKey => redialPoolBackendAfterResume(poolKey),
++      // A dead scope outside the warm/in-use set is only retired: rebuilding it would re-pin it.
++      rebuild: async poolKey =>
++        remoteWarmSet.holds.shouldHold(poolKey) ? redialPoolBackendAfterResume(poolKey) : undefined,
+       retire: async poolKey => {
+         await stopPoolBackend(poolKey, 'resume')
+         // The pool key doubles as the SSH scope for registry SSH backends and
+@@ -18111,6 +18108,7 @@ app.whenReady().then(() => {
+   }
+ 
+   void remotePrewarmer.start().catch(error => rememberLog(`[remote-prewarm] start failed: ${String(error)}`))
++  remoteWarmSet.holds.start()
+ 
+   app.on('activate', () => {
+     // Recreate the primary window if it's gone. Guard on mainWindow directly
+@@ -18315,6 +18313,7 @@ app.on('before-quit', event => {
+   minimizeToTray.beginQuit()
+   mainProcessLagWatchdog.stop()
+   remotePrewarmer.stop()
++  remoteWarmSet.holds.stop()
+ 
+   // A detached remote updater can outlive this Electron process. Do not tear
+   // down its SSH observer/restore transaction at the generic SSH shutdown
+diff --git a/apps/desktop/electron/remote-warm-set.ts b/apps/desktop/electron/remote-warm-set.ts
+new file mode 100644
+index 00000000000..bbe06057e70
+--- /dev/null
++++ b/apps/desktop/electron/remote-warm-set.ts
+@@ -0,0 +1,43 @@
++// The remote warm set and the keep-alive bound to it, wired in one place so the two can never disagree:
++// remote-prewarm.ts holds default + the profiles dispatched to recently warm, and ssh-keepalive-hold.ts keeps
++// Desktop main's idle-exit-blocking socket only on those scopes (plus the primary and anything used in the last
++// ACTIVE_USE_HOLD_MS).
++import fs from 'node:fs'
++
++import { prewarmTargetKey, prewarmTargets, RecentRemoteProfiles } from './remote-prewarm'
++import { type SshKeepaliveHoldDeps, SshKeepaliveHolds } from './ssh-keepalive-hold'
++
++export type RemoteWarmSetDeps = {
++  statePath: () => string
++  readRegistry: () => { connections: Array<{ id: string; kind?: string }> }
++  keepalives: SshKeepaliveHoldDeps['keepalives']
++  isPrimaryScope: (scope: string) => boolean
++  log: (line: string) => void
++  env?: Record<string, string | undefined>
++}
++
++export function createRemoteWarmSet(deps: RemoteWarmSetDeps) {
++  const sshConnectionIds = () =>
++    deps
++      .readRegistry()
++      .connections.filter(connection => connection.kind === 'ssh')
++      .map(connection => connection.id)
++
++  const recent = new RecentRemoteProfiles({
++    load: () => JSON.parse(fs.readFileSync(deps.statePath(), 'utf8')),
++    save: data => fs.writeFileSync(deps.statePath(), JSON.stringify(data), { mode: 0o600 })
++  })
++
++  const listTargets = () =>
++    (deps.env ?? process.env).HERMES_DESKTOP_REMOTE_PREWARM === '0' ? [] : prewarmTargets(sshConnectionIds(), recent)
++
++  const holds = new SshKeepaliveHolds({
++    keepalives: deps.keepalives,
++    prewarmKeys: () => listTargets().map(prewarmTargetKey),
++    isPrimaryScope: deps.isPrimaryScope,
++    isSshConnection: id => sshConnectionIds().includes(id),
++    log: deps.log
++  })
++
++  return { holds, listTargets, recent }
++}
+diff --git a/apps/desktop/electron/ssh-isolated-keepalive.ts b/apps/desktop/electron/ssh-isolated-keepalive.ts
+index 477049904c7..25bee03d5ac 100644
+--- a/apps/desktop/electron/ssh-isolated-keepalive.ts
++++ b/apps/desktop/electron/ssh-isolated-keepalive.ts
+@@ -11,6 +11,11 @@
+  * If the socket drops the registry reconnects with capped exponential backoff;
+  * while it is down the backend may idle-exit as before. This module never consults
+  * nonce/lock/token files.
++ *
++ * `setHeld(scope, false)` closes the socket of a scope Desktop no longer needs
++ * warm (ssh-keepalive-hold.ts) without tearing the scope down: a renderer
++ * socket or a running turn still keeps the backend alive, otherwise it
++ * idle-exits on its own. `setHeld(scope, true)` redials it.
+  */
+ import { buildGatewayWsUrl } from './connection-config'
+ 
+@@ -28,6 +33,7 @@ export type SshIsolatedKeepaliveOptions = {
+ 
+ type KeepaliveEntry = {
+   failures: number
++  held: boolean
+   reconnectTimer: ReturnType<typeof setTimeout> | null
+   scope: string
+   socket: { close?: () => void; url?: string } | null
+@@ -83,7 +89,7 @@ export function createSshIsolatedKeepaliveRegistry(options: SshIsolatedKeepalive
+   }
+ 
+   function scheduleReconnect(entry: KeepaliveEntry) {
+-    if (entries.get(entry.scope) !== entry || entry.reconnectTimer != null) {
++    if (entries.get(entry.scope) !== entry || !entry.held || entry.reconnectTimer != null) {
+       return
+     }
+ 
+@@ -97,7 +103,7 @@ export function createSshIsolatedKeepaliveRegistry(options: SshIsolatedKeepalive
+   }
+ 
+   function connect(entry: KeepaliveEntry) {
+-    if (entries.get(entry.scope) !== entry) {
++    if (entries.get(entry.scope) !== entry || !entry.held) {
+       return
+     }
+ 
+@@ -155,6 +161,7 @@ export function createSshIsolatedKeepaliveRegistry(options: SshIsolatedKeepalive
+ 
+     const entry: KeepaliveEntry = {
+       failures: 0,
++      held: true,
+       reconnectTimer: null,
+       scope,
+       socket: null,
+@@ -177,6 +184,35 @@ export function createSshIsolatedKeepaliveRegistry(options: SshIsolatedKeepalive
+     closeSocket(entry)
+   }
+ 
++  // Returns true when the hold state changed.
++  function setHeld(scope: string, held: boolean) {
++    const entry = entries.get(scope)
++
++    if (!entry || entry.held === held) {
++      return false
++    }
++
++    entry.held = held
++    entry.failures = 0
++    clearTimer(entry)
++
++    if (held) {
++      connect(entry)
++    } else {
++      closeSocket(entry)
++    }
++
++    return true
++  }
++
++  function isHeld(scope: string) {
++    return entries.get(scope)?.held === true
++  }
++
++  function scopes() {
++    return [...entries.keys()]
++  }
++
+   function stopAll() {
+     for (const scope of [...entries.keys()]) {
+       stop(scope)
+@@ -193,5 +229,5 @@ export function createSshIsolatedKeepaliveRegistry(options: SshIsolatedKeepalive
+     return typeof url === 'string' ? url : null
+   }
+ 
+-  return { isArmed, openUrl, start, stop, stopAll }
++  return { isArmed, isHeld, openUrl, scopes, setHeld, start, stop, stopAll }
+ }
+diff --git a/apps/desktop/electron/ssh-keepalive-hold.test.ts b/apps/desktop/electron/ssh-keepalive-hold.test.ts
+new file mode 100644
+index 00000000000..ac539bda221
+--- /dev/null
++++ b/apps/desktop/electron/ssh-keepalive-hold.test.ts
+@@ -0,0 +1,240 @@
++/**
++ * Retention bound for Desktop main's SSH-isolated keep-alive: only the primary,
++ * default, prewarm targets and recently used scopes keep the socket that stops
++ * a remote backend idle-exiting. A one-off sweep over every profile of a host
++ * must not pin those backends for the whole Desktop session.
++ */
++import fs from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++
++import { describe, expect, it, vi } from 'vitest'
++
++import { createRemoteWarmSet } from './remote-warm-set'
++import { createSshIsolatedKeepaliveRegistry } from './ssh-isolated-keepalive'
++import { ACTIVE_USE_HOLD_MS, SshKeepaliveHolds } from './ssh-keepalive-hold'
++
++function makeFakeWs() {
++  const instances: any[] = []
++
++  class FakeWs {
++    url: string
++    closed = false
++    listeners: Record<string, Array<(event?: any) => void>> = {}
++
++    constructor(url: string) {
++      this.url = url
++      instances.push(this)
++    }
++
++    addEventListener(type: string, fn: (event?: any) => void) {
++      ;(this.listeners[type] ||= []).push(fn)
++    }
++
++    close() {
++      this.closed = true
++      this.emit('close', { code: 1000 })
++    }
++
++    emit(type: string, event?: any) {
++      for (const fn of this.listeners[type] || []) {
++        fn(event)
++      }
++    }
++  }
++
++  return { FakeWs, instances }
++}
++
++const SCOPES = [
++  'conn:mini::default',
++  'conn:mini::bb-aux',
++  'conn:mini::bb-dev',
++  'conn:mini::bb-device',
++  'conn:mini::bb-voice',
++  'conn:hub::work'
++]
++
++function setup(overrides: { prewarm?: string[]; primary?: string[]; ssh?: string[] } = {}) {
++  const { FakeWs, instances } = makeFakeWs()
++  let now = 1_000_000
++  const keepalives = createSshIsolatedKeepaliveRegistry({ WebSocketImpl: FakeWs, reconnectDelayMs: 10 })
++
++  SCOPES.forEach((scope, i) => keepalives.start(scope, { baseUrl: `http://127.0.0.1:${50_000 + i}`, token: 't' }))
++  const log = vi.fn()
++
++  const holds = new SshKeepaliveHolds({
++    keepalives,
++    prewarmKeys: () => overrides.prewarm ?? ['mini::default', 'mini::bb-aux', 'hub::default'],
++    isPrimaryScope: scope => (overrides.primary ?? ['conn:hub::work']).includes(scope),
++    isSshConnection: id => (overrides.ssh ?? ['mini', 'hub']).includes(id),
++    log,
++    now: () => now
++  })
++
++  const openSocket = (scope: string) =>
++    instances.filter(ws => !ws.closed && ws.url === `ws://127.0.0.1:${50_000 + SCOPES.indexOf(scope)}/api/ws?token=t`)
++
++  return { advance: (ms: number) => (now += ms), holds, instances, keepalives, log, openSocket }
++}
++
++describe('SSH keep-alive retention bound', () => {
++  it('releases only scopes outside primary/default/prewarm/recent use, without disarming them', () => {
++    const { holds, keepalives, openSocket } = setup()
++
++    holds.reconcile()
++
++    for (const scope of ['conn:mini::default', 'conn:mini::bb-aux', 'conn:hub::work']) {
++      expect(keepalives.isHeld(scope)).toBe(true)
++      expect(openSocket(scope)).toHaveLength(1)
++    }
++
++    for (const scope of ['conn:mini::bb-dev', 'conn:mini::bb-device', 'conn:mini::bb-voice']) {
++      expect(keepalives.isHeld(scope)).toBe(false)
++      expect(keepalives.isArmed(scope)).toBe(true)
++      expect(openSocket(scope)).toHaveLength(0)
++    }
++  })
++
++  it('a released socket is never redialled until the scope is used again', async () => {
++    vi.useFakeTimers()
++
++    try {
++      const { holds, instances, keepalives, openSocket } = setup()
++
++      holds.reconcile()
++      const dialled = instances.length
++      await vi.advanceTimersByTimeAsync(60_000)
++      expect(instances).toHaveLength(dialled)
++
++      holds.noteUse('conn:mini::bb-device')
++      holds.reconcile()
++      expect(keepalives.isHeld('conn:mini::bb-device')).toBe(true)
++      expect(openSocket('conn:mini::bb-device')).toHaveLength(1)
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  it('holds a used scope for ACTIVE_USE_HOLD_MS, then lets it go', () => {
++    const { advance, holds, keepalives, log } = setup()
++
++    holds.noteUse('conn:mini::bb-dev')
++    holds.reconcile()
++    expect(keepalives.isHeld('conn:mini::bb-dev')).toBe(true)
++
++    advance(ACTIVE_USE_HOLD_MS - 1)
++    holds.reconcile()
++    expect(keepalives.isHeld('conn:mini::bb-dev')).toBe(true)
++
++    advance(2)
++    holds.reconcile()
++    expect(keepalives.isHeld('conn:mini::bb-dev')).toBe(false)
++    expect(log).toHaveBeenCalledWith(expect.stringContaining('keep-alive released for conn:mini::bb-dev'))
++  })
++
++  it('a profile entering the prewarm set is held again', () => {
++    const prewarm = ['mini::default']
++    const { holds, keepalives } = setup({ prewarm })
++
++    holds.reconcile()
++    expect(keepalives.isHeld('conn:mini::bb-voice')).toBe(false)
++
++    prewarm.push('mini::bb-voice')
++    holds.reconcile()
++    expect(keepalives.isHeld('conn:mini::bb-voice')).toBe(true)
++  })
++
++  it('never releases bare, local or non-SSH scopes (resume rebuild unchanged for them)', () => {
++    const { holds } = setup({ prewarm: [] })
++
++    expect(holds.shouldHold('')).toBe(true)
++    expect(holds.shouldHold('work')).toBe(true)
++    expect(holds.shouldHold('conn:local::work')).toBe(true)
++    expect(holds.shouldHold('conn:https-remote::work')).toBe(true)
++    expect(holds.shouldHold('conn:mini::default')).toBe(true)
++    expect(holds.shouldHold('conn:mini::bb-shadow')).toBe(false)
++  })
++
++  it('start/stop drive a periodic reconcile', () => {
++    const timers: Array<() => void> = []
++    const clearTimer = vi.fn()
++    const { keepalives } = setup()
++
++    const holds = new SshKeepaliveHolds({
++      keepalives,
++      prewarmKeys: () => [],
++      isPrimaryScope: () => false,
++      isSshConnection: () => true,
++      setTimer: fn => timers.push(fn),
++      clearTimer
++    })
++
++    holds.start()
++    holds.start()
++    expect(timers).toHaveLength(1)
++    timers[0]()
++    expect(keepalives.isHeld('conn:mini::bb-aux')).toBe(false)
++    expect(keepalives.isHeld('conn:mini::default')).toBe(true)
++    holds.stop()
++    expect(clearTimer).toHaveBeenCalledTimes(1)
++  })
++})
++
++describe('remote warm set wiring', () => {
++  function warmSet(recent: Record<string, Record<string, number>>, env: Record<string, string> = {}) {
++    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'warm-set-'))
++    const statePath = path.join(dir, 'remote-prewarm-profiles.json')
++    fs.writeFileSync(statePath, JSON.stringify(recent))
++    const { FakeWs } = makeFakeWs()
++    const keepalives = createSshIsolatedKeepaliveRegistry({ WebSocketImpl: FakeWs })
++
++    for (const scope of ['conn:mini::default', 'conn:mini::bb-aux', 'conn:mini::bb-voice', 'conn:url::work']) {
++      keepalives.start(scope, { baseUrl: 'http://127.0.0.1:1', token: 't' })
++    }
++
++    const set = createRemoteWarmSet({
++      statePath: () => statePath,
++      readRegistry: () => ({
++        connections: [
++          { id: 'mini', kind: 'ssh' },
++          { id: 'url', kind: 'remote' }
++        ]
++      }),
++      keepalives,
++      isPrimaryScope: () => false,
++      log: () => {},
++      env
++    })
++
++    return { keepalives, set, statePath }
++  }
++
++  it('holds exactly the persisted recent profiles + default; a touch joins the set and persists', () => {
++    const { keepalives, set, statePath } = warmSet({ mini: { 'bb-aux': Date.now() } })
++
++    expect(set.listTargets()).toEqual([
++      { connectionId: 'mini', profile: 'default' },
++      { connectionId: 'mini', profile: 'bb-aux' }
++    ])
++    set.holds.reconcile()
++    expect(keepalives.isHeld('conn:mini::default')).toBe(true)
++    expect(keepalives.isHeld('conn:mini::bb-aux')).toBe(true)
++    expect(keepalives.isHeld('conn:mini::bb-voice')).toBe(false)
++    expect(keepalives.isHeld('conn:url::work')).toBe(true)
++
++    set.recent.touch('mini', 'bb-voice')
++    set.holds.reconcile()
++    expect(keepalives.isHeld('conn:mini::bb-voice')).toBe(true)
++    expect(Object.keys(JSON.parse(fs.readFileSync(statePath, 'utf8')).mini)).toContain('bb-voice')
++  })
++
++  it('HERMES_DESKTOP_REMOTE_PREWARM=0 empties the warm set but keeps default held', () => {
++    const { keepalives, set } = warmSet({ mini: { 'bb-aux': Date.now() } }, { HERMES_DESKTOP_REMOTE_PREWARM: '0' })
++
++    expect(set.listTargets()).toEqual([])
++    set.holds.reconcile()
++    expect(keepalives.isHeld('conn:mini::default')).toBe(true)
++    expect(keepalives.isHeld('conn:mini::bb-aux')).toBe(false)
++  })
++})
+diff --git a/apps/desktop/electron/ssh-keepalive-hold.ts b/apps/desktop/electron/ssh-keepalive-hold.ts
+new file mode 100644
+index 00000000000..c60f9fbca03
+--- /dev/null
++++ b/apps/desktop/electron/ssh-keepalive-hold.ts
+@@ -0,0 +1,121 @@
++/**
++ * Which published SSH-isolated scopes Desktop main keeps a keep-alive socket on.
++ *
++ * The keep-alive (ssh-isolated-keepalive.ts, #106935) stops a backend that Desktop
++ * still owns from idle-exiting. Holding it for EVERY published scope turned any
++ * one-off dial (a sidebar/roster sweep over all of a host's profiles) into a
++ * backend that lived for the whole Desktop session: nine remote backends on one
++ * host, 4 of them outside the bounded warm set remote-prewarm.ts promises
++ * ("default + the profiles the user actually uses", cap per connection).
++ *
++ * A scope stays held while it is the primary, a bare/local/non-SSH scope, the
++ * `default` profile, a prewarm target, or was dialled for use in the last
++ * ACTIVE_USE_HOLD_MS. Everything else only loses Desktop main's keep-alive
++ * socket: the tunnel and pool entry stay, a renderer socket or running turn
++ * still keeps the backend up, and a later dispatch probe redials a backend that
++ * idle-exited. Nothing here kills a process or tears down a connection.
++ *
++ * Electron-free: main.ts injects the registry, targets and clock.
++ */
++import { parseBackendScopeKey } from './connection-registry'
++
++export const ACTIVE_USE_HOLD_MS = 30 * 60_000
++export const HOLD_RECONCILE_MS = 15_000
++
++type KeepaliveRegistry = {
++  isHeld: (scope: string) => boolean
++  scopes: () => string[]
++  setHeld: (scope: string, held: boolean) => boolean
++}
++
++export type SshKeepaliveHoldDeps = {
++  keepalives: KeepaliveRegistry
++  /** `${connectionId}::${profile}` of every current prewarm target (remote-prewarm.ts prewarmTargetKey). */
++  prewarmKeys: () => Iterable<string>
++  isPrimaryScope: (scope: string) => boolean
++  isSshConnection: (connectionId: string) => boolean
++  log?: (line: string) => void
++  now?: () => number
++  setTimer?: (fn: () => void, ms: number) => unknown
++  clearTimer?: (timer: unknown) => void
++}
++
++export class SshKeepaliveHolds {
++  readonly #deps: SshKeepaliveHoldDeps
++  readonly #lastUse = new Map<string, number>()
++  #timer: unknown = null
++
++  constructor(deps: SshKeepaliveHoldDeps) {
++    this.#deps = deps
++  }
++
++  #now() {
++    return (this.#deps.now ?? Date.now)()
++  }
++
++  /** A non-passive dial for real use (same signal remote-prewarm's recent set records). */
++  noteUse(scope: string) {
++    this.#lastUse.set(scope, this.#now())
++  }
++
++  shouldHold(scope: string, prewarm: ReadonlySet<string> = new Set(this.#deps.prewarmKeys())): boolean {
++    const { connectionId, profile } = parseBackendScopeKey(scope)
++
++    if (!connectionId || !this.#deps.isSshConnection(connectionId) || profile === 'default') {
++      return true
++    }
++
++    if (this.#deps.isPrimaryScope(scope) || prewarm.has(`${connectionId}::${profile}`)) {
++      return true
++    }
++
++    const usedAt = this.#lastUse.get(scope)
++
++    return usedAt != null && this.#now() - usedAt < ACTIVE_USE_HOLD_MS
++  }
++
++  reconcile() {
++    const prewarm = new Set(this.#deps.prewarmKeys())
++    const live = new Set(this.#deps.keepalives.scopes())
++
++    for (const scope of this.#lastUse.keys()) {
++      if (!live.has(scope) && !this.shouldHold(scope, prewarm)) {
++        this.#lastUse.delete(scope)
++      }
++    }
++
++    for (const scope of live) {
++      const held = this.shouldHold(scope, prewarm)
++
++      if (this.#deps.keepalives.setHeld(scope, held)) {
++        this.#deps.log?.(
++          held
++            ? `[ssh] keep-alive held again for ${scope} (in use / warm set)`
++            : `[ssh] keep-alive released for ${scope}: not primary, default, prewarm or used in ${ACTIVE_USE_HOLD_MS / 60_000} min; the backend idle-exits on its own once no client or turn holds it`
++        )
++      }
++    }
++  }
++
++  start() {
++    if (this.#timer != null) {
++      return
++    }
++
++    const setTimer = this.#deps.setTimer ?? ((fn: () => void, ms: number) => setInterval(fn, ms))
++
++    const timer = setTimer(() => this.reconcile(), HOLD_RECONCILE_MS)
++
++    ;(timer as { unref?: () => void } | undefined)?.unref?.()
++    this.#timer = timer
++  }
++
++  stop() {
++    if (this.#timer == null) {
++      return
++    }
++
++    ;(this.#deps.clearTimer ?? (t => clearInterval(t as ReturnType<typeof setInterval>)))(this.#timer)
++    this.#timer = null
++  }
++}
+-- 
+2.55.0
+
