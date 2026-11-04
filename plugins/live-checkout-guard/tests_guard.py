@@ -426,3 +426,63 @@ def test_ln_destination_in_live_blocked(env):
     assert blocked(term(f"ln -s -t {env.live} /etc/hosts", env.other))
     assert blocked(term(f"ln -s --target-directory={env.live} /etc/hosts", env.other))
     assert blocked(term(f"ln -s /etc/hosts {env.link}/y", env.other))
+
+
+# ---- leading cd / $VAR paths: resolve before refusing (card t_01a1a13103e73bf3) -----------------------
+
+def test_cd_out_first_then_relative_write_allowed(env, monkeypatch):
+    """(1) cwd inside the live checkout, but the command cd's out first: later relative paths are outside."""
+    out = env.other / "x"
+    out.mkdir()
+    assert not term(f"cd {out}; echo > f", env.live)
+    assert not term(f"cd {out}; cat > reply.txt <<'E'\nhi\nE", env.live)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(out))
+    assert not term("cd $HERMES_KANBAN_WORKSPACE; cat > reply.txt <<'E'\nhi\nE", env.live)
+    assert not term("cd ${HERMES_KANBAN_WORKSPACE} && echo > f", env.live)
+
+
+def test_tmpdir_var_paths_allowed_when_outside(env, monkeypatch):
+    """(2) $TMPDIR (and an in-command assignment from it) expands before the in-root check."""
+    monkeypatch.setenv("TMPDIR", str(env.other))
+    assert not term("rm -rf $TMPDIR/foo", env.live)
+    assert not term("rm -rf ${TMPDIR}/foo", env.live)
+    assert not term("D=$TMPDIR/rcwt; rm -rf $D", env.live)
+    assert not term("export D=$TMPDIR/rcwt && mkdir -p $D && echo > $D/f", env.live)
+
+
+def test_unknown_var_path_is_not_proven_inside(env, monkeypatch):
+    monkeypatch.delenv("LCG_NOPE", raising=False)
+    assert not term("rm -rf $LCG_NOPE/foo", env.live)
+    assert not term("cd $LCG_NOPE; echo > f", env.live)
+
+
+def test_relative_write_with_cwd_inside_still_refused(env):
+    """(3) no cd, cwd inside the checkout: still refused."""
+    assert blocked(term("echo > f", env.live))
+
+
+def test_cd_into_live_checkout_then_write_still_refused(env, monkeypatch):
+    """(4) cd into the checkout (literal, ~ or a variable that expands into it) still refuses."""
+    assert blocked(term(f"cd {env.live} && echo > f", env.other))
+    monkeypatch.setenv("HOME", str(env.tmp))
+    assert blocked(term("cd ~/live && echo > f", env.other))
+    assert blocked(term("cd $HOME/live && echo > f", env.other))
+    monkeypatch.setenv("TMPDIR", str(env.live))
+    assert blocked(term("rm -rf $TMPDIR/foo", env.other))
+    assert blocked(term("D=$TMPDIR/x; rm -rf $D", env.other))
+
+
+def test_literal_case4_default_root(monkeypatch, tmp_path):
+    """(4) verbatim: `cd ~/code/hermes-mods && echo > f` against the default root."""
+    monkeypatch.delenv("LIVE_CHECKOUT_ROOT", raising=False)
+    monkeypatch.delenv("LIVE_CHECKOUT_GUARD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "code" / "hermes-mods").mkdir(parents=True)
+    assert guard.check_shell("cd ~/code/hermes-mods && echo > f", str(tmp_path))
+
+
+def test_unknown_cwd_ln_and_git_not_crashing(env, monkeypatch):
+    monkeypatch.delenv("LCG_NOPE", raising=False)
+    assert not term("ln -s /x $LCG_NOPE/y", env.live)
+    assert not term("cd $LCG_NOPE && ln -s /x y && git stash", env.live)
+    assert blocked(term(f"cd $LCG_NOPE; cd {env.live}; echo > f", env.other))

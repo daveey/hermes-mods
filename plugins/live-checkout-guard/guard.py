@@ -12,6 +12,7 @@ Best-effort lexical analysis, not a sandbox. See README.md for limitations.
 from __future__ import annotations
 
 import ast
+import contextvars
 import os
 import re
 import shlex
@@ -60,12 +61,48 @@ def root_label() -> str:
     return os.environ.get("LIVE_CHECKOUT_ROOT") or DEFAULT_ROOT
 
 
+# Shell analysis only: variables assigned earlier in the same command (``D=$TMPDIR/x; rm -rf $D``; a None value
+# means "assigned, value unknown"). None outside check_shell, so file-tool and python paths are taken literally.
+_SHELL_VARS: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("lcg_shell_vars", default=None)
+# A cwd we cannot know (``cd $UNSET``, ``cd $(...)``): relative paths under it are not proven inside the root.
+UNKNOWN_CWD = "\x00unknown-cwd"
+_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _expand(path: str) -> Optional[str]:
+    """Expand ``~``, ``$NAME`` and ``${NAME}`` (in-command assignments first, then the environment) while
+    analysing a shell command. None when something stays unresolved (unset variable, ``$(...)``, backticks,
+    other ``${...}`` forms): such a path is not proven inside the root."""
+    shell_vars = _SHELL_VARS.get()
+    if shell_vars is None:
+        return os.path.expanduser(path)
+    missing = False
+
+    def sub(m: re.Match) -> str:
+        nonlocal missing
+        name = m.group(1) or m.group(2)
+        val = shell_vars[name] if name in shell_vars else os.environ.get(name)
+        if val is None:
+            missing = True
+            return ""
+        return val
+
+    out = _VAR.sub(sub, os.path.expanduser(path))
+    if missing or "$" in out or "`" in out:
+        return None
+    return os.path.expanduser(out)
+
+
 def in_root(path: str, cwd: Optional[str] = None) -> bool:
     """True if ``path`` (relative to ``cwd``) resolves, through symlinks, to the protected root or below."""
-    if not path:
+    if not path or path.startswith(UNKNOWN_CWD):
         return False
-    p = os.path.expanduser(path)
+    p = _expand(path)
+    if p is None:
+        return False
     if not os.path.isabs(p):
+        if cwd and cwd.startswith(UNKNOWN_CWD):
+            return False
         p = os.path.join(cwd or os.getcwd(), p)
     r = os.path.realpath(p)
     base = root()
@@ -174,8 +211,10 @@ def _git_clean(d: str) -> bool:
 
 
 def _join(cwd: str, p: str) -> str:
-    p = os.path.expanduser(p)
-    return p if os.path.isabs(p) else os.path.join(cwd, p)
+    q = _expand(p)
+    if q is None:
+        return UNKNOWN_CWD
+    return q if os.path.isabs(q) else os.path.join(cwd, q)
 
 
 def _check_git(args: list[str], cwd: str, git_env: Optional[dict] = None) -> Optional[str]:
@@ -303,6 +342,8 @@ def _in_root_nofollow(path: str, cwd: str) -> bool:
     """Like in_root, but a final symlink component is not followed unless it points at a directory
     (where tools like ln create the new entry inside it)."""
     p = _join(cwd, path)
+    if p.startswith(UNKNOWN_CWD):
+        return False
     if os.path.isdir(p):
         return in_root(p)
     parent, base = os.path.split(os.path.normpath(p))
@@ -344,6 +385,13 @@ def _check_segment(words: list[str], targets: list[str], cwd: str) -> tuple[Opti
         if in_root(t, cwd):
             return f"output redirection to {t}, inside the live checkout", cwd
     seg_cwd = cwd
+    lead = words[1:] if words and words[0] in {"export", "declare", "typeset", "readonly", "local"} else words
+    assigns = [re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", w, re.S) for w in lead]
+    shell_vars = _SHELL_VARS.get()
+    if lead and all(assigns) and shell_vars is not None:  # `D=x` / `export D=x` alone: D holds for later segments
+        for m in filter(None, assigns):
+            shell_vars[m.group(1)] = _expand(m.group(2)) if m.group(2) else ""
+        return None, seg_cwd
     words, cwd, git_env = _strip_wrappers(words, cwd)
     if not words:
         return None, seg_cwd
@@ -356,8 +404,10 @@ def _check_words(words: list[str], cwd: str, git_env: dict) -> tuple[Optional[st
     cmd = os.path.basename(words[0])
     args = words[1:]
     if cmd in {"cd", "pushd"}:
-        tgt = os.path.expanduser(args[0]) if args and not args[0].startswith("-") else (
-            os.path.expanduser(args[1]) if len(args) > 1 else os.path.expanduser("~"))
+        raw = args[0] if args and not args[0].startswith("-") else (args[1] if len(args) > 1 else "~")
+        tgt = _expand(raw)
+        if tgt is None or (not os.path.isabs(tgt) and cwd.startswith(UNKNOWN_CWD)):
+            return None, UNKNOWN_CWD  # `cd $UNSET` / `cd $(...)`: later relative paths are not proven inside
         return None, os.path.normpath(tgt if os.path.isabs(tgt) else os.path.join(cwd, tgt))
     if cmd == "hermes-sync":
         return None, cwd
@@ -541,12 +591,17 @@ def check_shell(cmd: str, cwd: Optional[str] = None, *, _update_checked: bool = 
         return why
     if not cmd.strip():
         return None
-    for seg in _segments(_tokens(cmd)):
-        words, targets = _redirect_targets(seg)
-        why, cwd = _check_segment(words, targets, cwd)
-        if why:
-            return why
-    return None
+    token = _SHELL_VARS.set({}) if _SHELL_VARS.get() is None else None  # nested sh -c / eval share the outer vars
+    try:
+        for seg in _segments(_tokens(cmd)):
+            words, targets = _redirect_targets(seg)
+            why, cwd = _check_segment(words, targets, cwd)
+            if why:
+                return why
+        return None
+    finally:
+        if token is not None:
+            _SHELL_VARS.reset(token)
 
 
 # ---- a throwaway HERMES_HOME that would persist in the terminal session -------------------------

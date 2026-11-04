@@ -197,7 +197,10 @@ terminal/execute-code guard checks. Existing
 
 ## Limitations (best-effort, not a sandbox)
 
-- Lexical analysis only. Variables/command substitution (`cd $X`, `> $(…)`, `"$DIR"/f`), globs, `xargs`, `find -exec`,
+- Lexical analysis only. `$NAME`/`${NAME}` in shell paths (and `cd` targets) expand from assignments earlier in the
+  same command (`D=$TMPDIR/x; rm -rf $D`) and then the guard process's environment; a path that stays unresolved
+  (unset variable, `$(…)`, backticks, `${X:-…}`) is not proven inside and is allowed, and after `cd` to such a path
+  later relative paths are too. Globs, `xargs`, `find -exec`,
   exported `GIT_DIR` (set in an earlier segment/call), aliases, functions, scripts that write on their own (`make`, `npm`,
   editors, `python script.py`) are not seen.
 - `execute_code` with non-literal paths/commands (built strings, loop variables, imports of other modules) is not inspected;
