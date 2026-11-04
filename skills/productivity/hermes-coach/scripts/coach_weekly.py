@@ -24,6 +24,8 @@ Prints a Markdown block the coach Bot turns into reports/weekly-<date>.md:
   3. Each --check: before/after comparison for a config change at a timestamp (sessions fully before vs started
      after, equal-length windows), with a keep / raise / revert recommendation.
   4. Pending and rejected proposals (the Bot must not re-propose rejected ones).
+  4b. Card outcomes: last linked-card outcomes, tried-and-decided, and watch (card closed, proposal undecided), from
+     the `card_outcome` rows coach-apply auto records (coach_proposals.render_outcomes).
 """
 import argparse, collections, contextlib, glob, json, re, statistics, sys, time
 from datetime import datetime, timezone
@@ -801,6 +803,7 @@ def main():
                "## Phase 4 ideas: none yet (no ideas.md in the data repo).")
     out.append("")
     out += section_proposals(data, now, a.days)
+    out += [""] + coach_proposals.render_outcomes(data)
     out += [""] + coach_yield.section_yield(data, now, a.sources_dir, a.source_target_root)
     print("\n".join(out))
 

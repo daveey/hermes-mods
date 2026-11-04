@@ -5,6 +5,7 @@
     coach_proposals.py list     --data DIR [--status pending|applied|rejected|all] [--json]
     coach_proposals.py rejected --data DIR                                    # the never-propose-again list
     coach_proposals.py mark     --data DIR --id ID --status applied|rejected [--note TEXT] [--by WHO]
+    coach_proposals.py outcomes --data DIR [--limit 6]   # last card outcomes / tried / watch (prompt block)
 
 A proposal is a fenced block in the weekly report:
 
@@ -46,8 +47,11 @@ line per decision (applied | canary | carded | rejected | dropped | reverted). T
 fingerprint (kind + target + change) was ever rejected is dropped by `add`, so it is never proposed again.
 reports/suppressions.jsonl holds the Inbox card decisions (`coach-improvement` type, written by coach_apply):
 Not now = no proposal for that kind + target for 14 days, Never = no proposal for it ever. `add` honours both.
+A metadata-only line {"id", "date", "card_outcome": {card, board, card_status, run_id, run_status, summary, evidence,
+completed_at}} records what the proposal's linked card ended with (written by `coach-apply auto` when the card is
+done/archived); it never carries `status`, so a proposal's decision is only ever the explicit one.
 """
-import argparse, calendar, hashlib, json, os, re, sys, time
+import argparse, calendar, contextlib, hashlib, json, os, re, sys, time
 from pathlib import Path
 
 KINDS = ("skill_patch", "config", "shared_config", "curriculum", "plugin_rule", "core", "fix", "trial")
@@ -193,6 +197,130 @@ def append(data, rec):
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+# ── Card outcomes: neutral memory of what a proposal's linked Kanban card ended with ──
+# `coach-apply auto` reads the card (read-only, on its own explicit board) once it is done or archived and appends
+# one metadata-only row {"id", "date", "card_outcome": {...}}: no `status`/`at`/`by`, so the proposal's explicit
+# decision (carded / applied / rejected / ...) is never changed or inferred from the card. A row is appended only when
+# the snapshot differs from the one already recorded, so reruns are no-ops.
+OUTCOME_TERMINAL = ("done", "archived")
+OUTCOME_SUMMARY_MAX = 280
+_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def board_db(home, board, environ=None):
+    """The explicit board's own kanban.db (core `board_own_db_path`): `<root>/kanban.db` for `default`, else
+    `<root>/kanban/boards/<board>/kanban.db`. root = HERMES_KANBAN_HOME, else the Hermes root (a profile home's
+    root is two levels up: boards are shared across profiles). Worker pins (HERMES_KANBAN_DB) are ignored on purpose:
+    the board is explicit, and a missing board DB means no outcomes, never another board's."""
+    e = os.environ if environ is None else environ
+    board = str(board or "").strip().lower()
+    if not _SLUG.match(board):
+        raise ValueError(f"bad board slug {board!r}")
+    root = Path(e.get("HERMES_KANBAN_HOME") or home).expanduser()
+    if not e.get("HERMES_KANBAN_HOME") and root.parent.name == "profiles":
+        root = root.parent.parent
+    return root / "kanban.db" if board == "default" else root / "kanban" / "boards" / board / "kanban.db"
+
+
+def _ro_db(path):
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+        c.execute("select 1 from sqlite_master limit 1").fetchall()
+        return c
+    except sqlite3.OperationalError:  # WAL db without -shm: query_only on a normal open, never writes rows
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=10)
+        c.execute("pragma query_only = on")
+        return c
+
+
+def _iso(ts):
+    if ts in (None, ""):
+        return None
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return None
+    ts = ts / 1000 if ts > 1e11 else ts  # some writers store ms
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _bound(text, limit=OUTCOME_SUMMARY_MAX):
+    t = " ".join(str(text or "").split())
+    t = re.sub(r"(gh[pousr]_|github_pat_|sk-[a-z]*-?)[A-Za-z0-9_-]{8,}", "<token>", t)
+    return t if len(t) <= limit else t[:limit - 1].rstrip() + "…"
+
+
+def card_outcome(kdb, board, card):
+    """Snapshot of a done/archived card on `kdb`, else None (absent from this board, or not terminal yet).
+    The run is the latest completed run with a non-empty summary; without one the latest run (any outcome) is named
+    and `summary` is None with `evidence: unknown`. Nothing is inferred from the summary."""
+    with contextlib.closing(_ro_db(kdb)) as k:
+        t = k.execute("select id, status, completed_at from tasks where id = ?", (card,)).fetchone()
+        if not t or t[1] not in OUTCOME_TERMINAL:
+            return None
+        runs = k.execute("select id, status, outcome, summary, ended_at from task_runs where task_id = ? "
+                         "order by id desc", (card,)).fetchall()
+    real = [r for r in runs if r[2] == "completed" and str(r[3] or "").strip()]
+    run = real[0] if real else (runs[0] if runs else None)
+    return {"card": card, "board": board, "card_status": t[1],
+            "run_id": run[0] if run else None,
+            "run_status": (run[2] or run[1]) if run else None,
+            "summary": _bound(run[3]) if real else None,
+            "evidence": "run_summary" if real else "unknown",
+            "completed_at": _iso(t[2]) or (_iso(run[4]) if run else None)}
+
+
+def reconcile_outcomes(data, home, board, dry=False, environ=None):
+    """Record the card outcome of every proposal whose linked card on `board` is done/archived. Returns
+    [(id, snapshot)] for new/changed snapshots; appends them unless dry. Never touches `status`."""
+    kdb = board_db(home, board, environ)
+    if not kdb.exists():
+        return []
+    out = []
+    for p in state(data).values():
+        card = p.get("card")
+        if not (isinstance(card, str) and re.match(r"^t_[0-9a-f]{6,}$", card)):
+            continue
+        snap = card_outcome(kdb, board, card)
+        if not snap or snap == p.get("card_outcome"):
+            continue
+        out.append((p["id"], snap))
+        if not dry:  # `date` is identity (ignored by state()); it keeps date-windowed readers (coach_yield) whole
+            append(data, {"id": p["id"], **({"date": p["date"]} if p.get("date") else {}), "card_outcome": snap})
+    return out
+
+
+def render_outcomes(data, limit=6):
+    """Bounded prompt block: the last card outcomes, what was tried and decided, and the watch list (a terminal
+    card whose proposal still has no explicit decision). Status is always the proposal's own."""
+    rows = [p for p in state(data).values()
+            if isinstance(p.get("card_outcome"), dict) and p["card_outcome"].get("card") == p.get("card")]
+    rows.sort(key=lambda p: (p["card_outcome"].get("completed_at") or "", p["id"]), reverse=True)
+
+    def line(p):
+        o = p["card_outcome"]
+        s = f'"{o["summary"]}"' if o.get("summary") else "summary unknown"
+        return (f"- {p['id']} {p.get('kind')} {p.get('target')} [{p.get('status')}]: card {o['card']} "
+                f"{o.get('card_status')} {str(o.get('completed_at') or 'date unknown')[:10]}, run "
+                f"{o.get('run_id') if o.get('run_id') is not None else 'unknown'} {o.get('run_status') or ''}"
+                f" — {s}").replace("  ", " ")
+
+    def capped(xs, fmt):
+        return [fmt(p) for p in xs[:limit]] + ([f"- (+{len(xs) - limit} more)"] if len(xs) > limit else []) \
+            or ["- none"]
+
+    watch = [p for p in rows if p.get("status") in ("carded", "pending")]
+    tried = [p for p in rows if p not in watch]
+    return (["## Card outcomes (linked Kanban cards; [status] is the proposal's own decision, never inferred)", "",
+             f"Last outcomes ({len(rows)}):"] + capped(rows, line)
+            + ["", f"Tried and decided ({len(tried)}):"]
+            + capped(tried, lambda p: f"- {p.get('kind')} {p.get('target')} -> {p.get('status')} "
+                                      f"(card {p['card_outcome']['card']} {p['card_outcome'].get('card_status')})")
+            + ["", f"Watch: card closed, proposal still undecided ({len(watch)}):"]
+            + capped(watch, line))
+
+
 def validate(p):
     errs = []
     if p.get("kind") not in KINDS:
@@ -312,6 +440,11 @@ def cmd_suppressions(a):
     return 0
 
 
+def cmd_outcomes(a):
+    print("\n".join(render_outcomes(a.data, a.limit)))
+    return 0
+
+
 def cmd_mark(a):
     st = state(a.data)
     if a.id not in st:
@@ -328,11 +461,13 @@ def cmd_mark(a):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("add", "list", "rejected", "mark", "suppressions"):
+    for name in ("add", "list", "rejected", "mark", "suppressions", "outcomes"):
         s = sub.add_parser(name)
         s.add_argument("--data", required=True)
         if name == "add":
             s.add_argument("--report", required=True)
+        if name == "outcomes":
+            s.add_argument("--limit", type=int, default=6)
         if name == "suppressions":
             s.add_argument("--clear", nargs=2, metavar=("KIND", "TARGET"))
         if name == "list":
@@ -346,7 +481,7 @@ def main(argv=None):
             s.add_argument("--by", default="coach-apply")
     a = ap.parse_args(argv)
     rc = {"add": cmd_add, "list": cmd_list, "rejected": cmd_rejected, "mark": cmd_mark,
-          "suppressions": cmd_suppressions}[a.cmd](a)
+          "suppressions": cmd_suppressions, "outcomes": cmd_outcomes}[a.cmd](a)
     if a.cmd == "mark" and rc == 0 and a.status in ("applied", "reverted"):
         # A card that lands a review-tier proposal marks it here, not through coach-apply: post it to the Inbox too.
         try:

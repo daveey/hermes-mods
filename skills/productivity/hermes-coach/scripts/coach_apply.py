@@ -17,6 +17,8 @@
         kind trial   -> the trial lane: one `coach-trial:<slug>` card a day (goal mode, 2 h) while the lane's spend
                         (trial cards + coach_eval runs) today is under $10; logged as lane trial
         pending > 7 days whose gate still fails -> dropped with the reason
+        linked card done/archived -> one metadata-only `card_outcome` row (card status, final run, bounded summary or
+                        explicit unknown); the proposal's status is never changed or inferred from it
     coach_apply.py list --status all|pending|applied|canary|carded|rejected|dropped|reverted
     coach_apply.py inbox [--days 7]    re-post recent applied/canary improvements to the Hermes Inbox
 Every applied / canary / kept / reverted improvement is posted to the Hermes Inbox (`hermes inbox post`, key
@@ -816,6 +818,12 @@ def auto(env, dry=False, now=None, out=print):
         done += sync_inbox(env, dry, now, out)
     except Exception as e:  # noqa: BLE001
         out(f"inbox sync failed: {type(e).__name__}: {e}")
+    try:  # neutral memory: what each linked card on env.board ended with (read-only board query, status untouched)
+        for pid, o in cp.reconcile_outcomes(env.data, env.home, env.board, dry=dry):
+            done.append((pid, "would record outcome" if dry else "card outcome",
+                         f"{o['card']} {o['card_status']} run {o['run_id']} {o['run_status']} ({o['evidence']})"))
+    except Exception as e:  # noqa: BLE001 — never block the rollout pass on outcome memory
+        out(f"card outcome reconcile failed: {type(e).__name__}: {e}")
     for p in sorted(cp.state(env.data).values(),
                     key=lambda q: (q.get("kind") not in ("fix", "trial"), q.get("at", ""))):
         st, pid = p.get("status"), p["id"]
