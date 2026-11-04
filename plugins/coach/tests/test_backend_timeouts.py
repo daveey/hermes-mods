@@ -81,7 +81,7 @@ class Runner:
 
 
 def run(home, runner, *extra, now=NOW):
-    return bt.main(["--home", str(home), "--host", "David-MBP", "--json", *extra], runner=runner, now=now,
+    return bt.main(["--home", str(home), "--host", "laptop-1", "--json", *extra], runner=runner, now=now,
                    probe=lambda: {"loadavg": [44.1, 50.2, 70.3], "backend_ps": ["123 281.0 hermes serve"]})
 
 
@@ -94,9 +94,9 @@ def test_40_timeouts_open_one_card_with_counts_paths_cpu_and_acceptance(tmp_path
     assert out["by_path"]["/api/sessions/<id>"] == 30
     assert out["by_path"]["/api/plugins/kanban/board"] == 10
     (argv, body), = r.creates()
-    assert argv[argv.index("--idempotency-key") + 1] == "backend-timeouts:David-MBP:2026-10-27"
+    assert argv[argv.index("--idempotency-key") + 1] == "backend-timeouts:laptop-1:2026-10-27"
     assert argv[argv.index("--assignee") + 1] == "default"
-    assert "40" in argv[-1] and "David-MBP" in argv[-1]
+    assert "40" in argv[-1] and "laptop-1" in argv[-1]
     assert "/api/sessions/<id>" in body and "281.0" in body and "44.1" in body
     assert "zero" in body.lower() and "30-minute" in body  # acceptance: a fresh clean window, not a restart
     assert r.comments() == []
@@ -149,7 +149,7 @@ def test_closed_card_opens_recurrence(tmp_path, status, lose_state):
     if lose_state:
         bt.state_path(tmp_path).unlink()
     run(tmp_path, r, now=NOW + timedelta(minutes=10))
-    key = bt.card_key('David-MBP', NOW)
+    key = bt.card_key('laptop-1', NOW)
     assert list(r.keys) == [key, key + ':2']
     assert 't_00000000' in r.creates()[-1][1]
     assert 'closed' in r.creates()[-1][1]
@@ -178,7 +178,7 @@ def test_status_lookup_failure_opens_recurrence(tmp_path, failure):
     run(tmp_path, r)
     r.show_failure = failure
     run(tmp_path, r, now=NOW + timedelta(minutes=10))
-    assert list(r.keys)[-1] == bt.card_key('David-MBP', NOW) + ':2'
+    assert list(r.keys)[-1] == bt.card_key('laptop-1', NOW) + ':2'
     assert 't_00000000' in r.creates()[-1][1]
     assert not r.comments()
 
@@ -191,7 +191,7 @@ def test_next_day_opens_a_new_card(tmp_path, capsys):
     write_log(tmp_path, 40, now=tomorrow)
     assert run(tmp_path, r, now=tomorrow) == 0
     capsys.readouterr()
-    assert sorted(r.keys) == ["backend-timeouts:David-MBP:2026-10-27", "backend-timeouts:David-MBP:2026-10-28"]
+    assert sorted(r.keys) == ["backend-timeouts:laptop-1:2026-10-27", "backend-timeouts:laptop-1:2026-10-28"]
     assert r.comments() == []
 
 
@@ -352,7 +352,7 @@ def test_awake_split_without_any_wake_is_no_wake_seen(tmp_path):
 
 
 def test_timeouts_issued_before_a_wake_count_as_sleep_even_when_they_fire_after_it(tmp_path):
-    # 2026-11-01 18:36:09 on David-MBP: 40 GET /api/cron/jobs 60 s timeouts fired 30 s after a lid wake. Each request
+    # 2026-11-01 18:36:09 on laptop-1: 40 GET /api/cron/jobs 60 s timeouts fired 30 s after a lid wake. Each request
     # was issued while the lid was shut (latest possible start 18:35:10 < wake 18:35:39), so none is an awake incident.
     sleep_lo = NOW - timedelta(minutes=10)
     wake = NOW - timedelta(minutes=5)
@@ -404,5 +404,5 @@ def test_spanning_burst_opens_no_card_and_body_reports_the_split(tmp_path, capsy
     out = json.loads(capsys.readouterr().out)
     assert out['count'] == 40 and out['awake_count'] == 0 and out['sleep_spanning_count'] == 40
     assert not out['over_threshold'] and not r.calls
-    body = bt.card_body('David-MBP', {**out, 'awake_count': 31}, {}, 30, 30)
+    body = bt.card_body('laptop-1', {**out, 'awake_count': 31}, {}, 30, 30)
     assert 'of which 40 landed\nafter a wake but were issued before it' in body

@@ -19,7 +19,7 @@ Source commit notes (first paragraph of each message, privacy-normalized):
 - 1716: reconcile_links ran every 60 s unconditionally: each pass re-ran kanban_chat_links.reconcile and its creator-chats backfill over every task, subscription, ledger row and replica link, and every placeholder check reloaded the placement config (5051 loads per pass on a 600-card probe board).
 - 1717: (subject only)
 - 1721: (subject only)
-- 1723: /api/status resolved the restart drain timeout through read_raw_config(), which deep-copies the whole user config (~2.6 ms per poll on David-MBP); board_paths() re-read kanban.sync once per board on every session-list poll. Tests RED first.
+- 1723: /api/status resolved the restart drain timeout through read_raw_config(), which deep-copies the whole user config (~2.6 ms per poll on laptop-1); board_paths() re-read kanban.sync once per board on every session-list poll. Tests RED first.
 
 ## Code
 

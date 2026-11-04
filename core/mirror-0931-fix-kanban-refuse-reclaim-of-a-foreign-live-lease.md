@@ -26,7 +26,7 @@ The source author's rationale below is retained for porting. Any tests or live o
 
 > A replica reclaim of a card another gateway still leases closed the run.
 > The close synced, and the owner's terminal-worker reaper SIGTERMed the
-> live worker (David-MBP 2026-10-28 23:05, during the core-update drain).
+> live worker (laptop-1 2026-10-28 23:05, during the core-update drain).
 > reclaim_task now records reclaim_refused and leaves the run open. The
 > reaper skips a run whose task is still running under that worker. A dead
 > worker during a drain hold is requeued to ready and not claimed again

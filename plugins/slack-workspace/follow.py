@@ -59,7 +59,7 @@ PICKUP_WAIT_S = 25
 # than PULL_GRACE_S goes to the Mac's pull cron (slack_follow_pull.py). "courier_only" = no pull
 # fallback. "pull" = the pull cron only. Why courier first: see DELIVERY.md in this plugin.
 PULL_GRACE_S = 180
-MBP_DEVICE = "david-mbp"  # follower.mbp_device: courier name for owner refs that say `@this-device`
+MBP_DEVICE = "macbook"  # follower.mbp_device: courier name for owner refs that say `@this-device`
 LOCAL_ALIASES = ("this-device", "local")
 
 

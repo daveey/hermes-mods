@@ -118,8 +118,8 @@ def test_remote_drain_claims_requests_only_it_can_serve_while_home_alive(tmp_pat
     _routed(base, "tohub", "hermes-hub")     # gateway only the remote Mac reaches
     _routed(base, "tomini", "mac-mini")      # home courier can serve it
     _request(base, "unrouted")               # anyone-can-serve: home courier keeps it
-    got = rf.claim_pending(base, home=False, courier="macbook", aliases=["david-mbp"],
-                           reach=["macbook", "david-mbp", "hermes-hub", "mac-mini"])
+    got = rf.claim_pending(base, home=False, courier="macbook", aliases=["laptop-1"],
+                           reach=["macbook", "laptop-1", "hermes-hub", "mac-mini"])
     assert sorted(r["id"] for r in got) == ["tohub", "tomac"]
     assert sorted(p.stem for p in (base / "outbox").glob("*.json")) == ["tomini", "unrouted"]
     assert sorted(r["id"] for r in rf.claim_pending(base, home=True, courier="mac-mini",

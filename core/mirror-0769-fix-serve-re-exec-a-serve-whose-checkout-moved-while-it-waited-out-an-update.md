@@ -22,7 +22,7 @@ The source author's rationale below is retained for porting. Any tests or live o
 
 > A Desktop serve that boots during `hermes update` waits in wait_for_update_clear, but by then
 > hermes_cli.main, hermes_cli.config and the provider plugins are already imported and
-> get_version_info() is cached (the fireworks plugin reads it at import). David-MBP 2026-10-28:
+> get_version_info() is cached (the fireworks plugin reads it at import). laptop-1 2026-10-28:
 > serve pid 50733 started 07:02:38, cached commit cc29d783ed by 07:02:39 (the source:git stamp
 > still matched HEAD), the checkout moved to 42ea812e27 at 07:02:50, the stamp at 07:03:36, the
 > wait cleared at 07:03:40.6, and /api/health reported cc29d783ed for the process's whole life

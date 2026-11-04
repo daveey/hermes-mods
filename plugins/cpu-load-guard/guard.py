@@ -10,7 +10,7 @@ from pathlib import Path
 # hermes-hub is the shared kanban host. It used to be the sanctioned place to
 # generate load, which put per-core burners on the fleet. Protect it by default.
 # A cpu-load-guard.yaml protected_hosts list still replaces this whole list.
-DEFAULT_PROTECTED = ["David-MBP", "MacBook-Pro-177", "hermes-hub"]
+DEFAULT_PROTECTED = ["hermes-hub"]
 
 # Expressions that evaluate to "number of cores".
 NCPU_RE = re.compile(

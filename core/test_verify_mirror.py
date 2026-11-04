@@ -267,6 +267,54 @@ class MirrorTests(unittest.TestCase):
         self.verify(policy=self.policy([['public-example', 'original-example']]),
                     error='Unexplained blob divergence')
 
+    def regex_policy(self, rules):
+        path = self.policy()
+        obj = json.loads(path.read_text())
+        obj['regex_substitutions'] = rules
+        path.write_text(json.dumps(obj))
+        return path
+
+    def test_regex_hostname_families_and_replay(self):
+        # Read the shipped generic rules; no private hostnames in fixtures.
+        rules = json.loads(SCRIPT.with_name('mirror-policy-1923.json').read_text())['regex_substitutions']
+        original = (b'Alex-MBP alex-mbp.local ALEX-MBP.LOCAL sams-mac-mini.local '
+                    b'MacBook-Pro-42 macbook-pro-42.LOCAL hermes-hub worker-1 https://example.com\n')
+        expected = (b'laptop-1 laptop-1.local laptop-1.LOCAL mini-1.local '
+                    b'laptop-2 laptop-2.LOCAL hermes-hub worker-1 https://example.com\n')
+        self.write('hosts.txt', original.decode())
+        self.tip = self.commit('hostname fixture')
+        self.export()
+        path = self.regex_policy(rules)
+        substitutions, _, _ = mirror.load_policy(path, self.tip, self.base)
+        self.assertEqual(mirror.normalize(original, substitutions), expected)
+        self.assertEqual(mirror.normalize(expected, substitutions), expected)
+        self.files[-1].write_bytes(self.files[-1].read_bytes().replace(original, expected))
+        self.verify(error='Unexplained blob divergence')
+        self.verify(policy=path)
+        self.files[-1].write_bytes(self.files[-1].read_bytes().replace(b'worker-1', b'worker-9'))
+        self.verify(policy=path, error='Unexplained blob divergence')
+
+    def test_regex_policy_validation(self):
+        invalid = [None, {}, 'pattern', [None], [['x']], [['x', 'y', 'z']],
+                   [[1, 'y']], [['x', None]], [['', 'y']], [['x', '']],
+                   [['x', 'x']], [['[', 'y']], [['a*', 'y']],
+                   [['x', 'y'], ['x', 'z']], [['(?u)x', 'y']],
+                   [['\ud800', 'y']], [['x', '\ud800']]]
+        for rules in invalid:
+            with self.subTest(rules=rules):
+                self.verify(policy=self.regex_policy(rules), error='Invalid policy')
+        rules, _, _ = mirror.load_policy(self.regex_policy([['(?=x)', 'y']]), self.tip, self.base)
+        with self.assertRaisesRegex(mirror.VerificationError, 'Zero-width'):
+            mirror.normalize(b'x', rules)
+
+    def test_regex_replacements_are_literal_and_follow_literal_rules(self):
+        path = self.regex_policy([['public', r'\1']])
+        obj = json.loads(path.read_text())
+        obj['substitutions'] = [['original', 'public']]
+        path.write_text(json.dumps(obj))
+        rules, _, _ = mirror.load_policy(path, self.tip, self.base)
+        self.assertEqual(mirror.normalize(b'original', rules), br'\1')
+
     def test_fingerprint_accepts_only_exact_paired_blobs(self):
         source_blob = self.git('rev-parse', self.tip + ':second.py')
         path = self.files[-1]

@@ -332,7 +332,7 @@ def test_configured_mac_offline_or_stale_errors_immediately(remote, monkeypatch)
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
     monkeypatch.setenv("HERMES_USER_TERMINAL_DEVICE", "macbook")
     _beat(base, "mac-mini")
-    _beat(base, "macbook", ["macbook", "david-mbp"])
+    _beat(base, "macbook", ["macbook", "laptop-1"])
     old = time.time() - 120
     os.utime(base / "couriers" / "macbook.json", (old, old))
     t = time.time()
@@ -398,7 +398,7 @@ class FakeCourier(threading.Thread):
 def test_round_trip_remote_to_mac_and_back(remote, monkeypatch, tmp_path):
     base, mac = remote
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
-    monkeypatch.setenv("HERMES_USER_TERMINAL_DEVICE", "david-mbp")  # an alias resolves to the device
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DEVICE", "laptop-1")  # an alias resolves to the device
     monkeypatch.setattr(ut, "POLL_S", 1)
     screens = []
 
@@ -407,8 +407,8 @@ def test_round_trip_remote_to_mac_and_back(remote, monkeypatch, tmp_path):
         return "fake"
 
     monkeypatch.setattr(ut, "open_window", fake_window)
-    mbp, mini = FakeCourier(base, "macbook", aliases=["macbook", "david-mbp"]), FakeCourier(base, "mac-mini")
-    _beat(base, "macbook", ["macbook", "david-mbp"])
+    mbp, mini = FakeCourier(base, "macbook", aliases=["macbook", "laptop-1"]), FakeCourier(base, "mac-mini")
+    _beat(base, "macbook", ["macbook", "laptop-1"])
     _beat(base, "mac-mini")
     mbp.start()
     mini.start()

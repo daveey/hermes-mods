@@ -19,7 +19,7 @@ backend without that env, a desktop chat continued as `platform=tui`. The agent 
 `deliver=origin`) and the desktop-only tools (`drive_preview`) were not loaded. The record kept `source=tui`,
 so the turns the user sent after opening the chat ran as TUI too.
 
-On David-MBP on 2026-10-28 at 08:02:39 PDT, serve 40523's sweep continued 20261027_134353_5ab65c (stored
+On laptop-1 on 2026-10-28 at 08:02:39 PDT, serve 40523's sweep continued 20261027_134353_5ab65c (stored
 `source=desktop`) with `conversation turn: … platform=tui`.
 
 ## Behavior

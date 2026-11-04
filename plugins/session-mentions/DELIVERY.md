@@ -109,10 +109,10 @@ Live results (2026-10-19 PDT):
   with wait 120 returned `replied`, `user_row_id: 151`. Rows 151–152 landed in `/opt/data/profiles/alpha-follow/state.db`.
   `/opt/data/state.db` stayed at max id 658 with no session of that id. The throwaway session was deleted afterwards.
 - Targeting. nous-1's dashboard was restarted onto the new routes (`s6-svc -r /run/service/dashboard`, no turns in the
-  previous 10 min). Both Desktops then drained nous-1 as couriers `david-mbp` and `daveey-mini`. Their backends still
+  previous 10 min). Both Desktops then drained nous-1 as couriers `laptop-1` and `daveey-mini`. Their backends still
   ran the old routes, so the names came from the hostname fallback. From nous-1, `cross_session read` gave:
-  `@session:default@david-mbp/20261019_132933_0b8012` (the session that used to 404) was answered by the MacBook
-  4/4 times (`gateway: david-mbp`, ~2.5 s). `@session:default@daveey-mini/<id>` was answered by the mini 4/4 times
+  `@session:default@laptop-1/20261019_132933_0b8012` (the session that used to 404) was answered by the MacBook
+  4/4 times (`gateway: laptop-1`, ~2.5 s). `@session:default@daveey-mini/<id>` was answered by the mini 4/4 times
   (`gateway: daveey-mini`). `@this-device/...` failed fast with the "ambiguous" error and listed both Desktops.
   `@macbook/...` was served by the mini through its `macbook` SSH connection. The MacBook answers it itself once
   its backend restarts and reports `device: macbook`.

@@ -19,7 +19,7 @@ The patch changes the following implementation seams (diff hunk headings, not a 
 
 The source author's rationale below is retained for porting. Any tests or live observations quoted here are source claims, not executions by this mirror:
 
-> The 04:36 PDT fenced update on David-MBP (2026-10-28) still owed a false gateway_restart after
+> The 04:36 PDT fenced update on laptop-1 (2026-10-28) still owed a false gateway_restart after
 > fc7b1ac399: the dashboard refresh stopped Desktop's local `serve --port 0` (pid 38035), and
 > _launchd_job_from_launch_env attributed it to gui/501/application.com.nousresearch.hermes.* --
 > the Desktop app's LaunchServices job, whose live pid (the app) is the backend's parent. The update

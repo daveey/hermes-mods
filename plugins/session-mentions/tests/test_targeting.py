@@ -37,7 +37,7 @@ def _req(base: Path, rid: str, route: str = "") -> None:
 
 
 # The two Desktops draining nous-1, as they name things.
-MBP = dict(courier="macbook", aliases="macbook,david-mbp", reach="mac-mini,nous-1,skint-polycentrism")
+MBP = dict(courier="macbook", aliases="macbook,laptop-1", reach="mac-mini,nous-1,skint-polycentrism")
 MINI = dict(courier="mac-mini", aliases="mac-mini,daveey-mini", reach="macbook,nous-1,skint-polycentrism")
 
 
@@ -61,7 +61,7 @@ def test_request_for_a_mac_is_claimed_by_that_mac_even_when_another_desktop_reac
     rf.claim_pending(base, home=False, **MBP)
     rf.claim_pending(base, home=False, **MINI)
     _req(base, "for-mbp", "macbook")
-    _req(base, "for-mbp-host", "david-mbp")
+    _req(base, "for-mbp-host", "laptop-1")
     assert rf.claim_pending(base, home=False, **MINI) == []  # the mini reaches `macbook` but is not it
     assert sorted(r["id"] for r in rf.claim_pending(base, home=False, **MBP)) == ["for-mbp", "for-mbp-host"]
 
@@ -106,12 +106,12 @@ def test_legacy_drain_does_not_steal_a_live_devices_request(tmp_path):
 def test_device_info_prefers_config_then_hostname(monkeypatch):
     import types
     monkeypatch.setitem(sys.modules, "hermes_cli.config", types.SimpleNamespace(load_config=lambda: {"session_mentions": {"device_name": "MacBook"}}))
-    monkeypatch.setattr("socket.gethostname", lambda: "David-MBP.local")
+    monkeypatch.setattr("socket.gethostname", lambda: "laptop-1.local")
     monkeypatch.setattr(rf, "gateway_name", lambda: "")
-    assert rf.device_info() == {"device": "macbook", "aliases": ["david-mbp", "macbook"], "gateway": ""}
+    assert rf.device_info() == {"device": "macbook", "aliases": ["laptop-1", "macbook"], "gateway": ""}
     monkeypatch.setitem(sys.modules, "hermes_cli.config", types.SimpleNamespace(load_config=lambda: {}))
     monkeypatch.delenv("HERMES_DEVICE_NAME", raising=False)
-    assert rf.device_info() == {"device": "david-mbp", "aliases": ["david-mbp"], "gateway": ""}
+    assert rf.device_info() == {"device": "laptop-1", "aliases": ["laptop-1"], "gateway": ""}
 
 
 @pytest.fixture
@@ -230,7 +230,7 @@ def test_request_routed_to_a_registry_name_is_claimed_by_the_courier_reaching_th
     pytest.importorskip("httpx")
     client = _api(tmp_path, monkeypatch, "macbook")
     base = tmp_path / "session_mentions"
-    mbp = {"home": "1", "courier": "macbook", "aliases": "macbook,david-mbp", "reach": "hub,hub-ec2,mac-mini"}
+    mbp = {"home": "1", "courier": "macbook", "aliases": "macbook,laptop-1", "reach": "hub,hub-ec2,mac-mini"}
     mini = {"courier": "mac-mini", "aliases": "mac-mini", "reach": "macbook,nous-1"}
     for q in (mbp, mini):
         client.get("/outbox", params=q)  # both couriers registered

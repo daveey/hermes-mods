@@ -21,7 +21,7 @@ The source author's rationale below is retained for porting. Any tests or live o
 > hermes-sync runs `hermes update --yes` inside its core-update fence: <home>/core-update/intent
 > holds its pid and every hermes-gateway-launcher parks until it is released, which happens only
 > after the update exits. The post-update fleet probe waited its 120 s settle window, saw no rows
-> and recorded a gateway_restart follow-up on every fenced update (David-MBP: 5 consecutive runs,
+> and recorded a gateway_restart follow-up on every fenced update (laptop-1: 5 consecutive runs,
 > gateway back 7 s after each update exited).
 >
 > When an intent is held by a live ancestor of this process, probe once without the settle window;

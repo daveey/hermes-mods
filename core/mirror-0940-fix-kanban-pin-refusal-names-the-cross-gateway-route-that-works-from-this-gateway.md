@@ -19,7 +19,7 @@ The source author's rationale below is retained for porting. Any tests or live o
 > placement=<machine> only reaches the gateway's routed target (on the hub there is
 > no route, so placement='macbook' is refused); hermes-hub create-task <machine>
 > works from any gateway (live: t_01a186cf60392092 claimed and completed on
-> David-MBP 8 s after a hub create).
+> laptop-1 8 s after a hub create).
 
 ## Code
 

@@ -382,10 +382,21 @@ def test_off_switch(monkeypatch):
     assert run("terminal", {"command": "stress-ng --cpu $(nproc)"}) is None
 
 
-def test_default_protects_laptop_and_hub(monkeypatch):
+def test_public_default_is_generic(monkeypatch, tmp_path):
     monkeypatch.delenv("CPU_LOAD_GUARD_HOSTS")
-    monkeypatch.setenv("HERMES_HOME", "/nonexistent")
-    monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "David-MBP.local")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert plugin.guard.protected_hosts() == ["hermes-hub"]
+    monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "laptop-1.local")
+    assert not plugin.guard.enabled()
+    monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "hermes-hub")
+    assert plugin.guard.enabled()
+
+
+def test_private_config_protects_laptop_and_hub(monkeypatch, tmp_path):
+    monkeypatch.delenv("CPU_LOAD_GUARD_HOSTS")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "cpu-load-guard.yaml").write_text("protected_hosts:\n  - laptop-1\n  - hermes-hub\n")
+    monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "laptop-1.local")
     assert plugin.guard.enabled()
     monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "hermes-hub")
     assert plugin.guard.enabled()

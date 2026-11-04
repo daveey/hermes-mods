@@ -4,7 +4,7 @@ Patches:
 
 - `patches/0759-fix-tui-a-chat-held-by-another-backend-gets-one-refu.patch`
 
-On 2026-10-28 a background-process completion was waiting in David-MBP's Desktop backend for chat
+On 2026-10-28 a background-process completion was waiting in laptop-1's Desktop backend for chat
 `20261023_204423_b85a94`. Meanwhile the mini's Desktop backend (SSH-spawned on the same Mac, so it shares
 state.db) held the chat's durable turn lease. The notification poller claimed the idle chat and ran the
 completion turn. `_admit_prompt_turn` refused it `SESSION_NOT_OWNED` (`_durable_owner_refusal`), the event went

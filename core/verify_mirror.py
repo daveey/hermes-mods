@@ -115,7 +115,7 @@ def load_policy(path, tip, base):
     try:
         policy = json.loads(Path(path).read_text())
         if not {'source_tip', 'base', 'substitutions', 'fingerprints'} <= set(policy) <= {
-                'source_tip', 'base', 'substitutions', 'fingerprints', 'renames'}:
+                'source_tip', 'base', 'substitutions', 'fingerprints', 'renames', 'regex_substitutions'}:
             raise ValueError()
         if policy['source_tip'] != tip or policy['base'] != base:
             raise ValueError()
@@ -143,8 +143,24 @@ def load_policy(path, tip, base):
                 raise ValueError()
         if len({rule['applied'] for rule in renames}) != len(renames):
             raise ValueError()
-        return [(a.encode(), b.encode()) for a, b in substitutions], fingerprints, renames
-    except (ValueError, TypeError, KeyError, AttributeError):
+        regex_rules = policy.get('regex_substitutions', [])
+        if not isinstance(regex_rules, list):
+            raise ValueError()
+        compiled = []
+        seen = set()
+        for pair in regex_rules:
+            if (not isinstance(pair, list) or len(pair) != 2
+                    or not all(isinstance(x, str) and x for x in pair)
+                    or pair[0] == pair[1] or pair[0] in seen):
+                raise ValueError()
+            pattern, replacement = pair
+            rule = re.compile(pattern.encode())
+            if rule.search(b'') is not None:
+                raise ValueError()
+            seen.add(pattern)
+            compiled.append((rule, replacement.encode()))
+        return [(a.encode(), b.encode()) for a, b in substitutions] + compiled, fingerprints, renames
+    except (ValueError, TypeError, KeyError, AttributeError, re.error, UnicodeError):
         raise VerificationError('Invalid policy or policy snapshot mismatch') from None
 
 
@@ -175,6 +191,20 @@ def match_renames(source_tree, applied_tree, renames):
         raise VerificationError('Tree path inventory differs (including added or removed tests)')
 
 
+def normalize(data, substitutions):
+    """Ordered byte normalization; regex replacements are literal, not templates."""
+    for old, new in substitutions:
+        if isinstance(old, bytes):
+            data = data.replace(old, new)
+        else:
+            def replace(match):
+                if match.start() == match.end():
+                    raise VerificationError('Zero-width regex normalization is forbidden')
+                return new
+            data = old.sub(replace, data)
+    return data
+
+
 def compare(repo, tip, applied, substitutions, fingerprints, renames=()):
     source_tree, applied_tree = tree(repo, tip), tree(repo, applied)
     if source_tree.keys() != applied_tree.keys():
@@ -192,8 +222,7 @@ def compare(repo, tip, applied, substitutions, fingerprints, renames=()):
             raise VerificationError('Tree mode or non-blob object differs')
         before = git(repo, 'cat-file', 'blob', source[2])
         after = git(repo, 'cat-file', 'blob', actual[2])
-        for old, new in substitutions:
-            before = before.replace(old, new)
+        before = normalize(before, substitutions)
         if before == after:
             continue
         name = path.decode('utf-8', errors='surrogateescape')

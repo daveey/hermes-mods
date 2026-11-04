@@ -59,11 +59,11 @@ const raw = [
 
 test('this Mac is keyed by its device name; refs handed to other gateways name it', async () => {
   const m = await load({ state })
-  const conns = m.gatewayKeys(raw, { device: 'macbook', aliases: ['macbook', 'david-mbp'] })
+  const conns = m.gatewayKeys(raw, { device: 'macbook', aliases: ['macbook', 'laptop-1'] })
   assert.equal(conns[0].key, 'macbook')
   assert.equal(m.sessionRef({ connectionId: 'local', profile: 'default', sessionId: '20261019_132933_0b8012' }, 'skint-polycentrism', conns), '@session:default@macbook/20261019_132933_0b8012')
   // Every spelling still resolves to this Mac: device, hostname alias, and the legacy label.
-  for (const name of ['macbook', 'david-mbp', 'this-device', 'local']) assert.equal(m.findGateway(conns, name)?.id, 'local', name)
+  for (const name of ['macbook', 'laptop-1', 'this-device', 'local']) assert.equal(m.findGateway(conns, name)?.id, 'local', name)
   // Unknown device name (older backend): legacy behaviour.
   assert.equal(m.gatewayKeys(raw, null)[0].key, 'this-device')
 })
@@ -77,13 +77,13 @@ test('a device name that collides with a registry label falls back to the connec
 
 test('courier drains name the device, its aliases and every gateway it can reach', async () => {
   const m = await load({ state })
-  const conns = m.gatewayKeys(raw, { device: 'macbook', aliases: ['macbook', 'david-mbp'] })
+  const conns = m.gatewayKeys(raw, { device: 'macbook', aliases: ['macbook', 'laptop-1'] })
   const home = new URLSearchParams(m.outboxPath(conns[0], conns).split('?')[1])
   assert.equal(home.get('home'), '1')
   assert.equal(home.get('courier'), 'macbook')
-  assert.deepEqual(home.get('aliases').split(','), ['macbook', 'david-mbp'])
+  assert.deepEqual(home.get('aliases').split(','), ['macbook', 'laptop-1'])
   const reach = home.get('reach').split(',')
-  for (const n of ['macbook', 'david-mbp', 'nous-1', 'skint-polycentrism', 'mac-mini']) assert.ok(reach.includes(n), n)
+  for (const n of ['macbook', 'laptop-1', 'nous-1', 'skint-polycentrism', 'mac-mini']) assert.ok(reach.includes(n), n)
   assert.ok(!reach.includes('this-device') && !reach.includes('local'))
   const remote = new URLSearchParams(m.outboxPath(conns[1], conns).split('?')[1])
   assert.equal(remote.get('home'), null)
@@ -98,7 +98,7 @@ test('courier learns the device name from its own backend ping', async () => {
   const paths = []
   const m = await load({ state, connections: async () => raw }, async req => {
     paths.push([req.connectionId, req.path])
-    if (req.path.endsWith('/ping')) return { ok: true, device: 'macbook', aliases: ['macbook', 'david-mbp'] }
+    if (req.path.endsWith('/ping')) return { ok: true, device: 'macbook', aliases: ['macbook', 'laptop-1'] }
     return req.path.includes('/outbox') ? { requests: [] } : { ok: true }
   })
   await m.courierTick()
@@ -115,12 +115,12 @@ test('courier learns the device name from its own backend ping', async () => {
 test('backend predating targeting: the device name falls back to its hostname', async () => {
   const m = await load({ state, connections: async () => raw }, async req => {
     if (req.path.endsWith('/ping')) return { ok: true, home_courier: true, forwarding: true }
-    if (req.path === '/api/system/stats') return { hostname: 'David-MBP.local' }
+    if (req.path === '/api/system/stats') return { hostname: 'laptop-1.local' }
     return req.path.includes('/outbox') ? { requests: [] } : { ok: true }
   })
   const paths = []
   const real = globalThis.window.hermesDesktop.api
   globalThis.window.hermesDesktop.api = req => (paths.push(req.path), real(req))
   await m.courierTick()
-  assert.ok(paths.some(p => p.startsWith('/api/plugins/session-mentions/outbox?home=1&courier=david-mbp&')))
+  assert.ok(paths.some(p => p.startsWith('/api/plugins/session-mentions/outbox?home=1&courier=laptop-1&')))
 })

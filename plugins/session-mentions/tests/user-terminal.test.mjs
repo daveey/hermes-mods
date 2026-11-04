@@ -15,7 +15,7 @@ async function load(host, api) {
 }
 // The MacBook's Desktop: its own machine is `local` (device macbook); nous-1 is a cloud connection.
 const conns = [
-  { id: 'local', label: 'This device', key: 'macbook', kind: 'local', primary: true, device: 'macbook', aliases: ['macbook', 'david-mbp'] },
+  { id: 'local', label: 'This device', key: 'macbook', kind: 'local', primary: true, device: 'macbook', aliases: ['macbook', 'laptop-1'] },
   { id: 'cloud-1', label: 'nous-1', key: 'nous-1', kind: 'cloud', primary: false }
 ]
 const state = { connectionId: { get: () => 'local' }, profile: { get: () => 'default' } }

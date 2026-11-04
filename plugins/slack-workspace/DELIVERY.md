@@ -5,7 +5,7 @@ engagement's owner session, e.g. `@session:default@this-device/<id>` (the MacBoo
 `self_gateway: this-device`). Two ways deliver it:
 
 - courier: the bot gateway's tick writes a session-mentions request into nous-1's outbox and the
-  MacBook's Desktop (which drains nous-1 as courier `david-mbp`, later `macbook`) submits it through the
+  MacBook's Desktop (which drains nous-1 as courier `laptop-1`, later `macbook`) submits it through the
   session's owning socket.
 - pull: `~/.hermes/scripts/slack_follow_pull.py`, a no-agent cron on the MacBook every 2 min, fetches
   requests (op `mbp_pull` over MacBook -> ssh mini -> cred-relay shell.exec on nous-1) and starts a
@@ -14,7 +14,7 @@ engagement's owner session, e.g. `@session:default@this-device/<id>` (the MacBoo
 ## Decision (2026-10-19): courier first, pull as the fallback
 
 Policy `follower.mbp_delivery`: `courier` (default) | `courier_only` | `pull`. `follower.mbp_device`
-(default `david-mbp`) names the Mac for owner refs that say `@this-device`/`@local`.
+(default `macbook`) names the Mac for owner refs that say `@this-device`/`@local`.
 
 Pull was chosen earlier only because the courier could not target one Mac or a named profile. Both
 are fixed (session-mentions DELIVERY.md, "Named profiles on a cloud gateway"). The pull cron is not
@@ -46,7 +46,7 @@ How the two share the queue without double delivery:
 
 Live (2026-10-19 PDT, nous-1 policy set to `courier`, gateway-default restarted; it multiplexes alpha):
 - Courier: a queued request for `@session:default@this-device/<throwaway MBP session>` was rewritten to
-  `@david-mbp`, claimed by the MacBook's courier (now `macbook`, alias `david-mbp`) and landed ~50 s
+  `@laptop-1`, claimed by the MacBook's courier (now `macbook`, alias `laptop-1`) and landed ~50 s
   after queueing (one bot tick). The reply was "courier ok", the row was `delivered` after 1 attempt, and
   the pull cron never saw it.
 - Fallback: a request whose target was a Kanban worker transcript was refused by core through the

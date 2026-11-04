@@ -14,7 +14,7 @@ next backend, which continues it from its startup sweep. But that backend's code
 kept busy by other chats never becomes idle, and a backend with no watchdog is never retired at all. The
 in-place watcher still waited its full `LEAVE_GRACE_S` (900 s) before continuing the turn itself.
 
-On David-MBP on 2026-10-28, three paused turns on serve pid 74105 logged "checkout moved" at 07:03:53. That
+On laptop-1 on 2026-10-28, three paused turns on serve pid 74105 logged "checkout moved" at 07:03:53. That
 serve outlived the 07:02:50 update. The turns logged "backend still not replaced after 900s" at 07:18:55, and
 session bef6c6 resumed at 07:19:28, a 19.5 min stall.
 
@@ -66,7 +66,7 @@ Not covered by a test: a live drain window where the paused turn's serve survive
 
 ## Second attempt (fork `26691e1ce5`, patch [`0859`](patches/0859-fix-core-update-a-paused-turn-continues-within-90-s-.patch))
 
-The first live sample failed acceptance. On David-MBP, 2026-10-28 PDT, serve 13052 survived the update.
+The first live sample failed acceptance. On laptop-1, 2026-10-28 PDT, serve 13052 survived the update.
 Session 2b256c paused at 17:17:53, and the watcher logged "checkout moved" at 17:22:19. A kanban notice
 was accepted at 17:22:21, and the turn continued only from the 300 s backstop at 17:30:39, 502 s after the
 gateway was back.

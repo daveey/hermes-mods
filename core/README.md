@@ -14,6 +14,9 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
+[Hostname normalization](hostname-normalization.md) documents the subsequent privacy
+repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
+
 1923 patches, one entry per non-merge source commit through `ea651aab330ef51dc3ad565c763c993a0e654e11`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their

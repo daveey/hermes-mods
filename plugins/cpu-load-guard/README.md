@@ -1,5 +1,22 @@
 # cpu-load-guard
 
+## Protected hosts
+
+The public default protects only the generic `hermes-hub` placement alias. Put
+machine-specific names in `$HERMES_HOME/cpu-load-guard.yaml` (default home:
+`~/.hermes`), not in the plugin source. This list replaces the default:
+
+```yaml
+protected_hosts:
+  - laptop-1
+  - mini-1
+  - hermes-hub
+```
+
+`CPU_LOAD_GUARD_HOSTS` is a comma-separated override when set. Host comparisons
+ignore case and the `.local` suffix. The private-config fixture verifies a laptop
+and hub remain protected with an explicit list; unrelated hosts are not protected.
+
 ## Shell burner regression contract
 
 `tests_guard.py` generates a must-refuse cross-product of burner payloads,

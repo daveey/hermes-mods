@@ -29,7 +29,7 @@ function fakeApi({ outbox = [], results = [], paths = [] } = {}) {
     paths.push([req.connectionId, req.path])
     const url = new URL(req.path, 'http://x')
     if (url.pathname.endsWith('/session-mentions/ping')) {
-      if (req.connectionId === 'local') return { ok: true, device: 'macbook', aliases: ['macbook', 'david-mbp'], gateway: 'macbook' }
+      if (req.connectionId === 'local') return { ok: true, device: 'macbook', aliases: ['macbook', 'laptop-1'], gateway: 'macbook' }
       if (req.connectionId === 'hub-ec2') return { ok: true, device: 'ip-172-31-0-1', aliases: [], gateway: 'hub' }
       return { ok: true, home_courier: false, forwarding: true }
     }
@@ -62,14 +62,14 @@ async function until(fn, ms = 3000) {
 
 test('a remote connection reporting registry name `hub` resolves @task and @session refs naming it', async () => {
   const m = await load({ state }, fakeApi())
-  const conns = m.gatewayKeys(raw, { device: 'macbook', aliases: ['macbook', 'david-mbp'] }, { local: 'macbook', 'hub-ec2': 'hub' })
+  const conns = m.gatewayKeys(raw, { device: 'macbook', aliases: ['macbook', 'laptop-1'] }, { local: 'macbook', 'hub-ec2': 'hub' })
   assert.equal(m.findGateway(conns, 'hub')?.id, 'hub-ec2')
   assert.deepEqual(m.parseTaskRef(`@task:default@hub/${TASK}`, 'local', conns), { connectionId: 'hub-ec2', board: 'default', taskId: TASK, anyGateway: false })
   assert.deepEqual(m.parseRef(`@session:default@hub/${SID}`, 'local', conns), { connectionId: 'hub-ec2', profile: 'default', sessionId: SID })
   // Existing names keep working: the connection label and this Mac's device / hostname alias.
   assert.equal(m.parseTaskRef(`@task:default@hub-ec2/${TASK}`, 'local', conns).connectionId, 'hub-ec2')
   assert.equal(m.parseRef(`@session:default@macbook/${SID}`, 'hub-ec2', conns).connectionId, 'local')
-  assert.equal(m.parseRef(`@session:default@david-mbp/${SID}`, 'hub-ec2', conns).connectionId, 'local')
+  assert.equal(m.parseRef(`@session:default@laptop-1/${SID}`, 'hub-ec2', conns).connectionId, 'local')
   // Refs this Desktop mints still use the connection key; links are not rewritten.
   assert.equal(m.taskRef({ connectionId: 'hub-ec2', board: 'default', taskId: TASK }, 'local', conns), `@task:default@hub-ec2/${TASK}`)
   // The drain reach carries the registry name, so the gateway hands this courier `route=hub`.

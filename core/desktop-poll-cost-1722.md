@@ -17,7 +17,7 @@ Mirrored in the 1703–1821 pass ([mirror-1821-verification.md](mirror-1821-veri
 
 Source commit notes (first paragraph of each message, privacy-normalized):
 
-- 1722: David-MBP profile (t_01a199a0a5d38255 / t_01a19d0bcab45558): the kanban annotation refreshed every ~3 s because the counts TTL expired while no board content moved (3 of 60 polls saw a revision change), and every /api/status poll reloaded the gateway config (re-parsing ~27 bundled manifests) and re-read state.db for the active-session count.
+- 1722: laptop-1 profile (t_01a199a0a5d38255 / t_01a19d0bcab45558): the kanban annotation refreshed every ~3 s because the counts TTL expired while no board content moved (3 of 60 polls saw a revision change), and every /api/status poll reloaded the gateway config (re-parsing ~27 bundled manifests) and re-read state.db for the active-session count.
 - 1724: kanban_session_activity stays under its line cap: the unchanged-input revalidation lives in kanban_session_activity_revalidate, the origin-work snapshot in kanban_session_activity_origin_snapshot (re-exported as _remote_snapshot, so its test seams stay). gateway.py nets zero lines.
 - 1743: (subject only)
 - 1751: (subject only)

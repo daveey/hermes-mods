@@ -425,9 +425,9 @@ def test_runner_leaves_mbp_queue_to_the_puller_when_policy_says_pull(env, monkey
 
 def test_courier_names_the_mac_for_this_device_owner_refs():
     assert follow.target_route("@session:default@this-device/s1") == "this-device"
-    assert follow.courier_target("@session:default@this-device/s1", "david-mbp") == "@session:default@david-mbp/s1"
-    assert follow.courier_target("@session:default@mac-mini/s1", "david-mbp") == "@session:default@mac-mini/s1"
-    assert follow.courier_target("@session:alpha-follow/s1", "david-mbp") == "@session:alpha-follow/s1"
+    assert follow.courier_target("@session:default@this-device/s1", "laptop-1") == "@session:default@laptop-1/s1"
+    assert follow.courier_target("@session:default@mac-mini/s1", "laptop-1") == "@session:default@mac-mini/s1"
+    assert follow.courier_target("@session:alpha-follow/s1", "laptop-1") == "@session:alpha-follow/s1"
 
 
 def test_courier_request_carries_route_so_only_that_mac_claims_it(env, tmp_path):
@@ -449,9 +449,9 @@ def test_courier_request_carries_route_so_only_that_mac_claims_it(env, tmp_path)
             time.sleep(0.05)
     seen = []
     t = threading.Thread(target=desktop); t.start()
-    assert r._courier_send("@session:default@david-mbp/s1", "hi") == (True, "queued", False)
+    assert r._courier_send("@session:default@laptop-1/s1", "hi") == (True, "queued", False)
     t.join()
-    assert seen[0]["route"] == "david-mbp" and seen[0]["args"]["target"] == "@session:default@david-mbp/s1"
+    assert seen[0]["route"] == "laptop-1" and seen[0]["args"]["target"] == "@session:default@laptop-1/s1"
 
 
 def test_courier_first_then_pull_fallback_never_both(env, monkeypatch):
@@ -464,7 +464,7 @@ def test_courier_first_then_pull_fallback_never_both(env, monkeypatch):
     assert follow.engagement_op(engs, "mbp_pull", {})["requests"] == []
     monkeypatch.setattr(r, "_courier_send", lambda t, m: sent.append(t) or (False, "Desktop courier offline", False))
     r.deliver_mbp()
-    assert sent == ["@session:default@david-mbp/s1"]  # this-device -> the named Mac
+    assert sent == ["@session:default@macbook/s1"]  # this-device -> the public courier alias
     r.deliver_mbp()
     assert len(sent) == 1  # courier backs off
     got = follow.engagement_op(engs, "mbp_pull", {})["requests"]

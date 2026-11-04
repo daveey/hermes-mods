@@ -1572,7 +1572,7 @@ export default {
     // sessions.changed fires every ~1-2 s while any turn streams, and a forced fetch of the
     // active (primary) connection makes Desktop main fan /api/sessions out to EVERY connected
     // gateway, up to 5 pages each: ~1,500 backend list reads per 40 s on a 20-gateway Desktop
-    // (David-MBP 2026-10-30). The @ list only needs to be fresh when someone types @, so a change
+    // (laptop-1 2026-10-30). The @ list only needs to be fresh when someone types @, so a change
     // marks rows pending; idle refreshes are capped at one per CHANGE_REFRESH_MIN_MS, and
     // provide() refreshes a pending change at once.
     let debounce = null

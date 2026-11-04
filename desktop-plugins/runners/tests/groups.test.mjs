@@ -7,7 +7,7 @@ const P = await loadPlugin()
 const NOW = Date.parse('2026-10-29T17:00:00Z')
 const slot = (runner, state, labels = []) => ({ runner, state, labels })
 const ci = [
-  { name: 'davids-mac-mini', category: 'Macs', ephemeral: false, labels: [], warnings: ['davids-mac-mini: tool:xcode failed'], slots: [slot('davids-mac-mini', 'idle')] },
+  { name: 'mini-1', category: 'Macs', ephemeral: false, labels: [], warnings: ['mini-1: tool:xcode failed'], slots: [slot('mini-1', 'idle')] },
   { name: 'ec2-gwgen', category: 'EC2 Linux', ephemeral: false, labels: [], warnings: [], slots: [slot('ec2-gwgen-1', 'busy'), slot('ec2-gwgen-2', 'idle')] },
   { name: 'ec2-gwhub', ephemeral: false, labels: [], warnings: [], slots: [slot('ec2-gwhub', 'busy', ['self-hosted', 'Linux'])] },
   { name: 'metta0', category: 'Metta', ephemeral: false, labels: [], warnings: [], slots: [slot('metta0', 'offline'), slot('metta0-2', 'idle')] },

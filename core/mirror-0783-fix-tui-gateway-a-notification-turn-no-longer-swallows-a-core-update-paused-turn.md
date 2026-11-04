@@ -25,7 +25,7 @@ The source author's rationale below is retained for porting. Any tests or live o
 > A synthesized turn (process completion, kanban notice, wake-up) that landed on a session paused for a
 > core update wrote its own crash marker over the core_update_pause one and cleared it on completion, and
 > the in-place watcher read the busy session as 'user moved on'. The paused request was never continued
-> (David-MBP session 5ab65c, 2026-10-28 07:50). Synthesized turns now run without a marker of their own
+> (laptop-1 session 5ab65c, 2026-10-28 07:50). Synthesized turns now run without a marker of their own
 > while a paused one exists, the watcher waits for them, and they re-arm the watcher on completion; a typed
 > message still retires the pause.
 

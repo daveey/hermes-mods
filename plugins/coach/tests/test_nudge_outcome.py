@@ -45,9 +45,9 @@ def test_prefilter_skips_coach_nudges_in_any_case():
 
 def test_backstop_files_nothing_when_the_only_new_turn_is_a_coach_nudge(tmp_path):
     now = time.time()
-    p = tmp_path / "data" / "MacBook-Pro-177" / "default" / "20261025_104956_99e2e1.json"
+    p = tmp_path / "data" / "laptop-2" / "default" / "20261025_104956_99e2e1.json"
     p.parent.mkdir(parents=True)
-    p.write_text(json.dumps({"id": "20261025_104956_99e2e1", "host": "MacBook-Pro-177", "profile": "default",
+    p.write_text(json.dumps({"id": "20261025_104956_99e2e1", "host": "laptop-2", "profile": "default",
                              "source": "desktop", "title": "BB recovery",
                              "user_turns": [{"t": now - 60, "text": REAL_NUDGE,
                                              "prev": "Recovery owner t_01a18a95223f7036 is running."}]}))
@@ -397,7 +397,7 @@ def test_nudge_counts_puts_screen_only_report_only_outcomes_under_unconfirmed(tm
 # the fixed CI line, so the lane read it as "the earlier fix didn't hold".
 
 E5_SID = "20261026_235722_bef6c6"
-E5_NUDGE = {"ts": NOW - 1900, "pid": 51050, "host": "David-MBP", "proc_start": NOW - 9000, "event": "reply_nudge",
+E5_NUDGE = {"ts": NOW - 1900, "pid": 51050, "host": "laptop-1", "proc_start": NOW - 9000, "event": "reply_nudge",
             "session_id": E5_SID, "rule": "report_only", "nudge_id": "n_d95d379faf674591", "p": 0.9,
             "evidence": "Still running: main CI for the command-list fix. I'm watching it and will post the result.",
             "platform": "desktop", "draft_id": "d_dd0ce5af121c43a4", "outcome": True}

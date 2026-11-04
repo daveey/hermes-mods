@@ -132,7 +132,7 @@ def test_ci_machines_take_load_from_collector_host_probes():
 
 def test_ci_machine_categories_for_the_panel_groups():
     c = fleet.category
-    assert c('davids-mac-mini', False, ['self-hosted']) == 'Macs'
+    assert c('mini-1', False, ['self-hosted']) == 'Macs'
     assert c('bb-sign', False, ['macOS']) == 'Macs'
     assert c('ec2-f18cf3d2-stable', False, ['Linux']) == 'EC2 Linux'
     assert c('hermes-hub-canary', False, []) == 'EC2 Linux'
