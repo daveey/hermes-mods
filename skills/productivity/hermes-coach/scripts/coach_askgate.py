@@ -41,9 +41,31 @@ SKIP = re.compile(
 # Defense in depth for old digests: generated user-role rows are not human corrections.
 GENERATED = re.compile(
     r'^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe)\]|'
-    r'\{\s*"item"\s*:)|\(Roleplay test of our reply checker', re.I)
+    r'\{\s*"item"\s*:|New notes? on your kanban task from another agent session\b)'
+    r'|\(Roleplay test of our reply checker', re.I)
 # Same marker as plugins/coach/self_heal.py PROBE_RE: a session opener that marks a deliberate detector probe.
 PROBE = re.compile(r"^\s*(?:\[selfheal-probe\]|Live test of a detector\b)", re.I)
+
+# A stamped line of a live card note: "- <author> (<tags>) at HH:MM TZ: <body…>" (core _comment_stamp).
+NOTE_HEADER = re.compile(r"^\s*New notes? on your kanban task from ", re.I)
+NOTE_LINE = re.compile(r"(?m)^- [^\n:]*? at \d{1,2}:\d{2}(?: [A-Za-z0-9+\-]+)?: ")
+AGENT_STAMP = re.compile(r"^- [^\n:(]*\([^)\n]*\bagent chat\b")
+
+
+def drop_agent_notes(text):
+    """A live card note minus the lines an agent wrote (core stamps them "(agent chat",
+    agent-261aa31f49): their words are not David's. Each line runs to the next stamp, so a
+    multi-line body is dropped whole. Unstamped (older) notes are kept for review."""
+    if not NOTE_HEADER.match(text):
+        return text
+    starts = [m.start() for m in NOTE_LINE.finditer(text)]
+    if not starts:
+        return text
+    parts = [text[:starts[0]]] + [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]
+    kept = [parts[0]] + [p for p in parts[1:] if not AGENT_STAMP.match(p)]
+    if len(kept) == 1:  # every line was an agent's: none of it is David's
+        return ""
+    return "".join(kept)
 
 
 def generated(text):
@@ -194,7 +216,7 @@ def clean(text):
     # Desktop appends these machine-owned sections to real user text. Their
     # quoted button labels are not new complaints from the user.
     text = re.split(r"(?m)^\s*\[(?:user-steps|chat-closeout)\]", text, maxsplit=1)[0]
-    return text.strip()
+    return drop_agent_notes(text.strip()).strip()
 
 
 def classify(text):

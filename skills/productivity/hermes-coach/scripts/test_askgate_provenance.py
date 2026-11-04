@@ -43,6 +43,29 @@ class Provenance(unittest.TestCase):
             text = f'New {noun} on your kanban task from the operator (delivered mid-run).\n- default (another session) at 06:29 UTC: do it yourself'
             self.assertTrue(g.classify(text))
 
+    # agent-261aa31f49: core now stamps notes a chat agent wrote via kanban_comment.
+    AGENT_NOTE = ("New note on your kanban task from another agent session (delivered mid-run). "
+                  "Take it into account for the work you're doing right now:\n"
+                  "- default (agent chat, another session) at 14:02 PDT: Please re-check (c) yourself, then complete.")
+
+    def test_agent_written_note_is_not_a_hit(self):
+        for text in (self.AGENT_NOTE,
+                     '[OUT-OF-BAND USER MESSAGE — steering]\n' + self.AGENT_NOTE + '\n[/OUT-OF-BAND USER MESSAGE]'):
+            with self.subTest(text=text[:40]):
+                self.assertIsNone(g.classify(g.clean(text)))
+                self.assertIsNone(g.classify_fix(g.clean(text)))
+
+    def test_mixed_note_drops_agent_lines_keeps_human(self):
+        mixed = ("New notes on your kanban task from the operator (delivered mid-run). "
+                 "Take it into account for the work you're doing right now:\n"
+                 "- default (agent chat, another session) at 06:29 UTC: check it yourself\n"
+                 "and figure out why it broke\n"
+                 "- default (another session) at 06:30 UTC: why are you asking me?")
+        self.assertEqual(g.classify(g.clean(mixed)), 'why-asking-me')
+        only_agent_lines = mixed.rsplit('\n- default (another session)', 1)[0]
+        self.assertIsNone(g.classify(g.clean(only_agent_lines)))
+        self.assertIsNone(g.classify_fix(g.clean(only_agent_lines)))
+
     def test_user_kept(self):
         for text in ('do it yourself', 'why are you asking me?',
                      '[OUT-OF-BAND USER MESSAGE — steering]\ndo it yourself\n[/OUT-OF-BAND USER MESSAGE]',
