@@ -426,6 +426,49 @@ def detection_for(h, detected):
     return None
 
 
+_HIT_ON = re.compile(r"\bon (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (?:PDT|PST)\b")
+
+
+def row_hit_t(row):
+    """A queued ask-gate row's hit time: its `hit_t` (queued since still_flags existed), else the `on YYYY-MM-DD
+    HH:MM PDT|PST` that hit_defect wrote into the body (`details`), else None."""
+    t = row.get("hit_t")
+    if isinstance(t, (int, float)) and not isinstance(t, bool):
+        return float(t)
+    m = _HIT_ON.search(str(row.get("details") or ""))
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M").replace(tzinfo=PT).timestamp()
+
+
+def still_flags(row, homes=None):
+    """Why the ask-gate monitor no longer stands by a row it queued earlier, else None. The drain re-checks a queued
+    row with today's full verdict, in route_hits' order, so any later rule fix retracts the rows it would not have
+    queued (plugin-656a006c84: queued 11 minutes before detection_for existed, filed a day later anyway). Only
+    positive evidence withdraws: a generated quote, a detection of that session near the hit (selfheal.json), or a
+    lane filing for that session (selfheal_lane.json). Any error -> None, so the row files as before."""
+    try:
+        q = row.get("quote") or ""
+        if q and generated(q):
+            return "monitor no longer flags (ask-gate): quote is a generated prompt, not David"
+        s = row.get("session_id")
+        if not s:
+            return None
+        homes = homes or [Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()]
+        t = row_hit_t(row)
+        for home in homes:
+            if s in lane_sessions(home):
+                return f"monitor no longer flags (ask-gate): the self-heal lane already has a filing for session {s}"
+            if t is not None:
+                fp = detection_for({"session": s, "t": t}, detected_sessions(home))
+                if fp:
+                    return (f"monitor no longer flags (ask-gate): the self-heal detector already saw this turn "
+                            f"({fp}, session {s})")
+    except Exception:
+        return None
+    return None
+
+
 def detected_lines(hits):
     """Weekly-post lines for hits skipped because the detector already saw them (a jump in this count shows up)."""
     if not hits:
@@ -479,7 +522,7 @@ def route_hits(hits, home, filer=None, signals=None, detected=None):
             continue
         m = hit_defect(h)
         d = signals.monitor_defect(m, host=h.get("host"))
-        d.update(session_id=m["session_id"], quote=m["quote"])
+        d.update(session_id=m["session_id"], quote=m["quote"], hit_t=h.get("t"))  # hit_t: still_flags at drain
         try:
             res = (filer or _coach_mod("self_heal").file_defect)(d)
         except Exception as e:

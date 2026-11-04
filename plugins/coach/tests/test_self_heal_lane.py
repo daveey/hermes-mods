@@ -1909,3 +1909,48 @@ def test_queued_ask_gate_row_the_classifier_now_calls_generated_is_dropped_not_f
     assert "monitor no longer flags (ask-gate)" in skips[card["fingerprint"]]
     assert "monitor no longer flags (ask-gate)" in skips[router["fingerprint"]]
     assert sh.retry_deferred(store, now=NOW + 7200, filer=lambda *a, **k: pytest.fail("resurrected")) == []
+
+
+def test_queued_ask_gate_row_the_detector_already_saw_is_withdrawn_by_the_full_verdict(store):
+    """plugin-656a006c84: an ask-gate fix-request row queued before detection_for existed was filed a day later
+    although today's monitor skips it. The drain re-checks with coach_askgate.still_flags: a selfheal.json detection
+    of that session near the hit withdraws the row (by hit_t, or by the time in `details` for rows queued before
+    hit_t); the same row with no detection, or a detection on another day, still files."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    hit = NOW - 3 * 3600
+    on = datetime.fromtimestamp(hit, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M %Z")
+
+    def fix(sym, session, **kw):
+        return defect(component="plugin", symptom=f"unfiled fix request needs review: {sym}", monitor="ask-gate",
+                      kind="monitor", source="signal", p_defect=None, session_id=session,
+                      quote="the sidebar is broken again, can you fix it",
+                      details=f"Ask-gate weekly: David had to ask for a Hermes fix (fix-it) on {on}, host hub, "
+                              f"session {session}, and the self-heal lane has no filing for that session.", **kw)
+    seen = fix("seen", "s_seen", hit_t=hit)
+    old = fix("old row", "s_old")  # queued before hit_t existed: the time comes from details
+    fresh = fix("no detection", "s_fresh", hit_t=hit)
+    other_day = fix("other day", "s_other", hit_t=hit)
+    _queue(store, seen, old, fresh, other_day)
+    (Path(store.root) / "selfheal.json").write_text(json.dumps({
+        "gateway-4d3f44896c": {"first": hit + 600, "last": hit + 600, "count": 2, "sessions": ["s_seen", "s_old"]},
+        "agent-0000000000": {"first": hit - 20 * 86400, "last": hit - 19 * 86400, "count": 1, "sessions": ["s_other"]},
+    }))
+    got = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d["session_id"]) or {"action": "filed"})
+    assert sorted(got) == ["s_fresh", "s_other"]
+    skips = {e["fingerprint"]: e["why"] for e in ev(store, "selfheal_skip")}
+    for d in (seen, old):
+        assert "self-heal detector already saw this turn (gateway-4d3f44896c" in skips[d["fingerprint"]]
+    assert fresh["fingerprint"] not in skips and other_day["fingerprint"] not in skips
+
+
+def test_queued_ask_gate_row_whose_session_the_lane_already_filed_is_withdrawn(store):
+    row = defect(symptom="unfiled fix request needs review: x", monitor="ask-gate", session_id="s_lane",
+                 quote="can you fix it", hit_t=NOW - 60)
+    _queue(store, row)
+    (Path(store.root) / "selfheal_lane.json").write_text(json.dumps(
+        {"agent-1111111111": {"status": "filed", "session_id": "s_lane"}}))
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda *a, **k: pytest.fail("filed a lane-owned session"))
+    (skip,) = [e for e in ev(store, "selfheal_skip") if e["fingerprint"] == row["fingerprint"]]
+    assert "already has a filing for session s_lane" in skip["why"]

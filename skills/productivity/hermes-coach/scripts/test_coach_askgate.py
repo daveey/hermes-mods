@@ -288,6 +288,16 @@ class RouteToLane(unittest.TestCase):
         self.assertEqual([d["session_id"] for d in filed], ["s_fix", "s_ask", "s_known"])
         self.assertEqual(len(rest), 3)
 
+    def test_queued_payload_carries_hit_t_and_details_fallback_parses(self):
+        # still_flags re-checks a queued row by its hit time: new payloads carry hit_t; old rows parse `details`
+        hits = self.hits()
+        filed = []
+        g.route_hits(hits, self.home({}), filer=lambda d: filed.append(d) or {"action": "would_file"})
+        self.assertEqual([d["hit_t"] for d in filed], [h["t"] for h in hits])
+        old = {k: v for k, v in filed[0].items() if k != "hit_t"}
+        self.assertEqual(g.row_hit_t(old), (hits[0]["t"] // 60) * 60)  # details keep minutes, not seconds
+        self.assertIsNone(g.row_hit_t({"details": "no time here"}))
+
     def test_detected_line_counts_skips(self):
         hit = dict(self.hits()[0], detected_fp="gateway-4d3f44896c")
         lines = g.detected_lines([hit])
