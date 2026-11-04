@@ -135,6 +135,10 @@ input = the new total in USD; the card's agent writes `budget-overrides.jsonl` a
 without card types, or a host without these type files, gets the old plain card (the post retries without `--type`).
 Undone notices are always plain cards.
 
+## Done means
+
+- [ ] Before calling an ask-gate hit a miss, checked every `<data>/*/selfheal-seen.json` plus local `coach/selfheal.json` with `detection_for`, and, when testing the cross-host path on the hub, removed same-session hub fingerprints only from a scratch home copy so local detections cannot mask the cross-host result?
+
 ## Pitfalls
 
 - xAI `x_search` via the Responses API (outside research scout): send `"tool_choice": "required"` and use
