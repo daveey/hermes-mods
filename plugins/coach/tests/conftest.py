@@ -34,6 +34,10 @@ os.environ['HERMES_RUNTIME_DIR'] = str(Path(_COLLECTION_HOME.name) / 'tools')
 os.environ['COACH_LESSONS'] = '0'
 
 
+# Finite core helpers that write under HERMES_HOME (not the infinite idle-reaper/takeover watchers).
+_CORE_WRITER_THREADS = frozenset({'kanban-annotation-refresh', 'kanban-remote-links', 'kanban-annotation-prewarm'})
+
+
 def pytest_configure(config):
     # Give pytest a known owned root before it creates its lock files/fixtures.
     if not config.option.basetemp:
@@ -136,6 +140,20 @@ def pytest_runtest_makereport(item, call):
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
+    # A client-auto-started `gateway run --idle-exit` can be homed at the pytest root itself (not a
+    # per-test tmp_path), so the per-test reaper misses it. Its graceful exit writes
+    # gateway_state.json/.clean_shutdown/logs while TemporaryDirectory cleanup rmtree()s the root
+    # (OSError 39 at interpreter exit). Stop it, and wait, before cleanup.
+    from gateway_reaper import stop_gateways_under
+    stop_gateways_under(_COLLECTION_HOME.name)
+    # Core's finite fire-and-forget helpers (daemon threads) persist origin-work.db under HERMES_HOME; one still
+    # running at teardown recreates a file mid-rmtree (OSError 39). Wait for them (bounded) before cleanup.
+    writers = [t for t in threading.enumerate() if t.name in _CORE_WRITER_THREADS]
+    for thread in writers:
+        thread.join(timeout=10)
+    remaining = [t.name for t in writers if t.is_alive()]
+    if remaining:
+        raise RuntimeError(f'core background writers outlived collection: {remaining}')
     late = list(_GUARD.violations)
     if hasattr(session.config, 'workeroutput'):
         # xdist ignores a worker's non-interrupt exitstatus. Send the ledger to
@@ -175,8 +193,9 @@ def _join_coach_threads(monkeypatch, _live_home_guard):
     def tracked(thread, *args, **kwargs):
         target = getattr(thread, '_target', None)
         code = getattr(target, '__code__', None)
-        if code and (Path(code.co_filename).resolve().parent == _ROOT / 'plugins/coach'
-                     or code.co_name == '_lesson_bg' or code.co_name.startswith('_selfheal_')):
+        if thread.name in _CORE_WRITER_THREADS or (code and (
+                Path(code.co_filename).resolve().parent == _ROOT / 'plugins/coach'
+                or code.co_name == '_lesson_bg' or code.co_name.startswith('_selfheal_'))):
             threads.append(thread)
         return start(thread, *args, **kwargs)
 
