@@ -6,6 +6,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 _here = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("loop_watch_watch_t", _here / "watch.py")
 watch = importlib.util.module_from_spec(_spec)
@@ -13,6 +15,23 @@ _spec.loader.exec_module(watch)
 _spec2 = importlib.util.spec_from_file_location("loop_watch_init_t", _here / "__init__.py")
 lw = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(lw)
+
+
+@pytest.fixture(autouse=True)
+def close_stats_threads(monkeypatch):
+    cls = watch._reqtrace_mod().ReqTrace
+    original = cls.start_stats
+    traces = []
+    def start(self, *args, **kwargs):
+        traces.append(self)
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(cls, 'start_stats', start)
+    yield
+    for trace in traces:
+        trace.close_stats()
+        if trace._stats_thread is not None:
+            trace._stats_thread.join(2)
+            assert not trace._stats_thread.is_alive()
 
 
 class _Loop:
@@ -134,8 +153,8 @@ def test_start_retries_tracer_after_lazy_webapp_load(tmp_path, monkeypatch):
     import types
     monkeypatch.delattr(sys, watch._STARTED_ATTR, raising=False)
     monkeypatch.setattr(watch, "find_loop", lambda: types.SimpleNamespace(_thread_id=1))
-    ticks, installs = [], []
-    trace = types.SimpleNamespace(tick=lambda loop: ticks.append(loop))
+    ticks, installs, closes = [], [], []
+    trace = types.SimpleNamespace(tick=lambda loop: ticks.append(loop), close_stats=lambda: closes.append(True))
 
     def install(*args):
         installs.append(args)
@@ -157,6 +176,7 @@ def test_start_retries_tracer_after_lazy_webapp_load(tmp_path, monkeypatch):
         assert not thread.is_alive()
         assert len(installs) == 2
         assert len(ticks) == 2
+        assert closes == [True]
     finally:
         monkeypatch.delattr(sys, watch._STARTED_ATTR, raising=False)
 

@@ -12,7 +12,9 @@ one report goes to the sink: method, path, total time, the sampled chains with c
 from __future__ import annotations
 
 import asyncio
+import atexit
 import itertools
+import uuid
 import logging
 import os
 import re
@@ -36,12 +38,12 @@ MAX_REPORTS_PER_HOUR = 120
 # /api/profiles/projects/tree spent all 120 by 00:32:59 (hub, 2026-11-03), and the fleet request behind a
 # Desktop timeout at 00:33:03 left no record.
 MAX_REPORTS_PER_PATH_PER_HOUR = 20
-# Hourly ``request_stats`` record: every request counts (fast ones and slow ones past the report caps), so the
-# per-hour slow rate and latency percentiles stay measurable while the slow_request reports are capped.
-STATS_MAX_PATHS = 300  # distinct normalized paths tracked per hour; the rest fold into "(other)"
-STATS_MAX_DURATIONS = 5000  # per path per hour, for the percentiles
-STATS_MAX_QUERIES = 64  # distinct slow query strings counted per path per hour
-STATS_EMIT_PATHS = 40  # paths written per record, by total time
+# Additive request_stats deltas, independently of slow-report caps. Production
+# installs a dedicated 5s flusher; UTC hours group requests by completion time.
+STATS_MAX_PATHS = 300  # per hour bucket per delta; excess folds into "(other)"
+STATS_MAX_DURATIONS = 5000  # first samples per path per delta, NOT mergeable percentiles
+STATS_MAX_QUERIES = 64  # distinct query strings counted per path per delta
+STATS_EMIT_PATHS = 40  # legacy constant; v2 emits ALL bounded path counters
 _ID_SEGMENT = re.compile(r"^(?=.*\d)[A-Za-z0-9_.:-]{8,}$")
 
 
@@ -123,7 +125,18 @@ class ReqTrace:
         self._hour = (0, 0)  # (hour bucket, reports in it)
         self._per_path: Counter = Counter()  # reports per path in the current hour bucket
         self._stats_hour = 0
-        self._stats: Dict[str, dict] = {}
+        self._stats: Dict[int, dict] = {}
+        self._stats_lock = threading.RLock()
+        self._stats_pending = None
+        self._stats_id = uuid.uuid4().hex
+        self._stats_seq = itertools.count(1)
+        self._stats_since = time.time()
+        self._stats_mono = time.monotonic()
+        self._stats_interval = 5.0
+        self._stats_dropped = 0
+        self._stats_stop = threading.Event()
+        self._stats_thread = None
+        self._stats_closed = False
 
     # ---- ASGI side (runs on the loop) ----
     def wrap(self, app):
@@ -131,7 +144,11 @@ class ReqTrace:
 
         async def traced(scope, receive, send):
             if scope.get("type") != "http":
-                return await app(scope, receive, send)
+                try:
+                    return await app(scope, receive, send)
+                finally:
+                    if scope.get('type') == 'lifespan' and trace._stats_thread is not None:
+                        trace.close_stats()
             path = scope.get("path", "?")
             try:
                 query = (scope.get("query_string") or b"").decode("latin-1")[:300]
@@ -160,48 +177,116 @@ class ReqTrace:
         return traced
 
     def _record_stats(self, req: _Req, total: float, hour: int) -> None:
-        if self._stats_hour != hour:
-            self.flush_stats()
-            self._stats_hour = hour
-        key = stats_path(req.path)
-        if key not in self._stats and len(self._stats) >= STATS_MAX_PATHS:
-            key = "(other)"
-        st = self._stats.get(key)
-        if st is None:
-            st = self._stats[key] = {"n": 0, "slow": 0, "durs": [], "max_inflight": 0, "slow_queries": Counter(),
-                                         "queries": Counter()}
-        st["n"] += 1
-        if len(st["durs"]) < STATS_MAX_DURATIONS:
-            st["durs"].append(total)
-        st["max_inflight"] = max(st["max_inflight"], req.inflight_same + 1)
-        if req.query in st["queries"] or len(st["queries"]) < STATS_MAX_QUERIES:
-            st["queries"][req.query] += 1
-        if total >= self.slow_s:
-            st["slow"] += 1
-            q = req.query
-            if q in st["slow_queries"] or len(st["slow_queries"]) < STATS_MAX_QUERIES:
-                st["slow_queries"][q] += 1
+        with self._stats_lock:
+            if self._stats_hour != hour:
+                self.flush_stats()
+                self._stats_hour = hour
+            # Bound memory even across a prolonged sink outage. A loss is explicit
+            # in the next coverage receipt, never silently called complete coverage.
+            if hour not in self._stats and len(self._stats) >= 2:
+                lost = self._stats.pop(min(self._stats))
+                self._stats_dropped += sum(st['n'] for st in lost.values())
+            stats = self._stats.setdefault(hour, {})
+            key = stats_path(req.path)
+            if key not in stats and len(stats) >= STATS_MAX_PATHS:
+                key = "(other)"
+            st = stats.get(key)
+            if st is None:
+                st = stats[key] = {"n": 0, "slow": 0, "durs": [], "max_s": 0.0,
+                                  "max_inflight": 0, "slow_queries": Counter(), "queries": Counter()}
+            st["n"] += 1
+            st["max_s"] = max(st["max_s"], total)
+            if len(st["durs"]) < STATS_MAX_DURATIONS:
+                st["durs"].append(total)
+            st["max_inflight"] = max(st["max_inflight"], req.inflight_same + 1)
+            if req.query in st["queries"] or len(st["queries"]) < STATS_MAX_QUERIES:
+                st["queries"][req.query] += 1
+            if total >= self.slow_s:
+                st["slow"] += 1
+                q = req.query
+                if q in st["slow_queries"] or len(st["slow_queries"]) < STATS_MAX_QUERIES:
+                    st["slow_queries"][q] += 1
+            if self._stats_closed:
+                # An old app can still drain a request after lifespan teardown.
+                self._stats_closed = False
+                atexit.register(self.close_stats)
+                self.close_stats()
 
-    def flush_stats(self) -> None:
-        """Sink the current hour's ``request_stats`` record (if any request finished in it) and reset."""
-        stats, self._stats = self._stats, {}
-        if not stats:
-            return
-        paths = {}
-        ranked = sorted(stats.items(), key=lambda kv: -sum(kv[1]["durs"]))[:STATS_EMIT_PATHS]
-        for key, st in ranked:
-            durs = sorted(st["durs"])
-            paths[key] = {"n": st["n"], "slow": st["slow"], "p50_s": round(_pct(durs, 0.5), 3),
-                          "p95_s": round(_pct(durs, 0.95), 3), "max_s": round(durs[-1] if durs else 0.0, 3),
-                          "max_inflight": st["max_inflight"],
-                          "queries": [[q, n] for q, n in st["queries"].most_common(8)],
-                          "slow_queries": [[q, n] for q, n in st["slow_queries"].most_common(8)]}
-        rep = {"kind": "request_stats", "hour": time.strftime("%Y-%m-%dT%H", time.localtime(self._stats_hour * 3600)),
-               "pid": os.getpid(), "slow_s": self.slow_s, "paths": paths}
-        try:
-            self.sink(rep)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("loop-watch request-stats sink failed: %s", exc)
+    def _stats_record(self, kind: str, **fields) -> dict:
+        return dict(kind=kind, schema=2, record_id=f'{self._stats_id}:{next(self._stats_seq)}',
+                    producer_id=self._stats_id, pid=os.getpid(), **fields)
+
+    def flush_stats(self, *, reason: str = "manual", coverage: bool = False) -> None:
+        """Emit disjoint deltas; retry an ambiguous write with the SAME record_id.
+
+        The lock covers record construction, sink acknowledgement and reset, so a
+        recorder cannot change a pending delta and concurrent flushes cannot repeat it.
+        """
+        with self._stats_lock:
+            try:
+                if self._stats_pending is not None:
+                    self.sink(self._stats_pending)
+                    self._stats_pending = None
+                while self._stats:
+                    hour = min(self._stats)
+                    stats = self._stats.pop(hour)
+                    paths = {}
+                    for key, st in stats.items():
+                        durs = sorted(st['durs'])
+                        paths[key] = dict(n=st['n'], slow=st['slow'],
+                                          p50_s=round(_pct(durs, .5), 3),
+                                          p95_s=round(_pct(durs, .95), 3),
+                                          max_s=round(st['max_s'], 3), duration_samples=len(durs),
+                                          max_inflight=st['max_inflight'],
+                                          queries=[[q, n] for q, n in st['queries'].most_common(8)],
+                                          slow_queries=[[q, n] for q, n in st['slow_queries'].most_common(8)])
+                    self._stats_pending = self._stats_record(
+                        'request_stats', hour=time.strftime('%Y-%m-%dT%H', time.gmtime(hour * 3600)),
+                        hour_epoch=hour * 3600, slow_s=self.slow_s, paths=paths,
+                        semantics='delta', reason=reason)
+                    self.sink(self._stats_pending)
+                    self._stats_pending = None
+                if coverage:
+                    wall, mono = time.time(), time.monotonic()
+                    self._stats_pending = self._stats_record(
+                        'request_stats_coverage', since=self._stats_since, through=wall,
+                        elapsed_s=mono - self._stats_mono, interval_s=self._stats_interval,
+                        dropped_requests=self._stats_dropped, reason=reason)
+                    self.sink(self._stats_pending)
+                    self._stats_pending = None
+                    self._stats_since, self._stats_mono = wall, mono
+                    self._stats_dropped = 0
+            except Exception as exc:  # noqa: BLE001
+                log.warning('loop-watch request-stats sink failed: %s', exc)
+
+    def start_stats(self, interval_s: float = 5.0) -> None:
+        """Dedicated flusher: loop stalls and LoopWatch.check_once cannot delay it."""
+        with self._stats_lock:
+            if self._stats_thread is not None or self._stats_closed:
+                return
+            self._stats_interval = max(.01, float(interval_s))
+            self.flush_stats(reason='start', coverage=True)
+            atexit.register(self.close_stats)
+
+            def run():
+                while not self._stats_stop.wait(self._stats_interval):
+                    with self._stats_lock:
+                        if self._stats_stop.is_set():
+                            return
+                        self.flush_stats(reason='periodic', coverage=True)
+            self._stats_thread = threading.Thread(target=run, name='loop-watch-stats', daemon=True)
+            self._stats_thread.start()
+
+    def close_stats(self) -> None:
+        self._stats_stop.set()
+        with self._stats_lock:
+            if self._stats_closed:
+                return
+            self.flush_stats(reason='shutdown', coverage=True)
+            # Retry on a later atexit call if the final sink failed.
+            self._stats_closed = self._stats_pending is None and not self._stats
+            if self._stats_closed:
+                atexit.unregister(self.close_stats)
 
     def _finish(self, req: _Req) -> None:
         end = req.resp_at if req.resp_at is not None else self.clock()
@@ -348,12 +433,13 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
 
     def sink(rep: dict) -> None:
         if rep.get("kind") != "slow_request":
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with open(path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(rep) + "\n")
-            except OSError:
-                pass
+            # Unlike diagnostic reports, counters require an acknowledged write.
+            # Propagate errors so flush_stats retains the same delta for retry.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rep) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             return
         chain = rep["awaiting"][0]["chain"] if rep["awaiting"] else []
         top = chain[-3:]
@@ -377,6 +463,34 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
     return sink
 
 
+def _install_server_shutdown(app, trace: ReqTrace) -> None:
+    """Uvicorn re-raises SIGTERM after lifespan, before Python atexit can run.
+
+    The watcher can attach after lifespan has already entered the OLD middleware
+    stack, so wrapping only ASGI lifespan misses shutdown. Flush at the server's
+    drained-shutdown boundary instead; preserve its arguments, result and errors.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        return  # other ASGI hosts retain lifespan + atexit + periodic coverage
+    app.__loop_watch_stats_trace__ = trace
+    server = uvicorn.Server
+    original = server.shutdown
+    if getattr(original, '__loop_watch_stats_shutdown__', False):
+        return
+
+    async def shutdown(self, *args, **kwargs):
+        try:
+            return await original(self, *args, **kwargs)
+        finally:
+            owner = getattr(self.config.app, '__loop_watch_stats_trace__', None)
+            if owner is not None:
+                owner.close_stats()
+    shutdown.__loop_watch_stats_shutdown__ = True
+    server.shutdown = shutdown
+
+
 def install_on_app(app, trace: ReqTrace) -> bool:
     """Wrap a running Starlette/FastAPI app's middleware stack once. True when installed."""
     current = getattr(app, "middleware_stack", None)
@@ -387,5 +501,6 @@ def install_on_app(app, trace: ReqTrace) -> bool:
         if build is None:
             return False
         current = build()
+    _install_server_shutdown(app, trace)
     app.middleware_stack = trace.wrap(current)
     return True

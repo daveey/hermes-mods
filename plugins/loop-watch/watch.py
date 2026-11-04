@@ -296,6 +296,7 @@ def _install_reqtrace(home: Path, slow_s: Optional[float]):
         rt = _reqtrace_mod()
         trace = rt.ReqTrace(sink=rt.default_sink(home / "logs" / "loop-watch.jsonl"), slow_s=slow_s)
         if rt.install_on_app(app, trace):
+            trace.start_stats()
             setattr(trace, "_loop_watch_app", app)
             log.info("loop-watch: tracing requests slower than %.1fs", slow_s)
             return trace
@@ -351,7 +352,11 @@ def start(home: Path, *, stall_s: float = STALL_S, wait_for_loop_s: float = 600.
             if trace is not None:
                 trace.tick(loop)
         lw.on_tick = tick
-        lw.run()
+        try:
+            lw.run()
+        finally:
+            if trace is not None:
+                trace.close_stats()
 
     th = threading.Thread(target=body, name="loop-watch", daemon=True)
     th.start()
