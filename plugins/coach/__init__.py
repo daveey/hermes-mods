@@ -2,6 +2,7 @@
 User channel = dashboard/plugin_api.py + desktop-plugins/coach (one-button panels above the composer)."""
 from __future__ import annotations
 
+import contextvars
 import datetime
 import hashlib
 import importlib.util
@@ -67,6 +68,15 @@ _cache_spec = importlib.util.spec_from_file_location("_coach_module_cache", _HER
 assert _cache_spec and _cache_spec.loader
 _cache = importlib.util.module_from_spec(_cache_spec)
 _cache_spec.loader.exec_module(_cache)
+
+
+def _bg_thread(fn, *args) -> None:
+    """Run `fn` on a daemon thread inside a copy of the caller's context. A bare Thread starts with an empty
+    context: on a multiplexed backend the profile secret scope (agent/secret_scope.py, a ContextVar) is then unset and
+    every aux judge call raises UnscopedSecretError. The hub's complaint judge failed that way, silently, for a
+    week (plugin-89461de0ed)."""
+    ctx = contextvars.copy_context()
+    threading.Thread(target=ctx.run, args=(fn, *args), daemon=True).start()
 
 
 def _load(name: str):
@@ -174,7 +184,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             # Check before scheduling: a disabled call must not wake after its caller's
             # temporary environment has been restored and start an auxiliary LLM call.
             if os.environ.get("COACH_LESSONS", "1").strip().lower() not in ("0", "off", "false", "no"):
-                threading.Thread(target=_lesson_bg, args=(session_id, user_message, prev), daemon=True).start()
+                _bg_thread(_lesson_bg, session_id, user_message, prev)
             _selfheal_run(_selfheal_complaint, session_id, user_message,
                           prev or _last_assistant(conversation_history), platform, parent_session_id,
                           list(coach.loop_state(session_id).get("last_log") or []),
@@ -550,7 +560,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             if selfheal_sync:
                 fn(*args)
             else:
-                threading.Thread(target=fn, args=args, daemon=True).start()
+                _bg_thread(fn, *args)
         except Exception as exc:
             log.debug("coach self_heal: %s", exc)
             try:  # a thread that could not start, or a self_heal module that failed to load, is a row

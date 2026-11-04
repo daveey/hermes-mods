@@ -813,7 +813,10 @@ hook thread are `selfheal_judged outcome=error stage=hook|handle|run` rows, not 
 `judge_liveness` hourly. It counts top-level user-platform turns in `state.db` over 24 h, and with more than 20 turns
 plus zero `selfheal_judged` rows (`no_judgments`), or at least 3 judge-reaching rows that are all
 error/no_opinion (`judge_failing`), it files one plugin defect per host and alarm through the lane. It logs
-`selfheal_liveness` every run. Tests: `tests/test_self_heal_judged.py`.
+`selfheal_liveness` every run. Root cause of that outage: the judge (and lessons) threads were bare `threading.Thread`s,
+which start with an empty context, so on the multiplexed backend the profile secret scope was unset and every aux call
+raised `UnscopedSecretError`. Background hook work now starts through `_bg_thread` (`contextvars.copy_context().run`).
+Tests: `tests/test_self_heal_judged.py`.
 
 Replay evals:
 - `eval/selfheal_incident_replay.py` (`run`, then `score --relabel --report`): the production code over an

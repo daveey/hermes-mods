@@ -131,6 +131,58 @@ def test_a_older_init_still_gets_a_row_via_handle(store):
     assert len(events(store, "selfheal_judged")) == 1
 
 
+# ── root cause: the judge thread must inherit the turn's context (profile secret scope) ──
+def _wait_rows(store, n=1, timeout=10.0):
+    import time as _t
+    end = _t.time() + timeout
+    while _t.time() < end:
+        rows = events(store, "selfheal_judged")
+        if len(rows) >= n:
+            return rows
+        _t.sleep(0.05)
+    return events(store, "selfheal_judged")
+
+
+def test_root_background_judge_sees_the_turns_context(store):
+    """The hub's multiplexed backend binds each profile's secrets in a ContextVar; a bare threading.Thread starts
+    with an empty context, so every aux judge call raised UnscopedSecretError (live probe 2026-11-04)."""
+    import contextvars
+    scope = contextvars.ContextVar("scope_under_test", default=None)
+
+    def llm(system, prompt):
+        if scope.get() is None:
+            raise RuntimeError("UnscopedSecretError: could not read this profile's ANTHROPIC_TOKEN")
+        return json.dumps({"p_defect": 0.96, "kind": "agent_fault", "component": "agent",
+                           "symptom": "posted without telling the user"})
+    _, h = plugin.build(store=store, checkout=None, selfheal_sync=False, selfheal_llm=llm, selfheal_confirm=None)
+    tok = scope.set({"ANTHROPIC_TOKEN": "x"})
+    try:
+        turn(h)
+    finally:
+        scope.reset(tok)
+    (row,) = _wait_rows(store)
+    assert row["outcome"] == "hit", row
+
+
+def test_root_background_judge_reads_core_secret_scope(store):
+    secret_scope = pytest.importorskip("agent.secret_scope")
+
+    def llm(system, prompt):
+        assert secret_scope.get_secret("ANTHROPIC_TOKEN") == "tok-under-test"
+        return json.dumps({"p_defect": 0.96, "kind": "agent_fault", "component": "agent",
+                           "symptom": "posted without telling the user"})
+    _, h = plugin.build(store=store, checkout=None, selfheal_sync=False, selfheal_llm=llm, selfheal_confirm=None)
+    mux = secret_scope.set_multiplex_context(True)
+    tok = secret_scope.set_secret_scope({"ANTHROPIC_TOKEN": "tok-under-test"})
+    try:
+        turn(h)
+    finally:
+        secret_scope.reset_secret_scope(tok)
+        secret_scope.reset_multiplex_context(mux)
+    (row,) = _wait_rows(store)
+    assert row["outcome"] == "hit", row
+
+
 # ── (c) a real hit ──
 def test_c_real_hit_logs_detect_and_a_hit_row(store):
     llm = lambda s, p: json.dumps({"p_defect": 0.96, "kind": "agent_fault", "component": "agent",
