@@ -230,8 +230,14 @@ def _git_step(msg: str) -> tuple:
     return (f"git:{m.group(1)}",) if m else ()
 
 
+HOME_PREFIX_RE = re.compile(r"(?<![^\s\"'(=`])/(?:Users|home)/[^/\s\"'`]+")
+
+
 def home_tilde(s: str) -> str:
-    return re.sub(r"/(?:Users|home)/[^/\s\"']+", "~", s or "")
+    """Shorten a home prefix (`/Users/<x>`, `/home/<x>`) to `~`, only where a path starts (string start or after
+    whitespace, a quote, `(`, `=` or a backtick). A `/home/` segment inside a longer path (the state repo's
+    `~/code/hermes/home/scripts/...`) is left alone (agent-49bda16366: it became `~/code/hermes~/...`)."""
+    return HOME_PREFIX_RE.sub("~", s or "")
 
 
 def _ts(s: str) -> float:

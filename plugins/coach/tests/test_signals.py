@@ -1969,3 +1969,20 @@ def test_non_retryable_provider_http_error_is_not_a_hermes_defect():
              "unresponsive (no response received) for 5 consecutive stale attempts",
              "2026-10-30 21:27:10,405 WARNING agent.conversation_loop: Non-retryable client error: whatever"]
     assert sg.parse_errors(lines) == []
+
+
+@pytest.mark.parametrize("raw, want", [
+    # a repo path that merely contains a `/home/` segment is not a home prefix (agent-49bda16366: the fix steps
+    # read `~/code/hermes~/guard_conformance.py`)
+    ("python3 ~/code/hermes/home/scripts/guard_conformance.py --dry-run",
+     "python3 ~/code/hermes/home/scripts/guard_conformance.py --dry-run"),
+    ("/Users/you/code/hermes/home/scripts/x.py", "~/code/hermes/home/scripts/x.py"),
+    ("/Users/you/.hermes/x", "~/.hermes/x"),
+    ("/home/ubuntu/.hermes/logs/errors.log", "~/.hermes/logs/errors.log"),
+    ('File "/home/ubuntu/.hermes/x.py", line 3', 'File "~/.hermes/x.py", line 3'),
+    ("cwd=/home/ubuntu/code (see /Users/you/a)", "cwd=~/code (see ~/a)"),
+    ("HERMES_HOME=/home/ubuntu/.hermes", "HERMES_HOME=~/.hermes"),
+    ("ERROR x: open '/Users/you/y' failed", "ERROR x: open '~/y' failed"),
+])
+def test_home_tilde_only_rewrites_a_real_home_prefix(raw, want):
+    assert sg.home_tilde(raw) == want
