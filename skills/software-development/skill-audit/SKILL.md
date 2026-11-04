@@ -41,6 +41,9 @@ metadata:
    To check "already present", grep a distinctive 4-6 word phrase or identifier (a path, command, test name) across
    the skill dir and sibling sub-skills, not the whole line: later sessions usually re-saved the note reworded.
    A failed call whose operations carry no new text at all is `stale` (nothing to recover).
+   The detector cannot see successful writes later reverted by sync. When a stale fact contradicts a shipped
+   fix, inspect that skill's `git log -p` for a corrective commit followed by a reversal; recover only text whose
+   underlying behavior still holds, then verify it remains in `origin/state` and the live skill after sync.
 3. **Oversize (>= 70%)**: split before the cap bites. Back up the old file to the scratch dir first.
    - Keep SKILL.md a router: when-to-use, orientation, the rules that apply to every task in the area, a table
      mapping task -> sub-skill, and a line saying new notes go to a sub-skill/reference and the router stays under
@@ -56,8 +59,11 @@ metadata:
      `skill_view`; a `skill_manage patch` on a sub-skill is accepted.
    - Grep the repo docs for copies of the skill elsewhere (other profiles, remote gateways) and update the
      copy instruction to name all the new dirs.
-4. **Unreferenced references**: a reference no SKILL.md names is effectively invisible. Link it from the skill
-   or sub-skill whose topic it covers (one line: when to read it). Delete only if it is wholly superseded.
+4. **Unreferenced references**: check machine consumers before treating a missing Markdown link as an orphan.
+   `tools/skill-trigger-eval/cards.py` discovers `references/trigger-cards.yaml` by convention; `scripts/test-all`
+   discovers skill regression tests. Verify that consumer before retaining these without a SKILL.md link.
+   Link human-facing guidance from the skill or sub-skill whose topic it covers (one line: when to read it).
+   Delete only if it is wholly superseded.
 5. **Broken links**: fix the path, or remove the mention if the file is gone for good.
 6. **Overlaps**: read both skills. Merge only when the triggers really are the same task; otherwise sharpen both
    descriptions so the trigger is unambiguous. When merging, move the content and leave nothing behind (archive the
