@@ -70,6 +70,15 @@ To identify the workflow, use `gh run view RUN -R O/R --json workflowDatabaseId`
   inventing a cause. An explicit runner-communication annotation supports investigating runner logs,
   host boot time and maintenance history, but does not alone identify why communication was lost.
 
+## Verify conditional test lanes
+
+When a workflow serves both ordinary PR validation and input-enabled native tests, treat a workflow-level pass as discovery, not proof that the native lane ran. The same SHA and workflow can have a green PR run with native jobs skipped and a failing dispatched native run.
+
+1. Enumerate runs for the required SHA and workflow; distinguish event and dispatch configuration using the workflow definition and recorded invocation.
+2. Inspect each candidate run's paginated jobs and test logs. Require the named native jobs to execute successfully and record package/test counts; `skipped` does not satisfy native acceptance. Use the jobs API above even when a wait helper reports success.
+3. For a staged stack, verify each independently landable prefix's required tests. A green full-stack run cannot validate an earlier prefix whose tests require later changes. Compare the affected blobs across heads to distinguish an actual fix from unrelated tests making the aggregate green.
+4. Cite the qualifying run and exact source SHA, retaining any failed native attempt separately from ordinary PR validation. Continue using the shared wait helper for scheduling, but do not let its workflow-level result replace these job-level checks.
+
 ## Prove ancestry and acceptance separately
 
 Find candidate fixes with `git log origin/main --format='%H %cI %s' -- <failing-file>` and review their diffs.
