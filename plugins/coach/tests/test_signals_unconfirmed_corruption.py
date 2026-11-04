@@ -115,6 +115,12 @@ def test_card_text_in_a_defect_never_joins_a_corruption_incident():
 @pytest.mark.parametrize("db", ["/tmp/pytest-of-ubuntu/pytest-56/test_x0/state.db",
                                 "/home/ubuntu/.hermes/cache/scratch/hh/state.db",
                                 "/home/ubuntu/.hermes/cache/core-update/stage/state.db",
+                                "/home/ubuntu/.hermes/profiles/coach/cache/scratch/t1/state.db",
+                                "/home/ubuntu/.hermes/profiles/coach/tmp/state.db",
+                                "/home/ubuntu/.hermes/profiles/coach/state.db.bak/state.db",
+                                "/home/ubuntu/.hermes/kanban/workspaces/t_x/state.db",
+                                "/home/ubuntu/.hermes/state-recovery/state.db",
+                                "/home/ubuntu/.hermes/profiles/state.db",
                                 "/home/other/.hermes/state.db",
                                 "relative/state.db"])
 def test_scratch_and_foreign_dbs_are_excluded(db):

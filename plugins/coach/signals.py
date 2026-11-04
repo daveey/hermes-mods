@@ -631,12 +631,13 @@ UNCONFIRMED_RE = re.compile(
 
 
 def _live_db(db: str, root: Path) -> bool:
-    """A db under the scanned home that is not scratch: cache/ (TMPDIR, throwaway test homes) never counts."""
+    """Only a profile's real state.db: `<home>/state.db` or `<home>/profiles/<name>/state.db`. Anything else under the
+    home (cache/ and profiles/<p>/cache/scratch = TMPDIR test homes, tmp/, workspaces, ...) is scratch."""
     try:
-        rel = Path(db).resolve().relative_to(root.resolve())
+        parts = Path(db).resolve().relative_to(root.resolve()).parts
     except (ValueError, OSError):
         return False
-    return bool(rel.parts) and rel.parts[0] != "cache"
+    return parts == ("state.db",) or (len(parts) == 3 and parts[0] == "profiles" and parts[2] == "state.db")
 
 
 def parse_unconfirmed_corruption(lines: List[str], root: Path) -> List[dict]:
