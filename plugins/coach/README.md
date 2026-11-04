@@ -1002,6 +1002,37 @@ every timeout still in the logs. Tests: `tests/test_backend_timeouts.py` (40 lin
 repeat the same day comments instead of duplicating, lost state, next day, rotated logs, histogram; also passes
 under Python 3.9).
 
+#### Timestamp contract and rollout
+
+Production scans use UTC instants and read the producer's immutable numeric offset:
+`YYYY-MM-DD HH:mm:ss,SSS -08:00 [hermes] ...`. The bounds, first/last events and power intervals
+include explicit UTC offsets. The caller's `TZ`, host timezone and Electron `Intl` zone are **not**
+authoritative for a cached `Date` formatter. No inspector, process restart or guessed Pacific timezone
+is needed. Daily incident keys retain the host-local date, independently of UTC scan bounds.
+
+Deploy the offset-emitting Desktop producer **before** this consumer. Until then a legacy timeout
+whose possible UTC instant overlaps the window yields `status: clock_unresolved`, `count: null`,
+exit 2 and no incident writes, not a successful zero. Legacy stamps are excluded only if their entire
+possible UTC range (wall stamp +/-24 hours) misses the window. Thus old rotated legacy entries cannot
+keep alerting disabled indefinitely after upgrade. Missing/unreadable logs, invalid timeout stamps,
+and a zero with no offset-stamped record at or before the window start also refuse certification.
+Unresolved evidence prints an error even in cron mode; it is not the silent healthy path.
+This conservative migration may require up to a day after the final legacy timeout before a valid
+bounded report is available. Do not force a restart or delete logs to manufacture acceptance.
+
+`clock.coverage_start` records the earliest retained offset-stamped record. This proves only a count
+in retained logs, not backend availability, complete historical retention or absence of logging gaps.
+`--hours` is exploratory: keys with `+00:00` are UTC, keys without it are unresolved legacy wall hours;
+the latter are never a bounded raw-zero receipt. Naive injected Python datetimes remain a compatibility
+path for existing low-level fixtures, explicitly labelled `injected-naive-compatibility`; CLI uses UTC.
+
+Tests: `test_backend_timeout_offsets.py` (cross-zone midnight, legacy/invalid/missing evidence,
+old legacy migration), `test_backend_timeout_clock.py` (DST fold distinguishes two identical wall
+stamps, excludes the other fold outside the window, spring transition and UTC power evidence),
+`test_backend_timeout_coverage.py` (bounded zero, insufficient coverage, literal CLI under New York
+and Pacific `TZ`, host-local daily keys and distinct histogram labels). Original counting, lifecycle
+and sleep thresholds remain covered by `test_backend_timeouts.py`.
+
 On macOS, the watcher also reads `pmset -g log` (30-second bound) to identify positively observed Sleep/DarkWake
 intervals, ending at either a plain full Wake or DarkWake-to-FullWake. Timeouts in those intervals, including
 expired timers delivered in the full-wake second, remain in raw `count`/`by_path` but are split into
