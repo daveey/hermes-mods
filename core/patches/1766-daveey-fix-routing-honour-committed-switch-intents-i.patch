@@ -1,0 +1,411 @@
+From 615d439f4a83a8e831661d49ee265e9fe139bf17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:00:22 +0000
+Subject: [PATCH] [daveey] fix(routing): honour committed switch intents in
+ commit order, one event each
+
+Why-chain (five whys, evidence: deleg_d342c5fe review probe4.log at 24096f5d558):
+1. Next exact build on the newer pick raised "Exact pinned route cannot fail over":
+   the durable allocation held the OLDER pick's tuple.
+2. A build that read intent A allocated after a newer intent B was already honoured;
+   fence(A) != fence(B), so the allocator replaced again with A's tuple.
+3. The switch_fences row was an equality fence (last token per root/class) with no order,
+   and the read -> allocate window is not serialized against later switches (cold
+   /review vs the drained queued turn).
+4. Intent rows had no event identity: the same tuple+generation recorded again (profile
+   selection A -> B -> A writes the same runtime_generation) produced the same token,
+   mistaken for the honoured one after an unfenced in-session switch.
+5. Not caught: fence tests covered same-intent overlap, crash retry and rollback, never
+   an older intent allocating after a newer one, nor a repeated identical intent.
+
+Fix: record_in_transaction stamps each intent with an event {store nonce, seq} from one
+counter in the session store, taken in the recording transaction (unique, commit
+ordered; signature unchanged, so the canonical writers are untouched). fence_token
+encodes it; the allocator replaces only when supersedes(token, honoured): same store ->
+strictly newer seq; equal -> sticky (retry / overlap); legacy or cross-store -> the old
+equality fence. A superseded build now takes the sticky path (an exact pin refuses it)
+and cannot move the newer pin. Failed prepare still rolls the fence back; unfenced
+replace=True unchanged. replace is typed bool | str through resolve_model_route,
+resolve_class_runtime, resolve_managed_runtime and RoutingState, matching
+hermes_cli/runtime_provider.
+
+Tests: tests/agent/test_route_switch_intent_order.py (real AIAgent builds: stale older
+after newer, repeated identical intent after unfenced switch, rollback then crash retry
+then newer intent; token order units). Two real-build tests fail at 24096f5d558.
+---
+ agent/model_routing.py                        |   2 +-
+ agent/model_routing_managed.py                |   2 +-
+ agent/model_routing_runtime.py                |   2 +-
+ agent/model_routing_state.py                  |  20 ++-
+ agent/model_routing_switch_intent.py          |  85 ++++++++-
+ tests/agent/test_route_switch_intent_order.py | 163 ++++++++++++++++++
+ 6 files changed, 260 insertions(+), 14 deletions(-)
+ create mode 100644 tests/agent/test_route_switch_intent_order.py
+
+diff --git a/agent/model_routing.py b/agent/model_routing.py
+index 67043ac438d..71bbcac8b53 100644
+--- a/agent/model_routing.py
++++ b/agent/model_routing.py
+@@ -105,7 +105,7 @@ def eligible_routes(policy, level, requirements=None, excluded=(), eligible=None
+ 
+ def resolve_model_route(model, provider="auto", *, config=None, session_id=None,
+                         parent_session_id=None, requirements=None, excluded=(), state_path=None,
+-                        eligible=None, prepare=None, exact_pin=False, replace=False):
++                        eligible=None, prepare=None, exact_pin=False, replace: bool | str = False):
+     """Return concrete model/provider and durable metadata, or unchanged exact pin.
+ 
+     ``excluded`` is a sequence of failed (provider, model) pairs for a new attempt,
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+index 714f35c7bf4..543f680ef2a 100644
+--- a/agent/model_routing_managed.py
++++ b/agent/model_routing_managed.py
+@@ -85,7 +85,7 @@ def pin_policy(model, provider, config):
+ 
+ 
+ def resolve_managed_runtime(model, provider, *, config, session_id=None, requirements=None,
+-                            prepare_runtime=None, replace=False):
++                            prepare_runtime=None, replace: bool | str = False):
+     from agent.model_routing_runtime import resolve_class_runtime
+     from hermes_state_ids import new_session_id
+     level, restricted = pin_policy(model, provider, config)
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index f29ad2cf64b..e5fcebe028b 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -20,7 +20,7 @@ def temporary_resolution():
+ 
+ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+                           parent_session_id=None, requirements=None, excluded=(), state_path=None,
+-                          prepare_runtime=None, exact_pin=False, replace=False):
++                          prepare_runtime=None, exact_pin=False, replace: bool | str = False):
+     from agent.credential_pool import load_pool
+     from hermes_cli import runtime_provider as runtime
+ 
+diff --git a/agent/model_routing_state.py b/agent/model_routing_state.py
+index b3fadb032ac..58106b488a5 100644
+--- a/agent/model_routing_state.py
++++ b/agent/model_routing_state.py
+@@ -13,13 +13,15 @@ class RoutingState:
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+ 
+     def allocate(self, session_id, parent_session_id, level, candidates, version, excluded, prepare=None,
+-                 exact_pin=False, replace=False):
++                 exact_pin=False, replace: bool | str = False):
+         """Allocate and persist atomically; aliases share one failover decision.
+ 
+         ``replace`` is ``True`` (unconditional, an in-session switch) or a committed switch-intent fence
+-        token: that intent replaces this lineage's class allocation at most once. The fence is recorded
+-        in this transaction, so overlapping builds and a crash retry before the intent is consumed
+-        re-read the honoured allocation instead of choosing again; a failed ``prepare`` rolls it back.
++        token: that intent replaces this lineage's class allocation at most once, and only while it is
++        newer than the intent the allocation last honoured (``model_routing_switch_intent.supersedes``).
++        The fence is recorded in this transaction, so overlapping builds, a crash retry before the intent
++        is consumed and a late build of a superseded intent re-read the honoured allocation instead of
++        choosing again; a failed ``prepare`` rolls it back.
+         """
+         with closing(sqlite3.connect(self.path, timeout=30, isolation_level=None)) as db:
+             db.execute("PRAGMA busy_timeout=30000")
+@@ -77,7 +79,8 @@ class RoutingState:
+                 db.execute("ROLLBACK")
+                 raise
+ 
+-    def _allocate(self, db, session, parent, level, candidates, version, excluded, exact_pin=False, replace=False):
++    def _allocate(self, db, session, parent, level, candidates, version, excluded, exact_pin=False,
++                  replace: bool | str = False):
+         from agent.model_routing import ModelRoutingError
+ 
+         root = self._root(db, session, parent)
+@@ -85,8 +88,11 @@ class RoutingState:
+         if fence is not None:
+             honoured = db.execute("SELECT intent FROM switch_fences WHERE root=? AND class=?",
+                                   (root, level)).fetchone()
+-            if honoured is not None and honoured[0] == fence:
+-                replace = False  # this intent already replaced the allocation: ordinary sticky lookup
++            from agent.model_routing_switch_intent import supersedes
++            if not supersedes(fence, honoured[0] if honoured is not None else None):
++                # This event (a retry, an overlapping build) or a newer one already replaced the
++                # allocation: ordinary sticky lookup, so a superseded build cannot move it back.
++                replace = False
+         row = db.execute("SELECT metadata FROM routes WHERE root=? AND class=?", (root, level)).fetchone()
+         if row and not replace:
+             previous = json.loads(row[0])
+diff --git a/agent/model_routing_switch_intent.py b/agent/model_routing_switch_intent.py
+index 25103f02f98..740668cff3a 100644
+--- a/agent/model_routing_switch_intent.py
++++ b/agent/model_routing_switch_intent.py
+@@ -21,22 +21,99 @@ adapter's idle guard reserves nothing). The allocator therefore keys the replace
+ intent replaces a lineage's class allocation at most once. An overlapping build, or a retry after a crash
+ between allocation and consume, re-reads the honoured route; a rolled-back allocation leaves no fence.
+ Consume still happens only after the allocation commits, never before it.
++
++The fence is also an order. Builds that read an intent are not serialized against later switches: a build
++can read intent A, a newer switch B can commit and be honoured by another build, and only then the A build
++allocates. Keyed to equality alone, A (a different token) replaced B's allocation, its compare-delete then
++missed, and the next build on B's exact tuple hit "Exact pinned route cannot fail over". And an identical
++intent recorded again (a profile selection A -> B -> A within one runtime generation writes the same raw
++row) was mistaken for the already-honoured one. So every recorded intent carries an ``event``: a store
++nonce plus a sequence number from one counter in the same session store, taken inside the recording
++transaction, so it is unique and follows commit order. The allocator replaces only when the presented
++event is newer than the one the lineage class last honoured; an equal one is a retry or an overlapping
++build (sticky), an older one is a superseded build (sticky: an exact pin then refuses it). Intents without
++an event, or from another store, keep the equality fence.
+ """
+ import hashlib
+ import json
++import uuid
+ 
+ PREFIX = "gateway.route_switch.v1."
++# One counter per session store: {"store": <nonce>, "seq": <last issued>}. Not a session key.
++ORDER_KEY = "gateway.route_switch_order.v1"
++_TOKEN = "switch-intent:"
++_ORDERED = _TOKEN + "v2:"
+ 
+ 
+ def fence_token(raw):
+-    """The allocator's idempotence key for exactly this committed intent (session, tuple, generation)."""
+-    return "switch-intent:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
++    """The allocator's key for exactly this committed intent event, ordered when the intent carries one."""
++    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
++    event = _event(raw)
++    if event is None:
++        return _TOKEN + digest
++    store, seq = event
++    return f"{_ORDERED}{store}:{seq:020d}:{digest}"
++
++
++def _event(raw):
++    try:
++        event = json.loads(raw).get("event")
++        store, seq = event["store"], event["seq"]
++    except (TypeError, ValueError, AttributeError, KeyError):
++        return None
++    if not isinstance(store, str) or not store or ":" in store or type(seq) is not int or seq < 1:
++        return None
++    return store, seq
++
++
++def _order(token):
++    if not isinstance(token, str) or not token.startswith(_ORDERED):
++        return None
++    parts = token[len(_ORDERED):].split(":", 2)
++    if len(parts) != 3 or not parts[1].isdigit():
++        return None
++    return parts[0], int(parts[1])
++
++
++def supersedes(token, honoured):
++    """Whether intent ``token`` may replace an allocation that last honoured ``honoured`` (or None).
++
++    Same store: strictly newer events only; an equal token is the same event (retry, overlapping build).
++    Unordered or cross-store tokens keep the equality fence.
++    """
++    if honoured is None:
++        return True
++    if token == honoured:
++        return False
++    mine, theirs = _order(token), _order(honoured)
++    if mine is not None and theirs is not None and mine[0] == theirs[0]:
++        return mine[1] > theirs[1]
++    return True
++
++
++def _next_event(conn):
++    row = conn.execute("SELECT value FROM state_meta WHERE key=?", (ORDER_KEY,)).fetchone()
++    try:
++        order = json.loads(row[0]) if row is not None else {}
++        store, seq = order.get("store"), order.get("seq")
++    except (TypeError, ValueError, AttributeError):
++        store = seq = None
++    if not isinstance(store, str) or not store or ":" in store or type(seq) is not int or seq < 0:
++        store, seq = uuid.uuid4().hex, 0  # first intent in this store (or an unreadable counter)
++    seq += 1
++    conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?) "
++                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
++                 (ORDER_KEY, json.dumps({"store": store, "seq": seq}, sort_keys=True)))
++    return {"store": store, "seq": seq}
+ 
+ 
+ def record_in_transaction(conn, session_id, model, provider, generation):
+-    """Write the intent inside the caller's receipt transaction (never on its own)."""
++    """Write the intent inside the caller's receipt transaction (never on its own).
++
++    Each call is a distinct, ordered event (module docstring), even for an identical tuple and generation.
++    """
+     value = json.dumps({"session_id": session_id, "model": model, "provider": provider or "",
+-                        "generation": generation}, sort_keys=True)
++                        "generation": generation, "event": _next_event(conn)}, sort_keys=True)
+     conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (PREFIX + session_id, value))
+ 
+diff --git a/tests/agent/test_route_switch_intent_order.py b/tests/agent/test_route_switch_intent_order.py
+new file mode 100644
+index 00000000000..c8ae1fba77d
+--- /dev/null
++++ b/tests/agent/test_route_switch_intent_order.py
+@@ -0,0 +1,163 @@
++"""Committed switch intents replace allocations in commit order, each as its own event. [daveey]
++
++A build reads its intent, then allocates; nothing serializes that window against a later switch. Keyed by
++equality alone, a build that read intent A could allocate AFTER a newer intent B was honoured, replace B's
++allocation with A's tuple, miss its compare-delete, and leave the next exact build on B refusing ("Exact
++pinned route cannot fail over"). And an identical intent recorded again (same tuple and generation, as a
++profile selection A -> B -> A writes) produced the same fence token as the honoured one. Every intent now
++carries a store-ordered event; the allocator replaces only for an event newer than the one it honoured.
++"""
++import json
++import threading
++from unittest.mock import patch
++
++import pytest
++
++import agent.model_routing_switch_intent as switch_intent
++from agent.model_routing import ModelRoutingError
++from agent.model_routing_state import RoutingState
++from agent.model_routing_switch_intent import PREFIX, fence_token, record_in_transaction, supersedes
++from hermes_state import SessionDB
++from tests.agent import test_route_switch_intent as base
++
++managed = base.managed
++routing_home = base.routing_home
++streaming_route = base.streaming_route
++destinations = base.destinations
++seams = base.seams
++_build = base._build
++
++
++def _record(db, session, model, generation=2):
++    db._execute_write(lambda conn: record_in_transaction(conn, session, model, 'anthropic', generation))
++    return db.route_switch_intent(session)
++
++
++def test_identical_intents_are_distinct_ordered_events(tmp_path):
++    db = SessionDB(tmp_path / 'state.db')
++    try:
++        first = _record(db, 's', 'z-anthropic-deep')
++        again = _record(db, 's', 'z-anthropic-deep')
++        assert first != again
++        assert json.loads(first)['event']['seq'] + 1 == json.loads(again)['event']['seq']
++        assert json.loads(first)['generation'] == json.loads(again)['generation'] == 2
++        older, newer = fence_token(first), fence_token(again)
++        assert older != newer
++        assert supersedes(newer, older) and not supersedes(older, newer)
++        assert not supersedes(newer, newer)  # a retry / overlapping build of the same event
++        assert supersedes(older, None)
++        # The counter is per store, shared by every session in it, so order follows commit order.
++        other = fence_token(_record(db, 'other', 'z-anthropic-deep'))
++        assert supersedes(other, newer)
++    finally:
++        db.close()
++
++
++def test_unordered_and_cross_store_tokens_keep_the_equality_fence(tmp_path):
++    legacy = json.dumps({'session_id': 's', 'model': 'm', 'provider': 'anthropic', 'generation': 2})
++    token = fence_token(legacy)
++    assert token.startswith('switch-intent:') and ':v2:' not in token
++    assert not supersedes(token, token)
++    ordered = []
++    for name in ('a.db', 'b.db'):
++        db = SessionDB(tmp_path / name)
++        try:
++            ordered.append(fence_token(_record(db, 's', 'm')))
++        finally:
++            db.close()
++    assert ordered[0] != ordered[1]
++    assert supersedes(ordered[0], ordered[1]) and supersedes(ordered[1], ordered[0])
++    assert supersedes(token, ordered[0]) and supersedes(ordered[0], token)
++
++
++def test_stale_older_build_after_a_newer_switch_cannot_replace_or_wedge(destinations, tmp_path, seams):
++    """Real AIAgent builds: an older intent's build that allocates late leaves the newer pin standing."""
++    _build('anthropic-deep')
++    routes = RoutingState(tmp_path / 'model-routing.sqlite3')
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    read, release = threading.Event(), threading.Event()
++    real = switch_intent.pending
++
++    def pending(*args, **kwargs):
++        raw = real(*args, **kwargs)
++        if threading.current_thread().name == 'stale':
++            read.set()
++            assert release.wait(20)
++        return raw
++    outcome = {}
++
++    def stale():
++        try:
++            outcome['agent'] = _build('z-anthropic-deep', session_db=db)
++        except BaseException as exc:  # asserted below
++            outcome['error'] = exc
++    try:
++        _record(db, 'pin', 'z-anthropic-deep')  # intent A
++        with patch.object(switch_intent, 'pending', pending):
++            thread = threading.Thread(target=stale, name='stale')
++            thread.start()
++            assert read.wait(20)  # the stale build holds intent A, not yet allocated
++            _record(db, 'pin', 'anthropic-deep', generation=3)  # newer intent B supersedes A
++            newer = _build('anthropic-deep', session_db=db)
++            assert newer.model == 'anthropic-deep'
++            assert db.get_meta(PREFIX + 'pin') is None  # B consumed
++            release.set()
++            thread.join(30)
++        assert not thread.is_alive()
++        assert isinstance(outcome.get('error'), ModelRoutingError), outcome
++        assert 'cannot fail over' in str(outcome['error'])
++        recorded = routes.peek('pin', 'deep')
++        assert (recorded['selected_model'], recorded['exact_pin'], recorded['reason']) == (
++            'anthropic-deep', True, 'explicit-switch')
++        # No wedge: the next exact build on the newer pick resolves from the durable route.
++        assert _build('anthropic-deep', session_db=db).model == 'anthropic-deep'
++    finally:
++        release.set()
++        db.close()
++
++
++def test_repeated_identical_intent_after_an_unfenced_switch_replaces_again(destinations, tmp_path, seams):
++    """A -> in-session /model -> the same tuple and generation again: a new event, not a lingering retry."""
++    _build('anthropic-deep')
++    path = tmp_path / 'model-routing.sqlite3'
++    routes = RoutingState(path)
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    try:
++        _record(db, 'pin', 'z-anthropic-deep')
++        assert _build('z-anthropic-deep', session_db=db).model == 'z-anthropic-deep'
++        honoured = routes.peek('pin', 'deep')
++        route = {'provider': honoured['selected_provider'], 'model': 'anthropic-deep',
++                 'billing': honoured['billing_group'], 'weight': 1}
++        moved = routes.allocate('pin', None, 'deep', [route], honoured['policy_version'], (),
++                                exact_pin=True, replace=True)  # unfenced in-session switch
++        assert moved['selected_model'] == 'anthropic-deep'
++        _record(db, 'pin', 'z-anthropic-deep')  # byte-identical apart from its event
++        assert _build('z-anthropic-deep', session_db=db).model == 'z-anthropic-deep'
++        assert routes.peek('pin', 'deep')['selected_model'] == 'z-anthropic-deep'
++        assert db.get_meta(PREFIX + 'pin') is None
++    finally:
++        db.close()
++
++
++def test_rollback_then_newer_intent_still_replaces_in_order(destinations, tmp_path, seams):
++    """A refused credential fences nothing; a newer intent and a crash retry of it behave in order."""
++    _build('anthropic-deep')
++    routes = RoutingState(tmp_path / 'model-routing.sqlite3')
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    try:
++        _record(db, 'pin', 'z-anthropic-deep')
++        with patch('agent.model_routing_runtime.verify_class_runtime',
++                   side_effect=ModelRoutingError('credential refused')):
++            with pytest.raises(ModelRoutingError, match='credential refused'):
++                _build('z-anthropic-deep', session_db=db)
++        assert routes.peek('pin', 'deep')['selected_model'] == 'anthropic-deep'
++        with patch.object(switch_intent, 'consume', lambda *a, **k: None):  # crash before consume
++            assert _build('z-anthropic-deep', session_db=db).model == 'z-anthropic-deep'
++        committed = routes.peek('pin', 'deep')
++        assert _build('z-anthropic-deep', session_db=db).model_routing == committed  # retry is sticky
++        assert db.get_meta(PREFIX + 'pin') is None
++        _record(db, 'pin', 'anthropic-deep', generation=3)
++        assert _build('anthropic-deep', session_db=db).model == 'anthropic-deep'
++        assert routes.peek('pin', 'deep')['selected_model'] == 'anthropic-deep'
++    finally:
++        db.close()
+-- 
+2.55.0
+

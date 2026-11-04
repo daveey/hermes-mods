@@ -1,0 +1,404 @@
+From 49c12ce7816ba1567f53283af6c3d1c00814f72a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:51:43 +0000
+Subject: [PATCH] Managed workers honour a committed model switch through
+ owner-scoped receipt operations
+
+The production worker's RuntimeSessionStore had no get_meta/_write_sql, so pending() silently
+returned None and every worker rebuild after a switch hit 'Exact pinned route cannot fail over'.
+Intent read/consume are now narrow worker.persist operations (route_switch.pending/consume) bound
+to the worker's own assigned session and generation by the receipt fence; SessionDB exposes the
+same two methods. Consume is compare-and-delete. An auto build honouring an intent resolves on the
+switch's committed provider. The model receipt row writer now moves provider/base_url/api_mode/
+gateway_runtime and billing to the picked tuple with update_session_model's merge. route_runtime
+pre-build lookups run under temporary_resolution so they mint no standing allocation. [daveey]
+---
+ agent/model_routing_agent.py            |   8 +-
+ agent/model_routing_switch_intent.py    |  42 +++++-
+ agent/runtime_session_store.py          |   9 ++
+ gateway/session_worker_construct.py     |  12 +-
+ hermes_state.py                         |  11 ++
+ hermes_state_mutation_prepared.py       |  17 ++-
+ hermes_state_worker_lifecycle.py        |   4 +
+ tests/agent/test_route_switch_intent.py | 174 ++++++++++++++++++++++++
+ 8 files changed, 263 insertions(+), 14 deletions(-)
+
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index 19a95c79013..26e189ff717 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -39,8 +39,14 @@ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+     # recorded allocation once; nothing else may move an exact pin.
+     from agent.model_routing_switch_intent import consume, pending
+     intent = pending(session_db, session_id, model, provider)
++    requested = provider or "auto"
++    if intent is not None and requested == "auto":
++        # An ``auto`` build honouring a switch must land on the provider the switch committed, never a
++        # sibling route serving the same model name; a provider that cannot serve it refuses below.
++        import json
++        requested = json.loads(intent).get("provider") or requested
+     runtime = resolve_runtime_provider(
+-        requested=provider or "auto", target_model=model,
++        requested=requested, target_model=model,
+         explicit_api_key=None if managed else api_key, explicit_base_url=None if managed else base_url,
+         routing_session_id=session_id, routing_config=config,
+         routing_requirements=requirements, routing_replace=intent is not None)
+diff --git a/agent/model_routing_switch_intent.py b/agent/model_routing_switch_intent.py
+index 5d75706126d..393bc712e70 100644
+--- a/agent/model_routing_switch_intent.py
++++ b/agent/model_routing_switch_intent.py
+@@ -31,13 +31,14 @@ def pending(session_db, session_id, model, provider):
+     """The raw intent row when it names exactly this session and tuple, else ``None``."""
+     if session_db is None or not session_id or not model:
+         return None
+-    get = getattr(session_db, "get_meta", None)
+-    if not callable(get):
+-        return None
+-    try:
+-        raw = get(PREFIX + session_id)
+-    except Exception:
++    # Both the owner's SessionDB and a managed worker's RuntimeSessionStore expose this one narrow read,
++    # bound to the session it names (the worker's is owner-checked against its own assignment). A store
++    # without it (a test double, a foreign wrapper) has no committed switch to honour; a store that has
++    # it and fails raises, so a broken owner link is never mistaken for "no switch".
++    read = getattr(session_db, "route_switch_intent", None)
++    if not callable(read):
+         return None
++    raw = read(session_id)
+     if not raw:
+         return None
+     try:
+@@ -54,4 +55,31 @@ def pending(session_db, session_id, model, provider):
+ 
+ def consume(session_db, session_id, raw):
+     """Delete the intent only if it is still the one this build honoured (a newer switch survives)."""
+-    session_db._write_sql("DELETE FROM state_meta WHERE key=? AND value=?", (PREFIX + session_id, raw))
++    session_db.consume_route_switch_intent(session_id, raw)
++
++
++def read_on_conn(conn, session_id):
++    row = conn.execute("SELECT value FROM state_meta WHERE key=?", (PREFIX + session_id,)).fetchone()
++    return row[0] if row is not None else None
++
++
++def consume_on_conn(conn, session_id, raw):
++    """Compare-and-delete; true only when this exact intent was the one removed."""
++    return conn.execute("DELETE FROM state_meta WHERE key=? AND value=?",
++                        (PREFIX + session_id, raw)).rowcount == 1
++
++
++def worker_pending(db, conn, session_id, payload):
++    """``worker.persist`` ``route_switch.pending``: the intent of the worker's own assigned session only."""
++    from hermes_state_runtime import RuntimeStoreError
++    if payload:
++        raise RuntimeStoreError('invalid_params')
++    return {'value': read_on_conn(conn, session_id)}
++
++
++def worker_consume(db, conn, session_id, payload):
++    """``worker.persist`` ``route_switch.consume``: CAS-delete the worker's own session intent."""
++    from hermes_state_runtime import RuntimeStoreError
++    if set(payload) != {'raw'} or not isinstance(payload['raw'], str):
++        raise RuntimeStoreError('invalid_params')
++    return {'value': consume_on_conn(conn, session_id, payload['raw'])}
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index e7cca9764f7..b5be22fe8f8 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -514,6 +514,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+         self._apply('session.model', {'model': model, 'provider': provider, 'base_url': base_url,
+                                       'api_mode': api_mode, 'clear_model_routing': bool(clear_model_routing)})
+ 
++    def route_switch_intent(self, session_id):
++        """The committed model-switch intent for this worker's own session (the owner reads it in-receipt)."""
++        self._session(session_id)
++        return self._apply('route_switch.pending', {})['value']
++
++    def consume_route_switch_intent(self, session_id, raw):
++        self._session(session_id)
++        return self._apply('route_switch.consume', {'raw': raw})['value']
++
+     def _session_turn_lease_key(self, session_id):
+         # The stand-down latch compares lineage keys; the owner answers only within this lineage.
+         if not session_id:
+diff --git a/gateway/session_worker_construct.py b/gateway/session_worker_construct.py
+index dd575c2c486..4c54339ecb2 100644
+--- a/gateway/session_worker_construct.py
++++ b/gateway/session_worker_construct.py
+@@ -169,7 +169,17 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
+     """``(runtime, fallback_entry)`` for a launch-policy route: the session's FROZEN config and launch
+     credential, walking its own fallback chain on an AuthError unless ``fallback=False`` (a session
+     control asking which route the session itself runs). The one resolver an in-process turn
+-    (``_resolve_policy_agent_runtime``) and a managed worker (``worker_route``) share."""
++    (``_resolve_policy_agent_runtime``) and a managed worker (``worker_route``) share.
++
++    This is a pre-build lookup: a managed route resolved here has no session identity yet (the resolver
++    mints a random one), so it must not record a standing allocation. The agent's own
++    ``prepare_agent_route`` allocates under the real session id."""
++    from agent.model_routing_runtime import temporary_resolution
++    with temporary_resolution():
++        return _route_runtime(policy, frozen, model, key, fallback=fallback)
++
++
++def _route_runtime(policy, frozen, model, key, *, fallback=True):
+     from hermes_cli.runtime_provider import (
+         frozen_runtime_config, resolve_runtime_provider, resolve_runtime_with_fallback,
+     )
+diff --git a/hermes_state.py b/hermes_state.py
+index 4bfd8c07e9b..9bdf04ea217 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -1691,6 +1691,17 @@ class SessionDB(
+ 
+     # ── Meta key/value (scheduler bookkeeping) ──
+ 
++    def route_switch_intent(self, session_id: str) -> Optional[str]:
++        """The committed model-switch intent for ``session_id`` (``agent.model_routing_switch_intent``)."""
++        from agent.model_routing_switch_intent import read_on_conn
++        with self._lock:
++            return read_on_conn(self._conn, session_id)
++
++    def consume_route_switch_intent(self, session_id: str, raw: str) -> bool:
++        """Compare-and-delete the intent this build honoured; a newer switch survives."""
++        from agent.model_routing_switch_intent import consume_on_conn
++        return self._execute_write(lambda conn: consume_on_conn(conn, session_id, raw))
++
+     def get_meta(self, key: str) -> Optional[str]:
+         """Read state_meta[key] on self._lock (not _read_ctx): fts_rebuild_step reads progress before its
+         write transaction and a WAL reader would not see it."""
+diff --git a/hermes_state_mutation_prepared.py b/hermes_state_mutation_prepared.py
+index f8e6b47b7d8..91073284d0e 100644
+--- a/hermes_state_mutation_prepared.py
++++ b/hermes_state_mutation_prepared.py
+@@ -49,14 +49,21 @@ def model_in_transaction(db, conn, session_id, payload, prepared):
+     target = snapshot['target']
+     # Keep the transcript and cached prompt byte-stable; the explicit model switch
+     # is a client/provider boundary, not an implicit reload of launch defaults.
+-    row = conn.execute('SELECT model_config FROM sessions WHERE id=?', (target,)).fetchone()
+-    model_config = json.loads(row[0] or '{}')
+-    model_config['provider'] = config['provider']
+     # The recorded allocation belongs to the route this switch leaves: kept, every reader that trusts
+     # the record over the row (restore_route) resumed the OLD model. The committed intent below is what
+     # lets the next build of this exact session replace the allocation (agent.model_routing_switch_intent).
+-    model_config['model_routing'] = None
+-    conn.execute('UPDATE sessions SET model=?,model_config=? WHERE id=?', (model, _json(model_config), target))
++    # The whole route moves with the provider, in both shapes resume reads (SessionDB.update_session_model's
++    # merge): a kept base_url/api_mode/gateway_runtime sent the new model to the previous provider's host.
++    route = {'provider': config['provider'], 'base_url': config.get('base_url') or None,
++             'api_mode': config.get('api_mode') or None}
++    merged = db._merge_model_config_json(conn, target, {**route, 'gateway_runtime': route, 'model': model,
++                                                        'model_routing': None, 'browser_model_lock': None})
++    from hermes_state_sessions import _MODEL_CONFIG_ROW_MISSING
++    if merged is not _MODEL_CONFIG_ROW_MISSING:
++        conn.execute('UPDATE sessions SET model=?,model_config=? WHERE id=?', (model, merged, target))
++    # Billing follows the same tuple (SessionDB.update_session_billing_route contract: mode only when known).
++    conn.execute('UPDATE sessions SET billing_provider=?,billing_base_url=?,billing_mode=COALESCE(?,billing_mode) '
++                 'WHERE id=?', (route['provider'], route['base_url'], route['api_mode'], target))
+     from agent.model_routing_switch_intent import record_in_transaction
+     record_in_transaction(conn, target, model, config['provider'], generation)
+     # This selection is newer than any model pick still waiting for a turn boundary: that pick is superseded.
+diff --git a/hermes_state_worker_lifecycle.py b/hermes_state_worker_lifecycle.py
+index c847e35028d..f220849a046 100644
+--- a/hermes_state_worker_lifecycle.py
++++ b/hermes_state_worker_lifecycle.py
+@@ -227,8 +227,12 @@ def worker_lease_key(db, conn, session_id, payload):
+     return {'value': key}
+ 
+ 
++from agent.model_routing_switch_intent import worker_consume as _switch_consume, worker_pending as _switch_pending
++
+ WORKER_LIFECYCLE_HANDLERS = {
+     'session.model': worker_model,
++    'route_switch.pending': _switch_pending,
++    'route_switch.consume': _switch_consume,
+     'session.lease_key': worker_lease_key,
+     'session.title': worker_title,
+     'session.title_source': worker_title_source,
+diff --git a/tests/agent/test_route_switch_intent.py b/tests/agent/test_route_switch_intent.py
+index 2c571146707..dc88bbd8ecb 100644
+--- a/tests/agent/test_route_switch_intent.py
++++ b/tests/agent/test_route_switch_intent.py
+@@ -59,6 +59,180 @@ def test_committed_switch_survives_restart_and_replaces_the_exact_pin(destinatio
+         restarted.close()
+ 
+ 
++def test_managed_worker_store_honors_committed_switch(destinations, tmp_path, seams):
++    """The production child has an RPC facade, not the owner's SessionDB."""
++    from tests.agent.test_runtime_session_store_surface_parity import _worker_store
++
++    _build('anthropic-deep')
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    try:
++        db.create_session('pin', 'cli', model='z-anthropic-deep')
++        db._execute_write(lambda conn: record_in_transaction(
++            conn, 'pin', 'z-anthropic-deep', 'anthropic', 2))
++        store = _worker_store(db, tmp_path, session_id='pin')
++        try:
++            agent = _build('z-anthropic-deep', session_db=store)
++            assert agent.model == 'z-anthropic-deep'
++            assert db.get_meta(PREFIX + 'pin') is None
++        finally:
++            store.close()
++    finally:
++        db.close()
++
++
++def _worker_db(tmp_path):
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    db.create_session('pin', 'cli', model='anthropic-deep')
++    db.create_session('other', 'cli', model='anthropic-deep')
++    return db
++
++
++def test_managed_worker_store_refuses_another_sessions_intent(tmp_path):
++    """Owner-only, assignment-bound: a worker for ``other`` can neither read nor consume ``pin``'s intent."""
++    from agent.runtime_session_store import WorkerPersistenceError
++    from tests.agent.test_runtime_session_store_surface_parity import _worker_store
++    db = _worker_db(tmp_path)
++    try:
++        db._execute_write(lambda conn: record_in_transaction(conn, 'pin', 'z-anthropic-deep', 'anthropic', 2))
++        raw = db.route_switch_intent('pin')
++        store = _worker_store(db, tmp_path, session_id='other')
++        try:
++            with pytest.raises(WorkerPersistenceError, match='permission_denied'):
++                store.route_switch_intent('pin')
++            with pytest.raises(WorkerPersistenceError, match='permission_denied'):
++                store.consume_route_switch_intent('pin', raw)
++            assert store.route_switch_intent('other') is None
++            assert store.consume_route_switch_intent('other', raw) is False  # own key only
++        finally:
++            store.close()
++        assert db.route_switch_intent('pin') == raw
++    finally:
++        db.close()
++
++
++def test_managed_worker_consume_is_compare_and_delete(tmp_path):
++    """A newer switch committed between the worker's read and its consume survives."""
++    from tests.agent.test_runtime_session_store_surface_parity import _worker_store
++    db = _worker_db(tmp_path)
++    try:
++        db._execute_write(lambda conn: record_in_transaction(conn, 'pin', 'z-anthropic-deep', 'anthropic', 2))
++        store = _worker_store(db, tmp_path, session_id='pin')
++        try:
++            old = store.route_switch_intent('pin')
++            db._execute_write(lambda conn: record_in_transaction(conn, 'pin', 'anthropic-standard', 'anthropic', 3))
++            assert store.consume_route_switch_intent('pin', old) is False
++            newer = db.route_switch_intent('pin')
++            assert newer != old and 'anthropic-standard' in newer
++            assert store.consume_route_switch_intent('pin', newer) is True
++            assert db.route_switch_intent('pin') is None
++        finally:
++            store.close()
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize('model,provider', [('z-anthropic-deep', 'openai-codex'), ('anthropic-standard', 'anthropic')],
++                         ids=['wrong-provider', 'class-change'])
++def test_managed_worker_build_with_a_non_matching_intent_keeps_the_pin(destinations, tmp_path, seams, model, provider):
++    from tests.agent.test_runtime_session_store_surface_parity import _worker_store
++    _build('anthropic-deep')
++    state = RoutingState(tmp_path / 'model-routing.sqlite3')
++    before = state.peek('pin', 'deep')
++    db = _worker_db(tmp_path)
++    try:
++        db._execute_write(lambda conn: record_in_transaction(conn, 'pin', model, provider, 2))
++        store = _worker_store(db, tmp_path, session_id='pin')
++        try:
++            # wrong-provider: the switch's provider cannot serve the model (refused); class-change: no match.
++            with pytest.raises(ModelRoutingError):
++                _build('z-anthropic-deep', session_db=store)
++        finally:
++            store.close()
++        assert state.peek('pin', 'deep') == before
++        assert db.route_switch_intent('pin') is not None
++    finally:
++        db.close()
++
++
++def test_managed_worker_failed_allocation_keeps_the_intent(destinations, tmp_path, seams):
++    from tests.agent.test_runtime_session_store_surface_parity import _worker_store
++    _build('anthropic-deep')
++    state = RoutingState(tmp_path / 'model-routing.sqlite3')
++    before = state.peek('pin', 'deep')
++    db = _worker_db(tmp_path)
++    try:
++        db._execute_write(lambda conn: record_in_transaction(conn, 'pin', 'z-anthropic-deep', 'anthropic', 2))
++        store = _worker_store(db, tmp_path, session_id='pin')
++        try:
++            with patch('agent.model_routing_runtime.verify_class_runtime',
++                       side_effect=ModelRoutingError('credential refused')):
++                with pytest.raises(ModelRoutingError, match='credential refused'):
++                    _build('z-anthropic-deep', session_db=store)
++            assert state.peek('pin', 'deep') == before
++            assert db.route_switch_intent('pin') is not None
++            assert _build('z-anthropic-deep', session_db=store).model == 'z-anthropic-deep'
++            assert db.route_switch_intent('pin') is None
++        finally:
++            store.close()
++    finally:
++        db.close()
++
++
++def test_model_switch_row_writer_moves_the_whole_route_and_billing(tmp_path, monkeypatch):
++    """The receipt row writer replaces stale endpoint/api_mode/gateway_runtime/billing with the picked tuple."""
++    import json
++    import hermes_state_mutation_prepared as prepared_mod
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    try:
++        db.create_session('pin', 'cli', model='gpt-old', model_config={
++            'provider': 'openai-codex', 'base_url': 'https://chatgpt.com/backend-api/codex',
++            'api_mode': 'codex_responses', 'keep': 1, 'model_routing': {'exact_pin': True},
++            'gateway_runtime': {'provider': 'openai-codex', 'base_url': 'https://chatgpt.com/backend-api/codex',
++                                'api_mode': 'codex_responses'}})
++        db._execute_write(lambda conn: conn.execute(
++            "UPDATE sessions SET billing_provider='openai-codex', billing_base_url='https://chatgpt.com/backend-api/codex',"
++            " billing_mode='codex_responses' WHERE id='pin'"))
++        monkeypatch.setattr(prepared_mod, '_commit_policy', lambda db, conn, sid, prepared: ({'target': sid}, 2))
++        prepared = {'policy': {'model': 'claude-opus-5-5', 'config_json': json.dumps({'model': {
++            'provider': 'anthropic', 'base_url': 'https://api.anthropic.com', 'default': 'claude-opus-5-5'}})}}
++        db._execute_write(lambda conn: prepared_mod.model_in_transaction(db, conn, 'pin', {'model': 'claude-opus-5-5'},
++                                                                          prepared))
++        row = db.get_session('pin')
++        config = json.loads(row['model_config'])
++        route = {'provider': 'anthropic', 'base_url': 'https://api.anthropic.com'}
++        assert row['model'] == 'claude-opus-5-5'
++        # Same shape SessionDB.update_session_model writes (top-level None deletes; gateway_runtime keeps None).
++        assert config == {'keep': 1, 'model': 'claude-opus-5-5', **route,
++                          'gateway_runtime': {**route, 'api_mode': None}}
++        assert (row['billing_provider'], row['billing_base_url']) == ('anthropic', 'https://api.anthropic.com')
++        assert 'claude-opus-5-5' in db.route_switch_intent('pin')
++    finally:
++        db.close()
++
++
++def test_route_runtime_prebuild_lookup_records_no_allocation(destinations, tmp_path, monkeypatch):
++    """Gateway and worker pre-resolution (route_runtime) must not mint standing allocations."""
++    import sqlite3
++    from gateway import session_worker_construct as construct
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++
++    def lookup(policy, frozen, model, key, *, fallback=True):
++        return resolve_runtime_provider(requested='anthropic', target_model='anthropic-deep'), None
++    monkeypatch.setattr(construct, '_route_runtime', lookup)
++    for fallback in (True, False):  # in-process turn and worker_route both come through here
++        runtime, _ = construct.route_runtime(None, {}, 'anthropic-deep', None, fallback=fallback)
++        assert runtime['model'] == 'anthropic-deep'
++    path = tmp_path / 'model-routing.sqlite3'
++    if path.exists():
++        with sqlite3.connect(path) as conn:
++            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++            assert 'routes' not in tables or conn.execute('SELECT COUNT(*) FROM routes').fetchone()[0] == 0
++    # Control: the same lookup outside route_runtime does allocate, so the check above can fail.
++    lookup(None, {}, 'anthropic-deep', None)
++    with sqlite3.connect(path) as conn:
++        assert conn.execute('SELECT COUNT(*) FROM routes').fetchone()[0] == 1
++
++
+ def test_no_intent_cannot_override_an_exact_pin(destinations, tmp_path, seams):
+     _build('anthropic-deep')
+     state = RoutingState(tmp_path / 'model-routing.sqlite3')
+-- 
+2.55.0
+

@@ -1,0 +1,220 @@
+From a10445e40c051a2bbb2c0822b8cdc694ff57d4fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:38:04 +0000
+Subject: [PATCH] fix(gateway): skip unused idle peer and owner scope work
+ [daveey]
+
+---
+ gateway/control_socket.py                     |  4 +-
+ gateway/session_hosted_service.py             |  4 +
+ .../gateway/test_control_socket_idle_peer.py  | 72 +++++++++++++++
+ .../gateway/test_session_hosted_idle_scope.py | 88 +++++++++++++++++++
+ 4 files changed, 167 insertions(+), 1 deletion(-)
+ create mode 100644 tests/gateway/test_control_socket_idle_peer.py
+ create mode 100644 tests/gateway/test_session_hosted_idle_scope.py
+
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index 70af0c45646..e7a7556995a 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -575,7 +575,9 @@ class GatewayControlServer:
+             # adapter so a fast-polling consumer can't stall heartbeats.
+             from gateway.control_diagnostics import safe_verb
+             timing.verb = safe_verb(raw, self._handlers.keys() | self.private_handlers.keys() | {"session-ticket"})
+-            peer = self._posix_peer_subject(writer)
++            # Only authenticated verbs consume the peer; public polls need no filesystem checks.
++            peer = (self._posix_peer_subject(writer)
++                    if timing.verb == "session-ticket" or timing.verb in self.private_handlers else None)
+             timing.enqueue()
+             try:
+                 future = _control_executor().submit(timing.run, self.handle_request_line, raw.rstrip(b"\n"), peer)
+diff --git a/gateway/session_hosted_service.py b/gateway/session_hosted_service.py
+index f6b17e9ea8a..20ae64e2fc4 100644
+--- a/gateway/session_hosted_service.py
++++ b/gateway/session_hosted_service.py
+@@ -248,6 +248,10 @@ async def ensure_hosted_service(runner):
+ 
+ 
+ async def _ensure_hosted_service(runner, authority):
++    service = getattr(authority, 'hosted_room_service', None)
++    # Preparation is a no-op once installed; the caller still applies the ready/start gates.
++    if service is not None and getattr(service, '_transport_installed', False):
++        return
+     with owner_scope(authority):
+         service = getattr(authority, 'hosted_room_service', None)
+         if service is None:
+diff --git a/tests/gateway/test_control_socket_idle_peer.py b/tests/gateway/test_control_socket_idle_peer.py
+new file mode 100644
+index 00000000000..32b8cf42315
+--- /dev/null
++++ b/tests/gateway/test_control_socket_idle_peer.py
+@@ -0,0 +1,72 @@
++"""Public polls avoid peer lookup; authenticated verbs recheck every connection."""
++import asyncio
++import json
++import os
++import socket
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from gateway.control_socket import GatewayControlServer
++
++
++async def exchange(server, request, sock=None):
++    reader = asyncio.StreamReader()
++    reader.feed_data(json.dumps(request).encode() + b'\n')
++    reader.feed_eof()
++    output = []
++
++    async def drain():
++        pass
++
++    writer = SimpleNamespace(write=output.append, drain=drain, close=lambda: None,
++                             get_extra_info=lambda key: sock)
++    await server._handle_connection(reader, writer)
++    assert len(output) == 1
++    return json.loads(output[0])
++
++
++@pytest.mark.parametrize('verb', ['identify', 'status', 'unknown'])
++def test_public_connection_never_looks_up_peer(tmp_path, monkeypatch, verb):
++    server = GatewayControlServer(tmp_path, verb_handlers={
++        'identify': lambda: {'alive': True}, 'status': lambda: {'alive': True}})
++    lookup = Mock(return_value=None)
++    monkeypatch.setattr(server, '_posix_peer_subject', lookup)
++    reply = asyncio.run(exchange(server, {'verb': verb}))
++    assert reply['ok'] is (verb != 'unknown')
++    lookup.assert_not_called()
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('verb', ['private', 'identify', 'session-ticket'])
++def test_private_connection_rechecks_home_and_peer(tmp_path, monkeypatch, verb):
++    home = tmp_path / 'home'
++    home.mkdir(mode=0o700)
++    server = GatewayControlServer(home, verb_handlers={'identify': lambda: {'public': True}})
++    private = Mock(return_value={'private': True})
++    if verb != 'session-ticket':
++        server.private_handlers[verb] = private
++    mint = Mock(return_value='ticket')
++    server.ticket_store = SimpleNamespace(instance_id='instance', mint=mint)
++    request = {'protocol': 1, 'verb': verb, 'params': {
++        'profile_id': 'profile', 'instance_id': 'instance', 'purpose': 'attach'}}
++    from hermes_cli import gateway_runtime_discovery as discovery
++    ours, theirs = socket.socketpair()
++    try:
++        assert asyncio.run(exchange(server, request, ours))['ok'] is True
++        called = mint if verb == 'session-ticket' else private
++        assert called.call_count == 1
++        if verb != 'session-ticket':
++            assert private.call_args.args[1] == f'uid:{os.getuid()}'
++        else:
++            assert mint.call_args.kwargs['subject'] == f'uid:{os.getuid()}'
++        home.chmod(0o777)
++        assert asyncio.run(exchange(server, request, ours))['ok'] is False
++        home.chmod(0o700)
++        monkeypatch.setattr(discovery, 'socket_peer_uid', lambda sock: os.getuid() + 1)
++        assert asyncio.run(exchange(server, request, ours))['ok'] is False
++        assert called.call_count == 1
++    finally:
++        ours.close()
++        theirs.close()
+diff --git a/tests/gateway/test_session_hosted_idle_scope.py b/tests/gateway/test_session_hosted_idle_scope.py
+new file mode 100644
+index 00000000000..f808c683f09
+--- /dev/null
++++ b/tests/gateway/test_session_hosted_idle_scope.py
+@@ -0,0 +1,88 @@
++"""Only fully prepared hosted services bypass owner scope on idle ticks."""
++import asyncio
++from contextlib import contextmanager
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from gateway import session_hosted_service as hosted
++
++
++def test_initialized_service_skips_scope_but_keeps_readiness_and_restart_gates(monkeypatch):
++    service = SimpleNamespace(_transport_installed=True, start=Mock())
++    authority = SimpleNamespace(hosted_room_service=service)
++    runner = SimpleNamespace(session_runtime_descriptor={'state': 'starting'}, _draining=False)
++    monkeypatch.setattr(hosted, 'active_authority', lambda runner: authority)
++    monkeypatch.setattr(hosted, 'serving_authorities', lambda runner: [authority])
++    scope = Mock(side_effect=AssertionError('initialized service entered scope'))
++    monkeypatch.setattr(hosted, 'owner_scope', scope)
++    from gateway import hosted_rooms_gateway_import
++    imports = Mock()
++    monkeypatch.setattr(hosted_rooms_gateway_import, 'import_after_ready', imports)
++
++    async def run():
++        assert await hosted.ensure_hosted_service(runner) is service
++        service.start.assert_not_called()
++        imports.assert_not_called()
++        runner.session_runtime_descriptor['state'] = 'ready'
++        runner._draining = True
++        await hosted.ensure_hosted_service(runner)
++        service.start.assert_not_called()
++        imports.assert_not_called()
++        runner._draining = False
++        await hosted.ensure_hosted_service(runner)
++        service.start.assert_called_once_with()
++        imports.assert_called_once_with([authority])
++        # A previously stopped coordinator still gets its restart opportunity on every tick.
++        await hosted.ensure_hosted_service(runner)
++        assert service.start.call_count == imports.call_count == 2
++    asyncio.run(run())
++    scope.assert_not_called()
++
++
++@pytest.mark.parametrize('existing', [False, True])
++def test_incomplete_preparation_remains_in_owner_scope(tmp_path, monkeypatch, existing):
++    events = []
++    service = SimpleNamespace(_transport_installed=False, attest=object())
++    authority = SimpleNamespace(hosted_room_service=service if existing else None,
++                                db=SimpleNamespace(db_path=tmp_path / 'state.db'), epoch=7)
++    runner = SimpleNamespace(session_control_server=object())
++    in_scope = False
++
++    @contextmanager
++    def scope(owner):
++        nonlocal in_scope
++        assert owner is authority
++        in_scope = True
++        events.append('enter')
++        try:
++            yield
++        finally:
++            in_scope = False
++            events.append('exit')
++
++    def prepare(*args, **kwargs):
++        assert in_scope
++        events.append('import')
++
++    def construct(*args):
++        assert in_scope
++        events.append('construct')
++        return service
++
++    def install(*args, **kwargs):
++        assert in_scope
++        assert args[:2] == (runner.session_control_server, authority)
++        events.append('install')
++
++    from gateway import hosted_rooms_gateway_import, session_hosted_transport
++    monkeypatch.setattr(hosted, 'owner_scope', scope)
++    monkeypatch.setattr(hosted_rooms_gateway_import, 'import_standalone_rooms', prepare)
++    monkeypatch.setattr(hosted, 'CanonicalHostedRoomService', construct)
++    monkeypatch.setattr(session_hosted_transport, 'install_hosted_transport', install)
++    asyncio.run(hosted._ensure_hosted_service(runner, authority))
++    assert events == (['enter', 'install', 'exit'] if existing else
++                      ['enter', 'import', 'construct', 'install', 'exit'])
++    assert authority.hosted_room_service is service
++    assert service._transport_installed is True
+-- 
+2.55.0
+

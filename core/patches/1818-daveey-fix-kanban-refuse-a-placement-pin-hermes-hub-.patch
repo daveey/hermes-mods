@@ -1,0 +1,140 @@
+From 581a9649586658175604fb8b68dc20a4df45a4f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:22:39 -0800
+Subject: [PATCH] [daveey] fix(kanban): refuse a placement pin hermes-hub has
+ no record of as an unknown name, listing the gateways it knows
+
+Problem: kanban_create(placement='hub-ec2') was refused 22 times in 5 sessions (10-28..11-02; 17 of them in one
+MacBook chat on 11-02) with "hub-ec2 not live: hub-ec2's capability record is stale or missing". 'mac-mini'
+was refused the same way. Every caller dropped the pin and let the default route choose.
+
+Why 1: the Desktop's connection names (cross_session gateways hub-ec2 and mac-mini, @task:default@hub-ec2/<id>
+  refs, done notices) are not hermes-hub gateway names (hub, macbook, mini). canonical_pin passes an unknown
+  name through, and target_live() finds no record for it.
+Why 2: no shipped policy mapped those names. kanban.placement.aliases existed but was unset; f88977402b
+  (10-28) added only the built-in hermes-<gw> form for the one spelling seen then. Fixed in daveey/hermes
+  state d1c428bb20, which ships aliases {hub-ec2: hub, mac-mini: mini} to every host.
+Root (not caught): target_live() gives one reason for "this gateway has no record of that name" and "that
+  gateway's record is old": "capability record is stale or missing". _target_not_live_why() then prefixes
+  "not live". That reads as a transient outage, so 22 refusals over 6 days went down as liveness noise, and
+  callers retried without a pin instead of fixing the name.
+
+Fix: when the registry has records but none named the target, target_live() returns "no gateway is named
+'<pin>': hermes-hub knows <sorted names>. Pin one of those, or map this name in kanban.placement.aliases", and
+_target_not_live_why() returns it without "not live". An empty registry, which can't tell a wrong name from an
+unreadable registry, keeps the old reason, and so does a stale record.
+
+Tests (tests/hermes_cli/test_kanban_placement.py):
+- test_target_live_names_the_known_gateways_for_a_name_it_has_no_record_of: the reason names hub, macbook and
+  mini and says nothing about staleness; an empty registry keeps "stale or missing".
+- test_desktop_gateway_name_through_the_tool_is_refused_with_the_names_to_use: _handle_create with
+  placement='hub-ec2' returns placement_unavailable naming hub, no "not live" or "stale", no local card and no
+  hub call.
+- test_desktop_gateway_name_with_a_configured_alias_creates_on_the_hub: tool entry path for the shipped alias.
+RED (origin/main kanban_placement.py): exactly the first two fail (230 passed, 2 failed). GREEN: 358 passed in
+the 7 kanban placement/relay/worker-node files.
+---
+ hermes_cli/kanban_placement.py            | 13 ++++++++-
+ tests/hermes_cli/test_kanban_placement.py | 34 +++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 595a3bd4eca..e95e238e4c1 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -38,7 +38,8 @@ A card stays local when any of these holds:
+   live on the hub and the MacBook" — is not a local-only need. A product name (Baby Bear) in the
+   title pins only when the card names no Linux, or also names Apple/device work;
+ * the target is not live: this gateway's hermes-hub sync has not succeeded recently, or the
+-  target's capability record is stale.
++  target's capability record is stale. A name hermes-hub has no record of at all is refused as
++  unknown, with the gateway names it does know.
+ 
+ Heavy work (tests, builds, benchmarks, installs: :data:`DEFAULT_HEAVY_MARKERS`, replaced by
+ ``kanban.placement.heavy_markers``) with no local-only need goes to a worker node instead of the target
+@@ -148,6 +149,8 @@ DEFAULT_HEAVY_MARKERS = (
+ )
+ # The routed target's own host named in the card: that work belongs on the target, not a worker.
+ TARGET_HOST_MARKERS = (r"\bhermes-hub\b", r"\bon the hub\b", r"\bthe hub's\b")
++# target_live()'s reason for a pin hermes-hub has no gateway record of (a wrong name, not a dead gateway).
++UNKNOWN_GATEWAY = "no gateway is named"
+ # kanban_create options hermes-hub create-task cannot carry: a card using them stays local.
+ UNCARRIED_OPTIONS = ("initial_status", "human_request", "workspace_path", "project", "project_id", "tenant",
+                      "max_retries")  # hermes-hub create-task has no retry breaker option [daveey]
+@@ -428,6 +431,12 @@ def target_live(target: str, *, now: float, live_seconds: int,
+         return "this gateway's hermes-hub sync has not succeeded recently"
+     remote = reg.remote_records() if remote is None else remote
+     rec = remote.get(target)
++    if rec is None and remote:
++        # A name hermes-hub has no record of is a wrong name, not an outage. "stale or missing" read as one, so
++        # callers dropped the pin instead of fixing it: the Desktop calls the hub 'hub-ec2' and the mini
++        # 'mac-mini' (22 refusals, 10-28..11-02). An empty registry can't tell the two apart. [daveey]
++        return (f"{UNKNOWN_GATEWAY} {target!r}: hermes-hub knows {', '.join(sorted(remote))}. Pin one of those, "
++                f"or map this name in kanban.placement.aliases")
+     try:
+         at = float((rec or {}).get("refreshed_at") or 0)
+     except (TypeError, ValueError):
+@@ -729,6 +738,8 @@ def _target_not_live_why(target: str, dead: str) -> str:
+         dead = (f"this gateway has no hermes-hub replica (a Board worker node), so it cannot place cards on other "
+                 f"gateways. Use kanban_block(needs=[...]): a worker node relays the need to the card's home "
+                 f"gateway, which opens the owner card on {target}")
++    if dead.startswith(UNKNOWN_GATEWAY):
++        return dead  # a wrong name, not a dead gateway: "not live" sent callers to drop the pin
+     return f"{target} not live: {dead}"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 04b19025ec8..b2059bc0e78 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -392,6 +392,19 @@ def test_target_live_needs_a_recent_sync_and_a_fresh_target_record():
+     assert "missing" in kp.target_live("hub", now=now, live_seconds=600, meta={"last_ok": now - 30}, remote={})
+ 
+ 
++def test_target_live_names_the_known_gateways_for_a_name_it_has_no_record_of():
++    # The Desktop calls the hub 'hub-ec2' and the mini 'mac-mini'. "stale or missing" read as an outage, so
++    # callers dropped the pin instead of fixing the name (22 refusals, 10-28..11-02). [daveey]
++    now = 1_000_000.0
++    fresh = {"hub": {"refreshed_at": now - 60}, "mini": {"refreshed_at": now - 60}, "macbook": {"refreshed_at": now}}
++    why = kp.target_live("hub-ec2", now=now, live_seconds=600, meta={"last_ok": now - 30}, remote=fresh) or ""
++    assert why.startswith("no gateway is named 'hub-ec2'") and "hub, macbook, mini" in why, why
++    assert "stale" not in why and "kanban.placement.aliases" in why, why
++    # An empty registry can't tell a wrong name from an unreadable registry: the old reason stays.
++    empty = kp.target_live("hub-ec2", now=now, live_seconds=600, meta={"last_ok": now - 30}, remote={}) or ""
++    assert "missing" in empty and not empty.startswith("no gateway"), empty
++
++
+ # --- kanban_create end to end -------------------------------------------------------------------
+ 
+ HUB_SCHEMA = """
+@@ -1305,6 +1318,27 @@ def test_hermes_hub_pin_on_the_hub_itself_creates_locally(mac, monkeypatch):
+     assert _local_count() == 1
+ 
+ 
++def test_desktop_gateway_name_through_the_tool_is_refused_with_the_names_to_use(mac):
++    # cross_session/cross_task and @task refs name the hub 'hub-ec2'. With no alias for it, the refusal must
++    # say which names exist, not "hub-ec2 not live: ... stale or missing". [daveey]
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hub-ec2"}))
++    assert out.get("code") == "placement_unavailable" and out.get("created") is False, out
++    assert "no gateway is named 'hub-ec2': hermes-hub knows hub" in out["error"], out
++    assert "not live" not in out["error"] and "stale" not in out["error"], out
++    assert _local_count() == 0 and not mac["calls"]
++
++
++def test_desktop_gateway_name_with_a_configured_alias_creates_on_the_hub(mac, monkeypatch):
++    # The shipped policy maps the Desktop's names: kanban.placement.aliases {hub-ec2: hub, mac-mini: mini}. [daveey]
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 0, "aliases": {"hub-ec2": "hub"}})
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hub-ec2"}))
++    assert out.get("ok"), out
++    assert out["placed"]["gateway"] == "hub" and mac["calls"], out
++    assert _local_count() == 0
++
++
+ # --- heavy work goes to a worker node (kanban.placement.heavy_route) ------------------------------------
+ 
+ HEAVY = {**ROUTE, "heavy_route": {"macbook": "worker-1"}}
+-- 
+2.55.0
+

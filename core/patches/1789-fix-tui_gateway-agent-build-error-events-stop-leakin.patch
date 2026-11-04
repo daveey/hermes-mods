@@ -1,0 +1,174 @@
+From d5a41fe03912854bb193f61eb1ff321dfd1c2936 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 02:36:25 +0000
+Subject: [PATCH] fix(tui_gateway): agent-build error events stop leaking
+ failure_resets_at past ErrorPayload [daveey]
+
+a0cd0f3219 put the automation replay's clock (failure_resets_at) into
+session['agent_failure'], which is spread into the session-level 'error'
+event, into session_failure_payload's agent_init_failed enrichment and into
+the RPC error data. ErrorPayload/MessageCompletePayload forbid extra keys, so
+every quota-walled build logged a wire-contract ERROR (strict only in tests).
+
+client_failure_fields() maps it to the declared reset_at (which the Desktop
+'Limit resets at' card reads) when unset and drops it on every client path;
+agent_failure keeps it for _replay_failed_wake.
+---
+ tests/tui_gateway/test_credential_failure.py | 49 ++++++++++++++++++++
+ tui_gateway/credential_failure.py            | 14 +++++-
+ tui_gateway/session_registry.py              | 18 +++++--
+ 3 files changed, 75 insertions(+), 6 deletions(-)
+
+diff --git a/tests/tui_gateway/test_credential_failure.py b/tests/tui_gateway/test_credential_failure.py
+index b2dd3d6e3de..4d2a0227611 100644
+--- a/tests/tui_gateway/test_credential_failure.py
++++ b/tests/tui_gateway/test_credential_failure.py
+@@ -162,3 +162,52 @@ def test_session_events_share_metadata(tmp_path, monkeypatch, event):
+     assert result["provider"] == "anthropic"
+     assert result["reset_at"] == 4102444800
+ 
++
++
++def _strict_build(monkeypatch, exc):
++    """Run the deferred build through the REAL ``_emit`` (contract-checked under test isolation)."""
++    import threading
++    from tui_gateway import server
++    from tests.tui_gateway.test_provider_not_configured_code import _fail_build, _run_build
++    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("m", "openai-codex"))
++    monkeypatch.setattr(server, "_load_cfg", dict)
++    frames, crashes = [], []
++    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
++    monkeypatch.setattr(threading, "excepthook", lambda args: crashes.append(args.exc_value))
++    session = _fail_build(monkeypatch, exc)
++    _run_build(session)
++    return session, [f["params"]["payload"] for f in frames if f["params"]["type"] == "error"], crashes
++
++
++def test_quota_walled_build_error_event_honours_its_contract(tmp_path, monkeypatch):
++    """A typed quota failure knows its reset: the replay keeps it, the client reads it as ``reset_at``."""
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from tui_gateway import server
++    from tui_gateway.contracts import registry
++    assert registry.STRICT  # the contract check raises here instead of only logging
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    reset = 1793774268.0
++    session, payloads, crashes = _strict_build(
++        monkeypatch, SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", reset))
++    assert crashes == []
++    assert len(payloads) == 1
++    payload = payloads[0]
++    assert "failure_resets_at" not in payload
++    assert payload["reset_at"] == reset
++    assert session["agent_failure"]["failure_resets_at"] == reset  # what the automation replay reads
++    assert "failure_resets_at" not in (server._wait_agent(session, "r")["error"]["data"] or {})
++
++
++def test_agent_init_failed_error_enrichment_honours_its_contract(tmp_path, monkeypatch):
++    """``session_failure_payload`` folds ``agent_failure`` into later ``agent_init_failed`` events too."""
++    from tui_gateway import server
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    frames = []
++    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
++    monkeypatch.setitem(server._sessions, "quota-test", {"agent_failure": {"failure_resets_at": 1793774268.0}})
++    for event, payload in (("error", {"message": "opaque"}), ("message.complete", {"text": "opaque", "status": "error"})):
++        server._emit(event, "quota-test", {**payload, "error_surface": {
++            "layer": "runtime", "code": "agent_init_failed", "retryable": False}})
++        result = frames[-1]["params"]["payload"]
++        assert "failure_resets_at" not in result
++        assert result["reset_at"] == 1793774268.0
+diff --git a/tui_gateway/credential_failure.py b/tui_gateway/credential_failure.py
+index a231e3fe1f5..b06e8a63852 100644
+--- a/tui_gateway/credential_failure.py
++++ b/tui_gateway/credential_failure.py
+@@ -32,6 +32,18 @@ def credential_failure_fields(provider: str, *, pool=None) -> dict:
+     return {**fields, "failure_kind": "exhausted", "reset_at": min(resets) if resets else None}
+ 
+ 
++def client_failure_fields(failure) -> dict:
++    """[daveey] ``agent_failure`` as a client may see it. ``failure_resets_at`` is the automation replay's own
++    clock (``session_notifications._replay_failed_wake``): the wire contracts declare ``reset_at`` instead, so it
++    fills ``reset_at`` when that is unset and never travels under its own name."""
++    if not isinstance(failure, dict):
++        return failure
++    fields = {k: v for k, v in failure.items() if k != "failure_resets_at"}
++    if fields.get("reset_at") is None and failure.get("failure_resets_at") is not None:
++        fields["reset_at"] = failure["failure_resets_at"]
++    return fields
++
++
+ def exception_failure_fields(error, provider: str = "", *, pool=None) -> dict:
+     """Only credential failures get setup metadata; unrelated session failures stay unrelated."""
+     from agent.auxiliary_unavailable import ProviderCredentialsExhaustedError, ProviderNotConfiguredError
+@@ -80,7 +92,7 @@ def session_failure_payload(event: str, payload: dict, session: dict) -> dict:
+     surface = payload.get("error_surface") or {}
+     code = surface.get("code")
+     if code == "agent_init_failed" and session.get("agent_failure"):
+-        return {**payload, **session["agent_failure"]}
++        return {**payload, **client_failure_fields(session["agent_failure"])}
+     if surface.get("layer") != "auth" and code not in {"rate_limit", "billing", "quota_exceeded"}:
+         return payload
+     from tui_gateway.server import _session_profile_runtime_scope
+diff --git a/tui_gateway/session_registry.py b/tui_gateway/session_registry.py
+index 845f59fcfb1..9eb1edcbdf8 100644
+--- a/tui_gateway/session_registry.py
++++ b/tui_gateway/session_registry.py
+@@ -6,11 +6,18 @@ import re
+ 
+ from .method_ctx import bind_module
+ 
++
++def _client_failure(session: dict):
++    """The RPC error ``data`` a client sees: ``agent_failure`` minus the replay-only ``failure_resets_at``."""
++    from tui_gateway.credential_failure import client_failure_fields
++    return client_failure_fields(session.get("agent_failure"))
++
++
+ def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
+     ready = session.get("agent_ready")
+     if ready is not None and not ready.wait(timeout=timeout):
+         return _err(rid, 5032, AGENT_STILL_STARTING)
+-    return _err(rid, 5032, err, data=session.get("agent_failure")) if (err := session.get("agent_error")) else None
++    return _err(rid, 5032, err, data=_client_failure(session)) if (err := session.get("agent_error")) else None
+ 
+ 
+ # The deferred prompt path waits in short slices so a cancel is honored promptly and a slow
+@@ -69,7 +76,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
+         if build_thread is not None and not build_thread.is_alive() and not ready.is_set():
+             # _build's finally guarantees ready.set(); dead thread + unset ready = died hard.
+             return _err(rid, 5032, session.get("agent_error") or "agent initialization failed before completing",
+-                        data=session.get("agent_failure"))
++                        data=_client_failure(session))
+         if not notified_slow and waited >= _AGENT_BUILD_SLOW_NOTICE_AFTER:
+             notified_slow = True  # one keyed, replace-in-place notice (toast / status bar)
+             _emit("notification.show", sid, {
+@@ -78,7 +85,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
+                 "key": _AGENT_BUILD_SLOW_NOTICE_KEY, "id": _AGENT_BUILD_SLOW_NOTICE_KEY})
+     if notified_slow:
+         _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
+-    return _err(rid, 5032, err, data=session.get("agent_failure")) if (err := session.get("agent_error")) else None
++    return _err(rid, 5032, err, data=_client_failure(session)) if (err := session.get("agent_error")) else None
+ 
+ 
+ def _bind_build_profile_scopes(profile_home: str | None) -> _TurnScopes | None:
+@@ -291,7 +298,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             notify_registered = _wire_session_agent(sid, key, agent)
+             _announce_built_agent(sid, key, current, agent)
+         except (Exception, ConfigBackendUnavailable) as e:  # health: allow BLE001 -- reported as agent_error + error event
+-            from tui_gateway.credential_failure import build_failure_fields, provider_not_configured
++            from tui_gateway.credential_failure import (
++                build_failure_fields, client_failure_fields, provider_not_configured)
+             current["agent_failure"] = build_failure_fields(e, current)
+             # [daveey] A typed quota/route exhaustion knows when it clears: an automation replay waits for it.
+             resets_at = getattr(e, "resets_at", None)
+@@ -307,7 +315,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             # error toast — but only if it can tell. The sentence is for the reader, the code is
+             # for the client; older clients keep matching the text.
+             _emit("error", sid, {
+-                "message": agent_init_failed_message(e), **current["agent_failure"],
++                "message": agent_init_failed_message(e), **client_failure_fields(current["agent_failure"]),
+                 **({"code": "provider_not_configured"} if provider_not_configured(e)
+                    and current["agent_failure"].get("failure_kind") != "exhausted" else {})})
+         finally:
+-- 
+2.55.0
+

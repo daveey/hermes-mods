@@ -1,0 +1,464 @@
+From 8c0f63fe9b2d0acfd97e00fc76942a668de58790 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 08:43:05 -0800
+Subject: [PATCH] fix(process): a spawn-ledger row written past a stalled lock
+ holder is never lost [daveey]
+
+CI (daveey/hermes run 41470490138, job 125362788105) lost 3 of 45 rows (retry: 6) in
+test_concurrent_processes_never_drop_each_others_ledger_rows, logging "spawn ledger lock unavailable".
+
+Five whys:
+1. Rows were lost: a writer's atomic replace dropped rows another writer had landed.
+2. Two writers did read-modify-write at once: one wrote past the cross-process lock (the WARNING in the log).
+3. It gave up on the lock after a flat 2 s (53a271506e), which a live writer on a loaded runner
+   (descheduled mid-write, or a queue of writers ahead) outlasts.
+4. Past the timeout the write went ahead on the ledger itself (3df6a4d5c4 only logged it), so the
+   holder's later replace, built from its read before the stall, dropped the row.
+Root: the stalled-holder escape hatch traded spawn latency for data loss, and a 2 s wall clock
+cannot tell a stalled holder from a slow one.
+Not caught: no test stalled a holder between its read and its replace while another process wrote.
+
+Fix:
+- The lock wait counts a holder as stalled only once the ledger has sat unchanged for 2 s (a queue of
+  live writers keeps replacing it), capped at 30 s overall.
+- Past a stalled holder the row goes to spawn-ledger.json.pending/ (one atomic file each), never the
+  ledger. Every locked write folds queued rows in and then deletes them; ledger_entries merges them
+  meanwhile; a daemon thread folds them once the holder lets go so file-only readers (Desktop, the
+  scratch reaper) catch up. Only a filesystem without file locks still writes unlocked (WARNING).
+- data_cleanup protects the pending dir like the ledger and its lock.
+
+Tests (RED on 252f9d51b6, GREEN here): a holder stalled between read and replace no longer drops a
+row written past it; a waiter keeps waiting behind writers that keep landing; the stalled-holder test
+asserts the row is queued, readable, then folded. The concurrent test also reads ledger_entries and
+waits for the file to catch up. Hub stress (8 concurrent runs, a controller SIGSTOPping the current
+lock holder for 3 s): baseline 5-8 of 16 fail with the CI symptom; fixed 50/50 pass, 21 runs through
+the queue path.
+---
+ hermes_cli/data_cleanup.py                |   3 +-
+ hermes_cli/process_identity.py            | 183 +++++++++++++++++++---
+ tests/hermes_cli/test_process_identity.py | 121 +++++++++++++-
+ 3 files changed, 279 insertions(+), 28 deletions(-)
+
+diff --git a/hermes_cli/data_cleanup.py b/hermes_cli/data_cleanup.py
+index 7a690d37ae4..c1cd539e881 100644
+--- a/hermes_cli/data_cleanup.py
++++ b/hermes_cli/data_cleanup.py
+@@ -28,7 +28,8 @@ def plan_data_removal(home: Path, project: Path, userdata: Path | None = None) -
+     protected = {
+         project.resolve(), base_venv(project).resolve(), store_root(project).resolve(),
+         installs_root().resolve(), machine / "tools", machine / "bin", machine / "cache",
+-        machine / "spawn-ledger.json", machine / "spawn-ledger.json.lock", home / "gateway.lock", home / ".backup.lock",
++        machine / "spawn-ledger.json", machine / "spawn-ledger.json.lock", machine / "spawn-ledger.json.pending",
++        home / "gateway.lock", home / ".backup.lock",
+         home / "runtime" / "active_sessions.lock", home / "cron" / ".tick.lock",
+         store_lock_path(home / "checkpoints"),
+     }
+diff --git a/hermes_cli/process_identity.py b/hermes_cli/process_identity.py
+index 2df91e688f0..cc0dbdd6532 100644
+--- a/hermes_cli/process_identity.py
++++ b/hermes_cli/process_identity.py
+@@ -12,6 +12,7 @@ Hermes process that reaps the owned children's process groups the moment Hermes
+ 
+ from __future__ import annotations
+ 
++import errno
+ import functools
+ import hashlib
+ import json
+@@ -461,54 +462,196 @@ def _new_entry(
+ 
+ 
+ # A ledger writer stopped mid-write (SIGSTOP, a debugger) must not stall every spawn_owned on the
+-# machine: past this the write goes ahead under the thread lock alone, as when no lock can be taken.
++# machine. A waiter counts the holder as stalled once the ledger has sat unchanged this long: a queue of
++# live writers replaces the file with every write, so it never reads as stalled however long it is (a flat
++# 2 s wait gave up behind queued writers on a loaded CI runner and then dropped their rows).
+ _LEDGER_LOCK_TIMEOUT_S = 2.0
++# Upper bound on the whole wait, even while other writers keep making progress (an unfair poll can lose
++# every round to them).
++_LEDGER_LOCK_MAX_WAIT_S = 30.0
++_LEDGER_LOCK_POLL_S = 0.02
+ _ledger_lock_warned = False
++# Rows written while the lock is held by a stalled holder wait here (one file each), never in the ledger
++# itself: writing the ledger past a holder lets its later replace drop them. The next locked write folds
++# them in; readers merge them meanwhile.
++_PENDING_SUFFIX = ".pending"
++_pending_folders: dict[Path, threading.Thread] = {}
++_PENDING_FOLD_INTERVAL_S = 1.0
+ 
+ 
+-def _append_entry(entry: LedgerEntry) -> bool:
+-    """Prune dead entries and append ``entry`` — the ONLY ledger write path.
++def _ledger_progress_key(path: Path) -> Optional[tuple]:
++    """Changes whenever a writer lands a ledger write (atomic replace: a new inode and mtime)."""
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    return (st.st_ino, st.st_mtime_ns, st.st_size)
+ 
+-    Serialized under ``_LEDGER_LOCK`` and, across processes, an exclusive lock on a sidecar file
+-    (every ``spawn_owned`` writes here, so concurrent Hermes processes otherwise dropped each
+-    other's rows), with an atomic tmp+replace; no writer touches the file outside this function.
+ 
+-    See #91660.
+-    """
+-    from hermes_cli.active_sessions import _FileLock
++@contextmanager
++def _ledger_file_lock(path: Path) -> Iterator[None]:
++    """Hold the ledger's cross-process lock. Waits as long as the ledger keeps changing (live writers
++    ahead of us); raises BlockingIOError once it has sat unchanged for ``_LEDGER_LOCK_TIMEOUT_S`` (a
++    stalled holder) or after ``_LEDGER_LOCK_MAX_WAIT_S`` overall. A filesystem without file locks raises
++    another OSError at once."""
++    from pm.filesystem import lock_fd, unlock_fd
++
++    lock_path = path.with_name(path.name + ".lock")
++    lock_path.parent.mkdir(parents=True, exist_ok=True)
++    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
++    try:
++        start = last_progress = time.monotonic()
++        seen = _ledger_progress_key(path)
++        while not lock_fd(fd, wait=False):
++            now = time.monotonic()
++            key = _ledger_progress_key(path)
++            if key != seen:
++                seen, last_progress = key, now
++            if now - last_progress >= _LEDGER_LOCK_TIMEOUT_S or now - start >= _LEDGER_LOCK_MAX_WAIT_S:
++                raise BlockingIOError(errno.EWOULDBLOCK, f"spawn ledger lock still held after {now - start:.1f}s")
++            time.sleep(_LEDGER_LOCK_POLL_S)
++        try:
++            yield
++        finally:
++            unlock_fd(fd)
++    finally:
++        os.close(fd)
+ 
+-    path = _ledger_path()
++
++def _pending_dir(path: Path) -> Path:
++    return path.with_name(path.name + _PENDING_SUFFIX)
++
++
++def _read_pending(path: Path) -> list[tuple[Path, dict]]:
++    """Rows queued past a stalled lock holder, oldest first; an unreadable file is skipped (and
++    removed by the next fold, which holds the lock)."""
++    try:
++        files = sorted(_pending_dir(path).glob("*.json"))
++    except OSError:
++        return []
++    rows = []
++    for f in files:
++        try:
++            row = json.loads(f.read_text(encoding="utf-8-sig"))
++        except (OSError, ValueError, UnicodeError):
++            row = None
++        rows.append((f, row if isinstance(row, dict) and isinstance(row.get("pid"), int) else None))
++    return rows
++
++
++def _merge_rows(base: list[dict], newer: list[dict]) -> list[dict]:
++    """``base`` with each ``newer`` row replacing any row of the same pid, in order."""
++    out = list(base)
++    for row in newer:
++        out = [e for e in out if e.get("pid") != row["pid"]]
++        out.append(row)
++    return out
++
++
++def _queue_pending(path: Path, entry: LedgerEntry) -> bool:
++    try:
++        from hermes_constants import mkdir_under_hermes_home
++        pending = mkdir_under_hermes_home(_pending_dir(path))
++        # time_ns first so a sorted listing is oldest first; pid keeps names unique across processes.
++        atomic_json_write(pending / f"{time.time_ns():020d}-{os.getpid()}-{entry.pid}.json", asdict(entry),
++                          mode=0o600, ensure_ascii=True)
++    except OSError:
++        logger.debug("spawn ledger pending write failed", exc_info=True)
++        return False
++    _start_pending_folder(path)
++    return True
++
++
++def _start_pending_folder(path: Path) -> None:
++    """Fold queued rows into the ledger once the stalled holder lets go, so readers that only read the
++    ledger file (Desktop, the scratch reaper) see them without waiting for another write."""
++    running = _pending_folders.get(path)
++    if running is not None and running.is_alive():
++        return
++
++    def run() -> None:
++        while True:
++            time.sleep(_PENDING_FOLD_INTERVAL_S)
++            if not _read_pending(path):
++                return
++            if _write_ledger(path, None) is not None:
++                return
++
++    from agent.memory_provider import spawn_context_thread
++
++    thread = spawn_context_thread(run, name="spawn-ledger-fold", daemon=True)
++    try:
++        thread.start()
++    except RuntimeError:  # interpreter shutting down: the next locked write anywhere folds the rows
++        return
++    _pending_folders[path] = thread
++
++
++def _write_ledger(path: Path, entry: Optional[LedgerEntry]) -> Optional[bool]:
++    """Under both locks: fold queued rows, prune dead entries, append ``entry``. ``None`` when the
++    cross-process lock is held by a stalled holder (nothing written)."""
+     with _LEDGER_LOCK, ExitStack() as held:
+         try:
+-            held.enter_context(_FileLock(path.with_name(path.name + ".lock"), timeout=_LEDGER_LOCK_TIMEOUT_S))
+-        except (RuntimeError, OSError):
+-            # Best-effort like the write itself: the thread lock is then the only guard, so a row another
++            held.enter_context(_ledger_file_lock(path))
++        except BlockingIOError:
++            return None
++        except OSError:
++            # No file locks on this filesystem: the thread lock is then the only guard, so a row another
+             # Hermes process writes meanwhile can be lost. Say so once where it shows (agent.log).
+             global _ledger_lock_warned
+             if not _ledger_lock_warned:
+                 _ledger_lock_warned = True
+-                logger.warning("spawn ledger lock unavailable (a stalled holder, or no file locks here); writing "
+-                               "without it, so concurrent Hermes processes may drop each other's rows")
++                logger.warning("spawn ledger lock unavailable (no file locks here); writing without it, so "
++                               "concurrent Hermes processes may drop each other's rows")
+             logger.debug("spawn ledger lock unavailable", exc_info=True)
+         entries = _read_ledger_or_quarantine(path) or []
++        pending = _read_pending(path)
++        entries = _merge_rows(entries, [row for _, row in pending if row is not None])
+         # Drop malformed entries, our own stale entry, and provably dead pids.
+         pruned = [
+             e for e in entries
+             if isinstance(e.get("pid"), int)
+-            and e["pid"] != entry.pid
++            and (entry is None or e["pid"] != entry.pid)
+             and entry_still_running(e)
+         ]
+-        pruned.append(asdict(entry))
++        if entry is not None:
++            pruned.append(asdict(entry))
+         try:
+             from hermes_constants import mkdir_under_hermes_home
+             mkdir_under_hermes_home(path.parent)
+             # argv may carry surrogate-escaped bytes (non-UTF-8 paths); ensure_ascii keeps the
+             # utf-8 text handle from raising UnicodeEncodeError (a ValueError, not an OSError).
+             atomic_json_write(path, pruned, mode=0o600, ensure_ascii=True)
+-            return True
+         except OSError:
+             logger.debug("spawn ledger write failed", exc_info=True)
+             return False
++        for f, _ in pending:  # only once their rows are in the ledger
++            with suppress(OSError):
++                f.unlink()
++        return True
++
++
++def _append_entry(entry: LedgerEntry) -> bool:
++    """Prune dead entries and append ``entry`` — the ONLY ledger write path.
++
++    Serialized under ``_LEDGER_LOCK`` and, across processes, an exclusive lock on a sidecar file
++    (every ``spawn_owned`` writes here, so concurrent Hermes processes otherwise dropped each
++    other's rows), with an atomic tmp+replace; no writer touches the file outside this function.
++    Past a stalled lock holder the row is queued in the pending dir instead (see ``_PENDING_SUFFIX``).
++
++    See #91660.
++    """
++    path = _ledger_path()
++    written = _write_ledger(path, entry)
++    if written is not None:
++        return written
++    global _ledger_lock_warned
++    if not _ledger_lock_warned:
++        _ledger_lock_warned = True
++        logger.warning("spawn ledger lock held by a stalled writer; rows are queued in %s until it lets go",
++                       _pending_dir(path))
++    logger.debug("spawn ledger lock stalled", exc_info=True)
++    return _queue_pending(path, entry)
+ 
+ 
+ def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = None) -> bool:
+@@ -551,10 +694,12 @@ def ledger_entries(
+     it block the caller either.
+     """
+     want_install = install_id(project_root)
++    path = _ledger_path()
+     with _LEDGER_LOCK:
+-        entries = _read_ledger_or_quarantine(_ledger_path())
++        entries = _read_ledger_or_quarantine(path)
+     if entries is None:
+         return []
++    entries = _merge_rows(entries, [row for _, row in _read_pending(path) if row is not None])
+     return [
+         e for e in entries
+         if (all_installs or e.get("install") == want_install)
+diff --git a/tests/hermes_cli/test_process_identity.py b/tests/hermes_cli/test_process_identity.py
+index ac30d3728d3..1c853640fd7 100644
+--- a/tests/hermes_cli/test_process_identity.py
++++ b/tests/hermes_cli/test_process_identity.py
+@@ -468,14 +468,17 @@ for kid in kids:
+ """
+ 
+ 
+-def test_concurrent_processes_never_drop_each_others_ledger_rows(tmp_path):
++def test_concurrent_processes_never_drop_each_others_ledger_rows(tmp_path, monkeypatch):
+     """Every spawn_owned writes the machine-wide ledger; three processes registering at once lost
+-    about two thirds of their rows to each other's read-modify-write before the cross-process lock."""
++    about two thirds of their rows to each other's read-modify-write before the cross-process lock.
++    A writer descheduled while holding the lock (a loaded runner) used to make the others write past
++    it and lose rows too; those rows are now queued beside the ledger and folded in when it lets go."""
+     import json
+     import time
+     from pathlib import Path
+ 
+     repo = str(Path(__file__).resolve().parents[2])
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+     env = {**os.environ, "HERMES_HOME": str(tmp_path / "home")}
+     start_at = time.time() + 2.0
+     writers = [subprocess.Popen([sys.executable, "-c", _CONCURRENT_WRITER, repo, str(start_at), "15"],
+@@ -484,9 +487,16 @@ def test_concurrent_processes_never_drop_each_others_ledger_rows(tmp_path):
+     try:
+         pids = {int(p) for w in writers for p in w.stdout.readline().split()}
+         assert len(pids) == 45
+-        rows = json.loads((tmp_path / "home" / "spawn-ledger.json").read_text(encoding="utf-8"))
+-        kept = {r["pid"] for r in rows if r.get("purpose") == "ledger-race"}
+-        assert kept == pids, f"{len(pids - kept)} of 45 rows lost to a concurrent writer"
++        readable = {e["pid"] for e in pi.ledger_entries(all_installs=True) if e.get("purpose") == "ledger-race"}
++        assert readable == pids, f"{len(pids - readable)} of 45 rows lost to a concurrent writer"
++        deadline = time.monotonic() + 30  # a row queued past a descheduled holder lands once it lets go
++        while True:
++            rows = json.loads((tmp_path / "home" / "spawn-ledger.json").read_text(encoding="utf-8"))
++            kept = {r["pid"] for r in rows if r.get("purpose") == "ledger-race"}
++            if kept == pids or time.monotonic() > deadline:
++                break
++            time.sleep(0.1)
++        assert kept == pids, f"{len(pids - kept)} of 45 rows never reached the ledger file"
+     finally:
+         for w in writers:
+             w.stdin.close()
+@@ -496,14 +506,15 @@ def test_concurrent_processes_never_drop_each_others_ledger_rows(tmp_path):
+ @pytest.mark.platforms("posix")  # an fcntl lock holder
+ def test_a_stalled_ledger_lock_holder_never_blocks_register_child(tmp_path, monkeypatch, caplog):
+     """A holder stopped mid-write (SIGSTOP, a debugger) kept the lock: every spawn_owned on the
+-    machine then waited forever. Past the timeout the row is written under the thread lock alone, and
+-    that is logged once at WARNING (rows of concurrent writers can be lost meanwhile)."""
++    machine then waited forever. Past the timeout the row is queued beside the ledger (logged once at
++    WARNING), readers see it at once, and it lands in the ledger once the holder lets go."""
+     import fcntl
+     import logging
+     import threading
+ 
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+     monkeypatch.setattr(pi, "_LEDGER_LOCK_TIMEOUT_S", 0.3)
++    monkeypatch.setattr(pi, "_PENDING_FOLD_INTERVAL_S", 0.1, raising=False)
+     monkeypatch.setattr(pi, "_ledger_lock_warned", False)
+     caplog.set_level(logging.DEBUG, logger=pi.logger.name)
+     ledger = pi._ledger_path()
+@@ -517,7 +528,101 @@ def test_a_stalled_ledger_lock_holder_never_blocks_register_child(tmp_path, monk
+         writer.join(timeout=10)
+         assert done == [True], "register_child waited on a stalled lock holder"
+         assert pi.register_child(os.getpid(), "stalled-again") is True  # a second write past the lock
++        seen = [e["purpose"] for e in pi.ledger_entries(all_installs=True)]
++        assert seen == ["stalled-again"], f"a row queued past the stalled holder is not readable: {seen}"
++        assert not ledger.exists(), "a write past the lock replaced the ledger under its holder"
+     warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "spawn ledger lock" in r.getMessage()]
+     assert len(warnings) == 1, f"{len(warnings)} warnings for two writes past a stalled lock"
++    deadline = time.monotonic() + 10
++    while not ledger.exists() and time.monotonic() < deadline:
++        time.sleep(0.05)
++    rows = json.loads(ledger.read_text(encoding="utf-8"))
++    assert [r.get("purpose") for r in rows] == ["stalled-again"], "the queued row was not folded into the ledger"
++    assert not list(pi._pending_dir(ledger).glob("*.json")), "a folded row was left queued"
++
++
++_STALLED_HOLDER = r"""
++import os, sys, time
++from pathlib import Path
++sys.path.insert(0, sys.argv[1])
++import hermes_cli.process_identity as pi
++go = Path(sys.argv[2])
++real_write = pi.atomic_json_write
++def stalled_write(*a, **kw):  # stopped after its read, before its replace (SIGSTOP, a debugger)
++    Path(str(go) + ".read").touch()
++    while not go.exists():
++        time.sleep(0.01)
++    return real_write(*a, **kw)
++pi.atomic_json_write = stalled_write
++print(pi.register_child(os.getpid(), "stalled-holder"), flush=True)
++"""
++
++
++@pytest.mark.platforms("posix")  # an fcntl lock holder in another process
++def test_a_row_written_past_a_stalled_holder_survives_its_late_write(tmp_path, monkeypatch):
++    """A writer that gave up on a stalled holder wrote the ledger itself; when the holder resumed, its
++    replace (built from its read before the stall) dropped that row (2 rows lost in #667's CI run)."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    monkeypatch.setattr(pi, "_LEDGER_LOCK_TIMEOUT_S", 0.3)
++    monkeypatch.setattr(pi, "_PENDING_FOLD_INTERVAL_S", 0.1, raising=False)
++    monkeypatch.setattr(pi, "_ledger_lock_warned", False)
++    repo = str(Path(__file__).resolve().parents[2])
++    go = tmp_path / "go"
++    holder = subprocess.Popen([sys.executable, "-c", _STALLED_HOLDER, repo, str(go)], stdout=subprocess.PIPE,
++                              text=True, env={**os.environ, "HERMES_HOME": str(tmp_path / "home")})
++    try:
++        deadline = time.monotonic() + 60
++        while not Path(str(go) + ".read").exists():
++            assert holder.poll() is None and time.monotonic() < deadline, "the holder never reached its write"
++            time.sleep(0.01)
++        assert pi.register_child(os.getpid(), "past-the-holder") is True
++        go.touch()
++        assert holder.stdout.readline().strip() == "True"
++        assert holder.wait(timeout=30) == 0
++        purposes = {e["purpose"] for e in pi.ledger_entries(all_installs=True)}
++        assert "past-the-holder" in purposes, "the stalled holder's late write dropped a row written past it"
++        assert pi.register_child(os.getpid(), "past-the-holder") is True  # the lock is free: folds the queue
++        rows = json.loads(pi._ledger_path().read_text(encoding="utf-8"))
++        assert [r["purpose"] for r in rows if r["pid"] == os.getpid()] == ["past-the-holder"]
++    finally:
++        go.touch()
++        if holder.poll() is None:
++            holder.kill()
++        holder.wait(timeout=30)
++
++
++@pytest.mark.platforms("posix")  # an fcntl lock holder
++def test_register_child_waits_behind_writers_that_keep_landing(tmp_path, monkeypatch, caplog):
++    """The lock wait gave up after a flat 2 s even while the writers ahead kept landing rows; on a
++    loaded host a queue of live writers outlasted it, so rows were written past the lock and lost."""
++    import fcntl
++    import logging
++    import threading
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    monkeypatch.setattr(pi, "_LEDGER_LOCK_TIMEOUT_S", 0.3)
++    monkeypatch.setattr(pi, "_ledger_lock_warned", False)
++    caplog.set_level(logging.DEBUG, logger=pi.logger.name)
++    ledger = pi._ledger_path()
++    ledger.parent.mkdir(parents=True, exist_ok=True)
++    released = threading.Event()
++
++    def busy_writers() -> None:  # 1.5 s of writers ahead, each landing within the stall window
++        with open(ledger.with_name(ledger.name + ".lock"), "a+b") as lock:
++            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
++            started.set()
++            for i in range(15):
++                pi.atomic_json_write(ledger, [{"pid": 1, "purpose": f"ahead-{i}"}])
++                time.sleep(0.1)  # health: allow HX013 -- the pacing IS the behaviour: live writers holding the lock past the old flat timeout
++            released.set()
++
++    started = threading.Event()
++    ahead = threading.Thread(target=busy_writers, daemon=True)
++    ahead.start()
++    assert started.wait(10)
++    assert pi.register_child(os.getpid(), "behind-the-queue") is True
++    ahead.join(10)
++    assert released.is_set(), "register_child wrote before the writers ahead of it let go of the lock"
++    assert not [r for r in caplog.records if "spawn ledger lock" in r.getMessage()], "gave up on live writers"
+     rows = json.loads(ledger.read_text(encoding="utf-8"))
+-    assert any(r.get("purpose") == "stalled-again" for r in rows), "the row was not written past the timeout"
++    assert [r["purpose"] for r in rows if r["pid"] == os.getpid()] == ["behind-the-queue"]
+-- 
+2.55.0
+

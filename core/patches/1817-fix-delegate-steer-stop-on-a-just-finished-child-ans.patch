@@ -1,0 +1,372 @@
+From d1a82931010ba978b997fe8c282a9d4164a251e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 04:57:39 +0000
+Subject: [PATCH] fix(delegate): steer/stop on a just-finished child answers
+ already_finished, not an error [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: delegate_task(action='steer') returned "No live subagent 'sa-N-…' in this
+conversation's spawn tree" in 3 sessions (20261031_064851_d0f106, 20261031_222913_405ade x2,
+20261101_012339_5a8ef0); the coach filed it as a Hermes failure (t_01a19fbe9374afb7).
+
+Why 1: the steered child was no longer in _active_subagents. Evidence (state.db): every target had
+  already finished; its batch completion arrived 21-212 s AFTER the failed steer (e.g. sa-1-21d68db5:
+  steer 1793497421, deleg_823bce9e complete 1793497442; sa-0-a8d7d609: 266.66 s run, steer 2 s after).
+Why 2: a child leaves the live registry the moment _run_single_child returns, but its result is held
+  until every sibling of its batch finishes and is delivered only between parent turns, so the parent
+  still believes it is working. action='list' just drops it (sa-1-63c2ae7a vanished from a 2-entry list).
+Why 3: _handle_control_action treated "finished" the same as "unknown or foreign id" and returned a
+  tool_error with a "may have" guess, although _recent_subagents already kept a stub of the finished
+  child (delegation id, owner session).
+Root (happened): the control plane had no state for "finished, result not yet delivered"; a benign,
+  unobservable race surfaced as an error with no definite answer.
+Root (not caught): tests covered live, foreign and closed-acceptance records only; none steered a
+  child after the real child runner returned.
+
+Fix: the finished-child stub keeps finish time and weak refs to the spawn ancestors; an owned finished
+child (identity or durable-session lineage) answers steer/stop with status=already_finished,
+steer_delivered=false, its delegation id and still-running siblings; a closed-acceptance (finishing)
+child answers status=finishing the same way; list adds finished_awaiting_batch for finished children
+whose batch is still held. Unknown and foreign ids stay errors.
+Tests: tests/tools/test_delegate_finished_child_control.py (6 fail before, all pass after), incl. an
+end-to-end run through _run_single_child + delegate_task.
+---
+ .../test_delegate_finished_child_control.py   | 178 ++++++++++++++++++
+ tools/delegate_tool_registry.py               |  92 ++++++++-
+ 2 files changed, 269 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tools/test_delegate_finished_child_control.py
+
+diff --git a/tests/tools/test_delegate_finished_child_control.py b/tests/tools/test_delegate_finished_child_control.py
+new file mode 100644
+index 00000000000..3d7dc6e5bda
+--- /dev/null
++++ b/tests/tools/test_delegate_finished_child_control.py
+@@ -0,0 +1,178 @@
++"""delegate_task steer/stop/list on a child that already FINISHED.
++
++A child leaves the live registry the moment ``_run_single_child`` returns, but its result reaches the parent later:
++between parent turns, and only once every sibling of its batch has finished. In that window the parent still believes
++the child is working and steers it. That used to return a tool error ("No live subagent 'sa-1-…' in this
++conversation's spawn tree"), the coach counted it as a Hermes failure in several sessions, and the model got no
++definite answer (finished? foreign? typo?). Now an owned, recently finished child yields a non-error
++``status: already_finished`` with ``steer_delivered: false``, the batch it belongs to and the still-running
++siblings; ``list`` names finished children whose batch result is still held. Unknown and foreign ids stay errors.
++"""
++
++import json
++import weakref
++from unittest.mock import MagicMock
++
++from tools.delegate_tool import (
++    _handle_control_action,
++    _register_subagent,
++    _unregister_subagent,
++    delegate_task,
++)
++
++
++class _Parent:
++    def __init__(self, session_id: str = ""):
++        self.session_id = session_id
++        self._session_db = None
++
++
++class _Child:
++    def __init__(self, parent=None, accept_steer: bool = True):
++        self.steered: list[str] = []
++        self.accept_steer = accept_steer
++        if parent is not None:
++            self._delegate_parent_ref = weakref.ref(parent)
++
++    def steer(self, text: str) -> bool:
++        if not self.accept_steer:
++            return False
++        self.steered.append(text)
++        return True
++
++
++def _register(sid: str, child, **extra) -> None:
++    record = {"subagent_id": sid, "parent_id": None, "depth": 0, "goal": f"goal {sid}", "model": "m",
++              "started_at": 1000.0, "status": "running", "tool_count": 0, "agent": child}
++    record.update(extra)
++    _register_subagent(record)
++
++
++def test_steer_finished_owned_child_is_not_an_error():
++    parent = _Parent()
++    child = _Child(parent)
++    _register("sa-0-fin00001", child, delegation_id="deleg_fin_1")
++    _unregister_subagent("sa-0-fin00001", agent=child)
++
++    raw = _handle_control_action("steer", "sa-0-fin00001", "late correction", parent)
++    out = json.loads(raw)
++    assert "error" not in out, raw
++    assert out["status"] == "already_finished"
++    assert out["steer_delivered"] is False
++    assert out["delegation_id"] == "deleg_fin_1"
++    assert out["pending_siblings"] == []
++    assert "deleg_fin_1" in out["note"]
++    assert child.steered == []
++
++
++def test_stop_finished_owned_child_is_not_an_error():
++    parent = _Parent()
++    child = _Child(parent)
++    _register("sa-0-fin00002", child, delegation_id="deleg_fin_2")
++    _unregister_subagent("sa-0-fin00002", agent=child)
++
++    out = json.loads(_handle_control_action("stop", "sa-0-fin00002", None, parent))
++    assert out["status"] == "already_finished"
++    assert "steer_delivered" not in out
++    assert "Nothing to stop" in out["note"]
++
++
++def test_finished_child_names_running_batch_siblings_and_list_shows_it():
++    parent = _Parent()
++    done, running = _Child(parent), _Child(parent)
++    _register("sa-0-fin00003", done, delegation_id="deleg_fin_3")
++    _register("sa-1-fin00003", running, delegation_id="deleg_fin_3")
++    _unregister_subagent("sa-0-fin00003", agent=done)
++    try:
++        out = json.loads(_handle_control_action("steer", "sa-0-fin00003", "x", parent))
++        assert out["status"] == "already_finished"
++        assert out["pending_siblings"] == ["sa-1-fin00003"]
++        assert "still-running sibling" in out["note"]
++
++        listed = json.loads(_handle_control_action("list", None, None, parent))
++        assert [e["subagent_id"] for e in listed["subagents"]] == ["sa-1-fin00003"]
++        held = listed["finished_awaiting_batch"]
++        assert [e["subagent_id"] for e in held] == ["sa-0-fin00003"]
++        assert held[0]["delegation_id"] == "deleg_fin_3"
++    finally:
++        _unregister_subagent("sa-1-fin00003", agent=running)
++
++    # Once the whole batch is done, nothing is held any more.
++    listed = json.loads(_handle_control_action("list", None, None, parent))
++    assert "finished_awaiting_batch" not in listed
++
++
++def test_finished_child_resolves_through_durable_session_after_parent_rebuild():
++    old_parent = _Parent("sess-fin-rebuild")
++    child = _Child(old_parent)
++    _register("sa-0-fin00004", child, delegation_id="deleg_fin_4", owner_agent_session_id="sess-fin-rebuild")
++    _unregister_subagent("sa-0-fin00004", agent=child)
++    rebuilt = _Parent("sess-fin-rebuild")
++
++    out = json.loads(_handle_control_action("steer", "sa-0-fin00004", "x", rebuilt))
++    assert out["status"] == "already_finished"
++
++
++def test_finished_foreign_child_stays_an_error():
++    owner = _Parent("sess-owner")
++    child = _Child(owner)
++    _register("sa-0-fin00005", child, delegation_id="deleg_fin_5", owner_agent_session_id="sess-owner")
++    _unregister_subagent("sa-0-fin00005", agent=child)
++
++    out = _handle_control_action("steer", "sa-0-fin00005", "hijack", _Parent("sess-other"))
++    assert "No live subagent" in out
++    listed = json.loads(_handle_control_action("list", None, None, _Parent("sess-other")))
++    assert "finished_awaiting_batch" not in listed
++
++
++def test_unknown_id_stays_an_error():
++    out = _handle_control_action("steer", "sa-9-neverexisted", "x", _Parent("sess-u"))
++    assert "No live subagent" in out
++
++
++def test_steer_while_child_is_finishing_is_not_an_error():
++    parent = _Parent()
++    child = _Child(parent)
++    _register("sa-0-fin00006", child, delegation_id="deleg_fin_6", accepting_steer=False)
++    try:
++        raw = _handle_control_action("steer", "sa-0-fin00006", "late", parent)
++        out = json.loads(raw)
++        assert "error" not in out, raw
++        assert out["status"] == "finishing"
++        assert out["steer_delivered"] is False
++        assert child.steered == []
++    finally:
++        _unregister_subagent("sa-0-fin00006", agent=child)
++
++
++def test_model_facing_steer_after_real_child_run_returns_already_finished():
++    """End to end through the real child runner and the model-facing delegate_task entry point."""
++    from tools.delegate_tool import _run_single_child
++
++    parent = _Parent("sess-fin-e2e")
++    child = MagicMock()
++    child._subagent_id = "sa-0-fine2e01"
++    child._delegate_depth = 1
++    child._delegation_id = "deleg_fin_e2e"
++    child._parent_session_id = "sess-fin-e2e"
++    child._delegate_parent_ref = weakref.ref(parent)
++    child.model = "test-model"
++    child.session_prompt_tokens = 0
++    child.session_completion_tokens = 0
++    child._drain_pending_steer.return_value = None
++    child.run_conversation.return_value = {
++        "final_response": "done", "completed": True, "interrupted": False, "api_calls": 1, "messages": [],
++    }
++
++    _run_single_child(0, "finish fast", child=child, parent_agent=parent)
++
++    raw = delegate_task(action="steer", subagent_id="sa-0-fine2e01", message="too late", parent_agent=parent)
++    out = json.loads(raw)
++    assert "error" not in out, raw
++    assert out["status"] == "already_finished"
++    assert out["delegation_id"] == "deleg_fin_e2e"
++    child.steer.assert_not_called()
++
++    # A rebuilt parent of the same conversation resolves it too (durable session spine).
++    raw = delegate_task(action="stop", subagent_id="sa-0-fine2e01", parent_agent=_Parent("sess-fin-e2e"))
++    assert json.loads(raw)["status"] == "already_finished"
+diff --git a/tools/delegate_tool_registry.py b/tools/delegate_tool_registry.py
+index 6146e468603..d5e0f0c287a 100644
+--- a/tools/delegate_tool_registry.py
++++ b/tools/delegate_tool_registry.py
+@@ -55,6 +55,19 @@ def _register_subagent(record: dict[str, Any]) -> None:
+     with _active_subagents_lock:
+         _active_subagents[sid] = record
+ 
++def _ancestor_refs(agent: Any, max_hops: int = 8) -> tuple:
++    """Weakrefs along *agent*'s ``_delegate_parent_ref`` chain (nearest first), captured while the child is live."""
++    refs = []
++    cur = agent
++    for _ in range(max_hops):
++        ref = getattr(cur, "_delegate_parent_ref", None) if cur is not None else None
++        ancestor = ref() if callable(ref) else None
++        if ancestor is None:
++            break
++        refs.append(ref)
++        cur = ancestor
++    return tuple(refs)
++
+ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
+     """Drop the live record (exact agent identity when given) and keep a bounded attribution stub."""
+     with _active_subagents_lock:
+@@ -65,7 +78,13 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
+         sid = record.get("subagent_id")
+         if not sid:
+             return
+-        _recent_subagents[sid] = {k: record.get(k) for k in ("goal", "delegation_id", "owner_agent_session_id")}
++        stub = {k: record.get(k) for k in ("goal", "delegation_id", "owner_agent_session_id", "parent_id")}
++        # [daveey] Enough to answer a late steer/stop/list from the owning conversation: the finish time and weak
++        # refs to the child's spawn ancestors (identity ownership without keeping the child or parent alive).
++        stub["subagent_id"] = sid
++        stub["finished_at"] = time.time()
++        stub["ancestor_refs"] = _ancestor_refs(record.get("agent"))
++        _recent_subagents[sid] = stub
+         while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
+             _recent_subagents.pop(next(iter(_recent_subagents)), None)
+ 
+@@ -225,6 +244,9 @@ def _owns_subagent_record(record: dict[str, Any], parent_agent: Any) -> bool:
+     """
+     if _is_descendant_of(record.get("agent"), parent_agent):
+         return True
++    # Finished-child stub (``_recent_subagents``): same identity rule over the ancestor weakrefs captured at finish.
++    if parent_agent is not None and any(ref() is parent_agent for ref in record.get("ancestor_refs") or ()):
++        return True
+     owner_sid = str(record.get("owner_agent_session_id") or "")
+     parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+     if not owner_sid or not parent_sid:
+@@ -253,6 +275,11 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
+             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
+         })
+     payload: dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
++    awaiting = _finished_awaiting_batch(parent_agent, records)
++    if awaiting:
++        # [daveey] Finished children whose batch result is still held for running siblings: without this the parent
++        # sees them vanish from the list, assumes they are still working, and steers them (No live subagent ...).
++        payload["finished_awaiting_batch"] = awaiting
+     if not entries:
+         payload["note"] = (
+             "No live subagents right now. Children that already finished "
+@@ -261,6 +288,63 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
+         )
+     return payload
+ 
++def _finished_awaiting_batch(parent_agent: Any, live_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Owned finished children whose delegation batch still has a live owned sibling (their result is not yet
++    delivered: the batch completion message waits for every sibling)."""
++    live_batches = {
++        r.get("delegation_id") for r in live_records if r.get("delegation_id") and _owns_subagent_record(r, parent_agent)
++    }
++    if not live_batches:
++        return []
++    with _active_subagents_lock:
++        stubs = list(_recent_subagents.values())
++    return [
++        {"subagent_id": s.get("subagent_id"), "delegation_id": s.get("delegation_id"), "goal": s.get("goal"),
++         "status": "finished", "result": "held until the batch completes"}
++        for s in stubs
++        if s.get("delegation_id") in live_batches and _owns_subagent_record(s, parent_agent)
++    ]
++
++def _finished_payload(
++    action: str, sid: str, stub: dict[str, Any], parent_agent: Any, *, status: str = "already_finished",
++) -> str:
++    """Non-error answer for steer/stop on a child that already finished (a race the parent cannot see: the child
++    leaves the live registry the moment it returns, but its result is delivered later, between parent turns and only
++    once every sibling of its batch is done)."""
++    delegation_id = stub.get("delegation_id")
++    with _active_subagents_lock:
++        live = list(_active_subagents.values())
++    siblings = sorted(
++        str(r.get("subagent_id")) for r in live
++        if delegation_id and r.get("delegation_id") == delegation_id and r.get("subagent_id") != sid
++        and _owns_subagent_record(r, parent_agent)
++    )
++    finished_at = stub.get("finished_at")
++    batch = f"[ASYNC DELEGATION BATCH COMPLETE — {delegation_id}]" if delegation_id else "its batch completion"
++    when = (
++        f" once its {len(siblings)} still-running sibling(s) ({', '.join(siblings)}) finish" if siblings
++        else " at your next turn boundary (it may already be in your context)"
++    )
++    done = (
++        "is no longer accepting steering (finishing: no delivery boundary remains)" if status == "finishing"
++        else "finished before it arrived"
++    )
++    lead = (
++        f"Steering text was NOT delivered: this subagent {done}."
++        if action == "steer" else "Nothing to stop: this subagent already finished."
++    )
++    payload: dict[str, Any] = {
++        "action": action, "subagent_id": sid, "status": status,
++        "delegation_id": delegation_id,
++        "finished_seconds_ago": round(time.time() - finished_at, 1) if isinstance(finished_at, (int, float)) else None,
++        "pending_siblings": siblings,
++        "note": f"{lead} Its result arrives in the {batch} message{when}. Do not retry; read the result, then act on "
++                "the correction yourself or re-delegate a follow-up task.",
++    }
++    if action == "steer":
++        payload["steer_delivered"] = False
++    return json.dumps(payload, ensure_ascii=False)
++
+ def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
+     """Synchronous control plane for delegate_task: list/steer/stop. Runs in-turn (never backgrounded) over the same
+     registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
+@@ -273,6 +357,9 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
+         return tool_error(f"action='{action}' requires subagent_id (from the spawn dispatch response or action='list').")
+     with _active_subagents_lock:
+         record = _active_subagents.get(sid)
++        stub = _recent_subagents.get(sid) if record is None else None
++    if record is None and stub is not None and _owns_subagent_record(stub, parent_agent):
++        return _finished_payload(action, sid, stub, parent_agent)
+     if record is None or not _owns_subagent_record(record, parent_agent):
+         return tool_error(
+             f"No live subagent '{sid}' in this conversation's spawn tree. It "
+@@ -288,6 +375,9 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
+     ok = interrupt_subagent(sid) if action == "stop" else steer_subagent(sid, message.strip())
+     if ok:
+         return json.dumps({"action": action, "subagent_id": sid, "status": status, "note": note}, ensure_ascii=False)
++    if action == "steer" and not record.get("accepting_steer", False):
++        # Finishing: acceptance closed for the final drain, the record leaves the registry next. Same race as above.
++        return _finished_payload(action, sid, record, parent_agent, status="finishing")
+     return tool_error(failure.format(sid=sid))
+ 
+ # action -> (success status, success note, failure error template)
+-- 
+2.55.0
+

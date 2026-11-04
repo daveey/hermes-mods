@@ -1,0 +1,579 @@
+From d040f572a9438a92535f00da633d82f05a33c6b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:59:26 +0000
+Subject: [PATCH] fix(kanban): retry busy setup outside board lifecycle locks
+ [daveey]
+
+---
+ hermes_cli/kanban_dispatch_owner.py           |  34 ++--
+ hermes_cli/kanban_generation.py               |  41 ++++-
+ hermes_cli/kanban_lockguard.py                |  44 +++---
+ hermes_cli/kanban_reader_lifecycle.py         |  11 +-
+ hermes_cli/sqlite_safe_read.py                |  17 +-
+ .../test_kanban_auxiliary_lockguard.py        |  10 +-
+ tests/hermes_cli/test_kanban_lockguard.py     |   2 +-
+ .../test_kanban_open_session_isolation.py     |  17 +-
+ .../test_kanban_reader_close_isolation.py     | 147 ++++++++++++++++++
+ 9 files changed, 269 insertions(+), 54 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_reader_close_isolation.py
+
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index c7d0ae9c392..96a0f537ea9 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -16,7 +16,7 @@ def connect_with_identity(path, **kwargs):
+     dispatch: reopen after contention clears instead of trusting a pathname.
+     """
+     from hermes_cli.kanban_db_connect import _dispatch_tick_lock
+-    from hermes_cli.kanban_generation import lifecycle_access, recover, remember
++    from hermes_cli.kanban_generation import lifecycle_access, prepare_connection, recover, retry_open
+     from hermes_cli.sqlite_safe_read import connect_tracked, _tracking_factory
+ 
+     canonical = Path(path).resolve()
+@@ -25,20 +25,24 @@ def connect_with_identity(path, **kwargs):
+     # global lock; the first journal read may wait on an unrelated board writer.
+     kwargs["factory"] = _kanban_lockguard.lifecycle_factory(_kanban_lockguard.guarded_factory(
+         _tracking_factory(kwargs.get("factory", sqlite3.Connection))))
+-    with lifecycle_access(canonical, kwargs.get("timeout", 5.0)) as lock, _dispatch_tick_lock(canonical) as held:
+-        recover(str(canonical))
+-        conn = connect_tracked(str(canonical), **kwargs)
+-        conn._hermes_lifecycle_lock = lock
+-        try:
+-            _kanban_lockguard.guard(conn)
+-            remember(conn)
+-            stat = canonical.stat() if held else None
+-            conn._dispatch_identity = (stat.st_dev, stat.st_ino) if stat else None
+-            conn._dispatch_open_contended = not held
+-            return conn
+-        except BaseException:
+-            conn.close()
+-            raise
++    timeout = kwargs.get("timeout", 5.0)
++
++    def open_once(remaining):
++        with lifecycle_access(canonical, remaining) as lock, _dispatch_tick_lock(canonical) as held:
++            recover(str(canonical))
++            conn = connect_tracked(str(canonical), wait_for_tracking=False, **kwargs)
++            conn._hermes_lifecycle_lock = lock
++            try:
++                prepare_connection(conn, timeout)
++                stat = canonical.stat() if held else None
++                conn._dispatch_identity = (stat.st_dev, stat.st_ino) if stat else None
++                conn._dispatch_open_contended = not held
++                return conn
++            except BaseException:
++                conn.close()
++                raise
++
++    return retry_open(open_once, timeout)
+ 
+ 
+ def connection_db_path(conn: sqlite3.Connection, *, validate: bool = True) -> Path:
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+index ac8566e357f..5c943f1a9fa 100644
+--- a/hermes_cli/kanban_generation.py
++++ b/hermes_cli/kanban_generation.py
+@@ -10,6 +10,7 @@ from contextlib import contextmanager
+ import os
+ import sqlite3
+ import threading
++import time
+ import weakref
+ from urllib.parse import unquote
+ 
+@@ -65,7 +66,7 @@ def _path(database) -> str | None:
+     return os.path.realpath(value)
+ 
+ 
+-def remember(conn) -> None:
++def remember(conn, *, strict=False) -> None:
+     from hermes_cli.kanban_lockguard import _db_file, shm_identity
+ 
+     path = _db_file(conn)
+@@ -76,6 +77,8 @@ def remember(conn) -> None:
+     try:
+         conn.execute("PRAGMA journal_mode").fetchone()
+     except sqlite3.Error:
++        if strict:
++            raise
+         return
+     with _lock:
+         conn._hermes_generation_path = os.path.realpath(path)
+@@ -84,6 +87,36 @@ def remember(conn) -> None:
+         _connections.add(conn)
+ 
+ 
++def prepare_connection(conn, timeout):
++    """Never sleep inside SQLite while holding a board lifecycle lock.
++
++    A busy attempt closes completely before retrying outside the lock. This
++    lets existing readers close without waiting for a native writer's budget.
++    """
++    from hermes_cli.kanban_lockguard import guard
++
++    conn.execute("PRAGMA busy_timeout=0")
++    guard(conn, strict=True)
++    remember(conn, strict=True)
++    conn.execute(f"PRAGMA busy_timeout={max(0, int(float(timeout) * 1000))}")
++
++
++def retry_open(open_once, timeout):
++    deadline = time.monotonic() + max(0.0, float(timeout))
++    while True:
++        try:
++            return open_once(max(0.0, deadline - time.monotonic()))
++        except sqlite3.OperationalError as exc:
++            code = getattr(exc, "sqlite_errorcode", 0) & 0xff
++            if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
++                raise
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise
++        # No board, tracking, dispatch or cache registry lock held here.
++        time.sleep(min(0.01, remaining))
++
++
+ def forget(conn) -> None:
+     with _lock:
+         _connections.discard(conn)
+@@ -130,7 +163,7 @@ def evict_readers(path: str) -> None:
+             entry[2].release()
+ 
+ 
+-def open_ro(path, check_same_thread: bool = True) -> sqlite3.Connection:
++def open_ro(path, check_same_thread: bool = True, *, timeout=0.5) -> sqlite3.Connection:
+     """Never create a missing board; retry read/write only to initialize missing WAL sidecars."""
+     from hermes_cli import kanban_lockguard
+ 
+@@ -138,13 +171,15 @@ def open_ro(path, check_same_thread: bool = True) -> sqlite3.Connection:
+         conn = None
+         try:
+             conn = kanban_lockguard.connect(path.resolve().as_uri() + f"?mode={mode}",
+-                                           uri=True, timeout=0.5, check_same_thread=check_same_thread)
++                                           uri=True, timeout=timeout, check_same_thread=check_same_thread)
+             conn.execute("PRAGMA query_only = ON")
+             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+             return conn
+         except sqlite3.Error as exc:
+             if conn is not None:
+                 conn.close()
++            if getattr(exc, "sqlite_errorcode", 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
++                raise  # mode=rw cannot resolve a busy writer; don't double the budget.
+             if isinstance(exc, DeletedWalGenerationError) or not isinstance(exc, sqlite3.OperationalError) or mode == "rw":
+                 raise
+     raise AssertionError("unreachable")
+diff --git a/hermes_cli/kanban_lockguard.py b/hermes_cli/kanban_lockguard.py
+index 28f811fc233..0f885224558 100644
+--- a/hermes_cli/kanban_lockguard.py
++++ b/hermes_cli/kanban_lockguard.py
+@@ -131,7 +131,7 @@ def unguard(conn: sqlite3.Connection) -> None:
+         conn._hermes_lockguard = None
+ 
+ 
+-def _apply(conn: Any, held_path: Optional[str] = None) -> bool:
++def _apply(conn: Any, held_path: Optional[str] = None, *, strict=False) -> bool:
+     path = held_path or _db_file(conn)
+     if not path:
+         return False
+@@ -139,6 +139,8 @@ def _apply(conn: Any, held_path: Optional[str] = None) -> bool:
+         # Also the first read: it opens -wal/-shm, so hold() can lock SQLite's own -shm descriptor.
+         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+     except sqlite3.Error:
++        if strict:
++            raise
+         return False
+     if str(mode).lower() != "wal":
+         return False
+@@ -157,35 +159,41 @@ def _apply(conn: Any, held_path: Optional[str] = None) -> bool:
+     return True
+ 
+ 
+-def guard(conn: sqlite3.Connection) -> bool:
++def guard(conn: sqlite3.Connection, *, strict=False) -> bool:
+     """(Re)apply the guard to *conn* (idempotent; extends it to a ``-shm`` minted after open).
+-    Returns whether the connection is guarded. Never raises: an unguardable connection (rollback
++    Returns whether the connection is guarded. With strict=True SQL errors propagate so an opener
++    retries instead of returning a partially configured handle. Otherwise an unguardable connection (rollback
+     journal, in-memory, unsupported platform, plain ``sqlite3.Connection`` instance) is left as is."""
+     if not isinstance(conn, _GuardMixin) or not _lockguard.supported():
+         return False
+     try:
+-        return _apply(conn)
+-    except Exception:  # the guard is protection, never a new failure mode for the caller
++        return _apply(conn, strict=strict)
++    except Exception as exc:  # the guard is protection, never a new failure mode for the caller
++        if strict and isinstance(exc, sqlite3.Error):
++            raise
+         logger.debug("kanban lock guard unavailable", exc_info=True)
+         return False
+ 
+ 
+ def connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+     """Drop-in ``sqlite3.connect`` for Kanban board files: same arguments, guarded result."""
+-    from hermes_cli.kanban_generation import lifecycle_access, recover, remember
++    from hermes_cli.kanban_generation import lifecycle_access, prepare_connection, recover, retry_open
+     timeout = args[0] if args else kwargs.get("timeout", 5.0)
+-    with lifecycle_access(database, timeout) as lock:
+-        recover(database)
+-        kwargs["factory"] = lifecycle_factory(guarded_factory(kwargs.get("factory", sqlite3.Connection)))
+-        conn = sqlite3.connect(database, *args, **kwargs)
+-        conn._hermes_lifecycle_lock = lock
+-        try:
+-            guard(conn)
+-            remember(conn)
+-            return conn
+-        except BaseException:
+-            conn.close()
+-            raise
++    kwargs["factory"] = lifecycle_factory(guarded_factory(kwargs.get("factory", sqlite3.Connection)))
++
++    def open_once(remaining):
++        with lifecycle_access(database, remaining) as lock:
++            recover(database)
++            conn = sqlite3.connect(database, *args, **kwargs)
++            conn._hermes_lifecycle_lock = lock
++            try:
++                prepare_connection(conn, timeout)
++                return conn
++            except BaseException:
++                conn.close()
++                raise
++
++    return retry_open(open_once, timeout)
+ 
+ 
+ def _canonical(path: Any) -> str:
+diff --git a/hermes_cli/kanban_reader_lifecycle.py b/hermes_cli/kanban_reader_lifecycle.py
+index f1c6bebf441..33ee825e0ae 100644
+--- a/hermes_cli/kanban_reader_lifecycle.py
++++ b/hermes_cli/kanban_reader_lifecycle.py
+@@ -3,17 +3,21 @@ import os
+ import sqlite3
+ import threading
+ 
+-from hermes_cli.kanban_generation import DeletedWalGenerationError, lifecycle_access
++from hermes_cli.kanban_generation import DeletedWalGenerationError, lifecycle_access, retry_open
+ 
+ 
+ def cached_entry(path):
++    return retry_open(lambda remaining: _cached_entry_once(path, remaining), 0.5)
++
++
++def _cached_entry_once(path, remaining):
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_cli.kanban_lockguard import shm_identity
+ 
+     key = str(path)
+     # Same-board opens/last closes are atomic; registry locks protect only map
+     # operations. Borrowers never wait for this board lock while holding the map.
+-    with lifecycle_access(path, timeout=0.5):
++    with lifecycle_access(path, timeout=remaining):
+         activity._recover_generation(path)
+         try:
+             st = os.stat(path)
+@@ -36,7 +40,8 @@ def cached_entry(path):
+             finally:
+                 stale[2].release()
+         if entry is None:
+-            conn = activity._open_ro(path, check_same_thread=False)
++            conn = activity._open_ro(path, check_same_thread=False, timeout=0)
++            conn.execute("PRAGMA busy_timeout=500")
+             entry = (conn, ident, threading.Lock(), shm_identity(path))
+             with activity._RO_CACHE_LOCK:
+                 activity._RO_CACHE[key] = entry
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index 6892d091812..80720a6e595 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -145,8 +145,21 @@ def _tracking_factory(factory: type) -> type:
+     return cached
+ 
+ 
++@contextlib.contextmanager
++def _tracking_access(blocking):
++    if not _live_lock.acquire(blocking=blocking):
++        exc = sqlite3.OperationalError("database is locked: SQLite tracking registry is busy")
++        exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
++        raise exc
++    try:
++        yield
++    finally:
++        _live_lock.release()
++
++
+ def connect_tracked(
+-    path: Path | str, *, tracking_path: Path | str | None = None, connect_fn=None, **kwargs,
++    path: Path | str, *, tracking_path: Path | str | None = None, connect_fn=None,
++    wait_for_tracking=True, **kwargs,
+ ) -> sqlite3.Connection:
+     """``sqlite3.connect`` that registers the connection for the lifetime of the fd (released on
+     ``close()``). Use for any database that might be byte-probed (``state.db``, ``kanban.db``).
+@@ -155,7 +168,7 @@ def connect_tracked(
+     opener = connect_fn if connect_fn is not None else sqlite3.connect
+     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
+ 
+-    with _live_lock:
++    with _tracking_access(wait_for_tracking):
+         conn = opener(str(path), **kwargs)
+         try:
+             resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
+diff --git a/tests/hermes_cli/test_kanban_auxiliary_lockguard.py b/tests/hermes_cli/test_kanban_auxiliary_lockguard.py
+index f98767f07d5..eff7277f01e 100644
+--- a/tests/hermes_cli/test_kanban_auxiliary_lockguard.py
++++ b/tests/hermes_cli/test_kanban_auxiliary_lockguard.py
+@@ -78,7 +78,7 @@ def test_recovery_retires_all_alias_caches_and_idle_board_handles(board, monkeyp
+     reader = None
+     try:
+         with monkeypatch.context() as m:
+-            m.setattr(kanban_lockguard, "guard", lambda conn: False)
++            m.setattr(kanban_lockguard, "guard", lambda conn, **kwargs: False)
+             reader = kanban_lockguard.connect(board)
+             reader.execute("SELECT * FROM tasks").fetchall()
+             for path in (board, alias):
+@@ -100,7 +100,7 @@ def test_recovery_retires_all_alias_caches_and_idle_board_handles(board, monkeyp
+ def test_recovery_does_not_rollback_a_live_transaction(board, monkeypatch):
+     from hermes_cli.kanban_generation import DeletedWalGenerationError
+     with monkeypatch.context() as m:
+-        m.setattr(kanban_lockguard, "guard", lambda conn: False)
++        m.setattr(kanban_lockguard, "guard", lambda conn, **kwargs: False)
+         reader = kanban_lockguard.connect(board)
+         reader.execute("BEGIN")
+         reader.execute("SELECT * FROM tasks").fetchall()
+@@ -126,7 +126,7 @@ def test_unregistered_stranded_peer_refuses_retries_and_ro_fallback(board, monke
+     try:
+         if registered:
+             with monkeypatch.context() as m:
+-                m.setattr(kanban_lockguard, "guard", lambda conn: False)
++                m.setattr(kanban_lockguard, "guard", lambda conn, **kwargs: False)
+                 peer = kanban_lockguard.connect(board)
+         _strand(board)
+         for _ in range(2):
+@@ -161,7 +161,7 @@ def test_foreign_thread_handle_refused_until_owner_closes(board, monkeypatch):
+             opened.set()
+ 
+     with monkeypatch.context() as m:
+-        m.setattr(kanban_lockguard, "guard", lambda conn: False)
++        m.setattr(kanban_lockguard, "guard", lambda conn, **kwargs: False)
+         thread = threading.Thread(target=owner)
+         thread.start()
+         assert opened.wait(10)
+@@ -186,7 +186,7 @@ def test_borrowed_cache_is_not_closed_or_waited_on_during_recovery(board, monkey
+     activity._reset_cache_for_tests()
+     try:
+         with monkeypatch.context() as m:
+-            m.setattr(kanban_lockguard, "guard", lambda conn: False)
++            m.setattr(kanban_lockguard, "guard", lambda conn, **kwargs: False)
+             with activity.cached_ro(board) as borrowed:
+                 borrowed.execute("SELECT * FROM tasks").fetchall()
+                 _strand(board)
+diff --git a/tests/hermes_cli/test_kanban_lockguard.py b/tests/hermes_cli/test_kanban_lockguard.py
+index 718f64e8540..8b129d11b69 100644
+--- a/tests/hermes_cli/test_kanban_lockguard.py
++++ b/tests/hermes_cli/test_kanban_lockguard.py
+@@ -213,7 +213,7 @@ def test_stranded_cached_reader_reopens(board, monkeypatch):
+     ksa._reset_cache_for_tests()
+     try:
+         with monkeypatch.context() as m:
+-            m.setattr(kanban_lockguard, "guard", lambda conn: False)  # the pre-fix, unguarded reader
++            m.setattr(kanban_lockguard, "guard", lambda conn, **kwargs: False)  # the pre-fix, unguarded reader
+             with ksa.cached_ro(board) as conn:
+                 assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+         _stray_raw_copy(board)
+diff --git a/tests/hermes_cli/test_kanban_open_session_isolation.py b/tests/hermes_cli/test_kanban_open_session_isolation.py
+index 2593ac1706a..761ab337312 100644
+--- a/tests/hermes_cli/test_kanban_open_session_isolation.py
++++ b/tests/hermes_cli/test_kanban_open_session_isolation.py
+@@ -43,9 +43,15 @@ def test_busy_board_open_does_not_block_session_poll(tmp_path, monkeypatch, http
+     entered = threading.Event()
+     original = guard._apply
+ 
+-    def observed_apply(conn, held_path=None):
+-        entered.set()
+-        return original(conn, held_path)
++    def observed_apply(conn, held_path=None, **kwargs):
++        if getattr(conn, "_hermes_tracked_path", None) == str(board_path):
++            # Every live attempt is probe-protected; busy attempts may close
++            # fully between retries rather than retaining a blocked handle.
++            assert has_live_connection(board_path)
++            with pytest.raises(LiveConnectionError), offline_file_access(board_path):
++                pass
++            entered.set()
++        return original(conn, held_path, **kwargs)
+ 
+     monkeypatch.setattr(guard, "_apply", observed_apply)
+ 
+@@ -84,9 +90,6 @@ def test_busy_board_open_does_not_block_session_poll(tmp_path, monkeypatch, http
+                 elapsed.extend(future.result(timeout=4) for future in polls)
+             assert max(elapsed) < 5
+             assert not opening.done()
+-            assert has_live_connection(board_path)
+-            with pytest.raises(LiveConnectionError), offline_file_access(board_path):
+-                pass
+         finally:
+             blocker.rollback()
+             blocker.close()
+@@ -102,7 +105,7 @@ def test_identity_setup_failure_closes_tracked_connection(tmp_path, monkeypatch)
+     path = tmp_path / "board.db"
+     seen = []
+ 
+-    def fail_after_open(conn):
++    def fail_after_open(conn, **kwargs):
+         seen.append(conn)
+         assert has_live_connection(path)
+         raise RuntimeError("generation registration failed")
+diff --git a/tests/hermes_cli/test_kanban_reader_close_isolation.py b/tests/hermes_cli/test_kanban_reader_close_isolation.py
+new file mode 100644
+index 00000000000..2d180ed9994
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_reader_close_isolation.py
+@@ -0,0 +1,147 @@
++"""A reader must finish cleanup while a native board opener retries a busy journal."""
++from concurrent.futures import ThreadPoolExecutor
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_lockguard as guard
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli.kanban_dispatch_owner import connect_with_identity
++from hermes_cli.kanban_generation import open_ro
++
++
++@pytest.mark.parametrize("reader", ["cached", "plain"])
++def test_reader_close_does_not_wait_for_busy_native_opener(tmp_path, monkeypatch, reader):
++    path = tmp_path / "board.db"
++    seed = sqlite3.connect(path)
++    seed.execute("CREATE TABLE marker(value)")
++    seed.commit()
++    seed.close()
++    have_conn, go, native_setup = threading.Event(), threading.Event(), threading.Event()
++    original = guard._apply
++
++    def observed(conn, *args, **kwargs):
++        if threading.current_thread().name.startswith("native-open"):
++            native_setup.set()
++        return original(conn, *args, **kwargs)
++
++    monkeypatch.setattr(guard, "_apply", observed)
++
++    def read():
++        if reader == "cached":
++            with activity.cached_ro(path) as conn:
++                have_conn.set()
++                assert go.wait(10)
++                conn.execute("SELECT count(*) FROM marker").fetchone()
++        else:
++            conn = open_ro(path)
++            try:
++                have_conn.set()
++                assert go.wait(10)
++                conn.execute("SELECT count(*) FROM marker").fetchone()
++            finally:
++                conn.close()
++
++    def native():
++        conn = connect_with_identity(path, timeout=30)
++        conn.close()
++
++    blocker = sqlite3.connect(path)
++    try:
++        with ThreadPoolExecutor(max_workers=1) as reads, ThreadPoolExecutor(
++                max_workers=1, thread_name_prefix="native-open") as opens:
++            pending = reads.submit(read)
++            try:
++                assert have_conn.wait(10)
++                blocker.execute("BEGIN EXCLUSIVE")
++                opening = opens.submit(native)
++                assert native_setup.wait(10)
++                start = time.monotonic()
++                go.set()
++                with pytest.raises(sqlite3.OperationalError):
++                    pending.result(timeout=3)
++                assert time.monotonic() - start < 3
++                assert not opening.done()
++            finally:
++                go.set()
++                blocker.rollback()
++            opening.result(timeout=5)
++    finally:
++        blocker.close()
++        activity._reset_cache_for_tests()
++
++
++def test_untracked_reader_close_while_native_open_waits_for_file_probe(tmp_path, monkeypatch):
++    from hermes_cli import sqlite_safe_read
++
++    path = tmp_path / "board.db"
++    seed = sqlite3.connect(path)
++    seed.execute("CREATE TABLE marker(value)")
++    seed.commit()
++    seed.close()
++    entered = threading.Event()
++    release = threading.Event()
++    ready = threading.Event()
++    original = sqlite_safe_read.connect_tracked
++
++    def observed(*args, **kwargs):
++        entered.set()
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(sqlite_safe_read, "connect_tracked", observed)
++
++    def read():
++        conn = open_ro(path)
++        ready.set()
++        assert release.wait(10)
++        conn.close()
++
++    def native():
++        conn = connect_with_identity(path, timeout=30)
++        conn.close()
++
++    other = tmp_path / "other.bin"
++    other.write_bytes(b"data")
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        reading = pool.submit(read)
++        assert ready.wait(10)
++        entered.clear()
++        try:
++            with sqlite_safe_read.offline_file_access(other):
++                opening = pool.submit(native)
++                assert entered.wait(10)
++                # Synchronize on the tracking-open boundary, not a sleep.
++                release.set()
++                reading.result(timeout=3)
++                assert not opening.done()
++        finally:
++            release.set()
++        opening.result(timeout=5)
++
++
++@pytest.mark.parametrize("connect", [guard.connect, connect_with_identity])
++def test_setup_retry_expires_and_restores_sql_budget(tmp_path, connect):
++    from hermes_cli.sqlite_safe_read import has_live_connection
++
++    path = tmp_path / "board.db"
++    blocker = sqlite3.connect(path)
++    try:
++        blocker.execute("CREATE TABLE marker(value)")
++        blocker.commit()
++        blocker.execute("BEGIN EXCLUSIVE")
++        start = time.monotonic()
++        with pytest.raises(sqlite3.OperationalError, match="locked"):
++            connect(path, timeout=0.1)
++        assert time.monotonic() - start < 2
++        assert not has_live_connection(path)
++        blocker.rollback()
++        conn = connect(path, timeout=0.1)
++        try:
++            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 100
++            assert conn.execute("SELECT count(*) FROM marker").fetchone()[0] == 0
++        finally:
++            conn.close()
++    finally:
++        blocker.close()
+-- 
+2.55.0
+

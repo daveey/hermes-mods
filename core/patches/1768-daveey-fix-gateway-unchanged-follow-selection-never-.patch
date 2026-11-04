@@ -1,0 +1,312 @@
+From 3dccfc97ac1699a20ab83b5e1175f9a195725784 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 22:01:29 +0000
+Subject: [PATCH] [daveey] fix(gateway): unchanged follow selection never
+ rerolls a class allocation
+
+commit_selection minted a fresh switch intent whenever [model, provider, physical, frozen pick]
+changed or no memo existed, so a compaction (new physical target) or a first commit with no memo
+replaced an unchanged class:deep allocation and moved the session to another provider with no
+profile edit.
+
+- Only a SELECTION change (tuple or the receipt's frozen pick) records a new intent. The memo is now
+  {selection, physical}; a physical change with the same selection is a relocation: a still-pending
+  intent moves to the new id as the SAME event (model_routing_switch_intent.relocate_in_transaction;
+  record_in_transaction untouched), a consumed one stays consumed.
+- No memo (first commit after upgrade): record the intent unless the lineage already runs a non-exact
+  class allocation for the selected class. Exact selections and class selections over an exact pin
+  still record it (pin correction / real first change).
+- tests: unmanaged compaction / missing memo / both and managed compaction / missing memo keep the
+  provider, allocation, allocator counters and fences unchanged, then still follow a real edit; a
+  pending intent moved across compaction is consumed with its original event (no new order number);
+  missing memo over an exact pin still moves off the pin.
+---
+ agent/model_routing_switch_intent.py        |  21 +++
+ gateway/session_profile_selection.py        |  63 +++++++--
+ tests/gateway/test_bot_chat_follow_entry.py | 134 ++++++++++++++++++++
+ 3 files changed, 207 insertions(+), 11 deletions(-)
+
+diff --git a/agent/model_routing_switch_intent.py b/agent/model_routing_switch_intent.py
+index 740668cff3a..7c9e0f3dda8 100644
+--- a/agent/model_routing_switch_intent.py
++++ b/agent/model_routing_switch_intent.py
+@@ -118,6 +118,27 @@ def record_in_transaction(conn, session_id, model, provider, generation):
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (PREFIX + session_id, value))
+ 
+ 
++def relocate_in_transaction(conn, old_session_id, new_session_id, model, provider):
++    """Carry a still-pending intent for (*model*, *provider*) from *old_session_id* to *new_session_id*
++    (a compaction moved the physical transcript) as the SAME event: no new order number, so an allocation
++    that already honoured it stays sticky (``supersedes`` compares the event). A consumed intent, another
++    tuple's intent, or one already waiting on the new id is left alone."""
++    raw = read_on_conn(conn, old_session_id)
++    if raw is None or old_session_id == new_session_id or read_on_conn(conn, new_session_id) is not None:
++        return
++    try:
++        intent = json.loads(raw)
++    except (TypeError, ValueError):
++        return
++    if not isinstance(intent, dict) or intent.get("session_id") != old_session_id \
++            or intent.get("model") != model or (intent.get("provider") or "") != (provider or ""):
++        return
++    intent["session_id"] = new_session_id
++    conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
++                 (PREFIX + new_session_id, json.dumps(intent, sort_keys=True)))
++    consume_on_conn(conn, old_session_id, raw)
++
++
+ def pending(session_db, session_id, model, provider):
+     """The raw intent row when it names exactly this session and tuple, else ``None``."""
+     if session_db is None or not session_id or not model:
+diff --git a/gateway/session_profile_selection.py b/gateway/session_profile_selection.py
+index 3d2b37c1a81..de9d82a7233 100644
+--- a/gateway/session_profile_selection.py
++++ b/gateway/session_profile_selection.py
+@@ -28,6 +28,38 @@ def _frozen_pick(saved_policy):
+     return [saved_policy.get('model'), block if isinstance(block, dict) else None]
+ 
+ 
++def _memo(row):
++    """The remembered ``{'selection': [model, provider, frozen pick], 'physical': id}``, or None when
++    nothing (or only an unreleased earlier format of this branch) is remembered."""
++    try:
++        memo = json.loads(row[0]) if row is not None else None
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(memo, dict) or not isinstance(memo.get('selection'), list) \
++            or not isinstance(memo.get('physical'), str):
++        return None
++    return memo
++
++
++def _already_allocated(physical, model):
++    """No memo yet (first commit after upgrade): whether the lineage already runs a class allocation for
++    the class *model* selects, so an intent would only re-roll it. An exact pin there (the class change
++    this session never committed) or an exact selection (re-pinning the same tuple, never a reroll)
++    still records the intent."""
++    from agent.model_routing import is_class_selector
++    if not is_class_selector(model):
++        return False
++    import sqlite3
++    from agent.model_routing_state import RoutingState
++    from hermes_constants import get_hermes_home
++    try:
++        current = RoutingState(get_hermes_home() / 'model-routing.sqlite3').peek(
++            physical, model.removeprefix('class:'))
++    except sqlite3.Error:
++        return False
++    return bool(current) and not current.get('exact_pin')
++
++
+ def commit_selection(authority, ref, policy, config, model, generation, *, ended=False):
+     """Authorize this effective selection, not arbitrary exact-pin failover. Returns the policy the
+     owner now publishes for the session (*policy*, or its released copy when *ended*).
+@@ -40,10 +72,14 @@ def commit_selection(authority, ref, policy, config, model, generation, *, ended
+     and that ``reserve_admission_worker`` assigns a worker after compression, through the canonical
+     writer (``record_in_transaction``), as ``model_in_transaction`` does for an explicit pick.
+ 
+-    The selection is remembered as (tuple, physical target, the receipt's frozen pick), independently
+-    of runtime usage stamps: rebuilding an unchanged selection never re-arms a consumed intent, while a
+-    compaction (new physical target) or an explicit pick another build consumed (frozen pick moved)
+-    re-arms it. *ended*: the policy's recorded pick no longer holds on that read
++    The selection (tuple + the receipt's frozen pick) is remembered beside the physical target it was
++    committed on, independently of runtime usage stamps. Only a SELECTION change records a new intent:
++    a profile edit, or an explicit pick another build consumed (frozen pick moved). A compaction (new
++    physical target, same selection) is a relocation: a still-pending intent moves to the new id as the
++    same event and a consumed one stays consumed, so a class allocation never re-rolls on it. With
++    nothing remembered (first commit after upgrade) the intent is recorded unless the lineage already
++    runs a class allocation for the selected class (``_already_allocated``).
++    *ended*: the policy's recorded pick no longer holds on that read
+     (``LocalSessionPolicy.effective_selection``); the same transaction commits its end to the receipt,
+     without a generation bump (nothing this generation runs changes), and the owner's live policy is
+     republished from it. A concurrent prepared mutation then fails its snapshot check
+@@ -51,7 +87,7 @@ def commit_selection(authority, ref, policy, config, model, generation, *, ended
+     """
+     if not policy.follows_profile or policy.ignore_user_config:
+         return policy
+-    from agent.model_routing_switch_intent import record_in_transaction
++    from agent.model_routing_switch_intent import record_in_transaction, relocate_in_transaction
+     from hermes_state_local import POLICY_PREFIX
+     from hermes_state_local_lineage import local_physical_target
+     from hermes_state_runtime import _epoch, _json
+@@ -72,14 +108,19 @@ def commit_selection(authority, ref, policy, config, model, generation, *, ended
+             saved['policy'] = released
+             conn.execute('UPDATE state_meta SET value=? WHERE key=?',
+                          (_json(saved), POLICY_PREFIX + ref.session_id))
+-        selected = json.dumps([model, provider, physical, _frozen_pick(expected)], sort_keys=True)
++        selection = json.loads(json.dumps([model, provider, _frozen_pick(expected)]))
+         key = PREFIX + ref.session_id
+-        old = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+-        if old is not None and old[0] == selected:
+-            return
+-        record_in_transaction(conn, physical, model, provider, generation)
++        old = _memo(conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone())
++        if old is not None and old['selection'] == selection:
++            if old['physical'] == physical:
++                return
++            # Relocation, not a selection change: carry a still-pending intent as the same event.
++            relocate_in_transaction(conn, old['physical'], physical, model, provider)
++        elif old is not None or not _already_allocated(physical, model):
++            record_in_transaction(conn, physical, model, provider, generation)
+         conn.execute('INSERT INTO state_meta (key,value) VALUES (?,?) '
+-                     'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, selected))
++                     'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
++                     (key, json.dumps({'selection': selection, 'physical': physical}, sort_keys=True)))
+     authority.db._execute_write(write)
+     if released is None:
+         return policy
+diff --git a/tests/gateway/test_bot_chat_follow_entry.py b/tests/gateway/test_bot_chat_follow_entry.py
+index bbccc30ee1d..d988f6ca7f8 100644
+--- a/tests/gateway/test_bot_chat_follow_entry.py
++++ b/tests/gateway/test_bot_chat_follow_entry.py
+@@ -222,6 +222,110 @@ async def test_class_profile_default_follows_off_exact_pin(home, monkeypatch):
+         store.close_all_db_handles()
+ 
+ 
++def _class_default(home):
++    from hermes_cli.config import atomic_config_write, read_user_config_raw
++    config = read_user_config_raw(home / 'config.yaml')
++    config['model'].update(default='class:deep', provider='auto')
++    atomic_config_write(home / 'config.yaml', config)
++
++
++def _routing_ledger(home, sid):
++    """What a reroll would change: the lineage's allocation, the allocator's counters, its honoured fences."""
++    import sqlite3
++    from contextlib import closing
++    with closing(sqlite3.connect(home / 'model-routing.sqlite3')) as db:
++        counters = db.execute('SELECT COALESCE(SUM(position), 0) FROM counters').fetchone()[0]
++        fences = sorted(db.execute('SELECT root, class, intent FROM switch_fences').fetchall())
++    return _allocation(home, sid), counters, fences
++
++
++def _forget_selection(db, ref):
++    """A session no follow-selection writer committed yet (first run after upgrade)."""
++    from gateway.session_profile_selection import PREFIX
++    db._execute_write(lambda c: c.execute('DELETE FROM state_meta WHERE key=?', (PREFIX + ref.session_id,)))
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('event', ['compaction', 'missing_memo', 'both'])
++async def test_unchanged_class_selection_never_rerolls(home, monkeypatch, event):
++    """No profile edit, no pick: a compaction (new physical target) or a missing selection memo is not a
++    selection change, so the class allocation keeps its provider and nothing is allocated again."""
++    from agent.model_routing_switch_intent import PREFIX as INTENT
++    store, db, authority, owner, ref, built = _bot_chat_owner(home, monkeypatch)
++    try:
++        await _open(authority, ref)
++        await _turn(authority, owner, ref, built, 'opus')
++        _class_default(home)
++        await _turn(authority, owner, ref, built, 'c1')
++        before = await _turn(authority, owner, ref, built, 'c2')
++        ledger = _routing_ledger(home, authority.physical_target(ref))
++        if event in ('compaction', 'both'):
++            _compress(db, authority, ref, 'tip')
++        if event in ('missing_memo', 'both'):
++            _forget_selection(db, ref)
++        after = await _turn(authority, owner, ref, built, 'c3')
++        physical = authority.physical_target(ref)
++        assert after[:2] == before[:2], built
++        assert _routing_ledger(home, physical) == ledger
++        assert db.get_meta(INTENT + physical) is None
++        # Once re-baselined, a real profile edit still switches.
++        _profile_pick(home, ASTRA, 'openai-codex')
++        assert await _turn(authority, owner, ref, built, 'astra') == (ASTRA, 'openai-codex', physical), built
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++async def test_missing_memo_class_selection_still_corrects_an_exact_pin(home, monkeypatch):
++    """First run after upgrade with the profile on a class and the lineage still exactly pinned: the class
++    selection must move the allocation off the pin (the change the session never committed)."""
++    store, db, authority, owner, ref, built = _bot_chat_owner(home, monkeypatch)
++    try:
++        await _open(authority, ref)
++        assert (await _turn(authority, owner, ref, built, 'opus'))[:2] == (OPUS, 'anthropic'), built
++        assert _allocation(home, ref.session_id)['exact_pin'] is True
++        _forget_selection(db, ref)
++        _class_default(home)
++        result = await _turn(authority, owner, ref, built, 'class')
++        assert result[0] != 'raised', result
++        recorded = _allocation(home, ref.session_id)
++        assert not recorded.get('exact_pin', False), recorded
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++async def test_pending_follow_intent_moves_with_compaction_unconsumed(home, monkeypatch):
++    """A committed profile change whose intent no build consumed yet, then a compaction: the next turn
++    builds on the new physical target with THAT committed event (moved, not minted again)."""
++    import json as _json
++    from agent.model_routing_switch_intent import ORDER_KEY, PREFIX as INTENT
++    from gateway.session_profile_selection import commit_selection
++    store, db, authority, owner, ref, built = _bot_chat_owner(home, monkeypatch)
++    try:
++        await _open(authority, ref)
++        assert (await _turn(authority, owner, ref, built, 'opus'))[:2] == (OPUS, 'anthropic'), built
++        _profile_pick(home, ASTRA, 'openai-codex')
++        policy, config, model, ended = _selection_inputs(authority, ref)
++        commit_selection(authority, ref, policy, config, model,
++                         db.get_session(ref.session_id)['runtime_generation'], ended=ended)
++        old = authority.physical_target(ref)
++        event = _json.loads(db.get_meta(INTENT + old))['event']
++        order = db.get_meta(ORDER_KEY)
++        tip = _compress(db, authority, ref, 'tip')
++        assert await _turn(authority, owner, ref, built, 'astra') == (ASTRA, 'openai-codex', tip), built
++        assert db.get_meta(ORDER_KEY) == order  # no fresh event was minted
++        assert db.get_meta(INTENT + old) is None and db.get_meta(INTENT + tip) is None
++        fences = _routing_ledger(home, tip)[2]
++        assert [f[2].split(':')[2:4] for f in fences] == [[event['store'], f"{event['seq']:020d}"]], fences
++        assert _allocation(home, tip)['selected_model'] == ASTRA
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
+ # ---- managed path: the real admission + reservation ------------------------------------------------
+ 
+ 
+@@ -313,6 +417,36 @@ async def test_managed_follow_after_compression_uses_the_reserved_physical_targe
+         store.close_all_db_handles()
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize('event', ['compaction', 'missing_memo'])
++async def test_managed_unchanged_class_selection_never_rerolls(home, monkeypatch, event):
++    from agent.model_routing_switch_intent import PREFIX as INTENT
++    from tests.gateway.test_model_switch_worker_composed import _noop
++    store, db, authority, owner, ref = _owner(home, monkeypatch, _noop)
++    authority.runner._peek_session_state = lambda key: None
++    authority.runner.session_authority = authority
++    try:
++        db.set_session_title(ref.session_id, 'Bot Chat')
++        await _open(authority, ref)
++        _managed_turn(authority, db, ref, monkeypatch, 'opus')
++        _class_default(home)
++        _managed_turn(authority, db, ref, monkeypatch, 'c1')
++        before, _ = _managed_turn(authority, db, ref, monkeypatch, 'c2')
++        ledger = _routing_ledger(home, authority.physical_target(ref))
++        if event == 'compaction':
++            _compress(db, authority, ref, 'tip')
++        else:
++            _forget_selection(db, ref)
++        after, scope = _managed_turn(authority, db, ref, monkeypatch, 'c3')
++        assert scope['session_id'] == authority.physical_target(ref)
++        assert (after.model, after.provider) == (before.model, before.provider)
++        assert _routing_ledger(home, scope['session_id']) == ledger
++        assert db.get_meta(INTENT + scope['session_id']) is None
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
+ # ---- owner stale controls -------------------------------------------------------------------------
+ 
+ 
+-- 
+2.55.0
+

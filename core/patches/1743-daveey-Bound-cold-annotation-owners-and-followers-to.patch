@@ -1,0 +1,245 @@
+From a4be890fafb3a546034b6c9368c5c61909fdf50d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:45:55 +0000
+Subject: [PATCH] [daveey] Bound cold annotation owners and followers to one
+ refresh budget (#699)
+
+---
+ hermes_cli/kanban_annotation_refresh.py       |  2 +-
+ hermes_cli/kanban_session_activity.py         | 35 ++++++------
+ .../test_kanban_annotation_cold_bounded.py    | 56 +++++++++++++++++++
+ .../test_kanban_annotation_refresh_bounded.py | 10 +++-
+ ...test_kanban_annotation_unchanged_inputs.py |  6 +-
+ .../test_kanban_session_activity.py           | 15 ++++-
+ 6 files changed, 99 insertions(+), 25 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_cold_bounded.py
+
+diff --git a/hermes_cli/kanban_annotation_refresh.py b/hermes_cli/kanban_annotation_refresh.py
+index 4c8d6468205..4929531a26b 100644
+--- a/hermes_cli/kanban_annotation_refresh.py
++++ b/hermes_cli/kanban_annotation_refresh.py
+@@ -42,7 +42,7 @@ def _real_thread_class() -> type:
+     return next(c for c in type(threading.main_thread()).__mro__ if c.__name__ == "Thread")
+ 
+ 
+-def refresh_bounded(refresh: Callable[[], tuple], lock: Any, previous: tuple, wait_s: float) -> tuple:
++def refresh_bounded(refresh: Callable[[], tuple], lock: Any, previous: tuple | None, wait_s: float) -> tuple | None:
+     """Run ``refresh`` on a helper thread that owns the already-held ``lock`` and releases it. Return its result
+     (or raise its error) when it finishes within ``wait_s``; otherwise return ``previous``."""
+     done = threading.Event()
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 38dcefe439d..337a4a44f90 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1792,21 +1792,22 @@ def _refresh_annotation_locked(scope: tuple[str, ...], read_at: float | None = N
+     return parts
+ 
+ 
+-def _annotation_snapshot() -> tuple:
++def _annotation_snapshot() -> tuple | None:
+     """One in-flight annotation read, shared by overlapping polls.
+ 
+     Returns the last good parts when a refresh is already running, so those polls
+     do not occupy an AnyIO worker for the whole waiting-source and attention pass.
+-    A cold start (nothing served yet) waits for that pass. Raises the read's own
+-    error when it fails; the caller stamps ``kanban_unknown``.
++    A cold start waits only its refresh budget, then returns None (unknown).
++    Completed failures raise their own error; neither case invents counts.
+ 
+     [daveey] One server process serves several profiles and the result is per scope.
+     A cold poll that waited behind another scope's read, or behind a read that failed,
+     used to get None and mark every row unknown (kanban-d0ba67426d). It now reads its
+-    own scope while it holds the lock; same-scope overlapping polls still share one read.
++    own scope within the remaining budget; overlapping same-scope polls share one read.
+     """
+     global _annotate_waiters
+     scope = _origin_scope()
++    deadline = time.monotonic() + _REFRESH_WAIT_S
+     if not _annotate_refresh_lock.acquire(blocking=False):
+         _annotate_waiters += 1
+         try:
+@@ -1814,25 +1815,23 @@ def _annotation_snapshot() -> tuple:
+             stale = stale or _annotation_copy.seed(scope, _last_annotation, _identity.freeze_annotation)
+             if stale is not None:
+                 return stale
+-            _annotate_refresh_lock.acquire()
++            if not _annotate_refresh_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
++                return None
+         finally:
+             _annotate_waiters -= 1
+-        try:
+-            if _annotate_flight_scope == scope and _annotate_flight_result is not None:
+-                return _annotate_flight_result
+-            cached = _last_annotation.get(scope)
+-            if cached is not None:
+-                return cached
+-            # No usable result for this scope: another profile's flight, or a failed one.
+-            return _refresh_annotation_locked(scope)
+-        finally:
++        cached = (_annotate_flight_result if _annotate_flight_scope == scope
++                  else None)
++        cached = cached if cached is not None else _last_annotation.get(scope)
++        if cached is not None:
+             _annotate_refresh_lock.release()
++            return cached
++        # No usable result: transfer lock ownership to a bounded read of this scope.
++        return _bounded.refresh_bounded(lambda: _refresh_annotation_locked(scope), _annotate_refresh_lock,
++                                        None, max(0.0, deadline - time.monotonic()))
+     previous = _last_annotation.get(scope)
+     if previous is None:
+-        try:
+-            return _refresh_annotation_locked(scope)
+-        finally:
+-            _annotate_refresh_lock.release()
++        return _bounded.refresh_bounded(lambda: _refresh_annotation_locked(scope), _annotate_refresh_lock,
++                                        None, max(0.0, deadline - time.monotonic()))
+     try:
+         parts = _revalidate.refresh_if_unchanged(scope, _refresh_annotation_locked)
+     except BaseException:
+diff --git a/tests/hermes_cli/test_kanban_annotation_cold_bounded.py b/tests/hermes_cli/test_kanban_annotation_cold_bounded.py
+new file mode 100644
+index 00000000000..2b948c39d7c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_cold_bounded.py
+@@ -0,0 +1,56 @@
++"""Cold annotation work must not strand otherwise readable sessions."""
++from concurrent.futures import ThreadPoolExecutor
++from contextvars import ContextVar
++import threading
++
++from hermes_cli import kanban_session_activity as activity
++import pytest
++
++
++@pytest.mark.parametrize("foreign", [False, True])
++def test_cold_polls_finish_while_refresh_is_descheduled(monkeypatch, foreign):
++    activity._reset_cache_for_tests()
++    scope = ContextVar("test_annotation_scope", default="owner")
++    monkeypatch.setattr(activity, "_origin_scope", lambda: (scope.get(),))
++    monkeypatch.setattr(activity._annotation_copy, "seed", lambda *args: None)
++    monkeypatch.setattr(activity._annotation_copy, "published", lambda *args: None)
++    entered, release = threading.Event(), threading.Event()
++    calls = []
++
++    def read():
++        calls.append(1)
++        entered.set()
++        assert release.wait(10), "test did not release cold refresh"
++        return activity._identity.freeze_annotation(({"target": 3}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}))
++
++    monkeypatch.setattr(activity, "_read_annotation_parts", read)
++
++    def poll(name):
++        scope.set(name)
++        return activity.annotate_kanban_activity([{"id": "target"}])[0]
++
++    try:
++        with ThreadPoolExecutor(max_workers=5) as pool:
++            owner = pool.submit(poll, "owner")
++            try:
++                assert entered.wait(5)
++                followers = [pool.submit(poll, "foreign" if foreign else "owner") for _ in range(4)]
++                for future in [owner, *followers]:
++                    row = future.result(timeout=4)
++                    assert row["id"] == "target"
++                    assert row["kanban_unknown"] is True
++                    assert "kanban_active" not in row
++                assert calls == [1]
++            finally:
++                release.set()
++        assert activity._annotate_refresh_lock.acquire(timeout=5)
++        activity._annotate_refresh_lock.release()
++        assert activity._last_annotation[("owner",)][0] == {"target": 3}
++        # Recovery publishes actual counts, not the temporary unknown response.
++        assert poll("owner")["kanban_active"] == 3
++        assert poll("foreign")["kanban_active"] == 3
++    finally:
++        release.set()
++        assert activity._annotate_refresh_lock.acquire(timeout=5)
++        activity._annotate_refresh_lock.release()
++        activity._reset_cache_for_tests()
+diff --git a/tests/hermes_cli/test_kanban_annotation_refresh_bounded.py b/tests/hermes_cli/test_kanban_annotation_refresh_bounded.py
+index 6bd348c27c6..db932ab5eb4 100644
+--- a/tests/hermes_cli/test_kanban_annotation_refresh_bounded.py
++++ b/tests/hermes_cli/test_kanban_annotation_refresh_bounded.py
+@@ -125,11 +125,15 @@ def test_slow_refresh_error_keeps_previous_and_releases_lock(scoped, caplog):
+     assert ksa._annotation_snapshot()[0] == {"s1": 4}
+ 
+ 
+-def test_cold_scope_still_reads_inline(scoped):
++def test_fast_cold_scope_returns_counts_with_caller_context(scoped):
++    from contextvars import ContextVar
++
++    scope = ContextVar("cold_scope", default="wrong")
++    scope.set("caller")
+     reads = []
+-    scoped.setattr(ksa, "_read_annotation_parts", lambda: reads.append(threading.current_thread().name) or _parts(1))
++    scoped.setattr(ksa, "_read_annotation_parts", lambda: reads.append(scope.get()) or _parts(1))
+     assert ksa._annotation_snapshot()[0] == {"s1": 1}
+-    assert reads == [threading.current_thread().name]
++    assert reads == ["caller"]
+ 
+ 
+ def test_refresh_runs_on_a_real_thread_when_thread_is_stubbed(scoped):
+diff --git a/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py b/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
+index 4a0115423d7..6f60bd0bbfb 100644
+--- a/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
++++ b/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
+@@ -77,6 +77,7 @@ def test_unchanged_polls_past_the_ttl_reuse_one_read_without_a_refresh_thread(cl
+     conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1")])
+     try:
+         assert _poll()["kanban_active"] == 1
++        cold_threads = spies["threads"]
+         dates = []
+         for _ in range(4):  # a Desktop poll every 3 s: past _CACHE_TTL_S each time
+             _advance(clock, ksa._CACHE_TTL_S + 0.5)
+@@ -84,7 +85,7 @@ def test_unchanged_polls_past_the_ttl_reuse_one_read_without_a_refresh_thread(cl
+             assert row["kanban_active"] == 1 and "kanban_unknown" not in row
+             dates.append(row["kanban_observed_at"])
+         assert spies["recompute"] == 1
+-        assert spies["threads"] == 0
++        assert spies["threads"] == cold_threads  # no additional warm refresh worker
+         # Each revalidation is a new observation: the Desktop's freshness checks see a current date.
+         assert dates == sorted(dates) and len(set(dates)) == 4
+         assert dates[-1] >= clock["wall"] - ksa._CACHE_TTL_S
+@@ -141,9 +142,10 @@ def test_a_settled_stat_keyed_board_revalidates_until_it_is_written(clock, spies
+         old = int((clock["wall"] - 3600) * 1e9)
+         os.utime(path, ns=(old, old))
+         assert _poll()["kanban_active"] == 1
++        cold_threads = spies["threads"]
+         _advance(clock, ksa._CACHE_TTL_S + 0.5)
+         assert _poll()["kanban_active"] == 1
+-        assert spies == {"recompute": 1, "threads": 0}
++        assert spies == {"recompute": 1, "threads": cold_threads}
+         conn.execute("INSERT INTO tasks VALUES ('t2', 'ready', 's1')")
+         _advance(clock, 0.1)
+         assert _poll()["kanban_active"] == 2
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index c11087d51f5..60ee758eac9 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -991,7 +991,20 @@ def _scoped_reader(monkeypatch, *, slow_scope=None, fail_scopes=()):
+     import threading
+     import time
+ 
+-    local = threading.local()
++    from contextvars import ContextVar
++
++    scope_var = ContextVar("annotation_test_scope", default="A")
++
++    class Scope:
++        @property
++        def scope(self):
++            return scope_var.get()
++
++        @scope.setter
++        def scope(self, value):
++            scope_var.set(value)
++
++    local = Scope()
+     monkeypatch.setattr(ksa, "_origin_scope", lambda: (getattr(local, "scope", "A"),))
+     reads: list[str] = []
+     fails = dict(fail_scopes)
+-- 
+2.55.0
+

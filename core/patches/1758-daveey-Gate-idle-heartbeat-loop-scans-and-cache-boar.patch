@@ -1,0 +1,1773 @@
+From 847887ec3c86ad4e028cc57e79e776954c060d40 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:43:58 +0000
+Subject: [PATCH] [daveey] Gate idle heartbeat/loop scans and cache board row
+ materialization
+
+Fifth idle-CPU cut, core half (kanban t_01a19d7fc2cfe36a, parent t_01a199a0a5d38255).
+
+- gateway/run_idle_gates.py, run_goals.py, hermes_cli/loops.py: heartbeat
+  restore and loop watcher cache only proven-empty metadata keyed on the same
+  reader connection revision (data_version + total_changes); active, corrupt and
+  error results are never cached. Root loop watch gates before listing; quiet
+  parser option avoids per-sweep warnings for corrupt rows while still retrying.
+- plugins/kanban/dashboard/board_rows.py (new), board_read.py (new),
+  plugin_api.py, board_prewarm.py: split SQL row materialization from payload
+  projection; retained board_rows observer registered with kanban_generation
+  (WAL/SHM fencing) so recover/connect is never pinned. Whole-payload TTL
+  unchanged; clock/config/profiles/replica/diagnostics projected each refresh.
+
+Tests: tests/gateway/test_run_idle_gates_empty_proofs.py,
+tests/plugins/test_kanban_board_rows_cache.py (new), board_read_cache updated.
+414 pass (40 files) + 120 pass/8 skip generation/lockguard/recovery; 12/12
+safeguard mutations caught. Native Mac copied-data replay: board refresh
+-69.52% interval CPU, heartbeat+loop -89.16%, per-tick output hashes equal.
+---
+ gateway/run_goals.py                          |   6 +-
+ gateway/run_idle_gates.py                     | 109 +++-
+ hermes_cli/loops.py                           |   7 +-
+ plugins/kanban/dashboard/board_prewarm.py     |   2 +
+ plugins/kanban/dashboard/board_read.py        | 208 +++++++
+ plugins/kanban/dashboard/board_rows.py        | 251 ++++++++
+ plugins/kanban/dashboard/plugin_api.py        | 164 +-----
+ .../test_run_idle_gates_empty_proofs.py       | 236 ++++++++
+ tests/plugins/test_kanban_board_read_cache.py |  11 +-
+ tests/plugins/test_kanban_board_rows_cache.py | 546 ++++++++++++++++++
+ 10 files changed, 1391 insertions(+), 149 deletions(-)
+ create mode 100644 plugins/kanban/dashboard/board_read.py
+ create mode 100644 plugins/kanban/dashboard/board_rows.py
+ create mode 100644 tests/gateway/test_run_idle_gates_empty_proofs.py
+ create mode 100644 tests/plugins/test_kanban_board_rows_cache.py
+
+diff --git a/gateway/run_goals.py b/gateway/run_goals.py
+index 42d38850a99..4a8bf3b4a93 100644
+--- a/gateway/run_goals.py
++++ b/gateway/run_goals.py
+@@ -539,7 +539,7 @@ class GatewayGoalsMixin:
+         profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
+         and each hit is fired against that profile's adapters."""
+         from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
+-        from gateway.run_idle_gates import profile_has_active_loop
++        from gateway.run_idle_gates import current_store_may_have_active_loop, profile_has_active_loop
+         await asyncio.sleep(5)  # let platforms finish connecting
+         warned_no_route: set = set()
+ 
+@@ -557,6 +557,10 @@ class GatewayGoalsMixin:
+             # Warm once per scan: the scan reads every persisted loop and a cold cache would
+             # run the state.db init on the loop thread before the first read.
+             await self._warm_goals_session_db("loop wakeup")
++            # The root scan has no scope-entry gate, but a store proven to hold no active loop at its
++            # current revision has nothing to list (run_idle_gates).
++            if not await self._run_in_executor_with_context(current_store_may_have_active_loop):
++                return
+             # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
+             active_loops = await self._run_in_executor_with_context(list_active_loops)
+             now = time.time()
+diff --git a/gateway/run_idle_gates.py b/gateway/run_idle_gates.py
+index 66ce74cf811..e4b20ebf877 100644
+--- a/gateway/run_idle_gates.py
++++ b/gateway/run_idle_gates.py
+@@ -5,15 +5,31 @@ terminal-policy build; on a multiplex gateway the pollers paid that per profile
+ to do. Each gate answers "does this profile's store hold work?" from the goals-cached SessionDB with
+ ONLY the HERMES_HOME contextvar installed. Every gate fails OPEN: an unavailable store, a failing
+ read or a corrupt row is "cannot prove emptiness", never "idle".
++
++The heartbeat/loop answers are ``state_meta`` prefix scans: ``LIKE ... ESCAPE`` cannot use the key
++index, so each tick walked the whole table and re-parsed every retained ``cleared``/``paused`` row.
++A proven-EMPTY answer is reused while the reader connection's committed revision (``_revision``) is
++unchanged. Only "no active row" is remembered: active work, unparseable rows and read errors are
++re-examined on every tick as before. Activity is status-only (no clock), so an unchanged store cannot
++become active without a commit.
+ """
+ from __future__ import annotations
+ 
+ import logging
++import threading
++from collections import OrderedDict
+ from pathlib import Path
+ from typing import Any, Callable, Optional
+ 
+ logger = logging.getLogger("gateway.run")
+ 
++# (kind, db, conn) -> the revision whose scan proved the store empty. Strong refs (sqlite3.Connection
++# is not weak-referenceable), bounded like the other per-connection revision caches; a closed
++# connection raises on its next PRAGMA and can never match a live one.
++_EMPTY_PROOFS: OrderedDict[tuple, tuple] = OrderedDict()
++_EMPTY_PROOFS_LOCK = threading.Lock()
++_MAX_EMPTY_PROOFS = 64
++
+ 
+ def _profile_session_db_probe(profile_home: Path) -> Optional[Any]:
+     """The goals-cached SessionDB for *profile_home*; None when unavailable."""
+@@ -30,27 +46,108 @@ def _profile_session_db_probe(profile_home: Path) -> Optional[Any]:
+         reset_hermes_home_override(token)
+ 
+ 
+-def _gate(profile_home: Path, store_has_work: Callable[[Any], bool]) -> bool:
++def _revision(conn) -> tuple:
++    # data_version moves on every commit by ANOTHER connection (pooled readers never write);
++    # total_changes covers the writer-connection fallback's own writes.
++    return conn.execute("PRAGMA data_version").fetchone()[0], conn.total_changes
++
++
++class _ConnMeta:
++    """``SessionDB.list_meta_prefix`` on one checked-out connection, so the scan runs between the two
++    revision reads of the connection that vouches for it."""
++
++    def __init__(self, conn) -> None:
++        self._conn = conn
++
++    def list_meta_prefix(self, prefix: str) -> list[tuple[str, str]]:
++        from hermes_state_common import escape_like
++
++        rows = self._conn.execute(
++            "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'", (escape_like(prefix) + "%",))
++        return [(row[0], row[1]) for row in rows]
++
++
++def _store_has_work_cached(db: Any, kind: str, store_has_work: Callable[[Any], bool]) -> bool:
++    """``store_has_work`` over ``state_meta``, skipping the scan while a proven-empty answer's
++    revision still holds. Read errors propagate and are never remembered."""
++    read = getattr(db, "_read_retrying_ioerr", None)
++    if not callable(read):  # not a SessionDB: no revision to key on
++        return store_has_work(db)
++
++    def probe(conn) -> bool:
++        identity = (kind, db, conn)
++        if conn.in_transaction:
++            # Writer fallback inside an open transaction: uncommitted rows (and a rollback, which
++            # total_changes does not undo) must never become a proof.
++            with _EMPTY_PROOFS_LOCK:
++                _EMPTY_PROOFS.pop(identity, None)
++            return store_has_work(_ConnMeta(conn))
++        before = _revision(conn)
++        with _EMPTY_PROOFS_LOCK:
++            if _EMPTY_PROOFS.get(identity) == before:
++                _EMPTY_PROOFS.move_to_end(identity)
++                return False
++            _EMPTY_PROOFS.pop(identity, None)
++        has_work = store_has_work(_ConnMeta(conn))
++        # Keyed by the revision read BEFORE the scan: a commit landing during the scan moves the
++        # revision past ``before``, so a proof the scan may have missed it under can never match.
++        if not has_work:
++            with _EMPTY_PROOFS_LOCK:
++                _EMPTY_PROOFS[identity] = before
++                while len(_EMPTY_PROOFS) > _MAX_EMPTY_PROOFS:
++                    _EMPTY_PROOFS.popitem(last=False)
++        return has_work
++
++    return bool(read(probe))
++
++
++def _gate(profile_home: Path, store_has_work: Callable[[Any], bool], kind: Optional[str] = None) -> bool:
+     db = _profile_session_db_probe(profile_home)
+     if db is None:
+         return True
+     try:
+-        return store_has_work(db)
++        if kind is None:
++            return store_has_work(db)
++        return _store_has_work_cached(db, kind, store_has_work)
+     except Exception:
+         logger.debug("idle probe failed for %s; keeping the full sweep", profile_home, exc_info=True)
+         return True
+ 
+ 
+ def profile_has_active_heartbeat(profile_home: Path) -> bool:
+-    from hermes_cli.heartbeat import store_has_active_heartbeat
++    from hermes_cli import heartbeat
+ 
+-    return _gate(profile_home, store_has_active_heartbeat)
++    return _gate(profile_home, heartbeat.store_has_active_heartbeat, "heartbeat")
+ 
+ 
+ def profile_has_active_loop(profile_home: Path) -> bool:
+-    from hermes_cli.loops import store_has_active_loop
++    from hermes_cli import loops
+ 
+-    return _gate(profile_home, store_has_active_loop)
++    return _gate(profile_home, loops.store_has_active_loop, "loop")
++
++
++def _quiet_store_has_active_loop(db: Any) -> bool:
++    from hermes_cli import loops
++
++    return loops.store_has_active_loop(db, warn=False)
++
++
++def current_store_may_have_active_loop() -> bool:
++    """The loop gate for the store the CURRENT scope resolves (the loop watcher's unscoped root scan).
++    False only when that store is proven to hold no active loop; an unavailable store or failing read
++    is True, leaving ``list_active_loops`` its own ``[]``-on-error handling."""
++    from hermes_cli.goals import _get_session_db
++
++    db = _get_session_db()
++    if db is None:
++        return True
++    try:
++        # Quiet: before this gate the root scan only ran list_active_loops, which skips an unparseable
++        # row silently; a corrupt row is never cached, so a warning here would repeat every tick.
++        return _store_has_work_cached(db, "loop", _quiet_store_has_active_loop)
++    except Exception:
++        logger.debug("idle loop probe failed; keeping the full scan", exc_info=True)
++        return True
+ 
+ 
+ def profile_has_pending_handoff(profile_home: Path) -> bool:
+diff --git a/hermes_cli/loops.py b/hermes_cli/loops.py
+index ab93f87785d..404b7e61588 100644
+--- a/hermes_cli/loops.py
++++ b/hermes_cli/loops.py
+@@ -321,12 +321,13 @@ def list_active_loops() -> list[tuple[str, LoopState]]:
+     return out
+ 
+ 
+-def store_has_active_loop(db: Any) -> bool:
++def store_has_active_loop(db: Any, *, warn: bool = True) -> bool:
+     """True when *db* holds an ACTIVE ``loop:*`` row — or a row that cannot be parsed (unknown, so the
+     caller keeps its full scan). Unlike :func:`list_active_loops` this takes the store explicitly and
+-    propagates read errors, so an idle gate can tell "empty" from "unavailable"."""
++    propagates read errors, so an idle gate can tell "empty" from "unavailable". ``warn=False`` skips
++    the corrupt-row warning (a per-tick gate whose follow-up listing already skips such rows silently)."""
+     for key, raw in db.list_meta_prefix(_META_PREFIX):
+-        state = _parse_state(raw, key[len(_META_PREFIX):]) if raw else None
++        state = _parse_state(raw, key[len(_META_PREFIX):] if warn else "") if raw else None
+         if state is None or state.status == "active":
+             return True
+     return False
+diff --git a/plugins/kanban/dashboard/board_prewarm.py b/plugins/kanban/dashboard/board_prewarm.py
+index 49099c8de7c..3a4a224a83c 100644
+--- a/plugins/kanban/dashboard/board_prewarm.py
++++ b/plugins/kanban/dashboard/board_prewarm.py
+@@ -32,6 +32,7 @@ def _warm_names(api):
+ 
+ def prewarm_boards(api) -> None:
+     """``api`` is the kanban plugin_api module (key and read come from the same code as GET /board)."""
++    from plugins.kanban.dashboard import board_rows
+     from plugins.kanban.dashboard.board_snapshot import file_sig, prewarm
+ 
+     # Desktop's blocked-task loader reads these boards too, not only the selected
+@@ -46,6 +47,7 @@ def prewarm_boards(api) -> None:
+             if key in seen:
+                 continue
+             seen.add(key)
++            board_rows.version(path)  # before file_sig: a first observer open can create the -wal
+             prewarm(lambda r=resolved: api._get_board_uncached(None, False, r, None, None, api._BOARD_DONE_LIMIT),
+                     key, file_sig(path))
+             log.info("kanban board prewarm finished board=%s elapsed_s=%.3f", name, time.monotonic() - started)
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+new file mode 100644
+index 00000000000..d88bb1cf622
+--- /dev/null
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -0,0 +1,208 @@
++"""GET /board read, split for board_rows: ``materialize`` does every SQL read and nothing
++else (retained until the database changes); ``project`` adds what can change without a
++commit (clock, config, profiles on disk, hub replica) and runs on every refresh."""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++from dataclasses import asdict
++from typing import Callable, Optional
++
++from hermes_cli import kanban_db
++from hermes_cli import kanban_diagnostics as kd
++from hermes_cli import kanban_workflow
++from plugins.kanban.dashboard.board_diagnostics import _attach_diagnostics
++
++# Dashboard columns, left-to-right ("archived" is a filter toggle, not a column), from the
++# one workflow definition. A status missing here gets mis-bucketed into ``todo``.
++BOARD_COLUMNS: list[str] = list(kanban_workflow.DEFAULT_WORKFLOW.keys())
++
++_CARD_SUMMARY_PREVIEW_CHARS = 200
++
++
++def _placeholders(ids: list) -> str:
++    return ",".join(["?"] * len(ids))
++
++
++def fresh(value):
++    """New dicts/lists all the way down (scalars shared). Projections hand these out so a
++    caller editing a payload can never edit the retained rows."""
++    if isinstance(value, dict):
++        return {k: fresh(v) for k, v in value.items()}
++    if isinstance(value, list):
++        return [fresh(v) for v in value]
++    return value
++
++
++def diagnostic_inputs(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> Optional[tuple]:
++    """The rows the diagnostics rules read: ``(task rows, events by task, runs by task, graph
++    contexts, wake-check states)`` via aggregate queries; None when there are no tasks. SQL only:
++    the board retains these between commits (board_rows) and re-runs the rules on each refresh."""
++    if task_ids is not None and not task_ids:
++        return None
++    if task_ids is not None:
++        rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
++    else:
++        rows = conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall()
++    if not rows:
++        return None
++    row_ids = [r["id"] for r in rows]
++
++    def _rows_by_task(table: str) -> dict[str, tuple]:
++        by_task: dict[str, list] = {tid: [] for tid in row_ids}
++        for row in conn.execute(
++            f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)}) ORDER BY id", tuple(row_ids)):
++            by_task.setdefault(row["task_id"], []).append(row)
++        return {tid: tuple(v) for tid, v in by_task.items()}  # sqlite3.Row is immutable
++
++    events_by_task = _rows_by_task("task_events")
++    runs_by_task = _rows_by_task("task_runs")
++    graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
++    from hermes_cli import kanban_wake_check as kwc
++    wake_by_task = kwc.load_states(conn, row_ids)
++    return tuple(rows), events_by_task, runs_by_task, graph_by_task, wake_by_task
++
++
++def diagnostics_from_inputs(inputs: Optional[tuple]) -> dict[str, list[dict]]:
++    """Run the rules over ``diagnostic_inputs``. Reads config, the clock and the hub replica
++    now, so a retained input set still yields current diagnostics. Rules get fresh lists and
++    copies of the graph/wake dicts, never the retained objects."""
++    from hermes_cli.config import load_config
++
++    if inputs is None:
++        return {}
++    rows, events_by_task, runs_by_task, graph_by_task, wake_by_task = inputs
++    diag_config = kd.config_from_runtime_config(load_config())
++    out: dict[str, list[dict]] = {}
++    for r in rows:
++        tid = r["id"]
++        diags = kd.compute_task_diagnostics(
++            r, list(events_by_task[tid]), list(runs_by_task[tid]), config=diag_config,
++            graph=fresh(graph_by_task.get(tid)), wake_check=fresh(wake_by_task.get(tid)))
++        if diags:
++            out[tid] = [d.to_dict() for d in diags]
++    return out
++
++
++def managing_sessions(conn: sqlite3.Connection) -> dict[str, str]:
++    """``{task_id: chat session id}`` of each card's most recent ``tui`` notify
++    subscriber — a session asked to shepherd someone else's card subscribes to
++    it, so the latest subscriber is the one managing it now. [daveey]"""
++    try:
++        rows = conn.execute(
++            "SELECT task_id, chat_id FROM kanban_notify_subs "
++            "WHERE platform = 'tui' AND chat_id != '' ORDER BY created_at, rowid").fetchall()
++    except sqlite3.Error:  # board predates notify subscriptions
++        return {}
++    return {str(r[0]): str(r[1]) for r in rows}
++
++
++def preview_list_body(task: dict) -> None:
++    """List cards carry a short body. The drawer loads the full text from /tasks/:id."""
++    body = task.get("body")
++    if isinstance(body, str) and len(body) > _CARD_SUMMARY_PREVIEW_CHARS:
++        task["body"] = body[:_CARD_SUMMARY_PREVIEW_CHARS]
++        task["body_truncated"] = True
++
++
++def materialize(conn, tenant, include_archived, workflow_template_id, current_step_key, done_limit, *,
++                diagnostic_inputs: Callable = diagnostic_inputs) -> dict:
++    """Everything the board payload reads from SQL, and nothing that depends on the clock,
++    config, profiles on disk or the replica. Retained across refreshes: never mutate it."""
++    tasks = kanban_db.list_tasks(
++        conn, tenant=tenant, include_archived=include_archived,
++        workflow_template_id=workflow_template_id, current_step_key=current_step_key)
++    # Link / comment / progress rollups are each one aggregate query rather than N per-task lookups.
++    link_counts: dict[str, dict[str, int]] = {}
++    for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
++        link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})["children"] += 1
++        link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})["parents"] += 1
++    comment_counts: dict[str, int] = {
++        r["task_id"]: r["n"] for r in conn.execute("SELECT task_id, COUNT(*) AS n FROM task_comments GROUP BY task_id")}
++    progress: dict[str, dict[str, int]] = {}  # per parent: children done / total, rendered as "N/M"
++    for row in conn.execute(
++        "SELECT l.parent_id AS pid, t.status AS cstatus FROM task_links l JOIN tasks t ON t.id = l.child_id").fetchall():
++        p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
++        p["total"] += 1
++        p["done"] += row["cstatus"] == "done"
++    # Done cards past ``done_limit`` never reach the payload: trim them before the per-card
++    # work (diagnostics alone were ~1.2 of the 1.5 s cold read on a 1.2k-card board).
++    # Same order as the done column below: completed_at DESC NULLS LAST, id DESC.
++    done_all = sorted(sorted((t for t in tasks if t.status == "done"), key=lambda t: t.id, reverse=True),
++                      key=lambda t: (t.completed_at is None, -(t.completed_at or 0)))
++    done_total = len(done_all)
++    done_cap = int(done_limit or 0)
++    dropped = {t.id for t in done_all[done_cap:]} if 0 < done_cap < done_total else set()
++    tasks = [t for t in tasks if t.id not in dropped]
++    diag_inputs = diagnostic_inputs(conn, task_ids=[t.id for t in tasks if t.status != "archived"])
++    latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
++    # One window-function query for latest summaries (avoids N+1); cards get a
++    # truncated preview, the full text comes from /tasks/:id.
++    summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
++    # One query for the active run's start per card (avoids N+1); the run
++    # clock ticks from this, not the task's first-ever start.
++    run_start_map = kanban_db.current_run_started_ats(conn, [t.id for t in tasks])
++    managers = managing_sessions(conn)
++    cards = []
++    for t in tasks:
++        full = summary_map.get(t.id)
++        cards.append((t, asdict(t), {
++            "latest_summary": full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None,
++            "current_run_started_at": run_start_map.get(t.id),
++            "link_counts": link_counts.get(t.id, {"parents": 0, "children": 0}),
++            "comment_count": comment_counts.get(t.id, 0),
++            "progress": progress.get(t.id),  # None when the task has no children
++            # [daveey] The chat shepherding the card: its latest ``tui`` notify
++            # subscriber, else the session that created it.
++            "managing_session_id": managers.get(t.id) or (t.session_id or None),
++        }))
++    tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
++    return {
++        "cards": tuple(cards), "diag_inputs": diag_inputs, "done_total": done_total,
++        "latest_event_id": int(latest_event_id), "tenants": tuple(tenants),
++        # The SQL half of kanban_db.known_assignees; profiles on disk are added per projection.
++        "task_assignees": frozenset(kanban_db._counts_by_assignee(conn)),
++    }
++
++
++def project(rows: dict, include_archived, diagnostics_from_inputs: Callable = diagnostics_from_inputs) -> dict:
++    """The /board payload from ``materialize`` rows plus what may change without a
++    commit (clock, config, profiles on disk, replica). Builds new containers throughout."""
++    diagnostics_per_task = diagnostics_from_inputs(rows["diag_inputs"])
++    columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
++    if include_archived:
++        columns["archived"] = []
++    for t, fields, extra in rows["cards"]:
++        d = fresh(fields)
++        # Derived age metrics so the UI can colour stale cards without client deltas.
++        try:
++            d["age"] = kanban_db.task_age(t)
++        except Exception:  # health: allow BLE001 -- same fallback as _task_dict: one bad row must not 500 the board
++            d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
++        d.update(fresh(extra))
++        _attach_diagnostics(d, diagnostics_per_task.get(t.id))
++        preview_list_body(d)
++        columns[t.status if t.status in columns else "todo"].append(d)
++
++    # Queue lanes keep the list_tasks dispatch order; the done column is
++    # history, so order it newest-completed-first. Two stable sorts compose
++    # into the "completed_at DESC NULLS LAST, id DESC" SQL key.
++    columns["done"].sort(key=lambda d: d["id"], reverse=True)
++    columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
++
++    # Lane-by-profile sub-grouping: the same names as kanban_db.known_assignees (and the
++    # /assignees picker): profiles holding non-archived tasks plus profiles configured on
++    # disk, so a freshly-added profile shows up as a (possibly empty) lane immediately.
++    assignees = sorted(set(kanban_db.list_profiles_on_disk()) | rows["task_assignees"])
++    done_total = rows["done_total"]
++    columns_out = []
++    for name, tasks in columns.items():
++        col = {"name": name, "tasks": tasks}
++        if name == "done":
++            col["total"] = done_total
++            col["omitted"] = done_total - len(tasks)
++        columns_out.append(col)
++    return {
++        "columns": columns_out, "tenants": list(rows["tenants"]),
++        "assignees": assignees, "latest_event_id": rows["latest_event_id"], "now": int(time.time())}
+diff --git a/plugins/kanban/dashboard/board_rows.py b/plugins/kanban/dashboard/board_rows.py
+new file mode 100644
+index 00000000000..9880dc87844
+--- /dev/null
++++ b/plugins/kanban/dashboard/board_rows.py
+@@ -0,0 +1,251 @@
++"""Retained SQL rows for GET /board.
++
++``board_snapshot`` re-reads an unchanged board every ``CACHE_TTL_S`` so clock-driven
++diagnostics, card ages, config, profiles on disk and the hub replica stay current. Most of
++that read is SQL row materialization (list_tasks/from_row, events, runs), which only
++changes when the database does. This module keeps the materialized rows and re-runs only
++the projection on each refresh.
++
++Key: one retained read-only observer connection per board file. ``PRAGMA data_version``
++on a connection changes whenever any *other* connection (this process or another one)
++commits, including bookkeeping-only writes (heartbeats, claim renewals, wake-check
++state). The observer never writes, so every commit moves it. The version is read before
++the rows, so a commit that lands during the read is read again next time. A new observer
++(first use, file replaced, error, idle expiry, eviction) gets a new generation, so a fresh
++connection's counter can never match rows read under an older one. File identity
++(dev, ino) and ``PRAGMA schema_version`` are in the key too.
++
++Writes that bypass SQLite (overwriting the file bytes in place) are not covered; neither
++were they by the stat signature (kanban_db_connect handles a replaced file on connect).
++
++WAL generations: an observer is a guarded, registered board handle (``kanban_generation.open_ro``
++via ``kanban_lockguard.connect``), and ``evict`` is a registered reader cache. When an external
++process unlinks the board's ``-wal``/``-shm`` (after a stray close dropped this process's locks),
++an observer would otherwise keep the deleted generation mapped: it reads a frozen
++``data_version`` (stale rows forever on a continuously polled board) and makes core ``recover()``
++refuse every board connect in the process. Two exits close it: each ``version`` compares the
++observer's recorded ``-shm`` identity with the live one and drops it on a change, and core
++``recover()`` evicts it before any other connect. Eviction never waits on a borrowed observer (it
++raises ``DeletedWalGenerationError``; the caller retries), and observers are only closed while
++holding their own lock, so a poll mid-PRAGMA never has its connection closed under it.
++"""
++
++from __future__ import annotations
++
++import itertools
++import logging
++import os
++import sqlite3
++import threading
++import time
++from collections import OrderedDict
++from pathlib import Path
++from typing import Callable, Optional, TypeVar
++
++log = logging.getLogger(__name__)
++
++T = TypeVar("T")
++
++MAX_OBSERVERS = 4  # board files with a retained observer connection
++MAX_ENTRIES = 8  # materialized row sets (board x query params)
++OBSERVER_IDLE_S = 600.0  # an observer unused this long is closed (archived/removed boards)
++
++_lock = threading.Lock()
++_generation = itertools.count(1)
++
++
++class _Observer:
++    __slots__ = ("conn", "gen", "ident", "lock", "path", "pid", "shm", "used")
++
++    def __init__(self, path: str, conn: sqlite3.Connection, ident: tuple, shm: Optional[tuple] = None):
++        self.path = path
++        self.conn = conn
++        self.ident = ident
++        self.shm = shm
++        self.gen = next(_generation)
++        self.pid = os.getpid()
++        self.used = time.monotonic()
++        self.lock = threading.Lock()
++
++    def close(self) -> None:
++        try:
++            self.conn.close()
++        except sqlite3.Error as exc:
++            log.debug("closing board rows observer for %s: %s", self.path, exc)
++
++
++_observers: OrderedDict[str, _Observer] = OrderedDict()
++_entries: OrderedDict[tuple, tuple] = OrderedDict()  # key -> (version, materialized)
++
++
++def _ident(path: str) -> tuple:
++    st = os.stat(path)
++    return (st.st_dev, st.st_ino)
++
++
++def _shm_identity(path: str) -> Optional[tuple]:
++    from hermes_cli.kanban_lockguard import shm_identity
++
++    return shm_identity(path)
++
++
++def _drop_observer(path: str) -> Optional[_Observer]:
++    """Caller holds ``_lock``. Unpublish the observer and forget rows read under it; the caller
++    closes the returned observer with ``_retire`` AFTER releasing ``_lock``."""
++    obs = _observers.pop(path, None)
++    for key in [k for k in _entries if k[0] == path]:
++        del _entries[key]
++    return obs
++
++
++def _retire(*observers: Optional[_Observer]) -> None:
++    """Close unpublished observers, each under its own lock (never with ``_lock`` held): a borrower
++    finishes its PRAGMAs before its connection is closed."""
++    for obs in observers:
++        if obs is not None:
++            with obs.lock:
++                obs.close()
++
++
++def _open_observer(path: str, ident: tuple) -> _Observer:
++    from hermes_state_guard import ensure_kanban_test_isolation
++    from hermes_cli.kanban_generation import open_ro
++
++    ensure_kanban_test_isolation(Path(path))
++    # Guarded and registered (recover() runs first, remember() records its -shm generation): never
++    # an unregistered handle that could pin a deleted generation where recover() cannot retire it.
++    conn = open_ro(Path(path), check_same_thread=False)
++    try:
++        if _ident(path) != ident:  # replaced between stat and open
++            raise sqlite3.OperationalError("board file replaced while opening observer")
++        shm = getattr(conn, "_hermes_generation_shm", None) or _shm_identity(path)
++    except BaseException:
++        conn.close()
++        raise
++    return _Observer(path, conn, ident, shm)
++
++
++def evict(path: str) -> None:
++    """``kanban_generation`` reader-cache hook: close every observer of ``path`` (a realpath) before
++    core reopens the board on a new WAL generation. Never waits (recover() may run with other cache
++    locks held): a borrowed observer raises ``DeletedWalGenerationError`` and the caller retries."""
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++
++    with _lock:
++        for key in [p for p in _observers if os.path.realpath(p) == path]:
++            obs = _observers[key]
++            if not obs.lock.acquire(blocking=False):
++                raise DeletedWalGenerationError(f"kanban DB {path}: board rows observer is borrowed; retry")
++            try:
++                _drop_observer(key)
++                obs.close()
++            finally:
++                obs.lock.release()
++
++
++from hermes_cli.kanban_generation import register_reader_cache as _register_reader_cache
++
++_register_reader_cache(evict)
++
++
++def _sweep(now: float) -> list:
++    """Caller holds ``_lock``; returns the observers to ``_retire`` after releasing it."""
++    out = [_drop_observer(p) for p in
++           [p for p, o in _observers.items() if now - o.used > OBSERVER_IDLE_S or o.pid != os.getpid()]]
++    while len(_observers) > MAX_OBSERVERS:
++        out.append(_drop_observer(next(iter(_observers))))
++    return out
++
++
++def version(path: str) -> Optional[tuple]:
++    """``(generation, dev, ino, schema_version, data_version)`` of ``path``; None when it
++    cannot be observed (missing file, open/read error): the caller reads uncached."""
++    path = str(path)
++    now = time.monotonic()
++    try:
++        ident = _ident(path)
++    except OSError:
++        with _lock:
++            gone = _drop_observer(path)
++        _retire(gone)
++        return None
++    shm = _shm_identity(path)
++    with _lock:
++        retired = _sweep(now)
++        obs = _observers.get(path)
++        if obs is not None and (obs.ident != ident or obs.shm != shm):
++            # Replaced file, or its WAL generation is gone/new: this handle may map a deleted -shm and
++            # read a frozen data_version. Drop it; reopening goes through recover().
++            retired.append(_drop_observer(path))
++            obs = None
++    _retire(*retired)
++    if obs is None:
++        try:
++            fresh = _open_observer(path, ident)
++        except Exception as exc:  # health: allow BLE001 -- unobservable board reads uncached
++            log.debug("board rows observer unavailable for %s: %s", path, exc)
++            return None
++        with _lock:
++            obs = _observers.get(path)
++            if obs is None or obs.ident != ident or obs.shm != fresh.shm:
++                retired = [_drop_observer(path)]
++                obs = _observers[path] = fresh
++                fresh = None
++            else:
++                retired = []  # another thread opened a current one first
++            retired += _sweep(now)
++        _retire(fresh, *retired)
++    try:
++        with obs.lock:
++            schema = obs.conn.execute("PRAGMA schema_version").fetchone()[0]
++            data = obs.conn.execute("PRAGMA data_version").fetchone()[0]
++            if obs.conn.in_transaction:  # never expected; a held read snapshot would pin the WAL
++                obs.conn.rollback()
++                raise sqlite3.OperationalError("observer left a transaction open")
++    except Exception as exc:  # health: allow BLE001 -- drop it; the next call opens a new generation
++        log.debug("board rows observer failed for %s: %s", path, exc)
++        with _lock:
++            gone = _drop_observer(path) if _observers.get(path) is obs else None
++        _retire(gone)
++        return None
++    with _lock:
++        obs.used = now
++        if _observers.get(path) is obs:
++            _observers.move_to_end(path)
++    return (obs.gen, ident[0], ident[1], int(schema), int(data))
++
++
++def materialized(key: tuple, path: str, build: Callable[[], T]) -> T:
++    """Rows for ``key`` (``key[0]`` must be ``path``), rebuilt when the version moved.
++    The version is read before ``build``. A failing build stores nothing, so the next call
++    retries; unobservable boards are always built."""
++    ver = version(path)
++    if ver is None:
++        return build()
++    with _lock:
++        hit = _entries.get(key)
++        if hit is not None and hit[0] == ver:
++            _entries.move_to_end(key)
++            return hit[1]
++    rows = build()
++    with _lock:
++        obs = _observers.get(str(path))
++        if obs is not None and obs.gen == ver[0]:  # the observer this version came from is still current
++            _entries[key] = (ver, rows)
++            _entries.move_to_end(key)
++            while len(_entries) > MAX_ENTRIES:
++                _entries.popitem(last=False)
++    return rows
++
++
++def clear() -> None:
++    """Close every observer and drop all rows (tests, shutdown)."""
++    with _lock:
++        retired = [_drop_observer(path) for path in list(_observers)]
++        _entries.clear()
++    _retire(*retired)
++
++
++def stats() -> dict:
++    with _lock:
++        return {"observers": len(_observers), "entries": len(_entries)}
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index a20091157f3..482fdcebab0 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -40,6 +40,9 @@ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_workspace as kbw
+ from hermes_cli import kanban_diagnostics as kd
+ from plugins.kanban.dashboard.board_diagnostics import _attach_diagnostics, _warnings_summary_from_diagnostics
++from plugins.kanban.dashboard import board_read
++from plugins.kanban.dashboard.board_read import (  # BOARD_COLUMNS: the documented column list
++    BOARD_COLUMNS, diagnostic_inputs as _diagnostic_inputs, diagnostics_from_inputs as _diagnostics_from_inputs)
+ from plugins.kanban.dashboard.plugin_api_human_request import ask_filing_refusal, classify_request
+ from hermes_cli.kanban_db_attachment_names import _collision_free_path, _safe_attachment_name
+ 
+@@ -177,11 +180,8 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
+ 
+ # --- Serialization helpers --------------------------------------------------
+ 
+-# Dashboard columns, left-to-right ("archived" is a filter toggle, not a column), from the
+-# one workflow definition. A status missing here gets mis-bucketed into ``todo``.
+-BOARD_COLUMNS: list[str] = list(kanban_workflow.DEFAULT_WORKFLOW.keys())
++# Board columns, card preview length, row materialization and projection: board_read.
+ 
+-_CARD_SUMMARY_PREVIEW_CHARS = 200
+ # Newest done cards on the board poll. A busy board's done column is history
+ # (thousands of cards, multi-MB bodies). Shipping all of it encodes megabytes
+ # on the request and cannot cross an SSH tunnel inside the Desktop's 6s
+@@ -219,40 +219,7 @@ def _placeholders(ids: list) -> str:
+ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
+     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
+     queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
+-    from hermes_cli.config import load_config
+-
+-    if task_ids is not None and not task_ids:
+-        return {}
+-    diag_config = kd.config_from_runtime_config(load_config())
+-    if task_ids is not None:
+-        rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
+-    else:
+-        rows = conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall()
+-    if not rows:
+-        return {}
+-    row_ids = [r["id"] for r in rows]
+-
+-    def _rows_by_task(table: str) -> dict[str, list]:
+-        by_task: dict[str, list] = {tid: [] for tid in row_ids}
+-        for row in conn.execute(
+-            f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)}) ORDER BY id", tuple(row_ids)):
+-            by_task.setdefault(row["task_id"], []).append(row)
+-        return by_task
+-
+-    events_by_task = _rows_by_task("task_events")
+-    runs_by_task = _rows_by_task("task_runs")
+-    graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
+-    from hermes_cli import kanban_wake_check as kwc
+-    wake_by_task = kwc.load_states(conn, row_ids)
+-    out: dict[str, list[dict]] = {}
+-    for r in rows:
+-        tid = r["id"]
+-        diags = kd.compute_task_diagnostics(
+-            r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid),
+-            wake_check=wake_by_task.get(tid))
+-        if diags:
+-            out[tid] = [d.to_dict() for d in diags]
+-    return out
++    return _diagnostics_from_inputs(_diagnostic_inputs(conn, task_ids))
+ 
+ 
+ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
+@@ -276,19 +243,6 @@ def _link_tasks(conn: sqlite3.Connection, links: dict[str, list[str]]) -> list[d
+ 
+ # --- GET /board -------------------------------------------------------------
+ 
+-def _managing_sessions(conn: sqlite3.Connection) -> dict[str, str]:
+-    """``{task_id: chat session id}`` of each card's most recent ``tui`` notify
+-    subscriber — a session asked to shepherd someone else's card subscribes to
+-    it, so the latest subscriber is the one managing it now. [daveey]"""
+-    try:
+-        rows = conn.execute(
+-            "SELECT task_id, chat_id FROM kanban_notify_subs "
+-            "WHERE platform = 'tui' AND chat_id != '' ORDER BY created_at, rowid").fetchall()
+-    except sqlite3.Error:  # board predates notify subscriptions
+-        return {}
+-    return {str(r[0]): str(r[1]) for r in rows}
+-
+-
+ def get_board(
+     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
+     include_archived: bool = Query(False),
+@@ -303,6 +257,7 @@ def get_board(
+     A signature hit is reused. A miss that already has a snapshot returns it and
+     refreshes off this request so a slow read cannot time out the Desktop poll.
+     """
++    from plugins.kanban.dashboard import board_rows
+     from plugins.kanban.dashboard.board_snapshot import file_sig, serve
+ 
+     resolved = _resolve_board(board)
+@@ -310,6 +265,9 @@ def get_board(
+     try:
+         path = str(kanban_db.kanban_db_path(board=resolved))
+         key = (path, tenant, include_archived, workflow_template_id, current_step_key, int(done_limit))
++        # Open the row observer first: on a board without a -wal it creates one, which
++        # would move the signature taken before this read.
++        board_rows.version(path)
+         sig = file_sig(path)  # before the read: a commit during it is read again next time
+     except Exception:
+         pass
+@@ -321,93 +279,27 @@ def get_board(
+     return serve(key, sig, read, now=time.monotonic())
+ 
+ 
+-def _preview_list_body(task: dict) -> None:
+-    """List cards carry a short body. The drawer loads the full text from /tasks/:id."""
+-    body = task.get("body")
+-    if isinstance(body, str) and len(body) > _CARD_SUMMARY_PREVIEW_CHARS:
+-        task["body"] = body[:_CARD_SUMMARY_PREVIEW_CHARS]
+-        task["body_truncated"] = True
++def _get_board_uncached(tenant, include_archived, board, workflow_template_id, current_step_key, done_limit=_BOARD_DONE_LIMIT):
++    """Board payload: retained SQL rows (re-read only after a commit, see board_rows) projected
++    with the current clock, config, profiles on disk and hub replica."""
++    from plugins.kanban.dashboard import board_rows
+ 
++    board = _resolve_board(board)
++    done_limit = int(done_limit or 0)
+ 
+-def _get_board_uncached(tenant, include_archived, board, workflow_template_id, current_step_key, done_limit=_BOARD_DONE_LIMIT):
+-    with _board_conn(board) as (board, conn):
+-        tasks = kanban_db.list_tasks(
+-            conn, tenant=tenant, include_archived=include_archived,
+-            workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+-        # Link / comment / progress rollups are each one aggregate query rather than N per-task lookups.
+-        link_counts: dict[str, dict[str, int]] = {}
+-        for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
+-            link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})["children"] += 1
+-            link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})["parents"] += 1
+-        comment_counts: dict[str, int] = {
+-            r["task_id"]: r["n"] for r in conn.execute("SELECT task_id, COUNT(*) AS n FROM task_comments GROUP BY task_id")}
+-        progress: dict[str, dict[str, int]] = {}  # per parent: children done / total, rendered as "N/M"
+-        for row in conn.execute(
+-            "SELECT l.parent_id AS pid, t.status AS cstatus FROM task_links l JOIN tasks t ON t.id = l.child_id").fetchall():
+-            p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
+-            p["total"] += 1
+-            p["done"] += row["cstatus"] == "done"
+-        # Done cards past ``done_limit`` never reach the payload: trim them before the per-card
+-        # work (diagnostics alone were ~1.2 of the 1.5 s cold read on a 1.2k-card board).
+-        # Same order as the done column below: completed_at DESC NULLS LAST, id DESC.
+-        done_all = sorted(sorted((t for t in tasks if t.status == "done"), key=lambda t: t.id, reverse=True),
+-                          key=lambda t: (t.completed_at is None, -(t.completed_at or 0)))
+-        done_total = len(done_all)
+-        done_cap = int(done_limit or 0)
+-        dropped = {t.id for t in done_all[done_cap:]} if 0 < done_cap < done_total else set()
+-        tasks = [t for t in tasks if t.id not in dropped]
+-        diagnostics_per_task = _compute_task_diagnostics(
+-            conn, task_ids=[t.id for t in tasks if t.status != "archived"])
+-        latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
+-        columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+-        if include_archived:
+-            columns["archived"] = []
+-        # One window-function query for latest summaries (avoids N+1); cards get a
+-        # truncated preview, the full text comes from /tasks/:id.
+-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+-        # One query for the active run's start per card (avoids N+1); the run
+-        # clock ticks from this, not the task's first-ever start.
+-        run_start_map = kanban_db.current_run_started_ats(conn, [t.id for t in tasks])
+-        managers = _managing_sessions(conn)
+-        for t in tasks:
+-            full = summary_map.get(t.id)
+-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
+-                           current_run_started_at=run_start_map.get(t.id))
+-            d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+-            d["comment_count"] = comment_counts.get(t.id, 0)
+-            d["progress"] = progress.get(t.id)  # None when the task has no children
+-            # [daveey] The chat shepherding the card: its latest ``tui`` notify
+-            # subscriber, else the session that created it.
+-            d["managing_session_id"] = managers.get(t.id) or (t.session_id or None)
+-            _attach_diagnostics(d, diagnostics_per_task.get(t.id))
+-            _preview_list_body(d)
+-            columns[t.status if t.status in columns else "todo"].append(d)
+-
+-        # Queue lanes keep the list_tasks dispatch order; the done column is
+-        # history, so order it newest-completed-first. Two stable sorts compose
+-        # into the "completed_at DESC NULLS LAST, id DESC" SQL key.
+-        columns["done"].sort(key=lambda d: d["id"], reverse=True)
+-        columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
+-
+-        # Queue columns keep list_tasks' dispatch order (priority DESC, created_at ASC).
+-        tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
+-        # List of known assignees for the lane-by-profile sub-grouping.
+-        # Uses kanban_db.known_assignees so the lane set unions profiles
+-        # currently holding non-archived tasks with profiles configured on
+-        # disk — a freshly-added profile shows up as a (possibly empty)
+-        # lane immediately, matching the assignee picker at /assignees
+-        # which already uses this helper.
+-        assignees = [entry["name"] for entry in kanban_db.known_assignees(conn)]
+-        columns_out = []
+-        for name, tasks in columns.items():
+-            col = {"name": name, "tasks": tasks}
+-            if name == "done":
+-                col["total"] = done_total
+-                col["omitted"] = done_total - len(tasks)
+-            columns_out.append(col)
+-        return {
+-            "columns": columns_out, "tenants": tenants,
+-            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
++    def build():
++        with closing(_conn(board=board)) as conn:
++            return board_read.materialize(conn, tenant, include_archived, workflow_template_id, current_step_key,
++                                          done_limit, diagnostic_inputs=_diagnostic_inputs)
++
++    try:
++        path = str(kanban_db.kanban_db_path(board=board))
++    except Exception:  # health: allow BLE001 -- no path to observe: read uncached, as before
++        rows = build()
++    else:
++        rows = board_rows.materialized(
++            (path, tenant, bool(include_archived), workflow_template_id, current_step_key, done_limit), path, build)
++    return board_read.project(rows, include_archived, _diagnostics_from_inputs)
+ 
+ 
+ _read_board = coalesced_read(get_board, admission_key=lambda a: (a.get("board") or "").strip().lower(), max_concurrent=2)  # one read per board, at most 2 boards: hub A/B, a cap of 4 made the default board's cold read time out
+diff --git a/tests/gateway/test_run_idle_gates_empty_proofs.py b/tests/gateway/test_run_idle_gates_empty_proofs.py
+new file mode 100644
+index 00000000000..cdbfeb4ede8
+--- /dev/null
++++ b/tests/gateway/test_run_idle_gates_empty_proofs.py
+@@ -0,0 +1,236 @@
++"""Idle heartbeat/loop gates reuse a proven-EMPTY answer only while the store's committed revision holds.
++
++The gates scan ``state_meta`` by prefix (a full-table LIKE plus a JSON parse of every retained row) on
++every poll tick. These contracts pin the reuse: an unchanged store is scanned once across K checks; any
++commit (this process's writer or another connection) is seen on the very next check; active work,
++unparseable rows and read errors are never remembered, so they are re-examined on every check.
++"""
++import asyncio
++import sqlite3
++
++import pytest
++
++from gateway import run_idle_gates as gates
++from hermes_cli import goals, heartbeat, loops
++from hermes_cli.heartbeat import HeartbeatState
++from hermes_cli.loops import LoopState
++
++K = 6
++
++_KINDS = {
++    # kind: (gate, module holding the scan, scan name, meta prefix, row factory)
++    "heartbeat": (gates.profile_has_active_heartbeat, heartbeat, "store_has_active_heartbeat", "heartbeat:",
++                  lambda status: HeartbeatState(prompt="p", interval_seconds=60, status=status).to_json()),
++    "loop": (gates.profile_has_active_loop, loops, "store_has_active_loop", "loop:",
++             lambda status: LoopState(prompt="p", status=status, interval_seconds=60.0).to_json()),
++}
++
++
++@pytest.fixture
++def work(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "root"))
++    (tmp_path / "root").mkdir()
++    home = tmp_path / "profiles" / "work"
++    home.mkdir(parents=True)
++    goals._DB_CACHE.clear()
++    db = gates._profile_session_db_probe(home)  # the registry-owned handle the gates themselves read
++    assert db is not None
++    getattr(gates, "_EMPTY_PROOFS", {}).clear()
++    yield home, db
++    goals._DB_CACHE.clear()
++    getattr(gates, "_EMPTY_PROOFS", {}).clear()
++    db.close()
++
++
++def _count_scans(monkeypatch, module, name, *, fail=None):
++    real = getattr(module, name)
++    calls = []
++
++    def counted(store):
++        calls.append(1)
++        if fail and fail.pop():
++            raise sqlite3.OperationalError("database is locked")
++        return real(store)
++
++    monkeypatch.setattr(module, name, counted)
++    return calls
++
++
++@pytest.mark.parametrize("kind", sorted(_KINDS))
++def test_unchanged_store_is_scanned_once_across_k_checks(work, monkeypatch, kind):
++    home, db = work
++    gate, module, name, prefix, row = _KINDS[kind]
++    db.set_meta(prefix + "old", row("cleared"))  # retained cleared rows are what every tick re-parsed
++    scans = _count_scans(monkeypatch, module, name)
++
++    assert [gate(home) for _ in range(K)] == [False] * K
++    assert len(scans) == 1, f"unchanged store must be scanned once across {K} checks, got {len(scans)}"
++
++
++@pytest.mark.parametrize("kind", sorted(_KINDS))
++def test_commit_is_seen_on_the_next_check(work, monkeypatch, kind):
++    home, db = work
++    gate, module, name, prefix, row = _KINDS[kind]
++    scans = _count_scans(monkeypatch, module, name)
++    assert gate(home) is False and gate(home) is False
++    assert len(scans) == 1
++
++    # This process's writer connection commits an active row.
++    db.set_meta(prefix + "s1", row("active"))
++    assert gate(home) is True
++    # Active work is never remembered: every check rescans it.
++    assert gate(home) is True
++    assert len(scans) == 3
++
++    db.set_meta(prefix + "s1", row("cleared"))
++    assert gate(home) is False and gate(home) is False
++    assert len(scans) == 4
++
++    # Another connection (another process's writer) commits: seen on the next check too.
++    other = sqlite3.connect(str(home / "state.db"))
++    try:
++        with other:
++            other.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)", (prefix + "s2", row("active")))
++    finally:
++        other.close()
++    assert gate(home) is True
++
++
++@pytest.mark.parametrize("kind", sorted(_KINDS))
++def test_read_errors_and_unparseable_rows_are_rechecked(work, monkeypatch, kind):
++    home, db = work
++    gate, module, name, prefix, _row = _KINDS[kind]
++    scans = _count_scans(monkeypatch, module, name, fail=[False, True])  # pop(): first scan raises
++
++    assert gate(home) is True, "a failing read fails open"
++    assert gate(home) is False, "the failure was not remembered: the next check scans again"
++    assert gate(home) is False
++    assert len(scans) == 2
++
++    db.set_meta(prefix + "bad", "{not json")
++    assert [gate(home) for _ in range(3)] == [True] * 3, "an unparseable row is unknown, never idle"
++    assert len(scans) == 5
++
++
++def test_commit_landing_during_the_proving_scan_is_seen_next_check(work, monkeypatch):
++    home, db = work
++    real = heartbeat.store_has_active_heartbeat
++    landed = []
++
++    def scan_then_commit(store):
++        answer = real(store)
++        if not landed:  # another connection commits after the scan read, before the proof is stored
++            landed.append(1)
++            db.set_meta("heartbeat:late", _KINDS["heartbeat"][4]("active"))
++        return answer
++
++    monkeypatch.setattr(heartbeat, "store_has_active_heartbeat", scan_then_commit)
++    assert gates.profile_has_active_heartbeat(home) is False
++    assert gates.profile_has_active_heartbeat(home) is True
++
++
++def test_writer_fallback_sees_its_own_commits(work, monkeypatch):
++    """With no pooled reader the read runs on the writer connection, whose data_version does not move
++    for its own commits: its write counter must invalidate the proof."""
++    home, db = work
++    monkeypatch.setattr(db, "_checkout_read_conn", lambda: None)
++    assert gates.profile_has_active_heartbeat(home) is False
++    assert gates.profile_has_active_heartbeat(home) is False
++    db.set_meta("heartbeat:s1", _KINDS["heartbeat"][4]("active"))
++    assert gates.profile_has_active_heartbeat(home) is True
++
++
++def test_uncommitted_state_never_becomes_a_proof(work, monkeypatch):
++    home, db = work
++    monkeypatch.setattr(db, "_checkout_read_conn", lambda: None)
++    db.set_meta("heartbeat:s1", _KINDS["heartbeat"][4]("active"))
++    conn = db._conn
++    conn.execute("BEGIN")
++    conn.execute("DELETE FROM state_meta WHERE key = 'heartbeat:s1'")
++    assert gates.profile_has_active_heartbeat(home) is False  # the open transaction's own view
++    conn.execute("ROLLBACK")  # total_changes keeps the rolled-back delete: the revision cannot tell
++    assert gates.profile_has_active_heartbeat(home) is True
++
++
++def test_heartbeat_and_loop_proofs_are_independent(work):
++    home, db = work
++    db.set_meta("loop:s1", _KINDS["loop"][4]("active"))
++    assert gates.profile_has_active_heartbeat(home) is False
++    assert gates.profile_has_active_heartbeat(home) is False
++    assert gates.profile_has_active_loop(home) is True, "a heartbeat proof must not answer the loop gate"
++
++
++@pytest.mark.asyncio
++async def test_root_loop_scan_skips_list_active_loops_while_proven_empty(work, monkeypatch):
++    """The watcher's unscoped root scan (profile_home None) had no gate: it called list_active_loops
++    every tick. It now consults the same proven-empty gate, and still lists every tick while a loop
++    is active."""
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++
++    root_db = await asyncio.to_thread(goals._get_session_db)  # HERMES_HOME=root: the store the unscoped root scan reads
++    root_db.set_meta("loop:old", _KINDS["loop"][4]("cleared"))
++    monkeypatch.setattr("gateway.run._handoff_watch_scopes", lambda _runner: [(None, None)])
++
++    listed = []
++    real_list = loops.list_active_loops
++
++    def counted_list():
++        listed.append(1)
++        return real_list()
++
++    monkeypatch.setattr(loops, "list_active_loops", counted_list)
++    fired = []
++
++    async def _fire_one(self, sid, state, now, warned, profile_name):
++        fired.append(sid)
++
++    monkeypatch.setattr(GatewayRunner, "_loop_wakeup_fire_one", _fire_one)
++
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(platforms={})
++    runner.adapters = {}
++    orig_sleep = asyncio.sleep
++
++    async def _ticks(n):
++        runner._running = True
++        calls = {"n": 0}
++
++        async def _sleep(delay):
++            calls["n"] += 1
++            if calls["n"] > n:  # 5s connect grace, then n scan passes
++                runner._running = False
++            return await orig_sleep(0)
++
++        with pytest.MonkeyPatch.context() as mp:
++            mp.setattr(asyncio, "sleep", _sleep)
++            await asyncio.wait_for(GatewayRunner._loop_wakeup_watcher(runner, interval=0), timeout=10)
++
++    try:
++        await _ticks(K)
++        assert listed == [], f"a proven-empty root store must not be listed every tick, got {len(listed)}"
++
++        root_db.set_meta("loop:live", _KINDS["loop"][4]("active"))
++        await _ticks(3)
++        assert len(listed) == 3, "an active loop keeps the per-tick listing"
++        assert fired == ["live"] * 3
++    finally:
++        root_db.close()
++
++
++def test_root_loop_gate_does_not_warn_on_a_corrupt_row_every_tick(work, caplog):
++    """Before the gate, the root scan's list_active_loops skipped an unparseable loop row silently.
++    The gate must keep failing open on it (never cached) without adding a warning per tick."""
++    import logging
++
++    root_db = goals._get_session_db()  # HERMES_HOME=root
++    assert root_db is not None
++    try:
++        root_db.set_meta("loop:bad", "{not json")
++        with caplog.at_level(logging.DEBUG, logger="hermes_cli.loops"):
++            assert [gates.current_store_may_have_active_loop() for _ in range(3)] == [True] * 3
++            assert loops.list_active_loops() == []  # the unchanged silent root listing
++        warned = [r for r in caplog.records if r.name == "hermes_cli.loops" and r.levelno >= logging.WARNING]
++        assert warned == []
++    finally:
++        root_db.close()
+diff --git a/tests/plugins/test_kanban_board_read_cache.py b/tests/plugins/test_kanban_board_read_cache.py
+index 0c372bbf23d..230c47cb196 100644
+--- a/tests/plugins/test_kanban_board_read_cache.py
++++ b/tests/plugins/test_kanban_board_read_cache.py
+@@ -170,15 +170,20 @@ def test_cold_read_computes_diagnostics_only_for_cards_in_the_payload(board, mon
+         live = kb.create_task(conn, title="live", assignee="w")
+     finally:
+         conn.close()
+-    seen = []
+-    real = mod._compute_task_diagnostics
+-    monkeypatch.setattr(mod, "_compute_task_diagnostics", lambda c, task_ids=None: seen.append(task_ids) or real(c, task_ids))
++    seen, ruled = [], []
++    # The board reads the diagnostics rows (SQL) and runs the rules in separate steps, so
++    # retained rows can be re-ruled on each refresh; both must be limited to payload cards.
++    real = mod._diagnostic_inputs
++    monkeypatch.setattr(mod, "_diagnostic_inputs", lambda c, task_ids=None: seen.append(task_ids) or real(c, task_ids))
++    real_rules = mod.kd.compute_task_diagnostics
++    monkeypatch.setattr(mod.kd, "compute_task_diagnostics", lambda r, *a, **k: ruled.append(r["id"]) or real_rules(r, *a, **k))
+     body = client.get("/api/plugins/kanban/board?done_limit=2").json()
+     done = next(c for c in body["columns"] if c["name"] == "done")
+     assert [t["title"] for t in done["tasks"]] == ["done-5", "done-4"]
+     assert (done["total"], done["omitted"]) == (6, 4)
+     assert len(seen) == 1 and seen[0] is not None
+     assert set(seen[0]) == {live, ids[5], ids[4]}
++    assert sorted(ruled) == sorted([live, ids[5], ids[4]])
+ 
+ 
+ def test_first_read_runs_once_when_prewarm_and_poll_overlap(board, monkeypatch):
+diff --git a/tests/plugins/test_kanban_board_rows_cache.py b/tests/plugins/test_kanban_board_rows_cache.py
+new file mode 100644
+index 00000000000..17562053a77
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_rows_cache.py
+@@ -0,0 +1,546 @@
++"""GET /board keeps its SQL rows while the database is unchanged.
++
++The board snapshot re-reads an unchanged board every CACHE_TTL_S so clock-driven
++diagnostics, ages, config and profiles stay current. Only that projection has to run
++again: the materialized rows (the bulk of the read) are reused until a retained read-only
++observer's ``PRAGMA data_version`` moves, which any commit by another connection does,
++bookkeeping-only writes included.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import os
++import sqlite3
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++def _load_plugin():
++    repo_root = Path(__file__).resolve().parents[2]
++    plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
++    spec = importlib.util.spec_from_file_location("hermes_kanban_plugin_board_rows_test", plugin_file)
++    assert spec is not None and spec.loader is not None
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _clear_rows():
++    try:
++        from plugins.kanban.dashboard import board_rows
++    except ImportError:  # base tree (RED run) has no row cache
++        return
++    board_rows.clear()
++
++
++@pytest.fixture
++def env(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    assert str(kb.kanban_db_path()).startswith(str(tmp_path))
++    _clear_rows()
++    mod = _load_plugin()
++    sql_reads = []
++    real_list = kb.list_tasks
++    monkeypatch.setattr(kb, "list_tasks", lambda *a, **k: sql_reads.append(1) or real_list(*a, **k))
++    yield mod, sql_reads, home
++    _clear_rows()
++
++
++def _read(mod, **kw):
++    args = dict(tenant=None, include_archived=False, board=None, workflow_template_id=None,
++                current_step_key=None, done_limit=mod._BOARD_DONE_LIMIT)
++    args.update(kw)
++    return mod._get_board_uncached(args["tenant"], args["include_archived"], args["board"],
++                                   args["workflow_template_id"], args["current_step_key"], args["done_limit"])
++
++
++def _cards(body):
++    return {t["id"]: t for col in body["columns"] for t in col["tasks"]}
++
++
++def _create(title, **kw):
++    conn = kbc.connect()
++    try:
++        return kb.create_task(conn, title=title, assignee=kw.pop("assignee", "worker"), **kw)
++    finally:
++        conn.close()
++
++
++def _raw(sql, params=()):
++    """A commit from a separate plain connection (no kanban helpers, no events)."""
++    conn = sqlite3.connect(str(kb.kanban_db_path()))
++    try:
++        conn.execute(sql, params)
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def _strip_now(body):
++    return {k: v for k, v in body.items() if k != "now"}
++
++
++def test_unchanged_board_materializes_rows_once(env):
++    mod, sql_reads, _home = env
++    tid = _create("first")
++    bodies = [_read(mod) for _ in range(5)]
++    assert len(sql_reads) == 1
++    assert tid in _cards(bodies[0])
++    assert all(_strip_now(b) == _strip_now(bodies[0]) for b in bodies[1:])
++
++
++def test_local_commit_is_read_on_the_next_refresh(env):
++    mod, sql_reads, _home = env
++    _create("first")
++    _read(mod)
++    _read(mod)
++    second = _create("second")
++    body = _read(mod)
++    assert second in _cards(body)
++    assert len(sql_reads) == 2
++    _read(mod)
++    assert len(sql_reads) == 2
++
++
++def test_external_process_commit_is_read_on_the_next_refresh(env):
++    mod, sql_reads, _home = env
++    tid = _create("before")
++    _read(mod)
++    code = ("import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
++            "c.execute(\"UPDATE tasks SET title='after' WHERE id=?\", (sys.argv[2],)); c.commit(); c.close()")
++    subprocess.run([sys.executable, "-c", code, str(kb.kanban_db_path()), tid], check=True)
++    body = _read(mod)
++    assert _cards(body)[tid]["title"] == "after"
++    assert len(sql_reads) == 2
++
++
++def test_heartbeat_only_write_is_read_on_the_next_refresh(env):
++    """Bookkeeping columns (excluded from the activity revision) are in the payload."""
++    mod, sql_reads, _home = env
++    tid = _create("hb")
++    assert _cards(_read(mod))[tid]["last_heartbeat_at"] is None
++    _raw("UPDATE tasks SET last_heartbeat_at = 1234567 WHERE id = ?", (tid,))
++    assert _cards(_read(mod))[tid]["last_heartbeat_at"] == 1234567
++    assert len(sql_reads) == 2
++
++
++def test_wake_check_only_write_is_read_on_the_next_refresh(env):
++    mod, sql_reads, _home = env
++    tid = _create("parked")
++    _read(mod)
++    _read(mod)
++    assert len(sql_reads) == 1
++    _raw("INSERT INTO task_wake_checks (task_id, cmd, every, next_at, fails, generation) "
++         "VALUES (?, 'true', 60, 1, 0, 'g')", (tid,))
++    _read(mod)
++    assert len(sql_reads) == 2
++
++
++def test_commit_during_the_row_read_is_read_again(env, monkeypatch):
++    """The version is taken before the rows: a commit that lands mid-read moves it."""
++    mod, _sql_reads, _home = env
++    tid = _create("before")
++    real = kb.list_tasks
++    once = {"done": False}
++
++    def racing(*a, **k):
++        out = real(*a, **k)  # rows read; now another writer commits before the read ends
++        if not once["done"]:
++            once["done"] = True
++            _raw("UPDATE tasks SET title = 'during' WHERE id = ?", (tid,))
++        return out
++
++    monkeypatch.setattr(kb, "list_tasks", racing)
++    assert _cards(_read(mod))[tid]["title"] == "before"
++    assert _cards(_read(mod))[tid]["title"] == "during"
++
++
++def test_failed_read_is_retried_and_not_cached(env, monkeypatch):
++    mod, _sql_reads, _home = env
++    tid = _create("first")
++    real = kb.list_tasks
++    calls = {"n": 0}
++
++    def flaky(*a, **k):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            raise sqlite3.OperationalError("database is locked")
++        return real(*a, **k)
++
++    monkeypatch.setattr(kb, "list_tasks", flaky)
++    with pytest.raises(sqlite3.OperationalError):
++        _read(mod)
++    assert tid in _cards(_read(mod))
++    _read(mod)
++    assert calls["n"] == 2
++
++
++def test_unobservable_board_reads_every_time_then_recovers(env, monkeypatch):
++    from plugins.kanban.dashboard import board_rows
++
++    mod, sql_reads, _home = env
++    _create("first")
++    real_open = board_rows._open_observer
++
++    def broken(*a, **k):
++        raise sqlite3.OperationalError("unable to open database file")
++
++    monkeypatch.setattr(board_rows, "_open_observer", broken)
++    _read(mod)
++    _read(mod)
++    assert len(sql_reads) == 2
++    monkeypatch.setattr(board_rows, "_open_observer", real_open)
++    _read(mod)
++    _read(mod)
++    assert len(sql_reads) == 3
++
++
++def test_observer_read_error_drops_rows_and_reopens(env, monkeypatch):
++    """A fresh observer's counter restarts, so rows read under the old one must not match."""
++    from plugins.kanban.dashboard import board_rows
++
++    mod, sql_reads, _home = env
++    _create("first")
++    _read(mod)
++    [obs] = board_rows._observers.values()
++    obs.conn.close()  # the next PRAGMA raises ProgrammingError
++    _read(mod)  # unobservable this call: built uncached
++    _read(mod)  # new generation: built and cached
++    _read(mod)
++    assert len(sql_reads) == 3
++    [fresh] = board_rows._observers.values()
++    assert fresh.gen != obs.gen
++
++
++def test_replaced_board_file_is_read_again(env):
++    mod, sql_reads, _home = env
++    tid = _create("first")
++    _read(mod)
++    path = kb.kanban_db_path()
++    copy = path.with_name("copy.db")
++    src = sqlite3.connect(str(path))
++    dst = sqlite3.connect(str(copy))
++    src.backup(dst)
++    dst.execute("UPDATE tasks SET title = 'replaced' WHERE id = ?", (tid,))
++    dst.commit()
++    src.close()
++    dst.close()
++    for suffix in ("-wal", "-shm"):
++        Path(f"{path}{suffix}").unlink(missing_ok=True)
++    os.replace(copy, path)
++    assert _cards(_read(mod))[tid]["title"] == "replaced"
++    assert len(sql_reads) == 2
++
++
++def test_time_only_diagnostics_and_ages_refresh_without_sql(env, monkeypatch):
++    mod, sql_reads, _home = env
++    tid = _create("stale")
++    t0 = int(time.time())
++    _raw("UPDATE tasks SET status = 'running', claim_lock = ?, claim_expires = ?, started_at = ?, "
++         "worker_pid = NULL, last_heartbeat_at = NULL WHERE id = ?",
++         (kb._host_prefix() + "dead", t0, t0, tid))
++    clock = {"t": float(t0 + 60)}
++    monkeypatch.setattr(time, "time", lambda: clock["t"])
++    first = _cards(_read(mod))[tid]
++    assert not any(d["kind"] == "stale_running" for d in first.get("diagnostics") or [])
++    clock["t"] = float(t0 + 3 * 3600)
++    later = _cards(_read(mod))[tid]
++    assert any(d["kind"] == "stale_running" for d in later.get("diagnostics") or [])
++    assert later["age"]["started_age_seconds"] == 3 * 3600
++    assert first["age"]["started_age_seconds"] == 60
++    assert len(sql_reads) == 1
++
++
++def test_config_and_profiles_on_disk_refresh_without_sql(env, monkeypatch):
++    import hermes_cli.config as cfg
++
++    mod, sql_reads, home = env
++    tid = _create("stale")
++    t0 = int(time.time()) - 2 * 3600
++    _raw("UPDATE tasks SET status = 'running', claim_lock = ?, claim_expires = ?, started_at = ?, "
++         "worker_pid = NULL WHERE id = ?", (kb._host_prefix() + "dead", t0, t0, tid))
++    first = _read(mod)
++    assert any(d["kind"] == "stale_running" for d in _cards(first)[tid].get("diagnostics") or [])
++    assert "newbie" not in first["assignees"]
++    real_load = cfg.load_config
++
++    def load_config(*a, **k):
++        out = dict(real_load(*a, **k))
++        out["kanban"] = {**(out.get("kanban") or {}), "diagnostics": {"stale_running_grace_seconds": 10 * 3600}}
++        return out
++
++    monkeypatch.setattr(cfg, "load_config", load_config)
++    (home / "profiles" / "newbie").mkdir(parents=True)
++    (home / "profiles" / "newbie" / "config.yaml").write_text("{}\n")
++    later = _read(mod)
++    assert "newbie" in later["assignees"]
++    assert not any(d["kind"] == "stale_running" for d in _cards(later)[tid].get("diagnostics") or [])
++    assert len(sql_reads) == 1
++
++
++def test_projection_copies_do_not_leak_into_cached_rows(env):
++    mod, sql_reads, _home = env
++    parent = _create("parent", skills=["a"])
++    _create("child", parents=[parent])
++    body = _read(mod)
++    card = _cards(body)[parent]
++    card["skills"].append("mutated")
++    card["link_counts"]["children"] = 99
++    card["title"] = "mutated"
++    body["assignees"].append("ghost")
++    body["columns"][0]["tasks"].clear()
++    again = _read(mod)
++    fresh = _cards(again)[parent]
++    assert fresh["skills"] == ["a"] and fresh["link_counts"]["children"] == 1 and fresh["title"] == "parent"
++    assert "ghost" not in again["assignees"]
++    assert len(sql_reads) == 1
++
++
++def test_row_cache_and_observers_are_bounded(env):
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    _create("first")
++    boards = [f"b{i}" for i in range(board_rows.MAX_OBSERVERS + 2)]
++    for slug in boards:
++        kb.create_board(slug)
++    _read(mod)
++    first_obs = next(iter(board_rows._observers.values()))
++    for slug in boards:
++        _read(mod, board=slug)
++    for limit in range(1, board_rows.MAX_ENTRIES + 3):
++        _read(mod, done_limit=limit)
++    stats = board_rows.stats()
++    assert stats["observers"] <= board_rows.MAX_OBSERVERS
++    assert stats["entries"] <= board_rows.MAX_ENTRIES
++    with pytest.raises(sqlite3.ProgrammingError):  # the evicted observer was closed
++        first_obs.conn.execute("SELECT 1")
++    board_rows.clear()
++    assert board_rows.stats() == {"observers": 0, "entries": 0}
++
++
++def test_idle_observer_is_closed(env, monkeypatch):
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    kb.create_board("other")
++    _read(mod, board="other")
++    [obs] = board_rows._observers.values()
++    clock = {"t": time.monotonic() + board_rows.OBSERVER_IDLE_S + 1}
++    monkeypatch.setattr(board_rows.time, "monotonic", lambda: clock["t"])
++    _read(mod)  # a different board: the idle one is swept
++    assert obs.path not in board_rows._observers
++    with pytest.raises(sqlite3.ProgrammingError):
++        obs.conn.execute("SELECT 1")
++
++
++def test_observer_never_writes_or_holds_a_snapshot(env):
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    _create("first")
++    _read(mod)
++    [obs] = board_rows._observers.values()
++    assert not obs.conn.in_transaction
++    with pytest.raises(sqlite3.OperationalError):
++        obs.conn.execute("CREATE TABLE nope (x)")
++    # A writer can still checkpoint the whole WAL: the observer holds no read snapshot.
++    conn = sqlite3.connect(str(kb.kanban_db_path()))
++    try:
++        busy, _log, _ckpt = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
++    finally:
++        conn.close()
++    assert busy == 0
++
++
++def test_snapshot_refresh_cadence_reprojects_unchanged_board(env, monkeypatch):
++    """Through GET /board: the TTL refresh re-runs only the projection."""
++    from plugins.kanban.dashboard.board_snapshot import CACHE_TTL_S, join_refresh
++
++    mod, sql_reads, _home = env
++    app = FastAPI()
++    app.include_router(mod.router, prefix="/api/plugins/kanban")
++    client = TestClient(app)
++    tid = _create("first")
++    mono = {"t": 1000.0}
++    monkeypatch.setattr(mod.time, "monotonic", lambda: mono["t"])
++    wall = {"t": float(int(time.time()))}
++    monkeypatch.setattr(time, "time", lambda: wall["t"])
++    one = _cards(client.get("/api/plugins/kanban/board").json())[tid]["age"]["created_age_seconds"]
++    wall["t"] += 600
++    mono["t"] += CACHE_TTL_S + 1
++    client.get("/api/plugins/kanban/board")  # stale snapshot served, refresh scheduled
++    join_refresh()
++    two = _cards(client.get("/api/plugins/kanban/board").json())[tid]["age"]["created_age_seconds"]
++    assert two == one + 600
++    assert len(sql_reads) == 1
++
++
++def test_board_payload_matches_a_cold_read(env):
++    """A projection over retained rows equals a read with no retained rows."""
++    mod, _sql_reads, _home = env
++    parent = _create("parent", skills=["a"])
++    _create("child", parents=[parent])
++    conn = kbc.connect()
++    try:
++        kb.add_comment(conn, parent, "me", "hello")
++    finally:
++        conn.close()
++    _read(mod)
++    warm = _read(mod)
++    _clear_rows()
++    cold = _read(mod)
++    assert _strip_now(warm) == _strip_now(cold)
++
++
++# --- WAL generation safety (kanban_generation) ------------------------------------------------
++# A retained observer must never pin a deleted -wal/-shm generation: core recover() refuses every
++# board connect while any handle in the process still maps one (kanban-759104eb56).
++
++def _lose_sidecars(db, title, tid):
++    """An external process checkpointed and unlinked the board's sidecars (a sibling's last close, after a
++    stray close dropped this process's POSIX locks), then another process committed on a fresh generation."""
++    from contextlib import closing
++
++    with closing(sqlite3.connect(str(db))) as conn:
++        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
++    for suffix in ("-wal", "-shm"):
++        os.unlink(str(db) + suffix)
++    subprocess.run(
++        [sys.executable, "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
++         "c.execute('UPDATE tasks SET title=? WHERE id=?', (sys.argv[2], sys.argv[3])); c.commit(); c.close()",
++         str(db), title, tid],
++        check=True, timeout=30,
++    )
++
++
++@pytest.mark.platforms("linux")
++def test_sidecar_loss_then_core_connect_recovers(env):
++    from contextlib import closing
++
++    from hermes_cli import kanban_lockguard
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    tid = _create("first")
++    _read(mod)
++    db = kb.kanban_db_path()
++    assert board_rows.stats()["observers"] == 1
++    _lose_sidecars(db, "renamed", tid)
++    assert kanban_lockguard.stranded_sidecars(db)
++    with closing(kanban_lockguard.connect(db)) as conn:
++        assert conn.execute("SELECT title FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "renamed"
++    assert not kanban_lockguard.stranded_sidecars(db)
++    assert board_rows.stats()["observers"] == 0  # evicted by recover(), not merely bypassed
++    assert _cards(_read(mod))[tid]["title"] == "renamed"
++    assert board_rows.stats()["observers"] == 1
++
++
++@pytest.mark.platforms("linux")
++def test_continuously_polled_board_reopens_after_sidecar_loss(env):
++    from hermes_cli import kanban_lockguard
++    from plugins.kanban.dashboard import board_rows
++
++    mod, sql_reads, _home = env
++    tid = _create("first")
++    _read(mod)
++    _read(mod)
++    db = kb.kanban_db_path()
++    _lose_sidecars(db, "renamed", tid)
++    # No idle gap and no explicit core connect first: the next poll itself must notice.
++    before = len(sql_reads)
++    assert _cards(_read(mod))[tid]["title"] == "renamed"
++    assert len(sql_reads) == before + 1
++    assert not kanban_lockguard.stranded_sidecars(db)
++    [obs] = board_rows._observers.values()
++    assert obs.shm == kanban_lockguard.shm_identity(db)
++
++
++def test_observer_is_a_registered_guarded_handle(env):
++    from hermes_cli import kanban_generation, kanban_lockguard
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    _create("first")
++    _read(mod)
++    [obs] = board_rows._observers.values()
++    assert isinstance(obs.conn, kanban_lockguard._GuardMixin)
++    assert obs.conn in set(kanban_generation._connections)
++    assert board_rows.evict in kanban_generation._reader_caches
++
++
++@pytest.mark.platforms("linux")
++def test_recovery_refuses_while_observer_is_borrowed_then_succeeds(env):
++    import threading
++    from contextlib import closing
++
++    from hermes_cli import kanban_lockguard
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    tid = _create("first")
++    _read(mod)
++    db = kb.kanban_db_path()
++    [obs] = board_rows._observers.values()
++    _lose_sidecars(db, "renamed", tid)
++    result = {}
++    with obs.lock:  # a poll is mid-PRAGMA on another thread
++        worker = threading.Thread(target=lambda: result.setdefault("r", _try_connect(kanban_lockguard, db)))
++        worker.start()
++        worker.join(10)
++        assert not worker.is_alive(), "recover() must not wait on a borrowed observer (deadlock risk)"
++    assert isinstance(result["r"], DeletedWalGenerationError)
++    obs.conn.execute("SELECT 1")  # never closed under its borrower
++    with closing(kanban_lockguard.connect(db)) as conn:  # the retry succeeds once it is returned
++        assert conn.execute("SELECT title FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "renamed"
++    with pytest.raises(sqlite3.ProgrammingError):
++        obs.conn.execute("SELECT 1")
++
++
++def _try_connect(lockguard, db):
++    try:
++        lockguard.connect(db).close()
++        return "ok"
++    except Exception as exc:  # returned to the asserting thread
++        return exc
++
++
++def test_drop_waits_for_the_borrower_before_closing(env):
++    import threading
++
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    _create("first")
++    _read(mod)
++    [obs] = board_rows._observers.values()
++    obs.lock.acquire()
++    try:
++        dropper = threading.Thread(target=board_rows.clear)
++        dropper.start()
++        dropper.join(0.3)
++        assert dropper.is_alive()  # waits for the borrower ...
++        assert board_rows.stats()["observers"] == 0  # ... after unpublishing it
++        obs.conn.execute("PRAGMA data_version").fetchone()  # still usable by the borrower
++    finally:
++        obs.lock.release()
++    dropper.join(10)
++    assert not dropper.is_alive()
++    with pytest.raises(sqlite3.ProgrammingError):
++        obs.conn.execute("SELECT 1")
+-- 
+2.55.0
+

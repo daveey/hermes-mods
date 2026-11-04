@@ -1,0 +1,248 @@
+From 9da750e43bf90deb91263459785c83be727731b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:53:30 +0000
+Subject: [PATCH] [daveey] Enforce singleton ownership for hermes-mods core
+ mirror passes
+
+---
+ hermes_cli/kanban_overlap.py                  |  28 ++++-
+ .../test_kanban_create_entry_parity.py        |  22 ++++
+ .../test_kanban_create_overlap_singleton.py   | 115 ++++++++++++++++++
+ 3 files changed, 160 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tools/test_kanban_create_overlap_singleton.py
+
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index a51a12c7acb..14b107634e2 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -11,6 +11,10 @@ An open card matches when:
+   the hundreds of cards on ``bb`` or ``hermes`` is chance, not overlap), or
+ - both titles share at least half of the longer title's significant words (3 or more).
+ 
++The hermes-mods core mirror is a singleton job: titles naming ``mirror``, ``hermes-mods``
++and ``core`` match regardless of score or heuristic exemptions below. Exact-key retries
++still return the existing card; an intentional second owner requires a recorded override.
++
+ Naming a board means an explicit reference in the title or body: ``board <slug>``, ``--board <slug>``,
+ ``<slug> board``, ``@task:<slug>@...`` / ``@task:<slug>/...`` or ``<gateway>/<slug>`` for a known gateway
+ (``hub/runners``). A plain-word slug (``hermes``, ``bb``, ``runners``) inside a URL, a filesystem path or a
+@@ -112,9 +116,20 @@ def _names_board(slug: str, title: str, body: str, gateways: Iterable[str] = ())
+     return bool(re.search(rf"(?<![a-z0-9_-]){s}(?![a-z0-9_-])", (title or "").lower()))
+ 
+ 
++def singleton_job(title: str) -> Optional[str]:
++    """Explicit single-writer jobs, not a change to general title similarity. [daveey]"""
++    tokens = set(re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", (title or "").lower()))
++    if {"mirror", "hermes-mods", "core"} <= tokens:
++        return "hermes-mods core mirror"
++    return None
++
++
+ def _reasons(card: dict, new_words: set[str], title: str, body: str, target_board: str,
+              gateways: Iterable[str] = ()) -> tuple[list[str], float]:
+     reasons, score = [], 0.0
++    job = singleton_job(title)
++    if job and job == singleton_job(card.get("title") or ""):
++        reasons.append(f"same singleton job: {job}")
+     theirs = words(card.get("title") or "")
+     shared = new_words & theirs
+     # A board named in passing (a path, a log line) is not enough: the titles must share a word too. A plain-word
+@@ -496,25 +511,28 @@ def _sibling_owner(card_title: str, waiting_id: str) -> bool:
+ def find(*, title: str, body: str, target_board: str, session_id: Optional[str], self_tid: Optional[str],
+          parents: Iterable[str], family: Optional[str] = None) -> list[dict]:
+     """Open cards elsewhere that already cover this work, best match first. Never raises. ``family`` (the new
+-    card's idempotency-key family) skips cards from the same keyed creator: its keys already dedupe them."""
++    card's idempotency-key family) skips cards from the same keyed creator, except singleton jobs."""
+     try:
+         from hermes_cli import kanban_capability_registry as reg
+         self_gw = reg.self_gateway()
+         skip = set(parents) | ({self_tid} if self_tid else set())
+         waiting = capability_owner_waiting_id(title, body)
+         new_words = words(title)
++        job = singleton_job(title)
+         out, seen, mine = [], set(), None
+         cards = [*_local_cards(self_gw), *_replica_cards(self_gw)]
+         gateways = {g for g in (self_gw, *(c["gateway"] for c in cards)) if g}
+         if gateways & {"hub", "hermes-hub"}:
+             gateways |= {"hub", "hermes-hub"}
+         for card in cards:
+-            if (card["id"] in skip or card["id"] == waiting
++            singleton = bool(job and job == singleton_job(card.get("title") or ""))
++            if (card["gateway"], card["id"]) in seen:
++                continue
++            if not singleton and (card["id"] in skip or card["id"] == waiting
+                     or (waiting and _sibling_owner(card.get("title") or "", waiting))
+                     or (session_id and card["session_id"] == session_id)
+                     or (self_tid and card["creator_task_id"] == self_tid)
+-                    or (family and card.get("key_family") == family)
+-                    or (card["gateway"], card["id"]) in seen):
++                    or (family and card.get("key_family") == family)):
+                 continue
+             seen.add((card["gateway"], card["id"]))
+             reasons, score = _reasons(card, new_words, title, body, target_board, gateways)
+@@ -525,7 +543,7 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+             admit = (f"waits on {card['id']}" if waits_on(card["id"], title, body)
+                      else f"recovers {card['id']}" if recovers(card["id"], title, card.get("title") or "")
+                      else _distinct(mine, _identity(card.get("title") or "", card.get("body") or "", gateways)))
+-            if admit:
++            if admit and not singleton:
+                 # Logged so an audit can tell an admitted look-alike from a missed one.
+                 _log.info("kanban create overlap: admitted %r despite %s/%s/%s (%s): %s", title, card["gateway"],
+                           card["board"], card["id"], "; ".join(reasons), admit)
+diff --git a/tests/hermes_cli/test_kanban_create_entry_parity.py b/tests/hermes_cli/test_kanban_create_entry_parity.py
+index 607c2a51864..257731c7052 100644
+--- a/tests/hermes_cli/test_kanban_create_entry_parity.py
++++ b/tests/hermes_cli/test_kanban_create_entry_parity.py
+@@ -412,6 +412,28 @@ def test_rest_create_refuses_a_duplicate_owner(chat):
+     assert _titles() == [_LIVE_TITLE]
+ 
+ 
++@pytest.mark.parametrize("surface", ["tool", "cli", "rest"])
++def test_mirror_singleton_refused_on_every_create_path(chat, monkeypatch, capsys, surface):
++    from tests.tools.test_kanban_create_overlap_singleton import NEW, OPEN_TITLE
++    with kbc.connect_closing() as conn:
++        live = kb.create_task(conn, title=OPEN_TITLE, assignee="default", session_id="other-chat",
++                              idempotency_key="core-mirror:a")
++    payload = {"title": NEW, "assignee": "default", "requires": [], "idempotency_key": "core-mirror:b"}
++    if surface == "tool":
++        from tools.registry import registry
++        out = json.loads(registry.dispatch("kanban_create", payload))
++    elif surface == "cli":
++        assert _cli([NEW, "--assignee", "default", "--json", "--idempotency-key", "core-mirror:b"],
++                    monkeypatch) == 2
++        out = json.loads(capsys.readouterr().out)
++    else:
++        response = _rest(payload)
++        assert response.status_code == 409, response.text
++        out = response.json()["detail"]
++    assert out["code"] == "create_overlap" and [m["id"] for m in out["matches"]] == [live], out
++    assert _titles() == [OPEN_TITLE]
++
++
+ def test_rest_create_override_is_accepted_and_recorded(chat):
+     live = _open_owner()
+     r = _rest({"title": _DUP_TITLE, "assignee": "default", "distinct_from": [live]})
+diff --git a/tests/tools/test_kanban_create_overlap_singleton.py b/tests/tools/test_kanban_create_overlap_singleton.py
+new file mode 100644
+index 00000000000..fbc0c8c34aa
+--- /dev/null
++++ b/tests/tools/test_kanban_create_overlap_singleton.py
+@@ -0,0 +1,115 @@
++"""Core mirror passes have one owner despite per-pass SHAs and ordinals. [daveey]"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_overlap as ko
++from tests.tools import test_kanban_create_overlap as helpers
++
++home = helpers.home
++
++NEW = ("Mirror core backlog into hermes-mods core/ (72+ unpublished fork commits, "
++       "through 98274ef72a9 and anything newer)")
++OPEN_TITLE = ("Mirror core commits 1626+ into hermes-mods core/ "
++              "(79929d70df and everything newer; starts 11-02 09:00 PST)")
++HISTORICAL = (
++    "Mirror core 48913b6339 (checkpoint workspace-vanished WARNING + kanban scratch-removal INFO) "
++    "into hermes-mods core/",
++    "hermes-mods core/ mirror: 17 recent daveey/hermes main commits have no patch",
++)
++
++
++def owner(title=OPEN_TITLE, status="ready", session="other", key="core-mirror:a"):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title=title, assignee="default", session_id=session, idempotency_key=key)
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++        conn.commit()
++    return tid
++
++
++def check(title=NEW, **args):
++    with kbc.connect_closing() as conn:
++        refusal, _ = ko.check(conn, args, courier=False, title=title, session_id="new", self_tid=None, parents=[])
++    return json.loads(refusal) if refusal else None
++
++
++@pytest.mark.parametrize("pair", [(NEW, OPEN_TITLE), HISTORICAL])
++@pytest.mark.parametrize("remote", [False, True])
++def test_exact_mirror_pairs_refused(home, tmp_path, pair, remote):
++    new, old = pair
++    if remote:
++        tid = "t_remote"
++        helpers._fake_replica(tmp_path / "hub-state" / "hub.db", [
++            ("macbook", {"id": tid, "board": "default", "title": old, "status": "scheduled"})])
++    else:
++        tid = owner(old)
++    result = check(new)
++    assert result and result["code"] == "create_overlap"
++    assert [m["id"] for m in result["matches"]] == [tid]
++    assert "singleton" in result["matches"][0]["why"]
++
++
++@pytest.mark.parametrize("session", ["new", "other"])
++def test_mirror_same_family_and_same_chat_still_refused(home, session):
++    tid = owner(session=session)
++    result = check(idempotency_key="core-mirror:b")
++    assert result and [m["id"] for m in result["matches"]] == [tid]
++    assert check(idempotency_key="core-mirror:a") is None  # exact retry, not a second card
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++@pytest.mark.parametrize("remote", [False, True])
++def test_closed_mirror_not_an_owner(home, tmp_path, status, remote):
++    if remote:
++        helpers._fake_replica(tmp_path / "hub-state" / "hub.db", [
++            ("macbook", {"id": "t_closed", "board": "default", "title": OPEN_TITLE, "status": status})])
++    else:
++        owner(status=status)
++    assert check() is None
++
++
++@pytest.mark.parametrize("title", [
++    "hermes-mods main red: test_no_bare_ro_open flags plugins/coach/origin_authority.py:80",
++    "Merge upstream 557254faa2 into fork main",
++    "Mirror core commits into another-repo core/",
++])
++def test_non_mirror_titles_do_not_match_singleton(home, title):
++    owner(title)
++    assert check() is None
++
++
++@pytest.mark.parametrize("exemption", ["parent", "self", "wait", "target"])
++def test_singleton_is_not_a_heuristic_fanout_or_target_match(home, exemption):
++    tid = owner(OPEN_TITLE + (" on mini" if exemption == "target" else ""))
++    matches = ko.find(title=NEW + (" on macbook" if exemption == "target" else ""),
++                      body=f"Wait on {tid}" if exemption == "wait" else "",
++                      target_board="default", session_id="new",
++                      self_tid=tid if exemption == "self" else None,
++                      parents=[tid] if exemption == "parent" else [])
++    assert [m["id"] for m in matches] == [tid]
++
++
++def test_singleton_does_not_change_word_score():
++    reasons, score = ko._reasons({"title": OPEN_TITLE, "board": "default"}, ko.words(NEW), NEW, "", "default")
++    assert reasons == ["same singleton job: hermes-mods core mirror"]
++    assert score == 0.4
++
++
++def test_mirror_override_is_recorded(home):
++    tid = owner()
++    args = {"idempotency_key": "core-mirror:b", "distinct_from": [tid]}
++    assert check(**args)["code"] == "create_overlap"
++    args["distinct_reason"] = "Isolated fixture mirror, not the production append-only series"
++    with kbc.connect_closing() as conn:
++        refusal, after = ko.check(conn, args, courier=False, title=NEW, session_id="new", self_tid=None, parents=[])
++        assert refusal is None
++        new = kb.create_task(conn, title=NEW, assignee="default")
++        after(conn, new)
++        events = [e.payload for e in kb.list_events(conn, new) if e.kind == ko.EVENT]
++    assert len(events) == 1
++    assert events[0]["outcome"] == "override" and events[0]["reason"] == args["distinct_reason"]
++    assert events[0]["matches"][0]["id"] == tid
+-- 
+2.55.0
+

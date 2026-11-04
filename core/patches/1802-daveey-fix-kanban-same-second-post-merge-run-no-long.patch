@@ -1,0 +1,147 @@
+From f56940d772f591ea98328b840b4a5f058c67e648 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 03:13:35 +0000
+Subject: [PATCH] [daveey] fix(kanban): same-second post-merge run no longer
+ pins MERGED acceptance pending
+
+mergedAt has 1 s resolution. A post-merge push run that started in the
+merge's own second and finished after it was read as a pre-merge run still
+in progress at merge and, as latest by start, overrode the earlier pre-merge
+success: the merged card stayed pending forever.
+
+partition_at_merge now treats such a tie run (started == mergedAt, not
+concluded by mergedAt) as post-merge only when an earlier same-key run
+(started < mergedAt) had concluded by mergedAt: that conclusion is what gated
+the merge. Without one the tie stays pending (fail closed). Runs strictly
+before the cutoff that finish after it are unchanged (still pending), as are
+legacy statuses and ties that concluded within the merge second.
+
+Tests: RED first (3 new merge_time cases pending before the fix), plus
+fail-closed controls (no earlier run, earlier run unfinished at merge, earlier
+run also in the tie second). The #710 enumeration test that pinned the old
+pending outcome for this exact edge now asserts the new semantics with a
+fail-closed variant.
+---
+ hermes_cli/kanban_pr_merge_time.py            | 24 ++++++++++++--
+ .../hermes_cli/test_kanban_pr_enumeration.py  | 17 ++++++++--
+ tests/hermes_cli/test_kanban_pr_merge_time.py | 33 +++++++++++++++++++
+ 3 files changed, 68 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_pr_merge_time.py b/hermes_cli/kanban_pr_merge_time.py
+index 038856df124..3955f32b684 100644
+--- a/hermes_cli/kanban_pr_merge_time.py
++++ b/hermes_cli/kanban_pr_merge_time.py
+@@ -30,17 +30,35 @@ def partition_at_merge(checks, merged_at, *, runs):
+     failed run behind a success. Legacy statuses have only their context identity.
+     """
+     cutoff = timestamp(merged_at)
++
++    def start(check):
++        return timestamp(check.get("started_at") if runs else check.get("created_at"))
++
++    def key_of(check):
++        return (check["name"], check["app"]["id"]) if runs else check["context"]
++
++    def concluded_at_merge(check):
++        done = check.get("completed_at")
++        return check.get("status") == "completed" and bool(done) and timestamp(done) <= cutoff
++
++    # mergedAt has 1 s resolution, so a run started in the merge's own second is
++    # unordered against it. If it had not concluded by then while an earlier same-key
++    # run had, that earlier conclusion is what gated the merge: the tie run is later
++    # (post-merge) evidence. With no earlier conclusion it stays pending (fail closed).
++    gated = {key_of(c) for c in checks if start(c) < cutoff and concluded_at_merge(c)} if runs else set()
+     latest = {}
+     post = []
+     for check in checks:
+-        started = timestamp(check.get("started_at") if runs else check.get("created_at"))
+-        if started > cutoff:
++        started = start(check)
++        tie_after_gate = (runs and started == cutoff and not concluded_at_merge(check)
++                          and key_of(check) in gated)
++        if started > cutoff or tie_after_gate:
+             post.append(check)
+             continue
+         # A pre-merge start does not make its later conclusion evidence at merge.
+         if runs and check.get("completed_at") and timestamp(check["completed_at"]) > cutoff:
+             check = {**check, "status": "in_progress", "conclusion": None}
+-        key = (check["name"], check["app"]["id"]) if runs else check["context"]
++        key = key_of(check)
+         order = (started, check["id"])
+         if key not in latest or order > latest[key][0]:
+             latest[key] = (order, check)
+diff --git a/tests/hermes_cli/test_kanban_pr_enumeration.py b/tests/hermes_cli/test_kanban_pr_enumeration.py
+index 25bcaaf03d7..643d5598709 100644
+--- a/tests/hermes_cli/test_kanban_pr_enumeration.py
++++ b/tests/hermes_cli/test_kanban_pr_enumeration.py
+@@ -268,9 +268,20 @@ def test_main_health_requires_proven_landed_head(replay, landed):
+     assert check_requests(replay) == [f"repos/acme/repo/commits/{SHA}/check-runs?per_page=100&filter=all"]
+ 
+ 
+-def test_same_second_red_start_is_ambiguous_not_postmerge(replay):
++@pytest.mark.parametrize("earlier_concluded", [True, False])
++def test_same_second_red_start_follows_earlier_conclusion(replay, earlier_concluded):
++    # The red run starts in the merge's second and finishes after it. The earlier
++    # success concluded before the merge and gated it, so the red run is post-merge
++    # main health; without that earlier conclusion the tie stays pending (fail closed).
+     replay.update(state="MERGED")
+     replay["runs"][0]["started_at"] = "2026-11-02T13:10:04Z"
++    if not earlier_concluded:
++        replay["runs"] = replay["runs"][:1]
+     receipt = collect()
+-    assert not receipt["ok"] and receipt["classification"] == "pending"
+-    assert not receipt["post_merge_checks"]
++    if earlier_concluded:
++        assert receipt["ok"] and receipt["classification"] == "success"
++        assert [c["classification"] for c in receipt["post_merge_checks"]] == ["failure"]
++        assert "main_health" in receipt
++    else:
++        assert not receipt["ok"] and receipt["classification"] == "pending"
++        assert not receipt["post_merge_checks"]
+diff --git a/tests/hermes_cli/test_kanban_pr_merge_time.py b/tests/hermes_cli/test_kanban_pr_merge_time.py
+index 62cdd948772..854d226da67 100644
+--- a/tests/hermes_cli/test_kanban_pr_merge_time.py
++++ b/tests/hermes_cli/test_kanban_pr_merge_time.py
+@@ -103,6 +103,39 @@ def test_failed_premerge_rerun_overrides_earlier_success(evidence):
+     assert not receipt["post_merge_checks"]
+ 
+ 
++@pytest.mark.parametrize("conclusion", ["success", "failure", None])
++def test_same_second_unfinished_run_after_concluded_premerge_is_post_merge(evidence, conclusion):
++    # mergedAt has 1 s resolution: a post-merge push run can start in the merge's second.
++    # It was not concluded at the merge, and an earlier same-key run was: that earlier
++    # conclusion gated the merge, so the tie run is later main health, not pending evidence.
++    tie = {**POST, "started_at": MERGED, "completed_at": "2026-11-02T13:10:20Z",
++           "conclusion": conclusion}
++    if conclusion is None:
++        tie.update(status="in_progress", completed_at=None)
++    evidence["runs"] = [PRE, tie]
++    receipt = collect()
++    assert receipt["ok"] and receipt["classification"] == "success", receipt
++    assert [c["id"] for c in receipt["checks"]] == [PRE["id"]]
++    assert [c["id"] for c in receipt["post_merge_checks"]] == [POST["id"]]
++    assert receipt["post_merge_checks"][0]["conclusion"] == conclusion
++
++
++@pytest.mark.parametrize("earlier", ["none", "unfinished", "same_second"])
++def test_same_second_unfinished_run_stays_pending_without_earlier_conclusion(evidence, earlier):
++    # No earlier conclusion at the merge to have gated it: ambiguous, fail closed.
++    tie = {**POST, "started_at": MERGED, "completed_at": "2026-11-02T13:10:20Z",
++           "conclusion": "success"}
++    runs = [tie]
++    if earlier == "unfinished":
++        runs.append({**PRE, "completed_at": "2026-11-02T13:10:30Z"})
++    elif earlier == "same_second":
++        runs.append({**PRE, "started_at": MERGED, "completed_at": MERGED})
++    evidence["runs"] = runs
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "pending", receipt
++    assert not receipt["post_merge_checks"]
++
++
+ def test_successful_premerge_rerun_overrides_earlier_failure(evidence):
+     evidence["runs"] = [{**PRE, "conclusion": "failure"},
+                         {**POST, "started_at": MERGED, "completed_at": MERGED, "conclusion": "success"}]
+-- 
+2.55.0
+

@@ -1,0 +1,479 @@
+From cdb9d4a76a5c85e43ad53505d0bfe556e4770830 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:24:51 +0000
+Subject: [PATCH] [daveey] Committed model switch replaces the recorded
+ allocation at the next build
+
+model_in_transaction moved sessions.model/provider but left model_config.model_routing and the
+allocation store on the old route, so restore_route resumed the old pin or the next build refused
+with 'Exact pinned route cannot fail over'. The receipt transaction now clears the stale record and
+writes a one-shot state_meta intent (gateway.route_switch.v1.<target>); prepare_agent_route honours
+it only for exactly that session and tuple (replace=True), consuming it by compare-and-delete after
+the allocation commits. Rejected/deferred preparations never write it; preparation's route lookups
+run as temporary (in-memory) resolutions. No intent: an exact pin still cannot move.
+---
+ agent/agent_init.py                           |   3 +-
+ agent/model_routing_agent.py                  |  10 +-
+ agent/model_routing_switch_intent.py          |  57 +++++++
+ gateway/session_mutation_model.py             |  10 +-
+ hermes_cli/runtime_provider.py                |   9 +-
+ hermes_state_mutation_prepared.py             |   6 +
+ tests/agent/test_route_switch_intent.py       | 107 ++++++++++++++
+ .../test_model_mutation_route_intent.py       | 139 ++++++++++++++++++
+ 8 files changed, 333 insertions(+), 8 deletions(-)
+ create mode 100644 agent/model_routing_switch_intent.py
+ create mode 100644 tests/agent/test_route_switch_intent.py
+ create mode 100644 tests/gateway/test_model_mutation_route_intent.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 8422a85a9c7..af8b577c4fe 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2114,7 +2114,8 @@ def init_agent(
+     _install_safe_stdio()
+     from agent.model_routing_agent import prepare_agent_route
+     model, provider, session_id, api_key, base_url, api_mode, credential_pool, fallback_model = prepare_agent_route(
+-        agent, model, provider, session_id, api_key, base_url, api_mode, credential_pool, fallback_model)
++        agent, model, provider, session_id, api_key, base_url, api_mode, credential_pool, fallback_model,
++        session_db=session_db)
+ 
+     _params = locals()
+     for _name in _PASSTHROUGH_PARAMS:
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index 8a6a80824ca..19a95c79013 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -15,7 +15,7 @@ def class_requirements(config):
+ 
+ 
+ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+-                        api_mode, credential_pool, fallback_model):
++                        api_mode, credential_pool, fallback_model, session_db=None):
+     """Resolve only class selectors; concrete user pins retain legacy semantics.
+ 
+     Parent sessions here can be delegated jobs, not compression continuations, so
+@@ -35,11 +35,17 @@ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+     config = managed or load_user_config_effective()
+     requirements = class_requirements(config)
+     session_id = session_id or new_session_id()
++    # A committed explicit switch to exactly this tuple, for exactly this session, replaces the
++    # recorded allocation once; nothing else may move an exact pin.
++    from agent.model_routing_switch_intent import consume, pending
++    intent = pending(session_db, session_id, model, provider)
+     runtime = resolve_runtime_provider(
+         requested=provider or "auto", target_model=model,
+         explicit_api_key=None if managed else api_key, explicit_base_url=None if managed else base_url,
+         routing_session_id=session_id, routing_config=config,
+-        routing_requirements=requirements)
++        routing_requirements=requirements, routing_replace=intent is not None)
++    if intent is not None:
++        consume(session_db, session_id, intent)
+     agent.model_routing = runtime["model_routing"]
+     agent._model_routing_requirements = requirements
+     return (runtime["model"], runtime["provider"], session_id,
+diff --git a/agent/model_routing_switch_intent.py b/agent/model_routing_switch_intent.py
+new file mode 100644
+index 00000000000..5d75706126d
+--- /dev/null
++++ b/agent/model_routing_switch_intent.py
+@@ -0,0 +1,57 @@
++"""A committed explicit model switch, carried to the next agent build as a one-shot allocator replace. [daveey]
++
++The canonical ``model`` mutation (``hermes_state_mutation_prepared.model_in_transaction``) moves the
++session row and its launch policy to the picked tuple, but the durable allocation store
++(``model-routing.sqlite3``) still holds the previous route, possibly as an exact pin. Rebuilding the
++agent on the picked tuple then collided with that pin ("Exact pinned route cannot fail over"), and
++readers that trust the recorded route (``restore_route``) resumed the OLD model.
++
++The receipt transaction therefore writes an intent row in ``state_meta`` beside the row update: it
++exists only if the switch committed (a refused, guarded or deferred preparation never reaches that
++transaction). The next build of exactly that session on exactly that tuple allocates with
++``replace=True`` and then deletes the intent by compare-and-delete. Without a matching intent an
++exact pin still refuses to move, so a stale row or a reader's guess cannot override it. A failed
++allocation (credential prepare raised) rolls back in the allocation store and leaves the intent for
++the next attempt.
++"""
++import json
++
++PREFIX = "gateway.route_switch.v1."
++
++
++def record_in_transaction(conn, session_id, model, provider, generation):
++    """Write the intent inside the caller's receipt transaction (never on its own)."""
++    value = json.dumps({"session_id": session_id, "model": model, "provider": provider or "",
++                        "generation": generation}, sort_keys=True)
++    conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?) "
++                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (PREFIX + session_id, value))
++
++
++def pending(session_db, session_id, model, provider):
++    """The raw intent row when it names exactly this session and tuple, else ``None``."""
++    if session_db is None or not session_id or not model:
++        return None
++    get = getattr(session_db, "get_meta", None)
++    if not callable(get):
++        return None
++    try:
++        raw = get(PREFIX + session_id)
++    except Exception:
++        return None
++    if not raw:
++        return None
++    try:
++        intent = json.loads(raw)
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(intent, dict) or intent.get("session_id") != session_id or intent.get("model") != model:
++        return None
++    wanted = intent.get("provider") or ""
++    if wanted and provider not in (None, "", "auto", wanted):
++        return None  # the build asks for another provider: not this switch
++    return raw
++
++
++def consume(session_db, session_id, raw):
++    """Delete the intent only if it is still the one this build honoured (a newer switch survives)."""
++    session_db._write_sql("DELETE FROM state_meta WHERE key=? AND value=?", (PREFIX + session_id, raw))
+diff --git a/gateway/session_mutation_model.py b/gateway/session_mutation_model.py
+index 8eda0418591..62520731eb6 100644
+--- a/gateway/session_mutation_model.py
++++ b/gateway/session_mutation_model.py
+@@ -29,9 +29,11 @@ def _current_route(authority, live, old):
+     resolves its own target.
+     """
+     from agent.model_routing import ModelRoutingError
++    from agent.model_routing_runtime import temporary_resolution
+     from gateway.session_policy import profile_read_scope
+     from hermes_cli.auth import AuthError
+-    with profile_read_scope(old, authority):
++    # A lookup, not a build: it must not allocate (or advance a counter) in the durable store.
++    with profile_read_scope(old, authority), temporary_resolution():
+         config = old.config(authority)
+         block = config.get('model') or {}
+         try:
+@@ -63,7 +65,11 @@ async def prepare_model(authority, live, payload, prepared):
+         _provider_resolution_config, authority, config, old.ignore_user_config)
+ 
+     def switch(**kwargs):
+-        result = switch_model(**kwargs)
++        # Preparation only resolves the target: the allocation moves when the committed switch's
++        # intent is consumed at the next build (agent.model_routing_switch_intent), never here.
++        from agent.model_routing_runtime import temporary_resolution
++        with temporary_resolution():
++            result = switch_model(**kwargs)
+         return result, _alias_credential(authority, result)
+     result, alias_credential = await asyncio.to_thread(switch, raw_input=payload['model'],
+         current_provider=current.provider, current_model=current.model, current_base_url=current.base_url,
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index e7b20f38eea..96ea491727a 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -1043,7 +1043,8 @@ def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url
+ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
+                              explicit_base_url: Optional[str] = None, target_model: Optional[str] = None,
+                              routing_session_id=None, routing_parent_session_id=None,
+-                             routing_requirements=None, routing_config=None, routing_excluded=()) -> dict[str, Any]:
++                             routing_requirements=None, routing_config=None, routing_excluded=(),
++                             routing_replace=False) -> dict[str, Any]:
+     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
+     rung returns or raises, else falls to the next):
+       1. disabled-provider guard (``providers.<name>.enabled: false``)
+@@ -1072,7 +1073,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
+         if explicit_api_key or overrides_endpoint(requested, explicit_base_url, managed):
+             raise ModelRoutingError("Managed subscription pins cannot override credentials or endpoint")
+         return resolve_managed_runtime(target_model, requested, config=managed,
+-                                       session_id=routing_session_id, requirements=routing_requirements)
++                                       session_id=routing_session_id, requirements=routing_requirements,
++                                       replace=routing_replace)
+     if is_class_selector(target_model):
+         from agent.model_routing_runtime import resolve_class_runtime
+         if explicit_api_key or explicit_base_url:
+@@ -1080,7 +1082,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
+         try:
+             return resolve_class_runtime(target_model, requested or "auto", config=routing_config,
+                                          session_id=routing_session_id, parent_session_id=routing_parent_session_id,
+-                                         requirements=routing_requirements, excluded=routing_excluded)
++                                         requirements=routing_requirements, excluded=routing_excluded,
++                                         replace=routing_replace)
+         except AuthError as exc:
+             raise ModelRoutingError("Class routing credentials unavailable; legacy fallback is prohibited") from exc
+     requested_provider = resolve_requested_provider(requested)
+diff --git a/hermes_state_mutation_prepared.py b/hermes_state_mutation_prepared.py
+index 5638ed213f7..f8e6b47b7d8 100644
+--- a/hermes_state_mutation_prepared.py
++++ b/hermes_state_mutation_prepared.py
+@@ -52,7 +52,13 @@ def model_in_transaction(db, conn, session_id, payload, prepared):
+     row = conn.execute('SELECT model_config FROM sessions WHERE id=?', (target,)).fetchone()
+     model_config = json.loads(row[0] or '{}')
+     model_config['provider'] = config['provider']
++    # The recorded allocation belongs to the route this switch leaves: kept, every reader that trusts
++    # the record over the row (restore_route) resumed the OLD model. The committed intent below is what
++    # lets the next build of this exact session replace the allocation (agent.model_routing_switch_intent).
++    model_config['model_routing'] = None
+     conn.execute('UPDATE sessions SET model=?,model_config=? WHERE id=?', (model, _json(model_config), target))
++    from agent.model_routing_switch_intent import record_in_transaction
++    record_in_transaction(conn, target, model, config['provider'], generation)
+     # This selection is newer than any model pick still waiting for a turn boundary: that pick is superseded.
+     # A level deferred beside it stays unless this selection carries its own, as defer_pick keeps it.
+     key = DEFERRED_PICK_PREFIX + session_id
+diff --git a/tests/agent/test_route_switch_intent.py b/tests/agent/test_route_switch_intent.py
+new file mode 100644
+index 00000000000..2c571146707
+--- /dev/null
++++ b/tests/agent/test_route_switch_intent.py
+@@ -0,0 +1,107 @@
++"""A committed explicit model switch replaces the recorded allocation at the next build, once. [daveey]
++
++Incident: the canonical ``model`` mutation moved ``sessions.model`` to claude-opus while the allocation
++store (and ``model_config.model_routing``) still held an exact pin on gpt-astra, so the next build either
++refused ("Exact pinned route cannot fail over") or a reader restored the OLD pin.
++"""
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from agent.model_routing_state import RoutingState
++from agent.model_routing_switch_intent import PREFIX, record_in_transaction
++from hermes_state import SessionDB
++from run_agent import AIAgent
++from tests.agent import test_managed_switch as switch_fixtures
++
++managed = switch_fixtures.managed
++routing_home = switch_fixtures.routing_home
++streaming_route = switch_fixtures.streaming_route
++destinations = switch_fixtures.destinations
++
++
++def _build(model, session='pin', session_db=None):
++    return AIAgent(model=model, provider='auto', session_id=session, session_db=session_db,
++                   quiet_mode=True, skip_memory=True, skip_context_files=True)
++
++
++@pytest.fixture
++def seams():
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()):
++        yield
++
++
++def _commit_intent(path, session, model, provider='anthropic'):
++    db = SessionDB(path)
++    db._execute_write(lambda conn: record_in_transaction(conn, session, model, provider, 2))
++    db.close()
++
++
++def test_committed_switch_survives_restart_and_replaces_the_exact_pin(destinations, tmp_path, seams):
++    _build('anthropic-deep')
++    state = RoutingState(tmp_path / 'model-routing.sqlite3')
++    assert state.peek('pin', 'deep')['selected_model'] == 'anthropic-deep'
++    _commit_intent(tmp_path / 'state-under-test.db', 'pin', 'z-anthropic-deep')
++    restarted = SessionDB(tmp_path / 'state-under-test.db')  # a fresh owner process reads the receipt
++    try:
++        agent = _build('z-anthropic-deep', session_db=restarted)
++        assert agent.model == 'z-anthropic-deep'
++        recorded = state.peek('pin', 'deep')
++        assert (recorded['selected_model'], recorded['exact_pin'], recorded['reason']) == (
++            'z-anthropic-deep', True, 'explicit-switch')
++        assert restarted.get_meta(PREFIX + 'pin') is None  # one-shot
++        # The new pin is now itself exact: the old model cannot come back without its own switch.
++        with pytest.raises(ModelRoutingError, match='cannot fail over'):
++            _build('anthropic-deep', session_db=restarted)
++    finally:
++        restarted.close()
++
++
++def test_no_intent_cannot_override_an_exact_pin(destinations, tmp_path, seams):
++    _build('anthropic-deep')
++    state = RoutingState(tmp_path / 'model-routing.sqlite3')
++    before = state.peek('pin', 'deep')
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    try:
++        with pytest.raises(ModelRoutingError, match='cannot fail over'):
++            _build('z-anthropic-deep', session_db=db)
++        assert state.peek('pin', 'deep') == before
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize('session,model', [('other', 'z-anthropic-deep'), ('pin', 'anthropic-standard')])
++def test_an_intent_for_another_session_or_tuple_does_not_move_the_pin(destinations, tmp_path, seams, session, model):
++    _build('anthropic-deep')
++    state = RoutingState(tmp_path / 'model-routing.sqlite3')
++    before = state.peek('pin', 'deep')
++    _commit_intent(tmp_path / 'state-under-test.db', session, model)
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    try:
++        with pytest.raises(ModelRoutingError, match='cannot fail over'):
++            _build('z-anthropic-deep', session_db=db)
++        assert state.peek('pin', 'deep') == before
++        assert db.get_meta(PREFIX + session) is not None  # never consumed by a non-matching build
++    finally:
++        db.close()
++
++
++def test_failed_allocation_rolls_back_and_keeps_the_intent(destinations, tmp_path, seams):
++    _build('anthropic-deep')
++    state = RoutingState(tmp_path / 'model-routing.sqlite3')
++    before = state.peek('pin', 'deep')
++    _commit_intent(tmp_path / 'state-under-test.db', 'pin', 'z-anthropic-deep')
++    db = SessionDB(tmp_path / 'state-under-test.db')
++    try:
++        with patch('agent.model_routing_runtime.verify_class_runtime',
++                   side_effect=ModelRoutingError('credential refused')):
++            with pytest.raises(ModelRoutingError, match='credential refused'):
++                _build('z-anthropic-deep', session_db=db)
++        assert state.peek('pin', 'deep') == before
++        assert db.get_meta(PREFIX + 'pin') is not None
++        assert _build('z-anthropic-deep', session_db=db).model == 'z-anthropic-deep'
++        assert db.get_meta(PREFIX + 'pin') is None
++    finally:
++        db.close()
+diff --git a/tests/gateway/test_model_mutation_route_intent.py b/tests/gateway/test_model_mutation_route_intent.py
+new file mode 100644
+index 00000000000..dcf3b8ef6b2
+--- /dev/null
++++ b/tests/gateway/test_model_mutation_route_intent.py
+@@ -0,0 +1,139 @@
++"""The canonical model mutation writes its route-switch intent only when the switch commits. [daveey]
++
++Only a committed receipt may later move an allocation (``agent.model_routing_switch_intent``): a refused
++(optimistic revision conflict) or deferred preparation must leave allocation state and intents alone, and
++preparation's own route lookups must never allocate in the durable store.
++"""
++import asyncio
++import json
++import threading
++
++import pytest
++
++from agent.model_routing_switch_intent import PREFIX
++from tests.gateway.test_session_mutation_model_busy import _mutate, _owner, _running_model
++from tests.waiting import async_wait_until
++
++
++def _intent(db, sid):
++    raw = db.get_meta(PREFIX + sid)
++    return json.loads(raw) if raw else None
++
++
++def _seed_stale_route(db, sid):
++    db.patch_session_model_config(sid, {'model_routing': {
++        'requested_class': 'deep', 'selected_model': 'frozen', 'selected_provider': 'anthropic',
++        'billing_group': 'subscription', 'exact_pin': True}})
++
++
++def _routing(db, sid):
++    config = db.get_session(sid)['model_config']
++    config = json.loads(config) if isinstance(config, str) else (config or {})
++    return config.get('model_routing')
++
++
++async def _noop(event):
++    return 'ok'
++
++
++@pytest.mark.asyncio
++async def test_committed_pick_records_the_intent_and_drops_the_stale_record(tmp_path, monkeypatch):
++    store, db, _authority, owner, ref = _owner(tmp_path, monkeypatch, _noop)
++    try:
++        _seed_stale_route(db, ref.session_id)
++        reply = await _mutate(owner, db, ref, 'pick', 'picked')
++        assert reply['result']['model'] == 'picked', reply
++        row = db.get_session(ref.session_id)
++        assert row['model'] == 'picked'
++        assert _routing(db, ref.session_id) is None  # restore_route no longer resumes the old pin
++        intent = _intent(db, ref.session_id)
++        assert (intent['session_id'], intent['model'], intent['provider']) == (ref.session_id, 'picked', 'custom')
++        assert intent['generation'] == row['runtime_generation']
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++async def test_optimistic_rejection_changes_no_route_state(tmp_path, monkeypatch):
++    store, db, _authority, owner, ref = _owner(tmp_path, monkeypatch, _noop)
++    try:
++        _seed_stale_route(db, ref.session_id)
++        before = _routing(db, ref.session_id)
++        snap = dict(db.get_session(ref.session_id))
++        snap['runtime_revision'] += 7
++        reply = await _mutate(owner, db, ref, 'stale', 'picked', snap)
++        assert reply['error']['data']['reason'] == 'revision_conflict'
++        assert _intent(db, ref.session_id) is None
++        assert _routing(db, ref.session_id) == before
++        assert db.get_session(ref.session_id)['model'] == 'frozen'
++        assert not (tmp_path / 'model-routing.sqlite3').exists()
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++async def test_deferred_pick_writes_its_intent_only_at_the_turn_boundary(tmp_path, monkeypatch):
++    from gateway.session_contract import Submission
++    import hermes_state_runtime as rt
++    started, release = threading.Event(), asyncio.Event()
++    state = {}
++
++    async def handle(event):
++        if event.text == 'RUNNING':
++            started.set()
++            await release.wait()
++        return 'ok'
++    store, db, authority, owner, ref = _owner(tmp_path, monkeypatch, handle)
++    state.update(authority=authority, ref=ref)
++    try:
++        _seed_stale_route(db, ref.session_id)
++        before = _routing(db, ref.session_id)
++        first = await authority.submit(owner.actor, Submission('running', ref, {'text': 'RUNNING'}, 'queue'))
++        await async_wait_until(started.is_set, timeout=10, what='the first turn is running')
++        reply = await _mutate(owner, db, ref, 'pick', 'picked')
++        assert reply['result']['status'] == 'deferred', reply
++        assert _intent(db, ref.session_id) is None
++        assert _routing(db, ref.session_id) == before
++        release.set()
++        await async_wait_until(
++            lambda: rt.get_session_admission(db, admission_id=first.admission_id)['status'] == 'terminal',
++            timeout=10, what='the running turn settled')
++        await async_wait_until(lambda: _running_model(authority, ref) == 'picked',
++                               timeout=10, what='the pick published at the turn boundary')
++        assert _intent(db, ref.session_id)['model'] == 'picked'
++        assert _routing(db, ref.session_id) is None
++    finally:
++        release.set()
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++async def test_preparation_route_lookups_never_allocate(tmp_path, monkeypatch):
++    """The current-route lookup and the target resolution run as temporary (in-memory) resolutions."""
++    from agent.model_routing_runtime import _temporary_resolution
++    from hermes_cli import model_switch
++    seen = []
++    store, db, authority, owner, ref = _owner(tmp_path, monkeypatch, _noop)
++    real_switch = model_switch.switch_model
++
++    def lookup(**kwargs):
++        seen.append(('current', _temporary_resolution.get()))
++        return 'frozen', {}
++
++    def switch(**kwargs):
++        seen.append(('target', _temporary_resolution.get()))
++        return real_switch(**kwargs)
++    authority.runner._resolve_session_agent_runtime = lookup
++    monkeypatch.setattr(model_switch, 'switch_model', switch)
++    try:
++        reply = await _mutate(owner, db, ref, 'pick', 'picked')
++        assert reply['result']['model'] == 'picked', reply
++        assert ('current', True) in seen and ('target', True) in seen
++        assert all(flag for _, flag in seen)
++        assert not (tmp_path / 'model-routing.sqlite3').exists()
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
+-- 
+2.55.0
+

@@ -1,0 +1,286 @@
+From 0f8b8e0a608affe5bcfb665e73ea55b0f2821be5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 02:06:12 +0000
+Subject: [PATCH] fix(kanban): host sync belongs to the root profile gateway;
+ heal released inherited creator links [daveey]
+
+Hub chats 20261016_123957_6212f7 and 20261017_114040_587d59 read unresolved/no_summary though they handed work to
+open cards (t_01a19084a3b36956 todo; decision card t_c21c170e). Their chat links were released=1, so session_tasks
+returned nothing. Five whys:
+- hermes-gateway-askeve-reviewer (named profile, pinned older core, no origin ledger in its HERMES_HOME) won the
+  first-come host .sync.lock and its links reconcile released inherited created links and every root-profile
+  ledger link each pass;
+- the root gateway logged 'another gateway already syncs; not starting' and never retried;
+- reconcile kept an inherited created link's stored released flag, so the root's own reconcile could not heal it.
+
+Fix: a named-profile gateway leaves host sync to a live root-profile gateway (and hands the loop back when one
+starts); a contended lock is retried instead of abandoned; reconcile wants an owned card's inherited created link
+unreleased (a picked-up foreign copy keeps the owner's answer). Tests per path.
+---
+ gateway/kanban_watchers.py                    | 57 ++++++++++++++---
+ gateway/kanban_watchers_common.py             | 24 ++++++++
+ hermes_cli/kanban_chat_links.py               | 11 +++-
+ .../test_kanban_creator_chat_backfill.py      | 41 +++++++++++++
+ tests/hermes_cli/test_kanban_sync_client.py   | 61 +++++++++++++++++--
+ 5 files changed, 179 insertions(+), 15 deletions(-)
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 061e33af8c4..9630126064d 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -38,6 +38,10 @@ from gateway.kanban_watchers_dispatcher import (
+ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+ _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+ _GC_INTERVAL_SECONDS = 3600.0
++# Host Kanban sync ownership (``_kanban_sync_watcher``): a contended lock is retried this often, and a named-profile
++# gateway re-checks for the root profile's gateway this often. [daveey]
++_SYNC_LOCK_RETRY_S = 5.0
++_SYNC_OWNER_RECHECK_S = 30.0
+ _HEALTH_WINDOW = 6
+ 
+ 
+@@ -407,11 +411,48 @@ class GatewayKanbanWatchersMixin:
+             return
+         from hermes_cli import kanban_db as _kb
+         from hermes_cli import kanban_sync_client as _ksc
+-        lock_handle, lock_state = _acquire_singleton_lock(_kb.kanban_home() / "kanban" / ".sync.lock")
+-        if lock_state == "contended":
+-            logger.info("kanban sync: another gateway on this host already syncs; not starting")
+-            return
+-        try:
+-            await asyncio.to_thread(_ksc.run_forever, lambda: self._running)
+-        finally:
+-            _release_singleton_lock(lock_handle)
++        from gateway import kanban_watchers_common as _kwc
++        # [daveey] The sync loop reconciles chat links with THIS process's profile (its origin ledger, its
++        # state.db, its core's rules), so it belongs to the kanban root profile's gateway. A named-profile gateway
++        # sharing the root's boards (hub: hermes-gateway-askeve-reviewer on a pinned core) won the first-come lock
++        # and released every root-profile chat's remote-card and inherited links each pass, while the root gateway
++        # logged "already syncs" and never retried. Now a named profile leaves sync to a live root gateway (and
++        # hands the lock back when one starts), and a contended root keeps retrying instead of giving up.
++        root = _kwc._is_kanban_root_profile()
++        said = None
++        while self._running:
++            if not root and _kwc._root_gateway_alive():
++                if said != "defer":
++                    logger.info("kanban sync: the root profile's gateway runs on this host; this profile "
++                                "gateway leaves host sync to it")
++                    said = "defer"
++                await asyncio.sleep(_SYNC_OWNER_RECHECK_S)
++                continue
++            lock_handle, lock_state = _acquire_singleton_lock(_kb.kanban_home() / "kanban" / ".sync.lock")
++            if lock_state == "contended":
++                if said != "contended":
++                    logger.info("kanban sync: another gateway on this host already syncs; retrying every %.0fs",
++                                _SYNC_LOCK_RETRY_S)
++                    said = "contended"
++                await asyncio.sleep(_SYNC_LOCK_RETRY_S)
++                continue
++            said = None
++            checked = [0.0, False]
++
++            def keep_running() -> bool:
++                if not self._running:
++                    return False
++                if root:
++                    return True
++                now = time.monotonic()
++                if now - checked[0] >= _SYNC_OWNER_RECHECK_S:
++                    checked[0], checked[1] = now, _kwc._root_gateway_alive()
++                return not checked[1]
++
++            try:
++                await asyncio.to_thread(_ksc.run_forever, keep_running)
++            finally:
++                _release_singleton_lock(lock_handle)
++            if root or not checked[1] or not self._running:
++                return  # the loop ended on its own (shutdown, no identity): never respin it
++            logger.info("kanban sync: the root profile's gateway started; handed host sync to it")
+diff --git a/gateway/kanban_watchers_common.py b/gateway/kanban_watchers_common.py
+index 212c1f23717..251722b7b4b 100644
+--- a/gateway/kanban_watchers_common.py
++++ b/gateway/kanban_watchers_common.py
+@@ -178,6 +178,30 @@ def _acquire_singleton_lock(lock_path) -> tuple[Optional[object], str]:
+     return handle, "held"
+ 
+ 
++def _is_kanban_root_profile() -> bool:
++    """True when this process's HERMES_HOME is the kanban root (the default profile), not a named profile whose
++    home only borrows the root's boards. [daveey]"""
++    try:
++        from hermes_cli import kanban_db
++        from hermes_constants import get_hermes_home
++        return Path(get_hermes_home()).resolve() == Path(kanban_db.kanban_home()).resolve()
++    except Exception:  # health: allow BLE001 -- an unresolvable home keeps today's behaviour (may sync)
++        return True
++
++
++def _root_gateway_alive() -> bool:
++    """True when the kanban root profile's gateway runs on this host (its lock held, its PID live).
++
++    Read-only probe of the root's identity files (``cleanup_stale=False``): a named-profile process never unlinks
++    the root's records. [daveey]"""
++    try:
++        from gateway.status import get_running_pid
++        from hermes_cli import kanban_db
++        return get_running_pid(Path(kanban_db.kanban_home()) / "gateway.pid", cleanup_stale=False) is not None
++    except Exception:  # health: allow BLE001 -- unknown reads as absent: the profile gateway may keep syncing
++        return False
++
++
+ def _release_singleton_lock(handle) -> None:
+     """Release a lock acquired via :func:`_acquire_singleton_lock`."""
+     if handle is None:
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 90b7543815d..267eb4a709f 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -54,6 +54,10 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+         "SELECT l.* FROM task_chat_links l WHERE l.chat_gateway=? AND l.kind='created' "
+         "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=l.task_id "
+         "AND e.kind='creator_chats_resolved')", (gateway,))] if has_links else []
++    # Cards this gateway owns (a picked-up foreign copy keeps the owner's answer, see _owner_written_releases).
++    foreign = {r[0] for r in conn.execute(
++        "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != '' AND created_on != ?", (gateway,))} \
++        if created and any(c[1] == "created_on" for c in conn.execute("PRAGMA table_info(tasks)")) else set()
+     sessions = [tuple(r) for r in conn.execute(
+         "SELECT id, session_id, created_at FROM tasks WHERE session_id IS NOT NULL AND session_id != ''")]
+     try:
+@@ -75,7 +79,12 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+ 
+     for row in created:
+         if not _worker_shepherd(row["chat_session"], row["kind"]) and row["chat_session"] not in machine:
+-            out[row["uid"]] = row
++            # [daveey] Wanted unreleased, like a ``tasks.session_id`` creator link: creator-chat ownership has no
++            # release on this gateway but the machine/placeholder rules above. Keeping the stored flag let one
++            # foreign reconcile (a named-profile gateway on an older core holding the host sync lock) release it
++            # for good, and the shepherd link this link replaces was then released too: the chat lost an open
++            # card it handed work to (hub chat 20261016_123957_6212f7 -> t_01a19084a3b36956, 2026-11-02).
++            out[row["uid"]] = row if row["task_id"] in foreign else {**row, "released": 0}
+     for task_id, session, created_at in sessions:
+         add(task_id, session, "created", created_at)
+     for task_id, session in shepherds:
+diff --git a/tests/hermes_cli/test_kanban_creator_chat_backfill.py b/tests/hermes_cli/test_kanban_creator_chat_backfill.py
+index e8cbb2b4c98..7161bb51cd3 100644
+--- a/tests/hermes_cli/test_kanban_creator_chat_backfill.py
++++ b/tests/hermes_cli/test_kanban_creator_chat_backfill.py
+@@ -45,3 +45,44 @@ def test_reconcile_backfills_worker_created_links_without_replay(tmp_path, monke
+         with kb.write_txn(conn):
+             kb._append_event(conn, child, "completed", {"summary": "future result"})
+         assert len(notify.unseen_events_for_sub(conn, task_id=child, platform="tui", chat_id="human")[1]) == 1
++
++
++def test_a_released_inherited_link_on_an_open_card_is_wanted_again(tmp_path, monkeypatch):
++    """Hub chat 20261016_123957_6212f7 handed work to worker-created t_01a19084a3b36956 (todo), yet its outcome read
++    unresolved: a named-profile gateway on an older core held the host sync lock, did not want inherited ``created``
++    links and released it. Reconcile kept the stored flag, so the chat never got its card back. [daveey]"""
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    with kbc.connect_closing(home / "kanban.db") as conn:
++        sync.ensure_identity(conn, "default", "here")
++        parent = kb.create_task(conn, title="parent", session_id="human")
++        links.reconcile(conn, "default", "here", ledger=False)
++        child = kb.create_task(conn, title="legacy", session_id=WORKER)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
++                         (json.dumps({"creator_task_id": parent}), child))
++        links.reconcile(conn, "default", "here", ledger=False)
++        uid = links.link_uid(child, "here", None, "human", "created")
++        with kb.write_txn(conn):  # what the foreign reconcile did
++            conn.execute("UPDATE task_chat_links SET released=1 WHERE uid=?", (uid,))
++        assert links.reconcile(conn, "default", "here", ledger=False)["changed"] == 1
++        assert conn.execute("SELECT released FROM task_chat_links WHERE uid=?", (uid,)).fetchone()[0] == 0
++        queued = [r[0] for r in conn.execute("SELECT row_uid FROM kanban_sync_outbox WHERE table_name='task_chat_links'")]
++        assert uid in queued  # pushed, so the Board replica (links_reader=replica) answers the chat again
++
++
++def test_a_picked_up_foreign_cards_inherited_link_keeps_the_owners_answer(tmp_path, monkeypatch):
++    """Only cards this gateway owns are healed: a foreign copy's released link stays the owner's call. [daveey]"""
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    with kbc.connect_closing(home / "kanban.db") as conn:
++        sync.ensure_identity(conn, "default", "here")
++        child = kb.create_task(conn, title="foreign", session_id=WORKER)
++        uid = links.link_uid(child, "here", None, "human", "created")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_on='elsewhere' WHERE id=?", (child,))
++            kb._append_event(conn, child, "creator_chats_resolved", {"creator_task_id": "t_gone"})
++            conn.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_session,kind,released,created_at) "
++                         "VALUES (?,?,'here','human','created',1,1)", (uid, child))
++        links.reconcile(conn, "default", "here", ledger=False)
++        assert conn.execute("SELECT released FROM task_chat_links WHERE uid=?", (uid,)).fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index c5cd6f8e0ea..1365fb30ba0 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -431,12 +431,61 @@ def test_gateway_watcher_runs_the_loop_once_per_host_and_not_when_disabled(kanba
+     assert calls == [True]
+     from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock
+     held, state = _acquire_singleton_lock(kb.kanban_home() / "kanban" / ".sync.lock")
+-    try:
+-        assert state == "held"
+-        asyncio.run(runner._kanban_sync_watcher())  # another gateway on this host holds it
+-        assert calls == [True]
+-    finally:
+-        _release_singleton_lock(held)
++    assert state == "held"
++    slept = []
++
++    async def fake_sleep(seconds):
++        slept.append(seconds)
++        _release_singleton_lock(held)  # the other gateway exits
++
++    monkeypatch.setattr(watchers.asyncio, "sleep", fake_sleep)
++    asyncio.run(runner._kanban_sync_watcher())  # another gateway on this host holds it: retried, never given up
++    assert slept == [watchers._SYNC_LOCK_RETRY_S] and calls == [True, True]
++
++
++def test_a_named_profile_gateway_leaves_host_sync_to_the_root_gateway(kanban_home, monkeypatch):
++    """Hub 2026-11-02: hermes-gateway-askeve-reviewer (a named profile on a pinned older core) won the host sync lock
++    first; its reconcile released root-profile chats' card links every pass, and the root gateway logged "another
++    gateway already syncs" and never retried. A named profile now defers to a live root gateway and hands the loop
++    back when one starts. [daveey]"""
++    import asyncio
++    from gateway import kanban_watchers as watchers
++    from gateway import kanban_watchers_common as kwc
++    support.write_sync_config(kanban_home, True)
++    root_alive = [True]
++    monkeypatch.setattr(kwc, "_is_kanban_root_profile", lambda: False)
++    monkeypatch.setattr(kwc, "_root_gateway_alive", lambda: root_alive[0])
++    monkeypatch.setattr(watchers, "_SYNC_OWNER_RECHECK_S", 0.0)
++    runner = watchers.GatewayKanbanWatchersMixin()
++    runner._running = True
++    ran, slept = [], []
++
++    async def fake_sleep(seconds):
++        slept.append(seconds)
++        root_alive[0] = False  # the root gateway stops: this profile may sync
++
++    def fake_run_forever(keep_running, interval=None, sleep=None):
++        ran.append(keep_running())
++        root_alive[0] = True  # the root gateway starts again
++        ran.append(keep_running())
++        runner._running = False
++    monkeypatch.setattr(watchers.asyncio, "sleep", fake_sleep)
++    monkeypatch.setattr(ksc, "run_forever", fake_run_forever)
++    asyncio.run(runner._kanban_sync_watcher())
++    assert slept == [0.0] and ran == [True, False]  # deferred, then ran, then handed back
++    from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock
++    held, state = _acquire_singleton_lock(kb.kanban_home() / "kanban" / ".sync.lock")
++    _release_singleton_lock(held)
++    assert state == "held"  # released on hand-back
++
++
++def test_root_profile_detection_reads_hermes_home_against_the_kanban_root(kanban_home, monkeypatch, tmp_path):
++    from gateway import kanban_watchers_common as kwc
++    assert kwc._is_kanban_root_profile()
++    monkeypatch.setenv("HERMES_HOME", str(kb.kanban_home() / "profiles" / "askeve-reviewer"))
++    monkeypatch.setattr(kb, "kanban_home", lambda: kanban_home)
++    assert not kwc._is_kanban_root_profile()
++    assert not kwc._root_gateway_alive()  # no root gateway.pid
+ 
+ 
+ def test_import_skips_events_older_than_the_service_retention(live):
+-- 
+2.55.0
+

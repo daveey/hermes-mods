@@ -1,0 +1,321 @@
+From 3d9916b2dc041cd1bd112f146b5465a19df19d4d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:56:27 -0800
+Subject: [PATCH] fix(routing): resume on the allocation store's route, not a
+ lagging model_config copy [daveey]
+
+MacBook chat 20261026_205117_f67f0d sat on an unanswered kanban notice (unresolved{notice_tail}) for 7 h:
+every agent build for it (notice close-out wake, kanban sweep wake, chat-closeout, automation replay) failed
+with "Exact pinned route cannot fail over".
+
+Why-chain (evidence: state.db sessions row, model-routing.sqlite3 routes row, agent.log 11:33-18:41 PT):
+1. Why did no turn answer the notice? Each wake's agent build raised ModelRoutingError (agent.log, 20+ lines).
+2. Why? Resume pinned claude-opus-5-5/anthropic, but the allocation store holds an exact pin on
+   gpt-6-astra/openai-codex (reason explicit-switch), and an exact pin cannot fail over.
+3. Why did resume pick claude? restore_route reads model_config.model_routing, which still recorded the
+   pre-switch claude allocation; the row's model (gpt-6-astra) disagreed and e320c9d273 made "the record wins".
+4. Why was the record stale? model_config.model_routing is a copy rewritten only after a turn; the honoured
+   switch moved the store without a completed turn rewriting the copy.
+5. Why wasn't it caught? e320c9d273's tests assumed the copy and the store agree; no test had the store moved
+   by an explicit switch while the copy lagged.
+
+Fix: restore_route takes the session id and prefers the allocation store's row for that lineage and class
+(RoutingState.peek), falling back to the copy only when the store has none. All four resume paths pass the id
+(Desktop/tui agent_factory, CLI, gateway restart, API server). Policy still gates the restored pin.
+Tests: store-vs-copy unit tests next to the desync tests, plus one test per entry path.
+---
+ agent/model_routing_restore.py                | 33 ++++++-
+ gateway/platforms/api_server_class_routing.py |  2 +-
+ gateway/run_class_routing.py                  |  2 +-
+ hermes_cli/cli_model_routing.py               |  3 +-
+ .../test_model_routing_row_route_desync.py    | 55 ++++++++++++
+ .../test_resume_allocation_store_wins.py      | 85 +++++++++++++++++++
+ tui_gateway/agent_factory.py                  |  2 +-
+ tui_gateway/class_routing.py                  |  4 +-
+ 8 files changed, 179 insertions(+), 7 deletions(-)
+ create mode 100644 tests/agent/test_resume_allocation_store_wins.py
+
+diff --git a/agent/model_routing_restore.py b/agent/model_routing_restore.py
+index bc02dceba23..d404f885fd9 100644
+--- a/agent/model_routing_restore.py
++++ b/agent/model_routing_restore.py
+@@ -40,7 +40,34 @@ def stale_session_pin(row):
+     return stale_managed_pin(row.get("model"), SessionDB.session_gateway_runtime(row).get("provider"))
+ 
+ 
+-def restore_route(model, config, policy_config=None):
++def _allocated_route(route, session_id, state_path=None):
++    """The allocation store's current route for this chat's lineage and class, else the cached ``route``.
++
++    ``model_config.model_routing`` is a copy written after a turn; the allocation store
++    (``model-routing.sqlite3``) is what the allocator checks. They diverge when an explicit switch is honoured
++    by a build whose turn never rewrote the copy: MacBook chat 20261026_205117_f67f0d (11-02) had the store on
++    gpt-6-astra/openai-codex (``explicit-switch``) and the copy still on claude-opus-5-5/anthropic, so resume
++    restored the copy as an exact pin and every build (close-out wake, notice wake, replay) was refused with
++    "Exact pinned route cannot fail over", leaving the chat on an unanswered notice. [daveey]
++    """
++    level = route.get("requested_class")
++    if not session_id or level not in CLASSES:
++        return route
++    try:
++        from agent.model_routing_state import RoutingState
++        if state_path is None:
++            from hermes_constants import get_hermes_home
++            state_path = get_hermes_home() / "model-routing.sqlite3"
++        current = RoutingState(state_path).peek(session_id, level)
++    except Exception:
++        logging.getLogger(__name__).debug("resume: allocation store unreadable for %s", session_id, exc_info=True)
++        return route
++    if isinstance(current, dict) and isinstance(current.get("selected_model"), str) and current["selected_model"]:
++        return current
++    return route
++
++
++def restore_route(model, config, policy_config=None, *, session_id=None, state_path=None):
+     """Return (model selector, provider), leaving policy validation to runtime.
+ 
+     Class allocations may fail over; exact pins must retain both tuple members,
+@@ -52,6 +79,9 @@ def restore_route(model, config, policy_config=None):
+     ``explicit-switch``). Replaying the row's tuple as a NEW exact pin collides with the recorded pin and is
+     refused as "Exact pinned route cannot fail over" on every build, so the chat can never reopen. A recorded
+     pin that policy no longer approves is not restored; the allocator keeps refusing it. [daveey]
++
++    With ``session_id`` the record is the allocation store's row for that lineage and class when it has one
++    (``_allocated_route``): the copy in ``model_config`` can lag an honoured switch. [daveey]
+     """
+     if isinstance(config, str):
+         try:
+@@ -61,6 +91,7 @@ def restore_route(model, config, policy_config=None):
+     route = config.get("model_routing") if isinstance(config, dict) else None
+     if not isinstance(route, dict):
+         return None
++    route = _allocated_route(route, session_id, state_path)
+     if route.get("selected_model") != model:
+         model = route.get("selected_model")  # row and record disagree: the record wins
+         if not isinstance(model, str) or not model:
+diff --git a/gateway/platforms/api_server_class_routing.py b/gateway/platforms/api_server_class_routing.py
+index 33e4ae1bd08..bae86b5d5b9 100644
+--- a/gateway/platforms/api_server_class_routing.py
++++ b/gateway/platforms/api_server_class_routing.py
+@@ -19,7 +19,7 @@ def restore_session_route(adapter, session_id, session_model, confirmed_runtime_
+         return None
+     if session_model and session_model != row.get("model"):
+         return None
+-    return restore_route(row.get("model"), row.get("model_config"))
++    return restore_route(row.get("model"), row.get("model_config"), session_id=session_id)
+ 
+ 
+ def initial_runtime(adapter, *, default_model, requested_model,
+diff --git a/gateway/run_class_routing.py b/gateway/run_class_routing.py
+index f35d3cd251a..a351d9e4ae9 100644
+--- a/gateway/run_class_routing.py
++++ b/gateway/run_class_routing.py
+@@ -63,7 +63,7 @@ def stored_route(runner, session_key):
+     row = db.get_session(entry.session_id)
+     if not isinstance(row, dict):
+         return None
+-    return restore_route(row.get("model"), row.get("model_config"))
++    return restore_route(row.get("model"), row.get("model_config"), session_id=entry.session_id)
+ 
+ 
+ def class_context_length(model, *, config=None, runner=None, session_key=None, provider="auto"):
+diff --git a/hermes_cli/cli_model_routing.py b/hermes_cli/cli_model_routing.py
+index fbc6cccbc14..df11a66102b 100644
+--- a/hermes_cli/cli_model_routing.py
++++ b/hermes_cli/cli_model_routing.py
+@@ -72,7 +72,8 @@ def restore_class_route(cli, session_meta):
+     if getattr(cli, "_explicit_model_override", False):
+         return False
+     from agent.model_routing_restore import restore_route
+-    restored = restore_route(session_meta.get("model"), session_meta.get("model_config"))
++    restored = restore_route(session_meta.get("model"), session_meta.get("model_config"),
++                             session_id=session_meta.get("id") or getattr(cli, "session_id", None))
+     if restored is None:
+         return False
+     cli.model, cli.requested_provider = restored
+diff --git a/tests/agent/test_model_routing_row_route_desync.py b/tests/agent/test_model_routing_row_route_desync.py
+index 643651db53e..30bf4cad7b1 100644
+--- a/tests/agent/test_model_routing_row_route_desync.py
++++ b/tests/agent/test_model_routing_row_route_desync.py
+@@ -80,3 +80,58 @@ def test_matching_row_is_unchanged(tmp_path):
+     _, recorded = _recorded(cfg, tmp_path, "openai-codex-deep")
+     assert restore_route("openai-codex-deep", {"model_routing": recorded}, policy_config=cfg) == (
+         "openai-codex-deep", "openai-codex")
++
++
++def _switched(cfg, tmp_path, old, new):
++    """An honoured explicit switch: the store moved old -> new, the session's model_config copy still says old."""
++    path, recorded = _recorded(cfg, tmp_path, old)
++    level, restricted = pin_policy(new, None, cfg)
++    moved = resolve_model_route("class:" + level, config=restricted, session_id="s", state_path=path,
++                                exact_pin=True, replace=True)
++    assert moved["metadata"]["selected_model"] == new
++    return path, recorded, moved["metadata"]
++
++
++def test_repro_stale_copy_after_honoured_switch_is_refused(tmp_path):
++    """MacBook chat 20261026_205117_f67f0d (11-02): restoring the lagging model_config copy collides with the store."""
++    cfg = _managed(policy())
++    path, stale_copy, _ = _switched(cfg, tmp_path, "anthropic-deep", "openai-codex-deep")
++    restored = restore_route("openai-codex-deep", {"model_routing": stale_copy}, policy_config=cfg)
++    assert restored == ("anthropic-deep", "anthropic")  # without the session id: the copy wins
++    with pytest.raises(ModelRoutingError, match="Exact pinned route cannot fail over"):
++        _pin(cfg, restored[0], path)
++
++
++def test_allocation_store_wins_over_a_lagging_model_config_copy(tmp_path):
++    cfg = _managed(policy())
++    path, stale_copy, current = _switched(cfg, tmp_path, "anthropic-deep", "openai-codex-deep")
++    restored = restore_route("openai-codex-deep", {"model_routing": stale_copy}, policy_config=cfg,
++                             session_id="s", state_path=path)
++    assert restored == ("openai-codex-deep", "openai-codex")
++    again = _pin(cfg, restored[0], path)
++    assert again["metadata"] == current  # sticky reuse, no refusal, no reallocation
++
++
++def test_store_wins_even_when_the_row_still_names_the_old_model(tmp_path):
++    cfg = _managed(policy())
++    path, stale_copy, _ = _switched(cfg, tmp_path, "anthropic-deep", "openai-codex-deep")
++    assert restore_route("anthropic-deep", {"model_routing": stale_copy}, policy_config=cfg,
++                         session_id="s", state_path=path) == ("openai-codex-deep", "openai-codex")
++
++
++def test_no_allocation_row_falls_back_to_the_copy(tmp_path):
++    cfg = _managed(policy())
++    _, recorded = _recorded(cfg, tmp_path, "anthropic-deep")
++    assert restore_route("anthropic-deep", {"model_routing": recorded}, policy_config=cfg,
++                         session_id="other", state_path=tmp_path / "routes.db") == ("anthropic-deep", "anthropic")
++    assert restore_route("anthropic-deep", {"model_routing": recorded}, policy_config=cfg,
++                         session_id="s", state_path=tmp_path / "missing.db") == ("anthropic-deep", "anthropic")
++
++
++def test_store_pin_policy_no_longer_approves_is_not_restored(tmp_path):
++    cfg = _managed(policy())
++    path, stale_copy, _ = _switched(cfg, tmp_path, "anthropic-deep", "openai-codex-deep")
++    cfg["model_routing"]["routes"]["deep"] = [
++        r for r in cfg["model_routing"]["routes"]["deep"] if r["model"] != "openai-codex-deep"]
++    assert restore_route("openai-codex-deep", {"model_routing": stale_copy}, policy_config=cfg,
++                         session_id="s", state_path=path) is None
+diff --git a/tests/agent/test_resume_allocation_store_wins.py b/tests/agent/test_resume_allocation_store_wins.py
+new file mode 100644
+index 00000000000..0120db8c531
+--- /dev/null
++++ b/tests/agent/test_resume_allocation_store_wins.py
+@@ -0,0 +1,85 @@
++"""Every resume entry path restores the allocation store's route, not a lagging ``model_config`` copy. [daveey]
++
++MacBook chat 20261026_205117_f67f0d (11-02): an explicit switch moved the allocation store (model-routing.sqlite3)
++to gpt-6-astra/openai-codex while the row's ``model_config.model_routing`` still recorded claude-opus-5-5/anthropic.
++Resume restored the copy as an exact pin; every agent build (kanban close-out wake, notice wake, automation replay)
++then failed with "Exact pinned route cannot fail over", and the chat stayed ``unresolved{notice_tail}``.
++"""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent.model_routing import resolve_model_route
++from agent.model_routing_managed import pin_policy
++from hermes_cli.config import atomic_config_write
++from tests.agent.test_model_routing import policy
++
++SID = "20261026_205117_f67f0d"
++OLD = ("anthropic-deep", "anthropic")
++NEW = ("openai-codex-deep", "openai-codex")
++
++
++@pytest.fixture
++def switched(tmp_path, monkeypatch):
++    """Store pinned on NEW via an honoured explicit switch; returns the session row whose copy still says OLD."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    cfg = policy()
++    cfg["model_routing"]["enforce_subscription_only"] = True
++    atomic_config_write(tmp_path / "config.yaml", cfg)
++    for (model, _), replace in ((OLD, False), (NEW, True)):
++        level, restricted = pin_policy(model, None, cfg)
++        last = resolve_model_route("class:" + level, config=restricted, session_id=SID, exact_pin=True,
++                                   replace=replace)
++    assert last["metadata"]["selected_model"] == NEW[0]
++    stale_copy = {"requested_class": "deep", "policy_version": 1, "selected_provider": OLD[1],
++                  "selected_model": OLD[0], "billing_group": "subscription", "reason": "allocation",
++                  "exact_pin": True}
++    return {"id": SID, "model": NEW[0], "title": "Audit sessions",
++            "model_config": json.dumps({"provider": NEW[1], "model": OLD[0], "model_routing": stale_copy}),
++            "billing_provider": OLD[1]}
++
++
++def _db(row):
++    return SimpleNamespace(get_session=lambda sid: row if sid == row["id"] else None)
++
++
++def test_desktop_resume_restores_the_store_route(switched):
++    from tui_gateway.server import _stored_session_runtime_overrides
++    kept = _stored_session_runtime_overrides(switched)
++    assert (kept["model_override"]["model"], kept["provider_override"]) == NEW
++
++
++def test_cli_resume_restores_the_store_route(switched):
++    from tests.hermes_cli.test_resume_model_restore import _make_stub
++    stub = _make_stub(model="class:deep", provider="auto", requested_provider="auto", base_url="", api_key="k")
++    stub._restore_session_model(switched)
++    assert (stub.model, stub.requested_provider) == NEW
++
++
++def test_gateway_restart_restores_the_store_route(switched):
++    from gateway.run_class_routing import stored_route
++    runner = SimpleNamespace(session_store=SimpleNamespace(_entries={"k": SimpleNamespace(session_id=SID)}),
++                             _session_db=_db(switched))
++    assert stored_route(runner, "k") == NEW
++
++
++def test_api_server_resume_restores_the_store_route(switched):
++    from gateway.platforms.api_server_class_routing import restore_session_route
++    adapter = SimpleNamespace(_ensure_session_db=lambda: _db(switched))
++    assert restore_session_route(adapter, SID, NEW[0], False) == NEW
++
++
++def test_restored_route_builds_without_refusal(switched):
++    """The restored tuple re-pins onto the store's allocation (sticky reuse), the old copy would be refused."""
++    from agent.model_routing import ModelRoutingError
++    from tui_gateway.server import _stored_session_runtime_overrides
++    cfg = policy()
++    cfg["model_routing"]["enforce_subscription_only"] = True
++    kept = _stored_session_runtime_overrides(switched)
++    level, restricted = pin_policy(kept["model_override"]["model"], None, cfg)
++    assert resolve_model_route("class:" + level, config=restricted, session_id=SID,
++                               exact_pin=True)["metadata"]["selected_model"] == NEW[0]
++    level, restricted = pin_policy(OLD[0], None, cfg)
++    with pytest.raises(ModelRoutingError, match="Exact pinned route cannot fail over"):
++        resolve_model_route("class:" + level, config=restricted, session_id=SID, exact_pin=True)
+diff --git a/tui_gateway/agent_factory.py b/tui_gateway/agent_factory.py
+index bba108d4d9e..37aa6e082dd 100644
+--- a/tui_gateway/agent_factory.py
++++ b/tui_gateway/agent_factory.py
+@@ -179,7 +179,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
+     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
+         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
+     from tui_gateway.class_routing import restore_class_overrides
+-    return restore_class_overrides(model, model_config, overrides)
++    return restore_class_overrides(model, model_config, overrides, session_id=row.get("id"))
+ 
+ 
+ def _scoped_session_provider(agent, session: dict) -> str:
+diff --git a/tui_gateway/class_routing.py b/tui_gateway/class_routing.py
+index 775c166c3e7..bfc1fcef1df 100644
+--- a/tui_gateway/class_routing.py
++++ b/tui_gateway/class_routing.py
+@@ -34,9 +34,9 @@ def probe_class_runtime(model, provider, config):
+     return runtime["model"], runtime
+ 
+ 
+-def restore_class_overrides(model, config, overrides):
++def restore_class_overrides(model, config, overrides, session_id=None):
+     from agent.model_routing_restore import restore_route, stale_managed_pin
+-    restored = restore_route(model, config)
++    restored = restore_route(model, config, session_id=session_id)
+     if restored is not None:
+         model, provider = restored
+         overrides["model_override"] = {"model": model, "provider": provider}
+-- 
+2.55.0
+

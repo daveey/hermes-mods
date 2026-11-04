@@ -1,0 +1,95 @@
+From eb153dcd539b614793a8388ab96204bd3e901840 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 03:18:16 +0000
+Subject: [PATCH] [daveey] kanban sync watcher: per-tenure latching stop flag
+ so yielded FeedWatcher threads don't revive
+
+---
+ gateway/kanban_watchers.py                   | 16 +++++++++-
+ tests/gateway/test_kanban_singleton_lease.py | 33 ++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 96911c1581c..402df2f7b28 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -13,6 +13,7 @@ import asyncio
+ import contextlib
+ import functools
+ import os
++import threading
+ import time
+ from pathlib import Path
+ from typing import Any, Optional
+@@ -431,10 +432,23 @@ class GatewayKanbanWatchersMixin:
+         while self._running:
+             if not await self._acquire_kanban_lease(lease):
+                 return
++            # Each tenure gets its own latching stop flag: after release the lease is idle again and
++            # should_yield() reads False, so a bare lambda would revive this tenure's daemon FeedWatcher
++            # threads beside the next tenure's set. [daveey]
++            stopped = threading.Event()
++
++            def keep_running(stopped=stopped):
++                if stopped.is_set():
++                    return False
++                if not self._running or lease.should_yield():
++                    stopped.set()
++                    return False
++                return True
+             try:
+-                await asyncio.to_thread(_ksc.run_forever, lambda: self._running and not lease.should_yield())
++                await asyncio.to_thread(_ksc.run_forever, keep_running)
+                 yielded = self._running and lease.should_yield()
+             finally:
++                stopped.set()
+                 lease.release()
+             if not yielded:
+                 return  # the loop ended on its own (stop, or sync unavailable): don't spin on it
+diff --git a/tests/gateway/test_kanban_singleton_lease.py b/tests/gateway/test_kanban_singleton_lease.py
+index 77adc35b890..1f77f443766 100644
+--- a/tests/gateway/test_kanban_singleton_lease.py
++++ b/tests/gateway/test_kanban_singleton_lease.py
+@@ -254,6 +254,39 @@ def test_sync_watcher_profile_gateway_yields_to_root_and_waits(root, monkeypatch
+     assert loops == ["start"] and sleeps == [ks.DEFAULT_RETRY_SECONDS]
+ 
+ 
++def test_sync_watcher_old_tenure_keep_running_stays_false_after_yield(root, monkeypatch):
++    """After a yield the lease is idle/deferred again, so should_yield() is False. The old tenure's
++    keep_running must stay False anyway, or run_forever's daemon FeedWatcher threads (which loop on
++    it) keep running beside the next tenure's set."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as ksc
++    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "askeve-reviewer"))
++    monkeypatch.setattr(ks, "DEFAULT_GRACE_SECONDS", 0.0)
++    monkeypatch.setattr(ks, "_YIELD_CACHE_SECONDS", 0.0)
++    monkeypatch.setattr(sync, "sync_enabled", lambda: True)
++    runner = _runner()
++    root_lease = _lease(root, is_root=True, clock=Clock(), name="sync")
++    tenures = []
++
++    def fake_run_forever(keep_running, interval=None, sleep=None):
++        tenures.append(keep_running)
++        assert keep_running()
++        assert not root_lease.try_acquire()  # root gateway asks
++        assert not keep_running()
++    monkeypatch.setattr(ksc, "run_forever", fake_run_forever)
++    after_release = []
++
++    async def between(interval):
++        # Root gateway takes the lock, then goes away: the profile's lease is no longer asked to yield.
++        assert root_lease.try_acquire()
++        root_lease.release()
++        after_release.append(tenures[0]())
++        runner._running = False
++    monkeypatch.setattr(runner, "_sleep_between_ticks", between)
++    asyncio.run(runner._kanban_sync_watcher())
++    assert after_release == [False]
++
++
+ # --- entry path 4: joint restart order in `hermes update` (posix pause resume) --------------------
+ 
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,451 @@
+From b8de24c3d65a6cdf95bbc05af242c7ca07bf71e3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:38:25 +0000
+Subject: [PATCH] [daveey] Desktop poll cost: move the annotation revalidation
+ and origin-work snapshot into topical siblings
+
+kanban_session_activity stays under its line cap: the unchanged-input revalidation lives in
+kanban_session_activity_revalidate, the origin-work snapshot in kanban_session_activity_origin_snapshot (re-exported
+as _remote_snapshot, so its test seams stay). gateway.py nets zero lines.
+---
+ hermes_cli/gateway.py                         |   7 +-
+ hermes_cli/kanban_session_activity.py         | 149 ++----------------
+ ...kanban_session_activity_origin_snapshot.py |  50 ++++++
+ .../kanban_session_activity_revalidate.py     | 105 ++++++++++++
+ 4 files changed, 173 insertions(+), 138 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_activity_origin_snapshot.py
+ create mode 100644 hermes_cli/kanban_session_activity_revalidate.py
+
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index dcbb6114522..b910e720447 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -52,8 +52,7 @@ from hermes_cli.config import (
+     get_hermes_home,
+     is_managed,
+     managed_error,
+-    read_raw_config,
+-    read_raw_config_readonly,
++    read_raw_config, read_raw_config_readonly,
+     save_env_value,
+     write_platform_config_field,
+ )
+@@ -3545,9 +3544,7 @@ def _get_restart_drain_timeout() -> float:
+     """Return the configured gateway restart drain timeout in seconds."""
+     raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
+     if not raw:
+-        # [daveey] Read-only view: every Desktop /api/status poll lands here, and read_raw_config() deep-copies the
+-        # whole config for this one key.
+-        cfg = read_raw_config_readonly()
++        cfg = read_raw_config_readonly()  # [daveey] each /api/status poll: no deep copy of the config for one key
+         agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+         raw = str(agent_cfg.get("restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT))
+     return parse_restart_drain_timeout(raw)
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index cd9081cfe5f..3436b6d924d 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -20,6 +20,8 @@ from hermes_cli import kanban_annotation_disk as _annotation_copy
+ from hermes_cli import kanban_annotation_refresh as _bounded
+ from hermes_cli import kanban_activity_revision as _revision
+ from hermes_cli import kanban_session_activity_hub as _hub_signature
++from hermes_cli import kanban_session_activity_revalidate as _revalidate
++from hermes_cli.kanban_session_activity_origin_snapshot import remote_snapshot as _remote_snapshot
+ from hermes_cli.kanban_session_activity_hub import _hub_content_signature
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+ from hermes_cli.kanban_session_activity_release import TERMINAL_STATUSES
+@@ -48,17 +50,15 @@ ACTIVE_STATUSES = ("todo", "ready", "running", "scheduled", "review")
+ BLOCKED_STATUSES = ("blocked", "triage")
+ 
+ _CACHE_TTL_S = 3.0
+-# [daveey] Past the TTL, counts read under an unchanged fingerprint stay valid up to this age: the bound on the
+-# time-derived states no key sees (stalled after kanban_wait_info.STALL_AFTER_S = 2 h, remote stale after
+-# HUB_STALE_AFTER_S = 180 s), so one may show up to this much later than its threshold. A fingerprint that can't
+-# prove "no write since" (``_revalidatable``) keeps the TTL bound. See ``_counts_fresh``.
++# [daveey] Max age of counts under an unchanged fingerprint (kanban_session_activity_revalidate): bounds the
++# time-derived states no key sees (stalled after STALL_AFTER_S = 2 h, remote stale after HUB_STALE_AFTER_S = 180 s).
+ _COUNTS_MAX_AGE_S = 30.0
+ _cache_lock = threading.Lock()
+ _cache: tuple[float, dict[str, int], dict[str, int], dict[str, int], dict[str, int]] | None = None
+ _cache_scope: tuple[str, ...] | None = None
+ _cache_fingerprint: tuple = ()
+ _cache_read_at = 0.0  # monotonic time of the read behind ``_cache``
+-_cache_revalidatable = False  # its fingerprint proves no write since (``_revalidatable``)
++_cache_revalidatable = False  # its fingerprint proves no write since (``_revalidate.revalidatable``)
+ _waiting_cache: list[dict[str, frozenset[str]]] = [{}]
+ # (parked, held) per session from the same snapshot as ``_cache`` (see ``_read_parked``); the sink is set while
+ # ``_all_counts`` reads local boards, like ``_pairs_sink``. [daveey]
+@@ -874,7 +874,7 @@ def _replica_paths() -> list[Path]:
+ 
+ def _activity_fingerprint(*, include_shadows: bool = True) -> tuple:
+     """Count inputs include sync shadows; the origin-ledger projection never reads them."""
+-    pinned = getattr(_inputs_pin, "fingerprints", None)
++    pinned = getattr(_revalidate.inputs_pin, "fingerprints", None)
+     if pinned is not None and pinned[int(include_shadows)] is not None:
+         return pinned[int(include_shadows)]
+     hub = _hub_db_path()
+@@ -892,74 +892,11 @@ def _shadow_fingerprint() -> tuple:
+     return tuple((str(db), _board_content_key(db, _revision.SHADOW_TABLES)) for db in _replica_paths())
+ 
+ 
+-_STAT_SETTLED_S = 2.0
+-
+-
+-def _revalidatable(fingerprint: tuple, wall: float) -> bool:
+-    """True when ``fingerprint`` (taken at wall time ``wall``) proves no write since: every board is keyed by its
+-    content revision, or by a file stat last modified more than ``_STAT_SETTLED_S`` before ``wall``. A stat key can
+-    miss a same-size commit inside the mtime tick of the previous one; a write after a settled stat lands in a later
+-    tick and moves it. (A board no current writer opened, e.g. ``boards/_archived``, has only its stat.)"""
+-    for entry in fingerprint:
+-        if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], tuple) and entry[1][:1] == ("stat",):
+-            for st in entry[1][1] if len(entry[1]) > 1 and isinstance(entry[1][1], tuple) else (None,):
+-                if st is not None and (not isinstance(st, tuple) or len(st) < 4 or st[3] / 1e9 > wall - _STAT_SETTLED_S):
+-                    return False
+-    return True
+-
+-
+-# [daveey] Set by ``_annotation_snapshot`` while it re-reads a scope whose inputs it just found unchanged:
+-# ``(without shadows or None, with shadows)``, so the readers do not read every board's revision again (per thread).
+-_inputs_pin = threading.local()
+-
+-
+ def _board_content_key(path: Path, tables: tuple[str, ...] = _revision.LOCAL_TABLES) -> tuple:
+     """Changes on every write to a row the activity readers read in ``path`` (stat fallback without the counter)."""
+     return _revision.content_key(path, tables, cached_ro)
+ 
+ 
+-def _remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str, Any]] | None:
+-    """Durable last-known origin obligations, separate from the replaceable hub replica.
+-
+-    A transaction replaces the snapshot atomically; failed writes propagate rather than
+-    claiming a durable association. This is a projection cache, not a second transport.
+-    """
+-    from hermes_cli import kanban_db
+-
+-    path = kanban_db.kanban_home() / "origin-work.db"
+-    if cards is None:
+-        if not path.exists():
+-            return None
+-        conn = _open_ro(path)
+-    else:
+-        path.parent.mkdir(parents=True, exist_ok=True)
+-        conn = _kanban_lockguard.connect(path, timeout=0.5)
+-    try:
+-        scope = json.dumps(_origin_scope())
+-        if cards is not None:
+-            with conn:
+-                conn.execute("CREATE TABLE IF NOT EXISTS scoped_snapshot (scope TEXT PRIMARY KEY, data TEXT NOT NULL)")
+-                conn.execute("INSERT OR REPLACE INTO scoped_snapshot VALUES (?, ?)", (scope, json.dumps(cards)))
+-            return cards
+-        # Historical snapshots omitted the origin profile. Never adopt or erase
+-        # their obligations merely because a new scoped projection is available.
+-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshot'").fetchone():
+-            old = conn.execute("SELECT data FROM snapshot WHERE id=1").fetchone()
+-            if old is None or json.loads(old[0]) != []:
+-                raise ValueError("unqualified origin-work snapshot requires explicit reconciliation")
+-        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scoped_snapshot'").fetchone():
+-            return None
+-        row = conn.execute("SELECT data FROM scoped_snapshot WHERE scope=?", (scope,)).fetchone()
+-        if row is None:
+-            return None
+-        saved = json.loads(row[0])
+-        if not isinstance(saved, list) or any(not isinstance(c, dict) or not c.get("session") or not c.get("id") for c in saved):
+-            raise ValueError("invalid origin-work snapshot")
+-        return saved
+-    finally:
+-        conn.close()
+-
+-
+ def _without_local_open_duplicates(rows: list[dict[str, Any]], *, gateway: str,
+                                    profile: str) -> list[dict[str, Any]]:
+     """Prefer exact local open associations, without inferring receipt release.
+@@ -1278,7 +1215,7 @@ def _all_counts(*, include_waiting: bool = False, include_snapshot: bool = False
+     wall = time.time()
+     fingerprint = _activity_fingerprint()
+     with _cache_lock:
+-        if _counts_fresh(scope, fingerprint, now):
++        if _revalidate.counts_fresh(scope, fingerprint, now):
+             return _cached_count_result(include_waiting, include_snapshot)
+         seen = _counts_generation
+     with _counts_flight:
+@@ -1289,17 +1226,6 @@ def _all_counts(*, include_waiting: bool = False, include_snapshot: bool = False
+                                      include_snapshot=include_snapshot, wall=wall)
+ 
+ 
+-def _counts_fresh(scope: tuple[str, ...], fingerprint: tuple, now: float) -> bool:
+-    """Caller holds ``_cache_lock``. The cached counts answer for ``fingerprint``: same scope and inputs, and either
+-    within the TTL or (``_revalidatable`` fingerprint) younger than ``_COUNTS_MAX_AGE_S``. [daveey] A board write moves
+-    its content revision, so it is never hidden (read-your-writes); the age bounds the time-derived states."""
+-    if _cache is None or _cache_scope != scope or fingerprint != _cache_fingerprint:
+-        return False
+-    if now < _cache[0]:
+-        return True
+-    return _cache_revalidatable and now < _cache_read_at + _COUNTS_MAX_AGE_S
+-
+-
+ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bool,
+                           include_snapshot: bool = False, wall: float | None = None) -> tuple:
+     """Read every local board and the remote links into fresh counts and publish them to the cache."""
+@@ -1361,7 +1287,7 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         _cache_scope = scope
+         _cache = (now + _CACHE_TTL_S, *counts)
+         _cache_read_at = now
+-        _cache_revalidatable = wall is not None and _revalidatable(fingerprint, wall)
++        _cache_revalidatable = wall is not None and _revalidate.revalidatable(fingerprint, wall)
+         _cache_fingerprint = fingerprint
+         _counts_generation += 1
+         _waiting_cache[0] = waiting_ids
+@@ -1817,7 +1743,7 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     hit = _attention.get(scope, mono)
+     if hit is not None:
+         return hit
+-    inputs = _attention_key()
++    inputs = _revalidate.attention_key()
+     hit = _attention.get(scope, mono, inputs)
+     if hit is not None:
+         return hit
+@@ -1843,20 +1769,6 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     return counts
+ 
+ 
+-def _attention_key(local: tuple | None = None, wall: float | None = None) -> tuple | None:
+-    """What the done checks read: the local boards' content keys (``local``, taken at ``wall``, when the caller
+-    already has them). None unless ``_revalidatable``, or when the boards can't be read: then only the TTL serves the
+-    cache."""
+-    if local is None:
+-        wall = time.time()
+-        try:
+-            local = _activity_fingerprint(include_shadows=False)
+-        except Exception:  # health: allow BLE001 -- a revalidation input; the recompute surfaces a real read error
+-            _log.debug("kanban attention key unavailable", exc_info=True)
+-            return None
+-    return local if _revalidatable(local, time.time() if wall is None else wall) else None
+-
+-
+ def _read_annotation_parts() -> tuple:
+     (active, blocked, unseen, remote_stale, waiting, parked, held, stalled,
+      remote_keys) = _all_counts(include_snapshot=True)
+@@ -1940,46 +1852,17 @@ def _annotation_snapshot() -> tuple:
+         finally:
+             _annotate_refresh_lock.release()
+     try:
+-        unchanged = _unchanged_inputs(scope)
+-    except Exception:  # health: allow BLE001 -- only a shortcut probe; the bounded refresh reports a real read error
+-        _log.debug("kanban annotation input probe failed; refreshing", exc_info=True)
+-        unchanged = None
+-    if unchanged is not None:
+-        # [daveey] Nothing the read depends on moved: re-read inline, where every heavy part is a cache hit (no
+-        # refresh thread, no recompute). It still runs the waiting sources and dates a new observation.
+-        read_at, fingerprints = unchanged
+-        _inputs_pin.fingerprints = fingerprints
+-        try:
+-            return _refresh_annotation_locked(scope, read_at)
+-        finally:
+-            _inputs_pin.fingerprints = None
+-            _annotate_refresh_lock.release()
++        parts = _revalidate.refresh_if_unchanged(scope, _refresh_annotation_locked)
++    except BaseException:
++        _annotate_refresh_lock.release()
++        raise
++    if parts is not None:
++        _annotate_refresh_lock.release()
++        return parts
+     return _bounded.refresh_bounded(lambda: _refresh_annotation_locked(scope), _annotate_refresh_lock, previous,
+                                     _REFRESH_WAIT_S)
+ 
+ 
+-def _unchanged_inputs(scope: tuple[str, ...]) -> tuple[float, tuple] | None:
+-    """``(wall time, pinned fingerprints)`` when a read of ``scope`` now would be all cache hits: the counts answer
+-    for the boards' current content revisions (``_counts_fresh``) and the attention counts (when checks are
+-    registered) for the local boards'. None otherwise, or while nothing is cached. [daveey] On David-MBP a Desktop
+-    poll started a refresh thread every ~3 s (20/min) although board content moved in 3 of 60 polls."""
+-    with _cache_lock:
+-        if _cache is None or _cache_scope != scope:
+-            return None
+-    read_at = time.time()
+-    mono = time.monotonic()
+-    local = _activity_fingerprint(include_shadows=False)
+-    full = local + _shadow_fingerprint()  # one read of each board serves both keys
+-    with _cache_lock:
+-        if not _counts_fresh(scope, full, mono):
+-            return None
+-    if _done_checks and _attention.get(scope, mono) is None:
+-        key = _attention_key(local, read_at)
+-        if key is None or _attention.get(scope, mono, key) is None:
+-            return None
+-    return read_at, (local, full)
+-
+-
+ annotation_read_at = _bounded.read_at
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity_origin_snapshot.py b/hermes_cli/kanban_session_activity_origin_snapshot.py
+new file mode 100644
+index 00000000000..1ecfcd73986
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_origin_snapshot.py
+@@ -0,0 +1,50 @@
++"""The durable origin-work snapshot behind the remote-links projection (moved from kanban_session_activity, which
++re-exports it as ``_remote_snapshot``: patch it there)."""
++
++from __future__ import annotations
++
++import json
++from typing import Any
++
++
++def remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str, Any]] | None:
++    """Durable last-known origin obligations, separate from the replaceable hub replica.
++
++    A transaction replaces the snapshot atomically; failed writes propagate rather than
++    claiming a durable association. This is a projection cache, not a second transport.
++    """
++    from hermes_cli import kanban_db
++    from hermes_cli import kanban_session_activity as _ksa  # lazy: that module imports this one; tests spy its seams
++
++    path = kanban_db.kanban_home() / "origin-work.db"
++    if cards is None:
++        if not path.exists():
++            return None
++        conn = _ksa._open_ro(path)
++    else:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        conn = _ksa._kanban_lockguard.connect(path, timeout=0.5)
++    try:
++        scope = json.dumps(_ksa._origin_scope())
++        if cards is not None:
++            with conn:
++                conn.execute("CREATE TABLE IF NOT EXISTS scoped_snapshot (scope TEXT PRIMARY KEY, data TEXT NOT NULL)")
++                conn.execute("INSERT OR REPLACE INTO scoped_snapshot VALUES (?, ?)", (scope, json.dumps(cards)))
++            return cards
++        # Historical snapshots omitted the origin profile. Never adopt or erase
++        # their obligations merely because a new scoped projection is available.
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshot'").fetchone():
++            old = conn.execute("SELECT data FROM snapshot WHERE id=1").fetchone()
++            if old is None or json.loads(old[0]) != []:
++                raise ValueError("unqualified origin-work snapshot requires explicit reconciliation")
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scoped_snapshot'").fetchone():
++            return None
++        row = conn.execute("SELECT data FROM scoped_snapshot WHERE scope=?", (scope,)).fetchone()
++        if row is None:
++            return None
++        saved = json.loads(row[0])
++        if not isinstance(saved, list) or any(not isinstance(c, dict) or not c.get("session") or not c.get("id") for c in saved):
++            raise ValueError("invalid origin-work snapshot")
++        return saved
++    finally:
++        conn.close()
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+new file mode 100644
+index 00000000000..11e02bc1daa
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -0,0 +1,105 @@
++"""Serve the kanban annotation inline while nothing it reads has moved. [daveey]
++
++On David-MBP a Desktop session-list poll started a refresh thread every ~3 s (20/min) although board content moved in
++3 of 60 polls (t_01a19d0bcab45558): the counts TTL (3 s) and the attention TTL (30 s) expired with unchanged inputs.
++Past its TTL a cached read is still the answer while the boards' fingerprint is unchanged and proves "no write since"
++(``revalidatable``), up to a max age that bounds the time-derived states no key sees. A board write moves its content
++revision, so it is never hidden (read-your-writes).
++
++State stays in ``kanban_session_activity`` (late-bound ``_ksa``: that module imports this one).
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import time
++
++_log = logging.getLogger("hermes_cli.kanban_session_activity")
++
++STAT_SETTLED_S = 2.0
++
++# Set by ``refresh_if_unchanged`` while it re-reads a scope whose inputs it just found unchanged:
++# ``(without shadows or None, with shadows)``, so the readers do not read every board's revision again (per thread).
++inputs_pin = threading.local()
++
++
++def revalidatable(fingerprint: tuple, wall: float) -> bool:
++    """True when ``fingerprint`` (taken at wall time ``wall``) proves no write since: every board is keyed by its
++    content revision, or by a file stat last modified more than ``STAT_SETTLED_S`` before ``wall``. A stat key can
++    miss a same-size commit inside the mtime tick of the previous one; a write after a settled stat lands in a later
++    tick and moves it. (A board no current writer opened, e.g. ``boards/_archived``, has only its stat.)"""
++    for entry in fingerprint:
++        if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], tuple) and entry[1][:1] == ("stat",):
++            for st in entry[1][1] if len(entry[1]) > 1 and isinstance(entry[1][1], tuple) else (None,):
++                if st is not None and (not isinstance(st, tuple) or len(st) < 4 or st[3] / 1e9 > wall - STAT_SETTLED_S):
++                    return False
++    return True
++
++
++def counts_fresh(scope: tuple[str, ...], fingerprint: tuple, now: float) -> bool:
++    """Caller holds ``_ksa._cache_lock``. The cached counts answer for ``fingerprint``: same scope and inputs, and
++    either within the TTL or (``revalidatable`` fingerprint) younger than ``_ksa._COUNTS_MAX_AGE_S``."""
++    from hermes_cli import kanban_session_activity as _ksa
++    cache = _ksa._cache
++    if cache is None or _ksa._cache_scope != scope or fingerprint != _ksa._cache_fingerprint:
++        return False
++    if now < cache[0]:
++        return True
++    return _ksa._cache_revalidatable and now < _ksa._cache_read_at + _ksa._COUNTS_MAX_AGE_S
++
++
++def attention_key(local: tuple | None = None, wall: float | None = None) -> tuple | None:
++    """What the done checks read: the local boards' content keys (``local``, taken at ``wall``, when the caller
++    already has them). None unless ``revalidatable``, or when the boards can't be read: then only the TTL serves the
++    cache."""
++    from hermes_cli import kanban_session_activity as _ksa
++    if local is None:
++        wall = time.time()
++        try:
++            local = _ksa._activity_fingerprint(include_shadows=False)
++        except Exception:  # health: allow BLE001 -- a revalidation input; the recompute surfaces a real read error
++            _log.debug("kanban attention key unavailable", exc_info=True)
++            return None
++    return local if revalidatable(local, time.time() if wall is None else wall) else None
++
++
++def unchanged_inputs(scope: tuple[str, ...]) -> tuple[float, tuple] | None:
++    """``(wall time, pinned fingerprints)`` when a read of ``scope`` now would be all cache hits: the counts answer
++    for the boards' current content revisions (``counts_fresh``) and the attention counts (when checks are
++    registered) for the local boards'. None otherwise, or while nothing is cached."""
++    from hermes_cli import kanban_session_activity as _ksa
++    with _ksa._cache_lock:
++        if _ksa._cache is None or _ksa._cache_scope != scope:
++            return None
++    read_at = time.time()
++    mono = time.monotonic()
++    local = _ksa._activity_fingerprint(include_shadows=False)
++    full = local + _ksa._shadow_fingerprint()  # one read of each board serves both keys
++    with _ksa._cache_lock:
++        if not counts_fresh(scope, full, mono):
++            return None
++    if _ksa._done_checks and _ksa._attention.get(scope, mono) is None:
++        key = attention_key(local, read_at)
++        if key is None or _ksa._attention.get(scope, mono, key) is None:
++            return None
++    return read_at, (local, full)
++
++
++def refresh_if_unchanged(scope: tuple[str, ...], refresh) -> tuple | None:
++    """Caller holds the annotation refresh lock. When nothing the read depends on moved, re-read inline, where every
++    heavy part is a cache hit (no refresh thread, no recompute; the waiting sources still run and a new observation
++    is dated): ``refresh(scope, read_at)``'s parts. None when an input moved (or the probe failed)."""
++    try:
++        unchanged = unchanged_inputs(scope)
++    except Exception:  # health: allow BLE001 -- only a shortcut probe; the bounded refresh reports a real read error
++        _log.debug("kanban annotation input probe failed; refreshing", exc_info=True)
++        return None
++    if unchanged is None:
++        return None
++    read_at, fingerprints = unchanged
++    inputs_pin.fingerprints = fingerprints
++    try:
++        return refresh(scope, read_at)
++    finally:
++        inputs_pin.fingerprints = None
+-- 
+2.55.0
+

@@ -1,0 +1,275 @@
+From e4b3ebe8053707dac5a70fb521afcd930684f758 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 02:27:52 +0000
+Subject: [PATCH] fix(kanban-sync): an older core refuses to sync a board a
+ newer core migrated [daveey]
+
+The hub's askeve-reviewer gateway (pinned core 1f926111, before #461) held the
+host .sync.lock and pushed every hub card. _wire_fields drops columns the
+client does not declare, so worker-first cards reached the Board without
+placement_policy, the pull wrote NULL back, and they ran on the hub instead of
+a pool worker. Nothing failed loudly.
+
+push() and the board round now raise SchemaAhead when the board holds columns
+this core neither syncs nor keeps local (undeclared_columns), leaving the
+outbox pending for a current core; run_forever gives the sync role up (ERROR
+log) so a current gateway can take it. Card t_01a19ec3963141dd.
+---
+ hermes_cli/kanban_sync_client.py              |  60 +++++++-
+ .../test_kanban_sync_schema_guard.py          | 131 ++++++++++++++++++
+ 2 files changed, 190 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_schema_guard.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 23a82c2099e..9b7624190a9 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -71,6 +71,38 @@ class Resync(Exception):
+     """The cursor is below the service's retention floor: rebuild from a snapshot."""
+ 
+ 
++class SchemaAhead(RuntimeError):
++    """The board holds columns this core neither syncs nor keeps local: a newer core migrated it. Pushing would
++    silently drop those columns from every op (``_wire_fields``), so this core must not sync the board. [daveey]"""
++
++    def __init__(self, columns: dict[str, set[str]]) -> None:
++        self.columns = columns
++        named = "; ".join(f"{t}: {', '.join(sorted(c))}" for t, c in sorted(columns.items()))
++        super().__init__(f"this core does not declare columns a newer core added ({named}); refusing to sync "
++                         "so their values are not dropped. Run a current core in the gateway that holds the "
++                         "host sync role")
++
++
++# (db file, schema_version, identity of the declared tasks columns) -> undeclared columns.
++_SCHEMA_SEEN: dict[tuple[str, int, int], dict[str, set[str]]] = {}
++
++
++def schema_ahead(conn: sqlite3.Connection) -> dict[str, set[str]]:
++    """Per synced table, the columns this core does not know (``undeclared_columns``), cached per schema version
++    so a round costs one PRAGMA, not one per table. [daveey]"""
++    version = conn.execute("PRAGMA schema_version").fetchone()[0]
++    key = (str(sync._db_key(conn)), int(version), id(sync.SYNCED_COLUMNS["tasks"]))
++    if key not in _SCHEMA_SEEN:
++        _SCHEMA_SEEN[key] = sync.undeclared_columns(conn)
++    return _SCHEMA_SEEN[key]
++
++
++def refuse_if_schema_ahead(conn: sqlite3.Connection) -> None:
++    ahead = schema_ahead(conn)
++    if ahead:
++        raise SchemaAhead(ahead)
++
++
+ @dataclass(frozen=True)
+ class Identity:
+     url: str
+@@ -516,6 +548,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+          max_batches: int = MAX_BATCHES_PER_ROUND) -> PushResult:
+     """Drain pending outbox rows in FIFO batches. A transport failure leaves them pending (retried next round)."""
+     from hermes_cli.kanban_db_connect import write_txn
++    refuse_if_schema_ahead(conn)  # an older core would strip the newer columns; the ops stay pending [daveey]
+     out = PushResult()
+     for _ in range(max_batches):
+         rows = [dict(r) for r in conn.execute(
+@@ -808,6 +841,7 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+         result = RoundResult(board=slug, mode=mode)
+         if mode == "off":
+             return result
++        refuse_if_schema_ahead(live)  # before pull/repair: an older core must not act on a newer board [daveey]
+         ensure_identity(live, slug, gateway)
+         with _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             result.pulled = pulled
+@@ -903,6 +937,9 @@ def sync_all_once(hub: Optional[Hub] = None, *,
+     for slug, path in board_paths() if boards is None else boards:
+         try:
+             results.append(sync_board(slug, path, hub, ident.gateway))
++        except SchemaAhead as exc:
++            _log.error("kanban sync: %s not synced: %s", slug, exc)
++            results.append(RoundResult(board=slug, mode="?", error=f"SchemaAhead: {exc}"))
+         except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable, SyncRoundBusy) as exc:
+             _log.warning("kanban sync: round for %s failed (%s: %s)", slug, type(exc).__name__, exc)
+             results.append(RoundResult(board=slug, mode="?", error=f"{type(exc).__name__}: {exc}"))
+@@ -1284,6 +1321,8 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+     except SyncUnavailable as exc:
+         _log.warning("%s; kanban sync not started", exc)
+         return
++    if _schema_ahead_boards(board_paths()):
++        return  # give the host sync role up: a current core's gateway can take it [daveey]
+     hub = Hub(ident)
+     sync.set_lease_client(HubLeaseClient(hub))
+     period = float(interval or sync.sync_config().get("interval_seconds") or DEFAULT_INTERVAL_S)
+@@ -1305,7 +1344,11 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+                 watchers[slug].start()
+         selected = work.select(boards, time.monotonic(), outbox_pending)
+         selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
+-        for r in sync_all_once(hub, boards=selected):
++        results = sync_all_once(hub, boards=selected)
++        if any((r.error or "").startswith("SchemaAhead") for r in results):
++            _log.error("kanban sync: a newer core migrated this host's board; giving up the sync role")
++            return
++        for r in results:
+             work.finished(r.board, not r.error)
+             if r.push and (r.push.sent or r.push.rejected):
+                 _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+@@ -1321,6 +1364,21 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+         wait_for_work(wake, [p for _s, p in boards], remaining, keep_running)
+ 
+ 
++def _schema_ahead_boards(boards: list[tuple[str, Path]]) -> list[str]:
++    """Boards a newer core migrated (logged at ERROR). An unreadable board is left to the round's own errors."""
++    ahead = []
++    for slug, path in boards:
++        try:
++            with connection(path, lambda p=path: _connect(p)) as conn:
++                cols = schema_ahead(conn)
++        except (sqlite3.Error, OSError):
++            cols = {}
++        if cols:
++            _log.error("kanban sync: not starting: board %s: %s", slug, SchemaAhead(cols))
++            ahead.append(slug)
++    return ahead
++
++
+ # --- import ---------------------------------------------------------------------------------------
+ 
+ def _row_fields(conn: sqlite3.Connection, table: str, row: sqlite3.Row) -> dict:
+diff --git a/tests/hermes_cli/test_kanban_sync_schema_guard.py b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+new file mode 100644
+index 00000000000..7751a1e5f31
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+@@ -0,0 +1,131 @@
++"""A sync client whose core is older than the board's schema must not push. [daveey]
++
++Incident (2026-11-02, hermes-hub): the askeve-reviewer gateway ran a pinned core (1f926111) that predates
++``placement_policy`` in ``SYNCED_COLUMNS["tasks"]`` (#461). It won the host-wide ``.sync.lock`` and pushed every
++hub card. ``_wire_fields`` drops a column the client does not declare, so the Board row of every worker-first card
++lacked ``placement_policy``; the pull then wrote NULL back locally and the cards ran on the hub instead of a pool
++worker. Nothing failed loudly.
++
++The guard: a board whose tables hold a column this core neither syncs nor keeps local was migrated by a newer core.
++``push`` refuses (``SchemaAhead``), leaves the outbox pending for a core that knows the column, and
++``run_forever`` gives the sync role up so a current gateway can take it.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, BOARD = "hub", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET mode = 'primary'")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _old_core(monkeypatch) -> None:
++    """This process now declares the columns of a core from before #461 (no ``placement_policy``)."""
++    monkeypatch.setitem(sync.SYNCED_COLUMNS, "tasks", sync.SYNCED_COLUMNS["tasks"] - {"placement_policy"})
++
++
++def _board_row(svc, tid):
++    return svc.board(BOARD)["rows"].get("tasks", {}).get(tid)
++
++
++def _pending(conn):
++    return conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'pending'").fetchone()[0]
++
++
++def test_current_core_pushes_placement_policy_to_the_board(live, svc):
++    tid = kb.create_task(live, title="Summarize public data", assignee="default",
++                         placement_policy="worker-first-v1")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    row = _board_row(svc, tid)
++    assert row["placement_policy"] == "worker-first-v1"
++    assert "placement_policy" in row["field_hlc"]
++    assert _pending(live) == 0
++
++
++def test_tool_created_worker_first_card_keeps_placement_policy_on_the_board(kanban_home, live, svc, monkeypatch):
++    """The live path: ``kanban_create`` with the default placement on a gateway with a worker pool."""
++    (kanban_home / "config.yaml").write_text(
++        "kanban:\n  sync:\n    enabled: true\n  placement:\n    worker_pools:\n      hub: [worker-1]\n")
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: ME)
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Summarize public data", "assignee": "default",
++                                        "requires": ["terminal"]}))
++    assert out.get("placement", {}).get("placement_policy") == "worker-first-v1", out
++    tid = out["task_id"]
++    assert live.execute("SELECT placement_policy FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "worker-first-v1"
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    assert _board_row(svc, tid)["placement_policy"] == "worker-first-v1"
++
++
++def test_schema_ahead_names_the_unknown_columns(live, monkeypatch):
++    assert ksc.schema_ahead(live) == {}
++    _old_core(monkeypatch)
++    assert ksc.schema_ahead(live) == {"tasks": {"placement_policy"}}
++
++
++def test_older_core_refuses_to_push_and_keeps_the_ops(live, svc, monkeypatch):
++    tid = kb.create_task(live, title="Summarize public data", assignee="default",
++                         placement_policy="worker-first-v1")
++    _old_core(monkeypatch)
++    with pytest.raises(ksc.SchemaAhead) as err:
++        ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    assert "placement_policy" in str(err.value)
++    assert _board_row(svc, tid) is None  # nothing reached the Board without the column
++    assert _pending(live) >= 1  # kept for a core that declares it
++    monkeypatch.undo()
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    assert _board_row(svc, tid)["placement_policy"] == "worker-first-v1"
++
++
++def test_older_core_round_reports_the_refusal(kanban_home, live, svc, monkeypatch):
++    kb.create_task(live, title="x", assignee="default", placement_policy="worker-first-v1")
++    _old_core(monkeypatch)
++    results = ksc.sync_all_once(svc.hub(ME), boards=[(BOARD, kanban_home / "kanban.db")])
++    assert results[0].error and results[0].error.startswith("SchemaAhead")
++
++
++def test_run_forever_gives_up_the_sync_role_on_an_older_core(kanban_home, live, svc, monkeypatch, caplog):
++    _old_core(monkeypatch)
++    hub = svc.hub(ME)
++    monkeypatch.setattr(ksc, "load_identity", lambda: hub.ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident: hub)
++    monkeypatch.setattr(ksc, "board_paths", lambda: [(BOARD, kanban_home / "kanban.db")])
++    monkeypatch.setattr(ksc, "FeedWatcher", lambda *a, **k: pytest.fail("feed started on an older core"))
++    ticks = iter(range(3))
++    with caplog.at_level("ERROR", logger=ksc._log.name):
++        ksc.run_forever(lambda: next(ticks, None) is not None, sleep=lambda _s: None)
++    assert any("placement_policy" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+-- 
+2.55.0
+

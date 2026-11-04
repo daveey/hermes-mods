@@ -1,0 +1,702 @@
+From d2fdacd98aec6deeda34a462988275bd2cea4570 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:58:47 +0000
+Subject: [PATCH] [daveey] Skip unchanged sync-loop chat-link passes and pin
+ placement config per round
+
+reconcile_links ran every 60 s unconditionally: each pass re-ran
+kanban_chat_links.reconcile and its creator-chats backfill over every task,
+subscription, ledger row and replica link, and every placeholder check
+reloaded the placement config (5051 loads per pass on a 600-card probe board).
+
+- reconcile_links(skip_unchanged=True), used by run_forever, skips a board
+  whose inputs equal its last completed pass: live file identity +
+  kanban_activity_revision (transactional, covers tasks/events/subs/links,
+  ignores bookkeeping columns), replica identity + feed cursor (read through
+  the loop's pooled, generation-recovered handle), this gateway's ledger rows
+  for the board (by value), mode, gateway/profile/home and placement config.
+  Inputs are read before the pass, so a commit during it (including the
+  pass's own writes) re-arms the next pass; a failed pass records nothing.
+  LINKS_MAX_AGE_S (300 s) bounds the unkeyed state.db machine-session input.
+  Explicit callers (hermes kanban sync links) still always reconcile.
+- Boards are borrowed through the existing connection_scope pool.
+- kanban_placement.config_snapshot pins one placement load per sync round
+  and links pass (thread-local, nested-safe); config() honours it.
+
+Probe (thread CPU, unchanged rounds, 600 / 1500 cards): links pass
+303 -> 15 ms / 822 -> 47 ms; sync_board + links 310 -> 22 ms / 845 -> 66 ms;
+links rows identical before/after.
+---
+ hermes_cli/kanban_placement.py                |  29 +-
+ hermes_cli/kanban_sync_client.py              | 132 +++++-
+ .../test_kanban_sync_connected_feed.py        |   2 +-
+ .../test_kanban_sync_connections.py           |   2 +-
+ .../test_kanban_sync_steady_links.py          | 382 ++++++++++++++++++
+ .../test_kanban_sync_targeted_rounds.py       |   2 +-
+ tests/hermes_cli/test_machine_metrics.py      |   2 +-
+ 7 files changed, 524 insertions(+), 27 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_steady_links.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index f610ced035d..595a3bd4eca 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -67,8 +67,10 @@ import hashlib
+ import json
+ import re
+ import subprocess
++import threading
+ import time
+-from typing import Callable, Optional
++from contextlib import contextmanager
++from typing import Callable, Iterator, Optional
+ 
+ from hermes_cli import kanban_capability_registry as reg
+ 
+@@ -254,7 +256,32 @@ def target_info(target: str, *, now: float, remote: Optional[dict] = None) -> di
+     return {"profiles": profiles, "tools": tools}
+ 
+ 
++_round_config = threading.local()  # .cfg: the placement config pinned by ``config_snapshot`` on this thread
++
++
++@contextmanager
++def config_snapshot() -> Iterator[dict]:
++    """Pin one placement-config load for this thread while the block runs (one sync round or links pass). [daveey]
++
++    Placeholder checks run per task, subscription and link row, and each unpinned check reloaded the config: about 5k
++    loads per chat-link pass on a 600-card board (2026-11-02). Nested snapshots share the outer one; another thread
++    never sees it. The next block loads afresh, so a config edit applies from the next round.
++    """
++    pinned = getattr(_round_config, "cfg", None)
++    if pinned is not None:
++        yield pinned
++        return
++    _round_config.cfg = cfg = config()
++    try:
++        yield cfg
++    finally:
++        _round_config.cfg = None
++
++
+ def config() -> dict:
++    pinned = getattr(_round_config, "cfg", None)
++    if pinned is not None:
++        return pinned
+     try:
+         from hermes_cli.config import load_config_readonly
+         cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("placement") or {}
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 6b0d00ced05..0417acb7a3d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -790,8 +790,9 @@ def _pull_replica(slug: str, hub: Hub, gateway: str) -> int:
+ 
+ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+     """Exclude explicit detach until this round's repairs and sends have ended."""
++    from hermes_cli.kanban_placement import config_snapshot
+     from hermes_cli.kanban_sync_guard import board_sync_lock
+-    with board_sync_lock(path):
++    with board_sync_lock(path), config_snapshot():  # one placement load per round, not one per placeholder check
+         return _sync_board_locked(slug, path, hub, gateway)
+ 
+ 
+@@ -971,32 +972,118 @@ class FeedWatcher:
+ 
+ 
+ LINKS_EVERY_S = 60.0
++# Machine-session sources come from state.db (``kanban_db_notify._local_session_sources``), which is not in a links
++# pass's key: a missing session is re-read after its 300 s TTL. An unchanged board is still reconciled this long after
++# its last pass, so a session classified later is released within the same bound as before. [daveey]
++LINKS_MAX_AGE_S = 300.0
++# Per board file: (inputs, started at) of the last completed links pass (see ``_links_inputs``).
++_LINKS_DONE: dict[str, tuple[tuple, float]] = {}
+ 
+ 
+-def reconcile_links(boards: list[tuple[str, Path]], gateway: str) -> None:
++def _links_clock() -> float:
++    return time.monotonic()
++
++
++def _ledger_slices(cards: Iterable[Mapping[str, Any]], gateway: str) -> dict[str, frozenset]:
++    """Per board, every field of this gateway's origin-ledger rows that a links pass reads (``ledger_boards``,
++    ``kanban_chat_links._ledger_links``). Compared by value: a re-projection with the same rows is no change."""
++    out: dict[str, set] = {}
++    for c in cards:
++        if not c.get("board") or c.get("origin_gateway") not in (None, gateway):
++            continue
++        out.setdefault(str(c["board"]), set()).add(
++            (c.get("id"), c.get("session"), c.get("via"), c.get("origin_profile"), bool(c.get("released"))))
++    return {board: frozenset(rows) for board, rows in out.items()}
++
++
++def _links_signature(gateway: str, placement: Mapping[str, Any]) -> Optional[tuple]:
++    """The configuration a links pass reads besides its board: gateway names, profile, homes, placement config."""
++    try:
++        from hermes_constants import get_hermes_home
++        from hermes_cli.kanban_origin import gateway_names
++        from hermes_cli.profiles import get_active_profile_name
++        return (gateway, gateway_names()[0], get_active_profile_name(), str(get_hermes_home()),
++                json.dumps(placement, sort_keys=True, default=str))
++    except (OSError, sqlite3.Error, TypeError, ValueError):
++        return None
++
++
++def _links_inputs(conn: sqlite3.Connection, path: Path, slug: str, gateway: str, mode: str,
++                  ledger: Optional[dict[str, frozenset]], signature: Optional[tuple]) -> Optional[tuple]:
++    """Everything one board's links pass (``kanban_chat_links.reconcile`` with its creator-chats backfill) reads,
++    besides state.db (``LINKS_MAX_AGE_S``): the live file's identity and transactional activity revision (tasks,
++    events, subscriptions, links; trigger-backed, so dispatcher clocks and sync stamps do not move it), the replica's
++    identity and feed cursor (its only writer besides the ``pulled_at`` stamp is the pull), this gateway's ledger rows
++    for the board, the mode and the configuration. Read before the pass, so a commit during it re-arms the next one.
++    None (cannot tell: no counter, unreadable file) always reconciles. [daveey]"""
++    from hermes_cli import kanban_activity_revision as rev
++    if ledger is None or signature is None:
++        return None
++    try:
++        st = os.stat(path)
++        revision = rev.read_key(conn, rev.LOCAL_TABLES)
++        if revision is None:
++            return None
++        shadow = shadow_path(slug)
++        if not shadow.exists():
++            replica: tuple = ("absent",)
++        else:
++            # The loop's own pooled replica handle (generation-recovered on borrow), not another connection.
++            with connection(shadow, lambda: open_shadow(slug, gateway)) as replica_conn:
++                rst = os.stat(shadow)
++                replica = (rst.st_dev, rst.st_ino, int((sync.sync_state(replica_conn) or {}).get("cursor") or 0))
++    except (OSError, sqlite3.Error, TypeError, ValueError):
++        return None
++    return (st.st_dev, st.st_ino), revision, replica, ledger.get(slug, frozenset()), mode, signature
++
++
++def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchanged: bool = False) -> None:
+     """Bring this gateway's chat links up to date in every synced board (kanban_chat_links.reconcile), creating a
+-    link-only board for each board this gateway's chats have cards on but this host does not have."""
++    link-only board for each board this gateway's chats have cards on but this host does not have.
++
++    ``skip_unchanged`` (the sync loop): a board whose links-pass inputs (``_links_inputs``) equal those of its last
++    completed pass, less than ``LINKS_MAX_AGE_S`` ago, is not reconciled again. A failed pass records nothing, so the
++    next one retries. Explicit callers (``hermes kanban sync links``) always reconcile. Boards are borrowed through
++    the loop's connection scope (``kanban_sync_connections``). [daveey]"""
+     from hermes_cli import kanban_chat_links
+-    try:
+-        created = ensure_link_boards(kanban_chat_links.ledger_boards(gateway), gateway)
+-        if created:
+-            _log.info("kanban sync: link-only boards %s", created)
+-            boards = board_paths()
+-    except Exception as exc:  # health: allow BLE001 -- link-only boards are best effort; local links still reconcile
+-        _log.warning("kanban sync: link-only boards failed (%s: %s)", type(exc).__name__, exc)
+-    for slug, path in boards:
++    from hermes_cli.kanban_placement import config_snapshot
++    with config_snapshot() as placement:
++        ledger: Optional[dict[str, frozenset]] = None
+         try:
+-            conn = _connect(path)
++            from hermes_cli.kanban_session_activity import _remote_links
++            ledger = _ledger_slices(_remote_links(), gateway)
++            local = {slug for slug, _path in boards}
++            if not skip_unchanged or set(ledger) - local:
++                created = ensure_link_boards(set(ledger), gateway)
++                if created:
++                    _log.info("kanban sync: link-only boards %s", created)
++                    boards = board_paths()
++        except Exception as exc:  # health: allow BLE001 -- link-only boards are best effort; local links still reconcile
++            _log.warning("kanban sync: link-only boards failed (%s: %s)", type(exc).__name__, exc)
++        signature = _links_signature(gateway, placement) if skip_unchanged else None
++        for slug, path in boards:
++            key = str(path)
+             try:
+-                if sync.board_mode(conn) == "off":
+-                    continue
+-                counts = kanban_chat_links.reconcile(conn, slug, gateway)
+-            finally:
+-                conn.close()
+-            if any(counts.values()):
+-                _log.info("kanban sync: %s chat links %s", slug, counts)
+-        except Exception as exc:  # health: allow BLE001 -- one board's links must not stop the sync loop
+-            _log.warning("kanban sync: chat links for %s failed (%s: %s)", slug, type(exc).__name__, exc)
++                with connection(path, lambda: _connect(path)) as conn:
++                    mode = sync.board_mode(conn)
++                    if mode == "off":
++                        continue
++                    inputs, started = None, 0.0
++                    if skip_unchanged:
++                        inputs = _links_inputs(conn, path, slug, gateway, mode, ledger, signature)
++                        done = _LINKS_DONE.pop(key, None)
++                        started = _links_clock()
++                        if inputs is not None and done is not None and done[0] == inputs \
++                                and started - done[1] < LINKS_MAX_AGE_S:
++                            _LINKS_DONE[key] = done
++                            continue
++                    counts = kanban_chat_links.reconcile(conn, slug, gateway)
++                    if inputs is not None:
++                        _LINKS_DONE[key] = (inputs, started)
++                if any(counts.values()):
++                    _log.info("kanban sync: %s chat links %s", slug, counts)
++            except Exception as exc:  # health: allow BLE001 -- one board's links must not stop the sync loop
++                _log.warning("kanban sync: chat links for %s failed (%s: %s)", slug, type(exc).__name__, exc)
+ 
+ 
+ class _BoardWatch:
+@@ -1098,6 +1185,7 @@ def reset_board_watch() -> None:
+     _REPAIRED.clear()
+     _REPAIRED_AT.clear()
+     _REPAIR_DEFERRED.clear()
++    _LINKS_DONE.clear()
+ 
+ 
+ def _defer_repair(key: str, inputs: Optional[tuple]) -> bool:
+@@ -1221,7 +1309,7 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+                 _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+                           r.push.sent, r.push.rejected)
+         if time.monotonic() >= next_links:
+-            reconcile_links(boards, ident.gateway)
++            reconcile_links(boards, ident.gateway, skip_unchanged=True)
+             next_links = time.monotonic() + LINKS_EVERY_S
+         metrics.report_due()
+         remaining = max(0.0, work.deadline - time.monotonic())
+diff --git a/tests/hermes_cli/test_kanban_sync_connected_feed.py b/tests/hermes_cli/test_kanban_sync_connected_feed.py
+index 9ae61072ffb..3675d694654 100644
+--- a/tests/hermes_cli/test_kanban_sync_connected_feed.py
++++ b/tests/hermes_cli/test_kanban_sync_connected_feed.py
+@@ -81,7 +81,7 @@ def test_connected_feed_skips_unchanged_poll_and_observes_next_change(monkeypatc
+     monkeypatch.setattr(client, 'board_paths', lambda: boards)
+     monkeypatch.setattr(client.sync, 'set_lease_client', lambda _: None)
+     monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda _: None)
+-    monkeypatch.setattr(client, 'reconcile_links', lambda *args: None)
++    monkeypatch.setattr(client, 'reconcile_links', lambda *args, **kwargs: None)
+     monkeypatch.setattr(client, 'outbox_pending', lambda paths: any(p in pending for p in paths))
+     monkeypatch.setattr(client, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
+     from hermes_cli import machine_metrics
+diff --git a/tests/hermes_cli/test_kanban_sync_connections.py b/tests/hermes_cli/test_kanban_sync_connections.py
+index 3bf3d9d5563..998f3a8157f 100644
+--- a/tests/hermes_cli/test_kanban_sync_connections.py
++++ b/tests/hermes_cli/test_kanban_sync_connections.py
+@@ -269,7 +269,7 @@ def test_run_forever_owns_and_closes_connections(board, opened, monkeypatch, fai
+     monkeypatch.setattr(client, "Hub", lambda ident: hub)
+     monkeypatch.setattr(client.sync, "set_lease_client", lambda value: None)
+     monkeypatch.setattr(client, "board_paths", list)
+-    monkeypatch.setattr(client, "reconcile_links", lambda *args: None)
++    monkeypatch.setattr(client, "reconcile_links", lambda *args, **kwargs: None)
+     monkeypatch.setattr(machine_metrics, "Reporter", lambda *args: SimpleNamespace(report_due=lambda: None))
+     # FakeHub has no metrics transport; the loop only needs this for Reporter construction.
+     monkeypatch.setattr(hub, "report_metrics", lambda *args: None, raising=False)
+diff --git a/tests/hermes_cli/test_kanban_sync_steady_links.py b/tests/hermes_cli/test_kanban_sync_steady_links.py
+new file mode 100644
+index 00000000000..c84af7e77e4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_steady_links.py
+@@ -0,0 +1,382 @@
++"""A steady sync loop must not redo the chat-link reconcile (and its creator-chats backfill) when none of its inputs
++changed, and must redo it the very next pass when one did. [daveey]
++
++Gateway profile 2026-11-02 (task t_01a19d0bcbc52b4b): ``reconcile_links`` ran every 60 s unconditionally, re-reading
++every task, subscription, ledger row and replica link of every board, and each placeholder check reloaded the
++placement config (about 5k config loads per pass on a 600-card board). Its inputs are the live board's activity
++revision, the replica's identity and feed cursor, this gateway's slice of the origin-ledger projection, the board
++mode and the placement/gateway/profile config; state.db machine-session sources are bounded by a maximum age.
++"""
++
++from __future__ import annotations
++
++import os
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_creator_chats as creator_chats
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_sync_connections import connection_scope
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "macbook", "mini", "default"
++WORKER = "local-" + "7c" * 32  # a headless worker receipt session: its cards are creator-chats backfill candidates
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def ledger(monkeypatch):
++    rows: list[dict] = []
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: list(rows))
++    return rows
++
++
++@pytest.fixture
++def live(kanban_home, ledger):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    ksa._reset_cache_for_tests()
++    try:
++        yield conn
++    finally:
++        conn.close()
++        ksa._reset_cache_for_tests()
++
++
++@pytest.fixture
++def scope():
++    with connection_scope():
++        yield
++
++
++@pytest.fixture
++def spies(monkeypatch):
++    calls = {"reconcile": 0, "backfill": 0}
++    real_reconcile, real_backfill = links.reconcile, creator_chats.backfill
++
++    def reconcile(*a, **k):
++        calls["reconcile"] += 1
++        return real_reconcile(*a, **k)
++
++    def backfill(*a, **k):
++        calls["backfill"] += 1
++        return real_backfill(*a, **k)
++
++    monkeypatch.setattr(links, "reconcile", reconcile)
++    monkeypatch.setattr(creator_chats, "backfill", backfill)
++    return calls
++
++
++def _ledger_row(task_id, session, *, released=False, board=BOARD):
++    return {"id": task_id, "board": board, "gateway": OTHER, "key": f"{OTHER}/default/{board}/{task_id}",
++            "session": session, "via": "shepherd", "origin_gateway": ME, "origin_profile": "default",
++            "released": released, "status": "done" if released else "running", "unfinished": not released,
++            "title": task_id}
++
++
++def _links(conn):
++    return {(r[0], r[1], r[2], r[3]) for r in conn.execute(
++        "SELECT task_id, chat_session, kind, released FROM task_chat_links")}
++
++
++def _pass(kanban_home, boards=None):
++    ksc.reconcile_links(boards or [(BOARD, kanban_home / "kanban.db")], ME, skip_unchanged=True)
++
++
++def _seed(live, ledger):
++    creator = kb.create_task(live, title="creator", assignee="worker", session_id="s_creator")
++    kb.create_task(live, title="worker child", assignee="worker", session_id=WORKER, creator_task_id=creator)
++    orphan = kb.create_task(live, title="orphan", assignee="worker")
++    kb.create_task(live, title="unresolved child", assignee="worker", session_id=WORKER, creator_task_id=orphan)
++    ledger.append(_ledger_row("t_remote", "s_chat"))
++
++
++def _settled(live, ledger, kanban_home, spies):
++    _seed(live, ledger)
++    for _ in range(3):  # backfill resolves a worker child once pass 1 wrote its creator's link; pass 3 is stable
++        _pass(kanban_home)
++    spies["reconcile"] = spies["backfill"] = 0
++    return _links(live)
++
++
++def test_unchanged_passes_skip_reconcile_and_backfill_with_the_same_links(live, ledger, kanban_home, spies, scope):
++    settled = _settled(live, ledger, kanban_home, spies)
++    assert ("t_remote", "s_chat", "shepherd", 0) in settled
++    watch = sqlite3.connect(kanban_home / "kanban.db")
++    try:
++        version = watch.execute("PRAGMA data_version").fetchone()[0]
++        for _ in range(4):
++            _pass(kanban_home)
++        assert watch.execute("PRAGMA data_version").fetchone()[0] == version, "an unchanged pass wrote the board"
++    finally:
++        watch.close()
++    assert spies == {"reconcile": 0, "backfill": 0}
++    assert _links(live) == settled
++
++
++def test_a_live_board_change_reconciles_on_the_next_pass(live, ledger, kanban_home, spies, scope):
++    _settled(live, ledger, kanban_home, spies)
++    tid = kb.create_task(live, title="new", assignee="worker", session_id="s_new")
++    _pass(kanban_home)
++    assert spies["reconcile"] == 1 and spies["backfill"] == 1
++    assert (tid, "s_new", "created", 0) in _links(live)
++
++
++def test_a_subscription_change_reconciles_on_the_next_pass(live, ledger, kanban_home, spies, scope):
++    """``kanban_notify_subs`` is outside the repair revision's tables; the reconcile key must still see it."""
++    _settled(live, ledger, kanban_home, spies)
++    tid = live.execute("SELECT id FROM tasks WHERE title = 'creator'").fetchone()[0]
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) "
++                     "VALUES (?, 'tui', 's_watcher', 1)", (tid,))
++    _pass(kanban_home)
++    assert (tid, "s_watcher", "shepherd", 0) in _links(live)
++
++
++def test_a_ledger_change_reconciles_on_the_next_pass(live, ledger, kanban_home, spies, scope):
++    _settled(live, ledger, kanban_home, spies)
++    ledger[:] = [_ledger_row("t_remote", "s_chat", released=True)]
++    _pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert ("t_remote", "s_chat", "shepherd", 1) in _links(live)
++
++
++def test_a_ledger_board_this_host_lacks_gets_its_link_only_file_on_the_next_pass(live, ledger, kanban_home, spies,
++                                                                                  scope):
++    _settled(live, ledger, kanban_home, spies)
++    ledger.append(_ledger_row("t_run", "s_chat", board="runners"))
++    _pass(kanban_home, ksc.board_paths())
++    boards = dict(ksc.board_paths())
++    assert boards["runners"] == kanban_home / "kanban" / sync.LINKS_DIR / "runners.db"
++    conn = kbc.connect(boards["runners"])
++    try:
++        assert _links(conn) == {("t_run", "s_chat", "shepherd", 0)}
++    finally:
++        conn.close()
++
++
++def test_a_placement_config_change_reconciles_on_the_next_pass(live, ledger, kanban_home, spies, scope):
++    _settled(live, ledger, kanban_home, spies)
++    assert ("t_remote", "s_chat", "shepherd", 0) in _links(live)
++    (kanban_home / "config.yaml").write_text(
++        "kanban:\n  sync:\n    enabled: true\n  placement:\n    creator_session: s_chat\n")
++    _pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert not any(r[1] == "s_chat" for r in _links(live)), "a configured placeholder session kept its link"
++
++
++def test_a_replica_pull_reconciles_on_the_next_pass(live, ledger, svc, kanban_home, spies, scope):
++    """An owner-written ``created`` link for this gateway's chat on a closed foreign card arrives only through the
++    replica (its feed cursor moves); the chat's gateway must release it on the next pass."""
++    path = kanban_home / "kanban.db"
++    for _ in range(2):
++        ksc.sync_board(BOARD, path, svc.hub(ME), ME)
++    _settled(live, ledger, kanban_home, spies)
++    hlc = f"{int(time.time() * 1000):013d}-0000-{OTHER}"
++    uid = links.link_uid("t_theirs", ME, "default", "s1", "created")
++    svc.hub(OTHER).ops(BOARD, [
++        {"client_op_id": "o-t", "op": "upsert", "table": "tasks", "uid": "t_theirs", "hlc": hlc,
++         "fields": {"title": "theirs", "status": "done", "created_at": 1}},
++        {"client_op_id": "o-l", "op": "upsert", "table": "task_chat_links", "uid": uid, "hlc": hlc,
++         "fields": {"task_id": "t_theirs", "chat_gateway": ME, "chat_profile": "default", "chat_session": "s1",
++                    "kind": "created", "released": 0, "created_at": 1}}])
++    _pass(kanban_home)
++    assert spies["reconcile"] == 0, "nothing changed yet: the replica has not pulled"
++    ksc.sync_board(BOARD, path, svc.hub(ME), ME)
++    _pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert tuple(live.execute("SELECT released FROM task_chat_links WHERE uid = ?", (uid,)).fetchone()) == (1,)
++
++
++def test_a_failed_pass_retries_on_the_next_pass(live, ledger, kanban_home, spies, scope, monkeypatch):
++    _settled(live, ledger, kanban_home, spies)
++    tid = kb.create_task(live, title="new", assignee="worker", session_id="s_new")
++    spied = links.reconcile
++
++    def boom(*a, **k):
++        spies["reconcile"] += 1
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(links, "reconcile", boom)
++    _pass(kanban_home)
++    monkeypatch.setattr(links, "reconcile", spied)
++    _pass(kanban_home)
++    assert spies["reconcile"] == 2, spies  # failed, then retried
++    assert (tid, "s_new", "created", 0) in _links(live)
++    spies["reconcile"] = 0
++    _pass(kanban_home)
++    _pass(kanban_home)
++    assert spies["reconcile"] <= 1
++
++
++def test_a_write_during_a_pass_is_not_cached_as_reconciled(live, ledger, kanban_home, spies, scope, monkeypatch):
++    _settled(live, ledger, kanban_home, spies)
++    spied = links.reconcile
++    wrote: list[str] = []
++
++    def concurrent(conn, *a, **k):
++        out = spied(conn, *a, **k)
++        if not wrote:
++            other = kbc.connect(kanban_home / "kanban.db")
++            try:
++                wrote.append(kb.create_task(other, title="during", assignee="worker", session_id="s_during"))
++            finally:
++                other.close()
++        return out
++
++    monkeypatch.setattr(links, "reconcile", concurrent)
++    ledger.append(_ledger_row("t_more", "s_chat"))  # arm one pass
++    _pass(kanban_home)
++    assert wrote and not any(r[0] == wrote[0] for r in _links(live))
++    _pass(kanban_home)
++    assert (wrote[0], "s_during", "created", 0) in _links(live)
++
++
++def test_a_replaced_board_file_reconciles_on_the_next_pass(live, ledger, kanban_home, spies, scope):
++    _settled(live, ledger, kanban_home, spies)
++    path = kanban_home / "kanban.db"
++    copy = path.with_name("restored.db")
++    live.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    backup = sqlite3.connect(copy)
++    try:
++        live.backup(backup)
++        # A backup restarts the schema cookie; pin it so only the file generation tells the copies apart.
++        backup.execute(f"PRAGMA schema_version = {live.execute('PRAGMA schema_version').fetchone()[0]}")
++    finally:
++        backup.close()
++    inode = os.stat(path).st_ino
++    os.replace(copy, path)  # same content and revision, new file generation
++    assert os.stat(path).st_ino != inode
++    _pass(kanban_home)
++    assert spies["reconcile"] == 1
++
++
++def test_the_maximum_age_reconciles_an_unchanged_board(live, ledger, kanban_home, spies, scope, monkeypatch):
++    """State.db machine-session sources are not keyed (a missing session is re-read after its TTL); the pass is
++    bounded by ``LINKS_MAX_AGE_S`` instead."""
++    _settled(live, ledger, kanban_home, spies)
++    later = time.monotonic() + ksc.LINKS_MAX_AGE_S + 1
++    monkeypatch.setattr(ksc, "_links_clock", lambda: later)
++    _pass(kanban_home)
++    assert spies["reconcile"] == 1
++
++
++def test_an_explicit_reconcile_always_runs(live, ledger, kanban_home, spies, scope):
++    """``hermes kanban sync links`` (no ``skip_unchanged``) reconciles now, whatever the loop last saw."""
++    _settled(live, ledger, kanban_home, spies)
++    for _ in range(2):
++        ksc.reconcile_links([(BOARD, kanban_home / "kanban.db")], ME)
++    assert spies["reconcile"] == 2
++
++
++def test_the_loop_reuses_its_board_connection_across_passes(live, ledger, kanban_home, spies, scope, monkeypatch):
++    _seed(live, ledger)
++    opened = []
++    real = ksc._connect
++    monkeypatch.setattr(ksc, "_connect", lambda p: opened.append(p) or real(p))
++    for _ in range(3):
++        ksc.reconcile_links([(BOARD, kanban_home / "kanban.db")], ME)
++    assert len(opened) == 1, opened
++
++
++def _config_loads(monkeypatch):
++    """Config loads made for the placement config (``kanban_placement.config``), not other readers'."""
++    import sys
++    from hermes_cli import config as hconfig
++    from hermes_cli import kanban_placement
++    count = {"n": 0}
++    real = hconfig.load_config_readonly
++
++    def counted():
++        caller = sys._getframe(1)
++        if caller.f_code is kanban_placement.config.__code__:
++            count["n"] += 1
++        return real()
++
++    monkeypatch.setattr(hconfig, "load_config_readonly", counted)
++    return count
++
++
++@pytest.mark.parametrize("cards", [3, 40])
++def test_a_reconcile_pass_loads_the_placement_config_once(live, ledger, kanban_home, monkeypatch, scope, cards):
++    """Placeholder checks run per task, subscription and link row; they share one placement snapshot per pass."""
++    for i in range(cards):
++        tid = kb.create_task(live, title=f"c{i}", assignee="worker", session_id=f"s{i}")
++        with kbc.write_txn(live):
++            live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) "
++                         "VALUES (?, 'tui', ?, 1)", (tid, f"w{i}"))
++        ledger.append(_ledger_row(f"t_r{i}", f"s{i}"))
++    count = _config_loads(monkeypatch)
++    ksc.reconcile_links([(BOARD, kanban_home / "kanban.db")], ME)
++    assert count["n"] <= 1, count
++
++
++@pytest.mark.parametrize("cards", [3, 40])
++def test_a_repair_round_loads_the_placement_config_once(live, ledger, svc, kanban_home, monkeypatch, scope, cards):
++    path = kanban_home / "kanban.db"
++    for i in range(cards):
++        kb.create_task(live, title=f"c{i}", assignee="worker", session_id=f"s{i}")
++    ksc.sync_board(BOARD, path, svc.hub(ME), ME)
++    kb.create_task(live, title="re-arm", assignee="worker")
++    count = _config_loads(monkeypatch)
++    ksc.sync_board(BOARD, path, svc.hub(ME), ME)
++    assert count["n"] <= 1, count
++
++
++def test_reset_forgets_reconciled_boards(live, ledger, kanban_home, spies, scope):
++    _settled(live, ledger, kanban_home, spies)
++    ksc.reset_board_watch()  # tests and a re-pointed home: no key survives into another file set
++    _pass(kanban_home)
++    assert spies["reconcile"] == 1
++
++
++def test_the_sync_loop_skips_unchanged_links_passes(live, ledger, svc, kanban_home, spies, monkeypatch):
++    """The loop's own entry path: ``run_forever`` reconciles links on its cadence, but an unchanged board only
++    once, inside the loop's connection scope; a change between iterations reconciles on the next one."""
++    from types import SimpleNamespace
++    from hermes_cli import machine_metrics
++    _seed(live, ledger)
++    path = kanban_home / "kanban.db"
++    iterations = {"n": 0}
++    monkeypatch.setattr(ksc, "load_identity", lambda: SimpleNamespace(gateway=ME, url="fake", key="k"))
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "report_metrics", lambda *args: None, raising=False)  # Reporter construction only
++    monkeypatch.setattr(ksc, "Hub", lambda ident: hub)
++    monkeypatch.setattr(ksc.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(ksc, "board_paths", lambda: [(BOARD, path)])
++    monkeypatch.setattr(ksc, "FeedWatcher", lambda *a, **k: SimpleNamespace(run=lambda: None))
++    monkeypatch.setattr(ksc, "sync_all_once", lambda *a, **k: [])
++    monkeypatch.setattr(ksc, "LINKS_EVERY_S", 0.0)
++    monkeypatch.setattr(machine_metrics, "Reporter", lambda *args: SimpleNamespace(report_due=lambda: None))
++    per_iteration: list[int] = []
++
++    def wait(*args):
++        iterations["n"] += 1
++        per_iteration.append(spies["reconcile"])
++
++    monkeypatch.setattr(ksc, "wait_for_work", wait)
++    ksc.run_forever(lambda: iterations["n"] < 6, interval=1)
++    # Converged in three passes (backfill needs its creator's link first), then three unchanged iterations skipped.
++    assert per_iteration == [1, 2, 3, 3, 3, 3], per_iteration
++    tid = kb.create_task(live, title="between", assignee="worker", session_id="s_between")
++    ksc.run_forever(lambda: iterations["n"] < 10, interval=1)
++    assert (tid, "s_between", "created", 0) in _links(live)
++    assert per_iteration[6:] == [4, 5, 5, 5], per_iteration  # the change, its own writes once, then skipped
+diff --git a/tests/hermes_cli/test_kanban_sync_targeted_rounds.py b/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+index 3b76cba8edb..b42269b38b4 100644
+--- a/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
++++ b/tests/hermes_cli/test_kanban_sync_targeted_rounds.py
+@@ -17,7 +17,7 @@ def test_feed_wake_only_pulls_changed_board_and_local_outbox(monkeypatch):
+     monkeypatch.setattr(client, 'board_paths', lambda: boards)
+     monkeypatch.setattr(client.sync, 'set_lease_client', lambda _: None)
+     monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda _: None)
+-    monkeypatch.setattr(client, 'reconcile_links', lambda *args: None)
++    monkeypatch.setattr(client, 'reconcile_links', lambda *args, **kwargs: None)
+     monkeypatch.setattr(client, 'outbox_pending', lambda paths: any(p in pending for p in paths))
+     monkeypatch.setattr(client, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
+     from hermes_cli import machine_metrics
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 40f2c963280..09b8743d231 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -71,7 +71,7 @@ def test_sync_loop_reports_metrics_once_per_window(monkeypatch):
+     monkeypatch.setattr(ksc.sync, "set_lease_client", lambda c: None)
+     monkeypatch.setattr(ksc, "board_paths", list)
+     monkeypatch.setattr(ksc, "sync_all_once", lambda hub, *, boards=None: [])
+-    monkeypatch.setattr(ksc, "reconcile_links", lambda boards, gw: None)
++    monkeypatch.setattr(ksc, "reconcile_links", lambda boards, gw, **kwargs: None)
+     monkeypatch.setattr(ksc, "wait_for_work", lambda *a, **k: "period")
+     monkeypatch.setattr(mm, "collect", lambda disk_path=None: {"cpus": 2})
+     rounds = iter([True, True, True, False])
+-- 
+2.55.0
+

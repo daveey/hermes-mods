@@ -1,0 +1,416 @@
+From df7d36c08bd77e06673420c1afa8eb9ab02f9a54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:01:43 +0000
+Subject: [PATCH] fix(kanban): separate pre-merge acceptance from main CI
+ [daveey]
+
+---
+ hermes_cli/kanban_pr_acceptance.py            |  32 +--
+ hermes_cli/kanban_pr_acceptance_store.py      |   2 +
+ hermes_cli/kanban_pr_merge_time.py            |  74 +++++++
+ tests/hermes_cli/test_kanban_pr_acceptance.py |   2 +
+ tests/hermes_cli/test_kanban_pr_merge_time.py | 187 ++++++++++++++++++
+ 5 files changed, 286 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_pr_merge_time.py
+ create mode 100644 tests/hermes_cli/test_kanban_pr_merge_time.py
+
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 731655e4c78..1e214e53361 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -16,6 +16,8 @@ import subprocess
+ from pathlib import Path
+ from urllib.parse import quote
+ 
++from hermes_cli.kanban_pr_merge_time import check_receipt, merge_evidence, timestamp
++
+ _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+ # The way out of a contract that can never pass. A worker can't take it (orchestrator-only),
+@@ -179,7 +181,7 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
+ def collect_acceptance(contract: str, published_pr: str | None,
+                        assignee: str | None = None) -> dict:
+     receipt = {"ok": False, "classification": "missing", "head_sha": None,
+-               "pr_url": published_pr, "checks": [],
++               "pr_url": published_pr, "checks": [], "post_merge_checks": [],
+                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
+                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
+     # Named in the catch-all detail so a failure says WHICH read broke, not "check gh auth". [daveey]
+@@ -197,7 +199,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         receipt["pr_url"] = url
+         owner, name = repo.split("/")
+         phase = "reading the PR"
+-        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
++        query = (f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)})'
++                 f'{{pullRequest(number:{number:d})'
++                 '{headRefOid baseRefName state mergedAt '
++                 'baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}')
+         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+         if repository is None:
+             # A private repo the login cannot read resolves to null, not an error.
+@@ -206,6 +211,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         sha, branch = pr["headRefOid"], pr["baseRefName"]
+         receipt["head_sha"] = sha
+         receipt["pr_state"] = pr["state"]
++        if pr["state"] == "MERGED":
++            receipt["recovery"] = (
++                "Restore complete exact-head evidence from at or before the merge, then retry completion. "
++                "Later main CI belongs to ci-main-watch; it cannot repair missing or failed pre-merge evidence.")
++            timestamp(pr["mergedAt"])
+         if pr["state"] == "CLOSED":
+             # Closure is a disposition, not a claim that the change shipped.
+             receipt.update(ok=True, classification="closed", detail="PR closed without merging; not delivery.")
+@@ -231,7 +241,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                 where=f"{repo}@{branch}", repoint=_REPOINT_HINT))
+             return receipt
+         phase = "reading check runs"
+-        pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
++        run_filter = "all" if pr["state"] == "MERGED" else "latest"
++        pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter={run_filter}",
+                      paginate=True, profile_home=profile_home)
+         runs = [run for page in pages for run in page["check_runs"]]
+         if len({r["id"] for r in runs}) != pages[0]["total_count"]:
+@@ -239,6 +250,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         phase = "reading commit statuses"
+         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
+                                                        paginate=True, profile_home=profile_home) for s in page]
++        runs, statuses = merge_evidence(receipt, pr, repo, runs, statuses)
+         outcomes = []
+         for context, app_id in sorted(required, key=str):
+             matching = [r for r in runs if r["name"] == context and
+@@ -250,14 +262,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                 outcomes.append("missing")
+                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
+             for check in selected:
+-                is_run = "conclusion" in check
+-                outcome = check.get("conclusion") if is_run else check["state"]
+-                classification = _classify(check, sha, outcome, is_run)
+-                outcomes.append(classification)
+-                receipt["checks"].append({"name": context, "id": check["id"],
+-                    "url": check.get("html_url") or check.get("target_url"),
+-                    "head_sha": check.get("head_sha", check.get("sha")),
+-                    "classification": classification, "conclusion": outcome})
++                evidence = check_receipt(check, sha)
++                outcomes.append(evidence["classification"])
++                receipt["checks"].append(evidence)
+         # Re-read after all pages: old-head successes are never transferable.
+         phase = "re-reading the PR head"
+         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+@@ -266,6 +273,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
+             return receipt
+         if current["state"] not in {"open", "closed"}:
+             raise ValueError("PR state is unavailable")
++        if bool(current.get("merged")) != (pr["state"] == "MERGED"):
++            receipt.update(classification="stale", detail="PR merge state changed while collecting evidence; retry.")
++            return receipt
+         receipt["pr_state"] = "MERGED" if current.get("merged") else current["state"].upper()
+         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
+         receipt["ok"] = receipt["classification"] == "success"
+diff --git a/hermes_cli/kanban_pr_acceptance_store.py b/hermes_cli/kanban_pr_acceptance_store.py
+index f259a4fc125..ec3d7a64498 100644
+--- a/hermes_cli/kanban_pr_acceptance_store.py
++++ b/hermes_cli/kanban_pr_acceptance_store.py
+@@ -63,6 +63,8 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+     # the ambient login of whichever process completes the card (#122689).
+     assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
+     receipt = _kpa.collect_acceptance(contract, published_pr, assignee=assignee)
++    from hermes_cli.kanban_pr_merge_time import annotate_main_health_owner
++    annotate_main_health_owner(conn, receipt)
+     reason = _kpa.waiver_reason(metadata)
+     if reason and receipt.get("classification") == "no_required_checks":
+         # The only waivable classification, judged on THIS fresh read: a repo that gained
+diff --git a/hermes_cli/kanban_pr_merge_time.py b/hermes_cli/kanban_pr_merge_time.py
+new file mode 100644
+index 00000000000..a0eba7852cb
+--- /dev/null
++++ b/hermes_cli/kanban_pr_merge_time.py
+@@ -0,0 +1,74 @@
++"""Separate immutable PR acceptance evidence from later main-health checks."""
++from __future__ import annotations
++
++from datetime import datetime
++
++
++def timestamp(value):
++    """Require an unambiguous GitHub timestamp; unknown chronology fails closed."""
++    parsed = datetime.fromisoformat(value)
++    if parsed.tzinfo is None:
++        raise ValueError("GitHub timestamp has no timezone")
++    return parsed
++
++
++def check_receipt(check, sha):
++    from hermes_cli.kanban_pr_acceptance import _classify
++
++    is_run = "conclusion" in check
++    outcome = check.get("conclusion") if is_run else check["state"]
++    return {"name": check.get("name", check.get("context")), "id": check["id"],
++            "url": check.get("html_url") or check.get("target_url"),
++            "head_sha": check.get("head_sha", check.get("sha")),
++            "classification": _classify(check, sha, outcome, is_run), "conclusion": outcome}
++
++
++def partition_at_merge(checks, merged_at, *, runs):
++    """Latest pre-merge execution per producer, plus every later execution.
++
++    App identities stay distinct: an unpinned context must not hide another app's
++    failed run behind a success. Legacy statuses have only their context identity.
++    """
++    cutoff = timestamp(merged_at)
++    latest = {}
++    post = []
++    for check in checks:
++        started = timestamp(check.get("started_at") if runs else check.get("created_at"))
++        if started > cutoff:
++            post.append(check)
++            continue
++        key = (check["name"], check["app"]["id"]) if runs else check["context"]
++        order = (started, check["id"])
++        if key not in latest or order > latest[key][0]:
++            latest[key] = (order, check)
++    return [entry[1] for entry in latest.values()], post
++
++
++def merge_evidence(receipt, pr, repo, runs, statuses):
++    if pr["state"] != "MERGED":
++        return runs, statuses
++    merged_at = pr["mergedAt"]
++    receipt["merged_at"] = merged_at
++    runs, post_runs = partition_at_merge(runs, merged_at, runs=True)
++    statuses, post_statuses = partition_at_merge(statuses, merged_at, runs=False)
++    sha = receipt["head_sha"]
++    receipt["post_merge_checks"] = [check_receipt(c, sha) for c in post_runs + post_statuses]
++    if any(c["classification"] in {"failure", "infra"} for c in receipt["post_merge_checks"]):
++        receipt["main_health"] = {
++            "idempotency_key": f"ci-red:{repo}:{sha}",
++            "detail": f"Main CI is red for {repo}@{sha}; owned by ci-main-watch, not this PR's acceptance."}
++    return runs, statuses
++
++
++def annotate_main_health_owner(conn, receipt):
++    """Use the lifecycle's board scope, never open/write a global board implicitly."""
++    health = receipt.get("main_health")
++    if not health:
++        return
++    row = conn.execute(
++        "SELECT id, status FROM tasks WHERE idempotency_key=? "
++        "ORDER BY created_at DESC, id DESC LIMIT 1", (health["idempotency_key"],)).fetchone()
++    if row:
++        health["owner_card"] = row["id"]
++        health["owner_status"] = row["status"]
++        health["detail"] += f" Main-health owner card: {row['id']} ({row['status']})."
+diff --git a/tests/hermes_cli/test_kanban_pr_acceptance.py b/tests/hermes_cli/test_kanban_pr_acceptance.py
+index a956bd88c66..31f1b3eaa07 100644
+--- a/tests/hermes_cli/test_kanban_pr_acceptance.py
++++ b/tests/hermes_cli/test_kanban_pr_acceptance.py
+@@ -24,12 +24,14 @@ def github(tmp_path, monkeypatch):
+                     {"context": "required", "app": {"databaseId": 1}}]}
+                 value = {"data": {"repository": {"pullRequest": {
+                     "headRefOid": sha, "baseRefName": "main", "state": state.get("pr_state", "MERGED"),
++                    "mergedAt": "2026-11-02T13:10:04Z",
+                     "baseRef": {"branchProtectionRule": rule}},
+                     "defaultBranchRef": {"name": "main", "branchProtectionRule": rule}}}}
+             elif "/rules/branches/" in self.path:
+                 value = [[]]
+             elif "/check-runs" in self.path:
+                 run = {"id": 42, "name": "required", "head_sha": sha,
++                       "started_at": "2026-11-02T12:51:52Z",
+                        "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
+                 if state.get("stale"):
+diff --git a/tests/hermes_cli/test_kanban_pr_merge_time.py b/tests/hermes_cli/test_kanban_pr_merge_time.py
+new file mode 100644
+index 00000000000..11dc7dcd7ff
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_merge_time.py
+@@ -0,0 +1,187 @@
++"""Merge-time evidence, using reduced recorded GitHub shapes from PR #656."""
++from copy import deepcopy
++
++import pytest
++
++from hermes_cli import kanban_pr_acceptance as acceptance
++
++SHA = "850d52075dc59a3e842e123c9d986f864f370762"
++MERGED = "2026-11-02T13:10:04Z"
++NAME = "All required checks pass (v2)"
++PRE = {"id": 125286307833, "name": NAME, "head_sha": SHA, "app": {"id": 15368},
++       "status": "completed", "conclusion": "success", "started_at": "2026-11-02T12:51:52Z",
++       "completed_at": "2026-11-02T12:52:08Z"}
++POST = {"id": 125304345962, "name": NAME, "head_sha": SHA, "app": {"id": 15368},
++        "status": "completed", "conclusion": "failure", "started_at": "2026-11-02T13:30:23Z",
++        "completed_at": "2026-11-02T13:30:38Z"}
++
++
++@pytest.fixture
++def evidence(monkeypatch):
++    state = {"runs": [deepcopy(POST), deepcopy(PRE)], "statuses": [], "state": "MERGED",
++             "merged_at": MERGED, "head": SHA, "landed": SHA, "requests": [], "app": 15368}
++
++    def api(endpoint, **kwargs):
++        state["requests"].append(endpoint)
++        if endpoint == "graphql":
++            return {"data": {"repository": {"pullRequest": {
++                "headRefOid": SHA, "baseRefName": "main", "state": state["state"],
++                "mergedAt": state["merged_at"], "baseRef": {"branchProtectionRule": {
++                    "requiredStatusChecks": [{"context": NAME, "app": {"databaseId": state["app"]}}]}}}}}}
++        if "/rules/branches/" in endpoint:
++            return [[]]
++        if "/check-runs?" in endpoint:
++            runs = state["runs"]
++            if "filter=latest" in endpoint:
++                # GitHub hides earlier executions for the same check name.
++                runs = [max(runs, key=lambda r: r["id"])] if runs else []
++            return [{"total_count": len(runs) + state.get("omitted", 0), "check_runs": runs}]
++        if "/statuses?" in endpoint:
++            return [state["statuses"]]
++        if "/pulls/" in endpoint:
++            return {"head": {"sha": state["head"]}, "base": {"ref": "main"},
++                    "state": "open" if state["state"] == "OPEN" else "closed",
++                    "merged": state["state"] == "MERGED", "merged_at": state["merged_at"],
++                    "merge_commit_sha": state["landed"]}
++        pytest.fail(f"Unexpected API call: {endpoint}")
++
++    monkeypatch.setattr(acceptance, "_api", api)
++    return state
++
++
++def collect():
++    return acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
++
++
++def test_merged_fast_forward_uses_premerge_success(evidence):
++    receipt = collect()
++    assert receipt["ok"], receipt
++    assert [c["id"] for c in receipt["checks"]] == [PRE["id"]]
++    assert receipt["post_merge_checks"][0]["classification"] == "failure"
++    assert "ci-main-watch" in receipt["main_health"]["detail"]
++    assert "rerun" not in receipt["recovery"].lower()
++
++
++def test_open_still_uses_latest_without_cutoff(evidence):
++    evidence["state"] = "OPEN"
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "failure"
++    assert receipt["checks"][0]["id"] == POST["id"]
++    assert receipt["post_merge_checks"] == []
++    assert any("filter=latest" in url for url in evidence["requests"])
++
++
++@pytest.mark.parametrize("result", ["failure", "missing", "pending"])
++def test_later_success_never_repairs_premerge_evidence(evidence, result):
++    pre = {**PRE, "conclusion": result, "status": "in_progress" if result == "pending" else "completed"}
++    evidence["runs"] = [{**POST, "conclusion": "success"}] + ([] if result == "missing" else [pre])
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == result
++    assert receipt["post_merge_checks"][0]["classification"] == "success"
++
++
++def test_failed_premerge_rerun_overrides_earlier_success(evidence):
++    evidence["runs"] = [PRE, {**POST, "started_at": MERGED}]
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "failure"
++    assert receipt["checks"][0]["id"] == POST["id"]
++    assert not receipt["post_merge_checks"]
++
++
++def test_successful_premerge_rerun_overrides_earlier_failure(evidence):
++    evidence["runs"] = [{**PRE, "conclusion": "failure"},
++                        {**POST, "started_at": MERGED, "conclusion": "success"}]
++    assert collect()["ok"]
++
++
++@pytest.mark.parametrize("fault", ["head_change", "stale_run", "pagination"])
++def test_merge_selection_preserves_evidence_guards(evidence, fault):
++    if fault == "head_change":
++        evidence["head"] = "b" * 40
++    elif fault == "stale_run":
++        evidence["runs"][1]["head_sha"] = "b" * 40
++    else:
++        evidence["omitted"] = 1
++    receipt = collect()
++    assert not receipt["ok"]
++    assert receipt["classification"] == ("infra" if fault == "pagination" else "stale")
++
++
++def test_rebased_landing_still_uses_original_head(evidence):
++    evidence["landed"] = "b" * 40
++    evidence["runs"] = [PRE]
++    receipt = collect()
++    assert receipt["ok"] and receipt["head_sha"] == SHA
++    assert not receipt["post_merge_checks"]
++    assert not any(evidence["landed"] in url for url in evidence["requests"])
++
++
++def status(check, result):
++    return {"id": check["id"], "context": NAME, "state": result,
++            "created_at": check["started_at"], "target_url": "https://example.com/ci"}
++
++
++@pytest.mark.parametrize("pre,post,expected", [("success", "failure", "success"),
++                                               ("failure", "success", "failure"),
++                                               ("pending", "success", "pending"),
++                                               (None, "success", "missing")])
++def test_legacy_statuses_obey_merge_cutoff(evidence, pre, post, expected):
++    evidence.update(app=None, runs=[], statuses=[status(POST, post)])
++    if pre:
++        evidence["statuses"].append(status(PRE, pre))
++    receipt = collect()
++    assert receipt["classification"] == expected
++    assert receipt["ok"] is (expected == "success")
++    assert receipt["post_merge_checks"][0]["classification"] == post
++
++
++def test_legacy_latest_premerge_failure_wins(evidence):
++    evidence.update(app=None, runs=[], statuses=[status(PRE, "success"),
++                    status({**POST, "started_at": MERGED}, "failure")])
++    assert collect()["classification"] == "failure"
++
++
++def test_pinned_app_cannot_borrow_legacy_success(evidence):
++    evidence.update(runs=[], statuses=[status(PRE, "success")])
++    assert collect()["classification"] == "missing"
++
++
++def test_unpinned_context_retains_each_app_failure(evidence):
++    evidence.update(app=None, runs=[PRE, {**PRE, "id": PRE["id"] + 1,
++                                         "app": {"id": 99}, "conclusion": "failure"}])
++    assert collect()["classification"] == "failure"
++
++
++@pytest.mark.parametrize("field,value", [("merged_at", None), ("merged_at", "invalid"),
++                                        ("started_at", None), ("started_at", "2026-11-02T12:00:00")])
++def test_unknown_merge_chronology_fails_closed(evidence, field, value):
++    if field == "merged_at":
++        evidence[field] = value
++    else:
++        evidence["runs"][1][field] = value
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "infra"
++
++
++@pytest.mark.parametrize("owner_state", ["ready", "done", "archived", None])
++def test_completion_receipt_names_main_health_owner(evidence, owner_state):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++    import json
++
++    kb.init_db()
++    with connect() as conn:
++        owner = None
++        if owner_state:
++            owner = kb.create_task(conn, title="Main health", idempotency_key=f"ci-red:acme/repo:{SHA}")
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (owner_state, owner))
++        task = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
++        assert kb.complete_task(conn, task, summary="verified", metadata={
++            "published_pr": "https://github.com/acme/repo/pull/7"})
++        receipt = json.loads(conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (task,)).fetchone()[0])
++        assert receipt["ok"]
++        assert receipt["main_health"].get("owner_card") == owner
++        assert "ci-main-watch" in receipt["main_health"]["detail"]
++        if owner:
++            assert owner in receipt["main_health"]["detail"]
+-- 
+2.55.0
+

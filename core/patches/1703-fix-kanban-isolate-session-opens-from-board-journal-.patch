@@ -1,0 +1,177 @@
+From 08ad5d923b6633e294a1196d1bd1bf29ba657adf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:43:53 +0000
+Subject: [PATCH] fix(kanban): isolate session opens from board journal waits
+ [daveey]
+
+---
+ hermes_cli/kanban_db_connect.py               |   4 +-
+ hermes_cli/kanban_dispatch_owner.py           |  13 ++-
+ .../test_kanban_open_session_isolation.py     | 109 ++++++++++++++++++
+ 3 files changed, 122 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_open_session_isolation.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 80ab83c94f1..dd752b4f594 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -62,13 +62,11 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
+     """Open a Kanban SQLite connection via ``connect_tracked``: while registered,
+     byte-level probes of the file are refused because an ``open()``/``close()``
+     would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``)."""
+-    from hermes_cli.sqlite_safe_read import connect_tracked
+     from hermes_cli.kanban_dispatch_owner import connect_with_identity
+ 
+     busy_timeout_ms = _resolve_busy_timeout_ms()
+-    conn = connect_tracked(
++    conn = connect_with_identity(
+         path,
+-        connect_fn=connect_with_identity,
+         isolation_level=None,
+         timeout=busy_timeout_ms / 1000.0,
+     )
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index b308077826e..ca9a5b28b27 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -16,10 +16,21 @@ def connect_with_identity(path, **kwargs):
+     dispatch: reopen after contention clears instead of trusting a pathname.
+     """
+     from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    from hermes_cli.kanban_generation import recover, remember
++    from hermes_cli.sqlite_safe_read import connect_tracked, _tracking_factory
++
+     canonical = Path(path).resolve()
++    # Keep guard release outside the tracking close lock, as in the previous
++    # guarded-opener composition. Only sqlite open + registration need that
++    # global lock; the first journal read may wait on an unrelated board writer.
++    kwargs["factory"] = _kanban_lockguard.guarded_factory(
++        _tracking_factory(kwargs.get("factory", sqlite3.Connection)))
+     with _dispatch_tick_lock(canonical) as held:
+-        conn = _kanban_lockguard.connect(str(canonical), **kwargs)
++        recover(str(canonical))
++        conn = connect_tracked(str(canonical), **kwargs)
+         try:
++            _kanban_lockguard.guard(conn)
++            remember(conn)
+             stat = canonical.stat() if held else None
+             conn._dispatch_identity = (stat.st_dev, stat.st_ino) if stat else None
+             conn._dispatch_open_contended = not held
+diff --git a/tests/hermes_cli/test_kanban_open_session_isolation.py b/tests/hermes_cli/test_kanban_open_session_isolation.py
+new file mode 100644
+index 00000000000..4a6a625d515
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_open_session_isolation.py
+@@ -0,0 +1,109 @@
++"""A busy board's first read must not serialize unrelated session browsing."""
++
++from concurrent.futures import ThreadPoolExecutor
++import sqlite3
++import threading
++import time
++
++from hermes_cli import kanban_db_connect as kb
++from hermes_cli import kanban_lockguard as guard
++from hermes_cli.sqlite_safe_read import has_live_connection, offline_file_access, LiveConnectionError
++from hermes_cli.web_server_sessions import _open_session_db_at_path
++from hermes_state import SessionDB
++import pytest
++
++
++@pytest.mark.platforms("linux", "macos")
++@pytest.mark.parametrize("http", [False, True])
++def test_busy_board_open_does_not_block_session_poll(tmp_path, monkeypatch, http):
++    state_path = tmp_path / "state.db"
++    writer = SessionDB(db_path=state_path)
++    writer.create_session("poll-target", source="cli")
++    writer.close()
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from hermes_cli import web_server_sessions
++    from hermes_cli.web_routers import sessions
++
++    monkeypatch.setattr(web_server_sessions, "_session_db_path_for_profile", lambda profile: state_path)
++    app = FastAPI()
++    app.include_router(sessions.manage_router)
++    client = TestClient(app)
++    assert client.get("/api/sessions/poll-target").status_code == 200
++    board_path = tmp_path / "board.db"
++    blocker = sqlite3.connect(board_path)
++    blocker.execute("PRAGMA journal_mode=DELETE")
++    blocker.execute("CREATE TABLE marker(value)")
++    blocker.commit()
++    blocker.execute("BEGIN EXCLUSIVE")
++    entered = threading.Event()
++    original = guard._apply
++
++    def observed_apply(conn, held_path=None):
++        entered.set()
++        return original(conn, held_path)
++
++    monkeypatch.setattr(guard, "_apply", observed_apply)
++
++    def open_board():
++        conn = kb._sqlite_connect(board_path)
++        try:
++            assert conn.execute("SELECT count(*) FROM marker").fetchone()[0] == 0
++        finally:
++            conn.close()
++
++    def poll():
++        start = time.monotonic()
++        if http:
++            response = client.get("/api/sessions/poll-target")
++            assert response.status_code == 200
++            assert response.json()["id"] == "poll-target"
++        else:
++            db = _open_session_db_at_path(state_path, read_only=True)
++            try:
++                row = db.get_session("poll-target")
++                assert row is not None and row["id"] == "poll-target"
++            finally:
++                db.close()
++        return time.monotonic() - start
++
++    with ThreadPoolExecutor(max_workers=5) as pool:
++        opening = pool.submit(open_board)
++        try:
++            assert entered.wait(10), "board never entered its first read"
++            elapsed = []
++            for _ in range(8):
++                polls = [pool.submit(poll) for _ in range(4)]
++                # The blocker stays held until every unrelated request completes.
++                elapsed.extend(future.result(timeout=4) for future in polls)
++            assert max(elapsed) < 5
++            assert not opening.done()
++            assert has_live_connection(board_path)
++            with pytest.raises(LiveConnectionError), offline_file_access(board_path):
++                pass
++        finally:
++            blocker.rollback()
++            blocker.close()
++        opening.result(timeout=10)
++    assert not has_live_connection(board_path)
++    assert not has_live_connection(state_path)
++    client.close()
++
++
++def test_identity_setup_failure_closes_tracked_connection(tmp_path, monkeypatch):
++    from hermes_cli import kanban_generation
++
++    path = tmp_path / "board.db"
++    seen = []
++
++    def fail_after_open(conn):
++        seen.append(conn)
++        assert has_live_connection(path)
++        raise RuntimeError("generation registration failed")
++
++    monkeypatch.setattr(kanban_generation, "remember", fail_after_open)
++    with pytest.raises(RuntimeError, match="generation registration failed"):
++        kb._sqlite_connect(path)
++    assert not has_live_connection(path)
++    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
++        seen[0].execute("SELECT 1")
+-- 
+2.55.0
+

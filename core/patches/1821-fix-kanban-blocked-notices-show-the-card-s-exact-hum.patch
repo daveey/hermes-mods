@@ -1,0 +1,275 @@
+From 2050733bc6571383fe954bea422f8da0f8cdd67d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 03:27:15 +0000
+Subject: [PATCH] fix(kanban): blocked notices show the card's exact human ask,
+ not clipped event prose [daveey]
+
+A blocked chat showed only an opaque, 160-char-clipped event reason ("...
+identity boundary ... Initiate HANDOFF ...") and a task id; the validated
+human_request (action/why/scope) never reached the notice.
+
+Five whys:
+1. Notice was opaque: local (tui session_notifications), remote
+   (kanban_remote_notices) and gateway (kanban_watchers_notifier) blocked
+   formatters render the event `reason`, clipped to 160 chars.
+2. They render event prose because each path built its own text; none
+   read the card's stored human_request.
+3. The earlier exact-ask fix covered card creation/closeout, not these
+   three notification entry paths, and nothing tied them to one contract.
+4. Not caught: no test asserted the full ask in each entry path; session
+   outcome also promoted a bare wait_state=="human" to a user decision
+   without validated request evidence.
+5. Root: no shared block presenter + cross-path contract test.
+
+Fix:
+- hermes_cli/kanban_block_notice.block_notice(): one read-only presenter
+  from current card evidence: validated ask -> "actor: user", full action,
+  why, scope, exact @task link (board@gateway for remote); missing/invalid
+  request or agent-owned kind -> "actor: agent" (never asks the user);
+  card no longer blocked -> "Earlier block resolved; current state".
+  user_terminal asks state that the link/unblock grants no terminal
+  authority (boundary unchanged).
+- All three entry paths use it; gateway wake carries the same text.
+- hermes_state_outcome: decisions require a validated human_request.
+
+Tests: tests/tui_gateway/test_actionable_block_notices.py (4 cases x 3
+paths, JSON-stored request, wake text, deleted card, outcome both ways).
+
+tests/tui_gateway/test_kanban_failure_notice_text.py pinned the old clipped
+"blocked: <reason>" suffix (the defect); it now asserts the same intent
+(reason verbatim, no failure-classifier text) plus no false user ask.
+---
+ gateway/kanban_watchers_notifier.py           | 11 ++-
+ hermes_cli/kanban_block_notice.py             | 36 ++++++++
+ hermes_state_outcome.py                       |  2 +-
+ .../test_actionable_block_notices.py          | 84 +++++++++++++++++++
+ .../test_kanban_failure_notice_text.py        |  5 +-
+ tui_gateway/kanban_remote_notices.py          |  4 +-
+ tui_gateway/session_notifications.py          |  3 +
+ 7 files changed, 137 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_block_notice.py
+ create mode 100644 tests/tui_gateway/test_actionable_block_notices.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index b69af7d0485..81d944302bc 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -463,6 +463,12 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
+     return msg, None, None
+ 
+ 
++def _fmt_blocked(ev, n) -> tuple:
++    from hermes_cli.kanban_block_notice import block_notice
++    body = block_notice(n.task, n.task_id, n.board_slug, reason=str(_payload(ev, "reason") or ""))
++    return f"⏸ {n.head} {body}", body, None
++
++
+ def _fmt_failure(kind: str):
+     """gave_up / crashed notice via the shared classifier: real cause, recorded retry state, no
+     unsupported promises. [daveey]"""
+@@ -494,10 +500,7 @@ def _fmt_timed_out(ev, n) -> tuple:
+ # never wake the creator.
+ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "completed": _fmt_completed,
+-    "blocked": lambda ev, n: (
+-        t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
+-        None, None,
+-    ),
++    "blocked": _fmt_blocked,
+     "gave_up": _fmt_failure("gave_up"),
+     "crashed": _fmt_failure("crashed"),
+     "timed_out": _fmt_timed_out,
+diff --git a/hermes_cli/kanban_block_notice.py b/hermes_cli/kanban_block_notice.py
+new file mode 100644
+index 00000000000..27515b61444
+--- /dev/null
++++ b/hermes_cli/kanban_block_notice.py
+@@ -0,0 +1,36 @@
++"""Read-only actionable block presentation shared by notification entry paths."""
++import json
++
++from hermes_cli.kanban_human_request import needs_human
++
++
++def block_notice(task, task_id: str, board: str, *, gateway: str = "", reason: str = "") -> str:
++    """Use current card evidence, never event prose, to assign a human action.
++
++    Links open the existing task flow; this function grants no authority and
++    never interprets evidence or action strings as executable commands.
++    """
++    def get(key, default=None):
++        return task.get(key, default) if isinstance(task, dict) else getattr(task, key, default)
++
++    link = f"@task:{board or 'default'}{'@' + gateway if gateway else ''}/{task_id}"
++    status = get("status")
++    if status and status not in {"blocked", "triage"}:
++        return f"Earlier block resolved; current state: {status}.\nOpen task: {link}"
++    request = get("human_request")
++    if isinstance(request, str):
++        try:
++            request = json.loads(request)
++        except ValueError:
++            request = None
++    if status in {"blocked", "triage"} and isinstance(request, dict) and needs_human(request, kind=get("block_kind")):
++        lines = ["blocked — actor: user", f"Next action for the user: {request['action']}",
++                 f"Why only the user: {request['why_human']}", f"Scope: {request['scope']}",
++                 f"Open task: {link}"]
++        if request["interaction"] == "user_terminal":
++            lines.append("Use the owner Desktop session's user-terminal flow; opening this task or unblocking it does not execute a command or grant terminal authority.")
++        return "\n".join(lines)
++    owner = get("assignee") or "assigned agent"
++    return (f"blocked — actor: agent ({owner}); no actionable human request recorded.\n"
++            "Next action: the agent must resolve the execution/dependency failure or prepare a concrete human action with evidence.\n"
++            f"Reason: {reason or get('block_kind') or 'block details missing'}\nOpen task: {link}")
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index f675c9318f6..bf7b2653356 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -312,7 +312,7 @@ def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+         status = str(card.get("status") or "")
+         wait = card.get("wait") if isinstance(card.get("wait"), dict) else {}
+         human = status in ("blocked", "triage") and (
+-            needs_human(request, kind=card.get("block_kind")) or wait.get("wait_state") == "human")
++            needs_human(request, kind=card.get("block_kind")))
+         if human:
+             req = request if isinstance(request, dict) else {}
+             decisions.append({"id": f"card:{tid}", "question": _str(req.get("action")) or _str(card.get("title")),
+diff --git a/tests/tui_gateway/test_actionable_block_notices.py b/tests/tui_gateway/test_actionable_block_notices.py
+new file mode 100644
+index 00000000000..6182770725f
+--- /dev/null
++++ b/tests/tui_gateway/test_actionable_block_notices.py
+@@ -0,0 +1,84 @@
++"""Exercise all block notice entry paths with the same current card evidence."""
++from types import SimpleNamespace
++
++import pytest
++
++ASK = {"action": "Authorize the reviewed activation in your Desktop session. " + "Keep the safety gate. " * 12 + "Unblock = verify; archive = abandon.",
++       "why_human": "Only the owner session holds terminal authority.", "interaction": "user_terminal",
++       "scope": "One reviewed activation", "evidence": "Owner boundary refusal"}
++
++
++def render(path, card):
++    ev = SimpleNamespace(kind="blocked", payload={"reason": "Opaque identity boundary"})
++    if path == "remote":
++        from tui_gateway.kanban_remote_notices import format_notice
++        return format_notice("remote-host", "ops/t_example", card)
++    task = SimpleNamespace(**card)
++    if path == "gateway":
++        from gateway.kanban_watchers_notifier import _fmt_blocked
++        return _fmt_blocked(ev, SimpleNamespace(task=task, task_id=card["id"], board_slug="ops", head="[ops] @worker Kanban t_example"))[0]
++    from tui_gateway import server
++    return server._format_kanban_event_text({"task_id": card["id"]}, task, ev, "ops")
++
++
++@pytest.mark.parametrize("path", ["local", "remote", "gateway"])
++@pytest.mark.parametrize("case", ["human", "capability", "missing", "resolved"])
++def test_actionable_block_entry_paths(path, case):
++    card = dict(id="t_example", title="Activation", status="blocked", assignee="worker", block_kind="needs_input", human_request=dict(ASK))
++    if case == "capability":
++        card.update(block_kind="capability", human_request=None)
++    elif case == "missing":
++        card["human_request"] = {"action": "Ask the user"}
++    elif case == "resolved":
++        card["status"] = "ready"
++    text = render(path, card)
++    assert "t_example blocked" in text or "t_example Earlier" in text
++    assert f"@task:ops{'@remote-host' if path == 'remote' else ''}/t_example" in text
++    if case == "human":
++        assert ASK["action"] in text
++        assert ASK["why_human"] in text
++        assert "actor: user" in text
++        assert "does not execute" in text
++    elif case == "resolved":
++        assert "Earlier block resolved" in text
++        assert "actor: user" not in text
++    else:
++        assert "actor: agent" in text
++        assert "Next action: the agent" in text
++
++
++def test_outcome_rejects_legacy_human_wait_without_evidence(monkeypatch):
++    from hermes_cli import kanban_session_activity as activity
++    import hermes_state_outcome as outcome
++    monkeypatch.setattr(activity, "session_tasks", lambda *a, **k: [dict(id="t_example", status="blocked", wait={"wait_state": "human"})])
++    decisions, waits = outcome._card_items(["chat"])
++    assert decisions == []
++    assert waits[0]["id"] == "t_example"
++
++
++def test_stored_json_request_and_wake_carry_full_ask():
++    import json
++    from gateway.kanban_watchers_notifier import _fmt_blocked
++    task = SimpleNamespace(id="t_example", status="blocked", assignee="worker", block_kind="needs_input",
++                           human_request=json.dumps(ASK))
++    ev = SimpleNamespace(kind="blocked", payload={"reason": "Opaque identity boundary"})
++    msg, wake, _ = _fmt_blocked(ev, SimpleNamespace(task=task, task_id="t_example", board_slug="ops", head="Kanban t_example"))
++    assert ASK["action"] in msg and ASK["action"] in wake
++    assert "Opaque identity boundary" not in msg
++
++
++def test_deleted_card_is_agent_owned():
++    from gateway.kanban_watchers_notifier import _fmt_blocked
++    ev = SimpleNamespace(kind="blocked", payload={"reason": "gone"})
++    msg = _fmt_blocked(ev, SimpleNamespace(task=None, task_id="t_example", board_slug="ops", head="Kanban t_example"))[0]
++    assert "actor: agent" in msg and "@task:ops/t_example" in msg
++
++
++def test_outcome_decision_keeps_full_validated_action(monkeypatch):
++    from hermes_cli import kanban_session_activity as activity
++    import hermes_state_outcome as outcome
++    monkeypatch.setattr(activity, "session_tasks", lambda *a, **k: [dict(
++        id="t_example", status="blocked", block_kind="needs_input", human_request=dict(ASK))])
++    decisions, waits = outcome._card_items(["chat"])
++    assert waits == []
++    assert decisions[0]["question"] == ASK["action"]
+diff --git a/tests/tui_gateway/test_kanban_failure_notice_text.py b/tests/tui_gateway/test_kanban_failure_notice_text.py
+index 4793a465fba..15cbfd546c9 100644
+--- a/tests/tui_gateway/test_kanban_failure_notice_text.py
++++ b/tests/tui_gateway/test_kanban_failure_notice_text.py
+@@ -75,8 +75,11 @@ def test_terminal_provider_config_is_the_one_actionable_ask():
+ 
+ def test_human_input_block_is_untouched():
+     text = _text("blocked", {"kind": "needs_input", "reason": "Which account should I use?"})
+-    assert text.endswith("blocked: Which account should I use?")
++    # Blocks bypass the failure classifier; the shared block presenter keeps the reason verbatim.
++    # Without a validated human_request it must not claim the user owns the next step.
++    assert "Reason: Which account should I use?" in text
+     assert "Hermes needs to recover" not in text
++    assert "actor: user" not in text
+ 
+ 
+ def test_poller_marks_failure_notices_diagnostic():
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 42198de5513..17e117e3736 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -220,8 +220,8 @@ def format_notice(gw: str, key: str, task: dict) -> str:
+         handoff = _first_line(run.get("summary") or task.get("result"), 200)
+         return f"✔ {prefix}Kanban {tid} done — {title}{handoff}\n(ran on {gw}; read it with cross_task @task:{board}@{gw}/{tid})"
+     reason = run.get("summary") or task.get("block_kind") or ""
+-    return (f"⏸ {prefix}Kanban {tid} blocked" + (f": {str(reason)[:160]}" if reason else "")
+-            + f" — {title}\n(on {gw}; read it with cross_task @task:{board}@{gw}/{tid})")
++    from hermes_cli.kanban_block_notice import block_notice
++    return f"⏸ {prefix}Kanban {tid} " + block_notice(task, tid, board, gateway=gw, reason=str(reason))
+ 
+ 
+ def _event_key(owner: str, key: str, notice: dict) -> str:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 9b83849d199..a3836048b69 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -581,6 +581,9 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
+     who = getattr(task, "assignee", None) or ""
+     prefix = f"{glyph} " + (f"[{board_slug}] " if board_slug else "") + (f"@{who} " if who else "")
+     payload = getattr(ev, "payload", None) or {}
++    if getattr(ev, "kind", "") == "blocked":
++        from hermes_cli.kanban_block_notice import block_notice
++        return f"{prefix}Kanban {task_id} " + block_notice(task, task_id, board_slug, reason=str(payload.get("reason") or ""))
+     if getattr(ev, "kind", "") == "completed":
+         # A worker refused a send into this chat put its message in the summary as a FINAL SEND line. [daveey]
+         from hermes_cli.kanban_final_send import final_send_for_chat
+-- 
+2.55.0
+

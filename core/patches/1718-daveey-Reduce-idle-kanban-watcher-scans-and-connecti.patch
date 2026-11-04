@@ -1,0 +1,827 @@
+From 1d19c6b38233e526a249a255797764cc251d32e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:44:51 +0000
+Subject: [PATCH] [daveey] Reduce idle kanban watcher scans and connection
+ churn
+
+---
+ gateway/kanban_watchers_notifier.py           |   5 +-
+ hermes_cli/kanban_db_dispatch.py              |  37 +-
+ hermes_cli/kanban_db_dispatch_guard_notice.py |   3 +
+ hermes_cli/kanban_db_notify.py                |  26 +-
+ hermes_cli/kanban_idle_candidates.py          |  73 ++++
+ hermes_cli/kanban_owner_archive_relay.py      |  30 +-
+ hermes_cli/kanban_reader_retention.py         |  55 +++
+ hermes_cli/kanban_worker_node.py              |  24 +-
+ .../test_kanban_notifier_idle_claims.py       |  41 +++
+ .../test_kanban_watcher_idle_work.py          | 326 ++++++++++++++++++
+ 10 files changed, 576 insertions(+), 44 deletions(-)
+ create mode 100644 hermes_cli/kanban_idle_candidates.py
+ create mode 100644 hermes_cli/kanban_reader_retention.py
+ create mode 100644 tests/gateway/test_kanban_notifier_idle_claims.py
+ create mode 100644 tests/hermes_cli/test_kanban_watcher_idle_work.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index a4046978621..b69af7d0485 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -344,7 +344,10 @@ class _Collector:
+             # No explicit init_db(): connect() already runs the migration once per
+             # process, and init_db() would re-run it on a second connection racing
+             # the first.
+-            subs = _kbn().list_notify_subs(conn, notifier_profiles=self.notifier_profiles, include_unowned=self.include_unowned)
++            subs = _kbn().list_notify_subs(
++                conn, notifier_profiles=self.notifier_profiles, include_unowned=self.include_unowned,
++                platforms=self.active_platforms, pending_only=True,
++            )
+             if not subs:
+                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
+             for sub in subs:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 317f9d43345..9f10e1fa894 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2261,32 +2261,29 @@ def _run_reclaim_phase(
+     # [daveey] Before any stale check: a long gap since the last pass is a host suspend, which the
+     # heartbeat backstop, the stale sweep and max_runtime must not count (``kanban_suspend_ledger``).
+     _record_dispatch_pass(conn, dry_run=dry_run)
+-    result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
++    # Process death and timeout expiry do not advance a content revision. Only
++    # a proven empty running set may skip these sweeps, never a prior no-op.
++    has_running = conn.execute("SELECT 1 FROM tasks WHERE status = 'running' LIMIT 1").fetchone() is not None
++    if has_running:
++        result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
++        if reconcile_orphans:
++            result.reconciled_orphans = reconcile_orphaned_running(conn)
+     if reconcile_orphans:
+-        result.reconciled_orphans = reconcile_orphaned_running(conn)
+-        close_dangling_runs(conn)
+-    result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
+-    result.crashed = detect_crashed_workers(conn, board=board)
+-    # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
+-    # went back to ``ready`` and the respawn guard defers them until quota clears.
+-    result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
+-    result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+-    result.reclaimed += len(getattr(detect_crashed_workers, "_last_owner_restarted", []))  # [daveey]
+-    result.timed_out = enforce_max_runtime(conn)
++        close_dangling_runs(conn)  # ended/non-running tasks can still retain a running run
++    if has_running:
++        result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
++        result.crashed = detect_crashed_workers(conn, board=board)
++        result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
++        result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
++        result.reclaimed += len(getattr(detect_crashed_workers, "_last_owner_restarted", []))
++        result.timed_out = enforce_max_runtime(conn)
+     from hermes_cli.kanban_supervisor_requests import dispatcher_drain  # [daveey] non-worker executor
+     result.supervisor_requests = [] if dry_run else dispatcher_drain(conn, board=board)
+     from hermes_cli.kanban_continuation import wake_due_continuations
+     result.woken_continuations = wake_due_continuations(conn)
+     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+-    from hermes_cli.kanban_shared_blockers import probe_stranded_blockers, release_cleared_blockers
+-    try:
+-        result.shared_blocker_released = release_cleared_blockers(conn)
+-    except Exception:
+-        _kb._log.warning("kanban: releasing cleared shared blockers failed", exc_info=True)
+-    try:
+-        result.shared_blocker_probed = probe_stranded_blockers(conn)
+-    except Exception:
+-        _kb._log.warning("kanban: probing stranded shared blockers failed", exc_info=True)
++    from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
++    sweep_shared_blockers(conn, result)
+     try:
+         from hermes_cli import kanban_provider_walls as _walls
+         _walls.alert_on_storm(conn, board=board)
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index 8e0ecb5bb33..264864b343d 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -196,6 +196,9 @@ def sweep_remote_guard_holds(conn: sqlite3.Connection, result) -> None:
+     from hermes_cli.kanban_wake_check import foreign_ids
+     from hermes_cli.kanban_worker_node import dispatch_refusals
+ 
++    from hermes_cli.kanban_idle_candidates import event_candidates
++    if not event_candidates(conn, ('ready', 'review'), ('respawn_guarded',)):
++        return
+     foreign = foreign_ids(conn)
+     for lane in ("ready", "review"):
+         for task_id in dispatch_refusals(conn, lane):
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index fc0ef7165cb..cf0a7116b9d 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -275,6 +275,8 @@ def list_notify_subs(
+     include_unowned: bool = False,
+     platform: Optional[str] = None,
+     chat_id: Optional[str] = None,
++    platforms: Optional[Iterable[str]] = None,
++    pending_only: bool = False,
+ ) -> list[dict]:
+     """List subscriptions, optionally restricted to notifier profile owners.
+ 
+@@ -301,6 +303,15 @@ def list_notify_subs(
+         if value is not None:
+             where.append(clause)
+             params.append(value)
++    if platforms is not None:
++        active = sorted({p.lower() for p in platforms})
++        where.append(f"LOWER(platform) IN ({','.join('?' * len(active))})")
++        params.extend(active)
++    if pending_only:
++        # A durable claim advanced the cursor, but a live holder can expire
++        # without another event. Keep it eligible for claim-path recovery.
++        where.append("(inflight_from IS NOT NULL OR EXISTS (SELECT 1 FROM task_events e "
++                     "WHERE e.task_id = kanban_notify_subs.task_id AND e.id > kanban_notify_subs.last_event_id))")
+     sql = "SELECT * FROM kanban_notify_subs"
+     if where:
+         sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
+@@ -323,16 +334,19 @@ def count_notify_subs(
+     chat_id: Optional[str] = None,
+     thread_id: Optional[str] = None,
+ ) -> int:
+-    """Count ``kanban_notify_subs`` rows via a read-only connection — the
++    """Count ``kanban_notify_subs`` rows via a shared query-only reader — the
+     notifier's cheap zero-subscription early exit. Unlike :func:`connect` it
+-    never creates the file, runs init/migration or opens writable; WAL rows are
+-    still visible so a fresh sub is never missed. Missing DB / missing table
++    never creates the file or runs init/migration. Generation recovery may use
++    a query-only writable handle when a read-only WAL open is unavailable.
++    Committed WAL rows remain visible so a fresh sub is never missed. Missing DB / missing table
+     counts as zero; platform matches case-insensitively (as notifier routing),
+     chat/thread exactly. Raises :class:`sqlite3.Error` if the DB exists but is
+     unreadable — callers pick their own fallback.
+     """
++    from hermes_cli import kanban_reader_retention as retention
+     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+     if not path.exists():
++        retention.prune(missing=str(path.resolve()))
+         return 0
+     owner_where, owner_params = _notify_profile_filter(
+         notifier_profiles, include_unowned=include_unowned,
+@@ -353,8 +367,8 @@ def count_notify_subs(
+     query = "SELECT COUNT(*) FROM kanban_notify_subs"
+     if clauses:
+         query += " WHERE " + " AND ".join(clauses)
+-    conn = _kanban_lockguard.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+-    try:
++    # Consume cursors in autocommit; committed subscriptions are visible next poll.
++    with retention.reader(path.resolve()) as conn:
+         try:
+             row = conn.execute(query, params).fetchone()
+         except sqlite3.OperationalError as exc:
+@@ -362,8 +376,6 @@ def count_notify_subs(
+                 return 0
+             raise
+         return int(row[0]) if row else 0
+-    finally:
+-        conn.close()
+ 
+ 
+ def remove_notify_sub(
+diff --git a/hermes_cli/kanban_idle_candidates.py b/hermes_cli/kanban_idle_candidates.py
+new file mode 100644
+index 00000000000..baf5ab8d2ff
+--- /dev/null
++++ b/hermes_cli/kanban_idle_candidates.py
+@@ -0,0 +1,73 @@
++"""Memoize structural candidates, never time or process-liveness decisions."""
++from pathlib import Path
++import sqlite3
++
++from hermes_cli import kanban_activity_revision as revision
++
++
++def event_candidates(conn: sqlite3.Connection, statuses: tuple[str, ...], kinds: tuple[str, ...],
++                     *, exclude_statuses: bool = False) -> bool:
++    """A positive answer always runs its handler, even without local writes."""
++    return bool(candidate_task_ids(conn, statuses, kinds, exclude_statuses=exclude_statuses))
++
++
++def candidate_task_ids(conn: sqlite3.Connection, statuses: tuple[str, ...], kinds: tuple[str, ...],
++                       *, exclude_statuses: bool = False) -> tuple[str, ...]:
++    """Retain an observer so fresh dispatcher connections share the structural memo.
++
++    Caller transactions see their uncommitted writes. File/WAL generation fences
++    belong to the shared reader; no stat-only cache of commit-visible data.
++    """
++    from hermes_cli.kanban_reader_retention import reader
++
++    if not conn.in_transaction:
++        path = conn.execute('PRAGMA database_list').fetchone()[2]
++        if path:
++            try:
++                with reader(Path(path).resolve()) as observer:
++                    return _on_connection(observer, statuses, kinds, exclude_statuses)
++            except (sqlite3.Error, OSError):
++                pass  # use the caller's connection if the optional observer is unavailable
++    return _on_connection(conn, statuses, kinds, exclude_statuses)
++
++
++def _on_connection(conn, statuses, kinds, exclude_statuses=False):
++    stamp = None
++    if not conn.in_transaction and hasattr(conn, '__dict__'):
++        try:
++            stamp = revision.read_key(conn, ('tasks', 'task_events'))
++        except sqlite3.Error:
++            stamp = None  # a failed optimization must not suppress the real query
++    key = (statuses, kinds, exclude_statuses)
++    cache = getattr(conn, '_idle_candidates', {})
++    if stamp is not None and cache.get(key, (None,))[0] == stamp:
++        return cache[key][1]
++    operator = 'NOT IN' if exclude_statuses else 'IN'
++    found = tuple(row[0] for row in conn.execute(
++        f"SELECT t.id FROM tasks t WHERE t.status {operator} ({','.join('?' * len(statuses))}) AND EXISTS "
++        f"(SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind IN ({','.join('?' * len(kinds))}))",
++        (*statuses, *kinds),
++    ).fetchall())
++    if stamp is not None:
++        if len(cache) >= 16:
++            cache.clear()
++        cache[key] = stamp, found
++        conn._idle_candidates = cache
++    return found
++
++
++def sweep_shared_blockers(conn, result) -> None:
++    """Skip proven-empty lanes; positive candidates still obey time-based policy."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_shared_blockers import probe_stranded_blockers, release_cleared_blockers
++
++    for statuses, handler, field in (
++        (('blocked', 'scheduled', 'ready', 'review'), release_cleared_blockers, 'shared_blocker_released'),
++        (('blocked',), probe_stranded_blockers, 'shared_blocker_probed'),
++    ):
++        try:
++            if conn.execute(f"SELECT 1 FROM tasks WHERE status IN ({','.join('?' * len(statuses))}) LIMIT 1",
++                            statuses).fetchone():
++                setattr(result, field, handler(conn))
++        except Exception:  # health: allow BLE001 -- each independent maintenance source must leave the tick alive
++            kb._log.warning('kanban: %s failed', field, exc_info=True)
+diff --git a/hermes_cli/kanban_owner_archive_relay.py b/hermes_cli/kanban_owner_archive_relay.py
+index 571b534583a..1919407ead1 100644
+--- a/hermes_cli/kanban_owner_archive_relay.py
++++ b/hermes_cli/kanban_owner_archive_relay.py
+@@ -157,12 +157,12 @@ def apply_requests(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_connect import write_txn
+ 
+-    # Per-card index probes (idx_events_task), not a scan of every event on the board.
+-    rows = conn.execute(
+-        "SELECT t.id FROM tasks t WHERE t.status != 'archived' AND EXISTS "
+-        "(SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = ?)", (REQUEST_KIND,)).fetchall()
++    from hermes_cli.kanban_idle_candidates import candidate_task_ids
++    # The task/event set is structural; home authority and answered UIDs below
++    # are still checked every tick, including changes in remote replicas.
++    rows = candidate_task_ids(conn, ('archived',), (REQUEST_KIND,), exclude_statuses=True)
+     done: list[str] = []
+-    for (waiting,) in rows:
++    for waiting in rows:
+         if _home_of(conn, waiting) is not None:
+             continue
+         answered = {p.get("request_uid") for p in _events(conn, waiting, RESULT_KIND)}
+@@ -244,19 +244,27 @@ def apply_remote_archives(conn: sqlite3.Connection) -> list[str]:
+     (:func:`apply_requests`), then send the archives of placed copies whose remote id has resolved since their card
+     was archived (:func:`hermes_cli.kanban_placement_forward.sweep_unresolved_archives`). Returns the ids archived
+     here; a failing source is logged and skipped."""
+-    from hermes_cli.kanban_remote_stop import apply_stop_requests
++    from hermes_cli.kanban_remote_stop import STOP_KIND, apply_stop_requests
++    from hermes_cli.kanban_idle_candidates import event_candidates
+ 
+     done: list[str] = []
+-    for label, apply in (("remote stop requests", apply_stop_requests), ("forwarded owner archives", apply_requests)):
++    sources = (
++        ('remote stop requests', apply_stop_requests, ('running',), (STOP_KIND,)),
++        ('forwarded owner archives', apply_requests,
++         ('archived',), (REQUEST_KIND,)),
++    )
++    for label, apply, statuses, kinds in sources:
+         try:
+-            done += apply(conn)
++            if event_candidates(conn, statuses, kinds, exclude_statuses=apply is apply_requests):
++                done += apply(conn)
+         except Exception:  # health: allow BLE001 -- one failing source must not stop the dispatcher tick
+             _log.warning("kanban: applying %s failed", label, exc_info=True)
+     # [daveey] Placed copies whose remote id was unknown when their card was archived here: archive them there now.
+     try:
+-        from hermes_cli.kanban_placement_forward import sweep_unresolved_archives
+-        for tid in sweep_unresolved_archives(conn):
+-            _log.info("kanban: sent the deferred archive of %s's placed copy", tid)
++        from hermes_cli.kanban_placement_forward import ARCHIVE_FORWARDED, CANCEL_INTENT, sweep_unresolved_archives
++        if event_candidates(conn, ('done', 'archived'), (ARCHIVE_FORWARDED, CANCEL_INTENT)):
++            for tid in sweep_unresolved_archives(conn):
++                _log.info("kanban: sent the deferred archive of %s's placed copy", tid)
+     except Exception:  # health: allow BLE001 -- one failing source must not stop the dispatcher tick
+         _log.warning("kanban: sweeping unresolved placement archives failed", exc_info=True)
+     return done
+diff --git a/hermes_cli/kanban_reader_retention.py b/hermes_cli/kanban_reader_retention.py
+new file mode 100644
+index 00000000000..f93e1a83fc9
+--- /dev/null
++++ b/hermes_cli/kanban_reader_retention.py
+@@ -0,0 +1,55 @@
++"""Bound shared idle readers without closing a connection under its borrower."""
++import atexit
++from contextlib import contextmanager
++import sqlite3
++
++LIMIT = 32
++
++
++@contextmanager
++def reader(path):
++    from hermes_cli.kanban_session_activity import cached_ro
++
++    try:
++        with cached_ro(path) as conn:
++            yield conn
++    finally:
++        prune()
++
++
++
++def prune(*, missing: str | None = None) -> None:
++    from hermes_cli import kanban_session_activity as activity
++
++    with activity._RO_CACHE_LOCK:
++        entries = list(activity._RO_CACHE.items())
++    for key, entry in entries:
++        with activity._RO_CACHE_LOCK:
++            if key != missing and len(activity._RO_CACHE) <= LIMIT:
++                continue
++        if not entry[2].acquire(blocking=False):
++            continue  # temporarily over limit while readers are borrowed
++        try:
++            with activity._RO_CACHE_LOCK:
++                if activity._RO_CACHE.get(key) is not entry:
++                    continue
++                del activity._RO_CACHE[key]
++            entry[0].close()
++        finally:
++            entry[2].release()
++
++
++def close_all() -> None:
++    """Shutdown cleanup; idle readers only, with active borrowers left alone."""
++    from hermes_cli import kanban_session_activity as activity
++
++    with activity._RO_CACHE_LOCK:
++        paths = list(activity._RO_CACHE)
++    for path in paths:
++        try:
++            prune(missing=path)
++        except sqlite3.Error:
++            continue
++
++
++atexit.register(close_all)
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 6042971eb24..96cc560e6c6 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -27,6 +27,7 @@ import json
+ import logging
+ import re
+ import sqlite3
++import threading
+ import time
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+@@ -37,13 +38,15 @@ _log = logging.getLogger(__name__)
+ LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9:._-]{0,63}$")
+ MAX_LABELS = 32
+ REGISTRY_TTL_S = 60
++REGISTRY_RETRY_S = 5
+ # Copy at most this many cards per tick when the dispatcher has no cap.
+ DEFAULT_PICKUP_BATCH = 4
+ # History copied with a card: enough for the worker's context, without the whole event log.
+ EVENT_TAIL = 200
+ _CHILD_TABLES = ("task_runs", "task_comments", "task_attachments", "task_events")
+ 
+-_REGISTRY: dict[str, Any] = {"at": 0.0, "value": None}
++_REGISTRY: dict[str, Any] = {"at": None, "value": None, "retry": False}
++_REGISTRY_LOCK = threading.Lock()
+ _FETCH: Optional[Callable[[], Mapping[str, Any]]] = None
+ 
+ 
+@@ -174,14 +177,24 @@ def _parse(value: Any) -> Optional[list[str]]:
+ def set_registry_fetch(fn: Optional[Callable[[], Mapping[str, Any]]]) -> None:
+     """Tests (and the sync loop) inject how ``GET /v2/machines`` is read; resets the cache."""
+     global _FETCH
+-    _FETCH = fn
+-    _REGISTRY.update(at=0.0, value=None)
++    with _REGISTRY_LOCK:
++        _FETCH = fn
++        _REGISTRY.update(at=None, value=None, retry=False)
+ 
+ 
+ def registry() -> Optional[Mapping[str, Any]]:
+     """``{me, machines: {name: entry}}``, cached for :data:`REGISTRY_TTL_S`; None when unreachable."""
++    # Several board/executor ticks can reach the same expired entry concurrently.
++    # Failed attempts also consume the TTL: an outage must not turn every tick
++    # into another HTTP request. The Board still authorizes every actual lease.
++    with _REGISTRY_LOCK:
++        return _registry_locked()
++
++
++def _registry_locked() -> Optional[Mapping[str, Any]]:
+     now = time.monotonic()
+-    if _REGISTRY["value"] is not None and now - _REGISTRY["at"] < REGISTRY_TTL_S:
++    ttl = REGISTRY_RETRY_S if _REGISTRY.get('retry') else REGISTRY_TTL_S
++    if _REGISTRY["at"] is not None and now - _REGISTRY["at"] < ttl:
+         return _REGISTRY["value"]
+     fetch = _FETCH
+     if fetch is None:
+@@ -191,10 +204,11 @@ def registry() -> Optional[Mapping[str, Any]]:
+     try:
+         raw = fetch()
+     except Exception as exc:  # health: allow BLE001 -- registry unreachable: pick up nothing this tick
++        _REGISTRY.update(at=time.monotonic(), retry=True)
+         _log.info("kanban worker node: machine registry unavailable (%s: %s)", type(exc).__name__, exc)
+         return _REGISTRY["value"]
+     value = {"me": raw.get("me"), "machines": {m["name"]: m for m in raw.get("machines") or [] if m.get("name")}}
+-    _REGISTRY.update(at=now, value=value)
++    _REGISTRY.update(at=time.monotonic(), value=value, retry=False)
+     return value
+ 
+ 
+diff --git a/tests/gateway/test_kanban_notifier_idle_claims.py b/tests/gateway/test_kanban_notifier_idle_claims.py
+new file mode 100644
+index 00000000000..ad4637fae88
+--- /dev/null
++++ b/tests/gateway/test_kanban_notifier_idle_claims.py
+@@ -0,0 +1,41 @@
++"""Idle filtering must preserve recovery of expired claims held by live processes."""
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import kanban_watchers_notifier as watcher
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++
++
++@pytest.mark.parametrize('expired', [False, True])
++def test_collector_retains_live_claims_for_expiry_recovery(tmp_path, monkeypatch, expired):
++    path = tmp_path / 'board.db'
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(path))
++    conn = kbc.connect(path)
++    try:
++        task = kb.create_task(conn, title='held notification', assignee='default')
++        notify.add_notify_sub(conn, task_id=task, platform='telegram', chat_id='chat')
++        before = notify.list_notify_subs(conn)[0]['last_event_id']
++        with kbc.write_txn(conn):
++            kb._append_event(conn, task, 'completed', {})
++            last = conn.execute('SELECT MAX(id) FROM task_events WHERE task_id = ?', (task,)).fetchone()[0]
++            age = notify.NOTIFY_CLAIM_STALE_S + 60 if expired else 0
++            conn.execute('UPDATE kanban_notify_subs SET inflight_from=?,last_event_id=?,inflight_pid=12345,'
++                         'inflight_start=NULL,inflight_at=?', (before, last, int(time.time()) - age))
++        monkeypatch.setattr(notify, '_holder_alive', lambda row: True)
++        monkeypatch.setattr(notify, '_holder_is_me', lambda row: False)
++        runner = SimpleNamespace(_owns_kanban_dispatcher_lock=lambda: True,
++                                 adapters={'telegram': object()}, _profile_adapters={},
++                                 config=SimpleNamespace(multiplex_profiles=False))
++        monkeypatch.setattr(watcher, '_adapter_for_subscription', lambda *a: object())
++        collector = watcher._Collector(runner, kb, notifier_profile='default', gc_due=False, gc_retention_days=30)
++        with kb.pin_first_board_resolution():
++            collector.collect_board('default')
++        assert len(collector.deliveries) == int(expired)
++        if expired:
++            assert [event.kind for event in collector.deliveries[0]['events']] == ['completed']
++    finally:
++        conn.close()
+diff --git a/tests/hermes_cli/test_kanban_watcher_idle_work.py b/tests/hermes_cli/test_kanban_watcher_idle_work.py
+new file mode 100644
+index 00000000000..edd5cb35cfa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_watcher_idle_work.py
+@@ -0,0 +1,326 @@
++"""Idle watchers avoid repeating work without hiding new inputs or live workers."""
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_guard_notice as guards
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_worker_node as node
++
++
++@pytest.fixture
++def board(tmp_path):
++    conn = kbc.connect(tmp_path / 'board.db')
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def test_registry_failure_waits_for_ttl_and_recovers(monkeypatch):
++    clock = SimpleNamespace(monotonic=lambda: 100.0)
++    monkeypatch.setattr(node, 'time', clock)
++    fetch = Mock(side_effect=OSError('offline'))
++    node.set_registry_fetch(fetch)
++    try:
++        for _ in range(20):
++            assert node.registry() is None
++        assert fetch.call_count == 1
++        clock.monotonic = lambda: 100.0 + node.REGISTRY_RETRY_S
++        fetch.side_effect = None
++        fetch.return_value = {'me': 'local', 'machines': [{'name': 'new'}]}
++        assert 'new' in node.registry()['machines']
++        assert fetch.call_count == 2
++    finally:
++        node.set_registry_fetch(None)
++
++
++def test_notify_count_reuses_reader_and_sees_external_commit(board, monkeypatch):
++    from hermes_cli import kanban_lockguard
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    real = kanban_lockguard.connect
++    opened = Mock(wraps=real)
++    monkeypatch.setattr(kanban_lockguard, 'connect', opened)
++    for _ in range(20):
++        assert notify.count_notify_subs(db_path=Path(path)) == 0
++    assert opened.call_count <= 1
++    task = kb.create_task(board, title='new subscription', assignee='default')
++    notify.add_notify_sub(board, task_id=task, platform='tui', chat_id='chat')
++    assert notify.count_notify_subs(db_path=Path(path)) == 1
++
++
++def test_notify_idle_reader_retention_is_bounded_and_missing_path_closes(tmp_path, monkeypatch):
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli import kanban_reader_retention as retention
++    monkeypatch.setattr(retention, 'LIMIT', 2)
++    for entry in list(activity._RO_CACHE.values()):
++        entry[0].close()
++    activity._RO_CACHE.clear()
++    for i in range(4):
++        path = tmp_path / f'empty-{i}.db'
++        conn = kbc.connect(path)
++        conn.close()
++        assert notify.count_notify_subs(db_path=path) == 0
++        assert len(activity._RO_CACHE) <= 2
++    entry = activity._RO_CACHE[str(path.resolve())]
++    path.unlink()
++    assert notify.count_notify_subs(db_path=path) == 0
++    import sqlite3
++    with pytest.raises(sqlite3.ProgrammingError):
++        entry[0].execute('SELECT 1')
++
++
++def test_notifier_scan_filters_idle_and_disconnected_subscriptions(board):
++    task = kb.create_task(board, title='notify', assignee='default')
++    for platform in ('tui', 'telegram'):
++        notify.add_notify_sub(board, task_id=task, platform=platform, chat_id='chat')
++    assert notify.list_notify_subs(board, platforms={'telegram'}, pending_only=True) == []
++    with kbc.write_txn(board):
++        kb._append_event(board, task, 'completed', {})
++    subs = notify.list_notify_subs(board, platforms={'TELEGRAM'}, pending_only=True)
++    assert [s['platform'] for s in subs] == ['telegram']
++    assert notify.list_notify_subs(board, platforms=set(), pending_only=True) == []
++    assert len(notify.list_notify_subs(board)) == 2
++
++
++def test_no_guard_candidates_avoids_registry_then_new_hold_runs(board, monkeypatch):
++    calls = Mock(return_value={})
++    monkeypatch.setattr(node, 'dispatch_refusals', calls)
++    for _ in range(20):
++        guards.sweep_remote_guard_holds(board, dispatch.DispatchResult())
++    assert calls.call_count == 0
++    task = kb.create_task(board, title='new hold', assignee='default')
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task,))
++        kb._append_event(board, task, 'respawn_guarded', {'reason': 'blocker_auth'})
++    guards.sweep_remote_guard_holds(board, dispatch.DispatchResult())
++    assert calls.call_count == 2
++
++
++def test_empty_reclaim_skips_worker_sweeps_but_running_retries(board, monkeypatch):
++    callbacks = []
++    for module, name, answer in (
++        (kb, 'release_stale_claims', 0),
++        (dispatch, 'reconcile_orphaned_running', []),
++        (dispatch, 'detect_stale_running', []),
++        (dispatch, 'detect_crashed_workers', []),
++        (dispatch, 'enforce_max_runtime', []),
++    ):
++        callback = Mock(return_value=answer)
++        if name == 'detect_crashed_workers':
++            callback._last_auto_blocked = []
++            callback._last_rate_limited = []
++            callback._last_owner_restarted = []
++        monkeypatch.setattr(module, name, callback)
++        callbacks.append(callback)
++    monkeypatch.setattr(dispatch, 'reap_worker_zombies', lambda: None)
++    monkeypatch.setattr(dispatch._worker_scope, 'stopped_scope_units', lambda *a, **kw: [])
++
++    def tick():
++        dispatch._run_reclaim_phase(board, dispatch.DispatchResult(),
++                                    stale_timeout_seconds=100, failure_limit=2, reconcile_orphans=True)
++    for _ in range(3):
++        tick()
++    assert all(callback.call_count == 0 for callback in callbacks)
++    task = kb.create_task(board, title='running worker', assignee='default')
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task,))
++    # No intervening board write: PID death and deadline expiry must still be checked.
++    for _ in range(3):
++        tick()
++    assert all(callback.call_count == 3 for callback in callbacks)
++
++
++def test_no_running_tasks_still_closes_dangling_runs(board, monkeypatch):
++    task = kb.create_task(board, title='old ended task', assignee='default')
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status='done' WHERE id=?", (task,))
++        run = board.execute("INSERT INTO task_runs(task_id,status,started_at) VALUES (?,'running',1)", (task,)).lastrowid
++    monkeypatch.setattr(dispatch, 'reap_worker_zombies', lambda: None)
++    monkeypatch.setattr(dispatch._worker_scope, 'stopped_scope_units', lambda *a, **kw: [])
++    dispatch._run_reclaim_phase(board, dispatch.DispatchResult(), stale_timeout_seconds=100,
++                                failure_limit=2, reconcile_orphans=True)
++    assert board.execute('SELECT status FROM task_runs WHERE id=?', (run,)).fetchone()[0] == 'reclaimed'
++
++
++def test_reader_pruning_leaves_active_borrower_usable(board, monkeypatch):
++    from hermes_cli import kanban_reader_retention as retention
++    from hermes_cli import kanban_session_activity as activity
++    path = Path(board.execute('PRAGMA database_list').fetchone()[2]).resolve()
++    monkeypatch.setattr(retention, 'LIMIT', 0)
++    with retention.reader(path) as conn:
++        retention.prune(missing=str(path))
++        assert conn.execute('SELECT 1').fetchone()[0] == 1
++        assert str(path) in activity._RO_CACHE
++    assert str(path) not in activity._RO_CACHE
++
++
++def test_empty_blocker_sweeps_skip_and_new_candidates_run(board, monkeypatch):
++    from hermes_cli import kanban_shared_blockers as blockers
++    release, probe = Mock(return_value=[]), Mock(return_value=[])
++    monkeypatch.setattr(kb, 'recompute_ready', lambda *a, **kw: [])  # isolate candidate gates from block-policy repair
++    monkeypatch.setattr(blockers, 'release_cleared_blockers', release)
++    monkeypatch.setattr(blockers, 'probe_stranded_blockers', probe)
++    monkeypatch.setattr(dispatch, 'reap_worker_zombies', lambda: None)
++    monkeypatch.setattr(dispatch._worker_scope, 'stopped_scope_units', lambda *a, **kw: [])
++    def tick():
++        dispatch._run_reclaim_phase(board, dispatch.DispatchResult(),
++                                    stale_timeout_seconds=100, failure_limit=2, reconcile_orphans=True)
++    for _ in range(3):
++        tick()
++    assert release.call_count == probe.call_count == 0
++    task = kb.create_task(board, title='blocker candidate', assignee='default')
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task,))
++    for _ in range(3):
++        tick()
++    assert release.call_count == probe.call_count == 3
++
++
++def test_owner_archive_candidate_scan_is_not_repeated(board, monkeypatch):
++    from hermes_cli import kanban_owner_archive_relay as relay
++    task = kb.create_task(board, title='answered archive', assignee='default')
++    with kbc.write_txn(board):
++        kb._append_event(board, task, relay.REQUEST_KIND, {'request_uid': 'handled'})
++        kb._append_event(board, task, relay.RESULT_KIND, {'request_uid': 'handled'})
++    monkeypatch.setattr(relay, '_home_of', lambda *a: None)
++    queries = []
++    board.set_trace_callback(queries.append)
++    try:
++        for _ in range(4):
++            assert relay.apply_requests(board) == []
++        assert sum(q.startswith('SELECT t.id FROM tasks t') for q in queries) <= 1
++    finally:
++        board.set_trace_callback(None)
++
++
++def test_remote_archive_empty_sources_skipped_but_pending_source_retried(board, monkeypatch):
++    from hermes_cli import kanban_owner_archive_relay as relay
++    from hermes_cli import kanban_remote_stop as stop
++    from hermes_cli import kanban_placement_forward as placement
++    stop_call, owner_call, placement_call = (Mock(return_value=[]) for _ in range(3))
++    monkeypatch.setattr(stop, 'apply_stop_requests', stop_call)
++    monkeypatch.setattr(relay, 'apply_requests', owner_call)
++    monkeypatch.setattr(placement, 'sweep_unresolved_archives', placement_call)
++    for _ in range(3):
++        assert relay.apply_remote_archives(board) == []
++    assert (stop_call.call_count, owner_call.call_count, placement_call.call_count) == (0, 0, 0)
++    task = kb.create_task(board, title='remote archive', assignee='default')
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task,))
++        kb._append_event(board, task, placement.CANCEL_INTENT, {})
++    # A pending source can resolve in the remote replica without a local write.
++    for _ in range(3):
++        relay.apply_remote_archives(board)
++    assert placement_call.call_count == 3
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task,))
++        kb._append_event(board, task, stop.STOP_KIND, {})
++        kb._append_event(board, task, relay.REQUEST_KIND, {})
++    relay.apply_remote_archives(board)
++    assert stop_call.call_count == owner_call.call_count == 1
++
++
++def test_candidate_memo_skips_scan_and_external_status_commit_invalidates(board):
++    from hermes_cli.kanban_idle_candidates import _on_connection as event_candidates
++    task = kb.create_task(board, title='held history', assignee='default')
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task,))
++        kb._append_event(board, task, 'respawn_guarded', {})
++    queries = []
++    board.set_trace_callback(queries.append)
++    try:
++        for _ in range(20):
++            assert not event_candidates(board, ('ready',), ('respawn_guarded',))
++        scans = lambda: sum(q.startswith('SELECT t.id FROM tasks t') for q in queries)
++        assert scans() == 1
++        path = Path(board.execute('PRAGMA database_list').fetchone()[2])
++        writer = kbc.connect(path)
++        try:
++            with kbc.write_txn(writer):
++                writer.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task,))
++        finally:
++            writer.close()
++        assert event_candidates(board, ('ready',), ('respawn_guarded',))
++        assert scans() == 2
++    finally:
++        board.set_trace_callback(None)
++
++
++def test_candidate_memo_survives_dispatch_connection_reopen(board, monkeypatch):
++    from hermes_cli import kanban_idle_candidates as candidates
++    from hermes_cli.kanban_reader_retention import reader
++    path = Path(board.execute('PRAGMA database_list').fetchone()[2])
++    queries = []
++    with reader(path) as observer:
++        observer.set_trace_callback(queries.append)
++    try:
++        for _ in range(3):
++            conn = kbc.connect(path)
++            conn.set_trace_callback(queries.append)
++            try:
++                assert not candidates.event_candidates(conn, ('ready',), ('respawn_guarded',))
++            finally:
++                conn.close()
++        assert sum(q.startswith('SELECT t.id FROM tasks t') for q in queries) == 1
++    finally:
++        with reader(path) as observer:
++            observer.set_trace_callback(None)
++
++
++def test_candidate_key_failure_falls_back_to_real_query(board, monkeypatch):
++    import sqlite3
++    from hermes_cli import kanban_idle_candidates as candidates
++    monkeypatch.setattr(candidates.revision, 'read_key', Mock(side_effect=sqlite3.OperationalError('key unavailable')))
++    assert not candidates.event_candidates(board, ('ready',), ('respawn_guarded',))
++
++
++def test_registry_concurrent_misses_are_single_flight(monkeypatch):
++    from concurrent.futures import ThreadPoolExecutor
++    from threading import Barrier
++    barrier = Barrier(8)
++    fetch = Mock(return_value={'me': 'local', 'machines': [{'name': 'one'}]})
++    node.set_registry_fetch(fetch)
++    try:
++        def read():
++            barrier.wait(timeout=10)
++            return node.registry()
++        with ThreadPoolExecutor(max_workers=8) as pool:
++            values = list(pool.map(lambda _: read(), range(8)))
++        assert all('one' in v['machines'] for v in values)
++        assert fetch.call_count == 1
++        monkeypatch.setattr(node, 'time', SimpleNamespace(monotonic=lambda: node._REGISTRY['at'] + node.REGISTRY_TTL_S))
++        fetch.return_value = {'me': 'local', 'machines': [{'name': 'two'}]}
++        assert 'two' in node.registry()['machines']
++        assert fetch.call_count == 2
++    finally:
++        node.set_registry_fetch(None)
++
++
++def test_candidate_memo_bypassed_for_transactions_and_missing_triggers(board):
++    from hermes_cli import kanban_activity_revision as revision
++    from hermes_cli.kanban_idle_candidates import _on_connection as event_candidates
++    assert not event_candidates(board, ('ready',), ('respawn_guarded',))
++    board.execute('BEGIN')
++    try:
++        task = 'transaction-only-task'
++        board.execute("INSERT INTO tasks(id,title,status,created_at) VALUES (?, 'temporary', 'ready', 1)", (task,))
++        kb._append_event(board, task, 'respawn_guarded', {})
++        assert event_candidates(board, ('ready',), ('respawn_guarded',))
++    finally:
++        board.rollback()
++    assert not event_candidates(board, ('ready',), ('respawn_guarded',))
++    revision.drop_triggers(board)
++    queries = []
++    board.set_trace_callback(queries.append)
++    try:
++        for _ in range(2):
++            assert not event_candidates(board, ('ready',), ('respawn_guarded',))
++        assert sum(q.startswith('SELECT t.id FROM tasks t') for q in queries) == 2
++    finally:
++        board.set_trace_callback(None)
+-- 
+2.55.0
+

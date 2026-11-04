@@ -1,0 +1,220 @@
+From 9908049020eec676d7ba73f1d1538a43b77f2675 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 02:08:13 +0000
+Subject: [PATCH] [daveey] update: start the root gateway first and wait for
+ its host Kanban locks on resume
+
+A pinned profile gateway on an older core neither defers nor yields the host dispatcher/sync locks, so
+the lease alone can't move them off it. resume_paused_set now starts the root gateway's unit first,
+waits (bounded, 90s) until its new pid holds the locks its config takes (.dispatcher.lock unless
+dispatch_in_gateway=false, .sync.lock when kanban.sync.enabled), then starts the profile gateways;
+a timeout prints a warning naming the missing lock and carries on.
+---
+ gateway/kanban_singleton.py                  | 58 +++++++++++++++++
+ hermes_cli/update_cmd_posix_pause.py         | 34 +++++++++-
+ tests/gateway/test_kanban_singleton_lease.py | 68 ++++++++++++++++++++
+ 3 files changed, 158 insertions(+), 2 deletions(-)
+
+diff --git a/gateway/kanban_singleton.py b/gateway/kanban_singleton.py
+index c35f919a999..92aff45f4c2 100644
+--- a/gateway/kanban_singleton.py
++++ b/gateway/kanban_singleton.py
+@@ -301,3 +301,61 @@ class SingletonLease:
+             self._clear_own_root_claim()
+         self.state = "idle"
+         self._yield_cache = (float("-inf"), False)
++
++
++# --- restart ordering ----------------------------------------------------------------------------
++# A pinned profile gateway running an older core neither defers nor yields, so on a joint restart the
++# only lever is order: start the root gateway, wait until it holds the host locks it takes, then start
++# the profile gateways (``hermes_cli.update_cmd_posix_pause.resume_paused_set``). [daveey]
++
++ROOT_LOCK_WAIT_SECONDS = 90.0
++
++
++def is_root_home(home: Optional[str]) -> bool:
++    if not home:
++        return False
++    try:
++        from hermes_cli.kanban_db import kanban_home
++        return _resolve(Path(home)) == _resolve(kanban_home())
++    except Exception:
++        return False
++
++
++def root_expected_locks() -> list[Path]:
++    """The host locks a root gateway takes under the kanban root's own config.yaml."""
++    from hermes_cli.kanban_db import kanban_home
++    root = kanban_home() / "kanban"
++    locks: list[Path] = []
++    try:
++        from hermes_cli.config_backend import config_exists, read_config_doc_readonly
++        path = kanban_home() / "config.yaml"
++        kanban = ((read_config_doc_readonly(path) if config_exists(path) else None) or {}).get("kanban") or {}
++    except Exception:
++        kanban = {}
++    if kanban.get("dispatch_in_gateway", True):
++        locks.append(root / ".dispatcher.lock")
++    if (kanban.get("sync") or {}).get("enabled"):
++        locks.append(root / ".sync.lock")
++    return locks
++
++
++def wait_for_root_locks(pid: int, *, timeout: float = ROOT_LOCK_WAIT_SECONDS, locks: Optional[list] = None,
++                        sleep: Optional[Callable[[float], None]] = None,
++                        clock: Optional[Callable[[], float]] = None) -> list[str]:
++    """Block until *pid* holds every expected host lock, or *timeout*; returns the lock names it lacks.
++
++    Never raises: a lock held by another live process is reported (that holder will not yield if it runs
++    an older core) and the caller carries on.
++    """
++    try:
++        paths = root_expected_locks() if locks is None else [Path(p) for p in locks]
++    except Exception:
++        return []
++    sleep = sleep or time.sleep
++    clock = clock or time.monotonic
++    deadline = clock() + timeout
++    while True:
++        missing = [p for p in paths if (holder_info(p) or {}).get("pid") != pid]
++        if not missing or clock() >= deadline or not _pid_alive(pid):
++            return [p.name for p in missing]
++        sleep(1.0)
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index 9bf6353603b..8d429fbb2f3 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -642,21 +642,51 @@ def _pause(token: dict) -> str | None:
+ 
+ # --------------------------------------------------------------------------- resume
+ 
++def _root_first(entries: list[dict]) -> tuple[list[dict], dict | None]:
++    """*entries* with the root gateway's systemd unit first, plus that entry when profile gateways follow it.
++
++    The host-wide Kanban dispatcher/sync locks go to whichever gateway reaches them first, and a pinned
++    profile gateway on an older core never hands them back: on hermes-hub (2026-11-02) askeve-reviewer
++    won every joint restart by ~20 s and synced/dispatched for the whole host with its own caps and
++    columns. Starting the root first and waiting for its locks is the one ordering that core can't undo. [daveey]"""
++    from gateway.kanban_singleton import is_root_home
++    root = [e for e in entries if e.get("kind") != "launchd" and is_root_home(e.get("home"))]
++    if not root:
++        return list(entries), None
++    rest = [e for e in entries if e is not root[0]]
++    return [root[0], *rest], (root[0] if rest else None)
++
++
++def _await_root_locks(name: str, pid: int) -> None:
++    """Wait (bounded) for the just-started root gateway to hold the host Kanban locks it takes."""
++    from gateway.kanban_singleton import ROOT_LOCK_WAIT_SECONDS, wait_for_root_locks
++    with suppress(Exception):
++        missing = wait_for_root_locks(pid)
++        if missing:
++            print(f"  ⚠ {name} (PID {pid}) does not hold {', '.join(missing)} after "
++                  f"{int(ROOT_LOCK_WAIT_SECONDS)}s; starting the profile gateways anyway "
++                  "(`hermes kanban stats` names the holder)")
++
++
+ def resume_paused_set(token: dict) -> None:
+     """Start every paused runtime again; each leaves *token* only on its own verified start."""
+     failures: list[str] = []
+     restarted: list[str] = []
+     kept_units = []
+-    for entry in token.get("posix_units") or []:
++    entries, root_pending = _root_first(token.get("posix_units") or [])
++    for entry in entries:
+         try:
+             if entry.get("kind") == "launchd":
+                 _start_job(entry)
+                 _RESTARTED["labels"].add(entry["label"])
+                 name = entry["label"]
+             else:
+-                _RESTARTED["pids"].add(_start_unit(entry))
++                new_pid = _start_unit(entry)
++                _RESTARTED["pids"].add(new_pid)
+                 _RESTARTED["units"].add(f"{entry['scope']}/{entry['unit']}")
+                 name = entry["unit"]
++                if entry is root_pending:
++                    _await_root_locks(name, new_pid)
+             restarted.append(name)
+             token.setdefault("restarted_services", []).append(name)
+         except Exception as exc:  # health: allow BLE001 -- one failed unit never keeps the others stopped
+diff --git a/tests/gateway/test_kanban_singleton_lease.py b/tests/gateway/test_kanban_singleton_lease.py
+index b19648e3a3d..77adc35b890 100644
+--- a/tests/gateway/test_kanban_singleton_lease.py
++++ b/tests/gateway/test_kanban_singleton_lease.py
+@@ -252,3 +252,71 @@ def test_sync_watcher_profile_gateway_yields_to_root_and_waits(root, monkeypatch
+     finally:
+         root_lease.release()
+     assert loops == ["start"] and sleeps == [ks.DEFAULT_RETRY_SECONDS]
++
++
++# --- entry path 4: joint restart order in `hermes update` (posix pause resume) --------------------
++
++
++def _unit(name, home, pid):
++    return {"kind": "systemd", "scope": "user", "unit": name, "pid": pid, "home": str(home)}
++
++
++def test_update_resume_starts_root_first_and_waits_for_its_locks(root, monkeypatch):
++    """A pinned profile gateway (older core) never yields, so resume must start the root gateway, wait
++    until the root's new pid holds the host locks, and only then start the profile gateways."""
++    from hermes_cli import update_cmd_posix_pause as pause
++    (root / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n")
++    order = []
++    leases = {}
++
++    def start(entry):
++        order.append(("start", entry["unit"]))
++        if entry["unit"] == "hermes-gateway.service":
++            # The root gateway's watchers take both locks a moment later (simulated by this process).
++            for name in ("dispatcher", "sync"):
++                leases[name] = _lease(root, is_root=True, clock=Clock(), name=name)
++        return os.getpid() if entry["unit"] == "hermes-gateway.service" else 99999
++
++    import os
++    monkeypatch.setattr(pause, "_start_unit", start)
++    waits = []
++
++    def fake_sleep(_s):
++        waits.append(len(order))
++        for lease in leases.values():
++            lease.try_acquire()
++    monkeypatch.setattr(ks.time, "sleep", fake_sleep)
++    monkeypatch.setattr(pause, "_RESTARTED", {"pids": set(), "units": set(), "labels": set()})
++    token = {"posix_units": [
++        _unit("hermes-gateway-askeve-reviewer.service", root / "profiles" / "askeve-reviewer", 11),
++        _unit("hermes-gateway.service", root, 12),
++        _unit("hermes-gateway-askeve-builder.service", root / "profiles" / "askeve-builder", 13),
++    ]}
++    try:
++        pause.resume_paused_set(token)
++    finally:
++        for lease in leases.values():
++            lease.release()
++    assert [u for _k, u in order] == ["hermes-gateway.service", "hermes-gateway-askeve-reviewer.service",
++                                      "hermes-gateway-askeve-builder.service"]
++    assert waits and all(n == 1 for n in waits), "profile units started before the root held its locks"
++
++
++def test_update_resume_root_lock_wait_is_bounded(root):
++    """A lock another process keeps (an older core never yields) costs at most the timeout, then resume goes on."""
++    from hermes_cli import update_cmd_posix_pause as pause
++    clock = Clock()
++    path = root / "kanban" / ".dispatcher.lock"
++    other, state = _acquire_singleton_lock(path)
++    assert state == "held"
++
++    def sleep(_s):
++        clock.now += 30
++    try:
++        # pid 1 is alive and is not the holder (this test process is).
++        assert ks.wait_for_root_locks(1, timeout=90.0, sleep=sleep, clock=clock, locks=[path]) == [".dispatcher.lock"]
++        assert 90 <= clock.now - 1000.0 <= 120
++    finally:
++        _release_singleton_lock(other)
++    lone = [_unit("hermes-gateway-x.service", root / "profiles" / "x", 1)]
++    assert pause._root_first(lone) == (lone, None)
+-- 
+2.55.0
+

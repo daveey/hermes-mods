@@ -1,0 +1,209 @@
+From db0a1a074e6a9c1e8e22465545edaa2ee5f28745 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 04:28:00 +0000
+Subject: [PATCH] fix(kanban): bound the healthy deploy-window re-park
+ exemption to 24h [daveey]
+
+A kind=deploy park counted as healthy (exempt from same-premise escalation) whenever the host's
+window.json was fresh, batching/draining and the window ahead. Nothing ties awaiting.ref to the
+pending batch, so a card waiting on a commit that never reaches main re-parked as healthy forever
+while other commits kept the window moving; its wake_check was the only exit.
+
+annotate() now records streak_since (created_at of the first park in the card's trailing run on
+this premise/probe, same stop rules as prior_same_premise, scanned over the full history rather
+than the last 20 parks). Past HEALTHY_MAX_SECONDS (24h) the park is unhealthy (healthy_expired),
+so it counts and the third such park escalates through REPARK_LIMIT. The wake floor is kept.
+
+Follow-up from the #718 review (t_01a19e8931f81f04); card t_01a19f1272494893.
+---
+ hermes_cli/kanban_deploy_window.py            | 37 ++++++++
+ tests/hermes_cli/test_kanban_deploy_window.py | 84 +++++++++++++++++--
+ 2 files changed, 116 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_deploy_window.py b/hermes_cli/kanban_deploy_window.py
+index 858839cf8cb..1093d29b7e4 100644
+--- a/hermes_cli/kanban_deploy_window.py
++++ b/hermes_cli/kanban_deploy_window.py
+@@ -16,6 +16,10 @@ The record (schema ``version`` 1) is evidence only when it is fresh (``observed_
+   the batch is ``batching``/``draining`` AND either the window is still ahead or the publisher's
+   semantic state (``state``, ``state_since``) moved since the previous park on this premise. A
+   newer ``observed_at`` alone is not progress: an overdue batch nobody is running escalates.
++  The exemption is also bounded in time: once the card's first park in its trailing run on this
++  premise is more than :data:`HEALTHY_MAX_SECONDS` old, parks count again (``healthy_expired``).
++  Nothing checks that the awaited ref is in the batch, so a ref that never reaches main would
++  otherwise re-park as healthy forever while other commits keep the window moving.
+ 
+ Anything else (missing, stale, foreign, malformed) changes nothing: the park escalates as before.
+ """
+@@ -31,6 +35,7 @@ WINDOW_FILE = Path("cache", "core-update", "window.json")
+ VERSION = 1
+ FRESH_SECONDS = 1200
+ HEALTHY_STATES = ("batching", "draining")
++HEALTHY_MAX_SECONDS = 24 * 3600  # a deploy-park run older than this is no longer exempt
+ DISPLAY_ZONE = "America/Los_Angeles"
+ _INT_FIELDS = ("observed_at", "window_at", "state_since", "drain_bound_s")
+ 
+@@ -85,6 +90,31 @@ def _previous(conn, task_id: str, premise: str) -> Optional[dict]:
+     return None
+ 
+ 
++def _streak_since(conn, task_id: str, premise: str, probe: Optional[str]) -> Optional[int]:
++    """``created_at`` of the first park in this card's trailing run of parks on ``premise`` (or on
++    the same opaque ``probe``), with the same stop rules as ``kanban_awaiting.prior_same_premise``:
++    another premise or the last escalation ends the run. Unbounded on purpose: a 20-event window
++    would keep the run's start under a day old however long the card has really waited."""
++    from hermes_cli.kanban_awaiting import ESCALATED_EVENT
++
++    first = None
++    for kind, payload, created_at in conn.execute(
++            "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? "
++            "AND kind IN ('scheduled','continued',?) ORDER BY id DESC", (task_id, ESCALATED_EVENT)):
++        if kind == ESCALATED_EVENT:
++            break
++        try:
++            got = json.loads(payload or "{}").get("awaiting") or {}
++        except (ValueError, AttributeError):
++            got = {}
++        if not isinstance(got, dict) or got.get("premise") is None:
++            continue
++        if got["premise"] != premise and not (probe and got.get("probe") == probe):
++            break
++        first = created_at
++    return first
++
++
+ def annotate(conn, task_id: str, record: dict, *, now: int) -> None:
+     """Attach ``deploy_window`` (with its ``healthy`` verdict) to a deploy park's record, in place."""
+     if record.get("kind") != "deploy" or not record.get("premise"):
+@@ -94,7 +124,14 @@ def annotate(conn, task_id: str, record: dict, *, now: int) -> None:
+         return
+     prev = _previous(conn, task_id, record["premise"])
+     moved = bool(prev) and (prev.get("state"), prev.get("state_since")) != (window["state"], window["state_since"])
++    since = _streak_since(conn, task_id, record["premise"], record.get("probe"))
++    window["streak_since"] = int(since) if since is not None else now
+     window["healthy"] = window["state"] in HEALTHY_STATES and (window["window_at"] > now or moved)
++    if window["healthy"] and now - window["streak_since"] > HEALTHY_MAX_SECONDS:
++        # Nothing ties the awaited ref to the pending batch, so other commits can keep a window
++        # ahead forever. Past the bound the exemption ends and REPARK_LIMIT escalates as usual.
++        window["healthy"] = False
++        window["healthy_expired"] = True
+     record["deploy_window"] = window
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_deploy_window.py b/tests/hermes_cli/test_kanban_deploy_window.py
+index 7d7e07ee146..757a0e0ab38 100644
+--- a/tests/hermes_cli/test_kanban_deploy_window.py
++++ b/tests/hermes_cli/test_kanban_deploy_window.py
+@@ -25,6 +25,7 @@ AWAITING = {"kind": "deploy", "ref": "abcdef123", "why": "core release"}
+ REASON = "SCHEDULED_UNTIL=2026-11-02T22:01:00Z core release pending"
+ PROBE = "test -f /nonexistent-core-release-receipt"
+ OPS = ["schedule", "block", "continue"]
++DAY = 24 * 3600  # the healthy-exemption bound (kanban_deploy_window.HEALTHY_MAX_SECONDS)
+ 
+ 
+ @pytest.fixture
+@@ -60,16 +61,16 @@ def running(conn, tid=None):
+     return tid
+ 
+ 
+-def park(conn, tid, op, awaiting=AWAITING):
++def park(conn, tid, op, awaiting=AWAITING, probe=PROBE):
+     """One real park; returns (last event, closed run summary)."""
+     if op == "schedule":
+-        assert kb.schedule_task(conn, tid, reason=REASON, awaiting=awaiting, wake_check=PROBE, check_every=300)
++        assert kb.schedule_task(conn, tid, reason=REASON, awaiting=awaiting, wake_check=probe, check_every=300)
+     elif op == "block":
+         assert kb.block_task(conn, tid, reason=REASON, kind="time", awaiting=awaiting,
+-                             wake_check=PROBE, check_every=300)
++                             wake_check=probe, check_every=300)
+     else:
+-        result = kc.continue_task(conn, tid, checkpoint=REASON, resume_after_seconds=60, max_continuations=20,
+-                                  awaiting=awaiting, wake_check=PROBE, check_every=300)
++        result = kc.continue_task(conn, tid, checkpoint=REASON, resume_after_seconds=60, max_continuations=40,
++                                  awaiting=awaiting, wake_check=probe, check_every=300)
+         assert result["ok"], result
+     run = kb.latest_run(conn, tid)
+     return kb.list_events(conn, tid)[-1], run.summary if run else None
+@@ -201,6 +202,79 @@ def test_malformed_or_unusable_window_changes_nothing(board, bad):
+     assert park_until_escalated(conn, tid, "schedule")[-1] == kaw.ESCALATED_EVENT
+ 
+ 
++def _at(monkeypatch, home, t):
++    """Move the clock to ``t`` and publish a fresh, healthy batch whose window is still ahead."""
++    monkeypatch.setattr("time.time", lambda: t)
++    publish(home, observed_at=t, window_at=t + 3600, state_since=t - 100)
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_healthy_exemption_expires_after_bound_then_escalates_on_third_park(board, monkeypatch, op):
++    """A ref that never reaches main: other commits keep the window ahead, so every park is
++    'healthy'. Once the run is older than the bound, parks count and the third one escalates."""
++    from hermes_cli import kanban_deploy_window as kdw
++
++    assert kdw.HEALTHY_MAX_SECONDS == DAY
++    home, conn = board
++    tid = running(conn)
++    # 22 hourly healthy parks: more than the 20 events prior_same_premise looks at, so the
++    # run's start must come from the full history, not the last 20 parks.
++    for h in range(22):
++        _at(monkeypatch, home, NOW + 3600 * h)
++        event, _summary = park(conn, tid, op)
++        assert event.kind != kaw.ESCALATED_EVENT
++        assert event.payload["awaiting"]["deploy_window"]["healthy"] is True
++        assert event.payload["awaiting"]["deploy_window"]["streak_since"] == NOW
++        running(conn, tid)
++    late = NOW + DAY + 1
++    kinds = []
++    for i in range(3):
++        _at(monkeypatch, home, late + 60 * i)
++        event, _summary = park(conn, tid, op)
++        kinds.append(event.kind)
++        if event.kind == kaw.ESCALATED_EVENT:
++            break
++        seen = event.payload["awaiting"]["deploy_window"]
++        assert seen["healthy"] is False and seen["healthy_expired"] is True
++        assert event.payload["wake_at"] == late + 60 * i + 3600 + 900  # floor is kept
++        running(conn, tid)
++    assert kinds == ["scheduled" if op != "continue" else "continued"] * 2 + [kaw.ESCALATED_EVENT]
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_healthy_exemption_holds_inside_bound(board, monkeypatch, op):
++    """Control: just inside the bound, healthy parks stay exempt and never escalate."""
++    home, conn = board
++    tid = running(conn)
++    for t in (NOW, NOW + 3600, NOW + DAY - 60, NOW + DAY, NOW + DAY):
++        _at(monkeypatch, home, t)
++        event, _summary = park(conn, tid, op)
++        assert event.kind != kaw.ESCALATED_EVENT
++        assert event.payload["awaiting"]["deploy_window"]["healthy"] is True
++        running(conn, tid)
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_bound_counts_from_the_run_after_another_premise(board, monkeypatch, op):
++    """A park on another premise ends the run: the bound restarts from the next deploy park."""
++    home, conn = board
++    tid = running(conn)
++    _at(monkeypatch, home, NOW)
++    park(conn, tid, op)
++    running(conn, tid)
++    restart = NOW + DAY
++    _at(monkeypatch, home, restart)
++    park(conn, tid, op, awaiting={"kind": "external", "ref": "vendor-1234", "why": "vendor queue"},
++         probe="test -f /nonexistent-vendor-receipt")
++    running(conn, tid)
++    for t in (restart + 60, restart + 120, restart + 180):
++        _at(monkeypatch, home, t)
++        event, _summary = park(conn, tid, op)
++        seen = event.payload["awaiting"]["deploy_window"]
++        assert seen["healthy"] is True and seen["streak_since"] == restart + 60
++        running(conn, tid)
++
++
+ @pytest.mark.parametrize("op", OPS)
+ @pytest.mark.parametrize("kind", [{"kind": "ci", "ref": "123456"}, {"kind": "external", "ref": "vendor-1234",
+                                                                       "why": "vendor queue"}])
+-- 
+2.55.0
+

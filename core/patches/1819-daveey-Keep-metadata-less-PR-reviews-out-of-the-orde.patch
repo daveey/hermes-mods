@@ -1,0 +1,244 @@
+From f3dea5638be52a61ac33d5d2b34f3d3b8fb0b503 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 01:47:28 +0000
+Subject: [PATCH] [daveey] Keep metadata-less PR reviews out of the
+ ordering-dependency handoff
+
+Problem: tests/hermes_cli/test_kanban_dependency_review_no_verdict.py::
+test_other_refusals_survive[missing] flaked on main (run 41531323842, job
+125572639298) and wt/api-context-usage (run 41542995049): check_respawn_guard
+returned None instead of "active_pr".
+
+Why 1: active_pr_reason released the hold through _dependency_handoff_after,
+not resumes_review. Proof: shifting the park 1 s past the PR comment fails the
+test every time; the same shift with _dependency_handoff_after stubbed False
+passes.
+Why 2: the ordering handoff only looks at a park strictly after the newest PR
+comment. The fixture used wall-clock time, so comment and park were usually in
+the same second (a tie, held) and sometimes in consecutive seconds under runner
+load (released).
+Why 3: the handoff decides "this parent is a review, so resumes_review owns it"
+only from verdict/approved/reviewed_sha keys or a VERDICT: line. A review that
+completes with metadata {} and summary "Reviewed PR #682 ..." matches none of
+them, so it counts as a finished ordering prerequisite and grants the
+continuation that the exact-head review rule refuses.
+Root (happened): the review/ordering classifier ignores the checkpoint's own
+PR scope. In production the park is almost always >= 1 s after the PR comment,
+so this refusal only held on same-second ties.
+Root (not caught): parked() never pinned its chronology, so every review test
+exercised the tie path on a fast machine. CI's flaky retry reported the run as
+success.
+
+Fix:
+- kanban_dependency_review.is_review_result: also treat a parent result as a
+  review when it names a checkpointed PR (pr / reviewed_pr key, or the PR URL
+  or "PR #N" in its summary). A bare `head` is still not a review marker
+  (operator gates record one: test_operator_added_gate_after_owner_park...).
+- parked() pins publication at now-park_delay and the park at now, default 1 s
+  (production order). The no-verdict refusal matrix runs at 0 and 1 s. The
+  two sync tests whose clocks measure from publication pass park_delay=0.
+- New boundary test: unreadable reviews that name the PR stay held. Ordering
+  prerequisites that do not name it (including a {"head": sha} gate and an
+  unrelated "PR #999") still get their one continuation.
+---
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  6 ++--
+ hermes_cli/kanban_dependency_review.py        | 24 +++++++++++++
+ .../test_kanban_dependency_review.py          | 35 +++++++++++++------
+ ...est_kanban_dependency_review_no_verdict.py | 26 +++++++++++---
+ .../test_kanban_dependency_review_sync.py     |  6 ++--
+ 5 files changed, 77 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 2f689a357f5..3d84647209b 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -369,7 +369,7 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+             or not set(checkpointed).issubset(parents)
+             or kb.unsatisfied_parents(conn, task_id)):
+         return False
+-    from hermes_cli.kanban_dependency_review import _awaited_parents, _SUMMARY_VERDICT
++    from hermes_cli.kanban_dependency_review import _awaited_parents, is_review_result
+     if not _awaited_parents(conn, parents, evidence, parked_at):
+         return False
+     awaited = evidence.get("awaited")
+@@ -388,9 +388,7 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+                     and kb.get_task(conn, parent) is None):
+                 continue
+             return False
+-        metadata = kb._json_dict(result["metadata"])
+-        if (any(key in metadata for key in ("verdict", "approved", "reviewed_sha"))
+-                or _SUMMARY_VERDICT.search(result["summary"] or "")):
++        if is_review_result(kb._json_dict(result["metadata"]), result["summary"], evidence.get("prs")):
+             return False
+     return True
+ 
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 8519a805f42..a972f745be5 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -188,6 +188,30 @@ def _approval_prs(conn, parent_id, parked_at, owner_run_id, captured: set[str])
+     return named if named is not None else set(captured)
+ 
+ 
++_REVIEW_KEYS = ("verdict", "approved", "reviewed_sha", "reviewed_pr")
++
++
++def is_review_result(metadata, summary, captured) -> bool:
++    """True when a parent's result belongs to the review rules, not the ordering handoff.
++
++    Verdict keys or a ``VERDICT:`` line mark a review (a bare ``head`` does not:
++    operator gates record one). So does a result that
++    names a checkpointed PR (``pr``/summary ``PR #N`` or URL) with none of them: a
++    review whose metadata was lost must fail closed on the exact-head check rather
++    than pass as an ordering prerequisite once the park is a second past the PR.
++    """
++    if any(key in metadata for key in _REVIEW_KEYS) or _SUMMARY_VERDICT.search(summary or ""):
++        return True
++    prs = {u.rstrip("/").lower() for u in captured or () if isinstance(u, str)}
++    if not prs:
++        return False
++    if "pr" in metadata and _named_prs(metadata, prs):
++        return True
++    text = (summary or "").lower()
++    nums = set(_SUMMARY_PR_NUM.findall(text))
++    return any(u in text or u.rsplit("/", 1)[-1] in nums for u in prs)
++
++
+ def _historical_parent(conn, parent_id, parked_at):
+     """Legacy checkpoints: exempt only provably finished, unchanged dependencies."""
+     from hermes_cli import kanban_db as kb
+diff --git a/tests/hermes_cli/test_kanban_dependency_review.py b/tests/hermes_cli/test_kanban_dependency_review.py
+index fb37c901cf5..7b5548ff424 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review.py
++++ b/tests/hermes_cli/test_kanban_dependency_review.py
+@@ -1,4 +1,6 @@
+ """Dependency-review continuation must repair the same PR, not defeat respawn guards."""
++import time
++
+ import pytest
+ 
+ from hermes_cli import kanban_db as kb
+@@ -19,16 +21,29 @@ def board(tmp_path, monkeypatch):
+         yield conn
+ 
+ 
+-def parked(conn, *, authenticated=True):
+-    task = kb.create_task(conn, title="implementation", assignee="dev")
+-    kb.claim_task(conn, task)
+-    run = kb.get_task(conn, task).current_run_id
+-    worker_comment(conn, task, "dev", PR)
+-    reviews = [kb.create_task(conn, title="review", assignee="reviewer") for _ in range(2)]
+-    for review in reviews:
+-        kb.link_tasks(conn, review, task, expected_child_run_id=run)
+-    assert kb.block_task(conn, task, kind="dependency", reason="Independent review",
+-                         expected_run_id=run if authenticated else None)
++def parked(conn, *, authenticated=True, park_delay=1):
++    """Owner publishes its PR, then parks ``park_delay`` whole seconds later.
++
++    The clock is pinned, not wall-clock: the ordering-dependency handoff only
++    considers a park strictly after the PR comment, so an unpinned fixture
++    flipped between that path and the same-second tie with runner load. 1 s is
++    production's usual ordering; both stamps are at or before real "now", so
++    later events (review completion, promotion) still sort after the park.
++    """
++    parked_at = int(time.time())
++    published = parked_at - park_delay
++    with pytest.MonkeyPatch.context() as clock:
++        clock.setattr(time, "time", lambda: published)
++        task = kb.create_task(conn, title="implementation", assignee="dev")
++        kb.claim_task(conn, task)
++        run = kb.get_task(conn, task).current_run_id
++        worker_comment(conn, task, "dev", PR)
++        clock.setattr(time, "time", lambda: parked_at)
++        reviews = [kb.create_task(conn, title="review", assignee="reviewer") for _ in range(2)]
++        for review in reviews:
++            kb.link_tasks(conn, review, task, expected_child_run_id=run)
++        assert kb.block_task(conn, task, kind="dependency", reason="Independent review",
++                             expected_run_id=run if authenticated else None)
+     return task, reviews
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py b/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
+index ddecee01939..fd1ed94f827 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
++++ b/tests/hermes_cli/test_kanban_dependency_review_no_verdict.py
+@@ -15,9 +15,9 @@ PR = "https://github.com/daveey/hermes/pull/682"
+ SHA = "80a1696031723d5f0ece4c3f5adda458729a560e"
+ 
+ 
+-def incident(board, monkeypatch, *, finish=True, metadata=None, summary=None):
++def incident(board, monkeypatch, *, finish=True, metadata=None, summary=None, park_delay=1):
+     monkeypatch.setattr(helpers, "PR", PR)
+-    task, parents = helpers.parked(board)
++    task, parents = helpers.parked(board, park_delay=park_delay)
+     data = {"reviewed_pr": PR, "reviewed_sha": SHA, "base_sha": "b" * 40,
+             "tests_run": 274, "live_probe": {"ok": True}, "findings": [{}] * 6,
+             "parent_comment_id": 1, "worker_session_id": "review-session"}
+@@ -58,8 +58,9 @@ def test_reviewed_pr_binds_without_summary_number(board, monkeypatch, named, ver
+     assert dispatch.check_respawn_guard(board, task) == (None if named == PR else "active_pr")
+ 
+ 
++@pytest.mark.parametrize("park_delay", [0, 1])
+ @pytest.mark.parametrize("mode", ["short", "missing", "before", "own", "pending", "outcome", "pr", "summary", "uid"])
+-def test_other_refusals_survive(board, monkeypatch, mode):
++def test_other_refusals_survive(board, monkeypatch, mode, park_delay):
+     data = {"reviewed_sha": SHA}
+     if mode == "short":
+         data["reviewed_sha"] = SHA[:8]
+@@ -69,7 +70,7 @@ def test_other_refusals_survive(board, monkeypatch, mode):
+         data["pr"] = PR + "1"
+     task, parents = incident(board, monkeypatch, metadata=data,
+                              summary="Reviewed PR #999" if mode == "summary" else None,
+-                             finish=mode != "pending")
++                             finish=mode != "pending", park_delay=park_delay)
+     event = board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='dependency_wait'", (task,)).fetchone()
+     if mode in {"before", "outcome", "uid"}:
+         with kb.write_txn(board):
+@@ -115,3 +116,20 @@ def test_finished_unreadable_review_notices_immediately(board, monkeypatch, fini
+         assert not notice.notify_guard_hold(board, task, "active_pr")
+         monkeypatch.setattr(notice.time, "time", lambda: start + 1800)
+         assert notice.notify_guard_hold(board, task, "active_pr")
++
++
++@pytest.mark.parametrize("metadata,summary,expected", [
++    # A review whose metadata was lost still names the checkpointed PR: review rules own it.
++    ({}, "Reviewed PR #682. No blocking defects; one medium finding.", "active_pr"),
++    ({}, "Looked at " + PR + " and found nothing blocking", "active_pr"),
++    ({"pr": PR}, "Review complete", "active_pr"),
++    # A finished ordering prerequisite that names no checkpointed PR keeps its one continuation.
++    ({}, "ordering work finished", None),
++    ({"head": SHA}, "gate finished", None),
++    ({}, "Unrelated PR #999 merged", None),
++])
++def test_ordering_handoff_does_not_absorb_unreadable_review(board, monkeypatch, metadata, summary, expected):
++    """Park a second after the PR comment (production order): the ordering handoff
++    releases only parents that are not reviews of the checkpointed PR."""
++    task, _ = incident(board, monkeypatch, metadata=metadata, summary=summary, park_delay=1)
++    assert dispatch.check_respawn_guard(board, task) == expected
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_sync.py b/tests/hermes_cli/test_kanban_dependency_review_sync.py
+index 779008bd12e..bc0e643dcc3 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review_sync.py
++++ b/tests/hermes_cli/test_kanban_dependency_review_sync.py
+@@ -90,7 +90,8 @@ def review_clock(monkeypatch):
+ @pytest.mark.parametrize("mode", ["other_pr", "short_head", "other_assignee", "unowned"])
+ def test_synced_invalid_review_or_owner_stays_held(boards, review_clock, mode):
+     source, target = boards
+-    task, reviews = parked(source, authenticated=mode != "unowned")
++    # Publication, park and reassignment share review_clock's second.
++    task, reviews = parked(source, authenticated=mode != "unowned", park_delay=0)
+     finish_reviews(source, reviews, metadata={"verdict": "changes_required",
+                    "head": HEAD[:8] if mode == "short_head" else HEAD,
+                    "pr": PR + "1" if mode == "other_pr" else PR})
+@@ -103,7 +104,8 @@ def test_synced_invalid_review_or_owner_stays_held(boards, review_clock, mode):
+ @pytest.mark.parametrize("assignment_delay", [0, 1])
+ def test_synced_reassignment_separates_review_from_operator_handoff(boards, review_clock, assignment_delay):
+     source, target = boards
+-    task, reviews = parked(source)
++    # assignment_delay is measured from publication, so park in the same second.
++    task, reviews = parked(source, park_delay=0)
+     finish_reviews(source, reviews, metadata={"verdict": "changes_required", "head": HEAD, "pr": PR})
+     assert resumes_review(source, task, [PR])
+     review_clock[0] += assignment_delay
+-- 
+2.55.0
+

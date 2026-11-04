@@ -1,0 +1,559 @@
+From 108897f28e93d75d1477d56882771814a03740e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:46:01 +0000
+Subject: [PATCH] [daveey] fix(routing): WAL routing state; sticky reuse
+ prepares outside the writer lock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: 2026-11-02 21:23-21:30 UTC on hermes-hub every model-routing allocation failed with
+"database is locked": managed workers at model_routing_state.py:32 (COMMIT) and :20 (CREATE TABLE
+IF NOT EXISTS), gateway context compression, delegate_task provider resolution and tui agent
+builds (managed-worker.log, agent.log, errors.log). Worker run 28218 died at startup.
+
+Why 1: allocators' COMMIT waited 30 s for an EXCLUSIVE lock and timed out — evidence: the
+  21:26:37 gateway control-loop stack dump shows a thread parked in allocate() at line 32.
+Why 2: a COMMIT in the rollback journal needs every SHARED reader gone, and a writer waiting at
+  COMMIT keeps PENDING, which refuses every new reader (schema check, peek, sticky lookup) —
+  evidence: isolated repro on sqlite 3.53.1 (journal_mode=delete: held BEGIN+SELECT makes COMMIT,
+  CREATE TABLE IF NOT EXISTS, SELECT and a mode=ro peek all return "database is locked"; WAL: all ok).
+Why 3: one read transaction was held for 8.5 min — evidence: maintenance dry run
+  `hydrate_allocations.py --routes ~/.hermes/model-routing.sqlite3` (card t_01a19d6f5cf8f953)
+  ran 21:21:38-21:30:15 (`/usr/bin/time` Elapsed 8:36.92), opening `BEGIN` with the routing DB
+  ATTACHed and streaming every table; the error window ends with it (last error 21:30:00).
+Why 4: model-routing.sqlite3 was created in the default rollback journal (live file: `delete`),
+  so any reader can stall all writers and, through PENDING, all other readers.
+Contributing: every per-turn sticky re-resolution (model_tools._resolve_active_context_length ->
+  resolve_runtime_provider -> allocate) took BEGIN IMMEDIATE and held it across prepare()
+  (credential-pool select, possibly an auth-store flock wait and token refresh), queueing all live
+  agents behind any slow first allocation.
+Root (happened): a shared multi-process state DB used the rollback journal and took the writer
+  lock for reads.
+Root (not caught): routing tests never held a concurrent reader or a slow prepare.
+
+Fix:
+- Writer connections switch the file to WAL (once; a conversion blocked by a reader is retried by
+  the next connection within a 1 s budget instead of failing allocation). Readers never block a
+  commit, and a commit never blocks readers or the read-only peek.
+- A sticky reuse that writes nothing is read from a snapshot and prepared outside the writer lock.
+  Every write (first allocation, alias, failover, exact-pin upgrade, replace) still prepares
+  before COMMIT, so an unready credential/client is never published; counters only move under the
+  lock. One `_reusable` rule serves both paths.
+- Schema DDL (now including switch_fences) stays autocommit before BEGIN IMMEDIATE, so a
+  rolled-back first allocation keeps the tables for peek/link_continuation; on an existing schema
+  in WAL it only reads.
+- No whole-transaction retry: prepare has credential-pool side effects (account selection,
+  refresh). SQLite's busy handler (BUSY_TIMEOUT_SECONDS=30) stays the single bounded retry, before
+  any allocation work. A writer-lock hold >= 5 s logs a warning.
+
+Tests (tests/agent/test_model_routing_state_contention.py, real files and connections, processes
+for the allocator fan-out): long reader vs new allocation; peek/schema/sticky reads with a reader
+plus a waiting writer; slow prepare vs sticky reuse, peek and a queued first allocation; busy
+deadline exhaustion (bounded, nothing prepared or published); 4-process allocators under a long
+reader (60 unique aliases, counter 60, exact 20/20/20 rotation); same-session concurrent
+allocators share one decision; sticky snapshot never moves counters and writes still lock;
+legacy rollback file conversion; conversion blocked by a reader (fallback asserted); ro peek
+with/without sidecars; rejected first allocation keeps the schema (review finding on a draft).
+RED on the parent: 7 of 10 fail ("database is locked", 30 s deadline; the rest are invariant
+controls); GREEN: 11/11. Routing suite (42 files, 377 tests incl. switch-intent fence/order) green.
+---
+ agent/model_routing_state.py                  | 119 ++++++-
+ .../test_model_routing_state_contention.py    | 300 ++++++++++++++++++
+ 2 files changed, 404 insertions(+), 15 deletions(-)
+ create mode 100644 tests/agent/test_model_routing_state_contention.py
+
+diff --git a/agent/model_routing_state.py b/agent/model_routing_state.py
+index 58106b488a5..239f60d55f2 100644
+--- a/agent/model_routing_state.py
++++ b/agent/model_routing_state.py
+@@ -2,16 +2,67 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import sqlite3
++import time
+ from contextlib import closing
+ from pathlib import Path
+ 
++logger = logging.getLogger(__name__)
++
++# SQLite's busy handler is the only retry: it re-attempts a lock until this deadline, before any
++# allocation work or ``prepare`` runs. A whole-transaction retry after ``prepare`` would repeat its
++# credential-pool side effects (account selection/refresh), so none is attempted.
++BUSY_TIMEOUT_SECONDS = 30.0
++# Converting a rollback-journal file to WAL needs a moment with no reader. A long reader must not
++# stall allocation for the full busy deadline here; the next connection simply tries again.
++WAL_CONVERT_TIMEOUT_SECONDS = 1.0
++# Allocation holds the writer lock across ``prepare`` (credential/client readiness). Log when that
++# window is long enough to queue other first allocations behind it.
++SLOW_WRITE_WARNING_SECONDS = 5.0
++
+ 
+ class RoutingState:
+     def __init__(self, path):
+         self.path = Path(path)
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+ 
++    def _connect(self):
++        """Writer connection in WAL mode, so readers never block a commit (nor a commit, readers).
++
++        In the default rollback journal a COMMIT needs every reader gone: one long read transaction
++        (a maintenance scan) made each allocator's COMMIT time out, and the PENDING lock it left
++        while waiting refused every new reader, schema check and peek host-wide.
++        """
++        db = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
++        try:
++            if str(db.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
++                db.execute(f"PRAGMA busy_timeout={int(WAL_CONVERT_TIMEOUT_SECONDS * 1000)}")
++                try:
++                    db.execute("PRAGMA journal_mode=WAL")
++                except sqlite3.OperationalError as exc:
++                    if exc.sqlite_errorcode & 0xFF not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
++                        raise
++                    # A reader holds the rollback-journal file: stay in it for this connection.
++                finally:
++                    db.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)}")
++        except BaseException:
++            db.close()
++            raise
++        return db
++
++    @staticmethod
++    def _ensure_schema(db):
++        """Autocommit, before the allocation transaction: tables outlive a rolled-back allocation, so a
++        later peek or ``link_continuation`` reads an empty table rather than a missing one. On an
++        existing schema each statement only reads it (no write lock in WAL)."""
++        db.execute("CREATE TABLE IF NOT EXISTS aliases (session TEXT PRIMARY KEY, root TEXT NOT NULL)")
++        db.execute("CREATE TABLE IF NOT EXISTS routes (root TEXT, class TEXT, metadata TEXT NOT NULL, "
++                   "PRIMARY KEY(root, class))")
++        db.execute("CREATE TABLE IF NOT EXISTS counters (pool TEXT PRIMARY KEY, position INTEGER NOT NULL)")
++        db.execute("CREATE TABLE IF NOT EXISTS switch_fences (root TEXT, class TEXT, intent TEXT NOT NULL, "
++                   "PRIMARY KEY(root, class))")
++
+     def allocate(self, session_id, parent_session_id, level, candidates, version, excluded, prepare=None,
+                  exact_pin=False, replace: bool | str = False):
+         """Allocate and persist atomically; aliases share one failover decision.
+@@ -22,16 +73,23 @@ class RoutingState:
+         The fence is recorded in this transaction, so overlapping builds, a crash retry before the intent
+         is consumed and a late build of a superseded intent re-read the honoured allocation instead of
+         choosing again; a failed ``prepare`` rolls it back.
++
++        A sticky reuse that writes nothing (the per-turn/re-entry case, never any truthy ``replace``)
++        is read from a snapshot and prepared outside the writer lock: no allocation, counter or route
++        changes, so there is nothing to publish atomically. Every write (first allocation, alias,
++        failover, pin, replacement) still runs ``prepare`` before COMMIT, so a failed credential/client
++        never becomes visible.
+         """
+-        with closing(sqlite3.connect(self.path, timeout=30, isolation_level=None)) as db:
+-            db.execute("PRAGMA busy_timeout=30000")
+-            db.execute("CREATE TABLE IF NOT EXISTS aliases (session TEXT PRIMARY KEY, root TEXT NOT NULL)")
+-            db.execute("CREATE TABLE IF NOT EXISTS routes (root TEXT, class TEXT, metadata TEXT NOT NULL, "
+-                       "PRIMARY KEY(root, class))")
+-            db.execute("CREATE TABLE IF NOT EXISTS counters (pool TEXT PRIMARY KEY, position INTEGER NOT NULL)")
+-            db.execute("CREATE TABLE IF NOT EXISTS switch_fences (root TEXT, class TEXT, intent TEXT NOT NULL, "
+-                       "PRIMARY KEY(root, class))")
++        if not replace:
++            previous = self._sticky(session_id, level, candidates, excluded, exact_pin)
++            if previous is not None:
++                if prepare is not None:
++                    prepare(previous)
++                return previous
++        with closing(self._connect()) as db:
++            self._ensure_schema(db)
+             db.execute("BEGIN IMMEDIATE")
++            started = time.monotonic()
+             try:
+                 result = self._allocate(db, session_id, parent_session_id, level, candidates, version, excluded,
+                                         exact_pin, replace)
+@@ -40,16 +98,42 @@ class RoutingState:
+                 if prepare is not None:
+                     prepare(result)
+                 db.execute("COMMIT")
+-                return result
+             except BaseException:
+                 db.execute("ROLLBACK")
+                 raise
++            held = time.monotonic() - started
++            if held >= SLOW_WRITE_WARNING_SECONDS:
++                logger.warning("model routing allocation held the routing writer lock %.1fs (class %s)", held, level)
++            return result
++
++    def _sticky(self, session, level, candidates, excluded, exact_pin):
++        """The existing allocation when reusing it needs no write, else None (take the write path)."""
++        if not self.path.exists():
++            return None
++        with closing(self._connect()) as db:
++            try:
++                row = db.execute(
++                    "SELECT r.metadata FROM aliases a JOIN routes r ON r.root=a.root "
++                    "WHERE a.session=? AND r.class=?", (session, level)).fetchone()
++            except sqlite3.OperationalError as exc:
++                if "no such table" in str(exc):
++                    return None
++                raise
++        if row is None:
++            return None
++        previous = json.loads(row[0])
++        if not _reusable(previous, candidates, excluded):
++            return None
++        if exact_pin and not previous.get("exact_pin"):
++            return None  # upgrading to an exact pin is a write
++        return previous
+ 
+     def peek(self, session, level):
+         """Read the latest lineage selection without creating state or advancing it."""
+         if not self.path.exists():
+             return None
+-        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)) as db:
++        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True,
++                                     timeout=BUSY_TIMEOUT_SECONDS)) as db:
+             row = db.execute(
+                 "SELECT r.metadata FROM routes r JOIN aliases a ON a.root=r.root "
+                 "WHERE a.session=? AND r.class=?", (session, level)).fetchone()
+@@ -64,7 +148,7 @@ class RoutingState:
+         """
+         from agent.model_routing import ModelRoutingError
+ 
+-        with closing(sqlite3.connect(self.path, timeout=30, isolation_level=None)) as db:
++        with closing(self._connect()) as db:
+             db.execute("BEGIN IMMEDIATE")
+             try:
+                 row = db.execute("SELECT root FROM aliases WHERE session=?", (parent,)).fetchone()
+@@ -96,10 +180,7 @@ class RoutingState:
+         row = db.execute("SELECT metadata FROM routes WHERE root=? AND class=?", (root, level)).fetchone()
+         if row and not replace:
+             previous = json.loads(row[0])
+-            identity = previous["selected_provider"], previous["selected_model"]
+-            allowed = any((r["provider"], r["model"]) == identity and
+-                          r["billing"] == previous["billing_group"] for r in candidates)
+-            if allowed and identity not in excluded:
++            if _reusable(previous, candidates, excluded):
+                 if exact_pin and not previous.get("exact_pin"):
+                     previous["exact_pin"] = True
+                     db.execute("UPDATE routes SET metadata=? WHERE root=? AND class=?",
+@@ -160,6 +241,14 @@ class RoutingState:
+         return sorted(groups[provider], key=lambda r: r["model"])[0]
+ 
+ 
++def _reusable(previous, candidates, excluded):
++    """One sticky-reuse rule for the snapshot read and the write transaction."""
++    identity = previous["selected_provider"], previous["selected_model"]
++    allowed = any((r["provider"], r["model"]) == identity and
++                  r["billing"] == previous["billing_group"] for r in candidates)
++    return allowed and identity not in excluded
++
++
+ def _allocation_kind(root):
+     """Auxiliary owners are allocated under ``aux:<owner>:<task>:<class>`` roots."""
+     return "aux" if str(root).startswith("aux:") else "main"
+diff --git a/tests/agent/test_model_routing_state_contention.py b/tests/agent/test_model_routing_state_contention.py
+new file mode 100644
+index 00000000000..2906c35a57e
+--- /dev/null
++++ b/tests/agent/test_model_routing_state_contention.py
+@@ -0,0 +1,300 @@
++"""Routing-state lock contention: long readers, slow prepare, concurrent allocators. [daveey]
++
++Hub incident (2026-11-02 21:23-21:30 UTC): a maintenance dry run held one read transaction on
++``model-routing.sqlite3`` for 8.5 minutes. In the rollback journal every allocator's COMMIT needs
++that reader gone, so each timed out at 30 s ("database is locked" at COMMIT), and the PENDING lock
++it held while waiting refused every new reader: worker startups failed at the schema check and
++``peek``. Per-turn sticky re-resolution also took the writer lock across ``prepare`` (credential
++selection), queueing every live agent behind any slow first allocation.
++
++Every case uses a real file and separate SQLite connections (threads or processes); nothing here
++mocks SQLite. The busy deadline is shortened so a regression fails in about a second instead of 30.
++"""
++import json
++import sqlite3
++import threading
++import time
++from collections import Counter
++from concurrent.futures import ProcessPoolExecutor
++from contextlib import closing
++
++import pytest
++
++import agent.model_routing_state as mrs
++from agent.model_routing import ModelRoutingError, resolve_model_route
++from agent.model_routing_state import RoutingState
++from tests.agent.test_model_routing import policy
++
++FAST = 1.0  # seconds; regressions fail on this deadline (old code ignored it and waited 30 s)
++
++
++@pytest.fixture(autouse=True)
++def short_busy(monkeypatch):
++    monkeypatch.setattr(mrs, "BUSY_TIMEOUT_SECONDS", FAST, raising=False)
++
++
++def route(path, session, **kw):
++    return resolve_model_route("class:deep", config=policy(), session_id=session, state_path=path, **kw)
++
++
++def rows(path, sql):
++    with closing(sqlite3.connect(path)) as db:
++        return db.execute(sql).fetchall()
++
++
++class LongReader:
++    """A read transaction held open, as the hydrate dry run did (``BEGIN`` + streamed SELECTs)."""
++
++    def __init__(self, path):
++        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
++        self.db.execute("BEGIN")
++        self.db.execute("SELECT * FROM routes").fetchall()
++
++    def close(self):
++        self.db.execute("COMMIT")
++        self.db.close()
++
++
++def timed(fn, *args, **kw):
++    started = time.monotonic()
++    result = fn(*args, **kw)
++    return result, time.monotonic() - started
++
++
++def test_long_reader_does_not_block_a_new_allocation_commit(tmp_path):
++    path = tmp_path / "routes.db"
++    first = route(path, "existing")
++    reader = LongReader(path)
++    try:
++        second, elapsed = timed(route, path, "new-startup")
++        assert elapsed < FAST
++    finally:
++        reader.close()
++    assert second["provider"] != first["provider"]
++    assert route(path, "new-startup") == second
++    assert rows(path, "PRAGMA journal_mode") == [("wal",)]
++
++
++def test_peek_schema_and_sticky_reads_survive_a_reader_plus_waiting_writer(tmp_path):
++    """The line-20/peek failure: a writer stuck at COMMIT behind a long reader refused new readers."""
++    path = tmp_path / "routes.db"
++    first = route(path, "existing")
++    reader = LongReader(path)
++    writer = sqlite3.connect(path, isolation_level=None, timeout=0)
++    try:
++        writer.execute("BEGIN IMMEDIATE")
++        writer.execute("INSERT INTO aliases VALUES ('w', 'w')")
++        try:
++            writer.execute("COMMIT")  # rollback journal: BUSY, and the PENDING lock is kept
++        except sqlite3.OperationalError:
++            pass
++        peeked, elapsed = timed(RoutingState(path).peek, "existing", "deep")
++        assert peeked == first["metadata"] and elapsed < FAST
++        again, elapsed = timed(route, path, "existing")
++        assert again == first and elapsed < FAST
++        fresh, elapsed = timed(route, path, "another-startup")
++        assert fresh["metadata"]["reason"] == "allocation" and elapsed < FAST
++    finally:
++        if writer.in_transaction:
++            writer.execute("ROLLBACK")
++        writer.close()
++        reader.close()
++
++
++def test_slow_prepare_holds_only_first_allocations_not_sticky_reuse_or_peek(tmp_path):
++    path = tmp_path / "routes.db"
++    sticky = route(path, "running-agent")
++    entered, release = threading.Event(), threading.Event()
++    outcome = {}
++
++    def slow_prepare(metadata):
++        entered.set()
++        assert release.wait(10)
++
++    def first_allocation():
++        try:
++            outcome["result"] = route(path, "slow-start", prepare=slow_prepare)
++        except BaseException as exc:  # surfaced by the assertions below
++            outcome["error"] = exc
++
++    thread = threading.Thread(target=first_allocation)
++    thread.start()
++    try:
++        assert entered.wait(10)
++        prepared = []
++        again, elapsed = timed(route, path, "running-agent", prepare=prepared.append)
++        assert again == sticky and elapsed < FAST
++        assert prepared == [sticky["metadata"]]  # sticky reuse is still prepared, exactly once
++        state = RoutingState(path)
++        assert state.peek("running-agent", "deep") == sticky["metadata"]
++        assert state.peek("slow-start", "deep") is None  # unprepared allocation stays invisible
++        # A second first allocation queues behind the writer lock and gives up at the deadline.
++        with pytest.raises(sqlite3.OperationalError, match="locked"):
++            route(path, "queued-start")
++    finally:
++        release.set()
++        thread.join(10)
++    assert "error" not in outcome
++    assert RoutingState(path).peek("slow-start", "deep") == outcome["result"]["metadata"]
++    assert RoutingState(path).peek("queued-start", "deep") is None
++
++
++def test_busy_deadline_exhaustion_publishes_nothing_and_never_prepares(tmp_path):
++    path = tmp_path / "routes.db"
++    sticky = route(path, "existing")
++    counters = rows(path, "SELECT * FROM counters")
++    holder = sqlite3.connect(path, isolation_level=None)
++    holder.execute("BEGIN IMMEDIATE")
++    prepared = []
++    try:
++        started = time.monotonic()
++        with pytest.raises(sqlite3.OperationalError, match="locked"):
++            route(path, "blocked", prepare=prepared.append)
++        assert FAST * 0.9 <= time.monotonic() - started < FAST * 3  # bounded: one busy deadline
++        assert prepared == []
++        # Reads are not writers: sticky reuse and peek still answer under a held writer lock.
++        again, elapsed = timed(route, path, "existing")
++        assert again == sticky and elapsed < FAST
++        assert RoutingState(path).peek("existing", "deep") == sticky["metadata"]
++    finally:
++        holder.execute("ROLLBACK")
++        holder.close()
++    assert rows(path, "SELECT * FROM counters") == counters
++    assert rows(path, "SELECT count(*) FROM aliases WHERE session='blocked'") == [(0,)]
++    assert route(path, "blocked")["metadata"]["reason"] == "allocation"
++
++
++def _allocate_twice(args):
++    path, index = args
++    first = route(path, f"s{index}")
++    assert route(path, f"s{index}") == first  # sticky re-resolution from another process
++    return first["provider"]
++
++
++def test_concurrent_process_allocators_under_a_long_reader_stay_unique_and_balanced(tmp_path):
++    path = tmp_path / "routes.db"
++    route(path, "seed")  # create the file (WAL) before the reader opens
++    reader = LongReader(path)
++    try:
++        with ProcessPoolExecutor(max_workers=4) as pool:
++            counts = Counter(pool.map(_allocate_twice, [(str(path), i) for i in range(59)]))
++    finally:
++        reader.close()
++    counts[route(path, "seed")["provider"]] += 1
++    assert counts == {"anthropic": 20, "openai-codex": 20, "xai-oauth": 20}
++    assert rows(path, "SELECT position FROM counters") == [(60,)]
++    assert rows(path, "SELECT count(*), count(DISTINCT session) FROM aliases") == [(60, 60)]
++
++
++def test_concurrent_same_session_allocators_share_one_decision(tmp_path):
++    path = tmp_path / "routes.db"
++    barrier = threading.Barrier(6)
++    results, errors = [], []
++
++    def worker():
++        try:
++            barrier.wait(10)
++            results.append(route(path, "shared", parent_session_id="parent"))
++        except BaseException as exc:
++            errors.append(exc)
++
++    threads = [threading.Thread(target=worker) for _ in range(6)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join(30)
++    assert errors == []
++    assert len({json.dumps(r, sort_keys=True) for r in results}) == 1
++    assert rows(path, "SELECT position FROM counters") == [(1,)]
++    assert route(path, "parent") == results[0]
++
++
++def test_sticky_snapshot_never_advances_counters_and_writes_still_go_through_the_lock(tmp_path):
++    path = tmp_path / "routes.db"
++    first = route(path, "s")
++    counters = rows(path, "SELECT * FROM counters")
++    for _ in range(5):
++        assert route(path, "s") == first
++    assert rows(path, "SELECT * FROM counters") == counters
++    # A failed prepare on reuse changes nothing.
++    with pytest.raises(RuntimeError):
++        route(path, "s", prepare=lambda metadata: (_ for _ in ()).throw(RuntimeError("client failed")))
++    assert route(path, "s") == first and rows(path, "SELECT * FROM counters") == counters
++    # Exact-pin upgrade is a write: recorded durably.
++    pinned = route(path, "s", exact_pin=True)
++    assert pinned["metadata"]["exact_pin"] is True
++    assert RoutingState(path).peek("s", "deep")["exact_pin"] is True
++    with pytest.raises(ModelRoutingError, match="cannot fail over"):
++        route(path, "s", excluded=[(first["provider"], first["model"])])
++    # Failover of an unpinned sticky route advances the counter once, under the writer lock.
++    other = route(path, "t")
++    failed = route(path, "t", excluded=[(other["provider"], other["model"])])
++    assert failed["provider"] != other["provider"]
++    assert failed["metadata"]["reason"] == "same-class-failover"
++    # (a failover's candidate set differs, so it counts in its own pool: compare the total)
++    assert rows(path, "SELECT sum(position) FROM counters") == [(counters[0][1] + 2,)]
++    # replace=True always re-selects, even when the sticky route is reusable.
++    replaced = route(path, "t", replace=True)
++    assert replaced["metadata"]["reason"] == "explicit-switch"
++
++
++def test_legacy_rollback_journal_file_converts_and_keeps_rows(tmp_path):
++    path = tmp_path / "routes.db"
++    first = route(path, "legacy")
++    with sqlite3.connect(path, isolation_level=None) as db:
++        db.execute("PRAGMA journal_mode=DELETE")  # the hub's pre-fix file
++    assert rows(path, "PRAGMA journal_mode") == [("delete",)]
++    assert route(path, "legacy") == first
++    assert rows(path, "PRAGMA journal_mode") == [("wal",)]
++    assert route(path, "legacy") == first
++
++
++def test_conversion_blocked_by_a_reader_does_not_fail_allocation(tmp_path, monkeypatch):
++    monkeypatch.setattr(mrs, "WAL_CONVERT_TIMEOUT_SECONDS", 0.1, raising=False)
++    monkeypatch.setattr(mrs, "BUSY_TIMEOUT_SECONDS", 10.0, raising=False)
++    path = tmp_path / "routes.db"
++    route(path, "legacy")
++    with sqlite3.connect(path, isolation_level=None) as db:
++        db.execute("PRAGMA journal_mode=DELETE")
++    reader = LongReader(path)
++    with closing(RoutingState(path)._connect()) as db:  # conversion refused under the reader: fallback
++        assert db.execute("PRAGMA journal_mode").fetchone() == ("delete",)
++    timer = threading.Timer(0.6, reader.close)  # outlives the conversion attempt, not the busy deadline
++    timer.start()
++    try:
++        result = route(path, "during-conversion")
++    finally:
++        timer.join()
++    assert result["metadata"]["reason"] == "allocation"
++    route(path, "after")
++    assert rows(path, "PRAGMA journal_mode") == [("wal",)]
++
++
++def test_read_only_peek_on_wal_with_and_without_sidecars(tmp_path):
++    path = tmp_path / "routes.db"
++    assert RoutingState(path).peek("x", "deep") is None and not path.exists()
++    first = route(path, "x")
++    assert not (tmp_path / "routes.db-wal").exists()  # last writer close checkpoints and removes it
++    assert RoutingState(path).peek("x", "deep") == first["metadata"]
++    writer = sqlite3.connect(path, isolation_level=None)
++    writer.execute("BEGIN IMMEDIATE")
++    writer.execute("UPDATE routes SET metadata=? WHERE root='x'", (json.dumps({"uncommitted": True}),))
++    try:
++        assert RoutingState(path).peek("x", "deep") == first["metadata"]
++    finally:
++        writer.execute("ROLLBACK")
++        writer.close()
++
++
++def test_rejected_first_allocation_leaves_schema_for_peek_and_link(tmp_path):
++    """Schema creation commits on its own: a rolled-back first allocation must not roll the tables back."""
++    path = tmp_path / "routes.db"
++    cfg = policy()
++    cfg["model_routing"]["routes"]["deep"] = []
++    with pytest.raises(ModelRoutingError):
++        resolve_model_route("class:deep", config=cfg, session_id="bad", state_path=path)
++    state = RoutingState(path)
++    assert state.peek("bad", "deep") is None
++    with pytest.raises(ModelRoutingError, match="no allocated parent"):
++        state.link_continuation("child", "bad")
++    assert rows(path, "SELECT count(*) FROM aliases") == [(0,)]
+-- 
+2.55.0
+

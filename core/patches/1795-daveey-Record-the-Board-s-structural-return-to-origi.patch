@@ -1,0 +1,200 @@
+From 133828f11a494e9cf5c474d7dade9bd6c43e6fb5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 04:08:59 +0000
+Subject: [PATCH] [daveey] Record the Board's structural return-to-origin as a
+ queue reason (#711)
+
+* [daveey] Persist worker queue observations and support explicit origin repin
+
+* [daveey] Keep queue diagnostics non-disruptive across recovery transitions
+
+* [daveey] Report lost repin replies as unknown outcomes
+
+* [daveey] Preserve unknown repin outcome on server errors
+
+* [daveey] Record the Board's structural return-to-origin as a queue reason
+
+The Board now answers a worker-first reserve with state=origin when no
+configured pool worker is attested to run the card, and repins it to its
+creator in the same transaction. Record that reply as worker_queue_reason
+code no_pool_worker with the Board's fixed-shape reason ('no pool worker can
+run it: missing <labels>'), keep it current while the card stays pinned to
+its origin (including its run there), and render it in kanban show and the
+card thread. Reason text outside the fixed shape is dropped.
+
+* [daveey] Keep the origin reason current before the feed applies; pull errors cannot supersede it
+---
+ hermes_cli/kanban_queue_reason.py             | 37 ++++++++-
+ .../test_kanban_queue_integration.py          | 77 +++++++++++++++++++
+ 2 files changed, 112 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index 5fface767a2..7a7e7d84663 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -10,10 +10,12 @@ from datetime import UTC, datetime
+ 
+ EVENT = "worker_queue_reason"
+ CODES = {"reserved", "draining", "admission_limits", "no_live_candidate", "capability_mismatch",
+-         "observation_unavailable", "mixed", "board_error", "board_refused"}
++         "observation_unavailable", "mixed", "board_error", "board_refused", "no_pool_worker"}
+ _REJECTIONS = {"invalid_policy", "not_creator", "not_claimable", "worker_pool_disabled",
+                "unauthorized_candidate", "explicit_pin", "revision_conflict", "not_found"}
+ _TOKEN = re.compile(r"^[A-Za-z0-9_.:/+-]{1,120}$")
++# Board-authored structural return (state "origin"): no configured pool worker is attested to run the card.
++_ORIGIN_REASON = re.compile(r"^no pool worker can run it: missing [A-Za-z0-9_.:/+-]{1,120}(, [A-Za-z0-9_.:/+-]{1,120}){0,63}$")
+ 
+ 
+ def _tokens(values):
+@@ -43,10 +45,17 @@ def normalize(reply):
+                 item["drain_until_ms"] = c["drain_until_ms"]
+             out["candidates"].append(item)
+         out["candidates"].sort(key=lambda c: c["machine"])
+-    if isinstance(reply, dict) and reply.get("state") in ("queued", "assigned"):
++    if isinstance(reply, dict) and reply.get("state") in ("queued", "assigned", "origin"):
+         out["state"] = reply["state"]
+         if _tokens([reply.get("machine")]):
+             out["machine"] = reply["machine"]
++    if out.get("state") == "origin":
++        # The Board repinned the card to its creator in the reserve transaction; the reason is server-authored
++        # text with a fixed shape, so only that shape is stored.
++        out["code"] = "no_pool_worker"
++        reason = reply.get("reason")
++        if isinstance(reason, str) and _ORIGIN_REASON.fullmatch(reason):
++            out["reason"] = reason
+     return out
+ 
+ 
+@@ -69,6 +78,21 @@ def latest(conn, task_id):
+     if value is None:
+         return None
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if value.get("state") == "origin":
++        # Holds while the card stays where the Board returned it (any status, including its run there).
++        try:
++            pinned = json.loads(row["runs_on"] or "null") if row else None
++        except (TypeError, ValueError):
++            pinned = None
++        applied = bool(row and not row["placement_policy"] and value.get("machine")
++                       and pinned == [f"machine:{value['machine']}"])
++        # Before the feed carries the Board's repin, the local row is still the unclaimed policy card the reply
++        # was recorded against: the return is decided, not historical.
++        pending = bool(row and row["status"] == "ready" and row["placement_policy"] == "worker-first-v1"
++                       and not row["claim_lock"] and not row["lease_holder"]
++                       and _same_lifecycle(conn, task_id, row, value))
++        value["current"] = applied or pending
++        return value
+     value["current"] = bool(row and row["status"] == "ready" and row["placement_policy"] == "worker-first-v1"
+                             and not row["claim_lock"] and not row["lease_holder"]
+                             and _same_lifecycle(conn, task_id, row, value))
+@@ -115,6 +139,12 @@ def _stamp(ms):
+ def describe(value):
+     if not value:
+         return "observation unavailable"
++    if value.get("state") == "origin":
++        title = f"Returned to origin {value.get('machine') or 'unknown'}: {value.get('reason') or 'no pool worker can run it'}"
++        if value.get("current") is False:
++            title = "[historical] " + title
++        at = value.get("observed_at_ms", value.get("recorded_at_ms"))
++        return title + (f" — observed {_stamp(at)}" if at is not None else "")
+     title = {"reserved": "Worker reserved; awaiting authoritative pickup",
+              "draining": "Worker draining; awaiting pickup",
+              "admission_limits": "Candidates excluded by admission limits",
+@@ -205,6 +235,9 @@ def record_error(conn, task_id, gateway, *, status=None, error=None):
+     from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
+     if isinstance(error, Resync):
+         return False  # A feed reset is a synchronization signal, not an outage.
++    previous = latest(conn, task_id)
++    if previous and previous.get("state") == "origin" and previous.get("current"):
++        return False  # The Board already returned this card; a feed read error cannot change that decision.
+     if error is not None:
+         value["error_class"] = ("HubError" if isinstance(error, HubError) else
+                                 "SyncUnavailable" if isinstance(error, SyncUnavailable) else
+diff --git a/tests/hermes_cli/test_kanban_queue_integration.py b/tests/hermes_cli/test_kanban_queue_integration.py
+index b4860193535..0724645acaf 100644
+--- a/tests/hermes_cli/test_kanban_queue_integration.py
++++ b/tests/hermes_cli/test_kanban_queue_integration.py
+@@ -95,3 +95,80 @@ def test_cli_json_text_tool_and_thread_share_observation(conn, monkeypatch, caps
+     assert kanban._cmd_show(args) == 0
+     assert qr.describe(cli["queue_reason"]) in capsys.readouterr().out
+     assert kb.list_comments(conn, tid)[-1].body == original
++
++
++ORIGIN_REASON = "no pool worker can run it: missing capability:file, capability:git"
++
++
++def origin_reply(reason=ORIGIN_REASON):
++    return {"state": "origin", "machine": "hub", "reservation_id": None, "expires_at": None, "reason": reason,
++            "observation": {"version": 1, "code": "no_pool_worker", "observed_at_ms": 1000, "candidates": [
++                {"machine": "worker-1", "reasons": ["missing_labels"],
++                 "missing_labels": ["capability:file", "capability:git"]}]}}
++
++
++def _apply_board_repin(conn, tid):
++    """What the authoritative feed carries after the Board's structural CAS repin."""
++    conn.execute("UPDATE kanban_sync_state SET applying=1")
++    conn.execute("UPDATE tasks SET placement_policy=NULL, runs_on=? WHERE id=?", (json.dumps(["machine:hub"]), tid))
++    conn.execute("UPDATE kanban_sync_state SET applying=0")
++    conn.commit()
++
++
++def test_origin_return_records_reason_and_unfences_origin(conn, monkeypatch, capsys):
++    """Board state=origin: the reason is durable, shown, and the origin may run the card in the same pass."""
++    from hermes_cli import kanban
++
++    tid = fixtures.acknowledged(conn, requires=json.dumps(["terminal", "file", "git"]))
++    hub = Mock()
++    hub.reserve.return_value = origin_reply()
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: _apply_board_repin(conn, tid))
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg={"worker_pools": {"hub": ["worker-1"]}}) == 1
++    value = qr.latest(conn, tid)
++    assert value["code"] == "no_pool_worker" and value["state"] == "origin" and value["machine"] == "hub"
++    assert value["reason"] == ORIGIN_REASON
++    assert value["current"] is True
++    assert value["candidates"] == [{"machine": "worker-1", "reasons": ["missing_labels"],
++                                    "missing_labels": ["capability:file", "capability:git"]}]
++    assert ORIGIN_REASON in kb.list_comments(conn, tid)[-1].body
++    row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert wp.execution_refusal(conn, row) is None
++    assert tid not in wp.local_refusals(conn, "ready")
++
++    @contextmanager
++    def closing():
++        yield conn
++
++    monkeypatch.setattr(kanban.kbc, "connect_closing", closing)
++    assert kanban._cmd_show(argparse.Namespace(task_id=tid, json=False)) == 0
++    assert ORIGIN_REASON in capsys.readouterr().out
++    # The reason stays current through the origin's own run; only a later re-placement makes it historical.
++    conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++    conn.commit()
++    assert qr.latest(conn, tid)["current"] is True
++    conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", (json.dumps(["machine:worker-1"]), tid))
++    conn.commit()
++    assert "[historical]" in qr.describe(qr.latest(conn, tid))
++
++
++def test_origin_reason_text_is_allowlisted(conn):
++    tid = fixtures.acknowledged(conn)
++    assert qr.record_reply(conn, tid, "hub", origin_reply(reason="no pool worker can run it: missing x; injected text"))
++    value = qr.latest(conn, tid)
++    assert value["code"] == "no_pool_worker" and "reason" not in value
++    assert "injected" not in kb.list_comments(conn, tid)[-1].body
++
++
++def test_origin_reason_is_current_before_feed_and_survives_pull_error(conn):
++    """Between the reserve reply and the feed applying the repin, the return is decided: it is shown as current,
++    and a failed feed read in that window must not supersede it with a board_error."""
++    tid = fixtures.acknowledged(conn, requires=json.dumps(["terminal", "file", "git"]))
++    assert qr.record_reply(conn, tid, "hub", origin_reply())
++    pending = qr.latest(conn, tid)
++    assert pending["state"] == "origin" and pending["current"] is True
++    assert "[historical]" not in qr.describe(pending)
++    qr.record_pull_error(conn, "hub", status=503)
++    assert qr.latest(conn, tid)["state"] == "origin"
++    _apply_board_repin(conn, tid)
++    applied = qr.latest(conn, tid)
++    assert applied["state"] == "origin" and applied["current"] is True and applied["reason"] == ORIGIN_REASON
+-- 
+2.55.0
+

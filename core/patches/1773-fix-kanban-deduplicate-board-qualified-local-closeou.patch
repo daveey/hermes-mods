@@ -1,0 +1,247 @@
+From 508014e752e10050713f86360439c8743876239c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:01:21 +0000
+Subject: [PATCH] fix(kanban): deduplicate board-qualified local closeout
+ obligations [daveey]
+
+Problem: a chat whose settled batch holds a human-blocked local card painted it twice: kanban_blocked=1 AND
+kanban_active=1 (grey + red), kanban_waiting_on=['default/t_b','t_b']. Reproduced with the real chat-closeout
+core.card_key over core's session_tasks rows.
+
+Why 1: annotate_kanban_activity added the closeout key 'default/t_b' to kanban_active because it matched neither
+open_ids nor the counted card keys.
+Why 2: open_ids are bare task ids ('t_b'); the snapshot's local card keys were '<db path>/<tid>'
+(kanban_activity_identity.local_keys), while chat-closeout's card_key emits '<board slug>/<tid>' for local cards
+(the same form core's parked_waits uses).
+Why 3: the local key was introduced only for lineage dedup, where any unique label works; the remote fix
+(5e059f005f3) reused the merged key set for closeout dedup without aligning the local label.
+Root (happened): two local-identity formats for one card with no shared contract.
+Root (not caught): the core closeout test fed bare ids ('t1'), not the plugin's board-qualified form.
+
+Fix: local keys are '<board slug>/<tid>' (slugs have no '/', remote keys have >= 3 parts, so local and remote
+never collide; different boards stay distinct). A counted local card's scoped closeout alias is dropped from
+kanban_waiting_on (it is listed under its bare id). waiting_on_task_ids() is unchanged (bare ids).
+
+Tests: test_kanban_local_waiting_overlap.py (plugin key format via session_tasks; running/review/human-blocked/
+triage overlaps, unrelated closeouts, same id on another board, named board, legacy bare ids, mixed local+remote,
+lineage dedup across boards, waiting_on_task_ids API). RED on main: 10 failed; GREEN: all pass.
+---
+ hermes_cli/kanban_activity_identity.py        |  30 +++-
+ hermes_cli/kanban_session_activity.py         |   9 +-
+ .../test_kanban_local_waiting_overlap.py      | 129 ++++++++++++++++++
+ 3 files changed, 160 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_local_waiting_overlap.py
+
+diff --git a/hermes_cli/kanban_activity_identity.py b/hermes_cli/kanban_activity_identity.py
+index e46c7e58a4e..58202690266 100644
+--- a/hermes_cli/kanban_activity_identity.py
++++ b/hermes_cli/kanban_activity_identity.py
+@@ -1,16 +1,40 @@
+ """Card identity helpers for local and remote session activity snapshots."""
+ 
+ 
+-def local_keys(path, reads):
+-    """Board-qualified identities from the count transaction, also retained by its memo."""
++def local_keys(path, reads, board=None):
++    """Board-qualified identities from the count transaction, also retained by its memo.
++
++    ``board`` (the board slug) keys a card ``<board>/<task id>``: the local key core's ``parked_waits`` and the
++    chat-closeout plugin's ``card_key`` use, so a pending close-out of a card the boards already count is
++    recognised as the same card. Remote keys have at least three parts (``gateway/[profile/]board/id``) and a slug
++    has no ``/``, so the two never collide. Without a slug the key falls back to the board's path."""
++    label = board or path
+     parked = reads.get("parked_pairs", set())
+     out = {}
+     for bucket in ("active", "blocked", "held", "stalled"):
+         for sid, tid in reads.get(bucket + "_pairs", ()):
+-            out.setdefault(sid, set()).add((f"{path}/{tid}", bucket, (sid, tid) in parked and bucket == "active"))
++            out.setdefault(sid, set()).add((f"{label}/{tid}", bucket, (sid, tid) in parked and bucket == "active"))
+     return out
+ 
+ 
++def is_local_board_key(key):
++    """A ``<board slug>/<task id>`` key (see ``local_keys``), as opposed to a remote ``gateway/.../id`` key."""
++    return key.count("/") == 1
++
++
++def closeout_extra(open_ids, extra_ids, card_keys):
++    """``(pending, listed)`` for plugin closeout ids against what the boards already count.
++
++    ``open_ids``: the bare local ids counted (a legacy bare closeout id matches these). ``card_keys``: per-session
++    ``(key, bucket, parked)`` sets, remote ``gateway/.../id`` and local ``<board>/<id>`` keys (the chat-closeout
++    ``card_key`` form). ``pending`` are closeouts no counted card covers (they add to ``kanban_active``);
++    ``listed`` are the closeout ids to show in ``kanban_waiting_on``: a counted local card is already listed under
++    its bare id, so its scoped alias is dropped."""
++    counted = {key for keys in card_keys for key, bucket, _ in keys if bucket in ("active", "blocked")}
++    pending = set(extra_ids) - set(open_ids) - counted
++    return pending, set(extra_ids) - {key for key in counted if is_local_board_key(key)}
++
++
+ def merge_keys(*sources):
+     out = {}
+     for source in sources:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 5f63532b6ba..bb1555e22cc 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1400,7 +1400,8 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+                 _log.debug("kanban stalled read failed for %s: %s", path, exc)
+         keys = getattr(_local_keys_sink, "keys", None)
+         if keys is not None:
+-            for sid, cards in _identity.local_keys(path, {**reads, "stalled_pairs": stalled_pairs}).items():
++            for sid, cards in _identity.local_keys(path, {**reads, "stalled_pairs": stalled_pairs},
++                                                   board=_board_slug(path)).items():
+                 keys.setdefault(sid, set()).update(cards)
+ 
+ 
+@@ -1925,10 +1926,8 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         # [daveey] The open card ids the chat waits on (lineage-wide, capped): the sidebar's "waiting on N cards".
+         open_ids = {tid for sid in ids for tid in waiting.get(sid, ())}
+         # Plugin sources (pending close-outs) must not recount local OR scoped remote obligations.
+-        extra_ids = {tid for sid in ids for tid in extra.get(sid, ())}
+-        counted_remote = {key for sid in ids for key, bucket, _ in remote_keys.get(sid, ())
+-                          if bucket in ("active", "blocked")}
+-        pending = extra_ids - open_ids - counted_remote
++        pending, extra_ids = _identity.closeout_extra(open_ids, {t for sid in ids for t in extra.get(sid, ())},
++                                                      [remote_keys.get(sid, ()) for sid in ids])
+         if pending:
+             row["kanban_active"] = int(row.get("kanban_active") or 0) + len(pending)
+         # [daveey] Parked/held are subsets of kanban_active. kanban_parked is stamped (even 0) whenever there is open
+diff --git a/tests/hermes_cli/test_kanban_local_waiting_overlap.py b/tests/hermes_cli/test_kanban_local_waiting_overlap.py
+new file mode 100644
+index 00000000000..3ed3f1c504e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_local_waiting_overlap.py
+@@ -0,0 +1,129 @@
++"""Local board obligations and plugin closeouts share board-qualified card identity.
++
++The chat-closeout plugin keys a local card ``<board>/<task id>`` (its ``core.card_key`` over a
++``session_tasks`` row: ``f"{card.get('board') or 'default'}/{card['id']}"``). Core counts the same card from the
++board read under its bare id. A pending closeout for a card core already counts must not add a second card.
++"""
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_session_activity as ksa
++
++HUMAN_REQUEST = {
++    "action": "Choose a release window.", "why_human": "Only the owner can choose downtime.",
++    "interaction": "reply", "scope": "Staging release", "evidence": "No release window selected.",
++}
++
++
++def _plugin_card_key(card):
++    """chat-closeout ``core.card_key`` for a local (non-remote) card, verbatim."""
++    return f"{card.get('board') or 'default'}/{card['id']}"
++
++
++def _board(path: Path, rows):
++    """rows: (id, status, session_id, block_kind, human_request)."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT, "
++                     "block_kind TEXT, human_request TEXT)")
++        conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)", [
++            (tid, st, sid, kind, json.dumps(HUMAN_REQUEST) if human else None)
++            for tid, st, sid, kind, human in rows])
++    return path
++
++
++@pytest.fixture
++def root(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))  # never the real hermes-hub replica
++    monkeypatch.setattr(ksa, "_waiting_sources", {})
++    monkeypatch.setattr(ksa, "_remote_wait", lambda card: None)
++    ksa._reset_cache_for_tests()
++    yield tmp_path
++    ksa._reset_cache_for_tests()
++
++
++def _keys_for(sids, task_id):
++    """The plugin's closeout key for ``task_id``, built from core's real ``session_tasks`` row."""
++    rows = [c for c in ksa.session_tasks(sids, ksa.LISTED_STATUSES) if c["id"] == task_id]
++    assert rows, f"{task_id} not listed by session_tasks"
++    return {_plugin_card_key(c) for c in rows}
++
++
++@pytest.mark.parametrize("status,kind,human,active,blocked", [
++    ("running", None, False, 1, 0),
++    ("review", None, False, 1, 0),
++    ("blocked", "needs_input", True, 0, 1),
++    ("triage", "capability", True, 0, 1),
++])
++@pytest.mark.parametrize("unrelated", [False, True])
++def test_local_closeout_overlap_counts_once(root, status, kind, human, active, blocked, unrelated):
++    _board(root / "kanban.db", [
++        ("t_shared", status, "s_root", kind, human),
++        ("t_done", "done", "s_root", None, False),
++    ])
++    shared = _keys_for(["s_root", "s_tip"], "t_shared")
++    assert shared == {"default/t_shared"}
++    pending = sorted(shared | ({"default/t_done"} if unrelated else set()))
++    ksa.register_waiting_source("chat-closeout", lambda: {"s_tip": pending})
++    for _ in range(2):  # fresh and cached annotation, across a compression lineage
++        row = ksa.annotate_kanban_activity([{"id": "s_tip", "_lineage_ids": ["s_root", "s_tip"]}])[0]
++        assert row.get("kanban_active", 0) == active + int(unrelated)
++        assert row.get("kanban_blocked", 0) == blocked
++        # One entry per card: the counted card keeps core's bare id, the unrelated closeout its scoped key.
++        assert row["kanban_waiting_on"] == sorted({"t_shared"} | ({"default/t_done"} if unrelated else set()))
++    # Existing API: bare local task ids, untouched by plugin sources.
++    assert ksa.waiting_on_task_ids() == {"s_root": frozenset({"t_shared"})}
++
++
++def test_same_task_id_on_another_board_is_not_conflated(root):
++    _board(root / "kanban.db", [("t_x", "running", "s", None, False)])
++    _board(root / "kanban" / "boards" / "ops" / "kanban.db", [("t_x", "done", "s", None, False)])
++    assert _keys_for(["s"], "t_x") == {"default/t_x"}  # only the open card is listed
++    ksa.register_waiting_source("chat-closeout", lambda: {"s": ["ops/t_x"]})
++    row = ksa.annotate_kanban_activity([{"id": "s"}])[0]
++    assert row["kanban_active"] == 2
++    assert row["kanban_waiting_on"] == ["ops/t_x", "t_x"]
++
++
++def test_named_board_overlap_counts_once(root):
++    _board(root / "kanban" / "boards" / "ops" / "kanban.db", [("t_y", "blocked", "s", "needs_input", True)])
++    assert _keys_for(["s"], "t_y") == {"ops/t_y"}
++    ksa.register_waiting_source("chat-closeout", lambda: {"s": ["ops/t_y"]})
++    row = ksa.annotate_kanban_activity([{"id": "s"}])[0]
++    assert row.get("kanban_active", 0) == 0 and row["kanban_blocked"] == 1
++    assert row["kanban_waiting_on"] == ["t_y"]
++
++
++def test_legacy_bare_closeout_id_still_deduplicated(root):
++    _board(root / "kanban.db", [("t_z", "running", "s", None, False)])
++    ksa.register_waiting_source("chat-closeout", lambda: {"s": ["t_z"]})
++    row = ksa.annotate_kanban_activity([{"id": "s"}])[0]
++    assert row["kanban_active"] == 1 and row["kanban_waiting_on"] == ["t_z"]
++
++
++def test_local_and_remote_overlaps_together(root, monkeypatch):
++    _board(root / "kanban.db", [("t_l", "blocked", "s", "needs_input", True)])
++    remote = "hub/default/default/t_l"  # same task id, another gateway: a different card
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a: [{
++        "key": remote, "id": "t_l", "session": "s", "status": "running",
++        "gateway": "hub", "board": "default", "profile": "default", "unfinished": True}])
++    ksa.register_waiting_source("chat-closeout", lambda: {"s": ["default/t_l", remote, "hub/default/default/t_gone"]})
++    row = ksa.annotate_kanban_activity([{"id": "s"}])[0]
++    assert row["kanban_blocked"] == 1           # local, counted once
++    assert row["kanban_active"] == 2            # remote counted once + the unrelated remote closeout
++    assert row["kanban_waiting_on"] == sorted(["t_l", remote, "hub/default/default/t_gone"])
++    assert ksa.waiting_on_task_ids() == {"s": frozenset({"t_l"})}
++
++
++def test_lineage_dedup_keeps_same_id_on_two_boards(root):
++    _board(root / "kanban.db", [("t_x", "running", "s_root", None, False)])
++    _board(root / "kanban" / "boards" / "ops" / "kanban.db", [("t_x", "running", "s_tip", None, False)])
++    _board(root / "kanban" / "boards" / "bb" / "kanban.db", [
++        ("t_y", "running", "s_root", None, False), ("t_y2", "blocked", "s_tip", "needs_input", True)])
++    row = ksa.annotate_kanban_activity([{"id": "s_tip", "_lineage_ids": ["s_root", "s_tip"]}])[0]
++    assert row["kanban_active"] == 3 and row["kanban_blocked"] == 1
+-- 
+2.55.0
+

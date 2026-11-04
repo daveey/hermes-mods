@@ -1,0 +1,261 @@
+From 49345a5b621c30e1899c0825cbc0b7c340338fb8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 04:01:41 +0000
+Subject: [PATCH] fix(desktop): move into a project whose folder the gateway
+ knows under another name [daveey]
+
+Moving a hub session into the Mac's 'infra' project (~/code/focus) failed with
+'folder already belongs to project focus': the hub has that folder as project
+'focus', the same-name lookup missed it, and projects.create refused the
+duplicate. Reuse the project that owns the folder instead.
+---
+ .../store/projects-cross-gateway-move.test.ts | 65 ++++++++++++++
+ apps/desktop/src/store/projects-move-paths.ts | 43 ++++++++++
+ apps/desktop/src/store/projects.ts            | 84 +++++++++----------
+ 3 files changed, 148 insertions(+), 44 deletions(-)
+ create mode 100644 apps/desktop/src/store/projects-move-paths.ts
+
+diff --git a/apps/desktop/src/store/projects-cross-gateway-move.test.ts b/apps/desktop/src/store/projects-cross-gateway-move.test.ts
+index 6e5a5845072..f7ce5cb242b 100644
+--- a/apps/desktop/src/store/projects-cross-gateway-move.test.ts
++++ b/apps/desktop/src/store/projects-cross-gateway-move.test.ts
+@@ -175,6 +175,71 @@ describe('moveSessionToProject across gateways', () => {
+     expect(remoteCalls.at(-1)?.[2]).toMatchObject({ cwd: '/home/me/code/myapp' })
+   })
+ 
++  it("reuses the remote's differently-named project that already owns the folder", async () => {
++    // The Mac calls ~/code/myapp "myapp"; the remote registered the same
++    // folder under another name, so projects.create refuses the duplicate.
++    setup(localDefault, (method, params) => {
++      if (method === 'projects.list') {
++        return {
++          active_id: null,
++          projects: [{ id: 'p_ad616738', name: 'focus', slug: 'focus', primary_path: '/home/me/code/myapp' }]
++        }
++      }
++
++      if (method === 'shell.exec') {
++        return { code: 0, stderr: '', stdout: '' }
++      }
++
++      if (method === 'projects.create') {
++        throw new Error(
++          "folder already belongs to project 'focus' (p_ad616738); switch to it instead of creating a duplicate"
++        )
++      }
++
++      if (method === 'projects.get') {
++        expect(params).toMatchObject({ id: 'p_ad616738' })
++
++        return { project: { id: 'p_ad616738', name: 'focus', primary_path: '/home/me/code/myapp' } }
++      }
++
++      return method === 'session.workspace.move'
++        ? { branch: null, cwd: '/home/me/code/myapp', git_repo_root: null }
++        : {}
++    })
++
++    await moveSessionToProject('remote-s', 'p_local')
++
++    expect(remoteCalls.map(([, m]) => m)).toEqual([
++      'projects.list',
++      'shell.exec',
++      'projects.create',
++      'projects.get',
++      'session.workspace.move'
++    ])
++    expect(remoteCalls.at(-1)?.[2]).toMatchObject({ cwd: '/home/me/code/myapp', session_key: 'remote-s' })
++  })
++
++  it('still surfaces any other projects.create error', async () => {
++    setup(localDefault, method => {
++      if (method === 'projects.list') {
++        return { active_id: null, projects: [] }
++      }
++
++      if (method === 'shell.exec') {
++        return { code: 0, stderr: '', stdout: '' }
++      }
++
++      if (method === 'projects.create') {
++        throw new Error('project name must not be empty')
++      }
++
++      return {}
++    })
++
++    await expect(moveSessionToProject('remote-s', 'p_local')).rejects.toThrow('project name must not be empty')
++    expect(remoteCalls.some(([, m]) => m === 'session.workspace.move')).toBe(false)
++  })
++
+   it('surfaces a failed mkdir instead of moving', async () => {
+     setup(localDefault, method =>
+       method === 'projects.list'
+diff --git a/apps/desktop/src/store/projects-move-paths.ts b/apps/desktop/src/store/projects-move-paths.ts
+new file mode 100644
+index 00000000000..9e5eca11396
+--- /dev/null
++++ b/apps/desktop/src/store/projects-move-paths.ts
+@@ -0,0 +1,43 @@
++// Pure path / error helpers for moving sessions into projects across gateways.
++
++export const labelKey = (label: string): string => label.trim().toLowerCase()
++
++/** `session.workspace.move`'s refusal of a folder that doesn't exist on that host. */
++export const MISSING_WORKDIR_RE = /working directory does not exist/
++// projects_db.create_project's refusal when another project already owns the folder.
++export const DUPLICATE_FOLDER_RE = /folder already belongs to project '[^']*' \((p_[0-9a-f]+)\)/
++
++/** Shell word for a path; a `~/` prefix stays expandable. */
++export function shellPath(path: string): string {
++  const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
++
++  return path.startsWith('~/') ? `"$HOME"/${quote(path.slice(2))}` : quote(path)
++}
++
++/**
++ * `/Users/x/code/a`, `/home/x/code/a`, `/root/code/a` or `/opt/data/code/a`
++ * (the Docker image's home) → `~/code/a`, so it lands in the other host's home.
++ */
++export function homeRelativePath(path: string): string {
++  const m = path.match(/^(?:\/Users|\/home)\/[^/]+(\/.*)?$/) ?? path.match(/^\/(?:root|opt\/data)(\/.*)?$/)
++
++  return m ? `~${m[1] ?? ''}` : path
++}
++
++/** Default folder for a project created by name alone: `~/code/<slug>`. */
++export function newProjectFolder(name: string): string {
++  const slug =
++    name
++      .trim()
++      .toLowerCase()
++      .replace(/[^\p{L}\p{N}._-]+/gu, '-')
++      .replace(/^[-.]+|-+$/g, '') || 'project'
++
++  return `~/code/${slug}`
++}
++
++export interface ShellResult {
++  code: number
++  stderr: string
++  stdout: string
++}
+diff --git a/apps/desktop/src/store/projects.ts b/apps/desktop/src/store/projects.ts
+index 4ab7f8ca109..e1d051f27b4 100644
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -70,6 +70,15 @@ import { $hiddenGatewayIds } from './gateway-visibility'
+ import { hubGatewayForConnection, hubGatewayProjects, hubRequest, learnHubGatewayName } from './hub-sync'
+ import { type OfflineReplicaRecord, offlineSessionsFromReplica } from './offline-sessions'
+ import { fetchRemoteProjectTree, type ProjectTreePayload } from './project-tree-background'
++import {
++  DUPLICATE_FOLDER_RE,
++  homeRelativePath,
++  labelKey,
++  MISSING_WORKDIR_RE,
++  newProjectFolder,
++  shellPath,
++  type ShellResult
++} from './projects-move-paths'
+ import { repoDiscoveryPolicyFromConfig, repoDiscoveryPolicySignature } from './projects-repo-discovery'
+ 
+ export {
+@@ -1108,33 +1117,7 @@ function expireRemoteProjectTree(connectionId: string): void {
+   }
+ }
+ 
+-const labelKey = (label: string): string => label.trim().toLowerCase()
+-
+-/** `session.workspace.move`'s refusal of a folder that doesn't exist on that host. */
+-const MISSING_WORKDIR_RE = /working directory does not exist/
+-
+-/** Shell word for a path; a `~/` prefix stays expandable. */
+-function shellPath(path: string): string {
+-  const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
+-
+-  return path.startsWith('~/') ? `"$HOME"/${quote(path.slice(2))}` : quote(path)
+-}
+-
+-/**
+- * `/Users/x/code/a`, `/home/x/code/a`, `/root/code/a` or `/opt/data/code/a`
+- * (the Docker image's home) → `~/code/a`, so it lands in the other host's home.
+- */
+-export function homeRelativePath(path: string): string {
+-  const m = path.match(/^(?:\/Users|\/home)\/[^/]+(\/.*)?$/) ?? path.match(/^\/(?:root|opt\/data)(\/.*)?$/)
+-
+-  return m ? `~${m[1] ?? ''}` : path
+-}
+-
+-interface ShellResult {
+-  code: number
+-  stderr: string
+-  stdout: string
+-}
++export { homeRelativePath, newProjectFolder }
+ 
+ /** Where the destination project lives on some gateway other than `target`. */
+ function projectSourceFor(node: SidebarProjectTree | undefined): null | { connectionId: string; path: string } {
+@@ -1225,11 +1208,36 @@ async function createProjectFolderOn(target: MoveTarget, name: string, path: str
+   // Projects only organize the sidebar here, so the folder just has to exist.
+   await makeFolderOn(target, path)
+ 
+-  const created = await moveTargetRequest<{ project: null | ProjectInfo }>(target, 'projects.create', {
+-    name,
+-    primary_path: path,
+-    profile
+-  })
++  let created: { project: null | ProjectInfo }
++
++  try {
++    created = await moveTargetRequest<{ project: null | ProjectInfo }>(target, 'projects.create', {
++      name,
++      primary_path: path,
++      profile
++    })
++  } catch (error) {
++    // The gateway already has this folder under ANOTHER name (e.g. the Mac's
++    // "infra" is the hub's "focus"): that project is the destination.
++    const owner = DUPLICATE_FOLDER_RE.exec(String((error as Error)?.message ?? error))?.[1]
++
++    if (!owner) {
++      throw error
++    }
++
++    const found = await moveTargetRequest<{ project: null | ProjectInfo }>(target, 'projects.get', {
++      id: owner,
++      profile
++    })
++
++    const ownerPath = found.project?.primary_path || found.project?.folders?.[0]?.path
++
++    if (!ownerPath) {
++      throw error
++    }
++
++    return ownerPath
++  }
+ 
+   if (target.remote) {
+     expireRemoteProjectTree(target.connectionId)
+@@ -1283,18 +1291,6 @@ export async function moveSessionToProject(
+   await moveSessionToCwd(target, sessionId, cwd)
+ }
+ 
+-/** Default folder for a project created by name alone: `~/code/<slug>`. */
+-export function newProjectFolder(name: string): string {
+-  const slug =
+-    name
+-      .trim()
+-      .toLowerCase()
+-      .replace(/[^\p{L}\p{N}._-]+/gu, '-')
+-      .replace(/^[-.]+|-+$/g, '') || 'project'
+-
+-  return `~/code/${slug}`
+-}
+-
+ // [daveey] ⌘⇧P "+ Create project": a new project named `name` with an empty
+ // `~/code/<slug>` folder, on the session's own gateway, then the move into it.
+ // A same-named project already on that gateway is reused instead.
+-- 
+2.55.0
+

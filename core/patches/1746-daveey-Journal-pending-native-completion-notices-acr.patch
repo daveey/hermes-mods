@@ -1,0 +1,1455 @@
+From 9a560a622473cea9ca3424e1f9be594bcbe605b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 12:41:48 -0800
+Subject: [PATCH] [daveey] Journal pending native completion notices across
+ orderly backend exit
+
+---
+ tests/tui_gateway/test_auto_continue.py       |   4 +-
+ .../tui_gateway/test_shutdown_job_receipts.py | 550 +++++++++++++++++-
+ tools/process_registry.py                     |  24 +-
+ tools/process_registry_awaiting.py            |  96 ++-
+ tui_gateway/exit_job_receipts.py              | 184 ++++--
+ tui_gateway/prompt_turn.py                    |  38 +-
+ tui_gateway/session_notifications.py          |  99 +++-
+ tui_gateway/session_reaper.py                 |   5 +
+ tui_gateway/turn_marker.py                    |  80 ++-
+ tui_gateway/update_pause.py                   |   8 +-
+ 10 files changed, 1011 insertions(+), 77 deletions(-)
+
+diff --git a/tests/tui_gateway/test_auto_continue.py b/tests/tui_gateway/test_auto_continue.py
+index d0e235f9daa..e84dc7eaba9 100644
+--- a/tests/tui_gateway/test_auto_continue.py
++++ b/tests/tui_gateway/test_auto_continue.py
+@@ -226,12 +226,12 @@ def test_interrupt_racing_marker_write_cannot_leave_recovery_state(
+     session = _session(agent=agent, running=True)
+     _patch_local_interrupt(monkeypatch, session)
+ 
+-    def write_after_stop(home, key, prompt, *, attempts=0, auto_continue=True):
++    def write_after_stop(home, key, prompt, *, attempts=0, auto_continue=True, **kwargs):
+         response = server._methods["session.interrupt"](
+             "stop-during-write", {"session_id": "runtime-race"}
+         )
+         assert response["result"]["status"] == "interrupted"
+-        record_turn_start(home, key, prompt, attempts=attempts, auto_continue=auto_continue)
++        return record_turn_start(home, key, prompt, attempts=attempts, auto_continue=auto_continue, **kwargs)
+ 
+     monkeypatch.setattr(server, "record_turn_start", write_after_stop)
+ 
+diff --git a/tests/tui_gateway/test_shutdown_job_receipts.py b/tests/tui_gateway/test_shutdown_job_receipts.py
+index 9fe3e59c1cf..f0845df98b6 100644
+--- a/tests/tui_gateway/test_shutdown_job_receipts.py
++++ b/tests/tui_gateway/test_shutdown_job_receipts.py
+@@ -139,9 +139,11 @@ def backend(monkeypatch, registry):
+ 
+     monkeypatch.setattr(server, "_sessions", sessions)
+     monkeypatch.setattr(server, "_close_session_by_id", close)
++    real = {}
+     for name in ("_flush_sessions_before_exit", "_release_gateway_wake_owner", "_stop_turns_before_exit"):
++        real[name] = getattr(server, name)
+         monkeypatch.setattr(server, name, lambda *a, **k: None)
+-    return types.SimpleNamespace(sessions=sessions, closed=closed, close=close)
++    return types.SimpleNamespace(sessions=sessions, closed=closed, close=close, real=real)
+ 
+ 
+ def _resume_text(monkeypatch, home) -> str:
+@@ -276,6 +278,498 @@ def test_sigterm_flush_handler_journals_before_chaining(home, registry, backend,
+     assert marker is not None and [j["session_id"] for j in marker["killed_jobs"]] == ["proc_notify"]
+ 
+ 
++@pytest.mark.parametrize("pending", ["refused", "held", "queue"])
++def test_finished_notice_survives_orderly_restart(home, registry, backend, monkeypatch, pending):
++    from tools.process_registry_notifications import format_process_notification
++    from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
++
++    job = _job("proc_success", owner="turn-1", command="gh run watch 123", notify=True)
++    registry._running[job.id] = job
++    job.append_output("CI passed: release verified\n")
++    registry._finish_exited(job, 0)
++    session = backend.sessions["sid"] = _session(home, _notif_held=[])
++    if pending == "held":
++        session["_notif_held"].append(registry.completion_queue.get_nowait())
++    elif pending == "refused":
++        event = registry.completion_queue.get_nowait()
++        monkeypatch.setattr(server, "_notif_claim_turn", lambda s: True)
++        monkeypatch.setattr(server, "_notif_submit", lambda *a, **kw: False)
++        monkeypatch.setattr(server, "_notif_refusal_backoff", lambda s: None)
++        server._notif_dispatch_completions("sid", session, [(event, format_process_notification(event))],
++                                            registry, None)
++        assert registry.completion_queue.qsize() == 1
++    # Repeated SIGTERM/atexit journaling and duplicate queue copies must stay one receipt.
++    journal_background_jobs_before_exit()
++    server._shutdown_sessions()
++    marker = read_turn_marker(home, "session-key")
++    assert marker is not None, "finished but undelivered completion lost at restart"
++    assert len(marker["killed_jobs"]) == 1
++    assert marker["killed_jobs"][0]["exit_code"] == 0
++    registry.completion_queue.queue.clear()
++    monkeypatch.setattr("tools.process_registry.process_registry", ProcessRegistry())
++    text = _resume_text(monkeypatch, home)
++    assert text.count("CI passed: release verified") == 1
++    assert "proc_success" in text
++    assert "killed" not in text and "restart it" not in text
++    assert "were running" not in text and "jobs stopped" not in text.lower()
++
++
++@pytest.mark.parametrize("control", ["stop", "quiet", "foreign_session", "consumed", "delivered"])
++def test_finished_notice_shutdown_controls(home, registry, backend, monkeypatch, control):
++    from tools.process_registry_notifications import format_process_notification
++
++    job = _job("proc_done", owner="turn-1", command="true", notify=True)
++    registry._running[job.id] = job
++    registry._finish_exited(job, 0)
++    event = registry.completion_queue.get_nowait()
++    session = backend.sessions["sid"] = _session(home)
++
++    def delivered():
++        monkeypatch.setattr(server, "_notif_claim_turn", lambda s: True)
++        monkeypatch.setattr(server, "_notif_submit", lambda *a, **kw: True)
++        server._notif_dispatch_completions("sid", session, [(event, format_process_notification(event))], registry, None)
++
++    {"stop": lambda: session.__setitem__("_turn_cancel_requested", True),
++     "quiet": lambda: monkeypatch.setattr(
++         server, "_load_cfg", lambda: {**CFG, "display": {"background_process_notifications": "off"}}),
++     "foreign_session": lambda: event.__setitem__("session_key", "other-chat"),
++     "consumed": lambda: registry._completion_consumed.add(job.id),
++     "delivered": delivered}[control]()
++    # A stale duplicate must not resurrect an acknowledged or suppressed completion.
++    registry.completion_queue.put(event)
++    server._shutdown_sessions()
++    assert read_turn_marker(home, "session-key") is None
++    assert read_turn_marker(home / "other-profile", "session-key") is None
++
++
++def test_finished_notice_dedups_held_and_shared_queue(home, registry, backend):
++    job = _job("proc_done", owner="turn-1", command="true", notify=True)
++    registry._running[job.id] = job
++    registry._finish_exited(job, 7)
++    event = registry.completion_queue.get_nowait()
++    backend.sessions["sid"] = _session(home, _notif_held=[event, dict(event)])
++    registry.completion_queue.put(dict(event))
++    server._shutdown_sessions()
++    receipts = read_turn_marker(home, "session-key")["killed_jobs"]
++    assert len(receipts) == 1 and receipts[0]["exit_code"] == 7
++
++
++def test_shutdown_receipt_fences_later_live_delivery(home, registry, backend):
++    from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
++    job = _job("proc_done", owner="turn-1", command="true", notify=True)
++    registry._running[job.id] = job
++    registry._finish_exited(job, 0)
++    session = backend.sessions["sid"] = _session(home)
++    journal_background_jobs_before_exit()
++    assert server._notif_claim_turn(session) is False
++    assert read_turn_marker(home, "session-key") is not None
++
++
++def test_repeated_shutdown_journal_keeps_running_job_kill_receipt(home, registry, backend):
++    from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
++    job = _job("proc_running", owner="turn-1", command="sleep 600", notify=True)
++    registry._running[job.id] = job
++    backend.sessions["sid"] = _session(home)
++    journal_background_jobs_before_exit()
++    server._shutdown_sessions()
++    marker = read_turn_marker(home, "session-key")
++    assert marker["killed_jobs"][0]["kill_state"] == "killed"
++
++
++def test_poller_requeue_after_snapshot_is_journaled_from_custody(home, registry, backend, monkeypatch):
++    """A poller holding a dequeued event (in-flight custody) hands it back only AFTER the snapshot: the
++    journal reads it from custody instead of waiting for the poller to settle."""
++    from tools.process_registry_awaiting import release, take_ready
++    from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
++    job = _job("proc_done", owner="turn-1", command="true", notify=True)
++    registry._running[job.id] = job
++    registry._finish_exited(job, 0)
++    stop, journaled = threading.Event(), threading.Event()
++    backend.sessions["sid"] = _session(home, _notif_stop=stop)
++    taken = []
++
++    def poller():
++        taken.extend(take_ready(registry.completion_queue, 0))
++        try:
++            assert stop.wait(5) and journaled.wait(5)  # still routing well past any settle budget
++            for evt in taken:
++                registry.completion_queue.put(evt)
++        finally:
++            release(taken)
++
++    joins = []
++
++    class _Poller(threading.Thread):
++        def join(self, timeout=None):
++            joins.append(timeout)
++            return super().join(timeout)
++
++    thread = _Poller(target=poller)
++    monkeypatch.setattr(server, "_notification_pollers", [(stop, thread)])
++    thread.start()
++    try:
++        deadline = time.monotonic() + 5
++        while not taken and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert taken and registry.completion_queue.qsize() == 0
++        journal_background_jobs_before_exit()
++        assert joins == [], "the exit journal waited on a poller instead of reading its custody"
++        receipts = read_turn_marker(home, "session-key")["killed_jobs"]
++        assert [(j["session_id"], j["kill_state"]) for j in receipts] == [("proc_done", "completed")]
++    finally:
++        journaled.set()
++        stop.set()
++        thread.join(5)
++
++
++def _finished_event(registry, sid="proc_done", exit_code=0, **job_kw):
++    job = _job(sid, owner="turn-1", command="gh run watch 9", notify=True, **job_kw)
++    registry._running[job.id] = job
++    job.append_output("CI passed\n")
++    registry._finish_exited(job, exit_code)
++    return job, registry.completion_queue.get_nowait()
++
++
++@pytest.mark.parametrize("stopped_by", ["backend_exit", "user_stop"])
++def test_backend_exit_interrupt_is_not_a_user_stop(home, registry, backend, stopped_by):
++    """The exit's own interrupt sets _turn_cancel_requested (reason backend_exit); only a prior user Stop suppresses."""
++    from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
++    _, event = _finished_event(registry)
++    session = backend.sessions["sid"] = _session(home, running=True, _notif_held=[event])
++    if stopped_by == "user_stop":
++        session["_turn_cancel_requested"] = True  # Stop pressed; the turn is still settling
++    backend.real["_stop_turns_before_exit"](budget_s=0)
++    assert session["_turn_cancel_requested"] is True  # both paths now look cancelled to the live flag
++    journal_background_jobs_before_exit()
++    marker = read_turn_marker(home, "session-key")
++    if stopped_by == "user_stop":
++        assert marker is None
++    else:
++        assert marker is not None, "backend_exit interrupt suppressed a held completion"
++        assert [(j["session_id"], j["kill_state"], j["exit_code"]) for j in marker["killed_jobs"]] == [
++            ("proc_done", "completed", 0)]
++
++
++def test_in_flight_event_is_journaled_from_registry_custody(home, registry, backend, monkeypatch):
++    """A poller dequeued the event and is still routing it: neither queued nor held, yet still owed."""
++    from tools.process_registry_awaiting import release, take_ready
++    from tools.process_registry_notifications import format_process_notification
++    _, event = _finished_event(registry, exit_code=3)
++    registry.completion_queue.put(event)
++    session = backend.sessions["sid"] = _session(home, _notif_held=[])
++    ready = take_ready(registry.completion_queue, 0)  # the poller's dequeue + in-flight hold
++    try:
++        assert ready == [event] and registry.completion_queue.qsize() == 0
++        server._shutdown_sessions()
++        receipts = read_turn_marker(home, "session-key")["killed_jobs"]
++        assert [(j["session_id"], j["kill_state"], j["exit_code"]) for j in receipts] == [("proc_done", "completed", 3)]
++        # The poller resumes routing after the snapshot: the exit fence keeps it from also delivering it live.
++        submitted = []
++        monkeypatch.setattr(server, "_notif_submit", lambda *a, **kw: submitted.append(a) or True)
++        server._notif_dispatch_completions("sid", session, [(event, format_process_notification(event))],
++                                            registry, None)
++        assert submitted == []
++    finally:
++        release(ready)
++    from tools import process_registry_awaiting as awaiting
++    assert not any(e is event for e in awaiting._in_flight_events)  # release ends the custody record
++
++
++def test_claimed_but_unpublished_completion_is_journaled_without_waiting(home, registry, backend, monkeypatch):
++    """The reader claimed the finish (left _running, result persisted) and is held before publishing the
++    completion, well past any settle budget: the journal records the registry's own final event, and the
++    later live publication is fenced, so the next backend reports it exactly once."""
++    job = _job("proc_done", owner="turn-1", command="gh run watch 9", notify=True)
++    registry._running[job.id] = job
++    job.append_output("CI passed\n")
++    claimed, go = threading.Event(), threading.Event()
++    real_release = registry._release_finished_handles
++
++    def held_release(session):
++        claimed.set()
++        assert go.wait(10)
++        return real_release(session)
++
++    monkeypatch.setattr(registry, "_release_finished_handles", held_release)
++    reader = threading.Thread(target=registry._finish_exited, args=(job, 0))
++    session = backend.sessions["sid"] = _session(home, _notif_held=[])
++    reader.start()
++    try:
++        assert claimed.wait(5)
++        assert job.id not in registry._running and not job._completion_event.is_set()
++        assert registry.completion_queue.qsize() == 0
++        server._shutdown_sessions()  # publication stays held until after the whole exit journal
++        marker = read_turn_marker(home, "session-key")
++        assert marker is not None, "claimed-but-unpublished completion lost at orderly exit"
++        receipts = marker["killed_jobs"]
++        assert [(j["session_id"], j["kill_state"], j["exit_code"]) for j in receipts] == [("proc_done", "completed", 0)]
++        assert "CI passed" in receipts[0]["notice"]
++    finally:
++        go.set()
++        reader.join(5)
++    published = registry.completion_queue.get_nowait()
++    assert published["session_id"] == "proc_done" and "CI passed" in published["output"]
++    assert server._notif_claim_turn(session) is False  # the fence keeps this backend from also delivering it
++    monkeypatch.setattr("tools.process_registry.process_registry", ProcessRegistry())
++    text = _resume_text(monkeypatch, home)
++    assert text.count("CI passed") == 1 and "restart it" not in text
++
++
++def test_claim_snapshot_never_redacts_under_the_registry_lock(registry):
++    """Redaction may look the session up (``process_registry.get`` takes ``registry._lock``) and runs hooks: the
++    claim snapshots the event unredacted and publication redacts a copy outside the lock."""
++    job = _job("proc_secret", owner="", command="echo sk-ant-api03-" + "x" * 40, notify=True)
++    registry._running[job.id] = job
++    job.append_output("token sk-ant-api03-" + "y" * 40 + "\n")
++    finisher = threading.Thread(target=registry._finish_exited, args=(job, 0), daemon=True)
++    finisher.start()
++    finisher.join(10)
++    assert not finisher.is_alive(), "claim deadlocked on registry._lock"
++    published = registry.completion_queue.get_nowait()
++    assert published["session_id"] == "proc_secret" and published is not job._completion_notice
++    assert job._completion_notice["output"].startswith("token sk-ant-api03-")  # the claim's raw snapshot
++
++
++def _slow_notice_turn(monkeypatch, *, block_in, start=None):
++    """Drive the real poller dispatch → _notif_submit → admission → start chain; ``block_in`` names where it
++    stalls: ``slot`` (before admission, like a slow ownership claim), ``admitted`` (after admission returned,
++    before the turn's start commit) or None. ``start`` replaces the worker start (``_start_session_work``):
++    returns non-None = started (no model turn runs), None = refused, raises = failed; calls are recorded."""
++    entered, go = threading.Event(), threading.Event()
++    outcomes, texts, starts = [], [], []
++    real_admit = server._admit_prompt_turn
++
++    def slot(sid, session):
++        if block_in == "slot":
++            entered.set()
++            assert go.wait(10)
++
++    def admit(*args, **kwargs):
++        admitted = real_admit(*args, **kwargs)
++        outcomes.append(admitted is not None)
++        texts.append(args[2])
++        if block_in == "admitted" and admitted is not None:
++            entered.set()
++            assert go.wait(10)
++        return admitted  # on to the real start commit in _run_admitted_prompt
++
++    def start_work(target, *, name, session=None, **kw):
++        starts.append(name)
++        return (start or (lambda: object()))()
++
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: True)
++    monkeypatch.setattr(server, "_session_moved_refusal", lambda session: None)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", slot)
++    monkeypatch.setattr(server, "_admit_prompt_turn", admit)
++    real_start = server._start_session_work
++    monkeypatch.setattr(server, "_start_session_work", start_work)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_notif_refusal_backoff", lambda s: None)
++    return types.SimpleNamespace(entered=entered, go=go, outcomes=outcomes, texts=texts, starts=starts,
++                                 real_start=real_start)
++
++
++def _closing_backend(monkeypatch, backend):
++    """Like ``_pop_session_by_id``: close marks the record ``_closing`` before tearing it down."""
++    def close(sid, **kw):
++        if (session := backend.sessions.get(sid)) is not None:
++            session["_closing"] = True
++        return backend.close(sid, **kw)
++    monkeypatch.setattr(server, "_close_session_by_id", close)
++
++
++def _next_backend_text(monkeypatch, home, turn) -> str:
++    monkeypatch.setattr(server, "_start_session_work", turn.real_start)  # the next backend's own start
++    monkeypatch.setattr("tools.process_registry.process_registry", ProcessRegistry())
++    return _resume_text(monkeypatch, home)
++
++
++def _assert_one_completed_receipt(home, monkeypatch, turn, *, exit_code=0):
++    marker = read_turn_marker(home, "session-key")
++    assert marker is not None, "pending notice lost at orderly exit"
++    assert [(j["session_id"], j["kill_state"], j["exit_code"]) for j in marker["killed_jobs"]] == [
++        ("proc_done", "completed", exit_code)]
++    assert _next_backend_text(monkeypatch, home, turn).count("CI passed") == 1
++
++
++@pytest.mark.parametrize("exit_path", ["journal", "full_exit"])
++@pytest.mark.parametrize("block_in", ["slot", "admitted"])
++def test_notice_turn_claimed_before_exit_fence_but_not_started_is_journaled(home, registry, backend, monkeypatch,
++                                                                             block_in, exit_path):
++    """A poller claimed the session (running=True) before the exit fence and stalls inside _notif_submit, before
++    admission (``slot``) or after it (``admitted``). Admission commits nothing: the worker start is the commit
++    point, and it is refused after the fence (``journal``) or the close (``full_exit``: the real
++    _shutdown_sessions, whose close sets _closing). The notice is journaled once, never marked delivered, never
++    started; the poller's later requeue happens after the last journal and loses nothing."""
++    from tools.process_registry_awaiting import release, take_ready
++    from tools.process_registry_notifications import format_process_notification
++    from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
++    from tui_gateway.session_notifications import COMPLETION_UNSECURED
++    _, event = _finished_event(registry, exit_code=0)
++    registry.completion_queue.put(event)
++    session = backend.sessions["sid"] = _session(home, _notif_held=[])
++    _closing_backend(monkeypatch, backend)
++    turn = _slow_notice_turn(monkeypatch, block_in=block_in)
++
++    def poller():
++        ready = take_ready(registry.completion_queue, 0)
++        try:
++            server._notif_dispatch_completions("sid", session, [(e, format_process_notification(e)) for e in ready],
++                                                registry, None)
++        finally:
++            release(ready)
++
++    thread = threading.Thread(target=poller)
++    thread.start()
++    try:
++        assert turn.entered.wait(5) and session["running"] is True
++        (journal_background_jobs_before_exit if exit_path == "journal" else server._shutdown_sessions)()
++    finally:
++        turn.go.set()
++        thread.join(5)
++    assert not thread.is_alive()
++    assert turn.outcomes == [block_in == "admitted"]
++    assert turn.starts == [], "a notice turn started after the exit fence"
++    assert session.get("_completion_delivered", set()) == set()
++    assert not session.get(COMPLETION_UNSECURED)
++    assert session["running"] is False
++    assert registry.completion_queue.qsize() == 1  # handed back to custody after the journal, not delivered
++    server._shutdown_sessions()  # atexit re-journal stays one receipt
++    registry.completion_queue.queue.clear()
++    _assert_one_completed_receipt(home, monkeypatch, turn)
++
++
++@pytest.mark.parametrize("start", ["refused", "raises"])
++def test_notice_turn_start_refused_or_raising_is_not_delivered(home, registry, backend, monkeypatch, start):
++    """No exit in progress: a start that is refused or raises rolls back the delivered mark it made under
++    _sessions_lock, the event goes back to the queue, and a later orderly exit journals it."""
++    from tools.process_registry_notifications import format_process_notification
++    from tui_gateway.session_notifications import COMPLETION_UNSECURED
++    _, event = _finished_event(registry, exit_code=4)
++    session = backend.sessions["sid"] = _session(home, _notif_held=[])
++
++    def raising():
++        raise RuntimeError("thread start failed")
++
++    turn = _slow_notice_turn(monkeypatch, block_in=None, start=(lambda: None) if start == "refused" else raising)
++    server._notif_dispatch_completions("sid", session, [(event, format_process_notification(event))], registry, None)
++    assert turn.outcomes == [True] and len(turn.starts) == 1
++    assert session.get("_completion_delivered", set()) == set()
++    assert not session.get(COMPLETION_UNSECURED)
++    assert session["running"] is False
++    assert [e["session_id"] for e in registry.completion_queue.queue] == ["proc_done"]
++    server._shutdown_sessions()
++    registry.completion_queue.queue.clear()
++    _assert_one_completed_receipt(home, monkeypatch, turn, exit_code=4)
++
++
++@pytest.mark.parametrize("phase", ["before_marker", "after_marker", "exit_interrupt_before_marker", "user_stop"])
++def test_started_notice_turn_keeps_custody_until_its_crash_marker(home, registry, backend, monkeypatch, phase):
++    """A notice turn whose start committed before the fence owns the notice (delivered), but until its crash
++    marker is on disk the exit journal still reports it (unsecured). The marker step here is the real
++    ``_record_turn_marker`` the turn body runs first, called inline (no model turn runs). A backend-exit
++    interrupt racing that write keeps the marker; a user Stop before the exit still suppresses both."""
++    from tools.process_registry_notifications import format_process_notification
++    from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
++    from tui_gateway.session_notifications import COMPLETION_UNSECURED
++    _, event = _finished_event(registry, exit_code=0)
++    session = backend.sessions["sid"] = _session(home, _notif_held=[])
++    turn = _slow_notice_turn(monkeypatch, block_in=None)
++    server._notif_dispatch_completions("sid", session, [(event, format_process_notification(event))], registry, None)
++    assert turn.outcomes == [True] and len(turn.starts) == 1
++    assert session["_completion_delivered"] == {"proc_done"}
++    assert set(session[COMPLETION_UNSECURED]) == {"proc_done"}
++    assert registry.completion_queue.qsize() == 0 and session["running"] is True
++    (text,) = turn.texts
++    if phase == "after_marker":
++        assert server._record_turn_marker(session, text) == "session-key"
++        assert not session.get(COMPLETION_UNSECURED)
++    elif phase in {"exit_interrupt_before_marker", "user_stop"}:
++        if phase == "user_stop":
++            session["_turn_cancel_requested"] = True
++        backend.real["_stop_turns_before_exit"](budget_s=0)  # fence + the exit's own interrupt
++        assert session["_turn_cancel_requested"] is True
++        server._record_turn_marker(session, text)  # the turn body reaches its marker after the interrupt
++    journal_background_jobs_before_exit()
++    server._shutdown_sessions()
++    marker = read_turn_marker(home, "session-key")
++    if phase == "user_stop":
++        assert marker is None
++        return
++    assert marker is not None, "a started notice turn's notice lost at orderly exit"
++    if phase == "before_marker":
++        assert [(j["session_id"], j["kill_state"]) for j in marker["killed_jobs"]] == [("proc_done", "completed")]
++    else:  # the turn's own marker carries the notice; the journal adds no second copy
++        assert "CI passed" in marker["prompt"] and not marker.get("killed_jobs")
++    assert _next_backend_text(monkeypatch, home, turn).count("CI passed") == 1
++
++
++def test_held_events_taken_for_routing_stay_in_custody(home, registry, backend):
++    """The poller took its held list to route it (out of _notif_held, never in the queue): still owed."""
++    from tools.process_registry_awaiting import release
++    _, event = _finished_event(registry, exit_code=5)
++    session = backend.sessions["sid"] = _session(home, _notif_held=[event])
++    taken = server._notif_take_held(session)
++    try:
++        assert taken == [event] and session["_notif_held"] == []
++        server._shutdown_sessions()
++        receipts = read_turn_marker(home, "session-key")["killed_jobs"]
++        assert [(j["session_id"], j["exit_code"]) for j in receipts] == [("proc_done", 5)]
++    finally:
++        release(taken)
++
++
++def test_natural_exit_between_running_snapshot_and_kill_reports_real_result(home, registry, backend, monkeypatch):
++    job = _job("proc_race", owner="turn-1", command="gh run watch 9", notify=True)
++    registry._running[job.id] = job
++    backend.sessions["sid"] = _session(home)
++    real_kill = registry.kill_process
++
++    def exits_first(sid, **kw):
++        job.append_output("CI passed\n")
++        registry._finish_exited(job, 0)  # finished on its own just before the shutdown signal
++        return real_kill(sid, **kw)
++
++    monkeypatch.setattr(registry, "kill_process", exits_first)
++    server._shutdown_sessions()
++    receipts = read_turn_marker(home, "session-key")["killed_jobs"]
++    assert [(j["session_id"], j["kill_state"], j["exit_code"]) for j in receipts] == [("proc_race", "completed", 0)]
++    registry.completion_queue.queue.clear()
++    monkeypatch.setattr("tools.process_registry.process_registry", ProcessRegistry())
++    text = _resume_text(monkeypatch, home)
++    assert text.count("CI passed") == 1 and "restart it" not in text and "interruption outcome" not in text
++
++
++@pytest.mark.parametrize("shape", ["rebuilt_agent", "ownerless_legacy"])
++def test_pending_ownership_follows_live_routing(home, registry, backend, shape):
++    """Addressed events follow session-key routing, not the agent's current owner-id set (a rebuilt agent
++    loses older ids); ownerless legacy events go to the session whose agent spawned them."""
++    _, event = _finished_event(registry)
++    session = backend.sessions["sid"] = _session(home, _notif_held=[])
++    if shape == "rebuilt_agent":
++        session["agent"]._process_owner_task_ids = ("turn-after-rebuild",)
++    else:
++        event.pop("session_key")
++    registry.completion_queue.put(event)
++    server._shutdown_sessions()
++    marker = read_turn_marker(home, "session-key")
++    assert marker is not None and [j["session_id"] for j in marker["killed_jobs"]] == ["proc_done"]
++
++
++def test_pending_completion_of_another_profiles_chat_stays_with_that_chat(home, registry, backend):
++    other_home = home / "other-profile"
++    other_home.mkdir()
++    _, event = _finished_event(registry, session_key="other-key")  # same raw owner id, other chat
++    registry.completion_queue.put(event)
++    backend.sessions["sid"] = _session(home, _notif_held=[])
++    other = backend.sessions["sid-other"] = _session(other_home, _notif_held=[])
++    other["session_key"] = "other-key"
++    server._shutdown_sessions()
++    assert read_turn_marker(home, "session-key") is None
++    receipts = read_turn_marker(other_home, "other-key")["killed_jobs"]
++    assert [j["session_id"] for j in receipts] == ["proc_done"]
++
++
+ def _dead_pid() -> int:
+     proc = subprocess.Popen([sys.executable, "-c", "pass"])
+     proc.wait()
+@@ -304,3 +798,57 @@ def test_startup_sweep_resumes_a_job_receipt_older_than_the_turn_freshness_windo
+     startup_resume.resume_interrupted_sessions(lambda rid, params: calls.append(params) or {}, home, CFG,
+                                                paused_only=True)
+     assert [c["session_id"] for c in calls] == ["session-key"]
++
++
++
++def _rcpt(sid, state="completed", notify=True):
++    return {"session_id": sid, "command": f"cmd {sid}", "started_at": 1.0, "notify_on_complete": notify,
++            "kill_state": state}
++
++
++def _late_marker_session(home):
++    from tui_gateway.session_notifications import COMPLETION_UNSECURED
++    session = _session(home)
++    session["history_lock"] = threading.Lock()
++    session[COMPLETION_UNSECURED] = {"P1": {"session_id": "P1"}}
++    return session
++
++
++@pytest.mark.parametrize("order", ["journal_then_marker", "marker_then_journal"])
++def test_late_notice_marker_and_exit_journal_keep_every_receipt(home, order):
++    """A notice turn (carrying P1) whose marker lands after or before the exit journal wrote P1, P2 and a
++    kill receipt: the final marker carries the turn's prompt, P2 and the kill receipt, and P1 exactly once."""
++    from tui_gateway.exit_job_receipts import _save_receipts
++    from tui_gateway.session_notifications import COMPLETION_UNSECURED
++    session = _late_marker_session(home)
++    journal = [_rcpt("P1"), _rcpt("P2"), _rcpt("K1", state="killed")]
++    if order == "journal_then_marker":
++        assert _save_receipts(home, "session-key", journal)
++        assert server._record_turn_marker(session, "notice P1 finished") == "session-key"
++    else:
++        assert server._record_turn_marker(session, "notice P1 finished") == "session-key"
++        assert _save_receipts(home, "session-key", [_rcpt("P2"), _rcpt("K1", state="killed")])
++    marker = read_turn_marker(home, "session-key")
++    assert marker["prompt"] == "notice P1 finished"
++    assert sorted(j["session_id"] for j in marker["killed_jobs"]) == ["K1", "P2"]
++    assert not session.get(COMPLETION_UNSECURED)
++
++
++def test_failed_marker_write_keeps_notice_custody(home, monkeypatch):
++    from tui_gateway import turn_marker
++    from tui_gateway.session_notifications import COMPLETION_UNSECURED
++    session = _late_marker_session(home)
++    monkeypatch.setattr(turn_marker, "_store", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
++    server._record_turn_marker(session, "notice P1 finished")
++    assert set(session[COMPLETION_UNSECURED]) == {"P1"}
++
++
++def test_user_stop_before_late_marker_keeps_journaled_receipts(home):
++    from tui_gateway.exit_job_receipts import JOBS_REASON, _save_receipts
++    session = _late_marker_session(home)
++    assert _save_receipts(home, "session-key", [_rcpt("P1"), _rcpt("P2"), _rcpt("K1", state="killed")])
++    session["_turn_cancel_requested"] = True
++    server._record_turn_marker(session, "notice P1 finished")
++    marker = read_turn_marker(home, "session-key")
++    assert marker["reason"] == JOBS_REASON
++    assert sorted(j["session_id"] for j in marker["killed_jobs"]) == ["K1", "P2"]
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index a4321a34263..094a3ac086e 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -608,6 +608,8 @@ class ProcessSession:
+     # Set by the _move_to_finished call that moved the session out of _running; only that call
+     # publishes the completion, so a duplicate finisher must not release waiters early.
+     _finish_claimed: bool = field(default=False, repr=False)
++    # [daveey] Its completion event, built at that claim (process_registry_awaiting.claim_completion_event).
++    _completion_notice: Optional[dict] = field(default=None, repr=False)
+     # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
+     # cleanup retries the stop even after the session finished.
+     _scope_stop_pending: bool = field(default=False, repr=False)
+@@ -1518,6 +1520,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+                 # Keep the session tracked until its result is durable. A finite
+                 # parent must not observe completion and exit during this write.
+                 save_completed_result(session)
++                if session.notify_on_complete:
++                    from tools.process_registry_awaiting import claim_completion_event
++                    claim_completion_event(session)
+                 self._running.pop(session.id)
+                 self._ownership_bindings.pop(session.id, None)
+             self._finished[session.id] = session
+@@ -1544,23 +1549,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+         self._release_finished_handles(session)
+         self._write_checkpoint(settled_id=session.id if was_running else None)
+         if was_running and session.notify_on_complete:
+-            notification = {
+-                "type": "completion",
+-                "session_id": session.id,
+-                "session_key": session.session_key,
+-                "task_id": session.task_id,
+-                "owner_task_id": session.owner_task_id,
+-                "command": session.command,
+-                **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
+-                **self._exit_fields(session),
+-                # A consumer that relays the output (a bot DM's reply) must know it is not whole.
+-                **_completion_output(session),
+-                # Stable producer identity across checkpoint recovery (unlike a
+-                # consumer-observed completion timestamp).
+-                "started_at": session.started_at,
+-            }
+-            _redact_process_result(notification)
+-            self._put_completion(session, notification)
++            from tools.process_registry_awaiting import completion_event, publishable
++            self._put_completion(session, publishable(session._completion_notice or completion_event(session)))
+ 
+     @staticmethod
+     def _exit_fields(session: ProcessSession) -> dict:
+diff --git a/tools/process_registry_awaiting.py b/tools/process_registry_awaiting.py
+index e1c7f52b0be..d24e936763f 100644
+--- a/tools/process_registry_awaiting.py
++++ b/tools/process_registry_awaiting.py
+@@ -8,7 +8,7 @@ produce it until a consumer has finished routing it:
+ 
+ 1. a notifying process is still running;
+ 2. its exit is recorded but the completion is not yet published (``_completion_event`` unset; the registry keeps
+-   such entries out of pruning);
++   such entries out of pruning; the claim already snapshotted the event, ``unpublished_completions``);
+ 3. the event sits in ``completion_queue``;
+ 4. a consumer has taken it off the queue and is still routing it (an in-flight hold, taken atomically with the
+    dequeue under the queue's own lock and released only after routing returns).
+@@ -21,13 +21,19 @@ from __future__ import annotations
+ 
+ import collections
+ import contextlib
++import logging
+ import threading
+ 
++logger = logging.getLogger("tools.process_registry")
++
+ # Owner task id → number of dequeued-but-unrouted events. take_ready increments it under the queue's mutex in the same
+ # critical section as the dequeue, and awaits_notification reads queue and counter under that mutex too, so a reader
+ # sees each event either queued or held, never neither. Decrements (release) happen only after any requeue.
+ _in_flight: collections.Counter = collections.Counter()
+ _in_flight_lock = threading.Lock()  # always taken after the queue mutex, never before
++# The dequeued-but-unrouted events themselves (same custody as ``_in_flight``), so an orderly backend exit can
++# journal a notice a poller holds mid-routing (``pending_events``) instead of only knowing its owner is busy.
++_in_flight_events: list = []
+ 
+ 
+ def _owner(evt) -> str:
+@@ -44,6 +50,20 @@ def _adjust(owners, delta: int) -> None:
+                 del _in_flight[owner]
+ 
+ 
++def _hold_events(events) -> None:
++    with _in_flight_lock:
++        _in_flight_events.extend(events)
++
++
++def _release_events(events) -> None:
++    with _in_flight_lock:
++        for evt in events:
++            for index, held in enumerate(_in_flight_events):
++                if held is evt:
++                    del _in_flight_events[index]
++                    break
++
++
+ def take_ready(queue, timeout: float) -> list:
+     """Dequeue everything queued (waiting up to ``timeout`` for the first event) and hold each event's owner in the
+     same critical section, so no reaper check can observe an event as neither queued nor held. The caller MUST pass
+@@ -56,13 +76,47 @@ def take_ready(queue, timeout: float) -> list:
+         if events:
+             queue.not_full.notify_all()
+             _adjust((_owner(e) for e in events), +1)
++            _hold_events(events)
+     return events
+ 
+ 
++def hold(events) -> None:
++    """Take the in-flight hold for events a consumer removed from somewhere other than the queue (a session's held
++    list). Call it inside the critical section that removes them, so they are never in neither place; ``release``
++    once routing returns."""
++    if events:
++        _adjust((_owner(e) for e in events), +1)
++        _hold_events(events)
++
++
+ def release(events) -> None:
+     """End the in-flight hold ``take_ready`` took for ``events`` (after any requeue, so coverage is continuous)."""
+     if events:
+         _adjust((_owner(e) for e in events), -1)
++        _release_events(events)
++
++
++def pending_events(queue) -> list:
++    """Every event still owed to a consumer: queued, or dequeued and still being routed. Read under the queue mutex
++    with the in-flight hold, like ``awaits_notification``, so an event moving between the two is seen at least once
++    (callers dedupe by process id). Historical result files are never included."""
++    with queue.mutex:
++        with _in_flight_lock:
++            return [*queue.queue, *_in_flight_events]
++
++
++def unpublished_completions(registry) -> list:
++    """[daveey] Completion events whose finish is claimed but not yet published to ``completion_queue`` (state 2):
++    the unredacted event the claiming ``_move_to_finished`` snapshotted under ``registry._lock`` (copies; the
++    caller redacts). Read this BEFORE
++    ``pending_events``: publication queues the event before it sets ``_completion_event``, so an event is seen
++    here, or already in the queue by the time that is read. Re-adopt-sink jobs are excluded (they never reach
++    the queue)."""
++    with registry._lock:
++        return [dict(s._completion_notice) for store in (registry._running, registry._finished) for s in store.values()
++                if s.notify_on_complete and retained_for_delivery(s)
++                and not getattr(s, "_completion_via_readopt_sink", False)
++                and isinstance(getattr(s, "_completion_notice", None), dict)]
+ 
+ 
+ @contextlib.contextmanager
+@@ -114,3 +168,43 @@ def awaits_notification(registry, owner_task_ids) -> bool:
+             if any(_in_flight.get(o) for o in owners):
+                 return True
+         return any(_owner(evt) in owners for evt in queue.queue)
++
++
++def completion_event(session) -> dict:
++    """The completion event a finished notifying session publishes (exit fields and output as recorded now),
++    unredacted: redaction runs hooks and may look the session up in the registry, so it must happen outside
++    ``registry._lock`` (``publishable``)."""
++    from tools.process_registry import ProcessRegistry, _completion_output
++    return {
++        "type": "completion",
++        "session_id": session.id,
++        "session_key": session.session_key,
++        "task_id": session.task_id,
++        "owner_task_id": session.owner_task_id,
++        "command": session.command,
++        **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
++        **ProcessRegistry._exit_fields(session),
++        # A consumer that relays the output (a bot DM's reply) must know it is not whole.
++        **_completion_output(session),
++        # Stable producer identity across checkpoint recovery (unlike a consumer-observed completion timestamp).
++        "started_at": session.started_at,
++    }
++
++
++def publishable(event: dict) -> dict:
++    """A redacted copy of a claim's event (the claim's own snapshot stays unchanged for concurrent readers)."""
++    from tools.process_registry import _redact_process_result
++    event = dict(event)
++    _redact_process_result(event)
++    return event
++
++
++def claim_completion_event(session) -> None:
++    """[daveey] Called by the claiming ``_move_to_finished`` under ``registry._lock``: snapshot the event it will
++    publish, so an orderly backend exit reads the real event while the claim is unpublished
++    (``unpublished_completions``; its reader redacts) instead of waiting for the publisher. Never raises (the
++    claim must not be left half-done); on failure publication builds the event itself."""
++    try:
++        session._completion_notice = completion_event(session)
++    except Exception:
++        logger.warning("completion event for %s not built at its claim", session.id, exc_info=True)
+diff --git a/tui_gateway/exit_job_receipts.py b/tui_gateway/exit_job_receipts.py
+index b28771eb600..8e749e7853a 100644
+--- a/tui_gateway/exit_job_receipts.py
++++ b/tui_gateway/exit_job_receipts.py
+@@ -6,6 +6,18 @@ exits (skew retirement, the updater's restart, idle exit, a Desktop quit), ``_sh
+ every session and ``agent.close`` kills its jobs with ``consume_output=True``: the notify completion the
+ chat was waiting for never arrives and nothing records why.
+ 
++Pending native completion events also ride this journal, with their actual exit status and output
++(``kill_state=completed``): held for the chat, queued, in flight in a poller (registry custody,
++``process_registry_awaiting.pending_events``), or claimed by the registry but not yet published (the event
++the claim built, ``unpublished_completions``). No step waits on a timer: the snapshot reads custody, and the
++exit fence (raised under ``_sessions_lock``) makes the turn's worker start the single commit point for a notice
++turn a poller claimed before the fence: started earlier → delivered (``_completion_delivered``) and, until that
++turn's crash marker is on disk, still journaled (``COMPLETION_UNSECURED``; at least once, possibly twice if the
++marker lands between the two reads); not started yet → the start is refused, the event stays in custody and is
++journaled, never also delivered here. Admission alone (ownership, slot) commits nothing. Finished jobs are never killed or offered restart advice. A user Stop before the exit,
++``off`` notifications, consumed/delivered completions and other chats' events are not journaled. This is an
++orderly-exit snapshot, not crash durability or historical result replay.
++
+ Before sessions are closed, each session's owned non-persist running jobs are journaled into its durable
+ turn marker (write-ahead), stopped with source ``backend_shutdown`` and ``consume_output=False``, and
+ their outcome journaled. A turn in flight keeps its crash marker and gains the list. An idle session gets
+@@ -17,6 +29,7 @@ end (/new, archive, close) does not come through here and keeps today's behaviou
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import logging
+ 
+ logger = logging.getLogger(__name__)
+@@ -24,7 +37,7 @@ logger = logging.getLogger(__name__)
+ SHUTDOWN_SOURCE = "backend_shutdown"
+ SHUTDOWN_KILL_REASON = "killed when the Hermes backend shut down"
+ JOBS_REASON = "background_jobs_stopped"
+-JOBS_PROMPT = "[Report background jobs stopped when the Hermes backend shut down]"
++JOBS_PROMPT = "[Report background job results pending when the Hermes backend shut down]"
+ # The report is a delivery, not a turn to redo: it outlives the turn freshness window, up to the
+ # marker file's own retention.
+ JOBS_RECEIPT_MAX_AGE_S = 24 * 3600.0
+@@ -44,56 +57,159 @@ def shutdown_kill_reason() -> str:
+ 
+ def jobs_stopped_note(killed_jobs: list | None) -> str:
+     from tui_gateway.update_pause import killed_jobs_report
+-    note = ("[System note: the Hermes backend shut down while background jobs from this chat were running. "
+-            "No turn was in progress; this stands in for their completion notices. Check what each job "
++    note = ("[System note: background job results from this chat were pending when the Hermes backend "
++            "shut down. This stands in for their completion notices. Check what each job "
+             "was gating before you continue, and tell the user if it matters to them.]")
+-    report = killed_jobs_report(killed_jobs, "Background jobs stopped when the Hermes backend shut down:")
++    report = killed_jobs_report(killed_jobs, "Background job results at backend shutdown:")
+     return f"{note}\n\n{report}" if report else note
+ 
+ 
+-def journal_session_jobs(session: dict, reason: str) -> int:
+-    """Journal, stop and re-journal one session's jobs; returns how many were journaled."""
++# Whether the user had stopped the chat before the exit began. ``_stop_turns_before_exit`` sets
++# ``_turn_cancel_requested`` with reason ``backend_exit`` too, so the live flag alone cannot tell a user Stop
++# (suppresses automatic wakes until the next prompt) from the shutdown's own interrupt.
++USER_STOP_AT_EXIT = "_user_stop_at_exit"
++EXIT_FENCE = "_exit_notices_pending"
++
++
++def fence_exit_notices(sessions=None) -> None:
++    """Before anything interrupts a turn: record each session's user-Stop state, then fence automatic wakes so a
++    notice journaled for the next backend is not also delivered by this one. One-way; only the exit calls it."""
++    from tui_gateway import server
++    # Raised only under ``_sessions_lock`` (reentrant): a notice turn's start commits under it
++    # (``start_synthesized_turn``), so each start lands wholly before the fence or is refused after it.
++    with server._sessions_lock:
++        if sessions is None:
++            sessions = list(server._sessions.items())
++        for _sid, session in sessions:
++            with session.get("history_lock") or contextlib.nullcontext():
++                session.setdefault(USER_STOP_AT_EXIT, bool(session.get("_turn_cancel_requested")))
++                session[EXIT_FENCE] = True
++
++
++def _user_stopped(session: dict) -> bool:
++    return bool(session.get(USER_STOP_AT_EXIT, session.get("_turn_cancel_requested")))
++
++
++def _owns_pending(sid: str, session: dict, event: dict) -> bool:
++    """The live poller's routing, not a narrower filter: an addressed event belongs to the session that provably
++    owns it with no more precise live owner elsewhere; an ownerless legacy event to the session whose agent
++    spawned it (the ids ``close()`` kills by)."""
++    from tui_gateway import server
++    if server._notification_event_requires_owner(event):
++        return (server._session_owns_notification_event(sid, session, event)
++                and server._notification_event_owner_elsewhere(sid, session, event) is None)
++    return str(event.get("owner_task_id") or "") in server._session_process_owners(session)
++
++
++def _pending_completions(sid: str, session: dict) -> list[dict]:
++    """Native completion events still owed to this chat: claimed but unpublished, queued, in flight in a poller,
++    or held for it. Never historical result files, never UI-emission dedup. Caller fenced the session first."""
++    from tui_gateway import server
++    from tools.process_registry import process_registry, _redact_process_result
++    from tools.process_registry_awaiting import pending_events, unpublished_completions
++    from tools.process_registry_notifications import format_process_notification
++    if _user_stopped(session) or server._background_notifications_off(session):
++        return []
++    # Custody order (each move keeps the event in its old place until it is in the new one): unpublished →
++    # queue ↔ in flight ↔ held. The held list is read under its lock together with queue and in-flight, so a
++    # poller moving an event between them (take_ready, _notif_take_held, a requeue) is seen at least once.
++    events = unpublished_completions(process_registry)
++    with server._notif_held_lock:
++        events.extend(pending_events(process_registry.completion_queue))
++        events.extend(session.get("_notif_held") or ())
++    # Stable after the fence: a notice turn's start marks its notices delivered under ``_sessions_lock``, and
++    # no notice turn starts once the fence is set. A started turn whose crash marker is not on disk yet still
++    # owes them (``COMPLETION_UNSECURED``): reported here too; the marker, once written, carries the notice.
++    from tui_gateway.session_notifications import COMPLETION_UNSECURED
++    with session.get("history_lock") or contextlib.nullcontext():
++        unsecured = list((session.get(COMPLETION_UNSECURED) or {}).values())
++        delivered = set(session.get("_completion_delivered", ())) - {e.get("session_id") for e in unsecured}
++    events.extend(unsecured)
++    jobs = {}
++    for event in events:
++        pid = event.get("session_id") if isinstance(event, dict) else None
++        if (not pid or pid in jobs or event.get("type", "completion") != "completion"
++                or process_registry.is_completion_consumed(pid) or pid in delivered
++                or not _owns_pending(sid, session, event)):
++            continue
++        receipt = _redact_process_result(dict(event))
++        receipt.update(kill_state="completed", notify_on_complete=True,
++                       notice=format_process_notification(receipt) or "")
++        jobs[pid] = receipt
++    return list(jobs.values())
++
++
++def _merge(prior: list, jobs: list) -> list:
++    receipts = {j["session_id"]: j for j in prior}
++    for job in jobs:
++        # SIGTERM then atexit sees the completion emitted by our own kill: keep its verified
++        # shutdown receipt (reason/restart advice), not a second notice.
++        if receipts.get(job["session_id"], {}).get("kill_state") == "killed" and job.get("kill_state") == "completed":
++            continue
++        receipts[job["session_id"]] = job
++    return list(receipts.values())
++
++
++def _save_receipts(home, key: str, jobs: list) -> bool:
++    """Merge ``jobs`` into the session's marker, creating a receipt marker only when something would have
++    reported back. False = nothing durable (no marker and no notify job, or the write failed)."""
++    from tui_gateway.turn_marker import merge_receipts
++    ok = merge_receipts(home, key, jobs, _merge, create=any(job.get("notify_on_complete") for job in jobs),
++                        prompt=JOBS_PROMPT)
++    if not ok and any(job.get("notify_on_complete") for job in jobs):
++        logger.warning("backend exit: no receipt marker for session %s; its jobs end unreported", key)
++    return ok
++
++
++def journal_session_jobs(session: dict, reason: str, *, sid: str = "") -> int:
++    """Journal, stop and re-journal one session's running jobs, then journal its pending completions;
++    returns how many were journaled."""
+     from tui_gateway import update_pause as up
+-    from tui_gateway.turn_marker import mark_turn_paused, read_turn_marker, record_killed_jobs, record_turn_start
+     key = str(session.get("session_key") or "")
+-    jobs = up._update_jobs(session) if key else []
+-    if not jobs:
++    if not key:
+         return 0
+     home = up._home(session)
+-    marker = read_turn_marker(home, key)
+-    if marker is None:
+-        if not any(job.get("notify_on_complete") for job in jobs):
+-            return 0  # nothing was going to report back: today's close applies
+-        record_turn_start(home, key, JOBS_PROMPT)
+-        if not mark_turn_paused(home, key, JOBS_REASON, increment=False):
+-            logger.warning("backend exit: no receipt marker for session %s; its jobs end unreported", key)
+-            return 0
+-        merged = jobs
+-    else:
+-        merged = list({j["session_id"]: j for j in (*marker.get("killed_jobs", []), *jobs)}.values())
+-
+-    def save() -> bool:
+-        return record_killed_jobs(home, key, merged)
+-
+-    if not save():
+-        logger.warning("backend exit: could not journal background jobs of session %s", key)
+-        return 0
+-    if not up.stop_owned_jobs_for_update_pause(jobs, save, source=SHUTDOWN_SOURCE, reason=reason):
+-        logger.warning("backend exit: some background jobs of session %s have an unverified outcome", key)
+-    logger.info("backend exit: session %s journaled %d background job(s) (%s)", key, len(jobs), reason)
+-    return len(jobs)
++    running = up._update_jobs(session)
++    journaled = {}
++    if running:
++        if _save_receipts(home, key, running):  # write-ahead, before any signal
++            if not up.stop_owned_jobs_for_update_pause(running, lambda: _save_receipts(home, key, running),
++                                                        source=SHUTDOWN_SOURCE, reason=reason):
++                logger.warning("backend exit: some background jobs of session %s have an unverified outcome", key)
++            journaled.update((job["session_id"], job) for job in running)
++        elif any(job.get("notify_on_complete") for job in running):
++            logger.warning("backend exit: could not journal background jobs of session %s", key)
++    # After the kills: a job that exited on its own between the running snapshot and its kill
++    # (``already_exited``) has claimed its finish by now or is still in ``_running`` (its uncertain receipt
++    # stands). A claimed one's real completion is in custody and supersedes that receipt.
++    pending = _pending_completions(sid, session)
++    if pending:
++        if _save_receipts(home, key, pending):
++            journaled.update((job["session_id"], job) for job in pending)
++        else:
++            logger.warning("backend exit: could not journal pending completions of session %s", key)
++    if journaled:
++        logger.info("backend exit: session %s journaled %d background job(s) (%s)", key, len(journaled), reason)
++    return len(journaled)
+ 
+ 
+ def journal_background_jobs_before_exit() -> int:
+     """Every live session's receipts, before ``_close_session_by_id`` would kill the jobs silently."""
+     from tui_gateway import server
+     with server._sessions_lock:
+-        sessions = list(server._sessions.values())
++        sessions = list(server._sessions.items())
++    # Idempotent: _stop_turns_before_exit normally fenced first. Every session is fenced before any is read,
++    # so no notice turn anywhere starts after its event could have been journaled.
++    fence_exit_notices(sessions)
++    # Pollers wind down on their own; nothing here waits for them. Their in-flight and held events are read
++    # from custody, and a turn they claimed before the fence cannot start after it.
++    for stop in {session.get("_notif_stop") for _sid, session in sessions} - {None}:
++        stop.set()
+     reason = shutdown_kill_reason()
+     total = 0
+-    for session in sessions:
++    for sid, session in sessions:
+         try:
+-            total += journal_session_jobs(session, reason)
++            total += journal_session_jobs(session, reason, sid=sid)
+         except Exception:
+             logger.warning("backend exit: background-job journal failed for a session", exc_info=True)
+     return total
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index e5ed7e91342..5d30696f229 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -182,6 +182,13 @@ def _admit_prompt_turn(
+                 # the session already held stays for close's own handoff (_settle_isolated_turn_before_close).
+                 _release_active_session_slot(session)
+             return None
++        from tui_gateway.session_notifications import admit_synthesized_turn
++        if not admit_synthesized_turn(session):
++            # [daveey] A backend exit fenced automatic turns after this one's claim: its notice is journaled
++            # for the next backend (exit_job_receipts), so it must not also run here. Delivery itself is
++            # committed only at the start below (start_synthesized_turn).
++            session["running"] = False
++            return None
+         images = list(session.get("attached_images", []) if image_paths is None else image_paths)
+         if image_paths is None:
+             session["attached_images"] = []
+@@ -276,7 +283,10 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+             session["_active_turn_marker_key"] = marker_key
+             # [daveey] _on_tool_start switches an at-most-once turn's marker off before its first tool runs.
+             session["_until_tool_marker_key"] = marker_key if until_tool and auto_continue else ""
+-        record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
++            from tui_gateway.session_notifications import COMPLETION_UNSECURED
++            carried = list(session.get(COMPLETION_UNSECURED) or ())
++        recorded = record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
++                          carried_job_ids=carried,
+                           auto_continue=auto_continue,
+                           **({"until_tool": True} if until_tool and auto_continue else {}),
+                           **({"killed_jobs": killed_jobs} if killed_jobs else {}),
+@@ -284,9 +294,20 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+                           **({"notification_category": "diagnostic"}
+                              if notification_category == "diagnostic" else {}))
+         with session["history_lock"]:
+-            marker_cancelled = bool(session.get("_turn_cancel_requested"))
++            # [daveey] The backend exit's own interrupt is not a Stop: like _retire_turn_marker, keep the marker
++            # it raced (only a user Stop before the exit drops it). That marker's prompt now carries any notice
++            # this turn was started with, so the exit journal stops reporting those separately.
++            exit_keeps = session.get("_exit_keeps_turn_marker") and not session.get("_user_stop_at_exit")
++            marker_cancelled = bool(session.get("_turn_cancel_requested")) and not exit_keeps
++            if recorded:  # only verified persistence secures the carried notices; a failed write keeps custody
++                unsecured = session.get(COMPLETION_UNSECURED) or {}
++                for pid in carried:
++                    unsecured.pop(pid, None)
++                if not unsecured:
++                    session.pop(COMPLETION_UNSECURED, None)
+         if marker_cancelled:
+-            clear_turn_marker(marker_home, marker_key)
++            from tui_gateway.turn_marker import retire_cancelled_turn_marker
++            retire_cancelled_turn_marker(marker_home, marker_key)
+     return marker_key
+ 
+ 
+@@ -1419,6 +1440,11 @@ def _run_admitted_prompt(
+                 with session["history_lock"]:
+                     if session.get(SESSION_KEY) is segments:
+                         session.pop(SESSION_KEY)
++                    if not session.get("_exit_keeps_turn_marker"):
++                        # [daveey] The turn ran; a notice it carried without a marker of its own (one carried
++                        # a core-update pause) is delivered. A backend exit's interrupt keeps it reportable.
++                        from tui_gateway.session_notifications import COMPLETION_UNSECURED
++                        session.pop(COMPLETION_UNSECURED, None)
+                 # Closing bookend of "tui prompt accepted" — exactly one per accepted prompt.
+                 # agent.session_id is re-read because compression may have rotated it (an
+                 # accepted/finished pair whose id changed IS a rotation trace).
+@@ -1473,7 +1499,11 @@ def _run_admitted_prompt(
+             # still run its turn, but its stamp stays (#106459).
+             if registered is session:
+                 _reopen_routed_session_row(routing_db, sid, session)
+-            can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
++            # [daveey] Under _sessions_lock: the exit fence check, the notice's delivered mark and the start
++            # are one commit (a refused or raising start rolls the mark back; exit_job_receipts).
++            from tui_gateway.session_notifications import start_synthesized_turn
++            can_start = start_synthesized_turn(session, lambda: _start_session_work(
++                run, name=f"prompt-turn-{sid}", session=session)) is not None
+     if not can_start:
+         from tui_gateway.turn_admission import owns
+         with session["history_lock"]:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 3cfb4e7a3e0..9b83849d199 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -173,6 +173,49 @@ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+ 
+ 
++# [daveey] Completion events (process id → event) a claimed notice turn is about to carry. The turn's start
++# (``start_synthesized_turn``) moves them to ``_completion_delivered`` + ``COMPLETION_UNSECURED``; until then
++# they stay in the poller's in-flight custody (backend-exit journal: exit_job_receipts).
++NOTIF_OFFERED_COMPLETIONS = "_notif_offered_completions"
++# Delivered to a started turn whose crash marker is not written yet: the exit journal still reports these.
++# ``_record_turn_marker`` drops them once the marker (whose prompt carries the notice) is on disk.
++COMPLETION_UNSECURED = "_completion_unsecured"
++
++
++def admit_synthesized_turn(session: dict) -> bool:
++    """Caller holds ``history_lock``. Early refusal only: a synthesized (automatic) turn is refused once a backend
++    exit fenced notices. Nothing is marked delivered here; the commit point is the turn's start."""
++    return not (session.get("_synthesized_turn") and session.get("_exit_notices_pending"))
++
++
++def start_synthesized_turn(session: dict, start):
++    """[daveey] The single commit point for the completions a notice turn carries. Caller holds the server's
++    ``_sessions_lock``, under which alone ``fence_exit_notices`` raises the exit fence, so the fence check, the
++    delivered mark and the worker start are one step with respect to the exit journal (which fences first):
++    fenced → refused (the events are still in custody and get journaled); started → delivered, and unsecured
++    until the turn's crash marker is on disk; start refused or raised → the mark is rolled back before the
++    lock is released. Returns ``start()``'s result (None = not started)."""
++    with session["history_lock"]:
++        synthesized = bool(session.get("_synthesized_turn"))
++        if synthesized and session.get("_exit_notices_pending"):
++            return None
++        offered = dict(session.pop(NOTIF_OFFERED_COMPLETIONS, None) or {}) if synthesized else {}
++        if offered:  # before the start: the started turn may secure them at once (_record_turn_marker)
++            session.setdefault("_completion_delivered", set()).update(offered)
++            session.setdefault(COMPLETION_UNSECURED, {}).update(offered)
++    started = None
++    try:
++        started = start()
++        return started
++    finally:
++        if offered and started is None:
++            with session["history_lock"]:
++                session.get("_completion_delivered", set()).difference_update(offered)
++                unsecured = session.get(COMPLETION_UNSECURED) or {}
++                for pid in offered:
++                    unsecured.pop(pid, None)
++
++
+ def _notif_release_turn(session: dict) -> None:
+     from tui_gateway.turn_admission import settle
+     with session["history_lock"]:
+@@ -191,7 +234,8 @@ def _notif_claim_turn(session: dict) -> bool:
+     if continuation_due(session):
+         return False  # [daveey] a core-update-paused turn continues first; callers requeue (update_pause)
+     with _session_turn_admission(session) as admitted:
+-        if not admitted or session.get("running") or session.get("_turn_cancel_requested"):
++        if (not admitted or session.get("running") or session.get("_turn_cancel_requested")
++                or session.get("_exit_notices_pending")):
+             return False
+         session["running"] = True
+         return True
+@@ -1202,13 +1246,16 @@ def _notif_hold_for(owner: dict, evt: dict, queue) -> bool:
+ 
+ 
+ def _notif_take_held(session: dict) -> list:
+-    """Remove and return every event held for ``session`` (oldest first)."""
++    """Remove and return every event held for ``session`` (oldest first), in in-flight custody (taken in the same
++    critical section): the caller MUST ``process_registry_awaiting.release`` them once routing returns."""
++    from tools.process_registry_awaiting import hold
+     held = session.get("_notif_held")
+     if not held:
+         return []
+     with _notif_held_lock:
+         taken = list(held)
+         held.clear()
++        hold(taken)
+     return taken
+ 
+ 
+@@ -1288,6 +1335,12 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
+     return True
+ 
+ 
++def _notif_undeliver(session, claimed) -> None:
++    """[daveey] Completions going back to custody were not delivered, whatever admission marked."""
++    with session["history_lock"]:
++        session.get("_completion_delivered", set()).difference_update(e.get("session_id") for e, _t, _c in claimed)
++
++
+ def _notif_retry_completions(claimed, registry, deferred):
+     """A delegation claim release cannot restore a dequeued native completion."""
+     from tools.async_delegation import release_event_delivery
+@@ -1335,12 +1388,23 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
+         _notif_release_turn(session)
+     try:
+         if text is not None:
+-            accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+-                                     "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+-                                     display_metadata={"display_text": batch.display_text(registry)})
++            # [daveey] The turn's start marks these delivered atomically with the exit fence check
++            # (start_synthesized_turn; exit_job_receipts: a fenced start is refused instead).
++            from tui_gateway.session_notifications import NOTIF_OFFERED_COMPLETIONS
++            session[NOTIF_OFFERED_COMPLETIONS] = {e.get("session_id"): e for e, _t, _c in claimed
++                                                  if e.get("type", "completion") == "completion"
++                                                  and e.get("session_id")}
++            try:
++                accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
++                                         "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
++                                         display_metadata={"display_text": batch.display_text(registry)})
++            finally:
++                session.pop(NOTIF_OFFERED_COMPLETIONS, None)
+             from tui_gateway.process_consumer_health import delivered
+             delivered(sid, session, registry, [event for event, _, _ in claimed], accepted, delivery_token)
+             if not accepted:
++                from tui_gateway.session_notifications import _notif_undeliver
++                _notif_undeliver(session, claimed)
+                 for event, _text, claim in claimed:
+                     _notif_defer_event(event, claim,
+                         deferred.append if deferred is not None else registry.completion_queue.put)
+@@ -1348,10 +1412,15 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
+                     _notif_refusal_backoff(session)
+                 return
+     except Exception:
++        from tui_gateway.session_notifications import _notif_undeliver
++        _notif_undeliver(session, claimed)
+         _notif_retry_completions(claimed, registry, deferred)
+         return
+     for event, _text, claim in claimed:
+         complete_event_delivery(event, claim)
++        if event.get("type", "completion") == "completion":
++            with session["history_lock"]:
++                session.setdefault("_completion_delivered", set()).add(event.get("session_id"))
+ 
+ 
+ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, *, owned=False):
+@@ -1598,10 +1667,13 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
+             last_parked_poll = now
+             _notif_take_parked(sid, session, process_registry, handle)
+         if session.get("_notif_held") and not session.get("running") and not session.get("_turn_cancel_requested"):
++            taken = _notif_take_held(session)
+             try:
+-                handle(_notif_take_held(session), None)  # still busy → held again by the claim gate
++                handle(taken, None)  # still busy → held again by the claim gate
+             except Exception as exc:
+                 _notif_log_failure("held notification dispatch failed", exc)
++            finally:
++                release_in_flight(taken)
+         # Dequeue and in-flight hold are one step: until routing admits a turn, requeues or drops each event, its
+         # owner session stays protected from the reapers (it is in neither the queue nor ``running`` meanwhile).
+         ready = take_ready(queue, 0.5)
+@@ -1623,15 +1695,20 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
+     # Drain remaining events after the stop signal so nothing is lost on shutdown; foreign and orphaned-delegation
+     # events are handed back to the shared queue afterwards.
+     deferred: list = []
++    from tools.process_registry_awaiting import hold as hold_in_flight
+     with _notif_held_lock:  # from here on a handoff to this session falls back to the shared queue
+         held = list(session.pop("_notif_held", None) or ())
+-    ready = take_ready(queue, 0)
++        hold_in_flight(held)  # [daveey] in custody until handed back (backend-exit journal reads it)
+     try:
+-        handle(held + list(ready), deferred)
+-        for evt in deferred:
+-            queue.put(evt)
++        ready = take_ready(queue, 0)
++        try:
++            handle(held + list(ready), deferred)
++            for evt in deferred:
++                queue.put(evt)
++        finally:
++            release_in_flight(ready)
+     finally:
+-        release_in_flight(ready)
++        release_in_flight(held)
+ 
+ 
+ def _async_delegation_display_metadata(evt: dict) -> dict:
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index 9d4b5b84946..c48c2505e5e 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -123,6 +123,11 @@ def _stop_turns_before_exit(budget_s: float | None = None) -> None:
+     group and would outlive the gateway, reparented to init. One still alive halfway through the budget
+     ignored the interrupt's SIGTERM: SIGKILL it then, early enough for its result to land as well (the
+     interrupt's own TERM, 1s, KILL outlasts the SIGTERM path's ~1s grace)."""
++    # [daveey] Before the backend_exit interrupt below sets _turn_cancel_requested: keep a prior user Stop
++    # distinguishable, and fence notification wakes so a journaled notice is not also delivered here.
++    with contextlib.suppress(Exception):
++        from tui_gateway.exit_job_receipts import fence_exit_notices
++        fence_exit_notices()
+     with _sessions_lock:
+         running = [(sid, s) for sid, s in _sessions.items() if s.get("running")]
+     threads = []
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 834e7156df1..6b01cfc773d 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -153,14 +153,18 @@ def _update(home: Path | str, session_key: str, mutate, what: str) -> bool:
+ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
+                       auto_continue: bool = True, notification_category: str | None = None,
+                       pauses: int = 0, killed_jobs: list | None = None, until_tool: bool = False,
+-                      reason: str | None = None) -> None:
++                      reason: str | None = None, carried_job_ids=()) -> bool:
+     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
+     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume.
+     ``pauses`` = core-update pauses this logical turn already took (``mark_turn_paused``), counted apart
+     from crash attempts so a pause never uses one up. ``until_tool`` [daveey]: the turn is continuable only
+-    until its first tool starts (``mark_turn_tool_started``); used by at-most-once admitted decisions."""
++    until its first tool starts (``mark_turn_tool_started``); used by at-most-once admitted decisions.
++    [daveey] An exit-journal receipt marker already on disk for this key (a backend exit journaled while this
++    turn was starting) keeps its receipts in the same locked write, except ``carried_job_ids`` (notices this
++    turn's prompt already carries); the receipts ``killed_jobs`` passes win on a shared id.
++    True only when the marker write landed."""
+     if not session_key or not prompt:
+-        return
++        return False
+     now = time.time()
+     entry = {"attempts": max(0, int(attempts)), "prompt": prompt[:_MAX_PROMPT_CHARS], "started_at": now,
+              "auto_continue": bool(auto_continue), **_writer_identity(),
+@@ -179,7 +183,73 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
+         entry["reason"] = str(reason)
+     # Identity only — never the prompt: this log is read on crash triage and must not carry turn content.
+     logger.debug("turn marker recorded for session %s by writer pid %s", session_key, entry["writer_pid"])
+-    _update(home, session_key, lambda entries: {**_prune(entries, now), session_key: entry}, "record")
++    carried = {str(i) for i in carried_job_ids or ()}
++
++    def mutate(entries):
++        prior = entries.get(session_key)
++        if isinstance(prior, dict) and prior.get("reason") == _JOBS_REASON:
++            own = {str(j.get("session_id")) for j in entry.get("killed_jobs", ()) if isinstance(j, dict)}
++            kept = [j for j in prior.get("killed_jobs") or () if isinstance(j, dict)
++                    and str(j.get("session_id") or "") not in own | carried]
++            if kept:
++                entry["killed_jobs"] = kept + list(entry.get("killed_jobs") or ())
++                entry["exit_receipt_ids"] = [str(j.get("session_id")) for j in kept]
++        return {**_prune(entries, now), session_key: entry}
++
++    return _update(home, session_key, mutate, "record")
++
++
++# Mirrors exit_job_receipts.JOBS_REASON (imported there; kept literal here to avoid an import cycle).
++_JOBS_REASON = "background_jobs_stopped"
++
++
++def retire_cancelled_turn_marker(home: Path | str, session_key: str) -> bool:
++    """[daveey] A turn Stopped before its marker landed: drop the turn, but exit-journal receipts its marker
++    absorbed (``exit_receipt_ids``) go back to a receipt marker instead of being deleted with it."""
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if not isinstance(entry, dict):
++            return None
++        ids = set(entry.get("exit_receipt_ids") or ())
++        kept = [j for j in entry.get("killed_jobs") or () if isinstance(j, dict) and j.get("session_id") in ids]
++        rest = {k: v for k, v in entries.items() if k != session_key}
++        if not kept:
++            return rest
++        from tui_gateway.exit_job_receipts import JOBS_PROMPT
++        rest[session_key] = {"attempts": 0, "prompt": JOBS_PROMPT, "started_at": time.time(), "auto_continue": True,
++                             **_writer_identity(), "pause_restarts_freshness": True, "reason": _JOBS_REASON,
++                             "paused_at": time.time(), "killed_jobs": kept}
++        return rest
++
++    return bool(session_key) and _update(home, session_key, mutate, "retire")
++
++
++def merge_receipts(home: Path | str, session_key: str, jobs: list, merge, *, create: bool,
++                   prompt: str) -> bool:
++    """[daveey] One locked load → merge → store of exit receipts into the session's marker (no read/write gap a
++    concurrent ``record_turn_start`` could fall into). No marker: a receipt marker is created only when
++    ``create``. True when the write landed."""
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if not isinstance(entry, dict):
++            if not create:
++                return None
++            now = time.time()
++            entry = entries[session_key] = {"attempts": 0, "prompt": prompt, "started_at": now,
++                                             "auto_continue": True, **_writer_identity(),
++                                             "pause_restarts_freshness": True, "reason": _JOBS_REASON,
++                                             "paused_at": now}
++        prior = _paused_killed_jobs(entry)
++        merged = merge(prior, jobs)
++        entry["killed_jobs"] = merged
++        if entry.get("reason") != _JOBS_REASON:
++            prior_ids = {j["session_id"] for j in prior}
++            extra = [j["session_id"] for j in jobs if j["session_id"] not in prior_ids]
++            if entry.get("exit_receipt_ids") is not None or extra:
++                entry["exit_receipt_ids"] = sorted(set(entry.get("exit_receipt_ids") or ()) | set(extra))
++        return entries
++
++    return bool(session_key) and _update(home, session_key, mutate, "journal jobs")
+ 
+ 
+ def clear_turn_marker(home: Path | str, session_key: str) -> None:
+@@ -250,7 +320,7 @@ def record_killed_jobs(home: Path | str, session_key: str, killed_jobs: list) ->
+ 
+ 
+ def _paused_killed_jobs(entry: dict) -> list[dict]:
+-    """Jobs a core-update pause actually stopped, or [] when the marker has none / junk."""
++    """Exit/pause receipts, including ``kill_state=completed`` pending notices; [] for junk."""
+     raw = entry.get("killed_jobs")
+     if not isinstance(raw, list):
+         return []
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index c14965568ae..1a1264202f9 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -186,7 +186,7 @@ def stop_owned_jobs_for_update_pause(jobs: list[dict], save: Callable[[], bool],
+     ``source``/``reason`` name who stopped the job (the backend-exit journal passes its own)."""
+     from tools.process_registry import process_registry, _redact_process_result
+     for job in jobs:
+-        if job.get("kill_state") == "killed":
++        if job.get("kill_state") in {"killed", "completed"}:
+             continue
+         sid = job["session_id"]
+         if source != PAUSE_REASON:
+@@ -330,10 +330,14 @@ def killed_jobs_report(killed_jobs: list | None, heading: str) -> str:
+     jobs = [job for job in (killed_jobs or []) if isinstance(job, dict) and job.get("session_id")]
+     if not jobs:
+         return ""
+-    lines = [heading]
++    lines = ["Background job results at interruption:" if any(
++        job.get("kill_state") == "completed" for job in jobs) else heading]
+     for job in jobs:
+         command = job.get("command") or "(no command)"
+         state = job.get("kill_state", "killed")
++        if state == "completed":
++            lines.append(job.get("notice") or "")
++            continue
+         if state != "killed":
+             lines.append(f"- {job['session_id']} started {_format_start(job.get('started_at'))}: {command} "
+                          f"— interruption outcome {state}; inspect its result before restarting")
+-- 
+2.55.0
+

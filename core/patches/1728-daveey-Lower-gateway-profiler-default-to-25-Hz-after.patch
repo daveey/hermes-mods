@@ -1,0 +1,231 @@
+From 9df8181e8dd52bf8064afb013aedf2bb9d5b40ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:42:59 +0000
+Subject: [PATCH] [daveey] Lower gateway profiler default to 25 Hz after live
+ 50 Hz overrun
+
+The post-deploy no-override live check at the 50 Hz default measured the
+gateway-profiler thread at 1.3854%, 3.6331% and 3.3729% of one core
+(123/166/149 threads), missing the <3% acceptance on two of three runs.
+Explicit 25 Hz live probes measured 1.7418%, 1.8144% and 2.1481%
+(147/152/171 threads).
+
+- DEFAULT_HZ = 25 in gateway/control_profile.py, used when a control
+  request omits hz; the CLI --hz default is 25 (parity test enforced).
+- Explicit hz 10..200 still overrides; CPU refresh stays 0.1 s.
+- Benchmark --hz now defaults to omitting hz, so it exercises the same
+  default path as a live request, and records the effective hz.
+- New control-socket test: omitted hz -> hz 25, <=26 samples/s; explicit
+  50 -> >26 samples. Default tests were RED on the 50 Hz code.
+- Docs record the live shortfall, the 40 ms vs 20 ms stack-resolution
+  cost, synthetic 25 vs 50 Hz A/B, and keep earlier history intact.
+
+The required no-override live acceptance must be re-run after deploy;
+25 Hz probes are not that acceptance.
+---
+ gateway/control_profile.py                    |  6 +++-
+ hermes_cli/subcommands/gateway.py             |  2 +-
+ scripts/benchmark_gateway_profile.py          | 12 ++++---
+ tests/gateway/test_control_profile.py         | 17 +++++++++-
+ tests/hermes_cli/test_gateway_profile.py      |  2 +-
+ .../docs/developer-guide/gateway-profiling.md | 32 +++++++++++++++++--
+ 6 files changed, 60 insertions(+), 11 deletions(-)
+
+diff --git a/gateway/control_profile.py b/gateway/control_profile.py
+index bbd6d87240c..0255e178124 100644
+--- a/gateway/control_profile.py
++++ b/gateway/control_profile.py
+@@ -66,6 +66,10 @@ def _cpu_seconds(native_id):
+         return None
+ 
+ 
++# Sampling frequency when a request omits ``hz``: 25 Hz (40 ms wall-stack
++# resolution). 50 Hz exceeded the 3%-of-one-core budget on a live 166-thread
++# gateway. An explicit ``hz`` in 10..200 still overrides it.
++DEFAULT_HZ = 25
+ # Native CPU clocks are read at a thread's first observation, then on refresh
+ # ticks at most this often (monotonic seconds), and once at window end.
+ _CPU_REFRESH_S = 0.1
+@@ -318,7 +322,7 @@ def trim_response(response, limit):
+ 
+ 
+ def validate_params(params):
+-    seconds, hz, top = (params.get('seconds', 20), params.get('hz', 50), params.get('top', 40))
++    seconds, hz, top = (params.get('seconds', 20), params.get('hz', DEFAULT_HZ), params.get('top', 40))
+     for name, value, low, high in [('seconds', seconds, 1, 60), ('hz', hz, 10, 200)]:
+         if type(value) not in (int, float) or not low <= value <= high:
+             raise ValueError(f'{name} must be a finite number in {low}..{high}')
+diff --git a/hermes_cli/subcommands/gateway.py b/hermes_cli/subcommands/gateway.py
+index e7e9765f2e2..03a47f76885 100644
+--- a/hermes_cli/subcommands/gateway.py
++++ b/hermes_cli/subcommands/gateway.py
+@@ -69,7 +69,7 @@ def build_gateway_parser(
+ 
+     gateway_profile = gateway_subparsers.add_parser('profile', help='Sample live gateway thread stacks and CPU')
+     gateway_profile.add_argument('--seconds', type=float, default=20, help='Duration in seconds (1..60; default 20)')
+-    gateway_profile.add_argument('--hz', type=float, default=50, help='Sampling frequency (10..200; default 50)')
++    gateway_profile.add_argument('--hz', type=float, default=25, help='Sampling frequency (10..200; default 25)')
+     gateway_profile.add_argument('--top', type=int, default=40, help='Top frames per thread (default 40)')
+     gateway_profile.add_argument('--json', action='store_true', help='Print machine-readable profile')
+ 
+diff --git a/scripts/benchmark_gateway_profile.py b/scripts/benchmark_gateway_profile.py
+index 240ecf53a3a..6472a61a2dd 100644
+--- a/scripts/benchmark_gateway_profile.py
++++ b/scripts/benchmark_gateway_profile.py
+@@ -45,7 +45,8 @@ def main():
+     parser.add_argument('--seconds', type=float, default=10)
+     parser.add_argument('--rounds', type=int, default=3)
+     parser.add_argument('--threads', type=int, default=150)
+-    parser.add_argument('--hz', type=float, default=50)
++    parser.add_argument('--hz', type=float, default=None,
++                        help='Sampling frequency (default: omit hz, i.e. the control verb default)')
+     parser.add_argument('--active-threads', type=int, default=0,
+                         help='Workers alternating real helper stacks (remaining workers idle)')
+     parser.add_argument('--active-interval', type=float, default=0.037,
+@@ -54,7 +55,9 @@ def main():
+     args = parser.parse_args()
+     if not 0 <= args.active_threads <= args.threads or args.rounds < 1 or args.active_interval <= 0:
+         parser.error('require 0 <= active-threads <= threads, rounds >= 1 and active-interval > 0')
+-    profiler.validate_params({'seconds': args.seconds, 'hz': args.hz})
++    # Omitting hz takes the same default path as a live request without --hz.
++    request = {'seconds': args.seconds} if args.hz is None else {'seconds': args.seconds, 'hz': args.hz}
++    profiler.validate_params(request)
+     stop = threading.Event()
+     barrier = threading.Barrier(args.threads + 1)
+     workers = [threading.Thread(target=_worker,
+@@ -106,12 +109,13 @@ def main():
+             order = ('baseline', 'profile') if index % 2 == 0 else ('profile', 'baseline')
+             for mode in order:
+                 wall, cpu = time.monotonic(), time.process_time()
+-                payload = profiler.profile({'seconds': args.seconds, 'hz': args.hz}) if mode == 'profile' else None
++                payload = profiler.profile(request) if mode == 'profile' else None
+                 if mode == 'baseline':
+                     stop.wait(args.seconds)
+                 cpu, wall = time.process_time() - cpu, time.monotonic() - wall
+                 measurements[mode] = dict(cpu_s=cpu, wall_s=wall, core_percent=100 * cpu / wall)
+                 if payload:
++                    measurements[mode]['hz'] = payload['hz']
+                     measurements[mode]['samples'] = payload['samples']
+                     measurements[mode]['workers_seen'] = sum(t['name'].startswith(('idle-', 'active-')) for t in payload['threads'])
+                     active = [t for t in payload['threads'] if t['name'].startswith('active-')]
+@@ -126,7 +130,7 @@ def main():
+         for worker in workers:
+             worker.join()
+         profiler._collect = collect
+-    print(json.dumps(dict(platform=platform.platform(), python=sys.version, params=vars(args), rounds=results,
++    print(json.dumps(dict(platform=platform.platform(), python=sys.version, params=vars(args), request=request, rounds=results,
+                           median_incremental_core_percent=statistics.median(r['incremental_core_percent'] for r in results),
+                           median_sampler_core_percent=statistics.median(r['profile']['sampler']['core_percent'] for r in results)), indent=2))
+ 
+diff --git a/tests/gateway/test_control_profile.py b/tests/gateway/test_control_profile.py
+index 8559ca141d9..aec2eadac51 100644
+--- a/tests/gateway/test_control_profile.py
++++ b/tests/gateway/test_control_profile.py
+@@ -31,11 +31,26 @@ def test_profile_rejects_nonobject_params(tmp_path, params, monkeypatch):
+ 
+ def test_parameter_defaults_and_boundaries():
+     from gateway.control_profile import validate_params
+-    assert validate_params({}) == (20, 50, 40)
++    assert validate_params({}) == (20, 25, 40)
+     assert validate_params({'seconds': 60, 'hz': 200, 'top': 1}) == (60, 200, 1)
+     assert validate_params({'seconds': 1, 'hz': 10}) == (1, 10, 40)
+ 
+ 
++@pytest.mark.parametrize('params, hz', [({'seconds': 1}, 25), ({'seconds': 1, 'hz': 50}, 50)])
++def test_control_verb_omitted_hz_uses_default_and_explicit_hz_overrides(tmp_path, params, hz):
++    raw = json.dumps({'verb': 'profile', 'params': params}).encode()
++    response = json.loads(GatewayControlServer(tmp_path).handle_request_line(raw))
++    assert response['ok'], response
++    result = response['result']
++    assert result['hz'] == hz and result['seconds'] == 1
++    assert result['cpu_refresh_s'] == pytest.approx(0.1)
++    # Ticks fall at start + k/hz before the 1 s deadline, so at most hz samples
++    # (+1 for float rounding); the 50 Hz override must sample beyond 25 Hz's cap.
++    assert 0 < result['samples'] <= hz + 1
++    if hz == 50:
++        assert result['samples'] > 26
++
++
+ def test_process_wide_concurrent_refusal_and_lock_release(tmp_path, monkeypatch):
+     import gateway.control_profile as profiler
+     started = threading.Event()
+diff --git a/tests/hermes_cli/test_gateway_profile.py b/tests/hermes_cli/test_gateway_profile.py
+index a511f1928dc..33d8d1fa2ec 100644
+--- a/tests/hermes_cli/test_gateway_profile.py
++++ b/tests/hermes_cli/test_gateway_profile.py
+@@ -24,7 +24,7 @@ def test_cli_and_control_defaults_agree():
+     from gateway.control_profile import validate_params
+     args = _parser().parse_args(['gateway', 'profile'])
+     assert (args.seconds, args.hz, args.top) == validate_params({})
+-    assert args.hz == 50
++    assert args.hz == 25
+ 
+ 
+ @pytest.mark.platforms('posix')
+diff --git a/website/docs/developer-guide/gateway-profiling.md b/website/docs/developer-guide/gateway-profiling.md
+index feb336d7ba5..b151bcb0445 100644
+--- a/website/docs/developer-guide/gateway-profiling.md
++++ b/website/docs/developer-guide/gateway-profiling.md
+@@ -5,7 +5,7 @@
+ The control verb is `profile`, with `params`:
+ 
+ - `seconds`: finite number, 1–60 inclusive, default 20.
+-- `hz`: finite number, 10–200 inclusive, default 50 (20 ms wall-stack resolution). Explicit `--hz 100` remains supported.
++- `hz`: finite number, 10–200 inclusive, default 25 (40 ms wall-stack resolution; `DEFAULT_HZ` in `gateway/control_profile.py`). Explicit `--hz 50` or `--hz 100` remains supported and overrides the default.
+ - `top`: positive integer, default 40.
+ 
+ Booleans, numeric strings, out-of-range numbers and non-finite numbers are rejected. Only one profile may run process-wide; another request fails immediately. A daemon sampler does the work while one of the four dedicated control workers waits. The CLI timeout is the requested duration plus 10 seconds. It reports a failed/unavailable request rather than silently starting another gateway.
+@@ -55,7 +55,7 @@ python3 scripts/benchmark_gateway_profile.py --seconds 5 --rounds 3 --threads 15
+ 
+ This creates an isolated process with 150 idle event-waiting threads. Each round measures **whole-process** `time.process_time()` and monotonic wall time, once without profiling and once with it; order alternates. Incremental percent of one core is `(profile CPU / profile wall - baseline CPU / baseline wall) * 100`. Thread creation is outside the measured intervals. The script prints raw measurements, Python/OS metadata, samples and idle-thread census; it never contacts a live gateway.
+ 
+-### Active-stack workload and 50 Hz default
++### Active-stack workload (50 Hz, later lowered to 25 Hz)
+ 
+ ```sh
+ python3 scripts/benchmark_gateway_profile.py --seconds 10 --rounds 3 --threads 180 --active-threads 180
+@@ -73,7 +73,31 @@ Linux/Python 3.14.9, 180 active workers, three 10-second rounds:
+ | Independent per-thread runs | 100 | 3.248, 2.940, 3.815 | 3.515, 3.210, 3.518 |
+ | Independent per-thread runs | 50 | 2.451, 2.365, 2.271 | 2.784, 2.711, 2.945 |
+ 
+-Since optimized 100 Hz still exceeded 3%, the CLI and control verb now default to **50 Hz**. CPU refresh remains 10 Hz; explicit frequencies remain available. These synthetic measurements are not a guarantee for every live gateway or OS.
++Since optimized 100 Hz still exceeded 3%, the CLI and control verb were then set to default to 50 Hz. CPU refresh remained 10 Hz; explicit frequencies remained available. These synthetic measurements were not a guarantee for every live gateway or OS, and the live check below failed.
++
++### Live 50 Hz shortfall and 25 Hz default
++
++Acceptance is the `gateway-profiler` thread's own `cpu_s` / `seconds` below **3% of one core**, from a post-deploy 10-second `hermes gateway profile` against the running gateway with **no `--hz` override**. After the 50 Hz default deployed, that check failed on two of three runs:
++
++| Live run (50 Hz default) | Threads | Samples | Profiler % of one core |
++| --- | ---: | ---: | ---: |
++| 1 | 123 | 500 | 1.3854 |
++| 2 | 166 | 500 | **3.6331** |
++| 3 | 149 | 500 | **3.3729** |
++
++Explicit `--hz 25` probes against the same live gateway passed: 147 threads 1.7418%, 152 threads 1.8144%, 171 threads 2.1481% (250 samples each). These were override probes, not the required no-override acceptance; that acceptance must be repeated after this default ships.
++
++The CLI and control verb now default to **25 Hz**. The cost is stack-time resolution: one wall sample per 40 ms instead of 20 ms, so a 10-second window holds 250 samples rather than 500, and stacks shorter than about 40 ms are proportionally more likely to be missed or attributed coarsely. CPU seconds are unaffected: native CPU refresh stays at 0.1 s (10 Hz) independent of `hz`. Pass `--hz 50` (or up to 200) when finer stack resolution is worth the extra cost.
++
++Synthetic check of the new default, Linux/Python 3.14.9, 180 active workers, 10-second windows, request with `hz` omitted (benchmark default), shared host with load average about 16–25. Each run collected 250 samples, saw all 180 workers and both helpers on all 180. An interleaved 50 Hz control ran in the same period:
++
++| Request | Sampler % of one core | Baseline-subtracted process % |
++| --- | --- | --- |
++| `hz` omitted (25), runs 1–3 | 2.407, 2.570, 2.479 | 3.378, 3.136, 3.183 |
++| `hz` omitted (25), interleaved A/B | 2.254, 2.262, 2.091 | 2.318, 2.740, 2.269 |
++| explicit `--hz 50`, interleaved A/B | 2.851, 3.213, 2.870 | 3.441, 4.284, 3.915 |
++
++On this synthetic workload halving `hz` cut sampler CPU by roughly a fifth, not by half. A likely but unmeasured contributor is the 10 Hz CPU refresh, which reads every thread's clock regardless of `hz`. The high, varying host load inflated the absolute figures relative to the earlier quiet-host table, and the baseline-subtracted process figure (which includes all 180 workers' wakeups) exceeded 3% in the first three runs. These synthetic numbers are not the acceptance measurement; the live no-override check is.
+ 
+ The old sleeping-thread check also lacked a competing CPU load, so a whole-process clock mutation passed. `test_control_profile_cpu_isolation.py` now baselines concurrent sleeping and burning threads, burns at least 0.35 thread-CPU seconds, then requires sleeper CPU below 0.05 s and burner CPU at least 0.2 s. On `9892672e83` with the Linux process-clock mutation it fails with sleeper CPU **0.350335282 s**. The native reader passes; the test is selected on Linux and macOS.
+ 
+@@ -151,6 +175,8 @@ Why the remaining overhead existed: the previous CPU-refresh tick unconditionall
+ 
+ ## Verification status
+ 
++25 Hz default change: **49 passed, 1 macOS-only skipped** across the six profiler gateway files and the CLI file via `scripts/run_tests.sh`. `test_parameter_defaults_and_boundaries`, the new `test_control_verb_omitted_hz_uses_default_and_explicit_hz_overrides[params0-25]` (a real control-socket request without `hz`; at most 26 samples per second) and `test_cli_and_control_defaults_agree` failed on the 50 Hz code. The explicit `hz: 50` case requires more than 26 samples, so the override really samples faster.
++
+ Final stable-refresh change: **38 passed, 1 macOS-only skipped** across the five profiler files via `scripts/run_tests.sh`; all **15 checks** passed via `python3 scripts/check --base HEAD`. The refresh-run test was RED on the preceding implementation and GREEN after; registry replacement and both sides of the lifetime sandwich have explicit controls. Earlier verification stages follow.
+ 
+ `tests/gateway/test_control_profile_fastpath.py` drives `_collect` with a fake clock, frame snapshot and thread registry, and covers: exact batched counts for identical safe snapshots (with recursive dedup and no per-thread work between CPU refreshes), re-walking when an ancestor generator's caller changes under the same leaf frame, re-walking when `greenlet` is imported, CPU cadence without catch-up after a stall, exited-thread lower bounds with a dead-thread read discarded, recovery from a failed first CPU read (marked partial), rejecting an identifier reused between the two enumerations, and no frame references surviving success or an error. A real-thread test checks the fast path engages for idle threads (it failed with 200 enumerations per 100 ticks before the sampler's own frame was kept stable). Each failed on the previous implementation and passes now; existing tests are unchanged. Five profiler test files via `scripts/run_tests.sh`: **35 passed, 1 macOS-only skipped**, three consecutive runs; `python3 scripts/check --base HEAD`: 15 checks ok.
+-- 
+2.55.0
+

@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1702 patches, one entry per non-merge source commit through `871e0a9e2161b7e58fd10e25b8d7322dd409bd97`.
+1821 patches, one entry per non-merge source commit through `2050733bc6571383fe954bea422f8da0f8cdd67d`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -23,11 +23,52 @@ follows 1281 although it sorts at position 1259 by date. Each patch is identifie
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `f0d94882e89ab8d4098b5bb2f166adfb9ee0a0ab`; current merge-base: `e8639fd4312e5102d6f10c76b56406cb01c19092` (the tested upstream sync reached the fork in `622f8967b06`).
-Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523, 1549 and 1627. Entries 1626, 1649 and 1656 are applied and tree-verified in their own source-parent contexts, then represented by explicit ancestry-only merge markers in the main replay. Their full patch bodies remain intact. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
-Current replay: [mirror-replay-1702.json](mirror-replay-1702.json) (seven hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-1702.json](mirror-policy-1702.json). Executed checks: [mirror-1702-verification.md](mirror-1702-verification.md); previous snapshot: [mirror-1625-verification.md](mirror-1625-verification.md).
+Replay starts at the previous verified base `831637fe8d58f050e9aa776b621bb2c7b614dcd1`, with explicit upstream-merge bridges immediately before patches 1328, 1430, 1432, 1478, 1523, 1549 and 1627 (1703–1821 need no new bridge: no upstream merge reached the fork between the 1702 and 1821 tips). Entries 1626, 1649 and 1656 are applied and tree-verified in their own source-parent contexts, then represented by explicit ancestry-only merge markers in the main replay. Their full patch bodies remain intact. All published patch bytes, SHA headers and ordinals are preserved. Empty duplicate entries are retained. Use the current **Applying** recipe below, not a single `git am` at the new merge-base.
+Current replay: [mirror-replay-1821.json](mirror-replay-1821.json) (seven hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-1821.json](mirror-policy-1821.json). Executed checks: [mirror-1821-verification.md](mirror-1821-verification.md); previous snapshots: [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1703–1821
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Kanban board lifecycle isolation and busy budgets](kanban-board-lifecycle-isolation.md) | 1703–1707, 1742, 1754, 1755 | Opening a session database no longer waits behind a Kanban board's journal or lifecycle lock (1703/1704). |
+| [Agent plugin activation from a --profile backend](agent-plugin-activate-profile-scope.md) | 1710 | `POST /api/agent-plugins/activate` scopes the default profile by name, so a backend started with `--profile` still serves activations meant for the root home. |
+| [Gateway and Kanban idle CPU cuts](gateway-idle-cpu-cuts.md) | 1711, 1718, 1738, 1739, 1758, 1759 | The control socket and session-hosted service skip idle peer and owner-scope work that no caller uses (1711). |
+| [Gateway thread profiler: bounded cost, 25 Hz default](gateway-thread-profiler-cost.md) | 1712, 1728 | An active `hermes gateway profile` run bounds its own hot-path cost, with a CPU-isolation test (1712). |
+| [Spawn ledger: no rows lost past a stalled lock holder](process-spawn-ledger-stalled-lock.md) | 1713 | A spawn-ledger writer that cannot get the cross-process lock within its wait no longer does an unlocked read-modify-write that drops rows another writer landed. |
+| [Post-turn outcome refresh in the session's profile scope](turn-outcome-secret-scope.md) | 1714, 1715 | The post-turn outcome refresh binds the session's profile secret scope, so it reads that profile's credentials, not the launching process's (1714); the regression distinguishes foreign and launch credentials (1715). |
+| [Kanban sync loop: skip unchanged chat-link passes](kanban-sync-loop-steady-rounds.md) | 1716, 1717, 1721, 1723 | `reconcile_links(skip_unchanged=True)` (used by `run_forever`) skips a board whose inputs equal its last completed pass, and the placement config is loaded once per round instead of per placeholder check (1716/1717). |
+| [Desktop: native gateway dials recover after a ticket refusal](desktop-native-gateway-ticket-recovery.md) | 1719 | A native gateway dial whose ticket factory refused once reconnects on the next attempt instead of staying disconnected. |
+| [Kanban: one open hermes-mods core mirror card](kanban-mirror-singleton.md) | 1720, 1772, 1801 | `kanban_create` refuses a second open card that is a hermes-mods core mirror pass and names the open owner (1720); the singleton identity is widened while capability execution cards are preserved (1772). |
+| [Desktop poll cost: revalidated annotations and cached status reads](desktop-poll-cost-1722.md) | 1722, 1724, 1743, 1751–1753, 1756, 1798, 1799 | Past its TTL, the Kanban annotation is re-served inline when its fingerprint is unchanged, bounded by max ages for time-derived states; gateway platforms, bundled manifest names and status session rows are cached on file signatures (1722, moved into topical... |
+| [Kanban: closeout obligations counted once](kanban-closeout-obligation-dedupe.md) | 1744, 1773 | A remote obligation already counted is not counted again in closeout (1744). |
+| [PR acceptance: pre-merge checks vs main CI](kanban-pr-merge-time-acceptance.md) | 1725–1727, 1745, 1782, 1802 | PR acceptance separates pre-merge acceptance from main-branch CI (1725); skipped post-merge jobs stay out of the red-main notice (1726); checks pending at merge keep their outcomes (1727). |
+| [Parked PR owners resume after verdict-free reviews](kanban-verdict-free-review-resume.md) | 1729–1731, 1819 | A PR owner parked for review resumes after an exact-head review that carries no verdict (1729); review aliases are bound and diagnostics deduplicated (1730); explicit approval paths are covered (1731). |
+| [Committed model switches reach the next build](model-switch-route-intent.md) | 1732–1737, 1763, 1765, 1766 | Adopting a legacy local session restores its recorded route (1732). |
+| [Bot Chat sessions follow their profile's selection](bot-chat-follow-profile.md) | 1762, 1764, 1767–1770, 1815 | Managed Bot Chat follows its profile and a held pick ends durably (1762/1764); in-process Bot Chat does the same and the switch intent names the physical target (1767). |
+| [Pending completion notices survive an orderly backend exit](native-completion-notice-journal.md) | 1746, 1747 | Pending native completion notices are journaled across an orderly backend exit and delivered after restart (1746); bound notice helpers are used and journal-after-marker cancellation is covered (1747). |
+| [Failed-turn boundary explains a provider refusal](provider-refusal-turn-boundary.md) | 1749, 1750 | When the provider refuses (content policy), the failed-turn boundary says so instead of a generic failure (1749); the boundary is asserted through ACP history (1750). |
+| [Worker queue reasons and explicit origin repin](kanban-queue-reasons-repin.md) | 1757, 1795 | Worker queue observations persist as queue reasons, and an explicit origin repin is supported; a lost repin reply is reported as an unknown outcome (1757). |
+| [API server: per-request context usage beside billing totals](api-context-usage.md) | 1760, 1761 | Chat Completions responses add optional `usage.context_usage = {version: 1, complete, requests: [{provider, model, input_tokens, input_limit}]}`, one entry per main-loop provider response; `usage.prompt_tokens` stays the turn's billing sum (1760/1761). |
+| [Model routing state: WAL, and resume on the allocation store's route](model-routing-state-wal-and-resume.md) | 1774, 1792 | The routing state database uses WAL and sticky reuse prepares outside the writer lock, so allocations no longer time out with `database is locked` under contention (1774). |
+| [Unit tests: offline catalogs and a loopback-only name fence](offline-unit-test-network-fence.md) | 1775–1781, 1788, 1796 | Video, model-metadata, models.dev and CLI catalog transports are stubbed offline by autouse fixtures (1775–1778). |
+| [Kanban parks: deploy window and declared clock waits](kanban-deploy-window-parks.md) | 1783, 1804, 1820 | A deploy park reads the host's `cache/core-update/window.json` (schema v1, fresh, this host) and floors its wake to the window, instead of re-parking and escalating while the deploy is only queued (1783). |
+| [Termux assembly: tools dir mode and test mount dir](termux-assembly-permissions.md) | 1784, 1785 | The assembly tools dir is created 0755 regardless of host umask (1785); the test uses a unique, self-cleaning docker mount dir (1784). |
+| [TUI gateway: failure reset time stays inside ErrorPayload](tui-error-payload-reset-at.md) | 1789 | Agent-build error events map `failure_resets_at` to the declared `reset_at` instead of leaking an undeclared key that violated `ErrorPayload`. |
+| [Kanban host dispatcher/sync locks belong to the root gateway](kanban-host-locks-root-gateway.md) | 1790, 1791, 1807–1812 | Host sync belongs to the root profile gateway, and released inherited creator links are healed (1790). |
+| [⌘B park and outcome refresh write on the live owner](sessions-mute-live-owner.md) | 1793 | `POST /api/sessions/{id}/mute` and `GET /outcome?refresh=1` go through the live owner's store instead of `exclusive_maintenance`, which a running gateway always holds, so ⌘B no longer fails with "Exclusive maintenance refused". |
+| [Kanban: scratch files named in handoff metadata survive cleanup](kanban-handoff-metadata-files.md) | 1794 | Workspace files cited in `kanban_complete`/`request_review` metadata (for example `replay_report`, `plan`) are preserved when the managed scratch workspace is reaped. |
+| [Kanban stop guard flushes the worker's answer first](kanban-stop-guard-flush.md) | 1797 | A worker's text-only final answer is flushed to a durable assistant row before the stop-loop nudge's next model request, so observed managed workers no longer fault closed. |
+| [kanban_create: one owner per red-CI failure](kanban-red-ci-failure-owner.md) | 1800 | A new card naming the same failing test function, or the same Actions run when neither names a test, as an open card is refused (`create_overlap`) unless lineage, waits-on, recovers, a citation of the owner's id or `distinct_from` applies. |
+| [Desktop: move into a project the gateway knows by another name](desktop-project-move-by-folder.md) | 1803 | Moving a session into a project whose folder the target gateway already owns under another project name reuses that project instead of failing. |
+| [scripts/check: quiet skip of a pm environment without JSON](scripts-check-pm-env.md) | 1806 | The pre-push hook skips a composing checkout whose `pm.environments` output is empty or not a JSON object, without printing a traceback. |
+| [delegate_task steer/stop on a just-finished child](delegate-finished-child-control.md) | 1817 | Steering or stopping a subagent that already finished answers `already_finished` instead of "No live subagent". |
+| [Kanban placement: unknown pin names are refused as unknown](kanban-placement-unknown-pin.md) | 1818 | A `placement` pin naming no gateway hermes-hub has a record of is refused as an unknown name, listing the gateways it knows, instead of "not live: capability record stale or missing". |
+| [Blocked notices show the card's exact human ask](kanban-actionable-block-notices.md) | 1821 | Local (`session_notifications`), remote (`kanban_remote_notices`) and gateway (`kanban_watchers_notifier`) blocked notices render the card's validated `human_request` (action, why, scope) and the exact task link, instead of a 160-character clipped event rea... |
+| [Test stability 1703–1821](test-stability-1703-1821.md) | 1708, 1709, 1740, 1741, 1748, 1771, 1786, 1787, 1805, 1813, 1814, 1816 | Backup busy deadline tested at its guarded opener (1708/1709); hermetic system-unit home fixture and split socket preflight suite (1740/1741); synthesized-turn commit point bound into rebound harnesses (1748); headless worker probe passes the reservation's... |
+| [1821-entry mirror verification](mirror-1821-verification.md) | verification report | Exact inventory, unchanged seven-bridge replay, normalized full tree, six fingerprint re-pins and one new reviewed fingerprint. |
 
 ## Mirror follow-ups 1626–1702
 
@@ -976,16 +1017,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1702-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply seven bridges and three ancestry-only markers from `mirror-replay-1702.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **1821-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply seven bridges and three ancestry-only markers from `mirror-replay-1821.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 871e0a9e2161b7e58fd10e25b8d7322dd409bd97 \
+  --source-tip 2050733bc6571383fe954bea422f8da0f8cdd67d \
   --base f0d94882e89ab8d4098b5bb2f166adfb9ee0a0ab \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-1702.json" \
-  --replay-plan "$MODS/core/mirror-replay-1702.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-1821.json" \
+  --replay-plan "$MODS/core/mirror-replay-1821.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1015,7 +1056,7 @@ git am -3 --empty=keep "${patches[@]:1626:22}"
 git commit --allow-empty -m 'Ancestry-only source merge ccbe7c69d0b retains patch 1649'
 git am -3 --empty=keep "${patches[@]:1649:6}"
 git commit --allow-empty -m 'Ancestry-only source merge ccbe7c69d0b retains patch 1656'
-git am -3 --empty=keep "${patches[@]:1656:46}"
+git am -3 --empty=keep "${patches[@]:1656:165}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

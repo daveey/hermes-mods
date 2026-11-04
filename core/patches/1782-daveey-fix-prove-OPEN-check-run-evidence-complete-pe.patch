@@ -1,0 +1,1055 @@
+From cd592994bc2ccf265435afc91f29acb694c49e72 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:52:54 +0000
+Subject: [PATCH] [daveey] fix: prove OPEN check-run evidence complete per
+ check suite
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+## PR acceptance: complete check-run evidence (OPEN latest view proven per suite)
+
+### Root chain (five whys, evidence-cited)
+1. **Symptom:** PR #656 (head 850d520) acceptance read the commit's `filter=latest` view as 100 runs while `filter=all` has 147. This was first read as truncation.
+2. **Why 100 vs 147?** It's legitimate. Suite 112327246670 is workflow run 41450628217. Attempt 1 had 47 runs and failed. Attempt 2 was cancelled before it created a job, so GitHub's latest view of that suite is empty (`latest_check_runs_count=0`). Recorded read-only: the commit latest response (100 IDs) equals the union of every suite's latest IDs, and the sum of the 48 suites' `latest_check_runs_count` is 100 (fixture `commit_latest_ids`, `suite_latest_ids`).
+3. **Why could the evidence still be wrong?** The old OPEN path trusted a filtered endpoint's own `total_count` (`len(ids) == total_count`). A self-consistent but capped or racing latest page passes that check. Nothing tied the latest view to GitHub's per-suite latest counts.
+4. **Why wasn't this caught?** The test fakes derived "latest" by guessing the newest ID per name. They never modelled suites, attempts, empty reruns or a capped latest view.
+5. **Root (a guard gap we control):** acceptance had no completeness proof for the OPEN latest view. Fix: prove it per suite as described below. Separately, the main-health owner lookup ignored `scheduled`, which is a live column (`kanban_workflow.py:118`), so a parked ci-main-watch owner went unreported.
+
+### Change
+- OPEN makes 2 paginated reads: `commits/{sha}/check-runs?filter=latest` and `commits/{sha}/check-suites`. `proven_latest_runs` checks:
+  - both paginations are complete (count stable across pages, unique positive IDs);
+  - there are ≤1000 suites;
+  - every suite has the exact head, a positive app ID and an integer `latest_check_runs_count` ≥ 0;
+  - every latest run belongs to a listed suite of the same app;
+  - each suite's latest-run tally equals its `latest_check_runs_count`, including suites with a count of 0 or none in the view.
+  Any mismatch raises `ValueError`, which fails closed as `infra`. There is no `filter=all` read on OPEN, no per-suite reads, and no latest guessing.
+- MERGED is unchanged in semantics: `filter=all` with the merge cutoff, now with `complete_runs` pagination validation.
+- `main_health` (diagnostic only, never changes `ok`/classification):
+  - emitted only when the PR's `mergeCommit.oid` equals the accepted head. A rebased landing (different landed SHA) or no merge commit means a later red run on the PR head is not base-branch CI: it stays in `post_merge_checks` with no `main_health`. Non-main bases use ci-main-watch's `repo@branch` label.
+  - owner lookup matches ci-main-watch's first-red streak keys (`ci-red:<label>:<any 40-hex sha>`, exact key preferred, exact label prefix, not LIKE), only `created_by='ci-main-watch'` and active statuses (now including `scheduled`), on this board and every sibling board opened `mode=ro` (missing boards are never created, unreadable ones skipped; no writes).
+
+### Verification
+- Recorded PR #656 replay: OPEN accepts, with checks = [125286307833 success]. The superseded attempt-1 failure 125304345962 is not latest. Request log = exactly the 2 reads above.
+- The same history with attempt 1 still latest yields `failure` (147 latest runs, paginated). A latest view that still carries the superseded runs fails as `infra` (zero-count suite).
+- Fault matrix → `infra`: short, changed or missing pages; duplicate or bad IDs; missing suite or app; suite head or app mismatch; bad or negative count; >1000 suites; count above tally; zero count with runs; absent suite with a positive count; a self-consistent latest view capped at 100 below its suite's 151.
+- Controls pass: absent zero-count suites up to 1000.
+- RED proof:
+  - dropping the landed-SHA check fails `test_post_merge_red_on_unlanded_head_is_not_main_health[rebased|missing]`;
+  - removing the tally equality fails 5 tests (capped view, superseded runs, absent, count-above, zero-with-runs);
+  - removing `scheduled` fails `test_only_active_owner_is_annotated_without_writes[scheduled]`.
+- `hermes-core-wt test`, 8 files: enumeration, main_health_owner, merge_time, acceptance, supersession, complete_rejection_class, transport, park_invariants. Result: 193 passed, 0 failed, 1 skipped (macOS-only platform test). Final head: enumeration, main_health_owner, merge_time, acceptance, landing, landing_notices, supersession, transport = 215 passed, 0 failed.
+- The shared HTTP GitHub fake in `test_kanban_pr_acceptance.py` now serves `commits/{sha}/check-suites` (one suite, head taken from the path) and gives each run a `check_suite`. Without this, `test_kanban_pr_landing*.py` (OPEN PRs) failed closed as `infra`; ship's affected-test gate caught 28 failures. After the fix, landing, landing_notices and acceptance pass: 86 passed.
+---
+ hermes_cli/kanban_pr_acceptance.py            |  14 +-
+ hermes_cli/kanban_pr_check_runs.py            |  94 ++++++
+ hermes_cli/kanban_pr_merge_time.py            |  69 ++++-
+ tests/hermes_cli/check_suite_fake.py          |  41 +++
+ .../hermes_cli/fixtures/pr656_check_runs.json | 195 +++++++++++++
+ .../test_kanban_main_health_owner.py          | 105 +++++++
+ tests/hermes_cli/test_kanban_pr_acceptance.py |   8 +-
+ .../hermes_cli/test_kanban_pr_enumeration.py  | 276 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_pr_merge_time.py |  47 ++-
+ 9 files changed, 818 insertions(+), 31 deletions(-)
+ create mode 100644 hermes_cli/kanban_pr_check_runs.py
+ create mode 100644 tests/hermes_cli/check_suite_fake.py
+ create mode 100644 tests/hermes_cli/fixtures/pr656_check_runs.json
+ create mode 100644 tests/hermes_cli/test_kanban_main_health_owner.py
+ create mode 100644 tests/hermes_cli/test_kanban_pr_enumeration.py
+
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 11718096902..2d1a216892b 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -201,7 +201,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         phase = "reading the PR"
+         query = (f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)})'
+                  f'{{pullRequest(number:{number:d})'
+-                 '{headRefOid baseRefName state mergedAt '
++                 '{headRefOid baseRefName state mergedAt mergeCommit{oid} '
+                  'baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}')
+         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+         if repository is None:
+@@ -241,12 +241,18 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                 where=f"{repo}@{branch}", repoint=_REPOINT_HINT))
+             return receipt
+         phase = "reading check runs"
++        # OPEN: GitHub's latest view (each suite's latest attempt), proven complete
++        # against every suite's latest_check_runs_count. MERGED: every run, cut at merge.
++        from hermes_cli.kanban_pr_check_runs import complete_runs, proven_latest_runs
+         run_filter = "all" if pr["state"] == "MERGED" else "latest"
+         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter={run_filter}",
+                      paginate=True, profile_home=profile_home)
+-        runs = [run for page in pages for run in page["check_runs"]]
+-        if len({r["id"] for r in runs}) != pages[0]["total_count"]:
+-            raise ValueError("Incomplete check-run pagination")
++        if run_filter == "latest":
++            suites = _api(f"repos/{repo}/commits/{sha}/check-suites?per_page=100",
++                          paginate=True, profile_home=profile_home)
++            runs = proven_latest_runs(pages, suites, sha)
++        else:
++            runs = complete_runs(pages)
+         phase = "reading commit statuses"
+         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
+                                                        paginate=True, profile_home=profile_home) for s in page]
+diff --git a/hermes_cli/kanban_pr_check_runs.py b/hermes_cli/kanban_pr_check_runs.py
+new file mode 100644
+index 00000000000..1fe4c8341a9
+--- /dev/null
++++ b/hermes_cli/kanban_pr_check_runs.py
+@@ -0,0 +1,94 @@
++"""Complete check-run enumeration and proof of GitHub's ``filter=latest`` view.
++
++For an OPEN PR the evidence is GitHub's commit ``filter=latest`` view, which is
++defined per check suite: the runs of the suite's latest attempt. A rerun
++supersedes the whole earlier attempt (even while the new attempt has no runs),
++and two same-name runs of one attempt are both latest. That is not derivable
++from run IDs or names, so the view is taken from GitHub as is and proven
++complete against the commit's check suites: every latest run belongs to a
++listed suite of the same app and head, and each suite's latest tally equals its
++own ``latest_check_runs_count`` (zero and absent included). Anything
++inconsistent (truncation, malformed identity, a race between the two reads)
++raises ``ValueError``: retry, never guess.
++"""
++
++_SUITE_LIMIT = 1000  # commits/{ref}/check-runs only covers the 1000 newest suites
++
++
++def _positive_id(value, what):
++    if type(value) is not int or value <= 0:
++        raise ValueError(f"Invalid {what} ID")
++    return value
++
++
++def _complete(pages, key, what):
++    """Every page agrees on one count and the pages hold exactly that many unique IDs."""
++    if not isinstance(pages, list) or not pages:
++        raise ValueError(f"Missing {what} pages")
++    total = pages[0]["total_count"]
++    if type(total) is not int or total < 0:
++        raise ValueError(f"Invalid {what} count")
++    rows = []
++    for page in pages:
++        if type(page["total_count"]) is not int or page["total_count"] != total:
++            raise ValueError(f"The {what} count changed during pagination")
++        if not isinstance(page[key], list):
++            raise ValueError(f"Invalid {what} page")
++        rows.extend(page[key])
++    ids = [_positive_id(row["id"], what) for row in rows]
++    if len(rows) != total or len(set(ids)) != total:
++        raise ValueError(f"Incomplete {what} pagination")
++    return rows
++
++
++def complete_runs(pages):
++    """A filtered endpoint's self-consistent count is not a completeness proof."""
++    return _complete(pages, "check_runs", "check-run")
++
++
++def _suite_of(run):
++    suite = run.get("check_suite")
++    if not isinstance(suite, dict):
++        raise ValueError("Check run has no check-suite identity")
++    return _positive_id(suite.get("id"), "check-suite")
++
++
++def _app_of(row):
++    app = row.get("app")
++    if not isinstance(app, dict):
++        raise ValueError("Missing app identity")
++    return _positive_id(app.get("id"), "app")
++
++
++def proven_latest_runs(latest_pages, suite_pages, sha):
++    """GitHub's commit ``filter=latest`` runs, proven complete suite by suite.
++
++    ``latest_pages`` is the paginated ``commits/{sha}/check-runs?filter=latest``
++    response, ``suite_pages`` the paginated ``commits/{sha}/check-suites``
++    response. Returns the latest runs unchanged.
++    """
++    runs = complete_runs(latest_pages)
++    suites = _complete(suite_pages, "check_suites", "check-suite")
++    if len(suites) > _SUITE_LIMIT:
++        raise ValueError("Too many check suites for complete check-run enumeration")
++    expected = {}
++    for suite in suites:
++        count = suite.get("latest_check_runs_count")
++        if type(count) is not int or count < 0:
++            raise ValueError("Invalid latest check-run count")
++        if suite.get("head_sha") != sha:
++            raise ValueError("Check suite belongs to another head")
++        expected[suite["id"]] = (_app_of(suite), count)
++    tally = {}
++    for run in runs:
++        suite_id = _suite_of(run)
++        if suite_id not in expected:
++            raise ValueError("Check run outside the commit's check suites")
++        if _app_of(run) != expected[suite_id][0]:
++            raise ValueError("Check run app differs from its suite")
++        tally[suite_id] = tally.get(suite_id, 0) + 1
++    for suite_id, (_, count) in expected.items():
++        # Zero too: a suite whose latest attempt has no runs must contribute none.
++        if tally.get(suite_id, 0) != count:
++            raise ValueError("Latest check runs disagree with their suite's latest count")
++    return runs
+diff --git a/hermes_cli/kanban_pr_merge_time.py b/hermes_cli/kanban_pr_merge_time.py
+index 930b66c06b7..038856df124 100644
+--- a/hermes_cli/kanban_pr_merge_time.py
++++ b/hermes_cli/kanban_pr_merge_time.py
+@@ -56,23 +56,68 @@ def merge_evidence(receipt, pr, repo, runs, statuses):
+     statuses, post_statuses = partition_at_merge(statuses, merged_at, runs=False)
+     sha = receipt["head_sha"]
+     receipt["post_merge_checks"] = [check_receipt(c, sha) for c in post_runs + post_statuses]
+-    if any(c["conclusion"] in {"failure", "error", "timed_out", "action_required"}
+-           for c in receipt["post_merge_checks"]):
++    landed = pr.get("mergeCommit")
++    if (isinstance(landed, dict) and landed.get("oid") == sha
++            and any(c["conclusion"] in {"failure", "error", "timed_out", "action_required"}
++                    for c in receipt["post_merge_checks"])):
++        branch = pr["baseRefName"]
++        label = repo if branch == "main" else f"{repo}@{branch}"
+         receipt["main_health"] = {
+-            "idempotency_key": f"ci-red:{repo}:{sha}",
+-            "detail": f"Main CI is red for {repo}@{sha}; owned by ci-main-watch, not this PR's acceptance."}
++            "idempotency_key": f"ci-red:{label}:{sha}",
++            "detail": f"Base branch {branch} CI is red for {repo}@{sha}; "
++                      "ci-main-watch owns base health, not this PR's acceptance."}
+     return runs, statuses
+ 
+ 
++def _health_owner_rows(conn, exact_key):
++    # ci-main-watch keys a continuing episode by FIRST red SHA, not current SHA.
++    # Off main its producer label is repo@branch. Match the whole label, not LIKE
++    # (repo/branch names may contain SQL wildcard characters).
++    prefix = exact_key.rsplit(":", 1)[0] + ":"
++    return conn.execute(
++        "SELECT id, status, idempotency_key, created_at FROM tasks "
++        "WHERE created_by='ci-main-watch' "
++        "AND status IN ('triage','todo','scheduled','ready','running','blocked','review') "
++        "AND substr(idempotency_key,1,?)=? "
++        "ORDER BY created_at DESC, id DESC", (len(prefix), prefix)).fetchall()
++
++
+ def annotate_main_health_owner(conn, receipt):
+-    """Use the lifecycle's board scope, never open/write a global board implicitly."""
++    """Diagnostic only: discover existing owners across boards without creating any.
++
++    Other board handles are mode=ro (never the initializing/migrating connect()).
++    Missing, old-schema or unreadable boards cannot change acceptance or prevent
++    its receipt from being persisted. No profile switching or global mutations.
++    """
++    import re
++    import sqlite3
++    from hermes_cli import kanban_lockguard
++    from hermes_cli.kanban_db_workspace import _sibling_board_db_files
++
+     health = receipt.get("main_health")
+     if not health:
+         return
+-    row = conn.execute(
+-        "SELECT id, status FROM tasks WHERE idempotency_key=? "
+-        "ORDER BY created_at DESC, id DESC LIMIT 1", (health["idempotency_key"],)).fetchone()
+-    if row:
+-        health["owner_card"] = row["id"]
+-        health["owner_status"] = row["status"]
+-        health["detail"] += f" Main-health owner card: {row['id']} ({row['status']})."
++    key = health["idempotency_key"]
++    rows = []
++    try:
++        rows.extend(_health_owner_rows(conn, key))
++        paths = _sibling_board_db_files(conn)
++    except (OSError, sqlite3.Error):
++        paths = []
++    for path in paths:
++        try:
++            other = kanban_lockguard.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)
++            try:
++                other.row_factory = sqlite3.Row
++                rows.extend(_health_owner_rows(other, key))
++            finally:
++                other.close()
++        except (OSError, sqlite3.Error):
++            continue
++    rows = [row for row in rows if re.fullmatch(r"[0-9a-f]{40}", row["idempotency_key"].rsplit(":", 1)[-1])]
++    if not rows:
++        return
++    row = max(rows, key=lambda r: (r["idempotency_key"] == key, r["created_at"], r["id"]))
++    health["owner_card"] = row["id"]
++    health["owner_status"] = row["status"]
++    health["detail"] += f" Main-health owner card: {row['id']} ({row['status']})."
+diff --git a/tests/hermes_cli/check_suite_fake.py b/tests/hermes_cli/check_suite_fake.py
+new file mode 100644
+index 00000000000..c3fab376bea
+--- /dev/null
++++ b/tests/hermes_cli/check_suite_fake.py
+@@ -0,0 +1,41 @@
++"""GitHub check-run/check-suite REST shapes for offline acceptance tests.
++
++Runs carry ``check_suite.id`` as GitHub returns them. By default each suite
++has one attempt (its latest view is all of its runs); ``latest`` overrides a
++suite's latest-attempt run IDs, ``suites`` the commit's check-suite list.
++The commit ``filter=latest`` view is the union of every suite's latest runs.
++Per-suite run endpoints are refused: acceptance must not need them.
++"""
++import re
++
++
++def pages(key, rows, total=None):
++    total = len(rows) if total is None else total
++    return [{"total_count": total, key: rows[i:i + 100]} for i in range(0, len(rows), 100)] or \
++        [{"total_count": total, key: []}]
++
++
++def default_suites(runs, sha, latest):
++    suites = {}
++    for run in runs:
++        suites.setdefault(run["check_suite"]["id"], run["app"])
++    return [{"id": sid, "app": app, "head_sha": sha, "status": "completed",
++             "latest_check_runs_count": len(latest.get(sid, []))} for sid, app in suites.items()]
++
++
++def check_api(endpoint, runs, sha, *, latest=None, suites=None):
++    """The response for a check-run/suite endpoint, or None for any other endpoint."""
++    if latest is None:
++        latest = {}
++        for run in runs:
++            latest.setdefault(run["check_suite"]["id"], []).append(run["id"])
++    assert not re.search(r"/check-suites/\d+/check-runs", endpoint), endpoint
++    if re.search(r"/commits/[0-9a-f]{40}/check-runs\?", endpoint):
++        if "filter=all" in endpoint:
++            return pages("check_runs", runs)
++        assert "filter=latest" in endpoint, endpoint
++        ids = {i for suite_ids in latest.values() for i in suite_ids}
++        return pages("check_runs", [run for run in runs if run["id"] in ids])
++    if re.search(r"/commits/[0-9a-f]{40}/check-suites\?", endpoint):
++        return pages("check_suites", default_suites(runs, sha, latest) if suites is None else suites)
++    return None
+diff --git a/tests/hermes_cli/fixtures/pr656_check_runs.json b/tests/hermes_cli/fixtures/pr656_check_runs.json
+new file mode 100644
+index 00000000000..b4e9c6ba22f
+--- /dev/null
++++ b/tests/hermes_cli/fixtures/pr656_check_runs.json
+@@ -0,0 +1,195 @@
++{"_source":"GET repos/daveey/hermes commits/850d52075dc59a3e842e123c9d986f864f370762 check-runs?filter=all, check-runs?filter=latest (commit_latest_ids, in response order), check-suites, and check-suites/{id}/check-runs?filter=latest, recorded 2026-11-02. Suite 112327246670 is workflow run 41450628217: attempt 1 (47 runs, failure) superseded by attempt 2 (cancelled, 0 jobs).","head_sha":"850d52075dc59a3e842e123c9d986f864f370762","app_id":15368,"run_fields":["id","suite","name","status","conclusion","started_at","completed_at"],"runs":[[125316794585,112345022894,"Rerun a runner-lost macOS state job","completed","skipped","2026-11-02T13:55:38Z","2026-11-02T13:55:31Z"],
++[125316496690,112344691340,"CI review comment (live)","completed","success","2026-11-02T13:55:03Z","2026-11-02T13:56:11Z"],
++[125315337718,112343486503,"CI review comment (live)","completed","success","2026-11-02T13:53:15Z","2026-11-02T13:54:00Z"],
++[125315141517,112343719289,"Rerun a runner-lost macOS state job","completed","skipped","2026-11-02T13:52:16Z","2026-11-02T13:52:16Z"],
++[125314714927,112343240685,"CI review comment (live)","completed","cancelled","2026-11-02T13:51:26Z","2026-11-02T13:52:39Z"],
++[125314671504,112342984384,"CI review comment (live)","completed","cancelled","2026-11-02T13:51:21Z","2026-11-02T14:03:56Z"],
++[125313152980,112342132346,"CI review comment (live)","completed","cancelled","2026-11-02T13:48:16Z","2026-11-02T13:57:37Z"],
++[125312467579,112341581472,"Rerun a runner-lost macOS state job","completed","success","2026-11-02T13:47:38Z","2026-11-02T13:47:55Z"],
++[125312321338,112341312010,"CI review comment (live)","completed","cancelled","2026-11-02T13:46:36Z","2026-11-02T13:55:01Z"],
++[125312095251,112341282830,"CI review comment (live)","completed","success","2026-11-02T13:46:29Z","2026-11-02T13:47:37Z"],
++[125312017626,112341228732,"CI review comment (live)","completed","cancelled","2026-11-02T13:46:00Z","2026-11-02T13:51:18Z"],
++[125311978317,112341078078,"CI review comment (live)","completed","cancelled","2026-11-02T13:45:54Z","2026-11-02T13:46:07Z"],
++[125311772984,112340651546,"CI review comment (live)","completed","cancelled","2026-11-02T13:46:04Z","2026-11-02T13:51:23Z"],
++[125310176366,112339728995,"CI review comment (live)","completed","cancelled","2026-11-02T13:42:11Z","2026-11-02T13:45:29Z"],
++[125309791968,112339158604,"CI review comment (live)","completed","cancelled","2026-11-02T13:42:06Z","2026-11-02T13:46:33Z"],
++[125305716628,112336144312,"CI review comment (live)","completed","cancelled","2026-11-02T13:33:00Z","2026-11-02T13:41:20Z"],
++[125305125212,112335519362,"CI review comment (live)","completed","cancelled","2026-11-02T13:32:21Z","2026-11-02T13:45:53Z"],
++[125305004590,112335578353,"Rerun a runner-lost macOS state job","completed","success","2026-11-02T13:32:27Z","2026-11-02T13:32:47Z"],
++[125304619087,112335262272,"CI review comment (live)","completed","skipped","2026-11-02T13:30:44Z","2026-11-02T13:30:43Z"],
++[125304572460,112327246670,"CI timing report","completed","success","2026-11-02T13:30:40Z","2026-11-02T13:31:27Z"],
++[125304475544,112335144719,"CI review comment (live)","completed","skipped","2026-11-02T13:30:26Z","2026-11-02T13:30:26Z"],
++[125304345962,112327246670,"All required checks pass (v2)","completed","failure","2026-11-02T13:30:23Z","2026-11-02T13:30:38Z"],
++[125302326395,112333086001,"CI review comment (live)","completed","success","2026-11-02T13:26:03Z","2026-11-02T13:26:58Z"],
++[125302268358,112333403033,"Rerun a runner-lost macOS state job","completed","success","2026-11-02T13:27:16Z","2026-11-02T13:27:46Z"],
++[125302034905,112333211902,"CI review comment (live)","completed","cancelled","2026-11-02T13:25:27Z","2026-11-02T13:31:45Z"],
++[125301959794,112327246014,"merge","completed","skipped","2026-11-02T13:25:16Z","2026-11-02T13:25:16Z"],
++[125301958112,112327246014,"Docker phase requirements met","completed","skipped","2026-11-02T13:25:16Z","2026-11-02T13:25:16Z"],
++[125301957967,112327246014,"publish","completed","skipped","2026-11-02T13:25:16Z","2026-11-02T13:25:16Z"],
++[125300342117,112331834176,"Rerun a runner-lost macOS state job","completed","skipped","2026-11-02T13:21:54Z","2026-11-02T13:21:54Z"],
++[125299774727,112331381590,"Rerun a runner-lost macOS state job","completed","success","2026-11-02T13:21:36Z","2026-11-02T13:21:56Z"],
++[125299596639,112331077482,"CI review comment (live)","completed","success","2026-11-02T13:20:23Z","2026-11-02T13:21:07Z"],
++[125297578881,112329617478,"CI review comment (live)","completed","skipped","2026-11-02T13:16:10Z","2026-11-02T13:16:10Z"],
++[125296743974,112328806801,"CI review comment (live)","completed","cancelled","2026-11-02T13:14:30Z","2026-11-02T13:26:00Z"],
++[125296045827,112327968160,"CI review comment (live)","completed","cancelled","2026-11-02T13:13:02Z","2026-11-02T13:20:20Z"],
++[125294994548,112327246014,"Build and test image (slim/amd64)","completed","success","2026-11-02T13:11:53Z","2026-11-02T13:25:16Z"],
++[125294994385,112327246014,"Build and test image (desktop/amd64)","completed","success","2026-11-02T13:11:54Z","2026-11-02T13:20:32Z"],
++[125294829881,112327246670,"Python tests / e2e-upgrade (${{ matrix.shard }})","completed","skipped","2026-11-02T13:10:29Z","2026-11-02T13:10:28Z"],
++[125294828672,112327246670,"Python tests / e2e-upgrade-plan","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294827791,112327246670,"Bootstrap installer / install.ps1 protocol surface","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294827769,112327246670,"Python tests / e2e","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294827343,112327246670,"Python lints / ruff + ty diff","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294827062,112327246670,"Python lints / code health ratchet (blocking)","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294826177,112327246670,"Bootstrap installer / install.sh protocol + small fresh-install E2E","completed","success","2026-11-02T13:12:38Z","2026-11-02T13:15:31Z"],
++[125294826157,112327246670,"Python tests / Run tests (4/8)","completed","success","2026-11-02T13:10:40Z","2026-11-02T13:23:02Z"],
++[125294826065,112327246670,"Python tests / Run tests (5/8)","completed","success","2026-11-02T13:14:58Z","2026-11-02T13:27:44Z"],
++[125294826060,112327246670,"Python tests / Run tests (8/8)","completed","success","2026-11-02T13:13:01Z","2026-11-02T13:26:28Z"],
++[125294826017,112327246670,"Python tests / Run tests (6/8)","completed","failure","2026-11-02T13:16:07Z","2026-11-02T13:30:10Z"],
++[125294826012,112327246670,"Python tests / Run tests (2/8)","completed","success","2026-11-02T13:12:05Z","2026-11-02T13:25:12Z"],
++[125294825991,112327246670,"Python tests / Run tests (7/8)","completed","success","2026-11-02T13:12:30Z","2026-11-02T13:25:29Z"],
++[125294825953,112327246670,"Python tests / Run tests (1/8)","completed","success","2026-11-02T13:11:56Z","2026-11-02T13:23:54Z"],
++[125294825948,112327246670,"Python tests / Run tests (3/8)","completed","success","2026-11-02T13:12:29Z","2026-11-02T13:24:46Z"],
++[125294825939,112327246670,"Lint Docker scripts / Lint Dockerfile (hadolint)","completed","success","2026-11-02T13:11:14Z","2026-11-02T13:11:31Z"],
++[125294825863,112327246670,"Remote terminal backends / SSH + Docker backends (real sshd, real daemon)","completed","success","2026-11-02T13:10:48Z","2026-11-02T13:12:06Z"],
++[125294825858,112327246670,"Catalog tests / Catalog tests","completed","success","2026-11-02T13:12:12Z","2026-11-02T13:13:40Z"],
++[125294825830,112327246670,"Check uv.lock / python -m pm.build_env --source . --check-lock","completed","success","2026-11-02T13:10:30Z","2026-11-02T13:11:05Z"],
++[125294825735,112327246670,"package-lock.json diff","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294825734,112327246670,"Desktop E2E","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294825720,112327246670,"Python tests / Termux assembly permissions","completed","success","2026-11-02T13:10:30Z","2026-11-02T13:11:29Z"],
++[125294825615,112327246670,"Python lints / Windows footguns (blocking)","completed","success","2026-11-02T13:10:30Z","2026-11-02T13:11:48Z"],
++[125294825411,112327246670,"Python lints / ruff enforcement (blocking)","completed","success","2026-11-02T13:10:39Z","2026-11-02T13:11:09Z"],
++[125294825380,112327246670,"Deny unrelated histories","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294825215,112327246670,"macOS state required (v1)","completed","success","2026-11-02T13:11:08Z","2026-11-02T13:11:24Z"],
++[125294825153,112327246670,"Desktop core E2E","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294824955,112327246670,"Rust tests / cargo test (bootstrap installer)","completed","success","2026-11-02T13:13:20Z","2026-11-02T13:15:36Z"],
++[125294824848,112327246670,"Supply-chain scan","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294824786,112327246670,"Desktop update E2E","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294824756,112327246670,"OS-specific tests","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294824599,112327246670,"hermes_state (macOS)","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294824550,112327246670,"Prompt surface diff","completed","skipped","2026-11-02T13:10:28Z","2026-11-02T13:10:28Z"],
++[125294824216,112327246670,"Check contributors / check-attribution","completed","success","2026-11-02T13:10:29Z","2026-11-02T13:11:24Z"],
++[125294824186,112327246670,"Check no large binaries / Reject large binaries","completed","success","2026-11-02T13:10:29Z","2026-11-02T13:10:46Z"],
++[125294824171,112327246670,"Icon assets freshness / Regenerate icons + diff against committed","completed","success","2026-11-02T13:11:18Z","2026-11-02T13:12:10Z"],
++[125294824082,112327246670,"Check no committed infographics / check-no-committed-infographics","completed","success","2026-11-02T13:10:29Z","2026-11-02T13:10:44Z"],
++[125294823928,112327246670,"Docs Site / docs-site-checks","completed","success","2026-11-02T13:14:46Z","2026-11-02T13:17:48Z"],
++[125294823799,112327246670,"Check no case-colliding filenames / check-case-collisions","completed","success","2026-11-02T13:10:29Z","2026-11-02T13:10:46Z"],
++[125294823774,112327246670,"No production imports of the tools.lazy_deps stub / No production imports of the tools.lazy_deps stub","completed","success","2026-11-02T13:10:29Z","2026-11-02T13:11:05Z"],
++[125294823733,112327246670,"JS & TS checks / E2E driver runtime-install checks","completed","success","2026-11-02T13:11:03Z","2026-11-02T13:11:40Z"],
++[125294823707,112327246670,"Profile artifact check / Reject profile archives","completed","success","2026-11-02T13:10:29Z","2026-11-02T13:10:47Z"],
++[125294823571,112327246670,"JS & TS checks / JS & TS checks","completed","success","2026-11-02T13:11:26Z","2026-11-02T13:27:27Z"],
++[125294823478,112327246670,"JS & TS checks / Prebuilt TUI install-shape checks","completed","success","2026-11-02T13:12:04Z","2026-11-02T13:13:59Z"],
++[125294794767,112327245759,"nix flake check","completed","success","2026-11-02T13:10:26Z","2026-11-02T13:18:40Z"],
++[125294709756,112327294538,"CI review comment (live)","completed","skipped","2026-11-02T13:10:14Z","2026-11-02T13:10:13Z"],
++[125294705975,112327246014,"Assemble versioned manifest and digest receipt","completed","skipped","2026-11-02T13:10:13Z","2026-11-02T13:10:13Z"],
++[125294705702,112327246014,"Publish tested Docker image (${{ matrix.variant }}/${{ matrix.arch }})","completed","skipped","2026-11-02T13:10:13Z","2026-11-02T13:10:13Z"],
++[125294702749,112327246014,"Detect affected areas","completed","success","2026-11-02T13:10:35Z","2026-11-02T13:10:49Z"],
++[125294653972,112327246670,"Detect affected areas","completed","success","2026-11-02T13:10:08Z","2026-11-02T13:10:27Z"],
++[125294652029,112327246148,"tests/hermes_state (macOS, mini)","completed","success","2026-11-02T13:12:01Z","2026-11-02T13:21:50Z"],
++[125294651948,112327245759,"Detect affected areas","completed","success","2026-11-02T13:10:08Z","2026-11-02T13:10:24Z"],
++[125294651591,112327246014,"Resolve release phase","completed","success","2026-11-02T13:10:08Z","2026-11-02T13:10:13Z"],
++[125294651114,112327245821,"actionlint","completed","success","2026-11-02T13:10:08Z","2026-11-02T13:10:24Z"],
++[125286434089,112312466991,"CI timing report","completed","success","2026-11-02T12:52:10Z","2026-11-02T12:52:53Z"],
++[125286307833,112312466991,"All required checks pass (v2)","completed","success","2026-11-02T12:51:52Z","2026-11-02T12:52:08Z"],
++[125277600100,112312466991,"Supply-chain scan / Aggregate review statuses","completed","success","2026-11-02T12:33:09Z","2026-11-02T12:33:14Z"],
++[125276798044,112312466991,"Python tests / e2e-upgrade (${{ matrix.shard }})","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276796676,112312466991,"Supply-chain scan / Check PyPI dependency upper bounds","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276796497,112312466991,"Python tests / e2e-upgrade-plan","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276796334,112312466991,"Python tests / e2e","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276795909,112312466991,"Check uv.lock","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276795373,112312466991,"Remote terminal backends","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276795368,112312466991,"Lint Docker scripts","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276795208,112312466991,"Docs Site","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276795168,112312466991,"Desktop update E2E","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276795167,112312466991,"package-lock.json diff","completed","skipped","2026-11-02T12:30:47Z","2026-11-02T12:30:46Z"],
++[125276795032,112312466991,"Desktop E2E","completed","skipped","2026-11-02T12:30:46Z","2026-11-02T12:30:46Z"],
++[125276794960,112312466991,"Python tests / Run tests (7/8)","completed","success","2026-11-02T12:34:38Z","2026-11-02T12:47:39Z"],
++[125276794885,112312466991,"Python tests / Run tests (6/8)","completed","success","2026-11-02T12:35:51Z","2026-11-02T12:50:01Z"],
++[125276794877,112312466991,"Python tests / Run tests (8/8)","completed","success","2026-11-02T12:32:31Z","2026-11-02T12:44:03Z"],
++[125276794857,112312466991,"Prompt surface diff / Prompt surface summary","completed","success","2026-11-02T12:32:18Z","2026-11-02T12:33:05Z"],
++[125276794835,112312466991,"Python tests / Run tests (3/8)","completed","success","2026-11-02T12:36:14Z","2026-11-02T12:48:17Z"],
++[125276794797,112312466991,"Python tests / Run tests (5/8)","completed","success","2026-11-02T12:32:49Z","2026-11-02T12:45:52Z"],
++[125276794778,112312466991,"Python tests / Run tests (1/8)","completed","success","2026-11-02T12:39:19Z","2026-11-02T12:51:50Z"],
++[125276794773,112312466991,"Rust tests","completed","skipped","2026-11-02T12:30:46Z","2026-11-02T12:30:46Z"],
++[125276794714,112312466991,"Python tests / Run tests (2/8)","completed","success","2026-11-02T12:31:17Z","2026-11-02T12:44:31Z"],
++[125276794704,112312466991,"Python tests / Run tests (4/8)","completed","success","2026-11-02T12:31:37Z","2026-11-02T12:44:00Z"],
++[125276794622,112312466991,"Bootstrap installer","completed","skipped","2026-11-02T12:30:46Z","2026-11-02T12:30:46Z"],
++[125276794440,112312466991,"Python tests / Termux assembly permissions","completed","success","2026-11-02T12:30:58Z","2026-11-02T12:31:57Z"],
++[125276794427,112312466991,"OS-specific tests","completed","skipped","2026-11-02T12:30:46Z","2026-11-02T12:30:46Z"],
++[125276794361,112312466991,"Python lints / code health ratchet (blocking)","completed","success","2026-11-02T12:32:19Z","2026-11-02T12:32:56Z"],
++[125276794340,112312466991,"hermes_state (macOS)","completed","skipped","2026-11-02T12:30:46Z","2026-11-02T12:30:46Z"],
++[125276794331,112312466991,"Python lints / ruff + ty diff","completed","success","2026-11-02T12:31:34Z","2026-11-02T12:33:20Z"],
++[125276794327,112312466991,"Python lints / ruff enforcement (blocking)","completed","success","2026-11-02T12:32:07Z","2026-11-02T12:32:36Z"],
++[125276794309,112312466991,"Python lints / Windows footguns (blocking)","completed","success","2026-11-02T12:31:46Z","2026-11-02T12:33:28Z"],
++[125276794085,112312466991,"Desktop core E2E","completed","skipped","2026-11-02T12:30:46Z","2026-11-02T12:30:46Z"],
++[125276793871,112312466991,"JS & TS checks","completed","skipped","2026-11-02T12:30:46Z","2026-11-02T12:30:46Z"],
++[125276793694,112312466991,"macOS state required (v1)","completed","success","2026-11-02T12:31:47Z","2026-11-02T12:32:02Z"],
++[125276793488,112312466991,"No production imports of the tools.lazy_deps stub / No production imports of the tools.lazy_deps stub","completed","success","2026-11-02T12:31:22Z","2026-11-02T12:31:56Z"],
++[125276793468,112312466991,"Catalog tests","completed","skipped","2026-11-02T12:30:46Z","2026-11-02T12:30:46Z"],
++[125276793366,112312466991,"Supply-chain scan / Scan PR for critical supply chain risks","completed","success","2026-11-02T12:31:46Z","2026-11-02T12:32:32Z"],
++[125276793213,112312466991,"Profile artifact check / Reject profile archives","completed","success","2026-11-02T12:31:13Z","2026-11-02T12:31:29Z"],
++[125276793204,112312466991,"Check contributors / check-attribution","completed","success","2026-11-02T12:30:48Z","2026-11-02T12:31:44Z"],
++[125276793131,112312466991,"Check no case-colliding filenames / check-case-collisions","completed","success","2026-11-02T12:31:22Z","2026-11-02T12:31:46Z"],
++[125276793078,112312466991,"Deny unrelated histories / check-common-ancestor","completed","success","2026-11-02T12:30:53Z","2026-11-02T12:31:40Z"],
++[125276793035,112312466991,"Check no committed infographics / check-no-committed-infographics","completed","success","2026-11-02T12:31:39Z","2026-11-02T12:32:02Z"],
++[125276792940,112312466991,"Icon assets freshness / Regenerate icons + diff against committed","completed","success","2026-11-02T12:31:24Z","2026-11-02T12:32:24Z"],
++[125276792868,112312466991,"Check no large binaries / Reject large binaries","completed","success","2026-11-02T12:30:48Z","2026-11-02T12:31:03Z"],
++[125276696590,112312466672,"nix flake check","completed","skipped","2026-11-02T12:30:34Z","2026-11-02T12:30:34Z"],
++[125276576819,112312466526,"merge","completed","skipped","2026-11-02T12:30:19Z","2026-11-02T12:30:19Z"],
++[125276576448,112312466526,"Docker phase requirements met","completed","skipped","2026-11-02T12:30:19Z","2026-11-02T12:30:19Z"],
++[125276576233,112312466526,"publish","completed","skipped","2026-11-02T12:30:19Z","2026-11-02T12:30:19Z"],
++[125276575475,112312466526,"Build and test image (${{ matrix.variant }}/${{ matrix.arch }})","completed","skipped","2026-11-02T12:30:19Z","2026-11-02T12:30:19Z"],
++[125276422144,112312466526,"Assemble versioned manifest and digest receipt","completed","skipped","2026-11-02T12:30:00Z","2026-11-02T12:29:59Z"],
++[125276420617,112312466526,"Publish tested Docker image (${{ matrix.variant }}/${{ matrix.arch }})","completed","skipped","2026-11-02T12:29:59Z","2026-11-02T12:29:59Z"],
++[125276418641,112312466526,"Detect affected areas","completed","success","2026-11-02T12:30:01Z","2026-11-02T12:30:18Z"],
++[125276363020,112312466991,"Detect affected areas","completed","success","2026-11-02T12:29:56Z","2026-11-02T12:30:46Z"],
++[125276361469,112312466672,"Detect affected areas","completed","success","2026-11-02T12:30:15Z","2026-11-02T12:30:33Z"],
++[125276361037,112312466526,"Resolve release phase","completed","success","2026-11-02T12:29:53Z","2026-11-02T12:29:59Z"],
++[125276360621,112312466551,"actionlint","completed","success","2026-11-02T12:30:28Z","2026-11-02T12:30:46Z"]],"suite_fields":["id","app_id","head_sha","status","conclusion","latest_check_runs_count"],"suites":[[112312442383,43820,"850d52075dc59a3e842e123c9d986f864f370762","queued",null,0],
++[112312442919,10529,"850d52075dc59a3e842e123c9d986f864f370762","queued",null,0],
++[112312443487,73253,"850d52075dc59a3e842e123c9d986f864f370762","queued",null,0],
++[112312444101,4233992,"850d52075dc59a3e842e123c9d986f864f370762","queued",null,0],
++[112312444731,1210556,"850d52075dc59a3e842e123c9d986f864f370762","queued",null,0],
++[112312445592,4049964,"850d52075dc59a3e842e123c9d986f864f370762","queued",null,0],
++[112312466526,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",8],
++[112312466551,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112312466672,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",2],
++[112312466991,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",46],
++[112327245759,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",2],
++[112327245821,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112327246014,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",9],
++[112327246148,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112327246670,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",0],
++[112327294538,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","skipped",1],
++[112327968160,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112328806801,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112329617478,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","skipped",1],
++[112330931471,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",0],
++[112331077482,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112331381590,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112331834176,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","skipped",1],
++[112332961097,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",0],
++[112333086001,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112333211902,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112333403033,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112335144719,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","skipped",1],
++[112335262272,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","skipped",1],
++[112335519362,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112335578353,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112336144312,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112339158604,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112339728995,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112340651546,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112341078078,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112341228732,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112341282830,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112341312010,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112341581472,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112342132346,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112342984384,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112343240685,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",1],
++[112343486503,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112343719289,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","skipped",1],
++[112344290583,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","cancelled",0],
++[112344691340,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","success",1],
++[112345022894,15368,"850d52075dc59a3e842e123c9d986f864f370762","completed","skipped",1]],"suite_latest_ids":{"112312466526":[125276361037,125276418641,125276420617,125276422144,125276575475,125276576233,125276576448,125276576819],"112312466551":[125276360621],"112312466672":[125276361469,125276696590],"112312466991":[125276363020,125276792868,125276792940,125276793035,125276793078,125276793131,125276793204,125276793213,125276793366,125276793468,125276793488,125276793694,125276793871,125276794085,125276794309,125276794327,125276794331,125276794340,125276794361,125276794427,125276794440,125276794622,125276794704,125276794714,125276794773,125276794778,125276794797,125276794835,125276794857,125276794877,125276794885,125276794960,125276795032,125276795167,125276795168,125276795208,125276795368,125276795373,125276795909,125276796334,125276796497,125276796676,125276798044,125277600100,125286307833,125286434089],"112327245759":[125294651948,125294794767],"112327245821":[125294651114],"112327246014":[125294651591,125294702749,125294705702,125294705975,125294994385,125294994548,125301957967,125301958112,125301959794],"112327246148":[125294652029],"112327246670":[],"112327294538":[125294709756],"112327968160":[125296045827],"112328806801":[125296743974],"112329617478":[125297578881],"112331077482":[125299596639],"112331381590":[125299774727],"112331834176":[125300342117],"112333086001":[125302326395],"112333211902":[125302034905],"112333403033":[125302268358],"112335144719":[125304475544],"112335262272":[125304619087],"112335519362":[125305125212],"112335578353":[125305004590],"112336144312":[125305716628],"112339158604":[125309791968],"112339728995":[125310176366],"112340651546":[125311772984],"112341078078":[125311978317],"112341228732":[125312017626],"112341282830":[125312095251],"112341312010":[125312321338],"112341581472":[125312467579],"112342132346":[125313152980],"112342984384":[125314671504],"112343240685":[125314714927],"112343486503":[125315337718],"112343719289":[125315141517],"112344691340":[125316496690],"112345022894":[125316794585]},
++"commit_latest_ids":[125316794585,125316496690,125315337718,125315141517,125314714927,125314671504,125313152980,125312467579,125312321338,125312095251,125312017626,125311978317,125311772984,125310176366,125309791968,125305716628,125305125212,125305004590,125304619087,125304475544,125302326395,125302268358,125302034905,125301959794,125301958112,125301957967,125300342117,125299774727,125299596639,125297578881,125296743974,125296045827,125294994548,125294994385,125294794767,125294709756,125294705975,125294705702,125294702749,125294652029,125294651948,125294651591,125294651114,125286434089,125286307833,125277600100,125276798044,125276796676,125276796497,125276796334,125276795909,125276795373,125276795368,125276795208,125276795168,125276795167,125276795032,125276794960,125276794885,125276794877,125276794857,125276794835,125276794797,125276794778,125276794773,125276794714,125276794704,125276794622,125276794440,125276794427,125276794361,125276794340,125276794331,125276794327,125276794309,125276794085,125276793871,125276793694,125276793488,125276793468,125276793366,125276793213,125276793204,125276793131,125276793078,125276793035,125276792940,125276792868,125276696590,125276576819,125276576448,125276576233,125276575475,125276422144,125276420617,125276418641,125276363020,125276361469,125276361037,125276360621]}
+\ No newline at end of file
+diff --git a/tests/hermes_cli/test_kanban_main_health_owner.py b/tests/hermes_cli/test_kanban_main_health_owner.py
+new file mode 100644
+index 00000000000..ed935ddee2f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_main_health_owner.py
+@@ -0,0 +1,105 @@
++"""Main-health owner annotations are best-effort, read-only, and non-authoritative."""
++import sqlite3
++from copy import deepcopy
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++from hermes_cli.kanban_pr_merge_time import annotate_main_health_owner
++
++SHA = "a" * 40
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
++    kb.init_db()
++    with connect() as conn:
++        yield conn
++
++
++def receipt(branch="main", ok=True):
++    label = "acme/repo" if branch == "main" else f"acme/repo@{branch}"
++    return {"ok": ok, "classification": "success" if ok else "failure", "main_health": {
++        "idempotency_key": f"ci-red:{label}:{SHA}", "detail": "CI red; ci-main-watch."}}
++
++
++def owner(conn, key, status="running", creator="ci-main-watch"):
++    tid = kb.create_task(conn, title="Repair main", idempotency_key=key, created_by=creator)
++    conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++    conn.commit()
++    return tid
++
++
++@pytest.mark.parametrize("status", ["ready", "running", "scheduled", "done", "archived", None])
++def test_only_active_owner_is_annotated_without_writes(board, status):
++    expected = None
++    if status:
++        tid = owner(board, f"ci-red:acme/repo:{SHA}", status)
++        if status not in {"done", "archived"}:
++            expected = tid
++    value = receipt()
++    before = board.total_changes
++    annotate_main_health_owner(board, value)
++    assert value["main_health"].get("owner_card") == expected
++    assert value["ok"] is True and value["classification"] == "success"
++    assert board.total_changes == before
++
++
++@pytest.mark.parametrize("branch", ["main", "release/test"])
++@pytest.mark.parametrize("other_board", [False, True])
++@pytest.mark.parametrize("ok", [False, True])
++def test_first_red_streak_owner_across_boards(board, branch, other_board, ok):
++    label = "acme/repo" if branch == "main" else f"acme/repo@{branch}"
++    key = f"ci-red:{label}:" + "b" * 40
++    if other_board:
++        kb.create_board("ci-owners")
++        with connect(board="ci-owners") as other:
++            tid = owner(other, key)
++    else:
++        tid = owner(board, key)
++    # A newer closed exact-SHA card cannot eclipse the active streak owner.
++    owner(board, f"ci-red:{label}:{SHA}", "done")
++    owner(board, f"ci-red:{label}:" + "c" * 40, creator="someone-else")
++    owner(board, "ci-red:acme/repository:" + "d" * 40)
++    value = receipt(branch, ok)
++    before = board.total_changes
++    annotate_main_health_owner(board, value)
++    assert value["main_health"].get("owner_card") == tid
++    assert value["ok"] is ok
++    assert value["classification"] == ("success" if ok else "failure")
++    assert board.total_changes == before
++
++
++def test_owner_lookup_failure_does_not_change_acceptance(board):
++    value = receipt()
++    before = deepcopy(value)
++    class Unreadable:
++        def execute(self, *args):
++            raise sqlite3.OperationalError("unreadable diagnostic board")
++
++    annotate_main_health_owner(Unreadable(), value)
++    assert value == before
++
++
++def test_sibling_open_is_read_only_and_missing_db_not_created(board, monkeypatch, tmp_path):
++    from hermes_cli import kanban_db_workspace as workspace
++    from hermes_cli import kanban_lockguard
++
++    path = tmp_path / "absent.db"
++    monkeypatch.setattr(workspace, "_sibling_board_db_files", lambda conn: [path])
++    real_connect = kanban_lockguard.connect
++    calls = []
++
++    def observed(database, **kwargs):
++        calls.append(database)
++        assert database.endswith("?mode=ro") and kwargs["uri"] is True
++        return real_connect(database, **kwargs)
++
++    monkeypatch.setattr(kanban_lockguard, "connect", observed)
++    value = receipt()
++    annotate_main_health_owner(board, value)
++    assert calls and not path.exists()
++    assert value["ok"] and "owner_card" not in value["main_health"]
+diff --git a/tests/hermes_cli/test_kanban_pr_acceptance.py b/tests/hermes_cli/test_kanban_pr_acceptance.py
+index 31f1b3eaa07..b6e35116662 100644
+--- a/tests/hermes_cli/test_kanban_pr_acceptance.py
++++ b/tests/hermes_cli/test_kanban_pr_acceptance.py
+@@ -29,11 +29,17 @@ def github(tmp_path, monkeypatch):
+                     "defaultBranchRef": {"name": "main", "branchProtectionRule": rule}}}}
+             elif "/rules/branches/" in self.path:
+                 value = [[]]
++            elif "/check-suites" in self.path:
++                # One suite holding every served run: OPEN proves its latest view against it.
++                suite_sha = self.path.split("/commits/", 1)[1].split("/", 1)[0]
++                count = 100 + (0 if state.get("missing") else 1)
++                value = [{"total_count": 1, "check_suites": [{
++                    "id": 7, "app": {"id": 1}, "head_sha": suite_sha, "latest_check_runs_count": count}]}]
+             elif "/check-runs" in self.path:
+                 run = {"id": 42, "name": "required", "head_sha": sha,
+                        "started_at": "2026-11-02T12:51:52Z",
+                        "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+-                       "html_url": "https://github.com/acme/repo/actions/runs/42"}
++                       "html_url": "https://github.com/acme/repo/actions/runs/42", "check_suite": {"id": 7}}
+                 if state.get("stale"):
+                     run["head_sha"] = "b" * 40
+                 runs = [] if state.get("missing") else [run]
+diff --git a/tests/hermes_cli/test_kanban_pr_enumeration.py b/tests/hermes_cli/test_kanban_pr_enumeration.py
+new file mode 100644
+index 00000000000..25bcaaf03d7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_enumeration.py
+@@ -0,0 +1,276 @@
++"""Check-run evidence enumeration, replayed offline from PR #656's exact head.
++
++``fixtures/pr656_check_runs.json`` holds GitHub's recorded responses for head
++850d520 (reduced to the fields acceptance reads): 147 runs across 39 suites
++(``filter=all``), the commit's ``filter=latest`` view (100 run IDs, in
++response order), the commit's 48 check suites, and each suite's
++``filter=latest`` run IDs. The required failure 125304345962 belongs to
++workflow run 41450628217, whose attempt 1 (47 runs) was superseded by an
++attempt 2 that was cancelled before creating any job, so GitHub's latest view
++of that suite is empty. No live GitHub or board writes occur here.
++"""
++import json
++from copy import deepcopy
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_pr_acceptance as acceptance
++from tests.hermes_cli.check_suite_fake import check_api, pages
++from tests.hermes_cli.test_kanban_pr_merge_time import NAME, POST, PRE, SHA
++
++RECORDED = json.loads((Path(__file__).parent / "fixtures" / "pr656_check_runs.json").read_text())
++MAIN_SUITE = 112327246670  # push CI on main: attempt 1 failed, attempt 2 empty
++PR_SUITE = 112312466991    # pull_request CI: one successful attempt
++
++
++def recorded():
++    runs = [{**dict(zip(RECORDED["run_fields"], row)), "head_sha": SHA, "app": {"id": RECORDED["app_id"]}}
++            for row in RECORDED["runs"]]
++    for row in runs:
++        row["check_suite"] = {"id": row.pop("suite")}
++    suites = []
++    for row in RECORDED["suites"]:
++        suite = dict(zip(RECORDED["suite_fields"], row))
++        suite["app"] = {"id": suite.pop("app_id")}
++        suites.append(suite)
++    latest = {int(k): v for k, v in RECORDED["suite_latest_ids"].items()}
++    return runs, suites, latest
++
++
++def run(check, suite):
++    return {**deepcopy(check), "check_suite": {"id": suite}}
++
++
++@pytest.fixture
++def replay(monkeypatch):
++    state = {"runs": [run(POST, MAIN_SUITE), run(PRE, PR_SUITE)], "latest": None, "suites": None,
++             "state": "OPEN", "merge": SHA, "app": 15368, "branch": "main", "requests": []}
++
++    def api(endpoint, **kwargs):
++        state["requests"].append(endpoint)
++        if endpoint == "graphql":
++            state["query"] = kwargs["query"]
++            return {"data": {"repository": {"pullRequest": {
++                "headRefOid": SHA, "baseRefName": state["branch"], "state": state["state"],
++                "mergedAt": "2026-11-02T13:10:04Z", "mergeCommit": {"oid": state["merge"]},
++                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
++                    {"context": NAME, "app": {"databaseId": state["app"]}}]}}}}}}
++        if "/rules/branches/" in endpoint:
++            return [[]]
++        if "pages" in state and "/commits/" in endpoint and "/check-runs?" in endpoint:
++            return state["pages"]
++        if "suite_pages" in state and "/commits/" in endpoint and "/check-suites?" in endpoint:
++            return state["suite_pages"]
++        checks = check_api(endpoint, state["runs"], SHA, latest=state["latest"], suites=state["suites"])
++        if checks is not None:
++            return checks
++        if "/statuses?" in endpoint:
++            return [[]]
++        if "/pulls/" in endpoint:
++            return {"head": {"sha": SHA}, "base": {"ref": state["branch"]},
++                    "state": "closed" if state["state"] == "MERGED" else "open",
++                    "merged": state["state"] == "MERGED"}
++        pytest.fail(endpoint)
++
++    monkeypatch.setattr(acceptance, "_api", api)
++    return state
++
++
++def collect():
++    return acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
++
++
++def check_requests(state):
++    return [u for u in state["requests"] if "/check-runs" in u or "/check-suites" in u]
++
++
++def test_recorded_commit_latest_view_is_each_suites_latest_attempt(replay):
++    runs, suites, latest = recorded()
++    by_id = {r["id"]: r for r in runs}
++    commit_latest = [by_id[i] for i in RECORDED["commit_latest_ids"]]
++    # 147 historical runs, 100 latest: exactly the union of every suite's latest
++    # attempt, and the 47-run superseded attempt 1 of MAIN_SUITE is not in it.
++    assert (len(runs), len(commit_latest), len(suites)) == (147, 100, 48)
++    assert set(RECORDED["commit_latest_ids"]) == {i for ids in latest.values() for i in ids}
++    assert latest[MAIN_SUITE] == [] and POST["id"] not in RECORDED["commit_latest_ids"]
++    assert sum(s["latest_check_runs_count"] for s in suites) == 100
++    replay.update(runs=runs, suites=suites, pages=pages("check_runs", commit_latest))
++    receipt = collect()
++    assert receipt["ok"], receipt
++    assert [c["id"] for c in receipt["checks"]] == [PRE["id"]]
++    # Two reads, no exhaustive or per-suite enumeration.
++    assert check_requests(replay) == [
++        f"repos/acme/repo/commits/{SHA}/check-runs?per_page=100&filter=latest",
++        f"repos/acme/repo/commits/{SHA}/check-suites?per_page=100"]
++
++
++def test_recorded_failure_retained_while_its_attempt_is_latest(replay):
++    # The same 147/39 history before attempt 2: 147 latest runs, past one page.
++    runs, suites, latest = recorded()
++    latest[MAIN_SUITE] = [r["id"] for r in runs if r["check_suite"]["id"] == MAIN_SUITE]
++    for suite in suites:
++        if suite["id"] == MAIN_SUITE:
++            suite["latest_check_runs_count"] = 47
++    replay.update(runs=runs, suites=suites, latest=latest)
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "failure"
++    assert {c["id"]: c["classification"] for c in receipt["checks"]} == {
++        PRE["id"]: "success", POST["id"]: "failure"}
++
++
++def test_recorded_superseded_runs_in_latest_view_fail_closed(replay):
++    # A latest view still carrying attempt 1 disagrees with the suite's own count of 0.
++    runs, suites, _ = recorded()
++    replay.update(runs=runs, suites=suites, latest=None)
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "infra"
++
++
++def test_open_retains_failed_run_of_another_suite(replay):
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "failure"
++    assert {c["id"] for c in receipt["checks"]} == {PRE["id"], POST["id"]}
++
++
++def test_two_same_name_runs_in_one_latest_attempt_are_both_retained(replay):
++    # A newest-ID-per-name guess would keep only the newer success.
++    failed = run({**PRE, "conclusion": "failure"}, 1)
++    passed = run({**PRE, "id": PRE["id"] + 1}, 1)
++    replay.update(runs=[failed, passed], latest={1: [failed["id"], passed["id"]]})
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "failure"
++    assert sorted(c["id"] for c in receipt["checks"]) == [failed["id"], passed["id"]]
++
++
++@pytest.mark.parametrize("first,rerun,ok", [("failure", "success", True), ("success", "failure", False)])
++def test_rerun_attempt_supersedes_the_earlier_attempt(replay, first, rerun, ok):
++    old = run({**PRE, "conclusion": first}, 1)
++    new = run({**POST, "conclusion": rerun}, 1)
++    replay.update(runs=[old, new], latest={1: [new["id"]]})
++    receipt = collect()
++    assert receipt["ok"] is ok
++    assert [c["id"] for c in receipt["checks"]] == [POST["id"]]
++
++
++def _big_suite(state):
++    filler = [run({**PRE, "id": i, "name": f"optional {i}"}, 1) for i in range(1, 151)]
++    state["runs"] = filler + [run(PRE, 1)]
++    return filler
++
++
++def test_latest_view_past_one_page_is_paginated(replay):
++    _big_suite(replay)
++    assert len(check_api(f"repos/acme/repo/commits/{SHA}/check-runs?per_page=100&filter=latest",
++                         replay["runs"], SHA) or []) == 2
++    assert collect()["ok"]
++
++
++def test_latest_view_capped_below_suite_count_fails_closed(replay):
++    # A self-consistent count is not completeness: the suite says 151 latest runs.
++    filler = _big_suite(replay)
++    replay["pages"] = [{"total_count": 100, "check_runs": filler[:100]}]
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "infra"
++
++
++def _suite(**changes):
++    return {"id": 1, "app": {"id": 15368}, "head_sha": SHA, "latest_check_runs_count": 1, **changes}
++
++
++def _many_suites(n):
++    return [_suite()] + [_suite(id=i, latest_check_runs_count=0) for i in range(2, n + 1)]
++
++
++FAULTS = {
++    # latest view pagination and identity
++    "short": lambda r, s, l: l[0].update(total_count=2),
++    "changed_total": lambda r, s, l: l.append({"total_count": 2, "check_runs": []}),
++    "duplicate": lambda r, s, l: l[0]["check_runs"].append(r),
++    "no_pages": lambda r, s, l: l.clear(),
++    "bad_suite": lambda r, s, l: r.update(check_suite={"id": None}),
++    "no_suite": lambda r, s, l: r.pop("check_suite"),
++    "bad_id": lambda r, s, l: r.update(id=None),
++    "no_app": lambda r, s, l: r.pop("app"),
++    # check-suite list
++    "suites_short": lambda r, s, l: s[0].update(total_count=2),
++    "no_suite_pages": lambda r, s, l: s.clear(),
++    "bad_suite_id": lambda r, s, l: s[0]["check_suites"][0].update(id=0),
++    "orphan_run": lambda r, s, l: s[0]["check_suites"][0].update(id=2),
++    "suite_head": lambda r, s, l: s[0]["check_suites"][0].update(head_sha="b" * 40),
++    "suite_app": lambda r, s, l: s[0]["check_suites"][0].update(app={"id": 99}),
++    "bad_latest_count": lambda r, s, l: s[0]["check_suites"][0].update(latest_check_runs_count=None),
++    "negative_latest_count": lambda r, s, l: s[0]["check_suites"][0].update(latest_check_runs_count=-1),
++    "too_many_suites": lambda r, s, l: s.__setitem__(slice(None), pages("check_suites", _many_suites(1001))),
++    # per-suite tally
++    "count_above_tally": lambda r, s, l: s[0]["check_suites"][0].update(latest_check_runs_count=2),
++    "zero_count_with_runs": lambda r, s, l: s[0]["check_suites"][0].update(latest_check_runs_count=0),
++    "absent_suite_with_count": lambda r, s, l: s[0].update(
++        total_count=2, check_suites=[*s[0]["check_suites"], _suite(id=2)]),
++}
++
++
++def _evidence(state, fault=None):
++    good = run(PRE, 1)
++    suite_pages = pages("check_suites", [_suite()])
++    latest_pages = [{"total_count": 1, "check_runs": [good]}]
++    if fault:
++        FAULTS[fault](good, suite_pages, latest_pages)
++    state.update(runs=[good], pages=latest_pages, suite_pages=suite_pages)
++
++
++def test_uncorrupted_control_passes(replay):
++    _evidence(replay)
++    assert collect()["ok"]
++
++
++@pytest.mark.parametrize("n", [2, 1000])
++def test_absent_zero_count_suites_pass_up_to_the_suite_limit(replay, n):
++    _evidence(replay)
++    replay["suite_pages"] = pages("check_suites", _many_suites(n))
++    assert collect()["ok"]
++
++
++@pytest.mark.parametrize("fault", sorted(FAULTS))
++def test_incomplete_malformed_or_racing_evidence_fails_closed(replay, fault):
++    _evidence(replay, fault)
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "infra", fault
++
++
++@pytest.mark.parametrize("fault", ["other_app", "stale_head", "queued_rerun"])
++def test_latest_selection_cannot_hide_strict_evidence(replay, fault):
++    old = run(PRE, 1)
++    new = run(POST, 1)
++    latest = None
++    if fault == "other_app":
++        # Another app's run is its own suite and stays visible to an unpinned context.
++        replay["app"] = None
++        new.update(app={"id": 99}, check_suite={"id": 2})
++    elif fault == "stale_head":
++        new.update(head_sha="b" * 40, conclusion="success")
++    else:
++        new.update(status="queued", conclusion=None, started_at=None, completed_at=None)
++        latest = {1: [new["id"]]}
++    replay.update(runs=[old, new], latest=latest)
++    assert not collect()["ok"]
++
++
++@pytest.mark.parametrize("landed", [SHA, "b" * 40, None])
++def test_main_health_requires_proven_landed_head(replay, landed):
++    replay.update(state="MERGED", merge=landed)
++    receipt = collect()
++    assert receipt["ok"]
++    assert receipt["post_merge_checks"][0]["classification"] == "failure"
++    assert ("main_health" in receipt) is (landed == SHA)
++    assert "mergeCommit" in replay["query"]
++    # MERGED keeps the exhaustive history (cut at merge), not the latest view.
++    assert check_requests(replay) == [f"repos/acme/repo/commits/{SHA}/check-runs?per_page=100&filter=all"]
++
++
++def test_same_second_red_start_is_ambiguous_not_postmerge(replay):
++    replay.update(state="MERGED")
++    replay["runs"][0]["started_at"] = "2026-11-02T13:10:04Z"
++    receipt = collect()
++    assert not receipt["ok"] and receipt["classification"] == "pending"
++    assert not receipt["post_merge_checks"]
+diff --git a/tests/hermes_cli/test_kanban_pr_merge_time.py b/tests/hermes_cli/test_kanban_pr_merge_time.py
+index 2179b33fe38..62cdd948772 100644
+--- a/tests/hermes_cli/test_kanban_pr_merge_time.py
++++ b/tests/hermes_cli/test_kanban_pr_merge_time.py
+@@ -4,16 +4,17 @@ from copy import deepcopy
+ import pytest
+ 
+ from hermes_cli import kanban_pr_acceptance as acceptance
++from tests.hermes_cli.check_suite_fake import check_api
+ 
+ SHA = "850d52075dc59a3e842e123c9d986f864f370762"
+ MERGED = "2026-11-02T13:10:04Z"
+ NAME = "All required checks pass (v2)"
+ PRE = {"id": 125286307833, "name": NAME, "head_sha": SHA, "app": {"id": 15368},
+        "status": "completed", "conclusion": "success", "started_at": "2026-11-02T12:51:52Z",
+-       "completed_at": "2026-11-02T12:52:08Z"}
++       "completed_at": "2026-11-02T12:52:08Z", "check_suite": {"id": 112312466991}}
+ POST = {"id": 125304345962, "name": NAME, "head_sha": SHA, "app": {"id": 15368},
+         "status": "completed", "conclusion": "failure", "started_at": "2026-11-02T13:30:23Z",
+-        "completed_at": "2026-11-02T13:30:38Z"}
++        "completed_at": "2026-11-02T13:30:38Z", "check_suite": {"id": 112327246670}}
+ 
+ 
+ @pytest.fixture
+@@ -26,16 +27,17 @@ def evidence(monkeypatch):
+         if endpoint == "graphql":
+             return {"data": {"repository": {"pullRequest": {
+                 "headRefOid": SHA, "baseRefName": "main", "state": state["state"],
+-                "mergedAt": state["merged_at"], "baseRef": {"branchProtectionRule": {
++                "mergedAt": state["merged_at"], "mergeCommit": {"oid": state["landed"]},
++                "baseRef": {"branchProtectionRule": {
+                     "requiredStatusChecks": [{"context": NAME, "app": {"databaseId": state["app"]}}]}}}}}}
+         if "/rules/branches/" in endpoint:
+             return [[]]
+-        if "/check-runs?" in endpoint:
++        if "/commits/" in endpoint and "/check-runs?" in endpoint and "filter=all" in endpoint:
+             runs = state["runs"]
+-            if "filter=latest" in endpoint:
+-                # Reduced single-suite history; latest retains other suites in real responses.
+-                runs = [max(runs, key=lambda r: r["id"])] if runs else []
+             return [{"total_count": len(runs) + state.get("omitted", 0), "check_runs": runs}]
++        checks = check_api(endpoint, state["runs"], SHA)
++        if checks is not None:
++            return checks
+         if "/statuses?" in endpoint:
+             return [state["statuses"]]
+         if "/pulls/" in endpoint:
+@@ -71,13 +73,17 @@ def test_run_finishing_after_merge_remains_pending_at_merge(evidence, conclusion
+     assert not receipt["ok"] and receipt["classification"] == "pending"
+ 
+ 
+-def test_open_still_uses_latest_without_cutoff(evidence):
++def test_open_uses_latest_view_without_cutoff(evidence):
++    # PR #656's pre- and post-merge runs live in different suites: both are latest.
+     evidence["state"] = "OPEN"
+     receipt = collect()
+     assert not receipt["ok"] and receipt["classification"] == "failure"
+-    assert receipt["checks"][0]["id"] == POST["id"]
++    assert {c["id"]: c["classification"] for c in receipt["checks"]} == {
++        PRE["id"]: "success", POST["id"]: "failure"}
+     assert receipt["post_merge_checks"] == []
+-    assert any("filter=latest" in url for url in evidence["requests"])
++    assert [u for u in evidence["requests"] if "/check-" in u] == [
++        f"repos/acme/repo/commits/{SHA}/check-runs?per_page=100&filter=latest",
++        f"repos/acme/repo/commits/{SHA}/check-suites?per_page=100"]
+ 
+ 
+ @pytest.mark.parametrize("result", ["failure", "missing", "pending"])
+@@ -125,6 +131,17 @@ def test_rebased_landing_still_uses_original_head(evidence):
+     assert not any(evidence["landed"] in url for url in evidence["requests"])
+ 
+ 
++@pytest.mark.parametrize("landed", ["rebased", "missing"])
++def test_post_merge_red_on_unlanded_head_is_not_main_health(evidence, landed):
++    # A rebase landed another SHA: a later red run on the PR head is not base CI.
++    evidence["landed"] = "b" * 40 if landed == "rebased" else None
++    receipt = collect()
++    assert receipt["ok"] and receipt["classification"] == "success"
++    assert [c["id"] for c in receipt["post_merge_checks"]] == [POST["id"]]
++    assert receipt["post_merge_checks"][0]["classification"] == "failure"
++    assert "main_health" not in receipt
++
++
+ def status(check, result):
+     return {"id": check["id"], "context": NAME, "state": result,
+             "created_at": check["started_at"], "target_url": "https://example.com/ci"}
+@@ -221,7 +238,8 @@ def test_completion_receipt_names_main_health_owner(evidence, owner_state):
+     with connect() as conn:
+         owner = None
+         if owner_state:
+-            owner = kb.create_task(conn, title="Main health", idempotency_key=f"ci-red:acme/repo:{SHA}")
++            owner = kb.create_task(conn, title="Main health", created_by="ci-main-watch",
++                                   idempotency_key=f"ci-red:acme/repo:{SHA}")
+             conn.execute("UPDATE tasks SET status=? WHERE id=?", (owner_state, owner))
+         task = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+         assert kb.complete_task(conn, task, summary="verified", metadata={
+@@ -229,7 +247,8 @@ def test_completion_receipt_names_main_health_owner(evidence, owner_state):
+         receipt = json.loads(conn.execute(
+             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (task,)).fetchone()[0])
+         assert receipt["ok"]
+-        assert receipt["main_health"].get("owner_card") == owner
++        active_owner = owner if owner_state == "ready" else None
++        assert receipt["main_health"].get("owner_card") == active_owner
+         assert "ci-main-watch" in receipt["main_health"]["detail"]
+-        if owner:
+-            assert owner in receipt["main_health"]["detail"]
++        if active_owner:
++            assert active_owner in receipt["main_health"]["detail"]
+-- 
+2.55.0
+

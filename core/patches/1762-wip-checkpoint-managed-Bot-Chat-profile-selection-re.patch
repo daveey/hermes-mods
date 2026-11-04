@@ -1,0 +1,187 @@
+From f87e1d7dc9634d8e06f4be615ebe6dace0295282 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 19:38:50 +0000
+Subject: [PATCH] wip: checkpoint managed Bot Chat profile selection regression
+ [daveey]
+
+---
+ gateway/session_managed_worker.py             | 11 ++-
+ gateway/session_profile_selection.py          | 41 +++++++++
+ tests/gateway/test_bot_chat_managed_follow.py | 83 +++++++++++++++++++
+ 3 files changed, 131 insertions(+), 4 deletions(-)
+ create mode 100644 gateway/session_profile_selection.py
+ create mode 100644 tests/gateway/test_bot_chat_managed_follow.py
+
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index 57297743d2b..03ff4c02449 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -77,8 +77,11 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
+         **({'display_v1': row['payload']['display_v1']} if row['payload'].get('display_v1') else {})})
+     from gateway.session_worker_construct import construct_inputs
+     request['construct_v1'] = construct_inputs(authority, policy, live.source.chat_id)
+-    config = _worker_config(authority, policy)
+-    hydrated = replace(policy, config_json=json.dumps(config), request_json=json.dumps(request),
++    config, model = policy.effective(authority)
++    config = _worker_config(authority, policy, config=config)
++    from gateway.session_profile_selection import commit_selection
++    commit_selection(authority, ref, policy, config, model, scope['generation'])
++    hydrated = replace(policy, model=model, config_json=json.dumps(config), request_json=json.dumps(request),
+                        terminal_json=json.dumps(terminal), credential_ref=None, config_secret_ref=None)
+     return {'version': 1, 'home': authority.profile_id, 'scope': scope,
+             'policy': asdict(hydrated), 'api_key': route_launch_key(authority, policy, config),
+@@ -89,13 +92,13 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
+             'safe_mode': policy.safe_mode, 'ignore_user_config': policy.ignore_user_config}
+ 
+ 
+-def _worker_config(authority, policy):
++def _worker_config(authority, policy, *, config=None):
+     """The frozen session config the child binds as its only config (``bind_worker_policy``).
+     ``command_allowlist`` is approval state rather than launch policy: an ``always`` grant an
+     earlier worker of an ordinary session persisted, or one the operator removed by hand, comes
+     from the live profile file, as it did before the child's config was frozen. Bypass sessions
+     never read the profile."""
+-    config = policy.config(authority)
++    config = policy.config(authority) if config is None else config
+     home = Path(str(authority.profile_id))
+     if policy.ignore_user_config or not home.is_absolute():
+         return config
+diff --git a/gateway/session_profile_selection.py b/gateway/session_profile_selection.py
+new file mode 100644
+index 00000000000..3e51c2b25c6
+--- /dev/null
++++ b/gateway/session_profile_selection.py
+@@ -0,0 +1,41 @@
++"""Owner-committed selections of a managed session that follows its profile."""
++import json
++from dataclasses import asdict
++
++from hermes_state_runtime import RuntimeStoreError
++
++PREFIX = 'gateway.profile_selection.v1.'
++
++
++def commit_selection(authority, ref, policy, config, model, generation):
++    """Authorize this effective selection, not arbitrary exact-pin failover.
++
++    Only the owner calls this with the single profile read it sends to the child. The durable
++    launch policy must still be this following policy. Remember the selection independently of
++    runtime usage stamps so rebuilding an unchanged selection never re-arms a consumed intent.
++    """
++    if not policy.follows_profile or policy.ignore_user_config:
++        return
++    from agent.model_routing_switch_intent import record_in_transaction
++    from hermes_state_local import POLICY_PREFIX
++    from hermes_state_runtime import _epoch
++    provider = (config.get('model') or {}).get('provider') or ''
++    selected = json.dumps([model, provider])
++    expected = json.loads(json.dumps(asdict(policy)))
++
++    def write(conn):
++        _epoch(conn, authority.epoch)
++        receipt = conn.execute('SELECT value FROM state_meta WHERE key=?',
++                               (POLICY_PREFIX + ref.session_id,)).fetchone()
++        row = conn.execute('SELECT runtime_generation FROM sessions WHERE id=?', (ref.session_id,)).fetchone()
++        if (receipt is None or json.loads(receipt[0])['policy'] != expected
++                or row is None or row[0] != generation):
++            raise RuntimeStoreError('revision_conflict')
++        key = PREFIX + ref.session_id
++        old = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
++        if old is not None and old[0] == selected:
++            return
++        record_in_transaction(conn, ref.session_id, model, provider, generation)
++        conn.execute('INSERT INTO state_meta (key,value) VALUES (?,?) '
++                     'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, selected))
++    authority.db._execute_write(write)
+diff --git a/tests/gateway/test_bot_chat_managed_follow.py b/tests/gateway/test_bot_chat_managed_follow.py
+new file mode 100644
+index 00000000000..54b2edd2a17
+--- /dev/null
++++ b/tests/gateway/test_bot_chat_managed_follow.py
+@@ -0,0 +1,83 @@
++"""Bot Chat policy following composed with durable exact-pin allocation and managed workers."""
++import json
++
++import pytest
++
++from tests.gateway.test_model_switch_worker_composed import (
++    home, OPUS, ASTRA, _owner, _noop, _worker_build, _allocation, _pinned_opus,
++)
++from tests.gateway.test_bot_chat_follows_profile import _open, _legacy
++
++
++def _profile_pick(home, model, provider):
++    from hermes_cli.config import atomic_config_write
++    from hermes_cli.config import read_user_config_raw
++    config = read_user_config_raw(home / 'config.yaml')
++    config['model'].update(default=model, provider=provider)
++    atomic_config_write(home / 'config.yaml', config)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('entry', ['resume', 'adoption'])
++@pytest.mark.parametrize('held', [False, True], ids=['follow', 'composer-hold'])
++async def test_managed_bot_follows_profile_across_exact_pins(home, monkeypatch, entry, held):
++    from gateway.session_local_migration import resolve_local_target
++    from gateway.session_policy import policy_for_source
++    from run_agent import AIAgent
++    store, db, authority, owner, ref = _owner(home, monkeypatch, _noop)
++    authority.runner._peek_session_state = lambda key: None
++    try:
++        if entry == 'resume':
++            _pinned_opus(home, authority, db, ref, monkeypatch)
++            db.set_session_title(ref.session_id, 'Bot Chat')
++            if held:
++                db.patch_session_model_config(ref.session_id, {
++                    'composer_override_profile': {'model': ASTRA, 'provider': 'openai-codex'}})
++        else:
++            sid = 'legacy-bot'
++            saved = {'provider': 'anthropic'}
++            if held:
++                saved['composer_override_profile'] = {'model': ASTRA, 'provider': 'openai-codex'}
++            _legacy(db, home, sid, source='gui', model=OPUS, title='Bot Chat', model_config=saved)
++            AIAgent(model=OPUS, provider='anthropic', session_id=sid, session_db=db,
++                    quiet_mode=True, skip_memory=True, skip_context_files=True)
++            assert _allocation(home, sid)['exact_pin']
++        _profile_pick(home, ASTRA, 'openai-codex')
++        if entry == 'adoption':
++            authority._native_legacy_transports = {owner.actor.transport_id: owner.actor}
++            ref = resolve_local_target(authority, owner.actor, sid)
++        await _open(authority, ref)
++        policy = policy_for_source(authority.runner, authority.sessions[ref.session_id].source)
++        assert policy.follows_profile
++        assert policy.effective(authority)[1] == (OPUS if held else ASTRA)
++        agent = _worker_build(authority, db, ref, monkeypatch, 'follow-first')
++        assert (agent.model, agent.provider) == ((OPUS, 'anthropic') if held else (ASTRA, 'openai-codex'))
++        # No further resume: the already-following policy must take later profile changes too.
++        _profile_pick(home, OPUS, 'anthropic')
++        agent = _worker_build(authority, db, ref, monkeypatch, 'follow-second')
++        assert (agent.model, agent.provider) == (OPUS, 'anthropic')
++        _profile_pick(home, ASTRA, 'openai-codex')
++        agent = _worker_build(authority, db, ref, monkeypatch, 'follow-third')
++        assert (agent.model, agent.provider) == (ASTRA, 'openai-codex')
++        assert _allocation(home, ref.session_id)['selected_model'] == ASTRA
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++async def test_ordinary_exact_pin_does_not_follow_profile(home, monkeypatch):
++    from agent.model_routing import ModelRoutingError
++    from run_agent import AIAgent
++    store, db, authority, owner, ref = _owner(home, monkeypatch, _noop)
++    try:
++        before = _pinned_opus(home, authority, db, ref, monkeypatch)
++        _profile_pick(home, ASTRA, 'openai-codex')
++        assert _worker_build(authority, db, ref, monkeypatch, 'ordinary').model == OPUS
++        with pytest.raises(ModelRoutingError, match='cannot fail over'):
++            AIAgent(model=ASTRA, provider='openai-codex', session_id=ref.session_id, session_db=db,
++                    quiet_mode=True, skip_memory=True, skip_context_files=True)
++        assert _allocation(home, ref.session_id) == before
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
+-- 
+2.55.0
+

@@ -1,0 +1,173 @@
+From 685020a940f0289df3d0297e373b5ae6c2c22c01 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:09:22 +0000
+Subject: [PATCH] [daveey] Desktop poll cost: drain timeout reads the read-only
+ raw config; board_paths reads kanban.sync once
+
+/api/status resolved the restart drain timeout through read_raw_config(), which deep-copies the whole user config
+(~2.6 ms per poll on David-MBP); board_paths() re-read kanban.sync once per board on every session-list poll.
+Tests RED first.
+---
+ hermes_cli/gateway.py                         |  5 +-
+ hermes_cli/kanban_db_sync.py                  |  6 +-
+ hermes_cli/kanban_sync_client.py              |  3 +-
+ tests/hermes_cli/test_kanban_sync_client.py   | 18 ++++++
+ .../test_restart_drain_timeout_readonly.py    | 62 +++++++++++++++++++
+ 5 files changed, 89 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_restart_drain_timeout_readonly.py
+
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 23b0548baad..dcbb6114522 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -53,6 +53,7 @@ from hermes_cli.config import (
+     is_managed,
+     managed_error,
+     read_raw_config,
++    read_raw_config_readonly,
+     save_env_value,
+     write_platform_config_field,
+ )
+@@ -3544,7 +3545,9 @@ def _get_restart_drain_timeout() -> float:
+     """Return the configured gateway restart drain timeout in seconds."""
+     raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
+     if not raw:
+-        cfg = read_raw_config()
++        # [daveey] Read-only view: every Desktop /api/status poll lands here, and read_raw_config() deep-copies the
++        # whole config for this one key.
++        cfg = read_raw_config_readonly()
+         agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+         raw = str(agent_cfg.get("restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT))
+     return parse_restart_drain_timeout(raw)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 9187ebea9f0..99133669900 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -298,13 +298,13 @@ def board_slug_for_path(db_path: str) -> str:
+     return "default"
+ 
+ 
+-def board_selected(db_path: str) -> bool:
++def board_selected(db_path: str, config: Optional[Mapping[str, Any]] = None) -> bool:
+     """``kanban.sync.boards`` lists the boards that sync (absent = every board). A shadow copy and a link-only board
+-    always do."""
++    always do. ``config``: an already-read ``sync_config()`` (a caller checking many boards reads it once)."""
+     from pathlib import Path
+     if Path(db_path).parent.name in (SHADOW_DIR, LINKS_DIR):
+         return True
+-    boards = sync_config().get("boards")
++    boards = (sync_config() if config is None else config).get("boards")
+     if not isinstance(boards, (list, tuple)):
+         return True
+     return board_slug_for_path(db_path) in {str(b) for b in boards}
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 20f1a90fb4c..23a82c2099e 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -336,7 +336,8 @@ def board_paths() -> list[tuple[str, Path]]:
+     links_dir = root / "kanban" / sync.LINKS_DIR
+     if links_dir.is_dir():  # boards only another gateway has, where this gateway's chats have cards
+         found += [(p.stem, p) for p in sorted(links_dir.glob("*.db")) if BOARD_ID_RE.match(p.stem) and p.stem not in local]
+-    return [(slug, path) for slug, path in found if sync.board_selected(str(path))]
++    config = sync.sync_config()  # [daveey] once, not per board: every Desktop session-list poll lands here
++    return [(slug, path) for slug, path in found if sync.board_selected(str(path), config)]
+ 
+ 
+ def ensure_link_boards(slugs: Iterable[str], gateway: str) -> list[str]:
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index d639f2db773..c5cd6f8e0ea 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -940,3 +940,21 @@ def test_board_discovery_skips_the_archive_folder(kanban_home):
+         d.mkdir(parents=True, exist_ok=True)
+         sqlite3.connect(d / "kanban.db").close()
+     assert [s for s, _ in ksc.board_paths()] == ["runners"]
++
++
++def test_board_discovery_reads_the_sync_config_once(kanban_home, monkeypatch):
++    """[daveey] Every Desktop session-list poll enumerates the replicas (``kanban_session_activity._replica_paths``):
++    one ``kanban.sync`` read per board re-read the kanban config 8x per poll on David-MBP (t_01a19d0bcab45558)."""
++    support.write_sync_config(kanban_home, True)
++    for slug in ("alpha", "beta", "gamma"):
++        d = kanban_home / "kanban" / "boards" / slug
++        d.mkdir(parents=True, exist_ok=True)
++        (d / "board.json").write_text("{}", encoding="utf-8")
++        sqlite3.connect(d / "kanban.db").close()
++    reads = []
++    real = sync.sync_config
++    monkeypatch.setattr(sync, "sync_config", lambda: reads.append(1) or real())
++    assert [s for s, _ in ksc.board_paths()] == ["alpha", "beta", "gamma"]
++    assert len(reads) == 1
++    monkeypatch.setattr(sync, "sync_config", lambda: {**real(), "boards": ["beta"]})
++    assert [s for s, _ in ksc.board_paths()] == ["beta"]
+diff --git a/tests/hermes_cli/test_restart_drain_timeout_readonly.py b/tests/hermes_cli/test_restart_drain_timeout_readonly.py
+new file mode 100644
+index 00000000000..f845c3a5c9a
+--- /dev/null
++++ b/tests/hermes_cli/test_restart_drain_timeout_readonly.py
+@@ -0,0 +1,62 @@
++"""The restart drain-timeout reader reads the cached raw config without copying it. [daveey]
++
++Every Desktop ``/api/status`` poll resolves the restart drain timeout (``_fts_rebuild_status`` ->
++``web_server_lifecycle._resolve_restart_drain_timeout``); ``read_raw_config()`` deep-copied the whole user config for
++one key (~2.6 ms per poll on David-MBP, t_01a19d0bcab45558). It only reads, so it uses the read-only view.
++"""
++
++from __future__ import annotations
++
++import os
++
++import pytest
++
++import hermes_cli.config as cfg
++from hermes_cli import gateway as gw
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
++    monkeypatch.delenv("HERMES_CRON_DRAIN_TIMEOUT", raising=False)
++    return home
++
++
++@pytest.fixture
++def copies(monkeypatch):
++    calls = []
++    real = cfg.copy.deepcopy
++
++    def spy(obj, *a, **k):
++        calls.append(1)
++        return real(obj, *a, **k)
++
++    monkeypatch.setattr(cfg.copy, "deepcopy", spy)
++    return calls
++
++
++def _write(path, text):
++    old = path.stat() if path.exists() else None
++    path.write_text(text, encoding="utf-8")
++    if old is not None:
++        bumped = max(old.st_mtime_ns, path.stat().st_mtime_ns) + 5_000_000_000
++        os.utime(path, ns=(bumped, bumped))
++
++
++def test_cached_reads_do_not_copy_the_config(home, copies):
++    _write(home / "config.yaml", "agent:\n  restart_drain_timeout: 42\n")
++    assert gw._get_restart_drain_timeout() == 42
++    copies.clear()
++    for _ in range(3):
++        assert gw._get_restart_drain_timeout() == 42
++    assert copies == []
++
++
++def test_a_config_edit_shows_on_the_next_read(home, copies):
++    _write(home / "config.yaml", "agent:\n  restart_drain_timeout: 42\n")
++    assert gw._get_restart_drain_timeout() == 42
++    _write(home / "config.yaml", "agent:\n  restart_drain_timeout: 7\n")
++    assert gw._get_restart_drain_timeout() == 7
+-- 
+2.55.0
+

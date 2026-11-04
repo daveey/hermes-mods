@@ -1,0 +1,553 @@
+From 0c57293711f6fd7cd56be001bc2ee1d9b2e11410 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 02:15:40 +0000
+Subject: [PATCH] fix(kanban): kanban_create refuses a second owner of one
+ red-CI failure (same failing test or Actions run) [daveey]
+
+Five cards owned test_busy_board_open_does_not_block_session_poll on 11-02 (run 41516070553) and two owned the
+termux assembly failure on 11-03: their titles share too few words for the word-overlap rule. A card now names
+failing tests (title test_ names, node ids in a failing sentence of the opening paragraph, FAILED log lines) and
+Actions runs; an open card naming the same test function, or the same run when neither names a test, refuses the
+create (create_overlap) unless lineage, waits-on, recovers, a citation of the owner's id, or distinct_from applies.
+t_01a19ea9f1739df6
+---
+ hermes_cli/kanban_overlap.py                  |  99 ++++++-
+ tests/tools/kanban_overlap_failure_cases.json | 123 +++++++++
+ .../test_kanban_create_overlap_failure.py     | 246 ++++++++++++++++++
+ 3 files changed, 464 insertions(+), 4 deletions(-)
+ create mode 100644 tests/tools/kanban_overlap_failure_cases.json
+ create mode 100644 tests/tools/test_kanban_create_overlap_failure.py
+
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index e91ac239c2f..449d16552d7 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -46,7 +46,7 @@ import os
+ import re
+ import sqlite3
+ from pathlib import Path
+-from typing import Callable, Iterable, Optional
++from typing import Callable, Iterable, NamedTuple, Optional
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -127,12 +127,99 @@ def singleton_job(title: str) -> Optional[str]:
+     return None
+ 
+ 
++# Failure identity (t_01a19ea9f1739df6). One red-CI failure, five owners in 23 min on 11-02: the cards named the same
++# failing test (``test_busy_board_open_does_not_block_session_poll``) or the same Actions run (41516070553), but their
++# titles shared too few words for the overlap above. A card NAMES a failing test when its title carries a pytest
++# function name (``test_\w+``), its body's opening paragraph carries a node id (``tests/…py::test_…``) in a sentence
++# that says it fails, or its body has a pytest ``FAILED <node id>`` line (ci_main_watch lists them). A node id
++# elsewhere in a body is context or a verification step ("the regression test tests/…::test_x checks …"), not the
++# failure. A card names a run by ``actions/runs/<id>`` anywhere in its title or body.
++_NODE = re.compile(r"(?<![\w-])(?:[\w.-]+/)*(test_\w+)\.py::(?:[A-Za-z_]\w*::)*(test_\w+)")
++_BARE_TEST = re.compile(r"(?<![\w/.:-])(test_\w*[a-z0-9])(?![\w.:/-])")
++_RUN = re.compile(r"\bactions/runs/(\d{6,})\b")
++_FAILING = re.compile(
++    r"FAILED|\bfail(?:s|ed|ing|ure|ures)?\b|[a-z]Error\b|\btime[sd]?[ -]?out\b|\btiming out\b"
++    r"|flak(?:e|es|y|iness)\b|\bred\b|\bbroken\b|\bregress\w*|\bhangs?\b", re.IGNORECASE)
++_FAILED_LINE = re.compile(r"^[\s|║>*`-]*FAILED\s+(.*)$", re.MULTILINE)
++_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
++_FAILURE_LEAD = 800  # the opening states the failure; later sections are context, history and verification steps
++_MIN_TEST_NAME = 10  # "test_" + 5: "test_main" or "test_ok" names too many unrelated tests
++_CARD_ID = re.compile(r"\bt_[0-9a-f]{8,16}\b")
++
++
++class FailureIdentity(NamedTuple):
++    tests: frozenset  # failing test functions (parameters dropped)
++    modules: frozenset  # test modules of the node ids named
++    bare: frozenset  # test names in the title without a module (may be a module: "test_kanban_db spawn tests fail")
++    runs: frozenset  # GitHub Actions run ids
++
++
++def _node_names(text: str) -> tuple[set[str], set[str]]:
++    funcs, mods = set(), set()
++    if "::" in text:
++        for m in _NODE.finditer(text):
++            mods.add(m.group(1))
++            funcs.add(m.group(2))
++    return funcs, mods
++
++
++def failure_identity(title: str, body: str) -> FailureIdentity:
++    """The failing tests and CI runs a card is about (see the comment above). Pure; never raises on text."""
++    title, body = title or "", (body or "")[:_BODY_SCAN]
++    funcs, mods = _node_names(title)
++    bare = {t for t in _BARE_TEST.findall(_NODE.sub(" ", title) if "::" in title else title)
++            if len(t) >= _MIN_TEST_NAME}
++    funcs |= bare
++    lead = body.strip().split("\n\n", 1)[0][:_FAILURE_LEAD]
++    if "::" in lead:
++        for sentence in _SENTENCE.split(lead):
++            if "::" in sentence and _FAILING.search(_NODE.sub(" ", sentence)):
++                f, m = _node_names(sentence)
++                funcs, mods = funcs | f, mods | m
++    if "FAILED" in body and not funcs:
++        # Only a card whose subject is the log list (ci_main_watch: "main is red", then FAILED lines). A card that
++        # already named its test pastes a job tail whose FAILED lines include OTHER tests of that job.
++        for line in _FAILED_LINE.findall(body):
++            f, m = _node_names(line)
++            funcs, mods = funcs | f, mods | m
++    runs = set(_RUN.findall(title)) | (set(_RUN.findall(body)) if "actions/runs/" in body else set())
++    return FailureIdentity(frozenset(f for f in funcs if len(f) >= _MIN_TEST_NAME), frozenset(mods),
++                           frozenset(bare), frozenset(runs))
++
++
++def same_failure(new: FailureIdentity, card: FailureIdentity) -> Optional[str]:
++    """Why two cards own one failure, else None: the same failing test function (a title's bare name may be the
++    other card's test module), or the same Actions run when neither card names a failing test. One run fails many
++    tests, so two cards naming different tests of one run are different failures."""
++    tests = (new.tests & card.tests) | (new.bare & card.modules) | (card.bare & new.modules)
++    if tests:
++        return "same failing test " + ", ".join(sorted(tests)[:3])
++    runs = new.runs & card.runs
++    if runs and not new.tests and not card.tests:
++        return "same CI run " + ", ".join(f"actions/runs/{r}" for r in sorted(runs)[:3])
++    return None
++
++
++def _failure_reason(why: str) -> bool:
++    return why.startswith(("same failing test ", "same CI run "))
++
++
++def cites(card_id: str, title: str, body: str) -> bool:
++    """The new card names ``card_id``: written knowing that card (a follow-up, an unstick, a split of its scope)."""
++    return card_id in set(_CARD_ID.findall(f"{title}\n{(body or '')[:_BODY_SCAN]}"))
++
++
+ def _reasons(card: dict, new_words: set[str], title: str, body: str, target_board: str,
+-             gateways: Iterable[str] = ()) -> tuple[list[str], float]:
++             gateways: Iterable[str] = (), failure: Optional[FailureIdentity] = None) -> tuple[list[str], float]:
+     reasons, score = [], 0.0
+     job = singleton_job(title)
+     if job and job == singleton_job(card.get("title") or ""):
+         reasons.append(f"same singleton job: {job}")
++    if failure is not None and (failure.tests or failure.runs):
++        why = same_failure(failure, failure_identity(card.get("title") or "", card.get("body") or ""))
++        if why:
++            reasons.append(why)
++            score = 1.0
+     theirs = words(card.get("title") or "")
+     shared = new_words & theirs
+     # A board named in passing (a path, a log line) is not enough: the titles must share a word too. A plain-word
+@@ -147,7 +234,7 @@ def _reasons(card: dict, new_words: set[str], title: str, body: str, target_boar
+             and _names_board(card["board"], title, body, gateways)):
+         reasons.append(f"the new card names board {card['board']!r}")
+     if new_words and theirs:
+-        score = len(shared) / max(len(new_words), len(theirs))
++        score = max(score, len(shared) / max(len(new_words), len(theirs)))
+         if len(shared) >= MIN_SHARED and score >= 0.5:
+             reasons.append(f"titles share {len(shared)} words ({', '.join(sorted(shared))})")
+     return reasons, score
+@@ -522,6 +609,7 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+         waiting = capability_owner_waiting_id(title, body)
+         new_words = words(title)
+         job = singleton_job(title)
++        failure = failure_identity(title, body)
+         out, seen, mine = [], set(), None
+         cards = [*_local_cards(self_gw), *_replica_cards(self_gw)]
+         gateways = {g for g in (self_gw, *(c["gateway"] for c in cards)) if g}
+@@ -542,13 +630,16 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+                     or (family and card.get("key_family") == family)):
+                 continue
+             seen.add((card["gateway"], card["id"]))
+-            reasons, score = _reasons(card, new_words, title, body, target_board, gateways)
++            reasons, score = _reasons(card, new_words, title, body, target_board, gateways, failure)
+             if not reasons:
+                 continue
+             if mine is None:
+                 mine = _identity(title, body, gateways)
+             admit = (f"waits on {card['id']}" if waits_on(card["id"], title, body)
+                      else f"recovers {card['id']}" if recovers(card["id"], title, card.get("title") or "")
++                     # A failure-only match the new card cites by id was written knowing that owner.
++                     else f"cites {card['id']}" if (all(_failure_reason(r) for r in reasons)
++                                                    and cites(card["id"], title, body))
+                      else _distinct(mine, _identity(card.get("title") or "", card.get("body") or "", gateways)))
+             if admit and not singleton:
+                 # Logged so an audit can tell an admitted look-alike from a missed one.
+diff --git a/tests/tools/kanban_overlap_failure_cases.json b/tests/tools/kanban_overlap_failure_cases.json
+new file mode 100644
+index 00000000000..1bc58a9c34f
+--- /dev/null
++++ b/tests/tools/kanban_overlap_failure_cases.json
+@@ -0,0 +1,123 @@
++{
++ "t_01a19dfe46a7b2a3": {
++  "title": "Fix red main CI: daveey/hermes (since ac613a6e)",
++  "body": "main of daveey/hermes is red at ac613a6e (2026-11-02 20:40 UTC):\n\n- CI: failure on ac613a6e https://github.com/daveey/hermes/actions/runs/41516070553\n  failed jobs: Python tests / Run tests (6/8), All required checks pass (v2)\n  failed tests:\n  - FAILED tests/hermes_cli/test_kanban_open_session_isolation.py::test_busy_board_open_does_not_block_session_poll[True-True]\n- Docker Build, Test, and Publish: failure on ac613a6e https://github.com/daveey/hermes/actions/runs/41516069658\n  failed jobs: Build and test image (desktop/amd64)\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until each workflow has a green push run on main, or a newer completed green workflow_dispatch run whose SHA compares identical or ahead of its latest completed push run.",
++  "key": "ci-red:daveey/hermes:ac613a6e3cc310ca02bf098e0bc525259d33cab8",
++  "created_by": "ci-main-watch",
++  "created": 1793652049,
++  "body_deployed": "main of daveey/hermes is red at ac613a6e (2026-11-02 20:40 UTC):\n\n- CI: failure on ac613a6e https://github.com/daveey/hermes/actions/runs/41516070553\n  failed jobs: Python tests / Run tests (6/8), All required checks pass (v2)\n- Docker Build, Test, and Publish: failure on ac613a6e https://github.com/daveey/hermes/actions/runs/41516069658\n  failed jobs: Build and test image (desktop/amd64)\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until each workflow has a green push run on main, or a newer completed green workflow_dispatch run whose SHA compares identical or ahead of its latest completed push run."
++ },
++ "t_01a19e02884dee02": {
++  "title": "Fix main CI timeout in test_busy_board_open_does_not_block_session_poll[True-True]",
++  "body": "Main CI run https://github.com/daveey/hermes/actions/runs/41516070553 at ac613a6e3cc310ca02bf098e0bc525259d33cab8 failed in Python shard 6/8 job 125525586833: tests/hermes_cli/test_kanban_open_session_isolation.py::test_busy_board_open_does_not_block_session_poll[True-True] - TimeoutError. Direct job logs confirm failure, flaky_kanban 0. Investigate with five-whys and fix root cause, preserving isolation assertions; do not widen retries. Search overlapping owners before editing. Acceptance: deterministic reproduction, focused tests including loaded scheduling conditions, merged PR with required exact-head CI and verified main CI passing target. This is separate from frozen-clock registry test fixed in PR690, whose file passed 21 tests first attempt on same main run.",
++  "key": "fix:main:busy-board-open-poll:true-true",
++  "created_by": "default",
++  "created": 1793652328
++ },
++ "t_01a19e082c8721b1": {
++  "title": "Fix session-open isolation CI TimeoutError on test_busy_board_open_does_not_block_session_poll[True-True]",
++  "body": "Follow-up from t_01a19dddd6ef7732, PR694 exact head c4e83c4a5b40d3d66f20bd5af066f40e26e63dcf CI run41520397394 job125535098783 fails tests/hermes_cli/test_kanban_open_session_isolation.py::test_busy_board_open_does_not_block_session_poll[True-True] with TimeoutError both first run and automatic retry. Log saved /home/ubuntu/.hermes/kanban/workspaces/t_01a19dddd6ef7732/shard7.log, also GH job logs. PR694 only changes overlap logic/tests, not this file. Trace actual failure neutrally; root not established. Prior PR475 landed cf4ec3f1a15; reviewer t_01a194ff2376cbec is done, no current matching owner found by cross_task. Fix per five-whys and core-dev skill in separate hermes-core-wt. Acceptance: evidence-backed cause plus not-caught chain, deterministic RED/GREEN retaining isolation semantics, whole affected file canonical runner plus targeted scheduling stress if timing implicated; independently review; ship with exact-head required CI and patch-id integrity. Notify parent card with merged fix SHA; parent will rebase PR694 if needed. No parent edge because parent delivery may need this fix first.",
++  "key": "fix:session-open-isolation:pr694-timeout",
++  "created_by": "default",
++  "created": 1793652698
++ },
++ "t_01a19e12c1eba138": {
++  "title": "Fix pre-existing busy-board session poll isolation timeout (warm same-board case)",
++  "body": "While task t_01a19deafed4a2ba tests PR689 mutations, unrelated existing tests/hermes_cli/test_kanban_open_session_isolation.py::test_busy_board_open_does_not_block_session_poll[True-True] repeatedly times out at future.result(timeout=4). Reproduced both original HEAD production and six-line stat-memo fix; evidence hub /home/ubuntu/.hermes/kanban/workspaces/t_01a19deafed4a2ba/kanban-open-isolation-head.log and kanban-open-isolation-recheck.log. New run kanban-related-suite.log repeats failure (6.20s). Diagnose with five-whys; preserve isolation/latency acceptance, fix root rather than widening deadlines. Use own core worktree; don't edit parent's worktree. Parent touches only _read_local_boards in kanban_session_activity.py + new mutation tests, so flag hotspot if touching same file. Acceptance: exact failing parameter and all open/close/lifecycle isolation files green using scripts/run_tests.sh; red/green deterministic repro; ship core PR with exact-head CI and merge. No dependency on parent delivery; independent baseline defect.",
++  "key": "fix-busy-board-poll-timeout-warm-same-board",
++  "created_by": "default",
++  "created": 1793653391
++ },
++ "t_01a19f0a4d82213d": {
++  "title": "Fix red main CI: daveey/hermes (since 108897f2)",
++  "body": "main of daveey/hermes is red at 108897f2 (2026-11-03 01:33 UTC):\n\n- CI: failure on 108897f2 https://github.com/daveey/hermes/actions/runs/41555531824\n  failed jobs: Python tests / Termux assembly permissions, All required checks pass (v2)\n  failed tests:\n  - FAILED tests/scripts/test_termux_assembly_permissions.py::test_assembly_publishes_facts_as_termux_uid_and_returns_host_owned_output[success]\n  - FAILED tests/scripts/test_termux_assembly_permissions.py::test_assembly_publishes_facts_as_termux_uid_and_returns_host_owned_output[failed-build]\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until each workflow has a green push run on main, or a newer completed green workflow_dispatch run whose SHA compares identical or ahead of its latest completed push run.",
++  "key": "ci-red:daveey/hermes:108897f28e93d75d1477d56882771814a03740e9",
++  "created_by": "ci-main-watch",
++  "created": 1793669614,
++  "body_deployed": "main of daveey/hermes is red at 108897f2 (2026-11-03 01:33 UTC):\n\n- CI: failure on 108897f2 https://github.com/daveey/hermes/actions/runs/41555531824\n  failed jobs: Python tests / Termux assembly permissions, All required checks pass (v2)\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until each workflow has a green push run on main, or a newer completed green workflow_dispatch run whose SHA compares identical or ahead of its latest completed push run."
++ },
++ "t_01a19f0a4cc8b092": {
++  "title": "Fix main CI: test_termux_assembly_permissions FileExistsError on reused HERMES_TEST_DOCKER_MOUNT_ROOT payload dir",
++  "body": "Main CI run https://github.com/daveey/hermes/actions/runs/41556904515 (head c34694e325d), job \"Python tests / Termux assembly permissions\" (125665322801) failed:\n\n```\nFAILED tests/scripts/test_termux_assembly_permissions.py::test_assembly_publishes_facts_as_termux_uid_and_returns_host_owned_output[success] - FileExistsError: [Errno 17] File exists: '/opt/actions-runner/_work/_temp/termux-assembly/test_assembly_publishes_facts_0/payload'\n(same for [failed-build], ..._1/payload)\n```\n\nCause (from the code at tests/scripts/test_termux_assembly_permissions.py:51): with `HERMES_TEST_DOCKER_MOUNT_ROOT` set, the payload dir is `mount_root / tmp_path.name / \"payload\"`. `tmp_path.name` (`test_assembly_publishes_facts_0`) is only unique within one pytest basetemp, but the mount root is a runner-temp dir shared across runs on the long-lived docker-ci runner, so a leftover from a previous run collides and `mkdir(parents=True)` raises.\n\nFix: make the per-test dir unique and owned by the test (e.g. `tempfile.mkdtemp(dir=mount_root)` or include a uuid/pid), and clean it up in a finalizer (contents may be owned by the container uid: use the same container to chown/rm, or rm with tolerant handling). Do not just add exist_ok=True (stale content from another run would leak into the assertions).\n\nDone when: the PR is merged to main and the Termux assembly permissions job is green on main's next CI run. Prior related deflake cards: t_01a1899a15eff3c8, t_01a187714d4b30a9 (done).",
++  "key": "main-ci:termux-assembly-mountroot-collision",
++  "created_by": "default",
++  "created": 1793669614
++ },
++ "t_62ce7dc1": {
++  "title": "daveey/hermes: flaky tests/gateway/test_session_api.py::test_interim_commentary_reaches_session_sse_and_responses_stream on hub runners",
++  "body": "Found while getting main CI green (t_7131b872, PR https://github.com/daveey/hermes/pull/32).\n\nThe test fails intermittently on the self-hosted hermes-hub runners:\n- FAILED on main push run https://github.com/daveey/hermes/actions/runs/39886244584 (job 120195193519, \"Python tests / Run tests (1/2)\"): `assert [] == [('Checking the docs first.', False)]` at tests/gateway/test_session_api.py:1377. The session SSE stream had no `assistant.commentary` event; `assistant.completed` was present.\n- PASSED in PR #30 run 39886091334 on the same code (except #30's one-line workflow change).\n\nWhat we know: `_commentary` (gateway/platforms/api_server.py ~3657) calls `events.enqueue`, and `_SessionEventQueue.enqueue` hops to the loop with `call_soon_threadsafe` when it runs off-loop. The fake agent calls `interim(...)` inside `run_conversation`. Find out why the event goes missing under load. It might be an ordering race between the enqueue hop and `run_agent`'s completion, something leaking from an earlier test in the file (gateway config / display.interim_assistant_messages cache), or an executor/loop mismatch. If it's a real product race, so commentary can be lost or reordered after `assistant.completed`, fix the product code, not the test.\n\nRepro: run the file on hermes-hub (`ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes ubuntu@192.0.2.10`), under load and in a loop, with scripts/run_tests.sh. Fork commits are tagged `[daveey]`. Merge once the PR's CI is green. Done when there's a root cause, a fix merged, and 20+ loop runs green.",
++  "key": null,
++  "created_by": "default",
++  "created": 1792724681
++ },
++ "t_bdb6c497": {
++  "title": "Fix red main CI: daveey/hermes (since f5ec2367)",
++  "body": "main of daveey/hermes is red at 9cdafef2 (2026-10-23 03:00 UTC):\n\n- CI: cancelled on 9cdafef2 https://github.com/daveey/hermes/actions/runs/39886244584\n  failed jobs: JS & TS checks / JS & TS checks, Python tests / Run tests (1/2), All required checks pass (v2)\n- Termux verification: failure on 15bd9424 https://github.com/daveey/hermes/actions/runs/39883176310\n  failed jobs: Prebuilt TUI checks, Termux packaging contracts on Linux, Detect R2 credentials\n- .github/workflows/lockfile-diff.yml: failure on 15bd9424 https://github.com/daveey/hermes/actions/runs/39883175189\n- Docker Build, Test, and Publish: failure on 813413ee https://github.com/daveey/hermes/actions/runs/39833033372\n  failed jobs: Resolve release phase\n- Nix flake check: failure on 813413ee https://github.com/daveey/hermes/actions/runs/39833033437\n  failed jobs: Detect affected areas\n- auto-fix lint issues & formatting: failure on d5f8a69c https://github.com/daveey/hermes/actions/runs/39724765530\n  failed jobs: Generate eslint --fix patch\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until a green push run exists for main.",
++  "key": "ci-red:daveey/hermes:f5ec2367c980e0b1d6bad394705671236bbc39de",
++  "created_by": "ci-main-watch",
++  "created": 1792724421
++ },
++ "t_fa55aeb4": {
++  "title": "Fix red main CI: daveey/hermes (since 16c20ad1)",
++  "body": "main of daveey/hermes is red at 16c20ad1 (2026-10-26 22:23 UTC):\n\n- CI: failure on 16c20ad1 https://github.com/daveey/hermes/actions/runs/40399486841\n  failed jobs: Python tests / Run tests (1/2), All required checks pass (v2)\n\nGoal: get every workflow above green on main (fix forward or revert). Verify with the run links; do not mark done until a green push run exists for main.",
++  "key": "ci-red:daveey/hermes:16c20ad1652a7f0464ca077fca00947223d3c2d5",
++  "created_by": "ci-main-watch",
++  "created": 1793053412
++ },
++ "t_47d51eb4": {
++  "title": "Deflake tests/tui_gateway/test_auto_continue.py::test_marker_roundtrip",
++  "body": "Flaky test: `tests/tui_gateway/test_auto_continue.py::test_marker_roundtrip`\n\nIt failed on its first attempt and passed when CI retried it (https://github.com/daveey/hermes/actions/runs/40399486841/job/121854981664, branch `main`).\nThe retry keeps the job green, so this card is the only signal. Fix the cause, don't widen the retry.\n\nUsual cause on the hub runners: a fixed wall-clock deadline (sleep, short wait/join timeout, short\nlease) that a CPU-throttled container misses. Wait on events or use generous timeouts that return\nas soon as the condition holds. Reproduce by starving the process (SIGSTOP/SIGCONT duty cycle) rather\nthan on a quiet laptop.\n\nFirst-attempt output (tail):\n```\nio-1.3.0, anyio-4.14.2\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollected 24 items\n\ntests/tui_gateway/test_auto_continue.py F.......................         [100%]\n\n=================================== FAILURES ===================================\n____________________________ test_marker_roundtrip _____________________________\n\ntmp_path = PosixPath('/var/tmp/hermes-pytest-1001/r-okpd2o_x/pytest-of-runner/pytest-0/test_marker_roundtrip0')\n\n    def test_marker_roundtrip(tmp_path):\n        record_turn_start(tmp_path, \"abc\", \"fix the bug\", attempts=1)\n    \n        marker = read_turn_marker(tmp_path, \"abc\")\n        assert marker is not None\n        assert marker[\"prompt\"] == \"fix the bug\"\n        assert marker[\"attempts\"] == 1\n>       assert marker[\"started_at\"] == pytest.approx(time.time(), abs=5)\nE       assert 1793051748.0323417 == 1793051753.0376186 ± 5\nE         \nE         comparison failed\nE         Obtained: 1793051748.0323417\nE         Expected: 1793051753.0376186 ± 5\n\ntests/tui_gateway/test_auto_continue.py:122: AssertionError\n=========================== short test summary info ============================\nFAILED tests/tui_gateway/test_auto_continue.py::test_marker_roundtrip - assert 1793051748.0323417 == 1793051753.0376186 ± 5\n  \n  comparison failed\n  Obtained: 1793051748.0323417\n  Expected: 1793051753.0376186 ± 5\n======================== 1 failed, 23 passed in 25.06s =========================\n```",
++  "key": "deflake:tests/tui_gateway/test_auto_continue.py::test_marker_roundtrip",
++  "created_by": "ci-flaky-cards",
++  "created": 1793053232
++ },
++ "t_01a18c20993d4e87": {
++  "title": "Merge daveey/hermes PR #272 (git_fingerprint.py in _UPDATE_CRITICAL_FILES) once CI green",
++  "body": "PR https://github.com/daveey/hermes/pull/272 (branch fix/critical-files-git-fingerprint, head 533e5ec44cd28b1982d6f77cc6f8d259b7fac37a) fixes real main breakage: tests/.../test_update_post_pull_syntax_guard fails on main (shard 2/2 of run https://github.com/daveey/hermes/actions/runs/41022235753) because git_fingerprint.py is missing from _UPDATE_CRITICAL_FILES after 84030f99. Its CI run 41028341397 had Run tests 1/2 and 2/2 pending at 09:30 UTC.\n\nAcceptance: when 'All required checks pass (v2)' is green on the current head, merge it: `token-broker exec --scope user/github --reason merge-pr -- gh pr merge 272 --repo daveey/hermes --rebase --match-head-commit <head>`. If the head changed or main moved, update the branch and re-wait. If a check fails, inspect the log and fix or rerun it. Done when the PR is merged and test_update_post_pull_syntax_guard passes on main's next full CI run. Shell: use write_file scripts (heredocs are blocked).",
++  "key": "followup:t_01a18b227fc5ada3:merge-pr-272",
++  "created_by": "default",
++  "created": 1793352309
++ },
++ "t_01a18c14b16fa4ec": {
++  "title": "Deflake tests/gateway/test_replace_ownership_guard.py::TestStampDurability::test_refusal_stamp_reaches_disk_before_the_hard_exit",
++  "body": "Flaky test: `tests/gateway/test_replace_ownership_guard.py::TestStampDurability::test_refusal_stamp_reaches_disk_before_the_hard_exit`\n\nIt failed on its first attempt and passed when CI retried it (https://github.com/daveey/hermes/actions/runs/41022235753/job/123953677069, branch `main`).\nThe retry keeps the job green, so this card is the only signal. Fix the cause, don't widen the retry.\n\nUsual cause on the hub runners: a fixed wall-clock deadline (sleep, short wait/join timeout, short\nlease) that a CPU-throttled container misses. Wait on events or use generous timeouts that return\nas soon as the condition holds. Reproduce by starving the process (SIGSTOP/SIGCONT duty cycle) rather\nthan on a quiet laptop.\n\nDone when the PR is merged to main and the test passes on main's next CI run.\nOpening a PR is not done. Once the PR is open, stay on the card: kanban_block(kind='dependency'/\n'time') or kanban_continue until the PR is merged (merge it yourself once its required checks are\ngreen on the current head), then confirm the test passes on main's next CI run. Do not call\nkanban_complete while the PR is open.\n\nFirst-attempt output (tail):\n```\ndis0')\n\n    def test_refusal_stamp_reaches_disk_before_the_hard_exit(self, tmp_path):\n        home = tmp_path / \"scratch-home\"\n        home.mkdir()\n        (home / \"gateway_state.json\").write_text(\n            json.dumps({\"gateway_state\": \"running\", \"pid\": 424242}), encoding=\"utf-8\")\n        repo_root = str(Path(__file__).resolve().parents[2])\n        child = tmp_path / \"refusal_child.py\"\n        child.write_text(_CHILD_SCRIPT.replace(\"@@REPO@@\", repo_root), encoding=\"utf-8\")\n        env = {**os.environ, \"HERMES_HOME\": str(home)}\n    \n        proc = subprocess.run(\n            [sys.executable, str(child)],\n            env=env, capture_output=True, text=True, timeout=120, check=False,\n        )\n    \n        assert proc.returncode == 1, f\"child stderr: {proc.stderr[-2000:]}\"\n        stamped = json.loads((home / \"gateway_state.json\").read_text(encoding=\"utf-8\"))\n>       assert stamped.get(\"gateway_state\") == \"startup_failed\"\nE       AssertionError: assert 'running' == 'startup_failed'\nE         \nE         - startup_failed\nE         + running\n\ntests/gateway/test_replace_ownership_guard.py:486: AssertionError\n=========================== short test summary info ============================\nFAILED tests/gateway/test_replace_ownership_guard.py::TestStampDurability::test_refusal_stamp_reaches_disk_before_the_hard_exit - AssertionError: assert 'running' == 'startup_failed'\n  \n  - startup_failed\n  + running\n========================= 1 failed, 14 passed in 8.35s =========================\n```",
++  "key": "deflake:tests/gateway/test_replace_ownership_guard.py::TestStampDurability::test_refusal_stamp_reaches_disk_before_the_hard_exit",
++  "created_by": "ci-flaky-cards",
++  "created": 1793351528
++ },
++ "t_e37a86df": {
++  "title": "daveey/hermes CI: tests/test_hermes_constants.py TestIsContainer fails on hub self-hosted runner",
++  "body": "Run https://github.com/daveey/hermes/actions/runs/39886244584 (main 9cdafef2bb), Python tests / Run tests (1/2): tests/test_hermes_constants.py::TestIsContainer::test_detects_dockerenv and ::test_detects_kubernetes_env fail (\"assert False is True\", lines 159/169) on the hub runner (/opt/runner/_work). Likely a cached/process-global is_container() result or the test not isolating its mocks when the runner itself is containerized/not. Make the tests deterministic (reset the cache / patch properly), PR, merge once tests pass (standing approval). Use a git worktree.",
++  "key": null,
++  "created_by": "default",
++  "created": 1792724724
++ },
++ "t_01a18e0f85fa5317": {
++  "title": "Ask Eve: extend screen-reader transcript-label test to eve/ and eve/changed-mind/ (Refs #51)",
++  "body": "Test-only follow-up from independent QA of Metta-AI/ask-eve#51 (card t_01a18c8dfb252820, issue comment https://github.com/Metta-AI/ask-eve/issues/51#issuecomment-6530401579).\n\nContext: transcript links `a.q__src` carry an aria-label built in English by `scripts/build_site.py` `cite()` (\"<speaker> in <episode> at <m:ss>: open the transcript there\") and translated at render by the `site_i18n` rewriter via the pattern added in #137 (5d105c5a). The regression test `tests/test_untranslated_english.py::test_under_the_hood_screen_reader_labels_are_translated` checks all 7 non-en LANGS but only `eve/under-the-hood/`. At main 004b3ef5 the built site also emits these labels on `eve/` (5) and `eve/changed-mind/` (2) per edition. Behaviour is currently correct (QA browser + dist scan: 0 English labels in 8 locales), so this is a guard, not a fix.\n\nDo: extend (parametrize) the test to cover `eve/`, `eve/changed-mind/` and `eve/under-the-hood/` for de, es, fr, pt, ru, zh, fa; assert each page has >=1 q__src label, no label matches the English template (` in .+ at \\d`, \"open the transcript there\"), and the timestamp survives. Keep fa label free of U+2066-2069/U+200E/U+200F/U+061C (as #225).\n\nAcceptance: new test fails if the i18n pattern is removed from any one locale json (prove by temporarily deleting it locally, show failure, restore); full pytest + ci_shards --verify pass; one PR off main, `Refs #51`, exact-head CI green. No voiced text changes, no merge/deploy. Follow the askeve-alpha-workflow skill; respect locale-file serialization in the brief ~/.hermes/kanban/workspaces/t_01a184cee94603eb/IMPLEMENTATION-BRIEF.md (hotspot: tests/test_untranslated_english.py shared test module).",
++  "key": null,
++  "created_by": "default",
++  "created": 1793384744
++ },
++ "t_01a18de0c2168ff2": {
++  "title": "Ask Eve: extend transcript-link screen-reader label test to eve/ and eve/changed-mind/ (all 7 locales)",
++  "body": "Follow-up from independent QA of Metta-AI/ask-eve#51 (card t_01a18c8dfb252820). Refs #51.\n\nFinding: `tests/test_untranslated_english.py::test_under_the_hood_screen_reader_labels_are_translated` checks the `a.q__src` transcript-link aria-labels only on `/{lang}/eve/under-the-hood/`. In the offline build at main 004b3ef5, `/{lang}/eve/` (5 labels) and `/{lang}/eve/changed-mind/` (2 labels) also emit `q__src` links whose aria-label comes from the same English source in `scripts/build_site.py` cite() (\"Eve in {episode} at {clock}: open the transcript there\"), translated by site_i18n. They are correct today (QA browser + dist scan: 0 English in de/es/fr/pt/ru/zh/fa), but no unit test guards them.\n\nDo: parametrize the test over the three pages (eve/, eve/changed-mind/, eve/under-the-hood/) x LANGS, restrict to `a.q__src` aria-labels, assert each page has >=1 such label, none contains \"open the transcript there\" / `\\bat \\d+:\\d\\d` / the English episode title, and for fa none contains U+2066..U+2069 (per #225). Test-only change; no i18n, voiced text or deploy changes.\n\nAcceptance: RED proof (temporarily remove the pattern from one locale's i18n JSON for a non-under-the-hood page -> new test fails), GREEN full `pytest tests/test_untranslated_english.py`, plus `ci_shards --shards 4 --verify`; PR on Metta-AI/ask-eve with exact-head CI green, following the repo's Eve review flow (askeve-alpha-workflow skill). No merge without Eve.",
++  "key": "followup:t_01a18c8dfb252820:q__src-test-all-pages",
++  "created_by": "default",
++  "created": 1793381679
++ },
++ "t_01a184c1ebcc0557": {
++  "title": "Deflake tests/gateway/test_multiplex_hot_serve.py::test_stalled_own_gateway_probe_never_wedges_the_loop_or_serves",
++  "body": "Flaky test: `tests/gateway/test_multiplex_hot_serve.py::test_stalled_own_gateway_probe_never_wedges_the_loop_or_serves`\n\nIt failed on its first attempt and passed when CI retried it (https://github.com/daveey/hermes/actions/runs/40739917536/job/123046201750, branch `fix/omitted-requires-preflight`).\nThe retry keeps the job green, so this card is the only signal. Fix the cause, don't widen the retry.\n\nUsual cause on the hub runners: a fixed wall-clock deadline (sleep, short wait/join timeout, short\nlease) that a CPU-throttled container misses. Wait on events or use generous timeouts that return\nas soon as the condition holds. Reproduce by starving the process (SIGSTOP/SIGCONT duty cycle) rather\nthan on a quiet laptop.\n\nFirst-attempt output (tail):\n```\n.get(descriptor) if descriptor else None, metadata=metadata,\n                       destructive=destructive(args, kwargs) if callable(destructive) else destructive)\n>       return original(*args, **kwargs)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^\nE       FileNotFoundError: [Errno 2] No such file or directory: '/var/tmp/hermes-pytest-1001/r-lv7k4l40/pytest-of-runner/pytest-0/test_profile_control_verbs_rou0/.hermes/gateway_state.json'\n\ntests/home_io_guard.py:217: FileNotFoundError\n=========================== short test summary info ============================\nFAILED tests/gateway/test_multiplex_hot_serve.py::test_stalled_own_gateway_probe_never_wedges_the_loop_or_serves - FileNotFoundError: [Errno 2] No such file or directory: '/var/tmp/hermes-pytest-1001/r-lv7k4l40/pytest-of-runner/pytest-0/test_stalled_own_gateway_probe0/.hermes/gateway_state.json'\nFAILED tests/gateway/test_multiplex_hot_serve.py::test_parked_profile_boot_and_reconcile - FileNotFoundError: [Errno 2] No such file or directory: '/var/tmp/hermes-pytest-1001/r-lv7k4l40/pytest-of-runner/pytest-0/test_parked_profile_boot_and_r0/.hermes/gateway_state.json'\nFAILED tests/gateway/test_multiplex_hot_serve.py::test_profile_control_verbs_round_trip_and_refusals - FileNotFoundError: [Errno 2] No such file or directory: '/var/tmp/hermes-pytest-1001/r-lv7k4l40/pytest-of-runner/pytest-0/test_profile_control_verbs_rou0/.hermes/gateway_state.json'\n========================= 3 failed, 8 passed in 12.90s =========================\n```",
++  "key": "deflake:tests/gateway/test_multiplex_hot_serve.py::test_stalled_own_gateway_probe_never_wedges_the_loop_or_serves",
++  "created_by": "ci-flaky-cards",
++  "created": 1793228663
++ },
++ "t_01a184c1fae6295e": {
++  "title": "Deflake tests/gateway/test_multiplex_hot_serve.py::test_profile_control_verbs_round_trip_and_refusals",
++  "body": "Flaky test: `tests/gateway/test_multiplex_hot_serve.py::test_profile_control_verbs_round_trip_and_refusals`\n\nIt failed on its first attempt and passed when CI retried it (https://github.com/daveey/hermes/actions/runs/40739917536/job/123046201750, branch `fix/omitted-requires-preflight`).\nThe retry keeps the job green, so this card is the only signal. Fix the cause, don't widen the retry.\n\nUsual cause on the hub runners: a fixed wall-clock deadline (sleep, short wait/join timeout, short\nlease) that a CPU-throttled container misses. Wait on events or use generous timeouts that return\nas soon as the condition holds. Reproduce by starving the process (SIGSTOP/SIGCONT duty cycle) rather\nthan on a quiet laptop.\n\nFirst-attempt output (tail):\n```\n.get(descriptor) if descriptor else None, metadata=metadata,\n                       destructive=destructive(args, kwargs) if callable(destructive) else destructive)\n>       return original(*args, **kwargs)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^\nE       FileNotFoundError: [Errno 2] No such file or directory: '/var/tmp/hermes-pytest-1001/r-lv7k4l40/pytest-of-runner/pytest-0/test_profile_control_verbs_rou0/.hermes/gateway_state.json'\n\ntests/home_io_guard.py:217: FileNotFoundError\n=========================== short test summary info ============================\nFAILED tests/gateway/test_multiplex_hot_serve.py::test_stalled_own_gateway_probe_never_wedges_the_loop_or_serves - FileNotFoundError: [Errno 2] No such file or directory: '/var/tmp/hermes-pytest-1001/r-lv7k4l40/pytest-of-runner/pytest-0/test_stalled_own_gateway_probe0/.hermes/gateway_state.json'\nFAILED tests/gateway/test_multiplex_hot_serve.py::test_parked_profile_boot_and_reconcile - FileNotFoundError: [Errno 2] No such file or directory: '/var/tmp/hermes-pytest-1001/r-lv7k4l40/pytest-of-runner/pytest-0/test_parked_profile_boot_and_r0/.hermes/gateway_state.json'\nFAILED tests/gateway/test_multiplex_hot_serve.py::test_profile_control_verbs_round_trip_and_refusals - FileNotFoundError: [Errno 2] No such file or directory: '/var/tmp/hermes-pytest-1001/r-lv7k4l40/pytest-of-runner/pytest-0/test_profile_control_verbs_rou0/.hermes/gateway_state.json'\n========================= 3 failed, 8 passed in 12.90s =========================\n```",
++  "key": "deflake:tests/gateway/test_multiplex_hot_serve.py::test_profile_control_verbs_round_trip_and_refusals",
++  "created_by": "ci-flaky-cards",
++  "created": 1793228667
++ }
++}
+diff --git a/tests/tools/test_kanban_create_overlap_failure.py b/tests/tools/test_kanban_create_overlap_failure.py
+new file mode 100644
+index 00000000000..cca4df49a9f
+--- /dev/null
++++ b/tests/tools/test_kanban_create_overlap_failure.py
+@@ -0,0 +1,246 @@
++"""kanban_create refuses a second owner of one red-CI failure: same failing test or same Actions run. [daveey]
++
++Incident (2026-11-02, t_01a19ea9f1739df6): main went red at ac613a6e on
++``test_busy_board_open_does_not_block_session_poll[True-True]`` (run 41516070553) and four cards owned that one failure
++within 23 minutes, all admitted because their titles share few words. On 11-03 a worker card and the ci-main-watch
++card for run 41555531824 (``test_termux_assembly_permissions``) were created in the same second. The cases below are
++the real titles, bodies and idempotency keys (``kanban_overlap_failure_cases.json``); the two ci-main-watch owners carry
++the body ci_main_watch writes since it lists ``FAILED <node id>`` lines (``body_deployed`` is what it wrote before).
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_overlap as ko
++from tests.tools import test_kanban_create_overlap as helpers
++
++home = helpers.home
++
++CASES = json.loads((Path(__file__).with_name("kanban_overlap_failure_cases.json")).read_text(encoding="utf-8"))
++OWNER_1102 = "t_01a19dfe46a7b2a3"  # ci-main-watch, 12:40 PST
++LATER_1102 = ["t_01a19e02884dee02", "t_01a19e082c8721b1", "t_01a19e12c1eba138"]  # 12:45, 12:51, 13:03
++CMW_1103, WORKER_1103 = "t_01a19f0a4d82213d", "t_01a19f0a4cc8b092"
++
++
++def owner(cid: str, *, status: str = "ready", body_field: str = "body") -> str:
++    """Create the real card ``cid`` on this gateway's default board (another chat's session); returns the new id."""
++    c = CASES[cid]
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title=c["title"], body=c[body_field], assignee="default",
++                             session_id=f"chat-{cid}", idempotency_key=c["key"])
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++        conn.commit()
++    return tid
++
++
++def remote(tmp_path, cids, status="ready"):
++    """The real cards as other-gateway rows of the hermes-hub replica, under their real ids."""
++    (tmp_path / "hub-state" / "hub.db").unlink(missing_ok=True)
++    helpers._fake_replica(tmp_path / "hub-state" / "hub.db", [
++        ("macbook", {"id": cid, "board": "default", "title": CASES[cid]["title"], "body": CASES[cid]["body"],
++                     "status": status, "gateway": "macbook", "sessions": [{"session": f"chat-{cid}", "rel": "created"}]})
++        for cid in cids])
++
++
++def check(cid: str | None = None, *, title: str | None = None, body: str | None = None, **args):
++    c = CASES[cid] if cid else {"title": title, "body": body or "", "key": None}
++    args.setdefault("body", c["body"] if body is None else body)
++    if c.get("key"):
++        args.setdefault("idempotency_key", c["key"])
++    with kbc.connect_closing() as conn:
++        refusal, _ = ko.check(conn, args, courier=False, title=title or c["title"], session_id="new-chat",
++                              self_tid=None, parents=[])
++    return json.loads(refusal) if refusal else None
++
++
++def failure_whys(result) -> list[str]:
++    return [m["why"] for m in (result or {}).get("matches", []) if "same failing test" in m["why"]
++            or "same CI run" in m["why"]]
++
++
++# --- Acceptance 1: the 11-02 sequence, in creation order -------------------------------------------------------
++
++
++@pytest.mark.parametrize("where", ["local", "replica"])
++def test_1102_each_later_card_is_refused_naming_an_open_earlier_card(home, tmp_path, where):
++    earlier = [OWNER_1102]
++    for cid in LATER_1102:
++        if where == "local":
++            with kbc.connect_closing() as conn:  # the board as history had it: every earlier card open
++                conn.execute("DELETE FROM tasks")
++                conn.commit()
++            made = {owner(e): e for e in earlier}
++        else:
++            remote(tmp_path, earlier)
++            made = {e: e for e in earlier}
++        result = check(cid)
++        assert result and result["code"] == "create_overlap", cid
++        named = [made.get(m["id"]) for m in result["matches"]]
++        assert named and None not in named, (cid, result["matches"])  # only earlier open cards
++        assert failure_whys(result), result
++        earlier.append(cid)
++
++
++def test_1102_ci_main_watch_card_names_the_failing_test_only_with_the_new_body():
++    new = ko.failure_identity(CASES[OWNER_1102]["title"], CASES[OWNER_1102]["body"])
++    old = ko.failure_identity(CASES[OWNER_1102]["title"], CASES[OWNER_1102]["body_deployed"])
++    assert new.tests == {"test_busy_board_open_does_not_block_session_poll"}
++    assert not old.tests and "41516070553" in old.runs
++    later = ko.failure_identity(CASES[LATER_1102[0]]["title"], CASES[LATER_1102[0]]["body"])
++    assert ko.same_failure(later, new) == "same failing test test_busy_board_open_does_not_block_session_poll"
++    assert ko.same_failure(later, old) is None  # deployed body: a test vs a bare run is not one failure
++
++
++# --- The 11-03 termux pair (created in the same second) ---------------------------------------------------------
++
++
++@pytest.mark.parametrize("where", ["local", "replica"])
++@pytest.mark.parametrize("first,second", [(CMW_1103, WORKER_1103), (WORKER_1103, CMW_1103)])
++def test_1103_second_card_of_the_pair_is_refused_naming_the_first(home, tmp_path, where, first, second):
++    if where == "local":
++        tid = owner(first)
++    else:
++        remote(tmp_path, [first])
++        tid = first
++    result = check(second)
++    assert result and [m["id"] for m in result["matches"]] == [tid]
++    # The worker's title names the module (test_termux_assembly_permissions); the watcher's body has the node id.
++    assert result["matches"][0]["why"].startswith("same failing test ")
++    assert "test_termux_assembly_permissions" in result["matches"][0]["why"]
++
++
++# --- Acceptance 2: real non-duplicate pairs stay admitted --------------------------------------------------------
++
++
++@pytest.mark.parametrize("new,old", [
++    # flaky test that passed on retry vs the red-main card of the same run (the run failed on other tests)
++    ("t_62ce7dc1", "t_bdb6c497"),
++    # TestIsContainer failure vs the red-main card that lists only runs: a test vs a whole run is not one failure
++    ("t_e37a86df", "t_bdb6c497"),
++    # red-main card vs a deflake card of a flake seen in the same run
++    ("t_fa55aeb4", "t_47d51eb4"),
++    # "merge PR #272 once CI green" vs a deflake card whose flake was seen in that PR's run
++    ("t_01a18c20993d4e87", "t_01a18c14b16fa4ec"),
++    # two ci-flaky-cards deflake cards for different tests (each body's FAILED excerpt names the other test):
++    # same key family (deflake:), the creator's own fan-out
++    ("t_01a184c1fae6295e", "t_01a184c1ebcc0557"),
++])
++@pytest.mark.parametrize("where", ["local", "replica"])
++def test_real_non_duplicate_pairs_have_no_failure_match(home, tmp_path, new, old, where):
++    if where == "local":
++        owner(old)
++    else:
++        remote(tmp_path, [old])
++    assert failure_whys(check(new)) == []
++
++
++def test_a_test_named_only_as_a_verification_step_is_not_a_failure(home):
++    """t_01a18e0f85fa5317 (real) names ``test_under_the_hood_screen_reader_labels_are_translated`` as the regression
++    test that checks its work. An open card about that test failing must not refuse it."""
++    body = CASES["t_01a18e0f85fa5317"]["body"]
++    assert "test_under_the_hood_screen_reader_labels_are_translated" in body
++    assert not ko.failure_identity(CASES["t_01a18e0f85fa5317"]["title"], body).tests
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="Ask Eve CI red: translation check fails", assignee="default", session_id="x",
++                       body="tests/test_untranslated_english.py::test_under_the_hood_screen_reader_labels_are_translated "
++                            "fails on main.")
++    assert check("t_01a18e0f85fa5317") is None
++
++
++# --- Rule details --------------------------------------------------------------------------------------------------
++
++
++def test_identity_sources():
++    fi = ko.failure_identity("Fix tests/a/test_mod.py::TestX::test_alpha_case[1] and test_beta_case_x", "")
++    assert fi.tests == {"test_alpha_case", "test_beta_case_x"} and fi.modules == {"test_mod"}
++    assert fi.bare == {"test_beta_case_x"}
++    lead = "Main fails tests/a/test_mod.py::test_gamma_case. Verified by tests/a/test_mod.py::test_delta_case."
++    assert ko.failure_identity("t", lead).tests == {"test_gamma_case"}
++    later = "Context.\n\nThis tests/a/test_mod.py::test_gamma_case fails too."
++    assert not ko.failure_identity("t", later).tests  # past the opening paragraph: context, not the failure
++    assert ko.failure_identity("t", "x\n\nlog:\n  FAILED tests/a/test_mod.py::test_eps_case - E").tests == {"test_eps_case"}
++    # A card that names its own test pastes a job tail: the tail's FAILED lines are other tests of that job.
++    tail = "Flaky test: `tests/a/test_mod.py::test_own_case`\n\n```\nFAILED tests/a/test_mod.py::test_other_case - E\n```"
++    assert ko.failure_identity("Deflake tests/a/test_mod.py::test_own_case", tail).tests == {"test_own_case"}
++    assert ko.failure_identity("test_main is short", "").tests == frozenset()
++    assert ko.failure_identity("t", "see https://github.com/o/r/actions/runs/123456789/job/9").runs == {"123456789"}
++
++
++def test_same_run_with_different_named_tests_is_two_failures():
++    run = "https://github.com/daveey/hermes/actions/runs/41516070553"
++    a = ko.failure_identity("Fix tests/a/test_m.py::test_one_thing", f"{run}")
++    b = ko.failure_identity("Fix tests/a/test_m.py::test_two_thing", f"{run}")
++    whole = ko.failure_identity("Fix red main CI", f"{run}")
++    assert ko.same_failure(a, b) is None
++    assert ko.same_failure(a, whole) is None
++    assert ko.same_failure(whole, ko.failure_identity("main red again", run)) == "same CI run actions/runs/41516070553"
++
++
++def test_closed_owner_never_matches(home):
++    owner(OWNER_1102, status="done")
++    assert check(LATER_1102[0]) is None
++
++
++def test_distinct_from_admits_and_records(home):
++    tid = owner(OWNER_1102)
++    assert check(LATER_1102[0], distinct_from=[tid], distinct_reason="a separate flake of the same test") is None
++
++
++def test_a_card_citing_the_owner_by_id_is_admitted(home):
++    tid = owner(OWNER_1102)
++    body = CASES[LATER_1102[0]]["body"] + f"\n\nSplit from {tid}: only the warm same-board case."
++    assert failure_whys(check(LATER_1102[0], body=body)) == []
++
++
++def test_exact_key_retry_is_not_a_second_card(home):
++    owner(LATER_1102[0])
++    assert check(LATER_1102[0]) is None
++
++
++# --- Acceptance 4: entry parity (tool, CLI, REST) -------------------------------------------------------------------
++
++
++NEW = CASES[LATER_1102[0]]
++
++
++def test_tool_refuses(home):
++    from tools import kanban_tools as kt
++    tid = owner(OWNER_1102)
++    out = json.loads(kt._handle_create({"title": NEW["title"], "body": NEW["body"], "assignee": "default",
++                                        "requires": [], "idempotency_key": NEW["key"]}))
++    assert out.get("code") == "create_overlap" and [m["id"] for m in out["matches"]] == [tid]
++    assert "same failing test" in out["matches"][0]["why"]
++
++
++def test_cli_refuses(home, monkeypatch, capsys):
++    import argparse
++    from hermes_cli import kanban as kc
++    tid = owner(OWNER_1102)
++    monkeypatch.setattr(kc, "_check_dispatcher_presence", lambda **kw: (True, ""))
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    rc = kc._cmd_create(root.parse_args(["kanban", "create", NEW["title"], "--body", NEW["body"], "--assignee",
++                                         "default", "--idempotency-key", NEW["key"]]))
++    err = capsys.readouterr().err
++    assert rc == 2 and "create_overlap" in err and tid in err and "same failing test" in err
++
++
++def test_rest_refuses(home):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from plugins.kanban.dashboard.plugin_api import router
++    tid = owner(OWNER_1102)
++    app = FastAPI()
++    app.include_router(router)
++    with TestClient(app) as client:
++        r = client.post("/tasks", json={"title": NEW["title"], "body": NEW["body"], "assignee": "default",
++                                        "idempotency_key": NEW["key"]})
++    payload = r.json()
++    detail = payload.get("detail", payload)
++    detail = json.loads(detail) if isinstance(detail, str) else detail
++    assert detail.get("code") == "create_overlap" and tid in [m["id"] for m in detail["matches"]]
+-- 
+2.55.0
+

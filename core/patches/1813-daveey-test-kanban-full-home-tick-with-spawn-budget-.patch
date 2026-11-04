@@ -1,0 +1,110 @@
+From 3e6d25735249e503bc43270457caeb736057e1cc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 04:35:40 +0000
+Subject: [PATCH] [daveey] test(kanban): full home tick with spawn budget never
+ runs a worker-first queued card
+
+Follow-up to #461 review. test_home_maintains_guard_hold_on_worker_queued_policy_card ticks with
+max_spawn=0, so its spawned == [] is trivial. The new test ticks the home with max_spawn=4 and a plain
+control card that does spawn, and asserts the worker-first-v1 card gets no spawn, no local or Board run
+row, no lease, and keeps its policy fence. local_admission is pinned True so only the policy fence keeps
+the card off. Parametrized both_fences (dispatch_refusals prefilter + claim gate) and claim_gate_only
+(prefilter disabled), so each fence is proven on its own.
+
+Also corrects machine_metrics / report_metrics docstrings that still said metrics are display-only:
+worker-first placement now reads them.
+---
+ hermes_cli/kanban_sync_client.py              |  3 +-
+ hermes_cli/machine_metrics.py                 |  9 +++--
+ .../hermes_cli/test_kanban_guard_hold_sync.py | 36 +++++++++++++++++++
+ 3 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 9b7624190a9..497e660fbd4 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -347,7 +347,8 @@ class Hub:
+         return self._call("GET", "/v2/machines")
+ 
+     def report_metrics(self, metrics: dict) -> dict:
+-        """This machine's own load for the registry (display only; see hermes_cli.machine_metrics)."""
++        """This machine's own load for the registry: Runners display and worker-first pool admission
++        (see hermes_cli.machine_metrics). Sending stays best-effort."""
+         return self._call("POST", "/v2/machines/me/metrics", metrics)
+ 
+     def report_pickup(self, pickup: Optional[str]) -> dict:
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index f642a8b803f..408e60ad965 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -1,7 +1,10 @@
+-"""This machine's load, reported to the Board's machine registry for display (Desktop Runners panel).
++"""This machine's load, reported to the Board's machine registry (Desktop Runners panel and worker-first placement).
+ 
+-``collect()`` reads CPU load, memory in use and free disk with a few cheap OS calls; the kanban sync loop
+-sends it with ``report_due()`` at most every :data:`REPORT_EVERY_S`. Display only: placement never reads it.
++``collect()`` reads CPU load, memory in use, free disk and whole-host ``active_card_runs`` with a few cheap OS
++calls; the kanban sync loop sends it with ``report_due()`` at most every :data:`REPORT_EVERY_S`. Not display-only
++since worker-first-v1 (docs/worker-first-v1.md): the Board's worker-pool admission scores the reported sample, and
++``kanban_worker_placement.local_admission`` takes a fresh ``collect()`` before turning a policy card's grant into a
++local run. Cards without ``placement_policy`` are still placed without it.
+ """
+ from __future__ import annotations
+ 
+diff --git a/tests/hermes_cli/test_kanban_guard_hold_sync.py b/tests/hermes_cli/test_kanban_guard_hold_sync.py
+index 4934e2bba75..2d4a7bb7d37 100644
+--- a/tests/hermes_cli/test_kanban_guard_hold_sync.py
++++ b/tests/hermes_cli/test_kanban_guard_hold_sync.py
+@@ -13,6 +13,7 @@ from hermes_cli import kanban_db_dispatch as dispatch
+ from hermes_cli import kanban_db_dispatch_guard_notice as notice
+ from hermes_cli import kanban_model_assignment as assignment
+ from hermes_cli import kanban_worker_node as wn
++from hermes_cli import kanban_worker_placement as placement
+ from tests.hermes_cli import test_kanban_worker_node as worker_node
+ 
+ gws = worker_node.gws
+@@ -164,6 +165,41 @@ def test_home_maintains_guard_hold_on_worker_queued_policy_card(gws, svc, monkey
+     assert home.conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (target,)).fetchone()[0] == 1
+ 
+ 
++@pytest.mark.parametrize("prefilter", [True, False], ids=["both_fences", "claim_gate_only"])
++def test_full_tick_with_spawn_budget_never_runs_worker_queued_policy_card(gws, svc, monkeypatch, prefilter):
++    """The guard-hold test above ticks with max_spawn=0, where no spawn is trivial. Here the home has budget and
++    spends it on a plain control card in the same tick, yet the worker-first card stays queued: no spawn, no run
++    row (locally or on the Board) and its policy fence intact. ``claim_gate_only`` drops the advisory prefilter
++    (``dispatch_refusals``) so the claim gate's own policy check must hold the line alone."""
++    home, _worker = gws
++    home.enter()
++    target = kb.create_task(home.conn, title="queued for worker capacity", assignee="default",
++                            placement_policy="worker-first-v1")
++    control = kb.create_task(home.conn, title="ordinary home card", assignee="default")
++    # Admit local capacity so the policy fence, not host pressure or fixture shape, is what keeps the card off.
++    monkeypatch.setattr(placement, "local_admission", lambda conn: True)
++    if not prefilter:
++        monkeypatch.setattr(wn, "dispatch_refusals", lambda conn, status: {})
++    result = home.tick(max_spawn=4)
++    assert [tid for tid, *_ in result.spawned] == [control]  # the budget was real and was spent
++    if prefilter:
++        assert (target, "waiting_for_worker_capacity") in result.skipped_ineligible
++    else:
++        assert (target, "waiting_for_worker_capacity") in result.claim_deferred
++    task = kb.get_task(home.conn, target)
++    assert task is not None and task.status == "ready"
++    assert task.placement_policy == "worker-first-v1"
++    assert task.claim_lock is None and task.current_run_id is None
++    row = home.conn.execute("SELECT runs_on, lease_holder FROM tasks WHERE id=?", (target,)).fetchone()
++    assert (row["runs_on"], row["lease_holder"]) == (None, None)
++    assert home.conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (target,)).fetchone()[0] == 0
++    home.round()
++    board_runs = [r for r in svc.board(worker_node.BOARD)["rows"].get("task_runs", {}).values()
++                  if r.get("task_id") in (target, control)]
++    assert [r["task_id"] for r in board_runs] == [control]  # the Board sees runs; none for the queued card
++    assert placement.local_refusals(home.conn, "ready") == {target: "waiting_for_worker_capacity"}
++
++
+ @pytest.mark.parametrize("cooldown", [120, 10000])
+ def test_home_revalidates_synced_cooldown_without_executor_budget(gws, monkeypatch, cooldown):
+     home, worker = gws
+-- 
+2.55.0
+

@@ -1,0 +1,243 @@
+From 2f3477913c5717ad10835bc33ca92ee81bfddb05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 20:28:56 +0000
+Subject: [PATCH] [daveey] fix(gateway): managed Bot Chat follows profile; held
+ pick ends durably
+
+- session_policy: effective_selection() reports a recorded pick that ended on the same profile read.
+- session_profile_selection: the owner's fenced commit (epoch + generation + receipt policy) drops
+  model.selection_profile from the receipt when the pick ended, then republishes the live policy,
+  so a composer hold never resurrects when the profile returns to its original target.
+- session_managed_worker: one profile read feeds route, selection commit and hold end.
+- test: align the owner's state.db with its profile home (root conftest re-points
+  hermes_state.DEFAULT_DB_PATH after first import, so later tests silently stopped following);
+  add durable-end and re-pick-after-end coverage.
+---
+ gateway/session_managed_worker.py             |  5 +-
+ gateway/session_policy.py                     | 13 ++++-
+ gateway/session_profile_selection.py          | 42 +++++++++++++---
+ tests/gateway/test_bot_chat_managed_follow.py | 49 +++++++++++++++++++
+ 4 files changed, 97 insertions(+), 12 deletions(-)
+
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index 03ff4c02449..547e1cfcc13 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -77,10 +77,11 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
+         **({'display_v1': row['payload']['display_v1']} if row['payload'].get('display_v1') else {})})
+     from gateway.session_worker_construct import construct_inputs
+     request['construct_v1'] = construct_inputs(authority, policy, live.source.chat_id)
+-    config, model = policy.effective(authority)
++    # One profile read for the child's route, the selection commit and a held pick's end.
++    config, model, ended = policy.effective_selection(authority)
+     config = _worker_config(authority, policy, config=config)
+     from gateway.session_profile_selection import commit_selection
+-    commit_selection(authority, ref, policy, config, model, scope['generation'])
++    commit_selection(authority, ref, policy, config, model, scope['generation'], ended=ended)
+     hydrated = replace(policy, model=model, config_json=json.dumps(config), request_json=json.dumps(request),
+                        terminal_json=json.dumps(terminal), credential_ref=None, config_secret_ref=None)
+     return {'version': 1, 'home': authority.profile_id, 'scope': scope,
+diff --git a/gateway/session_policy.py b/gateway/session_policy.py
+index e761c468043..4d9494606f4 100644
+--- a/gateway/session_policy.py
++++ b/gateway/session_policy.py
+@@ -202,6 +202,14 @@ class LocalSessionPolicy:
+         endpoint. Explicit choices (create-time reasoning / tier / toolsets, a session ``/reasoning`` until
+         reset, a pick that still holds) are applied over the followed defaults; frozen secrets of followed
+         sections are never recovered."""
++        return self.effective_selection(authority, secrets=secrets)[:2]
++
++    def effective_selection(self, authority=None, *, secrets=True):
++        """``effective()`` plus whether a recorded pick (``model.selection_profile``) has ended on that
++        same read: True once the profile no longer targets what the pick diverged from (or its entry no
++        longer serves the pinned endpoint), else False. The owner commits that end
++        (``session_profile_selection.commit_selection``) so the pick never holds again when the
++        profile later returns to that target: a pick holds until the NEXT profile edit, once."""
+         config = present_sections(json.loads(self.config_json))
+         live = self.read_profile(authority)
+         if self.config_secret_ref is not None and authority is not None and secrets:
+@@ -216,11 +224,12 @@ class LocalSessionPolicy:
+                     target = target.setdefault(key, {}) if isinstance(target, dict) else target[key]
+                 target[path[-1]] = value
+             disable_dropped_secrets(config, getattr(recovered, 'dropped', ()), getattr(recovered, 'session', None))
+-        model = self.model
++        model, ended = self.model, False
+         if live:
+             frozen, request = config.get('model') or {}, json.loads(self.request_json)
+             pick = frozen.get('selection_profile')
+             held = pick is not None and pick == list(profile_target(live)) and entry_serves(frozen, live)
++            ended = pick is not None and not held
+             pinned = {'platform_toolsets', 'disabled_toolsets'} if 'toolsets' in request else set()
+             chosen = session_pinned(config, 'reasoning', 'reasoning' in request)
+             pinned |= {'reasoning_effort', 'reasoning_overrides'} if chosen else set()
+@@ -252,7 +261,7 @@ class LocalSessionPolicy:
+             for part in source:
+                 value = value.get(part) if isinstance(value, dict) else None
+             config['model']['api_key'] = value
+-        return config, model
++        return config, model, ended
+ 
+     @cached_property
+     def follows_profile(self):
+diff --git a/gateway/session_profile_selection.py b/gateway/session_profile_selection.py
+index 3e51c2b25c6..b79b0f226df 100644
+--- a/gateway/session_profile_selection.py
++++ b/gateway/session_profile_selection.py
+@@ -1,36 +1,58 @@
+-"""Owner-committed selections of a managed session that follows its profile."""
++"""Owner-committed selections of a managed session that follows its profile. [daveey]"""
+ import json
+-from dataclasses import asdict
++from dataclasses import asdict, replace
+ 
+ from hermes_state_runtime import RuntimeStoreError
+ 
+ PREFIX = 'gateway.profile_selection.v1.'
+ 
+ 
+-def commit_selection(authority, ref, policy, config, model, generation):
++def released_pick(policy, model):
++    """*policy* without its recorded pick (``model.selection_profile``), running *model*: what a pick
++    that ended on a profile edit leaves. The followed ``model:`` block already replaces the frozen one
++    once the pick no longer holds, so dropping the marker changes nothing this turn runs; it only stops
++    the pick from holding again when the profile later returns to the target it diverged from."""
++    config = json.loads(policy.config_json)
++    block = config.get('model')
++    if isinstance(block, dict):
++        config['model'] = {k: v for k, v in block.items() if k != 'selection_profile'}
++    return replace(policy, model=model, config_json=json.dumps(config))
++
++
++def commit_selection(authority, ref, policy, config, model, generation, *, ended=False):
+     """Authorize this effective selection, not arbitrary exact-pin failover.
+ 
+     Only the owner calls this with the single profile read it sends to the child. The durable
+-    launch policy must still be this following policy. Remember the selection independently of
+-    runtime usage stamps so rebuilding an unchanged selection never re-arms a consumed intent.
++    launch policy must still be this following policy, at this owner epoch and runtime generation.
++    Remember the selection independently of runtime usage stamps so rebuilding an unchanged
++    selection never re-arms a consumed intent. *ended*: the policy's recorded pick no longer holds on
++    that read (``LocalSessionPolicy.effective_selection``); the same transaction commits its end to the
++    receipt, without a generation bump (nothing this generation runs changes), and the owner's live
++    policy is republished from it. A concurrent prepared mutation then fails its snapshot check
++    (``revision_conflict``) rather than writing over the end.
+     """
+     if not policy.follows_profile or policy.ignore_user_config:
+         return
+     from agent.model_routing_switch_intent import record_in_transaction
+     from hermes_state_local import POLICY_PREFIX
+-    from hermes_state_runtime import _epoch
++    from hermes_state_runtime import _epoch, _json
+     provider = (config.get('model') or {}).get('provider') or ''
+     selected = json.dumps([model, provider])
+     expected = json.loads(json.dumps(asdict(policy)))
++    released = json.loads(json.dumps(asdict(released_pick(policy, model)))) if ended else None
+ 
+     def write(conn):
+         _epoch(conn, authority.epoch)
+         receipt = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                                (POLICY_PREFIX + ref.session_id,)).fetchone()
+         row = conn.execute('SELECT runtime_generation FROM sessions WHERE id=?', (ref.session_id,)).fetchone()
+-        if (receipt is None or json.loads(receipt[0])['policy'] != expected
+-                or row is None or row[0] != generation):
++        saved = json.loads(receipt[0]) if receipt is not None else None
++        if saved is None or saved['policy'] != expected or row is None or row[0] != generation:
+             raise RuntimeStoreError('revision_conflict')
++        if released is not None:
++            saved['policy'] = released
++            conn.execute('UPDATE state_meta SET value=? WHERE key=?',
++                         (_json(saved), POLICY_PREFIX + ref.session_id))
+         key = PREFIX + ref.session_id
+         old = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+         if old is not None and old[0] == selected:
+@@ -39,3 +61,7 @@ def commit_selection(authority, ref, policy, config, model, generation):
+         conn.execute('INSERT INTO state_meta (key,value) VALUES (?,?) '
+                      'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, selected))
+     authority.db._execute_write(write)
++    if released is not None:
++        from gateway.session_local import publish_local_policy
++        # The agent this build replaces already ran the followed route: nothing cached to evict.
++        publish_local_policy(authority, ref.session_id, evict=False)
+diff --git a/tests/gateway/test_bot_chat_managed_follow.py b/tests/gateway/test_bot_chat_managed_follow.py
+index 54b2edd2a17..96e46513216 100644
+--- a/tests/gateway/test_bot_chat_managed_follow.py
++++ b/tests/gateway/test_bot_chat_managed_follow.py
+@@ -1,5 +1,6 @@
+ """Bot Chat policy following composed with durable exact-pin allocation and managed workers."""
+ import json
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -9,6 +10,15 @@ from tests.gateway.test_model_switch_worker_composed import (
+ from tests.gateway.test_bot_chat_follows_profile import _open, _legacy
+ 
+ 
++@pytest.fixture(autouse=True)
++def _state_db_in_profile(home, monkeypatch):
++    """The owner's state.db lives in its profile home, as in production: ``profile_config`` reads the
++    profile's config.yaml beside it. The root conftest re-points ``hermes_state.DEFAULT_DB_PATH`` to its
++    own sandbox once ``hermes_state`` is imported, so without this only a worker's first test followed."""
++    import hermes_state
++    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', home / 'state.db')
++
++
+ def _profile_pick(home, model, provider):
+     from hermes_cli.config import atomic_config_write
+     from hermes_cli.config import read_user_config_raw
+@@ -25,6 +35,7 @@ async def test_managed_bot_follows_profile_across_exact_pins(home, monkeypatch,
+     from gateway.session_policy import policy_for_source
+     from run_agent import AIAgent
+     store, db, authority, owner, ref = _owner(home, monkeypatch, _noop)
++    assert Path(db.db_path).resolve().parent == home.resolve()
+     authority.runner._peek_session_state = lambda key: None
+     try:
+         if entry == 'resume':
+@@ -60,6 +71,44 @@ async def test_managed_bot_follows_profile_across_exact_pins(home, monkeypatch,
+         agent = _worker_build(authority, db, ref, monkeypatch, 'follow-third')
+         assert (agent.model, agent.provider) == (ASTRA, 'openai-codex')
+         assert _allocation(home, ref.session_id)['selected_model'] == ASTRA
++        # The held pick's end is durable: the receipt no longer records it, so a restarted owner agrees.
++        assert 'selection_profile' not in _receipt_model(db, ref)
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++def _receipt_model(db, ref):
++    from hermes_state_local import local_receipt
++    return json.loads(local_receipt(db, ref.session_id)['policy']['config_json']).get('model') or {}
++
++
++@pytest.mark.asyncio
++async def test_new_pick_after_ended_hold_holds_until_next_profile_edit(home, monkeypatch):
++    """An ended composer hold does not swallow a later explicit pick: the pick holds against the profile
++    target it was made on and ends, durably, on the next profile edit."""
++    from tests.gateway.test_model_switch_worker_composed import _mutate
++    store, db, authority, owner, ref = _owner(home, monkeypatch, _noop)
++    authority.runner._peek_session_state = lambda key: None
++    try:
++        _pinned_opus(home, authority, db, ref, monkeypatch)
++        db.set_session_title(ref.session_id, 'Bot Chat')
++        db.patch_session_model_config(ref.session_id, {
++            'composer_override_profile': {'model': ASTRA, 'provider': 'openai-codex'}})
++        _profile_pick(home, ASTRA, 'openai-codex')
++        await _open(authority, ref)
++        assert _worker_build(authority, db, ref, monkeypatch, 'held').model == OPUS
++        _profile_pick(home, OPUS, 'anthropic')
++        assert _worker_build(authority, db, ref, monkeypatch, 'ended').model == OPUS
++        assert 'selection_profile' not in _receipt_model(db, ref)
++        reply = await _mutate(owner, db, ref, 'repick', {'model': ASTRA, 'provider': 'openai-codex'})
++        assert (reply['result']['model'], reply['result'].get('status')) == (ASTRA, None), reply
++        assert _receipt_model(db, ref)['selection_profile'] == [OPUS, 'anthropic']
++        agent = _worker_build(authority, db, ref, monkeypatch, 'repicked')
++        assert (agent.model, agent.provider) == (ASTRA, 'openai-codex')
++        _profile_pick(home, OPUS, 'anthropic')  # a rewrite that keeps the target keeps the pick
++        assert _worker_build(authority, db, ref, monkeypatch, 'still-held').model == ASTRA
++        assert _receipt_model(db, ref)['selection_profile'] == [OPUS, 'anthropic']
+     finally:
+         await owner.close()
+         store.close_all_db_handles()
+-- 
+2.55.0
+

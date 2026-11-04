@@ -1,0 +1,1116 @@
+From b896f8ad686dc5111640744f5265a84cb3f30660 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:52:49 +0000
+Subject: [PATCH] [daveey] Desktop poll cost: revalidate kanban annotation on
+ unchanged inputs, cache gateway platforms/manifest names/status session rows
+ on file signatures
+
+David-MBP profile (t_01a199a0a5d38255 / t_01a19d0bcab45558): the kanban annotation refreshed every ~3 s because the
+counts TTL expired while no board content moved (3 of 60 polls saw a revision change), and every /api/status poll
+reloaded the gateway config (re-parsing ~27 bundled manifests) and re-read state.db for the active-session count.
+
+- kanban_session_activity: past the TTL, counts and attention verdicts read under an unchanged, revalidatable
+  fingerprint are re-served inline (no refresh thread), bounded by _COUNTS_MAX_AGE_S / _ATTENTION_MAX_AGE_S for
+  time-derived states; stat-keyed boards count only once their mtime settled.
+- kanban_activity_revision: memoize the trigger-coverage check on schema_version.
+- gateway/config: memoize bundled manifest names on file signature.
+- web_server_gateway: connected platforms kept on config/.env/gateway.json/managed signatures + env + home (60 s max age).
+- web_routers/status: active-session rows kept on settled state.db/-wal signatures; window applied per call.
+
+Tests RED first; each cache key component mutation-checked.
+---
+ gateway/config.py                             |  30 ++-
+ hermes_cli/kanban_activity_revision.py        |  37 +++-
+ hermes_cli/kanban_session_activity.py         | 126 +++++++++++-
+ .../kanban_session_activity_attention.py      |  35 +++-
+ hermes_cli/web_routers/status.py              |  66 ++++++-
+ hermes_cli/web_server_gateway.py              |  57 +++++-
+ .../test_bundled_manifest_scan_cache.py       |  57 ++++++
+ .../test_gateway_platforms_poll_cache.py      | 124 ++++++++++++
+ .../test_kanban_activity_revision.py          |  20 ++
+ ...test_kanban_annotation_unchanged_inputs.py | 186 ++++++++++++++++++
+ .../test_status_active_sessions_cache.py      |  88 +++++++++
+ 11 files changed, 786 insertions(+), 40 deletions(-)
+ create mode 100644 tests/gateway/test_bundled_manifest_scan_cache.py
+ create mode 100644 tests/hermes_cli/test_gateway_platforms_poll_cache.py
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
+ create mode 100644 tests/hermes_cli/test_status_active_sessions_cache.py
+
+diff --git a/gateway/config.py b/gateway/config.py
+index 11e99a56701..5927d4dfa78 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -200,16 +200,32 @@ _Platform__bundled_plugin_names: Optional[set] = None  # cached outside the enum
+ _Platform__bundled_plugin_aliases: Optional[dict] = None  # manifest ``name:`` (lower) -> directory name
+ 
+ 
++# [daveey] Parsed manifest ``name:`` per (path, device, inode, size, mtime_ns). Every Desktop ``/api/status`` poll
++# loads the gateway config, whose env fallbacks scan every bundled platform manifest: re-parsing ~27 YAML files was
++# ~10 ms of a ~12 ms load on David-MBP (t_01a19d0bcab45558). Bounded by the number of bundled platforms.
++_MANIFEST_NAMES: dict[str, tuple[tuple, Optional[str]]] = {}
++
++
+ def _bundled_platform_manifest_name(plugin_dir: Path) -> Optional[str]:
+     """Lowercased ``name:`` from a bundled platform's plugin manifest (None when absent/unreadable)."""
+     try:
+-        manifest_file = next(
+-            (plugin_dir / m for m in ("plugin.yaml", "plugin.yml") if (plugin_dir / m).exists()), None)
+-        if manifest_file is None:
+-            return None
+-        data = fast_safe_load(manifest_file.read_text(encoding="utf-8-sig")) or {}
+-        name = data.get("name") if isinstance(data, dict) else None
+-        return str(name).strip().lower() or None
++        for m in ("plugin.yaml", "plugin.yml"):
++            manifest_file = plugin_dir / m
++            try:
++                st = manifest_file.stat()
++            except FileNotFoundError:
++                continue
++            key = str(manifest_file)
++            signature = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
++            memo = _MANIFEST_NAMES.get(key)
++            if memo is not None and memo[0] == signature:
++                return memo[1]
++            data = fast_safe_load(manifest_file.read_text(encoding="utf-8-sig")) or {}
++            name = data.get("name") if isinstance(data, dict) else None
++            name = str(name).strip().lower() or None
++            _MANIFEST_NAMES[key] = (signature, name)
++            return name
++        return None
+     except Exception:
+         return None
+ 
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 2573737861b..4ab8e524969 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -26,6 +26,7 @@ from __future__ import annotations
+ 
+ import os
+ import sqlite3
++import threading
+ from pathlib import Path
+ from typing import Callable, Iterable
+ 
+@@ -152,6 +153,38 @@ def file_stat(path: Path) -> tuple:
+     return tuple(out)
+ 
+ 
++# [daveey] ``(path, device, inode, tables) -> schema_version`` at which ``read_key`` found the counter covering
++# ``tables``. Every Desktop poll keys each board; the ``sqlite_master`` scan was most of that cost on David-MBP
++# (t_01a19d0bcab45558). Any trigger or table change bumps ``schema_version`` (and a replaced file has a new inode),
++# so a matching version proves the same coverage; one statement reads both, in one snapshot.
++_COVERED: dict[tuple, int] = {}
++_COVERED_LOCK = threading.Lock()
++_COVERED_MAX = 256
++
++
++def _covered_read(conn: sqlite3.Connection, path: Path, db: tuple | None, tables: tuple[str, ...]) -> tuple | None:
++    memo_key = (str(path), db[0], db[1], tables) if db is not None else None
++    with _COVERED_LOCK:
++        version = _COVERED.get(memo_key) if memo_key is not None else None
++    if version is not None:
++        try:
++            row = conn.execute(_READ_SQL).fetchone()
++        except sqlite3.OperationalError:
++            row = None
++        if row is not None and int(row[1]) == version:
++            return (int(row[0]), int(row[1]))
++    revision = read_key(conn, tables)
++    if memo_key is not None:
++        with _COVERED_LOCK:
++            if revision is None:
++                _COVERED.pop(memo_key, None)
++            else:
++                if len(_COVERED) >= _COVERED_MAX:
++                    _COVERED.clear()
++                _COVERED[memo_key] = revision[1]
++    return revision
++
++
+ def content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
+     """A key that changes whenever any row of ``tables`` that the readers read changes in ``path`` (and on file
+     replacement or schema change), but not on bookkeeping-only writes. ``open_ro(path)`` is a context manager
+@@ -160,12 +193,12 @@ def content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
+     mtime tick that leaves the WAL size unchanged would otherwise hide a task write from the next read."""
+     tables = tuple(tables)
+     stat = file_stat(path)
++    db = stat[0]
+     try:
+         with open_ro(path) as conn:
+-            revision = read_key(conn, tables)
++            revision = _covered_read(conn, path, db, tables)
+     except sqlite3.Error:
+         revision = None
+-    db = stat[0]
+     if revision is None or db is None:
+         return ("stat", stat)
+     return ("revision", db[0], db[1], *revision)
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 667f9336e09..cd9081cfe5f 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -48,10 +48,17 @@ ACTIVE_STATUSES = ("todo", "ready", "running", "scheduled", "review")
+ BLOCKED_STATUSES = ("blocked", "triage")
+ 
+ _CACHE_TTL_S = 3.0
++# [daveey] Past the TTL, counts read under an unchanged fingerprint stay valid up to this age: the bound on the
++# time-derived states no key sees (stalled after kanban_wait_info.STALL_AFTER_S = 2 h, remote stale after
++# HUB_STALE_AFTER_S = 180 s), so one may show up to this much later than its threshold. A fingerprint that can't
++# prove "no write since" (``_revalidatable``) keeps the TTL bound. See ``_counts_fresh``.
++_COUNTS_MAX_AGE_S = 30.0
+ _cache_lock = threading.Lock()
+ _cache: tuple[float, dict[str, int], dict[str, int], dict[str, int], dict[str, int]] | None = None
+ _cache_scope: tuple[str, ...] | None = None
+ _cache_fingerprint: tuple = ()
++_cache_read_at = 0.0  # monotonic time of the read behind ``_cache``
++_cache_revalidatable = False  # its fingerprint proves no write since (``_revalidatable``)
+ _waiting_cache: list[dict[str, frozenset[str]]] = [{}]
+ # (parked, held) per session from the same snapshot as ``_cache`` (see ``_read_parked``); the sink is set while
+ # ``_all_counts`` reads local boards, like ``_pairs_sink``. [daveey]
+@@ -867,16 +874,45 @@ def _replica_paths() -> list[Path]:
+ 
+ def _activity_fingerprint(*, include_shadows: bool = True) -> tuple:
+     """Count inputs include sync shadows; the origin-ledger projection never reads them."""
++    pinned = getattr(_inputs_pin, "fingerprints", None)
++    if pinned is not None and pinned[int(include_shadows)] is not None:
++        return pinned[int(include_shadows)]
+     hub = _hub_db_path()
+     signature = [_hub_content_signature(hub)] if hub is not None else []
+     # [daveey] Each board's content revision (``kanban_activity_revision``), not its stat: bookkeeping writes
+     # (sync stamps, dispatch stamps, a replica's pull stamp) rewrite the files ~61x/min with no task change.
+     signature.extend((str(db), _board_content_key(db)) for db in _board_db_paths())
+     if include_shadows:
+-        signature.extend((str(db), _board_content_key(db, _revision.SHADOW_TABLES)) for db in _replica_paths())
++        signature.extend(_shadow_fingerprint())
+     return tuple(signature)
+ 
+ 
++def _shadow_fingerprint() -> tuple:
++    """What ``_activity_fingerprint()`` appends to the local one: each sync shadow's content key."""
++    return tuple((str(db), _board_content_key(db, _revision.SHADOW_TABLES)) for db in _replica_paths())
++
++
++_STAT_SETTLED_S = 2.0
++
++
++def _revalidatable(fingerprint: tuple, wall: float) -> bool:
++    """True when ``fingerprint`` (taken at wall time ``wall``) proves no write since: every board is keyed by its
++    content revision, or by a file stat last modified more than ``_STAT_SETTLED_S`` before ``wall``. A stat key can
++    miss a same-size commit inside the mtime tick of the previous one; a write after a settled stat lands in a later
++    tick and moves it. (A board no current writer opened, e.g. ``boards/_archived``, has only its stat.)"""
++    for entry in fingerprint:
++        if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], tuple) and entry[1][:1] == ("stat",):
++            for st in entry[1][1] if len(entry[1]) > 1 and isinstance(entry[1][1], tuple) else (None,):
++                if st is not None and (not isinstance(st, tuple) or len(st) < 4 or st[3] / 1e9 > wall - _STAT_SETTLED_S):
++                    return False
++    return True
++
++
++# [daveey] Set by ``_annotation_snapshot`` while it re-reads a scope whose inputs it just found unchanged:
++# ``(without shadows or None, with shadows)``, so the readers do not read every board's revision again (per thread).
++_inputs_pin = threading.local()
++
++
+ def _board_content_key(path: Path, tables: tuple[str, ...] = _revision.LOCAL_TABLES) -> tuple:
+     """Changes on every write to a row the activity readers read in ``path`` (stat fallback without the counter)."""
+     return _revision.content_key(path, tables, cached_ro)
+@@ -1239,9 +1275,10 @@ def _all_counts(*, include_waiting: bool = False, include_snapshot: bool = False
+     sat in this function, starving ``/api/status`` (2026-10-27). [daveey]"""
+     scope = _origin_scope()
+     now = time.monotonic()
++    wall = time.time()
+     fingerprint = _activity_fingerprint()
+     with _cache_lock:
+-        if _cache is not None and _cache_scope == scope and now < _cache[0] and fingerprint == _cache_fingerprint:
++        if _counts_fresh(scope, fingerprint, now):
+             return _cached_count_result(include_waiting, include_snapshot)
+         seen = _counts_generation
+     with _counts_flight:
+@@ -1249,13 +1286,24 @@ def _all_counts(*, include_waiting: bool = False, include_snapshot: bool = False
+             if _counts_generation != seen and _cache is not None and _cache_scope == scope:
+                 return _cached_count_result(include_waiting, include_snapshot)
+         return _recompute_all_counts(scope, now, fingerprint, include_waiting=include_waiting,
+-                                     include_snapshot=include_snapshot)
++                                     include_snapshot=include_snapshot, wall=wall)
++
++
++def _counts_fresh(scope: tuple[str, ...], fingerprint: tuple, now: float) -> bool:
++    """Caller holds ``_cache_lock``. The cached counts answer for ``fingerprint``: same scope and inputs, and either
++    within the TTL or (``_revalidatable`` fingerprint) younger than ``_COUNTS_MAX_AGE_S``. [daveey] A board write moves
++    its content revision, so it is never hidden (read-your-writes); the age bounds the time-derived states."""
++    if _cache is None or _cache_scope != scope or fingerprint != _cache_fingerprint:
++        return False
++    if now < _cache[0]:
++        return True
++    return _cache_revalidatable and now < _cache_read_at + _COUNTS_MAX_AGE_S
+ 
+ 
+ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bool,
+-                          include_snapshot: bool = False) -> tuple:
++                          include_snapshot: bool = False, wall: float | None = None) -> tuple:
+     """Read every local board and the remote links into fresh counts and publish them to the cache."""
+-    global _cache, _cache_scope, _cache_fingerprint, _counts_generation
++    global _cache, _cache_scope, _cache_fingerprint, _counts_generation, _cache_read_at, _cache_revalidatable
+     active: dict[str, int] = {}
+     blocked: dict[str, int] = {}
+     unseen: dict[str, int] = {}
+@@ -1312,6 +1360,8 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         counts, waiting_ids, parked_held, stalled, remote_ids, local_ids = fresh
+         _cache_scope = scope
+         _cache = (now + _CACHE_TTL_S, *counts)
++        _cache_read_at = now
++        _cache_revalidatable = wall is not None and _revalidatable(fingerprint, wall)
+         _cache_fingerprint = fingerprint
+         _counts_generation += 1
+         _waiting_cache[0] = waiting_ids
+@@ -1702,9 +1752,12 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+ # registered = no field, no extra reads (upstream behaviour).
+ ATTENTION_WINDOW_S = 24 * 3600
+ _ATTENTION_TTL_S = 30.0
++# [daveey] Past the TTL the counts stay valid while the local boards' content revisions are unchanged, up to this age
++# (it bounds the time-derived ATTENTION_WINDOW_S edge). See kanban_session_activity_attention.
++_ATTENTION_MAX_AGE_S = 300.0
+ _done_checks: dict[str, Callable[[dict[str, Any]], bool]] = {}
+ # [daveey] Per origin scope, with done-check verdicts shared across scopes (see the module).
+-_attention = _AttentionCache(_ATTENTION_TTL_S)
++_attention = _AttentionCache(_ATTENTION_TTL_S, max_age_s=_ATTENTION_MAX_AGE_S)
+ 
+ 
+ def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool]) -> Callable[[], None]:
+@@ -1762,6 +1815,10 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     scope = _origin_scope()
+     mono = time.monotonic()
+     hit = _attention.get(scope, mono)
++    if hit is not None:
++        return hit
++    inputs = _attention_key()
++    hit = _attention.get(scope, mono, inputs)
+     if hit is not None:
+         return hit
+     since = (time.time() if now is None else now) - ATTENTION_WINDOW_S
+@@ -1782,10 +1839,24 @@ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     counts: dict[str, int] = {}
+     for sid, _tid in pairs:
+         counts[sid] = counts.get(sid, 0) + 1
+-    _attention.put(scope, mono, counts)
++    _attention.put(scope, mono, counts, inputs)
+     return counts
+ 
+ 
++def _attention_key(local: tuple | None = None, wall: float | None = None) -> tuple | None:
++    """What the done checks read: the local boards' content keys (``local``, taken at ``wall``, when the caller
++    already has them). None unless ``_revalidatable``, or when the boards can't be read: then only the TTL serves the
++    cache."""
++    if local is None:
++        wall = time.time()
++        try:
++            local = _activity_fingerprint(include_shadows=False)
++        except Exception:  # health: allow BLE001 -- a revalidation input; the recompute surfaces a real read error
++            _log.debug("kanban attention key unavailable", exc_info=True)
++            return None
++    return local if _revalidatable(local, time.time() if wall is None else wall) else None
++
++
+ def _read_annotation_parts() -> tuple:
+     (active, blocked, unseen, remote_stale, waiting, parked, held, stalled,
+      remote_keys) = _all_counts(include_snapshot=True)
+@@ -1813,12 +1884,12 @@ def _read_annotation_parts() -> tuple:
+ _frozen_parts: dict[tuple[str, ...], tuple] = {}
+ 
+ 
+-def _refresh_annotation_locked(scope: tuple[str, ...]) -> tuple:
++def _refresh_annotation_locked(scope: tuple[str, ...], read_at: float | None = None) -> tuple:
+     """Read this scope's parts and publish them. Caller holds ``_annotate_refresh_lock``."""
+     global _annotate_flight_scope, _annotate_flight_result
+     _annotate_flight_scope = scope
+     _annotate_flight_result = None
+-    read_at = time.time()
++    read_at = time.time() if read_at is None else read_at
+     parts = _read_annotation_parts()
+     _bounded.record(scope, parts, read_at)
+     _last_annotation[scope] = parts
+@@ -1868,10 +1939,47 @@ def _annotation_snapshot() -> tuple:
+             return _refresh_annotation_locked(scope)
+         finally:
+             _annotate_refresh_lock.release()
++    try:
++        unchanged = _unchanged_inputs(scope)
++    except Exception:  # health: allow BLE001 -- only a shortcut probe; the bounded refresh reports a real read error
++        _log.debug("kanban annotation input probe failed; refreshing", exc_info=True)
++        unchanged = None
++    if unchanged is not None:
++        # [daveey] Nothing the read depends on moved: re-read inline, where every heavy part is a cache hit (no
++        # refresh thread, no recompute). It still runs the waiting sources and dates a new observation.
++        read_at, fingerprints = unchanged
++        _inputs_pin.fingerprints = fingerprints
++        try:
++            return _refresh_annotation_locked(scope, read_at)
++        finally:
++            _inputs_pin.fingerprints = None
++            _annotate_refresh_lock.release()
+     return _bounded.refresh_bounded(lambda: _refresh_annotation_locked(scope), _annotate_refresh_lock, previous,
+                                     _REFRESH_WAIT_S)
+ 
+ 
++def _unchanged_inputs(scope: tuple[str, ...]) -> tuple[float, tuple] | None:
++    """``(wall time, pinned fingerprints)`` when a read of ``scope`` now would be all cache hits: the counts answer
++    for the boards' current content revisions (``_counts_fresh``) and the attention counts (when checks are
++    registered) for the local boards'. None otherwise, or while nothing is cached. [daveey] On David-MBP a Desktop
++    poll started a refresh thread every ~3 s (20/min) although board content moved in 3 of 60 polls."""
++    with _cache_lock:
++        if _cache is None or _cache_scope != scope:
++            return None
++    read_at = time.time()
++    mono = time.monotonic()
++    local = _activity_fingerprint(include_shadows=False)
++    full = local + _shadow_fingerprint()  # one read of each board serves both keys
++    with _cache_lock:
++        if not _counts_fresh(scope, full, mono):
++            return None
++    if _done_checks and _attention.get(scope, mono) is None:
++        key = _attention_key(local, read_at)
++        if key is None or _attention.get(scope, mono, key) is None:
++            return None
++    return read_at, (local, full)
++
++
+ annotation_read_at = _bounded.read_at
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity_attention.py b/hermes_cli/kanban_session_activity_attention.py
+index 0c5dec1b748..215e8736d52 100644
+--- a/hermes_cli/kanban_session_activity_attention.py
++++ b/hermes_cli/kanban_session_activity_attention.py
+@@ -4,6 +4,11 @@ One process annotates several profiles in one request (``/api/profiles/projects/
+ single-slot cache was evicted by every other scope, so its 30 s TTL never hit: each tree poll re-ran every done check
+ for every profile (48 board reads, 2-2.5 s on the hub) and evicted the default scope, whose next
+ ``/api/sessions/<id>`` re-ran them too.
++
++A count past its TTL is still served while the boards it read are unchanged (same content ``key``) and it is younger
++than ``max_age_s``: the done checks read only the card and the boards, so with no board write their verdicts cannot
++have moved. ``max_age_s`` bounds what the key cannot see (a card leaving the ``ATTENTION_WINDOW_S`` window). On
++David-MBP every expiry re-ran every check (~125 ms of CPU each 30 s) while no local board changed for minutes.
+ """
+ 
+ from __future__ import annotations
+@@ -27,14 +32,15 @@ def run_checks(checks: list[Callable[[dict[str, Any]], bool]], card: dict[str, A
+ 
+ 
+ class AttentionCache:
+-    """``counts``: ``{scope: (expires_mono, counts)}``, bounded at ``max_scopes``. ``verdicts``:
++    """``counts``: ``{scope: (expires_mono, counts, key, read_mono)}``, bounded at ``max_scopes``. ``verdicts``:
+     ``{(boards, board_path, id, completed_at, title, summary): (expires_mono, flagged)}``. A check reads only the
+     card and the boards, so another profile on the same kanban root gets the same verdict within the TTL."""
+ 
+-    def __init__(self, ttl_s: float, max_scopes: int = 64) -> None:
++    def __init__(self, ttl_s: float, max_scopes: int = 64, max_age_s: float | None = None) -> None:
+         self.ttl_s = ttl_s
++        self.max_age_s = ttl_s if max_age_s is None else max(ttl_s, max_age_s)
+         self.max_scopes = max_scopes
+-        self.counts: dict[tuple[str, ...], tuple[float, dict[str, int]]] = {}
++        self.counts: dict[tuple[str, ...], tuple[float, dict[str, int], Any, float]] = {}
+         self.verdicts: dict[tuple, tuple[float, bool]] = {}
+         self._lock = threading.Lock()
+ 
+@@ -43,17 +49,26 @@ class AttentionCache:
+             self.counts.clear()
+             self.verdicts.clear()
+ 
+-    def get(self, scope: tuple[str, ...], mono: float) -> dict[str, int] | None:
++    def get(self, scope: tuple[str, ...], mono: float, key: Any = None) -> dict[str, int] | None:
++        """The cached counts within the TTL; past it, only while ``key`` (not None) equals the key they were read
++        under and they are younger than ``max_age_s``."""
+         with self._lock:
+             hit = self.counts.get(scope)
+-        return hit[1] if hit is not None and mono < hit[0] else None
++        if hit is None:
++            return None
++        if mono < hit[0]:
++            return hit[1]
++        if key is not None and key == hit[2] and mono < hit[3] + self.max_age_s:
++            return hit[1]
++        return None
+ 
+-    def put(self, scope: tuple[str, ...], mono: float, counts: dict[str, int]) -> None:
++    def put(self, scope: tuple[str, ...], mono: float, counts: dict[str, int], key: Any = None) -> None:
+         with self._lock:
+-            self.counts[scope] = (mono + self.ttl_s, counts)
+-            for store in (self.counts, self.verdicts):
+-                for key in [k for k, v in store.items() if v[0] <= mono]:
+-                    store.pop(key, None)
++            self.counts[scope] = (mono + self.ttl_s, counts, key, mono)
++            for k in [k for k, v in self.counts.items() if v[3] + self.max_age_s <= mono]:
++                self.counts.pop(k, None)
++            for k in [k for k, v in self.verdicts.items() if v[0] <= mono]:
++                self.verdicts.pop(k, None)
+             while len(self.counts) > self.max_scopes:
+                 self.counts.pop(next(iter(self.counts)))
+ 
+diff --git a/hermes_cli/web_routers/status.py b/hermes_cli/web_routers/status.py
+index 9dc8542905f..b5333d2f741 100644
+--- a/hermes_cli/web_routers/status.py
++++ b/hermes_cli/web_routers/status.py
+@@ -12,6 +12,7 @@ import re
+ import asyncio
+ import os
+ import sys
++import threading
+ import time
+ from fastapi import APIRouter
+ from hermes_cli.web_deps import LateState, late
+@@ -77,20 +78,65 @@ def _safe_call(mod, fn_name: str, default):
+ 
+ def _count_status_active_sessions() -> int:
+     """Best-effort status garnish. Opens read-only (via the shared stale-schema heal) so
+-    /api/status never routinely writes to state.db while another Hermes process uses it."""
++    /api/status never routinely writes to state.db while another Hermes process uses it.
++
++    [daveey] The rows are kept on the store's settled file signatures (``_state_store_key``): every
++    Desktop status poll re-ran ``list_sessions_rich``. The 5-minute window is applied per call."""
++    global _active_rows_cache
+     from hermes_state import _default_db_path
+     # The heal helper bootstraps a missing store; this garnish must not — on a fresh install
+     # /api/status polls would otherwise create state.db before the user's first session.
+-    if not Path(_default_db_path()).exists():
++    path = Path(_default_db_path())
++    if not path.exists():
+         return 0
+-    db = _open_session_db_for_profile(None, read_only=True)
+-    try:
+-        sessions = db.list_sessions_rich(limit=50, compact_rows=True)
+-        now = time.time()
+-        return sum(1 for s in sessions if s.get("ended_at") is None
+-                   and (now - s.get("last_active", s.get("started_at", 0))) < 300)
+-    finally:
+-        db.close()
++    key = _state_store_key(path)
++    with _active_rows_lock:
++        hit = _active_rows_cache
++    if key is not None and hit is not None and hit[0] == key:
++        rows = hit[1]
++    else:
++        db = _open_session_db_for_profile(None, read_only=True)
++        try:
++            sessions = db.list_sessions_rich(limit=50, compact_rows=True)
++        finally:
++            db.close()
++        rows = tuple((s.get("ended_at"), s.get("last_active", s.get("started_at", 0))) for s in sessions)
++        with _active_rows_lock:
++            _active_rows_cache = (key, rows) if key is not None else None
++    now = time.time()
++    return sum(1 for ended_at, last_active in rows if ended_at is None and (now - (last_active or 0)) < 300)
++
++
++# [daveey] (store key, ((ended_at, last_active), ...)) for ``_count_status_active_sessions``.
++_active_rows_lock = threading.Lock()
++_active_rows_cache: Optional[tuple] = None
++
++
++def _reset_active_sessions_cache_for_tests() -> None:
++    global _active_rows_cache
++    with _active_rows_lock:
++        _active_rows_cache = None
++
++
++def _state_store_key(path: Path) -> Optional[tuple]:
++    """``state.db`` and ``-wal`` file signatures, taken BEFORE the read; None (no caching) while either is inside
++    the racy window, where a same-tick write could leave the signature unchanged. Every commit appends to the WAL
++    or, after a checkpoint, rewrites it in a later tick, so a settled signature that still matches proves no
++    write since."""
++    from utils import file_signature, mtime_is_racy
++    sigs = []
++    for p in (path, Path(str(path) + "-wal")):
++        try:
++            sig = file_signature(p.stat())
++        except FileNotFoundError:
++            sigs.append(None)
++            continue
++        except OSError:
++            return None
++        if mtime_is_racy(max(sig[0], sig[3])):
++            return None
++        sigs.append(sig)
++    return (str(path), *sigs)
+ 
+ 
+ async def _status_active_sessions() -> int:
+diff --git a/hermes_cli/web_server_gateway.py b/hermes_cli/web_server_gateway.py
+index 93647bd0f70..1e82be9a8ee 100644
+--- a/hermes_cli/web_server_gateway.py
++++ b/hermes_cli/web_server_gateway.py
+@@ -261,9 +261,62 @@ def _collect_profile_gateway_topology_cached() -> dict[str, Any]:
+ def _load_configured_gateway_platforms() -> set[str]:
+     """Connected platform names; synchronous by design — the first ``load_gateway_config()`` does
+     platform discovery and can outlast Desktop's WS connect timeout on Windows, so ``get_status``
+-    runs this in Starlette's worker pool."""
++    runs this in Starlette's worker pool.
++
++    [daveey] Kept on ``_platform_inputs()`` (file signatures, environment, home) up to
++    ``_PLATFORMS_MAX_AGE_S``: every Desktop ``/api/status`` poll used to reload the whole gateway config."""
+     from gateway.config import load_gateway_config
+-    return {platform.value for platform in load_gateway_config().get_connected_platforms()}
++    global _platforms_cache
++    key = _platform_inputs()
++    now = time.monotonic()
++    with _platforms_lock:
++        hit = _platforms_cache
++    if hit is not None and hit[0] == key and now < hit[1] + _PLATFORMS_MAX_AGE_S:
++        return set(hit[2])
++    platforms = frozenset(platform.value for platform in load_gateway_config().get_connected_platforms())
++    with _platforms_lock:
++        _platforms_cache = (key, now, platforms)
++    return set(platforms)
++
++
++# [daveey] (inputs key, monotonic read time, platforms). The key is taken BEFORE the load: a write during it costs
++# one more load next poll instead of pinning the older result. The max age bounds what no key sees: a platform's
++# ``is_connected`` check may read its own state, and plugin YAML hooks run only on a load.
++_PLATFORMS_MAX_AGE_S = 60.0
++_platforms_lock = threading.Lock()
++_platforms_cache: Optional[tuple[tuple, float, frozenset]] = None
++
++
++def _reset_platforms_cache_for_tests() -> None:
++    global _platforms_cache
++    with _platforms_lock:
++        _platforms_cache = None
++
++
++def _platform_inputs() -> tuple:
++    """What ``load_gateway_config()`` reads: the home's ``config.yaml`` (through its backend), ``gateway.json`` and
++    ``.env``, the managed layer's ``config.yaml``/``.env``, and the process environment (env overrides)."""
++    from hermes_cli.config_backend import config_cache_version_or_none
++    from hermes_cli.managed_scope import get_managed_dir
++    from utils import file_cache_version
++
++    def sig(path: Path):
++        try:
++            return file_cache_version(path)
++        except OSError:
++            return None
++
++    home = get_hermes_home()
++    managed = get_managed_dir()
++    return (
++        str(home),
++        config_cache_version_or_none(home / "config.yaml"),
++        sig(home / "gateway.json"),
++        sig(home / ".env"),
++        str(managed) if managed is not None else None,
++        tuple(sig(managed / name) for name in ("config.yaml", ".env")) if managed is not None else (),
++        hash(frozenset(os.environ.items())),
++    )
+ 
+ 
+ _WINDOWS_11_MIN_BUILD = 22000
+diff --git a/tests/gateway/test_bundled_manifest_scan_cache.py b/tests/gateway/test_bundled_manifest_scan_cache.py
+new file mode 100644
+index 00000000000..1dca0ba005e
+--- /dev/null
++++ b/tests/gateway/test_bundled_manifest_scan_cache.py
+@@ -0,0 +1,57 @@
++"""The bundled platform manifest scan parses each ``plugin.yaml`` once per file signature. [daveey]
++
++David-MBP profile (t_01a199a0a5d38255): every Desktop ``/api/status`` poll ran ``load_gateway_config`` ->
++``_bundled_env_fallbacks`` -> ``Platform._scan_bundled_plugin_platforms``, which YAML-parsed all ~27 bundled platform
++manifests again (~10 ms of a ~12 ms config load on the Mac). The manifest ``name:`` is now memoized on the file's
++(device, inode, size, mtime_ns), so an edited or replaced manifest is still read afresh.
++"""
++
++from __future__ import annotations
++
++import os
++
++import gateway.config as gc
++
++
++def _spy(monkeypatch):
++    calls = []
++    real = gc.fast_safe_load
++
++    def spy(text):
++        calls.append(text)
++        return real(text)
++
++    monkeypatch.setattr(gc, "fast_safe_load", spy)
++    return calls
++
++
++def test_unchanged_manifest_is_parsed_once(tmp_path, monkeypatch):
++    plugin = tmp_path / "irc"
++    plugin.mkdir()
++    (plugin / "plugin.yaml").write_text("name: irc-platform\n", encoding="utf-8")
++    calls = _spy(monkeypatch)
++    assert [gc._bundled_platform_manifest_name(plugin) for _ in range(5)] == ["irc-platform"] * 5
++    assert len(calls) == 1
++
++
++def test_edited_manifest_is_read_again(tmp_path, monkeypatch):
++    plugin = tmp_path / "irc"
++    plugin.mkdir()
++    manifest = plugin / "plugin.yaml"
++    manifest.write_text("name: irc-platform\n", encoding="utf-8")
++    assert gc._bundled_platform_manifest_name(plugin) == "irc-platform"
++    st = manifest.stat()
++    manifest.write_text("name: irc-renamed\n", encoding="utf-8")
++    os.utime(manifest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
++    assert gc._bundled_platform_manifest_name(plugin) == "irc-renamed"
++    manifest.unlink()
++    (plugin / "plugin.yml").write_text("name: irc-yml\n", encoding="utf-8")
++    assert gc._bundled_platform_manifest_name(plugin) == "irc-yml"
++
++
++def test_repeated_scans_parse_no_manifest(monkeypatch):
++    first = gc.Platform._scan_bundled_plugin_platforms()
++    calls = _spy(monkeypatch)
++    for _ in range(3):
++        assert gc.Platform._scan_bundled_plugin_platforms() == first
++    assert calls == []
+diff --git a/tests/hermes_cli/test_gateway_platforms_poll_cache.py b/tests/hermes_cli/test_gateway_platforms_poll_cache.py
+new file mode 100644
+index 00000000000..f5d5cadd015
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_platforms_poll_cache.py
+@@ -0,0 +1,124 @@
++"""``/api/status`` reloads the gateway config only when an input moved. [daveey]
++
++David-MBP profile (t_01a199a0a5d38255): every Desktop status poll ran ``load_gateway_config()`` (legacy JSON, config
++YAML + managed overlay, plugin YAML hooks, env overrides, bundled manifest scan) for the connected-platform set. The
++set is now kept on the inputs' file signatures (``config.yaml``, ``gateway.json``, ``.env``, the managed layer), the
++process environment and the home path, with ``_PLATFORMS_MAX_AGE_S`` bounding what no key sees (a platform's
++connected check may read its own state).
++"""
++
++from __future__ import annotations
++
++import os
++
++import pytest
++
++import gateway.config as gc
++from hermes_cli import web_server_gateway as wsg
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
++    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
++    now = {"mono": 100.0}
++    monkeypatch.setattr(wsg.time, "monotonic", lambda: now["mono"])
++    wsg._reset_platforms_cache_for_tests()
++    yield home, now
++    wsg._reset_platforms_cache_for_tests()
++
++
++@pytest.fixture
++def loads(monkeypatch):
++    calls = []
++    real = gc.load_gateway_config
++
++    def spy():
++        calls.append(1)
++        return real()
++
++    monkeypatch.setattr(gc, "load_gateway_config", spy)
++    return calls
++
++
++def _write(path, text):
++    """Rewrite ``path`` and move its mtime past any racy window (a same-tick rewrite is covered by the digest)."""
++    old = path.stat() if path.exists() else None
++    path.write_text(text, encoding="utf-8")
++    if old is not None:
++        bumped = max(old.st_mtime_ns, path.stat().st_mtime_ns) + 5_000_000_000
++        os.utime(path, ns=(bumped, bumped))
++
++
++def test_identical_polls_load_the_config_once(home, loads):
++    h, now = home
++    _write(h / "config.yaml", "platforms:\n  telegram:\n    enabled: true\n    token: abc123real\n")
++    first = wsg._load_configured_gateway_platforms()
++    assert "telegram" in first
++    for _ in range(5):
++        now["mono"] += 3
++        assert wsg._load_configured_gateway_platforms() == first
++    assert len(loads) == 1
++
++
++def test_a_config_write_shows_on_the_next_poll(home, loads):
++    h, _now = home
++    _write(h / "config.yaml", "platforms:\n  telegram:\n    enabled: true\n    token: abc123real\n")
++    assert "telegram" in wsg._load_configured_gateway_platforms()
++    _write(h / "config.yaml", "platforms:\n  telegram:\n    enabled: false\n    token: abc123real\n")
++    assert "telegram" not in wsg._load_configured_gateway_platforms()
++    assert len(loads) == 2
++
++
++def test_a_same_tick_same_size_rewrite_is_not_hidden(home, loads):
++    h, _now = home
++    cfg = h / "config.yaml"
++    cfg.write_text("platforms:\n  telegram:\n    enabled: true \n    token: abc123real\n", encoding="utf-8")
++    st = cfg.stat()
++    assert "telegram" in wsg._load_configured_gateway_platforms()
++    cfg.write_text("platforms:\n  telegram:\n    enabled: false\n    token: abc123real\n", encoding="utf-8")
++    os.utime(cfg, ns=(st.st_atime_ns, st.st_mtime_ns))  # same size, same mtime: only the racy digest tells
++    assert "telegram" not in wsg._load_configured_gateway_platforms()
++
++
++def test_an_env_write_or_dotenv_edit_shows_on_the_next_poll(home, loads, monkeypatch):
++    h, _now = home
++    _write(h / "config.yaml", "platforms:\n  discord:\n    enabled: true\n")
++    before = wsg._load_configured_gateway_platforms()
++    assert "discord" not in before
++    monkeypatch.setenv("DISCORD_BOT_TOKEN", "abc123realtokenvalue")
++    assert "discord" in wsg._load_configured_gateway_platforms()
++    assert len(loads) == 2
++    _write(h / ".env", "SOMETHING=1\n")
++    wsg._load_configured_gateway_platforms()
++    assert len(loads) == 3
++
++
++def test_a_home_switch_or_the_max_age_reloads(home, loads, tmp_path, monkeypatch):
++    _h, now = home
++    wsg._load_configured_gateway_platforms()
++    other = tmp_path / "other"
++    other.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(other))
++    wsg._load_configured_gateway_platforms()
++    assert len(loads) == 2
++    now["mono"] += wsg._PLATFORMS_MAX_AGE_S + 1
++    wsg._load_configured_gateway_platforms()
++    assert len(loads) == 3
++
++
++def test_a_failed_load_is_not_cached(home, monkeypatch):
++    calls = []
++
++    def boom():
++        calls.append(1)
++        raise RuntimeError("bad config")
++
++    monkeypatch.setattr(gc, "load_gateway_config", boom)
++    for _ in range(2):
++        with pytest.raises(RuntimeError):
++            wsg._load_configured_gateway_platforms()
++    assert len(calls) == 2
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+index 27f0d930132..4254fe8ed6c 100644
+--- a/tests/hermes_cli/test_kanban_activity_revision.py
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -251,3 +251,23 @@ def test_an_unchanged_annotation_reuses_its_frozen_parts(board, monkeypatch):
+     kb.complete_task(board, tid, result="ok")
+     changed = ksa._read_annotation_parts()
+     assert changed is not first and changed[0] == {} and len(freezes) == 2
++
++
++def test_an_unchanged_schema_checks_trigger_coverage_once(board, monkeypatch):
++    """[daveey] Every Desktop poll keys each board; re-scanning ``sqlite_master`` for the triggers each time was most
++    of the fingerprint's cost on David-MBP. The coverage verdict is kept per file and ``schema_version`` (a dropped
++    or added trigger moves it), so later keys read only the counter row."""
++    kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    path = ksa._board_db_paths()[0]
++    scans = []
++    real = rev.read_key
++    monkeypatch.setattr(rev, "read_key", lambda conn, tables: scans.append(1) or real(conn, tables))
++    first = ksa._board_content_key(path)
++    assert [ksa._board_content_key(path) for _ in range(4)] == [first] * 4
++    assert len(scans) == 1
++    kb.create_task(board, title="more", assignee="worker", session_id="s_chat")
++    moved = ksa._board_content_key(path)
++    assert rev.is_revision(moved) and moved != first and len(scans) == 1
++    board.execute("DROP TRIGGER kanban_activity_rev_tasks_update")
++    board.commit()
++    assert ksa._board_content_key(path)[0] == "stat" and len(scans) == 2
+diff --git a/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py b/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
+new file mode 100644
+index 00000000000..4a0115423d7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
+@@ -0,0 +1,186 @@
++"""A Desktop poll whose kanban inputs did not change reuses the previous read instead of refreshing. [daveey]
++
++David-MBP profile (t_01a199a0a5d38255, 60 s, Desktop open, 1-2 agents): the session-list poll (every ~3 s) started a
++``kanban-annotation-refresh`` thread on every poll (20/min, 1.72% of a core) because the counts cache expired after
++``_CACHE_TTL_S`` (3 s) even when no board content had moved, and the attention cache re-ran every done check after its
++30 s TTL. A 3-minute read of the live boards saw a content change in 3 of 60 polls. Now a poll whose board content
++revisions (and the attention inputs) are unchanged revalidates the cached read inline: no thread, no recompute, a new
++observation date. A board write still shows on the very next poll (read-your-writes); time-derived states (stalled,
++remote stale) are bounded by ``_COUNTS_MAX_AGE_S`` like the remote-links projection (``_LINKS_MAX_AGE_S``), and a board
++without the content-revision counter keeps the old 3 s bound.
++"""
++
++from __future__ import annotations
++
++import os
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as revision
++from hermes_cli import kanban_session_activity as ksa
++
++
++@pytest.fixture
++def clock(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    monkeypatch.setattr(ksa._annotation_copy, "published", lambda scope, parts: None)
++    monkeypatch.setattr(ksa._annotation_copy, "seed", lambda *a, **k: None)
++    now = {"mono": 1000.0, "wall": 5000.0}
++    monkeypatch.setattr(ksa.time, "monotonic", lambda: now["mono"])
++    monkeypatch.setattr(ksa.time, "time", lambda: now["wall"])
++    ksa._reset_cache_for_tests()
++    yield now
++    ksa._reset_cache_for_tests()
++
++
++def _advance(now, seconds):
++    now["mono"] += seconds
++    now["wall"] += seconds
++
++
++def _board(path: Path, rows, *, counted: bool = True) -> sqlite3.Connection:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path, isolation_level=None)
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)")
++    if counted:
++        revision.ensure_revision(conn, revision.LOCAL_TABLES)
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
++    return conn
++
++
++@pytest.fixture
++def spies(monkeypatch):
++    calls = {"recompute": 0, "threads": 0}
++    recompute, bounded = ksa._recompute_all_counts, ksa._bounded.refresh_bounded
++
++    def counting_recompute(*a, **k):
++        calls["recompute"] += 1
++        return recompute(*a, **k)
++
++    def counting_bounded(*a, **k):
++        calls["threads"] += 1
++        return bounded(*a, **k)
++
++    monkeypatch.setattr(ksa, "_recompute_all_counts", counting_recompute)
++    monkeypatch.setattr(ksa._bounded, "refresh_bounded", counting_bounded)
++    return calls
++
++
++def _poll(sid="s1"):
++    return ksa.annotate_kanban_activity([{"id": sid}])[0]
++
++
++def test_unchanged_polls_past_the_ttl_reuse_one_read_without_a_refresh_thread(clock, spies, tmp_path):
++    conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1")])
++    try:
++        assert _poll()["kanban_active"] == 1
++        dates = []
++        for _ in range(4):  # a Desktop poll every 3 s: past _CACHE_TTL_S each time
++            _advance(clock, ksa._CACHE_TTL_S + 0.5)
++            row = _poll()
++            assert row["kanban_active"] == 1 and "kanban_unknown" not in row
++            dates.append(row["kanban_observed_at"])
++        assert spies["recompute"] == 1
++        assert spies["threads"] == 0
++        # Each revalidation is a new observation: the Desktop's freshness checks see a current date.
++        assert dates == sorted(dates) and len(set(dates)) == 4
++        assert dates[-1] >= clock["wall"] - ksa._CACHE_TTL_S
++    finally:
++        conn.close()
++
++
++def test_a_board_write_shows_on_the_next_poll(clock, spies, tmp_path):
++    conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1")])
++    try:
++        assert _poll()["kanban_active"] == 1
++        _advance(clock, ksa._CACHE_TTL_S + 0.5)
++        assert _poll()["kanban_active"] == 1
++        conn.execute("INSERT INTO tasks VALUES ('t2', 'ready', 's1')")
++        _advance(clock, 0.1)  # well inside the TTL: the content revision moved, so the cache is not used
++        assert _poll()["kanban_active"] == 2
++        conn.execute("UPDATE tasks SET status = 'archived'")
++        _advance(clock, ksa._CACHE_TTL_S + 0.5)
++        assert "kanban_active" not in _poll()
++    finally:
++        conn.close()
++
++
++def test_time_derived_states_are_re_read_after_the_max_age(clock, spies, tmp_path):
++    conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1")])
++    try:
++        _poll()
++        assert spies["recompute"] == 1
++        _advance(clock, ksa._COUNTS_MAX_AGE_S + 0.5)
++        _poll()
++        assert spies["recompute"] == 2
++    finally:
++        conn.close()
++
++
++def test_a_board_without_the_revision_counter_keeps_the_ttl_bound(clock, spies, tmp_path):
++    conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1")], counted=False)
++    try:
++        _poll()
++        _advance(clock, ksa._CACHE_TTL_S + 0.5)
++        _poll()
++        # A stat key can miss a same-size commit inside one mtime tick: only the TTL bounds it, as before.
++        assert spies["recompute"] == 2
++    finally:
++        conn.close()
++
++
++def test_a_settled_stat_keyed_board_revalidates_until_it_is_written(clock, spies, tmp_path):
++    """``boards/_archived`` on David-MBP has no revision counter (no current writer opened it); its stat is days old.
++    A write after a settled stat lands in a later mtime tick, so the stat key is proof enough."""
++    path = tmp_path / "kanban.db"
++    conn = _board(path, [("t1", "running", "s1")], counted=False)
++    try:
++        old = int((clock["wall"] - 3600) * 1e9)
++        os.utime(path, ns=(old, old))
++        assert _poll()["kanban_active"] == 1
++        _advance(clock, ksa._CACHE_TTL_S + 0.5)
++        assert _poll()["kanban_active"] == 1
++        assert spies == {"recompute": 1, "threads": 0}
++        conn.execute("INSERT INTO tasks VALUES ('t2', 'ready', 's1')")
++        _advance(clock, 0.1)
++        assert _poll()["kanban_active"] == 2
++    finally:
++        conn.close()
++
++
++def _done_board(path: Path) -> sqlite3.Connection:
++    conn = _board(path, [])
++    conn.execute("ALTER TABLE tasks ADD COLUMN title TEXT")
++    conn.execute("ALTER TABLE tasks ADD COLUMN completed_at REAL")
++    conn.execute("ALTER TABLE tasks ADD COLUMN result TEXT")
++    revision.drop_triggers(conn)
++    revision.ensure_revision(conn, revision.LOCAL_TABLES)
++    return conn
++
++
++def test_attention_checks_rerun_only_when_board_content_moved(clock, monkeypatch, tmp_path):
++    conn = _done_board(tmp_path / "kanban.db")
++    conn.execute("INSERT INTO tasks VALUES ('t1', 'done', 's1', 'ship it', ?, 'done')", (clock["wall"] - 60,))
++    checked = []
++    dispose = ksa.register_done_check("test", lambda card: checked.append(card["id"]) or True)
++    try:
++        assert _poll()["kanban_attention"] == 1
++        assert checked == ["t1"]
++        for _ in range(3):  # past the 30 s attention TTL, nothing written
++            _advance(clock, ksa._ATTENTION_TTL_S + 1)
++            assert _poll()["kanban_attention"] == 1
++        assert checked == ["t1"]
++        conn.execute("INSERT INTO tasks VALUES ('t2', 'done', 's1', 'and this', ?, 'done')", (clock["wall"] - 5,))
++        _advance(clock, ksa._ATTENTION_TTL_S + 1)
++        assert _poll()["kanban_attention"] == 2
++        assert sorted(checked) == ["t1", "t1", "t2"]  # verdicts past their TTL re-run once the content moved
++        _advance(clock, ksa._ATTENTION_MAX_AGE_S + 1)  # the 24 h window is time-derived: bounded by the max age
++        _poll()
++        assert len(checked) == 5
++    finally:
++        dispose()
++        conn.close()
++
+diff --git a/tests/hermes_cli/test_status_active_sessions_cache.py b/tests/hermes_cli/test_status_active_sessions_cache.py
+new file mode 100644
+index 00000000000..c5c4076c4aa
+--- /dev/null
++++ b/tests/hermes_cli/test_status_active_sessions_cache.py
+@@ -0,0 +1,88 @@
++"""``/api/status``'s active-session count re-reads ``state.db`` only when it changed. [daveey]
++
++David-MBP profile (t_01a199a0a5d38255): every Desktop status poll opened ``state.db`` and ran ``list_sessions_rich``
++(50 rows) to count sessions active in the last 5 minutes (~4-6 ms of CPU on the Mac). The rows are now kept on the
++file signatures of ``state.db`` and its WAL, trusted only once settled (a write in the same timestamp tick as the
++stat could keep the signature); the 5-minute window is applied afresh on every call.
++"""
++
++from __future__ import annotations
++
++import time
++
++import pytest
++
++import utils
++from hermes_cli.web_routers import status as st
++from hermes_state import SessionDB, _default_db_path
++
++
++@pytest.fixture
++def home():
++    home = _default_db_path().parent  # the hermetic conftest pins the store path
++    home.mkdir(parents=True, exist_ok=True)
++    st._reset_active_sessions_cache_for_tests()
++    yield home
++    st._reset_active_sessions_cache_for_tests()
++
++
++@pytest.fixture
++def opens(monkeypatch):
++    calls = []
++    real = st._open_session_db_for_profile
++
++    def spy(*a, **k):
++        calls.append(1)
++        return real(*a, **k)
++
++    monkeypatch.setattr(st, "_open_session_db_for_profile", spy)
++    return calls
++
++
++@pytest.fixture
++def settle(monkeypatch):
++    """Treat the store's files as past the racy window, as an idle Desktop poll sees them (``os.utime`` can't age
++    a file: it moves the ctime to now)."""
++    return lambda _home: monkeypatch.setattr(utils, "RACY_MTIME_WINDOW_NS", 0)
++
++
++def test_unchanged_store_is_read_once(home, opens, settle):
++    db = SessionDB(home / "state.db")
++    db.create_session("s1", source="cli")  # held open, like the live gateway's store (its WAL persists)
++    settle(home)
++    assert [st._count_status_active_sessions() for _ in range(4)] == [1] * 4
++    assert len(opens) == 1
++    db.close()
++
++
++def test_a_session_write_shows_on_the_next_poll(home, opens, settle):
++    db = SessionDB(home / "state.db")
++    db.create_session("s1", source="cli")
++    settle(home)
++    assert st._count_status_active_sessions() == 1
++    db.create_session("s2", source="cli")
++    assert st._count_status_active_sessions() == 2
++    db.end_session("s1", "done")
++    assert st._count_status_active_sessions() == 1
++    db.close()
++
++
++def test_a_racy_store_is_never_cached(home, opens):
++    db = SessionDB(home / "state.db")
++    db.create_session("s1", source="cli")  # just written: its mtime is inside the racy window
++    st._count_status_active_sessions()
++    st._count_status_active_sessions()
++    assert len(opens) == 2
++    db.close()
++
++
++def test_the_activity_window_moves_with_the_clock(home, opens, settle, monkeypatch):
++    db = SessionDB(home / "state.db")
++    db.create_session("s1", source="cli")
++    settle(home)
++    assert st._count_status_active_sessions() == 1
++    real = time.time
++    monkeypatch.setattr(st.time, "time", lambda: real() + 3600)
++    assert st._count_status_active_sessions() == 0
++    assert len(opens) == 1
++    db.close()
+-- 
+2.55.0
+

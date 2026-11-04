@@ -1,0 +1,241 @@
+From 52fd8afadbefd70534570420c61cc3ed587d3bfb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 20:10:11 -0800
+Subject: [PATCH] fix(tests/ci): replay workflow steps under a bash 4+, not
+ macOS /bin/bash 3.2 [daveey]
+
+The replayed CI steps use mapfile (bash 4+: ci.yaml, tests.yml, catalog-tests.yml).
+_run took the first bash on PATH, which on a Mac is /bin/bash 3.2.57, so 17
+test_update_ci_routing tests failed on every Mac with 'mapfile: command not
+found' while passing on Linux CI.
+
+_run now probes BASH_VERSINFO and takes PATH's bash when it is 4+, else one in
+/opt/homebrew/bin or /usr/local/bin; with none it skips naming every bash found
+and its version. Linux (bash 5) and Windows (Git's bash 5) keep PATH's bash.
+
+Mac after: the 17 match Linux test-for-test (2 pass, 15 take the fork's
+tests-os skip exactly as on Linux). Linux: same 6 consumer files, 68 skips
+before and after. test_workflow_steps_bash.py drives _run with a fake bash 3
+first on PATH; it fails on the old _run (exit 127 instead of selection/skip).
+---
+ tests/ci/test_workflow_steps_bash.py | 116 +++++++++++++++++++++++++++
+ tests/ci/workflow_steps.py           |  66 ++++++++++++++-
+ 2 files changed, 181 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ci/test_workflow_steps_bash.py
+
+diff --git a/tests/ci/test_workflow_steps_bash.py b/tests/ci/test_workflow_steps_bash.py
+new file mode 100644
+index 00000000000..ce5d3ecda7c
+--- /dev/null
++++ b/tests/ci/test_workflow_steps_bash.py
+@@ -0,0 +1,116 @@
++"""Workflow-step replay picks a bash 4+, not merely the first bash on PATH.
++
++The replayed CI steps use ``mapfile`` (bash 4+). macOS puts /bin/bash 3.2 first on
++PATH, so every replay on a Mac died with ``mapfile: command not found`` (17 false
++failures in test_update_ci_routing.py) although Homebrew's bash 5 was installed.
++These tests drive ``_run`` itself with a fake bash 3 first on PATH.
++"""
++from __future__ import annotations
++
++import os
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from tests.ci import workflow_steps
++
++pytestmark = pytest.mark.skipif(os.name == "nt", reason="fake bashes are POSIX sh scripts")
++
++# Answers the version probe as bash 3 and fails a script the way bash 3.2 fails mapfile.
++FAKE_BASH3 = """#!/bin/sh
++case "$*" in
++  *BASH_VERSINFO*) echo 3; exit 0 ;;
++esac
++echo "step.sh: line 1: mapfile: command not found" >&2
++exit 127
++"""
++
++STEP = {
++    "name": "uses mapfile",
++    "run": 'mapfile -t lines < <(printf "a\\nb\\n")\n'
++           'echo "count=${#lines[@]}" >> "$GITHUB_OUTPUT"\n'
++           'echo "major=${BASH_VERSINFO[0]}" >> "$GITHUB_OUTPUT"\n',
++}
++
++
++def _executable(path: Path, text: str) -> Path:
++    path.write_text(text, encoding="utf-8")
++    path.chmod(0o755)
++    return path
++
++
++def _a_real_bash4() -> str | None:
++    """Found here, not through workflow_steps: these tests must also run against the old _run."""
++    for bash in (shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash"):
++        if bash and os.access(bash, os.X_OK):
++            probe = subprocess.run([bash, "-c", 'echo "${BASH_VERSINFO[0]}"'], capture_output=True,
++                                   encoding="utf-8", timeout=30, check=False)
++            if probe.stdout.strip().isdigit() and int(probe.stdout) >= 4:
++                return bash
++    return None
++
++
++@pytest.fixture
++def fake_path(tmp_path, monkeypatch):
++    """PATH = a dir whose bash is a fake 3.x (git rides along: _run resolves it too)."""
++    real = _a_real_bash4()
++    if real is None:
++        pytest.skip("no bash >= 4 on this host to stand in for Homebrew's")
++    old = tmp_path / "old"
++    old.mkdir()
++    _executable(old / "bash", FAKE_BASH3)
++    git = shutil.which("git")
++    assert git, "git is needed by the replayed steps"
++    (old / "git").symlink_to(git)
++    monkeypatch.setenv("PATH", str(old))
++    return old, real
++
++
++def test_a_bash4_in_a_known_dir_beats_a_bash3_first_on_path(fake_path, tmp_path, monkeypatch):
++    _, real = fake_path
++    brew = tmp_path / "brew"
++    brew.mkdir()
++    new = _executable(brew / "bash", f'#!/bin/sh\nexec "{real}" "$@"\n')
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (str(tmp_path / "absent"), str(brew)), raising=False)
++
++    outputs = workflow_steps.outputs(STEP, {})
++    assert outputs["count"] == "2"
++    assert int(outputs["major"]) >= 4
++    assert workflow_steps.find_replay_bash() == (str(new), "")
++
++
++def test_a_bash4_first_on_path_is_kept(fake_path, tmp_path, monkeypatch):
++    old, real = fake_path
++    first = tmp_path / "first"
++    first.mkdir()
++    new = _executable(first / "bash", f'#!/bin/sh\nexec "{real}" "$@"\n')
++    monkeypatch.setenv("PATH", os.pathsep.join((str(first), str(old))))
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (str(old),), raising=False)
++
++    assert workflow_steps.outputs(STEP, {})["count"] == "2"
++    assert workflow_steps.find_replay_bash() == (str(new), "")
++
++
++def test_no_bash4_anywhere_skips_naming_the_bash_found(fake_path, tmp_path, monkeypatch):
++    old, _ = fake_path
++    empty = tmp_path / "empty"
++    empty.mkdir()
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (str(empty),), raising=False)
++
++    with pytest.raises(pytest.skip.Exception) as skipped:
++        workflow_steps.outputs(STEP, {})
++    reason = str(skipped.value)
++    assert f"{old / 'bash'} (bash 3)" in reason
++    assert "bash >= 4" in reason and str(empty) in reason
++
++
++def test_a_bash_that_does_not_answer_is_not_selected(fake_path, tmp_path, monkeypatch):
++    old, _ = fake_path
++    _executable(old / "bash", "#!/bin/sh\nexit 1\n")
++    monkeypatch.setattr(workflow_steps, "BASH4_KNOWN_DIRS", (), raising=False)
++
++    bash, reason = workflow_steps.find_replay_bash()
++    assert bash is None
++    assert f"{old / 'bash'} (bash unknown version)" in reason
+diff --git a/tests/ci/workflow_steps.py b/tests/ci/workflow_steps.py
+index 10455335e3f..2340a14ce15 100644
+--- a/tests/ci/workflow_steps.py
++++ b/tests/ci/workflow_steps.py
+@@ -6,6 +6,7 @@ with argv receipts. No setup actions, installs, E2E tests or native hosts run he
+ from __future__ import annotations
+ 
+ import fnmatch
++import functools
+ import json
+ import os
+ import subprocess
+@@ -64,6 +65,69 @@ def _interpreter_dirs(root: Path) -> tuple[str, ...]:
+     return str(interpreter), str(shims)
+ 
+ 
++#: Where a bash 4+ lives when PATH's is too old: macOS ships /bin/bash 3.2 and the
++#: replayed steps use ``mapfile`` (bash 4+), so Homebrew's (Apple Silicon, then Intel).
++BASH4_KNOWN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
++
++
++def _bash_major(bash: str) -> int | None:
++    """``BASH_VERSINFO[0]`` of ``bash``, or None when it does not run or answer."""
++    try:
++        probe = subprocess.run(
++            [bash, "--noprofile", "--norc", "-c", 'echo "${BASH_VERSINFO[0]}"'],
++            stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", errors="replace",
++            timeout=30, check=False,
++        )
++    except (OSError, subprocess.SubprocessError):
++        return None
++    answer = probe.stdout.strip()
++    return int(answer) if probe.returncode == 0 and answer.isdigit() else None
++
++
++def find_replay_bash(ctx: LookupContext | None = None,
++                     known_dirs: tuple[str, ...] | None = None) -> tuple[str | None, str]:
++    """(first bash 4+: PATH's, else one in ``known_dirs``; or None, what was found).
++
++    The steps run in CI under Linux's bash 5 and Git for Windows' bash 5; only a
++    stock Mac has a bash too old for them, which used to fail every replay with
++    ``mapfile: command not found``.
++    """
++    known_dirs = BASH4_KNOWN_DIRS if known_dirs is None else known_dirs
++    seen = []
++    for candidate in locate_command("bash", ctx, known_dirs=known_dirs).present:
++        if candidate.value in (path for path, _ in seen):
++            continue
++        major = _bash_major(candidate.value)
++        if major is not None and major >= 4:
++            return candidate.value, ""
++        seen.append((candidate.value, major))
++    found = ", ".join(f"{path} (bash {major if major is not None else 'unknown version'})"
++                      for path, major in seen) or "no bash at all"
++    return None, (f"replayed workflow steps need bash >= 4 (they use mapfile); found {found}; "
++                  f"install one on PATH or in {' or '.join(known_dirs)}")
++
++
++@functools.cache
++def _replay_bash_cached(path: str | None, known_dirs: tuple[str, ...]) -> tuple[str | None, str]:
++    return find_replay_bash(LookupContext(path=path), known_dirs)
++
++
++def replay_bash() -> str:
++    """The bash to replay steps with, or skip the test saying which (too old) bash was found.
++
++    One probe per (PATH, known dirs): steps are replayed hundreds of times per file.
++    """
++    bash, reason = _replay_bash_cached(os.environ.get("PATH"), BASH4_KNOWN_DIRS)
++    if bash is None:
++        # Lazy: steps are also replayed from bare interpreters with no pytest installed.
++        try:
++            import pytest
++        except ImportError:
++            raise AssertionError(reason) from None
++        pytest.skip(reason)
++    return bash
++
++
+ def _run(step: dict, ctx: dict, cwd: Path | None = None, *, receipt: bool = False) -> tuple[dict, list]:
+     required(step, ctx)
+     assert step.get("shell", "bash") == "bash", "only safe Bash selection steps are replayed"
+@@ -72,7 +136,7 @@ def _run(step: dict, ctx: dict, cwd: Path | None = None, *, receipt: bool = Fals
+         output, calls = root / "outputs", root / "calls"
+         output.touch()
+         calls.touch()
+-        bash = locate_command("bash").command[0]
++        bash = replay_bash()
+         # Steps call git too. Linux reaches it through os.defpath; on Windows the bash found
+         # first may be Git's usr\bin (no git.exe), so git's own dir rides along like bash's.
+         git = locate_command("git").command[0]
+-- 
+2.55.0
+

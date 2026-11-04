@@ -1,0 +1,205 @@
+From b4bb0d87b09f23e605af7a768274ee194d80f048 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:38:39 +0000
+Subject: [PATCH] fix(tests): isolate metadata clients at transport boundary
+ [daveey]
+
+---
+ agent/model_metadata.py                 |  9 ++----
+ agent/model_metadata_http.py            |  9 +++++-
+ tests/_fixtures/offline_catalogs.py     | 30 +++++++++++++++++++
+ tests/agent/test_model_metadata_http.py |  4 +++
+ tests/conftest.py                       |  2 +-
+ tests/test_offline_metadata_defaults.py | 38 +++++++++++++++++++++++++
+ 6 files changed, 84 insertions(+), 8 deletions(-)
+ create mode 100644 tests/test_offline_metadata_defaults.py
+
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index cfbf43a4d10..d77473a4825 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -718,7 +718,6 @@ def _localhost_to_ipv4(url: str) -> str:
+ 
+ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+     """Probe known endpoints: "ollama", "lm-studio", "vllm", "llamacpp", or None (TTL-cached)."""
+-    import httpx
+     # IPv4-resolve BEFORE deriving server/LM Studio URLs and the cache lookup, so localhost and 127.0.0.1 share a cache entry.
+     normalized = _localhost_to_ipv4(_normalize_base_url(base_url))
+     # A hosted provider (api.openai.com, api.anthropic.com, ...) never runs Ollama/LM Studio/llama.cpp/vLLM:
+@@ -750,7 +749,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+     )
+     result: Optional[str] = None
+     try:
+-        with httpx.Client(timeout=2.0, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(base_url)) as client:
++        with model_metadata_http.create_client(timeout=2.0, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(base_url)) as client:
+             for name, urls, check in waterfall:
+                 try:
+                     for url in urls:
+@@ -1411,9 +1410,8 @@ def _model_id_matches(candidate_id: str, lookup_model: str) -> bool:
+ 
+ def _ollama_show(server_url: str, api_key: str, bare_model: str, timeout: float = 3.0, *, note_blackhole: bool = False) -> Optional[dict[str, Any]]:
+     """Ollama ``/api/show`` JSON for ``bare_model``, or None on any failure (``note_blackhole``: connect timeouts condemn the host)."""
+-    import httpx
+     try:
+-        with httpx.Client(timeout=timeout, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(server_url)) as client:
++        with model_metadata_http.create_client(timeout=timeout, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(server_url)) as client:
+             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+             return resp.json() if resp.status_code == 200 else None
+     except Exception as exc:
+@@ -1590,7 +1588,6 @@ def _openai_models_list_context(client, server_url: str, model: str) -> Optional
+ 
+ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+     """Query a local server for the model's context length."""
+-    import httpx
+     model = _strip_provider_prefix(model)
+     server_url = _server_root(base_url)
+     lmstudio_url = _localhost_to_ipv4(_lmstudio_server_root(base_url))
+@@ -1621,7 +1618,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
+     }.get(server_type)
+     probes = ([typed] if typed else []) + [_model_detail_ctx, lambda client: _openai_models_list_context(client, server_url, model)]
+     try:
+-        with httpx.Client(timeout=3.0, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(base_url)) as client:
++        with model_metadata_http.create_client(timeout=3.0, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(base_url)) as client:
+             return next((ctx for ctx in (probe(client) for probe in probes) if ctx is not None), None)
+     except Exception as exc:
+         _note_if_connect_timeout(exc, server_url)
+diff --git a/agent/model_metadata_http.py b/agent/model_metadata_http.py
+index 39e4fa23a46..045b101b87f 100644
+--- a/agent/model_metadata_http.py
++++ b/agent/model_metadata_http.py
+@@ -25,6 +25,13 @@ def resolve_verify(base_url: str = ""):
+     )
+ 
+ 
++def create_client(**kwargs):
++    """Build metadata/probe clients through one transport-injection boundary."""
++    import httpx
++
++    return httpx.Client(**kwargs)
++
++
+ @contextmanager
+ def stream(url: str, *, headers=None, params=None, timeout=10.0, verify=None):
+     import httpx
+@@ -43,7 +50,7 @@ def stream(url: str, *, headers=None, params=None, timeout=10.0, verify=None):
+     if isinstance(timeout, tuple):
+         connect, read = timeout
+         timeout = httpx.Timeout(read, connect=connect)
+-    with httpx.Client(
++    with create_client(
+         verify=resolve_verify() if verify is None else verify,
+         timeout=timeout,
+         follow_redirects=True,
+diff --git a/tests/_fixtures/offline_catalogs.py b/tests/_fixtures/offline_catalogs.py
+index 8c595389786..a75e6232f4f 100644
+--- a/tests/_fixtures/offline_catalogs.py
++++ b/tests/_fixtures/offline_catalogs.py
+@@ -35,3 +35,33 @@ def _offline_video_catalog(request, monkeypatch):
+         return real_get(url, *args, **kwargs)
+ 
+     monkeypatch.setattr(requests, "get", get)
++
++
++@pytest.fixture(autouse=True)
++def _offline_metadata_transport(request, monkeypatch):
++    """Only incidental metadata clients get an offline remote transport default.
++
++    Explicit client/transport fakes installed by tests win. The production
++    request construction, response handling, caches and fallbacks still run.
++    """
++    if request.node.get_closest_marker("live"):
++        return
++    import httpx
++    from agent import model_metadata_http
++
++    real_client = httpx.Client
++    create_client = model_metadata_http.create_client
++
++    class OfflineTransport(httpx.HTTPTransport):
++        def handle_request(self, request):
++            if not _is_loopback(request.url.host):
++                raise httpx.ConnectError("offline metadata fixture: provide a test transport", request=request)
++            return super().handle_request(request)
++
++    def client(**kwargs):
++        if httpx.Client is real_client and "transport" not in kwargs:
++            kwargs["transport"] = OfflineTransport(verify=kwargs.get("verify", True))
++        return create_client(**kwargs)
++
++    monkeypatch.setattr(model_metadata_http, "create_client", client)
++
+diff --git a/tests/agent/test_model_metadata_http.py b/tests/agent/test_model_metadata_http.py
+index 811f3694971..fc7ef69073d 100644
+--- a/tests/agent/test_model_metadata_http.py
++++ b/tests/agent/test_model_metadata_http.py
+@@ -29,6 +29,10 @@ def servers():
+ 
+ 
+ def test_redirect_credentials_and_proxy_routing_are_preserved(servers, monkeypatch):
++    import httpx
++
++    # This test owns both loopback peers, including the proxy for probe.invalid.
++    monkeypatch.setattr(model_metadata_http, "create_client", httpx.Client)
+     seen = []
+     sink_url = ""
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 888f647dc64..aba7556fb63 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -276,7 +276,7 @@ from tests._fixtures.live_system_guard import (
+     _live_system_guard,
+ )
+ from tests._fixtures.model_peer import model_peer  # fixture registers here
+-from tests._fixtures.offline_catalogs import _offline_video_catalog
++from tests._fixtures.offline_catalogs import _offline_metadata_transport, _offline_video_catalog
+ from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
+ from tests._fixtures.session_context_reset import _reset_session_context_vars
+ 
+diff --git a/tests/test_offline_metadata_defaults.py b/tests/test_offline_metadata_defaults.py
+new file mode 100644
+index 00000000000..ddf7eec798a
+--- /dev/null
++++ b/tests/test_offline_metadata_defaults.py
+@@ -0,0 +1,38 @@
++"""Catalog lookup defaults use transport errors, not real remote DNS."""
++import socket
++
++import httpx
++import pytest
++
++from agent import model_metadata, model_metadata_http
++
++
++@pytest.fixture
++def no_dns(monkeypatch):
++    def unexpected(*args, **kwargs):
++        pytest.fail("incidental metadata must not reach DNS")
++    monkeypatch.setattr(socket, "getaddrinfo", unexpected)
++
++
++def test_metadata_get_is_offline_before_dns(no_dns):
++    with pytest.raises(httpx.ConnectError, match="offline metadata"):
++        model_metadata_http.get("https://catalog.example.test/models")
++
++
++def test_ollama_probe_uses_offline_transport(no_dns):
++    assert model_metadata._ollama_show("http://ollama.example.test", "fake", "model") is None
++
++
++def test_explicit_metadata_client_fake_still_observes_real_request(no_dns, monkeypatch):
++    seen = []
++    real_client = httpx.Client
++
++    def handle(request):
++        seen.append((request.method, str(request.url)))
++        return httpx.Response(200, json={"data": [{"id": "test/model"}]})
++
++    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
++        **kwargs, transport=httpx.MockTransport(handle)))
++    response = model_metadata_http.get("https://catalog.example.test/models")
++    assert response.json() == {"data": [{"id": "test/model"}]}
++    assert seen == [("GET", "https://catalog.example.test/models")]
+-- 
+2.55.0
+

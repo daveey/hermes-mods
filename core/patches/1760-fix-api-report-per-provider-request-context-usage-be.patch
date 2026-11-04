@@ -1,0 +1,1423 @@
+From 0d0ee3a326d8666efdda877524e9ef3f7c6bddee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:49:07 -0800
+Subject: [PATCH] fix(api): report per-provider-request context usage beside
+ turn billing totals [daveey]
+
+Chat Completions usage.prompt_tokens is the sum of every provider call in a
+gateway turn (billing). Consumers (BB-1207) read it as one request's context
+size, so a two-call turn looked like a 2x context peak.
+
+Add optional usage.context_usage = {version:1, complete, requests:[{provider,
+model, input_tokens, input_limit|null}]}: one entry per main-loop provider
+response, captured once before MoA fold under the identity that served it,
+reset per run_conversation, capped at 128. complete=false when any response
+could not be measured individually (no usage, diverted, adapter-aggregated:
+MoA advisors, codex app-server, hosted tools, multi-hop decode). input_limit is
+the resolved runtime window minus output reservation; null when guessed or for
+another runtime. Billing totals, routing and limits are unchanged. Emitted on
+streaming and non-streaming chat completions, direct and canonical paths.
+---
+ agent/chat_completion_helpers.py        |   8 +-
+ agent/codex_runtime.py                  |   4 +
+ agent/context_usage.py                  | 220 +++++++++++
+ agent/conversation_loop.py              |   5 +
+ agent/turn_response_check.py            |  10 +-
+ agent/turn_usage.py                     |  35 +-
+ gateway/platforms/api_server.py         |  17 +-
+ gateway/platforms/api_server_usage.py   |  53 +++
+ gateway/run_turn_runner.py              |   5 +
+ tests/agent/test_turn_context_usage.py  | 481 ++++++++++++++++++++++++
+ tests/gateway/test_api_context_usage.py | 334 ++++++++++++++++
+ 11 files changed, 1152 insertions(+), 20 deletions(-)
+ create mode 100644 agent/context_usage.py
+ create mode 100644 gateway/platforms/api_server_usage.py
+ create mode 100644 tests/agent/test_turn_context_usage.py
+ create mode 100644 tests/gateway/test_api_context_usage.py
+
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 22f7735875a..affcead6040 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -31,6 +31,7 @@ from agent.error_classifier import (
+     _extract_status_code)
+ from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
+ from agent.errors import EmptyStreamError
++from agent.context_usage import capture_summary_context
+ from agent.chat_completion_local import _streams_llamacpp, stale_giveup
+ from agent.chat_completion_headers import _chat_completion_capturing_headers
+ from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
+@@ -2194,14 +2195,14 @@ def _managed_summary_call(agent, api_request_id: str, request, callback, *, retr
+ 
+ 
+ def _summary_text(agent, response, **normalize_kwargs) -> str:
++    capture_summary_context(agent, response)  # a main-runtime request outside record_response_usage
+     if is_router_timeout_shim(response):
+         # Router failure in a 200 envelope (#68396): an empty summary takes the retry slot.
+         logger.warning("Iteration summary returned a router timeout shim; retrying")
+         return ""
+     normalized = agent._get_transport().normalize_response(response, **normalize_kwargs)
+     if normalized.tool_calls:
+-        # No summary path executes tool calls; log so a tool-only response that falls into the
+-        # empty-summary retry is diagnosable.
++        # No summary path executes tool calls; logged so a tool-only reply in the empty-summary retry is diagnosable.
+         logger.warning("Iteration summary emitted tool calls; discarding them")
+     return (normalized.content or "").strip()
+ 
+@@ -2248,8 +2249,7 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
+         summary_kwargs["_moa_prepared_request"] = agent.client.chat.completions.prepare(api_messages)
+ 
+     def _attempt(retry_count: int) -> str:
+-        # Use the ordinary request-local lifecycle: a summary can be interrupted
+-        # during a long prefill without closing the shared primary client.
++        # Ordinary request-local lifecycle: a summary interrupted mid-prefill never closes the shared primary client.
+         response = _managed_summary_call(
+             agent, api_request_id, summary_kwargs, agent._interruptible_api_call,
+             retry_count=retry_count)
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 13058cac856..f4fdb19e9d5 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -153,6 +153,10 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
+     the main loop's capture, and the mirror is never compacted natively, so without an anchor the rough
+     estimate grows monotonically and hermes-mode fires thread compaction on tiny threads (#100381)."""
+     agent.session_api_calls += 1
++    # The app-server runs the whole turn's model calls in its subprocess and reports only the
++    # last/summed usage: per-response context accounting cannot list them individually.
++    from agent.context_usage import mark_turn_context_incomplete
++    mark_turn_context_incomplete(agent, "codex app-server aggregates internal model calls")
+     usage = getattr(turn, "token_usage_last", None)
+     compressor = getattr(agent, "context_compressor", None)
+ 
+diff --git a/agent/context_usage.py b/agent/context_usage.py
+new file mode 100644
+index 00000000000..9d881cde12f
+--- /dev/null
++++ b/agent/context_usage.py
+@@ -0,0 +1,220 @@
++"""Per-provider-response context accounting for one ``run_conversation`` turn.
++
++Exported on the turn result as ``context_usage``::
++
++    {"version": 1, "complete": bool,
++     "requests": [{"provider": str, "model": str, "input_tokens": int, "input_limit": int | None}]}
++
++One entry per main-loop provider response, captured in ``agent/turn_usage.py`` from the
++response's own (pre-MoA-fold) usage under the runtime identity that actually answered. This
++is distinct from the billing totals (which sum every call, advisors included) and never
++touches them. ``complete`` is False when any response this turn received could not be
++measured individually: no/zero usage, a truncation or refusal diverted before measurement,
++an adapter that aggregates several internal model calls into one usage figure (MoA advisors,
++codex app-server, multi-hop long decode, provider-executed tools), an unresolvable or wire-unsafe
++identity (over 80 chars or containing CR/LF/NUL, the ``served_runtime`` bound), or more than ``MAX_CONTEXT_REQUESTS`` responses. ``input_limit`` is the grounded runtime input
++window (context window minus the output reservation), never the compression trigger, and
++``None`` when the window is a guess or belongs to another runtime. A response whose request used
++provider-executed tools gets no entry at all (its usage may be an aggregate); billing still sums it.
++
++State lives on the agent instance (one turn at a time per agent: the turn lease), so
++concurrent agents, forks and subagents never share an accumulator.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++CONTEXT_USAGE_VERSION = 1
++MAX_CONTEXT_REQUESTS = 128
++_ATTR = "_turn_context_usage"
++# Virtual or unresolved provider labels are never an effective identity.
++_NON_IDENTITY_PROVIDERS = frozenset({"", "auto", "moa"})
++# Same bound the API server applies to ``served_runtime`` (``_clean_runtime_id(max_len=80)``).
++MAX_RUNTIME_ID_LEN = 80
++_UNSAFE_RUNTIME_ID_CHARS = ("\r", "\n", "\x00")
++
++
++def is_wire_safe_runtime_id(value: Any) -> bool:
++    """True for a non-empty, already-stripped id of at most 80 chars with no CR, LF or NUL."""
++    return (isinstance(value, str) and bool(value) and value == value.strip()
++            and len(value) <= MAX_RUNTIME_ID_LEN and not any(c in value for c in _UNSAFE_RUNTIME_ID_CHARS))
++
++
++class TurnContextUsage:
++    """Accumulator for one turn. Thread-safe; ``snapshot`` returns plain JSON types."""
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._requests: list[dict[str, Any]] = []
++        self._complete = True
++
++    def add(self, provider: str, model: str, input_tokens: int, input_limit: Optional[int]) -> None:
++        with self._lock:
++            if len(self._requests) >= MAX_CONTEXT_REQUESTS:
++                self._complete = False
++                return
++            self._requests.append({"provider": provider, "model": model,
++                                   "input_tokens": int(input_tokens), "input_limit": input_limit})
++
++    def mark_incomplete(self, reason: str) -> None:
++        with self._lock:
++            self._complete = False
++        logger.debug("context usage incomplete: %s", reason)
++
++    def snapshot(self) -> dict[str, Any]:
++        with self._lock:
++            return {"version": CONTEXT_USAGE_VERSION, "complete": self._complete,
++                    "requests": [dict(r) for r in self._requests]}
++
++
++def begin_turn_context_usage(agent: Any) -> TurnContextUsage:
++    """Install a fresh accumulator for the turn that is starting on ``agent``."""
++    acc = TurnContextUsage()
++    setattr(agent, _ATTR, acc)
++    return acc
++
++
++def active_turn_context_usage(agent: Any) -> Optional[TurnContextUsage]:
++    """The agent's live accumulator, or None outside a turn (forks, side questions, stubs)."""
++    acc = getattr(agent, _ATTR, None)
++    return acc if isinstance(acc, TurnContextUsage) else None
++
++
++def export_turn_context_usage(agent: Any) -> Optional[dict[str, Any]]:
++    acc = active_turn_context_usage(agent)
++    return acc.snapshot() if acc is not None else None
++
++
++def mark_turn_context_incomplete(agent: Any, reason: str) -> None:
++    acc = active_turn_context_usage(agent)
++    if acc is not None:
++        acc.mark_incomplete(reason)
++
++
++def _effective_identity(agent: Any, moa_slot: Any) -> Optional[tuple[str, str]]:
++    """``(provider, model)`` of the runtime that served the response, or None when unknown.
++    MoA answers come from the aggregator slot; class selectors and virtual providers never count."""
++    from agent.model_routing import is_class_selector
++
++    if str(getattr(agent, "provider", "") or "").strip().lower() == "moa":
++        if not isinstance(moa_slot, dict):
++            return None
++        provider, model = moa_slot.get("provider"), moa_slot.get("model")
++    else:
++        provider, model = getattr(agent, "provider", None), getattr(agent, "model", None)
++    if not (isinstance(provider, str) and isinstance(model, str)):
++        return None
++    provider, model = provider.strip(), model.strip()
++    if provider.lower() in _NON_IDENTITY_PROVIDERS or not model or is_class_selector(model):
++        return None
++    if not (is_wire_safe_runtime_id(provider) and is_wire_safe_runtime_id(model)):
++        return None  # an id the wire would refuse is an unresolvable identity
++    return provider, model
++
++
++def _is_fallback_window(compressor: Any, ctx: int) -> bool:
++    """True when ``ctx`` is the detection-failed hard default rather than a resolved window."""
++    from agent import model_metadata as mm
++
++    if ctx != mm.DEFAULT_FALLBACK_CONTEXT or getattr(compressor, "_config_context_length", None):
++        return False
++    model, base_url = str(getattr(compressor, "model", "") or ""), str(getattr(compressor, "base_url", "") or "")
++    # The fallback memo is keyed on the id resolution looked up (prefix and routing variant stripped).
++    stripped = mm._strip_provider_prefix(model)
++    candidates = {model, stripped, mm._strip_openrouter_routing_variant(
++        stripped, base_url=base_url, provider=str(getattr(compressor, "provider", "") or ""))}
++    return any((m, base_url) in mm._FALLBACK_WARNED for m in candidates)
++
++
++def grounded_input_limit(agent: Any, identity: tuple[str, str]) -> Optional[int]:
++    """The runtime input window the compressor holds for ``identity``, or None when unknown."""
++    compressor = getattr(agent, "context_compressor", None)
++    if compressor is None:
++        return None
++    if (getattr(compressor, "provider", None), getattr(compressor, "model", None)) != identity:
++        return None  # the window belongs to another runtime (MoA preset, unsynced switch)
++    if getattr(compressor, "_context_probed", False) and not getattr(compressor, "_context_probe_persistable", False):
++        return None  # guessed probe tier, not a provider-reported limit
++    # Read the resolved value; never trigger a (possibly network) resolution from accounting.
++    if "_resolved_context_length" in vars(compressor):
++        ctx = compressor._resolved_context_length
++    else:
++        ctx = getattr(compressor, "context_length", None)
++    if type(ctx) is not int or ctx <= 0 or _is_fallback_window(compressor, ctx):
++        return None
++    window = getattr(compressor, "_effective_input_window", None)
++    if callable(window):
++        max_tokens = getattr(compressor, "max_tokens", None)
++        limit = window(ctx, max_tokens if type(max_tokens) is int else None)
++        return limit if type(limit) is int and limit > 0 else ctx
++    return ctx
++
++
++def capture_context_request(
++    agent: Any, response: Any, *, context_prompt_tokens: Optional[int] = None, moa_slot: Any = None,
++) -> None:
++    """Record one received main-loop provider response (no-op outside a turn). ``context_prompt_tokens``
++    is the pre-fold prompt size the context actually held; None reads it from ``response.usage``."""
++    acc = active_turn_context_usage(agent)
++    if acc is None:
++        return
++    base_url = str(getattr(agent, "base_url", "") or "").lower()
++    if base_url.startswith(("acp://", "acp+tcp://")):
++        acc.mark_incomplete("agent-as-provider runs its own model calls")
++        return
++    usage = getattr(response, "usage", None)
++    if context_prompt_tokens is None and usage:
++        from agent.usage_pricing import normalize_usage
++        try:
++            context_prompt_tokens = normalize_usage(
++                usage, provider=getattr(agent, "provider", None), api_mode=getattr(agent, "api_mode", None),
++            ).prompt_tokens
++        except (AttributeError, TypeError, ValueError):
++            context_prompt_tokens = None  # an unreadable usage shape is a missing measurement
++    if type(context_prompt_tokens) is not int or context_prompt_tokens <= 0:
++        acc.mark_incomplete("response without input measurement")
++        return
++    identity = _effective_identity(agent, moa_slot)
++    if identity is None:
++        acc.mark_incomplete("no effective provider/model identity")
++        return
++    acc.add(identity[0], identity[1], context_prompt_tokens, grounded_input_limit(agent, identity))
++
++
++def note_request_features(agent: Any, api_kwargs: Any) -> bool:
++    """Whether THIS request's response is individually measurable. Provider-executed tools (hosted
++    web search, OpenRouter plugins) run extra model passes inside one response whose usage may be
++    their sum: that response gets no per-request entry (the turn is marked incomplete; billing still
++    folds it). Per response, never sticky: later ordinary requests in the turn are still recorded."""
++    if active_turn_context_usage(agent) is None or not isinstance(api_kwargs, dict):
++        return True
++    from agent.side_question_request import has_server_side_tools
++    try:
++        server_side = has_server_side_tools(api_kwargs)
++    except (AttributeError, TypeError):
++        server_side = True  # an unreadable request shape cannot be vouched for
++    if server_side:
++        mark_turn_context_incomplete(agent, "provider-executed tools aggregate internal calls")
++        return False
++    return True
++
++
++def capture_summary_context(agent: Any, response: Any) -> None:
++    """The iteration-limit summary is a main-runtime request that bypasses ``record_response_usage``.
++    A router timeout shim is a reply with no measurement; a MoA summary may fan out to advisors."""
++    if active_turn_context_usage(agent) is None:
++        return
++    from agent.transports.chat_completions import is_router_timeout_shim
++    if is_router_timeout_shim(response):
++        mark_turn_context_incomplete(agent, "iteration summary router shim not measured")
++        return
++    moa_slot = None
++    if str(getattr(agent, "provider", "") or "").strip().lower() == "moa":
++        moa_slot = getattr(getattr(agent, "client", None), "last_aggregator_slot", None)
++        mark_turn_context_incomplete(agent, "MoA summary may fan out to advisors")
++    capture_context_request(agent, response, moa_slot=moa_slot)
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 509b6783509..f48955220d8 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1831,6 +1831,7 @@ def run_conversation(
+     addresses, after every history rewrite including post-turn micro-compaction.
+     """
+     from agent.turn_context import export_current_turn_boundary
++    from agent.context_usage import begin_turn_context_usage, export_turn_context_usage
+     from agent.turn_finalizer import settle_held_final
+     from agent.voice_turn_route import end_voice_turn_route
+     from tools.vision_tools_history_budget import native_turn_images
+@@ -1838,6 +1839,8 @@ def run_conversation(
+     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
+     agent._turn_user_intervened = False
+     vars(agent).pop("_step_boundary_paused", None)  # [daveey] per-turn core-update pause verdict
++    # Per-provider-response context accounting starts empty every turn (agent/context_usage.py).
++    begin_turn_context_usage(agent)
+     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
+     # it does not embed the same pixels a second time into the same request (#76411).
+     with native_turn_images(user_message):
+@@ -1866,6 +1869,8 @@ def run_conversation(
+     result = export_current_turn_boundary(agent, result, user_message)
+     if isinstance(result, dict):
+         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
++        # Plain JSON types so managed worker transports can carry it unchanged.
++        result["context_usage"] = export_turn_context_usage(agent)
+     _close_durable_failed_turn(agent, result)
+     return result
+ 
+diff --git a/agent/turn_response_check.py b/agent/turn_response_check.py
+index 791893ba800..604659dc190 100644
+--- a/agent/turn_response_check.py
++++ b/agent/turn_response_check.py
+@@ -14,6 +14,7 @@ import time
+ from typing import Any, Dict, Optional
+ 
+ from agent.error_classifier import FailoverReason
++from agent.context_usage import mark_turn_context_incomplete, note_request_features
+ from agent.turn_api_call import stop_thinking_spinner
+ from agent.turn_failure_copy import invalid_response_failure_reason, provider_label_for, site_copy, stamp_failure
+ from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
+@@ -130,6 +131,10 @@ def check_api_response(
+ 
+     response_invalid, error_details = validate_response_shape(agent, response)
+     if response_invalid:
++        if response is not None:
++            # A provider reply that is never measured (retried or terminal) leaves the turn's
++            # per-response context accounting incomplete.
++            mark_turn_context_incomplete(agent, "invalid provider response not measured")
+         _iv = retry_invalid_response(
+             agent, response=response, error_details=error_details, _retry=_retry,
+             thinking_spinner=thinking_spinner, messages=messages, api_messages=api_messages,
+@@ -154,6 +159,7 @@ def check_api_response(
+ 
+     # HTTP-200 refusals are deterministic: one fallback try, else return the refusal.
+     if finish_reason == "content_filter":
++        mark_turn_context_incomplete(agent, "content-filter response diverted before measurement")
+         _rv = handle_content_policy_refusal(
+             agent, response, _retry, thinking_spinner=thinking_spinner, messages=messages,
+             api_messages=api_messages, api_kwargs=api_kwargs,
+@@ -188,14 +194,16 @@ def check_api_response(
+         retry_count = _tv.retry_count
+         compression_attempts = _tv.compression_attempts
+         if _tv.action in ("return", "break", "continue"):
++            mark_turn_context_incomplete(agent, "truncated response diverted before measurement")
+             return _verdict(_tv.action, _tv.result)
+ 
++    _context_measurable = note_request_features(agent, api_kwargs)
+     # Fold provider usage into compressor / anchors / session counters / state.db
+     # (agent/turn_usage.py). A rearmed budget also clears the preflight-block latch.
+     _usage_outcome = record_response_usage(
+         agent, response, messages=messages, api_call_count=api_call_count,
+         api_duration=api_duration, compression_attempts=compression_attempts,
+-        max_compression_attempts=max_compression_attempts,
++        max_compression_attempts=max_compression_attempts, context_measurable=_context_measurable,
+     )
+     compression_attempts = _usage_outcome.compression_attempts
+     if _usage_outcome.rearmed:
+diff --git a/agent/turn_usage.py b/agent/turn_usage.py
+index 6fd993664be..fbede226c74 100644
+--- a/agent/turn_usage.py
++++ b/agent/turn_usage.py
+@@ -16,6 +16,7 @@ from dataclasses import dataclass
+ from typing import Any, Dict, List
+ 
+ from agent.image_token_cost import calibrate_from_usage
++from agent.context_usage import capture_context_request, mark_turn_context_incomplete
+ from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
+ from agent.usage_pricing import estimate_usage_cost, normalize_usage, with_served_service_tier
+ 
+@@ -56,6 +57,9 @@ def _fold_moa_usage(agent, canonical_usage):
+             _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
+             if _ref_usage is not None:
+                 canonical_usage = canonical_usage + _ref_usage
++                if _ref_usage.prompt_tokens or _ref_usage.output_tokens:
++                    # Advisor calls arrive as one summed figure: not individually measurable.
++                    mark_turn_context_incomplete(agent, "MoA advisor usage is aggregated")
+         except Exception as _moa_acct_exc:  # pragma: no cover - defensive
+             logger.debug("MoA reference usage accounting failed: %s", _moa_acct_exc)
+     if _moa_client is not None and hasattr(_moa_client, "consume_and_save_trace"):
+@@ -70,13 +74,40 @@ def _fold_moa_usage(agent, canonical_usage):
+     return _moa_client, canonical_usage, _moa_ref_cost
+ 
+ 
++def _capture_context_request(agent, response, aggregator_usage, measurable: bool) -> None:
++    """Per-response context accounting (``agent/context_usage.py``), from the PRE-fold usage of the
++    response the main loop received, under the identity that served it (MoA: the aggregator slot).
++    ``aggregator_usage`` None = a response without usage (an unmeasured request); ``measurable``
++    False = its usage may aggregate provider-executed passes, so it gets no entry."""
++    if not measurable:
++        return
++    if aggregator_usage is None:
++        capture_context_request(agent, response)
++        return
++    context_prompt = aggregator_usage.prompt_tokens
++    initial = getattr(response.usage, "initial_prompt_tokens", None)
++    if isinstance(initial, int) and initial > 0:
++        # Multi-hop long decode: hop 1 is the context held; later hops are adapter-internal
++        # requests summed into the reported prompt, so they cannot be listed one by one.
++        if initial != context_prompt:
++            mark_turn_context_incomplete(agent, "multi-hop long decode aggregates internal requests")
++        context_prompt = initial
++    moa_slot = None
++    if str(getattr(agent, "provider", "") or "").strip().lower() == "moa":
++        moa_slot = getattr(getattr(agent, "client", None), "last_aggregator_slot", None)
++    capture_context_request(agent, response, context_prompt_tokens=context_prompt, moa_slot=moa_slot)
++
++
+ def record_response_usage(
+     agent: Any, response: Any, *, messages: list[dict[str, Any]], api_call_count: int,
+     api_duration: float, compression_attempts: int, max_compression_attempts: int,
++    context_measurable: bool = True,
+ ) -> ResponseUsageOutcome:
+     """Fold ``response.usage`` into compressor, anchors, session counters, state.db
+     and the API-call log line (see module docstring). No-usage responses only
+-    consume a pending compaction verdict. Returns the loop-visible outcome."""
++    consume a pending compaction verdict. Returns the loop-visible outcome. ``context_measurable=False``
++    (this response's usage may aggregate provider-executed passes) skips only its per-request context
++    entry; billing and compaction folding are unchanged."""
+     rearmed = False
+     compressor = agent.context_compressor
+     # Count every completed provider attempt, including providers that omit usage.
+@@ -96,6 +127,7 @@ def record_response_usage(
+             "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
+             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
+         )
++        _capture_context_request(agent, response, None, context_measurable)
+         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
+ 
+     canonical_usage = with_served_service_tier(
+@@ -103,6 +135,7 @@ def record_response_usage(
+     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
+     # OWN model rate and added as dollars below.
+     aggregator_usage = canonical_usage
++    _capture_context_request(agent, response, aggregator_usage, context_measurable)
+     _moa_client, canonical_usage, _moa_ref_cost = _fold_moa_usage(agent, canonical_usage)
+     prompt_tokens = canonical_usage.prompt_tokens
+     completion_tokens = canonical_usage.output_tokens
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 10718058e5f..40548382c40 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -116,6 +116,8 @@ from gateway.platforms import api_server_room_grants as _room_grants
+ from gateway.platforms import api_server_runs as _api_runs
+ from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
+ from gateway.platforms.api_server_thread_hops import ThreadSafeAsyncQueue, _ThreadHops
++# Re-exported: the route mixins import these wire serializers from this module.
++from gateway.platforms.api_server_usage import _chat_usage_payload, _responses_usage_payload, with_context_usage
+ from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
+ from gateway.platforms.api_server_bot_chat import reset_local_title_owner
+ from gateway.platforms.base import (
+@@ -579,20 +581,6 @@ def _request_turn_author(body: dict[str, Any]) -> Optional[dict[str, Any]]:
+     return parse_turn_author(raw)
+ 
+ 
+-_USAGE_TOKEN_KEYS = ("input_tokens", "output_tokens", "total_tokens")
+-
+-
+-def _chat_usage_payload(usage: dict[str, Any]) -> dict[str, int]:
+-    """OpenAI Chat Completions ``usage`` block (prompt/completion/total) from the agent's usage."""
+-    values = (usage.get(key, 0) for key in _USAGE_TOKEN_KEYS)
+-    return dict(zip(("prompt_tokens", "completion_tokens", "total_tokens"), values))
+-
+-
+-def _responses_usage_payload(usage: dict[str, Any]) -> dict[str, int]:
+-    """OpenAI Responses ``usage`` block from the agent's usage dict."""
+-    return {key: usage.get(key, 0) for key in _USAGE_TOKEN_KEYS}
+-
+-
+ async def _abandon_agent_task(
+     agent_ref, agent_task, reason: str, *,
+     reap_source: str = "api_server_sse_disconnect", await_cancel: bool = True) -> None:
+@@ -3613,6 +3601,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+         _session_rotated = isinstance(_eff_sid, str) and isinstance(session_id, str) and _eff_sid != session_id
+         if getattr(agent, "_last_compaction_in_place", False) or _session_rotated:
+             result["_compressed"] = True
++        with_context_usage(usage, result)  # per-response context accounting, beside the billing sums
+         result["served_runtime"] = {k: self._clean_runtime_id(getattr(agent, k, ""), max_len=80) for k in ("provider", "model")}  # who served; a class selector names neither
+         if requested_runtime or route or confirmed_runtime_lock or (route_source and route_source != "global"):
+             runtime = self._turn_runtime_metadata(
+diff --git a/gateway/platforms/api_server_usage.py b/gateway/platforms/api_server_usage.py
+new file mode 100644
+index 00000000000..f819ada3d56
+--- /dev/null
++++ b/gateway/platforms/api_server_usage.py
+@@ -0,0 +1,53 @@
++"""API wire ``usage`` blocks built from a finished turn's usage dict (``_finish_turn_result``, or the
++canonical admission's committed usage), plus the optional per-provider-response ``context_usage``."""
++from __future__ import annotations
++
++from typing import Any, Optional
++
++_USAGE_TOKEN_KEYS = ("input_tokens", "output_tokens", "total_tokens")
++_CONTEXT_REQUEST_KEYS = ("provider", "model", "input_tokens", "input_limit")
++
++
++def api_context_usage(value: Any) -> Optional[dict[str, Any]]:
++    """The turn's per-provider-response context accounting (``agent/context_usage.py``,
++    ``result["context_usage"]``) as the API wire carries it, or None when absent or malformed: an
++    unavailable measurement is omitted, never reconstructed. Returns a fresh plain-JSON copy."""
++    from agent.context_usage import CONTEXT_USAGE_VERSION, MAX_CONTEXT_REQUESTS, is_wire_safe_runtime_id
++    if (not isinstance(value, dict) or set(value) != {"version", "complete", "requests"}
++            or type(value["version"]) is not int or value["version"] != CONTEXT_USAGE_VERSION
++            or type(value["complete"]) is not bool or not isinstance(value["requests"], list)
++            or len(value["requests"]) > MAX_CONTEXT_REQUESTS):
++        return None
++    requests = []
++    for entry in value["requests"]:
++        if not isinstance(entry, dict) or set(entry) != set(_CONTEXT_REQUEST_KEYS):
++            return None
++        provider, model, tokens, limit = (entry[key] for key in _CONTEXT_REQUEST_KEYS)
++        # Identity ids follow the served_runtime bound: <=80 chars, no CR/LF/NUL.
++        if (not is_wire_safe_runtime_id(provider) or not is_wire_safe_runtime_id(model)
++                or type(tokens) is not int or tokens < 0
++                or not (limit is None or (type(limit) is int and limit > 0))):
++            return None
++        requests.append(dict(zip(_CONTEXT_REQUEST_KEYS, (provider, model, tokens, limit))))
++    return {"version": value["version"], "complete": value["complete"], "requests": requests}
++
++
++def with_context_usage(target: dict[str, Any], source: Any) -> dict[str, Any]:
++    """``target`` plus ``source["context_usage"]`` when it is a valid report. It rides beside (never
++    inside) the billing sums, which stay exactly as they were."""
++    context_usage = api_context_usage(source.get("context_usage")) if isinstance(source, dict) else None
++    if context_usage is not None:
++        target["context_usage"] = context_usage
++    return target
++
++
++def _chat_usage_payload(usage: dict[str, Any]) -> dict[str, Any]:
++    """OpenAI Chat Completions ``usage`` block (prompt/completion/total) from the agent's usage, plus
++    the optional ``context_usage``; streaming and non-streaming both serialize through here."""
++    values = (usage.get(key, 0) for key in _USAGE_TOKEN_KEYS)
++    return with_context_usage(dict(zip(("prompt_tokens", "completion_tokens", "total_tokens"), values)), usage)
++
++
++def _responses_usage_payload(usage: dict[str, Any]) -> dict[str, int]:
++    """OpenAI Responses ``usage`` block from the agent's usage dict."""
++    return {key: usage.get(key, 0) for key in _USAGE_TOKEN_KEYS}
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 914e5e16f28..8e2d339be26 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1047,6 +1047,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
+                 captured['usage'] = {'input_tokens': incoming, 'output_tokens': outgoing,
+                                      'total_tokens': incoming + outgoing}
++                if api is not None:
++                    # The canonical API admission's twin of ``_finish_turn_result``: the turn's
++                    # per-response context accounting rides the committed usage to the wire.
++                    from gateway.platforms.api_server_usage import with_context_usage
++                    with_context_usage(captured['usage'], result)
+                 _settle_api_runtime_lock(agent, result, captured)
+             return result
+         finally:
+diff --git a/tests/agent/test_turn_context_usage.py b/tests/agent/test_turn_context_usage.py
+new file mode 100644
+index 00000000000..69bffe5a1a6
+--- /dev/null
++++ b/tests/agent/test_turn_context_usage.py
+@@ -0,0 +1,481 @@
++"""Per-provider-response context accounting (``result["context_usage"]``).
++
++Contract: ``{version: 1, complete: bool, requests: [{provider, model, input_tokens, input_limit}]}``,
++one entry per main-loop provider response measured at ``turn_usage`` (before the MoA fold), at most
++128 entries, reset at every ``run_conversation`` turn. ``complete`` is False whenever a response the
++turn received could not be measured individually (no usage, truncation diversion, adapter-internal
++aggregation, overflow of the 128 cap). ``input_limit`` is the grounded runtime input capacity (never
++the compression trigger) or ``None`` when the capacity is unknown. Billing counters are untouched.
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++from contextlib import ExitStack
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from run_agent import AIAgent
++
++PRIMARY = ("zai", "glm-5.1")
++FALLBACK = ("zai", "glm-4.7")
++WINDOW = 200_000
++
++
++def _tool_defs():
++    return [{"type": "function", "function": {
++        "name": "web_search", "description": "search", "parameters": {"type": "object", "properties": {}}}}]
++
++
++def _agent(fallback_chain=None):
++    with (
++        patch("model_tools.get_tool_definitions", return_value=_tool_defs()),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
++    ):
++        agent = AIAgent(
++            api_key="primary-key-abcdef12", base_url="https://open.bigmodel.cn/api/coding/paas/v4",
++            provider=PRIMARY[0], model=PRIMARY[1], quiet_mode=True, skip_context_files=True,
++            skip_memory=True, fallback_model=fallback_chain,
++        )
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent.compression_enabled = False
++    agent.save_trajectories = False
++    # A grounded window (as if resolved from the provider catalog); no network at turn time.
++    agent.context_compressor.context_length = WINDOW
++    return agent
++
++
++def _usage(prompt, **extra):
++    return SimpleNamespace(prompt_tokens=prompt, completion_tokens=5, total_tokens=prompt + 5, **extra)
++
++
++def _resp(content="done", *, prompt=None, finish="stop", tool_calls=None, usage=None):
++    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
++    if usage is None and prompt is not None:
++        usage = _usage(prompt)
++    return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=finish)], model="served/model",
++                           usage=usage)
++
++
++def _tool_call(call_id="c1"):
++    return SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(name="web_search", arguments="{}"))
++
++
++def _fake_execute(assistant_message, messages, effective_task_id, api_call_count=0):
++    from agent.tool_dispatch_helpers import make_tool_result_message
++    for tc in assistant_message.tool_calls:
++        messages.append(make_tool_result_message("web_search", "result", tc.id))
++
++
++def _run(agent, api_call, message="hello", extra=()):
++    with ExitStack() as stack:
++        for cm in (
++            patch.object(agent, "_interruptible_api_call", side_effect=api_call),
++            patch.object(agent, "_persist_session"),
++            patch.object(agent, "_save_trajectory"),
++            patch.object(agent, "_cleanup_task_resources"),
++            patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
++            patch("agent.turn_recovery.interruptible_backoff_sleep", return_value=None),
++            patch("agent.agent_runtime_helpers.time.sleep"),
++            *extra,
++        ):
++            stack.enter_context(cm)
++        return agent.run_conversation(message)
++
++
++def _scripted(*responses):
++    queue = list(responses)
++
++    def call(api_kwargs):
++        item = queue.pop(0)
++        if isinstance(item, BaseException):
++            raise item
++        return item(api_kwargs) if callable(item) else item
++    return call
++
++
++def _entry(identity, tokens, limit=WINDOW):
++    return {"provider": identity[0], "model": identity[1], "input_tokens": tokens, "input_limit": limit}
++
++
++def _record(agent, response, api_call_count=1):
++    from agent.turn_usage import record_response_usage
++    return record_response_usage(agent, response, messages=[{"role": "user", "content": "hi"}],
++                                 api_call_count=api_call_count, api_duration=0.1, compression_attempts=0,
++                                 max_compression_attempts=3)
++
++
++# ── end-to-end through run_conversation ─────────────────────────────────────────────────────────
++
++
++def test_multi_call_turn_reports_each_response_with_grounded_window():
++    agent = _agent()
++    result = _run(agent, _scripted(
++        _resp("", prompt=1_000, finish="tool_calls", tool_calls=[_tool_call()]),
++        _resp("done", prompt=1_200),
++    ))
++    usage = result["context_usage"]
++    assert usage == {"version": 1, "complete": True,
++                     "requests": [_entry(PRIMARY, 1_000), _entry(PRIMARY, 1_200)]}
++    # The capacity is the runtime input window, not the compression trigger.
++    assert agent.context_compressor.threshold_tokens != WINDOW
++    # Serializable as-is for worker transports.
++    assert json.loads(json.dumps(usage)) == usage
++
++
++def test_usage_resets_every_turn_and_snapshot_is_not_shared():
++    agent = _agent()
++    first = _run(agent, _scripted(_resp("one", prompt=700)))["context_usage"]
++    second = _run(agent, _scripted(_resp("two", prompt=50)))["context_usage"]
++    assert first["requests"] == [_entry(PRIMARY, 700)]
++    assert second == {"version": 1, "complete": True, "requests": [_entry(PRIMARY, 50)]}
++
++
++def test_response_without_usage_marks_turn_incomplete():
++    agent = _agent()
++    usage = _run(agent, _scripted(_resp("no usage")))["context_usage"]
++    assert usage == {"version": 1, "complete": False, "requests": []}
++
++
++def test_failed_attempt_then_retry_counts_only_the_received_response():
++    class ReadTimeout(Exception):
++        pass
++
++    agent = _agent()
++    result = _run(agent, _scripted(ReadTimeout("read timed out"), _resp("ok", prompt=300)))
++    assert result["final_response"] == "ok"
++    assert result["context_usage"] == {"version": 1, "complete": True, "requests": [_entry(PRIMARY, 300)]}
++
++
++def test_fallback_switch_reports_the_runtime_that_answered():
++    class RateLimitError(Exception):
++        status_code = 429
++
++        def __init__(self):
++            super().__init__("Error code: 429 - rate limit exceeded")
++            self.response = SimpleNamespace(headers={})
++            self.body = {"error": {"message": "rate limit exceeded"}}
++
++    agent = _agent([{"provider": FALLBACK[0], "model": FALLBACK[1],
++                     "base_url": "https://open.bigmodel.cn/api/coding/paas/v4"}])
++    fb_client = MagicMock(api_key="primary-key-abcdef12", base_url="https://open.bigmodel.cn/api/coding/paas/v4",
++                          _custom_headers=None, default_headers=None)
++    result = _run(agent, _scripted(RateLimitError(), _resp("via fallback", prompt=400)), extra=(
++        patch("agent.auxiliary_client.resolve_provider_client", return_value=(fb_client, FALLBACK[1])),
++        patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
++        patch("agent.model_metadata.get_model_context_length", return_value=WINDOW),
++    ))
++    assert result["final_response"] == "via fallback"
++    assert agent.model == FALLBACK[1]
++    assert result["context_usage"]["requests"] == [_entry(FALLBACK, 400)]
++    assert result["context_usage"]["complete"] is True
++
++
++def test_mid_turn_identity_change_is_per_response_and_unknown_window_is_null():
++    agent = _agent()
++
++    def switch_then_answer(api_kwargs):
++        # A runtime swap the compressor has not been told about: the identity follows the
++        # response, the window for the new model is unknown.
++        agent.model = "glm-4.7"
++        return _resp("done", prompt=900)
++
++    result = _run(agent, _scripted(
++        _resp("", prompt=800, finish="tool_calls", tool_calls=[_tool_call()]), switch_then_answer))
++    assert result["context_usage"]["requests"] == [_entry(PRIMARY, 800), _entry(FALLBACK, 900, None)]
++
++
++def test_truncated_response_diverted_before_measurement_marks_incomplete():
++    agent = _agent()
++    result = _run(agent, _scripted(
++        _resp("partial answer that was cut", prompt=500, finish="length"),
++        _resp(" and the rest", prompt=520),
++        _resp("done", prompt=540),
++    ))
++    usage = result["context_usage"]
++    assert usage["complete"] is False
++    assert all(r["input_tokens"] in (500, 520, 540) for r in usage["requests"])
++
++
++def test_invalid_response_then_valid_marks_incomplete():
++    agent = _agent()
++    empty = SimpleNamespace(choices=[], model="served/model", usage=_usage(10))
++    usage = _run(agent, _scripted(empty, _resp("ok", prompt=310)))["context_usage"]
++    assert usage["complete"] is False
++    assert usage["requests"] == [_entry(PRIMARY, 310)]
++
++
++def test_server_side_tools_mark_incomplete():
++    agent = _agent()
++    real_build = agent._build_api_kwargs
++
++    def with_hosted_tool(*args, **kwargs):
++        kwargs_out = real_build(*args, **kwargs)
++        kwargs_out["tools"] = [*(kwargs_out.get("tools") or []), {"type": "web_search"}]
++        return kwargs_out
++
++    with patch.object(agent, "_build_api_kwargs", side_effect=with_hosted_tool):
++        usage = _run(agent, _scripted(_resp("ok", prompt=320)))["context_usage"]
++    # The hosted-tool response's usage may sum internal passes: no per-request entry.
++    assert usage == {"version": 1, "complete": False, "requests": []}
++    # Billing still folds it.
++    assert agent.session_prompt_tokens == 320
++
++
++def test_hosted_tool_response_then_ordinary_call_lists_only_the_ordinary_one():
++    """Per response, not sticky: an aggregate hosted-tool response is omitted, the later ordinary
++    request in the same turn is still recorded, and billing totals sum both unchanged."""
++    agent = _agent()
++    real_build = agent._build_api_kwargs
++    calls = {"n": 0}
++
++    def hosted_on_first_call(*args, **kwargs):
++        kwargs_out = real_build(*args, **kwargs)
++        calls["n"] += 1
++        if calls["n"] == 1:
++            kwargs_out["tools"] = [*(kwargs_out.get("tools") or []), {"type": "web_search"}]
++        return kwargs_out
++
++    script = _scripted(_resp(None, prompt=900, finish="tool_calls", tool_calls=[_tool_call()]),
++                       _resp("ok", prompt=400))
++    with patch.object(agent, "_build_api_kwargs", side_effect=hosted_on_first_call):
++        usage = _run(agent, script)["context_usage"]
++    assert calls["n"] == 2
++    assert usage == {"version": 1, "complete": False, "requests": [_entry(PRIMARY, 400)]}
++    assert agent.session_prompt_tokens == 1_300
++    assert agent.session_completion_tokens == 10
++    assert agent.session_api_calls == 2
++
++
++def test_unmeasurable_flag_skips_only_the_context_entry():
++    from agent import context_usage
++    from agent.turn_usage import record_response_usage
++    agent = _agent()
++    context_usage.begin_turn_context_usage(agent)
++    record_response_usage(agent, _resp(prompt=50), messages=[{"role": "user", "content": "hi"}],
++                          api_call_count=1, api_duration=0.1, compression_attempts=0,
++                          max_compression_attempts=3, context_measurable=False)
++    _record(agent, _resp(prompt=60), api_call_count=2)
++    assert context_usage.export_turn_context_usage(agent)["requests"] == [_entry(PRIMARY, 60)]
++    assert agent.session_prompt_tokens == 110
++
++
++@pytest.mark.parametrize("bad", ["m" * 81, "glm\r5", "glm\n5", "glm\x005"])
++@pytest.mark.parametrize("field", ["provider", "model"])
++def test_wire_unsafe_identity_is_unresolvable(field, bad):
++    from agent import context_usage
++    agent = _agent()
++    setattr(agent, field, bad)
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=70))
++    assert context_usage.export_turn_context_usage(agent) == {"version": 1, "complete": False, "requests": []}
++
++
++def test_identity_at_the_80_char_bound_is_kept():
++    from agent import context_usage
++    agent = _agent()
++    agent.model = "m" * 80
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=70))
++    assert context_usage.export_turn_context_usage(agent)["requests"] == [
++        _entry((PRIMARY[0], "m" * 80), 70, None)]
++
++
++# ── turn_usage capture seam ─────────────────────────────────────────────────────────────────────
++
++
++def test_capture_is_a_noop_outside_a_turn():
++    from agent import context_usage
++    agent = _agent()
++    _record(agent, _resp(prompt=10))
++    assert context_usage.export_turn_context_usage(agent) is None
++
++
++def test_moa_records_aggregator_before_advisor_fold_and_keeps_billing():
++    from agent import context_usage
++    from agent.usage_pricing import CanonicalUsage
++
++    agent = _agent()
++    agent.provider, agent.model = "moa", "my-preset"
++    moa = MagicMock(spec=["consume_reference_usage", "last_aggregator_slot", "consume_and_save_trace"])
++    moa.consume_reference_usage.return_value = (CanonicalUsage(input_tokens=9_000), None)
++    moa.last_aggregator_slot = {"provider": "anthropic", "model": "claude-opus-4-1"}
++    agent.client = moa
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=700))
++    usage = context_usage.export_turn_context_usage(agent)
++    # Aggregator identity and prompt; advisor calls are aggregated, so not individually measurable.
++    assert usage == {"version": 1, "complete": False,
++                     "requests": [_entry(("anthropic", "claude-opus-4-1"), 700, None)]}
++    # Billing still folds advisor spend.
++    assert agent.session_prompt_tokens == 9_700
++
++
++def test_moa_without_advisor_calls_stays_complete():
++    from agent import context_usage
++    from agent.usage_pricing import CanonicalUsage
++
++    agent = _agent()
++    agent.provider, agent.model = "moa", "my-preset"
++    moa = MagicMock(spec=["consume_reference_usage", "last_aggregator_slot", "consume_and_save_trace"])
++    moa.consume_reference_usage.return_value = (CanonicalUsage(), None)
++    moa.last_aggregator_slot = {"provider": "anthropic", "model": "claude-opus-4-1"}
++    agent.client = moa
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=700))
++    assert context_usage.export_turn_context_usage(agent)["complete"] is True
++
++
++def test_moa_without_aggregator_slot_never_reports_the_virtual_identity():
++    from agent import context_usage
++    agent = _agent()
++    agent.provider, agent.model = "moa", "my-preset"
++    agent.client = MagicMock(spec=["chat"])
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=700))
++    assert context_usage.export_turn_context_usage(agent) == {"version": 1, "complete": False, "requests": []}
++
++
++def test_class_selector_identity_is_never_reported():
++    from agent import context_usage
++    agent = _agent()
++    agent.model = "class:deep"
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=100))
++    assert context_usage.export_turn_context_usage(agent) == {"version": 1, "complete": False, "requests": []}
++
++
++def test_requests_are_capped_at_128_and_overflow_is_incomplete():
++    from agent import context_usage
++    agent = _agent()
++    context_usage.begin_turn_context_usage(agent)
++    for i in range(130):
++        _record(agent, _resp(prompt=100 + i), api_call_count=i + 1)
++    usage = context_usage.export_turn_context_usage(agent)
++    assert len(usage["requests"]) == 128
++    assert usage["requests"][-1]["input_tokens"] == 227
++    assert usage["complete"] is False
++
++
++def test_zero_usage_sentinel_is_not_a_measurement():
++    """ACP / external-process shims return all-zero usage for a whole remote agent run."""
++    from agent import context_usage
++    agent = _agent()
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=0))
++    assert context_usage.export_turn_context_usage(agent) == {"version": 1, "complete": False, "requests": []}
++
++
++def test_gemini_multi_hop_records_first_hop_and_marks_incomplete():
++    from agent import context_usage
++    agent = _agent()
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(usage=_usage(32_968, initial_prompt_tokens=100, initial_cached_tokens=0)))
++    assert context_usage.export_turn_context_usage(agent) == {
++        "version": 1, "complete": False, "requests": [_entry(PRIMARY, 100)]}
++
++
++def test_gemini_single_hop_stays_complete():
++    from agent import context_usage
++    agent = _agent()
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(usage=_usage(100, initial_prompt_tokens=100, initial_cached_tokens=0)))
++    assert context_usage.export_turn_context_usage(agent)["complete"] is True
++
++
++def test_input_limit_subtracts_output_reservation():
++    from agent import context_usage
++    agent = _agent()
++    agent.context_compressor.max_tokens = 32_000
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=10))
++    assert context_usage.export_turn_context_usage(agent)["requests"][0]["input_limit"] == WINDOW - 32_000
++
++
++def test_guessed_windows_are_null():
++    from agent import context_usage, model_metadata
++
++    agent = _agent()
++    comp = agent.context_compressor
++    # Guessed probe tier (step-down without a provider-reported limit).
++    comp._context_probed, comp._context_probe_persistable = True, False
++    context_usage.begin_turn_context_usage(agent)
++    _record(agent, _resp(prompt=10))
++    assert context_usage.export_turn_context_usage(agent)["requests"][0]["input_limit"] is None
++
++    # Provider-reported limit is grounded.
++    comp._context_probed, comp._context_probe_persistable = True, True
++    context_usage.begin_turn_context_usage(agent)
++    with patch("agent.model_metadata.save_provider_context_length"):
++        _record(agent, _resp(prompt=10))
++    assert context_usage.export_turn_context_usage(agent)["requests"][0]["input_limit"] == WINDOW
++
++    # Detection-failed hard default.
++    comp.context_length = model_metadata.DEFAULT_FALLBACK_CONTEXT
++    key = (agent.model, agent.base_url)
++    model_metadata._FALLBACK_WARNED.add(key)
++    try:
++        context_usage.begin_turn_context_usage(agent)
++        _record(agent, _resp(prompt=10))
++        assert context_usage.export_turn_context_usage(agent)["requests"][0]["input_limit"] is None
++    finally:
++        model_metadata._FALLBACK_WARNED.discard(key)
++
++
++def test_codex_app_server_turn_is_adapter_aggregated():
++    from agent import context_usage
++    from agent.codex_runtime import _record_codex_app_server_usage
++
++    agent = _agent()
++    context_usage.begin_turn_context_usage(agent)
++    _record_codex_app_server_usage(agent, SimpleNamespace(token_usage_last={"inputTokens": 5_000, "outputTokens": 9}))
++    assert context_usage.export_turn_context_usage(agent) == {"version": 1, "complete": False, "requests": []}
++
++
++def test_iteration_summary_response_is_captured():
++    from agent import context_usage
++    from agent.chat_completion_helpers import _summary_text
++
++    agent = _agent()
++    context_usage.begin_turn_context_usage(agent)
++    assert _summary_text(agent, _resp("summary", prompt=4_000)) == "summary"
++    assert context_usage.export_turn_context_usage(agent) == {
++        "version": 1, "complete": True, "requests": [_entry(PRIMARY, 4_000)]}
++
++
++def test_concurrent_agents_and_forks_are_isolated():
++    from agent import context_usage
++
++    a, b, fork = _agent(), _agent(), _agent()
++    context_usage.begin_turn_context_usage(a)
++    context_usage.begin_turn_context_usage(b)
++    barrier = threading.Barrier(3)
++
++    def work(agent, base):
++        barrier.wait()
++        for i in range(40):
++            _record(agent, _resp(prompt=base + i), api_call_count=i + 1)
++
++    threads = [threading.Thread(target=work, args=(ag, base)) for ag, base in ((a, 1_000), (b, 5_000), (fork, 9_000))]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    ua, ub = context_usage.export_turn_context_usage(a), context_usage.export_turn_context_usage(b)
++    assert [r["input_tokens"] for r in ua["requests"]] == list(range(1_000, 1_040))
++    assert [r["input_tokens"] for r in ub["requests"]] == list(range(5_000, 5_040))
++    assert ua["complete"] and ub["complete"]
++    # A fork that never began a turn records nothing anywhere.
++    assert context_usage.export_turn_context_usage(fork) is None
++
++
++@pytest.mark.parametrize("bad", [None, MagicMock()])
++def test_export_tolerates_foreign_state(bad):
++    from agent import context_usage
++    agent = SimpleNamespace(_turn_context_usage=bad)
++    assert context_usage.export_turn_context_usage(agent) is None
+diff --git a/tests/gateway/test_api_context_usage.py b/tests/gateway/test_api_context_usage.py
+new file mode 100644
+index 00000000000..89ae7937326
+--- /dev/null
++++ b/tests/gateway/test_api_context_usage.py
+@@ -0,0 +1,334 @@
++"""Chat Completions expose the turn's per-provider-response context accounting as the optional
++``usage.context_usage`` (``agent/context_usage.py``), streaming and non-streaming alike, on both the
++direct adapter path (``_finish_turn_result``) and the canonical session-authority path
++(``run_api_turn`` -> ``TurnRunner._run_conversation_with_approval`` -> committed admission usage).
++
++Every fixture drives a real ``AIAgent.run_conversation`` (only the provider call is scripted), so the
++measurements come from the agent's own accounting and reach the client through the real wire
++serializers. The billing sums (prompt/completion/total) must stay exactly what they were.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++from contextlib import ExitStack, contextmanager
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import TestClient, TestServer
++
++from gateway.config import PlatformConfig
++from gateway.platforms.api_server import APIServerAdapter
++from tests.agent.test_turn_context_usage import (
++    FALLBACK, PRIMARY, WINDOW, _agent, _entry, _fake_execute, _resp, _scripted, _tool_call,
++)
++
++TWO_CALLS = {"version": 1, "complete": True, "requests": [_entry(PRIMARY, 1_000), _entry(PRIMARY, 1_200)]}
++# completion_tokens is 5 per scripted response (tests/agent/test_turn_context_usage._usage).
++TWO_CALL_SUMS = {"prompt_tokens": 2_200, "completion_tokens": 10, "total_tokens": 2_210}
++
++
++def _two_call_script():
++    return _scripted(_resp("", prompt=1_000, finish="tool_calls", tool_calls=[_tool_call()]),
++                     _resp("done", prompt=1_200))
++
++
++@contextmanager
++def _armed(agent, api_call, extra=()):
++    """The agent with only its provider call scripted (same seams as the agent-side suite)."""
++    with ExitStack() as stack:
++        for cm in (
++            patch.object(agent, "_interruptible_api_call", side_effect=api_call),
++            patch.object(agent, "_persist_session"),
++            patch.object(agent, "_save_trajectory"),
++            patch.object(agent, "_cleanup_task_resources"),
++            patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
++            patch("agent.turn_recovery.interruptible_backoff_sleep", return_value=None),
++            patch("agent.agent_runtime_helpers.time.sleep"),
++            *extra,
++        ):
++            stack.enter_context(cm)
++        yield agent
++
++
++def _billing(usage):
++    return {k: v for k, v in usage.items() if k != "context_usage"}
++
++
++async def _chat(app, *, stream, text="hello"):
++    """POST /v1/chat/completions -> the wire ``usage`` block (the final chunk's when streaming).
++    A distinct ``text`` is a distinct conversation (header-less session ids derive from it)."""
++    body = {"model": "hermes-agent", "messages": [{"role": "user", "content": text}], "stream": stream}
++    async with TestClient(TestServer(app)) as client:
++        response = await client.post("/v1/chat/completions", json=body)
++        text = await response.text()
++    assert response.status == 200, text
++    if not stream:
++        return json.loads(text)["usage"]
++    chunks = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: {")]
++    usages = [chunk["usage"] for chunk in chunks if "usage" in chunk]
++    assert len(usages) == 1, text  # only the finish chunk carries usage
++    assert chunks[-1]["choices"][0]["finish_reason"] == "stop", text
++    return usages[0]
++
++
++# ── direct adapter path (no session authority) ─────────────────────────────────────────────────
++
++
++def _direct_app():
++    adapter = APIServerAdapter(PlatformConfig(enabled=True))
++    assert getattr(adapter.gateway_runner, "session_authority", None) is None
++    app = web.Application()
++    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
++    return adapter, app
++
++
++async def _direct(agent, api_call, *, stream, extra=()):
++    adapter, app = _direct_app()
++    with _armed(agent, api_call, extra), patch.object(adapter, "_create_agent", return_value=agent):
++        return await _chat(app, stream=stream)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_direct_two_measurements_keep_the_aggregate_sum(stream):
++    agent = _agent()
++    usage = await _direct(agent, _two_call_script(), stream=stream)
++    assert usage["context_usage"] == TWO_CALLS
++    # Billing is the same aggregate the wire always carried, equal to the agent's own counters.
++    assert _billing(usage) == TWO_CALL_SUMS
++    assert usage["prompt_tokens"] == agent.session_prompt_tokens == sum(
++        r["input_tokens"] for r in usage["context_usage"]["requests"])
++
++
++@pytest.mark.asyncio
++async def test_direct_stream_and_nonstream_carry_identical_context_usage():
++    nonstream = await _direct(_agent(), _two_call_script(), stream=False)
++    streamed = await _direct(_agent(), _two_call_script(), stream=True)
++    assert streamed == nonstream == {**TWO_CALL_SUMS, "context_usage": TWO_CALLS}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_direct_single_response(stream):
++    usage = await _direct(_agent(), _scripted(_resp("ok", prompt=700)), stream=stream)
++    assert usage == {"prompt_tokens": 700, "completion_tokens": 5, "total_tokens": 705,
++                     "context_usage": {"version": 1, "complete": True, "requests": [_entry(PRIMARY, 700)]}}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_direct_response_without_usage_is_reported_incomplete_not_faked(stream):
++    usage = await _direct(_agent(), _scripted(_resp("no usage")), stream=stream)
++    assert usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
++                     "context_usage": {"version": 1, "complete": False, "requests": []}}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_direct_retry_lists_only_the_received_response(stream):
++    class ReadTimeout(Exception):
++        pass
++
++    usage = await _direct(_agent(), _scripted(ReadTimeout("read timed out"), _resp("ok", prompt=300)), stream=stream)
++    assert usage["context_usage"] == {"version": 1, "complete": True, "requests": [_entry(PRIMARY, 300)]}
++    assert _billing(usage) == {"prompt_tokens": 300, "completion_tokens": 5, "total_tokens": 305}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_direct_fallback_switch_reports_the_runtime_that_answered(stream):
++    class RateLimitError(Exception):
++        status_code = 429
++
++        def __init__(self):
++            super().__init__("Error code: 429 - rate limit exceeded")
++            self.response = SimpleNamespace(headers={})
++            self.body = {"error": {"message": "rate limit exceeded"}}
++
++    agent = _agent([{"provider": FALLBACK[0], "model": FALLBACK[1],
++                     "base_url": "https://open.bigmodel.cn/api/coding/paas/v4"}])
++    fb_client = MagicMock(api_key="primary-key-abcdef12", base_url="https://open.bigmodel.cn/api/coding/paas/v4",
++                          _custom_headers=None, default_headers=None)
++    usage = await _direct(agent, _scripted(RateLimitError(), _resp("via fallback", prompt=400)), stream=stream, extra=(
++        patch("agent.auxiliary_client.resolve_provider_client", return_value=(fb_client, FALLBACK[1])),
++        patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
++        patch("agent.model_metadata.get_model_context_length", return_value=WINDOW),
++    ))
++    assert usage["context_usage"] == {"version": 1, "complete": True, "requests": [_entry(FALLBACK, 400)]}
++    assert usage["prompt_tokens"] == 400
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_direct_mid_turn_identity_change_is_per_response(stream):
++    agent = _agent()
++
++    def switch_then_answer(api_kwargs):
++        agent.model = FALLBACK[1]
++        return _resp("done", prompt=900)
++
++    usage = await _direct(agent, _scripted(
++        _resp("", prompt=800, finish="tool_calls", tool_calls=[_tool_call()]), switch_then_answer), stream=stream)
++    assert usage["context_usage"]["requests"] == [_entry(PRIMARY, 800), _entry(FALLBACK, 900, None)]
++    assert _billing(usage) == {"prompt_tokens": 1_700, "completion_tokens": 10, "total_tokens": 1_710}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_direct_concurrent_turns_are_isolated(stream):
++    """Two overlapping requests on two agents: each response carries only its own measurements."""
++    adapter, app = _direct_app()
++    barrier = threading.Barrier(2, timeout=30)
++    agents = [_agent(), _agent()]
++
++    def script(first, second):
++        calls = _scripted(_resp("", prompt=first, finish="tool_calls", tool_calls=[_tool_call()]),
++                          _resp("done", prompt=second))
++
++        def call(api_kwargs):
++            barrier.wait()  # both turns are mid-flight before either records a response
++            return calls(api_kwargs)
++        return call
++
++    pending = list(agents)
++    with ExitStack() as stack:
++        stack.enter_context(_armed(agents[0], script(111, 222)))
++        stack.enter_context(patch.object(agents[1], "_interruptible_api_call", side_effect=script(333, 444)))
++        for name in ("_persist_session", "_save_trajectory", "_cleanup_task_resources"):
++            stack.enter_context(patch.object(agents[1], name))
++        stack.enter_context(patch.object(agents[1], "_execute_tool_calls", side_effect=_fake_execute))
++        stack.enter_context(patch.object(adapter, "_create_agent", side_effect=lambda **kw: pending.pop(0)))
++        first, second = await asyncio.gather(_chat(app, stream=stream, text="first conversation"),
++                                             _chat(app, stream=stream, text="second conversation"))
++    got = sorted([first, second], key=lambda u: u["prompt_tokens"])
++    assert got[0] == {"prompt_tokens": 333, "completion_tokens": 10, "total_tokens": 343,
++                      "context_usage": {"version": 1, "complete": True,
++                                        "requests": [_entry(PRIMARY, 111), _entry(PRIMARY, 222)]}}
++    assert got[1] == {"prompt_tokens": 777, "completion_tokens": 10, "total_tokens": 787,
++                      "context_usage": {"version": 1, "complete": True,
++                                        "requests": [_entry(PRIMARY, 333), _entry(PRIMARY, 444)]}}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("reported", [
++    "absent",
++    None,
++    {"version": 2, "complete": True, "requests": []},
++    {"version": 1, "complete": "yes", "requests": []},
++    {"version": 1, "complete": True, "requests": [{"provider": "zai", "model": "glm-5.1", "input_tokens": True,
++                                                    "input_limit": None}]},
++    {"version": 1, "complete": True, "requests": [_entry(PRIMARY, 1)] * 129},
++    # Identity ids follow the served_runtime bound: <=80 chars, no CR/LF/NUL.
++    {"version": 1, "complete": True, "requests": [_entry(("zai", "m" * 81), 1)]},
++    {"version": 1, "complete": True, "requests": [_entry(("p" * 81, "glm-5.1"), 1)]},
++    {"version": 1, "complete": True, "requests": [_entry(("zai", "glm\r5"), 1)]},
++    {"version": 1, "complete": True, "requests": [_entry(("zai", "glm\n5"), 1)]},
++    {"version": 1, "complete": True, "requests": [_entry(("za\x00i", "glm-5.1"), 1)]},
++])
++async def test_direct_unavailable_context_usage_is_omitted_and_billing_unchanged(stream, reported):
++    """An agent that reports no (or a malformed) measurement leaves ``context_usage`` absent; the
++    gateway never reconstructs one, and the billing block is byte-for-byte the old one."""
++    agent = MagicMock()
++    agent.session_prompt_tokens, agent.session_completion_tokens, agent.session_total_tokens = 40, 2, 42
++    result = {"final_response": "ok", "completed": True, "messages": []}
++    if reported != "absent":
++        result["context_usage"] = reported
++    agent.run_conversation.return_value = result
++    adapter, app = _direct_app()
++    with patch.object(adapter, "_create_agent", return_value=agent):
++        usage = await _chat(app, stream=stream)
++    assert usage == {"prompt_tokens": 40, "completion_tokens": 2, "total_tokens": 42}
++
++
++def test_wire_keeps_identity_at_the_80_char_bound():
++    from gateway.platforms.api_server_usage import api_context_usage
++    report = {"version": 1, "complete": True, "requests": [_entry(("p" * 80, "m" * 80), 1)]}
++    assert api_context_usage(report) == report
++
++
++# ── canonical session-authority path (run_api_turn) ────────────────────────────────────────────
++
++
++def _canonical_handler(owner, agent):
++    """The admission's handler running the REAL ``TurnRunner._run_conversation_with_approval`` (the
++    executor-thread step that records the committed API usage) around ``agent``."""
++    from gateway.run_turn_runner import TurnRunner
++
++    async def handle(event):
++        from gateway.session_api_turn import api_execution
++        from gateway.session_results import execution_result
++        assert api_execution.get() is not None  # an API admission, executed under the authority
++        turn = object.__new__(TurnRunner)
++        turn._ctx = SimpleNamespace(
++            session_key="", session_id=event.source.chat_id, message=event.text, source=event.source,
++            title_user_message=None, persist_user_display_kind=None, persist_user_display_metadata=None,
++            moa_config=None, inbound_message_id=None, mute_notification_reply=False, reply_expected=None)
++        turn._approval_owner = None
++        turn._approval_notify_sync = lambda *args, **kwargs: None
++        turn._runner = SimpleNamespace(_consume_pending_native_image_paths=lambda key: [])
++        result = await asyncio.to_thread(turn._run_conversation_with_approval, agent, [], None, None, None)
++        execution_result.get()["result"] = {"final_response": result["final_response"], "messages": []}
++        return result["final_response"]
++    return handle
++
++
++def _canonical_app(api, owner, agent):
++    owner.runner._handle_message = _canonical_handler(owner, agent)
++    owner.adopt_agent = lambda *args: None
++    app = web.Application()
++    app.router.add_post("/v1/chat/completions", api._handle_chat_completions)
++    return app
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_canonical_two_measurements_keep_the_aggregate_sum(api, owner, stream):
++    agent = _agent()
++    app = _canonical_app(api, owner, agent)
++    with _armed(agent, _two_call_script()):
++        usage = await _chat(app, stream=stream)
++    assert usage["context_usage"] == TWO_CALLS
++    assert _billing(usage) == TWO_CALL_SUMS
++    assert usage["prompt_tokens"] == agent.session_prompt_tokens
++
++
++@pytest.mark.asyncio
++async def test_canonical_stream_and_nonstream_match_the_direct_path(api, owner):
++    seen = []
++    for stream in (False, True):
++        agent = _agent()
++        app = _canonical_app(api, owner, agent)
++        with _armed(agent, _two_call_script()):
++            seen.append(await _chat(app, stream=stream, text=f"canonical stream={stream}"))
++    direct = await _direct(_agent(), _two_call_script(), stream=False)
++    assert seen[0] == seen[1] == direct == {**TWO_CALL_SUMS, "context_usage": TWO_CALLS}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_canonical_response_without_usage_is_reported_incomplete(api, owner, stream):
++    agent = _agent()
++    app = _canonical_app(api, owner, agent)
++    with _armed(agent, _scripted(_resp("no usage"))):
++        usage = await _chat(app, stream=stream)
++    assert usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
++                     "context_usage": {"version": 1, "complete": False, "requests": []}}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_canonical_agent_without_context_usage_omits_it(api, owner, stream):
++    agent = SimpleNamespace(session_prompt_tokens=0, session_completion_tokens=0)
++
++    def run_conversation(message, **kwargs):
++        agent.session_prompt_tokens, agent.session_completion_tokens = 40, 2
++        return {"final_response": "ok", "completed": True, "messages": []}
++    agent.run_conversation = run_conversation
++    app = _canonical_app(api, owner, agent)
++    usage = await _chat(app, stream=stream)
++    assert usage == {"prompt_tokens": 40, "completion_tokens": 2, "total_tokens": 42}
+-- 
+2.55.0
+

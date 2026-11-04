@@ -1,0 +1,1569 @@
+From 761a9caf66c54bdd1eb48b6e7d744192cc6e295b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:27:20 +0000
+Subject: [PATCH] [daveey] Persist worker queue reasons and explicit origin
+ repin (#701)
+
+* [daveey] Persist worker queue observations and support explicit origin repin
+
+* [daveey] Keep queue diagnostics non-disruptive across recovery transitions
+
+* [daveey] Report lost repin replies as unknown outcomes
+
+* [daveey] Preserve unknown repin outcome on server errors
+
+* test(kanban): machine metrics key bound includes drain telemetry fields
+---
+ agent/core_update_drain.py                    |   6 +-
+ hermes_cli/kanban.py                          |   6 +
+ hermes_cli/kanban_move.py                     |  14 +-
+ hermes_cli/kanban_queue_reason.py             | 225 ++++++++++++
+ hermes_cli/kanban_worker_placement.py         |  18 +-
+ hermes_cli/kanban_worker_repin.py             | 179 ++++++++++
+ hermes_cli/machine_drain_metrics.py           |  43 +++
+ hermes_cli/machine_metrics.py                 |   5 +-
+ .../test_kanban_queue_integration.py          |  97 +++++
+ tests/hermes_cli/test_kanban_queue_reason.py  | 187 ++++++++++
+ tests/hermes_cli/test_kanban_queue_safety.py  |  77 ++++
+ tests/hermes_cli/test_kanban_worker_repin.py  | 336 ++++++++++++++++++
+ .../hermes_cli/test_machine_drain_metrics.py  |  73 ++++
+ tests/hermes_cli/test_machine_metrics.py      |   5 +-
+ tools/kanban_show.py                          |  32 ++
+ tools/kanban_tools.py                         |  33 +-
+ 16 files changed, 1295 insertions(+), 41 deletions(-)
+ create mode 100644 hermes_cli/kanban_queue_reason.py
+ create mode 100644 hermes_cli/kanban_worker_repin.py
+ create mode 100644 hermes_cli/machine_drain_metrics.py
+ create mode 100644 tests/hermes_cli/test_kanban_queue_integration.py
+ create mode 100644 tests/hermes_cli/test_kanban_queue_reason.py
+ create mode 100644 tests/hermes_cli/test_kanban_queue_safety.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_repin.py
+ create mode 100644 tests/hermes_cli/test_machine_drain_metrics.py
+ create mode 100644 tools/kanban_show.py
+
+diff --git a/agent/core_update_drain.py b/agent/core_update_drain.py
+index 2186b3c4abd..969bcef9234 100644
+--- a/agent/core_update_drain.py
++++ b/agent/core_update_drain.py
+@@ -46,14 +46,16 @@ def hold_paths() -> list[Path]:
+     return paths
+ 
+ 
+-def read_hold(path: Path, now: Optional[float] = None) -> Optional[dict]:
+-    """The hold record when ``path`` is an active hold, else None."""
++def read_hold(path: Path, now: Optional[float] = None, *, strict_errors: bool = False) -> Optional[dict]:
++    """Active hold or None; diagnostic readers can distinguish unreadable from absent."""
+     try:
+         raw = path.read_text(encoding="utf-8-sig")
+         st = path.stat()
+     except (FileNotFoundError, NotADirectoryError):
+         return None
+     except OSError:
++        if strict_errors:
++            raise
+         return None
+     try:
+         data = json.loads(raw)
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index a8d405ee5e4..9bc98b358f7 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -741,6 +741,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         latest_summary = kb.latest_summary(conn, args.task_id)
+         from hermes_cli import kanban_wake_check as kwc
+         wake_check = kwc.get_state(conn, args.task_id)
++        from hermes_cli import kanban_queue_reason as kqr
++        queue_reason = kqr.latest(conn, args.task_id)
+         if not want_json:
+             graph = kb.task_graph_context(conn, task.id)
+ 
+@@ -751,6 +753,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+             "wake_check": wake_check,
++            "queue_reason": queue_reason,
+         })
+         return 0
+ 
+@@ -760,6 +763,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+     print(f"Task {task.id}: {task.title}")
+     field("status", task.status)
+     field("assignee", task.assignee or "-")
++    kqr.print_field(queue_reason, field)
+     if task.tenant:
+         field("tenant", task.tenant)
+     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
+@@ -880,6 +884,8 @@ def _cmd_move(args: argparse.Namespace) -> int:
+     elif res.get("ok"):
+         print(f"Moved {args.task_id} to {res['runs_on']} (eligible: {', '.join(res['matches'])}; "
+               f"move {res['move_no']}; now {res['status']})")
++        if res.get("note"):
++            print(res["note"])
+     else:
+         print(f"kanban move: {res.get('error')} [{res.get('reason_code')}]", file=sys.stderr)
+     return 0 if res.get("ok") else 1
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 1a46c981ae5..bd2542d6f3b 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -167,13 +167,23 @@ def move_task(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: s
+ 
+ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: str, force: bool = False,
+                 machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
+-                cfg: Optional[dict] = None) -> dict[str, Any]:
+-    """Move a card that is NOT running (ready/todo/scheduled/blocked/triage): same guards, no run to end."""
++                cfg: Optional[dict] = None, hub: Any = None) -> dict[str, Any]:
++    """Move a card that is NOT running (ready/todo/scheduled/blocked/triage): same guards, no run to end.
++    A worker-first policy card instead takes the explicit Board repin path (``hub`` is for tests)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_worker_node as wn
+     reason = (reason or "").strip()
+     if not reason:
+         return {"ok": False, "reason_code": "reason_required", "error": "reason is required (why this card must move)"}
++    from hermes_cli import kanban_worker_repin as repin
++    if repin.applies(conn, task_id):
++        # A worker-first card's placement is Board-owned: a local relabel would be stripped, so only the Board's
++        # explicit repin to the origin is supported (kanban_worker_repin); every other target refuses.
++        try:
++            labels = wn.normalize_runs_on(runs_on)
++        except ValueError as exc:
++            return {"ok": False, "reason_code": "invalid_runs_on", "error": str(exc)}
++        return repin.repin_to_origin(conn, task_id, list(labels or []), reason, hub=hub)
+     try:
+         plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg)
+     except MoveRefused as exc:
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+new file mode 100644
+index 00000000000..5fface767a2
+--- /dev/null
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -0,0 +1,225 @@
++"""Durable origin-owned worker queue observations, independent of execution authority."""
++from __future__ import annotations
++
++import json
++import logging
++import math
++import re
++import time
++from datetime import UTC, datetime
++
++EVENT = "worker_queue_reason"
++CODES = {"reserved", "draining", "admission_limits", "no_live_candidate", "capability_mismatch",
++         "observation_unavailable", "mixed", "board_error", "board_refused"}
++_REJECTIONS = {"invalid_policy", "not_creator", "not_claimable", "worker_pool_disabled",
++               "unauthorized_candidate", "explicit_pin", "revision_conflict", "not_found"}
++_TOKEN = re.compile(r"^[A-Za-z0-9_.:/+-]{1,120}$")
++
++
++def _tokens(values):
++    return sorted({v for v in values if isinstance(v, str) and _TOKEN.fullmatch(v)}) if isinstance(values, list) else []
++
++
++def _number(value):
++    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 8.64e15
++
++
++def normalize(reply):
++    """Allowlist diagnostic fields; never store raw transport errors or unknown response keys."""
++    raw = reply.get("observation") if isinstance(reply, dict) else None
++    out = {"version": 1, "code": "observation_unavailable", "candidates": []}
++    if isinstance(raw, dict) and raw.get("version") == 1 and raw.get("code") in CODES:
++        out["code"] = raw["code"]
++        if _number(raw.get("observed_at_ms")):
++            out["observed_at_ms"] = raw["observed_at_ms"]
++        candidates = raw.get("candidates")
++        for c in candidates[:64] if isinstance(candidates, list) else []:
++            if not isinstance(c, dict) or not _tokens([c.get("machine")]):
++                continue
++            item = {"machine": c["machine"], "reasons": _tokens(c.get("reasons"))}
++            if labels := _tokens(c.get("missing_labels")):
++                item["missing_labels"] = labels
++            if "draining" in item["reasons"] and _number(c.get("drain_until_ms")):
++                item["drain_until_ms"] = c["drain_until_ms"]
++            out["candidates"].append(item)
++        out["candidates"].sort(key=lambda c: c["machine"])
++    if isinstance(reply, dict) and reply.get("state") in ("queued", "assigned"):
++        out["state"] = reply["state"]
++        if _tokens([reply.get("machine")]):
++            out["machine"] = reply["machine"]
++    return out
++
++
++def _stored(conn, task_id):
++    # Origin timestamps travel with the payload; replica-local insertion IDs do not.
++    rows = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
++        "ORDER BY COALESCE(json_extract(payload, '$.recorded_at_ms'), created_at * 1000) DESC, "
++        "payload DESC LIMIT 1", (task_id, EVENT)).fetchall()
++    try:
++        value = json.loads(rows[0][0]) if rows else None
++        return value if isinstance(value, dict) else None
++    except (TypeError, ValueError):
++        return None
++
++
++def latest(conn, task_id):
++    """Read the last transition, qualifying it against current task lifecycle state."""
++    value = _stored(conn, task_id)
++    if value is None:
++        return None
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    value["current"] = bool(row and row["status"] == "ready" and row["placement_policy"] == "worker-first-v1"
++                            and not row["claim_lock"] and not row["lease_holder"]
++                            and _same_lifecycle(conn, task_id, row, value))
++    return value
++
++
++def _lifecycle(conn, task_id, row):
++    return {"runs_on": row["runs_on"],
++            "run_count": conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]}
++
++
++def _same_lifecycle(conn, task_id, row, value):
++    current = _lifecycle(conn, task_id, row)
++    previous = value.get("lifecycle", {"runs_on": None, "run_count": 0})
++    if value.get("state") == "queued" and current["runs_on"] is None:
++        current["runs_on"] = previous["runs_on"]
++    # A reserve reply precedes the feed. Its matching assignment is not a new wait.
++    if value.get("state") == "assigned" and value.get("machine"):
++        try:
++            if json.loads(current["runs_on"] or "null") == [f"machine:{value['machine']}"]:
++                current["runs_on"] = previous["runs_on"]
++        except (TypeError, ValueError):
++            return False
++    return current == previous
++
++
++def _signature(value):
++    signature = {k: v for k, v in value.items() if k not in ("observed_at_ms", "recorded_at_ms", "current")}
++    if value.get("state") == "assigned" and value.get("machine") and "lifecycle" in value:
++        # Reading back the assignment promised by this reply is not a transition.
++        signature["lifecycle"] = {**value["lifecycle"], "runs_on": value["machine"]}
++    elif value.get("state") == "queued" and "lifecycle" in value:
++        signature["lifecycle"] = {**value["lifecycle"], "runs_on": None}
++    return signature
++
++
++def _stamp(ms):
++    try:
++        return datetime.fromtimestamp(ms / 1000, UTC).isoformat().replace("+00:00", "Z")
++    except (ValueError, OverflowError, OSError):
++        return "unknown"
++
++
++def describe(value):
++    if not value:
++        return "observation unavailable"
++    title = {"reserved": "Worker reserved; awaiting authoritative pickup",
++             "draining": "Worker draining; awaiting pickup",
++             "admission_limits": "Candidates excluded by admission limits",
++             "no_live_candidate": "No live candidate",
++             "capability_mismatch": "Candidate capabilities do not match",
++             "board_error": "Board observation failed",
++             "board_refused": "Board placement request refused",
++             "mixed": "Candidates have different exclusions",
++             "observation_unavailable": "Queue detail observation unavailable"}.get(value.get("code"), "Queue observation")
++    details = []
++    for c in value.get("candidates", []):
++        text = f"{c['machine']}: {', '.join(c['reasons']) or 'eligible'}"
++        if c.get("missing_labels"):
++            text += f" (missing {', '.join(c['missing_labels'])})"
++        if "draining" in c["reasons"]:
++            text += (f"; producer-announced drain deadline {_stamp(c['drain_until_ms'])} (not guaranteed)"
++                     if "drain_until_ms" in c else "; drain end time unknown")
++        details.append(text)
++    if value.get("http_status"):
++        details.append(f"HTTP {value['http_status']}")
++    for key in ("error_class", "rejection_code"):
++        if value.get(key):
++            details.append(value[key])
++    at = value.get("observed_at_ms", value.get("recorded_at_ms"))
++    if at is not None:
++        details.append(f"observed {_stamp(at)}")
++    if value.get("current") is False:
++        title = "[historical] Queue observation: " + title
++    return title + (" — " + "; ".join(details) if details else "")
++
++
++def print_field(value, field):
++    if value:
++        field("queue", describe(value))
++
++
++def _record(conn, task_id, gateway, value):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if (not row or sync.board_mode(conn) != "primary" or row["created_on"] != gateway
++                or (sync.sync_state(conn) or {}).get("gateway_id") != gateway
++                or row["placement_policy"] != "worker-first-v1" or row["status"] != "ready"
++                or row["claim_lock"] or row["lease_holder"]):
++            return False
++        value = {**value, "lifecycle": _lifecycle(conn, task_id, row)}
++        previous = _stored(conn, task_id)
++        if previous and _signature(previous) == _signature(value):
++            return False
++        previous_ms = (previous or {}).get("recorded_at_ms", 0)
++        recorded_ms = max(int(time.time() * 1000), int(previous_ms) + 1 if _number(previous_ms) else 0)
++        value = {**value, "recorded_at_ms": recorded_ms}
++        kb._append_event(conn, task_id, EVENT, value)
++        kb.add_comment(conn, task_id, "worker-placement", describe(value), origin_gateway=gateway)
++        return True
++
++
++def record_reply(conn, task_id, gateway, reply):
++    return _record(conn, task_id, gateway, normalize(reply))
++
++
++def try_record(writer, *args, **kwargs):
++    """Diagnostics must not suppress reserve/pull or convert a local fault into a Board error."""
++    try:
++        return writer(*args, **kwargs)
++    except Exception as exc:  # health: allow BLE001 -- optional diagnostics cannot control dispatch
++        logging.getLogger(__name__).warning("queue observation write failed (%s)", type(exc).__name__)
++        return False
++
++
++def record_pull_error(conn, gateway, *, status=None, error=None):
++    """A failed feed read affects all origin-owned ready policy observations.
++
++    Selection is diagnostic only; _record rechecks ownership and lifecycle under
++    the write transaction so a concurrent claim/repin cannot acquire a new wait.
++    """
++    rows = conn.execute(
++        "SELECT id FROM tasks WHERE placement_policy='worker-first-v1' AND status='ready' "
++        "AND created_on=? AND claim_lock IS NULL AND lease_holder IS NULL", (gateway,)).fetchall()
++    for row in rows:
++        try_record(record_error, conn, row["id"], gateway, status=status, error=error)
++
++
++def record_error(conn, task_id, gateway, *, status=None, error=None):
++    value = {"version": 1, "code": "board_error", "candidates": []}
++    from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
++    if isinstance(error, Resync):
++        return False  # A feed reset is a synchronization signal, not an outage.
++    if error is not None:
++        value["error_class"] = ("HubError" if isinstance(error, HubError) else
++                                "SyncUnavailable" if isinstance(error, SyncUnavailable) else
++                                "OSError" if isinstance(error, OSError) else "unknown")
++    if isinstance(error, HubError):
++        status = error.status
++        try:
++            body = json.loads(error.detail)
++            code = body.get("error") if isinstance(body, dict) else None
++        except (TypeError, ValueError):
++            code = None
++        if isinstance(code, str) and code in _REJECTIONS:
++            if code == "revision_conflict":
++                return False  # Expected CAS race; retry after sync, without outage/recovery chatter.
++            value.update(code="board_refused", rejection_code=code)
++    if type(status) is int and 100 <= status <= 599:
++        value["http_status"] = status
++    return _record(conn, task_id, gateway, value)
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 565d994083d..ac43b2be402 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -114,18 +114,23 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+         "AND NOT EXISTS (SELECT 1 FROM kanban_sync_outbox o WHERE o.table_name='tasks' "
+         "AND o.row_uid=tasks.id AND o.state='pending') ORDER BY (id <= ?), id LIMIT ?",
+         (POLICY, gateway, cursor, MAX_RESERVES_PER_TICK)).fetchall()
++    from hermes_cli import kanban_queue_reason as queue
++
+     attempted = 0
+     last = None
+     try:
+         for row in rows:
+             last = row["id"]
+             try:
+-                hub.reserve(board, task_id=row["id"], expected_revision=row["sync_version"], candidates=candidates)
++                reply = hub.reserve(board, task_id=row["id"], expected_revision=row["sync_version"], candidates=candidates)
++                queue.try_record(queue.record_reply, conn, row["id"], gateway, reply)
+                 attempted += 1
+-            except OSError:
++            except OSError as exc:
+                 # An unavailable transport applies to the entire batch, not just this card.
++                queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc)
+                 return attempted
+-            except client.HubError:
++            except client.HubError as exc:
++                queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc)
+                 # Refused revisions still advance the local cursor, but never the feed.
+                 continue
+     finally:
+@@ -189,7 +194,12 @@ def dispatch_tick(conn):
+             return
+         hub = client.Hub(ident, timeout=DISPATCH_NETWORK_BUDGET_S,
+                          deadline=time.monotonic() + DISPATCH_NETWORK_BUDGET_S)
+-        client.pull(conn, hub, state["board_id"], observers=True, partition=ident.gateway)
++        try:
++            client.pull(conn, hub, state["board_id"], observers=True, partition=ident.gateway)
++        except (client.HubError, client.SyncUnavailable, client.Resync, OSError) as exc:
++            from hermes_cli import kanban_queue_reason as queue
++            queue.try_record(queue.record_pull_error, conn, ident.gateway, error=exc)
++            return
+         reevaluate(conn, hub, state["board_id"], ident.gateway)
+     except (client.HubError, client.SyncUnavailable, client.Resync, OSError):
+         # Offline origin cannot remove the queue fence or manufacture an assignment.
+diff --git a/hermes_cli/kanban_worker_repin.py b/hermes_cli/kanban_worker_repin.py
+new file mode 100644
+index 00000000000..5971ccff909
+--- /dev/null
++++ b/hermes_cli/kanban_worker_repin.py
+@@ -0,0 +1,179 @@
++"""Explicit repin of an unstarted worker-first card back to its origin: ``hermes kanban move <id> --runs-on
++machine:<origin>``. [daveey]
++
++A ``worker-first-v1`` card's ``runs_on`` and ``placement_policy`` are Board-owned: the Board refuses an ordinary
++field edit (``placement_fenced``) and the outbox strips ``runs_on`` from a policy card's push
++(:func:`hermes_cli.kanban_worker_placement.acknowledged_outbox`). So a generic ``move_queued`` relabel of such a card
++would report success while nothing changes. The one supported change is the Board's explicit CAS repin
++(``POST /v2/boards/<id>/placement/repin``, worker ``repinWorker``): creator-only, ``ready`` with no lease, at the
++exact acknowledged revision; it clears the policy and its reservation and sets the pin.
++
++Scope (everything else refuses and writes nothing):
++
++* the card is ``worker-first-v1``, ``ready``, created on this gateway, with no local claim, no Board lease, no
++  ``started_at`` and no run row (never started anywhere);
++* the target is exactly ``[machine:<this gateway>]`` (the origin); another target is refused
++  ``repin_unavailable`` instead of a local relabel the Board would strip;
++* the board is a Board primary, its ``sync_version`` is acknowledged and no task edit is pending in the outbox;
++* the Hub identity used is this board's own gateway.
++
++The local row is never edited here. After the Board answers, the authoritative feed is pulled; until that readback
++lands the local policy stays as it was. Refusals leave this local copy intact; a lost reply has unknown Board outcome. A pull failure
++after a successful repin is reported as committed with readback pending (the normal sync loop applies it), not as a
++failed move. No network call runs inside a DB transaction, and nothing here runs on a timer.
++"""
++from __future__ import annotations
++
++import json
++import re
++import sqlite3
++from typing import Any, Optional
++
++REPINNED_EVENT_FLAG = "repinned"
++_BOARD_CODES = ("revision_conflict", "not_creator", "not_claimable", "invalid_pin", "not_found")
++
++
++def _refuse(code: str, message: str) -> dict[str, Any]:
++    return {"ok": False, "reason_code": code, "error": message}
++
++
++def _unknown(cause: str) -> dict[str, Any]:
++    return _refuse("outcome_unknown", f"repin reply unavailable ({cause}); Board outcome unknown, "
++                                     "local copy unchanged; verify placement after sync before retrying")
++
++
++def applies(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True when ``move_queued`` must route ``task_id`` here: a policy card whose status a queued move would
++    otherwise mutate. Running/done/archived and unknown cards keep the generic path's own refusals."""
++    row = conn.execute("SELECT status, placement_policy FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return bool(row is not None and row["placement_policy"] and row["status"] not in ("running", "done", "archived"))
++
++
++def _board_code(detail: str) -> Optional[str]:
++    """A known Board rejection code from an error body, never the raw body."""
++    try:
++        parsed = json.loads(detail)
++        text = str(parsed.get("error") or parsed.get("reason") or "") if isinstance(parsed, dict) else ""
++    except (TypeError, ValueError):
++        text = str(detail or "")
++    for code in _BOARD_CODES:
++        if re.search(rf"\b{code}\b", text):
++            return code
++    return None
++
++
++def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> dict[str, Any]:
++    """Local preconditions (read-only, no transaction held). ``{"ok": True, me, board, revision, previous}`` or a
++    refusal dict."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_placement as wp
++
++    if sync.board_mode(conn) != "primary":
++        return _refuse("not_synced", "a worker-first card is repinned through the Board service (kanban.sync primary)")
++    state = sync.sync_state(conn) or {}
++    me, board = state.get("gateway_id"), state.get("board_id")
++    if not me or not board:
++        return _refuse("not_synced", "this board has no Board sync identity")
++    row = conn.execute(
++        "SELECT status, placement_policy, created_on, claim_lock, lease_holder, started_at, current_run_id, "
++        "sync_version, runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return _refuse("not_found", f"task {task_id} not found")
++    origin = f"machine:{me}"
++    unavailable = (f"{task_id} is placed by the worker-first policy; the only supported move is the Board repin "
++                   f"of an unstarted ready card to its origin (--runs-on {origin})")
++    if row["placement_policy"] != wp.POLICY:
++        return _refuse("repin_unavailable", f"{task_id} has unknown placement policy {row['placement_policy']!r}")
++    if labels != [origin]:
++        return _refuse("repin_unavailable", unavailable + f"; {labels} is not that target")
++    if row["created_on"] != me:
++        return _refuse("repin_unavailable", unavailable + f"; it was created on {row['created_on']!r}, not {me}")
++    if row["status"] != "ready":
++        return _refuse("repin_unavailable", unavailable + f"; it is {row['status']}, not ready")
++    if row["claim_lock"] is not None or row["lease_holder"] is not None:
++        return _refuse("repin_unavailable", unavailable + "; it holds a claim or Board lease")
++    started = row["started_at"] is not None or row["current_run_id"] is not None or conn.execute(
++        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)).fetchone() is not None
++    if started:
++        return _refuse("repin_unavailable", unavailable + "; it has already started")
++    if row["sync_version"] is None or conn.execute(
++            "SELECT 1 FROM kanban_sync_outbox WHERE table_name = 'tasks' AND row_uid = ? AND state = 'pending' "
++            "LIMIT 1", (task_id,)).fetchone() is not None:
++        return _refuse("not_acknowledged", f"{task_id} has a task edit the Board has not acknowledged yet; "
++                                           "retry after the next sync")
++    try:
++        previous = json.loads(row["runs_on"]) if row["runs_on"] else None
++    except (TypeError, ValueError):
++        previous = None
++    return {"ok": True, "me": me, "board": board, "revision": int(row["sync_version"]), "previous": previous}
++
++
++def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], reason: str, *,
++                    hub: Any = None) -> dict[str, Any]:
++    """Board CAS repin + authoritative pull. Result keys match ``move_queued`` plus ``repinned``,
++    ``board_version`` and ``readback`` (``confirmed`` | ``pending``)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_sync_client as client
++
++    pre = eligibility(conn, task_id, labels)
++    if not pre.get("ok"):
++        return pre
++    me, board = pre["me"], pre["board"]
++    try:
++        if hub is None:
++            ident = client.load_identity()
++            if ident.gateway != me:
++                return _refuse("identity_mismatch", f"Hub identity {ident.gateway!r} is not this board's gateway {me!r}")
++            hub = client.Hub(ident)
++        elif getattr(getattr(hub, "ident", None), "gateway", None) != me:
++            return _refuse("identity_mismatch", f"Hub identity is not this board's gateway {me!r}")
++    except client.SyncUnavailable as exc:
++        return _refuse("board_unavailable", f"no Board identity on this gateway ({exc}); policy unchanged")
++
++    try:
++        reply = hub.repin(board, task_id=task_id, expected_revision=pre["revision"], runs_on=labels)
++    except client.HubError as exc:
++        if exc.status >= 500:
++            return _unknown(f"HTTP {exc.status}")
++        code = _board_code(exc.detail)
++        if code == "revision_conflict":
++            return _refuse("revision_conflict", f"the Board has a newer revision of {task_id} than this copy; "
++                                                "verify placement after the next sync before retrying")
++        return _refuse("repin_refused", f"the Board refused the repin (HTTP {exc.status}"
++                                        + (f", {code}" if code else "") + "); local copy unchanged; verify after sync")
++    except (OSError, client.Resync) as exc:
++        return _unknown(type(exc).__name__)
++    version = reply.get("version") if isinstance(reply, dict) else None
++
++    # The Board has committed. Record the operator's reason as the card's move audit (no runs_on/policy write).
++    move_no = len(km.history(conn, task_id)) + 1
++    try:
++        with kb.write_txn(conn):
++            kb._append_event(conn, task_id, km.MOVED_EVENT, {
++                "from_machine": me, "runs_on": labels, "previous_runs_on": pre["previous"], "reason": reason[:500],
++                "move_no": move_no, "forced": False, "matches": [me], "queued": True, REPINNED_EVENT_FLAG: True,
++                "board_version": version})
++    except sqlite3.Error:
++        pass  # the Board's own placement_repinned event still records the change
++
++    out = {"ok": True, "runs_on": labels, "matches": [me], "move_no": move_no, "status": "ready",
++           REPINNED_EVENT_FLAG: True, "board_version": version, "readback": "pending"}
++    try:
++        client.pull(conn, hub, board, observers=True, partition=me)
++    except (client.HubError, client.Resync, client.SyncUnavailable, OSError) as exc:
++        out["note"] = (f"the Board committed the repin (revision {version}); reading it back failed "
++                       f"({type(exc).__name__}), so the local copy still shows the policy until the next sync")
++        return out
++    row = conn.execute("SELECT status, placement_policy, runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    try:
++        local = json.loads(row["runs_on"]) if row and row["runs_on"] else None
++    except (TypeError, ValueError):
++        local = None
++    if row is not None and row["placement_policy"] is None and local == labels:
++        out["readback"] = "confirmed"
++        out["status"] = row["status"]
++    else:
++        out["note"] = (f"the Board committed the repin (revision {version}); the local copy has not caught up yet "
++                       "and updates on the next sync")
++    return out
+diff --git a/hermes_cli/machine_drain_metrics.py b/hermes_cli/machine_drain_metrics.py
+new file mode 100644
+index 00000000000..e5678e2e351
+--- /dev/null
++++ b/hermes_cli/machine_drain_metrics.py
+@@ -0,0 +1,43 @@
++"""Read-only drain telemetry. An updater's announced bound is not its actual end."""
++from __future__ import annotations
++
++import math
++
++
++def collect():
++    from agent import core_update_drain as drain
++
++    records = []
++    for path in drain.hold_paths():
++        try:
++            record = drain.read_hold(path, strict_errors=True)
++        except (OSError, UnicodeError):
++            return {}  # Unreadable is unknown, not evidence of no hold.
++        if record is not None:
++            records.append(record)
++    if not records:
++        return {"drain_active": 0}
++    result = {"drain_active": 1}
++    bounds = []
++    for record in records:
++        start, duration = record.get("started_at"), record.get("max_s")
++        if not all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in (start, duration)):
++            return result
++        bound = (start + duration) * 1000
++        if not math.isfinite(bound) or bound > 8.64e15:
++            return result
++        bounds.append(bound)
++    result["drain_until_ms"] = max(bounds)
++    return result
++
++
++def send_compatible(send, sample):
++    """Old Boards reject unknown metrics atomically; retry only additive drain fields."""
++    from hermes_cli.kanban_sync_client import HubError
++
++    try:
++        return send(sample)
++    except HubError as exc:
++        if exc.status != 400 or not any(k in sample for k in ("drain_active", "drain_until_ms")):
++            raise
++        return send({k: v for k, v in sample.items() if k not in ("drain_active", "drain_until_ms")})
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 85653ccc372..f642a8b803f 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -98,6 +98,8 @@ def active_card_runs() -> Optional[int]:
+ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+     """``{cpu_load1, cpus, mem_used_pct, disk_free_gb, disk_total_gb}``; a value that cannot be read is left out."""
+     out: dict[str, Any] = {"active_card_runs": active_card_runs()}
++    from hermes_cli import machine_drain_metrics
++    out.update(machine_drain_metrics.collect())
+     try:
+         out["cpu_load1"] = round(os.getloadavg()[0], 2)
+     except (OSError, AttributeError):
+@@ -133,7 +135,8 @@ class Reporter:
+             return False
+         self.next_at = now + REPORT_EVERY_S
+         try:
+-            self.send((self.collect_fn or collect)())
++            from hermes_cli.machine_drain_metrics import send_compatible
++            send_compatible(self.send, (self.collect_fn or collect)())
+             return True
+         except Exception as exc:  # health: allow BLE001 -- load reporting must never stop kanban sync
+             status = getattr(exc, "status", None)
+diff --git a/tests/hermes_cli/test_kanban_queue_integration.py b/tests/hermes_cli/test_kanban_queue_integration.py
+new file mode 100644
+index 00000000000..b4860193535
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_queue_integration.py
+@@ -0,0 +1,97 @@
++"""Queue diagnostics through dispatch, reserve and operator show entry points."""
++import argparse
++from contextlib import contextmanager
++import json
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++from tests.hermes_cli.test_kanban_queue_reason import reply
++
++conn = fixtures.conn
++
++
++@pytest.mark.parametrize("error", [OSError("private transport text"), client.HubError(500, "private response")])
++def test_initial_pull_failure_is_durable_and_recovers(conn, monkeypatch, error):
++    tid = fixtures.acknowledged(conn)
++    foreign = fixtures.acknowledged(conn, created_on="other")
++    hub = Mock()
++    hub.reserve.return_value = reply("draining", reasons=["draining"])
++    monkeypatch.setattr(client, "load_identity", lambda: client.Identity("http://unused", "synthetic", "hub"))
++    monkeypatch.setattr(client, "Hub", lambda *a, **kw: hub)
++    pull = Mock(side_effect=error)
++    monkeypatch.setattr(client, "pull", pull)
++    from hermes_cli import kanban_placement
++    monkeypatch.setattr(kanban_placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    wp.dispatch_tick(conn)
++    wp.dispatch_tick(conn)
++    assert qr.latest(conn, tid)["code"] == "board_error"
++    assert len(kb.list_comments(conn, tid)) == 1
++    assert qr.latest(conn, foreign) is None
++    assert "private" not in json.dumps(qr.latest(conn, tid))
++    hub.reserve.assert_not_called()
++    pull.side_effect = None
++    wp.dispatch_tick(conn)
++    assert qr.latest(conn, tid)["code"] == "draining"
++    assert len(kb.list_comments(conn, tid)) == 2
++    assert conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
++    assert wp.execution_refusal(conn, dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())) == wp.WAITING
++
++
++@pytest.mark.parametrize("error", [OSError("private transport text"), client.HubError(503, "private response")])
++def test_reserve_failure_dedupes_and_recovers(conn, monkeypatch, error):
++    tid = fixtures.acknowledged(conn)
++    hub = Mock()
++    hub.reserve.side_effect = error
++    monkeypatch.setattr(client, "pull", Mock())
++    cfg = {"worker_pools": {"hub": ["worker-1"]}}
++    for _ in range(2):
++        wp.reevaluate(conn, hub, "default", "hub", cfg=cfg)
++    assert qr.latest(conn, tid)["code"] == "board_error"
++    assert len(kb.list_comments(conn, tid)) == 1
++    hub.reserve.side_effect = None
++    hub.reserve.return_value = {"state": "assigned", "machine": "worker-1"}
++    wp.reevaluate(conn, hub, "default", "hub", cfg=cfg)
++    assert qr.latest(conn, tid)["state"] == "assigned"
++    assert len(kb.list_comments(conn, tid)) == 2
++    assert conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
++
++
++@pytest.mark.parametrize("historical", [False, True])
++def test_cli_json_text_tool_and_thread_share_observation(conn, monkeypatch, capsys, historical):
++    from hermes_cli import kanban
++    from tools import kanban_tools
++
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", reply("capability_mismatch", reasons=["capability_mismatch"]))
++    original = qr.describe(qr.latest(conn, tid))
++    assert kb.list_comments(conn, tid)[-1].body == original
++    if historical:
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++        conn.commit()
++
++    @contextmanager
++    def closing():
++        yield conn
++
++    @contextmanager
++    def granted(*args):
++        yield kb, conn, "default"
++
++    monkeypatch.setattr(kanban.kbc, "connect_closing", closing)
++    monkeypatch.setattr(kanban_tools, "_granted_board", granted)
++    args = argparse.Namespace(task_id=tid, json=True)
++    assert kanban._cmd_show(args) == 0
++    cli = json.loads(capsys.readouterr().out)
++    tool = json.loads(kanban_tools._handle_show({"task_id": tid}))
++    assert cli["queue_reason"] == tool["queue_reason"] == qr.latest(conn, tid)
++    assert cli["queue_reason"]["current"] is not historical
++    args.json = False
++    assert kanban._cmd_show(args) == 0
++    assert qr.describe(cli["queue_reason"]) in capsys.readouterr().out
++    assert kb.list_comments(conn, tid)[-1].body == original
+diff --git a/tests/hermes_cli/test_kanban_queue_reason.py b/tests/hermes_cli/test_kanban_queue_reason.py
+new file mode 100644
+index 00000000000..1be889520e7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_queue_reason.py
+@@ -0,0 +1,187 @@
++"""Durable, change-only placement observations; never an execution grant."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_queue_reason as qr
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++
++
++def reply(code="admission_limits", at=1000, reasons=None):
++    return {"state": "queued", "machine": None, "reason": "waiting_for_worker_capacity",
++            "observation": {"version": 1, "code": code, "observed_at_ms": at,
++                            "candidates": [{"machine": "worker-1", "reasons": reasons or ["load_threshold"]}]}}
++
++
++def test_reason_persists_once_and_recovers(conn):
++    tid = fixtures.acknowledged(conn)
++    assert qr.record_reply(conn, tid, "hub", reply())
++    assert not qr.record_reply(conn, tid, "hub", reply(at=2000))
++    assert len(kb.list_comments(conn, tid)) == 1
++    assert qr.latest(conn, tid)["code"] == "admission_limits"
++    assigned = {**reply("reserved"), "state": "assigned", "machine": "worker-1"}
++    assert qr.record_reply(conn, tid, "hub", assigned)
++    assert len(kb.list_comments(conn, tid)) == 2
++    assert qr.latest(conn, tid)["code"] == "reserved"
++    assert conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
++
++
++def test_legacy_and_board_errors_are_honest(conn):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", {"state": "queued", "reason": "waiting_for_worker_capacity"})
++    assert qr.latest(conn, tid)["code"] == "observation_unavailable"
++    qr.record_error(conn, tid, "hub", status=500)
++    assert qr.latest(conn, tid)["code"] == "board_error"
++    assert "500" in kb.list_comments(conn, tid)[-1].body
++    assert not qr.record_error(conn, tid, "hub", status=500)
++
++
++def test_foreign_and_running_copies_never_write(conn):
++    tid = fixtures.acknowledged(conn)
++    assert not qr.record_reply(conn, tid, "other", reply())
++    conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++    conn.commit()
++    assert not qr.record_reply(conn, tid, "hub", reply())
++    assert not kb.list_comments(conn, tid)
++
++
++def test_latest_qualifies_historical_wait(conn):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", reply())
++    conn.execute("UPDATE tasks SET placement_policy=NULL WHERE id=?", (tid,))
++    conn.commit()
++    assert qr.latest(conn, tid)["current"] is False
++    assert "historical" in qr.describe(qr.latest(conn, tid))
++
++
++def test_candidate_order_and_replay_do_not_repeat_comments(conn):
++    tid = fixtures.acknowledged(conn)
++    r = reply(reasons=["load_threshold", "memory_threshold"])
++    qr.record_reply(conn, tid, "hub", r)
++    r["observation"]["replay"] = True
++    r["observation"]["candidates"][0]["reasons"].reverse()
++    assert not qr.record_reply(conn, tid, "hub", r)
++    assert len(kb.list_comments(conn, tid)) == 1
++
++
++def test_unknown_payload_never_persists_raw_fields(conn):
++    tid = fixtures.acknowledged(conn)
++    r = reply()
++    r["observation"]["secret"] = "DO_NOT_STORE"
++    qr.record_reply(conn, tid, "hub", r)
++    assert "DO_NOT_STORE" not in json.dumps(qr.latest(conn, tid))
++
++
++@pytest.mark.parametrize("code", sorted(qr.CODES - {"board_error"}))
++def test_each_reason_has_durable_matching_thread_and_change_only_dedupe(conn, code):
++    tid = fixtures.acknowledged(conn)
++    r = reply(code, reasons=[code])
++    r["observation"]["candidates"][0]["missing_labels"] = ["git", "file"]
++    assert qr.record_reply(conn, tid, "hub", r)
++    latest = qr.latest(conn, tid)
++    assert latest["code"] == code
++    assert latest["observed_at_ms"] == 1000
++    assert kb.list_comments(conn, tid)[-1].body == qr.describe(latest)
++    r["observation"]["observed_at_ms"] = 2000
++    r["observation"]["candidates"][0]["cpu_load1"] = 99
++    assert not qr.record_reply(conn, tid, "hub", r)
++    assert len(kb.list_comments(conn, tid)) == 1
++    assert not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks' AND state='pending'").fetchone()
++
++
++@pytest.mark.parametrize("fields", [
++    {"created_on": "foreign"}, {"claim_lock": "claim"}, {"lease_holder": "worker-1"},
++    {"status": "blocked"}, {"placement_policy": None},
++])
++def test_record_fences_current_row(conn, fields):
++    tid = fixtures.acknowledged(conn, **fields)
++    assert not qr.record_error(conn, tid, "hub", status=500)
++    assert not qr.record_reply(conn, tid, "hub", reply())
++    assert qr.latest(conn, tid) is None
++    assert not kb.list_comments(conn, tid)
++
++
++@pytest.mark.parametrize("state_change", [
++    "runs_on='[\"machine:worker-1\"]'", "claim_lock='claim'", "lease_holder='worker-1'",
++    "status='running'", "status='done'", "placement_policy=NULL",
++])
++def test_lifecycle_changes_do_not_present_old_wait_as_current(conn, state_change):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", reply("draining", reasons=["draining"]))
++    conn.execute(f"UPDATE tasks SET {state_change} WHERE id=?", (tid,))
++    conn.commit()
++    assert qr.latest(conn, tid)["current"] is False
++    assert "historical" in qr.describe(qr.latest(conn, tid))
++
++
++def test_latest_uses_origin_record_time_not_replica_insertion_order(conn):
++    tid = fixtures.acknowledged(conn)
++    for code, recorded in [("reserved", 2002), ("draining", 2001)]:
++        conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                     (tid, qr.EVENT, json.dumps({"code": code, "recorded_at_ms": recorded}), 2))
++    conn.commit()
++    assert qr.latest(conn, tid)["code"] == "reserved"
++
++
++def test_same_millisecond_transitions_have_strict_record_order(conn, monkeypatch):
++    tid = fixtures.acknowledged(conn)
++    monkeypatch.setattr(qr.time, "time", lambda: 1234)
++    qr.record_reply(conn, tid, "hub", reply())
++    before = qr.latest(conn, tid)["recorded_at_ms"]
++    qr.record_reply(conn, tid, "hub", reply("no_live_candidate"))
++    assert qr.latest(conn, tid)["recorded_at_ms"] > before
++
++
++def test_drain_bounds_are_explicit_and_never_inferred(conn):
++    tid = fixtures.acknowledged(conn)
++    r = reply("draining", reasons=["draining"])
++    qr.record_reply(conn, tid, "hub", r)
++    assert "drain end time unknown" in qr.describe(qr.latest(conn, tid))
++    r["observation"]["candidates"][0]["drain_until_ms"] = 5000
++    qr.record_reply(conn, tid, "hub", r)
++    assert "producer-announced drain deadline" in qr.describe(qr.latest(conn, tid))
++    assert "not guaranteed" in qr.describe(qr.latest(conn, tid))
++
++
++def test_completed_attempt_does_not_revive_old_wait_on_ready_retry(conn):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", reply())
++    conn.execute("INSERT INTO task_runs(task_id, started_at, status) VALUES (?, 1, 'done')", (tid,))
++    conn.commit()
++    assert qr.latest(conn, tid)["current"] is False
++    assert qr.record_reply(conn, tid, "hub", reply())
++    assert qr.latest(conn, tid)["current"] is True
++
++
++def test_matching_authoritative_assignment_remains_current_without_duplicate(conn):
++    tid = fixtures.acknowledged(conn)
++    r = {**reply("reserved"), "state": "assigned", "machine": "worker-1"}
++    qr.record_reply(conn, tid, "hub", r)
++    conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", ('["machine:worker-1"]', tid))
++    conn.commit()
++    assert qr.latest(conn, tid)["current"] is True
++    assert not qr.record_reply(conn, tid, "hub", r)
++
++
++def test_wrong_sync_identity_cannot_record_origin_observation(conn):
++    tid = fixtures.acknowledged(conn)
++    conn.execute("UPDATE kanban_sync_state SET gateway_id='replica'")
++    conn.commit()
++    assert not qr.record_reply(conn, tid, "hub", reply())
++    assert not qr.record_reply(conn, tid, "replica", reply())
++    assert not kb.list_comments(conn, tid)
++
++
++def test_comment_failure_rolls_back_observation(conn, monkeypatch):
++    tid = fixtures.acknowledged(conn)
++
++    def fail(*args, **kwargs):
++        raise RuntimeError("synthetic comment failure")
++
++    monkeypatch.setattr(kb, "add_comment", fail)
++    with pytest.raises(RuntimeError, match="synthetic"):
++        qr.record_reply(conn, tid, "hub", reply())
++    assert qr.latest(conn, tid) is None
+diff --git a/tests/hermes_cli/test_kanban_queue_safety.py b/tests/hermes_cli/test_kanban_queue_safety.py
+new file mode 100644
+index 00000000000..7e5877a8f99
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_queue_safety.py
+@@ -0,0 +1,77 @@
++"""Review regressions: diagnostics cannot change scheduling or misstate transitions."""
++from unittest.mock import Mock
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++from tests.hermes_cli.test_kanban_queue_reason import reply
++
++conn = fixtures.conn
++
++
++def test_assigned_to_queued_feed_is_not_a_second_transition(conn):
++    tid = fixtures.acknowledged(conn)
++    assigned = {**reply("reserved"), "state": "assigned", "machine": "worker-1"}
++    qr.record_reply(conn, tid, "hub", assigned)
++    conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", ('["machine:worker-1"]', tid))
++    conn.commit()
++    assert qr.record_reply(conn, tid, "hub", reply())
++    conn.execute("UPDATE tasks SET runs_on=NULL WHERE id=?", (tid,))
++    conn.commit()
++    assert qr.latest(conn, tid)["current"]
++    assert not qr.record_reply(conn, tid, "hub", reply(at=2000))
++    assert len(kb.list_comments(conn, tid)) == 2
++
++
++@pytest.mark.parametrize("error", [sqlite3.OperationalError("locked"), RuntimeError("comment failed"), OSError("disk")])
++def test_record_failure_does_not_skip_successful_reserve_pull(conn, monkeypatch, error):
++    fixtures.acknowledged(conn)
++    hub = Mock()
++    hub.reserve.return_value = reply()
++    monkeypatch.setattr(qr, "record_reply", Mock(side_effect=error))
++    pull = Mock()
++    monkeypatch.setattr(client, "pull", pull)
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg={"worker_pools": {"hub": ["worker-1"]}}) == 1
++    pull.assert_called_once()
++
++
++def test_rejection_code_and_class_are_sanitized(conn, monkeypatch):
++    tid = fixtures.acknowledged(conn)
++    hub = Mock()
++    hub.reserve.side_effect = client.HubError(409, '{"error":"worker_pool_disabled","secret":"private"}')
++    monkeypatch.setattr(client, "pull", Mock())
++    wp.reevaluate(conn, hub, "default", "hub", cfg={"worker_pools": {"hub": ["worker-1"]}})
++    value = qr.latest(conn, tid)
++    assert value["code"] == "board_refused"
++    assert value["rejection_code"] == "worker_pool_disabled"
++    assert value["error_class"] == "HubError"
++    assert "worker_pool_disabled" in kb.list_comments(conn, tid)[-1].body
++    assert "private" not in str(value)
++
++
++def test_resync_has_no_outage_comment(conn):
++    tid = fixtures.acknowledged(conn)
++    assert not qr.record_error(conn, tid, "hub", error=client.Resync())
++    assert not kb.list_comments(conn, tid)
++
++
++def test_error_record_failure_preserves_refusal_path(conn, monkeypatch):
++    fixtures.acknowledged(conn)
++    hub = Mock()
++    hub.reserve.side_effect = client.HubError(503, "private")
++    monkeypatch.setattr(qr, "record_error", Mock(side_effect=RuntimeError("comment failed")))
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg={"worker_pools": {"hub": ["worker-1"]}}) == 0
++
++
++def test_revision_race_is_not_a_board_outage(conn, monkeypatch):
++    tid = fixtures.acknowledged(conn)
++    hub = Mock()
++    hub.reserve.side_effect = client.HubError(409, '{"error":"revision_conflict"}')
++    wp.reevaluate(conn, hub, "default", "hub", cfg={"worker_pools": {"hub": ["worker-1"]}})
++    assert qr.latest(conn, tid) is None
++    assert not kb.list_comments(conn, tid)
+diff --git a/tests/hermes_cli/test_kanban_worker_repin.py b/tests/hermes_cli/test_kanban_worker_repin.py
+new file mode 100644
+index 00000000000..af794a6e501
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_repin.py
+@@ -0,0 +1,336 @@
++"""Explicit origin repin of an unstarted worker-first card (hermes_cli.kanban_worker_repin). [daveey]
++
++Entry paths: ``kanban_move.move_queued`` (core API) and ``hermes kanban move`` (CLI), plus the real HTTP client
++against a stub Board for CAS/refusal/outage. The local policy row is never edited: it changes only when the
++authoritative feed is pulled.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from threading import Thread
++from typing import NoReturn
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_worker_placement as wp
++from hermes_cli import kanban_worker_repin as repin
++from tests.hermes_cli import test_kanban_worker_node as node_fixtures
++from tests.hermes_cli import test_kanban_worker_policy_db as db_fixtures
++from tests.hermes_cli.kanban_sync_fake_board import FakeHub
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB
++
++conn = db_fixtures.conn
++gws = node_fixtures.gws
++svc = node_fixtures.svc
++
++
++class RepinHub(FakeHub):
++    """FakeHub plus the Board's ``repinWorker`` (worker/src/worker_placement.ts): creator only, ready and unleased,
++    exact revision, then clear policy + set the pin in one Board write."""
++
++    def __init__(self, svc, gateway, *, during=None):
++        super().__init__(svc, gateway)
++        self.repins, self.during = [], during
++
++    def repin(self, board, *, task_id, expected_revision, runs_on):
++        self._check()
++        self.repins.append({"task_id": task_id, "expected_revision": expected_revision, "runs_on": runs_on})
++        if self.during:
++            self.during()
++        b = self.svc.board(board)
++        task = b["rows"].get("tasks", {}).get(task_id)
++        def refuse(reason) -> NoReturn:
++            raise ksc.HubError(409, json.dumps({"error": reason}))
++        if task is None:
++            refuse("not_found")
++        if task.get("created_on") != self.gateway:
++            refuse("not_creator")
++        if task.get("status") != "ready" or task_id in b["leases"]:
++            refuse("not_claimable")
++        if expected_revision != task["version"]:
++            refuse("revision_conflict")
++        row = self.svc._put(b, "tasks", task_id, {"placement_policy": None, "runs_on": json.dumps(runs_on)},
++                            self.gateway, None, f"{9_999_999_999_997:013d}-0000-board")
++        return {"version": row["version"], "runs_on": runs_on, "placement_policy": None}
++
++
++def _local(conn_, tid):
++    row = conn_.execute("SELECT placement_policy, runs_on, status FROM tasks WHERE id=?", (tid,)).fetchone()
++    return row["placement_policy"], json.loads(row["runs_on"]) if row["runs_on"] else None, row["status"]
++
++
++def _policy_card(origin):
++    origin.enter()
++    tid = kb.create_task(origin.conn, title="Public analysis", assignee="default", placement_policy=wp.POLICY)
++    origin.round()
++    origin.round()  # the second round reads the Board's echo, which carries the server-owned created_on
++    row = origin.conn.execute("SELECT sync_version, status, created_on FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert row["sync_version"] is not None and row["status"] == "ready" and row["created_on"] == HUB
++    return tid, row["sync_version"]
++
++
++def _moved(conn_, tid):
++    return [json.loads(p or "{}") for (p,) in conn_.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, km.MOVED_EVENT))]
++
++
++# --- core API: Board repin, then authoritative readback ------------------------------------------------------------
++
++def test_origin_repin_uses_board_cas_and_local_policy_changes_only_by_pull(gws, svc):
++    origin, _ = gws
++    tid, revision = _policy_card(origin)
++    seen = []
++    hub = RepinHub(svc, HUB, during=lambda: seen.append(_local(origin.conn, tid)))
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="run it on the hub", hub=hub)
++    assert res["ok"] and res["repinned"] and res["readback"] == "confirmed", res
++    assert hub.repins == [{"task_id": tid, "expected_revision": revision, "runs_on": ["machine:hub"]}]
++    assert seen == [(wp.POLICY, None, "ready")]  # nothing local was edited before the Board answered
++    assert _local(origin.conn, tid) == (None, ["machine:hub"], "ready")
++    assert wp.execution_refusal(origin.conn, origin.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) is None
++    [ev] = _moved(origin.conn, tid)
++    assert ev["repinned"] is True and ev["reason"] == "run it on the hub" and ev["board_version"] == res["board_version"]
++    # No local runs_on/policy edit was queued for push.
++    pending = origin.conn.execute("SELECT fields FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=? "
++                                  "AND state='pending'", (tid,)).fetchall()
++    assert not any({"runs_on", "placement_policy"} & set(json.loads(f[0])) for f in pending)
++
++
++def test_pull_failure_after_repin_reports_committed_with_readback_pending(gws, svc, monkeypatch):
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    def down(*a, **kw):
++        raise OSError("feed unreachable")
++    monkeypatch.setattr(ksc, "pull", down)
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="run it here", hub=RepinHub(svc, HUB))
++    assert res["ok"] and res["readback"] == "pending" and "committed" in res["note"], res
++    assert _local(origin.conn, tid) == (wp.POLICY, None, "ready")  # the fence holds until readback
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["placement_policy"] is None
++    monkeypatch.undo()
++    origin.round()  # the normal sync loop applies the Board's row
++    assert _local(origin.conn, tid) == (None, ["machine:hub"], "ready")
++
++
++@pytest.mark.parametrize("target", [["machine:worker-1"], ["machine:hub", "linux"], ["linux"]])
++def test_non_origin_target_refuses_instead_of_a_stripped_local_relabel(gws, svc, target):
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    hub = RepinHub(svc, HUB)
++    res = km.move_queued(origin.conn, tid, runs_on=target, reason="x", hub=hub)
++    assert res["reason_code"] == "repin_unavailable" and not res["ok"], res
++    assert hub.repins == [] and _local(origin.conn, tid) == (wp.POLICY, None, "ready") and not _moved(origin.conn, tid)
++
++
++def test_board_offline_reports_unknown_outcome_with_local_copy_intact(gws, svc):
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    svc.offline = True
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=RepinHub(svc, HUB))
++    assert res["reason_code"] == "outcome_unknown" and "local copy unchanged" in res["error"], res
++    assert "Board outcome unknown" in res["error"]
++    assert _local(origin.conn, tid) == (wp.POLICY, None, "ready") and not _moved(origin.conn, tid)
++
++
++def test_board_revision_conflict_leaves_policy_intact(gws, svc):
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    b = svc.board(BOARD)
++    svc._put(b, "tasks", tid, {"priority": 3}, "worker-1", None, f"{9_999_999_999_996:013d}-0000-x")  # unseen edit
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=RepinHub(svc, HUB))
++    assert res["reason_code"] == "revision_conflict", res
++    assert _local(origin.conn, tid)[0] == wp.POLICY and b["rows"]["tasks"][tid]["placement_policy"] == wp.POLICY
++
++
++# --- CLI entry path ------------------------------------------------------------------------------------------------
++
++def test_cli_move_repins_an_unstarted_origin_policy_card(gws, svc, monkeypatch):
++    from hermes_cli import kanban as kcli
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", HUB))
++    monkeypatch.setattr(ksc, "Hub", lambda ident, *a, **kw: RepinHub(svc, ident.gateway))
++    out = json.loads(kcli.run_slash(f'move {tid} --runs-on machine:hub --reason "run on origin" --json'))
++    assert out["ok"] and out["readback"] == "confirmed", out
++    assert _local(origin.conn, tid) == (None, ["machine:hub"], "ready")
++
++
++def test_cli_identity_for_another_gateway_is_refused(gws, svc, monkeypatch):
++    from hermes_cli import kanban as kcli
++    origin, _ = gws
++    tid, _ = _policy_card(origin)
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", "worker-1"))
++    monkeypatch.setattr(ksc, "Hub", lambda *a, **kw: pytest.fail("no Board call with a foreign identity"))
++    out = json.loads(kcli.run_slash(f"move {tid} --runs-on machine:hub --reason x --json"))
++    assert out["reason_code"] == "identity_mismatch" and _local(origin.conn, tid)[0] == wp.POLICY
++
++
++# --- real HTTP client: refusals, CAS, no DB transaction across the call --------------------------------------------
++
++def _acknowledged(conn_, **fields):
++    tid = kb.create_task(conn_, title="Public analysis", assignee="default", placement_policy=wp.POLICY)
++    conn_.execute("UPDATE kanban_sync_state SET applying=1")
++    conn_.execute("UPDATE tasks SET sync_version=4, created_on='hub', status='ready' WHERE id=?", (tid,))
++    for key, value in fields.items():
++        conn_.execute(f"UPDATE tasks SET {key}=? WHERE id=?", (value, tid))
++    conn_.execute("UPDATE kanban_sync_state SET applying=0")
++    conn_.execute("DELETE FROM kanban_sync_outbox")
++    conn_.commit()
++    return tid
++
++
++@pytest.fixture
++def board_stub(conn):
++    """A real HTTP server answering placement/repin with a configured status/body; records each request and
++    whether the DB write lock was free while it was served."""
++    state = {"status": 409, "body": {"error": "revision_conflict"}, "received": [], "lock_free": []}
++    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
++
++    class Handler(BaseHTTPRequestHandler):
++        def do_POST(self):
++            state["received"].append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
++            if state.get("drop_after_commit"):
++                state["committed"] = True
++                self.close_connection = True
++                return
++            probe = sqlite3.connect(db_path, timeout=0)
++            try:
++                probe.execute("BEGIN IMMEDIATE")
++                probe.rollback()
++                state["lock_free"].append(True)
++            except sqlite3.OperationalError:
++                state["lock_free"].append(False)
++            finally:
++                probe.close()
++            raw = json.dumps(state["body"]).encode()
++            self.send_response(state["status"])
++            self.send_header("Content-Length", str(len(raw)))
++            self.end_headers()
++            self.wfile.write(raw)
++
++        def log_message(self, format, *args):
++            pass
++
++    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++    thread = Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    state["hub"] = ksc.Hub(ksc.Identity(f"http://127.0.0.1:{server.server_port}", "synthetic", "hub"))
++    try:
++        yield state
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join()
++
++
++@pytest.mark.parametrize("status,body,code", [
++    (409, {"error": "revision_conflict"}, "revision_conflict"),
++    (409, {"error": "not_claimable"}, "repin_refused"),
++    (409, {"error": "not_creator"}, "repin_refused"),
++    (500, {"error": "secret internal detail"}, "outcome_unknown"),
++    (502, {"error": "revision_conflict"}, "outcome_unknown"),
++    (504, {"error": "timeout"}, "outcome_unknown"),
++])
++def test_http_refusal_leaves_policy_and_outbox_unchanged(conn, board_stub, status, body, code):
++    tid = _acknowledged(conn)
++    board_stub.update(status=status, body=body)
++    res = km.move_queued(conn, tid, runs_on="machine:hub", reason="x", hub=board_stub["hub"])
++    assert res["reason_code"] == code and not res["ok"], res
++    assert "secret internal detail" not in res["error"]  # never echoes the raw Board body
++    if status >= 500:
++        assert "Board outcome unknown" in res["error"] and "refused" not in res["error"]
++    assert board_stub["received"] == [("/v2/boards/default/placement/repin",
++                                       {"task_id": tid, "expected_revision": 4, "runs_on": ["machine:hub"]})]
++    assert board_stub["lock_free"] == [True]  # no write transaction held across the network call
++    assert _local(conn, tid) == (wp.POLICY, None, "ready")
++    assert conn.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0] == 0 and not _moved(conn, tid)
++
++
++def test_http_success_with_failed_readback_keeps_local_policy(conn, board_stub, monkeypatch):
++    tid = _acknowledged(conn)
++    board_stub.update(status=200, body={"version": 5, "runs_on": ["machine:hub"], "placement_policy": None})
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: (_ for _ in ()).throw(ksc.HubError(503, "down")))
++    res = km.move_queued(conn, tid, runs_on="machine:hub", reason="x", hub=board_stub["hub"])
++    assert res["ok"] and res["board_version"] == 5 and res["readback"] == "pending", res
++    assert board_stub["lock_free"] == [True]
++    assert _local(conn, tid) == (wp.POLICY, None, "ready")
++
++
++def test_http_transport_failure_has_unknown_outcome(conn):
++    tid = _acknowledged(conn)
++    hub = ksc.Hub(ksc.Identity("http://127.0.0.1:9", "synthetic", "hub"), timeout=2)
++    res = km.move_queued(conn, tid, runs_on="machine:hub", reason="x", hub=hub)
++    assert res["reason_code"] == "outcome_unknown" and _local(conn, tid) == (wp.POLICY, None, "ready")
++
++
++def test_committed_request_with_lost_reply_never_claims_policy_unchanged(conn, board_stub):
++    tid = _acknowledged(conn)
++    board_stub["drop_after_commit"] = True
++    res = km.move_queued(conn, tid, runs_on="machine:hub", reason="x", hub=board_stub["hub"])
++    assert board_stub["committed"] and len(board_stub["received"]) == 1
++    assert not res["ok"] and res["reason_code"] == "outcome_unknown"
++    assert "Board outcome unknown" in res["error"] and "policy unchanged" not in res["error"]
++    assert _local(conn, tid) == (wp.POLICY, None, "ready")
++
++
++class NoCallHub:
++    ident = ksc.Identity("https://hub.test", "k", "hub")
++
++    def repin(self, *a, **kw):
++        pytest.fail("refused locally: no Board call")
++
++
++@pytest.mark.parametrize("fields,code", [
++    ({"created_on": "other"}, "repin_unavailable"),
++    ({"status": "todo"}, "repin_unavailable"),
++    ({"status": "blocked"}, "repin_unavailable"),
++    ({"claim_lock": "local:1"}, "repin_unavailable"),
++    ({"lease_holder": "worker-1", "lease_expires": 1}, "repin_unavailable"),
++    ({"started_at": 1}, "repin_unavailable"),
++    ({"current_run_id": 7}, "repin_unavailable"),
++    ({"sync_version": None}, "not_acknowledged"),
++    ({"placement_policy": "other-policy"}, "repin_unavailable"),
++])
++def test_ineligible_policy_cards_refuse_without_network_or_mutation(conn, fields, code):
++    tid = _acknowledged(conn, **fields)
++    before = conn.execute("SELECT placement_policy, runs_on FROM tasks WHERE id=?", (tid,)).fetchone()
++    res = km.move_queued(conn, tid, runs_on=["machine:hub"], reason="x", hub=NoCallHub())
++    assert res["reason_code"] == code and not res["ok"], res
++    assert tuple(conn.execute("SELECT placement_policy, runs_on FROM tasks WHERE id=?", (tid,)).fetchone()) == tuple(before)
++    assert not _moved(conn, tid)
++
++
++def test_prior_run_row_refuses_as_started(conn):
++    tid = _acknowledged(conn)
++    conn.execute("INSERT INTO task_runs(task_id, status, started_at) VALUES(?, 'released', 1)", (tid,))
++    conn.commit()
++    res = km.move_queued(conn, tid, runs_on=["machine:hub"], reason="x", hub=NoCallHub())
++    assert res["reason_code"] == "repin_unavailable" and "started" in res["error"]
++
++
++def test_pending_task_outbox_refuses_as_unacknowledged(conn):
++    tid = _acknowledged(conn)
++    conn.execute("UPDATE tasks SET priority=2 WHERE id=?", (tid,))
++    conn.commit()
++    res = km.move_queued(conn, tid, runs_on=["machine:hub"], reason="x", hub=NoCallHub())
++    assert res["reason_code"] == "not_acknowledged"
++
++
++def test_hub_identity_must_match_board_gateway(conn):
++    tid = _acknowledged(conn)
++    hub = NoCallHub()
++    hub.ident = ksc.Identity("https://hub.test", "k", "worker-1")
++    res = km.move_queued(conn, tid, runs_on=["machine:hub"], reason="x", hub=hub)
++    assert res["reason_code"] == "identity_mismatch"
++
++
++def test_manual_and_running_cards_keep_the_generic_path(conn):
++    manual = kb.create_task(conn, title="manual", assignee="default")
++    assert not repin.applies(conn, manual)
++    res = km.move_queued(conn, manual, runs_on=["machine:hub"], reason="x", machines={}, hub=NoCallHub())
++    assert res["reason_code"] == "no_machine"  # unchanged: the generic move never targets this machine
++    for status in ("running", "done", "archived"):
++        assert not repin.applies(conn, _acknowledged(conn, status=status))
+diff --git a/tests/hermes_cli/test_machine_drain_metrics.py b/tests/hermes_cli/test_machine_drain_metrics.py
+new file mode 100644
+index 00000000000..c9fa7ae19d6
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_drain_metrics.py
+@@ -0,0 +1,73 @@
++"""Drain diagnostics preserve unknowns and old-Board load reporting."""
++import json
++
++import pytest
++
++from agent import core_update_drain as drain
++from hermes_cli import machine_drain_metrics as md
++from hermes_cli import machine_metrics as mm
++from hermes_cli.kanban_sync_client import HubError
++
++
++@pytest.fixture
++def hold(tmp_path, monkeypatch):
++    path = tmp_path / "drain-hold"
++    monkeypatch.setattr(drain, "hold_paths", lambda: [path])
++    monkeypatch.setattr(drain, "_pid_alive", lambda pid: pid == 123)
++    return path
++
++
++def test_actual_producer_bound_and_dead_writer(hold):
++    hold.write_text(json.dumps({"pid": 123, "started_at": 100, "max_s": 1200}))
++    assert md.collect() == {"drain_active": 1, "drain_until_ms": 1300000}
++    hold.write_text(json.dumps({"pid": 124, "started_at": 100, "max_s": 1200}))
++    assert md.collect() == {"drain_active": 0}
++
++
++@pytest.mark.parametrize("extra", [{}, {"max_s": None}, {"max_s": "1200"}, {"max_s": -1}])
++def test_never_invents_end(hold, extra):
++    hold.write_text(json.dumps({"pid": 123, "started_at": 100, **extra}))
++    assert md.collect() == {"drain_active": 1}
++
++
++def test_absent_and_unparseable(hold):
++    assert md.collect() == {"drain_active": 0}
++    hold.write_text("{")
++    assert md.collect() == {"drain_active": 1}
++
++
++def test_unreadable_is_unknown(hold, monkeypatch):
++    monkeypatch.setattr(type(hold), "read_text", lambda *a, **k: (_ for _ in ()).throw(PermissionError()))
++    assert md.collect() == {}
++
++
++def test_stat_failure_is_unknown(hold, monkeypatch):
++    hold.write_text(json.dumps({"pid": 123}))
++    original = type(hold).stat
++    def stat(path, *args, **kwargs):
++        if path == hold:
++            raise PermissionError("unreadable metadata")
++        return original(path, *args, **kwargs)
++    monkeypatch.setattr(type(hold), "stat", stat)
++    assert md.collect() == {}
++    assert drain.read_hold(hold) is None  # scheduler compatibility
++
++
++def test_reporter_falls_back_without_discarding_capacity():
++    sent = []
++    sample = {"cpu_load1": 1, "active_card_runs": 0, "drain_active": 1, "drain_until_ms": 1234}
++    def send(value):
++        sent.append(value)
++        if "drain_active" in value:
++            raise HubError(400, "unknown metric")
++    assert mm.Reporter(send, collect_fn=lambda: sample).report_due()
++    assert sent == [sample, {"cpu_load1": 1, "active_card_runs": 0}]
++
++
++def test_no_retry_of_other_board_errors():
++    sent = []
++    def send(value):
++        sent.append(value)
++        raise HubError(500, "failure")
++    assert not mm.Reporter(send, collect_fn=lambda: {"drain_active": 1}).report_due()
++    assert len(sent) == 1
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 09b8743d231..e2098b71178 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -30,8 +30,11 @@ def test_collect_reads_this_machine(tmp_path: Path):
+     assert out["cpus"] >= 1 and out["cpu_load1"] >= 0
+     assert 0 < out["disk_free_gb"] <= out["disk_total_gb"]
+     assert 0 <= out["mem_used_pct"] <= 100  # this platform's reader (linux or macos)
+-    assert set(out) <= {"cpu_load1", "cpus", "mem_used_pct", "disk_free_gb", "disk_total_gb", "active_card_runs"}
++    assert set(out) <= {"cpu_load1", "cpus", "mem_used_pct", "disk_free_gb", "disk_total_gb", "active_card_runs",
++                        "drain_active", "drain_until_ms"}
+     assert out["active_card_runs"] is None or out["active_card_runs"] >= 0
++    assert out.get("drain_active") in (None, 0, 1)  # omitted when the hold marker cannot be read
++    assert "drain_until_ms" not in out or out.get("drain_active") == 1
+ 
+ 
+ def test_reporter_sends_at_most_every_30s_and_backs_off_on_old_board():
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+new file mode 100644
+index 00000000000..46259192aad
+--- /dev/null
++++ b/tools/kanban_show.py
+@@ -0,0 +1,32 @@
++"""Read-only card detail assembly for the Kanban tool facade."""
++import json
++
++
++def show(args: dict) -> str:
++    from hermes_cli import kanban_queue_reason as kqr
++    from tools import kanban_tools as kt
++
++    tid = kt._default_task_id(args.get("task_id"))
++    if not tid:
++        return json.dumps({
++            "current_task": None,
++            "hint": (
++                "No dispatcher-assigned task in this session, so there is no "
++                "task to show by default. Call kanban_list to see task ids on "
++                "the board, then kanban_show(task_id=<id>) for full state."),
++        })
++    with kt._granted_board(args.get("board"), tid) as (kb, conn, _):
++        task = kt._existing_task(kb, conn, tid)
++        return json.dumps({
++            "task": kt._fields(task, kt._TASK_FIELDS),
++            "queue_reason": kqr.latest(conn, tid),
++            "parents": kb.parent_ids(conn, tid),
++            "unsatisfied_parents": [
++                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
++            "children": kb.child_ids(conn, tid),
++            "comments": [kt._fields(c, kt._COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
++            "undelivered_comments": [c.id for c in kb.undelivered_live_comments(conn, tid)],
++            "events": [kt._fields(e, kt._EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
++            "runs": [kt._fields(r, kt._RUN_FIELDS) for r in kb.list_runs(conn, tid)],
++            "supervisor_requests": kt._graph.supervisor_requests(conn, tid),
++            "worker_context": kb.build_worker_context(conn, tid)})
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 9f8f12c8547..da2db061817 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -838,37 +838,8 @@ def inject_soft_deadline_from_env(agent: Any, *, now: Optional[float] = None) ->
+ @_kanban_handler("kanban_show")
+ def _handle_show(args: dict, **kw) -> str:
+     """Full task state: row, parents, children, comments, runs, last 50 events."""
+-    tid = _default_task_id(args.get("task_id"))
+-    if not tid:
+-        # No dispatcher task in scope and no explicit id: the caller asked "what
+-        # should I be looking at". A chat profile cannot set HERMES_KANBAN_TASK,
+-        # so an error naming the env var is dead end (#91431) — answer instead.
+-        return json.dumps({
+-            "current_task": None,
+-            "hint": (
+-                "No dispatcher-assigned task in this session, so there is no "
+-                "task to show by default. Call kanban_list to see task ids on "
+-                "the board, then kanban_show(task_id=<id>) for full state."),
+-        })
+-    with _granted_board(args.get("board"), tid) as (kb, conn, _):
+-        task = _existing_task(kb, conn, tid)
+-        return json.dumps({
+-            "task": _fields(task, _TASK_FIELDS),
+-            "parents": kb.parent_ids(conn, tid),
+-            # Non-terminal parents; on a running card this means the dependency
+-            # gate is not holding it and kanban_complete will refuse.
+-            "unsatisfied_parents": [
+-                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
+-            "children": kb.child_ids(conn, tid),
+-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
+-            # Posted during the live run, not written by it, not yet steered into it.
+-            "undelivered_comments": [c.id for c in kb.undelivered_live_comments(conn, tid)],
+-            # Capped; full log via CLI.
+-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
+-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+-            "supervisor_requests": _graph.supervisor_requests(conn, tid),  # kanban_supervisor_request
+-            # Same string build_worker_context hands the dispatcher at spawn time.
+-            "worker_context": kb.build_worker_context(conn, tid)})
++    from tools.kanban_show import show
++    return show(args)
+ 
+ 
+ @_kanban_handler("kanban_list")
+-- 
+2.55.0
+

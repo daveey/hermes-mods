@@ -1,0 +1,482 @@
+From f539daa3ac8f6732fbe7f491e93da31e0f604178 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 22:29:16 +0000
+Subject: [PATCH] fix(kanban): deploy parks honour the host core update window
+ [daveey]
+
+A deploy wait parked before the host's core update batch opened re-parked on
+every wake and its third park escalated to an unstick owner card although the
+deploy was only queued. Parks now read <root>/cache/core-update/window.json
+(schema v1, fresh <=1200s, never future, this host as hermes-sync's HOST,
+well typed). With valid evidence the wake is floored to window_at +
+drain_bound_s and the reason names the window in Pacific time. The park is
+healthy (neither counted by prior_same_premise nor escalated) only while the
+batch is batching/draining and the window is ahead or its semantic state moved
+since the previous same-premise park; a newer observed_at alone is not
+progress. Missing, stale, foreign or malformed evidence changes nothing.
+Wired into schedule_task, timed-park block_task and continue_task before
+persistence; wake probes and other gates are unchanged.
+---
+ hermes_cli/kanban_awaiting.py                 |  16 +-
+ hermes_cli/kanban_continuation.py             |   3 +
+ hermes_cli/kanban_db_schedule.py              |   4 +
+ hermes_cli/kanban_deploy_window.py            | 125 ++++++++++
+ hermes_cli/kanban_timed_park.py               |   2 +
+ tests/hermes_cli/test_kanban_deploy_window.py | 215 ++++++++++++++++++
+ 6 files changed, 361 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_deploy_window.py
+ create mode 100644 tests/hermes_cli/test_kanban_deploy_window.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 1f1334c567c..b78031ad29d 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -592,7 +592,9 @@ def probe_premise(wake_check: Optional[str], *, op: str = "schedule", wake_in: O
+ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+                        probe: Optional[str] = None) -> int:
+     """Trailing parks of this card on ``premise`` (or on the same opaque ``probe``), newest first,
+-    stopping at the first other premise or at the last escalation (the supervisor acted since)."""
++    stopping at the first other premise or at the last escalation (the supervisor acted since).
++    A deploy park behind a healthy core update window (``kanban_deploy_window``) is not counted."""
++    from hermes_cli.kanban_deploy_window import is_healthy
+     count = 0
+     for kind, payload in conn.execute(
+             "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued',?) "
+@@ -607,7 +609,8 @@ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+             continue  # a continuation with no wait, or a legacy park
+         if got["premise"] != premise and not (probe and got.get("probe") == probe):
+             break
+-        count += 1
++        if not is_healthy(got):
++            count += 1
+     return count
+ 
+ 
+@@ -617,7 +620,10 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     """``resolve`` plus re-park escalation: the record to store on the parking event.
+ 
+     Raises ``RepeatedPark`` on the third park in a row on one premise. Card waits (their producer
+-    is accountable) and inferred clock waits (pacing continues, operator drags) never escalate."""
++    is accountable) and inferred clock waits (pacing continues, operator drags) never escalate,
++    nor does a deploy wait behind a healthy core update window (``kanban_deploy_window``), whose
++    evidence lands on the record as ``deploy_window`` for the caller's wake floor."""
++    from hermes_cli import kanban_deploy_window as kdw
+     record = resolve(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
+                      clock_only=clock_only, op=op, wake_in=wake_in)
+     if record["kind"] == "card" or (record["kind"] == "clock" and record.get("inferred")):
+@@ -626,7 +632,9 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     probe = probe_premise(wake_check, op=op, wake_in=wake_in)
+     if probe:
+         record["probe"] = probe
+-    if prior_same_premise(conn, task_id, record["premise"], probe=probe) >= REPARK_LIMIT:
++    kdw.annotate(conn, task_id, record, now=int(time.time()))
++    if (not kdw.is_healthy(record)
++            and prior_same_premise(conn, task_id, record["premise"], probe=probe) >= REPARK_LIMIT):
+         raise RepeatedPark(record)
+     return record
+ 
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 6fd2e9f5da3..25b5dc9d678 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -158,6 +158,9 @@ def continue_task(
+                     return {"ok": False, "error": "task changed state concurrently"}
+                 return {"ok": True, "status": "todo", "run_id": None, "continuation": streak,
+                         "wake_at": None, "escalated_to": owner}
++            from hermes_cli import kanban_deploy_window as kdw
++            wake_at, noted = kdw.apply(record, wake_at, checkpoint, now=now)
++            checkpoint = noted or checkpoint
+             wake_check = wake_check or kaw.card_probe(record)
+             why = kaw.park_cycle_error(conn, task_id, record, wake_check)
+             if why:
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index fc8b54a7486..0f8a627fcad 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -6,6 +6,7 @@ tests still reaches this code. Re-exported from ``kanban_db``.
+ from __future__ import annotations
+ 
+ import sqlite3
++import time as _time
+ from typing import Any, Optional
+ 
+ 
+@@ -46,7 +47,10 @@ def schedule_task(
+         why = kaw.park_cycle_error(conn, task_id, record, wake_check)
+         if why:
+             raise kaw.AwaitingError(kaw.INVALID_AWAITING, why)
++        from hermes_cli import kanban_deploy_window as kdw
+         payload = scheduled_payload(reason)
++        payload["wake_at"], reason = kdw.apply(record, payload["wake_at"], reason, now=int(_time.time()))
++        payload["reason"] = reason
+         wake_check, check_every = kwc.validate_park(
+             wake_at=payload["wake_at"], wake_check=wake_check,
+             check_every=check_every, clock_only=clock_only)
+diff --git a/hermes_cli/kanban_deploy_window.py b/hermes_cli/kanban_deploy_window.py
+new file mode 100644
+index 00000000000..858839cf8cb
+--- /dev/null
++++ b/hermes_cli/kanban_deploy_window.py
+@@ -0,0 +1,125 @@
++"""Deploy waits read the host's core update window before they count as a repeated park. [daveey]
++
++``hermes-sync`` on a host batches core updates into windows and publishes the batch it is in to
++``<root>/cache/core-update/window.json`` (the ROOT home: every profile on the host shares one
++update). A card waiting on a core deploy (``awaiting.kind == 'deploy'``) used to re-park every
++time it woke before the batch opened, and its third park escalated to an "unstick" owner card
++although the deploy was merely queued.
++
++The record (schema ``version`` 1) is evidence only when it is fresh (``observed_at`` at most
++:data:`FRESH_SECONDS` old, never in the future), names this host (the publisher's ``HOST`` is
++``socket.gethostname().split('.')[0]``) and is well typed. Then:
++
++* the park's wake is floored to ``window_at + drain_bound_s`` (the batch's latest end), and its
++  reason names the window in Pacific time;
++* the park is *healthy*, and neither counts toward nor triggers re-park escalation, only while
++  the batch is ``batching``/``draining`` AND either the window is still ahead or the publisher's
++  semantic state (``state``, ``state_since``) moved since the previous park on this premise. A
++  newer ``observed_at`` alone is not progress: an overdue batch nobody is running escalates.
++
++Anything else (missing, stale, foreign, malformed) changes nothing: the park escalates as before.
++"""
++from __future__ import annotations
++
++import json
++import socket
++from datetime import datetime
++from pathlib import Path
++from typing import Optional
++
++WINDOW_FILE = Path("cache", "core-update", "window.json")
++VERSION = 1
++FRESH_SECONDS = 1200
++HEALTHY_STATES = ("batching", "draining")
++DISPLAY_ZONE = "America/Los_Angeles"
++_INT_FIELDS = ("observed_at", "window_at", "state_since", "drain_bound_s")
++
++
++def host_identity() -> str:
++    """This host's name exactly as the window publisher writes it."""
++    return socket.gethostname().split(".")[0]
++
++
++def window_path() -> Path:
++    from hermes_constants import get_default_hermes_root
++
++    return get_default_hermes_root() / WINDOW_FILE
++
++
++def _is_int(value) -> bool:
++    return isinstance(value, int) and not isinstance(value, bool)
++
++
++def read_window(now: int) -> Optional[dict]:
++    """The validated window record for this host, or None when there is no usable evidence."""
++    try:
++        data = json.loads(window_path().read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    if not isinstance(data, dict) or data.get("version") != VERSION or not _is_int(data.get("version")):
++        return None
++    if not all(_is_int(data.get(key)) for key in _INT_FIELDS):
++        return None
++    if not isinstance(data.get("host"), str) or not isinstance(data.get("state"), str):
++        return None
++    if data["host"] != host_identity() or data["drain_bound_s"] < 0:
++        return None
++    if data["observed_at"] > now or now - data["observed_at"] > FRESH_SECONDS or data["state_since"] > now:
++        return None
++    return {key: data[key] for key in ("host", "observed_at", "window_at", "state", "state_since",
++                                       "drain_bound_s")}
++
++
++def _previous(conn, task_id: str, premise: str) -> Optional[dict]:
++    """``deploy_window`` of the latest park on ``premise`` (None when it carried none)."""
++    for (payload,) in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued') "
++            "ORDER BY id DESC LIMIT 20", (task_id,)):
++        try:
++            got = json.loads(payload or "{}").get("awaiting") or {}
++        except (ValueError, AttributeError):
++            continue
++        if isinstance(got, dict) and got.get("premise") == premise:
++            seen = got.get("deploy_window")
++            return seen if isinstance(seen, dict) else None
++    return None
++
++
++def annotate(conn, task_id: str, record: dict, *, now: int) -> None:
++    """Attach ``deploy_window`` (with its ``healthy`` verdict) to a deploy park's record, in place."""
++    if record.get("kind") != "deploy" or not record.get("premise"):
++        return
++    window = read_window(now)
++    if window is None:
++        return
++    prev = _previous(conn, task_id, record["premise"])
++    moved = bool(prev) and (prev.get("state"), prev.get("state_since")) != (window["state"], window["state_since"])
++    window["healthy"] = window["state"] in HEALTHY_STATES and (window["window_at"] > now or moved)
++    record["deploy_window"] = window
++
++
++def is_healthy(record) -> bool:
++    seen = record.get("deploy_window") if isinstance(record, dict) else None
++    return isinstance(seen, dict) and seen.get("healthy") is True
++
++
++def _local_time(epoch: int) -> str:
++    from zoneinfo import ZoneInfo
++
++    when = datetime.fromtimestamp(epoch, ZoneInfo(DISPLAY_ZONE))
++    return f"{when.hour % 12 or 12}:{when:%M %p %Z}"
++
++
++def apply(record, wake_at: Optional[int], reason: Optional[str], *, now: int) -> tuple[Optional[int], Optional[str]]:
++    """``(wake_at, reason)`` for the parking event: floored to the batch's drain end and naming the
++    window when the record carries window evidence; unchanged otherwise."""
++    seen = record.get("deploy_window") if isinstance(record, dict) else None
++    if not isinstance(seen, dict) or wake_at is None:
++        return wake_at, reason
++    from hermes_cli.kanban_timed_park import MAX_WAKE_SECONDS
++
++    floor = min(seen["window_at"] + seen["drain_bound_s"], now + MAX_WAKE_SECONDS)
++    note = f"waiting for {seen['host']}'s core update window at {_local_time(seen['window_at'])}"
++    if note not in (reason or ""):
++        reason = f"{reason}; {note}" if reason else note
++    return max(int(wake_at), floor), reason
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index ddd16945bc1..6b3025f7876 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -170,6 +170,8 @@ def park(
+         except kaw.RepeatedPark as rp:
+             return kaw.escalate(conn, task_id, record=rp.record, reason=reason,
+                                 expected_run_id=expected_run_id) is not None
++        from hermes_cli import kanban_deploy_window as kdw
++        wake_at, reason = kdw.apply(record, wake_at, reason, now=now)
+     wake_check = wake_check or kaw.card_probe(record)
+     wake_check, check_every = kwc.validate_park(
+         wake_at=wake_at, wake_check=wake_check, check_every=check_every, clock_only=clock_only)
+diff --git a/tests/hermes_cli/test_kanban_deploy_window.py b/tests/hermes_cli/test_kanban_deploy_window.py
+new file mode 100644
+index 00000000000..7d7e07ee146
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_deploy_window.py
+@@ -0,0 +1,215 @@
++"""Host-local core deploy window evidence through the real parking transactions. [daveey]
++
++The hub's hermes-sync publishes ``<root>/cache/core-update/window.json`` (``HOST`` there is
++``socket.gethostname().split('.')[0]``). A deploy wait parked behind a healthy batch window
++must not escalate as a repeated premise, and its wake is floored to the batch's drain end; stale,
++missing, foreign or malformed evidence changes nothing, and overdue unchanged batches still
++escalate.
++"""
++import json
++import socket
++from datetime import UTC, datetime
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_awaiting as kaw
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++
++NOW = int(datetime(2026, 11, 2, 22, tzinfo=UTC).timestamp())
++WINDOW = NOW + 3600  # 23:00 UTC = 3:00 PM PST
++AWAITING = {"kind": "deploy", "ref": "abcdef123", "why": "core release"}
++REASON = "SCHEDULED_UNTIL=2026-11-02T22:01:00Z core release pending"
++PROBE = "test -f /nonexistent-core-release-receipt"
++OPS = ["schedule", "block", "continue"]
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setattr("time.time", lambda: NOW)
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        yield home, conn
++    kwc._shutdown_for_tests()
++
++
++def publish(home, **changes):
++    data = dict(version=1, host=socket.gethostname().split(".")[0], observed_at=NOW,
++                window_at=WINDOW, state="batching", state_since=NOW - 100, drain_bound_s=900)
++    data.update(changes)
++    path = home / "cache/core-update/window.json"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(data if isinstance(data, str) else json.dumps(data))
++    return data
++
++
++def running(conn, tid=None):
++    if tid is None:
++        tid = kb.create_task(conn, title="Verify core release", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    return tid
++
++
++def park(conn, tid, op, awaiting=AWAITING):
++    """One real park; returns (last event, closed run summary)."""
++    if op == "schedule":
++        assert kb.schedule_task(conn, tid, reason=REASON, awaiting=awaiting, wake_check=PROBE, check_every=300)
++    elif op == "block":
++        assert kb.block_task(conn, tid, reason=REASON, kind="time", awaiting=awaiting,
++                             wake_check=PROBE, check_every=300)
++    else:
++        result = kc.continue_task(conn, tid, checkpoint=REASON, resume_after_seconds=60, max_continuations=20,
++                                  awaiting=awaiting, wake_check=PROBE, check_every=300)
++        assert result["ok"], result
++    run = kb.latest_run(conn, tid)
++    return kb.list_events(conn, tid)[-1], run.summary if run else None
++
++
++def park_until_escalated(conn, tid, op, home=None, states=None, awaiting=AWAITING, n=4):
++    """Park up to ``n`` times (re-claiming between); returns the kinds of the parking events."""
++    kinds = []
++    for i in range(n):
++        if states:
++            publish(home, **states[i])
++        event, _summary = park(conn, tid, op, awaiting)
++        kinds.append(event.kind)
++        if event.kind == kaw.ESCALATED_EVENT:
++            break
++        running(conn, tid)
++    return kinds
++
++
++@pytest.mark.parametrize("op", OPS)
++@pytest.mark.parametrize("named", [False, True])
++def test_future_window_floors_real_parks_and_preserves_probe(board, monkeypatch, op, named):
++    home, conn = board
++    publish(home)
++    if named:  # a named profile reads the ROOT home's cache
++        profile = home / "profiles/worker"
++        profile.mkdir(parents=True)
++        (profile / "config.yaml").write_text("{}\n")
++        monkeypatch.setenv("HERMES_HOME", str(profile))
++    tid = running(conn)
++    for _ in range(4):
++        event, summary = park(conn, tid, op)
++        assert event.kind in ("scheduled", "continued")
++        assert event.payload["wake_at"] == WINDOW + 900
++        assert event.payload["wake_check"] == PROBE
++        assert "core update window at 3:00 PM PST" in summary
++        assert event.payload["awaiting"]["deploy_window"]["healthy"] is True
++        assert kaw.prior_same_premise(conn, tid, kaw.premise_hash(AWAITING, REASON)) == 0
++        running(conn, tid)
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_stale_window_still_escalates(board, op):
++    home, conn = board
++    publish(home, observed_at=NOW - 1201)
++    tid = running(conn)
++    assert park_until_escalated(conn, tid, op)[-1] == kaw.ESCALATED_EVENT
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_missing_window_still_escalates(board, op):
++    _home, conn = board
++    tid = running(conn)
++    assert park_until_escalated(conn, tid, op) == ["scheduled" if op != "continue" else "continued"] * 2 + [
++        kaw.ESCALATED_EVENT]
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_unchanged_overdue_batch_escalates_but_keeps_drain_floor(board, op):
++    home, conn = board
++    overdue = dict(window_at=NOW - 600, drain_bound_s=3600, state_since=NOW - 900)
++    publish(home, observed_at=NOW - 30, **overdue)
++    tid = running(conn)
++    event, summary = park(conn, tid, op)
++    assert event.payload["wake_at"] == NOW - 600 + 3600
++    assert event.payload["awaiting"]["deploy_window"]["healthy"] is False
++    assert "core update window" in summary
++    running(conn, tid)
++    # Fresh observations of the same unchanged overdue batch are not a change.
++    kinds = park_until_escalated(conn, tid, op, home, states=[dict(overdue, observed_at=NOW - k) for k in (5, 1, 0)])
++    assert kinds[-1] == kaw.ESCALATED_EVENT and len(kinds) == 2
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_healthy_park_is_exempt_after_two_unhealthy_parks(board, op):
++    home, conn = board
++    tid = running(conn)
++    assert park_until_escalated(conn, tid, op, n=2) == ["scheduled" if op != "continue" else "continued"] * 2
++    publish(home)  # the batch is now published and ahead: the third park is not a repeat
++    event, _summary = park(conn, tid, op)
++    assert event.kind != kaw.ESCALATED_EVENT and event.payload["wake_at"] == WINDOW + 900
++    running(conn, tid)
++    (home / "cache/core-update/window.json").unlink()  # evidence gone: the unhealthy streak resumes
++    assert park(conn, tid, op)[0].kind == kaw.ESCALATED_EVENT
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_overdue_batch_whose_state_changes_never_escalates(board, op):
++    home, conn = board
++    states = [dict(window_at=NOW - 600, state=s, state_since=NOW - 500 + 50 * i)
++              for i, s in enumerate(("batching", "draining", "batching", "draining", "draining"))]
++    tid = running(conn)
++    kinds = park_until_escalated(conn, tid, op, home, states=states, n=5)
++    assert kaw.ESCALATED_EVENT not in kinds and len(kinds) == 5
++
++
++@pytest.mark.parametrize("op", OPS)
++def test_foreign_host_window_is_ignored(board, op):
++    home, conn = board
++    publish(home, host="some-other-host")
++    tid = running(conn)
++    event, summary = park(conn, tid, op)
++    assert event.payload["wake_at"] == NOW + 60 and "core update window" not in summary
++    running(conn, tid)
++    assert park_until_escalated(conn, tid, op)[-1] == kaw.ESCALATED_EVENT
++
++
++@pytest.mark.parametrize("bad", [
++    "{not json", "[]", {"version": 2}, {"host": 7}, {"observed_at": "now"}, {"observed_at": True},
++    {"observed_at": NOW + 30}, {"window_at": None}, {"state": 3}, {"state_since": NOW + 30},
++    {"drain_bound_s": -1}, {"drain_bound_s": 1.5e12}, {"state": "idle"},
++])
++def test_malformed_or_unusable_window_changes_nothing(board, bad):
++    home, conn = board
++    if isinstance(bad, str):
++        path = home / "cache/core-update/window.json"
++        path.parent.mkdir(parents=True)
++        path.write_text(bad)
++    else:
++        publish(home, **bad)
++    tid = running(conn)
++    event, summary = park(conn, tid, "schedule")
++    if bad == {"state": "idle"}:  # valid but not batching/draining: floored, not exempt
++        assert event.payload["awaiting"]["deploy_window"]["healthy"] is False
++    else:
++        assert event.payload["wake_at"] == NOW + 60 and "deploy_window" not in event.payload["awaiting"]
++        assert "core update window" not in summary
++    running(conn, tid)
++    assert park_until_escalated(conn, tid, "schedule")[-1] == kaw.ESCALATED_EVENT
++
++
++@pytest.mark.parametrize("op", OPS)
++@pytest.mark.parametrize("kind", [{"kind": "ci", "ref": "123456"}, {"kind": "external", "ref": "vendor-1234",
++                                                                      "why": "vendor queue"}])
++def test_non_deploy_waits_ignore_a_healthy_window(board, op, kind):
++    home, conn = board
++    publish(home)
++    tid = running(conn)
++    event, summary = park(conn, tid, op, awaiting=kind)
++    assert event.payload["wake_at"] == NOW + 60 and "deploy_window" not in event.payload["awaiting"]
++    assert "core update window" not in summary
++    running(conn, tid)
++    assert park_until_escalated(conn, tid, op, awaiting=kind)[-1] == kaw.ESCALATED_EVENT
+-- 
+2.55.0
+

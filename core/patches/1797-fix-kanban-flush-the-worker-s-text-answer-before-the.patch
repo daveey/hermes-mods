@@ -1,0 +1,218 @@
+From 40e91500bfed8c2a9f7c48092ef8d8e7b4be095f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 03:04:54 +0000
+Subject: [PATCH] fix(kanban): flush the worker's text answer before the
+ stop-loop nudge's next request [daveey]
+
+The kanban stop guard appended a worker's text-only final answer as ephemeral
+scaffolding (_kanban_stop_synthetic) and continued straight into the next model
+request without flushing it. An observed managed worker (Ask Eve's private
+observer binds every SDK response to exactly one durable assistant row before
+the next SDK request) therefore faulted closed with "previous response never
+durably bound", and every retry hit "SDK request after observer close/fault".
+
+Match verify-on-stop and pre_verify: the answer goes through
+_append_interim_answer (emit + append + session-DB flush, finish_reason
+kanban_terminal_required kept); only the nudge row carries
+_kanban_stop_synthetic. The finalizer now drops that nudge with the other
+verification-continuation nudges, and compaction anchoring treats it as
+synthetic user scaffolding, so budget exhaustion keeps exactly one answer row.
+
+Tests: tests/agent/test_kanban_stop_interim_flush.py (RED on main, GREEN here):
+the answer row is in state.db when the second request is made, the nudge is
+never persisted, and budget exhaustion leaves one durable answer.
+
+Ask Eve's pinned core (1f926111b0fa) is not touched; it picks this up with its
+next core pin.
+---
+ agent/conversation_compression.py             |   2 +-
+ agent/session_persistence.py                  |   2 +-
+ agent/turn_finalizer.py                       |   2 +-
+ agent/turn_stop_gates.py                      |   8 +-
+ tests/agent/test_kanban_stop_interim_flush.py | 116 ++++++++++++++++++
+ 5 files changed, 125 insertions(+), 5 deletions(-)
+ create mode 100644 tests/agent/test_kanban_stop_interim_flush.py
+
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 8ba5a462d94..186ac7fa1ab 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -2178,7 +2178,7 @@ def _message_text(message: Any) -> str:
+ 
+ _SYNTHETIC_USER_FLAGS = (
+     "_todo_snapshot_synthetic", "_empty_recovery_synthetic", "_verification_stop_synthetic", "_pre_verify_synthetic",
+-    "_dropped_toolcall_nudge", "_pre_final_gate_synthetic",
++    "_dropped_toolcall_nudge", "_pre_final_gate_synthetic", "_kanban_stop_synthetic",
+ )
+ 
+ 
+diff --git a/agent/session_persistence.py b/agent/session_persistence.py
+index 1e0f86f2173..0eb70973ac2 100644
+--- a/agent/session_persistence.py
++++ b/agent/session_persistence.py
+@@ -58,7 +58,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
+     "_verification_stop_synthetic",  # verify-on-stop nudge; the assistant candidate itself is NOT synthetic
+     "_pre_verify_synthetic",
+     "_pre_final_gate_synthetic",  # silent hold: held answer AND its nudge are never persisted [daveey]
+-    "_kanban_stop_synthetic",  # kanban worker stop-guard
++    "_kanban_stop_synthetic",  # kanban worker stop-guard nudge; the assistant answer itself is NOT synthetic
+     "_dropped_toolcall_nudge",  # internal retry instruction; must not replay as user context
+ )
+ 
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index 9311466bca9..4d793fc154b 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -27,7 +27,7 @@ from agent.served_model import result_model_fields
+ # real content and is not flagged. (#65919)
+ # ``_pre_final_gate_synthetic`` [daveey] marks BOTH rows of a silent hold (the held answer too).
+ _VERIFICATION_CONTINUATION_FLAGS = (
+-    "_verification_stop_synthetic", "_pre_verify_synthetic", "_pre_final_gate_synthetic",
++    "_verification_stop_synthetic", "_pre_verify_synthetic", "_pre_final_gate_synthetic", "_kanban_stop_synthetic",
+ )
+ 
+ _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
+diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
+index f9b92ab7ee1..1325d9eb19d 100644
+--- a/agent/turn_stop_gates.py
++++ b/agent/turn_stop_gates.py
+@@ -319,8 +319,12 @@ def _apply_verification_gates(agent, final_msg, final_response, messages, conver
+     if _kanban_nudge:
+         agent._kanban_stop_nudges = getattr(agent, "_kanban_stop_nudges", 0) + 1
+         final_msg["finish_reason"] = "kanban_terminal_required"
+-        final_msg["_kanban_stop_synthetic"] = True
+-        append_message(messages, final_msg)
++        # Like verify-on-stop/pre_verify, only the nudge is scaffolding: the answer is a real model
++        # response and must be durable before the next request (an observed managed worker binds
++        # each SDK response to one durable assistant row and faults closed otherwise).
++        _append_interim_answer(
++            agent, final_msg, messages, conversation_history, "kanban stop interim flush failed"
++        )
+         verdict = _continue(_kanban_nudge, "_kanban_stop_synthetic")
+         logger.info(
+             "kanban stop-loop nudge issued (attempt %d) task=%s",
+diff --git a/tests/agent/test_kanban_stop_interim_flush.py b/tests/agent/test_kanban_stop_interim_flush.py
+new file mode 100644
+index 00000000000..1f96d1aa7d6
+--- /dev/null
++++ b/tests/agent/test_kanban_stop_interim_flush.py
+@@ -0,0 +1,116 @@
++"""The kanban stop-loop nudge must make the worker's text answer durable before the next model call.
++
++An observed managed worker (e.g. Ask Eve's private observer) requires every SDK response to be bound to exactly
++one durable assistant row before the next SDK request. The nudge used to append the text-only answer as ephemeral
++scaffolding (``_kanban_stop_synthetic``) without a flush, so the second request went out with the first response
++unbound and the observer faulted closed ("previous response never durably bound"). The sibling verify-on-stop and
++pre_verify gates already flush the candidate through ``_append_interim_answer``; only their nudge is synthetic.
++"""
++
++from __future__ import annotations
++
++from contextlib import closing
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++
++def _response(content):
++    message = SimpleNamespace(content=content, tool_calls=None)
++    return SimpleNamespace(
++        choices=[SimpleNamespace(message=message, finish_reason="stop")],
++        model="test/model",
++        usage=None,
++    )
++
++
++@pytest.fixture
++def worker(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    from run_agent import AIAgent
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_flushprobe")
++    monkeypatch.delenv("HERMES_KANBAN_STOP_NUDGE", raising=False)
++    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
++    with closing(SessionDB(db_path=tmp_path / "state.db")) as db:
++        with (
++            patch("model_tools.get_tool_definitions", return_value=[]),
++            patch("model_tools.check_toolset_requirements", return_value={}),
++            patch("agent.process_bootstrap.OpenAI"),
++        ):
++            agent = AIAgent(
++                session_id="kanban-stop-flush",
++                session_db=db,
++                api_key="test-key",
++                base_url="https://example.invalid/v1",
++                provider="openai-compat",
++                model="test/model",
++                max_iterations=2,
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
++        agent._cached_system_prompt = "stable test prompt"
++        agent.save_trajectories = False
++        agent.compression_enabled = False
++        agent._cleanup_task_resources = lambda *_a, **_kw: None
++        agent._save_trajectory = lambda *_a, **_kw: None
++        yield agent, db
++
++
++def _assistant_rows(db, sid):
++    return [
++        row[0]
++        for row in db._conn.execute(
++            "SELECT content FROM messages WHERE session_id = ? AND role = 'assistant' ORDER BY id", (sid,)
++        ).fetchall()
++    ]
++
++
++def test_text_only_answer_is_durable_before_the_nudged_second_request(worker):
++    agent, db = worker
++    seen_at_request = []
++    answers = iter(["MANAGED_DONE", "still done"])
++
++    def model_call(_api_kwargs):
++        seen_at_request.append(_assistant_rows(db, agent.session_id))
++        return _response(next(answers))
++
++    agent._interruptible_api_call = model_call
++    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
++        result = agent.run_conversation("work kanban task t_flushprobe")
++
++    assert len(seen_at_request) == 2, "the kanban nudge must have continued the turn into a second request"
++    assert getattr(agent, "_kanban_stop_nudges", 0) >= 1
++    assert seen_at_request[0] == []
++    # The first SDK response is bound to exactly one durable assistant row before the second request.
++    assert seen_at_request[1] == ["MANAGED_DONE"]
++    # The nudge itself stays ephemeral scaffolding: never persisted, never replayed.
++    assert not [m for m in result["messages"] if m.get("_kanban_stop_synthetic")]
++    persisted_user = [
++        row[0]
++        for row in db._conn.execute(
++            "SELECT content FROM messages WHERE session_id = ? AND role = 'user'", (agent.session_id,)
++        ).fetchall()
++    ]
++    assert all("kanban_complete" not in (content or "") for content in persisted_user)
++    # The answer row keeps its finish_reason marker and is not itself flagged synthetic.
++    answer = next(m for m in result["messages"] if m.get("content") == "MANAGED_DONE")
++    assert answer.get("finish_reason") == "kanban_terminal_required"
++    assert not answer.get("_kanban_stop_synthetic")
++
++
++def test_budget_exhaustion_after_nudge_keeps_one_durable_answer(worker):
++    """The flushed answer is also the budget fallback: it must not be duplicated in memory or on disk."""
++    agent, db = worker
++    agent.max_iterations = 1
++    agent.iteration_budget.max_total = 1
++    agent._interruptible_api_call = lambda _kwargs: _response("MANAGED_DONE")
++    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
++        result = agent.run_conversation("work kanban task t_flushprobe")
++
++    assert result["final_response"] == "MANAGED_DONE"
++    assert [m["role"] for m in result["messages"]] == ["user", "assistant"]
++    assert _assistant_rows(db, agent.session_id) == ["MANAGED_DONE"]
+-- 
+2.55.0
+

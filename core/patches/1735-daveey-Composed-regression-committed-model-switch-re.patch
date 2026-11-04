@@ -1,0 +1,308 @@
+From 8f4c14f4d7baa53f8293b41d3c65105ef8ee4b0f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 19:05:42 +0000
+Subject: [PATCH] [daveey] Composed regression: committed model switch reaches
+ the next managed worker
+
+Drives the canonical session.mutate model switch (real prepare_model/switch_model/_commit_policy/
+model_in_transaction) on an isolated HERMES_HOME, then managed_worker.execute from the owner's
+_bootstrap frame with a real RuntimeSessionStore over worker.persist, real worker_route/route_runtime
+and a real AIAgent: exact claude-opus-5-5 allocation -> committed gpt-6-astra switch -> worker builds
+Astra on openai-codex and consumes the intent once. Controls: a revision-conflict refusal and a deferred
+pick (while the turn runs) keep the worker and allocation on Opus; the deferred pick reaches the worker
+after the boundary. Only the worker socket, pre-import policy binding, MCP, provider clients and the
+turn body are replaced; every HTTP send fails. Without a18c3ce23e9 the committed and deferred cases
+fail with 'Exact pinned route cannot fail over'.
+---
+ .../test_model_switch_worker_composed.py      | 279 ++++++++++++++++++
+ 1 file changed, 279 insertions(+)
+ create mode 100644 tests/gateway/test_model_switch_worker_composed.py
+
+diff --git a/tests/gateway/test_model_switch_worker_composed.py b/tests/gateway/test_model_switch_worker_composed.py
+new file mode 100644
+index 00000000000..17e76dbebd8
+--- /dev/null
++++ b/tests/gateway/test_model_switch_worker_composed.py
+@@ -0,0 +1,279 @@
++"""Composed: canonical ``session.mutate`` model switch -> managed-worker agent construction. [daveey]
++
++Incident shape: a gateway session ran an exact ``claude-opus-5-5`` allocation; the user picked
++``gpt-6-astra``; the next managed worker refused ("Exact pinned route cannot fail over") or resumed
++Opus. Unit tests covered the receipt writer, the intent store and the worker facade separately; this
++drives them as production composes them, on an isolated HERMES_HOME:
++
++owner ``SessionAuthority`` + ``AuthorityConnection.dispatch('session.mutate')`` (real ``prepare_model``,
++real ``switch_model``, real ``_commit_policy`` / ``model_in_transaction``) -> the owner's published
++launch policy -> ``session_managed_worker._bootstrap`` frame -> ``managed_worker.execute`` (real
++``worker_route`` / ``route_runtime``, real ``RuntimeSessionStore`` over ``worker.persist``, real
++``AIAgent`` / ``prepare_agent_route`` / durable ``RoutingState``).
++
++Seams replaced, and why: the worker<->owner socket (``WorkerRPC``; ``worker.adopt`` answers the owner
++epoch and every other call goes straight to ``mutate_worker_execution`` on the same DB, which is what the
++owner's ``worker.persist`` handler runs after ``_claim`` has authenticated the process identity),
++``bind_worker_policy`` (it must run before runtime imports, impossible in-process; the profile file it
++would freeze is the same one the in-process readers see here), the controls pipe reader, MCP
++discovery, provider client construction (credential/network), and the turn itself (the agent is
++captured at ``run_conversation``). Every HTTP send fails the test.
++"""
++import asyncio
++import base64
++import json
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from tests.waiting import async_wait_until
++
++OPUS, ASTRA = 'claude-opus-5-5', 'gpt-6-astra'
++# ``mutate_worker_execution``'s arguments; the owner's ``_claim`` consumes the process-identity fields
++# (profile_id/pid/birth/secret) before it, which an in-process worker cannot satisfy.
++PERSIST_FIELDS = frozenset({'epoch', 'execution_id', 'session_id', 'generation', 'sequence', 'operation', 'payload'})
++
++
++def _jwt(account, plan):
++    def seg(obj):
++        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b'=').decode()
++    return '.'.join((seg({'alg': 'none'}), seg({'exp': int(time.time()) + 3600, 'sub': account,
++                     'https://api.openai.com/auth': {'chatgpt_account_id': account, 'chatgpt_plan_type': plan}}),
++                     'sig'))
++
++
++def _route(provider, model):
++    return {'provider': provider, 'model': model, 'billing': 'subscription', 'weight': 1, 'eligible': True,
++            'funding_verified': True,
++            'capabilities': {'tools': True, 'vision': True, 'streaming': True, 'context_tokens': 200000}}
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    from hermes_cli.config import atomic_config_write
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'codex'))
++    atomic_config_write(tmp_path / 'config.yaml', {
++        'model': {'default': OPUS, 'provider': 'anthropic', 'context_length': 200000},
++        'model_routing': {'enabled': True, 'policy_version': 1, 'allow_metered': False,
++                          'enforce_subscription_only': True,
++                          'routes': {'deep': [_route('anthropic', OPUS), _route('openai-codex', ASTRA)]}}})
++    (tmp_path / 'auth.json').write_text(json.dumps({'version': 1, 'credential_pool': {
++        'anthropic': [{'id': 'sub', 'label': 'sub', 'priority': 0, 'auth_type': 'oauth', 'source': 'manual',
++                       'access_token': 'sk-ant-oat01-fixture'}],
++        'openai-codex': [{'id': 'pro', 'label': 'pro', 'priority': 0, 'auth_type': 'oauth',
++                          'source': 'manual:device_code', 'access_token': _jwt('acct-pro', 'pro'),
++                          'refresh_token': 'r'}]}}), encoding='utf-8')
++
++    def no_network(*args, **kwargs):
++        raise AssertionError(f'unexpected HTTP send: {args[1] if len(args) > 1 else args}')
++    monkeypatch.setattr('httpx.Client.send', no_network)
++    monkeypatch.setattr('httpx.AsyncClient.send', no_network)
++    monkeypatch.setattr('agent.anthropic_adapter.build_anthropic_client', lambda *a, **k: MagicMock())
++    monkeypatch.setattr('model_tools.get_tool_definitions', lambda *a, **k: [])
++    return tmp_path
++
++
++def _owner(tmp_path, monkeypatch, handle):
++    """The gateway owner, as tests/gateway/test_session_mutation_model_busy builds it, minus its
++    ``switch_model`` stub and with the runner's real policy route lookup."""
++    from gateway.config import GatewayConfig
++    from gateway.run_turn_prepare import _resolve_policy_agent_runtime
++    from gateway.session import SessionStore
++    from gateway.session_authority import SessionAuthority
++    from gateway.session_controls import AuthorityConnection
++    from gateway.session_local import create_local_session
++    from gateway.session_policy import policy_for_source
++    import hermes_state_runtime as rt
++    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
++    db = store._db
++    runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
++                             _evict_cached_agent=lambda route: None, _cached_agent_for=lambda route: None,
++                             _handle_message=handle)
++    runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
++    runner._resolve_session_agent_runtime = lambda *, source=None, session_key=None, fallback=True, **_: (
++        _resolve_policy_agent_runtime(runner, policy_for_source(runner, source), fallback=fallback))
++    authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='owner', db=db,
++                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
++    owner = AuthorityConnection(authority, object(), {'user_id': 'human'})
++    ref = create_local_session(authority, owner.actor, dict(request_id='m', source='gui', cwd=str(tmp_path),
++                                                            model=OPUS, provider='anthropic', toolsets=[]))
++    return store, db, authority, owner, ref
++
++
++def _live_policy(authority, ref):
++    from gateway.config import Platform
++    from gateway.session_local_recovery import local_adapter_map
++    live = authority.sessions[ref.session_id]
++    return local_adapter_map(authority)[Platform.LOCAL].policies[live.source.chat_id]
++
++
++async def _mutate(owner, db, ref, rid, payload, snap=None):
++    snap = snap or db.get_session(ref.session_id)
++    return await owner.dispatch({'id': 1, 'method': 'session.mutate', 'params': {
++        'session_id': ref.session_id, 'request_id': rid, 'expected_revision': snap['runtime_revision'],
++        'expected_generation': snap['runtime_generation'], 'operation': 'model', 'payload': payload}})
++
++
++def _worker_build(authority, db, ref, monkeypatch, execution_id):
++    """One managed-worker construction for the session's CURRENT owner policy; returns the agent."""
++    from agent import managed_worker as worker
++    from gateway.session_managed_worker import _bootstrap
++    from hermes_state_runtime import mutate_worker_execution, register_worker_execution
++    import run_agent
++    generation = db.get_session(ref.session_id)['runtime_generation']
++    scope = {'profile_id': authority.profile_id, 'session_id': ref.session_id, 'execution_id': execution_id,
++             'generation': generation, 'pid': 0, 'birth': 0, 'secret': 's', 'epoch': authority.epoch}
++    register_worker_execution(db, epoch=authority.epoch, execution_id=execution_id, session_id=ref.session_id,
++                              generation=generation, kind='compute', adoption_secret='s')
++    frame = _bootstrap(authority, ref, {'payload': {'text': 'hello'}}, _live_policy(authority, ref), scope)
++    captured, sent = [], []
++
++    class Agent(run_agent.AIAgent):
++        def run_conversation(self, *args, **kwargs):
++            captured.append(self)
++            return {'final_response': 'ok', 'completed': True}
++
++    class Controls:
++        def __init__(self, *args):
++            self.stopped, self.finish = threading.Event(), threading.Event()
++            self.finish.set()  # the owner acknowledged the result: execute() commits execution.finish
++        def approval(self, data): pass
++        def clarify(self, questions): pass
++
++    def rpc_factory(home):
++        def rpc(method, **params):
++            if method == 'worker.adopt':
++                return {'owner_epoch': authority.epoch}
++            # The owner's worker.persist handler; it authenticates the assignment fields itself.
++            return mutate_worker_execution(db, **{k: v for k, v in params.items() if k in PERSIST_FIELDS})
++        return rpc
++
++    with monkeypatch.context() as m:
++        m.setattr(worker, 'bind_worker_policy', lambda frame: None)
++        m.setattr(worker, 'discover_profile_mcp', lambda policy: None)
++        m.setattr(worker, 'retire_agent', lambda agent: None)
++        m.setattr(worker, 'WorkerControls', Controls)
++        m.setattr('agent.runtime_session_store.WorkerRPC', rpc_factory)
++        m.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
++        m.setattr('run_agent.AIAgent', Agent)
++        worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: sent.append(kind)))
++    assert len(captured) == 1 and sent[-1] == 'finished', sent
++    return captured[0]
++
++
++def _allocation(tmp_path, sid):
++    from agent.model_routing_state import RoutingState
++    return RoutingState(tmp_path / 'model-routing.sqlite3').peek(sid, 'deep')
++
++
++def _intent(db, ref):
++    """The committed switch's state_meta row, read directly (not through the API under test)."""
++    from agent.model_routing_switch_intent import PREFIX
++    return db.get_meta(PREFIX + ref.session_id)
++
++
++async def _noop(event):
++    return 'ok'
++
++
++def _pinned_opus(home, authority, db, ref, monkeypatch):
++    agent = _worker_build(authority, db, ref, monkeypatch, 'w-opus')
++    assert (agent.model, agent.provider) == (OPUS, 'anthropic')
++    recorded = _allocation(home, ref.session_id)
++    assert (recorded['selected_model'], recorded['selected_provider'], recorded['exact_pin']) == (
++        OPUS, 'anthropic', True)
++    return recorded
++
++
++@pytest.mark.asyncio
++async def test_committed_switch_reaches_the_next_managed_worker(home, monkeypatch):
++    from agent.model_routing import ModelRoutingError
++    store, db, authority, owner, ref = _owner(home, monkeypatch, _noop)
++    try:
++        _pinned_opus(home, authority, db, ref, monkeypatch)
++        reply = await _mutate(owner, db, ref, 'pick', {'model': ASTRA, 'provider': 'openai-codex'})
++        assert (reply['result']['model'], reply['result'].get('status')) == (ASTRA, None), reply
++        assert _intent(db, ref) is not None
++        agent = _worker_build(authority, db, ref, monkeypatch, 'w-astra')
++        assert (agent.model, agent.provider) == (ASTRA, 'openai-codex')
++        recorded = _allocation(home, ref.session_id)
++        assert (recorded['selected_model'], recorded['selected_provider'], recorded['exact_pin'],
++                recorded['reason']) == (ASTRA, 'openai-codex', True, 'explicit-switch')
++        assert _intent(db, ref) is None  # one-shot: consumed by the worker
++        # Rebuilds stay on Astra; the consumed switch cannot be replayed to move it again.
++        again = _worker_build(authority, db, ref, monkeypatch, 'w-astra-2')
++        assert again.model == ASTRA
++        row = db.get_session(ref.session_id)
++        assert row['model'] == ASTRA
++        with pytest.raises(ModelRoutingError, match='cannot fail over'):
++            from run_agent import AIAgent
++            AIAgent(model=OPUS, provider='anthropic', session_id=ref.session_id, session_db=db,
++                    quiet_mode=True, skip_memory=True, skip_context_files=True)
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++async def test_rejected_switch_keeps_the_worker_on_the_original_pin(home, monkeypatch):
++    store, db, authority, owner, ref = _owner(home, monkeypatch, _noop)
++    try:
++        before = _pinned_opus(home, authority, db, ref, monkeypatch)
++        snap = dict(db.get_session(ref.session_id))
++        snap['runtime_revision'] += 7
++        reply = await _mutate(owner, db, ref, 'stale', {'model': ASTRA, 'provider': 'openai-codex'}, snap)
++        assert reply['error']['data']['reason'] == 'revision_conflict', reply
++        assert _intent(db, ref) is None
++        agent = _worker_build(authority, db, ref, monkeypatch, 'w-after-reject')
++        assert (agent.model, agent.provider) == (OPUS, 'anthropic')
++        assert _allocation(home, ref.session_id) == before
++        assert db.get_session(ref.session_id)['model'] == OPUS
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++async def test_deferred_switch_keeps_the_original_until_the_turn_boundary(home, monkeypatch):
++    from gateway.session_contract import Submission
++    import hermes_state_runtime as rt
++    started, release = threading.Event(), asyncio.Event()
++
++    async def handle(event):
++        if event.text == 'RUNNING':
++            started.set()
++            await release.wait()
++        return 'ok'
++    store, db, authority, owner, ref = _owner(home, monkeypatch, handle)
++    try:
++        before = _pinned_opus(home, authority, db, ref, monkeypatch)
++        first = await authority.submit(owner.actor, Submission('running', ref, {'text': 'RUNNING'}, 'queue'))
++        await async_wait_until(started.is_set, timeout=10, what='the first turn is running')
++        reply = await _mutate(owner, db, ref, 'pick', {'model': ASTRA, 'provider': 'openai-codex'})
++        assert reply['result']['status'] == 'deferred', reply
++        assert _intent(db, ref) is None
++        assert _live_policy(authority, ref).model == OPUS
++        assert _allocation(home, ref.session_id) == before
++        # A worker built for this session while the pick waits keeps the original route.
++        held = _worker_build(authority, db, ref, monkeypatch, 'w-while-deferred')
++        assert (held.model, held.provider) == (OPUS, 'anthropic')
++        assert _allocation(home, ref.session_id) == before
++        release.set()
++        await async_wait_until(
++            lambda: rt.get_session_admission(db, admission_id=first.admission_id)['status'] == 'terminal',
++            timeout=10, what='the running turn settled')
++        await async_wait_until(lambda: _live_policy(authority, ref).model == ASTRA,
++                               timeout=10, what='the pick published at the turn boundary')
++        # Committed at the boundary: the next worker honours it exactly once.
++        agent = _worker_build(authority, db, ref, monkeypatch, 'w-after-boundary')
++        assert (agent.model, agent.provider) == (ASTRA, 'openai-codex')
++        assert _allocation(home, ref.session_id)['selected_model'] == ASTRA
++        assert _intent(db, ref) is None
++    finally:
++        release.set()
++        await owner.close()
++        store.close_all_db_handles()
+-- 
+2.55.0
+

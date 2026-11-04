@@ -1,0 +1,348 @@
+From 9f011576786d06d6f07940ee9833614d235f5286 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:15:54 +0000
+Subject: [PATCH] test: give SSRF-guard and PM-build tests offline resolvers
+ and toolchains [daveey]
+
+With the loopback-only fence, tests whose code under test resolves a URL's host
+itself (url_safety, browser CDP/eval guards, Slack file URLs, web extract) saw a
+refusal and failed closed. They now request the opt-in public_dns fixture:
+IP literals resolve numerically, localhost through the real resolver, other
+names to a fixed public address; nothing is dialled. PM build tests pin the
+host uv/interpreter instead of downloading python-build-standalone, and the
+subdirectory plugin update test publishes through admission_env. Real pypi.org
+canaries in the plugin sandbox suite are marked live, and the live marker text
+now says it is the fence's only opt-out.
+---
+ pyproject.toml                                |  2 +-
+ tests/_fixtures/fake_dns.py                   | 50 +++++++++++++++++++
+ tests/ci/test_plugin_validation_sandbox.py    | 14 ++++--
+ tests/conftest.py                             |  1 +
+ tests/gateway/test_media_download_retry.py    |  2 +
+ .../test_plugin_update_scan_override.py       |  7 ++-
+ .../web/test_web_search_provider_plugins.py   |  2 +-
+ tests/pm/test_pip_check.py                    | 10 ++++
+ tests/tools/test_browser_cdp_tool.py          | 10 ++--
+ tests/tools/test_browser_eval_ssrf.py         |  2 +-
+ tests/tools/test_browser_use_cli.py           |  2 +-
+ tests/tools/test_web_tools_config.py          |  2 +-
+ tests/tools/test_web_tools_perplexity.py      |  2 +-
+ tests/tools/test_web_tools_tavily.py          |  2 +-
+ 14 files changed, 90 insertions(+), 18 deletions(-)
+ create mode 100644 tests/_fixtures/fake_dns.py
+
+diff --git a/pyproject.toml b/pyproject.toml
+index b04d0de214d..cdf2300d24f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -745,7 +745,7 @@ tools = ["bot_desktop/launcher.sh", "bot_desktop/wallpaper.png"]
+ testpaths = ["tests"]
+ markers = [
+   "integration: marks tests requiring external services (API keys, Modal, etc.)",
+-  "live: secrets-gated canaries against REAL LLM provider APIs (spends money; select with -m live)",
++  "live: canaries that reach REAL external services (provider APIs, public hosts; may spend money); the only opt-out from the unit-test network fence; select with -m live",
+   "real_concurrent_gate: opt out of the autouse stub that disables _detect_concurrent_hermes_instances",
+   "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
+   "real_retry_backoff: opt out of the tests/agent autouse stub that zeroes jittered_backoff",
+diff --git a/tests/_fixtures/fake_dns.py b/tests/_fixtures/fake_dns.py
+new file mode 100644
+index 00000000000..dc79feb81b3
+--- /dev/null
++++ b/tests/_fixtures/fake_dns.py
+@@ -0,0 +1,50 @@
++"""Opt-in resolver for tests whose code under test resolves a URL's host itself.
++
++The suite's network fence (``_no_live_nous_services`` in tests/conftest.py) refuses every
++non-loopback name lookup, IP literals included. SSRF guards (``tools.url_safety``, the
++browser URL policy, Slack's file-URL check) judge a URL by the address its host resolves
++to, so under the fence they see a refusal and fail closed. A test of the *allowed* path
++requests ``public_dns``, which answers without touching the network:
++
++- IP literals resolve numerically (``AI_NUMERICHOST``: parsed, never sent to DNS);
++- ``localhost`` resolves through the real resolver (loopback, /etc/hosts);
++- any other name resolves to ``PUBLIC_TEST_ADDRESS`` unless the test maps it, e.g.
++  ``public_dns["internal.example"] = "10.0.0.5"`` to model a rebinding answer.
++
++The transport stays the test's job: a resolved address is never dialled by this fixture.
++"""
++from __future__ import annotations
++
++import socket
++
++import pytest
++
++# A globally routable address (example.com's long-standing A record), so SSRF policy
++# classifies it as public. Tests never connect to it: they stub the HTTP layer.
++PUBLIC_TEST_ADDRESS = "93.184.216.34"
++
++# Captured at import, before any test's fence replaces socket.getaddrinfo.
++_REAL_GETADDRINFO = socket.getaddrinfo
++
++
++def _numeric(host, port, family, type, proto, flags):
++    return _REAL_GETADDRINFO(host, port, family, type, proto, flags | socket.AI_NUMERICHOST)
++
++
++@pytest.fixture
++def public_dns(monkeypatch) -> dict[str, str]:
++    """Resolve names offline; returns the name -> address table the test may extend."""
++    answers: dict[str, str] = {}
++
++    def resolve(host, port, family=0, type=0, proto=0, flags=0):
++        name = (host.decode() if isinstance(host, bytes) else str(host or "")).lower().rstrip(".")
++        if name == "localhost":
++            return _REAL_GETADDRINFO(host, port, family, type, proto, flags)
++        try:
++            return _numeric(host, port, family, type, proto, flags)
++        except socket.gaierror:
++            pass
++        return _numeric(answers.get(name, PUBLIC_TEST_ADDRESS), port, family, type, proto, flags)
++
++    monkeypatch.setattr(socket, "getaddrinfo", resolve)
++    return answers
+diff --git a/tests/ci/test_plugin_validation_sandbox.py b/tests/ci/test_plugin_validation_sandbox.py
+index db9dee21818..afc865e7049 100644
+--- a/tests/ci/test_plugin_validation_sandbox.py
++++ b/tests/ci/test_plugin_validation_sandbox.py
+@@ -336,18 +336,18 @@ def test_unstatable_secret_paths_do_not_crash_the_path_policy(work, python):
+     ("pypi.org", 22, "port 22 not allowed"),
+     ("bad host", 443, "malformed"),
+ ])
+-def test_egress_policy_denies_internal_targets_and_other_ports(host, port, reason):
++def test_egress_policy_denies_internal_targets_and_other_ports(host, port, reason, public_dns):
+     verdict = sandbox.EgressPolicy({443}, []).resolve(host, port)
+     assert isinstance(verdict, str) and reason in verdict, verdict
+ 
+ 
+-def test_nat64_of_a_public_ipv4_stays_allowed():
++def test_nat64_of_a_public_ipv4_stays_allowed(public_dns):
+     """The embedded-IPv4 rule judges the IPv4, it does not ban NAT64 outright."""
+     verdict = sandbox.EgressPolicy({443}, []).resolve("[64:ff9b::808:808]", 443)  # 8.8.8.8
+     assert verdict == [("64:ff9b::808:808", 443)], verdict
+ 
+ 
+-def test_a_dial_that_lands_on_this_host_is_refused():
++def test_a_dial_that_lands_on_this_host_is_refused(public_dns):
+     """Policy is judged on addresses; a runner whose public address sits on its own
+     interface would still be 'public'. The dial itself is refused when the kernel
+     routed it to a local address (src == dst)."""
+@@ -371,8 +371,10 @@ def test_a_dial_that_lands_on_this_host_is_refused():
+         listener.close()
+ 
+ 
+-@pytest.mark.skipif(not _public_https_reachable(), reason="host has no route to pypi.org:443")
++@pytest.mark.live  # Dials the real pypi.org: a live canary for the self-connection check.
+ def test_a_dial_to_a_public_host_is_not_mistaken_for_this_host():
++    if not _public_https_reachable():
++        pytest.skip("host has no route to pypi.org:443")
+     addresses = sandbox.EgressPolicy({443}, []).resolve("pypi.org", 443)
+     assert isinstance(addresses, list), addresses
+     upstream = sandbox._dial(addresses)
+@@ -704,8 +706,10 @@ def test_no_route_to_host_loopback_or_metadata_and_proxy_refuses_them(work):
+ 
+ 
+ @needs_isolation
+-@pytest.mark.skipif(not _public_https_reachable(), reason="host has no route to pypi.org:443")
++@pytest.mark.live  # Downloads from the real pypi.org through the sandbox proxy.
+ def test_dependency_downloads_reach_public_https_through_the_proxy(work):
++    if not _public_https_reachable():
++        pytest.skip("host has no route to pypi.org:443")
+     probe = """
+         import urllib.request
+         with urllib.request.urlopen("https://pypi.org/simple/six/", timeout=30) as resp:
+diff --git a/tests/conftest.py b/tests/conftest.py
+index c8db3364143..76e1418c341 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -275,6 +275,7 @@ from tests._fixtures.live_system_guard import (
+     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
+     _live_system_guard,
+ )
++from tests._fixtures.fake_dns import public_dns  # opt-in offline resolver for SSRF-guard tests
+ from tests._fixtures.model_peer import model_peer  # fixture registers here
+ from tests._fixtures.offline_catalogs import (
+     _offline_metadata_transport, _offline_registry_transport, _offline_video_catalog,
+diff --git a/tests/gateway/test_media_download_retry.py b/tests/gateway/test_media_download_retry.py
+index 1a8b43ac870..8c07fc34784 100644
+--- a/tests/gateway/test_media_download_retry.py
++++ b/tests/gateway/test_media_download_retry.py
+@@ -338,6 +338,7 @@ def _make_slack_adapter():
+ # SlackAdapter._download_slack_file
+ # ---------------------------------------------------------------------------
+ 
++@pytest.mark.usefixtures("public_dns")  # the Slack file-URL SSRF check resolves files.slack.com
+ class TestSlackDownloadSlackFile:
+     """Tests for SlackAdapter._download_slack_file"""
+ 
+@@ -400,6 +401,7 @@ class TestSlackDownloadSlackFile:
+ # SlackAdapter._download_slack_file_bytes
+ # ---------------------------------------------------------------------------
+ 
++@pytest.mark.usefixtures("public_dns")
+ class TestSlackDownloadSlackFileBytes:
+     """Tests for SlackAdapter._download_slack_file_bytes"""
+ 
+diff --git a/tests/hermes_cli/test_plugin_update_scan_override.py b/tests/hermes_cli/test_plugin_update_scan_override.py
+index b46e7fa3033..59a2f91a6c5 100644
+--- a/tests/hermes_cli/test_plugin_update_scan_override.py
++++ b/tests/hermes_cli/test_plugin_update_scan_override.py
+@@ -149,10 +149,13 @@ def _subdir_install(tmp_path, monkeypatch):
+     return repo, plugin, target
+ 
+ 
+-def test_subdirectory_update_asks_before_a_caution_scan_and_never_accepts_dangerous(tmp_path, monkeypatch):
++def test_subdirectory_update_asks_before_a_caution_scan_and_never_accepts_dangerous(admission_env, tmp_path,
++                                                                                   monkeypatch):
+     """The re-clone path used to accept a caution verdict without asking, because replacing the tree and
+     accepting the scan were one ``force``. Now it follows the git-pull rule: caution needs ``force``,
+-    dangerous is refused even with it, and a refusal leaves the installed tree and record alone."""
++    dangerous is refused even with it, and a refusal leaves the installed tree and record alone.
++    ``admission_env`` runs publication's dependency sync against a fake core with the host toolchain,
++    so it never downloads PM's pinned Python."""
+     from hermes_cli import plugins_cmd as pc
+ 
+     repo, plugin, target = _subdir_install(tmp_path, monkeypatch)
+diff --git a/tests/plugins/web/test_web_search_provider_plugins.py b/tests/plugins/web/test_web_search_provider_plugins.py
+index 3c1accf5bd6..77a4ab227c6 100644
+--- a/tests/plugins/web/test_web_search_provider_plugins.py
++++ b/tests/plugins/web/test_web_search_provider_plugins.py
+@@ -257,7 +257,7 @@ class TestRegistryResolution:
+ class TestFirecrawlScrapeTimeout:
+     """Verify the server-side scrape timeout matches the asyncio deadline."""
+ 
+-    def test_extract_passes_timeout_ms_to_scrape(self, monkeypatch: pytest.MonkeyPatch) -> None:
++    def test_extract_passes_timeout_ms_to_scrape(self, monkeypatch: pytest.MonkeyPatch, public_dns) -> None:
+         """scrape() must receive timeout=60000 (ms) so the server-side
+         deadline matches the 60 s asyncio.wait_for deadline.  Without this
+         the API uses its 30 s default, causing SCRAPE_TIMEOUT."""
+diff --git a/tests/pm/test_pip_check.py b/tests/pm/test_pip_check.py
+index 9d034cce5e7..1f94a16513d 100644
+--- a/tests/pm/test_pip_check.py
++++ b/tests/pm/test_pip_check.py
+@@ -46,6 +46,16 @@ source = { registry = "https://pypi.org/simple" }
+ OVERRIDDEN = "The package `pinned-parent` requires `shared-dep==1.0`, but `2.0` is installed"
+ 
+ 
++@pytest.fixture(autouse=True)
++def _host_toolchain(monkeypatch):
++    """PM's own runtime resolves pinned uv/Python through ``_toolchain``, which in a fresh test home
++    downloads python-build-standalone. Builds here are offline (``UV_OFFLINE``): use the host uv and
++    this interpreter, as the other environment-build tests do."""
++    uv = shutil.which("uv")
++    if uv:
++        monkeypatch.setattr("pm._uv._toolchain", lambda **kwargs: (Path(uv), Path(sys.executable)))
++
++
+ def _report(*lines: str) -> str:
+     plural = "incompatibility" if len(lines) == 1 else "incompatibilities"
+     return f"Checked 3 packages in 1ms\nFound {len(lines)} {plural}\n" + "\n".join(lines) + "\n"
+diff --git a/tests/tools/test_browser_cdp_tool.py b/tests/tools/test_browser_cdp_tool.py
+index e896294b842..9ab7ff320c5 100644
+--- a/tests/tools/test_browser_cdp_tool.py
++++ b/tests/tools/test_browser_cdp_tool.py
+@@ -572,7 +572,8 @@ def test_page_navigate_to_private_url_blocked_before_cdp(monkeypatch):
+ 
+ 
+ @pytest.mark.parametrize(("page_url", "blocked"), [(PRIVATE_URL, True), ("https://93.184.216.34/", False)])
+-def test_page_url_probe_reads_the_target_over_the_same_endpoint(monkeypatch, cdp_server, page_url, blocked):
++def test_page_url_probe_reads_the_target_over_the_same_endpoint(monkeypatch, cdp_server, page_url, blocked,
++                                                              public_dns):
+     """The private-page probe reads the acted-on page's URL from Target.getTargets on the same CDP
+     endpoint: a private page refuses page-reading methods before they are sent; a public one runs."""
+     cdp_server.on("Target.getTargets", lambda params, sid: {"targetInfos": [
+@@ -604,7 +605,7 @@ PUBLIC_PAGE = "https://93.184.216.34/"
+     (None, PRIVATE_URL, True),            # browser-level call spans every page
+     ("worker-1", PUBLIC_PAGE, False),     # every page public: the worker runs
+ ])
+-def test_non_page_target_fails_closed_while_any_page_is_private(monkeypatch, cdp_server, target_id, page_url,
++def test_non_page_target_fails_closed_while_any_page_is_private(public_dns, monkeypatch, cdp_server, target_id, page_url,
+                                                                  blocked):
+     """A non-page / unknown target carries some page's origin, so page-reading CDP refuses it while any page
+     target is private, and runs it when every page is public."""
+@@ -628,7 +629,7 @@ def test_non_page_target_fails_closed_while_any_page_is_private(monkeypatch, cdp
+         assert result["success"] is True and len(evaluated) == 1
+ 
+ 
+-def test_frame_id_is_judged_by_its_own_target_not_the_first_page(monkeypatch, cdp_server):
++def test_frame_id_is_judged_by_its_own_target_not_the_first_page(monkeypatch, cdp_server, public_dns):
+     """frame_id routing checks the OOPIF's own target (frame id == iframe target id) and fails closed on a
+     private page, even when the first page target is public."""
+     supervisor_calls = []
+@@ -678,7 +679,8 @@ LOCAL_TAB = "http://127.0.0.1:3000/"
+     ("Network.getAllCookies", {}, False),  # every other target-less call stays fail-closed
+     ("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": "/srv"}, False),
+ ])
+-def test_tab_management_stays_usable_while_a_tab_is_private(monkeypatch, cdp_server, method, params, allowed):
++def test_tab_management_stays_usable_while_a_tab_is_private(monkeypatch, cdp_server, method, params, allowed,
++                                                            public_dns):
+     """One private tab (a local dev server) must not stop the model opening, switching or closing tabs; a
+     new tab is blank or its url is held to Page.navigate's rule, and every other browser-level call is refused."""
+     cdp_server.on("Target.getTargets", lambda params, sid: {"targetInfos": [
+diff --git a/tests/tools/test_browser_eval_ssrf.py b/tests/tools/test_browser_eval_ssrf.py
+index 0f1f85a55c1..b013a002f6c 100644
+--- a/tests/tools/test_browser_eval_ssrf.py
++++ b/tests/tools/test_browser_eval_ssrf.py
+@@ -105,7 +105,7 @@ def test_raw_cdp_keeps_the_metadata_floor_when_the_private_guard_is_off(monkeypa
+ 
+ 
+ @pytest.fixture
+-def cdp_guard(monkeypatch, local_backend):
++def cdp_guard(monkeypatch, local_backend, public_dns):
+     """The raw CDP guard with a public page open: private guard on for a remote backend, off for a local one."""
+     from tools import browser_cdp_tool
+     monkeypatch.setattr(browser_session_cloud, "is_local_backend", lambda: local_backend)
+diff --git a/tests/tools/test_browser_use_cli.py b/tests/tools/test_browser_use_cli.py
+index 0e1f8681e61..b2a78db4d10 100644
+--- a/tests/tools/test_browser_use_cli.py
++++ b/tests/tools/test_browser_use_cli.py
+@@ -1067,7 +1067,7 @@ class TestExecHybridPrivateUrlRouting:
+     LAN = "http://192.168.0.1:9120/login"
+ 
+     @pytest.fixture(autouse=True)
+-    def _cloud_with_hybrid(self, monkeypatch, tmp_path):
++    def _cloud_with_hybrid(self, monkeypatch, tmp_path, public_dns):
+         monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
+         monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda: "")
+         monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: object())
+diff --git a/tests/tools/test_web_tools_config.py b/tests/tools/test_web_tools_config.py
+index 9c73c9a0066..76c5f689589 100644
+--- a/tests/tools/test_web_tools_config.py
++++ b/tests/tools/test_web_tools_config.py
+@@ -192,7 +192,7 @@ class TestFirecrawlClientConfig:
+         assert captured["headers"] == {"Content-Type": "application/json"}
+         assert "Authorization" not in captured["headers"]
+ 
+-    def test_extract_through_keyless_client_forwards_server_timeout(self, monkeypatch):
++    def test_extract_through_keyless_client_forwards_server_timeout(self, monkeypatch, public_dns):
+         """_scrape_one passes the SDK's ``timeout`` kwarg; the keyless client must accept and forward it."""
+         import asyncio
+ 
+diff --git a/tests/tools/test_web_tools_perplexity.py b/tests/tools/test_web_tools_perplexity.py
+index c5434d81455..b440a33fd25 100644
+--- a/tests/tools/test_web_tools_perplexity.py
++++ b/tests/tools/test_web_tools_perplexity.py
+@@ -60,7 +60,7 @@ def test_search_dispatch_maps_search_api_shape():
+     }
+ 
+ 
+-def test_extract_dispatch_snippets_per_url_and_missing_key():
++def test_extract_dispatch_snippets_per_url_and_missing_key(public_dns):
+     """web_extract on backend=perplexity posts every URL to /sdk/content/snippets;
+     a URL the backend failed carries ``error`` instead of content; no key → error, no HTTP."""
+     import tools.web_tools as wt
+diff --git a/tests/tools/test_web_tools_tavily.py b/tests/tools/test_web_tools_tavily.py
+index 4de6c94b8fc..60fe51dec4b 100644
+--- a/tests/tools/test_web_tools_tavily.py
++++ b/tests/tools/test_web_tools_tavily.py
+@@ -172,7 +172,7 @@ class TestWebExtractCacheAttribution:
+             "https://example.com/second", "second page", "Second", format=None, provider="tavily"
+         )
+ 
+-    def test_redirected_page_caches_under_requested_source_url(self):
++    def test_redirected_page_caches_under_requested_source_url(self, public_dns):
+         """Keenable/Firecrawl report the post-redirect address in ``url`` and the requested URL in
+         ``metadata.sourceURL``; the cache key must stay the requested URL, never the redirect target.
+         The first requested page is omitted, so positional pairing would file the redirected page
+-- 
+2.55.0
+

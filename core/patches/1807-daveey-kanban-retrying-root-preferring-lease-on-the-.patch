@@ -1,0 +1,1149 @@
+From b98a7a54912cc8350162a9c65a47eff4a5b70607 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 01:52:54 +0000
+Subject: [PATCH] [daveey] kanban: retrying, root-preferring lease on the host
+ dispatcher/sync locks
+
+A gateway that lost the boot-time flock on .dispatcher.lock or .sync.lock never retried, and
+whichever gateway reached it first kept it for life. On hermes-hub a pinned profile gateway
+(askeve-reviewer, old core, memory-derived max_in_progress=8 vs the root's 16) won every joint
+restart and held both locks for hours while 64 cards sat ready.
+
+- gateway/kanban_singleton.py: SingletonLease. Contended -> retry every 30s. The root gateway
+  (HERMES_HOME == kanban root) posts <lock>.root-wanted when contended; a profile gateway waits a
+  60s grace before its first attempt, never acquires while a live root claim exists, and yields a
+  held lock when one appears (dispatcher: between ticks; sync: run_forever keep_running).
+  Holder writes <lock>.holder.json; contention > 5 min logs a WARNING naming holder pid/HERMES_HOME.
+- _check_dispatcher_presence asks who holds the host lock first, so a profile CLI with
+  dispatch_in_gateway=false no longer warns 'task will sit in ready' while the root dispatches.
+- kanban stats (text + JSON host_locks) names both lock holders and flags a non-root holder.
+- describe_suppression/stuck warning add cap_source=<config path or memory-derived default>.
+---
+ gateway/kanban_singleton.py                   | 303 ++++++++++++++++++
+ gateway/kanban_watchers.py                    | 112 +++----
+ gateway/kanban_watchers_common.py             |  24 --
+ hermes_cli/kanban.py                          |  39 +++
+ hermes_cli/kanban_db_dispatch_stuck.py        |  27 +-
+ .../gateway/test_kanban_dispatcher_health.py  |   9 +-
+ tests/gateway/test_kanban_singleton_lease.py  | 254 +++++++++++++++
+ .../test_kanban_host_lock_visibility.py       | 109 +++++++
+ tests/hermes_cli/test_kanban_sync_client.py   |  68 +---
+ 9 files changed, 797 insertions(+), 148 deletions(-)
+ create mode 100644 gateway/kanban_singleton.py
+ create mode 100644 tests/gateway/test_kanban_singleton_lease.py
+ create mode 100644 tests/hermes_cli/test_kanban_host_lock_visibility.py
+
+diff --git a/gateway/kanban_singleton.py b/gateway/kanban_singleton.py
+new file mode 100644
+index 00000000000..c35f919a999
+--- /dev/null
++++ b/gateway/kanban_singleton.py
+@@ -0,0 +1,303 @@
++"""Root-preferring, retrying lease on the host-wide Kanban singleton locks. [daveey]
++
++``.dispatcher.lock`` and ``.sync.lock`` live at the machine-global kanban root, so one gateway per host
++dispatches and syncs every board. Before this module a gateway tried each lock once at boot: the
++loser never retried, and whichever gateway reached the lock first kept it for its lifetime. On
++hermes-hub a pinned profile gateway (askeve-reviewer, old core, half the root's ``max_in_progress``)
++won every joint restart by ~20 s and held both locks for hours while 64 cards sat ready.
++
++Rules:
++
++* **Retry.** A gateway that finds the lock contended tries again every ``retry_seconds``.
++* **Root preference.** The *root* gateway is the one whose HERMES_HOME is the kanban root. A profile
++  gateway waits ``grace_seconds`` before its first attempt, never acquires while a live root gateway
++  has posted a claim (``<lock>.root-wanted``), and gives the lock up (``should_yield``) when one
++  appears. A profile gateway still dispatches/syncs on a host whose root gateway is down.
++* **Visibility.** The holder writes ``<lock>.holder.json`` (pid, HERMES_HOME). A contended gateway
++  logs a WARNING naming the holder once the contention passes ``warn_after_seconds``, and
++  :func:`holder_info` lets ``hermes kanban stats`` and the dispatcher-presence probe name it.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import os
++import threading
++import time
++import uuid
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger("gateway.run")
++
++DEFAULT_RETRY_SECONDS = 30.0
++DEFAULT_GRACE_SECONDS = 60.0
++DEFAULT_WARN_AFTER_SECONDS = 300.0
++_YIELD_CACHE_SECONDS = 5.0
++
++
++def _resolve(path: Path) -> str:
++    with contextlib.suppress(OSError):
++        return str(Path(path).resolve())
++    return str(path)
++
++
++def is_root_gateway() -> bool:
++    """True when this process's HERMES_HOME is the kanban root (not a ``profiles/<name>`` home)."""
++    try:
++        from hermes_cli.kanban_db import kanban_home
++        from hermes_constants import get_hermes_home
++        return _resolve(get_hermes_home()) == _resolve(kanban_home())
++    except Exception:
++        return True  # can't tell -> behave like the pre-lease code (no deference)
++
++
++def _process_start(pid: int) -> Optional[int]:
++    with contextlib.suppress(Exception):
++        from gateway.status import get_process_start_time
++        return get_process_start_time(pid)
++    return None
++
++
++def _pid_alive(pid: int) -> bool:
++    if not isinstance(pid, int) or pid <= 0:
++        return False
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    except OSError:
++        return False
++    return True
++
++
++def _read_json(path: Path) -> Optional[dict]:
++    with contextlib.suppress(OSError, ValueError):
++        data = json.loads(Path(path).read_text(encoding="utf-8"))
++        return data if isinstance(data, dict) else None
++    return None
++
++
++def _write_json(path: Path, record: dict) -> None:
++    tmp = Path(f"{path}.{os.getpid()}.tmp")
++    try:
++        tmp.write_text(json.dumps(record), encoding="utf-8")
++        tmp.replace(path)
++    except OSError:
++        with contextlib.suppress(OSError):
++            tmp.unlink()
++        logger.debug("kanban singleton: cannot write %s", path, exc_info=True)
++
++
++def _sidecar(lock_path: Path, suffix: str) -> Path:
++    return Path(f"{lock_path}.{suffix}")
++
++
++def _lock_holder_pid(lock_path: Path) -> Optional[int]:
++    """Pid holding the flock on *lock_path* per ``/proc/locks`` (Linux); None elsewhere or when free."""
++    try:
++        st = Path(lock_path).stat()
++        ident = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
++        for line in Path("/proc/locks").read_text(encoding="utf-8").splitlines():
++            fields = line.split()
++            # "<n>: FLOCK  ADVISORY  WRITE <pid> <maj:min:ino> 0 EOF" (blocked waiters carry "->")
++            if len(fields) >= 6 and fields[1] == "FLOCK" and fields[3] == "WRITE" and fields[5] == ident:
++                with contextlib.suppress(ValueError):
++                    return int(fields[4])
++    except OSError:
++        return None
++    return None
++
++
++def _environ_home(pid: int) -> Optional[str]:
++    with contextlib.suppress(OSError):
++        for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
++            if item.startswith(b"HERMES_HOME="):
++                return item[len(b"HERMES_HOME="):].decode("utf-8", "replace")
++    return None
++
++
++def holder_info(lock_path: Path) -> Optional[dict]:
++    """``{pid, hermes_home, root, since}`` for the process holding *lock_path*, or None when free/unknown.
++
++    The pid comes from ``/proc/locks`` when readable (authoritative), else from the holder sidecar
++    while that pid is alive. ``since`` is the wall time the holder took the lock (sidecar), or None.
++    """
++    lock_path = Path(lock_path)
++    side = _read_json(_sidecar(lock_path, "holder.json")) or {}
++    pid = _lock_holder_pid(lock_path)
++    if pid is None:
++        side_pid = side.get("pid")
++        # With /proc/locks readable a free lock means no holder; elsewhere trust a live sidecar pid.
++        if Path("/proc/locks").exists() or not (isinstance(side_pid, int) and _pid_alive(side_pid)):
++            return None
++        pid = side_pid
++    matches = side.get("pid") == pid
++    home = side.get("hermes_home") if matches else None
++    home = home or _environ_home(pid)
++    root = None
++    with contextlib.suppress(Exception):
++        from hermes_cli.kanban_db import kanban_home
++        root = home is not None and _resolve(Path(home)) == _resolve(kanban_home())
++    return {"pid": pid, "hermes_home": home, "root": root,
++            "since": side.get("acquired_at") if matches else None}
++
++
++def describe_holder(info: Optional[dict]) -> str:
++    if not info:
++        return "unknown holder"
++    who = "root gateway" if info.get("root") else "profile gateway"
++    return f"pid {info['pid']} ({who}, HERMES_HOME={info.get('hermes_home') or '?'})"
++
++
++class SingletonLease:
++    """One gateway's hold on a host-wide singleton lock. Not shared across processes; thread-safe reads.
++
++    ``state`` is ``"held"``, ``"contended"``, ``"deferred"`` (profile gateway waiting for its grace
++    period or for a live root claim), ``"unavailable"`` (no flock support: proceed on config alone),
++    or ``"idle"`` (never tried / released).
++    """
++
++    def __init__(self, lock_path: Path, *, name: str, root: Optional[bool] = None,
++                 retry_seconds: float = DEFAULT_RETRY_SECONDS, grace_seconds: float = DEFAULT_GRACE_SECONDS,
++                 warn_after_seconds: float = DEFAULT_WARN_AFTER_SECONDS,
++                 clock: Callable[[], float] = time.monotonic) -> None:
++        self.lock_path = Path(lock_path)
++        self.name = name
++        self.root = is_root_gateway() if root is None else bool(root)
++        self.retry_seconds = float(retry_seconds)
++        self.grace_seconds = 0.0 if self.root else float(grace_seconds)
++        self.warn_after_seconds = float(warn_after_seconds)
++        self._clock = clock
++        self._created = clock()
++        self.handle: Any = None
++        self.state = "idle"
++        self._contended_since: Optional[float] = None
++        self._last_warn: Optional[float] = None
++        self._logged_contended = False
++        self._yield_cache: tuple[float, bool] = (float("-inf"), False)
++        self._lock = threading.Lock()
++        self.token = uuid.uuid4().hex  # identifies this lease's claim/holder records (two leases may share a pid)
++
++    # --- root claim ---------------------------------------------------------------------------------
++
++    @property
++    def _claim_path(self) -> Path:
++        return _sidecar(self.lock_path, "root-wanted")
++
++    def _post_root_claim(self) -> None:
++        pid = os.getpid()
++        _write_json(self._claim_path, {"pid": pid, "token": self.token, "started_at": _process_start(pid),
++                                       "posted_at": time.time()})
++
++    def _clear_own_root_claim(self) -> None:
++        claim = _read_json(self._claim_path)
++        if claim and claim.get("token") == self.token:
++            with contextlib.suppress(OSError):
++                self._claim_path.unlink()
++
++    def root_claim_live(self) -> bool:
++        """A live root gateway (another lease) has asked for the lock."""
++        claim = _read_json(self._claim_path)
++        if not claim or claim.get("token") == self.token:
++            return False
++        pid = claim.get("pid")
++        if not isinstance(pid, int) or not _pid_alive(pid):
++            return False
++        started = claim.get("started_at")
++        return started is None or _process_start(pid) in (None, started)
++
++    # --- acquire / release --------------------------------------------------------------------------
++
++    def try_acquire(self) -> bool:
++        """One attempt. True when this gateway may run the singleton loop (``held`` or ``unavailable``)."""
++        if self.state in ("held", "unavailable"):
++            return True
++        if not self.root:
++            if self._clock() - self._created < self.grace_seconds or self.root_claim_live():
++                self.state = "deferred"
++                return False
++        from gateway.kanban_watchers_common import _acquire_singleton_lock
++        handle, state = _acquire_singleton_lock(self.lock_path)
++        if state == "held":
++            self.handle, self.state = handle, "held"
++            pid = os.getpid()
++            home: Optional[str] = None
++            with contextlib.suppress(Exception):
++                from hermes_constants import get_hermes_home
++                home = str(get_hermes_home())
++            _write_json(_sidecar(self.lock_path, "holder.json"), {
++                "pid": pid, "token": self.token, "started_at": _process_start(pid), "acquired_at": time.time(),
++                "hermes_home": home, "root": self.root})
++            if self.root:
++                self._clear_own_root_claim()
++            waited = (self._clock() - self._contended_since) if self._contended_since is not None else None
++            self._contended_since = None
++            self._logged_contended = False
++            logger.info("kanban %s: holding singleton %s lock (%s)%s", self.name, self.name, self.lock_path,
++                        f" after {waited:.0f}s of contention" if waited else "")
++            return True
++        if state == "unavailable":
++            self.state = "unavailable"
++            logger.warning("kanban %s: advisory lock unavailable at %s; proceeding on config control alone.",
++                           self.name, self.lock_path)
++            return True
++        self.state = "contended"
++        now = self._clock()
++        if self._contended_since is None:
++            self._contended_since = now
++        if self.root:
++            self._post_root_claim()
++        if not self._logged_contended:
++            self._logged_contended = True
++            logger.info("kanban %s: another gateway holds %s (%s); retrying every %.0fs%s", self.name,
++                        self.lock_path, describe_holder(holder_info(self.lock_path)), self.retry_seconds,
++                        " and asking a profile holder to yield" if self.root else "")
++        self._maybe_warn(now)
++        return False
++
++    def _maybe_warn(self, now: float) -> None:
++        if self._contended_since is None or now - self._contended_since < self.warn_after_seconds:
++            return
++        if self._last_warn is not None and now - self._last_warn < self.warn_after_seconds:
++            return
++        self._last_warn = now
++        info = holder_info(self.lock_path)
++        logger.warning("kanban %s: %s has held %s for %.0fs while this %s gateway waits; this gateway's "
++                       "kanban.* settings (max_in_progress, profiles) are not the ones in effect", self.name,
++                       describe_holder(info), self.lock_path, now - self._contended_since,
++                       "root" if self.root else "profile")
++
++    def should_yield(self) -> bool:
++        """Holder side: True when a profile gateway should hand the lock to a live root claimant."""
++        if self.root or self.state != "held":
++            return False
++        with self._lock:
++            at, cached = self._yield_cache
++            now = self._clock()
++            if now - at < _YIELD_CACHE_SECONDS:
++                return cached
++            result = self.root_claim_live()
++            self._yield_cache = (now, result)
++        if result:
++            logger.info("kanban %s: root gateway asked for %s; this profile gateway yields it",
++                        self.name, self.lock_path)
++        return result
++
++    def release(self) -> None:
++        handle, self.handle = self.handle, None
++        if handle is not None:
++            side = _sidecar(self.lock_path, "holder.json")
++            rec = _read_json(side)
++            if rec and rec.get("token") == self.token:
++                with contextlib.suppress(OSError):
++                    side.unlink()
++            from gateway.kanban_watchers_common import _release_singleton_lock
++            _release_singleton_lock(handle)
++        if self.root:
++            self._clear_own_root_claim()
++        self.state = "idle"
++        self._yield_cache = (float("-inf"), False)
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 9630126064d..78cc1f03d51 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -18,7 +18,6 @@ from pathlib import Path
+ from typing import Any, Optional
+ 
+ from gateway.kanban_watchers_common import (
+-    _acquire_singleton_lock,
+     _kanban_dispatch_allowed,
+     _kanban_dispatch_gate,
+     _release_singleton_lock,
+@@ -38,10 +37,6 @@ from gateway.kanban_watchers_dispatcher import (
+ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+ _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+ _GC_INTERVAL_SECONDS = 3600.0
+-# Host Kanban sync ownership (``_kanban_sync_watcher``): a contended lock is retried this often, and a named-profile
+-# gateway re-checks for the root profile's gateway this often. [daveey]
+-_SYNC_LOCK_RETRY_S = 5.0
+-_SYNC_OWNER_RECHECK_S = 30.0
+ _HEALTH_WINDOW = 6
+ 
+ 
+@@ -58,7 +53,26 @@ class GatewayKanbanWatchersMixin:
+             health.close()
+         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
+         self._kanban_dispatcher_lock_handle = None
+-        _release_singleton_lock(handle)
++        lease = getattr(self, "_kanban_dispatcher_lease", None)
++        if lease is not None and lease.handle is handle:
++            lease.release()
++        else:
++            _release_singleton_lock(handle)
++
++    def _kanban_singleton_lease(self, lock_path: Path, name: str):
++        """A retrying, root-preferring lease on a host-wide singleton lock (gateway/kanban_singleton.py)."""
++        from gateway import kanban_singleton as _ks
++        return _ks.SingletonLease(lock_path, name=name, retry_seconds=_ks.DEFAULT_RETRY_SECONDS,
++                                  grace_seconds=_ks.DEFAULT_GRACE_SECONDS,
++                                  warn_after_seconds=_ks.DEFAULT_WARN_AFTER_SECONDS)
++
++    async def _acquire_kanban_lease(self, lease) -> bool:
++        """Retry *lease* every ``lease.retry_seconds`` until held; False when the gateway stops first."""
++        while self._running:
++            if lease.try_acquire():
++                return True
++            await self._sleep_between_ticks(lease.retry_seconds)
++        return False
+ 
+     async def _sleep_between_ticks(self, interval: float) -> None:
+         """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
+@@ -270,21 +284,9 @@ class GatewayKanbanWatchersMixin:
+             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+             return None
+ 
+-        # Single-dispatcher backstop (see _acquire_singleton_lock). The lock
+-        # lives at the machine-global kanban root, so it serialises ALL gateways.
+-        self._kanban_dispatcher_lock_handle = None
+-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+-        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+-        if _lock_state == "contended":
+-            logger.info("kanban dispatcher: another gateway already holds the dispatcher "
+-                        "lock (%s); this gateway will NOT dispatch.", _lock_path)
+-            return None
+-        if _lock_state == "held":
+-            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
+-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+-        else:
+-            logger.warning("kanban dispatcher: advisory lock unavailable at %s; proceeding "
+-                           "on config control alone.", _lock_path)
++        # The single-dispatcher lock (machine-global kanban root) is taken by the watcher through a
++        # retrying, root-preferring SingletonLease (gateway/kanban_singleton.py), not here: a gateway
++        # that lost the boot race used to stay non-dispatching until it restarted. [daveey]
+         return _load_config, _kb, kanban_cfg
+ 
+     async def _kanban_dispatcher_watcher(self) -> None:
+@@ -301,8 +303,19 @@ class GatewayKanbanWatchersMixin:
+             return
+         _load_config, _kb, kanban_cfg = boot
+         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
+-        interval = settings.interval
++        lease = self._kanban_singleton_lease(_kb.kanban_home() / "kanban" / ".dispatcher.lock", "dispatcher")
++        self._kanban_dispatcher_lease = lease
++        # A gateway that finds the lock held keeps retrying; a profile gateway hands it back when the
++        # root gateway asks (lease.should_yield), then waits to take it again. [daveey]
++        while self._running:
++            if not await self._acquire_kanban_lease(lease):
++                return
++            self._kanban_dispatcher_lock_handle = lease.handle
++            await self._kanban_dispatch_while_held(settings, _load_config, _kb, lease)
+ 
++    async def _kanban_dispatch_while_held(self, settings, _load_config, _kb, lease) -> None:
++        """The dispatch loop for one tenure of the singleton lock; releases it on exit."""
++        interval = settings.interval
+         from gateway.kanban_dispatcher_health import DispatcherHealth
+         health = DispatcherHealth(getattr(self, "_kanban_dispatcher_lock_handle", None), interval=interval)
+         self._kanban_dispatcher_health = health
+@@ -320,7 +333,7 @@ class GatewayKanbanWatchersMixin:
+             dispatcher = _KanbanDispatcher(_kb, settings)
+ 
+             logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
+-            while self._running:
++            while self._running and not lease.should_yield():
+                 health.invalidate()
+                 try:
+                     # Reap zombies before per-board work so a board DB failure
+@@ -411,48 +424,17 @@ class GatewayKanbanWatchersMixin:
+             return
+         from hermes_cli import kanban_db as _kb
+         from hermes_cli import kanban_sync_client as _ksc
+-        from gateway import kanban_watchers_common as _kwc
+-        # [daveey] The sync loop reconciles chat links with THIS process's profile (its origin ledger, its
+-        # state.db, its core's rules), so it belongs to the kanban root profile's gateway. A named-profile gateway
+-        # sharing the root's boards (hub: hermes-gateway-askeve-reviewer on a pinned core) won the first-come lock
+-        # and released every root-profile chat's remote-card and inherited links each pass, while the root gateway
+-        # logged "already syncs" and never retried. Now a named profile leaves sync to a live root gateway (and
+-        # hands the lock back when one starts), and a contended root keeps retrying instead of giving up.
+-        root = _kwc._is_kanban_root_profile()
+-        said = None
++        # Same retrying, root-preferring lease as the dispatcher: a gateway that loses the boot race
++        # keeps retrying, and a profile gateway hands the lock back when the root gateway asks. [daveey]
++        lease = self._kanban_singleton_lease(_kb.kanban_home() / "kanban" / ".sync.lock", "sync")
++        self._kanban_sync_lease = lease
+         while self._running:
+-            if not root and _kwc._root_gateway_alive():
+-                if said != "defer":
+-                    logger.info("kanban sync: the root profile's gateway runs on this host; this profile "
+-                                "gateway leaves host sync to it")
+-                    said = "defer"
+-                await asyncio.sleep(_SYNC_OWNER_RECHECK_S)
+-                continue
+-            lock_handle, lock_state = _acquire_singleton_lock(_kb.kanban_home() / "kanban" / ".sync.lock")
+-            if lock_state == "contended":
+-                if said != "contended":
+-                    logger.info("kanban sync: another gateway on this host already syncs; retrying every %.0fs",
+-                                _SYNC_LOCK_RETRY_S)
+-                    said = "contended"
+-                await asyncio.sleep(_SYNC_LOCK_RETRY_S)
+-                continue
+-            said = None
+-            checked = [0.0, False]
+-
+-            def keep_running() -> bool:
+-                if not self._running:
+-                    return False
+-                if root:
+-                    return True
+-                now = time.monotonic()
+-                if now - checked[0] >= _SYNC_OWNER_RECHECK_S:
+-                    checked[0], checked[1] = now, _kwc._root_gateway_alive()
+-                return not checked[1]
+-
++            if not await self._acquire_kanban_lease(lease):
++                return
+             try:
+-                await asyncio.to_thread(_ksc.run_forever, keep_running)
++                await asyncio.to_thread(_ksc.run_forever, lambda: self._running and not lease.should_yield())
++                yielded = self._running and lease.should_yield()
+             finally:
+-                _release_singleton_lock(lock_handle)
+-            if root or not checked[1] or not self._running:
+-                return  # the loop ended on its own (shutdown, no identity): never respin it
+-            logger.info("kanban sync: the root profile's gateway started; handed host sync to it")
++                lease.release()
++            if not yielded:
++                return  # the loop ended on its own (stop, or sync unavailable): don't spin on it
+diff --git a/gateway/kanban_watchers_common.py b/gateway/kanban_watchers_common.py
+index 251722b7b4b..212c1f23717 100644
+--- a/gateway/kanban_watchers_common.py
++++ b/gateway/kanban_watchers_common.py
+@@ -178,30 +178,6 @@ def _acquire_singleton_lock(lock_path) -> tuple[Optional[object], str]:
+     return handle, "held"
+ 
+ 
+-def _is_kanban_root_profile() -> bool:
+-    """True when this process's HERMES_HOME is the kanban root (the default profile), not a named profile whose
+-    home only borrows the root's boards. [daveey]"""
+-    try:
+-        from hermes_cli import kanban_db
+-        from hermes_constants import get_hermes_home
+-        return Path(get_hermes_home()).resolve() == Path(kanban_db.kanban_home()).resolve()
+-    except Exception:  # health: allow BLE001 -- an unresolvable home keeps today's behaviour (may sync)
+-        return True
+-
+-
+-def _root_gateway_alive() -> bool:
+-    """True when the kanban root profile's gateway runs on this host (its lock held, its PID live).
+-
+-    Read-only probe of the root's identity files (``cleanup_stale=False``): a named-profile process never unlinks
+-    the root's records. [daveey]"""
+-    try:
+-        from gateway.status import get_running_pid
+-        from hermes_cli import kanban_db
+-        return get_running_pid(Path(kanban_db.kanban_home()) / "gateway.pid", cleanup_stale=False) is not None
+-    except Exception:  # health: allow BLE001 -- unknown reads as absent: the profile gateway may keep syncing
+-        return False
+-
+-
+ def _release_singleton_lock(handle) -> None:
+     """Release a lock acquired via :func:`_acquire_singleton_lock`."""
+     if handle is None:
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 9bc98b358f7..cd73bd7a99c 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -130,6 +130,19 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
+     running" warning against a perfectly healthy profile gateway (#71211). CLI callers leave it ``None`` and
+     keep the existing process-level behavior.
+     """
++    try:
++        # The dispatcher is host-wide: one gateway holds ``<kanban root>/kanban/.dispatcher.lock`` and
++        # dispatches every board for every profile. Ask who holds it before judging this home's own
++        # gateway/config, or a profile CLI with dispatch_in_gateway=false warns "task will sit in ready"
++        # while the root gateway dispatches it fine. [daveey]
++        from gateway.kanban_singleton import describe_holder, holder_info
++        from hermes_cli.kanban_db import kanban_home
++
++        holder = holder_info(kanban_home() / "kanban" / ".dispatcher.lock")
++        if holder:
++            return (True, f"host dispatcher: {describe_holder(holder)}")
++    except Exception:
++        pass
+     try:
+         from gateway.status import resolve_gateway_liveness  # type: ignore
+ 
+@@ -1593,9 +1606,23 @@ def _cmd_archive(args: argparse.Namespace) -> int:
+         return _bulk_apply(ids, _one, _ok_line, lambda tid: refusals.get(tid) or f"cannot archive {tid}")
+ 
+ 
++def _host_lock_holders() -> dict:
++    """``{"dispatcher": info|None, "sync": info|None}``: who holds the host-wide singleton locks. [daveey]"""
++    out: dict = {}
++    try:
++        from gateway.kanban_singleton import holder_info
++        root = kb.kanban_home() / "kanban"
++        for name in ("dispatcher", "sync"):
++            out[name] = holder_info(root / f".{name}.lock")
++    except Exception:
++        pass
++    return out
++
++
+ def _cmd_stats(args: argparse.Namespace) -> int:
+     with kbc.connect_closing() as conn:
+         stats = kb.board_stats(conn)
++    stats["host_locks"] = _host_lock_holders()
+     if _json_out(args, stats):
+         return 0
+     print("By status:")
+@@ -1610,6 +1637,18 @@ def _cmd_stats(args: argparse.Namespace) -> int:
+     age = stats["oldest_ready_age_seconds"]
+     if age is not None:
+         print(f"\nOldest ready task age: {int(age)}s")
++    locks = stats.get("host_locks") or {}
++    if locks:
++        from gateway.kanban_singleton import describe_holder
++        print("\nHost locks:")
++        for name, info in locks.items():
++            if not info:
++                print(f"  {name:10s}  free (nothing on this host {'dispatches' if name == 'dispatcher' else 'syncs'})")
++                continue
++            since = info.get("since")
++            held = f", held {int(time.time() - since)}s" if isinstance(since, (int, float)) else ""
++            flag = "" if info.get("root") else "  ⚠ not the root gateway: its config's kanban caps apply"
++            print(f"  {name:10s}  {describe_holder(info)}{held}{flag}")
+     return 0
+ 
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index 5d265990b26..d1e68ea1832 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -8,7 +8,7 @@ from typing import Any, Iterable, Optional
+ 
+ from hermes_cli.kanban_db_dispatch_clock import all_clock_held, deadline_suffixes
+ 
+-__all__ = ["all_at_capacity", "all_clock_held", "describe_suppression", "stuck_warning"]
++__all__ = ["all_at_capacity", "all_clock_held", "cap_source", "describe_suppression", "stuck_warning"]
+ 
+ 
+ def describe_suppression(results: Iterable[Optional[Any]]) -> str:
+@@ -50,11 +50,36 @@ def describe_suppression(results: Iterable[Optional[Any]]) -> str:
+     parts = [f"{k}={v}{until.get(k, '')}" for k, v in sorted(counts.items())]
+     if capacity:
+         parts.append(f"at_capacity({capacity})")
++        source = cap_source(capacity)
++        if source:
++            parts.append(f"cap_source={source}")
+     if pressure:
+         parts.append(f"memory_pressure={pressure}")
+     return ", ".join(parts)
+ 
+ 
++def cap_source(capacity: str) -> str:
++    """Where the cap named in an ``at_capacity`` string came from, with the config file it was read from.
++
++    A profile gateway that holds the host dispatcher lock applies ITS config's caps to every board; on
++    hermes-hub one ran a memory-derived ``max_in_progress=8`` instead of the root's 16 for hours and the
++    warning never said whose cap it was. [daveey]
++    """
++    try:
++        from hermes_constants import get_hermes_home
++        config = f"{get_hermes_home()}/config.yaml"
++    except Exception:
++        config = "config.yaml"
++    if capacity.startswith("max_in_progress="):
++        from hermes_cli.kanban_db_dispatch import configured_max_in_progress
++        if configured_max_in_progress() is not None:
++            return f"kanban.max_in_progress in {config}"
++        return f"memory-derived default (kanban.max_in_progress unset in {config})"
++    if capacity.startswith("max_spawn="):
++        return f"kanban.max_spawn in {config} or the --max flag"
++    return ""
++
++
+ def stuck_warning(bad_ticks: int, results: Iterable[Optional[Any]]) -> str:
+     """The "dispatcher stuck" line for the CLI daemon and the embedded gateway dispatcher.
+ 
+diff --git a/tests/gateway/test_kanban_dispatcher_health.py b/tests/gateway/test_kanban_dispatcher_health.py
+index 2be8310edb2..c644dcb4152 100644
+--- a/tests/gateway/test_kanban_dispatcher_health.py
++++ b/tests/gateway/test_kanban_dispatcher_health.py
+@@ -100,11 +100,8 @@ def test_native_loop_publishes_only_actual_board_success(tmp_path, monkeypatch,
+     monkeypatch.setattr(kbc, "connect", connect)
+     board = kb.kanban_db_path("default")
+     root = tmp_path / "kanban"
+-    lock, state = _acquire_singleton_lock(root / ".dispatcher.lock")
+-    assert state == "held"
+     runner = watchers.GatewayKanbanWatchersMixin()
+     runner._running = True
+-    runner._kanban_dispatcher_lock_handle = lock
+     cfg = {"auto_decompose": False, "dispatch_interval_seconds": 1}
+     monkeypatch.setattr(runner, "_kanban_dispatcher_boot", lambda: (lambda: {"kanban": cfg}, kb, cfg))
+     async def no_sleep(delay):
+@@ -135,7 +132,11 @@ def test_native_loop_publishes_only_actual_board_success(tmp_path, monkeypatch,
+     else:
+         asyncio.run(runner._kanban_dispatcher_watcher())
+     assert not health.available(root, board, "default", "ready")
+-    assert lock.closed
++    # The watcher took the lock itself (SingletonLease) and released it on every ending.
++    assert runner._kanban_dispatcher_lock_handle is None
++    lock, state = _acquire_singleton_lock(root / ".dispatcher.lock")
++    assert state == "held"
++    _release_singleton_lock(lock)
+ 
+ 
+ def test_one_shot_and_dry_run_never_publish(tmp_path, monkeypatch):
+diff --git a/tests/gateway/test_kanban_singleton_lease.py b/tests/gateway/test_kanban_singleton_lease.py
+new file mode 100644
+index 00000000000..b19648e3a3d
+--- /dev/null
++++ b/tests/gateway/test_kanban_singleton_lease.py
+@@ -0,0 +1,254 @@
++"""Host-wide Kanban singleton locks: retry when contended, prefer the root gateway, say who holds them.
++
++Regression for hermes-hub 2026-11-02: a pinned profile gateway (askeve-reviewer) won every joint
++restart, held .dispatcher.lock and .sync.lock for hours with half the root's max_in_progress, and the
++root gateway, having lost one boot-time attempt, never retried. [daveey]
++"""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++
++import asyncio
++import logging
++from pathlib import Path
++
++import pytest
++
++from gateway import kanban_singleton as ks
++from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock
++
++
++@pytest.fixture
++def root(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    (home / "kanban").mkdir(parents=True)
++    (home / "profiles" / "askeve-reviewer").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    return home
++
++
++class Clock:
++    def __init__(self):
++        self.now = 1000.0
++
++    def __call__(self):
++        return self.now
++
++
++def _lease(root, *, is_root, clock, name="dispatcher", grace=60.0):
++    return ks.SingletonLease(root / "kanban" / f".{name}.lock", name=name, root=is_root, retry_seconds=30.0,
++                             grace_seconds=grace, warn_after_seconds=300.0, clock=clock)
++
++
++def test_root_detection_follows_hermes_home(root, monkeypatch):
++    assert ks.is_root_gateway()
++    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "askeve-reviewer"))
++    assert not ks.is_root_gateway()
++
++
++def test_joint_restart_profile_gateway_defers_so_root_wins(root):
++    """Profile gateway reaches the lock ~20 s before the root one: it must not take it in its grace window."""
++    clock = Clock()
++    profile = _lease(root, is_root=False, clock=clock)
++    rootl = _lease(root, is_root=True, clock=clock)
++    assert not profile.try_acquire() and profile.state == "deferred"
++    clock.now += 20
++    assert rootl.try_acquire() and rootl.state == "held"
++    clock.now += 120  # grace over: the lock is simply contended now
++    assert not profile.try_acquire() and profile.state == "contended"
++    rootl.release()
++    profile.release()
++
++
++def test_profile_holder_yields_to_root_claim_and_root_takes_over(root):
++    """Root gateway restarted alone while a profile gateway held the lock: the profile hands it back."""
++    clock = Clock()
++    profile = _lease(root, is_root=False, clock=clock, grace=0.0)
++    rootl = _lease(root, is_root=True, clock=clock)
++    assert profile.try_acquire()
++    assert not profile.should_yield()
++    assert not rootl.try_acquire() and rootl.state == "contended"  # posts the root claim
++    clock.now += 10  # past the should_yield cache
++    assert profile.should_yield()
++    profile.release()
++    assert not profile.try_acquire() and profile.state == "deferred"  # live root claim: stay off it
++    assert rootl.try_acquire() and rootl.state == "held"
++    assert not (root / "kanban" / ".dispatcher.lock.root-wanted").exists()
++    assert not profile.root_claim_live()
++    rootl.release()
++
++
++def test_dead_root_claim_does_not_block_profile_gateway(root):
++    clock = Clock()
++    ks._write_json(root / "kanban" / ".dispatcher.lock.root-wanted", {"pid": 2 ** 22 + 12345, "token": "x"})
++    profile = _lease(root, is_root=False, clock=clock, grace=0.0)
++    assert profile.try_acquire() and profile.state == "held"
++    assert not profile.should_yield()
++    profile.release()
++
++
++def test_long_contention_warns_naming_holder_pid_and_home(root, caplog):
++    clock = Clock()
++    holder = _lease(root, is_root=False, clock=clock, grace=0.0)
++    waiter = _lease(root, is_root=True, clock=clock)
++    assert holder.try_acquire()
++    with caplog.at_level(logging.INFO, logger="gateway.run"):
++        assert not waiter.try_acquire()
++        clock.now += 299
++        assert not waiter.try_acquire()
++        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
++        clock.now += 2
++        assert not waiter.try_acquire()
++    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
++    assert len(warnings) == 1
++    import os
++    assert f"pid {os.getpid()}" in warnings[0] and f"HERMES_HOME={root}" in warnings[0]
++    holder.release()
++    waiter.release()
++
++
++def test_holder_info_names_pid_home_and_rootness(root):
++    clock = Clock()
++    lease = _lease(root, is_root=True, clock=clock)
++    path = root / "kanban" / ".dispatcher.lock"
++    assert ks.holder_info(path) is None
++    assert lease.try_acquire()
++    info = ks.holder_info(path)
++    import os
++    assert info is not None
++    assert info["pid"] == os.getpid() and info["hermes_home"] == str(root) and info["root"] is True
++    lease.release()
++    assert ks.holder_info(path) is None
++
++
++# --- watcher entry paths -------------------------------------------------------------------------
++
++
++def _runner():
++    from gateway import kanban_watchers as watchers
++    runner = watchers.GatewayKanbanWatchersMixin()
++    runner._running = True
++    return runner
++
++
++def test_dispatcher_watcher_retries_a_contended_lock_then_dispatches(root, monkeypatch):
++    """Entry path 1: the dispatcher loop. Losing the boot race is no longer permanent."""
++    from gateway import kanban_watchers as watchers
++    from hermes_cli import kanban_db as kb
++    runner = _runner()
++    cfg = {"auto_decompose": False, "dispatch_interval_seconds": 1}
++    monkeypatch.setattr(runner, "_kanban_dispatcher_boot", lambda: (lambda: {"kanban": cfg}, kb, cfg))
++    other, state = _acquire_singleton_lock(root / "kanban" / ".dispatcher.lock")
++    assert state == "held"
++    ticks, sleeps = [], []
++
++    async def no_sleep(_delay):
++        return None
++    monkeypatch.setattr(watchers.asyncio, "sleep", no_sleep)
++
++    class FakeDispatcher:
++        successful_scopes: list = []
++
++        def __init__(self, *_a, **_k):
++            pass
++
++        def tick_once(self, **_k):
++            ticks.append(runner._owns_kanban_dispatcher_lock())
++            runner._running = False
++            return []
++
++        def ready_nonempty(self):
++            return False
++    monkeypatch.setattr(watchers, "_KanbanDispatcher", FakeDispatcher)
++
++    async def between(interval):
++        sleeps.append(interval)
++        if len(sleeps) == 1:
++            _release_singleton_lock(other)  # the other gateway exits
++    monkeypatch.setattr(runner, "_sleep_between_ticks", between)
++    try:
++        asyncio.run(runner._kanban_dispatcher_watcher())
++    finally:
++        _release_singleton_lock(other)
++    assert sleeps[0] == ks.DEFAULT_RETRY_SECONDS
++    assert ticks == [True]
++    assert runner._kanban_dispatcher_lock_handle is None  # released on stop
++
++
++def test_dispatcher_watcher_profile_gateway_yields_to_root(root, monkeypatch):
++    """Entry path 2: a profile gateway holding the dispatcher lock hands it to a root claimant."""
++    from gateway import kanban_watchers as watchers
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "askeve-reviewer"))
++    monkeypatch.setattr(ks, "DEFAULT_GRACE_SECONDS", 0.0)
++    monkeypatch.setattr(ks, "_YIELD_CACHE_SECONDS", 0.0)
++    runner = _runner()
++    cfg = {"auto_decompose": False, "dispatch_interval_seconds": 1}
++    monkeypatch.setattr(runner, "_kanban_dispatcher_boot", lambda: (lambda: {"kanban": cfg}, kb, cfg))
++
++    async def no_sleep(_delay):
++        return None
++    monkeypatch.setattr(watchers.asyncio, "sleep", no_sleep)
++    root_lease = _lease(root, is_root=True, clock=Clock())
++    events = []
++
++    class FakeDispatcher:
++        successful_scopes: list = []
++
++        def __init__(self, *_a, **_k):
++            pass
++
++        def tick_once(self, **_k):
++            events.append(("tick", runner._owns_kanban_dispatcher_lock()))
++            assert not root_lease.try_acquire()  # root gateway starts and posts its claim
++            return []
++
++        def ready_nonempty(self):
++            return False
++    monkeypatch.setattr(watchers, "_KanbanDispatcher", FakeDispatcher)
++
++    async def between(interval):
++        events.append(("sleep", runner._owns_kanban_dispatcher_lock()))
++        if not runner._owns_kanban_dispatcher_lock() and root_lease.try_acquire():
++            events.append(("root-held", True))
++            runner._running = False
++    monkeypatch.setattr(runner, "_sleep_between_ticks", between)
++    try:
++        asyncio.run(runner._kanban_dispatcher_watcher())
++    finally:
++        root_lease.release()
++    assert events[0] == ("tick", True)
++    assert ("root-held", True) in events
++    assert events.count(("tick", True)) == 1  # no second tick after the root claim
++
++
++def test_sync_watcher_profile_gateway_yields_to_root_and_waits(root, monkeypatch):
++    """Entry path 3: the sync loop gives .sync.lock back to the root gateway and does not spin."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as ksc
++    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "askeve-reviewer"))
++    monkeypatch.setattr(ks, "DEFAULT_GRACE_SECONDS", 0.0)
++    monkeypatch.setattr(ks, "_YIELD_CACHE_SECONDS", 0.0)
++    monkeypatch.setattr(sync, "sync_enabled", lambda: True)
++    runner = _runner()
++    root_lease = _lease(root, is_root=True, clock=Clock(), name="sync")
++    loops = []
++
++    def fake_run_forever(keep_running, interval=None, sleep=None):
++        loops.append("start")
++        assert keep_running()
++        assert not root_lease.try_acquire()  # root gateway comes up and asks
++        assert not keep_running()  # ... so the profile's loop ends at its next check
++    monkeypatch.setattr(ksc, "run_forever", fake_run_forever)
++    sleeps = []
++
++    async def between(interval):
++        sleeps.append(interval)
++        assert root_lease.try_acquire()  # the yielded lock is the root's now
++        runner._running = False
++    monkeypatch.setattr(runner, "_sleep_between_ticks", between)
++    try:
++        asyncio.run(runner._kanban_sync_watcher())
++    finally:
++        root_lease.release()
++    assert loops == ["start"] and sleeps == [ks.DEFAULT_RETRY_SECONDS]
+diff --git a/tests/hermes_cli/test_kanban_host_lock_visibility.py b/tests/hermes_cli/test_kanban_host_lock_visibility.py
+new file mode 100644
+index 00000000000..ebec4bb5a07
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_host_lock_visibility.py
+@@ -0,0 +1,109 @@
++"""Who dispatches this host: presence probe, ``kanban stats`` and the cap source name the lock holder. [daveey]
++
++hermes-hub 2026-11-02: a profile CLI with ``dispatch_in_gateway=false`` warned "the task will sit in
++'ready'" while the root gateway dispatched fine, and the at-capacity line never said that the cap
++(8) came from the profile gateway's memory-derived default rather than the root's configured 16.
++"""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++
++import argparse
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock
++
++
++@pytest.fixture
++def root(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    (home / "kanban").mkdir(parents=True)
++    profile = home / "profiles" / "askeve-reviewer"
++    profile.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    return home
++
++
++def _no_gateway(monkeypatch):
++    from gateway import status
++    monkeypatch.setattr(status, "resolve_gateway_liveness",
++                        lambda **kw: SimpleNamespace(pid=None, probe_error=None))
++
++
++def test_presence_reports_host_dispatcher_held_by_another_home(root, monkeypatch):
++    from gateway import kanban_singleton as ks
++    from hermes_cli import kanban as cli
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    lease = ks.SingletonLease(root / "kanban" / ".dispatcher.lock", name="dispatcher", root=True)
++    assert lease.try_acquire()
++    try:
++        # The CLI runs as the profile: its own gateway is down and its config disables dispatch.
++        monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "askeve-reviewer"))
++        monkeypatch.setattr(cli, "_kanban_config", lambda: {"dispatch_in_gateway": False})
++        _no_gateway(monkeypatch)
++        running, message = cli._check_dispatcher_presence()
++        assert running, message
++        assert "root gateway" in message and f"HERMES_HOME={root}" in message
++    finally:
++        lease.release()
++
++
++def test_presence_still_warns_when_no_one_holds_the_host_lock(root, monkeypatch):
++    from hermes_cli import kanban as cli
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    _no_gateway(monkeypatch)
++    running, message = cli._check_dispatcher_presence()
++    assert not running and "No gateway is running" in message
++
++
++def test_stats_names_host_lock_holders(root, monkeypatch, capsys):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban as cli
++    from gateway import kanban_singleton as ks
++    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "askeve-reviewer"))
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(root / "kanban.db"))
++    kb.init_db()
++    lease = ks.SingletonLease(root / "kanban" / ".sync.lock", name="sync", root=False, grace_seconds=0.0)
++    assert lease.try_acquire()
++    try:
++        assert cli._cmd_stats(argparse.Namespace(json=True)) == 0
++        locks = json.loads(capsys.readouterr().out)["host_locks"]
++        assert locks["dispatcher"] is None
++        assert locks["sync"]["hermes_home"] == str(root / "profiles" / "askeve-reviewer")
++        assert locks["sync"]["root"] is False
++        assert cli._cmd_stats(argparse.Namespace(json=False)) == 0
++        out = capsys.readouterr().out
++        assert "Host locks:" in out and "not the root gateway" in out
++    finally:
++        lease.release()
++
++
++@pytest.mark.parametrize("configured", [None, 16])
++def test_at_capacity_names_where_the_cap_came_from(root, monkeypatch, configured):
++    from hermes_cli import kanban_db_dispatch as kbd
++    home = root / "profiles" / "askeve-reviewer"
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: configured)
++    res = kbd.DispatchResult()
++    res.at_capacity = "max_in_progress=8/8"
++    line = kbd.describe_suppression([res])
++    assert "at_capacity(max_in_progress=8/8)" in line
++    want = "kanban.max_in_progress in" if configured else "memory-derived default"
++    assert f"cap_source={want}" in line and f"{home}/config.yaml" in line
++    assert "cap_source=" in kbd.stuck_warning(6, [res])
++
++
++def test_lock_holder_unaffected_by_unheld_sidecar(root, monkeypatch):
++    """A stale holder sidecar from a dead gateway is not reported as a holder on Linux."""
++    from gateway import kanban_singleton as ks
++    if not Path("/proc/locks").exists():
++        pytest.skip("needs /proc/locks")
++    path = root / "kanban" / ".dispatcher.lock"
++    handle, state = _acquire_singleton_lock(path)
++    assert state == "held"
++    _release_singleton_lock(handle)
++    ks._write_json(Path(f"{path}.holder.json"), {"pid": 1, "hermes_home": "/x"})
++    assert ks.holder_info(path) is None
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 1365fb30ba0..9d9215fac26 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -431,61 +431,21 @@ def test_gateway_watcher_runs_the_loop_once_per_host_and_not_when_disabled(kanba
+     assert calls == [True]
+     from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock
+     held, state = _acquire_singleton_lock(kb.kanban_home() / "kanban" / ".sync.lock")
+-    assert state == "held"
+-    slept = []
++    waits = []
+ 
+-    async def fake_sleep(seconds):
+-        slept.append(seconds)
+-        _release_singleton_lock(held)  # the other gateway exits
+-
+-    monkeypatch.setattr(watchers.asyncio, "sleep", fake_sleep)
+-    asyncio.run(runner._kanban_sync_watcher())  # another gateway on this host holds it: retried, never given up
+-    assert slept == [watchers._SYNC_LOCK_RETRY_S] and calls == [True, True]
+-
+-
+-def test_a_named_profile_gateway_leaves_host_sync_to_the_root_gateway(kanban_home, monkeypatch):
+-    """Hub 2026-11-02: hermes-gateway-askeve-reviewer (a named profile on a pinned older core) won the host sync lock
+-    first; its reconcile released root-profile chats' card links every pass, and the root gateway logged "another
+-    gateway already syncs" and never retried. A named profile now defers to a live root gateway and hands the loop
+-    back when one starts. [daveey]"""
+-    import asyncio
+-    from gateway import kanban_watchers as watchers
+-    from gateway import kanban_watchers_common as kwc
+-    support.write_sync_config(kanban_home, True)
+-    root_alive = [True]
+-    monkeypatch.setattr(kwc, "_is_kanban_root_profile", lambda: False)
+-    monkeypatch.setattr(kwc, "_root_gateway_alive", lambda: root_alive[0])
+-    monkeypatch.setattr(watchers, "_SYNC_OWNER_RECHECK_S", 0.0)
+-    runner = watchers.GatewayKanbanWatchersMixin()
+-    runner._running = True
+-    ran, slept = [], []
+-
+-    async def fake_sleep(seconds):
+-        slept.append(seconds)
+-        root_alive[0] = False  # the root gateway stops: this profile may sync
+-
+-    def fake_run_forever(keep_running, interval=None, sleep=None):
+-        ran.append(keep_running())
+-        root_alive[0] = True  # the root gateway starts again
+-        ran.append(keep_running())
+-        runner._running = False
+-    monkeypatch.setattr(watchers.asyncio, "sleep", fake_sleep)
+-    monkeypatch.setattr(ksc, "run_forever", fake_run_forever)
+-    asyncio.run(runner._kanban_sync_watcher())
+-    assert slept == [0.0] and ran == [True, False]  # deferred, then ran, then handed back
+-    from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock
+-    held, state = _acquire_singleton_lock(kb.kanban_home() / "kanban" / ".sync.lock")
+-    _release_singleton_lock(held)
+-    assert state == "held"  # released on hand-back
+-
+-
+-def test_root_profile_detection_reads_hermes_home_against_the_kanban_root(kanban_home, monkeypatch, tmp_path):
+-    from gateway import kanban_watchers_common as kwc
+-    assert kwc._is_kanban_root_profile()
+-    monkeypatch.setenv("HERMES_HOME", str(kb.kanban_home() / "profiles" / "askeve-reviewer"))
+-    monkeypatch.setattr(kb, "kanban_home", lambda: kanban_home)
+-    assert not kwc._is_kanban_root_profile()
+-    assert not kwc._root_gateway_alive()  # no root gateway.pid
++    async def other_gateway_exits(interval):  # the retry sleep: the holder goes away meanwhile
++        waits.append(calls[:])
++        _release_singleton_lock(held)
++    runner._sleep_between_ticks = other_gateway_exits
++    try:
++        assert state == "held"
++        # Another gateway on this host holds it: this one waits instead of giving up for its lifetime,
++        # and syncs once the holder lets go.
++        asyncio.run(runner._kanban_sync_watcher())
++        assert waits == [[True]]
++        assert calls == [True, True]
++    finally:
++        _release_singleton_lock(held)
+ 
+ 
+ def test_import_skips_events_older_than_the_service_retention(live):
+-- 
+2.55.0
+

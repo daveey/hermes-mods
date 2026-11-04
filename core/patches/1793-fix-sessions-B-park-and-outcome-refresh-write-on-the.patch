@@ -1,0 +1,258 @@
+From 774d5e7198d6407e922ff737bcabd974958ff906 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 03:09:00 +0000
+Subject: [PATCH] =?UTF-8?q?fix(sessions):=20=E2=8C=98B=20park=20and=20outc?=
+ =?UTF-8?q?ome=20refresh=20write=20on=20the=20live=20owner,=20not=20under?=
+ =?UTF-8?q?=20the=20offline=20lock=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+POST /api/sessions/{id}/mute and GET /outcome?refresh=1 took exclusive_maintenance, which a running
+gateway always holds, so ⌘B on a gateway-served profile toasted 'Could not update the parked state:
+Exclusive maintenance refused' and rolled back (hub: 33 refusals since 2026-10-30). Route them through
+the live owner's own store like owner-backfill. Live-gateway test (RED = 409), plus a hotkey test for
+⌘B from the page and from the composer.
+---
+ .../use-keybinds-toggle-blocked.test.tsx      | 81 +++++++++++++++++
+ hermes_cli/web_routers/sessions.py            | 21 ++++-
+ tests/gateway/test_mute_live_owner.py         | 89 +++++++++++++++++++
+ 3 files changed, 187 insertions(+), 4 deletions(-)
+ create mode 100644 apps/desktop/src/app/hooks/use-keybinds-toggle-blocked.test.tsx
+ create mode 100644 tests/gateway/test_mute_live_owner.py
+
+diff --git a/apps/desktop/src/app/hooks/use-keybinds-toggle-blocked.test.tsx b/apps/desktop/src/app/hooks/use-keybinds-toggle-blocked.test.tsx
+new file mode 100644
+index 00000000000..bb9f6f4c0c7
+--- /dev/null
++++ b/apps/desktop/src/app/hooks/use-keybinds-toggle-blocked.test.tsx
+@@ -0,0 +1,81 @@
++import { renderHook } from '@testing-library/react'
++import type { ReactNode } from 'react'
++import { MemoryRouter } from 'react-router'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { isMacPlatform } from '@/lib/platform'
++import { $selectedStoredSessionId } from '@/store/session'
++
++import { useKeybinds } from './use-keybinds'
++
++const mocks = vi.hoisted(() => ({ toggleSessionBlocked: vi.fn() }))
++
++vi.mock('@/store/session-blocked', async importOriginal => ({
++  ...(await importOriginal<typeof SessionBlocked>()),
++  toggleSessionBlocked: mocks.toggleSessionBlocked
++}))
++
++vi.mock('@/themes/context', () => ({
++  useTheme: () => ({ resolvedMode: 'light', setMode: vi.fn() })
++}))
++
++import type * as SessionBlocked from '@/store/session-blocked'
++
++const deps = {
++  archiveSelectedSession: vi.fn(),
++  openNewSessionTab: vi.fn(),
++  requestGateway: vi.fn(),
++  startFreshSession: vi.fn(),
++  toggleCommandCenter: vi.fn(),
++  toggleSelectedPin: vi.fn()
++}
++
++function pressModB(target: EventTarget): KeyboardEvent {
++  const event = new KeyboardEvent('keydown', {
++    bubbles: true,
++    cancelable: true,
++    code: 'KeyB',
++    ctrlKey: !isMacPlatform(),
++    key: 'b',
++    metaKey: isMacPlatform()
++  })
++
++  target.dispatchEvent(event)
++
++  return event
++}
++
++describe('⌘B toggles the current session blocked', () => {
++  let unmount: (() => void) | undefined
++
++  beforeEach(() => {
++    $selectedStoredSessionId.set('s1')
++    unmount = renderHook(() => useKeybinds(deps), {
++      wrapper: ({ children }: { children: ReactNode }) => <MemoryRouter>{children}</MemoryRouter>
++    }).unmount
++  })
++
++  afterEach(() => {
++    unmount?.()
++    document.body.innerHTML = ''
++    mocks.toggleSessionBlocked.mockReset()
++  })
++
++  it('fires from the page body', () => {
++    const event = pressModB(document.body)
++
++    expect(mocks.toggleSessionBlocked).toHaveBeenCalledWith('s1')
++    expect(event.defaultPrevented).toBe(true)
++  })
++
++  it('fires while typing in the composer', () => {
++    const editor = document.createElement('div')
++    editor.contentEditable = 'true'
++    document.body.append(editor)
++    editor.focus()
++
++    pressModB(editor)
++
++    expect(mocks.toggleSessionBlocked).toHaveBeenCalledWith('s1')
++  })
++})
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index c7d89908345..7e21617dcd2 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -1020,8 +1020,18 @@ async def rename_session_endpoint(session_id: str, body: SessionRename, request:
+         expected_generation=body.expected_generation, operation='sidebar', payload=payload)
+ 
+ 
++async def _write_on_owner(request: Request, profile: Optional[str], fn: Callable):
++    """[daveey] A single-row write: on the live owner's own store when a composed gateway serves the
++    profile, else under the offline maintenance lock. A running gateway always holds that lock, so
++    taking it there 409s every write ("Exclusive maintenance refused") — same split as owner-backfill."""
++    owner_db = _owner_db_for(request, profile)
++    if owner_db is not None:
++        return await asyncio.to_thread(fn, owner_db)
++    return await asyncio.to_thread(_with_db, profile, fn, read_only=False)
++
++
+ @manage_router.post("/api/sessions/{session_id}/mute")
+-async def mute_session_endpoint(session_id: str, body: SessionMute):
++async def mute_session_endpoint(session_id: str, body: SessionMute, request: Request):
+     """[daveey] Server-side mute (Desktop ⌘B park): stored on the lineage and reflected in the outcome."""
+     from hermes_state_outcome import set_muted
+ 
+@@ -1031,11 +1041,12 @@ async def mute_session_endpoint(session_id: str, body: SessionMute):
+             raise HTTPException(status_code=404, detail=_NOT_FOUND)
+         return {"ok": True, "muted": body.muted, "outcome": set_muted(sid, body.muted, db=db)}
+ 
+-    return await asyncio.to_thread(_with_db, body.profile, _mute, read_only=False)
++    return await _write_on_owner(request, body.profile, _mute)
+ 
+ 
+ @manage_router.get("/api/sessions/{session_id}/outcome")
+-async def get_session_outcome_endpoint(session_id: str, refresh: bool = False, profile: Optional[str] = None):
++async def get_session_outcome_endpoint(session_id: str, request: Request, refresh: bool = False,
++                                       profile: Optional[str] = None):
+     """[daveey] The chat's stored outcome; ``refresh=1`` re-derives and stores it first."""
+     from hermes_state_outcome import get_outcome, refresh_outcome
+ 
+@@ -1050,7 +1061,9 @@ async def get_session_outcome_endpoint(session_id: str, refresh: bool = False, p
+         outcome = refresh_outcome(sid, "manual", db=db) if refresh else get_outcome(sid, db=db)
+         return {"session_id": sid, "outcome": outcome}
+ 
+-    return await asyncio.to_thread(_with_db, profile, _read, read_only=not refresh)
++    if refresh:
++        return await _write_on_owner(request, profile, _read)
++    return await asyncio.to_thread(_with_db, profile, _read, read_only=True)
+ 
+ 
+ def _compact_json(obj) -> str:
+diff --git a/tests/gateway/test_mute_live_owner.py b/tests/gateway/test_mute_live_owner.py
+new file mode 100644
+index 00000000000..515dc75ed6c
+--- /dev/null
++++ b/tests/gateway/test_mute_live_owner.py
+@@ -0,0 +1,89 @@
++"""Desktop ⌘B (POST /api/sessions/{id}/mute) and outcome refresh work against a live gateway.
++
++Both took the offline maintenance lock, which a running gateway always holds, so every ⌘B on a
++gateway-served profile failed with "Exclusive maintenance refused" and the park never stuck. They now
++write on the live owner's own store, like owner-backfill.
++"""
++import json
++import os
++from pathlib import Path
++import signal
++import subprocess
++import sys
++import time
++
++import httpx
++import pytest
++
++from tests.gateway.test_normal_runtime_boot import control
++
++
++def _seed(home: Path, sid: str) -> None:
++    from hermes_state import SessionDB
++
++    db = SessionDB(db_path=home / 'state.db')
++    try:
++        db.create_session(sid, source='desktop')
++        db.append_message(sid, role='user', content='fix it')
++        db.append_message(sid, role='assistant', content='Fixed and pushed; CI is green.')
++    finally:
++        db.close()
++
++
++@pytest.mark.platforms('linux')
++def test_mute_and_outcome_refresh_run_on_the_live_owner(tmp_path):
++    home, user = tmp_path / 'state', tmp_path / 'user'
++    home.mkdir(mode=0o700)
++    user.mkdir()
++    model = {'model': {'provider': 'custom', 'default': 'm', 'base_url': 'http://127.0.0.1:1/v1'},
++             'auxiliary': {'title_generation': {'enabled': False}}}
++    (home / 'config.yaml').write_text(json.dumps(model))
++    _seed(home, 'chat')
++    root = Path(__file__).resolve().parents[2]
++    env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
++    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
++               PYTHONUNBUFFERED='1')
++    with (tmp_path / 'gateway.log').open('w+') as log:
++        process = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
++                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
++        try:
++            deadline, descriptor = time.monotonic() + 60, {}
++            while process.poll() is None and time.monotonic() < deadline:
++                try:
++                    descriptor = control(home, 'identify')
++                    if descriptor.get('state') == 'ready':
++                        break
++                except (OSError, ValueError):
++                    pass
++                time.sleep(.1)
++            log.seek(0)
++            assert descriptor.get('state') == 'ready', (descriptor, log.read())
++
++            def headers():
++                # A native grant ticket is single-use: mint one per request, as Desktop does.
++                return {'X-Hermes-Gateway-Ticket': control(home, 'session-ticket', {
++                    'profile_id': str(home.resolve()), 'instance_id': descriptor['instance_id'],
++                    'purpose': 'native-http'})['ticket']}
++            with httpx.Client(base_url=descriptor['api_origin'], trust_env=False, timeout=30) as client:
++                muted = client.post('/api/sessions/chat/mute', json={'muted': True}, headers=headers())
++                assert muted.status_code == 200, muted.text
++                assert muted.json()['muted'] is True and muted.json()['outcome']['kind'] == 'muted'
++                stored = client.get('/api/sessions/chat/outcome', headers=headers())
++                assert stored.status_code == 200, stored.text
++                assert stored.json()['outcome']['kind'] == 'muted'
++
++                unmuted = client.post('/api/sessions/chat/mute', json={'muted': False}, headers=headers())
++                assert unmuted.status_code == 200, unmuted.text
++                assert unmuted.json()['outcome']['kind'] != 'muted'
++
++                refreshed = client.get('/api/sessions/chat/outcome', params={'refresh': 1}, headers=headers())
++                assert refreshed.status_code == 200, refreshed.text
++                assert client.post('/api/sessions/nope/mute', json={'muted': True}, headers=headers()).status_code == 404
++        finally:
++            if process.poll() is None:
++                process.send_signal(signal.SIGINT)
++                try:
++                    process.wait(timeout=20)
++                except subprocess.TimeoutExpired:
++                    process.kill()
++                    process.wait(timeout=5)
+-- 
+2.55.0
+

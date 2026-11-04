@@ -1,0 +1,80 @@
+From 5012a147c5dbc436a46dc013b518da5c5dc28556 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 03:01:55 +0000
+Subject: [PATCH] fix(kanban): an uncontended cold annotation read past its
+ budget serves the disk copy, not all-unknown [daveey]
+
+A fresh process's only poll (session-idle-check's collector, a restarted backend before polls overlap) passed no
+fallback to refresh_bounded, so on an overloaded host (load 24) one read slower than _REFRESH_WAIT_S marked every
+session row kanban_unknown even with a recent copy on disk. The contended path already seeded from that copy.
+t_01a19eee6379cea9
+---
+ hermes_cli/kanban_session_activity.py         |  7 +++-
+ .../hermes_cli/test_kanban_annotation_disk.py | 35 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index bb1555e22cc..3f47172bc44 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1823,8 +1823,13 @@ def _annotation_snapshot() -> tuple | None:
+                                         None, max(0.0, deadline - time.monotonic()))
+     previous = _last_annotation.get(scope)
+     if previous is None:
++        # [daveey] An uncontended cold read (a fresh process such as the session-idle-check collector, or a
++        # restarted backend before any poll overlapped) passed no fallback, so one read slower than the budget
++        # marked every row unknown even with a recent copy on disk: ~400 hub rows under load 24
++        # (t_01a19eee6379cea9). Serve that copy, dated by its own time, when the read overruns.
++        fallback = _annotation_copy.seed(scope, _last_annotation, _identity.freeze_annotation)
+         return _bounded.refresh_bounded(lambda: _refresh_annotation_locked(scope), _annotate_refresh_lock,
+-                                        None, max(0.0, deadline - time.monotonic()))
++                                        fallback, max(0.0, deadline - time.monotonic()))
+     try:
+         parts = _revalidate.refresh_if_unchanged(scope, _refresh_annotation_locked)
+     except BaseException:
+diff --git a/tests/hermes_cli/test_kanban_annotation_disk.py b/tests/hermes_cli/test_kanban_annotation_disk.py
+index 5d4ee80895a..c4e1615aab1 100644
+--- a/tests/hermes_cli/test_kanban_annotation_disk.py
++++ b/tests/hermes_cli/test_kanban_annotation_disk.py
+@@ -148,3 +148,38 @@ def test_cold_poll_without_a_copy_still_waits_for_the_read(copy_on, monkeypatch)
+         first.join(5)
+     waiter.join(5)
+     assert got and got[0][0] == {"s1": 9}
++
++
++def test_uncontended_cold_read_past_budget_serves_the_copy(copy_on, monkeypatch):
++    """A fresh process's only poll (session-idle-check's collector) on an overloaded host: the read overruns the
++    budget with nobody else holding the lock. It used to mark every row unknown (t_01a19eee6379cea9)."""
++    assert disk.save(SCOPE, _parts({"s1": 7}))
++    saved_at = _load()[1]
++    release = threading.Event()
++    monkeypatch.setattr(ksa, "_REFRESH_WAIT_S", 0.2)
++    monkeypatch.setattr(ksa, "_read_annotation_parts", lambda: (release.wait(10), _parts({"s1": 9}))[1])
++    try:
++        rows = ksa.annotate_kanban_activity([{"id": "s1"}])
++        assert "kanban_unknown" not in rows[0]
++        assert rows[0]["kanban_active"] == 7
++        assert rows[0]["kanban_observed_at"] <= saved_at
++    finally:
++        release.set()
++    assert ksa._annotate_refresh_lock.acquire(timeout=5)
++    ksa._annotate_refresh_lock.release()
++    rows = ksa.annotate_kanban_activity([{"id": "s1"}])
++    assert rows[0]["kanban_active"] == 9
++
++
++def test_uncontended_cold_read_past_budget_without_a_copy_is_unknown(copy_on, monkeypatch):
++    release = threading.Event()
++    monkeypatch.setattr(ksa, "_REFRESH_WAIT_S", 0.2)
++    monkeypatch.setattr(ksa, "_read_annotation_parts", lambda: (release.wait(10), _parts({"s1": 9}))[1])
++    try:
++        rows = ksa.annotate_kanban_activity([{"id": "s1"}])
++        assert rows[0]["kanban_unknown"] is True
++        assert "kanban_active" not in rows[0]
++    finally:
++        release.set()
++    assert ksa._annotate_refresh_lock.acquire(timeout=5)
++    ksa._annotate_refresh_lock.release()
+-- 
+2.55.0
+

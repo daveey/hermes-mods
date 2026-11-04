@@ -1,0 +1,228 @@
+From 0f2574c6dd6ae5c3052f748a65ad583d40cdf596 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:13:10 +0000
+Subject: [PATCH] fix(kanban): bound reader lifecycle waits by caller budget
+ [daveey]
+
+---
+ hermes_cli/kanban_dispatch_owner.py           |  5 ++-
+ hermes_cli/kanban_generation.py               | 12 +++++++
+ hermes_cli/kanban_lockguard.py                | 27 +++++++-------
+ hermes_cli/kanban_reader_lifecycle.py         |  4 +--
+ .../test_kanban_lifecycle_serialization.py    | 35 +++++++++++++++++--
+ .../test_kanban_open_session_isolation.py     | 10 ++++--
+ 6 files changed, 71 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index be31c708224..c7d0ae9c392 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -16,7 +16,7 @@ def connect_with_identity(path, **kwargs):
+     dispatch: reopen after contention clears instead of trusting a pathname.
+     """
+     from hermes_cli.kanban_db_connect import _dispatch_tick_lock
+-    from hermes_cli.kanban_generation import lifecycle_lock, recover, remember
++    from hermes_cli.kanban_generation import lifecycle_access, recover, remember
+     from hermes_cli.sqlite_safe_read import connect_tracked, _tracking_factory
+ 
+     canonical = Path(path).resolve()
+@@ -25,8 +25,7 @@ def connect_with_identity(path, **kwargs):
+     # global lock; the first journal read may wait on an unrelated board writer.
+     kwargs["factory"] = _kanban_lockguard.lifecycle_factory(_kanban_lockguard.guarded_factory(
+         _tracking_factory(kwargs.get("factory", sqlite3.Connection))))
+-    lock = lifecycle_lock(canonical)
+-    with lock, _dispatch_tick_lock(canonical) as held:
++    with lifecycle_access(canonical, kwargs.get("timeout", 5.0)) as lock, _dispatch_tick_lock(canonical) as held:
+         recover(str(canonical))
+         conn = connect_tracked(str(canonical), **kwargs)
+         conn._hermes_lifecycle_lock = lock
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+index 3e9cba5140b..ac8566e357f 100644
+--- a/hermes_cli/kanban_generation.py
++++ b/hermes_cli/kanban_generation.py
+@@ -38,6 +38,18 @@ def lifecycle_lock(database):
+         return lock
+ 
+ 
++@contextmanager
++def lifecycle_access(database, timeout):
++    """A reader keeps its own busy budget even behind a long-timeout opener."""
++    lock = lifecycle_lock(database)
++    if not lock.acquire(timeout=max(0.0, float(timeout))):
++        raise sqlite3.OperationalError("database is locked: board lifecycle is busy")
++    try:
++        yield lock
++    finally:
++        lock.release()
++
++
+ class DeletedWalGenerationError(sqlite3.OperationalError):
+     """Retry after the remaining active handles leave the dead WAL generation."""
+ 
+diff --git a/hermes_cli/kanban_lockguard.py b/hermes_cli/kanban_lockguard.py
+index ea0056c5f1f..28f811fc233 100644
+--- a/hermes_cli/kanban_lockguard.py
++++ b/hermes_cli/kanban_lockguard.py
+@@ -55,23 +55,24 @@ def _release(conn: Any) -> None:
+         fin()  # runs hermes_state_lockguard.release(held) exactly once
+ 
+ 
+-class _LifecycleMixin:
+-    def close(self) -> None:
+-        # Must wrap BOTH tracking and guard close, even with an already-guarded
+-        # custom factory: no board-lock wait while holding the tracking lock.
+-        with getattr(self, "_hermes_lifecycle_lock", nullcontext()):
+-            super().close()
+-
+-
+ _lifecycle_factory_cache: dict[type, type] = {}
+ 
+ 
+ def lifecycle_factory(factory: type) -> type:
+-    if issubclass(factory, _LifecycleMixin):
++    # Inherited lifecycle support is not enough: a tracking wrapper may now
++    # precede it. Always put this method outside any newly composed wrappers.
++    if factory.__dict__.get("_hermes_outer_lifecycle", False):
+         return factory
+     cached = _lifecycle_factory_cache.get(factory)
+     if cached is None:
+-        cached = type(f"Lifecycle{factory.__name__}", (_LifecycleMixin, factory), {})
++        class LifecycleConnection(factory):
++            _hermes_outer_lifecycle = True
++
++            def close(self) -> None:
++                with getattr(self, "_hermes_lifecycle_lock", nullcontext()):
++                    super().close()
++
++        cached = LifecycleConnection
+         _lifecycle_factory_cache[factory] = cached
+     return cached
+ 
+@@ -171,9 +172,9 @@ def guard(conn: sqlite3.Connection) -> bool:
+ 
+ def connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+     """Drop-in ``sqlite3.connect`` for Kanban board files: same arguments, guarded result."""
+-    from hermes_cli.kanban_generation import lifecycle_lock, recover, remember
+-    lock = lifecycle_lock(database)
+-    with lock:
++    from hermes_cli.kanban_generation import lifecycle_access, recover, remember
++    timeout = args[0] if args else kwargs.get("timeout", 5.0)
++    with lifecycle_access(database, timeout) as lock:
+         recover(database)
+         kwargs["factory"] = lifecycle_factory(guarded_factory(kwargs.get("factory", sqlite3.Connection)))
+         conn = sqlite3.connect(database, *args, **kwargs)
+diff --git a/hermes_cli/kanban_reader_lifecycle.py b/hermes_cli/kanban_reader_lifecycle.py
+index b8bfd051010..f1c6bebf441 100644
+--- a/hermes_cli/kanban_reader_lifecycle.py
++++ b/hermes_cli/kanban_reader_lifecycle.py
+@@ -3,7 +3,7 @@ import os
+ import sqlite3
+ import threading
+ 
+-from hermes_cli.kanban_generation import DeletedWalGenerationError, lifecycle_lock
++from hermes_cli.kanban_generation import DeletedWalGenerationError, lifecycle_access
+ 
+ 
+ def cached_entry(path):
+@@ -13,7 +13,7 @@ def cached_entry(path):
+     key = str(path)
+     # Same-board opens/last closes are atomic; registry locks protect only map
+     # operations. Borrowers never wait for this board lock while holding the map.
+-    with lifecycle_lock(path):
++    with lifecycle_access(path, timeout=0.5):
+         activity._recover_generation(path)
+         try:
+             st = os.stat(path)
+diff --git a/tests/hermes_cli/test_kanban_lifecycle_serialization.py b/tests/hermes_cli/test_kanban_lifecycle_serialization.py
+index ba3a40638ef..070ed8920fa 100644
+--- a/tests/hermes_cli/test_kanban_lifecycle_serialization.py
++++ b/tests/hermes_cli/test_kanban_lifecycle_serialization.py
+@@ -48,13 +48,19 @@ def test_same_board_open_close_churn(tmp_path, mixed):
+     assert not has_live_connection(path)
+ 
+ 
+-def test_guarded_custom_factory_close_waits_outside_tracking_lock(tmp_path):
++@pytest.mark.parametrize("reused_factory", [False, True])
++def test_guarded_custom_factory_close_waits_outside_tracking_lock(tmp_path, reused_factory):
+     from hermes_cli.kanban_dispatch_owner import connect_with_identity
+     from hermes_cli.sqlite_safe_read import _live_lock
+ 
+     entered = threading.Event()
+     path = tmp_path / "board.db"
+-    conn = connect_with_identity(path, factory=guard.GuardedConnection, check_same_thread=False)
++    factory = guard.GuardedConnection
++    if reused_factory:
++        prototype = guard.connect(":memory:")
++        factory = type(prototype)
++        prototype.close()
++    conn = connect_with_identity(path, factory=factory, check_same_thread=False)
+ 
+     class ObservedLock:
+         def __enter__(self):
+@@ -76,3 +82,28 @@ def test_guarded_custom_factory_close_waits_outside_tracking_lock(tmp_path):
+             assert acquired, "close waits for a board while holding the global tracking lock"
+         pending.result(timeout=10)
+     assert not has_live_connection(path)
++
++
++@pytest.mark.parametrize("opener", ["native", "guarded", "cached"])
++def test_board_lock_wait_honors_reader_budget(tmp_path, opener):
++    from hermes_cli.kanban_dispatch_owner import connect_with_identity
++    from hermes_cli.kanban_generation import lifecycle_lock
++    from hermes_cli.kanban_session_activity import cached_ro
++
++    path = tmp_path / "board.db"
++    seed = sqlite3.connect(path)
++    seed.close()
++
++    def read():
++        if opener == "cached":
++            with cached_ro(path):
++                pass
++        else:
++            connect = connect_with_identity if opener == "native" else guard.connect
++            connect(path, timeout=0.1).close()
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        with lifecycle_lock(path):
++            pending = pool.submit(read)
++            with pytest.raises(sqlite3.OperationalError, match="lifecycle is busy"):
++                pending.result(timeout=3)
+diff --git a/tests/hermes_cli/test_kanban_open_session_isolation.py b/tests/hermes_cli/test_kanban_open_session_isolation.py
+index 4a6a625d515..2593ac1706a 100644
+--- a/tests/hermes_cli/test_kanban_open_session_isolation.py
++++ b/tests/hermes_cli/test_kanban_open_session_isolation.py
+@@ -14,8 +14,8 @@ import pytest
+ 
+ 
+ @pytest.mark.platforms("linux", "macos")
+-@pytest.mark.parametrize("http", [False, True])
+-def test_busy_board_open_does_not_block_session_poll(tmp_path, monkeypatch, http):
++@pytest.mark.parametrize("http,discover_board", [(False, False), (True, False), (True, True)])
++def test_busy_board_open_does_not_block_session_poll(tmp_path, monkeypatch, http, discover_board):
+     state_path = tmp_path / "state.db"
+     writer = SessionDB(db_path=state_path)
+     writer.create_session("poll-target", source="cli")
+@@ -31,6 +31,10 @@ def test_busy_board_open_does_not_block_session_poll(tmp_path, monkeypatch, http
+     client = TestClient(app)
+     assert client.get("/api/sessions/poll-target").status_code == 200
+     board_path = tmp_path / "board.db"
++    if discover_board:
++        from hermes_cli import kanban_session_activity as activity
++        activity._reset_cache_for_tests()
++        monkeypatch.setattr(activity, "_board_db_paths", lambda: [board_path])
+     blocker = sqlite3.connect(board_path)
+     blocker.execute("PRAGMA journal_mode=DELETE")
+     blocker.execute("CREATE TABLE marker(value)")
+@@ -58,6 +62,8 @@ def test_busy_board_open_does_not_block_session_poll(tmp_path, monkeypatch, http
+             response = client.get("/api/sessions/poll-target")
+             assert response.status_code == 200
+             assert response.json()["id"] == "poll-target"
++            if discover_board:
++                assert response.json()["kanban_unknown"] is True
+         else:
+             db = _open_session_db_at_path(state_path, read_only=True)
+             try:
+-- 
+2.55.0
+
