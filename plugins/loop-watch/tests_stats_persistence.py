@@ -92,7 +92,7 @@ def test_failed_sink_retry_has_stable_identity_and_hour():
 def test_real_process_shutdown_restart_and_hard_death(tmp_path):
     out = tmp_path / 'stats.jsonl'
     code = '''
-import importlib.util, sys, time
+import importlib.util, json, sys, time
 from pathlib import Path
 s = importlib.util.spec_from_file_location('rt', sys.argv[1])
 m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
@@ -101,7 +101,13 @@ t.start_stats(interval_s=.05)
 t._record_stats(m._Req(1, 'GET', '/probe', 0, None), 3, 100)
 if sys.argv[3] == 'graceful':
     sys.exit(0)
-while not Path(sys.argv[2]).exists() or not any('request_stats"' in line for line in Path(sys.argv[2]).read_text().splitlines()):
+while True:
+    try:
+        rows = [json.loads(x) for x in Path(sys.argv[2]).read_text().splitlines()]
+    except (OSError, ValueError):
+        rows = []
+    if any(r['kind'] == 'request_stats' for r in rows) and any(r['kind'] == 'request_stats_coverage' for r in rows):
+        break  # kill AFTER an acknowledged coverage boundary, not mid-batch
     time.sleep(.01)
 t._record_stats(m._Req(2, 'GET', '/probe', 0, None), .1, 100)
 print('ready', flush=True)
