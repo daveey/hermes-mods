@@ -1,0 +1,434 @@
+From fbacb56f0d5a38c6841beb0a2d98d7470bb250ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 10:34:37 +0000
+Subject: [PATCH] fix(agent): a Desktop terminal batch timeout stops the batch,
+ not the turn [daveey]
+
+Problem: in a Desktop session, a message with 2+ terminal calls is prepared as a
+batch. When one command passed the sequential deadline, the turn ended with no
+reply (self-heal plugin-9605e451d0: 10-27 11:17 PT, row 593750 "timed out after
+420.0s", then a hidden "[interrupt: no assistant output for this turn]"; David
+asked "why did you stop" 55 min later).
+
+Why: the prepared-call timeout branch in _run_sequential_tool_execution_middleware
+called agent.interrupt(tool_reason="terminal batch timeout") after
+prepared.batch.close(). close() already keeps later prepared commands from
+starting; the interrupt only added a turn abort, so the model never saw the
+timeout. Batch preparation timeouts had the same abort.
+Not caught: tests pinned the "terminal_batch_timeout" issuer label; none checked
+that the model still gets a turn after a tool timeout on the batch path.
+
+Fix: _TerminalBatch.stop(notice) records a stop notice and closes the batch. A
+command timeout and a preparation timeout call it instead of interrupting. The
+sequential loop reports every unstarted call with "[Not run: ... timed out]"
+and the turn goes on to the next model call, as it does outside a batch. User
+stops keep their attribution, message and redirect.
+
+Proof: tests/agent/test_terminal_batch_timeout_continues.py runs a real Desktop
+run_conversation with 3 terminal calls (2nd over a 3 s deadline): on main
+final_response=None, Turn ended reason=interrupted_by_system(terminal_batch_timeout);
+with the fix REPORTED, 2 model calls, the 3rd command never runs. Also covers the
+preparation timeout and stop() closing at once. Mutants: dropping the loop check,
+the prep stop, or stop()'s close each fail a test. 17 files / 370 tests pass.
+---
+ agent/terminal_approval_batch.py              |  41 ++++-
+ agent/tool_executor.py                        |  23 ++-
+ .../test_interrupt_issuer_attribution.py      |  40 +++--
+ .../test_terminal_batch_timeout_continues.py  | 152 ++++++++++++++++++
+ 4 files changed, 230 insertions(+), 26 deletions(-)
+ create mode 100644 tests/agent/test_terminal_batch_timeout_continues.py
+
+diff --git a/agent/terminal_approval_batch.py b/agent/terminal_approval_batch.py
+index a347abb01c6..5cc42a6a90a 100644
+--- a/agent/terminal_approval_batch.py
++++ b/agent/terminal_approval_batch.py
+@@ -108,6 +108,16 @@ class _TerminalBatch:
+         # describes the world its command will run in, so it must not be
+         # consumed — the guard re-runs live instead (#113158).
+         self.failure_seen = False
++        # Set when the batch stopped itself (a prepared command or the preparation timed out).
++        # The sequential loop then reports every unstarted call with this notice and the turn
++        # goes on: the model gets the error, as it does outside a batch. Aborting the turn here
++        # ended it with no reply at all (self-heal plugin-9605e451d0).
++        self.stop_notice: str | None = None
++
++    def stop(self, notice: str):
++        """Close the batch so no later prepared command starts; later calls get ``notice``."""
++        self.stop_notice = notice
++        self.close()
+ 
+     def start(self):
+         from agent.tool_executor import _resolve_sequential_tool_timeout
+@@ -189,6 +199,28 @@ def bind_prepared_dispatch(dispatch):
+     return once
+ 
+ 
++COMMAND_TIMEOUT_NOTICE = "[Not run: {name} was not started because an earlier terminal command in this batch timed out]"
++PREPARATION_TIMEOUT_NOTICE = "[Not run: {name} was not started because terminal approval preparation for this batch timed out]"
++
++
++def batch_stop_notice():
++    """The current batch's stop notice once it stopped itself, else None."""
++    batch = _batch.get()
++    return None if batch is None else batch.stop_notice
++
++
++def report_batch_stop(agent, messages, remaining, task_id):
++    """None while the current batch runs. Once it stopped itself, append one not-run row per
++    ``remaining`` call and return True (False when a flush failed: the caller stops the batch)."""
++    notice = batch_stop_notice()
++    if notice is None:
++        return None
++    from agent.tool_executor import _append_skipped_tool_results
++    agent._vprint(f"{agent.log_prefix}⏱ Terminal batch stopped: skipping {len(remaining)} call(s)", force=True)
++    return _append_skipped_tool_results(agent, messages, remaining, task_id, content=notice,
++                                        flush_stage="skipped tool result")
++
++
+ def take_prepared_call(call_id):
+     batch = _batch.get()
+     if batch is None:
+@@ -313,13 +345,14 @@ def terminal_approval_batch(agent, calls, messages, task_id):
+             try:
+                 batch.start()
+             except (_CancelledPreparation, TimeoutError) as exc:
+-                batch.close()
+                 # A cancellation means a stop is already published (or our own
+                 # close() ran): re-interrupting would overwrite the user's queued
+-                # message/redirect. A timeout is a system stop: tool_reason only, no
+-                # message (callers re-queue _interrupt_message as the user's next turn).
++                # message/redirect. A timeout stops only the batch, never the turn:
++                # every call is reported as not run and the model answers.
+                 if isinstance(exc, TimeoutError):
+-                    agent.interrupt(tool_reason="terminal batch preparation timeout")
++                    batch.stop(PREPARATION_TIMEOUT_NOTICE)
++                else:
++                    batch.close()
+                 # The sequential path must still persist a result for every
+                 # assistant tool call, even if preparation never finished.
+         yield
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index fd84fbe1cd9..7247971806c 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -984,15 +984,14 @@ def _run_sequential_tool_execution_middleware(
+             )
+         abandoned = True
+         if prepared is not None:
+-            # A timed-out shell may still be unwinding. Never release a later
+-            # prepared command into overlapping execution.
+-            prepared.batch.close()
++            # A timed-out shell may still be unwinding. Never release a later prepared command into
++            # overlapping execution. A timeout stops the batch, not the turn: the model still gets this
++            # result (an interrupt here ended the turn with no reply, self-heal plugin-9605e451d0).
+             if state == "timeout":
+-                # Label the abort as the batch guard's own, not a user stop (#130207). No message:
+-                # ``_interrupt_message`` is what gateway/CLI re-queue as the user's next turn. On the
+-                # interrupted branch the stop is already published; re-interrupting would rebook it
+-                # and null the user's queued message and redirect.
+-                agent.interrupt(tool_reason="terminal batch timeout")
++                from agent.terminal_approval_batch import COMMAND_TIMEOUT_NOTICE
++                prepared.batch.stop(COMMAND_TIMEOUT_NOTICE)
++            else:
++                prepared.batch.close()
+         future.cancel()
+         if state == "timeout":
+             _interrupt_worker_tids(agent, worker_tid)
+@@ -1902,6 +1901,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
+     owns turn-end work)."""
+     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
+     tool_calls = assistant_message.tool_calls
++    from agent.terminal_approval_batch import report_batch_stop
+ 
+     for i, tool_call in enumerate(tool_calls, 1):
+         if getattr(agent, "_incremental_persistence_failed", False):
+@@ -1919,6 +1919,13 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
+                 return
+             break
+ 
++        # A Desktop terminal batch that stopped itself (a timeout) reports its unstarted calls; the turn goes on.
++        stopped = report_batch_stop(agent, messages, tool_calls[i - 1:], effective_task_id)
++        if stopped is not None:
++            if not stopped:
++                return
++            break
++
+         pc = _parse_tool_call(agent, tool_call, flatten_probe=True)
+         ref = pc.ref(effective_task_id)
+         if pc.parse_error is not None:
+diff --git a/tests/agent/test_interrupt_issuer_attribution.py b/tests/agent/test_interrupt_issuer_attribution.py
+index ded9aaacd27..cb5ce09b25f 100644
+--- a/tests/agent/test_interrupt_issuer_attribution.py
++++ b/tests/agent/test_interrupt_issuer_attribution.py
+@@ -101,16 +101,23 @@ def test_gateway_lifecycle_producers_name_a_system_issuer():
+ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
+     """A system producer that must stop the turn SOFTLY labels itself via ``tool_reason``. The
+     message-carrying soft path used to hardcode ``user sent a new message``, so a batch-guard abort
+-    was booked as a human stop and rendered as the user-stop placeholder (#130207)."""
++    was booked as a human stop and rendered as the user-stop placeholder (#130207).
++
++    The Desktop terminal batch guard itself is no longer a turn-stop producer: a command or
++    preparation timeout stops only the batch, and the model still answers (self-heal
++    plugin-9605e451d0, tests/agent/test_terminal_batch_timeout_continues.py)."""
+     import concurrent.futures
+     from types import SimpleNamespace
+     from unittest.mock import patch
+ 
++    import agent.terminal_approval_batch as tab
+     import agent.tool_executor as te
+ 
+     agent = _bare_agent()
+     agent._touch_activity = lambda *_: None
+-    batch = SimpleNamespace(authorization_gate=te._ConcurrentToolAuthorizationGate(), executor=None, close=lambda: None)
++    stops = []
++    batch = SimpleNamespace(authorization_gate=te._ConcurrentToolAuthorizationGate(), executor=None,
++                            close=lambda: None, stop=stops.append)
+     prepared = SimpleNamespace(batch=batch, tids=[], future=concurrent.futures.Future())
+     try:
+         # Drive the REAL batch-timeout guard: a prepared terminal call whose worker never settles.
+@@ -122,9 +129,10 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
+             te._run_sequential_tool_execution_middleware(
+                 agent, function_name="terminal", function_args={}, effective_task_id="t",
+                 tool_call_id="c1", execute=lambda *_a, **_k: None)
+-        assert agent._interrupt_requested is True
+-        assert interrupt_issuer(agent) == "terminal_batch_timeout"
+-        # No message: gateway/CLI re-queue ``_interrupt_message`` as the user's next turn.
++        # The timeout stops the batch (later prepared commands never start), not the turn.
++        assert stops == [tab.COMMAND_TIMEOUT_NOTICE]
++        assert agent._interrupt_requested is False
++        assert interrupt_issuer(agent) is None
+         assert agent._interrupt_message is None
+ 
+         # A USER stop that abandons the same wedged batch (grace elapsed) keeps its own attribution:
+@@ -148,9 +156,7 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
+         assert agent._pending_redirect == "use the staging db"
+ 
+         # Desktop batch PREPARATION has the same two exits: a user stop that cancels it keeps the
+-        # user's message/redirect, and a preparation timeout is a system stop with no message.
+-        import agent.terminal_approval_batch as tab
+-
++        # user's message/redirect, and a preparation timeout stops only the batch.
+         def _prepare(exc, during=lambda: None):
+             class _Batch:
+                 def __init__(self, *_a):
+@@ -163,6 +169,9 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
+                 def close(self):
+                     pass
+ 
++                def stop(self, notice):
++                    stops.append(notice)
++
+             ids = iter(["p1", "p2"])
+ 
+             def _parse(*_a, **_k):
+@@ -190,8 +199,11 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
+         assert agent._pending_redirect == "use the staging db"
+         set_interrupt(False)
+         agent.clear_interrupt()
++        stops.clear()
+         _prepare(TimeoutError("Terminal approval preparation timed out; commands were not started"))
+-        assert interrupt_issuer(agent) == "terminal_batch_preparation_timeout"
++        assert stops == [tab.PREPARATION_TIMEOUT_NOTICE]
++        assert agent._interrupt_requested is False
++        assert interrupt_issuer(agent) is None
+         assert agent._interrupt_message is None
+ 
+         # Sequential skip notices (stop before a call / after one) render the recorded system reason.
+@@ -199,7 +211,7 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
+             return [SimpleNamespace(id=f"s{i}", function=SimpleNamespace(name=f"t{i}", arguments="{}")) for i in (1, 2)]
+ 
+         def _stop_mid_batch(*_a, **_k):
+-            agent.interrupt(tool_reason="terminal batch timeout")
++            agent.interrupt(tool_reason="cron inactivity watchdog")
+             return None, 0.0
+ 
+         agent._vprint, agent.log_prefix = (lambda *_a, **_k: None), ""
+@@ -207,7 +219,7 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
+             set_interrupt(False)
+             agent.clear_interrupt()
+             if stop_first:
+-                agent.interrupt(tool_reason="terminal batch timeout")
++                agent.interrupt(tool_reason="cron inactivity watchdog")
+             rows = []
+             with (
+                 patch.object(te, "_budget_for_agent"),
+@@ -218,15 +230,15 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
+                 patch.object(te, "_publish_sequential_result", return_value=True),
+             ):
+                 te._execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=_calls()), rows, "t", finalize=False)
+-            assert rows and all("Turn aborted — terminal batch timeout" in r["content"] for r in rows), rows
++            assert rows and all("Turn aborted — cron inactivity watchdog" in r["content"] for r in rows), rows
+             assert not any("User sent a new message" in r["content"] for r in rows)
+ 
+         # A slot no worker filled after a system stop says so, in both the row and the hook.
+         with patch.object(te, "_emit_terminal_post_tool_call") as emitted:
+             result, _, _ = te._unfinished_tool_result(
+                 agent, te._ToolCallRef("t3", {}, "t", "u1", []), timed_out=False, timeout_s=None)
+-        assert "Turn aborted — terminal batch timeout" in result
+-        assert emitted.call_args.kwargs["error_message"] == "Tool execution cancelled. Turn aborted — terminal batch timeout"
++        assert "Turn aborted — cron inactivity watchdog" in result
++        assert emitted.call_args.kwargs["error_message"] == "Tool execution cancelled. Turn aborted — cron inactivity watchdog"
+         # Rendered verbatim: consumers substitute ``{name}`` with str.replace, never str.format.
+         agent._tool_interrupt_reason = "guard {x}"
+         assert interrupt_skip_wording(agent) == "Turn aborted — guard {x}"
+diff --git a/tests/agent/test_terminal_batch_timeout_continues.py b/tests/agent/test_terminal_batch_timeout_continues.py
+new file mode 100644
+index 00000000000..4a0561ca598
+--- /dev/null
++++ b/tests/agent/test_terminal_batch_timeout_continues.py
+@@ -0,0 +1,152 @@
++"""A timed-out command in a Desktop terminal batch must not end the turn silently.
++
++Desktop prepares 2+ terminal calls from one assistant message as a batch. When one of them hit the
++sequential deadline, the batch guard used to ``agent.interrupt(tool_reason="terminal batch timeout")``:
++the turn ended with no assistant reply and the user had to ask "why did you stop" (self-heal
++plugin-9605e451d0). ``batch.close()`` already keeps later prepared commands from starting, so the
++model must still get the timeout result and its next call, like it does outside a batch. The
++preparation timeout had the same turn abort and gets the same contract.
++"""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import agent.terminal_approval_batch as tab
++import agent.tool_executor as te
++from gateway.session_context import clear_session_vars
++from run_agent import AIAgent
++from tools import approval
++
++
++def _agent():
++    from tools.file_tools import READ_FILE_SCHEMA
++    from tools.terminal_tool import TERMINAL_SCHEMA
++    with (
++        patch("model_tools.get_tool_definitions", return_value=[
++            {"type": "function", "function": schema} for schema in (TERMINAL_SCHEMA, READ_FILE_SCHEMA)
++        ]),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI"),
++        patch("agent.model_metadata.fetch_model_metadata", return_value={}),
++    ):
++        agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
++                        quiet_mode=True, skip_context_files=True, skip_memory=True, platform="desktop")
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.tool_delay = 0
++    agent.save_trajectories = False
++    return agent
++
++
++def _call(call_id, command):
++    return SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(
++        name="terminal", arguments=json.dumps({"command": command})))
++
++
++def _response(content=None, tool_calls=None):
++    msg = SimpleNamespace(content=content, tool_calls=tool_calls, reasoning_content=None, reasoning=None)
++    finish = "tool_calls" if tool_calls else "stop"
++    resp = SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=finish)], model="test/model")
++    resp.usage = None
++    return resp
++
++
++def _run_desktop_turn(tmp_path, monkeypatch, calls):
++    """One real Desktop turn: the model emits ``calls`` in one message, then replies REPORTED."""
++    from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
++    from tools.terminal_tool_lifecycle import cleanup_vm
++    from tui_gateway import server
++
++    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
++    monkeypatch.setenv("TERMINAL_ENV", "local")
++    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
++    # Policy approves every command, so the batch runs without a human answer.
++    monkeypatch.setattr("tools.approval_context._get_approval_mode", lambda: "off")
++    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *a, **kw: None)
++    monkeypatch.setattr(te, "_resolve_sequential_tool_timeout", lambda: 3.0)
++
++    key = "desktop-batch-timeout"
++    agent = _agent()
++    approval.register_gateway_notify(key, lambda _data: None)
++    monkeypatch.setattr(server, "_sessions", {key: {
++        "session_key": key, "source": "desktop", "agent": agent, "cwd": str(tmp_path),
++    }})
++    tokens = server._set_session_context(key)
++    agent.client.chat.completions.create.side_effect = [
++        _response(tool_calls=calls),
++        _response(content="REPORTED"),
++    ]
++    reset_scope = set_terminal_scope({"TERMINAL_ENV": "local", "TERMINAL_CWD": str(tmp_path)})
++    try:
++        with (
++            patch.object(agent, "_persist_session"),
++            patch.object(agent, "_save_trajectory"),
++            patch.object(agent, "_cleanup_task_resources"),
++        ):
++            result = agent.run_conversation("run the commands", task_id=key)
++    finally:
++        reset_terminal_scope(reset_scope)
++        approval.unregister_gateway_notify(key)
++        cleanup_vm(key)
++        clear_session_vars(tokens)
++        agent.clear_interrupt()
++    rows = {m["tool_call_id"]: m["content"] for m in result["messages"] if m.get("role") == "tool"}
++    return agent, result, rows
++
++
++def _assert_turn_replied(agent, result):
++    # The model gets its next call, whose text is the turn's reply (not a silent system stop).
++    assert result["final_response"] == "REPORTED"
++    assert agent.client.chat.completions.create.call_count == 2
++    assert not result.get("interrupted")
++    exit_reason = str(result.get("turn_exit_reason") or result.get("exit_reason") or "")
++    assert "terminal_batch" not in exit_reason
++
++
++def test_batch_timeout_reports_to_the_model_and_the_turn_replies(tmp_path, monkeypatch):
++    third_marker = tmp_path / "third-ran"
++    calls = [
++        _call("c1", "echo one"),
++        _call("c2", "sleep 30; echo two"),
++        _call("c3", f"touch '{third_marker}'"),
++    ]
++    agent, result, rows = _run_desktop_turn(tmp_path, monkeypatch, calls)
++
++    assert set(rows) == {"c1", "c2", "c3"}
++    assert "one" in rows["c1"]
++    assert "timed out after 3.0s" in rows["c2"]
++    _assert_turn_replied(agent, result)
++    # The later prepared command still never starts once an earlier one timed out.
++    assert not third_marker.exists()
++    assert rows["c3"] == tab.COMMAND_TIMEOUT_NOTICE.replace("{name}", "terminal")
++    assert "Turn aborted" not in rows["c3"]
++
++
++def test_stop_closes_the_batch_at_once():
++    """``stop`` withdraws the batch immediately (pending approvals, unreleased slots), not only
++    when the context manager exits after the sequential loop."""
++    batch = tab._TerminalBatch(SimpleNamespace(_interrupt_requested=False), [], "t", [object()])
++    batch.stop(tab.COMMAND_TIMEOUT_NOTICE)
++    assert batch.stop_notice == tab.COMMAND_TIMEOUT_NOTICE
++    assert batch.cancelled.is_set()
++    assert batch.slots[0].release.is_set()
++
++
++def test_preparation_timeout_reports_every_call_and_the_turn_replies(tmp_path, monkeypatch):
++    markers = [tmp_path / "first-ran", tmp_path / "second-ran"]
++    calls = [_call(f"p{i}", f"touch '{m}'") for i, m in enumerate(markers, 1)]
++
++    def _wedged_start(self):
++        raise TimeoutError("Terminal approval preparation timed out; commands were not started")
++
++    monkeypatch.setattr(tab._TerminalBatch, "start", _wedged_start)
++    agent, result, rows = _run_desktop_turn(tmp_path, monkeypatch, calls)
++
++    assert not any(m.exists() for m in markers)
++    notice = tab.PREPARATION_TIMEOUT_NOTICE.replace("{name}", "terminal")
++    assert rows == {"p1": notice, "p2": notice}
++    _assert_turn_replied(agent, result)
+-- 
+2.55.0
+

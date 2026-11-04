@@ -1,0 +1,211 @@
+From 703280de25f7755796f218388ef9a3c87583c72b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 09:40:00 +0000
+Subject: [PATCH] [daveey] Retry revision-fenced reserve after reused socket
+ disconnect
+
+---
+ hermes_cli/kanban_sync_client.py              | 14 +--
+ .../test_kanban_sync_hub_keepalive.py         | 97 +++++++++++++++++--
+ 2 files changed, 98 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 2a5f439a8b6..f0653c4c02d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -261,13 +261,13 @@ class Hub:
+                 raise TimeoutError("Board request budget exhausted")
+         return timeout
+ 
+-    def _call(self, method: str, path: str, body: Optional[dict] = None) -> dict:
++    def _call(self, method: str, path: str, body: Optional[dict] = None, *, replay_safe: bool = False) -> dict:
+         timeout = self._remaining()
+         data = None if body is None else json.dumps(body).encode()
+         parts = urllib.parse.urlsplit(self.ident.url)
+         if parts.scheme not in ("http", "https") or not parts.hostname or self._proxied(parts):
+             return self._call_urlopen(method, path, data, timeout)
+-        return self._call_kept_alive(parts, method, path, data, timeout)
++        return self._call_kept_alive(parts, method, path, data, timeout, replay_safe=replay_safe)
+ 
+     def _call_urlopen(self, method: str, path: str, data: Optional[bytes], timeout: Optional[float] = None) -> dict:
+         timeout = self._remaining(timeout)
+@@ -339,7 +339,7 @@ class Hub:
+         return conn, False
+ 
+     def _call_kept_alive(self, parts: urllib.parse.SplitResult, method: str, path: str, data: Optional[bytes],
+-                         timeout: Optional[float] = None) -> dict:
++                         timeout: Optional[float] = None, *, replay_safe: bool = False) -> dict:
+         import http.client
+         target = (parts.path or "") + path
+         headers = self._headers()
+@@ -356,9 +356,9 @@ class Hub:
+                 resp = conn.getresponse()
+             except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError) as exc:
+                 self._drop()
+-                # The server closed a reused socket without answering. Only an idempotent GET is resent: a POST
+-                # (ops, leases) may have been applied, so it fails like any transport error and the round retries.
+-                if reused and attempt == 0 and method == "GET":
++                # Only GET or an explicitly replay-safe operation may repeat after a lost answer.
++                # Reserve is revision-fenced; other POSTs (ops, leases) must not opt in.
++                if reused and attempt == 0 and (method == "GET" or replay_safe):
+                     continue
+                 raise urllib.error.URLError(exc) from exc
+             except (OSError, http.client.HTTPException) as exc:
+@@ -413,7 +413,7 @@ class Hub:
+         """Atomic Board placement; errors leave the persisted local queue fence intact."""
+         return self._call("POST", f"/v2/boards/{board}/placement/reserve", {
+             "task_id": task_id, "expected_revision": expected_revision,
+-            "policy": "worker-first-v1", "candidates": candidates})
++            "policy": "worker-first-v1", "candidates": candidates}, replay_safe=True)
+ 
+     def sessions(self, board: str, body: dict) -> dict:
+         """Session owners (session handover, :mod:`hermes_cli.session_owner`): ``get`` / ``move``. A 409 refusal
+diff --git a/tests/hermes_cli/test_kanban_sync_hub_keepalive.py b/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+index 13404b3a0b2..c5d4562b0c9 100644
+--- a/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
++++ b/tests/hermes_cli/test_kanban_sync_hub_keepalive.py
+@@ -26,6 +26,7 @@ class _Server(http.server.ThreadingHTTPServer):
+         self.requests: list[tuple[str, str]] = []
+         self.mode = "ok"  # ok | close | drop_post | status:<n> | bad_status
+         self.lock = threading.Lock()
++        self.dropped = threading.Event()
+         self.open_sockets: list[socket.socket] = []
+ 
+     def get_request(self):
+@@ -59,7 +60,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
+         with srv.lock:
+             srv.requests.append((self.command, self.path))
+         mode = srv.mode
+-        if mode == "drop_post" and self.command == "POST":
++        if mode in ("drop_post", "drop_once") and self.command == "POST":
++            if mode == "drop_once":
++                srv.mode = "ok"
++                srv.dropped.set()
+             self.close_connection = True
+             self.connection.shutdown(socket.SHUT_RDWR)
+             return
+@@ -131,7 +135,8 @@ def test_stale_socket_get_is_retried_once(server, monkeypatch):
+ 
+ 
+ @pytest.mark.parametrize("elapsed", [1.5, 2.1])
+-def test_get_resend_recomputes_remaining_budget(server, monkeypatch, elapsed):
++@pytest.mark.parametrize("reserve", [False, True])
++def test_get_resend_recomputes_remaining_budget(server, monkeypatch, elapsed, reserve):
+     """A real reused connection closes after spending part (or all) of the budget."""
+     from types import SimpleNamespace
+     clock = [100.0]
+@@ -140,27 +145,107 @@ def test_get_resend_recomputes_remaining_budget(server, monkeypatch, elapsed):
+     hub.machines()
+     hub.deadline = 102.0
+     original = _Handler._serve
++    method = "do_POST" if reserve else "do_GET"
++
++    def request():
++        return (hub.reserve("default", task_id="t_test", expected_revision=7, candidates=["worker-1"])
++                if reserve else hub.machines())
+ 
+     def close_once(handler):
+         clock[0] += elapsed
+-        monkeypatch.setattr(_Handler, "do_GET", original)
++        monkeypatch.setattr(_Handler, method, original)
+         handler.close_connection = True
+         handler.connection.shutdown(socket.SHUT_RDWR)
+ 
+-    monkeypatch.setattr(_Handler, "do_GET", close_once)
++    monkeypatch.setattr(_Handler, method, close_once)
+     try:
+         if elapsed > 2:
+             with pytest.raises(TimeoutError, match="budget exhausted"):
+-                hub.machines()
++                request()
+             assert server.connections == 1
+         else:
+-            assert hub.machines()["path"] == "/v2/machines"
++            expected_path = "/v2/boards/default/placement/reserve" if reserve else "/v2/machines"
++            assert request()["path"] == expected_path
+             assert hub._local.conn.sock.gettimeout() <= 0.5
+             assert server.connections == 2
+     finally:
+         hub.close()
+ 
+ 
++def test_stale_socket_reserve_is_retried_once(server, monkeypatch):
++    hub = _hub(server)
++    hub.machines()
++    monkeypatch.setattr(ksc, "_peer_closed", lambda conn: False)
++    # Half-close emits FIN but still accepts the request writes, deterministically
++    # exercising getresponse rather than the existing request-write retry.
++    server.mode = "drop_once"
++    send = hub._local.conn.request
++
++    def send_then_observe_drop(*args, **kwargs):
++        send(*args, **kwargs)
++        assert server.dropped.wait(2)  # first handler switches mode before the retry can arrive
++
++    monkeypatch.setattr(hub._local.conn, "request", send_then_observe_drop)
++    with server.lock:
++        for sock in server.open_sockets:
++            sock.shutdown(socket.SHUT_WR)
++    try:
++        result = hub.reserve("default", task_id="t_test", expected_revision=7, candidates=["worker-1"])
++        assert json.loads(result["body"])["expected_revision"] == 7
++        assert server.connections == 2
++        assert [m for m, _ in server.requests].count("POST") == 2
++    finally:
++        hub.close()
++
++
++@pytest.mark.parametrize("warm, expected", [(True, 2), (False, 1)])
++def test_reserve_lost_answer_retry_is_bounded(server, warm, expected):
++    hub = _hub(server)
++    if warm:
++        hub.machines()
++    server.mode = "drop_post"
++    try:
++        with pytest.raises(OSError):
++            hub.reserve("default", task_id="t_test", expected_revision=7, candidates=["worker-1"])
++        assert [m for m, _ in server.requests].count("POST") == expected
++        assert server.connections == expected
++    finally:
++        hub.close()
++
++
++def test_reserve_lost_answer_replays_identical_body(server, monkeypatch):
++    hub = _hub(server)
++    hub.machines()
++    bodies = []
++    original = _Handler.do_POST
++
++    def lose_once(handler):
++        bodies.append(handler.rfile.read(int(handler.headers["content-length"])))
++        monkeypatch.setattr(_Handler, "do_POST", original)
++        handler.close_connection = True
++        handler.connection.shutdown(socket.SHUT_RDWR)
++
++    monkeypatch.setattr(_Handler, "do_POST", lose_once)
++    try:
++        result = hub.reserve("default", task_id="t_test", expected_revision=7, candidates=["worker-1"])
++        assert bodies == [result["body"].encode()]
++        assert server.connections == 2
++    finally:
++        hub.close()
++
++
++def test_lease_whose_answer_is_lost_is_not_resent(server):
++    hub = _hub(server)
++    hub.machines()
++    server.mode = "drop_post"
++    try:
++        with pytest.raises(OSError):
++            hub.leases("default", {"op": "claim"})
++        assert [m for m, _ in server.requests].count("POST") == 1
++    finally:
++        hub.close()
++
++
+ def test_post_whose_answer_is_lost_is_not_resent(server):
+     hub = _hub(server)
+     hub.machines()
+-- 
+2.55.0
+

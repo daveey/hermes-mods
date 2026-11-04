@@ -1,0 +1,229 @@
+From 2afdcca36fbb0c56d4ee80674b1818cc58f175eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 08:59:11 +0000
+Subject: [PATCH] fix(gateway): bound ACP shutdown bookkeeping off the owner
+ loop [daveey]
+
+---
+ gateway/run_runtime.py                        | 11 +--
+ gateway/session_acp_lifecycle.py              | 48 ++++++++--
+ .../test_gateway_acp_session_end.py           |  8 ++
+ tests/gateway/test_acp_shutdown_budget.py     | 89 +++++++++++++++++++
+ 4 files changed, 142 insertions(+), 14 deletions(-)
+ create mode 100644 tests/gateway/test_acp_shutdown_budget.py
+
+diff --git a/gateway/run_runtime.py b/gateway/run_runtime.py
+index 556d73b33c4..58cc9b39541 100644
+--- a/gateway/run_runtime.py
++++ b/gateway/run_runtime.py
+@@ -774,15 +774,8 @@ async def settle_gateway_runtime(runner, budget=None, reason=None):
+                            getattr(authority, 'profile_id', '?'))
+     # Work settled above. ACP has no per-session destroy,
+     # so the stop is the end of every ACP session nobody is viewing (#118216).
+-    from gateway.session_acp_lifecycle import end_idle_acp_sessions
+-    for authority in _authorities(runner):
+-        try:
+-            end_idle_acp_sessions(authority)
+-        except Exception:
+-            # Best-effort bookkeeping: a store that cannot answer must not abort the stop sequence.
+-            import logging
+-            logging.getLogger(__name__).warning('ACP sessions of %s not ended at shutdown',
+-                                                getattr(authority, 'profile_id', '?'), exc_info=True)
++    from gateway.session_acp_lifecycle import settle_idle_acp_sessions
++    await settle_idle_acp_sessions(runner, authorities, deadline - asyncio.get_running_loop().time())
+     from gateway.run_api import stop_gateway_api
+     store = getattr(runner, 'session_ticket_store', None)
+     if store is not None:
+diff --git a/gateway/session_acp_lifecycle.py b/gateway/session_acp_lifecycle.py
+index 8d5d098db64..3e497a64285 100644
+--- a/gateway/session_acp_lifecycle.py
++++ b/gateway/session_acp_lifecycle.py
+@@ -64,9 +64,47 @@ async def reopen_if_reattached(authority, session_id, ended):
+     return ended
+ 
+ 
+-def end_idle_acp_sessions(authority):
+-    """Gateway shutdown: every ACP session nobody is viewing, attached this run or not."""
++def end_idle_acp_sessions(authority, deadline=None):
++    """Gateway shutdown sweep; stop starting more I/O after the monotonic deadline."""
++    import time
++    def expired():
++        return deadline is not None and time.monotonic() >= deadline
++    if expired():
++        return 0
+     with authority.db._read_ctx() as conn:
+-        ids = [row[0][len(POLICY_PREFIX):] for row in conn.execute(
+-            'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
+-    return sum(end_idle_acp_session(authority, sid) for sid in ids)
++        ids = []
++        for row in conn.execute('SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',)):
++            if expired():
++                return 0
++            ids.append(row[0][len(POLICY_PREFIX):])
++    ended = 0
++    for sid in ids:
++        if expired():
++            break
++        ended += end_idle_acp_session(authority, sid)
++    return ended
++
++
++async def settle_idle_acp_sessions(runner, authorities, remaining):
++    """One small aggregate budget, off-loop in the pool the shutdown DB-close gate joins.
++
++    Cancelling an await cannot stop SQLite. The gateway-owned physical worker remains visible
++    to executor quiesce, which leaves DB handles open if it is still reading/writing. Never use
++    the loop's default executor here: asyncio.run would wait for it again at process exit.
++    """
++    import asyncio
++    import time
++    deadline = time.monotonic() + min(2.0, max(0.0, remaining))
++    for authority in authorities:
++        left = deadline - time.monotonic()
++        if left <= 0:
++            break
++        try:
++            await asyncio.wait_for(runner._run_in_executor_with_context(
++                end_idle_acp_sessions, authority, deadline), timeout=left)
++        except TimeoutError:
++            logging.getLogger(__name__).warning('ACP shutdown bookkeeping budget exhausted; left for recovery')
++            break
++        except Exception:
++            logging.getLogger(__name__).warning('ACP sessions of %s not ended at shutdown',
++                                                getattr(authority, 'profile_id', '?'), exc_info=True)
+diff --git a/tests/acp_adapter/test_gateway_acp_session_end.py b/tests/acp_adapter/test_gateway_acp_session_end.py
+index d78408fef8b..6d5e3d64442 100644
+--- a/tests/acp_adapter/test_gateway_acp_session_end.py
++++ b/tests/acp_adapter/test_gateway_acp_session_end.py
+@@ -24,6 +24,9 @@ async def test_last_viewer_or_shutdown_ends_only_idle_acp_sessions(tmp_path, mon
+     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
+                              _cached_agent_for=lambda route: None)
++    # Exercise the same owned pool as production; the old duck runner had no executor.
++    runner._get_executor = lambda: run.GatewayRunner._get_executor(runner)
++    runner._run_in_executor_with_context = lambda fn, *args: run.GatewayRunner._run_in_executor_with_context(runner, fn, *args)
+     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
+     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
+     db = authority.db
+@@ -73,6 +76,7 @@ async def test_last_viewer_or_shutdown_ends_only_idle_acp_sessions(tmp_path, mon
+         assert ended(unseen_row) == (True, 'acp_disconnect')
+         assert ended(busy_row) == (False, None) and ended(gui_row) == (False, None)
+     finally:
++        run.GatewayRunner._shutdown_executor(runner, drain_timeout=2)
+         store.close_all_db_handles()
+ 
+ 
+@@ -101,6 +105,9 @@ async def test_acp_session_left_mid_turn_ends_once_its_fifo_drains(tmp_path, mon
+     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
+                              _cached_agent_for=lambda route: None)
++    # Exercise the same owned pool as production; the old duck runner had no executor.
++    runner._get_executor = lambda: run.GatewayRunner._get_executor(runner)
++    runner._run_in_executor_with_context = lambda fn, *args: run.GatewayRunner._run_in_executor_with_context(runner, fn, *args)
+     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
+     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
+     try:
+@@ -125,4 +132,5 @@ async def test_acp_session_left_mid_turn_ends_once_its_fifo_drains(tmp_path, mon
+         assert (acp_row['ended_at'] is not None, acp_row['end_reason']) == (True, 'acp_disconnect')
+         assert authority.db.get_session(rows['gui'][1])['ended_at'] is None, 'only ACP sessions end on idle'
+     finally:
++        run.GatewayRunner._shutdown_executor(runner, drain_timeout=2)
+         store.close_all_db_handles()
+diff --git a/tests/gateway/test_acp_shutdown_budget.py b/tests/gateway/test_acp_shutdown_budget.py
+new file mode 100644
+index 00000000000..df8b8160d2d
+--- /dev/null
++++ b/tests/gateway/test_acp_shutdown_budget.py
+@@ -0,0 +1,89 @@
++"""Shutdown bookkeeping cannot hold the owner loop or outlive its total budget."""
++import asyncio
++import threading
++import time
++from contextlib import contextmanager
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from gateway import run_runtime, session_acp_lifecycle as acp
++from gateway.run import GatewayRunner
++
++
++@pytest.mark.asyncio
++async def test_slow_receipt_does_not_block_settlement(monkeypatch):
++    release = threading.Event()
++    entered = threading.Event()
++    class DB:
++        @contextmanager
++        def _read_ctx(self):
++            yield self
++
++        def execute(self, *args):
++            return [(acp.POLICY_PREFIX + 'slow',)]
++
++    authority = SimpleNamespace(db=DB(), sessions={}, profile_id='test')
++    runner = object.__new__(GatewayRunner)
++    authority.runner = runner
++    runner.session_ticket_store = SimpleNamespace(revoke=Mock())
++    runner.session_api = None
++    monkeypatch.setattr(run_runtime, '_authorities', lambda r: [authority])
++    monkeypatch.setattr(run_runtime, 'stop_managed_turns', lambda *a: None)
++
++    def receipt(*args):
++        entered.set()
++        release.wait(5)  # fails safely on old code instead of wedging pytest
++        return {'policy': {'source': 'cli'}}
++
++    monkeypatch.setattr(acp, 'local_receipt', receipt)
++    started = time.monotonic()
++    try:
++        await run_runtime.settle_gateway_runtime(
++            runner, budget=run_runtime.STOP_TAIL_RESERVE_SECONDS + .1)
++        assert time.monotonic() - started < 2
++        assert entered.is_set()
++        runner.session_ticket_store.revoke.assert_called_once()
++        # Timeout of the observer must not disguise the physical DB reader/writer:
++        # the shutdown close gate consumes this count to leave SQLite open safely.
++        assert runner._shutdown_executor(drain_timeout=0) == 1
++    finally:
++        release.set()
++        runner._shutdown_executor(drain_timeout=2)
++
++
++def test_sweep_stops_before_next_receipt_after_deadline(monkeypatch):
++    authority = SimpleNamespace(db=Mock(), sessions={})
++    authority.db._read_ctx = Mock()
++    authority.db._read_ctx.return_value.__enter__ = Mock(return_value=Mock())
++    authority.db._read_ctx.return_value.__exit__ = Mock(return_value=False)
++    conn = authority.db._read_ctx.return_value.__enter__.return_value
++    conn.execute.return_value = [(acp.POLICY_PREFIX + 'one',), (acp.POLICY_PREFIX + 'two',)]
++    ended = Mock(return_value=True)
++    monkeypatch.setattr(acp, 'end_idle_acp_session', ended)
++    assert acp.end_idle_acp_sessions(authority, deadline=time.monotonic() - 1) == 0
++    ended.assert_not_called()
++    authority.db._read_ctx.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_budget_is_shared_by_profiles(monkeypatch):
++    clock = [100.0]
++    calls = []
++    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
++
++    async def execute(fn, authority, deadline):
++        calls.append((authority, deadline))
++        clock[0] += 1.5
++
++    runner = SimpleNamespace(_run_in_executor_with_context=execute)
++    await acp.settle_idle_acp_sessions(runner, ['one', 'two', 'three'], 30)
++    assert calls == [('one', 102.0), ('two', 102.0)]
++
++
++@pytest.mark.asyncio
++async def test_exhausted_settle_budget_skips_bookkeeping():
++    runner = SimpleNamespace(_run_in_executor_with_context=Mock())
++    await acp.settle_idle_acp_sessions(runner, ['one'], 0)
++    runner._run_in_executor_with_context.assert_not_called()
+-- 
+2.55.0
+
