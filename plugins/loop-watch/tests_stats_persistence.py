@@ -101,7 +101,7 @@ t.start_stats(interval_s=.05)
 t._record_stats(m._Req(1, 'GET', '/probe', 0, None), 3, 100)
 if sys.argv[3] == 'graceful':
     sys.exit(0)
-while not any('request_stats"' in line for line in Path(sys.argv[2]).read_text().splitlines()):
+while not Path(sys.argv[2]).exists() or not any('request_stats"' in line for line in Path(sys.argv[2]).read_text().splitlines()):
     time.sleep(.01)
 t._record_stats(m._Req(2, 'GET', '/probe', 0, None), .1, 100)
 print('ready', flush=True)
@@ -144,7 +144,9 @@ def test_timer_flushes_without_watcher_tick_and_lifespan_closes():
         asyncio.run(t.wrap(lifespan)({'type': 'lifespan'}, None, None))
         assert totals(rows) == (2, 1)
         assert rows[-1]['reason'] == 'shutdown'
+        flushed.clear()
         t._record_stats(req(), .1, 100)  # draining old app after teardown
+        assert flushed.wait(2)
         assert totals(rows) == (3, 1)
     finally:
         t.close_stats()
@@ -180,3 +182,72 @@ def test_default_sink_failure_is_not_silently_acknowledged(tmp_path, monkeypatch
     monkeypatch.setattr(rt.os, 'fsync', real)
     t.close_stats()
     assert totals([json.loads(x) for x in out.read_text().splitlines()]) == (1, 1)
+
+
+def test_blocked_sink_does_not_block_recorders_or_rollover():
+    entered, release, recorded = threading.Event(), threading.Event(), threading.Event()
+    rows = []
+    def sink(r):
+        entered.set()
+        assert release.wait(3)
+        rows.append(r)
+    t = rt.ReqTrace(sink=sink)
+    t._record_stats(req(), 3, 100)
+    worker = threading.Thread(target=t.flush_stats)
+    worker.start()
+    assert entered.wait(2)
+    def record():
+        t._record_stats(req(), .1, 101)
+        recorded.set()
+    recorder = threading.Thread(target=record)
+    recorder.start()
+    try:
+        assert recorded.wait(.2), 'request loop waited for sink I/O'
+    finally:
+        release.set()
+        worker.join(3)
+        recorder.join(3)
+    t.close_stats()
+    assert totals(rows) == (2, 1)
+
+
+def test_late_drain_waits_for_concurrent_closer_before_exit_check(monkeypatch):
+    rows = []
+    in_sink, release_sink = threading.Event(), threading.Event()
+    block = [False]
+    def sink(r):
+        if block[0]:
+            in_sink.set()
+            assert release_sink.wait(3)
+        rows.append(r)
+    t = rt.ReqTrace(sink=sink)
+    t.close_stats()
+    real_close = t.close_stats
+    drain_done, go_check = threading.Event(), threading.Event()
+    def close():
+        real_close()
+        if threading.current_thread().name == 'loop-watch-stats-drain':
+            drain_done.set()
+            assert go_check.wait(3)
+    monkeypatch.setattr(t, 'close_stats', close)
+    t._record_stats(req(), .1, 100)
+    assert drain_done.wait(2)
+    drain = t._stats_late_thread
+    t._record_stats(req(), .1, 100)
+    block[0] = True
+    closer = threading.Thread(target=real_close)
+    closer.start()
+    try:
+        assert in_sink.wait(2)
+        t._record_stats(req(), .1, 100)
+        go_check.set()
+        drain.join(.2)
+        assert drain.is_alive(), 'transient pending write mistaken for failed sink'
+    finally:
+        block[0] = False
+        release_sink.set()
+        go_check.set()
+        closer.join(3)
+        drain.join(3)
+    assert totals(rows) == (3, 0)
+    assert not t._stats

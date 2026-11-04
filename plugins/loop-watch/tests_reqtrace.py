@@ -222,12 +222,16 @@ def test_hourly_request_stats_count_every_request_past_the_report_cap():
         assert not [r for r in reps if r["kind"] == "request_stats"]
         hour[0] += 1
         finish("/api/status", 0.01)
+        # Production's dedicated flusher is woken on rollover; this manual tracer
+        # explicitly drives that boundary (never perform fsync on a request loop).
+        trace.flush_stats()
     finally:
         rt.time.time = orig_time
     slow_reports = [r for r in reps if r["kind"] == "slow_request"]
     assert len(slow_reports) == rt.MAX_REPORTS_PER_PATH_PER_HOUR
     stats = [r for r in reps if r["kind"] == "request_stats"]
-    assert len(stats) == 1
+    assert len(stats) == 2
+    assert stats[1]['paths']['/api/status']['n'] == 1
     s = stats[0]["paths"]["/api/sessions"]
     assert s["n"] == 100 and s["slow"] == 50
     assert s["p95_s"] == 3.0 and s["p50_s"] in (0.1, 3.0) and s["max_s"] == 3.0

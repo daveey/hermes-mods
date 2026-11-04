@@ -8,7 +8,8 @@ from tests_reqtrace import rt
 import pytest
 
 
-def test_late_installed_uvicorn_sigterm_flushes_tail(tmp_path):
+@pytest.mark.parametrize('wrapped_app', [False, True])
+def test_late_installed_uvicorn_sigterm_flushes_tail(tmp_path, wrapped_app):
     pytest.importorskip('uvicorn')  # optional host; production and local gate exercise it
     code = '''
 import asyncio, importlib.util, os, signal, sys, threading
@@ -18,7 +19,12 @@ import uvicorn
 s = importlib.util.spec_from_file_location('rt', sys.argv[1])
 m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 app = Starlette()
-server = uvicorn.Server(uvicorn.Config(app, host='127.0.0.1', port=0, log_level='error'))
+def wrap(app):
+    async def wrapped(scope, receive, send):
+        return await app(scope, receive, send)
+    return wrapped
+served = wrap(app) if sys.argv[3] == 'True' else app
+server = uvicorn.Server(uvicorn.Config(served, host='127.0.0.1', port=0, log_level='error'))
 async def install_late():
     while not server.started:
         await asyncio.sleep(.01)
@@ -33,7 +39,7 @@ async def run():
 asyncio.run(run())
 '''
     out = tmp_path / 'stats.jsonl'
-    result = subprocess.run([sys.executable, '-c', code, str(rt.__file__), str(out)], timeout=15)
+    result = subprocess.run([sys.executable, '-c', code, str(rt.__file__), str(out), str(wrapped_app)], timeout=15)
     assert result.returncode in (0, -15)
     rows = [json.loads(x) for x in out.read_text().splitlines()]
     assert sum(r['paths']['/probe']['n'] for r in rows if r['kind'] == 'request_stats') == 1
@@ -65,3 +71,11 @@ def test_server_shutdown_preserves_other_servers_arguments_and_errors(monkeypatc
         asyncio.run(wrapped(owner, fail=True))
     assert closed == [True]
     assert calls == [(('arg',), {'sockets': []}), ((), {'fail': True})]
+    gateway = SimpleNamespace(config=SimpleNamespace(app=SimpleNamespace(web=SimpleNamespace(app=app))))
+    assert asyncio.run(wrapped(gateway)) == 42
+    assert closed == [True, True]
+    for inner in (SimpleNamespace(app=app), SimpleNamespace(__wrapped__=app)):
+        assert rt._server_trace(inner) is trace
+    cycle = SimpleNamespace()
+    cycle.app = cycle
+    assert rt._server_trace(cycle) is None

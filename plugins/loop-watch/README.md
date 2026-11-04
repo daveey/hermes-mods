@@ -9,11 +9,14 @@ Production installation starts one independent `loop-watch-stats` daemon per
 installed tracer. It flushes every **5 seconds**, even with no requests or a
 stalled asyncio loop. Hour changes also flush. ASGI lifespan exit, watcher exit,
 and Python `atexit` flush the tail. Uvicorn's `Server.shutdown` is wrapped once,
-closing only the tracer on that server's `config.app` after the original drained
-shutdown. This covers late installation after lifespan has started and Uvicorn's
-SIGTERM re-raise (which bypasses `atexit`); unrelated servers are unaffected.
-A request draining after shutdown flushes
-immediately. Repeated flush/close calls do not recount requests.
+closing the tracer on that server's `config.app` after the original drained
+shutdown. Bounded traversal resolves `.app`, `__wrapped__`, the gateway mount's
+`.web.app`, and a function closure's named `app` cell. This covers late
+installation after lifespan has started and Uvicorn's SIGTERM re-raise (which
+bypasses `atexit`); unrelated servers are unaffected. A request draining after
+shutdown schedules an independent flush. Repeated flush/close calls do not
+recount requests. Recording only takes a short data lock: serialization, sink
+writes and fsync hold a separate flush lock, never the request's data lock.
 
 `request_stats` retains `hour`, `pid`, `slow_s` and `paths`. New fields:
 
@@ -22,7 +25,7 @@ immediately. Repeated flush/close calls do not recount requests.
 - `record_id`: producer plus increasing sequence. **Deduplicate this ID** before
   aggregating. An ambiguous sink failure retries the identical record/ID.
 - `hour_epoch`: UTC hour start in Unix seconds. `hour` is now UTC, not local time.
-- `reason`: periodic/manual/shutdown (hour rollover uses manual).
+- `reason`: periodic/manual/shutdown/start (hour rollover wakes the periodic worker).
 - Each path keeps exact `n`, `slow`, `max_s`, `max_inflight`. Every bounded path
   counter is emitted; the old top-40 output cap no longer discards counts.
 - `p50_s`, `p95_s` describe the **first at most 5000 durations in this delta**;
@@ -70,8 +73,9 @@ current **5-second interval plus scheduling/write time** since the last receipt;
 this is a time bound, not a bound on request count. GIL starvation, suspend,
 stalled I/O, SIGKILL, `os._exit`, disk failure or a partial JSON append can exceed
 that bound or leave an unknown tail. No unconditional real-time or power-loss
-claim is made. Failed writes retain one immutable pending record plus at most two
-buffered hour buckets; further hour eviction increments `dropped_requests`,
+claim is made. Failed writes retain one immutable pending batch (up to two hour
+records and one coverage receipt) plus at most two buffered hour buckets; further
+hour eviction increments `dropped_requests`,
 invalidating complete-window acceptance. A death during a storage outage cannot
 report that loss retrospectively. Do not infer full coverage from counters alone.
 

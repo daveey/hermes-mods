@@ -127,7 +127,11 @@ class ReqTrace:
         self._stats_hour = 0
         self._stats: Dict[int, dict] = {}
         self._stats_lock = threading.RLock()
+        self._stats_flush_lock = threading.RLock()
         self._stats_pending = None
+        self._stats_queue = []
+        self._stats_wake = threading.Event()
+        self._stats_late_thread = None
         self._stats_id = uuid.uuid4().hex
         self._stats_seq = itertools.count(1)
         self._stats_since = time.time()
@@ -179,7 +183,8 @@ class ReqTrace:
     def _record_stats(self, req: _Req, total: float, hour: int) -> None:
         with self._stats_lock:
             if self._stats_hour != hour:
-                self.flush_stats()
+                if self._stats_hour:
+                    self._stats_wake.set()  # no disk I/O on the request thread
                 self._stats_hour = hour
             # Bound memory even across a prolonged sink outage. A loss is explicit
             # in the next coverage receipt, never silently called complete coverage.
@@ -206,30 +211,44 @@ class ReqTrace:
                 q = req.query
                 if q in st["slow_queries"] or len(st["slow_queries"]) < STATS_MAX_QUERIES:
                     st["slow_queries"][q] += 1
-            if self._stats_closed:
-                # An old app can still drain a request after lifespan teardown.
-                self._stats_closed = False
+            self._stats_closed = False
+            if self._stats_stop.is_set() and self._stats_late_thread is None:
+                # Late completions never perform storage I/O on the request loop.
                 atexit.register(self.close_stats)
-                self.close_stats()
+                def drain():
+                    while True:
+                        self.close_stats()
+                        with self._stats_flush_lock, self._stats_lock:
+                            if not self._stats or self._stats_pending is not None:
+                                self._stats_late_thread = None
+                                return
+                self._stats_late_thread = threading.Thread(target=drain, name='loop-watch-stats-drain', daemon=True)
+                self._stats_late_thread.start()
 
     def _stats_record(self, kind: str, **fields) -> dict:
         return dict(kind=kind, schema=2, record_id=f'{self._stats_id}:{next(self._stats_seq)}',
                     producer_id=self._stats_id, pid=os.getpid(), **fields)
 
-    def flush_stats(self, *, reason: str = "manual", coverage: bool = False) -> None:
-        """Emit disjoint deltas; retry an ambiguous write with the SAME record_id.
+    def _send_stats_queue(self) -> None:
+        # Only the flush lock is held across sink I/O, never the recorder lock.
+        while self._stats_pending is not None or self._stats_queue:
+            if self._stats_pending is None:
+                self._stats_pending = self._stats_queue.pop(0)
+            self.sink(self._stats_pending)
+            self._stats_pending = None
 
-        The lock covers record construction, sink acknowledgement and reset, so a
-        recorder cannot change a pending delta and concurrent flushes cannot repeat it.
-        """
-        with self._stats_lock:
+    def flush_stats(self, *, reason: str = "manual", coverage: bool = False) -> None:
+        """Atomically detach a bounded batch; acknowledge it outside the data lock."""
+        with self._stats_flush_lock:
             try:
-                if self._stats_pending is not None:
-                    self.sink(self._stats_pending)
-                    self._stats_pending = None
-                while self._stats:
-                    hour = min(self._stats)
-                    stats = self._stats.pop(hour)
+                self._send_stats_queue()
+                with self._stats_lock:
+                    batches, self._stats = self._stats, {}
+                    wall, mono = time.time(), time.monotonic()
+                    dropped = self._stats_dropped
+                    if coverage:
+                        self._stats_dropped = 0
+                for hour, stats in sorted(batches.items()):
                     paths = {}
                     for key, st in stats.items():
                         durs = sorted(st['durs'])
@@ -240,22 +259,17 @@ class ReqTrace:
                                           max_inflight=st['max_inflight'],
                                           queries=[[q, n] for q, n in st['queries'].most_common(8)],
                                           slow_queries=[[q, n] for q, n in st['slow_queries'].most_common(8)])
-                    self._stats_pending = self._stats_record(
+                    self._stats_queue.append(self._stats_record(
                         'request_stats', hour=time.strftime('%Y-%m-%dT%H', time.gmtime(hour * 3600)),
                         hour_epoch=hour * 3600, slow_s=self.slow_s, paths=paths,
-                        semantics='delta', reason=reason)
-                    self.sink(self._stats_pending)
-                    self._stats_pending = None
+                        semantics='delta', reason=reason))
                 if coverage:
-                    wall, mono = time.time(), time.monotonic()
-                    self._stats_pending = self._stats_record(
+                    self._stats_queue.append(self._stats_record(
                         'request_stats_coverage', since=self._stats_since, through=wall,
                         elapsed_s=mono - self._stats_mono, interval_s=self._stats_interval,
-                        dropped_requests=self._stats_dropped, reason=reason)
-                    self.sink(self._stats_pending)
-                    self._stats_pending = None
+                        dropped_requests=dropped, reason=reason))
                     self._stats_since, self._stats_mono = wall, mono
-                    self._stats_dropped = 0
+                self._send_stats_queue()
             except Exception as exc:  # noqa: BLE001
                 log.warning('loop-watch request-stats sink failed: %s', exc)
 
@@ -265,12 +279,17 @@ class ReqTrace:
             if self._stats_thread is not None or self._stats_closed:
                 return
             self._stats_interval = max(.01, float(interval_s))
-            self.flush_stats(reason='start', coverage=True)
             atexit.register(self.close_stats)
 
             def run():
-                while not self._stats_stop.wait(self._stats_interval):
-                    with self._stats_lock:
+                with self._stats_flush_lock:
+                    if self._stats_stop.is_set():
+                        return
+                    self.flush_stats(reason='start', coverage=True)
+                while not self._stats_stop.is_set():
+                    self._stats_wake.wait(self._stats_interval)
+                    self._stats_wake.clear()
+                    with self._stats_flush_lock:
                         if self._stats_stop.is_set():
                             return
                         self.flush_stats(reason='periodic', coverage=True)
@@ -279,14 +298,17 @@ class ReqTrace:
 
     def close_stats(self) -> None:
         self._stats_stop.set()
-        with self._stats_lock:
-            if self._stats_closed:
-                return
+        self._stats_wake.set()
+        with self._stats_flush_lock:
+            with self._stats_lock:
+                if self._stats_closed:
+                    return
             self.flush_stats(reason='shutdown', coverage=True)
-            # Retry on a later atexit call if the final sink failed.
-            self._stats_closed = self._stats_pending is None and not self._stats
-            if self._stats_closed:
-                atexit.unregister(self.close_stats)
+            with self._stats_lock:
+                # Retry at atexit on sink failure; late requests have their own drain.
+                self._stats_closed = self._stats_pending is None and not self._stats_queue and not self._stats
+                if self._stats_closed:
+                    atexit.unregister(self.close_stats)
 
     def _finish(self, req: _Req) -> None:
         end = req.resp_at if req.resp_at is not None else self.clock()
@@ -463,6 +485,36 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
     return sink
 
 
+def _server_trace(app):
+    """Follow conventional ASGI wrappers, including a closure's named app cell.
+
+    Do not inspect arbitrary closure state or globally flush unrelated servers.
+    Bounds and cycle detection keep foreign wrappers from trapping shutdown.
+    """
+    seen = set()
+    for _ in range(16):
+        if app is None or id(app) in seen:
+            return None
+        seen.add(id(app))
+        owner = getattr(app, '__loop_watch_stats_trace__', None)
+        if owner is not None:
+            return owner
+        inner = (getattr(app, 'app', None) or getattr(app, '__wrapped__', None)
+                 or getattr(getattr(app, 'web', None), 'app', None))
+        code = getattr(app, '__code__', None)
+        cells = getattr(app, '__closure__', None)
+        if inner is None and code is not None and cells:
+            for name, cell in zip(code.co_freevars, cells):
+                if name == 'app':
+                    try:
+                        inner = cell.cell_contents
+                    except ValueError:
+                        pass  # empty closure cell
+                    break
+        app = inner
+    return None
+
+
 def _install_server_shutdown(app, trace: ReqTrace) -> None:
     """Uvicorn re-raises SIGTERM after lifespan, before Python atexit can run.
 
@@ -484,7 +536,7 @@ def _install_server_shutdown(app, trace: ReqTrace) -> None:
         try:
             return await original(self, *args, **kwargs)
         finally:
-            owner = getattr(self.config.app, '__loop_watch_stats_trace__', None)
+            owner = _server_trace(self.config.app)
             if owner is not None:
                 owner.close_stats()
     shutdown.__loop_watch_stats_shutdown__ = True
