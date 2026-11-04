@@ -102,7 +102,7 @@ glance:
 
 | Marker | State | Title says |
 |---|---|---|
-| `▶` | running: a turn or a known background agent is working | on what, e.g. `▶ CoMax assistants (fixing desk 403)` |
+| `▶` | running: a turn or a known background agent is working | on what, e.g. `▶ Support assistants (fixing desk 403)` |
 | `⏳` | waiting on something other than the user | the thing: PR/CI run, merge queue, deploy, another session, a schedule |
 | `🔴` | needs the user | the decision in a few words, e.g. `🔴 Sleep framework (needs you: review #144)` |
 | `✅` | done but archive was refused | `✅ done (archive me)` |
