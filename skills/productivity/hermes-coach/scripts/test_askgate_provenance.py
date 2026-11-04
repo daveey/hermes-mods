@@ -175,6 +175,10 @@ class InboxDoit(unittest.TestCase):
         self.assertEqual([h['t'] for h in hits], [200])
         self.assertEqual([d['t'] for d in doit], [100])
 
+    def test_omitted_turns_placeholder_does_not_crash(self):  # session_digest writes {"t": None} for it
+        hits, _, _ = self._collect([{'t': None, 'text': '…[3 turns omitted]'}, {'t': 100, 'text': 'root cause it'}])
+        self.assertEqual([h['t'] for h in hits], [100])
+
     def test_plain_proposal_without_inbox_prev_still_classified(self):  # (c) no Inbox notice before it
         for prev in (None, '', 'Here is what I found. **Proposed:** ' + self.PROPOSAL):
             with self.subTest(prev=prev):

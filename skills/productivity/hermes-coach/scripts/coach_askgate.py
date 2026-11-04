@@ -305,7 +305,7 @@ def collect(data, since_ts, until_ts, doit=None):
         first = clean((turns[0].get("text") if turns and isinstance(turns[0], dict) else "") or "")
         probe = bool(PROBE.match(first))
         for i, u in enumerate(turns):
-            t, text = u.get("t", 0), clean(u.get("text") or "")
+            t, text = u.get("t") or 0, clean(u.get("text") or "")  # "…[N turns omitted]" rows carry t: None
             if not (since_ts <= t < until_ts) or not text or generated(text) or SKIP.match(text):
                 continue
             # Provenance: the digest's `inbox_doit` flag (the Inbox store says Do it sent this prompt; the only proof
