@@ -58,6 +58,15 @@ class PreCommitHook(unittest.TestCase):
     def git(self, *args):
         subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True, env=self.env())
 
+    def git_out(self, *args):
+        return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True, text=True,
+                              env=self.env()).stdout
+
+    def commit_base(self, name, text):
+        (self.repo / name).write_text(text)
+        self.git("add", name)
+        self.git("commit", "-q", "-m", "base")
+
     def stage(self, text):
         (self.repo / "f.txt").write_text(text)
         self.git("add", "f.txt")
@@ -126,6 +135,100 @@ class PreCommitHook(unittest.TestCase):
         r = self.run_hook(HERMES_MODS_DENYLIST=str(deny))
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn(str(deny), r.stderr)
+
+    # The denylist scan must see every line a commit adds, whatever shape the staged diff takes.
+    BODY = "".join(f"line {i} of a file long enough to stay a rename after one more line\n" for i in range(20))
+
+    def test_denylist_scans_lines_added_in_a_renamed_file(self):
+        """A rename+edit is an R entry, which `--diff-filter=AM` dropped whole: 21c46445 renamed a skill and added
+        a denylisted word in the same commit, and the hook let it into the public tree."""
+        self.fake_gitleaks()
+        self.hub_denylist()
+        self.commit_base("old.md", self.BODY)
+        self.git("mv", "old.md", "new.md")
+        (self.repo / "new.md").write_text(self.BODY + f"e.g. {WORD} assistants\n")
+        self.git("add", "new.md")
+        self.assertTrue(self.git_out("diff", "--cached", "--name-status").startswith("R"),
+                        "fixture is not a rename, so it would not exercise the rename path")
+        r = self.run_hook()
+        self.assertEqual(r.returncode, 1, f"a rename+edit slipped past the denylist:\n{r.stderr}")
+        self.assertIn("match the private denylist", r.stderr)
+
+    def test_clean_rename_passes(self):
+        self.fake_gitleaks()
+        self.hub_denylist()
+        self.commit_base("old.md", self.BODY)
+        self.git("mv", "old.md", "new.md")
+        r = self.run_hook()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_pure_rename_rescans_the_file_it_republishes(self):
+        """A file that already leaks (committed before a pattern joined the list, or past an older hook) is
+        refused when it moves, so the move scrubs it instead of republishing it under a new path."""
+        self.fake_gitleaks()
+        self.commit_base("old.md", self.BODY + f"e.g. {WORD} assistants\n")
+        self.hub_denylist()
+        self.git("mv", "old.md", "new.md")
+        self.assertTrue(self.git_out("diff", "--cached", "--name-status").startswith("R100"),
+                        "fixture is not a pure rename")
+        r = self.run_hook()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("match the private denylist", r.stderr)
+
+    def test_denylist_scans_a_new_files_path(self):
+        self.fake_gitleaks()
+        self.hub_denylist()
+        (self.repo / f"{WORD}-notes.md").write_text("hello\n")
+        self.git("add", f"{WORD}-notes.md")
+        r = self.run_hook()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("match the private denylist", r.stderr)
+
+    def test_denylist_scans_a_symlink_replaced_by_a_file(self):
+        """A type change (T) was dropped by `--diff-filter=AM` too."""
+        self.fake_gitleaks()
+        self.hub_denylist()
+        self.commit_base("target.md", "hello\n")
+        (self.repo / "link.md").symlink_to("target.md")
+        self.git("add", "link.md")
+        self.git("commit", "-q", "-m", "link")
+        (self.repo / "link.md").unlink()
+        (self.repo / "link.md").write_text(f"{WORD}\n")
+        self.git("add", "link.md")
+        self.assertTrue(self.git_out("diff", "--cached", "--name-status").startswith("T"),
+                        "fixture is not a type change")
+        r = self.run_hook()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("match the private denylist", r.stderr)
+
+    def test_denylist_scans_an_added_line_that_starts_with_plus_plus(self):
+        """`grep -v '^+++'`, meant for the `+++ b/<path>` header, also dropped added lines that start with `++`."""
+        self.fake_gitleaks()
+        self.hub_denylist()
+        self.stage(f"++ {WORD}\n")
+        r = self.run_hook()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("match the private denylist", r.stderr)
+
+    def test_denylist_scan_ignores_color_config(self):
+        """With color.diff=always every diff line starts with an escape code, so `grep '^+'` matched nothing."""
+        self.fake_gitleaks()
+        self.hub_denylist()
+        self.git("config", "color.diff", "always")
+        self.stage(f"{WORD}\n")
+        r = self.run_hook()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("match the private denylist", r.stderr)
+
+    def test_denylist_scan_ignores_an_external_diff_driver(self):
+        """A configured diff.external replaces git's patch output, so the scan read whatever that tool printed."""
+        self.fake_gitleaks()
+        self.hub_denylist()
+        self.git("config", "diff.external", shutil.which("true"))
+        self.stage(f"{WORD}\n")
+        r = self.run_hook()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("match the private denylist", r.stderr)
 
     def test_explicit_override_passes_loudly(self):
         self.stage("hello\n")
