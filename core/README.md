@@ -17,7 +17,7 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 
-1979 patches, one entry per non-merge source commit through `af81aae2d90e2df708f9b4e725e740bcdc4d385e`.
+1988 patches, one entry per non-merge source commit through `4e97608f339eeac5d4efb57d1f39ca7fdd0ef5ef`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -25,12 +25,20 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip and current merge-base: `71736c9f32597bbca9d89cede5aa136e55946b2f`.
-Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. The sixteen bridges from the 1932 pass remain unchanged; one reviewed source-space upstream integration bridge is added before 1975. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay.
-Current replay: [mirror-replay-1979.json](mirror-replay-1979.json) (seventeen hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-1979.json](mirror-policy-1979.json). Executed checks: [mirror-1979-verification.md](mirror-1979-verification.md); previous snapshots: [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
+Upstream exclusion tip: `d8c79e4b6b8c63e6c40167ff95ec28e7b1fee189`; current merge-base: `ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df`.
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. The seventeen bridges from the 1979 pass remain unchanged; one normalized first-parent upstream integration bridge is added before 1983. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay.
+Current replay: [mirror-replay-1988.json](mirror-replay-1988.json) (eighteen hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-1988.json](mirror-policy-1988.json). Executed checks: [mirror-1988-verification.md](mirror-1988-verification.md); previous snapshots: [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1980–1988
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Runtime recovery, resource waits and test follow-ups](mirror-1988-features.md) | 1980–1984, 1986–1988 | Probe timeouts, stable clocks, lock ownership, recovery admission, resource waits, CF Access and owner storage refusals. |
+| [Exact named-profile multiplexer homes](exact-profile-multiplexer-homes.md) | 1985 | Nested custom homes remain standalone; exact named profiles still multiplex. |
+| [1988-entry mirror verification](mirror-1988-verification.md) | verification report | Full inventory, eighteen bridges and normalized tree equivalence. |
 
 ## Mirror follow-ups 1933–1979
 
@@ -1086,16 +1094,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **1979-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply seventeen bridges and three ancestry-only markers from `mirror-replay-1979.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **1988-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply eighteen bridges and three ancestry-only markers from `mirror-replay-1988.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip af81aae2d90e2df708f9b4e725e740bcdc4d385e \
-  --base 71736c9f32597bbca9d89cede5aa136e55946b2f \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-1979.json" \
-  --replay-plan "$MODS/core/mirror-replay-1979.json"
+  --source-tip 4e97608f339eeac5d4efb57d1f39ca7fdd0ef5ef \
+  --base d8c79e4b6b8c63e6c40167ff95ec28e7b1fee189 \
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-1988.json" \
+  --replay-plan "$MODS/core/mirror-replay-1988.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1155,7 +1163,10 @@ git commit -m 'Explicit upstream merge bridge before 1922'
 git am -3 --empty=keep "${patches[@]:1921:53}"
 git apply --index --3way "$MODS/core/bridges/upstream-through-c79ab4146a8.diff"
 git commit -m 'Explicit upstream integration bridge before 1975'
-git am -3 --empty=keep "${patches[@]:1974:5}"
+git am -3 --empty=keep "${patches[@]:1974:8}"
+git apply --index --3way "$MODS/core/bridges/upstream-through-41f4b65b573.diff"
+git commit -m 'Explicit upstream integration bridge before 1983'
+git am -3 --empty=keep "${patches[@]:1982:6}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

@@ -1,0 +1,303 @@
+From a9347a785aa5d2ed44b863a242f8bb86d7d88949 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 05:21:12 +0000
+Subject: [PATCH] [daveey] Requeue bound mid-turn owner storage refusals
+ without charging card failures
+
+Why: admitted exit-1 WorkerPersistenceError storage_unavailable receipts fell
+through the owner-unavailable exit-kind gate and spent the card crash budget.
+The earlier host-refusal coverage exercised startup/pre-admission only.
+
+Recognize only the newest exact run/claim bound-interpreter result with the
+complete managed worker exception envelope and exit 1. Keep local persistence
+errors, stale-generation handling, and the neutral-streak breaker unchanged.
+Reuse the host notice window; describe an interrupted turn truthfully.
+
+Proof: regression red before (consecutive_failures 1 instead of 0), green after;
+48 focused tests pass. Eleven exact-anchor proof guard mutants killed.
+Read-only old/new replay across 20 live board/shadow DBs: 1015 exit-1 crash
+records, 12 changed records / 6 unique cards, all bound terminal owner-storage
+refusals. Includes all four 01:03:37Z incident cards. No live rows modified.
+Deployed replay remains NO_PROOF until the merged build is installed.
+---
+ hermes_cli/kanban_host_refusal.py             |  17 ++-
+ hermes_cli/kanban_owner_storage_refusal.py    |  26 ++++
+ hermes_cli/kanban_owner_unavailable.py        |  23 +++-
+ .../test_kanban_owner_storage_refusal.py      | 124 ++++++++++++++++++
+ 4 files changed, 176 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_owner_storage_refusal.py
+ create mode 100644 tests/hermes_cli/test_kanban_owner_storage_refusal.py
+
+diff --git a/hermes_cli/kanban_host_refusal.py b/hermes_cli/kanban_host_refusal.py
+index fd1829d29c0..57caaf41200 100644
+--- a/hermes_cli/kanban_host_refusal.py
++++ b/hermes_cli/kanban_host_refusal.py
+@@ -129,7 +129,8 @@ def proven(conn: sqlite3.Connection, task_id: str, run_id, claim_lock, *, admitt
+ 
+ def run_error(pid, proof: dict) -> str:
+     """The requeued run's error text for a proven host refusal."""
+-    return f"pid {pid}: {_cause(proof)}; no turn ran, requeued without counting a failure"
++    phase = "turn interrupted" if proof.get("phase") == "midrun" else "no turn ran"
++    return f"pid {pid}: {_cause(proof)}; {phase}, requeued without counting a failure"
+ 
+ 
+ def _cause(proof: dict, task_id: Optional[str] = None) -> str:
+@@ -139,6 +140,8 @@ def _cause(proof: dict, task_id: Optional[str] = None) -> str:
+         return (f"the host's model-routing registry could not be read or validated when {whose} worker "
+                 f"started ({proof.get('detail') or 'invalid'})")
+     if kind == OWNER_STORAGE_UNAVAILABLE:
++        if proof.get("phase") == "midrun":
++            return "the profile owner refused the running worker's persistence with storage_unavailable"
+         claim = f"card {task_id}'s claim" if task_id else "the claim"
+         return (f"the profile owner kept refusing {claim} with {proof.get('reason') or 'storage_unavailable'} "
+                 "(its runtime store or session policy could not be read)")
+@@ -168,7 +171,8 @@ def _notify(conn, task_id, proof):
+     host = _host()
+     base = NOTICE_KEY_PREFIX + host
+     window = int(time.time()) // NOTICE_WINDOW_SECONDS
+-    line = f"{host}: {_cause(proof, task_id)}; no turn ran and the card was requeued without counting a failure."
++    phase = "the turn was interrupted" if proof.get("phase") == "midrun" else "no turn ran"
++    line = f"{host}: {_cause(proof, task_id)}; {phase} and the card was requeued without counting a failure."
+     marker = {"window": window, "task_id": task_id, "kind": proof.get("kind")}
+     # The lookup runs inside the write transaction (the sweep's IMMEDIATE one, or our own), so two
+     # sweeps cannot both find no card and open two.
+@@ -186,14 +190,13 @@ def _notify(conn, task_id, proof):
+                     kb.add_comment(conn, existing, AUTHOR, f"Again: {line}")
+                     kb._append_event(conn, existing, NOTICE_EVENT, marker)
+                 return existing
+-            body = (f"{line}\n\nA host fault refuses Kanban workers on this host before any turn runs: an empty, "
++            body = (f"{line}\n\nA host fault refuses Kanban workers on this host before or during a turn: an empty, "
+                     "unreadable or invalid `model_routing` registry when a worker starts, or a profile owner whose "
+-                    "runtime store or session policy cannot be read (`storage_unavailable`, e.g. a truncated "
+-                    "config.yaml). Every card on this host is refused until it is restored. The refused cards are "
++                    "runtime store or session policy cannot be read (`storage_unavailable`). The refused cards are "
+                     "requeued uncounted (up to the owner-unavailable streak limit, then they count), and this card "
+                     "is commented at most once per 15 minutes while it lasts.\n\n"
+-                    "Fix: restore the host's config.yaml (the `model_routing` registry, the model and session "
+-                    "policy) from the last good copy (`hermes config` or the config history), then confirm a "
++                    "Fix: inspect the profile owner's storage health and config.yaml (the `model_routing` "
++                    "registry, model and session policy), restore the failing dependency, then confirm a "
+                     "refused card runs.")
+             tid = kb.create_task(conn, title=f"{host}: host config fault, Kanban workers refused"[:120],
+                                  body=body, assignee="default", created_by=AUTHOR, priority=80,
+diff --git a/hermes_cli/kanban_owner_storage_refusal.py b/hermes_cli/kanban_owner_storage_refusal.py
+new file mode 100644
+index 00000000000..14ab44d2aaa
+--- /dev/null
++++ b/hermes_cli/kanban_owner_storage_refusal.py
+@@ -0,0 +1,26 @@
++"""Recognize an owner-store refusal in the bound worker's terminal receipt. [daveey]"""
++from hermes_cli.kanban_host_refusal import OWNER_STORAGE_UNAVAILABLE, _run_events
++
++
++def proven(conn, task_id, run_id, claim_lock):
++    """No shared-log fallback: only the newest result from this run's bound interpreter.
++
++    A failed turn can write an empty result before the outer worker writes its final
++    exception. Accept that real two-receipt shape, but never search past a newer result.
++    The complete terminal line is the managed-worker exception envelope, not arbitrary
++    agent output containing the name of a storage error.
++    """
++    if conn is None or run_id is None or not claim_lock:
++        return None
++    bound = _run_events(conn, task_id, run_id, "worker_bound")
++    if not bound or bound[-1].get("claim_lock") != claim_lock or bound[-1].get("pid") is None:
++        return None
++    results = _run_events(conn, task_id, run_id, "worker_result")
++    if not results:
++        return None
++    result = results[-1]
++    if (result.get("claim_lock") != claim_lock or result.get("pid") != bound[-1]["pid"]
++            or result.get("exit_code") != 1
++            or result.get("last_output") != "Worker failed: WorkerPersistenceError: storage_unavailable"):
++        return None
++    return {"kind": OWNER_STORAGE_UNAVAILABLE, "phase": "midrun", "reason": "storage_unavailable"}
+diff --git a/hermes_cli/kanban_owner_unavailable.py b/hermes_cli/kanban_owner_unavailable.py
+index b110ba2718f..f4333f22268 100644
+--- a/hermes_cli/kanban_owner_unavailable.py
++++ b/hermes_cli/kanban_owner_unavailable.py
+@@ -12,7 +12,8 @@ Such a run is booked ``owner_unavailable`` and requeued WITHOUT counting a failu
+ - the board holds an ``owner_admitted`` marker for the run (the owner did admit it, so a turn may
+   have run and its loss is a real failure), unless the run's bound interpreter proved it died
+   constructing its agent on the host's routing registry (empty, or unreadable/invalid:
+-  ``kanban_host_refusal.proven``: no turn ran, and no card's pin could have passed), or
++  ``kanban_host_refusal.proven``: no turn ran, and no card's pin could have passed), or its final
++  bound-worker receipt proves an owner storage refusal (``kanban_owner_storage_refusal``), or
+ - the card's last ``NEUTRAL_STREAK_LIMIT`` closed runs were all ``owner_unavailable`` (an owner that
+   never comes back must still reach the breaker instead of respawning forever).
+ 
+@@ -92,7 +93,7 @@ def _note_legacy(dead, conn, task_id, run_id, log) -> None:
+ 
+ def noted(dead, conn, task_id, run_id, log=None):
+     """``note`` then return *dead* (one expression at the call site). A requeued host refusal (a
+-    startup registry refusal, or a pre-admission ``storage_unavailable``) is surfaced here, in the
++    startup registry refusal, or a pre-/post-admission ``storage_unavailable``) is surfaced here, in the
+     sweep's transaction: once per window per host, never once per card."""
+     _note_legacy(dead, conn, task_id, run_id, log)
+     note(dead, conn, task_id, run_id)
+@@ -103,9 +104,17 @@ def noted(dead, conn, task_id, run_id, log=None):
+ 
+ 
+ def note(dead, conn, task_id, run_id) -> None:
+-    """Rebook a dead worker (``_DeadWorker``) that exited owner-unavailable as a neutral requeue, or
+-    turn it back into a plain nonzero-exit crash when the run cannot be proven turn-free. No-op for
+-    any other exit."""
++    """Rebook owner unavailability or a proven mid-turn owner-store refusal as a neutral requeue.
++
++    Admission requires a startup or bound-worker storage proof; other exits remain crashes.
++    """
++    storage_proof = None
++    if dead.kind == "nonzero_exit" and dead.code == 1:
++        from hermes_cli.kanban_owner_storage_refusal import proven as storage_refusal
++        storage_proof = storage_refusal(conn, task_id, run_id, dead.event_payload.get("claimer"))
++        if storage_proof:
++            dead.kind = EXIT_KIND
++            dead.event_payload["exit_kind"] = EXIT_KIND
+     if dead.kind not in (EXIT_KIND, OWNER_DOWN_KIND):
+         return
+     owner_down = dead.kind == OWNER_DOWN_KIND
+@@ -114,9 +123,9 @@ def note(dead, conn, task_id, run_id) -> None:
+         reason = "no board connection to check the admission"
+     else:
+         admitted = _owner_admitted(conn, task_id, run_id)
+-        # Admitted: only a bound interpreter's startup proof excuses it. Not admitted: requeued as
++        # Admitted: only a bound interpreter's startup/storage proof excuses it. Not admitted: requeued as
+         # before; a submitter's pre-admission proof only names the host fault for the notice.
+-        proof = proven(conn, task_id, run_id, dead.event_payload.get("claimer"), admitted=admitted,
++        proof = storage_proof or proven(conn, task_id, run_id, dead.event_payload.get("claimer"), admitted=admitted,
+                        pid=dead.event_payload.get("pid"))
+         if admitted and not proof:
+             reason = "the owner had admitted this run"
+diff --git a/tests/hermes_cli/test_kanban_owner_storage_refusal.py b/tests/hermes_cli/test_kanban_owner_storage_refusal.py
+new file mode 100644
+index 00000000000..3ce17ba7360
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_storage_refusal.py
+@@ -0,0 +1,124 @@
++"""Mid-turn owner storage refusals are not card failures. [daveey]"""
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from tests.hermes_cli import test_kanban_host_refusal as helpers
++
++home = helpers.home
++
++
++def _result(conn, tid, **changes):
++    task = kb.get_task(conn, tid)
++    payload = {"pid": os.getpid(), "claim_lock": task.claim_lock, "exit_code": 1,
++               "last_output": "Worker failed: WorkerPersistenceError: storage_unavailable"}
++    payload.update(changes)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "worker_result", payload, run_id=task.current_run_id)
++
++
++def test_midrun_owner_refusal_requeues_without_spending_budget(home):
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET max_retries=1 WHERE id=?", (tid,))
++        _result(conn, tid, last_output="")  # the real turn records this before outer failure
++        _result(conn, tid)
++        kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready"
++        assert task.consecutive_failures == 0
++        assert helpers._runs(conn, tid)[-1]["outcome"] == "owner_unavailable"
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)).fetchone()
++        assert "no turn ran" not in helpers._runs(conn, tid)[-1]["error"]
++        (notice,) = helpers._notices(conn)
++        assert "no turn ran" not in notice["body"]
++
++
++@pytest.mark.parametrize("error", ["outbox_full", "unsafe_outbox", "lost_receipt", "permission_denied",
++                                  "stale_generation", "storage_unavailable_extra"])
++def test_worker_local_errors_still_count(home, error):
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        _result(conn, tid, last_output=f"Worker failed: WorkerPersistenceError: {error}")
++        kbd.detect_crashed_workers(conn)
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++        assert not helpers._notices(conn)
++
++
++@pytest.mark.parametrize("output", ["Worker failed: ValueError: storage_unavailable", "card failed",
++                                    "quoted Worker failed: WorkerPersistenceError: storage_unavailable",
++                                    "Worker failed: WorkerPersistenceError: storage_unavailable\nAnother failure"])
++def test_nonterminal_or_card_error_counts(home, output):
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        _result(conn, tid, last_output=output)
++        kbd.detect_crashed_workers(conn)
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++
++
++def test_latest_bound_result_wins(home):
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        _result(conn, tid)
++        _result(conn, tid, last_output="Worker failed: ValueError: real card fault")
++        kbd.detect_crashed_workers(conn)
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++
++
++@pytest.mark.parametrize("change", ["no_conn", "no_task", "no_run", "no_claim", "no_bound",
++                                   "bound_claim", "bound_pid", "no_result", "result_claim",
++                                   "result_pid", "result_exit", "result_output"])
++def test_proof_requires_exact_bound_terminal_receipt(home, change):
++    from hermes_cli import kanban_owner_storage_refusal as storage
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        _result(conn, tid)
++        task = kb.get_task(conn, tid)
++        args = [conn, tid, task.current_run_id, task.claim_lock]
++        if change.startswith("no_") and change not in ("no_bound", "no_result"):
++            args[["no_conn", "no_task", "no_run", "no_claim"].index(change)] = None
++        else:
++            kind = "worker_bound" if "bound" in change else "worker_result"
++            with kb.write_txn(conn):
++                if change in ("no_bound", "no_result"):
++                    conn.execute("DELETE FROM task_events WHERE task_id=? AND kind=?", (tid, kind))
++                else:
++                    field = {"claim": "claim_lock", "pid": "pid", "exit": "exit_code",
++                             "output": "last_output"}[change.split("_")[1]]
++                    conn.execute("UPDATE task_events SET payload=json_set(payload, ?, NULL) "
++                                 "WHERE task_id=? AND kind=?", ("$." + field, tid, kind))
++        assert storage.proven(*args) is None
++
++
++@pytest.mark.parametrize("field", ["claim_lock", "pid"])
++def test_missing_identity_on_both_receipts_cannot_agree(home, field):
++    from hermes_cli import kanban_owner_storage_refusal as storage
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        _result(conn, tid)
++        task = kb.get_task(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET payload=json_set(payload, ?, NULL) "
++                         "WHERE task_id=? AND kind IN ('worker_bound','worker_result')", ("$." + field, tid))
++        claim = None if field == "claim_lock" else task.claim_lock
++        assert storage.proven(conn, tid, task.current_run_id, claim) is None
++
++
++def test_midrun_notice_shared_and_streak_bounded(home):
++    from hermes_cli import kanban_owner_unavailable as ou
++    with kbc.connect() as conn:
++        tid = None
++        for i in range(ou.NEUTRAL_STREAK_LIMIT + 1):
++            tid, _ = helpers._admitted_run(conn, tid, submitter=72000 + i)
++            _result(conn, tid)
++            kbd.detect_crashed_workers(conn)
++        runs = helpers._runs(conn, tid)
++        assert [r["outcome"] for r in runs[:-1]] == ["owner_unavailable"] * ou.NEUTRAL_STREAK_LIMIT
++        assert runs[-1]["outcome"] == "crashed"
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++        (notice,) = helpers._notices(conn)
++        assert not helpers._notice_comments(conn, notice["id"])
+-- 
+2.55.0
+

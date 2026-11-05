@@ -1,0 +1,150 @@
+From 19c289158287593b69b978494261208237285aa5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 04:34:50 +0000
+Subject: [PATCH] [daveey] Read dispatcher health flock ownership from
+ per-process fdinfo
+
+---
+ gateway/kanban_dispatcher_health.py           | 22 +++--
+ .../gateway/test_kanban_dispatcher_health.py  |  2 +-
+ .../test_kanban_health_lock_observation.py    | 82 +++++++++++++++++++
+ 3 files changed, 100 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_health_lock_observation.py
+
+diff --git a/gateway/kanban_dispatcher_health.py b/gateway/kanban_dispatcher_health.py
+index af3d093e8d6..5e878195e42 100644
+--- a/gateway/kanban_dispatcher_health.py
++++ b/gateway/kanban_dispatcher_health.py
+@@ -16,11 +16,23 @@ def _owns_lock(path: Path, pid: int) -> bool:
+     """Require this process, not merely somebody, to hold the native flock."""
+     stat = path.stat()
+     identity = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
+-    for line in Path("/proc/locks").read_text(encoding="utf-8").splitlines():
+-        fields = line.split()
+-        if (len(fields) >= 6 and fields[1:4] == ["FLOCK", "ADVISORY", "WRITE"]
+-                and fields[4] == str(pid) and fields[5] == identity):
+-            return True
++    # /proc/locks is a host-wide, multi-read snapshot: unrelated lock churn
++    # can shift entries between reads and omit our still-held lock. fdinfo
++    # observes only this process's descriptor, including its actual lock owner.
++    for fd in Path(f"/proc/{pid}/fd").iterdir():
++        try:
++            opened = fd.stat()
++            if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino):
++                continue
++            info = Path(f"/proc/{pid}/fdinfo/{fd.name}").read_text(encoding="utf-8")
++        except OSError:
++            continue  # descriptors may close while being enumerated
++        for line in info.splitlines():
++            fields = line.split()
++            if (len(fields) >= 7 and fields[0] == "lock:"
++                    and fields[2:5] == ["FLOCK", "ADVISORY", "WRITE"]
++                    and fields[5] == str(pid) and fields[6] == identity):
++                return True
+     return False
+ 
+ 
+diff --git a/tests/gateway/test_kanban_dispatcher_health.py b/tests/gateway/test_kanban_dispatcher_health.py
+index c644dcb4152..c554e0671d1 100644
+--- a/tests/gateway/test_kanban_dispatcher_health.py
++++ b/tests/gateway/test_kanban_dispatcher_health.py
+@@ -111,7 +111,7 @@ def test_native_loop_publishes_only_actual_board_success(tmp_path, monkeypatch,
+     async def between(interval):
+         checks.append(health.available(root, board, "default", "ready"))
+         if len(checks) == 1:
+-            assert checks[-1]
++            assert checks[-1], (health.time.monotonic(), (root / ".dispatcher-health.json").read_text())
+             assert not health.available(root, kb.kanban_db_path("broken"), "default", "ready")
+             if ending == "cancel":
+                 raise asyncio.CancelledError
+diff --git a/tests/gateway/test_kanban_health_lock_observation.py b/tests/gateway/test_kanban_health_lock_observation.py
+new file mode 100644
+index 00000000000..65bf22b6c63
+--- /dev/null
++++ b/tests/gateway/test_kanban_health_lock_observation.py
+@@ -0,0 +1,82 @@
++"""Health ownership must not depend on a changing host-wide lock-table snapshot."""
++import fcntl
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++from tools.environments.local import build_subprocess_env
++
++import pytest
++
++from gateway import kanban_dispatcher_health as health
++
++pytestmark = pytest.mark.platforms("linux")
++
++
++@pytest.mark.parametrize("mode", ["exclusive", "shared", "posix", "unlocked"])
++def test_health_observes_exact_process_flock(tmp_path, monkeypatch, mode):
++    path = tmp_path / "dispatcher.lock"
++    with path.open("w") as handle:
++        if mode == "posix":
++            fcntl.lockf(handle, fcntl.LOCK_EX)
++        elif mode != "unlocked":
++            fcntl.flock(handle, fcntl.LOCK_EX if mode == "exclusive" else fcntl.LOCK_SH)
++        # A /proc/locks multi-read can miss this entry as unrelated locks churn.
++        # Keep the actual kernel lock and per-process observations intact.
++        read_text = Path.read_text
++
++        def snapshot(file, *args, **kwargs):
++            if file == Path("/proc/locks"):
++                return ""
++            return read_text(file, *args, **kwargs)
++
++        monkeypatch.setattr(Path, "read_text", snapshot)
++        assert health._owns_lock(path, os.getpid()) is (mode == "exclusive")
++        assert not health._owns_lock(path, os.getppid())
++    assert not health._owns_lock(path, os.getpid())
++
++
++def test_inherited_descriptor_does_not_make_child_the_owner(tmp_path):
++    path = tmp_path / "dispatcher.lock"
++    with path.open("w") as handle:
++        fcntl.flock(handle, fcntl.LOCK_EX)
++        code = (
++            "import os, sys; from pathlib import Path; "
++            "from gateway.kanban_dispatcher_health import _owns_lock; "
++            "path = Path(sys.argv[1]); "
++            "assert not _owns_lock(path, os.getpid()); "
++            "assert _owns_lock(path, os.getppid())"
++        )
++        subprocess.run(
++            [sys.executable, "-c", code, str(path)], pass_fds=(handle.fileno(),),
++            env=build_subprocess_env(), check=True, timeout=30,
++            capture_output=True, text=True, encoding="utf-8",
++        )
++
++
++@pytest.mark.parametrize("failure", [FileNotFoundError, PermissionError])
++def test_descriptor_observation_failure_is_unavailable(tmp_path, monkeypatch, failure):
++    path = tmp_path / "dispatcher.lock"
++    with path.open("w") as handle:
++        fcntl.flock(handle, fcntl.LOCK_EX)
++        read_text = Path.read_text
++        descriptor = Path(f"/proc/{os.getpid()}/fdinfo/{handle.fileno()}")
++
++        def unavailable(file, *args, **kwargs):
++            if file == descriptor:
++                raise failure("descriptor unavailable")
++            return read_text(file, *args, **kwargs)
++
++        monkeypatch.setattr(Path, "read_text", unavailable)
++        assert not health._owns_lock(path, os.getpid())
++
++
++def test_replaced_inode_is_not_the_owned_lock(tmp_path):
++    path = tmp_path / "dispatcher.lock"
++    with path.open("w") as handle:
++        fcntl.flock(handle, fcntl.LOCK_EX)
++        assert health._owns_lock(path, os.getpid())
++        path.unlink()
++        path.touch()
++        assert not health._owns_lock(path, os.getpid())
+-- 
+2.55.0
+

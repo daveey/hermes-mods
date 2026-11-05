@@ -1,0 +1,311 @@
+From ba6a058cff179cd9e8d970ec0253e2cf09fb34e5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 20:51:57 -0800
+Subject: [PATCH] [daveey] fix(kanban): governor/pool gates park as an internal
+ 'resource' wait that resumes on its probe, never escalates, and backs off on
+ repeats
+
+A bb-gate governor hold ('memory pressure warn; Claude pool at 87%') parked undeclared, so core inferred {kind: external, inferred: true, ref: <host launch command>} and the 3rd park escalated into an Unstick card (bb t_01a18aa302529d91 / t_01a19f5cca30ed12). awaiting kind='resource' needs a wake_check, keys its premise on the gate (not the reading), never raises RepeatedPark, and a repeat park doubles check_every (cap 1h) with the gate named in the reason. Genuine external premises still escalate on the 3rd park.
+---
+ hermes_cli/kanban_awaiting.py            | 66 +++++++++++++++++-
+ hermes_cli/kanban_continuation.py        |  2 +
+ hermes_cli/kanban_db_schedule.py         |  1 +
+ hermes_cli/kanban_parser.py              |  3 +-
+ hermes_cli/kanban_timed_park.py          |  1 +
+ hermes_cli/kanban_wait_info.py           |  4 +-
+ tests/hermes_cli/test_kanban_awaiting.py | 88 +++++++++++++++++++++++-
+ 7 files changed, 159 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 98b5743a9a9..5c2c6ee8bb9 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -16,6 +16,13 @@ Each park now carries ``awaiting = {kind, ref, why}`` on its parking event:
+ * ``ci`` / ``deploy``: ``ref`` is a run / job / release id or URL.
+ * ``external``: ``ref`` names the vendor or ticket and ``why`` gives the evidence.
+ * ``clock``: a real window (a soak, a cooldown, a release slot).
++* ``resource``: an internal resource gate (a governor's pool or host-pressure hold) whose own
++  ``wake_check`` passes once the reading drops below its threshold. It needs that probe, never
++  escalates into an "Unstick" owner card (nobody can act on a transient load reading), and a
++  repeat park on the same gate with no new evidence backs its probe cadence off and says so in
++  the reason (``resource_apply``) instead. Only an operator process (the gate) may declare one, never
++  a card's own worker. Its ``wake_at`` deadline still wakes the card: the gate then re-checks
++  admission and re-parks it (a counted repeat) if the hold stands.
+ * ``human``: refused. A wait on David is a visible ``blocked`` card with ``human_request``;
+   an ask he already answered (ask-gate ledger) is never re-asked.
+ 
+@@ -48,7 +55,10 @@ import time
+ from pathlib import Path
+ from typing import Any, Callable, Optional
+ 
+-KINDS = ("card", "ci", "deploy", "external", "clock", "human")
++KINDS = ("card", "ci", "deploy", "external", "clock", "human", "resource")
++RESOURCE = "resource"
++# A repeat resource park doubles its probe cadence per park in a row on the same gate, up to this.
++RESOURCE_BACKOFF_MAX_SECONDS = 3600
+ AGENT_ACTION_WAIT = "agent_action_wait"
+ HUMAN_WAIT = "human_wait"
+ INVALID_AWAITING = "invalid_awaiting"
+@@ -161,6 +171,9 @@ def premise_hash(awaiting: dict, reason: Optional[str]) -> str:
+     """Stable id of what a park waits on: the declared producer (with its why), else the reason."""
+     if awaiting.get("inferred"):
+         basis = " ".join((reason or "").lower().split())[:400]
++    elif awaiting.get("kind") == RESOURCE:
++        # The gate, not its reading: "pool at 87%" and "pool at 88%" are one premise with no new evidence.
++        basis = "|".join(awaiting.get(k, "") for k in ("kind", "gateway", "ref"))
+     else:
+         basis = "|".join(awaiting.get(k, "") for k in ("kind", "gateway", "ref", "why"))
+     return hashlib.sha256(basis.encode()).hexdigest()[:16]
+@@ -430,9 +443,24 @@ def _check_human(conn, task_id, awaiting, text) -> None:
+     raise human_error(task_id, text)
+ 
+ 
++def _check_resource(conn, task_id, awaiting, text) -> None:
++    if not awaiting.get("ref") or not awaiting.get("why"):
++        raise AwaitingError(INVALID_AWAITING, "awaiting kind='resource' needs ref=<gate and resource, e.g. "
++                                              "'bb-gate governor: pool'> and why=<the reading and threshold>")
++    if parked_by_own_worker(task_id):
++        # Only an admission gate (an operator process such as bb_gate) declares one: it is exempt from re-park
++        # escalation, so a worker naming its own wall a "resource" would hide a stuck premise.
++        raise AwaitingError(INVALID_AWAITING, (
++            "awaiting kind='resource' is for an admission gate parking a card behind its own hold, not a worker "
++            "parking itself; name the producer (card, ci, deploy, external, clock) instead"))
++    wall = text_wall(text)
++    if wall:
++        raise wall_error(task_id, wall, text)
++
++
+ _CHECKS: dict[str, Callable[[sqlite3.Connection, str, dict, str], None]] = {
+     "card": _check_card, "ci": _check_run, "deploy": _check_run, "external": _check_external,
+-    "clock": _check_clock, "human": _check_human,
++    "clock": _check_clock, "human": _check_human, "resource": _check_resource,
+ }
+ 
+ 
+@@ -509,6 +537,10 @@ def resolve(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Op
+         return _infer(conn, task_id, reason=reason, wake_check=wake_check, clock_only=clock_only,
+                       op=op, wake_in=wake_in)
+     text = " ".join(x for x in (reason, declared.get("why"), declared.get("ref")) if x)
++    if declared["kind"] == RESOURCE and not (wake_check and str(wake_check).strip()):
++        raise AwaitingError(INVALID_AWAITING, (
++            "awaiting kind='resource' needs a wake_check that passes once the resource drops below its threshold: "
++            "that probe is what resumes the card"))
+     _CHECKS[declared["kind"]](conn, task_id, declared, text)
+     return declared
+ 
+@@ -673,6 +705,14 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     if record["kind"] == "card" or (record["kind"] == "clock" and record.get("inferred")):
+         return record
+     record["premise"] = premise_hash(record, reason)
++    if record["kind"] == RESOURCE:
++        # A governor/pool hold is internal and transient: its probe resumes the card when the reading drops.
++        # Escalating it made "Unstick" cards for a premise nobody can act on (bb t_01a19f5cca30ed12), and on a
++        # Claude-pool hold they burned the quota the hold waits on. A repeat records its count for the backoff.
++        repeat = prior_same_premise(conn, task_id, record["premise"])
++        if repeat:
++            record["repeat"] = repeat
++        return record
+     if clock_window_end(record, time.time()) is not None:
+         # A stated window (a weekly quota reset) ends by itself; an escalation card cannot shorten it
+         # and, for a Claude-pool hold, burns the quota it waits on (bb t_01a19f847b7f5abb). No ``probe``
+@@ -688,6 +728,28 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     return record
+ 
+ 
++def resource_apply(record: Optional[dict], reason: Optional[str],
++                   check_every: Optional[int]) -> tuple[Optional[str], Optional[int]]:
++    """``(reason, check_every)`` for a park: a repeat resource park backs off and surfaces its gate.
++
++    The n-th park in a row on one resource gate with no new evidence re-checks ``2**n`` times less often (up
++    to ``RESOURCE_BACKOFF_MAX_SECONDS``), and the reason names the gate and its reading, so the board shows
++    "waiting on the pool" rather than an opaque probe. Other parks pass through unchanged."""
++    if not isinstance(record, dict) or record.get("kind") != RESOURCE:
++        return reason, check_every
++    repeat = int(record.get("repeat") or 0)
++    if repeat <= 0:
++        return reason, check_every
++    from hermes_cli import kanban_wake_check as kwc
++    base = kwc.normalize_every(check_every)
++    every = max(base, min(base * 2 ** min(repeat, 8), RESOURCE_BACKOFF_MAX_SECONDS))
++    record["backoff_check_every"] = every
++    note = (f"[resource wait on {record.get('ref')}: park {repeat + 1} in a row on this gate with no new "
++            f"evidence; re-checking every {every // 60} min"
++            + (f". Gate: {record['why'][:300]}" if record.get("why") else "") + "]")
++    return (f"{reason} {note}" if reason else note), every
++
++
+ # --- re-park escalation ------------------------------------------------------------------------
+ 
+ def _supervisor_profile(task) -> Optional[str]:
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 25b5dc9d678..8885e3a2606 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -161,6 +161,8 @@ def continue_task(
+             from hermes_cli import kanban_deploy_window as kdw
+             wake_at, noted = kdw.apply(record, wake_at, checkpoint, now=now)
+             checkpoint = noted or checkpoint
++            noted, check_every = kaw.resource_apply(record, checkpoint, check_every)
++            checkpoint = noted or checkpoint
+             wake_check = wake_check or kaw.card_probe(record)
+             why = kaw.park_cycle_error(conn, task_id, record, wake_check)
+             if why:
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 0f8a627fcad..baa3d67adbb 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -50,6 +50,7 @@ def schedule_task(
+         from hermes_cli import kanban_deploy_window as kdw
+         payload = scheduled_payload(reason)
+         payload["wake_at"], reason = kdw.apply(record, payload["wake_at"], reason, now=int(_time.time()))
++        reason, check_every = kaw.resource_apply(record, reason, check_every)
+         payload["reason"] = reason
+         wake_check, check_every = kwc.validate_park(
+             wake_at=payload["wake_at"], wake_check=wake_check,
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 2af6cce2b3a..e0c8676c7a8 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -111,7 +111,8 @@ def _WAKE_CHECK_ARGS():
+              help="A pure time wait with nothing to probe (soak window, calendar date)"),
+         _arg("--awaiting", dest="awaiting", default=None, metavar="KIND:REF|JSON",
+              help="Who produces the condition: card:<task id> (JSON adds gateway/board), ci:<run id>, "
+-                  "deploy:<id>, external:<vendor/ticket>, clock:<window>. A wait needs a producer; "
++                  "deploy:<id>, external:<vendor/ticket>, clock:<window>, resource:<gate> (an internal "
++                  "governor/pool hold; needs --wake-check, never escalates, backs off). A wait needs a producer; "
+                   "agent-action conditions (grant, permission, install, fix) are work, not waits."),
+         _arg("--awaiting-why", dest="awaiting_why", default=None, help="Evidence for --awaiting"),
+     )
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index 6b3025f7876..5e27ed48811 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -172,6 +172,7 @@ def park(
+                                 expected_run_id=expected_run_id) is not None
+         from hermes_cli import kanban_deploy_window as kdw
+         wake_at, reason = kdw.apply(record, wake_at, reason, now=now)
++        reason, check_every = kaw.resource_apply(record, reason, check_every)
+     wake_check = wake_check or kaw.card_probe(record)
+     wake_check, check_every = kwc.validate_park(
+         wake_at=wake_at, wake_check=wake_check, check_every=check_every, clock_only=clock_only)
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index 89caca3438f..7738225701c 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -29,8 +29,8 @@ from typing import Any, Optional
+ STALL_AFTER_S = 2 * 3600
+ 
+ # Producers that change the awaited condition without an agent acting (a card that runs, a CI run, a deploy, a
+-# vendor/ticket, the clock).
+-LIVE_PRODUCER_KINDS = ("card", "ci", "deploy", "external", "clock")
++# vendor/ticket, the clock, an internal resource gate whose own probe resumes the card once its reading drops).
++LIVE_PRODUCER_KINDS = ("card", "ci", "deploy", "external", "clock", "resource")
+ # Block kinds only an agent clears (core kanban_block_policy.AGENT_OWNED_KINDS, plus assignment routing). Untyped
+ # (None/legacy) blocks are agent-owned too, but uncertain: they only count once stalled.
+ AGENT_BLOCK_KINDS = ("transient", "capability", "assignment", "needs_input")
+diff --git a/tests/hermes_cli/test_kanban_awaiting.py b/tests/hermes_cli/test_kanban_awaiting.py
+index 9c06df77a0b..ab64b58f213 100644
+--- a/tests/hermes_cli/test_kanban_awaiting.py
++++ b/tests/hermes_cli/test_kanban_awaiting.py
+@@ -783,7 +783,8 @@ def test_bb_gate_pool_parks_with_a_stated_reset_never_escalate(kanban_home, monk
+     "bb-gate: governor: 5-min load 4.8/core",
+     "bb-gate: governor: free disk 8 GB < 15.0 GB",
+ ])
+-def test_bb_gate_host_holds_still_escalate_on_the_third_park(kanban_home, monkeypatch, reason) -> None:
++def test_undeclared_probe_parks_still_escalate_on_the_third_park(kanban_home, monkeypatch, reason) -> None:
++    # A park that declares nothing is a genuine inferred external wait: the repeat-park detector still fires.
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     with kbc.connect_closing() as conn:
+         tid = _ready(conn)
+@@ -815,3 +816,88 @@ def test_a_past_or_far_clock_window_still_escalates(kanban_home, monkeypatch) ->
+ ])
+ def test_inferred_probe_ref_names_the_script(cmd, ref) -> None:
+     assert kaw.probe_ref(cmd) == ref
++
++
++# -- governor/pool gates are an internal resource wait (bb t_01a19f5cca30ed12) ----------------------------
++# t_01a18aa302529d91 parked 3x on "governor: memory pressure warn; Claude pool at 87%", recorded as an inferred
++# external wait on the host launch command, and escalated into an Unstick card. A declared ``resource`` wait
++# resumes on its probe, never escalates, and a repeat backs off with the gate named in the reason.
++GOV = {"kind": "resource", "ref": "bb-gate governor: memory,pool"}
++
++
++def test_gate_denial_parks_as_a_resource_wait_then_auto_resumes(kanban_home, monkeypatch, tmp_path) -> None:
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    hold = tmp_path / "hold"
++    hold.write_text("governor")
++    probe = f"test ! -e {hold}"
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = _ready(conn)
++        assert run("schedule", tid, "bb-gate: governor: memory pressure warn; Claude pool at 87%",
++                   "--wake-check", probe, "--check-every", "600", "--awaiting", json.dumps(GOV),
++                   "--awaiting-why", "Claude pool at 87% (holds at 75%)") == 0
++        task = kb.get_task(conn, tid)
++        assert task.status == "scheduled"
++        rec = _park_payload(conn, tid)["awaiting"]
++        assert rec["kind"] == "resource" and rec["ref"] == GOV["ref"] and not rec.get("inferred"), rec
++        assert "probe" not in rec and "repeat" not in rec
++        from hermes_cli import kanban_wait_info as kwi
++        assert kwi.LIVE_PRODUCER_KINDS.count("resource") == 1
++        # The pool drops below threshold: the gate's own probe passes and the card resumes.
++        # While the hold stands the probe fails and the card stays parked.
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 601, wait=True)
++        assert kb.get_task(conn, tid).status == "scheduled"
++        hold.unlink()
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 1202, wait=True)
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_resource_wait_needs_its_probe(kanban_home, monkeypatch) -> None:
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    with kbc.connect_closing() as conn:
++        tid = _ready(conn)
++        with pytest.raises(kaw.AwaitingError, match="resource.*wake_check"):
++            kaw.resolve(conn, tid, awaiting=GOV, reason="bb-gate: governor: Claude pool at 87%")
++        with pytest.raises(kaw.AwaitingError, match="needs ref=.*why="):
++            kaw.resolve(conn, tid, awaiting=GOV, reason="bb-gate: governor: Claude pool at 87%", wake_check="false")
++
++
++def test_a_worker_cannot_dodge_escalation_by_calling_its_wall_a_resource(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _ready(conn)
++        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++        with pytest.raises(kaw.AwaitingError, match="admission gate"):
++            kaw.resolve(conn, tid, awaiting={**GOV, "why": "vendor response"}, reason="waiting", wake_check="false")
++
++
++def test_governor_resource_parks_never_escalate_and_back_off(kanban_home, monkeypatch) -> None:
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    reasons = [f"bb-gate: governor: memory pressure warn; Claude pool at {p}% (self-fix waits at 75%)"
++               for p in (84, 87, 87, 88, 90)]
++    with kbc.connect_closing() as conn:
++        tid = _ready(conn)
++        kinds = _bb_gate_parks(conn, tid, reasons, GOV, "Claude pool at 87% (holds at 75%)")
++        assert kaw.ESCALATED_EVENT not in kinds and kinds.count("scheduled") == 5, kinds
++        assert not conn.execute("SELECT 1 FROM tasks WHERE title LIKE 'Unstick%'").fetchone()
++        parks = [e.payload for e in kb.list_events(conn, tid) if e.kind == "scheduled"]
++        # Never an external premise inferred from the host launch command.
++        for p in parks:
++            assert p["awaiting"]["kind"] == "resource" and not p["awaiting"].get("inferred"), p
++            assert "daveey-min" not in p["awaiting"].get("ref", "") and "probe" not in p["awaiting"]
++        assert len({p["awaiting"]["premise"] for p in parks}) == 1  # the reading changed, the gate did not
++        assert [p["awaiting"].get("repeat", 0) for p in parks] == [0, 1, 2, 3, 4]
++        assert [p["check_every"] for p in parks] == [600, 1200, 2400, 3600, 3600]
++        assert "resource wait on bb-gate governor: memory,pool: park 3 in a row" in parks[2]["reason"]
++        assert "Gate: Claude pool at 87% (holds at 75%)" in parks[2]["reason"]
++        assert parks[0]["reason"] == reasons[0]
++
++
++def test_repeat_detector_still_fires_for_a_genuine_external_premise_after_resource_parks(
++        kanban_home, monkeypatch) -> None:
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    ext = {"kind": "external", "ref": "AWS support case 12345"}
++    with kbc.connect_closing() as conn:
++        tid = _ready(conn)
++        _bb_gate_parks(conn, tid, ["bb-gate: governor: Claude pool at 88%"] * 3, GOV, "pool 88%")
++        kinds = _bb_gate_parks(conn, tid, ["waiting on the vendor quota raise"] * 3, ext, "case open, ETA 2d")
++        assert kinds[-1] == kaw.ESCALATED_EVENT and kinds.count(kaw.ESCALATED_EVENT) == 1, kinds
+-- 
+2.55.0
+
