@@ -56,9 +56,9 @@ async def make_owner(home, monkeypatch, surface='tui'):
 
 
 def native_actor(authority):
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_local_migration import bind_native_transport
-    actor = Principal('uid:1000', authority.profile_id,
+    actor = SessionActor('uid:1000', authority.profile_id,
                       frozenset({'session:read', 'session:create'}), 'fixture-native')
     bind_native_transport(authority, actor, {'provider': 'local', 'profile_id': authority.profile_id,
                                             'instance_id': authority.instance_id})
@@ -294,7 +294,7 @@ def test_queued_legacy_reroutes_same_identity_after_adoption(legacy_home, monkey
 
 def test_existing_adoption_requires_authenticated_transport_and_refuses_live_inline_owner(legacy_home, monkeypatch):
     async def scenario():
-        from gateway.session_contract import Principal
+        from gateway.session_contract import SessionActor
         from gateway.session_local_migration import resolve_local_target
         from hermes_cli.active_sessions import try_acquire_active_session, release_active_session
         from hermes_state_runtime import RuntimeStoreError
@@ -302,7 +302,7 @@ def test_existing_adoption_requires_authenticated_transport_and_refuses_live_inl
         lease = None
         try:
             original = authority.db.get_session(sid)
-            producer = Principal('automation:terminal', authority.profile_id,
+            producer = SessionActor('automation:terminal', authority.profile_id,
                                  frozenset({'session:read', 'session:create'}), 'producer')
             with pytest.raises(RuntimeStoreError, match='not_found'):
                 resolve_local_target(authority, producer, sid)
