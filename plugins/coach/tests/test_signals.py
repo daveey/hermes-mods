@@ -836,6 +836,99 @@ def test_hub_flags_a_silent_forwarder(tmp_path):
     assert [d["host"] for d in got] == ["macbook"] and got[0]["component"] == "plugin"
 
 
+def _beat(hub, reach="you@macbook", at=NOW):
+    b = {"kind": "heartbeat", "host": "macbook", "n": 0}
+    if reach:
+        b["reach"] = reach
+    sg.ingest(hub, json.dumps(b) + "\n", now=at)
+
+
+def _log_events(hub, ev):
+    p = hub / "coach" / "log.jsonl"
+    return [r for r in map(json.loads, p.read_text().splitlines()) if r.get("event") == ev] if p.exists() else []
+
+
+DOWN = lambda reach: (False, "ssh: connect to host macbook port 22: Connection timed out")  # noqa: E731
+UP = lambda reach: (True, "")  # noqa: E731
+
+
+def test_hub_does_not_file_a_sleeping_host(tmp_path):
+    # plugin-8a7e4507f0: the MacBook slept 10 h with the lid closed; its forwarder was fine. A host the hub cannot
+    # reach is asleep or off the network, not a broken forwarder: log it, file nothing.
+    hub = tmp_path / "hub"
+    _beat(hub)
+    probed = []
+    got = sg.silent_forwarders(hub, now=NOW + 10 * 3600, prober=lambda r: probed.append(r) or DOWN(r))
+    assert got == [] and probed == ["you@macbook"]
+    down = _log_events(hub, "forwarder_silent_host_down")
+    assert [(d["host"], d["age_h"]) for d in down] == [("macbook", 10.0)]
+    filed = []
+    sg.sweep(hub, "hermes-hub", filer=lambda d: filed.append(d) or {"action": "would_file"}, now=NOW + 10 * 3600,
+             prober=DOWN)
+    assert filed == []
+
+
+def test_hub_files_an_awake_host_still_silent_after_30_min(tmp_path):
+    hub = tmp_path / "hub"
+    _beat(hub)
+    t0 = NOW + 10 * 3600
+    assert sg.silent_forwarders(hub, now=t0, prober=UP) == []  # first reachable: give the forwarder a full cycle
+    assert sg.silent_forwarders(hub, now=t0 + 20 * 60, prober=UP) == []
+    late = sg.silent_forwarders(hub, now=t0 + 31 * 60, prober=UP)
+    assert [s["host"] for s in late] == ["macbook"] and "reachable" in late[0]["details"]
+    assert late[0]["fp"] == sg.fp("plugin", "forwarder-silent", "macbook")  # same fp: file_defect dedupes repeats
+
+
+def test_reachable_window_restarts_after_the_host_sleeps_again_or_reports(tmp_path):
+    hub = tmp_path / "hub"
+    _beat(hub)
+    t0 = NOW + 10 * 3600
+    sg.silent_forwarders(hub, now=t0, prober=UP)
+    sg.silent_forwarders(hub, now=t0 + 10 * 60, prober=DOWN)  # lid closed again: the 30-min window starts over
+    assert sg.silent_forwarders(hub, now=t0 + 31 * 60, prober=UP) == []
+    _beat(hub, at=t0 + 40 * 60)  # the forwarder reported: nothing silent, the probe state is dropped
+    assert sg.silent_forwarders(hub, now=t0 + 41 * 60, prober=UP) == []
+    assert sg.silent_forwarders(hub, now=t0 + 40 * 60 + 7 * 3600, prober=UP) == []  # new silence, new window
+
+
+def test_hub_files_a_host_silent_for_over_a_week_even_if_unreachable(tmp_path):
+    hub = tmp_path / "hub"
+    _beat(hub)
+    got = sg.silent_forwarders(hub, now=NOW + 8 * 86400, prober=DOWN)
+    assert [s["host"] for s in got] == ["macbook"] and "host gone or forwarder dead" in got[0]["symptom"]
+
+
+def test_heartbeat_carries_reach_into_hosts_json(home, tmp_path, monkeypatch):
+    sent = []
+
+    def good(argv, stdin):
+        sent.append(stdin)
+        return SimpleNamespace(returncode=0, stdout='{"ingested": 0}', stderr="")
+    sg.forward(home, "macbook", "you@hub.example.com", runner=good, now=NOW, cfg={"reach_as": "you@mac.example.com"})
+    beat = json.loads(sent[0].splitlines()[0])
+    assert beat["reach"] == "you@mac.example.com"
+    hub = tmp_path / "hub"
+    sg.ingest(hub, sent[0], now=NOW)
+    assert json.loads((hub / "coach" / "signals" / "hosts.json").read_text())["macbook"]["reach"] == "you@mac.example.com"
+    # default: <user>@<tailscale short name>, else <user>@<hostname>
+    monkeypatch.setattr(sg, "_tailscale_name", lambda: "mac-ts")
+    monkeypatch.setattr(sg.getpass, "getuser", lambda: "you")
+    assert sg.reach_target({}) == "you@mac-ts"
+    monkeypatch.setattr(sg, "_tailscale_name", lambda: None)
+    monkeypatch.setattr(sg.socket, "gethostname", lambda: "mac.local")
+    assert sg.reach_target({}) == "you@mac.local"
+
+
+def test_probe_counts_an_answering_sshd_as_awake():
+    # The hub has no plain login key for the mini: "Permission denied" still proves the host is up.
+    run = lambda rc, err: (lambda argv, stdin=None: SimpleNamespace(returncode=rc, stdout="", stderr=err))  # noqa
+    assert sg.probe_host("you@mini", {}, runner=run(0, ""))[0] is True
+    assert sg.probe_host("you@mini", {}, runner=run(255, "you@mini: Permission denied (publickey)."))[0] is True
+    assert sg.probe_host("you@mini", {}, runner=run(255, "ssh: connect to host mini port 22: Operation timed out"))[0] \
+        is False
+    assert sg.probe_host("you@mini", {}, runner=run(255, "ssh: Could not resolve hostname mini"))[0] is False
+
+
 def r_count(payload):
     return len([x for x in payload.splitlines() if x.strip()])
 

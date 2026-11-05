@@ -969,7 +969,15 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
 - **Macs / mini**: `signals.py forward` ships new raw signals over ssh to the hub's `signals.py ingest` (the hub
   files them); the cursor only moves when the hub accepted the batch. Every pass sends a heartbeat first (even with
   no signals), recorded in the hub's `coach/signals/hosts.json`; the hub sweep files a `plugin` defect for a host
-  whose forwarder has been silent > 6 h. It rides on the existing launchd coach feed
+  whose forwarder has been silent > 6 h. A sleeping laptop is silent too (plugin-8a7e4507f0), so the heartbeat
+  carries `reach` (`reach_as` in `coach/selfheal-config.json`, else `<user>@<tailscale short name>`, else
+  `<user>@<hostname>`) and the hub probes a silent host with one BatchMode ssh first: unreachable (connect
+  timeout, no route, unresolvable) logs `forwarder_silent_host_down` to `coach/log.jsonl` and files nothing; an
+  answering sshd (login ok, or even `Permission denied`) counts as awake, logs `forwarder_silent_host_up_waiting`,
+  and files only once the host has stayed reachable and silent for 30 min (state in `signals/silent-probe.json`).
+  Silent > 7 days files regardless ("host gone or forwarder dead"); a heartbeat without `reach` (older forwarder)
+  keeps the age-only check (tests: `test_signals.py` `test_hub_does_not_file_a_sleeping_host` and its
+  neighbours). It rides on the existing launchd coach feed
   (`hermes-coach/scripts/coach_feed.py`, every 30 min) and is a no-op without a `hub_ssh` in
   `coach/selfheal-config.json` or on the hub itself. The ssh to the hub pins the key (`hub_ssh_key` in that file,
   default `~/.ssh/id_ed25519`) with `IdentitiesOnly=yes`, because launchd jobs offer different default identities

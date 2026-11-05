@@ -51,11 +51,13 @@ their ids are global and their runs show up on several hosts' boards, so a card'
 from __future__ import annotations
 
 import argparse
+import getpass
 import glob
 import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -1969,11 +1971,11 @@ def drain_spool(home: Path) -> List[dict]:
 
 
 def sweep(home: Path, host: str, m: Optional[str] = None, filer: Optional[Callable] = None,
-          now: Optional[float] = None) -> List[dict]:
+          now: Optional[float] = None, prober: Optional[Callable] = None) -> List[dict]:
     """Hub pass: local signals + forwarded ones -> file_defect. Returns [{signal, result}]."""
     now = now or time.time()
     cur = load_cursor(home)
-    sigs = collect(home, cur, host, now) + drain_spool(home) + silent_forwarders(home, now)
+    sigs = collect(home, cur, host, now) + drain_spool(home) + silent_forwarders(home, now, prober)
     if filer is None:
         sh = _self_heal()
         filer = lambda d: sh.file_defect(d, m=m)  # noqa: E731
@@ -2005,11 +2007,12 @@ def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, 
     its sweep flags a host whose forwarder went silent."""
     cur = load_cursor(home)
     sigs = collect(home, cur, host, now)
-    beat = {"kind": "heartbeat", "host": host, "at": now or time.time(), "n": len(sigs)}
+    cfg = cfg if cfg is not None else config(home)
+    beat = {"kind": "heartbeat", "host": host, "at": now or time.time(), "n": len(sigs), "reach": reach_target(cfg)}
     payload = "".join(json.dumps(s) + "\n" for s in [beat] + sigs)
     run = runner or (lambda argv, stdin: subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=90))
     try:
-        r = run(ssh_argv(cfg if cfg is not None else config(home)) + [hub, HUB_CMD], payload)
+        r = run(ssh_argv(cfg) + [hub, HUB_CMD], payload)
         ok, detail = r.returncode == 0, (r.stdout or r.stderr or "").strip()[-200:]
     except Exception as exc:
         ok, detail = False, f"{type(exc).__name__}: {exc}"[:200]
@@ -2019,6 +2022,56 @@ def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, 
 
 
 SILENT_S = 6 * 3600              # a forwarder (launchd, every 30 min) quiet this long is itself a defect
+AWAKE_GRACE_S = 30 * 60          # ...if the host has been reachable this long and still not reported
+GONE_S = 7 * 86400               # silent this long: file even when the host can't be reached
+
+
+def _tailscale_name() -> Optional[str]:
+    """This host's MagicDNS short name (what the hub ssh-es to), or None. launchd's PATH lacks the app's CLI."""
+    for exe in ("tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale",
+                "/usr/local/bin/tailscale"):
+        try:
+            r = subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=5)
+            me = (json.loads(r.stdout or "{}").get("Self") or {}) if r.returncode == 0 else {}
+        except Exception:
+            continue
+        name = (me.get("DNSName") or "").split(".")[0] or me.get("HostName")
+        if name:
+            return name
+    return None
+
+
+def reach_target(cfg: dict) -> str:
+    """The ssh target the hub probes when this host's forwarder goes quiet (plugin-8a7e4507f0): `reach_as` in
+    selfheal-config.json, else <user>@<tailscale short name>, else <user>@<hostname>."""
+    if cfg.get("reach_as"):
+        return str(cfg["reach_as"])[:120]
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = ""
+    host = _tailscale_name() or socket.gethostname()
+    return (f"{user}@{host}" if user else host)[:120]
+
+
+# ssh's own text when sshd answered (the host is awake) even though we may not be allowed to log in: the hub holds no
+# plain login key for every host, and an answering sshd is all the probe needs.
+SSHD_ANSWERED_RE = re.compile(r"Permission denied|Host key verification failed|REMOTE HOST IDENTIFICATION|"
+                              r"Too many authentication failures|Connection refused|Connection closed by|"
+                              r"Connection reset by|no matching (?:host key|key exchange|cipher)", re.I)
+
+
+def probe_host(reach: str, cfg: dict, runner: Optional[Callable] = None) -> Tuple[bool, str]:
+    """(awake, detail): one BatchMode ssh to `reach`. Awake = the login worked or sshd answered at all; asleep/off
+    the network = connect timeout, no route, unresolvable."""
+    run = runner or (lambda argv, stdin=None: subprocess.run(argv, input=stdin, capture_output=True, text=True,
+                                                             timeout=30))
+    try:
+        r = run(ssh_argv(cfg) + [reach, "true"], None)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:200]
+    err = (r.stderr or r.stdout or "").strip()[-200:]
+    return (r.returncode == 0 or bool(SSHD_ANSWERED_RE.search(err))), err
 
 
 def ingest(home: Path, text: str, now: Optional[float] = None) -> int:
@@ -2034,7 +2087,8 @@ def ingest(home: Path, text: str, now: Optional[float] = None) -> int:
             except Exception:
                 continue
             if isinstance(s, dict) and s.get("kind") == "heartbeat" and s.get("host"):
-                beats[str(s["host"])[:40]] = {"at": now, "n": s.get("n")}
+                beats[str(s["host"])[:40]] = {"at": now, "n": s.get("n"),
+                                              **({"reach": str(s["reach"])[:120]} if s.get("reach") else {})}
                 continue
             if not isinstance(s, dict) or not s.get("fp") or s.get("kind") not in KINDS + ("collector",):
                 continue
@@ -2054,23 +2108,68 @@ def ingest(home: Path, text: str, now: Optional[float] = None) -> int:
     return n
 
 
-def silent_forwarders(home: Path, now: Optional[float] = None) -> List[dict]:
-    """Hosts that forwarded before but not in SILENT_S: the forwarder (or the host's feed job / ssh) broke."""
+def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[Callable] = None) -> List[dict]:
+    """Hosts that forwarded before but not in SILENT_S: the forwarder (or the host's feed job / ssh) broke. A laptop
+    with its lid closed is silent too (plugin-8a7e4507f0), so a host whose heartbeat carries `reach` is probed first:
+    unreachable -> logged as forwarder_silent_host_down, not filed; reachable -> filed only once it has stayed
+    reachable AND silent for AWAKE_GRACE_S (a full forwarder cycle). Silent past GONE_S -> filed regardless.
+    Heartbeats without `reach` (older forwarders) keep the age-only check."""
     now = now or time.time()
+    sig_dir = coach_dir(home) / "signals"
     try:
-        hosts = json.loads((coach_dir(home) / "signals" / "hosts.json").read_text())
+        hosts = json.loads((sig_dir / "hosts.json").read_text())
     except Exception:
         return []
+    sp = sig_dir / "silent-probe.json"
+    try:
+        state = json.loads(sp.read_text())
+    except Exception:
+        state = {}
+    new_state = {}
+    cfg = None
     out = []
     for h, v in sorted(hosts.items()):
-        age = now - float(v.get("at") or 0)
-        if age > SILENT_S:
-            out.append({"kind": "collector", "component": "plugin", "at": now, "host": h,
-                        "symptom": f"self-heal signal forwarder on {h} has not reported for {age / 3600:.0f} h",
-                        "details": f"last heartbeat {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(v.get('at') or 0))}"
-                                   f"; the forwarder rides on that host's launchd coach feed (coach_feed.py, every "
-                                   f"30 min) and ssh to the hub",
-                        "fp": fp("plugin", "forwarder-silent", h)})
+        last = float(v.get("at") or 0)
+        age = now - last
+        if age <= SILENT_S:
+            continue
+        reach = v.get("reach")
+        last_s = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(last))
+        note = ""
+        if age <= GONE_S and reach:
+            if prober is None:
+                cfg = cfg if cfg is not None else config(home)
+                prober = lambda r: probe_host(r, cfg)  # noqa: E731
+            up, detail = prober(reach)
+            rec = {"ts": now, "host": h, "age_h": round(age / 3600, 1), "reach": reach, "detail": detail[:160]}
+            if not up:
+                _coach_log(home, {"event": "forwarder_silent_host_down", **rec})
+                continue
+            since = float((state.get(h) or {}).get("reachable_since") or 0)
+            if not since or since <= last:
+                since = now
+            new_state[h] = {"reachable_since": since}
+            if now - since < AWAKE_GRACE_S:
+                _coach_log(home, {"event": "forwarder_silent_host_up_waiting", **rec,
+                                  "reachable_min": round((now - since) / 60)})
+                continue
+            note = (f"; the host has answered ssh ({reach}) for {(now - since) / 60:.0f} min and still sent no "
+                    f"heartbeat, so it is reachable but its forwarder is not reporting")
+        gone = age > GONE_S
+        out.append({"kind": "collector", "component": "plugin", "at": now, "host": h,
+                    "symptom": (f"self-heal signal forwarder on {h} has not reported for {age / 86400:.0f} days "
+                                f"(host gone or forwarder dead)" if gone else
+                                f"self-heal signal forwarder on {h} has not reported for {age / 3600:.0f} h"),
+                    "details": f"last heartbeat {last_s}{note}; the forwarder rides on that host's launchd coach "
+                               f"feed (coach_feed.py, every 30 min) and ssh to the hub",
+                    "fp": fp("plugin", "forwarder-silent", h)})
+    if new_state != state:
+        try:
+            tmp = sp.with_suffix(".tmp")
+            tmp.write_text(json.dumps(new_state, indent=1))
+            tmp.replace(sp)
+        except OSError:
+            pass
     return out
 
 
