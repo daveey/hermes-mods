@@ -209,3 +209,22 @@ def test_incident_replay_one_case_per_stop_cause(tmp_path):
     fired = {f["sid"]: f["sym"] for f in res["fps"]}
     for s, c in cases:
         assert fired[s] == (f"turn interrupted (backend stopped: {c})" if c else "turn interrupted (backend stopped)")
+
+
+def test_plugin_sync_and_noop_receipts_are_not_a_core_update(tmp_path):
+    """Live check 2026-11-05 on the hub: `hermes plugins` sync receipts (pm_*-sync-*.json, latest.json, kind=sync)
+    land in update_receipts every few minutes and restart nothing, and a failed update leaves pre==post sha; counting
+    them labeled nearly every hub stop "core update"."""
+    home = tmp_path
+    d = home / "logs" / "update_receipts"
+    d.mkdir(parents=True)
+    sync = {"schema": 1, "kind": "sync", "outcome": "ok", "started_at": _iso(T0 + 60), "finished_at": _iso(T0 + 61)}
+    (d / "pm_20261105T061528Z-sync-1-abc.json").write_text(json.dumps(sync))
+    (d / "latest.json").write_text(json.dumps(sync))
+    (d / "update_failed.json").write_text(json.dumps({
+        "schema": 1, "started_at": _iso(T0 + 90), "finished_at": _iso(T0 + 95), "outcome": "failed",
+        "pre_update": {"short_sha": "fbd4ed13"}, "post_update": {"short_sha": "fbd4ed13"}, "gateway_restart": {}}))
+    got = sh.stop_cause(home, T0, T0 + 1800)
+    assert got["cause"] == "unknown", got
+    _receipt(home, T0 + 300)
+    assert sh.stop_cause(home, T0, T0 + 1800)["cause"] == "core update"

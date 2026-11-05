@@ -674,10 +674,14 @@ def stop_cause(home: Optional[Path] = None, since: float = 0.0, until: Optional[
                 r = json.loads(p.read_text())
             except (OSError, ValueError):
                 continue
+            if not isinstance(r, dict) or r.get("kind") == "sync":
+                continue  # `hermes plugins` sync receipts (pm_*, latest.json) restart nothing
+            pre = (r.get("pre_update") or {}).get("short_sha") or "?"
+            post = (r.get("post_update") or {}).get("short_sha") or "?"
+            if pre == post and not (r.get("gateway_restart") or {}).get("restarted_services"):
+                continue  # a failed/no-op update moved no code and restarted nothing
             a, b = _iso_ts(r.get("started_at")), _iso_ts(r.get("finished_at"))
             if inside(a) or inside(b) or (a is not None and b is not None and a <= since <= b):
-                pre = (r.get("pre_update") or {}).get("short_sha") or "?"
-                post = (r.get("post_update") or {}).get("short_sha") or "?"
                 found["core update"].append(f"update_receipts/{p.name}: {r.get('started_at')} -> "
                                             f"{r.get('finished_at')} {r.get('outcome') or '?'} {pre} -> {post}")
     except OSError:
