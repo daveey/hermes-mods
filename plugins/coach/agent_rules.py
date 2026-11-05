@@ -1544,6 +1544,43 @@ def subagent_list_line(result: Any) -> Optional[str]:
     return ("   <- OK subagents: " + (" | ".join(segs) if segs else "none live"))[:OK_LIST_LINE_MAX]
 
 
+# agent-9382d717aa: a subagent spawned one turn earlier is the started fix of a follow-up turn's "X is underway", but
+# the judges saw only this turn's log (prev_turn_section drops the previous turn after 2+ calls) and held the reply as
+# report_only. Before judging, the coach reads core's live registry and writes one `<- OK subagents: ... [live
+# registry]` line for this session's subagents still running and started under LIVE_SUBAGENT_MAX_AGE_S ago.
+LIVE_SUBAGENT_MAX_AGE_S = 3600
+LIVE_REGISTRY_TAG = "[live registry]"
+
+
+def registry_subagents() -> list:
+    """core's running-subagent records (tools.delegate_tool_registry), [] when core or the registry is unavailable."""
+    try:
+        from tools.delegate_tool_registry import list_active_subagents
+        recs = list_active_subagents()
+        return [r for r in recs if isinstance(r, dict)] if isinstance(recs, list) else []
+    except Exception:
+        return []
+
+
+def live_subagents_line(sid: str, records: list, now: Optional[float] = None) -> Optional[str]:
+    """`   <- OK subagents: <id>=running(<age>) goal=<head> ... [live registry]` for `sid`'s fresh running subagents."""
+    if not sid:
+        return None
+    now = time.time() if now is None else now
+    segs = []
+    for r in records or []:
+        started = r.get("started_at") if isinstance(r, dict) else None
+        if (str(r.get("owner_agent_session_id") or "") != sid or str(r.get("status") or "") != "running"
+                or not isinstance(started, (int, float)) or not 0 <= now - started <= LIVE_SUBAGENT_MAX_AGE_S):
+            continue
+        goal = " ".join(str(r.get("goal") or "").split())[:SUBAGENT_GOAL_HEAD]
+        segs.append(f"{r.get('subagent_id')}=running({_ago(now - started)})" + (f" goal={goal}" if goal else ""))
+    if not segs:
+        return None
+    tail = " " + LIVE_REGISTRY_TAG
+    return ("   <- OK subagents: " + " | ".join(segs))[:OK_LIST_LINE_MAX - len(tail)] + tail
+
+
 def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None) -> Optional[str]:
     """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls."""
     if subagent_list_call(tool, args):
@@ -1708,6 +1745,18 @@ class AgentCoach:
         turn_log and 300-char rich log can cut `cd <long path> && git commit` before the commit, so the diff review
         reads the commit dirs from these."""
         return list(self._s(sid).get("turn_commits") or [])
+
+    def note_live_subagents(self, sid: str, records: Optional[list] = None) -> None:
+        """Add this session's running subagents (live_subagents_line) to both turn logs once, before the reply check.
+        `records` defaults to core's live registry."""
+        line = live_subagents_line(sid, registry_subagents() if records is None else records)
+        if not line:
+            return
+        s = self._s(sid)
+        if any(LIVE_REGISTRY_TAG in str(x) for x in s["turn_log"]):
+            return
+        s["turn_log"].append(line)
+        s.setdefault("turn_rich", deque(maxlen=60)).append(line)
 
     def turn_rich(self, sid: str) -> list[str]:
         """This turn's tool log with real arguments (kanban_create title and body, delegate goals, patch paths), for the

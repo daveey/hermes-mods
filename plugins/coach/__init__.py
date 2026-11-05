@@ -813,6 +813,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 return None
             rc = _load("reply_check")
             cfg = rc.settings()
+            # agent-9382d717aa: a subagent this session spawned a turn earlier and still running is a started fix the
+            # judges can't see in this turn's log; add core's live-registry line (once) before any judge reads it.
+            coach.note_live_subagents(session_id)
             ask, log_lines = coach.turn_context(session_id)
             # this session's Kanban tools can't read the board: kanban_create fails too, so nudges don't ask for it
             kanban_down = coach.kanban_db_down(session_id) or rc.kanban_db_down(log_lines)
