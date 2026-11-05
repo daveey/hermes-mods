@@ -146,7 +146,7 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
   hand-run one needs `-R OWNER/NAME` (the script passes it from `origin`; override with `--gh-repo`).
 
 - With a narrow `remote.origin.fetch`, fetching a branch may update only FETCH_HEAD and leave its `origin/<branch>` tracking ref stale. The script now fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` explicitly; if an older copy reports “not on origin/…” after a verified push, compare `git ls-remote` and `git rev-parse origin/<branch>` and fetch that refspec yourself. Do not re-push an already verified head. Shas on different branches need one wait each (`--branch` per sha): several shas in one call must all be on that one branch.
-- `--repo` is a LOCAL checkout path (the script runs `git -C <repo> fetch`). An `owner/name` slug resolves to `~/code/<name>` only when that checkout's origin is the same repo; anything else exits with "not a local checkout". Run it from inside the checkout or pass the path.
+- Pass `--repo /absolute/checkout --gh-repo OWNER/NAME --branch <actual-remote-branch>` when tracking helper branches. `--repo` selects the local git checkout; `--gh-repo` selects GitHub. Never use `--branch none` to disable filtering: it attempts to fetch a literal branch named `none` and fails before checking CI. Repair the wait arguments and reuse the existing runs; do not redispatch.
 
 - Workflows with `paths:` filters don't run for every commit. Without `--workflow`, the script waits on the
   workflows that have a run on a commit containing yours. With `--workflow X`, when X never runs it reports a
