@@ -99,6 +99,49 @@ def _pct(sorted_vals: list, q: float) -> float:
     return sorted_vals[min(len(sorted_vals) - 1, int(round(q * (len(sorted_vals) - 1))))]
 
 
+_SECRET_KEY_RE = re.compile(
+    r"token|secret|passw(?:or)?d|passwd|apikey|authori[sz]ation|credential|bearer|privatekey")
+_QUERY_RAW_CAP = 8192
+QUERY_MAX_CHARS = 300
+
+
+def _decode_name(raw: str) -> str:
+    from urllib.parse import unquote_plus
+    name = raw
+    for _ in range(3):  # %2574oken -> %74oken -> token
+        nxt = unquote_plus(name)
+        if nxt == name:
+            break
+        name = nxt
+    return name
+
+
+def sanitize_query(query) -> str:
+    """Redact credential-valued params from a query string before it reaches any report or counter.
+
+    Names are percent-decoded (repeatedly) and matched case-insensitively; the value of a credential-like
+    key is replaced with ``[REDACTED]``. Other params are kept verbatim. On any failure the whole query is
+    dropped, never echoed.
+    """
+    try:
+        if isinstance(query, (bytes, bytearray)):
+            query = bytes(query).decode("latin-1")
+        query = (query or "")[:_QUERY_RAW_CAP]
+        out = []
+        for part in re.split(r"[&;]", query):
+            if not part:
+                continue
+            name, eq, _val = part.partition("=")
+            norm = re.sub(r"[\s_\-]", "", _decode_name(name).lower())
+            if eq and _SECRET_KEY_RE.search(norm):
+                out.append(name + "=[REDACTED]")
+            else:
+                out.append(part)
+        return "&".join(out)[:QUERY_MAX_CHARS]
+    except Exception:  # noqa: BLE001
+        return "[unparseable-query-dropped]"
+
+
 class _Req:
     __slots__ = ("id", "method", "path", "t0", "task", "resp_at", "status", "samples", "others", "workers",
                  "last_sample", "query", "inflight_same")
@@ -106,7 +149,7 @@ class _Req:
     def __init__(self, rid: int, method: str, path: str, t0: float, task, query: str = "",
                  inflight_same: int = 0) -> None:
         self.id, self.method, self.path, self.t0, self.task = rid, method, path, t0, task
-        self.query, self.inflight_same = query, inflight_same
+        self.query, self.inflight_same = sanitize_query(query), inflight_same
         self.resp_at: Optional[float] = None
         self.status: Optional[int] = None
         self.samples: Counter = Counter()
@@ -155,7 +198,7 @@ class ReqTrace:
                         trace.close_stats()
             path = scope.get("path", "?")
             try:
-                query = (scope.get("query_string") or b"").decode("latin-1")[:300]
+                query = sanitize_query(scope.get("query_string") or b"")
             except Exception:  # noqa: BLE001
                 query = ""
             with trace._lock:

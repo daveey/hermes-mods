@@ -247,3 +247,55 @@ def test_sink_writes_stats_record_without_a_log_line(tmp_path, caplog):
     sink({"kind": "request_stats", "hour": "2026-11-03T13", "paths": {}})
     assert json.loads(out.read_text())["kind"] == "request_stats"
     assert "slow request" not in caplog.text
+
+
+SYN = "SYNTHETICSECRET123"
+
+
+def test_sanitize_query_redacts_credentials_keeps_safe():
+    q = rt.sanitize_query(
+        f"limit=5&Token={SYN}&access_token={SYN}&API_KEY={SYN}&%74oken={SYN}&%2574oken={SYN}"
+        f"&Authorization=Bearer%20{SYN}&password={SYN}&secret={SYN}&api-key={SYN}&profile=p1&token=&profile=p2")
+    assert SYN not in q and "SYNTHETIC" not in q
+    assert "limit=5" in q and "profile=p1" in q and "profile=p2" in q
+    assert q.count("[REDACTED]") == 10  # incl. blank value and encoded names
+    assert rt.sanitize_query(b"a=1&TOKEN=" + SYN.encode()) == "a=1&TOKEN=[REDACTED]"
+    assert rt.sanitize_query("") == "" and rt.sanitize_query(None) == ""
+    assert rt.sanitize_query("order=recent&limit=100") == "order=recent&limit=100"
+
+
+def test_sanitize_query_failure_never_echoes(monkeypatch):
+    monkeypatch.setattr(rt, "_decode_name", lambda n: (_ for _ in ()).throw(ValueError(n)))
+    out = rt.sanitize_query(f"token={SYN}")
+    assert SYN not in out
+
+
+def test_secret_absent_from_slow_report_and_stats_sink():
+    reps = []
+    now = [100.0]
+    hour = [1000]
+    trace = rt.ReqTrace(sink=reps.append, slow_s=2.0, clock=lambda: now[0])
+    orig_time = rt.time.time
+    rt.time.time = lambda: hour[0] * 3600 + 5.0
+    try:
+        # direct record construction
+        req = rt._Req(1, "GET", "/api/files/download", now[0] - 3.0, None,
+                      f"path=a.txt&TOKEN={SYN}&%61ccess_token={SYN}", 0)
+        assert SYN not in req.query and "path=a.txt" in req.query
+        req.resp_at = now[0]
+        trace._finish(req)
+        # ASGI entry
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+        wrapped = trace.wrap(app)
+        asyncio.run(wrapped({"type": "http", "method": "GET", "path": "/api/files/download",
+                             "query_string": f"path=b.txt&token={SYN}".encode()}, None,
+                            lambda m: asyncio.sleep(0)))
+        hour[0] += 1
+        trace.flush_stats()
+    finally:
+        rt.time.time = orig_time
+    blob = json.dumps(reps, default=str)
+    assert SYN not in blob
+    assert [r for r in reps if r["kind"] == "request_stats"]
+    assert "path=a.txt" in blob and "path=b.txt" in blob
