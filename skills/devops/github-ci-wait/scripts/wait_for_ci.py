@@ -282,7 +282,9 @@ def main(argv: list[str] | None = None) -> int:
     slug = a.gh_repo or gh_repo(repo)
 
     def fetch():
-        git(repo, "fetch", "-q", "--tags", "--force", "origin", a.branch)
+        # Explicit refspec: with a narrow remote.origin.fetch (only main), `fetch origin <branch>` updates only
+        # FETCH_HEAD, so origin/<branch> stays missing or stale and a pushed sha reads as "not on origin/<branch>".
+        git(repo, "fetch", "-q", "--tags", "--force", "origin", f"+refs/heads/{a.branch}:refs/remotes/origin/{a.branch}")
 
     fetch()
     shas = [git(repo, "rev-parse", "--verify", f"{s}^{{commit}}") for s in a.shas]

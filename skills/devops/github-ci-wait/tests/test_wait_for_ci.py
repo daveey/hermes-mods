@@ -281,6 +281,40 @@ class ContainsCacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class NarrowRefspecFetchTests(unittest.TestCase):
+    """A checkout whose remote.origin.fetch maps only main must still see a pushed helper branch's sha."""
+
+    def test_branch_wait_works_with_a_main_only_refspec(self):
+        import contextlib
+        import io
+        import subprocess
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            origin, local = root / "origin", root / "local"
+
+            def g(repo, *args):
+                return subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", "-c",
+                                       "core.hooksPath=/dev/null", "-c", "user.email=y@e.com", "-c", "user.name=y",
+                                       *args], check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True)
+            g(origin, "commit", "-q", "--allow-empty", "-m", "a")
+            subprocess.run(["git", "clone", "-q", str(origin), str(local)], check=True, capture_output=True)
+            g(local, "config", "--replace-all", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+            g(origin, "checkout", "-q", "-b", "helper")
+            g(origin, "commit", "-q", "--allow-empty", "-m", "h")
+            sha = g(origin, "rev-parse", "HEAD")
+            g(local, "fetch", "-q", "origin", "helper")  # FETCH_HEAD only: origin/helper still missing
+            self.assertNotEqual(subprocess.run(["git", "-C", str(local), "rev-parse", "--verify", "-q",
+                                                "origin/helper"], capture_output=True).returncode, 0)
+            out = io.StringIO()
+            with mock.patch.object(w, "list_runs", return_value=[]), contextlib.redirect_stdout(out):
+                rc = w.main([sha, "--repo", str(local), "--branch", "helper", "--once", "--gh-repo", "o/r"])
+            self.assertNotEqual(rc, 3, out.getvalue())
+            self.assertNotIn("is not on origin/helper", out.getvalue())
+
+
 class BoundedCallTests(unittest.TestCase):
     """A hung or failing gh/git call must neither hold a wait past its deadline nor crash it."""
 
