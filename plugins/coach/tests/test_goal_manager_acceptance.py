@@ -281,9 +281,14 @@ def test_pre_verify_runs_once_after_owner_accepts(environment, monkeypatch, orde
     assert out[5]._pre_final_gate_attempts == 1 and out[5]._pre_verify_nudges == 1
     assert out[0]['final_response'] == accepted
     assert all(not row.get('_pre_verify_synthetic') for row in out[0]['messages'])
+    # Acceptance by the owner does not publish the buffered draft: pre_verify
+    # must explain that it was hidden, just like a pre_final_gate hold.
+    from agent.pre_final_gate import HELD_NOTICE
     nudges = [row for row in out[1][-1]['messages']
-              if row.get('content') == 'ACCEPTANCE_VERIFY_NUDGE']
+              if 'ACCEPTANCE_VERIFY_NUDGE' in str(row.get('content', ''))]
     assert len(nudges) == 1
+    assert nudges[0]['role'] == 'user'
+    assert nudges[0]['content'] == f'{HELD_NOTICE}\n\nACCEPTANCE_VERIFY_NUDGE'
 
 
 def test_complete_turn_captures_before_persist_and_keeps_restriction(environment, monkeypatch):
