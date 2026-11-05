@@ -10,6 +10,13 @@ import pytest
 
 pytestmark = pytest.mark.skipif(not Path('/proc').is_dir(), reason='needs /proc')
 
+# Each nested pytest must run with cwd=suite, not the parent's plugin checkout.
+# Its copied HomeGuard allows the temporary suite, not the parent's source tree.
+# CPython's fd-relative rmtree emits open('pytest', ...) without dir_fd in the
+# audit event; resolving that name against an inherited checkout cwd falsely
+# reports live/foreign-plugin access during TemporaryDirectory finalization.
+# Keep the guard and all teardown assertions enabled; isolate the child's cwd.
+
 
 def _alive(pid):
     try:
@@ -58,7 +65,7 @@ def test_spawn(tmp_path_factory):
 ''')
     env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
     result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(suite)],
-                            env=env, capture_output=True, text=True, timeout=180)
+                            env=env, cwd=suite, capture_output=True, text=True, timeout=180)
     pid = int(pidfile.read_text())
     try:
         assert result.returncode == 0, result.stdout + result.stderr
@@ -103,7 +110,7 @@ def test_02_drained():
 ''')
     env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
     result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(suite)],
-                            env=env, capture_output=True, text=True, timeout=180)
+                            env=env, cwd=suite, capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'Traceback' not in result.stderr
 
@@ -141,7 +148,7 @@ def pytest_sessionfinish(session, exitstatus):
     env['PYTHONPATH'] = os.pathsep.join([str(suite), env.get('PYTHONPATH', '')])
     result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
                              '-p', 'lifecycle_probe', str(suite)],
-                            env=env, capture_output=True, text=True, timeout=180)
+                            env=env, cwd=suite, capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'Traceback' not in result.stderr
     assert receipt.read_text() == 'written before cleanup'
