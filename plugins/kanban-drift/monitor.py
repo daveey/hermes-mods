@@ -118,9 +118,52 @@ def alert_after(config, key):
     return float(value)
 
 
-def stale_targets(config, receipts, now):
-    return sorted(key for key, row in receipts.items()
-                  if row.get("unavailable_since") is not None and now - row["unavailable_since"] > alert_after(config, key))
+DEFAULT_ABSENT_ALERT_AFTER = 7 * 86400  # seconds a host may be powered off/offline before the run fails
+
+
+def absent_after(config, key):
+    value = config.get("absent_alert_after", DEFAULT_ABSENT_ALERT_AFTER)
+    if isinstance(value, dict):
+        value = value.get(key, value.get("*", DEFAULT_ABSENT_ALERT_AFTER))
+    return float(value)
+
+
+def host_present(argv, timeout=15):
+    """Presence probe: exit 0 = host up, other exit = host down. A probe that cannot run or
+    times out counts as up, so a broken probe keeps sampling failures loud instead of hiding them."""
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=timeout).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def classify(config, receipts, now):
+    """Return ({stale key: reason}, [absent keys]) for targets in a dark period.
+
+    Without a `presence` command a target is stale once dark longer than unavailable_alert_after
+    (reason unavailable_too_long). With one, a host that is down is `absent` (expected: a closed
+    laptop) and fails only after absent_alert_after (absent_too_long); a host that is up while its
+    sample fails is the real blind spot and fails after unavailable_alert_after (sample_failing_while_up)."""
+    presence = config.get("presence") or {}
+    stale, absent = {}, []
+    for key, row in receipts.items():
+        since = row.get("unavailable_since")
+        if since is None:
+            continue
+        dark = now - since
+        if key not in presence:
+            if dark > alert_after(config, key):
+                stale[key] = "unavailable_too_long"
+            continue
+        up = host_present(presence[key], config.get("presence_timeout", 15))
+        row["host_present"] = up
+        if not up:
+            absent.append(key)
+            if dark > absent_after(config, key):
+                stale[key] = "absent_too_long"
+        elif dark > alert_after(config, key):
+            stale[key] = "sample_failing_while_up"
+    return stale, sorted(absent)
 
 
 def main():
@@ -144,10 +187,11 @@ def main():
             except Exception as exc:
                 receipts[key] = {"last_sample": report, "consumer_error": str(exc)}
         now = time.time()
-        stale = stale_targets(config, receipts, now)
-        print(json.dumps({"sampled_at": now, "stale_targets": stale, "targets": receipts}, sort_keys=True))
-        # Exit 1 = a consumer error, or a target dark longer than its threshold. A briefly
-        # unavailable target (asleep, rebooting) only resets its streak and keeps exit 0.
+        stale, absent = classify(config, receipts, now)
+        print(json.dumps({"sampled_at": now, "stale_targets": sorted(stale), "stale_reasons": stale,
+                          "absent_targets": absent, "targets": receipts}, sort_keys=True))
+        # Exit 1 = a consumer error, or a stale target (see classify). A briefly unavailable
+        # target, or an absent host within absent_alert_after, only resets its streak: exit 0.
         return int(bool(stale) or any(r.get("consumer_error") for r in receipts.values()))
 
 

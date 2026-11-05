@@ -237,3 +237,92 @@ def test_main_consumer_error_still_exits_one(tmp_path, monkeypatch):
     _run_main(tmp_path, monkeypatch, {"host/default": _emit(DIRTY, 1)}, 1.0, tools=tools)
     code, _ = _run_main(tmp_path, monkeypatch, {"host/default": _emit(DIRTY, 1)}, 2.0, tools=broken)
     assert code == 1
+
+
+# Presence: tell "host is off" (expected, e.g. a closed laptop) from "host is up but sampling fails".
+HOST_DOWN = [sys.executable, "-c", "import sys; sys.exit(1)"]
+HOST_UP = [sys.executable, "-c", "import sys; sys.exit(0)"]
+H14 = 14 * 3600.0
+
+
+@requires_core
+def test_main_absent_host_14h_exits_zero_and_lists_absent(tmp_path, monkeypatch, capsys):
+    """Replays cron-0d63c0cf26: laptop closed 14 h, presence probe says down -> not a failure."""
+    extra = {"presence": {"laptop/default": HOST_DOWN}, "unavailable_alert_after": {"laptop/default": 43200}}
+    _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 0.0, **extra)
+    capsys.readouterr()
+    code, state = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, H14, **extra)
+    receipt = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert receipt["stale_targets"] == []
+    assert receipt["absent_targets"] == ["laptop/default"]
+    assert state["targets"]["laptop/default"]["unavailable_since"] == 0.0
+
+
+@requires_core
+def test_main_sample_failing_while_host_up_still_exits_one(tmp_path, monkeypatch, capsys):
+    """Detection guard: the real blind spot (host reachable, sampling broken) stays loud."""
+    extra = {"presence": {"laptop/default": HOST_UP}, "unavailable_alert_after": {"laptop/default": 43200}}
+    _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 0.0, **extra)
+    capsys.readouterr()
+    code, _ = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, H14, **extra)
+    receipt = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert receipt["stale_targets"] == ["laptop/default"]
+    assert receipt["stale_reasons"] == {"laptop/default": "sample_failing_while_up"}
+    assert receipt["absent_targets"] == []
+
+
+@requires_core
+def test_main_absent_longer_than_absent_alert_after_exits_one(tmp_path, monkeypatch, capsys):
+    extra = {"presence": {"laptop/default": HOST_DOWN}}
+    _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 0.0, **extra)
+    capsys.readouterr()
+    code, _ = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 6 * 86400.0, **extra)
+    assert code == 0
+    capsys.readouterr()
+    code, _ = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 7 * 86400.0 + 1, **extra)
+    receipt = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert receipt["stale_targets"] == ["laptop/default"]
+    assert receipt["stale_reasons"] == {"laptop/default": "absent_too_long"}
+    assert receipt["absent_targets"] == ["laptop/default"]
+
+
+@requires_core
+def test_main_without_presence_keeps_elapsed_only_behaviour(tmp_path, monkeypatch, capsys):
+    extra = {"unavailable_alert_after": {"laptop/default": 43200}}
+    _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 0.0, **extra)
+    capsys.readouterr()
+    code, _ = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, H14, **extra)
+    receipt = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert receipt["stale_targets"] == ["laptop/default"]
+    assert receipt["stale_reasons"] == {"laptop/default": "unavailable_too_long"}
+    assert receipt["absent_targets"] == []
+
+
+@requires_core
+@pytest.mark.parametrize("probe", [["/nonexistent/presence-fixture"],
+                                   [sys.executable, "-c", "import time; time.sleep(30)"]])
+def test_main_presence_probe_error_counts_as_up(tmp_path, monkeypatch, capsys, probe):
+    extra = {"presence": {"laptop/default": probe}, "presence_timeout": 1,
+             "unavailable_alert_after": {"laptop/default": 43200}}
+    _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, 0.0, **extra)
+    capsys.readouterr()
+    code, _ = _run_main(tmp_path, monkeypatch, {"laptop/default": ASLEEP}, H14, **extra)
+    receipt = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert receipt["stale_reasons"] == {"laptop/default": "sample_failing_while_up"}
+    assert receipt["absent_targets"] == []
+
+
+@requires_core
+def test_main_presence_not_probed_for_available_target(tmp_path, monkeypatch, capsys):
+    marker = tmp_path / "probed"
+    probe = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    code, _ = _run_main(tmp_path, monkeypatch, {"laptop/default": _emit(CLEAN)}, 0.0,
+                        presence={"laptop/default": probe})
+    assert code == 0
+    assert not marker.exists()
+    assert json.loads(capsys.readouterr().out)["absent_targets"] == []

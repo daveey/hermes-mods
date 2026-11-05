@@ -23,6 +23,15 @@ target key → seconds with optional `"*"` default), so a sleeping laptop does n
 sample hit a `consumer_error` or a target has been dark longer than its threshold. The receipt lists those
 targets in `stale_targets`, so the scheduler's failure detector catches a lasting blind spot.
 
+Elapsed time alone cannot tell "host is off" (a closed laptop, a trip) from "host is up but sampling it
+fails". Optional `presence` (map of target key → argv, run only while that target is unavailable,
+`presence_timeout` seconds, default 15) answers it: exit 0 = host up, any other exit = host down. A host
+that is down is listed in `absent_targets` and fails the run only after `absent_alert_after` (default
+604800 = 7 days; int or per-target map like above). A host that is up while its sample keeps failing still
+fails after `unavailable_alert_after`. A probe that cannot run or times out counts as up, so a broken probe
+never hides a real failure. `stale_reasons` maps each stale target to `unavailable_too_long` (no presence
+configured), `sample_failing_while_up` or `absent_too_long`. Keep presence argv (hostnames) in host config.
+
 Deployment is opt-in: install ONE cron/timer on an always-on gateway, recording owner, schedule ID,
 config path, state path, command and receipt location. Disable that schedule to roll back; preserve
 state for restart-safe dedup. Do not enable another consumer for the same targets.
@@ -31,7 +40,9 @@ state for restart-safe dedup. Do not enable another consumer for the same target
 
 `scripts/test-all -k kanban-drift` exercises dirty-dirty, dirty-clean-dirty, restart, unavailable,
 closed-card renewal, crash-after-create recovery, command failures, duplicate suppression, and
-main() exit codes for short vs stale unavailability (global and per-target thresholds).
+main() exit codes for short vs stale unavailability (global and per-target thresholds), and presence:
+an absent host for 14 h exits 0, a reachable host with failing samples exits 1, absence past 7 days
+exits 1, and an erroring or hung presence probe counts as up.
 All card writes use isolated sinks (including a native-tool integration test with an explicitly
 isolated canonical Kanban path); tests cannot post live repair alerts. Malformed command output
 retains the exit code and bounded stderr diagnostic, while still failing unavailable.
