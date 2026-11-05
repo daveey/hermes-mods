@@ -2,6 +2,12 @@
 
 Patch **0592** (source `512f93867f`). Follows [kanban-replica-decode-memo.md](kanban-replica-decode-memo.md) (0536).
 
+**Historical snapshot:** the heartbeat-row key and per-heartbeat time horizons below
+were superseded by patches **2008–2009**. The current memo recomputes normalized
+fresh-scope verdicts on each read, allowing a timestamp refresh with the same verdict
+to reuse the projection. See [the current behavior and tests](mirror-2010-features.md#replica-read-memo-keyed-on-heartbeat-verdicts).
+The measurements below belong to 0592, not the current snapshot.
+
 After the chat-closeout fix ([backend-writable-open-guard.md](backend-writable-open-guard.md)), replaying
 `GET /api/profiles/sessions/sidebar` every 2 s against the live `~/.hermes` still spent most of its kanban time in the
 remote-links projection: `_project_remote_links` rebuilt on nearly every poll and each rebuild re-read all ~6.1k replica

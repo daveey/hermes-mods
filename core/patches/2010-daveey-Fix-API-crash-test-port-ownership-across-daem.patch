@@ -1,0 +1,183 @@
+From 79e38bd675dc56816606cf0736123bbf45dacfdd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 19:09:15 +0000
+Subject: [PATCH] [daveey] Fix API crash test port ownership across daemon
+ restarts
+
+---
+ gateway/platforms/api_server.py               |  4 +--
+ .../gateway/test_api_crash_collision_probe.py | 32 +++++++++++++++++++
+ tests/gateway/test_api_crash_recovery.py      | 26 +++++++++++----
+ tests/gateway/test_api_server_bound_port.py   | 28 ++++++++++++++++
+ 4 files changed, 81 insertions(+), 9 deletions(-)
+ create mode 100644 tests/gateway/test_api_crash_collision_probe.py
+ create mode 100644 tests/gateway/test_api_server_bound_port.py
+
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index aee9b74a7c7..4a3b22a74df 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -3891,8 +3891,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+         with self._session_db_cache_lock:
+             self._session_db_cache_closed = False
+         if not self._api_key_passes_startup_guard():
+-            # Config error, not transient: a bare ``return False`` would make the reconnect watcher
+-            # re-instantiate the adapter (+ sqlite connection) until EMFILE.
+             self._set_fatal_error(
+                 # A rejected API_SERVER_KEY is a configuration error, not a transient blip — the key will
+                 # not become valid on its own. A bare ``return False`` makes the reconnect watcher in
+@@ -3994,6 +3992,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+                     "config.yaml: platforms.api_server.port",
+                     self.name, self._host, self._port, exc)
+                 return False
++            # Port 0 asks the kernel to allocate; publish the owned endpoint, not :0.
++            self._port = self._runner.addresses[0][1]
+             from gateway.platforms.shared_ingress import listener_base_url
+             self._mark_connected(listener_base=listener_base_url(self._host, self._port))
+             # Publish a metrics-bearing snapshot at bind and keep it fresh: the
+diff --git a/tests/gateway/test_api_crash_collision_probe.py b/tests/gateway/test_api_crash_collision_probe.py
+new file mode 100644
+index 00000000000..897f18ff1fb
+--- /dev/null
++++ b/tests/gateway/test_api_crash_collision_probe.py
+@@ -0,0 +1,32 @@
++"""Controlled reproduction: the dashboard takes the released API port on restart."""
++import subprocess
++from pathlib import Path
++import re
++
++from tests.gateway.test_api_crash_recovery import test_api_crash_queue_and_identified_result_retry as exercise
++
++
++def test_dashboard_takes_released_port(tmp_path, monkeypatch):
++    original = subprocess.Popen
++
++    restarts = 0
++
++    def spawn(command, **kwargs):
++        nonlocal restarts
++        if command[1:] == ['-m', 'gateway.run']:
++            restarts += 1
++        if command[1:] == ['-m', 'gateway.run'] and restarts == 2:
++            log = Path(kwargs['env']['HERMES_HOME']) / 'logs/gateway.log'
++            ports = re.findall(r'API server listening on http://127\.0\.0\.1:([0-9]+)', log.read_text(encoding='utf-8'))
++            previous_port = int(ports[-1])
++            code = (
++                'import functools, runpy; from gateway import run_api; '
++                'run_api.start_gateway_api = functools.partial(run_api.start_gateway_api, '
++                f'port={previous_port}); '
++                'runpy.run_module("gateway.run", run_name="__main__")'
++            )
++            command = [command[0], '-c', code]
++        return original(command, **kwargs)
++
++    monkeypatch.setattr(subprocess, 'Popen', spawn)
++    exercise(tmp_path)
+diff --git a/tests/gateway/test_api_crash_recovery.py b/tests/gateway/test_api_crash_recovery.py
+index 93939785476..b9eff327fc0 100644
+--- a/tests/gateway/test_api_crash_recovery.py
++++ b/tests/gateway/test_api_crash_recovery.py
+@@ -4,7 +4,7 @@ from http.server import ThreadingHTTPServer
+ import json
+ import os
+ from pathlib import Path
+-import socket
++import re
+ import sqlite3
+ import threading
+ 
+@@ -13,7 +13,7 @@ pytest.importorskip("aiohttp.test_utils", reason="aiohttp not installed (optiona
+ import aiohttp
+ 
+ from tests.gateway.fixtures.local_recovery_probe import child_env, daemon, Model
+-from tests.waiting import async_wait_until
++from tests.waiting import async_wait_until, wait_until
+ 
+ 
+ def test_api_crash_queue_and_identified_result_retry(tmp_path):
+@@ -24,18 +24,27 @@ def test_api_crash_queue_and_identified_result_retry(tmp_path):
+     peer.requests = []
+     peer.blocked, peer.release = threading.Event(), threading.Event()
+     threading.Thread(target=peer.serve_forever, daemon=True).start()
+-    with socket.socket() as sock:
+-        sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
++
+     base = f'http://127.0.0.1:{peer.server_port}/v1'
+     cfg = {'model': {'provider': 'custom', 'default': 'local-wire-stub', 'base_url': base},
+-           'gateway': {'platforms': {'api_server': {'enabled': True, 'port': port, 'host': '127.0.0.1'}}, 'multiplex_profiles': False},
++           'gateway': {'platforms': {'api_server': {'enabled': True, 'port': 0, 'host': '127.0.0.1'}}, 'multiplex_profiles': False},
+            'auxiliary': {'title_generation': {'enabled': False}}, 'terminal': {'cwd': str(home)}}
+     (home / 'config.yaml').write_text(json.dumps(cfg))
+     env = {**child_env(), **{k: os.environ[k] for k in ('TIRITH_ENABLED',) if k in os.environ}}
+     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
+                OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=base, API_SERVER_KEY='ordinary-daemon-owned-secret',
+-               API_SERVER_ENABLED='true', API_SERVER_PORT=str(port), PYTHONUNBUFFERED='1')
+-    url = f'http://127.0.0.1:{port}/v1'
++               API_SERVER_ENABLED='true', API_SERVER_PORT='0', PYTHONUNBUFFERED='1')
++
++    api_log = home / 'logs/gateway.log'
++
++    def api_url(log_offset):
++        # Control-plane readiness does not identify the aiohttp listener. Bind in
++        # the child: bind/close in the parent leaves a port the next dashboard
++        # (or another test) can claim between crashes.
++        def listening():
++            text = api_log.read_bytes()[log_offset:].decode('utf-8', errors='replace')
++            return re.search(r'API server listening on (http://127\.0\.0\.1:[1-9][0-9]*) ', text)
++        return wait_until(listening, timeout=120, what='this daemon API listener').group(1) + '/v1'
+     headers = {'Authorization': 'Bearer ordinary-daemon-owned-secret'}
+     runs = {}
+     pids, epochs = [], []
+@@ -106,12 +115,15 @@ def test_api_crash_queue_and_identified_result_retry(tmp_path):
+     try:
+         with daemon(root, home, env, barrier=True, fixture='api_recovery_daemon.py') as (proc, desc):
+             pids.append(proc.pid); epochs.append(desc['authority_epoch'])
++            url = api_url(0)
+             asyncio.run(first())
+             proc.kill(); proc.wait(timeout=10)
+         peer.release.set()
+         for _ in range(2):
++            log_offset = api_log.stat().st_size
+             with daemon(root, home, env, barrier=False) as (proc, desc):
+                 pids.append(proc.pid); epochs.append(desc['authority_epoch'])
++                url = api_url(log_offset)
+                 asyncio.run(restarted())
+                 proc.kill(); proc.wait(timeout=10)
+         texts = [next((m.get('content', '') for m in reversed(req['messages']) if m['role'] == 'user'), '') for req in peer.requests]
+diff --git a/tests/gateway/test_api_server_bound_port.py b/tests/gateway/test_api_server_bound_port.py
+new file mode 100644
+index 00000000000..174133c6107
+--- /dev/null
++++ b/tests/gateway/test_api_server_bound_port.py
+@@ -0,0 +1,28 @@
++"""Ephemeral API listeners publish the address they actually own."""
++import logging
++
++import pytest
++pytest.importorskip("aiohttp", reason="optional messaging extra")
++import aiohttp
++
++from gateway.config import PlatformConfig
++from gateway.platforms.api_server import APIServerAdapter
++
++
++@pytest.mark.asyncio
++async def test_ephemeral_listener_reports_bound_port(caplog):
++    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
++        'host': '127.0.0.1', 'port': 0, 'key': 'test-owned-strong-api-secret',
++    }))
++    try:
++        with caplog.at_level(logging.INFO):
++            assert await adapter.connect()
++        port = adapter._runner.addresses[0][1]
++        assert port > 0
++        assert adapter._api_server_status_payload()['port'] == port
++        assert f'API server listening on http://127.0.0.1:{port} ' in caplog.text
++        async with aiohttp.ClientSession() as client:
++            async with client.get(f'http://127.0.0.1:{port}/health') as response:
++                assert response.status == 200
++    finally:
++        await adapter.disconnect()
+-- 
+2.55.0
+

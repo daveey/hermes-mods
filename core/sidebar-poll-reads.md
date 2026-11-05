@@ -50,7 +50,9 @@ three through; each of those spent ~600 ms.
 - Pinned back-fill: driven from `SELECT id FROM sessions WHERE pinned = 1`, then the same filter and columns.
 - Replica read memo (0592): the key drops `last_ok`; a hit also requires the same stale verdict and the same
   per-owner `synced_at` (`_replica_synced`, the projection's own expression over the memoized rows' update times),
-  which are the only ways `last_ok` reaches the answer. Reuse still ends at the next scope-heartbeat cut-off.
+  which are the only ways `last_ok` reaches the answer. Historically reuse ended at the next scope-heartbeat cut-off;
+  patches 2008–2009 instead recompute fresh-scope verdicts on every read and reuse while those verdicts stay equal
+  ([current behavior and tests](mirror-2010-features.md#replica-read-memo-keyed-on-heartbeat-verdicts)).
 - `_project_remote_links` resolves tips on one state.db connection per projection
   (`kanban_origin_adapter._resolve_session(path, sid, conn)`, each lookup in its own read transaction, ended by a
   rollback). Inside `one_annotation_snapshot`, every `_remote_links` / `remote_links_and_origin_rows` reader shares

@@ -1,0 +1,666 @@
+From 33a9e561246b797a1fc9d3c2dd749aaf0f35c114 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:42:33 +0000
+Subject: [PATCH] fix(kanban): fence a worker's graph/lifecycle calls after its
+ own run ended; say "run over" on success [daveey]
+
+agent-6ab88d2b1c (incident t_01a1a57922c2ba77 run 158177): a worker parked with
+kanban_block(kind='dependency'), then kanban_unlink'ed that parent (the card was promoted back to
+READY), then tried kanban_block(kind='time') and kanban_schedule. Both were refused "unknown id or not
+in running/ready/triage" although the card was READY: the real cause, the ended run, was never named.
+
+- tools/kanban_tools_run_end.py (new): ended_run() reads the worker's own task_runs row
+  (HERMES_KANBAN_TASK + HERMES_KANBAN_RUN_ID; ended_at set). refusal() returns
+  code=run_already_ended with run_id, run_outcome and the card's current status (schedule keeps the
+  human-answer way out). with_success_fields() adds run_ended=true + next="This run is over; the card
+  is <status>. ..." to a success that ended the caller's own run.
+- _worker_guard: block/schedule/continue/move/request_review/request_changes refuse up front with
+  run_already_ended once the worker's run ended. kanban_complete is exempt (keeps parked_by_own_run).
+- _kanban_handler: every successful run-lifecycle result for the worker's own run carries
+  run_ended/next (block, schedule, complete, continue, move, request_review). The read runs only for a
+  bound worker and, since the transition is already committed, a failed read returns the original success.
+- kanban_link/kanban_unlink: a worker whose run ended may not edit an edge on its OWN card.
+  Orchestrators (no HERMES_KANBAN_TASK), live workers, unbound workers and links between two other
+  cards are unchanged.
+- schemas: kanban_block says it ends the run; kanban_unlink says it is refused once the run ended.
+
+Contract change: test_worker_blocks_on_dependency_then_unlinks_and_completes (block -> unlink ->
+complete) encoded the flow that undid the park; it now unlinks while the run is live, and
+test_old_run_cannot_complete_once_the_card_was_reclaimed does its unlink as an orchestrator.
+
+Proof:
+- RED: new tests/tools/test_kanban_post_run_calls.py 14/14 failed on 221510a25b3; GREEN 27/27 (incl. request_changes fence, failed-annotation keeps success, no reads for non-workers).
+- 116 kanban test files: 2769 pass before the expectation updates; the 3 failures were the old contract
+  (exact success dict, refusal wording, post-park unlink), updated above.
+- 19 mutants (every added condition) killed.
+- Independent pinned-Opus review of f0dfa46: approve; its notes (masked committed success on a failed
+  annotation read, extra DB opens for non-workers, untested request_changes fence) are fixed here.
+- Replay over hub state.db (12,727 kanban sessions, deduped re-persisted rows) + all hub boards'
+  task_runs: 0 lifecycle successes after the caller's run ended (the up-front fence only rewords 17
+  real refusals, incl. 857674/857697 of the incident); 16 post-end graph successes, 13 on the worker's
+  own card (now refused, incl. the incident's 857664) and 3 linking two other cards (unchanged).
+---
+ .../test_kanban_refused_op_comments.py        |   1 +
+ tests/tools/test_kanban_post_run_calls.py     | 298 ++++++++++++++++++
+ tests/tools/test_kanban_tools.py              |  23 +-
+ tools/kanban_tools.py                         |  12 +-
+ tools/kanban_tools_graph.py                   |  10 +
+ tools/kanban_tools_run_end.py                 | 126 ++++++++
+ tools/kanban_tools_schemas.py                 |   9 +-
+ 7 files changed, 466 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tools/test_kanban_post_run_calls.py
+ create mode 100644 tools/kanban_tools_run_end.py
+
+diff --git a/tests/hermes_cli/test_kanban_refused_op_comments.py b/tests/hermes_cli/test_kanban_refused_op_comments.py
+index 57d817a78be..a23039bcebd 100644
+--- a/tests/hermes_cli/test_kanban_refused_op_comments.py
++++ b/tests/hermes_cli/test_kanban_refused_op_comments.py
+@@ -188,6 +188,7 @@ def test_tool_refused_schedule_leaves_no_comment_and_says_why(worker_env):
+     from tools import kanban_tools as kt
+     out = json.loads(kt._handle_schedule({"reason": "Parked on the wall", "clock_only": True}))
+     assert "blocked on a human answer (block_kind needs_input" in out.get("error", ""), out
++    assert out.get("code") == "run_already_ended", out  # the worker's own block ended its run
+     with kbc.connect() as conn:
+         assert kb.get_task(conn, worker_env).status == "blocked"
+         assert _comments(conn, worker_env) == []
+diff --git a/tests/tools/test_kanban_post_run_calls.py b/tests/tools/test_kanban_post_run_calls.py
+new file mode 100644
+index 00000000000..7e1ccd2063b
+--- /dev/null
++++ b/tests/tools/test_kanban_post_run_calls.py
+@@ -0,0 +1,298 @@
++"""Kanban calls a worker makes after its own run ended (agent-6ab88d2b1c). [daveey]
++
++Incident t_01a1a57922c2ba77 run 158177: the worker parked with kanban_block(kind='dependency'), then
++unlinked that same parent (which promoted the card back to READY), then tried kanban_block(kind='time')
++and kanban_schedule. Both were refused with "unknown id or not in running/ready/triage" although the
++card was READY. The real cause was that its run had already ended.
++
++Contract:
++- a run-ending success (block, schedule, complete, continue, request_review) says so: ``run_ended`` +
++  ``next``;
++- link/unlink by a worker whose run has ended are refused with ``code=run_already_ended`` and change
++  nothing (edges and status stay as the park left them);
++- a later lifecycle call is refused with ``code=run_already_ended`` naming the run, how it ended and the
++  card's current status (not "unknown id");
++- an orchestrator (no HERMES_KANBAN_TASK) and a worker whose run is live keep their graph tools.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from tests.tools import test_kanban_tools as _kt_tests
++
++worker_env = _kt_tests.worker_env
++
++
++def _conn():
++    from hermes_cli import kanban_db_connect as kbc
++    return kbc.connect()
++
++
++def _state(tid):
++    from hermes_cli import kanban_db as kb
++    with _conn() as conn:
++        return kb.get_task(conn, tid).status, kb.parent_ids(conn, tid)
++
++
++def _new_task(title):
++    from hermes_cli import kanban_db as kb
++    with _conn() as conn:
++        return kb.create_task(conn, title=title)
++
++
++def _dependency_park(tid):
++    """Link the worker's own live card under a fresh parent, then park on it."""
++    from tools import kanban_tools as kt
++    parent = _new_task("upstream")
++    linked = json.loads(kt._handle_link({"parent_id": parent, "child_id": tid}))
++    assert linked["ok"] is True, linked
++    parked = json.loads(kt._handle_block({"reason": "waiting on upstream", "kind": "dependency"}))
++    assert parked["ok"] is True and parked["status"] == "todo", parked
++    return parent, parked
++
++
++def _assert_run_already_ended(out: dict, run_id: int, status: str):
++    assert out.get("code") == "run_already_ended", out
++    assert out.get("run_id") == run_id and out.get("status") == status, out
++    assert out.get("run_outcome") == "blocked", out
++    assert f"run {run_id}" in out["error"] and status in out["error"], out
++    assert "unknown id" not in out["error"], out
++
++
++def _run_id():
++    import os
++    return int(os.environ["HERMES_KANBAN_RUN_ID"])
++
++
++# ── the incident sequence ──────────────────────────────────────────────────────────────────────
++
++def test_block_success_says_the_run_ended(worker_env):
++    _parent, parked = _dependency_park(worker_env)
++    assert parked["run_ended"] is True, parked
++    assert "This run is over" in parked["next"] and "todo" in parked["next"], parked
++
++
++def test_unlink_after_dependency_park_is_refused_and_changes_nothing(worker_env):
++    from tools import kanban_tools as kt
++    parent, _ = _dependency_park(worker_env)
++    out = json.loads(kt._handle_unlink({"parent_id": parent, "child_id": worker_env}))
++    _assert_run_already_ended(out, _run_id(), "todo")
++    assert _state(worker_env) == ("todo", [parent])
++
++
++def test_link_after_dependency_park_is_refused_and_changes_nothing(worker_env):
++    from tools import kanban_tools as kt
++    parent, _ = _dependency_park(worker_env)
++    other = _new_task("another upstream")
++    out = json.loads(kt._handle_link({"parent_id": other, "child_id": worker_env}))
++    _assert_run_already_ended(out, _run_id(), "todo")
++    assert _state(worker_env) == ("todo", [parent])
++
++
++@pytest.mark.parametrize("call", [
++    ("_handle_block", {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait", "kind": "time",
++                       "clock_only": True}),
++    ("_handle_schedule", {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait", "clock_only": True}),
++    ("_handle_continue", {"checkpoint": "resume later"}),
++    ("_handle_request_review", {"summary": "please review"}),
++    ("_handle_request_changes", {"reason": "please fix"}),
++])
++def test_lifecycle_after_dependency_park_names_the_ended_run(worker_env, call):
++    from tools import kanban_tools as kt
++    parent, _ = _dependency_park(worker_env)
++    name, args = call
++    out = json.loads(getattr(kt, name)(dict(args)))
++    _assert_run_already_ended(out, _run_id(), "todo")
++    assert _state(worker_env) == ("todo", [parent])
++
++
++def test_incident_sequence_end_to_end(worker_env):
++    """block(dependency) -> unlink -> block(time) -> schedule: the park survives every later call."""
++    from tools import kanban_tools as kt
++    parent, _ = _dependency_park(worker_env)
++    for fn, args in (
++        (kt._handle_unlink, {"parent_id": parent, "child_id": worker_env}),
++        (kt._handle_block, {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z", "kind": "time", "clock_only": True}),
++        (kt._handle_schedule, {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z", "clock_only": True}),
++    ):
++        _assert_run_already_ended(json.loads(fn(dict(args))), _run_id(), "todo")
++    assert _state(worker_env) == ("todo", [parent])
++
++
++def test_refusal_reports_the_successor_run_status(worker_env):
++    """A worker whose run was reclaimed and re-claimed sees the card's live status, not 'unknown id'."""
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++    old_run = _run_id()
++    with _conn() as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET status='released', outcome='reclaimed', ended_at=1 WHERE id=?",
++                         (old_run,))
++            conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL WHERE id=?",
++                         (worker_env,))
++        kb.claim_task(conn, worker_env)
++        new_run = kb._current_run_id(conn, worker_env)
++    assert new_run != old_run
++    out = json.loads(kt._handle_schedule({"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z", "clock_only": True}))
++    assert out.get("code") == "run_already_ended" and out.get("run_id") == old_run, out
++    assert out.get("run_outcome") == "reclaimed" and out.get("status") == "running", out
++    parent = _new_task("upstream")
++    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": worker_env}))
++    assert out.get("code") == "run_already_ended", out
++    with _conn() as conn:
++        assert kb.get_task(conn, worker_env).status == "running"
++        assert kb.parent_ids(conn, worker_env) == []
++        assert kb._current_run_id(conn, worker_env) == new_run
++
++
++# ── successful terminal tools say the run ended ────────────────────────────────────────────────
++
++@pytest.mark.parametrize("name,args,status", [
++    ("_handle_schedule", {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait", "clock_only": True}, "scheduled"),
++    ("_handle_block", {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait", "kind": "time",
++                       "clock_only": True}, "scheduled"),
++    ("_handle_complete", {"summary": "done"}, "done"),
++    ("_handle_continue", {"checkpoint": "resume later"}, "ready"),
++    ("_handle_request_review", {"summary": "please review"}, "review"),
++])
++def test_terminal_success_signals_run_ended(worker_env, name, args, status):
++    from tools import kanban_tools as kt
++    out = json.loads(getattr(kt, name)(dict(args)))
++    assert out.get("ok") is True, out
++    assert out.get("status", status) == status, out
++    assert out["run_ended"] is True, out
++    assert "This run is over" in out["next"], out
++
++
++# ── supported paths stay supported ─────────────────────────────────────────────────────────────
++
++def test_live_worker_links_and_unlinks_its_own_card(worker_env):
++    from tools import kanban_tools as kt
++    parent = _new_task("upstream")
++    assert json.loads(kt._handle_link({"parent_id": parent, "child_id": worker_env}))["ok"] is True
++    out = json.loads(kt._handle_unlink({"parent_id": parent, "child_id": worker_env}))
++    assert out["ok"] is True and out["unlinked"] is True, out
++    assert _state(worker_env) == ("running", [])
++
++
++def test_live_worker_heartbeat_result_has_no_run_ended(worker_env):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_heartbeat({"note": "alive"}))
++    assert out["ok"] is True and "run_ended" not in out, out
++
++
++def test_orchestrator_edits_a_parked_card_graph(worker_env, monkeypatch):
++    from tools import kanban_tools as kt
++    parent, _ = _dependency_park(worker_env)
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++    out = json.loads(kt._handle_unlink({"parent_id": parent, "child_id": worker_env}))
++    assert out["ok"] is True, out
++    other = _new_task("new upstream")
++    out = json.loads(kt._handle_link({"parent_id": other, "child_id": worker_env}))
++    assert out["ok"] is True, out
++    assert _state(worker_env)[1] == [other]
++
++
++def test_own_blocked_card_can_still_be_closed_by_its_worker(worker_env):
++    """kanban_complete keeps its own-park close (parked_by_own_run): the run-ended fence skips it."""
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++    with _conn() as conn:
++        assert kb.block_task(conn, worker_env, reason="David: approve", kind="needs_input",
++                             expected_run_id=_run_id())
++    out = json.loads(kt._handle_complete({"summary": "resolved after all"}))
++    assert out.get("ok") is True, out
++    assert out["run_ended"] is True, out
++    assert _state(worker_env)[0] == "done"
++
++
++def test_continue_keeps_its_own_next_and_adds_run_ended(worker_env):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_continue({"checkpoint": "resume later"}))
++    assert out["next"].startswith("Checkpoint saved;"), out
++    assert "This run is over; the card is ready." in out["next"], out
++
++
++def test_orchestrator_park_of_a_running_card_has_no_run_ended(worker_env, monkeypatch):
++    """The caller is not the worker whose run ended: no 'your run is over' signal."""
++    from tools import kanban_tools as kt
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++    out = json.loads(kt._handle_schedule({"task_id": worker_env, "clock_only": True,
++                                          "reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait"}))
++    assert out.get("ok") is True and out["status"] == "scheduled", out
++    assert "run_ended" not in out and "next" not in out, out
++
++
++def test_unbound_run_id_leaves_graph_tools_as_before(worker_env, monkeypatch):
++    """No parseable HERMES_KANBAN_RUN_ID: the fence cannot name a run, so it does not apply."""
++    from tools import kanban_tools as kt
++    from tools import kanban_tools_run_end as kre
++    parent, _ = _dependency_park(worker_env)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-a-number")
++    with _conn() as conn:
++        assert kre.ended_run(conn) is None
++    out = json.loads(kt._handle_unlink({"parent_id": parent, "child_id": worker_env}))
++    assert out.get("ok") is True, out
++
++
++def test_ended_run_ignores_another_tasks_scope(worker_env):
++    from tools import kanban_tools_run_end as kre
++    _dependency_park(worker_env)
++    with _conn() as conn:
++        assert kre.ended_run(conn, worker_env)["run_id"] == _run_id()
++        assert kre.ended_run(conn, "t_someone_else") is None
++
++
++def test_parked_worker_may_still_link_two_other_cards(worker_env):
++    """Replay: 3 real post-completion links wired cards the worker created; its own handoff is untouched."""
++    from tools import kanban_tools as kt
++    _dependency_park(worker_env)
++    a, b = _new_task("created a"), _new_task("created b")
++    out = json.loads(kt._handle_link({"parent_id": a, "child_id": b}))
++    assert out.get("ok") is True, out
++
++
++def test_parked_worker_may_not_link_its_own_card_as_a_parent(worker_env):
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++    _dependency_park(worker_env)
++    other = _new_task("downstream")
++    out = json.loads(kt._handle_link({"parent_id": worker_env, "child_id": other}))
++    _assert_run_already_ended(out, _run_id(), "todo")
++    with _conn() as conn:
++        assert kb.parent_ids(conn, other) == []
++
++
++def test_failed_annotation_keeps_the_committed_success(worker_env, monkeypatch):
++    """The park is committed before run_ended is read: a failed read must not turn it into an error."""
++    import sqlite3
++    from tools import kanban_tools as kt
++    from tools import kanban_tools_run_end as kre
++
++    def boom(*_a, **_k):
++        raise sqlite3.OperationalError("database is locked")
++    monkeypatch.setattr(kre, "with_success_fields", boom)
++    out = json.loads(kt._handle_schedule({"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait", "clock_only": True}))
++    assert out.get("ok") is True and out["status"] == "scheduled", out
++    assert "run_ended" not in out, out
++    assert _state(worker_env)[0] == "scheduled"
++
++
++def test_non_worker_lifecycle_call_skips_the_run_end_reads(worker_env, monkeypatch):
++    """Review note: an orchestrator call must not pay two extra board opens for a fence that cannot apply."""
++    from tools import kanban_tools as kt
++    from tools import kanban_tools_run_end as kre
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++
++    def no_read(*_a, **_k):
++        raise AssertionError("run-end read for a non-worker")
++    monkeypatch.setattr(kre, "refusal", no_read)
++    monkeypatch.setattr(kre, "with_success_fields", no_read)
++    out = json.loads(kt._handle_schedule({"task_id": worker_env, "clock_only": True,
++                                          "reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait"}))
++    assert out.get("ok") is True, out
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 8a12ddc1047..b76b69d7ac5 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -464,7 +464,9 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
+     assert out == {
+         "ok": True, "task_id": worker_env, "run_id": out["run_id"],
+         "status": "scheduled", "reason": reason,
++        "run_ended": True, "next": out["next"],  # agent-6ab88d2b1c: a run-ending success says so
+     }
++    assert "This run is over; the card is scheduled." in out["next"]
+     with kbc.connect() as conn:
+         assert kb.get_task(conn, worker_env).status == "scheduled"
+         run = kb.latest_run(conn, worker_env)
+@@ -1776,8 +1778,11 @@ def test_sweep_escalates_old_agent_owned_block_once(worker_env):
+ # kanban_unlink
+ # ---------------------------------------------------------------------------
+ 
+-def test_worker_blocks_on_dependency_then_unlinks_and_completes(worker_env):
+-    """link own card under a parent -> block(dependency) -> unlink -> complete own card."""
++def test_worker_links_then_unlinks_while_live_and_completes(worker_env):
++    """link own card under a parent -> unlink (run still live) -> complete own card.
++
++    Unlinking AFTER kanban_block(kind='dependency') is refused (run_already_ended): that is how a parked
++    worker undid its own park in agent-6ab88d2b1c (tests/tools/test_kanban_post_run_calls.py)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+     from tools import kanban_tools as kt
+@@ -1785,15 +1790,11 @@ def test_worker_blocks_on_dependency_then_unlinks_and_completes(worker_env):
+     with kbc.connect() as conn:
+         parent = kb.create_task(conn, title="upstream")
+     assert json.loads(kt._handle_link({"parent_id": parent, "child_id": worker_env}))["ok"] is True
+-    blocked = json.loads(kt._handle_block({"reason": "waiting on upstream", "kind": "dependency"}))
+-    assert blocked["ok"] is True
+-    with kbc.connect() as conn:
+-        assert kb.get_task(conn, worker_env).status == "todo"
+-
+     out = json.loads(kt._handle_unlink({"parent_id": parent, "child_id": worker_env}))
+     assert out["ok"] is True and out["unlinked"] is True
+     with kbc.connect() as conn:
+         assert kb.parent_ids(conn, worker_env) == []
++        assert kb.get_task(conn, worker_env).status == "running"
+ 
+     done = json.loads(kt._handle_complete({"summary": "no longer needs the parent"}))
+     assert "error" not in done, done
+@@ -1840,7 +1841,7 @@ def test_unlink_tool_registered_for_workers():
+     assert "kanban_unlink" not in kt._ORCHESTRATOR_TOOLS
+ 
+ 
+-def test_old_run_cannot_complete_once_the_card_was_reclaimed(worker_env):
++def test_old_run_cannot_complete_once_the_card_was_reclaimed(worker_env, monkeypatch):
+     """The late-completion path ends at the next claim: a stale run must not close the new run's card."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+@@ -1850,7 +1851,11 @@ def test_old_run_cannot_complete_once_the_card_was_reclaimed(worker_env):
+         parent = kb.create_task(conn, title="upstream")
+     kt._handle_link({"parent_id": parent, "child_id": worker_env})
+     assert json.loads(kt._handle_block({"reason": "waiting", "kind": "dependency"}))["ok"] is True
+-    kt._handle_unlink({"parent_id": parent, "child_id": worker_env})
++    # The parked worker may no longer unlink (run_already_ended); an orchestrator does it.
++    with monkeypatch.context() as orch:
++        orch.delenv("HERMES_KANBAN_TASK")
++        orch.delenv("HERMES_KANBAN_RUN_ID")
++        assert json.loads(kt._handle_unlink({"parent_id": parent, "child_id": worker_env}))["ok"] is True
+     with kbc.connect() as conn:
+         assert kb.claim_task(conn, worker_env) is not None  # dispatcher respawns the card
+     out = json.loads(kt._handle_complete({"summary": "late"}))
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 9e37f2fea8d..012ce9e436c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -134,9 +134,9 @@ class _Reject(Exception):
+     ``COMPLETE_REJECTION_CLASSES``) so digests can count refusals by cause
+     instead of grepping prose that changes between releases."""
+ 
+-    def __init__(self, message: str, rejection: Optional[str] = None):
++    def __init__(self, message: str, rejection: Optional[str] = None, *, payload: Optional[str] = None):
+         extra = {"rejection": rejection} if rejection else {}
+-        super().__init__(tool_error(message, **extra))
++        super().__init__(payload or tool_error(message, **extra))
+         self.rejection = rejection
+ 
+ 
+@@ -222,6 +222,9 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                 if refused is not None:
+                     return refused
+                 out = fn(args, **kw)
++                if tool_name in _RUN_LIFECYCLE_TOOLS and isinstance(out, str) and out.startswith('{"ok": true'):
++                    from tools import kanban_tools_run_end as kre
++                    out = kre.annotate_success(_board, args, out)
+                 if classify_rejections and isinstance(out, str) and out.startswith('{"error"'):
+                     out = _tag_rejection(out, "invalid_args")
+                 return out
+@@ -406,6 +409,11 @@ def _worker_guard(tool_name: str, args: dict) -> str:
+             "pinned, or use an orchestrator/CLI path that passes an explicit "
+             "expected_run_id."
+         )
++    if tool_name in _RUN_LIFECYCLE_TOOLS - {"kanban_complete"}:  # complete keeps its own-park close
++        from tools import kanban_tools_run_end as kre
++        refused = kre.guard_refusal(_board, args, tool_name, tid)
++        if refused:
++            raise _Reject("", kre.CODE, payload=refused)
+     return tid
+ 
+ 
+diff --git a/tools/kanban_tools_graph.py b/tools/kanban_tools_graph.py
+index 7334127a5d1..1f549de9829 100644
+--- a/tools/kanban_tools_graph.py
++++ b/tools/kanban_tools_graph.py
+@@ -25,7 +25,13 @@ def handle_link(args: dict, **kw) -> str:
+     parent_id = args.get("parent_id")
+     child_id = args.get("child_id")
+     _check(parent_id and child_id, "both parent_id and child_id are required")
++    from tools import kanban_tools_run_end as kre
+     with _board(args.get("board")) as (kb, conn):
++        own = os.environ.get("HERMES_KANBAN_TASK")
++        if own in (str(parent_id), str(child_id)):  # a parked worker must not edit its own card's edges
++            refused = kre.refusal(conn, "kanban_link", own)
++            if refused:
++                return refused
+         gated = kb.link_tasks(
+             conn, parent_id=parent_id, child_id=child_id,
+             expected_child_run_id=_worker_run_id(str(child_id)))
+@@ -51,7 +57,11 @@ def handle_unlink(args: dict, **kw) -> str:
+                       "edges between cards your task created, ask the board's supervisor executor: "
+                       "kanban_supervisor_request(ops=[{\"op\": \"unlink\", \"parent_id\": ..., "
+                       "\"child_id\": ...}]) (via tool_call; dry_run=true previews scope)")
++    from tools import kanban_tools_run_end as kre
+     with _board(args.get("board")) as (kb, conn):
++        refused = kre.refusal(conn, "kanban_unlink")  # unlinking a dependency park's parent undid the park
++        if refused:
++            return refused
+         _check(kb.unlink_tasks(conn, parent_id, child_id), f"no such link: {parent_id} -> {child_id}")
+         return _ok(parent_id=parent_id, child_id=child_id, unlinked=True)
+ 
+diff --git a/tools/kanban_tools_run_end.py b/tools/kanban_tools_run_end.py
+new file mode 100644
+index 00000000000..2a1e07effb5
+--- /dev/null
++++ b/tools/kanban_tools_run_end.py
+@@ -0,0 +1,126 @@
++"""Run-ended fence and feedback for a worker's own card (agent-6ab88d2b1c). [daveey]
++
++Lives outside ``kanban_tools`` so that file, already over its line cap, does not grow.
++
++A dispatcher worker's run ends at its first successful park/handoff (block, schedule, complete,
++continue, request_review), but its process keeps going until the turn ends. Before this module:
++
++- the success payload did not say the run was over, so the worker kept calling tools;
++- kanban_link / kanban_unlink did not check the run at all, so the worker could undo its own park
++  (unlinking the parent of a dependency park promoted the card back to READY);
++- the next lifecycle call was refused by the run-ownership CAS with "unknown id or not in
++  running/ready/triage", which hid the real cause.
++
++``refusal`` returns a ``code=run_already_ended`` tool error naming the run, how it ended and the card's
++current status; ``success_fields`` adds ``run_ended``/``next`` to a run-ending success. Both apply only to a
++dispatcher worker that can name its own run (``HERMES_KANBAN_TASK`` + ``HERMES_KANBAN_RUN_ID``):
++orchestrators, operators and the CLI are unaffected.
++"""
++from __future__ import annotations
++
++import os
++from typing import Optional
++
++CODE = "run_already_ended"
++
++
++def _own_run(task_id: Optional[str] = None) -> tuple[Optional[str], Optional[int]]:
++    """``(env task, env run id)`` of this dispatcher worker; ``(None, None)`` outside one.
++
++    With *task_id*, only when the worker is scoped to that task."""
++    env_tid = os.environ.get("HERMES_KANBAN_TASK")
++    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
++    if not env_tid or not raw or (task_id is not None and task_id != env_tid):
++        return None, None
++    try:
++        return env_tid, int(raw)
++    except ValueError:
++        return None, None
++
++
++def ended_run(conn, task_id: Optional[str] = None) -> Optional[dict]:
++    """``{task_id, run_id, outcome, status}`` when this worker's own run has ended; else None."""
++    tid, run_id = _own_run(task_id)
++    if run_id is None:
++        return None
++    run = conn.execute("SELECT ended_at, outcome, status FROM task_runs WHERE id = ? AND task_id = ?",
++                       (run_id, tid)).fetchone()
++    if run is None or run["ended_at"] is None:
++        return None
++    task = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
++    return {"task_id": tid, "run_id": run_id, "outcome": run["outcome"] or run["status"],
++            "status": task["status"] if task else "missing"}
++
++
++def _next(status: str) -> str:
++    return (f"This run is over; the card is {status}. Don't call kanban lifecycle tools "
++            "(block/schedule/continue/complete/request_review) or kanban_link/kanban_unlink on it "
++            "again; write your final reply.")
++
++
++def refusal(conn, tool_name: str, task_id: Optional[str] = None) -> Optional[str]:
++    """A ``run_already_ended`` tool error when this worker's run has ended, else None. Nothing changes."""
++    ended = ended_run(conn, task_id)
++    if ended is None:
++        return None
++    from tools.registry import tool_error
++    also = ""
++    if tool_name == "kanban_schedule":  # keep the human-answer way out (kanban_reason_comment)
++        from hermes_cli.kanban_reason_comment import human_answer_refusal
++        hint = human_answer_refusal(conn, ended["task_id"], "schedule")
++        also = f" Also: {hint}" if hint else ""
++    return tool_error(
++        f"{tool_name} refused: your run {ended['run_id']} on {ended['task_id']} already ended "
++        f"({ended['outcome']}); the card is now {ended['status']}. Nothing changed. "
++        f"{_next(ended['status'])}{also}",
++        code=CODE, task_id=ended["task_id"], run_id=ended["run_id"],
++        run_outcome=ended["outcome"], status=ended["status"], handoff_complete=False)
++
++
++def bound_worker() -> bool:
++    """Whether this process is a dispatcher worker that can name its run (else nothing here applies)."""
++    return _own_run()[1] is not None
++
++
++def guard_refusal(board, args: dict, tool_name: str, tid: str) -> Optional[str]:
++    """``refusal`` for ``_worker_guard``; opens the board only for a bound worker."""
++    if not bound_worker():
++        return None
++    with board(args.get("board")) as (_kb, conn):
++        return refusal(conn, tool_name, tid)
++
++
++def annotate_success(board, args: dict, payload: str) -> str:
++    """``with_success_fields`` for a committed success, opened on ``board(args['board'])`` for a bound worker
++    only. The transition is already committed, so a failed read returns the original success, never an error."""
++    import logging
++    import sqlite3
++    if not bound_worker():
++        return payload
++    try:
++        with board(args.get("board")) as (_kb, conn):
++            return with_success_fields(conn, args.get("task_id"), payload)
++    except (sqlite3.Error, OSError, ValueError):
++        logging.getLogger(__name__).debug("run_ended annotation skipped", exc_info=True)
++        return payload
++
++
++def success_fields(conn, task_id: Optional[str]) -> dict:
++    """``run_ended``/``next`` for a success that ended this worker's own run; ``{}`` otherwise."""
++    ended = ended_run(conn, task_id)
++    if ended is None:
++        return {}
++    return {"run_ended": True, "next": _next(ended["status"])}
++
++
++def with_success_fields(conn, task_id: Optional[str], payload: str) -> str:
++    """Add ``success_fields`` to a JSON success payload (an existing ``next`` is kept in front)."""
++    import json
++    extra = success_fields(conn, task_id)
++    if not extra:
++        return payload
++    data = json.loads(payload)  # the caller passes only a '{"ok": true' success payload
++    prior = data.get("next")
++    data["run_ended"] = True
++    data["next"] = f"{prior} {extra['next']}" if prior else extra["next"]
++    return json.dumps(data)
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 0d1139fd068..aca91c3225b 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -330,6 +330,9 @@ KANBAN_BLOCK_SCHEMA = _schema(
+     "kanban_block",
+     (
+         "Stop work on this task and route it according to WHY you're stuck. "
++        "This ends the current run: after a successful block, do not call "
++        "lifecycle tools or kanban_link/kanban_unlink on this card again; write "
++        "your final reply. "
+         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
+         "goes to todo and auto-resumes when that task finishes, no human "
+         "needed), 'needs_input' (a decision/answer only David can give; needs "
+@@ -937,8 +940,10 @@ KANBAN_UNLINK_SCHEMA = _schema(
+     (
+         "Remove a parent→child dependency edge. A dispatcher worker may "
+         "only remove edges of its own card (its dependencies or its "
+-        "children), e.g. to undo a kanban_link it made before a "
+-        "kanban_block(kind='dependency'); an orchestrator may unlink any "
++        "children), e.g. to undo a kanban_link it made, while its run is "
++        "still live (before it parks); once its run has ended (after "
++        "kanban_block/kanban_schedule/...) it is refused with run_already_ended. "
++        "An orchestrator may unlink any "
+         "edge. A child that no longer waits on anything is promoted at once."
+     ),
+     {
+-- 
+2.55.0
+

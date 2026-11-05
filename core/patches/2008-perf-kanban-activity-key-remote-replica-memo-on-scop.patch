@@ -1,0 +1,331 @@
+From ddf4a0fe8f3c19f3cb3848f0a41463779dd7268d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:54:21 +0000
+Subject: [PATCH] perf(kanban-activity): key remote replica memo on scope
+ heartbeat verdicts [daveey]
+
+The owner collector rewrites gateway/info with a new observed_at every cycle,
+and tuple(info_rows) in the live replica memo key turned each of those writes
+into a full ~46 MB task-row read and projection. _project_replica reads
+info_rows only via scope_heartbeats -> fresh() verdicts (owner_attests_terminal
+release, _moved_evidence live_scopes), so the key now carries the frozenset of
+scopes fresh at the read's own now (kanban_scope_heartbeat.fresh_scopes). The
+valid_until cut-off is replaced by that live verdict; read_at <= now still
+forces a reread on clock rollback. Invalid/duplicate/non-ok/identity-mismatch
+scopes stay absent, so they change the verdict set and reread.
+---
+ hermes_cli/kanban_scope_heartbeat.py          |   5 +
+ hermes_cli/kanban_session_activity.py         |  18 +-
+ .../test_kanban_replica_read_memo.py          |   5 +-
+ ...test_kanban_replica_read_memo_heartbeat.py | 217 ++++++++++++++++++
+ 4 files changed, 235 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_replica_read_memo_heartbeat.py
+
+diff --git a/hermes_cli/kanban_scope_heartbeat.py b/hermes_cli/kanban_scope_heartbeat.py
+index 94e2c395029..8ec13e921a3 100644
+--- a/hermes_cli/kanban_scope_heartbeat.py
++++ b/hermes_cli/kanban_scope_heartbeat.py
+@@ -71,3 +71,8 @@ def scope_heartbeats(info_rows: list[tuple[str, str]]) -> dict[tuple[str, str, s
+     return {key: (scopes[0]['observed_at'], windows[key]) for key, scopes in seen.items()
+             if len(scopes) == 1 and scopes[0].get('state') == 'ok'
+             and type(scopes[0].get('observed_at')) in (int, float)}
++
++
++def fresh_scopes(heartbeats: dict[tuple[str, str, str], tuple[float, float]], now: float) -> frozenset:
++    """The ``scope_heartbeats`` keys ``fresh`` at ``now``: all a replica projection learns from the heartbeats."""
++    return frozenset(key for key, (beat, window) in heartbeats.items() if fresh(beat, now, window))
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 298de5dddba..5fb2d669be4 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -642,14 +642,14 @@ def _decode_replica_task(record_key: str, data: Any) -> tuple[dict[str, Any], st
+     return t, digest, evidence
+ 
+ 
+-# [daveey] Last live (``now=None``) replica read: (key, read_at, valid_until, cards, qualified, owners). The remote
++# [daveey] Last live (``now=None``) replica read: (key, read_at, None, cards, qualified, owners). The remote
+ # projection rebuilds on every local board write (its fingerprint covers every kanban.db), and hub.db itself is
+ # written ~45 times a minute (outbox, ledger, cursor), but its task rows change only when a pull lands. Re-reading
+ # ~6k replica rows (~23 MB of JSON) cost ~0.1 s CPU per sidebar poll for an unchanged answer. hermes-hub stamps
+ # every replica write with the hub feed's monotonic ``seq``, so an insert or update raises ``max(seq)`` and a
+ # delete lowers ``count``: ``_REPLICA_PROBE`` (index-only, ~6 ms) plus the small identity/heartbeat rows is the
+-# whole input. Reused while that key and the origin profile are unchanged and wall time stays inside the window
+-# where no hub-staleness or scope-heartbeat cut-off can flip (``valid_until``).
++# whole input. Reused while that key (scope heartbeats as their freshness verdicts at read time), the origin
++# profile, the stale verdict and every ``synced_at`` are unchanged and wall time has not stepped back.
+ _remote_read_memo: tuple | None = None
+ _REPLICA_PROBE = ("SELECT count(*), count(seq), max(seq), total(seq), total(version), total(octet_length(data)) "
+                   "FROM replica WHERE coll = 'tasks'")
+@@ -686,12 +686,15 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+         if live and {'seq', 'version'} <= columns:
+             probe = conn.execute(_REPLICA_PROBE).fetchone()
+             if probe[0] == probe[1]:  # a row without seq proves nothing about its text: never memoize it
+-                key = (str(path), me, version_column, tuple(info_rows), offline, probe, get_active_profile_name())
++                # [daveey] ``info_rows`` reach the projection only as each scope's freshness verdict at ``now``
++                # (release, moved evidence): the owner's per-cycle ``observed_at`` rewrite alone is no new answer.
++                key = (str(path), me, version_column, _scope_hb.fresh_scopes(_scope_heartbeats(info_rows), now),
++                       offline, probe, get_active_profile_name())
+             memo = _remote_read_memo
+             # [daveey] ``last_ok`` moves on every hub pull (~2 s) while the task rows rarely do; it reaches the
+             # answer only through the stale verdict and each card's ``synced_at`` (``_replica_synced``), so the
+             # memo compares those instead of ``last_ok`` itself.
+-            if (key is not None and memo is not None and memo[0] == key and memo[1] <= now < memo[2]
++            if (key is not None and memo is not None and memo[0] == key and memo[1] <= now
+                     and memo[6] == stale and memo[7] == _replica_synced(memo[8], last_ok)):
+                 if qualified_out is not None:
+                     qualified_out.update(memo[4])
+@@ -712,9 +715,8 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+     seen_at: dict[str, float] = {}
+     cards = _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+                              qualified_out=qualified, owners_out=owners, seen_out=seen_at, moved_out=moved)
+-    # Reuse ends at the next scope-heartbeat cut-off; the hub-staleness cut-off is the ``stale`` comparison above.
+-    beats = [beat + d for beat, window in _scope_heartbeats(info_rows).values() for d in (0.0, window)]
+-    _remote_read_memo = (key, now, min((t for t in beats if t > now), default=float('inf')), list(cards),
++    # Heartbeat cut-offs are the live verdicts in ``key``, hub staleness the ``stale`` check; a clock step back rereads.
++    _remote_read_memo = (key, now, None, list(cards),
+                          frozenset(qualified), frozenset(owners), stale, _replica_synced(seen_at, last_ok),
+                          dict(seen_at), dict(moved))
+     if qualified_out is not None:
+diff --git a/tests/hermes_cli/test_kanban_replica_read_memo.py b/tests/hermes_cli/test_kanban_replica_read_memo.py
+index 75e7729604d..2bca78e3fff 100644
+--- a/tests/hermes_cli/test_kanban_replica_read_memo.py
++++ b/tests/hermes_cli/test_kanban_replica_read_memo.py
+@@ -128,9 +128,10 @@ def test_meta_and_heartbeat_changes_reread(hub):
+     statements.clear()
+     live, fresh, _, _ = live_and_fresh(path, clock)
+     assert row_reads(statements) == 2 and live == fresh and live[0]['stale'] is True
+-    with sqlite3.connect(path) as db:
++    with sqlite3.connect(path) as db:  # a heartbeat row that makes a scope fresh changes the answer's inputs
+         db.execute("INSERT INTO replica VALUES ('owner','gateway','info',1,99,?,0)",
+-                   (json.dumps({'gateway': 'owner', 'task_scopes': []}),))
++                   (json.dumps({'gateway': 'owner', 'task_scopes': [
++                       {'profile': 'work', 'board': 'build', 'state': 'ok', 'observed_at': 1000.0}]}),))
+     statements.clear()
+     activity._read_remote_links(path)
+     assert row_reads(statements) == 1
+diff --git a/tests/hermes_cli/test_kanban_replica_read_memo_heartbeat.py b/tests/hermes_cli/test_kanban_replica_read_memo_heartbeat.py
+new file mode 100644
+index 00000000000..e2638f44cd5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_read_memo_heartbeat.py
+@@ -0,0 +1,217 @@
++"""The live replica memo keys on each scope heartbeat's freshness verdict, not the raw ``gateway/info`` rows.
++
++The owner's collector rewrites ``gateway/info`` with a new ``observed_at`` every cycle while its task rows rarely
++change; the projection reads that row only as per-scope freshness verdicts (release, moved evidence). Every case
++compares the memoized live read with an explicit-``now`` read at the same wall time (it always reads every row).
++"""
++import json
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_scope_heartbeat as scope_hb
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli.test_kanban_remote_terminal_release import observed
++from tests.hermes_cli.test_kanban_replica_read_memo import card, hub, row_reads  # hub: the fixture
++
++WINDOW = scope_hb.SCOPE_HEARTBEAT_FLOOR_S
++
++
++def put_done(path, tid='t_done', seq=50):
++    with sqlite3.connect(path) as db:
++        db.execute("INSERT INTO replica VALUES ('owner','tasks',?,1,?,?,1000000)",
++                   (f'work/build/{tid}', seq, json.dumps(observed(card(tid, status='done')))))
++
++
++def set_info(path, scopes=None, *, raw=None, gw='owner', seq=900):
++    data = raw if raw is not None else json.dumps({'gateway': gw, 'task_scopes': scopes})
++    with sqlite3.connect(path) as db:
++        db.execute("INSERT INTO replica VALUES (?,'gateway','info',1,?,?,0) ON CONFLICT(gw, coll, key) DO UPDATE"
++                   " SET data=excluded.data", (gw, seq, data))
++
++
++def tick(path, clock, now):
++    """Move wall time with a hub pull landing just before it, so hub staleness never decides a case."""
++    with sqlite3.connect(path) as db:
++        db.execute("UPDATE meta SET v = ? WHERE k = 'last_ok'", (str(now),))
++    clock['now'] = now
++
++
++def ok(beat, board='build'):
++    return {'profile': 'work', 'board': board, 'state': 'ok', 'observed_at': beat}
++
++
++def read(path, clock):
++    """(live, explicit, live outs, explicit outs) at the same instant."""
++    outs = [(set(), set(), {}), (set(), set(), {})]
++    live = activity._read_remote_links(path, qualified_out=outs[0][0], owners_out=outs[0][1], moved_out=outs[0][2])
++    fresh = activity._read_remote_links(path, now=clock['now'], qualified_out=outs[1][0], owners_out=outs[1][1],
++                                        moved_out=outs[1][2])
++    assert live == fresh and outs[0] == outs[1]
++    return live, outs[0]
++
++
++def released(rows):
++    return {r['id']: r['released'] for r in rows}
++
++
++@pytest.fixture
++def world(hub):
++    path, put, statements, clock = hub
++    put('t_open')
++    put_done(path)
++    set_info(path, [ok(1000.0)])
++    return path, put, statements, clock
++
++
++def test_heartbeat_timestamp_only_refresh_serves_the_memo(world):
++    path, _, statements, clock = world
++    first, _ = read(path, clock)
++    assert released(first) == {'t_open': False, 't_done': True}
++    for beat in (1030.0, 1060.0, 1090.0):  # the collector's ~30 s cycle: same verdicts, new timestamp
++        set_info(path, [ok(beat)])
++        tick(path, clock, beat + 1)
++        statements.clear()
++        assert activity._read_remote_links(path) == first
++        assert row_reads(statements) == 0
++        live, outs = read(path, clock)
++        assert live == first and outs[2]['live_scopes'] == frozenset({('owner', 'work', 'build')})
++
++
++def test_a_refreshed_heartbeat_extends_reuse_past_the_first_cutoff(world):
++    path, _, statements, clock = world
++    first, _ = read(path, clock)
++    set_info(path, [ok(1400.0)])
++    tick(path, clock, 1000.0 + WINDOW + 50)  # past the cut-off of the heartbeat the memo was built on
++    statements.clear()
++    assert activity._read_remote_links(path) == first
++    assert row_reads(statements) == 0
++    read(path, clock)
++
++
++def test_expiry_flips_release_exactly_after_the_window(world):
++    path, _, statements, clock = world
++    read(path, clock)
++    tick(path, clock, 1000.0 + WINDOW)  # fresh uses <=: still fresh at the boundary
++    statements.clear()
++    live, _ = read(path, clock)
++    assert row_reads(statements) == 1 and released(live)['t_done'] is True
++    tick(path, clock, 1000.0 + WINDOW + 0.001)
++    statements.clear()
++    live, outs = read(path, clock)
++    assert row_reads(statements) == 2 and released(live)['t_done'] is False
++    assert outs[2]['live_scopes'] == frozenset()
++
++
++def test_future_dated_heartbeat_proves_nothing_until_it_is_reached(world):
++    path, _, statements, clock = world
++    set_info(path, [ok(1100.0)])
++    live, _ = read(path, clock)
++    assert released(live)['t_done'] is False
++    tick(path, clock, 1050.0)
++    statements.clear()
++    assert released(read(path, clock)[0])['t_done'] is False and row_reads(statements) == 1
++    tick(path, clock, 1100.0)
++    statements.clear()
++    assert released(read(path, clock)[0])['t_done'] is True and row_reads(statements) == 2
++
++
++def test_clock_rollback_rereads(world):
++    path, _, statements, clock = world
++    tick(path, clock, 1200.0)
++    read(path, clock)
++    set_info(path, [ok(1200.0)])
++    tick(path, clock, 1100.0)  # wall clock stepped back: the 1200 beat is future-dated now
++    statements.clear()
++    live, _ = read(path, clock)
++    assert row_reads(statements) == 2 and released(live)['t_done'] is False
++
++
++@pytest.mark.parametrize('scopes,raw', [
++    ([ok(1010.0), ok(1010.0)], None),  # duplicate scope: ambiguous, proves nothing
++    ([{**ok(1010.0), 'state': 'error'}], None),
++    ([{**ok(1010.0), 'observed_at': True}], None),
++    (None, '{not json'),
++    (None, json.dumps({'gateway': 'someone-else', 'task_scopes': [ok(1010.0)]})),  # identity mismatch
++])
++def test_invalid_or_duplicate_scopes_reread_and_lose_release(world, scopes, raw):
++    path, _, statements, clock = world
++    read(path, clock)
++    set_info(path, scopes, raw=raw)
++    tick(path, clock, 1010.0)
++    statements.clear()
++    live, outs = read(path, clock)
++    assert row_reads(statements) == 2 and released(live)['t_done'] is False
++    assert outs[2]['live_scopes'] == frozenset()
++
++
++def test_an_unrelated_scope_or_gateway_row_changes_nothing(world):
++    path, _, statements, clock = world
++    first, _ = read(path, clock)
++    set_info(path, [ok(1000.0), {**ok(1005.0, board='other'), 'state': 'error'}])
++    set_info(path, [], gw='bystander', seq=901)
++    tick(path, clock, 1005.0)
++    statements.clear()
++    assert read(path, clock)[0] == first and row_reads(statements) == 1
++
++
++def test_a_new_fresh_scope_rereads(world):
++    """``live_scopes`` (moved evidence) gains a scope: a different answer, never served from the memo."""
++    path, _, statements, clock = world
++    read(path, clock)
++    set_info(path, [ok(1000.0), ok(1005.0, board='other')])
++    tick(path, clock, 1005.0)
++    statements.clear()
++    _, outs = read(path, clock)
++    assert row_reads(statements) == 2 and ('owner', 'work', 'other') in outs[2]['live_scopes']
++
++
++def test_task_mutation_alongside_a_heartbeat_refresh_rereads(world):
++    path, put, statements, clock = world
++    read(path, clock)
++    set_info(path, [ok(1020.0)])
++    put('t_open', status='blocked')
++    tick(path, clock, 1020.0)
++    statements.clear()
++    live, _ = read(path, clock)
++    assert row_reads(statements) == 2 and {r['id']: r['status'] for r in live}['t_open'] == 'blocked'
++
++
++def test_gateway_identity_change_rereads(world):
++    path, _, statements, clock = world
++    read(path, clock)
++    with sqlite3.connect(path) as db:
++        db.execute("UPDATE meta SET v = 'elsewhere' WHERE k = 'gateway'")
++    statements.clear()
++    live, _ = read(path, clock)
++    assert row_reads(statements) == 2 and live == []
++
++
++def test_concurrent_reads_during_heartbeat_churn_answer_exactly(world):
++    path, _, _, clock = world
++    tick(path, clock, 1100.0)
++    fresh_answer, _ = read(path, clock)
++    set_info(path, [ok(2000.0)])  # future-dated: release lost
++    future_answer, _ = read(path, clock)
++    assert fresh_answer != future_answer
++    answers, errors = [], []
++
++    def reader():
++        try:
++            for _ in range(30):
++                answers.append(activity._read_remote_links(path))
++        except Exception as exc:  # pragma: no cover - surfaced below
++            errors.append(exc)
++
++    def writer():
++        for i in range(30):
++            set_info(path, [ok(1000.0 + i)] if i % 2 else [ok(2000.0)])
++
++    threads = [threading.Thread(target=reader) for _ in range(4)] + [threading.Thread(target=writer)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert not errors
++    assert all(a in (fresh_answer, future_answer) for a in answers) and len(answers) == 120
+-- 
+2.55.0
+

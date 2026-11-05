@@ -1,0 +1,864 @@
+From 1d3fe77e9a6ecee4323ef42a1be70714913e83d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:33:34 +0000
+Subject: [PATCH] fix(kanban-placement): confirm transient Board failures on 2
+ passes; replay a timed-out reserve once [daveey]
+
+A lone reserve or feed-pull timeout between two successful passes recorded
+board_error and then the previous queue reason again, posting a
+worker-placement comment pair each time: 31 such observations in 24 h on the
+hub after the stale-socket replay fix (PR #838) landed.
+
+- kanban_queue_reason.record_error: a transient failure (transport OSError,
+  SyncUnavailable, HTTP 5xx) changes the card's worker_queue_reason, and posts
+  its comment, only on the CONFIRM_PASSES=2nd consecutive transient failure of
+  the same request kind for that card. Kind "pull" (the dispatcher's feed
+  pull, observed for every origin card each tick) ends on a successful pull;
+  kind "card" (that card's own reserve/repin) ends only on a Board answer for
+  that card, so a card the batch cursor skips neither continues nor breaks its
+  streak. Any transient error continues a streak (502 then 503 is one
+  outage). Each unconfirmed failure is appended as a worker_queue_board_error
+  diagnostic event with the same allowlisted provenance (stage, transport,
+  budget_ms, elapsed_ms) and its pass number, under the same ownership fence,
+  with no comment. Board refusals and non-5xx HubErrors still record at once.
+  A streak also ends when the card ran since its last failure, and a feed
+  Resync ends pull streaks. No wall-clock window: the batch cursor may retry
+  a card only every few ticks. The registry is process-local and locked
+  (sync loop and dispatcher).
+- kanban_sync_client(_attempt): a replay-safe request (reserve only; revision-fenced,
+  the Board returns the recorded reservation on a same-revision replay) that
+  times out is resent once on a fresh connection when at least 0.1 s of the
+  shared deadline remains. Ops and leases are never replayed. On the
+  dispatcher's 2 s tick the per-call timeout equals the remaining deadline, so
+  this replay mostly helps callers with a longer deadline; the debounce is
+  what stops the dispatcher's flip.
+
+Tests: real-HTTP RED (RED on origin/main) -> GREEN in
+tests/hermes_cli/test_kanban_queue_transient_debounce.py. Five provenance and
+timing test files pin CONFIRM_PASSES=1 because they check the recorded
+board_error's fields, not the debounce; conftest resets the streak registry
+per test.
+---
+ hermes_cli/kanban_queue_reason.py             | 114 ++++-
+ hermes_cli/kanban_sync_client.py              |   8 +-
+ hermes_cli/kanban_sync_client_attempt.py      |  18 +
+ hermes_cli/kanban_worker_placement.py         |   5 +-
+ tests/hermes_cli/conftest.py                  |   2 +
+ .../test_kanban_pull_attempt_timing.py        |  10 +
+ .../test_kanban_pull_attempt_timing_edges.py  |  10 +
+ .../test_kanban_queue_error_provenance.py     |  10 +
+ .../test_kanban_queue_error_timing.py         |  10 +
+ .../test_kanban_queue_transient_debounce.py   | 409 ++++++++++++++++++
+ .../test_kanban_queued_reserve_throttle.py    |  10 +
+ 11 files changed, 594 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_queue_transient_debounce.py
+
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index 7fd2eaa30ba..eb7d175c599 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -5,6 +5,7 @@ import json
+ import logging
+ import math
+ import re
++import threading
+ import time
+ from datetime import UTC, datetime
+ 
+@@ -192,6 +193,24 @@ def snapshot(conn, task_id):
+     return None if row is None else {"row": dict(row), "lifecycle": _lifecycle(conn, task_id, row)}
+ 
+ 
++def _owned_row(conn, task_id, gateway, fence):
++    """The row an observation may be recorded against (``fence``'s when given), or None when not origin-owned
++    ready policy work. Call inside the write transaction."""
++    from hermes_cli import kanban_db_sync as sync
++
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if row is not None and fence is not None:
++        if fence["row"]["id"] != task_id:
++            raise ValueError("fence snapshot is for another task")
++        row = fence["row"]
++    if (not row or sync.board_mode(conn) != "primary" or row["created_on"] != gateway
++            or (sync.sync_state(conn) or {}).get("gateway_id") != gateway
++            or row["placement_policy"] != "worker-first-v1" or row["status"] != "ready"
++            or row["claim_lock"] or row["lease_holder"]):
++        return None
++    return row
++
++
+ def _record(conn, task_id, gateway, value, *, fence=None, comment=True):
+     """Append one change-only observation and its thread comment.
+ 
+@@ -200,18 +219,10 @@ def _record(conn, task_id, gateway, value, *, fence=None, comment=True):
+     the placement tick learned to pull on ``not_claimable``.
+     """
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_db_sync as sync
+ 
+     with kb.write_txn(conn):
+-        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+-        if row is not None and fence is not None:
+-            if fence["row"]["id"] != task_id:
+-                raise ValueError("fence snapshot is for another task")
+-            row = fence["row"]
+-        if (not row or sync.board_mode(conn) != "primary" or row["created_on"] != gateway
+-                or (sync.sync_state(conn) or {}).get("gateway_id") != gateway
+-                or row["placement_policy"] != "worker-first-v1" or row["status"] != "ready"
+-                or row["claim_lock"] or row["lease_holder"]):
++        row = _owned_row(conn, task_id, gateway, fence)
++        if row is None:
+             return False
+         value = {**value, "lifecycle": fence["lifecycle"] if fence is not None else _lifecycle(conn, task_id, row)}
+         previous = _stored(conn, task_id)
+@@ -230,6 +241,7 @@ def record_reply(conn, task_id, gateway, reply, pool=None):
+     from hermes_cli import kanban_repin_notice as repin
+ 
+     value = normalize(reply)
++    clear_streak(gateway, task_id)  # the Board answered for this card: a transient failure streak is over
+     recorded = _record(conn, task_id, gateway, value, comment=not repin.no_pool_worker(value, pool))
+     # Every reply, not only a changed one: a card queued before the notice existed gets it on the next pass.
+     repin.maybe_notify(conn, task_id, gateway, value, pool)
+@@ -334,6 +346,10 @@ def record_pull_error(conn, gateway, *, status=None, error=None):
+     the write transaction so a concurrent claim/repin cannot acquire a new wait.
+     Timing (budget_ms/elapsed_ms) is the failed HTTP attempt stamped on ``error``, never the whole pull.
+     """
++    from hermes_cli.kanban_sync_client import Resync
++
++    if isinstance(error, Resync):
++        clear_pull_streaks(gateway)  # a feed reset is the Board answering the pull, not an outage
+     timing = attempt_timing(error)
+     rows = conn.execute(
+         "SELECT id FROM tasks WHERE placement_policy='worker-first-v1' AND status='ready' "
+@@ -343,6 +359,14 @@ def record_pull_error(conn, gateway, *, status=None, error=None):
+ 
+ 
+ def record_error(conn, task_id, gateway, *, status=None, error=None, fence=None, stage=None, timing=None):
++    """Record a failed Board pass for one card.
++
++    A transient failure (transport ``OSError``, ``SyncUnavailable`` or an HTTP 5xx) changes the card's queue
++    reason, and posts its comment, only on the ``CONFIRM_PASSES``-th consecutive transient failure of the same
++    request kind for that card (see ``_streaks``). Every unconfirmed failure is still recorded, as a ``DIAGNOSTIC_EVENT`` carrying the same
++    allowlisted provenance (stage/transport/budget_ms/elapsed_ms), so nothing is silently dropped. A Board
++    refusal or other non-transient failure records at once, as before.
++    """
+     value = {"version": 1, "code": "board_error", "candidates": []}
+     from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
+     if isinstance(error, Resync):
+@@ -372,8 +396,78 @@ def record_error(conn, task_id, gateway, *, status=None, error=None, fence=None,
+             code = None
+         if isinstance(code, str) and code in _REJECTIONS:
+             if code == "revision_conflict":
++                clear_streak(gateway, task_id)  # the Board answered
+                 return False  # Expected CAS race; retry after sync, without outage/recovery chatter.
+             value.update(code="board_refused", rejection_code=code)
+     if type(status) is int and 100 <= status <= 599:
+         value["http_status"] = status
++    if not _transient(value, error):
++        if stage != "pull":
++            clear_streak(gateway, task_id)  # a Board answer (refusal or other non-outage error) for this card
++        return _record(conn, task_id, gateway, value, fence=fence)
++    runs = conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]
++    passes = _bump_streak(gateway, task_id, stage, runs)
++    if passes < CONFIRM_PASSES:
++        _record_diagnostic(conn, task_id, gateway, {**value, "pass": passes}, fence=fence)
++        return False
+     return _record(conn, task_id, gateway, value, fence=fence)
++
++
++DIAGNOSTIC_EVENT = "worker_queue_board_error"
++CONFIRM_PASSES = 2
++_STREAK_CAP = 4096
++# Consecutive transient failures per (gateway, task, kind). kind "pull": the dispatcher's feed pull, observed for
++# every origin card on every tick, so a successful pull ends it. kind "card": that card's own reserve/repin, observed
++# only when the card is attempted, so only a Board answer for that card ends it (a card skipped by the batch cursor
++# neither continues nor breaks its streak). Any transient failure keeps the streak: an outage that alternates
++# 502/503/timeout is still one outage. Process-local on purpose: a restart can only delay a confirmation by one pass,
++# never manufacture one. The sync loop and the dispatcher both reach it, hence the lock. A streak also ends when the
++# card ran since its last failure (it left the queue and came back). There is deliberately no wall-clock window: with
++# many queued cards the batch cursor retries one card only every few ticks, and a window would hide that outage.
++_streaks: dict[tuple[str, str, str], tuple[int, int]] = {}  # -> (passes, run count at the last failure)
++_streaks_lock = threading.Lock()
++
++
++def _transient(value, error):
++    from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
++
++    if value.get("code") != "board_error":
++        return False  # a Board refusal is an answer, not an outage
++    if isinstance(error, HubError):
++        return type(error.status) is int and 500 <= error.status <= 599
++    return isinstance(error, (OSError, SyncUnavailable))
++
++
++def _bump_streak(gateway, task_id, stage, runs):
++    key = (gateway, task_id, "pull" if stage == "pull" else "card")
++    with _streaks_lock:
++        held = _streaks.pop(key, None)
++        passes = held[0] + 1 if held is not None and held[1] == runs else 1
++        _streaks[key] = (passes, runs)
++        while len(_streaks) > _STREAK_CAP:
++            del _streaks[next(iter(_streaks))]
++    return passes
++
++
++def clear_streak(gateway, task_id):
++    """The Board answered this card's reserve/repin (a reply or a refusal): its card streak ends."""
++    with _streaks_lock:
++        _streaks.pop((gateway, task_id, "card"), None)
++
++
++def clear_pull_streaks(gateway):
++    """A feed pull succeeded: every origin card's pull streak ends."""
++    with _streaks_lock:
++        for key in [k for k in _streaks if k[0] == gateway and k[2] == "pull"]:
++            del _streaks[key]
++
++
++def _record_diagnostic(conn, task_id, gateway, value, *, fence=None):
++    """Append an unconfirmed transient failure; no queue-reason change and no thread comment."""
++    from hermes_cli import kanban_db as kb
++
++    with kb.write_txn(conn):
++        if _owned_row(conn, task_id, gateway, fence) is None:
++            return False
++        kb._append_event(conn, task_id, DIAGNOSTIC_EVENT, {**value, "recorded_at_ms": int(time.time() * 1000)})
++        return True
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 814d34fe9ee..3602739f80f 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -43,7 +43,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+-from hermes_cli.kanban_sync_client_attempt import note_attempt
++from hermes_cli.kanban_sync_client_attempt import note_attempt, replay_after_timeout
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -365,6 +365,8 @@ class Hub:
+                     self._drop()
+                     if reused and attempt == 0:  # a stale kept-alive socket: the request never reached the server
+                         continue
++                    if replay_after_timeout(exc, attempt, replay_safe, self.deadline, time.monotonic()):
++                        continue
+                     raise urllib.error.URLError(exc) from exc
+                 try:
+                     resp = conn.getresponse()
+@@ -377,11 +379,15 @@ class Hub:
+                     raise urllib.error.URLError(exc) from exc
+                 except (OSError, http.client.HTTPException) as exc:
+                     self._drop()
++                    if replay_after_timeout(exc, attempt, replay_safe, self.deadline, time.monotonic()):
++                        continue
+                     raise urllib.error.URLError(exc) from exc
+                 try:
+                     raw = resp.read()
+                 except (OSError, http.client.HTTPException) as exc:
+                     self._drop()
++                    if replay_after_timeout(exc, attempt, replay_safe, self.deadline, time.monotonic()):
++                        continue
+                     raise urllib.error.URLError(exc) from exc
+                 if resp.will_close:
+                     self._drop()
+diff --git a/hermes_cli/kanban_sync_client_attempt.py b/hermes_cli/kanban_sync_client_attempt.py
+index 2c0607f10b5..f7b828daee9 100644
+--- a/hermes_cli/kanban_sync_client_attempt.py
++++ b/hermes_cli/kanban_sync_client_attempt.py
+@@ -23,3 +23,21 @@ def note_attempt(exc: BaseException, deadline: Optional[float], started: float,
+             setattr(exc, ATTEMPT_ATTR, (budget, ended - started))
+     except Exception as err:  # health: allow BLE001 -- optional diagnostics must never mask the Board error
+         logging.getLogger(__name__).debug("attempt timing not stamped (%s)", type(err).__name__)
++
++
++# A replay-safe timeout is resent only when at least this much of the shared deadline is left: less cannot carry a
++# round trip, and spending it would turn the real timeout into a budget-exhausted error.
++REPLAY_MIN_BUDGET_S = 0.1
++
++
++def replay_after_timeout(exc: BaseException, attempt: int, replay_safe: bool, deadline: Optional[float],
++                         now: float) -> bool:
++    """Whether a timed-out first attempt of a replay-safe request is resent once, on a fresh connection, within the
++    same deadline (``now`` is the caller's monotonic clock). Only reserve opts in: it is revision-fenced, and the
++    Board answers a same-revision replay with the recorded reservation. Ops and leases never do."""
++    if not (replay_safe and attempt == 0 and isinstance(exc, TimeoutError)):
++        return False
++    if deadline is not None and deadline - now < REPLAY_MIN_BUDGET_S:
++        return False
++    logging.getLogger(__name__).warning("replay-safe Board request timed out; replaying it once (revision-fenced)")
++    return True
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index dcba29c378e..a7c0f782975 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -180,6 +180,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                     # A run moved this card (kanban_move). Its runs_on is Board-owned, so only the origin's
+                     # creator repin can apply that move; reserving would hand it straight back to the pool.
+                     reply = hub.repin(board, task_id=row["id"], expected_revision=row["sync_version"], runs_on=labels)
++                    queue.clear_streak(gateway, row["id"])
+                     try:
+                         _record_repin(conn, row["id"], gateway, labels, reply)
+                     except sqlite3.Error:
+@@ -209,6 +210,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                     _refused[key] = (row["sync_version"], now + NOT_CLAIMABLE_BACKOFF_S)
+                     fence, machine = before[row["id"]]
+                     if picked_up(conn, hub, board, gateway, row["id"], machine, pulled):
++                        queue.clear_streak(gateway, row["id"])
+                         continue  # the worker we reserved already claimed it: a pickup, not a refusal
+                 queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc, fence=fence, stage=stage,
+                                  timing=timing)
+@@ -359,12 +361,13 @@ def dispatch_tick(conn):
+             return
+         hub = client.Hub(ident, timeout=DISPATCH_NETWORK_BUDGET_S,
+                          deadline=time.monotonic() + DISPATCH_NETWORK_BUDGET_S)
++        from hermes_cli import kanban_queue_reason as queue
+         try:
+             client.pull(conn, hub, state["board_id"], observers=True, partition=ident.gateway)
+         except (client.HubError, client.SyncUnavailable, client.Resync, OSError) as exc:
+-            from hermes_cli import kanban_queue_reason as queue
+             queue.try_record(queue.record_pull_error, conn, ident.gateway, error=exc)
+             return
++        queue.clear_pull_streaks(ident.gateway)  # a feed-pull failure streak is no longer consecutive
+         reevaluate(conn, hub, state["board_id"], ident.gateway)
+     except (client.HubError, client.SyncUnavailable, client.Resync, OSError):
+         # Offline origin cannot remove the queue fence or manufacture an assignment.
+diff --git a/tests/hermes_cli/conftest.py b/tests/hermes_cli/conftest.py
+index 2666e42ba02..8e1e0f7c95a 100644
+--- a/tests/hermes_cli/conftest.py
++++ b/tests/hermes_cli/conftest.py
+@@ -13,9 +13,11 @@ def _isolate_kanban_worker_process_registries(monkeypatch):
+     Use fresh dictionaries rather than clearing shared ones so teardown restores their owner.
+     """
+     from hermes_cli import kanban_db_dispatch
++    from hermes_cli import kanban_queue_reason
+ 
+     monkeypatch.setattr(kanban_db_dispatch, "_live_worker_procs", {})
+     monkeypatch.setattr(kanban_db_dispatch, "_recent_worker_exits", {})
++    monkeypatch.setattr(kanban_queue_reason, "_streaks", {})  # transient Board-failure streaks are per test
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/hermes_cli/test_kanban_pull_attempt_timing.py b/tests/hermes_cli/test_kanban_pull_attempt_timing.py
+index 2f8862a4de3..60df8c6661c 100644
+--- a/tests/hermes_cli/test_kanban_pull_attempt_timing.py
++++ b/tests/hermes_cli/test_kanban_pull_attempt_timing.py
+@@ -27,6 +27,16 @@ from hermes_cli import kanban_sync_client as client
+ from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
+ 
++
++@pytest.fixture(autouse=True)
++def _confirm_on_first_pass(monkeypatch):
++    """These tests pin the provenance of the recorded board_error, not the transient-failure debounce
++    (tests/hermes_cli/test_kanban_queue_transient_debounce.py): confirm a transient failure on its first pass."""
++    from hermes_cli import kanban_queue_reason
++
++    monkeypatch.setattr(kanban_queue_reason, "CONFIRM_PASSES", 1)
++
++
+ conn = fixtures.conn
+ CFG = {"worker_pools": {"hub": ["worker-1"]}}
+ BUDGET_S = 1.0  # the production 2 s shared tick deadline, scaled down for a quick test
+diff --git a/tests/hermes_cli/test_kanban_pull_attempt_timing_edges.py b/tests/hermes_cli/test_kanban_pull_attempt_timing_edges.py
+index 4ef31064f90..a3bc54e74dd 100644
+--- a/tests/hermes_cli/test_kanban_pull_attempt_timing_edges.py
++++ b/tests/hermes_cli/test_kanban_pull_attempt_timing_edges.py
+@@ -20,6 +20,16 @@ from hermes_cli import kanban_sync_client_attempt as attempt
+ from tests.hermes_cli import test_kanban_sync_hub_keepalive as keepalive
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
+ 
++
++@pytest.fixture(autouse=True)
++def _confirm_on_first_pass(monkeypatch):
++    """These tests pin the provenance of the recorded board_error, not the transient-failure debounce
++    (tests/hermes_cli/test_kanban_queue_transient_debounce.py): confirm a transient failure on its first pass."""
++    from hermes_cli import kanban_queue_reason
++
++    monkeypatch.setattr(kanban_queue_reason, "CONFIRM_PASSES", 1)
++
++
+ conn = fixtures.conn
+ server = keepalive.server
+ CAP_MS = 86_400_000
+diff --git a/tests/hermes_cli/test_kanban_queue_error_provenance.py b/tests/hermes_cli/test_kanban_queue_error_provenance.py
+index e1900e1f89e..f67105ca76a 100644
+--- a/tests/hermes_cli/test_kanban_queue_error_provenance.py
++++ b/tests/hermes_cli/test_kanban_queue_error_provenance.py
+@@ -11,6 +11,16 @@ from hermes_cli import kanban_sync_client as client
+ from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
+ 
++
++@pytest.fixture(autouse=True)
++def _confirm_on_first_pass(monkeypatch):
++    """These tests pin the provenance of the recorded board_error, not the transient-failure debounce
++    (tests/hermes_cli/test_kanban_queue_transient_debounce.py): confirm a transient failure on its first pass."""
++    from hermes_cli import kanban_queue_reason
++
++    monkeypatch.setattr(kanban_queue_reason, "CONFIRM_PASSES", 1)
++
++
+ conn = fixtures.conn
+ CFG = {"worker_pools": {"hub": ["worker-1"]}}
+ SECRET = "https://user:hunter2-SECRET@hub.invalid/api?token=SECRET"
+diff --git a/tests/hermes_cli/test_kanban_queue_error_timing.py b/tests/hermes_cli/test_kanban_queue_error_timing.py
+index 2b43181f098..9d37f5934d3 100644
+--- a/tests/hermes_cli/test_kanban_queue_error_timing.py
++++ b/tests/hermes_cli/test_kanban_queue_error_timing.py
+@@ -20,6 +20,16 @@ from hermes_cli import kanban_sync_client as client
+ from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
+ 
++
++@pytest.fixture(autouse=True)
++def _confirm_on_first_pass(monkeypatch):
++    """These tests pin the provenance of the recorded board_error, not the transient-failure debounce
++    (tests/hermes_cli/test_kanban_queue_transient_debounce.py): confirm a transient failure on its first pass."""
++    from hermes_cli import kanban_queue_reason
++
++    monkeypatch.setattr(kanban_queue_reason, "CONFIRM_PASSES", 1)
++
++
+ conn = fixtures.conn
+ CFG = {"worker_pools": {"hub": ["worker-1"]}}
+ SECRET = "https://user:hunter2-SECRET@hub.invalid/api?token=SECRET"
+diff --git a/tests/hermes_cli/test_kanban_queue_transient_debounce.py b/tests/hermes_cli/test_kanban_queue_transient_debounce.py
+new file mode 100644
+index 00000000000..cbe9877f21d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_queue_transient_debounce.py
+@@ -0,0 +1,409 @@
++"""A single transient Board failure must not flip a card's queue reason or post a comment pair.
++
++Live, a lone reserve or feed-pull timeout between two successful passes recorded ``board_error`` and then the
++previous reason again, posting two worker-placement comments each time (31 such observations in 24 h on the hub).
++Now a transient failure (transport ``OSError``, HTTP 5xx) changes the reason only on the second consecutive
++transient failure of the same request kind (feed pull, or that card's own reserve) for that card; every unconfirmed failure is still recorded as a ``worker_queue_board_error``
++diagnostic event with its provenance. Separately, a timed-out reserve (revision-fenced, so a same-revision replay
++returns the recorded reservation) is resent once when the shared deadline still has room.
++
++Everything Board-facing runs through a real ``ThreadingHTTPServer``, the real ``client.Hub`` HTTP path,
++``reevaluate`` and ``dispatch_tick``.
++"""
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++CFG = {"worker_pools": {"hub": ["worker-1"]}}
++TIMEOUT_S = 0.8  # scaled-down dispatch budget (a good pass = reserve + feed pull must fit)
++RESERVE = "/v2/boards/default/placement/reserve"
++QUEUED = {"state": "queued", "task_version": 4,
++          "observation": {"version": 1, "code": "capability_mismatch", "candidates": []}}
++
++
++class _Board:
++    """A real kept-alive HTTP Board. ``script`` maps a path prefix to queued actions: ``"ok"``, ``"hang"`` (no
++    answer within any test budget) or ``"status:<n>"``. An empty queue answers ``"ok"``."""
++
++    def __init__(self):
++        self.script = {"GET": [], "POST": []}
++        self.requests, self.bodies, self.release, self.cursor = [], [], threading.Event(), 0
++        board = self
++
++        class Handler(BaseHTTPRequestHandler):
++            protocol_version = "HTTP/1.1"
++
++            def _serve(self):
++                n = int(self.headers.get("content-length") or 0)
++                body = self.rfile.read(n) if n else b""
++                board.requests.append((self.command, self.path.split("?")[0]))
++                board.bodies.append(body)
++                queue = board.script[self.command]
++                action = queue.pop(0) if queue else "ok"
++                if action == "hang":
++                    board.release.wait(10)
++                    self.close_connection = True
++                    return
++                status = int(action.split(":")[1]) if action.startswith("status:") else 200
++                if self.command == "GET":
++                    payload = {"changes": [], "next": board.cursor, "more": False}
++                elif self.path.startswith(RESERVE):
++                    payload = QUEUED
++                else:
++                    payload = {"path": self.path, "body": body.decode() or None}
++                raw = json.dumps(payload if status == 200 else {"error": "unavailable"}).encode()
++                self.send_response(status)
++                self.send_header("content-type", "application/json")
++                self.send_header("content-length", str(len(raw)))
++                self.end_headers()
++                self.wfile.write(raw)
++
++            do_GET = do_POST = _serve
++
++            def log_message(self, format, *args):  # the base signature
++                pass
++
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        self.server.daemon_threads = True
++        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
++
++    def __enter__(self):
++        self.thread.start()
++        return self
++
++    def __exit__(self, *exc):
++        self.release.set()
++        self.server.shutdown()
++        self.server.server_close()
++        self.thread.join()
++
++    @property
++    def url(self):
++        return f"http://127.0.0.1:{self.server.server_port}"
++
++    def posts(self):
++        return [p for m, p in self.requests if m == "POST"]
++
++
++@pytest.fixture
++def board(conn, monkeypatch):
++    for var in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(placement, "config", lambda: CFG)
++    monkeypatch.setattr(wp, "_queued", {})  # every pass asks the Board (no 60 s queued-reply throttle)
++    monkeypatch.setattr(wp, "_refused", {})
++    monkeypatch.setattr(wp, "DISPATCH_NETWORK_BUDGET_S", TIMEOUT_S)
++    with _Board() as b:
++        b.cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++        monkeypatch.setattr(client, "load_identity", lambda: client.Identity(b.url, "synthetic", "hub"))
++        yield b
++
++
++def _hub(board):
++    # The dispatcher's construction: per-call timeout == shared deadline, so a timeout leaves no replay budget.
++    import time
++    return client.Hub(client.Identity(board.url, "synthetic", "hub"), timeout=TIMEOUT_S,
++                      deadline=time.monotonic() + TIMEOUT_S)
++
++
++def _reserve_pass(conn, board):
++    wp._queued.clear()  # a pass asks the Board again (production throttles a queued reply for 60 s)
++    hub = _hub(board)
++    try:
++        wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    finally:
++        hub.close()
++
++
++def _reasons(conn, tid):
++    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
++                        (tid, qr.EVENT)).fetchall()
++    return [json.loads(r[0])["code"] for r in rows]
++
++
++def _diagnostics(conn, tid):
++    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
++                        (tid, qr.DIAGNOSTIC_EVENT)).fetchall()
++    return [json.loads(r[0]) for r in rows]
++
++
++def _comments(conn, tid):
++    return [c for c in kb.list_comments(conn, tid) if c.author == "worker-placement"]
++
++
++def test_single_reserve_timeout_between_successes_does_not_flip_or_comment(conn, board):
++    tid = fixtures.acknowledged(conn)
++    _reserve_pass(conn, board)
++    assert _reasons(conn, tid) == ["capability_mismatch"] and len(_comments(conn, tid)) == 1
++
++    board.script["POST"] = ["hang"]
++    _reserve_pass(conn, board)
++    assert board.posts() == [RESERVE, RESERVE], "the second reserve must actually reach the Board"
++    assert _reasons(conn, tid) == ["capability_mismatch"], "one transient timeout must not flip the reason"
++    assert len(_comments(conn, tid)) == 1, "one transient timeout must not post a comment"
++    [diag] = _diagnostics(conn, tid)  # ... but it stays visible, with its provenance
++    assert diag["code"] == "board_error" and diag["pass"] == 1
++    assert diag["stage"] == "reserve" and diag["transport"] == "timeout" and diag["error_class"] == "OSError"
++    assert type(diag["budget_ms"]) is int and type(diag["elapsed_ms"]) is int
++
++    _reserve_pass(conn, board)
++    assert _reasons(conn, tid) == ["capability_mismatch"] and len(_comments(conn, tid)) == 1
++
++
++def test_two_consecutive_reserve_timeouts_flip_once_with_one_comment_pair(conn, board):
++    tid = fixtures.acknowledged(conn)
++    _reserve_pass(conn, board)
++    board.script["POST"] = ["hang", "hang", "hang"]
++    for _ in range(3):
++        _reserve_pass(conn, board)
++    assert _reasons(conn, tid) == ["capability_mismatch", "board_error"], "confirmed on the 2nd pass, deduped after"
++    assert len(_comments(conn, tid)) == 2
++    assert [d["pass"] for d in _diagnostics(conn, tid)] == [1], "only the unconfirmed failure is a diagnostic"
++    _reserve_pass(conn, board)  # recovery
++    assert _reasons(conn, tid) == ["capability_mismatch", "board_error", "capability_mismatch"]
++    assert len(_comments(conn, tid)) == 3  # exactly one flip + one recovery comment
++
++
++def test_a_success_between_failures_resets_the_streak(conn, board):
++    tid = fixtures.acknowledged(conn)
++    board.script["POST"] = ["ok", "hang", "ok", "hang", "ok"]
++    for _ in range(5):
++        _reserve_pass(conn, board)
++    assert _reasons(conn, tid) == ["capability_mismatch"] and len(_comments(conn, tid)) == 1
++    assert [d["pass"] for d in _diagnostics(conn, tid)] == [1, 1]
++
++
++def _tick(conn):
++    wp._queued.clear()
++    wp.dispatch_tick(conn)
++
++
++def _cards(conn):
++    return sorted([fixtures.acknowledged(conn), fixtures.acknowledged(conn)])
++
++
++def test_single_pull_timeout_fanout_does_not_flip_or_comment(conn, board):
++    cards = _cards(conn)
++    _tick(conn)  # pull ok + reserve ok
++    assert all(_reasons(conn, t) == ["capability_mismatch"] for t in cards)
++    board.script["GET"] = ["hang"]
++    _tick(conn)
++    assert ("GET", "/v2/boards/default/changes") in board.requests
++    for tid in cards:
++        assert _reasons(conn, tid) == ["capability_mismatch"] and len(_comments(conn, tid)) == 1
++        [diag] = _diagnostics(conn, tid)
++        assert diag["stage"] == "pull" and diag["transport"] == "timeout" and diag["pass"] == 1
++    _tick(conn)  # recovery: pull ok clears the pull streak
++    board.script["GET"] = ["hang"]
++    _tick(conn)  # a later lone pull timeout is again only pass 1
++    for tid in cards:
++        assert _reasons(conn, tid) == ["capability_mismatch"] and len(_comments(conn, tid)) == 1
++        assert [d["pass"] for d in _diagnostics(conn, tid)] == [1, 1]
++
++
++def test_two_consecutive_pull_timeouts_flip_each_card_once(conn, board):
++    cards = _cards(conn)
++    _tick(conn)
++    board.script["GET"] = ["hang", "hang"]
++    _tick(conn)
++    _tick(conn)
++    for tid in cards:
++        assert _reasons(conn, tid) == ["capability_mismatch", "board_error"]
++        assert len(_comments(conn, tid)) == 2
++        assert (qr.latest(conn, tid) or {}).get("stage") == "pull"
++
++
++def test_isolated_reserve_and_pull_failures_do_not_combine(conn, board, monkeypatch):
++    """X's reserve times out; the next tick is healthy but the batch cursor skips X; then one lone pull times out.
++    The Board answered the feed in between, and the two failures hit different requests: no flip."""
++    monkeypatch.setattr(wp, "MAX_RESERVES_PER_TICK", 1)
++    first, second = _cards(conn)
++    _tick(conn)  # pull ok, first reserved ok
++    _tick(conn)  # pull ok, second reserved ok
++    board.script["POST"] = ["hang"]
++    _tick(conn)  # pull ok, first's reserve times out
++    _tick(conn)  # healthy: pull ok, second reserved ok (first skipped by the cursor)
++    board.script["GET"] = ["hang"]
++    _tick(conn)  # one lone pull timeout
++    for tid in (first, second):
++        assert _reasons(conn, tid) == ["capability_mismatch"] and len(_comments(conn, tid)) == 1
++    assert [(d["stage"], d["pass"]) for d in _diagnostics(conn, first)] == [("reserve", 1), ("pull", 1)]
++
++
++def test_sustained_reserve_outage_flips_while_the_feed_is_healthy(conn, board):
++    tid = fixtures.acknowledged(conn)
++    _tick(conn)
++    board.script["POST"] = ["hang", "status:503"]
++    _tick(conn)  # pull ok, reserve times out
++    _tick(conn)  # pull ok, reserve 503: still the same outage of this card's reserve
++    assert _reasons(conn, tid) == ["capability_mismatch", "board_error"]
++    assert len(_comments(conn, tid)) == 2
++
++
++def test_an_outage_that_alternates_its_error_still_confirms(conn, board):
++    tid = fixtures.acknowledged(conn)
++    _reserve_pass(conn, board)
++    board.script["POST"] = ["status:502", "status:503"]
++    for _ in range(2):
++        _reserve_pass(conn, board)
++    assert _reasons(conn, tid) == ["capability_mismatch", "board_error"], "502 then 503 is one outage"
++    assert qr.latest(conn, tid)["http_status"] == 503 and len(_comments(conn, tid)) == 2
++    assert [(d["http_status"], d["pass"]) for d in _diagnostics(conn, tid)] == [(502, 1)]
++
++
++def test_diagnostic_event_never_stores_raw_error_text(conn):
++    secret = "https://user:hunter2-SECRET@hub.invalid/api?token=SECRET"
++    tid = fixtures.acknowledged(conn)
++    import urllib.error
++    assert not qr.record_error(conn, tid, "hub", error=urllib.error.URLError(ConnectionResetError(secret)),
++                               stage="reserve", timing={"budget_ms": 5, "elapsed_ms": 7, "url": secret})
++    rows = [r[0] for r in conn.execute("SELECT payload FROM task_events WHERE task_id=?", (tid,)).fetchall()]
++    [diag] = _diagnostics(conn, tid)
++    assert diag["transport"] == "reset" and diag["budget_ms"] == 5 and "url" not in diag
++    assert rows and all("SECRET" not in blob and "hunter2" not in blob for blob in rows)
++
++
++def test_http_5xx_is_debounced_but_a_board_refusal_records_at_once(conn, board):
++    tid = fixtures.acknowledged(conn)
++    _reserve_pass(conn, board)
++    board.script["POST"] = ["status:503"]
++    _reserve_pass(conn, board)
++    assert _reasons(conn, tid) == ["capability_mismatch"] and len(_comments(conn, tid)) == 1
++    assert _diagnostics(conn, tid)[0]["http_status"] == 503
++
++    other = fixtures.acknowledged(conn)
++    error = client.HubError(403, json.dumps({"error": "not_creator"}))
++    assert qr.record_error(conn, other, "hub", error=error, stage="reserve")
++    assert _reasons(conn, other) == ["board_refused"] and _diagnostics(conn, other) == []
++
++
++def test_diagnostic_respects_the_ownership_fence(conn):
++    tid = fixtures.acknowledged(conn, created_on="other-gateway")
++    assert not qr.record_error(conn, tid, "hub", error=TimeoutError("timed out"), stage="reserve")
++    assert _diagnostics(conn, tid) == [] and _reasons(conn, tid) == []
++
++
++# --- reserve timeout replay (real kept-alive HTTP) ---------------------------------------------------------------
++
++
++def _plain_hub(board, *, timeout, deadline=None):
++    return client.Hub(client.Identity(board.url, "synthetic", "hub"), timeout=timeout, deadline=deadline)
++
++
++def test_reserve_timeout_replays_once_with_identical_body(board):
++    board.script["POST"] = ["hang"]
++    hub = _plain_hub(board, timeout=0.3)
++    try:
++        reply = hub.reserve("default", task_id="t_test", expected_revision=7, candidates=["worker-1"])
++    finally:
++        hub.close()
++    assert reply["state"] == "queued"
++    assert board.posts() == [RESERVE, RESERVE]
++    assert board.bodies[0] == board.bodies[1] and json.loads(board.bodies[0])["expected_revision"] == 7
++
++
++def test_reserve_timeout_replay_is_bounded_to_one(board):
++    board.script["POST"] = ["hang", "hang"]
++    hub = _plain_hub(board, timeout=0.2)
++    try:
++        with pytest.raises(OSError) as info:
++            hub.reserve("default", task_id="t_test", expected_revision=7, candidates=["worker-1"])
++    finally:
++        hub.close()
++    assert qr.transport_kind(info.value) == "timeout"
++    assert board.posts() == [RESERVE, RESERVE]
++
++
++def test_reserve_timeout_without_remaining_budget_is_not_replayed(board):
++    import time
++    board.script["POST"] = ["hang"]
++    hub = _plain_hub(board, timeout=0.3, deadline=time.monotonic() + 0.3)
++    try:
++        with pytest.raises(OSError) as info:
++            hub.reserve("default", task_id="t_test", expected_revision=7, candidates=["worker-1"])
++    finally:
++        hub.close()
++    assert qr.transport_kind(info.value) == "timeout", "the real timeout, never a budget-exhausted replay"
++    assert board.posts() == [RESERVE]
++
++
++def test_reserve_timeout_replays_within_a_larger_shared_deadline(board):
++    import time
++    board.script["POST"] = ["hang"]
++    hub = _plain_hub(board, timeout=0.2, deadline=time.monotonic() + 2.0)
++    try:
++        assert hub.reserve("default", task_id="t_test", expected_revision=7, candidates=["worker-1"])["state"] == "queued"
++    finally:
++        hub.close()
++    assert board.posts() == [RESERVE, RESERVE]
++
++
++@pytest.mark.parametrize("call", [lambda hub: hub.leases("default", {"op": "claim"}),
++                                  lambda hub: hub.ops("default", [{"op": 1}])], ids=["leases", "ops"])
++def test_non_idempotent_post_timeout_is_not_replayed(board, call):
++    board.script["POST"] = ["hang"]
++    hub = _plain_hub(board, timeout=0.2)
++    try:
++        with pytest.raises(OSError):
++            call(hub)
++    finally:
++        hub.close()
++    assert len(board.posts()) == 1
++
++
++def test_a_run_since_the_last_failure_ends_the_streak(conn):
++    """Fail, the card is claimed and runs (e.g. a lost reserve reply the Board applied), then it is ready again:
++    its next lone failure is a first pass, not a confirmation."""
++    import time
++    tid = fixtures.acknowledged(conn)
++    assert not qr.record_error(conn, tid, "hub", error=TimeoutError("timed out"), stage="reserve")
++    assert not qr.record_error(conn, tid, "hub", error=TimeoutError("timed out"), stage="pull")
++    conn.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'done', ?)", (tid, int(time.time())))
++    conn.commit()
++    assert not qr.record_error(conn, tid, "hub", error=TimeoutError("timed out"), stage="reserve")
++    assert not qr.record_error(conn, tid, "hub", error=TimeoutError("timed out"), stage="pull")
++    assert _reasons(conn, tid) == [] and [d["pass"] for d in _diagnostics(conn, tid)] == [1, 1, 1, 1]
++
++
++def test_a_card_retried_only_every_few_ticks_still_confirms(conn, board, monkeypatch):
++    """A reserve OSError ends the batch, so with several queued cards each is retried only every few ticks, however
++    far apart in wall-clock time: its second failed attempt still confirms (no time window hides the outage)."""
++    import time
++    from types import SimpleNamespace
++    clock = [1000.0]
++    monkeypatch.setattr(qr, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
++    cards = sorted(fixtures.acknowledged(conn) for _ in range(3))
++    _tick(conn)  # all three reserved ok (one tick, batch of up to 4)
++    board.script["POST"] = ["hang"] * 6
++    for _ in range(6):
++        clock[0] += 3600.0  # an hour between ticks
++        _tick(conn)
++    for tid in cards:
++        assert _reasons(conn, tid) == ["capability_mismatch", "board_error"], tid
++        assert len(_comments(conn, tid)) == 2
++
++
++def test_a_feed_reset_ends_pull_streaks(conn):
++    tid = fixtures.acknowledged(conn)
++    qr.record_pull_error(conn, "hub", error=TimeoutError("timed out"))
++    qr.record_pull_error(conn, "hub", error=client.Resync("reset"))
++    qr.record_pull_error(conn, "hub", error=TimeoutError("timed out"))
++    assert _reasons(conn, tid) == [] and [d["pass"] for d in _diagnostics(conn, tid)] == [1, 1]
++
++
++def test_a_non_transient_pull_error_does_not_end_a_card_streak(conn):
++    tid = fixtures.acknowledged(conn)
++    assert not qr.record_error(conn, tid, "hub", error=TimeoutError("timed out"), stage="reserve")
++    qr.record_error(conn, tid, "hub", error=client.HubError(401, "{}"), stage="pull")
++    assert qr.record_error(conn, tid, "hub", error=TimeoutError("timed out"), stage="reserve")
+diff --git a/tests/hermes_cli/test_kanban_queued_reserve_throttle.py b/tests/hermes_cli/test_kanban_queued_reserve_throttle.py
+index 44d660acda5..b741b59d7c2 100644
+--- a/tests/hermes_cli/test_kanban_queued_reserve_throttle.py
++++ b/tests/hermes_cli/test_kanban_queued_reserve_throttle.py
+@@ -8,6 +8,16 @@ from hermes_cli import kanban_sync_client as client
+ from hermes_cli import kanban_placement as placement
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
+ 
++
++@pytest.fixture(autouse=True)
++def _confirm_on_first_pass(monkeypatch):
++    """These tests pin the provenance of the recorded board_error, not the transient-failure debounce
++    (tests/hermes_cli/test_kanban_queue_transient_debounce.py): confirm a transient failure on its first pass."""
++    from hermes_cli import kanban_queue_reason
++
++    monkeypatch.setattr(kanban_queue_reason, "CONFIRM_PASSES", 1)
++
++
+ conn = fixtures.conn
+ CFG = {"worker_pools": {"hub": ["worker-1"]}}
+ 
+-- 
+2.55.0
+

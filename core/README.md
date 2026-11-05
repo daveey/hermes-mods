@@ -17,7 +17,7 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 
-2005 patches, one entry per non-merge source commit through `221510a25b32673c6f678f383ce15201b6f1c444`.
+2010 patches, one entry per non-merge source commit through `79e38bd675dc56816606cf0736123bbf45dacfdd`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -27,10 +27,19 @@ position in the log. `core/verify_mirror.py` checks exactly this: contiguous ord
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `84a0301415edd6d1385207ec96e4d7f2b6c1fcd9`; current merge-base: `e26e0e4b67bfae31eddaaefee87c062efd67429b`.
 Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. The eighteen bridges from the 1988 pass remain unchanged; three normalized upstream integration bridges are added before 1989, 1999 and 2001. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay.
-Current replay: [mirror-replay-2005.json](mirror-replay-2005.json) (twenty-one hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2005.json](mirror-policy-2005.json). Executed checks: [mirror-2005-verification.md](mirror-2005-verification.md); previous snapshots: [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
+Current replay: [mirror-replay-2010.json](mirror-replay-2010.json) (twenty-one hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2010.json](mirror-policy-2010.json). Executed checks: [mirror-2010-verification.md](mirror-2010-verification.md); previous snapshots: [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 2006–2010
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Worker run-end fencing](mirror-2010-features.md) | 2006 | Refuse post-run graph/lifecycle mutations and annotate successful handoffs. |
+| [Transient Board failures](mirror-2010-features.md) | 2007 | Two-pass transient confirmation, diagnostic-only first failure, bounded reserve replay. |
+| [Heartbeat verdict memo](mirror-2010-features.md) | 2008–2009 | Reuse projection across timestamp-only refreshes while reevaluating freshness; fixture alias correction. No live p95 claim. |
+| [Owned API listener port](mirror-2010-features.md) | 2010 | Publish kernel-assigned port and rediscover it per crash-test daemon restart. |
 
 ## Mirror follow-up 2005
 
@@ -1112,16 +1121,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **2005-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply twenty-one bridges and three ancestry-only markers from `mirror-replay-2005.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **2010-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply twenty-one bridges and three ancestry-only markers from `mirror-replay-2010.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 221510a25b32673c6f678f383ce15201b6f1c444 \
+  --source-tip 79e38bd675dc56816606cf0736123bbf45dacfdd \
   --base 84a0301415edd6d1385207ec96e4d7f2b6c1fcd9 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2005.json" \
-  --replay-plan "$MODS/core/mirror-replay-2005.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2010.json" \
+  --replay-plan "$MODS/core/mirror-replay-2010.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1193,7 +1202,7 @@ git commit -m 'Explicit upstream integration bridge before 1999'
 git am -3 --empty=keep "${patches[@]:1998:2}"
 git apply --index --3way "$MODS/core/bridges/upstream-through-857ffb31e9b.diff"
 git commit -m 'Explicit upstream integration bridge before 2001'
-git am -3 --empty=keep "${patches[@]:2000:5}"
+git am -3 --empty=keep "${patches[@]:2000:10}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.
