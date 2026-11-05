@@ -543,3 +543,135 @@ class BoundedCallTests(unittest.TestCase):
         rc, out = self._discovered_out([[skipped, green]], "--timeout-min", "0")
         self.assertEqual(rc, 0, out)
         self.assertIn("Recovery skipped u/Recovery/", out)
+
+
+class PerJobFailureTests(unittest.TestCase):
+    """A failed job is final even while its run is still queued behind a sibling job waiting for a runner.
+
+    Regression for validate.yml run 41956091801: macos failed 04:34Z while ios stayed queued, so the run read
+    `queued` and `--once` said "not yet" through three parks. A queued job is never a pass either.
+    """
+
+    SHA = "c" * 40
+
+    def queued_run(self, sha=None, rid=7, status="queued"):
+        return dict(run(sha or self.SHA, status=status, conclusion=""), _wf="ci.yml", databaseId=rid)
+
+    @staticmethod
+    def job(name, status="completed", conclusion="success"):
+        return {"name": name, "status": status, "conclusion": conclusion, "url": f"j/{name}"}
+
+    def _main_out(self, listings, jobs, *extra, grace=None):
+        import contextlib
+        import io
+        from unittest import mock
+        calls = []
+
+        def jobs_of(repo, slug, rid):
+            calls.append(rid)
+            value = jobs[rid] if isinstance(jobs, dict) else jobs
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        def fake_git(repo, *args):
+            return self.SHA if args[0] == "rev-parse" else ""
+        buf = io.StringIO()
+        patches = [mock.patch.object(w, "resolve_repo", side_effect=lambda p, slug=None: p),
+                   mock.patch.object(w, "git", side_effect=fake_git),
+                   mock.patch.object(w, "make_contains", return_value=lambda commit, sha: commit.startswith("origin/") or contains(commit[0], sha[0])),
+                   mock.patch.object(w, "list_runs", side_effect=listings),
+                   mock.patch.object(w, "list_jobs", side_effect=jobs_of),
+                   mock.patch.object(w.time, "sleep")]
+        if grace is not None:
+            patches.append(mock.patch.object(w, "STARTUP_GRACE_S", grace))
+        with contextlib.ExitStack() as stack, contextlib.redirect_stdout(buf):
+            for p in patches:
+                stack.enter_context(p)
+            rc = w.main([self.SHA, "--workflow", "ci.yml", "--gh-repo", "o/r", "--interval", "0", *extra])
+        self.calls = calls
+        return rc, buf.getvalue()
+
+    def test_queued_run_with_a_failed_job_is_stalled_under_once(self):
+        jobs = [self.job("plan"), self.job("ios", "queued", None), self.job("macos", conclusion="failure")]
+        rc, out = self._main_out([[self.queued_run()]], jobs, "--once")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("job 'macos' ended failure while the run is still queued: j/macos", out)
+
+    def test_timed_out_and_startup_failure_jobs_are_failures(self):
+        for conclusion in ("timed_out", "startup_failure"):
+            with self.subTest(conclusion=conclusion):
+                jobs = [self.job("ios", "queued", None), self.job("macos", conclusion=conclusion)]
+                rc, out = self._main_out([[self.queued_run(status="in_progress")]], jobs, "--once")
+                self.assertEqual(rc, 1, out)
+
+    def test_queued_jobs_alone_are_not_yet_never_a_pass(self):
+        jobs = [self.job("plan"), self.job("ios", "queued", None), self.job("macos", "queued", None)]
+        rc, out = self._main_out([[self.queued_run()]], jobs, "--once")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not yet", out)
+
+    def test_skipped_cancelled_neutral_and_green_jobs_beside_a_queued_one_are_not_yet(self):
+        jobs = [self.job("plan"), self.job("guards", conclusion="skipped"), self.job("lint", conclusion="neutral"),
+                self.job("old", conclusion="cancelled"), self.job("macos", "queued", None)]
+        rc, out = self._main_out([[self.queued_run()]], jobs, "--once")
+        self.assertEqual(rc, 2, out)
+
+    def test_every_job_green_while_the_run_still_reads_queued_is_not_a_pass(self):
+        # Only the run's own `success` passes; job evidence can make a run red, never green.
+        rc, out = self._main_out([[self.queued_run(status="in_progress")]], [self.job("plan"), self.job("macos")],
+                                 "--once")
+        self.assertEqual(rc, 2, out)
+
+    def test_unknown_job_conclusion_keeps_waiting_and_says_so(self):
+        for conclusion in (None, "stale", "action_required"):
+            with self.subTest(conclusion=conclusion):
+                jobs = [self.job("macos", conclusion=conclusion), self.job("ios", "queued", None)]
+                rc, out = self._main_out([[self.queued_run()]], jobs, "--once")
+                self.assertEqual(rc, 2, out)
+                self.assertIn("job 'macos' ended " + repr(conclusion) + " (unknown; still waiting)", out)
+
+    def test_unreadable_jobs_keep_waiting_and_say_so(self):
+        rc, out = self._main_out([[self.queued_run()]], RuntimeError("gh run view 7: HTTP 502"), "--once")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("jobs of run 7 unreadable", out)
+
+    def test_another_active_run_containing_the_commit_still_waits(self):
+        later = self.queued_run(sha="d" * 40, rid=8, status="in_progress")
+        jobs = {7: [self.job("macos", conclusion="failure"), self.job("ios", "queued", None)],
+                8: [self.job("macos", "in_progress", None)]}
+        rc, out = self._main_out([[later, self.queued_run()]], jobs, "--once")
+        self.assertEqual(rc, 2, out)
+
+    def test_a_green_run_containing_the_commit_still_passes(self):
+        green = dict(run("d" * 40), _wf="ci.yml", databaseId=9)
+        rc, out = self._main_out([[green, self.queued_run()]], {7: [self.job("macos", conclusion="failure")]},
+                                 "--once")
+        self.assertEqual(rc, 0, out)
+
+    def test_runs_not_containing_the_commit_and_finished_runs_are_not_queried(self):
+        older = dict(self.queued_run(sha="a" * 40, rid=5))
+        done = dict(run(self.SHA, conclusion="failure"), _wf="ci.yml", databaseId=6)
+        self._main_out([[older, done]], {}, "--once")
+        self.assertEqual(self.calls, [])
+
+    def test_loop_mode_stalls_on_a_failed_job_without_waiting_for_the_queued_sibling(self):
+        q = self.queued_run()
+        jobs = [self.job("macos", conclusion="failure"), self.job("ios", "queued", None)]
+        rc, out = self._main_out([[dict(q)], [dict(q)], [dict(q)]], jobs, "--timeout-min", "5", grace=0)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stalled: newest finished run containing the commit ended failure", out)
+        self.assertIn("job 'macos'", out)
+
+    def test_list_jobs_is_bounded_and_names_the_repo(self):
+        from unittest import mock
+        seen = []
+
+        def fake(cmd, **kw):
+            seen.append((cmd, kw.get("timeout")))
+            return mock.Mock(returncode=0, stdout='{"jobs": [{"name": "macos"}]}', stderr="")
+        with mock.patch.object(w.subprocess, "run", side_effect=fake):
+            self.assertEqual(w.list_jobs(Path("."), "o/r", 41), [{"name": "macos"}])
+        cmd, timeout = seen[0]
+        self.assertEqual(cmd, ["gh", "run", "view", "41", "--json", "jobs", "-R", "o/r"])
+        self.assertTrue(timeout)

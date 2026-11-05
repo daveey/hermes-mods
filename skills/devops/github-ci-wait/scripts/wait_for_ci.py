@@ -187,6 +187,68 @@ def run_ref(run: dict, shas: list[str]) -> str:
     return run["url"]
 
 
+# A job that ended like this makes its run end red whatever its queued/running siblings do. Skipped, neutral,
+# cancelled and success jobs say nothing yet; only the run's own `success` is ever a pass.
+JOB_FAILED = {"failure", "timed_out", "startup_failure"}
+JOB_NOT_FAILED = {"success", "skipped", "neutral", "cancelled"}
+
+
+def list_jobs(repo: Path, slug: str | None, run_id) -> list[dict]:
+    """The run's jobs (latest attempt), bounded like every other call."""
+    cmd = gh_cmd(slug, "run", "view", str(run_id), "--json", "jobs")
+    try:
+        out = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=CALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"gh run view {run_id}: timed out after {CALL_TIMEOUT_S}s") from None
+    if out.returncode != 0:
+        raise RuntimeError(f"gh run view {run_id}: {out.stderr.strip()}")
+    return json.loads(out.stdout or "{}").get("jobs") or []
+
+
+def mark_failed_jobs(runs: list[dict], shas: list[str], contains, workflows: list[str] | None, jobs_of) -> list[str]:
+    """Turn a still-active run that already has a failed job into the finished red run it will become.
+
+    A run stays `queued`/`in_progress` until its LAST job ends, so a job that already failed hid behind a sibling
+    still waiting for a runner: `--once` printed "not yet" for hours while the macOS job had been red since it ran
+    (validate.yml run 41956091801: macos failed 04:34Z, ios still queued). Only active runs containing the commit
+    are checked. Returns notes for runs whose jobs could not be read or ended in an unknown state: those stay
+    active (never a pass, never a failure).
+    """
+    notes = []
+    for i, r in enumerate(runs):
+        if r.get("status") not in ACTIVE or r.get("databaseId") is None:
+            continue
+        if not workflows and r.get("event") == "workflow_run":
+            continue
+        if not all(contains(r["headSha"], s) for s in shas):
+            continue
+        try:
+            jobs = jobs_of(r["databaseId"])
+        except (RuntimeError, ValueError) as e:  # ValueError: unparseable JSON
+            notes.append(f"jobs of run {r['databaseId']} unreadable ({e})")
+            continue
+        done = [j for j in jobs if j.get("status") == "completed"]
+        bad = next((j for j in done if j.get("conclusion") in JOB_FAILED), None)
+        if bad is not None:
+            runs[i] = dict(r, status="completed", conclusion="failure", _failed_job=bad, _run_status=r["status"])
+            continue
+        unknown = [j for j in done if j.get("conclusion") not in JOB_FAILED | JOB_NOT_FAILED]
+        if unknown:
+            notes.append(f"run {r['databaseId']} job {unknown[0].get('name')!r} ended "
+                         f"{unknown[0].get('conclusion')!r} (unknown; still waiting)")
+    return notes
+
+
+def failure_ref(run: dict, shas: list[str]) -> str:
+    """run_ref, plus the failed job when the run itself has not finished yet."""
+    job = run.get("_failed_job")
+    if not job:
+        return run_ref(run, shas)
+    where = job.get("url") or run_ref(run, shas)
+    return (f"{run_ref(run, shas)} (job {job.get('name')!r} ended {job.get('conclusion')} while the run is still "
+            f"{run.get('_run_status')}: {where})")
+
+
 def gh_repo(repo: Path) -> str | None:
     """OWNER/NAME of the checkout's `origin` on GitHub, passed to every `gh` call as `-R`.
 
@@ -317,6 +379,8 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(a.interval)
             continue
         errors = 0
+        # Per-job: a failed job decides its run even while a sibling job is still queued for a runner.
+        job_notes = mark_failed_jobs(runs, shas, contains, a.workflow or None, lambda rid: list_jobs(repo, slug, rid))
         if a.tag_glob:
             tags = tags_done(repo, shas, a.tag_glob)
             if all(tags.values()):
@@ -340,13 +404,15 @@ def main(argv: list[str] | None = None) -> int:
             failed = [s["failed"] for s in pend.values() if s["failed"]]
             missing = list(pend) or ["(no run yet)"]
             note = f"waiting for {', '.join(missing)}; {active} run(s) queued/running"
+        if job_notes:
+            note += "; " + "; ".join(job_notes)
 
         if a.once:
             # A finished red run with nothing queued/running is final: a wake probe must see it
             # (exit 1) instead of "not yet" forever.
             if failed and not active:
                 print(f"stalled: newest finished run containing the commit ended "
-                      f"{failed[0]['conclusion']}: {run_ref(failed[0], shas)}")
+                      f"{failed[0]['conclusion']}: {failure_ref(failed[0], shas)}")
                 return 1
             print(f"not yet: {note}")
             return 2
@@ -355,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
             last = note
         idle = 0 if active else idle + 1
         if idle >= 2 and time.monotonic() - start >= STARTUP_GRACE_S:
-            reason = (f"newest finished run containing the commit ended {failed[0]['conclusion']}: {run_ref(failed[0], shas)}"
+            reason = (f"newest finished run containing the commit ended {failed[0]['conclusion']}: {failure_ref(failed[0], shas)}"
                       if failed else "no run containing the commit succeeded and none is queued or running")
             if a.dispatch and a.workflow and dispatches < 2:
                 for wf in a.workflow:
