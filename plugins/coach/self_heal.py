@@ -2671,6 +2671,46 @@ def _complaint_identity(d: dict) -> dict:
             "complaint_quote_hash": hashlib.sha256(quote.encode()).hexdigest()[:20] if quote else None}
 
 
+# Exact transcript boundaries from agent/turn_failure_copy.py. Keep a standalone
+# fallback: the digest consumer can run without the source host's core installed.
+_FAILED_TURN_NOTICES = frozenset({
+    "Your request was not processed. Send it again if you still want me to carry it out.",
+    "This turn did not complete. Some actions may already have run; verify their effects before resending.",
+    "Hermes restarted before this turn finished. It continues automatically once the backend is back; "
+    "send it again only if nothing happens within a few minutes.",
+    "An automated delivery was interrupted and was not run again. Some actions may already have run; verify their effects.",
+})
+
+
+def _failed_turn_boundary(turn: dict) -> bool:
+    text = str(turn.get("prev") or "").strip()
+    if turn.get("prev_display_kind") == "failed_turn" or text in _FAILED_TURN_NOTICES:
+        return True
+    # The fifth boundary is parameterized by a validated refusal category.
+    return bool(re.fullmatch(
+        r"The model provider's content filter refused this turn(?: \(category: [A-Za-z0-9_-]{1,80}\))?\. "
+        r"Try to rephrase your question, or start a new chat or fork from before the problematic context; "
+        r"a long conversation can contribute to a filter trigger\."
+        r"(?: Some actions may already have run; verify their effects\.)?", text))
+
+
+def _failed_turn_nudge_since(turns: list, turn: dict) -> Optional[float]:
+    """Conservative digest interval: never bridge a real reply or missing history.
+
+    A digest stores the previous reply on the *next user* row, without its own
+    timestamp. That user's timestamp is a safe upper bound for the real reply.
+    With no retained reply, start at the first retained user row, not session birth.
+    """
+    if not _failed_turn_boundary(turn):
+        return None
+    earlier = turns[:next(i for i, t in enumerate(turns) if t is turn)]
+    since = turns[0]["t"]
+    for t in earlier:
+        if not _failed_turn_boundary(t):
+            since = t["t"]
+    return since
+
+
 def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]:
     """Different fingerprints for the same session/user turn share the original owner.
 
@@ -2714,6 +2754,16 @@ def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]
             same_time = False
         if card and (same_quote or same_time):
             owners.append((e.get("filed_at") or now, ofp, card, e, "complaint_turn"))
+        elif card and d.get("source") == "backstop" and d.get("failed_turn_since") is not None:
+            owner_at = e.get("complaint_at")
+            if owner_at is None:
+                owner_at = e.get("filed_at")
+            nudge_at = identity["complaint_at"]
+            try:
+                if nudge_at is not None and float(d["failed_turn_since"]) <= float(owner_at) <= nudge_at:
+                    owners.append((e.get("filed_at") or now, ofp, card, e, "failed_turn_nudge"))
+            except (TypeError, ValueError):
+                pass
     if not owners:
         return None
     _, ofp, card, e, via = sorted(owners, key=lambda o: (o[0], o[1]))[0]
@@ -2733,6 +2783,8 @@ def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]
                "owner_fingerprint": ofp, "card": card, "session_id": sid, "board": e.get("board"),
                "owner_session_id": e.get("session_id")})
     why = f"same quote as {card} ({ofp})" if via == "complaint_quote" else f"same complaint turn as {ofp}"
+    if via == "failed_turn_nudge":
+        why = f"nudge after failed turn owned by {ofp}"
     if via == "complaint_quote":
         store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp, "why": why, "card": card,
                    "session_id": sid})
@@ -3575,6 +3627,9 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
             d = {**hit, "session_id": sid, "quote": clean_user(text)[:500], "host": dg.get("host") or f.parts[-3],
                  "profile": dg.get("profile") or f.parts[-2], "at": t["t"], "source": "backstop",
                  "kind": hit.get("kind") or "complaint"}
+            since_failure = _failed_turn_nudge_since(turns, t)
+            if since_failure is not None:
+                d["failed_turn_since"] = since_failure
             store.log({"event": "selfheal_detect", "mode": m, "session_id": sid, "source": "backstop",
                        "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
                        "fingerprint": hit["fingerprint"], "new": new_fp, "evidence": d["quote"][:300]})

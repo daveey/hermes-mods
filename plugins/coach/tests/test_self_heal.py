@@ -672,6 +672,60 @@ def test_strict_prompt_counts_fix_requests_for_described_defects_and_never_calls
     assert calls[1][0].startswith(sh.COMPLAINT_STRICT_SYS)
 
 
+@pytest.mark.parametrize("case,adopted", [
+    ("late", True), ("real_reply", False), ("other_session", False),
+    ("success_then_failure", False), ("declined", False), ("expired", False),
+    ("filed_at", True), ("future_owner", False),
+])
+def test_backstop_late_failed_turn_nudge(tmp_path, monkeypatch, case, adopted):
+    import time
+    now = time.time()
+    owner_at = now - 15 * 3600  # owner at 23:45, resume fifteen hours later
+    notice = "Your request was not processed. Send it again if you still want me to carry it out."
+    turns = [{"t": owner_at - 60, "text": "do the work", "prev": "Ready."},
+             {"t": owner_at + 420, "text": "try again", "prev": notice}]
+    if case == "success_then_failure":
+        turns.append({"t": now - 600, "text": "next job", "prev": "Finished the earlier job."})
+    turns.append({"t": now - 1, "text": "resume", "prev": "Finished." if case == "real_reply" else notice})
+    p = tmp_path / "data" / "hub" / "default" / "s1.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"id": "s1", "source": "desktop", "user_turns": turns}))
+    store = core.Store(tmp_path / "coach")
+    lane = sh.LaneState(store.root)
+    lane.update("owner", status="declined" if case == "declined" else "not_defect" if case == "expired" else "fixed",
+                session_id="other" if case == "other_session" else "s1", fix_card="t_abcdef01",
+                complaint_at=None if case == "filed_at" else now + 600 if case == "future_owner" else owner_at,
+                filed_at=owner_at, closed_at=now - (sh.NOT_DEFECT_DAYS + 1) * 86400)
+    llm, _ = judge(0.99, component="agent", symptom="stopped without finishing", kind="agent_fault")
+    results = sh.backstop(tmp_path / "data", store=store, judge=llm, now=now, lookback=60,
+                          confirm=None, m="live", filer=lambda d, **kw: sh._adopt_complaint_lane(
+                              d, d["fingerprint"], store, now))
+    assert len(results) == 1
+    assert bool(results[0] and results[0].get("adopted")) is adopted
+    if adopted:
+        assert results[0]["via"] == "failed_turn_nudge"
+        assert results[0]["card"] == "t_abcdef01"
+        events = [json.loads(line) for line in (store.root / "log.jsonl").read_text().splitlines()]
+        assert any(e.get("event") == "selfheal_adopted_owner" and e.get("via") == "failed_turn_nudge" for e in events)
+
+
+@pytest.mark.parametrize("notice", [
+    "Your request was not processed. Send it again if you still want me to carry it out.",
+    "This turn did not complete. Some actions may already have run; verify their effects before resending.",
+    "Hermes restarted before this turn finished. It continues automatically once the backend is back; "
+    "send it again only if nothing happens within a few minutes.",
+    "An automated delivery was interrupted and was not run again. Some actions may already have run; verify their effects.",
+    "The model provider's content filter refused this turn (category: policy). "
+    "Try to rephrase your question, or start a new chat or fork from before the problematic context; "
+    "a long conversation can contribute to a filter trigger.",
+])
+def test_failed_turn_boundaries_are_exact(notice):
+    assert sh._failed_turn_boundary({"prev": notice})
+    assert not sh._failed_turn_boundary({"prev": "I investigated this notice: " + notice})
+    assert not sh._failed_turn_boundary({"prev": ""})
+    assert sh._failed_turn_boundary({"prev": "localized boundary", "prev_display_kind": "failed_turn"})
+
+
 def _digest(tmp_path, now):
     p = tmp_path / "data" / "hub" / "default" / "s1.json"
     p.parent.mkdir(parents=True, exist_ok=True)
