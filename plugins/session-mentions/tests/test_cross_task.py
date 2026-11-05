@@ -78,3 +78,22 @@ def test_read_and_comment_queue_no_shepherd_request(relay, monkeypatch):
                                      session_id="s_mac")) == {"ok": True, "echo": "task_read"}
     sm.handle_task({"action": "comment", "target": "hub:t_cccc3333", "message": "hi"}, session_id="s_mac")
     assert not spawned and not hasattr(sm, "_shepherd")
+
+
+def test_bounded_read_delivers_through_same_relay(relay):
+    out = json.loads(sm.handle_task({"action": "read", "target": "@task:default@other/t_aaaa1111"}, timeout_seconds=5))
+    assert out == {"ok": True, "echo": "task_read"}
+
+
+def test_bounded_read_timeout_withdraws_unclaimed_request(tmp_path, monkeypatch):
+    for sub in ("outbox", "results"):
+        (tmp_path / sub).mkdir()
+    monkeypatch.setattr(sm.rf, "root", lambda: tmp_path)
+    monkeypatch.setattr(sm, "_sender_info", lambda sid: {})
+    now = [100.0]
+    monkeypatch.setattr(sm.time, "time", lambda: now[0])
+    monkeypatch.setattr(sm.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    out = json.loads(sm.handle_task({"action": "read", "target": "@task:default@other/t_aaaa1111"}, timeout_seconds=2))
+    assert "Timed out" in out["error"]
+    assert now[0] == 102.0
+    assert not list((tmp_path / "outbox").iterdir())

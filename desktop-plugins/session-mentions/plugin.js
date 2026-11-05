@@ -911,6 +911,7 @@ export function summarizeTask(data, limit = 10) {
     // (owner, its created_on) created and owns; "live" = the gateway's own file. Writes on a replica copy
     // are refused with foreign_card naming the owner.
     ...(data?.source ? { source: data.source } : {}),
+    ...(data?.wait_observation ? { wait_observation: data.wait_observation } : {}),
     ...(data?.owner ? { owner: data.owner } : {}),
     // A ready card's place in the queue that starts it (lane local: ahead/running/limit; lane
     // worker_pool: the Board's last reason), so a long wait reads as queued, not stuck.

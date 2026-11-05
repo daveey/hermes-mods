@@ -212,7 +212,7 @@ TASK_SCHEMA = {
 TASK_TARGET_ALIASES = ("task", "task_id", "taskId", "task_ref", "task_link") + TARGET_ALIASES
 
 
-def handle_task(args: dict, session_id: str | None = None, **_kw) -> str:
+def handle_task(args: dict, session_id: str | None = None, *, timeout_seconds: float | None = None, **_kw) -> str:
     args = dict(args or {})
     if not str(args.get("target") or "").strip():
         alias = _first(args, TASK_TARGET_ALIASES)
@@ -228,7 +228,7 @@ def handle_task(args: dict, session_id: str | None = None, **_kw) -> str:
                     "(e.g. target=\"@task:default@nous-1/t_1a2b3c4d\"); got keys: " + (", ".join(got) or "none"))
     if action == "comment" and not str(args.get("message") or "").strip():
         return _err("message is required for comment — pass the text as `message`")
-    out = _relay(f"task_{action}", args, session_id, 0)
+    out = _relay(f"task_{action}", args, session_id, 0, **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}))
     return out
 
 def _devices_note(base) -> str:
@@ -239,7 +239,7 @@ def _devices_note(base) -> str:
     return ("Desktops draining this gateway now: " + ", ".join(seen)) if seen else "No Desktop is draining this gateway right now."
 
 
-def _relay(action: str, args: dict, session_id: str | None, wait: int) -> str:
+def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeout_seconds: float | None = None) -> str:
     base = rf.root()
     rid = uuid.uuid4().hex
     # Which gateway/Mac the request is for, so only a Desktop that can reach it claims it.
@@ -263,6 +263,8 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int) -> str:
     result_path = base / "results" / f"{rid}.json"
     deadline_pickup = time.time() + PICKUP_TIMEOUT
     deadline = time.time() + PICKUP_TIMEOUT + 120 + wait  # a forwarded send adds one hop
+    if timeout_seconds is not None:
+        deadline = min(deadline, time.time() + max(0, timeout_seconds))
 
     while time.time() < deadline:
         if result_path.exists():
@@ -287,6 +289,8 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int) -> str:
             return _err("The Hermes Desktop app did not pick up the request — it must be running with the "
                         "session-mentions plugin enabled to reach other gateways.")
         time.sleep(0.5)
+    if timeout_seconds is not None:
+        outbox.unlink(missing_ok=True)  # withdraw unclaimed bounded read requests
     return _err("Timed out waiting for the Desktop to finish the request (it may still complete).")
 
 
