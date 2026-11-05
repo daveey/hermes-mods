@@ -201,6 +201,7 @@ Countermeasures:
 ### 8. Check Done means (below), fix at most 2 rounds, then report what still fails
 
 ## Done means
+- [ ] For SQLite I/O errors or truncated disk-failure signals, is disk-owner adoption scoped to the same host and incident time (bounded local journal evidence is allowed), never cached in an unscoped generic family lane?
 - [ ] Every why cites evidence (log line, test, `file:line`, commit, metric) or is labelled `(hypothesis)`?
 - [ ] The write-up has both `Root (happened)` and `Root (not caught)`, and neither is "human error", "flaky" or "transient"?
 - [ ] A `Recurrence:` line names the earlier occurrence it searched for (or says first time)?
