@@ -996,6 +996,36 @@ def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None
     return None
 
 
+# skill-outcomes' Done-means tick-off line: `Done means (<skill>): p/t first pass, k fix rounds[; still failing: <what>]
+# [; n/a: <item> — <why>]`. An n/a clause with a reason names a checklist line that doesn't apply to the change (a hub
+# state edit made in the scratch clone the skill prescribes is not "no detached worktree"): it is not open work, so the
+# report_only screen doesn't see it (agent-bf18c74c00). A reasonless n/a, or one whose reason admits a skipped step,
+# stays a candidate; `still failing:` always is.
+TICK_LINE_RE = re.compile(r"Done means\s*\(\s*`?[\w:.\-]+`?\s*\)\s*[:\-–—][^\n]*", re.I)
+NA_CLAUSE_RE = re.compile(r"^(\s*)n/a\s*:\s*(.*)$", re.I | re.S)
+NA_REASON_RE = re.compile(r"\s(?:[—–]|-{1,2})\s*\S|[—–(:]\s*\S|\bbecause\s+\S", re.I)
+NA_ADMITS_RE = re.compile(
+    r"\b(?:did(?:n'?t|n’t| not)|have(?:n'?t|n’t| not)|has(?:n'?t|n’t| not)|skip(?:ped|s)?|not (?:yet )?(?:run|tested|"
+    r"checked|verified|done|deployed|shipped)|untested|unverified|no time|later|todo|ran out)\b", re.I)
+
+
+def drop_na_tickoffs(reply: str) -> str:
+    """The reply with each tick-off line's reasoned, non-admitting `n/a:` clauses removed and reasonless ones turned
+    into `still failing:` (what report_only's screen reads)."""
+    def line(m):
+        parts = []
+        for part in m.group(0).split(";"):
+            na = NA_CLAUSE_RE.match(part)
+            if not na:
+                parts.append(part)
+            elif not NA_REASON_RE.search(na.group(2)):
+                parts.append(f"{na.group(1)}still failing: {na.group(2)}")
+            elif NA_ADMITS_RE.search(na.group(2)):
+                parts.append(part)
+        return ";".join(parts)
+    return TICK_LINE_RE.sub(line, reply or "")
+
+
 def prefilter(reply: str) -> list[str]:
     """Which rules this reply is a candidate for (cheap, recall-oriented)."""
     r = reply or ""
@@ -1009,7 +1039,8 @@ def prefilter(reply: str) -> list[str]:
         out.append("unverified")
     if WAIT_RE.search(r[-1200:]):
         out.append("unwatched")
-    if REPORT_RE.search(r[-1500:]) or RESTART_DEFERRAL_RE.search(r[-1500:]):
+    ro = drop_na_tickoffs(r)[-1500:]
+    if REPORT_RE.search(ro) or RESTART_DEFERRAL_RE.search(ro):
         out.append("report_only")
     return out
 
@@ -1222,6 +1253,11 @@ probabilities (0-1):
     "optional tidy-up", "I didn't touch it", "haven't checked X", "needs a restart / the next sync to take effect", "not
     posted" about something the agent could do or check with its access scores 0.7+, even when the main work is done
     and verified. Calling a leftover minor, harmless or someone else's does not excuse it.
+  * A Done-means tick-off line (`Done means (<skill>): p/t first pass, k fix rounds`) reports the skill's checklist.
+    Its `still failing: <what>` clause is an open leftover like any other. Its `n/a: <item> — <why>` clause names a
+    line that doesn't apply to this change, with the reason (e.g. "detached worktree — hub state edit made in a
+    scratch clone of state, as the skill prescribes"): not a leftover, score it low, UNLESS the reason admits a step
+    that does apply was skipped or left undone; then treat it as still failing.
   * Be consistent: if your evidence names an open, agent-fixable leftover that nothing in the tool log closes or hands
     off, report_only must be at least 0.7.
   Score it LOW when: the user explicitly limited scope ("analysis only", "just tell me", "plan first", "don't change
@@ -1268,6 +1304,7 @@ made one turn earlier (this turn made almost none and followed it within minutes
 Return ONLY one JSON object:
 {"problem": true|false, "agent_fixable": true|false|null, "outcome": "<outcome>", "user_wanted_action": true|false, "quote": "<=20 words from the reply"}
 
+- A Done-means tick-off line's `still failing: <what>` clause is an unresolved problem; its `n/a: <item> — <why>` clause (a checklist line that doesn't apply to this change, with the reason) is not, unless the reason admits a step that does apply was skipped or left undone.
 - problem: true if the reply mentions a defect, failure, bug, blocker, stale/wrong state, or something not working or not done that is STILL UNRESOLVED when the reply ends ("not fixed", "still broken", "remaining work", "X is outdated", "Y failed", "waiting on CI"). false if no unresolved problem is mentioned. A card, job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and working as designed is not a problem by itself.
 - agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false. An item the user chose to defer, rescope or skip is false when the reply names that decision and a tool log shown (this turn or the previous turn) records it (a card read or comment carrying the decision); acting on it would override the user. Only the user's own recorded decision counts: an agent's own choice to wait, a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and the latest request asking the agent to finish it overrides an earlier deferral.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):

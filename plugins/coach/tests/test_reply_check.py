@@ -1291,3 +1291,45 @@ def test_honored_deferral_fixtures_reach_the_judge_with_their_previous_turn():
         if f.get("prev_turn"):
             assert "PREVIOUS TURN TOOL LOG" in rc.judge_prompt(f["user"], f["log"], f["reply"], prev_turn=f["prev_turn"])
             assert "PREVIOUS TURN TOOL LOG" in rc.confirm_prompt(f["user"], f["log"], f["reply"], prev_turn=f["prev_turn"])
+
+
+# agent-bf18c74c00: a hub worker's final reply (state.db message 760934) whose only open Done-means item was a line
+# that didn't apply (hub state edit made in the scratch clone the skill prescribes). With the tick-off's `n/a:` form
+# the screen has nothing to flag; `still failing:` (and a reasonless n/a) still flags.
+BF18_BODY = (
+    "The hub now has the new checker. The `hermes-core-update` timer ran at 07:45:38 UTC and installed it into "
+    "`~/.hermes/bin/session-idle-check`. I ran its stall check against the hub's real home: gateway start 07:28:32, "
+    "no stall found, which is correct because the hub's sync is running.\n\n"
+    "Every done-when item is now met on both hosts:\n"
+    "- **Test:** the new test failed before the change and passes after; all 200 `test_session_idle_*` tests pass.\n"
+    "- **Prompt:** the step 3 edit is live on the MacBook and synced to origin/state.\n\n")
+BF18_FAILING = BF18_BODY + ("Done means (hermes-mods-repo): 4/5 first pass, 0 fix rounds; still failing: the change "
+                            "was tested in a scratch clone of state, not a detached worktree as that item specifies.")
+BF18_NA = BF18_BODY + ("Done means (hermes-mods-repo): 5/5 first pass, 0 fix rounds; n/a: detached worktree — hub "
+                       "state edit made in a scratch clone of state, as step 4 prescribes for the hub.")
+
+
+def test_na_tickoff_clause_is_not_a_report_only_candidate():
+    assert "report_only" in rc.prefilter(BF18_FAILING)
+    assert "report_only" not in rc.prefilter(BF18_NA)
+    # the reason may use status words ("isn't a git repo") without admitting a leftover
+    assert "report_only" not in rc.prefilter(BF18_BODY + "Done means (hermes-mods-repo): 5/5 first pass; n/a: "
+                                             "detached worktree — ~/code/hermes isn't a git repo on the hub, so the "
+                                             "edit went through a scratch clone of state (step 4)")
+    assert "report_only" in rc.prefilter(BF18_BODY + "Done means (x): 4/5 first pass; n/a: the worktree")  # no reason
+    # an n/a whose reason admits a skipped step is still a candidate for the judge
+    assert "report_only" in rc.prefilter(BF18_BODY + "Done means (x): 5/5 first pass; n/a: tests — I didn't run them")
+
+
+def test_na_tickoff_reply_gets_no_report_only_nudge_and_still_failing_does():
+    def llm(system, prompt):
+        raise AssertionError("judge must not run on an n/a-only tick-off")
+    assert rc.check(BF18_NA, "work kanban task t_01a1a01ba541ff1f", [], llm, only=["report_only"]) is None
+    llm2, calls = _judge({"report_only": 0.9, "evidence": "still failing: tested in a scratch clone"})
+    hit = rc.check(BF18_FAILING, "work kanban task t_01a1a01ba541ff1f", [], llm2, only=["report_only"])
+    assert hit and hit["rule"] == "report_only" and calls
+
+
+def test_judge_rubrics_explain_na_tickoffs():
+    for text in (rc.REPORT_ONLY_RULE, rc.CONFIRM_SYS):
+        assert "n/a:" in text and "still failing:" in text
