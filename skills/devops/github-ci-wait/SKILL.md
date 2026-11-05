@@ -56,7 +56,8 @@ Exit codes: 0 done (prints the run URLs or tags; a run that built a later commit
 newest finished run containing your commit went red after the green run that proved it (a later push broke it),
 its entry ends `; but the newest finished run containing it, on <sha>, ended failure: <url>`: your commit passed,
 but that workflow is red on the branch now. Never report the branch green from a pass line; read the notes); 1 stalled (nothing queued or running will finish it,
-and the failing run's URL is printed), or `gh run list` failed 5 times in a row (prints `gh kept failing`: a `gh`
+and the failing run's URL is printed; under `--once`, exit 1 also covers a failed job in a still-active run
+when no other active run can finish the wait), or `gh run list` failed 5 times in a row (prints `gh kept failing`: a `gh`
 auth or repo problem, not a CI failure); 2 timed out (default 120 min) or not yet with `--once` (a failed listing
 included); 3 the sha isn't on `origin/<branch>` (default `main`; `--branch` to change). `--dispatch` (requires `--workflow`) re-runs the
 workflow via `gh workflow run` on a stall, at most twice, instead of exiting 1. Pass several shas to wait

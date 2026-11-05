@@ -663,6 +663,32 @@ class PerJobFailureTests(unittest.TestCase):
         self.assertIn("stalled: newest finished run containing the commit ended failure", out)
         self.assertIn("job 'macos'", out)
 
+    def test_dispatch_waits_while_failed_run_has_queued_sibling(self):
+        from unittest import mock
+        jobs = [self.job("macos", conclusion="failure"), self.job("ios", "queued", None)]
+        green = dict(run(self.SHA), _wf="ci.yml", databaseId=8)
+        listings = [[self.queued_run()] for _ in range(4)] + [[green]]
+        with mock.patch.object(w.subprocess, "run") as dispatch:
+            rc, out = self._main_out(listings, jobs, "--dispatch", grace=0)
+        self.assertEqual(rc, 0, out)
+        dispatch.assert_not_called()
+        self.assertEqual(self.calls, [7] * 4)
+
+    def test_dispatch_resumes_after_failed_run_really_completes(self):
+        from unittest import mock
+        jobs = [self.job("macos", conclusion="failure"), self.job("ios", "queued", None)]
+        red = dict(run(self.SHA, conclusion="failure"), _wf="ci.yml", databaseId=7)
+        green = dict(run(self.SHA), _wf="ci.yml", databaseId=8)
+        listings = ([[self.queued_run()] for _ in range(4)]
+                    + [[dict(red)], [dict(red)], [green]])
+        with mock.patch.object(w.subprocess, "run") as dispatch:
+            rc, out = self._main_out(listings, jobs, "--dispatch", grace=0)
+        self.assertEqual(rc, 0, out)
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[0],
+                         ["gh", "workflow", "run", "ci.yml", "--ref", "main", "-R", "o/r"])
+        self.assertEqual(self.calls, [7] * 4)
+
     def test_list_jobs_is_bounded_and_names_the_repo(self):
         from unittest import mock
         seen = []

@@ -23,8 +23,9 @@ Done when:
 
 Exit codes: 0 done; 1 stalled (nothing queued/running will finish it: the newest
 finished run containing the commit failed, or no run will ever pick it up), or
-`gh run list` failed MAX_CALL_ERRORS times in a row (under --once, 1 means a finished
-run containing the commit failed and nothing is queued/running); 2 timed out, or not yet done
+`gh run list` failed MAX_CALL_ERRORS times in a row (under --once, 1 also covers a
+failed job in a still-active run when no other active run can finish the wait);
+2 timed out, or not yet done
 with --once (a failed listing under --once is also 2); 3 a sha is not on origin/<branch>.
 Every gh/git call is bounded by CALL_TIMEOUT_S, so a hung call can't outlive the deadline.
 --dispatch: on a stall, `gh workflow run` each --workflow (at most twice) and
@@ -419,7 +420,9 @@ def main(argv: list[str] | None = None) -> int:
         if note != last:
             print(note, flush=True)
             last = note
-        idle = 0 if active else idle + 1
+        # Failure reporting is final, but do not dispatch while that run still has active siblings.
+        held = a.dispatch and any(r.get("_failed_job") for r in runs)
+        idle = 0 if active or held else idle + 1
         if idle >= 2 and time.monotonic() - start >= STARTUP_GRACE_S:
             reason = (f"newest finished run containing the commit ended {failed[0]['conclusion']}: {failure_ref(failed[0], shas)}"
                       if failed else "no run containing the commit succeeded and none is queued or running")
