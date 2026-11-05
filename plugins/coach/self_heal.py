@@ -574,10 +574,10 @@ def is_resume_note(user_text) -> bool:
     return clean_user(user_text).lstrip().startswith(RESUME_NOTE_PREFIX)
 
 
-def resume_signal(user_text, gap_s: Optional[float] = None) -> Optional[dict]:
+def resume_signal(user_text, gap_s: Optional[float] = None, stop: Optional[dict] = None) -> Optional[dict]:
     """A user turn that is core's crash-recovery note: the backend stopped mid-turn and Hermes resumed the chat.
     `gap_s` = seconds the chat stood still (None when unknown); for a pause note, since the paused turn stopped
-    (pause_gap_s), never since it started."""
+    (pause_gap_s), never since it started. `stop` = stop_cause() for a crash note (with_stop_cause)."""
     t = clean_user(user_text)
     if not is_resume_note(t):
         return None
@@ -587,10 +587,154 @@ def resume_signal(user_text, gap_s: Optional[float] = None) -> Optional[dict]:
         v = {"p_defect": 0.85, "kind": "interrupted", "component": "gateway",
              "symptom": "update pause did not continue in time"}
     else:
-        v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
-             "symptom": "turn interrupted (backend stopped)"}
-    return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal",
-            "gap_s": None if gap_s is None else int(gap_s)}
+        v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway", "symptom": CRASH_SYMPTOM}
+    hit = {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal",
+           "gap_s": None if gap_s is None else int(gap_s)}
+    return with_stop_cause(hit, stop) if stop is not None and is_crash_hit(hit) else hit
+
+
+# ── gateway-9aaf151a15 (came back): WHY the backend stopped ──
+# Core's crash note names no cause, so every stop shared one fingerprint: once one cause was fixed (fe419c4: update
+# pauses), the next stop from any other cause read as "the fix didn't hold". The evidence lives only on the host that
+# ran the turn, so it is read there, when the note is detected, over the window between the cut turn's start and the
+# resume. First match in STOP_CAUSES order names the cause; "unknown" keeps the old fingerprint.
+CRASH_SYMPTOM = "turn interrupted (backend stopped)"
+STOP_CAUSES = ("core update", "plugin reload", "gateway shutdown", "machine slept")
+STOP_EVIDENCE_MAX = 600
+STOP_WINDOW_DEFAULT_S = 6 * 3600  # gap unknown: look back this far
+STOP_SLACK_S = 60
+_SYNC_LINE_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[[^\]]*\] (mods-reload: .*)$")
+_PMSET_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d{4})\s+(Sleep|DarkWake|Wake)\s+(.*)$")
+
+
+def is_crash_hit(hit: Optional[dict]) -> bool:
+    return bool(hit) and hit.get("source") == "signal" and str(hit.get("symptom") or "").startswith(CRASH_SYMPTOM[:-1])
+
+
+def with_stop_cause(hit: dict, stop: Optional[dict]) -> dict:
+    """The crash hit with its stop cause: symptom "turn interrupted (backend stopped: <cause>)" and its own
+    fingerprint; an unknown cause keeps CRASH_SYMPTOM and gateway-9aaf151a15."""
+    stop = stop or {}
+    cause = stop.get("cause") if stop.get("cause") in STOP_CAUSES else "unknown"
+    out = {**hit, "stop_cause": cause, "stop_evidence": str(stop.get("evidence") or "")[:STOP_EVIDENCE_MAX],
+           "stop_host": stop.get("host") or host_name()}
+    out["symptom"] = CRASH_SYMPTOM if cause == "unknown" else f"{CRASH_SYMPTOM[:-1]}: {cause})"
+    out["fingerprint"] = fingerprint(out["component"], out["symptom"])
+    return out
+
+
+def _iso_ts(s) -> Optional[float]:
+    import datetime as _dt
+    try:
+        d = _dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (d if d.tzinfo else d.astimezone()).timestamp()
+
+
+def _pmset_log() -> list:
+    """macOS power log lines (`pmset -g log`); [] elsewhere or on any failure."""
+    import subprocess
+    import sys
+    if sys.platform != "darwin":
+        return []
+    try:
+        out = subprocess.run(["pmset", "-g", "log"], capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return []
+    return [ln for ln in out.splitlines() if " Sleep " in ln or "Wake " in ln]
+
+
+def _tail_lines(path: Path, max_bytes: int = 4 << 20) -> list:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            return fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+def stop_cause(home: Optional[Path] = None, since: float = 0.0, until: Optional[float] = None) -> dict:
+    """Why the backend on THIS host stopped between `since` and `until` (epoch s): {cause, evidence (<= 600 chars
+    of the matched lines, cause first), host, causes (every cause that matched)}. Fail-open: unreadable logs are
+    no evidence."""
+    import datetime as _dt
+    h = hermes_home(home)
+    until = time.time() if until is None else until
+    found: dict = {c: [] for c in STOP_CAUSES}
+
+    def inside(ts):
+        return ts is not None and since <= ts <= until
+
+    try:
+        for p in sorted((h / "logs" / "update_receipts").glob("*.json")):
+            try:
+                r = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            a, b = _iso_ts(r.get("started_at")), _iso_ts(r.get("finished_at"))
+            if inside(a) or inside(b) or (a is not None and b is not None and a <= since <= b):
+                pre = (r.get("pre_update") or {}).get("short_sha") or "?"
+                post = (r.get("post_update") or {}).get("short_sha") or "?"
+                found["core update"].append(f"update_receipts/{p.name}: {r.get('started_at')} -> "
+                                            f"{r.get('finished_at')} {r.get('outcome') or '?'} {pre} -> {post}")
+    except OSError:
+        pass
+    for ln in _tail_lines(h / "logs" / "hermes-sync.log"):
+        m = _SYNC_LINE_RE.match(ln)
+        if not m:
+            continue
+        try:
+            ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))  # hermes-sync logs local time
+        except (ValueError, OverflowError):
+            continue
+        if inside(ts):
+            found["plugin reload"].append(f"{m.group(1)} {m.group(2)}"[:240])
+    for ln in _tail_lines(h / "logs" / "gateway-exit-diag.log"):
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and inside(_iso_ts(r.get("ts"))):
+            extra = f" code={r['code']}" if "code" in r else ""
+            found["gateway shutdown"].append(f"gateway-exit-diag {r.get('ts')} {r.get('tag')} pid={r.get('pid')}{extra}")
+    lines = _tail_lines(h / "logs" / "gateway-shutdown-diag.log")
+    for i, ln in enumerate(lines):
+        if ln.startswith("=== shutdown diagnostic") and i + 2 < len(lines) and inside(_iso_ts(lines[i + 2].strip())):
+            found["gateway shutdown"].append(f"gateway-shutdown-diag {lines[i + 2].strip()} {ln.strip('= ')}")
+    slept = False
+    for ln in _pmset_log() or []:
+        m = _PMSET_RE.match(ln)
+        if not m:
+            continue
+        try:
+            ts = _dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S %z").timestamp()
+        except ValueError:
+            continue
+        if inside(ts):
+            slept = slept or m.group(2) == "Sleep"
+            found["machine slept"].append(f"pmset {m.group(1)} {m.group(2)}: {m.group(3).strip()}"[:200])
+    if not slept:
+        found["machine slept"] = []  # wake lines alone are not a sleep inside the window
+    causes = [c for c in STOP_CAUSES if found[c]]
+    cause = causes[0] if causes else "unknown"
+    ev = ""
+    for c in causes:
+        part = f"{c}: " + " | ".join(found[c])
+        ev += ("" if not ev else " || also ") + part
+    return {"cause": cause, "evidence": ev[:STOP_EVIDENCE_MAX], "host": host_name(), "causes": causes}
+
+
+def stop_window(hit: dict, session_id: str, now: float, home: Optional[Path] = None) -> tuple:
+    """(since, until) for stop_cause: from when the cut turn last wrote a row (state.db, tighter) or started (the
+    hit's gap_s), minus a minute of slack, to now."""
+    row_gap = pause_gap_s(session_id, now, home) if session_id else None
+    turn_gap = hit.get("gap_s") if isinstance(hit.get("gap_s"), (int, float)) else None
+    gaps = [g for g in (row_gap, turn_gap) if g is not None]
+    gap = min(gaps) if gaps else STOP_WINDOW_DEFAULT_S
+    return now - float(gap) - STOP_SLACK_S, now
 
 
 _STOP = set("a an the to of in on for and or is are was were be been it its this that with not no by at as from "
@@ -1007,15 +1151,27 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     if not hit:
         return None
     m = m or mode()
+    if is_crash_hit(hit) and "stop_cause" not in hit:
+        # Read the stop's cause HERE, on the host that ran the cut turn (its logs exist nowhere else), and in
+        # handle() so a long-running backend's older coach __init__ gets it too (gateway-9aaf151a15 came back).
+        try:
+            clock = getattr(store, "clock", None)
+            now = float(clock()) if callable(clock) else time.time()
+            since, until = stop_window(hit, session_id, now)
+            hit = with_stop_cause(hit, stop_cause(None, since, until))
+        except Exception as exc:  # fail-open: an unreadable log only loses the cause, never the alert
+            hit = with_stop_cause(hit, {"cause": "unknown", "evidence": f"stop_cause failed: {exc}"[:200]})
     # A machine signal carries what failed; lead with it here, not only in the caller, because a long-running gateway
     # re-execs this module on change but keeps the coach __init__ it booted with (agent-6eb3a51e94 live check).
     hit_ev = str(hit.get("evidence") or "")
     if hit_ev and not str(evidence or "").startswith(hit_ev[:60]):
         evidence = f"{hit_ev[:300]} | reply: {str(evidence or '')[-180:]}"
+    stop = {k: hit[k] for k in ("stop_cause", "stop_evidence", "stop_host") if k in hit}
     if probe_session(session_id, ask):
         rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
                "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
-               "fingerprint": hit["fingerprint"], "new": False, "probe": True, "evidence": (evidence or "")[:300]}
+               "fingerprint": hit["fingerprint"], "new": False, "probe": True, "evidence": (evidence or "")[:300],
+               **stop}
         store.log(rec)
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": hit["fingerprint"], "why": "probe",
                    "session_id": session_id})
@@ -1023,7 +1179,7 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     new = Fingerprints(store.root).record(hit, session_id)
     rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
            "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
-           "fingerprint": hit["fingerprint"], "new": new, "evidence": (evidence or "")[:300]}
+           "fingerprint": hit["fingerprint"], "new": new, "evidence": (evidence or "")[:300], **stop}
     store.log(rec)
     if m == "live" and new:
         q = Path(store.root) / "selfheal_queue.jsonl"
@@ -1424,6 +1580,10 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
 - When: {when} · host: {d.get('host') or '?'} · session: @session:{d.get('profile') or 'default'}/{sid}
 - Quote: "{(d.get('quote') or '').strip()[:500]}"
 {('- Extra: ' + str(d.get('details'))[:1500]) if d.get('details') else ''}
+{('- Stop evidence (captured on ' + str(d.get('stop_host') or d.get('host') or '?') + '): cause ' +
+  str(d.get('stop_cause')) + (' — ' + str(d.get('stop_evidence'))[:600] if d.get('stop_evidence') else
+  ' (no update receipt, mods-reload, gateway exit or sleep line in the window)'))
+ if d.get('stop_cause') else ''}
 {rec}
 ## Do this
 1. Reproduce or confirm it LIVE, not from the transcript alone. Scope it from the user's own words and the session's
