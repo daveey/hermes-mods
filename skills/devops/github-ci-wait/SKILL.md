@@ -15,11 +15,7 @@ metadata:
 
 **Look first:** the exact sha from `git`/`gh` output, the repo's AGENTS.md (it may name its own wait wrapper), and `--once`.
 
-Never write your own watcher that follows "the newest run" (`gh run list -L 1`) or one specific run id
-(`gh run watch <id>`). On a busy branch, concurrency groups replace pending runs and most end `cancelled`.
-The run that actually builds your commit is often one started by someone else's later push. Newest-run
-watchers miss it and wait for hours while the session looks idle. Ask instead whether any successful run, or
-any release tag, *contains* your commit. Tag-mode success establishes containment only, not that CI passed
+For ordinary commit/release waits, use containment rather than "the newest run" (`gh run list -L 1`) or a single-run watch: branch concurrency can replace pending runs with a later run containing your commit. For input-specific experiments (native enabled versus skipped, RED/GREEN controls), containment alone is insufficient: bind evidence to the exact head, dispatch inputs, job and executed tests. A successful same-head run with the target job skipped cannot satisfy that experiment. See the acceptance recipe in `references/ci-authoring-and-failure-fixes.md`. Tag-mode success establishes containment only, not that CI passed
 or release assets were published; verify the workflow and required release artifacts separately.
 
 When a branch uses ONE serialized concurrency group (in-flight always finishes, only the newest pending waits), a
@@ -110,7 +106,7 @@ How to run it from an agent:
 
 ## Done means
 - [ ] The sha was copied from `git`/`gh` output, and `--once` ran with the same arguments before any "waiting on CI"?
-- [ ] The wait is `wait_for_ci.py` (background+notify in chat; `--once` + `kanban_continue` in Kanban), never a newest-run or `gh run watch` loop?
+- [ ] Ordinary waits use `wait_for_ci.py`; input-specific controls additionally verify exact dispatch/job execution, not a skipped same-head success?
 - [ ] No filter pipe hides the wait's exit status (`| tail`/`| grep` only under `set -o pipefail`)?
 - [ ] The report cites the run URL or tag the script printed, marked "ran on a later commit" when it did?
 - [ ] On exit 1, the failing run's logs were read (`--log-failed` or the jobs API) before a cause was named?
