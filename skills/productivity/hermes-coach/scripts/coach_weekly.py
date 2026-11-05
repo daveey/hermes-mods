@@ -598,7 +598,9 @@ def section_selfheal(data, now, days, homes=None, events=None, cards=None):
 
 
 def held_draft_restores(homes, lo, hi):
-    """session-outcome's `restored held draft` events (<home>/logs/held-draft-restores.jsonl, profiles too) in [lo, hi)."""
+    """Held-draft restores in [lo, hi): session-outcome's `restored held draft` events
+    (<home>/logs/held-draft-restores.jsonl) plus core's pre_verify safety net (`restored_hidden_draft hook=pre_verify`
+    lines in <home>/logs/agent.log*, source "core"; agent-9382d717aa). Profiles too."""
     out = []
     for home in homes:
         for p in [home / "logs" / "held-draft-restores.jsonl", *sorted(home.glob("profiles/*/logs/held-draft-restores.jsonl"))]:
@@ -611,20 +613,54 @@ def held_draft_restores(homes, lo, hi):
                     continue
                 if isinstance(r, dict) and isinstance(r.get("ts"), (int, float)) and lo <= r["ts"] < hi:
                     out.append(r)
+        for p in [*sorted(home.glob("logs/agent.log*")), *sorted(home.glob("profiles/*/logs/agent.log*"))]:
+            out += [r for r in core_hidden_draft_restores(p) if lo <= r["ts"] < hi]
+    return out
+
+
+# 2026-11-05 11:21:17,269 INFO [<sid>] agent.conversation_loop: restored_hidden_draft hook=pre_verify draft_chars=..
+CORE_RESTORE_RE = re.compile(
+    r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\S* INFO .*?agent\.conversation_loop: restored_hidden_draft hook=(\w+) "
+    r"draft_chars=(\d+) reply_chars=(\d+) session=(\S*)")
+
+
+def core_hidden_draft_restores(path):
+    """Core `restored_hidden_draft` log lines of one agent.log as {ts, session_id, held_chars, reply_chars, source}."""
+    out = []
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        if "restored_hidden_draft" not in line:
+            continue
+        m = CORE_RESTORE_RE.match(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            continue
+        out.append({"ts": ts, "session_id": m.group(5), "held_chars": int(m.group(3)),
+                    "reply_chars": int(m.group(4)), "source": f"core:{m.group(2)}"})
     return out
 
 
 def section_held_drafts(now, days, homes=None):
-    """KPI: replies the session-outcome gate restored because the model answered its hold with a stub. Each one is
-    a full answer the user would otherwise have lost (hub 20261028_071229_45f849); a rising count means the core
-    not-shown notice is not holding and the gate's nudge needs another look."""
+    """KPI: replies the session-outcome gate (or core's pre_verify safety net) restored because the model answered a
+    hold with a stub. Each one is a full answer the user would otherwise have lost (hub 20261028_071229_45f849,
+    20261031_064851_d0f106); a rising count means the core not-shown notice is not holding and the nudge that
+    held the draft needs another look."""
     homes = selfheal_homes(homes)
     span = days * 86400
     cur = held_draft_restores(homes, now - span, now)
     prev = held_draft_restores(homes, now - 2 * span, now - span)
-    out = ["## Held-draft restores (session-outcome)", ""]
+    out = ["## Held-draft restores (session-outcome + core pre_verify)", ""]
     line = (f"Held-draft restores: {len(cur)} this window (previous {len(prev)}); "
             f"{len({r.get('session_id') for r in cur})} sessions.")
+    core = [r for r in cur if str(r.get("source") or "").startswith("core")]
+    if core:
+        line += f" Core pre_verify safety net: {len(core)}."
     if cur:
         worst = max(cur, key=lambda r: r.get("held_chars", 0) - r.get("reply_chars", 0))
         line += (f" Largest: {worst.get('session_id')} {worst.get('held_chars')} -> {worst.get('reply_chars')} chars. "

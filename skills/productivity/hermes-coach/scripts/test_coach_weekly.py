@@ -3,6 +3,7 @@ import ast
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -480,3 +481,19 @@ class HeldDraftRestores(unittest.TestCase):
         self.assertIn("Held-draft restores: 3 this window (previous 1); 2 sessions.", out)
         self.assertIn("Largest: s1 3000 -> 200 chars.", out)
         self.assertNotIn("future", out)
+
+    def test_counts_core_pre_verify_restores_from_agent_log(self):
+        """agent-9382d717aa: core's pre_verify safety net logs `restored_hidden_draft`; the KPI counts those lines."""
+        stamp = lambda ts: datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") + ",123"  # noqa: E731
+        p = self.home / "logs" / "agent.log.1"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join([
+            f"{stamp(self.NOW - self.DAY)} INFO [s9] agent.conversation_loop: restored_hidden_draft hook=pre_verify "
+            "draft_chars=1006 reply_chars=214 session=s9",
+            f"{stamp(self.NOW - 10 * self.DAY)} INFO [s8] agent.conversation_loop: restored_hidden_draft "
+            "hook=pre_verify draft_chars=900 reply_chars=10 session=s8",
+            f"{stamp(self.NOW - self.DAY)} INFO [s7] tools.terminal: grep restored_hidden_draft hook=pre_verify",
+        ]) + "\n")
+        out = self.section()
+        self.assertIn("Held-draft restores: 1 this window (previous 1); 1 sessions. Core pre_verify safety net: 1.", out)
+        self.assertIn("Largest: s9 1006 -> 214 chars.", out)
