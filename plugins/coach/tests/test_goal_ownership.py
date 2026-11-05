@@ -29,10 +29,15 @@ def owner(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_SESSION_KEY', SID)
     for key in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_TASK', 'HERMES_PROFILE'):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     monkeypatch.setattr(kb, 'kanban_home', lambda: tmp_path)
     db = tmp_path / 'kanban.db'
+    from agent.delegation_context import kanban_path_is_fenced
+    assert db.parent == tmp_path and not kanban_path_is_fenced(db)
+    # Real producers need the migrations and auxiliary tables too, not just
+    # SCHEMA_SQL. Bootstrap through the same initializer as production.
+    assert kb.init_db(db) == db
     with sqlite3.connect(db) as c:
-        c.executescript(kb.SCHEMA_SQL)
         c.execute("INSERT INTO tasks (id,title,body,assignee,status,created_at,session_id,current_run_id) VALUES (?,?,?,'default','running',?,?,1)", (TID,REQUEST,REQUEST,int(time.time()),SID))
         c.execute("INSERT INTO task_runs (id,task_id,profile,status,claim_lock,claim_expires,worker_pid,worker_started_at,started_at) VALUES (1,?,'default','running',?,?,?,?,?)", (TID,claim_prefix() + str(os.getpid()),int(time.time())+300,os.getpid(),_process_fingerprint(os.getpid()),int(time.time())))
         c.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,notifier_profile,created_at) VALUES (?,'tui',?,'default',?)", (TID,SID,int(time.time())))
