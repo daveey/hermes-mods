@@ -1341,6 +1341,55 @@ def test_kanban_sibling_cards_with_same_stem_and_error_are_one_signal(tmp_path):
     assert d["kanban"]["cards"] == ["t_load14", "t_load20", "t_load23"]
 
 
+def _timed_board(db, runs, consecutive=None):
+    """runs: (task_id, title, outcome, error, ended_at); tasks carry core's consecutive_failures column."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(db)
+    c.execute("create table tasks (id text primary key, title text, status text, idempotency_key text, "
+              "consecutive_failures integer not null default 0)")
+    c.execute("create table task_runs (id integer primary key autoincrement, task_id text, status text, "
+              "started_at integer, ended_at integer, outcome text, error text)")
+    for tid, title in {(r[0], r[1]) for r in runs}:
+        c.execute("insert into tasks values (?,?,?,?,?)", (tid, title, "scheduled", None,
+                                                          (consecutive or {}).get(tid, 0)))
+    for tid, _title, outcome, err, ended in runs:
+        c.execute("insert into task_runs (task_id, status, started_at, ended_at, outcome, error) values "
+                  "(?,?,?,?,?,?)", (tid, outcome, int(ended) - 60, int(ended), outcome, err))
+    c.commit()
+    c.close()
+
+
+def test_kanban_old_failures_plus_one_new_crash_is_not_filed(tmp_path):
+    """kanban-3039493fec: 24 credential crashes 11 days ago + 1 ENOSPC crash now was filed as 'failed 25x',
+    quoting the 11-day-old errors. Only failures inside the window count: one new crash is not a loop."""
+    h = tmp_path / "h"
+    old = [("t_shep", "Upkeep system shepherd", "crashed", "No Anthropic credentials found", NOW - 11 * 86400 + i)
+           for i in range(24)]
+    _timed_board(h / "kanban.db", old + [("t_shep", "Upkeep system shepherd", "crashed",
+                                          "OSError: [Errno 28] No space left on device", NOW - 300)],
+                 consecutive={"t_shep": 1})
+    assert sg.collect_kanban(h, {}, NOW, "hubhost") == []
+
+
+def test_kanban_recent_loop_counts_window_only_and_quotes_newest_first(tmp_path):
+    h = tmp_path / "h"
+    old = [("t_loop", "build the thing", "crashed", "No Anthropic credentials found " + "x" * 150,
+            NOW - 11 * 86400 + i) for i in range(24)]
+    _timed_board(h / "kanban.db", old + [
+        ("t_loop", "build the thing", "crashed", "worker died: SIGKILL", NOW - 3000),
+        ("t_loop", "build the thing", "timed_out", "OSError: [Errno 28] No space left on device", NOW - 300)],
+        consecutive={"t_loop": 2})
+    ks = sg.collect_kanban(h, {}, NOW, "hubhost")
+    assert len(ks) == 1
+    s = ks[0]
+    assert "failed 2x" in s["symptom"], s["symptom"]
+    assert "No Anthropic credentials" not in s["details"]  # out-of-window errors are not quoted
+    errs = s["details"].split("errors: ", 1)[1]
+    assert errs.index("No space left") < errs.index("SIGKILL")  # newest first, survives the 1500-char cut
+    assert "consecutive_failures=2" in s["details"]
+    assert "24 older failures not counted" in s["details"]
+
+
 # ── handoff nudge outcome (self-heal agent-e278947864): file the outcome, not the nudge ──────────────────────
 
 def _coach_home(tmp_path, rows):

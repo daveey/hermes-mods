@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 BACKFILL_S = 7 * 86400
+KANBAN_FAIL_WINDOW_S = 86400  # a card's failed runs count/quote only inside this window (kanban-3039493fec)
 HOLD_BACKFILL_S = 86400  # first sight of a board: sticky holds older than this were already handled (kanban-754a3e3cf1)
 MAX_READ = 4 * 1024 * 1024        # never read more than this from one log per pass (start at the tail instead)
 MAX_PER_KIND = 25                 # cap per collector per pass: a log storm files a handful, not hundreds
@@ -984,12 +985,32 @@ def collect_kanban(home: Path, cur: dict, now: float, host: str) -> List[dict]:
             c = _ro(db)
             last = int(seen.get(board) or 0)
             top = c.execute("select coalesce(max(id),0) from task_runs").fetchone()[0]
-            rows = c.execute(
-                f"select r.task_id, count(*), max(r.id), max(coalesce(r.ended_at, r.started_at)), "
-                f"group_concat(r.outcome), group_concat(substr(coalesce(r.error,''),1,200), ' | '), t.title, "
+            # only failures inside the window count and are quoted: a card's whole history made one new crash
+            # read as "failed 25x" with 11-day-old errors (kanban-3039493fec)
+            cutoff = int(now - KANBAN_FAIL_WINDOW_S)
+            agg = c.execute(
+                f"select r.task_id, count(*), max(r.id), max(coalesce(r.ended_at, r.started_at)), t.title, "
                 f"coalesce(t.idempotency_key,''), t.status from task_runs r join tasks t on t.id = r.task_id "
-                f"where r.outcome in ({q}) group by r.task_id having count(*) >= 2 and max(r.id) > ?",
-                (*FAIL_OUTCOMES, last)).fetchall()
+                f"where r.outcome in ({q}) and coalesce(r.ended_at, r.started_at) > ? "
+                f"group by r.task_id having count(*) >= 2 and max(r.id) > ?",
+                (*FAIL_OUTCOMES, cutoff, last)).fetchall()
+            rows, extra = [], {}
+            for tid, n, mx, ended, title, ikey, status in agg:
+                runs = c.execute(  # newest first, so the error that triggered the filing survives the cut
+                    f"select r.outcome, substr(coalesce(r.error,''),1,200) from task_runs r where r.task_id = ? "
+                    f"and r.outcome in ({q}) and coalesce(r.ended_at, r.started_at) > ? order by r.id desc",
+                    (tid, *FAIL_OUTCOMES, cutoff)).fetchall()
+                older = c.execute(
+                    f"select count(*) from task_runs r where r.task_id = ? and r.outcome in ({q}) "
+                    f"and coalesce(r.ended_at, r.started_at, 0) <= ?", (tid, *FAIL_OUTCOMES, cutoff)).fetchone()[0]
+                try:
+                    consec = c.execute("select consecutive_failures from tasks where id = ?", (tid,)).fetchone()[0]
+                except sqlite3.Error:
+                    consec = None  # an older board without core's breaker column
+                rows.append((tid, n, mx, ended, ",".join(r[0] for r in runs), " | ".join(r[1] for r in runs),
+                             title, ikey, status))
+                extra[tid] = (f" consecutive_failures={consec}" if consec is not None else "") + \
+                             (f" ({older} older failures not counted)" if older else "")
             c.close()
         except Exception:
             continue
@@ -1010,7 +1031,8 @@ def collect_kanban(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                 tid, n, _mx, ended, outcomes, errs, title, ikey, status = grp[0]
                 out.append({"kind": "kanban", "component": "kanban", "at": float(ended or now),
                             "symptom": f"kanban card {tid} on {host}/{board} failed {n}x ({outcomes}): {title[:80]}",
-                            "details": home_tilde(f"board {board} card {tid} status={status} title={title}\n"
+                            "details": home_tilde(f"board {board} card {tid} status={status}{extra.get(tid, '')} "
+                                                  f"title={title}\n"
                                                   f"outcomes: {outcomes}\nerrors: {errs}")[:1500],
                             "kanban": {"board": board, "cards": [tid]},
                             # card ids are global and a card's runs sit on several hosts' boards (its home, the
