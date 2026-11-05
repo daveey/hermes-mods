@@ -445,8 +445,8 @@ class TestAll(unittest.TestCase):
             install.assert_called_once_with(
                 ['/bin/uv', 'pip', 'install', '-q', '--python', '/fake/python with spaces',
                  '--target', str(site), 'pytest', 'pytest-asyncio', 'pytest-xdist', 'pyyaml', 'ruamel.yaml',
-                 'fastapi', 'httpx', 'psutil', 'cryptography', 'pillow', 'anthropic==0.125.0'], check=True)
-            for name in ('pytest', 'pytest_asyncio', 'xdist', 'yaml', 'ruamel', 'fastapi', 'httpx', 'psutil', 'cryptography', 'PIL', 'anthropic'):
+                 'fastapi', 'httpx', 'psutil', 'cryptography', 'pillow', 'jsonschema', 'anthropic==0.125.0'], check=True)
+            for name in ('pytest', 'pytest_asyncio', 'xdist', 'yaml', 'ruamel', 'fastapi', 'httpx', 'psutil', 'cryptography', 'PIL', 'jsonschema', 'anthropic'):
                 (site / name).mkdir(parents=True)
             metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
             metadata.parent.mkdir()
@@ -478,7 +478,9 @@ class TestAll(unittest.TestCase):
         runner = runpy.run_path(str(RUNNER))
         ensure = runner['ensure_test_site']
         # cryptography, pillow: remote-screen's runtime deps; without core (plugin-suites CI) the suite didn't collect.
-        required = {'ruamel': 'ruamel.yaml', 'xdist': 'pytest-xdist', 'cryptography': 'cryptography', 'PIL': 'pillow'}
+        # Coach's provenance tests import the real runners brief, which imports jsonschema.
+        required = {'ruamel': 'ruamel.yaml', 'xdist': 'pytest-xdist', 'cryptography': 'cryptography',
+                    'PIL': 'pillow', 'jsonschema': 'jsonschema'}
         with patch.dict(ensure.__globals__, {'TEST_SITE': self.root, 'python_version': lambda py: '3.14.9'}), \
                 patch('shutil.which', return_value='/bin/uv'), patch('subprocess.run') as install:
             site = self.root / 'python-3.14' / 'site-packages'
@@ -525,7 +527,7 @@ class TestAll(unittest.TestCase):
             self.assertEqual(install.call_count, 1)
             self.assertEqual(argv[argv.index('anthropic==0.125.0') + 1:], [*deps, '--override', str(overrides)])
             self.assertEqual(overrides.read_text(), 'Pillow==13.0.0\n')
-            for name in ('pytest', 'pytest_asyncio', 'xdist', 'yaml', 'ruamel', 'fastapi', 'httpx', 'psutil', 'cryptography', 'PIL', 'anthropic'):
+            for name in ('pytest', 'pytest_asyncio', 'xdist', 'yaml', 'ruamel', 'fastapi', 'httpx', 'psutil', 'cryptography', 'PIL', 'jsonschema', 'anthropic'):
                 (site / name).mkdir(parents=True)
             metadata = site / 'anthropic-0.125.0.dist-info' / 'METADATA'
             metadata.parent.mkdir()
