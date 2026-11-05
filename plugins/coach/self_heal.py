@@ -189,6 +189,31 @@ ACK_RE = re.compile(
 # replay's telemetry (api_err / interrupted / repeat): a provider error reply, an interrupted turn, or the same tool
 # error three times in one turn.
 API_ERR_RE = re.compile(r"not processed|API call failed|provider error|rate limit(?:ed)? .{0,40}(?:retry|exhaust)", re.I)
+# A reply IS a provider error only when it opens with the phrase (first line, a lead-in of at most 40 chars such as
+# "Sorry — ", no quote mark before it), or it is a short one-line notice whose last sentence is core's "Your message
+# was not processed" (agent/turn_facade_lease.py busy/taken-over notices). A finished reply that quotes the notice
+# (the agent reporting the fix for it) is not one: provider-1bc7008942 matched 12 such replies on the hub (state.db
+# replay), the same class as the INTERRUPT_RE anchoring below.
+API_ERR_LEAD = 40
+API_NOTICE_MAX = 300
+QUOTE_MARK_RE = re.compile(r"[\"`“”«»]|(?<!\w)['‘’]")  # an apostrophe inside a word ("couldn't") is not a quote
+NOT_PROCESSED_TAIL_RE = re.compile(r"(?:^|[.!?]\s+)(Your (?:message|request) was not\s+processed\b.*)\Z", re.S)
+
+
+def provider_error_span(reply: str) -> Optional[str]:
+    """The matched provider-error text when the reply itself is the error, else None (see API_ERR_LEAD)."""
+    t = (reply or "").strip()
+    first = t.split("\n", 1)[0]
+    m = API_ERR_RE.search(first, 0, API_ERR_LEAD + 120)
+    if m and m.start() <= API_ERR_LEAD and not QUOTE_MARK_RE.search(first[:m.start()]):
+        return first[:m.end() + 100]
+    if len(t) <= API_NOTICE_MAX and "\n" not in t and not QUOTE_MARK_RE.search(t):
+        n = NOT_PROCESSED_TAIL_RE.search(t)
+        if n:
+            return n.group(1)[:160]
+    return None
+
+
 # Core's interrupt placeholders, matched at the START of the reply only (core writes them as the whole reply; a
 # finished reply that quotes one mid-sentence is not an interruption). The tool log carries every command's arguments
 # (a grep for "Turn stopped" is not an interruption) and errors of cancelled tools the agent recovered from, so it is
@@ -381,8 +406,9 @@ def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
     if (final_reply or "").strip() in FAILED_TURN_NOTICES:
         v = {"p_defect": 0.9, "kind": "failed_turn", "component": "gateway",
              "symptom": "turn ended on a failed-turn notice (no reply)"}
-    elif API_ERR_RE.search(r):
-        v = {"p_defect": 0.9, "kind": "api_error", "component": "provider", "symptom": "turn failed with provider error"}
+    elif (span := provider_error_span(final_reply)):
+        v = {"p_defect": 0.9, "kind": "api_error", "component": "provider", "symptom": "turn failed with provider error",
+             "evidence": span}
     elif INTERRUPT_RE.search(r) or (not r.strip() and log and CANCEL_LINE_RE.search(log[-1])):
         v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
              "symptom": "turn interrupted before finishing"}

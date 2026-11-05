@@ -133,6 +133,64 @@ def test_machine_signal_flags_core_failed_turn_notices():
     assert sh.machine_signal("Done. I noted that 'This turn did not complete' is core's notice text.") is None
 
 
+# provider-1bc7008942: finished replies that QUOTED the "not processed" notice (they reported the fix for it) were
+# filed as "turn failed with provider error". These are the three real replies (hub state.db rows), opening verbatim.
+QUOTING_REPLIES = (
+    # row 721644, 20261102_205456_6898ba
+    "The fix for the refusal message is now live on hermes-hub. I checked: the installed Hermes includes commit "
+    "`16d4f566e09`, and the gateway restarted at 01:26:59Z, after the update. If the model provider blocks a turn now, "
+    "the chat says it was refused and gives the reason, instead of \"Your request was not processed\".\n\nThat fix is "
+    "done. The only open item from that session is the DoorDash renewal check, which runs on Nov 5 at 19:00 UTC.",
+    # row 732851, 20261102_205456_6898ba
+    "Everything from this chat is finished. Nothing is running and nothing needs you.\n\n- **Refusal message fix:** "
+    "when the model provider refuses a turn, the chat now says so and gives the reason, instead of \"Your request was "
+    "not processed\". It was merged as PR #709 and is live on hermes-hub.",
+    # row 244757, 20261023_052109_5b3dee
+    "Ignore my last reply (\"Your request was not processed\"). That came from the interrupted turn, and nothing needs "
+    "resending.\n\nA third fix in this thread is now merged and live.",
+)
+
+
+def test_finished_reply_quoting_a_provider_error_is_not_a_provider_error():
+    for reply in QUOTING_REPLIES:
+        assert sh.machine_signal(reply) is None, reply[:80]
+    # row 575946: a status report naming another service's rate limit after a 40+ char lead-in
+    assert sh.machine_signal("PR #511 has green CI and approved review. GitHub’s API rate limit blocked the guarded "
+                             "merge; scheduled a retry after quota reset.") is None
+
+
+def test_real_provider_error_replies_still_flag_with_matched_span():
+    for reply in ("Sorry — this message was not processed (API call failed).", "Sorry, not processed.",
+                  "API call failed after 3 retries: 529 overloaded",
+                  "⚠️ Provider error: upstream returned 502",
+                  "Rate limited by the provider; retry budget exhausted.",
+                  # core lease notices (agent/turn_facade_lease.py): the phrase ends a short notice
+                  "Stopped waiting for another Hermes process on this session. Your message was not processed.",
+                  "This chat was taken over by another Hermes window. Resume it explicitly to continue here. "
+                  "Your message was not processed.",
+                  "⏳ Another Hermes process kept this session busy too long. Your message was not processed - wait "
+                  "for the other process to finish, then send it again."):
+        hit = sh.machine_signal(reply)
+        assert hit and hit["kind"] == "api_error" and hit["fingerprint"] == "provider-1bc7008942", reply
+        assert sh.API_ERR_RE.search(hit["evidence"]), hit  # the card shows what matched, not the reply tail
+
+
+def test_quoted_or_mid_sentence_error_phrases_never_flag():
+    """Detection guard: every provider-error phrase and every core failed-turn notice, quoted or mid-sentence."""
+    phrases = ["not processed", "API call failed", "provider error", "rate limited by the provider, retries exhausted",
+               *sorted(sh.FAILED_TURN_NOTICES)]
+    for p in phrases:
+        for q in ('"{}"', "'{}'", "`{}`", "“{}”"):
+            quoted = q.format(p)
+            for reply in (f"Fixed: a blocked turn now gives the reason instead of {quoted}.",
+                          f"Ignore {quoted}; that was the cut-off turn. Everything else is done.",
+                          f"{quoted} came from the interrupted turn. Nothing needs resending."):
+                assert sh.machine_signal(reply) is None, reply
+        mid = (f"Shipped the coach change and checked the hub log for the whole week: there was no {p} anywhere, "
+               "so nothing needs you.")
+        assert sh.machine_signal(mid) is None, mid
+
+
 # gateway-a8b8d01aa4: finished turns were filed as "turn interrupted" because the tool log merely mentioned it.
 FINISHED = "Done. The hub's own background retry switches on once the hub Desktop backend restarts."
 
