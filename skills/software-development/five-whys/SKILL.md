@@ -201,6 +201,7 @@ Countermeasures:
 ### 8. Check Done means (below), fix at most 2 rounds, then report what still fails
 
 ## Done means
+- [ ] For a cron fingerprint that "came back", did you diff the current stderr against the previous fix card's error and establish whether the cause is the same before calling the earlier fix broken?
 - [ ] For SQLite I/O errors or truncated disk-failure signals, is disk-owner adoption scoped to the same host and incident time (bounded local journal evidence is allowed), never cached in an unscoped generic family lane?
 - [ ] Every why cites evidence (log line, test, `file:line`, commit, metric) or is labelled `(hypothesis)`?
 - [ ] The write-up has both `Root (happened)` and `Root (not caught)`, and neither is "human error", "flaky" or "transient"?
