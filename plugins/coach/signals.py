@@ -2051,6 +2051,8 @@ def reach_target(cfg: dict) -> str:
     except Exception:
         user = ""
     host = _tailscale_name() or socket.gethostname()
+    if host.endswith(".local"):  # macOS mDNS name: never resolvable from the hub; the bare name may be
+        host = host[: -len(".local")]
     return (f"{user}@{host}" if user else host)[:120]
 
 
@@ -2072,6 +2074,11 @@ def probe_host(reach: str, cfg: dict, runner: Optional[Callable] = None) -> Tupl
         return False, f"{type(exc).__name__}: {exc}"[:200]
     err = (r.stderr or r.stdout or "").strip()[-200:]
     return (r.returncode == 0 or bool(SSHD_ANSWERED_RE.search(err))), err
+
+
+# The hub could not even resolve `reach`. MagicDNS keeps resolving a sleeping tailnet peer, so this means the reach
+# the forwarder sent is unusable (e.g. a gethostname fallback), not that the host is asleep.
+UNRESOLVABLE_RE = re.compile(r"Could not resolve hostname|Name or service not known|nodename nor servname", re.I)
 
 
 def ingest(home: Path, text: str, now: Optional[float] = None) -> int:
@@ -2142,19 +2149,25 @@ def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[
                 prober = lambda r: probe_host(r, cfg)  # noqa: E731
             up, detail = prober(reach)
             rec = {"ts": now, "host": h, "age_h": round(age / 3600, 1), "reach": reach, "detail": detail[:160]}
-            if not up:
+            if not up and UNRESOLVABLE_RE.search(detail or ""):
+                # An unusable reach can't tell asleep from dead: keep the age-only check and say why.
+                _coach_log(home, {"event": "forwarder_reach_unresolvable", **rec})
+                note = (f"; its heartbeat's reach {reach} does not resolve from the hub, so the hub cannot tell "
+                        f"asleep from broken (set reach_as in that host's selfheal-config.json)")
+            elif not up:
                 _coach_log(home, {"event": "forwarder_silent_host_down", **rec})
                 continue
-            since = float((state.get(h) or {}).get("reachable_since") or 0)
-            if not since or since <= last:
-                since = now
-            new_state[h] = {"reachable_since": since}
-            if now - since < AWAKE_GRACE_S:
-                _coach_log(home, {"event": "forwarder_silent_host_up_waiting", **rec,
-                                  "reachable_min": round((now - since) / 60)})
-                continue
-            note = (f"; the host has answered ssh ({reach}) for {(now - since) / 60:.0f} min and still sent no "
-                    f"heartbeat, so it is reachable but its forwarder is not reporting")
+            else:
+                since = float((state.get(h) or {}).get("reachable_since") or 0)
+                if not since or since <= last:
+                    since = now
+                new_state[h] = {"reachable_since": since}
+                if now - since < AWAKE_GRACE_S:
+                    _coach_log(home, {"event": "forwarder_silent_host_up_waiting", **rec,
+                                      "reachable_min": round((now - since) / 60)})
+                    continue
+                note = (f"; the host has answered ssh ({reach}) for {(now - since) / 60:.0f} min and still sent "
+                        f"no heartbeat, so it is reachable but its forwarder is not reporting")
         gone = age > GONE_S
         out.append({"kind": "collector", "component": "plugin", "at": now, "host": h,
                     "symptom": (f"self-heal signal forwarder on {h} has not reported for {age / 86400:.0f} days "

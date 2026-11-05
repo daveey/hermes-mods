@@ -898,6 +898,27 @@ def test_hub_files_a_host_silent_for_over_a_week_even_if_unreachable(tmp_path):
     assert [s["host"] for s in got] == ["macbook"] and "host gone or forwarder dead" in got[0]["symptom"]
 
 
+def test_unresolvable_reach_keeps_the_age_only_check(tmp_path):
+    # Live 2026-11-05: the mini's forwarder sent reach=daveey@daveey-mini.local (no tailscale CLI under launchd, so
+    # the gethostname fallback), which the hub cannot resolve. MagicDNS still resolves a sleeping tailnet peer, so
+    # "could not resolve" means the reach is unusable, not that the host is asleep: file as before (with the reason)
+    # instead of hiding a dead forwarder for 7 days.
+    hub = tmp_path / "hub"
+    _beat(hub, reach="you@mini.local")
+    nores = lambda r: (False, "ssh: Could not resolve hostname mini.local: Temporary failure in name resolution")  # noqa
+    got = sg.silent_forwarders(hub, now=NOW + 7 * 3600, prober=nores)
+    assert [s["host"] for s in got] == ["macbook"] and "does not resolve" in got[0]["details"]
+    assert [d["reach"] for d in _log_events(hub, "forwarder_reach_unresolvable")] == ["you@mini.local"]
+    assert _log_events(hub, "forwarder_silent_host_down") == []
+
+
+def test_reach_fallback_drops_mdns_local_suffix(monkeypatch):
+    monkeypatch.setattr(sg, "_tailscale_name", lambda: None)
+    monkeypatch.setattr(sg.getpass, "getuser", lambda: "you")
+    monkeypatch.setattr(sg.socket, "gethostname", lambda: "mac.local")
+    assert sg.reach_target({}) == "you@mac"
+
+
 def test_heartbeat_carries_reach_into_hosts_json(home, tmp_path, monkeypatch):
     sent = []
 
@@ -916,7 +937,7 @@ def test_heartbeat_carries_reach_into_hosts_json(home, tmp_path, monkeypatch):
     assert sg.reach_target({}) == "you@mac-ts"
     monkeypatch.setattr(sg, "_tailscale_name", lambda: None)
     monkeypatch.setattr(sg.socket, "gethostname", lambda: "mac.local")
-    assert sg.reach_target({}) == "you@mac.local"
+    assert sg.reach_target({}) == "you@mac"
 
 
 def test_probe_counts_an_answering_sshd_as_awake():

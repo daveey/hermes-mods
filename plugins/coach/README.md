@@ -971,8 +971,10 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
   no signals), recorded in the hub's `coach/signals/hosts.json`; the hub sweep files a `plugin` defect for a host
   whose forwarder has been silent > 6 h. A sleeping laptop is silent too (plugin-8a7e4507f0), so the heartbeat
   carries `reach` (`reach_as` in `coach/selfheal-config.json`, else `<user>@<tailscale short name>`, else
-  `<user>@<hostname>`) and the hub probes a silent host with one BatchMode ssh first: unreachable (connect
-  timeout, no route, unresolvable) logs `forwarder_silent_host_down` to `coach/log.jsonl` and files nothing; an
+  `<user>@<hostname>` minus `.local`) and the hub probes a silent host with one BatchMode ssh first: unreachable
+  (connect timeout, no route) logs `forwarder_silent_host_down` to `coach/log.jsonl` and files nothing; a reach the
+  hub cannot resolve (MagicDNS still resolves sleeping peers, so the reach itself is bad) logs
+  `forwarder_reach_unresolvable` and keeps the age-only filing, naming the bad reach; an
   answering sshd (login ok, or even `Permission denied`) counts as awake, logs `forwarder_silent_host_up_waiting`,
   and files only once the host has stayed reachable and silent for 30 min (state in `signals/silent-probe.json`).
   Silent > 7 days files regardless ("host gone or forwarder dead"); a heartbeat without `reach` (older forwarder)
