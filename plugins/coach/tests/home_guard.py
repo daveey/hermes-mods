@@ -3,11 +3,20 @@
 Code/dependency roots and pytest-owned temporary directories are not live state, even
 when a managed interpreter or TMPDIR happens to live below ~/.hermes.
 """
+import functools
 import os
 from pathlib import Path
 import sys
 import threading
 from urllib.parse import unquote, urlsplit
+
+
+class _AuditStr(str):
+    """Unique audit identity, even for CPython's interned one-character paths."""
+
+
+class _AuditBytes(bytes):
+    pass
 
 
 class HomeGuard:
@@ -30,6 +39,14 @@ class HomeGuard:
         raw = args[0].co_filename if event == 'exec' else args[0]
         if not isinstance(raw, (str, bytes, os.PathLike)):
             return
+        pending = getattr(self.local, 'fd_open', None)
+        if (event == 'open' and pending is not None and raw is pending[0]
+                and len(args) > 1 and args[1] is None):
+            # os.open emits mode=None. An earlier hook's io.open(raw) can reuse
+            # the exact object, but its event has a string mode and is cwd-based.
+            # Consume once: another audit hook may itself open a same-named file.
+            self.local.fd_open = None
+            raw = pending[1]
         raw = os.fsdecode(raw)
         # The gateway reaper inspects these kernel-owned regular procfs files for
         # every PID after every test. They cannot be symlinks into a Hermes home.
@@ -64,4 +81,44 @@ class HomeGuard:
             self.local.busy = False
 
     def install(self):
+        if getattr(self, '_installed', False):
+            return
+        # CPython's open audit event has (path, mode, flags), but no dir_fd.
+        # Carry the missing authority through the Python os.open entry point;
+        # never exempt relative events or infer their target from caller frames.
+        # This is a test seatbelt, not a sandbox for native/direct-syscall code.
+        original = os.open
+
+        @functools.wraps(original)
+        def open_with_dir_fd(path, flags, mode=0o777, *, dir_fd=None):
+            raw = os.fsdecode(os.fspath(path))
+            previous = getattr(self.local, 'fd_open', None)
+            self.local.fd_open = None
+            try:
+                if dir_fd is not None and not os.path.isabs(raw):
+                    if sys.platform == 'darwin':
+                        import fcntl
+                        # Darwin F_GETPATH returns the kernel's path for this fd.
+                        base = os.fsdecode(fcntl.fcntl(dir_fd, 50, bytes(1024)).split(b'\0', 1)[0])
+                    elif sys.platform.startswith('linux'):
+                        base = os.readlink(f'/proc/self/fd/{dir_fd}')
+                    else:
+                        raise OSError('HomeGuard cannot resolve dir_fd on this platform')
+                    if not os.path.isabs(base) or base.endswith(' (deleted)'):
+                        raise OSError('HomeGuard cannot resolve directory fd safely')
+                    # A distinct object prevents an earlier audit hook's same-name
+                    # open from consuming our fd mapping (including one-char names).
+                    path = os.fspath(path)
+                    if not isinstance(path, (_AuditStr, _AuditBytes)):
+                        path = _AuditBytes(path) if isinstance(path, bytes) else _AuditStr(path)
+                    self.local.fd_open = (path, os.path.join(base, raw))
+                # Preserve kernel dir_fd semantics and flags; unresolvable fds fail closed.
+                return original(path, flags, mode, dir_fd=dir_fd)
+            finally:
+                self.local.fd_open = previous
+
+        if original in os.supports_dir_fd:
+            os.supports_dir_fd.add(open_with_dir_fd)
+        os.open = open_with_dir_fd
         sys.addaudithook(self.audit)
+        self._installed = True
