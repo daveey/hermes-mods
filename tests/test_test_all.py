@@ -115,6 +115,35 @@ class TestAll(unittest.TestCase):
         self.assertRegex(r.stdout, r"SILENT-EXIT\s+plugins/dies")
         self.assertIn("exit 1 with no pytest summary", r.stdout)
 
+    def test_error_after_a_green_summary_fails_the_suite(self):
+        # The real incident: TemporaryDirectory's weakref finalizer hit OSError 39 at interpreter exit, after
+        # "2475 passed"; pytest's exit status stayed 0 and the run reported PASS -- OK.
+        make_tree(self.root, {"finalizer": """
+            import weakref
+            class Home: pass
+            _home = Home()
+            def _cleanup():
+                raise OSError(39, 'Directory not empty')
+            weakref.finalize(_home, _cleanup)
+            def test_ok():
+                pass
+        """, "good": "def test_ok():\n    pass\n"})
+        out = self.root / "r.json"
+        r = run(self.root, "--json", str(out))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"FAIL\s+plugins/finalizer")
+        self.assertRegex(r.stdout, r"PASS\s+plugins/good")
+        self.assertIn("exit 0 but errors after the final summary", r.stdout)
+        rows = {s["name"]: s for s in json.loads(out.read_text())["suites"]}
+        self.assertEqual((rows["plugins/finalizer"]["rc"], rows["plugins/finalizer"]["passed"]), (0, 1))
+        self.assertIn("Directory not empty", rows["plugins/finalizer"]["tail"])
+        runner = runpy.run_path(str(RUNNER))
+        # Tracebacks a failing test captured print BEFORE the summary and are not interpreter-exit errors.
+        self.assertEqual(runner["post_summary_errors"]("Traceback (most recent call last):\n1 passed in 0.1s\n"), [])
+        self.assertEqual(runner["post_summary_errors"]("no summary\nTraceback (most recent call last):\n"), [])
+        self.assertEqual(runner["post_summary_errors"]("Ran 1 test in 0.0s\nOK\nException ignored in: <x>\n"),
+                         ["Exception ignored in: <x>"])
+
     def test_hanging_suite_times_out_and_is_reported(self):
         make_tree(self.root, {"hang": "import time\ntime.sleep(60)\n"})
         r = run(self.root, "--timeout", "3")

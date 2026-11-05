@@ -148,7 +148,9 @@ def pytest_sessionfinish(session, exitstatus):
     stop_gateways_under(_COLLECTION_HOME.name)
     # Core's finite fire-and-forget helpers (daemon threads) persist origin-work.db under HERMES_HOME; one still
     # running at teardown recreates a file mid-rmtree (OSError 39). Wait for them (bounded) before cleanup.
-    writers = [t for t in threading.enumerate() if t.name in _CORE_WRITER_THREADS]
+    # A sibling plugin's waker loop started outside any test (collection imports) is stopped the same way.
+    writers = [t for t in threading.enumerate() if t.name in _CORE_WRITER_THREADS or _plugin_loop_stop(t) is not None]
+    _stop_plugin_loops(writers)
     for thread in writers:
         thread.join(timeout=10)
     remaining = [t.name for t in writers if t.is_alive()]
@@ -197,13 +199,43 @@ def _join_coach_threads(monkeypatch, _live_home_guard):
                 Path(code.co_filename).resolve().parent == _ROOT / 'plugins/coach'
                 or code.co_name == '_lesson_bg' or code.co_name.startswith('_selfheal_'))):
             threads.append(thread)
+        elif _plugin_loop_stop(thread) is not None:
+            threads.append(thread)
         return start(thread, *args, **kwargs)
 
     monkeypatch.setattr(threading.Thread, 'start', tracked)
     yield
+    _stop_plugin_loops(threads)
     for thread in threads:
         thread.join(timeout=10)
     assert not [t.name for t in threads if t.is_alive()], 'coach background thread outlived its test'
+
+
+def _plugin_loop_stop(thread):
+    """Stop event of a sibling plugin's waker loop (``Thread(target=_loop, args=(stop_event,))``), else None.
+
+    Tests that load real plugins through the plugin manager (chat-closeout via the goal acceptance
+    fixtures) start that plugin's infinite daemon loop; ``manager.unload()`` does not stop it. Left
+    running, it resolves HERMES_HOME per tick, so after the test it writes cache/chat-closeout/ledger.db
+    and origin-work.db into the collection home while TemporaryDirectory cleanup rmtree()s it (OSError 39
+    after the summary). The loop's own reload path stops stale copies via the same first-arg event.
+    """
+    code = getattr(getattr(thread, '_target', None), '__code__', None)
+    args = getattr(thread, '_args', None) or ()
+    if not (code and args and isinstance(args[0], threading.Event)):
+        return None
+    path = Path(code.co_filename).resolve()
+    plugins = _ROOT / 'plugins'
+    if not path.is_relative_to(plugins) or path.is_relative_to(plugins / 'coach'):
+        return None
+    return args[0]
+
+
+def _stop_plugin_loops(threads):
+    for thread in threads:
+        stop = _plugin_loop_stop(thread)
+        if stop is not None:
+            stop.set()
 
 # Tests set HERMES_HOME=tmp_path. The first lazy import of hermes_bootstrap under that home (e.g. SessionDB.append_message
 # -> agent.conversation_loop -> hermes_bootstrap) otherwise runs a full dependency sync into the tmp home: ~400MB
