@@ -102,6 +102,11 @@ PROVIDER_STATUS_EXC_RE = re.compile(r"(?:^|\.)(?:\w*ServerError|APIStatusError)$
 PROXY_5XX_RE = re.compile(r"<title>\s*5\d\d\b|\b5\d\d\s+(?:Bad Gateway|Service|Gateway|Internal Server Error)|"
                           r"Bad Gateway|Service (?:Temporarily )?Unavailable|Gateway Time-?out|"
                           r"Error code: 5\d\d\b|\bstatus(?:_code)?[\s:=]+5\d\d\b", re.I)
+# A provider error delivered inside a stream that already answered HTTP 200: the SDK raises a generic APIStatusError
+# (anthropic/_streaming.py `_make_status_error`) with no 5xx anywhere, so the provider's error TYPE is the only
+# server-failure sign (agent-117687e1c2). These are the codes core retries as server_error
+# (agent/error_classifier.py `_PROVIDER_CODE_VERDICTS`); test_coach_server_error_types_cover_core_verdicts pins them.
+PROVIDER_5XX_TYPE_RE = re.compile(r"""['"]type['"]:\s*['"](?:api_error|server_error|internal)['"]""")
 EXC_BODY_LINES, EXC_BODY_CHARS = 20, 2000
 # Match only core's final offline exception, never generic DNS failures or a message quoting it. OFFLINE_MSG is core's
 # exact sentence (agent/api_error_summary.py `_summarize_api_error`; test_offline_message_matches_core pins it to the
@@ -134,11 +139,12 @@ def _exc_body(block: List[str], exc_line: str) -> str:
 
 def provider_5xx(exc_type: str, exc_line: str, body: str) -> bool:
     """A provider status error (by exception type) whose message, including its continuation lines, carries a
-    5xx status or a proxy 5xx page marker. Transient: core retries it; a real outage files via retry-exhausted."""
+    5xx status, a proxy 5xx page marker, or a provider server-error type (an in-stream error, PROVIDER_5XX_TYPE_RE).
+    Transient: core retries it; a real outage files via retry-exhausted."""
     if not PROVIDER_STATUS_EXC_RE.search(exc_type or ""):
         return False
     text = (exc_line or "") + "\n" + (body or "")
-    return bool(PROXY_5XX_RE.search(text) or TRANSIENT_RE.search(text)
+    return bool(PROXY_5XX_RE.search(text) or TRANSIENT_RE.search(text) or PROVIDER_5XX_TYPE_RE.search(text)
                 or re.search(r"InternalServerError[\s\S]{0,600}?\b5\d\d\b", text))
 
 

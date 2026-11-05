@@ -2149,3 +2149,70 @@ def test_non_retryable_provider_http_error_is_not_a_hermes_defect():
 ])
 def test_home_tilde_only_rewrites_a_real_home_prefix(raw, want):
     assert sg.home_tilde(raw) == want
+
+
+# ── provider error TYPE inside an HTTP-200 stream (agent-117687e1c2) ──────────────────────────────────────
+# The SDK raises a generic APIStatusError once the stream has started (anthropic/_streaming.py:163), so no 5xx
+# status reaches the log: the provider's error type is the only server-failure sign. Core retries these.
+
+def _instream_api_error_record():
+    """The mini's 2026-11-03 08:05 PST record (hub spool.jsonl:504, paths anonymised): Anthropic sent
+    `api_error` / "Internal server error" mid-stream; core retried and the card finished."""
+    return (FIX / "errors-instream-api-error.txt").read_text().splitlines()
+
+
+def test_instream_provider_api_error_is_transient():
+    lines = _instream_api_error_record()
+    assert lines[-1].startswith("anthropic.APIStatusError: {'type': 'error'")
+    assert sg.parse_errors(lines) == []
+
+
+def _stream_fail(exc_line):
+    return ["2026-11-03 08:05:33,412 ERROR agent.chat_completion_helpers: Streaming failed before delivery: x",
+            "Traceback (most recent call last):",
+            '  File "/home/you/.hermes/hermes-agent/agent/chat_completion_helpers.py", line 3540, in _stream',
+            "    for event in stream:", exc_line]
+
+
+@pytest.mark.parametrize("exc_line", [
+    "openai.APIStatusError: {'error': {'type': 'server_error', 'message': 'The server had an error'}}",
+    'openai.InternalServerError: {"error": {"type": "server_error", "code": null}}',
+    "google.genai.errors.APIStatusError: {'error': {'type': 'internal', 'message': 'Internal error'}}",
+])
+def test_instream_provider_server_error_types_are_transient(exc_line):
+    assert sg.parse_errors(_stream_fail(exc_line)) == []
+
+
+def test_own_exception_mentioning_api_error_type_still_files():
+    """Control: the type rule is scoped to provider status exception types."""
+    lines = _stream_fail("RuntimeError: bad payload {'type': 'api_error', 'message': 'Internal server error'}")
+    assert len(sg.parse_errors(lines)) == 1
+
+
+def test_provider_status_error_with_client_error_type_still_files():
+    """A provider status error whose type is not a server failure (invalid_request_error) is not skipped."""
+    lines = _stream_fail("anthropic.APIStatusError: {'type': 'error', 'error': {'type': 'invalid_request_error', "
+                         "'message': 'messages: roles must alternate'}}")
+    assert len(sg.parse_errors(lines)) == 1
+
+
+def test_coach_server_error_types_cover_core_verdicts():
+    """Drift guard: every provider error code core retries as server_error must be one the coach skips."""
+    import os
+    root = Path(os.environ.get("HERMES_TEST_CORE") or Path.home() / ".hermes/hermes-agent")
+    if not (root / "agent/error_classifier.py").exists():
+        if os.environ.get("HERMES_TEST_CORE"):
+            raise AssertionError(f"HERMES_TEST_CORE set but {root}/agent/error_classifier.py is missing")
+        pytest.skip("Hermes core checkout not found")
+    sys.path.insert(0, str(root))
+    try:
+        ec = importlib.import_module("agent.error_classifier")
+    except ImportError as e:
+        pytest.skip(f"core error_classifier not importable here: {e}")
+    finally:
+        sys.path.remove(str(root))
+    codes = {code for fam in ec._PROVIDER_CODE_VERDICTS.values() for code, v in fam.items()
+             if v is ec._V_SERVER_ERROR}
+    assert codes, "core maps no provider code to server_error: the guard lost its producer"
+    for code in codes:
+        assert sg.PROVIDER_5XX_TYPE_RE.search(f"{{'type': '{code}'}}"), code
